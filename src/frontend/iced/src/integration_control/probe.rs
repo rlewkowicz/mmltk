@@ -493,9 +493,16 @@ impl Requests {
                         Some(receipt) => current_receipt(receipt.control).as_ref() == Some(receipt),
                         #[cfg(any(target_arch = "wasm32", test))]
                         None if matches!(message, Message::ConfidenceInputDelivered(..)) => true,
+                        #[cfg(target_arch = "wasm32")]
+                        None if matches!(message, Message::StatusExercised { .. }) => true,
+                        None if matches!(message, Message::TrainingFixture(_)) => {
+                            matches!(driver.phase, Phase::Workflows(_))
+                        }
                         None => matches!(
                             message,
-                            Message::StatusSelectionRead(_) | Message::StatusClipboardRead(_) | Message::StatusMeasured { .. } | Message::StatusExercised { .. }
+                            Message::StatusSelectionRead(_)
+                                | Message::StatusClipboardRead(_)
+                                | Message::StatusMeasured { .. }
                                 | Message::DatasetInputDelivered(..)
                                 | Message::DatasetDisclosureToggle
                                 | Message::DatasetDrawn(..)

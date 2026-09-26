@@ -34,6 +34,11 @@ impl App {
         {
             return Task::none();
         }
+        let deferred_availability = self
+            .settings
+            .state()
+            .has_deferred_flush()
+            .then(|| self.model.execution_edit_submission_availability());
         match event {
             TransportEvent::Connected(connection) => {
                 if self.config.integration && self.config.integration_viewer_scenario == "quiet" {
@@ -57,7 +62,10 @@ impl App {
             TransportEvent::IntegrationControl(receipt) => {
                 if let Some(integration) = self.integration.as_mut() {
                     if let Err(detail) = integration.receive_control(receipt) {
-                        self.model.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol(detail));
+                        self.model.report_error(
+                            crate::view_model::notices::Origin::Protocol,
+                            UiError::protocol(detail),
+                        );
                     }
                 } else {
                     self.retire_peer(UiError::protocol(
@@ -76,17 +84,41 @@ impl App {
                 self.retire_peer(UiError::transport(reason));
             }
             TransportEvent::Rejected(record) => {
-                if !(0..).map_while(crate::generated::interaction_endpoint).any(|endpoint| endpoint == record.endpointid) {
-                    self.model.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol("InteractionRejected named an unknown interaction endpoint"));
+                if !(0..)
+                    .map_while(crate::generated::interaction_endpoint)
+                    .any(|endpoint| endpoint == record.endpointid)
+                {
+                    self.model.report_error(
+                        crate::view_model::notices::Origin::Protocol,
+                        UiError::protocol(
+                            "InteractionRejected named an unknown interaction endpoint",
+                        ),
+                    );
                     return Task::none();
                 }
                 let origin = crate::view_model::notices::Origin::Interaction(record.endpointid);
-                if self.connection.as_ref().is_some_and(|connection| connection.take_interaction_submission(record.endpointid)) { self.model.notices.clear_condition(origin); }
-                self.model.notices.condition(origin, true, || record.error.into());
+                if self.connection.as_ref().is_some_and(|connection| {
+                    connection.take_interaction_submission(record.endpointid)
+                }) {
+                    self.model.notices.clear_condition(origin);
+                }
+                self.model
+                    .notices
+                    .condition(origin, true, || record.error.into());
             }
             TransportEvent::ProtocolError(error) => {
                 self.retire_peer(UiError::protocol(error));
             }
+        }
+        if self.settings.state().has_deferred_flush()
+            && deferred_availability.is_some_and(|before| {
+                before
+                    .into_iter()
+                    .zip(self.model.execution_edit_submission_availability())
+                    .any(|(was_available, available)| !was_available && available)
+            })
+        {
+            self.flush_settings_edits();
         }
         self.advance_start();
         self.dispatch_explore_viewport()
@@ -123,9 +155,21 @@ impl App {
                 .observe(&crate::protocol::ServerRecord::IntentReply(reply.clone()))
                 .expect("test transport observation");
         }
-        if !self.model.accept_reply(&reply) { return; }
-        let endpoint_id = self.model.pending_endpoint(reply.correlation).expect("accepted pending reply");
+        if !self.model.accept_reply(&reply) {
+            return;
+        }
+        let endpoint_id = self
+            .model
+            .pending_endpoint(reply.correlation)
+            .expect("accepted pending reply");
         let context = self.model.pending_intent(reply.correlation);
+        if let Some(integration) = self.integration.as_ref()
+            && let Some(endpoint) = context
+        {
+            integration.observe_reporting(|reporting| {
+                reporting.observe_intent("reply", endpoint, reply.correlation);
+            });
+        }
         let settings_revision_before = self
             .model
             .settings_snapshot
@@ -315,7 +359,10 @@ impl App {
         let Some(connection) = self.connection.as_mut() else {
             self.model.abandon_intent(correlation);
             self.abandon_explore_edit(context);
-            self.model.report_error(crate::view_model::notices::Origin::Transport, UiError::transport("browser connection is not ready"));
+            self.model.report_error(
+                crate::view_model::notices::Origin::Transport,
+                UiError::transport("browser connection is not ready"),
+            );
             return false;
         };
         if let Err(error) = connection.send_intent(intent) {
@@ -336,12 +383,18 @@ impl App {
                     self.retire_peer(UiError::transport(error.to_string()));
                 }
                 crate::transport_connection::OutboundSendError::Capacity => {
-                    self.model.report_admission_error(context, UiError::busy(error.to_string()));
+                    self.model
+                        .report_admission_error(context, UiError::busy(error.to_string()));
                 }
             }
             return false;
         }
         self.model.begin_admission(context);
+        if let Some(integration) = self.integration.as_ref() {
+            integration.observe_reporting(|reporting| {
+                reporting.observe_intent("queued", context, correlation);
+            });
+        }
         true
     }
 }

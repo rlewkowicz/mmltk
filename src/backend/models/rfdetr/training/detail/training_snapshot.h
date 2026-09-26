@@ -26,10 +26,12 @@ struct ResumeState {
  std::optional<int> scaler_growth_tracker;
 };
 ModelStateLoadSummary load_training_model_weights(NativeRfDetrModel&, const DecodedNativeModelState&, TrainingSupervisionRoute);
-ResumeState load_resume_checkpoint_state(const std::filesystem::path&, const DecodedNativeModelState&, const detail::TrainingContinuation&, NativeOptimizer&,
- const std::vector<std::string>&, const std::vector<torch::Tensor>&, std::span<const std::uint8_t> active = {});
+ResumeState load_resume_checkpoint_state(const std::filesystem::path&, const DecodedNativeModelState&, const detail::TrainingContinuation&, NativeOptimizer&, const std::vector<std::string>&,
+ const std::vector<torch::Tensor>&, std::span<const std::uint8_t> active = {});
 class TrainingSnapshot;
-namespace testsupport { struct TrainingSnapshotTestAccess; }
+namespace testsupport {
+struct TrainingSnapshotTestAccess;
+}
 // A borrowed scope, never another tensor owner. Its snapshot must outlive it.
 class TrainingSnapshotPublication final {
 public:
@@ -40,6 +42,7 @@ public:
  // Normal completion propagates settlement/retained-reader failures. Unwinding
  // preserves the first error and keeps failed snapshot admission sealed.
  void finish();
+
 private:
  explicit TrainingSnapshotPublication(TrainingSnapshot& snapshot) : snapshot_(&snapshot) {}
  TrainingSnapshot* snapshot_;
@@ -50,8 +53,8 @@ public:
  [[nodiscard]] TrainingSnapshotPublication begin(std::span<const NormalizedModelStateEntry> ordinary, const std::vector<std::string>& names, const ModelEma*);
  void require_inactive() const;
  void save_weights(const std::filesystem::path&, const NativeCheckpointMetadata&, bool selected, const std::filesystem::path&);
- void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeOptimizer&, const GradScaler&, const TrainRequest&, int epoch,
-  int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor, detail::TrainingContinuationValues& continuation);
+ void save_resume(const std::filesystem::path&, const NativeCheckpointMetadata&, const NativeOptimizer&, const GradScaler&, const TrainRequest&, int epoch, int64_t ema_completed_updates,
+  std::string_view attempt_id, const std::filesystem::path& descriptor, detail::TrainingContinuationValues& continuation);
 
 private:
  friend class TrainingSnapshotPublication;

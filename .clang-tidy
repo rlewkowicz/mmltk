@@ -1,0 +1,2 @@
+CheckOptions:
+  modernize-use-auto.MinTypeNameLength: '5'

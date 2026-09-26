@@ -10,6 +10,7 @@ namespace torch_cuda = mmltk::backend::ml::cuda;
 struct TrainingMetricHandoff::Impl {
  static constexpr std::int64_t scalar_offset = 9;
  static constexpr std::int64_t packet_size = scalar_offset + static_cast<std::int64_t>(TrainingScalarPacket::size);
+
 public:
  explicit Impl(int device_id) : device_id_(device_id), launch_(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(device_id))), work_(device_id, 3) {}
  void initialize() {
@@ -24,9 +25,14 @@ public:
  }
  cudaError_t retire() noexcept {
   if (failure_ != cudaSuccess || work_.retire() != cudaSuccess) return cudaErrorUnknown;
-  try { launch_.synchronize(); return cudaSuccess; } catch (...) { return cudaErrorUnknown; }
+  try {
+   launch_.synchronize();
+   return cudaSuccess;
+  } catch (...) { return cudaErrorUnknown; }
  }
- void check() const { if (failure_ != cudaSuccess || work_.uncertain()) throw std::runtime_error("training metrics cannot reuse unproved device work"); }
+ void check() const {
+  if (failure_ != cudaSuccess || work_.uncertain()) throw std::runtime_error("training metrics cannot reuse unproved device work");
+ }
  void reset_epoch() {
   check();
   device_values_.zero_();
@@ -38,26 +44,36 @@ public:
   if (!state.microbatches) return;
   host_values_.zero_();
   auto* values = host_values_.data_ptr<float>();
-  values[0] = static_cast<float>(state.loss_sum); values[1] = static_cast<float>(state.class_loss_sum); values[2] = static_cast<float>(state.box_loss_sum); values[6] = 1;
-  template for (constexpr auto member : TrainingScalarPacket::members) {
-   values[scalar_offset + TrainingScalarPacket::index<member>()] = static_cast<float>(state.scalar_sums.[:member:].value_or(std::numeric_limits<double>::quiet_NaN()));
-  }
-  device_values_.copy_(host_values_, false); epoch_state_ = state;
+  values[0] = static_cast<float>(state.loss_sum);
+  values[1] = static_cast<float>(state.class_loss_sum);
+  values[2] = static_cast<float>(state.box_loss_sum);
+  values[6] = 1;
+  TrainingScalarPacket::visit(
+   [&]<auto Member, std::size_t Index>() { values[scalar_offset + Index] = static_cast<float>((state.scalar_sums.*Member).value_or(std::numeric_limits<double>::quiet_NaN())); });
+  device_values_.copy_(host_values_, false);
+  epoch_state_ = state;
  }
  const TrainingEpochMetricState& state() const noexcept { return epoch_state_; }
  void begin_attempt(std::size_t contributions) {
   check();
-  attempt_values_.zero_(); control_.zero_(); contribution_ = 0;
-  if (!statistics_.defined() || statistics_.size(0) != static_cast<std::int64_t>(contributions)) statistics_ = torch::zeros({static_cast<std::int64_t>(contributions), static_cast<std::int64_t>(DetectionStatisticsPacket::size)}, device_values_.options());
-  else statistics_.zero_();
+  attempt_values_.zero_();
+  control_.zero_();
+  contribution_ = 0;
+  if (!statistics_.defined() || statistics_.size(0) != static_cast<std::int64_t>(contributions))
+   statistics_ = torch::zeros({static_cast<std::int64_t>(contributions), static_cast<std::int64_t>(DetectionStatisticsPacket::size)}, device_values_.options());
+  else
+   statistics_.zero_();
  }
  void accumulate_empty() { ++contribution_; }
- void accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const TrainingScalarPacket::Tensors& scalars, const DetectionStatisticsPacket::Tensors& statistics) {
+ void accumulate(
+  const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const TrainingScalarPacket::Tensors& scalars, const DetectionStatisticsPacket::Tensors& statistics) {
   for (std::size_t i = 0; i < TrainingScalarPacket::size; ++i) scalar_sources_[i] = scalars[i].defined() ? scalars[i] : unavailable_;
   at::stack_out(scalar_values_, scalar_sources_);
   attempt_values_.narrow(0, 3, TrainingScalarPacket::size).add_(scalar_values_);
-  for (std::size_t i = 0; i < TrainingScalarPacket::size; ++i) if (scalars[i].defined()) attempt_values_.select(0, 3 + TrainingScalarPacket::size + i).fill_(1);
-  for (std::size_t i = 0; i < statistics.size(); ++i) if (statistics[i].defined()) statistics_.select(0, contribution_).select(0, i).copy_(statistics[i].detach());
+  for (std::size_t i = 0; i < TrainingScalarPacket::size; ++i)
+   if (scalars[i].defined()) attempt_values_.select(0, 3 + TrainingScalarPacket::size + i).fill_(1);
+  for (std::size_t i = 0; i < statistics.size(); ++i)
+   if (statistics[i].defined()) statistics_.select(0, contribution_).select(0, i).copy_(statistics[i].detach());
   ++contribution_;
   const auto detached_loss = loss.detach();
   const auto detached_class_loss = class_loss.detach();
@@ -105,10 +121,11 @@ public:
   device_values_.select(0, 7).zero_();
   return snapshot;
  }
- [[nodiscard]] double epoch_average() const {
-  return epoch_state_.microbatches ? epoch_state_.loss_sum / static_cast<double>(epoch_state_.microbatches) : 0.0;
+ [[nodiscard]] double epoch_average() const { return epoch_state_.microbatches ? epoch_state_.loss_sum / static_cast<double>(epoch_state_.microbatches) : 0.0; }
+ void begin_validation() {
+  check();
+  device_values_.select(0, 8).zero_();
  }
- void begin_validation() { check(); device_values_.select(0, 8).zero_(); }
  void accumulate_validation(const torch::Tensor& loss) { device_values_.select(0, 8).add_(loss.detach()); }
  [[nodiscard]] double validation_average(std::size_t count) {
   const auto* values = complete_values();
@@ -123,7 +140,10 @@ private:
    // host destination. A stream join alone never makes that storage reclaimable.
    work_.settle();
    return host_values_.data_ptr<float>();
-  } catch (...) { failure_ = cudaErrorUnknown; throw; }
+  } catch (...) {
+   failure_ = cudaErrorUnknown;
+   throw;
+  }
  }
  TrainingEpochMetricState epoch_state_;
  int device_id_ = 0;
@@ -139,21 +159,29 @@ private:
  cudaError_t failure_ = cudaSuccess;
 };
 TrainingMetricHandoff::TrainingMetricHandoff(int device_id) : impl_(std::make_shared<Impl>(device_id)) {
- try { impl_->initialize(); } catch (...) { retire(); throw; }
+ try {
+  impl_->initialize();
+ } catch (...) {
+  retire();
+  throw;
+ }
 }
 TrainingMetricHandoff::~TrainingMetricHandoff() { retire(); }
 void TrainingMetricHandoff::retire() noexcept {
  if (!impl_) return;
  const auto status = impl_->retire();
- if (status != cudaSuccess) std::move(terminal_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), status);
- else impl_.reset();
+ if (status != cudaSuccess)
+  std::move(terminal_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), status);
+ else
+  impl_.reset();
 }
 void TrainingMetricHandoff::reset_epoch() { impl_->reset_epoch(); }
 void TrainingMetricHandoff::restore_epoch(const TrainingEpochMetricState& state) { impl_->restore_epoch(state); }
 const TrainingEpochMetricState& TrainingMetricHandoff::state() const { return impl_->state(); }
 void TrainingMetricHandoff::begin_attempt(std::size_t contributions) { impl_->begin_attempt(contributions); }
 void TrainingMetricHandoff::accumulate_empty() { impl_->accumulate_empty(); }
-void TrainingMetricHandoff::accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const TrainingScalarPacket::Tensors& scalars, const DetectionStatisticsPacket::Tensors& statistics) {
+void TrainingMetricHandoff::accumulate(
+ const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const TrainingScalarPacket::Tensors& scalars, const DetectionStatisticsPacket::Tensors& statistics) {
  impl_->accumulate(loss, class_loss, box_loss, scalars, statistics);
 }
 TrainingMetricSnapshot TrainingMetricHandoff::complete_step(const torch::Tensor& found_inf, int64_t attempt_micro_batches, int64_t epoch_micro_batches, const DistributedContext& distributed) {

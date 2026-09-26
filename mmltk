@@ -2671,22 +2671,55 @@ run_benchmark_image_diagnostic() {
 run_process_diagnostic() {
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         printf '%s\n' \
-            'Usage: ./mmltk --diagnose-processes [WRAPPER_MODE]' \
+            'Usage: ./mmltk --diagnose-processes [WRAPPER_MODE] [--backtrace EXECUTABLE | --terminate EXECUTABLE | --read-file EXECUTABLE --file CONTAINER_PATH] [--pid CONTAINER_PID]' \
             'Read-only process snapshots for running wrapper containers owned by this repository.' \
             'Shows process names, elapsed/CPU time, CPU/memory use, state and wait channel; omits arguments and environment.' \
-            'Does not create, stop, attach to, or alter containers; each daemon query has a 15-second deadline.'
+            'Default snapshots do not alter containers; each daemon query has a 15-second deadline.' \
+            '--backtrace briefly attaches GDB to one exact native executable, prints thread stacks, and detaches.' \
+            '--read-file prints an escaped, bounded retained artifact from that process container; maximum 4 MiB.' \
+            '--pid selects one container PID when the exact executable has several workers.' \
+            '--terminate sends SIGTERM to that exact executable so a stuck test can fail and the suite can continue.'
         return 0
     fi
-    (( $# <= 1 )) || die "--diagnose-processes accepts at most one wrapper mode"
+    local process_mode="" process_action="" process_executable=""
+    local -a process_selector=()
+    if (( $# )) && [[ "$1" != --* ]]; then process_mode="$1"; shift; fi
+    if (( $# )); then
+        (( $# >= 2 )) || die "process action requires one executable name"
+        [[ "$1" == --backtrace || "$1" == --terminate || "$1" == --read-file ]] || die "unknown process diagnostic action '$1'"
+        process_action="$1"
+        process_executable="$2"
+        [[ "${process_executable}" =~ ^mmltk[_-][A-Za-z0-9_-]+$ ]] || die "expected an exact mmltk native executable name"
+        shift 2
+        while (( $# )); do
+            (( $# >= 2 )) || die "process diagnostic option requires a value"
+            case "$1" in
+                --pid) [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "expected a positive container PID" ;;
+                --file) [[ "${process_action}" == --read-file && "$2" == /* ]] || die "--file requires --read-file and an absolute container path" ;;
+                *) die "unknown process diagnostic option '$1'" ;;
+            esac
+            process_selector+=("$1" "$2")
+            shift 2
+        done
+    fi
     command -v docker >/dev/null 2>&1 || die "docker is not installed"
     local -a filters=(--filter label=com.mmltk.wrapper=1 --filter "label=com.mmltk.repo=${repo_root}")
-    if (( $# == 1 )); then filters+=(--filter "label=com.mmltk.mode=$1"); fi
+    if [[ -n "${process_mode}" ]]; then filters+=(--filter "label=com.mmltk.mode=${process_mode}"); fi
     local containers container
     containers="$(timeout --foreground --signal=KILL 15s docker ps "${filters[@]}" --format '{{.ID}}')" ||
         die "could not enumerate running wrapper containers"
     if [[ -z "${containers}" ]]; then
+        [[ -z "${process_action}" ]] || die "no running wrapper container for process action"
         printf '%s\n' 'No matching running wrapper containers.'
         return 0
+    fi
+    if [[ -n "${process_action}" ]]; then
+        [[ "${containers}" != *$'\n'* ]] || die "process action requires exactly one running wrapper container; select WRAPPER_MODE"
+        local -a process_exec_args=(exec --user "${uid}:${gid}")
+        if [[ "${process_action}" == --backtrace ]]; then process_exec_args=(exec --user 0 --privileged); fi
+        timeout --foreground --signal=KILL 45s docker "${process_exec_args[@]}" "${containers}" \
+            /usr/bin/python3 -I -B /workspace/tools/diagnose_native_process.py "${process_action}" "${process_executable}" "${process_selector[@]}"
+        return
     fi
     while IFS= read -r container; do
         timeout --foreground --signal=KILL 15s docker inspect \
@@ -2702,7 +2735,7 @@ run_native_symbols_diagnostic() {
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         printf '%s\n' \
             'Usage: ./mmltk --diagnose-native-symbols [--match REGEX] [--limit N] ARTIFACT...' \
-            'Inspect repository-relative .a/.o files with the existing development image GCC nm.' \
+            'Inspect repository-relative or installed /opt dependency .a/.o files with the existing development image GCC nm.' \
             'Read-only JSONL, no builds, pulls, network, or GPU execution; 120-second deadline.'
         return 0
     fi
@@ -2730,8 +2763,8 @@ run_native_symbols_diagnostic() {
 run_native_link_diagnostic() {
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         printf '%s\n' \
-            'Usage: ./mmltk --diagnose-native-link [--linker-directory DIR] [--trace-symbol SYMBOL] TARGET' \
-            'Repeat one cached Release link with saved LTO intermediates and a linker map.' \
+            'Usage: ./mmltk --diagnose-native-link [--graph release|analysis] [--no-save-temps] [--linker-directory DIR] [--trace-symbol SYMBOL] TARGET' \
+            'Repeat one cached native link with saved LTO intermediates and a linker map (default: release).' \
             'Uses the existing development image; repository remains read-only.' \
             'Artifacts go under build/diagnostics; no image builds, pulls, or network; 120-second deadline.'
         return 0
@@ -2753,6 +2786,7 @@ run_native_link_diagnostic() {
         --tmpfs /tmp:rw,nosuid,nodev,size=1g
         --volume "${repo_root}:/workspace:ro"
         --volume "${artifact_directory}:/diagnostic/output:rw"
+        --volume "${repo_root}:/host${repo_root}:ro"
         --entrypoint /usr/bin/timeout
     )
     append_wrapper_labels diagnostic_args "diagnose-native-link"

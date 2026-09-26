@@ -694,7 +694,8 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
  const auto order_seed = system.snapshot().order.shuffle_seed;
  const auto shuffled_order = system.snapshot().order.visible_indices;
  placeholder_count = audit.placeholder_count();
- const auto rerolled = system.Reroll();
+ controller::ExploreSnapshot rerolled;
+ REQUIRE_NOTHROW(rerolled = system.Reroll());
  REQUIRE(audit.Wait([&] {
   return !system.snapshot().busy && system.snapshot().revision > rerolled.revision && audit.placeholder_count() > placeholder_count &&
          audit.last_tile_generation() == audit.last_placeholder_generation() && audit.last_tile_cumulative() == 2U;

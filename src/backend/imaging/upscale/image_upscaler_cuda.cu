@@ -27,7 +27,7 @@ __global__ void prepare_tile_kernel(const std::uint8_t* source, const std::size_
  const auto* rgba = source + static_cast<std::size_t>(source_y) * source_pitch + static_cast<std::size_t>(source_x) * 4U;
 #pragma unroll
  for (std::uint32_t channel = 0U; channel < 3U; ++channel) {
-  const float byte = static_cast<float>(rgba[channel]);
+  const auto byte = static_cast<float>(rgba[channel]);
   // Retain NVCC's contracted multiply/subtract from the former normalization
   // kernel, the rounded division, and the restoration FMA. Replacing this
   // round trip with byte RGB changes decisions at LUT thresholds.
@@ -43,8 +43,8 @@ __global__ void stitch_tile_kernel(const float* output, const Tile tile, const b
  const std::uint64_t core_plane = static_cast<std::uint64_t>(core_output_width) * core_output_height;
  const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
  if (index >= core_plane) { return; }
- const std::uint32_t local_x = static_cast<std::uint32_t>(index % core_output_width);
- const std::uint32_t local_y = static_cast<std::uint32_t>(index / core_output_width);
+ const auto local_x = static_cast<std::uint32_t>(index % core_output_width);
+ const auto local_y = static_cast<std::uint32_t>(index / core_output_width);
  const std::uint32_t destination_x = tile.origin_x * 4U + local_x;
  const std::uint32_t destination_y = tile.origin_y * 4U + local_y;
  if (destination_x >= restored_width || destination_y >= restored_height) { return; }

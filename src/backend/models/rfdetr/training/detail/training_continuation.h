@@ -26,13 +26,13 @@ struct TrainingContinuationValues {
  double grad_scaler_scale = 1.0;
  int64_t grad_scaler_growth_tracker = 0;
  int64_t ema_completed_updates = 0;
- [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string training_attempt_id;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string training_original_descriptor;
- TrainingScheduleState schedule;
- TrainingEpochPolicyState epoch_policy;
- TrainingDataContinuation data;
- TrainingEpochMetricState epoch_metrics;
- ExecutionFacts execution;
+ [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string training_attempt_id{};
+ [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string training_original_descriptor{};
+ TrainingScheduleState schedule{};
+ TrainingEpochPolicyState epoch_policy{};
+ TrainingDataContinuation data{};
+ TrainingEpochMetricState epoch_metrics{};
+ ExecutionFacts execution{};
 };
 MMLTK_REFLECT_FIELDS(TrainingContinuationValues)
 struct TrainingContinuation {

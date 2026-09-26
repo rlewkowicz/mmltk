@@ -545,7 +545,10 @@ impl App {
                 }) {
                 Ok(schedule) => self.handle_settings_schedule(schedule),
                 Err(detail) => {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::SettingsUpdate, UiError::invalid(detail));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::SettingsUpdate,
+                        UiError::invalid(detail),
+                    );
                     Task::none()
                 }
             }

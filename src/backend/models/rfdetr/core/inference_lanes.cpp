@@ -12,7 +12,7 @@ namespace {
 void check(cudaError_t status, const char* operation) {
  if (status != cudaSuccess) throw runtime::CudaOperationError(status, operation);
 }
-}
+}  // namespace
 struct InferenceLanes::State final {
  struct Lane final {
   cudaStream_t stream = nullptr;
@@ -63,9 +63,12 @@ void InferenceLanes::RestrictCapacity(std::size_t capacity) {
  if (!capacity || capacity > state_->lanes.size() || state_->count || state_->closed) throw std::logic_error("invalid inference source capacity");
  while (state_->lanes.size() > capacity) {
   auto& lane = state_->lanes.back();
-  check(cudaEventDestroy(lane.source_read), "retire unused inference source event"); lane.source_read = nullptr;
-  check(cudaEventDestroy(lane.completed), "retire unused inference completion event"); lane.completed = nullptr;
-  check(cudaStreamDestroy(lane.stream), "retire unused inference lane"); lane.stream = nullptr;
+  check(cudaEventDestroy(lane.source_read), "retire unused inference source event");
+  lane.source_read = nullptr;
+  check(cudaEventDestroy(lane.completed), "retire unused inference completion event");
+  lane.completed = nullptr;
+  check(cudaStreamDestroy(lane.stream), "retire unused inference lane");
+  lane.stream = nullptr;
   state_->lanes.pop_back();
  }
 }
@@ -140,11 +143,12 @@ runtime::RuntimeStatus InferenceLanes::Close() noexcept {
    const auto selected = cudaSetDevice(state_->device);
    if (selected != cudaSuccess) return static_cast<runtime::RuntimeStatus>(selected);
    for (auto& lane : state_->lanes) {
-    for (auto* event : {&lane.source_read, &lane.completed}) if (*event) {
-     const auto status = cudaEventDestroy(*event);
-     if (status != cudaSuccess) return static_cast<runtime::RuntimeStatus>(status);
-     *event = nullptr;
-    }
+    for (auto* event : {&lane.source_read, &lane.completed})
+     if (*event) {
+      const auto status = cudaEventDestroy(*event);
+      if (status != cudaSuccess) return static_cast<runtime::RuntimeStatus>(status);
+      *event = nullptr;
+     }
     if (lane.stream) {
      const auto status = cudaStreamDestroy(lane.stream);
      if (status != cudaSuccess) return static_cast<runtime::RuntimeStatus>(status);
@@ -156,4 +160,4 @@ runtime::RuntimeStatus InferenceLanes::Close() noexcept {
   });
  } catch (...) { return static_cast<runtime::RuntimeStatus>(cudaErrorUnknown); }
 }
-}
+}  // namespace mmltk::backend::models::rfdetr

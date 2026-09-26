@@ -57,6 +57,7 @@ public:
  void accumulate(TensorMap terms);
  [[nodiscard]] std::string details(const std::vector<torch::Tensor>& parameters, const std::vector<std::string>& names) const;
  [[nodiscard]] std::runtime_error failure(const std::vector<torch::Tensor>& parameters, const std::vector<std::string>& names) const;
+
 private:
  std::vector<std::string> names_;
  std::vector<torch::Tensor> incoming_;
@@ -67,16 +68,17 @@ std::optional<mmltk::backend::ml::cuda::CudaEventPool::Lease> record_current_str
 void ensure_train_lane_model_supported(NativeRfDetrModel&, int);
 class TrainingLanes final {
 public:
- TrainingLanes(
-  const TrainRequest&, RuntimeContext&, mmltk::backend::data::DatasetLoader&, std::shared_ptr<NativeRfDetrModel>, const std::vector<std::string>&, int lane_count, std::size_t local_batch, const mmltk::frameworks::gpu::DeviceContext&, std::function<void(std::exception_ptr)> failure = {}, std::shared_ptr<mmltk::common::concurrency::WorkerPool> workers = {});
+ TrainingLanes(const TrainRequest&, RuntimeContext&, mmltk::backend::data::DatasetLoader&, std::shared_ptr<NativeRfDetrModel>, const std::vector<std::string>&, int lane_count, std::size_t local_batch,
+  const mmltk::frameworks::gpu::DeviceContext&, std::function<void(std::exception_ptr)> failure = {}, std::shared_ptr<mmltk::common::concurrency::WorkerPool> workers = {});
  ~TrainingLanes();
  TrainingLanes(const TrainingLanes&) = delete;
  TrainingLanes& operator=(const TrainingLanes&) = delete;
  // CLEANUP-IGNORE: This API declaration repeats its out-of-line definition's parameter types, not implementation.
  std::future<TrainLaneResult> enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
-  const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, std::size_t admitted_microbatches, double gradient_scale,
-  size_t parameter_version, const DetectionConfig& detection_config, const NativeRfDetrModel& model, int device_id, int image_height, int image_width, std::uint64_t seed, int epoch, int rank,
-  std::uint64_t augmentation_sequence, bool amp_enabled, at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<TrainingTargetCounts> normalizer, TrainingGradientReducer& reducer, std::size_t lane_index, std::span<const TrainingDonorDescriptor> donors);
+  const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, std::size_t admitted_microbatches, double gradient_scale, size_t parameter_version, const DetectionConfig& detection_config,
+  const NativeRfDetrModel& model, int device_id, int image_height, int image_width, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled,
+  at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<TrainingTargetCounts> normalizer, TrainingGradientReducer& reducer, std::size_t lane_index,
+  std::span<const TrainingDonorDescriptor> donors);
  void settle(TrainLaneResult&, int device_id);
  [[nodiscard]] std::vector<std::vector<torch::Tensor>> gradient_leaves() const;
  void reconfigure(NativeRfDetrModel&, const std::vector<std::string>& active_names, const GpuAugmentationConfig&, int batch_size, CompilationMode);

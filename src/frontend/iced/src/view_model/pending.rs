@@ -47,7 +47,9 @@ impl ApplicationModel {
             ));
         }
         let correlation = self.next_correlation;
-        let next = correlation.checked_add(1).ok_or_else(|| UiError::protocol("Request correlation exhausted"))?;
+        let next = correlation
+            .checked_add(1)
+            .ok_or_else(|| UiError::protocol("Request correlation exhausted"))?;
         let encoded = encode(correlation);
         if encoded.record.correlation != correlation || encoded.record.endpoint_id == 0 {
             return Err(UiError::protocol(
@@ -469,7 +471,11 @@ mod tests {
         );
         model.pending.clear();
         model.next_correlation = u64::MAX;
-        assert!(model.begin_intent(ApplicationIntentEndpoint::ValidationStart).is_err());
+        assert!(
+            model
+                .begin_intent(ApplicationIntentEndpoint::ValidationStart)
+                .is_err()
+        );
         assert_eq!(model.next_correlation, u64::MAX);
         assert!(model.pending.is_empty());
     }
@@ -631,36 +637,74 @@ impl ApplicationModel {
             use crate::application_codec::Value;
             std::mem::discriminant(value).hash(hash);
             match value {
-                Value::Null => {}, Value::Bool(value) => value.hash(hash),
-                Value::Signed(value) => value.hash(hash), Value::Unsigned(value) => value.hash(hash),
-                Value::Float(value) => value.to_bits().hash(hash), Value::Text(value) => value.hash(hash),
+                Value::Null => {}
+                Value::Bool(value) => value.hash(hash),
+                Value::Signed(value) => value.hash(hash),
+                Value::Unsigned(value) => value.hash(hash),
+                Value::Float(value) => value.to_bits().hash(hash),
+                Value::Text(value) => value.hash(hash),
                 Value::Bytes(value) => value.hash(hash),
-                Value::Array(values) => { values.len().hash(hash); for value in values { value_hash(value, hash); } },
-                Value::Object(values) => { values.len().hash(hash); for (key, value) in values { key.hash(hash); value_hash(value, hash); } },
+                Value::Array(values) => {
+                    values.len().hash(hash);
+                    for value in values {
+                        value_hash(value, hash);
+                    }
+                }
+                Value::Object(values) => {
+                    values.len().hash(hash);
+                    for (key, value) in values {
+                        key.hash(hash);
+                        value_hash(value, hash);
+                    }
+                }
             }
         }
         // A retired or impossible correlation needs no payload traversal. Recent
         // settled fingerprints still take precedence over the pending ledger.
-        let previous = self.settled_replies.iter().find(|(id, _)| *id == reply.correlation).map(|(_, fingerprint)| *fingerprint);
+        let previous = self
+            .settled_replies
+            .iter()
+            .find(|(id, _)| *id == reply.correlation)
+            .map(|(_, fingerprint)| *fingerprint);
         if previous.is_none() {
             if reply.correlation == 0 || reply.correlation >= self.next_correlation {
-                self.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol("IntentReply correlation was never issued"));
+                self.report_error(
+                    crate::view_model::notices::Origin::Protocol,
+                    UiError::protocol("IntentReply correlation was never issued"),
+                );
                 return false;
             }
-            if !self.pending.contains_key(&reply.correlation) { return false; }
+            if !self.pending.contains_key(&reply.correlation) {
+                return false;
+            }
         }
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         match &reply.result {
-            Ok(value) => { true.hash(&mut hash); value_hash(value, &mut hash); },
-            Err(error) => { false.hash(&mut hash); std::mem::discriminant(&error.category).hash(&mut hash); error.detail.hash(&mut hash); },
+            Ok(value) => {
+                true.hash(&mut hash);
+                value_hash(value, &mut hash);
+            }
+            Err(error) => {
+                false.hash(&mut hash);
+                std::mem::discriminant(&error.category).hash(&mut hash);
+                error.detail.hash(&mut hash);
+            }
         }
         let fingerprint = hash.finish();
         if let Some(previous) = previous {
-            if previous != fingerprint { self.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol("IntentReply replay changed its result")); }
+            if previous != fingerprint {
+                self.report_error(
+                    crate::view_model::notices::Origin::Protocol,
+                    UiError::protocol("IntentReply replay changed its result"),
+                );
+            }
             return false;
         }
-        if self.settled_replies.len() == MAX_PENDING_INTENTS { self.settled_replies.pop_front(); }
-        self.settled_replies.push_back((reply.correlation, fingerprint));
+        if self.settled_replies.len() == MAX_PENDING_INTENTS {
+            self.settled_replies.pop_front();
+        }
+        self.settled_replies
+            .push_back((reply.correlation, fingerprint));
         true
     }
 }

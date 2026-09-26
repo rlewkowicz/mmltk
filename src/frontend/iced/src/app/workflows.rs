@@ -8,22 +8,52 @@ impl App {
         }
         match crate::view::predict::output::settle_total(&self.model, self.settings.state_mut()) {
             Ok(schedule) => {
-                self.model.notices.clear_condition(crate::view_model::notices::Origin::PredictionTotal);
-                schedule.map_or_else(Task::none, |schedule| self.handle_settings_schedule(schedule))
+                self.model
+                    .notices
+                    .clear_condition(crate::view_model::notices::Origin::PredictionTotal);
+                schedule.map_or_else(Task::none, |schedule| {
+                    self.handle_settings_schedule(schedule)
+                })
             }
             Err(detail) => {
-                self.model.report_error(crate::view_model::notices::Origin::PredictionTotal, UiError::invalid(detail));
+                self.model.report_error(
+                    crate::view_model::notices::Origin::PredictionTotal,
+                    UiError::invalid(detail),
+                );
                 Task::none()
             }
         }
     }
 
     pub(super) fn on_workspace(&mut self, message: crate::view::router::Message) -> Task<Message> {
-        if let crate::view::router::Message::Annotation(crate::view::annotation::Message::ShortcutResolved { interaction_revision, .. }) = &message {
-            if *interaction_revision != self.interaction_revision || self.interaction_revision == u64::MAX || self.status.open || self.modal_active() { return Task::none(); }
+        if let crate::view::router::Message::Annotation(
+            crate::view::annotation::Message::ShortcutResolved {
+                interaction_revision,
+                ..
+            },
+        ) = &message
+        {
+            if *interaction_revision != self.interaction_revision
+                || self.interaction_revision == u64::MAX
+                || self.status.open
+                || self.modal_active()
+            {
+                return Task::none();
+            }
         }
-        if self.modal_active() && matches!(&message, crate::view::router::Message::Navigation(_)) { return Task::none(); }
-        if self.status.open && matches!(&message, crate::view::router::Message::Annotation(crate::view::annotation::Message::Shortcut(_))) { return Task::none(); }
+        if self.modal_active() && matches!(&message, crate::view::router::Message::Navigation(_)) {
+            return Task::none();
+        }
+        if self.status.open
+            && matches!(
+                &message,
+                crate::view::router::Message::Annotation(
+                    crate::view::annotation::Message::Shortcut(_)
+                )
+            )
+        {
+            return Task::none();
+        }
 
         let editor = match &message {
             crate::view::router::Message::Train(_) => FeatureId::Train,
@@ -42,22 +72,43 @@ impl App {
             Ok(Some(outcome)) => outcome,
             Ok(None) => return Task::none(),
             Err(detail) => {
-                self.model.report_error(crate::view_model::notices::Origin::Editor(editor), UiError::invalid(detail));
+                self.model.report_error(
+                    crate::view_model::notices::Origin::Editor(editor),
+                    UiError::invalid(detail),
+                );
                 return Task::none();
             }
         };
         // Typed edits establish recovery for their editor. Pointer movement,
         // navigation and unrelated action buttons do not acknowledge an editor.
-        if matches!(&outcome,
+        if matches!(
+            &outcome,
             crate::view::router::Outcome::Train(crate::view::train::Outcome::SettingsEdited(_))
-            | crate::view::router::Outcome::Validate(crate::view::validate::Outcome::SettingsEdited(_))
-            | crate::view::router::Outcome::Predict(crate::view::predict::Outcome::SettingsEdited(_))
-            | crate::view::router::Outcome::Live(crate::view::live::Outcome::SettingsEdited(_))
-            | crate::view::router::Outcome::Export(crate::view::export::Outcome::SettingsEdited(_))
-            | crate::view::router::Outcome::Explore(crate::view::explore::Outcome::SettingsEdited(_) | crate::view::explore::Outcome::FilterEdited(_) | crate::view::explore::Outcome::AugmentationUpdated(_) | crate::view::explore::Outcome::DetailUpdated(_) | crate::view::explore::Outcome::OverlayUpdated(_))
-            | crate::view::router::Outcome::Annotation(crate::view::annotation::Outcome::SettingsEdited(_) | crate::view::annotation::Outcome::EditRequested(_)))
-        {
-            self.model.notices.clear_condition(crate::view_model::notices::Origin::Editor(editor));
+                | crate::view::router::Outcome::Validate(
+                    crate::view::validate::Outcome::SettingsEdited(_)
+                )
+                | crate::view::router::Outcome::Predict(
+                    crate::view::predict::Outcome::SettingsEdited(_)
+                )
+                | crate::view::router::Outcome::Live(crate::view::live::Outcome::SettingsEdited(_))
+                | crate::view::router::Outcome::Export(
+                    crate::view::export::Outcome::SettingsEdited(_)
+                )
+                | crate::view::router::Outcome::Explore(
+                    crate::view::explore::Outcome::SettingsEdited(_)
+                        | crate::view::explore::Outcome::FilterEdited(_)
+                        | crate::view::explore::Outcome::AugmentationUpdated(_)
+                        | crate::view::explore::Outcome::DetailUpdated(_)
+                        | crate::view::explore::Outcome::OverlayUpdated(_)
+                )
+                | crate::view::router::Outcome::Annotation(
+                    crate::view::annotation::Outcome::SettingsEdited(_)
+                        | crate::view::annotation::Outcome::EditRequested(_)
+                )
+        ) {
+            self.model
+                .notices
+                .clear_condition(crate::view_model::notices::Origin::Editor(editor));
         }
         match outcome {
             crate::view::router::Outcome::FeatureSelected(feature) => {
@@ -366,9 +417,18 @@ impl App {
 
     pub(super) fn advance_start(&mut self) {
         self.advance_training_selection();
-        if self.model.workflow.pending_start.as_ref().is_some_and(|pending| {
-            matches!(pending.preparation, StartPreparation::Waiting | StartPreparation::ResumeQueued)
-        }) {
+        if self
+            .model
+            .workflow
+            .pending_start
+            .as_ref()
+            .is_some_and(|pending| {
+                matches!(
+                    pending.preparation,
+                    StartPreparation::Waiting | StartPreparation::ResumeQueued
+                )
+            })
+        {
             self.flush_settings_edits();
         }
         let Some(pending) = self.model.workflow.pending_start.as_ref() else {
@@ -612,7 +672,11 @@ impl App {
         }
     }
 
-    pub(super) fn guard_compute_start(&mut self, page: FeatureId, endpoint: ApplicationIntentEndpoint) -> bool {
+    pub(super) fn guard_compute_start(
+        &mut self,
+        page: FeatureId,
+        endpoint: ApplicationIntentEndpoint,
+    ) -> bool {
         self.model.begin_admission(endpoint);
         let available = !self.settings.has_local_edits()
             && self
@@ -620,7 +684,8 @@ impl App {
                 .draft()
                 .is_some_and(|draft| self.model.compute_start_available(draft, page));
         if !available {
-            self.model.report_admission_error(endpoint,
+            self.model.report_admission_error(
+                endpoint,
                 if self.settings.has_local_edits()
                     || self.model.native_settings_unsettled()
                     || self.model.model_request_pending()
@@ -641,7 +706,11 @@ impl App {
         available
     }
 
-    pub(super) fn guard_compute_stop(&mut self, page: FeatureId, endpoint: ApplicationIntentEndpoint) -> bool {
+    pub(super) fn guard_compute_stop(
+        &mut self,
+        page: FeatureId,
+        endpoint: ApplicationIntentEndpoint,
+    ) -> bool {
         self.model.begin_admission(endpoint);
         if self
             .model
@@ -662,30 +731,36 @@ impl App {
             FeatureId::Live | FeatureId::Annotate | FeatureId::Explore => false,
         };
         if !available {
-            self.model.report_admission_error(endpoint, UiError::busy(
-                "The operation is inactive or already changing state.",
-            ));
+            self.model.report_admission_error(
+                endpoint,
+                UiError::busy("The operation is inactive or already changing state."),
+            );
             return false;
         }
         true
     }
 
     pub(super) fn request_model(&mut self, page: FeatureId) {
-        self.model.begin_admission(ApplicationIntentEndpoint::ModelSelect);
+        self.model
+            .begin_admission(ApplicationIntentEndpoint::ModelSelect);
         if self.settings.has_local_edits()
             || !self
                 .settings
                 .draft()
                 .is_some_and(|draft| self.model.model_selection_available(draft, page))
         {
-            self.model.report_admission_error(ApplicationIntentEndpoint::ModelSelect, UiError::busy(
-                "Wait for settings and model activity to finish.",
-            ));
+            self.model.report_admission_error(
+                ApplicationIntentEndpoint::ModelSelect,
+                UiError::busy("Wait for settings and model activity to finish."),
+            );
             return;
         }
         let workflow = page;
         let Some(receipt) = self.model.workflow.model_selection_receipt(workflow) else {
-            self.model.report_admission_error(ApplicationIntentEndpoint::ModelSelect, UiError::invalid("Settings are not installed yet."));
+            self.model.report_admission_error(
+                ApplicationIntentEndpoint::ModelSelect,
+                UiError::invalid("Settings are not installed yet."),
+            );
             return;
         };
         self.submit_model_select_intent(receipt, move |correlation| {
@@ -722,7 +797,9 @@ impl App {
     ) -> Task<Message> {
         match outcome {
             crate::view::workflow::model_card::Outcome::ArtifactConfirmed(schedule) => {
-                self.model.notices.clear_condition(crate::view_model::notices::Origin::Editor(workflow));
+                self.model
+                    .notices
+                    .clear_condition(crate::view_model::notices::Origin::Editor(workflow));
                 if workflow == FeatureId::Train {
                     if self
                         .model
@@ -740,7 +817,9 @@ impl App {
                 task
             }
             crate::view::workflow::model_card::Outcome::SettingsEdited(schedule) => {
-                self.model.notices.clear_condition(crate::view_model::notices::Origin::Editor(workflow));
+                self.model
+                    .notices
+                    .clear_condition(crate::view_model::notices::Origin::Editor(workflow));
                 self.handle_settings_schedule(schedule)
             }
             crate::view::workflow::model_card::Outcome::BrowseRequested(target) => {
@@ -773,7 +852,10 @@ impl App {
                         return match schedule {
                             Ok(schedule) => self.handle_settings_schedule(schedule),
                             Err(error) => {
-                                self.model.report_admission_error(ApplicationIntentEndpoint::SettingsUpdate, UiError::invalid(error));
+                                self.model.report_admission_error(
+                                    ApplicationIntentEndpoint::SettingsUpdate,
+                                    UiError::invalid(error),
+                                );
                                 Task::none()
                             }
                         };
@@ -808,11 +890,13 @@ impl App {
             }
 
             crate::view::train::Outcome::CompileRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::DatasetCompile);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::DatasetCompile);
                 if self.settings.has_local_edits() || !self.model.dataset_compile_available() {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::DatasetCompile, UiError::busy(
-                        "Dataset compilation is unavailable or already active.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::DatasetCompile,
+                        UiError::busy("Dataset compilation is unavailable or already active."),
+                    );
                 } else {
                     self.submit_intent(ApplicationIntentEndpoint::DatasetCompile, |correlation| {
                         crate::generated::encode_dataset_Compile(correlation, Train {})
@@ -826,20 +910,24 @@ impl App {
                 self.request_start(FeatureId::Train);
             }
             crate::view::train::Outcome::DatasetStopRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::DatasetStop);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::DatasetStop);
                 if self.model.dataset_stop_available() {
                     self.submit_intent(
                         ApplicationIntentEndpoint::DatasetStop,
                         crate::generated::encode_dataset_Stop,
                     );
                 } else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::DatasetStop, UiError::busy(
-                        "Dataset compilation is inactive or already changing state.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::DatasetStop,
+                        UiError::busy("Dataset compilation is inactive or already changing state."),
+                    );
                 }
             }
             crate::view::train::Outcome::TrainingStopRequested => {
-                if self.guard_compute_stop(FeatureId::Train, ApplicationIntentEndpoint::TrainingStop) {
+                if self
+                    .guard_compute_stop(FeatureId::Train, ApplicationIntentEndpoint::TrainingStop)
+                {
                     self.submit_intent(ApplicationIntentEndpoint::TrainingStop, |correlation| {
                         crate::generated::encode_training_Stop(correlation, Train {})
                     });
@@ -850,7 +938,8 @@ impl App {
                 return self.handle_settings_schedule(schedule);
             }
             crate::view::train::Outcome::QueryOffersRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::TrainingQuery);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::TrainingQuery);
                 if !self.settings_unsettled() && self.model.provider_query_available() {
                     self.submit_intent(ApplicationIntentEndpoint::TrainingQuery, |correlation| {
                         crate::generated::encode_training_Query(
@@ -859,11 +948,15 @@ impl App {
                         )
                     });
                 } else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::TrainingQuery, UiError::busy("Provider query is unavailable."));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::TrainingQuery,
+                        UiError::busy("Provider query is unavailable."),
+                    );
                 }
             }
             crate::view::train::Outcome::ClearOffersRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::TrainingClear);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::TrainingClear);
                 if self.model.provider_clear_available() {
                     self.submit_intent(ApplicationIntentEndpoint::TrainingClear, |correlation| {
                         crate::generated::encode_training_Clear(
@@ -872,16 +965,20 @@ impl App {
                         )
                     });
                 } else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::TrainingClear, UiError::busy(
-                        "Provider offers are unavailable or cancellation is already requested.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::TrainingClear,
+                        UiError::busy(
+                            "Provider offers are unavailable or cancellation is already requested.",
+                        ),
+                    );
                 }
             }
             crate::view::train::Outcome::OfferSelected(offer) => {
                 self.select_provider_offer(offer);
             }
             crate::view::train::Outcome::StartRemoteRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::TrainingStartRemote);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::TrainingStartRemote);
                 if !self.settings.has_local_edits() && self.model.remote_start_available() {
                     self.submit_intent(
                         ApplicationIntentEndpoint::TrainingStartRemote,
@@ -893,11 +990,15 @@ impl App {
                         },
                     );
                 } else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::TrainingStartRemote, UiError::busy("Remote start is unavailable."));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::TrainingStartRemote,
+                        UiError::busy("Remote start is unavailable."),
+                    );
                 }
             }
             crate::view::train::Outcome::StopRemoteRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::TrainingStopRemote);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::TrainingStopRemote);
                 if self.model.remote_stop_available() {
                     self.submit_intent(
                         ApplicationIntentEndpoint::TrainingStopRemote,
@@ -909,18 +1010,25 @@ impl App {
                         },
                     );
                 } else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::TrainingStopRemote, UiError::busy("Remote stop is unavailable."));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::TrainingStopRemote,
+                        UiError::busy("Remote stop is unavailable."),
+                    );
                 }
             }
             crate::view::train::Outcome::RetryReconciliationRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::TrainingRetryReconciliation);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::TrainingRetryReconciliation);
                 if self.model.remote_retry_available() {
                     self.submit_intent(
                         ApplicationIntentEndpoint::TrainingRetryReconciliation,
                         crate::generated::encode_training_RetryReconciliation,
                     );
                 } else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::TrainingRetryReconciliation, UiError::busy("Remote reconciliation is unavailable."));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::TrainingRetryReconciliation,
+                        UiError::busy("Remote reconciliation is unavailable."),
+                    );
                 }
             }
         }
@@ -931,11 +1039,13 @@ impl App {
         &mut self,
         identity: crate::generated::ProviderOfferIdentity,
     ) {
-        self.model.begin_admission(ApplicationIntentEndpoint::TrainingSelect);
+        self.model
+            .begin_admission(ApplicationIntentEndpoint::TrainingSelect);
         if self.settings.has_local_edits() || !self.model.provider_select_available(&identity) {
-            self.model.report_admission_error(ApplicationIntentEndpoint::TrainingSelect, UiError::invalid(
-                "The selected provider offer is no longer available.",
-            ));
+            self.model.report_admission_error(
+                ApplicationIntentEndpoint::TrainingSelect,
+                UiError::invalid("The selected provider offer is no longer available."),
+            );
             return;
         }
         self.submit_intent(
@@ -1011,7 +1121,10 @@ impl App {
                 self.request_start(FeatureId::Validate);
             }
             crate::view::validate::Outcome::StopRequested => {
-                if self.guard_compute_stop(FeatureId::Validate, ApplicationIntentEndpoint::ValidationStop) {
+                if self.guard_compute_stop(
+                    FeatureId::Validate,
+                    ApplicationIntentEndpoint::ValidationStop,
+                ) {
                     self.submit_intent(
                         ApplicationIntentEndpoint::ValidationStop,
                         crate::generated::encode_validation_Stop,
@@ -1044,7 +1157,9 @@ impl App {
                 self.request_start(FeatureId::Predict);
             }
             crate::view::predict::Outcome::StopRequested => {
-                if self.guard_compute_stop(FeatureId::Predict, ApplicationIntentEndpoint::PredictStop) {
+                if self
+                    .guard_compute_stop(FeatureId::Predict, ApplicationIntentEndpoint::PredictStop)
+                {
                     self.submit_intent(ApplicationIntentEndpoint::PredictStop, |correlation| {
                         crate::generated::encode_predict_Stop(
                             correlation,
@@ -1082,11 +1197,13 @@ impl App {
     pub(super) fn on_live(&mut self, outcome: crate::view::live::Outcome) -> Task<Message> {
         match outcome {
             crate::view::live::Outcome::StartRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::LiveStart);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::LiveStart);
                 if self.settings.has_local_edits() || !self.model.live_start_available() {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::LiveStart, UiError::busy(
-                        "Live is unavailable or already changing state.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::LiveStart,
+                        UiError::busy("Live is unavailable or already changing state."),
+                    );
                     return Task::none();
                 }
                 let extent = VisualExtent {
@@ -1096,9 +1213,10 @@ impl App {
                 let Ok(frames_per_second) =
                     crate::generated::default_request_liveStartframespersecond()
                 else {
-                    self.model.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol(
-                        "The generated Live frame-rate default is unavailable.",
-                    ));
+                    self.model.report_error(
+                        crate::view_model::notices::Origin::Protocol,
+                        UiError::protocol("The generated Live frame-rate default is unavailable."),
+                    );
                     return Task::none();
                 };
                 self.submit_intent(ApplicationIntentEndpoint::LiveStart, move |correlation| {
@@ -1112,14 +1230,18 @@ impl App {
                 });
             }
             crate::view::live::Outcome::StopRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::LiveStop);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::LiveStop);
                 if self.model.live_stop_available() {
                     self.submit_intent(
                         ApplicationIntentEndpoint::LiveStop,
                         crate::generated::encode_live_Stop,
                     );
                 } else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::LiveStop, UiError::busy("Live is inactive or already changing state."));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::LiveStop,
+                        UiError::busy("Live is inactive or already changing state."),
+                    );
                 }
             }
             crate::view::live::Outcome::SettingsEdited(schedule) => {
@@ -1132,7 +1254,10 @@ impl App {
     pub(super) fn on_export(&mut self, outcome: crate::view::export::Outcome) -> Task<Message> {
         match outcome {
             crate::view::export::Outcome::StartRequested => {
-                if self.guard_compute_start(FeatureId::Export, ApplicationIntentEndpoint::ExportSystemStart) {
+                if self.guard_compute_start(
+                    FeatureId::Export,
+                    ApplicationIntentEndpoint::ExportSystemStart,
+                ) {
                     self.submit_intent(
                         ApplicationIntentEndpoint::ExportSystemStart,
                         |correlation| {
@@ -1145,7 +1270,10 @@ impl App {
                 }
             }
             crate::view::export::Outcome::StopRequested => {
-                if self.guard_compute_stop(FeatureId::Export, ApplicationIntentEndpoint::ExportSystemStop) {
+                if self.guard_compute_stop(
+                    FeatureId::Export,
+                    ApplicationIntentEndpoint::ExportSystemStop,
+                ) {
                     self.submit_intent(
                         ApplicationIntentEndpoint::ExportSystemStop,
                         crate::generated::encode_exportsystem_Stop,
@@ -1667,7 +1795,7 @@ mod tests {
             app.advance_start();
             assert!(matches!(
                 app.model.workflow.train_continuation.capability,
-                crate::view_model::CheckpointCapability::Failed(_)
+                crate::view_model::CheckpointCapability::Failed
             ));
             assert!(
                 !app.model
@@ -1689,7 +1817,7 @@ mod tests {
             app.model.workflow.train_continuation.mode_chosen = true;
             if failed {
                 app.model.workflow.train_continuation.capability =
-                    crate::view_model::CheckpointCapability::Failed("old failure".into());
+                    crate::view_model::CheckpointCapability::Failed;
             }
             // Ordinary updates preserve the chosen mode and do no archive work.
             let mut unrelated = app.model.settings_snapshot.clone().unwrap();
@@ -1771,7 +1899,7 @@ mod tests {
             } else {
                 assert!(matches!(
                     app.model.workflow.train_continuation.capability,
-                    crate::view_model::CheckpointCapability::Failed(_)
+                    crate::view_model::CheckpointCapability::Failed
                 ));
             }
             app.model.workflow.train_continuation = Default::default();
@@ -2085,19 +2213,34 @@ mod tests {
                 app.workspace.select(feature);
                 let mut first = None;
                 if earlier_update {
-                    app.settings.state_mut().edit(EditCadence::Debounced, |draft| {
-                        crate::generated::edit_uidarkmode(draft, true)
-                    }).unwrap();
+                    app.settings
+                        .state_mut()
+                        .edit(EditCadence::Debounced, |draft| {
+                            crate::generated::edit_uidarkmode(draft, true)
+                        })
+                        .unwrap();
                     app.flush_settings_edits();
                     let saved = app.settings.draft().unwrap().clone();
-                    first = Some((next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate), saved));
+                    first = Some((
+                        next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate),
+                        saved,
+                    ));
                 }
-                app.settings.state_mut().edit(EditCadence::Debounced, |draft| match feature {
-                    FeatureId::Train => crate::generated::edit_workflowstrainrequestlanes(draft, 3),
-                    FeatureId::Validate => crate::generated::edit_workflowsvalidaterequestbatchsize(draft, 4),
-                    FeatureId::Predict => crate::generated::edit_workflowspredictrequestlanes(draft, 3),
-                    _ => unreachable!(),
-                }).unwrap();
+                app.settings
+                    .state_mut()
+                    .edit(EditCadence::Debounced, |draft| match feature {
+                        FeatureId::Train => {
+                            crate::generated::edit_workflowstrainrequestlanes(draft, 3)
+                        }
+                        FeatureId::Validate => {
+                            crate::generated::edit_workflowsvalidaterequestbatchsize(draft, 4)
+                        }
+                        FeatureId::Predict => {
+                            crate::generated::edit_workflowspredictrequestlanes(draft, 3)
+                        }
+                        _ => unreachable!(),
+                    })
+                    .unwrap();
                 let expected = app.settings.draft().unwrap().clone();
                 app.request_start(feature);
                 assert!(app.model.primary_action_active(feature));
@@ -2113,8 +2256,15 @@ mod tests {
                     app.model.project_settings_snapshot(saved.clone()).unwrap();
                     app.advance_start();
                     assert!(capture.try_recv().is_err());
-                    app.model.reduce_reply(intent.correlation, Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)));
-                    app.settle_settings_reply(Some(ApplicationIntentEndpoint::SettingsUpdate), true, false);
+                    app.model.reduce_reply(
+                        intent.correlation,
+                        Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)),
+                    );
+                    app.settle_settings_reply(
+                        Some(ApplicationIntentEndpoint::SettingsUpdate),
+                        true,
+                        false,
+                    );
                 }
                 let update = next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate);
                 let mut saved = app.model.settings_snapshot.clone().unwrap();
@@ -2125,12 +2275,23 @@ mod tests {
                 app.advance_start();
                 assert!(app.settings.state().update_in_flight());
                 assert!(capture.try_recv().is_err());
-                app.model.reduce_reply(update.correlation, Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)));
-                app.settle_settings_reply(Some(ApplicationIntentEndpoint::SettingsUpdate), true, false);
+                app.model.reduce_reply(
+                    update.correlation,
+                    Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)),
+                );
+                app.settle_settings_reply(
+                    Some(ApplicationIntentEndpoint::SettingsUpdate),
+                    true,
+                    false,
+                );
                 app.advance_start();
                 let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
-                let accepted = accepted_model_for(&app.model, app.settings.draft().unwrap(), feature);
-                app.model.reduce_reply(select.correlation, Ok(crate::generated::ApplicationReply::ModelSelect(accepted)));
+                let accepted =
+                    accepted_model_for(&app.model, app.settings.draft().unwrap(), feature);
+                app.model.reduce_reply(
+                    select.correlation,
+                    Ok(crate::generated::ApplicationReply::ModelSelect(accepted)),
+                );
                 app.advance_start();
                 let endpoint = match feature {
                     FeatureId::Train => ApplicationIntentEndpoint::TrainingStart,
@@ -2148,12 +2309,18 @@ mod tests {
 
     #[test]
     fn queued_training_preflight_resumes_submission_after_history_settlement() {
-        for endpoint in [ApplicationIntentEndpoint::TrainingOpenRun, ApplicationIntentEndpoint::TrainingHistory] {
+        for endpoint in [
+            ApplicationIntentEndpoint::TrainingOpenRun,
+            ApplicationIntentEndpoint::TrainingHistory,
+        ] {
             let (mut app, mut capture) = start_app();
             let history = app.model.begin_intent(endpoint).unwrap();
-            app.settings.state_mut().edit(EditCadence::Debounced, |draft| {
-                crate::generated::edit_workflowstrainrequestlanes(draft, 3)
-            }).unwrap();
+            app.settings
+                .state_mut()
+                .edit(EditCadence::Debounced, |draft| {
+                    crate::generated::edit_workflowstrainrequestlanes(draft, 3)
+                })
+                .unwrap();
             app.request_start(FeatureId::Train);
             assert!(app.model.primary_action_active(FeatureId::Train));
             assert!(capture.try_recv().is_err());
@@ -2167,17 +2334,94 @@ mod tests {
     }
 
     #[test]
+    fn inspection_settlement_retries_requested_flushes_without_bypassing_debounce() {
+        use crate::application_codec::IntoApplicationValue;
+        for cadence in [EditCadence::Immediate, EditCadence::Debounced] {
+            for failed in [false, true] {
+                let (mut app, mut capture) = start_app();
+                let mut authoritative = app.model.settings_snapshot.clone().unwrap();
+                authoritative
+                    .settingsstate
+                    .workflows
+                    .train
+                    .request
+                    .weightspath
+                    .clear();
+                app.settings.install(&authoritative);
+                app.model.settings_snapshot = Some(authoritative);
+                let correlation = app
+                    .model
+                    .begin_intent(ApplicationIntentEndpoint::TrainingInspectCheckpoint)
+                    .unwrap();
+                let schedule = app
+                    .settings
+                    .state_mut()
+                    .edit(cadence, |draft| {
+                        crate::generated::edit_workflowstrainrequestdeviceids(draft, vec![1])
+                    })
+                    .unwrap();
+                drop(app.handle_settings_schedule(schedule));
+                assert!(capture.try_recv().is_err());
+                assert_eq!(
+                    app.settings.state().has_deferred_flush(),
+                    cadence == EditCadence::Immediate
+                );
+                let inspection = app
+                    .model
+                    .workflow
+                    .training
+                    .as_ref()
+                    .unwrap()
+                    .inspection
+                    .clone();
+                let reply = IntentReply {
+                    correlation,
+                    result: if failed {
+                        Err(crate::protocol::ApplicationError {
+                            category: crate::generated::ApplicationErrorCategory::Failed,
+                            detail: "checkpoint inspection failed".into(),
+                        })
+                    } else {
+                        Ok(inspection.into_application_transport_value())
+                    },
+                };
+                drop(app.on_transport(TransportEvent::IntentReply(reply.clone())));
+                if cadence == EditCadence::Immediate {
+                    next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate);
+                    assert!(app.settings.state().update_in_flight());
+                    assert!(!app.settings.state().has_deferred_flush());
+                } else {
+                    assert!(!app.settings.state().update_in_flight());
+                }
+                assert!(capture.try_recv().is_err());
+                drop(app.on_transport(TransportEvent::IntentReply(reply)));
+                assert!(capture.try_recv().is_err());
+                assert!(app.model.workflow.pending_start.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn cancelled_or_disconnected_preflight_never_launches_after_settings_settle() {
         for feature in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict] {
             for disconnect in [false, true] {
                 let (mut app, mut capture) = start_app();
                 app.workspace.select(feature);
-                app.settings.state_mut().edit(EditCadence::Debounced, |draft| match feature {
-                    FeatureId::Train => crate::generated::edit_workflowstrainrequestbatchsize(draft, 3),
-                    FeatureId::Validate => crate::generated::edit_workflowsvalidaterequestlanes(draft, 3),
-                    FeatureId::Predict => crate::generated::edit_workflowspredictrequestlanes(draft, 3),
-                    _ => unreachable!(),
-                }).unwrap();
+                app.settings
+                    .state_mut()
+                    .edit(EditCadence::Debounced, |draft| match feature {
+                        FeatureId::Train => {
+                            crate::generated::edit_workflowstrainrequestbatchsize(draft, 3)
+                        }
+                        FeatureId::Validate => {
+                            crate::generated::edit_workflowsvalidaterequestlanes(draft, 3)
+                        }
+                        FeatureId::Predict => {
+                            crate::generated::edit_workflowspredictrequestlanes(draft, 3)
+                        }
+                        _ => unreachable!(),
+                    })
+                    .unwrap();
                 app.request_start(feature);
                 let intent = next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate);
                 let mut saved = app.model.settings_snapshot.clone().unwrap();
@@ -2194,8 +2438,15 @@ mod tests {
                         _ => unreachable!(),
                     };
                     assert!(!app.guard_compute_stop(feature, stop));
-                    app.model.reduce_reply(intent.correlation, Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)));
-                    app.settle_settings_reply(Some(ApplicationIntentEndpoint::SettingsUpdate), true, false);
+                    app.model.reduce_reply(
+                        intent.correlation,
+                        Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)),
+                    );
+                    app.settle_settings_reply(
+                        Some(ApplicationIntentEndpoint::SettingsUpdate),
+                        true,
+                        false,
+                    );
                 }
                 app.advance_start();
                 assert!(app.model.workflow.pending_start.is_none());
@@ -2299,7 +2550,14 @@ mod tests {
 
     #[test]
     fn owned_preparation_receives_one_stop_before_or_after_select_admission() {
-        for (feature, stop_endpoint) in [(FeatureId::Train, ApplicationIntentEndpoint::TrainingStop), (FeatureId::Validate, ApplicationIntentEndpoint::ValidationStop), (FeatureId::Predict, ApplicationIntentEndpoint::PredictStop)] {
+        for (feature, stop_endpoint) in [
+            (FeatureId::Train, ApplicationIntentEndpoint::TrainingStop),
+            (
+                FeatureId::Validate,
+                ApplicationIntentEndpoint::ValidationStop,
+            ),
+            (FeatureId::Predict, ApplicationIntentEndpoint::PredictStop),
+        ] {
             for stop_before_reply in [true, false] {
                 let (mut app, mut capture) = start_app();
                 app.workspace.select(feature);
@@ -2367,12 +2625,16 @@ mod tests {
             app.request_start(FeatureId::Train);
             let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
             let active = active_preparation(&app, FeatureId::Train);
-            assert!(!app.guard_compute_stop(FeatureId::Train, ApplicationIntentEndpoint::TrainingStop));
+            assert!(
+                !app.guard_compute_stop(FeatureId::Train, ApplicationIntentEndpoint::TrainingStop)
+            );
             let mut terminal = active.clone();
             terminal.active = false;
             terminal.terminal.outcome = outcome;
             model_event(&mut app, terminal);
-            assert!(!app.guard_compute_stop(FeatureId::Train, ApplicationIntentEndpoint::TrainingStop));
+            assert!(
+                !app.guard_compute_stop(FeatureId::Train, ApplicationIntentEndpoint::TrainingStop)
+            );
             assert!(capture.try_recv().is_err());
             app.model.reduce_reply(
                 select.correlation,
@@ -2486,7 +2748,12 @@ mod tests {
             }
             app.connection = None;
             if endpoint == ApplicationIntentEndpoint::ModelStop {
-                assert!(!app.guard_compute_stop(FeatureId::Train, ApplicationIntentEndpoint::TrainingStop));
+                assert!(
+                    !app.guard_compute_stop(
+                        FeatureId::Train,
+                        ApplicationIntentEndpoint::TrainingStop
+                    )
+                );
             } else {
                 app.request_start(FeatureId::Train);
             }

@@ -6,7 +6,8 @@ TrainingSourceCatalog training_source_catalog(const TrainRequest& request) {
  TrainingSourceCatalog result;
  const auto weights = request.use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;
  const auto& configuration = request.lane_configuration;
- if (configuration.mode == TrainLaneMode::SharedGradients) result.available.push_back({TrainingRecordScope::Model, 0, weights});
+ if (configuration.mode == TrainLaneMode::SharedGradients)
+  result.available.push_back({TrainingRecordScope::Model, 0, weights});
  else {
   if (configuration.mode == TrainLaneMode::PeriodicAveraging) result.available.push_back({TrainingRecordScope::SynchronizedSession, 0, EvaluatedWeights::Ordinary});
   for (const auto& model : configuration.models) result.available.push_back({TrainingRecordScope::Model, model.model_id, weights});
@@ -20,25 +21,24 @@ TrainingSourceCatalog training_source_catalog(const TrainRequest& request) {
  }
  return result;
 }
-TrainingMetricSource training_metric_source(const TrainingRecord& record) noexcept {
- return {record.progress.scope, record.progress.model_id, record.evaluated_weights};
-}
+TrainingMetricSource training_metric_source(const TrainingRecord& record) noexcept { return {record.progress.scope, record.progress.model_id, record.evaluated_weights}; }
 namespace {
-void require(bool valid) { if (!valid) throw std::invalid_argument("invalid retained training sources"); }
+void require(bool valid) {
+ if (!valid) throw std::invalid_argument("invalid retained training sources");
+}
 void validate_observation(const TrainingRecord& observation, const TrainingRecord& current, const TrainingSourceCatalog& catalog) {
  const auto& progress = observation.progress;
- require(observation.format_version == kTrainingRunFormat && observation.run_id == current.run_id && observation.attempt_id == current.attempt_id &&
-         observation.sequence <= current.sequence && observation.role == TrainingRecordRole::Epoch && progress.phase == TrainingPhase::EpochComplete &&
-         !observation.attempt_configuration && !progress.failure && !progress.test && progress.artifact && progress.val &&
-         progress.session_id == current.progress.session_id && progress.epoch >= 0 && (current.role == TrainingRecordRole::Terminal || progress.epoch <= current.progress.epoch));
+ require(observation.format_version == kTrainingRunFormat && observation.run_id == current.run_id && observation.attempt_id == current.attempt_id && observation.sequence <= current.sequence &&
+         observation.role == TrainingRecordRole::Epoch && progress.phase == TrainingPhase::EpochComplete && !observation.attempt_configuration && !progress.failure && !progress.test &&
+         progress.artifact && progress.val && progress.session_id == current.progress.session_id && progress.epoch >= 0 &&
+         (current.role == TrainingRecordRole::Terminal || progress.epoch <= current.progress.epoch));
  require(std::ranges::find(catalog.available, training_metric_source(observation)) != catalog.available.end());
  const auto& artifact = *progress.artifact;
  require(artifact.weights == observation.evaluated_weights && artifact.session_id == progress.session_id && artifact.epoch == static_cast<std::uint64_t>(progress.epoch) &&
-         (!artifact.evaluation || artifact.evaluation == progress.val) &&
-         (progress.scope != TrainingRecordScope::Model || artifact.model_id == progress.model_id) &&
+         (!artifact.evaluation || artifact.evaluation == progress.val) && (progress.scope != TrainingRecordScope::Model || artifact.model_id == progress.model_id) &&
          (progress.scope != TrainingRecordScope::SynchronizedSession || (progress.model_id == 0 && artifact.weights == EvaluatedWeights::Ordinary)));
 }
-}
+}  // namespace
 void validate_training_sources(const TrainingSources& sources, const TrainingRecord& current) {
  require(sources.catalog.available.size() <= kTrainingSourceCapacity && sources.observations.size() <= sources.catalog.available.size() && sources.failures.size() <= kMaximumTrainingModels + 1);
  require(sources.catalog.available.empty() == !sources.catalog.default_source);
@@ -58,7 +58,8 @@ void validate_training_sources(const TrainingSources& sources, const TrainingRec
  for (std::size_t index = 0; index < sources.failures.size(); ++index) {
   const auto& failure = sources.failures[index];
   require(failure.session_id == current.progress.session_id && failure.first_cause != 0 && !failure.detail.empty());
-  require(failure.model_id == 0 || std::ranges::any_of(sources.catalog.available, [&](const auto& source) { return source.scope == TrainingRecordScope::Model && source.model_id == failure.model_id; }));
+  require(
+   failure.model_id == 0 || std::ranges::any_of(sources.catalog.available, [&](const auto& source) { return source.scope == TrainingRecordScope::Model && source.model_id == failure.model_id; }));
   for (std::size_t prior = 0; prior < index; ++prior) require(sources.failures[prior].model_id != failure.model_id);
  }
  require(sources.distributions.size() <= kMaximumTrainingModels);
@@ -76,13 +77,10 @@ void validate_training_sources(const TrainingSources& sources, const TrainingRec
 }
 void validate_training_progress_document(const TrainingProgressDocument& document, const TrainingSourceCatalog& catalog) {
  const auto& current = document.record;
- require(document.format_version == kTrainingRunFormat && current.format_version == kTrainingRunFormat &&
-         !current.run_id.empty() && !current.attempt_id.empty() && current.progress.session_id == current.run_id && document.sources.catalog == catalog);
+ require(document.format_version == kTrainingRunFormat && current.format_version == kTrainingRunFormat && !current.run_id.empty() && !current.attempt_id.empty() &&
+         current.progress.session_id == current.run_id && document.sources.catalog == catalog);
  validate_training_sources(document.sources, current);
- if (document.final) {
-  require(current.role == TrainingRecordRole::Terminal && current.progress.phase == TrainingPhase::Completed &&
-          document.final->selected == document.sources.selected);
- }
+ if (document.final) { require(current.role == TrainingRecordRole::Terminal && current.progress.phase == TrainingPhase::Completed && document.final->selected == document.sources.selected); }
  if (document.sources.selected) {
   require(document.final.has_value() && current.role == TrainingRecordRole::Terminal && current.progress.phase == TrainingPhase::Completed &&
           current.progress.scope == TrainingRecordScope::SelectedOutput && current.progress.artifact == document.sources.selected->artifact &&
@@ -110,7 +108,8 @@ void retain_training_source(TrainingSources& sources, const TrainingRecord& reco
   if (found == sources.distributions.end()) {
    require(sources.distributions.size() < kMaximumTrainingModels);
    sources.distributions.push_back(distribution);
-  } else if (*found != distribution) *found = distribution;
+  } else if (*found != distribution)
+   *found = distribution;
  }
  if (record.progress.failure) {
   const auto& failure = *record.progress.failure;
@@ -119,7 +118,8 @@ void retain_training_source(TrainingSources& sources, const TrainingRecord& reco
   if (found == sources.failures.end()) {
    require(sources.failures.size() < kMaximumTrainingModels + 1);
    sources.failures.push_back(failure);
-  } else require(*found == failure);
+  } else
+   require(*found == failure);
  }
 }
 }  // namespace mmltk::backend::models::rfdetr

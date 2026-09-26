@@ -344,6 +344,7 @@ fn quiet_driver_and_disabled_frontend_collect_no_probe_state() {
             &router,
             FeatureId::Explore,
             Some(crate::view_model::test_support::physical_surface(frame)),
+            false,
         ));
         assert_eq!(driver.widgets.location_pending(), expected_ready);
         assert_eq!(

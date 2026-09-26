@@ -11,7 +11,8 @@ inline detail::TrainingContinuationValues continuation_values(const TrainRequest
  TrainingSchedule schedule(request.recipe, {request.recipe.lr}, {TrainingGroupRole::Ordinary}, request.epochs, k, k);
  schedule.begin_epoch(values.epoch);
  for (std::uint64_t i = 0; i < k; ++i) schedule.consume_microbatch();
- schedule.prepare_attempt(); schedule.finish_attempt(true);
+ schedule.prepare_attempt();
+ schedule.finish_attempt(true);
  values.schedule = schedule.state();
  values.data.plan_hash = 1;
  values.data.epoch = values.epoch + 1;

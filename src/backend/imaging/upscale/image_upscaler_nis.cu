@@ -53,15 +53,15 @@ __global__ void horizontal_kernel(const void* source, const std::size_t source_p
  const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
  const std::uint64_t total = static_cast<std::uint64_t>(config.output_width) * config.crop_height;
  if (index >= total) return;
- const std::uint32_t output_x = static_cast<std::uint32_t>(index % config.output_width);
- const std::uint32_t crop_y = static_cast<std::uint32_t>(index / config.output_width);
+ const auto output_x = static_cast<std::uint32_t>(index % config.output_width);
+ const auto crop_y = static_cast<std::uint32_t>(index / config.output_width);
  const float source_x = (static_cast<float>(output_x) + 0.5F) * static_cast<float>(config.crop_width) / static_cast<float>(config.output_width) - 0.5F;
  const int base = static_cast<int>(floorf(source_x)) - 2;
  const std::uint32_t source_phase = device::phase(source_x);
  float3 color = make_float3(0.0F, 0.0F, 0.0F);
 #pragma unroll
  for (std::uint32_t tap = 0U; tap < device::kFilterTaps; ++tap) {
-  const std::uint32_t crop_x = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.crop_width) - 1, base + static_cast<int>(tap))));
+  const auto crop_x = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.crop_width) - 1, base + static_cast<int>(tap))));
   const float coefficient = device::kScaleCoefficients.values[source_phase][tap];
   const float3 sample = source_pixel(source, source_pitch, config.crop_x + crop_x, config.crop_y + crop_y);
   color.x = fmaf(coefficient, sample.x, color.x);
@@ -71,23 +71,23 @@ __global__ void horizontal_kernel(const void* source, const std::size_t source_p
  horizontal[index] = HalfRgba{__float2half_rn(color.x), __float2half_rn(color.y), __float2half_rn(color.z), __float2half_rn(0.0F)};
 }
 __device__ __forceinline__ HalfRgba load_clamped(const HalfRgba* pixels, const Configuration config, const int x, const int y) {
- const std::uint32_t clamped_x = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.output_width) - 1, x)));
- const std::uint32_t clamped_y = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.output_height) - 1, y)));
+ const auto clamped_x = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.output_width) - 1, x)));
+ const auto clamped_y = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.output_height) - 1, y)));
  return pixels[static_cast<std::size_t>(clamped_y) * config.output_width + clamped_x];
 }
 __global__ void vertical_kernel(const HalfRgba* horizontal, HalfRgba* scaled, const Configuration config) {
  const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
  const std::uint64_t total = static_cast<std::uint64_t>(config.output_width) * config.output_height;
  if (index >= total) return;
- const std::uint32_t output_x = static_cast<std::uint32_t>(index % config.output_width);
- const std::uint32_t output_y = static_cast<std::uint32_t>(index / config.output_width);
+ const auto output_x = static_cast<std::uint32_t>(index % config.output_width);
+ const auto output_y = static_cast<std::uint32_t>(index / config.output_width);
  const float source_y = (static_cast<float>(output_y) + 0.5F) * static_cast<float>(config.crop_height) / static_cast<float>(config.output_height) - 0.5F;
  const int base = static_cast<int>(floorf(source_y)) - 2;
  const std::uint32_t source_phase = device::phase(source_y);
  float3 color = make_float3(0.0F, 0.0F, 0.0F);
 #pragma unroll
  for (std::uint32_t tap = 0U; tap < device::kFilterTaps; ++tap) {
-  const std::uint32_t source_y_index = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.crop_height) - 1, base + static_cast<int>(tap))));
+  const auto source_y_index = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.crop_height) - 1, base + static_cast<int>(tap))));
   const HalfRgba sample = horizontal[static_cast<std::size_t>(source_y_index) * config.output_width + output_x];
   const float coefficient = device::kScaleCoefficients.values[source_phase][tap];
   color.x = fmaf(coefficient, __half2float(sample.red), color.x);
@@ -100,8 +100,8 @@ __global__ void sharpen_kernel(const void* source, const std::size_t source_pitc
  const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
  const std::uint64_t total = static_cast<std::uint64_t>(config.output_width) * config.output_height;
  if (index >= total) return;
- const std::uint32_t x = static_cast<std::uint32_t>(index % config.output_width);
- const std::uint32_t y = static_cast<std::uint32_t>(index / config.output_width);
+ const auto x = static_cast<std::uint32_t>(index % config.output_width);
+ const auto y = static_cast<std::uint32_t>(index / config.output_width);
  const HalfRgba center = load_clamped(scaled, config, static_cast<int>(x), static_cast<int>(y));
  const HalfRgba left = load_clamped(scaled, config, static_cast<int>(x) - 1, static_cast<int>(y));
  const HalfRgba right = load_clamped(scaled, config, static_cast<int>(x) + 1, static_cast<int>(y));

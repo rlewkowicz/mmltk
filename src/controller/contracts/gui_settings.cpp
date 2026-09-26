@@ -125,7 +125,8 @@ struct JsonFieldWriter {
  nlohmann::json& json;
  template <typename T>
  void operator()(const char* key, const T& value) const {
-  if constexpr (std::same_as<T, mmltk::backend::models::rfdetr::TrainRecipeSettings> || std::same_as<T, mmltk::backend::models::rfdetr::TrainLaneConfiguration> || std::same_as<T, mmltk::backend::models::rfdetr::TrainDataPolicy>) {
+  if constexpr (std::same_as<T, mmltk::backend::models::rfdetr::TrainRecipeSettings> || std::same_as<T, mmltk::backend::models::rfdetr::TrainLaneConfiguration> ||
+                std::same_as<T, mmltk::backend::models::rfdetr::TrainDataPolicy>) {
    std::array<std::byte, mmltk::backend::models::rfdetr::kMaximumTrainRequestJsonBytes> scratch;
    json[key] = mmltk::frameworks::serialization::reflected_json(value, scratch, {.max_bytes = scratch.size(), .max_items = 4096, .max_depth = 32});
   } else if constexpr (std::is_enum_v<T>) {
@@ -153,15 +154,18 @@ void apply_known_json_fields(nlohmann::json& destination, const nlohmann::json& 
  for (auto& [key, value] : destination.items()) {
   const auto found = patch.find(key);
   if (found == patch.end()) continue;
-  if (value.is_object()) apply_known_json_fields(value, *found);
-  else value = *found;
+  if (value.is_object())
+   apply_known_json_fields(value, *found);
+  else
+   value = *found;
  }
 }
 struct JsonFieldReader {
  const nlohmann::json& json;
  template <typename T>
  void operator()(const char* key, T& value) const {
-  if constexpr (std::same_as<T, mmltk::backend::models::rfdetr::TrainRecipeSettings> || std::same_as<T, mmltk::backend::models::rfdetr::TrainLaneConfiguration> || std::same_as<T, mmltk::backend::models::rfdetr::TrainDataPolicy>) {
+  if constexpr (std::same_as<T, mmltk::backend::models::rfdetr::TrainRecipeSettings> || std::same_as<T, mmltk::backend::models::rfdetr::TrainLaneConfiguration> ||
+                std::same_as<T, mmltk::backend::models::rfdetr::TrainDataPolicy>) {
    const auto found = json.find(key);
    if (found != json.end()) {
     std::array<std::byte, mmltk::backend::models::rfdetr::kMaximumTrainRequestJsonBytes> scratch;

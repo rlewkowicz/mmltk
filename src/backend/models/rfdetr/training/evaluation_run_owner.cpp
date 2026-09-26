@@ -408,7 +408,7 @@ RuntimeConfig validation_runtime_config(const TrainRequest& options, const Runti
  config.lanes = options.validation_lanes;
  return config;
 }
-}
+}  // namespace
 struct TrainingValidationRuntime::Impl {
  struct ForwardLane final {
   std::shared_ptr<NativeRfDetrModel> model;
@@ -417,6 +417,7 @@ struct TrainingValidationRuntime::Impl {
   std::unique_ptr<GpuBatchPreprocessor> preprocessor;
   std::unique_ptr<TargetScratch> targets;
  };
+
 public:
  Impl(const TrainRequest& options, RuntimeContext& runtime, std::unique_ptr<mmltk::backend::data::DatasetLoader> loader, size_t batch_size, std::string split_name, const bool query_count_automatic)
      : runtime_(validation_runtime_config(options, runtime)),
@@ -439,15 +440,15 @@ public:
   facts_ = derive_training_validation_facts(options, 0);
   facts_.admitted_capacity = capacity;
   facts_.effective_batch_per_model = facts_.aggregate_round_images = checked_training_product(batch_size_, capacity);
-  if (capacity < static_cast<std::size_t>(options.validation_lanes))
-   facts_.limitation = capacity == population_capacity ? ExecutionLimitation::SourceCapacity : ExecutionLimitation::BackendCapacity;
+  if (capacity < static_cast<std::size_t>(options.validation_lanes)) facts_.limitation = capacity == population_capacity ? ExecutionLimitation::SourceCapacity : ExecutionLimitation::BackendCapacity;
   compilation_mode_ = options.compilation_mode;
   pool_ = std::make_unique<InferenceLanes>(options.device_id, capacity);
   events_ = std::make_unique<TrainingEventOwner>(options.device_id, capacity + 1);
   for (std::size_t index = 0; index < capacity; ++index) {
    forward_.push_back(std::make_unique<ForwardLane>());
    auto& lane = *forward_.back();
-   torch_cuda::TorchCudaStreamGuard stream_guard(torch_cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(pool_->stream(index).native_handle), options.device_id));
+   torch_cuda::TorchCudaStreamGuard stream_guard(
+    torch_cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(pool_->stream(index).native_handle), torch_cuda::checked_device_index(options.device_id)));
    lane.batch.ensure(batch_capacity, loader_->image_height(), loader_->image_width(), options.device_id);
    lane.preprocessor = std::make_unique<GpuBatchPreprocessor>(batch_capacity, loader_->image_height(), loader_->image_width(), options.device_id, inference_dtype_);
    if (enable_loss) lane.targets = std::make_unique<TargetScratch>();
@@ -519,14 +520,19 @@ public:
 TrainingValidationRuntime::TrainingValidationRuntime(const TrainRequest& options, RuntimeContext& runtime, std::unique_ptr<mmltk::backend::data::DatasetLoader> loader, size_t batch_size,
  bool enable_loss, EvaluationMetricSet metric_set, const int64_t prediction_capacity, std::string split_name, const bool query_count_automatic)
     : impl_(std::make_shared<Impl>(options, runtime, std::move(loader), batch_size, std::move(split_name), query_count_automatic)) {
- try { impl_->initialize(options, enable_loss, metric_set, prediction_capacity); }
- catch (...) { cancel(); throw; }
+ try {
+  impl_->initialize(options, enable_loss, metric_set, prediction_capacity);
+ } catch (...) {
+  cancel();
+  throw;
+ }
 }
 TrainingValidationRuntime::~TrainingValidationRuntime() { cancel(); }
 void TrainingValidationRuntime::cancel() noexcept {
  if (!impl_) return;
- try { drain(); }
- catch (...) { std::move(lease_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), cudaErrorUnknown); }
+ try {
+  drain();
+ } catch (...) { std::move(lease_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), cudaErrorUnknown); }
 }
 void TrainingValidationRuntime::drain() {
  if (!impl_) throw std::runtime_error("training validation has terminal CUDA custody");
@@ -542,13 +548,16 @@ NativeRfDetrModel& TrainingValidationRuntime::active_model() { return *impl_->fo
 PostprocessLane& TrainingValidationRuntime::active_postprocess() { return *impl_->forward_.at(impl_->active_)->postprocess; }
 TrainingEventOwner& TrainingValidationRuntime::events() { return *impl_->events_; }
 void TrainingValidationRuntime::submitted() { impl_->pool_->Submitted(impl_->active_); }
-void TrainingValidationRuntime::release_oldest() { static_cast<void>(impl_->pool_->WaitOldest()); impl_->pool_->ReleaseOldest(); }
+void TrainingValidationRuntime::release_oldest() {
+ static_cast<void>(impl_->pool_->WaitOldest());
+ impl_->pool_->ReleaseOldest();
+}
 void TrainingValidationRuntime::bind_model(const NativeRfDetrModel& model, std::optional<std::uint64_t> version, EvaluatedWeights weights) {
  drain();
  if (version && impl_->source_ == &model && impl_->version_ == version && impl_->weights_ == weights) return;
  impl_->source_ = nullptr;
  impl_->version_.reset();
- const auto producer = torch_cuda::getCurrentCUDAStream(impl_->runtime_.execution().device);
+ const auto producer = torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(impl_->runtime_.execution().device));
  // The one mutable-master copy stays on its producer stream. Even a failed
  // snapshot remains ordered before an unwinding EMA restore on that stream.
  impl_->forward_.front()->model = model.make_inference_clone(static_cast<std::int32_t>(impl_->batch_size_), impl_->compilation_mode_);
@@ -556,14 +565,17 @@ void TrainingValidationRuntime::bind_model(const NativeRfDetrModel& model, std::
  for (std::size_t index = 0; index < impl_->forward_.size(); ++index) {
   auto& lane = *impl_->forward_[index];
   const auto stream = impl_->pool_->stream(index);
-  torch_cuda::TorchCudaStreamGuard stream_guard(torch_cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(stream.native_handle), impl_->runtime_.execution().device));
+  torch_cuda::TorchCudaStreamGuard stream_guard(
+   torch_cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(stream.native_handle), torch_cuda::checked_device_index(impl_->runtime_.execution().device)));
   if (index != 0) lane.model = impl_->forward_.front()->model->make_inference_clone(static_cast<std::int32_t>(impl_->batch_size_), impl_->compilation_mode_);
   lane.model->configure_supervision_timing({torch_cuda::cuda_device(impl_->runtime_.execution().device), 1, mmltk::common::logging::profile_enabled()});
   lane.postprocess = std::make_unique<PostprocessLane>(lane.model->class_layout());
   lane.postprocess->Prepare(lane.model->parameters().front().device());
   impl_->pool_->ReleaseSource(index);
  }
- impl_->source_ = &model; impl_->version_ = version; impl_->weights_ = weights;
+ impl_->source_ = &model;
+ impl_->version_ = version;
+ impl_->weights_ = weights;
 }
 void TrainingValidationRuntime::begin_pass() { impl_->begin_pass(); }
 torch::Tensor TrainingValidationRuntime::preprocess(const mmltk::backend::data::Batch& batch) { return impl_->preprocess(batch); }
@@ -583,8 +595,8 @@ std::string_view TrainingValidationRuntime::split_name() const noexcept { return
 std::size_t TrainingValidationRuntime::detection_limit() const noexcept { return impl_->detection_limit().as_size; }
 bool TrainingValidationRuntime::automatic_detection_limit() const noexcept { return impl_->detection_limit().automatic; }
 bool TrainingValidationRuntime::query_count_automatic() const noexcept { return impl_->query_count_automatic(); }
-EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRuntime& validation, NativeRfDetrModel& model, const DetectionConfig& detection_config,
- bool calculate_loss, EvaluationPurpose purpose, EvaluatedWeights evaluated_weights, std::optional<int> current_epoch, TrainingMetricHandoff* metrics, std::optional<std::uint64_t> parameter_version) {
+EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRuntime& validation, NativeRfDetrModel& model, const DetectionConfig& detection_config, bool calculate_loss,
+ EvaluationPurpose purpose, EvaluatedWeights evaluated_weights, std::optional<int> current_epoch, TrainingMetricHandoff* metrics, std::optional<std::uint64_t> parameter_version) {
  const bool capture_eval_sample = purpose == EvaluationPurpose::ScheduledValidation;
  if (capture_eval_sample && !current_epoch) throw std::logic_error("scheduled validation requires its epoch");
  mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_total{"rfdetr.train.eval.total"};
@@ -601,8 +613,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
   ~RestoreMode() { module.train(training); }
  } restore_mode{(model), (model).is_training()};
  model.eval();
- auto cancel_unsettled_run =
-  std::unique_ptr<TrainingValidationRuntime, void (*)(TrainingValidationRuntime*)>{&validation, [](TrainingValidationRuntime* owner) { owner->cancel(); }};
+ auto cancel_unsettled_run = std::unique_ptr<TrainingValidationRuntime, void (*)(TrainingValidationRuntime*)>{&validation, [](TrainingValidationRuntime* owner) { owner->cancel(); }};
  validation.bind_model(model, parameter_version, evaluated_weights);
  validation.begin_pass();
  TrainingEvaluationRunOwner& evaluation_run = validation.evaluation_run();
@@ -644,7 +655,9 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
  std::optional<CapturedEvalSample> captured_sample;
  std::unique_ptr<spdmon::ProgressBar> progress;
  if (options.progress_bar) {
-  auto label = purpose == EvaluationPurpose::FinalTest ? std::string("test") : purpose == EvaluationPurpose::SelectionValidation ? std::string("selection validation") : std::format("{} {}/{}", evaluated_weights == EvaluatedWeights::Ema ? "ema" : "val", *current_epoch + 1, options.epochs);
+  auto label = purpose == EvaluationPurpose::FinalTest             ? std::string("test")
+               : purpose == EvaluationPurpose::SelectionValidation ? std::string("selection validation")
+                                                                   : std::format("{} {}/{}", evaluated_weights == EvaluatedWeights::Ema ? "ema" : "val", *current_epoch + 1, options.epochs);
   progress = std::make_unique<spdmon::ProgressBar>(std::move(label), loader.num_images(), "img");
  }
  std::mt19937_64 sample_rng(static_cast<uint64_t>(options.seed) ^ (current_epoch.has_value() ? (0x9e3779b97f4a7c15ULL + static_cast<uint64_t>(*current_epoch + 1)) : 0xd1b54a32d192ed03ULL));
@@ -668,7 +681,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
   const auto lane_index = validation.admit_lane();
   ScopedRuntimeContext lane_context(&runtime, lane_index);
   const auto forward_stream = validation.active_stream();
-  torch_cuda::TorchCudaStreamGuard forward_guard(torch_cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(forward_stream), options.device_id));
+  torch_cuda::TorchCudaStreamGuard forward_guard(torch_cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(forward_stream), torch_cuda::checked_device_index(options.device_id)));
   auto& forward_model = validation.active_model();
   auto& evaluation_postprocess = validation.active_postprocess();
   mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_batch{"rfdetr.train.eval.batch"};
@@ -725,7 +738,8 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
    if (batch_timing) { evaluation_run.record_timing_start(batch_timing, EvaluationCudaBatchTiming::Phase::ModelForward, evaluation_stream); }
    {
     mmltk::backend::ml::cuda::TorchAutocastScope autocast_guard(amp_enabled, autocast_dtype);
-    outputs = match_free_loss ? forward_model.forward_for_match_free(NestedTensor{inference_input, validation.nested_mask()}) : forward_model.forward(NestedTensor{inference_input, validation.nested_mask()}, true);
+    outputs = match_free_loss ? forward_model.forward_for_match_free(NestedTensor{inference_input, validation.nested_mask()})
+                              : forward_model.forward(NestedTensor{inference_input, validation.nested_mask()}, true);
    }
    assert_inference_output_dtype(outputs.main.pred_logits, outputs.main.pred_boxes, autocast_dtype, "RF-DETR training validation");
    validation.record_preprocess_consumer(torch_cuda::current_torch_cuda_stream_object(torch_cuda::checked_device_index(options.device_id)).stream());
@@ -835,7 +849,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
  }
  if (progress) { progress->close(); }
  if (calculate_loss) {
-  metric_ready->wait(reinterpret_cast<std::uintptr_t>(torch_cuda::getCurrentCUDAStream(options.device_id).stream()), "wait for validation scalar accumulation");
+  metric_ready->wait(reinterpret_cast<std::uintptr_t>(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(options.device_id)).stream()), "wait for validation scalar accumulation");
   metric_ready->retire();
   result.loss = metrics->validation_average(batch_count);
  }

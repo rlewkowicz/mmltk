@@ -746,8 +746,7 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(
      if (!mask_samples.empty()) samples = mask_samples[layer_index];
      const auto layer_seed = tagged_seed(tagged_seed(outputs.mask_sampling_seed, 0x4c41594552ULL), layer_index);
      const auto groups = torch::floor_divide(torch::cat(query_indices), outputs.queries_per_group);
-     const auto semantic_rows = target_inventory.sampling_keys.defined()
-      ? torch::bitwise_xor(target_inventory.sampling_keys.index_select(0, mask_indices), groups * 0x45d9f3b) : torch::Tensor{};
+     const auto semantic_rows = target_inventory.sampling_keys.defined() ? torch::bitwise_xor(target_inventory.sampling_keys.index_select(0, mask_indices), groups * 0x45d9f3b) : torch::Tensor{};
      const DirectMaskRandomSeeds seeds{tagged_seed(layer_seed, 0x43414e4449444154ULL), tagged_seed(layer_seed, 0x52414e444f4dULL), semantic_rows};
      const auto sampled = sample_direct_masks(masks, target_inventory, mask_indices, config_.mask_point_sample_ratio, samples, seeds);
      const auto mask_zero = config_.mask_ce_loss_coef == 0.0 || config_.mask_dice_loss_coef == 0.0 ? sampled.logits.sum() * 0.0 : torch::Tensor{};

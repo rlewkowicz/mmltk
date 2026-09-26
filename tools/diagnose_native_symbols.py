@@ -14,7 +14,7 @@ def main():
     parser.add_argument("--match", default=".", help="Regular expression over demangled symbol records")
     parser.add_argument("--mangled", action="store_true", help="Keep mangled names for linker tracing")
     parser.add_argument("--limit", type=int, default=200, help="Maximum emitted symbol records")
-    parser.add_argument("artifacts", nargs="+", help="Repository-relative .a or .o paths")
+    parser.add_argument("artifacts", nargs="+", help="Repository-relative or installed /opt dependency .a or .o paths")
     args = parser.parse_args()
     if not 1 <= args.limit <= 10000:
         parser.error("--limit must be between 1 and 10000")
@@ -26,8 +26,8 @@ def main():
     paths = []
     for artifact in args.artifacts:
         path = (root / artifact).resolve(strict=True)
-        if not path.is_relative_to(root) or path.suffix not in {".a", ".o"} or not path.is_file():
-            parser.error(f"expected a repository .a or .o file: {artifact}")
+        if not (path.is_relative_to(root) or path.is_relative_to("/opt")) or path.suffix not in {".a", ".o"} or not path.is_file():
+            parser.error(f"expected a repository or installed /opt dependency .a or .o file: {artifact}")
         paths.append(str(path))
     command = ["/opt/gcc-16.2/bin/gcc-nm", "-A"]
     if not args.mangled:

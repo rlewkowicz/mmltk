@@ -216,8 +216,9 @@ impl Router {
         settings: &mut crate::view::settings::Component,
         message: Message,
     ) -> Result<Option<Outcome>, String> {
-        settings.state_mut().execution_edit_locked = [FeatureId::Train, FeatureId::Validate, FeatureId::Predict]
-            .map(|feature| model.primary_action_active(feature));
+        settings.state_mut().execution_edit_locked =
+            [FeatureId::Train, FeatureId::Validate, FeatureId::Predict]
+                .map(|feature| model.primary_action_active(feature));
         let outcome = match message {
             Message::Navigation(message) => match navigation::update(message) {
                 navigation::Outcome::PageSelected(feature) => Outcome::FeatureSelected(feature),
@@ -399,7 +400,11 @@ mod tests {
                         "{workflow:?}: {case}"
                     );
                     assert_eq!(settings.draft(), before.as_ref(), "{case}");
-                    assert_eq!(settings.state().clone().take_request([true; 3]), queued, "{case}");
+                    assert_eq!(
+                        settings.state().clone().take_request([true; 3]),
+                        queued,
+                        "{case}"
+                    );
                 }
                 model.file_dialog = Some(dialog.clone());
                 let outcome = router.update(&mut model, &mut settings, confirm()).unwrap();

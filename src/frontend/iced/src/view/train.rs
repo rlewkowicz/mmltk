@@ -6,8 +6,8 @@ use crate::view_model::ApplicationModel;
 use iced::widget::{button, column, container, text};
 
 mod advanced;
-mod lanes;
 pub(crate) mod dataset;
+mod lanes;
 pub mod output;
 mod progress;
 
@@ -89,7 +89,9 @@ impl Component {
         self.metrics.chart_view(chart)
     }
     pub fn sync_metrics(&mut self, model: &mut ApplicationModel, visible: bool) {
-        if model.connection != crate::view_model::ConnectionState::Connected { return; }
+        if model.connection != crate::view_model::ConnectionState::Connected {
+            return;
+        }
         self.metrics.rebase(model, visible);
         self.metrics.publish_conditions(&mut model.notices);
     }
@@ -186,7 +188,9 @@ impl Component {
                 dataset::Outcome::Stop => Outcome::DatasetStopRequested,
             },
             Message::Lanes(message) => {
-                let Some(schedule) = lanes::update(model, message)? else { return Ok(None); };
+                let Some(schedule) = lanes::update(model, message)? else {
+                    return Ok(None);
+                };
                 Outcome::SettingsEdited(schedule)
             }
             Message::Advanced(message) => {
@@ -221,7 +225,8 @@ impl Component {
             .as_ref()
             .map(|settings| &settings.workflows.train);
         let settings_edit_available = settings.draft.is_some() && model.settings_edit_available();
-        let execution_edit_available = settings_edit_available && !model.primary_action_active(crate::generated::FeatureId::Train);
+        let execution_edit_available = settings_edit_available
+            && !model.primary_action_active(crate::generated::FeatureId::Train);
         let settings_settled = !settings.has_local_edits();
         let offers = model
             .workflow
@@ -283,7 +288,9 @@ impl Component {
                 model
                     .training_stop_available()
                     .then_some(Message::TrainingStopRequested),
-                crate::view::workflow::progress::compute(training),
+                crate::view::workflow::progress::compute(
+                    model.workflow.training.as_ref().map(|state| &state.local)
+                ),
             ),
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)
@@ -337,51 +344,66 @@ impl Component {
         );
         let advanced = crate::view::shared::identified(
             "train.card.advanced",
-            iced::widget::keyed_column([(settings.recipe_model, column![
-                distribution, lane_controls,
-                advanced::view(installed_train, settings, editable, model).map(Message::Advanced),
-            ].into())]),
+            iced::widget::keyed_column([(
+                settings.recipe_model,
+                column![
+                    distribution,
+                    lane_controls,
+                    advanced::view(installed_train, settings, editable, model)
+                        .map(Message::Advanced),
+                ]
+                .into(),
+            )]),
         );
         let diagnostics = Some(crate::view::shared::identified(
-                    "train.card.remote",
-                    crate::view::shared::card(
-                        "Remote training",
-                        "Offers and selected identities are retained from generated replies.",
-                        column![
-                            container(button("Find offers").on_press_maybe(
-                                (settings_settled && model.provider_query_available())
-                                    .then_some(Message::QueryOffersRequested)
-                            )).id("train.offers.find"),
-                            container(
-                                button("Clear offers").on_press_maybe(
-                                    model
-                                        .provider_clear_available()
-                                        .then_some(Message::ClearOffersRequested)
-                                )
-                            )
-                            .id("train.offers.clear"),
-                            offers,
-                            container(button("Start remote").on_press_maybe(
-                                (settings_settled && model.remote_start_available())
-                                    .then_some(Message::StartRemoteRequested)
-                            )).id("train.remote.start"),
-                            container(button("Stop remote").on_press_maybe(
-                                model
-                                    .remote_stop_available()
-                                    .then_some(Message::StopRemoteRequested)
-                            )).id("train.remote.stop"),
-                            container(
-                                button("Retry reconciliation").on_press_maybe(
-                                    model
-                                        .remote_retry_available()
-                                        .then_some(Message::RetryReconciliationRequested)
-                                )
-                            )
-                            .id("train.remote.retry_reconciliation"),
-                        ]
-                        .spacing(crate::view::workflow::FIELD_SPACING),
-                    ),
-                ));
+            "train.card.remote",
+            crate::view::shared::card(
+                "Remote training",
+                "Offers and selected identities are retained from generated replies.",
+                column![
+                    container(
+                        button("Find offers").on_press_maybe(
+                            (settings_settled && model.provider_query_available())
+                                .then_some(Message::QueryOffersRequested)
+                        )
+                    )
+                    .id("train.offers.find"),
+                    container(
+                        button("Clear offers").on_press_maybe(
+                            model
+                                .provider_clear_available()
+                                .then_some(Message::ClearOffersRequested)
+                        )
+                    )
+                    .id("train.offers.clear"),
+                    offers,
+                    container(
+                        button("Start remote").on_press_maybe(
+                            (settings_settled && model.remote_start_available())
+                                .then_some(Message::StartRemoteRequested)
+                        )
+                    )
+                    .id("train.remote.start"),
+                    container(
+                        button("Stop remote").on_press_maybe(
+                            model
+                                .remote_stop_available()
+                                .then_some(Message::StopRemoteRequested)
+                        )
+                    )
+                    .id("train.remote.stop"),
+                    container(
+                        button("Retry reconciliation").on_press_maybe(
+                            model
+                                .remote_retry_available()
+                                .then_some(Message::RetryReconciliationRequested)
+                        )
+                    )
+                    .id("train.remote.retry_reconciliation"),
+                ]
+                .spacing(crate::view::workflow::FIELD_SPACING),
+            ),
+        ));
         crate::view::workflow::Regions::new(
             crate::generated::FeatureId::Train,
             setup,

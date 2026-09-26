@@ -17,7 +17,9 @@ struct DelayedForward final {
  }
  void Open() {
   if (!enqueued) return;
-  release.release(); finished.acquire(); enqueued = false;
+  release.release();
+  finished.acquire();
+  enqueued = false;
  }
  ~DelayedForward() { Open(); }
 };
@@ -56,7 +58,7 @@ TEST_CASE("Inference source copies retire before delayed forward and next frame 
  auto copies = torch::empty({2}, device);
  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
  rf::InferenceLanes lanes(0, 2);
- DelayedForward delayed; // Opens before stream retirement, even on assertion failure.
+ DelayedForward delayed;  // Opens before stream retirement, even on assertion failure.
  const mmltk::backend::ml::runtime::BorrowedCommandStream decode{reinterpret_cast<std::uintptr_t>(producer.get()), true};
  for (std::size_t index = 0; index < 2; ++index) {
   REQUIRE(lanes.Admit() == index);
@@ -88,4 +90,4 @@ TEST_CASE("Inference source copies retire before delayed forward and next frame 
  CHECK(lanes.Drain() == 0);
  CHECK(lanes.pending() == 0);
 }
-}
+}  // namespace

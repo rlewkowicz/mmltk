@@ -7,7 +7,9 @@ impl App {
     ) -> Task<Message> {
         match outcome {
             crate::view::annotation::Outcome::ShortcutRequested(shortcut) => {
-                if self.status.open || self.modal_active() { return Task::none(); }
+                if self.status.open || self.modal_active() {
+                    return Task::none();
+                }
                 let interaction_revision = self.interaction_revision;
                 return iced::widget::operation::is_focused(
                     crate::generated::constraint_uiannotationbrushradius()
@@ -28,29 +30,34 @@ impl App {
                 let _ = self.open_annotation();
             }
             crate::view::annotation::Outcome::SaveRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::AnnotationSave);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::AnnotationSave);
                 if self.settings.has_local_edits() || !self.model.annotation_save_available() {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::AnnotationSave, UiError::busy(
-                        "Annotation is unavailable or already changing state.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::AnnotationSave,
+                        UiError::busy("Annotation is unavailable or already changing state."),
+                    );
                     return Task::none();
                 }
                 if self.settings_unsettled() {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::AnnotationSave, UiError::busy(
-                        "Wait for Annotation settings to finish saving.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::AnnotationSave,
+                        UiError::busy("Wait for Annotation settings to finish saving."),
+                    );
                     return Task::none();
                 }
                 let Some(settings) = self.model.settings_snapshot.as_ref() else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::AnnotationSave, UiError::invalid(
-                        "Annotation settings are not installed yet.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::AnnotationSave,
+                        UiError::invalid("Annotation settings are not installed yet."),
+                    );
                     return Task::none();
                 };
                 let Some(_snapshot) = self.model.annotation.snapshot.as_ref() else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::AnnotationSave, UiError::invalid(
-                        "Annotation has no current typed workspace.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::AnnotationSave,
+                        UiError::invalid("Annotation has no current typed workspace."),
+                    );
                     return Task::none();
                 };
                 let destination = settings.settingsstate.workflows.annotate.outputdir.clone();
@@ -65,23 +72,26 @@ impl App {
                 );
             }
             crate::view::annotation::Outcome::StopRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::AnnotationStop);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::AnnotationStop);
                 if self.model.annotation_stop_available() {
                     self.submit_intent(
                         ApplicationIntentEndpoint::AnnotationStop,
                         crate::generated::encode_annotation_Stop,
                     );
                 } else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::AnnotationStop, UiError::busy(
-                        "Annotation is not running or is already stopping.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::AnnotationStop,
+                        UiError::busy("Annotation is not running or is already stopping."),
+                    );
                 }
             }
             crate::view::annotation::Outcome::DialogRequested(field_id) => {
                 self.open_dialog(field_id);
             }
             crate::view::annotation::Outcome::EditRequested(request) => {
-                self.model.begin_admission(ApplicationIntentEndpoint::AnnotationEdit);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::AnnotationEdit);
                 if self.model.annotation_edit_available() {
                     if self.submit_intent(
                         ApplicationIntentEndpoint::AnnotationEdit,
@@ -92,9 +102,10 @@ impl App {
                         self.workspace.rebase_annotation(&self.model);
                     }
                 } else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::AnnotationEdit, UiError::busy(
-                        "Annotation is unavailable or already changing state.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::AnnotationEdit,
+                        UiError::busy("Annotation is unavailable or already changing state."),
+                    );
                 }
             }
             crate::view::annotation::Outcome::SettingsEdited(schedule) => {
@@ -119,17 +130,20 @@ impl App {
     }
 
     fn submit_annotation_open(&mut self, request: Option<AnnotationOpen>, available: bool) -> bool {
-        self.model.begin_admission(ApplicationIntentEndpoint::AnnotationOpen);
+        self.model
+            .begin_admission(ApplicationIntentEndpoint::AnnotationOpen);
         if self.settings.has_local_edits() || !available {
-            self.model.report_admission_error(ApplicationIntentEndpoint::AnnotationOpen, UiError::busy(
-                "Annotation is unavailable or already changing state.",
-            ));
+            self.model.report_admission_error(
+                ApplicationIntentEndpoint::AnnotationOpen,
+                UiError::busy("Annotation is unavailable or already changing state."),
+            );
             return false;
         }
         let Some(request) = request else {
-            self.model.report_admission_error(ApplicationIntentEndpoint::AnnotationOpen, UiError::presentation(
-                "Annotation requires a current typed visual source",
-            ));
+            self.model.report_admission_error(
+                ApplicationIntentEndpoint::AnnotationOpen,
+                UiError::presentation("Annotation requires a current typed visual source"),
+            );
             return false;
         };
         let observed = self.integration.as_ref().map(|_| {

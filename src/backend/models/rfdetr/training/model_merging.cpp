@@ -57,11 +57,11 @@ public:
   std::filesystem::remove(path);
   commit(path);
  }
+
 private:
  std::vector<std::filesystem::path> paths_;
 };
-
-}
+}  // namespace
 void NativeModelAverage::prepare(std::span<const std::vector<NormalizedModelStateEntry>* const> inputs, std::span<const double> coefficients) {
  prepared_ = false;
  if (inputs.empty() || coefficients.size() != inputs.size()) throw std::invalid_argument("native merge needs complete coefficients");
@@ -78,15 +78,22 @@ void NativeModelAverage::prepare(std::span<const std::vector<NormalizedModelStat
  for (const auto* input : inputs) check_values(*inputs.front(), *input, checks_);
  const auto& reference = *inputs.front();
  if (reference.empty()) throw std::invalid_argument("native merge has no tensor values");
- if (values_.size() != reference.size()) { values_.resize(reference.size()); source_types_.resize(reference.size()); }
+ if (values_.size() != reference.size()) {
+  values_.resize(reference.size());
+  source_types_.resize(reference.size());
+ }
  for (std::size_t index = 0; index < reference.size(); ++index) {
   const auto& source = reference[index];
   auto& destination = values_[index];
-  destination.name = source.name; source_types_[index] = source.tensor.scalar_type();
+  destination.name = source.name;
+  source_types_[index] = source.tensor.scalar_type();
   const auto dtype = source.tensor.is_floating_point() && source.tensor.scalar_type() != torch::kFloat64 ? torch::kFloat32 : source.tensor.scalar_type();
   if (!destination.tensor.defined() || destination.tensor.sizes() != source.tensor.sizes() || destination.tensor.scalar_type() != dtype || destination.tensor.device() != source.tensor.device())
    destination.tensor = torch::empty_like(source.tensor, source.tensor.options().dtype(dtype));
-  if (!source.tensor.is_floating_point()) { destination.tensor.copy_(source.tensor); continue; }
+  if (!source.tensor.is_floating_point()) {
+   destination.tensor.copy_(source.tensor);
+   continue;
+  }
   destination.tensor.zero_();
   for (std::size_t input = 0; input < inputs.size(); ++input)
    if (coefficients[input] > 0) destination.tensor.add_((*inputs[input])[index].tensor, coefficients[input] / total);
@@ -101,16 +108,18 @@ void NativeModelAverage::install(std::span<const std::vector<NormalizedModelStat
  for (const auto* receiver : receivers) {
   if (!receiver || receiver->size() != values_.size()) throw std::invalid_argument("invalid native merge receiver");
   for (std::size_t i = 0; i < values_.size(); ++i)
-   if ((*receiver)[i].name != values_[i].name || (*receiver)[i].tensor.sizes() != values_[i].tensor.sizes() ||
-       (*receiver)[i].tensor.scalar_type() != source_types_[i] || (*receiver)[i].tensor.device() != values_[i].tensor.device()) throw std::invalid_argument("native merge receiver identity differs");
+   if ((*receiver)[i].name != values_[i].name || (*receiver)[i].tensor.sizes() != values_[i].tensor.sizes() || (*receiver)[i].tensor.scalar_type() != source_types_[i] ||
+       (*receiver)[i].tensor.device() != values_[i].tensor.device())
+    throw std::invalid_argument("native merge receiver identity differs");
  }
  torch::NoGradGuard guard;
  for (const auto* receiver : receivers)
   for (std::size_t i = 0; i < values_.size(); ++i) (*receiver)[i].tensor.copy_(values_[i].tensor);
 }
 TrainingMergeSchedule::TrainingMergeSchedule(const TrainLaneConfiguration& configuration, TrainingMergeState state)
- : cadence_(configuration.merge_cadence), enabled_(configuration.mode == TrainLaneMode::PeriodicAveraging), interval_(configuration.merge_rounds), state_(state) {
- if (!interval_ || (!enabled_ && state_.interval_rounds) || (enabled_ && cadence_ == TrainMergeCadence::Rounds && state_.interval_rounds >= interval_)) throw std::invalid_argument("invalid merge interval state");
+    : cadence_(configuration.merge_cadence), enabled_(configuration.mode == TrainLaneMode::PeriodicAveraging), interval_(configuration.merge_rounds), state_(state) {
+ if (!interval_ || (!enabled_ && state_.interval_rounds) || (enabled_ && cadence_ == TrainMergeCadence::Rounds && state_.interval_rounds >= interval_))
+  throw std::invalid_argument("invalid merge interval state");
 }
 bool TrainingMergeSchedule::finish_round(bool contained_attempts) {
  if (!contained_attempts) return false;
@@ -124,10 +133,13 @@ void TrainingMergeSchedule::retire_interval() {
  state_.merge = mmltk::common::math::checked_add(state_.merge, std::uint64_t{1}, "merge index overflow");
  state_.interval_rounds = 0;
 }
-TrainingSelection select_training_artifact(std::span<const TrainingSelectionCandidate> candidates, TrainFinalPolicy policy, bool masks,
- const std::filesystem::path& output, std::function_ref<EvalSummary(const std::filesystem::path&)> evaluate) {
+TrainingSelection select_training_artifact(std::span<const TrainingSelectionCandidate> candidates, TrainFinalPolicy policy, bool masks, const std::filesystem::path& output,
+ std::function_ref<EvalSummary(const std::filesystem::path&)> evaluate) {
  switch (policy) {
-  case TrainFinalPolicy::Off: case TrainFinalPolicy::Uniform: case TrainFinalPolicy::Explicit: case TrainFinalPolicy::ValidationGreedy: break;
+  case TrainFinalPolicy::Off:
+  case TrainFinalPolicy::Uniform:
+  case TrainFinalPolicy::Explicit:
+  case TrainFinalPolicy::ValidationGreedy: break;
   default: throw std::invalid_argument("invalid final training selection policy");
  }
  if (candidates.empty() || candidates.size() > kMaximumTrainingModels) throw std::invalid_argument("final selection requires one candidate per model");
@@ -135,14 +147,19 @@ TrainingSelection select_training_artifact(std::span<const TrainingSelectionCand
  std::unordered_set<std::uint64_t> ids;
  std::vector<std::shared_ptr<const TrainingArtifactAdmission>> admitted, proofs;
  std::vector<std::shared_ptr<const DecodedNativeModelState>> states;
- admitted.reserve(candidates.size()); proofs.reserve(candidates.size()); states.reserve(candidates.size());
+ admitted.reserve(candidates.size());
+ proofs.reserve(candidates.size());
+ states.reserve(candidates.size());
  const auto decoded = [&](std::size_t index) -> const DecodedNativeModelState& {
   auto& state = states[index];
   if (!state) {
    // A retained proof already admitted the content. Only arithmetic or a
    // comparison with different content needs decoded values again.
    for (std::size_t other = 0; other < states.size(); ++other) {
-    if (states[other] && proofs[other]->content() == proofs[index]->content()) { state = states[other]; break; }
+    if (states[other] && proofs[other]->content() == proofs[index]->content()) {
+     state = states[other];
+     break;
+    }
    }
    if (!state) state = proofs[index]->decode();
   }
@@ -153,8 +170,10 @@ TrainingSelection select_training_artifact(std::span<const TrainingSelectionCand
  std::iota(order.begin(), order.end(), 0);
  for (const auto& candidate : candidates) {
   const auto& artifact = candidate.artifact;
-  if (!ids.insert(artifact.model_id).second || artifact.session_id != reference.session_id || artifact.initialization != reference.initialization || artifact.configuration != reference.configuration || artifact.validation != reference.validation ||
-      artifact.weights != reference.weights || !artifact.selection_metric || !artifact.evaluation || training_selection_metric(*artifact.evaluation, masks) != *artifact.selection_metric || artifact.initialization.empty() || artifact.validation.empty()) throw std::invalid_argument("incompatible final model candidate");
+  if (!ids.insert(artifact.model_id).second || artifact.session_id != reference.session_id || artifact.initialization != reference.initialization ||
+      artifact.configuration != reference.configuration || artifact.validation != reference.validation || artifact.weights != reference.weights || !artifact.selection_metric || !artifact.evaluation ||
+      training_selection_metric(*artifact.evaluation, masks) != *artifact.selection_metric || artifact.initialization.empty() || artifact.validation.empty())
+   throw std::invalid_argument("incompatible final model candidate");
   const auto path = std::filesystem::absolute(artifact.path).lexically_normal();
   const auto found = std::ranges::find_if(admitted, [&](const auto& file) { return file->evidence()->artifact_path() == path; });
   std::shared_ptr<const TrainingArtifactAdmission> admission;
@@ -174,14 +193,15 @@ TrainingSelection select_training_artifact(std::span<const TrainingSelectionCand
     fresh->release_decoded_state();
     admission = std::move(fresh);
    }
-   if (!states.empty() && !same_native_model_semantics(admission->metadata(), admitted.front()->metadata()))
-    throw std::invalid_argument("final native model semantics differ");
+   if (!states.empty() && !same_native_model_semantics(admission->metadata(), admitted.front()->metadata())) throw std::invalid_argument("final native model semantics differ");
    // Every distinct named file completed admission before values may be shared.
    const auto same = std::ranges::find_if(proofs, [&](const auto& file) { return file->content() == admission->content(); });
    if (same != proofs.end()) {
     auto& shared = states[static_cast<std::size_t>(same - proofs.begin())];
-    if (shared) state = shared;
-    else if (state) shared = state;
+    if (shared)
+     state = shared;
+    else if (state)
+     shared = state;
    } else if (!states.empty()) {
     if (!state) state = admission->decode();
     const auto& first = decoded(0);
@@ -195,7 +215,8 @@ TrainingSelection select_training_artifact(std::span<const TrainingSelectionCand
  }
  require_checks(compatibility_checks);
  std::ranges::sort(order, [&](std::size_t a, std::size_t b) {
-  const auto& x = candidates[a].artifact; const auto& y = candidates[b].artifact;
+  const auto& x = candidates[a].artifact;
+  const auto& y = candidates[b].artifact;
   if (*x.selection_metric != *y.selection_metric) return *x.selection_metric > *y.selection_metric;
   if (policy != TrainFinalPolicy::ValidationGreedy && x.epoch != y.epoch) return x.epoch < y.epoch;
   return x.model_id < y.model_id;
@@ -212,7 +233,10 @@ TrainingSelection select_training_artifact(std::span<const TrainingSelectionCand
  const auto produce = [&](std::span<const std::size_t> indices, bool explicit_weights) {
   std::vector<const std::vector<NormalizedModelStateEntry>*> inputs;
   std::vector<double> weights;
-  for (auto index : indices) { inputs.push_back(&decoded(index).entries()); weights.push_back(explicit_weights ? candidates[index].coefficient : 1.0); }
+  for (auto index : indices) {
+   inputs.push_back(&decoded(index).entries());
+   weights.push_back(explicit_weights ? candidates[index].coefficient : 1.0);
+  }
   average.prepare(inputs, weights);
   DecodedNativeModelState state;
   state.metadata = admitted.front()->metadata();
@@ -236,21 +260,37 @@ TrainingSelection select_training_artifact(std::span<const TrainingSelectionCand
   for (std::size_t position = 1; position < order.size(); ++position) {
    const auto next = order[position];
    if (std::ranges::any_of(accepted, [&](auto index) { return candidates[index].artifact.content == candidates[next].artifact.content; })) continue;
-   auto trial = accepted; trial.push_back(next);
+   auto trial = accepted;
+   trial.push_back(next);
    auto [path, summary, metric, admission] = produce(trial, false);
    if (metric > *selected.artifact.selection_metric) {
-    accepted = std::move(trial); selected.artifact.path = std::move(path); selected.validation = std::move(summary); selected.artifact.selection_metric = metric; selected.artifact.weights = EvaluatedWeights::Soup; selected.artifact.content = admission->content(); selected.artifact.sha256 = admission->sha256(); selected_admission = std::move(admission);
-   } else trials.reject(path);
+    accepted = std::move(trial);
+    selected.artifact.path = std::move(path);
+    selected.validation = std::move(summary);
+    selected.artifact.selection_metric = metric;
+    selected.artifact.weights = EvaluatedWeights::Soup;
+    selected.artifact.content = admission->content();
+    selected.artifact.sha256 = admission->sha256();
+    selected_admission = std::move(admission);
+   } else
+    trials.reject(path);
   }
  } else if (policy == TrainFinalPolicy::Uniform || policy == TrainFinalPolicy::Explicit) {
   accepted = order;
   auto [path, summary, metric, admission] = produce(accepted, policy == TrainFinalPolicy::Explicit);
-  selected.artifact.path = std::move(path); selected.validation = std::move(summary); selected.artifact.selection_metric = metric; selected.artifact.weights = EvaluatedWeights::Soup; selected.artifact.content = admission->content(); selected.artifact.sha256 = admission->sha256(); selected_admission = std::move(admission);
+  selected.artifact.path = std::move(path);
+  selected.validation = std::move(summary);
+  selected.artifact.selection_metric = metric;
+  selected.artifact.weights = EvaluatedWeights::Soup;
+  selected.artifact.content = admission->content();
+  selected.artifact.sha256 = admission->sha256();
+  selected_admission = std::move(admission);
  }
  selected.artifact.evaluation = selected.validation;
  double total = 0;
  for (auto index : accepted) total += policy == TrainFinalPolicy::Explicit ? candidates[index].coefficient : 1;
- for (auto index : accepted) selected.ingredients.push_back({candidates[index].artifact.model_id, candidates[index].artifact.sha256, (policy == TrainFinalPolicy::Explicit ? candidates[index].coefficient : 1) / total});
+ for (auto index : accepted)
+  selected.ingredients.push_back({candidates[index].artifact.model_id, candidates[index].artifact.sha256, (policy == TrainFinalPolicy::Explicit ? candidates[index].coefficient : 1) / total});
  for (const auto& file : admitted) file->require_unchanged();
  if (selected.artifact.weights == EvaluatedWeights::Soup) {
   selected.artifact.model_id = 0;

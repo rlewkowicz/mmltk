@@ -731,7 +731,7 @@ bool BrowserAudit::dataset_presentation_complete() const {
   for (std::uint64_t stage = 1U; stage < 5U; ++stage)
    if (std::abs(dataset_fixture_heights.at(base + stage) - held) > 0.5) return false;
   const double terminal = dataset_fixture_heights.at(base + 5U);
-  if (terminal >= held || dataset_fixture_heights.at(base + 8U) >= held || !dataset_fixture_frames.contains(base + 5U)) return false;
+  if (terminal >= held || dataset_fixture_heights.at(base + 6U) != 0.0 || dataset_fixture_heights.at(base + 8U) >= held || !dataset_fixture_frames.contains(base + 5U)) return false;
   if (!std::ranges::any_of(dataset_fixture_frames.at(base + 5U), [held, terminal](double height) { return height > terminal && height < held; })) return false;
  }
  return true;
@@ -1025,7 +1025,7 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    advanced_assignment = bounds;
   else if (field_detail == "dn-toggle")
    advanced_denoising_toggle = bounds;
-  else if (!indexed("fixed-", advanced_fixed) && !indexed("match-free-", advanced_match_free))
+  else if (!indexed("fixed-", advanced_fixed) && !indexed("effective-", advanced_effective) && !indexed("match-free-", advanced_match_free))
    static_cast<void>(indexed("dn-", advanced_denoising));
  } else if (event == "integration.page_region") {
   const std::string control = record.value("control", "");
@@ -1324,8 +1324,8 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    } else {
     dataset_presentation_valid = dataset_presentation_valid && work == dataset_draw_rows.end() && cached == dataset_draw_rows.end();
     for (const auto* id : track_ids) dataset_presentation_valid = dataset_presentation_valid && !dataset_draw_rows.contains(id);
-    const std::string terminal = stage == 4U ? "Cancelling…" : stage == 5U ? "Cancelled" : stage == 6U ? "Failed\nLocal fixture publication failed" : "Completed\nLocal fixture output";
-    if (area != dataset_draw_rows.end()) captions = captions && area->second.second == terminal;
+    const std::string terminal = stage == 4U ? "Cancelling…" : stage == 5U ? "Cancelled" : stage == 6U ? "" : "Completed\nLocal fixture output";
+    if (area != dataset_draw_rows.end()) captions = captions && area->second.second == terminal && (stage != 6U || area->second.first[3] == 0.0);
    }
    // Intermediate frames prove reflow and immediate removal of stale bars.
    // Complete text is required on the final draw joined by the fixture receipt.
@@ -1440,9 +1440,12 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    dataset_divider_pixels.emplace(key, control);
  } else if (event == "integration.dataset_pixels") {
   const auto key = scalar(record, "a");
-  if (key >= 200U && key < 236U && numeric(record, "b") > 0 && numeric(record, "c") > 0 && numeric(record, "d") >= 20 && record.contains("colored") &&
-      ((key - 200U) % 9U < 4U ? scalar(record, "colored") > 0U : scalar(record, "colored") == 0U))
-   dataset_fixture_pixels.insert(key);
+  if (key >= 200U && key < 236U && numeric(record, "b") > 0 && record.contains("colored")) {
+   const auto stage = (key - 200U) % 9U;
+   const bool valid = stage == 6U ? record.value("detail", "") == "empty-component" && numeric(record, "c") == 0 && numeric(record, "d") == 0 && scalar(record, "colored") == 0U
+                                : numeric(record, "c") > 0 && numeric(record, "d") >= 20 && (stage < 4U ? scalar(record, "colored") > 0U : scalar(record, "colored") == 0U);
+   if (valid) dataset_fixture_pixels.insert(key);
+  }
  } else if (event == "integration.dataset_fixture") {
   const auto key = scalar(record, "b");
   if (key == scalar(record, "a") + 200U && key < 236U && scalar(record, "c") >= 4U && scalar(record, "d") == 1U) {
@@ -1927,8 +1930,9 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
  const auto primary_action = [&page_prefix](const std::string_view page) { return std::string{page_prefix(page)} + (page == "Annotate" ? ".save" : ".primary"); };
  const bool every_region = std::ranges::all_of(pages, [this, &page_prefix, &primary_action](const std::string_view page) {
   const std::string_view prefix = page_prefix(page);
-  return std::ranges::all_of(regions, [this, page](const std::string_view region) { return page_bounds.contains(std::string{page} + ":" + std::string{region}); }) &&
-         page_bounds.contains(std::string{page} + ":" + primary_action(page)) && page_bounds.contains(std::string{page} + ":" + prefix + ".status");
+  return std::ranges::all_of(regions, [this, page](const std::string_view region) {
+   return page_bounds.contains(std::string{page} + ":" + std::string{region}) == (page != "Live" || region != "workflow.diagnostics");
+  }) && page_bounds.contains(std::string{page} + ":" + primary_action(page)) && !page_bounds.contains(std::string{page} + ":" + prefix + ".status");
  });
  const bool primary_progress_placement = std::ranges::all_of(pages, [&page_bound, &immediately_above, &primary_action](const std::string_view page) {
   const std::string action = primary_action(page);
@@ -2029,10 +2033,12 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   }
   return true;
  };
- const std::array advanced_general{advanced_fixed[0], advanced_fixed[1], advanced_fixed[2], advanced_fixed[3]};
+ const std::array advanced_batch{advanced_fixed[0], advanced_effective[0], advanced_fixed[1], advanced_effective[1]};
+ const std::array advanced_general{advanced_fixed[2], advanced_fixed[3]};
  const std::array advanced_optimizer{advanced_fixed[4], advanced_fixed[5], advanced_fixed[6], advanced_fixed[7]};
  const bool advanced_composition =
-  aligned_grid(advanced_general) && aligned_grid(advanced_optimizer) && aligned_grid(advanced_match_free) && aligned_grid(advanced_denoising) &&
+  aligned_grid(advanced_batch) && aligned_grid(advanced_general) && aligned_grid(advanced_optimizer) && aligned_grid(advanced_match_free) && aligned_grid(advanced_denoising) &&
+  std::abs(advanced_batch.front().width - advanced_general.front().width) < 1.0 && advanced_general.front().y >= advanced_batch.front().y + advanced_batch.front().height - 1.0 &&
   std::abs(advanced_general.front().width - advanced_optimizer.front().width) < 1.0 && std::abs(advanced_general.front().width - advanced_match_free.front().width) < 1.0 &&
   std::abs(advanced_general.front().width - advanced_denoising.front().width) < 1.0 && advanced_optimizer.front().y >= advanced_general.front().y + advanced_general.front().height - 1.0 &&
   advanced_assignment.valid() && advanced_denoising_toggle.valid() && advanced_assignment.x >= advanced_container.x - 1.0 &&
@@ -2048,10 +2054,10 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
    const double cell_pitch = fields[1].x - fields[0].x;
    return cell_pitch > 0.0 && std::ranges::all_of(fields, [cell_pitch](const Bounds& bounds) { return bounds.width < cell_pitch * 0.70; });
   };
-  return compact_row(advanced_general) && compact_row(advanced_optimizer) && compact_row(advanced_match_free) && compact_row(advanced_denoising);
+  return compact_row(advanced_batch) && compact_row(advanced_general) && compact_row(advanced_optimizer) && compact_row(advanced_match_free) && compact_row(advanced_denoising);
  }();
  const bool status_composition = status_panel.valid() && status_copy.valid() && status_dismiss.valid() && status_copy.x < status_dismiss.x && status_copy.y >= status_panel.y - 1.0 &&
-                                status_dismiss.y >= status_panel.y - 1.0 && status_panel.contains_horizontally(status_copy) && status_panel.contains_horizontally(status_dismiss);
+                                 status_dismiss.y >= status_panel.y - 1.0 && status_panel.contains_horizontally(status_copy) && status_panel.contains_horizontally(status_dismiss);
  const bool gallery_shader_fill = explore_gallery.valid() && std::ranges::any_of(surface_geometries, [this](const auto& geometry) {
   const bool gallery_frame = std::ranges::any_of(explore_slot_frames, [&geometry](const auto& frame) { return frame.second == geometry.source_revision; });
   const auto key = std::pair{geometry.presentation_revision, geometry.source_revision};
@@ -2099,7 +2105,9 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released && ui_scale_restored && complete_pointer_drag && status_composition &&
    status_usable && status_exercise && status_notice_valid && status_notice_ids.empty() && status_escape_latch && status_stages.size() == 59U &&
    status_notice_transitions == std::vector<std::string>{"stop-added", "removed", "oom-added", "removed", "pair-added", "pair-added", "pair-removed", "pair-added", "pair-removed", "pair-removed"} &&
-   status_modals == std::set<std::string>{"settings", "reset", "file-dialog"} && status_focus_targets == std::set<std::string>{"next", "previous", "trigger"} && status_selection && status_hidden_quiet && status_motion == std::set<std::string>{"normal", "reduced"} && status_text_parts == std::set<std::string>{"first", "middle", "last"} && status_themes == std::set<std::string>{"light", "dark"} && status_healthy_themes == std::set<std::string>{"light", "dark"} && status_clipboard_reads == 2U,
+   status_modals == std::set<std::string>{"settings", "reset", "file-dialog"} && status_focus_targets == std::set<std::string>{"next", "previous", "trigger"} && status_selection &&
+   status_hidden_quiet && status_motion == std::set<std::string>{"normal", "reduced"} && status_text_parts == std::set<std::string>{"first", "middle", "last"} &&
+   status_themes == std::set<std::string>{"light", "dark"} && status_healthy_themes == std::set<std::string>{"light", "dark"} && status_clipboard_reads == 2U,
   "Settings composition",
   dataset_native_valid && dataset_native_generations.contains(cancelled_compile_generation) && dataset_native_generations.contains(active_compile_generation) && compile_tracks.size() == 3U,
   "Dataset native captions", dataset_presentation_complete(), "Dataset presentation", dataset_transitions_complete(), "Dataset transitions",
@@ -2304,10 +2312,10 @@ void BrowserAudit::consume_native_gpu(const nlohmann::json& record) {
  ranks[rank] = device;
 }
 bool BrowserAudit::training_sources_complete() const {
- const std::vector<std::array<double, 4>> expected{{0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12},
-  {4, 1, 6, 4}, {5, 2, 6, 5}, {6, 2, 12, 11}, {7, 2, 12, 11}, {8, 0, 12, 12}, {9, 0, 103, 12}};
- const std::vector<std::array<double, 4>> runs{{0, 0, 0, 0}, {1, 0, 0, 0}, {2, 0, 0, 0}, {3, 0, 0, 0},
-  {4, 1, 51, 100}, {5, 1, 51, 100}, {6, 1, 51, 200}, {7, 1, 52, 200}, {8, 1, 52, 200}, {9, 0, 0, 0}};
+ const std::vector<std::array<double, 4>> expected{
+  {0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12}, {4, 1, 6, 4}, {5, 2, 6, 5}, {6, 2, 12, 11}, {7, 2, 12, 11}, {8, 0, 12, 12}, {9, 0, 103, 12}};
+ const std::vector<std::array<double, 4>> runs{
+  {0, 0, 0, 0}, {1, 0, 0, 0}, {2, 0, 0, 0}, {3, 0, 0, 0}, {4, 1, 51, 100}, {5, 1, 51, 100}, {6, 1, 51, 200}, {7, 1, 52, 200}, {8, 1, 52, 200}, {9, 0, 0, 0}};
  return training_sources == expected && training_source_runs == runs;
 }
 bool BrowserAudit::workflow_gpus_complete() const {
@@ -2337,9 +2345,7 @@ bool BrowserAudit::workflow_gpus_complete() const {
    if (output == workflow_gpu_layout.end() || gpu == workflow_gpu_layout.end()) return false;
    const auto bounds = [](const auto& values) { return Bounds{values[0], values[1], values[2], values[3]}; };
    const auto a = bounds(output->second), b = bounds(gpu->second);
-   if (!a.valid() || !b.valid() || std::abs(a.x - b.x) > 1 || std::abs(a.width - b.width) > 1 ||
-       std::abs(b.y - a.y - a.height - 10) > 1)
-    return false;
+   if (!a.valid() || !b.valid() || std::abs(a.x - b.x) > 1 || std::abs(a.width - b.width) > 1 || std::abs(b.y - a.y - a.height - 10) > 1) return false;
   }
  }
  return true;

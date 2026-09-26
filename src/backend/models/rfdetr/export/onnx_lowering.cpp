@@ -786,7 +786,7 @@ torch::jit::Value* create_constant_of_shape(torch::jit::Node* node, const at::Te
  if (!output_sizes.has_value()) { throw_lowering_error(node, "output tensor shape must be statically known"); }
  auto* constant_of_shape = node->owningGraph()->create(kOnnxConstantOfShape, {create_int64s_constant(node, *output_sizes)}, 1);
  constant_of_shape->copyMetadata(node);
- constant_of_shape->t_(kAttrValue, fill_value);
+ constant_of_shape->t_(kAttrValue, fill_value.reshape({1}));
  constant_of_shape->insertBefore(node);
  constant_of_shape->output()->copyMetadata(node->output());
  return constant_of_shape->output();

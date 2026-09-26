@@ -474,6 +474,7 @@ TEST_CASE("staged cancellation keeps incumbent pixels visible until replacement 
 }
 TEST_CASE("staged completion wins late stop before promotion and publishes its exact borrowed product") {
  const bool producer_claims_completion = GENERATE(false, true);
+ const bool cancel_followup = GENERATE(false, true);
  auto backend = std::make_shared<FakeImageBackend>();
  auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
  std::promise<void> first;
@@ -481,7 +482,10 @@ TEST_CASE("staged completion wins late stop before promotion and publishes its e
  std::promise<void> release;
  auto released = release.get_future().share();
  std::promise<std::uint64_t> published;
+ std::promise<void> followup_completed;
  std::atomic_bool cancelled = false;
+ std::atomic_bool followup_ran = false;
+ std::atomic_bool followup_cancelled = false;
  detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {},
   [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t completed) noexcept {
    if (!producer_claims_completion && stage == detail::VisualRuntimeOwner::ActivityStage::StagedCompletionLatched && completed != 0U) {
@@ -506,7 +510,24 @@ TEST_CASE("staged completion wins late stop before promotion and publishes its e
   },
   [&] { cancelled = true; }, true));
  mmltk::testsupport::await_test_promise(latched, "latched");
- owner.RequestActiveStop();
+ CHECK_FALSE(owner.busy());
+ CHECK_FALSE(owner.RequestActiveStop());
+ REQUIRE(owner.SubmitDiscrete(
+  [&](auto&, std::stop_token) {
+   followup_ran = true;
+   return detail::VisualRuntimeOwner::Notification{[&] { followup_completed.set_value(); }};
+  },
+  [&] {
+   followup_cancelled = true;
+   followup_completed.set_value();
+  }));
+ CHECK(owner.busy());
+ CHECK_FALSE(owner.SubmitDiscrete(no_op_visual_work));
+ CHECK_FALSE(followup_ran.load());
+ if (cancel_followup) {
+  CHECK(owner.RequestActiveStop());
+  CHECK_FALSE(owner.busy());
+ }
  release.set_value();
  auto publication = published.get_future();
  REQUIRE(publication.wait_for(2s) == std::future_status::ready);
@@ -517,6 +538,9 @@ TEST_CASE("staged completion wins late stop before promotion and publishes its e
  CHECK(borrowed.plane(0U).revision() == revision);
  CHECK_FALSE(cancelled.load());
  borrowed = {};
+ REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(followup_completed, "followup completed", 2s));
+ CHECK(followup_ran.load() == !cancel_followup);
+ CHECK(followup_cancelled.load() == cancel_followup);
  owner.StopAndWait();
 }
 TEST_CASE("runtime construction does not hold scheduler admission while stop is requested") {

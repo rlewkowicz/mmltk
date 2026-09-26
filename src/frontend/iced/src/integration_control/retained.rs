@@ -482,8 +482,15 @@ impl State {
             }
             Phase::ViewerReconnect => {
                 if model.connection == crate::view_model::ConnectionState::Connected {
-                    if let Some(notice) = model.notices.rows().find(|notice| notice.origin == crate::view_model::notices::Origin::Transport) {
-                        return Task::done(RootMessage::Status(crate::view::status::Message::Activate(crate::view::status::Control::Dismiss(notice.id), crate::view::status::Opening::Keyboard)));
+                    if let Some(notice) = model.notices.rows().find(|notice| {
+                        notice.origin == crate::view_model::notices::Origin::Transport
+                    }) {
+                        return Task::done(RootMessage::Status(
+                            crate::view::status::Message::Activate(
+                                crate::view::status::Control::Dismiss(notice.id),
+                                crate::view::status::Opening::Keyboard,
+                            ),
+                        ));
                     }
                 }
                 if model.connection != crate::view_model::ConnectionState::Connected

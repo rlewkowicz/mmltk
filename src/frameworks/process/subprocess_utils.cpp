@@ -294,7 +294,9 @@ inline void read_captured_child_output(
  static_cast<void>(process.release_pid());
  read_captured_child_output(process.stdout_fd(), result, output_error_prefix, output_limit);
  process.close();
- throw CapturedChildAborted(std::string(process_name) + (reason == CapturedChildAbortReason::Cancelled ? " cancelled" : " timed out"), reason);
+ auto message = std::string(process_name) + (reason == CapturedChildAbortReason::Cancelled ? " cancelled" : " timed out");
+ if (!result.output.empty()) message += ":\n" + result.output;
+ throw CapturedChildAborted(message, reason);
 }
 CapturedChildProcessResult run_captured_child_process_erased(const std::string_view process_name, const std::string_view output_error_prefix, const ChildSetupTarget child_setup,
  const ChildCancellationTarget cancellation, const std::chrono::milliseconds timeout, const int cancel_fd, const bool kill_process_group, const std::size_t output_limit) {

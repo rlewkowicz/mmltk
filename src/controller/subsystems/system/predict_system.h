@@ -63,7 +63,8 @@ public:
  virtual void Close() noexcept {}
  [[nodiscard]] virtual bool HasUnsafeCustody() const noexcept { return false; }
  [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&,
-  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t generation = 0, const ExecutionSink& admitted = {}) = 0;
+  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t generation = 0,
+  const ExecutionSink& admitted = {}) = 0;
 };
 class CudaPredictRuntime final : public PredictRuntime {
 public:
@@ -72,7 +73,8 @@ public:
  void Close() noexcept override;
  [[nodiscard]] bool HasUnsafeCustody() const noexcept override;
  [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&,
-  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t generation = 0, const ExecutionSink& admitted = {}) override;
+  VisualExtent maximum, const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink& = {}, const PredictionRunOutput& = {}, std::uint64_t generation = 0,
+  const ExecutionSink& admitted = {}) override;
 
 private:
  services::RuntimeDiagnosticTarget diagnostics_;

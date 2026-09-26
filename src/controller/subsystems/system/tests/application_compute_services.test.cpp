@@ -911,10 +911,11 @@ TEST_CASE("Train process client exposes setup failure and one terminal", "[gui][
 TEST_CASE("Train process run owns its stop token, forwards progress, and reaps success", "[gui][services]") {
  mmltk::testsupport::ScopedTempDir temp("mmltk-train-run");
  const auto output = temp.path() / "output";
- const auto executable = script(temp,
-  "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\") || exit $?\n"
-  "MMLTK_TRAIN_FIXTURE_PROGRESS=normal \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n"
-  "printf complete\n");
+ const auto executable = script(temp, "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE
+                                      "\" \"$@\") || exit $?\n"
+                                      "MMLTK_TRAIN_FIXTURE_PROGRESS=normal \"" MMLTK_TRAIN_REQUEST_FIXTURE
+                                      "\" \"$@\" > /dev/null\n"
+                                      "printf complete\n");
  auto client = TrainProcessClient::launch(train_request(output), executable);
  auto [source, token] = TrainProcessStopSource::Mint();
  std::size_t progress_reports = 0U;
@@ -947,11 +948,12 @@ TEST_CASE("Train process client observes bounded output and inotify progress", "
  const auto output = temp.path() / "output";
  std::filesystem::create_directories(output);
  REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
- const auto executable = script(temp,
-  "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\") || exit $?\n"
-  "read ignored < \"$(dirname \"$out\")/gate\"\n"
-  "printf first; MMLTK_TRAIN_FIXTURE_PROGRESS=normal \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n"
-  "printf second\n");
+ const auto executable = script(temp, "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE
+                                      "\" \"$@\") || exit $?\n"
+                                      "read ignored < \"$(dirname \"$out\")/gate\"\n"
+                                      "printf first; MMLTK_TRAIN_FIXTURE_PROGRESS=normal \"" MMLTK_TRAIN_REQUEST_FIXTURE
+                                      "\" \"$@\" > /dev/null\n"
+                                      "printf second\n");
  auto client = TrainProcessClient::launch(train_request(output), executable);
  {
   std::ofstream gate(temp.path() / "gate");
@@ -988,10 +990,10 @@ TEST_CASE("Train process client rejects oversized public progress fields", "[gui
  const auto output = temp.path() / "output";
  std::filesystem::create_directories(output);
  REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
- const auto executable = script(temp,
-  "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\") || exit $?\n"
-  "read ignored < \"$(dirname \"$out\")/gate\"\n"
-  "MMLTK_TRAIN_FIXTURE_PROGRESS=invalid-phase \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n");
+ const auto executable = script(temp, "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE
+                                      "\" \"$@\") || exit $?\n"
+                                      "read ignored < \"$(dirname \"$out\")/gate\"\n"
+                                      "MMLTK_TRAIN_FIXTURE_PROGRESS=invalid-phase \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n");
  auto client = TrainProcessClient::launch(train_request(output), executable);
  {
   std::ofstream gate(temp.path() / "gate");
@@ -1005,10 +1007,10 @@ TEST_CASE("Train process client rejects oversized public checkpoint paths", "[gu
  const auto output = temp.path() / "output";
  std::filesystem::create_directories(output);
  REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
- const auto executable = script(temp,
-  "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\") || exit $?\n"
-  "read ignored < \"$(dirname \"$out\")/gate\"\n"
-  "MMLTK_TRAIN_FIXTURE_PROGRESS=invalid-path \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n");
+ const auto executable = script(temp, "out=$(\"" MMLTK_TRAIN_REQUEST_FIXTURE
+                                      "\" \"$@\") || exit $?\n"
+                                      "read ignored < \"$(dirname \"$out\")/gate\"\n"
+                                      "MMLTK_TRAIN_FIXTURE_PROGRESS=invalid-path \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n");
  auto client = TrainProcessClient::launch(train_request(output), executable);
  {
   std::ofstream gate(temp.path() / "gate");
@@ -1018,11 +1020,11 @@ TEST_CASE("Train process client rejects oversized public checkpoint paths", "[gu
  CHECK_THROWS(client.consume_progress());
 }
 TEST_CASE("Train process client admits only bounded identified retained observations", "[gui][services]") {
- for (const auto mode : {"invalid-observation", "future-observation", "foreign-observation", "duplicate-observation", "inconsistent-observation", "foreign-current-session", "premature-selected", "missing-selected-validation", "mismatched-selected-validation"}) {
+ for (const auto mode : {"invalid-observation", "future-observation", "foreign-observation", "duplicate-observation", "inconsistent-observation", "foreign-current-session", "premature-selected",
+       "missing-selected-validation", "mismatched-selected-validation"}) {
   mmltk::testsupport::ScopedTempDir temp("mmltk-train-observation-bound");
   const auto output = temp.path() / "output";
-  const auto executable = script(temp,
-   std::string("MMLTK_TRAIN_FIXTURE_PROGRESS=") + mode + " \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n");
+  const auto executable = script(temp, std::string("MMLTK_TRAIN_FIXTURE_PROGRESS=") + mode + " \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n");
   auto client = TrainProcessClient::launch(train_request(output), executable);
   REQUIRE(ready(client.pid_fd()));
   CHECK_THROWS(client.consume_exit());
@@ -1467,13 +1469,10 @@ TEST_CASE("Train process selects distributed fatal detail independently of worke
   first = expected = "CUDA out of memory. 42 MiB free.";
   second = "invalid checkpoint";
  }
- SECTION("distinct detailed worker causes have stable precedence") {
-  first = expected = generic + " nonfinite_losses=[loss_bbox=inf]";
- }
+ SECTION("distinct detailed worker causes have stable precedence") { first = expected = generic + " nonfinite_losses=[loss_bbox=inf]"; }
  if (reverse) std::swap(first, second);
  mmltk::testsupport::ScopedTempDir temp("mmltk-train-nonfinite-order");
- const auto executable = script(temp, "printf 'fatal: mmltk rfdetr error: " + first +
-  "\\nfatal: mmltk rfdetr error: " + second + "\\n'\nexit 7\n");
+ const auto executable = script(temp, "printf 'fatal: mmltk rfdetr error: " + first + "\\nfatal: mmltk rfdetr error: " + second + "\\n'\nexit 7\n");
  auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable);
  // Exercise split envelopes without retaining console text.
  std::string discarded;
@@ -1503,7 +1502,10 @@ TEST_CASE("Train consumes native selected results and typed degraded persistence
  const auto& progress = *result.terminal.final_progress;
  CHECK(progress.checkpoint_path == (selected ? "frozen-selected.pt" : "checkpoint.pt"));
  CHECK(progress.persistence.degraded == !selected);
- if (!selected) { CHECK(progress.persistence.dropped_records == 9); CHECK(progress.persistence.error == "epoch append failed"); }
+ if (!selected) {
+  CHECK(progress.persistence.dropped_records == 9);
+  CHECK(progress.persistence.error == "epoch append failed");
+ }
 }
 TEST_CASE("Train preserves a canonical remote first cause across generic parent lines", "[gui][services][train]") {
  const bool before = GENERATE(false, true);
@@ -1516,8 +1518,12 @@ TEST_CASE("Train preserves a canonical remote first cause across generic parent 
  const auto result = client.Run(std::move(token));
  CHECK(result.terminal.outcome == services::TrainProcessExitOutcome::Failed);
  CHECK(result.terminal.error.find("remote optimizer allocation failed") != std::string::npos);
- REQUIRE(result.terminal.final_progress); REQUIRE(result.terminal.final_progress->metrics);
+ REQUIRE(result.terminal.final_progress);
+ REQUIRE(result.terminal.final_progress->metrics);
  const auto& failure = result.terminal.final_progress->metrics->progress.failure;
- REQUIRE(failure); CHECK(failure->session_id == "session"); CHECK(failure->model_id == 7); CHECK(failure->first_cause == 19);
+ REQUIRE(failure);
+ CHECK(failure->session_id == "session");
+ CHECK(failure->model_id == 7);
+ CHECK(failure->first_cause == 19);
 }
 }  // namespace mmltk::controller::subsystems::system

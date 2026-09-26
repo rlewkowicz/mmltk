@@ -1,13 +1,12 @@
 use crate::fluent_theme::Element;
 use crate::generated::{self, FeatureId};
-use crate::view_model::selected_gpu_ordinals;
 use crate::view::settings::{EditCadence, EditSchedule, SettingsModel};
 use crate::view_model::ApplicationModel;
+use crate::view_model::selected_gpu_ordinals;
 use iced::widget::{checkbox, column, container, text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Message(pub i32);
-
 
 pub fn update(
     feature: FeatureId,
@@ -173,7 +172,10 @@ mod tests {
         assert_eq!(train.batchsize, 2);
         for feature in [FeatureId::Validate, FeatureId::Predict, FeatureId::Export] {
             update(feature, &mut settings, Message(5)).unwrap();
-            assert_eq!(selected_gpu_ordinals(feature, settings.draft.as_ref().unwrap()), vec![5]);
+            assert_eq!(
+                selected_gpu_ordinals(feature, settings.draft.as_ref().unwrap()),
+                vec![5]
+            );
         }
         update(FeatureId::Train, &mut settings, Message(1)).unwrap();
         assert!(update(FeatureId::Train, &mut settings, Message(3)).is_err());

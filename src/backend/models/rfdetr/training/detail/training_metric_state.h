@@ -19,4 +19,4 @@ struct TrainingEpochMetricState final {
  }
 };
 MMLTK_REFLECT_FIELDS(TrainingEpochMetricState)
-}
+}  // namespace mmltk::backend::models::rfdetr

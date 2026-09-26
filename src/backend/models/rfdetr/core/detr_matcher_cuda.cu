@@ -51,7 +51,7 @@ __global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, con
  const auto [batch_index, query_index, target_index, output_index] = pair;
  const int64_t class_index = target_labels[target_index];
  if (class_index < 0 || class_index >= class_count) { return; }
- const float logit = static_cast<float>(pred_logits[(batch_index * query_count + query_index) * class_count + class_index]);
+ const auto logit = static_cast<float>(pred_logits[(batch_index * query_count + query_index) * class_count + class_index]);
  const float probability = 1.0f / (1.0f + expf(-logit));
  const float one_minus_probability = 1.0f - probability;
  const float positive_class_cost = focal_alpha * one_minus_probability * one_minus_probability * stable_softplus(-logit);
@@ -80,7 +80,7 @@ __global__ void matcher_mask_cost_kernel(float* output, const Logit* pred_logits
  float probability_sum = 0.0f;
  float target_sum = 0.0f;
  for (int64_t point = lane; point < point_count; point += kWarpSize) {
-  const float logit = static_cast<float>(prediction[point]);
+  const auto logit = static_cast<float>(prediction[point]);
   const float target_value = target[point];
   const float probability = 1.0f / (1.0f + expf(-logit));
   ce_sum += stable_softplus(-logit) * target_value + stable_softplus(logit) * (1.0f - target_value);

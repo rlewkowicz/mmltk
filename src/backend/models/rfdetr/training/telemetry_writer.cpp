@@ -7,6 +7,7 @@
 #include <inplace_vector>
 #include <mutex>
 #include <random>
+#include <span>
 #include <thread>
 #include <unistd.h>
 #include "src/common/io/json_file.h"
@@ -150,8 +151,9 @@ struct TrainingTelemetryWriter::Impl final {
    if (!std::filesystem::exists(directory / "metrics.jsonl") || !std::filesystem::equivalent(std::filesystem::absolute(run.configuration.resume_path).parent_path(), directory))
     throw std::runtime_error("selected output history is not associated with the resume checkpoint");
    auto previous = serial::decode_reflected_json<TrainingRun>(read_manifest(manifest), manifest_limits);
-   if (previous.format_version != kTrainingRunFormat || previous.run_id.empty() || (!run.run_id.empty() && previous.run_id != run.run_id) || previous.attempt_id.empty() || previous.evaluated_weights != run.evaluated_weights ||
-       previous.class_layout != run.class_layout || run.source_checkpoint_attempt_id.empty() || (previous.checkpoint_attempt_id != run.source_checkpoint_attempt_id && previous.attempt_id != run.source_checkpoint_attempt_id))
+   if (previous.format_version != kTrainingRunFormat || previous.run_id.empty() || (!run.run_id.empty() && previous.run_id != run.run_id) || previous.attempt_id.empty() ||
+       previous.evaluated_weights != run.evaluated_weights || previous.class_layout != run.class_layout || run.source_checkpoint_attempt_id.empty() ||
+       (previous.checkpoint_attempt_id != run.source_checkpoint_attempt_id && previous.attempt_id != run.source_checkpoint_attempt_id))
     throw std::runtime_error("resume history has an unsupported or incompatible run format");
    run.run_id = previous.run_id;
    run.checkpoint_attempt_id = run.source_checkpoint_attempt_id;
@@ -171,7 +173,7 @@ struct TrainingTelemetryWriter::Impl final {
   record.evaluated_weights = record.progress.artifact ? record.progress.artifact->weights : EvaluatedWeights::Ordinary;
   if (record.progress.phase == TrainingPhase::Starting) record.attempt_configuration = run.configuration;
   const auto directory = run.configuration.output_dir;
-  auto record_json = serial::reflected_json(record, scratch, limits);
+  auto record_json = serial::reflected_json(record, std::span{scratch}.first(record_bytes), limits);
   append_file(directory / "metrics.jsonl", record_json);
   retain_training_source(document.sources, record);
   if (completed) document.sources.selected = completed->selected;

@@ -253,7 +253,7 @@ struct TrainingHistoryPage final {
 MMLTK_REFLECT_FIELDS(TrainingHistoryPage)
 struct TrainingFinalFacts final {
  std::uint64_t history_size = 0;
- std::optional<TrainingSelection> selected;
+ std::optional<TrainingSelection> selected{};
 };
 MMLTK_REFLECT_FIELDS(TrainingFinalFacts)
 // One bounded canonical projection is written and decoded by the producer and

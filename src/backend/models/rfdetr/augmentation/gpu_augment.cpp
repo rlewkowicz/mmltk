@@ -232,8 +232,10 @@ struct GpuAugmentationExecutor::Impl final {
    const auto key = image_keys[image];
    std::int64_t donor_slot = -1;
    if (copy_paste) {
-    if (donor_selection == GpuAugmentationDonorSelection::Aligned) donor_slot = static_cast<std::int64_t>(image);
-    else donor_slot = donor_index.select_for_image(key, batch.image_indices[image]);
+    if (donor_selection == GpuAugmentationDonorSelection::Aligned)
+     donor_slot = static_cast<std::int64_t>(image);
+    else
+     donor_slot = donor_index.select_for_image(key, batch.image_indices[image]);
    }
    std::array<float, kGpuCopyPasteParameterCount> unused{};
    detail::prepare_augmentation_image(plan.images[image], config, key, batch.image_indices[image], donor_slot >= 0 ? &donors[donor_slot] : nullptr, donor_slot,

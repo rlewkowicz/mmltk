@@ -15,7 +15,7 @@ template <typename Run>
  if (runs.empty()) return {};
  if (width == 0 || height == 0) throw std::invalid_argument("mask support requires positive dimensions");
  SupportBounds bounds{1, 1, 0, 0};
- const float image_width = static_cast<float>(width), image_height = static_cast<float>(height);
+ const auto image_width = static_cast<float>(width), image_height = static_cast<float>(height);
  std::uint64_t previous_end = 0;
  for (const auto& run : runs) {
   const auto [start, length] = run;

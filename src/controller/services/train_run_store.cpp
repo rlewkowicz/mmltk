@@ -11,7 +11,7 @@ constexpr std::size_t manifest_bytes = r::kTrainingManifestBytes;
 constexpr std::size_t line_bytes = r::kTrainingRecordBytes;
 constexpr std::size_t page_bytes = 2U * r::kTrainingRecordBytes;
 constexpr serial::wire::Limits record_limits{.max_bytes = line_bytes, .max_items = 8192, .max_depth = 32};
-template<class Value>
+template <class Value>
 Value ReadFacts(const std::filesystem::path& path, const std::size_t limit) {
  const auto identity = mmltk::common::io::FileSnapshot::Read(path);
  std::ifstream input(path, std::ios::binary);
@@ -98,8 +98,7 @@ r::TrainingHistoryPage TrainRunStore::Read(const r::TrainingHistoryQuery& query)
   if (!complete) break;  // A partial append is retried from its initial byte.
   if (consumed > page_bytes) break;
   auto record = serial::decode_reflected_json<r::TrainingRecord>(line_, record_limits);
-  if (record.format_version != r::kTrainingRunFormat || record.run_id != run_->run_id || record.attempt_id.empty())
-   throw std::runtime_error("training history record belongs to an incompatible run");
+  if (record.format_version != r::kTrainingRunFormat || record.run_id != run_->run_id || record.attempt_id.empty()) throw std::runtime_error("training history record belongs to an incompatible run");
   page.next_cursor += line_.size() + 1;
   page.records.push_back(std::move(record));
  }
@@ -114,8 +113,9 @@ std::filesystem::path TrainRunStore::ResolveOutput(const std::filesystem::path& 
   try {
    run = ReadRun(root);
   } catch (const std::exception&) {}
-  if (run && (std::filesystem::weakly_canonical(resume->path.parent_path()) == std::filesystem::weakly_canonical(root) && resume->resumable && resume->session_id == run->run_id &&
-              (resume->attempt_id == run->checkpoint_attempt_id || resume->attempt_id == run->attempt_id) && resume->evaluated_weights == run->evaluated_weights && resume->class_layout == run->class_layout))
+  if (run &&
+      (std::filesystem::weakly_canonical(resume->path.parent_path()) == std::filesystem::weakly_canonical(root) && resume->resumable && resume->session_id == run->run_id &&
+       (resume->attempt_id == run->checkpoint_attempt_id || resume->attempt_id == run->attempt_id) && resume->evaluated_weights == run->evaluated_weights && resume->class_layout == run->class_layout))
    return root;
   (void)run;
  }

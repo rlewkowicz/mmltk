@@ -253,7 +253,7 @@ TEST_CASE("all recipe field clears resolve the selected catalog and preserve mod
   Relation::set_override<reflection::member_path<&r::TrainRecipeSettings::lr>>(lanes.models.front().recipe.overrides);
   contracts::SettingsUpdateRequest select;
   select.lane_configuration = lanes;
-  select.updates.push_back({"workflows.train.request.recipe.optimizer", Value{std::string(reflection::enum_name(row.optimizer))}});
+  select.updates.push_back({"workflows.train.request.recipe.optimizer", *Value::text(reflection::enum_name(row.optimizer), reflection::kMaximumNameBytes)});
   const auto selected = settings.Update(std::move(select));
   CHECK(static_cast<const r::TrainRecipeValues&>(selected.settings_state.workflows.train.request.recipe) == static_cast<const r::TrainRecipeValues&>(row));
   Relation::VisitMembers([&]<class Entry>() {
@@ -262,9 +262,12 @@ TEST_CASE("all recipe field clears resolve the selected catalog and preserve mod
    const auto field = reflection::access<const r::TrainRecipeCatalogEntry, Entry::source>(row);
    const auto wire = [&] {
     using Field = std::remove_cvref_t<decltype(field)>;
-    if constexpr (std::is_enum_v<Field>) return Value{std::string(reflection::enum_name(field))};
-    else if constexpr (std::same_as<Field, int>) return Value{static_cast<std::int64_t>(field)};
-    else return Value{field};
+    if constexpr (std::is_enum_v<Field>)
+     return *Value::text(reflection::enum_name(field), reflection::kMaximumNameBytes);
+    else if constexpr (std::same_as<Field, int>)
+     return Value{static_cast<std::int64_t>(field)};
+    else
+     return Value{field};
    }();
    contracts::SettingsUpdateRequest pin;
    pin.updates.push_back({path, wire});
@@ -379,10 +382,11 @@ TEST_CASE("Native model count resolves accompanying global recipe before atomic 
  namespace r = mmltk::backend::models::rfdetr;
  using Value = mmltk::frameworks::serialization::wire::FlatValue;
  const mmltk::testsupport::ScopedTempDir root("native-model-count");
- SettingsSystem settings; REQUIRE(settings.Load(install_settings(root.path())).applied());
+ SettingsSystem settings;
+ REQUIRE(settings.Load(install_settings(root.path())).applied());
  contracts::SettingsUpdateRequest grow;
  grow.training_model_count = 2;
- grow.updates.push_back({"workflows.train.request.recipe.optimizer", Value{std::string("SGD")}});
+ grow.updates.push_back({"workflows.train.request.recipe.optimizer", *Value::text("SGD", mmltk::frameworks::reflection::kMaximumNameBytes)});
  grow.updates.push_back({"workflows.train.request.recipe.lr", Value{.025}});
  const auto initial = settings.snapshot();
  const auto grown = settings.Update(grow);
@@ -404,23 +408,24 @@ TEST_CASE("Native model count resolves accompanying global recipe before atomic 
  const auto changed = settings.Update(mode);
  CHECK(changed.settings_state.workflows.train.request.lane_configuration.models == appended.settings_state.workflows.train.request.lane_configuration.models);
  for (const auto count : {0U, 17U}) {
-  contracts::SettingsUpdateRequest invalid; invalid.training_model_count = count;
+  contracts::SettingsUpdateRequest invalid;
+  invalid.training_model_count = count;
   CHECK_THROWS(settings.Update(invalid));
   CHECK(settings.snapshot().revision == changed.revision);
  }
 }
-
 TEST_CASE("Admitted training rejects queued execution changes but preserves independent settings progress", "[controller][settings][training]") {
  const mmltk::testsupport::ScopedTempDir root("locked-model-count");
- SettingsSystem settings; REQUIRE(settings.Load(install_settings(root.path())).applied());
+ SettingsSystem settings;
+ REQUIRE(settings.Load(install_settings(root.path())).applied());
  const auto initial = settings.snapshot();
  settings.LockTrainingConfiguration(initial.revision);
- contracts::SettingsUpdateRequest grow; grow.training_model_count = 2;
+ contracts::SettingsUpdateRequest grow;
+ grow.training_model_count = 2;
  CHECK_THROWS_AS(settings.Update(grow), contracts::BusyError);
  using Value = mmltk::frameworks::serialization::wire::FlatValue;
- for (const auto& update : std::array{
-       contracts::SettingsValueUpdate{"workflows.train.compiled_dataset_dir", Value{std::string{"/next/dataset"}}},
-       contracts::SettingsValueUpdate{"workflows.train.model_source", Value{std::int64_t{1}}}}) {
+ for (const auto& update : std::array{contracts::SettingsValueUpdate{"workflows.train.compiled_dataset_dir", *Value::text("/next/dataset", mmltk::frameworks::reflection::kMaximumPathBytes)},
+       contracts::SettingsValueUpdate{"workflows.train.model_source", Value{std::int64_t{0}}}}) {
   contracts::SettingsUpdateRequest locked;
   locked.updates.push_back(update);
   CHECK_THROWS_AS(settings.Update(locked), contracts::BusyError);
@@ -440,7 +445,6 @@ TEST_CASE("Admitted training rejects queued execution changes but preserves inde
  CHECK_NOTHROW(settings.Update(grow));
  CHECK_THROWS_AS(settings.LockTrainingConfiguration(initial.revision), contracts::BusyError);
 }
-
 }  // namespace
 }  // namespace mmltk::controller
 namespace mmltk::controller {
@@ -467,11 +471,11 @@ TEST_CASE("export formats persist independently without changing weights selecti
   }
  }
 }
-
 TEST_CASE("Typed lane replacement and scalar edits publish one checked revision and persist stable recipes", "[controller][settings][training]") {
  namespace r = mmltk::backend::models::rfdetr;
  const mmltk::testsupport::ScopedTempDir root("typed-training-lanes");
- SettingsSystem settings; REQUIRE(settings.Load(install_settings(root.path())).applied());
+ SettingsSystem settings;
+ REQUIRE(settings.Load(install_settings(root.path())).applied());
  contracts::SettingsUpdateRequest grow;
  grow.training_model_count = 2;
  const auto initial = settings.Update(grow);
@@ -500,7 +504,8 @@ TEST_CASE("Typed lane replacement and scalar edits publish one checked revision 
  CHECK(saved.settings_state.workflows.train.request.lane_configuration.models[1].recipe.lr == .01);
  CHECK(saved.settings_state.workflows.train.request.recipe.optimizer == r::TrainOptimizerKind::AdamW);
  CHECK(r::effective_final_policy(lanes) == r::TrainFinalPolicy::ValidationGreedy);
- SettingsSystem restored; REQUIRE(restored.Load(services::SettingsLocation{(root.path() / "settings.json").string()}).applied());
+ SettingsSystem restored;
+ REQUIRE(restored.Load(services::SettingsLocation{(root.path() / "settings.json").string()}).applied());
  CHECK(restored.snapshot().settings_state == saved.settings_state);
  for (int fault = 0; fault < 6; ++fault) {
   auto invalid = request;
@@ -533,7 +538,6 @@ TEST_CASE("Typed lane replacement and scalar edits publish one checked revision 
  const auto regrown = settings.Update(shrink);
  CHECK(regrown.settings_state.workflows.train.request.lane_configuration.models.back().model_id > retired.model_id);
  CHECK(regrown.settings_state.workflows.train.request.lane_configuration.models.front() == saved.settings_state.workflows.train.request.lane_configuration.models.front());
-
 }
 }  // namespace
 }  // namespace mmltk::controller

@@ -46,7 +46,8 @@ void write_scalar(torch::serialize::OutputArchive& archive, const char* key, con
  else {
   constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<T>();
   serialization::wire::ByteBuffer bytes;
-  if (!serialization::encode(value, bytes, {.max_bytes = capacity, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32})) throw std::runtime_error("invalid continuation structure");
+  if (!serialization::encode(value, bytes, {.max_bytes = capacity, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32}))
+   throw std::runtime_error("invalid continuation structure");
   auto tensor = torch::empty({static_cast<int64_t>(bytes.size())}, torch::kUInt8);
   std::memcpy(tensor.data_ptr(), bytes.data(), bytes.size());
   archive.write(key, tensor);
@@ -64,7 +65,8 @@ auto read_scalar(torch::serialize::InputArchive& archive, const char* key) {
   constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<T>();
   if (!tensor.is_cpu() || tensor.scalar_type() != torch::kUInt8 || tensor.dim() != 1 || !tensor.is_contiguous() || static_cast<std::uint64_t>(tensor.numel()) > capacity)
    throw std::runtime_error("invalid continuation structure");
-  auto value = serialization::decode<T>({std::span(reinterpret_cast<const std::byte*>(tensor.const_data_ptr()), static_cast<std::size_t>(tensor.numel())), {}}, {.max_bytes = capacity, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32});
+  auto value = serialization::decode<T>({std::span(reinterpret_cast<const std::byte*>(tensor.const_data_ptr()), static_cast<std::size_t>(tensor.numel())), {}},
+   {.max_bytes = capacity, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32});
   if (!value) throw std::runtime_error("invalid continuation values");
   return std::move(*value);
  }
@@ -80,20 +82,23 @@ void validate_values(const TrainingContinuationValues& values, const TrainReques
  const auto expected = derive_execution_facts(request, values.execution.settings_revision);
  if (values.execution.logical_models != expected.logical_models || values.execution.microbatches_per_attempt != expected.microbatches_per_attempt ||
      values.execution.effective_batch_per_model != expected.effective_batch_per_model || values.execution.aggregate_round_images != expected.aggregate_round_images ||
-     values.execution.configured_capacity != expected.configured_capacity) throw std::runtime_error("checkpoint execution products differ from saved request");
+     values.execution.configured_capacity != expected.configured_capacity)
+  throw std::runtime_error("checkpoint execution products differ from saved request");
  const auto donor_streams = request.lane_configuration.mode == TrainLaneMode::SharedGradients ? request.lanes : 1;
- if (!values.data.plan_hash || values.data.donors.size() != checked_training_product(request.batch_size, donor_streams) ||
-     values.data.epoch < static_cast<std::uint64_t>(values.epoch) || values.data.epoch > static_cast<std::uint64_t>(values.epoch) + 1 ||
-     (values.data.epoch > static_cast<std::uint64_t>(values.epoch) && values.data.next_microbatch != 0) ||
-     values.data.next_microbatch % expected.microbatches_per_attempt) throw std::runtime_error("invalid checkpoint logical data continuation");
- if (values.data.next_microbatch && (values.epoch_metrics.microbatches != values.data.next_microbatch || !std::isfinite(values.epoch_metrics.loss_sum) || !std::isfinite(values.epoch_metrics.class_loss_sum) || !std::isfinite(values.epoch_metrics.box_loss_sum)))
+ if (!values.data.plan_hash || values.data.donors.size() != checked_training_product(request.batch_size, donor_streams) || values.data.epoch < static_cast<std::uint64_t>(values.epoch) ||
+     values.data.epoch > static_cast<std::uint64_t>(values.epoch) + 1 || (values.data.epoch > static_cast<std::uint64_t>(values.epoch) && values.data.next_microbatch != 0) ||
+     values.data.next_microbatch % expected.microbatches_per_attempt)
+  throw std::runtime_error("invalid checkpoint logical data continuation");
+ if (values.data.next_microbatch && (values.epoch_metrics.microbatches != values.data.next_microbatch || !std::isfinite(values.epoch_metrics.loss_sum) ||
+                                     !std::isfinite(values.epoch_metrics.class_loss_sum) || !std::isfinite(values.epoch_metrics.box_loss_sum)))
   throw std::runtime_error("checkpoint epoch metric accumulation differs from data cursor");
  const auto& clock = values.schedule;
  if (!clock.epoch_event_applied || clock.epoch != static_cast<std::uint64_t>(values.epoch) || clock.nb_ref % expected.microbatches_per_attempt ||
-     clock.steps_ref != clock.nb_ref / expected.microbatches_per_attempt || clock.consumed_microbatches % expected.microbatches_per_attempt || clock.consumed_attempts != clock.consumed_microbatches / expected.microbatches_per_attempt)
+     clock.steps_ref != clock.nb_ref / expected.microbatches_per_attempt || clock.consumed_microbatches % expected.microbatches_per_attempt ||
+     clock.consumed_attempts != clock.consumed_microbatches / expected.microbatches_per_attempt)
   throw std::runtime_error("inconsistent checkpoint scheduler clocks");
- TrainingSchedule schedule(request.recipe, clock.absolute_lrs, std::vector<TrainingGroupRole>(clock.absolute_lrs.size(), TrainingGroupRole::Ordinary), request.epochs,
-  clock.nb_ref, expected.microbatches_per_attempt);
+ TrainingSchedule schedule(
+  request.recipe, clock.absolute_lrs, std::vector<TrainingGroupRole>(clock.absolute_lrs.size(), TrainingGroupRole::Ordinary), request.epochs, clock.nb_ref, expected.microbatches_per_attempt);
  schedule.restore(clock);
 }
 bool has_continuation_fields(torch::serialize::InputArchive& archive) {
@@ -141,7 +146,6 @@ void write_training_continuation(torch::serialize::OutputArchive& archive, const
  write_training_supervision_config(archive, request.training_supervision);
  const auto write = [&](const char* key, const auto& value) { write_scalar(archive, key, value); };
  visit_continuation_values(values, write);
-
 }
 std::optional<TrainingContinuation> read_training_continuation(torch::serialize::InputArchive& archive) {
  torch::serialize::InputArchive optimizer;
@@ -163,10 +167,9 @@ std::optional<TrainingContinuation> read_training_continuation(torch::serialize:
 void require_active_training_continuation(const TrainingContinuation& saved, const TrainRequest& active) {
  if (active.epochs < saved.configuration.epochs) throw std::runtime_error("Resume cannot shorten the epoch horizon");
  const auto& prior = saved.configuration;
- if (prior.recipe != active.recipe || prior.lane_configuration != active.lane_configuration || prior.data_policy != active.data_policy ||
-     prior.batch_size != active.batch_size || prior.grad_accum_steps != active.grad_accum_steps || prior.lanes != active.lanes || prior.seed != active.seed ||
-     prior.unfreeze_encoder_last_epochs != active.unfreeze_encoder_last_epochs || prior.disable_augmentation_last_epochs != active.disable_augmentation_last_epochs ||
-     prior.freeze_encoder != active.freeze_encoder || prior.gpu_augmentation != active.gpu_augmentation)
+ if (prior.recipe != active.recipe || prior.lane_configuration != active.lane_configuration || prior.data_policy != active.data_policy || prior.batch_size != active.batch_size ||
+     prior.grad_accum_steps != active.grad_accum_steps || prior.lanes != active.lanes || prior.seed != active.seed || prior.unfreeze_encoder_last_epochs != active.unfreeze_encoder_last_epochs ||
+     prior.disable_augmentation_last_epochs != active.disable_augmentation_last_epochs || prior.freeze_encoder != active.freeze_encoder || prior.gpu_augmentation != active.gpu_augmentation)
   throw std::runtime_error("Resume recipe, logical data, or final epoch policy differs from saved configuration");
  if (saved.configuration.use_ema != active.use_ema) throw std::runtime_error("resume EMA selection differs from the saved training configuration");
  if (saved.configuration.training_supervision != active.training_supervision) throw std::runtime_error("native RF-DETR resume checkpoint training supervision configuration does not match");

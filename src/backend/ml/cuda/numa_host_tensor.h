@@ -1,6 +1,7 @@
 #pragma once
 #include <ATen/ATen.h>
 #include <memory>
+#include <source_location>
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 namespace mmltk::backend::ml::cuda {
 // Tensor storage retains the registered extent, including when a view escapes
@@ -8,7 +9,7 @@ namespace mmltk::backend::ml::cuda {
 class NumaHostTensor final {
 public:
  explicit NumaHostTensor(int device, std::shared_ptr<void> context_custody = {}, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {},
-  mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations = {});
+  mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations = {}, std::source_location location = std::source_location::current());
  [[nodiscard]] at::Tensor view(at::IntArrayRef shape, at::ScalarType dtype);
  [[nodiscard]] std::size_t capacity_bytes() const noexcept;
  // Only an owner that has completed all CUDA work may use this. Escaped
@@ -22,6 +23,6 @@ private:
  std::shared_ptr<void> context_custody_;
  std::shared_ptr<mmltk::frameworks::gpu::PinnedHostBuffer> storage_;
 };
-[[nodiscard]] at::Tensor numa_empty(at::IntArrayRef shape, at::ScalarType dtype, int device = -1);
+[[nodiscard]] at::Tensor numa_empty(at::IntArrayRef shape, at::ScalarType dtype, int device = -1, std::source_location location = std::source_location::current());
 [[nodiscard]] at::Tensor numa_readback(const at::Tensor& source);
 }  // namespace mmltk::backend::ml::cuda

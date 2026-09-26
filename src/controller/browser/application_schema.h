@@ -744,8 +744,7 @@ void append_value(FingerprintSink& sink, const Value& value) {
   // Opaque storage has one sealed serialization boundary; fingerprints consume
   // its canonical bytes without exposing private relation state to schema clients.
   mmltk::frameworks::serialization::wire::ByteBuffer bytes;
-  if (!mmltk::frameworks::serialization::encode(value, bytes, {.max_bytes = 1024U, .max_items = 16U, .max_depth = 4U}))
-   throw std::logic_error("invalid opaque settings default");
+  if (!mmltk::frameworks::serialization::encode(value, bytes, {.max_bytes = 1024U, .max_items = 16U, .max_depth = 4U})) throw std::logic_error("invalid opaque settings default");
   sink.append_number(bytes.size());
   for (const auto byte : bytes) sink.append_number(std::to_integer<std::uint8_t>(byte));
  } else if constexpr (ReflectedObject<Type>) {

@@ -143,7 +143,8 @@ struct DatasetLoader::Impl {
   const size_t batches = config.drop_last ? images / config.batch_size : images / config.batch_size + (images % config.batch_size != 0);
   const size_t local_batches = config.batch_shard_rank < batches ? (batches - 1 - config.batch_shard_rank) / config.batch_shard_count + 1 : 0;
   batch_starts.reserve(local_batches);
-  for (size_t batch = explicit_schedule ? resume_offset / config.batch_size : config.batch_shard_rank; batch < batches; batch += explicit_schedule ? 1 : config.batch_shard_count) batch_starts.push_back(batch * config.batch_size);
+  for (size_t batch = explicit_schedule ? resume_offset / config.batch_size : config.batch_shard_rank; batch < batches; batch += explicit_schedule ? 1 : config.batch_shard_count)
+   batch_starts.push_back(batch * config.batch_size);
   batch_slots.resize(batch_starts.size());
  }
  void refill(const size_t index) {
@@ -204,7 +205,9 @@ DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::framew
  auto& state = *impl_;
  state.config = config;
  if (config.source && !std::filesystem::equivalent(config.source->path(), config.compiled_path)) throw std::invalid_argument("shared compiled source differs from loader path");
- state.source = config.source ? config.source : std::make_shared<const CompiledDataset>(CompiledDataset::open(config.compiled_path, config.shuffle ? CompiledDataset::AccessPattern::Normal : CompiledDataset::AccessPattern::Sequential));
+ state.source = config.source ? config.source
+                              : std::make_shared<const CompiledDataset>(
+                                 CompiledDataset::open(config.compiled_path, config.shuffle ? CompiledDataset::AccessPattern::Normal : CompiledDataset::AccessPattern::Sequential));
  state.order.resize(state.source->header().num_images);
  std::iota(state.order.begin(), state.order.end(), 0U);
  state.rebuild_schedule();
@@ -268,10 +271,15 @@ DatasetLoader::~DatasetLoader() {
 void DatasetLoader::begin_epoch() { begin_epoch({}, 0); }
 void DatasetLoader::begin_epoch(std::shared_ptr<const DatasetIndexSchedule> schedule, std::size_t resume_offset) {
  if (schedule) {
-  if (resume_offset > schedule->image_indices.size() || resume_offset % impl_->config.batch_size || (!schedule->draw_keys.empty() && schedule->draw_keys.size() != schedule->image_indices.size())) throw std::invalid_argument("invalid explicit dataset schedule or resume offset");
-  if (!schedule->microbatch_keys.empty() && schedule->microbatch_keys.size() != (schedule->image_indices.size() / impl_->config.batch_size + (schedule->image_indices.size() % impl_->config.batch_size != 0))) throw std::invalid_argument("explicit microbatch key count differs");
-  for (auto image : schedule->image_indices) if (image >= impl_->source->header().num_images) throw std::invalid_argument("scheduled image is outside dataset");
- } else if (resume_offset) throw std::invalid_argument("resume offset requires an explicit dataset schedule");
+  if (resume_offset > schedule->image_indices.size() || resume_offset % impl_->config.batch_size || (!schedule->draw_keys.empty() && schedule->draw_keys.size() != schedule->image_indices.size()))
+   throw std::invalid_argument("invalid explicit dataset schedule or resume offset");
+  if (!schedule->microbatch_keys.empty() &&
+      schedule->microbatch_keys.size() != (schedule->image_indices.size() / impl_->config.batch_size + (schedule->image_indices.size() % impl_->config.batch_size != 0)))
+   throw std::invalid_argument("explicit microbatch key count differs");
+  for (auto image : schedule->image_indices)
+   if (image >= impl_->source->header().num_images) throw std::invalid_argument("scheduled image is outside dataset");
+ } else if (resume_offset)
+  throw std::invalid_argument("resume offset requires an explicit dataset schedule");
  {
   std::lock_guard lock(impl_->mutex);
   impl_->check_failure();
@@ -282,18 +290,18 @@ void DatasetLoader::begin_epoch(std::shared_ptr<const DatasetIndexSchedule> sche
  impl_->stream->cancel_reads();
  impl_->stream->synchronize();
  try {
- if (schedule && !schedule->image_indices.empty()) {
-  mmltk::frameworks::gpu::CudaDeviceScope scope(impl_->config.device_id);
-  mmltk::frameworks::gpu::ensure_cuda_ok(scope.status(), "explicit dataset schedule device binding");
-  const auto count = std::min(impl_->config.batch_size, schedule->image_indices.size());
-  const auto bytes = count * static_cast<std::size_t>(impl_->source->header().image_stride);
-  for (std::size_t slot = 0; slot < impl_->slots.size(); ++slot) {
-   if (impl_->config.loading.h2d_dataloader) impl_->stream->prepare_host(slot, bytes);
-   impl_->stream->prepare_device(slot, bytes);
-   impl_->slots[slot].reads.reserve(count);
+  if (schedule && !schedule->image_indices.empty()) {
+   mmltk::frameworks::gpu::CudaDeviceScope scope(impl_->config.device_id);
+   mmltk::frameworks::gpu::ensure_cuda_ok(scope.status(), "explicit dataset schedule device binding");
+   const auto count = std::min(impl_->config.batch_size, schedule->image_indices.size());
+   const auto bytes = count * static_cast<std::size_t>(impl_->source->header().image_stride);
+   for (std::size_t slot = 0; slot < impl_->slots.size(); ++slot) {
+    if (impl_->config.loading.h2d_dataloader) impl_->stream->prepare_host(slot, bytes);
+    impl_->stream->prepare_device(slot, bytes);
+    impl_->slots[slot].reads.reserve(count);
+   }
+   mmltk::frameworks::gpu::ensure_cuda_ok(scope.Finalize(), "explicit dataset schedule caller restoration");
   }
-  mmltk::frameworks::gpu::ensure_cuda_ok(scope.Finalize(), "explicit dataset schedule caller restoration");
- }
  } catch (...) {
   std::lock_guard lock(impl_->mutex);
   impl_->failure = std::current_exception();
@@ -345,8 +353,9 @@ bool DatasetLoader::next_batch(Batch& out, std::stop_token stop) {
   if (slot.batch == impl_->consumed && slot.state == Impl::State::Ready) {
    slot.state = Impl::State::CheckedOut;
    ++impl_->consumed;
-   out = {.draw_keys = impl_->explicit_schedule && !impl_->explicit_schedule->draw_keys.empty() ? std::span<const std::uint64_t>{impl_->explicit_schedule->draw_keys}.subspan(slot.start, slot.count) : std::span<const std::uint64_t>{},
-          .microbatch_key = impl_->explicit_schedule && !impl_->explicit_schedule->microbatch_keys.empty() ? impl_->explicit_schedule->microbatch_keys.at(slot.start / impl_->config.batch_size) : 0,
+   out = {.draw_keys = impl_->explicit_schedule && !impl_->explicit_schedule->draw_keys.empty() ? std::span<const std::uint64_t>{impl_->explicit_schedule->draw_keys}.subspan(slot.start, slot.count)
+                                                                                                : std::span<const std::uint64_t>{},
+    .microbatch_key = impl_->explicit_schedule && !impl_->explicit_schedule->microbatch_keys.empty() ? impl_->explicit_schedule->microbatch_keys.at(slot.start / impl_->config.batch_size) : 0,
     .num_images = slot.count,
     .device_images = static_cast<const float*>(impl_->stream->device_storage(index).data()),
     .label_index = impl_->source->label_index().data(),

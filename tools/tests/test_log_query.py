@@ -84,6 +84,17 @@ class ParserTests(unittest.TestCase):
 
 
 class LogFormatTests(unittest.TestCase):
+    def test_intent_request_projection_keeps_exact_uint64_and_rejects_other_counters(self):
+        maximum = 2**64 - 1
+        for event in ("received", "accepted", "rejected", "reply_rejected"):
+            native = record({"fields": {"event": "browser.intent." + event, "value": maximum}})
+            self.assertEqual(native.get("@intent_request"), maximum)
+        self.assertEqual(record({"event": "integration.intent", "control": str(maximum)}).get("@intent_request"), maximum)
+        for value in (0, -1, True, 1.0, "", "-1", "0", str(2**64), "1" * 100):
+            with self.subTest(value=value):
+                self.assertIs(record({"event": "integration.intent", "control": value}).get("@intent_request"), logs.MISSING)
+        self.assertIs(record({"event": "browser.server.binary_received", "value": 7}).get("@intent_request"), logs.MISSING)
+
     def test_training_terminal_errors_keep_run_and_attempt(self):
         for role, phase, failed in (("Terminal", "Error", True),
                                     ("Terminal", "Completed", False),
@@ -1032,6 +1043,20 @@ class FileQueryTests(unittest.TestCase):
     def exported(self, *arguments):
         status, output, diagnostics = self.run_query(*arguments, "--format", "jsonl")
         return status, [json.loads(line) for line in output.splitlines()], diagnostics
+
+    def test_explicit_intent_correlation_connects_browser_and_native_stages(self):
+        path = self.write("intent.jsonl", [
+            {"event": "integration.intent", "control": "7", "detail": "queued SettingsUpdate"},
+            {"fields": {"event": "browser.intent.received", "value": 7}},
+            {"fields": {"event": "browser.intent.accepted", "value": 7}},
+            {"event": "integration.intent", "control": "7", "detail": "reply SettingsUpdate"},
+            {"event": "browser.server.binary_received", "value": 7},
+            {"event": "browser.intent.accepted", "value": 8},
+        ])
+        status, rows, _ = self.exported(str(path), "-q", '@event=integration.intent detail:"queued"',
+                                      "--correlate", "@intent_request", "--no-auto-correlate")
+        self.assertEqual(status, 0)
+        self.assertEqual({row["_log"]["line"] for row in rows}, {1, 2, 3, 4})
 
     def test_vulkan_callback_preserves_complete_text_objects_and_physical_lines(self):
         message = vulkan_message()

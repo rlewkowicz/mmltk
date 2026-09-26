@@ -33,7 +33,15 @@ fn numeric_seed_round_trip_reuses_one_distinct_exact_target_for_typing_and_paste
         let driver = &mut fixture.controller;
         driver.driver.phase = Phase::ExploreNumericStart(2);
         let router = crate::view::router::Router::default();
-        drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+        drop(driver.advance(
+            &model,
+            &settings,
+            1.0,
+            &router,
+            FeatureId::Explore,
+            None,
+            false,
+        ));
         let target = driver.retained.explore_integer_target;
         assert_ne!(target, baseline);
         assert!(target > (1_u64 << 53));
@@ -49,7 +57,15 @@ fn numeric_seed_round_trip_reuses_one_distinct_exact_target_for_typing_and_paste
         assert_eq!(target.to_string().parse::<u64>(), Ok(target));
         driver.driver.phase = Phase::AwaitExploreNumeric { index: 2, step: 5 };
         model.explore.snapshot.as_mut().unwrap().revision += 1;
-        drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+        drop(driver.advance(
+            &model,
+            &settings,
+            1.0,
+            &router,
+            FeatureId::Explore,
+            None,
+            false,
+        ));
         assert_eq!(driver.driver.phase, Phase::AwaitExploreClipboard(18));
         assert_eq!(driver.retained.explore_integer_target, target);
         assert_eq!(driver.retained.explore_integer_baseline, baseline);
@@ -210,6 +226,7 @@ fn cold_gallery_walk_waits_for_new_complete_viewports_and_exact_held_receipts() 
             &router,
             FeatureId::Explore,
             Some(crate::view_model::test_support::physical_surface(frame)),
+            false,
         ));
     };
     {
@@ -522,6 +539,7 @@ fn retained_workflows_require_the_unique_settled_control_owner() {
             &router,
             FeatureId::Explore,
             Some(crate::view_model::test_support::physical_surface(frame)),
+            false,
         ));
     };
     driver.driver.desired_dark = None;
@@ -747,6 +765,7 @@ fn retained_workflows_require_the_unique_settled_control_owner() {
         &router,
         FeatureId::Annotate,
         Some(crate::view_model::test_support::physical_surface(frame)),
+        false,
     ));
     assert!(matches!(driver.driver.phase, Phase::AnnotationTool { .. }));
     assert!(driver.driver.reporting.state_is_absent());

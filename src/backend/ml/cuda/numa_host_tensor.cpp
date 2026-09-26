@@ -1,15 +1,20 @@
 #include "numa_host_tensor.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include <cuda_runtime_api.h>
+#include <stdexcept>
+#include <string>
 #include "src/frameworks/gpu/device_execution.h"
 namespace mmltk::backend::ml::cuda {
 NumaHostTensor::NumaHostTensor(
- int device, std::shared_ptr<void> context_custody, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations)
+ int device, std::shared_ptr<void> context_custody, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations,
+ std::source_location location)
     : retirement_(std::move(retirement)), operations_(operations), device_(device), context_custody_(std::move(context_custody)) {
  if (device_ < 0 && cudaGetDevice(&device_) != cudaSuccess) throw std::runtime_error("resolve NUMA host tensor device");
  c10::cuda::CUDAGuard guard(checked_device_index(device_));
  CUcontext context{};
- if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || !context) throw std::runtime_error("NUMA host tensor requires a current CUDA context");
+ const auto status = cuCtxGetCurrent(&context);
+ if (status != CUDA_SUCCESS || !context)
+  throw std::runtime_error("NUMA host tensor requires a current CUDA context in " + std::string(location.function_name()) + " (device=" + std::to_string(device_) + ", status=" + std::to_string(status) + ")");
  storage_ = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice(true, retirement_, operations_);
 }
 at::Tensor NumaHostTensor::view(at::IntArrayRef shape, at::ScalarType dtype) {
@@ -36,8 +41,8 @@ at::Tensor NumaHostTensor::view(at::IntArrayRef shape, at::ScalarType dtype) {
 }
 std::size_t NumaHostTensor::capacity_bytes() const noexcept { return storage_->capacity_bytes(); }
 CUresult NumaHostTensor::ReleaseSettled() noexcept { return storage_.use_count() == 1 ? storage_->ReleaseSettled() : CUDA_ERROR_NOT_READY; }
-at::Tensor numa_empty(at::IntArrayRef shape, at::ScalarType dtype, int device) {
- NumaHostTensor owner(device);
+at::Tensor numa_empty(at::IntArrayRef shape, at::ScalarType dtype, int device, std::source_location location) {
+ NumaHostTensor owner(device, {}, {}, {}, location);
  return owner.view(shape, dtype);
 }
 at::Tensor numa_readback(const at::Tensor& source) {

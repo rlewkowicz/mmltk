@@ -31,7 +31,7 @@ pub enum CheckpointCapability {
         generation: Option<u64>,
     },
     Ready(crate::generated::TrainingCheckpointCapability),
-    Failed(String),
+    Failed,
 }
 
 #[derive(Debug, Clone)]
@@ -103,11 +103,11 @@ impl Continuation {
             generation: None,
         };
     }
-    pub fn fail(&mut self, correlation: u64, detail: String) -> bool {
+    pub fn fail(&mut self, correlation: u64) -> bool {
         if self.request() != Some(correlation) {
             return false;
         }
-        self.capability = CheckpointCapability::Failed(detail);
+        self.capability = CheckpointCapability::Failed;
         true
     }
     pub fn reply(
@@ -142,8 +142,8 @@ impl Continuation {
         };
         if generation.is_none() {
             if let Some(observed) = self.observed.as_mut() {
-                if let Err(error) = merge_checkpoint_inspection(observed, value) {
-                    self.capability = CheckpointCapability::Failed(error.detail);
+                if merge_checkpoint_inspection(observed, value).is_err() {
+                    self.capability = CheckpointCapability::Failed;
                 }
             } else {
                 self.observed = Some(value);
@@ -166,18 +166,11 @@ impl Continuation {
                     }
                     self.capability = CheckpointCapability::Ready(checkpoint);
                 } else {
-                    self.capability = CheckpointCapability::Failed(
-                        "Checkpoint inspection returned no capability.".into(),
-                    );
+                    self.capability = CheckpointCapability::Failed;
                 }
             }
-            TrainingInspectionStatus::Failed => {
-                self.capability = CheckpointCapability::Failed(value.error)
-            }
-            TrainingInspectionStatus::Cancelled => {
-                self.capability =
-                    CheckpointCapability::Failed("Checkpoint inspection cancelled.".into())
-            }
+            TrainingInspectionStatus::Failed => self.capability = CheckpointCapability::Failed,
+            TrainingInspectionStatus::Cancelled => self.capability = CheckpointCapability::Failed,
             TrainingInspectionStatus::Idle | TrainingInspectionStatus::Running => {}
         }
     }
@@ -564,10 +557,14 @@ impl crate::generated::DatasetApplicationProjection<UiError> for ApplicationMode
                     value.progress,
                 ) {
                     self.report_error(crate::view_model::notices::Origin::Protocol, error);
-                } else { self.observe_dataset(); }
+                } else {
+                    self.observe_dataset();
+                }
             }
             ApplicationEvent::DatasetDatasetChanged(value) => {
-                if let Err(error) = self.install_dataset_snapshot(value.snapshot) { self.report_error(crate::view_model::notices::Origin::Protocol, error); }
+                if let Err(error) = self.install_dataset_snapshot(value.snapshot) {
+                    self.report_error(crate::view_model::notices::Origin::Protocol, error);
+                }
             }
 
             _ => unreachable!("generated Dataset dispatch supplied another system event"),
@@ -580,9 +577,10 @@ impl crate::generated::DatasetApplicationProjection<UiError> for ApplicationMode
             | ApplicationReply::DatasetStop(snapshot) => snapshot,
             _ => unreachable!("generated Dataset dispatch supplied another system reply"),
         };
-        if let Err(error) = self.install_dataset_snapshot(snapshot) { self.report_error(crate::view_model::notices::Origin::Protocol, error); }
+        if let Err(error) = self.install_dataset_snapshot(snapshot) {
+            self.report_error(crate::view_model::notices::Origin::Protocol, error);
+        }
     }
-
 }
 
 impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationModel {
@@ -692,7 +690,6 @@ impl ApplicationModel {
         &mut self,
         mut value: crate::generated::ValidationSnapshot,
     ) -> Result<(), UiError> {
-
         let mut installed = true;
         if let Some(current) = self.workflow.validation.as_ref() {
             // Neutralize only the independent logical facts: equality then covers
@@ -725,7 +722,10 @@ impl ApplicationModel {
             let outcome =
                 super::reduction::merge_compute_state(&mut operation, value.operation.clone())?;
             installed = outcome != Observation::Stale;
-            let execution = super::reduction::merge_execution_facts(&current.execution, value.execution.clone())?;
+            let execution = super::reduction::merge_execution_facts(
+                &current.execution,
+                value.execution.clone(),
+            )?;
             if outcome == Observation::Stale {
                 value.metrics = current.metrics.clone();
                 value.detailrows = current.detailrows;
@@ -749,7 +749,13 @@ impl ApplicationModel {
         {
             self.workflow.validation_details = None;
         }
-        if installed { observe_compute(&mut self.notices, FeatureId::Validate, &value.operation.terminal); }
+        if installed {
+            observe_compute(
+                &mut self.notices,
+                FeatureId::Validate,
+                &value.operation.terminal,
+            );
+        }
         observe_inference_capacity(&mut self.notices, FeatureId::Validate, &value.execution);
         self.workflow.validation = Some(value);
         Ok(())
@@ -805,7 +811,16 @@ impl crate::generated::ExportSystemApplicationProjection<UiError> for Applicatio
     ) -> Result<(), UiError> {
         let observation = merge_compute_snapshot(&mut self.workflow.export, value)?;
         if observation != Observation::Stale {
-            observe_compute(&mut self.notices, FeatureId::Export, &self.workflow.export.as_ref().expect("installed Export snapshot").terminal);
+            observe_compute(
+                &mut self.notices,
+                FeatureId::Export,
+                &self
+                    .workflow
+                    .export
+                    .as_ref()
+                    .expect("installed Export snapshot")
+                    .terminal,
+            );
         }
         Ok(())
     }
@@ -849,7 +864,9 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
             }
             ApplicationEvent::PredictPredictChanged(value) => {
                 match self.install_predict_snapshot(value.snapshot) {
-                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
+                    Err(error) => {
+                        self.report_error(crate::view_model::notices::Origin::Protocol, error)
+                    }
                     Ok(Observation::Installed) => {
                         if self.source_for(PresentationSourceKind::Predict).is_some() {
                             self.set_foreground_visual(Some(PresentationSourceKind::Predict));
@@ -860,16 +877,34 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
             }
             ApplicationEvent::PredictPredictFailed(value) => {
                 match self.install_predict_snapshot(value.snapshot) {
-                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
+                    Err(error) => {
+                        self.report_error(crate::view_model::notices::Origin::Protocol, error)
+                    }
                     Ok(Observation::Installed | Observation::Current) => {
                         if let Some(state) = &self.predict_snapshot {
-                            if state.operation.terminal.outcome == crate::generated::ComputeOperationOutcome::Failed && !state.operation.active {
-                                self.notices.terminal(super::notices::Origin::Compute(FeatureId::Predict), 0, state.operation.terminal.generation, || Some(super::notices::failure(value.detail)));
+                            if state.operation.terminal.outcome
+                                == crate::generated::ComputeOperationOutcome::Failed
+                                && !state.operation.active
+                            {
+                                self.notices.terminal(
+                                    super::notices::Origin::Compute(FeatureId::Predict),
+                                    0,
+                                    state.operation.terminal.generation,
+                                    || Some(super::notices::failure(value.detail)),
+                                );
                             } else {
-                                self.notices.visual_condition(super::notices::Origin::PredictionPreview, state.operation.generationfrontier, state.frame.revision, Some(super::notices::warning("Prediction preview unavailable", value.detail)));
+                                self.notices.visual_condition(
+                                    super::notices::Origin::PredictionPreview,
+                                    state.operation.generationfrontier,
+                                    state.frame.revision,
+                                    Some(super::notices::warning(
+                                        "Prediction preview unavailable",
+                                        value.detail,
+                                    )),
+                                );
                             }
                         }
-                    },
+                    }
                     Ok(Observation::Stale) => {}
                 }
             }
@@ -906,7 +941,9 @@ impl crate::generated::LiveApplicationProjection<UiError> for ApplicationModel {
             })
             | ApplicationEvent::LiveLiveChanged(crate::generated::LiveChanged { snapshot }) => {
                 match self.install_live_snapshot(snapshot) {
-                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
+                    Err(error) => {
+                        self.report_error(crate::view_model::notices::Origin::Protocol, error)
+                    }
                     Ok(Observation::Installed) => {
                         if self.presentation_model.foreground()
                             == Some(PresentationSourceKind::Live)
@@ -920,9 +957,16 @@ impl crate::generated::LiveApplicationProjection<UiError> for ApplicationModel {
             ApplicationEvent::LiveLiveFailed(value) => {
                 let generation = value.snapshot.revision;
                 match self.install_live_snapshot(value.snapshot) {
-                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
+                    Err(error) => {
+                        self.report_error(crate::view_model::notices::Origin::Protocol, error)
+                    }
                     Ok(Observation::Installed | Observation::Current) => {
-                        self.notices.terminal(super::notices::Origin::Compute(FeatureId::Live), 0, generation, || Some(super::notices::failure(value.detail)));
+                        self.notices.terminal(
+                            super::notices::Origin::Compute(FeatureId::Live),
+                            0,
+                            generation,
+                            || Some(super::notices::failure(value.detail)),
+                        );
                     }
                     Ok(Observation::Stale) => {}
                 }
@@ -1176,15 +1220,23 @@ mod validation_tests {
             model.workflow.validation.as_ref().unwrap().overlays,
             snapshot.overlayselection.value
         );
-        // The component has no preference to resurrect after transport reset.
-        model.clear_peer_state();
-        assert!(model.workflow.validation.is_none());
+        // Disconnect retains the settled native facts; the next complete
+        // bootstrap replaces them authoritatively, including lower revisions.
+        model.peer_disconnected(UiError::transport("reconnect"));
+        assert_eq!(model.workflow.validation.as_ref(), Some(&snapshot));
         let bootstrap = crate::view_model::test_support::bootstrapped()
             .workflow
             .validation
             .unwrap();
         model
-            .install_validation_snapshot(bootstrap.clone())
+            .install_bootstrap(
+                crate::generated::SCHEMA_FINGERPRINT,
+                crate::generated::application_snapshot_defaults()
+                    .unwrap()
+                    .into_iter()
+                    .map(|default| default.value)
+                    .collect(),
+            )
             .unwrap();
         assert_eq!(
             model.workflow.validation.as_ref().unwrap().overlayselection,
@@ -1210,7 +1262,10 @@ mod validation_tests {
         let admitted = value.execution.clone();
         value.execution.admittedcapacity = 0;
         model.install_validation_snapshot(value.clone()).unwrap();
-        assert_eq!(model.workflow.validation.as_ref().unwrap().execution, admitted);
+        assert_eq!(
+            model.workflow.validation.as_ref().unwrap().execution,
+            admitted
+        );
         assert_eq!(model.workflow.validation.as_ref().unwrap().frame, frame);
         value.execution.admittedcapacity = 2;
         assert!(model.install_validation_snapshot(value).is_err());
@@ -1428,12 +1483,9 @@ mod training_history_tests {
         selection.reply(1, inspect("/one.pt", 1, true));
         selection.observe(inspect("/one.pt", 1, true));
         assert!(selection.checkpoint().is_none());
-        assert!(!selection.fail(1, "stale".into()));
-        assert!(selection.fail(2, "unavailable weights".into()));
-        assert!(matches!(
-            selection.capability,
-            CheckpointCapability::Failed(_)
-        ));
+        assert!(!selection.fail(1));
+        assert!(selection.fail(2));
+        assert!(matches!(selection.capability, CheckpointCapability::Failed));
         assert!(selection.request().is_none());
         assert!(selection.checkpoint().is_none());
         selection.begin(3);
@@ -1483,7 +1535,7 @@ mod training_history_tests {
         model.project_training_reply(
             2,
             ApplicationReply::TrainingOpenRun(crate::generated::TrainingOpenedRun {
-                    selected: None,
+                selected: None,
                 generation: 7,
                 directory: "/saved".into(),
                 run: None,
@@ -1506,46 +1558,107 @@ impl ApplicationModel {
     pub(super) fn observe_dataset(&mut self) {
         if let Some(state) = &self.workflow.dataset {
             use crate::generated::ArtifactTerminalOutcome as Outcome;
-            self.notices.terminal(Origin::Dataset, 0, state.generation, || match state.terminal.outcome {
-                Outcome::Failed => Some(failure(state.terminal.detail.clone())),
-                Outcome::Refused => Some(warning("Compilation refused", state.terminal.detail.clone())),
-                _ => None,
-            });
+            self.notices
+                .terminal(Origin::Dataset, 0, state.generation, || {
+                    match state.terminal.outcome {
+                        Outcome::Failed => Some(failure(state.terminal.detail.clone())),
+                        Outcome::Refused => Some(warning(
+                            "Compilation refused",
+                            state.terminal.detail.clone(),
+                        )),
+                        _ => None,
+                    }
+                });
         }
     }
     pub(super) fn observe_training(&mut self) {
-        let Some(state) = &self.workflow.training else { return; };
-        self.notices.terminal(Origin::Provider, 0, state.offers.revision, ||
-            (state.offers.outcome == crate::generated::ProviderQueryOutcome::Failed)
-                .then(|| failure(state.offers.detail.clone())));
-        self.notices.terminal(Origin::Remote, 0, state.remote.revision, ||
-            matches!(state.remote.outcome, crate::generated::RemoteOperationOutcome::Failed | crate::generated::RemoteOperationOutcome::Inconclusive)
-                .then(|| failure(state.remote.detail.clone())));
-        let run = state.metrics.as_ref().map_or("", |record| record.runid.as_str());
-        self.notices.run_condition(Origin::History, run, state.persistence.degraded, || warning("History incomplete", format!("{} ({} records dropped)", state.persistence.error, state.persistence.droppedrecords)));
+        let Some(state) = &self.workflow.training else {
+            return;
+        };
+        self.notices
+            .terminal(Origin::Provider, 0, state.offers.revision, || {
+                (state.offers.outcome == crate::generated::ProviderQueryOutcome::Failed)
+                    .then(|| failure(state.offers.detail.clone()))
+            });
+        self.notices
+            .terminal(Origin::Remote, 0, state.remote.revision, || {
+                matches!(
+                    state.remote.outcome,
+                    crate::generated::RemoteOperationOutcome::Failed
+                        | crate::generated::RemoteOperationOutcome::Inconclusive
+                )
+                .then(|| failure(state.remote.detail.clone()))
+            });
+        let run = state
+            .metrics
+            .as_ref()
+            .map_or("", |record| record.runid.as_str());
+        self.notices
+            .run_condition(Origin::History, run, state.persistence.degraded, || {
+                warning(
+                    "History incomplete",
+                    format!(
+                        "{} ({} records dropped)",
+                        state.persistence.error, state.persistence.droppedrecords
+                    ),
+                )
+            });
         // Bootstrap seeds/rebases native run ownership before retained metrics
         // ingest. The metrics owner publishes subsequent actual count changes.
         if self.notices.bootstrapping() {
-            let dropped = state.metrics.as_ref().map_or(0, |record| record.droppedbefore);
-            self.notices.run_condition(Origin::HistoryDropped, run, (dropped > 0), || warning("History incomplete", format!("{dropped} training records were dropped.")));
+            let dropped = state
+                .metrics
+                .as_ref()
+                .map_or(0, |record| record.droppedbefore);
+            self.notices
+                .run_condition(Origin::HistoryDropped, run, dropped > 0, || {
+                    warning(
+                        "History incomplete",
+                        format!("{dropped} training records were dropped."),
+                    )
+                });
         }
         // Only the current fatal record identifies the model cause of this
         // process terminal. Retained failures alone cannot suppress an unrelated
         // process error. Keep the complete process status/advice with that cause.
-        let process_cause = state.metrics.as_ref().filter(|record|
-            record.role == crate::generated::TrainingRecordRole::Terminal && record.progress.phase == crate::generated::TrainingPhase::Error &&
-            state.local.terminal.outcome == crate::generated::ComputeOperationOutcome::Failed && state.local.terminal.generation == state.local.generationfrontier)
+        let process_cause = state
+            .metrics
+            .as_ref()
+            .filter(|record| {
+                record.role == crate::generated::TrainingRecordRole::Terminal
+                    && record.progress.phase == crate::generated::TrainingPhase::Error
+                    && state.local.terminal.outcome
+                        == crate::generated::ComputeOperationOutcome::Failed
+                    && state.local.terminal.generation == state.local.generationfrontier
+            })
             .and_then(|record| record.progress.failure.as_ref())
-            .filter(|cause| state.sources.failures.iter().any(|fact| fact.sessionid == cause.sessionid && fact.modelid == cause.modelid && fact.firstcause == cause.firstcause));
+            .filter(|cause| {
+                state.sources.failures.iter().any(|fact| {
+                    fact.sessionid == cause.sessionid
+                        && fact.modelid == cause.modelid
+                        && fact.firstcause == cause.firstcause
+                })
+            });
         for fact in &state.sources.failures {
-            let detail = process_cause.filter(|cause| fact.sessionid == cause.sessionid && fact.modelid == cause.modelid && fact.firstcause == cause.firstcause)
+            let detail = process_cause
+                .filter(|cause| {
+                    fact.sessionid == cause.sessionid
+                        && fact.modelid == cause.modelid
+                        && fact.firstcause == cause.firstcause
+                })
                 .map(|_| state.local.terminal.detail.as_str());
-            self.notices.training_failure(state.local.generationfrontier, fact, detail);
+            self.notices
+                .training_failure(state.local.generationfrontier, fact, detail);
         }
         if process_cause.is_none() {
             observe_compute(&mut self.notices, FeatureId::Train, &state.local.terminal);
         } else {
-            self.notices.terminal(Origin::Compute(FeatureId::Train), 0, state.local.terminal.generation, || None);
+            self.notices.terminal(
+                Origin::Compute(FeatureId::Train),
+                0,
+                state.local.terminal.generation,
+                || None,
+            );
         }
         if let Some(execution) = &state.sources.execution {
             let facts = &execution.training;
@@ -1556,79 +1669,173 @@ impl ApplicationModel {
                     _ => None,
                 });
             }
-            if facts.admittedcapacity > 0 && state.sources.distributions.iter().any(|facts| facts.missingclasses > 0) {
+            if facts.admittedcapacity > 0
+                && state
+                    .sources
+                    .distributions
+                    .iter()
+                    .any(|facts| facts.missingclasses > 0)
+            {
                 self.notices.terminal(Origin::TrainingSupport, 0, facts.operationgeneration, ||
                     Some(warning("Sparse class support", "Some admitted training models have no unique images for one or more classes. Repeated draws increase exposure but cannot create missing support.")));
             }
             let validation = &execution.validation;
             if validation.admittedcapacity > 0 {
-                self.notices.terminal(Origin::TrainingValidationCapacity, 0, validation.operationgeneration, ||
-                    matches!(validation.limitation, crate::generated::ExecutionLimitation::SourceCapacity | crate::generated::ExecutionLimitation::BackendCapacity)
-                        .then(|| warning("Training validation capacity limited", format!("Validation admits {} of {} requested lanes.", validation.admittedcapacity, validation.configuredcapacity))));
+                self.notices.terminal(
+                    Origin::TrainingValidationCapacity,
+                    0,
+                    validation.operationgeneration,
+                    || {
+                        matches!(
+                            validation.limitation,
+                            crate::generated::ExecutionLimitation::SourceCapacity
+                                | crate::generated::ExecutionLimitation::BackendCapacity
+                        )
+                        .then(|| {
+                            warning(
+                                "Training validation capacity limited",
+                                format!(
+                                    "Validation admits {} of {} requested lanes.",
+                                    validation.admittedcapacity, validation.configuredcapacity
+                                ),
+                            )
+                        })
+                    },
+                );
             }
         }
     }
-    pub(super) fn observe_checkpoint(&mut self, state: &crate::generated::TrainingCheckpointInspection) {
+    pub(super) fn observe_checkpoint(
+        &mut self,
+        state: &crate::generated::TrainingCheckpointInspection,
+    ) {
         use crate::generated::TrainingInspectionStatus;
-        self.notices.terminal(Origin::Checkpoint, 0, state.generation, || match state.status {
-            TrainingInspectionStatus::Failed => Some(failure(state.error.clone())),
-            TrainingInspectionStatus::Ready if state.checkpoint.is_none() => Some(UiError::protocol("Checkpoint inspection returned no capability.")),
-            _ => None,
-        });
+        self.notices
+            .terminal(Origin::Checkpoint, 0, state.generation, || {
+                match state.status {
+                    TrainingInspectionStatus::Failed => Some(failure(state.error.clone())),
+                    TrainingInspectionStatus::Ready if state.checkpoint.is_none() => Some(
+                        UiError::protocol("Checkpoint inspection returned no capability."),
+                    ),
+                    _ => None,
+                }
+            });
     }
     pub(super) fn observe_predict(&mut self) {
         if let Some(state) = &self.predict_snapshot {
-            self.notices.visual_condition(Origin::PredictionPreview, state.operation.generationfrontier, state.frame.revision, None);
-            self.notices.condition(Origin::PredictionInspection, (!state.inspection.error.is_empty()), || failure(state.inspection.error.clone()));
-            observe_compute(&mut self.notices, FeatureId::Predict, &state.operation.terminal);
+            self.notices.visual_condition(
+                Origin::PredictionPreview,
+                state.operation.generationfrontier,
+                state.frame.revision,
+                None,
+            );
+            self.notices.condition(
+                Origin::PredictionInspection,
+                !state.inspection.error.is_empty(),
+                || failure(state.inspection.error.clone()),
+            );
+            observe_compute(
+                &mut self.notices,
+                FeatureId::Predict,
+                &state.operation.terminal,
+            );
             observe_inference_capacity(&mut self.notices, FeatureId::Predict, &state.execution);
         }
     }
-    fn install_live_snapshot(&mut self, value: crate::generated::LiveSnapshot) -> Result<Observation, UiError> {
+    fn install_live_snapshot(
+        &mut self,
+        value: crate::generated::LiveSnapshot,
+    ) -> Result<Observation, UiError> {
         let observation = merge_live_snapshot(&mut self.live_snapshot, value)?;
         if observation != Observation::Stale {
-            let state = self.live_snapshot.as_ref().expect("installed Live snapshot");
-            self.notices.terminal(Origin::Compute(FeatureId::Live), 0, state.revision, || None);
+            let state = self
+                .live_snapshot
+                .as_ref()
+                .expect("installed Live snapshot");
+            self.notices
+                .terminal(Origin::Compute(FeatureId::Live), 0, state.revision, || None);
         }
         Ok(observation)
     }
 }
 
-pub(super) fn observe_compute(notices: &mut super::notices::NoticeStore, feature: FeatureId, state: &crate::generated::ComputeTerminal) {
+pub(super) fn observe_compute(
+    notices: &mut super::notices::NoticeStore,
+    feature: FeatureId,
+    state: &crate::generated::ComputeTerminal,
+) {
     use crate::generated::ComputeOperationOutcome as Outcome;
-    notices.terminal(Origin::Compute(feature), 0, state.generation, || match state.outcome {
-        Outcome::Failed => Some(failure(state.detail.clone())),
-        Outcome::Refused => Some(warning("Operation refused", state.detail.clone())),
-        _ => None,
-    });
+    notices.terminal(
+        Origin::Compute(feature),
+        0,
+        state.generation,
+        || match state.outcome {
+            Outcome::Failed => Some(failure(state.detail.clone())),
+            Outcome::Refused => Some(warning("Operation refused", state.detail.clone())),
+            _ => None,
+        },
+    );
 }
 
-fn observe_inference_capacity(notices: &mut super::notices::NoticeStore, feature: FeatureId, facts: &crate::generated::ExecutionFacts) {
+fn observe_inference_capacity(
+    notices: &mut super::notices::NoticeStore,
+    feature: FeatureId,
+    facts: &crate::generated::ExecutionFacts,
+) {
     use crate::generated::ExecutionLimitation;
-    if facts.admittedcapacity == 0 { return; }
-    notices.terminal(Origin::InferenceCapacity(feature), 0, facts.operationgeneration, || {
-        let reason = match facts.limitation {
-            ExecutionLimitation::SourceCapacity => "The selected source",
-            ExecutionLimitation::BackendCapacity => "The selected backend",
-            _ => return None,
-        };
-        Some(warning("Inference capacity limited", format!("{reason} admits {} of {} requested lanes.", facts.admittedcapacity, facts.configuredcapacity)))
-    });
+    if facts.admittedcapacity == 0 {
+        return;
+    }
+    notices.terminal(
+        Origin::InferenceCapacity(feature),
+        0,
+        facts.operationgeneration,
+        || {
+            let reason = match facts.limitation {
+                ExecutionLimitation::SourceCapacity => "The selected source",
+                ExecutionLimitation::BackendCapacity => "The selected backend",
+                _ => return None,
+            };
+            Some(warning(
+                "Inference capacity limited",
+                format!(
+                    "{reason} admits {} of {} requested lanes.",
+                    facts.admittedcapacity, facts.configuredcapacity
+                ),
+            ))
+        },
+    );
 }
 
 impl ApplicationModel {
-    pub(super) fn install_compute_snapshot(&mut self, page: FeatureId, snapshot: crate::generated::ComputeUiState) {
+    pub(super) fn install_compute_snapshot(
+        &mut self,
+        page: FeatureId,
+        snapshot: crate::generated::ComputeUiState,
+    ) {
         let target = match page {
-            FeatureId::Train => self.workflow.training.as_mut().map(|state| &mut state.local),
-            FeatureId::Validate => self.workflow.validation.as_mut().map(|state| &mut state.operation),
+            FeatureId::Train => self
+                .workflow
+                .training
+                .as_mut()
+                .map(|state| &mut state.local),
+            FeatureId::Validate => self
+                .workflow
+                .validation
+                .as_mut()
+                .map(|state| &mut state.operation),
             FeatureId::Export => self.workflow.export.as_mut(),
             FeatureId::Predict | FeatureId::Live | FeatureId::Annotate | FeatureId::Explore => None,
         };
-        let Some(target) = target else { return; };
+        let Some(target) = target else {
+            return;
+        };
         match super::reduction::merge_compute_state(target, snapshot) {
             Err(error) => self.report_error(Origin::Protocol, error),
-            Ok(Observation::Installed | Observation::Current) => observe_compute(&mut self.notices, page, &target.terminal),
-            Ok(Observation::Stale) => {},
+            Ok(Observation::Installed | Observation::Current) => {
+                observe_compute(&mut self.notices, page, &target.terminal)
+            }
+            Ok(Observation::Stale) => {}
         }
     }
 }

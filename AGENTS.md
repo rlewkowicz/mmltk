@@ -59,13 +59,11 @@ through `./mmltk`; add and use missing wrapper capabilities.
 
 During `actionplan.md` execution, after Final Validation completes and all
 preceding changes are committed, spawn exactly one fresh astra max subagent to
-update the complete documentation set against the current codebase.
-It verifies commands, paths, formats, behavior, ownership, and cross-links from
-authoritative source and tooling, edits documentation only, and reports the
-result.
-The main agent reviews the documentation diff for accuracy, scope, and
-organization, then commits it. This documentation pass does not reopen
-implementation review, cleanup, builds, tests, or acceptance.
+update the complete documentation set against current code. It verifies commands,
+paths, formats, behavior, ownership, and cross-links against authoritative source
+and tooling, edits documentation only, and reports results. The main agent
+reviews the diff for accuracy, scope, and organization, then commits it. This
+pass does not reopen implementation review, cleanup, builds, tests, or acceptance.
 
 Keep each document within its audience and purpose:
 
@@ -77,26 +75,26 @@ Keep each document within its audience and purpose:
   onward, preserve the developer's voice, humor, and interjections while
   correcting spelling and formatting. Move detailed reference and architecture
   material from that editable region into `docs/`.
-- `CONTRACT.md` defines high-level technical architecture: major application
+- `CONTRACT.md` owns high-level technical architecture: major application
   ownership, cross-repository flow, broad constraints, and critical component
   handoffs. Exclude implementation symbols, call sequences, and detailed code
   mechanics.
-- `AGENTS.md` is a terse agent navigation and policy guide. Include critical
+- `AGENTS.md` is a terse agent navigation and policy guide covering critical
   tooling, logging, optimization, repository organization, code direction,
   workflow rules, and gotchas. Describe repository, tool, and command outcomes;
   exclude system-specific implementation outcomes and architecture.
-- `docs/` is the technical wiki. Maintain `docs/README.md` as its index and
-  group pages by reader task: getting started and reference; architecture and
-  frameworks; data and backend systems; engineering processes, validation, and
-  operations. Put detailed commands, formats, code explanations, diagrams, and
-  procedures here. Give each fact one authoritative home and link to it instead
-  of duplicating it.
+- `docs/` is the technical wiki, indexed by `docs/README.md`. Maintain that index
+  and group pages by reader task: getting started and reference; architecture
+  and frameworks; data and backend systems; engineering processes, validation,
+  and operations. Put detailed commands, formats, code explanations, diagrams,
+  and procedures here. Give each fact one authoritative home; link instead of
+  duplicating it.
 
 The documentation agent chooses and evolves the smallest coherent hierarchy
-for the actual material. It updates stale facts, names, links, and examples;
-adds missing index entries; removes obsolete duplication; and preserves
-important nuance. It does not manufacture architecture or infer behavior from
-old prose when source, generated artifacts, or wrapper help can establish it.
+for the material, updates stale facts, names, links, and examples, adds missing
+index entries, and removes obsolete duplication while preserving nuance.
+Do not manufacture architecture or infer behavior from old prose when source,
+generated artifacts, or wrapper help can establish it.
 
 ## Building
 
@@ -118,47 +116,42 @@ wiring and regenerate through `./mmltk`.
 
 ## Crashes, Logging, and Debugging
 
-Examples:
-
-```bash
-  ./mmltk --logs --help
-```
+Logging help: `./mmltk --logs --help`.
 
 Provide granular opt-in JSONL logging with maximum useful troubleshooting
-detail. Disabled logging must avoid collecting and formatting diagnostic data.
-Keep normal execution quiet, but always report crashes and fatal operation or
-process failures with a concise useful error on stderr, even when diagnostic
-logging is disabled. Include the failing component and available error or exit
-status without enabling tracing, probes, or routine logging. Fatal signal paths
-must use async-signal-safe reporting; avoid duplicate reports for one failure.
-Gate nonfatal diagnostic print and logging statements that affect normal runtime. Prove a
-bug through tests or gated logging before changing behavior; do not infer fixes
-from crash-dump symbols alone.
+detail. Disabled logging must not collect or format diagnostics. Keep normal
+execution quiet; always report crashes and fatal operation or process failures
+on stderr with a concise useful error, even with diagnostics disabled. Include
+the failing component and available error or exit status without enabling
+tracing, probes, or routine logging. Fatal signal reporting must be
+async-signal-safe; avoid duplicate reports. Gate nonfatal diagnostic prints and
+logging that affect normal runtime. Prove bugs through tests or gated logging
+before changing behavior; crash-dump symbols alone do not justify fixes.
 
-If the same distinct test still fails after four evidence-driven fix and
-validation attempts during Final Validation, the main agent performs a deep
-diagnosis of the exact failure, requirements, complete current diff, attempted
-directions, and focused `./mmltk` evidence. Inspect ordinary API behavior,
-cohesive system boundaries, RAII resource safety, concurrency, and failure
-propagation before further edits. Repeated failures do not authorize a validation
-executor, diagnostic subagent, or additional reviewer.
+During Final Validation, if the same distinct test still fails after four
+evidence-driven fix and validation attempts, the main agent deeply diagnoses the
+exact failure, requirements, complete current diff, attempted directions, and
+focused `./mmltk` evidence. Inspect ordinary API behavior, cohesive system
+boundaries, RAII resource safety, concurrency, and failure propagation before
+further edits. Repeated failures authorize no validation executor, diagnostic
+subagent, or additional reviewer.
 
-Use the log query tool before raw-log searches. Needing a raw search to
-diagnose or prove an issue is a tooling gap: assign it to an astra max subagent,
-or update the existing logging-tool agent outside Final Validation. During Final
-Validation, the main agent fixes the tooling gap directly. The query tool should
-efficiently highlight matches, associated identities and frames, and end-to-end
-paths in as few queries as practical.
+Use the log query tool before raw-log searches. A raw search needed to diagnose
+or prove an issue is a tooling gap: outside Final Validation, assign it to an
+astra max subagent or update the existing logging-tool agent; during Final
+Validation, the main agent fixes it directly. The query tool should efficiently
+highlight matches, associated identities and frames, and end-to-end paths in as
+few queries as practical.
 
 ## actionplan.md
 
-`actionplan.md` is an executable phased plan for another agent. Include a
-problem statement or goal, Summary, Scope, Architecture, concrete phases,
-important files, exact actions/locations, risks, and post-cleanup concerns.
-Confirm files and line numbers first. Exclude user-facing notes, answers,
-commentary, reminders, repeated `AGENTS.md` constraints, and vague directives
-such as “explore this or that”. Do not reference conversation context that the
-next agent cannot access.
+`actionplan.md` is an executable phased plan for another agent. Confirm files and
+line numbers first. Include a problem statement or goal, Summary, Scope,
+Architecture, concrete phases, important files, every expected changed file,
+exact actions/locations, risks, and post-cleanup concerns. Exclude user-facing
+notes, answers, commentary, reminders, repeated `AGENTS.md` constraints, vague
+directives (“explore this or that”), and conversation context inaccessible to
+the next agent.
 
 ### Writing an action plan
 
@@ -166,72 +159,68 @@ next agent cannot access.
 - Arrange dependent work to avoid back-and-forth edits. Compilation occurs in
   Final Validation, so intermediate states need not compile.
 - In plan mode, save the final plan as `actionplan.md` before execution.
-- Include every file expected to change.
 
 ### Executing an action plan
 
-- Phase ordering guides sequencing; overlap or pull work forward for a complete,
-  architecturally aligned cutover. Review the implemented set against all
+- Phase order guides sequencing; overlap or pull work forward for a complete,
+  architecturally aligned cutover. Review the implementation against all
   applicable requirements.
 - Unless a phase explicitly requests a product-logic change, preserve every
-  existing observable outcome, failure path, and integration behavior across
+  observable outcome, failure path, and integration behavior across
   interface cutovers. Before deleting or replacing a substantial implementation,
-  trace what it does through its callers, callees, persisted forms, and tests;
-  reuse cohesive behavior where possible and carry all required outcomes into
-  the replacement.
-- Spawn exactly one new astra xhigh executor for each implementation phase's
-  first pass; use a low subagent for followup remediation within implementation phases, the main
-  agent handles small evidence-driven follow-up fixes and delegates large
-  missing implementation. Final Validation follows its separate main-agent
-  workflow regardless of a fix's size.
-- Update `actionplan.md` atomically after each phase, never defer to the end.
-  Remove completed phases entirely, leaving actionable steps. Preserve Summary,
-  Scope, Architecture, and scope clarification; otherwise change only the active
-  phase and materially affected later steps. Record pertinent detours while
-  actionable. Replace all surviving references to removed phases (dependencies,
-  actions, risks, handoffs) with concrete implemented APIs, owners, artifacts,
-  or invariants, never removed phase numbers, titles, or prose.
+  trace its behavior through callers, callees, persisted forms, and tests;
+  reuse cohesive behavior where possible and retain all required outcomes.
+- For each implementation phase's first pass, spawn exactly one new astra xhigh
+  executor. Use a low subagent for followup remediation within implementation
+  phases; the main agent handles small evidence-driven follow-up fixes and
+  delegates large missing implementation. Final Validation uses its separate
+  main-agent workflow regardless of fix size.
+- Update `actionplan.md` atomically after each phase: remove completed phases
+  entirely, leaving actionable steps; never defer updates. Preserve
+  Summary, Scope, Architecture, and scope clarification. Otherwise edit only
+  the active phase and materially affected later steps. Record pertinent detours
+  while actionable. Replace every surviving reference to removed phases
+  (dependencies, actions, risks, handoffs) with concrete implemented APIs, owners,
+  artifacts, or invariants, never removed phase numbers, titles, or prose.
 - After each implementation phase's first pass, spawn exactly one new sol xhigh
   reviewer with the relevant complete diff. Wait for and use its report before
   updating the executor; reuse that reviewer for follow-ups. Closure requires
   `COMPLETE`.
 - Phase reviewers compare `actionplan.md`, `CONTRACT.md`, and `AGENTS.md` for
-  end-to-end continuity: ambiguity, contradictions, vocabulary drift, missing
+  end-to-end continuity, ambiguity, contradictions, vocabulary drift, missing
   handoffs, and incompatible requirements.
-- Reviewers treat unrequested behavior loss as a blocker. For substantial
-  deletions or interface replacements, reconstruct the deleted behavior from
-  the complete prior implementation, callers, persisted forms, and tests, then
-  verify that every outcome is retained or is explicitly superseded by the
-  requirements. Prefer reuse of cohesive existing logic over deletion followed
-  by a partial reimplementation.
+- Reviewers block unrequested behavior loss. For substantial deletions or
+  interface replacements, reconstruct behavior from the complete prior
+  implementation, callers, persisted forms, and tests. Verify every outcome is
+  retained or explicitly superseded by requirements; prefer cohesive logic reuse
+  over deletion and partial reimplementation.
 - Reviews of Rust/Iced work verify component ownership and interaction rules
   against `CONTRACT.md`, relevant documentation, and source.
 - The reviewer must not edit `actionplan.md`. Staging files is optional. Fix
   medium through critical blockers that impede the required application
   behavior; optional nice-to-haves do not block the phase.
-- Treat interface changes as complete cutovers. Preserve backward
-  compatibility only when explicitly required. Do not add incremental
-  compatibility layers.
-- Reviews assess human-scale developer boundaries as well as runtime behavior.
-  Adding a product capability should extend one cohesive system or local
-  component through canonical reflected types, without mirrored vocabulary,
-  monolithic owners, or passthrough coordination layers.
+- Make complete interface cutovers; preserve backward compatibility only when
+  explicitly required, without incremental compatibility layers.
+- Review human-scale developer boundaries and runtime behavior. A product
+  capability should extend one cohesive system or local component through
+  canonical reflected types, without mirrored vocabulary, monolithic owners,
+  or passthrough coordination layers.
 - After `COMPLETE` and removal of the phase, commit all outstanding tracked
   changes except `actionplan.md`, which must remain uncommitted, never force-added.
 
 ### Post-main-phase framework audit
 
 Run one framework audit after each integer-numbered main implementation commit,
-before the next main phase (`Phase 2` is main; `Phase 2.1` is an audit subphase).
+before the next main phase (`Phase 2` is main; `Phase 2.1` an audit subphase).
 Do not audit subphase commits, Final Validation, or its checkpoints.
 
 Count changed files. Spawn exactly one fresh astra max agent without inherited
 context; supply the commit, main phase number/title, repository path, and prompt
-below. The agent independently reads the authorities and complete commit, may
-edit only `actionplan.md`, and must not build, test, or commit.
+below. It independently reads the authorities and complete commit, may edit only
+`actionplan.md`, and must not build, test, or commit.
 
-The prompt governs subphase insertion and later-phase changes. The main agent
-reviews scope and architectural alignment, then executes inserted subphases
+Follow the prompt for subphase insertion and later-phase changes. The main agent
+checks scope and architectural alignment, then executes inserted subphases
 through the ordinary executor/review/plan-update/commit workflow. After all
 subphases finish, inspect every later phase against the implemented framework
 and update materially affected dependencies, anchors, files, actions, and
@@ -307,80 +296,69 @@ Use this prompt verbatim, replacing `<MAIN PHASE>`, `<PHASE TITLE>`,
 
 ### Final Validation workflow
 
-The main agent owns all validation commands, diagnosis, and edits: application
-code, tests, build wiring, diagnostics, tooling, cleanup, and tidy fixes.
-Do not delegate validation implementation or troubleshooting to subagents.
-Do not turn validation fixes into implementation phases or detours to invoke
-executor/reviewer cycles. This rule applies regardless of the fix's size or
-number of failed attempts.
-
-Validation fixes receive no per-fix, phase, or framework review. The single
-cleanup review belongs to the cleanup stage before `post cleanup`. From that
-checkpoint onward, the main agent edits and validates directly without starting
-or reopening any review.
+The main agent owns all validation commands, diagnosis, and edits, including
+application code, tests, build wiring, diagnostics, tooling, cleanup, and tidy.
+Regardless of fix size or failed attempts, do not delegate validation
+implementation or troubleshooting, or turn fixes into implementation phases or
+detours invoking executor/reviewer cycles. Validation fixes receive no per-fix,
+phase, or framework review. The single cleanup review occurs before
+`post cleanup`; afterward the main agent edits and validates directly without
+starting or reopening reviews.
 
 Final Validation ends when the required final build, tests, and acceptance pass.
-Commit all remaining tracked changes, complete the documentation pass, and commit
-the documentation. Do not add a full-plan or whole-plan review, post-validation
-audit, or another validation stage. Documentation completion does not restart
-validation.
+Commit all remaining tracked changes, then complete and commit the documentation
+pass. Do not add a full-plan or whole-plan review, post-validation audit, or
+another validation stage; documentation does not restart validation.
 
-- The main agent runs these ordered stages: full tidy, full build, every
-  applicable cleanup profile, full tidy, cleanup review/remediation, final full
-  build, the complete `all` suite, then Wayland acceptance. Cleanup never
-  precedes successful initial tidy/build or follows the final build; tests
-  require that final build to pass.
-- The final test and acceptance gate is always exactly
-  `./mmltk --test all`, followed by
-  `./mmltk --test workspace-wayland --headless-compositor`.
-  Both must pass. Do not replace or supplement them with focused tests,
-  individual executables, additional suites, or plan-specific acceptance
-  commands. Put required feature coverage in these existing suites; diagnostic
-  investigation does not create another acceptance gate.
-- Both builds use `./mmltk --build`. Both tidy passes use the complete
-  configured `./mmltk --tidy` suite regardless of changed files or commits.
-  Resolve every genuine finding before the initial build. Do not reuse earlier
-  cleanup reports or start cleanup before initial tidy/build succeed.
-- Immediately after the successful pre-cleanup tidy and build, commit every
-  outstanding tracked change with the exact message `pre cleanup`; keep
-  `actionplan.md` uncommitted.
-- Obtain one full report per applicable cleanup profile, regardless of earlier
-  commits or changed files. Resolve every genuine hit, then run a final full
-  pass of every profile. Once all are clean, run the second full tidy and resolve
-  every genuine finding. If tidy remediation changes code, repeat cleanup then
-  tidy before continuing.
-- Group targeted cleanup and tidy follow-up paths in one invocation where
-  practical while preserving the governing stage order.
-  Proven detector false positives may use the narrow inline suppressions
-  documented below.
-- After clean cleanup/tidy, spawn exactly one fresh sol xhigh cleanup adversarial
-  reviewer for the cleanup stage, before the final rebuild. Supply
-  the complete diff from `pre cleanup` and the workflow-agnostic verifier prompt
-  below exactly once. Require it to prioritize time complexity and
-  system-boundary demarcation while auditing
-  cohesive ordinary C++ systems, high-quality DRY object-oriented design,
-  appropriate public/private class ownership, properly sealed interfaces,
-  appropriately scoped ordinary functions, canonical reflected schemas,
-  physical RAII resource safety, performance, and the absence of
-  detector-driven code distortion. It must reject brute-force suppression,
-  blind or overused templating, line compression, respelling, and indirection
-  added solely to quiet a detector. Schema/reflection and genuinely reusable
-  compile-time polymorphism may remain templated.
-- On `NOT COMPLETE`, the cleanup reviewer writes `remediationplan.md`; the main
-  agent checks scope/architecture, implements the corrections, and updates the
-  remediation plan directly. Follow up with that same reviewer until `COMPLETE`,
-  never spawning another cleanup reviewer or reissuing the prompt. After
-  remediation, rerun every applicable cleanup profile, then full tidy, before
-  follow-up review.
-- After the reviewer returns `COMPLETE` and cleanup and tidy reruns are clean,
-  commit all outstanding tracked cleanup, tidy, and remediation changes with
-  the exact message `post cleanup`; keep `actionplan.md` uncommitted.
-- From `post cleanup`, run the final full build once, then the complete `all`
-  suite and Wayland acceptance above, with no intervening cleanup/tidy. If
-  validation fails, the main agent diagnoses and edits the cause, rebuilds
-  affected product code with `./mmltk --build`, and reruns both required commands
-  in that order. Do not add a review or delegation step, repeat cleanup/tidy,
-  or reopen cleanup review for these fixes.
+Run these stages in order. Cleanup must follow successful initial tidy/build
+and never follow the final build; tests require a successful final build.
+Both builds use `./mmltk --build`; both tidy passes use the complete configured
+`./mmltk --tidy` suite regardless of changed files or commits.
+
+1. Run full tidy and resolve every genuine finding, then the initial full build.
+   Immediately after both succeed, commit every outstanding tracked change with
+   the exact message `pre cleanup`; keep `actionplan.md` uncommitted.
+2. Obtain a fresh full report from every applicable cleanup profile regardless
+   of earlier commits or changed files; never reuse earlier reports. Resolve
+   every genuine hit, then run a final full pass of every profile. Once all are
+   clean, run the second full tidy and resolve every genuine finding. If tidy
+   remediation changes code, repeat cleanup then tidy before continuing.
+3. After clean cleanup/tidy and before the final rebuild, spawn exactly one fresh
+   sol xhigh cleanup adversarial reviewer. Supply the complete diff from
+   `pre cleanup` and the workflow-agnostic verifier prompt below exactly once.
+   Require it to prioritize time complexity and system-boundary demarcation
+   while auditing cohesive ordinary C++ systems, high-quality DRY object-oriented
+   design, appropriate public/private class ownership, properly sealed
+   interfaces, appropriately scoped ordinary functions, canonical reflected
+   schemas, physical RAII resource safety, performance, and absence of
+   detector-driven code distortion. It must reject brute-force suppression,
+   blind or overused templating, line compression, respelling, and indirection
+   added solely to quiet a detector. Schema/reflection and genuinely reusable
+   compile-time polymorphism may remain templated.
+4. On `NOT COMPLETE`, the cleanup reviewer writes `remediationplan.md`. The main
+   agent checks scope/architecture, implements corrections, and updates the plan
+   directly. After remediation, rerun every applicable cleanup profile, then
+   full tidy before following up with the same reviewer until `COMPLETE`; never
+   spawn another cleanup reviewer or reissue the prompt.
+5. After the reviewer returns `COMPLETE` and cleanup and tidy reruns are clean,
+   commit all outstanding tracked cleanup, tidy, and remediation changes with
+   the exact message `post cleanup`; keep
+   `actionplan.md` uncommitted.
+6. From `post cleanup`, run the final full build once, then the complete `all`
+   suite and Wayland acceptance, exactly `./mmltk --test all` followed by
+   `./mmltk --test workspace-wayland --headless-compositor`, with no intervening
+   cleanup/tidy. Both must pass. Do not replace or supplement this gate with
+   focused tests, individual executables, additional suites, or plan-specific
+   acceptance commands. Put required feature coverage in these existing suites;
+   diagnostic investigation adds no acceptance gate.
+7. If validation fails after `post cleanup`, the main agent diagnoses and edits
+   the cause, rebuilds affected product code with `./mmltk --build`, and reruns
+   both required test commands in order. Do not add review or delegation, repeat
+   cleanup/tidy, or reopen cleanup review for these fixes.
+
+Group targeted cleanup and tidy follow-up paths in one invocation where
+practical, preserving stage order. Proven detector false positives may use the
+narrow inline suppressions [below](#deduplication-rules).
 
 ### Workflow-agnostic verifier prompt
 
@@ -489,14 +467,14 @@ paths; require one cohesive correction before phase closure.
 
 `remediationplan.md` is the reviewer's executable phased plan for the executor.
 After main-agent scope/architecture review, the same astra xhigh executor
-completes and updates it until no phases remain. Only then begin additional review.
-The scheduled cleanup review is the exception: the main agent implements and
-updates its remediation plan under Final Validation's ownership rules.
+completes and updates it until no phases remain; only then resume review.
+For scheduled cleanup review, the main agent instead implements and updates it
+under Final Validation's ownership rules.
 
 Include a problem statement or goal, Summary, Scope, Architecture, authoritative
-review set, findings, concrete phases, important files, exact actions/locations,
-architectural constraints, and post-cleanup concerns; exclude user-facing notes
-and repeated `AGENTS.md` constraints.
+review set, findings, concrete phases, important files, every expected changed
+file, exact actions/locations, architectural constraints, and post-cleanup
+concerns. Exclude user-facing notes and repeated `AGENTS.md` constraints.
 
 ### Writing a remediation plan
 
@@ -504,19 +482,16 @@ and repeated `AGENTS.md` constraints.
   the main-agent workflow.
 - Arrange dependent work to avoid back-and-forth edits. Compilation occurs in
   Final Validation.
-- Include every file expected to change.
 
 ### Executing a remediation plan
 
-- The executing owner modifies `remediationplan.md`: the main agent for cleanup
-  review remediation, otherwise the designated executor.
 - Work may be pulled forward when it creates a complete, cohesive cutover.
-- Atomically remove each completed phase from `remediationplan.md`, leaving only
-  actionable steps. Change only that phase; preserve Summary, Scope,
-  Architecture, and scope clarification.
+- The executing owner atomically removes each completed phase from
+  `remediationplan.md`, leaving only actionable steps. Change only that phase;
+  preserve Summary, Scope, Architecture, and scope clarification. Never defer
+  updates or force-commit `remediationplan.md`.
 - Apply the action-plan behavior-preservation rule before deleting or replacing
   substantial code, including code outside the immediate finding location.
-- Do not defer updates until the end or force-commit `remediationplan.md`.
 - Apply the action-plan complete-cutover and compatibility rules.
 
 ## Code Churn
@@ -529,7 +504,9 @@ derivation and exhaustive dispatch.
 
 ## Code Deduplication
 
-Remove all genuine duplicated code in scope, including cross-file duplication.
+Remove all genuine duplicated code in scope, including cross-file duplication,
+by consolidating repeated behavior or data into one reusable implementation or
+canonical reflected declaration.
 Do not bypass cleanup by installing system dependencies or evade either
 detector through line compression, respelling, one-method wrappers, or
 pass-through indirection.
@@ -544,7 +521,7 @@ runtime-discovery needs. Reflection owns only reusable structural projection;
 ordinary classes retain clear public contracts, private state, sealed ownership,
 and direct functions.
 
-Prefer deleting unused variants over abstracting them. Before extracting helpers,
+Prefer deleting unused variants over abstracting them. Before helper extraction,
 search callers for an existing registry, reflected dispatch surface, factory,
 ordinary system, or utility expressing the concept. Before deleting/replacing
 artifacts, search the entire repository and migrate every caller in one cutover.
@@ -556,8 +533,6 @@ report formats.
 
 ### Deduplication rules
 
-- Resolve a hit by consolidating repeated behavior or data into one reusable
-  implementation or canonical reflected declaration.
 - Replace string-keyed dispatch with the canonical typed enum or reflected
   intent. Do not consolidate comparisons into a parallel string table.
 - Derive wire, event, and client payload projections from canonical reflected
@@ -637,11 +612,9 @@ unnecessary blocking.
 
 ## Tidy
 
-All validation follows Final Validation's full
-tidy/build/cleanup/tidy/final-build/tests order. Run both builds with
-`./mmltk --build`. During action-plan execution, insert the single cleanup
-review before the final build. Final build/test/acceptance success leads directly
-to documentation and commits under the Final Validation workflow.
+All validation follows [Final Validation](#final-validation-workflow)'s stage
+order, commands, and completion rules; action plans include its single cleanup
+review before the final build.
 
 The full suite formats first-party C/C++/CUDA and the Iced application Rust
 package, runs clang-tidy on supported native translation units, and validates
@@ -655,18 +628,17 @@ flagged files together where practical. Do not run `--third_party`.
 
 ## Governing Contract and System Architecture
 
-- Keep this file focused on workflow and repository navigation. Put product
-  architecture in `CONTRACT.md`, documentation, and source, not code-specific
-  names or examples here. Exact operational prompts and log references are
-  exceptions.
+- Keep this file within its [documentation scope](#documentation). Put product
+  architecture in `CONTRACT.md`, documentation, and source. Omit code-specific
+  names/examples except exact operational prompts and log references.
 - `CONTRACT.md` states only positive desired architecture/product outcomes;
-  put historical negatives and migration details in plans.
-- `CONTRACT.md` describes broad architectural, browser, UI, GPU, performance,
-  failure, and shutdown outcomes. Keep it concise, using diagrams and a
-  current ownership matrix at system boundaries. Keep per-system algorithms,
-  method and protocol-record inventories, library choices, fixed private
-  budgets, temporary migration state, test fixtures, callback plumbing,
-  diagnostic layouts, and class-private state out of it.
+  historical negatives and migration details belong in plans.
+- Keep the contract concise, using diagrams and a current ownership matrix at
+  system boundaries. Cover broad architectural, browser, UI, GPU, performance,
+  failure, and shutdown outcomes; exclude per-system algorithms, method and
+  protocol-record inventories, library choices, fixed private budgets,
+  temporary migration state, test fixtures, callback plumbing, diagnostic
+  layouts, and class-private state.
 - `CONTRACT.md` is authoritative; implementation/plans converge toward it.
   Change it only for user-intended architecture/product outcome changes.
 - Consult the contract, relevant documentation, and owning source for product

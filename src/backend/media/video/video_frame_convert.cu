@@ -19,8 +19,8 @@ __global__ void convert(VideoColorConversion input, unsigned width, unsigned hei
   float second = sample(input.planes[1], x >> input.chroma_x, y >> input.chroma_y);
   float third = sample(input.planes[2], x >> input.chroma_x, y >> input.chroma_y);
   if (!input.rgb) {
-   const float scale = static_cast<float>(1U << (input.planes[0].depth - 8));
-   const float maximum = static_cast<float>((1U << input.planes[0].depth) - 1U);
+   const auto scale = static_cast<float>(1U << (input.planes[0].depth - 8));
+   const auto maximum = static_cast<float>((1U << input.planes[0].depth) - 1U);
    const float yy = input.full_range ? first : (first * maximum - 16.0F * scale) / (219.0F * scale);
    const float cb = (second * maximum - 128.0F * scale) / ((input.full_range ? maximum : 224.0F * scale));
    const float cr = (third * maximum - 128.0F * scale) / ((input.full_range ? maximum : 224.0F * scale));

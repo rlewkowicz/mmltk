@@ -146,7 +146,6 @@ void emit_rust_value(std::ostream& output, const mmltk::controller::browser::wir
  std::ranges::transform(result, result.begin(), [](unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
  return result;
 }
-
 // CLEANUP-IGNORE: Constant and type identifiers share only namespace stripping; casing and keyword policies are distinct.
 [[nodiscard]] std::string rust_constant_identifier(std::string_view source) {
  if (const auto separator = source.rfind("::"); separator != std::string_view::npos) source.remove_prefix(separator + 2U);
@@ -408,8 +407,7 @@ public:
   Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
    Schema::VisitEndpoints([&]<class Endpoint>() {
     if constexpr (Endpoint::interaction && std::same_as<typename Endpoint::system_cell, Cell> && std::same_as<typename Endpoint::request_type, mmltk::controller::WorkspaceMouse>) {
-     output_ << "PresentationSourceKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(Projection::kind), true)
-             << " => Some(" << Endpoint::stable_id << "),\n";
+     output_ << "PresentationSourceKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(Projection::kind), true) << " => Some(" << Endpoint::stable_id << "),\n";
     }
    });
   });
@@ -1349,7 +1347,7 @@ private:
   });
   output_ << "]) }\n";
  }
- template<class Value>
+ template <class Value>
  void EmitValueConstraints() {
   const auto owner = rust_type<Value>();
   mmltk::frameworks::reflection::visit_materialized_members<Value>([&]<class Declaration>(const auto& fact) {
@@ -1357,8 +1355,8 @@ private:
    if constexpr (std::is_arithmetic_v<Member>) {
     const auto function = "constraint_" + rust_relation_identifier(owner + std::string(fact.member_name));
     symbols_.Reserve("module", function, "native value constraint " + owner + "." + std::string(fact.member_name));
-    output_ << "pub const fn " << function << "() -> SettingsLeafConstraint { SettingsLeafConstraint { stable_field_id: "
-            << mmltk::controller::browser::application_stable_id(owner, fact.member_name) << ", ";
+    output_ << "pub const fn " << function << "() -> SettingsLeafConstraint { SettingsLeafConstraint { stable_field_id: " << mmltk::controller::browser::application_stable_id(owner, fact.member_name)
+            << ", ";
     EmitConstraintFields(mmltk::frameworks::reflection::policy_of_member<Declaration::pointer>());
     output_ << " } }\n";
    }
@@ -1376,8 +1374,8 @@ private:
     auto candidate = recipe;
     candidate.lr_scheduler = scheduler;
     output_ << "(TrainOptimizerKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(recipe.optimizer), true)
-            << ", TrainLrSchedulerKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(scheduler), true) << ") => "
-            << (r::train_recipe_values_valid(candidate) ? "true" : "false") << ",\n";
+            << ", TrainLrSchedulerKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(scheduler), true) << ") => " << (r::train_recipe_values_valid(candidate) ? "true" : "false")
+            << ",\n";
    }
   }
   output_ << "} }\n";
@@ -1387,8 +1385,8 @@ private:
    const auto mode = lane_entry.value;
    r::TrainLaneConfiguration configuration;
    configuration.mode = mode;
-   output_ << "TrainLaneMode::" << rust_identifier(mmltk::frameworks::reflection::enum_name(mode), true) << " => TrainFinalPolicy::"
-           << rust_identifier(mmltk::frameworks::reflection::enum_name(r::effective_final_policy(configuration)), true) << ",\n";
+   output_ << "TrainLaneMode::" << rust_identifier(mmltk::frameworks::reflection::enum_name(mode), true)
+           << " => TrainFinalPolicy::" << rust_identifier(mmltk::frameworks::reflection::enum_name(r::effective_final_policy(configuration)), true) << ",\n";
   }
   output_ << "}) }\n";
   ReserveGeneratedStruct("SettingsLeafFact", "generated settings-leaf metadata",
@@ -1500,7 +1498,7 @@ private:
    EmitConstraintFields(fact.constraint);
    output_ << " } }\n";
   });
-   EmitValueConstraints<mmltk::backend::models::rfdetr::TrainModelSettings>();
+  EmitValueConstraints<mmltk::backend::models::rfdetr::TrainModelSettings>();
   EmitValueConstraints<mmltk::backend::models::rfdetr::TrainLaneConfiguration>();
  }
  void EmitRequestDefaults() {
@@ -1626,9 +1624,7 @@ private:
   });
   output_ << "}\nimpl " << field_type << " { fn bit(self) -> u16 { match self {\n";
   std::size_t ordinal = 0U;
-  visit_fields([&]<class Entry>(const auto&, const auto& variant, const auto&) {
-   output_ << "Self::" << variant << " => " << (std::uint16_t{1U} << ordinal++) << "u16,\n";
-  });
+  visit_fields([&]<class Entry>(const auto&, const auto& variant, const auto&) { output_ << "Self::" << variant << " => " << (std::uint16_t{1U} << ordinal++) << "u16,\n"; });
   output_ << "} } }\nimpl " << override_type << " {\n"
           << "pub fn overridden(&self, field: " << field_type << ") -> bool { self.0 & field.bit() != 0 }\n"
           << "fn set_override(&mut self, field: " << field_type << ") { self.0 |= field.bit(); }\n"
@@ -1678,8 +1674,7 @@ private:
   symbols_.Reserve("module", edit_type, source);
   for (const auto& variant : {selector_variant, std::string("Clear"), std::string("Reset")}) symbols_.Reserve("enum " + edit_type, variant, source);
   symbols_.Reserve("impl " + edit_type, "apply", source);
-  output_ << "#[derive(Debug, Clone, PartialEq)]\npub enum " << edit_type << " {\n"
-          << selector_variant << "(" << rust_type<SelectorValue>() << "),\n";
+  output_ << "#[derive(Debug, Clone, PartialEq)]\npub enum " << edit_type << " {\n" << selector_variant << "(" << rust_type<SelectorValue>() << "),\n";
   visit_fields([&]<class Entry>(const auto& path, const auto& variant, const auto&) {
    using Field = mmltk::frameworks::reflection::accessor_value_t<typename Relation::destination_type, Entry::destination>;
    symbols_.Reserve("enum " + edit_type, variant, source + " " + std::string(path.view()));
@@ -1687,13 +1682,9 @@ private:
   });
   output_ << "Clear(" << field_type << "), Reset,\n}\nimpl " << edit_type << " { pub fn apply(self, state: &mut " << value_type << ") { match self {\n"
           << "Self::" << selector_variant << "(value) => select_" << value_prefix << "(state, value),\n";
-  visit_fields([&]<class Entry>(const auto&, const auto& variant, const auto& suffix) {
-   output_ << "Self::" << variant << "(value) => edit_" << suffix << "(state, value),\n";
-  });
+  visit_fields([&]<class Entry>(const auto&, const auto& variant, const auto& suffix) { output_ << "Self::" << variant << "(value) => edit_" << suffix << "(state, value),\n"; });
   output_ << "Self::Clear(field) => match field {\n";
-  visit_fields([&]<class Entry>(const auto&, const auto& variant, const auto& suffix) {
-   output_ << field_type << "::" << variant << " => reset_" << suffix << "(state),\n";
-  });
+  visit_fields([&]<class Entry>(const auto&, const auto& variant, const auto& suffix) { output_ << field_type << "::" << variant << " => reset_" << suffix << "(state),\n"; });
   output_ << "}, Self::Reset => reset_" << value_prefix << "(state),\n} } }\n";
  }
  void EmitSettingsRelations() {
@@ -1714,8 +1705,8 @@ private:
        constexpr auto destination = mmltk::frameworks::reflection::rebase_member_path<Settings, typename Relation::destination_type>(Selector, Entry::destination);
        constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<Settings, destination>();
        constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<typename Relation::source_type, Entry::source>();
-       output_ << "SettingsRelationFact { stable_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(path.view())
-               << ", source_path: " << std::quoted(source.view()) << ", destination_path: " << std::quoted(path.view()) << " },\n";
+       output_ << "SettingsRelationFact { stable_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(path.view()) << ", source_path: " << std::quoted(source.view())
+               << ", destination_path: " << std::quoted(path.view()) << " },\n";
       });
      }
     });
@@ -1737,8 +1728,8 @@ private:
     const auto value_suffix = value_prefix + "_" + rust_identifier(relative.view(), false);
     symbols_.Reserve("module", "edit_relation_" + suffix, source + " " + std::string(relative.view()));
     symbols_.Reserve("module", "clear_relation_" + suffix, source + " " + std::string(relative.view()));
-    output_ << "pub fn edit_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ", value: " << rust_type<Field>()
-            << ") -> SettingsValueUpdate { edit_" << value_suffix << "(&mut state";
+    output_ << "pub fn edit_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ", value: " << rust_type<Field>() << ") -> SettingsValueUpdate { edit_" << value_suffix
+            << "(&mut state";
     emit_rust_field_access(output_, parent);
     output_ << ", value.clone()); update_" << suffix << "(value) }\n";
     output_ << "pub fn clear_relation_" << suffix << "(state: &mut " << rust_type<Settings>() << ") -> SettingsValueUpdate { reset_" << value_suffix << "(&mut state";
@@ -1760,8 +1751,7 @@ private:
    constexpr auto selector_member = std::remove_cvref_t<decltype(Relation::destination_selector)>::terminal_member;
    const auto selector_variant = rust_identifier(mmltk::frameworks::reflection::materialized_member_name<selector_member>(), true);
    symbols_.Reserve("module", edit_function, source);
-   output_ << "pub fn " << edit_function << "(state: &mut " << rust_type<Settings>() << ", edit: " << edit_type
-           << ") -> Vec<SettingsValueUpdate> { match edit {\n"
+   output_ << "pub fn " << edit_function << "(state: &mut " << rust_type<Settings>() << ", edit: " << edit_type << ") -> Vec<SettingsValueUpdate> { match edit {\n"
            << edit_type << "::" << selector_variant << "(value) => { select_" << value_prefix << "(&mut state";
    emit_rust_field_access(output_, parent);
    output_ << ", value.clone()); vec![update_" << rust_identifier(selector.view(), false) << "(value)] },\n";
@@ -1773,13 +1763,9 @@ private:
      visitor(rust_identifier(mmltk::frameworks::reflection::materialized_member_name<terminal>(), true), rust_identifier(path.view(), false));
     });
    };
-   visit_edits([&](const auto& variant, const auto& suffix) {
-    output_ << edit_type << "::" << variant << "(value) => vec![edit_relation_" << suffix << "(state, value)],\n";
-   });
+   visit_edits([&](const auto& variant, const auto& suffix) { output_ << edit_type << "::" << variant << "(value) => vec![edit_relation_" << suffix << "(state, value)],\n"; });
    output_ << edit_type << "::Clear(field) => vec![match field {\n";
-   visit_edits([&](const auto& variant, const auto& suffix) {
-    output_ << field_type << "::" << variant << " => clear_relation_" << suffix << "(state),\n";
-   });
+   visit_edits([&](const auto& variant, const auto& suffix) { output_ << field_type << "::" << variant << " => clear_relation_" << suffix << "(state),\n"; });
    output_ << "}], " << edit_type << "::Reset => " << reset << "(state).into(),\n} }\n";
   });
  }

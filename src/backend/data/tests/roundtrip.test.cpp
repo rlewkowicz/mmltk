@@ -482,7 +482,6 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  }
  REQUIRE(total == 14U);
  dropped_loader.synchronize();
-
  // Explicit schedules own repeats, order and logical keys even when legacy
  // loader configuration requests a shuffle/shard. Borrowed views retain them.
  auto planned_cfg = shuffled_cfg;
@@ -520,7 +519,8 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  auto invalid = std::make_shared<DatasetIndexSchedule>();
  invalid->image_indices = {static_cast<std::uint32_t>(NUM_IMAGES)};
  REQUIRE_THROWS(planned_loader.begin_epoch(invalid));
- invalid->image_indices = {0, 1, 2, 3}; invalid->draw_keys = {1};
+ invalid->image_indices = {0, 1, 2, 3};
+ invalid->draw_keys = {1};
  REQUIRE_THROWS(planned_loader.begin_epoch(invalid));
  invalid->draw_keys.clear();
  REQUIRE_THROWS(planned_loader.begin_epoch(invalid, 1));
@@ -536,14 +536,24 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  DatasetLoader shared_peer(shared_config);
  CHECK(shared_owner->compiled_source() == shared_peer.compiled_source());
  CHECK(shared_owner->label_index() == shared_peer.label_index());
- auto first_schedule = std::make_shared<DatasetIndexSchedule>(); first_schedule->image_indices = {0, 1, 2, 3};
- auto other_schedule = std::make_shared<DatasetIndexSchedule>(); other_schedule->image_indices = {4, 5, 6, 7};
- shared_owner->begin_epoch(first_schedule); shared_peer.begin_epoch(other_schedule);
- shared_owner->stop_workers(); shared_owner.reset(); shared_config.source.reset();
+ auto first_schedule = std::make_shared<DatasetIndexSchedule>();
+ first_schedule->image_indices = {0, 1, 2, 3};
+ auto other_schedule = std::make_shared<DatasetIndexSchedule>();
+ other_schedule->image_indices = {4, 5, 6, 7};
+ shared_owner->begin_epoch(first_schedule);
+ shared_peer.begin_epoch(other_schedule);
+ shared_owner->stop_workers();
+ shared_owner.reset();
+ shared_config.source.reset();
  REQUIRE(shared_peer.next_batch(batch));
- CHECK(batch.image_indices[0] == 4); CHECK(batch.image_indices[3] == 7);
- shared_peer.release_batch(batch); CHECK_FALSE(shared_peer.next_batch(batch)); shared_peer.synchronize();
- auto mismatched = planned_cfg; mismatched.source = shared_peer.compiled_source(); mismatched.compiled_path += ".missing";
+ CHECK(batch.image_indices[0] == 4);
+ CHECK(batch.image_indices[3] == 7);
+ shared_peer.release_batch(batch);
+ CHECK_FALSE(shared_peer.next_batch(batch));
+ shared_peer.synchronize();
+ auto mismatched = planned_cfg;
+ mismatched.source = shared_peer.compiled_source();
+ mismatched.compiled_path += ".missing";
  REQUIRE_THROWS(DatasetLoader(mismatched));
  DatasetLoader same_seed_a(shuffled_cfg);
  DatasetLoader same_seed_b(shuffled_cfg);

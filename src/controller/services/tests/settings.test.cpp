@@ -130,44 +130,58 @@ static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSe
 void test_canonical_recipe_round_trip_and_scoped_overrides() {
  namespace r = mmltk::backend::models::rfdetr;
  mmltk::testsupport::ScopedTempDir root{"mmltk-schema-v9-recipe"};
- for (const auto& row : r::kTrainRecipeCatalog) for (bool explicit_overrides : {false, true}) {
-  auto state = default_gui_settings_state();
-  auto& request = state.workflows.train.request;
-  request.recipe.optimizer = row.optimizer;
-  r::reset_train_recipe(request.recipe);
-  TrainRecipeRelation::VisitMembers([&]<class Entry> { if (explicit_overrides) TrainRecipeRelation::set_override<Entry::destination>(request.recipe.overrides); });
-  r::resize_training_models(request.lane_configuration, 2, request.recipe, request.seed);
-  request.lane_configuration.models[1].recipe.lr = .003;
-  set_recipe_override(request.lane_configuration.models[1].recipe.overrides, &TrainRecipeSettings::lr, true);
-  const auto document = snapshot_gui_settings(state);
-  CHECK(document.at("schema_version") == 9U);
-  const auto& training = document.at("workflows").at("train").at("training");
-  CHECK_FALSE(training.contains("lr"));
-  CHECK_FALSE(training.contains("optimizer"));
-  const auto& recipe = training.at("recipe");
-  CHECK(recipe.size() == r::kTrainRecipeFieldCount + 2);
-  TrainRecipeRelation::VisitMembers([&]<class Entry>() {
-   constexpr auto field = mmltk::frameworks::reflection::reflected_member_path<TrainRecipeSettings, Entry::destination>();
-   CHECK(recipe.contains(std::string(field.view())));
-   CHECK((mmltk::frameworks::reflection::access<const TrainRecipeSettings, Entry::destination>(request.recipe) ==
-          mmltk::frameworks::reflection::access<const r::TrainRecipeCatalogEntry, Entry::source>(row)));
-  });
-  CHECK(recipe.at("optimizer") == mmltk::frameworks::reflection::enum_name(row.optimizer));
-  CHECK(recipe.at("overrides").at("mask") == (explicit_overrides ? r::kTrainRecipeOverrideBits : 0));
-  auto loaded = default_gui_settings_state();
-  bool repaired = true;
-  REQUIRE(load_settings(write_recipe_case(root, "roundtrip.json", document), loaded, nullptr, &repaired));
-  CHECK_FALSE(repaired);
-  CHECK(loaded == state);
-  CHECK(snapshot_gui_settings(loaded) == document);
- }
+ for (const auto& row : r::kTrainRecipeCatalog)
+  for (bool explicit_overrides : {false, true}) {
+   auto state = default_gui_settings_state();
+   auto& request = state.workflows.train.request;
+   request.recipe.optimizer = row.optimizer;
+   r::reset_train_recipe(request.recipe);
+   TrainRecipeRelation::VisitMembers([&]<class Entry> {
+    if (explicit_overrides) TrainRecipeRelation::set_override<Entry::destination>(request.recipe.overrides);
+   });
+   r::resize_training_models(request.lane_configuration, 2, request.recipe, request.seed);
+   request.lane_configuration.models[1].recipe.lr = .003;
+   set_recipe_override(request.lane_configuration.models[1].recipe.overrides, &TrainRecipeSettings::lr, true);
+   const auto document = snapshot_gui_settings(state);
+   CHECK(document.at("schema_version") == 9U);
+   const auto& training = document.at("workflows").at("train").at("training");
+   CHECK_FALSE(training.contains("lr"));
+   CHECK_FALSE(training.contains("optimizer"));
+   const auto& recipe = training.at("recipe");
+   CHECK(recipe.size() == r::kTrainRecipeFieldCount + 2);
+   TrainRecipeRelation::VisitMembers([&]<class Entry>() {
+    constexpr auto field = mmltk::frameworks::reflection::reflected_member_path<TrainRecipeSettings, Entry::destination>();
+    CHECK(recipe.contains(std::string(field.view())));
+    CHECK((mmltk::frameworks::reflection::access<const TrainRecipeSettings, Entry::destination>(request.recipe) ==
+           mmltk::frameworks::reflection::access<const r::TrainRecipeCatalogEntry, Entry::source>(row)));
+   });
+   CHECK(recipe.at("optimizer") == mmltk::frameworks::reflection::enum_name(row.optimizer));
+   CHECK(recipe.at("overrides").at("mask") == (explicit_overrides ? r::kTrainRecipeOverrideBits : 0));
+   auto loaded = default_gui_settings_state();
+   bool repaired = true;
+   REQUIRE(load_settings(write_recipe_case(root, "roundtrip.json", document), loaded, nullptr, &repaired));
+   CHECK_FALSE(repaired);
+   CHECK(loaded == state);
+   CHECK(snapshot_gui_settings(loaded) == document);
+  }
 }
 void test_recipe_override_masks_keep_the_schema_nine_meanings() {
  namespace r = mmltk::backend::models::rfdetr;
  // This is the persisted-format oracle, deliberately independent of declaration order.
  constexpr std::array<std::pair<std::string_view, std::uint16_t>, 13U> masks{{
-  {"lr", 1U}, {"lr_encoder", 2U}, {"lr_component_decay", 4U}, {"encoder_layer_decay", 8U}, {"momentum", 16U}, {"weight_decay", 32U},
-  {"warmup_epochs", 64U}, {"warmup_momentum", 128U}, {"lr_min_factor", 256U}, {"lr_drop", 512U}, {"lr_scheduler", 1024U}, {"nesterov", 2048U}, {"warmup_bias_lr", 4096U},
+  {"lr", 1U},
+  {"lr_encoder", 2U},
+  {"lr_component_decay", 4U},
+  {"encoder_layer_decay", 8U},
+  {"momentum", 16U},
+  {"weight_decay", 32U},
+  {"warmup_epochs", 64U},
+  {"warmup_momentum", 128U},
+  {"lr_min_factor", 256U},
+  {"lr_drop", 512U},
+  {"lr_scheduler", 1024U},
+  {"nesterov", 2048U},
+  {"warmup_bias_lr", 4096U},
  }};
  STATIC_REQUIRE(r::kTrainRecipeFieldCount == masks.size());
  STATIC_REQUIRE(r::kTrainRecipeOverrideBits == 8191U);
@@ -231,8 +245,10 @@ void test_current_recipe_malformed_values_and_historical_encodings_reject_atomic
   malformed["workflows"]["train"]["training"]["recipe"][key] = nullptr;
   reject(malformed);
   auto invalid = complete;
-  invalid["workflows"]["train"]["training"]["recipe"][key] = value.is_object() ? nlohmann::json{{"mask", 65535}} :
-   value.is_number() ? nlohmann::json(-1) : value.is_string() ? nlohmann::json("unknown") : nlohmann::json{1};
+  invalid["workflows"]["train"]["training"]["recipe"][key] = value.is_object()    ? nlohmann::json{{"mask", 65535}}
+                                                             : value.is_number()  ? nlohmann::json(-1)
+                                                              : value.is_string() ? nlohmann::json("unknown")
+                                                                                  : nlohmann::json{1};
   reject(invalid);
  }
  for (const auto key : {"optimizer", "lr_scheduler"}) {
@@ -240,8 +256,12 @@ void test_current_recipe_malformed_values_and_historical_encodings_reject_atomic
   historical["workflows"]["train"]["training"]["recipe"][key] = 0;
   reject(historical);
  }
- auto historical = complete; historical["schema_version"] = 8U; reject(historical);
- auto absent = complete; absent.erase("schema_version"); reject(absent);
+ auto historical = complete;
+ historical["schema_version"] = 8U;
+ reject(historical);
+ auto absent = complete;
+ absent.erase("schema_version");
+ reject(absent);
 }
 void test_ui_settings_round_trip() {
  SettingsViewStates states;
@@ -1629,7 +1649,6 @@ TEST_CASE("workflow GPU preferences persist independently of immutable CUDA inve
  CHECK(persisted.find("CUDA device") == std::string::npos);
  CHECK(persisted.find("cuda_devices") == std::string::npos);
 }
-
 TEST_CASE("validation lane count survives flat and nested settings persistence", "[gui][settings][validation]") {
  auto state = default_gui_settings_state();
  state.workflows.validate.request.lanes = 7;

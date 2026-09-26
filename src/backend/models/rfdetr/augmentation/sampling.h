@@ -17,7 +17,7 @@ namespace mmltk::backend::models::rfdetr {
 [[nodiscard]] inline std::uint32_t select_augmentation_preview_donor_image(
  const std::span<const std::uint32_t> annotated_indices, const std::uint32_t source_index, const std::uint64_t image_key) noexcept {
  if (annotated_indices.empty()) { return source_index; }
- std::size_t position = static_cast<std::size_t>(mmltk::common::math::deterministic_mix64(image_key ^ 0x51ed2705ULL) % annotated_indices.size());
+ auto position = static_cast<std::size_t>(mmltk::common::math::deterministic_mix64(image_key ^ 0x51ed2705ULL) % annotated_indices.size());
  if (annotated_indices[position] == source_index && annotated_indices.size() > 1U) { position = (position + 1U) % annotated_indices.size(); }
  return annotated_indices[position];
 }

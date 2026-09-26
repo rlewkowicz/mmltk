@@ -167,7 +167,9 @@ TrainingCheckpoint detail::inspect_training_model_checkpoint(const DecodedNative
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
   tensors.emplace(entry.name, entry.tensor);
  }
- const auto names = request.recipe.optimizer == TrainOptimizerKind::AdamW ? NativeAdamW::InspectCheckpoint(optimizer, tensors, stop, &continuation->values.schedule) : request.recipe.optimizer == TrainOptimizerKind::SGD ? NativeSGD::InspectCheckpoint(optimizer, tensors, stop, &continuation->values.schedule) : NativeMuonWithAuxAdam::InspectCheckpoint(optimizer, tensors, stop, &continuation->values.schedule);
+ const auto names = request.recipe.optimizer == TrainOptimizerKind::AdamW ? NativeAdamW::InspectCheckpoint(optimizer, tensors, stop, &continuation->values.schedule)
+                    : request.recipe.optimizer == TrainOptimizerKind::SGD ? NativeSGD::InspectCheckpoint(optimizer, tensors, stop, &continuation->values.schedule)
+                                                                          : NativeMuonWithAuxAdam::InspectCheckpoint(optimizer, tensors, stop, &continuation->values.schedule);
  if (request.use_ema) {
   torch::serialize::InputArchive ema;
   archive.read("ema_state", ema);

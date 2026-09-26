@@ -66,8 +66,8 @@ std::int64_t CachedAugmentationDonorIndex::select_for_image(const std::uint64_t 
  const auto start = std::min<std::size_t>(static_cast<std::size_t>(augment_math::uniform01(key, 0x4001ULL) * static_cast<float>(donors_.size())), donors_.size() - 1U);
  return select(start, source);
 }
-void detail::prepare_augmentation_image(AugmentationImagePlan& plan, const GpuAugmentationConfig& config, std::uint64_t key, std::uint32_t dataset_index,
- const GpuAugmentationDonor* selected, std::int64_t donor_slot, float* image_parameters, float* paste) {
+void detail::prepare_augmentation_image(AugmentationImagePlan& plan, const GpuAugmentationConfig& config, std::uint64_t key, std::uint32_t dataset_index, const GpuAugmentationDonor* selected,
+ std::int64_t donor_slot, float* image_parameters, float* paste) {
  plan = {};
  prepare_image_plan(plan, augmentation_launch_config(config), key, image_parameters);
  plan.cache_choice = augment_math::uniform01(key, 0x5000ULL);

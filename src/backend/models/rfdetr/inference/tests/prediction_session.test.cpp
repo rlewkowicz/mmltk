@@ -1,13 +1,17 @@
 #include "src/backend/models/rfdetr/training/detail/training_artifact.h"
 #include "src/frameworks/gpu/tests/pinned_host_fault.h"
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/backend/ml/torch/tests/tensor_fixture.h"
 #include "src/backend/models/rfdetr/core/tests/class_artifact_fixture.h"
 #include "src/test_support/cuda_test_utils.hpp"
 #include <catch2/generators/catch_generators.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/CPUGeneratorImpl.h>
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/common/io/file_digest.h"
+#include "src/common/math/checked_arithmetic.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"
@@ -58,18 +62,28 @@ TEST_CASE("Fixed artifact batches preserve tails ordered lane reuse and callback
  const mmltk::testsupport::ScopedTempDir root("artifact-inference-lanes");
  auto request = rfdetr::test_support::prediction_image_fixture(root.path());
  mmltk_onnx::ModelProto model;
- { std::ifstream input(request.onnx_path, std::ios::binary); REQUIRE(model.ParseFromIstream(&input)); }
+ {
+  std::ifstream input(request.onnx_path, std::ios::binary);
+  REQUIRE(model.ParseFromIstream(&input));
+ }
  auto* graph = model.mutable_graph();
  graph->mutable_input(0)->mutable_type()->mutable_tensor_type()->mutable_shape()->mutable_dim(0)->set_dim_value(3);
  for (auto& output : *graph->mutable_output()) output.mutable_type()->mutable_tensor_type()->mutable_shape()->mutable_dim(0)->set_dim_value(3);
- for (auto& tensor : *graph->mutable_initializer()) if (tensor.dims_size()) {
-  tensor.set_dims(0, 3);
-  const std::vector<float> values(tensor.float_data().begin(), tensor.float_data().end());
-  for (int copy = 0; copy < 2; ++copy) for (float value : values) tensor.add_float_data(value);
+ for (auto& tensor : *graph->mutable_initializer())
+  if (tensor.dims_size()) {
+   tensor.set_dims(0, 3);
+   const std::vector<float> values(tensor.float_data().begin(), tensor.float_data().end());
+   for (int copy = 0; copy < 2; ++copy)
+    for (float value : values) tensor.add_float_data(value);
+  }
+ {
+  std::ofstream output(request.onnx_path, std::ios::binary | std::ios::trunc);
+  REQUIRE(model.SerializeToOstream(&output));
  }
- { std::ofstream output(request.onnx_path, std::ios::binary | std::ios::trunc); REQUIRE(model.SerializeToOstream(&output)); }
  rfdetr::BuildEngineRequest engine;
- engine.onnx_path = request.onnx_path; engine.output_path = root.path() / "batch3.engine"; engine.allow_fp16 = false;
+ engine.onnx_path = request.onnx_path;
+ engine.output_path = root.path() / "batch3.engine";
+ engine.allow_fp16 = false;
  rfdetr::build_tensorrt_engine(engine);
  request.lanes = 4;
  request.preset_name = "rf-detr-nano";
@@ -87,25 +101,39 @@ TEST_CASE("Fixed artifact batches preserve tails ordered lane reuse and callback
    std::vector<std::int64_t> delivered;
    std::set<std::uintptr_t> streams;
    unsigned admissions = 0;
-   const auto result = session.Run(request, command, {
-    .source_pixels = true,
-    .completed = [&](const auto& record, auto pixels, const auto& annotations) {
-     delivered.push_back(record.image_id); streams.insert(pixels.stream);
-     REQUIRE(pixels.rgb8);
-     CHECK(annotations.masks_available);
-    },
-    .admitted = [&](const auto& facts) { ++admissions; CHECK(facts.admitted_capacity == 3); CHECK(facts.effective_batch_per_model == 9); },
-   });
+   const auto result = session.Run(request, command,
+    {
+     .source_pixels = true,
+     .completed =
+      [&](const auto& record, auto pixels, const auto& annotations) {
+       delivered.push_back(record.image_id);
+       streams.insert(pixels.stream);
+       REQUIRE(pixels.rgb8);
+       CHECK(annotations.masks_available);
+      },
+     .admitted =
+      [&](const auto& facts) {
+       ++admissions;
+       CHECK(facts.admitted_capacity == 3);
+       CHECK(facts.effective_batch_per_model == 9);
+      },
+    });
    CHECK(admissions == 1);
    CHECK(result.processed_images == 7);
    CHECK(delivered == std::vector<std::int64_t>{10, 11, 12, 13, 14, 15, 16});
    CHECK(streams.size() == 3);
-   if (pass == 0) first_streams = streams; else CHECK(streams == first_streams);
+   if (pass == 0)
+    first_streams = streams;
+   else
+    CHECK(streams == first_streams);
   }
   unsigned callbacks = 0;
-  CHECK_THROWS_WITH(session.Run(request, command, {.completed = [&](const auto&, auto, const auto&) {
-   if (++callbacks == 2) throw std::runtime_error("callback failure");
-  }}), "callback failure");
+  CHECK_THROWS_WITH(session.Run(request, command,
+                     {.completed =
+                       [&](const auto&, auto, const auto&) {
+                        if (++callbacks == 2) throw std::runtime_error("callback failure");
+                       }}),
+   "callback failure");
   CHECK_FALSE(session.HasUnsafeCustody());
   CHECK(session.Run(request, command).processed_images == 7);
   request.limit_images = 1;
@@ -125,8 +153,7 @@ TEST_CASE("Prediction partial pool construction retires streams when source cust
  auto retirement = std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(1U);
  {
   rfdetr::PredictionSession session;
-  CHECK_THROWS_WITH(session.Run(request, {reinterpret_cast<std::uintptr_t>(stream.get()), true}, {.retirement = retirement}),
-   "terminal CUDA custody reservation refused before resource allocation");
+  CHECK_THROWS_WITH(session.Run(request, {reinterpret_cast<std::uintptr_t>(stream.get()), true}, {.retirement = retirement}), "terminal CUDA custody reservation refused before resource allocation");
   CHECK_FALSE(session.HasUnsafeCustody());
   CHECK(session.Close() == mmltk::backend::ml::runtime::kRuntimeSuccess);
   CHECK(retirement->fact().occupancy == 0);
@@ -138,8 +165,10 @@ TEST_CASE("Video inference retains copied frames timing and the stopped ordered 
  const mmltk::testsupport::ScopedTempDir root("video-inference-lanes");
  auto request = rfdetr::test_support::prediction_image_fixture(root.path());
  request.source_kind = rfdetr::PredictSourceKind::VideoFile;
- request.image_inputs.clear(); request.video_path = root.path() / "frames.y4m";
- request.lanes = 4; request.include_masks = false;
+ request.image_inputs.clear();
+ request.video_path = root.path() / "frames.y4m";
+ request.lanes = 4;
+ request.include_masks = false;
  const std::array<unsigned char, 7> luminance{16, 50, 80, 110, 140, 180, 235};
  {
   std::ofstream output(request.video_path, std::ios::binary);
@@ -155,11 +184,22 @@ TEST_CASE("Video inference retains copied frames timing and the stopped ordered 
  rfdetr::PredictionSession session;
  std::vector<rfdetr::PredictionPixels> retained;
  std::vector<double> timestamps;
- const auto result = session.Run(request, command, {
-  .source_pixels = true,
-  .before_frame = [&](auto timestamp, double fps) { REQUIRE(timestamp); CHECK(fps == 4); timestamps.push_back(*timestamp); return true; },
-  .completed = [&](const auto& record, auto pixels, const auto&) { CHECK(record.dataset_index == static_cast<std::int64_t>(retained.size())); retained.push_back(std::move(pixels)); },
- });
+ const auto result = session.Run(request, command,
+  {
+   .source_pixels = true,
+   .before_frame =
+    [&](auto timestamp, double fps) {
+     REQUIRE(timestamp);
+     CHECK(fps == 4);
+     timestamps.push_back(*timestamp);
+     return true;
+    },
+   .completed =
+    [&](const auto& record, auto pixels, const auto&) {
+     CHECK(record.dataset_index == static_cast<std::int64_t>(retained.size()));
+     retained.push_back(std::move(pixels));
+    },
+  });
  REQUIRE(result.processed_images == luminance.size());
  REQUIRE(retained.size() == luminance.size());
  for (std::size_t index = 0; index < retained.size(); ++index) {
@@ -172,12 +212,20 @@ TEST_CASE("Video inference retains copied frames timing and the stopped ordered 
  std::stop_source stop;
  unsigned attempts = 0, decoded = 0;
  std::vector<std::int64_t> settled;
- const auto stopped = session.Run(request, command, {
-  .stop = stop.get_token(),
-  .before_source = [&] { if (++attempts == 3) { stop.request_stop(); return false; } return true; },
-  .completed = [&](const auto& record, auto, const auto&) { settled.push_back(record.dataset_index); },
-  .decoded = [&](auto, auto) { ++decoded; },
- });
+ const auto stopped = session.Run(request, command,
+  {
+   .stop = stop.get_token(),
+   .before_source =
+    [&] {
+     if (++attempts == 3) {
+      stop.request_stop();
+      return false;
+     }
+     return true;
+    },
+   .completed = [&](const auto& record, auto, const auto&) { settled.push_back(record.dataset_index); },
+   .decoded = [&](auto, auto) { ++decoded; },
+  });
  CHECK(decoded == 2);
  CHECK(stopped.cancelled);
  CHECK(stopped.processed_images == 2);
@@ -740,9 +788,10 @@ TEST_CASE("full HD prediction materializes masks only for threshold survivors", 
       REQUIRE(annotations.masks.address != 0U);
       std::array<std::uint8_t, 2U> samples{};
       const auto* masks = reinterpret_cast<const std::uint8_t*>(annotations.masks.address);
-      REQUIRE(cudaMemcpyAsync(samples.data(), masks, 1U, cudaMemcpyDeviceToHost, stream) == cudaSuccess);
-      REQUIRE(cudaMemcpyAsync(samples.data() + 1U, masks + 1920U * 1080U, 1U, cudaMemcpyDeviceToHost, stream) == cudaSuccess);
-      REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+      const auto delivery_stream = reinterpret_cast<cudaStream_t>(pixels.stream);
+      REQUIRE(cudaMemcpyAsync(samples.data(), masks, 1U, cudaMemcpyDeviceToHost, delivery_stream) == cudaSuccess);
+      REQUIRE(cudaMemcpyAsync(samples.data() + 1U, masks + 1920U * 1080U, 1U, cudaMemcpyDeviceToHost, delivery_stream) == cudaSuccess);
+      REQUIRE(cudaStreamSynchronize(delivery_stream) == cudaSuccess);
       CHECK(samples == std::array<std::uint8_t, 2U>{1U, 0U});
      }});
   CHECK(mode.processed_images == 1U);
@@ -1881,9 +1930,10 @@ TEST_CASE("Native prediction consumes shared compilation policy with full batche
    CHECK(result.result.summary.bbox.ap == *reference_ap);
  }
 }
-
 TEST_CASE("Frozen selected native soups preserve ONNX logits boxes masks and evaluation", "[model][rfdetr][prediction][selection][gpu]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; selected native/ONNX agreement remains unverified");
+ // Compare FP32 export arithmetic without process-default TF32 convolutions.
+ const mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
  const mmltk::testsupport::ScopedTempDir root("selected-native-onnx");
  const mmltk::backend::data::testsupport::FixtureSpec dataset{.root_dir = (root.path() / "dataset").string(), .width = 96, .height = 96, .num_images = 3, .background_images = 0};
  mmltk::backend::data::testsupport::create_synthetic_dataset(dataset);
@@ -1891,37 +1941,58 @@ TEST_CASE("Frozen selected native soups preserve ONNX logits boxes masks and eva
  const auto compiled = mmltk::backend::data::testsupport::compiled_bin_path(dataset);
  const auto source = mmltk::backend::data::CompiledDataset::open(compiled);
  const auto layout = rfdetr::native_training_class_layout(*source.class_catalog());
+ auto generator = at::detail::getDefaultCPUGenerator();
+ const auto saved_rng = generator.get_state();
+ const mmltk::testsupport::ScopedTestCleanup restore_rng{[&] { generator.set_state(saved_rng); }};
  for (const bool masks : {false, true}) {
-  const auto directory = root.path() / (masks ? "masks" : "boxes"); std::filesystem::create_directory(directory);
+  generator.set_current_seed(731);
+  const auto directory = root.path() / (masks ? "masks" : "boxes");
+  std::filesystem::create_directory(directory);
   const auto preset = std::ranges::find_if(rfdetr::model_presets(), [&](const auto& row) { return (row.task == rfdetr::ModelTask::Segmentation) == masks; });
   REQUIRE(preset != rfdetr::model_presets().end());
   auto config = rfdetr::native_config_from_preset(*preset);
-  config.resolution = 96; config.num_classes = layout.slots.size(); config.num_queries = 3; config.num_select = 3;
+  config.resolution = 96;
+  config.num_classes = mmltk::common::math::checked_cast<int>(layout.slots.size(), "selected native class count");
+  config.num_queries = 3;
+  config.num_select = 3;
   rfdetr::NativeRfDetrModel model(config, layout);
   std::vector<rfdetr::NormalizedModelStateEntry> entries;
   for (const auto& item : model.named_parameters(true)) entries.push_back({item.key(), item.value().detach()});
   for (const auto& item : model.named_buffers(true)) entries.push_back({item.key(), item.value().detach()});
   const auto initialization = rfdetr::native_state_fingerprint(entries);
-  rfdetr::ResolvedModelArtifacts artifacts; artifacts.config = config; artifacts.class_layout = layout;
+  rfdetr::ResolvedModelArtifacts artifacts;
+  artifacts.config = config;
+  artifacts.class_layout = layout;
   const auto evaluate = [&](const std::filesystem::path& path) {
    rfdetr::EvaluateRequest request;
-   request.weights_path = path; request.preset_name = config.preset_name; request.resolution = config.resolution;
-   request.compiled_path = compiled; request.backend = "weights"; request.batch_size = 1; request.progress_bar = false;
-   request.allow_fp16 = false; request.compilation_mode = rfdetr::CompilationMode::kNone;
+   request.weights_path = path;
+   request.preset_name = config.preset_name;
+   request.resolution = config.resolution;
+   request.compiled_path = compiled;
+   request.backend = "weights";
+   request.batch_size = 1;
+   request.progress_bar = false;
+   request.allow_fp16 = false;
+   request.compilation_mode = rfdetr::CompilationMode::kNone;
    return rfdetr::run_evaluation(request).result.summary;
   };
   std::array<rfdetr::TrainingSelectionCandidate, 2> candidates;
   torch::NoGradGuard no_grad;
   for (std::size_t index = 0; index < candidates.size(); ++index) {
    if (index) model.named_parameters(true)["class_embed.bias"].add_(.01);
-   rfdetr::DecodedNativeModelState state(entries); state.metadata = rfdetr::make_native_checkpoint_metadata(artifacts, config.num_classes);
+   rfdetr::DecodedNativeModelState state(entries);
+   state.metadata = rfdetr::make_native_checkpoint_metadata(artifacts, config.num_classes);
    auto& candidate = candidates[index].artifact;
    candidate.path = directory / ("model-" + std::to_string(index) + ".pt");
    rfdetr::save_native_checkpoint(candidate.path, state);
-   candidate.session_id = "selected-native-onnx"; candidate.model_id = index; candidate.initialization = initialization;
-   candidate.configuration = std::string(64, masks ? 'a' : 'b'); candidate.validation = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(compiled));
+   candidate.session_id = "selected-native-onnx";
+   candidate.model_id = index;
+   candidate.initialization = initialization;
+   candidate.configuration = std::string(64, masks ? 'a' : 'b');
+   candidate.validation = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(compiled));
    auto admission = std::make_shared<rfdetr::TrainingArtifactAdmission>(candidate.path);
-   candidate.evaluation = evaluate(candidate.path); candidate.selection_metric = rfdetr::training_selection_metric(*candidate.evaluation, masks);
+   candidate.evaluation = evaluate(candidate.path);
+   candidate.selection_metric = rfdetr::training_selection_metric(*candidate.evaluation, masks);
    candidate = admission->describe(std::move(candidate));
    admission->release_decoded_state();
    candidates[index].admission = std::move(admission);
@@ -1930,15 +2001,21 @@ TEST_CASE("Frozen selected native soups preserve ONNX logits boxes masks and eva
   REQUIRE(selected.artifact.weights == rfdetr::EvaluatedWeights::Soup);
   CHECK_FALSE(rfdetr::inspect_training_checkpoint(selected.artifact.path).checkpoint().resumable);
   rfdetr::ExportOnnxRequest export_request;
-  export_request.weights_path = selected.artifact.path; export_request.preset_name = config.preset_name; export_request.resolution = config.resolution;
+  export_request.weights_path = selected.artifact.path;
+  export_request.preset_name = config.preset_name;
+  export_request.resolution = config.resolution;
   export_request.output_path = directory / "selected.onnx";
   rfdetr::export_onnx(export_request);
   CHECK(rfdetr::load_onnx_model_info(export_request.output_path).class_layout == layout);
-  rfdetr::load_model_weights(model, selected.artifact.path, true); model.to(torch::kCUDA); model.eval();
+  rfdetr::load_model_weights(model, selected.artifact.path, true);
+  model.to(torch::kCUDA);
+  model.eval();
   auto input = torch::sin(torch::arange(3 * 96 * 96, torch::kFloat)).reshape({1, 3, 96, 96});
   const auto native = model.forward({input.to(torch::kCUDA), {}}, masks).main;
   mmltk::backend::ml::runtime::OnnxEnvironment environment(ORT_LOGGING_LEVEL_ERROR, "selected-native-onnx");
-  Ort::SessionOptions options; options.SetIntraOpNumThreads(1); options.SetInterOpNumThreads(1);
+  Ort::SessionOptions options;
+  options.SetIntraOpNumThreads(1);
+  options.SetInterOpNumThreads(1);
   Ort::Session session(environment.get(), export_request.output_path.c_str(), options);
   Ort::AllocatorWithDefaultOptions allocator;
   const auto input_name = session.GetInputNameAllocated(0, allocator);
@@ -1948,19 +2025,56 @@ TEST_CASE("Frozen selected native soups preserve ONNX logits boxes masks and eva
   auto value = Ort::Value::CreateTensor<float>(memory, input.data_ptr<float>(), input.numel(), input.sizes().data(), input.dim());
   auto outputs = session.Run(Ort::RunOptions{}, input_names, &value, 1, output_names, masks ? 3 : 2);
   std::vector<torch::Tensor> expected{native.pred_logits.cpu(), native.pred_boxes.cpu()};
-  if (masks) { REQUIRE(native.pred_masks); expected.push_back(native.pred_masks->cpu()); }
+  if (masks) {
+   REQUIRE(native.pred_masks);
+   expected.push_back(native.pred_masks->cpu());
+  }
+  std::vector<torch::Tensor> cpu_reference;
   for (std::size_t index = 0; index < expected.size(); ++index) {
    REQUIRE(outputs[index].GetTensorTypeAndShapeInfo().GetShape() == expected[index].sizes().vec());
    const auto actual = torch::from_blob(outputs[index].GetTensorMutableData<float>(), expected[index].sizes(), torch::kFloat);
-   CHECK(torch::allclose(actual, expected[index], 3e-4, 3e-4));
+   const auto difference = (actual - expected[index]).abs();
+   const bool matches = torch::allclose(actual, expected[index], 3e-4, 3e-4);
+   CAPTURE(masks, index, difference.max().item<float>(), (difference / (expected[index].abs() * 3e-4 + 3e-4)).max().item<float>());
+   CAPTURE(at::globalContext().allowTF32CuDNN(), at::globalContext().allowTF32CuBLAS());
+   float native_cpu_difference = 0, onnx_cpu_difference = 0;
+   if (!matches) {
+    if (cpu_reference.empty()) {
+     const auto read_cpu_reference = [&] {
+      // Feature layouts retain their first device projection. A separate
+      // model keeps this diagnostic from changing the CUDA owner's contract.
+      rfdetr::NativeRfDetrModel reference_model(config, layout);
+      rfdetr::load_model_weights(reference_model, selected.artifact.path, true);
+      reference_model.eval();
+      const auto cpu = reference_model.forward({input, {}}, masks).main;
+      cpu_reference = {cpu.pred_logits, cpu.pred_boxes};
+      if (masks) cpu_reference.push_back(*cpu.pred_masks);
+     };
+     REQUIRE_NOTHROW(read_cpu_reference());
+    }
+    native_cpu_difference = (expected[index] - cpu_reference[index]).abs().max().item<float>();
+    onnx_cpu_difference = (actual - cpu_reference[index]).abs().max().item<float>();
+   }
+   CAPTURE(native_cpu_difference, onnx_cpu_difference);
+   CHECK(matches);
   }
   rfdetr::EvaluateRequest onnx;
-  onnx.onnx_path = export_request.output_path; onnx.compiled_path = compiled; onnx.backend = "onnx"; onnx.batch_size = 1; onnx.allow_fp16 = false;
-  onnx.progress_bar = false; onnx.compilation_mode = rfdetr::CompilationMode::kNone;
+  onnx.onnx_path = export_request.output_path;
+  onnx.compiled_path = compiled;
+  onnx.backend = "onnx";
+  onnx.preset_name = config.preset_name;
+  onnx.resolution = config.resolution;
+  onnx.batch_size = 1;
+  onnx.allow_fp16 = false;
+  onnx.progress_bar = false;
+  onnx.compilation_mode = rfdetr::CompilationMode::kNone;
   const auto actual = rfdetr::run_evaluation(onnx).result.summary;
   CHECK(std::abs(actual.bbox.ap - selected.validation.bbox.ap) < 1e-5);
   CHECK(actual.mask.has_value() == masks);
-  if (masks) { REQUIRE(selected.validation.mask); CHECK(std::abs(actual.mask->ap - selected.validation.mask->ap) < 1e-5); }
+  if (masks) {
+   REQUIRE(selected.validation.mask);
+   CHECK(std::abs(actual.mask->ap - selected.validation.mask->ap) < 1e-5);
+  }
   CHECK(rfdetr::read_training_selection(directory / "selected.json") == selected);
  }
 }

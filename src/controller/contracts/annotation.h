@@ -277,7 +277,8 @@ struct AnnotationUiState final {
  std::uint64_t scene_revision = 0U;
  [[nodiscard]] bool empty() const noexcept {
   return tool_capabilities.empty() && !can_undo && !can_redo && !source_navigation_available && !scene.document.valid() && scene.categories.empty() && scene.palette.empty() && scene.objects.empty() &&
-         editor == AnnotationEditorFacts{} && save_status == AnnotationSaveStatus::Idle && save_generation == 0U && interaction_revision == 0U && document_revision == 0U && saved_revision == 0U && scene_revision == 0U;
+         editor == AnnotationEditorFacts{} && save_status == AnnotationSaveStatus::Idle && save_generation == 0U && interaction_revision == 0U && document_revision == 0U && saved_revision == 0U &&
+         scene_revision == 0U;
  }
  [[nodiscard]] bool valid() const noexcept {
   if (!scene.document.valid()) return empty();

@@ -18,6 +18,7 @@ public:
  void prepare(std::span<const std::vector<NormalizedModelStateEntry>* const>, std::span<const double> coefficients);
  void install(std::span<const std::vector<NormalizedModelStateEntry>* const> receivers) const;
  [[nodiscard]] const std::vector<NormalizedModelStateEntry>& values() const noexcept { return values_; }
+
 private:
  std::vector<NormalizedModelStateEntry> values_;
  std::vector<at::ScalarType> source_types_;
@@ -37,6 +38,7 @@ public:
  [[nodiscard]] bool pending() const noexcept { return state_.interval_rounds != 0; }
  void retire_interval();
  [[nodiscard]] const TrainingMergeState& state() const noexcept { return state_; }
+
 private:
  TrainMergeCadence cadence_;
  bool enabled_;
@@ -50,6 +52,6 @@ struct TrainingSelectionCandidate final {
 };
 // The evaluator sees the exact saved native artifact. Publication of the small
 // selected descriptor is the final operation and never replaces an ingredient.
-[[nodiscard]] TrainingSelection select_training_artifact(std::span<const TrainingSelectionCandidate>, TrainFinalPolicy, bool masks,
- const std::filesystem::path& output, std::function_ref<EvalSummary(const std::filesystem::path&)> evaluate);
+[[nodiscard]] TrainingSelection select_training_artifact(
+ std::span<const TrainingSelectionCandidate>, TrainFinalPolicy, bool masks, const std::filesystem::path& output, std::function_ref<EvalSummary(const std::filesystem::path&)> evaluate);
 }  // namespace mmltk::backend::models::rfdetr

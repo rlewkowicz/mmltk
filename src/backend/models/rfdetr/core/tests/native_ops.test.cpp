@@ -937,10 +937,13 @@ TEST_CASE("Postprocess scale replacement retains pending reads through geometry 
  second_stream.synchronize();
  mmltk::testsupport::TestGate gate("pending postprocess scale read");
  auto receipt = std::make_unique<mmltk::testsupport::TestGate::Receipt>(gate.receipt());
- REQUIRE(cudaLaunchHostFunc(first_stream.stream(), [](void* value) {
-  std::unique_ptr<mmltk::testsupport::TestGate::Receipt> read(static_cast<mmltk::testsupport::TestGate::Receipt*>(value));
-  read->ArriveAndWait();
- }, receipt.get()) == cudaSuccess);
+ REQUIRE(cudaLaunchHostFunc(
+          first_stream.stream(),
+          [](void* value) {
+           std::unique_ptr<mmltk::testsupport::TestGate::Receipt> read(static_cast<mmltk::testsupport::TestGate::Receipt*>(value));
+           read->ArriveAndWait();
+          },
+          receipt.get()) == cudaSuccess);
  static_cast<void>(receipt.release());
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
   gate.Release();

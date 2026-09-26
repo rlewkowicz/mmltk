@@ -75,14 +75,14 @@ __global__ void normalize_images_kernel(const float* input, Output* output, cons
   if ((width & 3) == 0 && x + 3 < width) {
    values = *reinterpret_cast<const float4*>(input + offset);
   } else {
-   float* lanes = reinterpret_cast<float*>(&values);
+   auto* lanes = reinterpret_cast<float*>(&values);
 #pragma unroll
    for (int lane = 0; lane < 4; ++lane) {
     if (x + lane < width) { lanes[lane] = input[offset + lane]; }
    }
   }
  }
- const float* input_values = reinterpret_cast<const float*>(&values);
+ const auto* input_values = reinterpret_cast<const float*>(&values);
 #pragma unroll
  for (int lane = 0; lane < 4; ++lane) {
   if (x + lane >= width) { break; }
@@ -172,7 +172,7 @@ __global__ void pointwise_images_kernel(const float* input, float* output, const
  } else {
 #pragma unroll
   for (int channel = 0; channel < 3; ++channel) {
-   float* channel_values = reinterpret_cast<float*>(&channels[channel]);
+   auto* channel_values = reinterpret_cast<float*>(&channels[channel]);
 #pragma unroll
    for (int lane = 0; lane < 4; ++lane) {
     const int x = output_x + lane;
@@ -196,9 +196,9 @@ __global__ void pointwise_images_kernel(const float* input, float* output, const
  for (int lane = 0; lane < 4; ++lane) {
   const int x = output_x + lane;
   if (x >= width) { continue; }
-  float* red_values = reinterpret_cast<float*>(&channels[0]);
-  float* green_values = reinterpret_cast<float*>(&channels[1]);
-  float* blue_values = reinterpret_cast<float*>(&channels[2]);
+  auto* red_values = reinterpret_cast<float*>(&channels[0]);
+  auto* green_values = reinterpret_cast<float*>(&channels[1]);
+  auto* blue_values = reinterpret_cast<float*>(&channels[2]);
   const std::int64_t pixel_index = static_cast<std::int64_t>(output_y) * width + x;
   apply_effects(red_values[lane], green_values[lane], blue_values[lane], values, key, pixel_index, x, output_y, width, height, output_domain);
  }
@@ -211,7 +211,7 @@ __global__ void pointwise_images_kernel(const float* input, float* output, const
  } else {
 #pragma unroll
   for (int channel = 0; channel < 3; ++channel) {
-   const float* channel_values = reinterpret_cast<const float*>(&channels[channel]);
+   const auto* channel_values = reinterpret_cast<const float*>(&channels[channel]);
 #pragma unroll
    for (int lane = 0; lane < 4; ++lane) {
     const int x = output_x + lane;
@@ -340,7 +340,7 @@ void launch_gpu_rgba8_to_planar_float(const std::uint8_t* input, float* output, 
  if (batch_size == 0) { return; }
  const std::int64_t image_pixels = static_cast<std::int64_t>(height) * width;
  const std::int64_t pixels = batch_size * image_pixels;
- const unsigned int blocks = static_cast<unsigned int>(ceil_div(pixels, kThreads));
+ const auto blocks = static_cast<unsigned int>(ceil_div(pixels, kThreads));
  rgba8_to_planar_float_kernel<<<blocks, kThreads, 0, stream>>>(input, output, image_pixels, pixels);
  ensure_cuda_ok(cudaGetLastError(), "RGBA8 augmentation input conversion launch");
 }
@@ -348,7 +348,7 @@ void launch_gpu_batch_normalization(const float* input, void* output, const std:
  const GpuPreprocessOutputType output_type, cudaStream_t stream) {
  if (active_batch_size == 0 || output_batch_size == 0) { return; }
  const std::int64_t groups = output_batch_size * 3 * static_cast<std::int64_t>(height) * ceil_div(width, 4);
- const unsigned int blocks = static_cast<unsigned int>(ceil_div(groups, kThreads));
+ const auto blocks = static_cast<unsigned int>(ceil_div(groups, kThreads));
  switch (output_type) {
   case GpuPreprocessOutputType::Float32: normalize_images_kernel<<<blocks, kThreads, 0, stream>>>(input, static_cast<float*>(output), active_batch_size, output_batch_size, height, width); break;
   case GpuPreprocessOutputType::Float16: normalize_images_kernel<<<blocks, kThreads, 0, stream>>>(input, static_cast<__half*>(output), active_batch_size, output_batch_size, height, width); break;

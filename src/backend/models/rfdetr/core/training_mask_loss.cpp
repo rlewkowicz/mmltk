@@ -238,8 +238,8 @@ DirectMaskSamples sample_direct_masks(
  }
  return {point_logits, labels};
 }
-PairwiseMaskSamples sample_pairwise_masks(
- const OutputLayer& layer, const PreparedTargets& targets, const torch::Tensor& indices, const torch::Tensor& valid, int64_t point_ratio, const torch::Tensor& coordinates, std::optional<std::uint64_t> sampling_key) {
+PairwiseMaskSamples sample_pairwise_masks(const OutputLayer& layer, const PreparedTargets& targets, const torch::Tensor& indices, const torch::Tensor& valid, int64_t point_ratio,
+ const torch::Tensor& coordinates, std::optional<std::uint64_t> sampling_key) {
  if (!layer.sparse_pred_masks) throw std::invalid_argument("Match-Free masks require sparse spatial/query projections");
  const auto& sparse = *layer.sparse_pred_masks;
  const auto& spatial = sparse.spatial_features;
@@ -252,7 +252,8 @@ PairwiseMaskSamples sample_pairwise_masks(
  validate_packed_mask_extent(masks, "Match-Free");
  if (masks.bits.size(0) < targets.all_labels.size(0)) throw std::invalid_argument("Match-Free packed masks do not cover the target inventory");
  const auto points = std::max<int64_t>(1, spatial.size(2) * spatial.size(3) / point_ratio);
- const auto coords = coordinates.defined() || !sampling_key ? mask_coordinates(coordinates, 1, points, spatial.device()) : semantic_coordinates(*sampling_key, points, 0x4d4650414952ULL, spatial.device());
+ const auto coords =
+  coordinates.defined() || !sampling_key ? mask_coordinates(coordinates, 1, points, spatial.device()) : semantic_coordinates(*sampling_key, points, 0x4d4650414952ULL, spatial.device());
  auto features = point_sample(spatial.to(torch::kFloat32), coords.expand({spatial.size(0), points, 2}));
  auto logits = torch::bmm(sparse.query_features.to(torch::kFloat32), features) + sparse.bias.to(torch::kFloat32);
  auto sampled_targets = sample_target_masks(masks, indices.reshape({-1}), coords, "Match-Free").view({indices.size(0), indices.size(1), points});

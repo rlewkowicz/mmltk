@@ -24,22 +24,28 @@ TEST_CASE("Training validation owns independent capacity and versioned immutable
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  TrainRequest request;
  request.batch_size = request.val_batch_size = 1;
- request.lanes = 1; request.validation_lanes = 4; request.amp = false; request.progress_bar = false;
+ request.lanes = 1;
+ request.validation_lanes = 4;
+ request.amp = false;
+ request.progress_bar = false;
  request.compilation_mode = CompilationMode::kNone;
  auto runtime_config = resolve_runtime_config(12, 1, 2, {}, 0);
  runtime_config.workers = 12;
  RuntimeContext training(runtime_config);
- const data::DatasetLoader::Config loader_config{.compiled_path = data::testsupport::compiled_bin_path(fixture), .batch_size = 1, .shuffle = false,
-  .prefetch_factor = 2, .gather_workers = 1, .loading = data::data_loading_options(true)};
+ const data::DatasetLoader::Config loader_config{
+  .compiled_path = data::testsupport::compiled_bin_path(fixture), .batch_size = 1, .shuffle = false, .prefetch_factor = 2, .gather_workers = 1, .loading = data::data_loading_options(true)};
  TrainingValidationRuntime validation(request, training, std::make_unique<data::DatasetLoader>(loader_config), 1, true, EvaluationMetricSet::BBox, 3, "validation", false);
  REQUIRE(training.split().lane_threads == 1);
  REQUIRE(validation.lane_capacity() == 4);
  CHECK(validation.execution_facts().configured_capacity == 4);
  CHECK(validation.execution_facts().admitted_capacity == 4);
  auto config = native_config_from_preset(model_presets().front());
- config.resolution = 64; config.num_classes = 7; config.num_queries = config.num_select = 3;
+ config.resolution = 64;
+ config.num_classes = 7;
+ config.num_queries = config.num_select = 3;
  NativeRfDetrModel master(config, native_training_class_layout(data::catalog::ClassCatalog({"person", "ret", "scope", "iron_sight", "anchor_dot", "glint"})));
- master.to(torch::Device(torch::kCUDA, 0)); master.eval();
+ master.to(torch::Device(torch::kCUDA, 0));
+ master.eval();
  validation.bind_model(master, 1, EvaluatedWeights::Ordinary);
  std::set<std::uintptr_t> streams;
  torch::Tensor first;
@@ -58,7 +64,10 @@ TEST_CASE("Training validation owns independent capacity and versioned immutable
  CHECK(validation.admit_lane() == 0);
  CHECK(validation.active_model().named_parameters()["class_embed.bias"].data_ptr() == first.data_ptr());
  validation.drain();
- { torch::NoGradGuard guard; master.named_parameters()["class_embed.bias"].add_(2); }
+ {
+  torch::NoGradGuard guard;
+  master.named_parameters()["class_embed.bias"].add_(2);
+ }
  validation.bind_model(master, 2, EvaluatedWeights::Ordinary);
  CHECK(validation.admit_lane() == 0);
  const auto changed = validation.active_model().named_parameters()["class_embed.bias"];

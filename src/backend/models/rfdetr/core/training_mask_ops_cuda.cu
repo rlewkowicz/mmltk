@@ -35,8 +35,8 @@ __global__ void matcher_point_sample_kernel(
  }
  const float x = clamp_coord(grid_sample_source(coord_x, width), static_cast<float>(width - 1));
  const float y = clamp_coord(grid_sample_source(coord_y, height), static_cast<float>(height - 1));
- const int64_t x0 = static_cast<int64_t>(floorf(x));
- const int64_t y0 = static_cast<int64_t>(floorf(y));
+ const auto x0 = static_cast<int64_t>(floorf(x));
+ const auto y0 = static_cast<int64_t>(floorf(y));
  const int64_t x1 = x0 + 1 < width ? x0 + 1 : width - 1;
  const int64_t y1 = y0 + 1 < height ? y0 + 1 : height - 1;
  const float wx = x - static_cast<float>(x0);

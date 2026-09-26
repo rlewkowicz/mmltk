@@ -27,8 +27,9 @@ public:
  // Covers partially submitted work and callback work after Submitted, too.
  [[nodiscard]] mmltk::backend::ml::runtime::RuntimeStatus Drain() noexcept;
  [[nodiscard]] mmltk::backend::ml::runtime::RuntimeStatus Close() noexcept;
+
 private:
  struct State;
  std::shared_ptr<State> state_;
 };
-}
+}  // namespace mmltk::backend::models::rfdetr

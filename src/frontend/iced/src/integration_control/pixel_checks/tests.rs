@@ -171,6 +171,7 @@ impl ProbeFixture {
             &crate::view::router::Router::default(),
             FeatureId::Explore,
             None,
+            false,
         ));
         assert_eq!(self.controller.driver.phase, Phase::AwaitWorkspaceFpsPixels);
         self.controller
@@ -225,6 +226,7 @@ impl ProbeFixture {
             &crate::view::router::Router::default(),
             FeatureId::Explore,
             None,
+            false,
         )
     }
 
@@ -310,7 +312,15 @@ fn fps_capture_success_and_recoverable_failures_restore_both_canonical_baselines
                 outcome,
                 Some(crate::view::settings::Outcome::SettingsEdited(_))
             ));
-            drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+            drop(driver.advance(
+                &model,
+                &settings,
+                1.0,
+                &router,
+                FeatureId::Explore,
+                None,
+                false,
+            ));
             assert_eq!(driver.driver.phase, Phase::AwaitWorkspaceFpsRestored);
             let restoration = settings
                 .take_request([true; 3])
@@ -320,7 +330,15 @@ fn fps_capture_success_and_recoverable_failures_restore_both_canonical_baselines
                 restoration.updates[0],
                 crate::generated::update_uishowworkspaceperformance(baseline)
             );
-            drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+            drop(driver.advance(
+                &model,
+                &settings,
+                1.0,
+                &router,
+                FeatureId::Explore,
+                None,
+                false,
+            ));
             assert_eq!(driver.driver.phase, Phase::AwaitWorkspaceFpsRestored);
             let pending = model
                 .begin_intent(crate::generated::ApplicationIntentEndpoint::SettingsUpdate)
@@ -329,11 +347,27 @@ fn fps_capture_success_and_recoverable_failures_restore_both_canonical_baselines
             authoritative.revision += 1;
             authoritative.settingsstate.ui.showworkspaceperformance = baseline;
             settings.settle_success(authoritative);
-            drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+            drop(driver.advance(
+                &model,
+                &settings,
+                1.0,
+                &router,
+                FeatureId::Explore,
+                None,
+                false,
+            ));
             assert_eq!(driver.driver.phase, Phase::AwaitWorkspaceFpsRestored);
             assert_eq!(driver.driver.failure_line, 0);
             model.abandon_intent(pending);
-            drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+            drop(driver.advance(
+                &model,
+                &settings,
+                1.0,
+                &router,
+                FeatureId::Explore,
+                None,
+                false,
+            ));
             assert_eq!(crate::workspace_fps::enabled(&settings), baseline);
             assert_eq!(
                 model
@@ -419,11 +453,15 @@ fn fps_capture_scale_change_rearms_without_accepting_the_old_result() {
     let (model, settings) = fps_settings();
     let mut old = fixture.request_fps(&model, &settings);
     let router = crate::view::router::Router::default();
-    drop(
-        fixture
-            .controller
-            .advance(&model, &settings, 1.5, &router, FeatureId::Explore, None),
-    );
+    drop(fixture.controller.advance(
+        &model,
+        &settings,
+        1.5,
+        &router,
+        FeatureId::Explore,
+        None,
+        false,
+    ));
     assert_eq!(fixture.controller.driver.phase, Phase::AwaitWorkspaceFps);
     drop(fixture.complete_fps(&mut old, FpsPixelOutcome::Failed, &model, &settings));
     assert_eq!(fixture.controller.driver.phase, Phase::AwaitWorkspaceFps);

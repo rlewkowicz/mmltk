@@ -75,7 +75,14 @@ impl Operation<ControlBounds> for FindControl {
         self.pending_translation += translation;
     }
 
-    fn focusable(&mut self, id: Option<&Id>, bounds: Rectangle, _state: &mut dyn widget::operation::Focusable) { self.capture(id, bounds); }
+    fn focusable(
+        &mut self,
+        id: Option<&Id>,
+        bounds: Rectangle,
+        _state: &mut dyn widget::operation::Focusable,
+    ) {
+        self.capture(id, bounds);
+    }
 
     fn text_input(
         &mut self,

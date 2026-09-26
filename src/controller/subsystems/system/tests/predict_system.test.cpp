@@ -54,7 +54,8 @@ public:
   const ContextProvider&, const PreviewRetirement&, const ComputeArtifactSink&, const PredictionRunOutput&, std::uint64_t, const ExecutionSink& admitted) override {
   auto facts = mmltk::backend::models::rfdetr::derive_execution_facts(request, 0);
   facts.admitted_capacity = 1;
-  admitted(facts); admitted(facts);
+  admitted(facts);
+  admitted(facts);
   return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
  }
 };
@@ -64,11 +65,12 @@ TEST_CASE("Predict retains admission facts with accepted settings and operation 
  auto [settings, dataset, model] = fixture.systems();
  const auto revision = settings.snapshot().revision;
  std::promise<void> settled;
- PredictSystem prediction{settings, dataset, model, {}, [](DirectComputeConfiguration) { return std::make_unique<AdmittedPredictRuntime>(); },
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [](DirectComputeConfiguration) { return std::make_unique<AdmittedPredictRuntime>(); },
   [&](PredictSystem::event_type event) {
    if (const auto* changed = std::get_if<PredictChanged>(&event); changed && !changed->snapshot.operation.active && changed->snapshot.operation.generation_frontier)
     mmltk::testsupport::release_test_promise(settled);
-  }, [](int, int) { return DirectComputeConfiguration{}; }};
+  },
+  [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(prediction.Start({}));
  mmltk::testsupport::await_test_promise(settled, "prediction admitted capacity");
  const auto snapshot = prediction.snapshot();

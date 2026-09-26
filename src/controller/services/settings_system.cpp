@@ -1,5 +1,6 @@
 #include "src/controller/services/settings_system.h"
 #include <concepts>
+#include <meta>
 #include <stdexcept>
 #include <span>
 #include <string_view>
@@ -8,6 +9,7 @@
 #include "src/controller/contracts/model_selection.h"
 #include "src/controller/services/settings_store.h"
 #include "src/controller/runtime/local_run.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 namespace mmltk::controller {
 void SettingsSystem::RestoreTrainingCheckpoint(mmltk::backend::models::rfdetr::TrainRequest request, const std::filesystem::path& checkpoint) {
  services::SettingsMutationResult result;
@@ -38,6 +40,20 @@ void SettingsSystem::RestoreTrainingCheckpoint(mmltk::backend::models::rfdetr::T
  if (!result.applied()) throw contracts::FailedError(result.detail);
 }
 namespace {
+[[nodiscard]] bool same_training_configuration(const contracts::TrainViewState& left, const contracts::TrainViewState& right) {
+ namespace reflection = mmltk::frameworks::reflection;
+ const auto compare = []<class T>(this auto&& self, const T& before, const T& after) -> bool {
+  bool equal = true;
+  reflection::visit_materialized_bases<T>([&]<class Base>() { equal = equal && self(static_cast<const Base&>(before), static_cast<const Base&>(after)); });
+  reflection::visit_materialized_members<T>([&]<class Declaration>(const auto&) {
+   constexpr auto member = std::meta::reflect_constant(Declaration::pointer);
+   if constexpr (member != std::meta::reflect_constant(&contracts::TrainViewState::output) && member != std::meta::reflect_constant(&contracts::TrainViewState::visualize_augmentation_in_explore))
+    equal = equal && before.*Declaration::pointer == after.*Declaration::pointer;
+  });
+  return equal;
+ };
+ return compare(left, right);
+}
 [[nodiscard]] bool flat_value_is_null(const mmltk::frameworks::serialization::wire::FlatValue& value) {
  bool null = false;
  value.visit([&]<class Item>(const Item&) { null = std::same_as<std::remove_cvref_t<Item>, std::monostate>; });
@@ -190,8 +206,7 @@ contracts::SettingsUiState SettingsSystem::Update(contracts::SettingsUpdateReque
    if (!flat_value_is_null(update.value)) ordinary.updates.push_back(update);
   }
   // Resolve global selectors and overrides before native growth copies the recipe.
-  if ((!ordinary.updates.empty() && !contracts::apply_gui_settings_values(candidate, std::span{ordinary.updates}, false)) ||
-      !apply_train_recipe_relation(candidate, std::span{request.updates}))
+  if ((!ordinary.updates.empty() && !contracts::apply_gui_settings_values(candidate, std::span{ordinary.updates}, false)) || !apply_train_recipe_relation(candidate, std::span{request.updates}))
    throw contracts::InvalidIntentError("invalid settings update");
   auto& training = candidate.workflows.train.request;
   if (request.lane_configuration) {
@@ -201,14 +216,14 @@ contracts::SettingsUiState SettingsSystem::Update(contracts::SettingsUpdateReque
    if (replacement.next_model_id != previous.next_model_id || replacement.models.size() != previous.models.size())
     throw contracts::InvalidIntentError("use the native model-count operation to change training membership");
    for (std::size_t index = 0; index < replacement.models.size(); ++index)
-    if (replacement.models[index].model_id != previous.models[index].model_id)
-     throw contracts::InvalidIntentError("training model identities are native-owned");
+    if (replacement.models[index].model_id != previous.models[index].model_id) throw contracts::InvalidIntentError("training model identities are native-owned");
    training.lane_configuration = std::move(*request.lane_configuration);
    for (auto& model : training.lane_configuration.models) mmltk::backend::models::rfdetr::resolve_train_recipe(model.recipe);
    if (!request.training_model_count && training.lane_configuration.mode != mmltk::backend::models::rfdetr::TrainLaneMode::SharedGradients) {
     if (training.lane_configuration.models.empty())
      mmltk::backend::models::rfdetr::resize_training_models(training.lane_configuration, static_cast<std::size_t>(training.lanes), training.recipe, training.seed);
-    else training.lanes = static_cast<int>(training.lane_configuration.models.size());
+    else
+     training.lanes = static_cast<int>(training.lane_configuration.models.size());
    }
   }
   if (request.training_model_count) {
@@ -274,7 +289,7 @@ services::SettingsMutationResult SettingsSystem::persist(contracts::GuiSettingsS
   // remain independently editable, including persistence retries and Explore.
   const auto& admitted = state_.settings_state.workflows.train;
   const auto& proposed = candidate.workflows.train;
-  if (training_locked_ && (proposed.request != admitted.request || proposed.model_source != admitted.model_source || proposed.model_input != admitted.model_input))
+  if (training_locked_ && !same_training_configuration(proposed, admitted))
    throw contracts::BusyError("training configuration is locked during an admitted run");
   if (!loaded_ || !location_.valid()) {
    terminal_ = {services::SettingsTerminal::NotLoaded, state_.revision, "settings are not loaded"};

@@ -306,90 +306,109 @@ TEST_CASE("telemetry retains complete history JSON through progress epoch and te
  CHECK(read_json("progress.json") == expected);
  CHECK(read_json("results.json") == expected);
 }
-
 TEST_CASE("telemetry reserves both complete periodic epoch traffic shapes", "[model][rfdetr][training][telemetry]") {
- for (const bool ema : {false, true}) for (const bool overflow : {false, true}) {
-  mmltk::testsupport::ScopedTempDir temp{"mmltk-telemetry-epoch-burst"};
-  r::TrainingRun run; run.run_id = "session";
-  run.configuration.use_ema = ema;
-  run.configuration.lane_configuration.mode = r::TrainLaneMode::PeriodicAveraging;
-  r::resize_training_models(run.configuration.lane_configuration, r::kMaximumTrainingModels, run.configuration.recipe, run.configuration.seed);
-  HeldHistory held(temp.path(), run);
-  r::TrainingMetricProgress progress;
-  progress.phase = r::TrainingPhase::EpochComplete;
-  progress.session_id = run.run_id;
-  const auto synchronized = [&] {
-   auto evaluated = progress;
-   evaluated.scope = r::TrainingRecordScope::SynchronizedSession; evaluated.model_id = 0;
-   evaluated.distribution.reset(); evaluated.val.emplace(); evaluated.val->bbox.ap = .5;
-   evaluated.artifact.emplace(); evaluated.artifact->session_id = run.run_id; evaluated.artifact->model_id = 1;
-   evaluated.artifact->path = "synchronized.pt";
-   held.writer->Submit(evaluated, r::TrainingRecordRole::Epoch);
-  };
-  if (ema) synchronized();
-  for (std::uint64_t model = 1; model <= r::kMaximumTrainingModels; ++model) {
-   progress.scope = r::TrainingRecordScope::Model; progress.model_id = model;
-   progress.scalars.total = static_cast<double>(model);
-   progress.distribution = r::TrainingDistributionFacts{.model_id = model, .unique_images = model, .scheduled_draws = model * 2, .repeated_class_exposure = model * 3};
-   if (ema) {
-    progress.val.emplace(); progress.val->bbox.ap = static_cast<double>(model) / 100;
-    progress.artifact.emplace(); progress.artifact->session_id = run.run_id;
-    progress.artifact->model_id = model; progress.artifact->path = "ema-" + std::to_string(model) + ".pt";
-    progress.artifact->weights = r::EvaluatedWeights::Ema;
+ for (const bool ema : {false, true})
+  for (const bool overflow : {false, true}) {
+   mmltk::testsupport::ScopedTempDir temp{"mmltk-telemetry-epoch-burst"};
+   r::TrainingRun run;
+   run.run_id = "session";
+   run.configuration.use_ema = ema;
+   run.configuration.lane_configuration.mode = r::TrainLaneMode::PeriodicAveraging;
+   r::resize_training_models(run.configuration.lane_configuration, r::kMaximumTrainingModels, run.configuration.recipe, run.configuration.seed);
+   HeldHistory held(temp.path(), run);
+   r::TrainingMetricProgress progress;
+   progress.phase = r::TrainingPhase::EpochComplete;
+   progress.session_id = run.run_id;
+   const auto synchronized = [&] {
+    auto evaluated = progress;
+    evaluated.scope = r::TrainingRecordScope::SynchronizedSession;
+    evaluated.model_id = 0;
+    evaluated.distribution.reset();
+    evaluated.val.emplace();
+    evaluated.val->bbox.ap = .5;
+    evaluated.artifact.emplace();
+    evaluated.artifact->session_id = run.run_id;
+    evaluated.artifact->model_id = 1;
+    evaluated.artifact->path = "synchronized.pt";
+    held.writer->Submit(evaluated, r::TrainingRecordRole::Epoch);
+   };
+   if (ema) synchronized();
+   for (std::uint64_t model = 1; model <= r::kMaximumTrainingModels; ++model) {
+    progress.scope = r::TrainingRecordScope::Model;
+    progress.model_id = model;
+    progress.scalars.total = static_cast<double>(model);
+    progress.distribution = r::TrainingDistributionFacts{.model_id = model, .unique_images = model, .scheduled_draws = model * 2, .repeated_class_exposure = model * 3};
+    if (ema) {
+     progress.val.emplace();
+     progress.val->bbox.ap = static_cast<double>(model) / 100;
+     progress.artifact.emplace();
+     progress.artifact->session_id = run.run_id;
+     progress.artifact->model_id = model;
+     progress.artifact->path = "ema-" + std::to_string(model) + ".pt";
+     progress.artifact->weights = r::EvaluatedWeights::Ema;
+    }
+    held.writer->Submit(progress, r::TrainingRecordRole::Epoch);
    }
+   if (!ema) synchronized();
+   progress = {};
+   progress.session_id = run.run_id;
+   progress.phase = r::TrainingPhase::EpochComplete;
+   progress.scope = r::TrainingRecordScope::Session;
    held.writer->Submit(progress, r::TrainingRecordRole::Epoch);
-  }
-  if (!ema) synchronized();
-  progress = {}; progress.session_id = run.run_id;
-  progress.phase = r::TrainingPhase::EpochComplete; progress.scope = r::TrainingRecordScope::Session;
-  held.writer->Submit(progress, r::TrainingRecordRole::Epoch);
-  if (overflow) held.writer->Submit(progress, r::TrainingRecordRole::Epoch);
-  progress.phase = r::TrainingPhase::Completed;
-  held.writer->Finish(progress, {.history_size = ema ? r::kMaximumTrainingModels + 1 : 1});
-  held.Drain();
-  std::istringstream history(held.history);
-  std::string line;
-  std::uint64_t count = 0, evaluated_count = 0, models = 0, synchronized_count = 0;
-  while (std::getline(history, line)) {
-   const auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
-   CHECK(record.sequence == count + (overflow && count == 18 ? 1 : 0));
-   if (record.progress.scope == r::TrainingRecordScope::SynchronizedSession) {
-    ++synchronized_count; REQUIRE(record.progress.val); REQUIRE(record.progress.artifact);
-    CHECK(record.evaluated_weights == r::EvaluatedWeights::Ordinary);
-   } else if (record.progress.scope == r::TrainingRecordScope::Model) {
-    ++models;
-    CHECK(record.progress.model_id == models);
-    CHECK(record.progress.scalars.total == static_cast<double>(models));
-    REQUIRE(record.progress.distribution); CHECK(record.progress.distribution->model_id == models);
-    CHECK(record.progress.distribution->scheduled_draws == models * 2);
-    CHECK(record.progress.val.has_value() == ema); CHECK(record.progress.artifact.has_value() == ema);
+   if (overflow) held.writer->Submit(progress, r::TrainingRecordRole::Epoch);
+   progress.phase = r::TrainingPhase::Completed;
+   held.writer->Finish(progress, {.history_size = ema ? r::kMaximumTrainingModels + 1 : 1});
+   held.Drain();
+   std::istringstream history(held.history);
+   std::string line;
+   std::uint64_t count = 0, evaluated_count = 0, models = 0, synchronized_count = 0;
+   while (std::getline(history, line)) {
+    const auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
+    CHECK(record.sequence == count + (overflow && count == 18 ? 1 : 0));
+    if (record.progress.scope == r::TrainingRecordScope::SynchronizedSession) {
+     ++synchronized_count;
+     REQUIRE(record.progress.val);
+     REQUIRE(record.progress.artifact);
+     CHECK(record.evaluated_weights == r::EvaluatedWeights::Ordinary);
+    } else if (record.progress.scope == r::TrainingRecordScope::Model) {
+     ++models;
+     CHECK(record.progress.model_id == models);
+     CHECK(record.progress.scalars.total == static_cast<double>(models));
+     REQUIRE(record.progress.distribution);
+     CHECK(record.progress.distribution->model_id == models);
+     CHECK(record.progress.distribution->scheduled_draws == models * 2);
+     CHECK(record.progress.val.has_value() == ema);
+     CHECK(record.progress.artifact.has_value() == ema);
+    }
+    evaluated_count += record.progress.val.has_value();
+    CHECK(record.role == (count == 18 ? r::TrainingRecordRole::Terminal : r::TrainingRecordRole::Epoch));
+    ++count;
    }
-   evaluated_count += record.progress.val.has_value();
-   CHECK(record.role == (count == 18 ? r::TrainingRecordRole::Terminal : r::TrainingRecordRole::Epoch));
-   ++count;
+   CHECK(count == 19);
+   CHECK(models == r::kMaximumTrainingModels);
+   CHECK(synchronized_count == 1);
+   CHECK(evaluated_count == (ema ? r::kMaximumTrainingModels + 1 : 1));
+   std::ifstream input(temp.path() / "results.json");
+   const auto document = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingProgressDocument>(
+    nlohmann::json::parse(input).dump(), {.max_bytes = r::kTrainingProgressDocumentBytes, .max_items = 131072, .max_depth = 32});
+   CHECK(document.sources.distributions.size() == r::kMaximumTrainingModels);
+   for (std::size_t index = 0; index < document.sources.distributions.size(); ++index) {
+    const auto& distribution = document.sources.distributions[index];
+    CHECK(distribution.model_id == index + 1);
+    CHECK(distribution.unique_images == index + 1);
+    CHECK(distribution.scheduled_draws == (index + 1) * 2);
+    CHECK(distribution.repeated_class_exposure == (index + 1) * 3);
+   }
+   CHECK(document.sources.observations.size() == evaluated_count);
+   REQUIRE(document.final);
+   CHECK(document.final->history_size == evaluated_count);
+   CHECK(document.record.sequence == (overflow ? 19 : 18));
+   CHECK(document.record.dropped_before == (overflow ? 1 : 0));
+   CHECK_NOTHROW(r::validate_training_progress_document(document, r::training_source_catalog(run.configuration)));
+   CHECK(held.writer->persistence().degraded == overflow);
+   CHECK(held.writer->persistence().dropped_records == (overflow ? 1 : 0));
   }
-  CHECK(count == 19); CHECK(models == r::kMaximumTrainingModels); CHECK(synchronized_count == 1);
-  CHECK(evaluated_count == (ema ? r::kMaximumTrainingModels + 1 : 1));
-  std::ifstream input(temp.path() / "results.json");
-  const auto document = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingProgressDocument>(nlohmann::json::parse(input).dump(), {.max_bytes = r::kTrainingProgressDocumentBytes, .max_items = 131072, .max_depth = 32});
-  CHECK(document.sources.distributions.size() == r::kMaximumTrainingModels);
-  for (std::size_t index = 0; index < document.sources.distributions.size(); ++index) {
-   const auto& distribution = document.sources.distributions[index];
-   CHECK(distribution.model_id == index + 1);
-   CHECK(distribution.unique_images == index + 1);
-   CHECK(distribution.scheduled_draws == (index + 1) * 2);
-   CHECK(distribution.repeated_class_exposure == (index + 1) * 3);
-  }
-  CHECK(document.sources.observations.size() == evaluated_count);
-  REQUIRE(document.final); CHECK(document.final->history_size == evaluated_count);
-  CHECK(document.record.sequence == (overflow ? 19 : 18));
-  CHECK(document.record.dropped_before == (overflow ? 1 : 0));
-  CHECK_NOTHROW(r::validate_training_progress_document(document, r::training_source_catalog(run.configuration)));
-  CHECK(held.writer->persistence().degraded == overflow);
-  CHECK(held.writer->persistence().dropped_records == (overflow ? 1 : 0));
- }
 }
-
 TEST_CASE("live projection retains every scheduled source beside current progress", "[model][rfdetr][training][telemetry]") {
  for (const bool ema : {false, true}) {
   mmltk::testsupport::ScopedTempDir temp{"mmltk-telemetry-observation"};
@@ -402,29 +421,42 @@ TEST_CASE("live projection retains every scheduled source beside current progres
   r::TrainingMetricProgress observed;
   observed.phase = r::TrainingPhase::EpochComplete;
   observed.scope = r::TrainingRecordScope::SynchronizedSession;
-  observed.artifact.emplace(); observed.artifact->path = "ordinary.pt";
+  observed.artifact.emplace();
+  observed.artifact->path = "ordinary.pt";
   observed.artifact->model_id = 1;
-  observed.val.emplace(); observed.val->bbox.ap = .2;
+  observed.val.emplace();
+  observed.val->bbox.ap = .2;
   held.writer->Submit(observed, r::TrainingRecordRole::Epoch);
   if (ema) {
-   observed.scope = r::TrainingRecordScope::Model; observed.model_id = 1;
-   observed.artifact->weights = r::EvaluatedWeights::Ema; observed.artifact->path = "ema-1.pt";
+   observed.scope = r::TrainingRecordScope::Model;
+   observed.model_id = 1;
+   observed.artifact->weights = r::EvaluatedWeights::Ema;
+   observed.artifact->path = "ema-1.pt";
    observed.val->bbox.ap = .4;
    held.writer->Submit(observed, r::TrainingRecordRole::Epoch);
-   auto other = observed; other.model_id = 2; other.artifact->model_id = 2;
-   other.artifact->path = "ema-2.pt"; other.val->bbox.ap = .8;
+   auto other = observed;
+   other.model_id = 2;
+   other.artifact->model_id = 2;
+   other.artifact->path = "ema-2.pt";
+   other.val->bbox.ap = .8;
    held.writer->Submit(other, r::TrainingRecordRole::Epoch);
   }
   r::TrainingMetricProgress current;
-  current.phase = r::TrainingPhase::EpochComplete; current.scope = r::TrainingRecordScope::Session;
+  current.phase = r::TrainingPhase::EpochComplete;
+  current.scope = r::TrainingRecordScope::Session;
   current.full_checkpoint_path = "session.json";
   held.writer->Submit(current, r::TrainingRecordRole::Epoch);
-  current.phase = r::TrainingPhase::Train; current.scope = r::TrainingRecordScope::Model;
-  current.epoch = 1; current.model_id = 2; current.completed_images = 3; current.total_images = 9;
+  current.phase = r::TrainingPhase::Train;
+  current.scope = r::TrainingRecordScope::Model;
+  current.epoch = 1;
+  current.model_id = 2;
+  current.completed_images = 3;
+  current.total_images = 9;
   held.writer->Submit(current, r::TrainingRecordRole::Live);
   held.Drain();
   std::ifstream input(temp.path() / "progress.json");
-  const auto document = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingProgressDocument>(nlohmann::json::parse(input).dump(), {.max_bytes = r::kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32});
+  const auto document = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingProgressDocument>(
+   nlohmann::json::parse(input).dump(), {.max_bytes = r::kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32});
   CHECK(document.record.progress == current);
   REQUIRE(document.sources.observations.size() == (ema ? 3 : 1));
   const auto selected = std::ranges::find_if(document.sources.observations, [&](const auto& record) { return r::training_metric_source(record) == *document.sources.catalog.default_source; });
@@ -438,31 +470,47 @@ TEST_CASE("live projection retains every scheduled source beside current progres
   CHECK_FALSE(held.writer->persistence().degraded);
  }
 }
-
 TEST_CASE("Retained selectable sources reject foreign duplicate inconsistent and future observations", "[model][rfdetr][training][telemetry]") {
- r::TrainRequest request; request.use_ema = true; request.lanes = 16;
+ r::TrainRequest request;
+ request.use_ema = true;
+ request.lanes = 16;
  request.lane_configuration.mode = r::TrainLaneMode::PeriodicAveraging;
  r::resize_training_models(request.lane_configuration, r::kMaximumTrainingModels, request.recipe, request.seed);
- r::TrainingSources sources; sources.catalog = r::training_source_catalog(request);
+ r::TrainingSources sources;
+ sources.catalog = r::training_source_catalog(request);
  REQUIRE(sources.catalog.available.size() == r::kMaximumTrainingModels + 1);
- r::TrainingRecord current; current.run_id = "run"; current.attempt_id = "attempt";
- current.progress.session_id = "session"; current.progress.epoch = 4;
- current.role = r::TrainingRecordRole::Epoch; current.progress.phase = r::TrainingPhase::EpochComplete;
+ r::TrainingRecord current;
+ current.run_id = "run";
+ current.attempt_id = "attempt";
+ current.progress.session_id = "session";
+ current.progress.epoch = 4;
+ current.role = r::TrainingRecordRole::Epoch;
+ current.progress.phase = r::TrainingPhase::EpochComplete;
  for (const auto& source : sources.catalog.available) {
   ++current.sequence;
-  current.progress.scope = source.scope; current.progress.model_id = source.model_id;
+  current.progress.scope = source.scope;
+  current.progress.model_id = source.model_id;
   current.evaluated_weights = source.weights;
-  current.progress.artifact.emplace(); auto& artifact = *current.progress.artifact;
-  artifact.session_id = "session"; artifact.model_id = source.model_id; artifact.epoch = 4; artifact.weights = source.weights;
+  current.progress.artifact.emplace();
+  auto& artifact = *current.progress.artifact;
+  artifact.session_id = "session";
+  artifact.model_id = source.model_id;
+  artifact.epoch = 4;
+  artifact.weights = source.weights;
   artifact.path = "model-" + std::to_string(source.model_id) + ".pt";
-  current.progress.val.emplace(); current.progress.val->bbox.ap = static_cast<double>(current.sequence) / 100;
+  current.progress.val.emplace();
+  current.progress.val->bbox.ap = static_cast<double>(current.sequence) / 100;
   r::retain_training_source(sources, current);
  }
  CHECK(sources.observations.size() == sources.catalog.available.size());
  CHECK_NOTHROW(r::validate_training_sources(sources, current));
  const auto retained = sources.observations;
- current.sequence += 50; current.dropped_before = 9; current.role = r::TrainingRecordRole::Live;
- current.progress.phase = r::TrainingPhase::Train; current.progress.artifact.reset(); current.progress.val.reset();
+ current.sequence += 50;
+ current.dropped_before = 9;
+ current.role = r::TrainingRecordRole::Live;
+ current.progress.phase = r::TrainingPhase::Train;
+ current.progress.artifact.reset();
+ current.progress.val.reset();
  r::retain_training_source(sources, current);
  CHECK(sources.observations == retained);
  CHECK(sources.observations.back().sequence < current.sequence);
@@ -478,7 +526,10 @@ TEST_CASE("Retained selectable sources reject foreign duplicate inconsistent and
    case 5: record.progress.artifact->weights = r::EvaluatedWeights::Ema; break;
    case 6: record.attempt_configuration.emplace(); break;
    case 7: record.progress.model_id = 999; break;
-   case 8: record.progress.artifact->evaluation.emplace(); record.progress.artifact->evaluation->bbox.ap = .99; break;
+   case 8:
+    record.progress.artifact->evaluation.emplace();
+    record.progress.artifact->evaluation->bbox.ap = .99;
+    break;
   }
   CHECK_THROWS(r::validate_training_sources(invalid, current));
  }
@@ -511,10 +562,14 @@ TEST_CASE("Retained selectable sources reject foreign duplicate inconsistent and
  selection.artifact.model_id = 1;
  selection.artifact.path = "selected.pt";
  selection.artifact.initialization = selection.artifact.configuration = selection.artifact.content = selection.artifact.sha256 = selection.artifact.validation = std::string(64, 'a');
- selection.validation.bbox.ap = .5; selection.validation.bbox.available = true;
- selection.artifact.evaluation = selection.validation; selection.artifact.selection_metric = .5;
- selection.best_individual_metric = .5; selection.ingredients.push_back({1, std::string(64, 'a'), 1});
- document.sources.selected = selection; document.final->selected = selection;
+ selection.validation.bbox.ap = .5;
+ selection.validation.bbox.available = true;
+ selection.artifact.evaluation = selection.validation;
+ selection.artifact.selection_metric = .5;
+ selection.best_individual_metric = .5;
+ selection.ingredients.push_back({1, std::string(64, 'a'), 1});
+ document.sources.selected = selection;
+ document.final->selected = selection;
  document.record.progress.phase = r::TrainingPhase::Completed;
  document.record.progress.scope = r::TrainingRecordScope::SelectedOutput;
  document.record.progress.model_id = selection.artifact.model_id;

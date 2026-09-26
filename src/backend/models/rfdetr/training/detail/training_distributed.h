@@ -11,13 +11,20 @@
 #include <c10/util/intrusive_ptr.h>
 #include <torch/types.h>
 #include <cuda_runtime_api.h>
-namespace c10d { class Backend; class Store; }
+namespace c10d {
+class Backend;
+class Store;
+}  // namespace c10d
 namespace mmltk::backend::models::rfdetr {
 class NativeRfDetrModel;
 struct TrainRequest;
 struct TrainingFailure;
-namespace detail { struct TrainingContinuationValues; }
-namespace testsupport { struct TrainingDistributedTestAccess; }
+namespace detail {
+struct TrainingContinuationValues;
+}
+namespace testsupport {
+struct TrainingDistributedTestAccess;
+}
 // Copies retain the same selected-device transport, including terminal custody.
 struct DistributedContext final {
  DistributedContext();
@@ -30,6 +37,7 @@ struct DistributedContext final {
  int rank = 0;
  int world_size = 1;
  int device_id = 0;
+
 private:
  struct Transport;
  std::shared_ptr<Transport> transport_;
@@ -72,6 +80,7 @@ public:
  void settle();
  [[nodiscard]] cudaError_t retire() noexcept;
  [[nodiscard]] bool uncertain() const noexcept;
+
 private:
  enum class Operation { Sum, Broadcast };
  std::size_t submit(const DistributedContext&, const torch::Tensor&, Operation);
@@ -85,7 +94,10 @@ void distributed_agree(const DistributedContext&, std::string_view turn, std::sp
 void agree_training_text(const DistributedContext&, std::string_view turn, std::string_view value);
 void agree_training_request(const DistributedContext&, const TrainRequest&);
 void agree_training_continuation(const DistributedContext&, const detail::TrainingContinuationValues&);
-struct TrainingPrecision final { at::ScalarType autocast_dtype = at::kFloat; bool fused_optimizer = false; };
+struct TrainingPrecision final {
+ at::ScalarType autocast_dtype = at::kFloat;
+ bool fused_optimizer = false;
+};
 [[nodiscard]] TrainingPrecision agree_training_precision(const DistributedContext&, int device, bool amp, bool fused);
 void agree_training_topology(const DistributedContext&, int device);
 void agree_model_inventory(const DistributedContext&, const NativeRfDetrModel&, std::string_view turn);

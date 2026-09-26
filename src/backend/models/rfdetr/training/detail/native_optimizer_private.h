@@ -81,9 +81,13 @@ public:
  [[nodiscard]] const std::vector<torch::Tensor>& eligible_parameters() const { return all_params_; }
  [[nodiscard]] const std::vector<std::string>& eligible_parameter_names() const { return all_param_names_; }
  void refresh_active_parameters() {
-  active_params_.clear(); active_names_.clear();
+  active_params_.clear();
+  active_names_.clear();
   for (std::size_t index = 0; index < all_params_.size(); ++index) {
-   if (all_params_[index].requires_grad()) { active_params_.push_back(all_params_[index]); active_names_.push_back(all_param_names_[index]); }
+   if (all_params_[index].requires_grad()) {
+    active_params_.push_back(all_params_[index]);
+    active_names_.push_back(all_param_names_[index]);
+   }
   }
  }
  [[nodiscard]] const std::vector<Group>& groups() const { return groups_; }
@@ -105,7 +109,8 @@ protected:
  NativeOptimizerStorage() = default;
  NativeOptimizerStorage(std::vector<Group> groups, std::vector<NamedParameter> params) : groups_(std::move(groups)), params_(std::move(params)) {}
  template <class Optimizer>
- [[nodiscard]] static std::vector<std::string> inspect_checkpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {}, const TrainingScheduleState* = nullptr);
+ [[nodiscard]] static std::vector<std::string> inspect_checkpoint(
+  torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {}, const TrainingScheduleState* = nullptr);
  std::vector<Group> groups_;
  std::vector<NamedParameter> params_;
  std::vector<ParamState> state_;
@@ -116,12 +121,16 @@ protected:
 };
 class NativeAdamW : public NativeOptimizerStorage<NativeAdamWGroupConfig, NativeAdamWParamState> {
 public:
- [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {}, const TrainingScheduleState* = nullptr);
+ [[nodiscard]] static std::vector<std::string> InspectCheckpoint(
+  torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {}, const TrainingScheduleState* = nullptr);
  NativeAdamW() = default;
  NativeAdamW(std::vector<Group> groups, std::vector<NamedParameter> params, NativeOptimizerBackend backend);
  [[nodiscard]] NativeOptimizerBackend backend() const;
  [[nodiscard]] const char* backend_name() const;
- void activate() { initialize_state(); refresh_active_parameters(); }
+ void activate() {
+  initialize_state();
+  refresh_active_parameters();
+ }
  void zero_grad(bool set_to_none);
  void set_lrs(const std::vector<double>& base_lrs, double scale);
  void step();
@@ -143,11 +152,15 @@ const char* native_optimizer_backend_name(NativeOptimizerBackend backend);
 [[nodiscard]] bool muon_parameter_eligible(std::string_view name, const torch::Tensor& parameter);
 class NativeMuonWithAuxAdam : public NativeOptimizerStorage<NativeMuonGroupConfig, NativeMuonParamState> {
 public:
- [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {}, const TrainingScheduleState* = nullptr);
+ [[nodiscard]] static std::vector<std::string> InspectCheckpoint(
+  torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {}, const TrainingScheduleState* = nullptr);
  NativeMuonWithAuxAdam() = default;
  NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params);
  [[nodiscard]] const char* backend_name() const;
- void activate() { initialize_state(); refresh_active_parameters(); }
+ void activate() {
+  initialize_state();
+  refresh_active_parameters();
+ }
  void zero_grad(bool set_to_none);
  void set_lrs(const std::vector<double>& base_lrs, double scale);
  void set_muon_momentum(double momentum);
@@ -164,15 +177,20 @@ class NativeSGD final : public NativeOptimizerStorage<NativeSGDGroupConfig, Nati
 public:
  NativeSGD() = default;
  NativeSGD(std::vector<Group>, std::vector<NamedParameter>);
- [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token = {}, const TrainingScheduleState* = nullptr);
+ [[nodiscard]] static std::vector<std::string> InspectCheckpoint(
+  torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token = {}, const TrainingScheduleState* = nullptr);
  [[nodiscard]] const char* backend_name() const { return "eager"; }
- void activate() { state_.resize(params_.size()); refresh_active_parameters(); }
+ void activate() {
+  state_.resize(params_.size());
+  refresh_active_parameters();
+ }
  void zero_grad(bool);
  void set_lrs(const std::vector<double>&, double);
  void set_momentum(double);
  void step();
  void save(torch::serialize::OutputArchive&, mmltk::backend::ml::cuda::TensorReadbackBuffers&, std::size_t) const;
  void load(torch::serialize::InputArchive& archive, std::stop_token stop = {}) { read_checkpoint(archive, stop, true); }
+
 private:
  friend NativeOptimizerStorage<NativeSGDGroupConfig, NativeSGDParamState>;
  void read_checkpoint(torch::serialize::InputArchive&, std::stop_token, bool);

@@ -36,8 +36,8 @@ __global__ void warp_affine_bgr_to_planar_kernel(const std::uint8_t* src, std::s
  float g = 128.0f;
  float r = 128.0f;
  if (src_x >= 0.0f && src_x < static_cast<float>(src_width) && src_y >= 0.0f && src_y < static_cast<float>(src_height)) {
-  const std::int32_t x_low = static_cast<std::int32_t>(floorf(src_x));
-  const std::int32_t y_low = static_cast<std::int32_t>(floorf(src_y));
+  const auto x_low = static_cast<std::int32_t>(floorf(src_x));
+  const auto y_low = static_cast<std::int32_t>(floorf(src_y));
   const std::int32_t x_high = min(x_low + 1, static_cast<std::int32_t>(src_width) - 1);
   const std::int32_t y_high = min(y_low + 1, static_cast<std::int32_t>(src_height) - 1);
   const float lx = src_x - static_cast<float>(x_low);

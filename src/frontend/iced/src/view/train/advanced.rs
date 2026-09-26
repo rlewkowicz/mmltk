@@ -19,7 +19,8 @@ pub enum Message {
     Augmentation(bool),
     PerceptualDownscale(bool),
     FreezeEncoder(bool),
-    UnfreezeLast(i32), DisableAugmentationLast(i32),
+    UnfreezeLast(i32),
+    DisableAugmentationLast(i32),
     Supervision(supervision::Message),
 }
 
@@ -90,8 +91,12 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedul
         Message::FreezeEncoder(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstrainrequestfreezeencoder(draft, value)
         }),
-        Message::UnfreezeLast(value) => model.edit(cadence, |draft| crate::generated::edit_workflowstrainrequestunfreezeencoderlastepochs(draft, value)),
-        Message::DisableAugmentationLast(value) => model.edit(cadence, |draft| crate::generated::edit_workflowstrainrequestdisableaugmentationlastepochs(draft, value)),
+        Message::UnfreezeLast(value) => model.edit(cadence, |draft| {
+            crate::generated::edit_workflowstrainrequestunfreezeencoderlastepochs(draft, value)
+        }),
+        Message::DisableAugmentationLast(value) => model.edit(cadence, |draft| {
+            crate::generated::edit_workflowstrainrequestdisableaugmentationlastepochs(draft, value)
+        }),
         Message::Supervision(message) => supervision::update(model, message),
     }
 }
@@ -110,7 +115,16 @@ pub fn view<'a>(
         );
     };
     let request = &train.request;
-    let scoped_recipe = settings.recipe_model.and_then(|id| request.laneconfiguration.models.iter().find(|entry| entry.modelid == id)).map_or(&request.recipe, |entry| &entry.recipe);
+    let scoped_recipe = settings
+        .recipe_model
+        .and_then(|id| {
+            request
+                .laneconfiguration
+                .models
+                .iter()
+                .find(|entry| entry.modelid == id)
+        })
+        .map_or(&request.recipe, |entry| &entry.recipe);
     let enabled = enabled && !settings.training_membership_pending();
     let lr = crate::generated::effective_trainrecipesettings_lr(scoped_recipe);
     let lr_encoder = crate::generated::effective_trainrecipesettings_lrencoder(scoped_recipe);
@@ -123,7 +137,9 @@ pub fn view<'a>(
             .fold(row![].spacing(6), |choices, recipe| {
                 choices.push(
                     button(optimizer_label(recipe.optimizer))
-                        .on_press_maybe(enabled.then_some(Message::Recipe(TrainRecipeSettingsEdit::Optimizer(recipe.optimizer))))
+                        .on_press_maybe(enabled.then_some(Message::Recipe(
+                            TrainRecipeSettingsEdit::Optimizer(recipe.optimizer),
+                        )))
                         .style(if scoped_recipe.optimizer == recipe.optimizer {
                             crate::fluent_theme::button_selected
                         } else {
@@ -137,7 +153,16 @@ pub fn view<'a>(
         .fold(row![].spacing(6), |choices, choice| {
             choices.push(
                 button(scheduler_label(choice))
-                    .on_press_maybe((enabled && crate::generated::train_scheduler_available(scoped_recipe.optimizer, choice)).then_some(Message::Recipe(TrainRecipeSettingsEdit::LrScheduler(choice))))
+                    .on_press_maybe(
+                        (enabled
+                            && crate::generated::train_scheduler_available(
+                                scoped_recipe.optimizer,
+                                choice,
+                            ))
+                        .then_some(Message::Recipe(
+                            TrainRecipeSettingsEdit::LrScheduler(choice),
+                        )),
+                    )
                     .style(if scheduler == choice {
                         crate::fluent_theme::button_selected
                     } else {
@@ -361,12 +386,17 @@ mod tests {
     #[test]
     fn recipe_edits_pin_values_and_reset_clears_the_basic_override_set() {
         let mut model = installed_settings_model();
-        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Lr(0.002))).unwrap();
+        update(
+            &mut model,
+            Message::Recipe(TrainRecipeSettingsEdit::Lr(0.002)),
+        )
+        .unwrap();
         let request = &model.draft.as_ref().unwrap().workflows.train.request;
         assert_eq!(request.recipe.lr, 0.002);
         assert!(
             request
-                .recipe.overrides
+                .recipe
+                .overrides
                 .overridden(TrainRecipeCatalogRelationField::Lr)
         );
 
@@ -378,7 +408,8 @@ mod tests {
             .workflows
             .train
             .request
-            .recipe.overrides;
+            .recipe
+            .overrides;
         assert!(!overrides.overridden(TrainRecipeCatalogRelationField::Lr));
         assert!(!overrides.overridden(TrainRecipeCatalogRelationField::LrEncoder));
         assert!(!overrides.overridden(TrainRecipeCatalogRelationField::LrScheduler));
@@ -389,19 +420,36 @@ mod tests {
     #[test]
     fn scheduler_selection_tracks_optimizer_recipe_until_explicitly_overridden() {
         let mut model = installed_settings_model();
-        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Optimizer(TrainOptimizerKind::Muon))).unwrap();
+        update(
+            &mut model,
+            Message::Recipe(TrainRecipeSettingsEdit::Optimizer(TrainOptimizerKind::Muon)),
+        )
+        .unwrap();
         let request = &model.draft.as_ref().unwrap().workflows.train.request;
         assert_eq!(
             effective_scheduler(request),
             recipe(TrainOptimizerKind::Muon).lrscheduler
         );
 
-        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::LrScheduler(TrainLrSchedulerKind::Cosine))).unwrap();
-        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Optimizer(TrainOptimizerKind::AdamW))).unwrap();
+        update(
+            &mut model,
+            Message::Recipe(TrainRecipeSettingsEdit::LrScheduler(
+                TrainLrSchedulerKind::Cosine,
+            )),
+        )
+        .unwrap();
+        update(
+            &mut model,
+            Message::Recipe(TrainRecipeSettingsEdit::Optimizer(
+                TrainOptimizerKind::AdamW,
+            )),
+        )
+        .unwrap();
         let request = &model.draft.as_ref().unwrap().workflows.train.request;
         assert!(
             request
-                .recipe.overrides
+                .recipe
+                .overrides
                 .overridden(TrainRecipeCatalogRelationField::LrScheduler)
         );
         assert_eq!(effective_scheduler(request), TrainLrSchedulerKind::Cosine);
@@ -422,32 +470,107 @@ mod tests {
         let mut model = installed_settings_model();
         let request = &mut model.draft.as_mut().unwrap().workflows.train.request;
         let global = request.recipe.clone();
-        request.laneconfiguration.models = (1..=2).map(|modelid| TrainModelSettings { modelid, seed: 42, recipe: global.clone(), coefficient: 1.0 }).collect();
+        request.laneconfiguration.models = (1..=2)
+            .map(|modelid| TrainModelSettings {
+                modelid,
+                seed: 42,
+                recipe: global.clone(),
+                coefficient: 1.0,
+            })
+            .collect();
         request.laneconfiguration.nextmodelid = 3;
         model.recipe_model = Some(1);
-        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Optimizer(TrainOptimizerKind::SGD))).unwrap();
-        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Momentum(0.8))).unwrap();
-        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::LrScheduler(TrainLrSchedulerKind::UltralyticsLinear))).unwrap();
-        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::WarmupBiasLr(0.04))).unwrap();
-        let first = model.draft.as_ref().unwrap().workflows.train.request.laneconfiguration.models[0].clone();
+        update(
+            &mut model,
+            Message::Recipe(TrainRecipeSettingsEdit::Optimizer(TrainOptimizerKind::SGD)),
+        )
+        .unwrap();
+        update(
+            &mut model,
+            Message::Recipe(TrainRecipeSettingsEdit::Momentum(0.8)),
+        )
+        .unwrap();
+        update(
+            &mut model,
+            Message::Recipe(TrainRecipeSettingsEdit::LrScheduler(
+                TrainLrSchedulerKind::UltralyticsLinear,
+            )),
+        )
+        .unwrap();
+        update(
+            &mut model,
+            Message::Recipe(TrainRecipeSettingsEdit::WarmupBiasLr(0.04)),
+        )
+        .unwrap();
+        let first = model
+            .draft
+            .as_ref()
+            .unwrap()
+            .workflows
+            .train
+            .request
+            .laneconfiguration
+            .models[0]
+            .clone();
         model.recipe_model = Some(2);
-        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Optimizer(TrainOptimizerKind::Muon))).unwrap();
-        update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Lr(0.004))).unwrap();
+        update(
+            &mut model,
+            Message::Recipe(TrainRecipeSettingsEdit::Optimizer(TrainOptimizerKind::Muon)),
+        )
+        .unwrap();
+        update(
+            &mut model,
+            Message::Recipe(TrainRecipeSettingsEdit::Lr(0.004)),
+        )
+        .unwrap();
         model.recipe_model = Some(1);
-        assert_eq!(model.draft.as_ref().unwrap().workflows.train.request.laneconfiguration.models[0], first);
+        assert_eq!(
+            model
+                .draft
+                .as_ref()
+                .unwrap()
+                .workflows
+                .train
+                .request
+                .laneconfiguration
+                .models[0],
+            first
+        );
         update(&mut model, Message::Recipe(TrainRecipeSettingsEdit::Reset)).unwrap();
         let request = &model.draft.as_ref().unwrap().workflows.train.request;
         assert_eq!(request.recipe, global);
-        assert_eq!(request.laneconfiguration.models[0].recipe.optimizer, TrainOptimizerKind::SGD);
-        assert!(!request.laneconfiguration.models[0].recipe.overrides.overridden(TrainRecipeCatalogRelationField::WarmupBiasLr));
-        assert_eq!(effective_trainrecipesettings_lr(&request.laneconfiguration.models[1].recipe), 0.004);
+        assert_eq!(
+            request.laneconfiguration.models[0].recipe.optimizer,
+            TrainOptimizerKind::SGD
+        );
+        assert!(
+            !request.laneconfiguration.models[0]
+                .recipe
+                .overrides
+                .overridden(TrainRecipeCatalogRelationField::WarmupBiasLr)
+        );
+        assert_eq!(
+            effective_trainrecipesettings_lr(&request.laneconfiguration.models[1].recipe),
+            0.004
+        );
         model.recipe_model = None;
         update(&mut model, Message::UnfreezeLast(3)).unwrap();
         update(&mut model, Message::DisableAugmentationLast(5)).unwrap();
         let request = &model.draft.as_ref().unwrap().workflows.train.request;
-        assert_eq!((request.unfreezeencoderlastepochs, request.disableaugmentationlastepochs), (3, 5));
-        assert!(train_scheduler_available(TrainOptimizerKind::SGD, TrainLrSchedulerKind::UltralyticsLinear));
-        assert!(!train_scheduler_available(TrainOptimizerKind::AdamW, TrainLrSchedulerKind::UltralyticsLinear));
+        assert_eq!(
+            (
+                request.unfreezeencoderlastepochs,
+                request.disableaugmentationlastepochs
+            ),
+            (3, 5)
+        );
+        assert!(train_scheduler_available(
+            TrainOptimizerKind::SGD,
+            TrainLrSchedulerKind::UltralyticsLinear
+        ));
+        assert!(!train_scheduler_available(
+            TrainOptimizerKind::AdamW,
+            TrainLrSchedulerKind::UltralyticsLinear
+        ));
     }
-
 }

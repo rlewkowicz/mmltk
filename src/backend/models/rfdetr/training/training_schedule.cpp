@@ -17,7 +17,7 @@ void advance(std::uint64_t& value) {
  if (value == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("training schedule clock exhausted");
  ++value;
 }
-}
+}  // namespace
 double compute_lr_scale(const TrainRecipeSettings& config, const std::uint64_t step, const std::uint64_t steps_per_epoch, const std::uint64_t total_steps) {
  const double warmup = std::trunc(static_cast<double>(steps_per_epoch) * config.warmup_epochs);
  if (warmup > 0.0 && static_cast<double>(step) < warmup) return static_cast<double>(step) / std::max(1.0, warmup);
@@ -35,10 +35,11 @@ double compute_warmup_momentum(const TrainRecipeSettings& config, const std::uin
  return config.warmup_momentum + (target - config.warmup_momentum) * alpha;
 }
 TrainingSchedule::TrainingSchedule(TrainRecipeSettings recipe, std::vector<double> lrs, std::vector<TrainingGroupRole> roles, std::uint64_t epochs, std::uint64_t nb, std::uint64_t k)
- : recipe_(std::move(recipe)), base_lrs_(std::move(lrs)), roles_(std::move(roles)), requested_epochs_(epochs), contributions_(k) {
+    : recipe_(std::move(recipe)), base_lrs_(std::move(lrs)), roles_(std::move(roles)), requested_epochs_(epochs), contributions_(k) {
  if (!train_recipe_valid(recipe_) || !epochs || !k || !nb || nb % k || base_lrs_.size() != roles_.size() || base_lrs_.empty() || base_lrs_.size() > 65536)
   throw std::invalid_argument("invalid training schedule admission");
- for (auto lr : base_lrs_) if (!std::isfinite(lr) || lr < 0) throw std::invalid_argument("invalid base learning rate");
+ for (auto lr : base_lrs_)
+  if (!std::isfinite(lr) || lr < 0) throw std::invalid_argument("invalid base learning rate");
  state_.steps_ref = nb / k;
  state_.nb_ref = nb;
  state_.original_epochs = epochs;
@@ -54,12 +55,14 @@ TrainingSchedule::TrainingSchedule(TrainRecipeSettings recipe, std::vector<doubl
  }
 }
 void TrainingSchedule::restore(TrainingScheduleState state) {
- if (!state.steps_ref || !state.nb_ref || state.nb_ref % contributions_ || state.steps_ref != state.nb_ref / contributions_ || state.consumed_attempts > state.consumed_microbatches / contributions_ || !state.original_epochs || state.original_epochs > requested_epochs_ || state.absolute_lrs.size() != base_lrs_.size() ||
-     state.successful_updates > state.consumed_attempts || !std::isfinite(state.held_momentum) || state.held_momentum < 0 || state.held_momentum > 1)
+ if (!state.steps_ref || !state.nb_ref || state.nb_ref % contributions_ || state.steps_ref != state.nb_ref / contributions_ || state.consumed_attempts > state.consumed_microbatches / contributions_ ||
+     !state.original_epochs || state.original_epochs > requested_epochs_ || state.absolute_lrs.size() != base_lrs_.size() || state.successful_updates > state.consumed_attempts ||
+     !std::isfinite(state.held_momentum) || state.held_momentum < 0 || state.held_momentum > 1)
   throw std::invalid_argument("invalid saved scheduler state");
  const auto nw = half_even(std::min(recipe_.warmup_epochs, static_cast<double>(state.original_epochs - 1)) * static_cast<double>(state.nb_ref));
  if (state.warmup_microbatches != nw) throw std::invalid_argument("saved warmup reference differs");
- for (auto lr : state.absolute_lrs) if (!std::isfinite(lr) || lr < 0) throw std::invalid_argument("invalid saved absolute learning rate");
+ for (auto lr : state.absolute_lrs)
+  if (!std::isfinite(lr) || lr < 0) throw std::invalid_argument("invalid saved absolute learning rate");
  (void)checked_training_product(requested_epochs_, state.steps_ref);
  state_ = std::move(state);
 }
@@ -95,4 +98,4 @@ void TrainingSchedule::finish_attempt(bool successful) {
  advance(state_.consumed_attempts);
  if (successful) advance(state_.successful_updates);
 }
-}
+}  // namespace mmltk::backend::models::rfdetr

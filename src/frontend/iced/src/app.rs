@@ -43,11 +43,8 @@ pub fn boot() -> (App, Task<Message>) {
     let config = TransportConfig::from_page();
     crate::presentation_surface::initialize_diagnostics(config.surface_trace, config.pixel_trace);
     #[cfg(target_arch = "wasm32")]
-    if config.surface_trace {
-        std::panic::set_hook(Box::new(|panic| {
-            if !crate::presentation_surface::surface_trace_enabled() {
-                return;
-            }
+    std::panic::set_hook(Box::new(|panic| {
+        if crate::presentation_surface::surface_trace_enabled() {
             if let Ok(message) =
                 js_sys::JSON::stringify(&wasm_bindgen::JsValue::from_str(&panic.to_string()))
                 && let Some(message) = message.as_string()
@@ -55,9 +52,13 @@ pub fn boot() -> (App, Task<Message>) {
                 crate::presentation_surface::emit_surface_trace(&format!(
                     "{{\"event\":\"iced.panic\",\"message\":{message}}}"
                 ));
+                return;
             }
-        }));
-    }
+        }
+        web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "fatal: Iced panic: {panic}"
+        )));
+    }));
     crate::integration_control::initialize_reporting(
         config.integration && config.surface_trace,
         config.integration_pixel_fixture,
@@ -128,7 +129,8 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                 integration.subscription().map(Message::Integration)
             }),
         if app.workspace.active() == crate::generated::FeatureId::Annotate
-            && !app.modal_active() && !app.status.open
+            && !app.modal_active()
+            && !app.status.open
         {
             crate::view::annotation::shortcuts().map(|message| {
                 Message::Workspace(crate::view::router::Message::Annotation(message))
@@ -176,7 +178,10 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
     }
-    if !previous_interaction.1 && app.modal_active() { app.status.close(); app.status.focus = None; }
+    if !previous_interaction.1 && app.modal_active() {
+        app.status.close();
+        app.status.focus = None;
+    }
     let prediction_settings_task = app.settle_prediction_total();
     app.advance_start();
     app.reconcile_surface_frame();
@@ -193,6 +198,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             &app.workspace,
             app.workspace.active(),
             surface,
+            app.status.open,
         );
         if let Some(connection) = app.connection.as_mut() {
             integration.publish_control(connection);
@@ -201,7 +207,13 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
     } else {
         Task::none()
     };
-    let notices = &app.integration.as_ref().map_or(&app.model, |integration| integration.status_model(&app.model)).notices;
+    let notices = &app
+        .integration
+        .as_ref()
+        .map_or(&app.model, |integration| {
+            integration.status_model(&app.model)
+        })
+        .notices;
     if let Some(control) = app.status.sync(notices) {
         app.interaction_revision = app.interaction_revision.saturating_add(1);
         task = Task::batch([task, iced::widget::operation::focus(control.id())]);
@@ -445,7 +457,10 @@ mod route_tests {
                 .is_none()
         );
         std::mem::swap(app.integration.as_mut().unwrap(), &mut fixture.controller);
-        app.model.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol("terminal transport closed"));
+        app.model.report_error(
+            crate::view_model::notices::Origin::Protocol,
+            UiError::protocol("terminal transport closed"),
+        );
         integration_control::initialize_reporting(false, false);
         let cancelled = fixture.receiver.try_recv().unwrap();
         assert_eq!(update(&mut app, Message::Integration(cancelled)).units(), 0);
@@ -772,7 +787,9 @@ mod route_tests {
 }
 
 pub fn view(app: &App) -> Element<'_, Message> {
-    let model = app.integration.as_ref().map_or(&app.model, |integration| integration.status_model(&app.model));
+    let model = app.integration.as_ref().map_or(&app.model, |integration| {
+        integration.status_model(&app.model)
+    });
     let content = crate::view::view(
         model,
         app.presentation.surface(),
@@ -951,7 +968,10 @@ mod tests {
             crate::view_model::ConnectionState::Reconnecting
         );
         assert_eq!(
-            app.model.notices.latest().map(|error| error.detail.as_str()),
+            app.model
+                .notices
+                .latest()
+                .map(|error| error.detail.as_str()),
             Some("peer lost")
         );
         assert_eq!(app.workspace.active(), FeatureId::Train);
@@ -1414,7 +1434,10 @@ mod tests {
         );
         assert!(capture.try_recv().is_err());
         app.model.abandon_intent(settings);
-        assert!(!app.guard_compute_stop(FeatureId::Validate, ApplicationIntentEndpoint::ValidationStop));
+        assert!(!app.guard_compute_stop(
+            FeatureId::Validate,
+            ApplicationIntentEndpoint::ValidationStop
+        ));
         assert!(app.model.workflow.pending_start.is_none());
         app.workspace.select(FeatureId::Export);
 
@@ -1515,7 +1538,8 @@ mod tests {
         annotation.ready = true;
         annotation.ui.documentrevision = 1;
         annotation.inputdocumentepoch = 1;
-        annotation.frame = crate::view_model::test_support::visual_frame(PresentationSourceKind::Annotation, 1);
+        annotation.frame =
+            crate::view_model::test_support::visual_frame(PresentationSourceKind::Annotation, 1);
         let (connection, mut capture) = Connection::test_channel();
         app.connection = Some(connection);
         drop(app.on_workspace(crate::view::router::Message::Annotation(
@@ -1523,27 +1547,45 @@ mod tests {
                 crate::presentation_surface::SurfaceGesture {
                     kind: crate::presentation_surface::SurfaceGestureKind::Pointer,
                     sample: crate::presentation_surface::SurfaceSample {
-                        width: 640, height: 480, x: 20, y: 30,
-                        content_x: 20.0, content_y: 30.0, pressed: true,
+                        width: 640,
+                        height: 480,
+                        x: 20,
+                        y: 30,
+                        content_x: 20.0,
+                        content_y: 30.0,
+                        pressed: true,
                     },
                 },
             )),
         )));
         let captured_revision = app.interaction_revision;
-        app.model.report_error(crate::view_model::notices::Origin::Transport, UiError::transport("visible notification"));
-        drop(update(&mut app, Message::Status(StatusMessage::Activate(Control::Trigger, Opening::Keyboard))));
+        app.model.report_error(
+            crate::view_model::notices::Origin::Transport,
+            UiError::transport("visible notification"),
+        );
+        drop(update(
+            &mut app,
+            Message::Status(StatusMessage::Activate(Control::Trigger, Opening::Keyboard)),
+        ));
         drop(update(&mut app, Message::Status(StatusMessage::Close)));
         assert!(!app.status.open);
         assert!(app.interaction_revision > captured_revision);
-        let resolved = |interaction_revision| crate::view::router::Message::Annotation(
-            AnnotationMessage::ShortcutResolved { shortcut: Shortcut::Undo, focused: false, interaction_revision },
-        );
+        let resolved = |interaction_revision| {
+            crate::view::router::Message::Annotation(AnnotationMessage::ShortcutResolved {
+                shortcut: Shortcut::Undo,
+                focused: false,
+                interaction_revision,
+            })
+        };
         drop(app.on_workspace(resolved(captured_revision)));
         assert_eq!(app.model.pending_count(), 0);
         assert!(capture.try_recv().is_err());
         drop(app.on_workspace(resolved(app.interaction_revision)));
         assert_eq!(app.model.pending_count(), 1);
-        assert!(matches!(capture.try_recv().unwrap(), crate::transport_connection::CapturedRecord::Intent(_)));
+        assert!(matches!(
+            capture.try_recv().unwrap(),
+            crate::transport_connection::CapturedRecord::Intent(_)
+        ));
     }
 
     #[test]
@@ -1554,27 +1596,50 @@ mod tests {
         drop(task);
         install_default_bootstrap(&mut app);
         for generation in 1..=2 {
-            app.model.notices.terminal(Origin::Provider, 0, generation, || Some(crate::view_model::notices::failure("row")));
+            app.model
+                .notices
+                .terminal(Origin::Provider, 0, generation, || {
+                    Some(crate::view_model::notices::failure("row"))
+                });
         }
         let ids: Vec<_> = app.model.notices.rows().map(|notice| notice.id).collect();
-        drop(update(&mut app, Message::Status(StatusMessage::Activate(Control::Trigger, Opening::Keyboard))));
-        drop(update(&mut app, Message::Status(StatusMessage::Focused(Control::Detail(ids[0]), true))));
+        drop(update(
+            &mut app,
+            Message::Status(StatusMessage::Activate(Control::Trigger, Opening::Keyboard)),
+        ));
+        drop(update(
+            &mut app,
+            Message::Status(StatusMessage::Focused(Control::Detail(ids[0]), true)),
+        ));
         let pending_focus = app.interaction_revision;
-        drop(update(&mut app, Message::Status(StatusMessage::Activate(Control::Dismiss(ids[0]), Opening::Keyboard))));
+        drop(update(
+            &mut app,
+            Message::Status(StatusMessage::Activate(
+                Control::Dismiss(ids[0]),
+                Opening::Keyboard,
+            )),
+        ));
         assert_eq!(app.status.focus, Some(Control::Copy(ids[1])));
         assert!(app.interaction_revision > pending_focus);
         for message in [
             StatusMessage::Focused(Control::Detail(ids[0]), true),
-            StatusMessage::FocusChecked { revision: pending_focus, focused: None },
+            StatusMessage::FocusChecked {
+                revision: pending_focus,
+                focused: None,
+            },
             StatusMessage::Activate(Control::Detail(ids[0]), Opening::Keyboard),
-        ] { drop(update(&mut app, Message::Status(message))); }
+        ] {
+            drop(update(&mut app, Message::Status(message)));
+        }
         assert_eq!(app.status.focus, Some(Control::Copy(ids[1])));
         assert!(app.status.open);
         drop(update(&mut app, Message::Status(StatusMessage::Close)));
         for message in [
             StatusMessage::Focused(Control::Detail(ids[1]), true),
             StatusMessage::SelectDetail(ids[1], iced::widget::text_editor::Action::SelectAll),
-        ] { drop(update(&mut app, Message::Status(message))); }
+        ] {
+            drop(update(&mut app, Message::Status(message)));
+        }
         assert_eq!(app.status.focus, Some(Control::Trigger));
         assert!(!app.status.open);
     }
@@ -1592,15 +1657,23 @@ mod tests {
         assert!(!app.guard_compute_stop(FeatureId::Train, stop));
         drop(app.on_annotation(crate::view::annotation::Outcome::SaveRequested));
         assert_eq!(app.model.notices.len(), 2);
-        app.model.report_error(Origin::Editor(FeatureId::Predict), UiError::invalid("invalid prediction field"));
+        app.model.report_error(
+            Origin::Editor(FeatureId::Predict),
+            UiError::invalid("invalid prediction field"),
+        );
         app.model.notices.dismiss_all();
         drop(app.on_workspace(crate::view::router::Message::Annotation(
             crate::view::annotation::Message::Workspace(crate::view::workspace::Message::Gesture(
                 crate::presentation_surface::SurfaceGesture {
                     kind: crate::presentation_surface::SurfaceGestureKind::Pointer,
                     sample: crate::presentation_surface::SurfaceSample {
-                        width: 640, height: 480, x: 20, y: 30,
-                        content_x: 20.0, content_y: 30.0, pressed: false,
+                        width: 640,
+                        height: 480,
+                        x: 20,
+                        y: 30,
+                        content_x: 20.0,
+                        content_y: 30.0,
+                        pressed: false,
                     },
                 },
             )),
@@ -1608,14 +1681,23 @@ mod tests {
         drop(app.on_workspace(crate::view::router::Message::Navigation(
             crate::view::navigation::Message::PageSelected(FeatureId::Predict),
         )));
-        app.model.report_admission_error(stop, UiError::busy("retained stop failure"));
-        app.model.report_admission_error(save, UiError::busy("retained save failure"));
-        app.model.report_error(Origin::Editor(FeatureId::Predict), UiError::invalid("same prediction field episode"));
+        app.model
+            .report_admission_error(stop, UiError::busy("retained stop failure"));
+        app.model
+            .report_admission_error(save, UiError::busy("retained save failure"));
+        app.model.report_error(
+            Origin::Editor(FeatureId::Predict),
+            UiError::invalid("same prediction field episode"),
+        );
         assert!(app.model.notices.is_empty());
         assert!(!app.guard_compute_stop(FeatureId::Train, stop));
         assert_eq!(app.model.notices.len(), 1);
-        assert_eq!(app.model.notices.latest().unwrap().origin, Origin::Admission(stop));
-        app.model.report_admission_error(save, UiError::busy("save still acknowledged"));
+        assert_eq!(
+            app.model.notices.latest().unwrap().origin,
+            Origin::Admission(stop)
+        );
+        app.model
+            .report_admission_error(save, UiError::busy("save still acknowledged"));
         assert_eq!(app.model.notices.len(), 1);
     }
 
@@ -1747,7 +1829,13 @@ mod tests {
                 crate::generated::edit_workflowsexploregridwidth(draft, 5)
             })
             .unwrap();
-        assert!(success.settings.state_mut().take_request([true; 3]).is_some());
+        assert!(
+            success
+                .settings
+                .state_mut()
+                .take_request([true; 3])
+                .is_some()
+        );
         let draft_request = ExploreViewportUpdate {
             viewport: success
                 .workspace
@@ -1775,7 +1863,13 @@ mod tests {
                 crate::generated::edit_workflowsexploregridwidth(draft, 5)
             })
             .unwrap();
-        assert!(rejected.settings.state_mut().take_request([true; 3]).is_some());
+        assert!(
+            rejected
+                .settings
+                .state_mut()
+                .take_request([true; 3])
+                .is_some()
+        );
         let draft_request = ExploreViewportUpdate {
             viewport: rejected
                 .workspace

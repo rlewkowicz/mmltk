@@ -316,10 +316,17 @@ impl crate::generated::PresentationApplicationProjection<UiError> for Applicatio
             ApplicationEvent::PresentationPresentationFailed(value) => {
                 let generation = value.snapshot.revision;
                 match self.install_presentation_snapshot(value.snapshot) {
-                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
+                    Err(error) => {
+                        self.report_error(crate::view_model::notices::Origin::Protocol, error)
+                    }
                     Ok(Observation::Stale) => {}
                     Ok(Observation::Installed | Observation::Current) => {
-                        self.notices.terminal(super::notices::Origin::Presentation, 0, generation, || Some(UiError::presentation(value.detail)));
+                        self.notices.terminal(
+                            super::notices::Origin::Presentation,
+                            0,
+                            generation,
+                            || Some(UiError::presentation(value.detail)),
+                        );
                     }
                 }
             }
@@ -931,7 +938,10 @@ mod tests {
         malformed.uirevision = malformed.revision + 1;
         assert!(model.annotation.install_snapshot(malformed).is_err());
         assert_eq!(model.annotation.snapshot.as_ref(), Some(&installed));
-        for ui_revision in [installed.uirevision - 1, installed.uirevision + 1] {
+        for (index, ui_revision) in [installed.uirevision - 1, installed.uirevision + 1]
+            .into_iter()
+            .enumerate()
+        {
             model.notices.dismiss_all();
             model.reduce_event(ApplicationEvent::AnnotationAnnotationFrameChanged(
                 crate::generated::AnnotationFrameChanged {
@@ -942,7 +952,9 @@ mod tests {
                     },
                 },
             ));
-            assert!(!model.notices.is_empty());
+            // Dismissal acknowledges this protocol episode until a successful
+            // bootstrap clears it, even when another malformed frame arrives.
+            assert_eq!(model.notices.is_empty(), index != 0);
             assert_eq!(model.annotation.snapshot.as_ref(), Some(&installed));
         }
         model.notices.dismiss_all();
@@ -1283,28 +1295,58 @@ mod tests {
             .unwrap();
         assert_eq!(model.predict_snapshot.as_ref().unwrap().frame, image.frame);
         assert!(model.notices.is_empty());
+        let retained = model.predict_snapshot.clone();
         model.peer_disconnected(UiError::transport("reconnect"));
-        assert_eq!(model.predict_snapshot.as_ref(), Some(&cancellation));
+        assert_eq!(model.predict_snapshot, retained);
         assert!(!model.compute_stop_available(FeatureId::Predict));
         assert!(!model.predict_pause_available());
-        assert!(model.begin_intent(ApplicationIntentEndpoint::PredictStart).is_err());
+        assert!(
+            model
+                .begin_intent(ApplicationIntentEndpoint::PredictStart)
+                .is_err()
+        );
         // Reconnect replaces retained logical facts authoritatively, including a
         // lower revision; disconnected retention does not grant admission.
-        let snapshots: Vec<_> = crate::generated::application_snapshot_defaults().unwrap().into_iter().map(|fact| fact.value).collect();
-        let replacement = snapshots.iter().find_map(|snapshot| match snapshot {
-            crate::generated::ApplicationSnapshot::Predict(state) => Some(state.clone()), _ => None,
-        }).unwrap();
-        model.install_bootstrap(crate::generated::SCHEMA_FINGERPRINT, snapshots).unwrap();
+        let snapshots: Vec<_> = crate::generated::application_snapshot_defaults()
+            .unwrap()
+            .into_iter()
+            .map(|fact| fact.value)
+            .collect();
+        let replacement = snapshots
+            .iter()
+            .find_map(|snapshot| match snapshot {
+                crate::generated::ApplicationSnapshot::Predict(state) => Some(state.clone()),
+                _ => None,
+            })
+            .unwrap();
+        model
+            .install_bootstrap(crate::generated::SCHEMA_FINGERPRINT, snapshots)
+            .unwrap();
         assert_eq!(model.predict_snapshot, Some(replacement));
-        assert!(model.begin_intent(ApplicationIntentEndpoint::PredictStart).is_ok());
+        assert!(
+            model
+                .begin_intent(ApplicationIntentEndpoint::PredictStart)
+                .is_ok()
+        );
     }
 }
 
 impl ApplicationModel {
-    fn install_presentation_snapshot(&mut self, value: PresentationState) -> Result<Observation, UiError> {
+    fn install_presentation_snapshot(
+        &mut self,
+        value: PresentationState,
+    ) -> Result<Observation, UiError> {
         let observation = merge_presentation_snapshot(&mut self.presentation, value)?;
         if observation != Observation::Stale {
-            self.notices.terminal(super::notices::Origin::Presentation, 0, self.presentation.as_ref().expect("installed Presentation snapshot").revision, || None);
+            self.notices.terminal(
+                super::notices::Origin::Presentation,
+                0,
+                self.presentation
+                    .as_ref()
+                    .expect("installed Presentation snapshot")
+                    .revision,
+                || None,
+            );
         }
         Ok(observation)
     }

@@ -311,23 +311,26 @@ public:
     [this, admission, revision = facts.revision] {
      settings_.LockTrainingConfiguration(revision);
      try {
-     std::scoped_lock lock(mutex_);
-     if (admission && (admission != inspection_admission_ || admission != prepared_admission_)) throw contracts::InvalidIntentError("prepare the selected checkpoint before Resume");
-     prepared_admission_.reset();
-     const auto next = contracts::next_compute_generation(state_.local.generation_frontier);
-     if (!next) throw contracts::FailedError("training operation generation exhausted");
-     state_.activity = TrainingActivity::Local;
-     state_.local.output = {};
-     state_.metrics.reset();
-     state_.sources = {};
-     state_.persistence = {};
-     state_.local.active = true;
-     state_.local.generation_frontier = *next;
-     state_.local.progress = {};
-     state_.local.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, state_.local.generation_frontier);
-     state_.local.terminal.detail = "Inspecting selected training inputs";
-     AdvanceObservation();
-     } catch (...) { settings_.UnlockTrainingConfiguration(); throw; }
+      std::scoped_lock lock(mutex_);
+      if (admission && (admission != inspection_admission_ || admission != prepared_admission_)) throw contracts::InvalidIntentError("prepare the selected checkpoint before Resume");
+      prepared_admission_.reset();
+      const auto next = contracts::next_compute_generation(state_.local.generation_frontier);
+      if (!next) throw contracts::FailedError("training operation generation exhausted");
+      state_.activity = TrainingActivity::Local;
+      state_.local.output = {};
+      state_.metrics.reset();
+      state_.sources = {};
+      state_.persistence = {};
+      state_.local.active = true;
+      state_.local.generation_frontier = *next;
+      state_.local.progress = {};
+      state_.local.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, state_.local.generation_frontier);
+      state_.local.terminal.detail = "Inspecting selected training inputs";
+      AdvanceObservation();
+     } catch (...) {
+      settings_.UnlockTrainingConfiguration();
+      throw;
+     }
     },
    .work = [this, settings = facts.settings, selection, admission](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
     contracts::ComputeTerminal terminal;

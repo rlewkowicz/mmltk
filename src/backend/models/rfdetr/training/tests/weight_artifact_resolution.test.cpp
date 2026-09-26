@@ -50,13 +50,18 @@ TEST_CASE("admitted native state resolves complete metadata without reopening it
  source.metadata.preset_name = "rf-detr-nano";
  source.metadata.source_kind = "native-training";
  source.metadata.source_path = "initial.pth";
- source.metadata.num_classes = 2; source.metadata.num_queries = 7; source.metadata.num_select = 3;
+ source.metadata.num_classes = 2;
+ source.metadata.num_queries = 7;
+ source.metadata.num_select = 3;
  source.metadata.class_layout = rfdetr::testsupport::synthetic_training_layout(1);
  source.metadata.for_each_detection_field([]<class Field>(const char*, Field& field) {
   using Value = typename Field::value_type;
-  if constexpr (std::is_same_v<Value, bool>) field = true;
-  else if constexpr (std::is_integral_v<Value>) field = 8;
-  else field = .75;
+  if constexpr (std::is_same_v<Value, bool>)
+   field = true;
+  else if constexpr (std::is_integral_v<Value>)
+   field = 8;
+  else
+   field = .75;
  });
  source.replace_entries({{"value", torch::ones({2})}});
  rfdetr::save_native_checkpoint(path, source);

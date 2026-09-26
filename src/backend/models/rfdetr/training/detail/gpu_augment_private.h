@@ -21,7 +21,8 @@ public:
  GpuBatchAugmenter(const GpuBatchAugmenter&) = delete;
  GpuBatchAugmenter& operator=(const GpuBatchAugmenter&) = delete;
  void reconfigure(const GpuAugmentationConfig& config);
- [[nodiscard]] torch::Tensor run(const mmltk::backend::data::Batch& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence, const mmltk::backend::data::DatasetLoader* source = nullptr, std::span<const TrainingDonorDescriptor> donors = {});
+ [[nodiscard]] torch::Tensor run(const mmltk::backend::data::Batch& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence, const mmltk::backend::data::DatasetLoader* source = nullptr,
+  std::span<const TrainingDonorDescriptor> donors = {});
  [[nodiscard]] inline AugmentationBatchPlan& batch_plan() {
   RequireActive();
   return batch_plan_;

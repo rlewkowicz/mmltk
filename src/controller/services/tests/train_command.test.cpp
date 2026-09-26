@@ -28,7 +28,7 @@ r::TrainRequest child_request(const r::TrainRequest& value) {
  REQUIRE(arguments[3].size() <= r::kMaximumTrainRequestJsonBytes);
  return r::decode_train_request_json(arguments[3]);
 }
-}
+}  // namespace
 TEST_CASE("training child carries the complete canonical request including topology and independent recipes", "[gui][train_command]") {
  auto value = request();
  CHECK(child_request(value) == value);
@@ -51,7 +51,8 @@ TEST_CASE("training child carries the complete canonical request including topol
  value.unfreeze_encoder_last_epochs = 4;
  value.disable_augmentation_last_epochs = 7;
  CHECK(child_request(value) == value);
- value.weights_path.clear(); value.resume_path = "/tmp/resume.pt";
+ value.weights_path.clear();
+ value.resume_path = "/tmp/resume.pt";
  CHECK(child_request(value) == value);
  value.distributed_worker = true;
  value.distributed_rank = 1;
@@ -82,7 +83,7 @@ TEST_CASE("every optimizer recipe retains complete JSON command and checkpoint c
   detached.lr = .003;
   Relation::set_override<reflection::member_path<&r::TrainRecipeSettings::lr>>(detached.overrides);
   CHECK(child_request(value) == value);
-  const auto size = serialization::encode(value, encoded, limits);
+  const auto size = serialization::encode(value, std::span(encoded), limits);
   REQUIRE(size.has_value());
   const auto decoded = serialization::decode<r::TrainRequest>({std::span(encoded).first(*size), {}}, limits);
   REQUIRE(decoded.has_value());
@@ -117,11 +118,14 @@ TEST_CASE("canonical training JSON is bounded and rejects invalid payloads befor
  auto value = request();
  value.device_id = -1;
  CHECK_THROWS(child_request(value));
- value = request(); value.recipe.lr = std::numeric_limits<double>::infinity();
+ value = request();
+ value.recipe.lr = std::numeric_limits<double>::infinity();
  CHECK_THROWS(child_request(value));
- value = request(); value.recipe.lr_scheduler = r::TrainLrSchedulerKind::UltralyticsLinear;
+ value = request();
+ value.recipe.lr_scheduler = r::TrainLrSchedulerKind::UltralyticsLinear;
  CHECK_THROWS(child_request(value));
- value = request(); value.lanes = 0;
+ value = request();
+ value.lanes = 0;
  CHECK_THROWS(child_request(value));
 }
 TEST_CASE("recipe selection and reset preserve scope and derive every override bit", "[gui][train_command]") {
@@ -140,7 +144,10 @@ TEST_CASE("recipe selection and reset preserve scope and derive every override b
  CHECK(value.recipe.lr == .0002);
  CHECK(independent.lr == .009);
  std::size_t fields = 0;
- Relation::VisitMembers([&]<class Entry> { CHECK_FALSE(Relation::overridden<Entry::destination>(value.recipe.overrides)); ++fields; });
+ Relation::VisitMembers([&]<class Entry> {
+  CHECK_FALSE(Relation::overridden<Entry::destination>(value.recipe.overrides));
+  ++fields;
+ });
  CHECK(fields == r::kTrainRecipeFieldCount);
  CHECK(r::cli_enum_spelling(r::TrainOptimizerKind::SGD) == "sgd");
  CHECK(r::train_lr_scheduler_from_spelling("ultralytics-linear") == r::TrainLrSchedulerKind::UltralyticsLinear);
@@ -152,7 +159,9 @@ TEST_CASE("Execution admission checks global products bounded stable models and 
  CHECK(value.validation_lanes == 1);
  CHECK(r::PredictRequest{}.lanes == 1);
  CHECK(r::ValidateRequest{}.lanes == 1);
- value.batch_size = 3; value.grad_accum_steps = 4; value.lanes = 2;
+ value.batch_size = 3;
+ value.grad_accum_steps = 4;
+ value.lanes = 2;
  const auto shared = r::derive_execution_facts(value, 17);
  CHECK(shared.settings_revision == 17);
  CHECK(shared.logical_models == 1);
@@ -172,16 +181,27 @@ TEST_CASE("Execution admission checks global products bounded stable models and 
  value.lane_configuration.models.clear();
  value.lane_configuration.next_model_id = std::numeric_limits<std::uint64_t>::max();
  CHECK_THROWS(r::resize_training_models(value.lane_configuration, 1, value.recipe, value.seed));
- value = request(); value.batch_size = std::numeric_limits<std::size_t>::max(); value.lanes = 2;
+ value = request();
+ value.batch_size = std::numeric_limits<std::size_t>::max();
+ value.lanes = 2;
  CHECK_THROWS(r::derive_execution_facts(value, 0));
- value = request(); value.val_batch_size = std::numeric_limits<std::size_t>::max(); value.validation_lanes = 2;
+ value = request();
+ value.val_batch_size = std::numeric_limits<std::size_t>::max();
+ value.validation_lanes = 2;
  CHECK_THROWS(r::validate_train_request(value));
- r::ValidateRequest validation; validation.batch_size = std::numeric_limits<std::size_t>::max(); validation.lanes = 2;
+ r::ValidateRequest validation;
+ validation.batch_size = std::numeric_limits<std::size_t>::max();
+ validation.lanes = 2;
  CHECK_THROWS(r::derive_execution_facts(validation, 0));
- r::PredictRequest prediction; prediction.batch_size = std::numeric_limits<std::size_t>::max(); prediction.lanes = 2;
+ r::PredictRequest prediction;
+ prediction.batch_size = std::numeric_limits<std::size_t>::max();
+ prediction.lanes = 2;
  CHECK_THROWS(r::derive_execution_facts(prediction, 0));
- value = request(); value.recipe.optimizer = r::TrainOptimizerKind::SGD; r::reset_train_recipe(value.recipe);
- value.recipe.nesterov = true; value.recipe.momentum = 0;
+ value = request();
+ value.recipe.optimizer = r::TrainOptimizerKind::SGD;
+ r::reset_train_recipe(value.recipe);
+ value.recipe.nesterov = true;
+ value.recipe.momentum = 0;
  CHECK_FALSE(r::train_recipe_valid(value.recipe));
  value.recipe.momentum = .9;
  CHECK(r::train_recipe_valid(value.recipe));
@@ -195,7 +215,8 @@ TEST_CASE("Execution admission checks global products bounded stable models and 
    if constexpr (constraint.has_minimum) {
     field = static_cast<Field>(constraint.minimum - 1);
     CHECK_FALSE(r::train_recipe_valid(candidate));
-    auto invalid = value; invalid.recipe = candidate;
+    auto invalid = value;
+    invalid.recipe = candidate;
     CHECK_THROWS(child_request(invalid));
    }
    if constexpr (constraint.has_maximum) {
@@ -204,8 +225,10 @@ TEST_CASE("Execution admission checks global products bounded stable models and 
    }
   }
   if constexpr (std::floating_point<Field>) {
-   field = std::numeric_limits<double>::quiet_NaN(); CHECK_FALSE(r::train_recipe_valid(candidate));
-   field = std::numeric_limits<double>::infinity(); CHECK_FALSE(r::train_recipe_valid(candidate));
+   field = std::numeric_limits<double>::quiet_NaN();
+   CHECK_FALSE(r::train_recipe_valid(candidate));
+   field = std::numeric_limits<double>::infinity();
+   CHECK_FALSE(r::train_recipe_valid(candidate));
   }
  });
 }

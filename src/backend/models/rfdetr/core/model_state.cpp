@@ -82,11 +82,13 @@ void capture_checkpoint_detection_metadata(NativeCheckpointMetadata& metadata, c
 }
 }  // namespace
 bool same_native_model_semantics(const NativeCheckpointMetadata& left, const NativeCheckpointMetadata& right) {
- template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeCheckpointMetadata, std::meta::access_context::current()))) {
-  if constexpr (std::meta::identifier_of(field) != "source_path" && std::meta::identifier_of(field) != "source_kind")
-   if (left.[:field:] != right.[:field:]) return false;
- }
- return true;
+ return []<class Metadata>(const Metadata& a, const Metadata& b) {
+  template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^Metadata, std::meta::access_context::current()))) {
+   if constexpr (std::meta::identifier_of(field) != "source_path" && std::meta::identifier_of(field) != "source_kind")
+    if (a.[:field:] != b.[:field:]) return false;
+  }
+  return true;
+ }(left, right);
 }
 void validate_decoded_model_state(const DecodedNativeModelState& state) {
  const ResolvedClassLayout layout(state.metadata.class_layout);
@@ -264,8 +266,8 @@ ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path
  auto artifacts = resolve_admitted_model_artifacts(state, canonical, preset_name, resolution, class_layout_path, stop);
  return {.artifacts = std::move(artifacts), .model_state = std::move(state)};
 }
-ResolvedModelArtifacts resolve_admitted_model_artifacts(const DecodedNativeModelState& state, const std::filesystem::path& weights_path,
- std::string_view preset_name, int resolution, const std::filesystem::path& class_layout_path, std::stop_token stop) {
+ResolvedModelArtifacts resolve_admitted_model_artifacts(
+ const DecodedNativeModelState& state, const std::filesystem::path& weights_path, std::string_view preset_name, int resolution, const std::filesystem::path& class_layout_path, std::stop_token stop) {
  if (!state.class_artifact) throw std::invalid_argument("model resolution requires admitted file evidence");
  state.class_artifact->RequireUnchanged(stop);
  const auto canonical = canonical_path(weights_path);

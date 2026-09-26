@@ -1,4 +1,5 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include <catch2/matchers/catch_matchers.hpp>
 #include <algorithm>
 #include <array>
 #include <fstream>
@@ -48,13 +49,12 @@ torch::serialize::InputArchive continuation_fixture(const r::TrainRequest& reque
  return r::testsupport::checkpoint_input(output);
 }
 torch::serialize::InputArchive continuation_fixture(const r::TrainRequest& request) {
- return continuation_fixture(request, r::testsupport::continuation_values(request,
-  {.epoch = 0,
-   .grad_scaler_scale = 1024.0,
-   .grad_scaler_growth_tracker = 17,
-   .ema_completed_updates = request.use_ema ? 37 : 0,
-   .training_attempt_id = "attempt",
-   .training_original_descriptor = "original.json"}));
+ return continuation_fixture(request, r::testsupport::continuation_values(request, {.epoch = 0,
+                                                                                    .grad_scaler_scale = 1024.0,
+                                                                                    .grad_scaler_growth_tracker = 17,
+                                                                                    .ema_completed_updates = request.use_ema ? 37 : 0,
+                                                                                    .training_attempt_id = "attempt",
+                                                                                    .training_original_descriptor = "original.json"}));
 }
 void test_current_continuation_required_fields() {
  auto source = continuation_fixture(saved_request());
@@ -94,8 +94,7 @@ void test_current_continuation_required_fields() {
 void test_current_continuation_scalar_boundaries() {
  const auto invalid = std::to_array<std::pair<std::string, c10::IValue>>({{"epoch", int64_t{-1}}, {"epoch", int64_t{std::numeric_limits<int>::max()}}, {"grad_scaler_scale", 0.0},
   {"grad_scaler_scale", std::numeric_limits<double>::infinity()}, {"grad_scaler_growth_tracker", int64_t{-1}}, {"grad_scaler_growth_tracker", int64_t{std::numeric_limits<int>::max()} + 1},
-  {"ema_completed_updates", int64_t{-1}}, {"ema_completed_updates", std::numeric_limits<int64_t>::max()}, {"ema_completed_updates", int64_t{1}},
-  {"training_attempt_id", std::string{}},
+  {"ema_completed_updates", int64_t{-1}}, {"ema_completed_updates", std::numeric_limits<int64_t>::max()}, {"ema_completed_updates", int64_t{1}}, {"training_attempt_id", std::string{}},
   {"training_attempt_id", std::string(65, 'a')}, {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')}});
  for (const auto& [key, value] : invalid) {
   auto source = continuation_fixture(saved_request());
@@ -210,8 +209,10 @@ TEST_CASE("Continuation preserves held SGD values logical offsets donor identiti
  auto values = r::detail::read_training_continuation(base)->values;
  r::TrainingSchedule schedule(request.recipe, {.01, .01}, {r::TrainingGroupRole::Bias, r::TrainingGroupRole::Ordinary}, 4, 4, 2);
  schedule.begin_epoch(0);
- schedule.consume_microbatch(); schedule.consume_microbatch();
- schedule.prepare_attempt(); schedule.finish_attempt(false);
+ schedule.consume_microbatch();
+ schedule.consume_microbatch();
+ schedule.prepare_attempt();
+ schedule.finish_attempt(false);
  values.schedule = schedule.state();
  values.epoch_policy = {true, true};
  values.data.epoch = 0;
@@ -300,13 +301,9 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  built.optimizer.reserve_checkpoint(readback, state.entries().size() + 1);
  torch::serialize::OutputArchive archive;
  r::detail::write_native_checkpoint_metadata(archive, state.metadata);
- r::detail::write_training_continuation(archive, request, r::testsupport::continuation_values(request,
-  {.epoch = 0,
-   .grad_scaler_scale = 128,
-   .grad_scaler_growth_tracker = 7,
-   .ema_completed_updates = 3,
-   .training_attempt_id = "stock-admission",
-   .training_original_descriptor = "original.json"}));
+ r::detail::write_training_continuation(archive, request,
+  r::testsupport::continuation_values(request,
+   {.epoch = 0, .grad_scaler_scale = 128, .grad_scaler_growth_tracker = 7, .ema_completed_updates = 3, .training_attempt_id = "stock-admission", .training_original_descriptor = "original.json"}));
  r::detail::write_resume_state_archive(archive, "state", state.entries(), readback, 0);
  r::detail::write_resume_state_archive(archive, "ema_state", shadow, readback, state.entries().size());
  torch::serialize::OutputArchive optimizer_archive;
@@ -370,22 +367,33 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  REQUIRE(admitted.artifacts.config.cls_loss_coef == 1.0);
  REQUIRE(admitted.model_state.metadata.cls_loss_coef == 7.3);
 }
-
 TEST_CASE("Continuation donor admission validates every descriptor before changing history", "[model][rfdetr][training][continuation]") {
  namespace data = mmltk::backend::data;
  namespace fixture = data::testsupport;
  mmltk::testsupport::ScopedTempDir root("continuation-donors");
- fixture::FixtureSpec spec; spec.root_dir = root.path().string(); spec.num_images = 3; spec.background_images = 0;
+ fixture::FixtureSpec spec;
+ spec.root_dir = root.path().string();
+ spec.num_images = 3;
+ spec.background_images = 0;
  fixture::create_synthetic_dataset(spec);
  const auto crowd_path = std::filesystem::path(fixture::dataset_dir(spec)) / spec.split / "000003.jsonl";
  nlohmann::json crowd;
- { std::ifstream input(crowd_path); input >> crowd; }
+ {
+  std::ifstream input(crowd_path);
+  input >> crowd;
+ }
  crowd["iscrowd"] = 1;
- { std::ofstream output(crowd_path); output << crowd.dump() << '\n'; }
+ {
+  std::ofstream output(crowd_path);
+  output << crowd.dump() << '\n';
+ }
  fixture::compile_existing_fixture(spec);
- data::DatasetLoader::Config config; config.compiled_path = fixture::compiled_bin_path(spec); config.batch_size = 2;
+ data::DatasetLoader::Config config;
+ config.compiled_path = fixture::compiled_bin_path(spec);
+ config.batch_size = 2;
  data::DatasetLoader loader(config);
- auto request = saved_request(); request.batch_size = 2;
+ auto request = saved_request();
+ request.batch_size = 2;
  auto base = continuation_fixture(request);
  auto values = r::detail::read_training_continuation(base)->values;
  values.data.donors = {{0, 0, true}, {1, 0, true}};
@@ -409,32 +417,35 @@ TEST_CASE("Continuation donor admission validates every descriptor before changi
   const auto restored = r::detail::read_training_continuation(archive);
   REQUIRE(restored);
   REQUIRE_THROWS(history.restore(loader, restored->values.data.donors));
-  CHECK(history.state() == accepted);
+  CHECK((history.state() == accepted));
  }
  values.data.donors = {{std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max(), false}, {1, 0, true}};
  history.restore(loader, values.data.donors);
- CHECK(history.state() == values.data.donors);
+ CHECK((history.state() == values.data.donors));
  REQUIRE_THROWS(history.restore(loader, {}));
- CHECK(history.state() == values.data.donors);
+ CHECK((history.state() == values.data.donors));
 }
-
 TEST_CASE("Logical donor admission preserves original RLE support and empty-mask meaning", "[model][rfdetr][training][continuation]") {
  namespace data = mmltk::backend::data;
  namespace fixture = data::testsupport;
  mmltk::testsupport::ScopedTempDir root("logical-donor-support");
- fixture::FixtureSpec spec; spec.root_dir = root.path().string(); spec.num_images = 4; spec.background_images = 0; spec.width = spec.height = 8;
+ fixture::FixtureSpec spec;
+ spec.root_dir = root.path().string();
+ spec.num_images = 4;
+ spec.background_images = 0;
+ spec.width = spec.height = 8;
  fixture::create_synthetic_dataset(spec);
- const std::array annotations{
-  R"({"class":"person","bbox_xyxy":[3,3,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:2 8:1","ignore":true})",
-  R"({"class":"person","bbox_xyxy":[1,1,7,7]})",
-  R"({"class":"person","bbox_xyxy":[1,1,7,7],"mask_rle_encoding":"row_major_start_length","mask_rle":""})",
+ const std::array annotations{R"({"class":"person","bbox_xyxy":[3,3,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:2 8:1","ignore":true})",
+  R"({"class":"person","bbox_xyxy":[1,1,7,7]})", R"({"class":"person","bbox_xyxy":[1,1,7,7],"mask_rle_encoding":"row_major_start_length","mask_rle":""})",
   R"({"class":"person","bbox_xyxy":[1,1,7,7],"iscrowd":true})"};
  for (std::size_t image = 0; image < annotations.size(); ++image) {
   std::ofstream output(std::filesystem::path(fixture::dataset_dir(spec)) / spec.split / ("00000" + std::to_string(image + 1) + ".jsonl"));
   output << annotations[image] << '\n';
  }
  fixture::compile_existing_fixture(spec);
- data::DatasetLoader::Config loader_config; loader_config.compiled_path = fixture::compiled_bin_path(spec); loader_config.batch_size = 1;
+ data::DatasetLoader::Config loader_config;
+ loader_config.compiled_path = fixture::compiled_bin_path(spec);
+ loader_config.batch_size = 1;
  data::DatasetLoader loader(loader_config);
  const r::TrainingDonorDescriptor masked{0, 0, true}, box{1, 0, true}, empty{2, 0, true};
  const auto source = r::resolve_training_donor(loader, masked);
@@ -444,13 +455,13 @@ TEST_CASE("Logical donor admission preserves original RLE support and empty-mask
  const std::array expected_support{data::RLEPair{0, 2}, data::RLEPair{8, 1}};
  CHECK(std::ranges::equal(source.support, expected_support, [](const auto& a, const auto& b) { return a.start == b.start && a.length == b.length; }));
  CHECK(source.metadata.box == std::array<float, 4>{.375F, .375F, .5F, .5F});
- CHECK(source.metadata.area == 3);
+ CHECK(source.metadata.area == 3.F);
  CHECK(source.metadata.has_mask);
  const auto box_source = r::resolve_training_donor(loader, box), empty_source = r::resolve_training_donor(loader, empty);
  CHECK_FALSE(box_source.metadata.has_mask);
- CHECK(box_source.metadata.area == 36);
+ CHECK(box_source.metadata.area == 36.F);
  CHECK(empty_source.metadata.has_mask);
- CHECK(empty_source.metadata.area == 0);
+ CHECK(empty_source.metadata.area == 0.F);
  CHECK(empty_source.support.empty());
  CHECK(box_source.metadata.box == empty_source.metadata.box);
  REQUIRE_THROWS_WITH(r::resolve_training_donor(loader, {3, 0, true}), "crowd annotation cannot enter logical donor history");
@@ -464,15 +475,20 @@ TEST_CASE("Logical donor admission preserves original RLE support and empty-mask
   REQUIRE_FALSE(r::augmentation_paste_admitted(config, key));
   const auto plan = r::plan_augmentation_image(config, key, 0, nullptr, -1);
   const auto original = r::map_augmentation_instance(instance, 8, 8, &plan, source.support);
-  auto box_only = instance; box_only.flags &= ~data::kAnnotationMask; box_only.mask_rle_pairs = 0;
+  auto box_only = instance;
+  box_only.flags &= ~data::kAnnotationMask;
+  box_only.mask_rle_pairs = 0;
   differs_from_box += original.visible != r::map_augmentation_instance(box_only, 8, 8, &plan).visible;
   history.replace(0, std::array{box});
   const auto donors = history.admit(loader, 0, std::array{key}, std::array<std::uint32_t, 1>{0}, config);
   CHECK(donors[0] == box);
   CHECK(history.state()[0] == (original.visible ? masked : box));
-  visible += original.visible; hidden += !original.visible;
+  visible += original.visible;
+  hidden += !original.visible;
  }
- CHECK(visible > 0); CHECK(hidden > 0); CHECK(differs_from_box > 0);
+ CHECK(visible > 0);
+ CHECK(hidden > 0);
+ CHECK(differs_from_box > 0);
  config = r::test_support::isolated_augmentation_config(std::numeric_limits<float>::min());
  for (const auto descriptor : {box, empty}) {
   (void)history.admit(loader, 0, std::array<std::uint64_t, 1>{42}, std::array{descriptor.image_index}, config);
@@ -480,7 +496,7 @@ TEST_CASE("Logical donor admission preserves original RLE support and empty-mask
  }
  const auto retained = history.state();
  (void)history.admit(loader, 0, std::array<std::uint64_t, 1>{42}, std::array<std::uint32_t, 1>{3}, config);
- CHECK(history.state() == retained);
+ CHECK((history.state() == retained));
  REQUIRE_THROWS_WITH(history.admit(loader, 0, std::array<std::uint64_t, 1>{42}, std::array<std::uint32_t, 1>{4}, config), "logical donor source image is outside dataset");
- CHECK(history.state() == retained);
+ CHECK((history.state() == retained));
 }

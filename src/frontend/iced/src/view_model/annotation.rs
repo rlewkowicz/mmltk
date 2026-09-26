@@ -71,7 +71,9 @@ impl AnnotationModel {
         }
         let observation = match self.snapshot.as_ref() {
             Some(installed) if incoming.revision < installed.revision => {
-                if incoming.uirevision != installed.uirevision { return Ok(Observation::Stale); }
+                if incoming.uirevision != installed.uirevision {
+                    return Ok(Observation::Stale);
+                }
                 // A newer frame cannot retire an equal logical UI observation:
                 // the earlier full event may carry its first failure detail.
                 incoming.revision = installed.revision;
@@ -97,26 +99,43 @@ impl AnnotationModel {
         if !keep_pending {
             self.pending_frame = None;
         }
-        let state = self.snapshot.as_ref().expect("accepted Annotation snapshot");
-        if state.ui.savegeneration == 0 || state.ui.savestatus == crate::generated::AnnotationSaveStatus::Idle {
-            self.save_terminal = None;
-        } else if self.save_terminal.is_none_or(|terminal|
-            terminal.document != state.inputdocumentepoch || terminal.generation != state.ui.savegeneration || terminal.status != state.ui.savestatus || state.uirevision < terminal.ui_revision)
+        let state = self
+            .snapshot
+            .as_ref()
+            .expect("accepted Annotation snapshot");
+        if state.ui.savegeneration == 0
+            || state.ui.savestatus == crate::generated::AnnotationSaveStatus::Idle
         {
+            self.save_terminal = None;
+        } else if self.save_terminal.is_none_or(|terminal| {
+            terminal.document != state.inputdocumentepoch
+                || terminal.generation != state.ui.savegeneration
+                || terminal.status != state.ui.savestatus
+                || state.uirevision < terminal.ui_revision
+        }) {
             self.save_terminal = Some(SaveTerminal {
-                document: state.inputdocumentepoch, generation: state.ui.savegeneration,
-                status: state.ui.savestatus, ui_revision: state.uirevision,
+                document: state.inputdocumentepoch,
+                generation: state.ui.savegeneration,
+                status: state.ui.savestatus,
+                ui_revision: state.uirevision,
             });
         }
         Ok(observation)
     }
 
     pub(super) fn bootstrap_baseline(&self) -> Self {
-        Self { save_terminal: self.save_terminal, ..Self::default() }
+        Self {
+            save_terminal: self.save_terminal,
+            ..Self::default()
+        }
     }
 
     fn save_failure_event(&self, document: u64, revision: u64) -> bool {
-        self.save_terminal.is_some_and(|terminal| terminal.document == document && terminal.ui_revision == revision && terminal.status == crate::generated::AnnotationSaveStatus::Failed)
+        self.save_terminal.is_some_and(|terminal| {
+            terminal.document == document
+                && terminal.ui_revision == revision
+                && terminal.status == crate::generated::AnnotationSaveStatus::Failed
+        })
     }
 
     fn install_frame(
@@ -194,12 +213,22 @@ impl crate::generated::AnnotationApplicationProjection<UiError> for ApplicationM
                 let generation = value.snapshot.uirevision;
                 let owner = value.snapshot.inputdocumentepoch;
                 match self.install_annotation_snapshot(value.snapshot) {
-                    Err(error) => self.report_error(crate::view_model::notices::Origin::Protocol, error),
+                    Err(error) => {
+                        self.report_error(crate::view_model::notices::Origin::Protocol, error)
+                    }
                     Ok(Observation::Stale) => {}
                     Ok(Observation::Installed | Observation::Current) => {
-                        if self.annotation.save_failure_event(owner, generation) { self.observe_annotation_save(Some(value.detail), false); }
-                        else { self.notices.terminal(super::notices::Origin::Annotation, owner, generation, || Some(super::notices::failure(value.detail))); }
-                    },
+                        if self.annotation.save_failure_event(owner, generation) {
+                            self.observe_annotation_save(Some(value.detail), false);
+                        } else {
+                            self.notices.terminal(
+                                super::notices::Origin::Annotation,
+                                owner,
+                                generation,
+                                || Some(super::notices::failure(value.detail)),
+                            );
+                        }
+                    }
                 }
                 return;
             }
@@ -317,12 +346,24 @@ mod tests {
 }
 
 impl ApplicationModel {
-    fn install_annotation_snapshot(&mut self, snapshot: crate::generated::AnnotationSnapshot) -> Result<Observation, UiError> {
+    fn install_annotation_snapshot(
+        &mut self,
+        snapshot: crate::generated::AnnotationSnapshot,
+    ) -> Result<Observation, UiError> {
         let previous_save = self.annotation.save_terminal;
         let observation = self.annotation.install_snapshot(snapshot)?;
         if observation != Observation::Stale {
-            let state = self.annotation.snapshot.as_ref().expect("accepted Annotation snapshot");
-            self.notices.terminal(super::notices::Origin::Annotation, state.inputdocumentepoch, state.uirevision, || None);
+            let state = self
+                .annotation
+                .snapshot
+                .as_ref()
+                .expect("accepted Annotation snapshot");
+            self.notices.terminal(
+                super::notices::Origin::Annotation,
+                state.inputdocumentepoch,
+                state.uirevision,
+                || None,
+            );
             if previous_save != self.annotation.save_terminal || self.notices.bootstrapping() {
                 self.observe_annotation_save(None, previous_save != self.annotation.save_terminal);
             }
@@ -333,7 +374,9 @@ impl ApplicationModel {
 
 impl ApplicationModel {
     fn observe_annotation_save(&mut self, detail: Option<String>, newly_observed: bool) {
-        let Some(state) = &self.annotation.snapshot else { return; };
+        let Some(state) = &self.annotation.snapshot else {
+            return;
+        };
         self.notices.terminal(super::notices::Origin::AnnotationSave, state.inputdocumentepoch, state.ui.savegeneration, || {
             use crate::generated::AnnotationSaveStatus;
             if state.ui.savegeneration == 0 || (!newly_observed && detail.is_none()) { return None; }

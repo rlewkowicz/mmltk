@@ -6,10 +6,10 @@ namespace mmltk::backend::models::rfdetr {
 struct TrainingScalarPacket final : ReflectedTensorPacket<TrainingScalars> {
  static TrainingScalars project(const float* values, double count) {
   TrainingScalars result;
-  template for (constexpr auto member : members) {
-   const auto value = static_cast<double>(values[index<member>()]);
-   if (count > 0 && std::isfinite(value)) result.[:member:] = value / count;
-  }
+  visit([&]<auto Member, std::size_t Index>() {
+   const auto value = static_cast<double>(values[Index]);
+   if (count > 0 && std::isfinite(value)) result.*Member = value / count;
+  });
   return result;
  }
 };

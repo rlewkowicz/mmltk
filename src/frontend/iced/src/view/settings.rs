@@ -249,12 +249,19 @@ pub fn view<'a>(model: &'a ApplicationModel, state: &'a SettingsModel) -> Elemen
         );
     };
     let ui = &draft.ui;
-    let ui_scale = crate::view_model::settings_constraint_bounds(crate::generated::constraint_uiuiscale());
-    let font_size = crate::view_model::settings_constraint_bounds(crate::generated::constraint_uifontsize());
-    let secondary_font_size = crate::view_model::settings_constraint_bounds(crate::generated::constraint_uisecondaryfontsize());
-    let mono_font_size = crate::view_model::settings_constraint_bounds(crate::generated::constraint_uimonofontsize());
-    let text_input_font_size =
-        crate::view_model::settings_constraint_bounds(crate::generated::constraint_uitextinputfontsize());
+    let ui_scale =
+        crate::view_model::settings_constraint_bounds(crate::generated::constraint_uiuiscale());
+    let font_size =
+        crate::view_model::settings_constraint_bounds(crate::generated::constraint_uifontsize());
+    let secondary_font_size = crate::view_model::settings_constraint_bounds(
+        crate::generated::constraint_uisecondaryfontsize(),
+    );
+    let mono_font_size = crate::view_model::settings_constraint_bounds(
+        crate::generated::constraint_uimonofontsize(),
+    );
+    let text_input_font_size = crate::view_model::settings_constraint_bounds(
+        crate::generated::constraint_uitextinputfontsize(),
+    );
     let edit_available = state.draft.is_some() && model.settings_edit_available();
     let reset_available = !state.has_local_edits() && model.settings_reset_available();
     let appearance = settings_group(
@@ -436,7 +443,6 @@ fn setting_value_row<'a>(id: &'static str, label: &'a str, value: f32) -> Elemen
     .into()
 }
 
-
 fn settings_group<'a>(
     id: &'static str,
     title: &'static str,
@@ -475,7 +481,8 @@ mod tests {
 
     fn another_scale(current: f32) -> f32 {
         let (minimum, maximum) =
-            crate::view_model::settings_constraint_bounds(crate::generated::constraint_uiuiscale()).unwrap();
+            crate::view_model::settings_constraint_bounds(crate::generated::constraint_uiuiscale())
+                .unwrap();
         if (current - minimum).abs() > f32::EPSILON {
             minimum
         } else {
@@ -494,7 +501,8 @@ mod tests {
         ];
         for constraint in constraints {
             assert_ne!(constraint.stable_field_id, 0);
-            let bounds = crate::view_model::settings_constraint_bounds(constraint).expect("generated finite range");
+            let bounds = crate::view_model::settings_constraint_bounds(constraint)
+                .expect("generated finite range");
             assert!(bounds.0 < bounds.1);
         }
     }

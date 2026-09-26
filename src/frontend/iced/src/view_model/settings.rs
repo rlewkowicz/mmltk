@@ -50,7 +50,12 @@ impl crate::generated::FileDialogApplicationProjection<UiError> for ApplicationM
                         self.report_error(crate::view_model::notices::Origin::Protocol, error);
                     }
                     Ok(Observation::Installed | Observation::Current) => {
-                        self.notices.terminal(super::notices::Origin::Dialog, 0, generation, || Some(super::notices::failure(value.detail)));
+                        self.notices.terminal(
+                            super::notices::Origin::Dialog,
+                            0,
+                            generation,
+                            || Some(super::notices::failure(value.detail)),
+                        );
                     }
                     Ok(Observation::Stale) => {}
                 }
@@ -76,7 +81,10 @@ impl crate::generated::FileDialogApplicationProjection<UiError> for ApplicationM
     }
 }
 
-pub(crate) fn selected_gpu_ordinals(feature: FeatureId, state: &crate::generated::GuiSettingsState) -> &[i32] {
+pub(crate) fn selected_gpu_ordinals(
+    feature: FeatureId,
+    state: &crate::generated::GuiSettingsState,
+) -> &[i32] {
     match feature {
         FeatureId::Train => &state.workflows.train.request.deviceids,
         FeatureId::Validate => std::slice::from_ref(&state.workflows.validate.request.deviceid),
@@ -86,7 +94,9 @@ pub(crate) fn selected_gpu_ordinals(feature: FeatureId, state: &crate::generated
     }
 }
 
-pub(crate) fn settings_constraint_bounds(constraint: crate::generated::SettingsLeafConstraint) -> Option<(f32, f32)> {
+pub(crate) fn settings_constraint_bounds(
+    constraint: crate::generated::SettingsLeafConstraint,
+) -> Option<(f32, f32)> {
     let (minimum, maximum) = constraint.minimum.zip(constraint.maximum)?;
     let range = (minimum as f32, maximum as f32);
     (constraint.finite && minimum.is_finite() && maximum.is_finite() && range.0 < range.1)
@@ -95,22 +105,58 @@ pub(crate) fn settings_constraint_bounds(constraint: crate::generated::SettingsL
 
 impl ApplicationModel {
     pub(super) fn observe_settings_notices(&mut self) {
-        let Some(state) = &self.settings_snapshot else { return; };
-        for feature in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict, FeatureId::Export] {
+        let Some(state) = &self.settings_snapshot else {
+            return;
+        };
+        for feature in [
+            FeatureId::Train,
+            FeatureId::Validate,
+            FeatureId::Predict,
+            FeatureId::Export,
+        ] {
             let selected = super::selected_gpu_ordinals(feature, &state.settingsstate);
-            let unavailable = |ordinal: &&i32| state.cudadevices.iter().all(|device| device.ordinal != **ordinal);
+            let unavailable = |ordinal: &&i32| {
+                state
+                    .cudadevices
+                    .iter()
+                    .all(|device| device.ordinal != **ordinal)
+            };
             self.notices.condition(Origin::Gpu(feature), selected.iter().any(|ordinal| unavailable(&ordinal)), || {
                 let missing: Vec<_> = selected.iter().filter(unavailable).collect();
                 warning("Selected GPU unavailable", format!("{feature:?}: selected CUDA device ordinals {missing:?} are unavailable."))
             });
         }
-        let missing = [crate::generated::constraint_uiuiscale(), crate::generated::constraint_uifontsize(), crate::generated::constraint_uisecondaryfontsize(), crate::generated::constraint_uimonofontsize(), crate::generated::constraint_uitextinputfontsize()].into_iter().any(|constraint| super::settings_constraint_bounds(constraint).is_none());
-        self.notices.condition(Origin::Settings, missing, || warning("Settings constraints unavailable", "Native range constraints are missing; affected controls are unavailable."));
+        let missing = [
+            crate::generated::constraint_uiuiscale(),
+            crate::generated::constraint_uifontsize(),
+            crate::generated::constraint_uisecondaryfontsize(),
+            crate::generated::constraint_uimonofontsize(),
+            crate::generated::constraint_uitextinputfontsize(),
+        ]
+        .into_iter()
+        .any(|constraint| super::settings_constraint_bounds(constraint).is_none());
+        self.notices.condition(Origin::Settings, missing, || {
+            warning(
+                "Settings constraints unavailable",
+                "Native range constraints are missing; affected controls are unavailable.",
+            )
+        });
     }
-    pub(super) fn install_dialog_snapshot(&mut self, value: FileDialogSnapshot) -> Result<Observation, UiError> {
+    pub(super) fn install_dialog_snapshot(
+        &mut self,
+        value: FileDialogSnapshot,
+    ) -> Result<Observation, UiError> {
         let observation = merge_dialog_snapshot(&mut self.file_dialog, value)?;
         if observation != Observation::Stale {
-            self.notices.terminal(Origin::Dialog, 0, self.file_dialog.as_ref().expect("installed dialog snapshot").generation, || None);
+            self.notices.terminal(
+                Origin::Dialog,
+                0,
+                self.file_dialog
+                    .as_ref()
+                    .expect("installed dialog snapshot")
+                    .generation,
+                || None,
+            );
         }
         Ok(observation)
     }

@@ -157,8 +157,7 @@ template <class Request>
 [[nodiscard]] bool valid_execution_products(const Request& request) noexcept {
  try {
   (void)mmltk::backend::models::rfdetr::derive_execution_facts(request, 0);
-  if constexpr (std::same_as<Request, mmltk::backend::models::rfdetr::TrainRequest>)
-   (void)mmltk::backend::models::rfdetr::derive_training_validation_facts(request, 0);
+  if constexpr (std::same_as<Request, mmltk::backend::models::rfdetr::TrainRequest>) (void)mmltk::backend::models::rfdetr::derive_training_validation_facts(request, 0);
   return true;
  } catch (...) { return false; }
 }
@@ -172,11 +171,13 @@ template <class Request>
         mmltk::backend::models::rfdetr::gpu_augmentation_relationships_valid(request.gpu_augmentation) &&
         mmltk::backend::models::rfdetr::training_supervision_config_valid(request.training_supervision) && valid_distributed;
 }
-[[nodiscard]] bool valid_validate(const ValidateViewState& validate) noexcept { return valid_execution_products(validate.request) && !mmltk::frameworks::reflection::validate_reflected_fields(validate.request); }
+[[nodiscard]] bool valid_validate(const ValidateViewState& validate) noexcept {
+ return valid_execution_products(validate.request) && !mmltk::frameworks::reflection::validate_reflected_fields(validate.request);
+}
 [[nodiscard]] bool valid_predict(const PredictViewState& predict) noexcept {
  const auto& request = predict.request;
- return valid_execution_products(request) && !mmltk::frameworks::reflection::validate_reflected_fields(request) && request.resolution > 0 && request.compiled_path.empty() && request.image_inputs.empty() && predict.live_split_count > 0 &&
-        valid_source(predict.source);
+ return valid_execution_products(request) && !mmltk::frameworks::reflection::validate_reflected_fields(request) && request.resolution > 0 && request.compiled_path.empty() &&
+        request.image_inputs.empty() && predict.live_split_count > 0 && valid_source(predict.source);
 }
 [[nodiscard]] bool selected_model_artifact_available(const ModelArtifactSelectionState& artifacts) noexcept {
  switch (artifacts.input) {

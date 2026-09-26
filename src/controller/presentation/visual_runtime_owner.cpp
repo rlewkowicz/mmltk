@@ -51,7 +51,7 @@ bool VisualRuntimeOwner::SubmitDiscrete(Work work, Notification cancellation, co
  {
   std::scoped_lock lock(mutex_);
   const std::size_t required = 1U + static_cast<std::size_t>(latest_.has_value());
-  if (stopping_ || runtime_retirement_blocked_ || discrete_active_ || ordered_.size() > 32U - required) return false;
+  if (stopping_ || runtime_retirement_blocked_ || discrete_queued_ || (active_discrete_ && active_outcome_ != ActiveOutcome::Completed) || ordered_.size() > 32U - required) return false;
   FlushLatest();
   ordered_.push_back(ScheduledWork{
    .run = std::move(work),
@@ -61,7 +61,7 @@ bool VisualRuntimeOwner::SubmitDiscrete(Work work, Notification cancellation, co
    .discrete = true,
    .reconstruct = reconstruct,
   });
-  discrete_active_ = true;
+  discrete_queued_ = true;
  }
  worker_.Wake();
  return true;
@@ -213,12 +213,12 @@ bool VisualRuntimeOwner::RequestActiveStop() noexcept {
    active_outcome_ = ActiveOutcome::Cancelled;
    stop = active_stop_;
   }
-  if (!active_discrete_) {
+  if (!active_discrete_ || active_outcome_ == ActiveOutcome::Completed) {
    const auto queued = std::ranges::find_if(ordered_, [](const auto& item) { return item.discrete; });
    if (queued != ordered_.end()) {
     cancellation = std::move(queued->cancellation);
     ordered_.erase(queued);
-    discrete_active_ = false;
+    discrete_queued_ = false;
    }
   }
  }
@@ -244,7 +244,7 @@ void VisualRuntimeOwner::RequestStop() noexcept {
   latest_.reset();
   continuation_state_.store(0U, std::memory_order_release);
   runtime_retirement_blocked_ = true;
-  discrete_active_ = false;
+  discrete_queued_ = false;
   terminal_barrier_active_ = false;
   if (active_outcome_ == ActiveOutcome::Running) {
    active_outcome_ = ActiveOutcome::Cancelled;
@@ -269,7 +269,7 @@ void VisualRuntimeOwner::FinishStoppedRetirement() noexcept {
 bool VisualRuntimeOwner::stopped() const noexcept { return worker_.stopped(); }
 bool VisualRuntimeOwner::busy() const noexcept {
  std::scoped_lock lock(mutex_);
- return discrete_active_;
+ return !stopping_ && (discrete_queued_ || (active_discrete_ && active_outcome_ != ActiveOutcome::Completed));
 }
 mmltk::frameworks::gpu::BorrowedImageProductReadView VisualRuntimeOwner::Borrow() const {
  bool observed = false;
@@ -497,6 +497,7 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
    ordered_.pop_front();
    if (ordered_work->ordered_drain) drain_queued_ = false;
    discrete = ordered_work->discrete;
+   if (discrete) discrete_queued_ = false;
    terminal_barrier = ordered_work->terminal_barrier;
   } else if (latest_) {
    latest_work = std::move(latest_);
@@ -568,7 +569,6 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
  bool wake_again = false;
  {
   std::scoped_lock lock(mutex_);
-  if (discrete) discrete_active_ = false;
   if (terminal_barrier) {
    terminal_barrier_active_ = false;
    if (continuation_ && !stopping_) continuation_state_.store(kContinuationEnabled, std::memory_order_release);
@@ -615,7 +615,7 @@ void VisualRuntimeOwner::ReportFailure(std::exception_ptr failure) noexcept {
   drain_queued_ = false;
   latest_.reset();
   continuation_state_.store(0U, std::memory_order_release);
-  discrete_active_ = false;
+  discrete_queued_ = false;
   terminal_barrier_active_ = false;
   active_stop_ = std::stop_source{std::nostopstate};
   active_discrete_ = false;

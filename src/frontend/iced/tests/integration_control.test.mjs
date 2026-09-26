@@ -105,6 +105,22 @@ function assertQuiet(fixture) {
   assert.deepEqual(fixture.reports, []);
 }
 
+test('wheel input establishes the target cursor before its pixel delta', t => {
+  const f = canvasFixture(t, true);
+  const delivered = [];
+  f.canvas.dispatchEvent = event => { delivered.push(event); return true; };
+  assert.equal(browser.mmltkIntegrationWheel(130, 220, 713, false, true), 1);
+  assert.deepEqual(delivered, []);
+  f.flushMicrotasks();
+  assert.deepEqual(delivered.map(event => event.type), ['pointermove', 'wheel']);
+  for (const event of delivered) {
+    assert.equal(event.clientX, 130);
+    assert.equal(event.clientY, 220);
+  }
+  assert.equal(delivered[1].deltaY, 713);
+  assert.equal(delivered[1].deltaMode, WheelEvent.DOM_DELTA_PIXEL);
+});
+
 test('ordinary execution constructs neither owner and schedules no input or probe work', t => {
   const f = canvasFixture(t, false, false);
   browser.mmltkIntegrationExpectInitialAtlas();
@@ -1195,21 +1211,27 @@ for (const stage of [1, 3]) {
 }
 
 
-test('Dataset component probes read actual contrasting pixels after frames', t => {
+for (const empty of [false, true]) {
+test(`Dataset component probes validate rendered content and collapsed failure layout: empty=${empty}`, t => {
   const f = canvasFixture(t, true);
   f.sampling.raster = (x, y) => y >= 220 ?
     ((y === 224 || y === 244) && x >= 35 && x < 185 ? [128, 128, 128, 255] : [255, 255, 255, 255]) :
     (x % 8 < 4 ? [32, 32, 32, 255] : [240, 240, 240, 255]);
   const result = [];
-  browser.mmltkIntegrationDatasetPixels(200, [10, 10, 224, 200], [10, 220, 200, 9, 10, 240, 200, 9], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
+  browser.mmltkIntegrationDatasetPixels(empty ? 206 : 200, [10, 10, 224, empty ? 0 : 200], [10, 220, 200, 9, 10, 240, 200, 9], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
   assert.deepEqual(result, []);
   f.frames.shift()();
   assert.deepEqual(result, []);
   f.flushFrames();
   assert.deepEqual(result, ['observed']);
   assert.equal(f.allocations.copies, 1);
-  assert.equal(f.reports.find(record => record.event === 'integration.dataset_pixels').a, '200');
+  const pixels = f.reports.find(record => record.event === 'integration.dataset_pixels');
+  assert.equal(pixels.a, empty ? '206' : '200');
+  assert.equal(pixels.detail, empty ? 'empty-component' : 'component-canvas');
+  assert.equal(f.allocations.reads, empty ? 2 : 3);
+  assert.equal(f.reports.filter(record => record.event === 'integration.dataset_divider_pixels').length, 2);
 });
+}
 
 test('Dataset component probes reject blank output and cancelled ownership', t => {
   const f = canvasFixture(t, true);
@@ -1217,10 +1239,13 @@ test('Dataset component probes reject blank output and cancelled ownership', t =
   browser.mmltkIntegrationDatasetPixels(200, [10, 10, 224, 200], [10, 220, 200, 9, 10, 240, 200, 9], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
   f.flushFrames(); f.flushFrames();
   assert.deepEqual(result, ['failed']);
+  browser.mmltkIntegrationDatasetPixels(206, [10, 10, 224, 20], [10, 220, 200, 9, 10, 240, 200, 9], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
+  f.flushFrames();
+  assert.deepEqual(result, ['failed', 'failed']);
   browser.mmltkIntegrationDatasetPixels(201, [10, 10, 224, 200], [10, 220, 200, 9, 10, 240, 200, 9], [0.5, 0.5, 0.5, 1, 1, 1, 1], 1, "", [], value => result.push(value));
   browser.mmltkIntegrationInitialize(false);
   f.flushFrames(); f.flushFrames();
-  assert.deepEqual(result, ['failed', 'invalidated']);
+  assert.deepEqual(result, ['failed', 'failed', 'invalidated']);
 });
 
 
@@ -1394,17 +1419,152 @@ test('Status diagnostics stay silent and allocate nothing when acceptance is dis
 
 test('Status pixel exercise rejects malformed measured geometry before reading the canvas', t => {
   const f = canvasFixture(t, true), results = [];
-  browser.mmltkIntegrationStatusExercise(0, [1,2,3], result => results.push(result));
+  browser.mmltkIntegrationStatusExercise(0, [1,2,3], '', result => results.push(result));
   assert.deepEqual(results, [false]);
   assert.equal(f.allocations.reads, 0);
   assert.equal(f.allocations.copies, 0);
+});
+
+test('Status selection establishes and releases Control around each shortcut', t => {
+  const f = canvasFixture(t, true), results = [], shortcuts = [];
+  const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+  bounds.splice(8, 8, 10,50,500,400, 22,140,470,1492);
+  f.sampling.raster = x => x % 2 ? [220,220,220,255] : [0,0,0,255];
+  const dispatch = f.canvas.dispatchEvent;
+  let control = false;
+  f.canvas.dispatchEvent = event => {
+    if (event.type === 'keydown' && ['a', 'c'].includes(event.key)) {
+      shortcuts.push([event.key, event.code, control]);
+    }
+    // Winit emits KeyboardInput before the modifier change for this event.
+    if (event.type === 'keydown' || event.type === 'keyup') control = event.ctrlKey;
+    return dispatch(event);
+  };
+  browser.mmltkIntegrationStatusExercise(3, bounds, '', result => results.push(result));
+  f.flushMicrotasks();
+  f.flushFrames();
+  assert.deepEqual(results, [true]);
+  assert.deepEqual(shortcuts, [['a','KeyA',true], ['c','KeyC',true]]);
+  assert.equal(control, false);
+  assert.deepEqual(f.keys.filter(([, key]) => key === 'Control'), [
+    ['keydown','Control',true], ['keyup','Control',false],
+    ['keydown','Control',true], ['keyup','Control',false],
+  ]);
+});
+
+test('Status reverse traversal establishes Shift and releases it before Escape', t => {
+  const f = canvasFixture(t, true), results = [], shortcuts = [];
+  const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+  f.sampling.pixel = () => [0,120,215,255];
+  const dispatch = f.canvas.dispatchEvent;
+  let shift = false;
+  f.canvas.dispatchEvent = event => {
+    if (event.type === 'keydown' && ['Tab', 'Escape'].includes(event.key)) {
+      shortcuts.push([event.key, shift]);
+    }
+    if (event.type === 'keydown' || event.type === 'keyup') shift = event.shiftKey;
+    return dispatch(event);
+  };
+  browser.mmltkIntegrationStatusDraw('status.close', [10,10,20,20,0,0,1,0,0,0,0,0,1]);
+  browser.mmltkIntegrationStatusExercise(13, bounds, 'status.close', result => results.push(result));
+  f.flushFrames();
+  assert.deepEqual(results, [true]);
+  assert.deepEqual(shortcuts, [['Tab',true], ['Escape',false]]);
+  assert.equal(shift, false);
+});
+
+test('Status focus evidence waits for the requested widget draw before sampling and input', t => {
+  const f = canvasFixture(t, true), results = [];
+  const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+  const facts = [10,10,20,20,0,0,1,0,0,0,0,0,1];
+  f.sampling.pixel = () => [0,120,215,255];
+  browser.mmltkIntegrationStatusExercise(13, bounds, 'status.close', result => results.push(result));
+  browser.mmltkIntegrationStatusDraw('navigation.status', facts);
+  browser.mmltkIntegrationStatusDraw('status.close', [...facts.slice(0,12),0]);
+  assert.deepEqual(f.frames, [], 'unsettled focus schedules no frame polling');
+  assert.equal(f.allocations.reads, 0);
+  assert.deepEqual(f.keys, []);
+  browser.mmltkIntegrationStatusDraw('status.close', facts);
+  browser.mmltkIntegrationStatusDraw('status.close', facts);
+  assert.equal(f.frames.length, 1, 'one focused draw releases the presentation handoff');
+  assert.equal(f.allocations.reads, 0);
+  f.flushFrames();
+  assert.deepEqual(results, [true]);
+  assert.equal(f.reports.filter(record => record.event === 'integration.status.paint_draw').length, 1);
+  assert.equal(f.reports.find(record => record.event === 'integration.status.focus_pixels').blue > 10, true);
+});
+
+for (const retirement of ['reset', 'disable', 'restore']) {
+  test(`Status focus wait loses custody on ${retirement}`, t => {
+    const f = canvasFixture(t, true), results = [];
+    const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+    browser.mmltkIntegrationStatusExercise(13, bounds, 'status.close', result => results.push(result));
+    if (retirement === 'reset') browser.mmltkIntegrationResetScenario();
+    else if (retirement === 'disable') browser.mmltkIntegrationDriver(false);
+    else browser.mmltkIntegrationStatusRestore();
+    browser.mmltkIntegrationStatusDraw('status.close', [10,10,20,20,0,0,1,0,0,0,0,0,1]);
+    f.flushFrames();
+    assert.deepEqual(results, [false]);
+    assert.equal(f.allocations.reads, 0);
+    assert.deepEqual(f.keys, []);
+  });
+}
+
+test('Status focus evidence rejects focus loss before presentation', t => {
+  const f = canvasFixture(t, true), results = [];
+  const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+  browser.mmltkIntegrationStatusExercise(13, bounds, 'status.close', result => results.push(result));
+  browser.mmltkIntegrationStatusDraw('status.close', [10,10,20,20,0,0,1,0,0,0,0,0,1]);
+  browser.mmltkIntegrationStatusDraw('status.close', [10,10,20,20,0,0,1,0,0,0,0,0,0]);
+  f.flushFrames();
+  assert.deepEqual(results, [false]);
+  assert.equal(f.allocations.reads, 0);
+  assert.deepEqual(f.keys, []);
+});
+
+test('Status modal evidence requires current input and matching overlay draw geometry', t => {
+  const f = canvasFixture(t, true), results = [], inputs = [];
+  f.canvas.dispatchEvent = event => { inputs.push([event.type,event.pointerType]); return true; };
+  const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+  const facts = [10,10,20,20,0,0,1,0,0,0,0,0,0];
+  f.sampling.raster = x => x % 2 ? [220,220,220,255] : [0,0,0,255];
+  browser.mmltkIntegrationStatusDraw('status.close', facts);
+  f.input('pointermove');
+  browser.mmltkIntegrationStatusExercise(40, bounds, '', result => results.push(result));
+  assert.deepEqual(f.frames, [], 'an overlay drawn before hover is stale');
+  browser.mmltkIntegrationStatusDraw('status.close', [15,...facts.slice(1)]);
+  assert.deepEqual(f.frames, [], 'a different overlay position cannot release the read');
+  assert.equal(f.allocations.reads, 0);
+  browser.mmltkIntegrationStatusDraw('status.close', facts);
+  f.flushFrames();
+  assert.deepEqual(results, [true]);
+  assert.equal(f.reports.find(record => record.event === 'integration.status.modal_pixels').ink > 8, true);
+  assert.deepEqual(inputs, [
+    ['pointerdown','touch'], ['pointerup','touch'],
+  ], 'outside touch preserves the hover-open panel until activation');
+});
+
+test('Status healthy header evidence waits for the last-notice removal draw', t => {
+  const f = canvasFixture(t, true), results = [];
+  const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
+  bounds.splice(0,12,330,9,192,34,530,9,96,34,0,0,0,0);
+  const facts = [330,9,192,34,0,0,1,1,.5,.5,.5,0,0];
+  f.sampling.raster = (x,y) => x>=430 && x<435 && y>=19 && y<24 ? [0,160,64,255] : [128,128,128,255];
+  browser.mmltkIntegrationStatusDraw('navigation.status', [...facts.slice(0,5),1,...facts.slice(6)]);
+  browser.mmltkIntegrationStatusExercise(32, bounds, '', result => results.push(result));
+  assert.deepEqual(f.frames, [], 'the previous alert cannot satisfy a healthy draw');
+  assert.equal(f.allocations.reads, 0);
+  browser.mmltkIntegrationStatusDraw('navigation.status', facts);
+  f.flushFrames();
+  assert.deepEqual(results, [true]);
+  assert.equal(f.reports.filter(record => record.event === 'integration.status.healthy').length, 1);
 });
 
 test('Status deferred input completion loses custody when the accepted session is retired', t => {
   const f = canvasFixture(t, true), results = [];
   const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
   bounds[8]=0; bounds[9]=0; bounds[10]=0; bounds[11]=0;
-  browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
+  browser.mmltkIntegrationStatusExercise(4, bounds, '', result => results.push(result));
   browser.mmltkIntegrationInitialize(false);
   f.flushFrames();
   assert.deepEqual(results, [false]);
@@ -1417,7 +1577,7 @@ for (const invalid of [NaN, Infinity, -1]) {
     const f = canvasFixture(t, true), results = [];
     const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
     bounds[2] = invalid;
-    browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
+    browser.mmltkIntegrationStatusExercise(4, bounds, '', result => results.push(result));
     assert.deepEqual(results, [false]);
     assert.equal(f.allocations.reads, 0);
     assert.deepEqual(f.events, []);
@@ -1431,7 +1591,7 @@ test('Status Escape latch handoff stays inside before a real leave and reentry',
   f.canvas.dispatchEvent = event => { if(event.type === 'pointermove') moves.push([event.clientX,event.clientY]); return dispatch(event); };
   const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
   bounds.splice(8,4,0,0,0,0);
-  browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
+  browser.mmltkIntegrationStatusExercise(4, bounds, '', result => results.push(result));
   assert.deepEqual(moves, [[20,20]]);
   assert.deepEqual(results, []);
   f.flushFrames();
@@ -1445,7 +1605,7 @@ test('Status rejects an inside-region hover reopen before issuing reentry input'
   document.getElementById = id => id === 'accessible.navigation.status' ? {getAttribute: () => 'true'} : null;
   const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
   bounds.splice(8,4,0,0,0,0);
-  browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
+  browser.mmltkIntegrationStatusExercise(4, bounds, '', result => results.push(result));
   f.flushFrames();
   assert.deepEqual(results, [false]);
   assert.equal(f.reports.filter(record=>record.event === 'integration.status.latch').length, 0);
@@ -1455,7 +1615,7 @@ test('Status driver cancellation settles once and prevents deferred reentry', t 
   const f = canvasFixture(t, true), results = [];
   const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
   bounds.splice(8,4,0,0,0,0);
-  browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
+  browser.mmltkIntegrationStatusExercise(4, bounds, '', result => results.push(result));
   browser.mmltkIntegrationDriver(false);
   const afterCancellation = f.events.length;
   f.flushFrames();
@@ -1468,7 +1628,7 @@ test('Status explicit failure restoration cancels its pending frame chain', t =>
   const f = canvasFixture(t, true), results = [];
   const bounds = Array.from({length:25}, () => [10,10,20,20]).flat();
   bounds.splice(8,4,0,0,0,0);
-  browser.mmltkIntegrationStatusExercise(4, bounds, result => results.push(result));
+  browser.mmltkIntegrationStatusExercise(4, bounds, '', result => results.push(result));
   browser.mmltkIntegrationStatusRestore();
   const afterRestoration = f.events.length;
   f.flushFrames();
@@ -1496,14 +1656,14 @@ function statusSemanticFixture(t) {
 test('Status semantic nodes survive unrelated input and reject identity replacement', t => {
   const f = statusSemanticFixture(t), results = [];
   for (let repeat = 0; repeat < 2; repeat++) {
-    browser.mmltkIntegrationStatusExercise(5, f.bounds, result => results.push(result));
+    browser.mmltkIntegrationStatusExercise(5, f.bounds, '', result => results.push(result));
     assert.equal(f.observers.at(-1).active, true);
     f.flushFrames();
     assert.equal(f.observers.at(-1).active, false);
   }
   assert.deepEqual(results, [true, true]);
   f.nodes[3] = {...f.nodes[3]};
-  browser.mmltkIntegrationStatusExercise(5, f.bounds, result => results.push(result));
+  browser.mmltkIntegrationStatusExercise(5, f.bounds, '', result => results.push(result));
   assert.deepEqual(results, [true, true, false]);
   assert.equal(f.allocations.reads, 0);
 });
@@ -1511,7 +1671,7 @@ test('Status semantic nodes survive unrelated input and reject identity replacem
 for (const delivered of [false, true]) {
   test(`Status unchanged-content evidence catches semantic mutation, delivered=${delivered}`, t => {
     const f = statusSemanticFixture(t), results = [];
-    browser.mmltkIntegrationStatusExercise(5, f.bounds, result => results.push(result));
+    browser.mmltkIntegrationStatusExercise(5, f.bounds, '', result => results.push(result));
     const observer = f.observers[0];
     if (delivered) observer.callback([{type:'attributes'}]);
     else observer.pending.push({type:'childList'});
@@ -1523,7 +1683,7 @@ for (const delivered of [false, true]) {
 
 test('Status semantic evidence retires its observer with the accepted session', t => {
   const f = statusSemanticFixture(t), results = [];
-  browser.mmltkIntegrationStatusExercise(5, f.bounds, result => results.push(result));
+  browser.mmltkIntegrationStatusExercise(5, f.bounds, '', result => results.push(result));
   browser.mmltkIntegrationInitialize(false);
   assert.equal(f.observers[0].active, false);
   f.flushFrames();

@@ -424,7 +424,18 @@ pub(crate) fn saved_training_run(
             checkpointattemptid: String::new(),
             sourcecheckpointattemptid: String::new(),
             configuration,
-            sources: TrainingSourceCatalog { defaultsource: Some(TrainingMetricSource { scope: TrainingRecordScope::Model, modelid: 0, weights: EvaluatedWeights::Ordinary }), available: vec![TrainingMetricSource { scope: TrainingRecordScope::Model, modelid: 0, weights: EvaluatedWeights::Ordinary }] },
+            sources: TrainingSourceCatalog {
+                defaultsource: Some(TrainingMetricSource {
+                    scope: TrainingRecordScope::Model,
+                    modelid: 0,
+                    weights: EvaluatedWeights::Ordinary,
+                }),
+                available: vec![TrainingMetricSource {
+                    scope: TrainingRecordScope::Model,
+                    modelid: 0,
+                    weights: EvaluatedWeights::Ordinary,
+                }],
+            },
             execution: TrainingExecutionFacts {
                 training: execution.clone(),
                 validation: execution,

@@ -207,6 +207,7 @@ inline constexpr std::array kValidateOptions{
  reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::prefetch_factor>("--prefetch-factor", "Dataset prefetch factor", "Execution"),
  reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::device_id>("--device-id", "CUDA device id", "Execution"),
  reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::workers>("--workers", "Dataset worker count", "Execution"),
+ reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::lanes>("--lanes", "Parallel backend lanes", "Execution"),
  reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::cpu_affinity>("--cpu-affinity", "Linux CPU list", "Execution"),
  reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::allow_fp16>("--fp16", "Enable FP16", "Execution", {}, "--no-fp16"),
  reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::log_mode>("--log-mode", "Validation logging mode", "Execution"),
@@ -245,10 +246,11 @@ void emit_train_integer_list(std::vector<std::string>& arguments, const TrainCli
  arguments.emplace_back(name);
  arguments.emplace_back(std::move(joined));
 }
-inline constexpr std::array kTrainOptions{
- reflection::option<TrainCliRequest, &TrainCliRequest::request_json>("--request-json", "Complete canonical training request (maximum 64 KiB)", "Training"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::nesterov>>("--nesterov", "SGD Nesterov momentum", "Optimization", {}, "--no-nesterov"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::warmup_bias_lr>>("--warmup-bias-lr", "Absolute SGD bias warmup learning rate", "Optimization"),
+inline constexpr std::array kTrainOptions{reflection::option<TrainCliRequest, &TrainCliRequest::request_json>("--request-json", "Complete canonical training request (maximum 64 KiB)", "Training"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::nesterov>>(
+  "--nesterov", "SGD Nesterov momentum", "Optimization", {}, "--no-nesterov"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::warmup_bias_lr>>(
+  "--warmup-bias-lr", "Absolute SGD bias warmup learning rate", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::class_layout_path>>("--class-layout", "Digest-bound class descriptor", "Model input"),
  reflection::negative_flag<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::h2d_dataloader>>("--gdrcopy", "Use GDRCopy image loading", "Execution"),
  reflection::custom_option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::numa_nodes>, &assign_train_integer_list<&rfdetr::TrainRequest::numa_nodes, false>,
@@ -266,24 +268,35 @@ inline constexpr std::array kTrainOptions{
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::val_batch_size>>("--val-batch-size", "Validation batch size", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::epochs>>("--epochs", "Epoch count", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::grad_accum_steps>>("--grad-accum-steps", "Gradient accumulation", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::optimizer>>("--optimizer", "adamw, muon, or sgd", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr>>("--lr", "Decoder learning rate", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_encoder>>("--lr-encoder", "Encoder learning rate", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::optimizer>>(
+  "--optimizer", "adamw, muon, or sgd", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr>>(
+  "--lr", "Decoder learning rate", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_encoder>>(
+  "--lr-encoder", "Encoder learning rate", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::momentum>>(
   "--momentum", "Muon or SGD momentum", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::freeze_encoder>>(
   "--freeze-encoder", "Freeze encoder", "Optimization", {}, "--no-freeze-encoder"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_component_decay>>("--lr-component-decay", "Component decay", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::encoder_layer_decay>>("--encoder-layer-decay", "Layer decay", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::weight_decay>>("--weight-decay", "Weight decay", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_drop>>("--lr-drop", "Step drop epoch", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_scheduler>>("--lr-scheduler", "step, cosine, or ultralytics-linear", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_min_factor>>("--lr-min-factor", "Minimum LR multiplier", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::warmup_epochs>>("--warmup-epochs", "Warmup duration", "Optimization"),
- reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::warmup_momentum>>("--warmup-momentum", "Warmup momentum", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_component_decay>>(
+  "--lr-component-decay", "Component decay", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::encoder_layer_decay>>(
+  "--encoder-layer-decay", "Layer decay", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::weight_decay>>(
+  "--weight-decay", "Weight decay", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_drop>>(
+  "--lr-drop", "Step drop epoch", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_scheduler>>(
+  "--lr-scheduler", "step, cosine, or ultralytics-linear", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::lr_min_factor>>(
+  "--lr-min-factor", "Minimum LR multiplier", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::warmup_epochs>>(
+  "--warmup-epochs", "Warmup duration", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::recipe, &rfdetr::TrainRecipeSettings::warmup_momentum>>(
+  "--warmup-momentum", "Warmup momentum", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::clip_max_norm>>("--clip-max-norm", "Gradient clipping norm", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::fused_optimizer>>(
-  "--fused-optimizer", "Use fused AdamW backend", "Optimization", {}, "--no-fused-optimizer"),
+  "--fused-optimizer", "Use fused AdamW backend (AdamW only)", "Optimization", {}, "--no-fused-optimizer"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::use_ema>>("--use-ema", "Maintain EMA", "Optimization", {}, "--no-ema"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::validation_loss>>(
   "--validation-loss", "Calculate validation loss", "Optimization", {}, "--no-validation-loss"),
@@ -381,6 +394,12 @@ inline constexpr std::array kTrainOptions{
   &emit_train_integer_list<&rfdetr::TrainRequest::device_ids>>("--device-ids", "Comma-separated CUDA device ids", "Execution"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::workers>>("--workers", "Dataset worker count", "Execution"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::lanes>>("--lanes", "Parallel backend lanes", "Execution"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::validation_lanes>>(
+  "--validation-lanes", "Parallel training validation lanes", "Execution"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::unfreeze_encoder_last_epochs>>(
+  "--unfreeze-encoder-last-epochs", "Unfreeze the encoder for the final epochs", "Optimization"),
+ reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::disable_augmentation_last_epochs>>(
+  "--disable-augmentation-last-epochs", "Disable augmentation for the final epochs", "Optimization"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::cpu_affinity>>("--cpu-affinity", "Linux CPU list", "Execution"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::prefetch_factor>>("--prefetch-factor", "Prefetch factor", "Execution"),
  reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::print_freq>>("--print-freq", "Logging frequency", "Execution"),
@@ -437,7 +456,20 @@ static_assert((reflection::audit_descriptors(kExportOnnxOptions, kExportOnnxUnex
 static_assert((reflection::audit_descriptors(kEvaluateOptions), true));
 static_assert((reflection::audit_descriptors(kPredictOptions, kPredictUnexposed), true));
 static_assert((reflection::audit_descriptors(kValidateOptions), true));
-static_assert((reflection::audit_descriptors(kTrainOptions), true));
+inline constexpr std::array kTrainUnexposed{
+ reflection::unexposed<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::lane_configuration, &rfdetr::TrainLaneConfiguration::models>>(
+  "--request-json owns the complete model recipes and identities"),
+ reflection::unexposed<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::lane_configuration, &rfdetr::TrainLaneConfiguration::next_model_id>>(
+  "--request-json owns the model identity frontier"),
+ reflection::unexposed<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::lane_configuration, &rfdetr::TrainLaneConfiguration::merge_rounds>>(
+  "--request-json owns the complete merge policy"),
+ reflection::unexposed<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::data_policy, &rfdetr::TrainDataPolicy::rare_threshold>>(
+  "--request-json owns the complete sampling policy"),
+ reflection::unexposed<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::data_policy, &rfdetr::TrainDataPolicy::maximum_repeat_factor>>(
+  "--request-json owns the complete sampling policy"),
+ reflection::unexposed<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::data_policy, &rfdetr::TrainDataPolicy::maximum_draw_multiplier>>(
+  "--request-json owns the complete sampling policy")};
+static_assert((reflection::audit_descriptors(kTrainOptions, kTrainUnexposed), true));
 void print_command_help(std::string rendered_options) { std::puts(rendered_options.c_str()); }
 template <class Request, class Options>
 [[nodiscard]] Request parse_request(const std::span<const std::string_view> arguments, const Options& options) {

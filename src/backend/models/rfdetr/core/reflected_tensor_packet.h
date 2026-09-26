@@ -19,12 +19,27 @@ struct ReflectedTensorPacket {
   throw "unknown tensor packet member";
  }
  template <std::meta::info Member>
- static const torch::Tensor& get(const Tensors& values) { return values[index<Member>()]; }
- template <std::meta::info Member>
- static void set(Tensors& values, const torch::Tensor& tensor) {
-  if (tensor.defined()) values[index<Member>()] = tensor.detach();
+ static const torch::Tensor& get(const Tensors& values) {
+  constexpr auto slot = index<Member>();
+  return values[slot];
  }
  template <std::meta::info Member>
- static torch::Tensor select(const torch::Tensor& values, std::int64_t dimension) { return values.select(dimension, static_cast<std::int64_t>(index<Member>())); }
+ static void set(Tensors& values, const torch::Tensor& tensor) {
+  constexpr auto slot = index<Member>();
+  if (tensor.defined()) values[slot] = tensor.detach();
+ }
+ template <std::meta::info Member>
+ static torch::Tensor select(const torch::Tensor& values, std::int64_t dimension) {
+  constexpr auto slot = static_cast<std::int64_t>(index<Member>());
+  return values.select(dimension, slot);
+ }
+ template <class Visitor>
+ static void visit(Visitor&& visitor) {
+  template for (constexpr auto member : members) {
+   constexpr auto pointer = &[:member:];
+   constexpr auto slot = index<member>();
+   visitor.template operator()<pointer, slot>();
+  }
+ }
 };
 }  // namespace mmltk::backend::models::rfdetr

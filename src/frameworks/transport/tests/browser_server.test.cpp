@@ -122,8 +122,9 @@ TEST_CASE("browser server rejects output without an active peer epoch", "[framew
  CHECK(server.publish(output(BrowserRecordPriority::Transient, 1U)) == BrowserRecordPush::Dropped);
  CHECK(server.publish(output(BrowserRecordPriority::Critical, 1U)) == BrowserRecordPush::ClosePeer);
 }
-TEST_CASE("browser output ceiling is configured independently of inbound admission", "[frameworks][transport][browser][limits]") {
+TEST_CASE("browser assets and output ceiling are independent of inbound admission", "[frameworks][transport][browser][limits]") {
  mmltk::testsupport::BrowserAssetDirectory assets{"mmltk-browser-output-ceiling"};
+ mmltk::testsupport::write_text_file(assets.path() / "application.wasm", std::string(8U * 1024U * 1024U + 1U, 'x'));
  const auto facts = std::make_shared<CallbackFacts>();
  BrowserServer server;
  CHECK_FALSE(server.start({.asset_root = assets.path(), .session_token = "test-capability", .maximum_output_bytes = 0U}, callbacks(facts)));

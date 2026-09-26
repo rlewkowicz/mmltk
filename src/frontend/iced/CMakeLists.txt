@@ -219,14 +219,18 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
     endif()
     set(_mmltk_frontend_test_commands)
     if(NOT MMLTK_ICED_TEST_PACKAGE)
+        set(_mmltk_frontend_js_arguments)
+        if(NOT "${MMLTK_ICED_JS_TEST_PATTERN}" STREQUAL "")
+            list(APPEND _mmltk_frontend_js_arguments "--test-name-pattern=${MMLTK_ICED_JS_TEST_PATTERN}")
+        endif()
         list(APPEND _mmltk_frontend_test_commands
             COMMAND "${MMLTK_FRONTEND_NODE_EXECUTABLE}" --test
-                "--test-name-pattern=${MMLTK_ICED_JS_TEST_PATTERN}"
+                ${_mmltk_frontend_js_arguments}
                 "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/integration_control.test.mjs"
                 "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/workspace_graphics.test.mjs"
         )
     endif()
-    if(NOT MMLTK_ICED_TEST_PACKAGE STREQUAL "iced_aw")
+    if("${MMLTK_ICED_JS_TEST_PATTERN}" STREQUAL "" AND NOT MMLTK_ICED_TEST_PACKAGE STREQUAL "iced_aw")
         if(MMLTK_ICED_TEST_PACKAGE)
             set(_mmltk_frontend_cargo_packages --package "${MMLTK_ICED_TEST_PACKAGE}")
         else()
@@ -243,7 +247,7 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
                 ${MMLTK_ICED_TEST_ARGUMENTS}
         )
     endif()
-    if(NOT MMLTK_ICED_TEST_PACKAGE OR MMLTK_ICED_TEST_PACKAGE STREQUAL "iced_aw")
+    if("${MMLTK_ICED_JS_TEST_PATTERN}" STREQUAL "" AND (NOT MMLTK_ICED_TEST_PACKAGE OR MMLTK_ICED_TEST_PACKAGE STREQUAL "iced_aw"))
         list(APPEND _mmltk_frontend_test_commands
             COMMAND "${CMAKE_COMMAND}" -E env
                 ${_mmltk_frontend_environment}

@@ -51,6 +51,8 @@ public:
  ~VisualRuntimeOwner();
  VisualRuntimeOwner(const VisualRuntimeOwner&) = delete;
  VisualRuntimeOwner& operator=(const VisualRuntimeOwner&) = delete;
+ // One unfinished discrete operation at a time. After completion is claimed,
+ // its successor may queue while the owner finishes the current operation.
  [[nodiscard]] bool SubmitDiscrete(Work, Notification cancellation = {}, bool reconstruct = false);
  [[nodiscard]] bool SubmitOrdered(Work);
  void RegisterOrderedDrain(Work);
@@ -160,7 +162,7 @@ private:
  std::stop_source active_stop_{std::nostopstate};
  enum class ActiveOutcome : std::uint8_t { Running, Cancelled, Completed };
  ActiveOutcome active_outcome_ = ActiveOutcome::Running;
- bool discrete_active_ = false;
+ bool discrete_queued_ = false;
  bool active_discrete_ = false;
  bool active_preserves_input_ = false;
  bool active_yields_to_workspace_ = false;

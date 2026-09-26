@@ -273,9 +273,7 @@ fn application_event(record: ServerRecord) -> Option<TransportEvent> {
         ServerRecord::IntegrationControl(record) => {
             Some(TransportEvent::IntegrationControl(record.receipt))
         }
-        ServerRecord::InteractionRejected(record) => {
-            Some(TransportEvent::Rejected(record))
-        }
+        ServerRecord::InteractionRejected(record) => Some(TransportEvent::Rejected(record)),
     }
 }
 

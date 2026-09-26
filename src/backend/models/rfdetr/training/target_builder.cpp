@@ -565,7 +565,8 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
     const auto& source_box = mapped.source_box_xyxy;
     const auto& transformed = mapped.output_box_xyxy;
     const int64_t target_index = total_instances++;
-    if (!batch.draw_keys.empty()) staging.sampling_keys.data_ptr<std::int64_t>()[target_index] = std::bit_cast<std::int64_t>(training_stochastic_key(image_key, instance.source_ordinal, instance_index, 0, 0x544152));
+    if (!batch.draw_keys.empty())
+     staging.sampling_keys.data_ptr<std::int64_t>()[target_index] = std::bit_cast<std::int64_t>(training_stochastic_key(image_key, instance.source_ordinal, instance_index, 0, 0x544152));
     write_cxcywh_box(boxes, target_index, transformed);
     labels[target_index] = static_cast<int64_t>(instance.class_id);
     if (erasure_bytes != nullptr) { std::memcpy(erasure_bytes + target_index * sizeof(erasure), &erasure, sizeof(erasure)); }
@@ -601,7 +602,8 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
                                                     : AugmentationAnnotationSupport{};
    if (paste_plan != nullptr && donor_support.present) {
     const int64_t paste_index = total_instances++;
-    if (!batch.draw_keys.empty()) staging.sampling_keys.data_ptr<std::int64_t>()[paste_index] = std::bit_cast<std::int64_t>(training_stochastic_key(image_key, paste_plan->paste_sampling_identity, 0, 0, 0x5041535445));
+    if (!batch.draw_keys.empty())
+     staging.sampling_keys.data_ptr<std::int64_t>()[paste_index] = std::bit_cast<std::int64_t>(training_stochastic_key(image_key, paste_plan->paste_sampling_identity, 0, 0, 0x5041535445));
     const auto& paste_box = donor_support.box_xyxy;
     write_cxcywh_box(boxes, paste_index, paste_box);
     labels[paste_index] = paste_plan->paste_label;

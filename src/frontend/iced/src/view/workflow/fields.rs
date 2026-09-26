@@ -168,39 +168,78 @@ pub fn number_f64<'a, Message: Clone + 'a>(
 }
 
 /// Read-only product facts retain ordinary input styling and have no edit callback.
-pub fn read_only<'a, Message: Clone + 'a>(label: &'static str, id: impl Into<String>, value: String) -> Element<'a, Message> {
-    labeled_numeric_field(label, text_input("", &value).id(id.into())
-        .style(|theme, _| iced_fluent_theme::text_input::default(theme, iced::widget::text_input::Status::Active))
-        .width(Length::FillPortion(NUMERIC_INPUT_PORTION)).into())
+pub fn read_only<'a, Message: Clone + 'a>(
+    label: &'static str,
+    id: impl Into<String>,
+    value: String,
+) -> Element<'a, Message> {
+    labeled_numeric_field(
+        label,
+        text_input("", &value)
+            .id(id.into())
+            .style(|theme, _| {
+                iced_fluent_theme::text_input::default(
+                    theme,
+                    iced::widget::text_input::Status::Active,
+                )
+            })
+            .width(Length::FillPortion(NUMERIC_INPUT_PORTION))
+            .into(),
+    )
 }
 
-pub fn execution_facts<'a>(feature: crate::generated::FeatureId, training_validation: bool,
-    model: &'a crate::view_model::ApplicationModel, settings: &crate::view::settings::SettingsModel,
+pub fn execution_facts<'a>(
+    feature: crate::generated::FeatureId,
+    training_validation: bool,
+    model: &'a crate::view_model::ApplicationModel,
+    settings: &crate::view::settings::SettingsModel,
 ) -> Option<&'a crate::generated::ExecutionFacts> {
     use crate::generated::FeatureId;
     let accepted = model.settings_snapshot.as_ref()?;
     let draft = settings.draft.as_ref()?;
     let matching = match feature {
-        FeatureId::Train => draft.workflows.train.request == accepted.settingsstate.workflows.train.request,
-        FeatureId::Validate => draft.workflows.validate.request == accepted.settingsstate.workflows.validate.request,
-        FeatureId::Predict => draft.workflows.predict.request == accepted.settingsstate.workflows.predict.request,
+        FeatureId::Train => {
+            draft.workflows.train.request == accepted.settingsstate.workflows.train.request
+        }
+        FeatureId::Validate => {
+            draft.workflows.validate.request == accepted.settingsstate.workflows.validate.request
+        }
+        FeatureId::Predict => {
+            draft.workflows.predict.request == accepted.settingsstate.workflows.predict.request
+        }
         _ => false,
     };
-    if !matching || (feature == FeatureId::Train && settings.training_membership_pending()) { return None; }
+    if !matching || (feature == FeatureId::Train && settings.training_membership_pending()) {
+        return None;
+    }
     if let Some(operation) = model.current_native_operation(feature) {
         let facts = match feature {
             FeatureId::Train => {
                 let state = model.workflow.training.as_ref()?;
                 let execution = state.sources.execution.as_ref()?;
-                if training_validation { &execution.validation } else { &execution.training }
+                if training_validation {
+                    &execution.validation
+                } else {
+                    &execution.training
+                }
             }
-            FeatureId::Validate => { let state = model.workflow.validation.as_ref()?; &state.execution }
-            FeatureId::Predict => { let state = model.predict_snapshot.as_ref()?; &state.execution }
+            FeatureId::Validate => {
+                let state = model.workflow.validation.as_ref()?;
+                &state.execution
+            }
+            FeatureId::Predict => {
+                let state = model.predict_snapshot.as_ref()?;
+                &state.execution
+            }
             _ => return None,
         };
-        return (facts.operationgeneration == operation.generationfrontier && facts.admittedcapacity > 0).then_some(facts);
+        return (facts.operationgeneration == operation.generationfrontier
+            && facts.admittedcapacity > 0)
+            .then_some(facts);
     }
-    if model.primary_action_active(feature) { return None; }
+    if model.primary_action_active(feature) {
+        return None;
+    }
     let facts = match feature {
         FeatureId::Train if training_validation => &accepted.trainingvalidationexecution,
         FeatureId::Train => &accepted.trainexecution,
@@ -211,15 +250,28 @@ pub fn execution_facts<'a>(feature: crate::generated::FeatureId, training_valida
     (facts.settingsrevision == accepted.revision).then_some(facts)
 }
 
-pub fn effective_batch<'a, Message: Clone + 'a>(feature: crate::generated::FeatureId, validation: bool,
-    model: &crate::view_model::ApplicationModel, settings: &crate::view::settings::SettingsModel,
+pub fn effective_batch<'a, Message: Clone + 'a>(
+    feature: crate::generated::FeatureId,
+    validation: bool,
+    model: &crate::view_model::ApplicationModel,
+    settings: &crate::view::settings::SettingsModel,
 ) -> Element<'a, Message> {
     let facts = execution_facts(feature, validation, model, settings);
-    let label = if feature == crate::generated::FeatureId::Train && !validation { "Effective batch / model" }
-        else if facts.is_some_and(|facts| facts.admittedcapacity > 0) { "Effective batch (admitted)" }
-        else { "Effective batch (pre-admission)" };
-    read_only(label, format!("{feature:?}.{validation}.effective_batch"),
-        facts.map_or_else(|| "Updating".into(), |facts| facts.effectivebatchpermodel.to_string()))
+    let label = if feature == crate::generated::FeatureId::Train && !validation {
+        "Effective batch / model"
+    } else if facts.is_some_and(|facts| facts.admittedcapacity > 0) {
+        "Effective batch (admitted)"
+    } else {
+        "Effective batch (pre-admission)"
+    };
+    read_only(
+        label,
+        format!("{feature:?}.{validation}.effective_batch"),
+        facts.map_or_else(
+            || "Updating".into(),
+            |facts| facts.effectivebatchpermodel.to_string(),
+        ),
+    )
 }
 
 pub fn toggle<'a, Message: Clone + 'a>(
@@ -255,29 +307,104 @@ mod tests {
         use crate::generated::*;
         let mut model = crate::view_model::test_support::bootstrapped();
         let snapshot = model.settings_snapshot.as_mut().unwrap();
-        assert_eq!([snapshot.settingsstate.workflows.train.request.lanes, snapshot.settingsstate.workflows.train.request.validationlanes,
-            snapshot.settingsstate.workflows.validate.request.lanes, snapshot.settingsstate.workflows.predict.request.lanes], [1; 4]);
+        assert_eq!(
+            [
+                snapshot.settingsstate.workflows.train.request.lanes,
+                snapshot
+                    .settingsstate
+                    .workflows
+                    .train
+                    .request
+                    .validationlanes,
+                snapshot.settingsstate.workflows.validate.request.lanes,
+                snapshot.settingsstate.workflows.predict.request.lanes
+            ],
+            [1; 4]
+        );
         snapshot.trainexecution.settingsrevision = snapshot.revision;
         snapshot.trainexecution.effectivebatchpermodel = 24;
         snapshot.trainexecution.aggregateroundimages = 72;
-        let mut settings = crate::view::settings::SettingsModel::default(); settings.install(snapshot);
-        assert_eq!(execution_facts(FeatureId::Train, false, &model, &settings).unwrap().effectivebatchpermodel, 24);
-        settings.draft.as_mut().unwrap().workflows.train.request.batchsize += 1;
+        let mut settings = crate::view::settings::SettingsModel::default();
+        settings.install(snapshot);
+        assert_eq!(
+            execution_facts(FeatureId::Train, false, &model, &settings)
+                .unwrap()
+                .effectivebatchpermodel,
+            24
+        );
+        settings
+            .draft
+            .as_mut()
+            .unwrap()
+            .workflows
+            .train
+            .request
+            .batchsize += 1;
         assert!(execution_facts(FeatureId::Train, false, &model, &settings).is_none());
         settings.install(model.settings_snapshot.as_ref().unwrap());
-        model.settings_snapshot.as_mut().unwrap().trainexecution.settingsrevision += 1;
+        model
+            .settings_snapshot
+            .as_mut()
+            .unwrap()
+            .trainexecution
+            .settingsrevision += 1;
         assert!(execution_facts(FeatureId::Train, false, &model, &settings).is_none());
         let state = model.workflow.training.as_mut().unwrap();
-        state.local.active = true; state.local.generationfrontier = 7;
-        let mut execution = model.settings_snapshot.as_ref().unwrap().trainexecution.clone();
-        execution.operationgeneration = 6; execution.admittedcapacity = 2;
-        let mut retained = crate::view_model::test_support::saved_training_run(settings.draft.as_ref().unwrap().workflows.train.request.clone()).run.unwrap().execution;
-        retained.training = execution.clone(); retained.validation = execution;
+        state.local.active = true;
+        state.local.generationfrontier = 7;
+        let mut execution = model
+            .settings_snapshot
+            .as_ref()
+            .unwrap()
+            .trainexecution
+            .clone();
+        execution.operationgeneration = 6;
+        execution.admittedcapacity = 2;
+        let mut retained = crate::view_model::test_support::saved_training_run(
+            settings
+                .draft
+                .as_ref()
+                .unwrap()
+                .workflows
+                .train
+                .request
+                .clone(),
+        )
+        .run
+        .unwrap()
+        .execution;
+        retained.training = execution.clone();
+        retained.validation = execution;
         state.sources.execution = Some(retained);
         assert!(execution_facts(FeatureId::Train, false, &model, &settings).is_none());
-        model.workflow.training.as_mut().unwrap().sources.execution.as_mut().unwrap().training.operationgeneration = 7;
-        assert_eq!(execution_facts(FeatureId::Train, false, &model, &settings).unwrap().admittedcapacity, 2);
-        model.workflow.training.as_mut().unwrap().sources.execution.as_mut().unwrap().training.admittedcapacity = 0;
+        model
+            .workflow
+            .training
+            .as_mut()
+            .unwrap()
+            .sources
+            .execution
+            .as_mut()
+            .unwrap()
+            .training
+            .operationgeneration = 7;
+        assert_eq!(
+            execution_facts(FeatureId::Train, false, &model, &settings)
+                .unwrap()
+                .admittedcapacity,
+            2
+        );
+        model
+            .workflow
+            .training
+            .as_mut()
+            .unwrap()
+            .sources
+            .execution
+            .as_mut()
+            .unwrap()
+            .training
+            .admittedcapacity = 0;
         assert!(execution_facts(FeatureId::Train, false, &model, &settings).is_none());
     }
 
@@ -288,22 +415,35 @@ mod tests {
         for feature in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict] {
             let mut model = crate::view_model::test_support::bootstrapped();
             let snapshot = model.settings_snapshot.as_mut().unwrap();
-            for facts in [&mut snapshot.trainexecution, &mut snapshot.trainingvalidationexecution,
-                &mut snapshot.validationexecution, &mut snapshot.predictionexecution] {
+            for facts in [
+                &mut snapshot.trainexecution,
+                &mut snapshot.trainingvalidationexecution,
+                &mut snapshot.validationexecution,
+                &mut snapshot.predictionexecution,
+            ] {
                 facts.settingsrevision = snapshot.revision;
                 facts.effectivebatchpermodel = 11;
             }
             let mut settings = crate::view::settings::SettingsModel::default();
             settings.install(snapshot);
             let retained = crate::view_model::test_support::saved_training_run(
-                snapshot.settingsstate.workflows.train.request.clone()).run.unwrap().execution;
+                snapshot.settingsstate.workflows.train.request.clone(),
+            )
+            .run
+            .unwrap()
+            .execution;
             model.workflow.training.as_mut().unwrap().sources.execution = Some(retained);
-            fn runtime(model: &mut crate::view_model::ApplicationModel, feature: FeatureId)
-                -> (&mut ComputeUiState, &mut ExecutionFacts) {
+            fn runtime(
+                model: &mut crate::view_model::ApplicationModel,
+                feature: FeatureId,
+            ) -> (&mut ComputeUiState, &mut ExecutionFacts) {
                 match feature {
                     FeatureId::Train => {
                         let state = model.workflow.training.as_mut().unwrap();
-                        (&mut state.local, &mut state.sources.execution.as_mut().unwrap().training)
+                        (
+                            &mut state.local,
+                            &mut state.sources.execution.as_mut().unwrap().training,
+                        )
                     }
                     FeatureId::Validate => {
                         let state = model.workflow.validation.as_mut().unwrap();
@@ -322,7 +462,12 @@ mod tests {
             facts.operationgeneration = 7;
             facts.admittedcapacity = 3;
             facts.effectivebatchpermodel = 99;
-            assert_eq!(execution_facts(feature, false, &model, &settings).unwrap().effectivebatchpermodel, 11);
+            assert_eq!(
+                execution_facts(feature, false, &model, &settings)
+                    .unwrap()
+                    .effectivebatchpermodel,
+                11
+            );
             model.workflow.pending_start = Some(PendingStart {
                 feature,
                 inputs: StartInputs::capture(settings.draft.as_ref().unwrap(), feature).unwrap(),
@@ -343,19 +488,37 @@ mod tests {
             facts.admittedcapacity = 0;
             assert!(execution_facts(feature, false, &model, &settings).is_none());
             runtime(&mut model, feature).1.admittedcapacity = 2;
-            assert_eq!(execution_facts(feature, false, &model, &settings).unwrap().effectivebatchpermodel, 99);
+            assert_eq!(
+                execution_facts(feature, false, &model, &settings)
+                    .unwrap()
+                    .effectivebatchpermodel,
+                99
+            );
             if feature == FeatureId::Train {
                 assert!(execution_facts(feature, true, &model, &settings).is_none());
-                let facts = &mut model.workflow.training.as_mut().unwrap().sources.execution.as_mut().unwrap().validation;
+                let facts = &mut model
+                    .workflow
+                    .training
+                    .as_mut()
+                    .unwrap()
+                    .sources
+                    .execution
+                    .as_mut()
+                    .unwrap()
+                    .validation;
                 facts.operationgeneration = 8;
                 facts.admittedcapacity = 1;
                 facts.effectivebatchpermodel = 5;
-                assert_eq!(execution_facts(feature, true, &model, &settings).unwrap().effectivebatchpermodel, 5);
+                assert_eq!(
+                    execution_facts(feature, true, &model, &settings)
+                        .unwrap()
+                        .effectivebatchpermodel,
+                    5
+                );
                 settings.resize_training_models(2).unwrap();
                 assert!(execution_facts(feature, false, &model, &settings).is_none());
                 assert!(execution_facts(feature, true, &model, &settings).is_none());
             }
         }
     }
-
 }

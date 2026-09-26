@@ -81,7 +81,8 @@ public:
  void ReleaseAfterCompletion(mmltk::backend::ml::runtime::RuntimeSubmission&& submission);
  [[nodiscard]] mmltk::backend::ml::runtime::RuntimeStatus Close() noexcept;
  [[nodiscard]] std::span<const RfdetrNamedOutputRole> output_roles() const noexcept;
- [[nodiscard]] std::shared_ptr<RfdetrRuntimeBackend> MakeLane(mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {}) const;
+ [[nodiscard]] std::shared_ptr<RfdetrRuntimeBackend> MakeLane(
+  mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {}) const;
 
 private:
  struct State;
@@ -96,7 +97,8 @@ private:
  friend std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRuntimeBackendOptions& options);
 };
 [[nodiscard]] std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRuntimeBackendOptions& options);
-[[nodiscard]] std::vector<std::shared_ptr<RfdetrRuntimeBackend>> make_rfdetr_runtime_backend_lanes(const RfdetrRuntimeBackendOptions& options, std::span<const mmltk::backend::ml::runtime::BorrowedCommandStream> streams);
+[[nodiscard]] std::vector<std::shared_ptr<RfdetrRuntimeBackend>> make_rfdetr_runtime_backend_lanes(
+ const RfdetrRuntimeBackendOptions& options, std::span<const mmltk::backend::ml::runtime::BorrowedCommandStream> streams);
 [[nodiscard]] ModelInfo inspect_tensorrt_model(const ModelArtifactRequest& artifacts, int device_id, std::stop_token stop = {});
 void build_tensorrt_engine(const BuildEngineRequest& request);
 void build_tensorrt_engine(const BuildEngineRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::shared_ptr<const ClassArtifactAdmission> admission = {},

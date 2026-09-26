@@ -31,7 +31,8 @@ public:
  [[nodiscard]] const TrainingEpochMetricState& state() const;
  void begin_attempt(std::size_t contributions);
  void accumulate_empty();
- void accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const TrainingScalarPacket::Tensors& scalars, const DetectionStatisticsPacket::Tensors& statistics = {});
+ void accumulate(
+  const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const TrainingScalarPacket::Tensors& scalars, const DetectionStatisticsPacket::Tensors& statistics = {});
  TrainingMetricSnapshot complete_step(const torch::Tensor& found_inf, int64_t attempt_micro_batches, int64_t epoch_micro_batches, const DistributedContext& distributed = {});
  [[nodiscard]] double epoch_average() const;
  void begin_validation();

@@ -24,7 +24,9 @@
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 namespace mmltk::backend::models::rfdetr {
 struct DistributedContext;
-namespace testsupport { struct TrainingDistributedTestAccess; }
+namespace testsupport {
+struct TrainingDistributedTestAccess;
+}
 class TrainingTargetCounts final {
 public:
  TrainingTargetCounts(std::size_t lanes, int device_id, const DistributedContext& distributed);
@@ -51,7 +53,10 @@ public:
  ParallelTrainingWave(const std::size_t lane_count, const bool active, const int device_id, const DistributedContext& distributed, std::shared_ptr<TrainingTargetCounts> counts = {}) {
   futures_.reserve(lane_count);
   results_.reserve(lane_count);
-  if (active) { normalizer_ = counts ? std::move(counts) : std::make_shared<TrainingTargetCounts>(lane_count, device_id, distributed); normalizer_->begin(lane_count); }
+  if (active) {
+   normalizer_ = counts ? std::move(counts) : std::make_shared<TrainingTargetCounts>(lane_count, device_id, distributed);
+   normalizer_->begin(lane_count);
+  }
  }
  ~ParallelTrainingWave() noexcept {
   if (!settled_) {
@@ -217,7 +222,7 @@ struct RoutedTrainingLoss {
  torch::Tensor box;
  TensorMap ordinary_terms;
  TrainingScalarPacket::Tensors scalars;
- DetectionStatisticsPacket::Tensors statistics;
+ DetectionStatisticsPacket::Tensors statistics{};
 };
 torch::Tensor loss_value_or_zero(const TensorMap&, const torch::Device&, std::string_view);
 TrainingScalarPacket::Tensors ordinary_scalar_tensors(const TensorMap&, const torch::Tensor&, const torch::Tensor&);

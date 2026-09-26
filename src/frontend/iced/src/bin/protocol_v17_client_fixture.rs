@@ -11,54 +11,124 @@ fn require(condition: bool, detail: &'static str) -> io::Result<()> {
 }
 
 fn validate_recipe_edits() -> io::Result<()> {
-    use mmltk_browser_app::application_codec::{IntoApplicationValue, Value};
-    use mmltk_browser_app::generated::*;
     use TrainRecipeCatalogRelationField as Field;
     use TrainRecipeSettingsEdit as Edit;
+    use mmltk_browser_app::application_codec::{IntoApplicationValue, Value};
+    use mmltk_browser_app::generated::*;
     let edits = [
         (Field::Lr, Edit::Lr(0.375), "lr"),
         (Field::LrEncoder, Edit::LrEncoder(0.375), "lr_encoder"),
-        (Field::LrComponentDecay, Edit::LrComponentDecay(0.375), "lr_component_decay"),
-        (Field::EncoderLayerDecay, Edit::EncoderLayerDecay(0.375), "encoder_layer_decay"),
+        (
+            Field::LrComponentDecay,
+            Edit::LrComponentDecay(0.375),
+            "lr_component_decay",
+        ),
+        (
+            Field::EncoderLayerDecay,
+            Edit::EncoderLayerDecay(0.375),
+            "encoder_layer_decay",
+        ),
         (Field::Momentum, Edit::Momentum(0.375), "momentum"),
         (Field::WeightDecay, Edit::WeightDecay(0.375), "weight_decay"),
-        (Field::WarmupEpochs, Edit::WarmupEpochs(0.375), "warmup_epochs"),
-        (Field::WarmupMomentum, Edit::WarmupMomentum(0.375), "warmup_momentum"),
-        (Field::LrMinFactor, Edit::LrMinFactor(0.375), "lr_min_factor"),
+        (
+            Field::WarmupEpochs,
+            Edit::WarmupEpochs(0.375),
+            "warmup_epochs",
+        ),
+        (
+            Field::WarmupMomentum,
+            Edit::WarmupMomentum(0.375),
+            "warmup_momentum",
+        ),
+        (
+            Field::LrMinFactor,
+            Edit::LrMinFactor(0.375),
+            "lr_min_factor",
+        ),
         (Field::LrDrop, Edit::LrDrop(9), "lr_drop"),
-        (Field::LrScheduler, Edit::LrScheduler(TrainLrSchedulerKind::Cosine), "lr_scheduler"),
+        (
+            Field::LrScheduler,
+            Edit::LrScheduler(TrainLrSchedulerKind::Cosine),
+            "lr_scheduler",
+        ),
         (Field::Nesterov, Edit::Nesterov(true), "nesterov"),
-        (Field::WarmupBiasLr, Edit::WarmupBiasLr(0.375), "warmup_bias_lr"),
+        (
+            Field::WarmupBiasLr,
+            Edit::WarmupBiasLr(0.375),
+            "warmup_bias_lr",
+        ),
     ];
-    require(edits.len() == TRAIN_RECIPE_CATALOG_RELATION.len()
-        && edits.iter().map(|(_, _, name)| *name).collect::<BTreeSet<_>>()
-            == TRAIN_RECIPE_CATALOG_RELATION.iter().map(|fact| fact.source_path).collect(),
-        "typed recipe edits must cover every reflected relation member")?;
-    let mut settings = application_snapshot_defaults().map_err(io::Error::other)?.into_iter()
-        .find_map(|fact| match fact.value { ApplicationSnapshot::Settings(state) => Some(state.settingsstate), _ => None })
+    require(
+        edits.len() == TRAIN_RECIPE_CATALOG_RELATION.len()
+            && edits
+                .iter()
+                .map(|(_, _, name)| *name)
+                .collect::<BTreeSet<_>>()
+                == TRAIN_RECIPE_CATALOG_RELATION
+                    .iter()
+                    .map(|fact| fact.source_path)
+                    .collect(),
+        "typed recipe edits must cover every reflected relation member",
+    )?;
+    let mut settings = application_snapshot_defaults()
+        .map_err(io::Error::other)?
+        .into_iter()
+        .find_map(|fact| match fact.value {
+            ApplicationSnapshot::Settings(state) => Some(state.settingsstate),
+            _ => None,
+        })
         .ok_or_else(|| io::Error::other("missing settings default"))?;
     for catalog in TRAIN_RECIPE_CATALOG {
         let mut model = settings.workflows.train.request.recipe.clone();
         Edit::Optimizer(catalog.optimizer).apply(&mut model);
-        let selection = edit_relation_workflowstrainrequestrecipe(&mut settings, Edit::Optimizer(catalog.optimizer));
-        require(selection == vec![update_workflowstrainrequestrecipeoptimizer(catalog.optimizer)]
-            && model == settings.workflows.train.request.recipe, "recipe selector projections disagree")?;
+        let selection = edit_relation_workflowstrainrequestrecipe(
+            &mut settings,
+            Edit::Optimizer(catalog.optimizer),
+        );
+        require(
+            selection
+                == vec![update_workflowstrainrequestrecipeoptimizer(
+                    catalog.optimizer,
+                )]
+                && model == settings.workflows.train.request.recipe,
+            "recipe selector projections disagree",
+        )?;
         let defaults = model.clone();
         for (field, edit, name) in &edits {
             edit.clone().apply(&mut model);
             let updates = edit_relation_workflowstrainrequestrecipe(&mut settings, edit.clone());
-            let relation = TRAIN_RECIPE_CATALOG_RELATION.iter().find(|fact| fact.source_path == *name).unwrap();
-            let Value::Object(values) = model.clone().into_application_value() else { return Err(io::Error::other("recipe must be an object")); };
-            let value = &values.iter().find(|(key, _)| key.as_str() == *name).unwrap().1;
-            require(model == settings.workflows.train.request.recipe && model.overrides.overridden(*field)
-                && updates.len() == 1 && updates[0].path == relation.destination_path && updates[0].value == *value,
-                "typed recipe edits must preserve their rooted native value and override")?;
+            let relation = TRAIN_RECIPE_CATALOG_RELATION
+                .iter()
+                .find(|fact| fact.source_path == *name)
+                .unwrap();
+            let Value::Object(values) = model.clone().into_application_value() else {
+                return Err(io::Error::other("recipe must be an object"));
+            };
+            let value = &values
+                .iter()
+                .find(|(key, _)| key.as_str() == *name)
+                .unwrap()
+                .1;
+            require(
+                model == settings.workflows.train.request.recipe
+                    && model.overrides.overridden(*field)
+                    && updates.len() == 1
+                    && updates[0].path == relation.destination_path
+                    && updates[0].value == *value,
+                "typed recipe edits must preserve their rooted native value and override",
+            )?;
             Edit::Clear(*field).apply(&mut model);
-            let cleared = edit_relation_workflowstrainrequestrecipe(&mut settings, Edit::Clear(*field));
-            require(model == defaults && model == settings.workflows.train.request.recipe
-                && !model.overrides.overridden(*field) && cleared.len() == 1
-                && cleared[0].path == relation.destination_path && cleared[0].value == Value::Null,
-                "recipe clear must restore only its selected catalog field")?;
+            let cleared =
+                edit_relation_workflowstrainrequestrecipe(&mut settings, Edit::Clear(*field));
+            require(
+                model == defaults
+                    && model == settings.workflows.train.request.recipe
+                    && !model.overrides.overridden(*field)
+                    && cleared.len() == 1
+                    && cleared[0].path == relation.destination_path
+                    && cleared[0].value == Value::Null,
+                "recipe clear must restore only its selected catalog field",
+            )?;
         }
         for (_, edit, _) in &edits {
             edit.clone().apply(&mut model);
@@ -66,19 +136,39 @@ fn validate_recipe_edits() -> io::Result<()> {
         }
         Edit::Reset.apply(&mut model);
         let reset = edit_relation_workflowstrainrequestrecipe(&mut settings, Edit::Reset);
-        require(model == defaults && settings.workflows.train.request.recipe == defaults
-            && reset.len() == TRAIN_RECIPE_CATALOG_RELATION.len()
-            && reset.iter().zip(TRAIN_RECIPE_CATALOG_RELATION).all(|(update, fact)|
-                update.path == fact.destination_path && update.value == Value::Null),
-            "recipe reset must retain the optimizer and clear every reflected override")?;
+        require(
+            model == defaults
+                && settings.workflows.train.request.recipe == defaults
+                && reset.len() == TRAIN_RECIPE_CATALOG_RELATION.len()
+                && reset
+                    .iter()
+                    .zip(TRAIN_RECIPE_CATALOG_RELATION)
+                    .all(|(update, fact)| {
+                        update.path == fact.destination_path && update.value == Value::Null
+                    }),
+            "recipe reset must retain the optimizer and clear every reflected override",
+        )?;
     }
-    let constraints = [constraint_trainmodelsettingsseed(), constraint_trainmodelsettingscoefficient(),
-        constraint_trainlaneconfigurationmergerounds()];
-    require(constraints.iter().all(|constraint| constraint.stable_field_id != 0)
-        && constraints.iter().map(|constraint| constraint.stable_field_id).collect::<BTreeSet<_>>().len() == constraints.len()
-        && constraints[1].minimum == Some(0.0) && constraints[1].finite
-        && constraints[2].minimum == Some(1.0),
-        "lane controls require distinct canonical lowercase value constraints")
+    let constraints = [
+        constraint_trainmodelsettingsseed(),
+        constraint_trainmodelsettingscoefficient(),
+        constraint_trainlaneconfigurationmergerounds(),
+    ];
+    require(
+        constraints
+            .iter()
+            .all(|constraint| constraint.stable_field_id != 0)
+            && constraints
+                .iter()
+                .map(|constraint| constraint.stable_field_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                == constraints.len()
+            && constraints[1].minimum == Some(0.0)
+            && constraints[1].finite
+            && constraints[2].minimum == Some(1.0),
+        "lane controls require distinct canonical lowercase value constraints",
+    )
 }
 
 fn validate_generated_surfaces() -> io::Result<()> {

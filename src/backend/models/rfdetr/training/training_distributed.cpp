@@ -44,8 +44,12 @@ DistributedContext::DistributedContext(DistributedContext&&) noexcept = default;
 DistributedContext& DistributedContext::operator=(DistributedContext&&) noexcept = default;
 DistributedContext DistributedContext::from_backend(int rank, int world, int device, c10::intrusive_ptr<c10d::Backend> backend) {
  DistributedContext result;
- result.enabled = true; result.rank = rank; result.world_size = world; result.device_id = device;
- result.transport_ = std::make_shared<Transport>(); result.transport_->backend = std::move(backend);
+ result.enabled = true;
+ result.rank = rank;
+ result.world_size = world;
+ result.device_id = device;
+ result.transport_ = std::make_shared<Transport>();
+ result.transport_->backend = std::move(backend);
  return result;
 }
 c10::intrusive_ptr<c10d::Backend> DistributedContext::backend() const { return transport_->backend; }
@@ -64,18 +68,22 @@ DistributedContext make_distributed_context(const std::filesystem::path& path, i
  result.transport_->store = std::move(store);
  return result;
 #else
- (void)device; (void)timeout;
+ (void)device;
+ (void)timeout;
  throw std::runtime_error("distributed RF-DETR training requires a LibTorch build with NCCL/c10d enabled");
 #endif
 }
 DistributedContext make_distributed_context(const TrainRequest& request) {
  if (request.distributed_worker && request.distributed_world_size > 1)
   return make_distributed_context(request.distributed_store_path, request.distributed_rank, request.distributed_world_size, request.device_id);
- DistributedContext result; result.device_id = request.device_id; return result;
+ DistributedContext result;
+ result.device_id = request.device_id;
+ return result;
 }
 void distributed_abort(const DistributedContext& group) noexcept {
- if (group.transport_ && !group.transport_->aborted.exchange(true))
-  try { group.transport_->backend->abort(); } catch (...) {}
+ if (group.transport_ && !group.transport_->aborted.exchange(true)) try {
+   group.transport_->backend->abort();
+  } catch (...) {}
 }
 TrainingFailure claim_training_failure(const DistributedContext& group, const TrainingFailure& cause) {
  if (!group.enabled || !group.transport_->store) return cause;
@@ -120,12 +128,14 @@ struct TrainingCollectiveWork::Owner final {
 };
 TrainingCollectiveWork::TrainingCollectiveWork(int device, std::size_t capacity) : owner_(std::make_unique<Owner>(device, capacity)) {}
 TrainingCollectiveWork::~TrainingCollectiveWork() {
- if (owner_ && retire() != cudaSuccess)
-  std::move(owner_->terminal).Install(gpu::TerminalCudaCustody::Share(std::move(owner_->state)), cudaErrorUnknown);
+ if (owner_ && retire() != cudaSuccess) std::move(owner_->terminal).Install(gpu::TerminalCudaCustody::Share(std::move(owner_->state)), cudaErrorUnknown);
 }
 TrainingCollectiveWork::TrainingCollectiveWork(TrainingCollectiveWork&&) noexcept = default;
 TrainingCollectiveWork& TrainingCollectiveWork::operator=(TrainingCollectiveWork&& other) noexcept {
- if (this != &other) { TrainingCollectiveWork previous(std::move(*this)); owner_ = std::move(other.owner_); }
+ if (this != &other) {
+  TrainingCollectiveWork previous(std::move(*this));
+  owner_ = std::move(other.owner_);
+ }
  return *this;
 }
 std::size_t TrainingCollectiveWork::submit(const DistributedContext& group, const torch::Tensor& tensor, Operation operation) {
@@ -143,18 +153,31 @@ std::size_t TrainingCollectiveWork::submit(const DistributedContext& group, cons
  auto& slot = state.slots[index];
  // Establish every application reference before calling the backend. The
  // backend may queue device work and throw before returning its Work handle.
- slot.group = group; slot.tensors.assign(1, tensor); slot.joined = false;
- ++state.used; state.completion_recorded = false;
- if (!group.enabled) { slot.joined = true; return index; }
+ slot.group = group;
+ slot.tensors.assign(1, tensor);
+ slot.joined = false;
+ ++state.used;
+ state.completion_recorded = false;
+ if (!group.enabled) {
+  slot.joined = true;
+  return index;
+ }
  slot.submitted = true;
  try {
-  if (operation == Operation::Sum) slot.work = group.transport_->backend->allreduce(slot.tensors);
+  if (operation == Operation::Sum)
+   slot.work = group.transport_->backend->allreduce(slot.tensors);
   else {
-   c10d::BroadcastOptions options; options.rootRank = 0; options.rootTensor = 0;
+   c10d::BroadcastOptions options;
+   options.rootRank = 0;
+   options.rootTensor = 0;
    slot.work = group.transport_->backend->broadcast(slot.tensors, options);
   }
   if (!slot.work) throw std::runtime_error("training collective returned no Work handle");
- } catch (...) { state.failure = cudaErrorUnknown; distributed_abort(group); throw; }
+ } catch (...) {
+  state.failure = cudaErrorUnknown;
+  distributed_abort(group);
+  throw;
+ }
  return index;
 }
 std::size_t TrainingCollectiveWork::all_reduce(const DistributedContext& group, const torch::Tensor& tensor) { return submit(group, tensor, Operation::Sum); }
@@ -177,7 +200,11 @@ void TrainingCollectiveWork::join(std::size_t index) {
   if (!slot.work->wait()) throw std::runtime_error("training collective wait returned false");
   if (slot.group.transport_->aborted) throw std::runtime_error("training collective was aborted during its stream join");
   slot.joined = true;
- } catch (...) { state.failure = cudaErrorUnknown; distributed_abort(slot.group); throw; }
+ } catch (...) {
+  state.failure = cudaErrorUnknown;
+  distributed_abort(slot.group);
+  throw;
+ }
 }
 bool TrainingCollectiveWork::uncertain() const noexcept {
  if (!owner_) return false;
@@ -195,28 +222,48 @@ void TrainingCollectiveWork::record_completion() {
  if (!state.used && state.retained.empty()) state.stream = tc::getCurrentCUDAStream(tc::checked_device_index(state.device));
  try {
   tc::TorchCudaStreamGuard guard(state.stream);
-  state.completed.record(state.stream); state.completion_recorded = true;
- } catch (...) { state.failure = cudaErrorUnknown; throw; }
+  state.completed.record(state.stream);
+  state.completion_recorded = true;
+ } catch (...) {
+  state.failure = cudaErrorUnknown;
+  throw;
+ }
 }
 void TrainingCollectiveWork::settle() {
  auto& state = *owner_->state;
  if (uncertain()) throw std::runtime_error("training collective physical completion is unproved");
  if (!state.completion_recorded) record_completion();
- try { state.completed.synchronize(); } catch (...) { state.failure = cudaErrorUnknown; throw; }
- for (std::size_t i = 0; i < state.used; ++i) {
-  auto& slot = state.slots[i]; slot.work.reset(); slot.tensors.clear(); slot.group = {}; slot.submitted = slot.joined = false;
+ try {
+  state.completed.synchronize();
+ } catch (...) {
+  state.failure = cudaErrorUnknown;
+  throw;
  }
- state.used = 0; state.retained.clear(); state.completion_recorded = false;
+ for (std::size_t i = 0; i < state.used; ++i) {
+  auto& slot = state.slots[i];
+  slot.work.reset();
+  slot.tensors.clear();
+  slot.group = {};
+  slot.submitted = slot.joined = false;
+ }
+ state.used = 0;
+ state.retained.clear();
+ state.completion_recorded = false;
 }
 cudaError_t TrainingCollectiveWork::retire() noexcept {
  if (!owner_) return cudaSuccess;
  const auto& state = *owner_->state;
  if (!state.used && state.retained.empty() && !state.completion_recorded && state.failure == cudaSuccess) return cudaSuccess;
- try { settle(); return cudaSuccess; } catch (...) { return cudaErrorUnknown; }
+ try {
+  settle();
+  return cudaSuccess;
+ } catch (...) { return cudaErrorUnknown; }
 }
 void distributed_all_reduce_tensor(const DistributedContext& group, const torch::Tensor& tensor) {
  if (!group.enabled) return;
- TrainingCollectiveWork work(group.device_id); work.join(work.all_reduce(group, tensor)); work.settle();
+ TrainingCollectiveWork work(group.device_id);
+ work.join(work.all_reduce(group, tensor));
+ work.settle();
 }
 void distributed_barrier(const DistributedContext& group) {
  if (!group.enabled) return;
@@ -235,7 +282,8 @@ void distributed_agree(const DistributedContext& group, std::string_view turn, s
  TrainingCollectiveWork work(group.device_id, 2);
  work.join(work.broadcast(group, reference));
  auto differs = local.ne(reference).any().to(torch::kInt32);
- work.join(work.all_reduce(group, differs)); work.settle();
+ work.join(work.all_reduce(group, differs));
+ work.settle();
  if (differs.item<std::int32_t>()) throw std::runtime_error("distributed training admission differs at " + std::string(turn));
 }
 void agree_training_text(const DistributedContext& group, std::string_view turn, std::string_view value) {
@@ -267,14 +315,17 @@ void agree_training_value(const DistributedContext& distributed, std::string_vie
  const auto digest = signature.Finish();
  distributed_agree(distributed, turn, digest);
 }
-} // namespace
+}  // namespace
 void agree_training_request(const DistributedContext& group, const TrainRequest& request) {
  if (!group.enabled) return;
  auto common = request;
  // Ordered topology owns rank placement. Physical CPU budgets may differ and
  // never enter the mathematical request signature.
- common.device_id = 0; common.distributed_rank = 0;
- common.numa_node = -1; common.cpu_affinity.clear(); common.workers = 0;
+ common.device_id = 0;
+ common.distributed_rank = 0;
+ common.numa_node = -1;
+ common.cpu_affinity.clear();
+ common.workers = 0;
  agree_training_value(group, "request", common);
 }
 void agree_training_continuation(const DistributedContext& group, const detail::TrainingContinuationValues& value) { agree_training_value(group, "continuation", value); }
@@ -282,9 +333,11 @@ void agree_model_inventory(const DistributedContext& distributed, const NativeRf
  if (!distributed.enabled) return;
  std::ostringstream signature;
  const auto append = [&](const auto& items) {
-  for (const auto& item : items) signature << item.key() << ':' << item.value().sizes() << ':' << item.value().strides() << ':' << item.value().scalar_type() << ':' << item.value().requires_grad() << ';';
+  for (const auto& item : items)
+   signature << item.key() << ':' << item.value().sizes() << ':' << item.value().strides() << ':' << item.value().scalar_type() << ':' << item.value().requires_grad() << ';';
  };
- append(model.named_parameters(true)); append(model.named_buffers(true));
+ append(model.named_parameters(true));
+ append(model.named_buffers(true));
  const auto bytes = signature.str();
  distributed_agree(distributed, turn, {reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()});
 }
@@ -305,7 +358,8 @@ void agree_training_topology(const DistributedContext& distributed, int device) 
  distributed.transport_->store->set("training/device/" + std::to_string(distributed.rank), std::vector<std::uint8_t>(uuid, uuid + sizeof(properties->uuid.bytes)));
  std::set<std::vector<std::uint8_t>> identities;
  for (int rank = 0; rank < distributed.world_size; ++rank)
-  if (!identities.insert(distributed.transport_->store->get("training/device/" + std::to_string(rank))).second) throw std::runtime_error("distributed training ranks selected the same physical CUDA device");
+  if (!identities.insert(distributed.transport_->store->get("training/device/" + std::to_string(rank))).second)
+   throw std::runtime_error("distributed training ranks selected the same physical CUDA device");
 #else
  (void)device;
  throw std::runtime_error("distributed training requires NCCL");
@@ -325,8 +379,10 @@ void broadcast_training_tensors(const DistributedContext& group, const std::vect
   void finish() {
    if (!pending) return;
    work.join(0);
-   for (std::size_t i = 0; i < items.size(); ++i) if (views[i].numel()) items[i].copy_(views[i], true);
-   work.settle(); pending = false;
+   for (std::size_t i = 0; i < items.size(); ++i)
+    if (views[i].numel()) items[i].copy_(views[i], true);
+   work.settle();
+   pending = false;
   }
  };
  std::array<Buffer, 2> buffers{Buffer(group.device_id), Buffer(group.device_id)};
@@ -334,9 +390,13 @@ void broadcast_training_tensors(const DistributedContext& group, const std::vect
  for (const auto& bucket : buckets) {
   auto& buffer = buffers[next++ % buffers.size()];
   buffer.finish();
-  buffer.items.clear(); buffer.items.reserve(bucket.size());
+  buffer.items.clear();
+  buffer.items.reserve(bucket.size());
   std::int64_t elements = 0;
-  for (auto index : bucket) { buffer.items.push_back(tensors[index]); elements += tensors[index].numel(); }
+  for (auto index : bucket) {
+   buffer.items.push_back(tensors[index]);
+   elements += tensors[index].numel();
+  }
   buffer.work.retain(buffer.items);
   // Flatten once per required allocation; subsequent compatible buckets reuse
   // the allocation through Torch's unflattened structural views.
@@ -371,9 +431,10 @@ void broadcast_training_model(const DistributedContext& group, NativeRfDetrModel
    if (item.value().is_floating_point()) invalid.add_(torch::isfinite(item.value()).all().logical_not().to(torch::kInt32));
   }
  };
- append(parameters); append(buffers);
+ append(parameters);
+ append(buffers);
  distributed_all_reduce_tensor(group, invalid);
  if (invalid.item<std::int32_t>() != 0) throw std::runtime_error("nonfinite initialized training model state on a selected rank");
  broadcast_training_tensors(group, tensors);
 }
-} // namespace mmltk::backend::models::rfdetr
+}  // namespace mmltk::backend::models::rfdetr

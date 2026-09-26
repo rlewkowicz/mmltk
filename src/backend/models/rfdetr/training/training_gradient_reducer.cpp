@@ -36,7 +36,7 @@ struct TrainingGradientReducer::Impl final {
   bool armed = false;
  };
  Impl(const DistributedContext& group, int device_id, tc::TorchCudaStream stream, std::size_t bytes)
-  : distributed(group), device(device_id), launch(stream), accumulation(tc::getStreamFromPool(false, tc::checked_device_index(device_id))), bucket_bytes(bytes) {
+     : distributed(group), device(device_id), launch(stream), accumulation(tc::getStreamFromPool(false, tc::checked_device_index(device_id))), bucket_bytes(bytes) {
   if (!bytes) throw std::invalid_argument("gradient bucket capacity must be positive");
  }
  ~Impl() { remove_hooks(); }
@@ -44,16 +44,21 @@ struct TrainingGradientReducer::Impl final {
   for (auto& slot : slots)
    for (std::size_t i = 0; i < slot.hooks.size(); ++i) slot.leaves[i].remove_hook(slot.hooks[i]);
  }
- void check() const { if (failure) std::rethrow_exception(failure); }
+ void check() const {
+  if (failure) std::rethrow_exception(failure);
+ }
  void rebuild(const std::vector<std::string>& names, const std::vector<torch::Tensor>& master, const std::vector<std::vector<torch::Tensor>>& leaves) {
   std::lock_guard lock(mutex);
   check();
   if (active) throw std::logic_error("gradient membership can only change at a drained boundary");
   if (names.size() != master.size() || master.empty() || leaves.empty()) throw std::invalid_argument("invalid gradient binding inventory");
-  launch.synchronize(); accumulation.synchronize();
-  for (auto& parameter : parameters) parameter.master.mutable_grad() = {};
+  launch.synchronize();
+  accumulation.synchronize();
+  for (auto& parameter : parameters) parameter.master.mutable_grad() = torch::Tensor{};
   remove_hooks();
-  slots.clear(); buckets.clear(); parameters.clear();
+  slots.clear();
+  buckets.clear();
+  parameters.clear();
   parameters.resize(master.size());
   tc::TorchCudaStreamGuard guard(accumulation);
   for (const auto& tensor : master)
@@ -70,8 +75,7 @@ struct TrainingGradientReducer::Impl final {
    do {
     const auto& tensor = master[end - 1];
     const auto tensor_bytes = tensor.nbytes();
-    if (!region.empty() && (tensor.scalar_type() != region.front().scalar_type() ||
-        tensor.device() != region.front().device() || bytes > bucket_bytes || tensor_bytes > bucket_bytes - bytes)) break;
+    if (!region.empty() && (tensor.scalar_type() != region.front().scalar_type() || tensor.device() != region.front().device() || bytes > bucket_bytes || tensor_bytes > bucket_bytes - bytes)) break;
     region.push_back(tensor);
     bytes += tensor_bytes;
     --end;
@@ -84,7 +88,8 @@ struct TrainingGradientReducer::Impl final {
     for (auto reverse : indices) {
      const auto i = region_end - 1 - reverse;
      parameters[i] = {names[i], master[i], {}, buckets.size() - 1};
-     bucket.parameters.push_back(i); elements += master[i].numel();
+     bucket.parameters.push_back(i);
+     elements += master[i].numel();
     }
     bucket.values = torch::zeros({elements}, master[bucket.parameters.front()].options().requires_grad(false));
     std::int64_t offset = 0;
@@ -98,18 +103,28 @@ struct TrainingGradientReducer::Impl final {
   work = std::make_unique<TrainingCollectiveWork>(device, buckets.size() + 1);
   usage = torch::zeros({static_cast<std::int64_t>(parameters.size())}, torch::TensorOptions().dtype(torch::kInt32).device(tc::cuda_device(device)));
   host_usage = tc::numa_empty({static_cast<std::int64_t>(parameters.size())}, torch::kInt32, device);
-  sources.reserve(parameters.size()); destinations.reserve(parameters.size());
+  sources.reserve(parameters.size());
+  destinations.reserve(parameters.size());
   slots.resize(leaves.size());
   for (std::size_t s = 0; s < slots.size(); ++s) {
-   auto& slot = slots[s]; slot.leaves = leaves[s];
+   auto& slot = slots[s];
+   slot.leaves = leaves[s];
    if (slot.leaves.size() != parameters.size()) throw std::invalid_argument("lane gradient inventory differs");
-   slot.gradients.resize(parameters.size()); slot.produced.resize(parameters.size());
-   slot.remaining.resize(buckets.size()); slot.closed.resize(buckets.size()); slot.hooks.reserve(parameters.size());
+   slot.gradients.resize(parameters.size());
+   slot.produced.resize(parameters.size());
+   slot.remaining.resize(buckets.size());
+   slot.closed.resize(buckets.size());
+   slot.hooks.reserve(parameters.size());
    for (std::size_t i = 0; i < parameters.size(); ++i) {
-    const auto& tensor = slot.leaves[i]; const auto& master_tensor = parameters[i].master;
-    if (!tensor.requires_grad() || !tensor.is_leaf() || tensor.sizes() != master_tensor.sizes() || tensor.strides() != master_tensor.strides() || tensor.options().dtype() != master_tensor.options().dtype() || tensor.device() != master_tensor.device())
+    const auto& tensor = slot.leaves[i];
+    const auto& master_tensor = parameters[i].master;
+    if (!tensor.requires_grad() || !tensor.is_leaf() || tensor.sizes() != master_tensor.sizes() || tensor.strides() != master_tensor.strides() ||
+        tensor.options().dtype() != master_tensor.options().dtype() || tensor.device() != master_tensor.device())
      throw std::invalid_argument("lane leaf does not match canonical gradient binding");
-    slot.hooks.push_back(tensor.register_hook([this, s, i](const torch::Tensor& gradient) { hook(s, i, gradient); return gradient; }));
+    slot.hooks.push_back(tensor.register_hook([this, s, i](const torch::Tensor& gradient) {
+     hook(s, i, gradient);
+     return gradient;
+    }));
    }
   }
   accumulation.synchronize();
@@ -129,24 +144,30 @@ struct TrainingGradientReducer::Impl final {
   if (slot.closed[ordinal]) return;
   torch::NoGradGuard no_grad;
   tc::TorchCudaStreamGuard guard(accumulation);
-  auto& bucket = buckets[ordinal]; sources.clear(); destinations.clear();
+  auto& bucket = buckets[ordinal];
+  sources.clear();
+  destinations.clear();
   for (auto i : bucket.parameters) {
    auto& value = slot.gradients[i];
    if (!value.defined()) continue;
    slot.produced[i].block(accumulation);
    value.record_stream(accumulation);
-   sources.push_back(value); destinations.push_back(parameters[i].view); host_usage.data_ptr<std::int32_t>()[i] = 1;
+   sources.push_back(value);
+   destinations.push_back(parameters[i].view);
+   host_usage.data_ptr<std::int32_t>()[i] = 1;
   }
   if (!sources.empty()) at::_foreach_add_(destinations, sources);
-  for (auto i : bucket.parameters) slot.gradients[i] = {};
-  sources.clear(); destinations.clear();
+  for (auto i : bucket.parameters) slot.gradients[i] = torch::Tensor{};
+  sources.clear();
+  destinations.clear();
   slot.closed[ordinal] = true;
   ++bucket.closed;
   if (bucket.closed == expected) bucket.ready.record(accumulation);
   launch_ready();
  }
  void hook(std::size_t s, std::size_t i, const torch::Tensor& gradient) {
-  std::lock_guard lock(mutex); check();
+  std::lock_guard lock(mutex);
+  check();
   auto& slot = slots.at(s);
   if (!active || !slot.armed || slot.gradients[i].defined() || slot.closed[parameters[i].bucket]) throw std::logic_error("gradient hook outside its contribution");
   slot.gradients[i] = gradient;
@@ -172,10 +193,15 @@ struct TrainingGradientReducer::Impl final {
  std::size_t expected = 0, admitted = 0, finished = 0, next_bucket = 0;
  bool active = false, counts_submitted = false;
 };
-TrainingGradientReducer::TrainingGradientReducer(const DistributedContext& group, int device, tc::TorchCudaStream stream,
- const std::vector<std::string>& names, const std::vector<torch::Tensor>& master, const std::vector<std::vector<torch::Tensor>>& leaves, std::size_t bytes)
- : impl_(std::make_shared<Impl>(group, device, stream, bytes)) {
- try { impl_->rebuild(names, master, leaves); } catch (...) { retire(); throw; }
+TrainingGradientReducer::TrainingGradientReducer(const DistributedContext& group, int device, tc::TorchCudaStream stream, const std::vector<std::string>& names,
+ const std::vector<torch::Tensor>& master, const std::vector<std::vector<torch::Tensor>>& leaves, std::size_t bytes)
+    : impl_(std::make_shared<Impl>(group, device, stream, bytes)) {
+ try {
+  impl_->rebuild(names, master, leaves);
+ } catch (...) {
+  retire();
+  throw;
+ }
 }
 TrainingGradientReducer::~TrainingGradientReducer() { retire(); }
 void TrainingGradientReducer::retire() noexcept {
@@ -199,50 +225,81 @@ void TrainingGradientReducer::retire() noexcept {
   const auto launch_status = cudaStreamSynchronize(impl_->launch.stream());
   if (status == cudaSuccess) status = launch_status;
  } catch (...) { status = cudaErrorUnknown; }
- if (status != cudaSuccess) std::move(terminal_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), status);
- else impl_.reset();
+ if (status != cudaSuccess)
+  std::move(terminal_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), status);
+ else
+  impl_.reset();
 }
-void TrainingGradientReducer::rebuild(const std::vector<std::string>& names, const std::vector<torch::Tensor>& master, const std::vector<std::vector<torch::Tensor>>& leaves) { impl_->rebuild(names, master, leaves); }
+void TrainingGradientReducer::rebuild(const std::vector<std::string>& names, const std::vector<torch::Tensor>& master, const std::vector<std::vector<torch::Tensor>>& leaves) {
+ impl_->rebuild(names, master, leaves);
+}
 void TrainingGradientReducer::begin_attempt(std::size_t count) {
- auto& p = *impl_; std::lock_guard lock(p.mutex); p.check();
+ auto& p = *impl_;
+ std::lock_guard lock(p.mutex);
+ p.check();
  if (p.active || !count) throw std::logic_error("invalid gradient attempt admission");
  torch::NoGradGuard no_grad;
  // The optimizer's preceding reads/writes must finish before bucket reuse.
- p.optimizer_done.record(tc::getCurrentCUDAStream(tc::checked_device_index(p.device))); p.optimizer_done.block(p.accumulation);
+ p.optimizer_done.record(tc::getCurrentCUDAStream(tc::checked_device_index(p.device)));
+ p.optimizer_done.block(p.accumulation);
  tc::TorchCudaStreamGuard guard(p.accumulation);
- for (auto& parameter : p.parameters) parameter.master.mutable_grad() = {};
- for (auto& bucket : p.buckets) { bucket.values.zero_(); bucket.closed = 0; }
- p.host_usage.zero_(); p.usage.zero_();
- p.expected = count; p.admitted = p.finished = p.next_bucket = 0; p.counts_submitted = false; p.active = true;
+ for (auto& parameter : p.parameters) parameter.master.mutable_grad() = torch::Tensor{};
+ for (auto& bucket : p.buckets) {
+  bucket.values.zero_();
+  bucket.closed = 0;
+ }
+ p.host_usage.zero_();
+ p.usage.zero_();
+ p.expected = count;
+ p.admitted = p.finished = p.next_bucket = 0;
+ p.counts_submitted = false;
+ p.active = true;
 }
 void TrainingGradientReducer::arm(std::size_t index) {
- auto& p = *impl_; std::lock_guard lock(p.mutex); p.check(); auto& slot = p.slots.at(index);
+ auto& p = *impl_;
+ std::lock_guard lock(p.mutex);
+ p.check();
+ auto& slot = p.slots.at(index);
  if (!p.active || slot.armed || p.admitted == p.expected) throw std::logic_error("invalid gradient contribution admission");
- slot.armed = true; ++p.admitted;
+ slot.armed = true;
+ ++p.admitted;
  std::fill(slot.closed.begin(), slot.closed.end(), false);
  for (std::size_t b = 0; b < p.buckets.size(); ++b) slot.remaining[b] = p.buckets[b].parameters.size();
 }
 void TrainingGradientReducer::collect(std::size_t index) {
- auto& p = *impl_; std::lock_guard lock(p.mutex); p.check(); auto& slot = p.slots.at(index);
+ auto& p = *impl_;
+ std::lock_guard lock(p.mutex);
+ p.check();
+ auto& slot = p.slots.at(index);
  if (!slot.armed) throw std::logic_error("gradient graph returned without an armed contribution");
  for (std::size_t b = 0; b < p.buckets.size(); ++b) p.close(slot, b);
- slot.armed = false; ++p.finished;
+ slot.armed = false;
+ ++p.finished;
 }
 void TrainingGradientReducer::contribute_empty() {
- auto& p = *impl_; std::lock_guard lock(p.mutex); p.check();
+ auto& p = *impl_;
+ std::lock_guard lock(p.mutex);
+ p.check();
  if (!p.active || p.admitted == p.expected) throw std::logic_error("invalid empty gradient contribution");
- ++p.admitted; ++p.finished;
+ ++p.admitted;
+ ++p.finished;
  tc::TorchCudaStreamGuard guard(p.accumulation);
- for (auto& bucket : p.buckets) if (++bucket.closed == p.expected) bucket.ready.record(p.accumulation);
+ for (auto& bucket : p.buckets)
+  if (++bucket.closed == p.expected) bucket.ready.record(p.accumulation);
  p.launch_ready();
 }
 void TrainingGradientReducer::enable_gradient_launch_after_counts() {
- auto& p = *impl_; std::lock_guard lock(p.mutex); p.check();
+ auto& p = *impl_;
+ std::lock_guard lock(p.mutex);
+ p.check();
  if (!p.active) throw std::logic_error("gradient launch outside attempt");
- p.counts_submitted = true; p.launch_ready();
+ p.counts_submitted = true;
+ p.launch_ready();
 }
 void TrainingGradientReducer::finish_attempt() {
- auto& p = *impl_; std::lock_guard lock(p.mutex); p.check();
+ auto& p = *impl_;
+ std::lock_guard lock(p.mutex);
+ p.check();
  if (!p.active || p.finished != p.expected || p.next_bucket != p.buckets.size()) throw std::logic_error("incomplete gradient attempt");
  const auto optimizer_stream = tc::getCurrentCUDAStream(tc::checked_device_index(p.device));
  {
@@ -257,16 +314,28 @@ void TrainingGradientReducer::finish_attempt() {
   // One physical boundary settles every gradient bucket and the usage readback.
   p.work->settle();
   const auto* used = p.host_usage.const_data_ptr<std::int32_t>();
-  for (std::size_t i = 0; i < p.parameters.size(); ++i) if (used[i]) p.parameters[i].master.mutable_grad() = p.parameters[i].view;
-  p.completed.record(p.launch); p.completed.block(optimizer_stream);
+  for (std::size_t i = 0; i < p.parameters.size(); ++i)
+   if (used[i]) p.parameters[i].master.mutable_grad() = p.parameters[i].view;
+  p.completed.record(p.launch);
+  p.completed.block(optimizer_stream);
  }
  p.active = false;
 }
 void TrainingGradientReducer::abort(std::exception_ptr error) noexcept {
  auto& p = *impl_;
- { std::lock_guard lock(p.mutex); if (p.failure) return; p.failure = error; }
+ {
+  std::lock_guard lock(p.mutex);
+  if (p.failure) return;
+  p.failure = error;
+ }
  distributed_abort(p.distributed);
 }
-std::size_t TrainingGradientReducer::launched_buckets() const { std::lock_guard lock(impl_->mutex); return impl_->next_bucket; }
-std::size_t TrainingGradientReducer::bucket_count() const { std::lock_guard lock(impl_->mutex); return impl_->buckets.size(); }
+std::size_t TrainingGradientReducer::launched_buckets() const {
+ std::lock_guard lock(impl_->mutex);
+ return impl_->next_bucket;
 }
+std::size_t TrainingGradientReducer::bucket_count() const {
+ std::lock_guard lock(impl_->mutex);
+ return impl_->buckets.size();
+}
+}  // namespace mmltk::backend::models::rfdetr

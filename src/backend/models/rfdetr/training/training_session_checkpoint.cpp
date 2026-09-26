@@ -25,12 +25,13 @@ io::ScopedFd lock(const std::filesystem::path& path, int operation) {
  if (file.get() < 0 || ::flock(file.get(), operation) != 0) throw std::runtime_error("training generation lease is unavailable");
  return file;
 }
-void cancel(std::stop_token stop) { if (stop.stop_requested()) throw ArtifactPublicationCancelled{}; }
-detail::TrainingContinuation admit_model(const DecodedNativeModelState& model, const std::filesystem::path& file,
- const TrainingSessionManifest& manifest, const TrainingPlanState& plan, std::size_t index, std::stop_token stop = {}) {
+void cancel(std::stop_token stop) {
+ if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+}
+detail::TrainingContinuation admit_model(
+ const DecodedNativeModelState& model, const std::filesystem::path& file, const TrainingSessionManifest& manifest, const TrainingPlanState& plan, std::size_t index, std::stop_token stop = {}) {
  const auto& entry = manifest.models[index];
- if (index >= plan.shards.size() || entry.model_id != plan.shards[index].model_id || !model.admitted_archive())
-  throw std::runtime_error("missing or mixed training generation");
+ if (index >= plan.shards.size() || entry.model_id != plan.shards[index].model_id || !model.admitted_archive()) throw std::runtime_error("missing or mixed training generation");
  auto continuation = detail::read_training_continuation(*model.admitted_archive());
  if (!continuation || continuation->values.training_attempt_id != manifest.attempt_id || continuation->values.data.model_id != entry.model_id ||
      continuation->values.data.plan_hash != plan.plan_hash || continuation->values.data.epoch != manifest.epoch)
@@ -51,11 +52,9 @@ detail::TrainingContinuation admit_model(const DecodedNativeModelState& model, c
  (void)detail::inspect_training_model_checkpoint(model, file, stop);
  return std::move(*continuation);
 }
-std::vector<std::shared_ptr<const TrainingArtifactAdmission>> admit_best_candidates(const TrainingSessionManifest& manifest,
- const NativeCheckpointMetadata& semantics, std::span<const std::shared_ptr<const TrainingArtifactAdmission>> retained = {},
- std::span<const std::shared_ptr<const TrainingArtifactAdmission>> supplied = {}, std::stop_token stop = {}) {
- if (manifest.models.size() > kMaximumTrainingModels || supplied.size() > kMaximumTrainingModels)
-  throw std::invalid_argument("session candidate capacity exceeded");
+std::vector<std::shared_ptr<const TrainingArtifactAdmission>> admit_best_candidates(const TrainingSessionManifest& manifest, const NativeCheckpointMetadata& semantics,
+ std::span<const std::shared_ptr<const TrainingArtifactAdmission>> retained = {}, std::span<const std::shared_ptr<const TrainingArtifactAdmission>> supplied = {}, std::stop_token stop = {}) {
+ if (manifest.models.size() > kMaximumTrainingModels || supplied.size() > kMaximumTrainingModels) throw std::invalid_argument("session candidate capacity exceeded");
  std::vector<std::shared_ptr<const TrainingArtifactAdmission>> result;
  result.reserve(manifest.models.size());
  std::unordered_map<std::filesystem::path, const TrainingArtifact*> logical;
@@ -68,7 +67,9 @@ std::vector<std::shared_ptr<const TrainingArtifactAdmission>> admit_best_candida
   const auto [found, inserted] = logical.emplace(path, &best);
   if (!inserted) {
    auto identified = best;
-   identified.model_id = found->second->model_id; identified.attempt = found->second->attempt; identified.path = found->second->path;
+   identified.model_id = found->second->model_id;
+   identified.attempt = found->second->attempt;
+   identified.path = found->second->path;
    if (identified != *found->second) throw std::runtime_error("shared session candidate identities differ");
    continue;
   }
@@ -76,8 +77,10 @@ std::vector<std::shared_ptr<const TrainingArtifactAdmission>> admit_best_candida
   std::shared_ptr<const TrainingArtifactAdmission> admission;
   const auto previous = std::ranges::find_if(retained, matches_path);
   const auto provided = std::ranges::find_if(supplied, matches_path);
-  if (previous != retained.end()) admission = *previous;
-  else if (provided != supplied.end()) admission = *provided;
+  if (previous != retained.end())
+   admission = *previous;
+  else if (provided != supplied.end())
+   admission = *provided;
   else {
    auto fresh = std::make_shared<TrainingArtifactAdmission>(best, stop);
    fresh->release_decoded_state();
@@ -89,7 +92,7 @@ std::vector<std::shared_ptr<const TrainingArtifactAdmission>> admit_best_candida
  }
  return result;
 }
-}
+}  // namespace
 bool is_training_session_manifest(const std::filesystem::path& path) { return path.extension() == ".json"; }
 struct TrainingSessionAdmission::Lease final {
  explicit Lease(const std::filesystem::path& path) : selected(path), snapshot(io::FileSnapshot::Read(path)) {
@@ -97,7 +100,10 @@ struct TrainingSessionAdmission::Lease final {
   for (unsigned slot = 0; slot < 16; ++slot) {
    io::ScopedFd candidate(::open((directory / (".session.reader-" + std::to_string(slot))).c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600));
    if (candidate.get() < 0) throw std::runtime_error("training session reader lease is unavailable");
-   if (::flock(candidate.get(), LOCK_EX | LOCK_NB) == 0) { reader = std::move(candidate); break; }
+   if (::flock(candidate.get(), LOCK_EX | LOCK_NB) == 0) {
+    reader = std::move(candidate);
+    break;
+   }
    if (errno != EWOULDBLOCK && errno != EAGAIN) throw std::runtime_error("training session reader lease failed");
   }
   if (reader.get() < 0) throw std::runtime_error("training session reader capacity exhausted");
@@ -122,7 +128,8 @@ TrainingSessionAdmission::TrainingSessionAdmission(const std::filesystem::path& 
  const auto plan_file = io::MappedFile::open_readonly(plan_path.string());
  constexpr auto plan_bound = serial::reflected_maximum_cbor_bytes<TrainingPlanState>();
  if (plan_file.size() > plan_bound) throw std::runtime_error("session data plan exceeds schema");
- auto decoded = serial::decode<TrainingPlanState>({std::span(reinterpret_cast<const std::byte*>(plan_file.data()), plan_file.size()), {}}, {.max_bytes = plan_bound, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32});
+ auto decoded = serial::decode<TrainingPlanState>(
+  {std::span(reinterpret_cast<const std::byte*>(plan_file.data()), plan_file.size()), {}}, {.max_bytes = plan_bound, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32});
  if (!decoded || !decoded->plan_hash || decoded->shards.size() != manifest_.models.size()) throw std::runtime_error("invalid session data plan");
  plan_ = std::make_shared<const TrainingPlanState>(std::move(*decoded));
  for (std::size_t index = 0; index < manifest_.models.size(); ++index) {
@@ -134,7 +141,8 @@ TrainingSessionAdmission::TrainingSessionAdmission(const std::filesystem::path& 
   auto continuation = admit_model(model, file, manifest_, *plan_, index, stop);
   if (index && !same_native_model_semantics(model.metadata, models_.front().metadata)) throw std::runtime_error("session model semantics differ");
   lease_->evidence.push_back(model.class_artifact);
-  models_.push_back(std::move(model)); continuations_.push_back(std::move(continuation));
+  models_.push_back(std::move(model));
+  continuations_.push_back(std::move(continuation));
  }
  lease_->candidates = admit_best_candidates(manifest_, models_.front().metadata, {}, {}, stop);
  require_unchanged();
@@ -158,7 +166,9 @@ void TrainingSessionAdmission::require_unchanged() const {
  for (const auto& candidate : lease_->candidates) candidate->require_unchanged();
 }
 void TrainingSessionAdmission::release_decoded_state() {
- models_.clear(); continuations_.clear(); plan_.reset();
+ models_.clear();
+ continuations_.clear();
+ plan_.reset();
 }
 const TrainingPlanState& TrainingSessionAdmission::plan() const {
  if (!plan_) throw std::logic_error("session decoded plan has been released");
@@ -172,11 +182,11 @@ std::shared_ptr<const TrainingArtifactAdmission> TrainingSessionAdmission::best_
  if (found == lease_->candidates.end()) throw std::logic_error("session candidate lacks retained evidence");
  return *found;
 }
-TrainingSessionCheckpoint::TrainingSessionCheckpoint(std::filesystem::path directory)
- : directory_(std::filesystem::absolute(directory).lexically_normal()), path_(directory_ / "session.json") { std::filesystem::create_directories(directory_ / "generations"); }
-void TrainingSessionCheckpoint::publish(TrainingSessionManifest& value, const TrainingPlanState& plan,
- std::function_ref<void(const std::filesystem::path&, std::size_t)> serialize, std::span<const std::shared_ptr<const TrainingArtifactAdmission>> candidates,
- std::function_ref<void(TrainingPublicationStep)> observe) {
+TrainingSessionCheckpoint::TrainingSessionCheckpoint(std::filesystem::path directory) : directory_(std::filesystem::absolute(directory).lexically_normal()), path_(directory_ / "session.json") {
+ std::filesystem::create_directories(directory_ / "generations");
+}
+void TrainingSessionCheckpoint::publish(TrainingSessionManifest& value, const TrainingPlanState& plan, std::function_ref<void(const std::filesystem::path&, std::size_t)> serialize,
+ std::span<const std::shared_ptr<const TrainingArtifactAdmission>> candidates, std::function_ref<void(TrainingPublicationStep)> observe) {
  if (value.models.empty() || value.models.size() > kMaximumTrainingModels) throw std::invalid_argument("invalid session model count");
  const auto writer = lock(directory_ / ".session.writer", LOCK_EX | LOCK_NB);
  TrainingSessionManifest next = value;
@@ -185,7 +195,10 @@ void TrainingSessionCheckpoint::publish(TrainingSessionManifest& value, const Tr
   current = read_training_manifest(path_);
   next.previous_generation = current.generation;
  }
- { const auto pointer_lock = lock(directory_ / ".session.lock", LOCK_EX); retire(current); }
+ {
+  const auto pointer_lock = lock(directory_ / ".session.lock", LOCK_EX);
+  retire(current);
+ }
  next.generation = training_artifact_identity();
  const auto staging = directory_ / "generations" / next.generation;
  if (!std::filesystem::create_directory(staging)) throw std::runtime_error("training generation identity already exists");
@@ -197,7 +210,8 @@ void TrainingSessionCheckpoint::publish(TrainingSessionManifest& value, const Tr
   constexpr auto bound = serial::reflected_maximum_cbor_bytes<TrainingPlanState>();
   if (!serial::encode(plan, bytes, {.max_bytes = bound, .max_items = std::numeric_limits<std::uint64_t>::max(), .max_depth = 32})) throw std::runtime_error("invalid immutable training plan");
   auto plan_file = io::FileHandle::create_output((staging / "plan.cbor").string(), bytes.size());
-  plan_file.pwrite_all(bytes.data(), bytes.size(), 0); plan_file.sync_data();
+  plan_file.pwrite_all(bytes.data(), bytes.size(), 0);
+  plan_file.sync_data();
   const auto plan_identity = io::FileSnapshot::Read(staging / "plan.cbor");
   next.plan_sha256 = io::sha256_hex(io::sha256_file(staging / "plan.cbor"));
   observe(TrainingPublicationStep::PlanWritten);
@@ -242,8 +256,15 @@ void TrainingSessionCheckpoint::publish(TrainingSessionManifest& value, const Tr
   retire(next);
   observe(TrainingPublicationStep::Retained);
  } catch (...) {
-  if (!committed) { std::error_code ignored; std::filesystem::remove_all(staging, ignored); }
-  else { try { const auto pointer_lock = lock(directory_ / ".session.lock", LOCK_EX); retire(value); } catch (...) {} }
+  if (!committed) {
+   std::error_code ignored;
+   std::filesystem::remove_all(staging, ignored);
+  } else {
+   try {
+    const auto pointer_lock = lock(directory_ / ".session.lock", LOCK_EX);
+    retire(value);
+   } catch (...) {}
+  }
   throw;
  }
 }

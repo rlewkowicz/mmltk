@@ -2532,19 +2532,27 @@ TEST_CASE("Dataset component audit rejects source and lifecycle presentation sub
   CHECK(audit.compile_tracks.empty());
  }
 }
-TEST_CASE("Dataset terminal captions require a complete final draw after their reveal", "[workspace][audit]") {
+TEST_CASE("Dataset terminal presentation requires complete captions and collapsed failure rows", "[workspace][audit]") {
  for (const bool complete : {false, true}) {
   BrowserAudit audit;
   const auto draw = [&](std::string_view caption, double height) {
    audit.consume({{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.area"}, {"detail", caption}, {"a", 10}, {"b", 10}, {"c", 200}, {"d", height}});
-   audit.consume({{"event", "integration.dataset_frame"}, {"a", 206U}});
+   audit.consume({{"event", "integration.dataset_frame"}, {"a", 207U}});
   };
-  draw("Failed", 15.6);
+  draw("Completed", 15.6);
   CHECK(audit.dataset_presentation_valid);
   CHECK_FALSE(audit.dataset_fixture_caption_frame);
-  if (complete) draw("Failed\nLocal fixture publication failed", 37.2);
-  audit.consume({{"event", "integration.dataset_fixture"}, {"a", 6U}, {"b", 206U}, {"c", 4U}, {"d", 1U}});
+  if (complete) draw("Completed\nLocal fixture output", 37.2);
+  audit.consume({{"event", "integration.dataset_fixture"}, {"a", 7U}, {"b", 207U}, {"c", 4U}, {"d", 1U}});
   CHECK(audit.dataset_presentation_valid == complete);
+ }
+ for (const std::string defect : {"none", "retained-text", "retained-space"}) {
+  BrowserAudit audit;
+  audit.consume({{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.area"}, {"detail", defect == "retained-text" ? "Failed" : ""},
+   {"a", 10}, {"b", 10}, {"c", 200}, {"d", defect == "retained-space" ? 15.6 : 0.0}});
+  audit.consume({{"event", "integration.dataset_frame"}, {"a", 206U}});
+  audit.consume({{"event", "integration.dataset_fixture"}, {"a", 6U}, {"b", 206U}, {"c", 4U}, {"d", 1U}});
+  CHECK(audit.dataset_presentation_valid == (defect == "none"));
  }
 }
 TEST_CASE("Dataset divider pixel audit requires both geometry and matching color evidence", "[workspace][audit]") {
@@ -2568,7 +2576,7 @@ TEST_CASE("Dataset presentation requires complete scoped custody evidence", "[wo
     const auto key = base + stage;
     audit.dataset_fixture_cases.insert(key);
     audit.dataset_fixture_pixels.insert(key);
-    audit.dataset_fixture_heights[key] = stage < 5U ? 100.0 : 20.0;
+    audit.dataset_fixture_heights[key] = stage < 5U ? 100.0 : stage == 6U ? 0.0 : 20.0;
     for (const auto* id : {"train.dataset.benchmark_divider", "train.dataset.dimensions_divider"}) audit.dataset_divider_pixels.emplace(key, id);
    }
    audit.dataset_fixture_frames[base + 5U] = {100.0, 60.0, 20.0};
@@ -2798,19 +2806,19 @@ TEST_CASE("workflow GPU evidence requires ordered cards and selected native runs
  }
  CHECK_FALSE(audit.workflow_gpus_complete());
 }
-
 TEST_CASE("training source pixels require stable identity and original observations after coalescing and reconnect", "[workspace][audit][training]") {
  mmltk::acceptance::wayland::BrowserAudit audit;
- const std::array<std::array<unsigned, 4>, 10> stages{{{0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12},
-  {4, 1, 6, 4}, {5, 2, 6, 5}, {6, 2, 12, 11}, {7, 2, 12, 11}, {8, 0, 12, 12}, {9, 0, 103, 12}}};
- const std::array<std::array<unsigned, 4>, 10> runs{{{0, 0, 0, 0}, {1, 0, 0, 0}, {2, 0, 0, 0}, {3, 0, 0, 0},
-  {4, 1, 51, 100}, {5, 1, 51, 100}, {6, 1, 51, 200}, {7, 1, 52, 200}, {8, 1, 52, 200}, {9, 0, 0, 0}}};
+ const std::array<std::array<unsigned, 4>, 10> stages{
+  {{0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12}, {4, 1, 6, 4}, {5, 2, 6, 5}, {6, 2, 12, 11}, {7, 2, 12, 11}, {8, 0, 12, 12}, {9, 0, 103, 12}}};
+ const std::array<std::array<unsigned, 4>, 10> runs{
+  {{0, 0, 0, 0}, {1, 0, 0, 0}, {2, 0, 0, 0}, {3, 0, 0, 0}, {4, 1, 51, 100}, {5, 1, 51, 100}, {6, 1, 51, 200}, {7, 1, 52, 200}, {8, 1, 52, 200}, {9, 0, 0, 0}}};
  CHECK_FALSE(audit.training_sources_complete());
- for (const auto& values : stages) audit.consume({{"event", "integration.training_sources"}, {"control", "train.metrics.plot"}, {"detail", "retained-pixels"},
-  {"a", values[0]}, {"b", values[1]}, {"c", values[2]}, {"d", values[3]}});
+ for (const auto& values : stages)
+  audit.consume({{"event", "integration.training_sources"}, {"control", "train.metrics.plot"}, {"detail", "retained-pixels"}, {"a", values[0]}, {"b", values[1]}, {"c", values[2]}, {"d", values[3]}});
  CHECK_FALSE(audit.training_sources_complete());
- for (const auto& values : runs) audit.consume({{"event", "integration.training_source_run"}, {"control", "train.metrics.plot"}, {"detail", "retained-pixels"},
-  {"a", values[0]}, {"b", values[1]}, {"c", values[2]}, {"d", values[3]}});
+ for (const auto& values : runs)
+  audit.consume(
+   {{"event", "integration.training_source_run"}, {"control", "train.metrics.plot"}, {"detail", "retained-pixels"}, {"a", values[0]}, {"b", values[1]}, {"c", values[2]}, {"d", values[3]}});
  REQUIRE(audit.training_sources_complete());
  SECTION("saved source switch cannot change opened generation") { audit.training_source_runs[5][2] = 0; }
  SECTION("later page preserves nondefault source") { audit.training_sources[6][1] = 1; }

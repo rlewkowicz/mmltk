@@ -12,10 +12,15 @@
 namespace mmltk::backend::data {
 class DatasetLoader;
 struct DatasetIndexSchedule;
-}
+}  // namespace mmltk::backend::data
 namespace mmltk::backend::models::rfdetr {
-struct TrainingImageClasses final { std::vector<std::uint32_t> classes; };
-struct TrainingRankSlice final { std::uint64_t begin = 0; std::uint64_t count = 0; };
+struct TrainingImageClasses final {
+ std::vector<std::uint32_t> classes;
+};
+struct TrainingRankSlice final {
+ std::uint64_t begin = 0;
+ std::uint64_t count = 0;
+};
 struct TrainingEpochDraws final {
  std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule> schedule;
  std::vector<std::uint64_t> repeated_exposure;
@@ -40,6 +45,7 @@ public:
  [[nodiscard]] static TrainingRankSlice rank_slice(std::uint64_t batch, std::uint32_t rank, std::uint32_t world);
  [[nodiscard]] std::uint64_t hash() const noexcept { return hash_; }
  [[nodiscard]] std::uint64_t microbatch_images() const noexcept { return batch_; }
+
 private:
  std::vector<TrainingImageClasses> membership_;
  std::vector<std::uint64_t> support_;
@@ -55,10 +61,12 @@ public:
  TrainingDonorHistory(std::size_t streams, std::size_t global_batch);
  // The planned span stays valid until the next plan/admit on this owner.
  [[nodiscard]] std::span<const TrainingDonorDescriptor> plan(std::size_t stream, std::span<const std::uint64_t> image_keys, std::span<const std::uint32_t> images);
- [[nodiscard]] std::span<const TrainingDonorDescriptor> admit(const mmltk::backend::data::DatasetLoader&, std::size_t stream, std::span<const std::uint64_t> keys, std::span<const std::uint32_t> images, const GpuAugmentationConfig&);
+ [[nodiscard]] std::span<const TrainingDonorDescriptor> admit(
+  const mmltk::backend::data::DatasetLoader&, std::size_t stream, std::span<const std::uint64_t> keys, std::span<const std::uint32_t> images, const GpuAugmentationConfig&);
  void replace(std::size_t stream, std::span<const TrainingDonorDescriptor>);
  void restore(const mmltk::backend::data::DatasetLoader&, std::span<const TrainingDonorDescriptor>);
  [[nodiscard]] const std::vector<TrainingDonorDescriptor>& state() const noexcept { return slots_; }
+
 private:
  std::size_t batch_;
  std::vector<TrainingDonorDescriptor> slots_;
@@ -67,4 +75,4 @@ private:
  std::vector<GpuAugmentationDonor> metadata_;
  CachedAugmentationDonorIndex index_;
 };
-}
+}  // namespace mmltk::backend::models::rfdetr

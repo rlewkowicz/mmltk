@@ -81,7 +81,8 @@ impl App {
                 return self.handle_settings_schedule(schedule);
             }
             crate::view::explore::Outcome::OpenRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::ExploreOpen);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::ExploreOpen);
                 let local_edits = self.settings.has_local_edits();
                 let open_available = self.model.explore_open_available();
                 if let Some(integration) = self.integration.as_mut() {
@@ -90,23 +91,33 @@ impl App {
                     });
                 }
                 if local_edits || !open_available {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::ExploreOpen, UiError::busy(
-                        "Explore is unavailable or already changing state.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::ExploreOpen,
+                        UiError::busy("Explore is unavailable or already changing state."),
+                    );
                     return Task::none();
                 }
                 if self.settings_unsettled() {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::ExploreOpen, UiError::busy("Wait for Explore settings to finish saving."));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::ExploreOpen,
+                        UiError::busy("Wait for Explore settings to finish saving."),
+                    );
                     return Task::none();
                 }
                 let Some(settings) = self.model.settings_snapshot.as_ref() else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::ExploreOpen, UiError::invalid("Explore settings are not installed yet."));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::ExploreOpen,
+                        UiError::invalid("Explore settings are not installed yet."),
+                    );
                     return Task::none();
                 };
                 if !settings.exploresource.available {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::ExploreOpen, UiError::invalid(
-                        "The selected Explore dataset has no compiled artifact path.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::ExploreOpen,
+                        UiError::invalid(
+                            "The selected Explore dataset has no compiled artifact path.",
+                        ),
+                    );
                     return Task::none();
                 }
                 if let Some(integration) = self.integration.as_mut() {
@@ -130,7 +141,8 @@ impl App {
                 self.dispatch_explore_desired();
             }
             crate::view::explore::Outcome::StopRequested => {
-                self.model.begin_admission(ApplicationIntentEndpoint::ExploreStop);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::ExploreStop);
                 if self.model.explore_stop_available() {
                     self.workspace.explore_clear_viewport_admission();
                     self.submit_intent(
@@ -138,9 +150,10 @@ impl App {
                         crate::generated::encode_explore_Stop,
                     );
                 } else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::ExploreStop, UiError::busy(
-                        "Explore is not running or is already stopping.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::ExploreStop,
+                        UiError::busy("Explore is not running or is already stopping."),
+                    );
                 }
             }
             crate::view::explore::Outcome::DialogRequested(field_id) => {
@@ -152,17 +165,20 @@ impl App {
                 }
             }
             crate::view::explore::Outcome::UpscaleRequested(kernel) => {
-                self.model.begin_admission(ApplicationIntentEndpoint::UpscaleStart);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::UpscaleStart);
                 if !self.model.upscale_start_available() {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::UpscaleStart, UiError::busy(
-                        "The selected Explore detail is unavailable for upscaling.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::UpscaleStart,
+                        UiError::busy("The selected Explore detail is unavailable for upscaling."),
+                    );
                     return Task::none();
                 }
                 let Some(request) = self.model.viewer_upscale_request(kernel) else {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::UpscaleStart, UiError::presentation(
-                        "Explore selected detail is unavailable.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::UpscaleStart,
+                        UiError::presentation("Explore selected detail is unavailable."),
+                    );
                     return Task::none();
                 };
                 if let Some(integration) = self.integration.as_mut() {
@@ -176,7 +192,8 @@ impl App {
                 self.dispatch_explore_desired();
             }
             crate::view::explore::Outcome::FilterEdited(request) => {
-                self.model.begin_admission(ApplicationIntentEndpoint::ExploreUpdateFilter);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::ExploreUpdateFilter);
                 let local_edits = self.settings.has_local_edits();
                 let mutation_available = self.model.explore_mutation_available();
                 if let Some(integration) = self.integration.as_mut() {
@@ -190,9 +207,10 @@ impl App {
                     });
                 }
                 if local_edits || !mutation_available {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::ExploreUpdateFilter, UiError::busy(
-                        "Explore filters are unavailable or already changing.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::ExploreUpdateFilter,
+                        UiError::busy("Explore filters are unavailable or already changing."),
+                    );
                     return Task::none();
                 }
                 self.workspace.explore_record_submission(request.clone());
@@ -204,13 +222,15 @@ impl App {
                 self.dispatch_explore_desired();
             }
             crate::view::explore::Outcome::AugmentationUpdated(request) => {
-                self.model.begin_admission(ApplicationIntentEndpoint::ExploreUpdateAugmentation);
+                self.model
+                    .begin_admission(ApplicationIntentEndpoint::ExploreUpdateAugmentation);
                 if self.settings.has_local_edits()
                     || !self.model.explore_augmentation_update_available()
                 {
-                    self.model.report_admission_error(ApplicationIntentEndpoint::ExploreUpdateAugmentation, UiError::busy(
-                        "Explore augmentation preview is already changing.",
-                    ));
+                    self.model.report_admission_error(
+                        ApplicationIntentEndpoint::ExploreUpdateAugmentation,
+                        UiError::busy("Explore augmentation preview is already changing."),
+                    );
                     return Task::none();
                 }
                 self.model.set_foreground_feature(FeatureId::Explore);

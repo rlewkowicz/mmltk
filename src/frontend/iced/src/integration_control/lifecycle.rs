@@ -757,7 +757,9 @@ impl State {
             }
             Phase::AwaitStatusNotice if !model.notices.is_empty() => {
                 let Some(id) = super::status::expected_initial(model, self.status_fixture) else {
-                    driver.fail("Status initial notice did not match its exact expected source and detail");
+                    driver.fail(
+                        "Status initial notice did not match its exact expected source and detail",
+                    );
                     return Task::none();
                 };
                 self.status_notice = id.0;
@@ -768,9 +770,18 @@ impl State {
             Phase::StatusPanel => widgets.arm(driver, STATUS_PANEL),
             Phase::StatusCopy => widgets.arm(driver, format!("status.{}.copy", self.status_notice)),
             Phase::AwaitStatusCopy | Phase::AwaitStatusClipboard => Task::none(),
-            Phase::StatusDismiss => widgets.arm(driver, format!("status.{}.dismiss", self.status_notice)),
+            Phase::StatusDismiss => {
+                widgets.arm(driver, format!("status.{}.dismiss", self.status_notice))
+            }
             Phase::AwaitStatusDismissed if model.notices.is_empty() => {
-                reporting::emit(|sink| sink.record("integration.status.notice", STATUS_PANEL, "removed", [self.status_notice as f64, 0.0, 0.0, 0.0]));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.status.notice",
+                        STATUS_PANEL,
+                        "removed",
+                        [self.status_notice as f64, 0.0, 0.0, 0.0],
+                    )
+                });
                 reporting::emit(|sink| {
                     sink.record(
                         "integration.status",
@@ -779,8 +790,12 @@ impl State {
                         [1.0, 1.0, 1.0, 0.0],
                     )
                 });
-                if !self.status_fixture { self.status_fixture = true; driver.phase = Phase::StatusFixtureBegin; }
-                else { driver.phase = Phase::StatusFixtureEnd; }
+                if !self.status_fixture {
+                    self.status_fixture = true;
+                    driver.phase = Phase::StatusFixtureBegin;
+                } else {
+                    driver.phase = Phase::StatusFixtureEnd;
+                }
                 Task::done(RootMessage::Integration(super::Message::Advance))
             }
             Phase::TrainCard => widgets.arm_scrolled(driver, TRAIN_CARD, RelativeOffset::START),
@@ -1899,7 +1914,7 @@ impl State {
                 None
             }
             Phase::AdvancedLayout(index) => {
-                driver.phase = if index < 17 {
+                driver.phase = if index < 19 {
                     Phase::AdvancedLayout(index + 1)
                 } else {
                     Phase::TriggerError
@@ -1908,11 +1923,17 @@ impl State {
             }
             Phase::StatusTrigger => {
                 driver.phase = Phase::StatusPanel;
-                if !click(input_bounds) { driver.fail("Status trigger click failed"); }
+                if !click(input_bounds) {
+                    driver.fail("Status trigger click failed");
+                }
                 None
             }
             Phase::StatusPanel => {
-                driver.phase = if self.status_fixture { Phase::StatusExercise } else { Phase::StatusCopy };
+                driver.phase = if self.status_fixture {
+                    Phase::StatusExercise(0)
+                } else {
+                    Phase::StatusCopy
+                };
                 None
             }
             Phase::StatusCopy => {
@@ -2117,7 +2138,12 @@ pub(super) fn advanced_layout_field(index: usize) -> (String, String) {
             match_free_field_id(index - 11),
             format!("match-free-{}", index - 11),
         ),
-        _ => (denoising_field_id(index - 14), format!("dn-{}", index - 14)),
+        14..=17 => (denoising_field_id(index - 14), format!("dn-{}", index - 14)),
+        18..=19 => (
+            format!("Train.{}.effective_batch", index == 19),
+            format!("effective-{}", index - 18),
+        ),
+        _ => unreachable!("Advanced layout has twenty measured controls"),
     }
 }
 
@@ -2181,7 +2207,9 @@ pub(super) fn advanced_control_value(
         if index == 2 {
             f64::from(draft.workflows.train.request.epochs)
         } else {
-            crate::generated::effective_trainrecipesettings_lr(&draft.workflows.train.request.recipe)
+            crate::generated::effective_trainrecipesettings_lr(
+                &draft.workflows.train.request.recipe,
+            )
         }
     })
 }
@@ -2217,8 +2245,9 @@ pub(super) fn numeric_edit_target(
         };
         (current.to_string(), f64::from(target), target.to_string())
     } else {
-        let current =
-            crate::generated::effective_trainrecipesettings_lr(&draft.workflows.train.request.recipe);
+        let current = crate::generated::effective_trainrecipesettings_lr(
+            &draft.workflows.train.request.recipe,
+        );
         let constraint = crate::generated::constraint_workflowstrainrequestrecipelr();
         let minimum = constraint.minimum.unwrap_or(f64::MIN);
         let maximum = constraint.maximum.unwrap_or(f64::MAX);
@@ -2307,8 +2336,6 @@ pub(super) const SETTINGS_RESET: &str = "settings.reset";
 pub(super) const SETTINGS_CLOSE: &str = "settings.close";
 
 pub(super) const STATUS_PANEL: &str = crate::view::status::PANEL_ID;
-
-
 
 #[cfg(test)]
 mod tests {

@@ -37,9 +37,9 @@ const AUDIT_REGIONS: [Region; 9] = [
     Region::Center,
     Region::Workspace,
     Region::Advanced,
-    Region::Diagnostics,
     Region::PrimaryProgress,
     Region::PrimaryAction,
+    Region::Diagnostics,
     Region::PrimaryCard,
     Region::OutputCard,
 ];
@@ -91,16 +91,10 @@ impl Composition {
     }
 
     pub fn audit_regions(self) -> &'static [Region] {
-        if matches!(
-            self.page,
-            crate::generated::FeatureId::Train
-                | crate::generated::FeatureId::Validate
-                | crate::generated::FeatureId::Predict
-                | crate::generated::FeatureId::Export
-        ) {
-            &AUDIT_REGIONS
-        } else {
-            &AUDIT_REGIONS[..8]
+        match self.page {
+            crate::generated::FeatureId::Live => &AUDIT_REGIONS[..6],
+            crate::generated::FeatureId::Annotate => &AUDIT_REGIONS[..7],
+            _ => &AUDIT_REGIONS,
         }
     }
 
@@ -143,7 +137,6 @@ impl Composition {
                 crate::generated::FeatureId::Export => "export.primary",
                 crate::generated::FeatureId::Explore => "explore.open",
             },
-
         }
     }
 
@@ -187,8 +180,14 @@ impl<'a, Message: 'a> Regions<'a, Message> {
         output: Element<'a, Message>,
         gpu_message: impl Fn(gpu::Message) -> Message + 'a,
     ) -> Self {
-        let mut cards = iced::widget::column![output, gpu::view(self.page, model, settings).map(gpu_message)].spacing(SECTION_SPACING);
-        if let Some(tools) = self.diagnostics.take() { cards = cards.push(tools); }
+        let mut cards = iced::widget::column![
+            output,
+            gpu::view(self.page, model, settings).map(gpu_message)
+        ]
+        .spacing(SECTION_SPACING);
+        if let Some(tools) = self.diagnostics.take() {
+            cards = cards.push(tools);
+        }
         self.diagnostics = Some(cards.into());
         self
     }
@@ -291,7 +290,13 @@ pub fn view<'a, Message: 'a>(
 
     let mut setup = Some(sidebar(Region::Setup, setup, layout.setup_width));
     let mut center = Some(center);
-    let mut diagnostics = regions.diagnostics.map(|content| sidebar(Region::Diagnostics, iced::widget::keyed_column([(regions.page, content)]), layout.diagnostics_width));
+    let mut diagnostics = regions.diagnostics.map(|content| {
+        sidebar(
+            Region::Diagnostics,
+            iced::widget::keyed_column([(regions.page, content)]),
+            layout.diagnostics_width,
+        )
+    });
     composition
         .shell_regions()
         .iter()
@@ -304,7 +309,11 @@ pub fn view<'a, Message: 'a>(
                 Region::Setup => row.push(setup.take().expect("one setup region")),
                 Region::Center => row.push(center.take().expect("one center region")),
                 Region::Diagnostics => {
-                    if let Some(content) = diagnostics.take() { row.push(content) } else { row }
+                    if let Some(content) = diagnostics.take() {
+                        row.push(content)
+                    } else {
+                        row
+                    }
                 }
                 _ => unreachable!("workflow shell contains only shell regions"),
             },
@@ -317,6 +326,28 @@ pub use primary_action::view as primary_action;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyed_regions_reconcile_empty_and_nested_widget_state() {
+        let mut tree = iced::advanced::widget::Tree::empty();
+        for count in [0, 2, 1, 0, 3, 0] {
+            let content: Element<'_, ()> = if count == 0 {
+                iced::widget::space().width(10).height(10).into()
+            } else {
+                iced::widget::keyed_column(
+                    (0..count).map(|key| (key, iced::widget::text(format!("Detail {key}")).into())),
+                )
+                .into()
+            };
+            let expected = content.as_widget().tag();
+            let mut region: Element<'_, ()> =
+                iced::widget::keyed_column([(crate::generated::FeatureId::Train, content)]).into();
+            tree.diff(region.as_widget_mut());
+            assert_eq!(tree.children.len(), 1);
+            assert_eq!(tree.children[0].tag, expected);
+            assert_eq!(tree.children[0].children.len(), count);
+        }
+    }
 
     #[test]
     fn ordinary_pages_use_the_reference_column_order_and_widths() {
@@ -349,10 +380,10 @@ mod tests {
                 Region::Center,
                 Region::Workspace,
                 Region::Advanced,
-                Region::Diagnostics,
                 Region::PrimaryProgress,
                 Region::PrimaryAction,
-                            Region::PrimaryCard,
+                Region::Diagnostics,
+                Region::PrimaryCard,
                 Region::OutputCard,
             ]
         );
@@ -377,17 +408,19 @@ mod tests {
             let composition = Composition::new(page, 1200.0);
             assert_eq!(
                 composition.audit_regions().len(),
-                if matches!(
-                    page,
-                    crate::generated::FeatureId::Live | crate::generated::FeatureId::Annotate
-                ) {
-                    8
-                } else {
-                    10
+                match page {
+                    crate::generated::FeatureId::Live => 6,
+                    crate::generated::FeatureId::Annotate => 7,
+                    _ => 9,
                 }
             );
-            assert!(!composition.stable_id(Region::PrimaryAction).is_empty());
-            assert!(!composition.stable_id(Region::PrimaryProgress).is_empty());
+            assert_eq!(
+                composition.audit_regions().contains(&Region::Diagnostics),
+                page != crate::generated::FeatureId::Live
+            );
+            for region in composition.audit_regions() {
+                assert!(!composition.stable_id(*region).is_empty());
+            }
         }
         assert_eq!(
             Composition::new(crate::generated::FeatureId::Annotate, 0.0).next_ordinary_page(),

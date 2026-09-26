@@ -22,4 +22,4 @@ namespace mmltk::backend::models::rfdetr {
  auto identity = torch::full({1}, static_cast<std::int64_t>(key & 0x7fffffffffffffffULL), torch::TensorOptions().dtype(torch::kInt64).device(device));
  return semantic_uniform(identity, count * 2, purpose).reshape({1, count, 2});
 }
-}
+}  // namespace mmltk::backend::models::rfdetr

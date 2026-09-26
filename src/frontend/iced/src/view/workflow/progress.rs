@@ -30,7 +30,9 @@ pub fn compute_presentation(state: Option<&crate::generated::ComputeUiState>) ->
     };
     if !state.active {
         return match state.terminal.outcome {
-            crate::generated::ComputeOperationOutcome::Idle | crate::generated::ComputeOperationOutcome::Failed | crate::generated::ComputeOperationOutcome::Refused => Presentation::Hidden,
+            crate::generated::ComputeOperationOutcome::Idle
+            | crate::generated::ComputeOperationOutcome::Failed
+            | crate::generated::ComputeOperationOutcome::Refused => Presentation::Hidden,
             outcome => Presentation::Terminal {
                 outcome: format!("{outcome:?}"),
                 detail: if state.terminal.detail.is_empty() {
@@ -43,7 +45,11 @@ pub fn compute_presentation(state: Option<&crate::generated::ComputeUiState>) ->
     }
     if state.progress.sequence == 0 || state.progress.status.is_empty() {
         return if state.terminal.detail.is_empty()
-            || matches!(state.terminal.outcome, crate::generated::ComputeOperationOutcome::Failed | crate::generated::ComputeOperationOutcome::Refused) {
+            || matches!(
+                state.terminal.outcome,
+                crate::generated::ComputeOperationOutcome::Failed
+                    | crate::generated::ComputeOperationOutcome::Refused
+            ) {
             Presentation::Active
         } else {
             Presentation::OpenEnded {
@@ -102,7 +108,8 @@ pub fn model_presentation(state: Option<&crate::generated::ModelUiState>) -> Pre
         };
     }
     match state.terminal.outcome {
-        crate::generated::ModelSelectionOutcome::Idle | crate::generated::ModelSelectionOutcome::Rejected => Presentation::Hidden,
+        crate::generated::ModelSelectionOutcome::Idle
+        | crate::generated::ModelSelectionOutcome::Rejected => Presentation::Hidden,
         outcome => Presentation::Terminal {
             outcome: format!("{outcome:?}"),
             detail: state.terminal.detail.clone(),

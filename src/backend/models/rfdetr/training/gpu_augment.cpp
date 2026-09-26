@@ -164,13 +164,15 @@ void GpuBatchAugmenter::materialize_donors(const mmltk::backend::data::DatasetLo
     const bool image_changed = !materialized_donors_[slot].valid || materialized_donors_[slot].image_index != descriptor.image_index;
     if (image_changed) {
      std::memcpy(image, reinterpret_cast<const std::byte*>(source.pixel_blob()) + descriptor.image_index * source.image_stride(), image_values * sizeof(float));
-     ensure_cuda_ok(cudaMemcpyAsync(resources_->donor_images_.data_ptr<float>() + slot * image_values, image, image_values * sizeof(float), cudaMemcpyHostToDevice, stream), "upload logical donor image");
+     ensure_cuda_ok(
+      cudaMemcpyAsync(resources_->donor_images_.data_ptr<float>() + slot * image_values, image, image_values * sizeof(float), cudaMemcpyHostToDevice, stream), "upload logical donor image");
     }
     auto* mask = resources_->donor_masks_cpu_.data_ptr<std::int64_t>() + slot * mask_words_;
     pack_compiled_rle_pairs(donor.support, {mask, static_cast<std::size_t>(mask_words_)});
     auto* box = resources_->donor_boxes_cpu_.data_ptr<float>() + slot * 4;
     std::copy(donor.metadata.box.begin(), donor.metadata.box.end(), box);
-    ensure_cuda_ok(cudaMemcpyAsync(resources_->donor_masks_.data_ptr<std::int64_t>() + slot * mask_words_, mask, mask_words_ * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "upload logical donor support");
+    ensure_cuda_ok(
+     cudaMemcpyAsync(resources_->donor_masks_.data_ptr<std::int64_t>() + slot * mask_words_, mask, mask_words_ * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "upload logical donor support");
     ensure_cuda_ok(cudaMemcpyAsync(resources_->donor_boxes_gpu_.data_ptr<float>() + slot * 4, box, 4 * sizeof(float), cudaMemcpyHostToDevice, stream), "upload logical donor box");
    }
    materialized_donors_[slot] = descriptor;
@@ -186,12 +188,16 @@ void GpuBatchAugmenter::materialize_donors(const mmltk::backend::data::DatasetLo
   throw;
  }
 }
-torch::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence, const mmltk::backend::data::DatasetLoader* source, std::span<const TrainingDonorDescriptor> supplied_donors) {
+torch::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence,
+ const mmltk::backend::data::DatasetLoader* source, std::span<const TrainingDonorDescriptor> supplied_donors) {
  RequireActive();
  require(static_cast<std::int64_t>(batch.num_images) <= batch_capacity_, "GPU augmentation batch exceeds preallocated capacity");
  require(batch.num_images == 0U || (batch.device_images != nullptr && batch.image_indices != nullptr), "GPU augmentation requires loader device images and identities");
  const auto device_index = checked_device_index(device_id_);
  TorchCudaDeviceGuard device_guard(device_index);
+ // A same-device Torch guard can leave a fresh lane thread unbound. Donor
+ // staging must run in the retained context before its first pinned allocation.
+ resources_->context.Bind();
  const cudaStream_t stream = current_torch_cuda_stream_object(device_index).stream();
  logical_donors_ = source != nullptr;
  if (source && executor_->copy_paste_enabled()) {
@@ -233,7 +239,7 @@ torch::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, c
  {
   mmltk::common::logging::ScopedProfile profile_rfdetr_augment_plan{"rfdetr.augment.plan"};
   batch_plan_ = batch.draw_keys.empty() ? executor_->RunTraining(raw_batch, seed, epoch, rank, sequence, donor_metadata_, donors, stream, sequence % 2U)
-                                      : executor_->Run(raw_batch, batch.draw_keys, donor_metadata_, donors, stream, sequence % 2U);
+                                        : executor_->Run(raw_batch, batch.draw_keys, donor_metadata_, donors, stream, sequence % 2U);
  }
  for (auto& image : batch_plan_.images) {
   if (image.paste_donor_slot < 0) continue;

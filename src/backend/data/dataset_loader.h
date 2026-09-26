@@ -21,7 +21,7 @@ struct DatasetIndexSchedule final {
  std::vector<std::uint64_t> microbatch_keys;
 };
 struct Batch {
- std::span<const std::uint64_t> draw_keys;
+ std::span<const std::uint64_t> draw_keys{};
  std::uint64_t microbatch_key = 0;
  size_t num_images = 0;
  const float* device_images = nullptr;
@@ -39,7 +39,7 @@ class DatasetLoader {
 public:
  struct Config {
   std::string compiled_path;
-  std::shared_ptr<const CompiledDataset> source;
+  std::shared_ptr<const CompiledDataset> source{};
   size_t batch_size = 32;
   bool shuffle = true;
   uint64_t seed = 42;

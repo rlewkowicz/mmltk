@@ -330,8 +330,8 @@ private:
  mmltk::frameworks::gpu::TerminalCudaRetirementLease lease_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement_);
  std::shared_ptr<Impl> impl_;
 };
-EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRuntime& validation, NativeRfDetrModel& model, const DetectionConfig& detection_config,
- bool calculate_loss, EvaluationPurpose purpose, EvaluatedWeights evaluated_weights, std::optional<int> current_epoch, TrainingMetricHandoff* metrics = nullptr,
+EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRuntime& validation, NativeRfDetrModel& model, const DetectionConfig& detection_config, bool calculate_loss,
+ EvaluationPurpose purpose, EvaluatedWeights evaluated_weights, std::optional<int> current_epoch, TrainingMetricHandoff* metrics = nullptr,
  std::optional<std::uint64_t> parameter_version = std::nullopt);
 mmltk::backend::data::DatasetLoader::Config make_loader_config(const std::string& compiled_path, size_t batch_size, bool shuffle, int prefetch_factor, int gather_workers,
  const std::string& cpu_affinity, int device_id, uint64_t seed, uint32_t batch_shard_rank = 0, uint32_t batch_shard_count = 1);

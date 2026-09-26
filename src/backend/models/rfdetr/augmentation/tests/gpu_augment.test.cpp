@@ -793,8 +793,12 @@ TEST_CASE("cached execution and semantic plans share donor identities and numeri
  std::array<GpuAugmentationDonor, capacity> donors{};
  std::vector<float> boxes;
  for (std::size_t slot = 0; slot < capacity; ++slot) {
-  donors[slot] = {.label = slot == 1 || slot == 4 ? -1 : static_cast<std::int64_t>(slot), .dataset_index = static_cast<std::uint32_t>(slot % 3),
-   .area = 16, .box = {0, 0, 1, 1}, .has_mask = true, .sampling_identity = 100 + slot};
+  donors[slot] = {.label = slot == 1 || slot == 4 ? -1 : static_cast<std::int64_t>(slot),
+   .dataset_index = static_cast<std::uint32_t>(slot % 3),
+   .area = 16,
+   .box = {0, 0, 1, 1},
+   .has_mask = true,
+   .sampling_identity = 100 + slot};
   boxes.insert(boxes.end(), donors[slot].box.begin(), donors[slot].box.end());
  }
  auto config = test_support::spatial_occlusion_config(true);

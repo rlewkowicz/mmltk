@@ -511,8 +511,12 @@ template <typename GroupConfig, typename ParamStateT>
 void NativeOptimizerStorage<GroupConfig, ParamStateT>::admit_continuation(const TrainingScheduleState& schedule) const {
  for (const auto& state : state_) {
   const auto step = [&]() -> std::uint64_t {
-   if constexpr (std::same_as<decltype(state.step), torch::Tensor>) return state.step.defined() ? state.step.template item<std::uint64_t>() : 0;
-   else return static_cast<std::uint64_t>(state.step);
+   if constexpr (std::same_as<decltype(state.step), torch::Tensor>) {
+    const auto value = state.step.defined() ? state.step.template item<double>() : 0.0;
+    if (!std::isfinite(value) || value < 0.0 || value >= 0x1p64) throw std::invalid_argument("saved optimizer age is out of range");
+    return static_cast<std::uint64_t>(value);
+   } else
+    return static_cast<std::uint64_t>(state.step);
   }();
   if (step > schedule.successful_updates) throw std::invalid_argument("saved optimizer age exceeds successful updates");
  }
@@ -534,8 +538,10 @@ void NativeOptimizerStorage<GroupConfig, ParamStateT>::broadcast_state(const Dis
  for (const auto& entry : groups_) {
   template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^GroupConfig, std::meta::access_context::current()))) {
    using T = std::remove_cvref_t<decltype(entry.config.[:field:])>;
-   if constexpr (std::is_enum_v<T>) inventory << static_cast<std::underlying_type_t<T>>(entry.config.[:field:]) << ':';
-   else inventory << entry.config.[:field:] << ':';
+   if constexpr (std::is_enum_v<T>)
+    inventory << static_cast<std::underlying_type_t<T>>(entry.config.[:field:]) << ':';
+   else
+    inventory << entry.config.[:field:] << ':';
   }
  }
  std::vector<torch::Tensor> tensors;
@@ -547,13 +553,15 @@ void NativeOptimizerStorage<GroupConfig, ParamStateT>::broadcast_state(const Dis
     inventory << value.defined() << ':';
     if (value.defined()) {
      inventory << value.sizes() << ':' << value.scalar_type() << ':';
-     if (value.is_cuda()) tensors.push_back(value);
+     if (value.is_cuda())
+      tensors.push_back(value);
      else {
       if (value.numel() != 1) throw std::invalid_argument("optimizer host state is not a scalar decision");
       inventory << value.template item<double>() << ':';
      }
     }
-   } else inventory << value << ':';
+   } else
+    inventory << value << ':';
   }
  }
  agree_training_text(group, "optimizer-state-inventory", inventory.str());
@@ -664,7 +672,8 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
  groups_.swap(candidate_groups);
  state_.swap(candidate_state);
 }
-std::vector<std::string> NativeAdamW::InspectCheckpoint(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop, const TrainingScheduleState* schedule) {
+std::vector<std::string> NativeAdamW::InspectCheckpoint(
+ torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop, const TrainingScheduleState* schedule) {
  return inspect_checkpoint<NativeAdamW>(archive, tensors, stop, schedule);
 }
 NativeMuonWithAuxAdam::NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params) : NativeOptimizerStorage(std::move(groups), std::move(params)) {
@@ -837,7 +846,8 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
  groups_.swap(candidate_groups);
  state_.swap(candidate_state);
 }
-std::vector<std::string> NativeMuonWithAuxAdam::InspectCheckpoint(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop, const TrainingScheduleState* schedule) {
+std::vector<std::string> NativeMuonWithAuxAdam::InspectCheckpoint(
+ torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop, const TrainingScheduleState* schedule) {
  return inspect_checkpoint<NativeMuonWithAuxAdam>(archive, tensors, stop, schedule);
 }
 NativeSGD::NativeSGD(std::vector<Group> groups, std::vector<NamedParameter> params) : NativeOptimizerStorage(std::move(groups), std::move(params)) {
@@ -847,24 +857,29 @@ NativeSGD::NativeSGD(std::vector<Group> groups, std::vector<NamedParameter> para
 }
 void NativeSGD::zero_grad(bool none) { zero_grad_parameters(all_params_, none); }
 void NativeSGD::set_lrs(const std::vector<double>& lrs, double scale) { set_scaled_group_lrs(groups_, lrs, scale, "native SGD LR group count differs"); }
-void NativeSGD::set_momentum(double momentum) { for (auto& group : groups_) group.config.momentum = momentum; }
+void NativeSGD::set_momentum(double momentum) {
+ for (auto& group : groups_) group.config.momentum = momentum;
+}
 void NativeSGD::step() {
  torch::NoGradGuard guard;
- for (const auto& group : groups_) for (const auto index : group.param_indices) {
-  auto& param = params_[index].tensor;
-  if (!param.requires_grad() || !param.grad().defined()) continue;
-  if (param.grad().is_sparse() || !param.is_floating_point() || torch::is_complex(param)) throw std::runtime_error("native SGD requires dense real gradients");
-  auto update = group.config.weight_decay == 0 ? param.grad() : param.grad().add(param, group.config.weight_decay);
-  auto& state = state_[index];
-  if (state.step == std::numeric_limits<int64_t>::max()) throw std::overflow_error("SGD parameter age exhausted");
-  if (group.config.momentum != 0) {
-   if (!state.momentum_buffer.defined()) state.momentum_buffer = update.detach().clone();
-   else state.momentum_buffer.mul_(group.config.momentum).add_(update);
-   update = group.config.nesterov ? update.add(state.momentum_buffer, group.config.momentum) : state.momentum_buffer;
+ for (const auto& group : groups_)
+  for (const auto index : group.param_indices) {
+   auto& param = params_[index].tensor;
+   if (!param.requires_grad() || !param.grad().defined()) continue;
+   if (param.grad().is_sparse() || !param.is_floating_point() || torch::is_complex(param)) throw std::runtime_error("native SGD requires dense real gradients");
+   auto update = group.config.weight_decay == 0 ? param.grad() : param.grad().add(param, group.config.weight_decay);
+   auto& state = state_[index];
+   if (state.step == std::numeric_limits<int64_t>::max()) throw std::overflow_error("SGD parameter age exhausted");
+   if (group.config.momentum != 0) {
+    if (!state.momentum_buffer.defined())
+     state.momentum_buffer = update.detach().clone();
+    else
+     state.momentum_buffer.mul_(group.config.momentum).add_(update);
+    update = group.config.nesterov ? update.add(state.momentum_buffer, group.config.momentum) : state.momentum_buffer;
+   }
+   param.add_(update, -group.config.lr);
+   ++state.step;
   }
-  param.add_(update, -group.config.lr);
-  ++state.step;
- }
 }
 void NativeSGD::save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t slot) const {
  namespace io = mmltk::backend::ml::serialization;
@@ -896,12 +911,13 @@ void NativeSGD::read_checkpoint(torch::serialize::InputArchive& archive, std::st
   const auto nesterov = require_optimizer_bool(saved, "nesterov");
   const auto role = io::require_int(saved, "role");
   if (role < static_cast<int64_t>(TrainingGroupRole::Ordinary) || role > static_cast<int64_t>(TrainingGroupRole::Bias) ||
-      (materialize && (role != static_cast<int64_t>(config.role) || nesterov != config.nesterov))) throw std::runtime_error("invalid saved SGD group identity");
+      (materialize && (role != static_cast<int64_t>(config.role) || nesterov != config.nesterov)))
+   throw std::runtime_error("invalid saved SGD group identity");
   config.nesterov = nesterov != 0;
   config.role = static_cast<TrainingGroupRole>(role);
-  if (!std::isfinite(config.lr) || config.lr < 0 || !std::isfinite(config.weight_decay) || config.weight_decay < 0 || !std::isfinite(config.momentum) ||
-      config.momentum < 0 || config.momentum > 1 ||
-      (config.role != TrainingGroupRole::Ordinary && config.role != TrainingGroupRole::Bias)) throw std::runtime_error("invalid saved SGD group");
+  if (!std::isfinite(config.lr) || config.lr < 0 || !std::isfinite(config.weight_decay) || config.weight_decay < 0 || !std::isfinite(config.momentum) || config.momentum < 0 || config.momentum > 1 ||
+      (config.role != TrainingGroupRole::Ordinary && config.role != TrainingGroupRole::Bias))
+   throw std::runtime_error("invalid saved SGD group");
  });
  std::vector<NativeSGDParamState> states(params_.size());
  read_indexed_optimizer_archive(archive, "param", params_.size(), [&](std::size_t index, auto& saved) {
@@ -915,9 +931,11 @@ void NativeSGD::read_checkpoint(torch::serialize::InputArchive& archive, std::st
    states[index].momentum_buffer = require_parameter_state_tensor(saved, "momentum_buffer", params_[index].tensor, "invalid SGD momentum tensor", materialize);
   }
  });
- groups_.swap(groups); state_.swap(states);
+ groups_.swap(groups);
+ state_.swap(states);
 }
-std::vector<std::string> NativeSGD::InspectCheckpoint(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop, const TrainingScheduleState* schedule) {
+std::vector<std::string> NativeSGD::InspectCheckpoint(
+ torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop, const TrainingScheduleState* schedule) {
  return inspect_checkpoint<NativeSGD>(archive, tensors, stop, schedule);
 }
 void NativeOptimizer::clip_grad_norm_(const double max_norm) {
@@ -947,9 +965,15 @@ void NativeOptimizer::clip_grad_norm_(const double max_norm) {
 NativeOptimizer::NativeOptimizer(NativeSGD optimizer) : storage_(std::move(optimizer)) {}
 NativeOptimizer::NativeOptimizer(NativeAdamW optimizer) : storage_(std::move(optimizer)) {}
 NativeOptimizer::NativeOptimizer(NativeMuonWithAuxAdam optimizer) : storage_(std::move(optimizer)) {}
-void NativeOptimizer::activate() { std::visit([](auto& optimizer) { optimizer.activate(); }, storage_); }
-void NativeOptimizer::admit_continuation(const TrainingScheduleState& schedule) const { std::visit([&](const auto& optimizer) { optimizer.admit_continuation(schedule); }, storage_); }
-void NativeOptimizer::broadcast_state(const DistributedContext& group) { std::visit([&](auto& optimizer) { optimizer.broadcast_state(group); }, storage_); }
+void NativeOptimizer::activate() {
+ std::visit([](auto& optimizer) { optimizer.activate(); }, storage_);
+}
+void NativeOptimizer::admit_continuation(const TrainingScheduleState& schedule) const {
+ std::visit([&](const auto& optimizer) { optimizer.admit_continuation(schedule); }, storage_);
+}
+void NativeOptimizer::broadcast_state(const DistributedContext& group) {
+ std::visit([&](auto& optimizer) { optimizer.broadcast_state(group); }, storage_);
+}
 const std::vector<torch::Tensor>& NativeOptimizer::eligible_parameters() const {
  return std::visit([](const auto& optimizer) -> const std::vector<torch::Tensor>& { return optimizer.eligible_parameters(); }, storage_);
 }
@@ -968,7 +992,12 @@ NativeOptimizer NativeOptimizer::stage_load(torch::serialize::InputArchive& arch
  return candidate;
 }
 void NativeOptimizer::commit(NativeOptimizer candidate) noexcept {
- std::visit([&](auto& optimizer) { using Type = std::remove_cvref_t<decltype(optimizer)>; optimizer.commit(std::get<Type>(std::move(candidate.storage_))); }, storage_);
+ std::visit(
+  [&](auto& optimizer) {
+   using Type = std::remove_cvref_t<decltype(optimizer)>;
+   optimizer.commit(std::get<Type>(std::move(candidate.storage_)));
+  },
+  storage_);
 }
 const char* NativeOptimizer::backend_name() const {
  return std::visit([](const auto& optimizer) { return optimizer.backend_name(); }, storage_);
@@ -1035,7 +1064,8 @@ double parameter_lr(std::string_view name, const TrainRequest& options) {
  if (is_encoder_param(name)) {
   constexpr int kNumVitLayers = 13;
   const int layer_id = encoder_layer_id(name);
-  return options.recipe.lr_encoder * std::pow(options.recipe.encoder_layer_decay, static_cast<double>(kNumVitLayers + 1 - layer_id)) * options.recipe.lr_component_decay * options.recipe.lr_component_decay;
+  return options.recipe.lr_encoder * std::pow(options.recipe.encoder_layer_decay, static_cast<double>(kNumVitLayers + 1 - layer_id)) * options.recipe.lr_component_decay *
+         options.recipe.lr_component_decay;
  }
  if (name.find("transformer.decoder") != std::string_view::npos) { return options.recipe.lr * options.recipe.lr_component_decay; }
  return options.recipe.lr;
@@ -1094,7 +1124,8 @@ OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch
  std::vector<TrainingGroupRole> roles;
  for (const auto& group : groups) roles.push_back(group.role);
  if (options.recipe.optimizer == TrainOptimizerKind::SGD) {
-  auto [optimizer_groups, optimizer_params] = build_optimizer_inputs<NativeSGD>(groups, named_params, base_lrs, [&options](const GroupSpec& group) { return NativeSGDGroupConfig{group.lr, group.weight_decay, options.recipe.momentum, options.recipe.nesterov, group.role}; });
+  auto [optimizer_groups, optimizer_params] = build_optimizer_inputs<NativeSGD>(
+   groups, named_params, base_lrs, [&options](const GroupSpec& group) { return NativeSGDGroupConfig{group.lr, group.weight_decay, options.recipe.momentum, options.recipe.nesterov, group.role}; });
   return {NativeOptimizer(NativeSGD(std::move(optimizer_groups), std::move(optimizer_params))), std::move(base_lrs), std::move(roles)};
  }
  if (options.recipe.optimizer == TrainOptimizerKind::Muon) {
@@ -1102,7 +1133,8 @@ OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch
    groups, named_params, base_lrs, [&options](const GroupSpec& group) { return NativeMuonGroupConfig{group.lr, group.weight_decay, options.recipe.momentum, group.use_muon, true}; });
   return OptimizerBuildResult{
    NativeOptimizer(NativeMuonWithAuxAdam(std::move(optimizer_groups), std::move(optimizer_params))),
-   std::move(base_lrs), std::move(roles),
+   std::move(base_lrs),
+   std::move(roles),
   };
  }
  auto [optimizer_groups, optimizer_params] =
@@ -1115,7 +1147,8 @@ OptimizerBuildResult build_optimizer(const torch::OrderedDict<std::string, torch
                                                                                                      : NativeOptimizerBackend::eager;
  return OptimizerBuildResult{
   NativeOptimizer(NativeAdamW(std::move(optimizer_groups), std::move(optimizer_params), backend)),
-  std::move(base_lrs), std::move(roles),
+  std::move(base_lrs),
+  std::move(roles),
  };
 }
 }  // namespace mmltk::backend::models::rfdetr

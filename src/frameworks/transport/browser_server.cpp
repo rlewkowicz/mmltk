@@ -21,6 +21,8 @@
 namespace mmltk::frameworks::transport {
 namespace {
 inline constexpr std::size_t kMaximumMessageBytes = 8U * 1024U * 1024U;
+// Packaged assets have a separate ceiling from individual protocol records.
+inline constexpr std::size_t kMaximumAssetBytes = 64U * 1024U * 1024U;
 struct Peer final {
  detail::BrowserPeerLifecycle lifecycle;
 };
@@ -52,7 +54,7 @@ struct Asset final {
   if (relative.empty() || relative.is_absolute()) continue;
   std::ifstream stream(entry.path(), std::ios::binary | std::ios::ate);
   const auto size = stream ? stream.tellg() : std::streampos{-1};
-  if (size < 0 || static_cast<std::uintmax_t>(size) > kMaximumMessageBytes) return std::nullopt;
+  if (size < 0 || static_cast<std::uintmax_t>(size) > kMaximumAssetBytes) return std::nullopt;
   Asset asset{
    .path = "/" + relative.generic_string(),
    .mime = mime_for(entry.path()),

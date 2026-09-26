@@ -370,7 +370,7 @@ __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::Man
   if (launch.scale_x <= 0 || launch.scale_y <= 0 || length == 0) return;
   const auto width = static_cast<std::uint64_t>(launch.overlay_region.width);
   // NOLINTNEXTLINE(bugprone-integer-division): A linear pixel index selects an integer row before geometric projection.
-  const float x = static_cast<float>(start % width), y = static_cast<float>(start / width);
+  const auto x = static_cast<float>(start % width), y = static_cast<float>(start / width);
   const auto project = [](float value, float source, float target, float scale) {
    // Match the separate float operations used when materializing the
    // saved intervals; contraction can cross a floor/ceil boundary.
@@ -454,10 +454,10 @@ __global__ void draw_polyline_rgba_pitched_kernel(const draw_launch::PolylineRgb
  for (int segment_index = 0; segment_index < segment_count; ++segment_index) {
   const int start_index = segment_index * 2;
   const int end_point_index = ((segment_index + 1) % points.point_count) * 2;
-  const float ax = static_cast<float>(points.points_xy[start_index + 0]);
-  const float ay = static_cast<float>(points.points_xy[start_index + 1]);
-  const float bx = static_cast<float>(points.points_xy[end_point_index + 0]);
-  const float by = static_cast<float>(points.points_xy[end_point_index + 1]);
+  const auto ax = static_cast<float>(points.points_xy[start_index + 0]);
+  const auto ay = static_cast<float>(points.points_xy[start_index + 1]);
+  const auto bx = static_cast<float>(points.points_xy[end_point_index + 0]);
+  const auto by = static_cast<float>(points.points_xy[end_point_index + 1]);
   if (store_segment_hit_rgba_pixel(overlay, x, y, px, py, ax, ay, bx, by, max_distance_sq, launch.color)) { return; }
  }
 }
@@ -469,11 +469,11 @@ __global__ void draw_points_rgba_pitched_kernel(const draw_launch::PointsRgbaPit
  if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count <= 0) { return; }
  const float px = static_cast<float>(x) + 0.5f;
  const float py = static_cast<float>(y) + 0.5f;
- const float max_distance_sq = static_cast<float>(launch.radius * launch.radius);
+ const auto max_distance_sq = static_cast<float>(launch.radius * launch.radius);
  for (int point_index = 0; point_index < points.point_count; ++point_index) {
   const int xy_index = point_index * 2;
-  const float qx = static_cast<float>(points.points_xy[xy_index + 0]);
-  const float qy = static_cast<float>(points.points_xy[xy_index + 1]);
+  const auto qx = static_cast<float>(points.points_xy[xy_index + 0]);
+  const auto qy = static_cast<float>(points.points_xy[xy_index + 1]);
   if (raster_math::point_distance_sq(px, py, qx, qy) > max_distance_sq) { continue; }
   raster_math::store_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y, raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
   return;
@@ -499,10 +499,10 @@ __global__ void draw_skeleton_rgba_pitched_kernel(const draw_launch::SkeletonRgb
   if (source_index >= static_cast<std::uint32_t>(points.point_count) || target_index >= static_cast<std::uint32_t>(points.point_count)) { continue; }
   const int source_xy_index = static_cast<int>(source_index) * 2;
   const int target_xy_index = static_cast<int>(target_index) * 2;
-  const float ax = static_cast<float>(points.points_xy[source_xy_index + 0]);
-  const float ay = static_cast<float>(points.points_xy[source_xy_index + 1]);
-  const float bx = static_cast<float>(points.points_xy[target_xy_index + 0]);
-  const float by = static_cast<float>(points.points_xy[target_xy_index + 1]);
+  const auto ax = static_cast<float>(points.points_xy[source_xy_index + 0]);
+  const auto ay = static_cast<float>(points.points_xy[source_xy_index + 1]);
+  const auto bx = static_cast<float>(points.points_xy[target_xy_index + 0]);
+  const auto by = static_cast<float>(points.points_xy[target_xy_index + 1]);
   if (store_segment_hit_rgba_pixel(overlay, x, y, px, py, ax, ay, bx, by, max_distance_sq, launch.color)) { return; }
  }
 }

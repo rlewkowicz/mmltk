@@ -147,8 +147,7 @@ void TrainProcessClient::State::finish_failure_line() {
   if (value == "local training exited unsuccessfully" || value == "distributed training failed") return Specificity::Parent;
   constexpr std::string_view nonfinite = "non-finite RF-DETR loss or gradients encountered during native training";
   if (value == nonfinite) return Specificity::Nonfinite;
-  if (value.starts_with(nonfinite) &&
-      (value.contains(" nonfinite_losses=[") || value.contains(" nonfinite_param=") || value.contains(" nonfinite_grad="))) return Specificity::NonfiniteDetail;
+  if (value.starts_with(nonfinite) && (value.contains(" nonfinite_losses=[") || value.contains(" nonfinite_param=") || value.contains(" nonfinite_grad="))) return Specificity::NonfiniteDetail;
   return Specificity::Concrete;
  };
  if (!cause.empty()) {
@@ -373,7 +372,10 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
    state_->observed_run = document->record.run_id;
    state_->observed_attempt = document->record.attempt_id;
   }
- } catch (...) { state_->persistence_failed = true; throw; }
+ } catch (...) {
+  state_->persistence_failed = true;
+  throw;
+ }
  std::string status = "training";
  std::uint64_t completed = 0, total = 0;
  std::filesystem::path checkpoint;
@@ -392,8 +394,12 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
    case r::TrainingPhase::Cancelled: status = "cancelled"; break;
    case r::TrainingPhase::Merge: status = "averaging models"; break;
   }
-  completed = facts.completed_images; total = facts.total_images;
-  if (!total && facts.total_epochs > 0) { total = facts.total_epochs; completed = std::min<std::uint64_t>(std::max(0, facts.epoch + 1), total); }
+  completed = facts.completed_images;
+  total = facts.total_images;
+  if (!total && facts.total_epochs > 0) {
+   total = facts.total_epochs;
+   completed = std::min<std::uint64_t>(std::max(0, facts.epoch + 1), total);
+  }
   checkpoint = facts.artifact ? facts.artifact->path : facts.checkpoint_path;
   if (checkpoint.empty()) checkpoint = facts.full_checkpoint_path;
   persistence = document->persistence;
@@ -411,7 +417,10 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
  validate_progress_fields(status, checkpoint.string());
  ++state_->progress_sequence;
  return TrainProcessProgress{.progress = {.sequence = state_->progress_sequence, .completed = std::min(completed, total), .total = total, .status = std::move(status)},
-  .checkpoint_path = std::move(checkpoint), .metrics = std::move(metrics), .sources = std::move(sources), .persistence = std::move(persistence)};
+  .checkpoint_path = std::move(checkpoint),
+  .metrics = std::move(metrics),
+  .sources = std::move(sources),
+  .persistence = std::move(persistence)};
 }
 std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* retained_output) {
  if (!active()) return std::nullopt;

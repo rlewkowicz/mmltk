@@ -1,7 +1,6 @@
 pub mod annotation;
 pub mod aspect_ratio;
 pub mod diagnostics;
-pub mod status;
 pub mod explore;
 pub mod export;
 pub mod file_dialog;
@@ -13,6 +12,7 @@ pub mod predict;
 pub mod router;
 pub mod settings;
 pub mod shared;
+pub mod status;
 pub mod train;
 pub mod validate;
 pub mod workflow;
@@ -106,21 +106,43 @@ pub fn view<'a>(
             }
         })
         .into();
-        let header = container(iced::widget::row![
-            scrollable(router.navigation(model.connection.label(), settings_component.state().typography(model.typography())).map(Message::Workspace))
-                .direction(Direction::Horizontal(compact_scrollbar())).width(Fill),
-            status_component.header(&model.notices).map(Message::Status),
-        ].spacing(0).align_y(iced::Center)).padding([9, 10]).height(NAVIGATION_HEIGHT).width(Fill).style(crate::fluent_theme::container_header_shadow);
+        let header = container(
+            iced::widget::row![
+                scrollable(
+                    router
+                        .navigation(
+                            model.connection.label(),
+                            settings_component.state().typography(model.typography())
+                        )
+                        .map(Message::Workspace)
+                )
+                .direction(Direction::Horizontal(compact_scrollbar()))
+                .width(Fill),
+                status_component.header(&model.notices).map(Message::Status),
+            ]
+            .spacing(0)
+            .align_y(iced::Center),
+        )
+        .padding([9, 10])
+        .height(NAVIGATION_HEIGHT)
+        .width(Fill)
+        .style(crate::fluent_theme::container_header_shadow);
         let body = scrollable(container(body).width(canvas_width).height(Fill))
-            .id(HORIZONTAL_SCROLL_ID).direction(Direction::Horizontal(compact_scrollbar()))
-            .style(crate::fluent_theme::scrollable_default).width(Fill).height(Fill);
+            .id(HORIZONTAL_SCROLL_ID)
+            .direction(Direction::Horizontal(compact_scrollbar().spacing(0)))
+            .style(crate::fluent_theme::scrollable_default)
+            .width(Fill)
+            .height(Fill);
         let shell = iced::widget::column![header, body].spacing(0).height(Fill);
         let shell = if settings_component.state().diagnostics_visible() {
             shell.push(diagnostics::view(model, diagnostics_component).map(Message::Diagnostics))
         } else {
             shell
         };
-        container(shell).width(Fill).height(Fill).style(crate::fluent_theme::container_shell)
+        container(shell)
+            .width(Fill)
+            .height(Fill)
+            .style(crate::fluent_theme::container_shell)
     });
 
     let settings_overlay = settings_component
@@ -137,22 +159,29 @@ pub fn view<'a>(
     let file_dialog_overlay =
         file_dialog::view(model).map(|dialog| opaque_fill(dialog.map(Message::FileDialog)));
 
-    let overlays = [
-        file_dialog_overlay,
-        settings_overlay,
-        reset_overlay,
-    ];
+    let overlays = [file_dialog_overlay, settings_overlay, reset_overlay];
     let mut layers: Vec<Element<'a, Message>> = Vec::with_capacity(5);
     layers.push(base.into());
     layers.extend(overlays.into_iter().map(|overlay| {
         overlay.map_or_else(
             || space::horizontal().width(0).height(0).into(),
             |overlay| {
-                iced::widget::column![space::vertical().height(NAVIGATION_HEIGHT), container(overlay).width(Fill).height(Fill).style(modal_backdrop)].height(Fill).into()
+                iced::widget::column![
+                    space::vertical().height(NAVIGATION_HEIGHT),
+                    container(overlay)
+                        .width(Fill)
+                        .height(Fill)
+                        .style(modal_backdrop)
+                ]
+                .height(Fill)
+                .into()
             },
         )
     }));
-    status_component.wrap(stack(layers).width(Fill).height(Fill).into(), &model.notices)
+    status_component.wrap(
+        stack(layers).width(Fill).height(Fill).into(),
+        &model.notices,
+    )
 }
 
 fn modal_backdrop(_theme: &Theme) -> iced::widget::container::Style {

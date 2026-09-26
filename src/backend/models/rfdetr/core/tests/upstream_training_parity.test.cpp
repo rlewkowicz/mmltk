@@ -88,7 +88,8 @@ void require_stock_loss_vocabulary(const rf::TensorMap& losses, std::size_t auxi
  REQUIRE(losses.contains("class_error"));
  for (const auto& suffix : suffixes) {
   for (const auto key : {"loss_ce", "loss_bbox", "loss_giou", "cardinality_error"}) REQUIRE(losses.contains(key + suffix));
-  if (masks) for (const auto key : {"loss_mask_ce", "loss_mask_dice"}) REQUIRE(losses.contains(key + suffix));
+  if (masks)
+   for (const auto key : {"loss_mask_ce", "loss_mask_dice"}) REQUIRE(losses.contains(key + suffix));
  }
  // Exhaust the upstream vocabulary: sufficient statistics never become map
  // entries, with or without a typed main-output consumer.
@@ -336,10 +337,10 @@ TEST_CASE("Stock matched classification and box losses follow independent groupe
      classification =
       ((labels * torch::softplus(-l) + (1 - labels) * torch::softplus(l)) * (1 - probability_target).square() * (config.focal_alpha * labels + (1 - config.focal_alpha) * (1 - labels))).sum() / groups;
     }
-    REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::matched_count>(statistics).item<float>() == groups);
+    REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::matched_count>(statistics).item<float>() == static_cast<float>(groups));
     REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::class_error_sum>(statistics).item<float>() == 0.F);
     REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::image_count>(statistics).item<float>() == 1.F);
-    REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::cardinality_error_sum>(statistics).item<float>() == 2 * groups - 1);
+    REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::cardinality_error_sum>(statistics).item<float>() == static_cast<float>(2 * groups - 1));
     for (const auto& statistic : statistics) REQUIRE_FALSE(statistic.requires_grad());
     REQUIRE(torch::allclose(losses.at("loss_ce"), classification, 1e-5, 1e-6));
     REQUIRE(torch::allclose(losses.at("loss_bbox"), l1, 1e-5, 1e-6));
@@ -348,10 +349,13 @@ TEST_CASE("Stock matched classification and box losses follow independent groupe
     distributed_config.world_size = 2;
     int reductions = 0;
     rf::DetectionStatisticsPacket::Tensors distributed_statistics;
-    const auto distributed = rf::detection_loss_dict(output, gt, distributed_config, true, true, [&](torch::Tensor& count) {
-     ++reductions;
-     count.add_(3 * groups);
-    }, &distributed_statistics);
+    const auto distributed = rf::detection_loss_dict(
+     output, gt, distributed_config, true, true,
+     [&](torch::Tensor& count) {
+      ++reductions;
+      count.add_(3 * groups);
+     },
+     &distributed_statistics);
     REQUIRE(reductions == 1);
     for (std::size_t field = 0; field < statistics.size(); ++field) REQUIRE(torch::equal(statistics[field], distributed_statistics[field]));
     REQUIRE(torch::allclose(distributed.at("loss_ce"), classification / 4, 1e-5, 1e-6));
@@ -443,7 +447,10 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
       require_stock_loss_vocabulary(losses, 1, true, true);
       REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::matched_count>(statistics).item<float>() == 1.F);
       REQUIRE(rf::DetectionStatisticsPacket::get<^^rf::DetectionSufficientStatistics::image_count>(statistics).item<float>() == 1.F);
-      for (const auto& statistic : statistics) { REQUIRE(statistic.defined()); REQUIRE_FALSE(statistic.requires_grad()); }
+      for (const auto& statistic : statistics) {
+       REQUIRE(statistic.defined());
+       REQUIRE_FALSE(statistic.requires_grad());
+      }
       totals[route] = rf::weighted_detection_loss(losses, config, device);
       if (route == 0) {
        // Exercise failure and old-signature reuse in this very criterion workspace.

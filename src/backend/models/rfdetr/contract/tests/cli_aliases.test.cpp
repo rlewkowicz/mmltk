@@ -1,5 +1,6 @@
 #include <stdexcept>
 // RF-DETR command spelling coverage.
+#include <array>
 #include <string>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
@@ -40,6 +41,7 @@ void test_validate_help_lists_recompile_compile_options() {
  REQUIRE((result.output_text.find("--recompile") != std::string::npos));
  CHECK(result.output_text.find("--resize-mode") != std::string::npos);
  CHECK(result.output_text.find("--candidate-count") != std::string::npos);
+ CHECK(result.output_text.find("--lanes") != std::string::npos);
  CHECK(result.output_text.find("--num-queries") == std::string::npos);
  REQUIRE((result.output_text.find("--compile-workers") != std::string::npos));
  REQUIRE((result.output_text.find("--compile-cuda-mask-batch-size") != std::string::npos));
@@ -237,12 +239,9 @@ TEST_CASE("Native prediction and evaluation retain compilation CLI spellings", "
   CHECK(result.output_text.find("--compile-mode") != std::string::npos);
  }
 }
-
 TEST_CASE("Training JSON is mutually exclusive bounded and shares scalar recipe admission", "[rfdetr][cli][training]") {
- for (const auto options : {
-  std::initializer_list<const char*>{"--request-json", "{}", "--epochs", "4"},
-  std::initializer_list<const char*>{"--optimizer", "sgd", "--request-json", "{}"},
-  std::initializer_list<const char*>{"--request-json", "{}", "--no-amp"}}) {
+ for (const auto options : {std::initializer_list<const char*>{"--request-json", "{}", "--epochs", "4"}, std::initializer_list<const char*>{"--optimizer", "sgd", "--request-json", "{}"},
+       std::initializer_list<const char*>{"--request-json", "{}", "--no-amp"}}) {
   const auto result = run_train_options(options);
   CHECK(result.exit_code == 1);
   CHECK(result.output_text.find("mutually exclusive") != std::string::npos);
@@ -264,5 +263,19 @@ TEST_CASE("Training JSON is mutually exclusive bounded and shares scalar recipe 
  CHECK(invalid.output_text.find("requires --train-compiled") == std::string::npos);
  const auto help = run_train_options({"--help"});
  CHECK(help.output_text.find("--request-json") != std::string::npos);
+ CHECK(help.output_text.find("--validation-lanes") != std::string::npos);
+ CHECK(help.output_text.find("--unfreeze-encoder-last-epochs") != std::string::npos);
+ CHECK(help.output_text.find("--disable-augmentation-last-epochs") != std::string::npos);
  CHECK(help.output_text.find("ultralytics-linear") != std::string::npos);
+}
+TEST_CASE("Validation CLI lane limits share native request admission", "[rfdetr][cli][lanes]") {
+ for (const auto& [command, option, required] : std::array{std::array{"validate", "--lanes", "requires --compiled"}, std::array{"train", "--validation-lanes", "requires --train-compiled"}}) {
+  const auto accepted = run_subprocess_capture_output({mmltk_cli_path(), "rfdetr", command, option, "2"});
+  CHECK(accepted.exit_code == 1);
+  CHECK(accepted.output_text.find(required) != std::string::npos);
+  const auto invalid = run_subprocess_capture_output({mmltk_cli_path(), "rfdetr", command, option, "0"});
+  CHECK(invalid.exit_code == 1);
+  CHECK(invalid.output_text.find(required) == std::string::npos);
+  CHECK(invalid.output_text.find("unknown option") == std::string::npos);
+ }
 }

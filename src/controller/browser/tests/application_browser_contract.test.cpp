@@ -1140,8 +1140,10 @@ TEST_CASE("canonical recipe inheritance exposes complete flattened fields and di
  application_schema_detail::visit_fields<r::TrainRecipeCatalogEntry>(value_fields);
  CHECK(values.size() == r::kTrainRecipeFieldCount + 1U);
  auto settings_fields = [&]<class Owner, class Declaration>(const auto& fact) {
-  if constexpr (std::same_as<Owner, r::TrainRecipeValues>) CHECK(values.erase(std::string(fact.member_name)) == 1U);
-  else CHECK(fact.member_name == "overrides");
+  if constexpr (std::same_as<Owner, r::TrainRecipeValues>)
+   CHECK(values.erase(std::string(fact.member_name)) == 1U);
+  else
+   CHECK(fact.member_name == "overrides");
  };
  application_schema_detail::visit_fields<r::TrainRecipeSettings>(settings_fields);
  CHECK(values.empty());
@@ -1552,29 +1554,42 @@ TEST_CASE("workflow output destinations have one mutable directory authority", "
  }
 }
 }  // namespace mmltk::controller::browser
-
 TEST_CASE("Maximum training source retention fits JSON process browser and bootstrap envelopes", "[browser][training][capacity]") {
  namespace r = mmltk::backend::models::rfdetr;
  namespace serial = mmltk::frameworks::serialization;
- r::TrainRequest request; request.lanes = r::kMaximumTrainingModels; request.use_ema = true;
+ r::TrainRequest request;
+ request.lanes = r::kMaximumTrainingModels;
+ request.use_ema = true;
  request.lane_configuration.mode = r::TrainLaneMode::PeriodicAveraging;
  r::resize_training_models(request.lane_configuration, r::kMaximumTrainingModels, request.recipe, request.seed);
  r::TrainingProgressDocument document;
  auto& current = document.record;
- current.run_id = std::string(64, 'r'); current.attempt_id = std::string(64, 'a');
- current.progress.session_id = current.run_id; current.progress.epoch = 7;
- current.role = r::TrainingRecordRole::Epoch; current.progress.phase = r::TrainingPhase::EpochComplete;
+ current.run_id = std::string(64, 'r');
+ current.attempt_id = std::string(64, 'a');
+ current.progress.session_id = current.run_id;
+ current.progress.epoch = 7;
+ current.role = r::TrainingRecordRole::Epoch;
+ current.progress.phase = r::TrainingPhase::EpochComplete;
  document.sources.catalog = r::training_source_catalog(request);
  const std::string path(mmltk::frameworks::reflection::kMaximumPathBytes, '\1');
  for (const auto& source : document.sources.catalog.available) {
-  ++current.sequence; current.evaluated_weights = source.weights;
-  current.progress.scope = source.scope; current.progress.model_id = source.model_id;
-  current.progress.checkpoint_path = path; current.progress.full_checkpoint_path = path;
-  current.progress.artifact.emplace(); auto& artifact = *current.progress.artifact;
-  artifact.session_id = current.run_id; artifact.model_id = source.model_id; artifact.weights = source.weights;
-  artifact.epoch = 7; artifact.path = path;
+  ++current.sequence;
+  current.evaluated_weights = source.weights;
+  current.progress.scope = source.scope;
+  current.progress.model_id = source.model_id;
+  current.progress.checkpoint_path = path;
+  current.progress.full_checkpoint_path = path;
+  current.progress.artifact.emplace();
+  auto& artifact = *current.progress.artifact;
+  artifact.session_id = current.run_id;
+  artifact.model_id = source.model_id;
+  artifact.weights = source.weights;
+  artifact.epoch = 7;
+  artifact.path = path;
   artifact.initialization = artifact.configuration = artifact.content = artifact.sha256 = artifact.validation = std::string(64, 'a');
-  current.progress.val.emplace(); current.progress.val->mask.emplace(); artifact.evaluation = current.progress.val;
+  current.progress.val.emplace();
+  current.progress.val->mask.emplace();
+  artifact.evaluation = current.progress.val;
   r::retain_training_source(document.sources, current);
  }
  document.sources.execution.emplace();
@@ -1589,8 +1604,10 @@ TEST_CASE("Maximum training source retention fits JSON process browser and boots
   selected.ingredients.push_back({model, std::string(64, 'b'), 1.0 / r::kMaximumTrainingModels});
   document.sources.distributions.push_back({model, 7, 100, 150, 200, 300, 2, 3});
  }
- document.final.emplace(); document.final->selected = selected;
- current.role = r::TrainingRecordRole::Terminal; current.progress.phase = r::TrainingPhase::Error;
+ document.final.emplace();
+ document.final->selected = selected;
+ current.role = r::TrainingRecordRole::Terminal;
+ current.progress.phase = r::TrainingPhase::Error;
  for (std::uint64_t model = 0; model <= r::kMaximumTrainingModels; ++model) {
   current.progress.failure = r::TrainingFailure{current.run_id, model, model + 1, std::string(65536, '\1')};
   r::retain_training_source(document.sources, current);
@@ -1600,17 +1617,20 @@ TEST_CASE("Maximum training source retention fits JSON process browser and boots
  const serial::wire::Limits limits{.max_bytes = r::kTrainingProgressDocumentBytes, .max_items = 131072, .max_depth = 32};
  const auto json = serial::reflected_json(document, scratch, limits).dump();
  CHECK(json.size() < r::kTrainingProgressDocumentBytes);
- CHECK(json.size() > 6U * 1024U * 1024U); // Real worst-case JSON escaping, not an ASCII-only fixture.
+ CHECK(json.size() > 6U * 1024U * 1024U);  // Real worst-case JSON escaping, not an ASCII-only fixture.
  const auto decoded = serial::decode_reflected_json<r::TrainingProgressDocument>(json, limits);
  CHECK(decoded.sources == document.sources);
  mmltk::controller::TrainingSnapshot snapshot;
- snapshot.metrics = current; snapshot.sources = document.sources;
+ snapshot.metrics = current;
+ snapshot.sources = document.sources;
  const auto measured = serial::measure(snapshot, {.max_bytes = r::kTrainingProgressWireBytes, .max_items = 131072, .max_depth = 32});
  REQUIRE(measured);
- CHECK(*measured < 2U * 1024U * 1024U); // Leaves the original complete-owner budget for other Training facts.
+ CHECK(*measured < 2U * 1024U * 1024U);  // Leaves the original complete-owner budget for other Training facts.
  mmltk::controller::TrainingProgress progress;
- progress.metrics = current; progress.sources = document.sources;
+ progress.metrics = current;
+ progress.sources = document.sources;
  REQUIRE(serial::measure(progress, {.max_bytes = mmltk::controller::browser::kMaxOutputValueBytes, .max_items = 131072, .max_depth = 32}));
  STATIC_REQUIRE(r::kTrainingProgressWireBytes <= mmltk::controller::browser::kMaxOutputValueBytes);
- STATIC_REQUIRE(serial::reflected_structural_cbor_bytes<std::variant<mmltk::controller::browser::Bootstrap>>(mmltk::controller::browser::ApplicationSchema<mmltk::controller::ApplicationSystems>::BootstrapPayloadBudget()) <= mmltk::controller::browser::kMaxRecordWireBytes);
+ STATIC_REQUIRE(serial::reflected_structural_cbor_bytes<std::variant<mmltk::controller::browser::Bootstrap>>(
+                 mmltk::controller::browser::ApplicationSchema<mmltk::controller::ApplicationSystems>::BootstrapPayloadBudget()) <= mmltk::controller::browser::kMaxRecordWireBytes);
 }

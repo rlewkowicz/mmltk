@@ -23,6 +23,7 @@ public:
  // A caller retains this shared read through all tensor/archive consumers.
  [[nodiscard]] std::shared_ptr<const DecodedNativeModelState> decode(std::stop_token = {}) const;
  void release_decoded_state() noexcept { decoded_.reset(); }
+
 private:
  NativeCheckpointMetadata metadata_;
  std::shared_ptr<const ClassArtifactAdmission> evidence_;

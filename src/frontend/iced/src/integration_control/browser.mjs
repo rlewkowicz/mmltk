@@ -50,6 +50,7 @@ export function mmltkIntegrationInitialize(enabled) {
     primaryActions: new Map(),
     primarySequence: 0,
     primaryInput: 0,
+    statusInput: 0,
     primaryPage: undefined,
     primaryScale: 1,
     fpsDraw: undefined,
@@ -61,6 +62,7 @@ export function mmltkIntegrationInitialize(enabled) {
   const owner = integrationState;
   integrationState.onInput = (event) => {
     if (integrationState !== owner) return;
+    ++owner.statusInput;
     if (event.type !== 'pointermove' || event.buttons) ++owner.primaryInput;
     if (!integrationState.initialAtlasWithoutInput || event.type === 'resize') return;
     integrationState.initialAtlasInputCount++;
@@ -1215,6 +1217,8 @@ export function mmltkIntegrationWheel(x, y, delta = -96, control = false, pixels
   if (!canvas || !Number.isFinite(x) || !Number.isFinite(y)) return 0;
   const rect = canvas.getBoundingClientRect();
   integrationMicrotask(() => {
+    // Iced receives wheel deltas separately from its retained cursor position.
+    canvas.dispatchEvent(integrationPointer(rect, x, y, 'pointermove', 0));
     canvas.dispatchEvent(new WheelEvent('wheel', {
       bubbles: true,
       cancelable: true,
@@ -1630,16 +1634,21 @@ export function mmltkIntegrationDatasetPixels(key, bounds, dividers, colors, sca
           a: String(key), b: String(width * height), c: String(maximum - minimum), d: String(Number(matched))});
       }
       if (key >= 200) {
-        const {width, height, pixels} = read(bounds);
+        // Failure details live in Status; their former inline area collapses.
+        // Both surrounding dividers still require actual pixel evidence below.
+        const empty = key < 236 && (key - 200) % 9 === 6;
+        if (empty && (bounds.length !== 4 || !bounds.every(Number.isFinite) || bounds[2] <= 0 || bounds[3] !== 0))
+          throw new Error('removed failure component retained layout');
+        const {width, height, pixels} = empty ? {width: Math.floor(bounds[2] * sx), height: 0, pixels: []} : read(bounds);
         let minimum = 255, maximum = 0, colored = 0;
         for (let i = 0; i < pixels.length; i += 4) {
           const luminance = (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
           minimum = Math.min(minimum, luminance); maximum = Math.max(maximum, luminance);
           if (Math.max(pixels[i], pixels[i + 1], pixels[i + 2]) - Math.min(pixels[i], pixels[i + 1], pixels[i + 2]) > 30) ++colored;
         }
-        valid &&= maximum - minimum >= 20;
-        emit({event: 'integration.dataset_pixels', control: 'dataset.presentation', detail: 'component-canvas',
-          a: String(key), b: String(width), c: String(height), d: String(maximum - minimum), colored});
+        valid &&= empty || maximum - minimum >= 20;
+        emit({event: 'integration.dataset_pixels', control: 'dataset.presentation', detail: empty ? 'empty-component' : 'component-canvas',
+          a: String(key), b: String(width), c: String(height), d: String(empty ? 0 : maximum - minimum), colored});
       }
       for (let index = 0; index < dividers.length; index += 4) {
         const rectangle = Array.from(dividers.slice(index, index + 4));
@@ -1781,23 +1790,33 @@ function restoreStatusEnvironment(owner) {
 }
 
 // Status probes use the composed canvas and real input dispatch. The retained
-// state is bounded to three controls and one current exercise, and disappears
-// with the existing acceptance owner.
+// state is bounded to three fixed controls, one focused draw and one current
+// exercise, and disappears with the existing acceptance owner.
 export function mmltkIntegrationStatusDraw(control, facts) {
   if (!integrationState || !integrationDriver) return;
-  integrationState.statusDraw ??= new Map();
-  if (!['navigation.status', 'navigation.settings', 'status.close'].includes(control)) return;
-  integrationState.statusDraw.set(control, Float64Array.from(facts));
+  const owner = integrationState;
+  const fixed = ['navigation.status', 'navigation.settings', 'status.close'].includes(control);
+  const draw = fixed || facts[12] === 1 ? {control, facts:Float64Array.from(facts), input:owner.statusInput} : undefined;
+  if (facts[12] === 1) owner.statusFocusedDraw = draw;
+  else if (owner.statusFocusedDraw?.control === control) owner.statusFocusedDraw = undefined;
+  if (fixed) {
+    owner.statusDraw ??= new Map();
+    owner.statusDraw.set(control, draw);
+  }
   if (control === 'navigation.status') integrationState.statusDrawCount = (integrationState.statusDrawCount ?? 0) + 1;
+  if (owner.statusPaintWait?.control === control) owner.statusPaintWait.drawn();
 }
 
-export function mmltkIntegrationStatusExercise(stage, measured, callback) {
+export function mmltkIntegrationStatusExercise(stage, measured, focused, callback) {
   const owner = integrationState;
-  let active = true, semanticObserver, semanticMutations = 0;
+  let active = true, semanticObserver, semanticMutations = 0, paintWait;
   const finish = integrationCompletion(outcome => {
     active = false;
     semanticObserver?.disconnect();
-    if (owner) owner.statusPending = undefined;
+    if (owner) {
+      owner.statusPending = undefined;
+      if (owner.statusPaintWait === paintWait) owner.statusPaintWait = undefined;
+    }
     if (outcome !== 'observed') restoreStatusFixture(owner);
     callback(outcome === 'observed');
   });
@@ -1814,7 +1833,22 @@ export function mmltkIntegrationStatusExercise(stage, measured, callback) {
   const point = (r, fx = .5, fy = .5) => [(r[0] + r[2] * fx) * scale, (r[1] + r[3] * fy) * scale];
   const move = (r, fx, fy) => { const [x,y] = point(r,fx,fy); canvas.dispatchEvent(integrationPointer(css,x,y,'pointermove',0)); };
   const click = r => { const [x,y] = point(r); return mmltkIntegrationClick(x,y) > 0; };
-  const key = (name, shift = false, control = false) => { integrationKey(canvas,'keydown',name,name,control,shift); integrationKey(canvas,'keyup',name,name,control,shift); };
+  const key = (name, shift = false, control = false) => {
+    // Winit reports changed modifiers after the triggering key. Establish
+    // them with their own press before delivering the actual shortcut.
+    const code = name === ' ' ? 'Space' : /^[a-z]$/i.test(name) ? `Key${name.toUpperCase()}` : name;
+    try {
+      if (control) integrationKey(canvas,'keydown','Control','ControlLeft',true,false);
+      if (shift) integrationKey(canvas,'keydown','Shift','ShiftLeft',control,true);
+      integrationKey(canvas,'keydown',name,code,control,shift);
+      integrationKey(canvas,'keyup',name,code,control,shift);
+    } finally {
+      if (shift) integrationKey(canvas,'keyup','Shift','ShiftLeft',control,false);
+      if (control) integrationKey(canvas,'keyup','Control','ControlLeft',false,false);
+    }
+    report({event:'integration.status.key',control:'status.panel',detail:name,
+      a:String(Number(control)),b:String(Number(shift)),c:code});
+  };
   const touch = r => { const [x,y] = point(r); for (const type of ['pointerdown','pointerup']) canvas.dispatchEvent(new PointerEvent(type, {bubbles:true,cancelable:true,pointerId:77,pointerType:'touch',isPrimary:true,clientX:css.left+x,clientY:css.top+y,button:0,buttons:type === 'pointerdown' ? 1 : 0})); };
   const outside = [2, Math.max(70, css.height / scale - 20), 2, 2];
   const opened = () => panel[2] > 0 && panel[3] > 0;
@@ -1852,7 +1886,7 @@ export function mmltkIntegrationStatusExercise(stage, measured, callback) {
   const header = (healthy = false) => {
     assert(Math.abs(trigger[2]-192) < .01 && Math.abs(settings[2]-96) < .01 && trigger[3] === settings[3], 'Status/Settings fixed geometry');
     assert(trigger[0] >= 0 && settings[0]+settings[2] <= css.width/scale+.5, 'Status header clipped');
-    const facts = owner.statusDraw?.get('navigation.status');
+    const facts = owner.statusDraw?.get('navigation.status')?.facts;
     assert(facts && facts[5] === Number(!healthy) && facts[11] === Number(!healthy), 'Status border draw missing');
     const image = pixels(trigger), sx = image.width / trigger[2], sy = image.height / trigger[3];
     const at = (x,y) => image.data.subarray((Math.floor(y*sy)*image.width+Math.floor(x*sx))*4,(Math.floor(y*sy)*image.width+Math.floor(x*sx))*4+3);
@@ -1873,8 +1907,15 @@ export function mmltkIntegrationStatusExercise(stage, measured, callback) {
     return Array.from(fill);
   };
   const focusPixels = control => {
+    const drawn = owner.statusFocusedDraw;
+    assert(drawn?.control === focused && control.every((value,index)=>Math.abs(value-drawn.facts[index])<.01),
+      'Status focused draw no longer matches the measured control');
     const image=pixels([control[0]-3,control[1]-3,control[2]+6,control[3]+6]);
     let blue=0; for(let i=0;i<image.data.length;i+=4) if(image.data[i]<30 && image.data[i+1]>80 && image.data[i+1]<160 && image.data[i+2]>170) blue++;
+    report({event:'integration.status.focus_pixels',control:'status.panel',stage,blue,
+      bounds:control,scale,canvas:[canvas.width,canvas.height],css:[css.width,css.height],
+      focused:drawn.control,focused_bounds:Array.from(drawn.facts.slice(0,4)),
+      drawn:Array.from(owner.statusDraw ?? [], ([control,{facts,input}])=>({control,bounds:Array.from(facts.slice(0,4)),focused:facts[12],input}))});
     assert(blue>10,'Status keyboard focus indicator is absent from the canvas');
   };
   const textPixels = (part) => {
@@ -1882,6 +1923,8 @@ export function mmltkIntegrationStatusExercise(stage, measured, callback) {
     const top=Math.max(detail[1],panel[1]+56), bottom=Math.min(detail[1]+detail[3],panel[1]+panel[3]-16);
     assert(bottom-top > 10,'Status multiline detail is not visible');
     if(part === 'first') assert(detail[1] >= panel[1],'first OOM line is clipped');
+    report({event:'integration.status.detail_geometry',control:'status.panel',detail:part,
+      a:String(detail[1]),b:String(detail[3]),c:String(top),d:String(bottom)});
     if(part === 'middle') assert(detail[1]<top-200 && detail[1]+detail[3]>bottom+100,'middle OOM lines did not scroll into view');
     if(part === 'last') assert(detail[1]+detail[3] <= panel[1]+panel[3]-10,'last OOM line is clipped');
     // Fixture lines 0..78 are deliberately shorter than the measured width;
@@ -1903,16 +1946,22 @@ export function mmltkIntegrationStatusExercise(stage, measured, callback) {
     // survive composition, and the following real outside press must be consumed.
     const image = pixels(close), base=Array.from(image.data.subarray(0,3));
     let ink=0; for(let i=0;i<image.data.length;i+=4) if(base.some((value,j)=>Math.abs(value-image.data[i+j])>50)) ink++;
+    report({event:'integration.status.modal_pixels',control:'status.panel',stage,ink,base,
+      close,panel,modal:modalBounds,scale,canvas:[canvas.width,canvas.height],
+      drawn:Array.from(owner.statusDraw ?? [], ([control,{facts,input}])=>({control,bounds:Array.from(facts.slice(0,4)),focused:facts[12],input}))});
     assert(ink>8,'Status panel is covered by modal backdrop');
   };
-  const clickCovered = control => {
+  const touchCovered = control => {
     const target=[control[0]+2,control[1]+control[3]/2,1,1];
     assert(!(target[0]>=panel[0] && target[0]<=panel[0]+panel[2] && target[1]>=panel[1] && target[1]<=panel[1]+panel[3]),'modal action is inside popup instead of outside');
-    return click(target);
+    // Moving a mouse outside correctly closes a hover-opened panel before its
+    // press. Touch tests outside activation while the popup is still open.
+    report({event:'integration.status.outside',control:'status.panel',stage,input:'touch',target});
+    touch(target);
   };
   const modalEvidence = name => report({event:'integration.status.modal',control:'status.panel',detail:name,a:'1',b:'1',c:'1',d:'1'});
   const resetCancel = [modal[0]+24,resetConfirm[1],60,resetConfirm[3]];
-  try {
+  const exercise = () => { try {
     owner.statusExercise ??= {run:run.slice(), tabs:tabs.slice(), modal:undefined, pulse:[]};
     const state=owner.statusExercise;
 
@@ -1944,7 +1993,7 @@ export function mmltkIntegrationStatusExercise(stage, measured, callback) {
       case 19: assert(opened() && Math.abs(panel[2]-192)<1 && panel[0]>=12 && panel[0]+panel[2]<=308,'narrow root popup geometry'); key('Escape'); mmltkIntegrationRestoreCanvasSize(); break;
       case 20: assert(!opened(),'narrow close failed'); assert(click(settings),'Settings dispatch'); break;
       case 21: assert(modal[2]>0,'Settings modal absent'); state.modal=modal.slice(); move(trigger); break;
-      case 22: assert(opened() && modal[2]>0,'Status cannot open above Settings'); header(); modalPixels(modal); assert(clickCovered(reset),'outside Settings reset dispatch'); break;
+      case 22: assert(opened() && modal[2]>0,'Status cannot open above Settings'); header(); modalPixels(modal); touchCovered(reset); break;
       case 23: assert(!opened() && modal[2]>0 && resetConfirm[2]===0,'outside activation escaped to modal'); assert(click(live),'guarded navigation dispatch'); break;
       case 24: assert(modal[2]>0 && run.every((value,index)=>Math.abs(value-state.run[index])<1),'modal navigation guard failed'); modalEvidence('settings'); assert(click(themeToggle),'theme toggle dispatch'); break;
       case 25: assert(modal[2]>0,'theme toggle dismissed modal'); move(trigger); break;
@@ -1954,7 +2003,7 @@ export function mmltkIntegrationStatusExercise(stage, measured, callback) {
         const sample=()=> { if(integrationState!==owner) { finish('invalidated'); return; } const elapsed=performance.now()-start;
           if(elapsed >= samples.length*500) samples.push(header());
           if(samples.length<5) { frame(sample); return; }
-          const reduced=owner.statusDraw.get('navigation.status')[7]===1;
+          const reduced=owner.statusDraw.get('navigation.status').facts[7]===1;
           const distance=(a,b)=>a.reduce((sum,value,index)=>sum+Math.abs(value-b[index]),0);
           const excursion=Math.max(...samples.map(sample=>distance(samples[0],sample)));
           const correct=!reduced && excursion>6 && distance(samples[0],samples[4])<12;
@@ -1964,7 +2013,7 @@ export function mmltkIntegrationStatusExercise(stage, measured, callback) {
       }
       case 28: document.mmltkStatusEnvironment(2); break;
       case 29: {
-        assert(window.matchMedia('(prefers-reduced-motion: reduce)').matches && owner.statusDraw.get('navigation.status')[7] === 1, 'native reduced motion did not reach Status');
+        assert(window.matchMedia('(prefers-reduced-motion: reduce)').matches && owner.statusDraw.get('navigation.status').facts[7] === 1, 'native reduced motion did not reach Status');
         const before=header(), start=performance.now();
         const sample=()=> { if(integrationState!==owner) { finish('invalidated'); return; }
           if(performance.now()-start<2000) { frame(sample); return; }
@@ -1999,15 +2048,27 @@ export function mmltkIntegrationStatusExercise(stage, measured, callback) {
       case 37: assert(!opened() && modal[2]===0,'Settings restoration before reset failed'); assert(click(settings),'reset Settings dispatch'); break;
       case 38: assert(modal[2]>0 && reset[2]>0,'Settings reset control missing'); assert(click(reset),'reset confirmation dispatch'); break;
       case 39: assert(resetConfirm[2]>0,'reset confirmation absent'); move(outside); frame(()=> { move(trigger); after(); }); return;
-      case 40: modalPixels(modal); assert(resetConfirm[2]>0,'reset confirmation lost'); assert(clickCovered(resetCancel),'outside reset cancel dispatch'); break;
+      case 40: modalPixels(modal); assert(resetConfirm[2]>0,'reset confirmation lost'); touchCovered(resetCancel); break;
       case 41: assert(!opened() && resetConfirm[2]>0,'outside activation cancelled reset'); assert(click(live),'reset guarded navigation dispatch'); break;
       case 42: assert(resetConfirm[2]>0 && run.every((v,i)=>Math.abs(v-state.run[i])<1),'reset navigation guard failed'); modalEvidence('reset'); assert(click(resetCancel),'reset cancellation dispatch'); break;
       case 43: assert(resetConfirm[2]===0 && modal[2]>0,'reset cancellation failed'); assert(click(settingsClose),'reset Settings close'); break;
-      case 44: assert(modal[2]===0 && browse[2]>0,'file dialog browse unavailable'); assert(click(browse),'file dialog open dispatch'); break;
+      case 44:
+        assert(modal[2]===0 && browse[2]>0,'file dialog browse unavailable');
+        assert(browse[0]>=0 && browse[1]>=52 && browse[0]+browse[2]<=css.width/scale && browse[1]+browse[3]<=css.height/scale,
+          'file dialog browse is outside the visible page');
+        report({event:'integration.status.file_browse',control:'train.dataset.browse',bounds:browse,run,scale});
+        assert(click(browse),'file dialog open dispatch'); break;
       case 45: assert(dialog[2]>0 && dialogStop[2]>0,'active file dialog overlay absent'); move(outside); frame(()=> { move(trigger); after(); }); return;
-      case 46: modalPixels(dialog); header(); assert(clickCovered(dialogStop),'outside file cancellation dispatch'); break;
-      case 47: assert(!opened() && dialog[2]>0,'outside press cancelled file dialog'); assert(click(live),'file guarded navigation dispatch'); break;
-      case 48: assert(dialog[2]>0 && run.every((v,i)=>Math.abs(v-state.run[i])<1),'file dialog navigation guard failed'); modalEvidence('file-dialog'); assert(click(dialogStop),'file dialog cancel'); break;
+      case 46: modalPixels(dialog); header(); touchCovered(dialogStop); break;
+      case 47:
+        assert(!opened() && dialog[2]>0,'outside press cancelled file dialog');
+        state.dialogRun=run.slice();
+        report({event:'integration.status.navigation',control:'navigation.live',stage,run,dialog});
+        assert(click(live),'file guarded navigation dispatch'); break;
+      case 48:
+        report({event:'integration.status.navigation',control:'navigation.live',stage,run,dialog});
+        assert(dialog[2]>0 && run.every((v,i)=>Math.abs(v-state.dialogRun[i])<1),'file dialog navigation guard failed');
+        modalEvidence('file-dialog'); assert(click(dialogStop),'file dialog cancel'); break;
       case 49: assert(dialog[2]===0 && modal[2]===0,'file dialog restoration failed'); break;
       case 50: assert(!opened(),'pair exercise starts closed'); key('Enter'); break;
       case 51: assert(opened() && firstDismiss[2]>0 && lastDismiss[2]>0,'two fixture rows not visible'); focusPixels(firstDismiss); key('Enter'); break;
@@ -2024,5 +2085,30 @@ export function mmltkIntegrationStatusExercise(stage, measured, callback) {
     after();
   } catch(error) {
     failed(error);
-  }
+  } };
+  const healthy = [32,34,36,57].includes(stage);
+  const painted = focused || (healthy ? 'navigation.status' : [22,40,46].includes(stage) ? 'status.close' : '');
+  if (!painted) { exercise(); return; }
+  // Widget operations and browser animation callbacks use independent queues.
+  // Observe the requested control after the latest input, then presentation.
+  // Cached overlay geometry alone cannot prove that its pixels are visible.
+  const ready = () => {
+    const draw = focused ? owner.statusFocusedDraw : owner.statusDraw?.get(painted);
+    const target = painted === 'navigation.status' ? trigger : close;
+    return draw?.control === painted && draw.input === owner.statusInput &&
+      (!healthy || draw.facts[5] === 0) &&
+      (!!focused || target.every((value,index)=>Math.abs(value-draw.facts[index])<.01));
+  };
+  paintWait = {control:painted, drawn:() => {
+    if (!active || owner.statusPaintWait !== paintWait || !ready()) return;
+    owner.statusPaintWait = undefined;
+    report({event:'integration.status.paint_draw',control:painted,stage,input:owner.statusInput});
+    frame(() => frame(() => {
+      assert(ready(), 'Status control changed before presentation');
+      exercise();
+    }));
+  }};
+  owner.statusPaintWait = paintWait;
+  report({event:'integration.status.paint_wait',control:painted,stage,input:owner.statusInput});
+  paintWait.drawn();
 }

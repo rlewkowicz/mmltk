@@ -40,24 +40,40 @@ struct TrainingTargetCounts::State final {
  bool distributed_abort_requested_ = false;
 };
 TrainingTargetCounts::State::State(const std::size_t capacity, const int device_id, const DistributedContext& distributed)
- : launch_(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(device_id))), consumers_(capacity), host_counts_(capacity, 0), published_(capacity, false), device_id_(device_id), distributed_(distributed), work_(device_id, capacity), ready_(capacity), consumed_(capacity), resolved_(capacity, false) {
+    : launch_(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(device_id))),
+      consumers_(capacity),
+      host_counts_(capacity, 0),
+      published_(capacity, false),
+      device_id_(device_id),
+      distributed_(distributed),
+      work_(device_id, capacity),
+      ready_(capacity),
+      consumed_(capacity),
+      resolved_(capacity, false) {
  if (!capacity) throw std::invalid_argument("target count capacity must be positive");
  device_counts_ = torch::empty({static_cast<std::int64_t>(capacity)}, torch::TensorOptions().dtype(torch::kInt64).device(torch_cuda::cuda_device(device_id)));
  begin(capacity);
 }
 void TrainingTargetCounts::State::begin(std::size_t slots) {
- std::lock_guard lock(mutex_); rethrow_failure_locked();
+ std::lock_guard lock(mutex_);
+ rethrow_failure_locked();
  if (!slots || slots > host_counts_.size()) throw std::invalid_argument("invalid count slot admission");
  // Previous waves have drained their futures. Settle collective slots once,
  // then order any delayed count-to-float reads before overwriting scalar storage.
  work_.settle();
- for (std::size_t lane = 0; lane < consumers_.size(); ++lane) if (consumers_[lane]) consumed_[lane].block(launch_);
- slots_ = slots; std::fill(published_.begin(), published_.end(), false); std::fill(resolved_.begin(), resolved_.end(), false);
+ for (std::size_t lane = 0; lane < consumers_.size(); ++lane)
+  if (consumers_[lane]) consumed_[lane].block(launch_);
+ slots_ = slots;
+ std::fill(published_.begin(), published_.end(), false);
+ std::fill(resolved_.begin(), resolved_.end(), false);
 }
 void TrainingTargetCounts::State::publish(const std::size_t lane, const std::int64_t count) {
- std::lock_guard lock(mutex_); rethrow_failure_locked();
+ std::lock_guard lock(mutex_);
+ rethrow_failure_locked();
  if (lane >= slots_ || published_[lane] || count < 0) throw std::runtime_error("invalid logical target count publication");
- host_counts_[lane] = count; published_[lane] = true; condition_.notify_all();
+ host_counts_[lane] = count;
+ published_[lane] = true;
+ condition_.notify_all();
 }
 void TrainingTargetCounts::State::resolve() {
  torch_cuda::TorchCudaStreamGuard guard(launch_);
@@ -67,42 +83,61 @@ void TrainingTargetCounts::State::resolve() {
   for (std::size_t lane = 0; lane < slots_; ++lane) {
    {
     std::unique_lock lock(mutex_);
-    condition_.wait(lock, [&] { return failure_ || published_[lane]; }); rethrow_failure_locked();
+    condition_.wait(lock, [&] { return failure_ || published_[lane]; });
+    rethrow_failure_locked();
     if (resolved_[lane]) continue;
    }
    auto count = device_counts_.narrow(0, static_cast<std::int64_t>(lane), 1);
    count.fill_(host_counts_[lane]);
    work_.join(work_.all_reduce(distributed_, count));
    ready_[lane].record(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(device_id_)));
-   { std::lock_guard lock(mutex_); rethrow_failure_locked(); resolved_[lane] = true; }
+   {
+    std::lock_guard lock(mutex_);
+    rethrow_failure_locked();
+    resolved_[lane] = true;
+   }
    condition_.notify_all();
   }
   work_.record_completion();
- } catch (...) { fail(std::current_exception()); std::lock_guard lock(mutex_); rethrow_failure_locked(); }
+ } catch (...) {
+  fail(std::current_exception());
+  std::lock_guard lock(mutex_);
+  rethrow_failure_locked();
+ }
 }
 DeviceLossNormalizer TrainingTargetCounts::State::consume(const std::size_t lane, const cudaStream_t stream) {
  {
   std::unique_lock lock(mutex_);
   if (lane >= slots_) throw std::runtime_error("target count slot out of range");
-  condition_.wait(lock, [&] { return failure_ || resolved_[lane]; }); rethrow_failure_locked();
+  condition_.wait(lock, [&] { return failure_ || resolved_[lane]; });
+  rethrow_failure_locked();
   consumers_[lane] = torch_cuda::getStreamFromExternal(stream, torch_cuda::checked_device_index(device_id_));
  }
  const auto consumer = *consumers_[lane];
  torch_cuda::TorchCudaStreamGuard stream_guard(consumer);
- ready_[lane].block(consumer); device_counts_.record_stream(consumer);
+ ready_[lane].block(consumer);
+ device_counts_.record_stream(consumer);
  auto value = device_counts_.select(0, static_cast<std::int64_t>(lane)).to(torch::kFloat32);
  consumed_[lane].record(consumer);
  return {std::move(value)};
 }
 void TrainingTargetCounts::State::fail(std::exception_ptr failure) noexcept {
  bool abort = false;
- { std::lock_guard lock(mutex_); if (!failure_) { failure_ = failure; abort = !distributed_abort_requested_; distributed_abort_requested_ = true; } }
+ {
+  std::lock_guard lock(mutex_);
+  if (!failure_) {
+   failure_ = failure;
+   abort = !distributed_abort_requested_;
+   distributed_abort_requested_ = true;
+  }
+ }
  condition_.notify_all();
  if (abort) distributed_abort(distributed_);
 }
-void TrainingTargetCounts::State::rethrow_failure_locked() const { if (failure_) std::rethrow_exception(failure_); }
-TrainingTargetCounts::TrainingTargetCounts(std::size_t capacity, int device, const DistributedContext& group)
- : state_(std::make_shared<State>(capacity, device, group)) {}
+void TrainingTargetCounts::State::rethrow_failure_locked() const {
+ if (failure_) std::rethrow_exception(failure_);
+}
+TrainingTargetCounts::TrainingTargetCounts(std::size_t capacity, int device, const DistributedContext& group) : state_(std::make_shared<State>(capacity, device, group)) {}
 TrainingTargetCounts::~TrainingTargetCounts() noexcept { retire(); }
 void TrainingTargetCounts::retire() noexcept {
  if (!state_) return;
@@ -117,13 +152,18 @@ void TrainingTargetCounts::retire() noexcept {
  try {
   torch_cuda::TorchCudaDeviceGuard device(torch_cuda::checked_device_index(state_->device_id_));
   failure = cudaStreamSynchronize(state_->launch_.stream());
-  for (const auto& stream : state_->consumers_) if (stream) {
-   const auto status = cudaStreamSynchronize(stream->stream());
-   if (failure == cudaSuccess) failure = status;
-  }
- } catch (...) { if (failure == cudaSuccess) failure = cudaErrorUnknown; }
- if (failure != cudaSuccess) std::move(terminal_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(state_)), failure);
- else state_.reset();
+  for (const auto& stream : state_->consumers_)
+   if (stream) {
+    const auto status = cudaStreamSynchronize(stream->stream());
+    if (failure == cudaSuccess) failure = status;
+   }
+ } catch (...) {
+  if (failure == cudaSuccess) failure = cudaErrorUnknown;
+ }
+ if (failure != cudaSuccess)
+  std::move(terminal_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(state_)), failure);
+ else
+  state_.reset();
 }
 void TrainingTargetCounts::begin(std::size_t slots) { state_->begin(slots); }
 void TrainingTargetCounts::publish(std::size_t lane, std::int64_t count) { state_->publish(lane, count); }

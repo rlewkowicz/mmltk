@@ -571,7 +571,7 @@ mod tests {
                     if let [(name, Value::Unsigned(storage))] = fields.as_mut_slice()
                         && name.as_str() == "mask"
                     {
-                        *storage = 0x0800;
+                        *storage = u64::from(u16::MAX);
                         return true;
                     }
                     fields

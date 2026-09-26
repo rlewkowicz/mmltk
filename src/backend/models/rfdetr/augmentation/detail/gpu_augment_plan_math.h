@@ -178,7 +178,6 @@ enum ParameterIndex : std::uint8_t {
   key, values[kOcclusionMode] == 2.0F ? 0.05F * values[kOcclusionStrength] : 0.0F, values[kEraseX0], values[kEraseY0], values[kEraseX1], values[kEraseY1], values[kOcclusionMode] == 3.0F ? 1U : 0U};
 }
 }  // namespace mmltk::backend::models::rfdetr::augment_math
-
 // Shared host preparation owns the numeric plan used by logical history and CUDA.
 // These declarations stay private; public semantic plans expose no launch state.
 namespace mmltk::backend::models::rfdetr {
@@ -187,7 +186,7 @@ struct GpuAugmentationDonor;
 struct AugmentationImagePlan;
 namespace detail {
 [[nodiscard]] GpuAugmentationLaunchConfig augmentation_launch_config(const GpuAugmentationConfig&);
-void prepare_augmentation_image(AugmentationImagePlan&, const GpuAugmentationConfig&, std::uint64_t key, std::uint32_t dataset_index,
- const GpuAugmentationDonor* selected, std::int64_t donor_slot, float* image_parameters, float* paste_parameters);
+void prepare_augmentation_image(AugmentationImagePlan&, const GpuAugmentationConfig&, std::uint64_t key, std::uint32_t dataset_index, const GpuAugmentationDonor* selected, std::int64_t donor_slot,
+ float* image_parameters, float* paste_parameters);
 }  // namespace detail
 }  // namespace mmltk::backend::models::rfdetr

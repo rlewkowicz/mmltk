@@ -562,6 +562,29 @@ impl State {
                 [0.0; 4],
             );
         }
+        let gpu = match message {
+            crate::view::router::Message::Train(crate::view::train::Message::Gpu(message)) => {
+                Some((FeatureId::Train, message))
+            }
+            crate::view::router::Message::Validate(crate::view::validate::Message::Gpu(
+                message,
+            )) => Some((FeatureId::Validate, message)),
+            crate::view::router::Message::Predict(crate::view::predict::Message::Gpu(message)) => {
+                Some((FeatureId::Predict, message))
+            }
+            crate::view::router::Message::Export(crate::view::export::Message::Gpu(message)) => {
+                Some((FeatureId::Export, message))
+            }
+            _ => None,
+        };
+        if let Some((feature, message)) = gpu {
+            SINK.record(
+                "integration.workflow_gpu_edit",
+                crate::view::navigation::label(feature),
+                "received",
+                [f64::from(message.0), 0.0, 0.0, 0.0],
+            );
+        }
     }
     pub fn observe_navigation_outcome(&self, selected: FeatureId, active: FeatureId) {
         SINK.record(
@@ -587,6 +610,60 @@ impl State {
                 0.0,
                 0.0,
             ],
+        );
+    }
+    pub fn observe_settings_flush(
+        &self,
+        model: &ApplicationModel,
+        settings: &crate::view::settings::SettingsModel,
+        request: Option<&crate::generated::SettingsUpdateRequest>,
+    ) {
+        SINK.record(
+            "integration.settings_flush",
+            if request.is_some() {
+                "submit"
+            } else {
+                "waiting"
+            },
+            &format!(
+                "pending={} local_edits={} deferred={} available={:?} training={:?} fields={:?}",
+                model.has_pending(crate::generated::ApplicationIntentEndpoint::SettingsUpdate),
+                settings.has_local_edits(),
+                settings.has_deferred_flush(),
+                model.execution_edit_submission_availability(),
+                model
+                    .workflow
+                    .training
+                    .as_ref()
+                    .map(|state| (state.activity, state.local.active)),
+                request.map(|request| request
+                    .updates
+                    .iter()
+                    .map(|update| update.path.as_str())
+                    .collect::<Vec<_>>()),
+            ),
+            [
+                model
+                    .settings_snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.revision) as f64,
+                request.map_or(0, |request| request.updates.len()) as f64,
+                0.0,
+                0.0,
+            ],
+        );
+    }
+    pub fn observe_intent(
+        &self,
+        stage: &str,
+        endpoint: crate::generated::ApplicationIntentEndpoint,
+        correlation: u64,
+    ) {
+        SINK.record(
+            "integration.intent",
+            &correlation.to_string(),
+            &format!("{stage} {endpoint:?}"),
+            [0.0; 4],
         );
     }
     pub fn observe_native_frame(
@@ -1195,6 +1272,7 @@ mod tests {
                 &router,
                 FeatureId::Explore,
                 Some(surface),
+                false,
             ));
             assert_eq!(driver.driver.phase, Phase::SettingsOpen);
             assert_eq!(driver.driver.input_scale, 1.5);
@@ -1310,6 +1388,7 @@ mod tests {
                 &router,
                 FeatureId::Explore,
                 Some(surface),
+                false,
             ));
             assert!(capture.records().is_empty());
             model.explore.snapshot.as_mut().unwrap().revision = 10;
@@ -1320,6 +1399,7 @@ mod tests {
                 &router,
                 FeatureId::Explore,
                 Some(surface),
+                false,
             ));
             assert!(capture.records().is_empty());
             let snapshot = model.explore.snapshot.as_mut().unwrap();
@@ -1332,6 +1412,7 @@ mod tests {
                 &router,
                 FeatureId::Explore,
                 Some(surface),
+                false,
             ));
             let records = capture.records();
             assert_eq!(records.len(), if enabled { 2 } else { 0 });
@@ -1423,6 +1504,7 @@ mod tests {
                 &router,
                 FeatureId::Explore,
                 Some(surface),
+                false,
             ));
             assert_eq!(driver.driver.phase, Phase::TrainNavigation);
             if !enabled {
@@ -1448,6 +1530,7 @@ mod tests {
                     &router,
                     FeatureId::Explore,
                     Some(surface),
+                    false,
                 ));
                 assert_eq!(driver.driver.phase, Phase::TrainNavigation);
                 STYLES.with(|styles| styles.borrow_mut().as_mut().unwrap().clear());

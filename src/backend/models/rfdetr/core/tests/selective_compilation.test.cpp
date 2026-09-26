@@ -22,7 +22,10 @@ TEST_CASE("Native inference clones rebind module owners and share only immutable
  REQUIRE(cudaSetDevice(0) == cudaSuccess);
  torch::NoGradGuard no_grad;
  auto config = rf::native_config_from_preset(rf::model_presets().front());
- config.resolution = 64; config.num_queries = 3; config.num_select = 3; config.num_classes = 2;
+ config.resolution = 64;
+ config.num_queries = 3;
+ config.num_select = 3;
+ config.num_classes = 2;
  rf::NativeRfDetrModel master(config);
  master.to(torch::Device(torch::kCUDA, 0));
  master.eval();
@@ -202,13 +205,22 @@ torch::Tensor dense_attention(torch::nn::MultiheadAttention& module, const torch
  const auto q = split(project(target + position, 0));
  const auto k = split(project(target + position, 1));
  const auto v = split(project(target, 2));
- auto scores = torch::matmul(q, k.transpose(-1, -2)) / std::sqrt(static_cast<double>(width / heads));
- if (admitted.defined()) scores = scores.masked_fill(~admitted.unsqueeze(1), -std::numeric_limits<float>::infinity());
- const auto probabilities = torch::softmax(scores, -1);
- const auto joined = torch::matmul(probabilities, v).transpose(1, 2).reshape_as(target);
+ torch::Tensor joined;
+ {
+  // SDPA accumulates its half/BF16 intermediates in FP32. An autocast dense
+  // equation rounds scores and probabilities at extra boundaries, changing
+  // the reference gradients independently of the grouped attention logic.
+  const mmltk::backend::ml::cuda::TorchAutocastScope full_precision(false, torch::kFloat32);
+  const auto precision = q.scalar_type() == torch::kFloat16 || q.scalar_type() == torch::kBFloat16 ? torch::kFloat32 : q.scalar_type();
+  auto scores = torch::matmul(q.to(precision), k.to(precision).transpose(-1, -2)) / std::sqrt(static_cast<double>(width / heads));
+  if (admitted.defined()) scores = scores.masked_fill(~admitted.unsqueeze(1), -std::numeric_limits<float>::infinity());
+  const auto probabilities = torch::softmax(scores, -1);
+  joined = torch::matmul(probabilities, v.to(precision)).to(v.scalar_type()).transpose(1, 2).reshape_as(target);
+ }
  return torch::linear(joined, module->out_proj->weight, module->out_proj->bias);
 }
 TEST_CASE("Decoder SDPA preserves independent positional and target gradients including coincident values", "[rfdetr][attention][compilation]") {
+ const tensor_fixture::FullMatrixPrecision precision;
  for (const auto& [device, dtype] : tensor_fixture::available_amp_precisions()) {
   for (const int64_t queries : {1, 3}) {
    AttentionPair pair(device);
@@ -259,8 +271,10 @@ TEST_CASE("Decoder SDPA preserves independent positional and target gradients in
  }
 }
 TEST_CASE("Ordinary and DN grouped SDPA match masked dense equations with retained AMP backwards", "[rfdetr][attention][compilation]") {
+ const tensor_fixture::FullMatrixPrecision precision;
  for (const auto& [device, dtype] : tensor_fixture::available_amp_precisions()) {
   for (bool dn : {false, true}) {
+   CAPTURE(device.str(), dtype, dn);
    const auto options = torch::TensorOptions().device(device);
    rf::DecoderQueryLayout layout;
    layout.ordinary = {2, 3};
@@ -308,7 +322,13 @@ TEST_CASE("Ordinary and DN grouped SDPA match masked dense equations with retain
     oracle_losses[index].backward();
    }
    for (const auto& [actual_input, expected_input] : inputs) REQUIRE(torch::allclose(actual_input.grad(), expected_input.grad(), 2e-2, 5e-3));
-   for (const auto& item : actual->named_parameters()) REQUIRE(torch::allclose(item.value().grad(), oracle->named_parameters()[item.key()].grad(), 2e-2, 5e-3));
+   for (const auto& item : actual->named_parameters()) {
+    const auto expected_gradient = oracle->named_parameters()[item.key()].grad();
+    const auto difference = (item.value().grad() - expected_gradient).abs();
+    CAPTURE(item.key(), difference.max().item<float>(), (difference / (expected_gradient.abs() * 2e-2 + 5e-3)).max().item<float>());
+    CAPTURE(item.value().grad(), expected_gradient);
+    REQUIRE(torch::allclose(item.value().grad(), expected_gradient, 2e-2, 5e-3));
+   }
    torch::optim::SGD optimizer(actual->parameters(), torch::optim::SGDOptions(0.001));
    torch::optim::SGD expected_optimizer(oracle->parameters(), torch::optim::SGDOptions(0.001));
    optimizer.step();

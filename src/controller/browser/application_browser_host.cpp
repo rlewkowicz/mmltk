@@ -185,6 +185,15 @@ struct ApplicationBrowserHost::Impl final {
      if constexpr (std::same_as<Type, Intent>) {
       const auto endpoint_id = value.endpoint_id;
       const auto correlation = value.correlation;
+      diagnostics.Emit([&] {
+       return services::RuntimeDiagnosticFact{
+        .owner = contracts::DiagnosticOwner::BrowserRuntime,
+        .event = "browser.intent.received",
+        .participant = endpoint_diagnostic_name(endpoint_id),
+        .sequence = endpoint_id,
+        .value = correlation,
+       };
+      });
       auto reply = dispatch_intent(*installed, std::move(value));
       if (reply.error.has_value()) {
        diagnostics.Emit([&] {

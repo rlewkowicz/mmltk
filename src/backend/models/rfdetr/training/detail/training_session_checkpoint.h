@@ -34,6 +34,7 @@ public:
  void require_unchanged() const;
  // Inspection retains exact file evidence and its lease, without tensor/plan allocations.
  void release_decoded_state();
+
 private:
  struct Lease;
  // Declared first so all decoded readers retire before the generation lease.
@@ -48,10 +49,10 @@ public:
  explicit TrainingSessionCheckpoint(std::filesystem::path directory);
  [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
  // All serialize callbacks run synchronously at the session's drained boundary.
- void publish(TrainingSessionManifest&, const TrainingPlanState&,
-  std::function_ref<void(const std::filesystem::path&, std::size_t)> serialize,
-  std::span<const std::shared_ptr<const TrainingArtifactAdmission>> candidates = {},
-  std::function_ref<void(TrainingPublicationStep)> observe = [](TrainingPublicationStep) {});
+ void publish(
+  TrainingSessionManifest&, const TrainingPlanState&, std::function_ref<void(const std::filesystem::path&, std::size_t)> serialize,
+  std::span<const std::shared_ptr<const TrainingArtifactAdmission>> candidates = {}, std::function_ref<void(TrainingPublicationStep)> observe = [](TrainingPublicationStep) {});
+
 private:
  std::filesystem::path directory_, path_;
  std::vector<std::shared_ptr<const TrainingArtifactAdmission>> candidates_;

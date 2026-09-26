@@ -18,7 +18,8 @@ int main(int argc, char** argv) {
   const auto precision = agree_training_precision(group, device, true, true);
   const std::array<std::uint8_t, 2> precision_signature{static_cast<std::uint8_t>(precision.autocast_dtype), static_cast<std::uint8_t>(precision.fused_optimizer)};
   distributed_agree(group, "precision", precision_signature);
-  const std::array<std::uint8_t, 3> signature{3, 2, 1}; distributed_agree(group, "fixture", signature);
+  const std::array<std::uint8_t, 3> signature{3, 2, 1};
+  distributed_agree(group, "fixture", signature);
   if (std::string_view(argv[4]) == "cancel") {
    auto ready = torch::ones({1}, torch::TensorOptions().device(mmltk::backend::ml::cuda::cuda_device(device)).dtype(torch::kInt32));
    distributed_all_reduce_tensor(group, ready);
@@ -39,6 +40,7 @@ int main(int argc, char** argv) {
   return 0;
  } catch (const std::exception& error) {
   std::fprintf(stderr, "distributed training rank %d failed: %s\n", group.rank, error.what());
-  distributed_abort(group); return 1;
+  distributed_abort(group);
+  return 1;
  }
 }

@@ -257,7 +257,8 @@ impl ApplicationModel {
 
     /// A new attempt or successful admission rearms only this action's episode.
     pub fn begin_admission(&mut self, endpoint: ApplicationIntentEndpoint) {
-        self.notices.clear_condition(notices::Origin::Admission(endpoint));
+        self.notices
+            .clear_condition(notices::Origin::Admission(endpoint));
     }
 
     pub fn report_admission_error(&mut self, endpoint: ApplicationIntentEndpoint, error: UiError) {

@@ -59,33 +59,10 @@ bindings project native facts; mutation remains with the owning system.
 | Firefox process lifetime and Linux process registrations | Firefox process owner |
 | Vulkan source images, independent backing allocations, views, external timelines, browser sample storage, graphics queues, swapchain, compositor cadence, and Wayland presentation | Firefox graphics integration |
 
-Each domain system also owns its private workers, GPU resources, models, and
-reusable content. All workspace sources use shared input and rendering facilities.
-The common renderer owns autonomous incremental drawing, reusable display storage,
-damage, and asynchronous graphics handoffs. Product systems supply their native
-content and domain drawing operations. Rendering retained content reuses completed
-inference, upscaling, decoding, and capture results.
-
-Firefox allocates the foreground workspace's two physical Vulkan display buffers
-and exports their independent memory and timeline resources. Native rendering
-finalizes display pixels and signals readiness in its GPU execution boundary.
-Presentation coordinates source routing and admission; native CUDA imports retain
-backing and context custody through all native writes and raw readers. The FD
-graphics connection and external GPU semaphores own the complete graphics handoff.
-
-Every workspace tab captures and delivers mouse input through the same immediate
-path and canonical vocabulary. Movement, all button transitions, click semantics,
-wheel input, and cancellation reach the appropriate native owner in order.
-Iced retains local view transforms and component state. Domain owners apply their
-own interaction behavior through the shared input facilities.
-
-Annotation owns its sole mutable document, editing history, hit testing, and
-gestures. Its input executor uses the shared workspace input facilities.
-The shared autonomous renderer consumes coherent native state independently of
-input arrival.
-GPU source preparation and color sampling return ordered continuations to the
-document owner. Accepted ordinary input and document commands progress
-independently of rendering and external image readers.
+Shared input and rendering facilities serve every workspace source. Product
+systems retain domain interaction and content ownership; the common renderer
+draws retained content independently of input and computation. Presentation
+coordinates foreground routing and graphics admission.
 
 ## Model, presentation model, and views
 
@@ -108,201 +85,115 @@ independently of rendering and external image readers.
     composition, widgets, layout, styling, themes, responsive behavior
 ```
 
-Canonical C++ declarations own domain types, defaults, constraints, stable
-identities, and operations. C++26 reflection derives structural projections,
-validation, exhaustive dispatch, schema identity, and generated typed Rust
-bindings and codecs. A schema change flows from that declaration through the
-boundary. Ordinary classes retain direct public contracts and private state;
-reflection supplies reusable structural machinery.
+Canonical C++ declarations own domain facts and operations. C++26 reflection
+derives validation, exhaustive dispatch, schema identity, and typed bindings
+from those declarations. Ordinary classes own behavior and private state;
+Rust/Iced owns presentation and interaction.
 
-At runtime, the browser server and the Rust presentation model exchange bounded,
-typed CBOR over bidirectional WebSockets bound to the local application
-session. Rust verifies schema agreement before installing current native
-snapshots. Input is fully validated before dispatch. Transport queues and
-backpressure remain bounded; loss of essential state continuity closes the
-peer so reconnection can install current snapshots.
+The local application connection carries validated input, operations, and
+logical state through bounded transport. Schema agreement precedes snapshot
+installation; loss of essential continuity reconnects to current snapshots.
+The separate FD graphics connection carries completed images, paired metadata,
+and GPU ownership. Application state and display readiness progress independently.
 
-The application connection carries input, settings, navigation, document
-commands, and logical UI facts. Graphics allocations, completed images,
-image-dependent metadata, and GPU read/write ownership flow through the separate
-FD graphics connection. A workspace component binds to that graphics source
-independently of application snapshot delivery.
-
-Rust owns presentation state and deliberate Iced views. Typed native replies
-and events update that state; UI actions submit typed operations to the owning
-C++ systems. Component-local interaction stays local, and routing composes
-pages through domain outcomes. The destination page selects its foreground
-source and retains only viewer work belonging to that page. Dataset availability
-and completed display readiness progress independently.
+Typed results update the Rust presentation model; UI actions reach the owning
+C++ system. Components retain local interaction state, and destination pages
+select their foreground sources. The [source guide](docs/architecture.md) locates
+these boundaries.
 
 ## Product interface
 
-The Iced interface provides coherent training, validation, prediction, live,
-annotation, export, and exploration workflows with Fluent styling, light and
-dark themes, responsive workspaces, settings, diagnostics, and session Status notifications.
-Progress appears with its owning operation or model. Known totals support
-determinate progress; open-ended work exposes stage, activity, and completed
-work. Completion and failure come from typed native results and events.
+Train, Validate, Predict, and Export share model preparation, artifact selection,
+and output presentation while retaining independent admission and execution.
+Explicit start actions capture validated settings, inputs, destinations, and
+compute-device choices; active operations expose cancellation. Completed artifacts
+and previews survive interruption or failure, and success settles required output
+writes.
 
-A bounded, memory-only frontend session history owns operational warnings and
-errors across workflows and reconnects. Independent native operation identities
-and retained component conditions govern observation and acknowledgement.
-The fixed header Status control opens a selectable, copyable notification panel
-above page and modal content. Notification arrival preserves navigation, focus,
-progress, controls, and completed products; dismissal changes only session
-presentation. Settings and Status remain reachable independently of page scrolling.
-Browser startup retains its emergency recovery interface when Iced cannot render.
+Validation and exploration share viewers while retaining their own results and
+display policies. Prediction owns incremental image/video processing and output
+policy; native media facilities preserve source timing, audio, and interrupted
+output. Display filtering preserves inference, evaluation, and annotation meaning.
+Annotation owns atomic import, ordered editing, undo/redo, and explicit saving.
+Upscale consumes the selected native source; Live owns capture and processing.
 
-Training, validation, and prediction start through their primary action,
-including required settings settlement, model preparation, and input inspection.
-Train, Validate, Predict and Export share artifact-selection and output
-presentation while keeping workflow controls and admission independent.
-Each workflow admits its automatic or manual output at accepted
-execution, preserves completed artifacts on failure, and separates configured
-destinations from run results. Output cards lead the right column, followed by
-shared GPU selection and optional workflow tools. Each workflow retains its compute-device
-preference from the native available-device inventory. Admission captures that
-selection for model preparation and execution; local training retains ordered
-multi-device ranks and their placement. Unavailable selections produce useful
-errors. The browser's graphics device remains independently selected.
-Training owns current-format history, fresh transfer initialization, immutable
-whole-session continuation, and selected native deployment artifacts. A session
-replicates every logical trajectory across the selected devices, completes one
-common initialization, and keeps optimizer, scheduler, scaler, stochastic and EMA
-state independent. Periodic synchronization averages compatible ordinary values
-by successful global images while leaving those trajectory states intact. Scheduled
-validation records distinguish individual, synchronized and selected artifacts.
-Native training configuration owns one recipe vocabulary across global defaults
-and stable independent model settings, with checked logical batch and admission
-facts. Global microbatches, accumulation, data identity, and stochastic inputs
-remain independent of physical worker capacity and rank slicing. Each logical
-microbatch retains its global criterion normalization and fixed accumulation
-weight; ranks sum its gradients, including zero contributions from empty slices.
-The session orders distributed communication, while a trajectory owns bounded
-reusable gradient storage and physical completion before globally agreed updates.
-Live and saved metrics describe global logical progress with stable session and
-model identity. Training owns
-scheduler clocks, held optimizer values, and separate final-epoch encoder and
-augmentation policies. Exact continuation admits the complete immutable session
-generation before restoring live model and optimizer state. Publication preserves
-the current and previous complete generations and bounded active reader leases.
-Final selection evaluates native ordinary or EMA ingredients from one common
-initialization and validation context; segmentation selection requires mask AP.
-The frozen selected artifact drives final test and the existing export chain,
-while individual artifacts survive selection or publication failure. Deployment
-artifacts support transfer initialization; optimizer Resume requires a complete
-session. Continuation restores applied policy before newly due policy; applied policies remain
-latched when the epoch horizon is extended. Selecting inputs, continuation mode, or an
-output directory never starts a run. Compact operational text fits a stable
-single line while preserving complete accessible and copyable content.
-Export independently selects interchange and engine artifacts through one
-shared model-conversion chain with complete intermediate resource custody.
-Rust/Iced owns a bounded retained chart dashboard in the aspect-selected center
-workspace, defaulting to 16:9. Selected charts fit the available workspace without
-internal scrolling and expand within that same region; wheel input belongs to
-the ordinary page scroller. Retained chart interaction survives expansion,
-hiding, and navigation. Live training progress appears in a separate card
-below the charts, using current native image counts and measured rates
-independently of explicitly selected saved history. Sparse scheduled evaluation
-observations remain separate from live training samples and final-test products.
-Only the selected evaluation weights are plotted; validation loss is not
-calculated or plotted by the GUI.
+Rust/Iced provides responsive themed workflows, retained interaction state, and
+operation-local progress. A bounded history in frontend memory retains warnings
+and errors across reconnects while preserving active work. Settings and Status
+remain reachable, and browser recovery remains available if Iced cannot render.
+[Workflow behavior and artifacts](docs/rfdetr-workflows.md) and
+[GUI interaction](docs/gui-interaction.md) have their detailed references.
 
-Validation presents fixed COCO summaries and up to six retained samples from its
-evaluation pass in a fixed metrics/preview workspace. It shares atlas containment
-and the complete image viewer with Explore, while retaining its own sample
-selection and overlay policy. Progressive capture continues independently of
-the selected detail view. Successful validation retains all captured samples
-for the return to its atlas, including through asynchronous presentation and
-retry. Both viewers support navigation, fit, pan, zoom,
-upscaling, and ground-truth import into Annotation. Validation independently
-controls its complete ground-truth and detection layers, uses complementary
-class colors, adds overlapping mask/outline RGB with unchanged alpha, and paints
-detection captions after ground-truth captions. Explore retains its own palette
-and overlay behavior. Preview confidence filters retained detections for display
-while preserving inference, evaluation metrics, reports, and ground-truth import.
-Prediction incrementally processes compiled images, ordinary images, and local
-video, retaining the latest completed preview through completion or cancellation.
-GUI prediction uses one image per batch; video has pause, resume, and stop.
-Validation saves the selected evaluation samples with run-captured display
-choices. Prediction independently selects image samples or complete annotated
-video without reducing admitted inference coverage. Saved media uses native
-source geometry independently of viewer state or browser availability.
-Video output preserves source timing and audio, completed partial media survives
-interruption, and successful settlement waits for required writes. Native media
-facilities own demux, timestamps, packet custody, encoding and container lifetime;
-prediction owns sampling and annotation policy.
+## Training lanes and handoffs
 
-Primary execution actions expose their owning cancellation while active, with
-shared visual feedback driven by visible browser redraws. Annotation's primary
-action remains save-only and prevents duplicate accepted saves.
+Native training separates logical lanes from physical execution capacity. The
+session owns data planning and distributed communication order. Each logical
+model owns its optimizer and training state, with an AdamW, Muon, or SGD recipe.
 
-Training admits target populations above the model's query count. Stock
-supervision retains its pinned reference mathematics for equivalent admitted
-inputs and settings. Optional learned correspondence and denoising supervise
-boxes and masks while preserving ordinary deployment outputs. Selective native
-compilation retains guarded tensor regions, live parameter ownership, ordinary
-fallback and equivalent training behavior. Optional EMA remains GPU-resident;
-each scheduled validation and best-weight decision use one selected weight set.
-Metric publication and persistence progress independently of browser rendering
-and telemetry storage pressure, with incomplete history explicitly visible.
-Optional perceptual downscaling belongs to existing compilation and augmentation
-owners and preserves categorical annotations and their geometric transforms.
+```text
+SHARED GRADIENTS                    INDEPENDENT / PERIODIC
+┌─────────────────────────────┐    ┌─────────────────────────────────┐
+│ Logical lanes               │    │ Lane A → Model A + optimizer A  │
+│       ↓ gradients           │    │ Lane B → Model B + optimizer B  │
+│ One model + one optimizer   │    │   …                             │
+└─────────────────────────────┘    └─────────────────────────────────┘
 
-Dataset compilation defaults to stretching the source into the model canvas,
-with an explicit aspect-preserving Letterbox alternative independent of RGB
-resampling policy. Compiled data preserves continuous source-box meaning,
-original annotation area, crowd and raw-ignore facts, available source
-identities, annotation order, and explicit mask presence. Supplied boxes remain
-authoritative even when mask support differs or becomes empty. Training and
-evaluation share this data meaning; crowd regions belong to evaluation rather
-than foreground supervision. Model execution owns normalization of raw compiled
-RGB independently of retained preview pixels.
+EVERY MODEL • distributed data parallel (DDP) across all selected GPUs
+Global microbatches → GPU slices → gradient SUM → agreed optimizer update
 
-Built-in dataset compilation shares acquisition, persistent source caching,
-annotation normalization, and atomic output publication across recipes.
-Eligible acquisition, annotation, and pixel work overlap within one bounded
-worker budget. Readers retain immutable source generations through completion;
-repair waits for affected readers to settle, and final publication admits only
-complete, consistent output.
-Coco custom retains the established sampled benchmark recipe. COCONut admits
-its full training membership, including images without foreground instances,
-with explicit validation membership and annotation choices. Physical image
-identity remains distinct from annotation edition and declared release identity.
-Optional COCONut recovery restores conservatively matched dropped foreground
-masks from original annotations and removes their pixels from surviving masks,
-retaining authoritative boxes and explicit recovery provenance. Carved masks
-retain their resulting visible source area.
-Progress independently exposes acquisition, labels/masks, and pixels with actual
-completed work, known or unknown totals, and explicit repair withdrawals.
-Diagnostics observe that work independently of cache validity and completion.
+PERIODIC ONLY • after admitted work settles
+Model weights → native average → every model on every GPU
+                Optimizers and other training state stay per model
+```
 
-Images and their annotation meaning share source identity and geometry through
-preview, augmentation, upscale, and editing. Clean pixels and native semantic
-image planes remain separate until producer-owned final display composition.
-Iced draws text labels from typed facts paired with the displayed image through
-the graphics connection. Class colors remain deterministic and stable across
-filtering and transformations.
-Visibility controls preserve the underlying objects. Annotation imports are
-atomic; editing, undo, redo, and saving preserve operation order and geometry.
-Derived results match the current source and requested processing parameters.
+Models share a verified initialization while retaining independent trajectories.
+Logical batches and training semantics survive changes in physical concurrency.
+Periodic averaging weights models by images in successful updates. Validation
+and final selection use a common evaluation context independently of merge
+cadence; individual artifacts survive selection or export failure.
 
-Iced owns fit, crop, pan, zoom, clipping, sampling, and redraws of completed
-workspace images. Native product dimensions remain independent of window size.
-Images and their attached metadata use the same view geometry.
-Original view displays source proportions using completed pixels and their
-paired source geometry. The model-canvas view uses the native input's proportions
-and includes its padding. Both choices reuse completed processing.
-Upscale follows the currently selected native source and restores explicitly
-stretched compiled content to source aspect before processing, without shrinking
-either input axis. Letterbox input retains its proportional content and padding;
-unknown source geometry preserves native dimensions. Native input geometry remains
-distinct from prepared and derived geometry. Annotation import captures the
-displayed crop and proportions and materializes pixels and annotation meaning
-through that same transform.
-Same-image revisions retain viewer identity and transforms; a new image resets
-them. Stable widget identities preserve interaction state through ordinary
-updates.
+```text
+TRAINING PRODUCTS
+Complete immutable session ───────────────────────→ exact Resume
+
+Retained model candidates → native selection / weight averaging
+                                             │
+                                             ▼
+                                  frozen native artifact
+                                             ├─ final test
+                                             ├─ export
+                                             └─ Transfer
+```
+
+Resume restores the complete session; Transfer maps deployment weights by class
+meaning. Final test consumes the frozen selection. Metrics and persistence
+progress independently of browser rendering.
+
+Inference workflows own bounded parallel lanes with ordered delivery. Immutable
+weights may be shared; each lane retains its mutable execution and storage.
+Readers settle before model weights change or lane pools retire.
+
+## Data and model meaning
+
+An immutable data catalog defines class meaning independently of model execution.
+Dataset categories, catalog references, model output slots, and external identities
+remain distinct. Admission validates artifact identity and class meaning.
+Unresolved external identities remain raw and are excluded from semantic
+evaluation. Systems preserve the declared catalog and reference domain with
+their products.
+
+Compilation shares acquisition, retained source caching, and atomic publication
+across dataset recipes. Readers retain consistent source generations through
+completion and repair. Products retain source identity, annotation meaning,
+provenance, and the relationship between source and derived geometry through
+compilation, preview, augmentation, upscaling, and editing. Clean pixels and
+semantic planes remain separate until final display composition.
+
+Iced applies a common view transform to completed pixels and their metadata,
+independently of native product dimensions. Annotation imports preserve the
+displayed geometry; derived products retain their source correspondence.
+Visibility changes preserve underlying objects.
+[Dataset formats and compilation](docs/datasets.md) own the detailed data rules.
 
 ## GPU buffer flow
 
@@ -318,170 +209,64 @@ Iced workspace drawing → Firefox swapchain/compositor → Wayland
                       └──────────────────────→ producer back-buffer reuse
 ```
 
-Producers retain independent, reusable resources while backgrounded. A clean
-single-plane product writes directly into available admitted final storage when
-its raw-reader and graphics lifetimes permit. Otherwise raw production continues
-in retained native storage. Products with native semantic planes retain those
-raw planes and perform one fused final composition. Algorithm systems continue
-to borrow raw products for explicit
-receiver-owned copies; their clean pixels, documents, and semantic meaning
-remain independent of display preparation.
+Independent producers retain raw products and reusable display resources.
+Shared native rendering prepares final pixels from retained content; input and
+logical work progress independently of browser availability. Product handoffs
+retain borrowed reads until receiver-owned copies complete.
 
-Layout negotiation belongs to the exact browser device incarnation and physical
-capacity. Firefox validates the shared-image capabilities and layout, creates
-each independent Vulkan allocation, and completes initial external ownership
-before exporting memory and timeline resources. Native CUDA imports the full
-allocation on the matching producer execution owner. It retains its context
-and independent backing custody through every native alias, including browser
-replacement and process exit. The producer then fills the final workspace.
-Late admission uses retained raw data without rerunning inference, reapplying
-edits, or requiring another camera frame.
-Logical completion and ordered input consumption never wait for the browser.
+Firefox allocates and exports Vulkan storage; native CUDA owns imported access
+and producer completion. Persistent front/back buffers exchange roles after
+completed writes, with GPU semaphores ordering access. Image-dependent metadata
+travels with its image: Firefox transports it opaquely and Rust interprets the
+generated native types.
 
-The foreground workspace has two persistent shared display buffers with front/back
-ownership, independently of retained native image products and document history.
-The producer writes a reusable back buffer, completes its image and attached
-metadata, and signals readiness through the external GPU semaphore.
-The graphics owner selects the latest completed buffer locally during draw
-preparation and retains the previous completed image while newer work is
-unfinished. The browser returns a buffer for reuse after its final GPU read
-and ownership release. External semaphore completion orders actual device access.
-Raw consumers independently retain the products they read.
+Firefox samples shared storage directly where supported and otherwise uses a
+bounded reusable GPU copy. The last completed image remains drawable through
+new work, capacity growth, and presentation failure. Producers, readers, and
+draws retain storage, backing, devices, and contexts until physical use
+settles, including across browser replacement and process exit.
 
-Buffer promotion exchanges roles without copying pixels. Firefox directly samples
-shared source storage when its requesting device supports the layout and usage.
-The capability fallback performs one GPU copy into bounded reusable sample
-storage. Copied pixels retain their own lifetime for future draws. Source
-retirement waits for the source's physical GPU reads. Capacity growth preserves
-the completed image until replacement is usable and retains useful high-water
-capacity. Setup, growth, and retirement remain asynchronous and bounded.
-
-Image dimensions, crop, atlas placement, labels, and other image-dependent facts
-travel with the image they describe. Firefox transports application metadata
-opaquely; the owning Rust workspace component interprets the generated native
-types. The graphics handoff makes that image and its metadata available together.
-Application snapshots independently describe logical UI state and operation
-outcomes.
-
-Display custody and each encoded draw retain independent resource references.
-Actual submission settlement or unsubmitted abandonment releases draw custody.
-Direct reads and capability copies preserve their respective physical completion
-requirements. Page and device teardown settle terminal resource ownership
-independently from rendering success. The last completed image remains drawable
-through newer work, capacity pressure, source changes, or presentation failure.
-
-The browser's display device follows its Wayland graphics session independently
-of each product's compute device. Native imports match the display allocation's
-physical device identity. Display-device mismatch uses producer-owned finalization
-through the existing peer or reusable pinned transfer route, retaining pending
-finalization custody through completion. Same-GPU display keeps pixels on the
-GPU; explicit diagnostic probes may read back samples. Firefox owns downstream
-graphics queues, swapchain, compositor cadence, and Wayland presentation
-independently of Live capture rate.
+Wayland GPU presentation is the sole display path. The display device follows
+the Wayland session independently of workflow compute devices; producers own
+required transfers between them. Same-device display stays on the GPU, and
+Firefox owns presentation cadence independently of capture.
+[GPU execution](docs/gpu-execution.md) owns allocation and transfer details.
 
 ## Execution, failure, and shutdown
 
-Ordinary C++ calls, compact results, exceptions, and RAII govern control flow.
-A genuine domain lifecycle keeps its states and transitions private within its
-system. Long-running systems own their workers, stop mechanism, GPU context,
-streams, models, and bounded working storage. Threads bind the appropriate GPU
-context before issuing work, and algorithmic parallelism stays with the
-algorithm's owner. GPU boundary execution declares device-local permitted CPU
-and memory placement. Workers retain fixed CPU assignments and verify strict
-memory locality and required high normal-scheduler and storage I/O priorities
-before accepting work. Owned host transfer and solver storage retains verified
-local pages through every consumer; unavailable required placement or policy
-becomes an operation failure. Independent systems own their worker budgets and
-may overlap eligible CPUs.
+Each long-running system owns its workers, cancellation, GPU context, and
+bounded working storage. Device-local CPU and memory placement and required
+execution policies are verified before work is admitted. Event-driven execution
+allows independent systems to progress concurrently.
 
-Duplicate discrete jobs report busy. Ordered document commands retain their
-admitted sequence, and cancellation requests the owning system's stop mechanism.
-Synchronous exceptions propagate through direct calls
-and become typed failures once at the nearest operation, worker, or external
-service boundary. Local training preserves the child's useful failure cause
-and exit status in the owning UI; an explicit CUDA memory failure identifies
-batch size and training lanes as user-controlled ways to reduce memory demand.
-A failed system preserves valid snapshots, reports failure,
-and retires its failed resources safely. Recoverable runtimes reconstruct
-lazily within that system, while independent systems continue operating.
-Persisted settings retain their named format. Compiled datasets use format 9
-with source geometry and annotation metadata. Native RF-DETR
-checkpoints use only the current version-4 format. Training history uses version 3,
-and bounded session manifests and selected-output descriptors use version 1.
-External upstream assets retain their independent import formats.
+Discrete jobs report busy while occupied. Accepted input and document commands
+retain their required order independently of rendering. Failures become typed
+outcomes at the owning boundary, preserve useful causes and valid state, and
+retire failed resources safely. Recovery stays within the affected system while
+independent systems continue.
 
-An independent immutable data catalog owns exact foreground names and dense
-zero-based foreground references. Source category IDs, foreground references,
-physical model output slots, and external output IDs are distinct domains. Model
-artifacts carry validated output roles, score encoding, class layout, and
-provenance. Unknown external identities remain visibly raw and cannot enter
-semantic evaluation. Artifact and descriptor identity is checked at admission
-and replacement, never per prediction.
-
-Fresh transfer maps verified class-dependent state by semantic identity while
-preserving unmatched initialized values; resume requires exact layout and state.
-Training splits share exact ordered catalogs; standalone evaluation admits an
-explicitly verified catalog permutation. Background/no-object meaning belongs
-to the artifact's validated layout and never becomes a foreground detection.
-Prediction, analysis, annotation, and presentation preserve the declared reference
-domain and catalog with their owned data. Mask storage is consumed only when
-the current result explicitly declares masks available.
-
-RAII protects complete and partial construction, borrowed views, mappings,
-asynchronous GPU work, and external consumers. Resource release respects GPU
-completion and consumer lifetime, including cancellation, dependency loss,
-capacity failure, and shutdown.
+The shell initiates coordinated shutdown; each system settles its own work.
 
 ```text
 Stop browser ingress → request system stops → return from browser loop
     → stop and join Firefox → join system workers → release resources
 ```
 
-The shell initiates shutdown; systems finish their own work and reverse-order
-RAII releases physical resources. Vulkan images and semaphores retain their
-device, and native CUDA imports retain their context and independent backing,
-through their own completed uses. Registry removal, IPC closure, and exporter
-exit do not substitute for physical resource settlement. Failures leave
-resources safe to destroy and shutdown outcomes observable.
+RAII protects partial construction, borrowed data, asynchronous work, and external
+consumers. Release follows physical GPU completion and consumer lifetime through
+cancellation, dependency loss, and shutdown.
 
 ## Performance and observability
 
-Execution uses system-owned workers and completion notifications, with bounded
-outstanding GPU work. Independent systems run concurrently. Ordered mouse input
-preserves every accepted event through temporary pressure and reaches the native
-owner immediately. Native event storage retains useful high-water capacity.
-Input consumption, document-command settlement, and image publication progress
-independently while retaining their required order. Long-lived buffers reuse
-tightly sized storage; steady-state graphics reuses geometry, image planes, and
-staging while updating affected content.
+Work follows product changes, demand, and completion notifications. Independent
+input, computation, publication, and redraw paths reuse completed products and
+retained capacity. Incremental rendering updates affected content; idle, hidden,
+and unchanged display work remains quiet. Resource growth and outstanding work
+stay bounded.
 
-Logical annotation UI facts describe the latest committed document. A new gesture
-resolves its target from the current native document and logical tool; accepted
-progress retains that target independently of rendering. Document/history-owned
-identities preserve editing and Undo/Redo without changing saved formats. Input
-consumption and GPU-dependent document commands retain their separate completion
-requirements. The autonomous renderer consumes coherent native state and keeps
-its useful caches while external display storage is occupied.
-
-Explore atlas loading follows the visible viewport and scroll direction: visible
-rows first, then leading rows, then prior rows. Cached rows entering the viewport
-populate its first result before additional content is fetched. Each tile shows
-source proportions within a padded cell. Gallery restoration preserves logical
-demand and republishes retained products through graphics availability.
-Viewport changes, newly loaded content, and actual product changes update the
-content used by shared incremental rendering. All visual producers use that
-autonomous rendering path.
-Browser redraws follow the visible window's graphics cadence and can reuse unchanged
-completed pixels.
-The optional workspace FPS display counts actual browser queue submissions
-containing workspace draws and belongs to the workspace component.
-
-Opt-in JSONL diagnostics provide granular system, operation, resource, and
-failure context. Crashes and fatal operation or process failures remain visible
-on stderr in normal execution, with a concise component and available error or
-exit status, independently of optional diagnostic sinks. Requested healthy
-shutdown remains quiet. Disabled diagnostics create no active diagnostic or probe
-state and perform no diagnostic collection, formatting, clock reads, counter
-updates, or I/O. Diagnostic identities remain effect-only observations.
-Explicitly enabled fatal diagnostics capture bounded troubleshooting context
-before orderly shutdown.
+Opt-in diagnostics provide system and failure context. Disabled diagnostics do
+no diagnostic work. Diagnostic identities observe behavior; product ordering,
+validity, and resource lifetime remain independent of them. Crashes and fatal
+operation or process failures report a concise cause on stderr even when
+diagnostics are disabled. Healthy shutdown remains quiet.
+[Logging](docs/logging.md) owns operational details.

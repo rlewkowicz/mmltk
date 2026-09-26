@@ -22,13 +22,15 @@ struct TrainingScheduleState final {
 [[nodiscard]] double compute_warmup_momentum(const TrainRecipeSettings&, std::uint64_t current_attempt, std::uint64_t reference_attempts, double target);
 class TrainingSchedule final {
 public:
- TrainingSchedule(TrainRecipeSettings, std::vector<double> base_lrs, std::vector<TrainingGroupRole>, std::uint64_t epochs, std::uint64_t first_epoch_microbatches, std::uint64_t microbatches_per_attempt);
+ TrainingSchedule(
+  TrainRecipeSettings, std::vector<double> base_lrs, std::vector<TrainingGroupRole>, std::uint64_t epochs, std::uint64_t first_epoch_microbatches, std::uint64_t microbatches_per_attempt);
  void restore(TrainingScheduleState);
  void begin_epoch(std::uint64_t epoch);
  void consume_microbatch();
  void prepare_attempt();
  void finish_attempt(bool successful);
  [[nodiscard]] const TrainingScheduleState& state() const noexcept { return state_; }
+
 private:
  [[nodiscard]] double epoch_factor() const noexcept;
  TrainRecipeSettings recipe_;
@@ -40,4 +42,4 @@ private:
 };
 MMLTK_REFLECT_ENUM(TrainingGroupRole)
 MMLTK_REFLECT_FIELDS(TrainingScheduleState)
-}
+}  // namespace mmltk::backend::models::rfdetr

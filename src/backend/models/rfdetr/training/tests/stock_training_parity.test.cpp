@@ -390,39 +390,42 @@ TEST_CASE("Training step restores precision on payload failure and rejects an em
  REQUIRE(at::autocast::get_autocast_dtype(at::kCUDA) == dtype);
  REQUIRE_THROWS_AS(rf::TrainingStep(0, 1.0, false, torch::kFloat32), std::invalid_argument);
 }
-
 TEST_CASE("SGD preserves coupled decay first buffer Nesterov undefined gradients and exact Resume", "[rfdetr][training][optimizer]") {
- for (const double momentum : {0.0, .9}) for (const bool nesterov : {false, true}) {
-  if (nesterov && momentum == 0) continue;
-  auto parameter = torch::tensor({1.25, -.5}, torch::kFloat64).set_requires_grad(true);
-  auto expected = parameter.detach().clone();
-  torch::Tensor buffer;
-  rf::NativeSGD::Group group{{.05, .1, momentum, nesterov, rf::TrainingGroupRole::Ordinary}, {0}};
-  rf::NativeOptimizer optimizer(rf::NativeSGD({group}, {{"weight", parameter}}));
-  for (int step = 0; step < 4; ++step) {
-   auto gradient = torch::tensor({.2 + .1 * step, -.3}, torch::kFloat64);
-   parameter.mutable_grad() = gradient;
-   auto direction = gradient + .1 * expected;
-   if (momentum != 0) {
-    buffer = buffer.defined() ? momentum * buffer + direction : direction.clone();
-    direction = nesterov ? direction + momentum * buffer : buffer;
-   }
-   expected = expected - .05 * direction;
-   optimizer.step();
-   REQUIRE(torch::allclose(parameter, expected, 1e-12, 1e-12));
-   optimizer.zero_grad(true);
-   optimizer.step();
-   REQUIRE(torch::allclose(parameter, expected, 1e-12, 1e-12));
-   if (step == 1) {
-    auto saved = optimizer_checkpoint(optimizer);
-    auto candidate = optimizer.stage_load(saved); optimizer.commit(std::move(candidate));
+ for (const double momentum : {0.0, .9})
+  for (const bool nesterov : {false, true}) {
+   if (nesterov && momentum == 0) continue;
+   auto parameter = torch::tensor({1.25, -.5}, torch::kFloat64).set_requires_grad(true);
+   auto expected = parameter.detach().clone();
+   torch::Tensor buffer;
+   rf::NativeSGD::Group group{{.05, .1, momentum, nesterov, rf::TrainingGroupRole::Ordinary}, {0}};
+   rf::NativeOptimizer optimizer(rf::NativeSGD({group}, {{"weight", parameter}}));
+   for (int step = 0; step < 4; ++step) {
+    auto gradient = torch::tensor({.2 + .1 * step, -.3}, torch::kFloat64);
+    parameter.mutable_grad() = gradient;
+    auto direction = gradient + .1 * expected;
+    if (momentum != 0) {
+     buffer = buffer.defined() ? momentum * buffer + direction : direction.clone();
+     direction = nesterov ? direction + momentum * buffer : buffer;
+    }
+    expected = expected - .05 * direction;
+    optimizer.step();
+    REQUIRE(torch::allclose(parameter, expected, 1e-12, 1e-12));
+    optimizer.zero_grad(true);
+    optimizer.step();
+    REQUIRE(torch::allclose(parameter, expected, 1e-12, 1e-12));
+    if (step == 1) {
+     auto saved = optimizer_checkpoint(optimizer);
+     auto candidate = optimizer.stage_load(saved);
+     optimizer.commit(std::move(candidate));
+    }
    }
   }
- }
 }
 TEST_CASE("Optimizer inventories retain cold named parameters and initialize once upon activation", "[rfdetr][training][activation]") {
  for (const auto kind : {rf::TrainOptimizerKind::AdamW, rf::TrainOptimizerKind::Muon, rf::TrainOptimizerKind::SGD}) {
-  rf::TrainRequest request; request.recipe.optimizer = kind; rf::reset_train_recipe(request.recipe);
+  rf::TrainRequest request;
+  request.recipe.optimizer = kind;
+  rf::reset_train_recipe(request.recipe);
   request.fused_optimizer = false;
   auto active = torch::full({2, 2}, .7).set_requires_grad(true);
   auto frozen = torch::full({2, 2}, .4);
@@ -435,9 +438,10 @@ TEST_CASE("Optimizer inventories retain cold named parameters and initialize onc
   CHECK(optimizer.parameters().size() == 1);
   rf::ModelEma ema(optimizer.eligible_parameters(), .9, 0);
   CHECK(ema.shadow_params().size() == 2);
-  frozen.mutable_grad() = torch::ones_like(frozen); // Stale gradients never activate frozen state.
+  frozen.mutable_grad() = torch::ones_like(frozen);  // Stale gradients never activate frozen state.
   active.mutable_grad() = torch::ones_like(active);
-  optimizer.step(); optimizer.zero_grad(true);
+  optimizer.step();
+  optimizer.zero_grad(true);
   CHECK(torch::equal(frozen, torch::full_like(frozen, .4)));
   auto saved = optimizer_checkpoint(optimizer);
   torch::serialize::InputArchive cold;
@@ -445,39 +449,50 @@ TEST_CASE("Optimizer inventories retain cold named parameters and initialize onc
   if (kind == rf::TrainOptimizerKind::SGD) {
    CHECK(mmltk::backend::ml::serialization::require_int(cold, "step") == 0);
    CHECK(mmltk::backend::ml::serialization::require_int(cold, "has_momentum") == 0);
-  } else CHECK(mmltk::backend::ml::serialization::require_int(cold, "initialized") == 0);
+  } else
+   CHECK(mmltk::backend::ml::serialization::require_int(cold, "initialized") == 0);
   torch::Tensor unused;
   CHECK_FALSE(cold.try_read("exp_avg", unused));
   CHECK_FALSE(cold.try_read("momentum_buffer", unused));
-  auto restored = optimizer.stage_load(saved); optimizer.commit(std::move(restored));
-  frozen.set_requires_grad(true); optimizer.activate();
+  auto restored = optimizer.stage_load(saved);
+  optimizer.commit(std::move(restored));
+  frozen.set_requires_grad(true);
+  optimizer.activate();
   CHECK(optimizer.parameters().size() == 2);
   CHECK(optimizer.parameter_names() == optimizer.eligible_parameter_names());
   frozen.mutable_grad() = torch::ones_like(frozen);
-  optimizer.step(); optimizer.zero_grad(true);
+  optimizer.step();
+  optimizer.zero_grad(true);
   CHECK_FALSE(torch::equal(frozen, torch::full_like(frozen, .4)));
   auto initialized = optimizer_checkpoint(optimizer);
   optimizer.load(initialized);
   const auto before = frozen.detach().clone();
-  frozen.set_requires_grad(false); optimizer.activate(); optimizer.step();
+  frozen.set_requires_grad(false);
+  optimizer.activate();
+  optimizer.step();
   CHECK(torch::equal(frozen, before));
-  frozen.set_requires_grad(true); optimizer.activate();
+  frozen.set_requires_grad(true);
+  optimizer.activate();
   CHECK(optimizer.eligible_parameter_names()[1] == "backbone.0.encoder.layer.0.weight");
  }
 }
 TEST_CASE("SGD bias warmup groups remain separate when ordinary LR and decay coincide", "[rfdetr][training][optimizer]") {
- rf::TrainRequest request; request.recipe.optimizer = rf::TrainOptimizerKind::SGD; rf::reset_train_recipe(request.recipe);
+ rf::TrainRequest request;
+ request.recipe.optimizer = rf::TrainOptimizerKind::SGD;
+ rf::reset_train_recipe(request.recipe);
  torch::OrderedDict<std::string, torch::Tensor> parameters;
  parameters.insert("head.weight", torch::ones({2}).set_requires_grad(true));
  parameters.insert("head.bias", torch::ones({2}).set_requires_grad(true));
  const auto built = rf::build_optimizer(parameters, request);
  CHECK(built.base_lrs == std::vector<double>{.01, .01});
- CHECK(built.roles == std::vector<rf::TrainingGroupRole>{rf::TrainingGroupRole::Ordinary, rf::TrainingGroupRole::Bias});
+ CHECK((built.roles == std::vector<rf::TrainingGroupRole>{rf::TrainingGroupRole::Ordinary, rf::TrainingGroupRole::Bias}));
 }
 TEST_CASE("Optimizer Resume seals group policy while restoring held schedule and parameter state", "[rfdetr][training][optimizer][continuation]") {
  namespace io = mmltk::backend::ml::serialization;
  for (const auto kind : {rf::TrainOptimizerKind::AdamW, rf::TrainOptimizerKind::Muon, rf::TrainOptimizerKind::SGD}) {
-  rf::TrainRequest request; request.recipe.optimizer = kind; rf::reset_train_recipe(request.recipe);
+  rf::TrainRequest request;
+  request.recipe.optimizer = kind;
+  rf::reset_train_recipe(request.recipe);
   request.fused_optimizer = false;
   auto parameter = torch::full({2, 2}, .7).set_requires_grad(true);
   torch::OrderedDict<std::string, torch::Tensor> parameters;
@@ -487,7 +502,8 @@ TEST_CASE("Optimizer Resume seals group policy while restoring held schedule and
   optimizer.set_lrs(built.base_lrs, .37);
   optimizer.set_momentum(.83);
   parameter.mutable_grad() = torch::full_like(parameter, .2);
-  optimizer.step(); optimizer.zero_grad(true);
+  optimizer.step();
+  optimizer.zero_grad(true);
   auto peer_parameter = parameter.detach().clone().set_requires_grad(true);
   torch::OrderedDict<std::string, torch::Tensor> peer_parameters;
   peer_parameters.insert("transformer.encoder.weight", peer_parameter);
@@ -507,7 +523,8 @@ TEST_CASE("Optimizer Resume seals group policy while restoring held schedule and
    faults.emplace_back(field, int64_t{2});
    faults.emplace_back(field, int64_t{-1});
   };
-  if (kind == rf::TrainOptimizerKind::AdamW) add_boolean_faults("amsgrad", false);
+  if (kind == rf::TrainOptimizerKind::AdamW)
+   add_boolean_faults("amsgrad", false);
   else if (kind == rf::TrainOptimizerKind::Muon) {
    add_boolean_faults("use_muon", true);
    add_boolean_faults("nesterov", true);
@@ -534,7 +551,8 @@ TEST_CASE("Optimizer Resume seals group policy while restoring held schedule and
   // survived both the successful restore and all rejected admission attempts.
   parameter.mutable_grad() = torch::full_like(parameter, .3);
   peer_parameter.mutable_grad() = parameter.grad().clone();
-  optimizer.step(); peer.optimizer.step();
+  optimizer.step();
+  peer.optimizer.step();
   CHECK(torch::allclose(peer_parameter, parameter, 1e-6, 1e-6));
  }
 }

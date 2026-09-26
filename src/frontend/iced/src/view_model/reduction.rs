@@ -16,13 +16,19 @@ impl ApplicationModel {
     pub fn peer_disconnected(&mut self, error: UiError) {
         self.clear_peer_state();
         self.connection = ConnectionState::Reconnecting;
-        let origin = if error.kind == UiErrorKind::Protocol { super::notices::Origin::Protocol } else { super::notices::Origin::Transport };
+        let origin = if error.kind == UiErrorKind::Protocol {
+            super::notices::Origin::Protocol
+        } else {
+            super::notices::Origin::Transport
+        };
         self.report_error(origin, error);
     }
 
     pub fn clear_peer_state(&mut self) {
         self.pending.clear();
-        self.workflow.cancel_start();
+        // Replies from the departed peer are retired with their correlations.
+        // A cancelled preparation cannot wait for one to arrive after reconnect.
+        self.workflow.pending_start = None;
         self.explore.reset_transport();
         self.requested_upscale = None;
         self.sent_upscale = None;
@@ -59,8 +65,12 @@ impl ApplicationModel {
             replacement.install_snapshot(snapshot)?;
         }
         replacement.notices.end_bootstrap();
-        replacement.notices.clear_condition(super::notices::Origin::Transport);
-        replacement.notices.clear_condition(super::notices::Origin::Protocol);
+        replacement
+            .notices
+            .clear_condition(super::notices::Origin::Transport);
+        replacement
+            .notices
+            .clear_condition(super::notices::Origin::Protocol);
         replacement.connection = ConnectionState::Connected;
         *self = replacement;
         Ok(())
@@ -77,7 +87,10 @@ impl ApplicationModel {
             .map(|pending| pending.endpoint)
         else {
             if correlation == 0 || correlation >= self.next_correlation {
-                self.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol("IntentReply correlation was never issued"));
+                self.report_error(
+                    crate::view_model::notices::Origin::Protocol,
+                    UiError::protocol("IntentReply correlation was never issued"),
+                );
             }
             return None;
         };
@@ -91,10 +104,9 @@ impl ApplicationModel {
                     | ApplicationIntentEndpoint::TrainingHistory => {
                         self.workflow.output.fail(correlation)
                     }
-                    ApplicationIntentEndpoint::TrainingInspectCheckpoint => self
-                        .workflow
-                        .train_continuation
-                        .fail(correlation, error.detail.clone()),
+                    ApplicationIntentEndpoint::TrainingInspectCheckpoint => {
+                        self.workflow.train_continuation.fail(correlation)
+                    }
                     ApplicationIntentEndpoint::UpscaleStart => {
                         self.requested_upscale == self.sent_upscale
                     }
@@ -140,9 +152,10 @@ impl ApplicationModel {
                     ) {
                         self.dialog_context = None;
                     }
-                    self.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol(
-                        "IntentReply kind did not match its pending endpoint",
-                    ));
+                    self.report_error(
+                        crate::view_model::notices::Origin::Protocol,
+                        UiError::protocol("IntentReply kind did not match its pending endpoint"),
+                    );
                 } else {
                     self.install_reply(correlation, reply);
                 }
@@ -212,9 +225,12 @@ impl ApplicationModel {
             if let Some(target) = expected_target.as_ref() {
                 self.clear_dialog_target_if_matches(target);
             }
-            self.report_error(crate::view_model::notices::Origin::Protocol, UiError::protocol(
-                "FileDialog reply kind or target did not match its pending context",
-            ));
+            self.report_error(
+                crate::view_model::notices::Origin::Protocol,
+                UiError::protocol(
+                    "FileDialog reply kind or target did not match its pending context",
+                ),
+            );
             return;
         }
         let terminal = !snapshot.active;
@@ -245,8 +261,14 @@ impl ApplicationModel {
         &mut self,
         snapshot: PredictSnapshot,
     ) -> Result<Observation, UiError> {
-        let observation = merge_predict_snapshot(&mut self.predict_snapshot, &mut self.predict_full_progress, snapshot)?;
-        if observation != Observation::Stale { self.observe_predict(); }
+        let observation = merge_predict_snapshot(
+            &mut self.predict_snapshot,
+            &mut self.predict_full_progress,
+            snapshot,
+        )?;
+        if observation != Observation::Stale {
+            self.observe_predict();
+        }
         Ok(observation)
     }
 
@@ -271,7 +293,9 @@ impl ApplicationModel {
             |value| value.revision,
             "Training",
         )?;
-        if observation != Observation::Stale { self.observe_training(); }
+        if observation != Observation::Stale {
+            self.observe_training();
+        }
         Ok(observation)
     }
 
@@ -352,7 +376,9 @@ impl ApplicationModel {
         snapshot: crate::generated::ArtifactUiState,
     ) -> Result<Observation, UiError> {
         let observation = merge_dataset_state(&mut self.workflow.dataset, snapshot)?;
-        if observation != Observation::Stale { self.observe_dataset(); }
+        if observation != Observation::Stale {
+            self.observe_dataset();
+        }
         Ok(observation)
     }
 
@@ -372,7 +398,9 @@ impl ApplicationModel {
             .as_ref()
             .is_some_and(|previous| previous.selectedimage == snapshot.selectedimage);
         let observation = merge_explore_snapshot(&mut self.explore.snapshot, snapshot)?;
-        if observation != Observation::Stale { self.observe_explore(); }
+        if observation != Observation::Stale {
+            self.observe_explore();
+        }
         if observation == Observation::Installed {
             let snapshot = self.explore.snapshot.as_ref().expect("installed snapshot");
             if let Some(request) = self
@@ -475,8 +503,6 @@ impl ApplicationModel {
             self.dialog_context = None;
         }
     }
-
-
 }
 
 pub(super) fn merge_observation<T: PartialEq>(
@@ -726,12 +752,15 @@ pub(super) fn merge_execution_facts(
     if incoming.operationgeneration < current.operationgeneration {
         return Ok(current.clone());
     }
-    if incoming.operationgeneration == current.operationgeneration && current.admittedcapacity != 0 {
+    if incoming.operationgeneration == current.operationgeneration && current.admittedcapacity != 0
+    {
         if incoming.admittedcapacity == 0 {
             return Ok(current.clone());
         }
         if incoming != *current {
-            return Err(UiError::protocol("inconsistent inference capacity for one operation"));
+            return Err(UiError::protocol(
+                "inconsistent inference capacity for one operation",
+            ));
         }
     }
     Ok(incoming)
@@ -1186,7 +1215,10 @@ mod tests {
                 snapshot: failed.clone(),
             },
         ));
-        assert_eq!(model.notices.latest().unwrap().detail, "provider unavailable");
+        assert_eq!(
+            model.notices.latest().unwrap().detail,
+            "provider unavailable"
+        );
         model.notices.dismiss_all();
         model.reduce_reply(correlation, Ok(ApplicationReply::TrainingQuery(admitted)));
         assert_eq!(model.workflow.training, Some(failed));
@@ -1388,9 +1420,10 @@ mod tests {
         let retained = &local.workflow.training.as_ref().unwrap().local;
         assert_eq!(retained.terminal.detail, failure);
         assert_eq!(local.notices.latest().unwrap().detail, failure);
-        assert!(
-            matches!(crate::view::workflow::progress::compute_presentation(Some(retained)), crate::view::workflow::progress::Presentation::Hidden)
-        );
+        assert!(matches!(
+            crate::view::workflow::progress::compute_presentation(Some(retained)),
+            crate::view::workflow::progress::Presentation::Hidden
+        ));
 
         let mut provider = bootstrapped();
         let query = provider

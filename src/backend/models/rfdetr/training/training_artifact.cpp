@@ -30,25 +30,32 @@ void write_json(const std::filesystem::path& path, const T& value, serial::wire:
  const auto staged = path.string() + ".staging";
  try {
   auto file = io::FileHandle::create_output(staged, text.size());
-  file.pwrite_all(text.data(), text.size(), 0); file.sync_data();
+  file.pwrite_all(text.data(), text.size(), 0);
+  file.sync_data();
   io::publish_staged_path_atomically(staged, path);
- } catch (...) { std::error_code ignored; std::filesystem::remove(staged, ignored); throw; }
+ } catch (...) {
+  std::error_code ignored;
+  std::filesystem::remove(staged, ignored);
+  throw;
+ }
 }
 void require_metric(const TrainingArtifact& artifact, const NativeCheckpointMetadata& metadata) {
  const auto* preset = find_preset_catalog_entry(metadata.preset_name);
- if (!artifact.selection_metric || !artifact.evaluation || !preset ||
-     training_selection_metric(*artifact.evaluation, preset->task == ModelTask::Segmentation) != *artifact.selection_metric)
+ if (!artifact.selection_metric || !artifact.evaluation || !preset || training_selection_metric(*artifact.evaluation, preset->task == ModelTask::Segmentation) != *artifact.selection_metric)
   throw std::invalid_argument("native training artifact metric differs");
 }
-}
+}  // namespace
 std::string native_state_fingerprint(std::span<const NormalizedModelStateEntry> state) {
  io::Sha256Hasher hash;
  const auto bytes = [&](const void* data, std::size_t size) { hash.Update({static_cast<const std::uint8_t*>(data), size}); };
  for (const auto& entry : state) {
   const auto name_size = static_cast<std::uint64_t>(entry.name.size());
-  bytes(&name_size, sizeof(name_size)); bytes(entry.name.data(), entry.name.size());
-  const auto dtype = entry.tensor.scalar_type(); bytes(&dtype, sizeof(dtype));
-  const auto dimensions = static_cast<std::uint64_t>(entry.tensor.dim()); bytes(&dimensions, sizeof(dimensions));
+  bytes(&name_size, sizeof(name_size));
+  bytes(entry.name.data(), entry.name.size());
+  const auto dtype = entry.tensor.scalar_type();
+  bytes(&dtype, sizeof(dtype));
+  const auto dimensions = static_cast<std::uint64_t>(entry.tensor.dim());
+  bytes(&dimensions, sizeof(dimensions));
   bytes(entry.tensor.sizes().data(), entry.tensor.dim() * sizeof(std::int64_t));
   const auto value = entry.tensor.detach().to(torch::kCPU).contiguous();
   bytes(value.const_data_ptr(), value.nbytes());
@@ -64,8 +71,7 @@ TrainingArtifactAdmission::TrainingArtifactAdmission(const std::filesystem::path
  if (state->entries().empty()) throw std::invalid_argument("native training artifact has no values");
  for (const auto& entry : state->entries()) {
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
-  if (entry.tensor.is_floating_point() && !torch::isfinite(entry.tensor).all().item<bool>())
-   throw std::invalid_argument("native training artifact contains nonfinite values");
+  if (entry.tensor.is_floating_point() && !torch::isfinite(entry.tensor).all().item<bool>()) throw std::invalid_argument("native training artifact contains nonfinite values");
  }
  metadata_ = state->metadata;
  evidence_ = state->class_artifact;
@@ -74,8 +80,7 @@ TrainingArtifactAdmission::TrainingArtifactAdmission(const std::filesystem::path
  require_unchanged(stop);
  decoded_ = std::move(state);
 }
-TrainingArtifactAdmission::TrainingArtifactAdmission(const TrainingArtifact& artifact, std::stop_token stop)
- : TrainingArtifactAdmission(artifact.path, stop) { require_matches(artifact, stop); }
+TrainingArtifactAdmission::TrainingArtifactAdmission(const TrainingArtifact& artifact, std::stop_token stop) : TrainingArtifactAdmission(artifact.path, stop) { require_matches(artifact, stop); }
 TrainingArtifact TrainingArtifactAdmission::describe(TrainingArtifact artifact) const {
  artifact.sha256 = sha256_;
  artifact.content = content_;

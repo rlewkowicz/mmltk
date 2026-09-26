@@ -480,9 +480,10 @@ runtime::RuntimeStatus RfdetrRuntimeBackend::Close() noexcept {
  return runtime::kRuntimeSuccess;
 }
 std::span<const RfdetrNamedOutputRole> RfdetrRuntimeBackend::output_roles() const noexcept { return state_->output_roles; }
-std::shared_ptr<RfdetrRuntimeBackend> RfdetrRuntimeBackend::MakeLane(runtime::BorrowedCommandStream command_stream, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement) const {
- return std::shared_ptr<RfdetrRuntimeBackend>(
-  new RfdetrRuntimeBackend(lane_->MakeLane(command_stream), backend_name_, static_resolution_, maximum_detections_, state_->layout, state_->output_roles, state_->admission, retirement ? std::move(retirement) : state_->retirement, state_->operations));
+std::shared_ptr<RfdetrRuntimeBackend> RfdetrRuntimeBackend::MakeLane(
+ runtime::BorrowedCommandStream command_stream, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement) const {
+ return std::shared_ptr<RfdetrRuntimeBackend>(new RfdetrRuntimeBackend(lane_->MakeLane(command_stream), backend_name_, static_resolution_, maximum_detections_, state_->layout, state_->output_roles,
+  state_->admission, retirement ? std::move(retirement) : state_->retirement, state_->operations));
 }
 std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRuntimeBackendOptions& options) {
  if (options.stop.stop_requested()) throw ArtifactPublicationCancelled{};

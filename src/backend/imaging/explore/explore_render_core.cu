@@ -152,8 +152,8 @@ __global__ void detail_base_kernel(const ExploreRenderTargetView target_view_val
  const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
  const std::uint64_t total = static_cast<std::uint64_t>(target.width) * target.height;
  if (index >= total) return;
- const std::uint32_t x = static_cast<std::uint32_t>(index % target.width);
- const std::uint32_t y = static_cast<std::uint32_t>(index / target.width);
+ const auto x = static_cast<std::uint32_t>(index % target.width);
+ const auto y = static_cast<std::uint32_t>(index / target.width);
  uchar4 output = view.draw_base != 0U ? make_uchar4(0U, 0U, 0U, 255U) : make_uchar4(0U, 0U, 0U, 0U);
  const float normalized_x = (static_cast<float>(x) + 0.5F) / static_cast<float>(target.width);
  const float normalized_y = (static_cast<float>(y) + 0.5F) / static_cast<float>(target.height);
@@ -194,8 +194,8 @@ __device__ __forceinline__ void draw_box_edges(const Target target, const Explor
  const int y0 = static_cast<int>(floorf(static_cast<float>(offset_y) + y0_normalized * scale_y)) - 1;
  const int x1 = static_cast<int>(ceilf(static_cast<float>(offset_x) + x1_normalized * scale_x));
  const int y1 = static_cast<int>(ceilf(static_cast<float>(offset_y) + y1_normalized * scale_y));
- const std::uint32_t width = static_cast<std::uint32_t>(max(1, x1 - x0 + 1));
- const std::uint32_t height = static_cast<std::uint32_t>(max(1, y1 - y0 + 1));
+ const auto width = static_cast<std::uint32_t>(max(1, x1 - x0 + 1));
+ const auto height = static_cast<std::uint32_t>(max(1, y1 - y0 + 1));
  const std::uint32_t edge_pixels = 2U * width + 2U * height;
  for (std::uint32_t edge_index = threadIdx.x; edge_index < edge_pixels; edge_index += blockDim.x) {
   int x = 0;
@@ -255,8 +255,8 @@ __global__ void detail_box_kernel(const ExploreRenderTargetView target_view_valu
  if (annotation_index >= semantics.annotation_count || semantics.show_boxes == 0U) return;
  // Detail annotations are expressed in the full model-image coordinate
  // space; map them into the selected letterboxed crop before drawing.
- const float source_width = static_cast<float>(view.source_width);
- const float source_height = static_cast<float>(view.source_height);
+ const auto source_width = static_cast<float>(view.source_width);
+ const auto source_height = static_cast<float>(view.source_height);
  draw_box_edges(target, annotations[annotation_index], 0U, 0U, static_cast<float>(target.width), static_cast<float>(target.height), static_cast<float>(view.crop_x) / source_width,
   static_cast<float>(view.crop_y) / source_height, static_cast<float>(view.crop_width) / source_width, static_cast<float>(view.crop_height) / source_height, 0U, 0U, target.width, target.height,
   classes, semantics.class_count);
@@ -286,8 +286,8 @@ __global__ void probe_rendered_card_kernel(const ExploreRenderTargetView clean_v
  const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
  const std::uint64_t total = static_cast<std::uint64_t>(clean.width) * clean.height;
  if (index >= total) return;
- const std::uint32_t x = static_cast<std::uint32_t>(index % clean.width);
- const std::uint32_t y = static_cast<std::uint32_t>(index / clean.width);
+ const auto x = static_cast<std::uint32_t>(index % clean.width);
+ const auto y = static_cast<std::uint32_t>(index / clean.width);
  const auto* clean_row = reinterpret_cast<const uchar4*>(clean.data + static_cast<std::size_t>(y) * clean.pitch);
  const auto* semantic_row = reinterpret_cast<const uchar4*>(semantic.data + static_cast<std::size_t>(y) * semantic.pitch);
  const uchar4 clean_pixel = clean_row[x];

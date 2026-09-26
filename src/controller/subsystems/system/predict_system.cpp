@@ -311,18 +311,18 @@ public:
       auto terminal = runtime_->Run(
        std::move(*request), stop, [this](const auto& progress) { Progress(progress); },
        [this, &source_key, video](std::expected<PredictRuntime::Product, std::string> product) { Product(std::move(product), source_key, video); },
-       {.admission = [this, stop] { return playback_.WaitAdmission(stop); },
-        .frame = [this, stop](std::optional<double> timestamp, double fps) { return playback_.Wait(timestamp, fps, stop); }}, {visual_.maximum_width, visual_.maximum_height},
+       {.admission = [this, stop] { return playback_.WaitAdmission(stop); }, .frame = [this, stop](std::optional<double> timestamp, double fps) { return playback_.Wait(timestamp, fps, stop); }},
+       {visual_.maximum_width, visual_.maximum_height},
        [this] {
         std::unique_lock context_lock(preview_context_mutex_, std::try_to_lock);
         return context_lock.owns_lock() ? preview_context_ : std::nullopt;
        },
        preview_retirement_, [this](const auto& path) { Artifact(path); }, media_output, generation,
-       [this, generation](const auto& admitted) {
+       [this, generation](const auto& admitted_execution) {
         {
          std::scoped_lock lock(mutex_);
          if (state_.operation.generation_frontier != generation || !state_.operation.active) return;
-         auto facts = admitted;
+         auto facts = admitted_execution;
          facts.settings_revision = state_.execution.settings_revision;
          facts.operation_generation = generation;
          if (state_.execution.admitted_capacity) {
@@ -330,7 +330,8 @@ public:
           return;
          }
          state_.execution = facts;
-         if (const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested)) state_.revision = *revision;
+         if (const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested))
+          state_.revision = *revision;
         }
         Publish(PredictChanged{snapshot()});
        });

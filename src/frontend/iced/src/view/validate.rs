@@ -70,7 +70,9 @@ impl Component {
         surface: Option<Surface>,
         width: f32,
     ) -> Element<'a, Message> {
-        let settings_edit_available = settings.draft.is_some() && model.settings_edit_available() && !model.primary_action_active(crate::generated::FeatureId::Validate);
+        let settings_edit_available = settings.draft.is_some()
+            && model.settings_edit_available()
+            && !model.primary_action_active(crate::generated::FeatureId::Validate);
         let settings_settled = !settings.has_local_edits();
         let draft = settings
             .draft
@@ -236,9 +238,26 @@ impl Component {
                 )
                 .map(Message::Loading),
                 crate::view::workflow::fields::numeric_grid()
-                    .push(crate::view::workflow::fields::number_u64("Batch size", draft.map_or(1, |value| value.request.batchsize), crate::generated::constraint_workflowsvalidaterequestbatchsize(), settings_edit_available, Message::BatchSizeChanged))
-                    .push(crate::view::workflow::fields::effective_batch(crate::generated::FeatureId::Validate, false, model, settings))
-                    .push(crate::view::workflow::fields::number_i32("Validate lanes", draft.map_or(1, |value| value.request.lanes), crate::generated::constraint_workflowsvalidaterequestlanes(), settings_edit_available, Message::Lanes)),
+                    .push(crate::view::workflow::fields::number_u64(
+                        "Batch size",
+                        draft.map_or(1, |value| value.request.batchsize),
+                        crate::generated::constraint_workflowsvalidaterequestbatchsize(),
+                        settings_edit_available,
+                        Message::BatchSizeChanged
+                    ))
+                    .push(crate::view::workflow::fields::effective_batch(
+                        crate::generated::FeatureId::Validate,
+                        false,
+                        model,
+                        settings
+                    ))
+                    .push(crate::view::workflow::fields::number_i32(
+                        "Validate lanes",
+                        draft.map_or(1, |value| value.request.lanes),
+                        crate::generated::constraint_workflowsvalidaterequestlanes(),
+                        settings_edit_available,
+                        Message::Lanes
+                    )),
                 crate::view::workflow::fields::decimal_f32(
                     "Display confidence",
                     draft.map_or(0.4, |value| value.display.confidencethreshold),
@@ -301,7 +320,11 @@ impl Component {
                     value,
                 )?)
             }
-            Message::Lanes(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Debounced, |draft| crate::generated::edit_workflowsvalidaterequestlanes(draft, value))?),
+            Message::Lanes(value) => Outcome::SettingsEdited(
+                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
+                    crate::generated::edit_workflowsvalidaterequestlanes(draft, value)
+                })?,
+            ),
             Message::Loading(message) => {
                 Outcome::SettingsEdited(crate::view::workflow::loading::update(
                     crate::generated::FeatureId::Validate,

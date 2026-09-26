@@ -183,7 +183,9 @@ impl ApplicationModel {
 
     /// Native activity is independent of preparation and submitted intent settlement.
     pub fn current_native_operation(&self, page: FeatureId) -> Option<&ComputeUiState> {
-        if self.connection != ConnectionState::Connected { return None; }
+        if self.connection != ConnectionState::Connected {
+            return None;
+        }
         let operation = match page {
             FeatureId::Train => &self.workflow.training.as_ref()?.local,
             FeatureId::Validate => &self.workflow.validation.as_ref()?.operation,
@@ -195,6 +197,11 @@ impl ApplicationModel {
     }
 
     /// Queued preflight edits may settle until native execution owns the request.
+    pub fn execution_edit_submission_availability(&self) -> [bool; 3] {
+        [FeatureId::Train, FeatureId::Validate, FeatureId::Predict]
+            .map(|feature| self.execution_edit_submission_available(feature))
+    }
+
     pub fn execution_edit_submission_available(&self, page: FeatureId) -> bool {
         let (start, stop) = match page {
             FeatureId::Train => {
@@ -738,26 +745,42 @@ mod tests {
     #[test]
     fn execution_submission_retains_training_capability_guards_and_native_activity() {
         let mut model = bootstrapped();
-        for endpoint in [ApplicationIntentEndpoint::TrainingInspectCheckpoint,
-            ApplicationIntentEndpoint::TrainingPrepareResume, ApplicationIntentEndpoint::TrainingResume,
-            ApplicationIntentEndpoint::TrainingQuery, ApplicationIntentEndpoint::TrainingOpenRun,
-            ApplicationIntentEndpoint::TrainingHistory] {
+        for endpoint in [
+            ApplicationIntentEndpoint::TrainingInspectCheckpoint,
+            ApplicationIntentEndpoint::TrainingPrepareResume,
+            ApplicationIntentEndpoint::TrainingResume,
+            ApplicationIntentEndpoint::TrainingQuery,
+            ApplicationIntentEndpoint::TrainingOpenRun,
+            ApplicationIntentEndpoint::TrainingHistory,
+        ] {
             let correlation = model.begin_intent(endpoint).unwrap();
             assert!(!model.execution_edit_submission_available(FeatureId::Train));
             assert!(model.current_native_operation(FeatureId::Train).is_none());
             assert!(model.execution_edit_submission_available(FeatureId::Validate));
             model.abandon_intent(correlation);
         }
-        for activity in [crate::generated::TrainingActivity::ProviderQuery, crate::generated::TrainingActivity::Remote] {
+        for activity in [
+            crate::generated::TrainingActivity::ProviderQuery,
+            crate::generated::TrainingActivity::Remote,
+        ] {
             model.workflow.training.as_mut().unwrap().activity = activity;
             assert!(!model.execution_edit_submission_available(FeatureId::Train));
             assert!(!model.primary_action_active(FeatureId::Train));
         }
-        model.workflow.training.as_mut().unwrap().activity = crate::generated::TrainingActivity::Idle;
+        model.workflow.training.as_mut().unwrap().activity =
+            crate::generated::TrainingActivity::Idle;
         assert!(model.execution_edit_submission_available(FeatureId::Train));
         for (feature, start, stop) in [
-            (FeatureId::Validate, ApplicationIntentEndpoint::ValidationStart, ApplicationIntentEndpoint::ValidationStop),
-            (FeatureId::Predict, ApplicationIntentEndpoint::PredictStart, ApplicationIntentEndpoint::PredictStop),
+            (
+                FeatureId::Validate,
+                ApplicationIntentEndpoint::ValidationStart,
+                ApplicationIntentEndpoint::ValidationStop,
+            ),
+            (
+                FeatureId::Predict,
+                ApplicationIntentEndpoint::PredictStart,
+                ApplicationIntentEndpoint::PredictStop,
+            ),
         ] {
             for endpoint in [start, stop] {
                 let correlation = model.begin_intent(endpoint).unwrap();

@@ -631,6 +631,18 @@ class Record:
             return surface_identity(self.data)
         if name == "@workspace_source":
             return workspace_source_identity(self.data)
+        if name == "@intent_request":
+            event = self.get("@event")
+            if event == "integration.intent":
+                value = value_from(self.data, "control", "fields.control")
+            elif event in ("browser.intent.received", "browser.intent.accepted",
+                           "browser.intent.rejected", "browser.intent.reply_rejected"):
+                value = value_from(self.data, "value", "fields.value")
+            else:
+                return MISSING
+            if isinstance(value, str) and re.fullmatch(r"[0-9]{1,20}", value):
+                value = int(value)
+            return value if type(value) is int and 0 < value <= 2**64 - 1 else MISSING
         if self.training_record() and name in ("@session", "@model", "@first_cause", "@phase", "@role"):
             field = {"@session": "progress.session_id", "@model": "progress.model_id",
                      "@first_cause": "progress.failure.first_cause", "@phase": "progress.phase", "@role": "role"}[name]
@@ -3934,12 +3946,16 @@ presence including null/zero. Quote strings containing spaces or punctuation.
 Fields:
   JSON paths (fields.name), event/trace_id/etc. (unqualified names also look
   inside fields), plus @file, @line, @line_end, @text, @format, @clock, @time_ns,
-  @event, @owner, @level, @error, @surface, @parse_error, @test, @tags,
+  @event, @owner, @level, @error, @surface, @intent_request, @parse_error, @test, @tags,
   @run, @archive_id, @family, @artifact, @mtime_ns, @context_copy, @part,
   @terminal, @exit_code, @signal, @signal_number, @proximity_ns, @time_link,
   @triage_reason, @triage_payload_truncated, @discovery.
   @event resolves wrapped fields.event/name before event/name.
   @surface joins native uint64 surface_high/low and Firefox 32-hex surfaces.
+  @intent_request projects exact uint64 request correlations from integration.intent
+  control and browser.intent received/accepted/rejected/reply_rejected value.
+  Query it or use --correlate @intent_request within one browser peer lifecycle;
+  a fresh browser may reuse counters, so this is never an automatic identity.
   @error marks failure candidates from levels/event/message text; it is a
   search aid, not a diagnosis. Numeric error=0 metrics do not mark failures.
   child.signaled value=139 decodes to SIGSEGV (11); 143 to SIGTERM (15).

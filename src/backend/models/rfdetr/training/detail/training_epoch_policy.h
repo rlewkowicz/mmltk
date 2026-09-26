@@ -20,10 +20,11 @@ public:
   return state_;
  }
  [[nodiscard]] const TrainingEpochPolicyState& state() const noexcept { return state_; }
+
 private:
  int unfreeze_;
  int disable_;
  TrainingEpochPolicyState state_;
 };
 MMLTK_REFLECT_FIELDS(TrainingEpochPolicyState)
-}
+}  // namespace mmltk::backend::models::rfdetr

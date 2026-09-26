@@ -518,7 +518,7 @@ if [[ -n "${start_at}" ]]; then
     printf '%s\n' "${translation_units[@]}" > "${translation_units_file}"
 fi
 
-clang_tidy_checks="${MMLTK_CLANG_TIDY_CHECKS:--*,clang-analyzer-*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-macro-parentheses,performance-*,portability-*,-portability-avoid-pragma-once,-portability-simd-intrinsics}"
+clang_tidy_checks="${MMLTK_CLANG_TIDY_CHECKS:--*,clang-analyzer-*,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,bugprone-*,-bugprone-easily-swappable-parameters,-bugprone-macro-parentheses,performance-*,portability-*,-portability-avoid-pragma-once,-portability-simd-intrinsics,modernize-use-auto,modernize-use-using}"
 total_units="${#translation_units[@]}"
 
 tidy_failed_units=()

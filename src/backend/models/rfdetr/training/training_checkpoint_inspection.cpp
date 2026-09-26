@@ -2,6 +2,7 @@
 #include "detail/checkpoint_private.h"
 #include "detail/training_session_checkpoint.h"
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
+#include "src/common/math/checked_arithmetic.h"
 #include <stdexcept>
 #include <utility>
 namespace mmltk::backend::models::rfdetr {
@@ -10,7 +11,8 @@ TrainingCheckpointAdmission::TrainingCheckpointAdmission(TrainingCheckpoint chec
  if (!std::get<0>(evidence_)) throw std::invalid_argument("missing checkpoint artifact evidence");
 }
 TrainingCheckpointAdmission::TrainingCheckpointAdmission(TrainingCheckpoint checkpoint, mmltk::common::io::FileSnapshot evidence) : checkpoint_(std::move(checkpoint)), evidence_(evidence) {}
-TrainingCheckpointAdmission::TrainingCheckpointAdmission(TrainingCheckpoint checkpoint, std::shared_ptr<const TrainingSessionAdmission> evidence) : checkpoint_(std::move(checkpoint)), evidence_(std::move(evidence)) {}
+TrainingCheckpointAdmission::TrainingCheckpointAdmission(TrainingCheckpoint checkpoint, std::shared_ptr<const TrainingSessionAdmission> evidence)
+    : checkpoint_(std::move(checkpoint)), evidence_(std::move(evidence)) {}
 void TrainingCheckpointAdmission::RequireUnchanged(std::stop_token stop) const {
  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
  if (const auto* native = std::get_if<0>(&evidence_)) {
@@ -36,7 +38,7 @@ TrainingCheckpointAdmission inspect_training_checkpoint(const std::filesystem::p
   result.class_layout = admission->model(0).metadata.class_layout;
   result.original_weights = admission->model(0).metadata.source_path;
   result.original_class_descriptor = admission->continuation(0).values.training_original_descriptor;
-  result.epoch = admission->continuation(0).values.epoch;
+  result.epoch = mmltk::common::math::checked_cast<int>(admission->continuation(0).values.epoch, "checkpoint epoch exceeds request range");
   result.evaluated_weights = result.configuration->use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;
   result.resumable = true;
   admission->require_unchanged();

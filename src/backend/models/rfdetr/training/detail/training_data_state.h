@@ -12,7 +12,7 @@ struct TrainingShard final {
  std::uint64_t seed = 42;
  [[= mmltk::frameworks::reflection::MaxItems{std::numeric_limits<std::uint32_t>::max()}]] std::vector<std::uint32_t> images;
  [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::data::MAX_CLASSES}]] std::vector<std::uint64_t> unique_support;
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::data::MAX_CLASSES}]] std::vector<std::uint32_t> missing_classes;
+ [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::data::MAX_CLASSES}]] std::vector<std::uint32_t> missing_classes{};
  bool operator==(const TrainingShard&) const = default;
 };
 struct TrainingDonorDescriptor final {

@@ -2117,7 +2117,8 @@ TEST_CASE("DN private mask sampling replays owned outputs without changing ordin
  const auto epoch_loss = owner.loss(epoch, targets, {torch::tensor(3.F)}, true);
  REQUIRE_FALSE(torch::equal(original.mask_ce, epoch_loss.mask_ce));
  REQUIRE(torch::equal(epoch_loss.total, owner.loss(epoch, targets, {torch::tensor(3.F)}, true, explicit_samples(epoch)).total));
- REQUIRE_FALSE(torch::equal(original.mask_ce, lane_loss.mask_ce));
+ // Physical placement does not change this logical draw's stochastic inputs.
+ REQUIRE(torch::equal(original.mask_ce, lane_loss.mask_ce));
  // Reverse outstanding-loss order after another preparation, as accumulation
  // scratch can be reused or a later admitted step cancelled before backward.
  static_cast<void>(make_outputs(owner, {701, 5, 0, 100}));

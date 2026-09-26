@@ -35,12 +35,12 @@ __device__ __forceinline__ float3 sample_normalized_nchw(const float* pixels, co
  float3 vertical_detail = make_float3(0.0F, 0.0F, 0.0F);
 #pragma unroll
  for (std::uint32_t tap_y = 0U; tap_y < kFilterTaps; ++tap_y) {
-  const std::uint32_t y = static_cast<std::uint32_t>(max(0, min(static_cast<int>(height) - 1, base_y + static_cast<int>(tap_y))));
+  const auto y = static_cast<std::uint32_t>(max(0, min(static_cast<int>(height) - 1, base_y + static_cast<int>(tap_y))));
   const float vertical = kScaleCoefficients.values[phase_y][tap_y];
   const float vertical_usm = kUsmCoefficients.values[phase_y][tap_y];
 #pragma unroll
   for (std::uint32_t tap_x = 0U; tap_x < kFilterTaps; ++tap_x) {
-   const std::uint32_t x = static_cast<std::uint32_t>(max(0, min(static_cast<int>(width) - 1, base_x + static_cast<int>(tap_x))));
+   const auto x = static_cast<std::uint32_t>(max(0, min(static_cast<int>(width) - 1, base_x + static_cast<int>(tap_x))));
    const float coefficient = vertical * kScaleCoefficients.values[phase_x][tap_x];
    const float horizontal_coefficient = vertical * kUsmCoefficients.values[phase_x][tap_x];
    const float vertical_coefficient = vertical_usm * kScaleCoefficients.values[phase_x][tap_x];

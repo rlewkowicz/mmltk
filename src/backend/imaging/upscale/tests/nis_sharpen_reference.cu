@@ -40,8 +40,8 @@ __device__ __forceinline__ std::uint8_t source_alpha_byte(const void* source, co
  return row[static_cast<std::size_t>(source_x) * 4U + 3U];
 }
 __device__ __forceinline__ HalfRgba load_clamped(const HalfRgba* pixels, const Configuration config, const int x, const int y) {
- const std::uint32_t clamped_x = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.output_width) - 1, x)));
- const std::uint32_t clamped_y = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.output_height) - 1, y)));
+ const auto clamped_x = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.output_width) - 1, x)));
+ const auto clamped_y = static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.output_height) - 1, y)));
  return pixels[static_cast<std::size_t>(clamped_y) * config.output_width + clamped_x];
 }
 __global__ void dual_direction_kernel(const void* source, const std::size_t source_pitch, const HalfRgba* scaled, std::uint8_t* target, const std::size_t target_pitch, const Configuration config) {
@@ -49,8 +49,8 @@ __global__ void dual_direction_kernel(const void* source, const std::size_t sour
  // CLEANUP-IGNORE: Independent dual-direction oracle retains original pixel and neighbor selection; do not share production sharpening.
  const std::uint64_t total = static_cast<std::uint64_t>(config.output_width) * config.output_height;
  if (index >= total) return;
- const std::uint32_t x = static_cast<std::uint32_t>(index % config.output_width);
- const std::uint32_t y = static_cast<std::uint32_t>(index / config.output_width);
+ const auto x = static_cast<std::uint32_t>(index % config.output_width);
+ const auto y = static_cast<std::uint32_t>(index / config.output_width);
  const HalfRgba center = load_clamped(scaled, config, static_cast<int>(x), static_cast<int>(y));
  const HalfRgba left = load_clamped(scaled, config, static_cast<int>(x) - 1, static_cast<int>(y));
  const HalfRgba right = load_clamped(scaled, config, static_cast<int>(x) + 1, static_cast<int>(y));

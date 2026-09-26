@@ -161,6 +161,7 @@ struct BrowserAudit final {
  bool perceptual_controls_round_trip = false;
  Bounds advanced_container;
  std::array<Bounds, 8> advanced_fixed;
+ std::array<Bounds, 2> advanced_effective;
  Bounds advanced_assignment;
  std::array<Bounds, 3> advanced_match_free;
  Bounds advanced_denoising_toggle;

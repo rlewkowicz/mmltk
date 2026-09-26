@@ -224,10 +224,6 @@ pub fn container_workspace(_theme: &Theme) -> iced::widget::container::Style {
     fill(Color::from_rgb8(0x11, 0x11, 0x11), Color::WHITE)
 }
 
-pub fn container_error(theme: &Theme) -> iced::widget::container::Style {
-    fill(theme.tokens().status_danger_background3, Color::WHITE)
-}
-
 pub fn text_secondary(theme: &Theme) -> iced::widget::text::Style {
     iced::widget::text::Style {
         color: Some(theme.tokens().neutral_foreground2),

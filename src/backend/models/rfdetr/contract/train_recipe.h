@@ -83,8 +83,7 @@ struct TrainRecipeCatalogEntry final : TrainRecipeValues {
 };
 MMLTK_REFLECT_FIELDS(TrainRecipeCatalogEntry)
 [[nodiscard]] constexpr bool train_recipe_values_valid(const TrainRecipeValues& value) noexcept {
- return !mmltk::frameworks::reflection::validate_reflected_fields(value) &&
-        (value.lr_scheduler != TrainLrSchedulerKind::UltralyticsLinear || value.optimizer == TrainOptimizerKind::SGD) &&
+ return !mmltk::frameworks::reflection::validate_reflected_fields(value) && (value.lr_scheduler != TrainLrSchedulerKind::UltralyticsLinear || value.optimizer == TrainOptimizerKind::SGD) &&
         (!value.nesterov || (value.optimizer == TrainOptimizerKind::SGD && value.momentum > 0));
 }
 inline constexpr std::array<TrainRecipeCatalogEntry, 3U> kTrainRecipeCatalog{{
@@ -112,7 +111,20 @@ inline constexpr std::array<TrainRecipeCatalogEntry, 3U> kTrainRecipeCatalog{{
   .lr_min_factor = 0.01,
   .lr_drop = 100,
   .lr_scheduler = TrainLrSchedulerKind::Cosine}},
- {{.optimizer = TrainOptimizerKind::SGD, .lr = .01, .lr_encoder = .001, .lr_component_decay = .7, .encoder_layer_decay = .8, .momentum = .9, .weight_decay = .0001, .warmup_epochs = 3, .warmup_momentum = .8, .lr_min_factor = .01, .lr_drop = 100, .lr_scheduler = TrainLrSchedulerKind::UltralyticsLinear, .nesterov = false, .warmup_bias_lr = .1}},
+ {{.optimizer = TrainOptimizerKind::SGD,
+  .lr = .01,
+  .lr_encoder = .001,
+  .lr_component_decay = .7,
+  .encoder_layer_decay = .8,
+  .momentum = .9,
+  .weight_decay = .0001,
+  .warmup_epochs = 3,
+  .warmup_momentum = .8,
+  .lr_min_factor = .01,
+  .lr_drop = 100,
+  .lr_scheduler = TrainLrSchedulerKind::UltralyticsLinear,
+  .nesterov = false,
+  .warmup_bias_lr = .1}},
 }};
 [[nodiscard]] consteval bool train_recipe_catalog_is_valid() {
  for (std::size_t index = 0U; index < kTrainRecipeCatalog.size(); ++index) {
@@ -163,8 +175,7 @@ MMLTK_REFLECT_FIELDS(TrainRecipeSettings)
 }  // namespace mmltk::backend::models::rfdetr
 namespace mmltk::frameworks::reflection {
 template <>
-struct catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>
- {
+struct catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog> {
  using value_type = mmltk::backend::models::rfdetr::TrainRecipeValues;
  using source_type = mmltk::backend::models::rfdetr::TrainRecipeCatalogEntry;
  using destination_type = mmltk::backend::models::rfdetr::TrainRecipeSettings;
@@ -186,7 +197,8 @@ struct catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCata
   // Both public forms must contain exactly the canonical values, with only the
   // opaque override state added by the settings form.
   if constexpr (Values::base_types::count != 0U || !std::same_as<typename Source::base_types, MaterializedBaseList<value_type>> ||
-                !std::same_as<typename Destination::base_types, MaterializedBaseList<value_type>> || Source::size() != 0U || Destination::size() != 1U) return false;
+                !std::same_as<typename Destination::base_types, MaterializedBaseList<value_type>> || Source::size() != 0U || Destination::size() != 1U)
+   return false;
   std::size_t selectors = 0U;
   std::size_t values = 0U;
   visit_materialized_members<value_type>([&]<class Declaration>(const auto&) {
@@ -273,7 +285,10 @@ inline constexpr void apply_train_recipe(TrainRecipeSettings& target, const Trai
  });
 }
 inline constexpr void resolve_train_recipe(TrainRecipeSettings& value) { apply_train_recipe(value, train_recipe(value.optimizer), value.overrides); }
-inline constexpr void reset_train_recipe(TrainRecipeSettings& value) { value.overrides = {}; resolve_train_recipe(value); }
+inline constexpr void reset_train_recipe(TrainRecipeSettings& value) {
+ value.overrides = {};
+ resolve_train_recipe(value);
+}
 [[nodiscard]] inline bool train_recipe_valid(const TrainRecipeSettings& value) noexcept {
  return train_recipe_values_valid(value) && !mmltk::frameworks::reflection::validate_reflected_fields(value.overrides);
 }

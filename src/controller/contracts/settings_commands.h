@@ -23,7 +23,9 @@ struct SettingsValueUpdate final {
 inline constexpr std::size_t kMaxSettingsUpdates = 64U;
 struct[[= reflection::all_feature_scope()]] SettingsUpdateRequest final {
  std::optional<mmltk::backend::models::rfdetr::TrainLaneConfiguration> lane_configuration;
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{1}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{mmltk::backend::models::rfdetr::kMaximumTrainingModels}]] std::optional<std::uint32_t> training_model_count;
+ [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{
+  1}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{mmltk::backend::models::rfdetr::kMaximumTrainingModels}]] std::optional<std::uint32_t>
+  training_model_count;
  [[= mmltk::frameworks::reflection::MaxItems{kMaxSettingsUpdates}]][[= reflection::direct::SettingsUpdateValues{}]] std::inplace_vector<SettingsValueUpdate, kMaxSettingsUpdates> updates;
 };
 struct[[= reflection::all_feature_scope()]] SettingsResetRequest final {};

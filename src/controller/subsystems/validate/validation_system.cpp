@@ -157,7 +157,8 @@ public:
      const auto next = contracts::next_compute_generation(state_.generation_frontier);
      if (!next) throw contracts::FailedError("compute operation generation exhausted");
      contracts::begin_compute(state_, *next, "Inspecting selected inputs");
-     execution_ = facts; execution_.operation_generation = *next;
+     execution_ = facts;
+     execution_.operation_generation = *next;
     },
    .work = [this, settings = settings.settings, selection, preview, configuration](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
     const auto generation = operation().generation_frontier;

@@ -25,8 +25,8 @@ mod annotation_product;
 mod reporting;
 pub(crate) use reporting::metric_projection as report_metric_projection;
 pub(crate) use reporting::primary_action_draw;
-mod workflows;
 pub(crate) mod status;
+mod workflows;
 
 thread_local! {
     static DRIVER_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -177,8 +177,15 @@ pub enum Message {
         active: bool,
         token: u32,
     },
-    StatusMeasured { stage: u32, bounds: Vec<Rectangle> },
-    StatusExercised { stage: u32, success: bool },
+    StatusMeasured {
+        stage: u32,
+        bounds: Vec<Rectangle>,
+    },
+    #[cfg(target_arch = "wasm32")]
+    StatusExercised {
+        stage: u32,
+        success: bool,
+    },
     PrimaryActionMeasure {
         control: String,
         token: u32,
@@ -690,7 +697,7 @@ enum Phase {
     AdvancedLayout(usize),
     TriggerError,
     StatusTrigger,
-    StatusExercise,
+    StatusExercise(u32),
     StatusFixtureBegin,
     StatusFixtureEnd,
     AwaitStatusClipboard,
@@ -1774,8 +1781,14 @@ impl Controller {
             message => message,
         };
         let (control, bounds) = match message {
-            Message::StatusSelectionRead(result) => { self.status.selection_read(&mut self.driver, result); return None; },
-            Message::StatusClipboardRead(result) => { self.status.clipboard_read(&mut self.driver, result); return None; },
+            Message::StatusSelectionRead(result) => {
+                self.status.selection_read(&mut self.driver, result);
+                return None;
+            }
+            Message::StatusClipboardRead(result) => {
+                self.status.clipboard_read(&mut self.driver, result);
+                return None;
+            }
             Message::DatasetInputDelivered(next, valid) => {
                 self.lifecycle.presentation.input_pending = false;
                 if valid {
@@ -1810,8 +1823,15 @@ impl Controller {
                 }
                 return None;
             }
-            Message::StatusMeasured { stage, bounds } => { self.status.measured(&mut self.driver, stage, bounds); return None; }
-            Message::StatusExercised { stage, success } => { self.status.exercised(&mut self.driver, stage, success); return None; }
+            Message::StatusMeasured { stage, bounds } => {
+                self.status.measured(&mut self.driver, stage, bounds);
+                return None;
+            }
+            #[cfg(target_arch = "wasm32")]
+            Message::StatusExercised { stage, success } => {
+                self.status.exercised(&mut self.driver, stage, success);
+                return None;
+            }
             Message::PrimaryActionMeasure { control, token } => {
                 self.driver.reporting.measure_primary(control, token);
                 return None;
@@ -1959,6 +1979,7 @@ impl Controller {
         router: &crate::view::router::Router,
         active: FeatureId,
         surface: Option<crate::presentation_surface::Surface>,
+        status_open: bool,
     ) -> Task<RootMessage> {
         let frame = surface.and_then(|surface| surface.frame);
         self.driver.report_phase_progress();
@@ -1995,7 +2016,21 @@ impl Controller {
             .observe(|reporting| reporting.explore_snapshot(model, settings));
         if !self.status.permits(&self.driver.phase, model) {
             let phase = self.driver.phase.clone();
-            self.driver.fail_detail(|| format!("Unexpected session notifications during {phase:?}: {:?}", model.notices.rows().map(|notice| (notice.id, &notice.error)).collect::<Vec<_>>()).into());
+            self.driver.fail_detail(|| {
+                match model.notices.latest() {
+                    Some(notice) => format!(
+                        "{:?}: unexpected session notification {} during {phase:?}: {}",
+                        notice.error.kind, notice.id.0, notice.error.detail
+                    ),
+                    None => format!("Unexpected session notification state during {phase:?}"),
+                }
+                .into()
+            });
+            return Task::none();
+        }
+        // Browser input is delivered asynchronously. Locate the overlay only
+        // after the owning component has observed its opening interaction.
+        if matches!(self.driver.phase, Phase::StatusPanel) && !status_open {
             return Task::none();
         }
         match self.driver.phase.clone() {
@@ -2439,18 +2474,41 @@ impl Controller {
         router: &crate::view::router::Router,
         active: FeatureId,
         surface: Option<crate::presentation_surface::Surface>,
+        status_open: bool,
     ) -> Task<RootMessage> {
-        if self.status.fixture.is_some() && !model.notices.is_empty() { self.driver.fail("Unexpected native notification during Status fixture"); }
-        if matches!(self.driver.phase, Phase::Failed | Phase::Disabled) { return self.status.cleanup(model); }
-        if matches!(self.driver.phase, Phase::StatusExercise) {
-            if active != FeatureId::Train { self.driver.fail("Status interaction navigated away from Train"); return self.status.cleanup(model); }
-            if !self.status.prepare(&mut self.driver, model, settings) { return if matches!(self.driver.phase, Phase::Failed) { self.status.cleanup(model) } else { Task::none() }; }
+        if self.status.fixture.is_some() && !model.notices.is_empty() {
+            self.driver
+                .fail("Unexpected native notification during Status fixture");
+        }
+        if matches!(self.driver.phase, Phase::Failed | Phase::Disabled) {
+            return self.status.cleanup(model);
+        }
+        if matches!(self.driver.phase, Phase::StatusExercise(_)) {
+            self.driver.report_phase_progress();
+            if active != FeatureId::Train {
+                self.driver
+                    .fail("Status interaction navigated away from Train");
+                return self.status.cleanup(model);
+            }
+            if !self.status.prepare(&mut self.driver, model, settings) {
+                return if matches!(self.driver.phase, Phase::Failed) {
+                    self.status.cleanup(model)
+                } else {
+                    Task::none()
+                };
+            }
             return self.status.exercise(&self.driver);
         }
-        if matches!(self.driver.phase, Phase::StatusFixtureBegin) { self.begin_status_fixture(model); }
+        if matches!(self.driver.phase, Phase::StatusFixtureBegin) {
+            self.begin_status_fixture(model);
+        }
         if matches!(self.driver.phase, Phase::StatusFixtureEnd) {
-            if self.status.begin_healthy() { self.driver.phase = Phase::StatusExercise; return self.status.exercise(&self.driver); }
-            self.status.fixture = None; self.driver.phase = Phase::TrainCard;
+            if self.status.begin_healthy() {
+                self.driver.phase = Phase::StatusExercise(32);
+                return self.status.exercise(&self.driver);
+            }
+            self.status.fixture = None;
+            self.driver.phase = Phase::TrainCard;
         }
         let fixture = self.status.fixture.take();
         let observed = fixture.as_ref().unwrap_or(model);
@@ -2465,8 +2523,15 @@ impl Controller {
         } else {
             None
         };
-        let result =
-            self.advance_transition(observed, settings, applied_scale, router, active, surface);
+        let result = self.advance_transition(
+            observed,
+            settings,
+            applied_scale,
+            router,
+            active,
+            surface,
+            status_open,
+        );
         self.status.fixture = fixture;
         if running {
             self.finish_transition();

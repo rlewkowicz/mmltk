@@ -66,8 +66,8 @@ void save_snapshot_checkpoint(const std::filesystem::path& path, const NativeChe
  save_native_checkpoint(path, checkpoint, descriptor);
 }
 void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const NativeCheckpointMetadata& metadata, const NativeOptimizer& optimizer, const GradScaler& grad_scaler,
- const TrainRequest& options, int epoch, int64_t ema_completed_updates, const std::vector<NormalizedModelStateEntry>& model_state,
- const std::vector<NormalizedModelStateEntry>& ema_state, std::string_view attempt_id, const std::filesystem::path& original_descriptor, torch_cuda::TensorReadbackBuffers& readback, detail::TrainingContinuationValues& continuation) {
+ const TrainRequest& options, int epoch, int64_t ema_completed_updates, const std::vector<NormalizedModelStateEntry>& model_state, const std::vector<NormalizedModelStateEntry>& ema_state,
+ std::string_view attempt_id, const std::filesystem::path& original_descriptor, torch_cuda::TensorReadbackBuffers& readback, detail::TrainingContinuationValues& continuation) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_total{"rfdetr.train.save.resume.total"};
  std::filesystem::create_directories(checkpoint_path.parent_path());
  torch::serialize::OutputArchive archive;
@@ -101,8 +101,8 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const 
   detail::publish_native_checkpoint_archive(archive, checkpoint_path, options.class_layout_path);
  }
 }
-ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& admitted, const detail::TrainingContinuation& continuation, NativeOptimizer& optimizer,
- const std::vector<std::string>& parameter_names, const std::vector<torch::Tensor>& parameters, std::span<const std::uint8_t> active) {
+ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& admitted, const detail::TrainingContinuation& continuation,
+ NativeOptimizer& optimizer, const std::vector<std::string>& parameter_names, const std::vector<torch::Tensor>& parameters, std::span<const std::uint8_t> active) {
  auto* retained = admitted.admitted_archive();
  if (!retained || !admitted.class_artifact) throw std::invalid_argument("full resume requires an admitted current native archive");
  admitted.class_artifact->RequireUnchanged();
@@ -131,7 +131,9 @@ ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint
 }
 TrainingSnapshotPublication::TrainingSnapshotPublication(TrainingSnapshotPublication&& other) noexcept : snapshot_(std::exchange(other.snapshot_, nullptr)) {}
 TrainingSnapshotPublication::~TrainingSnapshotPublication() noexcept {
- try { finish(); } catch (...) {}
+ try {
+  finish();
+ } catch (...) {}
 }
 void TrainingSnapshotPublication::finish() {
  if (!snapshot_) return;
@@ -150,8 +152,10 @@ TrainingSnapshotPublication TrainingSnapshot::begin(std::span<const NormalizedMo
  active_ = true;
  TrainingSnapshotPublication publication(*this);
  ordinary_.assign(ordinary.begin(), ordinary.end());
- if (ema) collect_ema_state(ema_, names, *ema);
- else ema_.clear();
+ if (ema)
+  collect_ema_state(ema_, names, *ema);
+ else
+  ema_.clear();
  detail::reserve_state_archive(ordinary_, readback_, 0);
  detail::reserve_state_archive(ema_, readback_, ordinary_.size());
  // Stage the full ordinary and EMA inventories before temporary EMA selection

@@ -121,7 +121,15 @@ fn destructive_profile_continues_viewer_completion_into_annotation() {
         driver.driver.phase = Phase::AwaitAnnotation;
         let settings = crate::view::settings::SettingsModel::default();
         let router = crate::view::router::Router::default();
-        drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Annotate, None));
+        drop(driver.advance(
+            &model,
+            &settings,
+            1.0,
+            &router,
+            FeatureId::Annotate,
+            None,
+            false,
+        ));
         assert_eq!(driver.driver.phase, Phase::AwaitAnnotation);
         driver.observe_annotation_open(
             crate::generated::AnnotationOpen {
@@ -135,7 +143,15 @@ fn destructive_profile_continues_viewer_completion_into_annotation() {
             let snapshot = model.annotation.snapshot.as_mut().unwrap();
             snapshot.inputdocumentepoch = epoch;
             snapshot.busy = busy;
-            drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Annotate, None));
+            drop(driver.advance(
+                &model,
+                &settings,
+                1.0,
+                &router,
+                FeatureId::Annotate,
+                None,
+                false,
+            ));
             assert_eq!(driver.widgets.location_pending(), imported);
             assert_eq!(
                 driver.driver.phase,
@@ -175,7 +191,10 @@ fn quiet_failure_receipts_preserve_ui_error_kind_and_bounded_utf8() {
             "quiet".into(),
         );
         let mut model = crate::view_model::test_support::bootstrapped();
-        model.report_error(crate::view_model::notices::Origin::Protocol, crate::view_model::UiError::protocol(detail));
+        model.report_error(
+            crate::view_model::notices::Origin::Protocol,
+            crate::view_model::UiError::protocol(detail),
+        );
         drop(driver.advance(
             &model,
             &crate::view::settings::SettingsModel::default(),
@@ -183,6 +202,7 @@ fn quiet_failure_receipts_preserve_ui_error_kind_and_bounded_utf8() {
             &crate::view::router::Router::default(),
             FeatureId::Explore,
             None,
+            false,
         ));
         assert_eq!(driver.driver.phase, Phase::Failed);
         assert!(driver.driver.failure.starts_with("Protocol: "));
@@ -325,7 +345,15 @@ fn inactive_controllers_do_not_observe_snapshots_or_consume_callbacks() {
         controller.driver.phase = phase;
         assert_eq!(
             controller
-                .advance(&model, &settings, 2.0, &router, FeatureId::Explore, None)
+                .advance(
+                    &model,
+                    &settings,
+                    2.0,
+                    &router,
+                    FeatureId::Explore,
+                    None,
+                    false
+                )
                 .units(),
             0
         );

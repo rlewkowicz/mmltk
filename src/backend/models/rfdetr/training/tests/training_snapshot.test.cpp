@@ -26,7 +26,7 @@ struct TrainingSnapshotTestAccess final {
  static torch::Tensor view(TrainingSnapshot& snapshot, std::size_t slot) { return snapshot.readback_.Stage(slot); }
  static std::size_t capacity(const TrainingSnapshot& snapshot) { return snapshot.readback_.capacity_bytes(); }
 };
-}
+}  // namespace mmltk::backend::models::rfdetr::testsupport
 namespace {
 namespace r = mmltk::backend::models::rfdetr;
 using Access = r::testsupport::TrainingSnapshotTestAccess;
@@ -57,9 +57,16 @@ public:
 }
 r::TrainRequest snapshot_request(const std::filesystem::path& directory) {
  r::TrainRequest request;
- request.train_compiled_path = "train.bin"; request.val_compiled_path = "val.bin"; request.weights_path = "seed.pt"; request.output_dir = directory;
- request.epochs = 3; request.use_ema = true; request.ema_decay = .5; request.ema_tau = 0;
- request.recipe.optimizer = r::TrainOptimizerKind::AdamW; request.recipe.warmup_epochs = 0;
+ request.train_compiled_path = "train.bin";
+ request.val_compiled_path = "val.bin";
+ request.weights_path = "seed.pt";
+ request.output_dir = directory;
+ request.epochs = 3;
+ request.use_ema = true;
+ request.ema_decay = .5;
+ request.ema_tau = 0;
+ request.recipe.optimizer = r::TrainOptimizerKind::AdamW;
+ request.recipe.warmup_epochs = 0;
  return request;
 }
 torch::OrderedDict<std::string, torch::Tensor> snapshot_parameters(const torch::Device& device) {
@@ -71,28 +78,35 @@ torch::OrderedDict<std::string, torch::Tensor> snapshot_parameters(const torch::
 r::NativeCheckpointMetadata snapshot_metadata() {
  r::NativeCheckpointMetadata metadata;
  metadata.class_layout = r::testsupport::synthetic_training_layout(1);
- metadata.preset_name = "rf-detr-nano"; metadata.source_kind = "native-training-test"; metadata.source_path = "seed.pt";
- metadata.num_classes = 2; metadata.num_queries = 2; metadata.num_select = 2;
+ metadata.preset_name = "rf-detr-nano";
+ metadata.source_kind = "native-training-test";
+ metadata.source_path = "seed.pt";
+ metadata.num_classes = 2;
+ metadata.num_queries = 2;
+ metadata.num_select = 2;
  return metadata;
 }
 struct SnapshotFixture final {
  SnapshotFixture(const std::filesystem::path& directory, bool cuda)
-  : request(snapshot_request(directory)), parameters(snapshot_parameters(torch::Device(cuda ? torch::kCUDA : torch::kCPU))),
-    built(r::build_optimizer(parameters, request)), ema(built.optimizer.eligible_parameters(), request.ema_decay, request.ema_tau),
-    ordinary{{"value", parameters["value"]}, {"training_supervision.value", parameters["training_supervision.value"]},
-     {"counter", torch::tensor({3}, torch::kInt64).to(parameters["value"].device())}},
-    values(r::testsupport::continuation_values(request, {.epoch = 0})) {
+     : request(snapshot_request(directory)),
+       parameters(snapshot_parameters(torch::Device(cuda ? torch::kCUDA : torch::kCPU))),
+       built(r::build_optimizer(parameters, request)),
+       ema(built.optimizer.eligible_parameters(), request.ema_decay, request.ema_tau),
+       ordinary{
+        {"value", parameters["value"]}, {"training_supervision.value", parameters["training_supervision.value"]}, {"counter", torch::tensor({3}, torch::kInt64).to(parameters["value"].device())}},
+       values(r::testsupport::continuation_values(request, {.epoch = 0})) {
   parameters["value"].mutable_grad() = torch::full_like(parameters["value"], .25);
-  built.optimizer.step(); built.optimizer.zero_grad(true); ema.update();
-  built.optimizer.set_lrs(values.schedule.absolute_lrs, 1); built.optimizer.set_momentum(values.schedule.held_momentum);
+  built.optimizer.step();
+  built.optimizer.zero_grad(true);
+  ema.update();
+  built.optimizer.set_lrs(values.schedule.absolute_lrs, 1);
+  built.optimizer.set_momentum(values.schedule.held_momentum);
   scaler.load_state(128, 0);
   torch::NoGradGuard guard;
   parameters["value"].add_(2);
  }
  [[nodiscard]] r::TrainingSnapshotPublication begin() { return snapshot.begin(ordinary, built.optimizer.eligible_parameter_names(), &ema); }
- void resume(const std::filesystem::path& path) {
-  snapshot.save_resume(path, snapshot_metadata(), built.optimizer, scaler, request, 0, ema.completed_updates(), "attempt", {}, values);
- }
+ void resume(const std::filesystem::path& path) { snapshot.save_resume(path, snapshot_metadata(), built.optimizer, scaler, request, 0, ema.completed_updates(), "attempt", {}, values); }
  r::TrainRequest request;
  torch::OrderedDict<std::string, torch::Tensor> parameters;
  r::OptimizerBuildResult built;
@@ -117,18 +131,23 @@ void require_archive_equal(torch::serialize::InputArchive& left, torch::serializ
    require_archive_equal(child, other);
   } else {
    c10::IValue value, other;
-   left.read(key, value); right.read(key, other);
-   if (value.isTensor()) { REQUIRE(other.isTensor()); REQUIRE(torch::equal(value.toTensor(), other.toTensor())); }
-   else REQUIRE(value == other);
+   left.read(key, value);
+   right.read(key, other);
+   if (value.isTensor()) {
+    REQUIRE(other.isTensor());
+    REQUIRE(torch::equal(value.toTensor(), other.toTensor()));
+   } else
+    REQUIRE(value == other);
   }
  }
 }
-}
+}  // namespace
 extern "C" cudaError_t __real_cudaMemcpyAsync(void*, const void*, std::size_t, cudaMemcpyKind, cudaStream_t);
 extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* destination, const void* source, std::size_t bytes, cudaMemcpyKind kind, cudaStream_t stream) {
  const auto status = __real_cudaMemcpyAsync(destination, source, bytes, kind, stream);
  if (status == cudaSuccess && active_copies && kind == cudaMemcpyDeviceToHost) {
-  ++active_copies->reads[source]; active_copies->bytes += bytes;
+  ++active_copies->reads[source];
+  active_copies->bytes += bytes;
  }
  return status;
 }
@@ -168,7 +187,9 @@ TEST_CASE("one publication reuses ordinary EMA and Resume values and appends onl
  REQUIRE_NOTHROW(fixture.snapshot.require_inactive());
  auto ordinary = r::decode_native_model_state(ordinary_path), selected = r::decode_native_model_state(ema_path);
  auto resume = r::decode_native_model_state(directory.path() / "resume.pt"), repeated = r::decode_native_model_state(directory.path() / "resume-again.pt");
- REQUIRE(ordinary.entries().size() == 2); REQUIRE(selected.entries().size() == 2); REQUIRE(resume.entries().size() == 3);
+ REQUIRE(ordinary.entries().size() == 2);
+ REQUIRE(selected.entries().size() == 2);
+ REQUIRE(resume.entries().size() == 3);
  REQUIRE(torch::equal(entry(ordinary, "value"), expected_ordinary));
  REQUIRE(torch::equal(entry(selected, "value"), expected_ema));
  REQUIRE(torch::equal(entry(resume, "value"), expected_ordinary));
@@ -176,8 +197,10 @@ TEST_CASE("one publication reuses ordinary EMA and Resume values and appends onl
  REQUIRE(torch::equal(entry(ordinary, "counter"), entry(resume, "counter")));
  require_archive_equal(*resume.admitted_archive(), *repeated.admitted_archive());
  const auto continuation = r::detail::read_training_continuation(*resume.admitted_archive());
- REQUIRE(continuation); REQUIRE(continuation->values.schedule == fixture.values.schedule);
- REQUIRE(continuation->values.grad_scaler_scale == 128); REQUIRE(continuation->values.ema_completed_updates == 1);
+ REQUIRE(continuation);
+ REQUIRE(continuation->values.schedule == fixture.values.schedule);
+ REQUIRE(continuation->values.grad_scaler_scale == 128);
+ REQUIRE(continuation->values.ema_completed_updates == 1);
  torch::serialize::InputArchive shadows;
  resume.admitted_archive()->read("ema_state", shadows);
  const auto restored_ema = r::detail::read_ema_shadow_archive(shadows, fixture.built.optimizer.eligible_parameter_names());
@@ -206,9 +229,14 @@ TEST_CASE("publication scope releases serializer failures and preserves the comp
  SnapshotFixture fixture(directory.path(), false);
  r::TrainingSessionCheckpoint checkpoint(directory.path());
  r::TrainingSessionManifest manifest;
- manifest.session_id = "session"; manifest.attempt_id = "attempt"; manifest.epoch = 1;
- manifest.initialization = std::string(64, '1'); manifest.configuration = std::string(64, '2'); manifest.validation = std::string(64, '3');
- manifest.precision = r::TrainingPrecisionKind::Float16; manifest.request = fixture.request;
+ manifest.session_id = "session";
+ manifest.attempt_id = "attempt";
+ manifest.epoch = 1;
+ manifest.initialization = std::string(64, '1');
+ manifest.configuration = std::string(64, '2');
+ manifest.validation = std::string(64, '3');
+ manifest.precision = r::TrainingPrecisionKind::Float16;
+ manifest.request = fixture.request;
  manifest.models.push_back({0, {}, {}, 0, {}});
  const r::TrainingPlanState plan{1, {{0, 42, {0}, {1}, {}}}};
  {
@@ -251,23 +279,29 @@ TEST_CASE("ordinary publication excludes stale EMA after released storage is reu
  const std::array invalid{r::NormalizedModelStateEntry{"undefined", {}}};
  REQUIRE_THROWS(fixture.snapshot.begin(invalid, {}, nullptr));
  REQUIRE_NOTHROW(fixture.snapshot.require_inactive());
- { auto publication = fixture.begin(); publication.finish(); }
+ {
+  auto publication = fixture.begin();
+  publication.finish();
+ }
  fixture.request.use_ema = false;
  auto publication = fixture.snapshot.begin(fixture.ordinary, {}, nullptr);
  REQUIRE_THROWS(fixture.snapshot.save_weights(directory.path() / "unadmitted-ema.pt", snapshot_metadata(), true, {}));
- fixture.snapshot.save_resume(directory.path() / "ordinary-resume.pt", snapshot_metadata(), fixture.built.optimizer, fixture.scaler, fixture.request,
-  0, 0, "attempt", {}, fixture.values);
+ fixture.snapshot.save_resume(directory.path() / "ordinary-resume.pt", snapshot_metadata(), fixture.built.optimizer, fixture.scaler, fixture.request, 0, 0, "attempt", {}, fixture.values);
  publication.finish();
  auto saved = r::decode_native_model_state(directory.path() / "ordinary-resume.pt");
  torch::serialize::InputArchive unwanted;
  REQUIRE_FALSE(saved.admitted_archive()->try_read("ema_state", unwanted));
  const auto continuation = r::detail::read_training_continuation(*saved.admitted_archive());
- REQUIRE(continuation); REQUIRE(continuation->values.ema_completed_updates == 0);
+ REQUIRE(continuation);
+ REQUIRE(continuation->values.ema_completed_updates == 0);
 }
-
 TEST_CASE("test_ema_selection_restores_identity_and_mode", "[model][rfdetr][training][ema][snapshot]") {
  r::NativeRfDetrConfig config;
- config.num_classes = 3; config.num_queries = 2; config.num_select = 2; config.dec_layers = 1; config.hidden_dim = 8;
+ config.num_classes = 3;
+ config.num_queries = 2;
+ config.num_select = 2;
+ config.dec_layers = 1;
+ config.hidden_dim = 8;
  config.ca_nheads = 2;
  config.training_supervision = {};
  r::NativeRfDetrModel module(config, r::testsupport::synthetic_training_layout(config.num_classes - 1));
@@ -292,7 +326,8 @@ TEST_CASE("test_ema_selection_restores_identity_and_mode", "[model][rfdetr][trai
  const std::vector<std::string> names{"class_embed.weight", "class_embed.bias"};
  mmltk::testsupport::ScopedTempDir directory("snapshot-ema-selection");
  auto metadata = snapshot_metadata();
- metadata.class_layout = r::testsupport::synthetic_training_layout(2); metadata.num_classes = 3;
+ metadata.class_layout = r::testsupport::synthetic_training_layout(2);
+ metadata.num_classes = 3;
  r::TrainingSnapshot snapshot;
  auto publication = snapshot.begin(state, names, &ema);
  try {

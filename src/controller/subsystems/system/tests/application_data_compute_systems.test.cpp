@@ -80,13 +80,7 @@ TEST_CASE("native training projects a child OOM into the GUI terminal and shared
  const auto executable = root / "trainer.sh";
  {
   std::ofstream script{executable};
-  script << "#!/bin/sh\n"
-            "batch=''; lanes=''; devices=''; while [ $# -gt 0 ]; do case \"$1\" in --batch-size) batch=$2;; --lanes) lanes=$2;; --device-id|--device-ids) devices=$2;; esac; shift; done\n"
-            "[ \"$batch\" = 16 ] && [ \"$lanes\" = 3 ] || { printf 'fatal: unexpected training argv\\n'; exit 9; }\n"
-            "[ \"$devices\" = \""
-         << (multiple ? "3,1" : "7")
-         << "\" ] || { printf 'fatal: unexpected GPU argv\\n'; exit 9; }\n"
-            "printf 'fatal: mmltk rfdetr error: CUDA out of memory. Tried to allocate 24.00 MiB. GPU 0 has a total capacity of 11.62 GiB of which 42.00 MiB is free.\\n'\nexit 1\n";
+  script << "#!/bin/sh\nMMLTK_TRAIN_FIXTURE_FAILURE=" << (multiple ? "oom-multiple" : "oom-single") << " exec \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\"\n";
  }
  std::filesystem::permissions(executable, std::filesystem::perms::owner_all);
  const auto diagnostic_path = root / "training.jsonl";

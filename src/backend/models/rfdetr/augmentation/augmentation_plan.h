@@ -45,8 +45,8 @@ struct GpuAugmentationDonor {
 };
 [[nodiscard]] bool augmentation_paste_admitted(const GpuAugmentationConfig& config, std::uint64_t key) noexcept;
 // The same pure semantic plan feeds logical donor history and physical launches.
-[[nodiscard]] AugmentationImagePlan plan_augmentation_image(const GpuAugmentationConfig&, std::uint64_t key, std::uint32_t dataset_index,
- const GpuAugmentationDonor* selected, std::int64_t donor_slot);
+[[nodiscard]] AugmentationImagePlan plan_augmentation_image(
+ const GpuAugmentationConfig&, std::uint64_t key, std::uint32_t dataset_index, const GpuAugmentationDonor* selected, std::int64_t donor_slot);
 struct AugmentationBatchPlan {
  std::vector<AugmentationImagePlan> images;
  std::size_t active_size = 0;

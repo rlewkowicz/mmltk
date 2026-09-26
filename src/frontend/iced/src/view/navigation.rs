@@ -58,7 +58,6 @@ pub fn view(
             text(connection)
                 .size(typography.secondary)
                 .style(crate::fluent_theme::text_secondary),
-
         ]
         .spacing(16)
         .align_y(Center),

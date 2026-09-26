@@ -358,7 +358,12 @@ pub(crate) fn view<Message: 'static>(state: Option<&ArtifactUiState>) -> Element
                         .width(Fill),
                 );
             }
-        } else if !state.active && !matches!(state.terminal.outcome, ArtifactTerminalOutcome::Failed | ArtifactTerminalOutcome::Refused) {
+        } else if !state.active
+            && !matches!(
+                state.terminal.outcome,
+                ArtifactTerminalOutcome::Failed | ArtifactTerminalOutcome::Refused
+            )
+        {
             for detail in [&state.terminal.detail, &state.terminal.artifact] {
                 if !detail.is_empty() {
                     body = body.push(status_text(detail.clone()).size(12));
