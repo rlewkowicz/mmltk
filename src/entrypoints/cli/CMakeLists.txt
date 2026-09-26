@@ -83,3 +83,4 @@ endfunction()
 
 mmltk_register_ordinary_sources(mmltk_entrypoints_cli tool_launch.cpp)
 mmltk_register_private_headers(mmltk_entrypoints_cli tool_launch.h)
+mmltk_register_header_isolation(mmltk_entrypoints_cli)

@@ -17,6 +17,7 @@
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
+#include "src/backend/models/rfdetr/inference/evaluation.h"
 #include "src/frameworks/reflection/cli_declarations.h"
 #include "src/frameworks/reflection/declaration_annotations.h"
 #include "src/frameworks/reflection/field_policy.h"

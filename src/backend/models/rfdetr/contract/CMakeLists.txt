@@ -74,6 +74,9 @@ function(mmltk_add_backend_models_rfdetr_contract_tests)
             mmltk::frameworks::serialization
     )
     if(BUILD_RFDETR_NATIVE)
+        mmltk_link_declarations(
+            mmltk_backend_models_rfdetr_contract_tests PRIVATE
+            mmltk::backend::models::rfdetr::inference)
         target_link_libraries(
             mmltk_backend_models_rfdetr_contract_tests PRIVATE
             mmltk_entrypoints_cli_test_support)
