@@ -7,7 +7,7 @@ facts. Their primary action settles settings, selects the requested model,
 prepares missing weights, inspects the selected compiled inputs where needed,
 and starts the owning system. Preparation progress belongs to the model card;
 execution progress belongs to the workflow. A preparation failure stops that
-start request and leaves its typed error visible.
+start request and publishes its typed error to session Status.
 
 Train launches the packaged sibling CLI through `TrainingSystem`. Validate and
 Predict own independent native sessions, GPU work, cancellation, and retained
@@ -25,10 +25,10 @@ execution and state boundaries through typed APIs:
 
 | Declaration | Responsibility |
 | --- | --- |
-| [detail/training_lanes.h](../src/backend/models/rfdetr/training/detail/training_lanes.h) | Training lanes, queued work, gradient handoff, and event custody |
+| [detail/training_lanes.h](../src/backend/models/rfdetr/training/detail/training_lanes.h) | Physical training workers, queued logical contributions, gradient handoff, and event custody |
 | [detail/training_metrics.h](../src/backend/models/rfdetr/training/detail/training_metrics.h) | GPU scalar accumulation and the completed metric handoff |
 | [detail/training_snapshot.h](../src/backend/models/rfdetr/training/detail/training_snapshot.h) | Ordinary/EMA serialization snapshots and continuation save/load coordination |
-| [detail/native_optimizer_private.h](../src/backend/models/rfdetr/training/detail/native_optimizer_private.h) | Typed AdamW/Muon state, parameter groups, update, and archive operations |
+| [detail/native_optimizer_private.h](../src/backend/models/rfdetr/training/detail/native_optimizer_private.h) | Typed AdamW/Muon/SGD state, parameter groups, update, and archive operations |
 | [detail/target_builder_private.h](../src/backend/models/rfdetr/training/detail/target_builder_private.h) | Target staging, scratch storage, and consumer leases |
 | [detail/evaluation_runtime.h](../src/backend/models/rfdetr/training/detail/evaluation_runtime.h) | Evaluation lanes, prediction buffers, scheduled validation lifetime, and retained sample-output writer |
 | [checkpoint.h](../src/backend/models/rfdetr/training/checkpoint.h) | Ordinary checkpoint application, normalization, weight loading, and continuation inspection API |
@@ -75,7 +75,7 @@ after selection, as described [below](#model-input-and-detection-selection).
 Current RF-DETR execution requires sigmoid logits; declaring a softmax layout
 does not make that execution mode supported.
 
-Native version-3 checkpoints embed the layout. External assets may supply
+Native version-4 checkpoints embed the layout. External assets may supply
 supported embedded metadata, verified asset metadata, or a digest-bound
 descriptor selected with `--class-layout`. The version-1
 `ModelClassDescriptor` JSON record contains the artifact SHA-256, layout, and
@@ -149,8 +149,10 @@ selection count. It does not change COCO evaluation policy.
 ## Shared weights selection
 
 Train, Validate, Predict, and Export use the same **RF-DETR Weights** card:
-catalog presets and **Custom Weights**, with a compact selected path, active preparation progress,
-and actionable errors. Train accepts trainable weights (`.pt`, `.pth`, `.ckpt`,
+catalog presets and **Custom Weights**, with a compact selected path and active
+preparation progress. Operational errors appear in the session
+[Status panel](gui-interaction.md#session-status). Train's chooser accepts
+trainable weights (`.pt`, `.pth`, `.ckpt`,
 `.safetensors`). Validate and Predict also accept ONNX (`.onnx`) and TensorRT
 (`.engine`, `.trt`). Export's custom chooser accepts `.pt` weights. The selected
 extension identifies an input kind through
@@ -240,9 +242,10 @@ or reports an error. Browsing changes neither weights nor Transfer/Resume mode.
 Re-enabling Auto clears the manual selection. Start selects live charts.
 
 Transfer may use an absent or empty manual destination directly. A populated
-destination gets a new numeric `run-*` child. Resume reuses a manual run directory
-only when the selected full `checkpoint.pt` is in that directory and its attempt,
-evaluated-weight choice, and class layout match the current history. Otherwise
+destination gets a new numeric `run-*` child. Native Resume output admission
+reuses a manual run directory only when the admitted session manifest is in
+that directory and its session, attempt, evaluated-weight choice, and class
+layout match the current history. Otherwise
 Resume reserves a fresh child, including for an empty manual destination.
 Automatic mode always reserves a fresh child. The resolved path appears when
 the run is admitted. This GUI policy belongs to
@@ -257,8 +260,9 @@ selection does.
 
 ## Local training failures
 
-An unsuccessful local run shows the child's bounded useful failure cause and
-exit status in Train. Signal termination retains the signal number. An
+An unsuccessful local run publishes the child's bounded useful failure cause
+and exit status to [session Status](gui-interaction.md#session-status). Signal
+termination retains the signal number. An
 explicit **CUDA out of memory** cause includes available allocator detail and
 guidance to reduce **batch size** or **training lanes**, then start again.
 The application preserves the configured workload and does not retry or tune
@@ -320,12 +324,13 @@ The [training reference](rfdetr-training.md#accumulation-optimizer-and-ema)
 defines first-copy, later averaging, and continuation behavior. `--no-ema` disables them. Disabled EMA creates no
 shadow storage or update work.
 
-Each scheduled validation evaluates exactly one weight set: EMA when enabled,
-ordinary weights otherwise. Metrics and best-checkpoint selection use that same
-set. Evaluation temporarily selects EMA weights with restoration of the working
-weights and training mode. There is one validation trajectory, identified by
-`evaluated_weights`, rather than a separate EMA chart. An optional final test
-uses the selected best checkpoint.
+Shared and independent models use EMA when enabled and ordinary weights
+otherwise for their selected validation trajectory and best-candidate choice.
+Evaluation temporarily selects EMA with restoration of working weights and
+training mode. Periodic mode also validates synchronized ordinary weights once,
+retaining that session source separately from model EMA sources. Final selection
+and optional test consume a frozen native artifact. See
+[model merging](model-merging.md) for cadence, policies, and publication.
 
 Stock Hungarian training follows the pinned upstream mathematics for equivalent
 admitted tensors and settings, including its extra accumulation divisor.
@@ -337,27 +342,22 @@ states what the mathematical and integration evidence establishes.
 
 ## Checkpoints and continuation
 
-Only the current native RF-DETR **version-3** application checkpoint format is
-supported. Upstream external weights keep their separate import routes.
-An old application checkpoint is not an upstream artifact or a resumable run.
-
-| Artifact | Contents and use |
-| --- | --- |
-| `checkpoint.pt` | Full continuation: working model/supervision state, optimizer, scheduler configuration/progress, scaler, and enabled EMA state/update count |
-| `checkpoint_epoch_N.pt` | Ordinary epoch weights for inference or transfer; not a full continuation |
-| `checkpoint_best_regular.pt` | Selected best ordinary weights when EMA is disabled |
-| `checkpoint_best_ema.pt` | Selected best EMA weights when EMA is enabled |
-| `checkpoint_fallback_regular.pt` or `checkpoint_fallback_ema.pt` | Selected weights when no best checkpoint was selected |
-
-The best/epoch/fallback artifacts are weights snapshots, not full resume
-checkpoints. Class layout accompanies native artifacts. Checkpoint/export
-serialization uses [reusable pinned readback storage](gpu-execution.md#checkpoint-and-export-readbacks);
-this does not move per-step EMA updates onto the CPU.
+Current native archives use **version 4**. Resume requires the complete
+`session.json` manifest and its immutable generation, including for one model.
+Individual model archives and deployment candidates support Transfer rather
+than partial Resume. The [artifact and continuation reference](model-merging.md#artifact-layout-and-formats)
+owns filenames, versions, candidate/selected-output publication, leases, and
+whole-session validation. Upstream external weights retain separate import
+routes; older application checkpoints are unsupported.
 
 Train's weights card owns mutually exclusive **Transfer** and **Resume** radios.
-Catalog and weights-only inputs use Transfer and cannot Resume. A resumable
-custom checkpoint defaults to Resume; Transfer may still use its weights with
-fresh training state. Selecting a file or changing the radio never starts work.
+Catalog and weights-only inputs use Transfer and cannot Resume. An admitted
+resumable custom selection defaults to Resume. Selecting a file or changing the
+radio never starts work. The current custom chooser/confirmation accepts weights
+extensions and rejects a newly selected `.json` manifest; Browse Output only
+loads history. A custom path already present in settings follows native
+inspection and the existing Prepare Resume path. The CLI accepts a manifest
+through `--resume`; see [whole-session Resume](model-merging.md#whole-session-resume).
 
 Custom selection starts cancellable native inspection on a worker. Inspection
 validates the archive, continuation, optimizer inventory, and required EMA
@@ -381,10 +381,11 @@ shows saved history. It disappears when that run completes, fails, or is
 cancelled. Preparing a model remains a separate stage in the model card.
 
 During the Train phase, the card uses native `completed_images` and
-`total_images` from the current epoch. These are **rank-local image counts**,
-not optimizer steps or world-wide totals. The native loader derives the total
-from usable full microbatches after tail, distributed, accumulation, and lane
-constraints; completion advances with processed local microbatches. The GUI
+`total_images` from the current epoch. These are **global logical image counts**
+for the reported source, not optimizer steps or a multiplication of rank-local
+observations. Native planning derives the total from complete admitted windows
+and reports unused tails separately; completion counts each processed global
+microbatch once. The GUI
 does not reconstruct either count from dataset size or editable batch settings.
 See [train.cpp](../src/backend/models/rfdetr/training/train.cpp) and the
 [progress declaration](../src/backend/models/rfdetr/contract/training_metrics.h).
@@ -399,17 +400,18 @@ show their phase without a stale image bar or loss/rate display.
 
 ## Saved history and plots
 
-Current manifests and metric records use **format version 2**, including the
-native image-count fields. Version-1 history and other older output directories
-are rejected; there is no compatibility reader or migration. Checkpoint version
-3 and the [compiled dataset format](datasets.md#compiled-binary-format) are
-independent formats.
+Current run manifests and metric records use **format version 3**, including
+typed source scope, session/model identity, round/merge facts, distributions,
+execution facts, and selected-output metadata. Older output directories are
+rejected; there is no compatibility reader or migration. The
+[continuation formats](model-merging.md#artifact-layout-and-formats) and
+[compiled dataset format](datasets.md#compiled-binary-format) are independent.
 
 | File | Authority |
 | --- | --- |
-| `run.json` | Run/attempt identity, training configuration, execution/query facts, class layout, selected evaluation weights, and resume provenance |
+| `run.json` | Run/attempt identity, training configuration, execution/query facts, source catalog, class layout, selected evaluation weights, and resume provenance |
 | `metrics.jsonl` | Append-only typed metric records, including sequence, attempt, role, missing-record count, and progress |
-| `progress.json` | Latest progress projection, including the typed metric record, consumed by the training process client |
+| `progress.json` | Latest typed record plus retained source state and optional final result, consumed by the training process client |
 | `log.txt` | Epoch summary projections |
 | `results.json` | Final result projection |
 
@@ -424,7 +426,7 @@ Training submits bounded records without waiting for charts, browser delivery,
 or telemetry disk I/O. Intermediate live records can coalesce; epoch and terminal
 records have reserved queue custody.
 Contention, capacity exhaustion, or persistence failure marks history incomplete
-and is reported in the GUI while training continues. Checkpoint failures keep
+and produces a session Status notice while training continues. Checkpoint failures keep
 their ordinary operation-failure behavior.
 
 Live samples are submitted at most once per second, with immediate phase,
@@ -444,11 +446,20 @@ does not advance past an incomplete trailing append. Opening history requires
 both a valid current manifest and its `metrics.jsonl`; a directory with neither
 is a valid empty history selection.
 
-Scheduled evaluation contributes one sparse observation per recorded epoch
-for the selected weight set. Live and terminal records carrying the latest
-evaluation do not add duplicate observations. Missing or unavailable
-measurements remain gaps. Optional final-test support and persisted results
-remain native; the GUI has no final-test result display or chart trajectory. The
+Native source identity is `(scope, model_id, weights)`: model,
+synchronized-session, selected-output, or session scope, with Ordinary, Ema, or
+Soup weights. Shared mode uses model ID zero. Independent/periodic modes retain
+stable model IDs; periodic ordinary validation uses synchronized-session scope.
+The default chart source prefers the run's selected weight kind and then the
+lowest model ID. Saved and live views retain separate source selections.
+
+Scheduled evaluation contributes one sparse observation per source and recorded
+epoch. Live and terminal records carrying the latest evaluation do not duplicate
+it. Missing or unavailable measurements remain gaps. **Selected output** shows
+the final artifact, method, ingredient coefficients/checksums, and validation
+summary separately from epoch curves. Native first-cause identities preserve
+per-model failures. Optional final-test results remain native; the GUI has no
+final-test chart trajectory. The
 [training dashboard](gui-interaction.md#training-dashboard) owns chart selection,
 axes, retained interaction, bounded summaries, and rendering behavior. Throughput
 belongs to live progress rather than a dashboard curve.
@@ -560,7 +571,9 @@ A save failure preserves computed metrics, the completed report and PNGs,
 and reports the image-output error. Optional interactive adoption does not
 control metrics or required saves.
 
-Scheduled training evaluation separately writes `eval_samples/epoch_N.png`.
+Scheduled training evaluation separately writes `eval_samples/epoch_N.png`
+with one-based epoch `N`. Shared mode uses the run root; independent/periodic
+model evaluation uses `model-<ID>/ordinary/` or `model-<ID>/ema/` beneath it.
 [TrainingValidationRuntime](../src/backend/models/rfdetr/training/evaluation_run_owner.cpp)
 owns an [EvaluationSampleWriter](../src/backend/models/rfdetr/core/sample_output.h)
 that lazily retains its CUDA device, worker, settlement stream, and event across

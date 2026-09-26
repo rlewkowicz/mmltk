@@ -21,8 +21,10 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --update-firefox-lock` | Refresh Firefox's Cargo lock from its vendored sources, offline |
 | `./mmltk --tidy` | Format native sources and Iced application Rust; run configured native analysis |
 | `./mmltk --cleanup-report cpp\|frontend\|all` | Generate the selected deduplication reports |
+| `./mmltk --raw-cpd [--min-tokens N] [--output PATH]` | Save unfiltered exact-spelling C++ CPD evidence and separate declaration context |
+| `./mmltk --format-declarations check\|preview\|fix [--file PATH] [--report PATH]` | Report or safely shorten canonical reflection annotation syntax |
 | `./mmltk --test list` | List supported suites and test options |
-| `./mmltk --test all` | Run ordinary native, browser JavaScript/Rust, and log-query fixtures |
+| `./mmltk --test all` | Run ordinary native, browser JavaScript/Rust, cleanup/declaration, and log-query fixtures |
 | `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |
 | `./mmltk --logs --help` | Show log-query grammar and options |
 | `./mmltk --diagnose-processes [WRAPPER_MODE]` | Inspect processes in this repository's running wrapper containers |
@@ -38,7 +40,8 @@ The `|` entries above mean choose one value; they are not shell pipelines.
 Build, test, tidy, cleanup, export, and diagnostics are separate operations.
 Put `--logs`, `--diagnose-io`, `--diagnose-nvidia-payload`,
 `--diagnose-gpu-environment`, `--diagnose-gpu-program`, `--diagnose-native-symbols`,
-`--diagnose-native-link`, `--diagnose-processes`, `--diagnose-benchmark-image`, or `--cleanup-report`
+`--diagnose-native-link`, `--diagnose-processes`, `--diagnose-benchmark-image`,
+`--cleanup-report`, `--raw-cpd`, or `--format-declarations`
 first when invoking that standalone operation.
 
 The [validation guide](validation.md#standalone-cudavulkan-diagnostic) owns
@@ -49,6 +52,9 @@ for symbol filters, linker maps, and saved LTO intermediates.
 The [test-selection reference](validation.md#selection-environment-deadlines-and-debugging)
 owns focused native filters, browser JavaScript/Rust package selection, and
 log-query fixture selectors.
+The [declaration-tool reference](validation.md#raw-cpd-and-declaration-formatting)
+owns report formats, exact-spelling evidence, conservative rewrite admission,
+and check/preview/fix behavior.
 
 ### Process snapshots
 
@@ -66,11 +72,31 @@ and mode, then reports PID, parent PID, elapsed time, CPU time, CPU/memory
 percentages, process state, wait channel, and process name. It omits command
 arguments and environment variables.
 
-This read-only operation requires a running Docker daemon and does not start
-one, create or alter containers, attach to a process, or build/pull images.
+The default snapshot is read-only. It requires a running Docker daemon and
+does not start one, create or alter containers, attach to a process, or
+build/pull images.
 Each daemon query has a 15-second deadline. No matching running container is
 a successful empty result. A snapshot describes current process state; it
 does not by itself establish a stall, completed work, or product performance.
+
+Explicit process actions accept one native executable basename of the form
+`mmltk[_-][A-Za-z0-9_-]+` and require exactly one matching wrapper container:
+
+```bash
+./mmltk --diagnose-processes test --backtrace mmltk_backend_models_rfdetr_training_tests
+./mmltk --diagnose-processes test --read-file mmltk_backend_models_rfdetr_training_tests --file /workspace/build/example.json
+./mmltk --diagnose-processes test --terminate mmltk_backend_models_rfdetr_training_tests --pid 123
+```
+
+The examples require that executable to be running. `--pid` is a container PID
+selector for an action, not a host PID. Selection verifies `/proc/PID/exe`,
+rather than command text. Backtrace attaches GDB as container root, collects
+all thread stacks, and detaches under a 35-second debugger deadline. Read-file
+uses the selected process's root namespace, accepts an absolute regular-file
+path, and prints escaped bytes up to 4 MiB. Terminate sends SIGTERM through a
+pidfd to the selected process and can fail the interrupted operation. These
+explicit actions are distinct from the read-only snapshot; none creates or
+builds a container. Wrapper action execution is bounded to 45 seconds.
 
 ### Benchmark image geometry
 
@@ -148,7 +174,7 @@ For example, with existing input artifacts:
 ```bash
 ./mmltk rfdetr predict \
   --compiled ./compiled/val.bin \
-  --weights ./checkpoints/checkpoint_best_regular.pt \
+  --weights ./checkpoints/model.pt \
   --output ./predictions.json
 ```
 
@@ -185,6 +211,35 @@ See [logging activation](logging.md#activation-and-quiet-execution), especially
 for ONNX metadata commands whose output requires explicit diagnostics.
 Fatal operation failures still produce a concise
 [stderr report](logging.md#fatal-stderr-reports) with diagnostics disabled.
+
+### Training request selection
+
+`rfdetr train --batch-size` is a **global microbatch** image count.
+`--grad-accum-steps` and logical `--lanes` determine the mode's effective batch;
+`--validation-lanes` controls training-owned inference independently. The
+[training reference](rfdetr-training.md#logical-lanes-and-global-batch) owns the
+equations and complete-window admission. `--optimizer` selects `adamw`, `muon`,
+or `sgd`; `--lr-scheduler` selects `step`, `cosine`, or `ultralytics-linear`,
+with the latter admitted only for SGD. `--nesterov`/`--no-nesterov` and
+`--warmup-bias-lr` expose SGD policy. Final-epoch controls are
+`--unfreeze-encoder-last-epochs` and `--disable-augmentation-last-epochs`.
+
+`--request-json JSON` accepts one complete canonical `TrainRequest`, bounded to
+64 KiB. The argument is JSON text, not a filename. It is mutually exclusive with
+every scalar train option. Use this route for the complete lane configuration,
+stable model IDs and per-model recipes, merge/final policy, and sparse sampling
+policy. The canonical
+[request](../src/backend/models/rfdetr/contract/workflow_requests.h),
+[execution plan](../src/backend/models/rfdetr/contract/execution_plan.h), and
+[parser](../src/entrypoints/cli/rfdetr_cli.cpp) own its field names and admission;
+there is no second CLI-specific schema. Paths inside JSON must already identify
+the inputs as visible to the runtime container.
+
+`--resume PATH` supplies a [whole-session manifest](model-merging.md#whole-session-resume).
+The scalar CLI does not implicitly restore all request settings; supply matching
+compiled inputs, recipes, and policies. Inspection and GUI Prepare Resume retain
+their distinct setting-restoration workflow. The selected deployment `.pt`
+artifact remains the ordinary input to prediction/export.
 
 ### Benchmark cache selection
 

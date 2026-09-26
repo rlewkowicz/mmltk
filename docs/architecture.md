@@ -72,6 +72,25 @@ declarations generate the browser payloads. The backend's
 [catalog](../src/backend/data/catalog/class_catalog.h) supplies immutable class
 identity independently of model execution.
 
+The native [training session](../src/backend/models/rfdetr/training/train.cpp)
+orders logical models and distributed work. Its
+[model owner](../src/backend/models/rfdetr/training/detail/training_model.h)
+retains working parameters, recipe, optimizer, scaler, EMA, and continuation.
+[TrainingDataPlan](../src/backend/models/rfdetr/training/detail/training_data_plan.h)
+owns sparse membership and draws;
+[TrainingSchedule](../src/backend/models/rfdetr/training/detail/training_schedule.h)
+owns recipe clocks; the
+[gradient reducer](../src/backend/models/rfdetr/training/detail/training_gradient_reducer.h)
+owns asynchronous bucket custody. These are ordinary runtime owners. Canonical
+[execution](../src/backend/models/rfdetr/contract/execution_plan.h),
+[recipe](../src/backend/models/rfdetr/contract/train_recipe.h), and
+[artifact](../src/backend/models/rfdetr/contract/training_artifacts.h)
+declarations supply reflected values and projections. The
+[training](rfdetr-training.md) and [merging/continuation](model-merging.md)
+references own the detailed contracts. Shared
+[inference lanes](gpu-execution.md#inference-lanes-and-borrowed-inputs) retain
+their separate immutable-model and borrowed-input boundary.
+
 Annotation's [input executor](../src/controller/subsystems/annotation/annotation_system.cpp)
 owns the mutable document and ordered history through
 [AnnotationDocument](../src/controller/subsystems/annotation/detail/annotation_document.h).
@@ -186,7 +205,7 @@ owns dialog confirmation and pending selection; the
 presentation, with Train history and Predict saving in their local components.
 The [GPU card](../src/frontend/iced/src/view/workflow/gpu.rs) owns selection
 interaction; the shared compositor supplies its
-[Output/GPU/Status placement](gui-interaction.md#gpu-selection).
+[Output/GPU placement](gui-interaction.md#gpu-selection).
 
 [ValidationSampleOutput](../src/controller/subsystems/validate/detail/validation_sample_output.h)
 captures selected borrowed samples into receiver-owned immutable products.
@@ -276,6 +295,14 @@ only when inserting a new metric. Its opt-in activation remains independent
 of product work.
 
 ## Reflected value and persistence boundaries
+
+The [declaration authoring guide](reflection.md) owns canonical registration,
+short annotation syntax, and safe mechanical formatting. The syntax-only
+[declaration_annotations.h](../src/frameworks/reflection/declaration_annotations.h)
+expands directly to existing field-policy annotations; ordinary declarations,
+defaults, equality, and registrations stay explicit. Structural projection
+removes repeated member inventories without moving product policy into
+reflection.
 
 [reflected_descriptors.h](../src/frameworks/reflection/reflected_descriptors.h)
 owns CLI assignment and emission. Non-boolean scalar, optional, and repeatable
@@ -411,6 +438,16 @@ native operation facts independently of selected history. The
 [GUI guide](gui-interaction.md#training-dashboard) owns interaction and rendering
 details; [RF-DETR workflows](rfdetr-workflows.md#live-training-progress) owns
 the native counts and timing semantics.
+
+The [lane component](../src/frontend/iced/src/view/train/lanes.rs) and
+[Advanced](../src/frontend/iced/src/view/train/advanced.rs) edit canonical
+recipe/model settings and display native execution facts. Metrics retain
+separate sources per live/saved history and selected-output presentation.
+[NoticeStore](../src/frontend/iced/src/view_model/notices.rs) owns bounded
+session notice identity and acknowledgment; the root
+[Status view](../src/frontend/iced/src/view/status.rs) owns its interaction,
+focus, clipboard, and presentation. Native system recovery and cancellation
+remain with their existing owners. See [session Status](gui-interaction.md#session-status).
 
 The [GUI interaction guide](gui-interaction.md#typed-application-boundary)
 owns the current protocol, compact input representation, native command

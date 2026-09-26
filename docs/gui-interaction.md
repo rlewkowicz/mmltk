@@ -14,6 +14,9 @@ Explore**. [navigation.rs](../src/frontend/iced/src/view/navigation.rs) owns
 that visual order; ordinary workflow traversal derives from it, excluding
 Explore.
 
+**Status** and **Settings** remain fixed at the header's right edge, outside the
+workflow tab scroller. Status owns session notices across every page.
+
 The destination page owns foreground source selection. Navigating directly from
 Validate to Explore restores Explore's native product even when Validation
 retains results or later publishes another update. A retained Upscale request
@@ -46,7 +49,7 @@ editor widget identities survive ordinary layout and native-state updates.
 ## Training, validation, and prediction
 
 Train, Validate, Predict and Export place **Output** at the top of the right
-column, **GPU** immediately below it, and **Status** below GPU. Their shared
+column and **GPU** immediately below it. Their shared
 Output card provides Auto Output, Browse Output and admitted/completed paths;
 Train adds saved history and
 Predict adds its source-specific saving controls. Setup and the primary action
@@ -62,7 +65,8 @@ when inference is disabled. Its weights card owns Transfer/Resume.
 Its Output card selects Auto Output or Browse Output, shows the selected/active
 path, and loads supported saved charts. Advanced includes
 **Exponential moving average**, disabled by default, and separate
-augmentation/perceptual-downscaling settings. The
+augmentation/perceptual-downscaling settings, alongside the
+[lane and recipe controls](#lane-and-recipe-controls). The
 [workflow reference](rfdetr-workflows.md) owns the metric conventions, current
 file formats, input admission, live progress, and continuation requirements.
 
@@ -100,6 +104,40 @@ Validation and prediction also retain the save-preview options captured at
 that accepted Start through preparation. Later viewer edits do not mutate the
 admitted save payload. Predict inspection replies enter the same revision-aware
 snapshot reduction as events, so a late reply cannot replace newer source facts.
+
+### Lane and recipe controls
+
+Train offers **Shared gradients**, **Independent models**, and **Periodic
+averaging**. The [native training contract](rfdetr-training.md#logical-lanes-and-global-batch)
+owns global batch, accumulation, model membership, and capacity. Train lanes
+and Training-validation lanes are independent controls. Native revision-bound
+facts supply effective batch and aggregate session-round images; stale or
+unsettled facts show **Updating**. Rust does not derive a second batch formula.
+Independent and periodic modes display their experimental limitation.
+
+**Recipe scope** selects Global defaults or a stable model ID. New models copy
+the settled global recipe; existing models retain overrides through mode
+changes. Model scope also exposes its seed and soup coefficient. AdamW, Muon,
+and SGD use generated catalog defaults; changing optimizer preserves explicit
+overrides. **Use optimizer defaults** clears the selected scope's overrides
+without changing its optimizer. Step, Cosine, and Ultralytics linear scheduler
+availability comes from native policy. The
+[recipe reference](rfdetr-training.md#recipes-and-schedules) owns equations,
+defaults, and continuation clocks.
+
+Class balancing offers Off, Stratified, and Rare repeats + Stratified, revealing
+the native rare-threshold/repeat limits when needed. Periodic mode exposes
+Each epoch or Every N rounds and the merge interval. **Final model soup**
+offers Mode default, Off, Uniform, Explicit, and Validation-greedy. Native
+[merging policy](model-merging.md) resolves defaults and selection. Final-epoch
+encoder unfreezing and augmentation disabling are separate numeric policies;
+zero disables each. These are configuration edits, not implicit starts.
+
+Validate, Predict, and training validation have separate inference-lane
+settings. Native source/backend capacity admission can reduce physical lanes;
+single-image prediction admits one. The
+[execution guide](gpu-execution.md#inference-lanes-and-borrowed-inputs) owns
+resource reuse, ordered delivery, and drain behavior.
 
 ### GPU selection
 
@@ -169,11 +207,61 @@ requested, both the action and progress say **Cancelling…**; live work, tracks
 and source rows disappear immediately, while the reserved space remains until
 the native system becomes inactive. Duplicate cancellation is disabled.
 
-Only the native terminal result settles the operation. **Completed**,
-**Cancelled**, **Failed**, or **Compilation refused** replaces live progress,
-with the supplied detail and artifact path when present. Releasing the active
-reservation animates the area to that result's natural height. Retained late
-progress cannot revive settled bars or turn a cancellation into success.
+Only the native terminal result settles the operation. **Completed** or
+**Cancelled** replaces live progress with supplied detail and artifact path.
+Failure and refusal publish a session Status notice and collapse the terminal
+progress body. Releasing the active reservation animates to its natural height.
+Retained late progress cannot revive bars or turn cancellation into success.
+
+## Session Status
+
+The header [Status component](../src/frontend/iced/src/view/status.rs) is the
+single operational warning/error surface. With no retained notices it shows
+only green **Ok**. Otherwise it shows a warning triangle and white outline with
+a pink two-second border pulse. Only a visible active pulse requests redraws;
+reduced motion keeps a static border and hidden windows stay quiet. Arriving
+notices do not open the panel or steal focus.
+
+Click, keyboard activation, or touch toggles the panel. Mouse hover opens it
+across the trigger, connecting gap, and panel; leaving that boundary closes a
+hover-opened panel. Explicit close or Escape while still inside latches it
+closed until leave/reentry or a new explicit activation. The panel is a root
+overlay, so page and sidebar clipping cannot cut it off. Its width is bounded by
+60% of the page and the viewport with 12-pixel margins; its rows scroll
+vertically. Complete title/detail text wraps in selectable read-only editors,
+without compact-text fitting or ellipses. **Copy** copies exactly the title,
+two newlines, and detail. Each row has **Dismiss**; there is no clear-all action.
+
+Status remains available over custom-model and file-dialog modals, while
+workflow navigation remains disabled. Its input boundary consumes pointer,
+scroll, and keyboard events so they do not reach the page, modal behind it,
+viewer gestures, or annotation shortcuts. Focus traverses the active panel's
+eligible controls. Closing/restoring focus checks interaction ownership,
+including delayed annotation focus replies. Clipboard completion is checked
+against notice identity, content version, and copy attempt; stale completion
+cannot mutate another row.
+
+[NoticeStore](../src/frontend/iced/src/view_model/notices.rs) is bounded,
+memory-only application state: up to 128 ordinary notices and one overflow
+notice. It projects failures from native owners and transport, protocol, dialog,
+checkpoint, remote/provider, annotation-save, history/chart, and clipboard
+boundaries. Stable typed source identity deduplicates snapshot/event/reply
+delivery. Updates retain row identity; dismissal or eviction acknowledges that
+source occurrence so replay cannot resurrect it. The bounded source frontiers
+survive row removal. A reconnect retains current-session notices and rebases
+only sources whose native owner changed. Initial bootstrap seeds prior terminal
+state without replaying historical failures. No notice history is persisted.
+
+Native owners still decide activity, recovery, retry, Stop/cancellation, result
+state, and artifact custody. Progress, output paths, and recovery controls stay
+in their components; notices replace operational Status cards, inline warnings,
+and error modals. Static help and validation rules remain local. Diagnostics
+retain separate opt-in detailed evidence and do not drive product state.
+
+The browser's [emergency recovery page](../src/frontend/iced/index.html) remains
+available when Iced cannot render. It allows one automatic reload per failure
+episode and then manual recovery; a healthy interval clears that episode.
+Its session-storage counter is separate from the nonpersistent notice store.
 
 ## Shared form expansion and dividers
 
@@ -213,14 +301,14 @@ divider's gaps.
 ## Compact operational text
 
 Shared [status text](../src/frontend/iced/src/view/shared/status_text.rs) keeps
-operational status, progress/activity, compact warnings and output paths on one
+operational status, progress/activity, and output paths on one
 normal-height line. It starts at the caller's normal font size and fits width
 in 0.5 logical-pixel steps down to 8; short text never grows. At the minimum it
 ellipsizes, while hover exposes the complete original message. Line breaks
 display as spacing; selection and copy preserve the original text, including
 its line breaks. Semantic colors and retained text-widget identities survive
-fitting. Headings, descriptions, editable fields, tables and full error-modal
-prose retain their ordinary wrapping and typography.
+fitting. Headings, descriptions, editable fields, tables, and complete session
+Status notice text retain ordinary wrapping and typography.
 
 Fitting uses a bounded binary search over the size steps. Retained measurements
 key content, width, normal size, renderer font and scale; finite/intrinsic
@@ -247,8 +335,8 @@ active presentation. Stop keeps each owner's cancellation behavior. An accepted
 save disables duplicate saves until settlement without changing its label.
 Train, Validate, Predict, and Export share the card-to-action gap; Train,
 Validate, and Predict have no separate start-status sentence. Native progress
-and failures retain their owning displays, while a successful Validate result
-does not leave “Succeeded” immediately above the action.
+remains in its component and failures enter session Status, while a successful
+Validate result does not leave “Succeeded” immediately above the action.
 
 During active work, ten equal blue segments move clockwise by perimeter distance
 through the existing white, three-logical-pixel rounded border. They use the
@@ -404,7 +492,7 @@ The dashboard fits the center column's available width and page-body height
 using the selected workspace aspect ratio. The default is 16:9; the shared
 selector also offers 9:16, 4:3, 3:2, 1:1, and 16:10. Charts fit this bounded
 region without an internal scrollbar. Clicking a chart title expands that
-chart in the same region; **Back to charts** restores the grid. Setup, status,
+chart in the same region; **Back to charts** restores the grid. Setup, session Status,
 and the [live progress card](rfdetr-workflows.md#live-training-progress) remain
 part of the page.
 
@@ -424,6 +512,13 @@ expanded chart. Selecting no charts leaves an explicit empty-selection state.
 Charts with no measurements show a waiting/empty state instead of fabricated zero values.
 Average-recall labels use the recorded detection caps. Mask and area values
 remain unavailable when the selected evaluation did not produce them.
+
+Source controls select a native model/weight trajectory or synchronized ordinary
+session results. Live and saved history keep separate source selections and
+storage. **Selected output** shows the final method, artifact path, ingredients,
+and validation summary without adding a synthetic epoch curve. The
+[history reference](rfdetr-workflows.md#saved-history-and-plots) owns source
+identity, default selection, and sparse observations.
 
 **Epoch axis** is on initially and uses fractional epoch positions for live
 training; turning it off selects the global optimizer-step axis.
@@ -449,7 +544,7 @@ The [metrics component](../src/frontend/iced/src/view/metrics.rs) owns separate
 live and saved histories. Each curve retains at most 128 summary buckets with
 endpoints and extrema. Sequence gaps, unavailable values, missing records, and
 new attempts break lines, while isolated points remain visible as markers.
-When older disconnected summaries must be retired, the Output card reports
+When older disconnected summaries must be retired, session Status reports
 chart omissions; retired extrema do not affect the retained plot. Missing
 observations keep a pending gap even when live display samples are coalesced.
 Saved history is unchanged. Hidden views continue ingesting records without

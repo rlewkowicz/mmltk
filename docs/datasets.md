@@ -457,6 +457,13 @@ whole chunk, so its actual extent depends on batch size. Batch sharding selects
 complete batch ordinals for a rank, and `drop_last` controls the partial final
 batch.
 
+Training uses the loader's explicit schedule path instead of this ordinary
+shuffle/shard policy. Its session-owned
+[sparse data plan](rfdetr-training.md#sparse-data-planning-and-stochastic-identity)
+supplies draw order, rank slices, and Resume offset; the loader does not
+reshuffle them or choose model membership. Empty rank slices retain collective
+participation without allocating an empty forward batch.
+
 The local schedule bounds storage: slot count is the smaller of prefetch depth
 and locally scheduled batch count, retaining one control slot when that count
 is zero. Worker count also respects useful slots and eligible CPUs. Pixel

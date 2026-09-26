@@ -17,7 +17,7 @@ and acceptance gate is exactly these commands, in order, and both must pass:
 ```
 
 The unfiltered `all` route includes native executables, browser JavaScript/Rust
-tests, and log-query fixtures. The remaining commands describe standalone
+tests, cleanup/declaration-tool fixtures, and log-query fixtures. The remaining commands describe standalone
 capabilities. Focused filters, individual executables, and additional suite
 invocations do not replace or supplement this Final Validation gate.
 
@@ -35,6 +35,9 @@ objects. Native `--file` selections skip the package-wide Rust formatting;
 `--start-at` retains it. This Rust step is formatting, not a Rust static-analysis
 suite. The [build reference](build.md#target-declarations-and-precompiled-headers)
 owns PCH and header-isolation handling in the analysis graph.
+The repository's `modernize-use-auto.MinTypeNameLength` is `5` in
+[.clang-tidy](../.clang-tidy); it is a type-spelling threshold, not a permission
+to hide meaningful ownership or introduce indirection.
 CUDA clang-tidy covers host/device code at `sm_86`. Cppcheck is currently
 disabled because its parser does not support the repository's reflection
 syntax; `--cppcheck-only` is unavailable.
@@ -71,9 +74,12 @@ The target files contain only match sizes, source paths/ranges, and applicable
 consolidation patterns. Detector configuration, inventory, rejected candidates,
 and inline-suppression details live separately in `cleanup/rejected.json`,
 under the selected profile. Running one profile preserves the other's rejection
-record. Each output is replaced atomically.
+record. Its `duplo.raw_hits` retains the detector's original hits before source
+filtering. Each output is replaced atomically.
 
-C++ CPD uses a 39-token minimum with identifiers anonymized. Only matches from
+C++ Duplo uses a six-line minimum; CPD uses a 39-token minimum with identifiers
+anonymized and literal sequences ignored. Frontend minima are nine lines and
+75 tokens. Only C++ CPD matches from
 39 through 99 tokens enter the source-context filter. Matches of 100 tokens or
 more bypass it unchanged and remain for executor review; the ordinary narrow
 inline suppression rules still apply. A source-context pass compares complete
@@ -101,8 +107,71 @@ time. Statement boundaries and scope ownership are cached; reported spans and
 pattern identities are grouped without all-pairs function comparisons. No
 filename exclusions or suppression registry are added.
 
-`./mmltk --test cleanup-tool` exercises inventory, detector options, context
-filtering, suppression behavior, and the terse report/rejection split.
+These ordinary reports retain the narrow inline suppression rules in
+[AGENTS.md](../AGENTS.md#deduplication-rules). They are separate from the raw
+declaration evidence below.
+
+## Raw CPD and declaration formatting
+
+```bash
+./mmltk --raw-cpd
+./mmltk --raw-cpd --min-tokens 12 --output cleanup/declarations-raw.json
+./mmltk --format-declarations check
+./mmltk --format-declarations preview --file src/backend/models/rfdetr/contract/train_recipe.h
+./mmltk --format-declarations fix --file src/backend/models/rfdetr/contract/train_recipe.h
+```
+
+[generate_cleanup_json.mjs](../tools/generate_cleanup_json.mjs) owns both
+ordinary cleanup and raw evidence. Raw CPD defaults to 12 tokens (minimum 2),
+preserves exact identifier/literal spelling, disables block skipping,
+and applies no source-context filter or inline suppression. Its first-party
+C/C++/CUDA inventory includes ordinary and template headers, modules, and
+untracked unignored files, excludes `third_party`, and omits deleted paths.
+This is declaration triage, not a verdict that every lexical match should be
+extracted into a shared algorithm.
+
+PMD `CPD-OFF`/`CPD-ON` suppression comments are neutralized only in same-length
+temporary copies. Original sources, line endings, offsets, ranges, and reported
+text remain intact. The format-1 report defaults to
+`cleanup/declarations-raw.json`: `inventory`, detector configuration/status,
+`raw_matches` with original occurrence coordinates/text, independent
+`classified_context`, and a summary. Classification supplies context without
+adding or deleting detector matches. Raw mode rejects nonzero detector status,
+error/processing-error XML, diagnostic exceptions, or incomplete lexer coverage;
+it cannot replace the report with an apparently clean partial scan.
+
+[format_declarations.mjs](../tools/format_declarations.mjs) shares the lexical
+index and classifiers in
+[declaration_patterns.mjs](../tools/cleanup/declaration_patterns.mjs). It is not
+a semantic C++ parser. By default it examines the complete first-party C++
+inventory; repeat `--file PATH` to narrow it. Files must belong to that
+inventory. Macro-conflict inspection still covers the full inventory.
+`--report PATH` selects the format-1 JSON report, default
+`cleanup/declarations-format.json`; both tools require a `.json` output path.
+
+Every formatter mode writes original spans, reasons, proposed edits, retained
+candidates, manual findings, and summary counts atomically. **Check** exits 1
+when safe edits remain, 0 otherwise (manual findings can still remain), and 2
+on an error. **Preview** leaves sources unchanged and reports before/after
+text. **Fix** applies only proven annotation spelling/direct-include edits,
+checks that each original file is unchanged, preserves its mode, and replaces
+it atomically. Repeated fix is idempotent.
+
+Automatic policy rewriting requires an absolute canonical name or an absolute
+global alias to the absolute canonical namespace. Relative lookup remains
+manual, as do conditional dependencies, annotation comments, conflicting
+macros, ambiguous syntax, and unsupported comma-containing type arguments.
+The [authoring guide](reflection.md) owns macro semantics and examples. This
+formatter does not consolidate repeated records or infer application owners.
+
+The `cleanup-tool` fixtures cover inventory, ordinary filters and suppressions,
+raw exact-spelling evidence and incomplete-scan rejection, original ranges,
+classification, conservative policy lookup, and formatter idempotence. They
+run within unfiltered `all`. A standalone filtered retry is:
+
+```bash
+./mmltk --test cleanup-tool -- --test-name-pattern PATTERN
+```
 
 ## Native and browser suites
 
@@ -151,17 +220,17 @@ outside the permitted test set.
 | `cuda-vulkan` | Standalone CUDA/Vulkan allocation, FD, timeline, pixel, and exporter-exit diagnostic |
 | `headless-compositor` | Real NVIDIA Weston availability and protocol checks |
 | `headless-compositor-tool` | Supervisor ownership/failure fixtures without GPU |
-| `cleanup-tool` | Cleanup-report tooling fixtures |
+| `cleanup-tool` | Cleanup/raw-CPD evidence and declaration-formatter fixtures |
 | `log-query-tool` | Log parser/query/correlation/triage fixtures |
 | `build` | Build the configured native test targets without running them |
-| `all` | Build native test targets; run ordinary native executables, browser JavaScript/Rust tests, and log-query fixtures |
+| `all` | Build native test targets; run ordinary native executables, browser JavaScript/Rust tests, cleanup/declaration fixtures, and log-query fixtures |
 
 `all` builds `mmltk_workspace_wayland_integration` but excludes it from its run
 list. With no native executable or runner-argument filter, it then executes
-`browser-app` and `log-query-tool`, retaining the first nonzero status while
+`browser-app`, `cleanup-tool`, and `log-query-tool`, retaining the first nonzero status while
 running the remaining groups. `all --executable TARGET` and `all -- FILTER`
 remain native selections and do not append those fixture groups. `all` does not
-execute `cuda-vulkan`, the compositor/cleanup tooling suites, or the profile
+execute `cuda-vulkan`, the compositor tooling suites, or the profile
 runner. `gui` and `tsan` suite names are currently unavailable even though other
 GUI/development build facilities exist.
 The full product build's `--no-run` frontend checks establish that the selected
@@ -259,8 +328,9 @@ suites; the `iced_plot --doc` command selects only that package's doctests.
 `headless-compositor` accepts a command after `--` and owns its runtime.
 `log-query-tool` accepts one or more `Class.test_method` selectors after `--`;
 with none it runs full discovery. It rejects native test options.
-`headless-compositor-tool` and `cleanup-tool` reject extra arguments and native
-test options.
+`headless-compositor-tool` rejects extra arguments and native test options.
+`cleanup-tool` accepts only `-- --test-name-pattern PATTERN` for filtering and
+rejects native test options.
 
 ## Native symbol and link diagnostics
 
@@ -275,7 +345,8 @@ test options.
 These standalone operations require the existing development image and a
 running Docker daemon. Both have a 120-second deadline and use no GPU or
 network; neither builds/pulls an image. Symbol inspection is read-only and uses
-GCC's archive-aware `gcc-nm`. It accepts repository `.a`/`.o` paths, a regular
+GCC's archive-aware `gcc-nm`. It accepts repository `.a`/`.o` paths or installed
+artifacts below `/opt` in the development image, a regular
 expression over symbol records, `--mangled` for linker names, and a bounded
 `--limit` (default 200, range 1–10000). JSONL contains symbol records and a final
 matched/emitted/exit-status summary.
@@ -455,13 +526,27 @@ products from that run without another evaluation.
 
 For each of the four workflows, the driver selects a native inventory device
 through the shared GPU card and checks settled settings. It measures the
-Output/GPU/Status order for all four cards in the light layout and for Train in
+Output/GPU order for all four workflows in the light layout and for Train in
 dark and narrow layouts. The independent browser audit joins each admitted
 native generation to actual
 `workflow.gpu_execution` records in both directions, checks device/rank facts,
 and covers cancellation before progress is published. Selection labels alone
 cannot satisfy the execution check. The
 [logging reference](logging.md#workflow-gpu-evidence) owns those records.
+
+The packaged Status scenario exercises the real root overlay with bounded
+in-memory fixture notices: add/update/dismiss and overflow, wrapping/selectable
+long text, exact Copy, hover and Escape/reentry, keyboard/touch input, wide and
+narrow layouts, theme, modal availability, and annotation shortcut isolation.
+It separately observes pulse/reduced-motion and hidden-window quietness.
+The [Status driver](../src/frontend/iced/src/integration_control/status.rs),
+JavaScript canvas/input adapter, and independent browser audit join rendered
+interaction evidence with notice identity; fixture data is not a native
+operation failure. Rust notice-store tests cover bootstrap, reconnect,
+deduplication, source acknowledgment, stale delivery, and clipboard custody.
+The [interaction contract](gui-interaction.md#session-status) and
+[record reference](logging.md#rendered-ui-acceptance-evidence) own behavior and
+diagnostic field meanings.
 
 The workflow scenario also verifies the individual saved Validation PNGs,
 Predict saving-control state, compiled/image samples, completed video, and
@@ -756,6 +841,19 @@ by `all` and the standalone `rfdetr` route:
 | [core/tests/selective_compilation.test.cpp](../src/backend/models/rfdetr/core/tests/selective_compilation.test.cpp) | First recording and retained live weights, signature/tail fallback, transactional replacement, dynamic query extents, direct grouped/DN SDPA and independent decoder-tail derivatives with outstanding backwards |
 | [training/tests/training_supervision.test.cpp](../src/backend/models/rfdetr/training/tests/training_supervision.test.cpp) | Production routed Hungarian/Match-Free and optional DN for boxes/masks; FP32/FP16/BF16; empty images, accumulated gradients and actual optimizer updates; current-format continuation; eager/selective values, recording/reuse/optimized execution, RNG and live state copies |
 | [inference/tests/prediction_session.test.cpp](../src/backend/models/rfdetr/inference/tests/prediction_session.test.cpp) | Native weights compilation-request propagation and incremental inference behavior |
+| [training/tests/execution_policy.test.cpp](../src/backend/models/rfdetr/training/tests/execution_policy.test.cpp) | Literal SGD warmup exit/round-even behavior, native schedule reference clocks, final-epoch latches, sparse membership/repeats, semantic samples, and donor identity |
+| [training/tests/training_gradient_reducer.test.cpp](../src/backend/models/rfdetr/training/tests/training_gradient_reducer.test.cpp) | Logical objective under physical capacity changes, early-bucket overlap, cancellation, partial failure, and physical collective custody |
+| [training/tests/distributed_training.test.cpp](../src/backend/models/rfdetr/training/tests/distributed_training.test.cpp) | Two selected physical GPUs: global objective/update equivalence, uneven/empty-rank contributions, early NCCL overlap, and cancellation/failure retirement |
+| [training/tests/model_merging.test.cpp](../src/backend/models/rfdetr/training/tests/model_merging.test.cpp) | Native averaging, cadence and zero intervals, final policies/ties/duplicates, finite mask metrics, immutable publication faults, whole-session leases and replaced/mixed artifact rejection |
+| [training/tests/training_continuation.test.cpp](../src/backend/models/rfdetr/training/tests/training_continuation.test.cpp) | Exact continuation inventory, SGD held values, schedules/offsets/donor support, named optimizer/EMA state, and applied epoch policies |
+| [core/tests/inference_lanes.test.cpp](../src/backend/models/rfdetr/core/tests/inference_lanes.test.cpp) | Bounded lanes, ordered delivery, source-copy release, backpressure, failure, and drain |
+
+Two-GPU cases require two eligible CUDA devices and report a skip when that
+capability is absent. A single-rank pass cannot establish physical NCCL overlap
+or cross-rank cancellation. Controller/contract and frontend fixtures also
+cover recipe projection, source-specific live/saved metrics, selected-output
+metadata, and whole-session capability admission. These cases remain inside
+the existing `all` gate; they add no plan-specific acceptance command.
 
 The complete-model selective fixture compares four accumulated microbatches
 using the production `TrainingStep`, including the K-squared divisor, frozen

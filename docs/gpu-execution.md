@@ -50,6 +50,11 @@ select Firefox's graphics device. Firefox follows the Wayland graphics session.
 The [shared-workspace path](#shared-workspace-interoperability) handles products
 whose compute, native receiver, and graphics devices differ.
 
+Every logical training model uses the complete selected rank set. DDP replicates
+model and optimizer storage on each GPU; it does not combine their VRAM.
+Logical lanes, global batch, and physical worker admission have distinct roles
+in the [training contract](rfdetr-training.md#logical-lanes-and-global-batch).
+
 ## Device and NUMA placement
 
 ```bash
@@ -152,6 +157,34 @@ and storage, so replacing a pool cannot invalidate borrowed samples. The
 [logical sample lifecycle](rfdetr-workflows.md#evaluation-metrics-and-retained-samples)
 continues independently of renderer availability.
 
+## Inference lanes and borrowed inputs
+
+[InferenceLanes](../src/backend/models/rfdetr/core/inference_lanes.h) owns a
+bounded pool of execution streams, lane-local input/output storage, and ordered
+completion. Validate, Predict, and training validation have independent lane
+settings. Admission respects source population and backend batch capacity;
+single-image prediction admits one lane. Physical capacity is a native fact,
+not a multiplier applied to the requested logical batch.
+
+Lane work can finish out of order, but callbacks and saved outputs deliver in
+source order. Capacity pressure waits for the oldest admitted result rather
+than accumulating an unbounded queue. Native immutable inference weights may
+share actual tensor storage while execution caches remain lane-owned. ONNX
+bindings are lane-owned; TensorRT shares an engine with separate contexts and
+streams. Pool reuse requires matching artifact, weight kind, input shape,
+precision, batch configuration, and admitted capacity. Mutable training models
+are independent owners.
+
+A borrowed loader batch is released after its last source read/copy physically
+completes, before unrelated inference completion when possible. Producer-side
+release observes that event, avoiding a cycle between bounded prefetch credits
+and admitted lanes. A video frame borrowed until the next decoder advance is
+copied into lane-owned input, and the decoder stream waits for that copy before
+advancing. Pause stops new admission; Stop, exceptions, partial setup, and
+callback failures drain admitted work before releasing its resources.
+Training validation likewise drains before restoring EMA-selected working
+weights, optimizer mutation, model merging, or checkpoint publication.
+
 ## Prediction preview storage
 
 [PredictionPreviewPool](../src/controller/subsystems/system/detail/prediction_preview.cpp)
@@ -184,8 +217,10 @@ ordinal-addressed storage for one immutable serialization snapshot. It reserves
 the next complete tensor inventory before staging. CUDA sources use pinned
 GPU-local host storage and per-device streams; copies complete before CPU
 archive or export readers consume them. Those readers release their views
-before storage is reused. Checkpoint saves share the ordinary/EMA snapshot
-across their artifacts; enabled EMA updates themselves stay on the GPU.
+before storage is reused. Checkpoint staging occurs after the training session
+drains, and archive readers finish before model mutation resumes. Immutable
+[session generations and deployment candidates](model-merging.md#artifact-layout-and-formats)
+retain separate identities; enabled EMA updates themselves stay on the GPU.
 
 The shared [Torch stream boundary](../src/backend/ml/cuda/detail/torch_cuda_scope.cpp)
 establishes a driver context before pinned-host or tensor work on a newly

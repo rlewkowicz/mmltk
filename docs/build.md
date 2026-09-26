@@ -38,6 +38,13 @@ The build publishes the canonical bundle at `build/browser-app/dist`; every
 location. A missing or incompatible bundle fails launch, so rebuild after a
 native contract change.
 
+The [frontend CMake inputs](../src/frontend/iced/CMakeLists.txt) include the
+vendored `iced-fluent-theme` Rust sources and manifest alongside Iced, iced_aw,
+and iced_plot. Theme-library edits therefore invalidate the bundle's build
+dependency set. Builds compile their configured Rust test targets with
+`--no-run`; actual native, browser, cleanup/declaration, and log-query fixture
+execution belongs to [validation](validation.md#native-and-browser-suites).
+
 Desktop startup resolves the native CLI beside `mmltk-browser-host` and gives
 that executable to the training process owner. Keep both installed siblings in
 the package; a browser bundle alone cannot supply local training.

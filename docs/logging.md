@@ -98,7 +98,8 @@ text and allocator warnings do not select a cause.
 
 [NativeTrainingRuntime](../src/controller/subsystems/train/training_system.cpp)
 projects the decoded exit/signal status and UTF-8-safe cause into the existing
-`ComputeTerminal.detail` for Train's UI. An explicit CUDA OOM cause adds the
+`ComputeTerminal.detail` for the [session Status panel](gui-interaction.md#session-status).
+An explicit CUDA OOM cause adds the
 [batch-size/lane guidance](rfdetr-workflows.md#local-training-failures).
 `TrainingSystem` owns the single settled fatal stderr report when it hosts the
 runtime, including preparation failures; standalone runtime use retains its
@@ -111,13 +112,13 @@ and available run/attempt context. Disabled tracing does not construct that
 diagnostic payload.
 
 The query tool also recognizes the canonical external
-[TrainingRecord format 2](rfdetr-workflows.md#saved-history-and-plots). It
+[TrainingRecord format 3](rfdetr-workflows.md#saved-history-and-plots). It
 projects valid role/phase observations as `training.<role>.<phase>` in lowercase.
 `Terminal` with `progress.phase: "Error"` is an explicit failure and triage
 anchor; every `Terminal` record is terminal evidence. Progress counters such
 as `class_error` do not imply failure. Bounded triage preserves `run_id`,
-`attempt_id`, role, sequence, and phase before optional configuration payloads
-and follows the run/attempt identity. These observations do not participate in
+`attempt_id`, role, sequence, phase, session/model, and first-cause identity before
+optional configuration payloads and follows the run/attempt identity. These observations do not participate in
 generic begin/end suffix balancing.
 
 For an existing captured run:
@@ -125,6 +126,8 @@ For an existing captured run:
 ```bash
 ./mmltk --logs output/train/run-0002/metrics.jsonl --errors --format timeline
 ./mmltk --logs output/train/run-0002/metrics.jsonl --triage
+./mmltk --logs output/train/run-0002/metrics.jsonl \
+  -q '@model=2 AND (@phase=Merge OR @role=Terminal)' --format timeline
 ./mmltk --logs --family latest-wayland-test \
   -q '@owner=training AND (@event=child.exited OR @event=child.signaled OR @event=training.failed)' \
   --format timeline --limit 20
@@ -416,7 +419,7 @@ resource lifetime.
 
 The packaged workflow driver emits `integration.workflow_gpu_selected` after
 ordinary settings settlement, `integration.workflow_gpu_layout` for the shared
-Output/GPU/Status bounds, and `integration.workflow.operation_admitted` from
+Output/GPU bounds, and `integration.workflow.operation_admitted` from
 native-backed operation snapshots. The independent audit joins admitted
 generations and actual execution in both directions, including cancellation
 before progress. All four cards have light-layout evidence; Train additionally
@@ -443,6 +446,11 @@ record UI interaction and pixels separately from physical resource custody:
 | Records | Evidence |
 | --- | --- |
 | Dataset selection, draw, caption, pixel, and cancellation records | [Dataset presentation evidence](#dataset-presentation-evidence) below |
+| `integration.status.notice`, `integration.status.stage` | Stable notice add/remove identity, bounded population, and completed fixture stages |
+| `integration.status.hover`, `integration.status.interaction`, `integration.status.latch` | Rendered hover boundary, explicit activation, and Escape/reentry behavior |
+| `integration.status.modal`, `integration.status.focus`, `integration.status.clipboard` | Modal availability, focus/input ownership, and exact clipboard result |
+| `integration.status.selection`, `integration.status.selection_readback` | Selectable complete text and actual selection/readback evidence |
+| `integration.status.exercise`, `integration.status.pulse`, `integration.status.visibility` | Rendered input exercise, visible pulse/reduced motion, and hidden-window quietness |
 | `integration.atlas_resize_measured`, `integration.atlas_resize` | Gallery measurements retained beneath Detail, then required/actual rows after each completed resized return |
 | `integration.atlas_ready_cell`, `integration.atlas_canvas_sample` | Exact drawn gallery identity, compiled image, selected canvas coordinates, patch counts, and sampled color |
 | `integration.explore_integer`, `integration.explore_integer_paste_baseline`, `integration.explore_integer_paste`, `integration.explore_integer_paste_restored` | Exact decimal integer values, native revision progression, typing/paste persistence, and restoration |
@@ -474,6 +482,8 @@ record UI interaction and pixels separately from physical resource custody:
 ./mmltk --logs --family latest-wayland-test \
   -q '@event:integration.workflow OR @event:integration.metric_ OR @event=integration.chart_view' \
   --format jsonl --limit 60
+./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID \
+  -q '@event:integration.status.' --format timeline --limit 80
 ```
 
 Workflow chart sampling checks a middle strip away from the legend and vertical
@@ -661,7 +671,8 @@ archived-only input with the current run. Added sources carry `@discovery`
 metadata; rotation-based relationships remain labeled as inferred. Ordinary
 explicit path queries do not automatically add sibling files.
 
-Paste a displayed error, including its title and blank line:
+Copy a session Status notice and paste its complete text, including its title
+and blank line:
 
 ```bash
 ./mmltk --logs --error 'Presentation unavailable
@@ -782,6 +793,8 @@ Useful metadata includes:
 | `@event`, `@owner`, `@level`, `@error` | Normalized event and failure-candidate metadata |
 | `@surface` | Joined native/browser sample-arena identity; source lifecycle records normalize their arena into this field |
 | `@workspace_source` | Joined producer import identity, distinct from the reusable sample arena |
+| `@session`, `@model`, `@first_cause`, `@phase`, `@role` | Canonical format-3 training identity, failure, and progress fields |
+| `@intent_request` | Exact positive uint64 request correlation from browser intent receipt/settlement and acceptance intent records |
 | `@test`, `@tags`, `@context_copy`, `@part` | Test context, copied INFO, transcript segment |
 | `@run`, `@archive_id`, `@family`, `@artifact` | Capture and artifact grouping |
 | `@terminal`, `@exit_code`, `@signal`, `@signal_number` | Observed terminal status |
@@ -807,6 +820,20 @@ for alternative identities; join field names with `+` for a composite
 identity. It joins original matches, excludes empty/zero identities, and
 does not expand transitively. Family/history correlations are scoped to each
 run. `--where` filters correlated and context rows too.
+
+`@intent_request` projects `control` from `integration.intent` and `value` from
+`browser.intent.received`, `.accepted`, `.rejected`, and `.reply_rejected`.
+It accepts exact positive uint64 integers or decimal strings, excluding zero,
+booleans, overflow, and approximate floating-point values. It is an explicit
+correlation field, not an automatic timeline identity: counters can repeat
+after a browser peer changes. Select one peer lifetime before querying it.
+The following example requires the selected capture to contain exactly one peer
+lifetime; `--run` isolates an archive, but does not establish that condition:
+
+```bash
+./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID \
+  -q '@intent_request=42' --correlate @intent_request --format timeline --limit 60
+```
 
 ## Vulkan diagnostics and descriptor provenance
 

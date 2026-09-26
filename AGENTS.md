@@ -9,6 +9,9 @@ Use [commands](docs/commands.md), [validation](docs/validation.md), and
 uses [interaction and presentation](docs/gui-interaction.md).
 [Build reference](docs/build.md) owns generated-artifact paths and cache rules;
 [GPU execution](docs/gpu-execution.md) owns capability-inspection commands.
+Use [reflected declaration authoring](docs/reflection.md) for canonical schema
+syntax and [declaration tooling](docs/validation.md#raw-cpd-and-declaration-formatting)
+for raw CPD evidence and safe formatter operations.
 
 ## Sub Agents
 

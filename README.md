@@ -54,12 +54,18 @@ policy, generated bindings, and build timing.
 Train prepares the selected model and starts the run from its primary action.
 Its center shows a selectable chart dashboard with a separate live progress
 card. Train and validation inputs are required; the final-test split is optional.
-Choose Transfer or Resume in the weights card. Train, Validate, Predict, and
-Export put Output at the top of the right column, with GPU selection immediately
-below it and Status below that. Each workflow remembers its compute GPU;
+The weights card keeps Transfer/Resume preparation separate from Start.
+Train, Validate, Predict, and Export put Output at the top of the right column,
+with GPU selection immediately below it. The header's Status panel retains
+session warnings and errors with complete selectable text, Copy, and Dismiss.
+Each workflow remembers its compute GPU;
 Train supports multiple GPUs in rank order. Auto Output creates a fresh
 run beneath `output/<workflow>` at Start; Browse Output selects a manual
 destination and, for Train, loads saved charts. EMA is optional and off by default.
+Train supports Shared gradients, Independent models, and Periodic averaging,
+with global batch semantics, per-model recipes, and native final model selection.
+Independent/periodic modes and model soups are experimental. The dashboard
+selects model/weight sources separately for live and saved history.
 Validate shows twelve COCO summaries beside six sample tiles and uses Explore's
 viewer, including Upscale and Open in Annotation. Samples captured while detail
 is open remain available when you close it after validation completes.
@@ -75,10 +81,12 @@ out-of-memory errors point to batch size and training lanes; restarting remains
 an explicit action.
 
 The [RF-DETR workflow guide](docs/rfdetr-workflows.md) covers class identity,
-metrics, output files, and continuation. Current native checkpoints use version
-3 and saved plots require run format 2; older application checkpoints
-and old output-directory history are unsupported. Upstream weights keep their
-own supported input routes. Compiled datasets use format 9; recompile older
+metrics, output files, and continuation. The
+[merging and Resume reference](docs/model-merging.md) explains current formats,
+whole-session manifests, deployment artifacts, and the custom chooser's current
+manifest-selection limit. Older application checkpoints and output-directory
+history are unsupported. Upstream weights keep their own supported input
+routes. Compiled datasets use format 9; recompile older
 bins. Dataset compilation defaults to Stretch, with Letterbox available
 explicitly. Explore thumbnails preserve source proportions in padded cells.
 Every Upscale method prepares stretched compiled input at source aspect first.
@@ -87,8 +95,9 @@ it does not recover source resolution. See the
 [viewer guide](docs/gui-interaction.md#original-view-and-annotation-import).
 
 The [training reference](docs/rfdetr-training.md) explains the pinned stock
-mathematics, optional Match-Free and denoising mask supervision, and native
-selective compilation. Its evidence covers controlled losses, gradients and
+mathematics, logical lanes, optimizer recipes and schedules, sparse data plans,
+optional Match-Free and denoising mask supervision, and native selective
+compilation. Its evidence covers controlled losses, gradients and
 updates; it does not establish AP, convergence or throughput equivalence.
 
 The Dataset card's benchmark override offers Coco custom and Coconut.
@@ -112,8 +121,8 @@ data, or the [command reference](docs/commands.md) for CLI and GUI operations.
 [Validation](docs/validation.md) covers tidy, cleanup, focused tests, and
 hardware acceptance; [logging](docs/logging.md) explains captured evidence.
 `./mmltk --test all` runs the ordinary native suites, browser JavaScript/Rust
-tests, and log-query fixtures. Packaged Wayland acceptance has its own command
-in the validation guide.
+tests, cleanup/declaration-tool fixtures, and log-query fixtures. Packaged
+Wayland acceptance has its own command in the validation guide.
 
 ## Codebase
 
