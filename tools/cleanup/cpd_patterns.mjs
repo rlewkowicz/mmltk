@@ -21,6 +21,21 @@ const NON_TYPES = new Set([
   "delete", "new", "break", "continue", "else", "goto", "operator",
 ]);
 
+// Shared lossless token ranges for CPD context and declaration formatting.
+// Literals remain one token; trivia is available when a rewrite must preserve it.
+export function tokenizeCpp(source, { trivia = false } = {}) {
+  const tokens = [];
+  TOKEN.lastIndex = 0;
+  for (const match of source.matchAll(TOKEN)) {
+    const text = match[0];
+    const kind = /^\s/u.test(text) ? "whitespace" : /^\/[/*]/u.test(text) ? "comment" :
+      /^(?:(?:u8|[uUL])?R?"|')/u.test(text) ? "literal" : "code";
+    if (!trivia && (kind === "whitespace" || kind === "comment")) continue;
+    tokens.push({ text, offset: match.index, end: match.index + text.length, kind });
+  }
+  return tokens;
+}
+
 function lowerBound(values, value, project = (entry) => entry) {
   let low = 0;
   let high = values.length;
@@ -95,19 +110,13 @@ function scopeOwners(scopes, size) {
   return owners;
 }
 
-class SourceIndex {
+export class SourceIndex {
   constructor(source) {
     this.lines = [0];
     for (let index = 0; index < source.length; ++index) {
       if (source[index] === "\n") this.lines.push(index + 1);
     }
-    this.tokens = [];
-    TOKEN.lastIndex = 0;
-    for (const match of source.matchAll(TOKEN)) {
-      const text = match[0];
-      if (/^\s|^\/[/*]/u.test(text)) continue;
-      this.tokens.push({ text, offset: match.index, end: match.index + text.length });
-    }
+    this.tokens = tokenizeCpp(source);
     this.pairs = new Map();
     const stack = [];
     const closes = { ")": "(", "]": "[", "}": "{" };

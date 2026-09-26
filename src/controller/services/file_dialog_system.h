@@ -1,4 +1,6 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -34,7 +36,7 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] FileDialogFailed final {
  FileDialogSnapshot snapshot{};
- [[= mmltk::frameworks::reflection::MaxBytes{services::kFileDialogTextCapacity}]] std::string detail;
+ MMLTK_MAX_BYTES(services::kFileDialogTextCapacity) std::string detail;
 };
 class FileDialogRuntime {
 public:

@@ -1,4 +1,7 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <cstdint>
 #include <vector>
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
@@ -15,7 +18,7 @@ struct TrainingScheduleState final {
  std::uint64_t epoch = 0;
  bool epoch_event_applied = false;
  double held_momentum = 0;
- [[= mmltk::frameworks::reflection::MaxItems{65536}]] std::vector<double> absolute_lrs;
+ MMLTK_MAX_ITEMS(65536) std::vector<double> absolute_lrs;
  bool operator==(const TrainingScheduleState&) const = default;
 };
 [[nodiscard]] double compute_lr_scale(const TrainRecipeSettings&, std::uint64_t current_attempt, std::uint64_t reference_attempts, std::uint64_t total_attempts);

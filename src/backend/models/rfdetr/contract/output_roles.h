@@ -1,4 +1,6 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <cstdint>
 #include <compare>
 #include <string>
@@ -9,7 +11,7 @@ namespace mmltk::backend::models::rfdetr {
 enum class RfdetrOutputRole : std::uint8_t { Unspecified, Logits, Boxes, Masks };
 MMLTK_REFLECT_ENUM(RfdetrOutputRole)
 struct RfdetrNamedOutputRole final {
- [[= mmltk::frameworks::reflection::MaxBytes{1024U}]] std::string name;
+ MMLTK_MAX_BYTES(1024U) std::string name;
  RfdetrOutputRole role = RfdetrOutputRole::Unspecified;
  auto operator<=>(const RfdetrNamedOutputRole&) const = default;
 };

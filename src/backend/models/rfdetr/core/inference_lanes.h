@@ -29,6 +29,7 @@ public:
  [[nodiscard]] mmltk::backend::ml::runtime::RuntimeStatus Close() noexcept;
 
 private:
+ void retire() noexcept;
  struct State;
  std::shared_ptr<State> state_;
 };

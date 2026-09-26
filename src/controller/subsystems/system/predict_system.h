@@ -1,4 +1,6 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/controller/services/runtime_diagnostics.h"
 #include "prediction_run_output.h"
 #include "src/controller/contracts/prediction_output.h"
@@ -37,7 +39,7 @@ struct PredictLabel final {
  mmltk::backend::data::catalog::ClassReferenceDomain class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
  float confidence = 0.0F;
  contracts::AnnotationColor color{};
- [[= mmltk::frameworks::reflection::MaxBytes{256U}]] std::string name;
+ MMLTK_MAX_BYTES(256U) std::string name;
 };
 namespace detail {
 class PredictionPreviewFrame;
@@ -88,17 +90,17 @@ struct PredictPauseIntent final {
 struct PredictImageMetadata final {
  std::uint64_t content_identity = 0U;
  VisualFrame frame{};
- [[= mmltk::frameworks::reflection::MaxItems{contracts::kAnnotationObjectCapacity}]] std::vector<PredictLabel> labels{};
+ MMLTK_MAX_ITEMS(contracts::kAnnotationObjectCapacity) std::vector<PredictLabel> labels {};
  std::int64_t image_id = 0;
 };
 struct PredictionSourceQuery final {
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string path;
+ MMLTK_MAX_PATH_BYTES std::string path;
 };
 struct PredictionSourceInspection final {
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string path;
+ MMLTK_MAX_PATH_BYTES std::string path;
  std::uint64_t count = 0;
  bool active = false;
- [[= mmltk::frameworks::reflection::MaxBytes{contracts::kArtifactErrorCapacity}]] std::string error;
+ MMLTK_MAX_BYTES(contracts::kArtifactErrorCapacity) std::string error;
 };
 MMLTK_REFLECT_FIELDS(PredictionSourceQuery)
 MMLTK_REFLECT_FIELDS(PredictionSourceInspection)
@@ -112,7 +114,7 @@ struct PredictSnapshot final {
  bool paused = false;
  bool video = false;
  VisualFrame frame{};
- [[= mmltk::frameworks::reflection::MaxItems{contracts::kAnnotationObjectCapacity}]] std::vector<PredictLabel> labels{};
+ MMLTK_MAX_ITEMS(contracts::kAnnotationObjectCapacity) std::vector<PredictLabel> labels {};
  std::int64_t image_id = 0;
  // CLEANUP-IGNORE: PredictSnapshot is a distinct reflected boundary type.
 };
@@ -133,7 +135,7 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] PredictFailed final {
  PredictSnapshot snapshot{};
  // CLEANUP-IGNORE: Predict failure fields and source registration have independent canonical domain identities.
- [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
+ MMLTK_MAX_BYTES(kVisualFailureByteCapacity) std::string detail;
  // CLEANUP-IGNORE: Predict direct input and source declarations are not a duplicate input or rendering implementation.
 };
 class PredictSystem final {

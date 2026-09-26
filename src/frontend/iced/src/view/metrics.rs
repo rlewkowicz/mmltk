@@ -564,6 +564,22 @@ pub(crate) mod tests {
     ) -> &'a history::Curve {
         &history.history().curves[metrics.iter().position(|m| m.chart == chart).unwrap()]
     }
+    fn install_live_observation(
+        model: &mut crate::view_model::ApplicationModel,
+        current: TrainingRecord,
+        observation: TrainingRecord,
+    ) {
+        let training = model.workflow.training.as_mut().unwrap();
+        training.metrics = Some(current);
+        let source = TrainingMetricSource {
+            scope: observation.progress.scope,
+            modelid: observation.progress.modelid,
+            weights: observation.evaluatedweights,
+        };
+        training.sources.catalog.defaultsource = Some(source.clone());
+        training.sources.catalog.available = vec![source];
+        training.sources.observations = vec![observation];
+    }
     #[test]
     fn coalesced_live_projection_keeps_current_progress_and_original_ema_observation() {
         let mut model = metric_model();
@@ -584,16 +600,7 @@ pub(crate) mod tests {
         current.progress.val = None;
         current.progress.scalars.total = None;
         current.progress.fullcheckpointpath = "session.json".into();
-        let training = model.workflow.training.as_mut().unwrap();
-        training.metrics = Some(current.clone());
-        training.sources.catalog.defaultsource = Some(crate::generated::TrainingMetricSource {
-            scope: observation.progress.scope,
-            modelid: observation.progress.modelid,
-            weights: observation.evaluatedweights,
-        });
-        training.sources.catalog.available =
-            vec![training.sources.catalog.defaultsource.clone().unwrap()];
-        training.sources.observations = vec![observation];
+        install_live_observation(&mut model, current.clone(), observation);
         let mut component = Component::default();
         component.rebase(&model, false);
         component.rebase(&model, false);
@@ -672,16 +679,7 @@ pub(crate) mod tests {
             current.progress.elapsedseconds = 3.0;
             current.progress.modelid = artifact.modelid;
             current.progress.scalars.total = Some(7.0);
-            let training = model.workflow.training.as_mut().unwrap();
-            training.metrics = Some(current.clone());
-            training.sources.catalog.defaultsource = Some(crate::generated::TrainingMetricSource {
-                scope: observation.progress.scope,
-                modelid: observation.progress.modelid,
-                weights: observation.evaluatedweights,
-            });
-            training.sources.catalog.available =
-                vec![training.sources.catalog.defaultsource.clone().unwrap()];
-            training.sources.observations = vec![observation];
+            install_live_observation(&mut model, current.clone(), observation);
             component.rebase(&model, false);
             component.rebase(&model, false);
             assert_eq!(component.live.sequence, Some(12));
@@ -752,18 +750,7 @@ pub(crate) mod tests {
     #[test]
     fn saved_page_replay_selects_ema_without_session_gaps() {
         let mut model = metric_model();
-        select_saved_run(&mut model);
-        let run = model
-            .workflow
-            .output
-            .saved_mut()
-            .unwrap()
-            .run
-            .as_mut()
-            .unwrap()
-            .run
-            .as_mut()
-            .unwrap();
+        let run = select_saved_run(&mut model);
         run.configuration.useema = true;
         run.sources.defaultsource.as_mut().unwrap().weights = EvaluatedWeights::Ema;
         run.sources.available[0].weights = EvaluatedWeights::Ema;
@@ -1216,7 +1203,9 @@ pub(crate) mod tests {
         assert_center(&component, kind, [45.0, 0.575]);
     }
 
-    fn select_saved_run(model: &mut crate::view_model::ApplicationModel) {
+    fn select_saved_run(
+        model: &mut crate::view_model::ApplicationModel,
+    ) -> &mut crate::generated::TrainingRun {
         // CLEANUP-IGNORE: One selected-request field access supplies this chart fixture, independent of the output-view fixture.
         let configuration = model
             .settings_snapshot
@@ -1228,9 +1217,11 @@ pub(crate) mod tests {
             .request
             .clone();
         model.workflow.output.select_saved("saved-output".into());
-        model.workflow.output.saved_mut().unwrap().run = Some(
-            crate::view_model::test_support::saved_training_run(configuration),
-        );
+        let saved = model.workflow.output.saved_mut().unwrap();
+        saved.run = Some(crate::view_model::test_support::saved_training_run(
+            configuration,
+        ));
+        saved.run.as_mut().unwrap().run.as_mut().unwrap()
     }
     fn publish(component: &mut Component, model: &mut crate::view_model::ApplicationModel) {
         component.rebase(model, false);
@@ -1556,19 +1547,7 @@ pub(crate) mod tests {
         current.progress.artifact = None;
         training.metrics = Some(current.clone());
         for modelid in 0..=TRAINING_MODEL_CAPACITY as u64 {
-            let source = TrainingMetricSource {
-                scope: if modelid == 0 {
-                    TrainingRecordScope::SynchronizedSession
-                } else {
-                    TrainingRecordScope::Model
-                },
-                modelid,
-                weights: if modelid == 0 {
-                    EvaluatedWeights::Ordinary
-                } else {
-                    EvaluatedWeights::Ema
-                },
-            };
+            let source = crate::integration_control::training_fixture::metric_source(modelid);
             let mut observation = record();
             observation.sequence = modelid + 1;
             observation.role = TrainingRecordRole::Epoch;
@@ -1715,19 +1694,7 @@ pub(crate) mod tests {
     }
     pub(super) fn all_sources() -> TrainingSourceCatalog {
         let available: Vec<_> = (0..=TRAINING_MODEL_CAPACITY as u64)
-            .map(|modelid| TrainingMetricSource {
-                scope: if modelid == 0 {
-                    TrainingRecordScope::SynchronizedSession
-                } else {
-                    TrainingRecordScope::Model
-                },
-                modelid,
-                weights: if modelid == 0 {
-                    EvaluatedWeights::Ordinary
-                } else {
-                    EvaluatedWeights::Ema
-                },
-            })
+            .map(crate::integration_control::training_fixture::metric_source)
             .collect();
         TrainingSourceCatalog {
             defaultsource: Some(available[3].clone()),
@@ -1816,19 +1783,7 @@ pub(crate) mod tests {
         let live_source = catalog.available[1].clone();
         component.update(Message::Source(live_source.clone()));
         component.update(Message::SelectedOutput(true));
-        select_saved_run(&mut model);
-        model
-            .workflow
-            .output
-            .saved_mut()
-            .unwrap()
-            .run
-            .as_mut()
-            .unwrap()
-            .run
-            .as_mut()
-            .unwrap()
-            .sources = catalog.clone();
+        select_saved_run(&mut model).sources = catalog.clone();
         let first = source_page(&catalog, 0);
         let second = source_page(&catalog, 1);
         for (page, points) in [(first.clone(), 1), (second.clone(), 2)] {
@@ -2141,19 +2096,7 @@ pub(crate) mod tests {
     fn all_source_storage_is_bounded_and_run_condition_dismissal_survives_switches() {
         let catalog = all_sources();
         let mut model = metric_model();
-        select_saved_run(&mut model);
-        model
-            .workflow
-            .output
-            .saved_mut()
-            .unwrap()
-            .run
-            .as_mut()
-            .unwrap()
-            .run
-            .as_mut()
-            .unwrap()
-            .sources = catalog.clone();
+        select_saved_run(&mut model).sources = catalog.clone();
         let mut component = Component::default();
         for epoch in 0..=history::BUCKETS as u64 {
             let mut page = source_page(&catalog, epoch);

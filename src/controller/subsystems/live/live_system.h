@@ -1,4 +1,6 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/controller/contracts/workspace_input.h"
 #include "src/controller/presentation/visual_source_projection.h"
 #include <chrono>
@@ -59,7 +61,7 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] LiveFailed final {
  LiveSnapshot snapshot{};
- [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
+ MMLTK_MAX_BYTES(kVisualFailureByteCapacity) std::string detail;
 };
 // CLEANUP-IGNORE: Live runtime construction, input endpoint, and source projection are independent canonical domain declarations.
 [[nodiscard]] VisualRuntimeFactory make_native_live_runtime_factory(VisualDeviceSettings, LiveNativeConfiguration = {});

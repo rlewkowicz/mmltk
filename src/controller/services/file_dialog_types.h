@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -37,7 +38,7 @@ struct BoundedText final {
  constexpr bool operator==(const BoundedText&) const noexcept = default;
 };
 struct FileDialogSelected final {
- [[= mmltk::frameworks::reflection::MinBytes{1U}]][[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string path{};
+ MMLTK_MIN_BYTES(1U) MMLTK_MAX_PATH_BYTES std::string path {};
  constexpr bool operator==(const FileDialogSelected&) const noexcept = default;
 };
 struct FileDialogCancelled final {

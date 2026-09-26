@@ -107,7 +107,7 @@ public:
 protected:
  using ParamState = ParamStateT;
  NativeOptimizerStorage() = default;
- NativeOptimizerStorage(std::vector<Group> groups, std::vector<NamedParameter> params) : groups_(std::move(groups)), params_(std::move(params)) {}
+ NativeOptimizerStorage(std::vector<Group> groups, std::vector<NamedParameter> params, const char* undefined_parameter, const char* invalid_group_index);
  template <class Optimizer>
  [[nodiscard]] static std::vector<std::string> inspect_checkpoint(
   torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {}, const TrainingScheduleState* = nullptr);
@@ -125,6 +125,7 @@ public:
   torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {}, const TrainingScheduleState* = nullptr);
  NativeAdamW() = default;
  NativeAdamW(std::vector<Group> groups, std::vector<NamedParameter> params, NativeOptimizerBackend backend);
+ // CLEANUP-OFF: Typed optimizer declarations share spelling, but AdamW and Muon initialize different state before the shared active-view projection.
  [[nodiscard]] NativeOptimizerBackend backend() const;
  [[nodiscard]] const char* backend_name() const;
  void activate() {
@@ -134,6 +135,7 @@ public:
  void zero_grad(bool set_to_none);
  void set_lrs(const std::vector<double>& base_lrs, double scale);
  void step();
+ // CLEANUP-ON
  void save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
  void load(torch::serialize::InputArchive& archive, std::stop_token stop = {});
 

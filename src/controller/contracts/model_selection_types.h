@@ -1,4 +1,7 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -18,9 +21,9 @@ struct ModelSelectionKey final {
  FeatureId workflow = FeatureId::Train;
  ModelSelectionSource source = ModelSelectionSource::Canonical;
  ModelArtifactInputKind input = ModelArtifactInputKind::None;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string preset;
+ MMLTK_MAX_NAME_BYTES std::string preset;
  std::uint32_t resolution = 0U;
- [[= mmltk::frameworks::reflection::MaxBytes{kModelArtifactCapacity}]] std::string class_layout_path{};
+ MMLTK_MAX_BYTES(kModelArtifactCapacity) std::string class_layout_path {};
  [[nodiscard]] bool valid() const noexcept;
  bool operator==(const ModelSelectionKey&) const = default;
 };
@@ -28,7 +31,7 @@ struct ModelSelectionKey final {
 struct ModelSettingsProjection final {
  ModelSelectionKey key{};
  std::optional<std::int32_t> inspection_device{};
- [[= mmltk::frameworks::reflection::MaxBytes{kModelArtifactCapacity}]] std::string artifact;
+ MMLTK_MAX_BYTES(kModelArtifactCapacity) std::string artifact;
  bool compatible = false;
  bool operator==(const ModelSettingsProjection&) const = default;
 };

@@ -12,9 +12,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { availableParallelism, cpus, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { filterCpdCandidates, MAX_CPD_FILTER_TOKENS } from "./cleanup/cpd_patterns.mjs";
+import { classifyDeclarations, sourceOccurrence, lineStarts } from "./cleanup/declaration_patterns.mjs";
+import { filterCpdCandidates, MAX_CPD_FILTER_TOKENS, tokenizeCpp } from "./cleanup/cpd_patterns.mjs";
 
 const REPO_ROOT = process.cwd();
 const DUPLO_BINARY = "/bin/duplo";
@@ -230,11 +231,36 @@ export function usageText() {
     "",
     `  --cpp       C/C++/CUDA: Duplo ${CPP_PROFILE.duplo.minLines} lines; C++ CPD ${CPP_PROFILE.cpd.minTokens} tokens`,
     `  --frontend  Iced Rust: Duplo ${FRONTEND_PROFILE.duplo.minLines} lines; Rust CPD ${FRONTEND_PROFILE.cpd.minTokens} tokens`,
+    "  --raw-cpd [--min-tokens N] [--output PATH]  Standalone unfiltered C++ CPD (default 12 tokens)",
+    "  Raw mode retains every match, ignores no literal sequences/blocks or inline suppressions,",
+    "  and reports original source spans separately from declaration classification.",
     "  -h, --help  Show this help",
   ].join("\n");
 }
 
+export function rawCpdProfile(minTokens = 12) {
+  if (!Number.isSafeInteger(minTokens) || minTokens < 2) throw new Error("--min-tokens must be an integer >= 2");
+  return { ...CPP_PROFILE, cpd: { ...CPP_PROFILE.cpd, minTokens,
+    raw: true, flags: ["--skip-blocks-pattern", ""] } };
+}
+
 export function parseArgs(args) {
+  if (args.length === 2 && args[0] === "--raw-cpd" && ["--help", "-h"].includes(args[1])) return { kind: "help" };
+  if (args[0] === "--raw-cpd") {
+    let minTokens = 12;
+    let output = "cleanup/declarations-raw.json";
+    const seen = new Set();
+    for (let index = 1; index < args.length; index += 2) {
+      const option = args[index];
+      if (!["--min-tokens", "--output"].includes(option) || !args[index + 1] || seen.has(option)) {
+        throw new Error("--raw-cpd accepts --min-tokens N and --output PATH once each");
+      }
+      seen.add(option);
+      if (option === "--min-tokens") minTokens = Number(args[index + 1]);
+      else output = args[index + 1];
+    }
+    return { kind: "raw-cpd", profile: rawCpdProfile(minTokens), output };
+  }
   if (args.length === 0) {
     return { kind: "profile", profile: CLEANUP_PROFILES.cpp };
   }
@@ -316,7 +342,7 @@ function runInventoryCommand(command) {
   return splitGitPaths(run(command[0], command.slice(1)).stdout);
 }
 
-function collectInventoryInputs() {
+export function collectInventoryInputs() {
   return {
     tracked: runInventoryCommand(INVENTORY_COMMANDS.tracked),
     untracked: runInventoryCommand(INVENTORY_COMMANDS.untracked),
@@ -507,7 +533,24 @@ export function parseCpdXml(xml) {
   return duplications;
 }
 
-async function runCpd(profile, paths) {
+function unsuppressedCpdSource(source) {
+  if (!source.includes("CPD-OFF") && !source.includes("CPD-ON")) return source;
+  const pieces = [];
+  let cursor = 0;
+  for (const token of tokenizeCpp(source, { trivia: true })) {
+    if (token.kind !== "comment") continue;
+    const text = token.text.replace(/CPD-O(?:FF|N)/gu, (marker) => `CPX${marker.slice(3)}`);
+    if (text === token.text) continue;
+    // Only comment markers change, with identical byte/character counts. PMD
+    // coordinates therefore still address the original source, including CRLF.
+    pieces.push(source.slice(cursor, token.offset), text);
+    cursor = token.end;
+  }
+  pieces.push(source.slice(cursor));
+  return pieces.join("");
+}
+
+export async function runCpd(profile, paths) {
   const lexable = paths.filter(
     (path) =>
       !profile.detectorExcludedPrefixes.some((prefix) =>
@@ -527,13 +570,24 @@ async function runCpd(profile, paths) {
   const temporaryDirectory = mkdtempSync(join(tmpdir(), "cpd-file-list-"));
   const fileList = join(temporaryDirectory, "files.txt");
   const args = detectorArguments(profile, { fileList }).cpd;
+  const originalPaths = new Map();
   let result;
   try {
-    writeFileSync(fileList, `${lexable.join("\n")}\n`, "utf8");
+    const inputs = lexable.map((path, index) => {
+      if (!profile.cpd.raw) return path;
+      const source = readFileSync(path, "utf8");
+      const unsuppressed = unsuppressedCpdSource(source);
+      if (unsuppressed === source) return path;
+      const copy = join(temporaryDirectory, `${index}-${basename(path)}`);
+      writeFileSync(copy, unsuppressed, "utf8");
+      originalPaths.set(copy, resolve(REPO_ROOT, path));
+      return copy;
+    });
+    writeFileSync(fileList, `${inputs.join("\n")}\n`, "utf8");
     result = await runAsync(
       profile.cpd.binary,
       args,
-      { acceptStatuses: [4, 5] },
+      { acceptStatuses: profile.cpd.raw ? [] : [4, 5] },
     );
   } catch (error) {
     if (error?.code === "ENOENT") {
@@ -552,8 +606,17 @@ async function runCpd(profile, paths) {
       `CPD could not lex a ${profile.name} source outside the configured exclusions:\n${stderr}`,
     );
   }
+  const metadata = result.stdout.replace(/<!\[CDATA\[[\s\S]*?\]\]>/gu, "");
+  const reportedErrors = metadata.match(/<(?:error|processing[-_]?error)\b[^>]*>/giu) ?? [];
+  if (profile.cpd.raw && (reportedErrors.length || /\b(?:ERROR|\w*Exception)\b/u.test(stderr))) {
+    throw new Error(`CPD reported incomplete raw source coverage:\n${stderr}\n${reportedErrors.join("\n")}`);
+  }
+  const duplications = parseCpdXml(result.stdout);
+  for (const match of duplications) for (const occurrence of match.occurrences) {
+    occurrence.path = originalPaths.get(occurrence.path) ?? occurrence.path;
+  }
   return {
-    duplications: parseCpdXml(result.stdout),
+    duplications,
     arguments: args,
     excludedLexerCount: paths.length - lexable.length,
     status: result.status,
@@ -1159,6 +1222,7 @@ export function buildReport({
       threads,
       status: duplo.status,
       stderr: duplo.stderr,
+      raw_hits: duplo.hits,
     },
     cpd: {
       binary: profile.cpd.binary,
@@ -1235,7 +1299,7 @@ export function rejectionReport(previous, report, filteredCpd) {
   };
 }
 
-function writeAtomic(path, contents) {
+export function writeAtomic(path, contents) {
   mkdirSync(dirname(path), { recursive: true });
   const directory = mkdtempSync(join(dirname(path), ".cleanup-"));
   const temporary = join(directory, basename(path));
@@ -1346,13 +1410,55 @@ export async function generateReport(
   return report;
 }
 
+export function rawCpdReport(profile, files, cpd, sourceReader = (path) => readFileSync(path, "utf8")) {
+  if (cpd.status !== 0) throw new Error(`CPD raw scan exited with status ${cpd.status}\n${cpd.stderr}`);
+  // One read per file, one classified occurrence per real source range. Source
+  // context is not another detector and never increases CPD's occurrence count.
+  const sources = new Map(files.scannedFiles.map((path) => [path, sourceReader(path)]));
+  const lines = new Map([...sources].map(([path, source]) => [path, lineStarts(source)]));
+  const classified = files.scannedFiles.flatMap((path) => classifyDeclarations(path, sources.get(path)).candidates);
+  return {
+    format: 1,
+    purpose: "Unfiltered CPD evidence and independent declaration context; not a behavior-duplication verdict",
+    inventory: files.scannedFiles,
+    detector: { binary: profile.cpd.binary, arguments: detectorArguments(profile).cpd,
+      min_tokens: profile.cpd.minTokens, status: cpd.status, stderr: cpd.stderr,
+      context_filter: false, inline_suppressions: false, sequence_skipping: false },
+    raw_matches: cpd.duplications.map((match) => ({ ...match,
+      occurrences: [...match.occurrences].sort((a, b) => a.path.localeCompare(b.path, "en") || a.start - b.start || (a.column ?? 1) - (b.column ?? 1) || a.end - b.end || (a.endColumn ?? 0) - (b.endColumn ?? 0)),
+    })).sort((a, b) => a.occurrences[0].path.localeCompare(b.occurrences[0].path, "en") || a.occurrences[0].start - b.occurrences[0].start ||
+      (a.occurrences[0].column ?? 1) - (b.occurrences[0].column ?? 1) || a.tokenCount - b.tokenCount || JSON.stringify(a).localeCompare(JSON.stringify(b), "en"))
+      .map((match, index) => ({
+      id: index + 1, token_count: match.tokenCount, line_count: match.lineCount,
+      occurrences: match.occurrences.map((occurrence) => {
+        const path = repoRelativePath(occurrence.path);
+        if (!sources.has(path)) throw new Error(`CPD returned an out-of-inventory path: ${path}`);
+        return sourceOccurrence(path, sources.get(path), occurrence, lines.get(path));
+      }),
+    })),
+    classified_context: classified,
+    summary: { files: sources.size, raw_matches: cpd.duplications.length, classified_candidates: classified.length },
+  };
+}
+
+export async function generateRawCpd(profile, output) {
+  if (!output.endsWith(".json")) throw new Error("raw CPD output must be a .json report path");
+  const files = buildInventory(profile, collectInventoryInputs());
+  const cpd = await runCpd(profile, files.scannedFiles);
+  const report = rawCpdReport(profile, files, cpd);
+  writeAtomic(output, `${JSON.stringify(report, null, 2)}\n`);
+  console.log(`wrote ${output}: ${report.summary.files} files, ${report.summary.raw_matches} raw CPD groups, ${report.summary.classified_candidates} source candidates`);
+  return report;
+}
+
 async function main() {
   const selection = parseArgs(process.argv.slice(2));
   if (selection.kind === "help") {
     console.log(usageText());
     return;
   }
-  await generateReport(selection.profile);
+  if (selection.kind === "raw-cpd") await generateRawCpd(selection.profile, selection.output);
+  else await generateReport(selection.profile);
 }
 
 const invokedPath = process.argv[1]

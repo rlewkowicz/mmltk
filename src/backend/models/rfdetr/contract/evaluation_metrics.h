@@ -1,4 +1,6 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -104,7 +106,7 @@ struct EvaluationMetricDetail final {
  std::array<std::uint32_t, 3> detection_limits{};
  std::array<double, kEvaluationIouCount> average_precision{};
  std::array<std::array<double, kEvaluationIouCount>, 3> average_recall{};
- [[= mmltk::frameworks::reflection::CatalogProvider<EvaluationAxisCatalog>{}]] std::array<std::array<double, kEvaluationRecallCount>, kEvaluationIouCount> precision_curve{};
+ MMLTK_CATALOG(EvaluationAxisCatalog) std::array<std::array<double, kEvaluationRecallCount>, kEvaluationIouCount> precision_curve {};
  ConfidenceMetrics confidence{};
  double confidence_threshold = 0.0;
 };
@@ -112,14 +114,14 @@ MMLTK_REFLECT_FIELDS(EvaluationMetricDetail)
 struct EvaluationDetailQuery final {
  std::uint64_t generation = 0U;
  std::uint32_t offset = 0U;
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{1U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{kEvaluationDetailPageSize}]] std::uint32_t count = kEvaluationDetailPageSize;
+ MMLTK_MINIMUM(std::uint32_t, 1U) MMLTK_MAXIMUM(std::uint32_t, kEvaluationDetailPageSize) std::uint32_t count = kEvaluationDetailPageSize;
 };
 MMLTK_REFLECT_FIELDS(EvaluationDetailQuery)
 struct EvaluationDetailPage final {
  std::uint64_t generation = 0U;
  std::uint32_t total = 0U;
  std::uint32_t offset = 0U;
- [[= mmltk::frameworks::reflection::MaxItems{kEvaluationDetailPageSize}]] std::vector<EvaluationMetricDetail> rows;
+ MMLTK_MAX_ITEMS(kEvaluationDetailPageSize) std::vector<EvaluationMetricDetail> rows;
 };
 MMLTK_REFLECT_FIELDS(EvaluationDetailPage)
 }  // namespace mmltk::backend::models::rfdetr

@@ -9,6 +9,7 @@ mmltk_configure_component(mmltk_frameworks_reflection
 mmltk_register_public_headers(mmltk_frameworks_reflection
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
+        declaration_annotations.h
         field_policy.h
         reflected_descriptors.h
         reflected_field_policy.h

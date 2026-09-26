@@ -22,6 +22,7 @@
 #include <limits>
 #include <condition_variable>
 #include <future>
+#include <functional>
 #include <exception>
 #include <mutex>
 #include <sstream>
@@ -151,6 +152,40 @@ public:
   return {gradients[0], torch::Tensor{}};
  }
 };
+// Own the readiness event and worker through the deliberately held derivative,
+// including assertion/exception unwinding before the fixture releases its gate.
+class HeldGradientBackward final {
+public:
+ HeldGradientBackward(
+  int device, tc::TorchCudaStream launch, TrainingGradientReducer& reducer, const std::vector<torch::Tensor>& parameters, std::function<torch::Tensor()> late_input, torch::Tensor early)
+     : gate(device), worker_stream(tc::getStreamFromPool(false, tc::checked_device_index(device))) {
+  ready_.record(launch);
+  future = std::async(std::launch::async, [this, &reducer, &parameters, late_input = std::move(late_input), early = std::move(early)] {
+   tc::TorchCudaStreamGuard stream(worker_stream);
+   ready_.block(worker_stream);
+   // Build the late branch first; autograd prioritizes the later independent early branch.
+   auto delayed = LateBackward::apply(late_input(), reinterpret_cast<std::int64_t>(&gate));
+   auto loss = (delayed + early.square()).sum();
+   reducer.arm(0);
+   static_cast<void>(TrainingStep(1, 1, false, at::kFloat).gradients(loss, parameters));
+   reducer.collect(0);
+  });
+ }
+ ~HeldGradientBackward() {
+  gate.release();
+  if (future.valid()) try {
+    future.get();
+   } catch (...) {}
+ }
+ HeldGradientBackward(const HeldGradientBackward&) = delete;
+ HeldGradientBackward& operator=(const HeldGradientBackward&) = delete;
+ BackwardGate gate;
+ tc::TorchCudaStream worker_stream;
+ std::future<void> future;
+
+private:
+ at::cuda::CUDAEvent ready_;
+};
 void mixed_early_bucket_overlap(const DistributedContext& distributed, int device) {
  const auto launch = tc::getCurrentCUDAStream(tc::checked_device_index(device));
  const auto options = torch::TensorOptions().device(tc::cuda_device(device));
@@ -162,19 +197,9 @@ void mixed_early_bucket_overlap(const DistributedContext& distributed, int devic
  TrainingGradientReducer reducer(distributed, device, launch, {"unused", "late", "wide", "early"}, parameters, {parameters}, 128);
  reducer.begin_attempt(1);
  reducer.enable_gradient_launch_after_counts();
- BackwardGate gate(device);
- at::cuda::CUDAEvent parameters_ready;
- parameters_ready.record(launch);
- const auto worker_stream = tc::getStreamFromPool(false, tc::checked_device_index(device));
- auto future = std::async(std::launch::async, [&] {
-  tc::TorchCudaStreamGuard stream(worker_stream);
-  parameters_ready.block(worker_stream);
-  auto delayed = LateBackward::apply(late + wide, reinterpret_cast<std::int64_t>(&gate));
-  auto loss = (delayed + early.square()).sum();
-  reducer.arm(0);
-  static_cast<void>(TrainingStep(1, 1, false, at::kFloat).gradients(loss, parameters));
-  reducer.collect(0);
- });
+ HeldGradientBackward backward(device, launch, reducer, parameters, [&] { return late + wide; }, early);
+ auto& gate = backward.gate;
+ auto& future = backward.future;
  const bool entered = gate.await();
  const auto launched_while_held = reducer.launched_buckets();
  gate.release();
@@ -238,21 +263,10 @@ void exercise_early_bucket_overlap(const DistributedContext& distributed, int de
  auto count = torch::zeros({1}, late.options().requires_grad(false));
  distributed_all_reduce_tensor(distributed, count);
  reducer.enable_gradient_launch_after_counts();
- BackwardGate gate(device);
- at::cuda::CUDAEvent parameters_ready;
- parameters_ready.record(launch);
- const auto worker_stream = tc::getStreamFromPool(false, tc::checked_device_index(device));
- auto future = std::async(std::launch::async, [&] {
-  tc::TorchCudaStreamGuard stream(worker_stream);
-  parameters_ready.block(worker_stream);
-  // Build the late branch first, then the early branch. Autograd's node
-  // sequence priority executes the early independent branch first.
-  auto delayed = LateBackward::apply(late, reinterpret_cast<std::int64_t>(&gate));
-  auto loss = (delayed + early.square()).sum();
-  reducer.arm(0);
-  static_cast<void>(TrainingStep(1, 1, false, at::kFloat).gradients(loss, parameters));
-  reducer.collect(0);
- });
+ HeldGradientBackward backward(device, launch, reducer, parameters, [&] { return late; }, early);
+ auto& gate = backward.gate;
+ auto& future = backward.future;
+ const auto& worker_stream = backward.worker_stream;
  const bool entered = gate.await();
  const auto launched_while_held = reducer.launched_buckets();
  if (abort_after_launch && entered && launched_while_held == 1) {

@@ -289,8 +289,7 @@ services::SettingsMutationResult SettingsSystem::persist(contracts::GuiSettingsS
   // remain independently editable, including persistence retries and Explore.
   const auto& admitted = state_.settings_state.workflows.train;
   const auto& proposed = candidate.workflows.train;
-  if (training_locked_ && !same_training_configuration(proposed, admitted))
-   throw contracts::BusyError("training configuration is locked during an admitted run");
+  if (training_locked_ && !same_training_configuration(proposed, admitted)) throw contracts::BusyError("training configuration is locked during an admitted run");
   if (!loaded_ || !location_.valid()) {
    terminal_ = {services::SettingsTerminal::NotLoaded, state_.revision, "settings are not loaded"};
   } else if (state_.revision == std::numeric_limits<std::uint64_t>::max()) {

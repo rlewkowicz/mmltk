@@ -23,6 +23,13 @@
 namespace {
 namespace rf = mmltk::backend::models::rfdetr;
 namespace tensor_fixture = mmltk::backend::ml::testsupport;
+rf::TrainRequest optimizer_test_request(rf::TrainOptimizerKind kind) {
+ rf::TrainRequest request;
+ request.recipe.optimizer = kind;
+ rf::reset_train_recipe(request.recipe);
+ request.fused_optimizer = false;
+ return request;
+}
 torch::serialize::InputArchive optimizer_checkpoint(rf::NativeOptimizer& optimizer) {
  mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
  readback.Begin();
@@ -422,11 +429,9 @@ TEST_CASE("SGD preserves coupled decay first buffer Nesterov undefined gradients
   }
 }
 TEST_CASE("Optimizer inventories retain cold named parameters and initialize once upon activation", "[rfdetr][training][activation]") {
+ // CLEANUP-IGNORE: Activation and Resume cases share only the recipe fixture and a seed tensor; their state transitions and assertions differ.
  for (const auto kind : {rf::TrainOptimizerKind::AdamW, rf::TrainOptimizerKind::Muon, rf::TrainOptimizerKind::SGD}) {
-  rf::TrainRequest request;
-  request.recipe.optimizer = kind;
-  rf::reset_train_recipe(request.recipe);
-  request.fused_optimizer = false;
+  const auto request = optimizer_test_request(kind);
   auto active = torch::full({2, 2}, .7).set_requires_grad(true);
   auto frozen = torch::full({2, 2}, .4);
   torch::OrderedDict<std::string, torch::Tensor> parameters;
@@ -490,10 +495,7 @@ TEST_CASE("SGD bias warmup groups remain separate when ordinary LR and decay coi
 TEST_CASE("Optimizer Resume seals group policy while restoring held schedule and parameter state", "[rfdetr][training][optimizer][continuation]") {
  namespace io = mmltk::backend::ml::serialization;
  for (const auto kind : {rf::TrainOptimizerKind::AdamW, rf::TrainOptimizerKind::Muon, rf::TrainOptimizerKind::SGD}) {
-  rf::TrainRequest request;
-  request.recipe.optimizer = kind;
-  rf::reset_train_recipe(request.recipe);
-  request.fused_optimizer = false;
+  const auto request = optimizer_test_request(kind);
   auto parameter = torch::full({2, 2}, .7).set_requires_grad(true);
   torch::OrderedDict<std::string, torch::Tensor> parameters;
   parameters.insert("transformer.encoder.weight", parameter);

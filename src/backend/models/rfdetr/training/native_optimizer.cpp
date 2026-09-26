@@ -157,6 +157,9 @@ torch::Tensor require_parameter_state_tensor(torch::serialize::InputArchive& arc
  }
  return materialize ? align_tensor_like_param(state_tensor, param) : state_tensor;
 }
+std::pair<torch::Tensor, torch::Tensor> read_adam_moments(torch::serialize::InputArchive& archive, const torch::Tensor& parameter, const char* mismatch, bool materialize) {
+ return {require_parameter_state_tensor(archive, "exp_avg", parameter, mismatch, materialize), require_parameter_state_tensor(archive, "exp_avg_sq", parameter, mismatch, materialize)};
+}
 torch::Tensor require_adam_step_tensor(torch::serialize::InputArchive& archive, const torch::Tensor& param, const NativeOptimizerBackend backend, bool materialize) {
  auto step = mmltk::backend::ml::serialization::require_tensor(archive, "step");
  if (!step.defined() || !step.device().is_cpu() || step.dim() != 0 || step.scalar_type() != torch::kFloat32 || !torch::isfinite(step).item<bool>() || step.item<float>() < 0.0F) {
@@ -439,10 +442,15 @@ bool native_optimizer_supports_fused(const std::vector<torch::Tensor>& params) {
  }
  return true;
 }
+template <typename GroupConfig, typename ParamStateT>
+NativeOptimizerStorage<GroupConfig, ParamStateT>::NativeOptimizerStorage(
+ std::vector<Group> groups, std::vector<NamedParameter> params, const char* undefined_parameter, const char* invalid_group_index)
+    : groups_(std::move(groups)), params_(std::move(params)) {
+ populate_named_parameter_views(params_, all_params_, all_param_names_, undefined_parameter);
+ validate_group_collection_indices(groups_, params_.size(), invalid_group_index);
+}
 NativeAdamW::NativeAdamW(std::vector<Group> groups, std::vector<NamedParameter> params, const NativeOptimizerBackend backend)
-    : NativeOptimizerStorage(std::move(groups), std::move(params)), backend_(backend) {
- populate_named_parameter_views(params_, all_params_, all_param_names_, "native AdamW received an undefined parameter tensor");
- validate_group_collection_indices(groups_, params_.size(), "native AdamW parameter group index is out of range");
+    : NativeOptimizerStorage(std::move(groups), std::move(params), "native AdamW received an undefined parameter tensor", "native AdamW parameter group index is out of range"), backend_(backend) {
  activate();
 }
 NativeOptimizerBackend NativeAdamW::backend() const { return backend_; }
@@ -646,14 +654,7 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
   }
   const auto& param = params_[index].tensor;
   auto loaded_step = require_adam_step_tensor(param_archive, param, backend_, materialize);
-  auto loaded_exp_avg = require_parameter_state_tensor(param_archive, "exp_avg", param,
-   "native AdamW archive tensor shape "
-   "does not match the current model",
-   materialize);
-  auto loaded_exp_avg_sq = require_parameter_state_tensor(param_archive, "exp_avg_sq", param,
-   "native AdamW archive tensor shape "
-   "does not match the current model",
-   materialize);
+  auto [loaded_exp_avg, loaded_exp_avg_sq] = read_adam_moments(param_archive, param, "native AdamW archive tensor shape does not match the current model", materialize);
   const bool has_max_exp_avg_sq = require_optimizer_bool(param_archive, "has_max_exp_avg_sq");
   if (has_max_exp_avg_sq != uses_amsgrad[index]) { throw std::runtime_error("native AdamW archive AMSGrad state does not match the current optimizer"); }
   auto& state = candidate_state[index];
@@ -676,9 +677,8 @@ std::vector<std::string> NativeAdamW::InspectCheckpoint(
  torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop, const TrainingScheduleState* schedule) {
  return inspect_checkpoint<NativeAdamW>(archive, tensors, stop, schedule);
 }
-NativeMuonWithAuxAdam::NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params) : NativeOptimizerStorage(std::move(groups), std::move(params)) {
- populate_named_parameter_views(params_, all_params_, all_param_names_, "native Muon received an undefined parameter tensor");
- validate_group_collection_indices(groups_, params_.size(), "native Muon parameter group index is out of range");
+NativeMuonWithAuxAdam::NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params)
+    : NativeOptimizerStorage(std::move(groups), std::move(params), "native Muon received an undefined parameter tensor", "native Muon parameter group index is out of range") {
  activate();
 }
 const char* NativeMuonWithAuxAdam::backend_name() const { return "eager"; }
@@ -830,18 +830,12 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
   }
   const auto step = mmltk::backend::ml::serialization::require_int(param_archive, "step");
   if (step < 0) { throw std::runtime_error("native Muon archive step does not match the current optimizer"); }
-  auto exp_avg = require_parameter_state_tensor(param_archive, "exp_avg", param,
-   "native Muon archive AuxAdam tensor shape does not match the "
-   "current model",
-   materialize);
-  auto exp_avg_sq = require_parameter_state_tensor(param_archive, "exp_avg_sq", param,
-   "native Muon archive AuxAdam tensor shape does not match the "
-   "current model",
-   materialize);
+  auto [exp_avg, exp_avg_sq] = read_adam_moments(param_archive, param, "native Muon archive AuxAdam tensor shape does not match the current model", materialize);
   state.step = step;
   state.momentum_buffer = torch::Tensor();
   state.exp_avg = std::move(exp_avg);
   state.exp_avg_sq = std::move(exp_avg_sq);
+  // CLEANUP-IGNORE: This fragment crosses typed archive commit, inspection and construction boundaries; their shared storage and parser operations already have one implementation.
  });
  groups_.swap(candidate_groups);
  state_.swap(candidate_state);
@@ -850,9 +844,8 @@ std::vector<std::string> NativeMuonWithAuxAdam::InspectCheckpoint(
  torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop, const TrainingScheduleState* schedule) {
  return inspect_checkpoint<NativeMuonWithAuxAdam>(archive, tensors, stop, schedule);
 }
-NativeSGD::NativeSGD(std::vector<Group> groups, std::vector<NamedParameter> params) : NativeOptimizerStorage(std::move(groups), std::move(params)) {
- populate_named_parameter_views(params_, all_params_, all_param_names_, "native SGD received an undefined tensor");
- validate_group_collection_indices(groups_, params_.size(), "native SGD group index is out of range");
+NativeSGD::NativeSGD(std::vector<Group> groups, std::vector<NamedParameter> params)
+    : NativeOptimizerStorage(std::move(groups), std::move(params), "native SGD received an undefined tensor", "native SGD group index is out of range") {
  activate();
 }
 void NativeSGD::zero_grad(bool none) { zero_grad_parameters(all_params_, none); }
@@ -972,6 +965,7 @@ void NativeOptimizer::admit_continuation(const TrainingScheduleState& schedule) 
  std::visit([&](const auto& optimizer) { optimizer.admit_continuation(schedule); }, storage_);
 }
 void NativeOptimizer::broadcast_state(const DistributedContext& group) {
+ // CLEANUP-IGNORE: CPD spans independent variant operations and getters; broadcasting, eligible tensors and active tensors are different APIs.
  std::visit([&](auto& optimizer) { optimizer.broadcast_state(group); }, storage_);
 }
 const std::vector<torch::Tensor>& NativeOptimizer::eligible_parameters() const {

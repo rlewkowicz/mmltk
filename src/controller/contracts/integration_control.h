@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <cstdint>
 #include <cstddef>
 #include <concepts>
@@ -66,13 +67,13 @@ constexpr void visit_integration_commands(Visitor&& visitor) {
 inline constexpr std::size_t kIntegrationFailureMaxBytes = 4096U;
 struct IntegrationControlReceipt final {
  IntegrationControlKind kind = IntegrationControlKind::Progress;
- [[= mmltk::frameworks::reflection::Minimum{std::uint64_t{1U}}]] std::uint64_t sequence = 0U;
+ MMLTK_MINIMUM_VALUE(std::uint64_t{1U}) std::uint64_t sequence = 0U;
  std::uint64_t progress = 0U;
  // Static integration-driver caller line; zero unless kind is Failed.
  std::uint32_t failureline = 0U;
  std::uint64_t read_generation = 0U;
  std::uint32_t compiled_index = 0U;
- [[= mmltk::frameworks::reflection::MaxBytes{kIntegrationFailureMaxBytes}]] std::string failure{};
+ MMLTK_MAX_BYTES(kIntegrationFailureMaxBytes) std::string failure {};
  bool operator==(const IntegrationControlReceipt&) const = default;
 };
 [[nodiscard]] constexpr bool integration_receipt_valid(const IntegrationControlReceipt& receipt) noexcept {

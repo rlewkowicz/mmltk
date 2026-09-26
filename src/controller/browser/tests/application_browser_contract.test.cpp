@@ -1,3 +1,6 @@
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/browser/application_workspace_abi_emitter.h"
@@ -51,7 +54,7 @@ public:
  constexpr bool operator==(const OverrideState&) const noexcept = default;
 
 private:
- [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{1U}]] std::uint16_t mask = 0U;
+ MMLTK_MAXIMUM(std::uint16_t, 1U) std::uint16_t mask = 0U;
 };
 struct Row final {
  std::uint16_t value = 0U;
@@ -60,13 +63,13 @@ struct OrphanSettings final {
  OverrideState overrides;
 };
 struct MultipleClaimSettings final {
- [[= mmltk::frameworks::reflection::CatalogProvider<FirstProvider>{}]] std::uint16_t first = 0U;
- [[= mmltk::frameworks::reflection::CatalogProvider<SecondProvider>{}]] std::uint16_t second = 0U;
+ MMLTK_CATALOG(FirstProvider) std::uint16_t first = 0U;
+ MMLTK_CATALOG(SecondProvider) std::uint16_t second = 0U;
  std::uint16_t value = 0U;
  OverrideState overrides;
 };
 struct InvalidDestinationSettings final {
- [[= mmltk::frameworks::reflection::CatalogProvider<InvalidDestinationProvider>{}]] std::uint16_t selector = 0U;
+ MMLTK_CATALOG(InvalidDestinationProvider) std::uint16_t selector = 0U;
  [[= mmltk::controller::contracts::reflection::PersistenceMetadata{}]] std::uint16_t persisted = 0U;
  OverrideState overrides;
 };
@@ -135,7 +138,7 @@ static_assert(!application_schema_detail::settings_relations_are_valid<relation_
 static_assert(!application_schema_detail::settings_relations_are_valid<relation_audit_test::InvalidDestinationSettings>());
 static_assert(application_schema_detail::settings_relations_are_valid<contracts::GuiSettingsState>());
 struct Increment final {
- [[= mmltk::frameworks::reflection::Minimum{std::int32_t{1}}]] std::int32_t amount = 1;
+ MMLTK_MINIMUM_VALUE(std::int32_t{1}) std::int32_t amount = 1;
 };
 struct CounterSnapshot final {
  std::int32_t value = 0;
@@ -462,17 +465,17 @@ struct[[= kValidFixedText]] WrongByteStorageFixedText final {
 };
 MMLTK_REFLECT_FIELDS(WrongByteStorageFixedText)
 struct DirectInheritanceRequest final {
- [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{1}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
+ MMLTK_MINIMUM(std::int32_t, 1) MMLTK_MAXIMUM(std::int32_t, 9) std::int32_t inherited_limit = 4;
  bool derived_enabled = true;
 };
 struct InheritedRequestBase {
- [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{1}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
+ MMLTK_MINIMUM(std::int32_t, 1) MMLTK_MAXIMUM(std::int32_t, 9) std::int32_t inherited_limit = 4;
 };
 struct InheritedRequest final : InheritedRequestBase {
  bool derived_enabled = true;
 };
 struct ChangedInheritedRequestBase {
- [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{2}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
+ MMLTK_MINIMUM(std::int32_t, 2) MMLTK_MAXIMUM(std::int32_t, 9) std::int32_t inherited_limit = 4;
 };
 struct ChangedInheritedRequest final : ChangedInheritedRequestBase {
  bool derived_enabled = true;
@@ -499,12 +502,12 @@ struct ChangedInheritedSystems final {
  InheritanceFixtureSystem<ChangedInheritedRequest>* fixture = nullptr;
 };
 struct DirectInheritanceSettings final {
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{2U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{12U}]] std::uint32_t inherited_limit = 6U;
+ MMLTK_MINIMUM(std::uint32_t, 2U) MMLTK_MAXIMUM(std::uint32_t, 12U) std::uint32_t inherited_limit = 6U;
  [[= contracts::reflection::PersistenceMetadata{}]] std::uint64_t persisted_revision = 17U;
  bool derived_enabled = true;
 };
 struct InheritedSettingsBase {
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{2U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{12U}]] std::uint32_t inherited_limit = 6U;
+ MMLTK_MINIMUM(std::uint32_t, 2U) MMLTK_MAXIMUM(std::uint32_t, 12U) std::uint32_t inherited_limit = 6U;
  [[= contracts::reflection::PersistenceMetadata{}]] std::uint64_t persisted_revision = 17U;
 };
 struct InheritedSettings final : InheritedSettingsBase {

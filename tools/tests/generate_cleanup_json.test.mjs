@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -10,18 +13,83 @@ import {
   compactDuploHits,
   compareHits,
   detectorArguments,
+  generateRawCpd,
   parseArgs,
   parseCpdXml,
   parseDuploJson,
   parseInlineSuppressions,
   rejectionReport,
+  runCpd,
   serializeReport,
   structuralHits,
 } from "../generate_cleanup_json.mjs";
 import { filterCpdCandidates } from "../cleanup/cpd_patterns.mjs";
+import { sourceOccurrence } from "../cleanup/declaration_patterns.mjs";
 
 const cpp = CLEANUP_PROFILES.cpp;
 const frontend = CLEANUP_PROFILES.frontend;
+
+test("raw CPD includes real PMD-suppressed code with original paths, columns, literals and CRLF", async (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "mmltk-cpd-source-"));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const body = 'int repeated(int value) {\r\n  const char* marker = "CPD-OFF";\r\n  int result = value * value + 3;\r\n  return result + value + marker[0];\r\n}\r\n';
+  const paths = [join(directory, "suppressed.cpp"), join(directory, "ordinary.cpp")];
+  const sources = ["// CPD-OFF\r\n" + body + "// CPD-ON\r\n", "// ordinary source\r\n" + body];
+  paths.forEach((path, index) => writeFileSync(path, sources[index]));
+  const raw = parseArgs(["--raw-cpd"]).profile;
+  const normal = { ...cpp, cpd: { ...cpp.cpd, minTokens: 12, flags: [] } };
+  assert.equal((await runCpd(normal, paths)).duplications.length, 0);
+  const result = await runCpd(raw, paths);
+  const match = result.duplications.find((candidate) => candidate.occurrences.length === 2 && candidate.tokenCount >= 30);
+  assert.ok(match, "unsuppressed complete function is present in raw evidence");
+  assert.deepEqual(match.occurrences.map(({ path }) => path).sort(), [...paths].sort());
+  for (const occurrence of match.occurrences) {
+    const source = sources[paths.indexOf(occurrence.path)];
+    const evidence = sourceOccurrence(occurrence.path, source, occurrence);
+    assert.equal(occurrence.start, 2);
+    assert.equal(occurrence.column, 1);
+    assert.ok(evidence.text.startsWith("int repeated("));
+    assert.ok(evidence.text.includes('"CPD-OFF"'));
+    assert.ok(evidence.text.includes("\r\n"));
+    assert.equal(source.slice(evidence.start_offset, evidence.end_offset), evidence.text);
+    assert.equal(readFileSync(occurrence.path, "utf8"), source);
+  }
+  assert.equal(existsSync(dirname(result.arguments[result.arguments.indexOf("--file-list") + 1])), false);
+  const invalid = join(directory, "invalid.cpp");
+  writeFileSync(invalid, 'int invalid() { return "unterminated; }\n');
+  await assert.rejects(runCpd(raw, [invalid]), /status 5|could not lex|incomplete raw source coverage/u);
+});
+
+test("raw CPD rejects partial detector runs without replacing a complete report and removes scan copies", async (context) => {
+  const directory = mkdtempSync(join(tmpdir(), "mmltk-cpd-failure-"));
+  context.after(() => rmSync(directory, { recursive: true, force: true }));
+  const binary = join(directory, "pmd-fixture.mjs"), capture = join(directory, "arguments.json");
+  const output = join(directory, "report.json"), original = '{"previous":"complete"}\n';
+  writeFileSync(output, original);
+  for (const result of [
+    { status: 5, stdout: "<pmd-cpd/>", stderr: "Cannot lex src/broken.cpp: unterminated literal" },
+    { status: 0, stdout: '<pmd-cpd><error filename="src/broken.cpp" msg="lexical failure"/></pmd-cpd>', stderr: "" },
+    { status: 0, stdout: "<pmd-cpd/>", stderr: "source scanner: ERROR in src/broken.cpp" },
+    { status: 0, stdout: "<pmd-cpd><codefragment><![CDATA[Result<Error> result;]]></codefragment></pmd-cpd>", stderr: "", complete: true },
+  ]) {
+    writeFileSync(binary, `#!/usr/bin/env node\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(capture)}, JSON.stringify(process.argv));\nprocess.stdout.write(${JSON.stringify(result.stdout)});\nprocess.stderr.write(${JSON.stringify(result.stderr)});\nprocess.exitCode = ${result.status};\n`, { mode: 0o755 });
+    const profile = parseArgs(["--raw-cpd"]).profile;
+    profile.cpd.binary = binary;
+    if (result.complete) await runCpd(profile, ["src/frameworks/reflection/declaration_annotations.h"]);
+    else await assert.rejects(generateRawCpd(profile, output), /src\/broken\.cpp/u);
+    assert.equal(readFileSync(output, "utf8"), original);
+    const args = JSON.parse(readFileSync(capture, "utf8"));
+    assert.equal(existsSync(dirname(args[args.indexOf("--file-list") + 1])), false);
+  }
+});
+
+test("empty raw CPD inventories complete without launching a detector", async () => {
+  const profile = parseArgs(["--raw-cpd"]).profile;
+  profile.cpd.binary = "/nonexistent/pmd";
+  const result = await runCpd(profile, []);
+  assert.equal(result.status, 0);
+  assert.deepEqual(result.duplications, []);
+});
 
 test("profiles and arguments select exactly one frozen configuration", () => {
   assert.equal(parseArgs([]).profile, cpp);
@@ -61,7 +129,7 @@ test("inventory commands are exact and frozen", () => {
 
 test("detector commands exactly encode each profile", () => {
   assert.deepEqual(detectorArguments(cpp, { threads: 3, fileList: "/f" }), {
-    duplo: ["-j", "3", "-ml", "9", "-ip", "-json", "-", "-"],
+    duplo: ["-j", "3", "-ml", "6", "-ip", "-json", "-", "-"],
     cpd: [
       "cpd",
       "--file-list",
@@ -633,4 +701,16 @@ test("a call in a lambda capture is not a function declaration or overload famil
     "a.cpp": "void A(Runtime& runtime) { owner.Defer(runtime, [value = std::move(candidate)]() mutable { runtime.Commit(std::move(value)); first(); }); }",
     "b.cpp": "void B(Runtime& runtime) { owner.Defer(runtime, [value = std::move(candidate)]() mutable { runtime.Commit(std::move(value)); second(); }); }",
   }).duplications.length, 0);
+});
+
+
+test("raw CPD argument validation cannot alter ordinary profile thresholds", () => {
+  const raw = parseArgs(["--raw-cpd", "--min-tokens", "16", "--output", "cleanup/raw.json"]);
+  assert.equal(raw.profile.cpd.minTokens, 16);
+  assert.equal(raw.output, "cleanup/raw.json");
+  assert.equal(cpp.cpd.minTokens, 39);
+  assert.deepEqual(raw.profile.cpd.flags, ["--skip-blocks-pattern", ""]);
+  for (const args of [["--raw-cpd", "--min-tokens", "1"], ["--raw-cpd", "--min-tokens", "NaN"],
+    ["--raw-cpd", "--min-tokens", "12.5"], ["--raw-cpd", "--output"], ["--raw-cpd", "--cpp"],
+    ["--raw-cpd", "--output", "a", "--output", "b"]]) assert.throws(() => parseArgs(args));
 });

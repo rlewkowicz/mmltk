@@ -256,6 +256,15 @@ TrainingSelection select_training_artifact(std::span<const TrainingSelectionCand
   const auto metric = training_selection_metric(summary, masks);
   return std::tuple{path, std::move(summary), metric, std::move(admission)};
  };
+ const auto accept_trial = [&](std::filesystem::path path, EvalSummary summary, double metric, std::shared_ptr<TrainingArtifactAdmission> admission) {
+  selected.artifact.path = std::move(path);
+  selected.validation = std::move(summary);
+  selected.artifact.selection_metric = metric;
+  selected.artifact.weights = EvaluatedWeights::Soup;
+  selected.artifact.content = admission->content();
+  selected.artifact.sha256 = admission->sha256();
+  selected_admission = std::move(admission);
+ };
  if (policy == TrainFinalPolicy::ValidationGreedy) {
   for (std::size_t position = 1; position < order.size(); ++position) {
    const auto next = order[position];
@@ -265,26 +274,14 @@ TrainingSelection select_training_artifact(std::span<const TrainingSelectionCand
    auto [path, summary, metric, admission] = produce(trial, false);
    if (metric > *selected.artifact.selection_metric) {
     accepted = std::move(trial);
-    selected.artifact.path = std::move(path);
-    selected.validation = std::move(summary);
-    selected.artifact.selection_metric = metric;
-    selected.artifact.weights = EvaluatedWeights::Soup;
-    selected.artifact.content = admission->content();
-    selected.artifact.sha256 = admission->sha256();
-    selected_admission = std::move(admission);
+    accept_trial(std::move(path), std::move(summary), metric, std::move(admission));
    } else
     trials.reject(path);
   }
  } else if (policy == TrainFinalPolicy::Uniform || policy == TrainFinalPolicy::Explicit) {
   accepted = order;
   auto [path, summary, metric, admission] = produce(accepted, policy == TrainFinalPolicy::Explicit);
-  selected.artifact.path = std::move(path);
-  selected.validation = std::move(summary);
-  selected.artifact.selection_metric = metric;
-  selected.artifact.weights = EvaluatedWeights::Soup;
-  selected.artifact.content = admission->content();
-  selected.artifact.sha256 = admission->sha256();
-  selected_admission = std::move(admission);
+  accept_trial(std::move(path), std::move(summary), metric, std::move(admission));
  }
  selected.artifact.evaluation = selected.validation;
  double total = 0;

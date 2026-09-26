@@ -44,15 +44,14 @@ InferenceLanes::InferenceLanes(int device, std::size_t capacity) : state_(std::m
    }
   });
  } catch (...) {
-  if (Close() != runtime::kRuntimeSuccess) {
-   auto lease = std::move(state_->lease);
-   std::move(lease).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(state_)), cudaErrorUnknown);
-  }
+  retire();
   throw;
  }
 }
-InferenceLanes::~InferenceLanes() {
+InferenceLanes::~InferenceLanes() { retire(); }
+void InferenceLanes::retire() noexcept {
  if (Close() != runtime::kRuntimeSuccess) {
+  // CLEANUP-IGNORE: Install already owns shared CUDA custody; this lease belongs to lane streams, not validation sessions.
   auto lease = std::move(state_->lease);
   std::move(lease).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(state_)), cudaErrorUnknown);
  }

@@ -1,4 +1,6 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include <cstdint>
 #include "training_schedule.h"
 #include "training_epoch_policy.h"
@@ -26,8 +28,8 @@ struct TrainingContinuationValues {
  double grad_scaler_scale = 1.0;
  int64_t grad_scaler_growth_tracker = 0;
  int64_t ema_completed_updates = 0;
- [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string training_attempt_id{};
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string training_original_descriptor{};
+ MMLTK_MAX_BYTES(64) std::string training_attempt_id {};
+ MMLTK_MAX_PATH_BYTES std::string training_original_descriptor{};
  TrainingScheduleState schedule{};
  TrainingEpochPolicyState epoch_policy{};
  TrainingDataContinuation data{};

@@ -1,4 +1,6 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -30,8 +32,8 @@ struct ModelClassSlot final {
 MMLTK_REFLECT_FIELDS(ModelClassSlot)
 struct ClassLayoutProvenance final {
  ClassLayoutOrigin origin = ClassLayoutOrigin::Unresolved;
- [[= mmltk::frameworks::reflection::MaxBytes{1024U}]] std::string producer;
- [[= mmltk::frameworks::reflection::MaxBytes{64U}]] std::string artifact_sha256;
+ MMLTK_MAX_BYTES(1024U) std::string producer;
+ MMLTK_MAX_BYTES(64U) std::string artifact_sha256;
  auto operator<=>(const ClassLayoutProvenance&) const = default;
 };
 MMLTK_REFLECT_FIELDS(ClassLayoutProvenance)
@@ -40,7 +42,7 @@ struct ModelClassLayout final {
  mmltk::backend::data::catalog::OrderedClassCatalog foreground;
  // Producer names without a slot schema are evidence only, never labels.
  mmltk::backend::data::catalog::OrderedClassCatalog class_name_evidence;
- [[= mmltk::frameworks::reflection::MaxItems{kMaximumClassOutputSlots}]] std::vector<ModelClassSlot> slots;
+ MMLTK_MAX_ITEMS(kMaximumClassOutputSlots) std::vector<ModelClassSlot> slots;
  ClassScoreEncoding scores = ClassScoreEncoding::SigmoidLogits;
  NoObjectEncoding no_object = NoObjectEncoding::Unspecified;
  ClassLayoutProvenance provenance;
@@ -61,9 +63,9 @@ struct ModelClassLayoutSummary final {
 MMLTK_REFLECT_FIELDS(ModelClassLayoutSummary)
 struct ModelClassDescriptor final {
  std::uint32_t version = 1U;
- [[= mmltk::frameworks::reflection::MaxBytes{64U}]] std::string artifact_sha256;
+ MMLTK_MAX_BYTES(64U) std::string artifact_sha256;
  ModelClassLayout layout;
- [[= mmltk::frameworks::reflection::MaxItems{3U}]] std::vector<RfdetrNamedOutputRole> output_roles{};
+ MMLTK_MAX_ITEMS(3U) std::vector<RfdetrNamedOutputRole> output_roles {};
 };
 MMLTK_REFLECT_FIELDS(ModelClassDescriptor)
 }  // namespace mmltk::backend::models::rfdetr

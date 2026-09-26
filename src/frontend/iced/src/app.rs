@@ -809,6 +809,23 @@ mod tests {
     use super::*;
     use crate::generated::PresentationSourceKind;
 
+    fn annotation_pointer(pressed: bool) -> crate::view::router::Message {
+        crate::view::router::Message::Annotation(crate::view::annotation::Message::Workspace(
+            crate::view::workspace::Message::Gesture(crate::presentation_surface::SurfaceGesture {
+                kind: crate::presentation_surface::SurfaceGestureKind::Pointer,
+                sample: crate::presentation_surface::SurfaceSample {
+                    width: 640,
+                    height: 480,
+                    x: 20,
+                    y: 30,
+                    content_x: 20.0,
+                    content_y: 30.0,
+                    pressed,
+                },
+            }),
+        ))
+    }
+
     fn install_default_bootstrap(app: &mut App) {
         let snapshots = crate::generated::application_snapshot_defaults()
             .unwrap()
@@ -1542,22 +1559,7 @@ mod tests {
             crate::view_model::test_support::visual_frame(PresentationSourceKind::Annotation, 1);
         let (connection, mut capture) = Connection::test_channel();
         app.connection = Some(connection);
-        drop(app.on_workspace(crate::view::router::Message::Annotation(
-            AnnotationMessage::Workspace(crate::view::workspace::Message::Gesture(
-                crate::presentation_surface::SurfaceGesture {
-                    kind: crate::presentation_surface::SurfaceGestureKind::Pointer,
-                    sample: crate::presentation_surface::SurfaceSample {
-                        width: 640,
-                        height: 480,
-                        x: 20,
-                        y: 30,
-                        content_x: 20.0,
-                        content_y: 30.0,
-                        pressed: true,
-                    },
-                },
-            )),
-        )));
+        drop(app.on_workspace(annotation_pointer(true)));
         let captured_revision = app.interaction_revision;
         app.model.report_error(
             crate::view_model::notices::Origin::Transport,
@@ -1662,22 +1664,7 @@ mod tests {
             UiError::invalid("invalid prediction field"),
         );
         app.model.notices.dismiss_all();
-        drop(app.on_workspace(crate::view::router::Message::Annotation(
-            crate::view::annotation::Message::Workspace(crate::view::workspace::Message::Gesture(
-                crate::presentation_surface::SurfaceGesture {
-                    kind: crate::presentation_surface::SurfaceGestureKind::Pointer,
-                    sample: crate::presentation_surface::SurfaceSample {
-                        width: 640,
-                        height: 480,
-                        x: 20,
-                        y: 30,
-                        content_x: 20.0,
-                        content_y: 30.0,
-                        pressed: false,
-                    },
-                },
-            )),
-        )));
+        drop(app.on_workspace(annotation_pointer(false)));
         drop(app.on_workspace(crate::view::router::Message::Navigation(
             crate::view::navigation::Message::PageSelected(FeatureId::Predict),
         )));

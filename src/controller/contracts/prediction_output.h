@@ -1,4 +1,6 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <cstdint>
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
@@ -11,16 +13,16 @@ struct PredictionOutputSettings final {
  bool single_enabled = true;
  bool compiled_enabled = true;
  PredictionCompiledSampling compiled_mode = PredictionCompiledSampling::Percent;
- [[= mmltk::frameworks::reflection::Minimum<unsigned>{1U}]][[= mmltk::frameworks::reflection::Maximum<unsigned>{100U}]] unsigned compiled_percent = 10U;
- [[= mmltk::frameworks::reflection::Minimum<std::uint64_t>{1U}]] std::uint64_t compiled_total = 6U;
+ MMLTK_MINIMUM(unsigned, 1U) MMLTK_MAXIMUM(unsigned, 100U) unsigned compiled_percent = 10U;
+ MMLTK_MINIMUM(std::uint64_t, 1U) std::uint64_t compiled_total = 6U;
  bool video_enabled = true;
  PredictionVideoSaving video_mode = PredictionVideoSaving::Full;
- [[= mmltk::frameworks::reflection::Minimum<std::uint64_t>{1U}]] std::uint64_t video_samples = 6U;
+ MMLTK_MINIMUM(std::uint64_t, 1U) std::uint64_t video_samples = 6U;
  bool operator==(const PredictionOutputSettings&) const = default;
 };
 struct PredictionRunPreview final {
  bool labels = true, boxes = true, masks = true;
- [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float confidence_threshold = 0.25F;
+ MMLTK_MINIMUM(float, 0.0F) MMLTK_MAXIMUM(float, 1.0F) MMLTK_FINITE float confidence_threshold = 0.25F;
  bool operator==(const PredictionRunPreview&) const = default;
 };
 MMLTK_REFLECT_FIELDS(PredictionOutputSettings)

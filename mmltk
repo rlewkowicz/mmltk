@@ -2537,7 +2537,7 @@ print_test_suites() {
         '  headless-compositor  Verify the NVIDIA headless Wayland compositor and protocols' \
         '  headless-compositor-tool  Headless session ownership and failure-handling fixture suite' \
         '  browser-app  Iced client protocol, state, and transport unit suite' \
-        '  cleanup-tool  Cleanup profile configuration and report fixture suite' \
+        '  cleanup-tool  Cleanup, declaration classification, and formatter fixture suite' \
         '  log-query-tool  Runtime log parser, query, correlation, and output fixture suite' \
         '  core    Core dataset/runtime/compiler Catch2 suite' \
         '  gui     Unavailable in the native Catch2 suite' \
@@ -2545,12 +2545,13 @@ print_test_suites() {
         '  rfdetr  RF-DETR native/model Catch2 suite' \
         '  rfdetr-profile  Opt-in RF-DETR training profile runner' \
         '  build   Build every available native release test target without running tests' \
-        '  all     Build native targets; run ordinary native, browser-app, and log-query suites' \
+        '  all     Build native targets; run ordinary native, browser-app, cleanup-tool, and log-query suites' \
         '' \
         'Use: ./mmltk --test <suite> [test options] [-- <Catch2 args...>]' \
         'For browser-app, arguments after -- are Cargo test arguments.' \
         '  Prefix --js-test-name-pattern <pattern> to select JavaScript cases, or' \
         '  --rust-package <package> to run one Rust package without JavaScript.' \
+        'For cleanup-tool, use -- --test-name-pattern PATTERN to rerun selected JavaScript cases.' \
         'For log-query-tool, arguments after -- select Class.test_method cases.' \
         'For headless-compositor, arguments after -- run a command in the private compositor.' \
         'For cuda-vulkan, arguments after -- are width height allocation-pairs transfers validation context-mode memory-owner process-mode; use -- --help.' \
@@ -2946,6 +2947,49 @@ run_nvidia_payload_diagnostic() {
         --entrypoint python3 "${diagnostic_image_id}" /diagnostic/report.py "$@"
 }
 
+run_declaration_tool() {
+    local operation="$1"
+    shift
+    local script=/workspace/tools/generate_cleanup_json.mjs
+    local -a arguments=(--raw-cpd)
+    if [[ "${operation}" == "format" ]]; then
+        script=/workspace/tools/format_declarations.mjs
+        arguments=()
+    fi
+    arguments+=("$@")
+    local command
+    printf -v command '%q ' node "${script}" "${arguments[@]}"
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    ensure_build_image
+    local status=0
+    run_owned_toolchain_command "${cleanup_report_container_name}" "set -euo pipefail; ${command}" || status=$?
+    release_mutation_locks
+    return "${status}"
+}
+
+run_cleanup_tool_tests() {
+    local -a test_filters=()
+    if (($#)); then
+        [[ "$#" == "2" && "$1" == "--test-name-pattern" && -n "$2" ]] ||
+            die "cleanup-tool accepts only --test-name-pattern PATTERN"
+        test_filters=(--test-name-pattern "$2")
+    fi
+    local command
+    printf -v command '%q ' node --test "${test_filters[@]}" \
+        /workspace/tools/tests/generate_cleanup_json.test.mjs /workspace/tools/tests/format_declarations.test.mjs
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    ensure_build_image
+    if (( ! gui_diagnostics_quiet )); then log "running cleanup and declaration tooling fixture tests"; fi
+    local status=0
+    run_owned_toolchain_command "${test_run_container_name}" "set -euo pipefail; ${command}" || status=$?
+    release_mutation_locks
+    return "${status}"
+}
+
 run_cleanup_report() {
     local profile="$1"
     local -a selectors=()
@@ -3328,7 +3372,6 @@ run_tests() {
         return "${browser_status}"
     fi
     if [[ "${suite}" == "cleanup-tool" ]]; then
-        (($# == 0)) || die "--test cleanup-tool does not accept additional arguments"
         (( ! test_config_explicit )) ||
             die "--test cleanup-tool does not accept --config"
         [[ -z "${test_executable}" ]] ||
@@ -3337,16 +3380,8 @@ run_tests() {
             die "--test cleanup-tool does not accept --gdb or --gdb-command"
         ((${#test_environment[@]} == 0)) ||
             die "--test cleanup-tool does not accept --env"
-        acquire_mutation_locks
-        ensure_docker
-        prepare_cache_layout
-        ensure_build_image
-        if (( ! gui_diagnostics_quiet )); then log "running cleanup tooling fixture tests"; fi
-        run_owned_toolchain_command "${test_run_container_name}" \
-            'set -euo pipefail
-             node --test /workspace/tools/tests/generate_cleanup_json.test.mjs'
-        release_mutation_locks
-        return 0
+        run_cleanup_tool_tests "$@"
+        return $?
     fi
     if [[ "${suite}" == "log-query-tool" ]]; then
         (( ! test_config_explicit )) ||
@@ -3668,6 +3703,9 @@ run_tests() {
         local browser_status=0
         run_browser_app_tests browser_status
         if (( first_failure == 0 )); then first_failure="${browser_status}"; fi
+        local cleanup_tool_status=0
+        run_cleanup_tool_tests || cleanup_tool_status=$?
+        if (( first_failure == 0 )); then first_failure="${cleanup_tool_status}"; fi
         local log_query_status=0
         if (( ! gui_diagnostics_quiet )); then log "running log query tooling fixture tests"; fi
         run_log_tool test || log_query_status=$?
@@ -3830,6 +3868,9 @@ tidy_mode=0
 tidy_third_party=0
 prepare_gui_container_mode=0
 test_mode=0
+declaration_tool_mode=0
+declaration_tool_operation=""
+declaration_tool_args=()
 cleanup_report_mode=0
 cleanup_report_profile=""
 diagnose_io_mode=0
@@ -3930,6 +3971,12 @@ if ((${#passthrough_args[@]} > 0)); then
             die "--diagnose-io requires exactly one compiled-file path"
         diagnose_io_path="${passthrough_args[1]}"
         passthrough_args=()
+    elif [[ "${passthrough_args[0]}" == "--raw-cpd" || "${passthrough_args[0]}" == "--format-declarations" ]]; then
+        declaration_tool_mode=1
+        declaration_tool_operation=raw
+        [[ "${passthrough_args[0]}" != "--format-declarations" ]] || declaration_tool_operation=format
+        declaration_tool_args=("${passthrough_args[@]:1}")
+        passthrough_args=()
     elif [[ "${passthrough_args[0]}" == "--cleanup-report" ]]; then
         cleanup_report_mode=1
         ((${#passthrough_args[@]} == 2)) ||
@@ -3970,6 +4017,8 @@ if (( ! cleanup_report_mode )); then
 fi
 
 for arg in "${passthrough_args[@]}"; do
+    [[ "${arg}" != "--raw-cpd" && "${arg}" != "--format-declarations" ]] ||
+        die "--raw-cpd and --format-declarations must be standalone operations"
     [[ "${arg}" != "--logs" ]] ||
         die "--logs must be the standalone operation; use './mmltk --logs --help'"
     [[ "${arg}" != "--diagnose-gpu-environment" ]] ||
@@ -4059,8 +4108,8 @@ if (( test_mode )) && [[ "${test_suite}" == "tsan" ]] && (( build_jobs > 8 )); t
 fi
 
 if (( build_mode + build_gui_mode + generate_protocol_mode + generate_application_bindings_mode + export_shiftlut_mode +
-      update_gui_lock_mode + update_firefox_lock_mode + tidy_mode + test_mode + cleanup_report_mode + diagnose_io_mode + diagnose_nvidia_mode + diagnose_gpu_mode > 1 ||
-      (build_mode || tidy_mode || test_mode || cleanup_report_mode || diagnose_io_mode || diagnose_nvidia_mode || diagnose_gpu_mode || export_shiftlut_mode || update_firefox_lock_mode) && gui_mode )); then
+      update_gui_lock_mode + update_firefox_lock_mode + tidy_mode + test_mode + cleanup_report_mode + declaration_tool_mode + diagnose_io_mode + diagnose_nvidia_mode + diagnose_gpu_mode > 1 ||
+      (build_mode || tidy_mode || test_mode || cleanup_report_mode || declaration_tool_mode || diagnose_io_mode || diagnose_nvidia_mode || diagnose_gpu_mode || export_shiftlut_mode || update_firefox_lock_mode) && gui_mode )); then
     die "--build, --build-gui, --generate-protocol, --generate-application-bindings, --export-shiftlut, --update-gui-lock, --update-firefox-lock, --test, --tidy, --cleanup-report, --diagnose-io, --diagnose-nvidia-payload, and --diagnose-gpu-environment are standalone"
 fi
 
@@ -4099,6 +4148,12 @@ fi
 if (( test_mode )); then
     invocation_mode="test"
     run_tests "${test_suite}" "${test_args[@]}"
+    exit $?
+fi
+
+if (( declaration_tool_mode )); then
+    invocation_mode="declaration-${declaration_tool_operation}"
+    run_declaration_tool "${declaration_tool_operation}" "${declaration_tool_args[@]}"
     exit $?
 fi
 

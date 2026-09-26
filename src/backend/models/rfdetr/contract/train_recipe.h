@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <array>
 #include <concepts>
 #include <cstddef>
@@ -50,30 +51,24 @@ struct TrainRecipeCatalog;
 // Declaration order is the persisted override-bit order for both recipe scopes.
 struct TrainRecipeValues {
  constexpr bool operator==(const TrainRecipeValues&) const = default;
- [[= mmltk::frameworks::reflection::CatalogProvider<TrainRecipeCatalog>{}]] TrainOptimizerKind optimizer = TrainOptimizerKind::AdamW;
- [[= mmltk::frameworks::reflection::Minimum<double>{
-  0.0}]][[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::LearningRate>{}]] double lr = 1.0e-4;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<
+ MMLTK_CATALOG(TrainRecipeCatalog) TrainOptimizerKind optimizer = TrainOptimizerKind::AdamW;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::LearningRate) double lr = 1.0e-4;
+ MMLTK_MINIMUM(double, 0.0)
+ MMLTK_FINITE MMLTK_PRESENTATION(
   // CLEANUP-IGNORE: Each learning-rate field needs an independently addressable generated identity.
-  mmltk::frameworks::reflection::PresentationKind::LearningRate>{}]] double lr_encoder = 1.5e-4;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double lr_component_decay = 0.7;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double encoder_layer_decay = 0.8;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double momentum = 0.95;
- [[= mmltk::frameworks::reflection::Minimum<double>{
-  0.0}]][[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double weight_decay = 1.0e-4;
+  mmltk::frameworks::reflection::PresentationKind::LearningRate) double lr_encoder = 1.5e-4;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_MAXIMUM(double, 1.0) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Decay) double lr_component_decay = 0.7;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_MAXIMUM(double, 1.0) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Decay) double encoder_layer_decay = 0.8;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_MAXIMUM(double, 1.0) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Decay) double momentum = 0.95;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Decay) double weight_decay = 1.0e-4;
  // CLEANUP-IGNORE: Warmup remains a separate constrained setting rather than an indexed optimizer scalar.
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Finite{}]] double warmup_epochs = 0.0;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double warmup_momentum = 0.0;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double lr_min_factor = 0.0;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int lr_drop = 100;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_FINITE double warmup_epochs = 0.0;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_MAXIMUM(double, 1.0) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Decay) double warmup_momentum = 0.0;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_MAXIMUM(double, 1.0) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Decay) double lr_min_factor = 0.0;
+ MMLTK_MINIMUM(int, 0) int lr_drop = 100;
  TrainLrSchedulerKind lr_scheduler = TrainLrSchedulerKind::Step;
  bool nesterov = false;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Finite{}]] double warmup_bias_lr = 0.0;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_FINITE double warmup_bias_lr = 0.0;
 };
 MMLTK_REFLECT_ENUM(TrainOptimizerKind)
 MMLTK_REFLECT_ENUM(TrainLrSchedulerKind)
@@ -163,7 +158,7 @@ public:
  constexpr bool operator==(const TrainRecipeOverrideState&) const noexcept = default;
 
 private:
- [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{kTrainRecipeOverrideBits}]] std::uint16_t mask = 0U;
+ MMLTK_MAXIMUM(std::uint16_t, kTrainRecipeOverrideBits) std::uint16_t mask = 0U;
  friend struct mmltk::frameworks::reflection::catalog_provider_relation<TrainRecipeCatalog>;
 };
 struct TrainRecipeSettings final : TrainRecipeValues {

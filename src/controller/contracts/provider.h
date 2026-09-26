@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -32,12 +33,12 @@ enum class ProviderGpuFamily : std::uint8_t { A100, B200, H100, H200, LSeries };
 }
 struct ProviderOffer final {
  int offer_id = 0;
- [[= mmltk::frameworks::reflection::MaxBytes{128U}]] std::string gpu_name{};
+ MMLTK_MAX_BYTES(128U) std::string gpu_name {};
  int gpu_count = 0;
  double gpu_ram_gib = 0.0;
  double hourly_price = 0.0;
  double reliability = 0.0;
- [[= mmltk::frameworks::reflection::MaxBytes{128U}]] std::string location{};
+ MMLTK_MAX_BYTES(128U) std::string location {};
  ProviderGpuFamily family = ProviderGpuFamily::A100;
  [[nodiscard]] bool valid() const noexcept {
   return offer_id > 0 && gpu_count > 0 && gpu_name.size() <= 128U && location.size() <= 128U && std::isfinite(gpu_ram_gib) && gpu_ram_gib >= 0.0 && std::isfinite(hourly_price) &&
@@ -48,9 +49,9 @@ struct ProviderOffer final {
 struct ProviderPreferences final {
  int minimum_gpus = 4;
  std::uint32_t result_limit = 2U;
- [[= mmltk::frameworks::reflection::MaxItems{kProviderFamilyCapacity}]] std::vector<ProviderGpuFamily> families{};
- [[= mmltk::frameworks::reflection::MaxBytes{kProviderTextCapacity}]] std::string image{};
- [[= mmltk::frameworks::reflection::MaxBytes{kProviderTextCapacity}]] std::string template_text{};
+ MMLTK_MAX_ITEMS(kProviderFamilyCapacity) std::vector<ProviderGpuFamily> families {};
+ MMLTK_MAX_BYTES(kProviderTextCapacity) std::string image {};
+ MMLTK_MAX_BYTES(kProviderTextCapacity) std::string template_text {};
  [[nodiscard]] bool valid() const noexcept {
   if (minimum_gpus <= 0 || result_limit == 0U || result_limit > kProviderOfferCapacity || families.empty() || image.empty() || image.size() > kProviderTextCapacity ||
       template_text.size() > kProviderTextCapacity) {
@@ -105,8 +106,8 @@ enum class ProviderReconciliationDisposition : std::uint8_t { Applied, NotApplie
 // domain outcome, while process infrastructure failures remain distinct.
 struct ProviderQueryResult final {
  ProviderQueryOutcome outcome = ProviderQueryOutcome::Failed;
- [[= mmltk::frameworks::reflection::MaxItems{kProviderOfferCapacity}]] std::vector<ProviderOffer> offers{};
- [[= mmltk::frameworks::reflection::MaxBytes{kProviderDetailCapacity}]] std::string detail{};
+ MMLTK_MAX_ITEMS(kProviderOfferCapacity) std::vector<ProviderOffer> offers {};
+ MMLTK_MAX_BYTES(kProviderDetailCapacity) std::string detail {};
  [[nodiscard]] bool valid() const noexcept {
   if (offers.size() > kProviderOfferCapacity || detail.size() > kProviderDetailCapacity) return false;
   switch (outcome) {
@@ -136,7 +137,7 @@ struct ProviderEffectResult final {
  ProviderReconciliationDisposition disposition = ProviderReconciliationDisposition::Inconclusive;
  int instance_id = 0;
  bool cancelled = false;
- [[= mmltk::frameworks::reflection::MaxBytes{kProviderDetailCapacity}]] std::string detail{};
+ MMLTK_MAX_BYTES(kProviderDetailCapacity) std::string detail {};
  [[nodiscard]] bool valid() const noexcept {
   if (instance_id < 0 || detail.size() > kProviderDetailCapacity) return false;
   switch (disposition) {
@@ -157,9 +158,9 @@ struct ProviderOfferState final {
  ProviderQueryOutcome outcome = ProviderQueryOutcome::Idle;
  std::uint64_t revision = 0U;
  bool cancellation_requested = false;
- [[= mmltk::frameworks::reflection::MaxItems{kProviderOfferCapacity}]] std::vector<ProviderOffer> offers{};
+ MMLTK_MAX_ITEMS(kProviderOfferCapacity) std::vector<ProviderOffer> offers {};
  std::optional<ProviderOfferIdentity> selected{};
- [[= mmltk::frameworks::reflection::MaxBytes{kProviderDetailCapacity}]] std::string detail{};
+ MMLTK_MAX_BYTES(kProviderDetailCapacity) std::string detail {};
  bool operator==(const ProviderOfferState&) const = default;
 };
 struct RemoteSessionState final {
@@ -168,7 +169,7 @@ struct RemoteSessionState final {
  std::uint64_t revision = 0U;
  int instance_id = 0;
  bool reconciliation_pending = false;
- [[= mmltk::frameworks::reflection::MaxBytes{kProviderDetailCapacity}]] std::string detail{};
+ MMLTK_MAX_BYTES(kProviderDetailCapacity) std::string detail {};
  // CLEANUP-IGNORE: Equality closes the canonical provider state declaration before its reflected inventory.
  bool operator==(const RemoteSessionState&) const = default;
 };

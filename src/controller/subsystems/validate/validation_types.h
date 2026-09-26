@@ -1,4 +1,6 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include <array>
 #include "src/controller/contracts/validation_display.h"
 #include <compare>
@@ -26,7 +28,7 @@ struct ValidationLabel final {
  std::uint32_t category = 0U;
  bool ground_truth = false;
  float confidence = 0.0F;
- [[= mmltk::frameworks::reflection::MaxBytes{256U}]] std::string name;
+ MMLTK_MAX_BYTES(256U) std::string name;
 };
 struct ValidationSampleMetadata final {
  ValidationSampleIdentity identity{};
@@ -35,7 +37,7 @@ struct ValidationSampleMetadata final {
  VisualExtent pixel_extent{};
  VisualExtent source_extent{};
  VisualRegion content{};
- [[= mmltk::frameworks::reflection::MaxItems{2U * contracts::kAnnotationObjectCapacity}]] std::vector<ValidationLabel> labels;
+ MMLTK_MAX_ITEMS(2U * contracts::kAnnotationObjectCapacity) std::vector<ValidationLabel> labels;
 };
 struct ValidationOverlaySelection final {
  std::uint64_t revision = 0U;

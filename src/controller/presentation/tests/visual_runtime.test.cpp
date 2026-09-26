@@ -472,6 +472,7 @@ TEST_CASE("staged cancellation keeps incumbent pixels visible until replacement 
  retained = {};
  owner.StopAndWait();
 }
+// CLEANUP-IGNORE: This fixture combines producer completion and followup cancellation; the other test combines output wakeups and input preservation with separate event receipts.
 TEST_CASE("staged completion wins late stop before promotion and publishes its exact borrowed product") {
  const bool producer_claims_completion = GENERATE(false, true);
  const bool cancel_followup = GENERATE(false, true);

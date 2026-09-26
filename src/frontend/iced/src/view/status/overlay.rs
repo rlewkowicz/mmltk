@@ -351,6 +351,19 @@ fn activation(event: &Event) -> bool {
             | Event::Touch(iced::touch::Event::FingerPressed { .. })
     )
 }
+fn traverse_status(event: &Event, shell: &mut Shell<'_, AppMessage>) -> bool {
+    if let Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+        modifiers,
+        ..
+    }) = event
+    {
+        shell.publish(AppMessage::Status(Message::Traverse(modifiers.shift())));
+        shell.capture_event();
+        return true;
+    }
+    false
+}
 impl Widget<AppMessage, Theme, iced::Renderer> for Host<'_> {
     fn tag(&self) -> widget::tree::Tag {
         widget::tree::Tag::of::<PointerRegion>()
@@ -416,21 +429,12 @@ impl Widget<AppMessage, Theme, iced::Renderer> for Host<'_> {
             shell,
             viewport,
         );
-        if !shell.is_event_captured()
-            && matches!(
-                event,
-                Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
-                    ..
-                })
-            )
-        {
-            if let Event::Keyboard(iced::keyboard::Event::KeyPressed { modifiers, .. }) = event {
-                shell.publish(AppMessage::Status(Message::Traverse(modifiers.shift())));
-                shell.capture_event();
-            }
+        if !shell.is_event_captured() {
+            // CLEANUP-IGNORE: CPD joins this Tab action to required Iced draw/mouse methods; DetailText publishes a distinct focus observation.
+            traverse_status(event, shell);
         }
     }
+    // CLEANUP-IGNORE: Required Iced draw and mouse methods forward this host's child; DetailText has a distinct message and state owner.
     fn draw(
         &self,
         tree: &widget::Tree,
@@ -451,6 +455,7 @@ impl Widget<AppMessage, Theme, iced::Renderer> for Host<'_> {
             viewport,
         );
     }
+    // CLEANUP-IGNORE: Required Iced mouse dispatch forwards the host child, while other wrappers map their own layouts.
     fn mouse_interaction(
         &self,
         tree: &widget::Tree,
@@ -462,6 +467,7 @@ impl Widget<AppMessage, Theme, iced::Renderer> for Host<'_> {
         self.content.as_widget().mouse_interaction(
             &tree.children[0],
             layout,
+            // CLEANUP-IGNORE: The fragment ends a child call and starts an unrelated overlay signature; panel construction differs by owner.
             cursor,
             viewport,
             renderer,
@@ -585,20 +591,8 @@ impl overlay::Overlay<AppMessage, Theme, iced::Renderer> for Popup<'_, '_> {
             shell.capture_event();
             return;
         }
-        if self.component.focus.is_some()
-            && matches!(
-                event,
-                Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
-                    ..
-                })
-            )
-        {
-            if let Event::Keyboard(iced::keyboard::Event::KeyPressed { modifiers, .. }) = event {
-                shell.publish(AppMessage::Status(Message::Traverse(modifiers.shift())));
-                shell.capture_event();
-                return;
-            }
+        if self.component.focus.is_some() && traverse_status(event, shell) {
+            return;
         }
         self.content.as_widget_mut().update(
             self.tree,
@@ -666,8 +660,10 @@ impl Widget<Message, Theme, iced::Renderer> for DetailText<'_> {
         widget::tree::State::new(DetailFocus::default())
     }
     fn diff(&mut self, tree: &mut widget::Tree) {
+        // CLEANUP-IGNORE: DetailText owns one child and Host owns two; following layout/operate signatures are required by Iced.
         tree.diff_children(std::slice::from_mut(&mut self.content));
     }
+    // CLEANUP-IGNORE: Iced requires explicit child layout and operation forwarding for this focus-observing widget.
     fn layout(
         &mut self,
         tree: &mut widget::Tree,
@@ -686,9 +682,11 @@ impl Widget<Message, Theme, iced::Renderer> for DetailText<'_> {
         operation: &mut dyn widget::Operation,
     ) {
         self.content
+            // CLEANUP-IGNORE: Required operate forwarding borders an update signature; text selection and button animation are different behaviors.
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
     }
+    // CLEANUP-IGNORE: Iced fixes this update signature; DetailText's selection and focus behavior differs from StatusText.
     fn update(
         &mut self,
         tree: &mut widget::Tree,
@@ -721,6 +719,7 @@ impl Widget<Message, Theme, iced::Renderer> for DetailText<'_> {
             shell.publish(Message::Focused(Control::Detail(self.id), focus.focused));
         }
     }
+    // CLEANUP-IGNORE: Iced fixes this draw signature and child rendering call; message and retained state belong to DetailText.
     fn draw(
         &self,
         tree: &widget::Tree,

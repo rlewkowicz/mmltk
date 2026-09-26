@@ -1,4 +1,7 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <sys/types.h>
 #include <cstdint>
 #include <cstddef>
@@ -162,7 +165,7 @@ struct PresentationCapabilityChanged final {
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] PresentationFailed final {
  PresentationState snapshot{};
- [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
+ MMLTK_MAX_BYTES(kVisualFailureByteCapacity) std::string detail;
 };
 class PresentationSystem final {
 public:

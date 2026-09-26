@@ -421,20 +421,7 @@ impl TrainingFixture {
                 evaluatedweights: EvaluatedWeights::Ema,
                 // Layout is irrelevant to retained chart projection; no synthetic
                 // class identity is admitted to an actual native operation.
-                classlayout: ModelClassLayout {
-                    version: 1,
-                    foreground: OrderedClassCatalog { names: Vec::new() },
-                    classnameevidence: OrderedClassCatalog { names: Vec::new() },
-                    slots: Vec::new(),
-                    scores: ClassScoreEncoding::SigmoidLogits,
-                    noobject: NoObjectEncoding::AllNegative,
-                    provenance: ClassLayoutProvenance {
-                        origin: ClassLayoutOrigin::Unresolved,
-                        producer: "fixture".into(),
-                        artifactsha256: String::new(),
-                    },
-                    supervisioninforegroundorder: false,
-                },
+                classlayout: super::training_fixture::unresolved_class_layout(),
                 resumeepoch: -1,
                 resumeoptimizerstep: 0,
             }),
@@ -464,25 +451,12 @@ impl TrainingFixture {
         })
     }
     fn source(stage: u8) -> crate::generated::TrainingMetricSource {
-        use crate::generated::*;
         let modelid = match stage {
             0 | 4 => 1,
             1 | 2 | 5 | 6 | 7 => 2,
             _ => 0,
         };
-        TrainingMetricSource {
-            scope: if modelid == 0 {
-                TrainingRecordScope::SynchronizedSession
-            } else {
-                TrainingRecordScope::Model
-            },
-            modelid,
-            weights: if modelid == 0 {
-                EvaluatedWeights::Ordinary
-            } else {
-                EvaluatedWeights::Ema
-            },
-        }
+        super::training_fixture::metric_source(modelid)
     }
     fn source_control(&self, stage: u8) -> Option<String> {
         if matches!(stage, 2 | 6 | 7 | 9) {
@@ -1066,6 +1040,7 @@ mod tests {
             .unwrap()
             .sources
             .observations = vec![sample];
+        // CLEANUP-IGNORE: A single generated request read supplies this fixture; output-view tests read the same input for different assertions.
         let configuration = model
             .settings_snapshot
             .as_ref()

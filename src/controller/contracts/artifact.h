@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -24,13 +25,13 @@ inline constexpr std::size_t kArtifactUiStateByteBudget = 64U * 1024U;
 inline constexpr std::size_t kArtifactProgressTextCapacity = mmltk::backend::data::kDatasetCompileProgressTextCapacity;
 [[nodiscard]] inline std::string bounded_artifact_detail(const std::string_view value) { return std::string{value.substr(0U, kArtifactErrorCapacity)}; }
 struct ArtifactSplitFact final {
- [[= mmltk::frameworks::reflection::MaxBytes{kArtifactPathCapacity}]] std::string path;
+ MMLTK_MAX_BYTES(kArtifactPathCapacity) std::string path;
  std::uint32_t image_count = 0U;
  std::uint32_t width = 0U;
  std::uint32_t height = 0U;
  std::uint32_t channels = 0U;
  std::uint32_t max_instances_per_image = 0U;
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::data::catalog::kClassCatalogCapacity}]] std::vector<mmltk::backend::data::catalog::ClassName> class_names;
+ MMLTK_MAX_ITEMS(mmltk::backend::data::catalog::kClassCatalogCapacity) std::vector<mmltk::backend::data::catalog::ClassName> class_names;
  [[nodiscard]] bool valid() const noexcept {
   if (path.empty() || path.size() > kArtifactPathCapacity || image_count == 0U || width == 0U || height == 0U || channels == 0U || class_names.empty() ||
       class_names.size() > mmltk::backend::data::catalog::kClassCatalogCapacity)
@@ -47,8 +48,8 @@ struct ArtifactSplitFact final {
 // inspection stay in the service request rather than becoming browser input.
 struct ArtifactInspection final {
  bool compatible = false;
- [[= mmltk::frameworks::reflection::MaxItems{kArtifactSplitCapacity}]] std::vector<ArtifactSplitFact> splits;
- [[= mmltk::frameworks::reflection::MaxBytes{kArtifactErrorCapacity}]] std::string detail;
+ MMLTK_MAX_ITEMS(kArtifactSplitCapacity) std::vector<ArtifactSplitFact> splits;
+ MMLTK_MAX_BYTES(kArtifactErrorCapacity) std::string detail;
  [[nodiscard]] bool available() const noexcept { return compatible && !splits.empty() && detail.empty(); }
  [[nodiscard]] bool valid() const noexcept {
   if (detail.size() > kArtifactErrorCapacity || splits.size() > kArtifactSplitCapacity) return false;
@@ -61,7 +62,7 @@ struct ArtifactInspection final {
 using ArtifactCompilePhase = mmltk::backend::data::DatasetCompilePhase;
 struct ArtifactProgress final {
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::StageOrStatus}]] ArtifactCompilePhase phase = ArtifactCompilePhase::Idle;
- [[= reflection::ProgressField{reflection::ProgressFieldSemantic::ActivityOrDetail}]][[= mmltk::frameworks::reflection::MaxBytes{kArtifactProgressTextCapacity}]] std::string activity;
+ [[= reflection::ProgressField{reflection::ProgressFieldSemantic::ActivityOrDetail}]] MMLTK_MAX_BYTES(kArtifactProgressTextCapacity) std::string activity;
  // CLEANUP-IGNORE: Artifact progress fields carry compile-specific semantics and generated identities.
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::Completed}]] std::uint64_t completed = 0U;
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::Total}]] std::uint64_t total = 0U;
@@ -76,7 +77,7 @@ struct ArtifactProgress final {
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::Dropped}]] std::uint64_t dropped_instances = 0U;
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::Quarantined}]] std::uint64_t quarantined_images = 0U;
  mmltk::backend::data::DatasetCompileTracks tracks{};
- [[= mmltk::frameworks::reflection::MaxItems{5U}]] std::vector<mmltk::backend::data::BenchmarkSourceProgress> sources{};
+ MMLTK_MAX_ITEMS(5U) std::vector<mmltk::backend::data::BenchmarkSourceProgress> sources {};
  [[nodiscard]] bool valid() const noexcept {
   if (!tracks.valid() || sources.size() > 5U) return false;
   for (const auto& source : sources)
@@ -101,8 +102,8 @@ static_assert(terminal_presentation::complete(kArtifactTerminalPresentations));
 [[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<ArtifactTerminalOutcome>) { return kArtifactTerminalPresentations; }
 struct ArtifactTerminal final {
  ArtifactTerminalOutcome outcome = ArtifactTerminalOutcome::Idle;
- [[= mmltk::frameworks::reflection::MaxBytes{kArtifactPathCapacity}]] std::string artifact;
- [[= mmltk::frameworks::reflection::MaxBytes{kArtifactErrorCapacity}]] std::string detail;
+ MMLTK_MAX_BYTES(kArtifactPathCapacity) std::string artifact;
+ MMLTK_MAX_BYTES(kArtifactErrorCapacity) std::string detail;
  [[nodiscard]] bool valid() const noexcept {
   if (artifact.size() > kArtifactPathCapacity || detail.size() > kArtifactErrorCapacity) return false;
   switch (outcome) {

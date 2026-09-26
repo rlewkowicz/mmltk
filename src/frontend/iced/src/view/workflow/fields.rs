@@ -377,6 +377,7 @@ mod tests {
         retained.validation = execution;
         state.sources.execution = Some(retained);
         assert!(execution_facts(FeatureId::Train, false, &model, &settings).is_none());
+        // CLEANUP-IGNORE: This field access changes generation; the later access independently changes admitted capacity.
         model
             .workflow
             .training

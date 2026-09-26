@@ -1,4 +1,6 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -15,13 +17,13 @@ namespace mmltk::backend::data::catalog {
 inline constexpr std::size_t kClassCatalogCapacity = 256U;
 inline constexpr std::size_t kClassNameCapacity = 256U;
 struct ClassName final {
- [[= mmltk::frameworks::reflection::MaxBytes{kClassNameCapacity}]] std::string value;
+ MMLTK_MAX_BYTES(kClassNameCapacity) std::string value;
  [[nodiscard]] bool valid() const noexcept { return !value.empty() && value.size() <= kClassNameCapacity && value.find('\0') == std::string::npos; }
  auto operator<=>(const ClassName&) const = default;
 };
 MMLTK_REFLECT_FIELDS(ClassName)
 struct OrderedClassCatalog final {
- [[= mmltk::frameworks::reflection::MaxItems{kClassCatalogCapacity}]] std::vector<ClassName> names;
+ MMLTK_MAX_ITEMS(kClassCatalogCapacity) std::vector<ClassName> names;
  auto operator<=>(const OrderedClassCatalog&) const = default;
 };
 MMLTK_REFLECT_FIELDS(OrderedClassCatalog)

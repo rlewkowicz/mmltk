@@ -1,6 +1,7 @@
 #pragma once
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/image_buffer.h"
+#include "src/common/system/execution_policy.h"
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
 #include <stdexcept>
@@ -48,5 +49,9 @@ inline DeviceExecution selected_test_device(int ordinal, const mmltk::common::sy
   return selected;
  }
  throw std::runtime_error("hardware test has no permitted NUMA node with an eligible CPU");
+}
+[[nodiscard]] inline mmltk::common::system::ExecutionPolicyRequest selected_test_execution_policy(int ordinal) {
+ auto execution = selected_test_device(ordinal, mmltk::common::system::NumaTopology::Capture());
+ return {std::move(execution.placement.cpus), {}, 0, execution.placement.numa_node, -10, false};
 }
 }  // namespace mmltk::frameworks::gpu::test_support

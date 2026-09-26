@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -8,7 +9,7 @@ namespace mmltk::frameworks::gpu {
 inline constexpr std::size_t kCudaDeviceCapacity = 64U;
 struct CudaDeviceFact final {
  int ordinal = 0;
- [[= mmltk::frameworks::reflection::MaxBytes{256U}]] std::string name;
+ MMLTK_MAX_BYTES(256U) std::string name;
  std::uint64_t total_vram = 0U;
  bool operator==(const CudaDeviceFact&) const = default;
 };

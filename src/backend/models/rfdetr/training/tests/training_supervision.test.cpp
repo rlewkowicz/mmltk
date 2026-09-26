@@ -92,6 +92,11 @@ struct GpuBatchAugmenterTestAccess final {
 }  // namespace mmltk::backend::models::rfdetr::test_support
 namespace {
 namespace rfdetr = mmltk::backend::models::rfdetr;
+rfdetr::TrainingProgressDocument read_training_progress(const std::filesystem::path& directory) {
+ std::ifstream input(directory / "progress.json");
+ return mmltk::frameworks::serialization::decode_reflected_json<rfdetr::TrainingProgressDocument>(
+  nlohmann::json::parse(input).dump(), {.max_bytes = rfdetr::kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32});
+}
 rfdetr::NativeRfDetrConfig tiny_native_training_config() {
  auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
  config.resolution = 64;
@@ -1436,7 +1441,8 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
   if (epoch.val_loss) REQUIRE(std::isfinite(*epoch.val_loss));
   REQUIRE(epoch.val->bbox.available);
   const auto expected_selection = rfdetr::effective_final_policy(request.lane_configuration) == rfdetr::TrainFinalPolicy::Uniform ? rfdetr::EvaluatedWeights::Soup
-                                                                                                                           : request.use_ema ? rfdetr::EvaluatedWeights::Ema : rfdetr::EvaluatedWeights::Ordinary;
+                                  : request.use_ema                                                                               ? rfdetr::EvaluatedWeights::Ema
+                                                                                                                                  : rfdetr::EvaluatedWeights::Ordinary;
   REQUIRE(result.selected->artifact.weights == expected_selection);
   REQUIRE(result.test_summary.has_value() == !request.test_compiled_path.empty());
   const auto samples = request.output_dir / "eval_samples";
@@ -1496,9 +1502,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     failed_publication.output_dir = root / "failed-session-publication";
     std::filesystem::create_directories(failed_publication.output_dir / "session.json.staging");
     REQUIRE_THROWS(rfdetr::run_training(failed_publication));
-    std::ifstream failed_input(failed_publication.output_dir / "progress.json");
-    const auto failed_document = mmltk::frameworks::serialization::decode_reflected_json<rfdetr::TrainingProgressDocument>(
-     nlohmann::json::parse(failed_input).dump(), {.max_bytes = rfdetr::kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32});
+    const auto failed_document = read_training_progress(failed_publication.output_dir);
     CHECK(failed_document.record.progress.phase == rfdetr::TrainingPhase::Error);
     CHECK(failed_document.record.progress.full_checkpoint_path.empty());
     CHECK_FALSE(std::filesystem::exists(failed_publication.output_dir / "session.json"));
@@ -1735,9 +1739,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
    const auto previous_descriptor = no_op.output_dir / "selected.json";
    std::filesystem::create_directory(no_op.output_dir / "selected.json.staging");
    REQUIRE_THROWS(rfdetr::run_training(no_op));
-   std::ifstream input(no_op.output_dir / "progress.json");
-   const auto terminal = mmltk::frameworks::serialization::decode_reflected_json<rfdetr::TrainingProgressDocument>(
-    nlohmann::json::parse(input).dump(), {.max_bytes = rfdetr::kTrainingProgressDocumentBytes, .max_items = 24576, .max_depth = 32});
+   const auto terminal = read_training_progress(no_op.output_dir);
    CHECK(terminal.record.progress.phase == rfdetr::TrainingPhase::Error);
    CHECK(terminal.record.progress.full_checkpoint_path == resumed_mixed.checkpoint_path);
    CHECK(rfdetr::read_training_selection(previous_descriptor) == *selected_again.selected);

@@ -1,0 +1,11 @@
+namespace policy = ::mmltk::frameworks::reflection;
+struct Manual {
+ [[= ::policy::MaxBytes{/* keep rationale */ 8}]] std::string comment;
+ [[= unseen::MaxBytes{8}]] std::string unresolved;
+ [[= ::policy::MaxBytes{8}]][[= ForeignPolicy{}]] std::string composition;
+ [[= ::policy::MaxBytes{8}, ForeignPolicy{}]] std::string combined;
+ [[= ::policy::Minimum<Pair<int, float>>{1}]] int comma_type;
+#if CHOOSE_POLICY
+ [[= ::policy::MaxBytes{8}]] std::string conditional;
+#endif
+};

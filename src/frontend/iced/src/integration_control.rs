@@ -26,6 +26,7 @@ mod reporting;
 pub(crate) use reporting::metric_projection as report_metric_projection;
 pub(crate) use reporting::primary_action_draw;
 pub(crate) mod status;
+pub(crate) mod training_fixture;
 mod workflows;
 
 thread_local! {
@@ -1972,6 +1973,7 @@ impl Controller {
     }
 
     fn advance_transition(
+        // CLEANUP-IGNORE: Public advancement and its transition body take the same explicit inputs but perform different lifecycle work.
         &mut self,
         model: &ApplicationModel,
         settings: &crate::view::settings::SettingsModel,

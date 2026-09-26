@@ -1,3 +1,5 @@
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include <algorithm>
 #include <array>
 #include <catch2/catch_test_macros.hpp>
@@ -33,7 +35,7 @@ public:
  constexpr bool operator==(const OpaqueFixture&) const noexcept = default;
 
 private:
- [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{std::uint16_t{0x07ffU}}]] std::uint16_t mask = 0U;
+ MMLTK_MAXIMUM(std::uint16_t, std::uint16_t{0x07ffU}) std::uint16_t mask = 0U;
  friend struct mmltk::frameworks::reflection::catalog_provider_relation<OpaqueFixtureProvider>;
 };
 struct OpaqueFixtureRow {
@@ -46,7 +48,7 @@ struct OpaqueFixtureOwner {
 };
 struct OpaqueProjectedEnvelope {
  OpaqueFixtureOwner owner;
- [[= mmltk::frameworks::reflection::MaxBytes{128U}]][[= mmltk::frameworks::reflection::MaxItems{16U}]] mmltk::frameworks::serialization::wire::FlatValue payload;
+ MMLTK_MAX_BYTES(128U) MMLTK_MAX_ITEMS(16U) mmltk::frameworks::serialization::wire::FlatValue payload;
 };
 MMLTK_REFLECT_FIELDS(OpaqueFixture)
 MMLTK_REFLECT_FIELDS(OpaqueFixtureRow)
@@ -183,12 +185,12 @@ static_assert(!PublicRawCborFixedEncode<OpaqueFixture>);
  return result;
 }
 struct InheritedCborBase {
- [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{1}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
+ MMLTK_MINIMUM(std::int32_t, 1) MMLTK_MAXIMUM(std::int32_t, 9) std::int32_t inherited_limit = 4;
  bool operator==(const InheritedCborBase&) const = default;
 };
 struct InheritedCbor final : InheritedCborBase {
  std::uint32_t derived_count = 2U;
- [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{9U}]] std::optional<std::uint16_t> optional_count;
+ MMLTK_MAXIMUM(std::uint16_t, 9U) std::optional<std::uint16_t> optional_count;
  bool operator==(const InheritedCbor&) const = default;
 };
 struct DuplicateCborBase {
@@ -204,7 +206,7 @@ MMLTK_REFLECT_FIELDS(DuplicateCbor)
 struct ProjectedKeyEnvelope {
  InheritedCbor nested;
  std::variant<InheritedCbor> choice;
- [[= mmltk::frameworks::reflection::MaxBytes{8U}]][[= mmltk::frameworks::reflection::MaxItems{8U}]] wire::FlatValue payload;
+ MMLTK_MAX_BYTES(8U) MMLTK_MAX_ITEMS(8U) wire::FlatValue payload;
 };
 MMLTK_REFLECT_FIELDS(ProjectedKeyEnvelope)
 TEST_CASE("projected CBOR reports nested required members and expected variant keys", "[frameworks][serialization][reflection]") {
@@ -371,6 +373,63 @@ TEST_CASE("opaque named values preserve ordered admission and nested error prece
   CHECK(result.error().offset == 0U);
   CHECK(destination == before);
  }
+}
+TEST_CASE("declaration annotations preserve typed bounds through CBOR and JSON", "[frameworks][serialization][reflection][bounds]") {
+ namespace cbor = mmltk::frameworks::serialization;
+ using cbor::test::DeclarationBounds;
+ constexpr std::size_t path_limit = mmltk::frameworks::reflection::kMaximumPathBytes;
+ const auto limits = test_limits(16U * 1024U);
+ std::array<std::byte, 16U * 1024U> scratch{};
+ const auto check = [&](const DeclarationBounds& source, const bool valid) {
+  wire::ByteBuffer encoded;
+  const auto status = cbor::encode(source, encoded, limits);
+  REQUIRE(status.has_value() == valid);
+  if (valid) {
+   const auto decoded = cbor::decode<DeclarationBounds>({encoded, {}}, limits);
+   REQUIRE(decoded);
+   CHECK(*decoded == source);
+   const auto json = cbor::reflected_json(source, scratch, limits).dump();
+   CHECK(cbor::decode_reflected_json<DeclarationBounds>(json, limits) == source);
+  } else {
+   CHECK(status.error().code == wire::ErrorCode::LimitExceeded);
+   CHECK_THROWS(cbor::reflected_json(source, scratch, limits));
+  }
+ };
+ DeclarationBounds source;
+ check(source, true);
+ source.paths.emplace();
+ check(source, true);
+ source.text = "abcd";
+ source.paths = std::vector<std::filesystem::path>{"abcd", "efgh"};
+ source.directory = std::string(path_limit, 'p');
+ source.original = std::string(path_limit, 's');
+ source.fraction = 1.0;
+ check(source, true);
+ source.text.clear();
+ check(source, false);
+ source.text = "abcde";
+ check(source, false);
+ source.text = "abcd";
+ source.paths->push_back("i");
+ check(source, false);
+ source.paths->pop_back();
+ source.paths->front() = "abcde";
+ check(source, false);
+ source.paths->front() = "abcd";
+ source.directory += "x";
+ check(source, false);
+ source.directory = std::string(path_limit, 'p');
+ source.original.push_back('x');
+ check(source, false);
+ source.original.pop_back();
+ source.fraction = std::numeric_limits<double>::infinity();
+ check(source, false);
+ source.fraction = 2.0;
+ check(source, false);
+ source.fraction = -1.0;
+ check(source, false);
+ source.fraction = 0.0;
+ check(source, true);
 }
 TEST_CASE("reflected text sequences bound each leaf and reject oversized paths before materialization", "[frameworks][serialization][reflection][bounds]") {
  namespace cbor = mmltk::frameworks::serialization;

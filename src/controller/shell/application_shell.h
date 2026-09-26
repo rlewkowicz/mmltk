@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <sys/types.h>
 #include "src/frameworks/reflection/field_policy.h"
 #include <atomic>
@@ -27,8 +28,8 @@ namespace transport = mmltk::frameworks::transport;
 struct ApplicationShellConfig final {
  struct PresentationConfig final {
   std::filesystem::path import_socket;
-  [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int cuda_device_index = 0;
-  [[= mmltk::frameworks::reflection::Minimum<int>{-1}]] int numa_node = -1;
+  MMLTK_MINIMUM(int, 0) int cuda_device_index = 0;
+  MMLTK_MINIMUM(int, -1) int numa_node = -1;
   VisualExtent extent{.width = 1'200U, .height = 800U};
   std::size_t pitch_bytes = 1'200U * 4U;
   std::size_t minimum_allocation_bytes = 0U;

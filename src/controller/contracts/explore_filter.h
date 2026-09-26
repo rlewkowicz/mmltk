@@ -1,4 +1,7 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -20,7 +23,7 @@ enum class ExploreClassSelectionMode : std::uint8_t {
 };
 struct ExploreClassSelection final {
  ExploreClassSelectionMode mode = ExploreClassSelectionMode::All;
- [[= mmltk::frameworks::reflection::MaxItems{kExploreClassCapacity}]] std::vector<std::uint32_t> classes{};
+ MMLTK_MAX_ITEMS(kExploreClassCapacity) std::vector<std::uint32_t> classes {};
  bool operator==(const ExploreClassSelection&) const = default;
 };
 struct ExploreOverlay final {

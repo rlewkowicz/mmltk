@@ -18,17 +18,6 @@
 namespace {
 namespace r = mmltk::backend::models::rfdetr;
 namespace io = mmltk::common::io;
-r::NativeCheckpointMetadata metadata() {
- r::NativeCheckpointMetadata value;
- value.class_layout = r::testsupport::synthetic_training_layout(1);
- value.preset_name = "rf-detr-nano";
- value.source_kind = "native-training-test";
- value.source_path = "seed.pt";
- value.num_classes = 2;
- value.num_queries = 2;
- value.num_select = 2;
- return value;
-}
 r::EvalSummary evaluation(double metric, bool masks = false) {
  r::EvalSummary value;
  value.bbox.ap = metric;
@@ -42,7 +31,7 @@ r::EvalSummary evaluation(double metric, bool masks = false) {
 }
 r::TrainingSelectionCandidate ingredient(const std::filesystem::path& directory, std::uint64_t id, double value, double metric, bool masks = false) {
  r::DecodedNativeModelState state;
- state.metadata = metadata();
+ state.metadata = r::testsupport::synthetic_training_metadata();
  state.replace_entries({{"value", torch::tensor({value})}, {"counter", torch::tensor({3}, torch::kInt64)}});
  r::TrainingSelectionCandidate candidate;
  auto& artifact = candidate.artifact;
@@ -104,7 +93,7 @@ struct SessionFixture final {
     optimizer.set_momentum(values.schedule.held_momentum);
     if (corrupt_model == index) ++values.data.model_id;
     torch::serialize::OutputArchive output;
-    r::detail::write_native_checkpoint_metadata(output, metadata());
+    r::detail::write_native_checkpoint_metadata(output, r::testsupport::synthetic_training_metadata());
     r::detail::write_training_continuation(output, configuration, values);
     mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
     readback.Begin();

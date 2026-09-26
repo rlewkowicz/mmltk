@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include <array>
 #include <atomic>
@@ -112,16 +113,16 @@ struct CompilerConfig {
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
  bool perceptual_downscale = false;
  // CLEANUP-IGNORE: Compiler input/output paths remain backend execution facts with canonical reflected limits.
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string source_dir;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string output_dir;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string split;
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{1U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{MAX_IMAGE_EXTENT}]] uint32_t target_width = 432;
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{1U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{MAX_IMAGE_EXTENT}]] uint32_t target_height = 432;
+ MMLTK_MAX_PATH_BYTES std::string source_dir;
+ MMLTK_MAX_PATH_BYTES std::string output_dir;
+ MMLTK_MAX_NAME_BYTES std::string split;
+ MMLTK_MINIMUM(std::uint32_t, 1U) MMLTK_MAXIMUM(std::uint32_t, MAX_IMAGE_EXTENT) uint32_t target_width = 432;
+ MMLTK_MINIMUM(std::uint32_t, 1U) MMLTK_MAXIMUM(std::uint32_t, MAX_IMAGE_EXTENT) uint32_t target_height = 432;
  // CLEANUP-IGNORE: Compiler worker controls are backend execution fields, distinct from training request controls.
- [[= mmltk::frameworks::reflection::Minimum<int>{-1}]] int num_workers = -1;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int cuda_mask_batch_size = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int cuda_device_id = 0;
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::frameworks::reflection::kMaximumCpuIdentifiers}]] std::vector<int> worker_cpus;
+ MMLTK_MINIMUM(int, -1) int num_workers = -1;
+ MMLTK_MINIMUM(int, 0) int cuda_mask_batch_size = 0;
+ MMLTK_MINIMUM(int, 0) int cuda_device_id = 0;
+ MMLTK_MAX_ITEMS(mmltk::frameworks::reflection::kMaximumCpuIdentifiers) std::vector<int> worker_cpus;
  std::vector<CompileDiagnostic>* diagnostics = nullptr;
 };
 MMLTK_REFLECT_FIELDS(CompilerConfig)

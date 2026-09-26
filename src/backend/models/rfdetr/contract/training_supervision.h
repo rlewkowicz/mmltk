@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -31,20 +32,17 @@ inline constexpr float kSupervisionOpenUnitMinimum = std::numeric_limits<float>:
 inline constexpr float kSupervisionOpenUnitMaximum = std::nextafter(1.0F, 0.0F);
 inline constexpr std::uint16_t kMaximumDenoisingGroups = 64U;
 struct MatchFreeSupervisionConfig {
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  kSupervisionOpenUnitMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kSupervisionOpenUnitMaximum}]][[= mmltk::frameworks::reflection::Finite{}]] float rho = 0.5F;
- [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float correspondence_weight = 1.0F;
- [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float query_weight = 1.0F;
+ MMLTK_MINIMUM(float, kSupervisionOpenUnitMinimum) MMLTK_MAXIMUM(float, kSupervisionOpenUnitMaximum) MMLTK_FINITE float rho = 0.5F;
+ MMLTK_MINIMUM(float, 0.0F) MMLTK_FINITE float correspondence_weight = 1.0F;
+ MMLTK_MINIMUM(float, 0.0F) MMLTK_FINITE float query_weight = 1.0F;
  constexpr bool operator==(const MatchFreeSupervisionConfig&) const noexcept = default;
 };
 struct DenoisingSupervisionConfig {
  bool enabled = false;
- [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{1U}]][[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{kMaximumDenoisingGroups}]] std::uint16_t groups = 5U;
- [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float label_noise_ratio = 0.2F;
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  kSupervisionOpenUnitMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kSupervisionOpenUnitMaximum}]][[= mmltk::frameworks::reflection::Finite{}]] float center_noise_scale = 0.4F;
- [[= mmltk::frameworks::reflection::Minimum<float>{
-  kSupervisionOpenUnitMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kSupervisionOpenUnitMaximum}]][[= mmltk::frameworks::reflection::Finite{}]] float size_noise_scale = 0.4F;
+ MMLTK_MINIMUM(std::uint16_t, 1U) MMLTK_MAXIMUM(std::uint16_t, kMaximumDenoisingGroups) std::uint16_t groups = 5U;
+ MMLTK_MINIMUM(float, 0.0F) MMLTK_MAXIMUM(float, 1.0F) MMLTK_FINITE float label_noise_ratio = 0.2F;
+ MMLTK_MINIMUM(float, kSupervisionOpenUnitMinimum) MMLTK_MAXIMUM(float, kSupervisionOpenUnitMaximum) MMLTK_FINITE float center_noise_scale = 0.4F;
+ MMLTK_MINIMUM(float, kSupervisionOpenUnitMinimum) MMLTK_MAXIMUM(float, kSupervisionOpenUnitMaximum) MMLTK_FINITE float size_noise_scale = 0.4F;
  constexpr bool operator==(const DenoisingSupervisionConfig&) const noexcept = default;
 };
 struct TrainingSupervisionConfig {

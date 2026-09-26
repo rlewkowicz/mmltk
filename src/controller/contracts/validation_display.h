@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 namespace mmltk::controller {
@@ -12,7 +13,7 @@ MMLTK_REFLECT_FIELDS(ValidationOverlays)
 }  // namespace mmltk::controller
 namespace mmltk::controller::contracts {
 struct ValidationDisplaySettings final {
- [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float confidence_threshold = 0.4F;
+ MMLTK_MINIMUM(float, 0.0F) MMLTK_MAXIMUM(float, 1.0F) MMLTK_FINITE float confidence_threshold = 0.4F;
  bool operator==(const ValidationDisplaySettings&) const = default;
 };
 struct ValidationRunPreview final {

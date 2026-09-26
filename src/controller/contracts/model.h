@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -28,7 +29,7 @@ enum class ModelProgressStage : std::uint8_t {
 };
 struct ModelProgress final {
  ModelProgressStage stage = ModelProgressStage::Idle;
- [[= mmltk::frameworks::reflection::MaxBytes{kModelDetailCapacity}]] std::string activity;
+ MMLTK_MAX_BYTES(kModelDetailCapacity) std::string activity;
  std::uint64_t completed = 0U;
  std::uint64_t total = 0U;
  bool total_known = false;
@@ -36,13 +37,13 @@ struct ModelProgress final {
  bool operator==(const ModelProgress&) const = default;
 };
 struct[[= reflection::feature_scope(FeatureId::Train, FeatureId::Validate, FeatureId::Predict, FeatureId::Export)]] ModelSelectionRequest final {
- [[= mmltk::frameworks::reflection::CatalogProvider<ModelSelectionCompatibilityCatalog>{}]] FeatureId workflow = FeatureId::Train;
+ MMLTK_CATALOG(ModelSelectionCompatibilityCatalog) FeatureId workflow = FeatureId::Train;
  [[nodiscard]] bool valid() const noexcept { return model_selection_workflow_supported(workflow); }
 };
 struct ModelSelection final {
  ModelSelectionKey key{};
  std::optional<std::int32_t> inspection_device{};
- [[= mmltk::frameworks::reflection::MaxBytes{kModelArtifactCapacity}]] std::string artifact;
+ MMLTK_MAX_BYTES(kModelArtifactCapacity) std::string artifact;
  mmltk::backend::models::rfdetr::ModelClassLayoutSummary class_layout{};
  [[nodiscard]] bool valid() const noexcept { return key.valid() && !artifact.empty() && artifact.size() <= kModelArtifactCapacity; }
  bool operator==(const ModelSelection&) const = default;
@@ -60,7 +61,7 @@ static_assert(terminal_presentation::complete(kModelSelectionPresentations));
 [[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<ModelSelectionOutcome>) { return kModelSelectionPresentations; }
 struct ModelSelectionResult final {
  ModelSelectionOutcome outcome = ModelSelectionOutcome::Idle;
- [[= mmltk::frameworks::reflection::MaxBytes{kModelDetailCapacity}]] std::string detail;
+ MMLTK_MAX_BYTES(kModelDetailCapacity) std::string detail;
  bool operator==(const ModelSelectionResult&) const = default;
 };
 struct ModelUiState final {

@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <cstdint>
 #include <cstddef>
 #include <optional>
@@ -43,7 +44,7 @@ struct BenchmarkTransferProgress final {
 MMLTK_REFLECT_FIELDS(BenchmarkTransferProgress)
 struct BenchmarkSourceProgress {
  BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
- [[= mmltk::frameworks::reflection::MaxBytes{kDatasetCompileProgressTextCapacity}]] std::string activity;
+ MMLTK_MAX_BYTES(kDatasetCompileProgressTextCapacity) std::string activity;
  std::optional<BenchmarkTransferProgress> transfer{};
  std::uint64_t completed_bytes = 0;
  std::uint64_t total_bytes = 0;

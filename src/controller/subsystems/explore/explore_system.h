@@ -1,4 +1,7 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/controller/contracts/workspace_input.h"
 #include "src/controller/presentation/visual_source_projection.h"
 #include <algorithm>
@@ -58,7 +61,7 @@ struct ExploreViewport final {
 }
 struct ExploreOpen final {
  ExploreViewport viewport{};
- [[= mmltk::frameworks::reflection::MaxBytes{4096U}]] std::string compiled_source;
+ MMLTK_MAX_BYTES(4096U) std::string compiled_source;
 };
 struct ExploreViewportUpdate final {
  ExploreViewport viewport{};
@@ -80,8 +83,8 @@ struct ExploreDatasetFacts final {
  std::uint32_t image_width = 0U;
  std::uint32_t image_height = 0U;
  ExploreClassCatalogIdentity class_catalog_identity = 0U;
- [[= mmltk::frameworks::reflection::MaxItems{kExploreClassCapacity}]] std::vector<mmltk::backend::data::catalog::ClassName> class_names{};
- [[= mmltk::frameworks::reflection::MaxItems{kExploreClassCapacity}]] std::vector<contracts::AnnotationColor> palette{};
+ MMLTK_MAX_ITEMS(kExploreClassCapacity) std::vector<mmltk::backend::data::catalog::ClassName> class_names {};
+ MMLTK_MAX_ITEMS(kExploreClassCapacity) std::vector<contracts::AnnotationColor> palette {};
 };
 struct ExploreLabel final {
  contracts::AnnotationBox box{};
@@ -91,7 +94,7 @@ struct ExploreLabel final {
 struct ExploreOrderFacts final {
  std::uint32_t matching_count = 0U;
  std::uint64_t shuffle_seed = 0U;
- [[= mmltk::frameworks::reflection::MaxItems{kExploreVisibleItemCapacity}]] std::vector<std::uint32_t> visible_indices{};
+ MMLTK_MAX_ITEMS(kExploreVisibleItemCapacity) std::vector<std::uint32_t> visible_indices {};
 };
 [[nodiscard]] constexpr std::uint64_t explore_visible_indices_digest(const std::span<const std::uint32_t> visible_indices) noexcept {
  constexpr std::uint64_t offset = 14'695'981'039'346'656'037ULL;
@@ -133,7 +136,7 @@ struct ExploreAtlasLayout final {
 struct ExploreGalleryReadiness final {
  std::uint64_t generation = 0U;
  ExploreAtlasLayout layout{};
- [[= mmltk::frameworks::reflection::MaxItems{kExploreVisibleItemCapacity}]] std::vector<bool> slots{};
+ MMLTK_MAX_ITEMS(kExploreVisibleItemCapacity) std::vector<bool> slots {};
 };
 struct ExploreImageMetadata final {
  std::uint64_t revision = 0U;
@@ -152,7 +155,7 @@ struct ExploreImageMetadata final {
  VisualFrame frame{};
  VisualDocumentFacts document{};
  contracts::AnnotationSceneContent scene{};
- [[= mmltk::frameworks::reflection::MaxItems{kExploreLabelCapacity}]] std::vector<ExploreLabel> labels{};
+ MMLTK_MAX_ITEMS(kExploreLabelCapacity) std::vector<ExploreLabel> labels {};
 };
 struct ExploreSnapshot final {
  std::uint64_t revision = 0U;
@@ -162,7 +165,7 @@ struct ExploreSnapshot final {
  bool render_pending = false;
  bool cancellation_requested = false;
  bool ready = false;
- [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string failure{};
+ MMLTK_MAX_BYTES(kVisualFailureByteCapacity) std::string failure {};
  ExploreFailureKind failure_kind = ExploreFailureKind::None;
  std::size_t nproc = 1U;
  VisualExtent maximum_atlas_extent{};
@@ -180,7 +183,7 @@ struct ExploreSnapshot final {
  VisualFrame frame{};
  VisualDocumentFacts document{};
  contracts::AnnotationSceneContent scene{};
- [[= mmltk::frameworks::reflection::MaxItems{kExploreLabelCapacity}]] std::vector<ExploreLabel> labels{};
+ MMLTK_MAX_ITEMS(kExploreLabelCapacity) std::vector<ExploreLabel> labels {};
 };
 struct ExploreRenderPlan final {
  ExploreViewport viewport{};
@@ -309,7 +312,7 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Lat
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] ExploreFailed final {
  ExploreSnapshot snapshot{};
  // CLEANUP-IGNORE: Explore failure fields and its direct source registration are canonical domain declarations, independent of Upscale.
- [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
+ MMLTK_MAX_BYTES(kVisualFailureByteCapacity) std::string detail;
  // CLEANUP-IGNORE: Explore source projection and direct input API retain their own canonical identity; execution is already shared.
 };
 class ExploreSystem final {

@@ -438,6 +438,22 @@ impl SettingsModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn assert_training_lanes(
+        model: &SettingsModel,
+        expected: &crate::generated::TrainLaneConfiguration,
+    ) {
+        assert_eq!(
+            &model
+                .draft
+                .as_ref()
+                .unwrap()
+                .workflows
+                .train
+                .request
+                .laneconfiguration,
+            expected
+        );
+    }
 
     fn settings_snapshot() -> SettingsUiState {
         crate::generated::application_snapshot_defaults()
@@ -1063,17 +1079,7 @@ mod tests {
         model.replace_training_lanes(lanes.clone()).unwrap();
         assert!(model.take_request([true; 3]).is_none());
         model.settle_success(&snapshot);
-        assert_eq!(
-            model
-                .draft
-                .as_ref()
-                .unwrap()
-                .workflows
-                .train
-                .request
-                .laneconfiguration,
-            lanes
-        );
+        assert_training_lanes(&model, &lanes);
         assert_eq!(
             model.take_request([true; 3]).unwrap().laneconfiguration,
             Some(lanes)
@@ -1088,6 +1094,7 @@ mod tests {
     {
         use crate::generated::*;
         let mut snapshot = settings_snapshot();
+        // CLEANUP-IGNORE: Shared installation precedes one generated field read; lock and capacity cases exercise different transactions.
         let mut model = SettingsModel::default();
         model.install(&snapshot);
         let lanes = snapshot
@@ -1294,21 +1301,14 @@ mod tests {
             .laneconfiguration
             .nextmodelid = 42;
         model.settle_success(&snapshot);
-        assert_eq!(
-            model
-                .draft
-                .as_ref()
-                .unwrap()
-                .workflows
-                .train
-                .request
-                .laneconfiguration,
-            snapshot
+        assert_training_lanes(
+            &model,
+            &snapshot
                 .settingsstate
                 .workflows
                 .train
                 .request
-                .laneconfiguration
+                .laneconfiguration,
         );
         assert!(!model.training_membership_pending());
         assert!(model.resize_training_models(0).is_err());
@@ -1515,17 +1515,7 @@ mod tests {
                 update_workflowstrainrequestrecipelr(0.003)
             ]
         );
-        assert_eq!(
-            model
-                .draft
-                .as_ref()
-                .unwrap()
-                .workflows
-                .train
-                .request
-                .laneconfiguration,
-            retained
-        );
+        assert_training_lanes(&model, &retained);
         assert!(model.edit_recipe(TrainRecipeSettingsEdit::Reset).is_err());
         model.settle_failure(Some(&snapshot));
         model.recipe_model = Some(99);

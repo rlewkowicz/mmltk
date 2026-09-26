@@ -161,6 +161,7 @@ private:
 TrainingMetricHandoff::TrainingMetricHandoff(int device_id) : impl_(std::make_shared<Impl>(device_id)) {
  try {
   impl_->initialize();
+  // CLEANUP-IGNORE: Constructor rollback retires this metric pipeline; adjacent owner boilerplate settles different resources in other classes.
  } catch (...) {
   retire();
   throw;
@@ -170,6 +171,7 @@ TrainingMetricHandoff::~TrainingMetricHandoff() { retire(); }
 void TrainingMetricHandoff::retire() noexcept {
  if (!impl_) return;
  const auto status = impl_->retire();
+ // CLEANUP-IGNORE: Shared terminal custody is already implemented by Install; metric and gradient retirement establish different physical completion proofs.
  if (status != cudaSuccess)
   std::move(terminal_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), status);
  else

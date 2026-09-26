@@ -51,9 +51,7 @@ public:
  int count = 0;
  if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA unavailable");
  CUDA_ASSERT_OK(cudaSetDevice(0));
- const auto execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
- const auto& placement = execution.placement;
- return std::make_unique<mmltk::common::system::ScopedExecutionPolicy>(mmltk::common::system::ExecutionPolicyRequest{placement.cpus, {}, 0, placement.numa_node, -10, false});
+ return std::make_unique<mmltk::common::system::ScopedExecutionPolicy>(mmltk::frameworks::gpu::test_support::selected_test_execution_policy(0));
 }
 r::TrainRequest snapshot_request(const std::filesystem::path& directory) {
  r::TrainRequest request;
@@ -75,17 +73,6 @@ torch::OrderedDict<std::string, torch::Tensor> snapshot_parameters(const torch::
  values.insert("training_supervision.value", torch::tensor({7.F}).to(device));
  return values;
 }
-r::NativeCheckpointMetadata snapshot_metadata() {
- r::NativeCheckpointMetadata metadata;
- metadata.class_layout = r::testsupport::synthetic_training_layout(1);
- metadata.preset_name = "rf-detr-nano";
- metadata.source_kind = "native-training-test";
- metadata.source_path = "seed.pt";
- metadata.num_classes = 2;
- metadata.num_queries = 2;
- metadata.num_select = 2;
- return metadata;
-}
 struct SnapshotFixture final {
  SnapshotFixture(const std::filesystem::path& directory, bool cuda)
      : request(snapshot_request(directory)),
@@ -106,7 +93,9 @@ struct SnapshotFixture final {
   parameters["value"].add_(2);
  }
  [[nodiscard]] r::TrainingSnapshotPublication begin() { return snapshot.begin(ordinary, built.optimizer.eligible_parameter_names(), &ema); }
- void resume(const std::filesystem::path& path) { snapshot.save_resume(path, snapshot_metadata(), built.optimizer, scaler, request, 0, ema.completed_updates(), "attempt", {}, values); }
+ void resume(const std::filesystem::path& path) {
+  snapshot.save_resume(path, r::testsupport::synthetic_training_metadata(), built.optimizer, scaler, request, 0, ema.completed_updates(), "attempt", {}, values);
+ }
  r::TrainRequest request;
  torch::OrderedDict<std::string, torch::Tensor> parameters;
  r::OptimizerBuildResult built;
@@ -165,9 +154,9 @@ TEST_CASE("one publication reuses ordinary EMA and Resume values and appends onl
  REQUIRE(accounting.copies.bytes == (cuda ? 32U : 0U));
  REQUIRE_THROWS(fixture.begin());
  const auto ordinary_path = directory.path() / "ordinary.pt", ema_path = directory.path() / "ema.pt";
- fixture.snapshot.save_weights(ordinary_path, snapshot_metadata(), false, {});
- fixture.snapshot.save_weights(ema_path, snapshot_metadata(), true, {});
- fixture.snapshot.save_weights(directory.path() / "ordinary-again.pt", snapshot_metadata(), false, {});
+ fixture.snapshot.save_weights(ordinary_path, r::testsupport::synthetic_training_metadata(), false, {});
+ fixture.snapshot.save_weights(ema_path, r::testsupport::synthetic_training_metadata(), true, {});
+ fixture.snapshot.save_weights(directory.path() / "ordinary-again.pt", r::testsupport::synthetic_training_metadata(), false, {});
  REQUIRE(accounting.copies.count() == (cuda ? 5U : 0U));
  fixture.resume(directory.path() / "resume.pt");
  // AdamW's one initialized parameter adds step, first and second moments once.
@@ -220,7 +209,7 @@ TEST_CASE("one publication reuses ordinary EMA and Resume values and appends onl
  REQUIRE(Access::capacity(fixture.snapshot) == capacity);
  REQUIRE(torch::equal(Access::view(fixture.snapshot, 0), expected_ordinary + 5));
  REQUIRE(accounting.copies.count() == (cuda ? 13U : 0U));
- fixture.snapshot.save_weights(directory.path() / "changed.pt", snapshot_metadata(), false, {});
+ fixture.snapshot.save_weights(directory.path() / "changed.pt", r::testsupport::synthetic_training_metadata(), false, {});
  changed.finish();
  REQUIRE(torch::equal(entry(r::decode_native_model_state(directory.path() / "changed.pt"), "value"), expected_ordinary + 5));
 }
@@ -241,7 +230,7 @@ TEST_CASE("publication scope releases serializer failures and preserves the comp
  const r::TrainingPlanState plan{1, {{0, 42, {0}, {1}, {}}}};
  {
   auto publication = fixture.begin();
-  fixture.snapshot.save_weights(directory.path() / "individual.pt", snapshot_metadata(), false, {});
+  fixture.snapshot.save_weights(directory.path() / "individual.pt", r::testsupport::synthetic_training_metadata(), false, {});
   checkpoint.publish(manifest, plan, [&](const auto& path, std::size_t) { fixture.resume(path); });
   publication.finish();
  }
@@ -285,8 +274,9 @@ TEST_CASE("ordinary publication excludes stale EMA after released storage is reu
  }
  fixture.request.use_ema = false;
  auto publication = fixture.snapshot.begin(fixture.ordinary, {}, nullptr);
- REQUIRE_THROWS(fixture.snapshot.save_weights(directory.path() / "unadmitted-ema.pt", snapshot_metadata(), true, {}));
- fixture.snapshot.save_resume(directory.path() / "ordinary-resume.pt", snapshot_metadata(), fixture.built.optimizer, fixture.scaler, fixture.request, 0, 0, "attempt", {}, fixture.values);
+ REQUIRE_THROWS(fixture.snapshot.save_weights(directory.path() / "unadmitted-ema.pt", r::testsupport::synthetic_training_metadata(), true, {}));
+ fixture.snapshot.save_resume(
+  directory.path() / "ordinary-resume.pt", r::testsupport::synthetic_training_metadata(), fixture.built.optimizer, fixture.scaler, fixture.request, 0, 0, "attempt", {}, fixture.values);
  publication.finish();
  auto saved = r::decode_native_model_state(directory.path() / "ordinary-resume.pt");
  torch::serialize::InputArchive unwanted;
@@ -325,7 +315,7 @@ TEST_CASE("test_ema_selection_restores_identity_and_mode", "[model][rfdetr][trai
  const std::vector<r::NormalizedModelStateEntry> state{{"class_embed.weight", parameters.front()}, {"class_embed.bias", parameters.back()}};
  const std::vector<std::string> names{"class_embed.weight", "class_embed.bias"};
  mmltk::testsupport::ScopedTempDir directory("snapshot-ema-selection");
- auto metadata = snapshot_metadata();
+ auto metadata = r::testsupport::synthetic_training_metadata();
  metadata.class_layout = r::testsupport::synthetic_training_layout(2);
  metadata.num_classes = 3;
  r::TrainingSnapshot snapshot;

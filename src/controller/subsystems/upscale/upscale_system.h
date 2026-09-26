@@ -1,4 +1,7 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/controller/contracts/workspace_input.h"
 #include "src/controller/presentation/visual_source_projection.h"
 #include <cstdint>
@@ -94,7 +97,7 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Lat
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] UpscaleFailed final {
  UpscaleSnapshot snapshot{};
- [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
+ MMLTK_MAX_BYTES(kVisualFailureByteCapacity) std::string detail;
  std::optional<UpscaleRequest> request{};
  // CLEANUP-IGNORE: Upscale failure kind and source registration are domain declarations, not another runtime implementation.
  UpscaleFailureKind kind = UpscaleFailureKind::Failed;

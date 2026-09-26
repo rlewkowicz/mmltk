@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include "src/backend/data/data_loading_options.h"
@@ -24,35 +25,33 @@ inline constexpr std::size_t kMaximumCliImageInputs = 4096U;
 inline constexpr std::size_t kMaximumTrainingDevices = 16U;
 struct ModelArtifactRequest {
  // CLEANUP-IGNORE: Each canonical artifact path carries the same reflected path capacity for generated consumers.
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path weights_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path class_layout_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path onnx_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path tensorrt_path;
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumNameBytes}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]][
-  [= mmltk::frameworks::reflection::CatalogProvider<RfdetrPresetCatalog>{}]] std::string preset_name;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int resolution = 0;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path weights_path;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path class_layout_path;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path onnx_path;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path tensorrt_path;
+ MMLTK_MAX_NAME_BYTES MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Preset) MMLTK_CATALOG(RfdetrPresetCatalog) std::string preset_name;
+ MMLTK_MINIMUM(int, 0) int resolution = 0;
  [[nodiscard]] std::size_t selected_input_count() const noexcept {
   return static_cast<std::size_t>(!weights_path.empty()) + static_cast<std::size_t>(!onnx_path.empty()) + static_cast<std::size_t>(!tensorrt_path.empty());
  }
 };
 struct DeviceExecutionConfig {
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
+ MMLTK_MINIMUM(int, 0) int device_id = 0;
 };
 struct InferenceExecutionConfig : DeviceExecutionConfig, mmltk::backend::data::DataLoadingOptions {
  CompilationMode compilation_mode = CompilationMode::kSelective;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string cpu_affinity;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int workers = 0;
+ MMLTK_MAX_NAME_BYTES std::string cpu_affinity;
+ MMLTK_MINIMUM(int, 0) int workers = 0;
  bool allow_fp16 = true;
 };
 struct ModelArtifactOutputRequest : ModelArtifactRequest, DeviceExecutionConfig {
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path output_path;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path output_path;
 };
 struct BuildEngineRequest : ModelArtifactOutputRequest {
  bool allow_fp16 = true;
 };
 struct ExportOnnxRequest : ModelArtifactOutputRequest {
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int opset_version = 19;
+ MMLTK_MINIMUM(int, 1) int opset_version = 19;
  bool simplify = false;
 };
 enum class PredictSourceKind : std::uint8_t {
@@ -61,21 +60,21 @@ enum class PredictSourceKind : std::uint8_t {
  VideoFile,
 };
 struct PredictImageInput {
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path image_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string source_name;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path image_path;
+ MMLTK_MAX_NAME_BYTES std::string source_name;
  std::int64_t image_id = 0;
 };
 struct PredictRequest : ModelArtifactRequest, InferenceExecutionConfig {
  PredictSourceKind source_kind = PredictSourceKind::CompiledDataset;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path video_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path compiled_path;
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::models::rfdetr::kMaximumCliImageInputs}]] std::vector<PredictImageInput> image_inputs;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::frameworks::reflection::RuntimeDestination{}]] std::filesystem::path output_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string backend = "auto";
- [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 1U;
- [[= mmltk::frameworks::reflection::Minimum<std::size_t>{0U}]][[= mmltk::frameworks::reflection::Maximum<std::size_t>{kMaximumPredictionCandidates}]] std::size_t max_dets_per_image = 500U;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int lanes = 1;
- [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float threshold = 0.0F;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path video_path;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path compiled_path;
+ MMLTK_MAX_ITEMS(mmltk::backend::models::rfdetr::kMaximumCliImageInputs) std::vector<PredictImageInput> image_inputs;
+ MMLTK_MAX_PATH_BYTES MMLTK_RUNTIME_DESTINATION std::filesystem::path output_path;
+ MMLTK_MAX_NAME_BYTES std::string backend = "auto";
+ MMLTK_MINIMUM(std::size_t, 1U) std::size_t batch_size = 1U;
+ MMLTK_MINIMUM(std::size_t, 0U) MMLTK_MAXIMUM(std::size_t, kMaximumPredictionCandidates) std::size_t max_dets_per_image = 500U;
+ MMLTK_MINIMUM(int, 1) int lanes = 1;
+ MMLTK_MINIMUM(float, 0.0F) MMLTK_MAXIMUM(float, 1.0F) MMLTK_FINITE float threshold = 0.0F;
  std::size_t limit_images = 0U;
  bool include_masks = true;
  bool progress_bar = true;
@@ -86,24 +85,24 @@ enum class ValidationLogMode : std::uint8_t {
 };
 // CLEANUP-IGNORE: Validation and training are distinct canonical requests even where their reflected path fields align.
 struct ValidateRequest : ModelArtifactRequest, InferenceExecutionConfig {
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int lanes = 1;
+ MMLTK_MINIMUM(int, 1) int lanes = 1;
  // CLEANUP-IGNORE: Distinct canonical path fields share constraints, not duplicated runtime behavior.
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path compiled_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path source_dir;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path save_engine_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::frameworks::reflection::RuntimeDestination{}]] std::filesystem::path report_json_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string eval_order = "onnx,tensorrt";
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string split;
- [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 1U;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path compiled_path;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path source_dir;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path save_engine_path;
+ MMLTK_MAX_PATH_BYTES MMLTK_RUNTIME_DESTINATION std::filesystem::path report_json_path;
+ MMLTK_MAX_NAME_BYTES std::string eval_order = "onnx,tensorrt";
+ MMLTK_MAX_NAME_BYTES std::string split;
+ MMLTK_MINIMUM(std::size_t, 1U) std::size_t batch_size = 1U;
  std::size_t limit_images = 0U;
  std::size_t candidate_count = 0U;
  std::size_t eval_max_dets = 0U;
  std::size_t alignment_images = 16U;
- [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t prefetch_factor = 2U;
+ MMLTK_MINIMUM(std::size_t, 1U) std::size_t prefetch_factor = 2U;
  mmltk::backend::imaging::resample::ImageResizeMode compile_resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
- [[= mmltk::frameworks::reflection::Minimum<int>{-1}]] int compile_workers = -1;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int compile_cuda_mask_batch_size = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int compile_cuda_device_id = 0;
+ MMLTK_MINIMUM(int, -1) int compile_workers = -1;
+ MMLTK_MINIMUM(int, 0) int compile_cuda_mask_batch_size = 0;
+ MMLTK_MINIMUM(int, 0) int compile_cuda_device_id = 0;
  bool recompile = false;
  bool profile = false;
  bool write_report_json = true;
@@ -116,12 +115,12 @@ struct AugmentationGroupConfig {
  // behavior.
  bool operator==(const AugmentationGroupConfig&) const = default;
  // CLEANUP-IGNORE: Every augmentation scalar deliberately exposes the same reflected unit-interval policy.
- [[= mmltk::frameworks::reflection::Minimum<float>{kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][
-  [= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float probability = 0.0F;
- [[= mmltk::frameworks::reflection::Minimum<float>{kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][
-  [= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float min_strength = 0.0F;
- [[= mmltk::frameworks::reflection::Minimum<float>{kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][
-  [= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float max_strength = 0.0F;
+ MMLTK_MINIMUM(float, kAugmentationScalarMinimum)
+ MMLTK_MAXIMUM(float, kAugmentationScalarMaximum) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::UnitInterval) float probability = 0.0F;
+ MMLTK_MINIMUM(float, kAugmentationScalarMinimum)
+ MMLTK_MAXIMUM(float, kAugmentationScalarMaximum) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::UnitInterval) float min_strength = 0.0F;
+ MMLTK_MINIMUM(float, kAugmentationScalarMinimum)
+ MMLTK_MAXIMUM(float, kAugmentationScalarMaximum) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::UnitInterval) float max_strength = 0.0F;
 };
 struct GpuAugmentationConfig {
  bool operator==(const GpuAugmentationConfig&) const = default;
@@ -134,65 +133,64 @@ struct GpuAugmentationConfig {
  AugmentationGroupConfig blur{0.50F, 0.05F, 0.50F};
  // CLEANUP-IGNORE: Occlusion remains a named generated field rather than an opaque indexed augmentation entry.
  AugmentationGroupConfig occlusion{0.50F, 0.05F, 0.50F};
- [[= mmltk::frameworks::reflection::Minimum<float>{kAugmentationScalarMinimum}]][[= mmltk::frameworks::reflection::Maximum<float>{kAugmentationScalarMaximum}]][
-  [= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float copy_paste_probability = 0.80F;
+ MMLTK_MINIMUM(float, kAugmentationScalarMinimum)
+ MMLTK_MAXIMUM(float, kAugmentationScalarMaximum) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::UnitInterval) float copy_paste_probability = 0.80F;
 };
 // CLEANUP-IGNORE: Train is the canonical reflected training request; coincident field shapes remain domain-named.
 struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
  bool operator==(const TrainRequest&) const = default;
  // Rank-ordered overrides correspond exactly to device_ids; -1 selects automatic locality.
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::models::rfdetr::kMaximumTrainingDevices}]] std::vector<int>
+ MMLTK_MAX_ITEMS(mmltk::backend::models::rfdetr::kMaximumTrainingDevices)
+ std::vector<int>
   // CLEANUP-IGNORE: The ranked NUMA vector and following Train paths are distinct canonical generated fields.
   numa_nodes;
  // CLEANUP-IGNORE: Training input paths each retain the shared path constraint in the authoritative declaration.
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path train_compiled_path;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path train_compiled_path;
  // CLEANUP-IGNORE: Validation and training paths remain separately reflected domain fields with stable generated
  // identities.
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path val_compiled_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path weights_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path class_layout_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path resume_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::frameworks::reflection::RuntimeDestination{}]] std::filesystem::path output_dir;
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumNameBytes}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]]
-                                                     // CLEANUP-IGNORE: Preset metadata is deliberately repeated on the Train field consumed by reflection.
-                                                     [[= mmltk::frameworks::reflection::CatalogProvider<RfdetrPresetCatalog>{}]] std::string preset_name;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path val_compiled_path;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path weights_path;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path class_layout_path;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path resume_path;
+ MMLTK_MAX_PATH_BYTES MMLTK_RUNTIME_DESTINATION std::filesystem::path output_dir;
+ MMLTK_MAX_NAME_BYTES MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Preset)
+  // CLEANUP-IGNORE: Preset metadata is deliberately repeated on the Train field consumed by reflection.
+  MMLTK_CATALOG(RfdetrPresetCatalog) std::string preset_name;
  // CLEANUP-IGNORE: Optional training artifact paths share a capacity but retain distinct generated identities.
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path test_compiled_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path distributed_store_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string cpu_affinity;
- [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 1U;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path test_compiled_path;
+ MMLTK_MAX_PATH_BYTES std::filesystem::path distributed_store_path;
+ MMLTK_MAX_NAME_BYTES std::string cpu_affinity;
+ MMLTK_MINIMUM(std::size_t, 1U) std::size_t batch_size = 1U;
  std::size_t val_batch_size = 0U;
  std::size_t num_queries = 0U;
  std::size_t eval_max_dets = 0U;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int epochs = 1;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int grad_accum_steps = 1;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int print_freq = 100;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int prefetch_factor = 2;
+ MMLTK_MINIMUM(int, 1) int epochs = 1;
+ MMLTK_MINIMUM(int, 1) int grad_accum_steps = 1;
+ MMLTK_MINIMUM(int, 1) int print_freq = 100;
+ MMLTK_MINIMUM(int, 1) int prefetch_factor = 2;
  // CLEANUP-IGNORE: Seed and worker settings are separate generated fields despite adjacent scalar defaults.
  int seed = 42;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int workers = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int lanes = 1;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int resolution = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::models::rfdetr::kMaximumTrainingDevices}]] std::vector<int> device_ids;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int distributed_rank = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int distributed_world_size = 1;
+ MMLTK_MINIMUM(int, 0) int workers = 0;
+ MMLTK_MINIMUM(int, 1) int lanes = 1;
+ MMLTK_MINIMUM(int, 0) int resolution = 0;
+ MMLTK_MINIMUM(int, 0) int device_id = 0;
+ MMLTK_MAX_ITEMS(mmltk::backend::models::rfdetr::kMaximumTrainingDevices) std::vector<int> device_ids;
+ MMLTK_MINIMUM(int, 0) int distributed_rank = 0;
+ MMLTK_MINIMUM(int, 1) int distributed_world_size = 1;
  // CLEANUP-IGNORE: EMA and optimizer fields retain explicit reflected constraints at their canonical declarations.
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int ema_tau = 100;
- [[= mmltk::frameworks::reflection::Minimum<double>{
-  0.0}]][[= mmltk::frameworks::reflection::Finite{}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Norm>{}]] double
+ MMLTK_MINIMUM(int, 0) int ema_tau = 100;
+ MMLTK_MINIMUM(double, 0.0)
+ MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Norm) double
   // CLEANUP-IGNORE: Gradient clipping is a nonnegative norm; adjacent optimizer scalars are bounded decay
   // fractions.
   clip_max_norm = 0.1;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Decay>{}]] double ema_decay = 0.993;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_MAXIMUM(double, 1.0) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Decay) double ema_decay = 0.993;
  TrainRecipeSettings recipe;
  TrainLaneConfiguration lane_configuration;
  TrainDataPolicy data_policy;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int validation_lanes = 1;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int unfreeze_encoder_last_epochs = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int disable_augmentation_last_epochs = 0;
+ MMLTK_MINIMUM(int, 1) int validation_lanes = 1;
+ MMLTK_MINIMUM(int, 0) int unfreeze_encoder_last_epochs = 0;
+ MMLTK_MINIMUM(int, 0) int disable_augmentation_last_epochs = 0;
  GpuAugmentationConfig gpu_augmentation;
  TrainingSupervisionConfig training_supervision;
  bool use_ema = false;

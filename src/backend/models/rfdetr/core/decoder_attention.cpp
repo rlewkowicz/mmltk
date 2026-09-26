@@ -58,9 +58,7 @@ torch::Tensor isolated_group_self_attention(torch::nn::MultiheadAttention& atten
  // Group-DETR groups; reshaping groups into the batch dimension realizes
  // those blocks without a quadratic all-query mask.
  auto output = attend(0, ordinary_count, layout.ordinary.groups);
- if (layout.has_denoising()) {
-  output = torch::cat({output, attend(ordinary_count, layout.denoising_queries(), layout.denoising_groups, key_padding)}, 1);
- }
+ if (layout.has_denoising()) { output = torch::cat({output, attend(ordinary_count, layout.denoising_queries(), layout.denoising_groups, key_padding)}, 1); }
  return attention->out_proj->forward(output);
 }
 }  // namespace mmltk::backend::models::rfdetr

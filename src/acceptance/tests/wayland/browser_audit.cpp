@@ -1443,7 +1443,7 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   if (key >= 200U && key < 236U && numeric(record, "b") > 0 && record.contains("colored")) {
    const auto stage = (key - 200U) % 9U;
    const bool valid = stage == 6U ? record.value("detail", "") == "empty-component" && numeric(record, "c") == 0 && numeric(record, "d") == 0 && scalar(record, "colored") == 0U
-                                : numeric(record, "c") > 0 && numeric(record, "d") >= 20 && (stage < 4U ? scalar(record, "colored") > 0U : scalar(record, "colored") == 0U);
+                                  : numeric(record, "c") > 0 && numeric(record, "d") >= 20 && (stage < 4U ? scalar(record, "colored") > 0U : scalar(record, "colored") == 0U);
    if (valid) dataset_fixture_pixels.insert(key);
   }
  } else if (event == "integration.dataset_fixture") {
@@ -1930,9 +1930,9 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
  const auto primary_action = [&page_prefix](const std::string_view page) { return std::string{page_prefix(page)} + (page == "Annotate" ? ".save" : ".primary"); };
  const bool every_region = std::ranges::all_of(pages, [this, &page_prefix, &primary_action](const std::string_view page) {
   const std::string_view prefix = page_prefix(page);
-  return std::ranges::all_of(regions, [this, page](const std::string_view region) {
-   return page_bounds.contains(std::string{page} + ":" + std::string{region}) == (page != "Live" || region != "workflow.diagnostics");
-  }) && page_bounds.contains(std::string{page} + ":" + primary_action(page)) && !page_bounds.contains(std::string{page} + ":" + prefix + ".status");
+  return std::ranges::all_of(regions,
+          [this, page](const std::string_view region) { return page_bounds.contains(std::string{page} + ":" + std::string{region}) == (page != "Live" || region != "workflow.diagnostics"); }) &&
+         page_bounds.contains(std::string{page} + ":" + primary_action(page)) && !page_bounds.contains(std::string{page} + ":" + prefix + ".status");
  });
  const bool primary_progress_placement = std::ranges::all_of(pages, [&page_bound, &immediately_above, &primary_action](const std::string_view page) {
   const std::string action = primary_action(page);

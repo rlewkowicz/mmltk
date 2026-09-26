@@ -18,9 +18,7 @@ TEST_CASE("Torch execution binds a context before pinned host work on an unbound
  REQUIRE(cuCtxGetCurrent(&original) == CUDA_SUCCESS);
  REQUIRE(original != nullptr);
  const mmltk::testsupport::ScopedTestCleanup restore_context{[&] { static_cast<void>(cuCtxSetCurrent(original)); }};
- const auto execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
- const auto& p = execution.placement;
- const mmltk::common::system::ScopedExecutionPolicy policy({p.cpus, {}, 0, p.numa_node, -10, false});
+ const mmltk::common::system::ScopedExecutionPolicy policy(mmltk::frameworks::gpu::test_support::selected_test_execution_policy(0));
  const auto work = [](void* opaque) {
   torch_cuda::NumaHostTensor storage(0);
   auto view = storage.view({4}, at::kFloat);
@@ -42,9 +40,7 @@ TEST_CASE("NUMA tensors retain zero-copy storage and compact active shapes", "[c
  int count = 0;
  if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA unavailable; NUMA host tensor hardware behavior remains unverified");
  CUDA_ASSERT_OK(cudaSetDevice(0));
- const auto execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
- const auto& p = execution.placement;
- mmltk::common::system::ScopedExecutionPolicy policy({p.cpus, {}, 0, p.numa_node, -10, false});
+ const mmltk::common::system::ScopedExecutionPolicy policy(mmltk::frameworks::gpu::test_support::selected_test_execution_policy(0));
  at::Tensor retained;
  {
   mmltk::backend::ml::cuda::NumaHostTensor owner(0);

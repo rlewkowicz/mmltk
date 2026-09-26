@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -45,8 +46,8 @@ struct ComputeTerminal final {
  ComputeOperationOutcome outcome = ComputeOperationOutcome::Idle;
  std::uint64_t generation = 0U;
  std::uint64_t completed = 0U;
- [[= mmltk::frameworks::reflection::MaxBytes{kComputePathCapacity}]] std::string output;
- [[= mmltk::frameworks::reflection::MaxBytes{kComputeErrorCapacity}]] std::string detail;
+ MMLTK_MAX_BYTES(kComputePathCapacity) std::string output;
+ MMLTK_MAX_BYTES(kComputeErrorCapacity) std::string detail;
  [[nodiscard]] bool valid_worker_terminal() const noexcept {
   if (!valid_compute_text(output, kComputePathCapacity) || !valid_compute_text(detail, kComputeErrorCapacity)) return false;
   switch (outcome) {
@@ -80,7 +81,7 @@ struct ComputeProgress final {
  std::uint64_t sequence = 0U;
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::Completed}]] std::uint64_t completed = 0U;
  [[= reflection::ProgressField{reflection::ProgressFieldSemantic::Total}]] std::uint64_t total = 0U;
- [[= reflection::ProgressField{reflection::ProgressFieldSemantic::StageOrStatus}]][[= mmltk::frameworks::reflection::MaxBytes{kComputeStatusCapacity}]] std::string status;
+ [[= reflection::ProgressField{reflection::ProgressFieldSemantic::StageOrStatus}]] MMLTK_MAX_BYTES(kComputeStatusCapacity) std::string status;
  [[nodiscard]] bool valid() const noexcept { return sequence != 0U && valid_compute_text(status, kComputeStatusCapacity) && (total == 0U || completed <= total); }
  bool operator==(const ComputeProgress&) const = default;
 };

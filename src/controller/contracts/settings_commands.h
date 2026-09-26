@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include <cstdint>
@@ -16,17 +17,14 @@ inline constexpr std::size_t kMaxSettingsPathBytes = 512U;
 inline constexpr std::size_t kMaxSettingsFlatValueBytes = 16U * 1024U;
 inline constexpr std::size_t kMaxSettingsFlatValueItems = 64U;
 struct SettingsValueUpdate final {
- [[= mmltk::frameworks::reflection::MaxBytes{kMaxSettingsPathBytes}]] std::string path;
- [[= mmltk::frameworks::reflection::MaxBytes{
-  kMaxSettingsFlatValueBytes}]][[= mmltk::frameworks::reflection::MaxItems{kMaxSettingsFlatValueItems}]] mmltk::frameworks::serialization::wire::FlatValue value;
+ MMLTK_MAX_BYTES(kMaxSettingsPathBytes) std::string path;
+ MMLTK_MAX_BYTES(kMaxSettingsFlatValueBytes) MMLTK_MAX_ITEMS(kMaxSettingsFlatValueItems) mmltk::frameworks::serialization::wire::FlatValue value;
 };
 inline constexpr std::size_t kMaxSettingsUpdates = 64U;
 struct[[= reflection::all_feature_scope()]] SettingsUpdateRequest final {
  std::optional<mmltk::backend::models::rfdetr::TrainLaneConfiguration> lane_configuration;
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{
-  1}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{mmltk::backend::models::rfdetr::kMaximumTrainingModels}]] std::optional<std::uint32_t>
-  training_model_count;
- [[= mmltk::frameworks::reflection::MaxItems{kMaxSettingsUpdates}]][[= reflection::direct::SettingsUpdateValues{}]] std::inplace_vector<SettingsValueUpdate, kMaxSettingsUpdates> updates;
+ MMLTK_MINIMUM(std::uint32_t, 1) MMLTK_MAXIMUM(std::uint32_t, mmltk::backend::models::rfdetr::kMaximumTrainingModels) std::optional<std::uint32_t> training_model_count;
+ MMLTK_MAX_ITEMS(kMaxSettingsUpdates)[[= reflection::direct::SettingsUpdateValues{}]] std::inplace_vector<SettingsValueUpdate, kMaxSettingsUpdates> updates;
 };
 struct[[= reflection::all_feature_scope()]] SettingsResetRequest final {};
 MMLTK_REFLECT_FIELDS(SettingsValueUpdate)

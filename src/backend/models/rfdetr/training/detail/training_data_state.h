@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -10,9 +11,9 @@ namespace mmltk::backend::models::rfdetr {
 struct TrainingShard final {
  std::uint64_t model_id = 0;
  std::uint64_t seed = 42;
- [[= mmltk::frameworks::reflection::MaxItems{std::numeric_limits<std::uint32_t>::max()}]] std::vector<std::uint32_t> images;
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::data::MAX_CLASSES}]] std::vector<std::uint64_t> unique_support;
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::data::MAX_CLASSES}]] std::vector<std::uint32_t> missing_classes{};
+ MMLTK_MAX_ITEMS(std::numeric_limits<std::uint32_t>::max()) std::vector<std::uint32_t> images;
+ MMLTK_MAX_ITEMS(mmltk::backend::data::MAX_CLASSES) std::vector<std::uint64_t> unique_support;
+ MMLTK_MAX_ITEMS(mmltk::backend::data::MAX_CLASSES) std::vector<std::uint32_t> missing_classes {};
  bool operator==(const TrainingShard&) const = default;
 };
 struct TrainingDonorDescriptor final {
@@ -29,12 +30,12 @@ struct TrainingDataContinuation final {
  std::uint64_t plan_hash = 0;
  std::uint64_t epoch = 0;
  std::uint64_t next_microbatch = 0;
- [[= mmltk::frameworks::reflection::MaxItems{kMaximumTrainingDonorSlots}]] std::vector<TrainingDonorDescriptor> donors;
+ MMLTK_MAX_ITEMS(kMaximumTrainingDonorSlots) std::vector<TrainingDonorDescriptor> donors;
  bool operator==(const TrainingDataContinuation&) const = default;
 };
 struct TrainingPlanState final {
  std::uint64_t plan_hash = 0;
- [[= mmltk::frameworks::reflection::MaxItems{kMaximumTrainingModels}]] std::vector<TrainingShard> shards;
+ MMLTK_MAX_ITEMS(kMaximumTrainingModels) std::vector<TrainingShard> shards;
  bool operator==(const TrainingPlanState&) const = default;
 };
 MMLTK_REFLECT_FIELDS(TrainingShard)

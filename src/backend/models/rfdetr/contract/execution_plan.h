@@ -1,4 +1,7 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -12,26 +15,26 @@ enum class TrainBalancing : std::uint8_t { Off, Stratified, RareRepeatsStratifie
 enum class TrainMergeCadence : std::uint8_t { Epoch, Rounds };
 enum class TrainFinalPolicy : std::uint8_t { Off, Uniform, Explicit, ValidationGreedy };
 struct TrainModelSettings final {
- [[= mmltk::frameworks::reflection::Minimum<std::uint64_t>{1}]] std::uint64_t model_id = 1;
+ MMLTK_MINIMUM(std::uint64_t, 1) std::uint64_t model_id = 1;
  std::uint64_t seed = 42;
  TrainRecipeSettings recipe;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Finite{}]] double coefficient = 1;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_FINITE double coefficient = 1;
  bool operator==(const TrainModelSettings&) const = default;
 };
 struct TrainLaneConfiguration final {
  TrainLaneMode mode = TrainLaneMode::SharedGradients;
- [[= mmltk::frameworks::reflection::MaxItems{kMaximumTrainingModels}]] std::vector<TrainModelSettings> models;
- [[= mmltk::frameworks::reflection::Minimum<std::uint64_t>{1}]] std::uint64_t next_model_id = 1;
+ MMLTK_MAX_ITEMS(kMaximumTrainingModels) std::vector<TrainModelSettings> models;
+ MMLTK_MINIMUM(std::uint64_t, 1) std::uint64_t next_model_id = 1;
  TrainMergeCadence merge_cadence = TrainMergeCadence::Epoch;
- [[= mmltk::frameworks::reflection::Minimum<std::uint64_t>{1}]] std::uint64_t merge_rounds = 1;
+ MMLTK_MINIMUM(std::uint64_t, 1) std::uint64_t merge_rounds = 1;
  std::optional<TrainFinalPolicy> final_policy;
  bool operator==(const TrainLaneConfiguration&) const = default;
 };
 struct TrainDataPolicy final {
  TrainBalancing balancing = TrainBalancing::Off;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]] double rare_threshold = .001;
- [[= mmltk::frameworks::reflection::Minimum<double>{1.0}]][[= mmltk::frameworks::reflection::Maximum<double>{64.0}]][[= mmltk::frameworks::reflection::Finite{}]] double maximum_repeat_factor = 10;
- [[= mmltk::frameworks::reflection::Minimum<double>{1.0}]][[= mmltk::frameworks::reflection::Maximum<double>{16.0}]][[= mmltk::frameworks::reflection::Finite{}]] double maximum_draw_multiplier = 4;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_MAXIMUM(double, 1.0) MMLTK_FINITE double rare_threshold = .001;
+ MMLTK_MINIMUM(double, 1.0) MMLTK_MAXIMUM(double, 64.0) MMLTK_FINITE double maximum_repeat_factor = 10;
+ MMLTK_MINIMUM(double, 1.0) MMLTK_MAXIMUM(double, 16.0) MMLTK_FINITE double maximum_draw_multiplier = 4;
  bool operator==(const TrainDataPolicy&) const = default;
 };
 enum class ExecutionLimitation : std::uint8_t { None, ExperimentalIndependentModels, ExperimentalPeriodicAveraging, SourceCapacity, BackendCapacity };

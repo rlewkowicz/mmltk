@@ -1,9 +1,10 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 namespace mmltk::backend::data {
 struct NativePlacementOptions {
- [[= mmltk::frameworks::reflection::Minimum<int>{-1}]] int numa_node = -1;
+ MMLTK_MINIMUM(int, -1) int numa_node = -1;
  bool operator==(const NativePlacementOptions&) const = default;
 };
 struct DataLoadingOptions : NativePlacementOptions {

@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include "src/controller/contracts/annotation_limits.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
@@ -145,7 +146,7 @@ struct AnnotationMaskRun final {
  auto operator<=>(const AnnotationMaskRun&) const = default;
 };
 struct AnnotationMask final {
- [[= mmltk::frameworks::reflection::MaxItems{kAnnotationMaskRunCapacity}]] std::vector<AnnotationMaskRun> runs{};
+ MMLTK_MAX_ITEMS(kAnnotationMaskRunCapacity) std::vector<AnnotationMaskRun> runs {};
  std::uint16_t cleanup_radius = 0U;
  AnnotationMaskCleanup cleanup = AnnotationMaskCleanup::LargestComponent;
  bool present = false;
@@ -163,10 +164,10 @@ struct AnnotationObject final {
  AnnotationColorRange sup{};
  // CLEANUP-IGNORE: Object geometry and scene catalogs are distinct canonical bounded fields, not parallel mappings.
  AnnotationColorRange nosup{};
- [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<AnnotationPoint> mask_points{};
- [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<AnnotationSplineKnot> spline_knots{};
- [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<AnnotationSkeletonNode> skeleton_nodes{};
- [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<AnnotationEdge> skeleton_edges{};
+ MMLTK_MAX_ITEMS(kAnnotationGeometryCapacity) std::vector<AnnotationPoint> mask_points {};
+ MMLTK_MAX_ITEMS(kAnnotationGeometryCapacity) std::vector<AnnotationSplineKnot> spline_knots {};
+ MMLTK_MAX_ITEMS(kAnnotationGeometryCapacity) std::vector<AnnotationSkeletonNode> skeleton_nodes {};
+ MMLTK_MAX_ITEMS(kAnnotationGeometryCapacity) std::vector<AnnotationEdge> skeleton_edges {};
  std::uint16_t category = 0U;
  bool spline_closed = false;
  bool enabled = true;
@@ -192,7 +193,7 @@ struct AnnotationTargetIdentity final {
 };
 struct AnnotationObjectIdentity final {
  std::uint64_t object = 0U;
- [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<std::uint64_t> elements{};
+ MMLTK_MAX_ITEMS(kAnnotationGeometryCapacity) std::vector<std::uint64_t> elements {};
  auto operator<=>(const AnnotationObjectIdentity&) const = default;
 };
 struct AnnotationPointerTarget final {
@@ -221,9 +222,9 @@ struct AnnotationEditorFacts final {
 // persistence. It deliberately has no history or operation identity.
 struct AnnotationSceneContent final {
  WorkspaceResource document{};
- [[= mmltk::frameworks::reflection::MaxItems{kAnnotationCategoryCapacity}]] std::vector<mmltk::backend::data::catalog::ClassName> categories{};
- [[= mmltk::frameworks::reflection::MaxItems{kAnnotationCategoryCapacity}]] std::vector<AnnotationColor> palette{};
- [[= mmltk::frameworks::reflection::MaxItems{kAnnotationObjectCapacity}]] std::vector<AnnotationObject> objects{};
+ MMLTK_MAX_ITEMS(kAnnotationCategoryCapacity) std::vector<mmltk::backend::data::catalog::ClassName> categories {};
+ MMLTK_MAX_ITEMS(kAnnotationCategoryCapacity) std::vector<AnnotationColor> palette {};
+ MMLTK_MAX_ITEMS(kAnnotationObjectCapacity) std::vector<AnnotationObject> objects {};
  std::uint16_t frame_width = 0U;
  std::uint16_t frame_height = 0U;
  std::uint32_t frame_index = 0U;
@@ -265,7 +266,7 @@ struct AnnotationToolCapability final {
 struct AnnotationUiState final {
  AnnotationSceneContent scene{};
  AnnotationEditorFacts editor{};
- [[= mmltk::frameworks::reflection::MaxItems{mmltk::frameworks::reflection::enum_entries<AnnotationTool>().size()}]] std::vector<AnnotationToolCapability> tool_capabilities{};
+ MMLTK_MAX_ITEMS(mmltk::frameworks::reflection::enum_entries<AnnotationTool>().size()) std::vector<AnnotationToolCapability> tool_capabilities {};
  bool can_undo = false;
  bool can_redo = false;
  bool source_navigation_available = false;

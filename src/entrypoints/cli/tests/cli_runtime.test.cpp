@@ -1,3 +1,4 @@
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <unistd.h>
 #include <algorithm>
 #include <array>
@@ -166,17 +167,17 @@ enum class ParserMode : std::uint8_t {
  FullTrace,
 };
 struct ParserNestedState {
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]][[= mmltk::frameworks::reflection::Maximum<int>{10}]] int count = 0;
+ MMLTK_MINIMUM(int, 0) MMLTK_MAXIMUM(int, 10) int count = 0;
  bool operator==(const ParserNestedState&) const = default;
 };
 struct ParserRequest {
  ParserNestedState nested;
- [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{1U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{4U}]] std::uint32_t unsigned_count = 1U;
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]] double ratio = 0.5;
- [[= mmltk::frameworks::reflection::MaxBytes{4U}]] std::string label;
+ MMLTK_MINIMUM(std::uint32_t, 1U) MMLTK_MAXIMUM(std::uint32_t, 4U) std::uint32_t unsigned_count = 1U;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_MAXIMUM(double, 1.0) MMLTK_FINITE double ratio = 0.5;
+ MMLTK_MAX_BYTES(4U) std::string label;
  bool enabled = true;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::optional<fs::path> optional_path;
- [[= mmltk::frameworks::reflection::MaxItems{2U}]] std::vector<int> values;
+ MMLTK_MAX_PATH_BYTES std::optional<fs::path> optional_path;
+ MMLTK_MAX_ITEMS(2U) std::vector<int> values;
  ParserMode mode = ParserMode::Fast;
  int positional = 0;
  bool operator==(const ParserRequest&) const = default;
@@ -185,11 +186,11 @@ MMLTK_REFLECT_FIELDS(ParserNestedState)
 MMLTK_REFLECT_FIELDS(ParserRequest)
 MMLTK_REFLECT_ENUM(ParserMode)
 struct InheritedCliBase {
- [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{1}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
+ MMLTK_MINIMUM(std::int32_t, 1) MMLTK_MAXIMUM(std::int32_t, 9) std::int32_t inherited_limit = 4;
 };
 struct InheritedCliRequest final : InheritedCliBase {
- [[= mmltk::frameworks::reflection::Minimum<double>{0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]] double derived_ratio = 0.5;
- [[= mmltk::frameworks::reflection::MaxBytes{8U}]] std::string boundary_owned;
+ MMLTK_MINIMUM(double, 0.0) MMLTK_MAXIMUM(double, 1.0) MMLTK_FINITE double derived_ratio = 0.5;
+ MMLTK_MAX_BYTES(8U) std::string boundary_owned;
 };
 MMLTK_REFLECT_FIELDS(InheritedCliBase)
 MMLTK_REFLECT_FIELDS(InheritedCliRequest)

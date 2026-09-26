@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include "prediction_output.h"
 #include "src/backend/data/benchmark_dataset_options.h"
 #include <array>
@@ -38,24 +39,20 @@ enum class SourceKind : std::uint8_t {
 };
 struct SourceSelectionState {
  SourceKind kind = SourceKind::CompiledDataset;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
-  [= reflection::FileDialog<"Select compiled dataset", "Compiled datasets", "*.mmltk *.bin">{.mode = FileDialogMode::OpenFile}]] std::string compiled_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
-  [= reflection::FileDialog<"Select image", "Images", "*.png *.jpg *.jpeg *.bmp *.webp">{.mode = FileDialogMode::OpenFile}]] std::string single_image_path;
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= reflection::FileDialog<"Select image directory", "Directories", "*">{.mode = FileDialogMode::OpenFolder}]] std::string image_directory;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
-  [= reflection::FileDialog<"Select video file", "Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v">{.mode = FileDialogMode::OpenFile}]] std::string video_file_path;
+ MMLTK_MAX_PATH_BYTES[[= reflection::FileDialog<"Select compiled dataset", "Compiled datasets", "*.mmltk *.bin">{.mode = FileDialogMode::OpenFile}]] std::string compiled_path;
+ MMLTK_MAX_PATH_BYTES[[= reflection::FileDialog<"Select image", "Images", "*.png *.jpg *.jpeg *.bmp *.webp">{.mode = FileDialogMode::OpenFile}]] std::string single_image_path;
+ MMLTK_MAX_PATH_BYTES[[= reflection::FileDialog<"Select image directory", "Directories", "*">{.mode = FileDialogMode::OpenFolder}]] std::string image_directory;
+ MMLTK_MAX_PATH_BYTES[[= reflection::FileDialog<"Select video file", "Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v">{.mode = FileDialogMode::OpenFile}]] std::string video_file_path;
  bool recursive = false;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_index = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int capture_width = 1920;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int capture_height = 1080;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int capture_fps = 120;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int v4l2_buffer_count = 4;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int crop_x = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int crop_y = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int crop_width = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int crop_height = 0;
+ MMLTK_MINIMUM(int, 0) int device_index = 0;
+ MMLTK_MINIMUM(int, 1) int capture_width = 1920;
+ MMLTK_MINIMUM(int, 1) int capture_height = 1080;
+ MMLTK_MINIMUM(int, 1) int capture_fps = 120;
+ MMLTK_MINIMUM(int, 1) int v4l2_buffer_count = 4;
+ MMLTK_MINIMUM(int, 0) int crop_x = 0;
+ MMLTK_MINIMUM(int, 0) int crop_y = 0;
+ MMLTK_MINIMUM(int, 0) int crop_width = 0;
+ MMLTK_MINIMUM(int, 0) int crop_height = 0;
  bool operator==(const SourceSelectionState&) const = default;
 };
 struct ResolvedVideoCrop {
@@ -91,48 +88,44 @@ inline constexpr std::string_view kDefaultModelPresetName = mmltk::backend::mode
 inline constexpr int kDefaultModelResolution = static_cast<int>(mmltk::backend::models::rfdetr::kPresetCatalog.front().resolution);
 inline constexpr int kMaxExploreGridColumns = 99;
 struct WorkflowModelSelectionState {
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumNameBytes}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]][
-  [= mmltk::frameworks::reflection::CatalogProvider<mmltk::backend::models::rfdetr::RfdetrPresetCatalog>{}]] std::string preset_name{std::string(kDefaultModelPresetName)};
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int model_resolution = kDefaultModelResolution;
+ MMLTK_MAX_NAME_BYTES MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Preset)
+  MMLTK_CATALOG(mmltk::backend::models::rfdetr::RfdetrPresetCatalog) std::string preset_name{std::string(kDefaultModelPresetName)};
+ MMLTK_MINIMUM(int, 1) int model_resolution = kDefaultModelResolution;
  ModelSelectionSource model_source = ModelSelectionSource::Canonical;
  ModelArtifactInputKind model_input = ModelArtifactInputKind::None;
 };
 struct UiSettingsState {
  bool dark_mode = false;
  bool show_workspace_performance = false;
- [[= mmltk::frameworks::reflection::Minimum<float>{0.85F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.75F}]][[= mmltk::frameworks::reflection::Finite{}]] float ui_scale = 1.0f;
- [[= mmltk::frameworks::reflection::Minimum<float>{10.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{32.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float font_size = 14.0f;
- [[= mmltk::frameworks::reflection::Minimum<float>{9.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{28.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float secondary_font_size = 12.0f;
- [[= mmltk::frameworks::reflection::Minimum<float>{9.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{28.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float mono_font_size = 12.0f;
- [[= mmltk::frameworks::reflection::Minimum<float>{9.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{31.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float text_input_font_size = 13.0f;
- [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float crop_edge_hit_half_width = 8.0f;
- [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float crop_corner_hit_size = 20.0f;
- [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float crop_handle_radius = 6.0f;
+ MMLTK_MINIMUM(float, 0.85F) MMLTK_MAXIMUM(float, 1.75F) MMLTK_FINITE float ui_scale = 1.0f;
+ MMLTK_MINIMUM(float, 10.0F) MMLTK_MAXIMUM(float, 32.0F) MMLTK_FINITE float font_size = 14.0f;
+ MMLTK_MINIMUM(float, 9.0F) MMLTK_MAXIMUM(float, 28.0F) MMLTK_FINITE float secondary_font_size = 12.0f;
+ MMLTK_MINIMUM(float, 9.0F) MMLTK_MAXIMUM(float, 28.0F) MMLTK_FINITE float mono_font_size = 12.0f;
+ MMLTK_MINIMUM(float, 9.0F) MMLTK_MAXIMUM(float, 31.0F) MMLTK_FINITE float text_input_font_size = 13.0f;
+ MMLTK_MINIMUM(float, 0.0F) MMLTK_FINITE float crop_edge_hit_half_width = 8.0f;
+ MMLTK_MINIMUM(float, 0.0F) MMLTK_FINITE float crop_corner_hit_size = 20.0f;
+ MMLTK_MINIMUM(float, 0.0F) MMLTK_FINITE float crop_handle_radius = 6.0f;
  WorkspaceAspectRatio workspace_aspect_ratio = WorkspaceAspectRatio::Widescreen;
- [[= mmltk::frameworks::reflection::Minimum<int>{kMinAnnotationBrushRadius}]][[= mmltk::frameworks::reflection::Maximum<int>{kMaxAnnotationBrushRadius}]] int annotation_brush_radius =
-  kDefaultAnnotationBrushRadius;
- [[= mmltk::frameworks::reflection::Minimum<int>{kMinAnnotationMaskCleanupRadius}]][[= mmltk::frameworks::reflection::Maximum<int>{kMaxAnnotationMaskCleanupRadius}]] int mask_cleanup_radius =
-  kDefaultAnnotationMaskCleanupRadius;
+ MMLTK_MINIMUM(int, kMinAnnotationBrushRadius) MMLTK_MAXIMUM(int, kMaxAnnotationBrushRadius) int annotation_brush_radius = kDefaultAnnotationBrushRadius;
+ MMLTK_MINIMUM(int, kMinAnnotationMaskCleanupRadius) MMLTK_MAXIMUM(int, kMaxAnnotationMaskCleanupRadius) int mask_cleanup_radius = kDefaultAnnotationMaskCleanupRadius;
 };
 struct ModelArtifactSelectionState {
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string class_layout_path{};
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string weights_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string onnx_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string tensorrt_path;
+ MMLTK_MAX_PATH_BYTES std::string class_layout_path{};
+ MMLTK_MAX_PATH_BYTES std::string weights_path;
+ MMLTK_MAX_PATH_BYTES std::string onnx_path;
+ MMLTK_MAX_PATH_BYTES std::string tensorrt_path;
  // CLEANUP-IGNORE: The normalized artifact projection and stored workflow selection have different field ownership.
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumNameBytes}]][[= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::Preset>{}]][
-  [= mmltk::frameworks::reflection::CatalogProvider<mmltk::backend::models::rfdetr::RfdetrPresetCatalog>{}]] std::string preset_name{std::string(kDefaultModelPresetName)};
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int resolution = kDefaultModelResolution;
+ MMLTK_MAX_NAME_BYTES MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::Preset)
+  MMLTK_CATALOG(mmltk::backend::models::rfdetr::RfdetrPresetCatalog) std::string preset_name{std::string(kDefaultModelPresetName)};
+ MMLTK_MINIMUM(int, 1) int resolution = kDefaultModelResolution;
  ModelSelectionSource source = ModelSelectionSource::Canonical;
  ModelArtifactInputKind input = ModelArtifactInputKind::None;
 };
 struct TrainExecutionPaneState {
  TrainExecutionTarget execution_target = TrainExecutionTarget::Local;
  std::array<bool, 5> remote_family_enabled{{true, true, true, true, true}};
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string remote_container_image;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string remote_launch_template;
+ MMLTK_MAX_NAME_BYTES std::string remote_container_image;
+ MMLTK_MAX_PATH_BYTES std::string remote_launch_template;
 };
 struct TrainViewState : TrainExecutionPaneState {
  TrainViewState() {
@@ -154,9 +147,9 @@ struct TrainViewState : TrainExecutionPaneState {
  mmltk::backend::models::rfdetr::TrainRequest request;
  ModelSelectionSource model_source = ModelSelectionSource::Canonical;
  ModelArtifactInputKind model_input = ModelArtifactInputKind::Weights;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select dataset source", "Directories", "*">{
+ MMLTK_MAX_PATH_BYTES[[= mmltk::controller::contracts::reflection::FileDialog<"Select dataset source", "Directories", "*">{
   .mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string dataset_source_dir = "./dataset";
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Directories", "*">{
+ MMLTK_MAX_PATH_BYTES[[= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Directories", "*">{
   .mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string compiled_dataset_dir = "./compiled";
  WorkflowOutputSelection output{};
  bool use_compiled_directory_defaults = true;
@@ -197,29 +190,27 @@ struct PredictViewState {
  SourceSelectionState source;
  ModelSelectionSource model_source = ModelSelectionSource::Canonical;
  ModelArtifactInputKind model_input = ModelArtifactInputKind::Weights;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int live_split_count = 1;
+ MMLTK_MINIMUM(int, 1) int live_split_count = 1;
 };
 struct AnnotateViewState : WorkflowModelSelectionState {
  AnnotateViewState() { source.kind = SourceKind::ImageFolder; }
  SourceSelectionState source;
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation weights", "Weights", "*.pt *.pth *.ckpt *.safetensors">{
+ MMLTK_MAX_PATH_BYTES[[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation weights", "Weights", "*.pt *.pth *.ckpt *.safetensors">{
   .mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string weights_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
+ MMLTK_MAX_PATH_BYTES[
   [= mmltk::controller::contracts::reflection::FileDialog<"Select annotation ONNX", "ONNX files", "*.onnx">{.mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string onnx_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation engine", "TensorRT files",
+ MMLTK_MAX_PATH_BYTES[[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation engine", "TensorRT files",
   // CLEANUP-IGNORE: Each annotation artifact field
   // owns a distinct reflected dialog identity.
   "*.engine *.trt">{.mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string tensorrt_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-  [[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation output", "Directories", "*">{.mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string output_dir =
-   "./annotated-scenes";
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string split = "train";
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string backend = "auto";
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int max_dets_per_image = 300;
- [[= mmltk::frameworks::reflection::Minimum<float>{0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]][
-  [= mmltk::frameworks::reflection::Presentation<mmltk::frameworks::reflection::PresentationKind::UnitInterval>{}]] float threshold = 0.25f;
+ MMLTK_MAX_PATH_BYTES
+ [[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation output", "Directories", "*">{.mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string output_dir =
+  "./annotated-scenes";
+ MMLTK_MAX_NAME_BYTES std::string split = "train";
+ MMLTK_MAX_NAME_BYTES std::string backend = "auto";
+ MMLTK_MINIMUM(int, 0) int device_id = 0;
+ MMLTK_MINIMUM(int, 1) int max_dets_per_image = 300;
+ MMLTK_MINIMUM(float, 0.0F) MMLTK_MAXIMUM(float, 1.0F) MMLTK_FINITE MMLTK_PRESENTATION(mmltk::frameworks::reflection::PresentationKind::UnitInterval) float threshold = 0.25f;
  bool allow_fp16 = true;
  bool full_frame = false;
  mmltk::backend::models::rfdetr::CompilationMode compile_mode = mmltk::backend::models::rfdetr::CompilationMode::kSelective;
@@ -228,11 +219,10 @@ struct AnnotateViewState : WorkflowModelSelectionState {
 struct ExportViewState : WorkflowModelSelectionState {
  ExportViewState() { model_input = ModelArtifactInputKind::Weights; }
  WorkflowOutputSelection output{};
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]][
-  [= reflection::FileDialog<"Select class layout", "Class descriptors", "*.classes.json *.json">{.mode = FileDialogMode::OpenFile}]] std::string class_layout_path;
- [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string weights_path;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int opset_version = 19;
+ MMLTK_MAX_PATH_BYTES[[= reflection::FileDialog<"Select class layout", "Class descriptors", "*.classes.json *.json">{.mode = FileDialogMode::OpenFile}]] std::string class_layout_path;
+ MMLTK_MAX_PATH_BYTES std::string weights_path;
+ MMLTK_MINIMUM(int, 0) int device_id = 0;
+ MMLTK_MINIMUM(int, 1) int opset_version = 19;
  bool allow_fp16 = true;
  bool export_onnx = true;
  bool build_tensorrt = true;
@@ -244,17 +234,16 @@ struct ExploreViewState : mmltk::backend::data::DataLoadingOptions {
   overlay_classes.fill(true);
  }
  ExploreDatasetSource dataset_source = ExploreDatasetSource::Train;
- [[= mmltk::frameworks::reflection::MaxBytes{
-  mmltk::frameworks::reflection::kMaximumPathBytes}]][[= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Compiled datasets", "*.mmltk *.bin">{
+ MMLTK_MAX_PATH_BYTES[[= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Compiled datasets", "*.mmltk *.bin">{
   .mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string custom_compiled_path;
- [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
- [[= mmltk::frameworks::reflection::Minimum<int>{1}]][[= mmltk::frameworks::reflection::Maximum<int>{kMaxExploreGridColumns}]] int grid_width = 3;
+ MMLTK_MINIMUM(int, 0) int device_id = 0;
+ MMLTK_MINIMUM(int, 1) MMLTK_MAXIMUM(int, kMaxExploreGridColumns) int grid_width = 3;
  ExploreOrder order = ExploreOrder::Sequential;
  std::uint64_t shuffle_seed = 0U;
  bool require_boxes = false;
  bool require_masks = false;
- [[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{10'000U}]] std::uint32_t min_instances = 0U;
- [[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{10'000U}]] std::uint32_t max_instances = 10'000U;
+ MMLTK_MAXIMUM(std::uint32_t, 10'000U) std::uint32_t min_instances = 0U;
+ MMLTK_MAXIMUM(std::uint32_t, 10'000U) std::uint32_t max_instances = 10'000U;
  std::uint64_t min_compiled_index = 0U;
  std::uint64_t max_compiled_index = std::numeric_limits<std::uint64_t>::max();
  [[= reflection::PersistenceMetadata{}]] ExploreClassCatalogIdentity class_catalog_identity = 0U;

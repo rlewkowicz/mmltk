@@ -1,4 +1,7 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -28,9 +31,8 @@ struct WorkspaceMouse final {
  std::uint8_t modifiers = 0U;
  WorkspaceWheelUnit wheel_unit = WorkspaceWheelUnit::Lines;
  WorkspacePoint wheel{};
- [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{
-  contracts::kMinAnnotationBrushRadius}]][[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationBrushRadius}]] std::uint16_t brush_radius =
-  contracts::kDefaultAnnotationBrushRadius;
+ MMLTK_MINIMUM(std::uint16_t, contracts::kMinAnnotationBrushRadius)
+ MMLTK_MAXIMUM(std::uint16_t, contracts::kMaxAnnotationBrushRadius) std::uint16_t brush_radius = contracts::kDefaultAnnotationBrushRadius;
  [[nodiscard]] bool valid() const noexcept {
   namespace reflection = mmltk::frameworks::reflection;
   return presentation_source_session(source) != 0U && peer_epoch != 0U && reflection::enum_contains(kind) && reflection::enum_contains(button) && reflection::enum_contains(wheel_unit) &&

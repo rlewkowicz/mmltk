@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <optional>
 #include <cstdint>
 #include <expected>
@@ -16,7 +17,7 @@ namespace mmltk::controller::subsystems::system {
 // private service request, and has neither runtime authority nor effects.
 struct ComputeIntentMaterializer final {
  struct Refusal final {
-  [[= mmltk::frameworks::reflection::MaxBytes{mmltk::controller::contracts::kArtifactErrorCapacity}]] std::string detail;
+  MMLTK_MAX_BYTES(mmltk::controller::contracts::kArtifactErrorCapacity) std::string detail;
  };
  using ValidationMaterialization = std::expected<mmltk::backend::models::rfdetr::ValidateRequest, Refusal>;
  using ExportMaterialization = std::expected<mmltk::controller::ExportRunRequest, Refusal>;

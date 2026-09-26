@@ -1,0 +1,25 @@
+#pragma once
+#include <optional>
+#include <vector>
+namespace policy = ::mmltk::frameworks::reflection;
+struct TrainingSourceCatalog {
+ [[= ::policy::MaxItems{kTrainingSourceCapacity}]] std::vector<MetricSource> available;
+ [[= ::mmltk::frameworks::reflection::MaxItems{
+   kMaximumTrainingModels + 1U}]] std::vector<Failure> failures;
+ [[= ::policy::MaxBytes{64}]][[= ::policy::MinBytes{1}]] std::string identity = "MMLTK_MAX_BYTES(99)";
+ [[= ::policy::MaxBytes{::policy::kMaximumPathBytes}]] std::filesystem::path directory;
+ [[= ::policy::Minimum<double>{0.0}]][[= ::policy::Maximum<double>{1.0}]][[= ::policy::Finite{}]] double fraction = 0.5;
+ [[= ::policy::CatalogProvider<Catalog<int, float>>{}]] int selection = 0;
+ [[= ::policy::MaxItems{std::integral_constant<std::size_t, 2>::value}]] std::optional<std::vector<int>> values;
+ MMLTK_MAX_BYTES(4) std::string already;
+ bool operator==(const TrainingSourceCatalog&) const = default;
+};
+MMLTK_REFLECT_FIELDS(TrainingSourceCatalog)
+[[nodiscard]] int inspect(const TrainingSourceCatalog&) noexcept;
+// [[= policy::MaxBytes{99}]] is an example, not a declaration.
+const auto literal = R"raw(
+#if SOMETHING
+[[= policy::MaxBytes{99}]]
+#define MMLTK_MAX_BYTES(X) broken
+)raw";
+#define EXAMPLE [[= policy::MaxBytes{99}]]

@@ -1,4 +1,6 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/controller/presentation/visual_source_projection.h"
 #include "src/controller/contracts/workspace_input.h"
 #include <memory>
@@ -29,9 +31,8 @@ struct AnnotationPointer final {
  // CLEANUP-IGNORE: The resolved native pointer and transport mouse enforce the same canonical brush bounds but retain distinct
  // lifetimes.
  contracts::AnnotationPoint point{};
- [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{
-  contracts::kMinAnnotationBrushRadius}]][[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationBrushRadius}]] std::uint16_t brush_radius =
-  contracts::kDefaultAnnotationBrushRadius;
+ MMLTK_MINIMUM(std::uint16_t, contracts::kMinAnnotationBrushRadius)
+ MMLTK_MAXIMUM(std::uint16_t, contracts::kMaxAnnotationBrushRadius) std::uint16_t brush_radius = contracts::kDefaultAnnotationBrushRadius;
  [[nodiscard]] bool valid() const noexcept {
   return mmltk::frameworks::reflection::enum_contains(phase) && interaction_id != 0U && sequence != 0U && target.valid() && point.finite() && brush_radius >= contracts::kMinAnnotationBrushRadius &&
          brush_radius <= contracts::kMaxAnnotationBrushRadius;
@@ -43,7 +44,7 @@ struct AnnotationOpen final {
  VisualExtent target{};
 };
 struct AnnotationSave final {
- [[= mmltk::frameworks::reflection::MaxBytes{4096U}]] std::string destination;
+ MMLTK_MAX_BYTES(4096U) std::string destination;
 };
 struct AnnotationToolEdit final {
  contracts::AnnotationTool tool = contracts::AnnotationTool::Select;
@@ -83,9 +84,8 @@ struct AnnotationSkeletonEdit final {
 };
 struct AnnotationMaskCleanupEdit final {
  contracts::AnnotationMaskCleanup operation = contracts::AnnotationMaskCleanup::LargestComponent;
- [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{
-  contracts::kMinAnnotationMaskCleanupRadius}]][[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationMaskCleanupRadius}]] std::uint16_t radius =
-  contracts::kDefaultAnnotationMaskCleanupRadius;
+ MMLTK_MINIMUM(std::uint16_t, contracts::kMinAnnotationMaskCleanupRadius)
+ MMLTK_MAXIMUM(std::uint16_t, contracts::kMaxAnnotationMaskCleanupRadius) std::uint16_t radius = contracts::kDefaultAnnotationMaskCleanupRadius;
 };
 struct AnnotationMaskColorsEdit final {
  contracts::AnnotationColorRange sup{};
@@ -157,7 +157,7 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Lat
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] AnnotationFailed final {
  AnnotationSnapshot snapshot{};
  // CLEANUP-IGNORE: This critical Annotation detail is a distinct reflected event boundary.
- [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
+ MMLTK_MAX_BYTES(kVisualFailureByteCapacity) std::string detail;
 };
 class AnnotationSystem final {
 public:

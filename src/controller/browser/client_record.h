@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include <array>
@@ -33,35 +34,34 @@ inline constexpr std::size_t kMaxErrorDetailBytes = 512U;
 inline constexpr std::size_t kMaxIntentFields = 64U;
 static_assert(kMaxIntentValueDepth == wire::kMaximumNestingDepth);
 struct IntentField final {
- [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t field_id = 0U;
- [[= field_policy::MaxBytes{
-  kMaxIntentValueBytes}]][[= field_policy::MaxItems{kMaxIntentValueItems}]] wire::Value value{};  // CLEANUP-IGNORE: Intent fields and System events are separate dynamic-value wire records.
+ MMLTK_MINIMUM_VALUE(std::uint64_t{1U}) std::uint64_t field_id = 0U;
+ MMLTK_MAX_BYTES(kMaxIntentValueBytes) MMLTK_MAX_ITEMS(kMaxIntentValueItems) wire::Value value {};  // CLEANUP-IGNORE: Intent fields and System events are separate dynamic-value wire records.
  bool operator==(const IntentField&) const = default;
 };
 struct Intent final {
  std::uint64_t protocol_version = kBrowserProtocolVersion;
- [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t correlation = 0U;
- [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t endpoint_id = 0U;
- [[= field_policy::MaxItems{kMaxIntentFields}]] std::vector<IntentField> fields;
+ MMLTK_MINIMUM_VALUE(std::uint64_t{1U}) std::uint64_t correlation = 0U;
+ MMLTK_MINIMUM_VALUE(std::uint64_t{1U}) std::uint64_t endpoint_id = 0U;
+ MMLTK_MAX_ITEMS(kMaxIntentFields) std::vector<IntentField> fields;
  bool operator==(const Intent&) const = default;
 };
 struct Interaction final {
  std::uint64_t protocol_version = kBrowserProtocolVersion;
- [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t endpoint_id = 0U;
- [[= field_policy::MaxBytes{kMaxIntentValueBytes}]] wire::ByteBuffer value{};
+ MMLTK_MINIMUM_VALUE(std::uint64_t{1U}) std::uint64_t endpoint_id = 0U;
+ MMLTK_MAX_BYTES(kMaxIntentValueBytes) wire::ByteBuffer value {};
  bool operator==(const Interaction&) const = default;
 };
 // Connection bootstrap establishes protocol/schema identity. Interaction opcodes
 // are projected from the canonical endpoint order, never a parallel registry.
 struct CompactInteraction final {
  std::uint64_t opcode = 0U;
- [[= field_policy::MaxBytes{kMaxIntentValueBytes}]] wire::ByteBuffer value{};
+ MMLTK_MAX_BYTES(kMaxIntentValueBytes) wire::ByteBuffer value {};
 };
 MMLTK_REFLECT_FIELDS(CompactInteraction)
 // CLEANUP-IGNORE: System snapshots and intent fields are distinct wire records with different byte limits and stable identities.
 struct SystemSnapshot final {
- [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t system_id = 0U;
- [[= field_policy::MaxBytes{kMaxOutputValueBytes}]][[= field_policy::MaxItems{kMaxOutputValueItems}]] wire::Value value{};
+ MMLTK_MINIMUM_VALUE(std::uint64_t{1U}) std::uint64_t system_id = 0U;
+ MMLTK_MAX_BYTES(kMaxOutputValueBytes) MMLTK_MAX_ITEMS(kMaxOutputValueItems) wire::Value value {};
  bool operator==(const SystemSnapshot&) const = default;
 };
 // Opaque to Firefox. The source projection captures this value against the
@@ -77,30 +77,30 @@ struct Bootstrap final {
  std::uint64_t protocol_version = kBrowserProtocolVersion;
  std::array<std::uint64_t, 2U> schema_fingerprint{};
  std::uint64_t input_epoch = 0U;
- [[= field_policy::MaxItems{kMaxSnapshotCount}]] std::vector<SystemSnapshot> snapshots;
+ MMLTK_MAX_ITEMS(kMaxSnapshotCount) std::vector<SystemSnapshot> snapshots;
  bool operator==(const Bootstrap&) const = default;
 };
 struct ApplicationErrorRecord final {
  mmltk::controller::contracts::ApplicationErrorCategory category = mmltk::controller::contracts::ApplicationErrorCategory::Failed;
  // CLEANUP-IGNORE: Error detail and reply payload apply different wire types despite sharing the envelope byte
  // budget.
- [[= field_policy::MaxBytes{kMaxErrorDetailBytes}]] std::string detail;
+ MMLTK_MAX_BYTES(kMaxErrorDetailBytes) std::string detail;
  bool operator==(const ApplicationErrorRecord&) const = default;
 };
 struct IntentReply final {
  std::uint64_t protocol_version = kBrowserProtocolVersion;
- [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t correlation = 0U;
- [[= field_policy::MaxBytes{kMaxOutputValueBytes}]][[= field_policy::MaxItems{kMaxOutputValueItems}]] std::optional<wire::Value> result;
+ MMLTK_MINIMUM_VALUE(std::uint64_t{1U}) std::uint64_t correlation = 0U;
+ MMLTK_MAX_BYTES(kMaxOutputValueBytes) MMLTK_MAX_ITEMS(kMaxOutputValueItems) std::optional<wire::Value> result;
  std::optional<ApplicationErrorRecord> error{};
  bool operator==(const IntentReply&) const = default;
 };
 struct SystemEvent final {
  std::uint64_t protocol_version = kBrowserProtocolVersion;
- [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t system_id = 0U;
- [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t event_id = 0U;
+ MMLTK_MINIMUM_VALUE(std::uint64_t{1U}) std::uint64_t system_id = 0U;
+ MMLTK_MINIMUM_VALUE(std::uint64_t{1U}) std::uint64_t event_id = 0U;
  mmltk::controller::contracts::reflection::EventDelivery delivery = mmltk::controller::contracts::reflection::EventDelivery::Transient;
  std::uint64_t state_revision = 0U;
- [[= field_policy::MaxBytes{kMaxOutputValueBytes}]][[= field_policy::MaxItems{kMaxOutputValueItems}]] wire::Value value{};
+ MMLTK_MAX_BYTES(kMaxOutputValueBytes) MMLTK_MAX_ITEMS(kMaxOutputValueItems) wire::Value value {};
  bool operator==(const SystemEvent&) const = default;
 };
 struct InteractionRejected final {

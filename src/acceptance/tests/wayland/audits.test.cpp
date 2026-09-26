@@ -2548,8 +2548,8 @@ TEST_CASE("Dataset terminal presentation requires complete captions and collapse
  }
  for (const std::string defect : {"none", "retained-text", "retained-space"}) {
   BrowserAudit audit;
-  audit.consume({{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.area"}, {"detail", defect == "retained-text" ? "Failed" : ""},
-   {"a", 10}, {"b", 10}, {"c", 200}, {"d", defect == "retained-space" ? 15.6 : 0.0}});
+  audit.consume({{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.area"}, {"detail", defect == "retained-text" ? "Failed" : ""}, {"a", 10}, {"b", 10}, {"c", 200},
+   {"d", defect == "retained-space" ? 15.6 : 0.0}});
   audit.consume({{"event", "integration.dataset_frame"}, {"a", 206U}});
   audit.consume({{"event", "integration.dataset_fixture"}, {"a", 6U}, {"b", 206U}, {"c", 4U}, {"d", 1U}});
   CHECK(audit.dataset_presentation_valid == (defect == "none"));

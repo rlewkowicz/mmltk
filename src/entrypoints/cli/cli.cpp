@@ -1,3 +1,4 @@
+#include "src/frameworks/reflection/declaration_annotations.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -35,12 +36,12 @@ int handle_rfdetr_cli(std::span<const std::string_view> arguments, const logging
 #endif
 namespace {
 struct BenchCommandRequest final : data::DataLoadingOptions {
- [[= reflection::MaxBytes{reflection::kMaximumPathBytes}]] std::string compiled_path;
- [[= reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 32U;
- [[= reflection::Minimum<int>{1}]] int epochs = 1;
+ MMLTK_MAX_PATH_BYTES std::string compiled_path;
+ MMLTK_MINIMUM(std::size_t, 1U) std::size_t batch_size = 32U;
+ MMLTK_MINIMUM(int, 1) int epochs = 1;
 };
 struct InfoCommandRequest final {
- [[= reflection::MaxBytes{reflection::kMaximumPathBytes}]] std::string compiled_path;
+ MMLTK_MAX_PATH_BYTES std::string compiled_path;
 };
 MMLTK_REFLECT_FIELDS(BenchCommandRequest)
 MMLTK_REFLECT_FIELDS(InfoCommandRequest)
