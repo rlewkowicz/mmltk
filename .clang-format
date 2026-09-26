@@ -3,7 +3,11 @@ BasedOnStyle: Google
 ColumnLimit: 200
 IndentWidth: 1
 ContinuationIndentWidth: 1
+BracedInitializerIndentWidth: 1
 AlignAfterOpenBracket: false
+BreakAfterOpenBracketBracedList: true
+BreakBeforeCloseBracketBracedList: true
+LambdaBodyIndentation: OuterScope
 TabWidth: 1
 UseTab: Never
 DerivePointerAlignment: false

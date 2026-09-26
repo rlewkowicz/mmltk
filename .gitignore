@@ -8,7 +8,7 @@
 /build/
 /compiled*/
 /dataset/
-/outputs*/
+/output/
 /profiles/
 /artifacts/
 /target/
@@ -97,4 +97,3 @@ CLAUDE.md
 remediationplan.md
 checkpoints
 .compiled*
-output

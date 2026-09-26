@@ -371,93 +371,90 @@ bool BrowserServer::start(Config config, Callbacks callbacks) noexcept {
   state->finalization_required.store(true, std::memory_order_release);
   state->detached = false;
   const std::weak_ptr<Impl> weak = state;
-  state->app->ws<Peer>("/mmltk", {.compression = uWS::DISABLED,
-                                  .maxPayloadLength = static_cast<unsigned int>(kMaximumMessageBytes),
-                                  .idleTimeout = 64,
-                                  .maxBackpressure = static_cast<unsigned int>(state->maximum_output_bytes),
-                                  .closeOnBackpressureLimit = false,
-                                  .upgrade =
-                                   [weak](uWS::HttpResponse<false>* response, uWS::HttpRequest* request, us_socket_context_t* context) noexcept {
-                                    const auto owner = weak.lock();
-                                    if (!owner) {
-                                     response->writeStatus("503 Service Unavailable")->end("unavailable");
-                                     return;
-                                    }
-                                    const bool valid_session = mmltk::common::types::constant_time_equal(request->getQuery("session"), owner->session_token);
-                                    const bool valid_origin = request->getHeader("origin") == owner->expected_origin;
-                                    if (!valid_session || !valid_origin) {
-                                     response->writeStatus("403 Forbidden")->end("forbidden");
-                                     return;
-                                    }
-                                    response->upgrade<Peer>(
-                                     {}, request->getHeader("sec-websocket-key"), request->getHeader("sec-websocket-protocol"), request->getHeader("sec-websocket-extensions"), context);
-                                   },
-                                  .open =
-                                   [weak](Socket* peer) noexcept {
-                                    const auto owner = weak.lock();
-                                    if (!owner) {
-                                     peer->close();
-                                     return;
-                                    }
-                                    if (owner->socket != nullptr) {
-                                     owner->trace(BrowserServerEvent::PeerReplaced);
-                                     owner->close_peer_on_owner();
-                                    }
-                                    if (owner->next_peer_generation == std::numeric_limits<std::uint64_t>::max()) {
-                                     peer->close();
-                                     return;
-                                    }
-                                    const std::uint64_t generation = ++owner->next_peer_generation;
-                                    owner->begin_output_epoch(generation);
-                                    peer->getUserData()->lifecycle.opened(generation);
-                                    owner->socket = peer;
-                                    owner->active_peer_generation = generation;
-                                    owner->backpressured = false;
-                                    owner->connected.store(true, std::memory_order_release);
-                                    owner->callbacks.opened(owner->callbacks.context.get());
-                                    owner->finish_output_epoch(generation);
-                                    owner->trace(BrowserServerEvent::PeerOpened, generation);
-                                    owner->drain();
-                                    if (owner->active_peer(peer) && owner->callbacks.activated) {
-                                     owner->callbacks.activated(owner->callbacks.context.get());
-                                     owner->drain();
-                                    }
-                                   },
-                                  .message =
-                                   [weak](Socket* peer, const std::string_view message, const uWS::OpCode opcode) noexcept {
-                                    const auto owner = weak.lock();
-                                    if (!owner) {
-                                     peer->close();
-                                     return;
-                                    }
-                                    if (!owner->active_peer(peer) || opcode != uWS::OpCode::BINARY || message.empty() || message.size() > kMaximumMessageBytes) {
-                                     owner->trace(BrowserServerEvent::InvalidMessage, message.size());
-                                     if (owner->active_peer(peer))
-                                      owner->close_peer_on_owner();
-                                     else
-                                      peer->close();
-                                     return;
-                                    }
-                                    const auto bytes = std::span<const std::byte>{reinterpret_cast<const std::byte*>(message.data()), message.size()};
-                                    owner->trace(BrowserServerEvent::BinaryReceived, message.size());
-                                    if (!owner->callbacks.record(owner->callbacks.context.get(), bytes)) {
-                                     owner->notify_peer_closed(peer);
-                                     peer->end(1002, "invalid application protocol record");
-                                    }
-                                   },
-                                  .drain =
-                                   [weak](Socket* peer) noexcept {
-                                    const auto owner = weak.lock();
-                                    if (owner && owner->active_peer(peer)) {
-                                     owner->backpressured = false;
-                                     owner->trace(BrowserServerEvent::WriteDrained);
-                                     owner->drain();
-                                    }
-                                   },
-                                  .close =
-                                   [weak](Socket* peer, int, std::string_view) noexcept {
-                                    if (const auto owner = weak.lock()) owner->notify_peer_closed(peer);
-                                   }});
+  state->app->ws<Peer>("/mmltk", {
+   .compression = uWS::DISABLED,
+   .maxPayloadLength = static_cast<unsigned int>(kMaximumMessageBytes),
+   .idleTimeout = 64,
+   .maxBackpressure = static_cast<unsigned int>(state->maximum_output_bytes),
+   .closeOnBackpressureLimit = false,
+   .upgrade = [weak](uWS::HttpResponse<false>* response, uWS::HttpRequest* request, us_socket_context_t* context) noexcept {
+    const auto owner = weak.lock();
+    if (!owner) {
+     response->writeStatus("503 Service Unavailable")->end("unavailable");
+     return;
+    }
+    const bool valid_session = mmltk::common::types::constant_time_equal(request->getQuery("session"), owner->session_token);
+    const bool valid_origin = request->getHeader("origin") == owner->expected_origin;
+    if (!valid_session || !valid_origin) {
+     response->writeStatus("403 Forbidden")->end("forbidden");
+     return;
+    }
+    response->upgrade<Peer>(
+     {}, request->getHeader("sec-websocket-key"), request->getHeader("sec-websocket-protocol"), request->getHeader("sec-websocket-extensions"), context);
+   },
+   .open = [weak](Socket* peer) noexcept {
+    const auto owner = weak.lock();
+    if (!owner) {
+     peer->close();
+     return;
+    }
+    if (owner->socket != nullptr) {
+     owner->trace(BrowserServerEvent::PeerReplaced);
+     owner->close_peer_on_owner();
+    }
+    if (owner->next_peer_generation == std::numeric_limits<std::uint64_t>::max()) {
+     peer->close();
+     return;
+    }
+    const std::uint64_t generation = ++owner->next_peer_generation;
+    owner->begin_output_epoch(generation);
+    peer->getUserData()->lifecycle.opened(generation);
+    owner->socket = peer;
+    owner->active_peer_generation = generation;
+    owner->backpressured = false;
+    owner->connected.store(true, std::memory_order_release);
+    owner->callbacks.opened(owner->callbacks.context.get());
+    owner->finish_output_epoch(generation);
+    owner->trace(BrowserServerEvent::PeerOpened, generation);
+    owner->drain();
+    if (owner->active_peer(peer) && owner->callbacks.activated) {
+     owner->callbacks.activated(owner->callbacks.context.get());
+     owner->drain();
+    }
+   },
+   .message = [weak](Socket* peer, const std::string_view message, const uWS::OpCode opcode) noexcept {
+    const auto owner = weak.lock();
+    if (!owner) {
+     peer->close();
+     return;
+    }
+    if (!owner->active_peer(peer) || opcode != uWS::OpCode::BINARY || message.empty() || message.size() > kMaximumMessageBytes) {
+     owner->trace(BrowserServerEvent::InvalidMessage, message.size());
+     if (owner->active_peer(peer))
+      owner->close_peer_on_owner();
+     else
+      peer->close();
+     return;
+    }
+    const auto bytes = std::span<const std::byte>{reinterpret_cast<const std::byte*>(message.data()), message.size()};
+    owner->trace(BrowserServerEvent::BinaryReceived, message.size());
+    if (!owner->callbacks.record(owner->callbacks.context.get(), bytes)) {
+     owner->notify_peer_closed(peer);
+     peer->end(1002, "invalid application protocol record");
+    }
+   },
+   .drain = [weak](Socket* peer) noexcept {
+    const auto owner = weak.lock();
+    if (owner && owner->active_peer(peer)) {
+     owner->backpressured = false;
+     owner->trace(BrowserServerEvent::WriteDrained);
+     owner->drain();
+    }
+   },
+   .close = [weak](Socket* peer, int, std::string_view) noexcept {
+    if (const auto owner = weak.lock()) owner->notify_peer_closed(peer);
+   }
+  });
   state->app->get("/health", [](auto* response, auto*) { response->writeHeader("Content-Type", "text/plain")->end("ok"); });
   state->app->get("/*", [weak](uWS::HttpResponse<false>* response, uWS::HttpRequest* request) {
    const auto owner = weak.lock();

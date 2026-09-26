@@ -73,18 +73,24 @@ void run_compile(const data::CompilerConfig& config) {
   std::size_t* total;
   spdmon::ProgressBar* bar;
  } state{&last_done, &total, &bar};
- data::CompileTelemetry telemetry{plan.splits[0].image_count, {.context = &state, .report = [](void* context, const data::CompileProgress& progress) noexcept {
-                                                                auto& progress_state = *static_cast<ProgressState*>(context);
-                                                                if (progress.total != *progress_state.total) {
-                                                                 *progress_state.total = progress.total;
-                                                                 progress_state.bar->set_total(*progress_state.total);
-                                                                }
-                                                                if (progress.done > *progress_state.last_done) {
-                                                                 progress_state.bar->add(progress.done - *progress_state.last_done);
-                                                                 *progress_state.last_done = progress.done;
-                                                                }
-                                                                progress_state.bar->set_postfix(data::format_dataset_compile_tracks(progress.tracks));
-                                                               }}};
+ data::CompileTelemetry telemetry{
+  plan.splits[0].image_count,
+  {
+   .context = &state,
+   .report = [](void* context, const data::CompileProgress& progress) noexcept {
+    auto& progress_state = *static_cast<ProgressState*>(context);
+    if (progress.total != *progress_state.total) {
+     *progress_state.total = progress.total;
+     progress_state.bar->set_total(*progress_state.total);
+    }
+    if (progress.done > *progress_state.last_done) {
+     progress_state.bar->add(progress.done - *progress_state.last_done);
+     *progress_state.last_done = progress.done;
+    }
+    progress_state.bar->set_postfix(data::format_dataset_compile_tracks(progress.tracks));
+   }
+  }
+ };
  data::DatasetCompiler::compile(plan, 0U, &telemetry);
  bar.close();
  const auto finished = std::chrono::steady_clock::now();
