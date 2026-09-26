@@ -1,10 +1,13 @@
 #include <stdexcept>
 // RF-DETR command spelling coverage.
+#include <algorithm>
 #include <array>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include "src/entrypoints/cli/tests/support/cli_path.h"
+#include "src/entrypoints/cli/rfdetr_cli_options.h"
 #include "src/test_support/subprocess_test_utils.hpp"
 namespace {
 using namespace mmltk::testsupport;
@@ -126,6 +129,14 @@ void test_train_help_lists_training_controls() {
   REQUIRE((result.output_text.find(option) != std::string::npos));
  }
  REQUIRE((result.output_text.find("hungarian or match-free") != std::string::npos));
+ std::size_t previous = 0U;
+ for (const std::string_view option : {"--aug-geometry-prob", "--aug-geometry-min-strength", "--aug-geometry-max-strength", "--aug-resize-prob", "--aug-resize-min-strength",
+       "--aug-resize-max-strength", "--aug-color-prob", "--aug-color-min-strength", "--aug-color-max-strength", "--aug-noise-prob", "--aug-noise-min-strength", "--aug-noise-max-strength",
+       "--aug-blur-prob", "--aug-blur-min-strength", "--aug-blur-max-strength", "--aug-occlusion-prob", "--aug-occlusion-min-strength", "--aug-occlusion-max-strength"}) {
+  const auto position = result.output_text.find(option, previous);
+  REQUIRE(position != std::string::npos);
+  previous = position + option.size();
+ }
 }
 void test_train_assignment_spellings_parse_through_the_canonical_descriptor() {
  for (const char* assignment : {"hungarian", "match-free"}) {
@@ -241,7 +252,8 @@ TEST_CASE("Native prediction and evaluation retain compilation CLI spellings", "
 }
 TEST_CASE("Training JSON is mutually exclusive bounded and shares scalar recipe admission", "[rfdetr][cli][training]") {
  for (const auto options : {std::initializer_list<const char*>{"--request-json", "{}", "--epochs", "4"}, std::initializer_list<const char*>{"--optimizer", "sgd", "--request-json", "{}"},
-       std::initializer_list<const char*>{"--request-json", "{}", "--no-amp"}}) {
+       std::initializer_list<const char*>{"--request-json", "{}", "--no-amp"}, std::initializer_list<const char*>{"--request-json", "{}", "--epochs", "1"},
+       std::initializer_list<const char*>{"--request-json", "{}", "--nesterov=false"}}) {
   const auto result = run_train_options(options);
   CHECK(result.exit_code == 1);
   CHECK(result.output_text.find("mutually exclusive") != std::string::npos);
@@ -267,6 +279,48 @@ TEST_CASE("Training JSON is mutually exclusive bounded and shares scalar recipe 
  CHECK(help.output_text.find("--unfreeze-encoder-last-epochs") != std::string::npos);
  CHECK(help.output_text.find("--disable-augmentation-last-epochs") != std::string::npos);
  CHECK(help.output_text.find("ultralytics-linear") != std::string::npos);
+}
+TEST_CASE("RF-DETR help keeps canonical usage for every command and alias", "[rfdetr][cli]") {
+ for (const auto& [spelling, canonical] : std::array{
+       std::array{"compile", "compile"}, std::array{"info", "info"}, std::array{"build-engine", "build-engine"}, std::array{"export-onnx", "export-onnx"},
+       std::array{"predict", "predict"}, std::array{"evaluate", "evaluate"}, std::array{"eval", "evaluate"}, std::array{"val", "evaluate"}, std::array{"validate", "validate"},
+       std::array{"train", "train"}, std::array{"normalize-weights", "normalize-weights"}}) {
+  const auto result = run_subprocess_capture_output({mmltk_cli_path(), "rfdetr", spelling, "--help"});
+  REQUIRE(result.exit_code == 0);
+  CHECK(result.stdout_text.find(std::string("Usage: mmltk rfdetr ") + canonical + " [options]\n") != std::string::npos);
+ }
+}
+TEST_CASE("training integer-list codecs retain assignment bounds and CSV emission", "[rfdetr][cli]") {
+ namespace cli = mmltk::entrypoints::cli::rfdetr_options;
+ namespace reflection = mmltk::frameworks::reflection;
+ const auto accepted = reflection::parse<cli::TrainCliRequest>(std::array<std::string_view, 4>{"--numa-nodes", "-1,-1", "--device-ids", "0,2"}, cli::kTrainOptions);
+ REQUIRE(accepted);
+ CHECK((accepted->request.request.numa_nodes == std::vector<int>{-1, -1}));
+ CHECK((accepted->request.request.device_ids == std::vector<int>{0, 2}));
+ struct ListCase {
+  std::vector<int> cli::TrainRequest::*member;
+  const char* spelling;
+  const char* text;
+ };
+ for (const auto& [member, spelling, text] : std::array{
+       ListCase{&cli::TrainRequest::numa_nodes, "--numa-nodes", "-1,-1"}, ListCase{&cli::TrainRequest::device_ids, "--device-ids", "0,2"}}) {
+  const auto descriptor = std::ranges::find(cli::kTrainOptions, std::string_view(spelling), &reflection::OptionDescriptor<cli::TrainCliRequest>::name);
+  REQUIRE(descriptor != cli::kTrainOptions.end());
+  std::vector<std::string> emitted;
+  descriptor->emit(emitted, accepted->request, spelling, {}, descriptor->kind, false);
+  CHECK((emitted == std::vector<std::string>{spelling, text}));
+  auto state = accepted->request;
+  const auto before = state.request.*member;
+  for (const std::string_view invalid : {"", "0,", ",0", "0,,1", "-2", "2147483648", "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16"}) {
+   const auto failure = descriptor->assign(state, invalid, false, descriptor->constraint);
+   REQUIRE_FALSE(failure);
+   CHECK(failure.error().code == reflection::ParseErrorCode::InvalidValue);
+   CHECK((state.request.*member == before));
+  }
+ }
+ const auto duplicate = reflection::parse<cli::TrainCliRequest>(std::array<std::string_view, 2>{"--device-ids", "0,0"}, cli::kTrainOptions);
+ REQUIRE_FALSE(duplicate);
+ CHECK(duplicate.error().code == reflection::ParseErrorCode::InvalidValue);
 }
 TEST_CASE("Validation CLI lane limits share native request admission", "[rfdetr][cli][lanes]") {
  for (const auto& [command, option, required] : std::array{std::array{"validate", "--lanes", "requires --compiled"}, std::array{"train", "--validation-lanes", "requires --train-compiled"}}) {

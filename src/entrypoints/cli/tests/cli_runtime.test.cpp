@@ -22,6 +22,7 @@
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
+#include "src/frameworks/reflection/cli_declarations.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/entrypoints/cli/tests/support/cli_path.h"
@@ -194,25 +195,29 @@ struct InheritedCliRequest final : InheritedCliBase {
 };
 MMLTK_REFLECT_FIELDS(InheritedCliBase)
 MMLTK_REFLECT_FIELDS(InheritedCliRequest)
+using Inherited = mmltk::frameworks::reflection::CliScope<InheritedCliRequest>;
+using InheritedBase = mmltk::frameworks::reflection::CliScope<InheritedCliRequest, InheritedCliBase>;
 inline constexpr std::array kInheritedCliOptions{
- mmltk::frameworks::reflection::option<InheritedCliRequest, &InheritedCliBase::inherited_limit>("--inherited-limit", "Inherited bounded scalar", "Inherited"),
- mmltk::frameworks::reflection::option<InheritedCliRequest, &InheritedCliRequest::derived_ratio>("--derived-ratio", "Derived bounded scalar", "Inherited"),
+ MMLTK_CLI_OPTION(InheritedBase, inherited_limit, "Inherited bounded scalar", "Inherited"),
+ MMLTK_CLI_OPTION(Inherited, derived_ratio, "Derived bounded scalar", "Inherited"),
 };
 inline constexpr std::array kInheritedCliExclusions{
  mmltk::frameworks::reflection::unexposed<InheritedCliRequest, &InheritedCliRequest::boundary_owned>("the embedding boundary owns this value"),
 };
 static_assert((mmltk::frameworks::reflection::audit_descriptors(kInheritedCliOptions, kInheritedCliExclusions), true));
+using Parser = mmltk::frameworks::reflection::CliScope<ParserRequest>;
+using ParserNested = Parser::within<&ParserRequest::nested>;
+static_assert(Parser::name<&ParserRequest::optional_path>() == "--optional-path");
 inline constexpr std::array kParserOptions{
- mmltk::frameworks::reflection::option<ParserRequest, mmltk::frameworks::reflection::member_path<&ParserRequest::nested, &ParserNestedState::count>>(
-  "--count", "Bounded scalar", "Values", "-c", {}, false, "MMLTK_REFLECTED_CLI_TEST_COUNT"),
- mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::unsigned_count>("--unsigned-count", "Bounded unsigned scalar", "Values"),
- mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::ratio>("--ratio", "Bounded finite ratio", "Values"),
- mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::label>("--label", "Bounded text", "Values"),
- mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::enabled>("--enabled", "Boolean flag", "Values", {}, "--no-enabled"),
- mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::optional_path>("--path", "Optional path", "Values"),
- mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::values>("--value", "Repeatable value", "Values"),
- mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::mode>("--mode", "Reflected enum", "Values"),
- mmltk::frameworks::reflection::positional<ParserRequest, &ParserRequest::positional>("input", "Positional integer", true),
+ MMLTK_CLI_OPTION(ParserNested, count, "Bounded scalar", "Values", "-c", {}, false, "MMLTK_REFLECTED_CLI_TEST_COUNT"),
+ MMLTK_CLI_OPTION(Parser, unsigned_count, "Bounded unsigned scalar", "Values"),
+ MMLTK_CLI_OPTION(Parser, ratio, "Bounded finite ratio", "Values"),
+ MMLTK_CLI_OPTION(Parser, label, "Bounded text", "Values"),
+ MMLTK_CLI_OPTION(Parser, enabled, "Boolean flag", "Values", {}, "--no-enabled"),
+ MMLTK_CLI_NAMED(Parser, optional_path, "--path", "Optional path", "Values"),
+ MMLTK_CLI_NAMED(Parser, values, "--value", "Repeatable value", "Values"),
+ MMLTK_CLI_OPTION(Parser, mode, "Reflected enum", "Values"),
+ mmltk::frameworks::reflection::positional<ParserRequest, Parser::path<&ParserRequest::positional>>("input", "Positional integer", true),
 };
 static_assert((mmltk::frameworks::reflection::audit_descriptors(kParserOptions), true));
 static_assert(mmltk::frameworks::reflection::reflected_policies_are_valid<ParserRequest>());
@@ -423,6 +428,8 @@ void test_reflected_cli_optional_repeatable_negation_positionals_environment_and
  REQUIRE((valid->request.positional == -9));
  std::vector<std::string> emitted;
  mmltk::frameworks::reflection::emit(emitted, valid->request, kParserOptions);
+ CHECK((emitted == std::vector<std::string>{"--count", "7", "--unsigned-count", "1", "--ratio", "0.5", "--no-enabled", "--path", "/tmp/image.png",
+  "--value", "4", "--value", "5", "--mode", "full-trace", "--", "-9"}));
  std::vector<std::string_view> emitted_views;
  emitted_views.reserve(emitted.size());
  for (const auto& token : emitted) emitted_views.emplace_back(token);
@@ -446,10 +453,23 @@ void test_reflected_cli_optional_repeatable_negation_positionals_environment_and
  REQUIRE((::unsetenv("MMLTK_REFLECTED_CLI_TEST_COUNT") == 0));
  REQUIRE((environment && environment->request.nested.count == 6));
  REQUIRE((command_override && command_override->request.nested.count == 8));
+ constexpr auto count_index = mmltk::frameworks::reflection::unique_descriptor_index(kParserOptions,
+  mmltk::frameworks::reflection::ReflectedMemberIdentity::from_path<ParserRequest, &ParserRequest::nested, &ParserNestedState::count>());
+ CHECK_FALSE(environment->presence.test(count_index));
+ CHECK(command_override->presence.test(count_index));
  const auto empty_optional = parse_parser_request(std::array<std::string_view, 3U>{"--path=", "--", "1"});
  REQUIRE((empty_optional && !empty_optional->request.optional_path.has_value()));
  const std::string help = mmltk::frameworks::reflection::help("test [options]", "Descriptor help", kParserOptions);
- for (const auto& option : kParserOptions) REQUIRE((help.find(option.name) != std::string::npos));
+ CHECK(help == "Descriptor help\nUsage: test [options]\nValues"
+               "\n  --count, -c  Bounded scalar"
+               "\n  --unsigned-count  Bounded unsigned scalar"
+               "\n  --ratio  Bounded finite ratio"
+               "\n  --label  Bounded text"
+               "\n  --enabled, --no-enabled  Boolean flag"
+               "\n  --path  Optional path"
+               "\n  --value  Repeatable value"
+               "\n  --mode  Reflected enum"
+               "\nPositionals\n  input  Positional integer");
 }
 void test_reflected_cli_scalar_success_has_no_parser_owned_allocation() {
  constexpr std::array<std::string_view, 6U> arguments{
@@ -889,6 +909,25 @@ TEST_CASE("CLI compilation persists default and explicit resize geometry", "[cor
   }
  }
 }
+TEST_CASE("generic compile uses square width fallback and preserves explicit height", "[core][cli][data]") {
+ namespace data = mmltk::backend::data;
+ const ScopedTempDir root{"mmltk-cli-dimensions"};
+ data::testsupport::create_synthetic_dataset({root.path().string(), "train", 64, 32, 1, 1, 0, true});
+ for (const bool explicit_height : {false, true}) {
+  const auto output = root.path() / (explicit_height ? "rectangle" : "square");
+  std::vector<std::string> command{mmltk_cli_path(), "compile", "--source-dir", (root.path() / "dataset").string(), "--output-dir", output.string(), "--split", "train",
+   "--width", "32", "--workers", "1"};
+  if (explicit_height) command.insert(command.end(), {"--height", "16"});
+  const auto result = run_subprocess_capture_output(command);
+  INFO(result.output_text);
+  REQUIRE(result.exit_code == 0);
+  const auto compiled = data::CompiledDataset::open(output / "train.bin");
+  CHECK(compiled.header().image_width == 32U);
+  CHECK(compiled.header().image_height == (explicit_height ? 16U : 32U));
+  CHECK(compiled.geometry(0U).resized_width == 32U);
+  CHECK(compiled.geometry(0U).resized_height == (explicit_height ? 16U : 32U));
+ }
+}
 TEST_CASE("CLI rejects invalid resize modes through ordinary option parsing", "[core][cli][rfdetr][data]") {
  for (auto command : std::vector<std::vector<std::string>>{{"compile"}, {"rfdetr", "compile"}, {"rfdetr", "validate"}}) {
   command.insert(command.begin(), mmltk_cli_path());
@@ -930,4 +969,56 @@ TEST_CASE("CLI prediction source finalization preserves empty and conflicting so
   CHECK(result.stderr_text.find("rfdetr predict requires exactly one source") != std::string::npos);
   CHECK_FALSE(fs::exists(root.path() / "result.json"));
  }
+}
+
+TEST_CASE("scoped CLI spellings aliases booleans and emission gates retain factory semantics", "[core][cli][reflected]") {
+ namespace reflection = mmltk::frameworks::reflection;
+ const auto alias = parse_parser_request(std::array<std::string_view, 4>{"-c", "4", "--enabled=false", "1"});
+ REQUIRE(alias);
+ CHECK(alias->request.nested.count == 4);
+ CHECK_FALSE(alias->request.enabled);
+ const auto inverted = parse_parser_request(std::array<std::string_view, 2>{"--no-enabled=false", "1"});
+ REQUIRE(inverted);
+ CHECK(inverted->request.enabled);
+ constexpr auto plain = MMLTK_CLI_OPTION(Parser, enabled, "Boolean");
+ CHECK(plain.name == "--enabled");
+ CHECK(plain.negated_name.empty());
+ constexpr std::array gated{reflection::option<ParserRequest, Parser::path<&ParserRequest::label>,
+  +[](const ParserRequest& request) noexcept { return request.enabled; }>("--label", "Text")};
+ ParserRequest request;
+ request.label = "text";
+ request.enabled = false;
+ std::vector<std::string> emitted;
+ reflection::emit(emitted, request, gated);
+ CHECK(emitted.empty());
+ request.enabled = true;
+ reflection::emit(emitted, request, gated);
+ CHECK((emitted == std::vector<std::string>{"--label", "text"}));
+}
+TEST_CASE("scoped required options accept environment defaults and enforce presence capacity", "[core][cli][reflected]") {
+ namespace reflection = mmltk::frameworks::reflection;
+ constexpr std::array required{MMLTK_CLI_NAMED(ParserNested, count, "--required", "Required count", "Values", "-r", {}, true, "MMLTK_CLI_TEST_REQUIRED")};
+ REQUIRE(::unsetenv("MMLTK_CLI_TEST_REQUIRED") == 0);
+ const auto missing = reflection::parse<ParserRequest>({}, required);
+ REQUIRE_FALSE(missing);
+ CHECK(missing.error().code == reflection::ParseErrorCode::MissingRequired);
+ REQUIRE(::setenv("MMLTK_CLI_TEST_REQUIRED", "5", 1) == 0);
+ const auto environment = reflection::parse<ParserRequest>({}, required);
+ const auto override = reflection::parse<ParserRequest>(std::array<std::string_view, 2>{"-r", "3"}, required);
+ REQUIRE(::unsetenv("MMLTK_CLI_TEST_REQUIRED") == 0);
+ REQUIRE(environment);
+ REQUIRE(override);
+ CHECK(environment->request.nested.count == 5);
+ CHECK_FALSE(environment->presence.test(0U));
+ CHECK(override->request.nested.count == 3);
+ CHECK(override->presence.test(0U));
+ static_assert(reflection::kMaximumCommandOptions == 128U);
+ reflection::PresenceSet presence;
+ presence.set(127U);
+ CHECK(presence.test(127U));
+ std::array<reflection::OptionDescriptor<ParserRequest>, 129U> excessive{};
+ const auto rejected = reflection::parse<ParserRequest>({}, excessive);
+ REQUIRE_FALSE(rejected);
+ CHECK(rejected.error().code == reflection::ParseErrorCode::InvalidValue);
+ CHECK(std::string_view(rejected.error().what()) == "command descriptor capacity exceeded");
 }

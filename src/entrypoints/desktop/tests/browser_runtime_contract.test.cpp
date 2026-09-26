@@ -1,7 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
+#include <array>
+#include <string>
+#include <string_view>
+#include <vector>
 #include "src/entrypoints/desktop/browser_runtime_options.h"
 #include "src/controller/services/firefox_process_owner.h"
 #include "src/controller/shell/application_shell.h"
+#include "src/frameworks/reflection/reflected_descriptors.h"
 namespace {
 namespace services = mmltk::controller::services;
 namespace shell = mmltk::controller::shell;
@@ -35,4 +40,20 @@ TEST_CASE("ordinary shell and native presentation configuration disable acceptan
  CHECK_FALSE(native_configuration.pending_supersession_acceptance);
  CHECK_FALSE(shell_configuration.completion_acceptance);
  CHECK_FALSE(native_configuration.completion_acceptance);
+}
+TEST_CASE("desktop scoped options retain public spellings help and emission order") {
+ namespace desktop = mmltk::entrypoints::desktop;
+ namespace reflection = mmltk::frameworks::reflection;
+ const auto configuration = desktop::parse_browser_runtime_options(std::array<std::string_view, 3>{"--device-id=2", "--numa-node=3", "--gdrcopy"});
+ std::vector<std::string> emitted;
+ reflection::emit(emitted, configuration, desktop::kBrowserExecutionOptions);
+ CHECK((emitted == std::vector<std::string>{"--device-id", "2", "--numa-node", "3", "--gdrcopy"}));
+ CHECK(reflection::help("desktop [options]", "Desktop", desktop::kBrowserExecutionOptions) ==
+       "Desktop\nUsage: desktop [options]\nExecution"
+       "\n  --device-id  CUDA-visible visual device"
+       "\n  --numa-node  GPU-local NUMA node (-1 selects automatic locality)"
+       "\n  --gdrcopy  Use GDRCopy for compiled-image loading");
+ for (const std::string_view spelling : {"--cuda-device-index", "--no-numa-node", "--h2d-dataloader"}) {
+  CHECK_THROWS(desktop::parse_browser_runtime_options(std::array{spelling}));
+ }
 }

@@ -6,7 +6,7 @@ mmltk_configure_component(mmltk_entrypoints_cli PRIVATE_DECLARATIONS)
 mmltk_register_retained_module_importers(
     mmltk_entrypoints_cli cli.cpp)
 mmltk_register_private_headers(
-    mmltk_entrypoints_cli cli_output.h)
+    mmltk_entrypoints_cli cli_output.h cli_options.h)
 target_include_directories(mmltk_entrypoints_cli PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/spdmon/include
 )
@@ -19,6 +19,8 @@ target_link_libraries(mmltk_entrypoints_cli PRIVATE
     mmltk::frameworks::reflection
 )
 if(BUILD_RFDETR_NATIVE)
+    mmltk_register_private_headers(
+        mmltk_entrypoints_cli rfdetr_cli_options.h)
     mmltk_register_retained_module_importers(
         mmltk_entrypoints_cli rfdetr_cli.cpp)
     target_compile_definitions(mmltk_entrypoints_cli PRIVATE

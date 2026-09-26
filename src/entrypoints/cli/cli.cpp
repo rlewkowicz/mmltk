@@ -1,11 +1,9 @@
-#include "src/frameworks/reflection/declaration_annotations.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
-#include <meta>
 #include <span>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
@@ -14,7 +12,7 @@
 #include <utility>
 #include <vector>
 #include "cli_output.h"
-#include "mmltk/frameworks/reflection/materializer.h"
+#include "cli_options.h"
 #include "spdmon/spdmon.hpp"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/compiled_format.h"
@@ -22,9 +20,7 @@
 #include "src/backend/data/dataset_loader.h"
 import mmltk.common.logging.mmltk_logging;
 #include "src/common/system/execution_policy.h"
-#include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
 namespace data = mmltk::backend::data;
 namespace logging = mmltk::common::logging;
 namespace reflection = mmltk::frameworks::reflection;
@@ -35,38 +31,7 @@ int handle_rfdetr_cli(std::span<const std::string_view> arguments, const logging
 }
 #endif
 namespace {
-struct BenchCommandRequest final : data::DataLoadingOptions {
- MMLTK_MAX_PATH_BYTES std::string compiled_path;
- MMLTK_MINIMUM(std::size_t, 1U) std::size_t batch_size = 32U;
- MMLTK_MINIMUM(int, 1) int epochs = 1;
-};
-struct InfoCommandRequest final {
- MMLTK_MAX_PATH_BYTES std::string compiled_path;
-};
-MMLTK_REFLECT_FIELDS(BenchCommandRequest)
-MMLTK_REFLECT_FIELDS(InfoCommandRequest)
-inline constexpr std::array kCompileOptions{reflection::option<data::CompilerConfig, &data::CompilerConfig::resize_mode>("--resize-mode", "Image geometry: Stretch or Letterbox", "Dataset"),
- reflection::option<data::CompilerConfig, &data::CompilerConfig::perceptual_downscale>("--perceptual-downscale", "Perceptual shrinking", "Dataset"),
- reflection::option<data::CompilerConfig, &data::CompilerConfig::source_dir>("--source-dir", "Source dataset directory", "Dataset", "source_dir", {}, true),
- reflection::option<data::CompilerConfig, &data::CompilerConfig::output_dir>("--output-dir", "Compiled binary output directory", "Dataset", "output_dir", {}, true),
- reflection::option<data::CompilerConfig, &data::CompilerConfig::split>("--split", "Dataset split", "Dataset", "split", {}, true),
- reflection::option<data::CompilerConfig, &data::CompilerConfig::target_width>("--width", "Target image width", "Dataset"),
- reflection::option<data::CompilerConfig, &data::CompilerConfig::target_height>("--height", "Target image height", "Dataset"),
- reflection::option<data::CompilerConfig, &data::CompilerConfig::cuda_mask_batch_size>("--cuda-mask-batch-size", "CUDA mask batch size", "Execution"),
- reflection::option<data::CompilerConfig, &data::CompilerConfig::cuda_device_id>("--cuda-device-id", "CUDA device id", "Execution"),
- reflection::option<data::CompilerConfig, &data::CompilerConfig::num_workers>("--workers", "CPU worker budget", "Execution")};
-inline constexpr std::array kBenchOptions{reflection::negative_flag<BenchCommandRequest, &BenchCommandRequest::h2d_dataloader>("--gdrcopy", "Use GDRCopy image loading", "Execution"),
- reflection::option<BenchCommandRequest, &BenchCommandRequest::numa_node>("--numa-node", "GPU-local NUMA node (-1 automatic)", "Execution"),
- reflection::option<BenchCommandRequest, &BenchCommandRequest::compiled_path>("--compiled", "Compiled dataset binary", "Dataset", "compiled", {}, true),
- reflection::option<BenchCommandRequest, &BenchCommandRequest::batch_size>("--batch-size", "Streaming batch size", "Execution", "batch_size"),
- reflection::option<BenchCommandRequest, &BenchCommandRequest::epochs>("--epochs", "Number of epochs", "Execution", "num_epochs")};
-inline constexpr std::array kInfoOptions{reflection::option<InfoCommandRequest, &InfoCommandRequest::compiled_path>("--compiled", "Compiled dataset binary", "Dataset", "compiled", {}, true)};
-inline constexpr std::array kCompileUnexposed{
- reflection::unexposed<data::CompilerConfig, &data::CompilerConfig::worker_cpus>("execution resolves the concrete CPU set from the container "
-                                                                                 "allocation")};
-static_assert((reflection::audit_descriptors(kCompileOptions, kCompileUnexposed), true));
-static_assert((reflection::audit_descriptors(kBenchOptions), true));
-static_assert((reflection::audit_descriptors(kInfoOptions), true));
+using namespace mmltk::entrypoints::cli::root_options;
 [[nodiscard]] reflection::ParsedCommand<data::CompilerConfig> parse_compile_request(const std::span<const std::string_view> arguments) {
  auto parsed = reflection::parse<data::CompilerConfig>(arguments, kCompileOptions);
  if (!parsed) throw parsed.error();
@@ -175,7 +140,9 @@ int handle_compile(const std::span<const std::string_view> arguments, const logg
   return 0;
  }
  auto parsed = parse_compile_request(arguments);
- if (parsed.presence.test(3U) && !parsed.presence.test(4U)) parsed.request.target_height = parsed.request.target_width;
+ constexpr auto width = reflection::unique_descriptor_index(kCompileOptions, reflection::accessor_member_identity<data::CompilerConfig, &data::CompilerConfig::target_width>());
+ constexpr auto height = reflection::unique_descriptor_index(kCompileOptions, reflection::accessor_member_identity<data::CompilerConfig, &data::CompilerConfig::target_height>());
+ if (parsed.presence.test(width) && !parsed.presence.test(height)) parsed.request.target_height = parsed.request.target_width;
  run_compile(parsed.request);
  return 0;
 }
