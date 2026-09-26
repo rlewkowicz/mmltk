@@ -29,6 +29,14 @@ objects. Native `--file` selections skip the package-wide Rust formatting;
 `--start-at` retains it. This Rust step is formatting, not a Rust static-analysis
 suite. The [build reference](build.md#target-declarations-and-precompiled-headers)
 owns PCH and header-isolation handling in the analysis graph.
+[.clang-format](../.clang-format) keeps the Google base, a 200-column limit,
+one-column indentation and continuation, and no tabs. Its Clang 22 braced-list
+settings use one-column indentation with opening/closing breaks for long lists;
+`LambdaBodyIndentation: OuterScope` keeps callbacks near their enclosing scope.
+An ordinary local aggregate can give a callback table a short anchor, as the
+`WebSocketBehavior` value in
+[browser_server.cpp](../src/frameworks/transport/browser_server.cpp) does.
+Layout changes do not count as structural code reduction.
 The repository's `modernize-use-auto.MinTypeNameLength` is `5` in
 [.clang-tidy](../.clang-tidy); it is a type-spelling threshold, not a permission
 to hide meaningful ownership or introduce indirection.
@@ -46,8 +54,9 @@ or resume at a translation unit with `--start-at`:
 ```
 
 `--file` and `--start-at` cannot be combined. Focused runs do not replace the
-full passes required by the workflow. Tidy writes a log below `build/logs`;
-`MMLTK_TIDY_LOG_FILE` selects another report path. The implementation and
+full passes required by the workflow. Tidy retains a
+[wrapper transcript](logging.md#wrapper-build-test-and-tidy-transcripts), with
+`MMLTK_TIDY_LOG_FILE` selecting its destination. The implementation and
 available analysis overrides are in
 [run_static_analysis.sh](../tools/run_static_analysis.sh).
 
@@ -73,11 +82,9 @@ filtering. Each output is replaced atomically.
 
 C++ Duplo uses a six-line minimum; CPD uses a 39-token minimum with identifiers
 anonymized and literal sequences ignored. Frontend minima are nine lines and
-75 tokens. Only C++ CPD matches from
-39 through 99 tokens enter the source-context filter. Matches of 100 tokens or
-more bypass it unchanged and remain for executor review; the ordinary narrow
-inline suppression rules still apply. A source-context pass compares complete
-statements, restoring operation names, types, member
+75 tokens. The C++ source-context pass applies at every CPD token size and to
+Duplo's code-bearing textual candidates. It compares complete statements,
+restoring operation names, types, member
 identities, constants, assertion facts, and local-variable relationships.
 Independent dimension/storage reads retain their local role names. This removes
 matches that hide a different callee or argument outside CPD's fragment,
@@ -85,6 +92,10 @@ declaration/signature boilerplate, aliases, adjacent getters, isolated calls,
 lock-and-forward bodies, and loop headers without a repeated body.
 Shared arithmetic can use a local value or a member receiver through the same
 method API; receiver overlays preserve repeated-input relationships.
+Multiplication-only arithmetic, useful CUDA setup, and repeated scalar/admission
+operations remain candidates. There is no blanket CUDA, role-name, or
+admission-name exclusion. A partial match must be assessed against its complete
+containing operations, regardless of match size.
 
 The pass retains repeated executable sequences, complete identical records in
 distinct declarations, and overloads sharing a name, complete first parameter,
@@ -103,12 +114,20 @@ filename exclusions or suppression registry are added.
 
 [Inline suppression policy](../AGENTS.md#deduplication-rules) applies only to
 ordinary reports; raw declaration evidence below is separate.
+The [detector-integrity checks below](#raw-cpd-and-declaration-formatting) also
+apply to ordinary reports. Inspected false positives use one narrow
+`CLEANUP-IGNORE` or bounded `CLEANUP-OFF`/`CLEANUP-ON` span. The rejection report
+retains the rejected coordinates/reasons and suppressed occurrence counts.
+A clean ordinary report is not evidence of zero raw repetition or a complete
+human review of every file.
 
 ## Raw CPD and declaration formatting
 
 ```bash
 ./mmltk --raw-cpd
 ./mmltk --raw-cpd --min-tokens 12 --output cleanup/declarations-raw.json
+./mmltk --raw-cpd --review
+./mmltk --raw-cpd --review --output cleanup/declarations-review.json
 ./mmltk --format-declarations check
 ./mmltk --format-declarations preview --file src/backend/models/rfdetr/contract/train_recipe.h
 ./mmltk --format-declarations fix --file src/backend/models/rfdetr/contract/train_recipe.h
@@ -123,15 +142,60 @@ untracked unignored files, excludes `third_party`, and omits deleted paths.
 This is declaration triage, not a verdict that every lexical match should be
 extracted into a shared algorithm.
 
-PMD `CPD-OFF`/`CPD-ON` suppression comments are neutralized only in same-length
-temporary copies. Original sources, line endings, offsets, ranges, and reported
-text remain intact. The format-1 report defaults to
+Ordinary and raw CPD both scan immutable temporary copies with unique supported
+`.cpp` or `.rs` suffixes, so CUDA, module, and template-header inputs actually
+reach the selected lexer. A one-to-one map restores the original source paths.
+PMD `CPD-OFF`/`CPD-ON` markers are neutralized only inside comments, preserving
+their length; strings containing marker-like text remain unchanged. Original
+line endings, offsets, ranges, and reported text remain intact. End columns are
+exclusive, and coordinate validation rejects spans outside the original source
+or splitting a Unicode surrogate pair. Both modes require complete per-file
+lexer coverage and valid match records, and compare source SHA-256 identities
+before publishing. An error cannot become an apparently clean partial report.
+
+The format-1 raw report defaults to
 `cleanup/declarations-raw.json`: `inventory`, detector configuration/status,
 `raw_matches` with original occurrence coordinates/text, independent
 `classified_context`, and a summary. Classification supplies context without
 adding or deleting detector matches. Raw mode rejects nonzero detector status,
 error/processing-error XML, diagnostic exceptions, or incomplete lexer coverage;
-it cannot replace the report with an apparently clean partial scan.
+ordinary mode uses the same detector-integrity checks.
+
+### Review candidates and the large-file queue
+
+`--review` adds `review` to the raw report and defaults to
+`cleanup/declarations-review.json` plus `cleanup/declarations-review.md`.
+`--output` chooses the JSON path and the same-stem Markdown sibling. Both
+renderings are prepared before publication and each replacement is atomic;
+the pair is not a filesystem transaction. Candidate presence is successful
+analysis, not a failing check.
+
+The review inventory includes first-party authored native, Rust, JavaScript/
+TypeScript, Python, shell, CMake, HTML/CSS, and Dockerfile code, including the
+root wrapper. It uses tracked and untracked-unignored Git inputs and omits
+deleted paths, third-party code, and generated/output trees. Each entry records
+language, byte and physical-line counts, SHA-256, dedicated/embedded test
+evidence, family IDs, and `status: "unreviewed"`. Non-C++ languages receive size
+triage only. The queue includes every file **over 500 physical lines** and any
+file with a candidate family. A file with exactly 500 lines needs a candidate
+family to enter the queue.
+
+[review_patterns.mjs](../tools/cleanup/review_patterns.mjs) groups bounded lexical
+CLI bindings, CLI exclusions, trait declarations, repeated qualifications, and
+same-name mappings with at least three distinct occurrences. Families retain
+original spans and owner evidence, invariant tokens, varying slots and values,
+file/owner/occurrence counts, and overlapping raw-match IDs. Raw matches,
+independent declaration classifications, and review families stay separate;
+manual/rejected classification context remains in the JSON. Covered-line counts
+merge overlapping spans and do not estimate removable or production lines.
+
+Markdown lists the queue and shows up to three excerpts per family, each at
+most eight lines and 800 characters. Full anchors and values remain in JSON.
+Every entry remains unreviewed until a person inspects it; generating the queue
+does not establish a complete visual inspection, semantic equivalence, or safe
+extraction. File size is an inspection trigger, not a refactoring requirement.
+
+### Annotation formatter
 
 [format_declarations.mjs](../tools/format_declarations.mjs) shares the lexical
 index and classifiers in
@@ -154,11 +218,13 @@ Automatic policy rewriting requires an absolute canonical name or an absolute
 global alias to the absolute canonical namespace. Relative lookup remains
 manual, as do conditional dependencies, annotation comments, conflicting
 macros, ambiguous syntax, and unsupported comma-containing type arguments.
+Template module inputs such as `.cppm.in` retain manual include placement.
 The [authoring guide](reflection.md) owns macro semantics and examples. This
 formatter does not consolidate repeated records or infer application owners.
 
 The `cleanup-tool` fixtures cover inventory, ordinary filters and suppressions,
 raw exact-spelling evidence and incomplete-scan rejection, original ranges,
+source hashes, supported detector suffixes, review-family/queue accounting,
 classification, conservative policy lookup, and formatter idempotence. They
 run within unfiltered `all`. A standalone filtered retry is:
 
@@ -234,6 +300,30 @@ Some RF-DETR tests download model checkpoints and derive normalized weights,
 ONNX, and TensorRT engines in `.cache/tests/rfdetr` on first use. Hardware-gated
 tests may skip when their requirements are unavailable; a skip is not hardware
 acceptance evidence.
+
+### Replacing an active test run
+
+A valid new `./mmltk --test all` first stops earlier test runs owned by this
+checkout. It does this before waiting
+for build/cache mutation locks. A short admission lock protects registration
+and replacement; it is released before the new suite runs. Registrations under
+the repository cache's `locks/test-run-*.owner` cover tooling suites and gaps
+between containers. Container labels and registrations identify the owner by
+PID and process-start identity, avoiding an unrelated process that reused a PID.
+
+Replacement requests graceful wrapper shutdown and stops repository-labeled
+test containers, then uses bounded waits and forced cleanup when needed. It
+verifies retirement before admitting the new run. If owners or containers
+cannot be retired, or enumeration/verification fails, the new run is not
+admitted. Normal exit removes the run's registration. Other repositories,
+non-test containers, and unrelated processes are outside this replacement scope.
+
+Focused suite names preserve active tests. An `all` invocation still replaces
+earlier runs when it carries `--executable` or runner filters; use the owning
+focused suite when replacement is unwanted. Test help/list routes neither
+register nor cancel a run. Use [process snapshots](commands.md#process-snapshots)
+for activity and [wrapper transcripts](logging.md#wrapper-build-test-and-tidy-transcripts)
+for command status.
 
 ## Selection, environment, deadlines, and debugging
 
@@ -703,7 +793,7 @@ sessions retain ordinary clipboard permissions.
 | Existing target | Evidence it owns |
 | --- | --- |
 | `mmltk_controller_annotation_tests` | Independent input/render progress, normalized-run hit testing, disk cleanup against scalar support, document/history/save behavior, immutable scene reuse, complete journal moves, packed upload reuse and allocation-local damage, stable target identity through Undo/Redo, retained input pressure, ordered command continuations, fractional raster boundaries, Original crop/aspect materialization, masks beyond boxes and present-empty masks, rejection, and cancellation |
-| `mmltk_controller_services_tests` | Counter-read interruption/size/error policies, reflected named settings including benchmark choices and preview-confidence defaults/repair/persistence, immutable CUDA inventory versus saved device IDs, independent optional-test settings, training command construction and bounded child failure causes, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
+| `mmltk_controller_services_tests` | Counter-read interruption/size/error policies, reflected named settings including complete Explore fields and label visibility, benchmark choices and preview-confidence defaults/repair/persistence, immutable CUDA inventory versus saved device IDs, independent optional-test settings, training command construction and bounded child failure causes, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
 | `mmltk_controller_data_compute_systems_tests` | Start/input admission including absent or incompatible optional test splits, selected-GPU admission and missing devices, TensorRT reinspection, captured NUMA placement, complete session/stream retirement and sealed unsafe custody, selected validation results and progressive/detail retention through settlement/refusal/retry, preview-confidence recomposition without another evaluation, compact RGB8 preview transfers/reuse and failure, incremental prediction, and video playback cancellation |
 | `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, nested/array metric projection fixtures, package fixtures, positional output versus named persistence, named-field lookup/error precedence, exact CBOR bytes and borrowed map keys, split owned/borrowed payloads, UTF-8 block/page tails, lossless compact input, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
@@ -713,7 +803,7 @@ sessions retain ordinary clipboard permissions.
 | `mmltk_controller_visual_systems_tests` | Shared visual runtime, presentation protocol/custody, native gallery cache/priority/atlas integration, acceptance gates, and cross-system workspace behavior |
 | `mmltk_frameworks_gpu_tests` | Independent raw-product/display storage, late workspace admission and availability wakes, Vulkan-owned CUDA import and backing lifetime, complete receiver/device transfers, sparse display coverage/coarsening/history recovery and scratch custody, acquisition/release/settlement, pressure, failure, and retirement |
 | `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, independent prepared/released artifacts, and bounded fatal reporting with disabled/uninitialized/failed sinks and broken pipes |
-| `mmltk_entrypoints_cli_tests` and `mmltk_entrypoints_tools_tests` | Reflected CLI parsing, scalar/item/fixed-capacity error precedence and unchanged rejected destinations; CLI/ONNX fatal stderr, logging overrides and named file identities, and command exit behavior |
+| `mmltk_entrypoints_cli_tests` and `mmltk_entrypoints_tools_tests` | Reflected CLI names/aliases/negation, canonical member presence and width-only square compilation, scalar/item/fixed-capacity error precedence and unchanged rejected destinations; CLI/ONNX fatal stderr, logging overrides and named file identities, and command exit behavior |
 | `mmltk_common_concurrency_tests` | Borrowed cancellation, scoped stop-token bridging, pre-requested/concurrent cancellation, unwind, and source destruction policy |
 | `mmltk_entrypoints_desktop_tests` and `mmltk_controller_firefox_process_tests` | Desktop startup/child failure status, exact launch OS errors, unexpected signal reporting, and quiet requested shutdown |
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |

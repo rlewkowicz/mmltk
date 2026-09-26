@@ -11,6 +11,7 @@ architecture, product outcomes, resource lifetime, and shutdown.
 | --- | --- |
 | [src/entrypoints/cli/cli.cpp](../src/entrypoints/cli/cli.cpp) | Dataset compile/info/benchmark commands and root dispatch |
 | [src/entrypoints/cli/rfdetr_cli.cpp](../src/entrypoints/cli/rfdetr_cli.cpp) | RF-DETR command parsing and execution |
+| [src/entrypoints/cli/cli_options.h](../src/entrypoints/cli/cli_options.h), [rfdetr_cli_options.h](../src/entrypoints/cli/rfdetr_cli_options.h) | Root and RF-DETR reflected option tables, scopes, explicit codecs, and exposure decisions |
 | [src/entrypoints/desktop/browser_runtime_entry.cpp](../src/entrypoints/desktop/browser_runtime_entry.cpp) | Packaged `mmltk-browser-host` startup |
 | [src/entrypoints/desktop/browser_runtime_options.h](../src/entrypoints/desktop/browser_runtime_options.h) | Reflected desktop execution options |
 | [src/entrypoints/tools](../src/entrypoints/tools) | ONNX inspection and simplification executables |
@@ -114,8 +115,8 @@ The implementation layers below those systems are:
 | [src/common](../src/common) | Shared types, math, I/O, concurrency, logging, and Linux system support |
 
 Shared image declarations live below dataset and model policy:
-[sampling.h](../src/backend/imaging/sampling.h) owns shared CPU/CUDA pixel-index
-and RLE sampling,
+[sampling.h](../src/backend/imaging/sampling.h) owns shared CPU/CUDA affine-point,
+normalized-pixel-center, pixel-index, and RLE sampling operations,
 [class_palette.h](../src/backend/imaging/raster/class_palette.h) owns class
 colors, [image_operations.h](../src/backend/imaging/raster/image_operations.h)
 owns reusable raster operations, and
@@ -295,7 +296,10 @@ of product work.
 ## Reflected value and persistence boundaries
 
 See [declaration authoring](reflection.md) for canonical registration,
-syntax-only annotations, structural projection, and safe formatting.
+all annotation macros, scoped CLI authoring, structural projection, and safe
+formatting. [cli_declarations.h](../src/frameworks/reflection/cli_declarations.h)
+binds request/member paths and derives ordinary option names at compile time;
+its compact authoring lowers to the existing descriptors.
 
 [reflected_descriptors.h](../src/frameworks/reflection/reflected_descriptors.h)
 owns CLI assignment and emission. Non-boolean scalar, optional, and repeatable
@@ -331,9 +335,12 @@ its decoded key strings into the map. Const encoding APIs, validation limits,
 error precedence, and transport delivery policy retain their existing contracts.
 
 [gui_settings.cpp](../src/controller/contracts/gui_settings.cpp) projects
-same-name source, UI, training-target, and shared loading fields through their
-materialized native declarations. Renamed keys and field-specific conversion
-and repair remain local to settings persistence. Benchmark rejection counters
+same-name source, UI, training-target, shared loading, and complete
+`ExploreViewState` fields through their materialized native declarations.
+Explore includes inherited loading fields and `show_labels` in both save and
+load, using the existing named-field reader/writer and subsequent normalization.
+Renamed keys and field-specific conversion and repair remain local to settings
+persistence. Benchmark rejection counters
 likewise derive their binary and named JSON projections from one declaration;
 their [cache-format guards](benchmark-datasets.md#cache-formats-and-capacity) preserve
 the persisted order and representation.

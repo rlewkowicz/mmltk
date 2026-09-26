@@ -45,6 +45,55 @@ default/`off` still reports fatal stderr and failure status. `rfdetr info --onnx
 forwards logging overrides to its sibling tool. Ordinary CLI result stdout
 (e.g. compiled-dataset `info`) is independent.
 
+## Wrapper build, test, and tidy transcripts
+
+Explicit `./mmltk --build`, `./mmltk --test ...`, and `./mmltk --tidy` commands
+retain their stdout and stderr automatically. The wrapper prints the selected
+path when capture starts:
+
+| Operation | Default path below the repository | Destination override |
+| --- | --- | --- |
+| Build | `build/logs/mmltk-build-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_BUILD_LOG_FILE` |
+| Test | `build/logs/mmltk-test-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_TEST_LOG_FILE` |
+| Tidy | `build/logs/mmltk-tidy-YYYYMMDD-HHMMSS-PID.log` | `MMLTK_TIDY_LOG_FILE` |
+
+Relative overrides resolve against the invocation's working directory. Capture
+appends to an existing override path, so choose a new filename to isolate a
+run. Test `list`, `help`, `-h`, and `--help` routes skip capture. Initial wrapper
+startup text emitted before operation selection is outside the transcript.
+Automatic command capture does not enable GUI traces, pixel probes, or routine
+application diagnostics.
+
+The caller still receives stdout on stdout and stderr on stderr. Separate tees
+retain both streams in one file; this does not establish a total ordering
+between them. On ordinary exit the wrapper drains both capture pipes before
+printing and appending its terminal line:
+
+```text
+mmltk: test exited with status 0
+```
+
+Build and tidy use their corresponding operation names. Capture/cleanup failures
+report an error and turn an otherwise successful command into a nonzero result.
+An abrupt termination can leave a transcript without a terminal; EOF alone
+does not establish success. The log parser exposes observed exit lines as
+`process.terminal`, with `@exit_code` and `@terminal` available for queries.
+
+For example:
+
+```bash
+MMLTK_TEST_LOG_FILE=build/logs/test-investigation.log ./mmltk --test core
+./mmltk --logs build/logs/test-investigation.log --errors --format timeline
+./mmltk --logs build/logs/test-investigation.log \
+  -q '@event=process.terminal' --fields @event,@exit_code,@terminal --format timeline
+```
+
+Use the printed path for a specific build or test. The default `--logs` input
+is `build/validation`, so select `build/logs` or a transcript explicitly.
+[Test replacement](validation.md#replacing-an-active-test-run) may explain a
+cancelled earlier run; its terminal records that run's outcome independently
+of its replacement.
+
 ## Fatal stderr reports
 
 Native CLI errors, RF-DETR command errors, ONNX tool failures, and desktop
@@ -343,9 +392,10 @@ The Wayland session assigns one writer to each artifact under
 | `latest-wayland-test-mozilla-…moz_log` | Explicit Mozilla module logs, with separate process/child and rotation identities |
 
 The harness rejects aliased writer destinations and rotates previous family
-members into their `.history` directories. A transcript captured by the caller
-is another source; it does not substitute for independently owned native or
-browser evidence. The headless supervisor owns a separate unique artifact
+members into their `.history` directories. The
+[wrapper test transcript](#wrapper-build-test-and-tidy-transcripts) is another
+source; it does not substitute for independently owned native or browser
+evidence. The headless supervisor owns a separate unique artifact
 directory, described in [headless Wayland](headless-wayland.md).
 Use [capture selection](#select-captures-and-histories) to find the scenario's
 archived family after later browser lifetimes have rotated it.
@@ -711,6 +761,20 @@ Use the [test-selection syntax](validation.md#selection-environment-deadlines-an
 for a comma-separated union of case names, and inspect the selected command's
 actual terminal result.
 
+Catch assertion/exception headers retain `source_file` and `source_line`,
+including uppercase `FAILED:` or `FATAL ERROR:` and a header with no inline
+message. Following exception text stays under the active test context. The
+exact `{Unknown expression after the reported line}` placeholder becomes
+`catch.expression` transcript text. This narrow handling does not make
+malformed JSON diagnostics valid; genuine malformed/truncated records still
+appear under `@parse_error` and fail `--strict`.
+
+```bash
+./mmltk --logs build/logs/test-investigation.log \
+  -q '@event=catch.assertion_failed OR @event=catch.assertion_fatal_error' \
+  --fields @event,@test,source_file,source_line,message --context 3 --format timeline
+```
+
 ### JavaScript and Rust outcomes
 
 TAP records normalize to `tap.test_started`, `tap.test_passed`,
@@ -726,8 +790,8 @@ result. Named stdout/stderr sections restore test context for following panic,
 assertion, and left/right values. Query `@test` to collect that context:
 
 ```bash
-./mmltk --logs build/validation/workflow-frontend-rerun-2.log --errors --format timeline
-./mmltk --logs build/validation/workflow-frontend-rerun-2.log \
+./mmltk --logs build/logs/browser-app-investigation.log --errors --format timeline
+./mmltk --logs build/logs/browser-app-investigation.log \
   -q '@test:"atlas_pixel_evidence"' --format timeline --limit 40
 ```
 
@@ -973,6 +1037,14 @@ then query its successful observations explicitly. For example, replace
 A later capture's empty result says nothing about earlier records. `--strict`
 checks parsing, independently of record presence, rendered assertions, and test
 outcome.
+
+Failure excerpts in a Catch transcript or a bounded query may omit the decisive
+browser records. First use the transcript's test name, source location, and
+terminal status to identify the failure, then list the artifact-family histories
+and select its archive. Query the native/acceptance/Firefox siblings for that
+lifetime; increasing a transcript excerpt cannot recover records that only
+the owning artifact contains. A historical transcript that was never fully
+captured remains partial evidence.
 
 The current Wayland harness uses one rotation identity for its artifact family.
 Older or independently produced captures can have separate rotation IDs.

@@ -21,7 +21,7 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --update-firefox-lock` | Refresh Firefox's Cargo lock from its vendored sources, offline |
 | `./mmltk --tidy` | Format native sources and Iced application Rust; run configured native analysis |
 | `./mmltk --cleanup-report cpp\|frontend\|all` | Generate the selected deduplication reports |
-| `./mmltk --raw-cpd [--min-tokens N] [--output PATH]` | Save unfiltered exact-spelling C++ CPD evidence and separate declaration context |
+| `./mmltk --raw-cpd [--review] [--min-tokens N] [--output PATH]` | Save exact-spelling C++ CPD evidence; `--review` adds an authored-file queue and lexical families in JSON/Markdown |
 | `./mmltk --format-declarations check\|preview\|fix [--file PATH] [--report PATH]` | Report or safely shorten canonical reflection annotation syntax |
 | `./mmltk --test list` | List supported suites and test options |
 | `./mmltk --test all` | Run ordinary native, browser JavaScript/Rust, cleanup/declaration, and log-query fixtures |
@@ -49,6 +49,14 @@ Detailed references: [CUDA/Vulkan diagnostics](validation.md#standalone-cudavulk
 [test selectors](validation.md#selection-environment-deadlines-and-debugging),
 [declaration tooling](validation.md#raw-cpd-and-declaration-formatting), and
 [log queries/provenance](logging.md).
+
+Build, test, and tidy automatically retain both output streams in
+[wrapper transcripts](logging.md#wrapper-build-test-and-tidy-transcripts).
+`MMLTK_BUILD_LOG_FILE`, `MMLTK_TEST_LOG_FILE`, and `MMLTK_TIDY_LOG_FILE`
+override their destinations; relative paths use the invocation directory.
+Test help/list routes skip capture. A new `--test all` replaces earlier tests
+owned by this checkout; [replacement scope and failures](validation.md#replacing-an-active-test-run)
+also apply when `all` has filters.
 
 ### Process snapshots
 
@@ -159,8 +167,13 @@ Top-level commands compile source datasets, inspect compiled metadata,
 benchmark loading, or dispatch RF-DETR work. RF-DETR exposes `compile`, `info`,
 `build-engine`, `export-onnx`, `predict`, `evaluate`, `validate`, `train`, and
 `normalize-weights`. Their options come from
-[rfdetr_cli.cpp](../src/entrypoints/cli/rfdetr_cli.cpp) and the native contract;
+[rfdetr_cli_options.h](../src/entrypoints/cli/rfdetr_cli_options.h) and the native contract;
 use command help for required fields and current defaults.
+Root compile/info/bench declarations live in
+[cli_options.h](../src/entrypoints/cli/cli_options.h); command execution remains
+in the corresponding `.cpp` owners. The
+[authoring reference](reflection.md#compact-cli-declarations) explains derived
+names, explicit spelling exceptions, aliases, negation, and exposure audits.
 
 For example, with existing input artifacts:
 

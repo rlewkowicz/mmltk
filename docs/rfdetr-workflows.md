@@ -169,8 +169,9 @@ cancellation; each workflow retains independent widget identities and state.
 
 Each workflow uses the shared [right-column layout](gui-interaction.md#training-validation-and-prediction).
 **Auto Output** is enabled initially. Accepted execution reserves the next
-`run-NNNN` beneath the workflow root, starting at `run-0001` and growing beyond
-four digits when needed. Existing entries are never overwritten.
+`run-NNNN` beneath the [canonical workflow root](../src/controller/contracts/workflow_output.h),
+starting at `run-0001` and growing beyond four digits when needed. Existing
+entries are never overwritten.
 
 | Workflow | Automatic root | Products within a run |
 | --- | --- | --- |

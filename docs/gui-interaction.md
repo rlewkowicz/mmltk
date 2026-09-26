@@ -983,7 +983,8 @@ paired metadata, encoded draw, and resource custody remain intact.
 
 Gallery and Detail Labels use the current local checkbox state over the labels
 and geometry paired with the displayed image. A label-only toggle needs no new
-GPU image. Boxes and Masks update native semantic planes through dirty work
+GPU image. Explore's Labels preference is saved and restored with its other
+view settings. Boxes and Masks update native semantic planes through dirty work
 and completion notifications, including while the viewport stays still.
 During an augmentation refresh, retained clean pixels and their meaning remain
 paired until each replacement completes; see the

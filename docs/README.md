@@ -20,7 +20,8 @@
   shared facilities, serialization, generated boundaries, frontend components,
   presentation, and vendor ownership.
 - [Reflected declarations and authoring](reflection.md): canonical schemas,
-  structural projection, annotation syntax, and safe mechanical formatting.
+  registration, all twelve annotation macros, scoped CLI declarations,
+  local macros/aliases, structural projection, and safe mechanical formatting.
 - [GUI interaction and presentation](gui-interaction.md): layout and controls,
   session Status, retained editing/charts/viewers, wire protocol, input ordering,
   image geometry, rendering, graphics custody, and redraws.
@@ -42,13 +43,14 @@
 ## Engineering, validation, and operations
 
 - [Validation](validation.md): required gates, suite/filter selection, tidy,
-  cleanup and declaration tooling, diagnostics, evidence ownership, rendered
-  acceptance, numerical coverage, fixtures, and evidence limits.
+  test-run replacement, cleanup and raw-review tooling, declaration formatting,
+  diagnostics, evidence ownership, rendered acceptance, numerical coverage,
+  fixtures, and evidence limits.
 - [Headless Wayland](headless-wayland.md): private NVIDIA Weston setup, input
   seat, readiness, deadlines, shutdown, artifacts, and limitations.
-- [Logging](logging.md): activation, fatal stderr, diagnostic records,
-  acceptance evidence formats, capture/history selection, queries, correlation,
-  triage, and output limits.
+- [Logging](logging.md): automatic build/test/tidy transcripts, opt-in runtime
+  diagnostics, fatal stderr, acceptance evidence formats, capture/history
+  selection, queries, correlation, triage, and output limits.
 - [Planned work](roadmap.md): future directions, distinct from current capability.
 
 `CONTRACT.md` owns high-level architecture and handoffs; this wiki owns detailed

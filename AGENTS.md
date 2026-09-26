@@ -120,6 +120,8 @@ wiring and regenerate through `./mmltk`.
 ## Crashes, Logging, and Debugging
 
 Logging help: `./mmltk --logs --help`.
+Explicit build, test, and tidy invocations retain
+[wrapper transcripts](docs/logging.md#wrapper-build-test-and-tidy-transcripts).
 
 Provide granular opt-in JSONL logging with maximum useful troubleshooting
 detail. Disabled logging must not collect or format diagnostics. Keep normal
@@ -581,6 +583,8 @@ or `remediationplan.md`.
 Do not add regression tests. You may add standard tests that exercise required
 behavior, boundaries, failure handling, resource safety, and integration.
 Final test selection is fixed by [Final Validation](#final-validation-workflow).
+A new `--test all`, including filtered invocations, replaces earlier test runs
+owned by this checkout; [focused suite names preserve them](docs/validation.md#replacing-an-active-test-run).
 
 Do not add tests to Firefox's test suites or execute those suites. Test Firefox
 only indirectly through this repository's first-party suites and packaged

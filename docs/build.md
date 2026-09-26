@@ -230,13 +230,17 @@ These are the default repository-local locations:
 | `.cache/image-fingerprints`, `.cache/locks` | Verified identities and mutation locks |
 | `.cache/tests/rfdetr` | RF-DETR test assets and derived artifacts |
 | `.cache/benchmark-dataset/v1` | Persistent benchmark source archives, JPEGs, indexes, and completion metadata; see [cache ownership](benchmark-datasets.md#persistent-cache-and-publication) |
+| `output/` | Repository-root product artifacts; automatic workflow roots and explicit destinations follow [workflow output policy](rfdetr-workflows.md#run-output-directories) |
 | `build/release`, `build/browser-app` | Staged package and canonical browser bundle |
-| `build/validation`, `build/logs` | Acceptance evidence and build/analysis logs |
+| `build/validation`, `build/logs` | Acceptance evidence and [build/test/tidy transcripts](logging.md#wrapper-build-test-and-tidy-transcripts) |
 | `build/diagnostics` | Wrapper-owned capability, standalone GPU, and native-link diagnostic artifacts |
 
 `MMLTK_CACHE_ROOT` may select a subtree of `.cache`; `MMLTK_RELEASE_STAGE_ROOT`
 must remain below `build`. The wrapper rejects overlapping checkout/cache-root
 mutations. Retain caches for incremental builds.
+The root artifact ignore rule is `/output/`. Build products, dependency caches,
+test scratch, and diagnostics retain their independent locations; explicit
+user destinations are not redirected into `output/`.
 
 `release` configures package and test targets; native tests are excluded from
 the default build. `gui` selects browser work, while `dev` and `analysis`
