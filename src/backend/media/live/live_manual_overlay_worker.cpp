@@ -137,7 +137,8 @@ LiveManualOverlayWorker::PrepareResult LiveManualOverlayWorker::prepare_uploads(
   } else if (!instance.mask_runs.empty()) {
    if (!packed.deferred_mask_projection.has_value()) {
     const ManualOverlayDeferredMaskMapping local{
-     instance.mask_region.width, instance.mask_region.height, 0U, 0U, instance.mask_region.width, instance.mask_region.height, snapshot.capture_width, snapshot.capture_height, 0U, 0U};
+     instance.mask_region.width, instance.mask_region.height, 0U, 0U, instance.mask_region.width, instance.mask_region.height, snapshot.capture_width, snapshot.capture_height, 0U, 0U
+    };
     if (!validate_manual_overlay_deferred_mask(local, instance.mask_region, instance.mask_runs, snapshot.capture_width, snapshot.capture_height).has_value()) return PrepareResult::Refused;
    }
    const std::size_t values = packed.deferred_mask_projection.has_value() ? packed.deferred_mask_projection->run_value_count : instance.mask_runs.size() * 2U;
@@ -251,31 +252,34 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
    has_content = true;
   }
   if (snapshot.renderer_mode != SemanticRenderer::Iced && instance.polyline_points.size() >= 2U && status == cudaSuccess) {
-   status = scope.Record(raster::raster_polyline_rgba({.overlay = target,
-    .points = {reinterpret_cast<const int*>(slot.points.device + packed.polyline_value_offset * sizeof(int)), static_cast<int>(instance.polyline_points.size())},
-    .closed = instance.polyline_closed,
-    .color = {color[0], color[1], color[2]},
-    .thickness = thickness,
-    .stream = slot.stream}));
+   status = scope.Record(raster::raster_polyline_rgba(
+    {.overlay = target,
+     .points = {reinterpret_cast<const int*>(slot.points.device + packed.polyline_value_offset * sizeof(int)), static_cast<int>(instance.polyline_points.size())},
+     .closed = instance.polyline_closed,
+     .color = {color[0], color[1], color[2]},
+     .thickness = thickness,
+     .stream = slot.stream}));
    has_content = true;
   }
   if (snapshot.renderer_mode != SemanticRenderer::Iced && !instance.skeleton_edges.empty() && !instance.points.empty() && status == cudaSuccess) {
-   status = scope.Record(raster::raster_skeleton_rgba({.overlay = target,
-    .points = {reinterpret_cast<const int*>(slot.points.device + packed.point_value_offset * sizeof(int)), static_cast<int>(instance.points.size())},
-    .edges = {reinterpret_cast<const std::uint32_t*>(slot.edges.device + packed.edge_value_offset * sizeof(std::uint32_t)), static_cast<int>(instance.skeleton_edges.size())},
-    .color = {color[0], color[1], color[2]},
-    .thickness = thickness,
-    .stream = slot.stream}));
+   status = scope.Record(raster::raster_skeleton_rgba(
+    {.overlay = target,
+     .points = {reinterpret_cast<const int*>(slot.points.device + packed.point_value_offset * sizeof(int)), static_cast<int>(instance.points.size())},
+     .edges = {reinterpret_cast<const std::uint32_t*>(slot.edges.device + packed.edge_value_offset * sizeof(std::uint32_t)), static_cast<int>(instance.skeleton_edges.size())},
+     .color = {color[0], color[1], color[2]},
+     .thickness = thickness,
+     .stream = slot.stream}));
    has_content = true;
   }
   // CLEANUP-IGNORE: Skeleton edges and standalone point glyphs are distinct raster primitives with separate
   // buffers.
   if (snapshot.renderer_mode != SemanticRenderer::Iced && !instance.points.empty() && status == cudaSuccess) {
-   status = scope.Record(raster::raster_points_rgba({.overlay = target,
-    .points = {reinterpret_cast<const int*>(slot.points.device + packed.point_value_offset * sizeof(int)), static_cast<int>(instance.points.size())},
-    .radius = radius,
-    .color = {color[0], color[1], color[2], instance.style.has_value() ? instance.style->alpha : std::uint8_t{240U}},
-    .stream = slot.stream}));
+   status = scope.Record(raster::raster_points_rgba(
+    {.overlay = target,
+     .points = {reinterpret_cast<const int*>(slot.points.device + packed.point_value_offset * sizeof(int)), static_cast<int>(instance.points.size())},
+     .radius = radius,
+     .color = {color[0], color[1], color[2], instance.style.has_value() ? instance.style->alpha : std::uint8_t{240U}},
+     .stream = slot.stream}));
    has_content = true;
   }
   if (snapshot.renderer_mode != SemanticRenderer::Iced && box_has_area(instance.box) && status == cudaSuccess) {
@@ -283,11 +287,12 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
     {.overlay = target, .box = {instance.box.x1, instance.box.y1, instance.box.x2, instance.box.y2}, .color = {color[0], color[1], color[2]}, .thickness = thickness, .stream = slot.stream}));
    has_content = true;
    if (status == cudaSuccess && instance.style.has_value() && instance.style->draw_handles)
-    status = scope.Record(raster::raster_selection_handles_rgba({.overlay = target,
-     .box = {instance.box.x1, instance.box.y1, instance.box.x2, instance.box.y2},
-     .handle_radius = std::max(1, instance.style->handle_radius),
-     .color = {color[0], color[1], color[2], instance.style->alpha},
-     .stream = slot.stream}));
+    status = scope.Record(raster::raster_selection_handles_rgba(
+     {.overlay = target,
+      .box = {instance.box.x1, instance.box.y1, instance.box.x2, instance.box.y2},
+      .handle_radius = std::max(1, instance.style->handle_radius),
+      .color = {color[0], color[1], color[2], instance.style->alpha},
+      .stream = slot.stream}));
   }
  }
  if (status == cudaSuccess && snapshot.renderer_mode != SemanticRenderer::Iced && snapshot.selected_instance.has_value() && *snapshot.selected_instance < snapshot.instances.size()) {
@@ -309,12 +314,13 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
   }
   status = scope.Record(cudaMemcpyAsync(reinterpret_cast<void*>(slot.brush.device), slot.brush.host, kManualOverlayBrushValueCount * sizeof(int), cudaMemcpyHostToDevice, slot.stream));
   if (status == cudaSuccess)
-   status = scope.Record(raster::raster_polyline_rgba({.overlay = target,
-    .points = {reinterpret_cast<const int*>(slot.brush.device), kManualOverlayBrushSegments},
-    .closed = true,
-    .color = {brush.erase ? std::uint8_t{255U} : std::uint8_t{128U}, brush.erase ? std::uint8_t{128U} : std::uint8_t{255U}, brush.erase ? std::uint8_t{128U} : std::uint8_t{170U}},
-    .thickness = 2,
-    .stream = slot.stream}));
+   status = scope.Record(raster::raster_polyline_rgba(
+    {.overlay = target,
+     .points = {reinterpret_cast<const int*>(slot.brush.device), kManualOverlayBrushSegments},
+     .closed = true,
+     .color = {brush.erase ? std::uint8_t{255U} : std::uint8_t{128U}, brush.erase ? std::uint8_t{128U} : std::uint8_t{255U}, brush.erase ? std::uint8_t{128U} : std::uint8_t{170U}},
+     .thickness = 2,
+     .stream = slot.stream}));
   has_content = true;
  }
  slot.has_content = has_content;
@@ -386,7 +392,8 @@ bool LiveManualOverlayWorker::try_acquire_latest(OverlayView* output) {
  Slot& slot = slots_[static_cast<std::uint32_t>(index)];
  if (!transition_slot_state(slot.state, SlotState::Published, SlotState::Acquired)) return false;
  *output = {
-  .slot = slot.index, .frame = {}, .rgba = slot.rgba, .pitch_bytes = slot.pitch, .width = width_, .height = height_, .ready = slot.ready, .stream = slot.stream, .has_content = slot.has_content};
+  .slot = slot.index, .frame = {}, .rgba = slot.rgba, .pitch_bytes = slot.pitch, .width = width_, .height = height_, .ready = slot.ready, .stream = slot.stream, .has_content = slot.has_content
+ };
  return true;
 }
 void LiveManualOverlayWorker::release(const std::uint32_t index) noexcept {

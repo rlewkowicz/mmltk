@@ -416,10 +416,12 @@ struct ImageUpscaler::Impl {
    .workspace_bytes = kTensorRtWorkspaceBytes,
    .profiling_verbosity = TensorRtProfilingVerbosity::LayerNames,
    .save_engine_path = {},
-   .optimization_profiles = {TensorRtOptimizationProfile{.input_name = std::string(descriptor.input_name),
+   .optimization_profiles = {TensorRtOptimizationProfile{
+    .input_name = std::string(descriptor.input_name),
     .minimum = {1, 3, kImageUpscalerInputExtent, kImageUpscalerInputExtent},
     .optimum = {1, 3, kImageUpscalerInputExtent, kImageUpscalerInputExtent},
-    .maximum = {1, 3, kImageUpscalerInputExtent, kImageUpscalerInputExtent}}},
+    .maximum = {1, 3, kImageUpscalerInputExtent, kImageUpscalerInputExtent}
+   }},
    .context = std::string("Image upscaler ") + std::string(descriptor.label),
    .log = {},
    .continue_build = [current] { return current(); },
@@ -665,7 +667,8 @@ ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerMod
     "source={} target={} stream={}",
     static_cast<std::uint32_t>(mode), width, height, source_pitch, target_pitch, reinterpret_cast<std::uintptr_t>(source), reinterpret_cast<std::uintptr_t>(target), stream_handle);
   });
-  const ImageUpscalerRequest request{.device_pixels = source,
+  const ImageUpscalerRequest request{
+   .device_pixels = source,
    .source_pitch = source_pitch,
    .target_pixels = target,
    .target_pitch = target_pitch,
@@ -676,7 +679,8 @@ ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerMod
    .crop_width = width,
    .crop_height = height,
    .current = current,
-   .purpose = purpose};
+   .purpose = purpose
+  };
   const ImageUpscalerRuntimeOutput output = slot.runtime->enqueue(request, stream);
   if (owner->checkpoint) owner->checkpoint(ImageUpscalerExecutionStage::RuntimeEnqueued);
   if (output.outcome == ImageUpscalerOutcome::Cancelled || !current()) return cancel();

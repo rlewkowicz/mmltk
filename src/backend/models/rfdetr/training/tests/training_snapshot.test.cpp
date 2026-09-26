@@ -103,7 +103,8 @@ struct SnapshotFixture final {
        built(r::build_optimizer(parameters, request)),
        ema(built.optimizer.eligible_parameters(), request.ema_decay, request.ema_tau),
        ordinary{
-        {"value", parameters["value"]}, {"training_supervision.value", parameters["training_supervision.value"]}, {"counter", torch::tensor({3}, torch::kInt64).to(parameters["value"].device())}},
+        {"value", parameters["value"]}, {"training_supervision.value", parameters["training_supervision.value"]}, {"counter", torch::tensor({3}, torch::kInt64).to(parameters["value"].device())}
+       },
        values(r::testsupport::continuation_values(request, {.epoch = 0})) {
   parameters["value"].mutable_grad() = torch::full_like(parameters["value"], .25);
   built.optimizer.step();

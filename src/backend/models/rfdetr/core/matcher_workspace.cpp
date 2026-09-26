@@ -398,8 +398,9 @@ std::vector<MatcherLayerIndices> MatcherWorkspace::pack(
  for (std::size_t layer = 0; layer < indices.size(); ++layer) {
   const auto begin = offsets[layer];
   const auto size = offsets[layer + 1] - begin;
-  result.push_back({{packed.select(0, 0).narrow(0, begin, size), packed.select(0, 1).narrow(0, begin, size)}, packed.select(0, 2).narrow(0, begin, size),
-   {cpu_packed.select(0, 0).narrow(0, begin, size), cpu_packed.select(0, 1).narrow(0, begin, size)}});
+  result.push_back(
+   {{packed.select(0, 0).narrow(0, begin, size), packed.select(0, 1).narrow(0, begin, size)}, packed.select(0, 2).narrow(0, begin, size),
+    {cpu_packed.select(0, 0).narrow(0, begin, size), cpu_packed.select(0, 1).narrow(0, begin, size)}});
  }
  state_->log("assignment_complete");
  return result;

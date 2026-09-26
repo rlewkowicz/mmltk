@@ -32,8 +32,10 @@ namespace mmltk::acceptance::wayland {
 TEST_CASE("Validate to Explore requires real gallery pixel evidence", "[workspace][audit][pixel]") {
  const auto defect = GENERATE("none", "control", "source", "presentation", "sampled", "visible", "placeholder", "background", "missing_tile", "unbounded");
  BrowserAudit audit;
- nlohmann::json record{{"event", "integration.workflow.pixels"}, {"detail", "validate-to-explore"}, {"control", "explore.gallery.workspace"}, {"a", 7U}, {"b", 9U}, {"c", 64U}, {"d", 48U},
-  {"ready_tile", true}, {"matched", true}, {"compiled_index", 0U}, {"sample_width", 8U}, {"sample_height", 8U}};
+ nlohmann::json record{
+  {"event", "integration.workflow.pixels"}, {"detail", "validate-to-explore"}, {"control", "explore.gallery.workspace"}, {"a", 7U}, {"b", 9U}, {"c", 64U}, {"d", 48U}, {"ready_tile", true},
+  {"matched", true}, {"compiled_index", 0U}, {"sample_width", 8U}, {"sample_height", 8U}
+ };
  if (std::string_view{defect} == "control") record["control"] = "validate.detail.image";
  if (std::string_view{defect} == "source") record["a"] = 0U;
  if (std::string_view{defect} == "presentation") record["b"] = 0U;
@@ -60,8 +62,9 @@ TEST_CASE("display confidence audit requires exact edits and reversible paired p
   const unsigned revision = stage < 6U ? 2U : stage - 3U;
   audit.consume({{"event", "integration.validation_confidence_edit"}, {"a", stage}, {"b", value}, {"c", revision}, {"d", 1U}});
   if (stage >= 6U)
-   audit.consume({{"event", "integration.validation_confidence_pixels"}, {"control", "validate.samples.atlas"}, {"stage", stage}, {"threshold", value}, {"detections", 300U}, {"minimum", 0.01},
-    {"maximum", 0.25}, {"clean", 8U}, {"generation", 1U}, {"revision", revision}, {"different", stage == 7U ? 50U : 0U}, {"matched", true}});
+   audit.consume(
+    {{"event", "integration.validation_confidence_pixels"}, {"control", "validate.samples.atlas"}, {"stage", stage}, {"threshold", value}, {"detections", 300U}, {"minimum", 0.01}, {"maximum", 0.25},
+     {"clean", 8U}, {"generation", 1U}, {"revision", revision}, {"different", stage == 7U ? 50U : 0U}, {"matched", true}});
  }
  REQUIRE(audit.validation_confidence_complete());
  SECTION("rounded value") { audit.validation_confidence_edits[0]["b"] = 0.44; }
@@ -100,17 +103,20 @@ TEST_CASE("benchmark radio audit requires every real choice, current visibility 
  };
  record("integration.benchmark_baseline", benchmark_override, "native-settled", {baseline_enabled ? 1.0 : 0.0, double(baseline_dataset), double(baseline_validation), 10.0});
  constexpr std::array controls{
-  "train.dataset.benchmark.custom", "train.dataset.benchmark.coconut", "train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"};
+  "train.dataset.benchmark.custom", "train.dataset.benchmark.coconut", "train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"
+ };
  struct Step {
   const char* control;
   unsigned dataset;
   unsigned validation;
   bool enabled;
  };
- const std::array sequence{Step{benchmark_override, baseline_dataset, baseline_validation, true}, Step{controls[1], 1U, baseline_validation, true}, Step{controls[3], 1U, 1U, true},
-  Step{controls[4], 1U, 2U, true}, Step{controls[2], 1U, 0U, true}, Step{controls[0], 0U, 0U, true}, Step{controls[1], 1U, 0U, true}, Step{"train.dataset.browse", 1U, 0U, true},
+ const std::array sequence{
+  Step{benchmark_override, baseline_dataset, baseline_validation, true}, Step{controls[1], 1U, baseline_validation, true}, Step{controls[3], 1U, 1U, true}, Step{controls[4], 1U, 2U, true},
+  Step{controls[2], 1U, 0U, true}, Step{controls[0], 0U, 0U, true}, Step{controls[1], 1U, 0U, true}, Step{"train.dataset.browse", 1U, 0U, true},
   Step{controls[2U + baseline_validation], 1U, baseline_validation, true}, Step{controls[baseline_dataset], baseline_dataset, baseline_validation, true},
-  Step{benchmark_override, baseline_dataset, baseline_validation, baseline_enabled}, Step{benchmark_override, baseline_dataset, baseline_validation, false}};
+  Step{benchmark_override, baseline_dataset, baseline_validation, baseline_enabled}, Step{benchmark_override, baseline_dataset, baseline_validation, false}
+ };
  for (std::size_t index = 0; index != sequence.size(); ++index) {
   const auto& step = sequence[index];
   record("integration.benchmark_click", step.control, "real-click", {double(index), 1.0, 0.0, 0.0});
@@ -148,15 +154,19 @@ TEST_CASE("browser adapter evidence requires the compositor display device", "[w
  CHECK(audit.failed_before_termination());
 }
 TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[workspace][audit][pixel]") {
- const nlohmann::json native{{"event", "presentation.pixel"}, {"surface_high", 1U}, {"surface_low", 2U}, {"presentation_revision", 7U}, {"source_session", 1U}, {"source_instance", 3U},
-  {"source_revision", 9U}, {"clean_revision", 8U}, {"source_observation_revision", 11U}, {"source_width", 384U}, {"source_height", 384U}, {"content_width", 384U}, {"content_height", 384U},
-  {"capacity_width", 894U}, {"capacity_height", 1080U}, {"allocation_generation", 2U}, {"transfer_sequence", 4U}, {"timeline_ready", 7U}, {"workspace_source_high", 3U}, {"workspace_source_low", 4U},
-  {"workspace_allocation", 8U}, {"sample_rgba", 0xff705030U}};
+ const nlohmann::json native{
+  {"event", "presentation.pixel"}, {"surface_high", 1U}, {"surface_low", 2U}, {"presentation_revision", 7U}, {"source_session", 1U}, {"source_instance", 3U}, {"source_revision", 9U},
+  {"clean_revision", 8U}, {"source_observation_revision", 11U}, {"source_width", 384U}, {"source_height", 384U}, {"content_width", 384U}, {"content_height", 384U}, {"capacity_width", 894U},
+  {"capacity_height", 1080U}, {"allocation_generation", 2U}, {"transfer_sequence", 4U}, {"timeline_ready", 7U}, {"workspace_source_high", 3U}, {"workspace_source_low", 4U},
+  {"workspace_allocation", 8U}, {"sample_rgba", 0xff705030U}
+ };
  const std::string surface = SurfaceAudit::native_identity(native);
  const auto pixel = [&](const char* event, const char* boundary) {
-  nlohmann::json record{{"event", event}, {"boundary", boundary}, {"surface", surface}, {"source", "00000000000000030000000000000004"}, {"presentation_revision", 7U}, {"content_session", 1U},
-   {"content_sequence", 9U}, {"frame_revision", 9U}, {"content_width", 384U}, {"content_height", 384U}, {"width", 894U}, {"height", 1080U}, {"transfer_sequence", 4U}, {"timeline_ready", 7U},
-   {"timeline_release", 8U}, {"layer", 0U}, {"slot", 1U}, {"sample_rgba", 0xff705030U}};
+  nlohmann::json record{
+   {"event", event}, {"boundary", boundary}, {"surface", surface}, {"source", "00000000000000030000000000000004"}, {"presentation_revision", 7U}, {"content_session", 1U}, {"content_sequence", 9U},
+   {"frame_revision", 9U}, {"content_width", 384U}, {"content_height", 384U}, {"width", 894U}, {"height", 1080U}, {"transfer_sequence", 4U}, {"timeline_ready", 7U}, {"timeline_release", 8U},
+   {"layer", 0U}, {"slot", 1U}, {"sample_rgba", 0xff705030U}
+  };
   if (std::string_view{event}.starts_with("iced.surface.")) {
    record.erase("transfer_sequence");
    record.erase("timeline_ready");
@@ -414,16 +424,19 @@ TEST_CASE("composition evidence requires every card and kind in each column publ
    for (const auto card : {3U, 8U}) {
     for (unsigned kind = 0U; kind < 4U; ++kind) {
      if (defect == "missing" && columns == 10U && card == 8U && kind == 3U) continue;
-     nlohmann::json record{{"event", "integration.atlas_composition"}, {"surface", "surface"}, {"columns", columns}, {"presentation_revision", columns}, {"card", card}, {"kind", kind},
-      {"content_width", 100U}, {"content_height", 100U}, {"image_x", 0.0}, {"image_y", 0.0}, {"image_width", 100.0}, {"image_height", 100.0}, {"sample_x", 10.5}, {"sample_y", 10.5},
-      {"canvas_x", 10.5}, {"canvas_y", 10.5}, {"expected", {120, 80, 40, 255}}, {"observed", {120, 80, 40, 255}}};
+     nlohmann::json record{
+      {"event", "integration.atlas_composition"}, {"surface", "surface"}, {"columns", columns}, {"presentation_revision", columns}, {"card", card}, {"kind", kind}, {"content_width", 100U},
+      {"content_height", 100U}, {"image_x", 0.0}, {"image_y", 0.0}, {"image_width", 100.0}, {"image_height", 100.0}, {"sample_x", 10.5}, {"sample_y", 10.5}, {"canvas_x", 10.5}, {"canvas_y", 10.5},
+      {"expected", {120, 80, 40, 255}}, {"observed", {120, 80, 40, 255}}
+     };
      if (defect == "mask-as-box" && kind == 2U) record["observed"] = {74, 80, 86, 255};
      if (defect == "mixed" && kind == 3U) record["presentation_revision"] = 99U;
      audit.consume(record);
     }
    }
-   audit.consume({{"event", "integration.atlas_composition_complete"}, {"surface", "surface"}, {"columns", columns}, {"presentation_revision", columns}, {"cards", {3U, 8U}}, {"emitted", 8U},
-    {"content_width", 100U}, {"content_height", 100U}});
+   audit.consume(
+    {{"event", "integration.atlas_composition_complete"}, {"surface", "surface"}, {"columns", columns}, {"presentation_revision", columns}, {"cards", {3U, 8U}}, {"emitted", 8U},
+     {"content_width", 100U}, {"content_height", 100U}});
   }
  };
  PixelBoundaryAudit valid;
@@ -654,13 +667,16 @@ TEST_CASE("rendered slot queries share fixed and wildcard geometry admission", "
 TEST_CASE("browser compile metrics accept zero drops and require consistent progress", "[workspace][audit]") {
  const auto dropped = GENERATE(0U, 3U);
  const auto completed = GENERATE(0U, 4U);
- const nlohmann::json metrics{{"event", "integration.compile_metrics"}, {"control", "train.compile_dataset.progress"}, {"detail", "elapsed-eta-throughput-dropped"}, {"a", 2U},
-  {"b", completed == 0U ? 0U : 8U}, {"c", completed == 0U ? 0U : 2U}, {"d", dropped}};
+ const nlohmann::json metrics{
+  {"event", "integration.compile_metrics"}, {"control", "train.compile_dataset.progress"}, {"detail", "elapsed-eta-throughput-dropped"}, {"a", 2U}, {"b", completed == 0U ? 0U : 8U},
+  {"c", completed == 0U ? 0U : 2U}, {"d", dropped}
+ };
  BrowserAudit audit;
  audit.consume(metrics);
  CHECK_FALSE(audit.compile_metrics);
- audit.consume({{"event", "integration.compile_progress"}, {"control", "train.compile_dataset.progress"}, {"detail", completed == 0U ? "planning" : "compiling"}, {"a", 1U}, {"b", completed},
-  {"c", 20U}, {"d", dropped}});
+ audit.consume(
+  {{"event", "integration.compile_progress"}, {"control", "train.compile_dataset.progress"}, {"detail", completed == 0U ? "planning" : "compiling"}, {"a", 1U}, {"b", completed}, {"c", 20U},
+   {"d", dropped}});
  REQUIRE(audit.progress);
  audit.consume(metrics);
  CHECK(audit.compile_metrics);
@@ -727,27 +743,29 @@ TEST_CASE("rendered_probe_audit_rejects_mismatched_identity", "[workspace_waylan
  const std::string_view name{event};
  const bool copying = name.starts_with("presentation.source_borrow.") || name == "presentation.source.read_submitted";
  const bool source_control = name.starts_with("presentation.source.") && !copying;
- return {{"kind", "gui_runtime"}, {"event", event}, {"sequence", 7U}, {"surface_high", 11U}, {"surface_low", source_control ? low + 1000U : low}, {"selection_generation", 19U},
-  {"frame_revision", 23U}, {"capacity_width", 64U}, {"capacity_height", 32U}, {"condition", 2U}, {"outcome", name == "presentation.source.read_submitted" ? 0U : 1U}, {"value", copying ? 0U : 1U},
-  {"source_revision", 23U}, {"source_session", 1U}, {"source_width", 64U}, {"source_height", 32U}, {"workspace_source_high", 11U}, {"workspace_source_low", low + 1000U},
-  {"workspace_allocation", low + 2000U}, {"workspace_bytes", 8192U}, {"workspace_pitch", 256U}, {"workspace_width", 64U}, {"workspace_height", 32U}, {"direct_sampling", false},
-  {"allocation_generation", 7U}, {"presentation_revision", copying ? 0U : 1U}, {"transfer_sequence", copying ? 0U : 1U}, {"metadata_bytes", 128U}, {"metadata_fingerprint", "819de48387b34f29"},
-  {"timeline_ready", copying ? 0U : 1U}, {"trace_id", 31U}, {"span_id", 31U},
-  {"span_outcome", static_cast<std::uint64_t>(std::string_view{event}.ends_with(".completed") ? mmltk::controller::contracts::DiagnosticSpanOutcome::Success
-                                                                                              : mmltk::controller::contracts::DiagnosticSpanOutcome::Unspecified)}};
+ return {
+  {"kind", "gui_runtime"}, {"event", event}, {"sequence", 7U}, {"surface_high", 11U}, {"surface_low", source_control ? low + 1000U : low}, {"selection_generation", 19U}, {"frame_revision", 23U},
+  {"capacity_width", 64U}, {"capacity_height", 32U}, {"condition", 2U}, {"outcome", name == "presentation.source.read_submitted" ? 0U : 1U}, {"value", copying ? 0U : 1U}, {"source_revision", 23U},
+  {"source_session", 1U}, {"source_width", 64U}, {"source_height", 32U}, {"workspace_source_high", 11U}, {"workspace_source_low", low + 1000U}, {"workspace_allocation", low + 2000U},
+  {"workspace_bytes", 8192U}, {"workspace_pitch", 256U}, {"workspace_width", 64U}, {"workspace_height", 32U}, {"direct_sampling", false}, {"allocation_generation", 7U},
+  {"presentation_revision", copying ? 0U : 1U}, {"transfer_sequence", copying ? 0U : 1U}, {"metadata_bytes", 128U}, {"metadata_fingerprint", "819de48387b34f29"}, {"timeline_ready", copying ? 0U : 1U},
+  {"trace_id", 31U}, {"span_id", 31U},
+  {"span_outcome", static_cast<std::uint64_t>(
+                    std::string_view{event}.ends_with(".completed") ? mmltk::controller::contracts::DiagnosticSpanOutcome::Success : mmltk::controller::contracts::DiagnosticSpanOutcome::Unspecified)}
+ };
 }
 [[nodiscard]] nlohmann::json browser_surface_record(const char* event, const std::uint64_t low = 12U) {
  const std::string_view name{event};
  static std::uint64_t next_draw = 0U;
  static std::unordered_map<std::uint64_t, std::uint64_t> current_draw;
  if (name == "iced.surface.sample_draw_selected") current_draw[low] = ++next_draw;
- return {{"event", event}, {"draw_identity", current_draw[low]},
-  {"surface", SurfaceAudit::native_identity(native_surface_record("", name.starts_with("firefox.workspace.source.") ? low + 1000U : low))},
+ return {
+  {"event", event}, {"draw_identity", current_draw[low]}, {"surface", SurfaceAudit::native_identity(native_surface_record("", name.starts_with("firefox.workspace.source.") ? low + 1000U : low))},
   {"source", SurfaceAudit::native_identity(native_surface_record("", low + 1000U))}, {"arena", SurfaceAudit::native_identity(native_surface_record("", low))}, {"workspace_allocation", low + 2000U},
   {"direct_sampling", false}, {"layer", 0U}, {"slot", 0U}, {"content_session", 1U}, {"content_sequence", 23U}, {"content_width", 64U}, {"content_height", 32U}, {"transfer_sequence", 1U},
   {"metadata_bytes", 128U}, {"metadata_fingerprint", "819de48387b34f29"}, {"timeline_ready", 1U}, {"timeline_release", 2U},
-  {"requested_surface", SurfaceAudit::native_identity(native_surface_record("", low))}, {"width", 64U}, {"height", 32U}, {"frame_revision", 23U}, {"presentation_revision", 1U},
-  {"outcome", "claimed"}};
+  {"requested_surface", SurfaceAudit::native_identity(native_surface_record("", low))}, {"width", 64U}, {"height", 32U}, {"frame_revision", 23U}, {"presentation_revision", 1U}, {"outcome", "claimed"}
+ };
 }
 [[nodiscard]] nlohmann::json release_only_record(const char* event) {
  auto record = browser_surface_record(event);
@@ -755,15 +773,18 @@ TEST_CASE("rendered_probe_audit_rejects_mismatched_identity", "[workspace_waylan
  record.erase("slot");
  return record;
 }
-constexpr std::array native_surface_events{"presentation.arena.advertised", "presentation.admission.enqueued", "presentation.admission.written", "presentation.import.outcome",
- "presentation.source.admission.enqueued", "presentation.source.admission.written", "presentation.source.ready", "presentation.source_borrow.started", "presentation.source_borrow.completed",
- "presentation.source.read_submitted", "presentation.ready_sync.started", "presentation.ready_sync.completed", "presentation.frame.edge", "presentation.release_wait.started",
- "presentation.release_wait.completed", "presentation.active.withdrawal", "presentation.retirement"};
-constexpr std::array browser_surface_events{"firefox.workspace.admitted", "iced.surface.texture_create", "firefox.workspace.claim_outcome", "firefox.workspace.registry_inserted",
- "firefox.workspace.import_ready_emitted", "firefox.workspace.ready", "firefox.workspace.source.admitted", "firefox.workspace.source.claim_outcome", "firefox.workspace.source.ready",
- "firefox.workspace.frame_forwarded", "firefox.workspace.frame_dispatched", "firefox.workspace.copy_completed", "iced.surface.sample_acquired", "iced.surface.sample_draw_selected",
- "iced.surface.draw_encoded", "iced.surface.draw_submitted", "iced.frame.draw_settled", "firefox.workspace.withdrawal", "iced.frame.sample_released", "iced.surface.texture_destroyed",
- "firefox.workspace.retired"};
+constexpr std::array native_surface_events{
+ "presentation.arena.advertised", "presentation.admission.enqueued", "presentation.admission.written", "presentation.import.outcome", "presentation.source.admission.enqueued",
+ "presentation.source.admission.written", "presentation.source.ready", "presentation.source_borrow.started", "presentation.source_borrow.completed", "presentation.source.read_submitted",
+ "presentation.ready_sync.started", "presentation.ready_sync.completed", "presentation.frame.edge", "presentation.release_wait.started", "presentation.release_wait.completed",
+ "presentation.active.withdrawal", "presentation.retirement"
+};
+constexpr std::array browser_surface_events{
+ "firefox.workspace.admitted", "iced.surface.texture_create", "firefox.workspace.claim_outcome", "firefox.workspace.registry_inserted", "firefox.workspace.import_ready_emitted",
+ "firefox.workspace.ready", "firefox.workspace.source.admitted", "firefox.workspace.source.claim_outcome", "firefox.workspace.source.ready", "firefox.workspace.frame_forwarded",
+ "firefox.workspace.frame_dispatched", "firefox.workspace.copy_completed", "iced.surface.sample_acquired", "iced.surface.sample_draw_selected", "iced.surface.draw_encoded",
+ "iced.surface.draw_submitted", "iced.frame.draw_settled", "firefox.workspace.withdrawal", "iced.frame.sample_released", "iced.surface.texture_destroyed", "firefox.workspace.retired"
+};
 constexpr std::size_t browser_live_stages = 17U;
 void record_source_transfer(SurfaceAudit& audit, const bool acquired = true) {
  for (std::size_t stage = 0U; stage < (acquired ? 15U : 13U); ++stage) audit.native(native_surface_record(native_surface_events[stage]));
@@ -1261,8 +1282,9 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
  CHECK(initial.partial_first_tile_count == 1U);
  CHECK_FALSE(initial.causal_inconsistent);
  CHECK_FALSE(initial.final_generations_for(rendered_slots, 2U, 8U).has_value());
- initial.consume({{"kind", "gui_runtime"}, {"owner", "presentation"}, {"event", "presentation.frame.edge"}, {"source_session", 1U}, {"source_instance", 1U}, {"source_observation_revision", 10U},
-  {"source_revision", 8U}, {"frame_revision", 8U}});
+ initial.consume(
+  {{"kind", "gui_runtime"}, {"owner", "presentation"}, {"event", "presentation.frame.edge"}, {"source_session", 1U}, {"source_instance", 1U}, {"source_observation_revision", 10U},
+   {"source_revision", 8U}, {"frame_revision", 8U}});
  initial.join_gallery_publication(2U, rendered_slots);
  CHECK_FALSE(initial.final_generations_for(rendered_slots, 2U, 8U).has_value());
  initial.join_gallery_publication(2U, rendered_slots);
@@ -1282,12 +1304,14 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
   if (missing != "patch" && missing != "late-patch") partial.consume_explore_evidence("acceptance.slot.patched", 1U, missing == "identity" ? 12U : 11U);
   partial.consume_explore_evidence("explore.frame.published", 8U);
   if (missing != "physical")
-   partial.consume({{"kind", "gui_runtime"}, {"owner", "presentation"}, {"event", "presentation.frame.edge"}, {"source_session", 1U}, {"source_instance", 1U}, {"source_observation_revision", 11U},
-    {"source_revision", 8U}, {"frame_revision", 8U}});
+   partial.consume(
+    {{"kind", "gui_runtime"}, {"owner", "presentation"}, {"event", "presentation.frame.edge"}, {"source_session", 1U}, {"source_instance", 1U}, {"source_observation_revision", 11U},
+     {"source_revision", 8U}, {"frame_revision", 8U}});
   if (missing == "late-patch") partial.consume_explore_evidence("acceptance.slot.patched", 1U, 11U);
   BrowserAudit browser;
   nlohmann::json snapshot{
-   {"gallery_generation", 2U}, {"visible_indices", {10U, 11U, 12U}}, {"source_revision", missing == "frame" ? 9U : 8U}, {"source_observation_revision", missing == "observation" ? 12U : 11U}};
+   {"gallery_generation", 2U}, {"visible_indices", {10U, 11U, 12U}}, {"source_revision", missing == "frame" ? 9U : 8U}, {"source_observation_revision", missing == "observation" ? 12U : 11U}
+  };
   if (missing != "bitmap") snapshot["ready_slots"] = std::vector<bool>{missing == "wrong-ready", missing != "wrong-ready", missing == "extra-ready"};
   browser.consume_gallery_generation(snapshot);
   REQUIRE(browser.bounds_valid);
@@ -1490,11 +1514,12 @@ TEST_CASE("rapid surface join requires a complete pending-candidate handoff", "[
  const auto drawing = pending_handoff(std::nullopt, pending_texture, true, true);
  REQUIRE(drawing.evidence_settled());
  CHECK(drawing.pending_supersession_completed());
- for (const auto missing : {MissingHandoffEvidence::PendingDiscard, MissingHandoffEvidence::Reconstruction, MissingHandoffEvidence::CaptureBeforeDraw, MissingHandoffEvidence::DuplicateReconstruction,
-       MissingHandoffEvidence::DifferentCompleted, MissingHandoffEvidence::Fallback, MissingHandoffEvidence::FallbackPublication, MissingHandoffEvidence::FallbackRequest,
-       MissingHandoffEvidence::ReplacementPublication, MissingHandoffEvidence::AcquisitionAfterReconstruction, MissingHandoffEvidence::OlderCompleted, MissingHandoffEvidence::AbandonedFallback,
-       MissingHandoffEvidence::AbandonedReplacement, MissingHandoffEvidence::FallbackSubmission, MissingHandoffEvidence::ReplacementSubmission, MissingHandoffEvidence::DuplicateFallbackSubmission,
-       MissingHandoffEvidence::DuplicateReplacementSubmission}) {
+ for (const auto missing :
+  {MissingHandoffEvidence::PendingDiscard, MissingHandoffEvidence::Reconstruction, MissingHandoffEvidence::CaptureBeforeDraw, MissingHandoffEvidence::DuplicateReconstruction,
+   MissingHandoffEvidence::DifferentCompleted, MissingHandoffEvidence::Fallback, MissingHandoffEvidence::FallbackPublication, MissingHandoffEvidence::FallbackRequest,
+   MissingHandoffEvidence::ReplacementPublication, MissingHandoffEvidence::AcquisitionAfterReconstruction, MissingHandoffEvidence::OlderCompleted, MissingHandoffEvidence::AbandonedFallback,
+   MissingHandoffEvidence::AbandonedReplacement, MissingHandoffEvidence::FallbackSubmission, MissingHandoffEvidence::ReplacementSubmission, MissingHandoffEvidence::DuplicateFallbackSubmission,
+   MissingHandoffEvidence::DuplicateReplacementSubmission}) {
   if (pending_texture && missing == MissingHandoffEvidence::FallbackRequest) continue;
   const auto audit = pending_handoff(missing, pending_texture);
   INFO("surface join: " << audit.joined_failure());
@@ -1898,10 +1923,11 @@ TEST_CASE("Source withdrawal permits claimed initialization to finish before ret
  const auto install_native_timeline = GENERATE(false, true);
  SurfaceAudit audit;
  for (const bool browser : {false, true}) {
-  const std::array events = browser ? std::array{"firefox.workspace.source.admitted", "firefox.workspace.source.claim_outcome", "firefox.workspace.source.ready", "firefox.workspace.source.withdrawal",
-                                       "firefox.workspace.source.retired"}
-                                    : std::array{"presentation.source.admission.enqueued", "presentation.source.admission.written", "presentation.source.ready", "presentation.source.withdrawal",
-                                       "presentation.source.retirement"};
+  const std::array events =
+   browser
+    ? std::
+       array{"firefox.workspace.source.admitted", "firefox.workspace.source.claim_outcome", "firefox.workspace.source.ready", "firefox.workspace.source.withdrawal", "firefox.workspace.source.retired"}
+    : std::array{"presentation.source.admission.enqueued", "presentation.source.admission.written", "presentation.source.ready", "presentation.source.withdrawal", "presentation.source.retirement"};
   const auto observe = [&](SurfaceAudit& target, const std::size_t stage) {
    if (browser)
     target.browser(browser_surface_record(events[stage]));
@@ -2229,8 +2255,9 @@ TEST_CASE("Detached unacquired offers retire without inventing physical read cus
  CHECK(state.samples.empty());
 }
 TEST_CASE("Source admission audit requires canonical allocation provenance", "[workspace][audit]") {
- for (const auto* field : {"sequence", "capacity_width", "capacity_height", "workspace_source_high", "workspace_source_low", "workspace_allocation", "workspace_bytes", "workspace_pitch",
-       "workspace_width", "workspace_height"}) {
+ for (const auto* field :
+  {"sequence", "capacity_width", "capacity_height", "workspace_source_high", "workspace_source_low", "workspace_allocation", "workspace_bytes", "workspace_pitch", "workspace_width",
+   "workspace_height"}) {
   SurfaceAudit audit;
   auto record = native_surface_record("presentation.source.admission.enqueued");
   record.erase(field);
@@ -2249,7 +2276,8 @@ TEST_CASE("held placeholder motion evidence uses only the target hover interval"
  for (const std::string_view timing : {"earlier", "during", "later"}) {
   BrowserAudit audit;
   const nlohmann::json motion{
-   {"event", "integration.explore_mouse"}, {"detail", "shared-input-admitted"}, {"a", 150.0}, {"b", 50.0}, {"c", static_cast<std::uint64_t>(mmltk::controller::WorkspaceMouseKind::Motion)}};
+   {"event", "integration.explore_mouse"}, {"detail", "shared-input-admitted"}, {"a", 150.0}, {"b", 50.0}, {"c", static_cast<std::uint64_t>(mmltk::controller::WorkspaceMouseKind::Motion)}
+  };
   audit.consume(motion);
   auto draw = atlas_draw_record(77U, 10U, 4U, 0.0);
   draw["ready_slots"] = std::vector<bool>{true, false};
@@ -2346,9 +2374,10 @@ TEST_CASE("physical ledger distinguishes abandonment and rejects obsolete image 
 TEST_CASE("read admission checks actual eligible demand and independently clipped neighbor windows", "[workspace][audit]") {
  for (const std::string_view defect : {"none", "immediate", "preferred", "outside"}) {
   NativeAudit audit;
-  nlohmann::json admission{{"kind", "gui_runtime"}, {"event", "gallery.read.scheduled"}, {"sequence", 7U}, {"detail", 20U}, {"admission_position", 20U}, {"admission_columns", 4U},
-   {"admission_first_row", 6U}, {"admission_row_count", 5U}, {"admission_forward", true}, {"admission_tier", 2U}, {"admission_immediate_eligible", 0U}, {"admission_forward_eligible", 0U},
-   {"admission_backward_eligible", 7U}};
+  nlohmann::json admission{
+   {"kind", "gui_runtime"}, {"event", "gallery.read.scheduled"}, {"sequence", 7U}, {"detail", 20U}, {"admission_position", 20U}, {"admission_columns", 4U}, {"admission_first_row", 6U},
+   {"admission_row_count", 5U}, {"admission_forward", true}, {"admission_tier", 2U}, {"admission_immediate_eligible", 0U}, {"admission_forward_eligible", 0U}, {"admission_backward_eligible", 7U}
+  };
   if (defect == "immediate") admission["admission_immediate_eligible"] = 1U;
   if (defect == "preferred") admission["admission_forward_eligible"] = 1U;
   if (defect == "outside") admission["admission_position"] = 0U;
@@ -2363,10 +2392,14 @@ TEST_CASE("cached viewport evidence joins initial readiness before new read admi
    NativeAudit audit;
    audit.consume({{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "acceptance.placeholder.slot"}, {"sequence", 7U}, {"value", 0U}, {"detail", 20U}, {"capacity_width", 1U}});
    audit.consume({{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "acceptance.placeholder.slot"}, {"sequence", 7U}, {"value", 1U}, {"detail", 21U}, {"capacity_width", 0U}});
-   const nlohmann::json restored{{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "acceptance.placeholder.complete"}, {"sequence", 7U}, {"value", 2U}, {"capacity_width", 1U},
-    {"admission_columns", 2U}, {"admission_first_row", 10U}, {"admission_row_count", 1U}, {"admission_forward", forward}};
-   const nlohmann::json admission{{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "gallery.read.scheduled"}, {"sequence", 7U}, {"detail", 21U}, {"admission_position", 21U},
-    {"admission_columns", 2U}, {"admission_first_row", 10U}, {"admission_row_count", 1U}, {"admission_forward", forward}, {"admission_tier", 0U}};
+   const nlohmann::json restored{
+    {"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "acceptance.placeholder.complete"}, {"sequence", 7U}, {"value", 2U}, {"capacity_width", 1U}, {"admission_columns", 2U},
+    {"admission_first_row", 10U}, {"admission_row_count", 1U}, {"admission_forward", forward}
+   };
+   const nlohmann::json admission{
+    {"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "gallery.read.scheduled"}, {"sequence", 7U}, {"detail", 21U}, {"admission_position", 21U}, {"admission_columns", 2U},
+    {"admission_first_row", 10U}, {"admission_row_count", 1U}, {"admission_forward", forward}, {"admission_tier", 0U}
+   };
    audit.consume(restored_first ? restored : admission);
    audit.consume(restored_first ? admission : restored);
    CHECK(audit.cached_first_valid == restored_first);
@@ -2438,8 +2471,9 @@ TEST_CASE("successful compile cannot replace real active cancellation and restar
 }
 TEST_CASE("drawn Coconut geometry rejects clipping, alignment and text regressions", "[workspace][audit]") {
  for (const bool narrow : {false, true})
-  for (const std::string defect : {"none", "wrapped", "fractional-wrap", "missing-viewport", "missing-paint", "clip-leak", "non-peer", "wrong-indent", "description-alignment", "description-size",
-        "recovery-size", "recovery-double-size", "recovery-fractional", "missing-reference", "recovery-reference", "recovery-line-height"}) {
+  for (const std::string defect :
+   {"none", "wrapped", "fractional-wrap", "missing-viewport", "missing-paint", "clip-leak", "non-peer", "wrong-indent", "description-alignment", "description-size", "recovery-size",
+    "recovery-double-size", "recovery-fractional", "missing-reference", "recovery-reference", "recovery-line-height"}) {
    BrowserAudit audit;
    const auto rectangle = [&](const char* event, const std::string& id, std::array<double, 4> bounds) {
     audit.consume({{"event", event}, {"control", id}, {"a", bounds[0]}, {"b", bounds[1]}, {"c", bounds[2]}, {"d", bounds[3]}});
@@ -2505,8 +2539,10 @@ TEST_CASE("Dataset reversal joins actual closing and reopening draws before sett
   if (defect != "missing-baseline") audit.dataset_transition_frames[25U].push_back({0, 217, 0, 0, 0, 0, 0, 0, 0});
   if (defect != "missing-closing") audit.dataset_transition_frames[6U].push_back({0, 180, 0, 0, 0, 0, 0, 0, 0});
   if (defect != "missing-reopening") audit.dataset_transition_frames[6U].push_back({0, 190, 0, 0, 0, 0, 0, 0, 0});
-  const nlohmann::json record{{"event", "integration.dataset_reversal"}, {"control", "train.dataset.coconut_options"}, {"detail", "actual-draw"}, {"a", defect == "wrong-full" ? 218 : 217},
-   {"b", defect == "settled-close" ? 0 : 180}, {"c", 190}, {"d", 1U}};
+  const nlohmann::json record{
+   {"event", "integration.dataset_reversal"}, {"control", "train.dataset.coconut_options"}, {"detail", "actual-draw"}, {"a", defect == "wrong-full" ? 218 : 217},
+   {"b", defect == "settled-close" ? 0 : 180}, {"c", 190}, {"d", 1U}
+  };
   audit.consume(record);
   if (defect == "duplicate") audit.consume(record);
   CHECK(audit.dataset_reversal == (defect == "none"));
@@ -2548,8 +2584,9 @@ TEST_CASE("Dataset terminal presentation requires complete captions and collapse
  }
  for (const std::string defect : {"none", "retained-text", "retained-space"}) {
   BrowserAudit audit;
-  audit.consume({{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.area"}, {"detail", defect == "retained-text" ? "Failed" : ""}, {"a", 10}, {"b", 10}, {"c", 200},
-   {"d", defect == "retained-space" ? 15.6 : 0.0}});
+  audit.consume(
+   {{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.area"}, {"detail", defect == "retained-text" ? "Failed" : ""}, {"a", 10}, {"b", 10}, {"c", 200},
+    {"d", defect == "retained-space" ? 15.6 : 0.0}});
   audit.consume({{"event", "integration.dataset_frame"}, {"a", 206U}});
   audit.consume({{"event", "integration.dataset_fixture"}, {"a", 6U}, {"b", 206U}, {"c", 4U}, {"d", 1U}});
   CHECK(audit.dataset_presentation_valid == (defect == "none"));
@@ -2558,8 +2595,9 @@ TEST_CASE("Dataset terminal presentation requires complete captions and collapse
 TEST_CASE("Dataset divider pixel audit requires both geometry and matching color evidence", "[workspace][audit]") {
  for (const std::string defect : {"none", "missing-stroke", "full-span", "extra-gap", "wrong-color"}) {
   BrowserAudit audit;
-  audit.consume({{"event", "integration.dataset_divider_pixels"}, {"control", "train.dataset.benchmark_divider"}, {"a", 200U}, {"b", 200}, {"c", defect == "full-span" ? 200 : 150},
-   {"d", defect == "missing-stroke" ? 0 : 1}, {"scale", 1}, {"gap", defect == "extra-gap" ? 1 : 0}, {"matched", defect != "wrong-color"}});
+  audit.consume(
+   {{"event", "integration.dataset_divider_pixels"}, {"control", "train.dataset.benchmark_divider"}, {"a", 200U}, {"b", 200}, {"c", defect == "full-span" ? 200 : 150},
+    {"d", defect == "missing-stroke" ? 0 : 1}, {"scale", 1}, {"gap", defect == "extra-gap" ? 1 : 0}, {"matched", defect != "wrong-color"}});
   CHECK(audit.dataset_divider_pixels.size() == (defect == "none" ? 1U : 0U));
  }
 }
@@ -2585,8 +2623,10 @@ TEST_CASE("Dataset presentation requires complete scoped custody evidence", "[wo
   for (unsigned step = 1U; step <= 6U; ++step) {
    const bool stimulus = step == 1U || step == 2U || step == 4U || step == 5U;
    const bool observed = step == 1U || step == 3U || step == 6U;
-   nlohmann::json record{{"event", "integration.dataset_custody"}, {"control", "dataset.presentation"}, {"detail", "admitted"}, {"case", step}, {"scope", 100U + step}, {"key", 200U},
-    {"snapshots", 0U}, {"reads", 0U}, {"reports", 0U}, {"stimulus", false}, {"owner", step == 6U ? 2U : 1U}};
+   nlohmann::json record{
+    {"event", "integration.dataset_custody"}, {"control", "dataset.presentation"}, {"detail", "admitted"}, {"case", step}, {"scope", 100U + step}, {"key", 200U}, {"snapshots", 0U}, {"reads", 0U},
+    {"reports", 0U}, {"stimulus", false}, {"owner", step == 6U ? 2U : 1U}
+   };
    audit.consume(record);
    if (stimulus) {
     record["detail"] = "stimulus";
@@ -2609,11 +2649,12 @@ TEST_CASE("Dataset presentation requires complete scoped custody evidence", "[wo
    if (observed || (step == 2U && defect == "retired-rendered")) {
     for (unsigned index = 0U; index < 3U; ++index) {
      if (defect == "missing-rendered" && step == 3U && index == 0U) continue;
-     audit.consume({{"event", index == 0U ? "integration.dataset_pixels" : "integration.dataset_divider_pixels"},
-      {"control", index == 0U                                     ? "dataset.presentation"
-                  : index == 1U || defect == "duplicate-rendered" ? "train.dataset.benchmark_divider"
-                                                                  : "train.dataset.dimensions_divider"},
-      {"a", 200U}, {"custody_scope", 100U + step}, {"custody_case", step}});
+     audit.consume(
+      {{"event", index == 0U ? "integration.dataset_pixels" : "integration.dataset_divider_pixels"},
+       {"control", index == 0U                                     ? "dataset.presentation"
+                   : index == 1U || defect == "duplicate-rendered" ? "train.dataset.benchmark_divider"
+                                                                   : "train.dataset.dimensions_divider"},
+       {"a", 200U}, {"custody_scope", 100U + step}, {"custody_case", step}});
     }
    }
    record["detail"] = observed ? "observed" : "invalidated";
@@ -2684,17 +2725,19 @@ TEST_CASE("Dataset fitted pixels require the exact narrow compiling frame", "[wo
   {"none", "wide-frame", "native-frame", "short-caption", "wrong-caption", "wide-row", "missing-fit", "normal-size", "wrong-step", "short-line", "wrapped", "stale-frame"}) {
   BrowserAudit audit;
   if (defect != "missing-fit")
-   audit.consume({{"event", "integration.dataset_status_font"}, {"control", "train.dataset.progress.pixels"},
-    {"a", defect == "normal-size"  ? 12.0
-          : defect == "wrong-step" ? 9.25
-                                   : 9.5},
-    {"b", 12.0}, {"c", defect == "short-line" ? 12.35 : 15.6}, {"d", defect == "wrapped" ? 31.2 : 15.6}});
+   audit.consume(
+    {{"event", "integration.dataset_status_font"}, {"control", "train.dataset.progress.pixels"},
+     {"a", defect == "normal-size"  ? 12.0
+           : defect == "wrong-step" ? 9.25
+                                    : 9.5},
+     {"b", 12.0}, {"c", defect == "short-line" ? 12.35 : 15.6}, {"d", defect == "wrapped" ? 31.2 : 15.6}});
   if (defect == "stale-frame") audit.consume({{"event", "integration.dataset_frame"}, {"a", 209U}});
-  audit.consume({{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.pixels"},
-   {"detail", defect == "short-caption"   ? "Pixels\nComplete"
-              : defect == "wrong-caption" ? "Pixels\nWaiting · 2,345 / 9,876"
-                                          : "Pixels\nCompiling image pixels · 2,345 / 9,876"},
-   {"a", 12}, {"b", 30}, {"c", defect == "wide-row" ? 336.0 : 200.0}, {"d", 43.2}});
+  audit.consume(
+   {{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.pixels"},
+    {"detail", defect == "short-caption"   ? "Pixels\nComplete"
+               : defect == "wrong-caption" ? "Pixels\nWaiting · 2,345 / 9,876"
+                                           : "Pixels\nCompiling image pixels · 2,345 / 9,876"},
+    {"a", 12}, {"b", 30}, {"c", defect == "wide-row" ? 336.0 : 200.0}, {"d", 43.2}});
   audit.consume({{"event", "integration.dataset_frame"}, {"a", defect == "wide-frame" ? 209U : defect == "native-frame" ? 100U : 200U}});
   CHECK(audit.dataset_status_fitted == (defect == "none"));
   CHECK_FALSE(audit.dataset_pixels_status_font);
@@ -2761,12 +2804,13 @@ TEST_CASE("workflow GPU evidence requires ordered cards and selected native runs
   audit.workflow_gpu_selected[name] = {1, 3, 2, 1};
   audit.workflow_gpu_operations[name].insert(1U);
   audit.consume({{"event", "integration.workflow.operation_admitted"}, {"control", name}, {"a", 1U}});
-  audit.consume_native_gpu({{"event", "workflow.gpu_execution"}, {"participant", name},
-   {"owner", name == "train"      ? "training"
-             : name == "validate" ? "validation"
-              : name == "predict" ? "prediction"
-                                  : "export"},
-   {"sequence", 1U}, {"value", 0U}, {"detail", 1U}, {"device", 1}});
+  audit.consume_native_gpu(
+   {{"event", "workflow.gpu_execution"}, {"participant", name},
+    {"owner", name == "train"      ? "training"
+              : name == "validate" ? "validation"
+               : name == "predict" ? "prediction"
+                                   : "export"},
+    {"sequence", 1U}, {"value", 0U}, {"detail", 1U}, {"device", 1}});
   for (const std::string stage : {"light", "dark", "narrow"}) {
    audit.workflow_gpu_layout[{stage, name + ".card.output"}] = {100, 100, 200, 70};
    audit.workflow_gpu_layout[{stage, name + ".card.gpu"}] = {100, 180, 200, 120};
@@ -2809,9 +2853,11 @@ TEST_CASE("workflow GPU evidence requires ordered cards and selected native runs
 TEST_CASE("training source pixels require stable identity and original observations after coalescing and reconnect", "[workspace][audit][training]") {
  mmltk::acceptance::wayland::BrowserAudit audit;
  const std::array<std::array<unsigned, 4>, 10> stages{
-  {{0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12}, {4, 1, 6, 4}, {5, 2, 6, 5}, {6, 2, 12, 11}, {7, 2, 12, 11}, {8, 0, 12, 12}, {9, 0, 103, 12}}};
+  {{0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12}, {4, 1, 6, 4}, {5, 2, 6, 5}, {6, 2, 12, 11}, {7, 2, 12, 11}, {8, 0, 12, 12}, {9, 0, 103, 12}}
+ };
  const std::array<std::array<unsigned, 4>, 10> runs{
-  {{0, 0, 0, 0}, {1, 0, 0, 0}, {2, 0, 0, 0}, {3, 0, 0, 0}, {4, 1, 51, 100}, {5, 1, 51, 100}, {6, 1, 51, 200}, {7, 1, 52, 200}, {8, 1, 52, 200}, {9, 0, 0, 0}}};
+  {{0, 0, 0, 0}, {1, 0, 0, 0}, {2, 0, 0, 0}, {3, 0, 0, 0}, {4, 1, 51, 100}, {5, 1, 51, 100}, {6, 1, 51, 200}, {7, 1, 52, 200}, {8, 1, 52, 200}, {9, 0, 0, 0}}
+ };
  CHECK_FALSE(audit.training_sources_complete());
  for (const auto& values : stages)
   audit.consume({{"event", "integration.training_sources"}, {"control", "train.metrics.plot"}, {"detail", "retained-pixels"}, {"a", values[0]}, {"b", values[1]}, {"c", values[2]}, {"d", values[3]}});

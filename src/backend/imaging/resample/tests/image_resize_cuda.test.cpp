@@ -143,36 +143,30 @@ struct FakeCompletion {
  ~FakeCompletion() { active = nullptr; }
  perceptual::CompletionApi api() {
   return {+[](cudaEvent_t* out, unsigned) -> cudaError_t {
-           if (active->create_status != cudaSuccess) return active->create_status;
-           active->events.push_back(std::make_unique<Event>());
-           *out = reinterpret_cast<cudaEvent_t>(active->events.back().get());
-           return cudaSuccess;
-          },
-   +[](cudaEvent_t event, cudaStream_t) -> cudaError_t {
-    if (active->record_status == cudaSuccess) reinterpret_cast<Event*>(event)->complete = false;
-    return active->record_status;
-   },
-   +[](cudaEvent_t event) -> cudaError_t {
-    if (active->query_status != cudaSuccess) return active->query_status;
-    return reinterpret_cast<Event*>(event)->complete ? cudaSuccess : cudaErrorNotReady;
-   },
-   +[](cudaEvent_t event) -> cudaError_t {
-    if (active->wait_status == cudaSuccess) reinterpret_cast<Event*>(event)->complete = true;
-    return active->wait_status;
-   },
-   +[](cudaStream_t stream) -> cudaError_t {
-    ++active->stream_waits;
-    active->waited = stream;
-    return active->wait_status;
-   },
-   +[](cudaStream_t, cudaEvent_t, unsigned) -> cudaError_t {
-    ++active->orders;
-    return cudaSuccess;
-   },
-   +[](cudaEvent_t) -> cudaError_t {
-    ++active->destroys;
-    return cudaSuccess;
-   }};
+   if (active->create_status != cudaSuccess) return active->create_status;
+   active->events.push_back(std::make_unique<Event>());
+   *out = reinterpret_cast<cudaEvent_t>(active->events.back().get());
+   return cudaSuccess;
+  }, +[](cudaEvent_t event, cudaStream_t) -> cudaError_t {
+   if (active->record_status == cudaSuccess) reinterpret_cast<Event*>(event)->complete = false;
+   return active->record_status;
+  }, +[](cudaEvent_t event) -> cudaError_t {
+   if (active->query_status != cudaSuccess) return active->query_status;
+   return reinterpret_cast<Event*>(event)->complete ? cudaSuccess : cudaErrorNotReady;
+  }, +[](cudaEvent_t event) -> cudaError_t {
+   if (active->wait_status == cudaSuccess) reinterpret_cast<Event*>(event)->complete = true;
+   return active->wait_status;
+  }, +[](cudaStream_t stream) -> cudaError_t {
+   ++active->stream_waits;
+   active->waited = stream;
+   return active->wait_status;
+  }, +[](cudaStream_t, cudaEvent_t, unsigned) -> cudaError_t {
+   ++active->orders;
+   return cudaSuccess;
+  }, +[](cudaEvent_t) -> cudaError_t {
+   ++active->destroys;
+   return cudaSuccess;
+  }};
  }
 };
 }  // namespace
@@ -182,8 +176,10 @@ TEST_CASE("CUDA perceptual serial traversal retains every accumulator bit", "[ba
  cudaDeviceProp properties{};
  cuda_check(cudaGetDeviceProperties(&properties, 0));
  INFO("CUDA device 0: " << properties.name << " CC " << properties.major << "." << properties.minor);
- constexpr std::array cases{std::array{1U, 19U, 1U, 7U}, std::array{19U, 1U, 7U, 1U}, std::array{17U, 13U, 7U, 5U}, std::array{32U, 24U, 8U, 6U}, std::array{14U, 14U, 2U, 2U},
-  std::array{15U, 14U, 2U, 2U}, std::array{16U, 16U, 2U, 2U}, std::array{257U, 5U, 19U, 3U}, std::array{67U, 61U, 1U, 1U}};
+ constexpr std::array cases{
+  std::array{1U, 19U, 1U, 7U}, std::array{19U, 1U, 7U, 1U}, std::array{17U, 13U, 7U, 5U}, std::array{32U, 24U, 8U, 6U}, std::array{14U, 14U, 2U, 2U}, std::array{15U, 14U, 2U, 2U},
+  std::array{16U, 16U, 2U, 2U}, std::array{257U, 5U, 19U, 3U}, std::array{67U, 61U, 1U, 1U}
+ };
  for (auto format : formats)
   for (const auto& dims : cases)
    for (unsigned pattern : {0U, 5U, 6U, 7U}) {

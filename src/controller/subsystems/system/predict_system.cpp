@@ -57,114 +57,110 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
  return impl_->resources.Run(
   [this, generation, &progress, &products, &gate, stop, operation, maximum, &current_context, &retirement, &published, &output, &admitted](
    const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
-   if (operation.device_id != impl_->resources.device()) throw std::invalid_argument("prediction device disagrees with admitted execution");
-   diagnostics_.Emit([&] {
-    return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Prediction,
-     .event = "workflow.gpu_execution",
-     .participant = "predict",
-     .sequence = generation,
-     .value = 0U,
-     .detail = 1U,
-     .device = impl_->resources.device()};
-   });
-   std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> classes;
-   int class_count = 0;
-   std::uint64_t sequence = 0U;
-   detail::PredictionOutput media(impl_->config, operation.source_kind, output, current_context ? current_context() : std::nullopt);
-   const bool full_video =
-    operation.source_kind == mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile && media.Enabled() && output.saving.video_mode == contracts::PredictionVideoSaving::Full;
-   using MediaBegin = std::function<void(const mmltk::backend::media::video::VideoMediaInfo&)>;
-   using AudioDelivery = std::function<void(const mmltk::backend::media::video::VideoAudioPacket&)>;
-   std::unique_ptr<mmltk::backend::models::rfdetr::PredictionJsonWriter> json;
-   if (operation.source_kind != mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile && !operation.output_path.empty())
-    json = std::make_unique<mmltk::backend::models::rfdetr::PredictionJsonWriter>(operation);
-   mmltk::backend::models::rfdetr::PredictionRunResult result;
-   try {
-    result = impl_->session.Run(operation, stream,
-     {
-      .stop = stop,
-      .source_pixels = static_cast<bool>(products),
-      .encoded_masks = static_cast<bool>(json),
-      .demand =
-       [&](std::int64_t index) {
-        const bool save = media.Wants(index);
-        return mmltk::backend::models::rfdetr::PredictionDemand{.native_pixels = save, .preview_masks = save && output.preview.masks};
-       },
-      .maximum_pixel_width = maximum.width,
-      .maximum_pixel_height = maximum.height,
-      .before_source = gate.admission,
-      .before_frame = gate.frame,
-      .media_begin = full_video ? MediaBegin{[&](const auto& info) { media.Media(info); }} : MediaBegin{},
-      .audio = full_video ? AudioDelivery{[&](const auto& packet) { media.Audio(packet); }} : AudioDelivery{},
-      .begin =
-       [&](const auto& summary) {
-        media.Begin(summary);
-        if (json) json->Begin(summary);
-        if (!products) return;
-        try {
-         classes = summary.class_catalog;
-         class_count = summary.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground ? static_cast<int>(summary.class_catalog->size()) : summary.artifacts.config.num_classes;
-        } catch (const std::exception& error) {
-         if (products) products(std::unexpected{std::string{error.what()}});
-        }
-       },
-      .completed =
-       [&](const auto& record, const auto pixels, const auto& annotations) {
-        auto saved_raw = media.Capture(record, pixels, annotations);
-        if (json) json->Append(record);
-        if (!products || !classes) return;
-        try {
-         const auto context = current_context ? current_context() : std::nullopt;
-         if (!context) {
-          products(std::unexpected{std::string{"Prediction preview context is recovering"}});
-          return;
-         }
-         if (!retirement->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
-         if (!pixels.preview_failure.empty()) throw std::runtime_error(std::string{pixels.preview_failure});
-         if (pixels.width > maximum.width || pixels.height > maximum.height) throw std::runtime_error("Prediction preview exceeds the visual dimensions");
-         if (saved_raw) {
-          products(Product{.extent = {pixels.width, pixels.height}, .raw = std::move(saved_raw), .image_id = record.image_id, .source_index = record.dataset_index});
-          return;
-         }
-         if (impl_->preview && impl_->preview->HasUnsafeSourceCustody()) throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, "prediction preview source custody"};
-         if (!impl_->preview || impl_->preview_context != context) {
-          auto candidate = std::make_unique<detail::PredictionPreviewPool>(
-           *context->execution(), *context, detail::PredictionPreviewPool::TransferOperations{&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister}, retirement);
-          impl_->preview = std::move(candidate);
-          impl_->preview_context = context;
-         }
-         auto raw = impl_->preview->Capture(pixels.chw, {pixels.width, pixels.height}, pixels.stream, record.detections, annotations, classes, class_count, pixels.rgb8, pixels.custody,
-          pixels.stop_source, pixels.source_control, {}, false, pixels.device);
-         if (raw) products(Product{.extent = {pixels.width, pixels.height}, .raw = std::move(raw), .image_id = record.image_id, .source_index = record.dataset_index});
-        } catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; } catch (const std::exception& error) {
-         products(std::unexpected{std::string{error.what()}});
-        } catch (...) { products(std::unexpected{std::string{"Prediction preview custody transfer failed"}}); }
-       },
-      .progress =
-       [&](std::size_t completed, std::size_t total) {
-        if (progress) progress({++sequence, completed, total, "Processed"});
-       },
-      .decoded =
-       [&](std::size_t decoded, std::size_t total) {
-        if (progress) progress({++sequence, decoded, total, "Decoded"});
-       },
-      .admitted = admitted,
-      .retirement = retirement,
-     });
-   } catch (...) {
-    const auto failure = std::current_exception();
-    media.Finish(false);
-    std::rethrow_exception(failure);
-   }
-   result.cancelled = result.cancelled || stop.stop_requested();
-   media.Finish(!result.cancelled);
-   if (!result.cancelled && json) {
-    json->Complete();
-    if (published) published(operation.output_path);
-   }
-   return contracts::make_compute_terminal(result.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded, 0U, result.processed_images,
-    result.cancelled || !json ? std::string{} : operation.output_path.string());
-  },
+  if (operation.device_id != impl_->resources.device()) throw std::invalid_argument("prediction device disagrees with admitted execution");
+  diagnostics_.Emit([&] {
+   return services::RuntimeDiagnosticFact{
+    .owner = contracts::DiagnosticOwner::Prediction, .event = "workflow.gpu_execution", .participant = "predict", .sequence = generation, .value = 0U, .detail = 1U, .device = impl_->resources.device()
+   };
+  });
+  std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> classes;
+  int class_count = 0;
+  std::uint64_t sequence = 0U;
+  detail::PredictionOutput media(impl_->config, operation.source_kind, output, current_context ? current_context() : std::nullopt);
+  const bool full_video =
+   operation.source_kind == mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile && media.Enabled() && output.saving.video_mode == contracts::PredictionVideoSaving::Full;
+  using MediaBegin = std::function<void(const mmltk::backend::media::video::VideoMediaInfo&)>;
+  using AudioDelivery = std::function<void(const mmltk::backend::media::video::VideoAudioPacket&)>;
+  std::unique_ptr<mmltk::backend::models::rfdetr::PredictionJsonWriter> json;
+  if (operation.source_kind != mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile && !operation.output_path.empty())
+   json = std::make_unique<mmltk::backend::models::rfdetr::PredictionJsonWriter>(operation);
+  mmltk::backend::models::rfdetr::PredictionRunResult result;
+  try {
+   result = impl_->session.Run(operation, stream,
+    {
+     .stop = stop,
+     .source_pixels = static_cast<bool>(products),
+     .encoded_masks = static_cast<bool>(json),
+     .demand =
+      [&](std::int64_t index) {
+    const bool save = media.Wants(index);
+    return mmltk::backend::models::rfdetr::PredictionDemand{.native_pixels = save, .preview_masks = save && output.preview.masks};
+   },
+     .maximum_pixel_width = maximum.width,
+     .maximum_pixel_height = maximum.height,
+     .before_source = gate.admission,
+     .before_frame = gate.frame,
+     .media_begin = full_video ? MediaBegin{[&](const auto& info) { media.Media(info); }} : MediaBegin{},
+     .audio = full_video ? AudioDelivery{[&](const auto& packet) { media.Audio(packet); }} : AudioDelivery{},
+     .begin =
+      [&](const auto& summary) {
+    media.Begin(summary);
+    if (json) json->Begin(summary);
+    if (!products) return;
+    try {
+     classes = summary.class_catalog;
+     class_count = summary.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground ? static_cast<int>(summary.class_catalog->size()) : summary.artifacts.config.num_classes;
+    } catch (const std::exception& error) {
+     if (products) products(std::unexpected{std::string{error.what()}});
+    }
+   },
+     .completed =
+      [&](const auto& record, const auto pixels, const auto& annotations) {
+    auto saved_raw = media.Capture(record, pixels, annotations);
+    if (json) json->Append(record);
+    if (!products || !classes) return;
+    try {
+     const auto context = current_context ? current_context() : std::nullopt;
+     if (!context) {
+      products(std::unexpected{std::string{"Prediction preview context is recovering"}});
+      return;
+     }
+     if (!retirement->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
+     if (!pixels.preview_failure.empty()) throw std::runtime_error(std::string{pixels.preview_failure});
+     if (pixels.width > maximum.width || pixels.height > maximum.height) throw std::runtime_error("Prediction preview exceeds the visual dimensions");
+     if (saved_raw) {
+      products(Product{.extent = {pixels.width, pixels.height}, .raw = std::move(saved_raw), .image_id = record.image_id, .source_index = record.dataset_index});
+      return;
+     }
+     if (impl_->preview && impl_->preview->HasUnsafeSourceCustody()) throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, "prediction preview source custody"};
+     if (!impl_->preview || impl_->preview_context != context) {
+      auto candidate = std::make_unique<detail::PredictionPreviewPool>(
+       *context->execution(), *context, detail::PredictionPreviewPool::TransferOperations{&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister}, retirement);
+      impl_->preview = std::move(candidate);
+      impl_->preview_context = context;
+     }
+     auto raw = impl_->preview->Capture(pixels.chw, {pixels.width, pixels.height}, pixels.stream, record.detections, annotations, classes, class_count, pixels.rgb8, pixels.custody, pixels.stop_source,
+      pixels.source_control, {}, false, pixels.device);
+     if (raw) products(Product{.extent = {pixels.width, pixels.height}, .raw = std::move(raw), .image_id = record.image_id, .source_index = record.dataset_index});
+    } catch (const mmltk::backend::ml::runtime::CudaOperationError&) { throw; } catch (const std::exception& error) {
+     products(std::unexpected{std::string{error.what()}});
+    } catch (...) { products(std::unexpected{std::string{"Prediction preview custody transfer failed"}}); }
+   },
+     .progress =
+      [&](std::size_t completed, std::size_t total) {
+    if (progress) progress({++sequence, completed, total, "Processed"});
+   },
+     .decoded =
+      [&](std::size_t decoded, std::size_t total) {
+    if (progress) progress({++sequence, decoded, total, "Decoded"});
+   },
+     .admitted = admitted,
+     .retirement = retirement,
+    });
+  } catch (...) {
+   const auto failure = std::current_exception();
+   media.Finish(false);
+   std::rethrow_exception(failure);
+  }
+  result.cancelled = result.cancelled || stop.stop_requested();
+  media.Finish(!result.cancelled);
+  if (!result.cancelled && json) {
+   json->Complete();
+   if (published) published(operation.output_path);
+  }
+  return contracts::make_compute_terminal(result.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded, 0U, result.processed_images,
+   result.cancelled || !json ? std::string{} : operation.output_path.string());
+ },
   {}, false);  // PredictionSession owns the atomic output completion boundary.
 }
 class PredictSystem::Impl final {
@@ -181,21 +177,19 @@ public:
        events_(std::move(events)),
        factory_(std::move(factory)),
        resolver_(std::move(resolver)),
-       worker_(
-        [this, visual, topology = mmltk::common::system::NumaTopology::Capture(), execution = std::optional<mmltk::frameworks::gpu::DeviceExecution>{}](auto revisions) mutable {
-         if (!execution) execution = mmltk::frameworks::gpu::resolve_device_execution(visual.device, topology, visual.numa_node);
-         mmltk::frameworks::gpu::SystemImageRuntimeConfig config{
-          .device = visual.device,
-          .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-          .output_buffer_count = 2U,
-          .numa_node = visual.numa_node,
-          .execution = *execution,
-          .product_revisions = std::move(revisions),
-          .adopted_context = PreviewContext(*execution),
-         };
-         return make_visual_runtime(std::move(config));
-        },
-        [this](const std::exception_ptr failure) { RenderingFailed(failure); }) {
+       worker_([this, visual, topology = mmltk::common::system::NumaTopology::Capture(), execution = std::optional<mmltk::frameworks::gpu::DeviceExecution>{}](auto revisions) mutable {
+        if (!execution) execution = mmltk::frameworks::gpu::resolve_device_execution(visual.device, topology, visual.numa_node);
+        mmltk::frameworks::gpu::SystemImageRuntimeConfig config{
+         .device = visual.device,
+         .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+         .output_buffer_count = 2U,
+         .numa_node = visual.numa_node,
+         .execution = *execution,
+         .product_revisions = std::move(revisions),
+         .adopted_context = PreviewContext(*execution),
+        };
+        return make_visual_runtime(std::move(config));
+       }, [this](const std::exception_ptr failure) { RenderingFailed(failure); }) {
   if (!visual_.valid()) throw contracts::UnavailableError("prediction visual device is unavailable");
   if (!factory_ || !resolver_) throw contracts::UnavailableError("prediction runtime factory or placement resolver is unavailable");
   worker_.RegisterContinuation([this](auto& runtime, auto stop) { return Render(runtime, stop); }, {}, true);
@@ -239,113 +233,109 @@ public:
      .policy = configuration.worker_policy(),
      .work = [this, settings = settings.settings, intent, selection, source_key = key, video = state_.video, generation = *generation, configuration, receiver_execution](
               const std::stop_token stop) mutable -> direct::LocalRun::Notification {
-      if (!preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction receiver custody is unobservable");
-      contracts::ArtifactInspection inspection;
-      if (!stop.stop_requested() && settings.workflows.predict.source.kind == contracts::SourceKind::CompiledDataset)
-       inspection = dataset_.Inspect({settings.workflows.predict.source.compiled_path, {}, {}}, selection.key.preset, selection.key.resolution, stop);
-      if (stop.stop_requested()) return [this, generation] { Settled(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, generation)); };
-      settings.workflows.predict.saving = intent.saving;
-      auto request = subsystems::system::ComputeIntentMaterializer::Predict(settings, inspection, selection);
-      if (!request) throw contracts::InvalidIntentError(request.error().detail);
-      if (stop.stop_requested()) return [this, generation] { Settled(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, generation)); };
-      if (request->source_kind == mmltk::backend::models::rfdetr::PredictSourceKind::ImageFiles && !std::filesystem::is_regular_file(request->image_inputs.front().image_path))
-       throw contracts::InvalidIntentError("prediction image is not a readable regular file");
-      if (request->source_kind == mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile && !std::filesystem::is_regular_file(request->video_path))
-       throw contracts::InvalidIntentError("prediction video is not a readable regular file");
-      PredictionRunOutput media_output;
-      media_output.saving = intent.saving;
-      media_output.preview = intent.preview;
-      if (request->source_kind == mmltk::backend::models::rfdetr::PredictSourceKind::CompiledDataset) {
-       if (inspection.splits.empty()) throw contracts::InvalidIntentError("prediction dataset is empty");
-       media_output.population = inspection.splits.front().image_count;
-       if (intent.compiled_population && intent.compiled_population != media_output.population) throw contracts::InvalidIntentError("prediction dataset count changed after inspection");
-       if (!intent.compiled_population) media_output.saving.compiled_total = std::min(media_output.saving.compiled_total, media_output.population);
-       if (intent.saving.compiled_enabled && intent.saving.compiled_mode == contracts::PredictionCompiledSampling::Total && media_output.saving.compiled_total > media_output.population)
-        throw contracts::InvalidIntentError("prediction Total exceeds the admitted dataset count");
-       if (media_output.saving.compiled_enabled) {
-        const auto count = media_output.saving.compiled_mode == contracts::PredictionCompiledSampling::Percent
-                            ? detail::PredictionSelection::Percent(media_output.population, media_output.saving.compiled_percent)
-                            : media_output.saving.compiled_total;
-        media_output.processing_population = detail::PredictionSelection::Eligible(media_output.population, request->limit_images, count);
-       }
+     if (!preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction receiver custody is unobservable");
+     contracts::ArtifactInspection inspection;
+     if (!stop.stop_requested() && settings.workflows.predict.source.kind == contracts::SourceKind::CompiledDataset)
+      inspection = dataset_.Inspect({settings.workflows.predict.source.compiled_path, {}, {}}, selection.key.preset, selection.key.resolution, stop);
+     if (stop.stop_requested()) return [this, generation] { Settled(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, generation)); };
+     settings.workflows.predict.saving = intent.saving;
+     auto request = subsystems::system::ComputeIntentMaterializer::Predict(settings, inspection, selection);
+     if (!request) throw contracts::InvalidIntentError(request.error().detail);
+     if (stop.stop_requested()) return [this, generation] { Settled(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, generation)); };
+     if (request->source_kind == mmltk::backend::models::rfdetr::PredictSourceKind::ImageFiles && !std::filesystem::is_regular_file(request->image_inputs.front().image_path))
+      throw contracts::InvalidIntentError("prediction image is not a readable regular file");
+     if (request->source_kind == mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile && !std::filesystem::is_regular_file(request->video_path))
+      throw contracts::InvalidIntentError("prediction video is not a readable regular file");
+     PredictionRunOutput media_output;
+     media_output.saving = intent.saving;
+     media_output.preview = intent.preview;
+     if (request->source_kind == mmltk::backend::models::rfdetr::PredictSourceKind::CompiledDataset) {
+      if (inspection.splits.empty()) throw contracts::InvalidIntentError("prediction dataset is empty");
+      media_output.population = inspection.splits.front().image_count;
+      if (intent.compiled_population && intent.compiled_population != media_output.population) throw contracts::InvalidIntentError("prediction dataset count changed after inspection");
+      if (!intent.compiled_population) media_output.saving.compiled_total = std::min(media_output.saving.compiled_total, media_output.population);
+      if (intent.saving.compiled_enabled && intent.saving.compiled_mode == contracts::PredictionCompiledSampling::Total && media_output.saving.compiled_total > media_output.population)
+       throw contracts::InvalidIntentError("prediction Total exceeds the admitted dataset count");
+      if (media_output.saving.compiled_enabled) {
+       const auto count = media_output.saving.compiled_mode == contracts::PredictionCompiledSampling::Percent
+                           ? detail::PredictionSelection::Percent(media_output.population, media_output.saving.compiled_percent)
+                           : media_output.saving.compiled_total;
+       media_output.processing_population = detail::PredictionSelection::Eligible(media_output.population, request->limit_images, count);
       }
-      const auto& output = settings.workflows.predict.output;
-      const auto directory = services::reserve_run_output(contracts::workflow_output_root(output, contracts::FeatureId::Predict), !output.automatic);
-      media_output.directory = directory;
-      media_output.progress = [this](const auto& facts) {
-       {
-        std::scoped_lock lock(mutex_);
-        auto artifacts = std::move(state_.operation.output.artifacts);
-        state_.operation.output = facts;
-        if (const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested))
-         state_.revision = *revision;
-        for (const auto& path : artifacts)
-         if (std::find(state_.operation.output.artifacts.begin(), state_.operation.output.artifacts.end(), path) == state_.operation.output.artifacts.end() &&
-             state_.operation.output.artifacts.size() < contracts::kWorkflowArtifactCapacity)
-          state_.operation.output.artifacts.push_back(path);
-       }
-       Publish(PredictChanged{snapshot()});
-      };
-      if (!request->output_path.empty()) request->output_path = directory / request->output_path.filename();
+     }
+     const auto& output = settings.workflows.predict.output;
+     const auto directory = services::reserve_run_output(contracts::workflow_output_root(output, contracts::FeatureId::Predict), !output.automatic);
+     media_output.directory = directory;
+     media_output.progress = [this](const auto& facts) {
       {
        std::scoped_lock lock(mutex_);
-       state_.operation.output.directory = directory.string();
+       auto artifacts = std::move(state_.operation.output.artifacts);
+       state_.operation.output = facts;
+       if (const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested))
+        state_.revision = *revision;
+       for (const auto& path : artifacts)
+        if (std::find(state_.operation.output.artifacts.begin(), state_.operation.output.artifacts.end(), path) == state_.operation.output.artifacts.end() &&
+            state_.operation.output.artifacts.size() < contracts::kWorkflowArtifactCapacity)
+         state_.operation.output.artifacts.push_back(path);
+      }
+      Publish(PredictChanged{snapshot()});
+     };
+     if (!request->output_path.empty()) request->output_path = directory / request->output_path.filename();
+     {
+      std::scoped_lock lock(mutex_);
+      state_.operation.output.directory = directory.string();
+      if (const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested))
+       state_.revision = *revision;
+     }
+     Publish(PredictChanged{snapshot()});
+     if (runtime_ && runtime_configuration_ != configuration) RetireRuntime();
+     if (!retirement_.admission_open() || !preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction runtime retirement failed");
+     const bool initial_runtime = !runtime_;
+     if (!runtime_) {
+      runtime_ = construct_compute_runtime(factory_, configuration, construction_failed_);
+      runtime_configuration_ = configuration;
+     }
+     if (!runtime_) throw std::runtime_error("prediction runtime factory returned no runtime");
+     try {
+      if (initial_runtime) static_cast<void>(PreviewContext(receiver_execution));
+     } catch (const mmltk::frameworks::gpu::CudaContextFailure& error) {
+      if (error.terminal()) throw;
+      Product(std::unexpected{std::string{error.what()}}, source_key, video);
+     } catch (const std::exception& error) { Product(std::unexpected{std::string{error.what()}}, source_key, video); }
+     auto terminal = runtime_->Run(std::move(*request), stop, [this](const auto& progress) { Progress(progress); },
+      [this, &source_key, video](std::expected<PredictRuntime::Product, std::string> product) { Product(std::move(product), source_key, video); },
+      {.admission = [this, stop] { return playback_.WaitAdmission(stop); }, .frame = [this, stop](std::optional<double> timestamp, double fps) { return playback_.Wait(timestamp, fps, stop); }},
+      {visual_.maximum_width, visual_.maximum_height}, [this] {
+      std::unique_lock context_lock(preview_context_mutex_, std::try_to_lock);
+      return context_lock.owns_lock() ? preview_context_ : std::nullopt;
+     }, preview_retirement_, [this](const auto& path) { Artifact(path); }, media_output, generation, [this, generation](const auto& admitted_execution) {
+      {
+       std::scoped_lock lock(mutex_);
+       if (state_.operation.generation_frontier != generation || !state_.operation.active) return;
+       auto facts = admitted_execution;
+       facts.settings_revision = state_.execution.settings_revision;
+       facts.operation_generation = generation;
+       if (state_.execution.admitted_capacity) {
+        if (state_.execution != facts) throw std::logic_error("prediction capacity changed during an admitted operation");
+        return;
+       }
+       state_.execution = facts;
        if (const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested))
         state_.revision = *revision;
       }
       Publish(PredictChanged{snapshot()});
-      if (runtime_ && runtime_configuration_ != configuration) RetireRuntime();
-      if (!retirement_.admission_open() || !preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction runtime retirement failed");
-      const bool initial_runtime = !runtime_;
-      if (!runtime_) {
-       runtime_ = construct_compute_runtime(factory_, configuration, construction_failed_);
-       runtime_configuration_ = configuration;
-      }
-      if (!runtime_) throw std::runtime_error("prediction runtime factory returned no runtime");
-      try {
-       if (initial_runtime) static_cast<void>(PreviewContext(receiver_execution));
-      } catch (const mmltk::frameworks::gpu::CudaContextFailure& error) {
-       if (error.terminal()) throw;
-       Product(std::unexpected{std::string{error.what()}}, source_key, video);
-      } catch (const std::exception& error) { Product(std::unexpected{std::string{error.what()}}, source_key, video); }
-      auto terminal = runtime_->Run(
-       std::move(*request), stop, [this](const auto& progress) { Progress(progress); },
-       [this, &source_key, video](std::expected<PredictRuntime::Product, std::string> product) { Product(std::move(product), source_key, video); },
-       {.admission = [this, stop] { return playback_.WaitAdmission(stop); }, .frame = [this, stop](std::optional<double> timestamp, double fps) { return playback_.Wait(timestamp, fps, stop); }},
-       {visual_.maximum_width, visual_.maximum_height},
-       [this] {
-        std::unique_lock context_lock(preview_context_mutex_, std::try_to_lock);
-        return context_lock.owns_lock() ? preview_context_ : std::nullopt;
-       },
-       preview_retirement_, [this](const auto& path) { Artifact(path); }, media_output, generation,
-       [this, generation](const auto& admitted_execution) {
-        {
-         std::scoped_lock lock(mutex_);
-         if (state_.operation.generation_frontier != generation || !state_.operation.active) return;
-         auto facts = admitted_execution;
-         facts.settings_revision = state_.execution.settings_revision;
-         facts.operation_generation = generation;
-         if (state_.execution.admitted_capacity) {
-          if (state_.execution != facts) throw std::logic_error("prediction capacity changed during an admitted operation");
-          return;
-         }
-         state_.execution = facts;
-         if (const auto revision = detail::PredictRevision::Progress(state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested))
-          state_.revision = *revision;
-        }
-        Publish(PredictChanged{snapshot()});
-       });
-      // Native source failures already fail RunAndWrite. Optional receiver
-      // failure seals custody without changing a completed semantic result.
-      if (runtime_->HasUnsafeCustody()) RetireRuntime();
-      if (!terminal.valid_worker_terminal()) throw std::runtime_error("prediction runtime returned an invalid terminal");
-      terminal.generation = generation;
-      return [this, terminal = std::move(terminal)]() mutable { Settled(std::move(terminal)); };
-     },
+     });
+     // Native source failures already fail RunAndWrite. Optional receiver
+     // failure seals custody without changing a completed semantic result.
+     if (runtime_->HasUnsafeCustody()) RetireRuntime();
+     if (!terminal.valid_worker_terminal()) throw std::runtime_error("prediction runtime returned an invalid terminal");
+     terminal.generation = generation;
+     return [this, terminal = std::move(terminal)]() mutable { Settled(std::move(terminal)); };
+    },
      .failure = [this](std::exception_ptr failure) -> direct::LocalRun::Notification {
-      RetireRuntime();
-      return [this, failure] { Failed(failure); };
-     },
+     RetireRuntime();
+     return [this, failure] { Failed(failure); };
+    },
     });
    } catch (...) {
     state_ = prior;
@@ -480,10 +470,11 @@ private:
    labels.reserve(product.raw->predictions().size());
    for (const auto& detection : product.raw->predictions()) {
     const auto category = detection.class_reference;
-    labels.push_back({{{detection.bbox_xyxy[0], detection.bbox_xyxy[1]}, {detection.bbox_xyxy[2], detection.bbox_xyxy[3]}}, category, detection.class_domain, detection.score,
-     category >= 0 && static_cast<std::size_t>(category) < palette.size() ? palette[category] : contracts::AnnotationColor{},
-     detection.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground && category >= 0 && static_cast<std::size_t>(category) < classes.size() ? classes[category]
-                                                                                                                                                                       : std::string{}});
+    labels.push_back(
+     {{{detection.bbox_xyxy[0], detection.bbox_xyxy[1]}, {detection.bbox_xyxy[2], detection.bbox_xyxy[3]}}, category, detection.class_domain, detection.score,
+      category >= 0 && static_cast<std::size_t>(category) < palette.size() ? palette[category] : contracts::AnnotationColor{},
+      detection.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground && category >= 0 && static_cast<std::size_t>(category) < classes.size() ? classes[category]
+                                                                                                                                                                        : std::string{}});
     const auto& label = labels.back();
     if (!label.box.valid() || !label.color.valid() || !std::isfinite(label.confidence) || label.name.size() > mmltk::frameworks::reflection::kMaximumNameBytes)
      throw std::runtime_error("Prediction preview metadata exceeds the visual product limits");
@@ -645,34 +636,33 @@ PredictSnapshot PredictSystem::Inspect(PredictionSourceQuery query) {
  }
  try {
   impl_->inspection_run_.Start({.work = [this, path = query.path, selected](std::stop_token stop) -> direct::LocalRun::Notification {
-                                 auto result = impl_->dataset_.Inspect({path, {}, {}}, selected.key.preset, selected.key.resolution, stop);
-                                 return [this, path, result = std::move(result)] {
-                                  {
-                                   std::scoped_lock lock(impl_->mutex_);
-                                   if (impl_->state_.inspection.path != path) return;
-                                   impl_->state_.revision = detail::PredictRevision::Admit(impl_->state_.revision);
-                                   auto& facts = impl_->state_.inspection;
-                                   facts.active = false;
-                                   if (result.available() && result.splits.size() == 1U)
-                                    facts.count = result.splits.front().image_count;
-                                   else
-                                    facts.error = result.detail.empty() ? "prediction dataset is unavailable" : result.detail;
-                                  }
-                                  impl_->Publish(PredictChanged{snapshot()});
-                                 };
-                                },
-   .failure = [this, path = query.path](std::exception_ptr error) -> direct::LocalRun::Notification {
-    return [this, path, error] {
-     {
-      std::scoped_lock lock(impl_->mutex_);
-      if (impl_->state_.inspection.path != path) return;
-      impl_->state_.revision = detail::PredictRevision::Admit(impl_->state_.revision);
-      impl_->state_.inspection.active = false;
-      impl_->state_.inspection.error = visual_failure_detail(error, "prediction dataset inspection failed");
-     }
-     impl_->Publish(PredictChanged{snapshot()});
-    };
-   }});
+   auto result = impl_->dataset_.Inspect({path, {}, {}}, selected.key.preset, selected.key.resolution, stop);
+   return [this, path, result = std::move(result)] {
+    {
+     std::scoped_lock lock(impl_->mutex_);
+     if (impl_->state_.inspection.path != path) return;
+     impl_->state_.revision = detail::PredictRevision::Admit(impl_->state_.revision);
+     auto& facts = impl_->state_.inspection;
+     facts.active = false;
+     if (result.available() && result.splits.size() == 1U)
+      facts.count = result.splits.front().image_count;
+     else
+      facts.error = result.detail.empty() ? "prediction dataset is unavailable" : result.detail;
+    }
+    impl_->Publish(PredictChanged{snapshot()});
+   };
+  }, .failure = [this, path = query.path](std::exception_ptr error) -> direct::LocalRun::Notification {
+   return [this, path, error] {
+    {
+     std::scoped_lock lock(impl_->mutex_);
+     if (impl_->state_.inspection.path != path) return;
+     impl_->state_.revision = detail::PredictRevision::Admit(impl_->state_.revision);
+     impl_->state_.inspection.active = false;
+     impl_->state_.inspection.error = visual_failure_detail(error, "prediction dataset inspection failed");
+    }
+    impl_->Publish(PredictChanged{snapshot()});
+   };
+  }});
  } catch (...) {
   std::scoped_lock lock(impl_->mutex_);
   impl_->state_.inspection.active = false;

@@ -1161,8 +1161,10 @@ void lower_layer_norm_node(torch::jit::Node* node) {
  if (!epsilon.has_value()) { throw_lowering_error(node, "epsilon must be a compile-time constant"); }
  const auto scalar_type = value_scalar_type(node->input(0)).value_or(value_scalar_type(node->output(0)).value_or(at::kFloat));
  const auto axis = static_cast<int64_t>(*input_rank - normalized_shape->size());
- std::vector<torch::jit::Value*> inputs{node->input(0), materialize_layer_norm_affine_input(node, node->input(2), *normalized_shape, scalar_type, 1.0),
-  materialize_layer_norm_affine_input(node, node->input(3), *normalized_shape, scalar_type, 0.0)};
+ std::vector<torch::jit::Value*> inputs{
+  node->input(0), materialize_layer_norm_affine_input(node, node->input(2), *normalized_shape, scalar_type, 1.0),
+  materialize_layer_norm_affine_input(node, node->input(3), *normalized_shape, scalar_type, 0.0)
+ };
  auto* layer_norm = node->owningGraph()->create(kOnnxLayerNormalization, inputs, node->outputs().size());
  layer_norm->copyMetadata(node);
  layer_norm->i_(kAttrAxis, axis);
@@ -1947,10 +1949,9 @@ const std::unordered_map<c10::Symbol, LoweringFactory>& onnx_lowering_factory() 
  static const std::unordered_map<c10::Symbol, LoweringFactory> kFactory{
   MMLTK_ONNX_LOWERING_TABLE(MMLTK_LOWER_NODE, MMLTK_LOWER_CTX, MMLTK_LOWER_SYMBOL, MMLTK_LOWER_CREATE, MMLTK_LOWER_RESIZE)
   // aten::max only lowers in its two-output reduce form, so it cannot use a table row.
-  {kAtenMax,
-   [](torch::jit::Node* node, const LoweringContext&) {
-    if (node->outputs().size() == 2) { lower_max_reduce_node(node); }
-   }},
+  {kAtenMax, [](torch::jit::Node* node, const LoweringContext&) {
+  if (node->outputs().size() == 2) { lower_max_reduce_node(node); }
+ }},
  };
  return kFactory;
 }

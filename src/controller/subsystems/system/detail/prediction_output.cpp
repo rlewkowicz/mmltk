@@ -111,7 +111,8 @@ struct PredictionOutput::Impl final {
     execution, *context, PredictionPreviewPool::TransferOperations{&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister}, retirement);
   if (!runtime)
    runtime = std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
-    .device = context->device(), .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .numa_node = execution.placement.numa_node, .execution = execution, .adopted_context = *context});
+    .device = context->device(), .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .numa_node = execution.placement.numa_node, .execution = execution, .adopted_context = *context
+   });
   if (full_video && !encode_stream) encode_stream = std::make_unique<gpu::ImageStream>(*context);
   if (!captions) captions = std::make_unique<raster::CaptionRaster>(*context);
   if (!full_video && !writer) writer = std::make_unique<raster::RenderedImageWriter>(*context, png_encoder);
@@ -175,17 +176,18 @@ struct PredictionOutput::Impl final {
    const int x = coordinate(prediction.bbox_xyxy[0]), y = coordinate(prediction.bbox_xyxy[1]);
    std::array<std::uint8_t, 3> color{};
    raster::color::class_color(category, classes, color[0], color[1], color[2]);
-   labels.push_back({foreground ? static_cast<std::uint32_t>(category) : 0U, x, y > static_cast<int>(raster::kNativeCaptionHeight) ? y - static_cast<int>(raster::kNativeCaptionHeight) : 0, color,
-    {suffix.data(), static_cast<std::size_t>(score.ptr - suffix.data())}});
+   labels.push_back(
+    {foreground ? static_cast<std::uint32_t>(category) : 0U, x, y > static_cast<int>(raster::kNativeCaptionHeight) ? y - static_cast<int>(raster::kNativeCaptionHeight) : 0, color,
+     {suffix.data(), static_cast<std::size_t>(score.ptr - suffix.data())}});
   }
   auto candidate = runtime->AcquireOutput();
   const VisualExtent extent{pixels.width, pixels.height};
   const std::array regions{PredictionPreviewComposition::Region{raw, {0U, 0U, extent.width, extent.height}}};
   PredictionPreviewComposition::Draw(*runtime, candidate, extent, regions, {options.preview.boxes, options.preview.masks, false, false, false, false, options.preview.confidence_threshold}, nullptr,
    [&](auto clean, auto semantic, auto stream) {
-    raster::CaptionRaster::Composite(clean, semantic, stream);
-    captions->Draw(clean, labels, stream);
-   });
+   raster::CaptionRaster::Composite(clean, semantic, stream);
+   captions->Draw(clean, labels, stream);
+  });
   static_cast<void>(runtime->CommitOutput(std::move(candidate)));
   if (video) {
    auto borrowed = runtime->Borrow();

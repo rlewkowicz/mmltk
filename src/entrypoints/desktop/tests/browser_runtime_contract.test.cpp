@@ -53,7 +53,5 @@ TEST_CASE("desktop scoped options retain public spellings help and emission orde
        "\n  --device-id  CUDA-visible visual device"
        "\n  --numa-node  GPU-local NUMA node (-1 selects automatic locality)"
        "\n  --gdrcopy  Use GDRCopy for compiled-image loading");
- for (const std::string_view spelling : {"--cuda-device-index", "--no-numa-node", "--h2d-dataloader"}) {
-  CHECK_THROWS(desktop::parse_browser_runtime_options(std::array{spelling}));
- }
+ for (const std::string_view spelling : {"--cuda-device-index", "--no-numa-node", "--h2d-dataloader"}) { CHECK_THROWS(desktop::parse_browser_runtime_options(std::array{spelling})); }
 }

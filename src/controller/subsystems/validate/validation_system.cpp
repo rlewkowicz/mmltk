@@ -35,39 +35,40 @@ ValidationRuntimeResult CudaValidationRuntime::Run(mmltk::backend::models::rfdet
  const mmltk::backend::models::rfdetr::ValidationDelivery& delivery, std::uint64_t generation) {
  ValidationRuntimeResult result;
  try {
-  result.terminal = impl_->resources.Run(
-   [this, generation, &result, &progress, &delivery, stop, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
-    if (operation.device_id != impl_->resources.device() || operation.compile_cuda_device_id != operation.device_id) throw std::invalid_argument("validation device disagrees with admitted execution");
-    diagnostics_.Emit([&] {
-     return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Validation,
-      .event = "workflow.gpu_execution",
-      .participant = "validate",
-      .sequence = generation,
-      .value = 0U,
-      .detail = 1U,
-      .device = impl_->resources.device()};
-    });
-    operation = mmltk::backend::models::rfdetr::finalize_validate_request(std::move(operation));
-    std::uint64_t sequence = 0U;
-    auto callbacks = delivery;
-    callbacks.stop = stop;
-    callbacks.progress = [&](std::size_t completed, std::size_t total) {
-     if (progress) progress({++sequence, completed, total, "Validating"});
+  result.terminal =
+   impl_->resources.Run([this, generation, &result, &progress, &delivery, stop, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
+   if (operation.device_id != impl_->resources.device() || operation.compile_cuda_device_id != operation.device_id) throw std::invalid_argument("validation device disagrees with admitted execution");
+   diagnostics_.Emit([&] {
+    return services::RuntimeDiagnosticFact{
+     .owner = contracts::DiagnosticOwner::Validation,
+     .event = "workflow.gpu_execution",
+     .participant = "validate",
+     .sequence = generation,
+     .value = 0U,
+     .detail = 1U,
+     .device = impl_->resources.device()
     };
-    auto evaluated = impl_->session.Run(operation, stream, callbacks);
-    if (evaluated.backends.size() > 1U) throw std::logic_error("GUI validation requires one selected backend");
-    std::exception_ptr report_failure;
-    if (!evaluated.cancelled && operation.write_report_json && !operation.report_json_path.empty()) {
-     try {
-      mmltk::backend::models::rfdetr::write_validation_report(operation, evaluated);
-      result.report = operation.report_json_path;
-     } catch (...) { report_failure = std::current_exception(); }
-    }
-    if (!evaluated.backends.empty()) result.evaluation = std::move(evaluated.backends.begin()->second);
-    if (report_failure) std::rethrow_exception(report_failure);
-    return contracts::make_compute_terminal(evaluated.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded, 0U, evaluated.processed_images);
-   },
-   stop);
+   });
+   operation = mmltk::backend::models::rfdetr::finalize_validate_request(std::move(operation));
+   std::uint64_t sequence = 0U;
+   auto callbacks = delivery;
+   callbacks.stop = stop;
+   callbacks.progress = [&](std::size_t completed, std::size_t total) {
+    if (progress) progress({++sequence, completed, total, "Validating"});
+   };
+   auto evaluated = impl_->session.Run(operation, stream, callbacks);
+   if (evaluated.backends.size() > 1U) throw std::logic_error("GUI validation requires one selected backend");
+   std::exception_ptr report_failure;
+   if (!evaluated.cancelled && operation.write_report_json && !operation.report_json_path.empty()) {
+    try {
+     mmltk::backend::models::rfdetr::write_validation_report(operation, evaluated);
+     result.report = operation.report_json_path;
+    } catch (...) { report_failure = std::current_exception(); }
+   }
+   if (!evaluated.backends.empty()) result.evaluation = std::move(evaluated.backends.begin()->second);
+   if (report_failure) std::rethrow_exception(report_failure);
+   return contracts::make_compute_terminal(evaluated.cancelled ? contracts::ComputeOperationOutcome::Cancelled : contracts::ComputeOperationOutcome::Succeeded, 0U, evaluated.processed_images);
+  }, stop);
  } catch (...) { result.terminal = contracts::compute_failure_terminal(std::current_exception(), "validation runtime failed"); }
  return result;
 }
@@ -83,18 +84,15 @@ public:
        resolver_(std::move(resolver)),
        previews_(visual.valid()),
        samples_(visual, [this] { Changed(); }),
-       sample_output_(
-        {}, visual,
-        [this](const auto& path) {
-         {
-          std::scoped_lock lock(mutex_);
-          state_.output.samples_directory = path.parent_path().string();
-          ++state_.output.completed_samples;
-          state_.output.recent_sample = path.string();
-         }
-         Changed();
-        },
-        std::move(encoder), std::move(retirement)) {
+       sample_output_({}, visual, [this](const auto& path) {
+        {
+         std::scoped_lock lock(mutex_);
+         state_.output.samples_directory = path.parent_path().string();
+         ++state_.output.completed_samples;
+         state_.output.recent_sample = path.string();
+        }
+        Changed();
+       }, std::move(encoder), std::move(retirement)) {
   if (!factory_ || !resolver_) throw contracts::UnavailableError("compute runtime factory or placement resolver is unavailable");
   samples_.SetDisplay(settings_.validation_display_settings());
  }
@@ -153,78 +151,76 @@ public:
    .policy = configuration.worker_policy(),
    .prepare =
     [this, facts = mmltk::backend::models::rfdetr::derive_execution_facts(request, settings.revision)] {
-     std::scoped_lock lock(mutex_);
-     const auto next = contracts::next_compute_generation(state_.generation_frontier);
-     if (!next) throw contracts::FailedError("compute operation generation exhausted");
-     contracts::begin_compute(state_, *next, "Inspecting selected inputs");
-     execution_ = facts;
-     execution_.operation_generation = *next;
-    },
+   std::scoped_lock lock(mutex_);
+   const auto next = contracts::next_compute_generation(state_.generation_frontier);
+   if (!next) throw contracts::FailedError("compute operation generation exhausted");
+   contracts::begin_compute(state_, *next, "Inspecting selected inputs");
+   execution_ = facts;
+   execution_.operation_generation = *next;
+  },
    .work = [this, settings = settings.settings, selection, preview, configuration](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
-    const auto generation = operation().generation_frontier;
-    auto terminal = run_checked_compute(
-     [&](const ComputeProgressSink& progress) {
-      if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
-      const auto inspection = dataset_.Inspect({contracts::resolve_validation_source(settings), {}, {}}, selection.key.preset, selection.key.resolution, stop);
-      if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
-      auto prepared = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspection, selection);
-      if (!prepared) throw contracts::InvalidIntentError(prepared.error().detail);
-      if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
-      const auto& output = settings.workflows.validate.output;
-      const auto directory = services::reserve_run_output(contracts::workflow_output_root(output, contracts::FeatureId::Validate), !output.automatic);
-      if (!prepared->report_json_path.empty()) prepared->report_json_path = directory / prepared->report_json_path.filename();
-      {
-       std::scoped_lock lock(mutex_);
-       state_.output.directory = directory.string();
-      }
-      Changed();
-      if (runtime_ && runtime_configuration_ != configuration) {
-       RetireRuntime();
-       if (retirement_failed_ || sample_output_.HasUnsafeCustody()) throw contracts::UnavailableError("compute CUDA retirement is unproved");
-      }
-      if (sample_output_.HasUnsafeCustody()) throw contracts::UnavailableError("validation output CUDA custody is unproved");
-      if (!runtime_) {
-       runtime_ = construct_compute_runtime(factory_, configuration, retirement_failed_);
-       runtime_configuration_ = configuration;
-      }
-      if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
-      auto delivery = Delivery(generation, directory, preview, configuration);
-      auto result = [&] {
-       try {
-        return runtime_->Run(std::move(*prepared), stop, progress, delivery, generation);
-       } catch (...) {
-        const auto failure = std::current_exception();
-        // Publish any completed selected image before this run becomes terminal.
-        // A secondary save failure must not replace the runtime's original error.
-        try {
-         sample_output_.Finish(false);
-        } catch (...) {}
-        std::rethrow_exception(failure);
-       }
-      }();
-      {
-       std::scoped_lock lock(mutex_);
-       if (!result.report.empty()) state_.output.artifacts.push_back(std::move(result.report));
-       evaluation_ = std::move(result.evaluation);
-       evaluation_generation_ = state_.generation_frontier;
-      }
+   const auto generation = operation().generation_frontier;
+   auto terminal = run_checked_compute([&](const ComputeProgressSink& progress) {
+    if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+    const auto inspection = dataset_.Inspect({contracts::resolve_validation_source(settings), {}, {}}, selection.key.preset, selection.key.resolution, stop);
+    if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+    auto prepared = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspection, selection);
+    if (!prepared) throw contracts::InvalidIntentError(prepared.error().detail);
+    if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+    const auto& output = settings.workflows.validate.output;
+    const auto directory = services::reserve_run_output(contracts::workflow_output_root(output, contracts::FeatureId::Validate), !output.automatic);
+    if (!prepared->report_json_path.empty()) prepared->report_json_path = directory / prepared->report_json_path.filename();
+    {
+     std::scoped_lock lock(mutex_);
+     state_.output.directory = directory.string();
+    }
+    Changed();
+    if (runtime_ && runtime_configuration_ != configuration) {
+     RetireRuntime();
+     if (retirement_failed_ || sample_output_.HasUnsafeCustody()) throw contracts::UnavailableError("compute CUDA retirement is unproved");
+    }
+    if (sample_output_.HasUnsafeCustody()) throw contracts::UnavailableError("validation output CUDA custody is unproved");
+    if (!runtime_) {
+     runtime_ = construct_compute_runtime(factory_, configuration, retirement_failed_);
+     runtime_configuration_ = configuration;
+    }
+    if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
+    auto delivery = Delivery(generation, directory, preview, configuration);
+    auto result = [&] {
+     try {
+      return runtime_->Run(std::move(*prepared), stop, progress, delivery, generation);
+     } catch (...) {
+      const auto failure = std::current_exception();
+      // Publish any completed selected image before this run becomes terminal.
+      // A secondary save failure must not replace the runtime's original error.
       try {
-       sample_output_.Finish(result.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
-      } catch (...) {
-       auto failure = contracts::compute_failure_terminal(std::current_exception(), "validation sample output failed");
-       failure.completed = result.terminal.completed;
-       return failure;
-      }
-      return std::move(result.terminal);
-     },
-     [this](const contracts::ComputeProgress& progress) { Progress(progress); });
-    if (terminal.outcome == contracts::ComputeOperationOutcome::Failed || (runtime_ && runtime_->HasUnsafeCustody())) RetireRuntime();
-    return Complete(generation, std::move(terminal));
-   },
+       sample_output_.Finish(false);
+      } catch (...) {}
+      std::rethrow_exception(failure);
+     }
+    }();
+    {
+     std::scoped_lock lock(mutex_);
+     if (!result.report.empty()) state_.output.artifacts.push_back(std::move(result.report));
+     evaluation_ = std::move(result.evaluation);
+     evaluation_generation_ = state_.generation_frontier;
+    }
+    try {
+     sample_output_.Finish(result.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
+    } catch (...) {
+     auto failure = contracts::compute_failure_terminal(std::current_exception(), "validation sample output failed");
+     failure.completed = result.terminal.completed;
+     return failure;
+    }
+    return std::move(result.terminal);
+   }, [this](const contracts::ComputeProgress& progress) { Progress(progress); });
+   if (terminal.outcome == contracts::ComputeOperationOutcome::Failed || (runtime_ && runtime_->HasUnsafeCustody())) RetireRuntime();
+   return Complete(generation, std::move(terminal));
+  },
    .failure = [this](const std::exception_ptr failure) -> direct::LocalRun::Notification {
-    RetireRuntime();
-    return Complete(operation().generation_frontier, contracts::compute_failure_terminal(failure, "compute worker failed"));
-   },
+   RetireRuntime();
+   return Complete(operation().generation_frontier, contracts::compute_failure_terminal(failure, "compute worker failed"));
+  },
   });
   return operation();
  }

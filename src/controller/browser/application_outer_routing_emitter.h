@@ -40,11 +40,12 @@ void emit_application_outer_routing(Writer& writer) {
   writer.reserve("module", symbol, "event " + std::string(Identity::system_cell::name) + "." + writer.template native_source<Event>());
   output << "pub const " << symbol << ": u64 = " << Identity::event_id << ";\n";
  });
- for (const std::string_view symbol : {"ApplicationSystem", "ApplicationEndpoint", "ApplicationIntentEndpoint", "EncodedApplicationIntent", "application_system_stable_id",
-       "application_system_from_stable_id", "application_endpoint_stable_id", "application_intent_endpoint_stable_id", "decode_application_intent_endpoint", "application_intent_system",
-       "application_reply_endpoint", "ApplicationSnapshot", "ApplicationEvent", "ApplicationReply", "APPLICATION_SNAPSHOT_COUNT", "application_snapshot_kind", "application_snapshot_system",
-       "application_event_system", "application_bootstrap_complete", "decode_application_snapshot", "decode_application_event", "application_event_delivery", "decode_application_reply",
-       "dispatch_application_snapshot", "dispatch_application_event", "dispatch_application_reply", "ApplicationProjection"}) {
+ for (const std::string_view symbol :
+  {"ApplicationSystem", "ApplicationEndpoint", "ApplicationIntentEndpoint", "EncodedApplicationIntent", "application_system_stable_id", "application_system_from_stable_id",
+   "application_endpoint_stable_id", "application_intent_endpoint_stable_id", "decode_application_intent_endpoint", "application_intent_system", "application_reply_endpoint", "ApplicationSnapshot",
+   "ApplicationEvent", "ApplicationReply", "APPLICATION_SNAPSHOT_COUNT", "application_snapshot_kind", "application_snapshot_system", "application_event_system", "application_bootstrap_complete",
+   "decode_application_snapshot", "decode_application_event", "application_event_delivery", "decode_application_reply", "dispatch_application_snapshot", "dispatch_application_event",
+   "dispatch_application_reply", "ApplicationProjection"}) {
   writer.reserve("module", symbol, "generated application outer routing");
  }
  output << "\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum ApplicationSystem {\n";

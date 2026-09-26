@@ -119,15 +119,12 @@ void remove_path_recursively_best_effort(const std::filesystem::path& path) noex
   }
   DIR* directory = ::opendir(path.c_str());
   if (directory != nullptr) {
-   static_cast<void>(remove_directory_entries(
-    directory, CleanupPolicy::BestEffort,
-    [&](const char* child) noexcept {
-     try {
-      remove_path_recursively_best_effort(path / child);
-      return true;
-     } catch (...) { return false; }
-    },
-    error));
+   static_cast<void>(remove_directory_entries(directory, CleanupPolicy::BestEffort, [&](const char* child) noexcept {
+    try {
+     remove_path_recursively_best_effort(path / child);
+     return true;
+    } catch (...) { return false; }
+   }, error));
    static_cast<void>(::closedir(directory));
   }
   static_cast<void>(::rmdir(path.c_str()));

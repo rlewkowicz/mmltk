@@ -21,10 +21,14 @@ struct AtlasDrawAudit final {
  using SourceKey = std::array<std::uint64_t, 4U>;
  using SampleKey = std::pair<std::string, std::uint64_t>;
  using AllocationKey = std::tuple<std::string, std::uint64_t, std::uint64_t>;
- static constexpr std::initializer_list<const char*> source_fields{"content_session", "source_kind", "source_instance", "source_revision", "content_width", "content_height", "dataset_identity",
-  "columns", "rows", "first_row", "matching_count", "visible_indices", "row_capacity", "row_origin", "card_extent"};
- static constexpr std::initializer_list<const char*> image_fields{"surface", "width", "height", "presentation_revision", "frame_revision", "content_session", "source_kind", "source_instance",
-  "source_revision", "content_width", "content_height", "columns", "rows", "first_row", "matching_count", "visible_indices", "row_capacity", "row_origin", "card_extent"};
+ static constexpr std::initializer_list<const char*> source_fields{
+  "content_session", "source_kind", "source_instance", "source_revision", "content_width", "content_height", "dataset_identity", "columns", "rows", "first_row", "matching_count", "visible_indices",
+  "row_capacity", "row_origin", "card_extent"
+ };
+ static constexpr std::initializer_list<const char*> image_fields{
+  "surface", "width", "height", "presentation_revision", "frame_revision", "content_session", "source_kind", "source_instance", "source_revision", "content_width", "content_height", "columns", "rows",
+  "first_row", "matching_count", "visible_indices", "row_capacity", "row_origin", "card_extent"
+ };
  static constexpr std::array stage_names{"fractional", "row1", "row2", "row10", "row9", "end", "restored"};
  static constexpr std::array held_names{"held-visible", "held-return", "held-aligned", "held-extra", "held-restored", "held-complete"};
  static constexpr std::array return_names{"return-cached", "return-aligned", "return-extra", "return-restored"};

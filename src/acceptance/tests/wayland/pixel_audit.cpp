@@ -163,8 +163,9 @@ auto PixelBoundaryAudit::identity_of(const nlohmann::json& record, std::size_t b
  if (boundary == 0U) {
   identity["workspace_source"] = SurfaceAudit::native_identity(record, true);
   copy("workspace_allocation");
-  for (const auto* field : {"source_session", "source_instance", "source_revision", "clean_revision", "source_observation_revision", "source_width", "source_height", "content_x", "content_y",
-        "content_width", "content_height", "allocation_generation", "capacity_width", "capacity_height", "transfer_sequence", "timeline_ready"})
+  for (const auto* field :
+   {"source_session", "source_instance", "source_revision", "clean_revision", "source_observation_revision", "source_width", "source_height", "content_x", "content_y", "content_width",
+    "content_height", "allocation_generation", "capacity_width", "capacity_height", "transfer_sequence", "timeline_ready"})
    copy(field);
  } else {
   for (const auto* field : {"content_session", "content_width", "content_height", "layer", "slot"}) copy(field);

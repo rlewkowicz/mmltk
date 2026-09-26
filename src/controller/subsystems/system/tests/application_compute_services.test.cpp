@@ -223,10 +223,12 @@ TEST_CASE("artifact service derives bounded inspection contracts from reflected 
  CHECK_FALSE(rejected.compatible);
  CHECK_FALSE(rejected.detail.empty());
  CHECK(rejected.detail.size() <= domain::kArtifactErrorCapacity);
- ArtifactCompileRequest exact{.source = std::filesystem::path(std::string(domain::kArtifactPathCapacity, 's')),
+ ArtifactCompileRequest exact{
+  .source = std::filesystem::path(std::string(domain::kArtifactPathCapacity, 's')),
   .output = std::filesystem::path(std::string(domain::kArtifactPathCapacity, 'o')),
   .preset = std::string(domain::kArtifactPresetCapacity, 'p'),
-  .resolution = 1U};
+  .resolution = 1U
+ };
  CHECK(exact.valid());
  exact.source = std::filesystem::path(std::string(domain::kArtifactPathCapacity + 1U, 's'));
  CHECK_FALSE(exact.valid());
@@ -308,17 +310,18 @@ TEST_CASE("artifact benchmark compilation uses the environment cache and retires
   mutable std::size_t path_reports = 0U;
  };
  Observations observations;
- const ArtifactDiagnosticObserver diagnostics{.benchmark = {
-                                               .context = &observations,
-                                               .report =
-                                                [](const void* context, const std::string_view event, const std::string_view fields) noexcept {
-                                                 if (event == "benchmark.compile.paths") {
-                                                  const auto& observed = *static_cast<const Observations*>(context);
-                                                  observed.paths = fields;
-                                                  ++observed.path_reports;
-                                                 }
-                                                },
-                                              }};
+ const ArtifactDiagnosticObserver diagnostics{
+  .benchmark = {
+   .context = &observations,
+   .report = [](const void* context, const std::string_view event, const std::string_view fields) noexcept {
+  if (event == "benchmark.compile.paths") {
+   const auto& observed = *static_cast<const Observations*>(context);
+   observed.paths = fields;
+   ++observed.path_reports;
+  }
+ },
+  }
+ };
  // Cancellation begins inside the real backend, after ArtifactStore's entry
  // check. Even a cache-selection regression cannot reach a public endpoint.
  const ArtifactProgressObserver progress{
@@ -423,8 +426,9 @@ TEST_CASE("artifact service owns verified cache publication and cancellation cle
  CHECK_FALSE(std::filesystem::exists(root / "fixture.bin"));
  ArtifactCancellationFixture first;
  std::vector<domain::ModelProgress> weight_progress;
- const ArtifactWeightProgressObserver observer{
-  .context = &weight_progress, .report = [](void* context, const domain::ModelProgress& value) noexcept { static_cast<std::vector<domain::ModelProgress>*>(context)->push_back(value); }};
+ const ArtifactWeightProgressObserver observer{.context = &weight_progress, .report = [](void* context, const domain::ModelProgress& value) noexcept {
+  static_cast<std::vector<domain::ModelProgress>*>(context)->push_back(value);
+ }};
  CHECK(store.canonical_weight_path("fixture", first.token, observer) == root / "fixture.bin");
  CHECK(operations.finds == 1U);
  CHECK(operations.downloads == 1U);
@@ -855,12 +859,12 @@ TEST_CASE("artifact compile reports synchronously through the caller-owned obser
   bool accepting = true;
  } reports;
  const ArtifactProgressObserver observer{.context = &reports, .report = [](void* context, const domain::ArtifactProgress&) {
-                                          auto& value = *static_cast<Reports*>(context);
-                                          REQUIRE(value.accepting);
-                                          ++value.count;
-                                         }};
- const ArtifactCompileResult result = store.compile(
-  {.source = mmltk::backend::data::testsupport::dataset_dir(fixture), .output = temporary.path() / "compiled", .preset = preset, .resolution = resolution}, cancellation.token, observer);
+  auto& value = *static_cast<Reports*>(context);
+  REQUIRE(value.accepting);
+  ++value.count;
+ }};
+ const ArtifactCompileResult result =
+  store.compile({.source = mmltk::backend::data::testsupport::dataset_dir(fixture), .output = temporary.path() / "compiled", .preset = preset, .resolution = resolution}, cancellation.token, observer);
  reports.accepting = false;
  CHECK(result.inspection.detail.empty());
  CHECK(std::filesystem::exists(result.output));
@@ -1034,8 +1038,9 @@ TEST_CASE("Train process client rejects oversized public checkpoint paths", "[gu
  CHECK_THROWS(client.consume_progress());
 }
 TEST_CASE("Train process client admits only bounded identified retained observations", "[gui][services]") {
- for (const auto mode : {"invalid-observation", "future-observation", "foreign-observation", "duplicate-observation", "inconsistent-observation", "foreign-current-session", "premature-selected",
-       "missing-selected-validation", "mismatched-selected-validation"}) {
+ for (const auto mode :
+  {"invalid-observation", "future-observation", "foreign-observation", "duplicate-observation", "inconsistent-observation", "foreign-current-session", "premature-selected",
+   "missing-selected-validation", "mismatched-selected-validation"}) {
   mmltk::testsupport::ScopedTempDir temp("mmltk-train-observation-bound");
   const auto output = temp.path() / "output";
   const auto executable = script(temp, std::string("MMLTK_TRAIN_FIXTURE_PROGRESS=") + mode + " \"" MMLTK_TRAIN_REQUEST_FIXTURE "\" \"$@\" > /dev/null\n");
@@ -1049,7 +1054,10 @@ TEST_CASE("Train preparation reaches the observer before metrics and ignores dup
  auto client = launch_train_ignoring_term(temp);
  const auto path = temp.path() / "output" / "preparation.json";
  const auto write = [&](const std::string_view content) {
-  { std::ofstream stream(path); stream << content; }
+  {
+   std::ofstream stream(path);
+   stream << content;
+  }
   REQUIRE(ready(client.progress_fd()));
  };
  write(R"({"stage":"Dataset"})");
@@ -1149,12 +1157,10 @@ TEST_CASE("benchmark current transfer advances typed facts at the exact image pl
  const BenchmarkTraceSink quiet;
  domain::ArtifactProgress displayed;
  data::BenchmarkCompileProgress latest;
- ProgressReporter reporter(
-  [&](const data::BenchmarkCompileProgress& update) {
-   latest = update;
-   displayed = project_artifact_progress(update);
-  },
-  quiet);
+ ProgressReporter reporter([&](const data::BenchmarkCompileProgress& update) {
+  latest = update;
+  displayed = project_artifact_progress(update);
+ }, quiet);
  reporter.phase(data::DatasetCompilePhase::Extracting);
  reporter.source_activity(Source::kCoco2017, "Old COCO activity");
  reporter.source_images(Source::kCoco2017, 123U, 123U);
@@ -1254,7 +1260,8 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
  for (std::size_t i = 0U; i < payload.size(); ++i) { payload[i] = static_cast<std::uint8_t>(i % 251U); }
  data::testsupport::HttpServer server(payload);
  DownloadRequest request{
-  "objects365-restart", server.url("restart"), root.path() / "archive.bin", root.path() / "archive.lock", payload.size(), mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)), 1U};
+  "objects365-restart", server.url("restart"), root.path() / "archive.bin", root.path() / "archive.lock", payload.size(), mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)), 1U
+ };
  request.source = data::BenchmarkDatasetSource::kObjects365V2;
  constexpr std::uint64_t retained = 512U;
  {
@@ -1280,13 +1287,10 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
  reporter.source_images(data::BenchmarkDatasetSource::kObjects365V2, 170161U, 408551U);
  reporter.source_images(data::BenchmarkDatasetSource::kOpenImagesV7, 56008U, 56008U);
  displayed.clear();
- const auto completed = download_artifacts(
-  {request}, 1U, {},
-  [&](const auto& update) {
-   observed.push_back(update);
-   totals.update(update, reporter);
-  },
-  trace);
+ const auto completed = download_artifacts({request}, 1U, {}, [&](const auto& update) {
+  observed.push_back(update);
+  totals.update(update, reporter);
+ }, trace);
  REQUIRE(completed.size() == 1U);
  REQUIRE(observed.size() == displayed.size());
  bool saw_retained = false;
@@ -1359,12 +1363,10 @@ TEST_CASE("real unknown metadata bytes remain open ended through artifact projec
  std::vector<data::BenchmarkCompileProgress> native;
  std::vector<domain::ArtifactProgress> displayed;
  const BenchmarkTraceSink trace;
- ProgressReporter reporter(
-  [&](const auto& update) {
-   native.push_back(update);
-   displayed.push_back(project_artifact_progress(update));
-  },
-  trace);
+ ProgressReporter reporter([&](const auto& update) {
+  native.push_back(update);
+  displayed.push_back(project_artifact_progress(update));
+ }, trace);
  ArtifactProgressTotals totals;
  reporter.phase(data::DatasetCompilePhase::Downloading);
  if (mixed) {

@@ -158,7 +158,9 @@ TEST_CASE("integration control retains typed direction and sequence validation",
  mmltk::controller::contracts::visit_integration_commands([&]<auto kind, auto policy>(auto) {
   const IntegrationControl source{
    .receipt = {
-    .kind = kind, .sequence = 3U, .progress = policy.server ? 0U : 5U, .failureline = kind == Kind::Failed ? 123U : 0U, .read_generation = policy.read_generation ? 7U : 0U, .compiled_index = 0U}};
+    .kind = kind, .sequence = 3U, .progress = policy.server ? 0U : 5U, .failureline = kind == Kind::Failed ? 123U : 0U, .read_generation = policy.read_generation ? 7U : 0U, .compiled_index = 0U
+   }
+  };
   check_integration_round_trip(source, policy.server, encoded);
   auto invalid = source.receipt;
   invalid.read_generation = policy.read_generation ? 0U : 7U;
@@ -333,19 +335,19 @@ TEST_CASE("browser server records preserve reply and event error vocabulary", "[
  const ServerRecord failed = IntentReply{
   .correlation = 23U,
   .result = {},
-  .error =
-   ApplicationErrorRecord{
-    .category = mmltk::controller::contracts::ApplicationErrorCategory::Busy,
-    .detail = "operation already active",
-   },
+  .error = ApplicationErrorRecord{
+   .category = mmltk::controller::contracts::ApplicationErrorCategory::Busy,
+   .detail = "operation already active",
+  },
  };
  wire::ByteBuffer encoded;
  REQUIRE(encode_server_record(failed, encoded));
  const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
  REQUIRE(decoded);
  CHECK(*decoded == failed);
- for (const auto delivery : {mmltk::controller::contracts::reflection::EventDelivery::Transient, mmltk::controller::contracts::reflection::EventDelivery::Critical,
-       mmltk::controller::contracts::reflection::EventDelivery::LatestState}) {
+ for (const auto delivery :
+  {mmltk::controller::contracts::reflection::EventDelivery::Transient, mmltk::controller::contracts::reflection::EventDelivery::Critical,
+   mmltk::controller::contracts::reflection::EventDelivery::LatestState}) {
   const ServerRecord event = SystemEvent{
    .system_id = 29U,
    .event_id = 31U,
@@ -362,8 +364,10 @@ TEST_CASE("browser server records preserve reply and event error vocabulary", "[
 TEST_CASE("consumed server records retain empty and large nested leaf ownership", "[controller][browser][protocol][limits]") {
  for (const std::size_t size : {0U, 65535U, 65536U, 65537U}) {
   const wire::Value payload(wire::Value::Object{{"nested", wire::Value(wire::Value::Array{wire::Value(std::string(size, 'x')), wire::Value(wire::ByteBuffer(size, std::byte{0xa5}))})}});
-  for (const ServerRecord& source : std::array<ServerRecord, 3U>{SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload},
-        Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload}}}, IntentReply{.correlation = 9U, .result = payload}}) {
+  for (const ServerRecord& source : std::array<ServerRecord, 3U>{
+        SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload},
+        Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload}}}, IntentReply{.correlation = 9U, .result = payload}
+       }) {
    auto owned = source;
    wire::ByteBuffer expected;
    REQUIRE(encode_server_record(source, expected));
@@ -386,24 +390,24 @@ TEST_CASE("complete server records preserve exact 64 KiB neighboring extents", "
   const auto payload = [](std::size_t text_size) {
    return wire::Value(wire::Value::Object{{"nested", wire::Value(wire::Value::Array{wire::Value(std::string(text_size, 'x')), wire::Value(wire::ByteBuffer(31U, std::byte{0xa5}))})}});
   };
-  for (ServerRecord source : std::array<ServerRecord, 3U>{SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload(32768U)},
-        Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload(32768U)}}}, IntentReply{.correlation = 9U, .result = payload(32768U)}}) {
+  for (ServerRecord source : std::array<ServerRecord, 3U>{
+        SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload(32768U)},
+        Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload(32768U)}}}, IntentReply{.correlation = 9U, .result = payload(32768U)}
+       }) {
    wire::ByteBuffer expected;
    REQUIRE(encode_server_record(source, expected));
    REQUIRE(expected.size() < target);
    const auto text_size = 32768U + target - expected.size();
    // Both text lengths retain the same canonical CBOR length-head width.
    REQUIRE(text_size <= 65535U);
-   std::visit(
-    [&]<class Record>(Record& record) {
-     if constexpr (std::is_same_v<Record, SystemEvent>)
-      record.value = payload(text_size);
-     else if constexpr (std::is_same_v<Record, Bootstrap>)
-      record.snapshots.front().value = payload(text_size);
-     else if constexpr (std::is_same_v<Record, IntentReply>)
-      record.result = payload(text_size);
-    },
-    source);
+   std::visit([&]<class Record>(Record& record) {
+    if constexpr (std::is_same_v<Record, SystemEvent>)
+     record.value = payload(text_size);
+    else if constexpr (std::is_same_v<Record, Bootstrap>)
+     record.snapshots.front().value = payload(text_size);
+    else if constexpr (std::is_same_v<Record, IntentReply>)
+     record.result = payload(text_size);
+   }, source);
    REQUIRE(encode_server_record(source, expected));
    REQUIRE(expected.size() == target);
    auto owned = source;
@@ -507,8 +511,10 @@ TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapsh
  auto zero_epoch = std::get<Bootstrap>(bootstrap);
  zero_epoch.input_epoch = 0U;
  CHECK_FALSE(encode_server_record(ServerRecord{zero_epoch}, encoded));
- for (const ServerRecord& record : std::array<ServerRecord, 2U>{InteractionRejected{.endpoint_id = 7U, .error = {.detail = "input unavailable"}},
-       InteractionRejected{.endpoint_id = 1U, .error = {.category = mmltk::controller::contracts::ApplicationErrorCategory::Unavailable, .detail = "unavailable"}}}) {
+ for (const ServerRecord& record : std::array<ServerRecord, 2U>{
+       InteractionRejected{.endpoint_id = 7U, .error = {.detail = "input unavailable"}},
+       InteractionRejected{.endpoint_id = 1U, .error = {.category = mmltk::controller::contracts::ApplicationErrorCategory::Unavailable, .detail = "unavailable"}}
+      }) {
   // CLEANUP-IGNORE: Interaction rejection round trips are independent wire-variant oracles, not a second codec implementation.
   REQUIRE(encode_server_record(record, encoded));
   const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
@@ -602,7 +608,8 @@ TEST_CASE("exception mapping preserves the common bounded error vocabulary", "[c
 }  // namespace mmltk::controller::browser
 TEST_CASE("Native graphics records reject unknown raw opcodes and malformed descriptor counts", "[browser][workspace][protocol]") {
  namespace abi = mmltk::controller::presentation::detail::workspace_surface_import;
- abi::Record record{.id_high = 1U,
+ abi::Record record{
+  .id_high = 1U,
   .width = 4U,
   .height = 3U,
   .stride = 32U,
@@ -613,7 +620,8 @@ TEST_CASE("Native graphics records reject unknown raw opcodes and malformed desc
   .device_incarnation = 4U,
   .alignment = 32U,
   .device_uuid = {1U},
-  .memory_type_bits = 1U};
+  .memory_type_bits = 1U
+ };
  REQUIRE(abi::valid(record));
  record.opcode = static_cast<abi::Opcode>(0xffff'ffffU);
  CHECK_FALSE(abi::valid(record));
@@ -634,7 +642,8 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
  REQUIRE(abi::valid(arena));
  arena.allocation_identity = 1U;
  CHECK_FALSE(abi::valid(arena));
- abi::Record layout{.opcode = abi::Opcode::ArenaReady,
+ abi::Record layout{
+  .opcode = abi::Opcode::ArenaReady,
   .id_high = 1U,
   .width = 4U,
   .height = 3U,
@@ -644,7 +653,8 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
   .offset = 32U,
   .alignment = 32U,
   .device_uuid = {1U},
-  .memory_type_bits = 1U};
+  .memory_type_bits = 1U
+ };
  REQUIRE(abi::valid(layout));
  SECTION("direct sampling is a negotiated binary capability") {
   layout.direct_sampling = 1U;
@@ -699,7 +709,8 @@ TEST_CASE("compact workspace mouse records preserve fractional coordinates and w
  using namespace mmltk::controller::browser;
  namespace cbor = mmltk::frameworks::serialization;
  constexpr wire::Limits limits{.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth};
- const WorkspaceMouse source{.source = PresentationSourceKind::Annotation,
+ const WorkspaceMouse source{
+  .source = PresentationSourceKind::Annotation,
   .peer_epoch = 9U,
   .document_epoch = 3U,
   .kind = WorkspaceMouseKind::Wheel,
@@ -709,7 +720,8 @@ TEST_CASE("compact workspace mouse records preserve fractional coordinates and w
   .click_count = 2U,
   .modifiers = 15U,
   .wheel_unit = WorkspaceWheelUnit::Pixels,
-  .wheel = {0.125F, -0.25F}};
+  .wheel = {0.125F, -0.25F}
+ };
  wire::ByteBuffer bytes(cbor::compact_maximum_cbor_bytes<WorkspaceMouse>());
  cbor::FixedCborEncoder encoder(bytes);
  REQUIRE(cbor::encode_compact(encoder, source));

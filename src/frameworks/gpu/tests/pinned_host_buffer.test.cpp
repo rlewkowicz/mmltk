@@ -23,11 +23,10 @@ TEST_CASE("Registered local storage preserves portable high-water registration",
   ~PrimaryLease() { (void)cuDevicePrimaryCtxRelease(device); }
  } lease{device};
  const auto selected = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
- mmltk::frameworks::gpu::PinnedHostBuffer host(
-  context, selected.placement, true, +[](void* data, std::size_t bytes, unsigned flags) -> CUresult {
-   if (bytes > mmltk::common::system::host_page_size()) return CUDA_ERROR_OUT_OF_MEMORY;
-   return cuMemHostRegister(data, bytes, flags);
-  });
+ mmltk::frameworks::gpu::PinnedHostBuffer host(context, selected.placement, true, +[](void* data, std::size_t bytes, unsigned flags) -> CUresult {
+  if (bytes > mmltk::common::system::host_page_size()) return CUDA_ERROR_OUT_OF_MEMORY;
+  return cuMemHostRegister(data, bytes, flags);
+ });
  host.ensure_bytes(64);
  auto* first = host.data();
  REQUIRE(first);

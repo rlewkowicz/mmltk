@@ -176,11 +176,13 @@ TEST_CASE("Firefox startup cause is retained separately from its mapped status")
   }
   std::filesystem::permissions(non_executable, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
   FirefoxObservations observations;
-  services::FirefoxProcessOwner owner{"/tmp/mmltk-test-import.sock",
+  services::FirefoxProcessOwner owner{
+   "/tmp/mmltk-test-import.sock",
    {.executable = refused_log ? std::filesystem::path{MMLTK_BROWSER_RUNTIME_CHILD_FIXTURE} : non_executable,
     .page_url = "normal-exit",
     .log_file = refused_log ? root.path() : std::filesystem::path{}},
-   observations.target()};
+   observations.target()
+  };
   CHECK(owner.start() == services::FirefoxProcessStartResult::Terminal);
   owner.wait();
   const auto lifecycle = owner.lifecycle();

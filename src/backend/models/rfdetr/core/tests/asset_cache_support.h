@@ -104,29 +104,26 @@ inline void regenerate_file_atomically(const fs::path& output_path, const std::s
 }
 inline void ensure_downloaded_weight(const fs::path& output_path, const WeightAsset& asset) {
  if (is_nonempty_regular_file(output_path) && md5_of_file(output_path) == asset.md5_hash) { return; }
- regenerate_file_atomically(
-  output_path, "RF-DETR weight download",
-  [&asset](const fs::path& temp_path) {
-   return std::vector<std::string>{
-    "curl",
-    "-L",
-    "--fail",
-    "--silent",
-    "--show-error",
-    "--retry",
-    "3",
-    "--output",
-    temp_path.string(),
-    std::string(asset.download_url),
-   };
-  },
-  [&output_path, &asset](const fs::path& temp_path) {
-   const std::string actual_md5 = md5_of_file(temp_path);
-   if (actual_md5 != asset.md5_hash) {
-    remove_if_exists(temp_path);
-    throw std::runtime_error("downloaded RF-DETR weight hash mismatch for " + output_path.string() + ": expected=" + std::string(asset.md5_hash) + " actual=" + actual_md5);
-   }
-  });
+ regenerate_file_atomically(output_path, "RF-DETR weight download", [&asset](const fs::path& temp_path) {
+  return std::vector<std::string>{
+   "curl",
+   "-L",
+   "--fail",
+   "--silent",
+   "--show-error",
+   "--retry",
+   "3",
+   "--output",
+   temp_path.string(),
+   std::string(asset.download_url),
+  };
+ }, [&output_path, &asset](const fs::path& temp_path) {
+  const std::string actual_md5 = md5_of_file(temp_path);
+  if (actual_md5 != asset.md5_hash) {
+   remove_if_exists(temp_path);
+   throw std::runtime_error("downloaded RF-DETR weight hash mismatch for " + output_path.string() + ": expected=" + std::string(asset.md5_hash) + " actual=" + actual_md5);
+  }
+ });
 }
 inline void ensure_native_checkpoint(const fs::path& upstream_weights_path, const fs::path& native_checkpoint_path) {
  if (is_nonempty_regular_file_newer_than(native_checkpoint_path, upstream_weights_path)) {
@@ -149,25 +146,22 @@ inline void ensure_native_checkpoint(const fs::path& upstream_weights_path, cons
 }
 inline void ensure_exported_onnx(const fs::path& native_checkpoint_path, const fs::path& onnx_path) {
  if (is_nonempty_regular_file_newer_than(onnx_path, native_checkpoint_path) && validate_onnx_model(onnx_path)) { return; }
- regenerate_file_atomically(
-  onnx_path, "RF-DETR ONNX export",
-  [&native_checkpoint_path](const fs::path& temp_path) {
-   return std::vector<std::string>{
-    mmltk::testsupport::mmltk_cli_path(),
-    "rfdetr",
-    "export-onnx",
-    "--weights",
-    native_checkpoint_path.string(),
-    "--output",
-    temp_path.string(),
-    "--device-id",
-    "0",
-    "--simplify",
-   };
-  },
-  [](const fs::path& temp_path) {
-   if (!validate_onnx_model(temp_path)) { throw std::runtime_error("RF-DETR ONNX export does not expose canonical prediction outputs"); }
-  });
+ regenerate_file_atomically(onnx_path, "RF-DETR ONNX export", [&native_checkpoint_path](const fs::path& temp_path) {
+  return std::vector<std::string>{
+   mmltk::testsupport::mmltk_cli_path(),
+   "rfdetr",
+   "export-onnx",
+   "--weights",
+   native_checkpoint_path.string(),
+   "--output",
+   temp_path.string(),
+   "--device-id",
+   "0",
+   "--simplify",
+  };
+ }, [](const fs::path& temp_path) {
+  if (!validate_onnx_model(temp_path)) { throw std::runtime_error("RF-DETR ONNX export does not expose canonical prediction outputs"); }
+ });
 }
 inline void ensure_built_tensorrt_engine(const fs::path& onnx_path, const fs::path& tensorrt_path) {
  if (is_nonempty_regular_file_newer_than(tensorrt_path, onnx_path) && validate_tensorrt_engine(tensorrt_path)) { return; }

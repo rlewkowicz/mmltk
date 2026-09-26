@@ -42,8 +42,9 @@ bool matches_family(const mmltk::controller::contracts::ProviderGpuFamily family
 }
 std::optional<mmltk::controller::contracts::ProviderGpuFamily> classify_family(std::string_view gpu_name) {
  const std::string normalized = normalize_gpu_name(gpu_name);
- for (const mmltk::controller::contracts::ProviderGpuFamily family : {mmltk::controller::contracts::ProviderGpuFamily::A100, mmltk::controller::contracts::ProviderGpuFamily::B200,
-       mmltk::controller::contracts::ProviderGpuFamily::H100, mmltk::controller::contracts::ProviderGpuFamily::H200, mmltk::controller::contracts::ProviderGpuFamily::LSeries}) {
+ for (const mmltk::controller::contracts::ProviderGpuFamily family :
+  {mmltk::controller::contracts::ProviderGpuFamily::A100, mmltk::controller::contracts::ProviderGpuFamily::B200, mmltk::controller::contracts::ProviderGpuFamily::H100,
+   mmltk::controller::contracts::ProviderGpuFamily::H200, mmltk::controller::contracts::ProviderGpuFamily::LSeries}) {
   if (matches_family(family, normalized)) { return family; }
  }
  return std::nullopt;
@@ -166,19 +167,16 @@ std::string run_vast_bridge_command(const VastBridgeConfig& config, const std::v
  const std::string http_timeout_seconds = std::to_string(std::chrono::duration<double>(config.http_timeout).count());
  mmltk::frameworks::process::CapturedChildProcessResult captured;
  try {
-  captured = mmltk::frameworks::process::run_captured_child_process(
-   "Vast bridge", "failed to read Vast bridge output: ",
-   [&](const int stdout_fd, const int setup_error_fd) {
-    mmltk::frameworks::process::prepare_captured_output_child(stdout_fd, setup_error_fd);
-    if (!config.api_key.empty()) {
-     mmltk::frameworks::process::require_child_setup_step(::setenv("VAST_API_KEY", config.api_key.c_str(), 1) == 0, setup_error_fd, mmltk::frameworks::process::ChildSetupStage::SetEnvironment);
-    }
-    mmltk::frameworks::process::require_child_setup_step(
-     ::setenv("MMLTK_VAST_HTTP_TIMEOUT_SECONDS", http_timeout_seconds.c_str(), 1) == 0, setup_error_fd, mmltk::frameworks::process::ChildSetupStage::SetEnvironment);
-    ::execvp(argv.program(), argv.data());
-    mmltk::frameworks::process::fail_child_setup(setup_error_fd, mmltk::frameworks::process::ChildSetupStage::Exec);
-   },
-   {}, invocation.deadline, invocation.cancellation_fd, true, kVastBridgeOutputCapacity);
+  captured = mmltk::frameworks::process::run_captured_child_process("Vast bridge", "failed to read Vast bridge output: ", [&](const int stdout_fd, const int setup_error_fd) {
+   mmltk::frameworks::process::prepare_captured_output_child(stdout_fd, setup_error_fd);
+   if (!config.api_key.empty()) {
+    mmltk::frameworks::process::require_child_setup_step(::setenv("VAST_API_KEY", config.api_key.c_str(), 1) == 0, setup_error_fd, mmltk::frameworks::process::ChildSetupStage::SetEnvironment);
+   }
+   mmltk::frameworks::process::require_child_setup_step(
+    ::setenv("MMLTK_VAST_HTTP_TIMEOUT_SECONDS", http_timeout_seconds.c_str(), 1) == 0, setup_error_fd, mmltk::frameworks::process::ChildSetupStage::SetEnvironment);
+   ::execvp(argv.program(), argv.data());
+   mmltk::frameworks::process::fail_child_setup(setup_error_fd, mmltk::frameworks::process::ChildSetupStage::Exec);
+  }, {}, invocation.deadline, invocation.cancellation_fd, true, kVastBridgeOutputCapacity);
  } catch (const mmltk::frameworks::process::CapturedChildAborted& error) {
   throw VastBridgeError(error.reason() == mmltk::frameworks::process::CapturedChildAbortReason::TimedOut ? VastBridgeFailureKind::TimedOut : VastBridgeFailureKind::Cancelled, error.what());
  } catch (const VastBridgeError&) { throw; } catch (const std::exception& error) {

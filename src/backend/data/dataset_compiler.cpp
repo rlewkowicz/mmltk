@@ -35,7 +35,8 @@ ProgressEstimate estimate_progress(const std::uint64_t completed, const std::uin
  if (completed >= total) { return {.remaining_seconds = 0U, .throughput_per_second = throughput}; }
  const __uint128_t remaining = static_cast<__uint128_t>(total - completed) * elapsed_seconds / completed;
  return {
-  .remaining_seconds = remaining > std::numeric_limits<std::uint64_t>::max() ? std::numeric_limits<std::uint64_t>::max() : static_cast<std::uint64_t>(remaining), .throughput_per_second = throughput};
+  .remaining_seconds = remaining > std::numeric_limits<std::uint64_t>::max() ? std::numeric_limits<std::uint64_t>::max() : static_cast<std::uint64_t>(remaining), .throughput_per_second = throughput
+ };
 }
 CompileProgress CompileTelemetry::snapshot() const noexcept { return snapshot(phase_.load(std::memory_order_relaxed)); }
 CompileProgress CompileTelemetry::snapshot(const DatasetCompilePhase phase) const noexcept {
@@ -50,27 +51,32 @@ CompileProgress CompileTelemetry::snapshot(const DatasetCompilePhase phase) cons
  const std::uint64_t elapsed_seconds = elapsed > 0 ? static_cast<std::uint64_t>(elapsed) : 0U;
  const auto progress = [&](const size_t done) {
   const ProgressEstimate estimate = estimate_progress(done, total, elapsed_seconds);
-  return CompileProgress{.done = done,
+  return CompileProgress{
+   .done = done,
    .total = total,
    .elapsed_seconds = elapsed_seconds,
    .remaining_seconds = estimate.remaining_seconds,
    .throughput_per_second = estimate.throughput_per_second,
    .phase = phase,
-   .tracks = {.acquisition = {.total_known = true, .complete = true, .activity = DatasetCompileActivity::Unnecessary},
-    .labels = {.completed = label_done,
-     .total = num_images,
-     .total_known = true,
-     .active = phase != DatasetCompilePhase::Planning && label_done != num_images,
-     .complete = label_done == num_images,
-     .activity = label_done == num_images ? DatasetCompileActivity::Complete : DatasetCompileActivity::Preparing},
-    .pixels = {.completed = pixel_done,
-     .total = num_images,
-     .total_known = true,
-     .active = (pixel_active != 0 || phase == DatasetCompilePhase::Pixels) && pixel_done != num_images,
-     .complete = pixel_done == num_images,
-     .activity = pixel_done == num_images ? DatasetCompileActivity::Complete : DatasetCompileActivity::Compiling}},
+   .tracks =
+    {.acquisition = {.total_known = true, .complete = true, .activity = DatasetCompileActivity::Unnecessary},
+     .labels =
+      {.completed = label_done,
+       .total = num_images,
+       .total_known = true,
+       .active = phase != DatasetCompilePhase::Planning && label_done != num_images,
+       .complete = label_done == num_images,
+       .activity = label_done == num_images ? DatasetCompileActivity::Complete : DatasetCompileActivity::Preparing},
+     .pixels =
+      {.completed = pixel_done,
+       .total = num_images,
+       .total_known = true,
+       .active = (pixel_active != 0 || phase == DatasetCompilePhase::Pixels) && pixel_done != num_images,
+       .complete = pixel_done == num_images,
+       .activity = pixel_done == num_images ? DatasetCompileActivity::Complete : DatasetCompileActivity::Compiling}},
    .active_workers = label_active + pixel_active,
-   .dropped_instances = dropped_instances_.load(std::memory_order_relaxed)};
+   .dropped_instances = dropped_instances_.load(std::memory_order_relaxed)
+  };
  };
  if (phase == DatasetCompilePhase::Planning) { return progress(0U); }
  if (phase == DatasetCompilePhase::Syncing || phase == DatasetCompilePhase::Publishing) {

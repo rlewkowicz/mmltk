@@ -1423,44 +1423,41 @@ void NativeRfDetrModel::Impl::optimize_for_inference(int batch_size, bool for_tr
  }
  std::pair<std::shared_ptr<torch::jit::tracer::TracingState>, torch::jit::Stack> trace_res;
  {
-  trace_res = torch::jit::tracer::trace(
-   {dummy_pixel_values, dummy_mask},
-   [&](torch::jit::Stack args) -> torch::jit::Stack {
-    auto outputs = this->forward(NestedTensor{args[0].toTensor(), args[1].toTensor()});
-    c10::Dict<std::string, torch::Tensor> dict;
-    dict.insert("pred_logits", outputs.main.pred_logits);
-    dict.insert("pred_boxes", outputs.main.pred_boxes);
-    if (outputs.main.pred_masks) { dict.insert("pred_masks", *outputs.main.pred_masks); }
-    if (outputs.main.sparse_pred_masks) {
-     dict.insert("sparse_spatial", outputs.main.sparse_pred_masks->spatial_features);
-     dict.insert("sparse_query", outputs.main.sparse_pred_masks->query_features);
-     dict.insert("sparse_bias", outputs.main.sparse_pred_masks->bias);
+  trace_res = torch::jit::tracer::trace({dummy_pixel_values, dummy_mask}, [&](torch::jit::Stack args) -> torch::jit::Stack {
+   auto outputs = this->forward(NestedTensor{args[0].toTensor(), args[1].toTensor()});
+   c10::Dict<std::string, torch::Tensor> dict;
+   dict.insert("pred_logits", outputs.main.pred_logits);
+   dict.insert("pred_boxes", outputs.main.pred_boxes);
+   if (outputs.main.pred_masks) { dict.insert("pred_masks", *outputs.main.pred_masks); }
+   if (outputs.main.sparse_pred_masks) {
+    dict.insert("sparse_spatial", outputs.main.sparse_pred_masks->spatial_features);
+    dict.insert("sparse_query", outputs.main.sparse_pred_masks->query_features);
+    dict.insert("sparse_bias", outputs.main.sparse_pred_masks->bias);
+   }
+   if (outputs.enc_outputs) {
+    dict.insert("enc_logits", outputs.enc_outputs->pred_logits);
+    dict.insert("enc_boxes", outputs.enc_outputs->pred_boxes);
+    if (outputs.enc_outputs->pred_masks) { dict.insert("enc_masks", *outputs.enc_outputs->pred_masks); }
+    if (outputs.enc_outputs->sparse_pred_masks) {
+     dict.insert("enc_sparse_spatial", outputs.enc_outputs->sparse_pred_masks->spatial_features);
+     dict.insert("enc_sparse_query", outputs.enc_outputs->sparse_pred_masks->query_features);
+     dict.insert("enc_sparse_bias", outputs.enc_outputs->sparse_pred_masks->bias);
     }
-    if (outputs.enc_outputs) {
-     dict.insert("enc_logits", outputs.enc_outputs->pred_logits);
-     dict.insert("enc_boxes", outputs.enc_outputs->pred_boxes);
-     if (outputs.enc_outputs->pred_masks) { dict.insert("enc_masks", *outputs.enc_outputs->pred_masks); }
-     if (outputs.enc_outputs->sparse_pred_masks) {
-      dict.insert("enc_sparse_spatial", outputs.enc_outputs->sparse_pred_masks->spatial_features);
-      dict.insert("enc_sparse_query", outputs.enc_outputs->sparse_pred_masks->query_features);
-      dict.insert("enc_sparse_bias", outputs.enc_outputs->sparse_pred_masks->bias);
-     }
+   }
+   for (size_t i = 0; i < outputs.aux_outputs.size(); ++i) {
+    dict.insert("aux_logits_" + std::to_string(i), outputs.aux_outputs[i].pred_logits);
+    dict.insert("aux_boxes_" + std::to_string(i), outputs.aux_outputs[i].pred_boxes);
+    if (outputs.aux_outputs[i].pred_masks) { dict.insert("aux_masks_" + std::to_string(i), *outputs.aux_outputs[i].pred_masks); }
+    if (outputs.aux_outputs[i].sparse_pred_masks) {
+     dict.insert("aux_sparse_spatial_" + std::to_string(i), outputs.aux_outputs[i].sparse_pred_masks->spatial_features);
+     dict.insert("aux_sparse_query_" + std::to_string(i), outputs.aux_outputs[i].sparse_pred_masks->query_features);
+     dict.insert("aux_sparse_bias_" + std::to_string(i), outputs.aux_outputs[i].sparse_pred_masks->bias);
     }
-    for (size_t i = 0; i < outputs.aux_outputs.size(); ++i) {
-     dict.insert("aux_logits_" + std::to_string(i), outputs.aux_outputs[i].pred_logits);
-     dict.insert("aux_boxes_" + std::to_string(i), outputs.aux_outputs[i].pred_boxes);
-     if (outputs.aux_outputs[i].pred_masks) { dict.insert("aux_masks_" + std::to_string(i), *outputs.aux_outputs[i].pred_masks); }
-     if (outputs.aux_outputs[i].sparse_pred_masks) {
-      dict.insert("aux_sparse_spatial_" + std::to_string(i), outputs.aux_outputs[i].sparse_pred_masks->spatial_features);
-      dict.insert("aux_sparse_query_" + std::to_string(i), outputs.aux_outputs[i].sparse_pred_masks->query_features);
-      dict.insert("aux_sparse_bias_" + std::to_string(i), outputs.aux_outputs[i].sparse_pred_masks->bias);
-     }
-    }
-    torch::jit::Stack result;
-    result.emplace_back(std::move(dict));
-    return result;
-   },
-   [](const torch::autograd::Variable&) { return ""; }, false, false, target_traced_model);
+   }
+   torch::jit::Stack result;
+   result.emplace_back(std::move(dict));
+   return result;
+  }, [](const torch::autograd::Variable&) { return ""; }, false, false, target_traced_model);
  }
  target_traced_model->type()->addMethod(cu->create_function("forward", trace_res.first->graph, true));
  if (for_training) {

@@ -26,9 +26,11 @@ struct CpuDownscalerTestAccess {
  static bool armed(const CpuDownscaler& owner) { return owner.fail_before_ != Step::None; }
  static std::size_t horizontal_size(const CpuDownscaler& owner) { return owner.x_.size(); }
  static Storage storage(const CpuDownscaler& owner) {
-  return {{{owner.x_.data(), owner.x_.capacity()}, {owner.y_.data(), owner.y_.capacity()}, {owner.moments_[0].data(), owner.moments_[0].capacity()},
-   {owner.moments_[1].data(), owner.moments_[1].capacity()}, {owner.coefficients_[0].data(), owner.coefficients_[0].capacity()}, {owner.coefficients_[1].data(), owner.coefficients_[1].capacity()},
-   {owner.alpha_[0].data(), owner.alpha_[0].capacity()}, {owner.alpha_[1].data(), owner.alpha_[1].capacity()}}};
+  return {
+   {{owner.x_.data(), owner.x_.capacity()}, {owner.y_.data(), owner.y_.capacity()}, {owner.moments_[0].data(), owner.moments_[0].capacity()}, {owner.moments_[1].data(), owner.moments_[1].capacity()},
+    {owner.coefficients_[0].data(), owner.coefficients_[0].capacity()}, {owner.coefficients_[1].data(), owner.coefficients_[1].capacity()}, {owner.alpha_[0].data(), owner.alpha_[0].capacity()},
+    {owner.alpha_[1].data(), owner.alpha_[1].capacity()}}
+  };
  }
 };
 }  // namespace mmltk::backend::imaging::resample::perceptual
@@ -123,7 +125,8 @@ TEST_CASE("perceptual SIMD handles lane boundaries and unequal fractional footpr
  for (auto format : formats)
   for (unsigned width : {1U, 7U, 8U, 9U, 15U, 16U, 17U})
    for (const auto& dims : std::array<std::array<unsigned, 4>, 6>{
-         {{width * 2 + 1, 11, width, 7}, {width * 2, 11, width, 7}, {width * 2 + 1, 12, width, 6}, {width * 2, 12, width, 6}, {width * 2 + 1, 1, width, 1}, {width * 3 - 1, 101, width, 7}}})
+         {{width * 2 + 1, 11, width, 7}, {width * 2, 11, width, 7}, {width * 2 + 1, 12, width, 6}, {width * 2, 12, width, 6}, {width * 2 + 1, 1, width, 1}, {width * 3 - 1, 101, width, 7}}
+        })
     for (unsigned pattern : {0U, 3U, 5U, 6U, 7U}) {
      INFO("format " << static_cast<int>(format) << " geometry " << dims[0] << "x" << dims[1] << " -> " << dims[2] << "x" << dims[3] << " pattern " << pattern);
      Image source(dims[0], dims[1], format, 3), output(dims[2], dims[3], format, 5);
@@ -157,7 +160,8 @@ TEST_CASE("AVIR float4 preserves scalar resize accuracy and production selection
  avir::CImageResizer<avir::fpclass_float4> simd(8);
  RgbImageResizer production;
  constexpr std::array<std::array<unsigned, 4>, 9> sizes{
-  {{31, 23, 7, 5}, {31, 23, 8, 7}, {31, 23, 9, 13}, {31, 23, 17, 11}, {17, 13, 35, 29}, {17, 13, 17, 13}, {1, 17, 1, 9}, {19, 1, 33, 1}, {17, 13, 9, 19}}};
+  {{31, 23, 7, 5}, {31, 23, 8, 7}, {31, 23, 9, 13}, {31, 23, 17, 11}, {17, 13, 35, 29}, {17, 13, 17, 13}, {1, 17, 1, 9}, {19, 1, 33, 1}, {17, 13, 9, 19}}
+ };
  for (const auto& dims : sizes)
   for (unsigned pattern = 0; pattern < 8; ++pattern) {
    INFO("geometry " << dims[0] << "x" << dims[1] << " -> " << dims[2] << "x" << dims[3] << " pattern " << pattern);
@@ -456,8 +460,10 @@ void check_compiler_projection(
 }
 }  // namespace
 TEST_CASE("compiler planar projection preserves every quantized RGB8 bit", "[backend][data][image_resize][perceptual]") {
- constexpr std::array<std::array<std::uint32_t, 4>, 18> sizes{{{32, 18, 16, 9}, {34, 18, 17, 9}, {16, 10, 8, 5}, {14, 10, 7, 5}, {17, 13, 9, 7}, {17, 13, 17, 5}, {17, 13, 7, 13}, {17, 13, 1, 1},
-  {1, 17, 1, 7}, {31, 3, 9, 11}, {17, 13, 17, 13}, {17, 13, 23, 19}, {17, 13, 9, 19}, {15, 11, 7, 7}, {17, 11, 8, 7}, {31, 11, 15, 7}, {33, 11, 16, 7}, {35, 11, 17, 7}}};
+ constexpr std::array<std::array<std::uint32_t, 4>, 18> sizes{
+  {{32, 18, 16, 9}, {34, 18, 17, 9}, {16, 10, 8, 5}, {14, 10, 7, 5}, {17, 13, 9, 7}, {17, 13, 17, 5}, {17, 13, 7, 13}, {17, 13, 1, 1}, {1, 17, 1, 7}, {31, 3, 9, 11}, {17, 13, 17, 13},
+   {17, 13, 23, 19}, {17, 13, 9, 19}, {15, 11, 7, 7}, {17, 11, 8, 7}, {31, 11, 15, 7}, {33, 11, 16, 7}, {35, 11, 17, 7}}
+ };
  for (const bool enabled : {false, true}) {
   RgbImageResizer resizer(1, enabled);
   for (const auto& dims : sizes)

@@ -180,13 +180,10 @@ TEST_CASE("failed readback proof retains the actual source and registered receiv
  void* allocation = nullptr;
  CUDA_ASSERT_OK(cudaMalloc(&allocation, 16 * sizeof(float)));
  auto released = std::make_shared<std::atomic_bool>(false);
- auto source = at::from_blob(
-  allocation, {16},
-  [released](void* pointer) {
-   *released = true;
-   static_cast<void>(cudaFree(pointer));
-  },
-  at::TensorOptions().device(at::Device(at::kCUDA, 0)).dtype(at::kFloat));
+ auto source = at::from_blob(allocation, {16}, [released](void* pointer) {
+  *released = true;
+  static_cast<void>(cudaFree(pointer));
+ }, at::TensorOptions().device(at::Device(at::kCUDA, 0)).dtype(at::kFloat));
  source.fill_(2.0);
  void* receiver = nullptr;
  {

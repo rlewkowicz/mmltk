@@ -18,9 +18,9 @@ void RunWithRetainedCudaContext(std::shared_ptr<void> state, frameworks::gpu::Te
   gpu::TerminalCudaRetirementLease& lease;
  } custody{std::move(state), lease};
  gpu::CudaContextScope scope({&custody, [](void* value) noexcept {
-                               auto& owner = *static_cast<Custody*>(value);
-                               std::move(owner.lease).Install(gpu::TerminalCudaCustody::Share(std::move(owner.state)), cudaErrorUnknown);
-                              }});
+  auto& owner = *static_cast<Custody*>(value);
+  std::move(owner.lease).Install(gpu::TerminalCudaCustody::Share(std::move(owner.state)), cudaErrorUnknown);
+ }});
  try {
   scope.Run(operation);
  } catch (...) {

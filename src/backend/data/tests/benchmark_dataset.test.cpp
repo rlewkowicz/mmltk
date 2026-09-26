@@ -314,7 +314,8 @@ void test_benchmark_annotation_indexes() {
  REQUIRE(persisted.good());
  CHECK((slots == std::array<std::uint64_t, 6>{101U, 23U, 37U, 41U, 53U, 67U}));
  const nlohmann::json expected_rejections{
-  {"raw_records", 101U}, {"unmapped_categories", 23U}, {"unknown_images", 37U}, {"malformed_records", 41U}, {"degenerate_boxes", 53U}, {"duplicate_boxes", 67U}};
+  {"raw_records", 101U}, {"unmapped_categories", 23U}, {"unknown_images", 37U}, {"malformed_records", 41U}, {"degenerate_boxes", 53U}, {"duplicate_boxes", 67U}
+ };
  const auto manifest_path = root.path() / "manifest" / "rejections.json";
  write_json_atomically(manifest_path, {{"rejected_records", reject_json(parsed.rejected)}}, {});
  CHECK(read_json_file(manifest_path).at("rejected_records") == expected_rejections);
@@ -536,9 +537,9 @@ void test_benchmark_archive_training_quarantine() {
   .cancel_requested = {},
   .progress =
    [&](const std::uint64_t completed, const std::uint64_t total) {
-    progress_completed = completed;
-    progress_total = total;
-   },
+  progress_completed = completed;
+  progress_total = total;
+ },
   .validator = [](const std::uint64_t, const std::span<const std::uint8_t> encoded) { require_condition(has_complete_image_markers(encoded), "archive test JPEG is incomplete"); },
   .trace = {},
   .quarantine_unavailable = true,
@@ -704,7 +705,8 @@ void test_benchmark_cached_image_writer_and_loader() {
   // Acquired facts come from the real raw-cache fixture. The production
   // publication boundary owns the envelope and selected policy/version.
   const nlohmann::json acquired{
-   {"image_cache", nlohmann::json::array({raw_cache_identity})}, {"train", {{"bytes", fs::file_size(output)}}}, {"val", {{"bytes", fs::file_size(perceptual_request.output_path)}}}};
+   {"image_cache", nlohmann::json::array({raw_cache_identity})}, {"train", {{"bytes", fs::file_size(output)}}}, {"val", {{"bytes", fs::file_size(perceptual_request.output_path)}}}
+  };
   publish_benchmark_manifest(manifest_config, staged, image_root, acquired, {});
   const auto manifest = read_json_file(staged / "benchmark_manifest.json");
   CHECK(manifest.at("resampling").at("perceptual_downscale").get<bool>() == perceptual);
@@ -1087,10 +1089,12 @@ TEST_CASE("normalized slices preserve exact fields and owned storage", "[backend
  input.annotation_sha256 = "identity";
  input.rejected = {13, 2, 3, 4, 5, 6};
  input.images = {{30, 0, 2, 8, 4, 7, 0}, {10, 2, 0, 9, 5, 8, 0}, {20, 2, 1, 10, 6, 9, 0}, {40, 3, 1, 11, 7, 10, 0}};
- input.boxes = {{0.1F, 0.2F, 0.8F, 0.9F, 0, 2, 2, kAnnotationMask | kAnnotationCategory | kAnnotationId, {}, 4.5, 101, 3, 19},
+ input.boxes = {
+  {0.1F, 0.2F, 0.8F, 0.9F, 0, 2, 2, kAnnotationMask | kAnnotationCategory | kAnnotationId, {}, 4.5, 101, 3, 19},
   {0.2F, 0.3F, 0.7F, 0.8F, 2, 0, 3, kAnnotationMask | kAnnotationCategory, {}, 0, 0, 4, 23},
   {0.3F, 0.4F, 0.6F, 0.7F, 2, 2, 4, kAnnotationMask | kAnnotationCrowd | kAnnotationCategory, {}, 8.25, 0, 5, 29},
-  {0.4F, 0.5F, 0.8F, 0.9F, 4, 1, 5, kAnnotationMask | kAnnotationIgnore | kAnnotationCategory, {}, 1, 0, 6, 31}};
+  {0.4F, 0.5F, 0.8F, 0.9F, 4, 1, 5, kAnnotationMask | kAnnotationIgnore | kAnnotationCategory, {}, 1, 0, 6, 31}
+ };
  input.mask_rle_pairs = {{0, 2}, {5, 1}, {2, 3}, {9, 2}, {7, 1}};
  const auto original = input;
  std::vector<std::size_t> order{0, 1, 2, 3};
@@ -1244,10 +1248,12 @@ TEST_CASE("benchmark annotations retain provenance crowd area masks and determin
  mmltk::testsupport::ScopedTempDir root("faithful-benchmark");
  const auto path = root.path() / "annotations.json";
  nlohmann::json document{
-  {"images", {{{"id", 0}, {"width", 16}, {"height", 8}}}}, {"categories", {{{"id", 1}, {"name", "person"}}, {{"id", 2}, {"name", "human"}}}}, {"annotations", nlohmann::json::array()}};
+  {"images", {{{"id", 0}, {"width", 16}, {"height", 8}}}}, {"categories", {{{"id", 1}, {"name", "person"}}, {{"id", 2}, {"name", "human"}}}}, {"annotations", nlohmann::json::array()}
+ };
  for (unsigned ordinal = 0; ordinal != 128U; ++ordinal) {
-  document["annotations"].push_back({{"id", 127U - ordinal}, {"image_id", 0}, {"category_id", ordinal % 2U + 1U}, {"bbox", {-0.5, 1.25, 13.0, 5.5}}, {"area", 7.25}, {"iscrowd", ordinal % 2U},
-   {"ignore", true}, {"segmentation", nlohmann::json::array()}});
+  document["annotations"].push_back(
+   {{"id", 127U - ordinal}, {"image_id", 0}, {"category_id", ordinal % 2U + 1U}, {"bbox", {-0.5, 1.25, 13.0, 5.5}}, {"area", 7.25}, {"iscrowd", ordinal % 2U}, {"ignore", true},
+    {"segmentation", nlohmann::json::array()}});
  }
  document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
  write_text(path, document.dump());
@@ -1303,7 +1309,8 @@ TEST_CASE("benchmark semantic admission isolates malformed masks and numeric ove
  mmltk::testsupport::ScopedTempDir root("benchmark-admission");
  const auto path = root.path() / "annotations.json";
  nlohmann::json document{
-  {"images", {{{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}}}}, {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
+  {"images", {{{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}}}}, {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}
+ };
  const nlohmann::json base{{"image_id", 0}, {"category_id", 1}, {"bbox", {-0.5, 1.25, 13.0, 5.5}}};
  const auto append = [&](nlohmann::json record) { document["annotations"].push_back(std::move(record)); };
  auto record = base;
@@ -1418,8 +1425,10 @@ TEST_CASE("normalized benchmark caches require source category presence", "[back
 TEST_CASE("benchmark supplied bbox admission precedes mask materialization", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("bbox-first-admission");
  const auto path = root.path() / "annotations.json";
- nlohmann::ordered_json document{{"images", {{{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}}, {{"id", 1}, {"width", 4096}, {"height", 4096}, {"file_name", "patch0/1.jpg"}}}},
-  {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::ordered_json::array()}};
+ nlohmann::ordered_json document{
+  {"images", {{{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}}, {{"id", 1}, {"width", 4096}, {"height", 4096}, {"file_name", "patch0/1.jpg"}}}},
+  {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::ordered_json::array()}
+ };
  // Invalid compressed RLE must not override a supplied degenerate bbox.
  document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"bbox", {0, 0, 0, 1}}, {"segmentation", {{"size", {8, 16}}, {"counts", "!"}}}});
  // This valid all-background mask would otherwise allocate 16 MiB.
@@ -1431,7 +1440,8 @@ TEST_CASE("benchmark supplied bbox admission precedes mask materialization", "[b
  // Decode-time failures must remain irrelevant to a degenerate supplied box,
  // even when segmentation is encountered before the box and identities.
  const std::array<nlohmann::ordered_json, 3> invalid_segmentations{
-  nlohmann::ordered_json(false), nlohmann::ordered_json{{"size", {8, 16}}}, nlohmann::ordered_json::array({nlohmann::ordered_json::array({0, 0, 1})})};
+  nlohmann::ordered_json(false), nlohmann::ordered_json{{"size", {8, 16}}}, nlohmann::ordered_json::array({nlohmann::ordered_json::array({0, 0, 1})})
+ };
  for (const auto& segmentation : invalid_segmentations) {
   for (const bool segmentation_first : {false, true}) {
    for (const int bbox_width : {0, 1}) {
@@ -1524,8 +1534,9 @@ TEST_CASE("generic and benchmark writers share complete format headers", "[backe
  prepare_cached_image_directory(image_root);
  write_cached_image_atomically(cached_image_path(image_root, 1U), make_jpeg(128U, 64U, 32U), {});
  for (const auto mode : {resize::ImageResizeMode::Stretch, resize::ImageResizeMode::Letterbox}) {
-  for (const std::string& annotation : {std::string{}, std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":""})"},
-        std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"17:3 33:3 49:3"})"}}) {
+  for (const std::string& annotation :
+   {std::string{}, std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":""})"},
+    std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"17:3 33:3 49:3"})"}}) {
    write_text(fs::path(fixtures::dataset_dir(fixture)) / "train/000001.jsonl", annotation);
    auto config = fixtures::compiler_config(fixture);
    config.num_workers = 1;
@@ -1696,9 +1707,11 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
 TEST_CASE("parser workers reset segmentation scratch across masks rejections and dimension changes", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("segmentation-scratch");
  const auto path = root.path() / "annotations.json";
- nlohmann::json document{{"images", {{{"id", 1}, {"width", 16}, {"height", 8}, {"file_name", "patch0/1.jpg"}}, {{"id", 2}, {"width", 4}, {"height", 4}, {"file_name", "patch0/2.jpg"}},
-                                     {{"id", 3}, {"width", 4}, {"height", 4}, {"file_name", "patch0/3.jpg"}}}},
-  {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
+ nlohmann::json document{
+  {"images", {{{"id", 1}, {"width", 16}, {"height", 8}, {"file_name", "patch0/1.jpg"}}, {{"id", 2}, {"width", 4}, {"height", 4}, {"file_name", "patch0/2.jpg"}},
+              {{"id", 3}, {"width", 4}, {"height", 4}, {"file_name", "patch0/3.jpg"}}}},
+  {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}
+ };
  for (unsigned cycle = 0U; cycle < 256U; ++cycle)
   for (unsigned kind = 0U; kind < 7U; ++kind) {
    const bool small = (cycle + kind) % 2U != 0U;
@@ -1823,12 +1836,10 @@ TEST_CASE("benchmark sink setup failure reports once without creating a sink", "
 }
 TEST_CASE("archive write progress orders late batches within one attempt", "[backend][data][benchmark][progress]") {
  std::vector<std::uint64_t> observed;
- CachedImageWriteProgress progress(
-  [&](const auto completed, const auto total) {
-   CHECK(total == 400U);
-   observed.push_back(completed);
-  },
-  16U, 384U);
+ CachedImageWriteProgress progress([&](const auto completed, const auto total) {
+  CHECK(total == 400U);
+  observed.push_back(completed);
+ }, 16U, 384U);
  std::promise<void> newer_published;
  auto newer = newer_published.get_future();
  auto old_batch = std::async(std::launch::async, [&] {
@@ -1846,14 +1857,12 @@ TEST_CASE("source count additions serialize publication and permit retry withdra
  BenchmarkCompileProgress latest;
  std::vector<std::uint64_t> counts;
  mmltk::testsupport::TestGate first("first source publication");
- ProgressReporter progress(
-  [&](const auto& update) {
-   latest = update;
-   const auto count = update.sources[1].completed_images;
-   counts.push_back(count);
-   if (count == 128U) { first.receipt().ArriveAndWait(); }
-  },
-  quiet);
+ ProgressReporter progress([&](const auto& update) {
+  latest = update;
+  const auto count = update.sources[1].completed_images;
+  counts.push_back(count);
+  if (count == 128U) { first.receipt().ArriveAndWait(); }
+ }, quiet);
  const auto source = BenchmarkDatasetSource::kObjects365V2;
  progress.phase(DatasetCompilePhase::Extracting);
  auto first_add = std::async(std::launch::async, [&] { progress.transfers().images(source, "first", 128U, 512U, progress); });
@@ -1887,7 +1896,8 @@ TEST_CASE("archive image reuse reports initial and resolved counts without repla
   const RetainedArtifact retained{cached_image_path(images, 1U)};
   const std::vector<std::uint64_t> ids{1U, 2U};
   std::vector<std::uint64_t> counts;
-  ArchiveExtractionRequest request{.archive_path = archive,
+  ArchiveExtractionRequest request{
+   .archive_path = archive,
    .source_identity = "fixture:reuse",
    .output_root = images,
    .source = "objects365",
@@ -1896,15 +1906,16 @@ TEST_CASE("archive image reuse reports initial and resolved counts without repla
    .image_id_parser = [](const std::string_view name) -> std::optional<std::uint64_t> { return name.ends_with("/2.jpg") ? std::optional<std::uint64_t>{2U} : std::nullopt; },
    .progress =
     [&](const auto completed, const auto total) {
-     CHECK(total == 2U);
-     counts.push_back(completed);
-    },
+   CHECK(total == 2U);
+   counts.push_back(completed);
+  },
    .validator =
     [](const auto, const auto encoded) {
-     if (!has_complete_image_markers(encoded)) { throw std::runtime_error("invalid cached JPEG"); }
-    },
+   if (!has_complete_image_markers(encoded)) { throw std::runtime_error("invalid cached JPEG"); }
+  },
    .decompression_workers = 0U,
-   .cache_write_workers = workers};
+   .cache_write_workers = workers
+  };
   auto result = extract_selected_archive_images(request);
   REQUIRE_FALSE(counts.empty());
   CHECK(counts.front() == 1U);
@@ -2043,26 +2054,28 @@ TEST_CASE("batched image writes settle before cancellation and preserve successf
   }
   std::atomic<bool> cancelled{false};
   std::vector<std::uint64_t> counts;
-  ArchiveExtractionRequest request{.archive_path = archive,
+  ArchiveExtractionRequest request{
+   .archive_path = archive,
    .source_identity = "fixture:batch",
    .output_root = root.path() / "images",
    .source = "objects365",
    .shard = "patch-0",
    .selected_image_ids = ids,
    .image_id_parser = [](const std::string_view name) -> std::optional<std::uint64_t> {
-    const auto digits = name.substr(name.find_last_of('/') + 1U);
-    std::uint64_t id = 0U;
-    const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size() - 4U, id);
-    return parsed.ec == std::errc{} ? std::optional<std::uint64_t>{id} : std::nullopt;
-   },
+   const auto digits = name.substr(name.find_last_of('/') + 1U);
+   std::uint64_t id = 0U;
+   const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size() - 4U, id);
+   return parsed.ec == std::errc{} ? std::optional<std::uint64_t>{id} : std::nullopt;
+  },
    .cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled),
    .progress =
     [&](const auto completed, const auto) {
-     counts.push_back(completed);
-     if (cancel_after_batch && completed >= 128U) { cancelled.store(true); }
-    },
+   counts.push_back(completed);
+   if (cancel_after_batch && completed >= 128U) { cancelled.store(true); }
+  },
    .decompression_workers = 0U,
-   .cache_write_workers = 3U};
+   .cache_write_workers = 3U
+  };
   if (cancel_after_batch) {
    CHECK_THROWS(extract_selected_archive_images(request));
    CHECK_FALSE(fs::exists(request.output_root / ".complete.json"));
@@ -2132,16 +2145,13 @@ TEST_CASE("discarded segmented state retains the typed re-download context durin
   if (event == "benchmark.download.segmented_fallback") { saw_discarded_state = nlohmann::json::parse(fields).at("redownload").get<bool>(); }
   if (event == "benchmark.download.complete") { saw_completion = nlohmann::json::parse(fields).at("redownload").get<bool>(); }
  });
- const auto downloaded = download_artifacts(
-  {request}, 2U, {},
-  [&](const DownloadProgress& update) {
-   if (update.redownload) {
-    saw_redownload = true;
-    CHECK(update.transfer.retained_bytes == 0U);
-    CHECK_FALSE(update.transfer.resumed);
-   }
-  },
-  trace);
+ const auto downloaded = download_artifacts({request}, 2U, {}, [&](const DownloadProgress& update) {
+  if (update.redownload) {
+   saw_redownload = true;
+   CHECK(update.transfer.retained_bytes == 0U);
+   CHECK_FALSE(update.transfer.resumed);
+  }
+ }, trace);
  REQUIRE(downloaded.size() == 1U);
  CHECK(saw_discarded_state);
  CHECK(saw_redownload);
@@ -2296,37 +2306,29 @@ TEST_CASE("annotation retries distinguish source corruption from local capacity 
   remove_cache_path(completion);
  };
  SECTION("typed storage exhaustion never invalidates completed source files") {
-  CHECK_THROWS_AS(retry_annotation_indexing(
-                   cancellation,
+  CHECK_THROWS_AS(retry_annotation_indexing(cancellation,
                    [&] {
-                    ++bodies;
-                    throw InsufficientBenchmarkStorage("fixture capacity");
-                   },
-                   repair),
+   ++bodies;
+   throw InsufficientBenchmarkStorage("fixture capacity");
+  }, repair),
    InsufficientBenchmarkStorage);
   CHECK(bodies == 1);
   CHECK(repairs == 0);
  }
  SECTION("cancellation never enters source repair") {
-  CHECK_THROWS(retry_annotation_indexing(
-   cancellation,
-   [&] {
-    ++bodies;
-    cancel = true;
-    throw std::runtime_error("interrupted parse");
-   },
-   repair));
+  CHECK_THROWS(retry_annotation_indexing(cancellation, [&] {
+   ++bodies;
+   cancel = true;
+   throw std::runtime_error("interrupted parse");
+  }, repair));
   CHECK(bodies == 1);
   CHECK(repairs == 0);
  }
  SECTION("source corruption has exactly three bodies and two repairs") {
-  CHECK_THROWS(retry_annotation_indexing(
-   cancellation,
-   [&] {
-    ++bodies;
-    throw std::runtime_error("malformed source");
-   },
-   [&](const std::exception&) { ++repairs; }));
+  CHECK_THROWS(retry_annotation_indexing(cancellation, [&] {
+   ++bodies;
+   throw std::runtime_error("malformed source");
+  }, [&](const std::exception&) { ++repairs; }));
   CHECK(bodies == 3);
   CHECK(repairs == 2);
  }
@@ -2427,15 +2429,16 @@ TEST_CASE("one-worker image readiness resizes before archive completion and reus
  const BenchmarkTraceSink quiet;
  ProgressReporter progress([&](const auto& value) { observed = value; }, quiet);
  progress.pixels(0, 1);
- write.progress = {.context = &progress,
-  .image_completed = [](void* context) { static_cast<ProgressReporter*>(context)->pixel_completed(); },
-  .images_invalidated = [](void* context, std::uint64_t count) { static_cast<ProgressReporter*>(context)->invalidate_pixels(count); }};
+ write.progress = {.context = &progress, .image_completed = [](void* context) {
+  static_cast<ProgressReporter*>(context)->pixel_completed();
+ }, .images_invalidated = [](void* context, std::uint64_t count) { static_cast<ProgressReporter*>(context)->invalidate_pixels(count); }};
  BenchmarkSplitWriter writer(write);
  BenchmarkCompilePipeline pipeline(1);
  pipeline.register_split(writer, membership);
  const std::array<std::uint64_t, 1> ids{1};
  std::size_t ready_count = 0;
- ArchiveExtractionRequest acquisition{.archive_path = archive,
+ ArchiveExtractionRequest acquisition{
+  .archive_path = archive,
   .source_identity = "ready-fixture",
   .output_root = images,
   .source = "coco",
@@ -2443,7 +2446,8 @@ TEST_CASE("one-worker image readiness resizes before archive completion and reus
   .selected_image_ids = ids,
   .image_id_parser = [](std::string_view name) -> std::optional<std::uint64_t> { return name.ends_with("/1.jpg") ? std::optional<std::uint64_t>{1} : std::nullopt; },
   .decompression_workers = 0,
-  .cache_write_workers = 0};
+  .cache_write_workers = 0
+ };
  acquisition.image_ready = [&](const CachedImageReady& image) {
   pipeline.image_ready(image);
   ++ready_count;
@@ -2487,19 +2491,21 @@ TEST_CASE("cache readiness failure joins held publication and retains completed 
  const std::array<std::uint64_t, 2> ids{1, 2};
  mmltk::testsupport::TestGate failing("failing cache publication"), held("held cache publication");
  std::promise<void> failure_delivered;
- ArchiveExtractionRequest request{.archive_path = archive,
+ ArchiveExtractionRequest request{
+  .archive_path = archive,
   .source_identity = "ready-failure-fixture",
   .output_root = images,
   .source = "coco",
   .shard = "train2017",
   .selected_image_ids = ids,
   .image_id_parser = [](std::string_view name) -> std::optional<std::uint64_t> {
-   if (name.ends_with("/1.jpg")) return 1;
-   if (name.ends_with("/2.jpg")) return 2;
-   return std::nullopt;
-  },
+  if (name.ends_with("/1.jpg")) return 1;
+  if (name.ends_with("/2.jpg")) return 2;
+  return std::nullopt;
+ },
   .decompression_workers = 0,
-  .cache_write_workers = 2};
+  .cache_write_workers = 2
+ };
  request.image_ready = [&](const CachedImageReady& image) {
   require_condition(fs::file_size(cached_image_path(image.root, image.image_id)) == jpeg.size(), "readiness preceded durable image publication");
   if (image.image_id == 1) {
@@ -2639,13 +2645,13 @@ TEST_CASE("pipeline failure retires queued custody and drains active readers bef
  auto request = benchmark_write_request(membership, root.path() / "result.bin", 8);
  request.num_workers = 2;
  request.progress = {.context = &completion, .image_completed = [](void* opaque) {
-                      auto& state = *static_cast<Completion*>(opaque);
-                      if (state.count.fetch_add(1) == 0) {
-                       state.first.ArriveAndWait();
-                       throw std::runtime_error("injected pixel completion failure");
-                      }
-                      state.second.ArriveAndWait();
-                     }};
+  auto& state = *static_cast<Completion*>(opaque);
+  if (state.count.fetch_add(1) == 0) {
+   state.first.ArriveAndWait();
+   throw std::runtime_error("injected pixel completion failure");
+  }
+  state.second.ArriveAndWait();
+ }};
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline pipeline(6);
  pipeline.register_split(writer, membership);

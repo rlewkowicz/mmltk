@@ -19,13 +19,15 @@
 namespace mmltk::controller {
 VisualDiagnosticFact presentation_diagnostic_fact(const VisualDiagnosticOperation operation, const PresentationDiagnosticRecord& record, const int device, const std::uint64_t outcome) noexcept {
  const auto& capability = record.publication.capability;
- return {.system = contracts::DiagnosticOwner::Presentation,
+ return {
+  .system = contracts::DiagnosticOwner::Presentation,
   .operation = operation,
   .device = device,
   .generation = capability.generation,
   .value = record.publication.presentation_revision,
   .detail = outcome,
-  .context = {.capacity_width = capability.extent.width,
+  .context = {
+   .capacity_width = capability.extent.width,
    .capacity_height = capability.extent.height,
    .surface_high = capability.surface_high,
    .surface_low = capability.surface_low,
@@ -37,7 +39,9 @@ VisualDiagnosticFact presentation_diagnostic_fact(const VisualDiagnosticOperatio
    .publication = {.presentation_revision = record.publication.presentation_revision},
    .allocation = {.allocation_generation = capability.generation},
    .transfer = {.transfer_sequence = record.publication.transfer_sequence, .timeline_ready = record.publication.timeline_ready},
-   .link = record.link}};
+   .link = record.link
+  }
+ };
 }
 namespace gpu = mmltk::frameworks::gpu;
 class PresentationSystem::Impl final {
@@ -226,14 +230,14 @@ private:
    if (in_flight_ && diagnostics_.valid()) pump_source = visual_diagnostic_source(in_flight_->observation);
   }
   services::RuntimeDiagnosticSpan pump_span{pump_frame_revision != 0U ? diagnostics_ : VisualDiagnosticSink{}, [&] {
-                                             return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Presentation,
-                                                                                .operation = VisualDiagnosticOperation::PresentationPumpStarted,
-                                                                                .device = settings_.device,
-                                                                                .generation = pump_generation,
-                                                                                .value = pump_frame_revision,
-                                                                                .context = {.selection_generation = pump_generation, .source = pump_source}},
-                                              VisualDiagnosticOperation::PresentationPumpCompleted);
-                                            }};
+   return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Presentation,
+                                      .operation = VisualDiagnosticOperation::PresentationPumpStarted,
+                                      .device = settings_.device,
+                                      .generation = pump_generation,
+                                      .value = pump_frame_revision,
+                                      .context = {.selection_generation = pump_generation, .source = pump_source}},
+    VisualDiagnosticOperation::PresentationPumpCompleted);
+  }};
   const PresentationNativeOutcome outcome = writer_->Pump(pump_generation);
   pump_span.FinishWith([&](auto& fact) { fact.detail = static_cast<std::uint64_t>(outcome.progress); });
   bool superseded_source_advanced = false;
@@ -312,14 +316,16 @@ private:
      .generation = capability_snapshot.capability.generation,
      .value = capability_snapshot.revision,
      .detail = static_cast<std::uint64_t>(capability_snapshot.capability.condition),
-     .context = {.capacity_width = capability_snapshot.capability.extent.width,
+     .context = {
+      .capacity_width = capability_snapshot.capability.extent.width,
       .capacity_height = capability_snapshot.capability.extent.height,
       .surface_high = capability_snapshot.capability.surface_high,
       .surface_low = capability_snapshot.capability.surface_low,
       .selection_generation = pump_generation,
       .frame_revision = pump_frame_revision,
       .condition = static_cast<std::uint64_t>(capability_snapshot.capability.condition),
-      .outcome = 1U},
+      .outcome = 1U
+     },
     };
    });
    Publish(event_type{PresentationCapabilityChanged{capability_snapshot}});

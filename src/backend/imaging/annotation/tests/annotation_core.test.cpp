@@ -600,8 +600,9 @@ TEST_CASE("test_dense_source_catalog_reorder_preserves_jsonl_meaning", "[backend
  write_text_file(root / "empty.jsonl", "");
  REQUIRE(load_annotation_scene_objects(root / "empty.jsonl", &categories).empty());
  REQUIRE(categories.items.size() == 3U);
- for (const auto text : {R"({"classes":[{"id":0,"name":"same"},{"id":1,"name":"same"}]})", R"({"classes":[{"id":1,"name":"a"},{"id":1,"name":"b"}]})",
-       R"({"classes":[{"id":1,"name":"a"},{"id":3,"name":"b"}]})", R"({"classes":[{"id":0,"name":""}]})"}) {
+ for (const auto text :
+  {R"({"classes":[{"id":0,"name":"same"},{"id":1,"name":"same"}]})", R"({"classes":[{"id":1,"name":"a"},{"id":1,"name":"b"}]})", R"({"classes":[{"id":1,"name":"a"},{"id":3,"name":"b"}]})",
+   R"({"classes":[{"id":0,"name":""}]})"}) {
   write_text_file(root / "categories.json", text);
   REQUIRE_THROWS(load_annotation_categories(root));
  }

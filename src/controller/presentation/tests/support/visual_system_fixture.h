@@ -158,14 +158,13 @@ public:
   const auto& target = Contains(active_, width, height) ? *active_ : *candidate_;
   reader_ = std::addressof(reader);
   pending_ = PresentationPublication{
-   .capability =
-    {
-     .surface_high = 1U,
-     .surface_low = target.generation,
-     .extent = {target.width, target.height},
-     .generation = target.generation,
-     .condition = PresentationCapabilityCondition::Ready,
-    },
+   .capability = {
+    .surface_high = 1U,
+    .surface_low = target.generation,
+    .extent = {target.width, target.height},
+    .generation = target.generation,
+    .condition = PresentationCapabilityCondition::Ready,
+   },
   };
  }
  PresentationNativeOutcome Pump(const std::uint64_t current_selection_generation) override {
@@ -304,18 +303,17 @@ public:
  [[nodiscard]] VisualDiagnosticSink sink() noexcept {
   return {
    .context = this,
-   .write =
-    [](void* context, const VisualDiagnosticFact fact) noexcept {
-     auto& capture = *static_cast<DiagnosticCapture*>(context);
-     capture.last_system.store(fact.system, std::memory_order_release);
-     if (fact.operation == VisualDiagnosticOperation::StaleThumbnailDiscarded) capture.stale_discarded.fetch_add(fact.value, std::memory_order_acq_rel);
-     if (fact.operation == VisualDiagnosticOperation::UpscaleResultReused) {
-      capture.reused_revision.store(fact.value, std::memory_order_release);
-      capture.reused_meaning.store(fact.context.document_meaning_identity, std::memory_order_release);
-      capture.reused_observation.store(fact.context.observation_revision, std::memory_order_release);
-     }
-     capture.count.fetch_add(1U, std::memory_order_acq_rel);
-    },
+   .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
+   auto& capture = *static_cast<DiagnosticCapture*>(context);
+   capture.last_system.store(fact.system, std::memory_order_release);
+   if (fact.operation == VisualDiagnosticOperation::StaleThumbnailDiscarded) capture.stale_discarded.fetch_add(fact.value, std::memory_order_acq_rel);
+   if (fact.operation == VisualDiagnosticOperation::UpscaleResultReused) {
+    capture.reused_revision.store(fact.value, std::memory_order_release);
+    capture.reused_meaning.store(fact.context.document_meaning_identity, std::memory_order_release);
+    capture.reused_observation.store(fact.context.observation_revision, std::memory_order_release);
+   }
+   capture.count.fetch_add(1U, std::memory_order_acq_rel);
+  },
   };
  }
  // CLEANUP-OFF: These named trace assertions are independent domain evidence, not physical fake-backend
@@ -364,9 +362,9 @@ template <class System>
   .source = system.snapshot().frame.source,
   .observe =
    [&system] {
-    const auto snapshot = system.snapshot();
-    return VisualSourceObservation{.frame = snapshot.frame, .snapshot_revision = snapshot.revision};
-   },
+  const auto snapshot = system.snapshot();
+  return VisualSourceObservation{.frame = snapshot.frame, .snapshot_revision = snapshot.revision};
+ },
   .borrow = [&system] { return system.BorrowFrame(); },
  };
 }
@@ -421,9 +419,9 @@ public:
    .source = identity_,
    .observe =
     [this] {
-     std::scoped_lock lock(mutex_);
-     return VisualSourceObservation{.frame = frame_, .snapshot_revision = snapshot_revision_};
-    },
+   std::scoped_lock lock(mutex_);
+   return VisualSourceObservation{.frame = frame_, .snapshot_revision = snapshot_revision_};
+  },
    .borrow = [this] { return runtime_.Borrow(); },
   };
  }
@@ -458,11 +456,11 @@ public:
     .source = identity,
     .observe =
      [identity, extent] {
-      return VisualSourceObservation{
-       .frame = visual_frame(identity, extent, 1U),
-       .snapshot_revision = 1U,
-      };
-     },
+    return VisualSourceObservation{
+     .frame = visual_frame(identity, extent, 1U),
+     .snapshot_revision = 1U,
+    };
+   },
     .borrow = [private_runtime] { return private_runtime->Borrow(); },
    });
   }

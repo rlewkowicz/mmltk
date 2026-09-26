@@ -45,19 +45,17 @@ public:
   if (state_.running) throw contracts::BusyError("Live is already running");
   const auto admitted_revision = contracts::next_compute_generation(state_.revision);
   if (!admitted_revision) throw contracts::FailedError("Live observation revision exhausted");
-  if (!worker_.SubmitDiscrete(
-       [this, request, cadence](mmltk::frameworks::gpu::SystemImageRuntime& runtime, const std::stop_token) -> detail::VisualRuntimeOwner::Notification {
-        auto* const algorithm = dynamic_cast<LiveAlgorithm*>(runtime.model());
-        if (algorithm == nullptr) throw std::runtime_error("Live capture data plane is unavailable");
-        algorithm->SetOutputAvailableSink([this] { static_cast<void>(worker_.NotifyContinuation()); });
-        algorithm->Start(request);
-        request_ = request;
-        cadence_ = cadence;
-        next_capture_ = {};
-        static_cast<void>(worker_.NotifyContinuation());
-        return {};
-       },
-       [this] { Settle(nullptr); })) {
+  if (!worker_.SubmitDiscrete([this, request, cadence](mmltk::frameworks::gpu::SystemImageRuntime& runtime, const std::stop_token) -> detail::VisualRuntimeOwner::Notification {
+   auto* const algorithm = dynamic_cast<LiveAlgorithm*>(runtime.model());
+   if (algorithm == nullptr) throw std::runtime_error("Live capture data plane is unavailable");
+   algorithm->SetOutputAvailableSink([this] { static_cast<void>(worker_.NotifyContinuation()); });
+   algorithm->Start(request);
+   request_ = request;
+   cadence_ = cadence;
+   next_capture_ = {};
+   static_cast<void>(worker_.NotifyContinuation());
+   return {};
+  }, [this] { Settle(nullptr); })) {
    throw contracts::BusyError("Live is already running");
   }
   state_.running = true;
@@ -173,7 +171,8 @@ private:
   worker_.NotifyContinuationAt(next_capture_);
   diagnostics_.Emit([&] {
    return VisualDiagnosticFact{
-    .system = contracts::DiagnosticOwner::Live, .operation = VisualDiagnosticOperation::FrameCompleted, .device = settings_.device, .generation = runtime.OutputFacts().revision};
+    .system = contracts::DiagnosticOwner::Live, .operation = VisualDiagnosticOperation::FrameCompleted, .device = settings_.device, .generation = runtime.OutputFacts().revision
+   };
   });
   return [this] { PublishFrame(); };
  }

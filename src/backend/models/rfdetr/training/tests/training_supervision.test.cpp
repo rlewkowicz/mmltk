@@ -209,7 +209,8 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
  mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
  readback.Begin();
  const std::vector<rfdetr::NormalizedModelStateEntry> entries{
-  {"backbone.weight", torch::ones({1})}, {"training_supervision.query_projection.weight", torch::ones({1})}, {"training_supervision.mask_projection.weight", torch::ones({2, 2})}};
+  {"backbone.weight", torch::ones({1})}, {"training_supervision.query_projection.weight", torch::ones({1})}, {"training_supervision.mask_projection.weight", torch::ones({2, 2})}
+ };
  rfdetr::detail::reserve_state_archive(entries, readback, 0);
  torch::serialize::OutputArchive output;
  rfdetr::detail::write_training_supervision_config(output, config);
@@ -617,14 +618,16 @@ void test_copy_paste_cache_publication_recovers_without_targets() {
  constexpr RLEPair run{0, 64};
  const std::array<mmltk::backend::data::LabelIndexEntry, 2> entries{{{0, 1, 0}, {0, 0, 0}}};
  const std::array<std::uint32_t, 1> donor_index{0}, source_index{1};
- const mmltk::backend::data::Batch donor{.num_images = 1,
+ const mmltk::backend::data::Batch donor{
+  .num_images = 1,
   .device_images = donor_pixels.data_ptr<float>(),
   .label_index = entries.data(),
   .labels = &instance,
   .rle_pairs = &run,
   .image_indices = donor_index.data(),
   .slot_index = 0,
-  .lease_id = 0};
+  .lease_id = 0
+ };
  auto source = donor;
  source.device_images = source_pixels.data_ptr<float>();
  source.image_indices = source_index.data();
@@ -899,20 +902,24 @@ void test_copy_paste_ring_support_and_cache_cycles() {
  for (std::size_t i = 0; i < dot_runs.size(); ++i) {
   const auto x = static_cast<int>(dot_runs[i].start % 8);
   const auto y = static_cast<int>(dot_runs[i].start / 8);
-  labels[i] = {static_cast<std::uint8_t>(i), mmltk::backend::data::kAnnotationMask, static_cast<float>(x), static_cast<float>(y), static_cast<float>(x + dot_runs[i].length), static_cast<float>(y + 1),
-   static_cast<std::uint32_t>(i * sizeof(RLEPair)), 1};
+  labels[i] = {
+   static_cast<std::uint8_t>(i), mmltk::backend::data::kAnnotationMask, static_cast<float>(x), static_cast<float>(y), static_cast<float>(x + dot_runs[i].length), static_cast<float>(y + 1),
+   static_cast<std::uint32_t>(i * sizeof(RLEPair)), 1
+  };
  }
  labels.back() = {7, mmltk::backend::data::kAnnotationMask, 1, 1, 7, 7, dot_runs.size() * sizeof(RLEPair), static_cast<std::uint16_t>(ring_runs.size())};
  const std::array<mmltk::backend::data::LabelIndexEntry, 3> entries{{{0, 7, 0}, {7, 1, 0}, {0, 0, 0}}};
  const std::array<std::uint32_t, 1> source_index{0}, donor_index{1}, empty_index{2};
- auto batch = mmltk::backend::data::Batch{.num_images = 1,
+ auto batch = mmltk::backend::data::Batch{
+  .num_images = 1,
   .device_images = donor_pixels.data_ptr<float>(),
   .label_index = entries.data(),
   .labels = labels.data(),
   .rle_pairs = runs.data(),
   .image_indices = donor_index.data(),
   .slot_index = 0,
-  .lease_id = 0};
+  .lease_id = 0
+ };
  std::vector<float> centers;
  for (int y = 0; y < 8; ++y)
   for (int x = 0; x < 8; ++x) {
@@ -1093,7 +1100,8 @@ void test_native_augmentation_preview_target_support_parity() {
  const std::array<mmltk::backend::data::LabelIndexEntry, 1> entries{{{0, 1, 0}}};
  const std::array<std::uint32_t, 1> indices{0};
  const mmltk::backend::data::Batch batch{
-  .num_images = 1, .device_images = nullptr, .label_index = entries.data(), .labels = &source, .rle_pairs = runs.data(), .image_indices = indices.data(), .slot_index = 0, .lease_id = 0};
+  .num_images = 1, .device_images = nullptr, .label_index = entries.data(), .labels = &source, .rle_pairs = runs.data(), .image_indices = indices.data(), .slot_index = 0, .lease_id = 0
+ };
  for (const bool include_masks : {false, true})
   for (const bool erase_all : {false, true}) {
    rfdetr::AugmentationBatchPlan plan;
@@ -1148,7 +1156,8 @@ void test_tiny_mask_training_outer_edges() {
  for (const auto run : {RLEPair{0, 1}, RLEPair{7, 1}, RLEPair{24, 1}, RLEPair{31, 1}, RLEPair{11, 1}, RLEPair{11, 2}, RLEPair{10, 4}}) {
   const PackedInstance source{0, mmltk::backend::data::kAnnotationMask, 0, 0, 8, 4, 0, 1};
   const mmltk::backend::data::Batch batch{
-   .num_images = 1, .device_images = nullptr, .label_index = entries.data(), .labels = &source, .rle_pairs = &run, .image_indices = indices.data(), .slot_index = 0, .lease_id = 0};
+   .num_images = 1, .device_images = nullptr, .label_index = entries.data(), .labels = &source, .rle_pairs = &run, .image_indices = indices.data(), .slot_index = 0, .lease_id = 0
+  };
   for (int geometry = 0; geometry < 4; ++geometry)
    for (const bool masks : {false, true}) {
     CAPTURE(run.start, run.length, geometry, masks);
@@ -1197,14 +1206,16 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
  }
  constexpr std::array labels{mmltk::backend::data::PackedInstance{0U, mmltk::backend::data::kAnnotationMask, 0, 0, extent, extent, 0U, 1U}};
  constexpr std::array rle{mmltk::backend::data::RLEPair{0U, extent * extent}};
- const mmltk::backend::data::Batch batch{.num_images = count,
+ const mmltk::backend::data::Batch batch{
+  .num_images = count,
   .device_images = pixels.data_ptr<float>(),
   .label_index = label_index.data(),
   .labels = labels.data(),
   .rle_pairs = rle.data(),
   .image_indices = indices.data(),
   .slot_index = 0U,
-  .lease_id = 0U};
+  .lease_id = 0U
+ };
  rfdetr::test_support::AugmentationExecution execution_augmenter(0);
  rfdetr::GpuBatchAugmenter augmenter(rfdetr::test_support::spatial_occlusion_config(), count, extent, extent, execution_augmenter.context);
  const auto image = augmenter.run(batch, 53U, 0, 0, 0U);
@@ -1387,21 +1398,21 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
  const std::array routes{
   rfdetr::TrainingSupervisionConfig{},
   [] {
-   rfdetr::TrainingSupervisionConfig value;
-   value.assignment = rfdetr::TrainAssignmentKind::MatchFree;
-   return value;
-  }(),
+  rfdetr::TrainingSupervisionConfig value;
+  value.assignment = rfdetr::TrainAssignmentKind::MatchFree;
+  return value;
+ }(),
   [] {
-   rfdetr::TrainingSupervisionConfig value;
-   value.denoising.enabled = true;
-   return value;
-  }(),
+  rfdetr::TrainingSupervisionConfig value;
+  value.denoising.enabled = true;
+  return value;
+ }(),
   [] {
-   rfdetr::TrainingSupervisionConfig value;
-   value.assignment = rfdetr::TrainAssignmentKind::MatchFree;
-   value.denoising.enabled = true;
-   return value;
-  }(),
+  rfdetr::TrainingSupervisionConfig value;
+  value.assignment = rfdetr::TrainAssignmentKind::MatchFree;
+  value.denoising.enabled = true;
+  return value;
+ }(),
  };
  const auto require_selected_evaluation = [&fixture](const rfdetr::TrainRequest& request, const rfdetr::TrainRunResult& result) {
   std::ifstream metrics(request.output_dir / "metrics.jsonl");
@@ -1607,8 +1618,10 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
      rfdetr::testsupport::copy_checkpoint_archive(source, incomplete, missing);
      reject_checkpoint(incomplete, missing);
     }
-    const std::array<std::pair<const char*, c10::IValue>, 4> invalid{{{"epoch", std::string("wrong-type")}, {"grad_scaler_scale", 0.0}, {"training_configuration_cbor", int64_t{1}},
-     {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'x')}}};
+    const std::array<std::pair<const char*, c10::IValue>, 4> invalid{
+     {{"epoch", std::string("wrong-type")}, {"grad_scaler_scale", 0.0}, {"training_configuration_cbor", int64_t{1}},
+      {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'x')}}
+    };
     for (const auto& [key, value] : invalid) {
      torch::serialize::InputArchive source;
      source.load_from(archive_path.string(), torch::Device(torch::kCPU));
@@ -1675,7 +1688,8 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
   mixed.lane_configuration.final_policy = rfdetr::TrainFinalPolicy::Off;
   rfdetr::resize_training_models(mixed.lane_configuration, 5, mixed.recipe, mixed.seed);
   const std::array optimizers{
-   rfdetr::TrainOptimizerKind::AdamW, rfdetr::TrainOptimizerKind::Muon, rfdetr::TrainOptimizerKind::SGD, rfdetr::TrainOptimizerKind::AdamW, rfdetr::TrainOptimizerKind::Muon};
+   rfdetr::TrainOptimizerKind::AdamW, rfdetr::TrainOptimizerKind::Muon, rfdetr::TrainOptimizerKind::SGD, rfdetr::TrainOptimizerKind::AdamW, rfdetr::TrainOptimizerKind::Muon
+  };
   for (std::size_t i = 0; i < optimizers.size(); ++i) {
    auto& recipe = mixed.lane_configuration.models[i].recipe;
    recipe.optimizer = optimizers[i];
@@ -1868,7 +1882,8 @@ TEST_CASE("perceptual augmentation admits actual Torch suballocations and reject
   torch::Tensor input, output;
  };
  auto images = std::make_shared<TensorImages>(TensorImages{
-  execution.context, stream, torch::full({20, 3, 9, 9}, .25F, torch::TensorOptions().device(torch::kCUDA)), torch::full({20, 3, 9, 9}, -.75F, torch::TensorOptions().device(torch::kCUDA))});
+  execution.context, stream, torch::full({20, 3, 9, 9}, .25F, torch::TensorOptions().device(torch::kCUDA)), torch::full({20, 3, 9, 9}, -.75F, torch::TensorOptions().device(torch::kCUDA))
+ });
  auto config = rfdetr::test_support::isolated_augmentation_config();
  config.resize = {.probability = 1.F, .min_strength = 1.F, .max_strength = 1.F};
  config.perceptual_downscale = true;
@@ -1876,7 +1891,8 @@ TEST_CASE("perceptual augmentation admits actual Torch suballocations and reject
  std::array<std::uint32_t, 20> indices{};
  std::array<std::uint64_t, 20> keys{};
  for (std::size_t i = 0; i != keys.size(); ++i) keys[i] = i + 1;
- rfdetr::GpuAugmentationBatchView batch{.input = images->input.data_ptr<float>(),
+ rfdetr::GpuAugmentationBatchView batch{
+  .input = images->input.data_ptr<float>(),
   .output = images->output.data_ptr<float>(),
   .image_indices = indices,
   .height = 9,
@@ -1885,7 +1901,8 @@ TEST_CASE("perceptual augmentation admits actual Torch suballocations and reject
   .input_custody = images,
   .output_custody = images,
   .input_capacity_bytes = static_cast<std::size_t>(images->input.numel()) * sizeof(float) - 1,
-  .output_capacity_bytes = static_cast<std::size_t>(images->output.numel()) * sizeof(float)};
+  .output_capacity_bytes = static_cast<std::size_t>(images->output.numel()) * sizeof(float)
+ };
  REQUIRE_THROWS(executor.Run(batch, keys, {}, {}, stream.stream()));
  CHECK(images->output.eq(-.75F).all().item<bool>());
  ++batch.input_capacity_bytes;
@@ -1913,7 +1930,8 @@ TEST_CASE("training cache failed settlement retains tensors stream and source an
    retained_source = pixels;
    std::array<std::uint32_t, 1> indices{0};
    mmltk::backend::data::Batch batch{
-    .num_images = 1, .device_images = pixels->data_ptr<float>(), .image_indices = indices.data(), .image_custody = pixels, .image_capacity_bytes = 48U * sizeof(float)};
+    .num_images = 1, .device_images = pixels->data_ptr<float>(), .image_indices = indices.data(), .image_custody = pixels, .image_capacity_bytes = 48U * sizeof(float)
+   };
    if (failure_path == 0) {
     Access::FailCacheWait(owner);
     REQUIRE_THROWS(owner.reconfigure(config));
@@ -2076,8 +2094,9 @@ TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and cur
     auto built = rfdetr::build_optimizer(parameters, optimizer_request);
     ParameterValues before_update;
     const auto is_mask_parameter = [](std::string_view name) { return name.starts_with("segmentation_head.") || name == "training_supervision.mask_projection.weight"; };
-    for (const auto name : {"segmentation_head.bias", "segmentation_head.spatial_features_proj.weight", "segmentation_head.query_features_proj.weight", "training_supervision.mask_projection.weight",
-          "training_supervision.ground_truth_mlp.linear1.weight", "class_embed.weight", "bbox_embed.layers.2.weight"}) {
+    for (const auto name :
+     {"segmentation_head.bias", "segmentation_head.spatial_features_proj.weight", "segmentation_head.query_features_proj.weight", "training_supervision.mask_projection.weight",
+      "training_supervision.ground_truth_mlp.linear1.weight", "class_embed.weight", "bbox_embed.layers.2.weight"}) {
      const bool mask_parameter = is_mask_parameter(name);
      if (!config.segmentation && mask_parameter) continue;
      before_update.emplace(name, capture_update_parameter(parameters, built.optimizer, name, !mask_parameter || mode >= 2));
@@ -2229,8 +2248,9 @@ TEST_CASE("Production Hungarian DN masks preserve stock draws and accumulated tr
   auto optimizer_request = gradient_update_request();
   auto built = rfdetr::build_optimizer(parameters, optimizer_request);
   ParameterValues before_update;
-  for (const auto name : {"segmentation_head.bias", "segmentation_head.spatial_features_proj.weight", "segmentation_head.query_features_proj.weight",
-        "training_supervision.denoising_label_embedding.weight", "class_embed.weight", "bbox_embed.layers.2.weight"}) {
+  for (const auto name :
+   {"segmentation_head.bias", "segmentation_head.spatial_features_proj.weight", "segmentation_head.query_features_proj.weight", "training_supervision.denoising_label_embedding.weight",
+    "class_embed.weight", "bbox_embed.layers.2.weight"}) {
    before_update.emplace(name, capture_update_parameter(parameters, built.optimizer, name, true));
   }
   check_parameter_update(built.optimizer, parameters, before_update, [](std::string_view) { return true; });

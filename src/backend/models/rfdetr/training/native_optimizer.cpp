@@ -456,15 +456,13 @@ NativeAdamW::NativeAdamW(std::vector<Group> groups, std::vector<NamedParameter> 
 NativeOptimizerBackend NativeAdamW::backend() const { return backend_; }
 const char* NativeAdamW::backend_name() const { return native_optimizer_backend_name(backend_); }
 void NativeAdamW::initialize_state() {
- initialize_param_states(
-  state_, params_, groups_, [](const auto& group) { return group.config.amsgrad; },
-  [this](ParamState& state, const torch::Tensor& param, const bool needs_amsgrad) {
-   if (!param.requires_grad() || state.step.defined()) return;
-   state.step = make_step_tensor(param, backend_);
-   state.exp_avg = torch::zeros_like(param);
-   state.exp_avg_sq = torch::zeros_like(param);
-   if (needs_amsgrad) { state.max_exp_avg_sq = torch::zeros_like(param); }
-  });
+ initialize_param_states(state_, params_, groups_, [](const auto& group) { return group.config.amsgrad; }, [this](ParamState& state, const torch::Tensor& param, const bool needs_amsgrad) {
+  if (!param.requires_grad() || state.step.defined()) return;
+  state.step = make_step_tensor(param, backend_);
+  state.exp_avg = torch::zeros_like(param);
+  state.exp_avg_sq = torch::zeros_like(param);
+  if (needs_amsgrad) { state.max_exp_avg_sq = torch::zeros_like(param); }
+ });
 }
 void NativeAdamW::zero_grad(const bool set_to_none) { zero_grad_parameters(all_params_, set_to_none); }
 void NativeAdamW::set_lrs(const std::vector<double>& base_lrs, const double scale) { set_scaled_group_lrs(groups_, base_lrs, scale, "native AdamW base LR count does not match param group count"); }
@@ -629,11 +627,11 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
   "native AdamW archive parameter group order does not match the "
   "current optimizer",
   [stop, materialize](auto& group_archive, auto& config) {
-   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
-   const auto amsgrad = require_optimizer_bool(group_archive, "amsgrad");
-   if (materialize && amsgrad != config.amsgrad) throw std::runtime_error("AdamW AMSGrad differs from admitted policy");
-   config.amsgrad = amsgrad;
-  });
+  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+  const auto amsgrad = require_optimizer_bool(group_archive, "amsgrad");
+  if (materialize && amsgrad != config.amsgrad) throw std::runtime_error("AdamW AMSGrad differs from admitted policy");
+  config.amsgrad = amsgrad;
+ });
  for (const auto& group : candidate_groups) {
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
   if (!std::isfinite(group.config.lr) || group.config.lr < 0.0 || !std::isfinite(group.config.weight_decay) || group.config.weight_decay < 0.0) {
@@ -683,17 +681,15 @@ NativeMuonWithAuxAdam::NativeMuonWithAuxAdam(std::vector<Group> groups, std::vec
 }
 const char* NativeMuonWithAuxAdam::backend_name() const { return "eager"; }
 void NativeMuonWithAuxAdam::initialize_state() {
- initialize_param_states(
-  state_, params_, groups_, [](const auto& group) { return group.config.use_muon; },
-  [](ParamState& state, const torch::Tensor& param, const bool use_muon) {
-   if (!param.requires_grad() || state.momentum_buffer.defined() || state.exp_avg.defined()) return;
-   if (use_muon) {
-    state.momentum_buffer = torch::zeros_like(param);
-   } else {
-    state.exp_avg = torch::zeros_like(param);
-    state.exp_avg_sq = torch::zeros_like(param);
-   }
-  });
+ initialize_param_states(state_, params_, groups_, [](const auto& group) { return group.config.use_muon; }, [](ParamState& state, const torch::Tensor& param, const bool use_muon) {
+  if (!param.requires_grad() || state.momentum_buffer.defined() || state.exp_avg.defined()) return;
+  if (use_muon) {
+   state.momentum_buffer = torch::zeros_like(param);
+  } else {
+   state.exp_avg = torch::zeros_like(param);
+   state.exp_avg_sq = torch::zeros_like(param);
+  }
+ });
 }
 void NativeMuonWithAuxAdam::zero_grad(const bool set_to_none) { zero_grad_parameters(all_params_, set_to_none); }
 void NativeMuonWithAuxAdam::set_lrs(const std::vector<double>& base_lrs, const double scale) {
@@ -782,14 +778,14 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
   "native Muon archive parameter group order does not match the "
   "current optimizer",
   [stop, materialize](auto& group_archive, auto& config) {
-   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
-   config.momentum = mmltk::backend::ml::serialization::require_double(group_archive, "momentum");
-   const auto use_muon = require_optimizer_bool(group_archive, "use_muon");
-   const auto nesterov = require_optimizer_bool(group_archive, "nesterov");
-   if (materialize && (use_muon != config.use_muon || nesterov != config.nesterov)) throw std::runtime_error("Muon routing or Nesterov differs from admitted policy");
-   config.use_muon = use_muon;
-   config.nesterov = nesterov;
-  });
+  if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+  config.momentum = mmltk::backend::ml::serialization::require_double(group_archive, "momentum");
+  const auto use_muon = require_optimizer_bool(group_archive, "use_muon");
+  const auto nesterov = require_optimizer_bool(group_archive, "nesterov");
+  if (materialize && (use_muon != config.use_muon || nesterov != config.nesterov)) throw std::runtime_error("Muon routing or Nesterov differs from admitted policy");
+  config.use_muon = use_muon;
+  config.nesterov = nesterov;
+ });
  for (const auto& group : candidate_groups) {
   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
   if (!std::isfinite(group.config.lr) || group.config.lr < 0.0 || !std::isfinite(group.config.weight_decay) || group.config.weight_decay < 0.0 || !std::isfinite(group.config.momentum) ||
@@ -986,12 +982,10 @@ NativeOptimizer NativeOptimizer::stage_load(torch::serialize::InputArchive& arch
  return candidate;
 }
 void NativeOptimizer::commit(NativeOptimizer candidate) noexcept {
- std::visit(
-  [&](auto& optimizer) {
-   using Type = std::remove_cvref_t<decltype(optimizer)>;
-   optimizer.commit(std::get<Type>(std::move(candidate.storage_)));
-  },
-  storage_);
+ std::visit([&](auto& optimizer) {
+  using Type = std::remove_cvref_t<decltype(optimizer)>;
+  optimizer.commit(std::get<Type>(std::move(candidate.storage_)));
+ }, storage_);
 }
 const char* NativeOptimizer::backend_name() const {
  return std::visit([](const auto& optimizer) { return optimizer.backend_name(); }, storage_);
@@ -1012,18 +1006,16 @@ void NativeOptimizer::set_lrs(const std::vector<double>& base_lrs, const double 
  std::visit([&](auto& optimizer) { optimizer.set_lrs(base_lrs, scale); }, storage_);
 }
 void NativeOptimizer::set_momentum(const double momentum) {
- std::visit(
-  [&](auto& optimizer) {
-   using Optimizer = std::decay_t<decltype(optimizer)>;
-   if constexpr (std::is_same_v<Optimizer, NativeMuonWithAuxAdam>) {
-    optimizer.set_muon_momentum(momentum);
-   } else if constexpr (std::is_same_v<Optimizer, NativeSGD>) {
-    optimizer.set_momentum(momentum);
-   } else {
-    (void)momentum;
-   }
-  },
-  storage_);
+ std::visit([&](auto& optimizer) {
+  using Optimizer = std::decay_t<decltype(optimizer)>;
+  if constexpr (std::is_same_v<Optimizer, NativeMuonWithAuxAdam>) {
+   optimizer.set_muon_momentum(momentum);
+  } else if constexpr (std::is_same_v<Optimizer, NativeSGD>) {
+   optimizer.set_momentum(momentum);
+  } else {
+   (void)momentum;
+  }
+ }, storage_);
 }
 void NativeOptimizer::step() {
  std::visit([](auto& optimizer) { optimizer.step(); }, storage_);

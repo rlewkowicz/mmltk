@@ -130,9 +130,10 @@ void test_train_help_lists_training_controls() {
  }
  REQUIRE((result.output_text.find("hungarian or match-free") != std::string::npos));
  std::size_t previous = 0U;
- for (const std::string_view option : {"--aug-geometry-prob", "--aug-geometry-min-strength", "--aug-geometry-max-strength", "--aug-resize-prob", "--aug-resize-min-strength",
-       "--aug-resize-max-strength", "--aug-color-prob", "--aug-color-min-strength", "--aug-color-max-strength", "--aug-noise-prob", "--aug-noise-min-strength", "--aug-noise-max-strength",
-       "--aug-blur-prob", "--aug-blur-min-strength", "--aug-blur-max-strength", "--aug-occlusion-prob", "--aug-occlusion-min-strength", "--aug-occlusion-max-strength"}) {
+ for (const std::string_view option :
+  {"--aug-geometry-prob", "--aug-geometry-min-strength", "--aug-geometry-max-strength", "--aug-resize-prob", "--aug-resize-min-strength", "--aug-resize-max-strength", "--aug-color-prob",
+   "--aug-color-min-strength", "--aug-color-max-strength", "--aug-noise-prob", "--aug-noise-min-strength", "--aug-noise-max-strength", "--aug-blur-prob", "--aug-blur-min-strength",
+   "--aug-blur-max-strength", "--aug-occlusion-prob", "--aug-occlusion-min-strength", "--aug-occlusion-max-strength"}) {
   const auto position = result.output_text.find(option, previous);
   REQUIRE(position != std::string::npos);
   previous = position + option.size();
@@ -251,9 +252,10 @@ TEST_CASE("Native prediction and evaluation retain compilation CLI spellings", "
  }
 }
 TEST_CASE("Training JSON is mutually exclusive bounded and shares scalar recipe admission", "[rfdetr][cli][training]") {
- for (const auto options : {std::initializer_list<const char*>{"--request-json", "{}", "--epochs", "4"}, std::initializer_list<const char*>{"--optimizer", "sgd", "--request-json", "{}"},
-       std::initializer_list<const char*>{"--request-json", "{}", "--no-amp"}, std::initializer_list<const char*>{"--request-json", "{}", "--epochs", "1"},
-       std::initializer_list<const char*>{"--request-json", "{}", "--nesterov=false"}}) {
+ for (const auto options :
+  {std::initializer_list<const char*>{"--request-json", "{}", "--epochs", "4"}, std::initializer_list<const char*>{"--optimizer", "sgd", "--request-json", "{}"},
+   std::initializer_list<const char*>{"--request-json", "{}", "--no-amp"}, std::initializer_list<const char*>{"--request-json", "{}", "--epochs", "1"},
+   std::initializer_list<const char*>{"--request-json", "{}", "--nesterov=false"}}) {
   const auto result = run_train_options(options);
   CHECK(result.exit_code == 1);
   CHECK(result.output_text.find("mutually exclusive") != std::string::npos);
@@ -282,9 +284,10 @@ TEST_CASE("Training JSON is mutually exclusive bounded and shares scalar recipe 
 }
 TEST_CASE("RF-DETR help keeps canonical usage for every command and alias", "[rfdetr][cli]") {
  for (const auto& [spelling, canonical] : std::array{
-       std::array{"compile", "compile"}, std::array{"info", "info"}, std::array{"build-engine", "build-engine"}, std::array{"export-onnx", "export-onnx"},
-       std::array{"predict", "predict"}, std::array{"evaluate", "evaluate"}, std::array{"eval", "evaluate"}, std::array{"val", "evaluate"}, std::array{"validate", "validate"},
-       std::array{"train", "train"}, std::array{"normalize-weights", "normalize-weights"}}) {
+       std::array{"compile", "compile"}, std::array{"info", "info"}, std::array{"build-engine", "build-engine"}, std::array{"export-onnx", "export-onnx"}, std::array{"predict", "predict"},
+       std::array{"evaluate", "evaluate"}, std::array{"eval", "evaluate"}, std::array{"val", "evaluate"}, std::array{"validate", "validate"}, std::array{"train", "train"},
+       std::array{"normalize-weights", "normalize-weights"}
+      }) {
   const auto result = run_subprocess_capture_output({mmltk_cli_path(), "rfdetr", spelling, "--help"});
   REQUIRE(result.exit_code == 0);
   CHECK(result.stdout_text.find(std::string("Usage: mmltk rfdetr ") + canonical + " [options]\n") != std::string::npos);
@@ -298,12 +301,11 @@ TEST_CASE("training integer-list codecs retain assignment bounds and CSV emissio
  CHECK((accepted->request.request.numa_nodes == std::vector<int>{-1, -1}));
  CHECK((accepted->request.request.device_ids == std::vector<int>{0, 2}));
  struct ListCase {
-  std::vector<int> cli::TrainRequest::*member;
+  std::vector<int> cli::TrainRequest::* member;
   const char* spelling;
   const char* text;
  };
- for (const auto& [member, spelling, text] : std::array{
-       ListCase{&cli::TrainRequest::numa_nodes, "--numa-nodes", "-1,-1"}, ListCase{&cli::TrainRequest::device_ids, "--device-ids", "0,2"}}) {
+ for (const auto& [member, spelling, text] : std::array{ListCase{&cli::TrainRequest::numa_nodes, "--numa-nodes", "-1,-1"}, ListCase{&cli::TrainRequest::device_ids, "--device-ids", "0,2"}}) {
   const auto descriptor = std::ranges::find(cli::kTrainOptions, std::string_view(spelling), &reflection::OptionDescriptor<cli::TrainCliRequest>::name);
   REQUIRE(descriptor != cli::kTrainOptions.end());
   std::vector<std::string> emitted;

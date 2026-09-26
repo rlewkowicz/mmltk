@@ -728,8 +728,9 @@ TEST_CASE("owned scalar payloads survive every segmented split and input retirem
  for (const std::size_t length : {0U, 31U, 257U}) {
   const std::string text(length, 'x');
   const wire::ByteBuffer bytes(length, std::byte{0xa5});
-  for (const wire::Value& source : {wire::Value(text), wire::Value(bytes), wire::Value(std::string("a\xe2\x82\xac")), wire::Value(wire::Value::Array{}),
-        wire::Value(wire::Value::Array{wire::Value(text), wire::Value(bytes), wire::Value(std::int64_t{-17})})}) {
+  for (const wire::Value& source :
+   {wire::Value(text), wire::Value(bytes), wire::Value(std::string("a\xe2\x82\xac")), wire::Value(wire::Value::Array{}),
+    wire::Value(wire::Value::Array{wire::Value(text), wire::Value(bytes), wire::Value(std::int64_t{-17})})}) {
    wire::ByteBuffer encoded;
    REQUIRE(wire::encode(source, encoded, test_limits(2048U)));
    const auto limits = test_limits(encoded.size());
@@ -769,9 +770,9 @@ TEST_CASE("borrowed byte payloads alias separate live segments at every split", 
    } probe;
    auto limits = test_limits(encoded.size(), 3U, 0U);
    limits.allocation_policy = {.context = &probe, .allows = [](const void* context, const wire::AllocationRequest&) noexcept {
-                                ++static_cast<const AllocationProbe*>(context)->calls;
-                                return false;
-                               }};
+    ++static_cast<const AllocationProbe*>(context)->calls;
+    return false;
+   }};
    wire::Reader reader(input, limits);
    REQUIRE(reader.read_scalar_item(0U));
    const auto payload = reader.borrow_bytes_item(0U);
@@ -985,14 +986,14 @@ TEST_CASE("scalar allocation admission reports exact kind size path and cursor",
    Observation observed;
    auto limits = test_limits(encoded.size());
    limits.allocation_policy = {.context = &observed, .allows = [](const void* context, const wire::AllocationRequest& request) noexcept {
-                                const auto& state = *static_cast<const Observation*>(context);
-                                ++state.calls;
-                                state.kind = request.kind;
-                                state.size = request.size;
-                                state.offset = state.reader->offset();
-                                state.path_matches = request.path.size() == 2U && request.path[0].name == "outer" && request.path[1].name == "payload";
-                                return false;
-                               }};
+    const auto& state = *static_cast<const Observation*>(context);
+    ++state.calls;
+    state.kind = request.kind;
+    state.size = request.size;
+    state.offset = state.reader->offset();
+    state.path_matches = request.path.size() == 2U && request.path[0].name == "outer" && request.path[1].name == "payload";
+    return false;
+   }};
    wire::Reader reader({std::span(encoded).first(split), std::span(encoded).subspan(split)}, limits);
    observed.reader = &reader;
    auto outer = reader.enter_path("outer");
@@ -1038,8 +1039,9 @@ TEST_CASE("UTF8 block boundaries agree with scalar recognition", "[frameworks][s
    }
   }
  };
- for (const std::string_view scalar : {std::string_view{}, std::string_view{"a\0b", 3U}, std::string_view{"\x7f"}, std::string_view{"\xc2\x80"}, std::string_view{"\xdf\xbf"},
-       std::string_view{"\xe0\xa0\x80"}, std::string_view{"\xed\x9f\xbf"}, std::string_view{"\xef\xbf\xbf"}, std::string_view{"\xf0\x90\x80\x80"}, std::string_view{"\xf4\x8f\xbf\xbf"}})
+ for (const std::string_view scalar :
+  {std::string_view{}, std::string_view{"a\0b", 3U}, std::string_view{"\x7f"}, std::string_view{"\xc2\x80"}, std::string_view{"\xdf\xbf"}, std::string_view{"\xe0\xa0\x80"},
+   std::string_view{"\xed\x9f\xbf"}, std::string_view{"\xef\xbf\xbf"}, std::string_view{"\xf0\x90\x80\x80"}, std::string_view{"\xf4\x8f\xbf\xbf"}})
   compare(scalar);
  for (const auto scalar : mmltk::testsupport::kMalformedUtf8) compare(scalar);
  std::string dense;
@@ -1304,15 +1306,18 @@ TEST_CASE("rejects_nonminimal_malformed_duplicate_and_invalid_utf8_values", "[fr
  std::array<std::uint32_t, nested_reused_key.size()> nested_scratch{};
  CHECK(wire::validate_raw_item_structural(nested_reused_key, {nested_reused_key.size(), nested_reused_key.size(), 4U}, {.key_offsets = nested_scratch}).has_value());
  const std::array nested_duplicate{
-  std::byte{0xa1}, std::byte{0x61}, std::byte{'o'}, std::byte{0xa2}, std::byte{0x61}, std::byte{'a'}, std::byte{0x01}, std::byte{0x61}, std::byte{'a'}, std::byte{0x02}};
+  std::byte{0xa1}, std::byte{0x61}, std::byte{'o'}, std::byte{0xa2}, std::byte{0x61}, std::byte{'a'}, std::byte{0x01}, std::byte{0x61}, std::byte{'a'}, std::byte{0x02}
+ };
  std::array<std::uint32_t, nested_duplicate.size()> nested_duplicate_scratch{};
  const auto nested_structural_duplicate = wire::validate_raw_item_structural(nested_duplicate, {nested_duplicate.size(), nested_duplicate.size(), 4U}, {.key_offsets = nested_duplicate_scratch});
  REQUIRE_FALSE(nested_structural_duplicate.has_value());
  CHECK(nested_structural_duplicate.error().code == wire::ErrorCode::DuplicateKey);
  const std::array invalid_utf8{std::byte{0x61}, std::byte{0x80}};
  require_malformed_scalar(invalid_utf8, wire::ErrorCode::InvalidUtf8);
- const std::array nested_invalid_utf8{std::byte{0xa1}, std::byte{0x65}, std::byte{'o'}, std::byte{'u'}, std::byte{'t'}, std::byte{'e'}, std::byte{'r'}, std::byte{0xa1}, std::byte{0x65},
-  std::byte{'i'}, std::byte{'n'}, std::byte{'n'}, std::byte{'e'}, std::byte{'r'}, std::byte{0x61}, std::byte{0x80}};
+ const std::array nested_invalid_utf8{
+  std::byte{0xa1}, std::byte{0x65}, std::byte{'o'}, std::byte{'u'}, std::byte{'t'}, std::byte{'e'}, std::byte{'r'}, std::byte{0xa1}, std::byte{0x65}, std::byte{'i'}, std::byte{'n'}, std::byte{'n'},
+  std::byte{'e'}, std::byte{'r'}, std::byte{0x61}, std::byte{0x80}
+ };
  const auto nested_error = wire::decode({nested_invalid_utf8, {}}, {nested_invalid_utf8.size(), 16U, 4U});
  REQUIRE(!nested_error.has_value());
  REQUIRE(nested_error.error().code == wire::ErrorCode::InvalidUtf8);

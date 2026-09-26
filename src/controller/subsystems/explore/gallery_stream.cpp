@@ -378,7 +378,8 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
  if (!CompleteCandidate()) throw std::logic_error("Explore initialization requires complete inactive construction");
  const auto side = explore_atlas_card_extent(plan.viewport);
  const GalleryThumbnailCache::Identity identity{
-  .incarnation = store.get(), .dataset = plan.dataset_identity, .seed = plan.augmentation.seed, .augmentation = plan.augmentation_config, .extent = side, .augmented = plan.augmentation.enabled};
+  .incarnation = store.get(), .dataset = plan.dataset_identity, .seed = plan.augmentation.seed, .augmentation = plan.augmentation_config, .extent = side, .augmented = plan.augmentation.enabled
+ };
  const auto maximum_rows = std::min<std::size_t>(kExploreVisibleItemCapacity / plan.viewport.columns, maximum_height_ / side);
  const auto retained_capacity = std::min<std::size_t>(store->header().num_images, (maximum_rows + 2U * GalleryThumbnailCache::kNeighborRows) * plan.viewport.columns);
  if (identity == committed_.cache.identity() && retained_capacity <= committed_.cache.size()) {
@@ -448,25 +449,33 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
    const auto restored = static_cast<std::uint32_t>(State().tile_meanings[slot] != nullptr);
    restored_tiles += restored;
    diagnostics_.Emit([&] {
-    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+    return VisualDiagnosticFact{
+     .system = contracts::DiagnosticOwner::Explore,
      .operation = VisualDiagnosticOperation::AcceptancePlaceholderSlot,
      .generation = plan.generation,
      .value = slot,
      .detail = State().visible_indices[slot],
-     .context = {.capacity_width = restored}};
+     .context = {.capacity_width = restored}
+    };
    });
   }
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Explore,
     .operation = VisualDiagnosticOperation::AcceptancePlaceholderComplete,
     .generation = plan.generation,
     .value = State().visible_indices.size(),
     .detail = explore_visible_indices_digest(State().visible_indices),
-    .context = {.capacity_width = restored_tiles,
-     .admission = {.admission_first_row = plan.viewport.first_row,
+    .context = {
+     .capacity_width = restored_tiles,
+     .admission = {
+      .admission_first_row = plan.viewport.first_row,
       .admission_row_count = plan.viewport.row_count,
       .admission_columns = plan.viewport.columns,
-      .admission_forward = plan.scroll_direction == ExploreScrollDirection::Forward}}};
+      .admission_forward = plan.scroll_direction == ExploreScrollDirection::Forward
+     }
+    }
+   };
   });
  }
  auto publication = PublicationFacts(scheduler_.stale_discarded_.exchange(0U, std::memory_order_acq_rel));
@@ -480,12 +489,14 @@ ExploreGalleryPublication GalleryStream::Impl::Advance() {
  const auto diagnose_stage = [this, generation, &failure](const std::uint64_t stage) {
   if (acceptance_ && diagnostics_.valid())
    diagnostics_.Emit([&] {
-    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+    return VisualDiagnosticFact{
+     .system = contracts::DiagnosticOwner::Explore,
      .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
      .device = device_,
      .generation = generation,
      .value = failure ? 1U : 0U,
-     .detail = stage};
+     .detail = stage
+    };
    });
  };
  diagnose_stage(10U);
@@ -837,14 +848,16 @@ ExploreStorageFootprint GalleryStream::Impl::StorageFootprint() const {
  const auto descriptor_bytes = descriptors_.storage_.buffers_.descriptors_.capacity_bytes() + descriptors_.storage_.buffers_.cards_device_.capacity_bytes() +
                                descriptors_.storage_.buffers_.annotations_device_.capacity_bytes() + descriptors_.storage_.buffers_.rle_device_.capacity_bytes() +
                                descriptors_.storage_.buffers_.classes_device_.capacity_bytes() + descriptors_.storage_.buffers_.tiles_device_.capacity_bytes();
- return {.host_bytes = host_bytes,
+ return {
+  .host_bytes = host_bytes,
   .device_bytes = device_bytes,
   .pinned_bytes = staging_bytes,
   .cache_device_bytes = cache_bytes,
   .descriptor_bytes = descriptor_bytes,
   .augmentation_device_bytes = augmentation_device,
   .augmentation_pinned_bytes = augmentation_pinned,
-  .cache_cards = std::max(State().cache.size(), retained_.cache.size())};
+  .cache_cards = std::max(State().cache.size(), retained_.cache.size())
+ };
 }
 void GalleryStream::Impl::PrepareCacheWrite(const std::uintptr_t stream) {
  const auto side = State().cache.identity().extent;
@@ -879,11 +892,15 @@ std::uint8_t GalleryStream::Impl::WritableCacheBank(std::size_t position, bool s
 mmltk::frameworks::gpu::ImagePlaneView GalleryStream::Impl::CachePlane(const bool semantic) const {
  const auto side = State().cache.identity().extent;
  const auto& buffer = semantic ? storage_.storage_.buffers_.cached_semantic_[State().cache_active] : storage_.storage_.buffers_.cached_clean_[State().cache_active];
- return {.data = reinterpret_cast<CUdeviceptr>(buffer.data()),
-  .descriptor = {.kind = semantic ? mmltk::frameworks::gpu::ImagePlaneKind::Semantic : mmltk::frameworks::gpu::ImagePlaneKind::Clean,
+ return {
+  .data = reinterpret_cast<CUdeviceptr>(buffer.data()),
+  .descriptor = {
+   .kind = semantic ? mmltk::frameworks::gpu::ImagePlaneKind::Semantic : mmltk::frameworks::gpu::ImagePlaneKind::Clean,
    .width = side,
    .height = static_cast<std::uint32_t>(2U * State().cache.size() * side),
-   .pitch_bytes = static_cast<std::size_t>(side) * 4U}};
+   .pitch_bytes = static_cast<std::size_t>(side) * 4U
+  }
+ };
 }
 void GalleryStream::Impl::PlaceTile(
  const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uint32_t slot, const std::uintptr_t stream, const bool semantic_only) {
@@ -919,21 +936,25 @@ void GalleryStream::Impl::PlaceTile(
  }
  if (!unchanged && acceptance_ && diagnostics_.valid() && publication_change_ != ExploreOutputChange::Initialize)
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Explore,
     .operation = VisualDiagnosticOperation::AcceptanceSlotPatched,
     .generation = State().plan.generation,
     .value = slot,
-    .detail = State().visible_indices[slot]};
+    .detail = State().visible_indices[slot]
+   };
   });
  if (!unchanged)
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Explore,
     .operation = VisualDiagnosticOperation::ExploreCacheTransfer,
     .device = device_,
     .generation = State().plan.generation,
     .value = (clean_unchanged ? 1U : 2U) * static_cast<std::size_t>(side) * side * 4U,
     .detail = slot,
-    .context = {.condition = clean_unchanged}};
+    .context = {.condition = clean_unchanged}
+   };
   });
 }
 void GalleryStream::Impl::RenderCachedSemantics(const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView target, const std::uintptr_t stream) {
@@ -979,12 +1000,14 @@ void GalleryStream::Impl::RenderCachedSemantics(const mmltk::frameworks::gpu::Im
    store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.rle.offset + run_offset * sizeof(data::RLEPair), std::span{meaning.runs});
    run_offset += meaning.runs.size();
    const auto position = static_cast<std::size_t>(State().viewport.first_row) * State().viewport.columns + slot;
-   const explore::ExploreRenderTileDescriptor tile{.card_index = static_cast<std::uint32_t>(index),
+   const explore::ExploreRenderTileDescriptor tile{
+    .card_index = static_cast<std::uint32_t>(index),
     .destination_x = 0U,
     .destination_y = static_cast<std::uint32_t>(State().cache.PhysicalRow(State().cache.Slot(position), WritableCacheBank(position, true))),
     .destination_width = side,
     .destination_height = side,
-    .generation = {.viewport = State().plan.generation, .tile = ++scheduler_.next_tile_generation_}};
+    .generation = {.viewport = State().plan.generation, .tile = ++scheduler_.next_tile_generation_}
+   };
    store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.tiles.offset + index * sizeof(tile), tile);
   }
   store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.classes.offset, std::span{State().active_classes});
@@ -1138,13 +1161,15 @@ const rfdetr::AugmentationBatchPlan* GalleryStream::Impl::PrepareImages(const st
                         static_cast<const std::byte*>(lane.pinned.data()) + lane.layout.donor_mask, mask_words * sizeof(std::uint64_t), cudaMemcpyHostToDevice, cuda_stream),
     "Explore prepared donor mask upload failed");
   }
-  donor_view = {.images = nullptr,
+  donor_view = {
+   .images = nullptr,
    .masks = static_cast<const std::int64_t*>(descriptors_.storage_.buffers_.donor_masks_device_.data()),
    .boxes = static_cast<const float*>(descriptors_.storage_.buffers_.donor_boxes_device_.data()),
    .mask_words = static_cast<std::int64_t>(mask_words),
    .image_slots = descriptors_.batch_donor_slots_,
    .image_custody = scheduler_.image_stream_.storage_custody().lock(),
-   .image_capacity_bytes = pixel_bytes};
+   .image_capacity_bytes = pixel_bytes
+  };
  }
  const rfdetr::AugmentationBatchPlan* augmentation_plan = nullptr;
  if (!scheduler_.current_demand_(State().plan.generation)) return nullptr;
@@ -1264,13 +1289,15 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(
   const auto planned_pastes =
    static_cast<std::uint32_t>(std::ranges::count_if(augmentation_plan->images | std::views::take(augmentation_plan->active_size), [](const auto& image) { return image.paste_donor_slot >= 0; }));
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Explore,
     .operation = VisualDiagnosticOperation::ExploreAugmentationBatchPrepared,
     .device = device_,
     .generation = generation,
     .value = ready_lanes.size(),
     .detail = State().plan.augmentation.seed,
-    .context = {.capacity_width = valid_donors, .capacity_height = planned_pastes, .staging_bytes = image_capacity}};
+    .context = {.capacity_width = valid_donors, .capacity_height = planned_pastes, .staging_bytes = image_capacity}
+   };
   });
  }
  std::size_t ready_annotation_count = source_budget.annotations;
@@ -1353,13 +1380,15 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(
  const auto submission = RenderAtlasBatch(CachePlane(false), CachePlane(true), stream, static_cast<std::uint32_t>(tile_count), generation, AtlasBatch::Cache);
  if (submission == BatchSubmission::Skipped) return PublicationFacts(0U);
  diagnostics_.Emit([&] {
-  return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+  return VisualDiagnosticFact{
+   .system = contracts::DiagnosticOwner::Explore,
    .operation = VisualDiagnosticOperation::ExploreRenderSubmitted,
    .device = device_,
    .generation = generation,
    .value = tile_count,
    .detail = State().cumulative_tiles,
-   .context = {.condition = background}};
+   .context = {.condition = background}
+  };
  });
  if (acceptance_) acceptance_->ObserveSubmission(stream, background ? ExploreAcceptanceGate::SubmissionStage::Background : ExploreAcceptanceGate::SubmissionStage::Foreground);
  {
@@ -1676,13 +1705,15 @@ void GalleryStream::Impl::UploadDescriptors(cudaStream_t stream, bool upload_cla
  if (acceptance_) acceptance_->CheckPublication(ExploreAcceptanceGate::PublicationStage::DescriptorsPrepared);
  if (diagnostics_.valid())
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Explore,
     .operation = VisualDiagnosticOperation::ExploreOverlayDescriptorsPrepared,
     .device = device_,
     .generation = State().plan.generation,
     .value = descriptors_.descriptor_layout_.annotations.count,
     .detail = descriptors_.descriptor_layout_.rle.count,
-    .context = {.capacity_width = State().store->header().image_width, .capacity_height = State().store->header().image_height}};
+    .context = {.capacity_width = State().store->header().image_width, .capacity_height = State().store->header().image_height}
+   };
   });
 }
 void GalleryStream::Impl::SettleDescriptors() {

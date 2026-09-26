@@ -331,16 +331,13 @@ void RuntimeDiagnosticTarget::State::write_batch(const std::span<const RuntimeDi
    .facts = facts,
    .steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
   };
-  submitted(operation.submit_encoded_batch(
-   facts.size(), &context,
-   [](void* const opaque, const std::size_t index, const std::span<char> destination, std::size_t& size) noexcept {
-    const auto& batch = *static_cast<const BatchContext*>(opaque);
-    BoundedJsonWriter writer{destination};
-    if (!writer.runtime_event(batch.facts[index], batch.steady_ns)) return false;
-    size = writer.view().size();
-    return true;
-   },
-   complete));
+  submitted(operation.submit_encoded_batch(facts.size(), &context, [](void* const opaque, const std::size_t index, const std::span<char> destination, std::size_t& size) noexcept {
+   const auto& batch = *static_cast<const BatchContext*>(opaque);
+   BoundedJsonWriter writer{destination};
+   if (!writer.runtime_event(batch.facts[index], batch.steady_ns)) return false;
+   size = writer.view().size();
+   return true;
+  }, complete));
  } catch (...) { fail_delivery(); }
 }
 void RuntimeDiagnosticTarget::State::write_browser_event(const std::string_view event, const mmltk::frameworks::serialization::wire::Value& fields) const noexcept {

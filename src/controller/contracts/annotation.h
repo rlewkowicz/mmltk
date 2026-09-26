@@ -241,14 +241,12 @@ struct AnnotationSceneContent final {
   if (frame_ready && (frame_width == 0U || frame_height == 0U)) return false;
   const auto point_in_frame = [this](const AnnotationPoint point) { return !frame_ready || (point.x >= 0.0F && point.y >= 0.0F && point.x <= frame_width && point.y <= frame_height); };
   if (!std::ranges::all_of(categories, [](const auto& item) { return item.valid(); }) || !std::ranges::all_of(objects, [this, &point_in_frame](const auto& item) {
-       return item.valid() && item.category < categories.size() && point_in_frame(item.point) && point_in_frame(item.box.first) && point_in_frame(item.box.second) &&
-              std::ranges::all_of(
-               item.mask.runs, [this](const auto& run) { return !frame_ready || (run.row < frame_height && run.last < frame_width); }) &&
-              std::ranges::all_of(item.mask_points, point_in_frame) &&
-              std::ranges::all_of(
-               item.spline_knots, [&point_in_frame](const auto& knot) { return point_in_frame(knot.point) && point_in_frame(knot.in.point) && point_in_frame(knot.out.point); }) &&
-              std::ranges::all_of(item.skeleton_nodes, [&point_in_frame](const auto& node) { return point_in_frame(node.point); });
-      })) {
+   return item.valid() && item.category < categories.size() && point_in_frame(item.point) && point_in_frame(item.box.first) && point_in_frame(item.box.second) &&
+          std::ranges::all_of(item.mask.runs, [this](const auto& run) { return !frame_ready || (run.row < frame_height && run.last < frame_width); }) &&
+          std::ranges::all_of(item.mask_points, point_in_frame) &&
+          std::ranges::all_of(item.spline_knots, [&point_in_frame](const auto& knot) { return point_in_frame(knot.point) && point_in_frame(knot.in.point) && point_in_frame(knot.out.point); }) &&
+          std::ranges::all_of(item.skeleton_nodes, [&point_in_frame](const auto& node) { return point_in_frame(node.point); });
+  })) {
    return false;
   }
   return true;

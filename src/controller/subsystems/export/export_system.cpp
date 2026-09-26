@@ -29,18 +29,16 @@ void CudaExportRuntime::Close() { impl_->resources.Retire(); }
 bool CudaExportRuntime::HasUnsafeCustody() const noexcept { return impl_->resources.HasUnsafeCustody(); }
 contracts::ComputeTerminal CudaExportRuntime::Run(
  ExportRunRequest operation, std::stop_token stop, const ComputeProgressSink& progress, const ComputeArtifactSink& published, std::uint64_t generation) {
- return impl_->resources.Run(
-  [this, generation, stop, &progress, &published, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
-   if (operation.onnx.device_id != impl_->resources.device()) throw std::invalid_argument("export device disagrees with admitted execution");
-   diagnostics_.Emit([&] {
-    return services::RuntimeDiagnosticFact{
-     .owner = contracts::DiagnosticOwner::Export, .event = "workflow.gpu_execution", .participant = "export", .sequence = generation, .value = 0U, .detail = 1U, .device = impl_->resources.device()};
-   });
-   return execute_export_run(
-    operation, stop, progress, published, [&](const auto& request, const auto& committed) { impl_->session.Run(request, stream, stop, committed); },
-    [&](const auto& request, const auto& committed) { mmltk::backend::models::rfdetr::build_tensorrt_engine(request, stream, {}, stop, committed); });
-  },
-  stop);
+ return impl_->resources.Run([this, generation, stop, &progress, &published, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
+  if (operation.onnx.device_id != impl_->resources.device()) throw std::invalid_argument("export device disagrees with admitted execution");
+  diagnostics_.Emit([&] {
+   return services::RuntimeDiagnosticFact{
+    .owner = contracts::DiagnosticOwner::Export, .event = "workflow.gpu_execution", .participant = "export", .sequence = generation, .value = 0U, .detail = 1U, .device = impl_->resources.device()
+   };
+  });
+  return execute_export_run(operation, stop, progress, published, [&](const auto& request, const auto& committed) { impl_->session.Run(request, stream, stop, committed); },
+   [&](const auto& request, const auto& committed) { mmltk::backend::models::rfdetr::build_tensorrt_engine(request, stream, {}, stop, committed); });
+ }, stop);
 }
 class ExportSystem::Impl final {
 public:
@@ -64,46 +62,44 @@ public:
    .policy = configuration.worker_policy(),
    .prepare =
     [this] {
-     std::scoped_lock lock(mutex_);
-     const auto next = contracts::next_compute_generation(state_.generation_frontier);
-     if (!next) throw contracts::FailedError("compute operation generation exhausted");
-     contracts::begin_compute(state_, *next, {});
-    },
+   std::scoped_lock lock(mutex_);
+   const auto next = contracts::next_compute_generation(state_.generation_frontier);
+   if (!next) throw contracts::FailedError("compute operation generation exhausted");
+   contracts::begin_compute(state_, *next, {});
+  },
    .work = [this, prepared = std::move(prepared), output = settings.settings.workflows.export_state.output, configuration](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
-    auto terminal = run_checked_compute(
-     [&](const ComputeProgressSink& progress) {
-      if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
-      const auto directory = services::reserve_run_output(contracts::workflow_output_root(output, contracts::FeatureId::Export), !output.automatic);
-      prepared->output_directory = directory;
-      {
-       std::scoped_lock lock(mutex_);
-       state_.output.directory = directory.string();
-      }
-      direct::PublishLazyNoexcept(events_, [&] { return ComputeSystemEvent{ComputeChanged{snapshot()}}; });
-      if (runtime_ && runtime_configuration_ != configuration) {
-       RetireRuntime();
-       if (retirement_failed_) throw contracts::UnavailableError("compute CUDA retirement is unproved");
-      }
-      if (!runtime_) {
-       runtime_ = construct_compute_runtime(factory_, configuration, retirement_failed_);
-       runtime_configuration_ = configuration;
-      }
-      if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
-      // CLEANUP-IGNORE: Export owns retirement and publication; LocalRun and run_checked_compute already share execution.
-      const auto generation = [this] {
-       std::scoped_lock lock(mutex_);
-       return state_.generation_frontier;
-      }();
-      return runtime_->Run(std::move(*prepared), stop, progress, [this](const auto& path) { Artifact(path); }, generation);
-     },
-     [this](const contracts::ComputeProgress& progress) { Progress(progress); });
-    if (terminal.outcome == contracts::ComputeOperationOutcome::Failed || (runtime_ && runtime_->HasUnsafeCustody())) RetireRuntime();
-    return Complete(std::move(terminal));
-   },
+   auto terminal = run_checked_compute([&](const ComputeProgressSink& progress) {
+    if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+    const auto directory = services::reserve_run_output(contracts::workflow_output_root(output, contracts::FeatureId::Export), !output.automatic);
+    prepared->output_directory = directory;
+    {
+     std::scoped_lock lock(mutex_);
+     state_.output.directory = directory.string();
+    }
+    direct::PublishLazyNoexcept(events_, [&] { return ComputeSystemEvent{ComputeChanged{snapshot()}}; });
+    if (runtime_ && runtime_configuration_ != configuration) {
+     RetireRuntime();
+     if (retirement_failed_) throw contracts::UnavailableError("compute CUDA retirement is unproved");
+    }
+    if (!runtime_) {
+     runtime_ = construct_compute_runtime(factory_, configuration, retirement_failed_);
+     runtime_configuration_ = configuration;
+    }
+    if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
+    // CLEANUP-IGNORE: Export owns retirement and publication; LocalRun and run_checked_compute already share execution.
+    const auto generation = [this] {
+     std::scoped_lock lock(mutex_);
+     return state_.generation_frontier;
+    }();
+    return runtime_->Run(std::move(*prepared), stop, progress, [this](const auto& path) { Artifact(path); }, generation);
+   }, [this](const contracts::ComputeProgress& progress) { Progress(progress); });
+   if (terminal.outcome == contracts::ComputeOperationOutcome::Failed || (runtime_ && runtime_->HasUnsafeCustody())) RetireRuntime();
+   return Complete(std::move(terminal));
+  },
    .failure = [this](const std::exception_ptr failure) -> direct::LocalRun::Notification {
-    RetireRuntime();
-    return Complete(contracts::compute_failure_terminal(failure, "compute worker failed"));
-   },
+   RetireRuntime();
+   return Complete(contracts::compute_failure_terminal(failure, "compute worker failed"));
+  },
   });
   return snapshot();
  }

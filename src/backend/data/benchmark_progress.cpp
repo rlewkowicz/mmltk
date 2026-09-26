@@ -198,9 +198,11 @@ void ProgressReporter::pixel_completed() {
  if (*trace_) {
   const double elapsed = std::chrono::duration<double>(Clock::now() - pixel_started_).count();
   trace_benchmark_event(*trace_, "benchmark.pixel_compile.throughput", [&] {
-   return nlohmann::json{{"completed_images", pixels.completed}, {"total_images", pixels.total}, {"elapsed_seconds", elapsed}, {"split", "train and val"},
+   return nlohmann::json{
+    {"completed_images", pixels.completed}, {"total_images", pixels.total}, {"elapsed_seconds", elapsed}, {"split", "train and val"},
     {"images_per_second", elapsed > 0 ? static_cast<double>(pixels.completed) / elapsed : 0},
-    {"eta_seconds", pixels.completed != 0 ? static_cast<double>(pixels.total - pixels.completed) * elapsed / static_cast<double>(pixels.completed) : 0}};
+    {"eta_seconds", pixels.completed != 0 ? static_cast<double>(pixels.total - pixels.completed) * elapsed / static_cast<double>(pixels.completed) : 0}
+   };
   });
  }
 }
@@ -425,14 +427,16 @@ void ArtifactProgressTotals::update(const DownloadProgress& update, ProgressRepo
  totals.completed = completed;
  totals.known_total = known_total;
  totals.unknown_count = unknown_count;
- reporter.source_transfer(update, BenchmarkSourceProgress{.source = source,
+ reporter.source_transfer(update, BenchmarkSourceProgress{
+                                   .source = source,
                                    .activity = {},
                                    .completed_bytes = completed,
                                    .total_bytes = unknown_count == 0U ? known_total : 0U,
                                    .retry_count = source_retries,
                                    .cache_hit = source_cached == totals.artifacts.size(),
                                    .resumed = source_resumed != 0,
-                                   .byte_total_known = unknown_count == 0U});
+                                   .byte_total_known = unknown_count == 0U
+                                  });
 }
 void ArtifactProgressTotals::images(BenchmarkDatasetSource source, const std::string& artifact, std::uint64_t completed, std::uint64_t source_total, ProgressReporter& reporter, std::string activity) {
  if (!reporter.transfer_observer_enabled()) return;

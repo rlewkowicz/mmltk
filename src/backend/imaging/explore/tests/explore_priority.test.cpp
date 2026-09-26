@@ -552,7 +552,8 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
    const std::array<float, 4> expected{float(edges[0]) / 8, float(edges[1]) / 4, float(edges[2]) / 8, float(edges[3]) / 4};
    REQUIRE(resolved.box_xyxy == expected);
    ExploreRenderAnnotationDescriptor annotation{
-    .box_xyxy = {expected[0], expected[1], expected[2], expected[3]}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = static_cast<std::uint32_t>(runs.size())};
+    .box_xyxy = {expected[0], expected[1], expected[2], expected[3]}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = static_cast<std::uint32_t>(runs.size())
+   };
    std::ranges::copy(resolved.mask_bounds, annotation.mask_bounds);
    std::ranges::copy(plan.inverse, annotation.inverse);
    for (const auto extent : {3U, 8U, 13U, 32U}) {

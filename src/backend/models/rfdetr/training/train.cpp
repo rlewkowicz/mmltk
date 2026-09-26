@@ -205,8 +205,10 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   std::vector<std::pair<std::filesystem::path, mmltk::common::io::FileSnapshot>> admitted_files;
   {
    admitted_files.reserve(5);
-   for (const auto& [role, path] : std::array{std::pair{"train", options.train_compiled_path}, std::pair{"validation", options.val_compiled_path}, std::pair{"test", options.test_compiled_path},
-         std::pair{"class-layout", options.class_layout_path}, std::pair{"initial-state", options.resume_path.empty() ? options.weights_path : options.resume_path}}) {
+   for (const auto& [role, path] : std::array{
+         std::pair{"train", options.train_compiled_path}, std::pair{"validation", options.val_compiled_path}, std::pair{"test", options.test_compiled_path},
+         std::pair{"class-layout", options.class_layout_path}, std::pair{"initial-state", options.resume_path.empty() ? options.weights_path : options.resume_path}
+        }) {
     if (!path.empty()) {
      const auto snapshot = mmltk::common::io::FileSnapshot::Read(path);
      std::ostringstream signature;
@@ -693,9 +695,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
       session.models.push_back({models[i]->id(), {}, {}, successful_images[i], best ? std::optional{best->artifact} : std::nullopt});
       if (best) candidate_admissions.push_back(best->admission);
      }
-     checkpoint->publish(
-      session, immutable_plan, [&](const std::filesystem::path& destination, std::size_t index) { models[index]->save_resume(destination, metadata, session.attempt_id, original_descriptor); },
-      candidate_admissions);
+     checkpoint->publish(session, immutable_plan,
+      [&](const std::filesystem::path& destination, std::size_t index) { models[index]->save_resume(destination, metadata, session.attempt_id, original_descriptor); }, candidate_admissions);
      for (auto& publication : publications) publication.finish();
      last_checkpoint_path = checkpoint->path();
      latest = {};

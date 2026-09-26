@@ -142,9 +142,12 @@ TEST_CASE("Flat mask runs match independent pixel membership through clipped row
   const std::array<std::vector<std::uint32_t>, 14U> cases{
    {{}, {0U, 0U}, {11U, 32U}, {0U, std::numeric_limits<std::uint32_t>::max()}, {116U, 6U, 117U, 9U, std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max()},
     {2U, 4U, 12U, 29U, 63U, 21U, 101U, 2U}, {0U, pixel_count}, {row_width / 2U, 2U * row_width}, {row_width - 1U, row_width + 2U}, {row_width - 1U, 1U}, {row_width, 1U}, {row_width, 2U * row_width},
-    {pixel_count - 1U, std::numeric_limits<std::uint32_t>::max()}, {0U, row_width, row_width + 1U, row_width, 3U * row_width, 2U * row_width, pixel_count, 1U}}};
-  const std::array<raster::IntRect, 14U> clips{{{0, 0, width, height}, {5, 3, 6, 4}, {4, 1, 9, 5}, {2, 2, 2, 7}, {1, 5, 8, 5}, {-7, -9, 4, 2}, {width, height, 20, 20},
-   {width / 2, 0, width / 2 + 1, height}, {1, 0, width - 1, height}, {0, 1, width, height - 1}, {0, 0, 0, height}, {-4, -3, -1, height}, {0, height + 1, width, height + 3}, {0, -4, width, -1}}};
+    {pixel_count - 1U, std::numeric_limits<std::uint32_t>::max()}, {0U, row_width, row_width + 1U, row_width, 3U * row_width, 2U * row_width, pixel_count, 1U}}
+  };
+  const std::array<raster::IntRect, 14U> clips{
+   {{0, 0, width, height}, {5, 3, 6, 4}, {4, 1, 9, 5}, {2, 2, 2, 7}, {1, 5, 8, 5}, {-7, -9, 4, 2}, {width, height, 20, 20}, {width / 2, 0, width / 2 + 1, height}, {1, 0, width - 1, height},
+    {0, 1, width, height - 1}, {0, 0, 0, height}, {-4, -3, -1, height}, {0, height + 1, width, height + 3}, {0, -4, width, -1}}
+  };
   for (const auto& runs : cases)
    for (const auto clip : clips) {
     CAPTURE(runs, clip.x1, clip.y1, clip.x2, clip.y2);
@@ -162,12 +165,13 @@ TEST_CASE("Flat mask runs match independent pixel membership through clipped row
      }
     CUDA_ASSERT_OK(cudaMemsetAsync(storage, untouched, expected.size(), stream));
     if (!runs.empty()) CUDA_ASSERT_OK(cudaMemcpyAsync(pairs, runs.data(), runs.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream));
-    CHECK(raster::raster_mask_runs_rgba({.overlay = {storage + guard, pitch, width, height},
-           .run_pairs = runs.empty() ? nullptr : pairs,
-           .run_count = static_cast<std::uint32_t>(runs.size() / 2U),
-           .color = {color[0], color[1], color[2], color[3]},
-           .stream = {reinterpret_cast<void*>(stream)},
-           .clip = clip}) == (runs.empty() ? cudaErrorInvalidValue : cudaSuccess));
+    CHECK(raster::raster_mask_runs_rgba(
+           {.overlay = {storage + guard, pitch, width, height},
+            .run_pairs = runs.empty() ? nullptr : pairs,
+            .run_count = static_cast<std::uint32_t>(runs.size() / 2U),
+            .color = {color[0], color[1], color[2], color[3]},
+            .stream = {reinterpret_cast<void*>(stream)},
+            .clip = clip}) == (runs.empty() ? cudaErrorInvalidValue : cudaSuccess));
     CUDA_ASSERT_OK(cudaStreamSynchronize(stream));
     std::vector<std::uint8_t> actual(expected.size());
     CUDA_ASSERT_OK(cudaMemcpy(actual.data(), storage, actual.size(), cudaMemcpyDeviceToHost));

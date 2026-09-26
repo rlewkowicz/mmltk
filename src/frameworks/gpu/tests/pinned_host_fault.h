@@ -19,29 +19,30 @@ public:
  [[nodiscard]] unsigned synchronizations() const noexcept { return synchronizations_; }
  [[nodiscard]] PinnedHostBuffer::Operations operations() noexcept {
   return {
-   .context = {this, [](void*, CUcontext* context) noexcept { return cuCtxGetCurrent(context); },
+   .context = {
+    this, [](void*, CUcontext* context) noexcept { return cuCtxGetCurrent(context); },
     [](void* value, CUcontext context) noexcept {
-     auto& owner = *static_cast<PinnedHostFault*>(value);
-     if (owner.armed_ && owner.configuration_.restore && ++owner.restores_ == 2U) return CUDA_ERROR_CONTEXT_IS_DESTROYED;
-     return cuCtxSetCurrent(context);
-    }},
+   auto& owner = *static_cast<PinnedHostFault*>(value);
+   if (owner.armed_ && owner.configuration_.restore && ++owner.restores_ == 2U) return CUDA_ERROR_CONTEXT_IS_DESTROYED;
+   return cuCtxSetCurrent(context);
+  }
+   },
    .synchronize =
     [](void* value) {
-     auto& owner = *static_cast<PinnedHostFault*>(value);
-     ++owner.synchronizations_;
-     return owner.armed_ && owner.configuration_.synchronize ? CUDA_ERROR_UNKNOWN : cuCtxSynchronize();
-    },
-   .unregister =
-    [](void* value, void* address) {
-     auto& owner = *static_cast<PinnedHostFault*>(value);
-     ++owner.unregisters_;
-     if (owner.armed_) {
-      ++owner.armed_unregisters_;
-      const auto call = owner.configuration_.unregister_call;
-      if (call && (*call == 0U || *call == owner.armed_unregisters_)) return CUDA_ERROR_UNKNOWN;
-     }
-     return cuMemHostUnregister(address);
-    },
+   auto& owner = *static_cast<PinnedHostFault*>(value);
+   ++owner.synchronizations_;
+   return owner.armed_ && owner.configuration_.synchronize ? CUDA_ERROR_UNKNOWN : cuCtxSynchronize();
+  },
+   .unregister = [](void* value, void* address) {
+   auto& owner = *static_cast<PinnedHostFault*>(value);
+   ++owner.unregisters_;
+   if (owner.armed_) {
+    ++owner.armed_unregisters_;
+    const auto call = owner.configuration_.unregister_call;
+    if (call && (*call == 0U || *call == owner.armed_unregisters_)) return CUDA_ERROR_UNKNOWN;
+   }
+   return cuMemHostUnregister(address);
+  },
   };
  }
 

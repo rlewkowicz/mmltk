@@ -80,8 +80,10 @@ void reject_local_curl_failure(const CURLcode result) {
 void trace_transfer_progress(const BenchmarkTraceSink& trace, const DownloadRequest& request, const std::uint64_t completed, const std::uint64_t total, const std::uint32_t attempt, const bool resumed,
  const std::uint64_t retained, const std::uint64_t durable, const bool redownload) {
  trace_benchmark_event(trace, "benchmark.download.progress", [&] {
-  return nlohmann::json{{"artifact", request.artifact_id}, {"completed_bytes", completed}, {"total_bytes", total}, {"attempt", attempt}, {"resumed", resumed}, {"cache_hit", false},
-   {"retained_bytes", retained}, {"durable_bytes", durable}, {"redownload", redownload}};
+  return nlohmann::json{
+   {"artifact", request.artifact_id}, {"completed_bytes", completed}, {"total_bytes", total}, {"attempt", attempt}, {"resumed", resumed}, {"cache_hit", false}, {"retained_bytes", retained},
+   {"durable_bytes", durable}, {"redownload", redownload}
+  };
  });
 }
 class CurlGlobal {
@@ -570,8 +572,10 @@ struct IdentityProbe {
   }
   if (probe.http.response_code == 200L || (valid_range && !strong_etag && probe.http.last_modified.empty())) { throw SegmentedDownloadUnsupported("server does not provide stable ranged downloads"); }
   trace_benchmark_event(trace, "benchmark.download.segmented_probe_retry", [&] {
-   return nlohmann::json{{"artifact", request.artifact_id}, {"attempt", attempt}, {"curl_code", static_cast<int>(result)}, {"http_status", probe.http.response_code},
-    {"detail", probe.error_buffer[0] != '\0' ? probe.error_buffer.data() : curl_easy_strerror(result)}};
+   return nlohmann::json{
+    {"artifact", request.artifact_id}, {"attempt", attempt}, {"curl_code", static_cast<int>(result)}, {"http_status", probe.http.response_code},
+    {"detail", probe.error_buffer[0] != '\0' ? probe.error_buffer.data() : curl_easy_strerror(result)}
+   };
   });
   if (attempt == request.maximum_attempts) { throw BenchmarkDownloadUnavailable("cannot establish a stable ranged download identity for " + request.artifact_id); }
   // The remote probe retry is intentionally deadline-based HTTP backoff, not local status polling.
@@ -664,8 +668,10 @@ private:
  [[nodiscard]] nlohmann::json metadata_locked() const {
   nlohmann::json segments = nlohmann::json::array();
   for (const DownloadSegment& segment : segments_) { segments.push_back({{"begin", segment.begin}, {"end", segment.end}, {"completed", segment.completed}, {"attempts", segment.attempts}}); }
-  return nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion}, {"mode", "segmented"}, {"url", request_.url}, {"size", request_.expected_size}, {"etag", identity_.etag},
-   {"last_modified", identity_.last_modified}, {"segments", std::move(segments)}};
+  return nlohmann::json{
+   {"schema_version", kBenchmarkCacheSchemaVersion}, {"mode", "segmented"}, {"url", request_.url}, {"size", request_.expected_size}, {"etag", identity_.etag},
+   {"last_modified", identity_.last_modified}, {"segments", std::move(segments)}
+  };
  }
  void load_resume_state() {
   bool valid = false;
@@ -728,7 +734,8 @@ private:
   if (force || completed <= request_.expected_size) {
    if (progress_) {
     progress_(DownloadProgress{
-     request_.artifact_id, {completed, request_.expected_size, retained_bytes_, attempts, false, retained_bytes_ != 0U}, DownloadProgressPhase::kDownloading, request_.redownload, request_.source});
+     request_.artifact_id, {completed, request_.expected_size, retained_bytes_, attempts, false, retained_bytes_ != 0U}, DownloadProgressPhase::kDownloading, request_.redownload, request_.source
+    });
    }
    trace_transfer_progress(trace_, request_, completed, request_.expected_size, attempts, retained_bytes_ != 0U, retained_bytes_, durable, request_.redownload);
   }
@@ -897,8 +904,10 @@ struct SegmentTransfer {
    if (transfer.http.response_code == 200L) { throw SegmentedDownloadUnsupported("server ignored a segmented byte range"); }
    if (complete) { break; }
    trace_benchmark_event(trace, "benchmark.download.segment_retry", [&] {
-    return nlohmann::json{{"artifact", request.artifact_id}, {"segment", segment_index}, {"attempt", attempt}, {"curl_code", static_cast<int>(result)}, {"http_status", transfer.http.response_code},
-     {"completed_bytes", transfer.transferred()}, {"detail", transfer.error_buffer[0] != '\0' ? transfer.error_buffer.data() : curl_easy_strerror(result)}};
+    return nlohmann::json{
+     {"artifact", request.artifact_id}, {"segment", segment_index}, {"attempt", attempt}, {"curl_code", static_cast<int>(result)}, {"http_status", transfer.http.response_code},
+     {"completed_bytes", transfer.transferred()}, {"detail", transfer.error_buffer[0] != '\0' ? transfer.error_buffer.data() : curl_easy_strerror(result)}
+    };
    });
    if (attempt == request.maximum_attempts) { throw BenchmarkDownloadUnavailable("segmented benchmark download failed after retries for " + request.artifact_id); }
    // The remote segment retry is intentionally deadline-based HTTP backoff.
@@ -929,15 +938,19 @@ struct SegmentTransfer {
  sync_parent_directory(request.destination);
  const std::uint32_t attempts = state.maximum_attempts();
  write_json_atomically(complete_metadata_path(request),
-  nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"url", request.url}, {"size", request.expected_size}, {"identity", identity_digest},
-   {"integrity_mode", "http_identity_size"}, {"etag", identity.etag}, {"last_modified", identity.last_modified}, {"attempts", attempts}, {"segments", segment_count}},
+  nlohmann::json{
+   {"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"url", request.url}, {"size", request.expected_size}, {"identity", identity_digest}, {"integrity_mode", "http_identity_size"},
+   {"etag", identity.etag}, {"last_modified", identity.last_modified}, {"attempts", attempts}, {"segments", segment_count}
+  },
   cancel_requested);
  std::error_code remove_error;
  std::filesystem::remove(partial_metadata_path(request), remove_error);
  if (remove_error) { throw std::filesystem::filesystem_error("cannot remove segmented download metadata", partial_metadata_path(request), remove_error); }
  trace_benchmark_event(trace, "benchmark.download.segmented_complete", [&] {
-  return nlohmann::json{{"artifact", request.artifact_id}, {"bytes", request.expected_size}, {"identity", identity_digest}, {"segments", segment_count}, {"attempts", attempts},
-   {"resumed", state.retained_bytes() != 0U}, {"retained_bytes", state.retained_bytes()}, {"redownload", request.redownload}};
+  return nlohmann::json{
+   {"artifact", request.artifact_id}, {"bytes", request.expected_size}, {"identity", identity_digest}, {"segments", segment_count}, {"attempts", attempts}, {"resumed", state.retained_bytes() != 0U},
+   {"retained_bytes", state.retained_bytes()}, {"redownload", request.redownload}
+  };
  });
  return DownloadResult{
   request.destination,
@@ -963,15 +976,18 @@ struct SegmentTransfer {
  std::filesystem::rename(partial_path(request), request.destination);
  sync_parent_directory(request.destination);
  write_json_atomically(complete_metadata_path(request),
-  nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"url", request.url}, {"size", size}, {"identity", identity}, {"integrity_mode", "http_identity_size"},
-   {"etag", transfer.effective_etag()}, {"last_modified", transfer.effective_last_modified()}, {"attempts", transfer.attempt}},
+  nlohmann::json{
+   {"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"url", request.url}, {"size", size}, {"identity", identity}, {"integrity_mode", "http_identity_size"},
+   {"etag", transfer.effective_etag()}, {"last_modified", transfer.effective_last_modified()}, {"attempts", transfer.attempt}
+  },
   transfer.cancel_requested);
  std::error_code ignored;
  std::filesystem::remove(partial_metadata_path(request), ignored);
  transfer.emit_progress(size, size, size);
  trace_benchmark_event(transfer.trace, "benchmark.download.complete", [&] {
   return nlohmann::json{
-   {"artifact", request.artifact_id}, {"bytes", size}, {"attempt", transfer.attempt}, {"resumed", transfer.resumed && !transfer.response_restarted}, {"redownload", transfer.redownload}};
+   {"artifact", request.artifact_id}, {"bytes", size}, {"attempt", transfer.attempt}, {"resumed", transfer.resumed && !transfer.response_restarted}, {"redownload", transfer.redownload}
+  };
  });
  return DownloadResult{
   request.destination,
@@ -1105,8 +1121,10 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
    if (error) { throw std::filesystem::filesystem_error("cannot reset benchmark partial metadata", partial_metadata_path(transfer.request), error); }
   }
   trace_benchmark_event(trace, "benchmark.download.attempt_failed", [&] {
-   return nlohmann::json{{"artifact", transfer.request.artifact_id}, {"attempt", transfer.attempt}, {"curl_code", static_cast<int>(curl_code)}, {"http_status", transfer.http.response_code},
-    {"reset_partial", reset_partial}, {"detail", detail}};
+   return nlohmann::json{
+    {"artifact", transfer.request.artifact_id}, {"attempt", transfer.attempt}, {"curl_code", static_cast<int>(curl_code)}, {"http_status", transfer.http.response_code},
+    {"reset_partial", reset_partial}, {"detail", detail}
+   };
   });
   if (transfer.attempt >= transfer.request.maximum_attempts) { throw BenchmarkDownloadUnavailable("benchmark download failed after retries for " + transfer.request.artifact_id + ": " + detail); }
   const auto backoff = std::chrono::milliseconds{std::min<std::uint64_t>(4000U, 250U << std::min<std::uint32_t>(transfer.attempt - 1U, 4U))};

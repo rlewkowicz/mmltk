@@ -221,13 +221,16 @@ DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::framew
  state.slots.resize(useful_slots);
  // Scheduled starts increase; only the last global batch can be short.
  const auto maximum_count = state.batch_starts.empty() ? 0U : std::min(config.batch_size, state.order.size() - state.batch_starts.front());
- state.stream = std::make_unique<CompiledImageStream>(CompiledImageStream::Config{.slots = state.slots.size(),
-                                                       .workers = workers,
-                                                       .device = config.device_id,
-                                                       .cpu_affinity = config.cpu_affinity,
-                                                       .loading = config.loading,
-                                                       .execution = execution,
-                                                       .record_consumer = record_consumer},
+ state.stream = std::make_unique<CompiledImageStream>(
+  CompiledImageStream::Config{
+   .slots = state.slots.size(),
+   .workers = workers,
+   .device = config.device_id,
+   .cpu_affinity = config.cpu_affinity,
+   .loading = config.loading,
+   .execution = execution,
+   .record_consumer = record_consumer
+  },
   std::move(retirement));
  const auto stride = static_cast<size_t>(state.source->header().image_stride);
  if (config.batch_size > std::numeric_limits<size_t>::max() / stride) throw std::overflow_error("dataset batch storage size overflow");
@@ -353,8 +356,9 @@ bool DatasetLoader::next_batch(Batch& out, std::stop_token stop) {
   if (slot.batch == impl_->consumed && slot.state == Impl::State::Ready) {
    slot.state = Impl::State::CheckedOut;
    ++impl_->consumed;
-   out = {.draw_keys = impl_->explicit_schedule && !impl_->explicit_schedule->draw_keys.empty() ? std::span<const std::uint64_t>{impl_->explicit_schedule->draw_keys}.subspan(slot.start, slot.count)
-                                                                                                : std::span<const std::uint64_t>{},
+   out = {
+    .draw_keys = impl_->explicit_schedule && !impl_->explicit_schedule->draw_keys.empty() ? std::span<const std::uint64_t>{impl_->explicit_schedule->draw_keys}.subspan(slot.start, slot.count)
+                                                                                          : std::span<const std::uint64_t>{},
     .microbatch_key = impl_->explicit_schedule && !impl_->explicit_schedule->microbatch_keys.empty() ? impl_->explicit_schedule->microbatch_keys.at(slot.start / impl_->config.batch_size) : 0,
     .num_images = slot.count,
     .device_images = static_cast<const float*>(impl_->stream->device_storage(index).data()),
@@ -366,7 +370,8 @@ bool DatasetLoader::next_batch(Batch& out, std::stop_token stop) {
     .lease_id = slot.lease,
     .owner = impl_.get(),
     .image_custody = impl_->stream->storage_custody(),
-    .image_capacity_bytes = slot.count * impl_->source->header().image_stride};
+    .image_capacity_bytes = slot.count * impl_->source->header().image_stride
+   };
    return true;
   }
   impl_->changed.wait(lock);

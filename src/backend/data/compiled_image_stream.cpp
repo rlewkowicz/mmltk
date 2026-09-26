@@ -521,7 +521,8 @@ void CompiledImageStream::read_slot(const std::size_t index) noexcept {
      destination.begin_write();
      read = source.read_images_to(current.reads,
       CompiledDataset::ImageDestination{
-       &destination, destination.capacity_bytes(), [](void* buffer, std::size_t offset, std::span<const std::byte> bytes) { static_cast<Buffer*>(buffer)->write(offset, bytes); }},
+       &destination, destination.capacity_bytes(), [](void* buffer, std::size_t offset, std::span<const std::byte> bytes) { static_cast<Buffer*>(buffer)->write(offset, bytes); }
+      },
       current.cancelled, impl_->config.prefault);
      if (read) destination.publish(nullptr);
     });

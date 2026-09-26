@@ -65,12 +65,12 @@ TEST_CASE("Predict retains admission facts with accepted settings and operation 
  auto [settings, dataset, model] = fixture.systems();
  const auto revision = settings.snapshot().revision;
  std::promise<void> settled;
- PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [](DirectComputeConfiguration) { return std::make_unique<AdmittedPredictRuntime>(); },
-  [&](PredictSystem::event_type event) {
-   if (const auto* changed = std::get_if<PredictChanged>(&event); changed && !changed->snapshot.operation.active && changed->snapshot.operation.generation_frontier)
-    mmltk::testsupport::release_test_promise(settled);
-  },
-  [](int, int) { return DirectComputeConfiguration{}; }};
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [](DirectComputeConfiguration) {
+  return std::make_unique<AdmittedPredictRuntime>();
+ }, [&](PredictSystem::event_type event) {
+  if (const auto* changed = std::get_if<PredictChanged>(&event); changed && !changed->snapshot.operation.active && changed->snapshot.operation.generation_frontier)
+   mmltk::testsupport::release_test_promise(settled);
+ }, [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(prediction.Start({}));
  mmltk::testsupport::await_test_promise(settled, "prediction admitted capacity");
  const auto snapshot = prediction.snapshot();
@@ -144,15 +144,12 @@ TEST_CASE("Predict seals unsafe execution and close custody across repeated admi
  std::atomic_size_t constructions = 0U;
  std::promise<void> failed;
  {
-  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-   [&](DirectComputeConfiguration) {
-    ++constructions;
-    return std::make_unique<UnsafePredictRuntime>(on_close, custody, preview_terminal);
-   },
-   [&](PredictSystem::event_type event) {
-    if (const auto* failure = std::get_if<PredictFailed>(&event); failure && !failure->snapshot.operation.active) mmltk::testsupport::release_test_promise(failed);
-   },
-   [](int, int) { return DirectComputeConfiguration{}; }};
+  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [&](DirectComputeConfiguration) {
+   ++constructions;
+   return std::make_unique<UnsafePredictRuntime>(on_close, custody, preview_terminal);
+  }, [&](PredictSystem::event_type event) {
+   if (const auto* failure = std::get_if<PredictFailed>(&event); failure && !failure->snapshot.operation.active) mmltk::testsupport::release_test_promise(failed);
+  }, [](int, int) { return DirectComputeConfiguration{}; }};
   static_cast<void>(prediction.Start({}));
   mmltk::testsupport::await_test_promise(failed, "unsafe Predict settlement");
   REQUIRE_FALSE(prediction.snapshot().operation.active);
@@ -186,19 +183,14 @@ TEST_CASE("Predict observes receiver retirement discovered while releasing a rep
  auto [settings, dataset, model] = fixture.systems();
  unsigned constructions = 0;
  std::array<std::promise<void>, 2> settled;
- PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [&](DirectComputeConfiguration) {
-   ++constructions;
-   return std::make_unique<ReleasingRuntime>();
-  },
-  [&](const PredictSystem::event_type& event) {
-   std::visit(
-    [&](const auto& value) {
-     if (!value.snapshot.operation.active && value.snapshot.operation.generation_frontier) mmltk::testsupport::release_test_promise(settled.at(value.snapshot.operation.generation_frontier - 1U));
-    },
-    event);
-  },
-  [](int device, int numa) { return DirectComputeConfiguration{.numa_node = device + numa}; }};
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [&](DirectComputeConfiguration) {
+  ++constructions;
+  return std::make_unique<ReleasingRuntime>();
+ }, [&](const PredictSystem::event_type& event) {
+  std::visit([&](const auto& value) {
+   if (!value.snapshot.operation.active && value.snapshot.operation.generation_frontier) mmltk::testsupport::release_test_promise(settled.at(value.snapshot.operation.generation_frontier - 1U));
+  }, event);
+ }, [](int device, int numa) { return DirectComputeConfiguration{.numa_node = device + numa}; }};
  static_cast<void>(prediction.Start({}));
  mmltk::testsupport::await_test_promise(settled[0], "initial receiver run");
  REQUIRE(prediction.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
@@ -220,18 +212,15 @@ TEST_CASE("Predict distinguishes ordinary from terminal runtime construction fai
  auto [settings, dataset, model] = fixture.systems();
  unsigned constructions = 0U;
  std::array<std::promise<void>, 2> failed;
- PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [&](DirectComputeConfiguration) -> std::unique_ptr<PredictRuntime> {
-   ++constructions;
-   const auto failure = std::make_exception_ptr(std::runtime_error("injected runtime construction refusal"));
-   if (terminal) throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(failure);
-   std::rethrow_exception(failure);
-  },
-  [&](PredictSystem::event_type event) {
-   if (const auto* value = std::get_if<PredictFailed>(&event); value && !value->snapshot.operation.active)
-    mmltk::testsupport::release_test_promise(failed.at(value->snapshot.operation.generation_frontier - 1U));
-  },
-  [](int, int) { return DirectComputeConfiguration{}; }};
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [&](DirectComputeConfiguration) -> std::unique_ptr<PredictRuntime> {
+  ++constructions;
+  const auto failure = std::make_exception_ptr(std::runtime_error("injected runtime construction refusal"));
+  if (terminal) throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(failure);
+  std::rethrow_exception(failure);
+ }, [&](PredictSystem::event_type event) {
+  if (const auto* value = std::get_if<PredictFailed>(&event); value && !value->snapshot.operation.active)
+   mmltk::testsupport::release_test_promise(failed.at(value->snapshot.operation.generation_frontier - 1U));
+ }, [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(prediction.Start({}));
  mmltk::testsupport::await_test_promise(failed[0], "prediction construction refusal");
  if (terminal)
@@ -251,17 +240,14 @@ TEST_CASE("prediction count inspection preserves source identity and revalidates
  std::promise<void> inspected, failed;
  std::atomic_size_t constructions = 0U;
  const auto path = (root / "train.bin").string();
- PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [&](DirectComputeConfiguration) {
-   ++constructions;
-   return std::make_unique<UnsafePredictRuntime>(false, std::make_shared<int>(0));
-  },
-  [&](PredictSystem::event_type event) {
-   if (const auto* changed = std::get_if<PredictChanged>(&event); changed && changed->snapshot.inspection.path == path && !changed->snapshot.inspection.active)
-    mmltk::testsupport::release_test_promise(inspected);
-   if (const auto* failure = std::get_if<PredictFailed>(&event); failure && !failure->snapshot.operation.active) mmltk::testsupport::release_test_promise(failed);
-  },
-  [](int, int) { return DirectComputeConfiguration{}; }};
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [&](DirectComputeConfiguration) {
+  ++constructions;
+  return std::make_unique<UnsafePredictRuntime>(false, std::make_shared<int>(0));
+ }, [&](PredictSystem::event_type event) {
+  if (const auto* changed = std::get_if<PredictChanged>(&event); changed && changed->snapshot.inspection.path == path && !changed->snapshot.inspection.active)
+   mmltk::testsupport::release_test_promise(inspected);
+  if (const auto* failure = std::get_if<PredictFailed>(&event); failure && !failure->snapshot.operation.active) mmltk::testsupport::release_test_promise(failed);
+ }, [](int, int) { return DirectComputeConfiguration{}; }};
  CHECK_THROWS_AS(prediction.Inspect({}), contracts::InvalidIntentError);
  static_cast<void>(prediction.Inspect({path}));
  mmltk::testsupport::await_test_promise(inspected, "prediction source inspection");
@@ -351,14 +337,14 @@ TEST_CASE("prediction application retains admitted outputs with independent medi
  fixture.PrepareModel(contracts::FeatureId::Predict);
  DatasetSystem dataset{settings, [] { return std::make_unique<OutputDatasetRuntime>(); }};
  std::promise<void> terminal;
- PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 8U, .maximum_height = 8U}, [](DirectComputeConfiguration) { return std::make_unique<OutputPredictRuntime>(); },
-  [&](PredictSystem::event_type event) {
-   if (const auto* changed = std::get_if<PredictChanged>(&event); changed && changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded)
-    mmltk::testsupport::release_test_promise(terminal);
-   else if (std::holds_alternative<PredictFailed>(event))
-    mmltk::testsupport::release_test_promise(terminal);
-  },
-  [](int, int) { return DirectComputeConfiguration{}; }};
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 8U, .maximum_height = 8U}, [](DirectComputeConfiguration) {
+  return std::make_unique<OutputPredictRuntime>();
+ }, [&](PredictSystem::event_type event) {
+  if (const auto* changed = std::get_if<PredictChanged>(&event); changed && changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded)
+   mmltk::testsupport::release_test_promise(terminal);
+  else if (std::holds_alternative<PredictFailed>(event))
+   mmltk::testsupport::release_test_promise(terminal);
+ }, [](int, int) { return DirectComputeConfiguration{}; }};
  contracts::PredictWorkflowIntent intent;
  intent.saving.compiled_enabled = saving;
  intent.saving.single_enabled = saving;
@@ -393,15 +379,12 @@ TEST_CASE("impossible compiled saving under inference limit fails before reserva
  DatasetSystem dataset{settings, [] { return std::make_unique<OutputDatasetRuntime>(); }};
  std::promise<void> failed;
  std::atomic_size_t constructions = 0;
- PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [&](DirectComputeConfiguration) {
-   ++constructions;
-   return std::make_unique<OutputPredictRuntime>();
-  },
-  [&](PredictSystem::event_type event) {
-   if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(failed);
-  },
-  [](int, int) { return DirectComputeConfiguration{}; }};
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [&](DirectComputeConfiguration) {
+  ++constructions;
+  return std::make_unique<OutputPredictRuntime>();
+ }, [&](PredictSystem::event_type event) {
+  if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(failed);
+ }, [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(prediction.Start({}));
  mmltk::testsupport::await_test_promise(failed, "prediction impossible saving count");
  CHECK(constructions == 0U);
@@ -470,24 +453,21 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
  std::atomic_size_t constructions = 0U;
  std::promise<void> first_frame, first_done, second_done, visual_failure, recovered;
  {
-  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-   [&](DirectComputeConfiguration) {
-    ++constructions;
-    return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .receiver_fault = fault});
-   },
-   [&](PredictSystem::event_type event) {
-    if (const auto* changed = std::get_if<PredictChanged>(&event)) {
-     const auto& state = changed->snapshot;
-     if (state.frame.valid() && state.operation.generation_frontier == 1U) mmltk::testsupport::release_test_promise(first_frame);
-     if (!state.operation.active) {
-      if (state.operation.generation_frontier == 1U) mmltk::testsupport::release_test_promise(first_done);
-      if (state.operation.generation_frontier == 2U) mmltk::testsupport::release_test_promise(second_done);
-     }
-     if (state.operation.generation_frontier == 3U && state.frame.revision > 1U) mmltk::testsupport::release_test_promise(recovered);
+  PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [&](DirectComputeConfiguration) {
+   ++constructions;
+   return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .receiver_fault = fault});
+  }, [&](PredictSystem::event_type event) {
+   if (const auto* changed = std::get_if<PredictChanged>(&event)) {
+    const auto& state = changed->snapshot;
+    if (state.frame.valid() && state.operation.generation_frontier == 1U) mmltk::testsupport::release_test_promise(first_frame);
+    if (!state.operation.active) {
+     if (state.operation.generation_frontier == 1U) mmltk::testsupport::release_test_promise(first_done);
+     if (state.operation.generation_frontier == 2U) mmltk::testsupport::release_test_promise(second_done);
     }
-    if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(visual_failure);
-   },
-   [](int, int) { return DirectComputeConfiguration{}; }};
+    if (state.operation.generation_frontier == 3U && state.frame.revision > 1U) mmltk::testsupport::release_test_promise(recovered);
+   }
+   if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(visual_failure);
+  }, [](int, int) { return DirectComputeConfiguration{}; }};
   const mmltk::testsupport::ScopedTestCleanup stop{[&] {
    fault->upload.Release();
    prediction.Shutdown();
@@ -538,13 +518,12 @@ TEST_CASE("prediction preview refusal preserves successful inference completion"
  gate->Release();
  std::promise<PredictSnapshot> completed;
  std::promise<PredictFailed> preview_failed;
- PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [gate](DirectComputeConfiguration) { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .refuse_preview = true}); },
-  [&](PredictSystem::event_type event) {
-   if (auto* failure = std::get_if<PredictFailed>(&event)) preview_failed.set_value(std::move(*failure));
-   if (auto* changed = std::get_if<PredictChanged>(&event); changed && !changed->snapshot.operation.active) completed.set_value(std::move(changed->snapshot));
-  },
-  [](int, int) { return DirectComputeConfiguration{}; }};
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [gate](DirectComputeConfiguration) {
+  return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .refuse_preview = true});
+ }, [&](PredictSystem::event_type event) {
+  if (auto* failure = std::get_if<PredictFailed>(&event)) preview_failed.set_value(std::move(*failure));
+  if (auto* changed = std::get_if<PredictChanged>(&event); changed && !changed->snapshot.operation.active) completed.set_value(std::move(changed->snapshot));
+ }, [](int, int) { return DirectComputeConfiguration{}; }};
  static_cast<void>(prediction.Start({}));
  const auto failure = mmltk::testsupport::await_test_promise(preview_failed, "prediction preview refusal");
  CHECK(failure.snapshot.operation.terminal.outcome != contracts::ComputeOperationOutcome::Failed);
@@ -980,21 +959,20 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
  std::promise<void> failed;
  std::atomic_size_t published = 0U;
  std::atomic_uint64_t last_revision = 0U;
- PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-  [&](DirectComputeConfiguration) { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .source_index = source_index, .labels = 1U}); },
-  [&](PredictSystem::event_type event) {
-   if (const auto* changed = std::get_if<PredictChanged>(&event)) {
-    const auto& snapshot = changed->snapshot;
-    if (!snapshot.operation.active && snapshot.operation.generation_frontier <= done.size()) mmltk::testsupport::release_test_promise(done[snapshot.operation.generation_frontier - 1U]);
-    if (snapshot.frame.valid() && snapshot.frame.revision > last_revision.load()) {
-     last_revision = snapshot.frame.revision;
-     const auto index = published.fetch_add(1U);
-     if (index < images.size()) mmltk::testsupport::release_test_promise(images[index]);
-    }
+ PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [&](DirectComputeConfiguration) {
+  return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .source_index = source_index, .labels = 1U});
+ }, [&](PredictSystem::event_type event) {
+  if (const auto* changed = std::get_if<PredictChanged>(&event)) {
+   const auto& snapshot = changed->snapshot;
+   if (!snapshot.operation.active && snapshot.operation.generation_frontier <= done.size()) mmltk::testsupport::release_test_promise(done[snapshot.operation.generation_frontier - 1U]);
+   if (snapshot.frame.valid() && snapshot.frame.revision > last_revision.load()) {
+    last_revision = snapshot.frame.revision;
+    const auto index = published.fetch_add(1U);
+    if (index < images.size()) mmltk::testsupport::release_test_promise(images[index]);
    }
-   if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(failed);
-  },
-  [](int, int) { return DirectComputeConfiguration{}; }};
+  }
+  if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(failed);
+ }, [](int, int) { return DirectComputeConfiguration{}; }};
  const mmltk::testsupport::ScopedTestCleanup stop{[&] { prediction.Shutdown(); }};
  const auto run = [&](std::size_t index) {
   source_index->store(static_cast<std::int64_t>(index));

@@ -205,7 +205,8 @@ void RgbImageResizer::resize(const uint8_t* src, int src_width, int src_height, 
   const auto layout = [](int width, int height) {
    const auto row = common::math::checked_multiply<std::size_t>(width, 3, "perceptual image extent overflow");
    return RgbImageLayout{
-    static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), row, 0, common::math::checked_multiply(row, height, "perceptual image extent overflow"), RgbPixelFormat::RGB8};
+    static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), row, 0, common::math::checked_multiply(row, height, "perceptual image extent overflow"), RgbPixelFormat::RGB8
+   };
   };
   downscale({src, layout(src_width, src_height)}, {dst, layout(dst_width, dst_height)});
   return;

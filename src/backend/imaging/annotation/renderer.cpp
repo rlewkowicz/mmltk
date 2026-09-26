@@ -99,25 +99,23 @@ struct VisibleSkeletonTopology {
 }
 [[nodiscard]] AnnotationVisibleGeometry build_visible_geometry(const AnnotationFrame& frame, const AnnotationObject& object) {
  AnnotationVisibleGeometry geometry;
- std::visit(
-  [&](const auto& shape) {
-   using Shape = std::decay_t<decltype(shape)>;
-   if constexpr (std::is_same_v<Shape, AnnotationPointShape>) {
-    geometry.frame_points.push_back(annotation_capture_point_to_frame_unclipped(frame, shape.point));
-   } else if constexpr (std::is_same_v<Shape, AnnotationSplineShape>) {
-    geometry.frame_points = sample_annotation_spline_points(shape);
-    for (AnnotationPoint& point : geometry.frame_points) { point = annotation_capture_point_to_frame_unclipped(frame, point); }
-   } else if constexpr (std::is_same_v<Shape, AnnotationSkeletonShape>) {
-    VisibleSkeletonTopology topology = visible_skeleton_topology(shape);
-    geometry.frame_points.reserve(topology.node_indices.size());
-    for (const std::size_t node_index : topology.node_indices) {
-     const AnnotationPoint& point = shape.nodes[node_index].point;
-     geometry.frame_points.push_back(annotation_capture_point_to_frame_unclipped(frame, point));
-    }
-    geometry.edges = std::move(topology.edges);
+ std::visit([&](const auto& shape) {
+  using Shape = std::decay_t<decltype(shape)>;
+  if constexpr (std::is_same_v<Shape, AnnotationPointShape>) {
+   geometry.frame_points.push_back(annotation_capture_point_to_frame_unclipped(frame, shape.point));
+  } else if constexpr (std::is_same_v<Shape, AnnotationSplineShape>) {
+   geometry.frame_points = sample_annotation_spline_points(shape);
+   for (AnnotationPoint& point : geometry.frame_points) { point = annotation_capture_point_to_frame_unclipped(frame, point); }
+  } else if constexpr (std::is_same_v<Shape, AnnotationSkeletonShape>) {
+   VisibleSkeletonTopology topology = visible_skeleton_topology(shape);
+   geometry.frame_points.reserve(topology.node_indices.size());
+   for (const std::size_t node_index : topology.node_indices) {
+    const AnnotationPoint& point = shape.nodes[node_index].point;
+    geometry.frame_points.push_back(annotation_capture_point_to_frame_unclipped(frame, point));
    }
-  },
-  object.shape);
+   geometry.edges = std::move(topology.edges);
+  }
+ }, object.shape);
  return geometry;
 }
 void project_selected_handles(const AnnotationFrame& frame, const AnnotationSceneView& document, const std::optional<std::size_t> selected_object_index, AnnotationProjectedScene& scene) {
@@ -129,40 +127,38 @@ void project_selected_handles(const AnnotationFrame& frame, const AnnotationScen
   return;
  }
  const std::size_t selected_index = *selected_object_index;
- std::visit(
-  [&](const auto& shape) {
-   using Shape = std::decay_t<decltype(shape)>;
-   if constexpr (std::is_same_v<Shape, AnnotationPointShape>) {
-    push_handle(scene, selected_index, 0U, AnnotationHandleRole::Point, object->category_index, shape.point, annotation_capture_point_to_frame_unclipped(frame, shape.point));
-   } else if constexpr (std::is_same_v<Shape, AnnotationSplineShape>) {
-    scene.editable_handles.reserve(shape.knots.size() * 5U);
-    for (std::size_t index = 0; index < shape.knots.size(); ++index) {
-     const AnnotationSplineKnot& knot = shape.knots[index];
-     push_handle(scene, selected_index, index, AnnotationHandleRole::SplineKnot, object->category_index, knot.position, annotation_capture_point_to_frame_unclipped(frame, knot.position));
-     const auto push_spline_handle = [&](const AnnotationSplineHandle& handle, const AnnotationHandleRole role) {
-      std::optional<AnnotationPoint> point;
-      if (handle.enabled) {
-       point = handle.position;
-      } else {
-       point = default_spline_handle_capture_point(frame, shape, index, role);
-      }
-      if (!point.has_value()) return;
-      push_handle(scene, selected_index, index, role, object->category_index, *point, annotation_capture_point_to_frame_unclipped(frame, *point),
-       annotation_capture_point_to_frame_unclipped(frame, knot.position), true, handle.enabled);
-     };
-     push_spline_handle(knot.in_handle, AnnotationHandleRole::SplineInHandle);
-     push_spline_handle(knot.out_handle, AnnotationHandleRole::SplineOutHandle);
-    }
-   } else if constexpr (std::is_same_v<Shape, AnnotationSkeletonShape>) {
-    scene.editable_handles.reserve(shape.nodes.size());
-    for (std::size_t index = 0; index < shape.nodes.size(); ++index) {
-     const AnnotationSkeletonNode& node = shape.nodes[index];
-     if (!node.visible) continue;
-     push_handle(scene, selected_index, index, AnnotationHandleRole::SkeletonNode, object->category_index, node.point, annotation_capture_point_to_frame_unclipped(frame, node.point));
-    }
+ std::visit([&](const auto& shape) {
+  using Shape = std::decay_t<decltype(shape)>;
+  if constexpr (std::is_same_v<Shape, AnnotationPointShape>) {
+   push_handle(scene, selected_index, 0U, AnnotationHandleRole::Point, object->category_index, shape.point, annotation_capture_point_to_frame_unclipped(frame, shape.point));
+  } else if constexpr (std::is_same_v<Shape, AnnotationSplineShape>) {
+   scene.editable_handles.reserve(shape.knots.size() * 5U);
+   for (std::size_t index = 0; index < shape.knots.size(); ++index) {
+    const AnnotationSplineKnot& knot = shape.knots[index];
+    push_handle(scene, selected_index, index, AnnotationHandleRole::SplineKnot, object->category_index, knot.position, annotation_capture_point_to_frame_unclipped(frame, knot.position));
+    const auto push_spline_handle = [&](const AnnotationSplineHandle& handle, const AnnotationHandleRole role) {
+     std::optional<AnnotationPoint> point;
+     if (handle.enabled) {
+      point = handle.position;
+     } else {
+      point = default_spline_handle_capture_point(frame, shape, index, role);
+     }
+     if (!point.has_value()) return;
+     push_handle(scene, selected_index, index, role, object->category_index, *point, annotation_capture_point_to_frame_unclipped(frame, *point),
+      annotation_capture_point_to_frame_unclipped(frame, knot.position), true, handle.enabled);
+    };
+    push_spline_handle(knot.in_handle, AnnotationHandleRole::SplineInHandle);
+    push_spline_handle(knot.out_handle, AnnotationHandleRole::SplineOutHandle);
    }
-  },
-  object->shape);
+  } else if constexpr (std::is_same_v<Shape, AnnotationSkeletonShape>) {
+   scene.editable_handles.reserve(shape.nodes.size());
+   for (std::size_t index = 0; index < shape.nodes.size(); ++index) {
+    const AnnotationSkeletonNode& node = shape.nodes[index];
+    if (!node.visible) continue;
+    push_handle(scene, selected_index, index, AnnotationHandleRole::SkeletonNode, object->category_index, node.point, annotation_capture_point_to_frame_unclipped(frame, node.point));
+   }
+  }
+ }, object->shape);
 }
 }  // namespace
 AnnotationProjectedScene build_annotation_projected_scene(const AnnotationFrame& frame, const AnnotationSceneView& document, std::optional<std::size_t> selected_object_index) {

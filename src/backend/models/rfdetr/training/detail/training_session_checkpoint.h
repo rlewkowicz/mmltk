@@ -54,8 +54,7 @@ public:
  explicit TrainingSessionCheckpoint(std::filesystem::path directory);
  [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
  // All serialize callbacks run synchronously at the session's drained boundary.
- void publish(
-  TrainingSessionManifest&, const TrainingPlanState&, std::function_ref<void(const std::filesystem::path&, std::size_t)> serialize,
+ void publish(TrainingSessionManifest&, const TrainingPlanState&, std::function_ref<void(const std::filesystem::path&, std::size_t)> serialize,
   std::span<const std::shared_ptr<const TrainingArtifactAdmission>> candidates = {}, std::function_ref<void(TrainingPublicationStep)> observe = [](TrainingPublicationStep) {});
 
 private:

@@ -83,20 +83,20 @@ TEST_CASE_METHOD(DigestFileFixture, "File digest rejects mutation and replacemen
  SECTION("truncation before the read cannot expose unwritten scratch") {
   CHECK_THROWS_WITH(io::try_file_digests(path, true,
                      [&] {
-                      if (++checkpoints == 2) std::filesystem::resize_file(path, 1U);
-                      return false;
-                     }),
+   if (++checkpoints == 2) std::filesystem::resize_file(path, 1U);
+   return false;
+  }),
    "unexpected EOF during pread");
  }
  SECTION("growth after the read fails descriptor admission") {
   CHECK_THROWS_WITH(io::try_file_digests(path, true,
                      [&] {
-                      if (++checkpoints == 3) {
-                       std::ofstream file(path, std::ios::app);
-                       file << "d";
-                      }
-                      return false;
-                     }),
+   if (++checkpoints == 3) {
+    std::ofstream file(path, std::ios::app);
+    file << "d";
+   }
+   return false;
+  }),
    "artifact changed while computing digest");
  }
  SECTION("replacement before final admission fails pathname custody") {

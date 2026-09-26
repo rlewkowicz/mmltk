@@ -540,10 +540,12 @@ TEST_CASE("derived image envelopes select the exact reflected source system") {
   });
   const auto product = mmltk::frameworks::serialization::reflected_transport_value(derived.snapshot());
   REQUIRE(product);
-  const auto expected = mmltk::frameworks::serialization::reflected_transport_value(WorkspaceImageMetadata{.schema_fingerprint = application_schema_fingerprint<DerivedVisualComposition>().words,
+  const auto expected = mmltk::frameworks::serialization::reflected_transport_value(WorkspaceImageMetadata{
+   .schema_fingerprint = application_schema_fingerprint<DerivedVisualComposition>().words,
    .frame = derived.snapshot().frame,
    .product = {.system_id = product_id, .value = *product},
-   .source = SystemSnapshot{.system_id = source_id, .value = *source}});
+   .source = SystemSnapshot{.system_id = source_id, .value = *source}
+  });
   REQUIRE(expected);
   CHECK(*decoded == *expected);
  }
@@ -720,7 +722,8 @@ TEST_CASE("materialized event publisher preserves transient and essential failur
 }
 TEST_CASE("clean identity preserves semantic updates and distinguishes geometry and legacy products", "[controller][browser][reflection]") {
  const std::array kinds{
-  PresentationSourceKind::None, PresentationSourceKind::Explore, PresentationSourceKind::Annotation, PresentationSourceKind::Predict, PresentationSourceKind::Live, PresentationSourceKind::Upscale};
+  PresentationSourceKind::None, PresentationSourceKind::Explore, PresentationSourceKind::Annotation, PresentationSourceKind::Predict, PresentationSourceKind::Live, PresentationSourceKind::Upscale
+ };
  for (std::size_t session = 0U; session < kinds.size(); ++session) CHECK(presentation_source_session(kinds[session]) == session);
  auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, {32U, 24U}, 7U);
  frame.content = {1U, 2U, 20U, 16U};
@@ -780,7 +783,7 @@ TEST_CASE("closed application categories discover nested reflected declarations 
 TEST_CASE("annotation fingerprints preserve canonical names typed values and order", "[controller][browser][reflection]") {
  namespace policy = mmltk::frameworks::reflection;
  using Annotations = policy::MaterializedAnnotations<policy::Minimum<std::int32_t>{-2}, policy::Maximum<std::uint16_t>{7U}, policy::Finite{}, policy::MinBytes{1U}, policy::MaxBytes{8U},
-                                                   policy::MaxItems{3U}, policy::Presentation<policy::PresentationKind::Norm>{}, policy::RuntimeDestination{}>;
+  policy::MaxItems{3U}, policy::Presentation<policy::PresentationKind::Norm>{}, policy::RuntimeDestination{}>;
  STATIC_REQUIRE(Annotations::annotation_count == 8U);
  application_schema_detail::FingerprintSink actual;
  application_schema_detail::append_annotations<Annotations>(actual);
@@ -1057,8 +1060,10 @@ TEST_CASE("native application schema flattens inherited request and settings dec
   settings_default_ids.push_back(field.stable_id);
   if constexpr (std::unsigned_integral<Member> && !std::same_as<Member, bool>) integer_defaults.push_back(static_cast<std::uint64_t>(value));
  });
- CHECK((settings_default_ids == std::vector<std::uint64_t>{application_settings_field_stable_id("inherited_limit"), application_settings_field_stable_id("persisted_revision"),
-                                 application_settings_field_stable_id("derived_enabled")}));
+ CHECK(
+  (settings_default_ids == std::vector<std::uint64_t>{
+                            application_settings_field_stable_id("inherited_limit"), application_settings_field_stable_id("persisted_revision"), application_settings_field_stable_id("derived_enabled")
+                           }));
  CHECK((integer_defaults == std::vector<std::uint64_t>{6U, 17U}));
 }
 TEST_CASE("native application fingerprint contribution changes with an inherited field policy", "[controller][browser][reflection][inheritance]") {
@@ -1307,14 +1312,14 @@ TEST_CASE("canonical schema projects typed catalog rows and settings defaults", 
   CHECK(identities.insert(provider.stable_id).second);
   ApplicationSchema<mmltk::controller::ApplicationSystems>::template VisitCatalogRows<Provider>(
    [&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& row, const ActualRow& value) {
-    STATIC_REQUIRE(std::same_as<Row, ActualRow>);
-    ++catalog_row_count;
-    CHECK(row.provider_id == provider.stable_id);
-    REQUIRE(row.stable_id != 0U);
-    REQUIRE_FALSE(row.key.empty());
-    CHECK(identities.insert(row.stable_id).second);
-    CHECK(row.key == Provider::row_key(value));
-   });
+   STATIC_REQUIRE(std::same_as<Row, ActualRow>);
+   ++catalog_row_count;
+   CHECK(row.provider_id == provider.stable_id);
+   REQUIRE(row.stable_id != 0U);
+   REQUIRE_FALSE(row.key.empty());
+   CHECK(identities.insert(row.stable_id).second);
+   CHECK(row.key == Provider::row_key(value));
+  });
  });
  CHECK(provider_count != 0U);
  CHECK(catalog_row_count != 0U);
@@ -1322,12 +1327,12 @@ TEST_CASE("canonical schema projects typed catalog rows and settings defaults", 
  std::size_t default_count = 0U;
  ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitApplicationSettingsDefaults(
   [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsDefaultFact& fact, const Member& value) {
-   ++default_count;
-   REQUIRE(fact.stable_id != 0U);
-   REQUIRE_FALSE(fact.path.empty());
-   CHECK(default_ids.insert(fact.stable_id).second);
-   CHECK(mmltk::frameworks::serialization::reflected_value(value).has_value());
-  });
+  ++default_count;
+  REQUIRE(fact.stable_id != 0U);
+  REQUIRE_FALSE(fact.path.empty());
+  CHECK(default_ids.insert(fact.stable_id).second);
+  CHECK(mmltk::frameworks::serialization::reflected_value(value).has_value());
+ });
  CHECK(default_count == contracts::settings_vocabulary::leaf_count<contracts::GuiSettingsState>());
  std::size_t request_default_count = 0U;
  ApplicationSchema<TestSystems>::VisitEndpoints([&]<class Endpoint>() {
@@ -1367,19 +1372,19 @@ TEST_CASE("model selection compatibility is a reachable deterministic eight-row 
    std::size_t row_index = 0U;
    ApplicationSchema<mmltk::controller::ApplicationSystems>::template VisitCatalogRows<Provider>(
     [&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& fact, const ActualRow& row) {
-     STATIC_REQUIRE(std::same_as<ActualProvider, Provider>);
-     STATIC_REQUIRE(std::same_as<ActualRow, Row>);
-     REQUIRE(row_index < expected_keys.size());
-     CHECK(row.key == expected_keys[row_index]);
-     CHECK(fact.key == expected_keys[row_index]);
-     CHECK_FALSE(row.artifact_field_path.empty());
-     CHECK_FALSE(row.dialog_title.empty());
-     CHECK_FALSE(row.dialog_filter.empty());
-     CHECK_FALSE(row.dialog_pattern.empty());
-     CHECK(fact.index == row_index);
-     CHECK(fact.stable_id == application_stable_id(provider.identity, fact.key));
-     ++row_index;
-    });
+    STATIC_REQUIRE(std::same_as<ActualProvider, Provider>);
+    STATIC_REQUIRE(std::same_as<ActualRow, Row>);
+    REQUIRE(row_index < expected_keys.size());
+    CHECK(row.key == expected_keys[row_index]);
+    CHECK(fact.key == expected_keys[row_index]);
+    CHECK_FALSE(row.artifact_field_path.empty());
+    CHECK_FALSE(row.dialog_title.empty());
+    CHECK_FALSE(row.dialog_filter.empty());
+    CHECK_FALSE(row.dialog_pattern.empty());
+    CHECK(fact.index == row_index);
+    CHECK(fact.stable_id == application_stable_id(provider.identity, fact.key));
+    ++row_index;
+   });
    CHECK(row_index == expected_keys.size());
   }
  });

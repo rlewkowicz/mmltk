@@ -75,39 +75,36 @@ struct SessionFixture final {
   }
  }
  void publish(std::function_ref<void(r::TrainingPublicationStep)> observe = [](r::TrainingPublicationStep) {}) {
-  checkpoint.publish(
-   manifest, plan,
-   [&](const std::filesystem::path& destination, std::size_t index) {
-    torch::OrderedDict<std::string, torch::Tensor> parameters;
-    parameters.insert("value", torch::ones({2}, torch::TensorOptions().requires_grad(true)));
-    auto configuration = request;
-    configuration.recipe = request.lane_configuration.models[index].recipe;
-    auto optimizer = r::build_optimizer(parameters, configuration).optimizer;
-    parameters["value"].mutable_grad() = torch::ones_like(parameters["value"]);
-    optimizer.step();
-    optimizer.zero_grad(true);
-    auto values = r::testsupport::continuation_values(configuration, {.epoch = 0, .training_attempt_id = manifest.attempt_id});
-    values.data.model_id = manifest.models[index].model_id;
-    values.grad_scaler_scale = r::GradScaler::kInitialScale;
-    optimizer.set_lrs(values.schedule.absolute_lrs, 1);
-    optimizer.set_momentum(values.schedule.held_momentum);
-    if (corrupt_model == index) ++values.data.model_id;
-    torch::serialize::OutputArchive output;
-    r::detail::write_native_checkpoint_metadata(output, r::testsupport::synthetic_training_metadata());
-    r::detail::write_training_continuation(output, configuration, values);
-    mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
-    readback.Begin();
-    const std::vector<r::NormalizedModelStateEntry> state{{"value", parameters["value"]}};
-    r::detail::reserve_state_archive(state, readback, 0);
-    optimizer.reserve_checkpoint(readback, 1);
-    r::detail::write_resume_state_archive(output, "state", state, readback, 0);
-    torch::serialize::OutputArchive saved_optimizer;
-    optimizer.save(saved_optimizer, readback, 1);
-    output.write("optimizer", saved_optimizer);
-    readback.Complete();
-    r::detail::publish_native_checkpoint_archive(output, destination);
-   },
-   admissions, observe);
+  checkpoint.publish(manifest, plan, [&](const std::filesystem::path& destination, std::size_t index) {
+   torch::OrderedDict<std::string, torch::Tensor> parameters;
+   parameters.insert("value", torch::ones({2}, torch::TensorOptions().requires_grad(true)));
+   auto configuration = request;
+   configuration.recipe = request.lane_configuration.models[index].recipe;
+   auto optimizer = r::build_optimizer(parameters, configuration).optimizer;
+   parameters["value"].mutable_grad() = torch::ones_like(parameters["value"]);
+   optimizer.step();
+   optimizer.zero_grad(true);
+   auto values = r::testsupport::continuation_values(configuration, {.epoch = 0, .training_attempt_id = manifest.attempt_id});
+   values.data.model_id = manifest.models[index].model_id;
+   values.grad_scaler_scale = r::GradScaler::kInitialScale;
+   optimizer.set_lrs(values.schedule.absolute_lrs, 1);
+   optimizer.set_momentum(values.schedule.held_momentum);
+   if (corrupt_model == index) ++values.data.model_id;
+   torch::serialize::OutputArchive output;
+   r::detail::write_native_checkpoint_metadata(output, r::testsupport::synthetic_training_metadata());
+   r::detail::write_training_continuation(output, configuration, values);
+   mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
+   readback.Begin();
+   const std::vector<r::NormalizedModelStateEntry> state{{"value", parameters["value"]}};
+   r::detail::reserve_state_archive(state, readback, 0);
+   optimizer.reserve_checkpoint(readback, 1);
+   r::detail::write_resume_state_archive(output, "state", state, readback, 0);
+   torch::serialize::OutputArchive saved_optimizer;
+   optimizer.save(saved_optimizer, readback, 1);
+   output.write("optimizer", saved_optimizer);
+   readback.Complete();
+   r::detail::publish_native_checkpoint_archive(output, destination);
+  }, admissions, observe);
  }
  std::vector<std::shared_ptr<const r::TrainingArtifactAdmission>> admissions;
  std::optional<std::size_t> corrupt_model;

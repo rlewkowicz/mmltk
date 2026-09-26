@@ -45,7 +45,8 @@ namespace mmltk::controller::presentation {
 using mmltk::common::io::ScopedFd;
 contracts::DiagnosticWorkspace workspace_source_diagnostic(const workspace_surface_import::Record& record) noexcept {
  // CLEANUP-IGNORE: Workspace diagnostic projection has no shared fields or behavior with RF-DETR model preset construction.
- return {.workspace_source_high = record.id_high,
+ return {
+  .workspace_source_high = record.id_high,
   .workspace_source_low = record.id_low,
   .workspace_allocation = record.allocation_identity,
   .workspace_arena_high = record.arena_high,
@@ -54,7 +55,8 @@ contracts::DiagnosticWorkspace workspace_source_diagnostic(const workspace_surfa
   .workspace_pitch = record.stride,
   .workspace_width = record.width,
   .workspace_height = record.height,
-  .direct_sampling = record.direct_sampling != 0U};
+  .direct_sampling = record.direct_sampling != 0U
+ };
 }
 namespace {
 using workspace_surface_import::FailureCode;
@@ -309,13 +311,15 @@ struct WorkspaceSurfaceImportChannel::Impl {
    return false;
   }
   seen.push_back(id);
-  admitted.emplace_back(id, Admission{.request = record,
+  admitted.emplace_back(id, Admission{
+                             .request = record,
                              .generation = generation,
                              .selection_generation = selection_generation,
                              .frame_revision = frame_revision,
                              .width = record.width,
                              .height = record.height,
-                             .arena = record.opcode == Opcode::Arena});
+                             .arena = record.opcode == Opcode::Arena
+                            });
   EmitAdmission(record, VisualDiagnosticOperation::PresentationAdmissionEnqueued);
   if (send(record, descriptors)) return true;
   erase_id(seen, id);
@@ -345,12 +349,14 @@ struct WorkspaceSurfaceImportChannel::Impl {
    const WorkspaceSurfaceImportId id{record.id_high, record.id_low};
    const auto found = find_admission(id);
    const auto& admission = found->second;
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Presentation,
     .operation = admission.arena ? operation
                                  : (operation == VisualDiagnosticOperation::PresentationAdmissionEnqueued ? VisualDiagnosticOperation::PresentationSourceAdmissionEnqueued
                                                                                                           : VisualDiagnosticOperation::PresentationSourceAdmissionWritten),
     .generation = admission.generation,
-    .context = {.capacity_width = admission.width,
+    .context = {
+     .capacity_width = admission.width,
      .capacity_height = admission.height,
      .surface_high = id.high,
      .surface_low = id.low,
@@ -359,7 +365,9 @@ struct WorkspaceSurfaceImportChannel::Impl {
      .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted),
      .outcome = 1U,
      .allocation = {.allocation_generation = admission.generation},
-     .workspace = admission.arena ? contracts::DiagnosticWorkspace{} : workspace_source_diagnostic(record)}};
+     .workspace = admission.arena ? contracts::DiagnosticWorkspace{} : workspace_source_diagnostic(record)
+    }
+   };
   });
  }
  void flush() {

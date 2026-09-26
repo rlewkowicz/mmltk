@@ -187,10 +187,9 @@ TEST_CASE("ModelSystem records the CUDA ordinal used to inspect TensorRT", "[con
  REQUIRE(settings.Load(location).applied());
  std::vector<int> devices;
  std::array<std::promise<contracts::ModelUiState>, 2> settled;
- ModelSystem model{settings, [&] { return std::make_unique<Inspector>(devices); },
-  [&](const ModelSystem::event_type& event) {
-   if (const auto* changed = std::get_if<ModelChanged>(&event); changed && !changed->snapshot.active) settled.at(changed->snapshot.generation - 1U).set_value(changed->snapshot);
-  }};
+ ModelSystem model{settings, [&] { return std::make_unique<Inspector>(devices); }, [&](const ModelSystem::event_type& event) {
+  if (const auto* changed = std::get_if<ModelChanged>(&event); changed && !changed->snapshot.active) settled.at(changed->snapshot.generation - 1U).set_value(changed->snapshot);
+ }};
  contracts::ModelSelectionKey key;
  for (const int device : {3, 7}) {
   contracts::SettingsUpdateRequest edit;
@@ -432,17 +431,16 @@ TEST_CASE("model selection shutdown cancels and joins one active acquisition wit
  std::atomic_size_t terminals = 0U;
  std::atomic_size_t progress = 0U;
  std::atomic_bool malformed_progress = false;
- ModelSystem model{settings, [gate] { return std::make_unique<BlockingModelRuntime>(gate); },
-  [&](ModelSystem::event_type event) {
-   if (std::holds_alternative<ModelProgressChanged>(event)) {
-    const auto& value = std::get<ModelProgressChanged>(event);
-    if (value.progress.stage != contracts::ModelProgressStage::Verifying) malformed_progress = true;
-    ++progress;
-   } else {
-    ++terminals;
-    terminal.set_value(std::get<ModelChanged>(std::move(event)).snapshot);
-   }
-  }};
+ ModelSystem model{settings, [gate] { return std::make_unique<BlockingModelRuntime>(gate); }, [&](ModelSystem::event_type event) {
+  if (std::holds_alternative<ModelProgressChanged>(event)) {
+   const auto& value = std::get<ModelProgressChanged>(event);
+   if (value.progress.stage != contracts::ModelProgressStage::Verifying) malformed_progress = true;
+   ++progress;
+  } else {
+   ++terminals;
+   terminal.set_value(std::get<ModelChanged>(std::move(event)).snapshot);
+  }
+ }};
  CHECK_THROWS_AS(model.Select({.workflow = contracts::FeatureId::Explore}), contracts::InvalidIntentError);
  const auto admitted = model.Select({.workflow = contracts::FeatureId::Train});
  CHECK(admitted.active);

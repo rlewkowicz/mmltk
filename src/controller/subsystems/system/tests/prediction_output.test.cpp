@@ -110,8 +110,7 @@ TEST_CASE("failed reservoir replacement preserves the published incumbent", "[co
  contracts::WorkflowOutputFacts facts;
  options.progress = [&](const auto& value) { facts = value; };
  unsigned writes = 0;
- detail::PredictionOutput output(
-  {execution}, rfdetr::PredictSourceKind::VideoFile, options, {},
+ detail::PredictionOutput output({execution}, rfdetr::PredictSourceKind::VideoFile, options, {},
   [&](const char* path, int width, int height, int channels, const void* pixels, int stride) { return ++writes == 1U ? stbi_write_png(path, width, height, channels, pixels, stride) : 0; }, 0U);
  auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"frame"});
  output.Begin({.class_catalog = catalog, .class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground});

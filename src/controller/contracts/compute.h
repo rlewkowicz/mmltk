@@ -33,7 +33,8 @@ inline constexpr std::array kComputeTerminalPresentations{
  terminal_presentation::Policy{ComputeOperationOutcome::Failed, terminal_presentation::Classification::Failed, "compute.failed", "The compute operation failed."},
  terminal_presentation::Policy{ComputeOperationOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "compute.cancelled", "The compute operation was cancelled."},
  terminal_presentation::Policy{
-  ComputeOperationOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled, "compute.cancellation_requested", "Compute cancellation was requested."},
+  ComputeOperationOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled, "compute.cancellation_requested", "Compute cancellation was requested."
+ },
  terminal_presentation::Policy{ComputeOperationOutcome::Refused, terminal_presentation::Classification::Refused, "compute.refused", "The compute operation was refused."},
 };
 static_assert(terminal_presentation::complete(kComputeTerminalPresentations));

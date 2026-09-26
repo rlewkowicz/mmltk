@@ -117,13 +117,15 @@ struct DeviceFrameCopyTarget final {
 };
 [[nodiscard]] cudaError_t copy_device_frame(LiveCudaCommandScope&, const DeviceFrameView&, DeviceFrameCopyTarget) noexcept;
 inline DeviceFrameMetadata DeviceFrameMetadata::Captured(const capture::FilledCaptureSlotLease& lease) noexcept {
- return {.frame = {lease.identity().session, lease.sequence()},
+ return {
+  .frame = {lease.identity().session, lease.sequence()},
   .capture_identity = lease.identity(),
   .capture_slot = lease.slot(),
   .pixel_format = lease.pixel_format(),
   .region = lease.region(),
   .captured_ns = lease.capture_ns(),
-  .short_frame = lease.short_frame()};
+  .short_frame = lease.short_frame()
+ };
 }
 inline DeviceFrameMetadata DeviceFrameMetadata::From(const DeviceFrameView& view) noexcept { return static_cast<const DeviceFrameMetadata&>(view); }
 inline DeviceFrameView DeviceFrameMetadata::View(const std::uint32_t slot, const CUdeviceptr pixels, const std::size_t pitch_bytes, const cudaEvent_t ready, const cudaStream_t stream) const noexcept {

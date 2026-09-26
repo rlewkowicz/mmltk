@@ -242,8 +242,9 @@ json manifest_from_model_state(const fs::path& root, const std::vector<Normalize
    readback.Complete();
    const fs::path tensor_path = tensor_dir / tensor_entry_filename(index);
    write_raw_tensor_file(tensor_path, tensor);
-   manifest["state_dict"].push_back({{"name", entries[index].name}, {"tensor_path", fs::relative(tensor_path, root).string()},
-    {"dtype", mmltk::backend::ml::serialization::scalar_type_name(tensor.scalar_type())}, {"sizes", tensor.sizes().vec()}});
+   manifest["state_dict"].push_back(
+    {{"name", entries[index].name}, {"tensor_path", fs::relative(tensor_path, root).string()}, {"dtype", mmltk::backend::ml::serialization::scalar_type_name(tensor.scalar_type())},
+     {"sizes", tensor.sizes().vec()}});
   }
   readback.Release();
  }

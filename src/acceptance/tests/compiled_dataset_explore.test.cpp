@@ -84,57 +84,57 @@ public:
    .context = this,
    .write =
     [](void* context, const controller::VisualDiagnosticFact fact) noexcept {
-     auto& audit = *static_cast<NativeExploreAudit*>(context);
-     const auto sequence = audit.sequence_.fetch_add(1U, std::memory_order_acq_rel) + 1U;
-     if (fact.operation == controller::VisualDiagnosticOperation::GalleryReadScheduled) {
-      audit.read_admissions_.fetch_add(1U, std::memory_order_acq_rel);
-     } else if (fact.operation == controller::VisualDiagnosticOperation::PlaceholderPublished) {
-      audit.placeholder_.Observe(sequence, fact);
-     } else if (fact.operation == controller::VisualDiagnosticOperation::ExplorePrefetchReady) {
-      if (fact.value < 64U) audit.prefetched_indices_.fetch_or(std::uint64_t{1U} << fact.value, std::memory_order_acq_rel);
-     } else if (fact.operation == controller::VisualDiagnosticOperation::TileBatchPublished) {
-      audit.tile_.Observe(sequence, fact);
-      audit.last_tile_cumulative_.store(fact.value, std::memory_order_release);
-      audit.reused_tiles_.fetch_add(fact.detail, std::memory_order_acq_rel);
-     } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreCacheStorage) {
-      audit.pinned_storage_.store(fact.context.staging_bytes, std::memory_order_release);
-     } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreAugmentationBatchPrepared) {
-      audit.augmentation_count_.fetch_add(1U, std::memory_order_acq_rel);
-      audit.last_augmentation_seed_.store(fact.detail, std::memory_order_release);
-      audit.last_valid_donors_.store(fact.context.capacity_width, std::memory_order_release);
-      audit.last_planned_pastes_.store(fact.context.capacity_height, std::memory_order_release);
-     } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreOverlayDescriptorsPrepared) {
-      if (audit.last_descriptor_generation_.exchange(fact.generation, std::memory_order_acq_rel) != fact.generation) {
-       audit.last_descriptor_annotations_.store(0U, std::memory_order_release);
-       audit.last_descriptor_rle_.store(0U, std::memory_order_release);
-      }
-      audit.descriptor_count_.fetch_add(1U, std::memory_order_acq_rel);
-      audit.last_descriptor_annotations_.fetch_add(fact.value, std::memory_order_acq_rel);
-      audit.last_descriptor_rle_.fetch_add(fact.detail, std::memory_order_acq_rel);
-     } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreTransformedBounds) {
-      audit.bounds_count_.fetch_add(1U, std::memory_order_acq_rel);
-     } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreSemanticPixels) {
-      if (audit.last_semantic_generation_.exchange(fact.generation, std::memory_order_acq_rel) != fact.generation) audit.semantic_nonzero_cards_.store(0U, std::memory_order_release);
-      audit.semantic_count_.fetch_add(1U, std::memory_order_acq_rel);
-      audit.last_semantic_pixels_.store(fact.detail, std::memory_order_release);
-      if (fact.detail != 0U) audit.semantic_nonzero_cards_.fetch_add(1U, std::memory_order_acq_rel);
-     } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreImagePixels) {
-      if ((fact.context.staging_bytes & 4U) == 0U) audit.detail_checksum_.store(fact.detail, std::memory_order_release);
-      if (fact.value >= 10U && fact.value <= 11U && (fact.context.staging_bytes & 7U) == 7U) {
-       const auto image = static_cast<std::size_t>(fact.value - 10U);
-       audit.image_seeds_[image].store(fact.context.capacity_width, std::memory_order_release);
-       audit.image_checksums_[image].store(fact.detail, std::memory_order_release);
-       audit.image_pixel_count_.fetch_add(1U, std::memory_order_acq_rel);
-      }
-     } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreDonorDescriptorsPrepared) {
-      audit.donor_descriptor_count_.fetch_add(1U, std::memory_order_acq_rel);
-      audit.donor_count_.store(fact.value, std::memory_order_release);
-      audit.donor_rle_.store(fact.detail, std::memory_order_release);
-     } else if (fact.operation == controller::VisualDiagnosticOperation::RenderCompleted) {
-      audit.last_render_flags_.store(fact.detail, std::memory_order_release);
-     }
-     audit.Wake();
-    },
+   auto& audit = *static_cast<NativeExploreAudit*>(context);
+   const auto sequence = audit.sequence_.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+   if (fact.operation == controller::VisualDiagnosticOperation::GalleryReadScheduled) {
+    audit.read_admissions_.fetch_add(1U, std::memory_order_acq_rel);
+   } else if (fact.operation == controller::VisualDiagnosticOperation::PlaceholderPublished) {
+    audit.placeholder_.Observe(sequence, fact);
+   } else if (fact.operation == controller::VisualDiagnosticOperation::ExplorePrefetchReady) {
+    if (fact.value < 64U) audit.prefetched_indices_.fetch_or(std::uint64_t{1U} << fact.value, std::memory_order_acq_rel);
+   } else if (fact.operation == controller::VisualDiagnosticOperation::TileBatchPublished) {
+    audit.tile_.Observe(sequence, fact);
+    audit.last_tile_cumulative_.store(fact.value, std::memory_order_release);
+    audit.reused_tiles_.fetch_add(fact.detail, std::memory_order_acq_rel);
+   } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreCacheStorage) {
+    audit.pinned_storage_.store(fact.context.staging_bytes, std::memory_order_release);
+   } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreAugmentationBatchPrepared) {
+    audit.augmentation_count_.fetch_add(1U, std::memory_order_acq_rel);
+    audit.last_augmentation_seed_.store(fact.detail, std::memory_order_release);
+    audit.last_valid_donors_.store(fact.context.capacity_width, std::memory_order_release);
+    audit.last_planned_pastes_.store(fact.context.capacity_height, std::memory_order_release);
+   } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreOverlayDescriptorsPrepared) {
+    if (audit.last_descriptor_generation_.exchange(fact.generation, std::memory_order_acq_rel) != fact.generation) {
+     audit.last_descriptor_annotations_.store(0U, std::memory_order_release);
+     audit.last_descriptor_rle_.store(0U, std::memory_order_release);
+    }
+    audit.descriptor_count_.fetch_add(1U, std::memory_order_acq_rel);
+    audit.last_descriptor_annotations_.fetch_add(fact.value, std::memory_order_acq_rel);
+    audit.last_descriptor_rle_.fetch_add(fact.detail, std::memory_order_acq_rel);
+   } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreTransformedBounds) {
+    audit.bounds_count_.fetch_add(1U, std::memory_order_acq_rel);
+   } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreSemanticPixels) {
+    if (audit.last_semantic_generation_.exchange(fact.generation, std::memory_order_acq_rel) != fact.generation) audit.semantic_nonzero_cards_.store(0U, std::memory_order_release);
+    audit.semantic_count_.fetch_add(1U, std::memory_order_acq_rel);
+    audit.last_semantic_pixels_.store(fact.detail, std::memory_order_release);
+    if (fact.detail != 0U) audit.semantic_nonzero_cards_.fetch_add(1U, std::memory_order_acq_rel);
+   } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreImagePixels) {
+    if ((fact.context.staging_bytes & 4U) == 0U) audit.detail_checksum_.store(fact.detail, std::memory_order_release);
+    if (fact.value >= 10U && fact.value <= 11U && (fact.context.staging_bytes & 7U) == 7U) {
+     const auto image = static_cast<std::size_t>(fact.value - 10U);
+     audit.image_seeds_[image].store(fact.context.capacity_width, std::memory_order_release);
+     audit.image_checksums_[image].store(fact.detail, std::memory_order_release);
+     audit.image_pixel_count_.fetch_add(1U, std::memory_order_acq_rel);
+    }
+   } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreDonorDescriptorsPrepared) {
+    audit.donor_descriptor_count_.fetch_add(1U, std::memory_order_acq_rel);
+    audit.donor_count_.store(fact.value, std::memory_order_release);
+    audit.donor_rle_.store(fact.detail, std::memory_order_release);
+   } else if (fact.operation == controller::VisualDiagnosticOperation::RenderCompleted) {
+    audit.last_render_flags_.store(fact.detail, std::memory_order_release);
+   }
+   audit.Wake();
+  },
    .pixel_probes = true,
   };
  }
@@ -293,8 +293,10 @@ struct NativeExploreFixture final {
  const std::size_t parallelism = controller::normalize_explore_parallelism(2U);
  controller::ExploreSystem system;
  NativeExploreFixture(controller::SettingsSystem& settings, bool h2d)
-     : system{settings, device, parallelism, controller::make_native_explore_runtime_factory(device, parallelism, {.loading = data::data_loading_options(h2d), .diagnostics = audit.diagnostics()}),
-        [this](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); }, audit.diagnostics()} {}
+     : system{
+        settings, device, parallelism, controller::make_native_explore_runtime_factory(device, parallelism, {.loading = data::data_loading_options(h2d), .diagnostics = audit.diagnostics()}),
+        [this](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); }, audit.diagnostics()
+       } {}
 };
 void wait_for_native_gallery(
  NativeExploreAudit& audit, const controller::ExploreSystem& system, const std::uint64_t placeholder_count, const std::uint64_t tile_count, const std::uint32_t ready_tiles = 2U) {
@@ -883,12 +885,14 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
  const bool h2d = GENERATE(true, false);
  INFO("h2d_dataloader=" << h2d);
  require_explore_transport(h2d);
- for (const auto annotations : std::array{mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationObjectCapacity, 1U},
+ for (const auto annotations : std::array{
+       mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationObjectCapacity, 1U},
        mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationObjectCapacity - 1U, 1U},
        mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationMaskRunCapacity / 32U, 32U},
        mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationMaskRunCapacity / 32U - 1U, 32U},
        mmltk::testsupport::ExploreFixtureAnnotations{.objects = 2U, .runs_per_object = 1U, .crowd_only = true},
-       mmltk::testsupport::ExploreFixtureAnnotations{.objects = 2U, .runs_per_object = 1U, .mixed_crowd = true}, mmltk::testsupport::ExploreFixtureAnnotations{.objects = 1U, .runs_per_object = 0U}}) {
+       mmltk::testsupport::ExploreFixtureAnnotations{.objects = 2U, .runs_per_object = 1U, .mixed_crowd = true}, mmltk::testsupport::ExploreFixtureAnnotations{.objects = 1U, .runs_per_object = 0U}
+      }) {
   CAPTURE(annotations.objects, annotations.runs_per_object);
   mmltk::testsupport::ScopedTempDir root{"mmltk-explore-capacity"};
   const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "dense", 12, {}, annotations);
@@ -1129,17 +1133,16 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
   }
  });
  const controller::VisualDiagnosticSink diagnostics{.context = &reads, .write = [](void* context, const controller::VisualDiagnosticFact fact) noexcept {
-                                                     auto& observed = *static_cast<ReadObservation*>(context);
-                                                     if (fact.operation == controller::VisualDiagnosticOperation::AcceptanceLaneStarted && fact.detail < 64U)
-                                                      observed.started.fetch_or(std::uint64_t{1U} << fact.detail, std::memory_order_acq_rel);
-                                                     if (fact.operation == controller::VisualDiagnosticOperation::AcceptanceStaleReadDiscarded)
-                                                      observed.discarded.fetch_add(1U, std::memory_order_acq_rel);
-                                                     observed.audit.diagnostics()(fact);
-                                                    }};
+  auto& observed = *static_cast<ReadObservation*>(context);
+  if (fact.operation == controller::VisualDiagnosticOperation::AcceptanceLaneStarted && fact.detail < 64U) observed.started.fetch_or(std::uint64_t{1U} << fact.detail, std::memory_order_acq_rel);
+  if (fact.operation == controller::VisualDiagnosticOperation::AcceptanceStaleReadDiscarded) observed.discarded.fetch_add(1U, std::memory_order_acq_rel);
+  observed.audit.diagnostics()(fact);
+ }};
  const controller::VisualDeviceSettings device{.device = 0, .maximum_width = 256U, .maximum_height = 256U};
- controller::ExploreSystem system{settings, device, 1U,
-  controller::make_native_explore_runtime_factory(device, 1U, {.loading = data::data_loading_options(h2d), .acceptance = gate, .diagnostics = diagnostics}),
-  [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); }, diagnostics};
+ controller::ExploreSystem system{
+  settings, device, 1U, controller::make_native_explore_runtime_factory(device, 1U, {.loading = data::data_loading_options(h2d), .acceptance = gate, .diagnostics = diagnostics}),
+  [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); }, diagnostics
+ };
  // Stop blocked I/O before system destruction, including assertion unwinding.
  const mmltk::testsupport::ScopedTestCleanup stop{[&] {
   gate->Stop();
@@ -1320,8 +1323,10 @@ void test_native_explore_transaction_faults_and_inactive_release() {
  });
  NativeExploreAudit audit;
  const controller::VisualDeviceSettings device{.device = 0, .maximum_width = 256U, .maximum_height = 256U};
- controller::ExploreSystem system{settings, device, 1U, controller::make_native_explore_runtime_factory(device, 1U, {.loading = data::data_loading_options(true), .acceptance = gate}),
-  [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); }};
+ controller::ExploreSystem system{
+  settings, device, 1U, controller::make_native_explore_runtime_factory(device, 1U, {.loading = data::data_loading_options(true), .acceptance = gate}),
+  [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); }
+ };
  const mmltk::testsupport::ScopedTestCleanup stop{[&] { gate->Stop(); }};
  const controller::ExploreViewport viewport{.extent = {64U, 32U}, .columns = 2U};
  static_cast<void>(system.Open({.viewport = viewport, .compiled_source = compiled.string()}));

@@ -22,8 +22,10 @@ namespace {
 }
 }  // namespace
 CustomRecipeCatalog custom_recipe_catalog() {
- return {coco_annotations_artifact(), coco_train_images_artifact(), coco_val_images_artifact(), objects365_annotations_artifact(), open_images_boxes_artifact(), open_images_classes_artifact(),
-  objects365_train_image_artifacts()};
+ return {
+  coco_annotations_artifact(), coco_train_images_artifact(), coco_val_images_artifact(), objects365_annotations_artifact(), open_images_boxes_artifact(), open_images_classes_artifact(),
+  objects365_train_image_artifacts()
+ };
 }
 CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout& cache, const CustomRecipeCatalog& catalog, ProgressReporter& progress,
  std::size_t effective_num_workers, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, std::span<const int> worker_cpus) {
@@ -114,53 +116,47 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  const auto prepare_objects = [&] {
   download_source(BenchmarkDatasetSource::kObjects365V2);
   if (!objects) {
-   retry_annotation_indexing(
-    cancel_requested,
-    [&] {
-     const DownloadResult& annotation_archive = annotation_downloads.at(catalog.objects_annotations.artifact_id);
-     const std::filesystem::path extracted_dir = cache.source_indexes("objects365") / "source-json";
-     std::filesystem::create_directories(extracted_dir);
-     const std::filesystem::path json_path = extracted_dir / "zhiyuan_objv2_train.json";
-     progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Extracting Objects365 train annotations");
-     const std::string annotation_digest =
-      extract_archive_member(annotation_archive.path, "zhiyuan_objv2_train.json", json_path, annotation_archive.identity, cache.locks / "objects365-train-json.extract.lock", cancel_requested, trace);
-     objects = load_or_build_index(cache, objects_index_path, BenchmarkDatasetSource::kObjects365V2, "train", annotation_digest, cancel_requested, trace, [&] {
-      progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Parsing and indexing Objects365 annotations");
-      return parse_coco_style_annotations(json_path, annotation_digest, objects365_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kObjects365V2, "train", 0U, false));
-     });
-     ++completed_indexes;
-     progress.phase(DatasetCompilePhase::Indexing, completed_indexes.load(), kIndexCount);
-    },
-    [&](const std::exception& error) {
-     const std::filesystem::path json_path = cache.source_indexes("objects365") / "source-json" / "zhiyuan_objv2_train.json";
-     remove_cache_path(json_path.string() + ".extract.json");
-     remove_cache_path(json_path);
-     remove_normalized_annotation_index(objects_index_path);
-     repair_annotations(BenchmarkDatasetSource::kObjects365V2, {*objects_annotation_request}, error.what());
+   retry_annotation_indexing(cancel_requested, [&] {
+    const DownloadResult& annotation_archive = annotation_downloads.at(catalog.objects_annotations.artifact_id);
+    const std::filesystem::path extracted_dir = cache.source_indexes("objects365") / "source-json";
+    std::filesystem::create_directories(extracted_dir);
+    const std::filesystem::path json_path = extracted_dir / "zhiyuan_objv2_train.json";
+    progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Extracting Objects365 train annotations");
+    const std::string annotation_digest =
+     extract_archive_member(annotation_archive.path, "zhiyuan_objv2_train.json", json_path, annotation_archive.identity, cache.locks / "objects365-train-json.extract.lock", cancel_requested, trace);
+    objects = load_or_build_index(cache, objects_index_path, BenchmarkDatasetSource::kObjects365V2, "train", annotation_digest, cancel_requested, trace, [&] {
+     progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Parsing and indexing Objects365 annotations");
+     return parse_coco_style_annotations(json_path, annotation_digest, objects365_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kObjects365V2, "train", 0U, false));
     });
+    ++completed_indexes;
+    progress.phase(DatasetCompilePhase::Indexing, completed_indexes.load(), kIndexCount);
+   }, [&](const std::exception& error) {
+    const std::filesystem::path json_path = cache.source_indexes("objects365") / "source-json" / "zhiyuan_objv2_train.json";
+    remove_cache_path(json_path.string() + ".extract.json");
+    remove_cache_path(json_path);
+    remove_normalized_annotation_index(objects_index_path);
+    repair_annotations(BenchmarkDatasetSource::kObjects365V2, {*objects_annotation_request}, error.what());
+   });
   }
  };
  const auto prepare_open_images = [&] {
   download_source(BenchmarkDatasetSource::kOpenImagesV7);
   if (!open_images) {
-   retry_annotation_indexing(
-    cancel_requested,
-    [&] {
-     const DownloadResult& boxes = annotation_downloads.at(catalog.open_images_boxes.artifact_id);
-     const DownloadResult& classes = annotation_downloads.at(catalog.open_images_classes.artifact_id);
-     const std::string annotation_identity = combined_artifact_digest(boxes.identity, classes.identity);
-     open_images = load_or_build_index(cache, open_images_index_path, BenchmarkDatasetSource::kOpenImagesV7, "train", annotation_identity, cancel_requested, trace, [&] {
-      progress.source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Parsing and indexing Open Images annotations");
-      return parse_open_images_annotations(
-       boxes.path, classes.path, annotation_identity, open_images_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kOpenImagesV7, "train", 0U, false));
-     });
-     ++completed_indexes;
-     progress.phase(DatasetCompilePhase::Indexing, completed_indexes.load(), kIndexCount);
-    },
-    [&](const std::exception& error) {
-     remove_normalized_annotation_index(open_images_index_path);
-     repair_annotations(BenchmarkDatasetSource::kOpenImagesV7, {*open_images_boxes_request, *open_images_classes_request}, error.what());
+   retry_annotation_indexing(cancel_requested, [&] {
+    const DownloadResult& boxes = annotation_downloads.at(catalog.open_images_boxes.artifact_id);
+    const DownloadResult& classes = annotation_downloads.at(catalog.open_images_classes.artifact_id);
+    const std::string annotation_identity = combined_artifact_digest(boxes.identity, classes.identity);
+    open_images = load_or_build_index(cache, open_images_index_path, BenchmarkDatasetSource::kOpenImagesV7, "train", annotation_identity, cancel_requested, trace, [&] {
+     progress.source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Parsing and indexing Open Images annotations");
+     return parse_open_images_annotations(
+      boxes.path, classes.path, annotation_identity, open_images_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kOpenImagesV7, "train", 0U, false));
     });
+    ++completed_indexes;
+    progress.phase(DatasetCompilePhase::Indexing, completed_indexes.load(), kIndexCount);
+   }, [&](const std::exception& error) {
+    remove_normalized_annotation_index(open_images_index_path);
+    repair_annotations(BenchmarkDatasetSource::kOpenImagesV7, {*open_images_boxes_request, *open_images_classes_request}, error.what());
+   });
   }
  };
  const auto cpus = worker_cpus.empty() ? mmltk::common::system::allowed_cpu_set() : std::vector<int>(worker_cpus.begin(), worker_cpus.end());
@@ -224,15 +220,19 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  trace_sampling(objects_sampling.stats, BenchmarkDatasetSource::kObjects365V2);
  trace_sampling(open_images_sampling.stats, BenchmarkDatasetSource::kOpenImagesV7);
  trace_benchmark_event(trace, "benchmark.sampling.source_mix", [&] {
-  return nlohmann::json{{"target_images", combined_sampling.target_images}, {"objects365_images", objects_sampling.stats.selected_images},
-   {"open_images_images", open_images_sampling.stats.selected_images}, {"open_images_floor", combined_sampling.open_images_floor}, {"open_images_ceiling", combined_sampling.open_images_ceiling},
-   {"objects365_shards", combined_sampling.objects365_shards}, {"objects365_archive_bytes", combined_sampling.objects365_archive_bytes}};
+  return nlohmann::json{
+   {"target_images", combined_sampling.target_images}, {"objects365_images", objects_sampling.stats.selected_images}, {"open_images_images", open_images_sampling.stats.selected_images},
+   {"open_images_floor", combined_sampling.open_images_floor}, {"open_images_ceiling", combined_sampling.open_images_ceiling}, {"objects365_shards", combined_sampling.objects365_shards},
+   {"objects365_archive_bytes", combined_sampling.objects365_archive_bytes}
+  };
  });
  progress.activity("Finalizing normalized annotation cache");
  open_images_annotation_lifecycle = ArtifactLease{};
  objects_annotation_lifecycle = ArtifactLease{};
- return CustomRecipePreparation{std::move(coco_train_index_path), std::move(coco_val_index_path), std::move(objects_index_path), std::move(open_images_index_path), std::move(coco_train),
-  std::move(coco_val), std::move(objects), std::move(open_images), std::move(coco_indexes_cache_hit), std::move(objects_index_cache_hit), std::move(open_images_index_cache_hit),
-  std::move(combined_sampling), std::move(objects_sampling), std::move(open_images_sampling), std::move(sampling_object_artifacts)};
+ return CustomRecipePreparation{
+  std::move(coco_train_index_path), std::move(coco_val_index_path), std::move(objects_index_path), std::move(open_images_index_path), std::move(coco_train), std::move(coco_val), std::move(objects),
+  std::move(open_images), std::move(coco_indexes_cache_hit), std::move(objects_index_cache_hit), std::move(open_images_index_cache_hit), std::move(combined_sampling), std::move(objects_sampling),
+  std::move(open_images_sampling), std::move(sampling_object_artifacts)
+ };
 }
 }  // namespace mmltk::backend::data::benchmark_internal

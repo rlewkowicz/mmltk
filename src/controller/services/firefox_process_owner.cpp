@@ -41,8 +41,10 @@ constexpr std::uint32_t kInitialFirefoxWindowHeight = 1'125U;
 }
 [[nodiscard]] std::vector<std::string> firefox_environment(
  const std::filesystem::path& runtime_root, const std::filesystem::path& workspace_import_socket, const bool integration, const bool integration_high_dpi) {
- static constexpr std::array<std::string_view, 12U> kOverridden{"DISPLAY", "GDK_BACKEND", "LD_LIBRARY_PATH", "MOZILLA_FIVE_HOME", "MOZ_CRASHREPORTER_DISABLE", "MOZ_DBUS_REMOTE", "MOZ_DEFAULT_PREFS",
-  "MOZ_ENABLE_WAYLAND", "MOZ_NOREMOTE", "NO_AT_BRIDGE", "XDG_SESSION_TYPE", "MMLTK_WORKSPACE_IMPORT_SOCKET"};
+ static constexpr std::array<std::string_view, 12U> kOverridden{
+  "DISPLAY", "GDK_BACKEND", "LD_LIBRARY_PATH", "MOZILLA_FIVE_HOME", "MOZ_CRASHREPORTER_DISABLE", "MOZ_DBUS_REMOTE", "MOZ_DEFAULT_PREFS", "MOZ_ENABLE_WAYLAND", "MOZ_NOREMOTE", "NO_AT_BRIDGE",
+  "XDG_SESSION_TYPE", "MMLTK_WORKSPACE_IMPORT_SOCKET"
+ };
  std::vector<std::string> result;
  std::string inherited_library_path;
  for (char** current = environ; current && *current; ++current) {
@@ -242,15 +244,19 @@ public:
   std::vector<std::string> environment_storage;
   std::vector<char*> environment;
   try {
-   argument_storage = {executable_.string(), "--no-remote", "--new-instance", "--profile", profile_.string(), "--width", std::to_string(kInitialFirefoxWindowWidth), "--height",
-    std::to_string(kInitialFirefoxWindowHeight), page_url_};
+   argument_storage = {
+    executable_.string(), "--no-remote", "--new-instance", "--profile", profile_.string(), "--width", std::to_string(kInitialFirefoxWindowWidth), "--height",
+    std::to_string(kInitialFirefoxWindowHeight), page_url_
+   };
    environment_storage = firefox_environment(executable_.parent_path(), workspace_import_socket_, integration_, integration_high_dpi_);
    environment.reserve(environment_storage.size() + 1U);
    for (auto& entry : environment_storage) environment.push_back(entry.data());
    environment.push_back(nullptr);
   } catch (...) { return startup_failed("start.arguments_refused"); }
-  std::array<char*, 11U> arguments{argument_storage[0].data(), argument_storage[1].data(), argument_storage[2].data(), argument_storage[3].data(), argument_storage[4].data(),
-   argument_storage[5].data(), argument_storage[6].data(), argument_storage[7].data(), argument_storage[8].data(), argument_storage[9].data(), nullptr};
+  std::array<char*, 11U> arguments{
+   argument_storage[0].data(), argument_storage[1].data(), argument_storage[2].data(), argument_storage[3].data(), argument_storage[4].data(), argument_storage[5].data(), argument_storage[6].data(),
+   argument_storage[7].data(), argument_storage[8].data(), argument_storage[9].data(), nullptr
+  };
   SpawnFileActions file_actions;
   if (!prepare_log_handoff(file_actions)) return startup_failed("start.log_handoff_refused", errno);
   posix_spawnattr_t attributes{};
@@ -391,11 +397,13 @@ private:
   if (!signaled) { return force_stop(); }
   const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(stop_grace_);
   const auto nanoseconds = stop_grace_ - seconds;
-  const itimerspec deadline{.it_interval = {},
+  const itimerspec deadline{
+   .it_interval = {},
    .it_value = {
     .tv_sec = static_cast<time_t>(seconds.count()),
     .tv_nsec = static_cast<long>(std::chrono::duration_cast<std::chrono::nanoseconds>(nanoseconds).count()),
-   }};
+   }
+  };
   if (::timerfd_settime(timer_fd_.get(), 0, &deadline, nullptr) != 0) {
    terminal_monitor_failure("child.stop_timer_arm_refused", errno, errno);
    return false;

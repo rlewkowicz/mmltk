@@ -349,13 +349,10 @@ TEST_CASE("Stock matched classification and box losses follow independent groupe
     distributed_config.world_size = 2;
     int reductions = 0;
     rf::DetectionStatisticsPacket::Tensors distributed_statistics;
-    const auto distributed = rf::detection_loss_dict(
-     output, gt, distributed_config, true, true,
-     [&](torch::Tensor& count) {
-      ++reductions;
-      count.add_(3 * groups);
-     },
-     &distributed_statistics);
+    const auto distributed = rf::detection_loss_dict(output, gt, distributed_config, true, true, [&](torch::Tensor& count) {
+     ++reductions;
+     count.add_(3 * groups);
+    }, &distributed_statistics);
     REQUIRE(reductions == 1);
     for (std::size_t field = 0; field < statistics.size(); ++field) REQUIRE(torch::equal(statistics[field], distributed_statistics[field]));
     REQUIRE(torch::allclose(distributed.at("loss_ce"), classification / 4, 1e-5, 1e-6));
@@ -467,9 +464,8 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
        const auto labels = torch::tensor({{{1., 0.}}}, options);
        {
         mmltk::backend::ml::cuda::TorchAutocastScope rejected_scope(amp == torch::kFloat32, torch::kBFloat16);
-        REQUIRE_THROWS(slot.invoke(
-         "__torch__.RejectedCriterionTrace", {alpha + 0.1, 3.0}, [](const torch::Tensor&, const torch::Tensor&) -> torch::Tensor { throw std::runtime_error("replacement failure"); },
-         logits.to(torch::kFloat64), labels.to(torch::kFloat64)));
+        REQUIRE_THROWS(slot.invoke("__torch__.RejectedCriterionTrace", {alpha + 0.1, 3.0},
+         [](const torch::Tensor&, const torch::Tensor&) -> torch::Tensor { throw std::runtime_error("replacement failure"); }, logits.to(torch::kFloat64), labels.to(torch::kFloat64)));
        }
        REQUIRE(slot.identity() == original);
        const auto reused = rf::detection_loss_dict(output, gt, config, true, torch::full({}, denominator, options), samples);
@@ -479,13 +475,10 @@ TEST_CASE("Stock dense and sparse masks share explicit CPU CUDA samples and reta
        // Gamma is fixed at two by the criterion. Mutate the same slot through its
        // ordinary semantic API, then prove criterion restoration replaces it.
        if (change == 3) {
-        const auto changed = slot.invoke(
-         "__torch__.ChangedCriterionGamma", {alpha, 3.0},
-         [alpha](const torch::Tensor& x, const torch::Tensor& y) {
-          const auto p = x.sigmoid();
-          return ((y * torch::softplus(-x) + (1 - y) * torch::softplus(x)) * torch::pow(1 - (p * y + (1 - p) * (1 - y)), 3) * (alpha * y + (1 - alpha) * (1 - y))).mean(1).sum();
-         },
-         logits, labels);
+        const auto changed = slot.invoke("__torch__.ChangedCriterionGamma", {alpha, 3.0}, [alpha](const torch::Tensor& x, const torch::Tensor& y) {
+         const auto p = x.sigmoid();
+         return ((y * torch::softplus(-x) + (1 - y) * torch::softplus(x)) * torch::pow(1 - (p * y + (1 - p) * (1 - y)), 3) * (alpha * y + (1 - alpha) * (1 - y))).mean(1).sum();
+        }, logits, labels);
         REQUIRE(slot.identity() != original);
         const auto p = logits.sigmoid();
         const auto reference =
@@ -549,7 +542,8 @@ TEST_CASE("Loss contraction cache follows effective CUDA precision with outstand
   c10::ScalarType dtype;
  };
  const std::array<Context, 7> contexts{
-  {{false, torch::kFloat16}, {false, torch::kBFloat16}, {true, torch::kFloat16}, {true, torch::kFloat16}, {true, torch::kBFloat16}, {true, torch::kFloat16}, {false, torch::kFloat16}}};
+  {{false, torch::kFloat16}, {false, torch::kBFloat16}, {true, torch::kFloat16}, {true, torch::kFloat16}, {true, torch::kBFloat16}, {true, torch::kFloat16}, {false, torch::kFloat16}}
+ };
  const auto recorded = [](const torch::Tensor& x, const torch::Tensor& y) {
   const auto p = x.sigmoid();
   return 1 - (2 * torch::einsum("nc,mc->nm", {p, y}) + 1) / (p.sum(1).unsqueeze(1) + y.sum(1).unsqueeze(0) + 1);
@@ -996,8 +990,10 @@ TEST_CASE("DN masks use stock direct equations for fixed samples gradients and u
        rf::DenoisingOutputLayer value;
        value.pred_logits = torch::full({3, groups, population, 2}, shift, options).set_requires_grad(true);
        value.pred_boxes = (prepared->original_boxes + shift * 0.1).detach().set_requires_grad(true);
-       value.sparse_pred_masks = rf::SparsePredMasks{(torch::arange(96, options).reshape({3, 2, 4, 4}) * 0.037 - 1.1 + shift).set_requires_grad(true),
-        (torch::arange(3 * groups * population * 2, options).reshape({3, groups * population, 2}) * 0.043 - 0.7).set_requires_grad(true), torch::full({1}, 0.173, options).set_requires_grad(true)};
+       value.sparse_pred_masks = rf::SparsePredMasks{
+        (torch::arange(96, options).reshape({3, 2, 4, 4}) * 0.037 - 1.1 + shift).set_requires_grad(true),
+        (torch::arange(3 * groups * population * 2, options).reshape({3, groups * population, 2}) * 0.043 - 0.7).set_requires_grad(true), torch::full({1}, 0.173, options).set_requires_grad(true)
+       };
        return value;
       };
       dn.main = layer(0.31F);
@@ -1013,7 +1009,8 @@ TEST_CASE("DN masks use stock direct equations for fixed samples gradients and u
      const int64_t important = static_cast<int64_t>(0.75 * static_cast<double>(points));
      const auto coordinates = [&](int64_t count, float shift) { return (torch::arange(rows * count * 2, options) * 0.137 + shift).remainder(1.2).sub(0.1).reshape({rows, count, 2}); };
      const std::array<rf::LayerMaskSamples, 2> samples{
-      {{{}, coordinates(points * 3, 0.03F), coordinates(points - important, 0.21F)}, {{}, coordinates(points * 3, 0.17F), coordinates(points - important, 0.41F)}}};
+      {{{}, coordinates(points * 3, 0.03F), coordinates(points - important, 0.21F)}, {{}, coordinates(points * 3, 0.17F), coordinates(points - important, 0.41F)}}
+     };
      const auto count = torch::full({}, population + 1, options);
      rf::TrainingLoss loss;
      torch::Tensor expected = torch::zeros({}, options), expected_ce = torch::zeros({}, options), expected_dice = torch::zeros({}, options);

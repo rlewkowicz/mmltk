@@ -138,7 +138,8 @@ std::optional<ExploreAtlasLayout> make_explore_atlas_layout(const std::size_t it
  if (rows > std::numeric_limits<std::uint32_t>::max() || viewport.columns > std::numeric_limits<std::uint32_t>::max() / card_extent || rows > std::numeric_limits<std::uint32_t>::max() / card_extent)
   return std::nullopt;
  return ExploreAtlasLayout{
-  .width = viewport.columns * card_extent, .height = static_cast<std::uint32_t>(rows) * card_extent, .columns = viewport.columns, .rows = static_cast<std::uint32_t>(rows), .card_extent = card_extent};
+  .width = viewport.columns * card_extent, .height = static_cast<std::uint32_t>(rows) * card_extent, .columns = viewport.columns, .rows = static_cast<std::uint32_t>(rows), .card_extent = card_extent
+ };
 }
 std::size_t prioritize_explore_work(const std::span<const std::uint32_t> order, const ExploreViewport viewport, const std::optional<std::uint32_t> focused_index, const std::uint32_t background_cursor,
  const std::span<std::uint32_t> output) noexcept {

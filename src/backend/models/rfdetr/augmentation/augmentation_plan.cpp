@@ -20,8 +20,9 @@ void prepare_image_plan(AugmentationImagePlan& plan, const GpuAugmentationLaunch
 }
 }  // namespace
 GpuAugmentationLaunchConfig detail::augmentation_launch_config(const GpuAugmentationConfig& config) {
- return {config.enabled ? 1 : 0, launch_group(config.geometry), launch_group(config.resize), launch_group(config.color), launch_group(config.noise), launch_group(config.blur),
-  launch_group(config.occlusion)};
+ return {
+  config.enabled ? 1 : 0, launch_group(config.geometry), launch_group(config.resize), launch_group(config.color), launch_group(config.noise), launch_group(config.blur), launch_group(config.occlusion)
+ };
 }
 bool augmentation_paste_admitted(const GpuAugmentationConfig& config, const std::uint64_t key) noexcept {
  return config.enabled && augment_math::uniform01(key, 0x4000ULL) < config.copy_paste_probability;

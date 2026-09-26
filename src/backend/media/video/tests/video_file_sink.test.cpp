@@ -199,9 +199,10 @@ TEST_CASE("annotated Matroska copies multiple audio tracks and their disposition
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("no CUDA device available");
  mmltk::testsupport::ScopedTempDir temporary("video-audio");
  input_video(temporary.path() / "source.y4m");
- const auto generated = mmltk::testsupport::run_subprocess_capture_output({"ffmpeg", "-v", "error", "-i", (temporary.path() / "source.y4m").string(), "-f", "lavfi", "-i",
-  "sine=frequency=440:sample_rate=8000:duration=4", "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=8000:duration=4", "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "ffv1", "-c:a",
-  "pcm_s16le", "-disposition:a:0", "default", "-disposition:a:1", "comment", (temporary.path() / "source.mkv").string()});
+ const auto generated = mmltk::testsupport::run_subprocess_capture_output(
+  {"ffmpeg", "-v", "error", "-i", (temporary.path() / "source.y4m").string(), "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000:duration=4", "-f", "lavfi", "-i",
+   "sine=frequency=880:sample_rate=8000:duration=4", "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "ffv1", "-c:a", "pcm_s16le", "-disposition:a:0", "default", "-disposition:a:1", "comment",
+   (temporary.path() / "source.mkv").string()});
  REQUIRE(generated.exit_code == 0);
  encode(temporary.path(), true, true);
  AVFormatContext* input = nullptr;

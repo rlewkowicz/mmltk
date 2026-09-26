@@ -220,11 +220,14 @@ struct AdmittedSource final {
    workspace_release_started = true;
    workspace_retirement.SetWake(workspace_release_wake);
    workspace_release_span.emplace(diagnostics, [&] {
-    return visual_diagnostic_boundary(VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
-                                       .operation = VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted,
-                                       .device = context.device(),
-                                       .generation = generation,
-                                       .context = {.surface_high = description.id_high, .surface_low = description.id_low, .workspace = native::workspace_source_diagnostic(description)}},
+    return visual_diagnostic_boundary(
+     VisualDiagnosticFact{
+      .system = contracts::DiagnosticOwner::Presentation,
+      .operation = VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted,
+      .device = context.device(),
+      .generation = generation,
+      .context = {.surface_high = description.id_high, .surface_low = description.id_low, .workspace = native::workspace_source_diagnostic(description)}
+     },
      VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted);
    });
    workspace.reset();
@@ -281,11 +284,14 @@ private:
  template <class Release>
  void Cleanup(VisualDiagnosticOperation started, VisualDiagnosticOperation completed, Release&& release) noexcept {
   services::RuntimeDiagnosticSpan span(diagnostics, [&] {
-   return visual_diagnostic_boundary(VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
-                                      .operation = started,
-                                      .device = context.device(),
-                                      .generation = generation,
-                                      .context = {.surface_high = description.id_high, .surface_low = description.id_low, .workspace = native::workspace_source_diagnostic(description)}},
+   return visual_diagnostic_boundary(
+    VisualDiagnosticFact{
+     .system = contracts::DiagnosticOwner::Presentation,
+     .operation = started,
+     .device = context.device(),
+     .generation = generation,
+     .context = {.surface_high = description.id_high, .surface_low = description.id_low, .workspace = native::workspace_source_diagnostic(description)}
+    },
     completed);
   });
   std::forward<Release>(release)();
@@ -418,15 +424,12 @@ public:
 private:
  enum class Stage : std::uint8_t { Idle, ReadyPending, ReadyComplete };
  static void EnqueueCompletion(gpu::ImageStream& stream, Completion& completion) {
-  if (cudaStreamAddCallback(
-       reinterpret_cast<cudaStream_t>(stream.native_handle()),
-       [](cudaStream_t, cudaError_t status, void* pointer) {
-        auto& signal = *static_cast<Completion*>(pointer);
-        signal.status = status;
-        signal.ready.store(true, std::memory_order_release);
-        static_cast<void>(mmltk::common::io::signal_event_fd(signal.fd));
-       },
-       &completion, 0U) != cudaSuccess)
+  if (cudaStreamAddCallback(reinterpret_cast<cudaStream_t>(stream.native_handle()), [](cudaStream_t, cudaError_t status, void* pointer) {
+   auto& signal = *static_cast<Completion*>(pointer);
+   signal.status = status;
+   signal.ready.store(true, std::memory_order_release);
+   static_cast<void>(mmltk::common::io::signal_event_fd(signal.fd));
+  }, &completion, 0U) != cudaSuccess)
    throw std::runtime_error("presentation completion submission failed");
  }
  void ReleaseRead() noexcept {
@@ -517,11 +520,13 @@ private:
   }
  }
  static PresentationCapability CapabilityOf(const SampleArena& arena) noexcept {
-  return {.surface_high = arena.id.high,
+  return {
+   .surface_high = arena.id.high,
    .surface_low = arena.id.low,
    .extent = arena.extent,
    .generation = arena.generation,
-   .condition = arena.ready ? PresentationCapabilityCondition::Ready : PresentationCapabilityCondition::Admitted};
+   .condition = arena.ready ? PresentationCapabilityCondition::Ready : PresentationCapabilityCondition::Admitted
+  };
  }
  PresentationCapability Capability() const noexcept {
   const auto* arena = candidate_ ? candidate_.get() : active_.get();
@@ -572,7 +577,8 @@ private:
  gpu::ImageWorkspaceLayout Layout(const SampleArena& arena) const {
   if (!arena.context) throw std::runtime_error("Firefox workspace device is unresolved");
   const auto& packet = arena.layout;
-  gpu::ImageWorkspaceLayout layout{.device_incarnation = packet.device_incarnation,
+  gpu::ImageWorkspaceLayout layout{
+   .device_incarnation = packet.device_incarnation,
    .device = arena.context->device(),
    .width = packet.width,
    .height = packet.height,
@@ -581,21 +587,24 @@ private:
    .required_allocation_bytes = std::max<std::uint64_t>(packet.size, configuration_.minimum_allocation_bytes),
    .alignment_bytes = packet.alignment,
    .dedicated = packet.dedicated != 0U,
-   .direct_sampling = packet.direct_sampling != 0U};
+   .direct_sampling = packet.direct_sampling != 0U
+  };
   std::ranges::copy(packet.device_uuid, layout.device_uuid.begin());
   if (!layout.valid()) throw std::runtime_error("Firefox returned an invalid workspace layout");
   return layout;
  }
  void Request(const VisualSourceReader& reader, const gpu::ImageWorkspaceObservation& observed, AdmittedSource& source, bool detach_only = false) {
   source.preparing->store(true, std::memory_order_release);
-  VisualWorkspaceRequest request{.product_owner = observed.product_owner,
+  VisualWorkspaceRequest request{
+   .product_owner = observed.product_owner,
    .product_revision = observed.product_revision,
    .detach_only = detach_only,
    .destination = source.workspace,
    .ready = [completion = source.preparing, weak = std::weak_ptr{wake_}] {
-    completion->store(false, std::memory_order_release);
-    if (const auto wake = weak.lock()) static_cast<void>(mmltk::common::io::signal_event_fd(wake->get()));
-   }};
+   completion->store(false, std::memory_order_release);
+   if (const auto wake = weak.lock()) static_cast<void>(mmltk::common::io::signal_event_fd(wake->get()));
+  }
+  };
   try {
    reader.request_workspace(std::move(request));
   } catch (...) {
@@ -791,15 +800,12 @@ private:
   }
   admitted->detaching = false;
   admitted->producer = pending_->reader;
-  services::RuntimeDiagnosticSpan borrow_span(
-   diagnostics_,
-   [&] {
-    auto fact = presentation_diagnostic_fact(
-     VisualDiagnosticOperation::PresentationSourceBorrowStarted, {.submitted = pending_->submitted, .publication = {.capability = CapabilityOf(*arena)}, .link = pending_->link}, settings_.device);
-    fact.context.workspace = native::workspace_source_diagnostic(admitted->description);
-    return visual_diagnostic_boundary(fact, VisualDiagnosticOperation::PresentationSourceBorrowCompleted);
-   },
-   pending_->link);
+  services::RuntimeDiagnosticSpan borrow_span(diagnostics_, [&] {
+   auto fact = presentation_diagnostic_fact(
+    VisualDiagnosticOperation::PresentationSourceBorrowStarted, {.submitted = pending_->submitted, .publication = {.capability = CapabilityOf(*arena)}, .link = pending_->link}, settings_.device);
+   fact.context.workspace = native::workspace_source_diagnostic(admitted->description);
+   return visual_diagnostic_boundary(fact, VisualDiagnosticOperation::PresentationSourceBorrowCompleted);
+  }, pending_->link);
   if (pending_->requested_owner == 0U) {
    const bool direct = observed.workspace == admitted->workspace && admitted->workspace->Contains({observed.product_owner, frame.revision});
    auto raw = direct ? pending_->reader->borrow() : gpu::BorrowedImageProductReadView{};
@@ -821,14 +827,17 @@ private:
   try {
    borrow_span.FinishWith([](auto& fact) { fact.context.outcome = 1U; });
    const auto transfer = mmltk::common::types::take_monotonic_identity(admitted->next_transfer);
-   transfer_.emplace(Transfer{.source = admitted,
+   transfer_.emplace(Transfer{
+    .source = admitted,
     .pending = std::move(*pending_),
-    .publication = {.capability = CapabilityOf(*arena),
-     .timeline_ready = native::detail::workspace_timeline_ready(transfer),
-     .presentation_revision = mmltk::common::types::take_monotonic_identity(next_publication_),
-     .transfer_sequence = transfer},
+    .publication =
+     {.capability = CapabilityOf(*arena),
+      .timeline_ready = native::detail::workspace_timeline_ready(transfer),
+      .presentation_revision = mmltk::common::types::take_monotonic_identity(next_publication_),
+      .transfer_sequence = transfer},
     .plane = admitted->workspace->plane(frame.extent.width, frame.extent.height),
-    .physical_revision = admitted->workspace->revision()});
+    .physical_revision = admitted->workspace->revision()
+   });
    diagnostics_.Emit([&] {
     auto fact = Fact(VisualDiagnosticOperation::PresentationSourceReadSubmitted, *transfer_, 0U);
     fact.value = 0U;
@@ -837,9 +846,9 @@ private:
     return fact;
    });
    SamplePixels(*transfer_, admitted->stream);
-   ready_span_.emplace(
-    diagnostics_, [&] { return visual_diagnostic_boundary(Fact(VisualDiagnosticOperation::PresentationReadySyncStarted, *transfer_, 0U), VisualDiagnosticOperation::PresentationReadySyncCompleted); },
-    transfer_->pending.link);
+   ready_span_.emplace(diagnostics_, [&] {
+    return visual_diagnostic_boundary(Fact(VisualDiagnosticOperation::PresentationReadySyncStarted, *transfer_, 0U), VisualDiagnosticOperation::PresentationReadySyncCompleted);
+   }, transfer_->pending.link);
    admitted->timeline->SignalReady(reinterpret_cast<cudaStream_t>(admitted->stream.native_handle()), transfer_->publication.timeline_ready);
    stage_ = Stage::ReadyPending;
    EnqueueCompletion(admitted->stream, completion_);
@@ -875,7 +884,8 @@ private:
    DiagnoseArena(VisualDiagnosticOperation::PresentationReplacement, *active_, 1U);
   }
   PresentationNativeOutcome outcome{
-   .progress = PresentationNativeProgress::Published, .submitted = transfer.pending.submitted, .publication = transfer.publication, .diagnostic_link = transfer.pending.link};
+   .progress = PresentationNativeProgress::Published, .submitted = transfer.pending.submitted, .publication = transfer.publication, .diagnostic_link = transfer.pending.link
+  };
   return outcome;
  }
  void ObserveSourceTransition(const abi::Record& record) {
@@ -900,9 +910,9 @@ private:
    return;
   }
   if (record.opcode != abi::Opcode::ReleaseSubmitted || !source.acquired) throw std::runtime_error("workspace release submission has no acquisition");
-  source.release_span.emplace(
-   diagnostics_, [&] { return visual_diagnostic_boundary(Fact(VisualDiagnosticOperation::PresentationReleaseWaitStarted, transfer, 0U), VisualDiagnosticOperation::PresentationReleaseWaitCompleted); },
-   transfer.pending.link);
+  source.release_span.emplace(diagnostics_, [&] {
+   return visual_diagnostic_boundary(Fact(VisualDiagnosticOperation::PresentationReleaseWaitStarted, transfer, 0U), VisualDiagnosticOperation::PresentationReleaseWaitCompleted);
+  }, transfer.pending.link);
   source.context.Bind();
   source.timeline->WaitForRelease(reinterpret_cast<cudaStream_t>(source.stream.native_handle()), transfer.publication.timeline_ready + 1U);
   source.release_submitted = true;
@@ -932,9 +942,9 @@ private:
     coordinates[2U * index + 1U] = coordinate(index / 5U, plane.descriptor.height);
    }
    source.pixel_coordinates = coordinates;
-   services::RuntimeDiagnosticSpan probe_span(
-    diagnostics_, [&] { return visual_diagnostic_boundary(Fact(VisualDiagnosticOperation::PresentationPixelProbeStarted, transfer, 0U), VisualDiagnosticOperation::PresentationPixelProbeSubmitted); },
-    transfer.pending.link);
+   services::RuntimeDiagnosticSpan probe_span(diagnostics_, [&] {
+    return visual_diagnostic_boundary(Fact(VisualDiagnosticOperation::PresentationPixelProbeStarted, transfer, 0U), VisualDiagnosticOperation::PresentationPixelProbeSubmitted);
+   }, transfer.pending.link);
    if (mmltk::backend::imaging::raster::probe_rgba(
         {reinterpret_cast<const std::uint8_t*>(plane.data), plane.descriptor.pitch_bytes, static_cast<int>(plane.descriptor.width), static_cast<int>(plane.descriptor.height)},
         source.pixel_device.get(), coordinates, stream.native_handle()) != cudaSuccess ||
@@ -963,16 +973,20 @@ private:
   const bool copied = std::exchange(source.probe_source_copy_pending, false);
   if (!diagnostics_.pixel_probes_enabled()) return;
   const auto* values = static_cast<const std::uint32_t*>(source.pixels->data());
-  const std::array operations{operation, operation == VisualDiagnosticOperation::PresentationPixelAfterRelease ? VisualDiagnosticOperation::PresentationPixelSourceCopyAfterRelease
-                                                                                                               : VisualDiagnosticOperation::PresentationPixelSourceCopyBeforeReady};
+  const std::array operations{
+   operation, operation == VisualDiagnosticOperation::PresentationPixelAfterRelease ? VisualDiagnosticOperation::PresentationPixelSourceCopyAfterRelease
+                                                                                    : VisualDiagnosticOperation::PresentationPixelSourceCopyBeforeReady
+  };
   std::array<VisualDiagnosticFact, kPixelSampleCount> facts;
   for (std::size_t probe = 0U; probe != (copied ? operations.size() : 1U); ++probe) {
    for (std::size_t index = 0U; index != facts.size(); ++index) {
     facts[index] = Fact(operations[probe], transfer, 0U);
-    facts[index].context.pixel = {.sample_index = static_cast<std::uint32_t>(index),
+    facts[index].context.pixel = {
+     .sample_index = static_cast<std::uint32_t>(index),
      .sample_x = source.pixel_coordinates[2U * index],
      .sample_y = source.pixel_coordinates[2U * index + 1U],
-     .sample_rgba = values[probe * kPixelSampleCount + index]};
+     .sample_rgba = values[probe * kPixelSampleCount + index]
+    };
    }
    diagnostics_.WriteBatch(facts);
   }
@@ -987,16 +1001,20 @@ private:
  }
  void DiagnoseSource(VisualDiagnosticOperation operation, const AdmittedSource& source, std::uint64_t outcome) const noexcept {
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Presentation,
     .operation = operation,
     .device = source.context.device(),
     .generation = source.generation,
-    .context = {.capacity_width = source.description.width,
+    .context = {
+     .capacity_width = source.description.width,
      .capacity_height = source.description.height,
      .surface_high = source.description.id_high,
      .surface_low = source.description.id_low,
      .outcome = outcome,
-     .workspace = native::workspace_source_diagnostic(source.description)}};
+     .workspace = native::workspace_source_diagnostic(source.description)
+    }
+   };
   });
  }
  void DiagnoseArena(VisualDiagnosticOperation operation, const SampleArena& arena, std::uint64_t outcome) const noexcept {

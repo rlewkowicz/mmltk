@@ -40,8 +40,8 @@ auto SurfaceAudit::source_transition(const std::string& id, const std::string_vi
  } else
   return;
  if (!browser && next == 5U && std::ranges::any_of(surfaces, [&](const auto& surface) {
-      return std::ranges::any_of(surface.second.transfers, [&](const auto& transfer) { return transfer.second.read.source == id && transfer.second.terminal == TerminalRead::Retained; });
-     })) {
+  return std::ranges::any_of(surface.second.transfers, [&](const auto& transfer) { return transfer.second.read.source == id && transfer.second.terminal == TerminalRead::Retained; });
+ })) {
   reject("physical source retirement contradicts installed terminal custody");
   return;
  }
@@ -126,10 +126,12 @@ auto SurfaceAudit::native(const nlohmann::json& record) -> void {
   source.direct_sampling = record.value("direct_sampling", false);
   return;
  }
- constexpr std::array transitions{"presentation.arena.advertised", "presentation.admission.enqueued", "presentation.admission.written", "presentation.import.outcome",
-  "presentation.source_borrow.started", "presentation.source_borrow.completed", "presentation.source.read_submitted", "presentation.ready_sync.started", "presentation.ready_sync.completed",
-  "presentation.frame.edge", "presentation.active.withdrawal", "presentation.candidate.withdrawal", "presentation.retirement", "presentation.release_wait.started",
-  "presentation.release_wait.completed", "presentation.terminal_read.completed", "presentation.terminal_read.retained", "presentation.replacement"};
+ constexpr std::array transitions{
+  "presentation.arena.advertised", "presentation.admission.enqueued", "presentation.admission.written", "presentation.import.outcome", "presentation.source_borrow.started",
+  "presentation.source_borrow.completed", "presentation.source.read_submitted", "presentation.ready_sync.started", "presentation.ready_sync.completed", "presentation.frame.edge",
+  "presentation.active.withdrawal", "presentation.candidate.withdrawal", "presentation.retirement", "presentation.release_wait.started", "presentation.release_wait.completed",
+  "presentation.terminal_read.completed", "presentation.terminal_read.retained", "presentation.replacement"
+ };
  if (record.value("kind", "") != "gui_runtime" || std::ranges::find(transitions, event) == transitions.end()) return;
  const auto id = native_identity(record);
  if (!record.contains("surface_high") || !record.contains("surface_low") || !valid_identity(id)) {
@@ -227,7 +229,8 @@ auto SurfaceAudit::native(const nlohmann::json& record) -> void {
     const auto source = native_identity(record, true);
     const auto admitted = sources.find(source);
     const SourceRead read{
-     source, scalar(record, "workspace_allocation"), scalar(record, "source_session"), scalar(record, "source_revision"), scalar(record, "source_width"), scalar(record, "source_height")};
+     source, scalar(record, "workspace_allocation"), scalar(record, "source_session"), scalar(record, "source_revision"), scalar(record, "source_width"), scalar(record, "source_height")
+    };
     if (admitted == sources.end() || !admitted->second.native.live() || read.allocation == 0U || admitted->second.allocation != read.allocation || read.session == 0U || read.frame == 0U ||
         read.width == 0U || read.height == 0U || read.width > admitted->second.width || read.height > admitted->second.height)
      reject("source read does not name its admitted workspace allocation");
@@ -257,8 +260,10 @@ auto SurfaceAudit::native(const nlohmann::json& record) -> void {
   }
   if (transferred) {
    const auto receipt = state.transfers.find(publication_key);
-   const SourceRead observed{native_identity(record, true), scalar(record, "workspace_allocation"), scalar(record, "source_session"), scalar(record, "source_revision"), scalar(record, "source_width"),
-    scalar(record, "source_height")};
+   const SourceRead observed{
+    native_identity(record, true), scalar(record, "workspace_allocation"), scalar(record, "source_session"), scalar(record, "source_revision"), scalar(record, "source_width"),
+    scalar(record, "source_height")
+   };
    if (receipt == state.transfers.end() || receipt->second.read != observed)
     reject("physical publication changed source read provenance");
    else if (event == "presentation.frame.edge") {
@@ -386,8 +391,10 @@ auto SurfaceAudit::browser(const nlohmann::json& record) -> void {
  }
  if (event == "firefox.workspace.frame_forwarded" || event == "firefox.workspace.frame_dispatched" || event == "firefox.workspace.copy_completed" || event == "firefox.workspace.read_settled") {
   const auto publication = scalar(record, "presentation_revision");
-  const ReceiverReceipt observed{record.value("source", ""), scalar(record, "transfer_sequence"), scalar(record, "layer"), scalar(record, "slot"), scalar(record, "content_session"),
-   scalar(record, "content_sequence"), scalar(record, "content_width"), scalar(record, "content_height"), 0U, record.value("direct_sampling", false)};
+  const ReceiverReceipt observed{
+   record.value("source", ""), scalar(record, "transfer_sequence"), scalar(record, "layer"), scalar(record, "slot"), scalar(record, "content_session"), scalar(record, "content_sequence"),
+   scalar(record, "content_width"), scalar(record, "content_height"), 0U, record.value("direct_sampling", false)
+  };
   if (publication == 0U || observed.session == 0U || observed.frame == 0U || observed.width == 0U || observed.height == 0U || !record.contains("layer") || !record.contains("slot") ||
       observed.layer != 0U || observed.slot >= 2U)
    reject("receiver physical receipt has missing or invalid identity");

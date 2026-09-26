@@ -349,7 +349,8 @@ __device__ inline void ms_deformable_col2im_kernel_body(const int index, const s
    const scalar_t loc_h = data_sampling_loc[data_loc_w_ptr + 1];
    const scalar_t weight = data_attn_weight[data_weight_ptr];
    point_reducer(MsDeformableCol2ImPointArgs<scalar_t>{
-    data_value_ptr, spatial_h, spatial_w, num_heads, channels, loc_w, loc_h, m_col, c_col, top_grad, weight, grad_value_ptr, grad_sampling_loc, grad_attn_weight});
+    data_value_ptr, spatial_h, spatial_w, num_heads, channels, loc_w, loc_h, m_col, c_col, top_grad, weight, grad_value_ptr, grad_sampling_loc, grad_attn_weight
+   });
    ++data_weight_ptr;
    data_loc_w_ptr += 2;
    ++grad_attn_weight;
@@ -406,7 +407,8 @@ __global__ void ms_deformable_im2col_gpu_kernel(const int n, MMLTK_ML_LAYERS_DEF
  ms_deformable_col2im_kernel_body(index, grad_col, data_value, data_layout, data_sampling_loc, data_attn_weight, spatial_size, num_heads, channels, num_levels, num_query, num_point, grad_value, \
   grad_sampling_loc, grad_attn_weight,                                                                                                                                                            \
   SharedMemoryCol2ImPointReducer<scalar_t, reduction_type_expr<scalar_t, unsigned int>, store_type_expr<scalar_t>>{                                                                               \
-   cache_grad_sampling_loc_expr, cache_grad_attn_weight_expr, tid, reduction_type_expr<scalar_t, unsigned int>{reduction_count_expr}, store_type_expr<scalar_t>{}})
+   cache_grad_sampling_loc_expr, cache_grad_attn_weight_expr, tid, reduction_type_expr<scalar_t, unsigned int>{reduction_count_expr}, store_type_expr<scalar_t>{}                                 \
+  })
 #define MMLTK_ML_LAYERS_DEFINE_STATIC_SHM_COL2IM_KERNEL(kernel_name, reduction_type, store_type)                                      \
  template <typename scalar_t, unsigned int blockSize>                                                                                 \
  __global__ void kernel_name(const int n, MMLTK_ML_LAYERS_DEFORM_COL2IM_PARAMS(scalar_t)) {                                           \

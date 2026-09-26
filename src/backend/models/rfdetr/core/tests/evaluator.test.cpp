@@ -71,7 +71,8 @@ public:
   const auto plan = data::DatasetCompiler::prepare(config, {config.split});
   data::DatasetCompiler::compile(plan, 0U);
   loader = std::make_unique<data::DatasetLoader>(data::DatasetLoader::Config{
-   .compiled_path = data::testsupport::compiled_bin_path(fixture), .batch_size = 1U, .shuffle = false, .prefetch_factor = 2, .gather_workers = 1, .loading = data::data_loading_options(true)});
+   .compiled_path = data::testsupport::compiled_bin_path(fixture), .batch_size = 1U, .shuffle = false, .prefetch_factor = 2, .gather_workers = 1, .loading = data::data_loading_options(true)
+  });
  }
  std::unique_ptr<data::DatasetLoader> loader;
 
@@ -421,7 +422,8 @@ TEST_CASE("evaluation retained prefixes preserve score bits records and metrics"
  const auto ordinary = box(0, {0, 0, 32, 32});
  EvaluationFixture fixture({{ordinary, ordinary, box(0, {0, 0, 128, 128})}}, 128, {{{{"area", 1024.0}}, {{"area", 9216.0}, {"ignore", true}}, {{"iscrowd", true}}}});
  const std::array scores{
-  0.0F, -0.0F, 1.0F, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), 1.0F, -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()};
+  0.0F, -0.0F, 1.0F, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), 1.0F, -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()
+ };
  const std::array<std::uint32_t, 8U> order{4U, 2U, 5U, 0U, 1U, 6U, 3U, 7U};
  std::vector<r::Prediction> predictions;
  for (std::size_t index = 0U; index < scores.size(); ++index) predictions.push_back(box(0, {0, 0, index % 2U == 0U ? 32.0F : 24.0F, 32}, scores[index]));

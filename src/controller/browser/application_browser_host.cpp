@@ -179,79 +179,77 @@ struct ApplicationBrowserHost::Impl final {
     });
     return false;
    }
-   return std::visit(
-    [this, installed]<class Record>(Record value) {
-     using Type = std::remove_cvref_t<Record>;
-     if constexpr (std::same_as<Type, Intent>) {
-      const auto endpoint_id = value.endpoint_id;
-      const auto correlation = value.correlation;
+   return std::visit([this, installed]<class Record>(Record value) {
+    using Type = std::remove_cvref_t<Record>;
+    if constexpr (std::same_as<Type, Intent>) {
+     const auto endpoint_id = value.endpoint_id;
+     const auto correlation = value.correlation;
+     diagnostics.Emit([&] {
+      return services::RuntimeDiagnosticFact{
+       .owner = contracts::DiagnosticOwner::BrowserRuntime,
+       .event = "browser.intent.received",
+       .participant = endpoint_diagnostic_name(endpoint_id),
+       .sequence = endpoint_id,
+       .value = correlation,
+      };
+     });
+     auto reply = dispatch_intent(*installed, std::move(value));
+     if (reply.error.has_value()) {
       diagnostics.Emit([&] {
        return services::RuntimeDiagnosticFact{
         .owner = contracts::DiagnosticOwner::BrowserRuntime,
-        .event = "browser.intent.received",
+        .event = "browser.intent.rejected",
+        .participant = endpoint_diagnostic_name(endpoint_id),
+        .sequence = endpoint_id,
+        .value = correlation,
+        .detail = static_cast<std::uint64_t>(reply.error->category),
+        .message = reply.error->detail,
+       };
+      });
+     } else {
+      diagnostics.Emit([&] {
+       return services::RuntimeDiagnosticFact{
+        .owner = contracts::DiagnosticOwner::BrowserRuntime,
+        .event = "browser.intent.accepted",
         .participant = endpoint_diagnostic_name(endpoint_id),
         .sequence = endpoint_id,
         .value = correlation,
        };
       });
-      auto reply = dispatch_intent(*installed, std::move(value));
-      if (reply.error.has_value()) {
-       diagnostics.Emit([&] {
-        return services::RuntimeDiagnosticFact{
-         .owner = contracts::DiagnosticOwner::BrowserRuntime,
-         .event = "browser.intent.rejected",
-         .participant = endpoint_diagnostic_name(endpoint_id),
-         .sequence = endpoint_id,
-         .value = correlation,
-         .detail = static_cast<std::uint64_t>(reply.error->category),
-         .message = reply.error->detail,
-        };
-       });
-      } else {
-       diagnostics.Emit([&] {
-        return services::RuntimeDiagnosticFact{
-         .owner = contracts::DiagnosticOwner::BrowserRuntime,
-         .event = "browser.intent.accepted",
-         .participant = endpoint_diagnostic_name(endpoint_id),
-         .sequence = endpoint_id,
-         .value = correlation,
-        };
-       });
-      }
-      const bool published = publish_record(std::move(reply), transport::BrowserRecordPriority::Critical);
-      if (!published) {
-       diagnostics.Emit([&] {
-        return services::RuntimeDiagnosticFact{
-         .owner = contracts::DiagnosticOwner::BrowserRuntime,
-         .event = "browser.intent.reply_rejected",
-         .participant = endpoint_diagnostic_name(endpoint_id),
-         .sequence = endpoint_id,
-         .value = correlation,
-        };
-       });
-      }
-      return published;
-     } else if constexpr (std::same_as<Type, Interaction>) {
-      return interaction(*installed, InteractionView{value});
-     } else if constexpr (std::same_as<Type, IntegrationControl>) {
-      const bool accepted = integration && integration->ObserveFrontend(value.receipt);
-      if (!accepted && diagnostics.valid()) {
-       try {
-        namespace serialization = mmltk::frameworks::serialization;
-        using Value = serialization::wire::Value;
-        auto receipt = serialization::reflected_value(value.receipt);
-        if (receipt) {
-         diagnostics.write_browser_event("browser.integration.rejected", Value(Value::Object{
-                                                                          {"receipt", std::move(*receipt)},
-                                                                          {"gate_installed", Value(static_cast<bool>(integration))},
-                                                                         }));
-        }
-       } catch (...) {}
-      }
-      return accepted;
      }
-    },
-    std::move(*decoded));
+     const bool published = publish_record(std::move(reply), transport::BrowserRecordPriority::Critical);
+     if (!published) {
+      diagnostics.Emit([&] {
+       return services::RuntimeDiagnosticFact{
+        .owner = contracts::DiagnosticOwner::BrowserRuntime,
+        .event = "browser.intent.reply_rejected",
+        .participant = endpoint_diagnostic_name(endpoint_id),
+        .sequence = endpoint_id,
+        .value = correlation,
+       };
+      });
+     }
+     return published;
+    } else if constexpr (std::same_as<Type, Interaction>) {
+     return interaction(*installed, InteractionView{value});
+    } else if constexpr (std::same_as<Type, IntegrationControl>) {
+     const bool accepted = integration && integration->ObserveFrontend(value.receipt);
+     if (!accepted && diagnostics.valid()) {
+      try {
+       namespace serialization = mmltk::frameworks::serialization;
+       using Value = serialization::wire::Value;
+       auto receipt = serialization::reflected_value(value.receipt);
+       if (receipt) {
+        diagnostics.write_browser_event("browser.integration.rejected", Value(Value::Object{
+                                                                         {"receipt", std::move(*receipt)},
+                                                                         {"gate_installed", Value(static_cast<bool>(integration))},
+                                                                        }));
+       }
+      } catch (...) {}
+     }
+     return accepted;
+    }
+   }, std::move(*decoded));
   } catch (...) {
    if (diagnostics.valid()) {
     const auto error = map_current_exception();

@@ -11,12 +11,14 @@ std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime> make_visual_runtime(
   const auto source = [](const auto plane) -> raster::ConstBytes {
    return {reinterpret_cast<const std::uint8_t*>(plane.data), plane.descriptor.pitch_bytes, static_cast<int>(plane.descriptor.width), static_cast<int>(plane.descriptor.height)};
   };
-  raster::FinalizeRgbaWork work{.clean = source(clean),
+  raster::FinalizeRgbaWork work{
+   .clean = source(clean),
    .semantic = source(semantic),
-   .destination = {reinterpret_cast<std::uint8_t*>(destination.data), destination.descriptor.pitch_bytes, static_cast<int>(destination.descriptor.width),
-    static_cast<int>(destination.descriptor.height)},
+   .destination =
+    {reinterpret_cast<std::uint8_t*>(destination.data), destination.descriptor.pitch_bytes, static_cast<int>(destination.descriptor.width), static_cast<int>(destination.descriptor.height)},
    .full_image = coverage.full_image,
-   .stream = reinterpret_cast<void*>(stream)};
+   .stream = reinterpret_cast<void*>(stream)
+  };
   const auto submit = [&] { mmltk::frameworks::gpu::ensure_cuda_ok(static_cast<cudaError_t>(raster::finalize_rgba(work)), "workspace raster finalization"); };
   if (coverage.full_image) {
    submit();

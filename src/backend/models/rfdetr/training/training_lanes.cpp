@@ -191,7 +191,8 @@ TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_
    }
    (*lane.model)
     .configure_supervision_timing(SupervisionTimingSetup{
-     mmltk::backend::ml::cuda::cuda_device(options.device_id), static_cast<std::size_t>(derive_execution_facts(options, 0).microbatches_per_attempt), mmltk::common::logging::profile_enabled()});
+     mmltk::backend::ml::cuda::cuda_device(options.device_id), static_cast<std::size_t>(derive_execution_facts(options, 0).microbatches_per_attempt), mmltk::common::logging::profile_enabled()
+    });
    lane.model->optimize_for_inference(checked_cast<int>(local_batch, "batch_size exceeds supported inference compilation range"), true, options.compilation_mode);
    lane.grad_params = lane_grad_parameters(*lane.model, all_param_names);
   }
@@ -247,111 +248,111 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mml
  return lane_pool.enqueue(
   [failure = impl_->failure, runtime, &loader, &lane, batch, params_ready, admitted_microbatches, gradient_scale, parameter_version, &detection_config, &model, device_id, image_height, image_width,
    seed, epoch, rank, augmentation_sequence, amp_enabled, autocast_dtype, route, normalizer = std::move(normalizer), &reducer, lane_index]() mutable {
-   try {
-    ScopedRuntimeContext worker_scope(runtime, lane_index + 1);
-    torch_cuda::TorchCudaDeviceGuard device_guard(torch_cuda::checked_device_index(device_id));
-    torch_cuda::TorchCudaStreamGuard stream_guard(lane.stream);
-    LoaderBatchGuard batch_guard(loader, batch, device_id);
-    torch::Tensor normalized;
-    {
-     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_augment{"rfdetr.train.parallel.augment"};
-     mmltk::common::logging::ScopedProfile profile_benchmark_rfdetr_train_augmentation{"benchmark.rfdetr.train.augmentation"};
-     if (!lane.augmenter) { throw std::runtime_error("parallel RF-DETR train lane is missing its GPU augmenter"); }
-     normalized = lane.augmenter->run(batch, seed, epoch, rank, augmentation_sequence, &loader, lane.donors);
-    }
-    PreparedTargets prepared;
-    {
-     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets{"rfdetr.train.parallel.targets"};
-     prepared = build_targets(batch, image_height, image_width, detection_config.include_masks, detection_config.include_masks, device_id, lane.target_scratch, "train", model.config().num_queries,
-      model.config().training_supervision, static_cast<int>(model.class_layout()->catalog()->size()), &lane.augmenter->batch_plan());
-    }
-    const auto target_count = prepared_target_count(prepared);
-    normalizer->publish(lane_index, target_count);
-    batch_guard.set_consumer_stream(lane.augmenter->prepare_batch_consumer());
-    static_cast<void>(lane.augmenter->finish_batch(batch));
-    batch_guard.release();
-    if (!lane.model) { throw std::runtime_error("parallel RF-DETR train lane is missing its model replica"); }
-    if (lane.synced_parameter_version != parameter_version) {
-     if (params_ready) { params_ready->wait(reinterpret_cast<std::uintptr_t>(lane.stream.stream()), "wait for parallel train parameter readiness"); }
-     torch::NoGradGuard no_grad;
-     if (!lane.copy_sources.empty()) at::_foreach_copy_(lane.copy_destinations, lane.copy_sources);
-     lane.synced_parameter_version = parameter_version;
-    }
-    (*lane.model).train();
-    torch::Tensor detached_loss;
-    torch::Tensor detached_class_loss;
-    torch::Tensor detached_box_loss;
-    TrainingScalarPacket::Tensors scalar_values;
-    DetectionStatisticsPacket::Tensors statistics;
-    TensorMap loss_terms;
-    {
-     RoutedTrainingLoss loss_result;
-     TargetConsumerLease target_consumer(lane.target_scratch, prepared, device_id);
-     auto& lane_owner = (*lane.model);
-     SupervisionTimingLease step_timing(lane_owner, route_is_active(route), SupervisionTimingLease::Kind::Step);
-     const TrainingStep step(admitted_microbatches, gradient_scale, amp_enabled, autocast_dtype);
-     step.forward([&] {
-      ModelOutputs outputs;
-      if (route_uses_denoising(route)) {
-       mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets_handoff{"rfdetr.train.parallel.targets_handoff"};
-       target_consumer.handoff();
-       outputs = (*lane.model)
-                  .forward_with_denoising(
-                   NestedTensor{normalized, prepared.nested_mask}, prepared, TrainingStepIdentity{seed, static_cast<std::uint64_t>(epoch), static_cast<std::uint32_t>(rank), augmentation_sequence});
-      } else {
-       mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_forward{"rfdetr.train.parallel.forward"};
-       outputs = route_uses_match_free(route) ? (*lane.model).forward_for_match_free(NestedTensor{normalized, prepared.nested_mask})
-                                              : (*lane.model).forward(NestedTensor{normalized, prepared.nested_mask}, true);
-      }
-      if (!route_uses_denoising(route)) {
-       mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets_handoff{"rfdetr.train.parallel.targets_handoff"};
-       target_consumer.handoff();
-      }
-      auto global_count = normalizer->consume(lane_index, lane.stream.stream());
-      SupervisionTimingLease criterion_timing(lane_owner, route_is_active(route), SupervisionTimingLease::Kind::Criterion);
-      loss_result = compute_routed_training_loss(*lane.model, route, outputs, prepared, global_count, detection_config);
-      criterion_timing.finish();
-     });
-     {
-      mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_grad{"rfdetr.train.parallel.grad"};
-      reducer.arm(lane_index);
-      // Hooks retain each produced tensor until its bucket accumulation has been
-      // enqueued. The returned autograd inventory is never transported to main.
-      static_cast<void>(step.gradients(loss_result.total, lane.grad_params));
-      reducer.collect(lane_index);
-      runtime->matcher_workspace().complete_assignments(lane.stream.stream());
-     }
-     target_consumer.retire();
-     step_timing.finish();
-     detached_loss = loss_result.total.detach();
-     detached_class_loss = loss_result.classification.detach();
-     detached_box_loss = loss_result.box.detach();
-     scalar_values = std::move(loss_result.scalars);
-     statistics = std::move(loss_result.statistics);
-     loss_terms = std::move(loss_result.ordinary_terms);
-     for (auto& [name, value] : loss_terms) value = value.detach();
-    }
-    lane.ready.record(lane.stream);
-    return TrainLaneResult{
-     std::move(detached_loss),
-     std::move(detached_class_loss),
-     std::move(detached_box_loss),
-     std::move(scalar_values),
-     std::move(statistics),
-     std::move(loss_terms),
-     &lane.ready,
-    };
-   } catch (...) {
-    if (failure) {
-     try {
-      failure(std::current_exception());
-     } catch (...) {}
-    }
-    normalizer->fail(std::current_exception());
-    reducer.abort(std::current_exception());
-    throw;
+  try {
+   ScopedRuntimeContext worker_scope(runtime, lane_index + 1);
+   torch_cuda::TorchCudaDeviceGuard device_guard(torch_cuda::checked_device_index(device_id));
+   torch_cuda::TorchCudaStreamGuard stream_guard(lane.stream);
+   LoaderBatchGuard batch_guard(loader, batch, device_id);
+   torch::Tensor normalized;
+   {
+    mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_augment{"rfdetr.train.parallel.augment"};
+    mmltk::common::logging::ScopedProfile profile_benchmark_rfdetr_train_augmentation{"benchmark.rfdetr.train.augmentation"};
+    if (!lane.augmenter) { throw std::runtime_error("parallel RF-DETR train lane is missing its GPU augmenter"); }
+    normalized = lane.augmenter->run(batch, seed, epoch, rank, augmentation_sequence, &loader, lane.donors);
    }
-  });
+   PreparedTargets prepared;
+   {
+    mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets{"rfdetr.train.parallel.targets"};
+    prepared = build_targets(batch, image_height, image_width, detection_config.include_masks, detection_config.include_masks, device_id, lane.target_scratch, "train", model.config().num_queries,
+     model.config().training_supervision, static_cast<int>(model.class_layout()->catalog()->size()), &lane.augmenter->batch_plan());
+   }
+   const auto target_count = prepared_target_count(prepared);
+   normalizer->publish(lane_index, target_count);
+   batch_guard.set_consumer_stream(lane.augmenter->prepare_batch_consumer());
+   static_cast<void>(lane.augmenter->finish_batch(batch));
+   batch_guard.release();
+   if (!lane.model) { throw std::runtime_error("parallel RF-DETR train lane is missing its model replica"); }
+   if (lane.synced_parameter_version != parameter_version) {
+    if (params_ready) { params_ready->wait(reinterpret_cast<std::uintptr_t>(lane.stream.stream()), "wait for parallel train parameter readiness"); }
+    torch::NoGradGuard no_grad;
+    if (!lane.copy_sources.empty()) at::_foreach_copy_(lane.copy_destinations, lane.copy_sources);
+    lane.synced_parameter_version = parameter_version;
+   }
+   (*lane.model).train();
+   torch::Tensor detached_loss;
+   torch::Tensor detached_class_loss;
+   torch::Tensor detached_box_loss;
+   TrainingScalarPacket::Tensors scalar_values;
+   DetectionStatisticsPacket::Tensors statistics;
+   TensorMap loss_terms;
+   {
+    RoutedTrainingLoss loss_result;
+    TargetConsumerLease target_consumer(lane.target_scratch, prepared, device_id);
+    auto& lane_owner = (*lane.model);
+    SupervisionTimingLease step_timing(lane_owner, route_is_active(route), SupervisionTimingLease::Kind::Step);
+    const TrainingStep step(admitted_microbatches, gradient_scale, amp_enabled, autocast_dtype);
+    step.forward([&] {
+     ModelOutputs outputs;
+     if (route_uses_denoising(route)) {
+      mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets_handoff{"rfdetr.train.parallel.targets_handoff"};
+      target_consumer.handoff();
+      outputs = (*lane.model)
+                 .forward_with_denoising(
+                  NestedTensor{normalized, prepared.nested_mask}, prepared, TrainingStepIdentity{seed, static_cast<std::uint64_t>(epoch), static_cast<std::uint32_t>(rank), augmentation_sequence});
+     } else {
+      mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_forward{"rfdetr.train.parallel.forward"};
+      outputs = route_uses_match_free(route) ? (*lane.model).forward_for_match_free(NestedTensor{normalized, prepared.nested_mask})
+                                             : (*lane.model).forward(NestedTensor{normalized, prepared.nested_mask}, true);
+     }
+     if (!route_uses_denoising(route)) {
+      mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets_handoff{"rfdetr.train.parallel.targets_handoff"};
+      target_consumer.handoff();
+     }
+     auto global_count = normalizer->consume(lane_index, lane.stream.stream());
+     SupervisionTimingLease criterion_timing(lane_owner, route_is_active(route), SupervisionTimingLease::Kind::Criterion);
+     loss_result = compute_routed_training_loss(*lane.model, route, outputs, prepared, global_count, detection_config);
+     criterion_timing.finish();
+    });
+    {
+     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_grad{"rfdetr.train.parallel.grad"};
+     reducer.arm(lane_index);
+     // Hooks retain each produced tensor until its bucket accumulation has been
+     // enqueued. The returned autograd inventory is never transported to main.
+     static_cast<void>(step.gradients(loss_result.total, lane.grad_params));
+     reducer.collect(lane_index);
+     runtime->matcher_workspace().complete_assignments(lane.stream.stream());
+    }
+    target_consumer.retire();
+    step_timing.finish();
+    detached_loss = loss_result.total.detach();
+    detached_class_loss = loss_result.classification.detach();
+    detached_box_loss = loss_result.box.detach();
+    scalar_values = std::move(loss_result.scalars);
+    statistics = std::move(loss_result.statistics);
+    loss_terms = std::move(loss_result.ordinary_terms);
+    for (auto& [name, value] : loss_terms) value = value.detach();
+   }
+   lane.ready.record(lane.stream);
+   return TrainLaneResult{
+    std::move(detached_loss),
+    std::move(detached_class_loss),
+    std::move(detached_box_loss),
+    std::move(scalar_values),
+    std::move(statistics),
+    std::move(loss_terms),
+    &lane.ready,
+   };
+  } catch (...) {
+   if (failure) {
+    try {
+     failure(std::current_exception());
+    } catch (...) {}
+   }
+   normalizer->fail(std::current_exception());
+   reducer.abort(std::current_exception());
+   throw;
+  }
+ });
 }
 void TrainingLanes::settle(TrainLaneResult& result, int device_id) {
  wait_for_lane_result(result, device_id);

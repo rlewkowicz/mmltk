@@ -162,14 +162,14 @@ void run_compile(const CompileCliRequest& request) {
    spdmon::ProgressBar* bar;
   } state{&completed, &bar};
   data::CompileTelemetry telemetry{plan.splits[split_index].image_count, {.context = &state, .report = [](void* context, const data::CompileProgress& progress) noexcept {
-                                                                           auto& progress_state = *static_cast<ProgressState*>(context);
-                                                                           progress_state.bar->set_total(progress.total);
-                                                                           progress_state.bar->set_postfix(data::format_dataset_compile_tracks(progress.tracks));
-                                                                           if (progress.done > *progress_state.completed) {
-                                                                            progress_state.bar->add(progress.done - *progress_state.completed);
-                                                                            *progress_state.completed = progress.done;
-                                                                           }
-                                                                          }}};
+   auto& progress_state = *static_cast<ProgressState*>(context);
+   progress_state.bar->set_total(progress.total);
+   progress_state.bar->set_postfix(data::format_dataset_compile_tracks(progress.tracks));
+   if (progress.done > *progress_state.completed) {
+    progress_state.bar->add(progress.done - *progress_state.completed);
+    *progress_state.completed = progress.done;
+   }
+  }}};
   data::DatasetCompiler::compile(plan, split_index, &telemetry);
   bar.close();
  }

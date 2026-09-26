@@ -4,7 +4,6 @@
 #include <string_view>
 #include "mmltk/frameworks/reflection/member_path.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
-
 namespace mmltk::frameworks::reflection {
 // Bind only the request, member owner and typed prefix; descriptors retain
 // their existing policy, parser, emission and presence contracts.
@@ -26,10 +25,7 @@ struct CliScope final {
  }
 };
 }  // namespace mmltk::frameworks::reflection
-
 // Explicit spellings, aliases, negations and all remaining factory arguments
 // stay visible at the declaration. Neither macro introduces CLI policy.
-#define MMLTK_CLI_NAMED(Scope, Member, ...) \
- ::mmltk::frameworks::reflection::option<typename Scope::request_type, Scope::template path<&Scope::owner_type::Member>>(__VA_ARGS__)
-#define MMLTK_CLI_OPTION(Scope, Member, ...) \
- MMLTK_CLI_NAMED(Scope, Member, Scope::template name<&Scope::owner_type::Member>(), __VA_ARGS__)
+#define MMLTK_CLI_NAMED(Scope, Member, ...) ::mmltk::frameworks::reflection::option<typename Scope::request_type, Scope::template path<&Scope::owner_type::Member>>(__VA_ARGS__)
+#define MMLTK_CLI_OPTION(Scope, Member, ...) MMLTK_CLI_NAMED(Scope, Member, Scope::template name<&Scope::owner_type::Member>(), __VA_ARGS__)

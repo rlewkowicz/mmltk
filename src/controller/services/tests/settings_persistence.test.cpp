@@ -123,16 +123,15 @@ TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, an
  std::promise<FileDialogSystem::event_type> third_completion;
  std::atomic_size_t completions = 0U;
  FileDialogSystem dialog{[&] {
-                          ++constructions;
-                          return std::make_unique<FakeDialogRuntime>(gate, constructions.load() == 1U);
-                         },
-  [&](FileDialogSystem::event_type event) {
-   switch (completions++) {
-    case 0U: first_completion.set_value(std::move(event)); throw std::runtime_error("observer failure");
-    case 1U: second_completion.set_value(std::move(event)); break;
-    default: third_completion.set_value(std::move(event)); break;
-   }
-  }};
+  ++constructions;
+  return std::make_unique<FakeDialogRuntime>(gate, constructions.load() == 1U);
+ }, [&](FileDialogSystem::event_type event) {
+  switch (completions++) {
+   case 0U: first_completion.set_value(std::move(event)); throw std::runtime_error("observer failure");
+   case 1U: second_completion.set_value(std::move(event)); break;
+   default: third_completion.set_value(std::move(event)); break;
+  }
+ }};
  const services::FileDialogOpen selector{.target = services::FileDialogTarget{services::SettingsFieldTarget{services::file_dialog_catalog().entries().front().stable_id}}};
  const auto admission = dialog.Open(selector);
  CHECK(admission.generation == 1U);
@@ -424,8 +423,10 @@ TEST_CASE("Admitted training rejects queued execution changes but preserves inde
  grow.training_model_count = 2;
  CHECK_THROWS_AS(settings.Update(grow), contracts::BusyError);
  using Value = mmltk::frameworks::serialization::wire::FlatValue;
- for (const auto& update : std::array{contracts::SettingsValueUpdate{"workflows.train.compiled_dataset_dir", *Value::text("/next/dataset", mmltk::frameworks::reflection::kMaximumPathBytes)},
-       contracts::SettingsValueUpdate{"workflows.train.model_source", Value{std::int64_t{0}}}}) {
+ for (const auto& update : std::array{
+       contracts::SettingsValueUpdate{"workflows.train.compiled_dataset_dir", *Value::text("/next/dataset", mmltk::frameworks::reflection::kMaximumPathBytes)},
+       contracts::SettingsValueUpdate{"workflows.train.model_source", Value{std::int64_t{0}}}
+      }) {
   contracts::SettingsUpdateRequest locked;
   locked.updates.push_back(update);
   CHECK_THROWS_AS(settings.Update(locked), contracts::BusyError);
@@ -458,8 +459,10 @@ TEST_CASE("export formats persist independently without changing weights selecti
  for (const bool onnx : {false, true}) {
   for (const bool engine : {false, true}) {
    contracts::SettingsUpdateRequest edit;
-   edit.updates = {{.path = "workflows.export_state.export_onnx", .value = mmltk::frameworks::serialization::wire::FlatValue{onnx}},
-    {.path = "workflows.export_state.build_tensorrt", .value = mmltk::frameworks::serialization::wire::FlatValue{engine}}};
+   edit.updates = {
+    {.path = "workflows.export_state.export_onnx", .value = mmltk::frameworks::serialization::wire::FlatValue{onnx}},
+    {.path = "workflows.export_state.build_tensorrt", .value = mmltk::frameworks::serialization::wire::FlatValue{engine}}
+   };
    static_cast<void>(settings.Update(std::move(edit)));
    SettingsSystem restored;
    REQUIRE(restored.Load(services::SettingsLocation{(root.path() / "settings.json").string()}).applied());

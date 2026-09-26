@@ -22,14 +22,13 @@ namespace {
   .rle_pairs = value.rle_pairs,
   .classes = value.classes,
   .tiles = value.tiles,
-  .capacities =
-   {
-    .cards = value.card_capacity,
-    .annotations = value.annotation_capacity,
-    .rle_pairs = value.rle_capacity,
-    .classes = value.class_capacity,
-    .tiles = value.tile_capacity,
-   },
+  .capacities = {
+   .cards = value.card_capacity,
+   .annotations = value.annotation_capacity,
+   .rle_pairs = value.rle_capacity,
+   .classes = value.class_capacity,
+   .tiles = value.tile_capacity,
+  },
  };
 }
 static_assert(rle_abi_layout_matches());

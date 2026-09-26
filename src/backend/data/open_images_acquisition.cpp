@@ -579,7 +579,8 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   progress->transfers().images(BenchmarkDatasetSource::kOpenImagesV7, shard, completed_images - begin, ids.size(), *progress);
   trace_benchmark_event(trace, "benchmark.images.cache_reuse", [&] {
    return nlohmann::json{
-    {"source", "open-images"}, {"shard", shard}, {"inspected_images", group.size()}, {"reused_images", group_available.size()}, {"reused_bytes", cached_image_bytes - group_bytes_begin}};
+    {"source", "open-images"}, {"shard", shard}, {"inspected_images", group.size()}, {"reused_images", group_available.size()}, {"reused_bytes", cached_image_bytes - group_bytes_begin}
+   };
   });
   const std::size_t quarantine_begin = quarantined->size();
   if (!missing_downloads.empty()) {
@@ -623,8 +624,12 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
  }
  std::ranges::sort(available);
  available.erase(std::unique(available.begin(), available.end()), available.end());
- return AcquiredOpenImages{CachedImageDirectory{"open-images", "train", image_root, "open-images-v7:train:" + std::string(kBenchmarkCatalogRevision), cached_image_selection_digest(available),
-                            available.size(), cached_image_bytes, all_cache_hits, {}},
-  std::move(available)};
+ return AcquiredOpenImages{
+  CachedImageDirectory{
+   "open-images", "train", image_root, "open-images-v7:train:" + std::string(kBenchmarkCatalogRevision), cached_image_selection_digest(available), available.size(), cached_image_bytes, all_cache_hits,
+   {}
+  },
+  std::move(available)
+ };
 }
 }  // namespace mmltk::backend::data::benchmark_internal

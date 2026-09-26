@@ -247,7 +247,8 @@ static_assert(!policy::MaterializedOpaqueMemberDeclaration<int, policy::Minimum<
 // Opaque declaration validation intentionally checks only numeric categories.
 static_assert(policy::MaterializedOpaqueMemberDeclaration<int, policy::MaxBytes{1U}, policy::MaxBytes{2U}>::annotations_valid);
 static_assert(policy::MaterializedOpaqueMemberDeclaration<int, policy::Presentation<policy::PresentationKind::Path>{}, policy::Presentation<policy::PresentationKind::Norm>{}>::annotations_valid);
-static_assert(policy::merge(policy::FieldConstraint{.has_minimum = true, .minimum = 1.0L, .maximum_bytes = 4U}, policy::FieldConstraint{.finite = true, .has_minimum = true, .minimum = 2.0L, .maximum_items = 3U}) ==
+static_assert(policy::merge(policy::FieldConstraint{.has_minimum = true, .minimum = 1.0L, .maximum_bytes = 4U},
+               policy::FieldConstraint{.finite = true, .has_minimum = true, .minimum = 2.0L, .maximum_items = 3U}) ==
               policy::FieldConstraint{.finite = true, .has_minimum = true, .minimum = 2.0L, .maximum_bytes = 4U, .maximum_items = 3U});
 static_assert(policy::policy_of_member<&DeclarationBounds::directory>() == policy::policy_of_member<&DeclarationBounds::original>());
 // Materialize each query beside its ordinary canonical declaration.

@@ -34,60 +34,60 @@ FileDialogSnapshot FileDialogSystem::Open(const services::FileDialogOpen request
  run_.Start({
   .prepare =
    [this, request] {
-    std::scoped_lock lock(mutex_);
-    const auto next = contracts::next_compute_generation(state_.generation);
-    if (!next) throw contracts::FailedError("file dialog operation generation exhausted");
-    state_.generation = *next;
-    state_.active = true;
-    state_.cancellation_requested = false;
-    state_.target = request.target;
-    state_.selection.reset();
-   },
+  std::scoped_lock lock(mutex_);
+  const auto next = contracts::next_compute_generation(state_.generation);
+  if (!next) throw contracts::FailedError("file dialog operation generation exhausted");
+  state_.generation = *next;
+  state_.active = true;
+  state_.cancellation_requested = false;
+  state_.target = request.target;
+  state_.selection.reset();
+ },
   .work = [this, resolved = *resolved](const std::stop_token stop) -> direct::LocalRun::Notification {
-   services::FileDialogSelection terminal{.target = resolved.target};
-   std::string detail;
-   bool failed = false;
-   try {
-    if (!runtime_) runtime_ = factory_();
-    if (!runtime_) throw std::runtime_error("file dialog runtime is unavailable");
-    terminal = runtime_->Open(resolved, stop);
-    if (!terminal.valid_for(resolved.target)) throw std::runtime_error("file dialog runtime returned an invalid selection");
-   } catch (const std::exception& error) {
-    failed = true;
-    detail = bounded_dialog_detail(error.what());
-   } catch (...) {
-    failed = true;
-    detail = "file dialog operation failed";
-   }
-   if (failed) runtime_.reset();
-   FileDialogSnapshot settled;
-   {
-    std::scoped_lock lock(mutex_);
-    state_.active = false;
-    state_.cancellation_requested = false;
-    state_.target = resolved.target;
-    state_.selection = failed ? std::nullopt : std::optional{terminal};
-    settled = state_;
-   }
-   if (failed)
-    return [this, settled = std::move(settled), detail = std::move(detail)]() mutable noexcept {
-     direct::PublishLazyNoexcept(events_, [&] { return event_type{FileDialogFailed{std::move(settled), std::move(detail)}}; });
-    };
-   return [this, settled = std::move(settled)]() mutable noexcept { direct::PublishLazyNoexcept(events_, [&] { return event_type{FileDialogCompleted{std::move(settled)}}; }); };
-  },
+  services::FileDialogSelection terminal{.target = resolved.target};
+  std::string detail;
+  bool failed = false;
+  try {
+   if (!runtime_) runtime_ = factory_();
+   if (!runtime_) throw std::runtime_error("file dialog runtime is unavailable");
+   terminal = runtime_->Open(resolved, stop);
+   if (!terminal.valid_for(resolved.target)) throw std::runtime_error("file dialog runtime returned an invalid selection");
+  } catch (const std::exception& error) {
+   failed = true;
+   detail = bounded_dialog_detail(error.what());
+  } catch (...) {
+   failed = true;
+   detail = "file dialog operation failed";
+  }
+  if (failed) runtime_.reset();
+  FileDialogSnapshot settled;
+  {
+   std::scoped_lock lock(mutex_);
+   state_.active = false;
+   state_.cancellation_requested = false;
+   state_.target = resolved.target;
+   state_.selection = failed ? std::nullopt : std::optional{terminal};
+   settled = state_;
+  }
+  if (failed)
+   return [this, settled = std::move(settled), detail = std::move(detail)]() mutable noexcept {
+    direct::PublishLazyNoexcept(events_, [&] { return event_type{FileDialogFailed{std::move(settled), std::move(detail)}}; });
+   };
+  return [this, settled = std::move(settled)]() mutable noexcept { direct::PublishLazyNoexcept(events_, [&] { return event_type{FileDialogCompleted{std::move(settled)}}; }); };
+ },
   .failure = [this](std::exception_ptr) -> direct::LocalRun::Notification {
-   runtime_.reset();
-   FileDialogSnapshot settled;
-   {
-    std::scoped_lock lock(mutex_);
-    state_.active = false;
-    state_.cancellation_requested = false;
-    state_.selection.reset();
-    settled = state_;
-   }
-   return
-    [this, settled = std::move(settled)]() mutable noexcept { direct::PublishLazyNoexcept(events_, [&] { return event_type{FileDialogFailed{std::move(settled), "file dialog worker failed"}}; }); };
-  },
+  runtime_.reset();
+  FileDialogSnapshot settled;
+  {
+   std::scoped_lock lock(mutex_);
+   state_.active = false;
+   state_.cancellation_requested = false;
+   state_.selection.reset();
+   settled = state_;
+  }
+  return
+   [this, settled = std::move(settled)]() mutable noexcept { direct::PublishLazyNoexcept(events_, [&] { return event_type{FileDialogFailed{std::move(settled), "file dialog worker failed"}}; }); };
+ },
  });
  return snapshot();
 }

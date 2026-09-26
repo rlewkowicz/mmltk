@@ -36,20 +36,17 @@ public:
        events_(std::move(events)),
        diagnostics_(diagnostics),
        renderer_(std::move(factory), [this](std::exception_ptr failure) { RendererFailed(failure); }),
-       input_worker_([this](std::stop_token stop) { Reduce(stop); }, [this](std::exception_ptr failure) { Failed(failure); },
-        [this] {
-         if (input_policy_) {
-          input_policy_->Restore();
-          input_policy_.reset();
-         }
-        }) {
+       input_worker_([this](std::stop_token stop) { Reduce(stop); }, [this](std::exception_ptr failure) { Failed(failure); }, [this] {
+        if (input_policy_) {
+         input_policy_->Restore();
+         input_policy_.reset();
+        }
+       }) {
   if (!settings_.valid() || !borrow_source_) throw contracts::InvalidIntentError("Annotation device settings are invalid");
-  renderer_.RegisterContinuation(
-   [this](Runtime& runtime, std::stop_token stop) {
-    RenderPending(runtime, stop);
-    return detail::VisualRuntimeOwner::Notification{};
-   },
-   {}, true, detail::VisualRuntimeOwner::ContinuationCancellation::PreserveOrderedInput);
+  renderer_.RegisterContinuation([this](Runtime& runtime, std::stop_token stop) {
+   RenderPending(runtime, stop);
+   return detail::VisualRuntimeOwner::Notification{};
+  }, {}, true, detail::VisualRuntimeOwner::ContinuationCancellation::PreserveOrderedInput);
  }
  ~Impl() { Shutdown(); }
  [[nodiscard]] AnnotationSnapshot Open(AnnotationOpen request) {
@@ -188,24 +185,22 @@ private:
     continue;
    }
    if (!record) return;
-   std::visit(
-    [this](auto value) {
-     using Value = decltype(value);
-     if constexpr (std::same_as<Value, WorkspaceMouse>)
-      ReduceMouse(value);
-     else if constexpr (std::same_as<Value, Command>)
-      Execute(std::move(value));
-     else {
-      const bool preview_changed = CancelGesture();
-      bool ready;
-      {
-       std::scoped_lock lock(mutex_);
-       ready = state_.ready;
-      }
-      if (preview_changed && ready) QueueRender();
+   std::visit([this](auto value) {
+    using Value = decltype(value);
+    if constexpr (std::same_as<Value, WorkspaceMouse>)
+     ReduceMouse(value);
+    else if constexpr (std::same_as<Value, Command>)
+     Execute(std::move(value));
+    else {
+     const bool preview_changed = CancelGesture();
+     bool ready;
+     {
+      std::scoped_lock lock(mutex_);
+      ready = state_.ready;
      }
-    },
-    std::move(*record));
+     if (preview_changed && ready) QueueRender();
+    }
+   }, std::move(*record));
   }
  }
  [[nodiscard]] bool CancelGesture() noexcept {
@@ -289,44 +284,43 @@ private:
    InstallUi(true);
    return;
   }
-  std::visit(
-   [this](auto request) {
-    using Request = decltype(request);
-    if constexpr (std::same_as<Request, AnnotationOpen>)
-     OpenSource(request);
-    else {
-     bool ready;
-     {
-      std::scoped_lock lock(mutex_);
-      ready = state_.ready;
-     }
-     if (!ready) {
-      Reject("Annotation source image is unavailable", true);
-      return;
-     }
-     const auto result = [&] {
-      if constexpr (std::same_as<Request, AnnotationSave>)
-       return document_.Save(request.destination);
-      else {
-       pointer_.reset();
-       return document_.Edit(request.edit);
-      }
-     }();
-     if (result.outcome == document::DocumentOutcome::Applied)
-      InstallUi(true);
-     else
-      Reject(result.detail, true);
-     if (result.render_changed) QueueRender();
-     if constexpr (std::same_as<Request, AnnotationEditRequest>) {
-      if (result.outcome == document::DocumentOutcome::Applied)
-       diagnostics_.Emit([&] {
-        return VisualDiagnosticFact{
-         .system = contracts::DiagnosticOwner::Annotation, .operation = VisualDiagnosticOperation::DocumentEdited, .device = settings_.device, .generation = document_.ui().document_revision};
-       });
-     }
+  std::visit([this](auto request) {
+   using Request = decltype(request);
+   if constexpr (std::same_as<Request, AnnotationOpen>)
+    OpenSource(request);
+   else {
+    bool ready;
+    {
+     std::scoped_lock lock(mutex_);
+     ready = state_.ready;
     }
-   },
-   std::move(command));
+    if (!ready) {
+     Reject("Annotation source image is unavailable", true);
+     return;
+    }
+    const auto result = [&] {
+     if constexpr (std::same_as<Request, AnnotationSave>)
+      return document_.Save(request.destination);
+     else {
+      pointer_.reset();
+      return document_.Edit(request.edit);
+     }
+    }();
+    if (result.outcome == document::DocumentOutcome::Applied)
+     InstallUi(true);
+    else
+     Reject(result.detail, true);
+    if (result.render_changed) QueueRender();
+    if constexpr (std::same_as<Request, AnnotationEditRequest>) {
+     if (result.outcome == document::DocumentOutcome::Applied)
+      diagnostics_.Emit([&] {
+       return VisualDiagnosticFact{
+        .system = contracts::DiagnosticOwner::Annotation, .operation = VisualDiagnosticOperation::DocumentEdited, .device = settings_.device, .generation = document_.ui().document_revision
+       };
+      });
+    }
+   }
+  }, std::move(command));
  }
  void OpenSource(AnnotationOpen request) {
   // Source borrowing and materialization can wait on another producer and
@@ -335,70 +329,66 @@ private:
    std::scoped_lock lock(mutex_);
    gpu_continuation_ = true;
   }
-  if (!renderer_.SubmitDiscrete(
-       [this, request](Runtime& runtime, std::stop_token stop) -> detail::VisualRuntimeOwner::Notification {
-        if (stop.stop_requested() || CancelRequested()) return [this] { Post([this] { FinishCancelled(); }); };
-        auto source = borrow_source_(request.source);
-        if (!source.valid() || !visual_product_matches_frame(request.source, source.pixels)) return [this] { Post([this] { FinishRejected("Annotation source image is unavailable"); }); };
-        const auto descriptor = source.pixels.plane(0U).plane().descriptor;
-        if (descriptor.width > settings_.maximum_width || descriptor.height > settings_.maximum_height || !request.crop.valid() || !request.target.valid() ||
-            request.target.width > request.crop.width || request.target.height > request.crop.height || request.target.width > settings_.maximum_width ||
-            request.target.height > settings_.maximum_height)
-         return [this] { Post([this] { FinishRejected("Annotation import geometry is invalid or exceeds device bounds"); }); };
-        const auto crop = request.crop;
-        const auto target = request.target;
-        contracts::AnnotationSceneContent scene;
-        try {
-         scene = materialize_visual_document(*source.document, request.source.extent, crop, target);
-        } catch (const contracts::InvalidIntentError& error) {
-         return [this, detail = std::string(error.what())] { Post([this, detail] { FinishRejected(detail); }); };
-        }
-        if (stop.stop_requested() || CancelRequested()) return [this] { Post([this] { FinishCancelled(); }); };
-        {
-         std::scoped_lock lock(render_mutex_);
-         pending_render_ = false;
-        }
-        pending_baseline_ = {};
-        renderer_.SetOutputRetry(false);
-        const auto paths = runtime.CopyInputFrom(std::move(source.pixels));
-        diagnostics_.Emit([&] {
-         return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation, .operation = VisualDiagnosticOperation::CopyCompleted, .device = settings_.device, .copy_path = paths[0U]};
-        });
-        const auto input = runtime.BorrowInput();
-        auto& algorithm = annotation_algorithm(runtime);
-        const auto plane = input.plane(0U).plane();
-        std::exception_ptr preparation_failure;
-        try {
-         algorithm.Open(plane, crop, target);
-        } catch (...) { preparation_failure = std::current_exception(); }
-        if (preparation_failure) return [this, preparation_failure] { Post([this, preparation_failure] { Failed(preparation_failure); }); };
-        std::optional<mmltk::common::system::ExecutionPolicyRequest> policy;
-        if (const auto* execution = runtime.execution())
-         policy = mmltk::common::system::ExecutionPolicyRequest{execution->placement.cpus, "annot-input", 0U, execution->placement.numa_node, -10, false};
-        // Copy completion has committed receiver storage. A later Stop must
-        // not leave that source paired with the old editable document.
-        return [this, scene = std::move(scene), policy = std::move(policy)]() mutable {
-         Post([this, scene = std::move(scene), policy = std::move(policy)]() mutable {
-          if (policy && !input_policy_) input_policy_.emplace(*policy);
-          static_cast<void>(CancelGesture());
-          auto result = document_.Open(std::move(scene));
-          if (result.outcome != document::DocumentOutcome::Applied) throw std::runtime_error(result.detail);
-          {
-           std::scoped_lock lock(mutex_);
-           gpu_continuation_ = false;
-           state_.ready = true;
-           state_.input_document_epoch = mmltk::common::types::advance_monotonic_identity(state_.input_document_epoch);
-          }
-          InstallUi(true);
-          QueueRender();
-          diagnostics_.Emit([&] {
-           return VisualDiagnosticFact{
-            .system = contracts::DiagnosticOwner::Annotation, .operation = VisualDiagnosticOperation::DocumentOpened, .device = settings_.device, .generation = document_.ui().document_revision};
-          });
-         });
-        };
-       },
-       [this] { Post([this] { FinishCancelled(); }); }))
+  if (!renderer_.SubmitDiscrete([this, request](Runtime& runtime, std::stop_token stop) -> detail::VisualRuntimeOwner::Notification {
+   if (stop.stop_requested() || CancelRequested()) return [this] { Post([this] { FinishCancelled(); }); };
+   auto source = borrow_source_(request.source);
+   if (!source.valid() || !visual_product_matches_frame(request.source, source.pixels)) return [this] { Post([this] { FinishRejected("Annotation source image is unavailable"); }); };
+   const auto descriptor = source.pixels.plane(0U).plane().descriptor;
+   if (descriptor.width > settings_.maximum_width || descriptor.height > settings_.maximum_height || !request.crop.valid() || !request.target.valid() || request.target.width > request.crop.width ||
+       request.target.height > request.crop.height || request.target.width > settings_.maximum_width || request.target.height > settings_.maximum_height)
+    return [this] { Post([this] { FinishRejected("Annotation import geometry is invalid or exceeds device bounds"); }); };
+   const auto crop = request.crop;
+   const auto target = request.target;
+   contracts::AnnotationSceneContent scene;
+   try {
+    scene = materialize_visual_document(*source.document, request.source.extent, crop, target);
+   } catch (const contracts::InvalidIntentError& error) {
+    return [this, detail = std::string(error.what())] { Post([this, detail] { FinishRejected(detail); }); };
+   }
+   if (stop.stop_requested() || CancelRequested()) return [this] { Post([this] { FinishCancelled(); }); };
+   {
+    std::scoped_lock lock(render_mutex_);
+    pending_render_ = false;
+   }
+   pending_baseline_ = {};
+   renderer_.SetOutputRetry(false);
+   const auto paths = runtime.CopyInputFrom(std::move(source.pixels));
+   diagnostics_.Emit(
+    [&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation, .operation = VisualDiagnosticOperation::CopyCompleted, .device = settings_.device, .copy_path = paths[0U]}; });
+   const auto input = runtime.BorrowInput();
+   auto& algorithm = annotation_algorithm(runtime);
+   const auto plane = input.plane(0U).plane();
+   std::exception_ptr preparation_failure;
+   try {
+    algorithm.Open(plane, crop, target);
+   } catch (...) { preparation_failure = std::current_exception(); }
+   if (preparation_failure) return [this, preparation_failure] { Post([this, preparation_failure] { Failed(preparation_failure); }); };
+   std::optional<mmltk::common::system::ExecutionPolicyRequest> policy;
+   if (const auto* execution = runtime.execution()) policy = mmltk::common::system::ExecutionPolicyRequest{execution->placement.cpus, "annot-input", 0U, execution->placement.numa_node, -10, false};
+   // Copy completion has committed receiver storage. A later Stop must
+   // not leave that source paired with the old editable document.
+   return [this, scene = std::move(scene), policy = std::move(policy)]() mutable {
+    Post([this, scene = std::move(scene), policy = std::move(policy)]() mutable {
+     if (policy && !input_policy_) input_policy_.emplace(*policy);
+     static_cast<void>(CancelGesture());
+     auto result = document_.Open(std::move(scene));
+     if (result.outcome != document::DocumentOutcome::Applied) throw std::runtime_error(result.detail);
+     {
+      std::scoped_lock lock(mutex_);
+      gpu_continuation_ = false;
+      state_.ready = true;
+      state_.input_document_epoch = mmltk::common::types::advance_monotonic_identity(state_.input_document_epoch);
+     }
+     InstallUi(true);
+     QueueRender();
+     diagnostics_.Emit([&] {
+      return VisualDiagnosticFact{
+       .system = contracts::DiagnosticOwner::Annotation, .operation = VisualDiagnosticOperation::DocumentOpened, .device = settings_.device, .generation = document_.ui().document_revision
+      };
+     });
+    });
+   };
+  }, [this] { Post([this] { FinishCancelled(); }); }))
    FinishRejected("Annotation renderer is unavailable");
  }
  void FinishCancelled() {
@@ -453,10 +443,10 @@ private:
   }
   InstallUi(false);
   if (!renderer_.SubmitOrdered([this, pointer](Runtime& runtime, std::stop_token stop) -> detail::VisualRuntimeOwner::Notification {
-       std::optional<contracts::AnnotationColor> color;
-       if (!stop.stop_requested() && !CancelRequested()) color = annotation_algorithm(runtime).Sample(pointer.point);
-       return [this, pointer, color] { Post([this, pointer, color] { FinishSample(pointer, color); }); };
-      }))
+   std::optional<contracts::AnnotationColor> color;
+   if (!stop.stop_requested() && !CancelRequested()) color = annotation_algorithm(runtime).Sample(pointer.point);
+   return [this, pointer, color] { Post([this, pointer, color] { FinishSample(pointer, color); }); };
+  }))
    throw contracts::UnavailableError("Annotation color sampling is unavailable");
  }
  AnnotationSnapshot CaptureUi(bool settle) {
@@ -474,17 +464,21 @@ private:
  void InstallUi(bool settle) { Publish(AnnotationChanged{CaptureUi(settle)}); }
  void DiagnoseRender(VisualDiagnosticOperation operation, const AnnotationRenderState& description, const Runtime::CompletedOutput* baseline = nullptr, std::uint64_t revision = 0U) const noexcept {
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Annotation,
     .operation = operation,
     .device = settings_.device,
     .generation = description.generation,
     .value = description.scene_revision,
     .detail = description.document_epoch,
-    .context = {.capacity_width = description.scene ? description.scene->frame_width : 0U,
+    .context = {
+     .capacity_width = description.scene ? description.scene->frame_width : 0U,
      .capacity_height = description.scene ? description.scene->frame_height : 0U,
      .frame_revision = revision,
      .condition = baseline && baseline->valid() ? 1U : 0U,
-     .source = {.source_session = presentation_source_session(PresentationSourceKind::Annotation), .source_instance = 1U, .source_revision = revision}}};
+     .source = {.source_session = presentation_source_session(PresentationSourceKind::Annotation), .source_instance = 1U, .source_revision = revision}
+    }
+   };
   });
  }
  void QueueRender() {
@@ -537,9 +531,9 @@ private:
   const bool fresh_source = clean_epoch_ != description.document_epoch;
   const auto input = runtime.BorrowInput();
   const auto baseline = output.ObserveWorkspace();
-  runtime.PublishRetained(
-   output, extent.width, extent.height, [&](auto clean, auto semantic, auto stream) { annotation_algorithm(runtime).Render(description, input.plane(0U).plane(), clean, semantic, stream); },
-   mmltk::frameworks::gpu::ImageSubmission::Enqueue);
+  runtime.PublishRetained(output, extent.width, extent.height, [&](auto clean, auto semantic, auto stream) {
+   annotation_algorithm(runtime).Render(description, input.plane(0U).plane(), clean, semantic, stream);
+  }, mmltk::frameworks::gpu::ImageSubmission::Enqueue);
   runtime.FinalizeWorkspace(output, annotation_algorithm(runtime).WorkspaceCoverage(baseline));
   renderer_.DeferCompletion(runtime, [this, &runtime, output = std::move(output), fresh_source, extent]() mutable {
    const auto& completed_description = active_description_;

@@ -12,16 +12,18 @@ services::ArtifactCompileResult ArtifactDatasetRuntime::Compile(
  mmltk::common::concurrency::ScopedEventCancellation<services::ArtifactCancellationSource> cancellation{stop};
  services::ArtifactProgressObserver observer{
   .context = const_cast<std::function<void(const contracts::ArtifactProgress&)>*>(&progress), .report = [](void* context, const contracts::ArtifactProgress& value) noexcept {
-   try {
-    (*static_cast<std::function<void(const contracts::ArtifactProgress&)>*>(context))(value);
-   } catch (...) {}
-  }};
+  try {
+   (*static_cast<std::function<void(const contracts::ArtifactProgress&)>*>(context))(value);
+  } catch (...) {}
+ }
+ };
  services::ArtifactDiagnosticObserver diagnostics;
  if (diagnostics_.benchmark_trace_enabled()) {
   diagnostics.benchmark = {
    .context = &diagnostics_,
-   .report = [](const void* context, const std::string_view event,
-              const std::string_view fields) noexcept { static_cast<const services::RuntimeDiagnosticTarget*>(context)->write_benchmark_trace(event, fields); },
+   .report = [](const void* context, const std::string_view event, const std::string_view fields) noexcept {
+   static_cast<const services::RuntimeDiagnosticTarget*>(context)->write_benchmark_trace(event, fields);
+  },
   };
  }
  return store_.compile(request, cancellation.token(), observer, diagnostics);
@@ -47,97 +49,97 @@ contracts::ArtifactUiState DatasetSystem::Compile(contracts::WorkflowIntent<cont
  run_.Start({
   .prepare =
    [this] {
-    std::scoped_lock lock(mutex_);
-    if (activity_ != DatasetActivity::None) throw contracts::BusyError("dataset operation is active");
-    const auto next = contracts::next_compute_generation(state_.generation);
-    if (!next) throw contracts::FailedError("dataset operation generation exhausted");
-    activity_ = DatasetActivity::Compile;
-    state_.generation = *next;
-    state_.active = true;
-    state_.progress = {};
-    state_.terminal = {
-     .outcome = contracts::ArtifactTerminalOutcome::Idle,
-     .artifact = {},
-     .detail = {},
-    };
-   },
+  std::scoped_lock lock(mutex_);
+  if (activity_ != DatasetActivity::None) throw contracts::BusyError("dataset operation is active");
+  const auto next = contracts::next_compute_generation(state_.generation);
+  if (!next) throw contracts::FailedError("dataset operation generation exhausted");
+  activity_ = DatasetActivity::Compile;
+  state_.generation = *next;
+  state_.active = true;
+  state_.progress = {};
+  state_.terminal = {
+   .outcome = contracts::ArtifactTerminalOutcome::Idle,
+   .artifact = {},
+   .detail = {},
+  };
+ },
   .work = [this, request = std::move(*request)](const std::stop_token stop) -> direct::LocalRun::Notification {
-   services::ArtifactCompileResult result;
-   std::string detail;
-   bool failed = false;
-   std::atomic_bool malformed_progress = false;
-   try {
-    if (!runtime_) runtime_ = factory_();
-    if (!runtime_) throw std::runtime_error("dataset runtime is unavailable");
-    result = runtime_->Compile(request, stop, [this, &malformed_progress](const contracts::ArtifactProgress& value) {
-     if (!value.valid()) {
-      malformed_progress.store(true, std::memory_order_relaxed);
-      return;
-     }
-     progress(value);
-    });
-    failed = malformed_progress.load(std::memory_order_relaxed) || result.output.string().size() > contracts::kArtifactPathCapacity || !result.inspection.valid() ||
-             (!result.cancelled && (result.output.empty() || !result.inspection.available()));
-    if (failed)
-     detail = contracts::bounded_artifact_detail(malformed_progress.load(std::memory_order_relaxed) ? "dataset compiler returned invalid progress"
-                                                 : !result.inspection.valid()                       ? "dataset compiler returned an invalid inspection"
-                                                  : result.inspection.detail.empty()                ? "dataset compiler returned no compatible artifact"
-                                                                                                    : result.inspection.detail);
-   } catch (const std::exception& error) {
-    failed = true;
-    detail = contracts::bounded_artifact_detail(error.what());
-   } catch (...) {
-    failed = true;
-    detail = "dataset compile failed";
-   }
-   contracts::ArtifactTerminal terminal;
-   if (failed) {
-    runtime_.reset();
-    terminal = {
-     .outcome = contracts::ArtifactTerminalOutcome::Failed,
-     .artifact = {},
-     .detail = detail,
-    };
-   } else if (result.cancelled || stop.stop_requested()) {
-    terminal = {
-     .outcome = contracts::ArtifactTerminalOutcome::Cancelled,
-     .artifact = {},
-     .detail = {},
-    };
-   } else {
-    terminal = {.outcome = contracts::ArtifactTerminalOutcome::Succeeded, .artifact = result.output.string().substr(0, contracts::kArtifactPathCapacity), .detail = {}};
-   }
-   std::optional<contracts::ArtifactUiState> settled;
-   {
-    std::scoped_lock lock(mutex_);
-    if (activity_ == DatasetActivity::Compile) {
-     state_.active = false;
-     state_.inspection = failed ? contracts::ArtifactInspection{} : result.inspection;
-     state_.terminal = terminal;
-     activity_ = DatasetActivity::None;
-     settled = state_;
+  services::ArtifactCompileResult result;
+  std::string detail;
+  bool failed = false;
+  std::atomic_bool malformed_progress = false;
+  try {
+   if (!runtime_) runtime_ = factory_();
+   if (!runtime_) throw std::runtime_error("dataset runtime is unavailable");
+   result = runtime_->Compile(request, stop, [this, &malformed_progress](const contracts::ArtifactProgress& value) {
+    if (!value.valid()) {
+     malformed_progress.store(true, std::memory_order_relaxed);
+     return;
     }
-   }
-   return changed(std::move(settled));
-  },
-  .failure = [this](std::exception_ptr) -> direct::LocalRun::Notification {
+    progress(value);
+   });
+   failed = malformed_progress.load(std::memory_order_relaxed) || result.output.string().size() > contracts::kArtifactPathCapacity || !result.inspection.valid() ||
+            (!result.cancelled && (result.output.empty() || !result.inspection.available()));
+   if (failed)
+    detail = contracts::bounded_artifact_detail(malformed_progress.load(std::memory_order_relaxed) ? "dataset compiler returned invalid progress"
+                                                : !result.inspection.valid()                       ? "dataset compiler returned an invalid inspection"
+                                                 : result.inspection.detail.empty()                ? "dataset compiler returned no compatible artifact"
+                                                                                                   : result.inspection.detail);
+  } catch (const std::exception& error) {
+   failed = true;
+   detail = contracts::bounded_artifact_detail(error.what());
+  } catch (...) {
+   failed = true;
+   detail = "dataset compile failed";
+  }
+  contracts::ArtifactTerminal terminal;
+  if (failed) {
    runtime_.reset();
-   std::optional<contracts::ArtifactUiState> settled;
-   {
-    std::scoped_lock lock(mutex_);
-    if (activity_ == DatasetActivity::Compile) {
-     state_.active = false;
-     state_.terminal.outcome = contracts::ArtifactTerminalOutcome::Failed;
-     state_.terminal.detail = "dataset worker failed";
-     state_.inspection.compatible = false;
-     state_.inspection.splits.clear();
-     state_.inspection.detail.clear();
-     activity_ = DatasetActivity::None;
-     settled = state_;
-    }
+   terminal = {
+    .outcome = contracts::ArtifactTerminalOutcome::Failed,
+    .artifact = {},
+    .detail = detail,
+   };
+  } else if (result.cancelled || stop.stop_requested()) {
+   terminal = {
+    .outcome = contracts::ArtifactTerminalOutcome::Cancelled,
+    .artifact = {},
+    .detail = {},
+   };
+  } else {
+   terminal = {.outcome = contracts::ArtifactTerminalOutcome::Succeeded, .artifact = result.output.string().substr(0, contracts::kArtifactPathCapacity), .detail = {}};
+  }
+  std::optional<contracts::ArtifactUiState> settled;
+  {
+   std::scoped_lock lock(mutex_);
+   if (activity_ == DatasetActivity::Compile) {
+    state_.active = false;
+    state_.inspection = failed ? contracts::ArtifactInspection{} : result.inspection;
+    state_.terminal = terminal;
+    activity_ = DatasetActivity::None;
+    settled = state_;
    }
-   return changed(std::move(settled));
-  },
+  }
+  return changed(std::move(settled));
+ },
+  .failure = [this](std::exception_ptr) -> direct::LocalRun::Notification {
+  runtime_.reset();
+  std::optional<contracts::ArtifactUiState> settled;
+  {
+   std::scoped_lock lock(mutex_);
+   if (activity_ == DatasetActivity::Compile) {
+    state_.active = false;
+    state_.terminal.outcome = contracts::ArtifactTerminalOutcome::Failed;
+    state_.terminal.detail = "dataset worker failed";
+    state_.inspection.compatible = false;
+    state_.inspection.splits.clear();
+    state_.inspection.detail.clear();
+    activity_ = DatasetActivity::None;
+    settled = state_;
+   }
+  }
+  return changed(std::move(settled));
+ },
  });
  return snapshot();
 }

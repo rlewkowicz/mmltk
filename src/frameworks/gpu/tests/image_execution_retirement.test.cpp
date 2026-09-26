@@ -557,25 +557,23 @@ TEST_CASE("exact CUDA context transactions restore or retain their physical owne
   unsigned terminal = 0U;
   bool work = false;
  } driver{.target = reinterpret_cast<CUcontext>(same_context ? 1U : 2U), .failure = failure};
- const CudaContextApi api{&driver,
-  [](void* value, CUcontext* current) noexcept {
-   auto& injected = *static_cast<Driver*>(value);
-   if (injected.failure == Failure::Query) return CUDA_ERROR_INVALID_CONTEXT;
-   *current = injected.current;
-   return CUDA_SUCCESS;
-  },
-  [](void* value, CUcontext current) noexcept {
-   auto& injected = *static_cast<Driver*>(value);
-   if (++injected.sets == 1U && (injected.failure == Failure::Bind || injected.failure == Failure::BindAndRestore)) return CUDA_ERROR_INVALID_CONTEXT;
-   if (injected.sets > 1U && current == injected.caller) {
-    ++injected.restores;
-    if (injected.failure == Failure::LostRestore) return CUDA_ERROR_CONTEXT_IS_DESTROYED;
-    if (injected.failure == Failure::RestoreAlways || injected.failure == Failure::BindAndRestore || (injected.failure == Failure::RestoreOnce && injected.restores == 1U))
-     return CUDA_ERROR_INVALID_CONTEXT;
-   }
-   injected.current = current;
-   return CUDA_SUCCESS;
-  }};
+ const CudaContextApi api{&driver, [](void* value, CUcontext* current) noexcept {
+  auto& injected = *static_cast<Driver*>(value);
+  if (injected.failure == Failure::Query) return CUDA_ERROR_INVALID_CONTEXT;
+  *current = injected.current;
+  return CUDA_SUCCESS;
+ }, [](void* value, CUcontext current) noexcept {
+  auto& injected = *static_cast<Driver*>(value);
+  if (++injected.sets == 1U && (injected.failure == Failure::Bind || injected.failure == Failure::BindAndRestore)) return CUDA_ERROR_INVALID_CONTEXT;
+  if (injected.sets > 1U && current == injected.caller) {
+   ++injected.restores;
+   if (injected.failure == Failure::LostRestore) return CUDA_ERROR_CONTEXT_IS_DESTROYED;
+   if (injected.failure == Failure::RestoreAlways || injected.failure == Failure::BindAndRestore || (injected.failure == Failure::RestoreOnce && injected.restores == 1U))
+    return CUDA_ERROR_INVALID_CONTEXT;
+  }
+  injected.current = current;
+  return CUDA_SUCCESS;
+ }};
  CudaContextScope scope({&driver, [](void* value) noexcept { ++static_cast<Driver*>(value)->terminal; }}, api);
  const auto run = [&] {
   scope.Run([&] {

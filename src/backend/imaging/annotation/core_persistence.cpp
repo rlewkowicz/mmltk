@@ -112,52 +112,50 @@ void append_jsonl(const std::filesystem::path& path, const json& entry) { mmltk:
 json point_to_json(const AnnotationPoint& point) { return json::array({point.x, point.y}); }
 json box_to_json(const AnnotationBox& box) { return json::array({box.x1, box.y1, box.x2, box.y2}); }
 json serialize_annotation_shape_payload(const AnnotationFrame& frame, const AnnotationObject& object) {
- return std::visit(
-  [&frame](const auto& shape) -> json {
-   using T = std::decay_t<decltype(shape)>;
-   if constexpr (std::is_same_v<T, AnnotationBoxShape> || std::is_same_v<T, AnnotationMaskShape>) {
-    return json{
-     {"box_xyxy", box_to_json(annotation_box_to_frame(frame, shape.box))},
+ return std::visit([&frame](const auto& shape) -> json {
+  using T = std::decay_t<decltype(shape)>;
+  if constexpr (std::is_same_v<T, AnnotationBoxShape> || std::is_same_v<T, AnnotationMaskShape>) {
+   return json{
+    {"box_xyxy", box_to_json(annotation_box_to_frame(frame, shape.box))},
+   };
+  } else if constexpr (std::is_same_v<T, AnnotationPointShape>) {
+   return json{
+    {"xy", point_to_json(annotation_capture_point_to_frame_unclipped(frame, shape.point))},
+   };
+  } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
+   json knots = json::array();
+   for (const AnnotationSplineKnot& knot : shape.knots) {
+    json payload{
+     {"xy", point_to_json(annotation_capture_point_to_frame_unclipped(frame, knot.position))},
+     {"handle_mode", annotation_spline_handle_mode_name(knot.handle_mode)},
     };
-   } else if constexpr (std::is_same_v<T, AnnotationPointShape>) {
-    return json{
-     {"xy", point_to_json(annotation_capture_point_to_frame_unclipped(frame, shape.point))},
-    };
-   } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
-    json knots = json::array();
-    for (const AnnotationSplineKnot& knot : shape.knots) {
-     json payload{
-      {"xy", point_to_json(annotation_capture_point_to_frame_unclipped(frame, knot.position))},
-      {"handle_mode", annotation_spline_handle_mode_name(knot.handle_mode)},
-     };
-     if (knot.in_handle.enabled) { payload["in_handle_xy"] = point_to_json(annotation_capture_point_to_frame_unclipped(frame, knot.in_handle.position)); }
-     if (knot.out_handle.enabled) { payload["out_handle_xy"] = point_to_json(annotation_capture_point_to_frame_unclipped(frame, knot.out_handle.position)); }
-     knots.push_back(std::move(payload));
-    }
-    return json{
-     {"closed", shape.closed},
-     {"knots", std::move(knots)},
-    };
-   } else if constexpr (std::is_same_v<T, AnnotationSkeletonShape>) {
-    json nodes = json::array();
-    for (const AnnotationSkeletonNode& node : shape.nodes) {
-     nodes.push_back(json{
-      {"key", node.key},
-      {"visible", node.visible},
-      {"xy", point_to_json(annotation_capture_point_to_frame_unclipped(frame, node.point))},
-     });
-    }
-    json edges = json::array();
-    for (const AnnotationSkeletonEdge& edge : shape.edges) { edges.push_back({edge.source_index, edge.target_index}); }
-    return json{
-     {"nodes", std::move(nodes)},
-     {"edges", std::move(edges)},
-    };
-   } else {
-    return json::object();
+    if (knot.in_handle.enabled) { payload["in_handle_xy"] = point_to_json(annotation_capture_point_to_frame_unclipped(frame, knot.in_handle.position)); }
+    if (knot.out_handle.enabled) { payload["out_handle_xy"] = point_to_json(annotation_capture_point_to_frame_unclipped(frame, knot.out_handle.position)); }
+    knots.push_back(std::move(payload));
    }
-  },
-  object.shape);
+   return json{
+    {"closed", shape.closed},
+    {"knots", std::move(knots)},
+   };
+  } else if constexpr (std::is_same_v<T, AnnotationSkeletonShape>) {
+   json nodes = json::array();
+   for (const AnnotationSkeletonNode& node : shape.nodes) {
+    nodes.push_back(json{
+     {"key", node.key},
+     {"visible", node.visible},
+     {"xy", point_to_json(annotation_capture_point_to_frame_unclipped(frame, node.point))},
+    });
+   }
+   json edges = json::array();
+   for (const AnnotationSkeletonEdge& edge : shape.edges) { edges.push_back({edge.source_index, edge.target_index}); }
+   return json{
+    {"nodes", std::move(nodes)},
+    {"edges", std::move(edges)},
+   };
+  } else {
+   return json::object();
+  }
+ }, object.shape);
 }
 std::optional<AnnotationPoint> annotation_point_from_json(const json& value) {
  if (!value.is_array() || value.size() != 2U) { return std::nullopt; }

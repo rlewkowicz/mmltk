@@ -29,9 +29,7 @@ struct BoundedText final {
   return result;
  }
  [[nodiscard]] constexpr bool valid() const noexcept {
-  return size != 0U && size < bytes.size() && bytes[size] == '\0' &&
-         std::all_of(
-          bytes.begin(), bytes.begin() + size, [](const char value) { return value != '\0'; }) &&
+  return size != 0U && size < bytes.size() && bytes[size] == '\0' && std::all_of(bytes.begin(), bytes.begin() + size, [](const char value) { return value != '\0'; }) &&
          std::all_of(bytes.begin() + size, bytes.end(), [](const char value) { return value == '\0'; });
  }
  [[nodiscard]] constexpr std::string_view view() const noexcept { return valid() ? std::string_view{bytes.data(), size} : std::string_view{}; }
@@ -63,15 +61,13 @@ struct FileDialogTarget final {
  return std::visit([](const auto& value) { return value.stable_id; }, target.value);
 }
 [[nodiscard]] constexpr bool valid_file_dialog_target(const FileDialogTarget& target) noexcept {
- return std::visit(
-  [](const auto& value) {
-   if (value.stable_id == 0U) return false;
-   if constexpr (std::same_as<std::remove_cvref_t<decltype(value)>, ModelArtifactTarget>) {
-    return mmltk::controller::contracts::valid_feature(value.workflow) && value.input != mmltk::backend::models::catalog::ModelArtifactInputKind::None;
-   }
-   return true;
-  },
-  target.value);
+ return std::visit([](const auto& value) {
+  if (value.stable_id == 0U) return false;
+  if constexpr (std::same_as<std::remove_cvref_t<decltype(value)>, ModelArtifactTarget>) {
+   return mmltk::controller::contracts::valid_feature(value.workflow) && value.input != mmltk::backend::models::catalog::ModelArtifactInputKind::None;
+  }
+  return true;
+ }, target.value);
 }
 struct FileDialogSelection final {
  FileDialogTarget target{};

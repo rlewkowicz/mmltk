@@ -38,9 +38,8 @@ T get_value_or(const nlohmann::json& j, const char* key, T fallback) {
 void get_optional_compile_mode(const nlohmann::json& j, const char* key, rfdetr::CompilationMode& out) {
  int compile_mode = static_cast<int>(out);
  get_optional(j, key, compile_mode);
- out = compile_mode >= static_cast<int>(rfdetr::CompilationMode::kNone) && compile_mode <= static_cast<int>(rfdetr::CompilationMode::kFullTrace)
-        ? static_cast<rfdetr::CompilationMode>(compile_mode)
-        : rfdetr::CompilationMode::kSelective;
+ out = compile_mode >= static_cast<int>(rfdetr::CompilationMode::kNone) && compile_mode <= static_cast<int>(rfdetr::CompilationMode::kFullTrace) ? static_cast<rfdetr::CompilationMode>(compile_mode)
+                                                                                                                                                 : rfdetr::CompilationMode::kSelective;
 }
 [[nodiscard]] ModelArtifactInputKind model_input_from_index(const int value, const ModelArtifactInputKind fallback) noexcept {
  switch (static_cast<ModelArtifactInputKind>(value)) {
@@ -126,8 +125,7 @@ struct JsonFieldWriter {
  nlohmann::json& json;
  template <typename T>
  void operator()(const char* key, const T& value) const {
-  if constexpr (std::same_as<T, rfdetr::TrainRecipeSettings> || std::same_as<T, rfdetr::TrainLaneConfiguration> ||
-                std::same_as<T, rfdetr::TrainDataPolicy>) {
+  if constexpr (std::same_as<T, rfdetr::TrainRecipeSettings> || std::same_as<T, rfdetr::TrainLaneConfiguration> || std::same_as<T, rfdetr::TrainDataPolicy>) {
    std::array<std::byte, rfdetr::kMaximumTrainRequestJsonBytes> scratch;
    json[key] = mmltk::frameworks::serialization::reflected_json(value, scratch, {.max_bytes = scratch.size(), .max_items = 4096, .max_depth = 32});
   } else if constexpr (std::is_enum_v<T>) {
@@ -165,8 +163,7 @@ struct JsonFieldReader {
  const nlohmann::json& json;
  template <typename T>
  void operator()(const char* key, T& value) const {
-  if constexpr (std::same_as<T, rfdetr::TrainRecipeSettings> || std::same_as<T, rfdetr::TrainLaneConfiguration> ||
-                std::same_as<T, rfdetr::TrainDataPolicy>) {
+  if constexpr (std::same_as<T, rfdetr::TrainRecipeSettings> || std::same_as<T, rfdetr::TrainLaneConfiguration> || std::same_as<T, rfdetr::TrainDataPolicy>) {
    const auto found = json.find(key);
    if (found != json.end()) {
     std::array<std::byte, rfdetr::kMaximumTrainRequestJsonBytes> scratch;
@@ -396,8 +393,7 @@ constexpr auto train_execution_fields = [](auto& request, const auto& visit) {
  visit("compile_mode", request.compilation_mode);
 };
 constexpr auto inference_execution_fields = [](auto& request, const auto& visit) {
- visit_record_fields<rfdetr::InferenceExecutionConfig>(
-  request, [&](const char* name, auto& field) { visit(std::string_view{name} == "compilation_mode" ? "compile_mode" : name, field); });
+ visit_record_fields<rfdetr::InferenceExecutionConfig>(request, [&](const char* name, auto& field) { visit(std::string_view{name} == "compilation_mode" ? "compile_mode" : name, field); });
 };
 constexpr auto validate_execution_fields = [](auto& request, const auto& visit) {
  inference_execution_fields(request, visit);

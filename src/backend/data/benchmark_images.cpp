@@ -401,8 +401,10 @@ void complete_cached_image_group(const std::filesystem::path& root, const std::f
  const std::vector<std::uint64_t> available = available_image_ids(expected_image_ids, quarantined);
  nlohmann::json quarantined_records = nlohmann::json::array();
  for (const CachedImageRejection& image : quarantined) { quarantined_records.push_back({{"image_id", image.image_id}, {"reason", image.reason}}); }
- nlohmann::json manifest{{"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"identity", identity}, {"image_count", available.size()}, {"image_bytes", image_bytes},
-  {"selection_sha256", cached_image_selection_digest(available)}};
+ nlohmann::json manifest{
+  {"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"identity", identity}, {"image_count", available.size()}, {"image_bytes", image_bytes},
+  {"selection_sha256", cached_image_selection_digest(available)}
+ };
  if (!quarantined.empty()) {
   manifest["requested_image_count"] = expected_image_ids.size();
   manifest["requested_selection_sha256"] = cached_image_selection_digest(expected_image_ids);
@@ -450,7 +452,8 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   if (request.trace && inspected != 0U && inspected % 128U == 0U) {
    trace_benchmark_event(request.trace, "benchmark.images.cache_scan", [&] {
     return nlohmann::json{
-     {"source", request.source}, {"shard", request.shard}, {"inspected_images", inspected}, {"reused_images", completed.size()}, {"total_images", request.selected_image_ids.size()}};
+     {"source", request.source}, {"shard", request.shard}, {"inspected_images", inspected}, {"reused_images", completed.size()}, {"total_images", request.selected_image_ids.size()}
+    };
    });
   }
   if (request.trace) { ++inspected; }

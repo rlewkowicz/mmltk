@@ -28,12 +28,9 @@ public:
    auto cu = std::make_shared<torch::jit::CompilationUnit>();
    auto cls = torch::jit::ClassType::create(class_name, cu, true);
    auto candidate = std::make_unique<State>(torch::jit::Module(cu, cls), signature);
-   auto trace_res = torch::jit::tracer::trace(
-    {tensors.detach().contiguous()...},
-    [&](torch::jit::Stack args) -> torch::jit::Stack {
-     return [&]<size_t... I>(std::index_sequence<I...>) -> torch::jit::Stack { return {fn(args[I].toTensor()...)}; }(std::make_index_sequence<Arity>{});
-    },
-    [](const torch::autograd::Variable&) { return ""; }, false, false, &candidate->module);
+   auto trace_res = torch::jit::tracer::trace({tensors.detach().contiguous()...}, [&](torch::jit::Stack args) -> torch::jit::Stack {
+    return [&]<size_t... I>(std::index_sequence<I...>) -> torch::jit::Stack { return {fn(args[I].toTensor()...)}; }(std::make_index_sequence<Arity>{});
+   }, [](const torch::autograd::Variable&) { return ""; }, false, false, &candidate->module);
    candidate->module.type()->addMethod(cu->create_function("forward", trace_res.first->graph, true));
    state_ = std::move(candidate);
   }

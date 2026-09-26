@@ -45,12 +45,14 @@ void ensure_gallery_buffer(explore::ExploreHighWaterBuffer& buffer, const std::s
  if (!buffer.ensure_bytes(bytes)) throw std::runtime_error(detail);
  if (observed && buffer.capacity_bytes() != previous)
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Explore,
     .operation = VisualDiagnosticOperation::ExploreStorageGrown,
     .device = device_,
     .generation = generation,
     .value = previous,
-    .detail = buffer.capacity_bytes()};
+    .detail = buffer.capacity_bytes()
+   };
   });
 }
 }  // namespace mmltk::controller::explore_detail

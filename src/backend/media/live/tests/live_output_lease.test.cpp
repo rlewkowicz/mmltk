@@ -256,7 +256,8 @@ TEST_CASE("Live admitted-run terminal notification is retained after checked sna
 }
 TEST_CASE("Live no-custody start failure is synchronous and has no admitted terminal") {
  const mmltk::backend::media::capture::CaptureSessionStartResult rejected{
-  mmltk::backend::media::capture::CaptureSessionStartPhase::NoCustody, {mmltk::backend::media::capture::StatusCode::kNoDevice, "capture unavailable"}, {}};
+  mmltk::backend::media::capture::CaptureSessionStartPhase::NoCustody, {mmltk::backend::media::capture::StatusCode::kNoDevice, "capture unavailable"}, {}
+ };
  CHECK_FALSE(rejected.running());
  CHECK_FALSE(rejected.has_custody());
 }

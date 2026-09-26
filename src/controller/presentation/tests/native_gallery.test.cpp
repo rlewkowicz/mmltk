@@ -67,7 +67,8 @@ void check_labels(const std::span<const ExploreLabel> actual, const std::span<co
 // CUDA rendering, cache ownership and runtime publication in the test path.
 void write_gallery_artifact(const std::filesystem::path& path, const float red, const std::uint32_t mask_start, const std::uint32_t count = 203U, const std::uint32_t classes = 1U) {
  namespace data = mmltk::backend::data;
- data::FileHeader header{.magic = data::MAGIC,
+ data::FileHeader header{
+  .magic = data::MAGIC,
   .version = data::FORMAT_VERSION,
   .num_images = count,
   .image_width = 8U,
@@ -82,7 +83,8 @@ void write_gallery_artifact(const std::filesystem::path& path, const float red, 
   .image_stride = 8U * 8U * 3U * sizeof(float),
   .class_names = {},
   .max_instances_per_image = 1U,
-  ._reserved = {}};
+  ._reserved = {}
+ };
  header.pixel_offset = data::align_up(header.index_offset + count * sizeof(data::ImageEntry), data::HUGE_PAGE_SIZE);
  header.label_offset = header.pixel_offset + count * header.image_stride;
  header.mask_rle_offset = header.label_offset + count * sizeof(data::PackedInstance);
@@ -94,15 +96,18 @@ void write_gallery_artifact(const std::filesystem::path& path, const float red, 
  std::vector<std::byte> bytes(header.total_file_size);
  std::memcpy(bytes.data(), &header, sizeof(header));
  for (std::uint32_t index = 0U; index < count; ++index) {
-  const data::ImageEntry entry{.pixel_offset = header.pixel_offset + index * header.image_stride,
+  const data::ImageEntry entry{
+   .pixel_offset = header.pixel_offset + index * header.image_stride,
    .label_offset = static_cast<std::uint32_t>(index * sizeof(data::PackedInstance)),
    .num_instances = 1U,
    ._pad = 0U,
    .label_bytes = sizeof(data::PackedInstance),
    .original_width = 8U,
    .original_height = 8U,
-   ._reserved = 0U};
-  const data::PackedInstance label{.class_id = 0U,
+   ._reserved = 0U
+  };
+  const data::PackedInstance label{
+   .class_id = 0U,
    .flags = data::kAnnotationMask,
    .bbox_x1 = 1,
    .bbox_y1 = 1,
@@ -110,7 +115,8 @@ void write_gallery_artifact(const std::filesystem::path& path, const float red, 
    .bbox_y2 = 7,
    .mask_rle_offset = static_cast<std::uint32_t>(index * sizeof(data::RLEPair)),
    .mask_rle_pairs = 1U,
-   .original_area = 4.0};
+   .original_area = 4.0
+  };
   const data::RLEPair run{mask_start, 4U};
   std::array<float, 8U * 8U * 3U> pixels{};
   for (std::size_t pixel = 0U; pixel < 64U; ++pixel) {
@@ -166,17 +172,13 @@ struct GalleryEvidence final {
   return images;
  }
  [[nodiscard]] VisualDiagnosticSink Sink() {
-  return {.context = this,
-   .write =
-    [](void* context, VisualDiagnosticFact fact) noexcept {
-     auto& evidence = *static_cast<GalleryEvidence*>(context);
-     try {
-      std::scoped_lock lock(evidence.mutex);
-      evidence.facts.push_back(fact);
-     } catch (...) {}
-    },
-   .enabled = [](void* context) noexcept { return static_cast<GalleryEvidence*>(context)->enabled.load(); },
-   .pixel_probes = true};
+  return {.context = this, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+   auto& evidence = *static_cast<GalleryEvidence*>(context);
+   try {
+    std::scoped_lock lock(evidence.mutex);
+    evidence.facts.push_back(fact);
+   } catch (...) {}
+  }, .enabled = [](void* context) noexcept { return static_cast<GalleryEvidence*>(context)->enabled.load(); }, .pixel_probes = true};
  }
 };
 class NativeGalleryArtifact final {
@@ -229,16 +231,13 @@ struct GalleryGpuPause final {
  bool entered = false;
  bool released = false;
  void Submit(const std::uintptr_t stream) {
-  const auto status = cudaLaunchHostFunc(
-   reinterpret_cast<cudaStream_t>(stream),
-   [](void* context) {
-    auto& pause = *static_cast<GalleryGpuPause*>(context);
-    std::unique_lock lock(pause.mutex);
-    pause.entered = true;
-    pause.changed.notify_all();
-    pause.changed.wait(lock, [&] { return pause.released; });
-   },
-   this);
+  const auto status = cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream), [](void* context) {
+   auto& pause = *static_cast<GalleryGpuPause*>(context);
+   std::unique_lock lock(pause.mutex);
+   pause.entered = true;
+   pause.changed.notify_all();
+   pause.changed.wait(lock, [&] { return pause.released; });
+  }, this);
   if (status != cudaSuccess) throw std::runtime_error("native gallery GPU pause submission failed");
  }
  [[nodiscard]] bool Wait() {
@@ -1750,12 +1749,10 @@ TEST_CASE("Native superseded source failure leaves newer system demand queued", 
   throw std::runtime_error("superseded native source failure");
  });
  auto factory = make_native_explore_runtime_factory({.device = 0, .maximum_width = 4096U, .maximum_height = 4096U}, 2U, {.acceptance = gate, .diagnostics = diagnostics});
- ExploreSystem system{settings, {.device = 0, .maximum_width = 4096U, .maximum_height = 4096U}, 2U, std::move(factory),
-  [&interleave](ExploreSystem::event_type event) {
-   if (std::holds_alternative<ExploreFailed>(event)) interleave.failures.fetch_add(1U);
-   interleave.evidence.Wake();
-  },
-  diagnostics};
+ ExploreSystem system{settings, {.device = 0, .maximum_width = 4096U, .maximum_height = 4096U}, 2U, std::move(factory), [&interleave](ExploreSystem::event_type event) {
+  if (std::holds_alternative<ExploreFailed>(event)) interleave.failures.fetch_add(1U);
+  interleave.evidence.Wake();
+ }, diagnostics};
  interleave.system = &system;
  static_cast<void>(system.Open({.viewport = {.extent = {32U, 32U}, .first_row = 17U, .row_count = 4U, .columns = 4U}, .compiled_source = path.string()}));
  for (;;) {
@@ -1801,16 +1798,16 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
  REQUIRE(::send(commands.get(), &release_reads, sizeof(release_reads), MSG_NOSIGNAL) == sizeof(release_reads));
  auto factory = make_native_explore_runtime_factory({.device = 0, .maximum_width = 4096U, .maximum_height = 4096U}, 2U, {.acceptance = gate, .diagnostics = diagnostics});
  mmltk::frameworks::gpu::SystemImageRuntime* runtime = nullptr;
- ExploreSystem system{settings,
+ ExploreSystem system{
+  settings,
   // CLEANUP-IGNORE: This native rollback fixture captures its runtime for exact product
   // inspection; the presentation test constructs a fake runtime with different ownership.
-  {.device = 0, .maximum_width = 4096U, .maximum_height = 4096U}, 2U,
-  [factory = std::move(factory), &runtime](auto revisions) mutable {
-   auto created = factory(std::move(revisions));
-   runtime = created.get();
-   return created;
-  },
-  [&evidence](ExploreSystem::event_type) { evidence.Wake(); }, diagnostics};
+  {.device = 0, .maximum_width = 4096U, .maximum_height = 4096U}, 2U, [factory = std::move(factory), &runtime](auto revisions) mutable {
+  auto created = factory(std::move(revisions));
+  runtime = created.get();
+  return created;
+ }, [&evidence](ExploreSystem::event_type) { evidence.Wake(); }, diagnostics
+ };
  const auto wait = [&](const char* stage, auto&& ready) {
   for (;;) {
    const auto observed = evidence.Epoch();

@@ -96,7 +96,8 @@ TEST_CASE("Committed visual frames exactly authorize one- and two-plane products
 }
 TEST_CASE("Workspace layout rejects delayed undersized capacity") {
  namespace abi = presentation::detail::workspace_surface_import;
- abi::Record layout{.opcode = abi::Opcode::ArenaReady,
+ abi::Record layout{
+  .opcode = abi::Opcode::ArenaReady,
   .id_high = 1U,
   .width = 100U,
   .height = 100U,
@@ -105,7 +106,8 @@ TEST_CASE("Workspace layout rejects delayed undersized capacity") {
   .device_incarnation = 2U,
   .alignment = 16U,
   .device_uuid = {1U},
-  .memory_type_bits = 1U};
+  .memory_type_bits = 1U
+ };
  CHECK(abi::valid(layout));
  layout.width = 200U;
  layout.height = 200U;
@@ -187,8 +189,9 @@ private:
 };
 [[nodiscard]] PresentationSystem make_failure_presentation(
  const PresentationSourceFixture& source, const std::shared_ptr<TestPresentationWriterState>& writer_state, PresentationFailureProbe& failures) {
- return PresentationSystem{
-  kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources(), [&failures](PresentationSystem::event_type event) { failures.Observe(std::move(event)); }};
+ return PresentationSystem{kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources(), [&failures](PresentationSystem::event_type event) {
+  failures.Observe(std::move(event));
+ }};
 }
 TEST_CASE("Presentation monotonic identities fail before wrap") {
  namespace identity = mmltk::common::types;
@@ -267,8 +270,9 @@ TEST_CASE("Presentation serializes consecutive growth through exact retirement a
  auto writer_state = std::make_shared<TestPresentationWriterState>();
  auto third_submission = writer_state->third_submission.get_future();
  EventGate events;
- PresentationSystem presentation{kDevice, [backend = products.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); }, sources,
-  [&events](PresentationSystem::event_type) { events.Advance(); }};
+ PresentationSystem presentation{kDevice, [backend = products.backend(), writer_state] {
+  return std::make_unique<TestPresentationWriter>(0, backend, writer_state);
+ }, sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
  PresentationScenario scenario{presentation, writer_state};
  const auto source_a = sources[0].source;
  const auto source_b = sources[2].source;
@@ -332,14 +336,11 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
   bool enabled = false;
  } capture;
  capture.enabled = diagnostics == Diagnostics::Enabled;
- const VisualDiagnosticSink sink{.context = &capture,
-  .write =
-   [](void* context, const VisualDiagnosticFact fact) noexcept {
-    auto& value = *static_cast<Capture*>(context);
-    if (value.count < value.facts.size()) value.facts[value.count] = fact;
-    ++value.count;
-   },
-  .enabled = [](void* context) noexcept { return static_cast<Capture*>(context)->enabled; }};
+ const VisualDiagnosticSink sink{.context = &capture, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
+  auto& value = *static_cast<Capture*>(context);
+  if (value.count < value.facts.size()) value.facts[value.count] = fact;
+  ++value.count;
+ }, .enabled = [](void* context) noexcept { return static_cast<Capture*>(context)->enabled; }};
  presentation::WorkspaceSurfaceImportChannel channel{path, diagnostics == Diagnostics::Absent ? VisualDiagnosticSink{} : sink};
  auto peer = mmltk::testsupport::connect_workspace_surface_shell(path);
  channel.pump();
@@ -358,7 +359,8 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
  auto edge = mmltk::testsupport::workspace_surface_event_descriptor();
  auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
  const presentation::WorkspaceSurfaceImportId id{11U, 12U};
- abi::Record record{.id_high = id.high,
+ abi::Record record{
+  .id_high = id.high,
   .id_low = id.low,
   .width = 64U,
   .height = 32U,
@@ -372,7 +374,8 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
   .offset = 256U,
   .alignment = 256U,
   .device_uuid = {1U},
-  .memory_type_bits = 1U};
+  .memory_type_bits = 1U
+ };
  const auto admitted = record;
  REQUIRE(channel.admit_source(record, 7U, edge.get(), signal.descriptor(), edge.get(), 19U, 23U));
  CHECK(channel.claimable(id) == !deferred);
@@ -440,7 +443,8 @@ public:
   REQUIRE(channel.connected());
  }
  [[nodiscard]] static Record Layout(const Id id) {
-  return {.opcode = Opcode::ArenaReady,
+  return {
+   .opcode = Opcode::ArenaReady,
    .id_high = id.high,
    .id_low = id.low,
    .width = 4U,
@@ -450,7 +454,8 @@ public:
    .device_incarnation = 5U,
    .alignment = 32U,
    .device_uuid = {1U},
-   .memory_type_bits = 1U};
+   .memory_type_bits = 1U
+  };
  }
  [[nodiscard]] static Record Sample(const Id arena) {
   return {.opcode = Opcode::Presented, .id_high = arena.high, .id_low = arena.low, .stride = 7U, .size = 8U, .code = 1U, .presentation_revision = 9U};
@@ -1056,11 +1061,11 @@ TEST_CASE("Presentation diagnostics join admitted and completed snapshots to one
  } capture;
  capture.facts.reserve(16U);
  const VisualDiagnosticSink diagnostics{.context = &capture, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
-                                         if (fact.operation != VisualDiagnosticOperation::PresentationCapabilityPublished && fact.operation != VisualDiagnosticOperation::TimelineReady) return;
-                                         auto& result = *static_cast<Capture*>(context);
-                                         std::scoped_lock lock(result.mutex);
-                                         result.facts.push_back(fact);
-                                        }};
+  if (fact.operation != VisualDiagnosticOperation::PresentationCapabilityPublished && fact.operation != VisualDiagnosticOperation::TimelineReady) return;
+  auto& result = *static_cast<Capture*>(context);
+  std::scoped_lock lock(result.mutex);
+  result.facts.push_back(fact);
+ }};
  auto writer = std::make_shared<TestPresentationWriterState>();
  writer->allow_publication.store(false, std::memory_order_release);
  PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }, diagnostics};
@@ -1091,15 +1096,17 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
  std::atomic<std::uint64_t> last_completed_revision{0U};
  std::atomic<std::uint64_t> last_completed_product{0U};
  auto writer_state = std::make_shared<TestPresentationWriterState>();
- PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources(),
+ PresentationSystem presentation{
+  kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources(),
   [&events, &completed_events, &last_completed_revision, &last_completed_product](PresentationSystem::event_type event) {
-   if (const auto* completed = std::get_if<PresentationCompleted>(&event)) {
-    last_completed_revision.store(completed->snapshot.revision, std::memory_order_release);
-    completed_events.fetch_add(1U, std::memory_order_acq_rel);
-    last_completed_product.store(completed->snapshot.completed.revision, std::memory_order_release);
-   }
-   events.Advance();
-  }};
+  if (const auto* completed = std::get_if<PresentationCompleted>(&event)) {
+   last_completed_revision.store(completed->snapshot.revision, std::memory_order_release);
+   completed_events.fetch_add(1U, std::memory_order_acq_rel);
+   last_completed_product.store(completed->snapshot.completed.revision, std::memory_order_release);
+  }
+  events.Advance();
+ }
+ };
  PresentationScenario scenario{presentation, writer_state};
  publish_first_presentation(presentation, source, *writer_state, events);
  REQUIRE(events.Wait([&] { return last_completed_product.load(std::memory_order_acquire) == 1U; }));
@@ -1231,9 +1238,9 @@ TEST_CASE("Presentation diagnostics retain exact observations across supersessio
   std::size_t count = 0U;
  } capture;
  const VisualDiagnosticSink diagnostics{.context = &capture, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-                                         auto& output = *static_cast<Capture*>(context);
-                                         if (fact.operation == VisualDiagnosticOperation::TimelineReady && output.count < output.completed.size()) output.completed[output.count++] = fact;
-                                        }};
+  auto& output = *static_cast<Capture*>(context);
+  if (fact.operation == VisualDiagnosticOperation::TimelineReady && output.count < output.completed.size()) output.completed[output.count++] = fact;
+ }};
  auto writer = std::make_shared<TestPresentationWriterState>();
  PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }, diagnostics};
  PresentationScenario scenario{presentation, writer};
@@ -1321,12 +1328,12 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
  auto observation = workspace->ObserveRetirement();
  std::exception_ptr producer_failure;
  unsigned failure_reports = 0U;
- detail::VisualRuntimeOwner owner{
-  [backend](auto revisions) { return std::make_unique<gpu::SystemImageRuntime>(mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions))); },
-  [&](std::exception_ptr failure) {
-   producer_failure = failure;
-   ++failure_reports;
-  }};
+ detail::VisualRuntimeOwner owner{[backend](auto revisions) {
+  return std::make_unique<gpu::SystemImageRuntime>(mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions)));
+ }, [&](std::exception_ptr failure) {
+  producer_failure = failure;
+  ++failure_reports;
+ }};
  std::promise<void> initialized;
  bool prepared = false;
  REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
@@ -1349,19 +1356,15 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
  auto request_diagnostics = std::make_shared<VisualWorkspaceDiagnostics>();
  if (ordering == 2U)
   request_diagnostics->sink = {.context = &completed_service, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-                                if (fact.operation == VisualDiagnosticOperation::PresentationWorkspaceService && fact.failure_detail == "prepare_completed")
-                                 static_cast<mmltk::testsupport::TestGate*>(context)->receipt().ArriveAndWait();
-                               }};
+   if (fact.operation == VisualDiagnosticOperation::PresentationWorkspaceService && fact.failure_detail == "prepare_completed")
+    static_cast<mmltk::testsupport::TestGate*>(context)->receipt().ArriveAndWait();
+  }};
  std::atomic<unsigned> responses{0U};
  std::promise<void> ready;
- owner.RequestWorkspace({.detach_only = true,
-  .destination = workspace,
-  .ready =
-   [&] {
-    ++responses;
-    ready.set_value();
-   },
-  .diagnostics = request_diagnostics});
+ owner.RequestWorkspace({.detach_only = true, .destination = workspace, .ready = [&] {
+  ++responses;
+  ready.set_value();
+ }, .diagnostics = request_diagnostics});
  if (ordering == 0U) {
   std::promise<void> parked;
   REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&] { parked.set_value(); }}; }));
@@ -1381,10 +1384,10 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
   std::uint64_t outcome = 9U;
  } facts{&native_releasing};
  VisualDiagnosticSink diagnostics{.context = &facts, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-                                   auto& observed = *static_cast<NativeFacts*>(context);
-                                   if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted) observed.releasing->set_value();
-                                   if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted) observed.outcome = fact.context.outcome;
-                                  }};
+  auto& observed = *static_cast<NativeFacts*>(context);
+  if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted) observed.releasing->set_value();
+  if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted) observed.outcome = fact.context.outcome;
+ }};
  mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-detach-handoff"};
  auto writer = test_support::NativePresentationWriterTestAccess::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, std::move(workspace), diagnostics);
  auto terminal = std::async(std::launch::async, [&] { return writer->BrowserPeerLost(); });
@@ -1449,19 +1452,19 @@ TEST_CASE("Unretired adopted native sources release before their stream is destr
   bool source_context_restored = false;
  } facts{backend.get(), completed_failure ? std::make_exception_ptr(std::runtime_error("completed source rollback failure")) : std::exception_ptr{}};
  VisualDiagnosticSink diagnostics{.context = &facts, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-                                   auto& observed = *static_cast<RollbackFacts*>(context);
-                                   if (fact.operation == VisualDiagnosticOperation::PresentationSourceStreamSettlementStarted) {
-                                    observed.source_context = observed.backend->last_bound_context.load();
-                                    if (observed.failure) observed.backend->FailAfter(FakeImageBackend::FailurePoint::SynchronizeStream, 0U, observed.failure);
-                                   }
-                                   if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted) {
-                                    ++observed.releases;
-                                    observed.outcome = fact.context.outcome;
-                                   }
-                                   if (fact.operation == VisualDiagnosticOperation::PresentationSourceStreamDestructionStarted) observed.released_before_stream = observed.releases == 1U;
-                                   if (fact.operation == VisualDiagnosticOperation::PresentationSourceProbeDeviceReleaseStarted)
-                                    observed.source_context_restored = observed.backend->last_bound_context.load() == observed.source_context;
-                                  }};
+  auto& observed = *static_cast<RollbackFacts*>(context);
+  if (fact.operation == VisualDiagnosticOperation::PresentationSourceStreamSettlementStarted) {
+   observed.source_context = observed.backend->last_bound_context.load();
+   if (observed.failure) observed.backend->FailAfter(FakeImageBackend::FailurePoint::SynchronizeStream, 0U, observed.failure);
+  }
+  if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted) {
+   ++observed.releases;
+   observed.outcome = fact.context.outcome;
+  }
+  if (fact.operation == VisualDiagnosticOperation::PresentationSourceStreamDestructionStarted) observed.released_before_stream = observed.releases == 1U;
+  if (fact.operation == VisualDiagnosticOperation::PresentationSourceProbeDeviceReleaseStarted)
+   observed.source_context_restored = observed.backend->last_bound_context.load() == observed.source_context;
+ }};
  mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-admission-rollback"};
  auto writer = test_support::NativePresentationWriterTestAccess::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, std::move(workspace), diagnostics);
  // Neither ordinary source removal nor terminal browser retirement ran.
@@ -1508,10 +1511,10 @@ TEST_CASE("Native display-last retirement consumes physical cleanup and its diag
   std::uint64_t source = 9U;
  } outcomes;
  VisualDiagnosticSink diagnostics{.context = &outcomes, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-                                   auto& result = *static_cast<Outcomes*>(context);
-                                   if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted) result.workspace = fact.context.outcome;
-                                   if (fact.operation == VisualDiagnosticOperation::PresentationSourceRetirement) result.source = fact.context.outcome;
-                                  }};
+  auto& result = *static_cast<Outcomes*>(context);
+  if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted) result.workspace = fact.context.outcome;
+  if (fact.operation == VisualDiagnosticOperation::PresentationSourceRetirement) result.source = fact.context.outcome;
+ }};
  mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-display-retirement"};
  auto writer = Access::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, std::move(workspace), diagnostics);
  const auto cleanup = std::make_exception_ptr(std::runtime_error("display-last binding failure"));
@@ -1635,8 +1638,8 @@ TEST_CASE("Native terminal retirement observes independently completing detached
  auto observation = attempt->ObserveRetirement();
  std::promise<void> releasing;
  VisualDiagnosticSink diagnostics{.context = &releasing, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-                                   if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted) static_cast<std::promise<void>*>(context)->set_value();
-                                  }};
+  if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted) static_cast<std::promise<void>*>(context)->set_value();
+ }};
  mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-terminal-pending"};
  auto writer = test_support::NativePresentationWriterTestAccess::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, attempt, diagnostics);
  auto terminal = std::async(std::launch::async, [&] { return writer->BrowserPeerLost(); });
@@ -1692,19 +1695,14 @@ TEST_CASE("Workspace retries cancellation and worker failure settle their ready 
  std::promise<void> failed;
  std::exception_ptr failure;
  detail::VisualRuntimeOwner owner{[=](auto revisions) {
-                                   return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{.device = 0,
-                                    .backend = backend,
-                                    .workspace_finalize =
-                                     [=](auto clean, auto, auto destination, auto, auto) {
-                                      if (outcome == 2U) std::rethrow_exception(injected);
-                                      fixture::CopyImagePlane(destination, clean);
-                                     },
-                                    .product_revisions = std::move(revisions)});
-                                  },
-  [&](std::exception_ptr value) {
-   failure = value;
-   failed.set_value();
-  }};
+  return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .workspace_finalize = [=](auto clean, auto, auto destination, auto, auto) {
+   if (outcome == 2U) std::rethrow_exception(injected);
+   fixture::CopyImagePlane(destination, clean);
+  }, .product_revisions = std::move(revisions)});
+ }, [&](std::exception_ptr value) {
+  failure = value;
+  failed.set_value();
+ }};
  std::promise<void> published;
  REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
   runtime.Publish(4U, 3U, [](auto, auto, auto) {});
@@ -1718,9 +1716,9 @@ TEST_CASE("Workspace retries cancellation and worker failure settle their ready 
  std::atomic<unsigned> responses{0U};
  std::promise<void> ready;
  owner.RequestWorkspace({.product_owner = source.product_owner, .product_revision = source.product_revision, .destination = workspace, .ready = [&] {
-                          ++responses;
-                          ready.set_value();
-                         }});
+  ++responses;
+  ready.set_value();
+ }});
  if (outcome != 2U) {
   std::promise<void> attempted;
   std::promise<void> resume;

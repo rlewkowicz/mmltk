@@ -40,14 +40,11 @@ TEST_CASE("Two selected GPUs retain the global training objective and early NCCL
  for (std::size_t rank = 0; rank < children.size(); ++rank)
   children[rank] = std::async(std::launch::async, [&, rank] {
    process::ArgvBuffer arguments({MMLTK_DISTRIBUTED_TRAINING_WORKER, store.string(), std::to_string(rank), std::to_string(devices[rank]), scenario});
-   return process::run_captured_child_process(
-    "training-nccl", "distributed training helper",
-    [&](int output, int errors) {
-     process::prepare_captured_output_child(output, errors);
-     ::execv(arguments.program(), arguments.data());
-     process::fail_child_setup(errors, process::ChildSetupStage::Exec);
-    },
-    {}, std::chrono::seconds(180));
+   return process::run_captured_child_process("training-nccl", "distributed training helper", [&](int output, int errors) {
+    process::prepare_captured_output_child(output, errors);
+    ::execv(arguments.program(), arguments.data());
+    process::fail_child_setup(errors, process::ChildSetupStage::Exec);
+   }, {}, std::chrono::seconds(180));
   });
  for (std::size_t rank = 0; rank < children.size(); ++rank) {
   CAPTURE(rank);

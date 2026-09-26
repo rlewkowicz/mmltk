@@ -32,11 +32,13 @@ template <typename Pixel>
 }
 [[nodiscard]] launch::PackedImageU8 as_launch_image(const PackedImage& value) noexcept { return {value.pixels, value.width, value.height}; }
 [[nodiscard]] launch::RgbaTargetViewAbi as_launch_target(const RgbaTargetView& value) noexcept {
- return {.kind = value.kind == RgbaTargetKind::Pitched ? launch::RgbaTargetKindAbi::Pitched : launch::RgbaTargetKindAbi::SurfaceObject,
+ return {
+  .kind = value.kind == RgbaTargetKind::Pitched ? launch::RgbaTargetKindAbi::Pitched : launch::RgbaTargetKindAbi::SurfaceObject,
   .pitched = as_launch_surface(value.pitched),
   .surface = static_cast<cudaSurfaceObject_t>(value.surface),
   .width = value.width,
-  .height = value.height};
+  .height = value.height
+ };
 }
 [[nodiscard]] cudaStream_t as_stream(const NativeStream value) noexcept { return reinterpret_cast<cudaStream_t>(value.value); }
 [[nodiscard]] bool packed_image_valid(const PackedImage& image) noexcept { return image.pixels != nullptr && image.width > 0 && image.height > 0; }
@@ -175,8 +177,9 @@ std::int32_t raster_mask_runs_rgba(const MaskRunsRgbaWork& work) noexcept {
  if ((work.scale_x != 1 || work.scale_y != 1 || work.source_x != work.target_x || work.source_y != work.target_y) &&
      (work.overlay.pitch_bytes % alignof(std::uint32_t) != 0U || reinterpret_cast<std::uintptr_t>(work.overlay.pixels) % alignof(std::uint32_t) != 0U))
   return cudaErrorInvalidValue;
- return detail::launch_draw_manual_mask_runs_rgba_pitched({as_launch_surface(work.overlay), work.run_pairs, work.run_count, work.color, as_stream(work.stream), work.clip, work.source_x, work.source_y,
-  work.target_x, work.target_y, work.scale_x, work.scale_y});
+ return detail::launch_draw_manual_mask_runs_rgba_pitched(
+  {as_launch_surface(work.overlay), work.run_pairs, work.run_count, work.color, as_stream(work.stream), work.clip, work.source_x, work.source_y, work.target_x, work.target_y, work.scale_x,
+   work.scale_y});
 }
 std::int32_t raster_box_outline_rgba(const BoxOutlineRgbaWork& work) noexcept {
  if (!drawable_box(work.overlay, work.box, work.thickness, work.stream)) { return cudaErrorInvalidValue; }

@@ -341,12 +341,16 @@ struct GpuAugmentationExecutor::Impl final {
    downscaler->finish();
    prepared->pixels.ensure(total);
   }
-  const mmltk::backend::imaging::resample::RgbImageLayout source_layout{std::uint32_t(width), std::uint32_t(height), std::size_t(width) * sizeof(float),
-   std::size_t(width) * std::size_t(height) * sizeof(float), image_bytes, mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32};
+  const mmltk::backend::imaging::resample::RgbImageLayout source_layout{
+   std::uint32_t(width), std::uint32_t(height), std::size_t(width) * sizeof(float), std::size_t(width) * std::size_t(height) * sizeof(float), image_bytes,
+   mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32
+  };
   for (const auto& reduction : reductions) {
    const auto values = std::size_t(reduction.width) * std::size_t(reduction.height);
-   const mmltk::backend::imaging::resample::RgbImageLayout destination_layout{std::uint32_t(reduction.width), std::uint32_t(reduction.height), std::size_t(reduction.width) * sizeof(float),
-    values * sizeof(float), values * 3U * sizeof(float), mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32};
+   const mmltk::backend::imaging::resample::RgbImageLayout destination_layout{
+    std::uint32_t(reduction.width), std::uint32_t(reduction.height), std::size_t(reduction.width) * sizeof(float), values * sizeof(float), values * 3U * sizeof(float),
+    mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32
+   };
    downscaler->downscale({reduction.source, source_layout}, {prepared->pixels.data() + reduction.offset, destination_layout}, stream, reduction.custody, prepared);
   }
   for (std::size_t image = 0; image != count * 2U; ++image) {

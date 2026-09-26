@@ -465,18 +465,16 @@ template <class Float>
 }
 template <class Number>
 [[nodiscard]] std::expected<Number, wire::DecodeError> decode_number(const wire::Value& value) {
- return std::visit(
-  [](const auto& storage) -> std::expected<Number, wire::DecodeError> {
-   using Storage = RemoveCvRef<decltype(storage)>;
-   if constexpr ((std::integral<Number> && (std::same_as<Storage, std::int64_t> || std::same_as<Storage, std::uint64_t>))) {
-    return decode_integer_scalar<Number>(storage);
-   } else if constexpr (std::floating_point<Number> && (std::same_as<Storage, double> || std::same_as<Storage, std::int64_t> || std::same_as<Storage, std::uint64_t>)) {
-    return decode_float_scalar<Number>(storage);
-   } else {
-    return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch));
-   }
-  },
-  value.storage);
+ return std::visit([](const auto& storage) -> std::expected<Number, wire::DecodeError> {
+  using Storage = RemoveCvRef<decltype(storage)>;
+  if constexpr ((std::integral<Number> && (std::same_as<Storage, std::int64_t> || std::same_as<Storage, std::uint64_t>))) {
+   return decode_integer_scalar<Number>(storage);
+  } else if constexpr (std::floating_point<Number> && (std::same_as<Storage, double> || std::same_as<Storage, std::int64_t> || std::same_as<Storage, std::uint64_t>)) {
+   return decode_float_scalar<Number>(storage);
+  } else {
+   return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch));
+  }
+ }, value.storage);
 }
 template <class T>
 [[nodiscard]] std::expected<void, wire::DecodeError> from_value_into(T& destination, const wire::Value& value) {
@@ -776,19 +774,17 @@ template <ObjectLayout Layout, class Variant>
  wire::Value::Object object;
  object.reserve(VariantEnvelope::field_count);
  std::optional<wire::EncodeError> failure;
- std::visit(
-  [&object, &failure](const auto& alternative) {
-   using Alternative = RemoveCvRef<decltype(alternative)>;
-   auto encoded = to_value<Layout>(alternative);
-   if (!encoded) {
-    failure = encoded.error();
-    prepend_path(*failure, VariantEnvelope::payload_key);
-    return;
-   }
-   object.emplace_back(VariantEnvelope::kind_key, wire::Value(variant_name<Alternative>()));
-   object.emplace_back(VariantEnvelope::payload_key, std::move(*encoded));
-  },
-  value);
+ std::visit([&object, &failure](const auto& alternative) {
+  using Alternative = RemoveCvRef<decltype(alternative)>;
+  auto encoded = to_value<Layout>(alternative);
+  if (!encoded) {
+   failure = encoded.error();
+   prepend_path(*failure, VariantEnvelope::payload_key);
+   return;
+  }
+  object.emplace_back(VariantEnvelope::kind_key, wire::Value(variant_name<Alternative>()));
+  object.emplace_back(VariantEnvelope::payload_key, std::move(*encoded));
+ }, value);
  if (failure) { return std::unexpected(std::move(*failure)); }
  return wire::Value(std::move(object));
 }
@@ -1657,24 +1653,22 @@ template <class T>
  using U = RemoveCvRef<T>;
  static_assert(supported_type<U>(), "Attempted to encode an unsupported reflected CBOR type.");
  if constexpr (std::is_same_v<U, wire::Value>) {
-  return std::visit(
-   [&writer](const auto& item) {
-    using Item = RemoveCvRef<decltype(item)>;
-    if constexpr (std::is_same_v<Item, wire::Value::Array>) {
-     if (!writer.array(item.size())) return false;
-     for (const auto& child : item)
-      if (!encode_fixed_projection(writer, child)) return false;
-     return true;
-    } else if constexpr (std::is_same_v<Item, wire::Value::Object>) {
-     if (!writer.object(item.size())) return false;
-     for (const auto& [key, child] : item)
-      if (!writer.text(key) || !encode_fixed_projection(writer, child)) return false;
-     return true;
-    } else {
-     return encode_fixed_projection(writer, item);
-    }
-   },
-   value.storage);
+  return std::visit([&writer](const auto& item) {
+   using Item = RemoveCvRef<decltype(item)>;
+   if constexpr (std::is_same_v<Item, wire::Value::Array>) {
+    if (!writer.array(item.size())) return false;
+    for (const auto& child : item)
+     if (!encode_fixed_projection(writer, child)) return false;
+    return true;
+   } else if constexpr (std::is_same_v<Item, wire::Value::Object>) {
+    if (!writer.object(item.size())) return false;
+    for (const auto& [key, child] : item)
+     if (!writer.text(key) || !encode_fixed_projection(writer, child)) return false;
+    return true;
+   } else {
+    return encode_fixed_projection(writer, item);
+   }
+  }, value.storage);
  } else if constexpr (std::is_same_v<U, wire::FlatValue>) {
   return value.visit([&writer](const auto& leaf) {
    using Leaf = RemoveCvRef<decltype(leaf)>;
@@ -1715,12 +1709,10 @@ template <class T>
   return value ? encode_fixed_projection(writer, *value) : writer.null();
  } else if constexpr (kIsVariant<U>) {
   static_assert(kUniqueVariantAlternatives<U>, "Reflected CBOR variant alternatives require unique type identifiers.");
-  return std::visit(
-   [&writer](const auto& alternative) {
-    return writer.object(VariantEnvelope::field_count) && writer.text(VariantEnvelope::kind_key) && writer.text(static_variant_name<RemoveCvRef<decltype(alternative)>>()) &&
-           writer.text(VariantEnvelope::payload_key) && encode_fixed_projection(writer, alternative);
-   },
-   value);
+  return std::visit([&writer](const auto& alternative) {
+   return writer.object(VariantEnvelope::field_count) && writer.text(VariantEnvelope::kind_key) && writer.text(static_variant_name<RemoveCvRef<decltype(alternative)>>()) &&
+          writer.text(VariantEnvelope::payload_key) && encode_fixed_projection(writer, alternative);
+  }, value);
  } else if constexpr (kIsArray<U> || kIsVector<U> || kIsSpan<U> || kIsInplaceVector<U>) {
   if (!writer.array(value.size())) return false;
   for (const auto& element : value)

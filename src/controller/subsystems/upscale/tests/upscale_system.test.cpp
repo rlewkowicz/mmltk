@@ -226,10 +226,10 @@ TEST_CASE("Upscale owns and publishes its receiver image") {
  // CLEANUP-IGNORE: Upscale and Annotation are independently sealed receiver systems with different model factories,
  // intents, snapshots, and output invariants.
  auto selected_kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
- UpscaleSystem upscale{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [selected_kernel] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel); }, 4U),
-  borrow_exactly_from(explore), [&upscale_events](UpscaleSystem::event_type) { upscale_events.Advance(); }};
+ UpscaleSystem upscale{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [selected_kernel] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel); }, 4U),
+  borrow_exactly_from(explore), [&upscale_events](UpscaleSystem::event_type) { upscale_events.Advance(); }
+ };
  CHECK_FALSE(upscale.BorrowFrame().valid());
  static_cast<void>(upscale.Start(test_upscale_request({
   .source = explore.snapshot().frame,
@@ -254,7 +254,8 @@ TEST_CASE("Upscale equal extent source changes replace actual receiver pixels") 
  auto backend = std::make_shared<FakeImageBackend>();
  auto probe = std::make_shared<UpscaleExtentProbe>();
  UpscaleSourceFixture subject{
-  backend, {16U, 8U}, 3U, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [probe] { return std::make_unique<ExtentUpscaleAlgorithm>(probe); }, 4U)};
+  backend, {16U, 8U}, 3U, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [probe] { return std::make_unique<ExtentUpscaleAlgorithm>(probe); }, 4U)
+ };
  auto& source = subject.source;
  auto& events = subject.events;
  auto& upscale = subject.upscale;
@@ -323,10 +324,11 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
  std::atomic_uint32_t copies{0U};
  EventGate events;
  const VisualDiagnosticSink diagnostics{.context = &copies, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-                                         if (fact.operation == VisualDiagnosticOperation::CopyCompleted) static_cast<std::atomic_uint32_t*>(context)->fetch_add(1U);
-                                        }};
- UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs, semantics), [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
-  [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
+  if (fact.operation == VisualDiagnosticOperation::CopyCompleted) static_cast<std::atomic_uint32_t*>(context)->fetch_add(1U);
+ }};
+ UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs, semantics), [&source](const VisualFrame& frame) {
+  return source.BorrowExact(frame);
+ }, [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
  for (const auto selected : {UpscaleKernel::Default, UpscaleKernel::ShiftLut, UpscaleKernel::RealPlksr, UpscaleKernel::Default}) {
   const auto request = test_upscale_request({.source = source.frame(), .kernel = selected});
   static_cast<void>(upscale.Start(request));
@@ -394,12 +396,14 @@ TEST_CASE("Validation clean identity reuses native Upscale while replacing paire
  REQUIRE(initial.frame.clean_revision != 0U);
  REQUIRE(initial.frame.content == VisualRegion{0U, 0U, 8U, 8U});
  std::atomic_uint32_t runs = 0U;
- UpscaleSystem upscale{kDevice,
+ UpscaleSystem upscale{
+  kDevice,
   make_native_upscale_runtime_factory(kDevice,
    [&](Stage stage) {
-    if (stage == Stage::BasicLaunchAdmitted) ++runs;
-   }),
-  [&samples](const VisualFrame& frame) { return samples.BorrowDocument(frame); }, [&](UpscaleSystem::event_type) { output_events.Advance(); }};
+  if (stage == Stage::BasicLaunchAdmitted) ++runs;
+ }),
+  [&samples](const VisualFrame& frame) { return samples.BorrowDocument(frame); }, [&](UpscaleSystem::event_type) { output_events.Advance(); }
+ };
  static_cast<void>(upscale.Start({.source = initial.frame, .document = initial.document}));
  REQUIRE(output_events.Wait([&] { return upscale.snapshot().ready; }, 120s));
  const auto clean_launches = runs.load();
@@ -457,16 +461,14 @@ TEST_CASE("Upscale semantic revisions reuse clean pixels and retain exact input 
  auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
  auto runs = std::make_shared<std::atomic_uint32_t>(0U);
  EventGate events;
- UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
-  [&source, source_kind](const VisualFrame& frame) {
-   if (frame.source.kind != source_kind) return VisualDocumentRead{};
-   auto native = frame;
-   native.source.kind = PresentationSourceKind::Explore;
-   auto result = source.BorrowExact(native);
-   result.image_metadata = std::make_shared<const mmltk::frameworks::serialization::wire::Value>(frame.revision);
-   return result;
-  },
-  [&events](UpscaleSystem::event_type) { events.Advance(); }};
+ UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs), [&source, source_kind](const VisualFrame& frame) {
+  if (frame.source.kind != source_kind) return VisualDocumentRead{};
+  auto native = frame;
+  native.source.kind = PresentationSourceKind::Explore;
+  auto result = source.BorrowExact(native);
+  result.image_metadata = std::make_shared<const mmltk::frameworks::serialization::wire::Value>(frame.revision);
+  return result;
+ }, [&events](UpscaleSystem::event_type) { events.Advance(); }};
  const auto initial = displayed(source.frame());
  static_cast<void>(upscale.Start(test_upscale_request({.source = initial})));
  REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
@@ -516,14 +518,14 @@ TEST_CASE("Upscale cached selection cannot redirect an active candidate and all 
  std::atomic_uint32_t borrows{0U};
  EventGate events;
  DiagnosticCapture diagnostics;
- UpscaleSystem upscale{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [kernel, gate, runs] { return std::make_unique<TestUpscaleAlgorithm>(kernel, gate, runs, 3U); }, 4U),
+ UpscaleSystem upscale{
+  kDevice,
+  RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [kernel, gate, runs] { return std::make_unique<TestUpscaleAlgorithm>(kernel, gate, runs, 3U); }, 4U),
   [&source, &borrows](const VisualFrame& frame) {
-   ++borrows;
-   return source.BorrowExact(frame);
-  },
-  [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics.sink()};
+  ++borrows;
+  return source.BorrowExact(frame);
+ }, [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics.sink()
+ };
  auto settle_upscale = settle_upscale_on_exit(upscale, gate->release);
  std::array<VisualFrame, 2U> cached;
  for (const auto method : {UpscaleKernel::Default, UpscaleKernel::ShiftLut}) {
@@ -571,21 +573,19 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
  auto blocked = admissions.blocked.get_future();
  auto returned = admissions.returned.get_future();
  const VisualDiagnosticSink diagnostics{.context = &admissions, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-                                         auto& probe = *static_cast<Admissions*>(context);
-                                         if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAdmissionStarted && ++probe.started == 5U) probe.blocked.set_value();
-                                         if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAdmissionCompleted && ++probe.completed == 5U) probe.returned.set_value();
-                                         if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAllocation) ++probe.prepared;
-                                        }};
+  auto& probe = *static_cast<Admissions*>(context);
+  if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAdmissionStarted && ++probe.started == 5U) probe.blocked.set_value();
+  if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAdmissionCompleted && ++probe.completed == 5U) probe.returned.set_value();
+  if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAllocation) ++probe.prepared;
+ }};
  EventGate events;
  std::atomic<mmltk::frameworks::gpu::SystemImageRuntime*> output_runtime{nullptr};
  const auto factory = TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs);
- UpscaleSystem upscale{kDevice,
-  [&, factory](auto revisions) {
-   auto runtime = factory(std::move(revisions));
-   output_runtime.store(runtime.get(), std::memory_order_release);
-   return runtime;
-  },
-  [&source](const VisualFrame& frame) { return source.BorrowExact(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
+ UpscaleSystem upscale{kDevice, [&, factory](auto revisions) {
+  auto runtime = factory(std::move(revisions));
+  output_runtime.store(runtime.get(), std::memory_order_release);
+  return runtime;
+ }, [&source](const VisualFrame& frame) { return source.BorrowExact(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
  std::vector<mmltk::frameworks::gpu::BorrowedImageProductReadView> readers;
  for (std::uint8_t value = 1U; value <= 4U; ++value) {
   source.Publish({16U, 8U}, value);
@@ -639,14 +639,13 @@ TEST_CASE("Upscale publishes only the newest selected kernel after obsolete devi
  auto entered = gate->committed.get_future();
  std::atomic_uint32_t ready_publications{0U};
  EventGate events;
- UpscaleSystem upscale{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [kernel, gate, runs] { return std::make_unique<TestUpscaleAlgorithm>(kernel, gate, runs); }, 4U),
-  [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
-  [&](UpscaleSystem::event_type event) {
-   if (const auto* changed = std::get_if<UpscaleChanged>(&event); changed && changed->snapshot.ready) ready_publications.fetch_add(1U, std::memory_order_acq_rel);
-   events.Advance();
-  }};
+ UpscaleSystem upscale{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [kernel, gate, runs] { return std::make_unique<TestUpscaleAlgorithm>(kernel, gate, runs); }, 4U),
+  [&source](const VisualFrame& frame) { return source.BorrowExact(frame); }, [&](UpscaleSystem::event_type event) {
+  if (const auto* changed = std::get_if<UpscaleChanged>(&event); changed && changed->snapshot.ready) ready_publications.fetch_add(1U, std::memory_order_acq_rel);
+  events.Advance();
+ }
+ };
  auto settle_upscale = settle_upscale_on_exit(upscale, gate->release);
  static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
  REQUIRE(entered.wait_for(2s) == std::future_status::ready);
@@ -673,15 +672,16 @@ TEST_CASE("Upscale Stop reaches active latest work after its receiver copy settl
   std::shared_future<void> released = release.get_future().share();
  } gate;
  const VisualDiagnosticSink diagnostics{.context = &gate, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-                                         auto& current = *static_cast<CopyGate*>(context);
-                                         if (fact.operation == VisualDiagnosticOperation::CopyCompleted && current.first.exchange(false)) {
-                                          current.copied.set_value();
-                                          current.released.wait();
-                                         }
-                                        }};
+  auto& current = *static_cast<CopyGate*>(context);
+  if (fact.operation == VisualDiagnosticOperation::CopyCompleted && current.first.exchange(false)) {
+   current.copied.set_value();
+   current.released.wait();
+  }
+ }};
  EventGate events;
- UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs), [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
-  [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
+ UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs), [&source](const VisualFrame& frame) {
+  return source.BorrowExact(frame);
+ }, [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
  auto settle_upscale = settle_upscale_on_exit(upscale, gate.release);
  static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(gate.copied, "gate.copied", 2s));
@@ -717,18 +717,16 @@ TEST_CASE("Superseded Upscale demand releases source custody without copying at 
  } gate;
  gate.after = after_borrow;
  const VisualDiagnosticSink diagnostics{.context = &gate, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
-                                         auto& observed_gate = *static_cast<Gate*>(context);
-                                         if (!observed_gate.after && fact.operation == VisualDiagnosticOperation::UpscaleWorkerStarted) observed_gate.Await();
-                                        }};
+  auto& observed_gate = *static_cast<Gate*>(context);
+  if (!observed_gate.after && fact.operation == VisualDiagnosticOperation::UpscaleWorkerStarted) observed_gate.Await();
+ }};
  EventGate events;
- UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
-  [&source, &gate](const VisualFrame& frame) {
-   ++gate.borrows;
-   auto borrowed = source.BorrowExact(frame);
-   if (gate.after) gate.Await();
-   return borrowed;
-  },
-  [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
+ UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs), [&source, &gate](const VisualFrame& frame) {
+  ++gate.borrows;
+  auto borrowed = source.BorrowExact(frame);
+  if (gate.after) gate.Await();
+  return borrowed;
+ }, [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
  auto settle_upscale = settle_upscale_on_exit(upscale, gate.release);
  static_cast<void>(upscale.Start(test_upscale_request({source.frame(), UpscaleKernel::Default})));
  const auto entered = gate.entered.get_future().wait_for(2s);
@@ -750,8 +748,9 @@ TEST_CASE("Upscale completed and failed facts require exact immutable document m
  auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
  auto runs = std::make_shared<std::atomic_uint32_t>(0U);
  EventGate events;
- UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs), [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
-  [&events](UpscaleSystem::event_type) { events.Advance(); }};
+ UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs), [&source](const VisualFrame& frame) {
+  return source.BorrowExact(frame);
+ }, [&events](UpscaleSystem::event_type) { events.Advance(); }};
  const auto request = test_upscale_request({source.frame()});
  static_cast<void>(upscale.Start(request));
  REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
@@ -775,10 +774,11 @@ TEST_CASE("Upscale warm activates every mode once and repeated ready signals are
  auto activation = std::make_shared<UpscaleActivationProbe>();
  auto completed = activation->first_warm_completed.get_future();
  EventGate events;
- UpscaleSystem upscale{{.device = 0, .maximum_width = 2048U, .maximum_height = 1024U},
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
-  [](const VisualFrame&) { return VisualDocumentRead{}; }, [&events](UpscaleSystem::event_type) { events.Advance(); }};
+ UpscaleSystem upscale{
+  {.device = 0, .maximum_width = 2048U, .maximum_height = 1024U},
+  RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
+  [](const VisualFrame&) { return VisualDocumentRead{}; }, [&events](UpscaleSystem::event_type) { events.Advance(); }
+ };
  upscale.Warm(extent);
  upscale.Warm(extent);
  REQUIRE(completed.wait_for(2s) == std::future_status::ready);
@@ -1162,12 +1162,12 @@ public:
  using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
  using Injection = std::function<void(Stage, std::atomic_bool&)>;
  explicit NativeUpscaleFailureScenario(Injection injection)
-     : upscale{kDevice, make_native_upscale_runtime_factory(kDevice, [this, injection = std::move(injection)](const Stage reached) { injection(reached, armed); }),
-        [this](const VisualFrame& frame) { return source.Borrow(frame); },
-        [this](UpscaleSystem::event_type event) {
-         if (auto* failure = std::get_if<UpscaleFailed>(&event)) failed.set_value(*failure);
-         events.Advance();
-        }} {}
+     : upscale{kDevice, make_native_upscale_runtime_factory(kDevice, [this, injection = std::move(injection)](const Stage reached) { injection(reached, armed); }), [this](const VisualFrame& frame) {
+                return source.Borrow(frame);
+               }, [this](UpscaleSystem::event_type event) {
+                if (auto* failure = std::get_if<UpscaleFailed>(&event)) failed.set_value(*failure);
+                events.Advance();
+               }} {}
  NativeUpscaleSource source;
  std::atomic_bool armed{true};
  std::promise<UpscaleFailed> failed;
@@ -1191,16 +1191,18 @@ TEST_CASE("Native Upscale cancellation settles admitted work without recording i
  std::atomic_bool armed{true};
  std::array<std::atomic_uint32_t, static_cast<std::size_t>(Stage::Count)> stages{};
  EventGate events;
- UpscaleSystem upscale{kDevice,
+ UpscaleSystem upscale{
+  kDevice,
   make_native_upscale_runtime_factory(kDevice,
    [&](Stage reached) {
-    ++stages[static_cast<std::size_t>(reached)];
-    if (reached == stage && armed.exchange(false)) {
-     admitted.set_value();
-     released.wait();
-    }
-   }),
-  [&source](const VisualFrame& frame) { return source.Borrow(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); }};
+  ++stages[static_cast<std::size_t>(reached)];
+  if (reached == stage && armed.exchange(false)) {
+   admitted.set_value();
+   released.wait();
+  }
+ }),
+  [&source](const VisualFrame& frame) { return source.Borrow(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); }
+ };
  auto settle_native = settle_upscale_on_exit(upscale, release);
  static_cast<void>(upscale.Start(test_upscale_request({source.frame, method})));
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(admitted, "native Upscale admitted boundary", 120s));
@@ -1276,11 +1278,13 @@ TEST_CASE("Completed native activation survives same-method withdrawal without r
    CHECK(counts[static_cast<std::size_t>(stage)] == completed[static_cast<std::size_t>(stage)]);
   }
  };
- check_unchanged({Stage::InitializationAdmitted, Stage::ChecksumAdmitted, Stage::CacheLockAdmitted, Stage::BuildAdmitted, Stage::ContextCreated, Stage::BuffersAllocated, Stage::StreamCreated,
-  Stage::EventCreated, Stage::BindingsReady});
+ check_unchanged(
+  {Stage::InitializationAdmitted, Stage::ChecksumAdmitted, Stage::CacheLockAdmitted, Stage::BuildAdmitted, Stage::ContextCreated, Stage::BuffersAllocated, Stage::StreamCreated, Stage::EventCreated,
+   Stage::BindingsReady});
  if (method == UpscaleKernel::RealPlksr) {
-  check_unchanged({Stage::WarmInputSubmitted, Stage::WarmSubmitted, Stage::WarmSettled, Stage::CaptureBegan, Stage::CaptureSubmitted, Stage::CaptureEnded, Stage::GraphInstantiated,
-   Stage::ReplaySubmitted, Stage::ReplaySettled});
+  check_unchanged(
+   {Stage::WarmInputSubmitted, Stage::WarmSubmitted, Stage::WarmSettled, Stage::CaptureBegan, Stage::CaptureSubmitted, Stage::CaptureEnded, Stage::GraphInstantiated, Stage::ReplaySubmitted,
+    Stage::ReplaySettled});
   CHECK(counts[static_cast<std::size_t>(Stage::ContextCreated)] == 2U);
   CHECK(counts[static_cast<std::size_t>(Stage::ReplaySettled)] == 2U);
  }
@@ -1352,12 +1356,14 @@ TEST_CASE("Native cache lock admission remains cancellable while another process
  std::promise<void> waiting;
  NativeUpscaleSource source;
  EventGate events;
- UpscaleSystem upscale{kDevice,
+ UpscaleSystem upscale{
+  kDevice,
   make_native_upscale_runtime_factory(kDevice,
    [&](Stage stage) {
-    if (stage == Stage::CacheLockWaiting && !observed.exchange(true)) waiting.set_value();
-   }),
-  [&source](const VisualFrame& frame) { return source.Borrow(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); }};
+  if (stage == Stage::CacheLockWaiting && !observed.exchange(true)) waiting.set_value();
+ }),
+  [&source](const VisualFrame& frame) { return source.Borrow(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); }
+ };
  static_cast<void>(upscale.Start(test_upscale_request({source.frame, UpscaleKernel::RealPlksr})));
  const auto reached = waiting.get_future().wait_for(120s);
  if (reached != std::future_status::ready) static_cast<void>(upscale.Stop());
@@ -1521,10 +1527,10 @@ TEST_CASE("Warmed Upscale retains physical custody when model release fails") {
  auto backend = std::make_shared<FakeImageBackend>();
  auto release = std::make_shared<UpscaleReleaseFailureProbe>();
  auto warmed = release->warmed.get_future();
- UpscaleSystem upscale{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [release] { return std::make_unique<ReleaseFailingUpscaleAlgorithm>(release); }, 4U),
-  [](const VisualFrame&) { return VisualDocumentRead{}; }};
+ UpscaleSystem upscale{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [release] { return std::make_unique<ReleaseFailingUpscaleAlgorithm>(release); }, 4U),
+  [](const VisualFrame&) { return VisualDocumentRead{}; }
+ };
  upscale.Warm({32U, 32U});
  REQUIRE(warmed.wait_for(2s) == std::future_status::ready);
  warmed.get();
@@ -1544,17 +1550,16 @@ TEST_CASE("Upscale requests behind warmup retain identities without queued sourc
  std::atomic_uint32_t borrows{0U};
  std::atomic_uint32_t failures{0U};
  EventGate events;
- UpscaleSystem upscale{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
+ UpscaleSystem upscale{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
   [&source, &borrows](const VisualFrame& frame) {
-   borrows.fetch_add(1U);
-   return source.BorrowExact(frame);
-  },
-  [&events, &failures](UpscaleSystem::event_type event) {
-   if (std::holds_alternative<UpscaleFailed>(event)) failures.fetch_add(1U);
-   events.Advance();
-  }};
+  borrows.fetch_add(1U);
+  return source.BorrowExact(frame);
+ }, [&events, &failures](UpscaleSystem::event_type event) {
+  if (std::holds_alternative<UpscaleFailed>(event)) failures.fetch_add(1U);
+  events.Advance();
+ }
+ };
  auto settle_upscale = settle_upscale_on_exit(upscale, activation->warm_release);
  upscale.Warm(source.frame().extent);
  const bool warming = warm_entered.wait_for(2s) == std::future_status::ready;
@@ -1581,14 +1586,13 @@ TEST_CASE("Upscale warm failure is isolated and Start retains first-use activati
  activation->fail_warm.store(true, std::memory_order_release);
  std::promise<void> warm_failed;
  EventGate events;
- UpscaleSystem upscale{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
-  [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
-  [&warm_failed, &events](UpscaleSystem::event_type event) {
-   if (std::holds_alternative<UpscaleFailed>(event)) warm_failed.set_value();
-   events.Advance();
-  }};
+ UpscaleSystem upscale{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
+  [&source](const VisualFrame& frame) { return source.BorrowExact(frame); }, [&warm_failed, &events](UpscaleSystem::event_type event) {
+  if (std::holds_alternative<UpscaleFailed>(event)) warm_failed.set_value();
+  events.Advance();
+ }
+ };
  upscale.Warm({32U, 32U});
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(warm_failed, "warm_failed", 2s));
  upscale.Warm({32U, 32U});
@@ -1618,14 +1622,13 @@ TEST_CASE("A preempted warm failure remains method-local through another method 
  std::promise<UpscaleSnapshot> completed;
  auto result = completed.get_future();
  std::atomic_bool observed{false};
- UpscaleSystem upscale{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
-  [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
-  [&](UpscaleSystem::event_type event) {
-   if (const auto* changed = std::get_if<UpscaleChanged>(&event); changed && changed->snapshot.ready && changed->snapshot.kernel == UpscaleKernel::RealPlksr && !observed.exchange(true))
-    completed.set_value(changed->snapshot);
-  }};
+ UpscaleSystem upscale{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
+  [&source](const VisualFrame& frame) { return source.BorrowExact(frame); }, [&](UpscaleSystem::event_type event) {
+  if (const auto* changed = std::get_if<UpscaleChanged>(&event); changed && changed->snapshot.ready && changed->snapshot.kernel == UpscaleKernel::RealPlksr && !observed.exchange(true))
+   completed.set_value(changed->snapshot);
+ }
+ };
  auto settle_upscale = settle_upscale_on_exit(upscale, activation->warm_release);
  upscale.Warm({32U, 32U});
  const auto waiting = entered.wait_for(2s);
@@ -1647,17 +1650,16 @@ TEST_CASE("Upscale exact-frame admission separates invalid kernels from unavaila
  std::atomic<std::size_t> borrows{0U};
  std::atomic<UpscaleFailureKind> failure_kind{UpscaleFailureKind::Failed};
  EventGate events;
- UpscaleSystem upscale{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [selected_kernel] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel); }, 4U),
+ UpscaleSystem upscale{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [selected_kernel] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel); }, 4U),
   [&source, &borrows](const VisualFrame& frame) {
-   borrows.fetch_add(1U, std::memory_order_acq_rel);
-   return source.BorrowExact(frame);
-  },
-  [&events, &failure_kind](UpscaleSystem::event_type event) {
-   if (const auto* failure = std::get_if<UpscaleFailed>(&event)) failure_kind.store(failure->kind);
-   events.Advance();
-  }};
+  borrows.fetch_add(1U, std::memory_order_acq_rel);
+  return source.BorrowExact(frame);
+ }, [&events, &failure_kind](UpscaleSystem::event_type event) {
+  if (const auto* failure = std::get_if<UpscaleFailed>(&event)) failure_kind.store(failure->kind);
+  events.Advance();
+ }
+ };
  const auto current = source.frame();
  CHECK_THROWS_AS(upscale.Start(test_upscale_request({.source = current, .kernel = static_cast<UpscaleKernel>(255U)})), contracts::InvalidIntentError);
  CHECK(borrows.load(std::memory_order_acquire) == 0U);
@@ -1673,8 +1675,9 @@ TEST_CASE("Upscale exact-frame admission separates invalid kernels from unavaila
  CHECK_THROWS_AS(upscale.Start({.source = current, .document = invalid_revision}), contracts::InvalidIntentError);
  CHECK_THROWS_AS(upscale.Start(test_upscale_request({.source = {}})), contracts::InvalidIntentError);
  CHECK(borrows.load(std::memory_order_acquire) == 0U);
- for (const auto& expired : {visual_frame(current.source, current.extent, current.revision + 1U), visual_frame(current.source, {current.extent.width + 1U, current.extent.height}, current.revision),
-       visual_frame({PresentationSourceKind::Explore, 2U}, current.extent, current.revision)}) {
+ for (const auto& expired :
+  {visual_frame(current.source, current.extent, current.revision + 1U), visual_frame(current.source, {current.extent.width + 1U, current.extent.height}, current.revision),
+   visual_frame({PresentationSourceKind::Explore, 2U}, current.extent, current.revision)}) {
   static_cast<void>(upscale.Start(test_upscale_request({.source = expired})));
   REQUIRE(events.Wait([&] { return !upscale.snapshot().busy && failure_kind.load() == UpscaleFailureKind::Unavailable; }));
   CHECK_FALSE(upscale.snapshot().ready);
@@ -1688,7 +1691,8 @@ TEST_CASE("Upscale copies the admitted exact revision before a source update can
  auto copy_gate = backend->HoldSameDeviceCopies("Presentation source copy");
  auto race = std::make_shared<UpscaleAdmissionRaceProbe>();
  UpscaleSourceFixture subject{
-  backend, {24U, 15U}, 11U, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [race] { return std::make_unique<RacingUpscaleAlgorithm>(race); }, 4U)};
+  backend, {24U, 15U}, 11U, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [race] { return std::make_unique<RacingUpscaleAlgorithm>(race); }, 4U)
+ };
  auto& source = subject.source;
  auto& events = subject.events;
  auto& upscale = subject.upscale;
@@ -1756,12 +1760,13 @@ TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
  CHECK(explore.snapshot().frame.extent.width <= base_envelope.maximum_width);
  // CLEANUP-IGNORE: The base-envelope assertion and later high-water scenario setup are unrelated test operations.
  CHECK(explore.snapshot().frame.extent.height <= base_envelope.maximum_height);
- UpscaleSystem upscale{output_envelope,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+ UpscaleSystem upscale{
+  output_envelope,
+  RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
    // CLEANUP-IGNORE: Upscale Start and Annotation Open are distinct typed runtime paths.
    [selected_kernel] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel); }, 4U),
-  borrow_exactly_from(explore), [&events](UpscaleSystem::event_type) { events.Advance(); }};
+  borrow_exactly_from(explore), [&events](UpscaleSystem::event_type) { events.Advance(); }
+ };
  static_cast<void>(upscale.Start(test_upscale_request({.source = explore.snapshot().frame})));
  REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
  CHECK((upscale.snapshot().frame.extent == VisualExtent{256U, 256U}));
@@ -1772,8 +1777,9 @@ TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
  auto writer_state = std::make_shared<TestPresentationWriterState>();
  auto allocation_retired = writer_state->allocation_retired.get_future();
  EventGate presentation_events;
- PresentationSystem presentation{output_envelope, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); }, std::span{sources},
-  [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
+ PresentationSystem presentation{output_envelope, [backend, writer_state] {
+  return std::make_unique<TestPresentationWriter>(0, backend, writer_state);
+ }, std::span{sources}, [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
  PresentationScenario scenario{presentation, writer_state};
  static_cast<void>(presentation.Select(sources[0].source));
  writer_state->SignalReadiness();
@@ -1811,10 +1817,11 @@ TEST_CASE("Upscale invalid exact-source admission preserves the active operation
  auto gate = std::make_shared<MutationCommitProbe>();
  auto entered = gate->committed.get_future();
  EventGate events;
- UpscaleSystem upscale{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [selected_kernel, gate] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel, gate); }, 4U),
-  borrow_exactly_from(explore), [&events](UpscaleSystem::event_type) { events.Advance(); }};
+ UpscaleSystem upscale{
+  kDevice,
+  RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [selected_kernel, gate] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel, gate); }, 4U),
+  borrow_exactly_from(explore), [&events](UpscaleSystem::event_type) { events.Advance(); }
+ };
  auto settle_upscale = settle_upscale_on_exit(upscale, gate->release);
  const auto admitted = upscale.Start(test_upscale_request({
   .source = explore.snapshot().frame,
@@ -1842,13 +1849,13 @@ TEST_CASE("Upscale method failure preserves healthy resident products and permit
  auto runs = std::make_shared<std::atomic_uint32_t>(0U);
  std::promise<UpscaleFailed> failure;
  EventGate events;
- UpscaleSystem upscale{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [runs] { return std::make_unique<FailingUpscaleAlgorithm>(runs); }, 4U),
+ UpscaleSystem upscale{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [runs] { return std::make_unique<FailingUpscaleAlgorithm>(runs); }, 4U),
   borrow_exactly_from(explore), [&failure, &events](UpscaleSystem::event_type event) {
-   events.Advance();
-   if (auto* failed = std::get_if<UpscaleFailed>(&event)) failure.set_value(std::move(*failed));
-  }};
+  events.Advance();
+  if (auto* failed = std::get_if<UpscaleFailed>(&event)) failure.set_value(std::move(*failed));
+ }
+ };
  static_cast<void>(upscale.Start(test_upscale_request({.source = explore.snapshot().frame})));
  REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
  REQUIRE(upscale.BorrowFrame().valid());
@@ -1875,14 +1882,13 @@ TEST_CASE("Shared Upscale execution failure invalidates every resident product a
  auto runs = std::make_shared<std::atomic_uint32_t>(0U);
  std::promise<UpscaleFailed> failed;
  EventGate events;
- UpscaleSystem upscale{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [runs] { return std::make_unique<FailingUpscaleAlgorithm>(runs, true); }, 4U),
-  [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
-  [&events, &failed](UpscaleSystem::event_type event) {
-   if (auto* failure = std::get_if<UpscaleFailed>(&event)) failed.set_value(*failure);
-   events.Advance();
-  }};
+ UpscaleSystem upscale{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [runs] { return std::make_unique<FailingUpscaleAlgorithm>(runs, true); }, 4U),
+  [&source](const VisualFrame& frame) { return source.BorrowExact(frame); }, [&events, &failed](UpscaleSystem::event_type event) {
+  if (auto* failure = std::get_if<UpscaleFailed>(&event)) failed.set_value(*failure);
+  events.Advance();
+ }
+ };
  static_cast<void>(upscale.Start(test_upscale_request({source.frame()})));
  REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
  const auto request = test_upscale_request({source.frame(), UpscaleKernel::ShiftLut});

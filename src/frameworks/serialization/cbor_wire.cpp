@@ -197,45 +197,41 @@ std::expected<FlatValue, DecodeError> FlatValue::array(const std::span<const Fla
 }
 std::expected<FlatValue, DecodeError> FlatValue::from_value(const Value& value, const DynamicValueLimits limits) {
  if (limits.max_bytes == 0U || limits.max_items == 0U) { return std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}}); }
- return std::visit(
-  [limits]<class T>(const T& leaf) -> std::expected<FlatValue, DecodeError> {
-   if constexpr (std::is_same_v<T, std::monostate> || std::is_same_v<T, bool> || std::is_same_v<T, std::int64_t> || std::is_same_v<T, std::uint64_t>) {
-    return FlatValue(leaf);
-   } else if constexpr (std::is_same_v<T, double>) {
-    return std::isfinite(leaf) ? std::expected<FlatValue, DecodeError>(FlatValue(leaf)) : std::unexpected(DecodeError{.code = ErrorCode::InvalidFloat, .offset = 0U, .path = {}});
-   } else if constexpr (std::is_same_v<T, std::string>) {
-    return FlatValue::text(leaf, limits.max_bytes);
-   } else if constexpr (std::is_same_v<T, ByteBuffer>) {
-    return FlatValue::bytes(leaf, limits.max_bytes);
-   } else if constexpr (std::is_same_v<T, Value::Array>) {
-    if (leaf.size() > limits.max_items || (limits.max_depth == 0U && !leaf.empty())) { return std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}}); }
-    FlatValue::Array result;
-    result.reserve(leaf.size());
-    for (const Value& item : leaf) {
-     auto scalar = std::visit(
-      [limits]<class U>(const U& item_leaf) -> std::expected<FlatValue::Scalar, DecodeError> {
-       if constexpr (std::is_same_v<U, std::monostate> || std::is_same_v<U, bool> || std::is_same_v<U, std::int64_t> || std::is_same_v<U, std::uint64_t>) {
-        return FlatValue::Scalar(item_leaf);
-       } else if constexpr (std::is_same_v<U, double>) {
-        return std::isfinite(item_leaf) ? std::expected<FlatValue::Scalar, DecodeError>(FlatValue::Scalar(item_leaf))
-                                        : std::unexpected(DecodeError{.code = ErrorCode::InvalidFloat, .offset = 0U, .path = {}});
-       } else if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, ByteBuffer>) {
-        return item_leaf.size() <= limits.max_bytes ? std::expected<FlatValue::Scalar, DecodeError>(FlatValue::Scalar(item_leaf))
-                                                    : std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}});
-       } else {
-        return std::unexpected(DecodeError{.code = ErrorCode::TypeMismatch, .offset = 0U, .path = {}});
-       }
-      },
-      item.storage);
-     if (!scalar) { return std::unexpected(scalar.error()); }
-     result.push_back(std::move(*scalar));
-    }
-    return FlatValue(Storage(std::move(result)));
-   } else {
-    return std::unexpected(DecodeError{.code = ErrorCode::TypeMismatch, .offset = 0U, .path = {}});
+ return std::visit([limits]<class T>(const T& leaf) -> std::expected<FlatValue, DecodeError> {
+  if constexpr (std::is_same_v<T, std::monostate> || std::is_same_v<T, bool> || std::is_same_v<T, std::int64_t> || std::is_same_v<T, std::uint64_t>) {
+   return FlatValue(leaf);
+  } else if constexpr (std::is_same_v<T, double>) {
+   return std::isfinite(leaf) ? std::expected<FlatValue, DecodeError>(FlatValue(leaf)) : std::unexpected(DecodeError{.code = ErrorCode::InvalidFloat, .offset = 0U, .path = {}});
+  } else if constexpr (std::is_same_v<T, std::string>) {
+   return FlatValue::text(leaf, limits.max_bytes);
+  } else if constexpr (std::is_same_v<T, ByteBuffer>) {
+   return FlatValue::bytes(leaf, limits.max_bytes);
+  } else if constexpr (std::is_same_v<T, Value::Array>) {
+   if (leaf.size() > limits.max_items || (limits.max_depth == 0U && !leaf.empty())) { return std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}}); }
+   FlatValue::Array result;
+   result.reserve(leaf.size());
+   for (const Value& item : leaf) {
+    auto scalar = std::visit([limits]<class U>(const U& item_leaf) -> std::expected<FlatValue::Scalar, DecodeError> {
+     if constexpr (std::is_same_v<U, std::monostate> || std::is_same_v<U, bool> || std::is_same_v<U, std::int64_t> || std::is_same_v<U, std::uint64_t>) {
+      return FlatValue::Scalar(item_leaf);
+     } else if constexpr (std::is_same_v<U, double>) {
+      return std::isfinite(item_leaf) ? std::expected<FlatValue::Scalar, DecodeError>(FlatValue::Scalar(item_leaf))
+                                      : std::unexpected(DecodeError{.code = ErrorCode::InvalidFloat, .offset = 0U, .path = {}});
+     } else if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, ByteBuffer>) {
+      return item_leaf.size() <= limits.max_bytes ? std::expected<FlatValue::Scalar, DecodeError>(FlatValue::Scalar(item_leaf))
+                                                  : std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}});
+     } else {
+      return std::unexpected(DecodeError{.code = ErrorCode::TypeMismatch, .offset = 0U, .path = {}});
+     }
+    }, item.storage);
+    if (!scalar) { return std::unexpected(scalar.error()); }
+    result.push_back(std::move(*scalar));
    }
-  },
-  value.storage);
+   return FlatValue(Storage(std::move(result)));
+  } else {
+   return std::unexpected(DecodeError{.code = ErrorCode::TypeMismatch, .offset = 0U, .path = {}});
+  }
+ }, value.storage);
 }
 bool dynamic_value_within_limits(const FlatValue& value, const DynamicValueLimits limits) noexcept {
  if (limits.max_bytes == 0U || limits.max_items == 0U) { return false; }
@@ -243,12 +239,10 @@ bool dynamic_value_within_limits(const FlatValue& value, const DynamicValueLimit
   if constexpr (std::is_same_v<T, FlatValue::Array>) {
    if (leaf.size() > limits.max_items || (limits.max_depth == 0U && !leaf.empty())) { return false; }
    return std::all_of(leaf.begin(), leaf.end(), [limits](const FlatValue::Scalar& scalar) {
-    return std::visit(
-     [limits]<class U>(const U& item) {
-      if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, ByteBuffer>) { return item.size() <= limits.max_bytes; }
-      return true;
-     },
-     scalar);
+    return std::visit([limits]<class U>(const U& item) {
+     if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, ByteBuffer>) { return item.size() <= limits.max_bytes; }
+     return true;
+    }, scalar);
    });
   } else if constexpr (std::is_same_v<T, std::string> || std::is_same_v<T, ByteBuffer>) {
    return leaf.size() <= limits.max_bytes;
@@ -554,15 +548,13 @@ std::expected<FlatValue, DecodeError> Reader::read_flat_item(const std::size_t d
   if (!item) { return std::unexpected(item.error()); }
   auto scalar = read_flat_scalar(*item, true);
   if (!scalar) { return std::unexpected(scalar.error()); }
-  auto flat_scalar = std::visit(
-   []<class T>(T&& leaf) -> std::optional<FlatValue::Scalar> {
-    if constexpr (std::is_same_v<std::remove_cvref_t<T>, FlatValue::Array>) {
-     return std::nullopt;
-    } else {
-     return FlatValue::Scalar(std::forward<T>(leaf));
-    }
-   },
-   std::move(scalar->storage));
+  auto flat_scalar = std::visit([]<class T>(T&& leaf) -> std::optional<FlatValue::Scalar> {
+   if constexpr (std::is_same_v<std::remove_cvref_t<T>, FlatValue::Array>) {
+    return std::nullopt;
+   } else {
+    return FlatValue::Scalar(std::forward<T>(leaf));
+   }
+  }, std::move(scalar->storage));
   if (!flat_scalar) { return std::unexpected(error(ErrorCode::TypeMismatch)); }
   result.push_back(std::move(*flat_scalar));
  }
@@ -712,59 +704,57 @@ std::expected<void, EncodeError> Writer::write_text_body(const std::string_view 
 std::expected<void, EncodeError> Writer::write_item(const Value& value, const std::size_t depth) {
  auto begun = begin_encode_item(depth, items_, limits_);
  if (!begun) return begun;
- return std::visit(
-  [this, depth](const auto& item) -> std::expected<void, EncodeError> {
-   using T = std::decay_t<decltype(item)>;
-   if constexpr (std::is_same_v<T, std::monostate>) {
-    return put(std::byte{0xf6});
-   } else if constexpr (std::is_same_v<T, bool>) {
-    return put(item ? std::byte{0xf5} : std::byte{0xf4});
-   } else if constexpr (std::is_same_v<T, std::int64_t>) {
-    return item >= 0 ? head(0U, static_cast<std::uint64_t>(item)) : head(1U, static_cast<std::uint64_t>(-(item + 1)));
-   } else if constexpr (std::is_same_v<T, std::uint64_t>) {
-    return head(0U, item);
-   } else if constexpr (std::is_same_v<T, double>) {
-    const auto encoding = canonical_float_encoding(item);
-    if (!encoding) return std::unexpected(encode_error(encoding.error()));
-    const std::size_t width = static_cast<std::size_t>(encoding->width);
-    auto result = put(width == 2U ? std::byte{0xf9} : width == 4U ? std::byte{0xfa} : std::byte{0xfb});
+ return std::visit([this, depth](const auto& item) -> std::expected<void, EncodeError> {
+  using T = std::decay_t<decltype(item)>;
+  if constexpr (std::is_same_v<T, std::monostate>) {
+   return put(std::byte{0xf6});
+  } else if constexpr (std::is_same_v<T, bool>) {
+   return put(item ? std::byte{0xf5} : std::byte{0xf4});
+  } else if constexpr (std::is_same_v<T, std::int64_t>) {
+   return item >= 0 ? head(0U, static_cast<std::uint64_t>(item)) : head(1U, static_cast<std::uint64_t>(-(item + 1)));
+  } else if constexpr (std::is_same_v<T, std::uint64_t>) {
+   return head(0U, item);
+  } else if constexpr (std::is_same_v<T, double>) {
+   const auto encoding = canonical_float_encoding(item);
+   if (!encoding) return std::unexpected(encode_error(encoding.error()));
+   const std::size_t width = static_cast<std::size_t>(encoding->width);
+   auto result = put(width == 2U ? std::byte{0xf9} : width == 4U ? std::byte{0xfa} : std::byte{0xfb});
+   if (!result) { return result; }
+   for (std::size_t index = width; index-- > 0U;) {
+    result = put(std::byte((encoding->bits >> (index * 8U)) & 0xffU));
     if (!result) { return result; }
-    for (std::size_t index = width; index-- > 0U;) {
-     result = put(std::byte((encoding->bits >> (index * 8U)) & 0xffU));
-     if (!result) { return result; }
-    }
-    return {};
-   } else if constexpr (std::is_same_v<T, std::string>) {
-    return write_text_body(item);
-   } else if constexpr (std::is_same_v<T, ByteBuffer>) {
-    auto result = head(2U, item.size());
-    if (!result) { return result; }
-    return append(item);
-   } else if constexpr (std::is_same_v<T, Value::Array>) {
-    const bool substitute = raw_array_.target == &item;
-    const std::size_t element_count = substitute ? raw_array_.items.size() : item.size();
-    if (!fits_remaining(element_count, items_, limits_.max_items)) { return std::unexpected(encode_error(ErrorCode::LimitExceeded)); }
-    auto result = head(4U, element_count);
-    if (!result) { return result; }
-    if (substitute) {
-     return encode_each(raw_array_.items, [this, depth](const ByteSegments encoded) { return append_raw_item(encoded, depth + 1U); });
-    }
-    return encode_each(item, [this, depth](const Value& element) { return write_item(element, depth + 1U); });
-   } else {
-    auto valid = validate_object_encoding(item, items_, limits_);
-    if (!valid) return valid;
-    auto result = head(5U, item.size());
-    if (!result) { return result; }
-    return encode_each(item, [this, depth](const auto& entry) {
-     auto encoded = begin_encode_item(depth + 1U, items_, limits_);
-     if (!encoded) return encoded;
-     encoded = write_text_body(entry.first);
-     if (!encoded) return encoded;
-     return write_item(entry.second, depth + 1U);
-    });
    }
-  },
-  value.storage);
+   return {};
+  } else if constexpr (std::is_same_v<T, std::string>) {
+   return write_text_body(item);
+  } else if constexpr (std::is_same_v<T, ByteBuffer>) {
+   auto result = head(2U, item.size());
+   if (!result) { return result; }
+   return append(item);
+  } else if constexpr (std::is_same_v<T, Value::Array>) {
+   const bool substitute = raw_array_.target == &item;
+   const std::size_t element_count = substitute ? raw_array_.items.size() : item.size();
+   if (!fits_remaining(element_count, items_, limits_.max_items)) { return std::unexpected(encode_error(ErrorCode::LimitExceeded)); }
+   auto result = head(4U, element_count);
+   if (!result) { return result; }
+   if (substitute) {
+    return encode_each(raw_array_.items, [this, depth](const ByteSegments encoded) { return append_raw_item(encoded, depth + 1U); });
+   }
+   return encode_each(item, [this, depth](const Value& element) { return write_item(element, depth + 1U); });
+  } else {
+   auto valid = validate_object_encoding(item, items_, limits_);
+   if (!valid) return valid;
+   auto result = head(5U, item.size());
+   if (!result) { return result; }
+   return encode_each(item, [this, depth](const auto& entry) {
+    auto encoded = begin_encode_item(depth + 1U, items_, limits_);
+    if (!encoded) return encoded;
+    encoded = write_text_body(entry.first);
+    if (!encoded) return encoded;
+    return write_item(entry.second, depth + 1U);
+   });
+  }
+ }, value.storage);
 }
 std::expected<void, EncodeError> Writer::write(const Value& value) {
  const std::size_t initial_size = destination_size();

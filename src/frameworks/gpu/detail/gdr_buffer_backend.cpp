@@ -82,11 +82,13 @@ public:
  GdrMappingInfo info(void* handle, std::uintptr_t mapping) override {
   gdr_info_t result{};
   check_gdr(gdr_get_info(static_cast<gdr_t>(handle), {mapping}, &result), "inspect GDR mapping");
-  return {.base = result.va,
+  return {
+   .base = result.va,
    .bytes = result.mapped_size,
    .page_size = result.page_size,
    .mapping_type = static_cast<int>(result.mapping_type),
-   .mapped = result.mapped != 0 && result.mapping_type > GDR_MAPPING_TYPE_NONE && result.mapping_type < GDR_MAPPING_TYPE_MAX};
+   .mapped = result.mapped != 0 && result.mapping_type > GDR_MAPPING_TYPE_NONE && result.mapping_type < GDR_MAPPING_TYPE_MAX
+  };
  }
  int unmap(void* handle, std::uintptr_t mapping, void* address, std::size_t bytes) noexcept override { return gdr_unmap(static_cast<gdr_t>(handle), {mapping}, address, bytes); }
  void copy(std::uintptr_t mapping, void* destination, const void* source, std::size_t bytes) override {

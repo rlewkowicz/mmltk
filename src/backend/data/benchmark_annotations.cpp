@@ -758,9 +758,10 @@ void rasterize_coco_polygons(const std::vector<std::vector<double>>& polygons, c
 // produces, and the reject tally. Parser-specific fields are added by the caller to the returned object, which is
 // only built from inside the trace sink's lambda so untraced runs still pay nothing.
 [[nodiscard]] nlohmann::json normalized_index_trace_json(const NormalizedAnnotationIndex& index) {
- return nlohmann::json{{"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()},
-  {"raw_records", index.rejected.raw_records}, {"unmapped", index.rejected.unmapped_categories}, {"malformed", index.rejected.malformed_records}, {"degenerate", index.rejected.degenerate_boxes},
-  {"duplicates", index.rejected.duplicate_boxes}};
+ return nlohmann::json{
+  {"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"raw_records", index.rejected.raw_records},
+  {"unmapped", index.rejected.unmapped_categories}, {"malformed", index.rejected.malformed_records}, {"degenerate", index.rejected.degenerate_boxes}, {"duplicates", index.rejected.duplicate_boxes}
+ };
 }
 void compact_annotations(NormalizedAnnotationIndex* index, const std::vector<ParsedImage>& parsed_images, const std::vector<std::uint64_t>& offsets, const std::span<const std::uint64_t> accepted_ends,
  std::vector<NormalizedBox> boxes, std::optional<std::vector<std::vector<RLEPair>>> masks, const bool keep_empty, mmltk::common::concurrency::CancellationObservation cancel_requested) {
@@ -1385,7 +1386,8 @@ std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const 
   validate_normalized_records(index, cancel_requested);
   trace_benchmark_event(trace, "benchmark.annotations.cache_hit", [&] {
    return nlohmann::json{
-    {"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"mask_rle_pairs", index.mask_rle_pairs.size()}};
+    {"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"mask_rle_pairs", index.mask_rle_pairs.size()}
+   };
   });
   return index;
  } catch (const std::exception& error) {
@@ -1451,9 +1453,11 @@ void store_normalized_annotation_index(
   throw_if_benchmark_cancelled(cancel_requested);
   publish_staged_path_atomically(staging_path, path, true);
   write_json_atomically(completion,
-   nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion}, {"index_version", kNormalizedAnnotationIndexVersion}, {"complete", true}, {"source", benchmark_source_name(index.source)},
-    {"split", index.split}, {"mapping_revision", kBenchmarkMappingRevision}, {"annotation_sha256", index.annotation_sha256}, {"size", total_size}, {"identity", identity},
-    {"integrity_mode", "atomic_layout_identity"}, {"images", index.images.size()}, {"mask_rle_pairs", index.mask_rle_pairs.size()}, {"boxes", index.boxes.size()}},
+   nlohmann::json{
+    {"schema_version", kBenchmarkCacheSchemaVersion}, {"index_version", kNormalizedAnnotationIndexVersion}, {"complete", true}, {"source", benchmark_source_name(index.source)}, {"split", index.split},
+    {"mapping_revision", kBenchmarkMappingRevision}, {"annotation_sha256", index.annotation_sha256}, {"size", total_size}, {"identity", identity}, {"integrity_mode", "atomic_layout_identity"},
+    {"images", index.images.size()}, {"mask_rle_pairs", index.mask_rle_pairs.size()}, {"boxes", index.boxes.size()}
+   },
    cancel_requested);
   trace_benchmark_event(trace, "benchmark.annotations.cache_store",
    [&] { return nlohmann::json{{"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"bytes", total_size}}; });

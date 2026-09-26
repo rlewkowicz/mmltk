@@ -33,43 +33,41 @@ namespace reflect = ::mmltk::frameworks::reflection;
 [[nodiscard]] std::string browser_protocol_marker() { return "MMLTK_HOST_API_PROTOCOL_" + std::to_string(mmltk::controller::browser::kBrowserProtocolVersion); }
 void emit_rust_value(std::ostream& output, const mmltk::controller::browser::wire::Value& value) {
  using Value = mmltk::controller::browser::wire::Value;
- std::visit(
-  [&]<class Storage>(const Storage& storage) {
-   using Type = std::remove_cvref_t<Storage>;
-   if constexpr (std::same_as<Type, std::monostate>) {
-    output << "Value::Null";
-   } else if constexpr (std::same_as<Type, bool>) {
-    output << (storage ? "Value::Bool(true)" : "Value::Bool(false)");
-   } else if constexpr (std::same_as<Type, std::int64_t>) {
-    output << "Value::Signed(" << storage << ')';
-   } else if constexpr (std::same_as<Type, std::uint64_t>) {
-    output << "Value::Unsigned(" << storage << ')';
-   } else if constexpr (std::same_as<Type, double>) {
-    output << "Value::Float(" << std::showpoint << storage << std::noshowpoint << ')';
-   } else if constexpr (std::same_as<Type, std::string>) {
-    output << "Value::Text(" << std::quoted(storage) << ".into())";
-   } else if constexpr (std::same_as<Type, Value::Bytes>) {
-    output << "Value::Bytes(vec![";
-    for (const std::byte byte : storage) output << static_cast<unsigned int>(std::to_integer<std::uint8_t>(byte)) << ',';
-    output << "])";
-   } else if constexpr (std::same_as<Type, Value::Array>) {
-    output << "Value::Array(vec![";
-    for (const auto& item : storage) {
-     emit_rust_value(output, item);
-     output << ',';
-    }
-    output << "])";
-   } else {
-    output << "Value::Object(vec![";
-    for (const auto& [name, item] : storage) {
-     output << '(' << std::quoted(name) << ".into(),";
-     emit_rust_value(output, item);
-     output << "),";
-    }
-    output << "])";
+ std::visit([&]<class Storage>(const Storage& storage) {
+  using Type = std::remove_cvref_t<Storage>;
+  if constexpr (std::same_as<Type, std::monostate>) {
+   output << "Value::Null";
+  } else if constexpr (std::same_as<Type, bool>) {
+   output << (storage ? "Value::Bool(true)" : "Value::Bool(false)");
+  } else if constexpr (std::same_as<Type, std::int64_t>) {
+   output << "Value::Signed(" << storage << ')';
+  } else if constexpr (std::same_as<Type, std::uint64_t>) {
+   output << "Value::Unsigned(" << storage << ')';
+  } else if constexpr (std::same_as<Type, double>) {
+   output << "Value::Float(" << std::showpoint << storage << std::noshowpoint << ')';
+  } else if constexpr (std::same_as<Type, std::string>) {
+   output << "Value::Text(" << std::quoted(storage) << ".into())";
+  } else if constexpr (std::same_as<Type, Value::Bytes>) {
+   output << "Value::Bytes(vec![";
+   for (const std::byte byte : storage) output << static_cast<unsigned int>(std::to_integer<std::uint8_t>(byte)) << ',';
+   output << "])";
+  } else if constexpr (std::same_as<Type, Value::Array>) {
+   output << "Value::Array(vec![";
+   for (const auto& item : storage) {
+    emit_rust_value(output, item);
+    output << ',';
    }
-  },
-  value.storage);
+   output << "])";
+  } else {
+   output << "Value::Object(vec![";
+   for (const auto& [name, item] : storage) {
+    output << '(' << std::quoted(name) << ".into(),";
+    emit_rust_value(output, item);
+    output << "),";
+   }
+   output << "])";
+  }
+ }, value.storage);
 }
 [[nodiscard]] std::string rust_identifier(std::string_view source, const bool upper) {
  if (const auto separator = source.rfind("::"); separator != std::string_view::npos) source.remove_prefix(separator + 2U);
@@ -445,8 +443,7 @@ private:
    output_ << "}\nimpl IntoApplicationValue for " << name << " { fn into_application_value(self) -> Value { Value::Text(match self {\n";
    for (const auto entry : reflect::enum_entries<Type>()) output_ << "    Self::" << rust_identifier(entry.name, true) << " => \"" << entry.name << "\",\n";
    output_ << "}.into()) } }\nimpl FromApplicationValue for " << name << " { fn from_application_value(value: Value) -> Result<Self, String> { match value {\n";
-   for (const auto entry : reflect::enum_entries<Type>())
-    output_ << "    Value::Text(value) if value == \"" << entry.name << "\" => Ok(Self::" << rust_identifier(entry.name, true) << "),\n";
+   for (const auto entry : reflect::enum_entries<Type>()) output_ << "    Value::Text(value) if value == \"" << entry.name << "\" => Ok(Self::" << rust_identifier(entry.name, true) << "),\n";
    output_ << "    _ => Err(\"invalid enum symbol\".into()), } } }\n\n";
    const auto inventory = rust_constant_identifier(name) + "_VALUES";
    symbols_.Reserve("module", inventory, NativeSource<Type>() + " enum inventory");
@@ -765,8 +762,7 @@ private:
    row << "ReflectedFieldFact { owner: \"" << name << "\", declaration_owner: \"" << mmltk::frameworks::serialization::reflected_schema_type_name<Owner>() << "\", name: \"" << fact.member_name
        << "\", ";
    EmitCompactConstraintFields(row, fact.constraint);
-   row << ", presentation: \"" << reflect::enum_name(fact.presentation) << "\", operation_state: " << operation_state << ", progress: " << progress
-       << ", catalog_provider: " << catalog << " },\n";
+   row << ", presentation: \"" << reflect::enum_name(fact.presentation) << "\", operation_state: " << operation_state << ", progress: " << progress << ", catalog_provider: " << catalog << " },\n";
    field_facts_.push_back(std::move(row).str());
   });
  }
@@ -834,10 +830,8 @@ private:
   ModelSelectionRelation::VisitRows([&]<class Relation>(const auto& row) {
    constexpr auto path = reflect::reflected_member_path<Settings, Relation::artifact>();
    const auto stable_id = mmltk::controller::browser::application_settings_field_stable_id(path.view());
-   output_ << "ModelArtifactDialogFact { target: ModelArtifactTarget { stableid: " << stable_id
-           << ", workflow: FeatureId::" << rust_identifier(reflect::enum_name(row.workflow), true)
-           << ", input: ModelArtifactInputKind::" << rust_identifier(reflect::enum_name(row.input), true) << " }, stable_field_id: " << stable_id
-           << ", key_fields: ModelSelectionFields {";
+   output_ << "ModelArtifactDialogFact { target: ModelArtifactTarget { stableid: " << stable_id << ", workflow: FeatureId::" << rust_identifier(reflect::enum_name(row.workflow), true)
+           << ", input: ModelArtifactInputKind::" << rust_identifier(reflect::enum_name(row.input), true) << " }, stable_field_id: " << stable_id << ", key_fields: ModelSelectionFields {";
    EmitModelKeyFields<Relation>(false);
    output_ << "}, field_path: " << std::quoted(path.view()) << ", dialog: ";
    emit_catalog_value(output_, ModelArtifactDialog{row.dialog_title, row.dialog_filter, row.dialog_pattern});
@@ -1374,9 +1368,8 @@ private:
     const auto scheduler = scheduler_entry.value;
     auto candidate = recipe;
     candidate.lr_scheduler = scheduler;
-    output_ << "(TrainOptimizerKind::" << rust_identifier(reflect::enum_name(recipe.optimizer), true)
-            << ", TrainLrSchedulerKind::" << rust_identifier(reflect::enum_name(scheduler), true) << ") => " << (r::train_recipe_values_valid(candidate) ? "true" : "false")
-            << ",\n";
+    output_ << "(TrainOptimizerKind::" << rust_identifier(reflect::enum_name(recipe.optimizer), true) << ", TrainLrSchedulerKind::" << rust_identifier(reflect::enum_name(scheduler), true) << ") => "
+            << (r::train_recipe_values_valid(candidate) ? "true" : "false") << ",\n";
    }
   }
   output_ << "} }\n";
@@ -1386,8 +1379,8 @@ private:
    const auto mode = lane_entry.value;
    r::TrainLaneConfiguration configuration;
    configuration.mode = mode;
-   output_ << "TrainLaneMode::" << rust_identifier(reflect::enum_name(mode), true)
-           << " => TrainFinalPolicy::" << rust_identifier(reflect::enum_name(r::effective_final_policy(configuration)), true) << ",\n";
+   output_ << "TrainLaneMode::" << rust_identifier(reflect::enum_name(mode), true) << " => TrainFinalPolicy::" << rust_identifier(reflect::enum_name(r::effective_final_policy(configuration)), true)
+           << ",\n";
   }
   output_ << "}) }\n";
   ReserveGeneratedStruct("SettingsLeafFact", "generated settings-leaf metadata",
@@ -1416,8 +1409,7 @@ private:
              "pub static SETTINGS_LEAVES: &[SettingsLeafFact] = &[\n";
   Schema::VisitApplicationSettingsLeaves([&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsLeafFact& fact) {
    output_ << "SettingsLeafFact { stable_field_id: " << fact.stable_id << ", path: \"" << fact.path << "\", owner: \"" << mmltk::frameworks::serialization::reflected_schema_type_name<Owner>()
-           << "\", member: \"" << reflect::materialized_member_name<Declaration::pointer>() << "\", mutable_leaf: " << (fact.mutable_leaf ? "true" : "false")
-           << ", workflows: &[";
+           << "\", member: \"" << reflect::materialized_member_name<Declaration::pointer>() << "\", mutable_leaf: " << (fact.mutable_leaf ? "true" : "false") << ", workflows: &[";
    for (std::size_t index = 0U; index < fact.workflows.count; ++index) {
     if (index != 0U) output_ << ", ";
     output_ << "FeatureId::" << rust_identifier(reflect::enum_name(fact.workflows.workflows[index]), true);
@@ -1841,10 +1833,9 @@ private:
   });
   output_ << "];\npub static CATALOG_ROWS: &[CatalogRowFact] = &[\n";
   Schema::VisitCatalogProviders([&]<class Provider, class Row>(const auto&) {
-   Schema::template VisitCatalogRows<Provider>(
-    [&]<class ActualProvider, class ActualRow>(const mmltk::controller::browser::ApplicationCatalogRowFact& fact, const ActualRow&) {
-     output_ << "CatalogRowFact { provider_id: " << fact.provider_id << ", stable_id: " << fact.stable_id << ", key: " << std::quoted(fact.key) << ", index: " << fact.index << " },\n";
-    });
+   Schema::template VisitCatalogRows<Provider>([&]<class ActualProvider, class ActualRow>(const mmltk::controller::browser::ApplicationCatalogRowFact& fact, const ActualRow&) {
+    output_ << "CatalogRowFact { provider_id: " << fact.provider_id << ", stable_id: " << fact.stable_id << ", key: " << std::quoted(fact.key) << ", index: " << fact.index << " },\n";
+   });
   });
   output_ << "];\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct FileDialogFact { "
              "pub stable_field_id: u64, pub title: &'static str, pub filter: &'static str, "

@@ -654,16 +654,13 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
  const auto bbox_prediction_score = [&bbox](const std::uint32_t prediction_index) { return bbox.scores[static_cast<std::ptrdiff_t>(prediction_index) * bbox.score_stride]; };
  for (size_t category_index = 0; category_index < category_count; ++category_index) {
   const GroundTruthSpan span = category_ground_truth_span(category_index);
-  match_category_predictions(
-   scratch.predictions_by_category[category_index], span_ordinals(span), image_ordinal, static_cast<std::uint16_t>(category_index), scratch, result.bbox, bbox_iou_candidate_count,
-   bbox_prediction_score,
-   [this, span, &scratch](const std::uint32_t prediction_index, const size_t ground_truth_index) {
-    return bbox_iou(scratch.staged_boxes[prediction_index], ground_truth_boxes_[span.offset + ground_truth_index],
-     (ground_truth_flags_[span.offset + ground_truth_index] & mmltk::backend::data::kAnnotationCrowd) != 0U);
-   },
-   [this, span](size_t index) { return ground_truth_areas_[span.offset + index]; },
-   [this, image_index, &scratch](size_t index) { return evaluation_box_area(scratch.staged_boxes[index]) * image_area_scale_[image_index]; },
-   [this, span](size_t index) { return (ground_truth_flags_[span.offset + index] & mmltk::backend::data::kAnnotationCrowd) != 0U; });
+  match_category_predictions(scratch.predictions_by_category[category_index], span_ordinals(span), image_ordinal, static_cast<std::uint16_t>(category_index), scratch, result.bbox,
+   bbox_iou_candidate_count, bbox_prediction_score, [this, span, &scratch](const std::uint32_t prediction_index, const size_t ground_truth_index) {
+   return bbox_iou(scratch.staged_boxes[prediction_index], ground_truth_boxes_[span.offset + ground_truth_index],
+    (ground_truth_flags_[span.offset + ground_truth_index] & mmltk::backend::data::kAnnotationCrowd) != 0U);
+  }, [this, span](size_t index) { return ground_truth_areas_[span.offset + index]; }, [this, image_index, &scratch](size_t index) {
+   return evaluation_box_area(scratch.staged_boxes[index]) * image_area_scale_[image_index];
+  }, [this, span](size_t index) { return (ground_truth_flags_[span.offset + index] & mmltk::backend::data::kAnnotationCrowd) != 0U; });
  }
  result.prediction_count = result.bbox.size();
  if (mask_mode) {
@@ -684,21 +681,18 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
   const auto& runs = *ground_truth_mask_runs_;
   for (size_t category_index = 0; category_index < category_count; ++category_index) {
    const GroundTruthSpan span = category_ground_truth_span(category_index);
-   match_category_predictions(
-    scratch.predictions_by_category[category_index], span_ordinals(span), image_ordinal, static_cast<std::uint16_t>(category_index), scratch, mask_matches, mask_iou_candidate_count,
-    bbox_prediction_score,
-    [this, span, &masks, &runs, &prediction_mask_at](const std::uint32_t prediction_index, const size_t ground_truth_index) {
-     const EncodedMask& prediction_mask = prediction_mask_at(prediction_index);
-     const GroundTruthMask& ground_truth_mask = masks[span.offset + ground_truth_index];
-     const auto ground_truth_runs = std::span<const std::pair<std::uint32_t, std::uint32_t>>(runs).subspan(ground_truth_mask.run_offset, ground_truth_mask.run_count);
-     const std::uint32_t intersect = intersection_area(prediction_mask, ground_truth_runs);
-     const bool crowd = (ground_truth_flags_[span.offset + ground_truth_index] & mmltk::backend::data::kAnnotationCrowd) != 0U;
-     const std::uint64_t union_area = crowd ? prediction_mask.area : static_cast<std::uint64_t>(prediction_mask.area) + ground_truth_mask.area - intersect;
-     return union_area == 0 ? 0.0 : static_cast<double>(intersect) / static_cast<double>(union_area);
-    },
-    [this, span](size_t index) { return ground_truth_areas_[span.offset + index]; },
-    [this, image_index, &prediction_mask_at](size_t index) { return prediction_mask_at(index).area * image_area_scale_[image_index]; },
-    [this, span](size_t index) { return (ground_truth_flags_[span.offset + index] & mmltk::backend::data::kAnnotationCrowd) != 0U; });
+   match_category_predictions(scratch.predictions_by_category[category_index], span_ordinals(span), image_ordinal, static_cast<std::uint16_t>(category_index), scratch, mask_matches,
+    mask_iou_candidate_count, bbox_prediction_score, [this, span, &masks, &runs, &prediction_mask_at](const std::uint32_t prediction_index, const size_t ground_truth_index) {
+    const EncodedMask& prediction_mask = prediction_mask_at(prediction_index);
+    const GroundTruthMask& ground_truth_mask = masks[span.offset + ground_truth_index];
+    const auto ground_truth_runs = std::span<const std::pair<std::uint32_t, std::uint32_t>>(runs).subspan(ground_truth_mask.run_offset, ground_truth_mask.run_count);
+    const std::uint32_t intersect = intersection_area(prediction_mask, ground_truth_runs);
+    const bool crowd = (ground_truth_flags_[span.offset + ground_truth_index] & mmltk::backend::data::kAnnotationCrowd) != 0U;
+    const std::uint64_t union_area = crowd ? prediction_mask.area : static_cast<std::uint64_t>(prediction_mask.area) + ground_truth_mask.area - intersect;
+    return union_area == 0 ? 0.0 : static_cast<double>(intersect) / static_cast<double>(union_area);
+   }, [this, span](size_t index) { return ground_truth_areas_[span.offset + index]; }, [this, image_index, &prediction_mask_at](size_t index) {
+    return prediction_mask_at(index).area * image_area_scale_[image_index];
+   }, [this, span](size_t index) { return (ground_truth_flags_[span.offset + index] & mmltk::backend::data::kAnnotationCrowd) != 0U; });
   }
  }
  result.bbox_iou_candidate_count = bbox_iou_candidate_count;

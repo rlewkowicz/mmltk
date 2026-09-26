@@ -546,17 +546,19 @@ public:
   if (source == "/allocation-failed") throw std::bad_alloc{};
   const std::vector<mmltk::backend::data::catalog::ClassName> class_names =
    source == "/different-catalog" ? std::vector<mmltk::backend::data::catalog::ClassName>{{"animal"}, {"building"}} : std::vector<mmltk::backend::data::catalog::ClassName>{{"person"}, {"vehicle"}};
-  return {.dataset = {.image_count = 3U, .image_width = 64U, .image_height = 64U, .class_names = class_names},
-   .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()), .visible_indices = candidate_order_}};
+  return {
+   .dataset = {.image_count = 3U, .image_width = 64U, .image_height = 64U, .class_names = class_names},
+   .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()), .visible_indices = candidate_order_}
+  };
  }
  ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, std::uint64_t seed, std::size_t, std::stop_token) override {
   if (work_probe_) work_probe_->prepares.fetch_add(1U, std::memory_order_release);
   if (filter.minimum_instances == 7U) throw std::bad_alloc{};
   if (filter.minimum_instances == 8U) candidate_render_failure_ = true;
   if (candidate_order_.empty()) candidate_order_ = order_;
-  return {.filter = filter,
-   .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()), .shuffle_seed = seed, .visible_indices = candidate_order_},
-   .generation = ++candidate_generation_};
+  return {
+   .filter = filter, .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()), .shuffle_seed = seed, .visible_indices = candidate_order_}, .generation = ++candidate_generation_
+  };
  }
  void Commit(ExploreOrderCandidate) noexcept override {
   order_ = std::move(candidate_order_);
@@ -592,8 +594,10 @@ public:
  VisualExtent DetailExtent(const ExploreRenderPlan& plan) const override { return detail_extent_ ? detail_extent_->padded : ExploreAlgorithm::DetailExtent(plan); }
  VisualRegion DetailContent(const ExploreRenderPlan&) const override {
   if (!detail_extent_) return {};
-  return {(detail_extent_->padded.width - detail_extent_->original.width) / 2U, (detail_extent_->padded.height - detail_extent_->original.height) / 2U, detail_extent_->original.width,
-   detail_extent_->original.height};
+  return {
+   (detail_extent_->padded.width - detail_extent_->original.width) / 2U, (detail_extent_->padded.height - detail_extent_->original.height) / 2U, detail_extent_->original.width,
+   detail_extent_->original.height
+  };
  }
  std::optional<std::uint32_t> Adjacent(std::uint32_t selected, std::int64_t offset) const override { return static_cast<std::uint32_t>((static_cast<std::int64_t>(selected) + offset % 3 + 3) % 3); }
  void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc, const mmltk::frameworks::gpu::ImagePlaneView clean,
@@ -637,9 +641,8 @@ class OpenedExplore final {
 public:
  OpenedExplore(std::shared_ptr<FakeImageBackend> backend, const VisualExtent extent)
      : explore_(settings_.system(), kDevice, 2U,
-        RuntimeFactory(
-         0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); },
-         3U),
+        RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+         [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }, 3U),
         [this](ExploreSystem::event_type) { events_.Advance(); }) {
   static_cast<void>(explore_.Open({.viewport = {.extent = extent, .columns = extent.width / extent.height}, .compiled_source = "/test"}));
   REQUIRE(events_.Wait([this] { return explore_.snapshot().ready; }));
@@ -663,14 +666,10 @@ public:
      : ExploreScenario(settings, 2U, RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, model ? std::move(model) : DefaultModel(), 3U),
         std::move(observer), diagnostics) {}
  ExploreScenario(LoadedSettings& settings, const std::size_t nproc, VisualRuntimeFactory runtime, Observer observer = {}, VisualDiagnosticSink diagnostics = {})
-     : observer_(std::move(observer)),
-       explore_(
-        settings.system(), kDevice, nproc, std::move(runtime),
-        [this](ExploreSystem::event_type event) {
-         if (observer_) observer_(std::move(event));
-         events_.Advance();
-        },
-        diagnostics) {}
+     : observer_(std::move(observer)), explore_(settings.system(), kDevice, nproc, std::move(runtime), [this](ExploreSystem::event_type event) {
+        if (observer_) observer_(std::move(event));
+        events_.Advance();
+       }, diagnostics) {}
  [[nodiscard]] ExploreSystem& system() noexcept { return explore_; }
  void OpenAndWait(const ExploreViewport viewport, const std::string_view compiled_source = "/test") {
   const auto admitted = explore_.Open({.viewport = viewport, .compiled_source = std::string{compiled_source}});

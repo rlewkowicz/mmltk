@@ -180,18 +180,15 @@ SelectiveTensorRegion::Tensors SelectiveTensorRegion::invoke(bool training, cons
   for (const auto& input : inputs) arguments.emplace_back(input);
   const auto recording = [&] {
    RecordingAutocastCache cache;
-   return torch::jit::tracer::trace(
-    std::move(arguments),
-    [&](torch::jit::Stack values) {
-     Tensors tensors;
-     for (const auto& value : values) tensors.push_back(value.toTensor());
-     std::vector<c10::IValue> outputs;
-     for (auto& output : ordinary(tensors)) outputs.emplace_back(std::move(output));
-     values.clear();
-     values.emplace_back(c10::ivalue::Tuple::create(std::move(outputs)));
-     return values;
-    },
-    [](const torch::autograd::Variable&) { return ""; }, false, false, &candidate->module);
+   return torch::jit::tracer::trace(std::move(arguments), [&](torch::jit::Stack values) {
+    Tensors tensors;
+    for (const auto& value : values) tensors.push_back(value.toTensor());
+    std::vector<c10::IValue> outputs;
+    for (auto& output : ordinary(tensors)) outputs.emplace_back(std::move(output));
+    values.clear();
+    values.emplace_back(c10::ivalue::Tuple::create(std::move(outputs)));
+    return values;
+   }, [](const torch::autograd::Variable&) { return ""; }, false, false, &candidate->module);
   }();
   candidate->module.type()->addMethod(cu->create_function("forward", recording.first->graph, true));
   auto output = unpack(recording.second.front());

@@ -245,9 +245,9 @@ TEST_CASE("evidence cursor preserves callback failure order and captured extent"
   JsonLineCursor cursor{path, 0U};
   CHECK_THROWS_AS(cursor.consume(audit,
                    [&](const nlohmann::json&) {
-                    order.push_back("observer:first");
-                    throw std::runtime_error("observer failure");
-                   }),
+   order.push_back("observer:first");
+   throw std::runtime_error("observer failure");
+  }),
    std::runtime_error);
   CHECK(order.size() == (audit_failure ? 1U : 2U));
   CHECK(order.front() == "audit:first");

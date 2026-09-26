@@ -57,7 +57,8 @@ ExecutionFacts derive_execution_facts(const TrainRequest& request, const std::ui
  const bool shared = request.lane_configuration.mode == TrainLaneMode::SharedGradients;
  const auto k = checked_training_product(request.grad_accum_steps, shared ? request.lanes : 1);
  const auto effective = checked_training_product(request.batch_size, k);
- return {.settings_revision = revision,
+ return {
+  .settings_revision = revision,
   .logical_models = shared ? 1U : static_cast<std::uint64_t>(request.lanes),
   .microbatches_per_attempt = k,
   .effective_batch_per_model = effective,
@@ -65,7 +66,8 @@ ExecutionFacts derive_execution_facts(const TrainRequest& request, const std::ui
   .configured_capacity = static_cast<std::uint64_t>(request.lanes),
   .limitation = shared                                                          ? ExecutionLimitation::None
                 : request.lane_configuration.mode == TrainLaneMode::Independent ? ExecutionLimitation::ExperimentalIndependentModels
-                                                                                : ExecutionLimitation::ExperimentalPeriodicAveraging};
+                                                                                : ExecutionLimitation::ExperimentalPeriodicAveraging
+ };
 }
 namespace {
 ExecutionFacts inference_facts(std::size_t batch, int lanes, std::uint64_t revision) {

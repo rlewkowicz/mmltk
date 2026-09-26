@@ -147,10 +147,12 @@ struct TrainViewState : TrainExecutionPaneState {
  mmltk::backend::models::rfdetr::TrainRequest request;
  ModelSelectionSource model_source = ModelSelectionSource::Canonical;
  ModelArtifactInputKind model_input = ModelArtifactInputKind::Weights;
- MMLTK_MAX_PATH_BYTES[[= mmltk::controller::contracts::reflection::FileDialog<"Select dataset source", "Directories", "*">{
-  .mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string dataset_source_dir = "./dataset";
- MMLTK_MAX_PATH_BYTES[[= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Directories", "*">{
-  .mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string compiled_dataset_dir = "./compiled";
+ MMLTK_MAX_PATH_BYTES[
+  [= mmltk::controller::contracts::reflection::FileDialog<"Select dataset source", "Directories", "*">{.mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string
+  dataset_source_dir = "./dataset";
+ MMLTK_MAX_PATH_BYTES[
+  [= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Directories", "*">{.mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string
+  compiled_dataset_dir = "./compiled";
  WorkflowOutputSelection output{};
  bool use_compiled_directory_defaults = true;
  bool overwrite_compiled_dataset = false;
@@ -195,8 +197,8 @@ struct PredictViewState {
 struct AnnotateViewState : WorkflowModelSelectionState {
  AnnotateViewState() { source.kind = SourceKind::ImageFolder; }
  SourceSelectionState source;
- MMLTK_MAX_PATH_BYTES[[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation weights", "Weights", "*.pt *.pth *.ckpt *.safetensors">{
-  .mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string weights_path;
+ MMLTK_MAX_PATH_BYTES[[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation weights", "Weights",
+  "*.pt *.pth *.ckpt *.safetensors">{.mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string weights_path;
  MMLTK_MAX_PATH_BYTES[
   [= mmltk::controller::contracts::reflection::FileDialog<"Select annotation ONNX", "ONNX files", "*.onnx">{.mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string onnx_path;
  MMLTK_MAX_PATH_BYTES[[= mmltk::controller::contracts::reflection::FileDialog<"Select annotation engine", "TensorRT files",
@@ -234,8 +236,9 @@ struct ExploreViewState : mmltk::backend::data::DataLoadingOptions {
   overlay_classes.fill(true);
  }
  ExploreDatasetSource dataset_source = ExploreDatasetSource::Train;
- MMLTK_MAX_PATH_BYTES[[= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Compiled datasets", "*.mmltk *.bin">{
-  .mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string custom_compiled_path;
+ MMLTK_MAX_PATH_BYTES[
+  [= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Compiled datasets", "*.mmltk *.bin">{.mode = mmltk::controller::contracts::FileDialogMode::OpenFile}]] std::string
+  custom_compiled_path;
  MMLTK_MINIMUM(int, 0) int device_id = 0;
  MMLTK_MINIMUM(int, 1) MMLTK_MAXIMUM(int, kMaxExploreGridColumns) int grid_width = 3;
  ExploreOrder order = ExploreOrder::Sequential;
@@ -292,14 +295,16 @@ template <ModelArtifactSelectionView State>
   else
    return s.model_resolution;
  }();
- ModelArtifactSelectionState artifact_state{.class_layout_path = {},
+ ModelArtifactSelectionState artifact_state{
+  .class_layout_path = {},
   .weights_path = path_text(source.weights_path),
   .onnx_path = {},
   .tensorrt_path = {},
   .preset_name = preset_name,
   .resolution = resolution,
   .source = s.model_source,
-  .input = s.model_input};
+  .input = s.model_input
+ };
  if constexpr (requires { source.class_layout_path; }) { artifact_state.class_layout_path = path_text(source.class_layout_path); }
  if constexpr (requires { source.onnx_path; }) { artifact_state.onnx_path = path_text(source.onnx_path); }
  if constexpr (requires { source.tensorrt_path; }) { artifact_state.tensorrt_path = path_text(source.tensorrt_path); }

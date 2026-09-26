@@ -274,7 +274,8 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
     throw std::runtime_error("invalid source bbox");
    if (diagnostics != nullptr && has_mask && source_bounds.has_foreground && record.contains("bbox_xyxy")) {
     const std::array<double, 4> mask_box{
-     static_cast<double>(source_bounds.min_x), static_cast<double>(source_bounds.min_y), static_cast<double>(source_bounds.max_x), static_cast<double>(source_bounds.max_y)};
+     static_cast<double>(source_bounds.min_x), static_cast<double>(source_bounds.min_y), static_cast<double>(source_bounds.max_x), static_cast<double>(source_bounds.max_y)
+    };
     if (source_box != mask_box) {
      CompileDiagnostic diagnostic;
      diagnostic.kind = CompileDiagnosticKind::kSourceBoundingBoxMismatch;

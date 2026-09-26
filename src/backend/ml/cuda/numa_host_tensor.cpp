@@ -31,13 +31,10 @@ at::Tensor NumaHostTensor::view(at::IntArrayRef shape, at::ScalarType dtype) {
  } else {
   storage_->ensure_bytes(std::max<std::size_t>(bytes, 1));
  }
- return at::from_blob(
-  storage_->data(), shape,
-  [context = context_custody_, storage = storage_](void*) mutable {
-   storage.reset();
-   context.reset();
-  },
-  at::TensorOptions().dtype(dtype).device(at::kCPU));
+ return at::from_blob(storage_->data(), shape, [context = context_custody_, storage = storage_](void*) mutable {
+  storage.reset();
+  context.reset();
+ }, at::TensorOptions().dtype(dtype).device(at::kCPU));
 }
 std::size_t NumaHostTensor::capacity_bytes() const noexcept { return storage_->capacity_bytes(); }
 CUresult NumaHostTensor::ReleaseSettled() noexcept { return storage_.use_count() == 1 ? storage_->ReleaseSettled() : CUDA_ERROR_NOT_READY; }

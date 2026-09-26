@@ -180,65 +180,61 @@ const char* annotation_shape_type_name(const AnnotationShapeType shape_type) {
 }
 const char* annotation_object_shape_label(const AnnotationObject& object) { return annotation_shape_type_name(annotation_shape_type(object.shape)); }
 std::optional<AnnotationBox> annotation_object_bbox(const AnnotationObject& object) {
- return std::visit(
-  [](const auto& shape) -> std::optional<AnnotationBox> {
-   using T = std::decay_t<decltype(shape)>;
-   if constexpr (std::is_same_v<T, AnnotationBoxShape> || std::is_same_v<T, AnnotationMaskShape>) {
-    return shape.box;
-   } else if constexpr (std::is_same_v<T, AnnotationPointShape>) {
-    return AnnotationBox{
-     static_cast<int>(shape.point.x),
-     static_cast<int>(shape.point.y),
-     static_cast<int>(shape.point.x) + 1,
-     static_cast<int>(shape.point.y) + 1,
-    };
-   } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
-    std::vector<AnnotationPoint> points;
-    points.reserve(shape.knots.size());
-    for (const AnnotationSplineKnot& knot : shape.knots) {
-     points.push_back(knot.position);
-     if (knot.in_handle.enabled) { points.push_back(knot.in_handle.position); }
-     if (knot.out_handle.enabled) { points.push_back(knot.out_handle.position); }
-    }
-    return bbox_from_points(points);
-   } else {
-    std::vector<AnnotationPoint> points;
-    points.reserve(shape.nodes.size());
-    for (const AnnotationSkeletonNode& node : shape.nodes) {
-     if (node.visible) { points.push_back(node.point); }
-    }
-    return bbox_from_points(points);
+ return std::visit([](const auto& shape) -> std::optional<AnnotationBox> {
+  using T = std::decay_t<decltype(shape)>;
+  if constexpr (std::is_same_v<T, AnnotationBoxShape> || std::is_same_v<T, AnnotationMaskShape>) {
+   return shape.box;
+  } else if constexpr (std::is_same_v<T, AnnotationPointShape>) {
+   return AnnotationBox{
+    static_cast<int>(shape.point.x),
+    static_cast<int>(shape.point.y),
+    static_cast<int>(shape.point.x) + 1,
+    static_cast<int>(shape.point.y) + 1,
+   };
+  } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
+   std::vector<AnnotationPoint> points;
+   points.reserve(shape.knots.size());
+   for (const AnnotationSplineKnot& knot : shape.knots) {
+    points.push_back(knot.position);
+    if (knot.in_handle.enabled) { points.push_back(knot.in_handle.position); }
+    if (knot.out_handle.enabled) { points.push_back(knot.out_handle.position); }
    }
-  },
-  object.shape);
+   return bbox_from_points(points);
+  } else {
+   std::vector<AnnotationPoint> points;
+   points.reserve(shape.nodes.size());
+   for (const AnnotationSkeletonNode& node : shape.nodes) {
+    if (node.visible) { points.push_back(node.point); }
+   }
+   return bbox_from_points(points);
+  }
+ }, object.shape);
 }
 std::optional<AnnotationBox> annotation_object_display_box(const AnnotationObject& object) { return annotation_object_bbox(object); }
 std::vector<AnnotationPoint> annotation_object_points(const AnnotationObject& object) {
- return std::visit(
-  [](const auto& shape) {
-   using T = std::decay_t<decltype(shape)>;
-   std::vector<AnnotationPoint> points;
-   [[maybe_unused]] const auto push_corner = [&points](const int x, const int y) { points.push_back(AnnotationPoint{static_cast<float>(x), static_cast<float>(y)}); };
-   if constexpr (std::is_same_v<T, AnnotationBoxShape>) {
-    push_corner(shape.box.x1, shape.box.y1);
-    push_corner(shape.box.x2, shape.box.y1);
-    push_corner(shape.box.x2, shape.box.y2);
-    push_corner(shape.box.x1, shape.box.y2);
-   } else if constexpr (std::is_same_v<T, AnnotationMaskShape>) {
-    push_corner(shape.box.x1, shape.box.y1);
-    push_corner(shape.box.x2, shape.box.y2);
-   } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
-    points.reserve(shape.knots.size());
-    for (const AnnotationSplineKnot& knot : shape.knots) { points.push_back(knot.position); }
-   } else if constexpr (std::is_same_v<T, AnnotationPointShape>) {
-    points.push_back(shape.point);
-   } else {
-    points.reserve(shape.nodes.size());
-    for (const AnnotationSkeletonNode& node : shape.nodes) { points.push_back(node.point); }
-   }
-   return points;
-  },
-  object.shape);
+ return std::visit([](const auto& shape) {
+  using T = std::decay_t<decltype(shape)>;
+  std::vector<AnnotationPoint> points;
+  [[maybe_unused]] const auto push_corner = [&points](const int x, const int y) { points.push_back(AnnotationPoint{static_cast<float>(x), static_cast<float>(y)}); };
+  if constexpr (std::is_same_v<T, AnnotationBoxShape>) {
+   push_corner(shape.box.x1, shape.box.y1);
+   push_corner(shape.box.x2, shape.box.y1);
+   push_corner(shape.box.x2, shape.box.y2);
+   push_corner(shape.box.x1, shape.box.y2);
+  } else if constexpr (std::is_same_v<T, AnnotationMaskShape>) {
+   push_corner(shape.box.x1, shape.box.y1);
+   push_corner(shape.box.x2, shape.box.y2);
+  } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
+   points.reserve(shape.knots.size());
+   for (const AnnotationSplineKnot& knot : shape.knots) { points.push_back(knot.position); }
+  } else if constexpr (std::is_same_v<T, AnnotationPointShape>) {
+   points.push_back(shape.point);
+  } else {
+   points.reserve(shape.nodes.size());
+   for (const AnnotationSkeletonNode& node : shape.nodes) { points.push_back(node.point); }
+  }
+  return points;
+ }, object.shape);
 }
 const AnnotationMaskShape* annotation_object_mask_shape(const AnnotationObject& object) { return std::get_if<AnnotationMaskShape>(&object.shape); }
 AnnotationMaskShape* annotation_object_mask_shape(AnnotationObject* object) {
@@ -338,35 +334,33 @@ bool resize_annotation_object_to_box(AnnotationObject* object, const AnnotationB
  if (!box_has_area(target_box)) { return false; }
  const std::optional<AnnotationBox> source_box = annotation_object_bbox(*object);
  if (source_box.has_value() && *source_box == target_box) { return false; }
- std::visit(
-  [&](auto& shape) {
-   using T = std::decay_t<decltype(shape)>;
-   if constexpr (std::is_same_v<T, AnnotationBoxShape>) {
-    shape.box = target_box;
-   } else if constexpr (std::is_same_v<T, AnnotationMaskShape>) {
-    if (!materialize_annotation_mask(&shape)) return;
-    const AnnotationMaskRegion next_region = mask_region_from_box(target_box);
-    shape.mask = resize_mask_nearest(shape.mask, shape.region.width, shape.region.height, next_region.width, next_region.height);
-    shape.region = next_region;
-    shape.box = target_box;
-   } else if constexpr (std::is_same_v<T, AnnotationPointShape>) {
-    shape.point = AnnotationPoint{
-     clamp_capture_axis(static_cast<float>(target_box.x1 + target_box.x2 - 1) * 0.5f, capture_width),
-     clamp_capture_axis(static_cast<float>(target_box.y1 + target_box.y2 - 1) * 0.5f, capture_height),
-    };
-   } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
-    if (!source_box.has_value()) { return; }
-    for (AnnotationSplineKnot& knot : shape.knots) {
-     scale_point_to_box(&knot.position, *source_box, target_box, capture_width, capture_height);
-     if (knot.in_handle.enabled) { scale_point_to_box(&knot.in_handle.position, *source_box, target_box, capture_width, capture_height); }
-     if (knot.out_handle.enabled) { scale_point_to_box(&knot.out_handle.position, *source_box, target_box, capture_width, capture_height); }
-    }
-   } else {
-    if (!source_box.has_value()) { return; }
-    for (AnnotationSkeletonNode& node : shape.nodes) { scale_point_to_box(&node.point, *source_box, target_box, capture_width, capture_height); }
+ std::visit([&](auto& shape) {
+  using T = std::decay_t<decltype(shape)>;
+  if constexpr (std::is_same_v<T, AnnotationBoxShape>) {
+   shape.box = target_box;
+  } else if constexpr (std::is_same_v<T, AnnotationMaskShape>) {
+   if (!materialize_annotation_mask(&shape)) return;
+   const AnnotationMaskRegion next_region = mask_region_from_box(target_box);
+   shape.mask = resize_mask_nearest(shape.mask, shape.region.width, shape.region.height, next_region.width, next_region.height);
+   shape.region = next_region;
+   shape.box = target_box;
+  } else if constexpr (std::is_same_v<T, AnnotationPointShape>) {
+   shape.point = AnnotationPoint{
+    clamp_capture_axis(static_cast<float>(target_box.x1 + target_box.x2 - 1) * 0.5f, capture_width),
+    clamp_capture_axis(static_cast<float>(target_box.y1 + target_box.y2 - 1) * 0.5f, capture_height),
+   };
+  } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
+   if (!source_box.has_value()) { return; }
+   for (AnnotationSplineKnot& knot : shape.knots) {
+    scale_point_to_box(&knot.position, *source_box, target_box, capture_width, capture_height);
+    if (knot.in_handle.enabled) { scale_point_to_box(&knot.in_handle.position, *source_box, target_box, capture_width, capture_height); }
+    if (knot.out_handle.enabled) { scale_point_to_box(&knot.out_handle.position, *source_box, target_box, capture_width, capture_height); }
    }
-  },
-  object->shape);
+  } else {
+   if (!source_box.has_value()) { return; }
+   for (AnnotationSkeletonNode& node : shape.nodes) { scale_point_to_box(&node.point, *source_box, target_box, capture_width, capture_height); }
+  }
+ }, object->shape);
  if (!source_box.has_value()) {
   return std::holds_alternative<AnnotationBoxShape>(object->shape) || std::holds_alternative<AnnotationMaskShape>(object->shape) || std::holds_alternative<AnnotationPointShape>(object->shape);
  }

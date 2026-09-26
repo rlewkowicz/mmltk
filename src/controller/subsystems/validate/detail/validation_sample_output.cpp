@@ -44,11 +44,13 @@ public:
  void Draw(const std::shared_ptr<const PredictionPreviewFrame>& raw, VisualExtent extent, std::uint32_t index) {
   Flush();
   if (!runtime_) {
-   runtime_ = std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{.device = context_->device(),
+   runtime_ = std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
+    .device = context_->device(),
     .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
     .numa_node = context_->execution()->placement.numa_node,
     .execution = *context_->execution(),
-    .adopted_context = *context_});
+    .adopted_context = *context_
+   });
   }
   runtime_->BindContext();
   if (!captions_) captions_ = std::make_unique<raster::CaptionRaster>(*context_);
@@ -86,9 +88,9 @@ public:
    {overlays.prediction_layer && overlays.prediction_boxes, overlays.prediction_layer && overlays.prediction_masks, overlays.ground_truth_layer && overlays.ground_truth_boxes,
     overlays.ground_truth_layer && overlays.ground_truth_masks, true, false, options_.display.confidence_threshold},
    nullptr, [&](auto clean, auto semantic, auto stream) {
-    raster::CaptionRaster::Composite(clean, semantic, stream);
-    captions_->Draw(clean, labels_, stream);
-   });
+   raster::CaptionRaster::Composite(clean, semantic, stream);
+   captions_->Draw(clean, labels_, stream);
+  });
   static_cast<void>(runtime_->CommitOutput(std::move(candidate)));
   writer_->Write(runtime_->Borrow(), directory_ / ("sample-" + std::to_string(index) + ".png"));
  }

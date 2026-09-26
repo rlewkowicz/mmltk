@@ -109,14 +109,11 @@ struct BackwardGate {
   // Queue an actual CUDA completion event behind a held host callback, only
   // after the early backward branch has run. The late autograd derivative
   // cannot proceed until the test releases this device event.
-  const auto status = cudaLaunchHostFunc(
-   stream.stream(),
-   [](void* context) {
-    auto& gate = *static_cast<BackwardGate*>(context);
-    std::unique_lock lock(gate.mutex);
-    gate.changed.wait(lock, [&] { return gate.released; });
-   },
-   this);
+  const auto status = cudaLaunchHostFunc(stream.stream(), [](void* context) {
+   auto& gate = *static_cast<BackwardGate*>(context);
+   std::unique_lock lock(gate.mutex);
+   gate.changed.wait(lock, [&] { return gate.released; });
+  }, this);
   require(status == cudaSuccess, "could not hold late backward CUDA event");
   event.record(stream);
   {
@@ -926,7 +923,8 @@ void exercise_collective_custody(int device) {
   broadcast_training_tensors(group, ema, 64);
   require(facts->broadcasts == 10, "EMA initialization failed to coalesce its parameter inventory");
   std::vector<torch::Tensor> mixed{
-   torch::arange(6, options).reshape({2, 3}).transpose(0, 1), torch::ones({2}, options), torch::full({2}, .25, options.dtype(torch::kFloat64)), torch::full({2}, 7, options.dtype(torch::kInt64))};
+   torch::arange(6, options).reshape({2, 3}).transpose(0, 1), torch::ones({2}, options), torch::full({2}, .25, options.dtype(torch::kFloat64)), torch::full({2}, 7, options.dtype(torch::kInt64))
+  };
   const auto before = mixed.front().clone();
   broadcast_training_tensors(group, mixed, 64);
   require(facts->broadcasts == 13 && torch::equal(mixed.front(), before) && mixed.front().stride(0) == 1 && mixed.back().eq(7).all().item<bool>(),

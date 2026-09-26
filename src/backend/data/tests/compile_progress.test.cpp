@@ -244,11 +244,10 @@ void test_invalid_annotations_fail_loud() {
    20,
   },
   [](const fs::path& annotation_path) {
-   std::ofstream file(annotation_path, std::ios::trunc);
-   REQUIRE(file.is_open());
-   file << "{invalid json}\n";
-  },
-  "invalid JSON annotation record");
+  std::ofstream file(annotation_path, std::ios::trunc);
+  REQUIRE(file.is_open());
+  file << "{invalid json}\n";
+ }, "invalid JSON annotation record");
  expect_compile_failure(
   FixtureSpec{
    unknown_class.path().string(),
@@ -258,12 +257,11 @@ void test_invalid_annotations_fail_loud() {
    20,
   },
   [](const fs::path& annotation_path) {
-   std::ofstream file(annotation_path, std::ios::trunc);
-   REQUIRE(file.is_open());
-   file << R"({"class":"unknown","bbox_xyxy":[10,10,20,20],"mask_rle_encoding":"row_major_start_length","mask_rle":"660:10","image_size_wh":[65,65]})"
-        << "\n";
-  },
-  "is not declared in categories.json");
+  std::ofstream file(annotation_path, std::ios::trunc);
+  REQUIRE(file.is_open());
+  file << R"({"class":"unknown","bbox_xyxy":[10,10,20,20],"mask_rle_encoding":"row_major_start_length","mask_rle":"660:10","image_size_wh":[65,65]})"
+       << "\n";
+ }, "is not declared in categories.json");
 }
 void test_checked_progress_estimates() {
  CHECK(estimate_progress(0U, 100U, 10U) == ProgressEstimate{});
@@ -322,8 +320,10 @@ void test_compile_progress_reports_monotonic_updates() {
  REQUIRE(plan.splits.front().image_count == static_cast<uint32_t>(fixture.num_images));
  REQUIRE(plan.total_steps() == expected_total);
  g_compile_elapsed_seconds.store(0U, std::memory_order_relaxed);
- CompileTelemetry telemetry{plan.splits[0].image_count,
-  {.context = &state, .report = [](void* context, const CompileProgress& progress) noexcept { static_cast<ProgressRecorder*>(context)->Record(progress); }}, &compile_test_now};
+ CompileTelemetry telemetry{
+  plan.splits[0].image_count, {.context = &state, .report = [](void* context, const CompileProgress& progress) noexcept { static_cast<ProgressRecorder*>(context)->Record(progress); }},
+  &compile_test_now
+ };
  DatasetCompiler::compile(plan, 0U, &telemetry);
  REQUIRE_FALSE(state.overflow);
  REQUIRE_FALSE(state.overlap.load(std::memory_order_relaxed));
@@ -427,8 +427,8 @@ void test_compile_event_cancellation(bool publishing) {
  const DatasetCompilePlan plan = prepare_cancellation_compile(fixture);
  if (publishing) {
   CompileTelemetry telemetry{plan.splits.front().image_count, {.context = &source, .report = [](void* context, const CompileProgress& progress) noexcept {
-                                                                if (progress.phase == DatasetCompilePhase::Publishing) static_cast<void>(static_cast<CancellationSource*>(context)->RequestCancel());
-                                                               }}};
+   if (progress.phase == DatasetCompilePhase::Publishing) static_cast<void>(static_cast<CancellationSource*>(context)->RequestCancel());
+  }}};
   REQUIRE_THROWS_AS(DatasetCompiler::compile(plan, 0U, &telemetry, mmltk::common::concurrency::CancellationObservation::Borrow(token)), std::runtime_error);
   REQUIRE_FALSE(std::filesystem::exists(std::filesystem::path(plan.config.output_dir) / "train.bin"));
  } else {

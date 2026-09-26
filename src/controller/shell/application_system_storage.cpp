@@ -29,16 +29,13 @@ SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(
 std::unique_ptr<ExploreSystem> make_shell_explore_system(SettingsSystem& settings, const ApplicationSystemConfiguration& configuration, const mmltk::frameworks::gpu::DeviceExecution& execution,
  SystemEventSink<ExploreSystem::event_type> events, const VisualDiagnosticSink diagnostics) {
  const auto nproc = normalize_explore_parallelism(configuration.explore_nproc, execution.placement);
- return std::make_unique<ExploreSystem>(
-  settings, configuration.base_visual, nproc,
-  [&settings, visual = configuration.base_visual, native = configuration.explore, nproc](auto revisions) mutable {
-   const auto selected = settings.explore_settings_candidate();
-   visual.device = selected.device_id;
-   visual.numa_node = selected.loading.numa_node;
-   native.loading = selected.loading;
-   return make_native_explore_runtime_factory(visual, nproc, native)(std::move(revisions));
-  },
-  std::move(events), diagnostics);
+ return std::make_unique<ExploreSystem>(settings, configuration.base_visual, nproc, [&settings, visual = configuration.base_visual, native = configuration.explore, nproc](auto revisions) mutable {
+  const auto selected = settings.explore_settings_candidate();
+  visual.device = selected.device_id;
+  visual.numa_node = selected.loading.numa_node;
+  native.loading = selected.loading;
+  return make_native_explore_runtime_factory(visual, nproc, native)(std::move(revisions));
+ }, std::move(events), diagnostics);
 }
 ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguration configuration, EventSink events, const VisualDiagnosticSink diagnostics, ContinuitySink continuity)
     : events_(std::move(events)), continuity_(std::move(continuity)) {
@@ -46,19 +43,16 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
  const auto source_changed = [this](const PresentationSourceIdentity source) {
   if (auto* presentation = presentation_notifications_.load(std::memory_order_acquire)) presentation->SourceChanged(source);
  };
- settings_ = std::make_unique<SettingsSystem>(
-  [this, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::settings>(events_, continuity_)](SettingsSystem::event_type event) noexcept {
-   publisher(event);
-   if (explore_) explore_->ExecutionSettingsChanged();
-   if (validation_) validation_->DisplaySettingsChanged();
-  },
-  mmltk::frameworks::gpu::discover_cuda_devices());
+ settings_ = std::make_unique<SettingsSystem>([this, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::settings>(events_, continuity_)](SettingsSystem::event_type event) noexcept {
+  publisher(event);
+  if (explore_) explore_->ExecutionSettingsChanged();
+  if (validation_) validation_->DisplaySettingsChanged();
+ }, mmltk::frameworks::gpu::discover_cuda_devices());
  const auto initial_settings = settings_->Load(configuration.settings_location, configuration.h2d_dataloader);
  if (!initial_settings.applied()) throw std::runtime_error(initial_settings.detail.empty() ? "initial settings load was not applied" : initial_settings.detail);
  file_dialog_ = std::make_unique<FileDialogSystem>([client = configuration.file_dialog, settings = settings_.get()] { return std::make_unique<NativeFileDialogRuntime>(client, *settings); },
   browser::ApplicationEventPublisher<&ApplicationSystems::file_dialog>(events_, continuity_));
- dataset_ = std::make_unique<DatasetSystem>(
-  *settings_, [diagnostics = configuration.runtime_diagnostics] { return std::make_unique<ArtifactDatasetRuntime>(services::ArtifactStore{}, diagnostics); },
+ dataset_ = std::make_unique<DatasetSystem>(*settings_, [diagnostics = configuration.runtime_diagnostics] { return std::make_unique<ArtifactDatasetRuntime>(services::ArtifactStore{}, diagnostics); },
   browser::ApplicationEventPublisher<&ApplicationSystems::dataset>(events_, continuity_));
  model_ = std::make_unique<ModelSystem>(*settings_, [] { return std::make_unique<ArtifactModelRuntime>(); }, browser::ApplicationEventPublisher<&ApplicationSystems::model>(events_, continuity_));
  const DirectComputeConfiguration compute{
@@ -72,25 +66,22 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
   .storage_worker = true,
  };
  training_ = std::make_unique<TrainingSystem>(
-  *settings_, *dataset_, *model_, inspection_policy,
-  [provider = configuration.provider, executable = std::move(configuration.training_executable), diagnostics = configuration.runtime_diagnostics] {
-   return std::make_unique<NativeTrainingRuntime>(NativeTrainingConfiguration{
-    .provider = provider,
-    .training_executable = executable,
-    .diagnostics = diagnostics,
-   });
-  },
-  browser::ApplicationEventPublisher<&ApplicationSystems::training>(events_, continuity_), configuration.runtime_diagnostics);
- validation_ = std::make_unique<ValidationSystem>(
-  *settings_, *dataset_, *model_, [diagnostics = configuration.runtime_diagnostics](DirectComputeConfiguration selected) { return std::make_unique<CudaValidationRuntime>(selected, diagnostics); },
-  browser::ApplicationEventPublisher<&ApplicationSystems::validation>(events_, continuity_, source_changed), resolve_compute_configuration, configuration.base_visual);
- export_ = std::make_unique<ExportSystem>(
-  *settings_, *dataset_, *model_, [diagnostics = configuration.runtime_diagnostics](DirectComputeConfiguration selected) { return std::make_unique<CudaExportRuntime>(selected, diagnostics); },
-  browser::ApplicationEventPublisher<&ApplicationSystems::export_system>(events_, continuity_), resolve_compute_configuration);
- predict_ = std::make_unique<PredictSystem>(
-  *settings_, *dataset_, *model_, configuration.base_visual,
-  [diagnostics = configuration.runtime_diagnostics](DirectComputeConfiguration selected) { return std::make_unique<CudaPredictRuntime>(selected, diagnostics); },
-  browser::ApplicationEventPublisher<&ApplicationSystems::predict>(events_, continuity_, source_changed));
+  *settings_, *dataset_, *model_, inspection_policy, [provider = configuration.provider, executable = std::move(configuration.training_executable), diagnostics = configuration.runtime_diagnostics] {
+  return std::make_unique<NativeTrainingRuntime>(NativeTrainingConfiguration{
+   .provider = provider,
+   .training_executable = executable,
+   .diagnostics = diagnostics,
+  });
+ }, browser::ApplicationEventPublisher<&ApplicationSystems::training>(events_, continuity_), configuration.runtime_diagnostics);
+ validation_ = std::make_unique<ValidationSystem>(*settings_, *dataset_, *model_, [diagnostics = configuration.runtime_diagnostics](DirectComputeConfiguration selected) {
+  return std::make_unique<CudaValidationRuntime>(selected, diagnostics);
+ }, browser::ApplicationEventPublisher<&ApplicationSystems::validation>(events_, continuity_, source_changed), resolve_compute_configuration, configuration.base_visual);
+ export_ = std::make_unique<ExportSystem>(*settings_, *dataset_, *model_, [diagnostics = configuration.runtime_diagnostics](DirectComputeConfiguration selected) {
+  return std::make_unique<CudaExportRuntime>(selected, diagnostics);
+ }, browser::ApplicationEventPublisher<&ApplicationSystems::export_system>(events_, continuity_), resolve_compute_configuration);
+ predict_ = std::make_unique<PredictSystem>(*settings_, *dataset_, *model_, configuration.base_visual, [diagnostics = configuration.runtime_diagnostics](DirectComputeConfiguration selected) {
+  return std::make_unique<CudaPredictRuntime>(selected, diagnostics);
+ }, browser::ApplicationEventPublisher<&ApplicationSystems::predict>(events_, continuity_, source_changed));
  mmltk::backend::imaging::upscale::ImageUpscalerExecutionCheckpoint upscale_checkpoint;
  if (diagnostics.valid()) {
   upscale_checkpoint = [diagnostics, device = configuration.output_visual.device](const auto stage) {

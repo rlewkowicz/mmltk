@@ -384,18 +384,20 @@ void test_ui_settings_round_trip() {
  const nlohmann::json saved = snapshot_gui_settings(snapshot);
  REQUIRE((saved.at("schema_version") == kGuiSettingsSchemaVersion));
  CHECK(saved.at("schema_version") == 9);
- const nlohmann::json expected_source{{"kind", 1}, {"compiled_path", "/tmp/source.bin"}, {"single_image_path", "/tmp/input.png"}, {"image_directory", "/tmp/images"},
-  {"video_file_path", "/tmp/movie.mp4"}, {"recursive", true}, {"device_index", 3}, {"capture_width", 640}, {"capture_height", 480}, {"capture_fps", 29}, {"v4l2_buffer_count", 7}, {"crop_x", 11},
-  {"crop_y", 13}, {"crop_width", 101}, {"crop_height", 103}};
+ const nlohmann::json expected_source{
+  {"kind", 1}, {"compiled_path", "/tmp/source.bin"}, {"single_image_path", "/tmp/input.png"}, {"image_directory", "/tmp/images"}, {"video_file_path", "/tmp/movie.mp4"}, {"recursive", true},
+  {"device_index", 3}, {"capture_width", 640}, {"capture_height", 480}, {"capture_fps", 29}, {"v4l2_buffer_count", 7}, {"crop_x", 11}, {"crop_y", 13}, {"crop_width", 101}, {"crop_height", 103}
+ };
  CHECK(saved.at("workflows").at("predict").at("source") == expected_source);
  const auto& saved_training = saved.at("workflows").at("train").at("training");
  CHECK(saved_training.at("execution_target") == 1);
  CHECK(saved_training.at("remote_family_enabled") == nlohmann::json::array({true, false, true, false, false}));
  CHECK(saved_training.at("remote_container_image") == "test-training-image");
  CHECK(saved_training.at("remote_launch_template") == "/tmp/launch-template");
- const nlohmann::json expected_ui{{"dark_mode", true}, {"show_workspace_performance", true}, {"ui_scale", 1.35f}, {"font_size", 18.0f}, {"secondary_font_size", 15.0f}, {"mono_font_size", 14.0f},
-  {"text_input_font_size", 17.0f}, {"crop_edge_hit_half_width", 11.0f}, {"crop_corner_hit_size", 24.0f}, {"crop_handle_radius", 7.5f}, {"workspace_aspect_ratio", 3}, {"annotation_brush_radius", 27},
-  {"mask_cleanup_radius", 6}};
+ const nlohmann::json expected_ui{
+  {"dark_mode", true}, {"show_workspace_performance", true}, {"ui_scale", 1.35f}, {"font_size", 18.0f}, {"secondary_font_size", 15.0f}, {"mono_font_size", 14.0f}, {"text_input_font_size", 17.0f},
+  {"crop_edge_hit_half_width", 11.0f}, {"crop_corner_hit_size", 24.0f}, {"crop_handle_radius", 7.5f}, {"workspace_aspect_ratio", 3}, {"annotation_brush_radius", 27}, {"mask_cleanup_radius", 6}
+ };
  CHECK(saved.at("ui") == expected_ui);
  REQUIRE((saved.at("ui").at("workspace_aspect_ratio") == 3));
  REQUIRE((saved.at("ui").at("annotation_brush_radius") == 27));
@@ -583,8 +585,10 @@ void test_fresh_defaults_use_capture_only_annotate() {
 TEST_CASE("explicit compiled selections override inferred directories and keep test input optional", "[gui][settings]") {
  auto state = default_gui_settings_state();
  const std::array updates{
-  SettingsValueUpdate{.path = "workflows.train.request.train_compiled_path",
-   .value = *mmltk::frameworks::serialization::wire::FlatValue::text("/selected/compiled.mmltk", mmltk::frameworks::reflection::kMaximumPathBytes)},
+  SettingsValueUpdate{
+   .path = "workflows.train.request.train_compiled_path",
+   .value = *mmltk::frameworks::serialization::wire::FlatValue::text("/selected/compiled.mmltk", mmltk::frameworks::reflection::kMaximumPathBytes)
+  },
  };
  REQUIRE(apply_gui_settings_values(state, updates));
  CHECK_FALSE(state.workflows.train.use_compiled_directory_defaults);
@@ -933,35 +937,39 @@ void test_gui_json_persistence_enforces_reflected_field_policies() {
   PersistenceCase{"float endpoint", [](nlohmann::json& document) { document["ui"]["ui_scale"] = 1.75F; }, true, false},
   PersistenceCase{"float outside", [](nlohmann::json& document) { document["ui"]["ui_scale"] = 1.7501F; }, true, true},
   PersistenceCase{"nonfinite JSON representation", [](nlohmann::json& document) { document["ui"]["ui_scale"] = nullptr; }, false, false},
-  PersistenceCase{"path endpoint",
+  PersistenceCase{
+   "path endpoint",
    [](nlohmann::json& document) {
-    document["workflows"]["train"]["output"]["automatic"] = false;
-    document["workflows"]["train"]["output"]["directory"] = std::string(mmltk::frameworks::reflection::kMaximumPathBytes, 'x');
-   },
-   true, false},
-  PersistenceCase{"path outside",
+  document["workflows"]["train"]["output"]["automatic"] = false;
+  document["workflows"]["train"]["output"]["directory"] = std::string(mmltk::frameworks::reflection::kMaximumPathBytes, 'x');
+ }, true, false
+  },
+  PersistenceCase{
+   "path outside",
    [](nlohmann::json& document) {
-    document["workflows"]["train"]["output"]["automatic"] = false;
-    document["workflows"]["train"]["output"]["directory"] = std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1U, 'x');
-   },
-   false, false},
-  PersistenceCase{"container endpoint",
+  document["workflows"]["train"]["output"]["automatic"] = false;
+  document["workflows"]["train"]["output"]["directory"] = std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1U, 'x');
+ }, false, false
+  },
+  PersistenceCase{
+   "container endpoint",
    [](nlohmann::json& document) {
-    auto& ids = document["workflows"]["train"]["training"]["local_device_ids"];
-    ids = nlohmann::json::array();
-    for (std::size_t index = 0U; index < mmltk::backend::models::rfdetr::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
-   },
-   true, false},
-  PersistenceCase{"container outside",
+  auto& ids = document["workflows"]["train"]["training"]["local_device_ids"];
+  ids = nlohmann::json::array();
+  for (std::size_t index = 0U; index < mmltk::backend::models::rfdetr::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
+ }, true, false
+  },
+  PersistenceCase{
+   "container outside",
    [](nlohmann::json& document) {
-    auto& ids = document["workflows"]["train"]["training"]["local_device_ids"];
-    ids = nlohmann::json::array();
-    for (std::size_t index = 0U; index <= mmltk::backend::models::rfdetr::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
-   },
-   false, false},
-  PersistenceCase{"container element conversion overflow",
-   [](nlohmann::json& document) { document["workflows"]["train"]["training"]["local_device_ids"] = nlohmann::json::array({static_cast<std::uint64_t>(std::numeric_limits<int>::max()) + 1U}); }, false,
-   false},
+  auto& ids = document["workflows"]["train"]["training"]["local_device_ids"];
+  ids = nlohmann::json::array();
+  for (std::size_t index = 0U; index <= mmltk::backend::models::rfdetr::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
+ }, false, false
+  },
+  PersistenceCase{"container element conversion overflow", [](nlohmann::json& document) {
+  document["workflows"]["train"]["training"]["local_device_ids"] = nlohmann::json::array({static_cast<std::uint64_t>(std::numeric_limits<int>::max()) + 1U});
+ }, false, false},
  };
  mmltk::testsupport::ScopedTempDir persistence_root("mmltk-field-policy-persistence");
  std::size_t persistence_index = 0U;
@@ -1179,11 +1187,16 @@ void test_schema_v9_training_supervision_round_trip_defaults_and_atomic_rejectio
  missing["workflows"]["train"]["training"].erase("training_supervision");
  apply_gui_settings(missing, round_trip);
  CHECK(round_trip.workflows.train.request.training_supervision == mmltk::backend::models::rfdetr::TrainingSupervisionConfig{});
- for (const nlohmann::json& malformed : {nlohmann::json{"not-an-object"},
-       nlohmann::json{{"assignment", "match-free"}, {"match_free", {{"rho", 0.0}, {"correspondence_weight", 1.0}, {"query_weight", 1.0}}},
-        {"denoising", {{"enabled", false}, {"groups", 5}, {"label_noise_ratio", 0.2}, {"center_noise_scale", 0.4}, {"size_noise_scale", 0.4}}}},
-       nlohmann::json{{"assignment", "match-free"}, {"match_free", {{"rho", 0.5}, {"correspondence_weight", 0.0}, {"query_weight", 0.0}}},
-        {"denoising", {{"enabled", false}, {"groups", 5}, {"label_noise_ratio", 0.2}, {"center_noise_scale", 0.4}, {"size_noise_scale", 0.4}}}}}) {
+ for (const nlohmann::json& malformed :
+  {nlohmann::json{"not-an-object"},
+   nlohmann::json{
+    {"assignment", "match-free"}, {"match_free", {{"rho", 0.0}, {"correspondence_weight", 1.0}, {"query_weight", 1.0}}},
+    {"denoising", {{"enabled", false}, {"groups", 5}, {"label_noise_ratio", 0.2}, {"center_noise_scale", 0.4}, {"size_noise_scale", 0.4}}}
+   },
+   nlohmann::json{
+    {"assignment", "match-free"}, {"match_free", {{"rho", 0.5}, {"correspondence_weight", 0.0}, {"query_weight", 0.0}}},
+    {"denoising", {{"enabled", false}, {"groups", 5}, {"label_noise_ratio", 0.2}, {"center_noise_scale", 0.4}, {"size_noise_scale", 0.4}}}
+   }}) {
   nlohmann::json invalid = saved;
   invalid["workflows"]["train"]["training"]["training_supervision"] = malformed;
   const GuiSettingsState before = round_trip;
@@ -1334,8 +1347,10 @@ TEST_CASE("Explore labels and inherited loading preferences survive durable upda
  using Value = mmltk::frameworks::serialization::wire::FlatValue;
  for (const bool labels : {false, true}) {
   SettingsUpdateRequest edit;
-  edit.updates = {{.path = "workflows.explore.show_labels", .value = Value{labels}}, {.path = "workflows.explore.h2d_dataloader", .value = Value{false}},
-   {.path = "workflows.explore.numa_node", .value = Value{std::int64_t{2}}}};
+  edit.updates = {
+   {.path = "workflows.explore.show_labels", .value = Value{labels}}, {.path = "workflows.explore.h2d_dataloader", .value = Value{false}},
+   {.path = "workflows.explore.numa_node", .value = Value{std::int64_t{2}}}
+  };
   const auto changed = settings.Update(std::move(edit));
   CHECK(changed.settings_state.workflows.explore.show_labels == labels);
   std::ifstream file(path);
@@ -1469,8 +1484,9 @@ TEST_CASE("explicit output selections preserve independent policies and transact
   CHECK(output().automatic);
   CHECK(output().directory == "/selected/output");
   state = accepted;
-  for (const SettingsValueUpdate& invalid : {selected, SettingsValueUpdate{.path = prefix + "automatic", .value = Value{std::int64_t{1}}},
-        SettingsValueUpdate{.path = prefix + "unknown", .value = Value{true}}, SettingsValueUpdate{.path = "workflows.train.request.epochs", .value = Value{std::int64_t{-1}}}}) {
+  for (const SettingsValueUpdate& invalid :
+   {selected, SettingsValueUpdate{.path = prefix + "automatic", .value = Value{std::int64_t{1}}}, SettingsValueUpdate{.path = prefix + "unknown", .value = Value{true}},
+    SettingsValueUpdate{.path = "workflows.train.request.epochs", .value = Value{std::int64_t{-1}}}}) {
    const std::array edits{selected, invalid};
    CHECK_FALSE(apply_gui_settings_values(state, edits));
    CHECK(state == accepted);
@@ -1513,7 +1529,8 @@ TEST_CASE("benchmark selections persist as one canonical nested value and reject
    const auto validation_name = mmltk::frameworks::reflection::enum_name(validation);
    const std::array edits{
     SettingsValueUpdate{.path = "workflows.train.benchmark_selection.dataset", .value = *mmltk::frameworks::serialization::wire::FlatValue::text(dataset_name, dataset_name.size())},
-    SettingsValueUpdate{.path = "workflows.train.benchmark_selection.validation", .value = *mmltk::frameworks::serialization::wire::FlatValue::text(validation_name, validation_name.size())}};
+    SettingsValueUpdate{.path = "workflows.train.benchmark_selection.validation", .value = *mmltk::frameworks::serialization::wire::FlatValue::text(validation_name, validation_name.size())}
+   };
    REQUIRE(apply_gui_settings_values(state, edits));
    const std::array recovery_edit{SettingsValueUpdate{.path = "workflows.train.benchmark_selection.recover_dropped_masks", .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
    REQUIRE(apply_gui_settings_values(state, recovery_edit));
@@ -1650,15 +1667,19 @@ TEST_CASE("all workflow output selections persist current controls and independe
  CHECK(state.workflows.predict.output.automatic);
  CHECK(state.workflows.export_state.output.automatic);
  using Value = mmltk::frameworks::serialization::wire::FlatValue;
- const std::array directories{SettingsValueUpdate{.path = "workflows.train.output.directory", .value = *Value::text("train-runs", mmltk::frameworks::reflection::kMaximumPathBytes)},
+ const std::array directories{
+  SettingsValueUpdate{.path = "workflows.train.output.directory", .value = *Value::text("train-runs", mmltk::frameworks::reflection::kMaximumPathBytes)},
   SettingsValueUpdate{.path = "workflows.validate.output.directory", .value = *Value::text("../validation-runs", mmltk::frameworks::reflection::kMaximumPathBytes)},
   SettingsValueUpdate{.path = "workflows.predict.output.directory", .value = *Value::text("/prediction-runs", mmltk::frameworks::reflection::kMaximumPathBytes)},
-  SettingsValueUpdate{.path = "workflows.export_state.output.directory", .value = *Value::text("export-runs", mmltk::frameworks::reflection::kMaximumPathBytes)}};
+  SettingsValueUpdate{.path = "workflows.export_state.output.directory", .value = *Value::text("export-runs", mmltk::frameworks::reflection::kMaximumPathBytes)}
+ };
  REQUIRE(apply_gui_settings_values(state, directories));
  CHECK_FALSE(state.workflows.train.output.automatic);
  CHECK_FALSE(state.workflows.predict.output.automatic);
- const std::array policies{SettingsValueUpdate{.path = "workflows.train.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
-  SettingsValueUpdate{.path = "workflows.predict.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
+ const std::array policies{
+  SettingsValueUpdate{.path = "workflows.train.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
+  SettingsValueUpdate{.path = "workflows.predict.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}}
+ };
  REQUIRE(apply_gui_settings_values(state, policies));
  CHECK(state.workflows.train.output.directory == "train-runs");
  CHECK(state.workflows.predict.output.directory == "/prediction-runs");
@@ -1679,8 +1700,10 @@ TEST_CASE("all workflow output selections persist current controls and independe
  CHECK(restored == state);
  for (const std::string_view destination : {"workflows.train.request.output_dir", "workflows.validate.request.report_json_path", "workflows.predict.request.output_path"}) {
   CAPTURE(destination);
-  const std::array edits{SettingsValueUpdate{.path = "workflows.train.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
-   SettingsValueUpdate{.path = std::string(destination), .value = *mmltk::frameworks::serialization::wire::FlatValue::text("ignored-output", mmltk::frameworks::reflection::kMaximumPathBytes)}};
+  const std::array edits{
+   SettingsValueUpdate{.path = "workflows.train.output.automatic", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
+   SettingsValueUpdate{.path = std::string(destination), .value = *mmltk::frameworks::serialization::wire::FlatValue::text("ignored-output", mmltk::frameworks::reflection::kMaximumPathBytes)}
+  };
   CHECK_FALSE(apply_gui_settings_values(restored, edits));
   CHECK(restored == state);
  }
@@ -1697,8 +1720,10 @@ TEST_CASE("workflow GPU preferences persist independently of immutable CUDA inve
  REQUIRE(settings.Load(location).applied());
  SettingsUpdateRequest update;
  using Value = mmltk::frameworks::serialization::wire::FlatValue;
- update.updates = {{.path = "workflows.validate.request.device_id", .value = Value{std::int64_t{7}}}, {.path = "workflows.predict.request.device_id", .value = Value{std::int64_t{5}}},
-  {.path = "workflows.export_state.device_id", .value = Value{std::int64_t{3}}}};
+ update.updates = {
+  {.path = "workflows.validate.request.device_id", .value = Value{std::int64_t{7}}}, {.path = "workflows.predict.request.device_id", .value = Value{std::int64_t{5}}},
+  {.path = "workflows.export_state.device_id", .value = Value{std::int64_t{3}}}
+ };
  const auto changed = settings.Update(std::move(update));
  CHECK(changed.cuda_devices == devices);
  CHECK(changed.settings_state.workflows.validate.request.device_id == 7);

@@ -34,7 +34,8 @@ LiveAnalyzerWorker::LiveAnalyzerWorker(
     annotation.value_capacity = runtime::kMaximumAnalysisRegions;
     const std::size_t values = annotation.value_capacity;
     const std::size_t sizes[5] = {
-     values * 4U * sizeof(float), values * sizeof(std::int32_t), values * sizeof(float), values * 3U * sizeof(std::uint8_t), values * width * height * sizeof(std::uint8_t)};
+     values * 4U * sizeof(float), values * sizeof(std::int32_t), values * sizeof(float), values * 3U * sizeof(std::uint8_t), values * width * height * sizeof(std::uint8_t)
+    };
     for (std::size_t plane = 0; plane < 5U; ++plane) {
      void* allocation = nullptr;
      if (scope.Record(cudaMalloc(&allocation, sizes[plane])) != cudaSuccess) throw std::runtime_error("allocate Live annotation storage");
@@ -136,8 +137,9 @@ bool LiveAnalyzerWorker::process_latest() {
  runtime::AnalysisRequest request{
   .identity = {source.frame.sequence, source.frame.session},
   .captured_ns = source.captured_ns,
-  .source = {{source.pixels, source.pitch_bytes * source.height, {3U, {source.height, source.width, 3U}}, runtime::AnalysisElementType::Uint8}, source.pitch_bytes, source.width, source.height, 3U,
-   cuda_.device()},
+  .source =
+   {{source.pixels, source.pitch_bytes * source.height, {3U, {source.height, source.width, 3U}}, runtime::AnalysisElementType::Uint8}, source.pitch_bytes, source.width, source.height, 3U,
+    cuda_.device()},
   .source_ready = {cuda_.device(), reinterpret_cast<std::uintptr_t>(source.ready), reinterpret_cast<std::uintptr_t>(source.stream)},
   .regions = {&region, 1U},
   .annotations = {&annotation, 1U},

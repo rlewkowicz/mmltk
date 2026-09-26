@@ -76,75 +76,75 @@ struct AlignmentSample final {
    .stop = delivery.stop,
    .demand =
     [&](std::int64_t index) {
-     const bool selected = delivery.sample && is_sample(index);
-     return PredictionDemand{.native_pixels = selected, .encoded_masks = masks, .preview_masks = selected};
-    },
+  const bool selected = delivery.sample && is_sample(index);
+  return PredictionDemand{.native_pixels = selected, .encoded_masks = masks, .preview_masks = selected};
+ },
    .begin =
     [&](const PredictionRunResult& result) {
-     if (result.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground || !result.class_catalog)
-      throw std::invalid_argument("semantic evaluation requires a fully bound model class layout");
-     const auto mode = resolve_evaluation_metric_set(loader, delivery.mask_metrics && result.masks_available);
-     masks = mode == EvaluationMetricSet::BBoxAndMask;
-     if (!dataset || dataset->facts().metric_set != mode)
-      dataset.emplace(loader, mode);
-     else
-      dataset->clear_predictions();
-     if (request.limit_images != 0U) dataset->limit_images(request.limit_images);
-     evaluator_order = result.class_catalog->permutation_to(*dataset->class_catalog());
-     model_order.resize(evaluator_order.size());
-     for (std::size_t category = 0; category < evaluator_order.size(); ++category) model_order[evaluator_order[category]] = static_cast<std::uint32_t>(category);
-    },
+  if (result.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground || !result.class_catalog)
+   throw std::invalid_argument("semantic evaluation requires a fully bound model class layout");
+  const auto mode = resolve_evaluation_metric_set(loader, delivery.mask_metrics && result.masks_available);
+  masks = mode == EvaluationMetricSet::BBoxAndMask;
+  if (!dataset || dataset->facts().metric_set != mode)
+   dataset.emplace(loader, mode);
+  else
+   dataset->clear_predictions();
+  if (request.limit_images != 0U) dataset->limit_images(request.limit_images);
+  evaluator_order = result.class_catalog->permutation_to(*dataset->class_catalog());
+  model_order.resize(evaluator_order.size());
+  for (std::size_t category = 0; category < evaluator_order.size(); ++category) model_order[evaluator_order[category]] = static_cast<std::uint32_t>(category);
+ },
    .completed =
     [&](const PredictionRecord& record, PredictionPixels pixels, const runtime::AnalysisAnnotationStorage& annotations) {
-     scores.clear();
-     labels.clear();
-     boxes.clear();
-     scores.reserve(record.detections.size());
-     labels.reserve(record.detections.size());
-     boxes.reserve(record.detections.size() * 4U);
-     for (const auto& detection : record.detections) {
-      scores.push_back(detection.score);
-      if (detection.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground || detection.class_reference < 0 ||
-          static_cast<std::size_t>(detection.class_reference) >= evaluator_order.size())
-       throw std::invalid_argument("invalid semantic evaluator class reference");
-      labels.push_back(evaluator_order[detection.class_reference]);
-      boxes.insert(boxes.end(), detection.bbox_xyxy.begin(), detection.bbox_xyxy.end());
-     }
-     dataset->merge_matches(dataset->match_predictions(record.dataset_index,
-      {.image_id = static_cast<int>(record.image_id), .scores = scores.data(), .labels_zero_based = labels.data(), .boxes_xyxy = boxes.data(), .count = scores.size()}, std::nullopt, evaluation_cap,
-      masks ? std::span<const Prediction>{record.detections} : std::span<const Prediction>{}));
-     if (delivery.sample && is_sample(record.dataset_index)) {
-      ground_truth.clear();
-      const auto sample_index = static_cast<std::uint32_t>(record.dataset_index);
-      const auto& entry = loader.label_index()[sample_index];
-      for (std::size_t ordinal = 0; ordinal < entry.num_instances; ++ordinal) {
-       const auto& packed = loader.label_data()[entry.label_begin + ordinal];
-       Prediction gt;
-       gt.image_id = static_cast<int>(record.image_id);
-       // GT is expressed in the producing sample catalog, while metrics
-       // consume the already-admitted model-to-dataset permutation.
-       gt.class_reference = static_cast<int>(model_order[packed.class_id]);
-       gt.bbox_xyxy = {static_cast<float>(packed.bbox_x1), static_cast<float>(packed.bbox_y1), static_cast<float>(packed.bbox_x2), static_cast<float>(packed.bbox_y2)};
-       gt.has_mask = packed.has_mask();
-       gt.mask.width = loader.image_width();
-       gt.mask.height = loader.image_height();
-       for (std::size_t run = 0; run < packed.mask_rle_pairs; ++run) {
-        const auto pair = loader.rle_data()[packed.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair) + run];
-        gt.mask.runs.emplace_back(pair.start, pair.length);
-        gt.mask.area += pair.length;
-       }
-       ground_truth.push_back(std::move(gt));
-      }
-      const auto& source = loader.image_entry(sample_index);
-      delivery.sample({record, std::move(pixels), annotations, ground_truth, loader.geometry(sample_index), source.original_width, source.original_height, loader.resize_mode()});
-     }
-     if (captured_predictions != nullptr && captured_predictions->size() < request.alignment_images) {
-      if (record.detections.empty())
-       captured_predictions->push_back(std::nullopt);
-      else
-       captured_predictions->push_back(AlignmentSample{record.detections.front().score, record.detections.front().bbox_xyxy});
-     }
-    },
+  scores.clear();
+  labels.clear();
+  boxes.clear();
+  scores.reserve(record.detections.size());
+  labels.reserve(record.detections.size());
+  boxes.reserve(record.detections.size() * 4U);
+  for (const auto& detection : record.detections) {
+   scores.push_back(detection.score);
+   if (detection.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground || detection.class_reference < 0 ||
+       static_cast<std::size_t>(detection.class_reference) >= evaluator_order.size())
+    throw std::invalid_argument("invalid semantic evaluator class reference");
+   labels.push_back(evaluator_order[detection.class_reference]);
+   boxes.insert(boxes.end(), detection.bbox_xyxy.begin(), detection.bbox_xyxy.end());
+  }
+  dataset->merge_matches(dataset->match_predictions(record.dataset_index,
+   {.image_id = static_cast<int>(record.image_id), .scores = scores.data(), .labels_zero_based = labels.data(), .boxes_xyxy = boxes.data(), .count = scores.size()}, std::nullopt, evaluation_cap,
+   masks ? std::span<const Prediction>{record.detections} : std::span<const Prediction>{}));
+  if (delivery.sample && is_sample(record.dataset_index)) {
+   ground_truth.clear();
+   const auto sample_index = static_cast<std::uint32_t>(record.dataset_index);
+   const auto& entry = loader.label_index()[sample_index];
+   for (std::size_t ordinal = 0; ordinal < entry.num_instances; ++ordinal) {
+    const auto& packed = loader.label_data()[entry.label_begin + ordinal];
+    Prediction gt;
+    gt.image_id = static_cast<int>(record.image_id);
+    // GT is expressed in the producing sample catalog, while metrics
+    // consume the already-admitted model-to-dataset permutation.
+    gt.class_reference = static_cast<int>(model_order[packed.class_id]);
+    gt.bbox_xyxy = {static_cast<float>(packed.bbox_x1), static_cast<float>(packed.bbox_y1), static_cast<float>(packed.bbox_x2), static_cast<float>(packed.bbox_y2)};
+    gt.has_mask = packed.has_mask();
+    gt.mask.width = loader.image_width();
+    gt.mask.height = loader.image_height();
+    for (std::size_t run = 0; run < packed.mask_rle_pairs; ++run) {
+     const auto pair = loader.rle_data()[packed.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair) + run];
+     gt.mask.runs.emplace_back(pair.start, pair.length);
+     gt.mask.area += pair.length;
+    }
+    ground_truth.push_back(std::move(gt));
+   }
+   const auto& source = loader.image_entry(sample_index);
+   delivery.sample({record, std::move(pixels), annotations, ground_truth, loader.geometry(sample_index), source.original_width, source.original_height, loader.resize_mode()});
+  }
+  if (captured_predictions != nullptr && captured_predictions->size() < request.alignment_images) {
+   if (record.detections.empty())
+    captured_predictions->push_back(std::nullopt);
+   else
+    captured_predictions->push_back(AlignmentSample{record.detections.front().score, record.detections.front().bbox_xyxy});
+  }
+ },
    .progress = delivery.progress,
    .admitted = delivery.admitted,
    .retirement = delivery.retirement,

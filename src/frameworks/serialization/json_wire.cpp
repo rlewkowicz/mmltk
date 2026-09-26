@@ -10,29 +10,27 @@ namespace mmltk::frameworks::serialization {
 namespace {
 using Json = nlohmann::json;
 Json project_json(wire::Value value) {
- return std::visit(
-  [](auto&& item) -> Json {
-   using T = std::remove_cvref_t<decltype(item)>;
-   if constexpr (std::is_same_v<T, std::monostate>) {
-    return nullptr;
-   } else if constexpr (std::is_same_v<T, wire::Value::Array>) {
-    Json::array_t result;
-    result.reserve(item.size());
-    for (auto& child : item) result.push_back(project_json(std::move(child)));
-    return result;
-   } else if constexpr (std::is_same_v<T, wire::Value::Object>) {
-    Json::object_t result;
-    for (auto& [key, child] : item) result.emplace(std::move(key), project_json(std::move(child)));
-    return result;
-   } else if constexpr (std::is_same_v<T, wire::Value::Bytes>) {
-    std::vector<std::uint8_t> bytes(item.size());
-    std::transform(item.begin(), item.end(), bytes.begin(), [](std::byte byte) { return std::to_integer<std::uint8_t>(byte); });
-    return Json::binary(std::move(bytes));
-   } else {
-    return std::forward<decltype(item)>(item);
-   }
-  },
-  std::move(value.storage));
+ return std::visit([](auto&& item) -> Json {
+  using T = std::remove_cvref_t<decltype(item)>;
+  if constexpr (std::is_same_v<T, std::monostate>) {
+   return nullptr;
+  } else if constexpr (std::is_same_v<T, wire::Value::Array>) {
+   Json::array_t result;
+   result.reserve(item.size());
+   for (auto& child : item) result.push_back(project_json(std::move(child)));
+   return result;
+  } else if constexpr (std::is_same_v<T, wire::Value::Object>) {
+   Json::object_t result;
+   for (auto& [key, child] : item) result.emplace(std::move(key), project_json(std::move(child)));
+   return result;
+  } else if constexpr (std::is_same_v<T, wire::Value::Bytes>) {
+   std::vector<std::uint8_t> bytes(item.size());
+   std::transform(item.begin(), item.end(), bytes.begin(), [](std::byte byte) { return std::to_integer<std::uint8_t>(byte); });
+   return Json::binary(std::move(bytes));
+  } else {
+   return std::forward<decltype(item)>(item);
+  }
+ }, std::move(value.storage));
 }
 wire::Value project_wire(Json value) {
  switch (value.type()) {

@@ -139,19 +139,17 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
  auto& archive = *admitted_archive;
  const auto file = mmltk::common::io::FileHandle::open_readonly(path);
  const auto bytes = file.size();
- archive.load_from(
-  [&](std::uint64_t offset, void* target, std::size_t count) {
-   if (offset > bytes || count > bytes - offset) throw std::runtime_error("checkpoint archive read outside file");
-   std::size_t copied = 0;
-   while (copied != count) {
-    if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
-    const auto chunk = std::min<std::size_t>(count - copied, 1024U * 1024U);
-    file.pread_all(static_cast<std::byte*>(target) + copied, chunk, offset + copied);
-    copied += chunk;
-   }
-   return copied;
-  },
-  [&] { return bytes; }, torch::Device(torch::kCPU));
+ archive.load_from([&](std::uint64_t offset, void* target, std::size_t count) {
+  if (offset > bytes || count > bytes - offset) throw std::runtime_error("checkpoint archive read outside file");
+  std::size_t copied = 0;
+  while (copied != count) {
+   if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+   const auto chunk = std::min<std::size_t>(count - copied, 1024U * 1024U);
+   file.pread_all(static_cast<std::byte*>(target) + copied, chunk, offset + copied);
+   copied += chunk;
+  }
+  return copied;
+ }, [&] { return bytes; }, torch::Device(torch::kCPU));
  if (!supported_format(mmltk::backend::ml::serialization::require_string(archive, "format"))) { throw std::runtime_error("RF-DETR checkpoint is not a native checkpoint: " + path); }
  const auto version = mmltk::backend::ml::serialization::require_int(archive, "format_version");
  if (version != kNativeCheckpointFormatVersion) { throw std::runtime_error("unsupported RF-DETR native checkpoint format version " + std::to_string(version) + ": " + path); }

@@ -268,7 +268,8 @@ TEST_CASE("Production step and canonical groups match distributed stock AdamW wi
     request.recipe.weight_decay = 0.07;
     request.fused_optimizer = false;
     const std::array<std::string, 4> names{
-     "backbone.0.encoder.encoder.layer.2.attention.weight", "backbone.0.encoder.embeddings.position_embeddings", "transformer.decoder.layers.0.linear1.weight", "class_embed.bias"};
+     "backbone.0.encoder.encoder.layer.2.attention.weight", "backbone.0.encoder.embeddings.position_embeddings", "transformer.decoder.layers.0.linear1.weight", "class_embed.bias"
+    };
     // Literal upstream grouping: 13 ViT layers + terminal id; embeddings id=0,
     // layer.2 id=3; decoder one component decay, heads none. Only encoder
     // embeddings/bias/norm/gamma receive the stock decay exclusion.

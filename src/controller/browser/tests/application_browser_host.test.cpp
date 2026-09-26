@@ -244,34 +244,29 @@ public:
  ReadyHostAnnotation()
      : backend_(std::make_shared<mmltk::frameworks::gpu::test_support::FakeImageBackend>()),
        source_(std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_})),
-       annotation_(
-        {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-        [backend = backend_](auto revisions) {
-         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
-          .device = 0,
-          .backend = backend,
-          .model = std::make_unique<HostAnnotationAlgorithm>(),
-          .input_layout = mmltk::frameworks::gpu::ImageProductLayout::Clean,
-          .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-          .product_revisions = std::move(revisions),
-         });
-        },
-        [this](const VisualFrame& frame) {
-         if (frame.source != identity_) return VisualDocumentRead{};
-         auto document = std::make_shared<VisualDocument>();
-         document->scene.document = contracts::WorkspaceResource::From("test://image", 1U);
-         document->scene.categories.push_back({.value = "object"});
-         return VisualDocumentRead{borrow_matching_visual_product(frame, source_->Borrow()), std::move(document)};
-        },
-        [this](AnnotationSystem::event_type event) {
-         {
-          std::scoped_lock lock(mutex_);
-          if (const auto* failed = std::get_if<AnnotationFailed>(&event)) failure_ = failed->detail;
-          ++events_;
-         }
-         changed_.notify_all();
-        },
-        mmltk::testsupport::annotation_render_evidence()) {
+       annotation_({.device = 0, .maximum_width = 64U, .maximum_height = 64U}, [backend = backend_](auto revisions) {
+        return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+         .device = 0,
+         .backend = backend,
+         .model = std::make_unique<HostAnnotationAlgorithm>(),
+         .input_layout = mmltk::frameworks::gpu::ImageProductLayout::Clean,
+         .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+         .product_revisions = std::move(revisions),
+        });
+       }, [this](const VisualFrame& frame) {
+        if (frame.source != identity_) return VisualDocumentRead{};
+        auto document = std::make_shared<VisualDocument>();
+        document->scene.document = contracts::WorkspaceResource::From("test://image", 1U);
+        document->scene.categories.push_back({.value = "object"});
+        return VisualDocumentRead{borrow_matching_visual_product(frame, source_->Borrow()), std::move(document)};
+       }, [this](AnnotationSystem::event_type event) {
+        {
+         std::scoped_lock lock(mutex_);
+         if (const auto* failed = std::get_if<AnnotationFailed>(&event)) failure_ = failed->detail;
+         ++events_;
+        }
+        changed_.notify_all();
+       }, mmltk::testsupport::annotation_render_evidence()) {
   source_->Publish(16U, 16U, [](auto, auto, auto) {});
   static_cast<void>(annotation_.Open({.source = visual_frame(identity_, {16U, 16U}, source_->OutputFacts().revision), .crop = {0U, 0U, 16U, 16U}, .target = {16U, 16U}}));
   const bool ready = Wait([this] { return (annotation_.snapshot().ready && annotation_.snapshot().frame.valid()) || !failure_.empty(); });

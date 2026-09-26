@@ -185,10 +185,11 @@ void CoconutFailureReport::reject(const CoconutPhysicalImage& image, const std::
    stream_.open(path_, std::ios::app);
   }
   if (stream_) {
-   stream_ << nlohmann::json{{"image", image.member}, {"image_id", image.image_id}, {"release_image_id", release_image_id}, {"source", coconut_namespace_name(image.source)}, {"release", release},
-               {"object_id", object_id}, {"category_id", category_id}, {"reason", reason}}
-               .dump()
-           << '\n';
+   stream_
+    << nlohmann::
+        json{{"image", image.member}, {"image_id", image.image_id}, {"release_image_id", release_image_id}, {"source", coconut_namespace_name(image.source)}, {"release", release}, {"object_id", object_id}, {"category_id", category_id}, {"reason", reason}}
+         .dump()
+    << '\n';
    stream_.flush();
   }
   if (!warned_) {
@@ -218,8 +219,10 @@ CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation validation) {
   catalog.releases.push_back(release);
  }
  catalog.stock_annotations = coco_annotations_artifact();
- catalog.images = {{CoconutImageNamespace::CocoTrain, 0, "train2017", coco_train_images_artifact()}, {CoconutImageNamespace::CocoUnlabeled, 0, "unlabeled2017", coconut_unlabeled_images_artifact()},
-  {CoconutImageNamespace::CocoValidation, 0, "val2017", coco_val_images_artifact()}};
+ catalog.images = {
+  {CoconutImageNamespace::CocoTrain, 0, "train2017", coco_train_images_artifact()}, {CoconutImageNamespace::CocoUnlabeled, 0, "unlabeled2017", coconut_unlabeled_images_artifact()},
+  {CoconutImageNamespace::CocoValidation, 0, "val2017", coco_val_images_artifact()}
+ };
  const auto objects = objects365_train_image_artifacts();
  std::vector<bool> admitted(objects.size(), false);
  for (const auto edition : {CoconutEdition::Large, CoconutEdition::XLarge}) {
@@ -266,8 +269,9 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   downloads.push_back(acquire(artifact, owner));
   identity += downloads.back().identity;
   prepared.annotation_storage_bytes = checked_add(prepared.annotation_storage_bytes, downloads.back().size, "COCONut annotation archive storage overflow");
-  prepared.manifest["artifacts"].push_back({{"artifact_id", artifact.artifact_id}, {"url", artifact.url}, {"filename", artifact.filename}, {"expected_size", artifact.expected_size},
-   {"expected_sha256", artifact.expected_sha256}, {"identity", downloads.back().identity}});
+  prepared.manifest["artifacts"].push_back(
+   {{"artifact_id", artifact.artifact_id}, {"url", artifact.url}, {"filename", artifact.filename}, {"expected_size", artifact.expected_size}, {"expected_sha256", artifact.expected_sha256},
+    {"identity", downloads.back().identity}});
  }
  identity = digest_text(identity);
  const auto path_for = [&](CoconutImageNamespace source) {
@@ -415,11 +419,12 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   if (!metadata_only || complete)
    for (const auto& path : {index_path, std::filesystem::path(index_path.string() + ".inventory"), std::filesystem::path(index_path.string() + ".complete.json")})
     prepared.annotation_storage_bytes = checked_add(prepared.annotation_storage_bytes, std::filesystem::file_size(path), "COCONut index storage overflow");
-  prepared.manifest["components"].push_back({{"edition", release.edition}, {"revision", release.revision}, {"physical_source", coconut_namespace_name(component.source)},
-   {"input_identity", component.input_identity}, {"recovery_policy", component.recovery_policy}, {"original_annotation_identity", component.original_annotation_identity},
-   {"offered_images", component.index.images.size()}, {"annotation_source", coconut_annotation_source(component.source)}, {"imported_annotation_sha256", component.index.annotation_sha256},
-   {"imported_index", index_path.lexically_relative(cache.root).string()},
-   {"imported_index_identity", metadata_only && !complete ? nlohmann::json(nullptr) : read_json_file(index_path.string() + ".complete.json").at("identity")}});
+  prepared.manifest["components"].push_back(
+   {{"edition", release.edition}, {"revision", release.revision}, {"physical_source", coconut_namespace_name(component.source)}, {"input_identity", component.input_identity},
+    {"recovery_policy", component.recovery_policy}, {"original_annotation_identity", component.original_annotation_identity}, {"offered_images", component.index.images.size()},
+    {"annotation_source", coconut_annotation_source(component.source)}, {"imported_annotation_sha256", component.index.annotation_sha256},
+    {"imported_index", index_path.lexically_relative(cache.root).string()},
+    {"imported_index_identity", metadata_only && !complete ? nlohmann::json(nullptr) : read_json_file(index_path.string() + ".complete.json").at("identity")}});
   prepared.components.push_back(std::move(component));
  }
  return prepared;
@@ -480,8 +485,10 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  std::optional<CocoAnnotationCache> annotations;
  if (config.selection.recover_dropped_masks || config.selection.validation == CoconutValidation::Stock) {
   if (!retained.originals_ready) {
-   const CocoAnnotationRequest selection{config.selection.recover_dropped_masks ? CocoSplitAdmission::Optional : CocoSplitAdmission::Unselected,
-    config.selection.validation == CoconutValidation::Stock ? CocoSplitAdmission::Required : CocoSplitAdmission::Optional};
+   const CocoAnnotationRequest selection{
+    config.selection.recover_dropped_masks ? CocoSplitAdmission::Optional : CocoSplitAdmission::Unselected,
+    config.selection.validation == CoconutValidation::Stock ? CocoSplitAdmission::Required : CocoSplitAdmission::Optional
+   };
    trace_benchmark_event(
     trace, "benchmark.annotations.originals_begin", [&] { return nlohmann::json{{"recover_dropped_masks", config.selection.recover_dropped_masks}, {"validation", config.selection.validation}}; });
    annotations.emplace(cache, catalog.stock_annotations, selection, 0, checked_cast<std::uint32_t>(catalog.coco_validation_images, "COCO validation count overflow"), static_cast<int>(parse_workers),
@@ -618,8 +625,9 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
     {"expected_sha256", archive.artifact.expected_sha256}, {"physical_source", coconut_namespace_name(archive.source)}, {"identity", admitted.download.identity}, {"bytes", admitted.download.size}});
  }
  if (config.selection.validation == CoconutValidation::Stock || config.selection.recover_dropped_masks)
-  prepared.manifest["artifacts"].push_back({{"artifact_id", catalog.stock_annotations.artifact_id}, {"url", catalog.stock_annotations.url}, {"expected_size", catalog.stock_annotations.expected_size},
-   {"expected_sha256", catalog.stock_annotations.expected_sha256}});
+  prepared.manifest["artifacts"].push_back(
+   {{"artifact_id", catalog.stock_annotations.artifact_id}, {"url", catalog.stock_annotations.url}, {"expected_size", catalog.stock_annotations.expected_size},
+    {"expected_sha256", catalog.stock_annotations.expected_sha256}});
  std::uint64_t recovered = 0, unresolved = 0;
  for (const auto& component : prepared.components) {
   std::uint64_t component_recovered = 0;
@@ -645,10 +653,12 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  }
  prepared.manifest["recover_dropped_masks"] = config.selection.recover_dropped_masks;
  if (config.selection.recover_dropped_masks)
-  prepared.manifest["original_annotations"] = {{"train", originals.train ? nlohmann::json(originals.train->annotation_sha256) : nlohmann::json(nullptr)},
+  prepared.manifest["original_annotations"] = {
+   {"train", originals.train ? nlohmann::json(originals.train->annotation_sha256) : nlohmann::json(nullptr)},
    {"validation", prepared.stock_validation ? nlohmann::json(prepared.stock_validation->annotation_sha256)
                   : originals.validation    ? nlohmann::json(originals.validation->annotation_sha256)
-                                            : nlohmann::json(nullptr)}};
+                                            : nlohmann::json(nullptr)}
+  };
  prepared.manifest["recovered_objects"] = recovered;
  prepared.manifest["unresolved_objects"] = unresolved;
  if (config.selection.recover_dropped_masks) progress.activity("COCONut mask recovery: " + std::to_string(recovered) + " recovered, " + std::to_string(unresolved) + " unresolved");

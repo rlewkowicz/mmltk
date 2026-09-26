@@ -188,8 +188,10 @@ std::size_t GalleryThumbnailCache::MeaningBytes(const GalleryThumbnailCache* oth
  std::size_t count = 0U;
  const auto meaning = [&](const auto& value) {
   if (value)
-   allocations[count++] = {value.get(), GallerySharedBytes(value) + value->annotations.capacity() * sizeof(decltype(GalleryTileMeaning::annotations)::value_type) +
-                                         value->runs.capacity() * sizeof(decltype(GalleryTileMeaning::runs)::value_type)};
+   allocations[count++] = {
+    value.get(), GallerySharedBytes(value) + value->annotations.capacity() * sizeof(decltype(GalleryTileMeaning::annotations)::value_type) +
+                  value->runs.capacity() * sizeof(decltype(GalleryTileMeaning::runs)::value_type)
+   };
  };
  const auto visit = [&](const auto& entries) {
   for (const auto& entry : entries) { meaning(entry.meaning); }

@@ -147,10 +147,11 @@ constexpr void visit_annotations(Visitor&& visitor) {
 // Presence is constrained; malformed present markers must still fail to compile.
 // Keep declared value types: a compound conversion would test const lvalues instead.
 #define MMLTK_VALUE_ANNOTATION(Name, Marker, ValueType) \
- template <class Annotation> \
- concept Name = requires { Annotation::Marker; std::declval<const Annotation&>().value; } && [] { \
-  return std::bool_constant<Annotation::Marker && std::is_convertible_v<decltype(std::declval<const Annotation&>().value), ValueType>>::value; \
- }();
+ template <class Annotation>                            \
+ concept Name = requires {                              \
+  Annotation::Marker;                                   \
+  std::declval<const Annotation&>().value;              \
+ } && [] { return std::bool_constant < Annotation::Marker && std::is_convertible_v < decltype(std::declval<const Annotation&>().value), ValueType >> ::value; }();
 MMLTK_VALUE_ANNOTATION(MinimumAnnotation, is_minimum, long double)
 MMLTK_VALUE_ANNOTATION(MaximumAnnotation, is_maximum, long double)
 MMLTK_VALUE_ANNOTATION(MinBytesAnnotation, is_min_bytes, std::size_t)
@@ -162,10 +163,9 @@ concept FiniteAnnotation = requires { Annotation::is_finite; } && [] { return st
 template <class Annotation>
 concept PresentationAnnotation = requires { requires std::is_convertible_v<decltype(Annotation::kind), PresentationKind>; };
 template <class Annotation>
-inline constexpr bool kPolicyAnnotation =
- MinimumAnnotation<RemoveCvRef<Annotation>> || MaximumAnnotation<RemoveCvRef<Annotation>> || FiniteAnnotation<RemoveCvRef<Annotation>> ||
- MinBytesAnnotation<RemoveCvRef<Annotation>> || MaxBytesAnnotation<RemoveCvRef<Annotation>> || MaxItemsAnnotation<RemoveCvRef<Annotation>> ||
- PresentationAnnotation<RemoveCvRef<Annotation>> || is_catalog_provider_annotation<RemoveCvRef<Annotation>>;
+inline constexpr bool kPolicyAnnotation = MinimumAnnotation<RemoveCvRef<Annotation>> || MaximumAnnotation<RemoveCvRef<Annotation>> || FiniteAnnotation<RemoveCvRef<Annotation>> ||
+                                          MinBytesAnnotation<RemoveCvRef<Annotation>> || MaxBytesAnnotation<RemoveCvRef<Annotation>> || MaxItemsAnnotation<RemoveCvRef<Annotation>> ||
+                                          PresentationAnnotation<RemoveCvRef<Annotation>> || is_catalog_provider_annotation<RemoveCvRef<Annotation>>;
 template <class Annotation>
 constexpr void apply_field_constraint(FieldConstraint& result, const Annotation& annotation) {
  using A = RemoveCvRef<Annotation>;

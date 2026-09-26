@@ -55,7 +55,8 @@ inline constexpr std::array kModelSelectionPresentations{
  terminal_presentation::Policy{ModelSelectionOutcome::Rejected, terminal_presentation::Classification::Refused, "model_selection.rejected", "The model selection was rejected."},
  terminal_presentation::Policy{ModelSelectionOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "model_selection.cancelled", "The model selection was cancelled."},
  terminal_presentation::Policy{
-  ModelSelectionOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled, "model_selection.cancellation_requested", "Model selection cancellation was requested."},
+  ModelSelectionOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled, "model_selection.cancellation_requested", "Model selection cancellation was requested."
+ },
 };
 static_assert(terminal_presentation::complete(kModelSelectionPresentations));
 [[nodiscard]] consteval const auto& materialized_terminal_presentation_policy(std::type_identity<ModelSelectionOutcome>) { return kModelSelectionPresentations; }

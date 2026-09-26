@@ -40,22 +40,28 @@ public:
  FakeDatasetRuntime(std::shared_ptr<mmltk::testsupport::StopGate> gate, const bool fail) : gate_(std::move(gate)), fail_(fail) {}
  services::ArtifactCompileResult Compile(
   const services::ArtifactCompileRequest& request, const std::stop_token stop, const std::function<void(const contracts::ArtifactProgress&)>& progress) override {
-  progress(fail_ ? contracts::ArtifactProgress{.phase = static_cast<contracts::ArtifactCompilePhase>(255U),
-                    .activity = std::string(contracts::kArtifactProgressTextCapacity + 1U, 'x'),
-                    .completed = 2U,
-                    .total = 1U}
-                 : contracts::ArtifactProgress{.phase = contracts::ArtifactCompilePhase::Pixels,
-                    .activity = "compiling",
-                    .completed = 1U,
-                    .total = 2U,
-                    .tracks = {.acquisition = {.total_known = true, .complete = true, .activity = mmltk::backend::data::DatasetCompileActivity::Unnecessary},
-                     .labels = {.completed = 1U, .total = 1U, .total_known = true, .complete = true, .activity = mmltk::backend::data::DatasetCompileActivity::Complete},
-                     .pixels = {.total = 1U, .total_known = true, .active = true, .activity = mmltk::backend::data::DatasetCompileActivity::Compiling}}});
+  progress(fail_
+            ? contracts::
+               ArtifactProgress{.phase = static_cast<contracts::ArtifactCompilePhase>(255U), .activity = std::string(contracts::kArtifactProgressTextCapacity + 1U, 'x'), .completed = 2U, .total = 1U}
+            : contracts::ArtifactProgress{
+               .phase = contracts::ArtifactCompilePhase::Pixels,
+               .activity = "compiling",
+               .completed = 1U,
+               .total = 2U,
+               .tracks = {
+                .acquisition = {.total_known = true, .complete = true, .activity = mmltk::backend::data::DatasetCompileActivity::Unnecessary},
+                .labels = {.completed = 1U, .total = 1U, .total_known = true, .complete = true, .activity = mmltk::backend::data::DatasetCompileActivity::Complete},
+                .pixels = {.total = 1U, .total_known = true, .active = true, .activity = mmltk::backend::data::DatasetCompileActivity::Compiling}
+               }
+              });
   if (!gate_->Wait(stop)) return {.output = request.output, .cancelled = true};
   if (fail_)
-   return {.output = request.output,
+   return {
+    .output = request.output,
     .inspection = {
-     .compatible = true, .splits = {split(request.output / "train.bin"), split(request.output / "val.bin"), split(request.output / "test.bin"), split(request.output / "overflow.bin")}, .detail = {}}};
+     .compatible = true, .splits = {split(request.output / "train.bin"), split(request.output / "val.bin"), split(request.output / "test.bin"), split(request.output / "overflow.bin")}, .detail = {}
+    }
+   };
   return {.output = request.output, .inspection = {.compatible = true, .splits = {split(request.output / "train.bin")}, .detail = {}}};
  }
  contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths, std::string_view, std::uint32_t, std::stop_token) override {
@@ -86,22 +92,19 @@ public:
        loaded_(root_),
        dataset_gate_(std::make_shared<mmltk::testsupport::StopGate>()),
        dataset_(loaded_.settings, [gate = dataset_gate_] { return std::make_unique<FakeDatasetRuntime>(gate, false); }),
-       model_(
-        loaded_.settings,
-        [] {
-         auto gate = std::make_shared<mmltk::testsupport::StopGate>();
-         gate->Release();
-         return std::make_unique<BlockingModelRuntime>(std::move(gate));
-        },
-        [this](ModelSystem::event_type event) {
-         if (std::holds_alternative<ModelChanged>(event)) {
-          {
-           std::scoped_lock lock(model_mutex_);
-           model_terminals_.push_back(std::get<ModelChanged>(std::move(event)).snapshot);
-          }
-          model_changed_.notify_all();
+       model_(loaded_.settings, [] {
+        auto gate = std::make_shared<mmltk::testsupport::StopGate>();
+        gate->Release();
+        return std::make_unique<BlockingModelRuntime>(std::move(gate));
+       }, [this](ModelSystem::event_type event) {
+        if (std::holds_alternative<ModelChanged>(event)) {
+         {
+          std::scoped_lock lock(model_mutex_);
+          model_terminals_.push_back(std::get<ModelChanged>(std::move(event)).snapshot);
          }
-        }) {
+         model_changed_.notify_all();
+        }
+       }) {
   dataset_gate_->Release();
  }
  void PrepareModel(const contracts::FeatureId workflow = contracts::FeatureId::Train) {

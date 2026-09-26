@@ -95,7 +95,8 @@ inline constexpr std::array kRemoteOperationTerminalPresentations{
  terminal_presentation::Policy{RemoteOperationOutcome::Inconclusive, terminal_presentation::Classification::Failed, "remote_operation.inconclusive", "The remote operation outcome is inconclusive."},
  terminal_presentation::Policy{RemoteOperationOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "remote_operation.cancelled", "The remote operation was cancelled."},
  terminal_presentation::Policy{
-  RemoteOperationOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled, "remote_operation.cancellation_requested", "Remote operation cancellation was requested."},
+  RemoteOperationOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled, "remote_operation.cancellation_requested", "Remote operation cancellation was requested."
+ },
  terminal_presentation::Policy{RemoteOperationOutcome::Refused, terminal_presentation::Classification::Refused, "remote_operation.refused", "The remote operation was refused."},
 };
 static_assert(terminal_presentation::complete(kRemoteOperationTerminalPresentations));

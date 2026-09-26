@@ -428,8 +428,9 @@ void test_reflected_cli_optional_repeatable_negation_positionals_environment_and
  REQUIRE((valid->request.positional == -9));
  std::vector<std::string> emitted;
  mmltk::frameworks::reflection::emit(emitted, valid->request, kParserOptions);
- CHECK((emitted == std::vector<std::string>{"--count", "7", "--unsigned-count", "1", "--ratio", "0.5", "--no-enabled", "--path", "/tmp/image.png",
-  "--value", "4", "--value", "5", "--mode", "full-trace", "--", "-9"}));
+ CHECK((
+  emitted ==
+  std::vector<std::string>{"--count", "7", "--unsigned-count", "1", "--ratio", "0.5", "--no-enabled", "--path", "/tmp/image.png", "--value", "4", "--value", "5", "--mode", "full-trace", "--", "-9"}));
  std::vector<std::string_view> emitted_views;
  emitted_views.reserve(emitted.size());
  for (const auto& token : emitted) emitted_views.emplace_back(token);
@@ -453,23 +454,24 @@ void test_reflected_cli_optional_repeatable_negation_positionals_environment_and
  REQUIRE((::unsetenv("MMLTK_REFLECTED_CLI_TEST_COUNT") == 0));
  REQUIRE((environment && environment->request.nested.count == 6));
  REQUIRE((command_override && command_override->request.nested.count == 8));
- constexpr auto count_index = mmltk::frameworks::reflection::unique_descriptor_index(kParserOptions,
-  mmltk::frameworks::reflection::ReflectedMemberIdentity::from_path<ParserRequest, &ParserRequest::nested, &ParserNestedState::count>());
+ constexpr auto count_index = mmltk::frameworks::reflection::unique_descriptor_index(
+  kParserOptions, mmltk::frameworks::reflection::ReflectedMemberIdentity::from_path<ParserRequest, &ParserRequest::nested, &ParserNestedState::count>());
  CHECK_FALSE(environment->presence.test(count_index));
  CHECK(command_override->presence.test(count_index));
  const auto empty_optional = parse_parser_request(std::array<std::string_view, 3U>{"--path=", "--", "1"});
  REQUIRE((empty_optional && !empty_optional->request.optional_path.has_value()));
  const std::string help = mmltk::frameworks::reflection::help("test [options]", "Descriptor help", kParserOptions);
- CHECK(help == "Descriptor help\nUsage: test [options]\nValues"
-               "\n  --count, -c  Bounded scalar"
-               "\n  --unsigned-count  Bounded unsigned scalar"
-               "\n  --ratio  Bounded finite ratio"
-               "\n  --label  Bounded text"
-               "\n  --enabled, --no-enabled  Boolean flag"
-               "\n  --path  Optional path"
-               "\n  --value  Repeatable value"
-               "\n  --mode  Reflected enum"
-               "\nPositionals\n  input  Positional integer");
+ CHECK(help ==
+       "Descriptor help\nUsage: test [options]\nValues"
+       "\n  --count, -c  Bounded scalar"
+       "\n  --unsigned-count  Bounded unsigned scalar"
+       "\n  --ratio  Bounded finite ratio"
+       "\n  --label  Bounded text"
+       "\n  --enabled, --no-enabled  Boolean flag"
+       "\n  --path  Optional path"
+       "\n  --value  Repeatable value"
+       "\n  --mode  Reflected enum"
+       "\nPositionals\n  input  Positional integer");
 }
 void test_reflected_cli_scalar_success_has_no_parser_owned_allocation() {
  constexpr std::array<std::string_view, 6U> arguments{
@@ -855,8 +857,10 @@ TEST_CASE("RF-DETR help exposes independent augmentation and compiler resampling
 }
 TEST_CASE("CLI fatal boundaries remain visible with logging off or unavailable", "[core][cli][logging]") {
  const ScopedTempDir root{"mmltk-cli-fatal"};
- const std::vector<std::vector<std::string>> cases{{"--log-level=off", "unknown-command"}, {"--log-level=off", "rfdetr", "unknown-command"}, {"--log-level=off", "rfdetr", "train", "--unknown-option"},
-  {"--log-level=info", "--log-file=" + root.path().string(), "--help"}};
+ const std::vector<std::vector<std::string>> cases{
+  {"--log-level=off", "unknown-command"}, {"--log-level=off", "rfdetr", "unknown-command"}, {"--log-level=off", "rfdetr", "train", "--unknown-option"},
+  {"--log-level=info", "--log-file=" + root.path().string(), "--help"}
+ };
  for (const auto& arguments : cases) {
   std::vector<std::string> command{"env", "-u", "MMLTK_LOG_LEVEL", "-u", "MMLTK_LOG_FILE", "-u", "MMLTK_LOG_DIR", mmltk_cli_path()};
   command.insert(command.end(), arguments.begin(), arguments.end());
@@ -915,8 +919,9 @@ TEST_CASE("generic compile uses square width fallback and preserves explicit hei
  data::testsupport::create_synthetic_dataset({root.path().string(), "train", 64, 32, 1, 1, 0, true});
  for (const bool explicit_height : {false, true}) {
   const auto output = root.path() / (explicit_height ? "rectangle" : "square");
-  std::vector<std::string> command{mmltk_cli_path(), "compile", "--source-dir", (root.path() / "dataset").string(), "--output-dir", output.string(), "--split", "train",
-   "--width", "32", "--workers", "1"};
+  std::vector<std::string> command{
+   mmltk_cli_path(), "compile", "--source-dir", (root.path() / "dataset").string(), "--output-dir", output.string(), "--split", "train", "--width", "32", "--workers", "1"
+  };
   if (explicit_height) command.insert(command.end(), {"--height", "16"});
   const auto result = run_subprocess_capture_output(command);
   INFO(result.output_text);
@@ -970,7 +975,6 @@ TEST_CASE("CLI prediction source finalization preserves empty and conflicting so
   CHECK_FALSE(fs::exists(root.path() / "result.json"));
  }
 }
-
 TEST_CASE("scoped CLI spellings aliases booleans and emission gates retain factory semantics", "[core][cli][reflected]") {
  namespace reflection = mmltk::frameworks::reflection;
  const auto alias = parse_parser_request(std::array<std::string_view, 4>{"-c", "4", "--enabled=false", "1"});
@@ -983,8 +987,7 @@ TEST_CASE("scoped CLI spellings aliases booleans and emission gates retain facto
  constexpr auto plain = MMLTK_CLI_OPTION(Parser, enabled, "Boolean");
  CHECK(plain.name == "--enabled");
  CHECK(plain.negated_name.empty());
- constexpr std::array gated{reflection::option<ParserRequest, Parser::path<&ParserRequest::label>,
-  +[](const ParserRequest& request) noexcept { return request.enabled; }>("--label", "Text")};
+ constexpr std::array gated{reflection::option<ParserRequest, Parser::path<&ParserRequest::label>, +[](const ParserRequest& request) noexcept { return request.enabled; }>("--label", "Text")};
  ParserRequest request;
  request.label = "text";
  request.enabled = false;

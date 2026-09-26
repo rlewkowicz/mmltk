@@ -226,8 +226,10 @@ TEST_CASE("desktop terminal reports preserve process status and quiet requested 
   int status;
   const char* detail;
  };
- const std::array cases{Case{"healthy", 0, ""}, Case{"exit-failure", 23, "status=23"}, Case{"signal-failure", 128 + SIGKILL, "terminated by signal (status=9)"}, Case{"request-int", 0, ""},
-  Case{"request-term", 0, ""}, Case{"invalid-option", 1, "unknown"}, Case{"invalid-assets", 1, "browser host"}};
+ const std::array cases{
+  Case{"healthy", 0, ""}, Case{"exit-failure", 23, "status=23"}, Case{"signal-failure", 128 + SIGKILL, "terminated by signal (status=9)"}, Case{"request-int", 0, ""}, Case{"request-term", 0, ""},
+  Case{"invalid-option", 1, "unknown"}, Case{"invalid-assets", 1, "browser host"}
+ };
  for (const auto& entry : cases) {
   for (const char* level : {static_cast<const char*>(nullptr), "off"}) {
    CAPTURE(entry.mode, level == nullptr ? "default" : level);

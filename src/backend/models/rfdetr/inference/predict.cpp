@@ -305,9 +305,9 @@ public:
   } call{this, &input, &annotations};
   torch_cuda::run_with_torch_cuda_scope(
    {.device = device_, .stream = command_stream_.native_handle, .inference_mode = true, .autocast = native_autocast_enabled_, .precision = native_precision_}, &call, [](void* opaque) {
-    auto& native_call = *static_cast<NativeCall*>(opaque);
-    native_call.owner->ExecuteNative(*native_call.input, *native_call.annotations);
-   });
+   auto& native_call = *static_cast<NativeCall*>(opaque);
+   native_call.owner->ExecuteNative(*native_call.input, *native_call.annotations);
+  });
  }
  [[nodiscard]] runtime::RuntimeStatus Close() noexcept {
   if (runtime_) {
@@ -424,13 +424,12 @@ void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t
      .shape = {.rank = 1U, .extents = {static_cast<std::uint32_t>(capacity)}},
      .element_type = runtime::AnalysisElementType::Int32,
     },
-   .confidences =
-    {
-     .address = reinterpret_cast<std::uintptr_t>(result.scores[index].data_ptr()),
-     .capacity_bytes = capacity * sizeof(float),
-     .shape = {.rank = 1U, .extents = {static_cast<std::uint32_t>(capacity)}},
-     .element_type = runtime::AnalysisElementType::Float32,
-    },
+   .confidences = {
+    .address = reinterpret_cast<std::uintptr_t>(result.scores[index].data_ptr()),
+    .capacity_bytes = capacity * sizeof(float),
+    .shape = {.rank = 1U, .extents = {static_cast<std::uint32_t>(capacity)}},
+    .element_type = runtime::AnalysisElementType::Float32,
+   },
   };
  }
 }
@@ -479,10 +478,12 @@ ResolvedPredictionDemand prediction_demand(
  const bool bounded = width <= delivery.maximum_pixel_width && height <= delivery.maximum_pixel_height;
  const bool pixels = (delivery.source_pixels || requested.source_pixels || requested.native_pixels) && static_cast<bool>(delivery.completed);
  const bool admitted = pixels && (requested.native_pixels || bounded);
- return {.pixels_requested = pixels,
+ return {
+  .pixels_requested = pixels,
   .pixels_admitted = admitted,
   .encoded_masks = ((delivery.encoded_masks && options.include_masks) || requested.encoded_masks) && backend.has_masks(),
-  .preview_masks = admitted && ((bounded && (delivery.source_pixels || requested.source_pixels) && options.include_masks) || requested.preview_masks) && backend.has_masks()};
+  .preview_masks = admitted && ((bounded && (delivery.source_pixels || requested.source_pixels) && options.include_masks) || requested.preview_masks) && backend.has_masks()
+ };
 }
 struct PredictionSourceStorage final {
  std::array<torch::Tensor, 11U> products;
@@ -500,10 +501,11 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
   pixels = {.preview_failure = "Prediction preview exceeds the visual dimensions"};
  else if (pixels.chw || pixels.rgb8) {
   try {
-   pixels.custody = std::make_shared<PredictionSourceStorage>(
-    PredictionSourceStorage{{annotations.boxes, annotations.labels, annotations.scores, annotations.masks, annotations.compact_boxes, annotations.compact_labels, annotations.compact_scores,
-                             readback.device_indices, readback.index_values, annotations.selections[index].query_indices, annotations.selections[index].mask_logits.value_or(torch::Tensor{})},
-     annotations.runtime_selections[index].custody, std::move(source)});
+   pixels.custody = std::make_shared<PredictionSourceStorage>(PredictionSourceStorage{
+    {annotations.boxes, annotations.labels, annotations.scores, annotations.masks, annotations.compact_boxes, annotations.compact_labels, annotations.compact_scores, readback.device_indices,
+     readback.index_values, annotations.selections[index].query_indices, annotations.selections[index].mask_logits.value_or(torch::Tensor{})},
+    annotations.runtime_selections[index].custody, std::move(source)
+   });
   } catch (...) { pixels = {.preview_failure = "Prediction source custody allocation failed"}; }
  }
  const runtime::AnalysisAnnotationStorage unavailable{.source_region = annotations.storage[index].source_region};
@@ -1197,9 +1199,10 @@ PredictionRunResult PredictionSession::State::RunResolved(
      lane.decoded.emplace_back(stbi_load(source.image_path.c_str(), &width, &height, &channels, 3), &stbi_image_free);
      auto* pixels = lane.decoded.back().get();
      if (!pixels || width <= 0 || height <= 0) throw std::runtime_error("failed to decode RF-DETR prediction image: " + source.image_path.string());
-     lane.records.push_back({.dataset_index = static_cast<std::int64_t>(source_index),
-      .image_id = source.image_id ? source.image_id : static_cast<std::int64_t>(source_index + 1),
-      .source_name = source.source_name.empty() ? source.image_path.string() : source.source_name});
+     lane.records.push_back(
+      {.dataset_index = static_cast<std::int64_t>(source_index),
+       .image_id = source.image_id ? source.image_id : static_cast<std::int64_t>(source_index + 1),
+       .source_name = source.source_name.empty() ? source.image_path.string() : source.source_name});
      lane.pixels.push_back({.width = static_cast<std::uint32_t>(width), .height = static_cast<std::uint32_t>(height), .device = device, .stream = stream.native_handle});
      lane.annotations.demand[image] = prediction_demand(options, backend, delivery, lane.records.back(), width, height);
      if (width != input_resolution || height != input_resolution) {

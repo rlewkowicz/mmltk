@@ -135,8 +135,10 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
  throw_if_benchmark_cancelled(cancel_requested);
  common_io::publish_staged_path_atomically(staging_path, output_path, true);
  write_json_atomically(completion,
-  nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"archive_identity", archive_identity}, {"member", member_suffix}, {"size", expected_size},
-   {"identity", identity}, {"integrity_mode", "archive_structure_size"}},
+  nlohmann::json{
+   {"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"archive_identity", archive_identity}, {"member", member_suffix}, {"size", expected_size}, {"identity", identity},
+   {"integrity_mode", "archive_structure_size"}
+  },
   cancel_requested);
  trace_benchmark_event(trace, "benchmark.archive.extracted", [&] { return nlohmann::json{{"member", member_suffix}, {"bytes", expected_size}, {"identity", identity}}; });
  return identity;

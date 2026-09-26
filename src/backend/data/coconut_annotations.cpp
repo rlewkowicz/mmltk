@@ -1049,9 +1049,11 @@ void store_coconut_component(const std::filesystem::path& index_path, const Coco
  // completion alone cannot be admitted if publication is interrupted here.
  const auto manifest_path = std::filesystem::path(index_path.string() + ".complete.json");
  auto manifest = read_json_file(manifest_path);
- manifest["coconut"] = {{"edition", component.edition}, {"source", component.source}, {"input_identity", component.input_identity}, {"normalization", kCoconutNormalizationRevision},
-  {"inventory_identity", identity}, {"inventory_count", component.inventory.size()}, {"recovery_policy", component.recovery_policy},
-  {"original_annotation_identity", component.original_annotation_identity}, {"recovery_images", component.recovery.size()}};
+ manifest["coconut"] = {
+  {"edition", component.edition}, {"source", component.source}, {"input_identity", component.input_identity}, {"normalization", kCoconutNormalizationRevision}, {"inventory_identity", identity},
+  {"inventory_count", component.inventory.size()}, {"recovery_policy", component.recovery_policy}, {"original_annotation_identity", component.original_annotation_identity},
+  {"recovery_images", component.recovery.size()}
+ };
  throw_if_benchmark_cancelled(cancellation);
  write_json_atomically(manifest_path, manifest, cancellation);
 }

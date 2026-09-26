@@ -294,15 +294,15 @@ void test_training_supervision_checkpoint_blob_admission() {
  REQUIRE(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(obsolete_key_input) == mmltk::backend::models::rfdetr::TrainingSupervisionConfig{});
  const std::array variants{
   [] {
-   mmltk::backend::models::rfdetr::TrainingSupervisionConfig value;
-   value.assignment = mmltk::backend::models::rfdetr::TrainAssignmentKind::MatchFree;
-   return value;
-  }(),
+  mmltk::backend::models::rfdetr::TrainingSupervisionConfig value;
+  value.assignment = mmltk::backend::models::rfdetr::TrainAssignmentKind::MatchFree;
+  return value;
+ }(),
   [] {
-   mmltk::backend::models::rfdetr::TrainingSupervisionConfig value;
-   value.denoising.enabled = true;
-   return value;
-  }(),
+  mmltk::backend::models::rfdetr::TrainingSupervisionConfig value;
+  value.denoising.enabled = true;
+  return value;
+ }(),
   config,
  };
  for (const auto& variant : variants) { REQUIRE(round_trip_training_supervision_config(path, variant) == variant); }
@@ -495,8 +495,10 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
  auto source = r::testsupport::clone_normalized_model_state(owner);
  // Independent expected axes cover both classifier owners and distinct
  // supervision coordinates, rather than consulting the production inventory.
- const std::array axes{std::pair{"class_embed.weight", 0}, std::pair{"class_embed.bias", 0}, std::pair{"transformer.enc_out_class_embed.0.weight", 0},
-  std::pair{"transformer.enc_out_class_embed.0.bias", 0}, std::pair{"training_supervision.denoising_label_embedding.weight", 0}, std::pair{"training_supervision.ground_truth_mlp.linear1.weight", 1}};
+ const std::array axes{
+  std::pair{"class_embed.weight", 0}, std::pair{"class_embed.bias", 0}, std::pair{"transformer.enc_out_class_embed.0.weight", 0}, std::pair{"transformer.enc_out_class_embed.0.bias", 0},
+  std::pair{"training_supervision.denoising_label_embedding.weight", 0}, std::pair{"training_supervision.ground_truth_mlp.linear1.weight", 1}
+ };
  for (const auto& [name, dimension] : axes) {
   auto entry = std::ranges::find(source, name, &r::NormalizedModelStateEntry::name);
   REQUIRE(entry != source.end());

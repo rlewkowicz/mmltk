@@ -293,9 +293,9 @@ contracts::ComputeTerminal ComputeSequence::Run(std::stop_token stop, const Comp
                          : contracts::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 2U, .status = "running"});
  if (!scenario_.gate->Wait(stop)) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
  if (scenario_.fail)
-  return {.outcome = static_cast<contracts::ComputeOperationOutcome>(255U),
-   .output = std::string(contracts::kComputePathCapacity + 1U, 'x'),
-   .detail = std::string(contracts::kComputeErrorCapacity + 1U, 'x')};
+  return {
+   .outcome = static_cast<contracts::ComputeOperationOutcome>(255U), .output = std::string(contracts::kComputePathCapacity + 1U, 'x'), .detail = std::string(contracts::kComputeErrorCapacity + 1U, 'x')
+  };
  return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0U, 2U, "result");
 }
 ValidationRuntimeResult FakeNonvisualComputeRuntime::Run(rfdetr::ValidateRequest, std::stop_token stop, const ComputeProgressSink& progress, const rfdetr::ValidationDelivery&, std::uint64_t) {

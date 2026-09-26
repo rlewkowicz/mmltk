@@ -110,7 +110,8 @@ BenchmarkImageHeader BenchmarkImageDecoder::read_header(const std::span<const st
   throw BenchmarkImageError("benchmark image dimensions do not match annotations");
  }
  return BenchmarkImageHeader{
-  actual_width, actual_height, colorspace, encoding == BenchmarkImageEncoding::Jpeg && (colorspace == TJCS_YCCK || (colorspace == TJCS_CMYK && has_adobe_app14(encoded))), encoding};
+  actual_width, actual_height, colorspace, encoding == BenchmarkImageEncoding::Jpeg && (colorspace == TJCS_YCCK || (colorspace == TJCS_CMYK && has_adobe_app14(encoded))), encoding
+ };
 }
 void BenchmarkImageDecoder::decode_rgb(const std::span<const std::uint8_t> encoded, const BenchmarkImageHeader& header, std::vector<std::uint8_t>* rgb, std::vector<std::uint8_t>* cmyk_scratch) {
  if (rgb == nullptr || cmyk_scratch == nullptr) { throw BenchmarkImageError("benchmark image decode buffers are missing"); }

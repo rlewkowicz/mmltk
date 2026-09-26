@@ -46,10 +46,11 @@ private:
  std::shared_ptr<ShellWarmProbe> probe_;
 };
 [[nodiscard]] UpscaleSystem shell_upscale(const std::shared_ptr<FakeImageBackend>& backend, const std::shared_ptr<ShellWarmProbe>& probe, SystemEventSink<UpscaleSystem::event_type> events = {}) {
- return UpscaleSystem{{.device = 0, .maximum_width = 1024U, .maximum_height = 1024U},
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [probe] { return std::make_unique<ShellWarmAlgorithm>(probe); }, 4U),
-  [](const VisualFrame&) { return VisualDocumentRead{}; }, std::move(events)};
+ return UpscaleSystem{
+  {.device = 0, .maximum_width = 1024U, .maximum_height = 1024U},
+  RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [probe] { return std::make_unique<ShellWarmAlgorithm>(probe); }, 4U),
+  [](const VisualFrame&) { return VisualDocumentRead{}; }, std::move(events)
+ };
 }
 [[nodiscard]] ExploreSystem::event_type ready_explore_event() {
  return ExploreChanged{ExploreSnapshot{

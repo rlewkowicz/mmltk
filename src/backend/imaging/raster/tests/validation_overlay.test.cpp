@@ -36,18 +36,20 @@ TEST_CASE("validation adds completed layers once with unchanged alpha and ordina
  std::unique_ptr<Input, decltype(release)> storage(device, release);
  const auto draw = [&](bool add, bool device_count = false, const float* threshold = nullptr) {
   REQUIRE(cudaMemcpyAsync(device, &input, sizeof(input), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
-  REQUIRE(raster::raster_instance_overlay_rgba({.overlay = {reinterpret_cast<std::uint8_t*>(device), 16U, 4, 1},
-           .instances = {reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, boxes)), reinterpret_cast<const std::uint8_t*>(device) + offsetof(Input, colors),
-            reinterpret_cast<const int*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, labels)), 2,
-            device_count ? reinterpret_cast<const std::int64_t*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, count)) : nullptr},
-           .masks = reinterpret_cast<const bool*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, masks)),
-           .mask_alpha = 96U,
-           .box_thickness = 0,
-           .stream = {stream.get()},
-           .labels = false,
-           .add_rgb_to_existing = add,
-           .confidences = threshold ? reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, confidences)) : nullptr,
-           .confidence_threshold = threshold ? *threshold : 0.0F}) == cudaSuccess);
+  REQUIRE(raster::raster_instance_overlay_rgba(
+           {.overlay = {reinterpret_cast<std::uint8_t*>(device), 16U, 4, 1},
+            .instances =
+             {reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, boxes)), reinterpret_cast<const std::uint8_t*>(device) + offsetof(Input, colors),
+              reinterpret_cast<const int*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, labels)), 2,
+              device_count ? reinterpret_cast<const std::int64_t*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, count)) : nullptr},
+            .masks = reinterpret_cast<const bool*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, masks)),
+            .mask_alpha = 96U,
+            .box_thickness = 0,
+            .stream = {stream.get()},
+            .labels = false,
+            .add_rgb_to_existing = add,
+            .confidences = threshold ? reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, confidences)) : nullptr,
+            .confidence_threshold = threshold ? *threshold : 0.0F}) == cudaSuccess);
   std::array<std::uint8_t, 16> output{};
   REQUIRE(cudaMemcpyAsync(output.data(), device, output.size(), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
   REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
@@ -137,15 +139,17 @@ TEST_CASE("overwrite raster agrees with forward host painting for overlaps label
        }
       REQUIRE(cudaMemcpyAsync(device, &input, sizeof(input), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
       const auto base = reinterpret_cast<std::uint8_t*>(device);
-      REQUIRE(raster::raster_instance_overlay_rgba({.overlay = {base + guard, pitch, width, height},
-               .instances = {reinterpret_cast<const float*>(base + offsetof(Input, boxes)), base + offsetof(Input, colors), reinterpret_cast<const int*>(base + offsetof(Input, labels)), 3,
-                reinterpret_cast<const std::int64_t*>(base + offsetof(Input, count))},
-               .masks = masks ? reinterpret_cast<const bool*>(base + offsetof(Input, masks)) : nullptr,
-               .mask_alpha = 96U,
-               .box_thickness = boxes ? 2 : 0,
-               .stream = {stream.get()},
-               .labels = labels,
-               .add_rgb_to_existing = add}) == cudaSuccess);
+      REQUIRE(raster::raster_instance_overlay_rgba(
+               {.overlay = {base + guard, pitch, width, height},
+                .instances =
+                 {reinterpret_cast<const float*>(base + offsetof(Input, boxes)), base + offsetof(Input, colors), reinterpret_cast<const int*>(base + offsetof(Input, labels)), 3,
+                  reinterpret_cast<const std::int64_t*>(base + offsetof(Input, count))},
+                .masks = masks ? reinterpret_cast<const bool*>(base + offsetof(Input, masks)) : nullptr,
+                .mask_alpha = 96U,
+                .box_thickness = boxes ? 2 : 0,
+                .stream = {stream.get()},
+                .labels = labels,
+                .add_rgb_to_existing = add}) == cudaSuccess);
       decltype(input.pixels) actual{};
       REQUIRE(cudaMemcpyAsync(actual.data(), device, actual.size(), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
       REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);

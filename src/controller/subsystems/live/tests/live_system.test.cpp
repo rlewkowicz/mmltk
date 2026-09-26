@@ -67,14 +67,13 @@ constexpr detail::LiveReceiverCopyOperations kLiveReceiverCopyProbe{
 [[nodiscard]] constexpr mmltk::frameworks::gpu::ImagePlaneView live_receiver_copy_target() noexcept {
  return {
   .data = 1U,
-  .descriptor =
-   {
-    .kind = mmltk::frameworks::gpu::ImagePlaneKind::Clean,
-    .format = mmltk::frameworks::gpu::ImageFormat::Rgba8,
-    .width = 4U,
-    .height = 4U,
-    .pitch_bytes = 16U,
-   },
+  .descriptor = {
+   .kind = mmltk::frameworks::gpu::ImagePlaneKind::Clean,
+   .format = mmltk::frameworks::gpu::ImageFormat::Rgba8,
+   .width = 4U,
+   .height = 4U,
+   .pitch_bytes = 16U,
+  },
  };
 }
 TEST_CASE("Live receiver copy completes only after synchronization") {
@@ -151,10 +150,10 @@ TEST_CASE("Live complete frames alternate native output slots without preparatio
  backend->pitch_padding_bytes = 17U;
  auto state = std::make_shared<ControlledLiveCapture>();
  EventGate events;
- LiveSystem live{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
-  [&](LiveSystem::event_type) { events.Advance(); }};
+ LiveSystem live{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
+  [&](LiveSystem::event_type) { events.Advance(); }
+ };
  const auto check = [](const auto& read, const std::size_t value) {
   REQUIRE(read.valid());
   const auto plane = read.plane(0U).plane();
@@ -208,10 +207,10 @@ TEST_CASE("Live rejected or stopped complete captures never report frame progres
  auto state = std::make_shared<ControlledLiveCapture>();
  state->result = stop_after_capture;
  EventGate events;
- LiveSystem live{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
-  [&](LiveSystem::event_type) { events.Advance(); }};
+ LiveSystem live{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
+  [&](LiveSystem::event_type) { events.Advance(); }
+ };
  if (stop_after_capture) state->after_capture = [&] { static_cast<void>(live.Stop()); };
  state->Offer();
  static_cast<void>(live.Start({.extent = {7U, 3U}, .frames_per_second = 240U}));
@@ -234,13 +233,12 @@ TEST_CASE("Live receiver publication failure does not commit a captured candidat
  state->after_capture = [backend, point] { backend->FailAfter(point); };
  EventGate events;
  std::atomic_bool failed{false};
- LiveSystem live{kDevice,
-  RuntimeFactory(
-   0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U),
-  [&](LiveSystem::event_type event) {
-   if (std::holds_alternative<LiveFailed>(event)) failed = true;
-   events.Advance();
-  }};
+ LiveSystem live{
+  kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [state] { return std::make_unique<ControlledLiveAlgorithm>(state); }, 2U), [&](LiveSystem::event_type event) {
+  if (std::holds_alternative<LiveFailed>(event)) failed = true;
+  events.Advance();
+ }
+ };
  state->Offer();
  static_cast<void>(live.Start({.extent = {7U, 3U}, .frames_per_second = 240U}));
  REQUIRE(events.Wait([&] { return failed.load(); }));
@@ -275,12 +273,10 @@ TEST_CASE("Live queued discrete cancellation settles without running obsolete wo
   return detail::VisualRuntimeOwner::Notification{};
  });
  mmltk::testsupport::await_test_promise(latest_entered, "latest_entered");
- REQUIRE(owner.SubmitDiscrete(
-  [&queued_ran](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
-   queued_ran.store(true, std::memory_order_release);
-   return detail::VisualRuntimeOwner::Notification{};
-  },
-  [&queued_cancelled] { queued_cancelled.set_value(); }));
+ REQUIRE(owner.SubmitDiscrete([&queued_ran](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+  queued_ran.store(true, std::memory_order_release);
+  return detail::VisualRuntimeOwner::Notification{};
+ }, [&queued_cancelled] { queued_cancelled.set_value(); }));
  owner.RequestActiveStop();
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(active_cancelled, "active_cancelled", 2s));
  REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(queued_cancelled, "queued_cancelled", 2s));
@@ -294,8 +290,9 @@ TEST_CASE("Live failure publishes its newer settled snapshot") {
  std::promise<LiveFailed> failure;
  LiveSystem live{
   kDevice, RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [] { return std::make_unique<FailingLiveAlgorithm>(); }), [&failure](LiveSystem::event_type event) {
-   if (auto* failed = std::get_if<LiveFailed>(&event)) failure.set_value(std::move(*failed));
-  }};
+  if (auto* failed = std::get_if<LiveFailed>(&event)) failure.set_value(std::move(*failed));
+ }
+ };
  const auto admitted = live.Start({.extent = {80U, 45U}, .frames_per_second = 120U});
  const auto failed = failure.get_future().get();
  CHECK_FALSE(failed.snapshot.running);

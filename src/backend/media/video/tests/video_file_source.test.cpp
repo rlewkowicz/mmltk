@@ -142,11 +142,10 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
  CHECK(retirement->admission_open());
  CHECK(retirement->fact().reservations == 0U);
  {
-  mmltk::backend::media::video::VideoFileSource source(
-   path, {4U}, 0, reinterpret_cast<std::uintptr_t>(stream), {}, retirement, +[](cudaStream_t value) -> cudaError_t {
-    const auto status = cudaStreamSynchronize(value);
-    return status == cudaSuccess ? cudaErrorUnknown : status;
-   });
+  mmltk::backend::media::video::VideoFileSource source(path, {4U}, 0, reinterpret_cast<std::uintptr_t>(stream), {}, retirement, +[](cudaStream_t value) -> cudaError_t {
+   const auto status = cudaStreamSynchronize(value);
+   return status == cudaSuccess ? cudaErrorUnknown : status;
+  });
   REQUIRE(source.Next());
  }
  CHECK_FALSE(retirement->admission_open());
@@ -386,15 +385,13 @@ TEST_CASE("video resolution growth stays bounded and failed admission preserves 
  const mmltk::testsupport::ScopedTestStream stream_owner;
  const auto stream = stream_owner.get();
  unsigned context_calls = 0U;
- gpu::CudaContextApi api{&context_calls,
-  [](void* count, CUcontext* context) noexcept {
-   ++*static_cast<unsigned*>(count);
-   return cuCtxGetCurrent(context);
-  },
-  [](void* count, CUcontext context) noexcept {
-   ++*static_cast<unsigned*>(count);
-   return cuCtxSetCurrent(context);
-  }};
+ gpu::CudaContextApi api{&context_calls, [](void* count, CUcontext* context) noexcept {
+  ++*static_cast<unsigned*>(count);
+  return cuCtxGetCurrent(context);
+ }, [](void* count, CUcontext context) noexcept {
+  ++*static_cast<unsigned*>(count);
+  return cuCtxSetCurrent(context);
+ }};
  auto retirement = std::make_shared<gpu::TerminalCudaRetirementOwner>(1U);
  auto source = Access::Create(path, {64U * 32U}, 0, reinterpret_cast<std::uintptr_t>(stream), {}, retirement, api);
  std::optional<mmltk::backend::media::video::VideoFrame> previous;
@@ -604,23 +601,21 @@ TEST_CASE("video exact context transitions seal the existing owner before furthe
   unsigned sets = 0U;
   CUcontext caller = nullptr;
  } driver{stage == Stage::Construction, query, repeated};
- gpu::CudaContextApi api{&driver,
-  [](void* opaque, CUcontext* value) noexcept {
-   auto& injected = *static_cast<Driver*>(opaque);
-   ++injected.calls;
-   if (injected.armed && injected.query) return CUDA_ERROR_INVALID_CONTEXT;
-   return cuCtxGetCurrent(value);
-  },
-  [](void* opaque, CUcontext value) noexcept {
-   auto& injected = *static_cast<Driver*>(opaque);
-   ++injected.calls;
-   const auto result = cuCtxSetCurrent(value);
-   if (++injected.sets > 1U && injected.armed && !injected.query && value == injected.caller && (injected.repeated || injected.failures == 0U)) {
-    ++injected.failures;
-    return CUDA_ERROR_INVALID_CONTEXT;
-   }
-   return result;
-  }};
+ gpu::CudaContextApi api{&driver, [](void* opaque, CUcontext* value) noexcept {
+  auto& injected = *static_cast<Driver*>(opaque);
+  ++injected.calls;
+  if (injected.armed && injected.query) return CUDA_ERROR_INVALID_CONTEXT;
+  return cuCtxGetCurrent(value);
+ }, [](void* opaque, CUcontext value) noexcept {
+  auto& injected = *static_cast<Driver*>(opaque);
+  ++injected.calls;
+  const auto result = cuCtxSetCurrent(value);
+  if (++injected.sets > 1U && injected.armed && !injected.query && value == injected.caller && (injected.repeated || injected.failures == 0U)) {
+   ++injected.failures;
+   return CUDA_ERROR_INVALID_CONTEXT;
+  }
+  return result;
+ }};
  auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(1U);
  std::unique_ptr<VideoFileSource> source;
  const auto create = [&] {
@@ -677,18 +672,16 @@ TEST_CASE("cancelled video context admission publishes no metadata and releases 
   bool at_entry;
   unsigned queries = 0;
  } driver{{}, at_entry};
- gpu::CudaContextApi api{&driver,
-  [](void* opaque, CUcontext* value) noexcept {
-   auto& state = *static_cast<Driver*>(opaque);
-   const auto result = cuCtxGetCurrent(value);
-   if (++state.queries == 1U && !state.at_entry) state.stop.request_stop();
-   return result;
-  },
-  [](void* opaque, CUcontext value) noexcept {
-   auto& state = *static_cast<Driver*>(opaque);
-   if (state.at_entry) state.stop.request_stop();
-   return cuCtxSetCurrent(value);
-  }};
+ gpu::CudaContextApi api{&driver, [](void* opaque, CUcontext* value) noexcept {
+  auto& state = *static_cast<Driver*>(opaque);
+  const auto result = cuCtxGetCurrent(value);
+  if (++state.queries == 1U && !state.at_entry) state.stop.request_stop();
+  return result;
+ }, [](void* opaque, CUcontext value) noexcept {
+  auto& state = *static_cast<Driver*>(opaque);
+  if (state.at_entry) state.stop.request_stop();
+  return cuCtxSetCurrent(value);
+ }};
  auto retirement = std::make_shared<gpu::TerminalCudaRetirementOwner>(1U);
  {
   auto source = media::test_support::VideoFileSourceTestAccess::Create(path, {4U}, 0, reinterpret_cast<std::uintptr_t>(stream.get()), driver.stop.get_token(), retirement, api);

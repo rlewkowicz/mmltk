@@ -238,11 +238,12 @@ int main(int argc, char** argv) {
    if (!server.running()) { return fail_closed(shell, "browser server stopped during startup"); }
    auto page = server.page_url();
    if (!page) return fail_closed(shell, "browser page URL unavailable");
-   const auto process_start = shell.start_firefox({.executable = configured_root("MMLTK_FIREFOX_RUNTIME_ROOT_OVERRIDE", MMLTK_FIREFOX_RUNTIME_ROOT) / "firefox",
-    .page_url = std::move(*page),
-    .log_file = firefox_log_file(),
-    .integration = integration,
-    .integration_high_dpi = integration_high_dpi});
+   const auto process_start = shell.start_firefox(
+    {.executable = configured_root("MMLTK_FIREFOX_RUNTIME_ROOT_OVERRIDE", MMLTK_FIREFOX_RUNTIME_ROOT) / "firefox",
+     .page_url = std::move(*page),
+     .log_file = firefox_log_file(),
+     .integration = integration,
+     .integration_high_dpi = integration_high_dpi});
    if (process_start == mmltk::controller::services::FirefoxProcessStartResult::Terminal) {
     const auto firefox = shell.firefox_lifecycle();
     const auto detail = firefox_error_detail(firefox.error_code);

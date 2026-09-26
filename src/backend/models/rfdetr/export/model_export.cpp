@@ -113,14 +113,11 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
   }
   const bool has_masks = model.config().segmentation;
   ScopedSdpBackend sdp_scope;
-  auto traced = torch::jit::tracer::trace(
-   {dummy_pixels},
-   [&technical_model, dummy_mask, has_masks](torch::jit::Stack args) {
-    const auto outputs = technical_model.forward(NestedTensor{args[0].toTensor(), dummy_mask}, true);
-    if (has_masks && outputs.main.pred_masks) { return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes, *outputs.main.pred_masks}; }
-    return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes};
-   },
-   [](const torch::autograd::Variable&) { return ""; }, false, false, &export_module);
+  auto traced = torch::jit::tracer::trace({dummy_pixels}, [&technical_model, dummy_mask, has_masks](torch::jit::Stack args) {
+   const auto outputs = technical_model.forward(NestedTensor{args[0].toTensor(), dummy_mask}, true);
+   if (has_masks && outputs.main.pred_masks) { return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes, *outputs.main.pred_masks}; }
+   return torch::jit::Stack{outputs.main.pred_logits, outputs.main.pred_boxes};
+  }, [](const torch::autograd::Variable&) { return ""; }, false, false, &export_module);
   export_module.type()->addMethod(compilation_unit->create_function("forward", traced.first->graph, true));
   std::unordered_map<std::string, at::Tensor> lowering_initializers;
   const auto collect = [&](const std::string& name, const at::Tensor& value) { lowering_initializers.emplace(name, value); };
@@ -131,10 +128,10 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
    .graph = graph.get(),
    .initializer_context = &lowering_initializers,
    .find_initializer = [](const void* opaque, const std::string& name) noexcept -> const void* {
-    const auto& values = *static_cast<const std::unordered_map<std::string, at::Tensor>*>(opaque);
-    const auto found = values.find(name);
-    return found == values.end() ? nullptr : std::addressof(found->second);
-   },
+   const auto& values = *static_cast<const std::unordered_map<std::string, at::Tensor>*>(opaque);
+   const auto found = values.find(name);
+   return found == values.end() ? nullptr : std::addressof(found->second);
+  },
    .readback = &readback,
   });
   erase_unused_module_self_input(graph);

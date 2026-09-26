@@ -177,9 +177,9 @@ struct ImageWorkspace::State final {
  State(std::shared_ptr<Owner> lifetime, ImageWorkspaceLayout requested, const Operations* injected)
      : owner(std::move(lifetime)),
        layout(std::move(requested)),
-       operations(injected ? *injected
-                           : Operations{&initialize_workspace_allocation, [](ImportedImageBuffer& buffer) noexcept { return buffer.Release(); },
-                              [](const ImportedImageBuffer& buffer, DeviceContext import_context) { return buffer.ImportAlias(std::move(import_context)); }}) {}
+       operations(injected ? *injected : Operations{&initialize_workspace_allocation, [](ImportedImageBuffer& buffer) noexcept {
+                                                     return buffer.Release();
+                                                    }, [](const ImportedImageBuffer& buffer, DeviceContext import_context) { return buffer.ImportAlias(std::move(import_context)); }}) {}
  void Initialize(DeviceContext source, std::optional<DeviceExecution> execution) {
   identity = next_image_allocation_identity();
   if (!layout.valid()) throw std::invalid_argument("workspace layout is invalid");

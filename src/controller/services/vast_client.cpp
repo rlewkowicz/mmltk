@@ -42,7 +42,8 @@ void validate_query(const VastQueryConfig& config, const std::vector<mmltk::cont
 }
 void validate_template(const VastLaunchTemplateOptions& options) {
  const std::array<const std::string*, 10U> fields{
-  &options.user, &options.login, &options.label, &options.onstart, &options.onstart_cmd, &options.entrypoint, &options.jupyter_dir, &options.extra, &options.env, &options.template_hash};
+  &options.user, &options.login, &options.label, &options.onstart, &options.onstart_cmd, &options.entrypoint, &options.jupyter_dir, &options.extra, &options.env, &options.template_hash
+ };
  std::size_t total = 0U;
  for (const std::string* field : fields) {
   if (field->size() > kVastFieldCapacity || field->size() > kVastTemplateCapacity - total) { throw std::invalid_argument("Vast launch template exceeds fixed capacity"); }
@@ -145,14 +146,16 @@ contracts::ProviderQueryResult materialize_provider_query_result(const std::span
   contracts::ProviderQueryResult result{.outcome = contracts::ProviderQueryOutcome::Succeeded};
   result.offers.reserve(offers.size());
   for (const auto& offer : offers) {
-   contracts::ProviderOffer converted{.offer_id = offer.offer_id,
+   contracts::ProviderOffer converted{
+    .offer_id = offer.offer_id,
     .gpu_name = offer.gpu_name,
     .gpu_count = offer.num_gpus,
     .gpu_ram_gib = offer.gpu_ram,
     .hourly_price = offer.dph,
     .reliability = offer.reliability,
     .location = offer.geolocation,
-    .family = offer.family};
+    .family = offer.family
+   };
    result.offers.push_back(std::move(converted));
   }
   return contracts::normalize_provider_query_result(std::move(result));

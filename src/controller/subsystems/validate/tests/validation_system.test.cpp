@@ -53,12 +53,10 @@ TEST_CASE("Validation retains stable admitted capacity independently of visual r
  auto [settings, dataset, model] = fixture.systems();
  const auto revision = settings.snapshot().revision;
  std::promise<void> settled;
- ValidationSystem validation{settings, dataset, model, [](DirectComputeConfiguration) { return std::make_unique<AdmittedValidationRuntime>(); },
-  [&](ValidationSystem::event_type event) {
-   if (const auto* changed = std::get_if<ValidationChanged>(&event); changed && !changed->snapshot.operation.active && changed->snapshot.operation.generation_frontier)
-    mmltk::testsupport::release_test_promise(settled);
-  },
-  [](int, int) { return DirectComputeConfiguration{}; }};
+ ValidationSystem validation{settings, dataset, model, [](DirectComputeConfiguration) { return std::make_unique<AdmittedValidationRuntime>(); }, [&](ValidationSystem::event_type event) {
+  if (const auto* changed = std::get_if<ValidationChanged>(&event); changed && !changed->snapshot.operation.active && changed->snapshot.operation.generation_frontier)
+   mmltk::testsupport::release_test_promise(settled);
+ }, [](int, int) { return DirectComputeConfiguration{}; }};
  const auto frame = validation.snapshot().frame;
  static_cast<void>(validation.Start({}));
  mmltk::testsupport::await_test_promise(settled, "validation admitted capacity");
@@ -109,13 +107,14 @@ TEST_CASE("composed preview retains every source after the outer draw callback",
   gpu::DeviceContext context(0, backend, gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
   auto retirement = std::make_shared<gpu::TerminalCudaRetirementOwner>(9U);
   detail::PredictionPreviewPool pool(execution, context, PredictionReceiverFault::Operations(), retirement, 7U);
-  gpu::SystemImageRuntime runtime({.device = 0,
-   .backend = backend,
-   .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
-   .output_buffer_count = 2U,
-   .numa_node = execution.placement.numa_node,
-   .execution = execution,
-   .adopted_context = context});
+  gpu::SystemImageRuntime runtime(
+   {.device = 0,
+    .backend = backend,
+    .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
+    .output_buffer_count = 2U,
+    .numa_node = execution.placement.numa_node,
+    .execution = execution,
+    .adopted_context = context});
   const std::array<std::uint8_t, 12> pixels{255, 0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0};
   std::array<Composition::Region, 6> regions;
   for (std::size_t index = 0U; index < regions.size(); ++index) {
@@ -173,15 +172,12 @@ TEST_CASE("validation admits asynchronous selected-path inspection and cancels b
  auto gate = std::make_shared<mmltk::testsupport::StopGate>();
  std::atomic_size_t constructions = 0;
  std::promise<ValidationSystem::event_type> settled;
- ValidationSystem validation{settings, dataset, model,
-  [&](DirectComputeConfiguration) {
-   ++constructions;
-   return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = gate});
-  },
-  [&](ValidationSystem::event_type event) {
-   if (std::holds_alternative<ValidationChanged>(event)) settled.set_value(std::move(event));
-  },
-  [](int, int) { return DirectComputeConfiguration{}; }};
+ ValidationSystem validation{settings, dataset, model, [&](DirectComputeConfiguration) {
+  ++constructions;
+  return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = gate});
+ }, [&](ValidationSystem::event_type event) {
+  if (std::holds_alternative<ValidationChanged>(event)) settled.set_value(std::move(event));
+ }, [](int, int) { return DirectComputeConfiguration{}; }};
  const auto admitted = validation.Start({});
  CHECK(admitted.operation.active);
  observation->inspect_started.get_future().wait();
@@ -218,14 +214,11 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
  PredictionReceiverFault fault;
  ScopedPredictionReceiverFault receiver(fault);
  std::size_t notifications = 0U;
- detail::ValidationSamples samples(
-  {.device = 0, .maximum_width = 768U, .maximum_height = 512U},
-  [&] {
-   std::scoped_lock lock(mutex);
-   ++notifications;
-   changed.notify_all();
-  },
-  PredictionReceiverFault::Operations());
+ detail::ValidationSamples samples({.device = 0, .maximum_width = 768U, .maximum_height = 512U}, [&] {
+  std::scoped_lock lock(mutex);
+  ++notifications;
+  changed.notify_all();
+ }, PredictionReceiverFault::Operations());
  const std::array<std::uint32_t, 6> indices{1U, 3U, 4U, 5U, 8U, 9U};
  const auto selected_indices = std::span(indices).first(sample_count);
  samples.Begin(7U, selected_indices);
@@ -391,8 +384,9 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
  samples.CloseDetail();
  await_validation(mutex, changed, [&] { return !samples.snapshot().detail; });
  check_retained_atlas();
- for (const auto overlays : {ValidationOverlays{true, true, true, true, false, true}, ValidationOverlays{true, true, true, true, true, false}, ValidationOverlays{true, true, true, true, false, false},
-       ValidationOverlays{true, false, false, false}, ValidationOverlays{false, true, false, false}, ValidationOverlays{false, false, true, false}, ValidationOverlays{false, false, false, true}}) {
+ for (const auto overlays :
+  {ValidationOverlays{true, true, true, true, false, true}, ValidationOverlays{true, true, true, true, true, false}, ValidationOverlays{true, true, true, true, false, false},
+   ValidationOverlays{true, false, false, false}, ValidationOverlays{false, true, false, false}, ValidationOverlays{false, false, true, false}, ValidationOverlays{false, false, false, true}}) {
   const auto revision = samples.snapshot().frame.revision;
   samples.SetOverlays(overlays);
   await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > revision; });
@@ -617,14 +611,11 @@ TEST_CASE("validation presentation refusals preserve settled populations and exp
   if (auto* gate = pending_draw.exchange(nullptr)) gate->receipt().ArriveAndWait();
   return PredictionReceiverFault::Operations().clear_semantic(destination, pitch, value, width, height, stream);
  };
- detail::ValidationSamples samples(
-  {.device = 0, .maximum_width = 512U, .maximum_height = 576U},
-  [&] {
-   std::scoped_lock lock(mutex);
-   ++notifications;
-   changed.notify_all();
-  },
-  operations);
+ detail::ValidationSamples samples({.device = 0, .maximum_width = 512U, .maximum_height = 576U}, [&] {
+  std::scoped_lock lock(mutex);
+  ++notifications;
+  changed.notify_all();
+ }, operations);
  mmltk::testsupport::ScopedTestCleanup release([&] {
   pending_draw = nullptr;
   draw_gate.Release();
@@ -819,7 +810,8 @@ TEST_CASE("validation composition preserves independent nonempty box and mask pi
  std::array<std::uint8_t, 12U * 12U> mask{};
  mask[3U * 12U + 3U] = 1U;
  const rfdetr::Prediction prediction{
-  .class_reference = 0, .class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground, .score = 0.75F, .bbox_xyxy = {2, 2, 4, 4}, .has_mask = true};
+  .class_reference = 0, .class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground, .score = 0.75F, .bbox_xyxy = {2, 2, 4, 4}, .has_mask = true
+ };
  auto truth = prediction;
  truth.class_reference = same_class ? 0 : 1;
  truth.bbox_xyxy = {8, 8, 10, 10};
@@ -1020,27 +1012,25 @@ TEST_CASE("validation semantic metrics survive required sample refusal without r
  std::atomic_size_t runs = 0U;
  std::promise<ValidationSnapshot> finished;
  unsigned encoded_samples = 0;
- ValidationSystem validation(
-  settings, dataset, model, [&](DirectComputeConfiguration) { return std::make_unique<RefusedValidationPreview>(runs, failure); },
-  [&](auto event) {
-   std::scoped_lock lock(display_mutex);
-   display_changed.notify_all();
-   if (auto* changed = std::get_if<ValidationChanged>(&event);
-    changed && !changed->snapshot.operation.active && changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed) {
-    try {
-     finished.set_value(changed->snapshot);
-    } catch (const std::future_error&) {}
-   }
-  },
-  [](int, int) { return DirectComputeConfiguration{}; }, {.device = 0, .maximum_width = 768U, .maximum_height = 512U},
-  [&](const char* path, int width, int height, int channels, const void* pixels, int stride) {
-   if (failure == 2U && ++encoded_samples == 2U) {
-    auto* full = std::fopen("/dev/full", "wb");
-    if (!full) throw std::runtime_error("open validation PNG failure stream");
-    return mmltk::backend::imaging::raster::detail::write_png_stream(full, path, width, height, channels, pixels, stride);
-   }
-   return mmltk::backend::imaging::raster::detail::write_png_file(path, width, height, channels, pixels, stride);
-  });
+ ValidationSystem validation(settings, dataset, model, [&](DirectComputeConfiguration) { return std::make_unique<RefusedValidationPreview>(runs, failure); }, [&](auto event) {
+  std::scoped_lock lock(display_mutex);
+  display_changed.notify_all();
+  if (auto* changed = std::get_if<ValidationChanged>(&event);
+   changed && !changed->snapshot.operation.active && changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed) {
+   try {
+    finished.set_value(changed->snapshot);
+   } catch (const std::future_error&) {}
+  }
+ }, [](int, int) {
+  return DirectComputeConfiguration{};
+ }, {.device = 0, .maximum_width = 768U, .maximum_height = 512U}, [&](const char* path, int width, int height, int channels, const void* pixels, int stride) {
+  if (failure == 2U && ++encoded_samples == 2U) {
+   auto* full = std::fopen("/dev/full", "wb");
+   if (!full) throw std::runtime_error("open validation PNG failure stream");
+   return mmltk::backend::imaging::raster::detail::write_png_stream(full, path, width, height, channels, pixels, stride);
+  }
+  return mmltk::backend::imaging::raster::detail::write_png_file(path, width, height, channels, pixels, stride);
+ });
  static_cast<void>(validation.Start({}));
  const auto result = finished.get_future().get();
  // Operation settlement schedules preview rollback; its terminal snapshot may
@@ -1196,21 +1186,19 @@ TEST_CASE("validation receiver authority survives group replacement and late bor
  // A changed execution descriptor exercises receiver replacement on one GPU too.
  replacement.placement.cpus.push_back(replacement.placement.cpus.front());
  bool fail_restore = false;
- const gpu::CudaContextApi context_api{&fail_restore, [](void*, CUcontext* value) noexcept { return cuCtxGetCurrent(value); },
-  [](void* fault, CUcontext value) noexcept { return *static_cast<bool*>(fault) ? CUDA_ERROR_CONTEXT_IS_DESTROYED : cuCtxSetCurrent(value); }};
+ const gpu::CudaContextApi context_api{&fail_restore, [](void*, CUcontext* value) noexcept { return cuCtxGetCurrent(value); }, [](void* fault, CUcontext value) noexcept {
+  return *static_cast<bool*>(fault) ? CUDA_ERROR_CONTEXT_IS_DESTROYED : cuCtxSetCurrent(value);
+ }};
  auto retirement = std::make_shared<gpu::TerminalCudaRetirementOwner>(21U);
  const mmltk::testsupport::ScopedTempDir root("validation-late-receiver");
  ApplicationDataFixture fixture(root.path());
  fixture.PrepareModel(contracts::FeatureId::Validate);
  auto [settings, dataset, model] = fixture.systems();
  unsigned factories = 0;
- ValidationSystem validation(
-  settings, dataset, model,
-  [&](DirectComputeConfiguration) {
-   ++factories;
-   return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{});
-  },
-  {}, [](int, int) { return DirectComputeConfiguration{}; }, {}, {}, retirement);
+ ValidationSystem validation(settings, dataset, model, [&](DirectComputeConfiguration) {
+  ++factories;
+  return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{});
+ }, {}, [](int, int) { return DirectComputeConfiguration{}; }, {}, {}, retirement);
  std::vector<std::filesystem::path> published;
  detail::ValidationSampleOutput output({execution}, {}, [&](const auto& path) { published.push_back(path); }, {}, retirement, context_api);
  const std::array<std::uint32_t, 1> selected{0U};
@@ -1446,17 +1434,14 @@ TEST_CASE("validation public Stop and Shutdown settle an engaged PNG before term
  const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
  mmltk::testsupport::TestGate encoding("public validation PNG write");
  std::promise<ValidationSnapshot> terminal;
- ValidationSystem validation(
-  settings, dataset, model, [&](DirectComputeConfiguration) { return std::make_unique<PendingOutputRuntime>(execution); },
-  [&](auto event) {
-   if (auto* changed = std::get_if<ValidationChanged>(&event);
-    changed && !changed->snapshot.operation.active && changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled) {
-    try {
-     terminal.set_value(changed->snapshot);
-    } catch (const std::future_error&) {}
-   }
-  },
-  [execution](int, int) { return DirectComputeConfiguration{execution}; }, {}, pending_png_encoder(encoding));
+ ValidationSystem validation(settings, dataset, model, [&](DirectComputeConfiguration) { return std::make_unique<PendingOutputRuntime>(execution); }, [&](auto event) {
+  if (auto* changed = std::get_if<ValidationChanged>(&event);
+   changed && !changed->snapshot.operation.active && changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled) {
+   try {
+    terminal.set_value(changed->snapshot);
+   } catch (const std::future_error&) {}
+  }
+ }, [execution](int, int) { return DirectComputeConfiguration{execution}; }, {}, pending_png_encoder(encoding));
  PendingValidationRun run(validation, encoding);
  std::future<void> joining;
  std::promise<void> shutdown_entered;
@@ -1494,21 +1479,18 @@ TEST_CASE("validation runtime throw settles selected PNG before failure and rest
  std::promise<ValidationSnapshot> failed, restarted;
  auto failure = failed.get_future();
  unsigned runs = 0;
- ValidationSystem validation(
-  settings, dataset, model,
-  [&](
-   DirectComputeConfiguration) { return std::make_unique<PendingOutputRuntime>(execution, runs++ == 0 ? contracts::ComputeOperationOutcome::Failed : contracts::ComputeOperationOutcome::Succeeded); },
-  [&](auto event) {
-   if (auto* changed = std::get_if<ValidationChanged>(&event); changed && !changed->snapshot.operation.active) {
-    try {
-     if (changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed)
-      failed.set_value(changed->snapshot);
-     else if (changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded)
-      restarted.set_value(changed->snapshot);
-    } catch (const std::future_error&) {}
-   }
-  },
-  [execution](int, int) { return DirectComputeConfiguration{execution}; }, {}, pending_png_encoder(encoding));
+ ValidationSystem validation(settings, dataset, model, [&](DirectComputeConfiguration) {
+  return std::make_unique<PendingOutputRuntime>(execution, runs++ == 0 ? contracts::ComputeOperationOutcome::Failed : contracts::ComputeOperationOutcome::Succeeded);
+ }, [&](auto event) {
+  if (auto* changed = std::get_if<ValidationChanged>(&event); changed && !changed->snapshot.operation.active) {
+   try {
+    if (changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed)
+     failed.set_value(changed->snapshot);
+    else if (changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded)
+     restarted.set_value(changed->snapshot);
+   } catch (const std::future_error&) {}
+  }
+ }, [execution](int, int) { return DirectComputeConfiguration{execution}; }, {}, pending_png_encoder(encoding));
  PendingValidationRun run(validation, encoding);
  CHECK(failure.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout);
  CHECK(validation.snapshot().operation.active);

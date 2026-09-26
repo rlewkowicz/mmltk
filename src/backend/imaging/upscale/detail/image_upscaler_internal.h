@@ -135,12 +135,9 @@ public:
  }
  [[nodiscard]] ImageUpscalerBackend backend() const noexcept final { return Backend; }
  [[nodiscard]] ImageUpscalerRuntimeOutput enqueue(const ImageUpscalerRequest& request, const cudaStream_t consumer_stream) final {
-  return state_.enqueue(
-   request, consumer_stream, &owner(),
-   [](void* context, const ImageUpscalerRequest& submitted, const cudaStream_t stream, const std::uint32_t width, const std::uint32_t height) {
-    return static_cast<BackendOwner*>(context)->submit_tiles(submitted, stream, width, height);
-   },
-   checkpoint_);
+  return state_.enqueue(request, consumer_stream, &owner(), [](void* context, const ImageUpscalerRequest& submitted, const cudaStream_t stream, const std::uint32_t width, const std::uint32_t height) {
+   return static_cast<BackendOwner*>(context)->submit_tiles(submitted, stream, width, height);
+  }, checkpoint_);
  }
  void mark_consumed(const cudaStream_t stream) final { state_.mark_consumed(stream); }
  void abandon_consumer() noexcept final { state_.abandon_consumer(); }

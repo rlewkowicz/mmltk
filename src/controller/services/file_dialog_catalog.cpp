@@ -46,18 +46,18 @@ FileDialogCatalog FileDialogCatalog::Build() {
  FileDialogDescriptorStorage dialogs;
  mmltk::controller::browser::VisitSettingsLeaves<mmltk::controller::contracts::GuiSettingsState>(
   [&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsLeafFact& field) {
-   if (!field.file_dialog) return;
-   if (dialogs.size() == dialogs.capacity()) throw std::logic_error("file-dialog declarations exceed fixed catalog capacity");
-   FileDialogDescriptor descriptor{};
-   descriptor.stable_id = field.stable_id;
-   descriptor.field_path = decltype(descriptor.field_path)::From(field.path);
-   descriptor.workflows = field.workflows;
-   descriptor.title = decltype(descriptor.title)::From(field.file_dialog->title);
-   descriptor.filter.name = decltype(descriptor.filter.name)::From(field.file_dialog->filter);
-   descriptor.filter.pattern = decltype(descriptor.filter.pattern)::From(field.file_dialog->pattern);
-   descriptor.mode = field.file_dialog->mode;
-   dialogs.push_back(std::move(descriptor));
-  });
+  if (!field.file_dialog) return;
+  if (dialogs.size() == dialogs.capacity()) throw std::logic_error("file-dialog declarations exceed fixed catalog capacity");
+  FileDialogDescriptor descriptor{};
+  descriptor.stable_id = field.stable_id;
+  descriptor.field_path = decltype(descriptor.field_path)::From(field.path);
+  descriptor.workflows = field.workflows;
+  descriptor.title = decltype(descriptor.title)::From(field.file_dialog->title);
+  descriptor.filter.name = decltype(descriptor.filter.name)::From(field.file_dialog->filter);
+  descriptor.filter.pattern = decltype(descriptor.filter.pattern)::From(field.file_dialog->pattern);
+  descriptor.mode = field.file_dialog->mode;
+  dialogs.push_back(std::move(descriptor));
+ });
  append_model_artifact_dialogs(dialogs);
  return Create(dialogs);
 }

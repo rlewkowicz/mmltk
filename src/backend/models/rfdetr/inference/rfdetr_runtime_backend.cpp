@@ -344,114 +344,115 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(
  } context{this, output_storage.get(), batch, annotations, selections, include_masks};
  const runtime::RuntimeOutputBinding binding{
   .context = &context,
-  .bind =
-   [](void* opaque, std::int32_t device, std::uintptr_t stream_value, std::span<runtime::RuntimeTensorBuffer> buffers) {
-    auto& call = *static_cast<Context*>(opaque);
-    auto& owner = *call.owner;
-    if (device != owner.lane_->device() || stream_value != owner.lane_->command_stream().native_handle || buffers.size() != owner.model_info().output_count) {
-     throw std::runtime_error("RF-DETR output binding received the wrong lane");
-    }
-    const auto options = torch::TensorOptions().device(torch::kCUDA, device);
-    for (std::size_t index = 0U; index < buffers.size(); ++index) {
-     runtime::RuntimeShape shape = owner.model_info().outputs[index].shape;
-     shape.extents[0] = call.batch;
-     const auto type = owner.model_info().outputs[index].element_type;
-     const auto count = checked_element_count(shape, element_bytes(type));
-     const at::IntArrayRef extents(shape.extents.data(), shape.rank);
-     auto& tensor = call.outputs->tensors[index];
-     if (!tensor.defined()) {
-      tensor = torch::empty(extents, options.dtype(torch_type(type)));
-     } else {
-      tensor.resize_(extents);
-     }
-     buffers[index] = {
-      .device_data = tensor.data_ptr(),
-      .capacity_bytes = count * element_bytes(type),
-      .shape = shape,
-      .element_type = type,
-     };
-    }
-   },
+  .bind = [](void* opaque, std::int32_t device, std::uintptr_t stream_value, std::span<runtime::RuntimeTensorBuffer> buffers) {
+  auto& call = *static_cast<Context*>(opaque);
+  auto& owner = *call.owner;
+  if (device != owner.lane_->device() || stream_value != owner.lane_->command_stream().native_handle || buffers.size() != owner.model_info().output_count) {
+   throw std::runtime_error("RF-DETR output binding received the wrong lane");
+  }
+  const auto options = torch::TensorOptions().device(torch::kCUDA, device);
+  for (std::size_t index = 0U; index < buffers.size(); ++index) {
+   runtime::RuntimeShape shape = owner.model_info().outputs[index].shape;
+   shape.extents[0] = call.batch;
+   const auto type = owner.model_info().outputs[index].element_type;
+   const auto count = checked_element_count(shape, element_bytes(type));
+   const at::IntArrayRef extents(shape.extents.data(), shape.rank);
+   auto& tensor = call.outputs->tensors[index];
+   if (!tensor.defined()) {
+    tensor = torch::empty(extents, options.dtype(torch_type(type)));
+   } else {
+    tensor.resize_(extents);
+   }
+   buffers[index] = {
+    .device_data = tensor.data_ptr(),
+    .capacity_bytes = count * element_bytes(type),
+    .shape = shape,
+    .element_type = type,
+   };
+  }
+ },
  };
  const runtime::RuntimeContinuation continuation{
   .context = &context,
-  .enqueue =
-   [](void* opaque, std::int32_t device, std::uintptr_t stream_value) {
-    auto& call = *static_cast<Context*>(opaque);
-    auto& owner = *call.owner;
-    if (device != owner.lane_->device() || stream_value != owner.lane_->command_stream().native_handle) { throw std::runtime_error("RF-DETR continuation received the wrong lane"); }
-    mmltk::backend::ml::cuda::run_on_torch_cuda_stream(device, stream_value, opaque, [](void* bound_context) {
-     auto& bound_call = *static_cast<Context*>(bound_context);
-     auto& bound_owner = *bound_call.owner;
-     const auto bound_device = bound_owner.lane_->device();
-     const auto bound_stream = bound_owner.lane_->command_stream().native_handle;
-     PredictionCountStorage::Prepare(bound_call.outputs->counts, bound_call.annotations.size(), bound_device, bound_owner.state_->retirement, bound_owner.state_->operations);
-     auto logits = bound_call.outputs->tensors[bound_owner.state_->logits];
-     auto all_boxes = bound_call.outputs->tensors[bound_owner.state_->boxes];
-     for (std::size_t index = 0U; index < bound_call.annotations.size(); ++index) {
-      auto& annotation = bound_call.annotations[index];
-      const auto limit = std::min({bound_owner.maximum_detections_, annotation.value_capacity, static_cast<std::size_t>(logits.size(1) * logits.size(2))});
-      if (limit == 0 || bound_owner.state_->layout->eligible_count() == 0) {
-       if (!bound_call.selections.empty()) bound_call.selections[index] = {};
-       continue;
-      }
-      const auto& region = annotation.source_region;
-      auto selected = select_output_batch_fixed_size(
-       OutputTensors{
-        .pred_logits = logits.narrow(0, static_cast<std::int64_t>(index), 1),
-        .pred_boxes = all_boxes.narrow(0, static_cast<std::int64_t>(index), 1),
-        .pred_masks =
-         bound_call.include_masks && bound_owner.state_->masks ? std::optional{bound_call.outputs->tensors[*bound_owner.state_->masks].narrow(0, static_cast<std::int64_t>(index), 1)} : std::nullopt,
-       },
-       region.height, region.width, static_cast<std::int64_t>(limit), bound_call.include_masks, bound_owner.state_->postprocess.get());
-      bound_call.outputs->counts->Publish(index, selected.counts, annotation);
-      PostprocessedBatch processed{selected.scores, selected.labels, selected.boxes, std::nullopt};
-      if (!bound_call.selections.empty()) {
-       auto& custody = bound_owner.state_->selections[index];
-       if (!custody) custody = std::make_shared<PostprocessedSelection>();
-       *custody = selected;
-       auto& destination = bound_call.selections[index];
-       destination = {.query_indices = {.device_data = selected.query_indices.data_ptr(),
-                       .capacity_bytes = static_cast<std::size_t>(selected.query_indices.numel() * selected.query_indices.element_size()),
-                       .shape = {.rank = 2U, .extents = {1, selected.query_indices.size(1)}},
-                       .element_type = runtime::RuntimeElementType::Int64},
-        .custody = custody};
-       if (selected.mask_logits) {
-        auto mask_buffer = bound_call.outputs->buffers[*bound_owner.state_->masks];
-        mask_buffer.device_data = selected.mask_logits->data_ptr();
-        mask_buffer.shape.extents[0] = 1;
-        mask_buffer.capacity_bytes = selected.mask_logits->numel() * selected.mask_logits->element_size();
-        destination.mask_logits = mask_buffer;
-       }
-      } else if (selected.mask_logits)
-       processed.masks = materialize_selected_masks(*selected.mask_logits, selected.query_indices, region.height, region.width);
-      auto scores = processed.scores[0];
-      auto labels = processed.labels[0].to(at::kInt);
-      auto xyxy = processed.boxes[0].to(at::kFloat);
-      const auto count = static_cast<std::size_t>(scores.size(0));
-      if (count == 0U) continue;
-      const auto cuda_options = torch::TensorOptions().device(torch::kCUDA, bound_device);
-      const std::array<std::int64_t, 2> boxes_shape{static_cast<std::int64_t>(count), 4};
-      const std::array<std::int64_t, 1> values_shape{static_cast<std::int64_t>(count)};
-      torch::from_blob(reinterpret_cast<void*>(annotation.boxes_xyxy.address), at::IntArrayRef{boxes_shape}, cuda_options.dtype(at::kFloat)).copy_(xyxy);
-      torch::from_blob(reinterpret_cast<void*>(annotation.class_references.address), at::IntArrayRef{values_shape}, cuda_options.dtype(at::kInt)).copy_(labels);
-      torch::from_blob(reinterpret_cast<void*>(annotation.confidences.address), at::IntArrayRef{values_shape}, cuda_options.dtype(at::kFloat)).copy_(scores.to(at::kFloat));
-      if (processed.masks && annotation.masks.address != 0U) {
-       const auto bytes = count * region.width * region.height;
-       validate_annotation_buffer(annotation.masks, runtime::AnalysisElementType::Uint8, bytes, 3U, static_cast<std::uint32_t>(annotation.value_capacity), region.height, "mask");
-       if (annotation.masks.shape.extents[1] != region.height || annotation.masks.shape.extents[2] != region.width) throw std::invalid_argument("RF-DETR mask storage has wrong geometry");
-       const std::array<std::int64_t, 3> mask_shape{static_cast<std::int64_t>(count), region.height, region.width};
-       torch::from_blob(reinterpret_cast<void*>(annotation.masks.address), at::IntArrayRef{mask_shape}, cuda_options.dtype(torch::kUInt8)).copy_((*processed.masks)[0]);
-       annotation.masks_available = true;
-      }
-      if (annotation.colors_rgb.address != 0U) {
-       build_instance_colors_async(reinterpret_cast<const std::int32_t*>(annotation.class_references.address), count,
-        static_cast<int>(bound_owner.state_->layout->semantic() ? bound_owner.state_->layout->catalog()->size() : bound_owner.state_->layout->output_width()),
-        reinterpret_cast<std::uint8_t*>(annotation.colors_rgb.address), reinterpret_cast<cudaStream_t>(bound_stream));
-      }
+  .enqueue = [](void* opaque, std::int32_t device, std::uintptr_t stream_value) {
+  auto& call = *static_cast<Context*>(opaque);
+  auto& owner = *call.owner;
+  if (device != owner.lane_->device() || stream_value != owner.lane_->command_stream().native_handle) { throw std::runtime_error("RF-DETR continuation received the wrong lane"); }
+  mmltk::backend::ml::cuda::run_on_torch_cuda_stream(device, stream_value, opaque, [](void* bound_context) {
+   auto& bound_call = *static_cast<Context*>(bound_context);
+   auto& bound_owner = *bound_call.owner;
+   const auto bound_device = bound_owner.lane_->device();
+   const auto bound_stream = bound_owner.lane_->command_stream().native_handle;
+   PredictionCountStorage::Prepare(bound_call.outputs->counts, bound_call.annotations.size(), bound_device, bound_owner.state_->retirement, bound_owner.state_->operations);
+   auto logits = bound_call.outputs->tensors[bound_owner.state_->logits];
+   auto all_boxes = bound_call.outputs->tensors[bound_owner.state_->boxes];
+   for (std::size_t index = 0U; index < bound_call.annotations.size(); ++index) {
+    auto& annotation = bound_call.annotations[index];
+    const auto limit = std::min({bound_owner.maximum_detections_, annotation.value_capacity, static_cast<std::size_t>(logits.size(1) * logits.size(2))});
+    if (limit == 0 || bound_owner.state_->layout->eligible_count() == 0) {
+     if (!bound_call.selections.empty()) bound_call.selections[index] = {};
+     continue;
+    }
+    const auto& region = annotation.source_region;
+    auto selected = select_output_batch_fixed_size(
+     OutputTensors{
+      .pred_logits = logits.narrow(0, static_cast<std::int64_t>(index), 1),
+      .pred_boxes = all_boxes.narrow(0, static_cast<std::int64_t>(index), 1),
+      .pred_masks =
+       bound_call.include_masks && bound_owner.state_->masks ? std::optional{bound_call.outputs->tensors[*bound_owner.state_->masks].narrow(0, static_cast<std::int64_t>(index), 1)} : std::nullopt,
+     },
+     region.height, region.width, static_cast<std::int64_t>(limit), bound_call.include_masks, bound_owner.state_->postprocess.get());
+    bound_call.outputs->counts->Publish(index, selected.counts, annotation);
+    PostprocessedBatch processed{selected.scores, selected.labels, selected.boxes, std::nullopt};
+    if (!bound_call.selections.empty()) {
+     auto& custody = bound_owner.state_->selections[index];
+     if (!custody) custody = std::make_shared<PostprocessedSelection>();
+     *custody = selected;
+     auto& destination = bound_call.selections[index];
+     destination = {
+      .query_indices =
+       {.device_data = selected.query_indices.data_ptr(),
+        .capacity_bytes = static_cast<std::size_t>(selected.query_indices.numel() * selected.query_indices.element_size()),
+        .shape = {.rank = 2U, .extents = {1, selected.query_indices.size(1)}},
+        .element_type = runtime::RuntimeElementType::Int64},
+      .custody = custody
+     };
+     if (selected.mask_logits) {
+      auto mask_buffer = bound_call.outputs->buffers[*bound_owner.state_->masks];
+      mask_buffer.device_data = selected.mask_logits->data_ptr();
+      mask_buffer.shape.extents[0] = 1;
+      mask_buffer.capacity_bytes = selected.mask_logits->numel() * selected.mask_logits->element_size();
+      destination.mask_logits = mask_buffer;
      }
-    });
-   },
+    } else if (selected.mask_logits)
+     processed.masks = materialize_selected_masks(*selected.mask_logits, selected.query_indices, region.height, region.width);
+    auto scores = processed.scores[0];
+    auto labels = processed.labels[0].to(at::kInt);
+    auto xyxy = processed.boxes[0].to(at::kFloat);
+    const auto count = static_cast<std::size_t>(scores.size(0));
+    if (count == 0U) continue;
+    const auto cuda_options = torch::TensorOptions().device(torch::kCUDA, bound_device);
+    const std::array<std::int64_t, 2> boxes_shape{static_cast<std::int64_t>(count), 4};
+    const std::array<std::int64_t, 1> values_shape{static_cast<std::int64_t>(count)};
+    torch::from_blob(reinterpret_cast<void*>(annotation.boxes_xyxy.address), at::IntArrayRef{boxes_shape}, cuda_options.dtype(at::kFloat)).copy_(xyxy);
+    torch::from_blob(reinterpret_cast<void*>(annotation.class_references.address), at::IntArrayRef{values_shape}, cuda_options.dtype(at::kInt)).copy_(labels);
+    torch::from_blob(reinterpret_cast<void*>(annotation.confidences.address), at::IntArrayRef{values_shape}, cuda_options.dtype(at::kFloat)).copy_(scores.to(at::kFloat));
+    if (processed.masks && annotation.masks.address != 0U) {
+     const auto bytes = count * region.width * region.height;
+     validate_annotation_buffer(annotation.masks, runtime::AnalysisElementType::Uint8, bytes, 3U, static_cast<std::uint32_t>(annotation.value_capacity), region.height, "mask");
+     if (annotation.masks.shape.extents[1] != region.height || annotation.masks.shape.extents[2] != region.width) throw std::invalid_argument("RF-DETR mask storage has wrong geometry");
+     const std::array<std::int64_t, 3> mask_shape{static_cast<std::int64_t>(count), region.height, region.width};
+     torch::from_blob(reinterpret_cast<void*>(annotation.masks.address), at::IntArrayRef{mask_shape}, cuda_options.dtype(torch::kUInt8)).copy_((*processed.masks)[0]);
+     annotation.masks_available = true;
+    }
+    if (annotation.colors_rgb.address != 0U) {
+     build_instance_colors_async(reinterpret_cast<const std::int32_t*>(annotation.class_references.address), count,
+      static_cast<int>(bound_owner.state_->layout->semantic() ? bound_owner.state_->layout->catalog()->size() : bound_owner.state_->layout->output_width()),
+      reinterpret_cast<std::uint8_t*>(annotation.colors_rgb.address), reinterpret_cast<cudaStream_t>(bound_stream));
+    }
+   }
+  });
+ },
  };
  try {
   std::shared_ptr<void> retained_storage = output_storage;

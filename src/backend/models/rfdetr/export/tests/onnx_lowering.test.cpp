@@ -186,8 +186,7 @@ TEST_CASE("test_lower_to_emits_onnx_cast", "[model][rfdetr][onnx_lowering]") {
  check_lowered_cast_target(torch::randn({2, 3}), [](const torch::Tensor& input) { return input.to(torch::kBool); }, kAtenTo, mmltk::backend::models::rfdetr::OnnxTensorElementType::Bool);
 }
 TEST_CASE("test_lower_type_as_emits_onnx_cast", "[model][rfdetr][onnx_lowering]") {
- check_lowered_cast_target(
-  torch::randn({2, 3}), [](const torch::Tensor& input) { return input.type_as(torch::ones({1}, torch::TensorOptions().dtype(torch::kFloat16))); }, kAtenTypeAs,
+ check_lowered_cast_target(torch::randn({2, 3}), [](const torch::Tensor& input) { return input.type_as(torch::ones({1}, torch::TensorOptions().dtype(torch::kFloat16))); }, kAtenTypeAs,
   mmltk::backend::models::rfdetr::OnnxTensorElementType::Float16);
 }
 TEST_CASE("test_lower_noop_to_removes_redundant_cast", "[model][rfdetr][onnx_lowering]") {
@@ -195,25 +194,20 @@ TEST_CASE("test_lower_noop_to_removes_redundant_cast", "[model][rfdetr][onnx_low
  REQUIRE((!block_contains_kind(graph->block(), kOnnxCast)));
 }
 TEST_CASE("test_lower_six_input_to_emits_onnx_cast", "[model][rfdetr][onnx_lowering]") {
- check_lowered_cast_target(
-  torch::randn({2, 3}),
-  [](const torch::Tensor& input) {
-   auto source = torch::ones({2, 3}, torch::TensorOptions().dtype(torch::kInt64).device(input.device()));
-   return source.to(input.device(), input.dtype(), false, false);
-  },
-  kAtenTo, mmltk::backend::models::rfdetr::OnnxTensorElementType::Float32);
+ check_lowered_cast_target(torch::randn({2, 3}), [](const torch::Tensor& input) {
+  auto source = torch::ones({2, 3}, torch::TensorOptions().dtype(torch::kInt64).device(input.device()));
+  return source.to(input.device(), input.dtype(), false, false);
+ }, kAtenTo, mmltk::backend::models::rfdetr::OnnxTensorElementType::Float32);
 }
 TEST_CASE("test_lower_convolution_emits_onnx_conv", "[model][rfdetr][onnx_lowering]") {
  auto weight = torch::randn({8, 3, 3, 3});
  auto bias = torch::randn({8});
- const auto graph = lower_unary_graph_and_check(torch::randn({1, 3, 16, 16}),
-  [weight, bias](const torch::Tensor& input) {
-   const std::vector<int64_t> stride{2, 2};
-   const std::vector<int64_t> padding{1, 1};
-   const std::vector<int64_t> dilation{1, 1};
-   return torch::conv2d(input, weight, bias, stride, padding, dilation, 1);
-  },
-  {kAtenConvolution});
+ const auto graph = lower_unary_graph_and_check(torch::randn({1, 3, 16, 16}), [weight, bias](const torch::Tensor& input) {
+  const std::vector<int64_t> stride{2, 2};
+  const std::vector<int64_t> padding{1, 1};
+  const std::vector<int64_t> dilation{1, 1};
+  return torch::conv2d(input, weight, bias, stride, padding, dilation, 1);
+ }, {kAtenConvolution});
  auto* conv = find_first_node_kind(graph->block(), kOnnxConv);
  REQUIRE((conv != nullptr));
  REQUIRE((conv->is(kAttrKernelShape) == std::vector<int64_t>({3, 3})));
@@ -326,12 +320,10 @@ TEST_CASE("test_lower_layer_norm_emits_onnx_layer_normalization", "[model][rfdet
  assert_lowering_replaces_kinds(graph, &initializers, {kAtenLayerNorm}, {kOnnxLayerNormalization});
 }
 TEST_CASE("test_lower_add_inplace_emits_onnx_add", "[model][rfdetr][onnx_lowering]") {
- lower_unary_graph_and_check(torch::randn({2, 3, 8}),
-  [](const torch::Tensor& input) {
-   auto out = input + 1.0;
-   return out.add_(input);
-  },
-  {kAtenAddInplace}, {kOnnxAdd});
+ lower_unary_graph_and_check(torch::randn({2, 3, 8}), [](const torch::Tensor& input) {
+  auto out = input + 1.0;
+  return out.add_(input);
+ }, {kAtenAddInplace}, {kOnnxAdd});
 }
 TEST_CASE("test_lower_arange_emits_onnx_range", "[model][rfdetr][onnx_lowering]") {
  lower_unary_graph_and_check(torch::randn({2, 3, 8}), [](const torch::Tensor& input) { return at::arange(input.size(2), input.options().dtype(torch::kFloat32)); }, {kAtenArange}, {kOnnxRange});

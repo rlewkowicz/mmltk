@@ -137,9 +137,9 @@ TEST_CASE("rendered image writer shutdown retains engaged encoder pixels through
  mmltk::testsupport::TestGate encoding("rendered writer pending encode");
  auto writer =
   std::make_unique<mmltk::backend::imaging::raster::RenderedImageWriter>(context, [gate = encoding.receipt()](const char* path, int width, int height, int channels, const void* pixels, int stride) {
-   gate.ArriveAndWait();
-   return stbi_write_png(path, width, height, channels, pixels, stride);
-  });
+  gate.ArriveAndWait();
+  return stbi_write_png(path, width, height, channels, pixels, stride);
+ });
  mmltk::testsupport::ScopedTestCleanup release([&] { encoding.Release(); });
  const mmltk::testsupport::ScopedTempDir directory("writer-shutdown-output");
  const auto path = directory.path() / "sample.png";

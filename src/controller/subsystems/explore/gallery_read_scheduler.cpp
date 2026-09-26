@@ -146,12 +146,14 @@ void GalleryReadScheduler::PublishInput(Lane& lane) {
   lane.state = lane.failure ? LaneState::Failed : lane.read_valid ? LaneState::InputReady : LaneState::StaleReady;
  if (lane.prefetch && lane.state == LaneState::InputReady && diagnostics_.valid())
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Explore,
     .operation = VisualDiagnosticOperation::ExplorePrefetchReady,
     .generation = lane.generation,
     .value = lane.compiled_index,
     .detail = lanes_.size(),
-    .context = {.staging_bytes = lane.pinned.capacity_bytes() + image_stream_.host_storage(lane.index).capacity_bytes()}};
+    .context = {.staging_bytes = lane.pinned.capacity_bytes() + image_stream_.host_storage(lane.index).capacity_bytes()}
+   };
   });
 }
 void GalleryReadScheduler::FinishTransfer(std::size_t index, std::exception_ptr failure) noexcept {
@@ -179,12 +181,14 @@ void GalleryReadScheduler::AcceptanceDiagnostic(const VisualDiagnosticOperation 
  std::scoped_lock lock(lanes_mutex_);
  if (lane.prefetch) return;
  diagnostics_.Emit([&] {
-  return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+  return VisualDiagnosticFact{
+   .system = contracts::DiagnosticOwner::Explore,
    .operation = operation,
    .generation = lane.generation,
    .value = lane.destination_slot,
    .detail = detail,
-   .context = {.staging_bytes = lane.pinned.capacity_bytes()}};
+   .context = {.staging_bytes = lane.pinned.capacity_bytes()}
+  };
  });
 }
 void GalleryReadScheduler::ReadLanePayload(Lane& lane) {
@@ -254,13 +258,15 @@ void GalleryReadScheduler::CompleteLane(const std::size_t lane_index, std::excep
    lane.state = LaneState::GpuComplete;
   }
   if (observed)
-   fact = {.system = contracts::DiagnosticOwner::Explore,
+   fact = {
+    .system = contracts::DiagnosticOwner::Explore,
     .operation = failure ? VisualDiagnosticOperation::GalleryGpuFailed : VisualDiagnosticOperation::GalleryGpuCompleted,
     .device = device_,
     .generation = lane.generation,
     .value = lane.destination_slot,
     .detail = lane.compiled_index,
-    .context = {.demand = {.demand_generation = lane.DemandGeneration()}, .transfer = {.transfer_sequence = lane.tile_generation}, .link = lane.diagnostic_link}};
+    .context = {.demand = {.demand_generation = lane.DemandGeneration()}, .transfer = {.transfer_sequence = lane.tile_generation}, .link = lane.diagnostic_link}
+   };
   sink = ready_sink_;
  }
  if (observed) diagnostics_(fact);
@@ -273,23 +279,25 @@ void GalleryReadScheduler::SubmitRead(Lane& lane, const bool observed) {
  const std::array reads{data::CompiledImageRead{lane.compiled_index, 0U}, data::CompiledImageRead{lane.donor_index, lane.layout.pixel_bytes}};
  data::CompiledImageStream::ReadObserver observer;
  if (observed)
-  observer = {.context = this,
-   .before = [](void* context, std::size_t index) { return static_cast<GalleryReadScheduler*>(context)->BeginReadLane(index); },
-   .complete = [](void* context, std::size_t index, std::exception_ptr failure, bool read) noexcept { static_cast<GalleryReadScheduler*>(context)->FinishReadLane(index, failure, read); }};
+  observer = {.context = this, .before = [](void* context, std::size_t index) {
+   return static_cast<GalleryReadScheduler*>(context)->BeginReadLane(index);
+  }, .complete = [](void* context, std::size_t index, std::exception_ptr failure, bool read) noexcept { static_cast<GalleryReadScheduler*>(context)->FinishReadLane(index, failure, read); }};
  else
   observer = {.context = this, .before = [](void* context, std::size_t index) {
-               auto& owner = *static_cast<GalleryReadScheduler*>(context);
-               const auto& candidate_lane = owner.LaneAt(index);
-               if (!owner.current_demand_(candidate_lane.DemandGeneration())) return false;
-               owner.diagnostics_.Emit([&] {
-                return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                 .operation = VisualDiagnosticOperation::GalleryReadStarted,
-                 .device = owner.device_,
-                 .generation = candidate_lane.generation,
-                 .detail = candidate_lane.compiled_index};
-               });
-               return true;
-              }};
+   auto& owner = *static_cast<GalleryReadScheduler*>(context);
+   const auto& candidate_lane = owner.LaneAt(index);
+   if (!owner.current_demand_(candidate_lane.DemandGeneration())) return false;
+   owner.diagnostics_.Emit([&] {
+    return VisualDiagnosticFact{
+     .system = contracts::DiagnosticOwner::Explore,
+     .operation = VisualDiagnosticOperation::GalleryReadStarted,
+     .device = owner.device_,
+     .generation = candidate_lane.generation,
+     .detail = candidate_lane.compiled_index
+    };
+   });
+   return true;
+  }};
  image_stream_.submit(lane.index, *lane.store, std::span{reads}.first(lane.donor_instance ? 2U : 1U), observer,
   {.context = this, .complete = [](void* context, std::size_t index, std::exception_ptr error) noexcept { static_cast<GalleryReadScheduler*>(context)->FinishTransfer(index, error); }});
 }
@@ -328,12 +336,14 @@ GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(
 void GalleryReadScheduler::PrepareLaneStorage(const GalleryProductState& product, Lane& lane, const std::uint32_t compiled_index, const std::uint32_t slot, const std::uint64_t generation) {
  image_stream_.bind_current_context();
  lane.store = product.store;
- lane.identity = {.incarnation = lane.store.get(),
+ lane.identity = {
+  .incarnation = lane.store.get(),
   .dataset = product.plan.dataset_identity,
   .seed = product.plan.augmentation.seed,
   .augmentation = product.plan.augmentation_config,
   .extent = explore_atlas_card_extent(product.viewport),
-  .augmented = product.plan.augmentation.enabled};
+  .augmented = product.plan.augmentation.enabled
+ };
  lane.transfer_ready = false;
  lane.read_valid = false;
  lane.pending_meaning.reset();
@@ -475,12 +485,14 @@ void GalleryReadScheduler::RebindInput(const GalleryProductState& product, const
  lane.semantic_bank = product.cache.WritableBank(lane.position, incumbent, true);
  lane.state = LaneState::InputReady;
  scheduled_slots_[product.cache.Slot(lane.position)] = generation;
- const explore::ExploreRenderTileDescriptor tile{.card_index = lane.destination_slot,
+ const explore::ExploreRenderTileDescriptor tile{
+  .card_index = lane.destination_slot,
   .destination_x = lane.prefetch ? 0U : lane.destination_slot % lane.columns * lane.card_extent,
   .destination_y = lane.prefetch ? static_cast<std::uint32_t>(product.cache.PhysicalRow(product.cache.Slot(lane.position), lane.cache_bank)) : lane.destination_slot / lane.columns * lane.card_extent,
   .destination_width = lane.card_extent,
   .destination_height = lane.card_extent,
-  .generation = {.viewport = generation, .tile = ++next_tile_generation_}};
+  .generation = {.viewport = generation, .tile = ++next_tile_generation_}
+ };
  store_payload(lane.pinned.data(), lane.layout.tile, tile);
 }
 void GalleryReadScheduler::StartIdleLanes(const GalleryProductState& product, const GalleryThumbnailCache* incumbent) {
@@ -551,12 +563,14 @@ void GalleryReadScheduler::StartIdleLanes(const GalleryProductState& product, co
    }
    diagnostics_.Emit([&] {
     std::scoped_lock lock(lanes_mutex_);
-    contracts::DiagnosticExploreAdmission admission{.admission_position = position,
+    contracts::DiagnosticExploreAdmission admission{
+     .admission_position = position,
      .admission_first_row = product.viewport.first_row,
      .admission_row_count = product.viewport.row_count,
      .admission_columns = product.viewport.columns,
      .admission_tier = !prefetch ? 0U : ((position / product.viewport.columns >= product.viewport.first_row) == (product.plan.scroll_direction == ExploreScrollDirection::Forward) ? 1U : 2U),
-     .admission_forward = product.plan.scroll_direction == ExploreScrollDirection::Forward};
+     .admission_forward = product.plan.scroll_direction == ExploreScrollDirection::Forward
+    };
     for (std::size_t offset = 0U; offset < product.window_indices.size(); ++offset) {
      const auto candidate = product.window_first + offset;
      if (product.cache.Find(product.window_indices[offset]) || scheduled_slots_[product.cache.Slot(candidate)] == generation) continue;
@@ -568,13 +582,15 @@ void GalleryReadScheduler::StartIdleLanes(const GalleryProductState& product, co
      else
       ++admission.admission_immediate_eligible;
     }
-    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+    return VisualDiagnosticFact{
+     .system = contracts::DiagnosticOwner::Explore,
      .operation = VisualDiagnosticOperation::GalleryReadScheduled,
      .device = device_,
      .generation = generation,
      .value = lane_index,
      .detail = compiled_index,
-     .context = {.admission = admission}};
+     .context = {.admission = admission}
+    };
    });
    SubmitRead(lane, true);
   } catch (...) {

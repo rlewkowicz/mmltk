@@ -25,10 +25,12 @@ namespace {
 class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
 public:
  [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(const mmltk::frameworks::gpu::ImageWorkspaceObservation& baseline) const override {
-  return {.allocation_identity = baseline.workspace ? baseline.workspace->identity() : 0U,
+  return {
+   .allocation_identity = baseline.workspace ? baseline.workspace->identity() : 0U,
    .regions = {&damage_, 1U},
    .full_image = full_damage_,
-   .baseline = {baseline.product_owner, baseline.product_revision}};
+   .baseline = {baseline.product_owner, baseline.product_revision}
+  };
  }
  void Open(const mmltk::frameworks::gpu::ImagePlaneView source, const VisualRegion crop, const VisualExtent target) override {
   crop_ = crop.valid() ? crop : VisualRegion{0U, 0U, source.descriptor.width, source.descriptor.height};
@@ -174,8 +176,10 @@ private:
     y2 = std::max(y2, bottom);
    }
   }
-  return {static_cast<int>(std::clamp(x1, 0.0F, static_cast<float>(width))), static_cast<int>(std::clamp(y1, 0.0F, static_cast<float>(height))),
-   static_cast<int>(std::clamp(x2, 0.0F, static_cast<float>(width))), static_cast<int>(std::clamp(y2, 0.0F, static_cast<float>(height)))};
+  return {
+   static_cast<int>(std::clamp(x1, 0.0F, static_cast<float>(width))), static_cast<int>(std::clamp(y1, 0.0F, static_cast<float>(height))),
+   static_cast<int>(std::clamp(x2, 0.0F, static_cast<float>(width))), static_cast<int>(std::clamp(y2, 0.0F, static_cast<float>(height)))
+  };
  }
  void Render(const AnnotationRenderState& description, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
   const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream_value) const override {
@@ -189,8 +193,10 @@ private:
   const bool initialize = retained.identity != clean.allocation.identity || retained.epoch != description.document_epoch || retained.width != clean.descriptor.width ||
                           retained.height != clean.descriptor.height || retained.semantic != semantic.allocation.identity;
   if (initialize) {
-   const raster::ConstBytes input{reinterpret_cast<const std::uint8_t*>(source.data + crop_.y * source.descriptor.pitch_bytes + crop_.x * 4U), source.descriptor.pitch_bytes,
-    static_cast<int>(crop_.width), static_cast<int>(crop_.height)};
+   const raster::ConstBytes input{
+    reinterpret_cast<const std::uint8_t*>(source.data + crop_.y * source.descriptor.pitch_bytes + crop_.x * 4U), source.descriptor.pitch_bytes, static_cast<int>(crop_.width),
+    static_cast<int>(crop_.height)
+   };
    const raster::MutableBytes output{reinterpret_cast<std::uint8_t*>(clean.data), clean.descriptor.pitch_bytes, static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)};
    if (!source.valid()) throw std::runtime_error("Annotation clean baseline source is unavailable");
    const auto status = input.width == output.width && input.height == output.height
@@ -428,7 +434,8 @@ private:
     offset += object.mask.runs.size();
    }
    const raster::MutableBytes overlay{
-    reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes, static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)};
+    reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes, static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)
+   };
    const raster::NativeStream native_stream{reinterpret_cast<void*>(stream_value)};
    const auto& geometry = geometry_[index];
    const auto* words = total_words ? static_cast<const std::uint32_t*>(mask_device_.active()) + run_count * 2 : nullptr;
@@ -446,8 +453,9 @@ private:
     throw std::runtime_error("Annotation vertex rendering failed");
    if (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask) continue;
    if (description.editor.selected_object == index &&
-       raster::raster_selection_handles_rgba({overlay, {static_cast<int>(box.first.x) - 5, static_cast<int>(box.first.y) - 5, static_cast<int>(box.second.x) + 5, static_cast<int>(box.second.y) + 5},
-        3, {255, 255, 255, 255}, native_stream, object_clip}) != 0)
+       raster::raster_selection_handles_rgba(
+        {overlay, {static_cast<int>(box.first.x) - 5, static_cast<int>(box.first.y) - 5, static_cast<int>(box.second.x) + 5, static_cast<int>(box.second.y) + 5}, 3, {255, 255, 255, 255},
+         native_stream, object_clip}) != 0)
     throw std::runtime_error("Annotation selection rendering failed");
    const raster::IntRect outline{static_cast<int>(box.first.x), static_cast<int>(box.first.y), static_cast<int>(box.second.x), static_cast<int>(box.second.y)};
    if (outline.x1 >= outline.x2 || outline.y1 >= outline.y2) continue;

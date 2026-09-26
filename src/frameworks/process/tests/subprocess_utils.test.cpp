@@ -83,25 +83,20 @@ TEST_CASE("captured_child_runner_reports_setup_failure", "[frameworks][process]"
  CHECK(result.setup_failure->error_number == ENOENT);
 }
 TEST_CASE("captured_child_runner_enforces_output_bound", "[frameworks][process]") {
- CHECK_THROWS_AS(process::run_captured_child_process(
-                  "test child", "failed to read test child output: ",
+ CHECK_THROWS_AS(process::run_captured_child_process("test child", "failed to read test child output: ",
                   [](const int output_fd, const int setup_fd) {
-                   process::prepare_captured_output_child(output_fd, setup_fd);
-                   exit_after_writing_stdout("too much output");
-                  },
-                  {}, std::chrono::milliseconds{0}, -1, false, 4U),
+  process::prepare_captured_output_child(output_fd, setup_fd);
+  exit_after_writing_stdout("too much output");
+ }, {}, std::chrono::milliseconds{0}, -1, false, 4U),
   std::runtime_error);
 }
 TEST_CASE("captured child timeout retains diagnostics and reaps its child", "[frameworks][process]") {
  try {
-  static_cast<void>(process::run_captured_child_process(
-   "waiting child", "failed to read waiting child output: ",
-   [](const int output_fd, const int setup_fd) {
-    process::prepare_captured_output_child(output_fd, setup_fd);
-    if (!write_exact(STDERR_FILENO, "waiting for peer\n")) std::_Exit(127);
-    for (;;) ::pause();
-   },
-   {}, std::chrono::seconds(1)));
+  static_cast<void>(process::run_captured_child_process("waiting child", "failed to read waiting child output: ", [](const int output_fd, const int setup_fd) {
+   process::prepare_captured_output_child(output_fd, setup_fd);
+   if (!write_exact(STDERR_FILENO, "waiting for peer\n")) std::_Exit(127);
+   for (;;) ::pause();
+  }, {}, std::chrono::seconds(1)));
   FAIL("waiting child escaped its deadline");
  } catch (const process::CapturedChildAborted& error) {
   CHECK(error.reason() == process::CapturedChildAbortReason::TimedOut);

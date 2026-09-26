@@ -258,7 +258,8 @@ public:
    for (const auto id : available_ids) publish_image({image_root, id});
   transfer_progress->images(source, artifact.artifact_id, expected_ids.size(), source_total_images, *progress, "Reusing cached " + archive_name + " images");
   return CachedImageDirectory{
-   source_name, std::move(shard), image_root, source_identity, cached_image_selection_digest(available_ids), available_ids.size(), cached_image_bytes, true, std::move(cached_quarantine)};
+   source_name, std::move(shard), image_root, source_identity, cached_image_selection_digest(available_ids), available_ids.size(), cached_image_bytes, true, std::move(cached_quarantine)
+  };
  }
  DownloadRequest request = make_download_request(cache, source_name, artifact);
  std::uint64_t pending_images = expected_ids.size();
@@ -300,35 +301,33 @@ public:
     .cancel_requested = cancel_requested,
     .progress =
      [&](const std::uint64_t completed, const std::uint64_t) {
-      if (completed < attempt_reported) { throw std::logic_error("archive attempt image progress regressed"); }
-      attempt_reported = completed;
-      if (progress->transfer_observer_enabled()) {
-       transfer_progress->images(source, artifact.artifact_id, completed, source_total_images, *progress, "Resolving " + archive_name + " selected images");
-      }
-      trace_benchmark_event(trace, "benchmark.images.progress",
-       [&] { return nlohmann::json{{"source", source_name}, {"shard", shard}, {"attempt", attempt}, {"resolved_images", completed}, {"total_images", expected_ids.size()}}; });
-     },
+    if (completed < attempt_reported) { throw std::logic_error("archive attempt image progress regressed"); }
+    attempt_reported = completed;
+    if (progress->transfer_observer_enabled()) { transfer_progress->images(source, artifact.artifact_id, completed, source_total_images, *progress, "Resolving " + archive_name + " selected images"); }
+    trace_benchmark_event(trace, "benchmark.images.progress",
+     [&] { return nlohmann::json{{"source", source_name}, {"shard", shard}, {"attempt", attempt}, {"resolved_images", completed}, {"total_images", expected_ids.size()}}; });
+   },
     .validator =
      [&](const std::uint64_t image_id, const std::span<const std::uint8_t> encoded) {
-      if (!has_complete_image_markers(encoded)) {
-       if (decode_probe && decode_probe->image_id == image_id && !quarantine_unavailable) {
-        throw RequiredImageDecodeError("required archive image " + std::to_string(image_id) + " remains incomplete after bounded repair");
-       }
-       throw std::runtime_error("selected archive image " + std::to_string(image_id) + " is not a complete JPEG or PNG");
-      }
-      try {
-       if (decode_probe && decode_probe->image_id == image_id) {
-        image_validator.validate_decodable(encoded, decode_probe->expected_width, decode_probe->expected_height);
-       } else {
-        (void)image_validator.read_header(encoded);
-       }
-      } catch (const InvalidImageError& error) {
-       if (decode_probe && decode_probe->image_id == image_id && !quarantine_unavailable) {
-        throw RequiredImageDecodeError("required archive image " + std::to_string(image_id) + " remains undecodable after bounded repair: " + error.what());
-       }
-       throw InvalidImageError("selected archive image " + std::to_string(image_id) + ": " + error.what());
-      }
-     },
+    if (!has_complete_image_markers(encoded)) {
+     if (decode_probe && decode_probe->image_id == image_id && !quarantine_unavailable) {
+      throw RequiredImageDecodeError("required archive image " + std::to_string(image_id) + " remains incomplete after bounded repair");
+     }
+     throw std::runtime_error("selected archive image " + std::to_string(image_id) + " is not a complete JPEG or PNG");
+    }
+    try {
+     if (decode_probe && decode_probe->image_id == image_id) {
+      image_validator.validate_decodable(encoded, decode_probe->expected_width, decode_probe->expected_height);
+     } else {
+      (void)image_validator.read_header(encoded);
+     }
+    } catch (const InvalidImageError& error) {
+     if (decode_probe && decode_probe->image_id == image_id && !quarantine_unavailable) {
+      throw RequiredImageDecodeError("required archive image " + std::to_string(image_id) + " remains undecodable after bounded repair: " + error.what());
+     }
+     throw InvalidImageError("selected archive image " + std::to_string(image_id) + ": " + error.what());
+    }
+   },
     .trace = trace,
     .quarantine_unavailable = quarantine_unavailable,
     .decompression_workers = decompression_workers,
@@ -538,15 +537,17 @@ void write_split_with_progress(BenchmarkSplitWriter& writer, const BenchmarkWrit
  const Clock::time_point started = trace ? Clock::now() : Clock::time_point{};
  BenchmarkWriteRequest observed = request;
  if (progress->pixel_observer_enabled()) {
-  observed.progress = {.context = progress,
-   .image_completed = [](void* context) { static_cast<ProgressReporter*>(context)->pixel_completed(); },
-   .images_invalidated = [](void* context, std::uint64_t count) { static_cast<ProgressReporter*>(context)->invalidate_pixels(count); }};
+  observed.progress = {.context = progress, .image_completed = [](void* context) {
+   static_cast<ProgressReporter*>(context)->pixel_completed();
+  }, .images_invalidated = [](void* context, std::uint64_t count) { static_cast<ProgressReporter*>(context)->invalidate_pixels(count); }};
  }
  writer.write_remaining(observed);
  trace_benchmark_event(trace, "benchmark.pixel_compile.complete", [&] {
   const double elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
-  return nlohmann::json{{"split", request.split.name}, {"completed_images", request.split.images.size()}, {"elapsed_seconds", elapsed_seconds},
-   {"images_per_second", elapsed_seconds > 0.0 ? static_cast<double>(request.split.images.size()) / elapsed_seconds : 0.0}, {"eta_seconds", 0.0}};
+  return nlohmann::json{
+   {"split", request.split.name}, {"completed_images", request.split.images.size()}, {"elapsed_seconds", elapsed_seconds},
+   {"images_per_second", elapsed_seconds > 0.0 ? static_cast<double>(request.split.images.size()) / elapsed_seconds : 0.0}, {"eta_seconds", 0.0}
+  };
  });
 }
 [[nodiscard]] nlohmann::json mapping_manifest() {
@@ -677,8 +678,10 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   trace_benchmark_event(trace, "benchmark.compile.paths", [&] {
    const TracePath cache_path = project_trace_path(normalized_cache_root.native());
    const TracePath output_path = project_trace_path(normalized_output.native());
-   return nlohmann::json{{"cache_root", cache_path.text}, {"output_root", output_path.text}, {"cache_root_truncated", cache_path.truncated}, {"output_root_truncated", output_path.truncated},
-    {"cache_root_utf8_replaced", cache_path.utf8_replaced}, {"output_root_utf8_replaced", output_path.utf8_replaced}};
+   return nlohmann::json{
+    {"cache_root", cache_path.text}, {"output_root", output_path.text}, {"cache_root_truncated", cache_path.truncated}, {"output_root_truncated", output_path.truncated},
+    {"cache_root_utf8_replaced", cache_path.utf8_replaced}, {"output_root_utf8_replaced", output_path.utf8_replaced}
+   };
   });
   if (path_contains(normalized_cache_root, normalized_output) || path_contains(normalized_output, normalized_cache_root) || path_contains(normalized_cache_root, normalized_publication) ||
       path_contains(normalized_publication, normalized_cache_root)) {
@@ -988,14 +991,20 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     BenchmarkCompilePipeline pipeline(pipeline_workers, std::span(compile_cpus).last(pipeline_workers));
     const auto pixel_lanes = pipeline.pixel_workers();
     const BenchmarkWriteProgressEvent pixel_progress = progress.pixel_observer_enabled()
-                                                        ? BenchmarkWriteProgressEvent{.context = &progress,
+                                                        ? BenchmarkWriteProgressEvent{
+                                                           .context = &progress,
                                                            .image_completed = [](void* context) { static_cast<ProgressReporter*>(context)->pixel_completed(); },
-                                                           .images_invalidated = [](void* context, std::uint64_t count) { static_cast<ProgressReporter*>(context)->invalidate_pixels(count); }}
+                                                           .images_invalidated = [](void* context, std::uint64_t count) { static_cast<ProgressReporter*>(context)->invalidate_pixels(count); }
+                                                          }
                                                         : BenchmarkWriteProgressEvent{};
-    const BenchmarkWriteRequest train_pixel_request{pixel_train, staging_dir / "train.bin", config.resolution, static_cast<int>(pixel_lanes), {}, false, cancel_requested, pixel_progress,
-     config.perceptual_downscale, config.resize_mode, image_opened};
-    const BenchmarkWriteRequest validation_pixel_request{pixel_validation, staging_dir / "val.bin", config.resolution, static_cast<int>(pixel_lanes), {}, false, cancel_requested, pixel_progress,
-     config.perceptual_downscale, config.resize_mode, image_opened};
+    const BenchmarkWriteRequest train_pixel_request{
+     pixel_train, staging_dir / "train.bin", config.resolution, static_cast<int>(pixel_lanes), {}, false, cancel_requested, pixel_progress, config.perceptual_downscale, config.resize_mode,
+     image_opened
+    };
+    const BenchmarkWriteRequest validation_pixel_request{
+     pixel_validation, staging_dir / "val.bin", config.resolution, static_cast<int>(pixel_lanes), {}, false, cancel_requested, pixel_progress, config.perceptual_downscale, config.resize_mode,
+     image_opened
+    };
     const auto reserve_pixels = [&](std::unique_ptr<BenchmarkSplitWriter>& retained, const BenchmarkWriteRequest& request, bool actual_dimensions) {
      if (retained && retained->matches_membership(request.split)) return;
      auto replacement = std::make_unique<BenchmarkSplitWriter>(request, actual_dimensions);
@@ -1589,8 +1598,9 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     std::uint64_t cached_image_bytes = 0U;
     const auto append_image_cache = [&](const std::vector<CachedImageDirectory>& directories) {
      for (const CachedImageDirectory& directory : directories) {
-      manifest["image_cache"].push_back({{"source", directory.source}, {"shard", directory.shard}, {"path", directory.path.lexically_relative(cache.root).string()}, {"identity", directory.identity},
-       {"selection_sha256", directory.selection_sha256}, {"images", directory.image_count}, {"bytes", directory.image_bytes}, {"cache_hit", directory.cache_hit}});
+      manifest["image_cache"].push_back(
+       {{"source", directory.source}, {"shard", directory.shard}, {"path", directory.path.lexically_relative(cache.root).string()}, {"identity", directory.identity},
+        {"selection_sha256", directory.selection_sha256}, {"images", directory.image_count}, {"bytes", directory.image_bytes}, {"cache_hit", directory.cache_hit}});
       cached_image_bytes = common_math::checked_add(cached_image_bytes, directory.image_bytes, "benchmark cached image byte total overflow");
      }
     };
@@ -1622,8 +1632,10 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     staging_owner->published();
     progress.phase(DatasetCompilePhase::Publishing, 1U, 1U);
     trace_benchmark_event(trace, "benchmark.publication.complete", [&] {
-     return nlohmann::json{{"output", config.output_dir.string()}, {"train_images", train.images.size()}, {"val_images", validation.images.size()}, {"train_mask_rle_pairs", train.rle_pairs.size()},
-      {"val_mask_rle_pairs", validation.rle_pairs.size()}, {"bytes", total_output_estimate}};
+     return nlohmann::json{
+      {"output", config.output_dir.string()}, {"train_images", train.images.size()}, {"val_images", validation.images.size()}, {"train_mask_rle_pairs", train.rle_pairs.size()},
+      {"val_mask_rle_pairs", validation.rle_pairs.size()}, {"bytes", total_output_estimate}
+     };
     });
     return;
    } catch (const PhysicalArchiveRecovery& error) {

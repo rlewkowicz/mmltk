@@ -17,38 +17,34 @@ namespace {
         std::ranges::all_of(intent.fields, [&intent](const IntentField& field) { return field.field_id != 0U && std::ranges::count(intent.fields, field.field_id, &IntentField::field_id) == 1U; });
 }
 [[nodiscard]] bool valid_client_record(const ClientRecord& record) noexcept {
- return std::visit(
-  []<class Record>(const Record& value) noexcept {
-   using T = std::remove_cvref_t<Record>;
-   if constexpr (std::same_as<T, Intent>) {
-    return valid_intent(value);
-   } else if constexpr (std::same_as<T, Interaction>) {
-    return value.protocol_version == kBrowserProtocolVersion && value.endpoint_id != 0U;
-   } else if constexpr (std::same_as<T, IntegrationControl>) {
-    return value.protocol_version == kBrowserProtocolVersion && contracts::integration_receipt_valid(value.receipt) && !contracts::integration_server_command(value.receipt.kind);
-   }
-  },
-  record);
+ return std::visit([]<class Record>(const Record& value) noexcept {
+  using T = std::remove_cvref_t<Record>;
+  if constexpr (std::same_as<T, Intent>) {
+   return valid_intent(value);
+  } else if constexpr (std::same_as<T, Interaction>) {
+   return value.protocol_version == kBrowserProtocolVersion && value.endpoint_id != 0U;
+  } else if constexpr (std::same_as<T, IntegrationControl>) {
+   return value.protocol_version == kBrowserProtocolVersion && contracts::integration_receipt_valid(value.receipt) && !contracts::integration_server_command(value.receipt.kind);
+  }
+ }, record);
 }
 [[nodiscard]] bool valid_server_record(const ServerRecord& record) noexcept {
- return std::visit(
-  []<class Record>(const Record& value) noexcept {
-   using T = std::remove_cvref_t<Record>;
-   if constexpr (std::same_as<T, Bootstrap>) {
-    if (value.protocol_version != kBrowserProtocolVersion || value.input_epoch == 0U || value.schema_fingerprint[0] == 0U || value.schema_fingerprint[1] == 0U) return false;
-    return std::ranges::all_of(
-     value.snapshots, [&value](const SystemSnapshot& snapshot) { return snapshot.system_id != 0U && std::ranges::count(value.snapshots, snapshot.system_id, &SystemSnapshot::system_id) == 1U; });
-   } else if constexpr (std::same_as<T, IntentReply>) {
-    return value.protocol_version == kBrowserProtocolVersion && value.correlation != 0U && (value.result.has_value() != value.error.has_value());
-   } else if constexpr (std::same_as<T, InteractionRejected>) {
-    return value.protocol_version == kBrowserProtocolVersion && value.endpoint_id != 0U;
-   } else if constexpr (std::same_as<T, IntegrationControl>) {
-    return value.protocol_version == kBrowserProtocolVersion && contracts::integration_receipt_valid(value.receipt) && contracts::integration_server_command(value.receipt.kind);
-   } else {
-    return value.protocol_version == kBrowserProtocolVersion && value.system_id != 0U && value.event_id != 0U;
-   }
-  },
-  record);
+ return std::visit([]<class Record>(const Record& value) noexcept {
+  using T = std::remove_cvref_t<Record>;
+  if constexpr (std::same_as<T, Bootstrap>) {
+   if (value.protocol_version != kBrowserProtocolVersion || value.input_epoch == 0U || value.schema_fingerprint[0] == 0U || value.schema_fingerprint[1] == 0U) return false;
+   return std::ranges::all_of(
+    value.snapshots, [&value](const SystemSnapshot& snapshot) { return snapshot.system_id != 0U && std::ranges::count(value.snapshots, snapshot.system_id, &SystemSnapshot::system_id) == 1U; });
+  } else if constexpr (std::same_as<T, IntentReply>) {
+   return value.protocol_version == kBrowserProtocolVersion && value.correlation != 0U && (value.result.has_value() != value.error.has_value());
+  } else if constexpr (std::same_as<T, InteractionRejected>) {
+   return value.protocol_version == kBrowserProtocolVersion && value.endpoint_id != 0U;
+  } else if constexpr (std::same_as<T, IntegrationControl>) {
+   return value.protocol_version == kBrowserProtocolVersion && contracts::integration_receipt_valid(value.receipt) && contracts::integration_server_command(value.receipt.kind);
+  } else {
+   return value.protocol_version == kBrowserProtocolVersion && value.system_id != 0U && value.event_id != 0U;
+  }
+ }, record);
 }
 [[nodiscard]] std::string normalized_error_detail(const char* detail) noexcept {
  try {

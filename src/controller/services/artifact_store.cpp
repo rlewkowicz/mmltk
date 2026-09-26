@@ -34,14 +34,16 @@ std::expected<ArtifactCompileRequest, ArtifactCompileMaterializationError> mater
  const auto refusal = [](const std::string_view detail) { return std::unexpected{ArtifactCompileMaterializationError{.detail = mmltk::controller::contracts::bounded_artifact_detail(detail)}}; };
  if (!mmltk::controller::contracts::gui_settings_valid(settings)) return refusal("invalid settings");
  const auto& train = settings.workflows.train;
- ArtifactCompileRequest request{.source = train.dataset_source_dir,
+ ArtifactCompileRequest request{
+  .source = train.dataset_source_dir,
   .output = train.compiled_dataset_dir,
   .preset = train.request.preset_name,
   .resolution = static_cast<std::uint32_t>(train.request.resolution),
   .overwrite = train.overwrite_compiled_dataset,
   .benchmark_selection = train.benchmark_selection,
   .perceptual_downscale = train.compile_perceptual_downscale,
-  .resize_mode = train.compile_resize_mode};
+  .resize_mode = train.compile_resize_mode
+ };
  request.kind = train.compile_benchmark_dataset_override ? ArtifactCompileKind::Benchmark : ArtifactCompileKind::Directory;
  if (!request.valid()) return refusal("invalid dataset compile settings");
  return request;
@@ -53,7 +55,8 @@ namespace {
 [[nodiscard]] std::string bounded_progress_text(const std::string_view value) { return std::string{value.substr(0U, contracts::kArtifactProgressTextCapacity)}; }
 }  // namespace
 contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data::CompileProgress& value) {
- return {.phase = value.phase,
+ return {
+  .phase = value.phase,
   .activity = std::string{mmltk::backend::data::dataset_compile_phase_label(value.phase)},
   .completed = bounded_u64_count(value.done),
   .total = bounded_u64_count(value.total),
@@ -61,7 +64,8 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
   .remaining_seconds = value.remaining_seconds,
   .throughput_per_second = value.throughput_per_second,
   .dropped_instances = value.dropped_instances,
-  .tracks = value.tracks};
+  .tracks = value.tracks
+ };
 }
 contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data::BenchmarkCompileProgress& value) {
  std::string activity = value.activity;
@@ -73,7 +77,8 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
   }
  }
  const mmltk::backend::data::ProgressEstimate estimate = mmltk::backend::data::estimate_progress(value.completed, value.total, value.activity_elapsed_seconds);
- return {.phase = value.phase,
+ return {
+  .phase = value.phase,
   .activity = bounded_progress_text(activity),
   .completed = value.completed,
   .total = value.total,
@@ -84,7 +89,8 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
   .dropped_instances = value.dropped_instances,
   .quarantined_images = value.quarantined_images,
   .tracks = value.tracks,
-  .sources = value.sources};
+  .sources = value.sources
+ };
 }
 namespace {
 class RuntimeArtifactCompilerOperations final : public ArtifactCompilerOperations {
@@ -144,9 +150,11 @@ private:
     mmltk::backend::data::DatasetCompiler::compile(plan, split, nullptr, cancellation);
     continue;
    }
-   mmltk::backend::data::CompileTelemetry telemetry{plan.splits[split].image_count,
-    {.context = const_cast<ArtifactProgressObserver*>(&progress),
-     .report = [](void* context, const mmltk::backend::data::CompileProgress& update) noexcept { (*static_cast<const ArtifactProgressObserver*>(context))(project_artifact_progress(update)); }}};
+   mmltk::backend::data::CompileTelemetry telemetry{
+    plan.splits[split].image_count, {.context = const_cast<ArtifactProgressObserver*>(&progress), .report = [](void* context, const mmltk::backend::data::CompileProgress& update) noexcept {
+    (*static_cast<const ArtifactProgressObserver*>(context))(project_artifact_progress(update));
+   }}
+   };
    mmltk::backend::data::DatasetCompiler::compile(plan, split, &telemetry, cancellation);
    if (cancellation.requested()) return;
   }
@@ -189,19 +197,21 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
    if (const auto invalid = invalid_inspected_split(info)) { return rejected_inspection(*invalid); }
    if (info.width != info.height || info.channels != 3U || (resolution != 0U && info.width != resolution)) {
     const auto expected = resolution == 0U ? std::string{"square RGB (3 channels)"} : std::to_string(resolution) + "x" + std::to_string(resolution) + " RGB (3 channels)";
-    return rejected_inspection("Compiled dataset is " + std::to_string(info.width) + "x" + std::to_string(info.height) + " with " + std::to_string(info.channels) +
-                               " channels; " + std::string{preset} + " requires " + expected + ". Select matching model/dataset settings or recompile for that resolution. File: " + path.string());
+    return rejected_inspection("Compiled dataset is " + std::to_string(info.width) + "x" + std::to_string(info.height) + " with " + std::to_string(info.channels) + " channels; " +
+                               std::string{preset} + " requires " + expected + ". Select matching model/dataset settings or recompile for that resolution. File: " + path.string());
    }
    if (classes && !classes->ordered_equal(*info.class_catalog)) return rejected_inspection("compiled artifact class catalogs differ");
    classes = info.class_catalog;
    if (result.splits.size() >= contracts::kArtifactSplitCapacity) { return rejected_inspection("compiled artifact split count exceeds fixed capacity"); }
-   auto& split = result.splits.emplace_back(mmltk::controller::contracts::ArtifactSplitFact{.path = info.path.string(),
+   auto& split = result.splits.emplace_back(mmltk::controller::contracts::ArtifactSplitFact{
+    .path = info.path.string(),
     .image_count = static_cast<std::uint32_t>(info.image_count),
     .width = info.width,
     .height = info.height,
     .channels = info.channels,
     .max_instances_per_image = info.max_instances_per_image,
-    .class_names = {}});
+    .class_names = {}
+   });
    for (const std::string& name : info.class_names()) split.class_names.push_back({.value = name});
   } catch (const std::exception& error) { return rejected_inspection(error.what()); }
  }

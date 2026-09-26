@@ -802,9 +802,9 @@ TEST_CASE("Failed display finalization closes admission and retains complete tra
  const auto initiating = std::make_exception_ptr(std::runtime_error("display finalizer failed after transfer"));
  const auto cleanup = std::make_exception_ptr(std::runtime_error("display completion unavailable"));
  SystemImageRuntime runtime({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .workspace_finalize = [&](auto, auto, auto, auto, auto) {
-                              backend->FailDeviceBinding(1, cleanup);
-                              std::rethrow_exception(initiating);
-                             }});
+  backend->FailDeviceBinding(1, cleanup);
+  std::rethrow_exception(initiating);
+ }});
  runtime.Publish(4U, 3U, [](auto, auto, auto) {});
  auto completed = runtime.Completed();
  const auto raw = completed.Borrow().plane(0U).plane().data;
@@ -837,9 +837,9 @@ TEST_CASE("Workspace retirement retains cross-device transfer and raw custody th
   backend->peer_access = peer;
   SystemImageRuntime runtime(
    {.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .workspace_finalize = [](auto clean, auto semantic, auto destination, auto, auto) {
-     CHECK(*reinterpret_cast<const std::byte*>(semantic.data) == std::byte{91});
-     test_support::CopyImagePlane(destination, clean);
-    }});
+   CHECK(*reinterpret_cast<const std::byte*>(semantic.data) == std::byte{91});
+   test_support::CopyImagePlane(destination, clean);
+  }});
   runtime.Publish(4U, 3U, [](auto clean, auto semantic, auto) {
    for (const auto plane : {clean, semantic})
     std::memset(reinterpret_cast<void*>(plane.data), plane.descriptor.kind == ImagePlaneKind::Clean ? 37 : 91, plane.descriptor.pitch_bytes * plane.descriptor.height);
@@ -883,16 +883,18 @@ TEST_CASE("Shared display content rotates independent producer owners and layout
     std::array<ImageWorkspaceContent, 2U> contents{};
     for (std::size_t index = 0U; index != producers.size(); ++index) {
      const bool semantic = (index == 0U) == semantic_first;
-     producers[index] = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0,
+     producers[index] = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
+      .device = 0,
       .backend = backend,
       .output_layout = semantic ? ImageProductLayout::CleanAndSemantic : ImageProductLayout::Clean,
       .workspace_finalize = [&, index, semantic](auto clean, auto semantics, auto destination, auto coverage, auto) {
-       CHECK(coverage.full_image);
-       CHECK(semantics.valid() == semantic);
-       if (display_device == 0) CHECK(backend->last_bound_context == producer_contexts[index]);
-       if (semantic) CHECK(*reinterpret_cast<const std::byte*>(semantics.data) == std::byte{91});
-       test_support::CopyImagePlane(destination, clean);
-      }});
+      CHECK(coverage.full_image);
+      CHECK(semantics.valid() == semantic);
+      if (display_device == 0) CHECK(backend->last_bound_context == producer_contexts[index]);
+      if (semantic) CHECK(*reinterpret_cast<const std::byte*>(semantics.data) == std::byte{91});
+      test_support::CopyImagePlane(destination, clean);
+     }
+     });
      auto& runtime = *producers[index];
      runtime.BindContext();
      producer_contexts[index] = backend->last_bound_context.load();
@@ -1032,9 +1034,9 @@ TEST_CASE("Display remapping retries preserve raw products through partial const
    auto workspace = ImageWorkspaceTestAccess::Create(display, ImageWorkspaceTestAccess::Layout(0));
    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
    SystemImageRuntime runtime({.device = 0, .backend = backend, .workspace_finalize = [](auto clean, auto, auto destination, auto coverage, auto) {
-                                CHECK(coverage.full_image);
-                                test_support::CopyImagePlane(destination, clean);
-                               }});
+    CHECK(coverage.full_image);
+    test_support::CopyImagePlane(destination, clean);
+   }});
    runtime.Publish(4U, 3U, [](auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 73, clean.descriptor.pitch_bytes * clean.descriptor.height); });
    const auto observed = runtime.ObserveWorkspace();
    const ImageWorkspaceContent content{observed.product_owner, observed.product_revision};
@@ -1423,7 +1425,8 @@ TEST_CASE("Partial display copies retain raw reads until transfer settlement and
 }
 TEST_CASE("Workspace layout rejects overflow and inconsistent subresource bounds", "[gpu][workspace]") {
  ImageWorkspaceLayout layout{
-  .device_incarnation = 7U, .device_uuid = {1U}, .device = 0, .width = 4U, .height = 3U, .pitch_bytes = 32U, .offset_bytes = 128U, .required_allocation_bytes = 256U, .alignment_bytes = 64U};
+  .device_incarnation = 7U, .device_uuid = {1U}, .device = 0, .width = 4U, .height = 3U, .pitch_bytes = 32U, .offset_bytes = 128U, .required_allocation_bytes = 256U, .alignment_bytes = 64U
+ };
  REQUIRE(layout.valid());
  auto invalid = layout;
  invalid.offset_bytes = std::numeric_limits<std::size_t>::max() - 1U;
@@ -1652,11 +1655,11 @@ TEST_CASE("Asynchronous workspace finalization retains raw custody until the own
  const auto display = std::make_shared<DisplayObservation>();
  workspace->SetDisplayAvailabilitySink(
   std::make_shared<const std::function<void()>>([display, throwing_sinks, weak = std::weak_ptr{workspace}, content = ImageWorkspaceContent{raw.product_owner, raw.product_revision}] {
-   ++display->notifications;
-   const auto completed = weak.lock();
-   display->ready = completed && completed->Contains(content) && completed->WriteAvailable();
-   if (throwing_sinks) throw std::runtime_error("display wake failure");
-  }));
+  ++display->notifications;
+  const auto completed = weak.lock();
+  display->ready = completed && completed->Contains(content) && completed->WriteAvailable();
+  if (throwing_sinks) throw std::runtime_error("display wake failure");
+ }));
  backend->defer_notifications = true;
  CHECK_FALSE(runtime.PrepareDisplay(raw.product_revision, workspace));
  const auto product_wakes = std::make_shared<std::size_t>(0U);

@@ -242,9 +242,9 @@ TEST_CASE("Decoder SDPA preserves independent positional and target gradients in
     for (const auto& item : actual->named_parameters()) recorded.register_parameter("parameter_" + std::to_string(index++), item.value(), false);
     const bool cache = at::autocast::is_autocast_cache_enabled();
     at::autocast::set_autocast_cache_enabled(false);
-    const auto trace = torch::jit::tracer::trace(
-     {target, position}, [&](torch::jit::Stack arguments) { return torch::jit::Stack{rf::isolated_group_self_attention(actual, arguments[0].toTensor(), arguments[1].toTensor(), layout)}; },
-     [](const torch::autograd::Variable&) { return ""; }, false, false, &recorded);
+    const auto trace = torch::jit::tracer::trace({target, position}, [&](torch::jit::Stack arguments) {
+     return torch::jit::Stack{rf::isolated_group_self_attention(actual, arguments[0].toTensor(), arguments[1].toTensor(), layout)};
+    }, [](const torch::autograd::Variable&) { return ""; }, false, false, &recorded);
     at::autocast::set_autocast_cache_enabled(cache);
     output = trace.second.front().toTensor();
     bool sdpa_operator = false;

@@ -145,10 +145,9 @@ inline void CopyImagePlane(const ImagePlaneView destination, const ImagePlaneVie
 }
 [[nodiscard]] inline SystemImageRuntimeConfig WorkspaceRuntimeConfig(
  std::shared_ptr<ImageCopyBackend> backend, std::shared_ptr<ImageProductRevisionSequence> revisions = std::make_shared<ImageProductRevisionSequence>()) {
- return {.device = 0,
-  .backend = std::move(backend),
-  .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) { CopyImagePlane(destination, clean); },
-  .product_revisions = std::move(revisions)};
+ return {.device = 0, .backend = std::move(backend), .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
+  CopyImagePlane(destination, clean);
+ }, .product_revisions = std::move(revisions)};
 }
 [[nodiscard]] inline std::pair<std::shared_ptr<ImageWorkspace>, bool> PublishTestWorkspace(SystemImageRuntime& runtime, std::shared_ptr<ImageCopyBackend> backend, const int device = 1) {
  auto workspace = ImageWorkspaceTestAccess::CreateAdmitted(std::move(backend), ImageWorkspaceTestAccess::Layout(device));
@@ -331,14 +330,13 @@ public:
   ++planes_allocated;
   return {
    .data = reinterpret_cast<CUdeviceptr>(storage),
-   .descriptor =
-    {
-     .kind = kind,
-     .format = ImageFormat::Rgba8,
-     .width = width,
-     .height = height,
-     .pitch_bytes = pitch,
-    },
+   .descriptor = {
+    .kind = kind,
+    .format = ImageFormat::Rgba8,
+    .width = width,
+    .height = height,
+    .pitch_bytes = pitch,
+   },
   };
  }
  void FreePlane(std::uintptr_t, const CUdeviceptr data) noexcept override {

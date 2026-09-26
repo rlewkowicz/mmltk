@@ -126,46 +126,37 @@ torch::Tensor binary_cross_entropy_with_logits_none(const torch::Tensor& inputs,
  return F::binary_cross_entropy_with_logits(inputs, targets, F::BinaryCrossEntropyWithLogitsFuncOptions().reduction(torch::kNone));
 }
 torch::Tensor sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& num_masks, bool use_jit_traced_loss_ops, const torch::Tensor& valid) {
- const auto rows = run_binary_traced_or_direct(
-  &TracedLossOpCache::sigmoid_ce, "__torch__.NativeRfDetrSigmoidCeLoss", use_jit_traced_loss_ops,
+ const auto rows = run_binary_traced_or_direct(&TracedLossOpCache::sigmoid_ce, "__torch__.NativeRfDetrSigmoidCeLoss", use_jit_traced_loss_ops,
   [](const torch::Tensor& a, const torch::Tensor& b) { return binary_cross_entropy_with_logits_none(a, b).mean(1); }, inputs, targets);
  return (valid.defined() ? torch::where(valid, rows, torch::zeros_like(rows)) : rows).sum() / num_masks;
 }
 torch::Tensor dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& num_masks, bool use_jit_traced_loss_ops, const torch::Tensor& valid) {
- const auto rows = run_binary_traced_or_direct(
-  &TracedLossOpCache::dice, "__torch__.NativeRfDetrDiceLoss", use_jit_traced_loss_ops,
-  [](const torch::Tensor& a, const torch::Tensor& b) {
-   const auto probs = a.sigmoid().flatten(1);
-   const auto flat_targets = b.flatten(1);
-   const auto numerator = 2 * (probs * flat_targets).sum(-1);
-   const auto denominator = probs.sum(-1) + flat_targets.sum(-1);
-   return 1 - (numerator + 1) / (denominator + 1);
-  },
-  inputs, targets);
+ const auto rows = run_binary_traced_or_direct(&TracedLossOpCache::dice, "__torch__.NativeRfDetrDiceLoss", use_jit_traced_loss_ops, [](const torch::Tensor& a, const torch::Tensor& b) {
+  const auto probs = a.sigmoid().flatten(1);
+  const auto flat_targets = b.flatten(1);
+  const auto numerator = 2 * (probs * flat_targets).sum(-1);
+  const auto denominator = probs.sum(-1) + flat_targets.sum(-1);
+  return 1 - (numerator + 1) / (denominator + 1);
+ }, inputs, targets);
  return (valid.defined() ? torch::where(valid, rows, torch::zeros_like(rows)) : rows).sum() / num_masks;
 }
 torch::Tensor batch_dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, bool use_jit_traced_loss_ops) {
- return run_binary_traced_or_direct(
-  &TracedLossOpCache::batch_dice, "__torch__.NativeRfDetrBatchDiceLoss", use_jit_traced_loss_ops,
-  [](const torch::Tensor& a, const torch::Tensor& b) {
-   const auto probs = a.sigmoid();
-   const auto flat_targets = b;
-   const auto numerator = 2 * torch::matmul(probs, flat_targets.transpose(-1, -2));
-   const auto denominator = probs.sum(-1).unsqueeze(-1) + flat_targets.sum(-1).unsqueeze(-2);
-   return 1 - (numerator + 1) / (denominator + 1);
-  },
-  inputs, targets);
+ return run_binary_traced_or_direct(&TracedLossOpCache::batch_dice, "__torch__.NativeRfDetrBatchDiceLoss", use_jit_traced_loss_ops, [](const torch::Tensor& a, const torch::Tensor& b) {
+  const auto probs = a.sigmoid();
+  const auto flat_targets = b;
+  const auto numerator = 2 * torch::matmul(probs, flat_targets.transpose(-1, -2));
+  const auto denominator = probs.sum(-1).unsqueeze(-1) + flat_targets.sum(-1).unsqueeze(-2);
+  return 1 - (numerator + 1) / (denominator + 1);
+ }, inputs, targets);
 }
 torch::Tensor batch_sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets, bool use_jit_traced_loss_ops) {
- return run_binary_traced_or_direct(
-         &TracedLossOpCache::batch_sigmoid_ce, "__torch__.NativeRfDetrBatchSigmoidCeLoss", use_jit_traced_loss_ops,
+ return run_binary_traced_or_direct(&TracedLossOpCache::batch_sigmoid_ce, "__torch__.NativeRfDetrBatchSigmoidCeLoss", use_jit_traced_loss_ops,
          [](const torch::Tensor& a, const torch::Tensor& b) {
-          const auto flat_targets = b;
-          const auto positives = binary_cross_entropy_with_logits_none(a, torch::ones_like(a));
-          const auto negatives = binary_cross_entropy_with_logits_none(a, torch::zeros_like(a));
-          return (torch::matmul(positives, flat_targets.transpose(-1, -2)) + torch::matmul(negatives, (1 - flat_targets).transpose(-1, -2)));
-         },
-         inputs, targets) /
+  const auto flat_targets = b;
+  const auto positives = binary_cross_entropy_with_logits_none(a, torch::ones_like(a));
+  const auto negatives = binary_cross_entropy_with_logits_none(a, torch::zeros_like(a));
+  return (torch::matmul(positives, flat_targets.transpose(-1, -2)) + torch::matmul(negatives, (1 - flat_targets).transpose(-1, -2)));
+ }, inputs, targets) /
         static_cast<double>(targets.size(-1));
 }
 torch::Tensor point_sample(const torch::Tensor& input, const torch::Tensor& point_coords, F::GridSampleFuncOptions::mode_t mode) {

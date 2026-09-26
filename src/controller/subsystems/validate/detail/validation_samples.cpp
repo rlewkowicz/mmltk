@@ -44,30 +44,27 @@ public:
   contracts::ValidationDisplaySettings display;
  };
  Impl(VisualDeviceSettings visual, std::function<void()> changed, PredictionPreviewPool::TransferOperations transfers)
-     : visual_(visual),
-       changed_(std::move(changed)),
-       transfers_(transfers),
-       worker_(
-        [this](auto revisions) {
-         EnsurePool();
-         gpu::SystemImageRuntimeConfig config{.device = visual_.device,
-          .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
-          .output_buffer_count = 2U,
-          .numa_node = visual_.numa_node,
-          .execution = execution_,
-          .product_revisions = std::move(revisions),
-          .adopted_context = context_};
-         return make_visual_runtime(std::move(config));
-        },
-        [this](std::exception_ptr) {
-         {
-          std::scoped_lock lock(mutex_);
-          SelectOverlays(image_.overlays);
-          if (current_) RestoreIncumbent();
-          render_requested_ = false;
-         }
-         Notify();
-        }) {
+     : visual_(visual), changed_(std::move(changed)), transfers_(transfers), worker_([this](auto revisions) {
+        EnsurePool();
+        gpu::SystemImageRuntimeConfig config{
+         .device = visual_.device,
+         .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
+         .output_buffer_count = 2U,
+         .numa_node = visual_.numa_node,
+         .execution = execution_,
+         .product_revisions = std::move(revisions),
+         .adopted_context = context_
+        };
+        return make_visual_runtime(std::move(config));
+       }, [this](std::exception_ptr) {
+        {
+         std::scoped_lock lock(mutex_);
+         SelectOverlays(image_.overlays);
+         if (current_) RestoreIncumbent();
+         render_requested_ = false;
+        }
+        Notify();
+       }) {
   if (visual_.valid() && (visual_.maximum_width < 8U || visual_.maximum_height < 9U)) throw contracts::InvalidIntentError("validation requires at least an 8 by 9 image envelope");
   worker_.RegisterContinuation([this](auto& runtime, auto stop) { return Render(runtime, stop); }, {}, true);
  }
@@ -203,8 +200,9 @@ public:
     mmltk::backend::imaging::raster::color::class_color(static_cast<int>(category), static_cast<int>(raw->classes().size()), rgb[0], rgb[1], rgb[2]);
     if (ground_truth)
      for (auto& channel : rgb) channel = 255U - channel;
-    metadata.labels.push_back({{{prediction.bbox_xyxy[0], prediction.bbox_xyxy[1]}, {prediction.bbox_xyxy[2], prediction.bbox_xyxy[3]}}, palette[category], rgb, static_cast<std::uint32_t>(category),
-     ground_truth, prediction.score, raw->classes()[category]});
+    metadata.labels.push_back(
+     {{{prediction.bbox_xyxy[0], prediction.bbox_xyxy[1]}, {prediction.bbox_xyxy[2], prediction.bbox_xyxy[3]}}, palette[category], rgb, static_cast<std::uint32_t>(category), ground_truth,
+      prediction.score, raw->classes()[category]});
    }
   };
   labels(raw->predictions(), false);

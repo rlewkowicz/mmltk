@@ -120,44 +120,40 @@ torch::Tensor matcher_point_sample(const torch::Tensor& input, const torch::Tens
 torch::Tensor sigmoid_focal_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& num_boxes, double alpha, double gamma, bool use_jit_traced_loss_ops) {
  return run_parametric_traced_or_direct(&TracedLossOpCache::sigmoid_focal, "__torch__.NativeRfDetrSigmoidFocalLoss", inputs, targets, alpha, gamma, use_jit_traced_loss_ops,
          [alpha, gamma](const torch::Tensor& a, const torch::Tensor& b) {
-          const auto prob = a.sigmoid();
-          const auto ce_loss = binary_cross_entropy_with_logits_none(a, b);
-          const auto p_t = prob * b + (1 - prob) * (1 - b);
-          auto loss = ce_loss * torch::pow(1 - p_t, gamma);
-          if (alpha >= 0.0) {
-           const auto alpha_t = alpha * b + (1 - alpha) * (1 - b);
-           loss = alpha_t * loss;
-          }
-          return loss.mean(1).sum();
-         }) /
-        num_boxes;
+  const auto prob = a.sigmoid();
+  const auto ce_loss = binary_cross_entropy_with_logits_none(a, b);
+  const auto p_t = prob * b + (1 - prob) * (1 - b);
+  auto loss = ce_loss * torch::pow(1 - p_t, gamma);
+  if (alpha >= 0.0) {
+   const auto alpha_t = alpha * b + (1 - alpha) * (1 - b);
+   loss = alpha_t * loss;
+  }
+  return loss.mean(1).sum();
+ }) / num_boxes;
 }
 torch::Tensor sigmoid_varifocal_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& num_boxes, double alpha, double gamma, bool use_jit_traced_loss_ops) {
  return run_parametric_traced_or_direct(&TracedLossOpCache::sigmoid_varifocal, "__torch__.NativeRfDetrSigmoidVarifocalLoss", inputs, targets, alpha, gamma, use_jit_traced_loss_ops,
          [alpha, gamma](const torch::Tensor& a, const torch::Tensor& b) {
-          const auto prob = a.sigmoid();
-          const auto focal_weight = b * b.gt(0.0).to(a.dtype()) + (1 - alpha) * torch::pow((prob - b).abs(), gamma) * b.le(0.0).to(a.dtype());
-          const auto ce_loss = binary_cross_entropy_with_logits_none(a, b);
-          return (ce_loss * focal_weight).mean(1).sum();
-         }) /
-        num_boxes;
+  const auto prob = a.sigmoid();
+  const auto focal_weight = b * b.gt(0.0).to(a.dtype()) + (1 - alpha) * torch::pow((prob - b).abs(), gamma) * b.le(0.0).to(a.dtype());
+  const auto ce_loss = binary_cross_entropy_with_logits_none(a, b);
+  return (ce_loss * focal_weight).mean(1).sum();
+ }) / num_boxes;
 }
 torch::Tensor position_supervised_loss(const torch::Tensor& inputs, const torch::Tensor& targets, const torch::Tensor& num_boxes, double alpha, double gamma, bool use_jit_traced_loss_ops) {
  return run_parametric_traced_or_direct(&TracedLossOpCache::position_supervised, "__torch__.NativeRfDetrPositionSupervisedLoss", inputs, targets, alpha, gamma, use_jit_traced_loss_ops,
          [alpha, gamma](const torch::Tensor& a, const torch::Tensor& b) {
-          const auto prob = a.sigmoid();
-          auto loss = binary_cross_entropy_with_logits_none(a, b) * torch::pow((b - prob).abs(), gamma);
-          if (alpha >= 0.0) {
-           const auto alpha_t = alpha * b.gt(0.0).to(a.dtype()) + (1 - alpha) * b.le(0.0).to(a.dtype());
-           loss = alpha_t * loss;
-          }
-          return loss.mean(1).sum();
-         }) /
-        num_boxes;
+  const auto prob = a.sigmoid();
+  auto loss = binary_cross_entropy_with_logits_none(a, b) * torch::pow((b - prob).abs(), gamma);
+  if (alpha >= 0.0) {
+   const auto alpha_t = alpha * b.gt(0.0).to(a.dtype()) + (1 - alpha) * b.le(0.0).to(a.dtype());
+   loss = alpha_t * loss;
+  }
+  return loss.mean(1).sum();
+ }) / num_boxes;
 }
 torch::Tensor ia_bce_loss(const torch::Tensor& inputs, const torch::Tensor& pos_weights, const torch::Tensor& neg_weights, const torch::Tensor& num_boxes, bool use_jit_traced_loss_ops) {
- return run_ternary_traced_or_direct(
-         &TracedLossOpCache::ia_bce, "__torch__.NativeRfDetrIaBceLoss", use_jit_traced_loss_ops,
+ return run_ternary_traced_or_direct(&TracedLossOpCache::ia_bce, "__torch__.NativeRfDetrIaBceLoss", use_jit_traced_loss_ops,
          [](const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& c) { return (c * a - F::logsigmoid(a) * (b + c)).sum(); }, inputs, pos_weights, neg_weights) /
         num_boxes;
 }

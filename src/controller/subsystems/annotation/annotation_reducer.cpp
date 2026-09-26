@@ -216,34 +216,32 @@ struct ObjectAfterView final {
 [[nodiscard]] bool entry_forward_valid(const DocumentState& state, const JournalView& entry) {
  if (entry.before != state.ui.editor || entry.entry.mutation.valueless_by_exception()) return false;
  const auto& scene = state.ui.scene;
- const bool mutation_valid = std::visit(
-  [&scene, &entry](const auto& mutation) {
-   using Mutation = std::remove_cvref_t<decltype(mutation)>;
-   if constexpr (std::same_as<Mutation, JournalEntry::Facts>) {
-    return true;
-   } else if constexpr (std::same_as<Mutation, JournalEntry::Object>) {
-    if (entry.Before(mutation.before_present, mutation.after_present) == entry.After(mutation.before_present, mutation.after_present)) {
-     if (!entry.Before(mutation.before_present, mutation.after_present) || mutation.index >= scene.objects.size() || scene.objects[mutation.index] != entry.Before(mutation.before, mutation.after))
-      return false;
-    } else if (entry.Before(mutation.before_present, mutation.after_present)) {
-     if (mutation.index >= scene.objects.size() || scene.objects[mutation.index] != entry.Before(mutation.before, mutation.after)) return false;
-    } else if (mutation.index > scene.objects.size()) {
+ const bool mutation_valid = std::visit([&scene, &entry](const auto& mutation) {
+  using Mutation = std::remove_cvref_t<decltype(mutation)>;
+  if constexpr (std::same_as<Mutation, JournalEntry::Facts>) {
+   return true;
+  } else if constexpr (std::same_as<Mutation, JournalEntry::Object>) {
+   if (entry.Before(mutation.before_present, mutation.after_present) == entry.After(mutation.before_present, mutation.after_present)) {
+    if (!entry.Before(mutation.before_present, mutation.after_present) || mutation.index >= scene.objects.size() || scene.objects[mutation.index] != entry.Before(mutation.before, mutation.after))
      return false;
-    }
-    return !entry.After(mutation.before_present, mutation.after_present) || object_valid_for(entry.After(mutation.before, mutation.after), scene.categories.size(), scene);
-   } else if constexpr (std::same_as<Mutation, JournalEntry::Category>) {
-    if (entry.Before(mutation.before_present, mutation.after_present) == entry.After(mutation.before_present, mutation.after_present)) return false;
-    if (entry.Before(mutation.before_present, mutation.after_present)) {
-     return !scene.categories.empty() && mutation.index + 1U == scene.categories.size() && scene.categories[mutation.index] == entry.Before(mutation.before, mutation.after);
-    }
-    return mutation.index == scene.categories.size() && entry.After(mutation.before, mutation.after).valid();
-   } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
-    return entry.Before(mutation.before, mutation.after) == scene.objects;
-   } else {
-    return entry.Before(mutation.before_index, mutation.after_index) == scene.frame_index && entry.Before(mutation.before_ready, mutation.after_ready) == scene.frame_ready;
+   } else if (entry.Before(mutation.before_present, mutation.after_present)) {
+    if (mutation.index >= scene.objects.size() || scene.objects[mutation.index] != entry.Before(mutation.before, mutation.after)) return false;
+   } else if (mutation.index > scene.objects.size()) {
+    return false;
    }
-  },
-  entry.entry.mutation);
+   return !entry.After(mutation.before_present, mutation.after_present) || object_valid_for(entry.After(mutation.before, mutation.after), scene.categories.size(), scene);
+  } else if constexpr (std::same_as<Mutation, JournalEntry::Category>) {
+   if (entry.Before(mutation.before_present, mutation.after_present) == entry.After(mutation.before_present, mutation.after_present)) return false;
+   if (entry.Before(mutation.before_present, mutation.after_present)) {
+    return !scene.categories.empty() && mutation.index + 1U == scene.categories.size() && scene.categories[mutation.index] == entry.Before(mutation.before, mutation.after);
+   }
+   return mutation.index == scene.categories.size() && entry.After(mutation.before, mutation.after).valid();
+  } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
+   return entry.Before(mutation.before, mutation.after) == scene.objects;
+  } else {
+   return entry.Before(mutation.before_index, mutation.after_index) == scene.frame_index && entry.Before(mutation.before_ready, mutation.after_ready) == scene.frame_ready;
+  }
+ }, entry.entry.mutation);
  return mutation_valid && facts_valid_for(scene, entry.after(), &entry);
 }
 template <class T>
@@ -253,70 +251,66 @@ void prepare_append(std::vector<T>& values) {
 }
 [[nodiscard]] JournalEntry prepare_application(DocumentState& state, const JournalView& view, std::vector<domain::AnnotationColor>& palette) {
  JournalEntry prepared{.after = view.after()};
- std::visit(
-  [&](const auto& mutation) {
-   using Mutation = std::remove_cvref_t<decltype(mutation)>;
-   auto& payload = prepared.mutation.emplace<Mutation>();
-   if constexpr (std::same_as<Mutation, JournalEntry::Object>) {
-    payload.index = mutation.index;
-    payload.before_present = view.Before(mutation.before_present, mutation.after_present);
-    payload.after_present = view.After(mutation.before_present, mutation.after_present);
-    if (payload.after_present) {
-     payload.after = view.After(mutation.before, mutation.after);
-     payload.after_identity = view.After(mutation.before_identity, mutation.after_identity);
-     if (!payload.before_present) {
-      prepare_append(state.ui.scene.objects);
-      prepare_append(state.identities);
-     }
+ std::visit([&](const auto& mutation) {
+  using Mutation = std::remove_cvref_t<decltype(mutation)>;
+  auto& payload = prepared.mutation.emplace<Mutation>();
+  if constexpr (std::same_as<Mutation, JournalEntry::Object>) {
+   payload.index = mutation.index;
+   payload.before_present = view.Before(mutation.before_present, mutation.after_present);
+   payload.after_present = view.After(mutation.before_present, mutation.after_present);
+   if (payload.after_present) {
+    payload.after = view.After(mutation.before, mutation.after);
+    payload.after_identity = view.After(mutation.before_identity, mutation.after_identity);
+    if (!payload.before_present) {
+     prepare_append(state.ui.scene.objects);
+     prepare_append(state.identities);
     }
-   } else if constexpr (std::same_as<Mutation, JournalEntry::Category>) {
-    payload.before_present = view.Before(mutation.before_present, mutation.after_present);
-    payload.after_present = view.After(mutation.before_present, mutation.after_present);
-    payload.after = view.After(mutation.before, mutation.after);
-    if (payload.after_present) prepare_append(state.ui.scene.categories);
-    palette = mmltk::controller::annotation_class_palette(state.ui.scene.categories.size() + (payload.after_present ? 1U : 0U) - (payload.before_present ? 1U : 0U));
-   } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
-    payload.after = view.After(mutation.before, mutation.after);
-    payload.after_identities = view.After(mutation.before_identities, mutation.after_identities);
-   } else if constexpr (std::same_as<Mutation, JournalEntry::Frame>) {
-    payload.after_index = view.After(mutation.before_index, mutation.after_index);
-    payload.after_ready = view.After(mutation.before_ready, mutation.after_ready);
    }
-  },
-  view.entry.mutation);
+  } else if constexpr (std::same_as<Mutation, JournalEntry::Category>) {
+   payload.before_present = view.Before(mutation.before_present, mutation.after_present);
+   payload.after_present = view.After(mutation.before_present, mutation.after_present);
+   payload.after = view.After(mutation.before, mutation.after);
+   if (payload.after_present) prepare_append(state.ui.scene.categories);
+   palette = mmltk::controller::annotation_class_palette(state.ui.scene.categories.size() + (payload.after_present ? 1U : 0U) - (payload.before_present ? 1U : 0U));
+  } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
+   payload.after = view.After(mutation.before, mutation.after);
+   payload.after_identities = view.After(mutation.before_identities, mutation.after_identities);
+  } else if constexpr (std::same_as<Mutation, JournalEntry::Frame>) {
+   payload.after_index = view.After(mutation.before_index, mutation.after_index);
+   payload.after_ready = view.After(mutation.before_ready, mutation.after_ready);
+  }
+ }, view.entry.mutation);
  return prepared;
 }
 void apply_forward(DocumentState& state, const JournalView& retained, JournalEntry& entry, std::vector<domain::AnnotationColor>& palette) {
  auto& scene = state.ui.scene;
- std::visit(
-  [&scene, &state, &palette](auto& mutation) {
-   using Mutation = std::remove_cvref_t<decltype(mutation)>;
-   if constexpr (std::same_as<Mutation, JournalEntry::Object>) {
-    if (!mutation.before_present && mutation.after_present) {
-     scene.objects.insert(scene.objects.begin() + mutation.index, std::move(mutation.after));
-     state.identities.insert(state.identities.begin() + mutation.index, std::move(mutation.after_identity));
-    } else if (mutation.before_present && !mutation.after_present) {
-     scene.objects.erase(scene.objects.begin() + mutation.index);
-     state.identities.erase(state.identities.begin() + mutation.index);
-    } else {
-     scene.objects[mutation.index] = std::move(mutation.after);
-     state.identities[mutation.index] = std::move(mutation.after_identity);
-    }
-   } else if constexpr (std::same_as<Mutation, JournalEntry::Category>) {
-    if (!mutation.before_present && mutation.after_present)
-     scene.categories.push_back(std::move(mutation.after));
-    else
-     scene.categories.pop_back();
-    scene.palette = std::move(palette);
-   } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
-    scene.objects = std::move(mutation.after);
-    state.identities = std::move(mutation.after_identities);
-   } else if constexpr (std::same_as<Mutation, JournalEntry::Frame>) {
-    scene.frame_index = mutation.after_index;
-    scene.frame_ready = mutation.after_ready;
+ std::visit([&scene, &state, &palette](auto& mutation) {
+  using Mutation = std::remove_cvref_t<decltype(mutation)>;
+  if constexpr (std::same_as<Mutation, JournalEntry::Object>) {
+   if (!mutation.before_present && mutation.after_present) {
+    scene.objects.insert(scene.objects.begin() + mutation.index, std::move(mutation.after));
+    state.identities.insert(state.identities.begin() + mutation.index, std::move(mutation.after_identity));
+   } else if (mutation.before_present && !mutation.after_present) {
+    scene.objects.erase(scene.objects.begin() + mutation.index);
+    state.identities.erase(state.identities.begin() + mutation.index);
+   } else {
+    scene.objects[mutation.index] = std::move(mutation.after);
+    state.identities[mutation.index] = std::move(mutation.after_identity);
    }
-  },
-  entry.mutation);
+  } else if constexpr (std::same_as<Mutation, JournalEntry::Category>) {
+   if (!mutation.before_present && mutation.after_present)
+    scene.categories.push_back(std::move(mutation.after));
+   else
+    scene.categories.pop_back();
+   scene.palette = std::move(palette);
+  } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
+   scene.objects = std::move(mutation.after);
+   state.identities = std::move(mutation.after_identities);
+  } else if constexpr (std::same_as<Mutation, JournalEntry::Frame>) {
+   scene.frame_index = mutation.after_index;
+   scene.frame_ready = mutation.after_ready;
+  }
+ }, entry.mutation);
  state.ui.editor = retained.after();
 }
 void mark_edited(DocumentState& state) {
@@ -329,20 +323,18 @@ void mark_edited(DocumentState& state) {
 }
 [[nodiscard]] bool entry_changes(const JournalEntry& entry) {
  if (entry.before != entry.after) return true;
- return std::visit(
-  [](const auto& mutation) {
-   using Mutation = std::remove_cvref_t<decltype(mutation)>;
-   if constexpr (std::same_as<Mutation, JournalEntry::Facts>) {
-    return false;
-   } else if constexpr (std::same_as<Mutation, JournalEntry::Object> || std::same_as<Mutation, JournalEntry::Category>) {
-    return mutation.before_present != mutation.after_present || mutation.before != mutation.after;
-   } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
-    return mutation.before != mutation.after;
-   } else {
-    return mutation.before_index != mutation.after_index || mutation.before_ready != mutation.after_ready;
-   }
-  },
-  entry.mutation);
+ return std::visit([](const auto& mutation) {
+  using Mutation = std::remove_cvref_t<decltype(mutation)>;
+  if constexpr (std::same_as<Mutation, JournalEntry::Facts>) {
+   return false;
+  } else if constexpr (std::same_as<Mutation, JournalEntry::Object> || std::same_as<Mutation, JournalEntry::Category>) {
+   return mutation.before_present != mutation.after_present || mutation.before != mutation.after;
+  } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
+   return mutation.before != mutation.after;
+  } else {
+   return mutation.before_index != mutation.after_index || mutation.before_ready != mutation.after_ready;
+  }
+ }, entry.mutation);
 }
 [[nodiscard]] std::size_t identity_element_count(const domain::AnnotationObject& object) noexcept {
  if (object.shape == domain::AnnotationShape::Spline) return object.spline_knots.size();
@@ -454,7 +446,8 @@ enum class JournalDirection : std::uint8_t {
  const domain::AnnotationObject& before_object, const bool after_present, domain::AnnotationObject after_object, const std::uint64_t created_identity = 0U) {
  return journal_entry(before, after,
   JournalEntry::Object{
-   .index = index, .before_present = before_present, .after_present = after_present, .before = before_object, .after = std::move(after_object), .after_identity = {.object = created_identity}});
+   .index = index, .before_present = before_present, .after_present = after_present, .before = before_object, .after = std::move(after_object), .after_identity = {.object = created_identity}
+  });
 }
 template <class Mutate>
 [[nodiscard]] DocumentOutcome change_object(DocumentState& state, const std::uint16_t index, const AnnotationEditorFacts& before, AnnotationEditorFacts after, Mutate&& mutate) {
@@ -603,7 +596,8 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
  auto after = before;
  if (request.phase == domain::AnnotationPointerPhase::Begin) {
   if (request.sequence != 1U || state.pointer.active) { return refused(state, "A new gesture requires sequence one and no active gesture"); }
-  state.pointer = {.active = true,
+  state.pointer = {
+   .active = true,
    .interaction_id = request.interaction_id,
    .action = action,
    .target = request.target,
@@ -611,7 +605,8 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
    .origin = request.point,
    .latest = request.point,
    .sequence = request.sequence,
-   .brush_radius = brush_radius};
+   .brush_radius = brush_radius
+  };
   if (action == AnnotationPointerAction::Brush) {
    if (!state.ui.scene.frame_ready || state.ui.scene.categories.empty()) {
     state.pointer = {};
@@ -1038,49 +1033,47 @@ public:
   const bool preview = state_.pointer.brush || state_.pointer.preview;
   state_.pointer = {};
   std::string_view operation;
-  const auto result = std::visit(
-   [this, &operation](const auto& value) -> DocumentOutcome {
-    using Edit = std::remove_cvref_t<decltype(value)>;
-    operation = std::meta::identifier_of(^^Edit);
-    if constexpr (std::same_as<Edit, mmltk::controller::AnnotationToolEdit>)
-     return reduce_tool(state_, value.tool);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSetupEdit>)
-     return reduce_setup(state_, value.action);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationHoldEdit>)
-     return reduce_hold(state_, value.enabled);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSidebarEdit>)
-     return reduce_sidebar(state_, value.command);
-    // CLEANUP-IGNORE: Every typed edit variant retains an explicit exhaustive reducer arm and domain
-    // payload.
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationObjectEdit>)
-     return reduce_object(state_, value.object);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationCategoryEdit>)
-     return reduce_category(state_, value.category);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationClassEdit>) {
-     if (value.category >= state_.ui.scene.categories.size()) return refused(state_);
-     return change_editor_facts(state_, [&value](auto& editor) { editor.selected_category = value.category; });
-    } else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSelectedObjectEdit>)
-     return reduce_object_facts(state_, value.category, value.enabled);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSplineEdit>)
-     return reduce_spline(state_, value.segment);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSplineHandleEdit>)
-     return reduce_handle(state_, value.handle, value.mode, value.point);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSkeletonEdit>)
-     return reduce_skeleton(state_, value.joint);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationMaskCleanupEdit>)
-     return reduce_mask_cleanup(state_, value.operation, value.radius);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationMaskColorsEdit>)
-     return reduce_mask_colors(state_, value.sup, value.nosup);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSceneEdit>)
-     return reduce_scene(state_);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationUndoEdit>)
-     return reduce_undo(state_);
-    else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationRedoEdit>)
-     return reduce_redo(state_);
-    else
-     static_assert(std::same_as<Edit, void>, "Unhandled AnnotationEdit alternative");
-   },
-   edit.value);
+  const auto result = std::visit([this, &operation](const auto& value) -> DocumentOutcome {
+   using Edit = std::remove_cvref_t<decltype(value)>;
+   operation = std::meta::identifier_of(^^Edit);
+   if constexpr (std::same_as<Edit, mmltk::controller::AnnotationToolEdit>)
+    return reduce_tool(state_, value.tool);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSetupEdit>)
+    return reduce_setup(state_, value.action);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationHoldEdit>)
+    return reduce_hold(state_, value.enabled);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSidebarEdit>)
+    return reduce_sidebar(state_, value.command);
+   // CLEANUP-IGNORE: Every typed edit variant retains an explicit exhaustive reducer arm and domain
+   // payload.
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationObjectEdit>)
+    return reduce_object(state_, value.object);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationCategoryEdit>)
+    return reduce_category(state_, value.category);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationClassEdit>) {
+    if (value.category >= state_.ui.scene.categories.size()) return refused(state_);
+    return change_editor_facts(state_, [&value](auto& editor) { editor.selected_category = value.category; });
+   } else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSelectedObjectEdit>)
+    return reduce_object_facts(state_, value.category, value.enabled);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSplineEdit>)
+    return reduce_spline(state_, value.segment);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSplineHandleEdit>)
+    return reduce_handle(state_, value.handle, value.mode, value.point);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSkeletonEdit>)
+    return reduce_skeleton(state_, value.joint);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationMaskCleanupEdit>)
+    return reduce_mask_cleanup(state_, value.operation, value.radius);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationMaskColorsEdit>)
+    return reduce_mask_colors(state_, value.sup, value.nosup);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationSceneEdit>)
+    return reduce_scene(state_);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationUndoEdit>)
+    return reduce_undo(state_);
+   else if constexpr (std::same_as<Edit, mmltk::controller::AnnotationRedoEdit>)
+    return reduce_redo(state_);
+   else
+    static_assert(std::same_as<Edit, void>, "Unhandled AnnotationEdit alternative");
+  }, edit.value);
   auto reduced = Result(result, operation);
   reduced.render_changed = preview || scene_revision != state_.ui.scene_revision;
   return reduced;
@@ -1122,7 +1115,8 @@ public:
    if (object.shape == Shape::Box || object.shape == Shape::Mask) {
     const auto& box = object.box;
     const std::array<domain::AnnotationPoint, 4U> corners{
-     {{box.first.x - 5.0F, box.first.y - 5.0F}, {box.second.x + 4.0F, box.first.y - 5.0F}, {box.second.x + 4.0F, box.second.y + 4.0F}, {box.first.x - 5.0F, box.second.y + 4.0F}}};
+     {{box.first.x - 5.0F, box.first.y - 5.0F}, {box.second.x + 4.0F, box.first.y - 5.0F}, {box.second.x + 4.0F, box.second.y + 4.0F}, {box.first.x - 5.0F, box.second.y + 4.0F}}
+    };
     for (std::size_t index = 0U; index != corners.size(); ++index)
      if (near(corners[index])) return handle(index, Role::BoxCorner);
    }

@@ -213,9 +213,9 @@ TEST_CASE("clean-only candidate preservation excludes invalid semantics and roll
   auto candidate = runtime.AcquireOutput({}, baseline, ImagePlanePreservation::Clean);
   CHECK_THROWS_WITH(runtime.Publish(candidate, 8U, 8U,
                      [](auto, auto semantic, auto) {
-                      std::memset(reinterpret_cast<void*>(semantic.data), 0x58, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
-                      throw std::runtime_error("semantic preparation failed");
-                     }),
+   std::memset(reinterpret_cast<void*>(semantic.data), 0x58, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
+   throw std::runtime_error("semantic preparation failed");
+  }),
    "semantic preparation failed");
  }
  CHECK(runtime.Completed().revision() == baseline.revision());

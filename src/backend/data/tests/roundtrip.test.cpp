@@ -81,10 +81,10 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
  stream.handoff(0U, nullptr);
  ensure_cuda_ok(cudaMemcpyAsync(received.data(), device, received.size(), cudaMemcpyDeviceToHost, nullptr), "compiled stream consumer read");
  const CompiledImageStream::CompletionObserver completed{.context = &completion, .complete = [](void* raw, std::size_t, std::exception_ptr error) noexcept {
-                                                          auto& state = *static_cast<Completion*>(raw);
-                                                          state.failure = error;
-                                                          state.done.store(true, std::memory_order_release);
-                                                         }};
+  auto& state = *static_cast<Completion*>(raw);
+  state.failure = error;
+  state.done.store(true, std::memory_order_release);
+ }};
  stream.release(0U, nullptr, completed);
  stream.synchronize();
  REQUIRE(completion.done.load(std::memory_order_acquire));
@@ -128,9 +128,9 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
    stream.wait_reads();
   });
   stream.submit(0U, source, reads, {.context = &receipt, .before = [](void* raw, std::size_t) {
-                                     static_cast<mmltk::testsupport::TestGate::Receipt*>(raw)->ArriveAndWait();
-                                     return true;
-                                    }});
+   static_cast<mmltk::testsupport::TestGate::Receipt*>(raw)->ArriveAndWait();
+   return true;
+  }});
   read_result = std::async(std::launch::async, [&] { return stream.wait_read(0U); });
   REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
   // A checked-out physical read job cannot be replaced while its worker owns it.
@@ -172,8 +172,10 @@ void exercise_schedule_capacity(const std::string& path, const bool h2d) {
   std::uint32_t shards, rank;
   bool drop;
  };
- const std::array cases{Schedule{32U, 8, 1U, 0U, false}, Schedule{7U, 8, 3U, 2U, false}, Schedule{7U, 8, 4U, 3U, false}, Schedule{32U, 8, 1U, 0U, true}, Schedule{4U, 2, 1U, 0U, false},
-  Schedule{10U, 2, 1U, 0U, false}, Schedule{7U, 8, 1U, 0U, true}};
+ const std::array cases{
+  Schedule{32U, 8, 1U, 0U, false}, Schedule{7U, 8, 3U, 2U, false}, Schedule{7U, 8, 4U, 3U, false}, Schedule{32U, 8, 1U, 0U, true}, Schedule{4U, 2, 1U, 0U, false}, Schedule{10U, 2, 1U, 0U, false},
+  Schedule{7U, 8, 1U, 0U, true}
+ };
  for (const auto schedule : cases)
   for (const bool shuffle : {false, true}) {
    INFO("batch " << schedule.batch << " prefetch " << schedule.prefetch << " shards " << schedule.shards << " rank " << schedule.rank << " drop " << schedule.drop << " shuffle " << shuffle << " H2D "

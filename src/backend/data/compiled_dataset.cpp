@@ -83,7 +83,8 @@ const float* CompiledDataset::pixel_blob() const noexcept { return reinterpret_c
 bool CompiledDataset::read_images(const std::span<const CompiledImageRead> reads, const std::span<std::byte> destination, const std::atomic<bool>& cancelled, const bool prefault) const {
  return read_images_to(reads,
   ImageDestination{
-   destination.data(), destination.size(), [](void* data, std::size_t offset, std::span<const std::byte> bytes) { std::memcpy(static_cast<std::byte*>(data) + offset, bytes.data(), bytes.size()); }},
+   destination.data(), destination.size(), [](void* data, std::size_t offset, std::span<const std::byte> bytes) { std::memcpy(static_cast<std::byte*>(data) + offset, bytes.data(), bytes.size()); }
+  },
   cancelled, prefault);
 }
 bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> reads, const ImageDestination destination, const std::atomic<bool>& cancelled, const bool prefault) const {

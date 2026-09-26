@@ -237,13 +237,15 @@ TEST_CASE("augmentation executor selects display RGB for both input formats and 
   test_support::AugmentationExecution execution_executor(0);
   GpuAugmentationExecutor executor(config, 1U, 4, 4, execution_executor.context, execution_executor.retirement);
   for (const auto format : {GpuAugmentationInputFormat::PlanarFloat32, GpuAugmentationInputFormat::Rgba8}) {
-   const GpuAugmentationBatchView batch{.input = format == GpuAugmentationInputFormat::Rgba8 ? static_cast<const void*>(rgba_input.data()) : static_cast<const void*>(input.data()),
+   const GpuAugmentationBatchView batch{
+    .input = format == GpuAugmentationInputFormat::Rgba8 ? static_cast<const void*>(rgba_input.data()) : static_cast<const void*>(input.data()),
     .output = output.data(),
     .image_indices = indices,
     .height = 4,
     .width = 4,
     .input_format = format,
-    .output_domain = GpuAugmentationOutputDomain::UnitRgb};
+    .output_domain = GpuAugmentationOutputDomain::UnitRgb
+   };
    const std::array<GpuAugmentationDonor, 1U> missing_donor{};
    (void)executor.Run(batch, keys, missing_donor, {}, nullptr);
    std::array<float, planar.size()> actual{};
@@ -259,7 +261,8 @@ TEST_CASE("native augmentation resolves exact visible support", "[backend][model
  const std::array runs{RLEPair{9, 3}, RLEPair{17, 3}, RLEPair{25, 3}, RLEPair{10, 2}, RLEPair{18, 2}, RLEPair{26, 2}};
  PackedInstance source{.class_id = 2, .flags = mmltk::backend::data::kAnnotationMask, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 5, .bbox_y2 = 5, .mask_rle_offset = 0, .mask_rle_pairs = 3};
  PackedInstance donor{
-  .class_id = 4, .flags = mmltk::backend::data::kAnnotationMask, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 5, .bbox_y2 = 5, .mask_rle_offset = 3 * sizeof(RLEPair), .mask_rle_pairs = 3};
+  .class_id = 4, .flags = mmltk::backend::data::kAnnotationMask, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 5, .bbox_y2 = 5, .mask_rle_offset = 3 * sizeof(RLEPair), .mask_rle_pairs = 3
+ };
  AugmentationImagePlan plan;
  plan.paste_donor_slot = 0;
  plan.paste_source_box = {0, 0, 0.625F, 0.625F};
@@ -793,12 +796,14 @@ TEST_CASE("cached execution and semantic plans share donor identities and numeri
  std::array<GpuAugmentationDonor, capacity> donors{};
  std::vector<float> boxes;
  for (std::size_t slot = 0; slot < capacity; ++slot) {
-  donors[slot] = {.label = slot == 1 || slot == 4 ? -1 : static_cast<std::int64_t>(slot),
+  donors[slot] = {
+   .label = slot == 1 || slot == 4 ? -1 : static_cast<std::int64_t>(slot),
    .dataset_index = static_cast<std::uint32_t>(slot % 3),
    .area = 16,
    .box = {0, 0, 1, 1},
    .has_mask = true,
-   .sampling_identity = 100 + slot};
+   .sampling_identity = 100 + slot
+  };
   boxes.insert(boxes.end(), donors[slot].box.begin(), donors[slot].box.end());
  }
  auto config = test_support::spatial_occlusion_config(true);
@@ -844,7 +849,8 @@ TEST_CASE("augmentation failed staging finish and reconfigure settlement closes 
   std::array<std::uint32_t, 20> indices{};
   std::array<std::uint64_t, 20> keys{};
   for (std::size_t i = 0; i < keys.size(); ++i) keys[i] = i + 1;
-  GpuAugmentationBatchView batch{.input = pixels->input.data(),
+  GpuAugmentationBatchView batch{
+   .input = pixels->input.data(),
    .output = pixels->output.data(),
    .image_indices = indices,
    .height = 9,
@@ -852,7 +858,8 @@ TEST_CASE("augmentation failed staging finish and reconfigure settlement closes 
    .input_custody = pixels,
    .output_custody = pixels,
    .input_capacity_bytes = pixels->input.size_bytes(),
-   .output_capacity_bytes = pixels->output.size_bytes()};
+   .output_capacity_bytes = pixels->output.size_bytes()
+  };
   auto invalid = batch;
   invalid.height = 8;
   REQUIRE_THROWS(executor.Run(invalid, keys, {}, {}, pixels->stream));
@@ -955,7 +962,8 @@ TEST_CASE("perceptual augmentation preserves plans and independently remaps mixe
   const std::vector<float> unchanged(input.size(), -.25F);
   cuda_require(cudaMemcpy(pixels->input.data(), input.data(), pixels->input.size_bytes(), cudaMemcpyHostToDevice));
   cuda_require(cudaMemcpy(pixels->output.data(), unchanged.data(), pixels->output.size_bytes(), cudaMemcpyHostToDevice));
-  GpuAugmentationBatchView batch{.input = pixels->input.data(),
+  GpuAugmentationBatchView batch{
+   .input = pixels->input.data(),
    .output = pixels->output.data(),
    .image_indices = indices,
    .height = extent,
@@ -964,7 +972,8 @@ TEST_CASE("perceptual augmentation preserves plans and independently remaps mixe
    .input_custody = pixels,
    .output_custody = pixels,
    .input_capacity_bytes = pixels->input.size_bytes(),
-   .output_capacity_bytes = pixels->output.size_bytes()};
+   .output_capacity_bytes = pixels->output.size_bytes()
+  };
   REQUIRE_THROWS_WITH(executor.Run(batch, keys, {}, {}, pixels->stream), "terminal CUDA custody reservation refused before resource allocation");
   CHECK(executor.plan().images == plans);
   CHECK(executor.workspace_capacity_bytes() == baseline_bytes);
@@ -1166,7 +1175,8 @@ TEST_CASE("continuous augmentation boxes survive independent and empty mask supp
  using mmltk::backend::data::PackedInstance;
  using mmltk::backend::data::RLEPair;
  PackedInstance annotation{
-  .class_id = 0, .flags = mmltk::backend::data::kAnnotationMask, .bbox_x1 = 1.25F, .bbox_y1 = 2.5F, .bbox_x2 = 6.25F, .bbox_y2 = 7.25F, .mask_rle_offset = 0, .mask_rle_pairs = 0};
+  .class_id = 0, .flags = mmltk::backend::data::kAnnotationMask, .bbox_x1 = 1.25F, .bbox_y1 = 2.5F, .bbox_x2 = 6.25F, .bbox_y2 = 7.25F, .mask_rle_offset = 0, .mask_rle_pairs = 0
+ };
  const std::array runs{RLEPair{27, 1}};
  for (const auto mask : {std::span<const RLEPair>{}, std::span<const RLEPair>{runs}}) {
   AugmentationImagePlan plan;

@@ -166,87 +166,85 @@ std::vector<std::uint8_t> seed_mask_from_paths(const std::vector<AnnotationPoint
 EffectiveObjectSeed effective_object_seed(const AnnotationFrame& frame, const AnnotationObject& object, const bool live_mode, const AnnotationVisibleObject* projected_object) {
  EffectiveObjectSeed seed;
  seed.shape_type = annotation_shape_type(object.shape);
- std::visit(
-  [&](const auto& shape) {
-   using T = std::decay_t<decltype(shape)>;
-   if constexpr (std::is_same_v<T, AnnotationBoxShape>) {
-    seed.box = annotation_box_to_frame(frame, shape.box);
+ std::visit([&](const auto& shape) {
+  using T = std::decay_t<decltype(shape)>;
+  if constexpr (std::is_same_v<T, AnnotationBoxShape>) {
+   seed.box = annotation_box_to_frame(frame, shape.box);
+   seed.mask = seed_mask_from_box(seed.box, frame.width, frame.height);
+  } else if constexpr (std::is_same_v<T, AnnotationMaskShape>) {
+   seed.box = annotation_box_to_frame(frame, shape.box);
+   bool frame_match = true;
+   if (live_mode) {
+    if (shape.seed_live_frame_id.has_value() && frame.live_frame_id.has_value()) {
+     frame_match = *shape.seed_live_frame_id == *frame.live_frame_id;
+    } else {
+     frame_match = shape.seed_frame_id == 0U || shape.seed_frame_id == frame.frame_id;
+    }
+   }
+   const bool dense_mask_valid = shape.mask.size() == static_cast<std::size_t>(shape.region.width) * shape.region.height;
+   if (frame_match && dense_mask_valid) {
+    seed.mask = project_mask_region_to_frame(frame, shape.region, shape.mask);
+    if (const std::optional<AnnotationBox> mask_box = annotation_bbox_from_mask(seed.mask, frame.width, frame.height); mask_box.has_value()) { seed.box = *mask_box; }
+   } else if (shape.deferred == nullptr) {
     seed.mask = seed_mask_from_box(seed.box, frame.width, frame.height);
-   } else if constexpr (std::is_same_v<T, AnnotationMaskShape>) {
-    seed.box = annotation_box_to_frame(frame, shape.box);
-    bool frame_match = true;
-    if (live_mode) {
-     if (shape.seed_live_frame_id.has_value() && frame.live_frame_id.has_value()) {
-      frame_match = *shape.seed_live_frame_id == *frame.live_frame_id;
-     } else {
-      frame_match = shape.seed_frame_id == 0U || shape.seed_frame_id == frame.frame_id;
-     }
-    }
-    const bool dense_mask_valid = shape.mask.size() == static_cast<std::size_t>(shape.region.width) * shape.region.height;
-    if (frame_match && dense_mask_valid) {
-     seed.mask = project_mask_region_to_frame(frame, shape.region, shape.mask);
-     if (const std::optional<AnnotationBox> mask_box = annotation_bbox_from_mask(seed.mask, frame.width, frame.height); mask_box.has_value()) { seed.box = *mask_box; }
-    } else if (shape.deferred == nullptr) {
-     seed.mask = seed_mask_from_box(seed.box, frame.width, frame.height);
-    }
-   } else if constexpr (std::is_same_v<T, AnnotationPointShape>) {
-    if (projected_object != nullptr && !projected_object->geometry.frame_points.empty()) {
-     seed.points_xy.push_back(projected_object->geometry.frame_points.front());
-    } else if (const std::optional<AnnotationPoint> frame_point = capture_point_to_frame(frame, shape.point); frame_point.has_value()) {
-     seed.points_xy.push_back(*frame_point);
-    }
-    if (!seed.points_xy.empty()) {
-     const AnnotationPoint& frame_point = seed.points_xy.front();
-     seed.box = AnnotationBox{
-      static_cast<int>(std::floor(frame_point.x)),
-      static_cast<int>(std::floor(frame_point.y)),
-      static_cast<int>(std::floor(frame_point.x)) + 1,
-      static_cast<int>(std::floor(frame_point.y)) + 1,
-     };
-     seed.mask = seed_mask_from_paths(seed.points_xy, frame.width, frame.height, false);
-    }
-   } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
-    if (projected_object != nullptr && !projected_object->geometry.frame_points.empty()) {
-     seed.points_xy = projected_object->geometry.frame_points;
-    } else {
-     const std::vector<AnnotationPoint> capture_points = sample_annotation_spline_points(shape);
-     seed.points_xy = capture_points_to_frame(frame, capture_points);
-    }
-    if (!seed.points_xy.empty()) {
-     seed.mask = seed_mask_from_paths(seed.points_xy, frame.width, frame.height, shape.closed);
-     if (const std::optional<AnnotationBox> bbox = annotation_bbox_from_mask(seed.mask, frame.width, frame.height); bbox.has_value()) { seed.box = *bbox; }
-    }
+   }
+  } else if constexpr (std::is_same_v<T, AnnotationPointShape>) {
+   if (projected_object != nullptr && !projected_object->geometry.frame_points.empty()) {
+    seed.points_xy.push_back(projected_object->geometry.frame_points.front());
+   } else if (const std::optional<AnnotationPoint> frame_point = capture_point_to_frame(frame, shape.point); frame_point.has_value()) {
+    seed.points_xy.push_back(*frame_point);
+   }
+   if (!seed.points_xy.empty()) {
+    const AnnotationPoint& frame_point = seed.points_xy.front();
+    seed.box = AnnotationBox{
+     static_cast<int>(std::floor(frame_point.x)),
+     static_cast<int>(std::floor(frame_point.y)),
+     static_cast<int>(std::floor(frame_point.x)) + 1,
+     static_cast<int>(std::floor(frame_point.y)) + 1,
+    };
+    seed.mask = seed_mask_from_paths(seed.points_xy, frame.width, frame.height, false);
+   }
+  } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
+   if (projected_object != nullptr && !projected_object->geometry.frame_points.empty()) {
+    seed.points_xy = projected_object->geometry.frame_points;
    } else {
-    seed.mask.assign(static_cast<std::size_t>(frame.width) * static_cast<std::size_t>(frame.height), 0U);
-    if (projected_object != nullptr) {
-     seed.points_xy = projected_object->geometry.frame_points;
-     for (const AnnotationSkeletonEdge& edge : projected_object->geometry.edges) {
-      if (edge.source_index >= seed.points_xy.size() || edge.target_index >= seed.points_xy.size()) { continue; }
-      rasterize_line(seed.mask, frame.width, frame.height, seed.points_xy[edge.source_index], seed.points_xy[edge.target_index]);
-     }
-    } else {
-     std::vector<AnnotationPoint> node_points_capture;
-     node_points_capture.reserve(shape.nodes.size());
-     for (const AnnotationSkeletonNode& node : shape.nodes) {
-      if (node.visible) { node_points_capture.push_back(node.point); }
-     }
-     seed.points_xy = capture_points_to_frame(frame, node_points_capture);
-     for (const AnnotationSkeletonEdge& edge : shape.edges) {
-      if (edge.source_index >= shape.nodes.size() || edge.target_index >= shape.nodes.size()) { continue; }
-      const AnnotationSkeletonNode& source = shape.nodes[edge.source_index];
-      const AnnotationSkeletonNode& target = shape.nodes[edge.target_index];
-      if (!source.visible || !target.visible) { continue; }
-      const std::optional<AnnotationPoint> source_frame = capture_point_to_frame(frame, source.point);
-      const std::optional<AnnotationPoint> target_frame = capture_point_to_frame(frame, target.point);
-      if (!source_frame.has_value() || !target_frame.has_value()) { continue; }
-      rasterize_line(seed.mask, frame.width, frame.height, *source_frame, *target_frame);
-     }
-    }
-    for (const AnnotationPoint& point : seed.points_xy) { paint_mask_pixel(seed.mask, frame.width, frame.height, static_cast<int>(std::lround(point.x)), static_cast<int>(std::lround(point.y))); }
+    const std::vector<AnnotationPoint> capture_points = sample_annotation_spline_points(shape);
+    seed.points_xy = capture_points_to_frame(frame, capture_points);
+   }
+   if (!seed.points_xy.empty()) {
+    seed.mask = seed_mask_from_paths(seed.points_xy, frame.width, frame.height, shape.closed);
     if (const std::optional<AnnotationBox> bbox = annotation_bbox_from_mask(seed.mask, frame.width, frame.height); bbox.has_value()) { seed.box = *bbox; }
    }
-  },
-  object.shape);
+  } else {
+   seed.mask.assign(static_cast<std::size_t>(frame.width) * static_cast<std::size_t>(frame.height), 0U);
+   if (projected_object != nullptr) {
+    seed.points_xy = projected_object->geometry.frame_points;
+    for (const AnnotationSkeletonEdge& edge : projected_object->geometry.edges) {
+     if (edge.source_index >= seed.points_xy.size() || edge.target_index >= seed.points_xy.size()) { continue; }
+     rasterize_line(seed.mask, frame.width, frame.height, seed.points_xy[edge.source_index], seed.points_xy[edge.target_index]);
+    }
+   } else {
+    std::vector<AnnotationPoint> node_points_capture;
+    node_points_capture.reserve(shape.nodes.size());
+    for (const AnnotationSkeletonNode& node : shape.nodes) {
+     if (node.visible) { node_points_capture.push_back(node.point); }
+    }
+    seed.points_xy = capture_points_to_frame(frame, node_points_capture);
+    for (const AnnotationSkeletonEdge& edge : shape.edges) {
+     if (edge.source_index >= shape.nodes.size() || edge.target_index >= shape.nodes.size()) { continue; }
+     const AnnotationSkeletonNode& source = shape.nodes[edge.source_index];
+     const AnnotationSkeletonNode& target = shape.nodes[edge.target_index];
+     if (!source.visible || !target.visible) { continue; }
+     const std::optional<AnnotationPoint> source_frame = capture_point_to_frame(frame, source.point);
+     const std::optional<AnnotationPoint> target_frame = capture_point_to_frame(frame, target.point);
+     if (!source_frame.has_value() || !target_frame.has_value()) { continue; }
+     rasterize_line(seed.mask, frame.width, frame.height, *source_frame, *target_frame);
+    }
+   }
+   for (const AnnotationPoint& point : seed.points_xy) { paint_mask_pixel(seed.mask, frame.width, frame.height, static_cast<int>(std::lround(point.x)), static_cast<int>(std::lround(point.y))); }
+   if (const std::optional<AnnotationBox> bbox = annotation_bbox_from_mask(seed.mask, frame.width, frame.height); bbox.has_value()) { seed.box = *bbox; }
+  }
+ }, object.shape);
  return seed;
 }
 AnnotationResolvedObject resolve_object(const AnnotationFrame& frame, const AnnotationCategories& categories, const AnnotationObject& object, const std::size_t object_index, const bool live_mode,

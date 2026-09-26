@@ -279,14 +279,12 @@ int main(int argc, char** argv) {
   };
   build_fixture(options, fixture);
   const std::string compiled_path = mmltk::backend::data::testsupport::compiled_bin_path(fixture);
-  run_profile_phases(
-   run_label.c_str(), options.warmup_runs, options.repetitions,
-   [&options, &compiled_path, &fixture](const bool is_warmup, const int index) {
-    const std::string run_name = (is_warmup ? "run-warmup-" : "run-") + std::to_string(index);
-    return run_train_iteration(options, compiled_path, fs::path(fixture.root_dir) / run_name, !is_warmup);
-   },
-   [&options](const TrainRun& run) { record_train_metrics(run, options); },
-   [&options](const char* phase, const int index, const int total, const TrainRun& run) { print_iteration_line(options, phase, index, total, run); });
+  run_profile_phases(run_label.c_str(), options.warmup_runs, options.repetitions, [&options, &compiled_path, &fixture](const bool is_warmup, const int index) {
+   const std::string run_name = (is_warmup ? "run-warmup-" : "run-") + std::to_string(index);
+   return run_train_iteration(options, compiled_path, fs::path(fixture.root_dir) / run_name, !is_warmup);
+  }, [&options](const TrainRun& run) { record_train_metrics(run, options); }, [&options](const char* phase, const int index, const int total, const TrainRun& run) {
+   print_iteration_line(options, phase, index, total, run);
+  });
   mmltk::common::logging::profile_flush();
   verify_profile_route(profile_log, run_label, options);
   if (!options.keep_artifacts) { fs::remove_all(fixture.root_dir); }

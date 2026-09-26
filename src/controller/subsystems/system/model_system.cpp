@@ -30,10 +30,11 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
   // respective runtime boundaries.
   const services::ArtifactWeightProgressObserver observer{
    .context = const_cast<std::function<void(const contracts::ModelProgress&)>*>(&progress), .report = [](void* context, const contracts::ModelProgress& value) noexcept {
-    try {
-     (*static_cast<std::function<void(const contracts::ModelProgress&)>*>(context))(value);
-    } catch (...) {}
-   }};
+   try {
+    (*static_cast<std::function<void(const contracts::ModelProgress&)>*>(context))(value);
+   } catch (...) {}
+  }
+  };
   artifact = store_.canonical_weight_path(key.preset, cancellation.token(), observer);
  }
  if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
@@ -78,83 +79,83 @@ contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionReque
  run_.Start({
   .prepare =
    [this] {
-    std::scoped_lock lock(mutex_);
-    if (state_.active) throw contracts::BusyError("model selection is active");
-    const auto next = contracts::next_compute_generation(state_.generation);
-    if (!next) throw contracts::FailedError("model selection generation exhausted");
-    state_.generation = *next;
-    state_.active = true;
-    state_.progress = {};
-    state_.terminal = {};
-   },
+  std::scoped_lock lock(mutex_);
+  if (state_.active) throw contracts::BusyError("model selection is active");
+  const auto next = contracts::next_compute_generation(state_.generation);
+  if (!next) throw contracts::FailedError("model selection generation exhausted");
+  state_.generation = *next;
+  state_.active = true;
+  state_.progress = {};
+  state_.terminal = {};
+ },
   .work = [this, input = std::move(*input)](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
-   contracts::ModelSelection selection;
-   contracts::ModelSelectionResult terminal;
-   bool failed = false;
-   std::atomic_bool malformed_progress = false;
-   try {
-    if (!runtime_) runtime_ = factory_();
-    if (!runtime_) throw std::runtime_error("model runtime is unavailable");
-    auto artifact = runtime_->Acquire(input.key, input.custom_artifact, input.inspection_device.value_or(0), stop, [this, &malformed_progress](const contracts::ModelProgress& value) {
-     if (!value.valid()) {
-      malformed_progress.store(true, std::memory_order_relaxed);
-     } else {
-      progress(value);
-     }
-    });
-    if (malformed_progress.load(std::memory_order_relaxed)) throw std::runtime_error("model runtime returned invalid progress");
-    if (stop.stop_requested()) {
-     terminal.outcome = contracts::ModelSelectionOutcome::Cancelled;
+  contracts::ModelSelection selection;
+  contracts::ModelSelectionResult terminal;
+  bool failed = false;
+  std::atomic_bool malformed_progress = false;
+  try {
+   if (!runtime_) runtime_ = factory_();
+   if (!runtime_) throw std::runtime_error("model runtime is unavailable");
+   auto artifact = runtime_->Acquire(input.key, input.custom_artifact, input.inspection_device.value_or(0), stop, [this, &malformed_progress](const contracts::ModelProgress& value) {
+    if (!value.valid()) {
+     malformed_progress.store(true, std::memory_order_relaxed);
     } else {
-     selection = {.key = std::move(input.key), .inspection_device = input.inspection_device, .artifact = std::move(artifact.artifact), .class_layout = std::move(artifact.class_layout)};
-     if (!selection.valid()) throw std::runtime_error("model runtime returned an invalid selection");
-     terminal.outcome = contracts::ModelSelectionOutcome::Accepted;
+     progress(value);
     }
-   } catch (const std::exception& error) {
-    if (stop.stop_requested()) {
-     terminal.outcome = contracts::ModelSelectionOutcome::Cancelled;
-    } else {
-     failed = true;
-     terminal = {.outcome = contracts::ModelSelectionOutcome::Rejected, .detail = contracts::bounded_model_detail(error.what())};
-    }
-   } catch (...) {
-    if (stop.stop_requested()) {
-     terminal.outcome = contracts::ModelSelectionOutcome::Cancelled;
-    } else {
-     failed = true;
-     terminal = {.outcome = contracts::ModelSelectionOutcome::Rejected, .detail = "model selection failed"};
-    }
+   });
+   if (malformed_progress.load(std::memory_order_relaxed)) throw std::runtime_error("model runtime returned invalid progress");
+   if (stop.stop_requested()) {
+    terminal.outcome = contracts::ModelSelectionOutcome::Cancelled;
+   } else {
+    selection = {.key = std::move(input.key), .inspection_device = input.inspection_device, .artifact = std::move(artifact.artifact), .class_layout = std::move(artifact.class_layout)};
+    if (!selection.valid()) throw std::runtime_error("model runtime returned an invalid selection");
+    terminal.outcome = contracts::ModelSelectionOutcome::Accepted;
    }
-   contracts::ModelUiState settled;
-   {
-    std::scoped_lock lock(mutex_);
-    state_.active = false;
-    state_.progress = {};
-    state_.terminal = std::move(terminal);
-    if (state_.terminal.outcome == contracts::ModelSelectionOutcome::Accepted)
-     state_.selection = std::move(selection);
-    else
-     state_.selection = {};
-    settled = state_;
+  } catch (const std::exception& error) {
+   if (stop.stop_requested()) {
+    terminal.outcome = contracts::ModelSelectionOutcome::Cancelled;
+   } else {
+    failed = true;
+    terminal = {.outcome = contracts::ModelSelectionOutcome::Rejected, .detail = contracts::bounded_model_detail(error.what())};
    }
-   if (failed) runtime_.reset();
-   return changed(std::move(settled));
-  },
-  .failure = [this](std::exception_ptr) -> direct::LocalRun::Notification {
-   runtime_.reset();
-   contracts::ModelUiState settled;
-   {
-    std::scoped_lock lock(mutex_);
-    state_.active = false;
-    state_.progress = {};
+  } catch (...) {
+   if (stop.stop_requested()) {
+    terminal.outcome = contracts::ModelSelectionOutcome::Cancelled;
+   } else {
+    failed = true;
+    terminal = {.outcome = contracts::ModelSelectionOutcome::Rejected, .detail = "model selection failed"};
+   }
+  }
+  contracts::ModelUiState settled;
+  {
+   std::scoped_lock lock(mutex_);
+   state_.active = false;
+   state_.progress = {};
+   state_.terminal = std::move(terminal);
+   if (state_.terminal.outcome == contracts::ModelSelectionOutcome::Accepted)
+    state_.selection = std::move(selection);
+   else
     state_.selection = {};
-    state_.terminal = {.outcome = contracts::ModelSelectionOutcome::Rejected, .detail = "model worker failed"};
-    settled = state_;
-    // CLEANUP-IGNORE: Model failure settlement and cancellation use model-selection terminal facts;
-    // Dataset uses artifact inspection and compile facts.
-   }
-   return changed(std::move(settled));
-  },
+   settled = state_;
+  }
+  if (failed) runtime_.reset();
+  return changed(std::move(settled));
+ },
+  .failure = [this](std::exception_ptr) -> direct::LocalRun::Notification {
+  runtime_.reset();
+  contracts::ModelUiState settled;
+  {
+   std::scoped_lock lock(mutex_);
+   state_.active = false;
+   state_.progress = {};
+   state_.selection = {};
+   state_.terminal = {.outcome = contracts::ModelSelectionOutcome::Rejected, .detail = "model worker failed"};
+   settled = state_;
+   // CLEANUP-IGNORE: Model failure settlement and cancellation use model-selection terminal facts;
+   // Dataset uses artifact inspection and compile facts.
+  }
+  return changed(std::move(settled));
+ },
  });
  return snapshot();
 }

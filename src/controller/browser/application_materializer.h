@@ -179,51 +179,51 @@ template <class Composition>
    .source = {Projection::kind, 1U},
    .observe =
     [system] {
-     if constexpr (requires {
-                    { system->ObserveSource() } -> std::same_as<VisualSourceObservation>;
-                   })
-      return system->ObserveSource();
-     else
-      return Projection::Observe(std::invoke(&[:Snapshot:], *system));
-    },
+   if constexpr (requires {
+                  { system->ObserveSource() } -> std::same_as<VisualSourceObservation>;
+                 })
+    return system->ObserveSource();
+   else
+    return Projection::Observe(std::invoke(&[:Snapshot:], *system));
+  },
    .borrow = [system] { return system->BorrowFrame(); },
    .observe_workspace = [system] { return system->ObserveWorkspace(); },
    .borrow_workspace = [system] { return system->BorrowWorkspace(); },
    .request_workspace = [system](VisualWorkspaceRequest request) { system->RequestWorkspace(std::move(request)); },
    .image_metadata = [system](const VisualFrame& frame) -> std::optional<std::vector<std::byte>> {
-    using ProductSnapshot = typename Projection::image_type;
-    const auto retained = [&]() -> std::optional<ProductSnapshot> {
-     if constexpr (requires { system->ImageSnapshot(frame); })
-      return system->ImageSnapshot(frame);
-     else
-      return Projection::ImageOf(std::invoke(&[:Snapshot:], *system));
-    }();
-    if (!retained) return std::nullopt;
-    const auto& snapshot = *retained;
-    if (snapshot.frame != frame) return std::nullopt;
-    auto value = application_materializer_detail::reflected_value(snapshot);
-    if (!value) throw std::runtime_error("workspace image metadata cannot be projected");
-    WorkspaceImageMetadata metadata{
-     .schema_fingerprint = application_schema_fingerprint<Composition>().words,
-     .frame = frame,
-     .product = {.system_id = Cell::stable_id, .value = std::move(*value)},
-    };
-    if constexpr (Projection::kind == PresentationSourceKind::Upscale) {
-     const auto source = system->ImageSourceMetadata(frame);
-     if (!source) return std::nullopt;
-     Schema::VisitVisualSources([&]<class SourceCell, std::meta::info, class SourceProjection>() {
-      if (SourceProjection::kind == snapshot.input.source.kind) metadata.source = SystemSnapshot{.system_id = SourceCell::stable_id, .value = *source};
-     });
-     if (!metadata.source) return std::nullopt;
-    }
-    auto projected = application_materializer_detail::reflected_value(metadata);
-    if (!projected) throw std::runtime_error("workspace image envelope cannot be projected");
-    wire::ByteBuffer bytes;
-    if (!wire::encode(*projected, bytes,
-         {.max_bytes = presentation::detail::kWorkspaceMetadataByteCapacity, .max_items = presentation::detail::kWorkspaceMetadataByteCapacity, .max_depth = wire::kMaximumNestingDepth}))
-     throw std::runtime_error("workspace image metadata exceeds the graphics envelope");
-    return bytes;
-   },
+   using ProductSnapshot = typename Projection::image_type;
+   const auto retained = [&]() -> std::optional<ProductSnapshot> {
+    if constexpr (requires { system->ImageSnapshot(frame); })
+     return system->ImageSnapshot(frame);
+    else
+     return Projection::ImageOf(std::invoke(&[:Snapshot:], *system));
+   }();
+   if (!retained) return std::nullopt;
+   const auto& snapshot = *retained;
+   if (snapshot.frame != frame) return std::nullopt;
+   auto value = application_materializer_detail::reflected_value(snapshot);
+   if (!value) throw std::runtime_error("workspace image metadata cannot be projected");
+   WorkspaceImageMetadata metadata{
+    .schema_fingerprint = application_schema_fingerprint<Composition>().words,
+    .frame = frame,
+    .product = {.system_id = Cell::stable_id, .value = std::move(*value)},
+   };
+   if constexpr (Projection::kind == PresentationSourceKind::Upscale) {
+    const auto source = system->ImageSourceMetadata(frame);
+    if (!source) return std::nullopt;
+    Schema::VisitVisualSources([&]<class SourceCell, std::meta::info, class SourceProjection>() {
+     if (SourceProjection::kind == snapshot.input.source.kind) metadata.source = SystemSnapshot{.system_id = SourceCell::stable_id, .value = *source};
+    });
+    if (!metadata.source) return std::nullopt;
+   }
+   auto projected = application_materializer_detail::reflected_value(metadata);
+   if (!projected) throw std::runtime_error("workspace image envelope cannot be projected");
+   wire::ByteBuffer bytes;
+   if (!wire::encode(*projected, bytes,
+        {.max_bytes = presentation::detail::kWorkspaceMetadataByteCapacity, .max_items = presentation::detail::kWorkspaceMetadataByteCapacity, .max_depth = wire::kMaximumNestingDepth}))
+    throw std::runtime_error("workspace image metadata exceeds the graphics envelope");
+   return bytes;
+  },
   };
  });
  return readers;

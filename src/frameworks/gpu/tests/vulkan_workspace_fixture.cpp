@@ -138,7 +138,8 @@ VulkanWorkspaceFixture::VulkanWorkspaceFixture(int ordinal, std::uint32_t width,
  subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
  VkSubresourceLayout sublayout{};
  vkGetImageSubresourceLayout(state.device, state.image, &subresource, &sublayout);
- state.layout = {.device_incarnation = 7U + static_cast<std::uint64_t>(ordinal),
+ state.layout = {
+  .device_incarnation = 7U + static_cast<std::uint64_t>(ordinal),
   .device = ordinal,
   .width = width,
   .height = height,
@@ -146,7 +147,8 @@ VulkanWorkspaceFixture::VulkanWorkspaceFixture(int ordinal, std::uint32_t width,
   .offset_bytes = sublayout.offset,
   .required_allocation_bytes = requirements.size,
   .alignment_bytes = requirements.alignment,
-  .dedicated = true};
+  .dedicated = true
+ };
  std::memcpy(state.layout.device_uuid.data(), uuid.bytes, VK_UUID_SIZE);
  if (!state.layout.valid()) throw std::runtime_error("Vulkan fixture pitched layout unavailable");
  VkCommandPoolCreateInfo pool_info{};

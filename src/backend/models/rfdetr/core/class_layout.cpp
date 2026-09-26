@@ -69,12 +69,14 @@ ResolvedClassLayout::ResolvedClassLayout(ModelClassLayout record) : record_(std:
 }
 catalog::ClassReferenceDomain ResolvedClassLayout::domain() const noexcept { return semantic_ ? catalog::ClassReferenceDomain::Foreground : catalog::ClassReferenceDomain::RawOutputSlot; }
 ModelClassLayoutSummary ResolvedClassLayout::summary() const {
- ModelClassLayoutSummary result{.domain = domain(),
+ ModelClassLayoutSummary result{
+  .domain = domain(),
   .foreground_count = static_cast<std::uint32_t>(catalog_->size()),
   .output_count = static_cast<std::uint32_t>(output_width()),
   .scores = record_.scores,
   .no_object = record_.no_object,
-  .provenance = record_.provenance};
+  .provenance = record_.provenance
+ };
  for (const auto& slot : record_.slots) {
   result.background_count += slot.role == ClassSlotRole::Background;
   result.unused_count += slot.role == ClassSlotRole::Unused;

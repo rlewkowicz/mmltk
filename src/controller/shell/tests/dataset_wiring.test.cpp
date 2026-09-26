@@ -53,8 +53,8 @@ TEST_CASE("production dataset factory connects optional tracing through staged o
  const auto changed = browser::encode_system_event<&ApplicationSystems::dataset>(DatasetChanged{});
  std::promise<void> settled;
  ApplicationSystemStorage storage{std::move(configuration), [&](const browser::SystemEvent& event) {
-                                   if (event.system_id == changed.system_id && event.event_id == changed.event_id) settled.set_value();
-                                  }};
+  if (event.system_id == changed.system_id && event.event_id == changed.event_id) settled.set_value();
+ }};
  const mmltk::testsupport::ScopedTestCleanup shutdown{[&] {
   storage.presentation().CloseAdmission();
   storage.presentation().BrowserPeerLost();

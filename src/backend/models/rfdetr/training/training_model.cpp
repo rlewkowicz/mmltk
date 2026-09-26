@@ -190,8 +190,7 @@ void TrainingModel::start(std::shared_ptr<mmltk::common::concurrency::WorkerPool
     p.scaler.current_scale(), p.scaler.growth_tracker(), p.continuation.execution.effective_batch_per_model);
   });
  ensure_train_lane_model_supported(*p.owner, p.lane_capacity);
- p.lanes = std::make_unique<TrainingLanes>(
-  p.options, p.runtime, *p.loader, p.owner, p.optimizer_build.optimizer.parameter_names(), p.lane_capacity, p.rank_slice.count, p.augmentation_context,
+ p.lanes = std::make_unique<TrainingLanes>(p.options, p.runtime, *p.loader, p.owner, p.optimizer_build.optimizer.parameter_names(), p.lane_capacity, p.rank_slice.count, p.augmentation_context,
   [&p](std::exception_ptr failure) { p.failure(p.shard.model_id, std::move(failure)); }, std::move(workers));
  p.reducer =
   std::make_unique<TrainingGradientReducer>(p.distributed, p.options.device_id, mmltk::backend::ml::cuda::getCurrentCUDAStream(mmltk::backend::ml::cuda::checked_device_index(p.options.device_id)),
@@ -204,12 +203,14 @@ void TrainingModel::begin_epoch(std::uint64_t epoch, TrainingEpochDraws draws) {
  p.epoch = mmltk::common::math::checked_cast<int>(epoch, "training epoch exceeds request range");
  p.draws = std::move(draws);
  p.epoch_closed = false;
- p.distribution = {.model_id = p.shard.model_id,
+ p.distribution = {
+  .model_id = p.shard.model_id,
   .epoch = epoch,
   .unique_images = p.shard.images.size(),
   .scheduled_draws = mmltk::common::math::checked_add(static_cast<std::uint64_t>(p.draws.schedule->image_indices.size()), p.draws.unused_tail, "training draw count overflow"),
   .missing_classes = p.shard.missing_classes.size(),
-  .unused_tail = p.draws.unused_tail};
+  .unused_tail = p.draws.unused_tail
+ };
  for (const auto support : p.shard.unique_support)
   p.distribution.unique_class_support = mmltk::common::math::checked_add(p.distribution.unique_class_support, support, "training class support overflow");
  for (const auto exposure : p.draws.repeated_exposure)

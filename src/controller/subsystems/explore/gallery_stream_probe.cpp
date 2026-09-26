@@ -124,7 +124,8 @@ void GalleryStreamProbe::DiagnoseRendered(const GalleryProductState& product, co
    probe_annotation.reset();
   }
  }
- probes_[probe_count_++] = {.generation = generation,
+ probes_[probe_count_++] = {
+  .generation = generation,
   .slot = slot,
   .compiled_index = compiled_index,
   .count_target = count_target,
@@ -138,7 +139,8 @@ void GalleryStreamProbe::DiagnoseRendered(const GalleryProductState& product, co
   .image_key = sample_card ? sample_card->erasure.key : 0U,
   .source_extent = {product.store->header().image_width, product.store->header().image_height},
   .sampled_card = sample_card != nullptr,
-  .augmentation_config_enabled = product.plan.augmentation_config.enabled};
+  .augmentation_config_enabled = product.plan.augmentation_config.enabled
+ };
 } catch (...) {
  // Optional diagnostics may fail independently of the rendered product.
  // Partial launches retain their buffers until normal stream settlement.
@@ -175,12 +177,14 @@ void GalleryStreamProbe::FlushProbes(const std::uintptr_t stream) {
   probes_disabled_ = true;
  else {
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Explore,
     .operation = VisualDiagnosticOperation::ExploreProbeBatchSubmitted,
     .device = device_,
     .generation = probes_[0U].generation,
     .value = submitted_probes_,
-    .context = {.staging_bytes = submitted_probes_ * kProbeFacts * sizeof(std::uint64_t)}};
+    .context = {.staging_bytes = submitted_probes_ * kProbeFacts * sizeof(std::uint64_t)}
+   };
   });
  }
 }
@@ -193,24 +197,30 @@ void GalleryStreamProbe::EmitProbe(const RenderedProbe& record, const std::uint6
  const auto& [generation, slot, compiled_index, count_target, checksum_target, probe, seed, augmented, card, probe_annotation, dataset_identity, image_key, source_extent, sampled_card,
   augmentation_config_enabled] = record;
  diagnostics_.Emit([&] {
-  return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+  return VisualDiagnosticFact{
+   .system = contracts::DiagnosticOwner::Explore,
    .operation = VisualDiagnosticOperation::ExploreSemanticPixels,
    .device = device_,
    .generation = generation,
    .value = slot,
    .detail = facts[0],
-   .context = {.capacity_width = count_target.width, .capacity_height = count_target.height}};
+   .context = {.capacity_width = count_target.width, .capacity_height = count_target.height}
+  };
  });
  diagnostics_.Emit([&] {
-  return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+  return VisualDiagnosticFact{
+   .system = contracts::DiagnosticOwner::Explore,
    .operation = VisualDiagnosticOperation::ExploreImagePixels,
    .device = device_,
    .generation = generation,
    .value = compiled_index,
    .detail = facts[1],
-   .context = {.capacity_width = static_cast<std::uint32_t>(seed),
+   .context = {
+    .capacity_width = static_cast<std::uint32_t>(seed),
     .capacity_height = static_cast<std::uint32_t>(slot),
-    .staging_bytes = (checksum_target.width == checksum_target.height ? 1U : 0U) | (augmented ? 2U : 0U) | (card ? 4U : 0U)}};
+    .staging_bytes = (checksum_target.width == checksum_target.height ? 1U : 0U) | (augmented ? 2U : 0U) | (card ? 4U : 0U)
+   }
+  };
  });
  if (sampled_card) EmitCardSamples(record, facts);
  if (!card) return;
@@ -235,24 +245,28 @@ void GalleryStreamProbe::EmitProbe(const RenderedProbe& record, const std::uint6
    fact.context.capacity_height = static_cast<std::uint32_t>(std::min<std::uint64_t>(facts[2], std::numeric_limits<std::uint32_t>::max()));
    fact.context.staging_bytes =
     (std::min<std::uint64_t>(facts[3], std::numeric_limits<std::uint32_t>::max()) << 32U) | (std::min<std::uint64_t>(facts[4], 0xffffU) << 16U) | std::min<std::uint64_t>(facts[5], 0xffffU);
-   fact.context.source = {.source_width = checksum_target.width,
+   fact.context.source = {
+    .source_width = checksum_target.width,
     .source_height = checksum_target.height,
     .content_x = probe.content_x,
     .content_y = probe.content_y,
     .content_width = probe.content_width,
-    .content_height = probe.content_height};
+    .content_height = probe.content_height
+   };
    return fact;
   });
   const auto transition_count = (probe.content_y != 0U ? probe.content_width : 0U) + (probe.content_y + probe.content_height < checksum_target.height ? probe.content_width : 0U) +
                                 (probe.content_x != 0U ? probe.content_height : 0U) + (probe.content_x + probe.content_width < checksum_target.width ? probe.content_height : 0U);
   diagnostics_.Emit([&] {
-   return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+   return VisualDiagnosticFact{
+    .system = contracts::DiagnosticOwner::Explore,
     .operation = VisualDiagnosticOperation::ExploreRenderedTransitionProbe,
     .device = device_,
     .generation = generation,
     .value = slot,
     .detail = compiled_index,
-    .context = {.capacity_width = static_cast<std::uint32_t>(facts[3]), .capacity_height = static_cast<std::uint32_t>(facts[6]), .staging_bytes = transition_count}};
+    .context = {.capacity_width = static_cast<std::uint32_t>(facts[3]), .capacity_height = static_cast<std::uint32_t>(facts[6]), .staging_bytes = transition_count}
+   };
   });
  }
 }
@@ -359,15 +373,19 @@ void GalleryStreamProbe::DiagnoseDescriptors(const GalleryDescriptorStorage& des
   maximum_y = std::max(maximum_y, annotation.box_xyxy[3]);
  }
  diagnostics_.Emit([&] {
-  return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+  return VisualDiagnosticFact{
+   .system = contracts::DiagnosticOwner::Explore,
    .operation = VisualDiagnosticOperation::ExploreTransformedBounds,
    .device = device_,
    .generation = generation,
    .value = slot,
    .detail = (static_cast<std::uint64_t>(count) << 32U) | rle_count,
-   .context = {.capacity_width = count == 0U ? 0U : diagnostic_coordinate(minimum_x),
+   .context = {
+    .capacity_width = count == 0U ? 0U : diagnostic_coordinate(minimum_x),
     .capacity_height = count == 0U ? 0U : diagnostic_coordinate(minimum_y),
-    .staging_bytes = count == 0U ? 0U : (static_cast<std::size_t>(diagnostic_coordinate(maximum_x)) << 32U) | diagnostic_coordinate(maximum_y)}};
+    .staging_bytes = count == 0U ? 0U : (static_cast<std::size_t>(diagnostic_coordinate(maximum_x)) << 32U) | diagnostic_coordinate(maximum_y)
+   }
+  };
  });
 }
 void GalleryStreamProbe::DiagnosePreparedImage(const ExploreRenderPlan& plan, const GalleryReadScheduler& scheduler_, const mmltk::backend::models::rfdetr::GpuAugmentationExecutor& augmenter,

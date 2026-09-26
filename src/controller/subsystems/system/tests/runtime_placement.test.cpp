@@ -53,18 +53,16 @@ namespace {
 TEST_CASE("compute runtime admission preserves valid progress and reports malformed or failed work", "[controller][systems][compute]") {
  const auto scenario = GENERATE(0, 1, 2, 3);
  std::vector<std::uint64_t> delivered;
- const auto terminal = run_checked_compute(
-  [&](const ComputeProgressSink& progress) {
-   std::jthread reporter([&] {
-    progress({1U, 1U, 2U, "first"});
-    if (scenario == 1) progress({2U, 3U, 2U, "invalid"});
-    progress({3U, 2U, 2U, "last"});
-   });
-   reporter.join();
-   if (scenario == 3) throw std::runtime_error("runtime failure detail");
-   return contracts::make_compute_terminal(scenario == 2 ? contracts::ComputeOperationOutcome::Running : contracts::ComputeOperationOutcome::Succeeded, 0U, 2U);
-  },
-  [&](const contracts::ComputeProgress& progress) { delivered.push_back(progress.sequence); });
+ const auto terminal = run_checked_compute([&](const ComputeProgressSink& progress) {
+  std::jthread reporter([&] {
+   progress({1U, 1U, 2U, "first"});
+   if (scenario == 1) progress({2U, 3U, 2U, "invalid"});
+   progress({3U, 2U, 2U, "last"});
+  });
+  reporter.join();
+  if (scenario == 3) throw std::runtime_error("runtime failure detail");
+  return contracts::make_compute_terminal(scenario == 2 ? contracts::ComputeOperationOutcome::Running : contracts::ComputeOperationOutcome::Succeeded, 0U, 2U);
+ }, [&](const contracts::ComputeProgress& progress) { delivered.push_back(progress.sequence); });
  CHECK(delivered == std::vector<std::uint64_t>{1U, 3U});
  CHECK(terminal.valid_worker_terminal());
  if (scenario == 0) {
@@ -87,15 +85,15 @@ TEST_CASE("local run linearizes Stop with admission and installed worker", "[con
   run.Start({
    .prepare =
     [&] {
-     preparing.set_value();
-     release.wait();
-    },
+   preparing.set_value();
+   release.wait();
+  },
    .work = [&](const std::stop_token stop) -> direct::LocalRun::Notification {
-    std::unique_lock lock(stop_mutex);
-    const bool completed = stop_condition.wait(lock, stop, [] { return false; });
-    observed_stop.set_value(!completed && stop.stop_requested());
-    return {};
-   },
+   std::unique_lock lock(stop_mutex);
+   const bool completed = stop_condition.wait(lock, stop, [] { return false; });
+   observed_stop.set_value(!completed && stop.stop_requested());
+   return {};
+  },
   });
  });
  preparing.get_future().wait();
@@ -111,11 +109,11 @@ TEST_CASE("local run linearizes Stop with admission and installed worker", "[con
  std::promise<bool> second_cancelled;
  run.Start({
   .work = [&](const std::stop_token stop) -> direct::LocalRun::Notification {
-   second_started.set_value();
-   static_cast<void>(second_gate->Wait(stop));
-   second_cancelled.set_value(stop.stop_requested());
-   return {};
-  },
+  second_started.set_value();
+  static_cast<void>(second_gate->Wait(stop));
+  second_cancelled.set_value(stop.stop_requested());
+  return {};
+ },
  });
  second_started.get_future().wait();
  CHECK_FALSE(admitted.request_stop());
@@ -135,9 +133,9 @@ TEST_CASE("local run preserves admission after prepare throws", "[controller][sy
  std::promise<void> completed;
  run.Start({
   .work = [&](std::stop_token) -> direct::LocalRun::Notification {
-   completed.set_value();
-   return {};
-  },
+  completed.set_value();
+  return {};
+ },
  });
  completed.get_future().wait();
 }
@@ -159,9 +157,9 @@ TEST_CASE("Local compute admission waits for required worker placement", "[contr
  run.Start({
   .policy = ExecutionPolicyRequest{{cpu}, {}, 0, node, -10, false},
   .work = [&](std::stop_token) -> direct::LocalRun::Notification {
-   observed = capture_execution_policy_snapshot();
-   return {};
-  },
+  observed = capture_execution_policy_snapshot();
+  return {};
+ },
  });
  run.StopAndJoin();
  REQUIRE(observed);
@@ -191,8 +189,9 @@ TEST_CASE("Compute policy denial precedes admission and CUDA construction", "[co
    } catch (const std::system_error& error) {
     if (admitted || run.active() || error.code().value() != EPERM) return false;
     const DirectComputeConfiguration configuration{.execution = mmltk::frameworks::gpu::DeviceExecution{.device = 999999, .placement = {.numa_node = node, .cpus = {cpu}}}};
-    for (const auto& construct : std::array<std::function<void()>, 3>{
-          [&] { CudaValidationRuntime runtime(configuration); }, [&] { CudaExportRuntime runtime(configuration); }, [&] { CudaPredictRuntime runtime(configuration); }}) {
+    for (const auto& construct : std::array<std::function<void()>, 3>{[&] { CudaValidationRuntime runtime(configuration); }, [&] { CudaExportRuntime runtime(configuration); }, [&] {
+     CudaPredictRuntime runtime(configuration);
+    }}) {
      try {
       construct();
       return false;
@@ -221,39 +220,40 @@ struct RuntimeRetirementSession {
 };
 detail::CudaRuntimeResources::Operations retirement_operations(const std::shared_ptr<RuntimeRetirementProbe>& probe) {
  return detail::CudaRuntimeResources::Operations{
-  .device = {probe.get(),
+  .device = {
+   probe.get(),
    [](void* value, int* device) noexcept {
-    *device = static_cast<RuntimeRetirementProbe*>(value)->current;
-    return cudaSuccess;
-   },
+  *device = static_cast<RuntimeRetirementProbe*>(value)->current;
+  return cudaSuccess;
+ },
    [](void* value, int device) noexcept {
-    auto& state = *static_cast<RuntimeRetirementProbe*>(value);
-    if (device == 9 && state.restore_failure) return cudaErrorUnknown;
-    state.current = device;
-    return cudaSuccess;
-   }},
+  auto& state = *static_cast<RuntimeRetirementProbe*>(value);
+  if (device == 9 && state.restore_failure) return cudaErrorUnknown;
+  state.current = device;
+  return cudaSuccess;
+ }
+  },
   .context = probe.get(),
   .create =
    [](void* value, cudaStream_t* stream, unsigned) {
-    auto& state = *static_cast<RuntimeRetirementProbe*>(value);
-    ++state.created;
-    *stream = reinterpret_cast<cudaStream_t>(value);
-    if (state.construction_restore_failure) state.restore_failure = true;
-    return cudaSuccess;
-   },
+  auto& state = *static_cast<RuntimeRetirementProbe*>(value);
+  ++state.created;
+  *stream = reinterpret_cast<cudaStream_t>(value);
+  if (state.construction_restore_failure) state.restore_failure = true;
+  return cudaSuccess;
+ },
   .synchronize =
    [](void* value, cudaStream_t) {
-    auto& state = *static_cast<RuntimeRetirementProbe*>(value);
-    ++state.synchronized;
-    return state.sync_failure ? cudaErrorUnknown : cudaSuccess;
-   },
-  .destroy =
-   [](void* value, cudaStream_t) {
-    auto& state = *static_cast<RuntimeRetirementProbe*>(value);
-    if (state.destroy_failure) return cudaErrorUnknown;
-    ++state.destroyed;
-    return cudaSuccess;
-   },
+  auto& state = *static_cast<RuntimeRetirementProbe*>(value);
+  ++state.synchronized;
+  return state.sync_failure ? cudaErrorUnknown : cudaSuccess;
+ },
+  .destroy = [](void* value, cudaStream_t) {
+  auto& state = *static_cast<RuntimeRetirementProbe*>(value);
+  if (state.destroy_failure) return cudaErrorUnknown;
+  ++state.destroyed;
+  return cudaSuccess;
+ },
  };
 }
 TEST_CASE("direct CUDA resources preserve the exact session and stream on unproved settlement", "[controller][compute][custody]") {
@@ -294,12 +294,10 @@ TEST_CASE("direct CUDA resources preserve the exact session and stream on unprov
    CHECK(resources->Run([](auto) { return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded); }, {}).outcome == contracts::ComputeOperationOutcome::Succeeded);
    std::stop_source stopped;
    stopped.request_stop();
-   const auto cancelled = resources->Run(
-    [](auto) -> contracts::ComputeTerminal {
-     FAIL("cancelled work ran");
-     return {};
-    },
-    stopped.get_token());
+   const auto cancelled = resources->Run([](auto) -> contracts::ComputeTerminal {
+    FAIL("cancelled work ran");
+    return {};
+   }, stopped.get_token());
    CHECK(cancelled.outcome == contracts::ComputeOperationOutcome::Cancelled);
    resources->Retire();
    const auto synchronized = probe->synchronized;
@@ -388,22 +386,15 @@ public:
      : feature_(feature), settings_(std::get<0>(fixture.systems())), observe_(std::move(observe)) {
   auto [settings, dataset, model] = fixture.systems();
   if (factories.validation)
-   validation_.emplace(
-    settings, dataset, model, std::move(factories.validation),
-    [this](const ValidationSystem::event_type& event) {
-     if (const auto* changed = std::get_if<ValidationChanged>(&event)) observe_(changed->snapshot.operation);
-    },
-    resolver);
+   validation_.emplace(settings, dataset, model, std::move(factories.validation), [this](const ValidationSystem::event_type& event) {
+    if (const auto* changed = std::get_if<ValidationChanged>(&event)) observe_(changed->snapshot.operation);
+   }, resolver);
   if (factories.exporter)
-   exporter_.emplace(
-    settings, dataset, model, std::move(factories.exporter),
-    [this](const ExportSystem::event_type& event) {
-     if (const auto* changed = std::get_if<ComputeChanged>(&event)) observe_(changed->snapshot);
-    },
-    resolver);
+   exporter_.emplace(settings, dataset, model, std::move(factories.exporter), [this](const ExportSystem::event_type& event) {
+    if (const auto* changed = std::get_if<ComputeChanged>(&event)) observe_(changed->snapshot);
+   }, resolver);
   if (factories.prediction)
-   prediction_.emplace(
-    settings, dataset, model, VisualDeviceSettings{.device = 0, .maximum_width = extent.width, .maximum_height = extent.height}, std::move(factories.prediction),
+   prediction_.emplace(settings, dataset, model, VisualDeviceSettings{.device = 0, .maximum_width = extent.width, .maximum_height = extent.height}, std::move(factories.prediction),
     [this](const PredictSystem::event_type& event) { std::visit([this](const auto& value) { observe_(value.snapshot.operation); }, event); }, resolver);
  }
  void Start() {
@@ -504,16 +495,10 @@ TEST_CASE("workflow replacement observes production session registered-page reti
  class SessionRuntime final : public ValidationRuntime, public PredictRuntime {
  public:
   SessionRuntime(DirectComputeConfiguration configuration, std::shared_ptr<Probe> probe, rfdetr::PredictRequest request, std::shared_ptr<rfdetr::PredictionSession> session)
-      : session_(std::move(session)),
-        probe_(std::move(probe)),
-        request_(std::move(request)),
-        resources_(
-         configuration,
-         [session = session_, probe = probe_] {
-          static_cast<void>(probe);
-          if (session->Close() != mmltk::backend::ml::runtime::kRuntimeSuccess) throw std::runtime_error("production session close failed");
-         },
-         StreamOperations(probe_.get())) {}
+      : session_(std::move(session)), probe_(std::move(probe)), request_(std::move(request)), resources_(configuration, [session = session_, probe = probe_] {
+         static_cast<void>(probe);
+         if (session->Close() != mmltk::backend::ml::runtime::kRuntimeSuccess) throw std::runtime_error("production session close failed");
+        }, StreamOperations(probe_.get())) {}
   void Close() noexcept override {
    try {
     resources_.Retire();
@@ -540,12 +525,10 @@ TEST_CASE("workflow replacement observes production session registered-page reti
   }
   contracts::ComputeTerminal Execute(const PredictRuntime::PreviewRetirement& retirement) {
    const auto operations = probe_->pages.operations();
-   return resources_.Run(
-    [&](auto stream) {
-     const auto result = session_->Run(request_, stream, {.retirement = retirement, .registered_host_operations = operations});
-     return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0U, result.processed_images);
-    },
-    {});
+   return resources_.Run([&](auto stream) {
+    const auto result = session_->Run(request_, stream, {.retirement = retirement, .registered_host_operations = operations});
+    return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0U, result.processed_images);
+   }, {});
   }
   std::shared_ptr<rfdetr::PredictionSession> session_;
   std::shared_ptr<Probe> probe_;

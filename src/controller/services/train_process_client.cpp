@@ -435,11 +435,13 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
  if (persistence.degraded && persistence.error.empty()) persistence.error = "Training metric persistence is incomplete";
  validate_progress_fields(status, checkpoint.string());
  ++state_->progress_sequence;
- return TrainProcessProgress{.progress = {.sequence = state_->progress_sequence, .completed = std::min(completed, total), .total = total, .status = std::move(status)},
+ return TrainProcessProgress{
+  .progress = {.sequence = state_->progress_sequence, .completed = std::min(completed, total), .total = total, .status = std::move(status)},
   .checkpoint_path = std::move(checkpoint),
   .metrics = std::move(metrics),
   .sources = std::move(sources),
-  .persistence = std::move(persistence)};
+  .persistence = std::move(persistence)
+ };
 }
 std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* retained_output) {
  if (!active()) return std::nullopt;

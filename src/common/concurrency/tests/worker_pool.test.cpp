@@ -195,11 +195,10 @@ TEST_CASE("Child pools use immutable placement after the creator is pinned", "[c
  WorkerPool parent(1, placement.cpus, "parent", 1, &placement);
  const auto observed = parent
                         .enqueue([&] {
-                         WorkerPool children(placement.cpus.size(), placement.cpus, "child", 1, &placement);
-                         auto snapshot = children.enqueue([] { return capture_execution_policy_snapshot(); }).get();
-                         return std::pair{children.size(), snapshot};
-                        })
-                        .get();
+  WorkerPool children(placement.cpus.size(), placement.cpus, "child", 1, &placement);
+  auto snapshot = children.enqueue([] { return capture_execution_policy_snapshot(); }).get();
+  return std::pair{children.size(), snapshot};
+ }).get();
  CHECK(observed.first == placement.cpus.size());
  CHECK(observed.second.numa_node == placement.numa_node);
  CHECK(observed.second.nice_value <= -10);

@@ -52,8 +52,9 @@ public:
  }
  contracts::ComputeTerminal Train(
   mmltk::backend::models::rfdetr::TrainRequest, const std::stop_token stop, const std::function<void(const services::TrainProcessProgress&)>& progress, std::uint64_t) override {
-  progress({.progress = fail_ ? contracts::ComputeProgress{.sequence = 0U, .status = std::string(contracts::kComputeStatusCapacity + 1U, 'x')}
-                              : contracts::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 1U, .status = "trained"}});
+  progress(
+   {.progress = fail_ ? contracts::ComputeProgress{.sequence = 0U, .status = std::string(contracts::kComputeStatusCapacity + 1U, 'x')}
+                      : contracts::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 1U, .status = "trained"}});
   if (!gate_->Wait(stop)) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
   if (fail_) return {.outcome = static_cast<contracts::ComputeOperationOutcome>(255U), .output = std::string(contracts::kComputePathCapacity + 1U, 'x'), .detail = {}};
   return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
@@ -61,9 +62,11 @@ public:
  contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, const std::stop_token stop) override {
   if (!gate_->Wait(stop)) return {.outcome = contracts::ProviderQueryOutcome::Cancelled};
   if (fail_)
-   return {.outcome = static_cast<contracts::ProviderQueryOutcome>(255U),
+   return {
+    .outcome = static_cast<contracts::ProviderQueryOutcome>(255U),
     .offers = std::vector<contracts::ProviderOffer>(contracts::kProviderOfferCapacity + 1U),
-    .detail = std::string(contracts::kProviderDetailCapacity + 1U, 'x')};
+    .detail = std::string(contracts::kProviderDetailCapacity + 1U, 'x')
+   };
   return {.outcome = contracts::ProviderQueryOutcome::Succeeded, .offers = {provider_offer()}};
  }
  contracts::ProviderEffectResult Mutate(contracts::ProviderMutation, const contracts::ProviderPreferences&, contracts::ProviderOfferIdentity, int, std::string_view, std::stop_token) override {
@@ -171,13 +174,14 @@ TEST_CASE("checkpoint inspection replaces bounded worker work and guards cached 
   checkpoint.configuration = configuration;
   return r::TrainingCheckpointAdmission(std::move(checkpoint), mmltk::common::io::FileSnapshot::Read(path));
  };
- TrainingSystem training{settings, dataset, model, policy, [&] { return std::make_unique<FakeTrainingRuntime>(std::make_shared<mmltk::testsupport::StopGate>(), false, false, inspect); },
-  [&](TrainingSystem::event_type event) {
-   if (const auto* changed = std::get_if<TrainingInspectionChanged>(&event)) {
-    if (changed->inspection.status == r::TrainingInspectionStatus::Ready) completed.set_value(changed->inspection);
-    if (changed->inspection.status == r::TrainingInspectionStatus::Failed) failed.set_value(changed->inspection);
-   }
-  }};
+ TrainingSystem training{settings, dataset, model, policy, [&] {
+  return std::make_unique<FakeTrainingRuntime>(std::make_shared<mmltk::testsupport::StopGate>(), false, false, inspect);
+ }, [&](TrainingSystem::event_type event) {
+  if (const auto* changed = std::get_if<TrainingInspectionChanged>(&event)) {
+   if (changed->inspection.status == r::TrainingInspectionStatus::Ready) completed.set_value(changed->inspection);
+   if (changed->inspection.status == r::TrainingInspectionStatus::Failed) failed.set_value(changed->inspection);
+  }
+ }};
  const auto first = training.InspectCheckpoint({blocked});
  CHECK(first.status == r::TrainingInspectionStatus::Running);
  mmltk::testsupport::await_test_promise(entered, "inspection started");
@@ -258,28 +262,26 @@ TEST_CASE("Resume reuses exact admitted checkpoint evidence across preparation a
  std::atomic_bool launched = false;
  std::promise<r::TrainingCheckpointInspection> inspected, refreshed;
  std::promise<TrainingSnapshot> settled;
- TrainingSystem training{settings, dataset, model, std::nullopt,
-  [&] {
-   return std::make_unique<FakeTrainingRuntime>(train_gate, false, false, [&](const auto& selected, std::stop_token stop) {
-    ++inspections;
-    r::TrainingCheckpoint checkpoint;
-    checkpoint.path = selected;
-    checkpoint.resumable = true;
-    checkpoint.configuration = configuration;
-    checkpoint.class_layout = layout;
-    return r::TrainingCheckpointAdmission(std::move(checkpoint), std::make_shared<const r::ClassArtifactAdmission>(selected, std::filesystem::path{}, nullptr, stop));
-   });
-  },
-  [&](TrainingSystem::event_type event) {
-   if (const auto* ready = std::get_if<TrainingInspectionChanged>(&event)) {
-    if (ready->inspection.generation == 1)
-     inspected.set_value(ready->inspection);
-    else
-     refreshed.set_value(ready->inspection);
-   }
-   if (std::holds_alternative<TrainingProgress>(event)) launched = true;
-   if (const auto* changed = std::get_if<TrainingChanged>(&event); changed && !changed->snapshot.local.active) settled.set_value(changed->snapshot);
-  }};
+ TrainingSystem training{settings, dataset, model, std::nullopt, [&] {
+  return std::make_unique<FakeTrainingRuntime>(train_gate, false, false, [&](const auto& selected, std::stop_token stop) {
+   ++inspections;
+   r::TrainingCheckpoint checkpoint;
+   checkpoint.path = selected;
+   checkpoint.resumable = true;
+   checkpoint.configuration = configuration;
+   checkpoint.class_layout = layout;
+   return r::TrainingCheckpointAdmission(std::move(checkpoint), std::make_shared<const r::ClassArtifactAdmission>(selected, std::filesystem::path{}, nullptr, stop));
+  });
+ }, [&](TrainingSystem::event_type event) {
+  if (const auto* ready = std::get_if<TrainingInspectionChanged>(&event)) {
+   if (ready->inspection.generation == 1)
+    inspected.set_value(ready->inspection);
+   else
+    refreshed.set_value(ready->inspection);
+  }
+  if (std::holds_alternative<TrainingProgress>(event)) launched = true;
+  if (const auto* changed = std::get_if<TrainingChanged>(&event); changed && !changed->snapshot.local.active) settled.set_value(changed->snapshot);
+ }};
  (void)training.InspectCheckpoint({path});
  REQUIRE(mmltk::testsupport::await_test_promise(inspected, "checkpoint admitted").status == r::TrainingInspectionStatus::Ready);
  const auto capability = training.PrepareResume({path});
@@ -328,9 +330,9 @@ TEST_CASE("checkpoint inspection policy denial fails construction before runtime
   std::atomic_bool constructed = false;
   try {
    TrainingSystem training{settings, dataset, model, inspection_policy(), [&] {
-                            constructed = true;
-                            return std::make_unique<FakeTrainingRuntime>(std::make_shared<mmltk::testsupport::StopGate>(), false);
-                           }};
+    constructed = true;
+    return std::make_unique<FakeTrainingRuntime>(std::make_shared<mmltk::testsupport::StopGate>(), false);
+   }};
   } catch (const std::system_error& error) { return error.code().value() == EPERM && !constructed.load(); }
   return false;
  }) == 0);
@@ -372,9 +374,9 @@ TEST_CASE("training owns provider offers and remote control with Busy and lazy f
  std::atomic_size_t constructions = 0U;
  TerminalSequence<TrainingSystem::event_type> terminals;
  TrainingSystem training{settings, dataset, model, std::nullopt, reconstructing_training_runtime(gate, constructions), [&](TrainingSystem::event_type event) {
-                          if (std::holds_alternative<TrainingProgress>(event)) return;
-                          terminals.Publish(std::move(event));
-                         }};
+  if (std::holds_alternative<TrainingProgress>(event)) return;
+  terminals.Publish(std::move(event));
+ }};
  const auto admitted_query = training.Query({});
  CHECK_THROWS_AS(training.Query({}), contracts::BusyError);
  CHECK_THROWS_AS(training.Select({.offer_id = 17}), contracts::BusyError);
@@ -413,16 +415,16 @@ TEST_CASE("local training resets progress and supports failure Stop and reconstr
  auto first_successful_progress_observed = first_successful_progress.get_future();
  TerminalSequence<TrainingSystem::event_type> terminals;
  TrainingSystem training{settings, dataset, model, std::nullopt, reconstructing_training_runtime(gate, constructions), [&](TrainingSystem::event_type event) {
-                          if (const auto* progress = std::get_if<TrainingProgress>(&event)) {
-                           if (progress->local.progress.sequence == 1U) {
-                            CHECK(progress->local.generation_frontier != 0U);
-                            if (sequence_one_progress.fetch_add(1U) == 0U) first_successful_progress.set_value();
-                           }
-                           return;
-                          }
-                          if (const auto* changed = std::get_if<TrainingChanged>(&event); changed && changed->snapshot.local.active) return;
-                          terminals.Publish(std::move(event));
-                         }};  // CLEANUP-IGNORE: Local training and validation start evidence targets independently typed terminal state.
+  if (const auto* progress = std::get_if<TrainingProgress>(&event)) {
+   if (progress->local.progress.sequence == 1U) {
+    CHECK(progress->local.generation_frontier != 0U);
+    if (sequence_one_progress.fetch_add(1U) == 0U) first_successful_progress.set_value();
+   }
+   return;
+  }
+  if (const auto* changed = std::get_if<TrainingChanged>(&event); changed && changed->snapshot.local.active) return;
+  terminals.Publish(std::move(event));
+ }};  // CLEANUP-IGNORE: Local training and validation start evidence targets independently typed terminal state.
  mmltk::testsupport::console_output::ScopedStderrCapture capture;
  static_cast<void>(training.Start({}));
  CHECK_THROWS_AS(training.Start({}), contracts::BusyError);
@@ -461,15 +463,14 @@ TEST_CASE("remote training rejects duplicate starts and reconciles an inconclusi
  std::promise<void> mutation_done;
  std::promise<void> reconciliation_done;
  std::atomic_size_t changed = 0U;
- TrainingSystem training{settings, dataset, model, std::nullopt, [gate] { return std::make_unique<FakeTrainingRuntime>(gate, false, true); },
-  [&](TrainingSystem::event_type event) {
-   if (!std::holds_alternative<TrainingChanged>(event)) return;
-   switch (changed++) {
-    case 0U: query_done.set_value(); break;
-    case 1U: mutation_done.set_value(); break;
-    default: reconciliation_done.set_value(); break;
-   }
-  }};
+ TrainingSystem training{settings, dataset, model, std::nullopt, [gate] { return std::make_unique<FakeTrainingRuntime>(gate, false, true); }, [&](TrainingSystem::event_type event) {
+  if (!std::holds_alternative<TrainingChanged>(event)) return;
+  switch (changed++) {
+   case 0U: query_done.set_value(); break;
+   case 1U: mutation_done.set_value(); break;
+   default: reconciliation_done.set_value(); break;
+  }
+ }};
  static_cast<void>(training.Query({}));
  query_done.get_future().wait();
  static_cast<void>(training.Select({.offer_id = 17}));
@@ -488,10 +489,9 @@ TEST_CASE("provider Clear cancels the active query and clears selection state", 
  auto [settings, dataset, model] = fixture.systems();
  auto query_gate = std::make_shared<mmltk::testsupport::StopGate>();
  std::promise<void> query_done;
- TrainingSystem training{settings, dataset, model, std::nullopt, [query_gate] { return std::make_unique<FakeTrainingRuntime>(query_gate, false); },
-  [&](TrainingSystem::event_type event) {
-   if (std::holds_alternative<TrainingChanged>(event)) query_done.set_value();
-  }};
+ TrainingSystem training{settings, dataset, model, std::nullopt, [query_gate] { return std::make_unique<FakeTrainingRuntime>(query_gate, false); }, [&](TrainingSystem::event_type event) {
+  if (std::holds_alternative<TrainingChanged>(event)) query_done.set_value();
+ }};
  static_cast<void>(training.Query({}));
  const auto stopping = training.Clear({});
  CHECK(stopping.activity == TrainingActivity::ProviderQuery);
@@ -510,10 +510,9 @@ TEST_CASE("provider Clear is admitted once until the query worker settles", "[co
  auto started = probe->started.get_future();
  auto cancellation = probe->cancellation_observed.get_future();
  std::promise<void> settled;
- TrainingSystem training{settings, dataset, model, std::nullopt, [probe] { return std::make_unique<BlockingCancellationTrainingRuntime>(probe); },
-  [&settled](TrainingSystem::event_type event) {
-   if (std::holds_alternative<TrainingChanged>(event)) settled.set_value();
-  }};
+ TrainingSystem training{settings, dataset, model, std::nullopt, [probe] { return std::make_unique<BlockingCancellationTrainingRuntime>(probe); }, [&settled](TrainingSystem::event_type event) {
+  if (std::holds_alternative<TrainingChanged>(event)) settled.set_value();
+ }};
  static_cast<void>(training.Query({}));
  started.wait();
  const auto stopping = training.Clear({});
@@ -533,10 +532,9 @@ TEST_CASE("local Stop does not cancel provider query or remote effect", "[contro
  auto [settings, dataset, model] = fixture.systems();
  auto query_gate = std::make_shared<mmltk::testsupport::StopGate>();
  std::promise<void> query_done;
- TrainingSystem query_training{settings, dataset, model, std::nullopt, [query_gate] { return std::make_unique<FakeTrainingRuntime>(query_gate, false); },
-  [&](TrainingSystem::event_type event) {
-   if (std::holds_alternative<TrainingChanged>(event)) query_done.set_value();
-  }};
+ TrainingSystem query_training{settings, dataset, model, std::nullopt, [query_gate] { return std::make_unique<FakeTrainingRuntime>(query_gate, false); }, [&](TrainingSystem::event_type event) {
+  if (std::holds_alternative<TrainingChanged>(event)) query_done.set_value();
+ }};
  static_cast<void>(query_training.Query({}));
  static_cast<void>(query_training.Stop({}));
  query_gate->Release();
@@ -546,14 +544,13 @@ TEST_CASE("local Stop does not cancel provider query or remote effect", "[contro
  std::promise<void> offers_ready;
  std::promise<void> remote_done;
  std::atomic_size_t changes = 0U;
- TrainingSystem remote_training{settings, dataset, model, std::nullopt, [remote_gate] { return std::make_unique<BlockingRemoteRuntime>(remote_gate); },
-  [&](TrainingSystem::event_type event) {
-   if (!std::holds_alternative<TrainingChanged>(event)) return;
-   if (changes++ == 0U)
-    offers_ready.set_value();
-   else
-    remote_done.set_value();
-  }};
+ TrainingSystem remote_training{settings, dataset, model, std::nullopt, [remote_gate] { return std::make_unique<BlockingRemoteRuntime>(remote_gate); }, [&](TrainingSystem::event_type event) {
+  if (!std::holds_alternative<TrainingChanged>(event)) return;
+  if (changes++ == 0U)
+   offers_ready.set_value();
+  else
+   remote_done.set_value();
+ }};
  static_cast<void>(remote_training.Query({}));
  offers_ready.get_future().wait();
  static_cast<void>(remote_training.Select({.offer_id = 17}));
@@ -583,13 +580,12 @@ TEST_CASE("training completion releases admission before observer publication re
  std::promise<void> local_publishing;
  std::promise<void> release_local_publication;
  const auto release_local = release_local_publication.get_future().share();
- TrainingSystem local{settings, dataset, model, std::nullopt, [local_gate] { return std::make_unique<FakeTrainingRuntime>(local_gate, false); },
-  [&](TrainingSystem::event_type event) {
-   const auto* changed = std::get_if<TrainingChanged>(&event);
-   if (!changed || changed->snapshot.local.active) return;
-   local_publishing.set_value();
-   release_local.wait();
-  }};
+ TrainingSystem local{settings, dataset, model, std::nullopt, [local_gate] { return std::make_unique<FakeTrainingRuntime>(local_gate, false); }, [&](TrainingSystem::event_type event) {
+  const auto* changed = std::get_if<TrainingChanged>(&event);
+  if (!changed || changed->snapshot.local.active) return;
+  local_publishing.set_value();
+  release_local.wait();
+ }};
  auto release_local_on_exit = release_training_publication_on_exit(local, *local_gate, release_local_publication);
  static_cast<void>(local.Start({}));
  auto publishing = local_publishing.get_future();
@@ -603,13 +599,12 @@ TEST_CASE("training completion releases admission before observer publication re
  std::promise<TrainingSnapshot> query_publishing;
  std::promise<void> release_query_publication;
  const auto release_query = release_query_publication.get_future().share();
- TrainingSystem query{settings, dataset, model, std::nullopt, [query_gate] { return std::make_unique<FakeTrainingRuntime>(query_gate, false); },
-  [&](TrainingSystem::event_type event) {
-   const auto* changed = std::get_if<TrainingChanged>(&event);
-   if (changed == nullptr) return;
-   query_publishing.set_value(changed->snapshot);
-   release_query.wait();
-  }};
+ TrainingSystem query{settings, dataset, model, std::nullopt, [query_gate] { return std::make_unique<FakeTrainingRuntime>(query_gate, false); }, [&](TrainingSystem::event_type event) {
+  const auto* changed = std::get_if<TrainingChanged>(&event);
+  if (changed == nullptr) return;
+  query_publishing.set_value(changed->snapshot);
+  release_query.wait();
+ }};
  auto release_query_on_exit = release_training_publication_on_exit(query, *query_gate, release_query_publication);
  static_cast<void>(query.Query({}));
  auto query_publication = query_publishing.get_future();
@@ -634,10 +629,9 @@ TEST_CASE("training admission and matching cancellation do not invert system and
  auto [settings, dataset, model] = fixture.systems();
  auto runtime_gate = std::make_shared<mmltk::testsupport::StopGate>();
  std::promise<void> done;
- TrainingSystem system{settings, dataset, model, std::nullopt, [runtime_gate] { return std::make_unique<FakeTrainingRuntime>(runtime_gate, false); },
-  [&](TrainingSystem::event_type event) {
-   if (!std::holds_alternative<TrainingProgress>(event)) done.set_value();
-  }};
+ TrainingSystem system{settings, dataset, model, std::nullopt, [runtime_gate] { return std::make_unique<FakeTrainingRuntime>(runtime_gate, false); }, [&](TrainingSystem::event_type event) {
+  if (!std::holds_alternative<TrainingProgress>(event)) done.set_value();
+ }};
  mmltk::testsupport::TestGate admission{provider_query ? "concurrent provider Query and Clear admission" : "concurrent training Start and Stop admission"};
  std::future<TrainingSnapshot> starting;
  std::future<void> cancelling;

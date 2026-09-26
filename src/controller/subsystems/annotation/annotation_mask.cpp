@@ -87,8 +87,9 @@ Runs dilate(const Runs& runs, std::uint16_t radius, std::uint16_t width, std::ui
   for (int y = low; y <= high; ++y) {
    const int dy = y - run.row;
    const int reach = disk.At(dy);
-   result.push_back({static_cast<std::uint16_t>(y), static_cast<std::uint16_t>(std::max(0, static_cast<int>(run.first) - reach)),
-    static_cast<std::uint16_t>(std::min(static_cast<int>(width) - 1, static_cast<int>(run.last) + reach))});
+   result.push_back(
+    {static_cast<std::uint16_t>(y), static_cast<std::uint16_t>(std::max(0, static_cast<int>(run.first) - reach)),
+     static_cast<std::uint16_t>(std::min(static_cast<int>(width) - 1, static_cast<int>(run.last) + reach))});
   }
   // Bound transient storage while consolidating actual support.
   if (result.size() > c::kAnnotationMaskRunCapacity * 2) normalize(result);

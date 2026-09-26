@@ -92,10 +92,11 @@ void test_current_continuation_required_fields() {
  REQUIRE_FALSE(r::detail::read_training_continuation(input).has_value());
 }
 void test_current_continuation_scalar_boundaries() {
- const auto invalid = std::to_array<std::pair<std::string, c10::IValue>>({{"epoch", int64_t{-1}}, {"epoch", int64_t{std::numeric_limits<int>::max()}}, {"grad_scaler_scale", 0.0},
-  {"grad_scaler_scale", std::numeric_limits<double>::infinity()}, {"grad_scaler_growth_tracker", int64_t{-1}}, {"grad_scaler_growth_tracker", int64_t{std::numeric_limits<int>::max()} + 1},
-  {"ema_completed_updates", int64_t{-1}}, {"ema_completed_updates", std::numeric_limits<int64_t>::max()}, {"ema_completed_updates", int64_t{1}}, {"training_attempt_id", std::string{}},
-  {"training_attempt_id", std::string(65, 'a')}, {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')}});
+ const auto invalid = std::to_array<std::pair<std::string, c10::IValue>>(
+  {{"epoch", int64_t{-1}}, {"epoch", int64_t{std::numeric_limits<int>::max()}}, {"grad_scaler_scale", 0.0}, {"grad_scaler_scale", std::numeric_limits<double>::infinity()},
+   {"grad_scaler_growth_tracker", int64_t{-1}}, {"grad_scaler_growth_tracker", int64_t{std::numeric_limits<int>::max()} + 1}, {"ema_completed_updates", int64_t{-1}},
+   {"ema_completed_updates", std::numeric_limits<int64_t>::max()}, {"ema_completed_updates", int64_t{1}}, {"training_attempt_id", std::string{}}, {"training_attempt_id", std::string(65, 'a')},
+   {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')}});
  for (const auto& [key, value] : invalid) {
   auto source = continuation_fixture(saved_request());
   torch::serialize::OutputArchive output;
@@ -264,8 +265,9 @@ TEST_CASE("Resolved current Resume preserves recipe optimizer EMA and an unfinis
  state.metadata.num_queries = 2;
  state.metadata.num_select = 2;
  state.metadata.class_layout = r::testsupport::synthetic_training_layout(2);
- state.replace_entries({{"query_feat.weight", torch::zeros({26, 256})}, {"refpoint_embed.weight", torch::zeros({26, 4})}, {"class_embed.weight", torch::zeros({3, 256})},
-  {"class_embed.bias", torch::tensor({0.3F, -0.2F, 0.7F})}});
+ state.replace_entries(
+  {{"query_feat.weight", torch::zeros({26, 256})}, {"refpoint_embed.weight", torch::zeros({26, 4})}, {"class_embed.weight", torch::zeros({3, 256})},
+   {"class_embed.bias", torch::tensor({0.3F, -0.2F, 0.7F})}});
  state.metadata.cls_loss_coef = 7.3;
  state.metadata.bbox_loss_coef = 9.1;
  state.metadata.giou_loss_coef = 3.2;
@@ -435,9 +437,10 @@ TEST_CASE("Logical donor admission preserves original RLE support and empty-mask
  spec.background_images = 0;
  spec.width = spec.height = 8;
  fixture::create_synthetic_dataset(spec);
- const std::array annotations{R"({"class":"person","bbox_xyxy":[3,3,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:2 8:1","ignore":true})",
-  R"({"class":"person","bbox_xyxy":[1,1,7,7]})", R"({"class":"person","bbox_xyxy":[1,1,7,7],"mask_rle_encoding":"row_major_start_length","mask_rle":""})",
-  R"({"class":"person","bbox_xyxy":[1,1,7,7],"iscrowd":true})"};
+ const std::array annotations{
+  R"({"class":"person","bbox_xyxy":[3,3,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:2 8:1","ignore":true})", R"({"class":"person","bbox_xyxy":[1,1,7,7]})",
+  R"({"class":"person","bbox_xyxy":[1,1,7,7],"mask_rle_encoding":"row_major_start_length","mask_rle":""})", R"({"class":"person","bbox_xyxy":[1,1,7,7],"iscrowd":true})"
+ };
  for (std::size_t image = 0; image < annotations.size(); ++image) {
   std::ofstream output(std::filesystem::path(fixture::dataset_dir(spec)) / spec.split / ("00000" + std::to_string(image + 1) + ".jsonl"));
   output << annotations[image] << '\n';

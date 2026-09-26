@@ -119,9 +119,11 @@ CaptureSession::Impl::CaptureLoopResult CaptureSession::Impl::CaptureLoop() {
   if (dequeued == DequeueResult::kCameraError) return {.kind = CaptureStopKind::kCameraError, .status = std::move(error), .teardown = CaptureTeardownDisposition::kNoStreamOrDeviceLost};
   const Status handled = HandleDequeuedBuffer(buffer);
   if (!handled.ok())
-   return {.kind = camera_fault_.load(std::memory_order_acquire) ? CaptureStopKind::kCameraError : CaptureStopKind::kOwnerFailure,
+   return {
+    .kind = camera_fault_.load(std::memory_order_acquire) ? CaptureStopKind::kCameraError : CaptureStopKind::kOwnerFailure,
     .status = handled,
-    .teardown = camera_fault_.load(std::memory_order_acquire) ? CaptureTeardownDisposition::kNoStreamOrDeviceLost : CaptureTeardownDisposition::kOwnerRetainThenStreamOff};
+    .teardown = camera_fault_.load(std::memory_order_acquire) ? CaptureTeardownDisposition::kNoStreamOrDeviceLost : CaptureTeardownDisposition::kOwnerRetainThenStreamOff
+   };
  }
 }
 Status CaptureSession::Impl::HandleDequeuedBuffer(const v4l2_buffer& buffer) {

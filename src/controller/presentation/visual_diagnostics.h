@@ -187,8 +187,8 @@ struct VisualDiagnosticNameMaterializer final {
      constexpr auto name = std::meta::extract<Annotation>(annotation);
      const std::string_view alias{name.value};
      if (alias.empty() || !std::all_of(alias.begin(), alias.end(), [](const char character) {
-          return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '.' || character == '_';
-         }))
+      return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '.' || character == '_';
+     }))
       throw "visual diagnostic names require nonempty alphanumeric, dot, or underscore text";
      names[index] = std::define_static_string(std::string_view{name.value});
     }
@@ -267,16 +267,16 @@ struct VisualWorkspaceDiagnostics final {
   .write = [](void* context, VisualDiagnosticFact fact) noexcept { static_cast<services::RuntimeDiagnosticTarget*>(context)->write(visual_runtime_diagnostic(fact)); },
   .write_batch =
    [](void* context, const std::span<const VisualDiagnosticFact> facts) noexcept {
-    constexpr std::size_t capacity = 25U;
-    auto& runtime_target = *static_cast<services::RuntimeDiagnosticTarget*>(context);
-    if (facts.size() > capacity) {
-     for (const auto& fact : facts) runtime_target.write(visual_runtime_diagnostic(fact));
-     return;
-    }
-    std::array<services::RuntimeDiagnosticFact, capacity> runtime_facts;
-    std::ranges::transform(facts, runtime_facts.begin(), visual_runtime_diagnostic);
-    runtime_target.write_batch({runtime_facts.data(), facts.size()});
-   },
+  constexpr std::size_t capacity = 25U;
+  auto& runtime_target = *static_cast<services::RuntimeDiagnosticTarget*>(context);
+  if (facts.size() > capacity) {
+   for (const auto& fact : facts) runtime_target.write(visual_runtime_diagnostic(fact));
+   return;
+  }
+  std::array<services::RuntimeDiagnosticFact, capacity> runtime_facts;
+  std::ranges::transform(facts, runtime_facts.begin(), visual_runtime_diagnostic);
+  runtime_target.write_batch({runtime_facts.data(), facts.size()});
+ },
   .enabled = [](void* context) noexcept { return static_cast<services::RuntimeDiagnosticTarget*>(context)->valid(); },
   .pixel_probes = target.pixel_probes_enabled(),
  };

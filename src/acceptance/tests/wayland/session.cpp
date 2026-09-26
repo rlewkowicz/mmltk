@@ -426,17 +426,16 @@ void prepare_wayland_upscale_assets() {
  std::promise<void> prepared;
  auto ready = prepared.get_future();
  std::atomic_bool completed{false};
- UpscaleSystem upscale{settings, make_native_upscale_runtime_factory(settings), [](const VisualFrame&) { return VisualDocumentRead{}; },
-  [&](UpscaleSystem::event_type event) {
-   const auto* failure = std::get_if<UpscaleFailed>(&event);
-   const auto* changed = std::get_if<UpscaleChanged>(&event);
-   if (!failure && (!changed || !std::ranges::all_of(changed->snapshot.methods, [](const auto& method) { return method.warm; }))) return;
-   if (completed.exchange(true)) return;
-   if (failure)
-    prepared.set_exception(std::make_exception_ptr(std::runtime_error(failure->detail)));
-   else
-    prepared.set_value();
-  }};
+ UpscaleSystem upscale{settings, make_native_upscale_runtime_factory(settings), [](const VisualFrame&) { return VisualDocumentRead{}; }, [&](UpscaleSystem::event_type event) {
+  const auto* failure = std::get_if<UpscaleFailed>(&event);
+  const auto* changed = std::get_if<UpscaleChanged>(&event);
+  if (!failure && (!changed || !std::ranges::all_of(changed->snapshot.methods, [](const auto& method) { return method.warm; }))) return;
+  if (completed.exchange(true)) return;
+  if (failure)
+   prepared.set_exception(std::make_exception_ptr(std::runtime_error(failure->detail)));
+  else
+   prepared.set_value();
+ }};
  std::cout << "workspace-wayland: preparing GPU-specific upscale model assets before browser interaction deadlines\n" << std::flush;
  upscale.Warm({8U, 8U});
  if (ready.wait_for(std::chrono::seconds{120}) != std::future_status::ready) {
@@ -545,21 +544,18 @@ void WaylandSession::ConsumeRecords(const bool final) {
   report_consumed_record(record, "native");
  });
  if (native.firefox_pid > 0) process_->retain_peer(native.firefox_pid);
- browser_cursor_->consume(
-  browser,
-  [&](const auto& record) {
-   surface_audit.browser(record);
-   pixel_audit.consume(record);
-   browser.atlas_draws.failure.report(acceptance_log, "acceptance.atlas_draw.failed", firefox_log, browser_cursor_->line());
-   browser.owned_atlas_failure.report(acceptance_log, "acceptance.owned_atlas.failed", firefox_log, browser_cursor_->line());
-   if (logging) browser.prediction_failure.report(acceptance_log, "acceptance.prediction.failed", firefox_log, browser_cursor_->line());
-   const auto event = record.value("event", "");
-   if (event == "firefox.adapter.selected") display_adapter_seen_ = true;
-   if (event == "integration.workflow.completed") workflow_steps_.insert(record.value("detail", ""));
-   if (event == "integration.workflow.pixels") workflow_pixels_.insert(record.value("detail", ""));
-   report_consumed_record(record, "firefox");
-  },
-  final);
+ browser_cursor_->consume(browser, [&](const auto& record) {
+  surface_audit.browser(record);
+  pixel_audit.consume(record);
+  browser.atlas_draws.failure.report(acceptance_log, "acceptance.atlas_draw.failed", firefox_log, browser_cursor_->line());
+  browser.owned_atlas_failure.report(acceptance_log, "acceptance.owned_atlas.failed", firefox_log, browser_cursor_->line());
+  if (logging) browser.prediction_failure.report(acceptance_log, "acceptance.prediction.failed", firefox_log, browser_cursor_->line());
+  const auto event = record.value("event", "");
+  if (event == "firefox.adapter.selected") display_adapter_seen_ = true;
+  if (event == "integration.workflow.completed") workflow_steps_.insert(record.value("detail", ""));
+  if (event == "integration.workflow.pixels") workflow_pixels_.insert(record.value("detail", ""));
+  report_consumed_record(record, "firefox");
+ }, final);
  browser_failed_ = browser_failed_ || browser.failed_before_termination();
  for (const auto& [generation, evidence] : browser.gallery_generations) {
   const auto digest = native.placeholder_digests.find(generation);
@@ -643,12 +639,14 @@ void WaylandSession::RunWorkflows() {
   }
  }
  CHECK(display_adapter_seen_);
- CHECK((workflow_steps_ == std::set<std::string>{"train", "validation", "validation_layer_settled", "validation_original", "compiled", "image", "video", "stop", "export_stop",
-                            "export_stop_narrow_dark", "theme", "narrow", "chart_legend", "chart_pan", "chart_retained_expanded", "chart_retained_back", "chart_retained_hidden",
-                            "chart_retained_revealed", "chart_retained_navigation", "chart_tile_0", "chart_tile_1", "chart_tile_2", "chart_tile_3", "chart_tile_4", "chart_tile_5", "chart_expanded",
-                            "chart_aspect_0", "chart_aspect_1", "chart_aspect_2", "chart_aspect_3", "chart_aspect_4", "chart_aspect_5", "chart_wheel_grid_0", "chart_wheel_grid_1",
-                            "chart_wheel_grid_2", "chart_wheel_grid_3", "chart_wheel_grid_4", "chart_wheel_grid_5", "chart_wheel_expanded_0", "chart_wheel_expanded_1", "chart_wheel_expanded_2",
-                            "chart_wheel_expanded_3", "chart_wheel_expanded_4", "chart_wheel_expanded_5"}));
+ CHECK(
+  (workflow_steps_ == std::set<std::string>{
+                       "train", "validation", "validation_layer_settled", "validation_original", "compiled", "image", "video", "stop", "export_stop", "export_stop_narrow_dark", "theme", "narrow",
+                       "chart_legend", "chart_pan", "chart_retained_expanded", "chart_retained_back", "chart_retained_hidden", "chart_retained_revealed", "chart_retained_navigation", "chart_tile_0",
+                       "chart_tile_1", "chart_tile_2", "chart_tile_3", "chart_tile_4", "chart_tile_5", "chart_expanded", "chart_aspect_0", "chart_aspect_1", "chart_aspect_2", "chart_aspect_3",
+                       "chart_aspect_4", "chart_aspect_5", "chart_wheel_grid_0", "chart_wheel_grid_1", "chart_wheel_grid_2", "chart_wheel_grid_3", "chart_wheel_grid_4", "chart_wheel_grid_5",
+                       "chart_wheel_expanded_0", "chart_wheel_expanded_1", "chart_wheel_expanded_2", "chart_wheel_expanded_3", "chart_wheel_expanded_4", "chart_wheel_expanded_5"
+                      }));
  CHECK((workflow_pixels_ == std::set<std::string>{"progress", "train", "validation", "validate-to-explore", "detail", "compiled", "image", "video", "stop", "theme", "narrow"}));
  CHECK(browser.validate_to_explore_pixels);
  const auto prediction_output_blocker = browser.prediction_output_blocker();
@@ -1299,9 +1297,9 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
       if (pixels == browser.atlas_draws.ready_cell_samples.end()) continue;
       const auto& slots = native.placeholder_slots.at(generation);
       if (std::ranges::any_of(cached.slots, [&](auto slot) {
-           const auto image = slots.find(slot);
-           return image != slots.end() && pixels->second.contains(image->second);
-          }))
+       const auto image = slots.find(slot);
+       return image != slots.end() && pixels->second.contains(image->second);
+      }))
        cached_scroll_pixels[cached.forward ? 0U : 1U] = true;
      }
     }
@@ -1429,8 +1427,9 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     CHECK(source != 0U);
     CHECK(browser.surface_draws.contains(presentation));
    }
-   for (const auto operation : {"color-sample", "mask-fill", "move-Mask", "resize-mask", "paint-mask", "erase-mask", "move-Point", "move-Spline", "move-Skeleton", "spline-handle", "singleton-spline",
-         "reclassify", "undo-class", "redo-class", "cancel-preview", "create-Box", "create-Point", "create-Skeleton"})
+   for (const auto operation :
+    {"color-sample", "mask-fill", "move-Mask", "resize-mask", "paint-mask", "erase-mask", "move-Point", "move-Spline", "move-Skeleton", "spline-handle", "singleton-spline", "reclassify", "undo-class",
+     "redo-class", "cancel-preview", "create-Box", "create-Point", "create-Skeleton"})
     CHECK(browser.annotation_product_operations[operation] >= 2U);
    for (const auto tool : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::AnnotationTool>())
     CHECK(browser.annotation_product_operations["tool-" + std::string{tool.name}] >= 2U);

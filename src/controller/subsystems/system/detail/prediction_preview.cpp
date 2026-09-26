@@ -43,10 +43,10 @@ gpu::DeviceContext CreatePredictionPreviewContext(const gpu::DeviceExecution& ex
  if (cuInit(0U) != CUDA_SUCCESS) throw std::runtime_error("prediction CUDA initialization failed");
  gpu::CudaContextScope scope({&construction,
                               [](void* owner) noexcept {
-                               auto& value = *static_cast<Construction*>(owner);
-                               auto retained = value.candidate;
-                               std::move(value.lease).Install(gpu::TerminalCudaCustody::Share(std::move(retained)), cudaErrorUnknown);
-                              }},
+  auto& value = *static_cast<Construction*>(owner);
+  auto retained = value.candidate;
+  std::move(value.lease).Install(gpu::TerminalCudaCustody::Share(std::move(retained)), cudaErrorUnknown);
+ }},
   api);
  scope.Run([&] { candidate->emplace(execution.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution); });
  return **candidate;
@@ -566,17 +566,18 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
         {reinterpret_cast<const int*>(data + state.labels_offset), state.predictions.size(), state.category_count, data + state.colors_offset, {reinterpret_cast<void*>(stream)}})));
        state.pending.colors = true;
       }
-      checked(static_cast<cudaError_t>(raster::raster_instance_overlay_rgba({.overlay = overlay,
-       .instances = {reinterpret_cast<const float*>(data + state.boxes_offset), data + state.colors_offset, reinterpret_cast<const int*>(data + state.labels_offset),
-        static_cast<int>(state.predictions.size())},
-       .masks = prediction_masks && state.masks ? reinterpret_cast<const bool*>(data + state.masks_offset) : nullptr,
-       .mask_alpha = 96U,
-       .box_thickness = prediction_boxes ? 2 : 0,
-       .stream = {reinterpret_cast<void*>(stream)},
-       .labels = !state.composition,
-       .add_rgb_to_existing = complementary_layers && !state.ground_truth.empty() && (ground_truth_boxes || ground_truth_masks),
-       .confidences = confidence_threshold ? reinterpret_cast<const float*>(data + state.confidences_offset) : nullptr,
-       .confidence_threshold = confidence_threshold.value_or(0.0F)})));
+      checked(static_cast<cudaError_t>(raster::raster_instance_overlay_rgba(
+       {.overlay = overlay,
+        .instances =
+         {reinterpret_cast<const float*>(data + state.boxes_offset), data + state.colors_offset, reinterpret_cast<const int*>(data + state.labels_offset), static_cast<int>(state.predictions.size())},
+        .masks = prediction_masks && state.masks ? reinterpret_cast<const bool*>(data + state.masks_offset) : nullptr,
+        .mask_alpha = 96U,
+        .box_thickness = prediction_boxes ? 2 : 0,
+        .stream = {reinterpret_cast<void*>(stream)},
+        .labels = !state.composition,
+        .add_rgb_to_existing = complementary_layers && !state.ground_truth.empty() && (ground_truth_boxes || ground_truth_masks),
+        .confidences = confidence_threshold ? reinterpret_cast<const float*>(data + state.confidences_offset) : nullptr,
+        .confidence_threshold = confidence_threshold.value_or(0.0F)})));
      }
     };
     if (!complementary_layers) draw_prediction();
@@ -597,21 +598,26 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
      }
      ++gt_index;
      if (ground_truth_masks && !gt.mask.runs.empty())
-      checked(static_cast<cudaError_t>(raster::raster_mask_runs_rgba({.overlay = overlay,
-       .run_pairs = reinterpret_cast<const std::uint32_t*>(data + state.ground_truth_offset) + word,
-       .run_count = static_cast<std::uint32_t>(gt.mask.runs.size()),
-       .color = {color.r, color.g, color.b, 96U},
-       .stream = {reinterpret_cast<void*>(stream)}})));
+      checked(static_cast<cudaError_t>(raster::raster_mask_runs_rgba(
+       {.overlay = overlay,
+        .run_pairs = reinterpret_cast<const std::uint32_t*>(data + state.ground_truth_offset) + word,
+        .run_count = static_cast<std::uint32_t>(gt.mask.runs.size()),
+        .color = {color.r, color.g, color.b, 96U},
+        .stream = {reinterpret_cast<void*>(stream)}})));
      if (ground_truth_boxes) {
       const raster::IntRect box{
-       static_cast<int>(std::floor(gt.bbox_xyxy[0])), static_cast<int>(std::floor(gt.bbox_xyxy[1])), static_cast<int>(std::ceil(gt.bbox_xyxy[2])), static_cast<int>(std::ceil(gt.bbox_xyxy[3]))};
-      checked(static_cast<cudaError_t>(raster::raster_box_outline_rgba({.overlay = overlay,
-       .box = box,
-       .color = {color.r, color.g, color.b},
-       .thickness = 1,
-       .stream = {reinterpret_cast<void*>(stream)},
-       .clip = {static_cast<int>(std::max<std::int64_t>(0, std::int64_t{box.x1} - 1)), static_cast<int>(std::max<std::int64_t>(0, std::int64_t{box.y1} - 1)),
-        static_cast<int>(std::min<std::int64_t>(overlay.width, std::int64_t{box.x2} + 1)), static_cast<int>(std::min<std::int64_t>(overlay.height, std::int64_t{box.y2} + 1))}})));
+       static_cast<int>(std::floor(gt.bbox_xyxy[0])), static_cast<int>(std::floor(gt.bbox_xyxy[1])), static_cast<int>(std::ceil(gt.bbox_xyxy[2])), static_cast<int>(std::ceil(gt.bbox_xyxy[3]))
+      };
+      checked(static_cast<cudaError_t>(raster::raster_box_outline_rgba(
+       {.overlay = overlay,
+        .box = box,
+        .color = {color.r, color.g, color.b},
+        .thickness = 1,
+        .stream = {reinterpret_cast<void*>(stream)},
+        .clip = {
+         static_cast<int>(std::max<std::int64_t>(0, std::int64_t{box.x1} - 1)), static_cast<int>(std::max<std::int64_t>(0, std::int64_t{box.y1} - 1)),
+         static_cast<int>(std::min<std::int64_t>(overlay.width, std::int64_t{box.x2} + 1)), static_cast<int>(std::min<std::int64_t>(overlay.height, std::int64_t{box.y2} + 1))
+        }})));
      }
      word += gt.mask.runs.size() * 2U;
     }

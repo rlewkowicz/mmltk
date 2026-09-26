@@ -767,51 +767,48 @@ void append_integration_command_policy(FingerprintSink& sink) {
  });
 }
 inline void append_wire_value(FingerprintSink& sink, const mmltk::frameworks::serialization::wire::Value& value) {
- std::visit(
-  [&](const auto& storage) {
-   using Type = std::remove_cvref_t<decltype(storage)>;
-   if constexpr (std::same_as<Type, std::monostate>) {
-    sink.append("null");
-    return;
-   } else if constexpr (std::same_as<Type, bool>) {
-    sink.append("boolean");
-    sink.append_number(storage);
-   } else if constexpr (std::is_arithmetic_v<Type>) {
-    sink.append(std::is_floating_point_v<Type> ? "floating" : "integer");
-    sink.append_number(sizeof(Type));
-    sink.append_number(std::is_signed_v<Type>);
-    sink.append_number(storage);
-   } else if constexpr (std::same_as<Type, std::string>) {
-    sink.append("text");
-    sink.append(storage);
-   } else if constexpr (std::same_as<Type, mmltk::frameworks::serialization::wire::Value::Bytes>) {
-    sink.append("bytes");
-    sink.append_number(storage.size());
-    for (const std::byte byte : storage) sink.append_number(std::to_integer<std::uint8_t>(byte));
-   } else if constexpr (std::same_as<Type, mmltk::frameworks::serialization::wire::Value::Array>) {
-    sink.append("array");
-    sink.append_number(storage.size());
-    for (const auto& item : storage) append_wire_value(sink, item);
-   } else {
-    static_assert(std::same_as<Type, mmltk::frameworks::serialization::wire::Value::Object>);
-    sink.append("object");
-    sink.append_number(storage.size());
-    for (const auto& [name, item] : storage) {
-     sink.append(name);
-     append_wire_value(sink, item);
-    }
+ std::visit([&](const auto& storage) {
+  using Type = std::remove_cvref_t<decltype(storage)>;
+  if constexpr (std::same_as<Type, std::monostate>) {
+   sink.append("null");
+   return;
+  } else if constexpr (std::same_as<Type, bool>) {
+   sink.append("boolean");
+   sink.append_number(storage);
+  } else if constexpr (std::is_arithmetic_v<Type>) {
+   sink.append(std::is_floating_point_v<Type> ? "floating" : "integer");
+   sink.append_number(sizeof(Type));
+   sink.append_number(std::is_signed_v<Type>);
+   sink.append_number(storage);
+  } else if constexpr (std::same_as<Type, std::string>) {
+   sink.append("text");
+   sink.append(storage);
+  } else if constexpr (std::same_as<Type, mmltk::frameworks::serialization::wire::Value::Bytes>) {
+   sink.append("bytes");
+   sink.append_number(storage.size());
+   for (const std::byte byte : storage) sink.append_number(std::to_integer<std::uint8_t>(byte));
+  } else if constexpr (std::same_as<Type, mmltk::frameworks::serialization::wire::Value::Array>) {
+   sink.append("array");
+   sink.append_number(storage.size());
+   for (const auto& item : storage) append_wire_value(sink, item);
+  } else {
+   static_assert(std::same_as<Type, mmltk::frameworks::serialization::wire::Value::Object>);
+   sink.append("object");
+   sink.append_number(storage.size());
+   for (const auto& [name, item] : storage) {
+    sink.append(name);
+    append_wire_value(sink, item);
    }
-  },
-  value.storage);
+  }
+ }, value.storage);
 }
 template <class Annotation>
 void append_annotation(FingerprintSink& sink, const Annotation& annotation) {
  using A = std::remove_cvref_t<Annotation>;
  static_assert(std::meta::has_identifier(^^A), "wire annotations require canonical declaration identifiers");
  sink.append(std::meta::identifier_of(^^A));
- if constexpr (mmltk::frameworks::reflection::MinimumAnnotation<A> || mmltk::frameworks::reflection::MaximumAnnotation<A> ||
-               mmltk::frameworks::reflection::MinBytesAnnotation<A> || mmltk::frameworks::reflection::MaxBytesAnnotation<A> ||
-               mmltk::frameworks::reflection::MaxItemsAnnotation<A>) {
+ if constexpr (mmltk::frameworks::reflection::MinimumAnnotation<A> || mmltk::frameworks::reflection::MaximumAnnotation<A> || mmltk::frameworks::reflection::MinBytesAnnotation<A> ||
+               mmltk::frameworks::reflection::MaxBytesAnnotation<A> || mmltk::frameworks::reflection::MaxItemsAnnotation<A>) {
   sink.append_number(annotation.value);
  } else if constexpr (mmltk::frameworks::reflection::PresentationAnnotation<A>) {
   sink.append_number(static_cast<std::uint8_t>(A::kind));
@@ -994,10 +991,9 @@ struct ApplicationEventDescriptor final {
  static constexpr auto delivery = metadata.delivery;
  static_assert(mmltk::frameworks::reflection::enum_contains(delivery), "invalid event delivery");
  static_assert(application_schema_detail::runtime_boundary_projectable<Event>(), "event record contains an unsupported or unreflected reachable type");
- static_assert(
-  delivery != contracts::reflection::EventDelivery::LatestState || requires(const Event& event) {
-   { event.snapshot.revision } -> std::same_as<const std::uint64_t&>;
-  }, "LatestState requires the canonical state snapshot revision");
+ static_assert(delivery != contracts::reflection::EventDelivery::LatestState || requires(const Event& event) {
+  { event.snapshot.revision } -> std::same_as<const std::uint64_t&>;
+ }, "LatestState requires the canonical state snapshot revision");
  static constexpr auto system_id = identity::system_id;
  static constexpr auto event_id = identity::event_id;
  [[nodiscard]] static constexpr std::uint64_t StateRevision(const Event& event) noexcept {
@@ -1153,16 +1149,14 @@ struct ApplicationSchema final {
     using Signature = SystemMethodSignature<decltype(&[:Snapshot:])>;
     static_assert(Projection::valid(), "malformed visual producer descriptor");
     static_assert(std::same_as<typename Projection::snapshot_type, typename Signature::result_type>, "visual projection must name the system snapshot");
-    static_assert(
-     requires(const System& system) {
-      { system.BorrowFrame() } -> std::same_as<mmltk::frameworks::gpu::BorrowedImageProductReadView>;
-      { system.BorrowWorkspace() } -> std::same_as<mmltk::frameworks::gpu::BorrowedImageWorkspace>;
-      { system.ObserveWorkspace() } -> std::same_as<mmltk::frameworks::gpu::ImageWorkspaceObservation>;
-     }, "visual producer must expose borrowed-product access");
-    static_assert(
-     requires(System& system, VisualWorkspaceRequest request) {
-      { system.RequestWorkspace(std::move(request)) } -> std::same_as<void>;
-     }, "visual producer must service workspace requests on its owner");
+    static_assert(requires(const System& system) {
+     { system.BorrowFrame() } -> std::same_as<mmltk::frameworks::gpu::BorrowedImageProductReadView>;
+     { system.BorrowWorkspace() } -> std::same_as<mmltk::frameworks::gpu::BorrowedImageWorkspace>;
+     { system.ObserveWorkspace() } -> std::same_as<mmltk::frameworks::gpu::ImageWorkspaceObservation>;
+    }, "visual producer must expose borrowed-product access");
+    static_assert(requires(System& system, VisualWorkspaceRequest request) {
+     { system.RequestWorkspace(std::move(request)) } -> std::same_as<void>;
+    }, "visual producer must service workspace requests on its owner");
     visitor.template operator()<SystemCell, Snapshot, Projection>();
    }
   });

@@ -143,10 +143,14 @@ void require_one_terminal_wake(DiagnosticsClient& diagnostics) {
 }
 [[nodiscard]] FileDialogRequest dialog_request(const std::string_view title = "Select",
  const mmltk::controller::contracts::FileDialogMode mode = mmltk::controller::contracts::FileDialogMode::OpenFile, const std::string_view filter = "Files", const std::string_view pattern = "*") {
- return {.title = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(title),
+ return {
+  .title = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(title),
   .mode = mode,
-  .filter = {.name = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(filter),
-   .pattern = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(pattern)}};
+  .filter = {
+   .name = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(filter),
+   .pattern = mmltk::controller::services::BoundedText<mmltk::controller::services::kFileDialogTextCapacity>::From(pattern)
+  }
+ };
 }
 [[nodiscard]] FileDialogResult run_dialog(const std::filesystem::path& helper, const std::filesystem::path& launch_directory, const FileDialogRequest& request, const bool cancel_before_run = false) {
  FileDialogClientOwner owner{helper.string(), launch_directory.string()};
@@ -340,9 +344,9 @@ TEST_CASE("diagnostics disabled producers perform no submission work", "[gui][se
  const auto ids = DiagnosticSpanIds::issued();
  DiagnosticCountingClock::reads = 0U;
  RuntimeDiagnosticSpan<RuntimeDiagnosticTarget, RuntimeDiagnosticFact, DiagnosticCountingClock> span{target, [&] {
-                                                                                                      ++collections;
-                                                                                                      return std::pair{RuntimeDiagnosticFact{}, RuntimeDiagnosticFact{}};
-                                                                                                     }};
+  ++collections;
+  return std::pair{RuntimeDiagnosticFact{}, RuntimeDiagnosticFact{}};
+ }};
  span.FinishWith([&](auto&) { ++collections; });
  std::array<RuntimeDiagnosticFact, kDiagnosticOwners.size()> facts{};
  for (std::size_t index = 0U; index < facts.size(); ++index) {
@@ -516,7 +520,8 @@ TEST_CASE("diagnostic spans preserve typed correlation and explicit scope outcom
  { RuntimeDiagnosticSpan span{target, facts}; }
  diagnostics.close();
  const std::array outcomes{
-  contracts::DiagnosticSpanOutcome::Success, contracts::DiagnosticSpanOutcome::Cancelled, contracts::DiagnosticSpanOutcome::Exception, contracts::DiagnosticSpanOutcome::ScopeExit};
+  contracts::DiagnosticSpanOutcome::Success, contracts::DiagnosticSpanOutcome::Cancelled, contracts::DiagnosticSpanOutcome::Exception, contracts::DiagnosticSpanOutcome::ScopeExit
+ };
  std::ifstream input{path};
  std::string line;
  for (const auto outcome : outcomes) {
@@ -805,7 +810,8 @@ TEST_CASE("complete background diagnostics preserve unique concurrent single and
    for (std::size_t index = 0U; index != kRecordsPerProducer;) {
     if (index % 3U == 0U && index + 1U < kRecordsPerProducer) {
      const std::array batch{
-      RuntimeDiagnosticFact{.event = "concurrent", .sequence = index, .value = producer}, RuntimeDiagnosticFact{.event = "concurrent", .sequence = index + 1U, .value = producer}};
+      RuntimeDiagnosticFact{.event = "concurrent", .sequence = index, .value = producer}, RuntimeDiagnosticFact{.event = "concurrent", .sequence = index + 1U, .value = producer}
+     };
      target.write_batch(batch);
      index += 2U;
     } else {
@@ -1208,8 +1214,9 @@ TEST_CASE("file dialog selected results require an owned bounded nonempty path",
 }
 TEST_CASE("workflow path dialogs are projected from controller member paths", "[gui][services][dialogs]") {
  const auto entries = mmltk::controller::services::file_dialog_catalog().entries();
- for (const auto path : {"workflows.validate.request.compiled_path", "workflows.train.output.directory", "workflows.train.request.resume_path", "workflows.predict.source.compiled_path",
-       "workflows.predict.source.single_image_path"}) {
+ for (const auto path :
+  {"workflows.validate.request.compiled_path", "workflows.train.output.directory", "workflows.train.request.resume_path", "workflows.predict.source.compiled_path",
+   "workflows.predict.source.single_image_path"}) {
   const auto found = std::ranges::find_if(entries, [path](const auto& entry) { return entry.field_path.view() == path; });
   REQUIRE(found != entries.end());
   CHECK_FALSE(found->model_input.has_value());

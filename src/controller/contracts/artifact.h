@@ -95,7 +95,8 @@ inline constexpr std::array kArtifactTerminalPresentations{
  terminal_presentation::Policy{ArtifactTerminalOutcome::Failed, terminal_presentation::Classification::Failed, "artifact.failed", "The artifact operation failed."},
  terminal_presentation::Policy{ArtifactTerminalOutcome::Cancelled, terminal_presentation::Classification::Cancelled, "artifact.cancelled", "The artifact operation was cancelled."},
  terminal_presentation::Policy{
-  ArtifactTerminalOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled, "artifact.cancellation_requested", "Artifact cancellation was requested."},
+  ArtifactTerminalOutcome::CancellationRequested, terminal_presentation::Classification::Cancelled, "artifact.cancellation_requested", "Artifact cancellation was requested."
+ },
  terminal_presentation::Policy{ArtifactTerminalOutcome::Refused, terminal_presentation::Classification::Refused, "artifact.refused", "The artifact operation was refused."},
 };
 static_assert(terminal_presentation::complete(kArtifactTerminalPresentations));

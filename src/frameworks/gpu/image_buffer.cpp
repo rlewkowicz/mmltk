@@ -175,14 +175,13 @@ public:
   return {
    .data = data,
    // CLEANUP-IGNORE: The real device allocator and the test backend separately construct the canonical plane descriptor for their own storage.
-   .descriptor =
-    {
-     .kind = kind,
-     .format = ImageFormat::Rgba8,
-     .width = width,
-     .height = height,
-     .pitch_bytes = pitch,
-    },
+   .descriptor = {
+    .kind = kind,
+    .format = ImageFormat::Rgba8,
+    .width = width,
+    .height = height,
+    .pitch_bytes = pitch,
+   },
   };
  }
  void FreePlane(const std::uintptr_t context, const CUdeviceptr data) noexcept override {
@@ -1157,8 +1156,8 @@ BorrowedImageProductReadView ImageProductBuffer::Borrow() const {
  BorrowedImageProductReadView result{std::make_shared<BorrowedImageProductReadView::Lease>(state_)};
  result.count_ = state_->plane_count_;
  for (std::size_t index = 0U; index != state_->plane_count_; ++index)
-  result.planes_[index] = BorrowedImageReadView{
-   std::make_unique<BorrowedImageReadView::Lease>(state_->planes_[index]->state_, state_->completion_, result.lease_, result.lease_->generation, &result.lease_->lock, state_->availability_sink_)};
+  result.planes_[index] = BorrowedImageReadView{std::make_unique<BorrowedImageReadView::Lease>(
+   state_->planes_[index]->state_, state_->completion_, result.lease_, result.lease_->generation, &result.lease_->lock, state_->availability_sink_)};
  if (!result.valid()) return {};
  return result;
 }

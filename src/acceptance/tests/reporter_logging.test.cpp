@@ -141,8 +141,9 @@ TEST_CASE("fatal reporting is bounded visible and independent of diagnostic sink
   const auto log = directory.path() / (mode + ".log");
   if (mode == "init-failure") std::filesystem::create_directory(log);
   const bool enabled = mode == "enabled" || mode == "disabled-after-init" || mode == "sink-failure" || mode == "init-failure";
-  const auto result = run_subprocess_capture_output({"env", "-u", "MMLTK_LOG_DIR", "MMLTK_FATAL_FIXTURE=" + mode, "MMLTK_LOG_LEVEL=off", "MMLTK_LOG_FILE=", "MMLTK_FATAL_LOG=" + log.string(),
-   mmltk::common::system::runtime_paths::current_executable_path().string(), "fatal_reporting_fixture", "--reporter", "compact", "--colour-mode", "none"});
+  const auto result = run_subprocess_capture_output(
+   {"env", "-u", "MMLTK_LOG_DIR", "MMLTK_FATAL_FIXTURE=" + mode, "MMLTK_LOG_LEVEL=off", "MMLTK_LOG_FILE=", "MMLTK_FATAL_LOG=" + log.string(),
+    mmltk::common::system::runtime_paths::current_executable_path().string(), "fatal_reporting_fixture", "--reporter", "compact", "--colour-mode", "none"});
   INFO(result.output_text);
   REQUIRE(result.exit_code == 0);
   const auto begin = result.stderr_text.find("fatal: ");

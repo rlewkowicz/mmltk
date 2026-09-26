@@ -156,13 +156,11 @@ public:
  [[nodiscard]] bool Decode(wire::Reader& reader) {
   namespace d = implementation::detail;
   d::audit_object<Record>();
-  static_assert(
-   [] consteval {
-    bool direct = true;
-    d::visit_bases<Record>([&]<class>() { direct = false; });
-    return direct;
-   }(),
-   "borrowed byte records require direct reflected fields");
+  static_assert([] consteval {
+   bool direct = true;
+   d::visit_bases<Record>([&]<class>() { direct = false; });
+   return direct;
+  }(), "borrowed byte records require direct reflected fields");
   static_assert(std::same_as<std::remove_cvref_t<decltype(record_.*BytesMember)>, wire::ByteBuffer>, "borrowed byte projection requires a declaration-bounded byte buffer");
   constexpr auto names = [] consteval {
    std::array<std::string_view, d::flattened_member_count<Record>()> result{};

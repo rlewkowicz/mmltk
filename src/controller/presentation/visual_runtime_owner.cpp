@@ -310,11 +310,13 @@ void diagnose_workspace_service(const VisualWorkspaceRequest& request, std::stri
  const auto destination = request.destination.lock();
  if (!request.diagnostics || !destination) return;
  request.diagnostics->sink.Emit([&] {
-  VisualDiagnosticFact fact{.system = contracts::DiagnosticOwner::Presentation,
+  VisualDiagnosticFact fact{
+   .system = contracts::DiagnosticOwner::Presentation,
    .operation = VisualDiagnosticOperation::PresentationWorkspaceService,
    .device = destination->layout().device,
    .context = request.diagnostics->context,
-   .failure_detail = reason};
+   .failure_detail = reason
+  };
   auto& progress = fact.context.workspace_progress;
   progress.requested_product_owner = request.product_owner;
   progress.requested_product_revision = request.product_revision;

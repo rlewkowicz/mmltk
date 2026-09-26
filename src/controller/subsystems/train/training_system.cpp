@@ -56,7 +56,8 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(
    }
    diagnostic_message += ' ';
    diagnostic_message.append(failure.substr(0, contracts::kComputeErrorCapacity));
-   return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training,
+   return services::RuntimeDiagnosticFact{
+    .owner = contracts::DiagnosticOwner::Training,
     .event = terminal == nullptr            ? "training.failed"
              : terminal->signal_number != 0 ? "child.signaled"
                                             : "child.exited",
@@ -64,7 +65,8 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(
     .detail = terminal ? static_cast<std::uint64_t>(terminal->signal_number) : 0U,
     .device = request.device_ids.empty() ? request.device_id : request.device_ids.front(),
     .context = {.document_resource = request.output_dir.native()},
-    .message = training_diagnostic_text(diagnostic_message)};
+    .message = training_diagnostic_text(diagnostic_message)
+   };
   });
  };
  try {
@@ -75,7 +77,8 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(
    for (std::size_t rank = 0; rank < ranks.size(); ++rank)
     config_.diagnostics.Emit([&] {
      return services::RuntimeDiagnosticFact{
-      .owner = contracts::DiagnosticOwner::Training, .event = "workflow.gpu_execution", .participant = "train", .sequence = generation, .value = rank, .detail = ranks.size(), .device = ranks[rank]};
+      .owner = contracts::DiagnosticOwner::Training, .event = "workflow.gpu_execution", .participant = "train", .sequence = generation, .value = rank, .detail = ranks.size(), .device = ranks[rank]
+     };
     });
   }
   mmltk::common::concurrency::ScopedEventCancellation<services::TrainProcessStopSource> cancellation{stop};
@@ -155,9 +158,8 @@ public:
   int instance = 0;
   std::string launch_token;
  };
- Impl(
-  SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, std::optional<mmltk::common::system::ExecutionPolicyRequest> policy, RuntimeFactory factory, SystemEventSink<event_type> events,
-  services::RuntimeDiagnosticTarget diagnostics)
+ Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, std::optional<mmltk::common::system::ExecutionPolicyRequest> policy, RuntimeFactory factory,
+  SystemEventSink<event_type> events, services::RuntimeDiagnosticTarget diagnostics)
      : settings_(settings), dataset_(dataset), model_(model), factory_(std::move(factory)), events_(std::move(events)), diagnostics_(std::move(diagnostics)) {
   if (!factory_) throw contracts::UnavailableError("training runtime factory is unavailable");
   std::promise<void> initialized;
@@ -313,122 +315,135 @@ public:
   run_.Start({
    .prepare =
     [this, admission, revision = facts.revision] {
-     settings_.LockTrainingConfiguration(revision);
-     try {
+   settings_.LockTrainingConfiguration(revision);
+   try {
+    std::scoped_lock lock(mutex_);
+    if (admission && (admission != inspection_admission_ || admission != prepared_admission_)) throw contracts::InvalidIntentError("prepare the selected checkpoint before Resume");
+    prepared_admission_.reset();
+    const auto next = contracts::next_compute_generation(state_.local.generation_frontier);
+    if (!next) throw contracts::FailedError("training operation generation exhausted");
+    state_.activity = TrainingActivity::Local;
+    state_.local.output = {};
+    state_.metrics.reset();
+    state_.sources = {};
+    state_.persistence = {};
+    state_.local.active = true;
+    state_.local.generation_frontier = *next;
+    state_.local.progress = {};
+    state_.local.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, state_.local.generation_frontier);
+    state_.local.terminal.detail = "Inspecting selected training inputs";
+    AdvanceObservation();
+   } catch (...) {
+    settings_.UnlockTrainingConfiguration();
+    throw;
+   }
+  },
+   .work = [this, settings = facts.settings, revision = facts.revision, selection, admission](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+   contracts::ComputeTerminal terminal;
+   bool failed = false;
+   std::atomic_bool malformed_progress = false;
+   try {
+    const auto& selected = settings.workflows.train.request;
+    const auto generation = [this] {
+     std::scoped_lock lock(mutex_);
+     return state_.local.generation_frontier;
+    }();
+    std::string diagnostic_message;
+    diagnostics_.Emit([&] {
+     diagnostic_message = std::format("requested_preset={} requested_resolution={} prepared_preset={} prepared_resolution={} validation={} test={}", selected.preset_name, selected.resolution,
+      selection.key.preset, selection.key.resolution, selected.val_compiled_path.native(), selected.test_compiled_path.native());
+     return services::RuntimeDiagnosticFact{
+      .owner = contracts::DiagnosticOwner::Training,
+      .event = "training.inputs",
+      .participant = "train",
+      .sequence = generation,
+      .value = revision,
+      .detail = selection.key.resolution,
+      .context = {.document_resource = selected.train_compiled_path.native()},
+      .message = training_diagnostic_text(diagnostic_message)
+     };
+    });
+    contracts::ArtifactInspection inspection;
+    if (!stop.stop_requested()) {
+     inspection = dataset_.Inspect({selected.train_compiled_path, selected.val_compiled_path, selected.test_compiled_path}, selection.key.preset, selection.key.resolution, stop);
+    }
+    if (stop.stop_requested()) {
+     terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+    } else {
+     auto request = subsystems::system::ComputeIntentMaterializer::LocalTrain(settings, inspection, selection);
+     if (!request) throw contracts::InvalidIntentError(request.error().detail);
+     std::optional<mmltk::backend::models::rfdetr::TrainingCheckpoint> continuation;
+     if (!request->resume_path.empty()) {
+      if (!admission || admission->checkpoint().path != request->resume_path) throw contracts::InvalidIntentError("Resume does not match its admitted checkpoint");
+      admission->RequireUnchanged(stop);
+      continuation = admission->checkpoint();
+      if (!continuation->resumable) throw contracts::InvalidIntentError("selected artifact is not resumable");
+     }
+     if (stop.stop_requested()) throw mmltk::backend::models::rfdetr::ArtifactPublicationCancelled{};
+     request->output_dir = services::TrainRunStore::ResolveOutput(request->output_dir, continuation, settings.workflows.train.output.automatic);
+     {
       std::scoped_lock lock(mutex_);
-      if (admission && (admission != inspection_admission_ || admission != prepared_admission_)) throw contracts::InvalidIntentError("prepare the selected checkpoint before Resume");
-      prepared_admission_.reset();
-      const auto next = contracts::next_compute_generation(state_.local.generation_frontier);
-      if (!next) throw contracts::FailedError("training operation generation exhausted");
-      state_.activity = TrainingActivity::Local;
-      state_.local.output = {};
+      state_.local.output.directory = request->output_dir.string();
       state_.metrics.reset();
       state_.sources = {};
       state_.persistence = {};
-      state_.local.active = true;
-      state_.local.generation_frontier = *next;
-      state_.local.progress = {};
-      state_.local.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, state_.local.generation_frontier);
-      state_.local.terminal.detail = "Inspecting selected training inputs";
       AdvanceObservation();
-     } catch (...) {
-      settings_.UnlockTrainingConfiguration();
-      throw;
      }
-    },
-   .work = [this, settings = facts.settings, revision = facts.revision, selection, admission](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
-    contracts::ComputeTerminal terminal;
-    bool failed = false;
-    std::atomic_bool malformed_progress = false;
-    try {
-     const auto& selected = settings.workflows.train.request;
-     const auto generation = [this] {
-      std::scoped_lock lock(mutex_);
-      return state_.local.generation_frontier;
-     }();
-     std::string diagnostic_message;
-     diagnostics_.Emit([&] {
-      diagnostic_message = std::format("requested_preset={} requested_resolution={} prepared_preset={} prepared_resolution={} validation={} test={}", selected.preset_name, selected.resolution, selection.key.preset,
-       selection.key.resolution, selected.val_compiled_path.native(), selected.test_compiled_path.native());
-      return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training, .event = "training.inputs", .participant = "train",
-       .sequence = generation, .value = revision, .detail = selection.key.resolution, .context = {.document_resource = selected.train_compiled_path.native()}, .message = training_diagnostic_text(diagnostic_message)};
-     });
-     contracts::ArtifactInspection inspection;
-     if (!stop.stop_requested()) {
-      inspection = dataset_.Inspect({selected.train_compiled_path, selected.val_compiled_path, selected.test_compiled_path}, selection.key.preset, selection.key.resolution, stop);
-     }
-     if (stop.stop_requested()) {
-      terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
-     } else {
-      auto request = subsystems::system::ComputeIntentMaterializer::LocalTrain(settings, inspection, selection);
-      if (!request) throw contracts::InvalidIntentError(request.error().detail);
-      std::optional<mmltk::backend::models::rfdetr::TrainingCheckpoint> continuation;
-      if (!request->resume_path.empty()) {
-       if (!admission || admission->checkpoint().path != request->resume_path) throw contracts::InvalidIntentError("Resume does not match its admitted checkpoint");
-       admission->RequireUnchanged(stop);
-       continuation = admission->checkpoint();
-       if (!continuation->resumable) throw contracts::InvalidIntentError("selected artifact is not resumable");
+     direct::PublishLazyNoexcept(events_, [&] { return event_type{TrainingChanged{snapshot()}}; });
+     if (admission) admission->RequireUnchanged(stop);
+     terminal = runtime().Train(std::move(*request), stop, [this, &malformed_progress](const services::TrainProcessProgress& update) {
+      const auto& progress = update.progress;
+      if (!progress.valid()) {
+       malformed_progress.store(true, std::memory_order_relaxed);
+       return;
       }
-      if (stop.stop_requested()) throw mmltk::backend::models::rfdetr::ArtifactPublicationCancelled{};
-      request->output_dir = services::TrainRunStore::ResolveOutput(request->output_dir, continuation, settings.workflows.train.output.automatic);
+      TrainingProgress observation;
       {
        std::scoped_lock lock(mutex_);
-       state_.local.output.directory = request->output_dir.string();
-       state_.metrics.reset();
-       state_.sources = {};
-       state_.persistence = {};
+       if (!state_.local.active || !contracts::compute_progress_follows(progress, state_.local.progress.sequence)) return;
+       state_.local.progress = progress;
+       if (update.metrics) state_.metrics = update.metrics;
+       state_.sources = update.sources;
+       if (state_.sources.execution) {
+        state_.sources.execution->training.operation_generation = state_.local.generation_frontier;
+        state_.sources.execution->validation.operation_generation = state_.local.generation_frontier;
+       }
+       state_.persistence = update.persistence;
+       if (state_.local.terminal.outcome == contracts::ComputeOperationOutcome::Running) state_.local.terminal.detail.clear();
        AdvanceObservation();
+       observation = {
+        .revision = state_.revision,
+        .activity = state_.activity,
+        .local = state_.local,
+        .metrics = state_.metrics,
+        .sources = state_.sources,
+        .persistence = state_.persistence,
+       };
       }
-      direct::PublishLazyNoexcept(events_, [&] { return event_type{TrainingChanged{snapshot()}}; });
-      if (admission) admission->RequireUnchanged(stop);
-      terminal = runtime().Train(
-       std::move(*request), stop,
-       [this, &malformed_progress](const services::TrainProcessProgress& update) {
-        const auto& progress = update.progress;
-        if (!progress.valid()) {
-         malformed_progress.store(true, std::memory_order_relaxed);
-         return;
-        }
-        TrainingProgress observation;
-        {
-         std::scoped_lock lock(mutex_);
-         if (!state_.local.active || !contracts::compute_progress_follows(progress, state_.local.progress.sequence)) return;
-         state_.local.progress = progress;
-         if (update.metrics) state_.metrics = update.metrics;
-         state_.sources = update.sources;
-         if (state_.sources.execution) {
-          state_.sources.execution->training.operation_generation = state_.local.generation_frontier;
-          state_.sources.execution->validation.operation_generation = state_.local.generation_frontier;
-         }
-         state_.persistence = update.persistence;
-         if (state_.local.terminal.outcome == contracts::ComputeOperationOutcome::Running) state_.local.terminal.detail.clear();
-         AdvanceObservation();
-         observation = {
-          .revision = state_.revision,
-          .activity = state_.activity,
-          .local = state_.local,
-          .metrics = state_.metrics,
-          .sources = state_.sources,
-          .persistence = state_.persistence,
-         };
-        }
-        if (!update.metrics) diagnostics_.Emit([&] {
-         return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training, .event = "training.preparation", .participant = "train",
-          .sequence = observation.local.generation_frontier, .value = progress.completed, .detail = progress.total, .message = progress.status};
-        });
-        direct::PublishLazyNoexcept(events_, [&] { return event_type{std::move(observation)}; });
-       },
-       generation);
-     }
-     if (malformed_progress.load(std::memory_order_relaxed) || !terminal.valid_worker_terminal()) throw std::runtime_error("local training runtime returned an invalid result");
-     failed = terminal.outcome == contracts::ComputeOperationOutcome::Failed;
-    } catch (const mmltk::backend::models::rfdetr::ArtifactPublicationCancelled&) { terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled); } catch (...) {
-     failed = true;
-     terminal = contracts::compute_failure_terminal(std::current_exception(), "local training failed");
+      if (!update.metrics)
+       diagnostics_.Emit([&] {
+        return services::RuntimeDiagnosticFact{
+         .owner = contracts::DiagnosticOwner::Training,
+         .event = "training.preparation",
+         .participant = "train",
+         .sequence = observation.local.generation_frontier,
+         .value = progress.completed,
+         .detail = progress.total,
+         .message = progress.status
+        };
+       });
+      direct::PublishLazyNoexcept(events_, [&] { return event_type{std::move(observation)}; });
+     }, generation);
     }
-    if (stop.stop_requested() && !failed) terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
-    return SettleLocal(std::move(terminal));
-   },
+    if (malformed_progress.load(std::memory_order_relaxed) || !terminal.valid_worker_terminal()) throw std::runtime_error("local training runtime returned an invalid result");
+    failed = terminal.outcome == contracts::ComputeOperationOutcome::Failed;
+   } catch (const mmltk::backend::models::rfdetr::ArtifactPublicationCancelled&) { terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled); } catch (...) {
+    failed = true;
+    terminal = contracts::compute_failure_terminal(std::current_exception(), "local training failed");
+   }
+   if (stop.stop_requested() && !failed) terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+   return SettleLocal(std::move(terminal));
+  },
    .failure = [this](std::exception_ptr failure) { return FailLocal(failure); },
   });
   return snapshot();
@@ -439,52 +454,52 @@ public:
   run_.Start({
    .prepare =
     [this] {
-     std::scoped_lock lock(mutex_);
-     const auto next = contracts::next_compute_generation(state_.offers.revision);
-     if (!next || !contracts::next_compute_generation(*next)) throw contracts::FailedError("provider query revision exhausted");
-     state_.activity = TrainingActivity::ProviderQuery;
-     state_.offers.revision = *next;
-     state_.offers.outcome = contracts::ProviderQueryOutcome::Idle;
-     state_.offers.cancellation_requested = false;
-     state_.offers.detail.clear();
-     AdvanceObservation();
-    },
+   std::scoped_lock lock(mutex_);
+   const auto next = contracts::next_compute_generation(state_.offers.revision);
+   if (!next || !contracts::next_compute_generation(*next)) throw contracts::FailedError("provider query revision exhausted");
+   state_.activity = TrainingActivity::ProviderQuery;
+   state_.offers.revision = *next;
+   state_.offers.outcome = contracts::ProviderQueryOutcome::Idle;
+   state_.offers.cancellation_requested = false;
+   state_.offers.detail.clear();
+   AdvanceObservation();
+  },
    .work = [this, preferences](const std::stop_token stop) -> direct::LocalRun::Notification {
-    contracts::ProviderQueryResult result;
-    bool failed = false;
-    try {
-     result = contracts::normalize_provider_query_result(runtime().Query(preferences, stop));
-     failed = result.outcome == contracts::ProviderQueryOutcome::Failed || result.outcome == contracts::ProviderQueryOutcome::Rejected;
-    } catch (const std::exception& error) {
-     failed = true;
-     result = {.outcome = contracts::ProviderQueryOutcome::Failed, .detail = contracts::bounded_provider_detail(error.what())};
-    } catch (...) {
-     failed = true;
-     result = {.outcome = contracts::ProviderQueryOutcome::Failed, .detail = "provider query failed"};
+   contracts::ProviderQueryResult result;
+   bool failed = false;
+   try {
+    result = contracts::normalize_provider_query_result(runtime().Query(preferences, stop));
+    failed = result.outcome == contracts::ProviderQueryOutcome::Failed || result.outcome == contracts::ProviderQueryOutcome::Rejected;
+   } catch (const std::exception& error) {
+    failed = true;
+    result = {.outcome = contracts::ProviderQueryOutcome::Failed, .detail = contracts::bounded_provider_detail(error.what())};
+   } catch (...) {
+    failed = true;
+    result = {.outcome = contracts::ProviderQueryOutcome::Failed, .detail = "provider query failed"};
+   }
+   if (failed) runtime_.reset();
+   {
+    std::scoped_lock lock(mutex_);
+    AdvanceRevision(state_.offers.revision, "provider query revision exhausted");
+    if (stop.stop_requested()) {
+     result.outcome = contracts::ProviderQueryOutcome::Cancelled;
+     result.detail = "provider query cancelled";
+     result.offers.clear();
+     failed = false;
     }
-    if (failed) runtime_.reset();
-    {
-     std::scoped_lock lock(mutex_);
-     AdvanceRevision(state_.offers.revision, "provider query revision exhausted");
-     if (stop.stop_requested()) {
-      result.outcome = contracts::ProviderQueryOutcome::Cancelled;
-      result.detail = "provider query cancelled";
-      result.offers.clear();
-      failed = false;
-     }
-     state_.offers.outcome = result.outcome;
-     state_.offers.cancellation_requested = false;
-     state_.offers.detail = contracts::bounded_provider_detail(result.detail);
-     state_.offers.offers = result.outcome == contracts::ProviderQueryOutcome::Succeeded ? std::move(result.offers) : std::vector<contracts::ProviderOffer>{};
-     // CLEANUP-IGNORE: Query settlement clears selection; local-compute settlement owns terminal
-     // progress instead.
-     state_.offers.selected.reset();
-     state_.activity = TrainingActivity::Idle;
-     AdvanceObservation();
-    }
-    auto settled = snapshot();
-    return notification(event_type{TrainingChanged{std::move(settled)}});
-   },
+    state_.offers.outcome = result.outcome;
+    state_.offers.cancellation_requested = false;
+    state_.offers.detail = contracts::bounded_provider_detail(result.detail);
+    state_.offers.offers = result.outcome == contracts::ProviderQueryOutcome::Succeeded ? std::move(result.offers) : std::vector<contracts::ProviderOffer>{};
+    // CLEANUP-IGNORE: Query settlement clears selection; local-compute settlement owns terminal
+    // progress instead.
+    state_.offers.selected.reset();
+    state_.activity = TrainingActivity::Idle;
+    AdvanceObservation();
+   }
+   auto settled = snapshot();
+   return notification(event_type{TrainingChanged{std::move(settled)}});
+  },
    .failure = [this](std::exception_ptr) { return FailQuery(); },
   });
   return snapshot();
@@ -494,43 +509,43 @@ public:
   run_.Start({
    .prepare =
     [this] {
-     std::scoped_lock lock(mutex_);
-     const auto next = contracts::next_compute_generation(state_.remote.revision);
-     if (!next || !contracts::next_compute_generation(*next)) throw contracts::FailedError("remote operation revision exhausted");
-     state_.activity = TrainingActivity::Remote;
-     state_.remote.revision = *next;
-     state_.remote.outcome = contracts::RemoteOperationOutcome::Idle;
-     state_.remote.detail.clear();
-     AdvanceObservation();
-    },
+   std::scoped_lock lock(mutex_);
+   const auto next = contracts::next_compute_generation(state_.remote.revision);
+   if (!next || !contracts::next_compute_generation(*next)) throw contracts::FailedError("remote operation revision exhausted");
+   state_.activity = TrainingActivity::Remote;
+   state_.remote.revision = *next;
+   state_.remote.outcome = contracts::RemoteOperationOutcome::Idle;
+   state_.remote.detail.clear();
+   AdvanceObservation();
+  },
    .work = [this, pending = std::move(pending), reconcile](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
-    contracts::ProviderEffectResult result;
-    bool worker_failed = false;
-    try {
-     result = reconcile ? runtime().Reconcile({.mutation = pending.mutation,
-                                               .instance_id = pending.mutation == contracts::ProviderMutation::Create ? 0 : pending.instance,
-                                               .launch_token = pending.mutation == contracts::ProviderMutation::Create ? pending.launch_token : std::string{}},
-                           stop)
-                        : runtime().Mutate(pending.mutation, pending.preferences, pending.offer, pending.instance, pending.launch_token, stop);
-     if (!result.valid()) throw std::runtime_error("provider runtime returned an invalid effect");
-    } catch (const std::exception& error) {
-     worker_failed = true;
-     result = contracts::provider_effect_not_applied(error.what());
-    } catch (...) {
-     worker_failed = true;
-     result = contracts::provider_effect_not_applied("provider operation failed");
-    }
-    if (worker_failed) runtime_.reset();
-    {
-     std::scoped_lock lock(mutex_);
-     SettleRemote(pending, result, reconcile);
-     AdvanceRevision(state_.remote.revision, "remote operation revision exhausted");
-     state_.activity = TrainingActivity::Idle;
-     AdvanceObservation();
-    }
-    auto settled = snapshot();
-    return notification(event_type{TrainingChanged{std::move(settled)}});
-   },
+   contracts::ProviderEffectResult result;
+   bool worker_failed = false;
+   try {
+    result = reconcile ? runtime().Reconcile({.mutation = pending.mutation,
+                                              .instance_id = pending.mutation == contracts::ProviderMutation::Create ? 0 : pending.instance,
+                                              .launch_token = pending.mutation == contracts::ProviderMutation::Create ? pending.launch_token : std::string{}},
+                          stop)
+                       : runtime().Mutate(pending.mutation, pending.preferences, pending.offer, pending.instance, pending.launch_token, stop);
+    if (!result.valid()) throw std::runtime_error("provider runtime returned an invalid effect");
+   } catch (const std::exception& error) {
+    worker_failed = true;
+    result = contracts::provider_effect_not_applied(error.what());
+   } catch (...) {
+    worker_failed = true;
+    result = contracts::provider_effect_not_applied("provider operation failed");
+   }
+   if (worker_failed) runtime_.reset();
+   {
+    std::scoped_lock lock(mutex_);
+    SettleRemote(pending, result, reconcile);
+    AdvanceRevision(state_.remote.revision, "remote operation revision exhausted");
+    state_.activity = TrainingActivity::Idle;
+    AdvanceObservation();
+   }
+   auto settled = snapshot();
+   return notification(event_type{TrainingChanged{std::move(settled)}});
+  },
    .failure = [this, pending = std::move(failure_pending)](std::exception_ptr) mutable -> direct::LocalRun::Notification { return FailRemote(std::move(pending)); },
   });
   return snapshot();
@@ -549,16 +564,21 @@ public:
   settings_.UnlockTrainingConfiguration();
   auto settled = snapshot();
   diagnostics_.Emit([&] {
-   return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training, .event = failed ? "training.operation.failed" : "training.operation.settled",
-    .participant = "train", .sequence = settled.local.terminal.generation, .value = settled.revision, .detail = static_cast<std::uint64_t>(settled.local.terminal.outcome),
-    .context = {.document_resource = settled.local.output.directory}, .message = training_diagnostic_text(settled.local.terminal.detail)};
+   return services::RuntimeDiagnosticFact{
+    .owner = contracts::DiagnosticOwner::Training,
+    .event = failed ? "training.operation.failed" : "training.operation.settled",
+    .participant = "train",
+    .sequence = settled.local.terminal.generation,
+    .value = settled.revision,
+    .detail = static_cast<std::uint64_t>(settled.local.terminal.outcome),
+    .context = {.document_resource = settled.local.output.directory},
+    .message = training_diagnostic_text(settled.local.terminal.detail)
+   };
   });
   if (failed) mmltk::common::logging::report_fatal("local training", settled.local.terminal.detail);
   return notification(event_type{TrainingChanged{std::move(settled)}});
  }
- [[nodiscard]] direct::LocalRun::Notification FailLocal(std::exception_ptr failure) {
-  return SettleLocal(contracts::compute_failure_terminal(failure, "local training worker failed"));
- }
+ [[nodiscard]] direct::LocalRun::Notification FailLocal(std::exception_ptr failure) { return SettleLocal(contracts::compute_failure_terminal(failure, "local training worker failed")); }
  [[nodiscard]] direct::LocalRun::Notification FailQuery() {
   runtime_.reset();
   {
@@ -651,9 +671,8 @@ private:
  // CLEANUP-IGNORE: Training owns one LocalRun behind its sealed facade; compute systems have separate cores.
  direct::LocalRun run_;
 };
-TrainingSystem::TrainingSystem(
- SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, std::optional<mmltk::common::system::ExecutionPolicyRequest> policy, RuntimeFactory factory, SystemEventSink<event_type> events,
- services::RuntimeDiagnosticTarget diagnostics)
+TrainingSystem::TrainingSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, std::optional<mmltk::common::system::ExecutionPolicyRequest> policy, RuntimeFactory factory,
+ SystemEventSink<event_type> events, services::RuntimeDiagnosticTarget diagnostics)
     : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(policy), std::move(factory), std::move(events), std::move(diagnostics))) {}
 TrainingSystem::~TrainingSystem() = default;
 mmltk::backend::models::rfdetr::TrainingOpenedRun TrainingSystem::OpenRun(mmltk::backend::models::rfdetr::TrainingDirectoryQuery query) {

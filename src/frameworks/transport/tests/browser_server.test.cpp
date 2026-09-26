@@ -26,9 +26,9 @@ struct CallbackFacts final {
   .opened = [](void* context) noexcept { ++static_cast<CallbackFacts*>(context)->opened; },
   .record =
    [](void* context, std::span<const std::byte>) noexcept {
-    ++static_cast<CallbackFacts*>(context)->records;
-    return true;
-   },
+  ++static_cast<CallbackFacts*>(context)->records;
+  return true;
+ },
   .closed = [](void* context) noexcept { ++static_cast<CallbackFacts*>(context)->closed; },
  };
 }

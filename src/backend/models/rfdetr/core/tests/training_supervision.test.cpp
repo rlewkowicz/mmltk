@@ -583,7 +583,8 @@ void test_timing_leases_are_explicit_bounded_and_harvested_once() {
  masks.configure_timing({features.device(), 2, true});
  auto mask_outputs = outputs;
  mask_outputs.main.sparse_pred_masks = rfdetr::SparsePredMasks{
-  torch::ones({1, 2, 1, 2}, boxes.options()).set_requires_grad(true), torch::ones({1, 3, 2}, boxes.options()).set_requires_grad(true), torch::zeros({1}, boxes.options()).set_requires_grad(true)};
+  torch::ones({1, 2, 1, 2}, boxes.options()).set_requires_grad(true), torch::ones({1, 3, 2}, boxes.options()).set_requires_grad(true), torch::zeros({1}, boxes.options()).set_requires_grad(true)
+ };
  mask_outputs.aux_outputs = {mask_outputs.main};
  mask_outputs.enc_outputs = mask_outputs.main;
  auto mask_targets = targets;
@@ -1279,12 +1280,14 @@ void test_production_dn_retained_graph_scratch_padding_and_gradients() {
  static_cast<void>(owner.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({image.clone()}), high_water_targets, {71, 3, 1, 6}));
  second_loss.backward();
  first_loss.backward();
- require_finite_gradients({first.denoising->main.pred_logits, first.denoising->main.pred_boxes, first.denoising->aux_outputs.front().pred_logits, first.denoising->aux_outputs.front().pred_boxes,
-  second.denoising->main.pred_logits, second.denoising->main.pred_boxes});
+ require_finite_gradients(
+  {first.denoising->main.pred_logits, first.denoising->main.pred_boxes, first.denoising->aux_outputs.front().pred_logits, first.denoising->aux_outputs.front().pred_boxes,
+   second.denoising->main.pred_logits, second.denoising->main.pred_boxes});
  REQUIRE(second.denoising->main.pred_logits.grad().index({1}).abs().sum().item<float>() == 0.0F);
  REQUIRE(second.denoising->main.pred_boxes.grad().index({1}).abs().sum().item<float>() == 0.0F);
- for (const auto& name : {"training_supervision.denoising_label_embedding.weight", "training_supervision.denoising_task_embedding.weight", "training_supervision.ground_truth_mlp.linear1.weight",
-       "class_embed.weight", "bbox_embed.layers.2.weight", "transformer.decoder.layers.0.self_attn.in_proj_weight"}) {
+ for (const auto& name :
+  {"training_supervision.denoising_label_embedding.weight", "training_supervision.denoising_task_embedding.weight", "training_supervision.ground_truth_mlp.linear1.weight", "class_embed.weight",
+   "bbox_embed.layers.2.weight", "transformer.decoder.layers.0.self_attn.in_proj_weight"}) {
   const auto parameters = owner.named_parameters(true);
   const auto* parameter = parameters.find(name);
   REQUIRE(parameter != nullptr);
@@ -1720,8 +1723,10 @@ TEST_CASE("Mask supervision groups layers and disabled terms preserve the box ob
      layer.pred_boxes = layer.pred_boxes.detach().repeat({1, groups, 1}).set_requires_grad(true);
      layer.query_layout = rfdetr::SupervisedQueryLayout{groups, 3};
      if (config.segmentation)
-      layer.sparse_pred_masks = rfdetr::SparsePredMasks{torch::tensor({content, 0.4F - content}).view({1, 2, 1, 1}).set_requires_grad(true),
-       features.detach().squeeze(1).reshape({1, groups * 3, 2}).clone().set_requires_grad(true), torch::zeros({1}).set_requires_grad(true)};
+      layer.sparse_pred_masks = rfdetr::SparsePredMasks{
+       torch::tensor({content, 0.4F - content}).view({1, 2, 1, 1}).set_requires_grad(true), features.detach().squeeze(1).reshape({1, groups * 3, 2}).clone().set_requires_grad(true),
+       torch::zeros({1}).set_requires_grad(true)
+      };
      return layer;
     };
     rfdetr::ModelOutputs outputs;
@@ -2024,8 +2029,10 @@ TEST_CASE("DN private mask sampling replays owned outputs without changing ordin
    rfdetr::DenoisingOutputLayer layer;
    layer.pred_logits = torch::full({2, 2, 2, 4}, 0.1F).set_requires_grad(true);
    layer.pred_boxes = torch::full({2, 2, 2, 4}, 0.2F).set_requires_grad(true);
-   layer.sparse_pred_masks = rfdetr::SparsePredMasks{(torch::arange(64, torch::kFloat32).reshape({2, 2, 4, 4}) * 0.073 - 1.1).set_requires_grad(true),
-    (torch::arange(16, torch::kFloat32).reshape({2, 4, 2}) * 0.13 - 0.7).set_requires_grad(true), torch::full({1}, 0.31F).set_requires_grad(true)};
+   layer.sparse_pred_masks = rfdetr::SparsePredMasks{
+    (torch::arange(64, torch::kFloat32).reshape({2, 2, 4, 4}) * 0.073 - 1.1).set_requires_grad(true), (torch::arange(16, torch::kFloat32).reshape({2, 4, 2}) * 0.13 - 0.7).set_requires_grad(true),
+    torch::full({1}, 0.31F).set_requires_grad(true)
+   };
    return layer;
   };
   dn.main = make_layer();

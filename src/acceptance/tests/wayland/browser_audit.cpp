@@ -118,9 +118,11 @@ auto AtlasDrawAudit::check(const bool passed, const std::string_view reason, con
  -> bool {
  if (!passed)
   failure.capture(reason, record, [&] {
-   nlohmann::json context{{"completed_scroll_stages", stages}, {"completed_held_stages", held_stages.size()}, {"return_stage", return_stage}, {"away_return", away_return},
-    {"source_count", sources.size()}, {"acquisition_count", acquisitions.size()}, {"ready_sample_count", ready_cell_samples.size()}, {"retained_pixel_count", retained_cell_pixels.size()},
-    {"retained_readiness_count", retained_ready.size()}, {"record_limit", kAcceptanceRecordLimit}};
+   nlohmann::json context{
+    {"completed_scroll_stages", stages}, {"completed_held_stages", held_stages.size()}, {"return_stage", return_stage}, {"away_return", away_return}, {"source_count", sources.size()},
+    {"acquisition_count", acquisitions.size()}, {"ready_sample_count", ready_cell_samples.size()}, {"retained_pixel_count", retained_cell_pixels.size()},
+    {"retained_readiness_count", retained_ready.size()}, {"record_limit", kAcceptanceRecordLimit}
+   };
    if (stages.size() < stage_names.size()) context["expected_scroll_stage"] = stage_names[stages.size()];
    if (held_stages.size() < held_names.size()) context["expected_held_stage"] = held_names[held_stages.size()];
    if (return_stage < return_names.size()) context["expected_return_stage"] = return_names[return_stage];
@@ -851,7 +853,8 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   if (!valid)
    prediction_failure.capture("prediction media-disabled output differs from its reserved run", record, [&] {
     return nlohmann::json{
-     {"claim_only", claim_only}, {"processed", processed}, {"expected_processed", expected}, {"filesystem_error", error.message()}, {"unexpected_entry", unexpected_entry.string()}};
+     {"claim_only", claim_only}, {"processed", processed}, {"expected_processed", expected}, {"filesystem_error", error.message()}, {"unexpected_entry", unexpected_entry.string()}
+    };
    });
  } else if (event == "integration.prediction.output") {
   const auto stage = record.value("detail", "");
@@ -1264,9 +1267,10 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    }
    auto& frames = dataset_transition_frames[key];
    if (frames.size() < 180U)
-    frames.push_back({numeric(record, "c"), coconut == dataset_draw_rows.end() ? 0.0 : coconut->second.first[3], choices == dataset_draw_rows.end() ? 0.0 : choices->second.first[3],
-     trigger == dataset_draw_rows.end() ? 0.0 : trigger->second.first[1], dataset_viewport ? (*dataset_viewport)[0] : 0.0, dataset_viewport ? (*dataset_viewport)[1] : 0.0,
-     dataset_viewport ? (*dataset_viewport)[2] : 0.0, dataset_viewport ? (*dataset_viewport)[3] : 0.0, numeric(record, "b")});
+    frames.push_back(
+     {numeric(record, "c"), coconut == dataset_draw_rows.end() ? 0.0 : coconut->second.first[3], choices == dataset_draw_rows.end() ? 0.0 : choices->second.first[3],
+      trigger == dataset_draw_rows.end() ? 0.0 : trigger->second.first[1], dataset_viewport ? (*dataset_viewport)[0] : 0.0, dataset_viewport ? (*dataset_viewport)[1] : 0.0,
+      dataset_viewport ? (*dataset_viewport)[2] : 0.0, dataset_viewport ? (*dataset_viewport)[3] : 0.0, numeric(record, "b")});
    if (key < 50U)
     for (const auto* id : {"train.dataset.benchmark_divider", "train.dataset.dimensions_divider"}) {
      const auto divider = dataset_draw_rows.find(id);
@@ -2043,14 +2047,14 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
  const std::array advanced_validation{advanced_fixed[1], advanced_validation_lanes, advanced_effective[1]};
  const std::array advanced_optimizer{advanced_fixed[4], advanced_fixed[5], advanced_fixed[6], advanced_fixed[7]};
  const bool advanced_composition =
-  aligned_grid(advanced_batch) && aligned_grid(advanced_general) && aligned_grid(advanced_validation) && aligned_grid(advanced_optimizer) && aligned_grid(advanced_match_free) && aligned_grid(advanced_denoising) &&
-  std::abs(advanced_batch.front().width - advanced_general.front().width) < 1.0 && advanced_general.front().y >= advanced_batch.front().y + advanced_batch.front().height - 1.0 &&
-  std::abs(advanced_general.front().width - advanced_optimizer.front().width) < 1.0 && std::abs(advanced_general.front().width - advanced_match_free.front().width) < 1.0 &&
-  std::abs(advanced_general.front().width - advanced_denoising.front().width) < 1.0 && advanced_validation.front().y >= advanced_general.front().y + advanced_general.front().height - 1.0 &&
-  advanced_optimizer.front().y >= advanced_validation.front().y + advanced_validation.front().height - 1.0 &&
-  advanced_assignment.valid() && advanced_denoising_toggle.valid() && advanced_assignment.x >= advanced_container.x - 1.0 &&
-  advanced_assignment.x + advanced_assignment.width <= advanced_container.x + advanced_container.width + 1.0 && advanced_assignment.y >= advanced_container.y - 1.0 &&
-  advanced_assignment.y + advanced_assignment.height <= advanced_container.y + advanced_container.height + 1.0 &&
+  aligned_grid(advanced_batch) && aligned_grid(advanced_general) && aligned_grid(advanced_validation) && aligned_grid(advanced_optimizer) && aligned_grid(advanced_match_free) &&
+  aligned_grid(advanced_denoising) && std::abs(advanced_batch.front().width - advanced_general.front().width) < 1.0 &&
+  advanced_general.front().y >= advanced_batch.front().y + advanced_batch.front().height - 1.0 && std::abs(advanced_general.front().width - advanced_optimizer.front().width) < 1.0 &&
+  std::abs(advanced_general.front().width - advanced_match_free.front().width) < 1.0 && std::abs(advanced_general.front().width - advanced_denoising.front().width) < 1.0 &&
+  advanced_validation.front().y >= advanced_general.front().y + advanced_general.front().height - 1.0 &&
+  advanced_optimizer.front().y >= advanced_validation.front().y + advanced_validation.front().height - 1.0 && advanced_assignment.valid() && advanced_denoising_toggle.valid() &&
+  advanced_assignment.x >= advanced_container.x - 1.0 && advanced_assignment.x + advanced_assignment.width <= advanced_container.x + advanced_container.width + 1.0 &&
+  advanced_assignment.y >= advanced_container.y - 1.0 && advanced_assignment.y + advanced_assignment.height <= advanced_container.y + advanced_container.height + 1.0 &&
   advanced_assignment.y >= advanced_optimizer.front().y + advanced_optimizer.front().height - 1.0 && advanced_denoising_toggle.x >= advanced_container.x - 1.0 &&
   advanced_denoising_toggle.x + advanced_denoising_toggle.width <= advanced_container.x + advanced_container.width + 1.0 && advanced_denoising_toggle.y >= advanced_container.y - 1.0 &&
   advanced_denoising_toggle.y + advanced_denoising_toggle.height <= advanced_container.y + advanced_container.height + 1.0 &&
@@ -2061,7 +2065,8 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
    const double cell_pitch = fields[1].x - fields[0].x;
    return cell_pitch > 0.0 && std::ranges::all_of(fields, [cell_pitch](const Bounds& bounds) { return bounds.width < cell_pitch * 0.70; });
   };
-  return compact_row(advanced_batch) && compact_row(advanced_general) && compact_row(advanced_validation) && compact_row(advanced_optimizer) && compact_row(advanced_match_free) && compact_row(advanced_denoising);
+  return compact_row(advanced_batch) && compact_row(advanced_general) && compact_row(advanced_validation) && compact_row(advanced_optimizer) && compact_row(advanced_match_free) &&
+         compact_row(advanced_denoising);
  }();
  const bool status_composition = status_panel.valid() && status_copy.valid() && status_dismiss.valid() && status_copy.x < status_dismiss.x && status_copy.y >= status_panel.y - 1.0 &&
                                  status_dismiss.y >= status_panel.y - 1.0 && status_panel.contains_horizontally(status_copy) && status_panel.contains_horizontally(status_dismiss);
@@ -2125,13 +2130,11 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   detail_containers, "detail containers", padded_and_original_detail, "padded and original detail", upscale_growth, "upscale growth", upscale_presentation, "upscale presentation",
   upscale_modes == expected_upscale_modes, "upscale modes", upscale_presentations == expected_upscale_presentations, "upscale presentations",
   upscale_completed_pixels == expected_upscale_presentations, "upscale completed blue pixels", upscale_same_method == expected_upscale_presentations, "upscale exact re-click", upscale_later_frame,
-  "upscale later frame",
-  std::ranges::all_of(
-   viewer_navigation_draws, [this](const auto draw) { return draw != 0U && surface_draws.contains(draw); }),
-  "Previous/Next automatic upscale draws", reopened, "dataset reopen", repeated_same_revision, "same-revision redraw", annotation_ready && annotation_tool && annotation_pointer,
-  "annotation lifecycle", complete && surface_draws.contains(presentation_receipt) && surface_redraws.contains(presentation_receipt), "presentation completion",
-  bounds_valid && !failed_before_termination(), "browser validity", firefox_import && firefox_claim && firefox_ready, "Firefox integration",
-  std::ranges::all_of(expected, [this](const std::string_view id) { return controls.contains(id); }), "expected controls");
+  "upscale later frame", std::ranges::all_of(viewer_navigation_draws, [this](const auto draw) { return draw != 0U && surface_draws.contains(draw); }), "Previous/Next automatic upscale draws",
+  reopened, "dataset reopen", repeated_same_revision, "same-revision redraw", annotation_ready && annotation_tool && annotation_pointer, "annotation lifecycle",
+  complete && surface_draws.contains(presentation_receipt) && surface_redraws.contains(presentation_receipt), "presentation completion", bounds_valid && !failed_before_termination(),
+  "browser validity", firefox_import && firefox_claim && firefox_ready, "Firefox integration", std::ranges::all_of(expected, [this](const std::string_view id) { return controls.contains(id); }),
+  "expected controls");
 }
 auto BrowserAudit::prediction_output_blocker() const -> std::string_view {
  return first_failed_check(prediction_no_outputs[0], "compiled prediction media-disabled output", prediction_no_outputs[1], "single-image prediction media-disabled output",
@@ -2197,7 +2200,8 @@ bool BrowserAudit::benchmark_choices_complete() const {
  const auto& baseline = *benchmark_baseline;
  if ((baseline[0] != 0.0 && baseline[0] != 1.0) || (baseline[1] != 0.0 && baseline[1] != 1.0) || (baseline[2] != 0.0 && baseline[2] != 1.0 && baseline[2] != 2.0) || baseline[3] <= 0.0) return false;
  constexpr std::array benchmark_controls{
-  "train.dataset.benchmark.custom", "train.dataset.benchmark.coconut", "train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"};
+  "train.dataset.benchmark.custom", "train.dataset.benchmark.coconut", "train.dataset.validation.coconut", "train.dataset.validation.stock", "train.dataset.validation.coconut_stock"
+ };
  double previous_revision = baseline[3];
  double previous_dataset = baseline[1];
  double previous_validation = baseline[2];
@@ -2320,9 +2324,11 @@ void BrowserAudit::consume_native_gpu(const nlohmann::json& record) {
 }
 bool BrowserAudit::training_sources_complete() const {
  const std::vector<std::array<double, 4>> expected{
-  {0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12}, {4, 1, 6, 4}, {5, 2, 6, 5}, {6, 2, 12, 11}, {7, 2, 12, 11}, {8, 0, 12, 12}, {9, 0, 103, 12}};
+  {0, 1, 103, 10}, {1, 2, 103, 11}, {2, 2, 103, 11}, {3, 0, 103, 12}, {4, 1, 6, 4}, {5, 2, 6, 5}, {6, 2, 12, 11}, {7, 2, 12, 11}, {8, 0, 12, 12}, {9, 0, 103, 12}
+ };
  const std::vector<std::array<double, 4>> runs{
-  {0, 0, 0, 0}, {1, 0, 0, 0}, {2, 0, 0, 0}, {3, 0, 0, 0}, {4, 1, 51, 100}, {5, 1, 51, 100}, {6, 1, 51, 200}, {7, 1, 52, 200}, {8, 1, 52, 200}, {9, 0, 0, 0}};
+  {0, 0, 0, 0}, {1, 0, 0, 0}, {2, 0, 0, 0}, {3, 0, 0, 0}, {4, 1, 51, 100}, {5, 1, 51, 100}, {6, 1, 51, 200}, {7, 1, 52, 200}, {8, 1, 52, 200}, {9, 0, 0, 0}
+ };
  return training_sources == expected && training_source_runs == runs;
 }
 bool BrowserAudit::workflow_gpus_complete() const {

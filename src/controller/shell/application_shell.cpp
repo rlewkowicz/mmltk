@@ -35,10 +35,12 @@ ApplicationShell::ApplicationShell(ApplicationShellConfig config)
       presentation_config_(std::move(config.presentation)),
       live_configuration_(std::move(config.live)) {
  normalize(presentation_config_);
- const VisualDeviceSettings base_visual{.device = presentation_config_.cuda_device_index,
+ const VisualDeviceSettings base_visual{
+  .device = presentation_config_.cuda_device_index,
   .maximum_width = std::max(presentation_config_.extent.width, live_configuration_.capture_width),
   .maximum_height = std::max(presentation_config_.extent.height, live_configuration_.capture_height),
-  .numa_node = presentation_config_.numa_node};
+  .numa_node = presentation_config_.numa_node
+ };
  const auto output_extent = checked_upscale_output_extent({.width = base_visual.maximum_width, .height = base_visual.maximum_height});
  const VisualDeviceSettings output_visual{
   .device = base_visual.device,
@@ -51,21 +53,24 @@ ApplicationShell::ApplicationShell(ApplicationShellConfig config)
  if (explore_configuration.acceptance) browser_host_.install_integration(explore_configuration.acceptance, config.completion_acceptance);
  explore_configuration.diagnostics = diagnostics;
  systems_ = std::make_unique<ApplicationSystemStorage>(
-  ApplicationSystemConfiguration{.base_visual = base_visual,
+  ApplicationSystemConfiguration{
+   .base_visual = base_visual,
    .output_visual = output_visual,
    .explore_nproc = 0U,
    .explore = std::move(explore_configuration),
    .live = live_configuration_,
-   .presentation = {.import_socket = presentation_config_.import_socket,
-    .minimum_allocation_bytes = presentation_config_.minimum_allocation_bytes,
-    .pending_supersession_acceptance = config.pending_supersession_acceptance,
-    .completion_acceptance = config.completion_acceptance},
+   .presentation =
+    {.import_socket = presentation_config_.import_socket,
+     .minimum_allocation_bytes = presentation_config_.minimum_allocation_bytes,
+     .pending_supersession_acceptance = config.pending_supersession_acceptance,
+     .completion_acceptance = config.completion_acceptance},
    .settings_location = std::move(config.settings_location),
    .h2d_dataloader = config.h2d_dataloader,
    .file_dialog = file_dialog_owner_.client(),
    .provider = provider_owner_.client(),
    .training_executable = std::move(config.training_executable),
-   .runtime_diagnostics = runtime_diagnostics_.target()},
+   .runtime_diagnostics = runtime_diagnostics_.target()
+  },
   [this](browser::SystemEvent event) { browser_host_.publish(std::move(event)); }, diagnostics, [this] { browser_host_.continuity_lost(); });
  if (!browser_host_.install(systems_->application_systems())) {
   browser_host_.close_admission();
@@ -84,7 +89,8 @@ services::FirefoxProcessStartResult ApplicationShell::start_firefox(services::Fi
  if (firefox_process_ || shutdown_requested_.load(std::memory_order_acquire)) return services::FirefoxProcessStartResult::Terminal;
  firefox_process_.emplace(presentation_import_socket_path(), std::move(config),
   services::FirefoxProcessObservationTarget{
-   .context = this, .install_process_group = &ApplicationShell::InstallFirefoxProcessGroup, .submit_observation = &ApplicationShell::FirefoxPhysicalObservation},
+   .context = this, .install_process_group = &ApplicationShell::InstallFirefoxProcessGroup, .submit_observation = &ApplicationShell::FirefoxPhysicalObservation
+  },
   runtime_diagnostics_.target());
  return firefox_process_->start();
 }

@@ -820,17 +820,16 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
     std::move(filtered_masks),
    };
   }
-  evaluation_run.submit(
-   lane_pool,
+  evaluation_run.submit(lane_pool,
    [processed = std::move(processed), processed_ready = std::move(*processed_ready), lease = std::move(prediction_slot), category_count = loader.num_classes(), max_dets = validation.detection_limit(),
     device_id = options.device_id](auto& lane) mutable {
-    processed_ready.wait(reinterpret_cast<std::uintptr_t>(lane.stream.stream()), "wait for train eval prediction readiness");
-    processed_ready.retire();
-    c10::InferenceMode lane_inference_mode;
-    torch_cuda::TorchCudaDeviceGuard lane_device_guard(torch_cuda::checked_device_index(device_id));
-    torch_cuda::TorchCudaStreamGuard stream_guard(lane.stream);
-    return stage_prediction_batch(std::move(processed), category_count, max_dets, std::move(lease), device_id, reinterpret_cast<void*>(lane.stream.stream()));
-   },
+   processed_ready.wait(reinterpret_cast<std::uintptr_t>(lane.stream.stream()), "wait for train eval prediction readiness");
+   processed_ready.retire();
+   c10::InferenceMode lane_inference_mode;
+   torch_cuda::TorchCudaDeviceGuard lane_device_guard(torch_cuda::checked_device_index(device_id));
+   torch_cuda::TorchCudaStreamGuard stream_guard(lane.stream);
+   return stage_prediction_batch(std::move(processed), category_count, max_dets, std::move(lease), device_id, reinterpret_cast<void*>(lane.stream.stream()));
+  },
    batch_timing);
   validation.submitted();
   while (evaluation_run.pending_lane_count() >= validation.lane_capacity()) { evaluation_run.drain_lane(cpu_pool); }

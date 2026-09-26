@@ -345,14 +345,14 @@ public:
      auto* const model = dynamic_cast<UpscaleAlgorithm*>(runtime.model());
      if (model == nullptr) throw std::runtime_error("Upscale runtime model is unavailable during warm-up");
      services::RuntimeDiagnosticSpan warm_span{diagnostics_, [&] {
-                                                return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Upscale,
-                                                                                   .operation = VisualDiagnosticOperation::UpscaleWarmRuntimeStarted,
-                                                                                   .device = settings_.device,
-                                                                                   .value = index,
-                                                                                   .context = {.capacity_width = extent.width, .capacity_height = extent.height},
-                                                                                   .failure_detail = mmltk::frameworks::reflection::enum_name(static_cast<UpscaleKernel>(index))},
-                                                 VisualDiagnosticOperation::UpscaleWarmRuntimeCompleted);
-                                               }};
+      return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Upscale,
+                                         .operation = VisualDiagnosticOperation::UpscaleWarmRuntimeStarted,
+                                         .device = settings_.device,
+                                         .value = index,
+                                         .context = {.capacity_width = extent.width, .capacity_height = extent.height},
+                                         .failure_detail = mmltk::frameworks::reflection::enum_name(static_cast<UpscaleKernel>(index))},
+       VisualDiagnosticOperation::UpscaleWarmRuntimeCompleted);
+     }};
      if (!warm_initialized_) {
       warm_initialized_ = true;
       model->Warm();
@@ -451,18 +451,22 @@ public:
     AdvanceRevision();
     const auto selected = state_;
     diagnostics_.Emit([&] {
-     return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
+     return VisualDiagnosticFact{
+      .system = contracts::DiagnosticOwner::Upscale,
       .operation = VisualDiagnosticOperation::UpscaleResultReused,
       .device = settings_.device,
       .generation = demand_,
       .value = selected.frame.revision,
       .detail = static_cast<std::uint64_t>(request.kernel),
-      .context = {.observation_revision = selected.revision,
+      .context = {
+       .observation_revision = selected.revision,
        .document_resource = request.document.resource.view(),
        .document_revision = request.document.resource.revision,
        .document_meaning_identity = request.document.meaning_identity,
        .source = visual_diagnostic_source({.frame = request.source}),
-       .demand = {.demand_generation = demand_}}};
+       .demand = {.demand_generation = demand_}
+      }
+     };
     });
     admission_lock.unlock();
     Publish(event_type{UpscaleChanged{selected}});
@@ -485,214 +489,214 @@ public:
    AdvanceRevision();
    if (!worker_.SubmitLatest([this, request, target, prepared_extent, content = *content, demand, admission_link](
                               mmltk::frameworks::gpu::SystemImageRuntime& runtime, std::stop_token stop) mutable -> detail::VisualRuntimeOwner::Notification {
-        const auto current = [this, demand, stop] {
-         std::scoped_lock lock(mutex_);
-         return demand == demand_ && !stop.stop_requested();
-        };
-        if (!current()) return {};
-        contracts::DiagnosticLink worker_link;
-        diagnostics_.Emit([&] {
-         worker_link = services::DiagnosticSpanIds::Next(admission_link);
-         return RequestDiagnostic(VisualDiagnosticOperation::UpscaleWorkerStarted, request, demand, worker_link);
-        });
-        try {
-         VisualDocumentRead source;
-         const bool retained_input = input_request_ && SameSource(*input_request_, request);
-         if (!current()) return {};
-         if (!retained_input) source = borrow_source_(request.source);
-         if (!current()) return {};
-         if (!retained_input && (!source.valid() || !visual_product_matches_frame(request.source, source.pixels) || source.document->facts() != request.document)) {
-          std::scoped_lock lock(mutex_);
-          if (demand != demand_) return {};
-          state_.busy = false;
-          state_.pending.reset();
-          state_.methods[static_cast<std::size_t>(request.kernel)].failed = true;
-          state_.methods[static_cast<std::size_t>(request.kernel)].failure = request;
-          AdvanceRevision();
-          return [this, request] { Publish(event_type{UpscaleFailed{snapshot(), "Upscale source is no longer available", request, UpscaleFailureKind::Unavailable}}); };
-         }
-         const auto source_descriptor = retained_input ? runtime.BorrowInput().plane(0U).plane().descriptor : source.pixels.plane(0U).plane().descriptor;
-         if (source_descriptor.width != request.source.extent.width || source_descriptor.height != request.source.extent.height)
-          throw contracts::UnavailableError("Upscale source geometry does not match its frame");
-         auto document = retained_input ? input_document_ : scale_visual_document(source.document, request.source.extent, target);
-         auto image_metadata = retained_input ? input_image_metadata_ : source.image_metadata;
-         auto* const model = dynamic_cast<UpscaleAlgorithm*>(runtime.model());
-         if (model == nullptr) throw std::runtime_error("Upscale runtime model is unavailable");
-         const auto copied_planes = diagnostics_.valid() ? source.pixels.plane_count() : 0U;
-         if (!retained_input) {
-          services::RuntimeDiagnosticSpan copy_span{diagnostics_,
-           [&] {
-            return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Upscale,
-                                               .operation = VisualDiagnosticOperation::UpscaleCopyStarted,
-                                               .device = settings_.device,
-                                               .generation = demand,
-                                               .value = request.source.revision,
-                                               .context = {.source = visual_diagnostic_source({.frame = request.source}), .demand = {.demand_generation = demand}}},
-             VisualDiagnosticOperation::CopyCompleted);
-           },
-           worker_link};
-          const bool preserve_clean = input_request_ && visual_clean_content_identity(input_request_->source) == visual_clean_content_identity(request.source);
-          if (!current()) return {};
-          input_request_.reset();
-          input_document_.reset();
-          input_image_metadata_.reset();
-          if (!current()) return {};
-          const auto paths = runtime.CopyInputFrom(std::move(source.pixels), [model](const auto plane, const auto stream) { model->Semantics({}, plane, stream); }, preserve_clean);
-          input_request_ = request;
-          input_document_ = document;
-          input_image_metadata_ = image_metadata;
-          copy_span.FinishWith([&](auto& fact) { fact.copy_path = paths[preserve_clean ? 1U : 0U]; });
-         }
-         if (stop.stop_requested()) return {};
-         const auto input = runtime.BorrowInput();
-         if (!input.valid()) throw std::runtime_error("Upscale runtime model is unavailable");
-         if (diagnostics_.valid()) {
-          const auto plane = input.plane(0U).plane();
-          diagnostics_.Emit([&] {
-           auto fact = Diagnostic(VisualDiagnosticOperation::UpscaleInputGeometry, demand);
-           fact.value = source_descriptor.pitch_bytes;
-           fact.detail = plane.descriptor.pitch_bytes;
-           fact.context.capacity_width = plane.descriptor.width;
-           fact.context.capacity_height = plane.descriptor.height;
-           fact.context.frame_revision = request.source.revision;
-           return fact;
-          });
-          diagnostics_.Emit([&] {
-           return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
-            .operation = VisualDiagnosticOperation::UpscaleInputAllocation,
-            .device = settings_.device,
-            .generation = demand,
-            .value = plane.data,
-            .detail = plane.descriptor.row_bytes() * plane.descriptor.height * copied_planes};
-          });
-         }
-         Record baseline;
-         {
-          std::scoped_lock lock(mutex_);
-          if (demand != demand_) return {};
-          baseline = records_[static_cast<std::size_t>(request.kernel)];
-          for (auto& record : records_) {
-           if (!SameClean(record.request.source, request.source)) record = {};
-          }
-         }
-         const bool reuse_clean = baseline.product.valid() && SameClean(baseline.request.source, request.source) && baseline.frame.extent == target;
-         auto output_candidate =
-          AcquireOutput(runtime, stop, reuse_clean ? baseline.product : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{}, mmltk::frameworks::gpu::ImagePlanePreservation::Clean);
-         if (!output_candidate.valid() || !current()) return {};
-         const auto write_output = [this, model, &input, request, prepared_extent, reuse_clean, demand, stop](const auto output, const auto semantic, const auto stream) {
-          if (diagnostics_.valid())
-           diagnostics_.Emit([&] {
-            auto fact = Diagnostic(VisualDiagnosticOperation::UpscaleOutputAllocation, demand);
-            fact.value = output.data;
-            fact.detail = output.descriptor.pitch_bytes;
-            fact.context.capacity_width = output.descriptor.width;
-            fact.context.capacity_height = output.descriptor.height;
-            return fact;
-           });
-          const auto output_current = [this, demand, stop] {
-           std::scoped_lock lock(mutex_);
-           return demand == demand_ && !stop.stop_requested();
-          };
-          if (!output_current()) return;
-          if (!reuse_clean) {
-           const auto prepared = model->Prepare(input.plane(0U).plane(), request.source, prepared_extent);
-           model->Run(request.kernel, prepared.valid() ? prepared.plane() : input.plane(0U).plane(), output, stream, output_current);
-          }
-          if (!output_current()) return;
-          model->Semantics(input.plane(1U).plane(), semantic, stream);
-         };
-         if (reuse_clean)
-          runtime.Publish(output_candidate, target.width, target.height, write_output);
-         else
-          runtime.PublishRetained(output_candidate, target.width, target.height, write_output);
-         {
-          std::scoped_lock lock(mutex_);
-          if (demand != demand_ || stop.stop_requested()) return {};
-          auto product = runtime.CommitOutput(std::move(output_candidate));
-          const auto clean_revision = reuse_clean ? baseline.frame.clean_revision : product.revision();
-          state_.busy = false;
-          state_.pending.reset();
-          auto& record = records_[static_cast<std::size_t>(request.kernel)];
-          record.product = std::move(product);
-          record.request = request;
-          record.document = std::move(document);
-          record.image_metadata = std::move(image_metadata);
-          record.frame = {
-           .source =
-            {
-             .kind = PresentationSourceKind::Upscale,
-             .instance = 1U,
-            },
-           .extent = target,
-           .revision = record.product.revision(),
-           .content = content,
-           .clean_revision = clean_revision,
-           .source_extent = request.source.source_extent,
-          };
-          state_.methods[static_cast<std::size_t>(request.kernel)] = {
-           .available = true,
-           .warm = true,
-           .graph_replay = model->GraphReplay(request.kernel),
-           .completed = request,
-           .frame = record.frame,
-          };
-          if (desired_ == request)
-           Select(record);
-          else if (selected_.valid())
-           runtime.SelectOutput(selected_);
-          if (desired_) RefreshAvailability(*desired_);
-          AdvanceRevision();
-         }
-         diagnostics_.Emit([&] {
-          return VisualDiagnosticFact{
-           .system = contracts::DiagnosticOwner::Upscale,
-           .operation = VisualDiagnosticOperation::UpscaleModelSubmitted,
-           .device = settings_.device,
-           .generation = runtime.OutputFacts().revision,
-           .value = static_cast<std::uint64_t>(request.kernel),
-           .detail = demand,
-          };
-         });
-         return [this] { PublishChanged(); };
-        } catch (...) {
-         const auto failure = std::current_exception();
-         rethrow_physical_upscale_failure(failure);
-         const auto detail = visual_failure_detail(failure, "Upscale method failed");
-         const auto kind = [failure] {
-          try {
-           std::rethrow_exception(failure);
-          } catch (const contracts::UnavailableError&) { return UpscaleFailureKind::Unavailable; } catch (...) {
-           return UpscaleFailureKind::Failed;
-          }
-         }();
-         {
-          std::scoped_lock lock(mutex_);
-          auto& method = state_.methods[static_cast<std::size_t>(request.kernel)];
-          const bool initialization = static_cast<bool>(mmltk::frameworks::gpu::find_image_failure<native_upscale::ImageUpscalerInitializationFailure>(failure));
-          if (initialization) {
-           method.initialization_failed = true;
-           method.warm = false;
-          }
-          if (demand != demand_) {
-           if (initialization) {
-            AdvanceRevision();
-            return [this] { PublishChanged(); };
-           }
-           return {};
-          }
-          method.failed = true;
-          method.failure = request;
-          method.warm = false;
-          state_.busy = false;
-          state_.pending.reset();
-          AdvanceRevision();
-         }
-         return [this, detail, request, kind] {
-          report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Upscale, settings_.device, detail);
-          Publish(event_type{UpscaleFailed{snapshot(), detail, request, kind}});
-         };
-        }
-       })) {
+    const auto current = [this, demand, stop] {
+     std::scoped_lock lock(mutex_);
+     return demand == demand_ && !stop.stop_requested();
+    };
+    if (!current()) return {};
+    contracts::DiagnosticLink worker_link;
+    diagnostics_.Emit([&] {
+     worker_link = services::DiagnosticSpanIds::Next(admission_link);
+     return RequestDiagnostic(VisualDiagnosticOperation::UpscaleWorkerStarted, request, demand, worker_link);
+    });
+    try {
+     VisualDocumentRead source;
+     const bool retained_input = input_request_ && SameSource(*input_request_, request);
+     if (!current()) return {};
+     if (!retained_input) source = borrow_source_(request.source);
+     if (!current()) return {};
+     if (!retained_input && (!source.valid() || !visual_product_matches_frame(request.source, source.pixels) || source.document->facts() != request.document)) {
+      std::scoped_lock lock(mutex_);
+      if (demand != demand_) return {};
+      state_.busy = false;
+      state_.pending.reset();
+      state_.methods[static_cast<std::size_t>(request.kernel)].failed = true;
+      state_.methods[static_cast<std::size_t>(request.kernel)].failure = request;
+      AdvanceRevision();
+      return [this, request] { Publish(event_type{UpscaleFailed{snapshot(), "Upscale source is no longer available", request, UpscaleFailureKind::Unavailable}}); };
+     }
+     const auto source_descriptor = retained_input ? runtime.BorrowInput().plane(0U).plane().descriptor : source.pixels.plane(0U).plane().descriptor;
+     if (source_descriptor.width != request.source.extent.width || source_descriptor.height != request.source.extent.height)
+      throw contracts::UnavailableError("Upscale source geometry does not match its frame");
+     auto document = retained_input ? input_document_ : scale_visual_document(source.document, request.source.extent, target);
+     auto image_metadata = retained_input ? input_image_metadata_ : source.image_metadata;
+     auto* const model = dynamic_cast<UpscaleAlgorithm*>(runtime.model());
+     if (model == nullptr) throw std::runtime_error("Upscale runtime model is unavailable");
+     const auto copied_planes = diagnostics_.valid() ? source.pixels.plane_count() : 0U;
+     if (!retained_input) {
+      services::RuntimeDiagnosticSpan copy_span{diagnostics_, [&] {
+       return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Upscale,
+                                          .operation = VisualDiagnosticOperation::UpscaleCopyStarted,
+                                          .device = settings_.device,
+                                          .generation = demand,
+                                          .value = request.source.revision,
+                                          .context = {.source = visual_diagnostic_source({.frame = request.source}), .demand = {.demand_generation = demand}}},
+        VisualDiagnosticOperation::CopyCompleted);
+      }, worker_link};
+      const bool preserve_clean = input_request_ && visual_clean_content_identity(input_request_->source) == visual_clean_content_identity(request.source);
+      if (!current()) return {};
+      input_request_.reset();
+      input_document_.reset();
+      input_image_metadata_.reset();
+      if (!current()) return {};
+      const auto paths = runtime.CopyInputFrom(std::move(source.pixels), [model](const auto plane, const auto stream) { model->Semantics({}, plane, stream); }, preserve_clean);
+      input_request_ = request;
+      input_document_ = document;
+      input_image_metadata_ = image_metadata;
+      copy_span.FinishWith([&](auto& fact) { fact.copy_path = paths[preserve_clean ? 1U : 0U]; });
+     }
+     if (stop.stop_requested()) return {};
+     const auto input = runtime.BorrowInput();
+     if (!input.valid()) throw std::runtime_error("Upscale runtime model is unavailable");
+     if (diagnostics_.valid()) {
+      const auto plane = input.plane(0U).plane();
+      diagnostics_.Emit([&] {
+       auto fact = Diagnostic(VisualDiagnosticOperation::UpscaleInputGeometry, demand);
+       fact.value = source_descriptor.pitch_bytes;
+       fact.detail = plane.descriptor.pitch_bytes;
+       fact.context.capacity_width = plane.descriptor.width;
+       fact.context.capacity_height = plane.descriptor.height;
+       fact.context.frame_revision = request.source.revision;
+       return fact;
+      });
+      diagnostics_.Emit([&] {
+       return VisualDiagnosticFact{
+        .system = contracts::DiagnosticOwner::Upscale,
+        .operation = VisualDiagnosticOperation::UpscaleInputAllocation,
+        .device = settings_.device,
+        .generation = demand,
+        .value = plane.data,
+        .detail = plane.descriptor.row_bytes() * plane.descriptor.height * copied_planes
+       };
+      });
+     }
+     Record baseline;
+     {
+      std::scoped_lock lock(mutex_);
+      if (demand != demand_) return {};
+      baseline = records_[static_cast<std::size_t>(request.kernel)];
+      for (auto& record : records_) {
+       if (!SameClean(record.request.source, request.source)) record = {};
+      }
+     }
+     const bool reuse_clean = baseline.product.valid() && SameClean(baseline.request.source, request.source) && baseline.frame.extent == target;
+     auto output_candidate =
+      AcquireOutput(runtime, stop, reuse_clean ? baseline.product : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{}, mmltk::frameworks::gpu::ImagePlanePreservation::Clean);
+     if (!output_candidate.valid() || !current()) return {};
+     const auto write_output = [this, model, &input, request, prepared_extent, reuse_clean, demand, stop](const auto output, const auto semantic, const auto stream) {
+      if (diagnostics_.valid())
+       diagnostics_.Emit([&] {
+        auto fact = Diagnostic(VisualDiagnosticOperation::UpscaleOutputAllocation, demand);
+        fact.value = output.data;
+        fact.detail = output.descriptor.pitch_bytes;
+        fact.context.capacity_width = output.descriptor.width;
+        fact.context.capacity_height = output.descriptor.height;
+        return fact;
+       });
+      const auto output_current = [this, demand, stop] {
+       std::scoped_lock lock(mutex_);
+       return demand == demand_ && !stop.stop_requested();
+      };
+      if (!output_current()) return;
+      if (!reuse_clean) {
+       const auto prepared = model->Prepare(input.plane(0U).plane(), request.source, prepared_extent);
+       model->Run(request.kernel, prepared.valid() ? prepared.plane() : input.plane(0U).plane(), output, stream, output_current);
+      }
+      if (!output_current()) return;
+      model->Semantics(input.plane(1U).plane(), semantic, stream);
+     };
+     if (reuse_clean)
+      runtime.Publish(output_candidate, target.width, target.height, write_output);
+     else
+      runtime.PublishRetained(output_candidate, target.width, target.height, write_output);
+     {
+      std::scoped_lock lock(mutex_);
+      if (demand != demand_ || stop.stop_requested()) return {};
+      auto product = runtime.CommitOutput(std::move(output_candidate));
+      const auto clean_revision = reuse_clean ? baseline.frame.clean_revision : product.revision();
+      state_.busy = false;
+      state_.pending.reset();
+      auto& record = records_[static_cast<std::size_t>(request.kernel)];
+      record.product = std::move(product);
+      record.request = request;
+      record.document = std::move(document);
+      record.image_metadata = std::move(image_metadata);
+      record.frame = {
+       .source =
+        {
+         .kind = PresentationSourceKind::Upscale,
+         .instance = 1U,
+        },
+       .extent = target,
+       .revision = record.product.revision(),
+       .content = content,
+       .clean_revision = clean_revision,
+       .source_extent = request.source.source_extent,
+      };
+      state_.methods[static_cast<std::size_t>(request.kernel)] = {
+       .available = true,
+       .warm = true,
+       .graph_replay = model->GraphReplay(request.kernel),
+       .completed = request,
+       .frame = record.frame,
+      };
+      if (desired_ == request)
+       Select(record);
+      else if (selected_.valid())
+       runtime.SelectOutput(selected_);
+      if (desired_) RefreshAvailability(*desired_);
+      AdvanceRevision();
+     }
+     diagnostics_.Emit([&] {
+      return VisualDiagnosticFact{
+       .system = contracts::DiagnosticOwner::Upscale,
+       .operation = VisualDiagnosticOperation::UpscaleModelSubmitted,
+       .device = settings_.device,
+       .generation = runtime.OutputFacts().revision,
+       .value = static_cast<std::uint64_t>(request.kernel),
+       .detail = demand,
+      };
+     });
+     return [this] { PublishChanged(); };
+    } catch (...) {
+     const auto failure = std::current_exception();
+     rethrow_physical_upscale_failure(failure);
+     const auto detail = visual_failure_detail(failure, "Upscale method failed");
+     const auto kind = [failure] {
+      try {
+       std::rethrow_exception(failure);
+      } catch (const contracts::UnavailableError&) { return UpscaleFailureKind::Unavailable; } catch (...) {
+       return UpscaleFailureKind::Failed;
+      }
+     }();
+     {
+      std::scoped_lock lock(mutex_);
+      auto& method = state_.methods[static_cast<std::size_t>(request.kernel)];
+      const bool initialization = static_cast<bool>(mmltk::frameworks::gpu::find_image_failure<native_upscale::ImageUpscalerInitializationFailure>(failure));
+      if (initialization) {
+       method.initialization_failed = true;
+       method.warm = false;
+      }
+      if (demand != demand_) {
+       if (initialization) {
+        AdvanceRevision();
+        return [this] { PublishChanged(); };
+       }
+       return {};
+      }
+      method.failed = true;
+      method.failure = request;
+      method.warm = false;
+      state_.busy = false;
+      state_.pending.reset();
+      AdvanceRevision();
+     }
+     return [this, detail, request, kind] {
+      report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Upscale, settings_.device, detail);
+      Publish(event_type{UpscaleFailed{snapshot(), detail, request, kind}});
+     };
+    }
+   })) {
     state_ = prior;
     desired_ = prior_desired;
     throw contracts::UnavailableError("Upscale desired-product ingress is stopped");
@@ -723,11 +727,13 @@ public:
   {
    std::scoped_lock lock(mutex_);
    diagnostics_.Emit([&] {
-    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
+    return VisualDiagnosticFact{
+     .system = contracts::DiagnosticOwner::Upscale,
      .operation = VisualDiagnosticOperation::UpscaleStopRequested,
      .device = settings_.device,
      .generation = demand_,
-     .context = {.observation_revision = state_.revision, .source = visual_diagnostic_source({.frame = state_.input})}};
+     .context = {.observation_revision = state_.revision, .source = visual_diagnostic_source({.frame = state_.input})}
+    };
    });
    ++demand_;
    state_.busy = false;
@@ -781,10 +787,9 @@ private:
  mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate AcquireOutput(mmltk::frameworks::gpu::SystemImageRuntime& runtime, std::stop_token stop,
   mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline = {}, mmltk::frameworks::gpu::ImagePlanePreservation preservation = mmltk::frameworks::gpu::ImagePlanePreservation::All) {
   services::RuntimeDiagnosticSpan admission{diagnostics_, [&] {
-                                             return visual_diagnostic_boundary(
-                                              {.system = contracts::DiagnosticOwner::Upscale, .operation = VisualDiagnosticOperation::UpscaleOutputAdmissionStarted, .device = settings_.device},
-                                              VisualDiagnosticOperation::UpscaleOutputAdmissionCompleted);
-                                            }};
+   return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Upscale, .operation = VisualDiagnosticOperation::UpscaleOutputAdmissionStarted, .device = settings_.device},
+    VisualDiagnosticOperation::UpscaleOutputAdmissionCompleted);
+  }};
   auto candidate = runtime.AcquireOutput(stop, std::move(baseline), preservation);
   admission.Finish();
   return candidate;
