@@ -5,6 +5,7 @@
 #include "src/common/math/deterministic_sampling.h"
 #include <span>
 #include "augmentation_plan.h"
+#include "src/backend/imaging/sampling.h"
 namespace mmltk::backend::models::rfdetr {
 struct AugmentationAnnotationSupport {
  std::array<float, 4> box_xyxy{};
@@ -23,8 +24,7 @@ struct AugmentationAnnotationSupport {
  for (int corner = 0; corner < 4; ++corner) {
   const float x = (corner & 1) != 0 ? box[2] : box[0];
   const float y = (corner & 2) != 0 ? box[3] : box[1];
-  const float transformed_x = transform[0] * x + transform[1] * y + transform[2];
-  const float transformed_y = transform[3] * x + transform[4] * y + transform[5];
+  const auto [transformed_x, transformed_y] = mmltk::backend::imaging::sampling::affine_point(transform.data(), x, y);
   minimum_x = std::min(minimum_x, transformed_x);
   minimum_y = std::min(minimum_y, transformed_y);
   maximum_x = std::max(maximum_x, transformed_x);

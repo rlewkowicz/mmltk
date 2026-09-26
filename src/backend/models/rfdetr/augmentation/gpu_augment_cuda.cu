@@ -10,6 +10,7 @@
 namespace mmltk::backend::models::rfdetr {
 using mmltk::frameworks::gpu::ensure_cuda_ok;
 namespace {
+namespace sampling = mmltk::backend::imaging::sampling;
 constexpr int kThreads = 256;
 using augment_math::clamp01;
 using augment_math::uniform01;
@@ -186,12 +187,7 @@ __global__ void pointwise_images_kernel(const float* input, float* output, const
    }
   }
  }
- std::uint64_t key = 0U;
- if constexpr (ExplicitKeys) {
-  key = image_keys[image];
- } else {
-  key = training_augmentation_image_key(seed, epoch, rank, sequence, image);
- }
+ const std::uint64_t key = ExplicitKeys ? image_keys[image] : training_augmentation_image_key(seed, epoch, rank, sequence, image);
 #pragma unroll
  for (int lane = 0; lane < 4; ++lane) {
   const int x = output_x + lane;
@@ -268,11 +264,10 @@ __global__ void remap_images_kernel(const float* input, float* output, const flo
  const std::int64_t pixel_index = index - image * pixels_per_image;
  const int output_y = static_cast<int>(pixel_index / width);
  const int output_x = static_cast<int>(pixel_index - static_cast<std::int64_t>(output_y) * width);
- const float normalized_x = (static_cast<float>(output_x) + 0.5F) / static_cast<float>(width);
- const float normalized_y = (static_cast<float>(output_y) + 0.5F) / static_cast<float>(height);
+ const float normalized_x = sampling::normalized_pixel_center(output_x, width);
+ const float normalized_y = sampling::normalized_pixel_center(output_y, height);
  const float* values = parameters + image * kGpuAugmentationParameterCount;
- const float source_x = values[kInverse00] * normalized_x + values[kInverse01] * normalized_y + values[kInverse02];
- const float source_y = values[kInverse10] * normalized_x + values[kInverse11] * normalized_y + values[kInverse12];
+ const auto [source_x, source_y] = sampling::affine_point(values + kInverse00, normalized_x, normalized_y);
  const float blur_strength = values[kBlurStrength];
  float channels[3];
 #pragma unroll
@@ -285,8 +280,7 @@ __global__ void remap_images_kernel(const float* input, float* output, const flo
   const float* paste = copy_paste_parameters + image * kGpuCopyPasteParameterCount;
   const int donor_slot = static_cast<int>(paste[kPasteDonorSlot]);
   if (donor_slot >= 0) {
-   const float donor_x = paste[kPasteInverse00] * normalized_x + paste[kPasteInverse01] * normalized_y + paste[kPasteInverse02];
-   const float donor_y = paste[kPasteInverse10] * normalized_x + paste[kPasteInverse11] * normalized_y + paste[kPasteInverse12];
+   const auto [donor_x, donor_y] = sampling::affine_point(paste + kPasteInverse00, normalized_x, normalized_y);
    const int mode = static_cast<int>(paste[kPasteMode]);
    bool paste_pixel = false;
    if (mode == 1) {
@@ -305,12 +299,7 @@ __global__ void remap_images_kernel(const float* input, float* output, const flo
    }
   }
  }
- std::uint64_t key = 0U;
- if constexpr (ExplicitKeys) {
-  key = image_keys[image];
- } else {
-  key = training_augmentation_image_key(seed, epoch, rank, sequence, image);
- }
+ const std::uint64_t key = ExplicitKeys ? image_keys[image] : training_augmentation_image_key(seed, epoch, rank, sequence, image);
  apply_effects(channels[0], channels[1], channels[2], values, key, pixel_index, output_x, output_y, width, height, output_domain);
 #pragma unroll
  for (int channel = 0; channel < 3; ++channel) { output[(image * 3 + channel) * pixels_per_image + pixel_index] = channels[channel]; }

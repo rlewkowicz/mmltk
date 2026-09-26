@@ -37,6 +37,7 @@ __device__ int shifted_pixel(int y, int x, int height, int width, const float* s
  return min(height - 1, max(0, y + static_cast<int>(shifts[channel]))) * width + min(width - 1, max(0, x + static_cast<int>(shifts[kChannels + channel])));
 }
 struct RotatedThread final {
+ int index = 0;
  int plane = 0;
  int batch = 0;
  int channel = 0;
@@ -45,7 +46,9 @@ struct RotatedThread final {
  int y = 0;
  int x = 0;
 };
-__device__ bool locate_rotated_thread(const int index, const int height, const int width, RotatedThread& thread) {
+__device__ bool locate_rotated_thread(const int height, const int width, RotatedThread& thread) {
+ const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+ thread.index = index;
  thread.plane = height * width;
  if (index >= kRotatedBatch * kChannels * thread.plane) return false;
  thread.batch = index / (kChannels * thread.plane);
@@ -57,16 +60,14 @@ __device__ bool locate_rotated_thread(const int index, const int height, const i
  return true;
 }
 __global__ void record_shifted_decisions(const std::int8_t* source, const float* shifts, std::int8_t* target, int height, int width) {
- const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
  RotatedThread thread;
- if (!locate_rotated_thread(index, height, width, thread)) return;
+ if (!locate_rotated_thread(height, width, thread)) return;
  const int pixel = shifted_pixel(thread.y, thread.x, thread.height, thread.width, shifts, thread.channel);
- target[index] = source[(thread.batch * kChannels + thread.channel) * thread.plane + pixel];
+ target[thread.index] = source[(thread.batch * kChannels + thread.channel) * thread.plane + pixel];
 }
 __global__ void initial_depthwise(const float* input, const float* tables, std::int8_t* target, int height, int width) {
- const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
  RotatedThread thread;
- if (!locate_rotated_thread(index, height, width, thread)) return;
+ if (!locate_rotated_thread(height, width, thread)) return;
  const int rotation = thread.batch / kRgbChannels;
  float msb = 0;
  float lsb = 0;
@@ -80,12 +81,11 @@ __global__ void initial_depthwise(const float* input, const float* tables, std::
  const auto residual = centered(input, thread.batch % kRgbChannels, thread.y, thread.x, height, width, rotation);
  const float high_result = rounded_average(msb, 1.0F / 9.0F) + high(residual);
  const float low_result = fminf(3.0F, fmaxf(0.0F, rounded_average(lsb, 1.0F / 9.0F) + low(residual)));
- target[index] = static_cast<std::int8_t>(clamp_high(high_result + low_result));
+ target[thread.index] = static_cast<std::int8_t>(clamp_high(high_result + low_result));
 }
 __global__ void depthwise(const std::int8_t* source, const float* table, std::int8_t* target, int height, int width) {
- const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
  RotatedThread thread;
- if (!locate_rotated_thread(index, height, width, thread)) return;
+ if (!locate_rotated_thread(height, width, thread)) return;
  const auto image_offset = (static_cast<std::size_t>(thread.batch) * static_cast<std::size_t>(kChannels) + static_cast<std::size_t>(thread.channel)) * static_cast<std::size_t>(thread.plane);
  const auto* image = source + image_offset;
  float sum = 0;
@@ -94,12 +94,11 @@ __global__ void depthwise(const std::int8_t* source, const float* table, std::in
   const int sx = min(thread.width - 1, max(0, thread.x + tap % 3 - 1));
   sum = __fadd_rn(sum, lookup<TableFamily::Depthwise>(table, thread.channel, tap, static_cast<int>(image[sy * thread.width + sx]) + 32));
  }
- target[index] = static_cast<std::int8_t>(clamp_high(rounded_average(sum, 1.0F / 9.0F) + static_cast<float>(source[index])));
+ target[thread.index] = static_cast<std::int8_t>(clamp_high(rounded_average(sum, 1.0F / 9.0F) + static_cast<float>(source[thread.index])));
 }
 __global__ void shifted_pointwise(const std::int8_t* source, const float* table, const float* shifts, std::int8_t* target, int height, int width) {
- const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
  RotatedThread thread;
- if (!locate_rotated_thread(index, height, width, thread)) return;
+ if (!locate_rotated_thread(height, width, thread)) return;
  float sum = 0;
  float residual = 0;
  for (int in = 0; in < kChannels; ++in) {
@@ -108,7 +107,7 @@ __global__ void shifted_pointwise(const std::int8_t* source, const float* table,
   if (in == thread.channel) residual = value;
   sum = __fadd_rn(sum, lookup<TableFamily::Pointwise>(table, thread.channel, in, static_cast<int>(value) + 32));
  }
- target[index] = static_cast<std::int8_t>(clamp_high(rounded_average(sum, 1.0F / 16.0F) + residual));
+ target[thread.index] = static_cast<std::int8_t>(clamp_high(rounded_average(sum, 1.0F / 16.0F) + residual));
 }
 __global__ void restore(const std::int8_t* source, const float* table, float* output, int height, int width) {
  const int plane = height * width;

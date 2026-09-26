@@ -3,8 +3,6 @@
 // This is candidate triage, not a C++ parser or a proof of semantic equivalence.
 import { readFileSync } from "node:fs";
 
-export const MAX_CPD_FILTER_TOKENS = 99;
-
 const TOKEN =
   /\s+|\/\/[^\n]*|\/\*[\s\S]*?(?:\*\/|$)|(?:u8|[uUL])?R"([^ ()\\\t\r\n]{0,16})\([\s\S]*?\)\1"|(?:u8|[uUL])?"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|[0-9](?:[a-zA-Z0-9_.']|[eEpP][+-])*|[a-zA-Z_$][\w$]*|::|->|==|!=|<=|>=|&&|\|\||\+\+|--|<<|>>|[^\s]/gy;
 const IDENTIFIER = /^[a-zA-Z_$][\w$]*$/u;
@@ -125,6 +123,13 @@ function parameterDeclarations(tokens, pairs, start, end) {
     start = index + 1;
   }
   return result;
+}
+
+function parameterName(declaration) {
+  const name = declaration.at(-1)?.text;
+  return IDENTIFIER.test(name ?? "") && declaration.at(-2)?.text !== "::" &&
+    declaration.filter((token) => IDENTIFIER.test(token.text) && token.text !== "const").length >= 2
+    ? name : null;
 }
 
 function algorithmReceivers(tokens) {
@@ -277,6 +282,8 @@ export class SourceIndex {
           this.functions.push({
             name, start: boundary, open: index, end, firstStatementEnd,
             parameters, locals: new Set(),
+            parameterTypes: JSON.stringify(parameters.map((declaration) =>
+              (parameterName(declaration) === null ? declaration : declaration.slice(0, -1)).map((token) => token.text))),
             guardEnd: guard ? firstStatementEnd : null,
             prefix: !setup || firstParameter === "" || firstParameter === "void" ? null : JSON.stringify([
               name,
@@ -292,11 +299,8 @@ export class SourceIndex {
   indexLocals() {
     for (const fn of this.functions) {
       for (const declaration of fn.parameters) {
-        const name = declaration.at(-1)?.text;
-        if (IDENTIFIER.test(name ?? "") && declaration.at(-2)?.text !== "::" &&
-            declaration.filter((token) => IDENTIFIER.test(token.text) && token.text !== "const").length >= 2) {
-          fn.locals.add(name);
-        }
+        const name = parameterName(declaration);
+        if (name !== null) fn.locals.add(name);
       }
     }
     for (let index = 1; index + 1 < this.tokens.length; ++index) {
@@ -358,6 +362,18 @@ export class SourceIndex {
     };
   }
 
+  isBinding(start, end, fn) {
+    const tokens = this.tokens.slice(start, end).map((token) => token.text);
+    if (tokens.at(-1) !== ";") return false;
+    const equal = tokens.indexOf("=");
+    const nameIndex = equal < 0 ? tokens.length - 2 : equal - 1;
+    if (nameIndex < 1 || !fn.locals.has(tokens[nameIndex]) || NON_TYPES.has(tokens[0]) ||
+        tokens.slice(0, nameIndex).some((token) => [".", "->", "[", "{", "}"].includes(token))) return false;
+    if (equal < 0) return true;
+    const rhs = tokens.slice(equal + 1, -1);
+    return rhs.length === 1 || /^[\w$]+(?:(?:\.|->|::)[\w$]+)+$/u.test(rhs.join(""));
+  }
+
   describe(occurrence) {
     const [rawStart, rawEnd] = this.range(occurrence);
     const start = this.statementStarts[rawStart] ?? rawStart;
@@ -400,6 +416,7 @@ export class SourceIndex {
               fn.firstStatementEnd + 1 < fn.end) {
             prefixes.push({
               key: fn.prefix, start: fn.start, end: fn.end,
+              parameterTypes: fn.parameterTypes,
               occurrence: this.occurrence(occurrence.path, fn.start, fn.firstStatementEnd + 1),
             });
           }
@@ -418,7 +435,10 @@ export class SourceIndex {
         }
         if (text === ";" && this.statementEnds[index] === index + 1 &&
             (fn.guardEnd === null || index > fn.guardEnd)) {
-          const count = (statementsByFunction.get(owner) ?? 0) + 1;
+          const first = this.statementStarts[index];
+          const transfer = index === first + 1 && ["return", "break", "continue"].includes(this.tokens[first].text);
+          const binding = this.isBinding(first, index + 1, fn);
+          const count = (statementsByFunction.get(owner) ?? 0) + (transfer || binding ? 0 : 1);
           statementsByFunction.set(owner, count);
           maxStatements = Math.max(maxStatements, count);
         }
@@ -493,12 +513,9 @@ function groupOccurrences(entries, keyFor, identityFor) {
 
 export function filterCpdCandidates(candidates, {
   sourceReader = (path) => readFileSync(path, "utf8"),
+  consolidate = true,
 } = {}) {
-  const duplications = [];
-  const unfiltered = [];
-  for (const candidate of candidates) {
-    (candidate.tokenCount > MAX_CPD_FILTER_TOKENS ? unfiltered : duplications).push(candidate);
-  }
+  const duplications = candidates;
   const byPath = new Map();
   const described = duplications.map((duplication) => duplication.occurrences.map((occurrence) => {
     const entry = { occurrence };
@@ -538,12 +555,12 @@ export function filterCpdCandidates(candidates, {
       for (const prefix of entry.description.prefixes) {
         const group = prefixes.get(prefix.key) ?? new Map();
         group.set(JSON.stringify([entry.occurrence.path, prefix.start, prefix.end]),
-          { ...entry, original: entry, occurrence: prefix.occurrence });
+          { ...entry, original: entry, occurrence: prefix.occurrence, parameterTypes: prefix.parameterTypes });
         prefixes.set(prefix.key, group);
       }
     }
     for (const [key, group] of prefixes) {
-      if (group.size < 2) continue;
+      if (group.size < 2 || new Set([...group.values()].map((entry) => entry.parameterTypes)).size < 2) continue;
       keep([...group.values()], "same function, first parameter and opening statement",
         [...group.keys()], `prefix:${key}`);
     }
@@ -574,6 +591,7 @@ export function filterCpdCandidates(candidates, {
       filtered.push({ ...duplication, reason });
     }
   }
+  if (!consolidate) return { duplications: retained, filtered, reasons, indexedFiles: byPath.size };
   const targets = new Map();
   for (const { targetIdentities, patternKey: key, ...duplication } of retained) {
     const occurrences = new Map(targetIdentities.map((identity, index) => [identity, duplication.occurrences[index]]));
@@ -593,7 +611,6 @@ export function filterCpdCandidates(candidates, {
   }
   return {
     duplications: [
-      ...unfiltered,
       ...[...targets.values()].map(({ duplication, occurrences }) =>
         ({ ...duplication, occurrences: [...occurrences.values()] })),
     ],

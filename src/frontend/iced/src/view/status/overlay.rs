@@ -748,6 +748,7 @@ impl Widget<Message, Theme, iced::Renderer> for DetailText<'_> {
         self.content
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
+        // CLEANUP-IGNORE: Iced's child operation forwarding overlaps the layout terminator and update signature; these widgets own different interaction behavior.
     }
     fn operate(
         &mut self,

@@ -8,6 +8,10 @@
 #include <cstddef>
 #include <cstdint>
 namespace mmltk::backend::imaging::sampling {
+[[nodiscard]] __host__ __device__ inline float2 affine_point(const float* transform, float x, float y) noexcept {
+ return {transform[0] * x + transform[1] * y + transform[2], transform[3] * x + transform[4] * y + transform[5]};
+}
+[[nodiscard]] __host__ __device__ inline float normalized_pixel_center(std::int64_t pixel, std::int64_t extent) noexcept { return (static_cast<float>(pixel) + 0.5F) / static_cast<float>(extent); }
 // Normalized closed conservative bounds; all-zero denotes empty support.
 using SupportBounds = std::array<float, 4>;
 template <typename Run>

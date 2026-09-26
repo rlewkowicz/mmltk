@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <cstddef>
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
@@ -53,6 +54,11 @@ __device__ bool pixel_xy_in_bounds(const Surface& surface, int& x, int& y) {
  x = global_thread_x();
  y = global_thread_y();
  return x < surface.width && y < surface.height;
+}
+__device__ bool clipped_pixel_xy_in_bounds(const draw_launch::MutableSurfaceU8& surface, const draw_launch::IntRect& clip, int& x, int& y) {
+ x = clip.x1 + global_thread_x();
+ y = clip.y1 + global_thread_y();
+ return x < clip.x2 && y < clip.y2 && x < surface.width && y < surface.height;
 }
 __device__ bool load_visible_rgba_overlay(const draw_launch::ConstSurfaceU8& overlay, const int x, const int y, raster_math::RgbaPixelU8& pixel) {
  pixel = raster_math::load_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y);
@@ -204,9 +210,14 @@ __device__ void apply_launch_boxes_and_labels(const int x, const int y, const La
  const auto& instances = launch.instances;
  apply_boxes_and_labels(x, y, instances.boxes, instances.colors, instances.labels, resolved_instance_count(instances), launch.box_thickness, pixel);
 }
-template <typename OverlayT, typename ColorT>
-__device__ bool store_segment_hit_rgba_pixel(
- const OverlayT& overlay, const int x, const int y, const float px, const float py, const float ax, const float ay, const float bx, const float by, const float max_distance_sq, const ColorT& color) {
+__device__ bool store_segment_hit_rgba_pixel(const draw_launch::MutableSurfaceU8& overlay, const int x, const int y, const float px, const float py, const int* points_xy, const int first,
+ const int second, const float max_distance_sq, const draw_launch::RgbColorU8& color) {
+ const auto first_offset = static_cast<std::ptrdiff_t>(first) * 2;
+ const auto second_offset = static_cast<std::ptrdiff_t>(second) * 2;
+ const auto ax = static_cast<float>(points_xy[first_offset]);
+ const auto ay = static_cast<float>(points_xy[first_offset + 1]);
+ const auto bx = static_cast<float>(points_xy[second_offset]);
+ const auto by = static_cast<float>(points_xy[second_offset + 1]);
  if (raster_math::point_to_segment_distance_sq(px, py, ax, ay, bx, by) > max_distance_sq) { return false; }
  raster_math::store_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y, raster_math::RgbaPixelU8{color.r, color.g, color.b, 255U});
  return true;
@@ -421,18 +432,18 @@ __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::Man
 __global__ void draw_box_outline_rgba_pitched_kernel(const draw_launch::BoxOutlineRgbaPitchedLaunch launch) {
  const auto& overlay = launch.overlay;
  const auto& box = launch.box;
- const int x = launch.clip.x1 + global_thread_x();
- const int y = launch.clip.y1 + global_thread_y();
- if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height) { return; }
+ int x = 0;
+ int y = 0;
+ if (!clipped_pixel_xy_in_bounds(overlay, launch.clip, x, y)) { return; }
  if (!pixel_hits_box_edge(x, y, box.x1, box.y1, box.x2 - 1, box.y2 - 1, launch.thickness)) { return; }
  raster_math::store_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y, raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, 255U});
 }
 __global__ void draw_selection_handles_rgba_pitched_kernel(const draw_launch::SelectionHandlesRgbaPitchedLaunch launch) {
  const auto& overlay = launch.overlay;
  const auto& box = launch.box;
- const int x = launch.clip.x1 + global_thread_x();
- const int y = launch.clip.y1 + global_thread_y();
- if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height) { return; }
+ int x = 0;
+ int y = 0;
+ if (!clipped_pixel_xy_in_bounds(overlay, launch.clip, x, y)) { return; }
  const int corners_x[4] = {box.x1, box.x2 - 1, box.x1, box.x2 - 1};
  const int corners_y[4] = {box.y1, box.y1, box.y2 - 1, box.y2 - 1};
  for (int i = 0; i < 4; ++i) {
@@ -444,29 +455,23 @@ __global__ void draw_selection_handles_rgba_pitched_kernel(const draw_launch::Se
 __global__ void draw_polyline_rgba_pitched_kernel(const draw_launch::PolylineRgbaPitchedLaunch launch) {
  const auto& overlay = launch.overlay;
  const auto& points = launch.points;
- const int x = launch.clip.x1 + global_thread_x();
- const int y = launch.clip.y1 + global_thread_y();
- if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count < 2) { return; }
+ int x = 0;
+ int y = 0;
+ if (!clipped_pixel_xy_in_bounds(overlay, launch.clip, x, y) || points.points_xy == nullptr || points.point_count < 2) { return; }
  const int segment_count = launch.closed ? points.point_count : points.point_count - 1;
  const float px = static_cast<float>(x) + 0.5f;
  const float py = static_cast<float>(y) + 0.5f;
  const float max_distance_sq = fmaxf(1.0f, static_cast<float>(launch.thickness * launch.thickness));
  for (int segment_index = 0; segment_index < segment_count; ++segment_index) {
-  const int start_index = segment_index * 2;
-  const int end_point_index = ((segment_index + 1) % points.point_count) * 2;
-  const auto ax = static_cast<float>(points.points_xy[start_index + 0]);
-  const auto ay = static_cast<float>(points.points_xy[start_index + 1]);
-  const auto bx = static_cast<float>(points.points_xy[end_point_index + 0]);
-  const auto by = static_cast<float>(points.points_xy[end_point_index + 1]);
-  if (store_segment_hit_rgba_pixel(overlay, x, y, px, py, ax, ay, bx, by, max_distance_sq, launch.color)) { return; }
+  if (store_segment_hit_rgba_pixel(overlay, x, y, px, py, points.points_xy, segment_index, (segment_index + 1) % points.point_count, max_distance_sq, launch.color)) { return; }
  }
 }
 __global__ void draw_points_rgba_pitched_kernel(const draw_launch::PointsRgbaPitchedLaunch launch) {
  const auto& overlay = launch.overlay;
  const auto& points = launch.points;
- const int x = launch.clip.x1 + global_thread_x();
- const int y = launch.clip.y1 + global_thread_y();
- if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count <= 0) { return; }
+ int x = 0;
+ int y = 0;
+ if (!clipped_pixel_xy_in_bounds(overlay, launch.clip, x, y) || points.points_xy == nullptr || points.point_count <= 0) { return; }
  const float px = static_cast<float>(x) + 0.5f;
  const float py = static_cast<float>(y) + 0.5f;
  const auto max_distance_sq = static_cast<float>(launch.radius * launch.radius);
@@ -483,12 +488,9 @@ __global__ void draw_skeleton_rgba_pitched_kernel(const draw_launch::SkeletonRgb
  const auto& overlay = launch.overlay;
  const auto& points = launch.points;
  const auto& edges = launch.edges;
- const int x = launch.clip.x1 + global_thread_x();
- const int y = launch.clip.y1 + global_thread_y();
- if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || edges.edge_indices == nullptr || points.point_count <= 0 ||
-     edges.edge_count <= 0) {
-  return;
- }
+ int x = 0;
+ int y = 0;
+ if (!clipped_pixel_xy_in_bounds(overlay, launch.clip, x, y) || points.points_xy == nullptr || edges.edge_indices == nullptr || points.point_count <= 0 || edges.edge_count <= 0) { return; }
  const float px = static_cast<float>(x) + 0.5f;
  const float py = static_cast<float>(y) + 0.5f;
  const float max_distance_sq = fmaxf(1.0f, static_cast<float>(launch.thickness * launch.thickness));
@@ -497,13 +499,7 @@ __global__ void draw_skeleton_rgba_pitched_kernel(const draw_launch::SkeletonRgb
   const std::uint32_t source_index = edges.edge_indices[pair_index + 0];
   const std::uint32_t target_index = edges.edge_indices[pair_index + 1];
   if (source_index >= static_cast<std::uint32_t>(points.point_count) || target_index >= static_cast<std::uint32_t>(points.point_count)) { continue; }
-  const int source_xy_index = static_cast<int>(source_index) * 2;
-  const int target_xy_index = static_cast<int>(target_index) * 2;
-  const auto ax = static_cast<float>(points.points_xy[source_xy_index + 0]);
-  const auto ay = static_cast<float>(points.points_xy[source_xy_index + 1]);
-  const auto bx = static_cast<float>(points.points_xy[target_xy_index + 0]);
-  const auto by = static_cast<float>(points.points_xy[target_xy_index + 1]);
-  if (store_segment_hit_rgba_pixel(overlay, x, y, px, py, ax, ay, bx, by, max_distance_sq, launch.color)) { return; }
+  if (store_segment_hit_rgba_pixel(overlay, x, y, px, py, points.points_xy, static_cast<int>(source_index), static_cast<int>(target_index), max_distance_sq, launch.color)) { return; }
  }
 }
 #define MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(name, launch_type) cudaError_t name(const launch_type& launch) noexcept

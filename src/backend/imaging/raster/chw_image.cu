@@ -12,6 +12,7 @@ __global__ void convert_chw(const float* source, std::uint32_t width, std::uint3
  for (unsigned channel = 0U; channel < 3U; ++channel) pixel[channel] = static_cast<std::uint8_t>(__float2uint_rn(fminf(1.0F, fmaxf(0.0F, source[channel * plane + offset])) * 255.0F));
  pixel[3] = 255U;
 }
+// CLEANUP-IGNORE: These distinct format-conversion kernels retain ordinary thread admission; a shared pixel-address helper adds more code than its two callers remove.
 __global__ void convert_rgb8(const std::uint8_t* source, std::uint32_t width, std::uint32_t height, std::uint8_t* destination, std::size_t pitch) {
  const auto x = blockIdx.x * blockDim.x + threadIdx.x;
  const auto y = blockIdx.y * blockDim.y + threadIdx.y;

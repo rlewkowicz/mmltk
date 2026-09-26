@@ -13,6 +13,7 @@ import {
   compactDuploHits,
   compareHits,
   detectorArguments,
+  filterDuploCandidates,
   generateRawCpd,
   parseArgs,
   parseCpdXml,
@@ -374,11 +375,11 @@ test("cleanup contains only targets while rejected output retains diagnostics by
   assert.ok(!first.includes("suppressed_duplo_occurrences"));
 });
 
-function classifySources(sources, ranges = {}) {
+function classifySources(sources, ranges = {}, tokenCount = 39) {
   const entries = Object.entries(sources);
   const reads = new Map();
   const result = filterCpdCandidates([{
-    lineCount: 5, tokenCount: 39,
+    lineCount: 5, tokenCount,
     occurrences: entries.map(([path, source]) => ({
       path, start: 1, end: source.split("\n").length, ...ranges[path],
     })),
@@ -392,29 +393,20 @@ function classifySources(sources, ranges = {}) {
   return result;
 }
 
-test("100-token and larger matches bypass context filtering and source indexing", () => {
-  const candidate = {
-    lineCount: 10, tokenCount: 100,
-    occurrences: [{ path: "a.h", start: 1, end: 10 }, { path: "b.h", start: 1, end: 10 }],
-  };
-  for (const tokenCount of [100, 101, 640]) {
-    const large = { ...candidate, tokenCount };
-    const result = filterCpdCandidates([large], {
-      sourceReader() { assert.fail("large matches must bypass the source-context index"); },
-    });
-    assert.deepEqual(result.duplications, [large]);
-    assert.equal(result.indexedFiles, 0);
-    assert.deepEqual(result.filtered, []);
+test("context filtering checks every match size and retains repeated implementations", () => {
+  for (const tokenCount of [39, 99, 100, 101, 640]) {
+    const unrelated = classifySources({
+      "a.h": "struct A { int width; int height; };",
+      "b.h": "struct B { bool active; bool pending; };",
+    }, {}, tokenCount);
+    assert.deepEqual(unrelated.duplications, []);
+    assert.equal(unrelated.filtered.length, 1);
+    assert.equal(unrelated.indexedFiles, 2);
+    assert.equal(classifySources({
+      "a.cpp": "void A() { auto item = acquire(); inspect(item); publish(item); }",
+      "b.cpp": "void B() { auto value = acquire(); inspect(value); publish(value); }",
+    }, {}, tokenCount).duplications.length, 1);
   }
-  const short = { ...candidate, lineCount: 1, tokenCount: 99, occurrences: candidate.occurrences.map((occurrence) => ({ ...occurrence, end: 1 })) };
-  const result = filterCpdCandidates([short], {
-    sourceReader: (path) => path === "a.h"
-      ? "struct A { int width; int height; };"
-      : "struct B { bool active; bool pending; };",
-  });
-  assert.deepEqual(result.duplications, []);
-  assert.equal(result.filtered.length, 1);
-  assert.equal(result.indexedFiles, 2);
 });
 
 test("CPD retains overloaded conversion setup despite distinct enum types and fallbacks", () => {
@@ -439,6 +431,116 @@ test("overload identity includes the complete templated first parameter", () => 
     "a.cpp": "void read(const std::map<int, First>& input, Kind& value) { int index = static_cast<int>(value); first(input, index); }",
     "b.cpp": "void read(const std::map<int, Second>& input, Order& value) { int index = static_cast<int>(value); second(input, index); }",
   }).duplications.length, 0);
+});
+
+test("equal signatures in separate implementations do not manufacture an overload family", () => {
+  assert.equal(classifySources({
+    "a.cpp": "void read(const Input& input, Value& value) { auto index = select(input); first(index, value); }",
+    "b.cpp": "void read(const Input& input, Value& value) { auto index = select(input); second(index, value); }",
+  }).duplications.length, 0);
+});
+
+test("aliases and bare control transfers do not turn one call into a shared algorithm", () => {
+  for (const body of [
+    "const int threads = launch::kThreads; const int blocks = blocks_for(count, threads);",
+    "PixelThread pixel; if (!locate_pixel(width, height, pixel)) return;",
+    "store(pixel, color); return;",
+    "continue; } store(pixel, color);",
+  ]) {
+    const nested = body.startsWith("continue") ? "for (;;) { if (skip) { " : "";
+    const closing = nested ? " }" : "";
+    const sources = Object.fromEntries(["a", "b"].map((name) => [
+      `${name}.cpp`, `void ${name}() { ${nested}${body}${closing} }`,
+    ]));
+    const ranges = Object.fromEntries(Object.entries(sources).map(([path, source]) =>
+      [path, { column: source.indexOf(body) + 1 }]));
+    assert.equal(classifySources(sources, ranges).duplications.length, 0);
+  }
+  assert.equal(classifySources({
+    "a.cpp": "void A() { prepare(); store(pixel, color); return; }",
+    "b.cpp": "void B() { prepare(); store(pixel, color); return; }",
+  }).duplications.length, 1);
+});
+
+test("scalar calculations remain candidates despite different local roles", () => {
+  const ranges = { "a.cpp": { start: 2, end: 3 }, "b.cpp": { start: 2, end: 3 } };
+  assert.equal(classifySources({
+    "a.cpp": "void A() {\nconst float transformed_x = matrix[0] * x + matrix[1] * y;\nconst float transformed_y = matrix[2] * x + matrix[3] * y;\n}",
+    "b.cpp": "void B() {\nconst float sample_x = matrix[0] * x + matrix[1] * y;\nconst float sample_y = matrix[2] * x + matrix[3] * y;\n}",
+  }, ranges).duplications.length, 1);
+  for (const bodies of [
+    ["const int area = width * height;\nconst int bytes = area * 4;", "const int count = width * height;\nconst int size = count * 4;"],
+    ["auto first = acquire();\nauto second = acquire();", "auto left = acquire();\nauto right = acquire();"],
+  ]) assert.equal(classifySources({
+    "a.cpp": `void A() {\n${bodies[0]}\n}`,
+    "b.cpp": `void B() {\n${bodies[1]}\n}`,
+  }, ranges).duplications.length, 1);
+});
+
+test("repeated admission guards remain candidates despite different input roles", () => {
+  for (const braced of [false, true]) {
+    const failure = braced ? "{ return Invalid; }" : "return Invalid;";
+    const make = (name, input) => `void ${name}(void* ${input}, int pitch) {\nif (${input} == nullptr) ${failure}\nif (pitch < minimum) ${failure}\n}`;
+    assert.equal(classifySources({ "a.cpp": make("A", "scratch"), "b.cpp": make("B", "target") }).duplications.length, 1);
+    assert.equal(classifySources({ "a.cpp": make("A", "scratch"), "b.cpp": make("B", "scratch") }).duplications.length, 1);
+  }
+});
+
+test("CUDA setup remains visible alongside complete kernels and numerical work", () => {
+  const make = (name, operation) => `__global__ void ${name}(int* output, int count) {
+const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+if (index >= count) return;
+output[index] = ${operation}(index);
+}`;
+  const prefix = { "a.cu": { end: 3 }, "b.cu": { end: 3 } };
+  assert.equal(classifySources({ "a.cu": make("A", "first"), "b.cu": make("B", "second") }, prefix).duplications.length, 1);
+  assert.equal(classifySources({ "a.cu": make("A", "first"), "b.cu": make("B", "first") }).duplications.length, 1);
+  assert.equal(classifySources({
+    "a.cu": "__global__ void A() {\nconst int area = width * height;\nconst int bytes = area * 4;\nwrite(bytes);\n}",
+    "b.cu": "__global__ void B() {\nconst int area = width * height;\nconst int bytes = area * 4;\nwrite(bytes);\n}",
+  }, { "a.cu": { start: 2, end: 3 }, "b.cu": { start: 2, end: 3 } }).duplications.length, 1);
+  const projection = "__device__ int column() { return static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); }\n";
+  const projected = Object.fromEntries(["a", "b"].map((name) => [
+    `${name}.cu`, projection + make(name, name).replace("static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x)", "column()"),
+  ]));
+  assert.equal(classifySources(projected, { "a.cu": { start: 2, end: 4 }, "b.cu": { start: 2, end: 4 } }).duplications.length, 1);
+  const guarded = Object.fromEntries(["a", "b"].map((name) => [
+    `${name}.cu`, make(name, name).replace("index >= count", "!admit(index) || !advance(count)"),
+  ]));
+  assert.equal(classifySources(guarded, prefix).duplications.length, 1);
+  const numerical = Object.fromEntries(["a", "b"].map((name) => [
+    `${name}.cu`, make(name, name).replace("output[index] =", "const int value = input[index] * gain;\nconst int result = value * value;\noutput[index] ="),
+  ]));
+  assert.equal(classifySources(numerical, { "a.cu": { end: 5 }, "b.cu": { end: 5 } }).duplications.length, 1);
+  const admissions = Object.fromEntries(["a", "b"].map((name) => [
+    `${name}.cu`, make(name, name).replace("if (index >= count) return;", "if (!admit(index)) return;\nif (!advance(count)) return;"),
+  ]));
+  assert.equal(classifySources(admissions, { "a.cu": { end: 4 }, "b.cu": { end: 4 } }).duplications.length, 1);
+});
+
+test("Duplo compares complete initializer context and preserves real repeated operations", () => {
+  const hit = {
+    LineCount: 6, SourceFile1: "a.cpp", StartLineNumber1: 2, EndLineNumber1: 7,
+    SourceFile2: "b.cpp", StartLineNumber2: 2, EndLineNumber2: 7,
+  };
+  const initializer = (value) => `void publish_fact() {
+const Fact fact{
+.kind = Kind::Ready,
+.width = width,
+.height = height,
+.epoch = epoch,
+.generation = generation,
+.capacity = ${value},
+};
+publish(fact);
+}`;
+  const rejected = filterDuploCandidates(cpp, [hit], (path) => initializer(path === "a.cpp" ? "width" : "capacity"));
+  assert.deepEqual(rejected.hits, []);
+  assert.equal(rejected.filteredCount, 0);
+  assert.equal(rejected.contextRejected.length, 1);
+  assert.deepEqual(rejected.contextRejected[0].occurrences.map(({ start, end }) => [start, end]), [[2, 7], [2, 7]]);
+  const body = "void work() {\nauto item = acquire();\ninspect(item);\nprepare(item);\nwrite(item);\npublish(item);\nrelease(item);\n}";
+  assert.deepEqual(filterDuploCandidates(cpp, [hit], () => body).hits, [hit]);
 });
 
 test("CPD does not present ordinary declarations or concatenated getters as extraction work", () => {

@@ -6,22 +6,21 @@
 #include <limits>
 namespace mmltk::backend::models::rfdetr {
 namespace {
+namespace sampling = mmltk::backend::imaging::sampling;
 constexpr std::array<float, 6> identity{1, 0, 0, 0, 1, 0};
 AugmentationAnnotationSupport mask_extent(std::span<const mmltk::backend::data::RLEPair> runs, int width, int height) {
  AugmentationAnnotationSupport support;
- support.box_xyxy = mmltk::backend::imaging::sampling::rle_support_bounds(runs, width, height);
+ support.box_xyxy = sampling::rle_support_bounds(runs, width, height);
  support.present = !runs.empty();
  for (const auto& run : runs) support.area_pixels += static_cast<float>(run.length);
  return support;
 }
 bool contains(const std::array<float, 4>& box, std::span<const mmltk::backend::data::RLEPair> runs, const std::array<float, 6>& inverse, float x, float y, int width, int height) {
- // CLEANUP-IGNORE: Inverse support sampling and forward box-corner projection intentionally express opposite coordinate mappings.
- const float sx = inverse[0] * x + inverse[1] * y + inverse[2];
- const float sy = inverse[3] * x + inverse[4] * y + inverse[5];
+ const auto [sx, sy] = sampling::affine_point(inverse.data(), x, y);
  if (sx < 0 || sx > 1 || sy < 0 || sy > 1) return false;
  if (runs.empty()) return sx >= box[0] && sx <= box[2] && sy >= box[1] && sy <= box[3];
- const auto pixel = mmltk::backend::imaging::sampling::support_pixel_index(sy, height) * width + mmltk::backend::imaging::sampling::support_pixel_index(sx, width);
- return mmltk::backend::imaging::sampling::rle_support_contains(runs.data(), runs.size(), pixel);
+ const auto pixel = sampling::support_pixel_index(sy, height) * width + sampling::support_pixel_index(sx, width);
+ return sampling::rle_support_contains(runs.data(), runs.size(), pixel);
 }
 }  // namespace
 bool augmentation_changes_support(const AugmentationImagePlan* plan) noexcept {
@@ -84,7 +83,7 @@ AugmentationAnnotationSupport resolve_augmentation_annotation_support(
  const int y1 = std::clamp(static_cast<int>(std::ceil(candidate[3] * image_height)), 0, height);
  for (int y = y0; y < y1; ++y)
   for (int x = x0; x < x1; ++x) {
-   const float nx = (static_cast<float>(x) + 0.5F) / image_width, ny = (static_cast<float>(y) + 0.5F) / image_height;
+   const float nx = sampling::normalized_pixel_center(x, width), ny = sampling::normalized_pixel_center(y, height);
    if (augment_math::erases_pixel(plan->erasure, x, y, width, height) || !contains(source_box, source_mask, inverse, nx, ny, width, height) ||
        (has_paste && contains(plan->paste_source_box, donor_mask, plan->paste_inverse, nx, ny, width, height)))
     continue;

@@ -34,6 +34,7 @@ __device__ __forceinline__ std::uint32_t nearest_source_coordinate(const std::ui
  return min(crop_extent - 1U, static_cast<std::uint32_t>(centered / output_extent));
 }
 __device__ __forceinline__ std::uint8_t source_alpha_byte(const void* source, const std::size_t pitch, const Configuration config, const std::uint32_t x, const std::uint32_t y) {
+ // CLEANUP-IGNORE: Independent numerical oracle preserves alpha sampling coordinates; sharing production arithmetic would make the comparison circular.
  const std::uint32_t source_x = config.crop_x + nearest_source_coordinate(x, config.crop_width, config.output_width);
  const std::uint32_t source_y = config.crop_y + nearest_source_coordinate(y, config.crop_height, config.output_height);
  const auto* row = static_cast<const std::uint8_t*>(source) + static_cast<std::size_t>(source_y) * pitch;
@@ -72,6 +73,7 @@ __global__ void dual_direction_kernel(const void* source, const std::size_t sour
   horizontal.x = fmaf(horizontal_coefficient, __half2float(horizontal_sample.red), horizontal.x);
   horizontal.y = fmaf(horizontal_coefficient, __half2float(horizontal_sample.green), horizontal.y);
   horizontal.z = fmaf(horizontal_coefficient, __half2float(horizontal_sample.blue), horizontal.z);
+  // CLEANUP-IGNORE: Independent dual-direction oracle evaluates this complete FMA chain even when production selects only the horizontal chain.
   vertical.x = fmaf(vertical_coefficient, __half2float(vertical_sample.red), vertical.x);
   vertical.y = fmaf(vertical_coefficient, __half2float(vertical_sample.green), vertical.y);
   vertical.z = fmaf(vertical_coefficient, __half2float(vertical_sample.blue), vertical.z);

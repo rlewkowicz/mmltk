@@ -1,9 +1,11 @@
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
+#include "src/backend/imaging/sampling.h"
 #include "detail/training_mask_ops_cuda_launch.h"
 #include "src/backend/models/rfdetr/augmentation/spatial_erasure.h"
 namespace mmltk::backend::models::rfdetr {
 namespace {
+using mmltk::backend::imaging::sampling::affine_point;
 constexpr int kCudaThreads = 256;
 int ceil_div(int64_t value, int divisor) { return static_cast<int>((value + divisor - 1) / divisor); }
 __device__ float clamp_coord(float value, float limit) { return fminf(fmaxf(value, 0.0f), limit); }
@@ -93,8 +95,7 @@ __global__ void sample_transformed_packed_masks_kernel(const int64_t* packed_bit
   output[slot.index] = 0.0F;
   return;
  }
- const float coord_x = transform[0] * output_x + transform[1] * output_y + transform[2];
- const float coord_y = transform[3] * output_x + transform[4] * output_y + transform[5];
+ const auto [coord_x, coord_y] = affine_point(transform, output_x, output_y);
  if (coord_x < 0.0F || coord_x > 1.0F || coord_y < 0.0F || coord_y > 1.0F) {
   output[slot.index] = 0.0F;
   return;
@@ -113,8 +114,7 @@ __global__ void sample_transformed_packed_masks_kernel(const int64_t* packed_bit
   const int64_t occluder_index = occluder_mask_indices[mask_index];
   if (occluder_index >= 0) {
    const float* occluder_transform = occluder_inverse_transforms + mask_index * transform_stride;
-   const float occluder_x = occluder_transform[0] * output_x + occluder_transform[1] * output_y + occluder_transform[2];
-   const float occluder_y = occluder_transform[3] * output_x + occluder_transform[4] * output_y + occluder_transform[5];
+   const auto [occluder_x, occluder_y] = affine_point(occluder_transform, output_x, output_y);
    if (occluder_x >= 0.0F && occluder_x <= 1.0F && occluder_y >= 0.0F && occluder_y <= 1.0F) {
     const int64_t occluder_pixel = nearest_grid_sample_index(occluder_y, height) * width + nearest_grid_sample_index(occluder_x, width);
     const auto* occluder_words = reinterpret_cast<const unsigned long long*>(packed_bits + occluder_index * words_per_mask);

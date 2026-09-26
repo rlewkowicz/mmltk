@@ -16,7 +16,7 @@ import { availableParallelism, cpus, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { classifyDeclarations, inventoryMacroConflicts, sourceOccurrence, lineStarts } from "./cleanup/declaration_patterns.mjs";
-import { filterCpdCandidates, MAX_CPD_FILTER_TOKENS, sourceComments } from "./cleanup/cpd_patterns.mjs";
+import { filterCpdCandidates, sourceComments } from "./cleanup/cpd_patterns.mjs";
 import { buildReview, renderReviewMarkdown } from "./cleanup/review_patterns.mjs";
 
 const REPO_ROOT = process.cwd();
@@ -908,7 +908,17 @@ export function filterDuploCandidates(
         codeCount(occurrence) >= profile.duplo.minLines,
     ),
   );
-  return { hits, filteredCount: rawHits.length - hits.length };
+  const filteredCount = rawHits.length - hits.length;
+  if (profile.name !== "cpp") return { hits, filteredCount };
+  const contextual = filterCpdCandidates(hits.map((hit, sourceHitIndex) => ({
+    sourceHitIndex, lineCount: duploLineCount(hit),
+    occurrences: [duploOccurrence(hit, 1), duploOccurrence(hit, 2)],
+  })), { sourceReader, consolidate: false });
+  const retained = new Set(contextual.duplications.map((hit) => hit.sourceHitIndex));
+  return {
+    hits: hits.filter((_, index) => retained.has(index)), filteredCount,
+    contextRejected: contextual.filtered.map(({ sourceHitIndex, ...hit }) => hit),
+  };
 }
 
 function duploDuplicateKey(hit) {
@@ -1267,6 +1277,7 @@ export function buildReport({
       min_lines: profile.duplo.minLines,
       content_filter: profile.duplo.contentFilter,
       non_code_hits_filtered: codeOnlyDuplo.filteredCount,
+      context_filter_rejected: codeOnlyDuplo.contextRejected ?? [],
       threads,
       status: duplo.status,
       stderr: duplo.stderr,
@@ -1333,7 +1344,8 @@ export function rejectionReport(previous, report, filteredCpd) {
     [report.profile]: {
       ...diagnostics,
       cpd_candidate_filter: {
-        maximum_tokens: report.profile === "cpp" ? MAX_CPD_FILTER_TOKENS : null,
+        enabled: report.profile === "cpp",
+        maximum_tokens: null,
         indexed_files: filteredCpd.indexedFiles,
         rejected: filteredCpd.filtered.map((duplication) => ({
           reason: duplication.reason,
