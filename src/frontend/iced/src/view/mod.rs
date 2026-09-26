@@ -23,13 +23,16 @@ use crate::message::Message;
 use crate::view_model::ApplicationModel;
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::{container, opaque, responsive, scrollable, space, stack};
-use iced::{Color, Fill, Padding};
+use iced::{Color, Fill, Length, Padding};
 
 pub const HORIZONTAL_SCROLL_ID: &str = "application.horizontal.scroll";
 pub const PAGE_SCROLL_ID: &str = "application.page.scroll";
 pub const PAGE_MIN_WIDTH: f32 = 1020.0;
 pub const PAGE_MAX_WIDTH: f32 = 1500.0;
 pub const NAVIGATION_HEIGHT: f32 = 52.0;
+const HEADER_PADDING: f32 = 10.0;
+const HEADER_GROUP_SPACING: f32 = 8.0;
+const SETTINGS_SPACING: f32 = 16.0;
 const SCROLLBAR_WIDTH: f32 = 5.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -106,24 +109,52 @@ pub fn view<'a>(
             }
         })
         .into();
+        let typography = settings_component.state().typography(model.typography());
+        let connection_width = (size.width
+            - status::STATUS_WIDTH
+            - status::SETTINGS_WIDTH
+            - 2.0 * HEADER_PADDING
+            - HEADER_GROUP_SPACING
+            - SETTINGS_SPACING)
+            .max(0.0);
+        let connection = container(
+            shared::status_text(model.connection.label())
+                .size(typography.secondary)
+                .compact()
+                .style(crate::fluent_theme::text_secondary),
+        )
+        .width(Length::Shrink.max(connection_width))
+        .id("navigation.connection");
+        let navigation = responsive(move |available| {
+            iced::widget::row![
+                scrollable(router.navigation(typography).map(Message::Workspace))
+                    .direction(Direction::Horizontal(compact_scrollbar()))
+                    .width(Length::Shrink.max((available.width - status::STATUS_WIDTH).max(0.0))),
+                container(
+                    status_component
+                        .trigger(&model.notices)
+                        .map(Message::Status)
+                )
+                .center_x(Fill),
+            ]
+            .height(Fill)
+            .align_y(iced::Center)
+        });
         let header = container(
             iced::widget::row![
-                scrollable(
-                    router
-                        .navigation(
-                            model.connection.label(),
-                            settings_component.state().typography(model.typography())
-                        )
-                        .map(Message::Workspace)
-                )
-                .direction(Direction::Horizontal(compact_scrollbar()))
-                .width(Fill),
-                status_component.header(&model.notices).map(Message::Status),
+                navigation,
+                iced::widget::row![connection, status_component.settings().map(Message::Status)]
+                    .spacing(if connection_width > 0.0 {
+                        SETTINGS_SPACING
+                    } else {
+                        0.0
+                    })
+                    .align_y(iced::Center),
             ]
-            .spacing(0)
+            .spacing(HEADER_GROUP_SPACING)
             .align_y(iced::Center),
         )
-        .padding([9, 10])
+        .padding([0.0, HEADER_PADDING])
         .height(NAVIGATION_HEIGHT)
         .width(Fill)
         .style(crate::fluent_theme::container_header_shadow);
@@ -194,6 +225,74 @@ fn modal_backdrop(_theme: &Theme) -> iced::widget::container::Style {
 #[cfg(test)]
 mod tests {
     use crate::view_model::ApplicationModel;
+
+    #[test]
+    fn header_layout_preserves_button_height_and_status_connection_order() {
+        use iced::advanced::{Layout, layout, renderer::Headless, widget};
+        use iced::{Rectangle, Size};
+        use std::collections::HashMap;
+
+        #[derive(Default)]
+        struct Bounds(HashMap<widget::Id, Rectangle>);
+        impl widget::Operation for Bounds {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn widget::Operation)) {
+                operate(self);
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if let Some(id) = id {
+                    self.0.insert(id.clone(), bounds);
+                }
+            }
+        }
+
+        let renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            Default::default(),
+            Some("wgpu"),
+        ))
+        .expect("header layout requires the container renderer");
+        let model = crate::view_model::test_support::bootstrapped();
+        let router = super::router::Router::default();
+        let settings = super::settings::Component::default();
+        let status = super::status::Component::default();
+        let diagnostics = super::diagnostics::Component::default();
+        for width in [320.0, 360.0, 700.0, 1020.0, 1479.0, 2200.0] {
+            let mut view = super::view(&model, None, &diagnostics, &router, &settings, &status);
+            let mut tree = widget::Tree::new(&view);
+            tree.diff(&mut view);
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, 720.0)),
+            );
+            let mut bounds = Bounds::default();
+            view.as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            let control = |id| bounds.0[&widget::Id::from(id)];
+            let train = control("navigation.train");
+            assert!(train.height >= 28.0, "width {width}: {train:?}");
+            let status = control(super::status::TRIGGER_ID);
+            let settings = control("navigation.settings");
+            assert!(status.x >= 0.0 && status.x + status.width <= settings.x);
+            assert!(settings.x + settings.width <= width);
+            assert_eq!(status.height, super::status::CONTROL_HEIGHT);
+            assert_eq!(settings.height, status.height);
+            if width == 320.0 {
+                assert_eq!(control("navigation.connection").width, 0.0);
+                continue;
+            }
+            let connection = control("navigation.connection");
+            assert!(status.x + status.width <= connection.x);
+            assert!(connection.x + connection.width < settings.x);
+            if width >= super::PAGE_MIN_WIDTH {
+                let explore = control("navigation.explore");
+                let midpoint = (explore.x + explore.width + connection.x) * 0.5;
+                assert!(
+                    (status.center_x() - midpoint).abs() <= 10.0,
+                    "width {width}: Status {status:?}, Explore {explore:?}, Connected {connection:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn focused_routes_construct_at_narrow_and_wide_shell_widths() {

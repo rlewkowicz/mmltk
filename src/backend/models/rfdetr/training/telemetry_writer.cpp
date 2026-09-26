@@ -1,6 +1,7 @@
 #include "telemetry_writer.h"
 #include <cerrno>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <fstream>
 #include <format>
@@ -50,7 +51,43 @@ void write_file(const std::filesystem::path& path, const nlohmann::json& value) 
 void append_file(const std::filesystem::path& path, const nlohmann::json& value) {
  mmltk::common::io::throw_on_json_write_failure(mmltk::common::io::append_json_line(path, value), path, "training telemetry");
 }
+void report_persistence_failure() noexcept {
+ constexpr std::string_view notice = kTrainingPersistenceFailureLine;
+ std::size_t offset = 0;
+ while (offset < notice.size()) {
+  const auto written = ::write(STDERR_FILENO, notice.data() + offset, notice.size() - offset);
+  if (written < 0 && errno == EINTR) continue;
+  if (written <= 0) break;
+  offset += static_cast<std::size_t>(written);
+ }
+}
 }  // namespace
+TrainingPreparationWriter::TrainingPreparationWriter(const TrainRequest& request) {
+ if (request.distributed_worker && request.distributed_rank != 0) return;
+ path_ = request.output_dir / kTrainingPreparationFile;
+ try {
+  std::filesystem::create_directories(path_.parent_path());
+ } catch (...) {
+  path_.clear();
+  report_persistence_failure();
+  return;
+ }
+ Publish();
+}
+void TrainingPreparationWriter::Stage(TrainingPreparationStage stage) {
+ if (path_.empty()) return;
+ progress_ = {.stage = stage};
+ Publish();
+}
+void TrainingPreparationWriter::Publish() noexcept {
+ try {
+  std::array<std::byte, 1024> scratch{};
+  write_file(path_, serial::reflected_json(progress_, scratch, {.max_bytes = scratch.size(), .max_items = 16, .max_depth = 4}));
+ } catch (...) {
+  path_.clear();
+  report_persistence_failure();
+ }
+}
 struct TrainingTelemetryWriter::Impl final {
  explicit Impl(TrainingRun value) : run(std::move(value)) {
   run.attempt_id = identity();
@@ -132,15 +169,7 @@ struct TrainingTelemetryWriter::Impl final {
   }
   if (!reported_failure) {
    // Product status travels through the already-captured child output.
-   // Only this independent writer can wait for the pipe.
-   constexpr std::string_view notice = kTrainingPersistenceFailureLine;
-   std::size_t offset = 0;
-   while (offset < notice.size()) {
-    const auto written = ::write(STDERR_FILENO, notice.data() + offset, notice.size() - offset);
-    if (written < 0 && errno == EINTR) continue;
-    if (written <= 0) break;
-    offset += static_cast<std::size_t>(written);
-   }
+   report_persistence_failure();
    reported_failure = true;
   }
  }

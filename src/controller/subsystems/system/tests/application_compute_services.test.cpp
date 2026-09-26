@@ -843,6 +843,8 @@ TEST_CASE("Vast create accepts only complete provider result records", "[gui][se
  CHECK(operations.creates == malformed.size() + 3U);
 }
 TEST_CASE("artifact compile reports synchronously through the caller-owned observer", "[gui][services]") {
+ const std::uint32_t resolution = GENERATE(16U, 312U);
+ const std::string preset = resolution == 312U ? "rf-detr-seg-nano" : "rf-detr-nano";
  mmltk::testsupport::ScopedTempDir temporary("mmltk-artifact-progress");
  const mmltk::backend::data::testsupport::FixtureSpec fixture{.root_dir = temporary.path().string(), .split = "train", .width = 16, .height = 16, .num_images = 1};
  mmltk::backend::data::testsupport::create_synthetic_dataset(fixture);
@@ -858,7 +860,7 @@ TEST_CASE("artifact compile reports synchronously through the caller-owned obser
                                           ++value.count;
                                          }};
  const ArtifactCompileResult result = store.compile(
-  {.source = mmltk::backend::data::testsupport::dataset_dir(fixture), .output = temporary.path() / "compiled", .preset = "rf-detr-nano", .resolution = 16U}, cancellation.token, observer);
+  {.source = mmltk::backend::data::testsupport::dataset_dir(fixture), .output = temporary.path() / "compiled", .preset = preset, .resolution = resolution}, cancellation.token, observer);
  reports.accepting = false;
  CHECK(result.inspection.detail.empty());
  CHECK(std::filesystem::exists(result.output));
@@ -878,11 +880,23 @@ TEST_CASE("artifact compile reports synchronously through the caller-owned obser
  }
  std::array<std::filesystem::path, domain::kArtifactSplitCapacity> paths{};
  paths.front() = compiled;
- const domain::ArtifactInspection accepted = store.inspect(paths, "rf-detr-nano", 16U, cancellation.token);
+ const domain::ArtifactInspection accepted = store.inspect(paths, preset, resolution, cancellation.token);
  REQUIRE(accepted.compatible);
  REQUIRE(accepted.splits.size() == 1U);
  CHECK(accepted.splits.front().class_names.size() == header.num_classes);
  CHECK(accepted.splits.front().class_names.front().value.size() == header.class_names.front().size() - 1U);
+ CHECK(accepted.splits.front().width == resolution);
+ CHECK(accepted.splits.front().height == resolution);
+ CHECK(accepted.splits.front().channels == 3U);
+ const auto incompatible = store.inspect(paths, preset, resolution + 16U, cancellation.token);
+ CHECK_FALSE(incompatible.compatible);
+ CHECK(incompatible.splits.empty());
+ CHECK(incompatible.detail.find(std::to_string(resolution) + "x" + std::to_string(resolution)) != std::string::npos);
+ CHECK(incompatible.detail.find(std::to_string(resolution + 16U) + "x" + std::to_string(resolution + 16U)) != std::string::npos);
+ CHECK(incompatible.detail.find("3 channels") != std::string::npos);
+ CHECK(incompatible.detail.find(preset) != std::string::npos);
+ CHECK(incompatible.detail.find(compiled.string()) != std::string::npos);
+ CHECK(incompatible.detail.size() <= domain::kArtifactErrorCapacity);
  {
   std::fstream stream(compiled, std::ios::binary | std::ios::in | std::ios::out);
   REQUIRE(stream);
@@ -891,7 +905,7 @@ TEST_CASE("artifact compile reports synchronously through the caller-owned obser
   stream.write(reinterpret_cast<const char*>(&header), sizeof(header));
   REQUIRE(stream);
  }
- const domain::ArtifactInspection oversized_catalog = store.inspect(paths, "rf-detr-nano", 16U, cancellation.token);
+ const domain::ArtifactInspection oversized_catalog = store.inspect(paths, preset, resolution, cancellation.token);
  CHECK_FALSE(oversized_catalog.compatible);
  CHECK(oversized_catalog.splits.empty());
  CHECK_FALSE(oversized_catalog.detail.empty());
@@ -1029,6 +1043,31 @@ TEST_CASE("Train process client admits only bounded identified retained observat
   REQUIRE(ready(client.pid_fd()));
   CHECK_THROWS(client.consume_exit());
  }
+}
+TEST_CASE("Train preparation reaches the observer before metrics and ignores duplicate progress", "[gui][services][train]") {
+ mmltk::testsupport::ScopedTempDir temp("mmltk-train-preparation");
+ auto client = launch_train_ignoring_term(temp);
+ const auto path = temp.path() / "output" / "preparation.json";
+ const auto write = [&](const std::string_view content) {
+  { std::ofstream stream(path); stream << content; }
+  REQUIRE(ready(client.progress_fd()));
+ };
+ write(R"({"stage":"Dataset"})");
+ const auto progress = client.consume_progress();
+ REQUIRE(progress);
+ CHECK(progress->progress.status == "Preparing dataset and sampling plan");
+ CHECK(progress->progress.completed == 0);
+ CHECK(progress->progress.total == 0);
+ CHECK_FALSE(progress->metrics);
+ write(R"({"stage":"Dataset"})");
+ CHECK_FALSE(client.consume_progress());
+ write(R"({"stage":"Optimizers"})");
+ const auto ready_for_optimizer = client.consume_progress();
+ REQUIRE(ready_for_optimizer);
+ CHECK(ready_for_optimizer->progress.sequence > progress->progress.sequence);
+ CHECK(ready_for_optimizer->progress.status == "Preparing optimizers and validation");
+ write(R"({"stage":"Unknown"})");
+ CHECK_THROWS(client.consume_progress());
 }
 TEST_CASE("Train process client escalates a stopped process group", "[gui][services]") {
  mmltk::testsupport::ScopedTempDir temp("mmltk-train-service");

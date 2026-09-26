@@ -53,12 +53,31 @@ pub fn modal<'a, Message: 'a>(
     .into()
 }
 
-/// A section break owns its entire nine-pixel vertical extent.
-pub fn card_section_divider<'a, Message: 'a>() -> Element<'a, Message> {
+pub enum CardHeading {
+    H2,
+    H3,
+}
+
+pub fn card_section<'a, Message: 'a>(
+    title: &'a str,
+    heading: CardHeading,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let (size, spacing) = match heading {
+        CardHeading::H2 => (16, 2.0 * crate::fluent_theme::FIELD_SPACING),
+        CardHeading::H3 => (14, 1.5 * crate::fluent_theme::FIELD_SPACING),
+    };
+    column![text(title).size(size), content.into()]
+        .spacing(spacing)
+        .into()
+}
+
+/// A section break defaults to four pixels of vertical padding on each side.
+pub fn card_section_divider<'a, Message: 'a>()
+-> iced::widget::Container<'a, Message, crate::fluent_theme::Theme> {
     container(iced::widget::rule::horizontal(1).style(crate::fluent_theme::card_section_divider))
         .padding([4, 0])
         .width(Fill)
-        .into()
 }
 
 #[cfg(test)]

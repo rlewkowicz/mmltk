@@ -7,6 +7,7 @@
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/browser/application_event_publisher.h"
+#include "src/frameworks/serialization/cbor_wire.h"
 #include "src/controller/contracts/default_state.h"
 #include "src/controller/contracts/model_selection.h"
 #include "src/controller/services/file_dialog_system.h"
@@ -137,11 +138,16 @@ TEST_CASE("native training projects a child OOM into the GUI terminal and shared
  CHECK_FALSE(static_cast<bool>(std::getline(input, line)));
 }
 TEST_CASE("training operation reports preparation and native failures exactly once", "[controller][systems][training]") {
- const int failure_stage = GENERATE(0, 1, 2, 3);
+ const int failure_stage = GENERATE(0, 1, 2, 3, 4);
+ const bool tracing = GENERATE(false, true);
  const auto root = mmltk::testsupport::make_temp_root("training-failure-reporting");
  ApplicationDataFixture fixture{root};
  if (failure_stage != 0) fixture.PrepareModel();
  auto [settings, dataset, model] = fixture.systems();
+ DatasetSystem physical_dataset{settings, [] { return std::make_unique<ArtifactDatasetRuntime>(); }};
+ const auto diagnostic_path = root / "training.jsonl";
+ services::DiagnosticsClient diagnostics = tracing ? services::DiagnosticsClient{diagnostic_path} : services::DiagnosticsClient{};
+ services::RuntimeDiagnostics runtime_diagnostics{diagnostics.producer()};
  const auto executable = root / "failed-trainer.sh";
  if (failure_stage == 3) {
   std::ofstream script{executable};
@@ -152,7 +158,7 @@ TEST_CASE("training operation reports preparation and native failures exactly on
  std::atomic_size_t constructions = 0;
  std::promise<TrainingSnapshot> settled;
  mmltk::testsupport::console_output::ScopedStderrCapture capture;
- TrainingSystem training{settings, dataset, model, std::nullopt,
+ TrainingSystem training{settings, failure_stage == 4 ? physical_dataset : dataset, model, std::nullopt,
   [&]() -> std::unique_ptr<TrainingRuntime> {
    ++constructions;
    if (failure_stage == 1) throw std::runtime_error("training fixture construction failed");
@@ -160,17 +166,47 @@ TEST_CASE("training operation reports preparation and native failures exactly on
   },
   [&](TrainingSystem::event_type event) {
    if (auto* changed = std::get_if<TrainingChanged>(&event); changed && !changed->snapshot.local.active) settled.set_value(std::move(changed->snapshot));
-  }};
+  }, runtime_diagnostics.target()};
  static_cast<void>(training.Start({}));
- const auto terminal = settled.get_future().get().local.terminal;
+ const auto snapshot = settled.get_future().get();
+ const auto& terminal = snapshot.local.terminal;
  training.Shutdown();
  const auto stderr_text = capture.finish();
  CHECK(terminal.outcome == contracts::ComputeOperationOutcome::Failed);
- CHECK(constructions == (failure_stage == 0 ? 0U : 1U));
+ CHECK(constructions == (failure_stage == 0 || failure_stage == 4 ? 0U : 1U));
  CHECK(std::ranges::count(stderr_text, '\n') == 1);
  CHECK(stderr_text.find("fatal: local training:") == 0);
  CHECK(stderr_text.find(terminal.detail) != std::string::npos);
  if (failure_stage == 3) CHECK(terminal.detail.find("status 7") != std::string::npos);
+ const auto event = browser::encode_system_event<&ApplicationSystems::training>(TrainingChanged{snapshot});
+ CHECK(event.delivery == contracts::reflection::EventDelivery::Critical);
+ browser::wire::ByteBuffer encoded;
+ const browser::wire::Limits limits{browser::kMaxOutputValueBytes, browser::kMaxOutputValueItems, browser::kMaxIntentValueDepth};
+ REQUIRE(browser::wire::encode(event.value, encoded, limits));
+ const auto decoded = browser::wire::decode({.first = encoded}, limits);
+ REQUIRE(decoded);
+ CHECK(*decoded == event.value);
+ CHECK(diagnostics.counters().accepted == (tracing ? 2U : 0U));
+ diagnostics.close();
+ if (!tracing) {
+  CHECK_FALSE(std::filesystem::exists(diagnostic_path));
+  return;
+ }
+ std::ifstream input{diagnostic_path};
+ std::string line;
+ REQUIRE(static_cast<bool>(std::getline(input, line)));
+ const auto inspected = nlohmann::json::parse(line);
+ CHECK(inspected["event"] == "training.inputs");
+ CHECK(inspected["sequence"] == terminal.generation);
+ CHECK(inspected["message"].get<std::string>().find("requested_resolution=") != std::string::npos);
+ CHECK(inspected["message"].get<std::string>().find("prepared_resolution=") != std::string::npos);
+ REQUIRE(static_cast<bool>(std::getline(input, line)));
+ const auto failure = nlohmann::json::parse(line);
+ CHECK(failure["event"] == "training.operation.failed");
+ CHECK(failure["sequence"] == terminal.generation);
+ CHECK(failure["value"] == snapshot.revision);
+ CHECK(failure["message"] == terminal.detail);
+ CHECK_FALSE(static_cast<bool>(std::getline(input, line)));
 }
 TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and lazy runtime reconstruction", "[controller][systems][compute]") {
  const auto root = mmltk::testsupport::make_temp_root("ordinary-compute");

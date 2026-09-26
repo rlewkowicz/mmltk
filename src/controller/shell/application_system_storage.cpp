@@ -80,7 +80,7 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
     .diagnostics = diagnostics,
    });
   },
-  browser::ApplicationEventPublisher<&ApplicationSystems::training>(events_, continuity_));
+  browser::ApplicationEventPublisher<&ApplicationSystems::training>(events_, continuity_), configuration.runtime_diagnostics);
  validation_ = std::make_unique<ValidationSystem>(
   *settings_, *dataset_, *model_, [diagnostics = configuration.runtime_diagnostics](DirectComputeConfiguration selected) { return std::make_unique<CudaValidationRuntime>(selected, diagnostics); },
   browser::ApplicationEventPublisher<&ApplicationSystems::validation>(events_, continuity_, source_changed), resolve_compute_configuration, configuration.base_visual);

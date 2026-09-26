@@ -14,8 +14,12 @@ Explore**. [navigation.rs](../src/frontend/iced/src/view/navigation.rs) owns
 that visual order; ordinary workflow traversal derives from it, excluding
 Explore.
 
-**Status** and **Settings** remain fixed at the header's right edge, outside the
-workflow tab scroller. Status owns session notices across every page.
+**Status** is centered in the available space after Explore. The connection
+label sits immediately before the bordered **Settings** button at the right
+edge. These controls stay outside the workflow tab scroller; tabs retain their
+ordinary button height when the window narrows. Status owns session notices
+across every page, and its popup follows the trigger's measured bounds. At the
+narrowest widths, the connection label yields space to Status and Settings.
 
 The destination page owns foreground source selection. Navigating directly from
 Validate to Explore restores Explore's native product even when Validation
@@ -48,50 +52,28 @@ editor widget identities survive ordinary layout and native-state updates.
 
 ## Training, validation, and prediction
 
-Train, Validate, Predict and Export place **Output** at the top of the right
-column and **GPU** immediately below it. Their shared
-Output card provides Auto Output, Browse Output and admitted/completed paths;
-Train adds saved history and
-Predict adds its source-specific saving controls. Setup and the primary action
-remain in the left column. The [output reference](rfdetr-workflows.md#run-output-directories)
-owns reservation, defaults and artifact names.
+Train, Validate, Predict, and Export place **Output** at the top of the right
+column and **GPU** immediately below, with setup and the primary action on the
+left. Output provides Auto
+Output, Browse Output, and admitted/completed paths; Train adds saved history,
+Predict adds source-specific saving. [Output policy](rfdetr-workflows.md#run-output-directories)
+owns reservations, defaults, and artifact names.
 
-Train uses the [retained dashboard](#training-dashboard) in the center column,
-with the shared workspace aspect selector and a separate live progress card.
-It has no native GPU image workspace. Its
-[Dataset card](#dataset-compilation-controls) keeps the optional test split
-independent of inferred train/validation paths; manual split text fields appear
-when inference is disabled. Its weights card owns Transfer/Resume.
-Its Output card selects Auto Output or Browse Output, shows the selected/active
-path, and loads supported saved charts. Advanced includes
-**Exponential moving average**, disabled by default, and separate
-augmentation/perceptual-downscaling settings, alongside the
-[lane and recipe controls](#lane-and-recipe-controls). The
-[workflow reference](rfdetr-workflows.md) owns the metric conventions, current
-file formats, input admission, live progress, and continuation requirements.
+All four share the **RF-DETR Weights** card's confirmation, preparation, and
+cancellation. [Weights selection](rfdetr-workflows.md#shared-weights-selection)
+owns supported extensions and native admission; these cards have no manual
+artifact-kind or Class layout controls. Page-specific composition is:
 
-All four workflows share the **RF-DETR Weights** selector, its custom-selection
-confirmation, preparation and cancellation, using native artifact compatibility
-facts. Only Train has Transfer/Resume. Predict infers weights/ONNX/TensorRT from
-the custom path; Export's custom chooser accepts `.pt`. There are no manual
-artifact-kind or Class layout controls on these cards. Validate's Open Dataset
-shows its explicit path or the
-effective inherited Train validation split. It uses the
-[fixed Validation workspace](#validation-workspace-and-shared-viewer) below.
+| Page | Controls and workspace |
+| --- | --- |
+| Train | Center [dashboard](#training-dashboard), shared aspect selector, separate live progress card; no native image workspace. Dataset exposes manual split fields when inference is off, keeping optional test independent. Weights adds Transfer/Resume; Output loads saved charts. Advanced includes default-off EMA, separate augmentation/perceptual settings, and [lanes/recipes](#lane-and-recipe-controls). |
+| Validate | Open Dataset displays the explicit override or inherited Train validation split; [fixed workspace](#validation-workspace-and-shared-viewer). |
+| Predict | Compiled/image/video inputs, preview threshold, aspect selector, video Pause/Resume/Stop; batch size is always 1 with no field. Output has image Save sample, compiled Percent %/Total with count inspection, and video Samples/Full. Shared disclosures retain each source's choices when switching; [saving semantics](rfdetr-workflows.md#prediction-samples-and-full-video). |
+| Export | Left-column independent ONNX/TensorRT checkboxes; Run Export requires at least one. |
 
-Predict offers compiled-dataset, single-image, and local-video inputs, a preview
-threshold, and video Pause/Resume/Stop. Its Output card offers Save sample for
-an image, Save samples with Percent %/Total and dataset-count inspection for
-compiled input, and Save video with Samples/Full for video. Conditional choices
-use the shared disclosure; switching source retains that source's settings.
-The [saving reference](rfdetr-workflows.md#prediction-samples-and-full-video)
-defines counts, media and failure behavior. Export's left-column format card
-offers independent ONNX and TensorRT checkboxes; Run Export requires at least
-one. Predict retains the
-workspace aspect selector. Every GUI prediction request uses batch size 1;
-there is no batch-size field on this page. Train, Validate, and Predict hide
-H2D/NUMA controls while preserving the generated settings and backend support.
-Explore retains its loading controls.
+Train, Validate, and Predict hide H2D/NUMA controls while retaining generated
+settings/backend support; Explore keeps loading controls. [Workflow details](rfdetr-workflows.md)
+own input admission, progress, metrics, formats, and continuation.
 
 The primary action retains one preparation request across settings settlement,
 model selection/preparation, and native start. Changing its inputs or leaving
@@ -100,6 +82,10 @@ duplicate starts. Progress shows the preparation stage and then the owning
 operation's completed work; unknown totals stay indeterminate. Video controls
 use the same pending-system admission as their typed requests, including an
 event arriving before its reply.
+Validation, Prediction, and Export keep progress inside setup; Train uses its
+live progress card. [Primary-action spacing](#shared-primary-actions) remains
+empty in every state. Training preparation reports GPU connection, dataset
+admission, model initialization, and optimizer setup before measurements exist.
 Validation and prediction also retain the save-preview options captured at
 that accepted Start through preparation. Later viewer edits do not mutate the
 admitted save payload. Predict inspection replies enter the same revision-aware
@@ -110,9 +96,25 @@ snapshot reduction as events, so a late reply cannot replace newer source facts.
 Train offers **Shared gradients**, **Independent models**, and **Periodic
 averaging**. The [native training contract](rfdetr-training.md#logical-lanes-and-global-batch)
 owns global batch, accumulation, model membership, and capacity. Train lanes
-and Training-validation lanes are independent controls. Native revision-bound
-facts supply effective batch and aggregate session-round images; stale or
-unsettled facts show **Updating**. Rust does not derive a second batch formula.
+and validation lanes are independent controls. One Advanced card groups
+training batches and lanes, validation, model recipes, learning-rate schedules,
+precision/encoder settings, data sampling/augmentation, supervision, and model
+merging/final soup. The [shared dividers](#shared-form-expansion-and-dividers)
+use ten-pixel gaps above/below in this card. The 18 px Advanced title and its
+unchanged 12 px subtitle precede the first divider. H2 section headings are
+16 px with 8 px before settings. Recipe scope
+and Global optimizer defaults (or Model optimizer) are H3, 14 px with 8 px before
+the heading and 6 px before controls.
+
+**Global batch (all GPUs)** is the editable microbatch size. Native facts supply
+**Batch / GPU / microbatch** (a range for uneven splits), **Effective batch /
+model update**, and **Images / session round**. Calculated values retain the
+numeric field's size and alignment without an outline or edit callback.
+Matching revision-bound training calculations remain visible through Start and
+worker preparation; admitted facts replace them when the current operation
+publishes them. Stale drafts or unsettled lane membership show **Updating**.
+Validation distinguishes pre-admission and admitted capacity. Rust does not
+derive a second batch formula.
 Independent and periodic modes display their experimental limitation.
 
 **Recipe scope** selects Global defaults or a stable model ID. New models copy
@@ -182,12 +184,10 @@ pixels beneath Coconut. Recovery text and the validation descriptions use
 text at 12 logical pixels; each description sits beneath its radio, aligned
 with its label.
 
-The recipe, validation choice, and recovery setting persist. Returning to Coco
-custom or disabling the override hides the dependent controls without clearing
-their values. Hidden validation/recovery choices have no effect on Coco custom;
-Directory compilation ignores the benchmark selection. Override mode disables
-source-directory text and Browse; turning it off restores those controls.
-Changing these controls never starts work.
+Recipe, validation, and recovery choices persist when hidden. Coco custom ignores
+hidden validation/recovery values; Directory ignores benchmark selection.
+Override disables source-directory text/Browse and restores them when off.
+Control edits never start compilation.
 
 **Compile Benchmark Dataset** or **Compile Dataset** requires settled settings
 and native admission. The accepted native request captures those settings for
@@ -199,13 +199,11 @@ current work, separate **Acquisition**, **Labels/masks**, and **Pixels** tracks,
 and benchmark source details. The [progress reference](benchmark-datasets.md#reading-compilation-progress)
 defines their units, readable quantities, and source summaries.
 
-The progress area grows when needed and retains its greatest measured height
-for the active native generation at the current width. Shorter updates therefore
-leave the action in place. A changed width remeasures the content, and a new
-generation starts a fresh reservation. Once native Stop reports cancellation
-requested, both the action and progress say **Cancelling…**; live work, tracks,
-and source rows disappear immediately, while the reserved space remains until
-the native system becomes inactive. Duplicate cancellation is disabled.
+Progress retains its greatest measured height for the active generation/width,
+keeping the action stationary on shorter updates. Width changes remeasure; new
+generations reset the reservation. Native cancellation-requested state changes
+action/progress to **Cancelling…**, immediately hides work/tracks/source rows,
+and disables duplicate cancellation. Reserved space remains until native inactivity.
 
 Only the native terminal result settles the operation. **Completed** or
 **Cancelled** replaces live progress with supplied detail and artifact path.
@@ -221,6 +219,9 @@ only green **Ok**. Otherwise it shows a warning triangle and white outline with
 a pink two-second border pulse. Only a visible active pulse requests redraws;
 reduced motion keeps a static border and hidden windows stay quiet. Arriving
 notices do not open the panel or steal focus.
+Healthy Status returns to its borderless appearance when the pointer leaves,
+including after hover-close restores trigger focus. Keyboard interaction shows
+the focus outline again without changing the retained focus target.
 
 Click, keyboard activation, or touch toggles the panel. Mouse hover opens it
 across the trigger, connecting gap, and panel; leaving that boundary closes a
@@ -241,16 +242,15 @@ including delayed annotation focus replies. Clipboard completion is checked
 against notice identity, content version, and copy attempt; stale completion
 cannot mutate another row.
 
-[NoticeStore](../src/frontend/iced/src/view_model/notices.rs) is bounded,
-memory-only application state: up to 128 ordinary notices and one overflow
-notice. It projects failures from native owners and transport, protocol, dialog,
-checkpoint, remote/provider, annotation-save, history/chart, and clipboard
-boundaries. Stable typed source identity deduplicates snapshot/event/reply
-delivery. Updates retain row identity; dismissal or eviction acknowledges that
-source occurrence so replay cannot resurrect it. The bounded source frontiers
-survive row removal. A reconnect retains current-session notices and rebases
-only sources whose native owner changed. Initial bootstrap seeds prior terminal
-state without replaying historical failures. No notice history is persisted.
+[NoticeStore](../src/frontend/iced/src/view_model/notices.rs) retains at most 128
+ordinary notices plus one overflow notice in memory. Sources include native
+owners, transport/protocol, dialogs, checkpoints, remote/providers, annotation
+saving, history/charts, and clipboard. Stable typed source identity deduplicates
+snapshot/event/reply delivery; updates preserve rows. Dismissal/eviction
+acknowledges the occurrence through bounded frontiers that survive row removal,
+preventing replay. Reconnect retains session notices and rebases only changed
+native owners. Bootstrap seeds prior terminals without replaying old failures;
+running/cancelling work can still report a later failure. Nothing is persisted.
 
 Native owners still decide activity, recovery, retry, Stop/cancellation, result
 state, and artifact custody. Progress, output paths, and recovery controls stay
@@ -333,10 +333,9 @@ owns the common presentation:
 Native activity and accepted explicit preparation/save state determine the
 active presentation. Stop keeps each owner's cancellation behavior. An accepted
 save disables duplicate saves until settlement without changing its label.
-Train, Validate, Predict, and Export share the card-to-action gap; Train,
-Validate, and Predict have no separate start-status sentence. Native progress
-remains in its component and failures enter session Status, while a successful
-Validate result does not leave “Succeeded” immediately above the action.
+Train, Validate, Predict, and Export share the ten-pixel card-to-action gap.
+Every workflow leaves that gap empty in every operation state. Native progress
+remains inside its owning card and failures enter session Status.
 
 During active work, ten equal blue segments move clockwise by perimeter distance
 through the existing white, three-logical-pixel rounded border. They use the
@@ -607,12 +606,10 @@ increments.
 
 ## Typed application boundary
 
-The current application package protocol is **17**. Canonical C++ declarations
-own native types, field identities, constraints, defaults, endpoints, events,
-and snapshots. C++26 reflection generates typed Rust projections, compact
-interaction codecs, validation, exhaustive dispatch, and schema identity.
-Handwritten Rust owns component state, visual copy, navigation, layout,
-styling, and interaction.
+Application package protocol **17** derives typed Rust, compact codecs,
+validation, exhaustive dispatch, and schema identity from [canonical C++ declarations](reflection.md).
+Native endpoints/events/snapshots and presentation ownership follow
+[the contract](../CONTRACT.md#model-presentation-model-and-views).
 
 [client_record.h](../src/controller/browser/client_record.h) declares the
 outer records and protocol version;
@@ -844,19 +841,12 @@ Even if a cross-device transfer has released its raw input read, that product
 cannot detach, replace its workspace, or become writable before final display
 work settles. Raw-reader release and completed finalization are separate facts.
 
-The native runtime factories linked above and
-[SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.h) define these
-inventories.
-
-`ImageWorkspace` owns native custody of the Vulkan allocation and immutable
-layout. `VisualRuntimeOwner` services layout/admission requests on the producer's
-existing worker. A raw product can finish before browser layout is available.
-After Firefox allocation and CUDA import, the worker prepares that exact
-retained product without another command, repeated inference/editing, or
-another camera frame. First admission or growth can require a fill from retained
-raw data; subsequent production finalizes into the admitted storage.
-See [external workspace interoperability](gpu-execution.md#shared-workspace-interoperability)
-for the initial ownership and device requirements.
+The linked runtime factories and [SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.h)
+define these inventories. `VisualRuntimeOwner` services layout/admission on the
+producer worker; `ImageWorkspace` owns the admitted Vulkan layout and native
+custody. [Workspace interoperability](gpu-execution.md#shared-workspace-interoperability)
+defines allocation/import and filling from retained raw products, including late
+layout, first admission, and growth without repeating domain work.
 
 Raw `BorrowFrame` and `BorrowDocument` consumers keep their existing meaning.
 Annotation, Upscale, and other processing receivers finish their required
@@ -913,11 +903,10 @@ after its GPU read while copied pixels remain drawable. A direct fallback
 continues to retain the source it samples. Page references, encoded draws,
 physical source reads, and arena retirement settle independently.
 
-Physical Vulkan image and semaphore owners retain device custody through
-registry removal, IPC shutdown, and partial-construction failure. Native imports
-retain backing FD and CUDA context custody through their own completed uses.
-Browser exit is not a GPU completion receipt; terminal rescue never waits for an
-unavailable peer to advance a timeline.
+[Physical import owners](gpu-execution.md#shared-workspace-interoperability)
+retain Vulkan device, backing FD, and CUDA context custody through removal,
+partial failure, and completed uses. Browser exit is not a completion receipt;
+terminal rescue never waits for an unavailable peer's timeline.
 
 Live's requested rate configures capture and its system-owned consumption
 cadence. Firefox's graphics queue, swapchain, compositor, and Wayland determine
@@ -1098,10 +1087,8 @@ release them; normal retirement does not depend on JavaScript collection.
 
 ## Browser redraws and FPS
 
-The visible browser requests redraws from its graphics/window loop and can
-submit the last completed image continuously while native content is unchanged
-or newer work is pending. Native dirty rendering has its own event-driven
-progress.
+The visible graphics/window loop can continuously redraw the completed fallback;
+native dirty rendering progresses independently on events.
 
 Show FPS enables one component-owned counter of actual browser queue
 submissions containing workspace draws, including retained pixels. Several

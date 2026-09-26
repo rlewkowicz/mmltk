@@ -336,6 +336,7 @@ contracts::SettingsUiState SettingsSystem::snapshot() const {
  result.validation_source = contracts::resolve_validation_source(result.settings_state).native();
  result.explore_source = contracts::resolve_explore_source(result.settings_state);
  result.train_execution = mmltk::backend::models::rfdetr::derive_execution_facts(result.settings_state.workflows.train.request, result.revision);
+ result.training_batch_distribution = mmltk::backend::models::rfdetr::derive_training_batch_distribution(result.settings_state.workflows.train.request);
  result.training_validation_execution = mmltk::backend::models::rfdetr::derive_training_validation_facts(result.settings_state.workflows.train.request, result.revision);
  result.validation_execution = mmltk::backend::models::rfdetr::derive_execution_facts(result.settings_state.workflows.validate.request, result.revision);
  result.prediction_execution = mmltk::backend::models::rfdetr::derive_execution_facts(result.settings_state.workflows.predict.request, result.revision);

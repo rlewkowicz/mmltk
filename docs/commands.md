@@ -44,17 +44,11 @@ Put `--logs`, `--diagnose-io`, `--diagnose-nvidia-payload`,
 `--cleanup-report`, `--raw-cpd`, or `--format-declarations`
 first when invoking that standalone operation.
 
-The [validation guide](validation.md#standalone-cudavulkan-diagnostic) owns
-CUDA/Vulkan cases and argument meanings; [logging](logging.md) owns query,
-Vulkan-message, and descriptor-lineage examples. See
-[native link diagnostics](validation.md#native-symbol-and-link-diagnostics)
-for symbol filters, linker maps, and saved LTO intermediates.
-The [test-selection reference](validation.md#selection-environment-deadlines-and-debugging)
-owns focused native filters, browser JavaScript/Rust package selection, and
-log-query fixture selectors.
-The [declaration-tool reference](validation.md#raw-cpd-and-declaration-formatting)
-owns report formats, exact-spelling evidence, conservative rewrite admission,
-and check/preview/fix behavior.
+Detailed references: [CUDA/Vulkan diagnostics](validation.md#standalone-cudavulkan-diagnostic),
+[native symbols/links](validation.md#native-symbol-and-link-diagnostics),
+[test selectors](validation.md#selection-environment-deadlines-and-debugging),
+[declaration tooling](validation.md#raw-cpd-and-declaration-formatting), and
+[log queries/provenance](logging.md).
 
 ### Process snapshots
 
@@ -72,15 +66,14 @@ and mode, then reports PID, parent PID, elapsed time, CPU time, CPU/memory
 percentages, process state, wait channel, and process name. It omits command
 arguments and environment variables.
 
-The default snapshot is read-only. It requires a running Docker daemon and
-does not start one, create or alter containers, attach to a process, or
-build/pull images.
-Each daemon query has a 15-second deadline. No matching running container is
-a successful empty result. A snapshot describes current process state; it
-does not by itself establish a stall, completed work, or product performance.
+Snapshots require a running daemon and are read-only: no daemon start,
+container creation/mutation, process attachment, or image build/pull. Each daemon
+query has a 15-second deadline. A selection with no matching container succeeds
+with empty output. A snapshot alone establishes neither a stall, completion,
+nor performance.
 
-Explicit process actions accept one native executable basename of the form
-`mmltk[_-][A-Za-z0-9_-]+` and require exactly one matching wrapper container:
+Explicit process actions accept `mmltk` or a native executable basename of the
+form `mmltk[_-][A-Za-z0-9_-]+` and require exactly one matching wrapper container:
 
 ```bash
 ./mmltk --diagnose-processes test --backtrace mmltk_backend_models_rfdetr_training_tests
@@ -178,26 +171,19 @@ For example, with existing input artifacts:
   --output ./predictions.json
 ```
 
-See [datasets](datasets.md) for compilation and annotation requirements.
-Both `compile` and `rfdetr compile` accept `--resize-mode Stretch` (default)
-or `--resize-mode Letterbox`, independently of `--perceptual-downscale`.
-`rfdetr validate --resize-mode` selects geometry when compiling source input;
-existing bins retain their stored mode. Training exposes the independent
-`--aug-perceptual-downscale` option.
-Training also exposes `--use-ema`/`--no-ema`, `--resume`, and `--output-dir`.
-`--test-compiled` supplies an optional final-test split; train and validation
-remain required. Model-input commands accept `--class-layout` for a digest-bound
-class descriptor.
-`rfdetr predict` accepts repeatable `--image` inputs as an alternative to
-`--compiled`, and retains CLI batch-size selection. Local video belongs to the
-GUI prediction workflow. `rfdetr evaluate` selects one backend; `rfdetr validate`
-retains its ordered multi-backend report path. Both accept `--candidate-count`
-for physical candidate selection and `--eval-max-dets` for COCO accumulation.
-Zero uses the admitted model's candidate count and the shared evaluation cap
-respectively. Training exposes `--eval-max-dets`; prediction has its separate
-`--max-dets-per-image`. See [count semantics](rfdetr-workflows.md#model-input-and-detection-selection).
-The [workflow/artifact reference](rfdetr-workflows.md) explains these distinctions,
-current checkpoints, metrics, and saved history.
+Key option groups (required fields and defaults remain in command help):
+
+| Commands | Options and reference |
+| --- | --- |
+| `compile`, `rfdetr compile` | `--resize-mode Stretch` (default) or `Letterbox`; independent `--perceptual-downscale`; [source/geometry rules](datasets.md#compile-and-inspect) |
+| `rfdetr validate` | `--resize-mode` affects source compilation only; existing bins retain stored geometry |
+| `rfdetr train` | Independent `--aug-perceptual-downscale`, `--use-ema`/`--no-ema`, `--resume`, `--output-dir`; `--test-compiled` is optional, train/validation required |
+| Model-input commands | `--class-layout` supplies a [digest-bound descriptor](rfdetr-workflows.md#class-identity-and-model-admission) |
+| `rfdetr predict` | Repeatable `--image` or `--compiled`, CLI `--batch-size`; local video is GUI-only |
+| `rfdetr evaluate`, `validate` | One backend or ordered multi-backend report, respectively; independent `--candidate-count` and `--eval-max-dets` |
+| Train / Predict counts | Train exposes `--eval-max-dets`; Predict uses `--max-dets-per-image`; [count semantics and zero defaults](rfdetr-workflows.md#model-input-and-detection-selection) |
+
+[RF-DETR workflows](rfdetr-workflows.md) owns checkpoint, metric, and history behavior.
 Train, predict and evaluate accept `--compile-mode none|selective|full`.
 The [native selective contract](rfdetr-training.md#native-selective-compilation)
 describes the default selective path, its guards and inference propagation;
@@ -214,14 +200,12 @@ Fatal operation failures still produce a concise
 
 ### Training request selection
 
-`rfdetr train --batch-size` is a **global microbatch** image count.
-`--grad-accum-steps` and logical `--lanes` determine the mode's effective batch;
-`--validation-lanes` controls training-owned inference independently. The
-[training reference](rfdetr-training.md#logical-lanes-and-global-batch) owns the
-equations and complete-window admission. `--optimizer` selects `adamw`, `muon`,
-or `sgd`; `--lr-scheduler` selects `step`, `cosine`, or `ultralytics-linear`,
-with the latter admitted only for SGD. `--nesterov`/`--no-nesterov` and
-`--warmup-bias-lr` expose SGD policy. Final-epoch controls are
+`rfdetr train --batch-size` counts **global microbatch** images;
+`--grad-accum-steps` and logical `--lanes` determine effective batch.
+`--validation-lanes` is independent. See [batch equations/admission](rfdetr-training.md#logical-lanes-and-global-batch).
+Recipe flags are `--optimizer adamw|muon|sgd`,
+`--lr-scheduler step|cosine|ultralytics-linear` (last choice requires SGD),
+`--nesterov`/`--no-nesterov`, and `--warmup-bias-lr`. Final-epoch flags are
 `--unfreeze-encoder-last-epochs` and `--disable-augmentation-last-epochs`.
 
 `--request-json JSON` accepts one complete canonical `TrainRequest`, bounded to

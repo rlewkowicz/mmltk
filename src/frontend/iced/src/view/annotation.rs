@@ -283,7 +283,6 @@ impl Component {
                 (settings_settled && model.annotation_save_available())
                     .then_some(Message::SaveRequested),
                 None,
-                column![].into(),
             ),
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)

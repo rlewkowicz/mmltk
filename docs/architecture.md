@@ -2,9 +2,8 @@
 
 [Wiki index](README.md) · [Quick start](../README.md#codebase) · [Build graph](build.md)
 
-[CONTRACT.md](../CONTRACT.md) defines desired ownership, product outcomes,
-resource lifetime, and shutdown behavior. This guide locates the implementation;
-the contract's ownership matrix remains the authority.
+This guide locates implementation owners; [CONTRACT.md](../CONTRACT.md) governs
+architecture, product outcomes, resource lifetime, and shutdown.
 
 ## Entrypoints and application construction
 
@@ -40,11 +39,10 @@ annotation, Explore, Live, and Upscale have their own implementation directories
 file dialogs, external-provider access, Firefox process ownership, and
 diagnostics live under `src/controller/services/`.
 
-The neutral [controller runtime](../src/controller/runtime/local_run.h) owns
-one local job's worker, startup settlement, stop request, and join. Product
-systems using it retain their own admission, mutable state, failure
-translation, and event policy. Visual workers use the separate presentation
-runtime described below.
+The neutral [controller runtime](../src/controller/runtime/local_run.h) owns a
+local job's worker, startup settlement, stop, and join; product systems retain
+admission, state, failure translation, and events. Visual workers use the
+[presentation runtime](#presentation-and-browser-integration).
 
 [SettingsSystem](../src/controller/services/settings_system.h) owns live
 settings and mutation admission, plus the immutable native CUDA inventory
@@ -296,13 +294,8 @@ of product work.
 
 ## Reflected value and persistence boundaries
 
-The [declaration authoring guide](reflection.md) owns canonical registration,
-short annotation syntax, and safe mechanical formatting. The syntax-only
-[declaration_annotations.h](../src/frameworks/reflection/declaration_annotations.h)
-expands directly to existing field-policy annotations; ordinary declarations,
-defaults, equality, and registrations stay explicit. Structural projection
-removes repeated member inventories without moving product policy into
-reflection.
+See [declaration authoring](reflection.md) for canonical registration,
+syntax-only annotations, structural projection, and safe formatting.
 
 [reflected_descriptors.h](../src/frameworks/reflection/reflected_descriptors.h)
 owns CLI assignment and emission. Non-boolean scalar, optional, and repeatable
@@ -392,14 +385,10 @@ being converted into floating-point chart values. The Rust chart catalog
 selects generated identities and owns visual grouping, labels, and ordering;
 it does not mirror native member access or introduce a runtime string registry.
 
-The separate
 [application_workspace_abi_emitter.h](../src/controller/browser/application_workspace_abi_emitter.h)
-projects the native graphics records into a data-only Rust artifact consumed
-by Firefox. It derives field types, enum values, and size/alignment/offset
-assertions from the canonical native declarations in
-[presentation/abi](../src/controller/presentation/abi). This graphics ABI is
-independent of the application's CBOR package protocol; [build outputs](build.md#generated-bindings-and-dependency-maintenance)
-locates both artifacts and their invalidation rules.
+projects [native graphics declarations](../src/controller/presentation/abi) for
+Firefox independently of application CBOR. [Build outputs](build.md#generated-bindings-and-dependency-maintenance)
+defines the artifact, derived layout assertions, and invalidation rules.
 
 The physical listener and transport owner is
 [BrowserServer](../src/frameworks/transport/browser_server.h).
@@ -411,21 +400,18 @@ messages live in `app/`, `view/`, and the owning widgets. Use
 [generation commands](build.md#generated-bindings-and-dependency-maintenance)
 after changing the native schema.
 
-The shared [page canvas](../src/frontend/iced/src/view/mod.rs) and
-[workflow compositor](../src/frontend/iced/src/view/workflow/mod.rs) own page
-width, scrolling, and ordinary column composition, including Annotate.
-[navigation.rs](../src/frontend/iced/src/view/navigation.rs) owns visual order.
-[workflow/fields.rs](../src/frontend/iced/src/view/workflow/fields.rs) supplies
-typed numeric widgets; Explore's local controls retain their domain-specific
-filter editing. [view/shared/transition.rs](../src/frontend/iced/src/view/shared/transition.rs)
-owns retained form expansion, clipping, and input visibility; Dataset, model
-cards, Predict saving, Export, and diagnostics use that same widget.
-[status_text.rs](../src/frontend/iced/src/view/shared/status_text.rs) owns retained
-single-line fitting and intrinsic status measurement. Dataset's
-[progress component](../src/frontend/iced/src/view/train/dataset/progress.rs)
-formats native facts and reserves active presentation height. The
-[interaction guide](gui-interaction.md#shared-form-expansion-and-dividers)
-owns these presentation policies alongside page layout and input behavior.
+Frontend shared owners:
+
+| Owner | Responsibility |
+| --- | --- |
+| [Page canvas](../src/frontend/iced/src/view/mod.rs), [workflow compositor](../src/frontend/iced/src/view/workflow/mod.rs) | Page width, scrolling, and ordinary columns, including Annotate |
+| [Navigation](../src/frontend/iced/src/view/navigation.rs) | Visual order |
+| [Numeric fields](../src/frontend/iced/src/view/workflow/fields.rs) | Typed widgets; Explore retains local filter editing |
+| [Transition](../src/frontend/iced/src/view/shared/transition.rs) | Retained expansion, clipping, input visibility; [consumers and policy](gui-interaction.md#shared-form-expansion-and-dividers) |
+| [Status text](../src/frontend/iced/src/view/shared/status_text.rs) | Retained single-line fitting and intrinsic measurement |
+| [Dataset progress](../src/frontend/iced/src/view/train/dataset/progress.rs) | Native-fact formatting and active-height reservation |
+
+[GUI interaction](gui-interaction.md) defines their layout and input behavior.
 
 Train's [metrics component](../src/frontend/iced/src/view/metrics.rs) owns chart
 selection and expansion. Its [catalog](../src/frontend/iced/src/view/metrics/catalog.rs)
@@ -535,15 +521,12 @@ how captures connect these boundaries. Frontend acceptance control lives in
 `integration_control.rs`; its private `integration_control/reporting.rs`
 owns effect-only collection and reporting.
 
-The retained Train plotting component is
-[view/metrics.rs](../src/frontend/iced/src/view/metrics.rs), using the owned
-[iced_plot](../third_party/iced_plot) crate. Validation's
-[results](../src/frontend/iced/src/view/validate/results.rs) and
-[samples](../src/frontend/iced/src/view/validate/samples.rs) components own their
-local UI interactions. The primary-action preparation state belongs to
-[app/workflows.rs](../src/frontend/iced/src/app/workflows.rs); native runtime
-execution remains with each system. The real-model acceptance scenario has its
-own [workflow driver](../src/frontend/iced/src/integration_control/workflows.rs).
+Train's metrics component uses the owned [iced_plot](../third_party/iced_plot)
+crate. Validation's [results](../src/frontend/iced/src/view/validate/results.rs)
+and [samples](../src/frontend/iced/src/view/validate/samples.rs) own local UI
+interaction; `PendingStart`, described [above](#workflow-output-and-media-handoffs),
+owns preparation. The real-model acceptance [workflow driver](../src/frontend/iced/src/integration_control/workflows.rs)
+exercises the native systems.
 
 ## Tests and vendor changes
 

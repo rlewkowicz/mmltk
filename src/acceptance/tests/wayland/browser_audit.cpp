@@ -1025,6 +1025,14 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    advanced_assignment = bounds;
   else if (field_detail == "dn-toggle")
    advanced_denoising_toggle = bounds;
+  else if (field_detail == "rank-batch")
+   advanced_rank_batch = bounds;
+  else if (field_detail == "aggregate-batch")
+   advanced_aggregate_batch = bounds;
+  else if (field_detail == "train-lanes")
+   advanced_train_lanes = bounds;
+  else if (field_detail == "validation-lanes")
+   advanced_validation_lanes = bounds;
   else if (!indexed("fixed-", advanced_fixed) && !indexed("effective-", advanced_effective) && !indexed("match-free-", advanced_match_free))
    static_cast<void>(indexed("dn-", advanced_denoising));
  } else if (event == "integration.page_region") {
@@ -1920,10 +1928,6 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   const auto found = page_bounds.find(std::string{page} + ":" + std::string{control});
   return found == page_bounds.end() ? nullptr : &found->second;
  };
- const auto immediately_above = [](const Bounds& progress_bounds, const Bounds& action_bounds) {
-  const double progress_bottom = progress_bounds.y + progress_bounds.height;
-  return progress_bounds.valid() && action_bounds.valid() && progress_bottom <= action_bounds.y + 1.0 && action_bounds.y - progress_bottom <= 5.0;
- };
  const auto page_prefix = [](const std::string_view page) {
   return page == "Train" ? "train" : page == "Validate" ? "validate" : page == "Predict" ? "predict" : page == "Live" ? "live" : page == "Annotate" ? "annotation" : "export";
  };
@@ -1934,11 +1938,11 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
           [this, page](const std::string_view region) { return page_bounds.contains(std::string{page} + ":" + std::string{region}) == (page != "Live" || region != "workflow.diagnostics"); }) &&
          page_bounds.contains(std::string{page} + ":" + primary_action(page)) && !page_bounds.contains(std::string{page} + ":" + prefix + ".status");
  });
- const bool primary_progress_placement = std::ranges::all_of(pages, [&page_bound, &immediately_above, &primary_action](const std::string_view page) {
+ const bool primary_action_clearance = std::ranges::all_of(pages, [&page_bound, &primary_action](const std::string_view page) {
   const std::string action = primary_action(page);
   const Bounds* const progress_bounds = page_bound(page, action + ".progress");
   const Bounds* const action_bounds = page_bound(page, action);
-  return progress_bounds != nullptr && action_bounds != nullptr && immediately_above(*progress_bounds, *action_bounds);
+  return progress_bounds == nullptr && action_bounds != nullptr;
  });
  const bool primary_action_geometry = std::ranges::all_of(pages, [&page_bound, &primary_action](const std::string_view page) {
   const std::string action = primary_action(page);
@@ -1954,7 +1958,7 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
    return action->y - above->y - above->height;
   };
   const auto reference = gap("Export", "export.card.formats");
-  if (!reference || *reference <= 0.0) return false;
+  if (!reference || std::abs(*reference - 10.0) > 1.0) return false;
   for (const auto& [page, card] : std::array{std::pair{"Train", "train.card.dataset"}, std::pair{"Validate", "validate.card.inputs"}, std::pair{"Predict", "predict.card.inputs"}}) {
    const auto measured = gap(page, card);
    if (!measured || std::abs(*measured - *reference) > 1.0) return false;
@@ -1968,7 +1972,8 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   return output && diagnostics && center && output->valid() && diagnostics->valid() && center->valid() && diagnostics->contains(*output) && std::abs(output->y - diagnostics->y) < 1.0 &&
          std::abs(output->x - diagnostics->x - 10.0) < 1.0 && std::abs(output->width - diagnostics->width + 20.0) < 1.0 && diagnostics->x >= center->x + center->width - 1.0;
  });
- const bool compile_progress_placement = immediately_above(compile_progress, compile_action);
+ const bool compile_progress_placement = compile_progress.valid() && compile_action.valid() && compile_progress.y + compile_progress.height <= compile_action.y + 1.0 &&
+                                         compile_action.y - compile_progress.y - compile_progress.height <= 5.0;
  const bool model_progress_placement = model_card.valid() && model_progress.valid() && model_card.contains(model_progress);
  const bool model_composition = [&] {
   if (!std::ranges::all_of(model_parts, [](const Bounds& bounds) { return bounds.valid(); })) return false;
@@ -2033,14 +2038,16 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
   }
   return true;
  };
- const std::array advanced_batch{advanced_fixed[0], advanced_effective[0], advanced_fixed[1], advanced_effective[1]};
- const std::array advanced_general{advanced_fixed[2], advanced_fixed[3]};
+ const std::array advanced_batch{advanced_fixed[0], advanced_rank_batch, advanced_fixed[3], advanced_effective[0]};
+ const std::array advanced_general{advanced_train_lanes, advanced_fixed[2], advanced_aggregate_batch};
+ const std::array advanced_validation{advanced_fixed[1], advanced_validation_lanes, advanced_effective[1]};
  const std::array advanced_optimizer{advanced_fixed[4], advanced_fixed[5], advanced_fixed[6], advanced_fixed[7]};
  const bool advanced_composition =
-  aligned_grid(advanced_batch) && aligned_grid(advanced_general) && aligned_grid(advanced_optimizer) && aligned_grid(advanced_match_free) && aligned_grid(advanced_denoising) &&
+  aligned_grid(advanced_batch) && aligned_grid(advanced_general) && aligned_grid(advanced_validation) && aligned_grid(advanced_optimizer) && aligned_grid(advanced_match_free) && aligned_grid(advanced_denoising) &&
   std::abs(advanced_batch.front().width - advanced_general.front().width) < 1.0 && advanced_general.front().y >= advanced_batch.front().y + advanced_batch.front().height - 1.0 &&
   std::abs(advanced_general.front().width - advanced_optimizer.front().width) < 1.0 && std::abs(advanced_general.front().width - advanced_match_free.front().width) < 1.0 &&
-  std::abs(advanced_general.front().width - advanced_denoising.front().width) < 1.0 && advanced_optimizer.front().y >= advanced_general.front().y + advanced_general.front().height - 1.0 &&
+  std::abs(advanced_general.front().width - advanced_denoising.front().width) < 1.0 && advanced_validation.front().y >= advanced_general.front().y + advanced_general.front().height - 1.0 &&
+  advanced_optimizer.front().y >= advanced_validation.front().y + advanced_validation.front().height - 1.0 &&
   advanced_assignment.valid() && advanced_denoising_toggle.valid() && advanced_assignment.x >= advanced_container.x - 1.0 &&
   advanced_assignment.x + advanced_assignment.width <= advanced_container.x + advanced_container.width + 1.0 && advanced_assignment.y >= advanced_container.y - 1.0 &&
   advanced_assignment.y + advanced_assignment.height <= advanced_container.y + advanced_container.height + 1.0 &&
@@ -2054,7 +2061,7 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
    const double cell_pitch = fields[1].x - fields[0].x;
    return cell_pitch > 0.0 && std::ranges::all_of(fields, [cell_pitch](const Bounds& bounds) { return bounds.width < cell_pitch * 0.70; });
   };
-  return compact_row(advanced_batch) && compact_row(advanced_general) && compact_row(advanced_optimizer) && compact_row(advanced_match_free) && compact_row(advanced_denoising);
+  return compact_row(advanced_batch) && compact_row(advanced_general) && compact_row(advanced_validation) && compact_row(advanced_optimizer) && compact_row(advanced_match_free) && compact_row(advanced_denoising);
  }();
  const bool status_composition = status_panel.valid() && status_copy.valid() && status_dismiss.valid() && status_copy.x < status_dismiss.x && status_copy.y >= status_panel.y - 1.0 &&
                                  status_dismiss.y >= status_panel.y - 1.0 && status_panel.contains_horizontally(status_copy) && status_panel.contains_horizontally(status_dismiss);
@@ -2094,7 +2101,7 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
  return first_failed_check(std::ranges::all_of(expected_primary_labels, [this](const char* label) { return primary_idle_labels.contains(label); }), "primary action rendered labels",
   bootstrap && fluent && uniform_primary && benchmark_purple && rendered_controls.contains(BENCHMARK_OVERRIDE) &&
    std::ranges::all_of(expected_primary, [this](const std::string_view id) { return shared_primary.contains(id) && rendered_controls.contains(id); }),
-  "shell and style", every_region, "ordinary workflow regions", primary_progress_placement, "primary progress placement", primary_action_geometry, "primary action geometry", primary_card_gaps,
+  "shell and style", every_region, "ordinary workflow regions", primary_action_clearance, "primary action clearance", primary_action_geometry, "primary action geometry", primary_card_gaps,
   "primary card gaps match Export", output_card_placement, "Output cards at top of right column", reference_columns, "workflow column geometry", vertical_composition, "workflow vertical composition",
   advanced_composition, "Advanced composition", advanced_compact, "Advanced compact controls", explore_integer_controls.size() == 5U && explore_integer_precision,
   "Explore integer editing and spinner suppression", explore_paste_restored, "Explore clipboard paste persistence and restoration", spinnerless_integer, "integer spinner suppression",

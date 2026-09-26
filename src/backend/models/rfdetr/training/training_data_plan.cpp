@@ -157,11 +157,7 @@ TrainingEpochDraws TrainingDataPlan::epoch(std::size_t model, std::uint64_t epoc
  }
  return result;
 }
-TrainingRankSlice TrainingDataPlan::rank_slice(std::uint64_t batch, std::uint32_t rank, std::uint32_t world) {
- if (!batch || !world || rank >= world) throw std::invalid_argument("invalid training rank slice");
- return {batch / world * rank + std::min<std::uint64_t>(rank, batch % world), batch / world + (rank < batch % world)};
-}
-TrainingRankSlice TrainingDataPlan::rank_slice(std::uint32_t rank, std::uint32_t world) const { return rank_slice(batch_, rank, world); }
+TrainingRankSlice TrainingDataPlan::rank_slice(std::uint32_t rank, std::uint32_t world) const { return training_rank_slice(batch_, rank, world); }
 std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule> TrainingDataPlan::rank_schedule(const TrainingEpochDraws& global, std::uint32_t rank, std::uint32_t world) const {
  if (!world || rank >= world) throw std::invalid_argument("invalid training rank slice");
  auto local = std::make_shared<mmltk::backend::data::DatasetIndexSchedule>();

@@ -53,6 +53,19 @@ struct ExecutionFacts final {
 struct TrainRequest;
 struct ValidateRequest;
 struct PredictRequest;
+struct TrainingBatchDistribution final {
+ std::uint64_t ranks = 1;
+ std::uint64_t minimum_rank_batch = 1;
+ std::uint64_t maximum_rank_batch = 1;
+ bool operator==(const TrainingBatchDistribution&) const = default;
+};
+MMLTK_REFLECT_FIELDS(TrainingBatchDistribution)
+[[nodiscard]] TrainingBatchDistribution derive_training_batch_distribution(const TrainRequest&);
+struct TrainingRankSlice final {
+ std::uint64_t begin = 0;
+ std::uint64_t count = 0;
+};
+[[nodiscard]] TrainingRankSlice training_rank_slice(std::uint64_t batch, std::uint32_t rank, std::uint32_t world);
 [[nodiscard]] std::uint64_t checked_training_product(std::uint64_t, std::uint64_t);
 [[nodiscard]] std::uint64_t training_stochastic_key(std::uint64_t seed, std::uint64_t model, std::uint64_t epoch, std::uint64_t occurrence, std::uint64_t purpose = 0) noexcept;
 void resize_training_models(TrainLaneConfiguration&, std::size_t count, const TrainRecipeSettings&, std::uint64_t session_seed);

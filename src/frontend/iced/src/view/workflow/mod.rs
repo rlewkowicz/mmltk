@@ -24,7 +24,6 @@ pub enum Region {
     Workspace,
     Advanced,
     Diagnostics,
-    PrimaryProgress,
     PrimaryAction,
     PrimaryCard,
     OutputCard,
@@ -32,12 +31,11 @@ pub enum Region {
 
 const SHELL_REGIONS: [Region; 3] = [Region::Setup, Region::Center, Region::Diagnostics];
 const CENTER_REGIONS: [Region; 2] = [Region::Workspace, Region::Advanced];
-const AUDIT_REGIONS: [Region; 9] = [
+const AUDIT_REGIONS: [Region; 8] = [
     Region::Setup,
     Region::Center,
     Region::Workspace,
     Region::Advanced,
-    Region::PrimaryProgress,
     Region::PrimaryAction,
     Region::Diagnostics,
     Region::PrimaryCard,
@@ -92,8 +90,8 @@ impl Composition {
 
     pub fn audit_regions(self) -> &'static [Region] {
         match self.page {
-            crate::generated::FeatureId::Live => &AUDIT_REGIONS[..6],
-            crate::generated::FeatureId::Annotate => &AUDIT_REGIONS[..7],
+            crate::generated::FeatureId::Live => &AUDIT_REGIONS[..5],
+            crate::generated::FeatureId::Annotate => &AUDIT_REGIONS[..6],
             _ => &AUDIT_REGIONS,
         }
     }
@@ -118,15 +116,6 @@ impl Composition {
                 crate::generated::FeatureId::Predict => "predict.card.output",
                 crate::generated::FeatureId::Export => "export.card.output",
                 _ => panic!("this workflow does not have an Output card"),
-            },
-            Region::PrimaryProgress => match self.page {
-                crate::generated::FeatureId::Train => "train.primary.progress",
-                crate::generated::FeatureId::Validate => "validate.primary.progress",
-                crate::generated::FeatureId::Predict => "predict.primary.progress",
-                crate::generated::FeatureId::Live => "live.primary.progress",
-                crate::generated::FeatureId::Annotate => "annotation.save.progress",
-                crate::generated::FeatureId::Export => "export.primary.progress",
-                crate::generated::FeatureId::Explore => "explore.open.progress",
             },
             Region::PrimaryAction => match self.page {
                 crate::generated::FeatureId::Train => "train.primary",
@@ -380,7 +369,6 @@ mod tests {
                 Region::Center,
                 Region::Workspace,
                 Region::Advanced,
-                Region::PrimaryProgress,
                 Region::PrimaryAction,
                 Region::Diagnostics,
                 Region::PrimaryCard,

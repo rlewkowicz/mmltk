@@ -2,12 +2,12 @@
 
 [Wiki index](README.md) · [Commands](commands.md) · [Datasets](datasets.md) · [Training reference](rfdetr-training.md) · [GUI layout](gui-interaction.md#training-validation-and-prediction)
 
-Train, Validate, Predict, and Export use the same native model selection and preparation
-facts. Their primary action settles settings, selects the requested model,
-prepares missing weights, inspects the selected compiled inputs where needed,
-and starts the owning system. Preparation progress belongs to the model card;
-execution progress belongs to the workflow. A preparation failure stops that
-start request and publishes its typed error to session Status.
+Train, Validate, Predict, and Export share model selection/preparation. Their
+[primary action](gui-interaction.md#training-validation-and-prediction) settles
+settings, selects/prepares weights, inspects required compiled inputs, and starts
+the owning system. Preparation failure ends that request with its typed error
+in session Status. The model card shows preparation; the workflow shows execution
+progress.
 
 Train launches the packaged sibling CLI through `TrainingSystem`. Validate and
 Predict own independent native sessions, GPU work, cancellation, and retained
@@ -59,12 +59,10 @@ distinct:
 | Model output slot | Physical classifier axis, which may include unused or background slots |
 | External output ID | Identity required by an external export format |
 
-The [compiled format](datasets.md#compiled-binary-format) uses one-byte
-foreground references and 32-byte name fields. Names must fit exactly; the
-compiler rejects truncation. Source category identity is stored separately.
-Training, validation, and test splits for one training run require the same
-ordered catalog. Standalone evaluation can use an explicitly verified
-permutation of the same exact names.
+[Compiled class fields](datasets.md#compiled-binary-format) preserve source
+category identity separately and reject name truncation. A training run's
+train/validation/test splits require the same ordered catalog; standalone
+evaluation permits an explicitly verified permutation of the same exact names.
 
 [ModelClassLayout](../src/backend/models/rfdetr/contract/class_layout.h) records
 the ordered foreground catalog, each output slot's role, score encoding,
@@ -324,31 +322,20 @@ The [training reference](rfdetr-training.md#accumulation-optimizer-and-ema)
 defines first-copy, later averaging, and continuation behavior. `--no-ema` disables them. Disabled EMA creates no
 shadow storage or update work.
 
-Shared and independent models use EMA when enabled and ordinary weights
-otherwise for their selected validation trajectory and best-candidate choice.
-Evaluation temporarily selects EMA with restoration of working weights and
-training mode. Periodic mode also validates synchronized ordinary weights once,
-retaining that session source separately from model EMA sources. Final selection
-and optional test consume a frozen native artifact. See
-[model merging](model-merging.md) for cadence, policies, and publication.
-
-Stock Hungarian training follows the pinned upstream mathematics for equivalent
-admitted tensors and settings, including its extra accumulation divisor.
-Match-Free and DN are opt-in training extensions supporting both boxes and
-segmentation masks. See [RF-DETR training and selective compilation](rfdetr-training.md)
-for reference scope, native batch policy, mask adaptations, actual traced regions,
-and guard/fallback behavior; [validation](validation.md#training-mathematics-and-compilation-evidence)
-states what the mathematical and integration evidence establishes.
+Evaluation temporarily selects EMA, then restores working weights and training
+mode. [Merging/selection](model-merging.md) owns ordinary-versus-EMA trajectories,
+periodic synchronized validation, frozen final selection/test, and publication.
+[Training](rfdetr-training.md) owns pinned Hungarian mathematics (including the
+extra accumulation divisor), opt-in Match-Free/DN box/mask objectives, and
+selective tracing; [validation](validation.md#training-mathematics-and-compilation-evidence)
+owns their evidence limits.
 
 ## Checkpoints and continuation
 
-Current native archives use **version 4**. Resume requires the complete
-`session.json` manifest and its immutable generation, including for one model.
-Individual model archives and deployment candidates support Transfer rather
-than partial Resume. The [artifact and continuation reference](model-merging.md#artifact-layout-and-formats)
-owns filenames, versions, candidate/selected-output publication, leases, and
-whole-session validation. Upstream external weights retain separate import
-routes; older application checkpoints are unsupported.
+[Artifact formats](model-merging.md#artifact-layout-and-formats) and
+[whole-session admission](model-merging.md#whole-session-resume) govern Resume:
+even one model requires `session.json` and its complete immutable generation.
+Individual archives/candidates authorize Transfer only.
 
 Train's weights card owns mutually exclusive **Transfer** and **Resume** radios.
 Catalog and weights-only inputs use Transfer and cannot Resume. An admitted
@@ -359,12 +346,11 @@ loads history. A custom path already present in settings follows native
 inspection and the existing Prepare Resume path. The CLI accepts a manifest
 through `--resume`; see [whole-session Resume](model-merging.md#whole-session-resume).
 
-Custom selection starts cancellable native inspection on a worker. Inspection
-validates the archive, continuation, optimizer inventory, and required EMA
-state before publishing a compact capability. It retains immutable admission
-evidence rather than decoded tensors; exact file identity is checked again
-before use. Confirming the same custom path deliberately refreshes inspection.
-An inspection error stays actionable rather than automatically retrying.
+Custom selection starts worker-owned cancellable inspection of the archive,
+continuation, optimizer inventory, and required EMA state. Its compact capability
+retains immutable evidence with identity rechecked on use, as defined by
+[Resume admission](model-merging.md#whole-session-resume). Confirming the same
+path refreshes inspection; errors remain actionable without automatic retry.
 
 Start in Resume mode restores the saved training settings, settles that
 restoration, and passes the native continuation admission used by CLI training.
@@ -520,10 +506,10 @@ source segmentation detail or establish source-resolution segmentation parity.
 Exact AP retains compact matching records proportional to evaluated detections;
 it is not a constant-memory statistic.
 
-Validation chooses up to six distinct random images from the evaluated
-population and captures their pixels, predictions, and ground truth during the
-same evaluation pass. A smaller population leaves empty cells. The fixed
-two-column/three-row atlas and its detail viewer reuse those retained products.
+Validation captures pixels, predictions, and ground truth for up to six distinct
+random images from the evaluated population during that same pass.
+The [atlas/detail viewer](gui-interaction.md#validation-workspace-and-shared-viewer)
+reuses them, leaving empty cells for a smaller population.
 [ValidationSamples](../src/controller/subsystems/validate/detail/validation_samples.cpp)
 keeps progressive population membership separate from the immutable membership
 used by displayed detail. Opening detail freezes that view while capture
@@ -548,25 +534,21 @@ reported macro-F1 threshold, candidate selection, COCO accumulation, and CLI
 reports. Preview edits preserve the evaluation generation, results, and raw
 samples; ground-truth import remains unchanged.
 
-The GUI presents twelve fixed COCO summary rows: AP 50:95, AP50, AP75,
-AP small/medium/large, AR at each of the three recorded caps, and AR
-small/medium/large. Boxes and available Masks use separate columns; unavailable
-values show `—`. Native detail queries still support pages of at most four
-rows, while this view has no metric, IoU, recall, or detail-page controls.
-The [Validation workspace](gui-interaction.md#validation-workspace-and-shared-viewer)
-owns layout, shared viewer interaction, and the Validation-only
-Groundtruth/Detections layer and compositing rules.
+The twelve fixed GUI COCO summary rows are AP 50:95, AP50, AP75, AP small/medium/large, AR at the
+three recorded caps, and AR small/medium/large. Boxes and available Masks have
+separate columns; unavailable values show `—`. Native detail queries support
+pages of at most four rows, though the [view](gui-interaction.md#validation-workspace-and-shared-viewer)
+has no metric, IoU, recall, or detail-page controls.
 
 At the accepted primary Start, Validate captures layer visibility, label
 visibility, boxes/masks, and Display confidence in a typed
 [ValidationRunPreview](../src/controller/contracts/validation_display.h).
 That payload survives settings settlement and model preparation. The native
 [sample-output owner](../src/controller/subsystems/validate/detail/validation_sample_output.cpp)
-saves each selected identity once as `samples/sample-<dataset-index>.png`, at
-the sample's complete native geometry. It uses actual class names, complementary
-GT/Det colors, additive mask/outline overlap, and GT-before-Det captions.
-Later viewer edits, pan, zoom, scrolling, and browser availability do not change
-the captured save. Required PNG writes settle before successful completion.
+saves each selected identity once as `samples/sample-<dataset-index>.png` at
+complete native geometry, using class names and the [Validation composition rules](gui-interaction.md#validation-workspace-and-shared-viewer).
+Viewer edits, pan/zoom/scroll, and browser availability cannot change the captured
+save. Required PNG writes settle before success.
 A save failure preserves computed metrics, the completed report and PNGs,
 and reports the image-output error. Optional interactive adoption does not
 control metrics or required saves.

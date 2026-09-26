@@ -71,11 +71,11 @@ void arm_escalation(const int descriptor, const std::chrono::milliseconds delay_
  ::close(descriptor);
  throw std::system_error(error, std::generic_category(), "failed to register train progress watch");
 }
-[[nodiscard]] std::string bounded_file(const std::filesystem::path& path) {
+[[nodiscard]] std::string bounded_file(const std::filesystem::path& path, std::size_t limit = kProgressDocumentLimit) {
  std::error_code error;
  const auto size = std::filesystem::file_size(path, error);
  if (error) return {};
- if (size > kProgressDocumentLimit) throw std::runtime_error("train progress document exceeds its fixed admission limit");
+ if (size > limit) throw std::runtime_error("train progress document exceeds its fixed admission limit");
  std::ifstream input(path.c_str(), std::ios::binary);
  if (!input) return {};
  std::string result(static_cast<std::size_t>(size), '\0');
@@ -100,7 +100,7 @@ void arm_escalation(const int descriptor, const std::chrono::milliseconds delay_
    const auto* event = reinterpret_cast<const inotify_event*>(buffer.data() + offset);
    if (event->wd == watch && event->len != 0U && (event->mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) != 0U) {
     const std::string_view name{event->name};
-    relevant = relevant || name == "progress.json" || name == "results.json" || name == "log.txt";
+    relevant = relevant || name == "progress.json" || name == "results.json" || name == "log.txt" || name == mmltk::backend::models::rfdetr::kTrainingPreparationFile;
    }
    offset += sizeof(inotify_event) + event->len;
   }
@@ -245,6 +245,7 @@ TrainProcessClient TrainProcessClient::launch(
  std::filesystem::remove(request.output_dir / "progress.json", cleanup_error);
  std::filesystem::remove(request.output_dir / "results.json", cleanup_error);
  std::filesystem::remove(request.output_dir / "log.txt", cleanup_error);
+ std::filesystem::remove(request.output_dir / mmltk::backend::models::rfdetr::kTrainingPreparationFile, cleanup_error);
  const auto arguments = build_train_command_arguments(request, fallback_preset_name);
  std::vector<std::string> argv_storage;
  argv_storage.reserve(arguments.size() + 1U);
@@ -267,6 +268,7 @@ TrainProcessClient TrainProcessClient::launch(
   state.setup_fd.reset(child.release_setup_error_fd());
   state.output_directory = request.output_dir;
   state.source_catalog = mmltk::backend::models::rfdetr::training_source_catalog(request);
+  state.status_dirty = true;
   state.progress_fd.reset(progress_descriptor(state.output_directory, state.progress_watch));
   state.control_fd.reset(event_descriptor());
   state.escalation_fd.reset(timer_descriptor());
@@ -359,8 +361,25 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
  if (state_->progress_sequence == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("train progress sequence exhausted");
  const auto progress = nlohmann::json::parse(bounded_file(state_->output_directory / "progress.json"), nullptr, false);
  const auto result = nlohmann::json::parse(bounded_file(state_->output_directory / "results.json"), nullptr, false);
- if (!progress.is_object() && !result.is_object() && !state_->persistence_failed) return std::nullopt;
  namespace r = mmltk::backend::models::rfdetr;
+ if (!progress.is_object() && !result.is_object() && !state_->persistence_failed) {
+  const auto text = bounded_file(state_->output_directory / r::kTrainingPreparationFile, 1024);
+  if (text.empty() || !state_->observed_run.empty()) return std::nullopt;
+  const auto preparation = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingPreparationProgress>(text, {.max_bytes = 1024, .max_items = 16, .max_depth = 4});
+  if (state_->preparation == preparation) return std::nullopt;
+  state_->preparation = preparation;
+  std::string status;
+  switch (preparation.stage) {
+   case r::TrainingPreparationStage::Runtime: status = "Preparing runtime"; break;
+   case r::TrainingPreparationStage::Distributed: status = "Connecting training GPUs"; break;
+   case r::TrainingPreparationStage::Dataset: status = "Preparing dataset and sampling plan"; break;
+   case r::TrainingPreparationStage::Model: status = "Initializing model and GPU weights"; break;
+   case r::TrainingPreparationStage::Optimizers: status = "Preparing optimizers and validation"; break;
+  }
+  TrainProcessProgress update{.progress = {.sequence = ++state_->progress_sequence, .status = std::move(status)}};
+  update.sources.catalog = state_->source_catalog;
+  return update;
+ }
  std::optional<r::TrainingProgressDocument> document;
  try {
   const auto& source = progress.is_object() ? progress : result;

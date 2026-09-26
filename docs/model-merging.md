@@ -2,10 +2,9 @@
 
 [Wiki index](README.md) · [Training mathematics and lanes](rfdetr-training.md) · [Workflows and history](rfdetr-workflows.md) · [GUI controls](gui-interaction.md#lane-and-recipe-controls)
 
-Native RF-DETR training owns periodic model averaging, final deployment
-selection, and whole-session continuation. These operate on admitted named
-native tensors before ONNX/TensorRT export. They do not combine exported graphs
-or share mutable training state between independent models.
+Periodic averaging, deployment selection, and whole-session continuation operate
+on admitted named native tensors before export. Exported graphs are not merged;
+independent models retain separate mutable training state.
 
 ## Periodic averaging
 
@@ -116,11 +115,8 @@ must still satisfy native admission; use
 full model recipes and policies. Individual model `.pt` files, epoch candidates,
 and soups are Transfer/deployment inputs, even if an archive contains fields
 that belong to a session. They cannot authorize a partial-model Resume.
-Train's current custom chooser and confirmation admit weights extensions only;
-they do not admit a newly selected `.json` manifest. The existing GUI
-inspection/Prepare Resume path still operates on a custom path already present
-in settings; Browse Output selects history only. The CLI provides an explicit
-session-manifest entrypoint.
+The [GUI continuation reference](rfdetr-workflows.md#checkpoints-and-continuation)
+covers inspection/Prepare Resume and the current weights-only chooser limitation.
 
 [TrainingSessionAdmission](../src/backend/models/rfdetr/training/detail/training_session_checkpoint.h)
 validates the entire manifest, every named model, plan, checksum, and continuation
@@ -131,11 +127,18 @@ successful-image counters, and retained candidate identity. Epoch extension is
 supported while preserving consumed clocks and applied latches. Physical worker
 capacity does not redefine logical draws or effective batch.
 
-Inspection is cancellable. It retains exact admission evidence and a physical
-generation lease without decoded tensor/plan allocations after inspection;
-use checks those file identities again. A path, `run.json`, or a partial set of
-model files is insufficient. Transfer instead starts fresh training state from
-admitted weights.
+The compiled train/validation identities combine the already loaded format
+header (including geometry, classes, and section offsets), file size and
+modification time, and resolved model configuration. Startup does not read all
+image pixels to checksum a dataset. Moving or copying a compiled file while
+preserving its modification time retains this identity; replacing or modifying
+it requires a new session. Earlier manifests based on full-file checksums do
+not have this metadata identity and cannot authorize exact Resume.
+
+Cancellable inspection retains exact admission evidence and a physical generation
+lease, releasing decoded tensors/plans afterward and rechecking file identities
+on use. A path, `run.json`, or partial model set cannot authorize Resume.
+Transfer starts fresh training state from admitted weights.
 
 [TrainingSessionCheckpoint](../src/backend/models/rfdetr/training/training_session_checkpoint.cpp)
 writes one staging generation at a drained session boundary. It saves and
@@ -146,6 +149,6 @@ its predecessor, and any older generation with an active reader lease;
 retirement requires an exclusive lease. Reader custody therefore survives
 publication and cancellation without deleting files still in use.
 
-The [GUI output policy](rfdetr-workflows.md#training-inputs-and-output-destination)
-and CLI `--output-dir` decide where a run writes. They do not relax whole-session
-admission or change the independent saved-history format.
+[GUI output selection](rfdetr-workflows.md#training-inputs-and-output-destination)
+and CLI `--output-dir` choose destinations without changing admission or history
+format.

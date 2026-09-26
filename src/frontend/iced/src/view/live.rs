@@ -80,7 +80,6 @@ impl Component {
                 model
                     .live_stop_available()
                     .then_some(Message::StopRequested),
-                column![].into(),
             ),
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)

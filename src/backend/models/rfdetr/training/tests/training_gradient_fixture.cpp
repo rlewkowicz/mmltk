@@ -449,7 +449,7 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
      metrics.begin_attempt(k);
      expected_optimizer.zero_grad(true);
      double attempt_loss = 0;
-     const auto slice = TrainingDataPlan::rank_slice(batch, distributed.rank, distributed.world_size);
+     const auto slice = training_rank_slice(batch, distributed.rank, distributed.world_size);
      for (std::size_t start = 0; start < k; start += physical) {
       const auto slots = std::min(physical, k - start);
       counts.begin(slots);
@@ -584,7 +584,7 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
     // in every collective without manufacturing class/cardinality availability.
     metrics.reset_epoch();
     metrics.begin_attempt(k);
-    const auto slice = TrainingDataPlan::rank_slice(batch, distributed.rank, distributed.world_size);
+    const auto slice = training_rank_slice(batch, distributed.rank, distributed.world_size);
     for (std::size_t micro = 0; micro < k; ++micro) {
      if (!slice.count) {
       metrics.accumulate_empty();

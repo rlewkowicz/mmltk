@@ -23,6 +23,14 @@ inline constexpr std::size_t kTrainingManifestBytes = 4U * 1024U * 1024U;
 inline constexpr std::string_view kTrainingPersistenceFailureLine = "\nMMLTK_TRAIN_PERSISTENCE_FAILED_V1\n";
 enum class TrainingPhase : std::uint8_t { Starting, Train, Validate, EpochComplete, Completed, Error, Cancelled, Merge };
 enum class TrainingRecordRole : std::uint8_t { Live, Boundary, Epoch, Terminal };
+enum class TrainingPreparationStage : std::uint8_t { Runtime, Distributed, Dataset, Model, Optimizers };
+MMLTK_REFLECT_ENUM(TrainingPreparationStage)
+inline constexpr std::string_view kTrainingPreparationFile = "preparation.json";
+struct TrainingPreparationProgress final {
+ TrainingPreparationStage stage = TrainingPreparationStage::Runtime;
+ bool operator==(const TrainingPreparationProgress&) const = default;
+};
+MMLTK_REFLECT_FIELDS(TrainingPreparationProgress)
 MMLTK_REFLECT_ENUM(TrainingPhase)
 MMLTK_REFLECT_ENUM(TrainingRecordRole)
 // Hungarian components are raw main-output losses; Match-Free components are

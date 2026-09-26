@@ -23,16 +23,11 @@ owns coverage, tolerances and evidence limits. These checks establish neither
 COCO AP, convergence, throughput nor bitwise equivalence to upstream's default
 kernel selection.
 
-The current runtime payload is pinned by
-[nvidia-payload.json](../docker/nvidia-payload.json): NGC 26.08 with
-Torch `2.14.0a0+4fdf77b940`. Versioned upstream dependency references below
-explain particular equations; they do not identify the installed payload's
-complete implementation.
-
-Workflow [GPU selection](gpu-execution.md#workflow-device-selection) and
-[local-training failure guidance](rfdetr-workflows.md#local-training-failures)
-are independent of these equations. CUDA OOM reporting preserves the admitted
-workload; changing batch size or lane count requires the user's next run.
+[nvidia-payload.json](../docker/nvidia-payload.json) pins NGC 26.08 and Torch
+`2.14.0a0+4fdf77b940`. Upstream dependency links below explain equations, not the
+installed payload's entire implementation. [GPU selection](gpu-execution.md#workflow-device-selection)
+and [failure/OOM handling](rfdetr-workflows.md#local-training-failures) have
+separate operational contracts.
 
 ## Stock objective and mask mathematics
 
@@ -133,11 +128,10 @@ NCCL transport to overlap ready reductions with remaining backward work.
 Hook, bucket, stream, and collective Work custody survive cancellation until
 physical use settles.
 
-Native execution facts identify configuration-derived products by settings
-revision and admitted runtime capacity by operation generation. The
-[GUI controls](gui-interaction.md#lane-and-recipe-controls) display those facts;
-they do not repeat the arithmetic in Rust. More lanes use more memory and do
-not establish a throughput improvement.
+Native facts bind configuration calculations to settings revision and runtime
+capacity to operation generation; [GUI controls](gui-interaction.md#lane-and-recipe-controls)
+display them without repeating the arithmetic. More lanes cost memory without
+guaranteeing throughput.
 
 ## Accumulation, optimizer and EMA
 
@@ -173,12 +167,11 @@ once, preserving the ordinary temporal weighting of epoch losses.
 
 ### Recipes and schedules
 
-[TrainRecipeSettings](../src/backend/models/rfdetr/contract/train_recipe.h)
-is the one recipe vocabulary for global defaults and each logical model.
-New model entries copy the settled global recipe, then retain independent
-overrides. Mode changes preserve existing entries. Reset clears overrides in
-the selected scope while retaining its optimizer. IDs are stable and not reused;
-new model seeds derive from the session seed and ID.
+Canonical [TrainRecipeSettings](../src/backend/models/rfdetr/contract/train_recipe.h)
+serves global defaults and each model. New entries copy settled globals and
+retain independent overrides through mode changes. Reset clears only the
+selected scope's overrides, retaining its optimizer. IDs are stable/nonreused;
+new seeds derive from session seed and ID.
 
 | Catalog default | AdamW | Muon | SGD |
 | --- | ---: | ---: | ---: |
@@ -278,10 +271,9 @@ owns selected-weight evaluation and saved artifacts.
 
 [TrainingDataPlan](../src/backend/models/rfdetr/training/training_data_plan.cpp)
 owns sparse distinct class presence per original image, immutable model shards,
-and deterministic epoch schedules. Crowd annotations do not contribute support;
-empty and crowd-only images remain members. Shared mode retains the full dataset
-in one model shard; independent/periodic modes partition membership between
-models before slicing each global microbatch across ranks.
+and deterministic epoch schedules. Crowd contributes no support; empty/crowd-only images
+remain members. Shared mode uses one full-dataset shard; independent/periodic
+modes partition between models before rank-slicing global microbatches.
 
 **Off** uses approximately equal deterministic image shards. **Stratified**
 prioritizes scarce support while respecting shard capacity. **Rare repeats +
@@ -361,12 +353,11 @@ updates; no measured accuracy or convergence benefit is asserted.
 
 ## Native selective compilation
 
-Native **selective** mode uses LibTorch/TorchScript tracing. The pinned upstream
-instead calls `torch.compile(model, dynamic=True)` with Dynamo/Inductor,
-graph breaks and suppressed compiler failures. These are distinct systems with
-different capture and kernel-optimization coverage. Upstream partial compilation
-does not imply a successful single full graph; native selective tracing does
-not imply equivalent fusion or speed.
+Native **selective** mode uses LibTorch/TorchScript tracing; pinned upstream uses
+`torch.compile(model, dynamic=True)` with Dynamo/Inductor, graph breaks, and
+suppressed failures. Their capture/optimization coverage differs: upstream
+partial compilation does not establish a single full graph; native tracing
+implies neither equivalent fusion nor speed.
 
 The current bounded tensor regions are:
 
@@ -423,7 +414,7 @@ batch one. ONNX and TensorRT retain their own execution engines. CLI
 `--compile-mode none|selective` controls native selection; the existing `full`
 trace route is separate from this selective contract and its evidence.
 
-The [diagnostic reference](logging.md#native-selective-compilation) distinguishes
-recorded and executed optimized graphs, TensorExpr and older fusion node forms,
-autocast, and TF32 policy. Capture/reuse is evidence of graph execution, not
-proof of training fusion or a throughput improvement.
+[Diagnostics](logging.md#native-selective-compilation) distinguishes recorded
+versus executed optimized graphs, fusion node forms, autocast, and TF32.
+[Validation](validation.md#training-mathematics-and-compilation-evidence) records
+the observed fusion boundary and evidence limits.

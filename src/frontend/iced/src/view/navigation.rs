@@ -1,8 +1,8 @@
 use crate::fluent_theme::Element;
 use crate::generated::FeatureId;
 use crate::view_model::Typography;
-use iced::widget::{button, container, row, space, text};
-use iced::{Center, Fill};
+use iced::Center;
+use iced::widget::{button, container, row, text};
 
 pub const ORDER: [FeatureId; 7] = [
     FeatureId::Train,
@@ -33,11 +33,7 @@ pub fn update(message: Message) -> Outcome {
     }
 }
 
-pub fn view(
-    selected: FeatureId,
-    connection: &'static str,
-    typography: Typography,
-) -> Element<'static, Message> {
+pub fn view(selected: FeatureId, typography: Typography) -> Element<'static, Message> {
     let tabs = ORDER
         .into_iter()
         .fold(row![].spacing(6).align_y(Center), |tabs, feature| {
@@ -51,19 +47,11 @@ pub fn view(
             tabs.push(container(tab).id(stable_id(feature)))
         });
     container(
-        row![
-            text("mmltk").size(typography.primary * 1.8),
-            tabs,
-            space::horizontal(),
-            text(connection)
-                .size(typography.secondary)
-                .style(crate::fluent_theme::text_secondary),
-        ]
-        .spacing(16)
-        .align_y(Center),
+        row![text("mmltk").size(typography.primary * 1.8), tabs,]
+            .spacing(16)
+            .align_y(Center),
     )
     .padding([6, 10])
-    .width(Fill)
     .into()
 }
 

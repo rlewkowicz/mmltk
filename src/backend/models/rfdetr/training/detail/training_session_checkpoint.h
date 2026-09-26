@@ -5,6 +5,7 @@
 #include <memory>
 #include <stop_token>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "training_continuation.h"
 #include "training_data_state.h"
@@ -12,7 +13,11 @@
 #include <span>
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/contract/training_artifacts.h"
+#include "src/backend/data/compiled_format.h"
+#include "src/common/io/file_digest.h"
 namespace mmltk::backend::models::rfdetr {
+// Uses the admitted header and file metadata only; never reads dataset payloads.
+[[nodiscard]] std::string training_dataset_identity(const mmltk::backend::data::FileHeader&, const mmltk::common::io::FileSnapshot&, std::string_view configuration);
 [[nodiscard]] bool is_training_session_manifest(const std::filesystem::path&);
 enum class TrainingPublicationStep { Created, PlanWritten, ModelWritten, ModelValidated, Serialized, Validated, Synced, Published, Retained };
 // The bounded admission retains a physical directory lease through all archive

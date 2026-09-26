@@ -3,19 +3,19 @@
 [Wiki index](README.md) · [Architecture](architecture.md#reflected-value-and-persistence-boundaries) · [Generated bindings](build.md#generated-bindings-and-dependency-maintenance) · [Declaration tooling](validation.md#raw-cpd-and-declaration-formatting)
 
 Canonical C++ declarations own native vocabulary, defaults, constraints, field
-identity, and structural projections. Ordinary classes and functions own
-resource lifetime, control flow, and product policy. Rust/Iced retains visual
-copy, component state, layout, styling, navigation, and interaction.
+identity, and structural projections. Ordinary systems own resources, execution,
+and product policy; Rust/Iced owns presentation and interaction, as defined by
+[the contract](../CONTRACT.md#model-presentation-model-and-views).
 
 ## Declare once, project structurally
 
-Put a canonical type beside its owning system in a self-contained ordinary
-header. Include its full dependencies directly. Materialize reflection through
-that header and publish ordinary types, functions, constants, or reusable
-template specializations; consumers should not re-reflect the same schema or
-depend on include order. CMake registers source/header membership and generated
-boundary inputs; it is not accompanied by another declaration scanner or field
-inventory. See [target registration](build.md#target-declarations-and-precompiled-headers).
+Declare canonical types beside their systems in self-contained ordinary
+headers with direct dependencies. Materialize reflection there; publish ordinary
+types, functions, constants, or reusable template specializations so consumers
+need neither re-reflection nor include-order assumptions.
+[CMake registration](build.md#target-declarations-and-precompiled-headers) owns
+source/header membership and generation inputs, without a parallel scanner or
+field inventory.
 
 [reflection_metadata.h](../src/frameworks/reflection/reflection_metadata.h)
 provides `MMLTK_REFLECT_FIELDS(Type)` and `MMLTK_REFLECT_ENUM(Type)` registration.
@@ -47,8 +47,7 @@ MMLTK_REFLECT_FIELDS(ExportOptions)
 }  // namespace example
 ```
 
-The struct, initializer, equality, and registration remain ordinary visible
-C++. The example adds no owner, runtime registry, or alternate schema.
+The struct, initializer, equality, and registration remain explicit C++.
 
 ## Short annotation syntax
 
@@ -77,10 +76,9 @@ can contain commas. For a comma-containing `Minimum`/`Maximum` type, declare a
 scoped type alias and pass that alias as the first argument. Do not introduce
 another macro family or mirror the canonical limits locally.
 
-These macros do not declare records, fields, constructors, defaults, equality,
-or registrations. They do not reflect resource or execution state. Dynamic
-type tables and runtime discovery require a product need; short annotation
-syntax supplies neither.
+Macros supply annotation syntax only: records, fields, constructors, defaults,
+equality, and registrations stay explicit. Resource/execution state remains
+ordinary; dynamic type tables or discovery require a product need.
 
 ## Safe mechanical formatting
 

@@ -44,6 +44,14 @@ void validate_training_configuration(const TrainRequest& request) {
  if (effective_final_policy(config) == TrainFinalPolicy::Explicit && (!(coefficients > 0) || !std::isfinite(coefficients)))
   throw std::invalid_argument("explicit final coefficients require a finite positive sum");
 }
+TrainingRankSlice training_rank_slice(std::uint64_t batch, std::uint32_t rank, std::uint32_t world) {
+ if (!batch || !world || rank >= world) throw std::invalid_argument("invalid training rank slice");
+ return {batch / world * rank + std::min<std::uint64_t>(rank, batch % world), batch / world + (rank < batch % world)};
+}
+TrainingBatchDistribution derive_training_batch_distribution(const TrainRequest& request) {
+ const auto ranks = request.device_ids.empty() ? 1U : static_cast<std::uint32_t>(request.device_ids.size());
+ return {ranks, training_rank_slice(request.batch_size, ranks - 1, ranks).count, training_rank_slice(request.batch_size, 0, ranks).count};
+}
 ExecutionFacts derive_execution_facts(const TrainRequest& request, const std::uint64_t revision) {
  validate_training_configuration(request);
  const bool shared = request.lane_configuration.mode == TrainLaneMode::SharedGradients;

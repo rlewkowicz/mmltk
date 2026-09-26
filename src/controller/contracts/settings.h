@@ -23,6 +23,7 @@ struct SettingsUiState final {
  std::uint64_t revision = 0U;
  GuiSettingsState settings_state{};
  mmltk::backend::models::rfdetr::ExecutionFacts train_execution{};
+ mmltk::backend::models::rfdetr::TrainingBatchDistribution training_batch_distribution{};
  mmltk::backend::models::rfdetr::ExecutionFacts training_validation_execution{};
  mmltk::backend::models::rfdetr::ExecutionFacts validation_execution{};
  mmltk::backend::models::rfdetr::ExecutionFacts prediction_execution{};

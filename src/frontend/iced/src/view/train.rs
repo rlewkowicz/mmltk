@@ -45,7 +45,6 @@ pub enum Message {
     RetryReconciliationRequested,
     Dataset(dataset::Message),
     Advanced(advanced::Message),
-    Lanes(lanes::Message),
     Model(crate::view::workflow::model_card::Message),
     Metrics(crate::view::metrics::Message),
     Output(output::Message),
@@ -187,14 +186,11 @@ impl Component {
                 dataset::Outcome::Compile => Outcome::CompileRequested,
                 dataset::Outcome::Stop => Outcome::DatasetStopRequested,
             },
-            Message::Lanes(message) => {
-                let Some(schedule) = lanes::update(model, message)? else {
+            Message::Advanced(message) => {
+                let Some(schedule) = advanced::update(model, message)? else {
                     return Ok(None);
                 };
                 Outcome::SettingsEdited(schedule)
-            }
-            Message::Advanced(message) => {
-                Outcome::SettingsEdited(advanced::update(model, message)?)
             }
             Message::Model(message) => {
                 let Some(outcome) = self.model_card.update(message, file_dialog, model)? else {
@@ -288,9 +284,6 @@ impl Component {
                 model
                     .training_stop_available()
                     .then_some(Message::TrainingStopRequested),
-                crate::view::workflow::progress::compute(
-                    model.workflow.training.as_ref().map(|state| &state.local)
-                ),
             ),
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)
@@ -327,32 +320,12 @@ impl Component {
             center = center.push(progress::view(model));
         }
         let workspace = center.into();
-        let mut distribution = column![].spacing(6);
-        if let Some(training) = &model.workflow.training {
-            for facts in &training.sources.distributions {
-                distribution = distribution.push(text(format!(
-                    "Model {} · epoch {} · {} unique images · {} scheduled draws · {} class support · {} class exposure · {} missing classes · {} unused tail",
-                    facts.modelid, facts.epoch + 1, facts.uniqueimages, facts.scheduleddraws,
-                    facts.uniqueclasssupport, facts.repeatedclassexposure, facts.missingclasses, facts.unusedtail,
-                )).size(12));
-            }
-        }
         let editable = execution_edit_available;
-        let lane_controls: Element<'_, Message> = installed_train.map_or_else(
-            || text("Training settings unavailable").into(),
-            |train| lanes::view(&train.request, settings, editable).map(Message::Lanes),
-        );
         let advanced = crate::view::shared::identified(
             "train.card.advanced",
             iced::widget::keyed_column([(
                 settings.recipe_model,
-                column![
-                    distribution,
-                    lane_controls,
-                    advanced::view(installed_train, settings, editable, model)
-                        .map(Message::Advanced),
-                ]
-                .into(),
+                advanced::view(installed_train, settings, editable, model).map(Message::Advanced),
             )]),
         );
         let diagnostics = Some(crate::view::shared::identified(

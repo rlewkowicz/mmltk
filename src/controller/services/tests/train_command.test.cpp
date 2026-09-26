@@ -168,6 +168,21 @@ TEST_CASE("Execution admission checks global products bounded stable models and 
  CHECK(shared.microbatches_per_attempt == 8);
  CHECK(shared.effective_batch_per_model == 24);
  CHECK(shared.aggregate_round_images == 24);
+ for (const auto batch : {1U, 3U, 12U}) {
+  auto distributed = value;
+  distributed.batch_size = batch;
+  distributed.device_ids = {1, 0};
+  const auto configured = r::derive_training_batch_distribution(distributed);
+  CHECK(configured.ranks == 2);
+  const auto first = r::training_rank_slice(batch, 0, 2);
+  const auto last = r::training_rank_slice(batch, 1, 2);
+  CHECK(configured.minimum_rank_batch == last.count);
+  CHECK(configured.maximum_rank_batch == first.count);
+  CHECK(first.count + last.count == batch);
+  CHECK(last.begin == first.count);
+  distributed.device_ids.clear();
+  CHECK(r::derive_training_batch_distribution(distributed).minimum_rank_batch == batch);
+ }
  r::resize_training_models(value.lane_configuration, r::kMaximumTrainingModels, value.recipe, value.seed);
  CHECK(value.lane_configuration.models.size() == 16);
  CHECK(value.lane_configuration.models.front().seed != value.lane_configuration.models.back().seed);

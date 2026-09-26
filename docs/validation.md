@@ -2,24 +2,18 @@
 
 [Wiki index](README.md) · [Quick start](../README.md#build) · [Logging](logging.md) · [Headless Wayland](headless-wayland.md)
 
-The governing validation sequence and review/checkpoint rules are in
-[AGENTS.md](../AGENTS.md#final-validation-workflow). Follow those rules when
-executing a plan, including the main agent's ownership of validation fixes and
-the single cleanup review before the final build. Successful required final
-build, tests, and acceptance lead to the implementation commit, documentation
-pass, and documentation commit; documentation does not reopen validation or
-introduce a whole-plan review. After the required final full build, the test
-and acceptance gate is exactly these commands, in order, and both must pass:
+[AGENTS.md](../AGENTS.md#final-validation-workflow) owns validation stage order,
+fix/review ownership, checkpoints, and the final documentation pass. After the
+required final full build, both gate commands must pass in this order:
 
 ```bash
 ./mmltk --test all
 ./mmltk --test workspace-wayland --headless-compositor
 ```
 
-The unfiltered `all` route includes native executables, browser JavaScript/Rust
-tests, cleanup/declaration-tool fixtures, and log-query fixtures. The remaining commands describe standalone
-capabilities. Focused filters, individual executables, and additional suite
-invocations do not replace or supplement this Final Validation gate.
+Unfiltered `all` runs native, browser JavaScript/Rust, cleanup/declaration, and
+log-query fixtures. The standalone capabilities below neither replace nor
+supplement this gate with focused filters, executables, or extra suites.
 
 ## Formatting and static analysis
 
@@ -107,9 +101,8 @@ time. Statement boundaries and scope ownership are cached; reported spans and
 pattern identities are grouped without all-pairs function comparisons. No
 filename exclusions or suppression registry are added.
 
-These ordinary reports retain the narrow inline suppression rules in
-[AGENTS.md](../AGENTS.md#deduplication-rules). They are separate from the raw
-declaration evidence below.
+[Inline suppression policy](../AGENTS.md#deduplication-rules) applies only to
+ordinary reports; raw declaration evidence below is separate.
 
 ## Raw CPD and declaration formatting
 
@@ -233,10 +226,9 @@ remain native selections and do not append those fixture groups. `all` does not
 execute `cuda-vulkan`, the compositor tooling suites, or the profile
 runner. `gui` and `tsan` suite names are currently unavailable even though other
 GUI/development build facilities exist.
-The full product build's `--no-run` frontend checks establish that the selected
-Rust test targets compile. They do not establish execution of `browser-app`,
-its Rust tests, or its direct JavaScript tests. Report execution only when the
-fixtures ran through unfiltered `all` or the standalone `browser-app` route.
+Product-build `--no-run` checks prove Rust test compilation only. Execution
+requires unfiltered `all` or standalone `browser-app`, including its JavaScript
+cases.
 
 Some RF-DETR tests download model checkpoints and derive normalized weights,
 ONNX, and TensorRT engines in `.cache/tests/rfdetr` on first use. Hardware-gated
@@ -506,47 +498,33 @@ when a source revision is fixed, browser checks establish matching slot identity
 before one geometry scan. Evidence ordinals, predecessor/suffix rules,
 independent stream drains, and late-conflict rejection still govern those joins.
 
-The workflow case uses
-[native model/video fixtures](../src/acceptance/tests/workflow_wayland_inputs.cpp)
-and the real packaged desktop's sibling CLI, prediction, and validation systems.
-Its [frontend workflow driver](../src/frontend/iced/src/integration_control/workflows.rs)
-uses normal primary actions and viewers. It separately requires typed terminal
-stages and canvas pixel observations for Train curves, the isolated live
-progress bar, all six thumbnails, detail, each prediction source, retained Stop
-output, and theme/narrow layouts. Progress evidence pairs the bar capture with
-observed native image counts during the Train phase; hidden-tab evidence then
-requires metric sequence advancement.
-Validation waits for all six samples to be available with identities from the
-completed evaluation generation before advancing to their canvas checks.
-Native metric completion can precede the asynchronous sample renderer.
-The validation run opens detail during progressive capture, waits for
-successful native settlement with detail retained, closes it, and requires all
-six samples from that generation in the returned atlas. This uses completed
-products from that run without another evaluation.
+The [workflow driver](../src/frontend/iced/src/integration_control/workflows.rs)
+uses [native model/video fixtures](../src/acceptance/tests/workflow_wayland_inputs.cpp),
+normal primary actions/viewers, and the packaged sibling CLI and native systems.
+Typed terminals and canvas pixels are independently required for Train curves,
+progress, all six Validation thumbnails/detail, each prediction source, retained
+Stop output, and theme/narrow layouts. Bar capture pairs native image counts
+during Train; hidden-tab checks require later metric sequences. Validation opens
+detail during capture, settles successfully with detail retained, then closes it and requires all
+six same-generation samples without reevaluation. Canvas checks wait for sample
+rendering, which can lag native metric completion.
 
-For each of the four workflows, the driver selects a native inventory device
-through the shared GPU card and checks settled settings. It measures the
-Output/GPU order for all four workflows in the light layout and for Train in
-dark and narrow layouts. The independent browser audit joins each admitted
-native generation to actual
-`workflow.gpu_execution` records in both directions, checks device/rank facts,
-and covers cancellation before progress is published. Selection labels alone
-cannot satisfy the execution check. The
-[logging reference](logging.md#workflow-gpu-evidence) owns those records.
+Each workflow selects a native inventory device through the GPU card and settles
+settings. [GPU evidence](logging.md#workflow-gpu-evidence) requires bidirectional
+admitted-generation/execution joins, device/rank facts, cancellation before
+progress, and Output/GPU layout in all four light cards plus dark/narrow Train.
+Selection labels alone do not pass.
 
-The packaged Status scenario exercises the real root overlay with bounded
-in-memory fixture notices: add/update/dismiss and overflow, wrapping/selectable
-long text, exact Copy, hover and Escape/reentry, keyboard/touch input, wide and
-narrow layouts, theme, modal availability, and annotation shortcut isolation.
-It separately observes pulse/reduced-motion and hidden-window quietness.
-The [Status driver](../src/frontend/iced/src/integration_control/status.rs),
-JavaScript canvas/input adapter, and independent browser audit join rendered
-interaction evidence with notice identity; fixture data is not a native
-operation failure. Rust notice-store tests cover bootstrap, reconnect,
-deduplication, source acknowledgment, stale delivery, and clipboard custody.
-The [interaction contract](gui-interaction.md#session-status) and
-[record reference](logging.md#rendered-ui-acceptance-evidence) own behavior and
-diagnostic field meanings.
+The [Status driver](../src/frontend/iced/src/integration_control/status.rs)
+exercises the real overlay using bounded in-memory notices: add/update/dismiss,
+overflow, wrapping/selection of long text, exact Copy, hover/Escape/reentry,
+keyboard/touch, wide/narrow/theme/modal layouts, annotation shortcut isolation,
+pulse/reduced motion, and
+hidden quietness. JavaScript input/canvas and independent audits join
+[rendered records](logging.md#rendered-ui-acceptance-evidence) to notice identity;
+fixtures are not native failures. Rust tests cover bootstrap/reconnect,
+deduplication/acknowledgment, stale delivery, and clipboard custody under the
+[Status contract](gui-interaction.md#session-status).
 
 The workflow scenario also verifies the individual saved Validation PNGs,
 Predict saving-control state, compiled/image samples, completed video, and
@@ -560,21 +538,16 @@ preceding each primary action; Predict keeps its saving controls. Exact
 [failure records](logging.md#prediction-media-acceptance) distinguish invalid
 observations from missing terminal evidence.
 
-The same browser first opens Explore, runs Validate, and returns directly to
-Explore through normal navigation. It requires a current paired gallery draw
-and actual colored pixels inside a ready compiled-image tile. There is no
-intermediate page or extra Open action on that return. The
-[pixel record](logging.md#rendered-ui-acceptance-evidence) carries the image and
-draw identities independently of logical dataset readiness.
+The same browser opens Explore, runs Validate, and returns directly with no
+intermediate page or extra Open. It requires [paired ready-tile pixels](logging.md#rendered-ui-acceptance-evidence),
+independently of dataset readiness.
 
-Validation checks its default display confidence, exact `0.437` entry, retained
-value after blank/out-of-range text and arrow/wheel input, and settled `0 → 1 → 0`
-edits. Metrics and the evaluation generation must stay unchanged. With ground
-truth hidden, independent canvas comparisons require detection pixels to
-disappear at 1 and return at 0 while raw detections and clean-image identity
-remain intact. The driver also measures Groundtruth/Detections groups beneath
-the preview at ordinary and narrow widths, requires the 20-pixel group spacing
-and narrow wrapping, and observes the Advanced confidence text.
+Confidence checks cover the default, exact `0.437`, blank/out-of-range retention,
+inert arrow/wheel input, and settled `0 → 1 → 0` edits. The independent
+[confidence pixel oracle](logging.md#rendered-ui-acceptance-evidence) verifies
+filtering with unchanged metrics/evaluation generation, raw detections, and
+clean identity. Layout checks require Groundtruth/Detections beneath the preview,
+20-pixel spacing, narrow wrapping, and Advanced confidence text.
 
 The workflow fixture keeps a real six-query native detector. It calibrates its
 checkpoint against the model's actual selected proposals so detection captions
@@ -632,16 +605,11 @@ wrapped labels within the right column. Reveal operations remeasure bounds
 after scrolling and allow for whole-pixel scroll translation; canvas gestures
 continue to use the full image geometry and visible source region.
 
-The physical ledger distinguishes native source allocations from retained
-browser arenas and requires each exact acquisition, transfer, mode-specific
-settlement receipt, encoded/submitted draw, and final sample release. A
-diagnostic-only draw identity joins each draw's encoding, actual submission,
-and terminal settlement; independent callbacks may arrive out of order. The
-capacity scenario deliberately delivers arena availability before the held native
-completion receipt, then verifies the exact retry. Allocation inventories,
-actual copy receipts, resource settlement, and rendered pixels have independent
-assertions; [logging evidence](logging.md#physical-presentation-evidence)
-describes the fields and their limits.
+The [physical ledger](logging.md#physical-presentation-evidence) independently
+checks allocation inventories, exact acquisitions/transfers, mode-specific
+settlement, encoded/submitted draws, final release, and rendered pixels, admitting
+out-of-order callbacks by draw identity. The capacity fixture delivers arena
+availability before a held native completion receipt, then checks the exact retry.
 
 The pending-supersession fixture uses a typed acceptance-only hold for a
 synthetic undersized candidate; it verifies the retained completed fallback
@@ -651,20 +619,14 @@ The physical ledger separately requires submission and settlement.
 FPS acceptance combines actual submission observations with an
 asynchronous canvas read of the displayed counter.
 
-The ledger follows the negotiated mode: direct acquisitions retain the native
-source until actual GPU read settlement; copied samples require physical copy
-completion. Unacquired offers require no read receipt. Per-card and full-frame
-probes check pixels independently of allocation and submission facts.
-Canvas atlas probes sample bounded patches inside the actual clipped visible
-tile interiors from one canvas snapshot, retaining the exact draw receipt and
-physical coordinates. Annotation pixel checks independently verify
-downsampled colored geometry against the fixture's known uniform background.
-The [rendered evidence reference](logging.md#rendered-ui-acceptance-evidence)
-describes these records and their sampling limits.
-Use the [Vulkan log queries](logging.md#vulkan-diagnostics-and-descriptor-provenance)
-for validation-layer output. A controlled window close and an intentional
-process loss have different terminal evidence; process exit alone does not
-establish balanced userspace destruction or native GPU completion.
+[Mode-specific physical evidence](logging.md#physical-presentation-evidence)
+distinguishes direct read settlement, copy completion, and unacquired offers.
+Independent per-card/full-frame probes, clipped atlas patches, and Annotation
+geometry/background checks follow the [rendered evidence rules](logging.md#rendered-ui-acceptance-evidence).
+[Vulkan queries](logging.md#vulkan-diagnostics-and-descriptor-provenance) inspect
+validation-layer output. Controlled window close and intentional process loss
+have distinct terminals; exit alone proves neither balanced userspace destruction
+nor native GPU completion.
 
 See [headless details](headless-wayland.md) for compositor readiness,
 shutdown, and virtual-output limits. The [logging guide](logging.md#delivery-and-acceptance-ownership)
@@ -891,10 +853,7 @@ Native data membership and TF32 policy remain as documented in the reference.
 GPU-gated cases explicitly skip when their required CUDA or physical
 capabilities are unavailable; BF16 branches require compatible hardware.
 GDRCopy mappings additionally need a usable `gdrdrv` or CUDA DMA-BUF mmap route.
-A host lacking both cannot supply successful GDRCopy mapping evidence even
-when ordinary CUDA and Wayland pass. Product builds compile selected frontend
-test targets; unfiltered `all` and standalone `browser-app` execute them, as
-described [above](#native-and-browser-suites).
+A host lacking both cannot prove GDRCopy mapping even when CUDA/Wayland pass.
 
 ## Benchmark compilation evidence
 
@@ -946,10 +905,9 @@ The `browser-app` fixture group additionally owns
 [shared transition cases](../src/frontend/iced/src/view/shared/transition/tests.rs)
 for reversal, intrinsic reflow, retained widget identity, redraw quietness,
 focus/overlay clipping, mouse/touch cancellation, and composed-scroller input.
-Its integration-driver and JavaScript cases cover asynchronous array ownership,
-request retirement, and replacement-owner isolation. The full build compiles
-the selected Rust test targets; unfiltered `all` executes this group as part of
-the Final Validation gate. The standalone route supports focused investigation.
+Integration-driver/JavaScript cases cover asynchronous array ownership,
+request retirement, and replacement-owner isolation. [Suite selection](#native-and-browser-suites)
+defines build checks versus fixture execution.
 
 For standalone focused selection outside the Final Validation gate:
 
@@ -959,13 +917,11 @@ For standalone focused selection outside the Final Validation gate:
 ./mmltk --test application-systems --executable mmltk_controller_shell_tests -- '[dataset]'
 ```
 
-The [packaged Dataset scenario](#dataset-presentation-and-lifecycle) separately
-proves rendered presentation, real input, cancellation/restart, and native
-caption agreement.
-[Benchmark capacity and live-download limits](benchmark-datasets.md#cache-formats-and-capacity)
-define what these bounded fixtures do not establish. Runtime trace encoder
-and serialization suites additionally cover benchmark timestamps, effect-only
-delivery failures, Unicode scalar handling, and malformed wire-text rejection.
+[Packaged Dataset acceptance](#dataset-presentation-and-lifecycle) separately
+proves rendering, input, cancellation/restart, and native caption agreement;
+[capacity/download limits](benchmark-datasets.md#cache-formats-and-capacity) bound
+these claims. Trace/serialization suites cover timestamps, effect-only delivery
+failure, Unicode scalars, and malformed wire-text rejection.
 
 ## Shared fixtures and evidence
 

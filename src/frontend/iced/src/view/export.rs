@@ -96,6 +96,7 @@ impl Component {
                             settings_edit_available,
                             Message::TensorRtChanged
                         ),
+                        crate::view::workflow::progress::compute(operation),
                     ]
                     .spacing(crate::view::workflow::FIELD_SPACING)
                 )
@@ -115,7 +116,6 @@ impl Component {
                 model
                     .compute_stop_available(crate::generated::FeatureId::Export)
                     .then_some(Message::StopRequested),
-                crate::view::workflow::progress::compute(operation),
             ),
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)

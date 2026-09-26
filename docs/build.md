@@ -38,12 +38,11 @@ The build publishes the canonical bundle at `build/browser-app/dist`; every
 location. A missing or incompatible bundle fails launch, so rebuild after a
 native contract change.
 
-The [frontend CMake inputs](../src/frontend/iced/CMakeLists.txt) include the
-vendored `iced-fluent-theme` Rust sources and manifest alongside Iced, iced_aw,
-and iced_plot. Theme-library edits therefore invalidate the bundle's build
-dependency set. Builds compile their configured Rust test targets with
-`--no-run`; actual native, browser, cleanup/declaration, and log-query fixture
-execution belongs to [validation](validation.md#native-and-browser-suites).
+The [frontend CMake inputs](../src/frontend/iced/CMakeLists.txt) include Iced,
+iced_aw, iced_plot, and `iced-fluent-theme` Rust sources/manifests; plot WGSL
+also invalidates the bundle. Configured host Rust tests compile with `--no-run`,
+separately from the optimized `trunk build --release` Wasm bundle. Execution and
+package selection belong to [validation](validation.md#native-and-browser-suites).
 
 Desktop startup resolves the native CLI beside `mmltk-browser-host` and gives
 that executable to the training process owner. Keep both installed siblings in
@@ -80,18 +79,8 @@ Explicit ONNX, simdjson, and cppcheck source builds use GCC 16.2 while retaining
 their configured language policies. Vendored dependencies keep their own
 policies; Firefox retains its cached Clang toolchain and bootstrap sysroot.
 The frontend Cargo workspace includes the owned `third_party/iced_plot` and
-`third_party/iced_aw` crates. Plot Rust, manifest, and WGSL inputs and iced_aw
-Rust/manifest inputs participate in browser bundle invalidation.
-The frontend check target compiles, with `--no-run`, the host Rust suites
-selected by the [browser-app test route](validation.md#native-and-browser-suites),
-including its explicit iced_aw library selection. These host checks and tests
-remain separate from the optimized `trunk build --release` Wasm bundle.
-The plot crate declares its native test dependencies in its own manifest so
-package-selected tests and doctests retain their renderer dependencies.
-`--no-run` checks compile tests without executing them; the unfiltered
-`./mmltk --test all` route executes the browser JavaScript/Rust fixtures along
-with native suites and log-query fixtures. See
-[suite selection](validation.md#native-and-browser-suites) for focused routes.
+`third_party/iced_aw` crates. Plot declares its native test/renderer dependencies
+in its own manifest, including package-selected tests and doctests.
 
 [CMakeLists.txt](../CMakeLists.txt) requires exactly CMake 4.4.3.
 [MmltkToolchain.cmake](../cmake/MmltkToolchain.cmake) enforces compiler paths
@@ -220,12 +209,10 @@ build directory.
 [check_toolchain_invariants.py](../tools/check_toolchain_invariants.py) checks
 the compilation database against this policy, including creation/use
 environment equality, exclusions, and fatal invalid-PCH diagnostics.
-The analysis graph keeps the same PCH registrations: tidy builds exact GCC
-objects for reflection units, while supported non-reflection units use
-clang-tidy. Header-isolation checks remain independent of PCHs in the same
-graph. PCH consumption and declaration isolation belong to the single normal
-product build. No performance benchmarking acceptance or measured speedup
-claim accompanies this configuration. See [static analysis](validation.md#formatting-and-static-analysis).
+The analysis graph retains these registrations and independent header-isolation
+checks; [tidy](validation.md#formatting-and-static-analysis) selects GCC objects
+or clang-tidy by reflection support. PCH use and declaration isolation are part
+of the normal product build, without a benchmarking gate or measured speedup claim.
 
 ## Cache and output locations
 
@@ -283,14 +270,13 @@ Under the selected graph's `generated/frontend/iced/`, generation owns:
 | `protocol_v17_server_records.cbor` | Native-to-Rust application fixture |
 | `workspace_graphics_abi.rs` | Data-only native graphics ABI projection for Firefox; current ABI version 14 |
 
-The current [typed boundary](gui-interaction.md#typed-application-boundary) must be
-packaged together with the native host and browser bundle. Generating
-these artifacts does not update the complete runtime package or run the
-application test suites.
+Generation alone neither repackages the host/bundle nor runs tests; the
+[typed boundary](gui-interaction.md#typed-application-boundary) requires matching
+packaged artifacts.
 
-The graphics artifact derives records, enum wire values, field offsets, sizes,
-and alignments from the native workspace import and frame-signal declarations
-in [presentation/abi](../src/controller/presentation/abi).
+The graphics artifact derives records, field types, enum wire values, and
+field-offset/size/alignment assertions from the native workspace import and
+frame-signal declarations in [presentation/abi](../src/controller/presentation/abi).
 Firefox includes it through `MMLTK_WORKSPACE_GRAPHICS_ABI`. CMake makes its
 generation a direct Firefox build dependency and owns regeneration from the
 native declarations and generator inputs.

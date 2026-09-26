@@ -68,6 +68,20 @@ impl Notice {
     pub fn presentation(&self) -> &Presentation {
         &self.presentation
     }
+    fn trace(&self, _event: &str) {
+        #[cfg(target_arch = "wasm32")]
+        if crate::presentation_surface::surface_trace_enabled() {
+            let message = format!("{}\n\n{}", self.title, self.detail);
+            if let Ok(message) = js_sys::JSON::stringify(&wasm_bindgen::JsValue::from_str(&message))
+                && let Some(message) = message.as_string()
+            {
+                crate::presentation_surface::emit_surface_trace(&format!(
+                    "{{\"event\":\"iced.notice.{_event}\",\"notice_id\":{},\"origin\":\"{:?}\",\"content_version\":{},\"message\":{message}}}",
+                    self.id.0, self.origin, self.content_version,
+                ));
+            }
+        }
+    }
 }
 impl std::ops::Deref for Notice {
     type Target = UiError;
@@ -204,6 +218,40 @@ impl NoticeStore {
         generation: u64,
         error: impl FnOnce() -> Option<UiError>,
     ) {
+        let Some((index, rebase)) = self.advance_frontier(origin, owner, generation) else {
+            return;
+        };
+        let slot = &mut self.frontiers[index];
+        if self.bootstrapping && (!self.initialized || rebase) {
+            slot.observed = true;
+            return;
+        }
+        if slot.observed && slot.row.is_none() {
+            return;
+        }
+        let Some(error) = error() else {
+            return;
+        };
+        if slot.observed {
+            if let Some(id) = slot.row {
+                self.update(id, error);
+            }
+            return;
+        }
+        slot.observed = true;
+        let row = self.push(origin, error);
+        self.frontiers[index].row = row;
+    }
+    /// Active bootstrap work has no historical terminal to acknowledge.
+    pub fn ongoing(&mut self, origin: Origin, owner: u64, generation: u64) {
+        self.advance_frontier(origin, owner, generation);
+    }
+    fn advance_frontier(
+        &mut self,
+        origin: Origin,
+        owner: u64,
+        generation: u64,
+    ) -> Option<(usize, bool)> {
         if self.frontiers.len() == SOURCE_CAPACITY
             && !self.frontiers.iter().any(|slot| slot.origin == origin)
         {
@@ -211,7 +259,7 @@ impl NoticeStore {
                 Origin::Protocol,
                 UiError::protocol("Notification source capacity exhausted"),
             );
-            return;
+            return None;
         }
         let index = self
             .frontiers
@@ -238,32 +286,14 @@ impl NoticeStore {
             slot.row = None;
         }
         if generation < slot.generation {
-            return;
+            return None;
         }
         if generation > slot.generation {
             slot.generation = generation;
             slot.observed = false;
             slot.row = None;
         }
-        if self.bootstrapping && (!self.initialized || rebase) {
-            slot.observed = true;
-            return;
-        }
-        if slot.observed && slot.row.is_none() {
-            return;
-        }
-        let Some(error) = error() else {
-            return;
-        };
-        if slot.observed {
-            if let Some(id) = slot.row {
-                self.update(id, error);
-            }
-            return;
-        }
-        slot.observed = true;
-        let row = self.push(origin, error);
-        self.frontiers[index].row = row;
+        Some((index, rebase))
     }
     /// A visual condition clears when its owner successfully publishes another frame.
     /// A first snapshot cannot acknowledge event-only detail that it does not carry.
@@ -456,7 +486,7 @@ impl NoticeStore {
             self.update_overflow();
         }
         self.presentation = Presentation::default();
-        self.rows.push_back(Notice {
+        let row = Notice {
             id,
             origin,
             severity: severity(&error),
@@ -465,7 +495,9 @@ impl NoticeStore {
             occurrences: 1,
             copy_attempt: 0,
             presentation: self.presentation.clone(),
-        });
+        };
+        row.trace("added");
+        self.rows.push_back(row);
         Some(id)
     }
     fn update(&mut self, id: NoticeId, error: UiError) {
@@ -480,6 +512,7 @@ impl NoticeStore {
             row.severity = severity(&error);
             row.error = error;
             row.presentation = Presentation::default();
+            row.trace("updated");
             self.presentation = row.presentation.clone();
         }
     }
@@ -522,6 +555,12 @@ impl NoticeStore {
         }
     }
     pub fn dismiss(&mut self, id: NoticeId) {
+        #[cfg(target_arch = "wasm32")]
+        if crate::presentation_surface::surface_trace_enabled()
+            && let Some(row) = self.get(id)
+        {
+            row.trace("dismissed");
+        }
         let before = self.len();
         if self.overflow.as_ref().is_some_and(|row| row.id == id) {
             self.overflow = None;

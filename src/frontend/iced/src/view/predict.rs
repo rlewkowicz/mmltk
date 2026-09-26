@@ -173,6 +173,7 @@ impl Component {
                                         .then_some(Message::DialogRequested(fact.stable_field_id))
                                 )
                             )),
+                        crate::view::workflow::progress::compute(operation),
                     ]
                     .spacing(crate::view::workflow::FIELD_SPACING),
                 )
@@ -190,7 +191,6 @@ impl Component {
                 model
                     .compute_stop_available(crate::generated::FeatureId::Predict)
                     .then_some(Message::StopRequested),
-                crate::view::workflow::progress::compute(operation),
             ),
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)

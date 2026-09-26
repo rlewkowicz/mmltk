@@ -150,6 +150,7 @@ impl Component {
                         )
                         .size(12),
                         dialogs,
+                        progress,
                     ]
                     .spacing(crate::view::workflow::FIELD_SPACING)
                 )
@@ -167,7 +168,6 @@ impl Component {
                 model
                     .compute_stop_available(crate::generated::FeatureId::Validate)
                     .then_some(Message::StopRequested),
-                progress,
             ),
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)

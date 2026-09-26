@@ -2690,7 +2690,7 @@ run_process_diagnostic() {
         [[ "$1" == --backtrace || "$1" == --terminate || "$1" == --read-file ]] || die "unknown process diagnostic action '$1'"
         process_action="$1"
         process_executable="$2"
-        [[ "${process_executable}" =~ ^mmltk[_-][A-Za-z0-9_-]+$ ]] || die "expected an exact mmltk native executable name"
+        [[ "${process_executable}" == mmltk || "${process_executable}" =~ ^mmltk[_-][A-Za-z0-9_-]+$ ]] || die "expected an exact mmltk native executable name"
         shift 2
         while (( $# )); do
             (( $# >= 2 )) || die "process diagnostic option requires a value"
@@ -2716,10 +2716,10 @@ run_process_diagnostic() {
     fi
     if [[ -n "${process_action}" ]]; then
         [[ "${containers}" != *$'\n'* ]] || die "process action requires exactly one running wrapper container; select WRAPPER_MODE"
-        local -a process_exec_args=(exec --user "${uid}:${gid}")
-        if [[ "${process_action}" == --backtrace ]]; then process_exec_args=(exec --user 0 --privileged); fi
+        local -a process_exec_args=(exec -i --user "${uid}:${gid}")
+        if [[ "${process_action}" == --backtrace ]]; then process_exec_args=(exec -i --user 0 --privileged); fi
         timeout --foreground --signal=KILL 45s docker "${process_exec_args[@]}" "${containers}" \
-            /usr/bin/python3 -I -B /workspace/tools/diagnose_native_process.py "${process_action}" "${process_executable}" "${process_selector[@]}"
+            /usr/bin/python3 -I -B - "${process_action}" "${process_executable}" "${process_selector[@]}" < "${repo_root}/tools/diagnose_native_process.py"
         return
     fi
     while IFS= read -r container; do

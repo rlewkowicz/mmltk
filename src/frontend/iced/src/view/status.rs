@@ -26,6 +26,19 @@ pub enum Control {
     Dismiss(NoticeId),
 }
 impl Control {
+    fn style(
+        self,
+        theme: &Theme,
+        status: iced::widget::button::Status,
+        pulse: f32,
+        alert: bool,
+    ) -> iced::widget::button::Style {
+        if self == Self::Settings {
+            crate::fluent_theme::button_secondary(theme, status)
+        } else {
+            alert_style(theme, pulse, alert)
+        }
+    }
     pub fn id(self) -> String {
         match self {
             Self::Trigger => TRIGGER_ID.into(),
@@ -232,7 +245,7 @@ impl Component {
             .unwrap_or(0);
         controls[(index + if reverse { controls.len() - 1 } else { 1 }) % controls.len()]
     }
-    pub fn header<'a>(&'a self, notices: &'a NoticeStore) -> Element<'a, Message> {
+    pub fn trigger<'a>(&'a self, notices: &'a NoticeStore) -> Element<'a, Message> {
         let alert = !notices.is_empty();
         let label: Element<'a, Message> = if alert {
             row![
@@ -251,25 +264,22 @@ impl Component {
             .align_y(Center)
             .into()
         };
-        row![
-            overlay::control(
-                Control::Trigger,
-                container(label).center(Fill).into(),
-                STATUS_WIDTH,
-                alert,
-                self.environment
-            ),
-            overlay::control(
-                Control::Settings,
-                container(text("Settings")).center(Fill).into(),
-                SETTINGS_WIDTH,
-                false,
-                self.environment
-            ),
-        ]
-        .spacing(8)
-        .align_y(Center)
-        .into()
+        overlay::control(
+            Control::Trigger,
+            container(label).center(Fill).into(),
+            STATUS_WIDTH,
+            alert,
+            self.environment,
+        )
+    }
+    pub fn settings(&self) -> Element<'_, Message> {
+        overlay::control(
+            Control::Settings,
+            container(text("Settings")).center(Fill).into(),
+            SETTINGS_WIDTH,
+            false,
+            self.environment,
+        )
     }
     pub fn wrap<'a>(
         &'a self,

@@ -1,12 +1,12 @@
 //! One ordinary button, with a non-interactive, widget-local border decoration.
 mod border;
 
-use super::{Composition, FIELD_SPACING, PRIMARY_ACTION_HEIGHT, Region};
+use super::{Composition, PRIMARY_ACTION_HEIGHT, Region};
 use crate::fluent_theme::{Element, Theme};
 use crate::generated::FeatureId;
 use iced::advanced::{Layout, Shell, Widget, layout, mouse, renderer, widget};
-use iced::widget::{button, column, container, text};
-use iced::{Event, Fill, Font, Length, Padding, Rectangle, Size};
+use iced::widget::{button, container, text};
+use iced::{Event, Fill, Font, Length, Rectangle, Size};
 
 const FRAME_INSET: f32 = 1.0;
 
@@ -61,7 +61,6 @@ pub fn view<'a, Message: Clone + 'a>(
     active: bool,
     start: Option<Message>,
     stop: Option<Message>,
-    progress: Element<'a, Message>,
 ) -> Element<'a, Message> {
     let composition = Composition::new(page, 0.0);
     let presentation = Action::new(page, active, start, stop);
@@ -93,18 +92,7 @@ pub fn view<'a, Message: Clone + 'a>(
         .width(Fill)
         .height(Length::Fixed(PRIMARY_ACTION_HEIGHT))
         .style(crate::fluent_theme::container_primary_frame);
-    column![
-        container(progress)
-            .id(composition.stable_id(Region::PrimaryProgress))
-            .padding(Padding {
-                bottom: 1.0,
-                ..Padding::ZERO
-            })
-            .width(Fill),
-        framed
-    ]
-    .spacing(FIELD_SPACING)
-    .into()
+    framed.into()
 }
 
 #[derive(Default)]

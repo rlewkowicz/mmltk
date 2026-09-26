@@ -167,7 +167,7 @@ pub fn number_f64<'a, Message: Clone + 'a>(
     )
 }
 
-/// Read-only product facts retain ordinary input styling and have no edit callback.
+/// Calculated facts keep the numeric field geometry without an editable outline.
 pub fn read_only<'a, Message: Clone + 'a>(
     label: &'static str,
     id: impl Into<String>,
@@ -178,10 +178,12 @@ pub fn read_only<'a, Message: Clone + 'a>(
         text_input("", &value)
             .id(id.into())
             .style(|theme, _| {
-                iced_fluent_theme::text_input::default(
+                let mut style = iced_fluent_theme::text_input::default(
                     theme,
                     iced::widget::text_input::Status::Active,
-                )
+                );
+                style.border.color = iced::Color::TRANSPARENT;
+                style
             })
             .width(Length::FillPortion(NUMERIC_INPUT_PORTION))
             .into(),
@@ -212,32 +214,39 @@ pub fn execution_facts<'a>(
     if !matching || (feature == FeatureId::Train && settings.training_membership_pending()) {
         return None;
     }
-    if let Some(operation) = model.current_native_operation(feature) {
-        let facts = match feature {
-            FeatureId::Train => {
-                let state = model.workflow.training.as_ref()?;
-                let execution = state.sources.execution.as_ref()?;
-                if training_validation {
-                    &execution.validation
-                } else {
-                    &execution.training
+    let admitted = model
+        .current_native_operation(feature)
+        .and_then(|operation| {
+            let facts = match feature {
+                FeatureId::Train => {
+                    let state = model.workflow.training.as_ref()?;
+                    let execution = state.sources.execution.as_ref()?;
+                    if training_validation {
+                        &execution.validation
+                    } else {
+                        &execution.training
+                    }
                 }
-            }
-            FeatureId::Validate => {
-                let state = model.workflow.validation.as_ref()?;
-                &state.execution
-            }
-            FeatureId::Predict => {
-                let state = model.predict_snapshot.as_ref()?;
-                &state.execution
-            }
-            _ => return None,
-        };
-        return (facts.operationgeneration == operation.generationfrontier
-            && facts.admittedcapacity > 0)
-            .then_some(facts);
+                FeatureId::Validate => {
+                    let state = model.workflow.validation.as_ref()?;
+                    &state.execution
+                }
+                FeatureId::Predict => {
+                    let state = model.predict_snapshot.as_ref()?;
+                    &state.execution
+                }
+                _ => return None,
+            };
+            (facts.operationgeneration == operation.generationfrontier
+                && facts.admittedcapacity > 0)
+                .then_some(facts)
+        });
+    if admitted.is_some() {
+        return admitted;
     }
-    if model.primary_action_active(feature) {
+    // Training's configured batch math is independent of worker startup and
+    // physical lane admission. Never substitute a previous run's capacity.
+    if feature != FeatureId::Train && model.primary_action_active(feature) {
         return None;
     }
     let facts = match feature {
@@ -250,6 +259,26 @@ pub fn execution_facts<'a>(
     (facts.settingsrevision == accepted.revision).then_some(facts)
 }
 
+pub fn rank_batch<'a, Message: Clone + 'a>(
+    model: &crate::view_model::ApplicationModel,
+    settings: &crate::view::settings::SettingsModel,
+) -> Element<'a, Message> {
+    let value = execution_facts(crate::generated::FeatureId::Train, false, model, settings)
+        .and_then(|_| model.settings_snapshot.as_ref())
+        .map_or_else(
+            || "Updating".into(),
+            |snapshot| {
+                let facts = &snapshot.trainingbatchdistribution;
+                if facts.minimumrankbatch == facts.maximumrankbatch {
+                    facts.minimumrankbatch.to_string()
+                } else {
+                    format!("{}–{}", facts.minimumrankbatch, facts.maximumrankbatch)
+                }
+            },
+        );
+    read_only("Batch / GPU / microbatch", "train.rank_batch", value)
+}
+
 pub fn effective_batch<'a, Message: Clone + 'a>(
     feature: crate::generated::FeatureId,
     validation: bool,
@@ -258,7 +287,7 @@ pub fn effective_batch<'a, Message: Clone + 'a>(
 ) -> Element<'a, Message> {
     let facts = execution_facts(feature, validation, model, settings);
     let label = if feature == crate::generated::FeatureId::Train && !validation {
-        "Effective batch / model"
+        "Effective batch / model update"
     } else if facts.is_some_and(|facts| facts.admittedcapacity > 0) {
         "Effective batch (admitted)"
     } else {
@@ -479,15 +508,27 @@ mod tests {
                 prediction_saving: default_request_predictStartsaving().unwrap(),
                 prediction_population: 0,
             });
-            assert!(execution_facts(feature, false, &model, &settings).is_none());
+            assert_eq!(
+                execution_facts(feature, false, &model, &settings)
+                    .map(|facts| facts.effectivebatchpermodel),
+                (feature == FeatureId::Train).then_some(11)
+            );
             let (operation, _) = runtime(&mut model, feature);
             operation.active = true;
             operation.generationfrontier = 8;
-            assert!(execution_facts(feature, false, &model, &settings).is_none());
+            assert_eq!(
+                execution_facts(feature, false, &model, &settings)
+                    .map(|facts| facts.effectivebatchpermodel),
+                (feature == FeatureId::Train).then_some(11)
+            );
             let (_, facts) = runtime(&mut model, feature);
             facts.operationgeneration = 8;
             facts.admittedcapacity = 0;
-            assert!(execution_facts(feature, false, &model, &settings).is_none());
+            assert_eq!(
+                execution_facts(feature, false, &model, &settings)
+                    .map(|facts| facts.effectivebatchpermodel),
+                (feature == FeatureId::Train).then_some(11)
+            );
             runtime(&mut model, feature).1.admittedcapacity = 2;
             assert_eq!(
                 execution_facts(feature, false, &model, &settings)
@@ -496,7 +537,12 @@ mod tests {
                 99
             );
             if feature == FeatureId::Train {
-                assert!(execution_facts(feature, true, &model, &settings).is_none());
+                assert_eq!(
+                    execution_facts(feature, true, &model, &settings)
+                        .unwrap()
+                        .effectivebatchpermodel,
+                    11
+                );
                 let facts = &mut model
                     .workflow
                     .training

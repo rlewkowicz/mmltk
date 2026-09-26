@@ -119,6 +119,7 @@ private:
   mmltk::backend::models::rfdetr::TrainingSourceCatalog source_catalog;
   std::string observed_run;
   std::string observed_attempt;
+  std::optional<mmltk::backend::models::rfdetr::TrainingPreparationProgress> preparation;
   int progress_watch = -1;
   std::uint64_t progress_sequence = 0U;
   std::size_t persistence_marker = 0;

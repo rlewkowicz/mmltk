@@ -1115,6 +1115,114 @@ fn resumed_model_failures_use_native_operations_and_reconnect_baselines() {
 }
 
 #[test]
+fn training_input_failure_is_retained_across_reply_and_event_ordering() {
+    for event_first in [false, true] {
+        let mut model = bootstrapped();
+        let correlation = model
+            .begin_intent(ApplicationIntentEndpoint::TrainingStart)
+            .unwrap();
+        let mut running = model.workflow.training.clone().unwrap();
+        running.revision += 1;
+        running.activity = TrainingActivity::Local;
+        running.local.active = true;
+        running.local.generationfrontier += 1;
+        running.local.terminal.generation = running.local.generationfrontier;
+        running.local.terminal.outcome = ComputeOperationOutcome::Running;
+        let mut failed = running.clone();
+        failed.revision += 1;
+        failed.activity = TrainingActivity::Idle;
+        failed.local.active = false;
+        failed.local.terminal.outcome = ComputeOperationOutcome::Failed;
+        failed.local.terminal.detail =
+            "compiled artifact does not match the configured square RGB resolution".into();
+        let event = ApplicationEvent::TrainingTrainingChanged(TrainingChanged {
+            snapshot: failed.clone(),
+        });
+        if event_first {
+            model.reduce_event(event.clone());
+        }
+        model.reduce_reply(correlation, Ok(ApplicationReply::TrainingStart(running)));
+        model.reduce_event(event.clone());
+        assert_eq!(model.notices.len(), 1);
+        assert_eq!(
+            model.notices.latest().unwrap().origin,
+            Origin::Compute(FeatureId::Train)
+        );
+        assert_eq!(
+            model.notices.latest().unwrap().detail,
+            failed.local.terminal.detail
+        );
+        model.notices.dismiss_all();
+        model.reduce_event(event);
+        assert!(model.notices.is_empty());
+    }
+}
+
+#[test]
+fn training_active_at_bootstrap_reports_its_later_input_failure() {
+    for restarted in [false, true] {
+        for outcome in [
+            ComputeOperationOutcome::Running,
+            ComputeOperationOutcome::CancellationRequested,
+        ] {
+            let mut model = if restarted {
+                bootstrapped()
+            } else {
+                crate::view_model::ApplicationModel::default()
+            };
+            if restarted {
+                let mut previous = model.workflow.training.clone().unwrap();
+                previous.revision += 1;
+                previous.local.generationfrontier = 7;
+                previous.local.terminal.generation = 7;
+                previous.local.terminal.outcome = ComputeOperationOutcome::Failed;
+                previous.local.terminal.detail = "previous native process".into();
+                model.reduce_event(ApplicationEvent::TrainingTrainingChanged(TrainingChanged {
+                    snapshot: previous,
+                }));
+                model.notices.dismiss_all();
+            }
+            let snapshots = application_snapshot_defaults()
+                .unwrap()
+                .into_iter()
+                .map(|fact| {
+                    let mut snapshot = fact.value;
+                    if let ApplicationSnapshot::Training(state) = &mut snapshot {
+                        state.revision = 1;
+                        state.activity = TrainingActivity::Local;
+                        state.local.active = true;
+                        state.local.generationfrontier = 1;
+                        state.local.terminal.generation = 1;
+                        state.local.terminal.outcome = outcome;
+                    }
+                    snapshot
+                })
+                .collect();
+            model
+                .install_bootstrap(SCHEMA_FINGERPRINT, snapshots)
+                .unwrap();
+            assert!(model.notices.is_empty());
+            let mut snapshot = model.workflow.training.clone().unwrap();
+            snapshot.revision += 1;
+            snapshot.activity = TrainingActivity::Idle;
+            snapshot.local.active = false;
+            snapshot.local.terminal.outcome = ComputeOperationOutcome::Failed;
+            snapshot.local.terminal.detail = "compiled dataset resolution mismatch".into();
+            let event = ApplicationEvent::TrainingTrainingChanged(TrainingChanged { snapshot });
+            model.reduce_event(event.clone());
+            assert_eq!(model.notices.len(), 1);
+            assert_eq!(
+                model.notices.latest().unwrap().detail,
+                "compiled dataset resolution mismatch"
+            );
+            model.notices.dismiss_all();
+            model.reduce_event(event);
+            assert!(model.notices.is_empty());
+        }
+    }
+}
+
+#[test]
 fn model_status_retains_process_status_and_advice_without_hiding_independent_process_errors() {
     for terminal_detail in [
         "local training exited with status 1: CUDA out of memory. Reduce batch size or training lanes to lower GPU memory use, then start again.",

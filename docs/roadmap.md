@@ -2,7 +2,7 @@
 
 [Wiki index](README.md) · [Repository introduction](../README.md)
 
-The project's stated future directions include:
+Future directions:
 
 - YOLO26 model integration.
 - SAM3 support for annotation.
@@ -11,12 +11,10 @@ The project's stated future directions include:
   design choices.
 - Keypoint and pose workflows.
 
-These are directions, not supported-feature or delivery-date commitments.
-The [native model catalog](../src/backend/models/catalog/model_registry.cpp) and exposed
-CLI/UI operations describe current capabilities; see the
-[command reference](commands.md). Use the relevant
-[validation suites](validation.md) to establish acceptance for a workflow.
+These carry no feature or delivery-date commitment. Current capabilities come
+from the [native model catalog](../src/backend/models/catalog/model_registry.cpp)
+and exposed [CLI/UI operations](commands.md), with acceptance established by
+[validation](validation.md).
 
-Product distribution and any future paid features remain undecided. Current
-repository licensing and third-party attribution are recorded in
-[LICENSE](../LICENSE) and [NOTICE](../NOTICE).
+Distribution and future paid features remain undecided; [LICENSE](../LICENSE)
+and [NOTICE](../NOTICE) record current licensing and attribution.

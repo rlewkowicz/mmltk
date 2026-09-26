@@ -28,15 +28,13 @@ and source order. COCO-style polygon or RLE segmentation becomes source mask
 support before resizing. Open Images `IsGroupOf` becomes crowd, with its category
 MID retained separately from the mapped class. Equal boxes remain distinct.
 
-COCONut uses the union of B and the two Objects365 extensions. Large wins when
-Large and XL offer the same physical image. Images without selected foreground
-instances remain in the dataset. Validation membership is checked separately
-and cannot enter training. The nested S/B/L/XL releases are not concatenated as
-independent complete datasets, and COCONut does not apply supplemental sampling.
-Every offered image and required panoptic mask must be available after bounded
-archive/image repair for publication to succeed. Optional
-[dropped-mask recovery](#optional-dropped-mask-recovery) preserves these recipe
-and validation memberships.
+COCONut unions B and the two Objects365 extensions, preferring Large over XL
+for duplicate physical images. It retains foreground-empty images, validates
+validation membership separately and excludes it from training, and uses neither
+concatenated nested S/B/L/XL sets nor supplemental sampling. Publication requires
+every offered image and
+required panoptic mask after bounded repair. [Recovery](#optional-dropped-mask-recovery)
+preserves these memberships.
 
 The [pinned release catalog](../src/backend/data/coconut_catalog.cpp) owns exact
 URLs, revisions, expected sizes, available SHA-256 identities, and patch lists:
@@ -49,14 +47,13 @@ URLs, revisions, expected sizes, available SHA-256 identities, and patch lists:
 | `coconut_xlarge` | Paired per-image JSON/PNG entries in a tar; additional patches 17, 23, 25, 28, 38, 42, 44 |
 | `coconut_val` | COCO-shaped JSON and panoptic tar; separate Objects365 v1 JPEG archive |
 
-Hugging Face inputs use pinned `resolve/<revision>/<file>` URLs. The separate
-Objects365 validation JPEG archive uses the catalog's public Google Drive
-download endpoint. HTTP identity, response/range validation, and structural
-admission still govern downloads; an HTML response cannot become an admitted
-image archive. Final counts come from admitted records and overlap
-reconciliation, rather than rounded release descriptions or tar viewer counts.
-The manifest records offered/admitted component counts, duplicate XL coverage,
-selected annotation identities, source artifacts, and validation membership.
+Hugging Face URLs pin `resolve/<revision>/<file>`; Objects365 validation JPEGs
+use the catalog's public Google Drive endpoint. HTTP identity, response/range,
+and structural checks reject HTML masquerading as archives. Admitted records
+and overlap reconciliation determine final counts, not release estimates or tar
+viewer counts. The manifest retains
+offered/admitted counts, duplicate XL coverage, annotation/source identities,
+and validation membership.
 
 ## Native import and provenance
 
@@ -240,11 +237,9 @@ for JPEG and uses the existing PNG decoder without recompressing the source.
 Cached image paths keep their stable `.jpg` spelling and original encoded bytes;
 PNG pixels, dimensions, and annotation joins remain intact.
 
-The benchmark cache is persistent source data. Its default wrapper location is
-`.cache/benchmark-dataset/v1`; it remains reusable across compilation failures,
-cancellation, output replacement, and recipe changes. Cache-root precedence and
-the wrapper/CLI configuration are documented in
-[benchmark cache selection](commands.md#benchmark-cache-selection).
+The persistent source cache survives compilation failure/cancellation, output
+replacement, and recipe changes. [Cache selection](commands.md#benchmark-cache-selection)
+owns the default location and wrapper/CLI precedence.
 
 [benchmark_compiler.cpp](../src/backend/data/benchmark_compiler.cpp) resolves
 and checks both the compiler's staging output and the final publication
@@ -338,13 +333,10 @@ A later compilation attempts original admission again.
 | `components[].recovery_policy`, `.original_annotation_identity` | Policy and original identity governing that component; zero/empty for base products |
 | `components[].recovered_objects`, `.unresolved_objects` | That component's current counts after membership reconciliation |
 
-These counts concern normalization's recovery outcome, not every historical
-`failed.txt` line or the later image/header geometry checks. Cached derived
-products retain the same counts and replay their unresolved omissions to the
-append-only report. Recovery-off compilation records zero recovery counts.
-When enabled, compilation exposes a concise recovered/unresolved progress
-summary. No diagnostic log is needed to establish cache validity or these
-product facts.
+Counts describe selected normalization recovery, excluding historical `failed.txt`
+entries and later geometry checks. Cached products retain counts and replay
+unresolved omissions to that report. Recovery off records zeros; on reports a
+recovered/unresolved summary. These product/cache facts need no diagnostic log.
 
 ## Reading compilation progress
 
@@ -381,14 +373,12 @@ permitted quarantine outcomes; successful cache-write observations follow
 physical write settlement. Projected output bytes are a storage-admission
 bound, not bytes already written.
 
-The canonical `BenchmarkTransferProgress` separately describes the latest
-observed artifact transfer: completed and total bytes, retained bytes, attempt,
-cache reuse, and resume state. It is optional within `BenchmarkSourceProgress`;
-the source counters continue to aggregate artifact contributions. A zero transfer
-total means unknown. Retained bytes cannot exceed completed bytes, and completed
-bytes cannot exceed a known total. A changed source activity or source completion
-clears the latest transfer. Concurrent sources can advance independently; the
-latest transfer does not enumerate every in-flight artifact.
+Optional `BenchmarkSourceProgress.transfer` uses canonical
+`BenchmarkTransferProgress` for the latest artifact's completed/total/retained
+bytes, attempt, reuse, and resume state; source counters aggregate artifacts.
+Zero transfer total means unknown. Retained ≤ completed ≤ known total. Source
+activity changes/completion clear the latest transfer, which does not enumerate
+all concurrent in-flight artifacts.
 
 Fresh, resumed, retried, and re-downloaded transfers report bytes actually
 written. A resumed transfer distinguishes retained bytes from its new work.
@@ -466,16 +456,10 @@ namespace, member joins, and normalization revision. Inventory strings are
 bounded to 4,096 bytes. Incompatible or invalid cache records require rebuilding
 from admitted source inputs rather than reinterpretation.
 
-Compiled mask offsets address the complete split's RLE block with 64 bits, so
-COCONut label preparation can exceed 4 GiB of mask data. Older compiled files
-require recompilation; source downloads, extracted images, and normalized
-annotation caches remain reusable.
-
-The [packed format limits](datasets.md#instances-and-masks) still apply. The
-compiler rejects unrepresentable offsets, counts, coordinates, or extents
-before publishing output. Exact COCONut masks
-are not simplified or sampled to fit those limits. Bounded local fixtures
-establish the documented conversion/reuse behavior; they do not establish
-full production-release capacity at every resolution or the duration/liveness
-of live downloads. [Validation ownership](validation.md#benchmark-compilation-evidence)
-locates those cases.
+[Packed format limits](datasets.md#instances-and-masks) permit split RLE blocks
+beyond 4 GiB through 64-bit offsets but reject unrepresentable offsets, counts,
+coordinates, and extents before publication. Exact COCONut masks are never
+simplified/sampled to fit. Recompiling older bins preserves reusable downloads,
+images, and normalized annotations. [Bounded fixtures](validation.md#benchmark-compilation-evidence)
+prove conversion/reuse, not full-release capacity at every resolution or live
+download duration/liveness.

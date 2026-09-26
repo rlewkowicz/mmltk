@@ -4,13 +4,11 @@
 
 ## Activation and quiet execution
 
-Ordinary `./mmltk --gui` has no active diagnostic sink, integration driver,
-reporting state, or pixel-probe owner. Disabled paths skip diagnostic payload
-collection, formatting, clock reads, counter updates, and I/O. Application
-state, ordered input, resource custody, and physical completion still work.
-Diagnostic identities never determine their behavior.
-Fatal operation and process failures have a separate
-[stderr reporting path](#fatal-stderr-reports) that remains active.
+Ordinary `./mmltk --gui` creates no active diagnostic sink, integration driver,
+reporting state, or pixel-probe owner. Disabled diagnostics perform no collection,
+formatting, clock reads, counter updates, or I/O. Product state, input order,
+and physical custody/completion remain independent of diagnostic identities.
+[Fatal stderr](#fatal-stderr-reports) remains active.
 
 Training run history and incomplete-history notices are product output,
 independent of diagnostic activation. `run.json`/`metrics.jsonl`, progress
@@ -25,12 +23,10 @@ projections, and their writer/reader ownership are documented in
 | `MMLTK_GUI_PIXEL_TRACE=1` with a GUI trace path | Additional pixel probes |
 | `MMLTK_FIREFOX_LOG_FILE` | Redirect Firefox stdout/stderr to a separate file; does not itself enable native lifecycle or pixel collection |
 
-For native application logging, a level other than `off` enables output.
-A file or directory without an explicit level uses the build's default enabled
-level. Explicit `off` disables that logging even when a destination is set.
-These settings do not disable an independently requested GUI lifecycle trace.
-The desktop accepts logging through the environment; the native CLI and ONNX
-tools also accept the three logging flags.
+Native logging is enabled by a non-`off` level, or a destination with the build's
+default enabled level. Explicit `off` wins over destinations but leaves separately
+requested GUI traces active. Desktop logging uses the environment; native CLI
+and ONNX tools also accept the three flags.
 
 ```bash
 MMLTK_LOG_LEVEL=info ./mmltk --gui
@@ -44,12 +40,10 @@ Explicit file/directory overrides retain their destination and host-path
 rewriting. Native logs use the application name, a 10 MiB rotation threshold,
 and five archived files.
 
-The ONNX inspection and simplification tools suppress routine output by default
-and with `off`; fatal failures still report to stderr and return failure.
-Request diagnostics explicitly when consuming model metadata.
-`rfdetr info --onnx` forwards the CLI logging overrides to its sibling ONNX
-inspection tool. Ordinary CLI result stdout, such as compiled-dataset `info`,
-remains available independently of diagnostics.
+ONNX inspection/simplification needs explicit diagnostics for routine metadata;
+default/`off` still reports fatal stderr and failure status. `rfdetr info --onnx`
+forwards logging overrides to its sibling tool. Ordinary CLI result stdout
+(e.g. compiled-dataset `info`) is independent.
 
 ## Fatal stderr reports
 
@@ -106,22 +100,54 @@ runtime, including preparation failures; standalone runtime use retains its
 own reporting responsibility. Cancellation and process-group retirement are
 independent of diagnostic activation.
 
-With native GUI tracing enabled, training's `child.exited`, `child.signaled`,
-or `training.failed` records include bounded batch/lane, output, selected-device,
-and available run/attempt context. Disabled tracing does not construct that
-diagnostic payload.
+Enabled GUI trace records `child.exited`, `child.signaled`, and `training.failed`
+include bounded batch/lane, output, device, and available run/attempt context.
 
-The query tool also recognizes the canonical external
-[TrainingRecord format 3](rfdetr-workflows.md#saved-history-and-plots). It
-projects valid role/phase observations as `training.<role>.<phase>` in lowercase.
-`Terminal` with `progress.phase: "Error"` is an explicit failure and triage
-anchor; every `Terminal` record is terminal evidence. Progress counters such
-as `class_error` do not imply failure. Bounded triage preserves `run_id`,
-`attempt_id`, role, sequence, phase, session/model, and first-cause identity before
-optional configuration payloads and follows the run/attempt identity. These observations do not participate in
-generic begin/end suffix balancing.
+The training system also emits `training.inputs` before dataset inspection,
+including the operation generation (`sequence`), captured settings revision
+(`value`), requested and prepared preset/resolution, and compiled split paths.
+`training.operation.failed` and `training.operation.settled` record the resulting
+typed terminal, including failures before a training process exists. Their
+`sequence` is the operation generation and `value` is the snapshot revision.
+Resolution errors identify the file, actual geometry/channels, and required
+geometry. Diagnostic messages remain bounded to 1024 UTF-8 bytes; the UI retains
+the full bounded terminal detail.
 
-For an existing captured run:
+`training.preparation` reports the worker's startup stage before metrics exist.
+Its `sequence` is the operation generation. The small native
+`preparation.json` document is watched alongside metric documents and changes
+only at stage transitions. No console parsing is needed for startup
+progress. Query `@event=training.preparation` for GPU connection, dataset
+admission, model initialization, and optimizer setup. [Dataset identity](model-merging.md#whole-session-resume)
+uses admitted metadata without scanning image payloads.
+Distributed CLI training forwards explicit logging options to each worker, so
+`--log-level` and `--log-file` also cover the native training processes. Each
+worker inserts `.rank-N` before the log file extension to keep rotating sinks
+independent. Without an explicit file, workers use `mmltk.rank-N.log` in the
+configured log directory or the training output directory. Disabled logging
+creates no worker log files.
+
+With GUI lifecycle tracing enabled, Firefox output records
+`iced.notice.added`, `iced.notice.updated`, and `iced.notice.dismissed` with the
+notice ID, typed origin, content version, and title/detail text. These records
+track the frontend notice store independently of native operation settlement.
+For example:
+
+```bash
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl .mmltk-data/logs/firefox.log \
+  -q '@event=training.inputs OR @event=training.operation.failed OR @event=iced.notice.added' \
+  --format timeline --fields @event,sequence,value,notice_id,origin,message
+```
+
+The query tool projects canonical [TrainingRecord format 3](rfdetr-workflows.md#saved-history-and-plots)
+role/phase as lowercase `training.<role>.<phase>`. Every `Terminal` is terminal
+evidence; `progress.phase: "Error"` additionally anchors failure triage. Counters
+such as `class_error` imply no failure. Bounded triage prioritizes `run_id`, `attempt_id`,
+role, sequence, phase, session/model, and first cause over optional configuration,
+follows run/attempt identity, and excludes these records from generic suffix
+balancing.
+
+For a captured run:
 
 ```bash
 ./mmltk --logs output/train/run-0002/metrics.jsonl --errors --format timeline
@@ -265,24 +291,18 @@ For a capture produced by [the GUI example](#capture-one-reproduction):
   --format timeline --limit 60
 ```
 
-`completed_bytes` follows actual accepted writes, not preallocated file length;
-zero `total_bytes` means unknown. Retry withdrawal can legitimately decrease
-the count. The [progress reference](benchmark-datasets.md#reading-compilation-progress)
-owns the independent acquisition, labels/masks, and pixel tracks, source
-aggregation, repair withdrawals, and projected-output semantics. Release and
-pixel records can interleave with acquisition records; a phase name does not
-imply exclusive execution. They do not establish a measured performance gain.
-An unchanged image fraction or absent best-effort record cannot establish a
-deadlock or network liveness.
+[Compilation progress](benchmark-datasets.md#reading-compilation-progress) defines
+actual-write bytes, unknown totals, retry withdrawals, independent tracks, and
+source aggregation. Release/pixel/acquisition records can interleave; phase names
+are not exclusive execution states. These observations prove neither performance
+gains nor, from unchanged fractions or absent best-effort records, deadlock or
+network liveness.
 
-Disabled benchmark diagnostics skip field construction, JSON serialization,
-and diagnostic collection. Transfer observers are installed only when progress
-or tracing needs them; the unobserved segmented path skips progress locking
-and clock reads. Trace construction, serialization, and callback failures are
-contained and delivery is attempted once. Invalid payloads are reported to
-diagnostic delivery failure handling, never published as successful empty records
-or turned into compilation failure. The existing complete-delivery acceptance
-mode can still fail its evidence requirements independently of product work.
+Transfer observers exist only for progress/tracing; unobserved segmented downloads
+skip progress locking and clock reads. Trace construction/serialization/callback
+failures are contained, with one delivery attempt. Invalid payloads go to
+diagnostic failure handling, never successful empty records or compilation
+failure. Complete-delivery acceptance may independently fail its evidence gate.
 
 ## Delivery and acceptance ownership
 
@@ -299,20 +319,16 @@ Sources are [diagnostics_client.h](../src/controller/services/diagnostics_client
 [runtime_diagnostics.cpp](../src/controller/services/runtime_diagnostics.cpp),
 and [desktop startup](../src/entrypoints/desktop/browser_runtime_entry.cpp).
 
-Quiet acceptance still uses real control receipts, browser interaction,
-accepted-unsent input pressure, command settlement, and exact drawn-frame
-readiness. Its driver is independent of the private
-[reporting owner](../src/frontend/iced/src/integration_control/reporting.rs)
-and [JavaScript reporting state](../src/frontend/iced/src/integration_control/browser.mjs).
-With reporting disabled, payload callbacks, phase/revision/style deduplication,
-passive viewport queries, gallery scans, and diagnostic sinks stay inactive.
-Benchmark visibility reporting likewise schedules no widget measurements when
-disabled; integration control continues independently.
-Compact failed control receipts retain static source-line context without
-initializing reporting or probes. They also carry up to 4096 bytes of
-UTF-8-safe failure detail, including the native UI error kind, title, and body
-when available. Successful receipts carry no failure payload, and an inactive
-driver does not collect it.
+Quiet acceptance still uses real receipts/input, accepted-unsent pressure,
+command settlement, and exact drawn-frame readiness. Its driver is separate
+from [Rust reporting](../src/frontend/iced/src/integration_control/reporting.rs)
+and [JavaScript reporting](../src/frontend/iced/src/integration_control/browser.mjs).
+Disabled reporting performs no payload callbacks, phase/revision/style
+deduplication, passive viewport/gallery scans, benchmark widget measurements,
+or sink work. Failed control receipts still retain static source-line context
+and up to 4096 UTF-8-safe detail bytes, including available native error
+kind/title/body, without reporting/probes. Successful receipts have no failure
+payload; inactive drivers collect none.
 
 The Wayland session assigns one writer to each artifact under
 `build/validation`:
@@ -382,20 +398,15 @@ release even with diagnostics disabled.
 | `final_reader_releases` | Exact samples returned after their final read hold |
 | `explore_peak_pinned_bytes` | Observed Explore staging high-water footprint |
 
-These are allocation/lifetime and cumulative operation facts for the retained
-session, not frame latency or hardware throughput measurements. They do not
-count every internal algorithm transfer. Native workspace allocations, raw
-product pools, and copied browser sample storage are separate inventories.
-The complete direct-read/draw chain establishes a sampled source's physical
-path; absence of an event in a best-effort log cannot establish zero copies.
-
-Iced draw settlement proves release of a submitted resource batch; successful
-rendering additionally needs matching drawn-image/pixel evidence. Draw holds,
-displayed fallback holds, source read release, and copy completion are distinct
-facts in the [presentation lifetime rules](gui-interaction.md#browser-draw-eligibility-and-retained-fallback).
-Independent log drains retain incomplete joins across scenario/source retirement
-and require completion at final settlement. Missing evidence is a failed
-acceptance condition, not an inferred successful handoff.
+These retained-session lifetime/inventory facts and cumulative operation counts
+measure neither latency nor throughput and do not count every internal algorithm
+transfer. Workspace allocations,
+raw pools, and copied sample storage remain separate. A complete direct-read/draw
+chain establishes its physical path; absent best-effort events cannot prove zero
+copies. [Draw settlement](gui-interaction.md#browser-draw-eligibility-and-retained-fallback)
+releases resources; rendering additionally requires matching image/pixel evidence.
+Independent drains retain incomplete joins across scenario/source retirement
+until final settlement; missing evidence fails acceptance.
 
 The acceptance-only undersized-candidate gate uses typed control to hold and
 release a synthetic pending allocation while the completed fallback is drawn.
@@ -486,17 +497,14 @@ record UI interaction and pixels separately from physical resource custody:
   -q '@event:integration.status.' --format timeline --limit 80
 ```
 
-Workflow chart sampling checks a middle strip away from the legend and vertical
-axis and counts saturated curve pixels. Progress sampling covers the isolated
-bar's full extent and requires visible saturated fill. Widget samples wait for
-browser presentation opportunities after layout. Image sampling requires
-the current draw identity, paired metadata, and visible geometry; stale
-asynchronous captures are retried within the driver bound. A typed completion,
-finite metric, or allocated chart buffer does not prove pixels were drawn. The
-workflow case requires both semantic completion and actual canvas observations.
-A sparse chart can legitimately have finite samples but no connected segments
-when records are missing; its markers preserve those observations without
-joining gaps.
+Chart probes count saturated curve pixels in a middle strip clear of legend/Y
+axis. Progress probes sample the isolated bar's full extent and require visible
+saturated fill, including partial progress. Widget samples wait for post-layout
+presentation opportunities. Image samples require current draw identity, paired
+metadata, and visible geometry, retrying stale asynchronous captures within the
+driver bound. Semantic completion, finite metrics, or buffers alone cannot prove
+drawing. Missing records may leave finite chart markers without connected
+segments; the chart preserves those gaps.
 
 For `integration.workflow.pixels` with `detail: "validate-to-explore"`, the
 browser samples a ready tile's interior after direct navigation. The record
@@ -618,22 +626,18 @@ small-text metrics. Observation keys and probe scopes belong only to acceptance
 diagnostics. They never become native operation generations, settings revisions,
 or resource-lifetime state.
 
-The frame record closes the preceding row, paint, viewport, and native-fact
-observations. The audit compares complete work/track captions with the native
-facts for both real compile generations. A local fixture's completion receipt
-must join its fully exposed expected caption draw. Intermediate clipped text
-can demonstrate motion but cannot establish caption correctness. Canvas contrast
-establishes visible drawing; it is not OCR and does not replace exact text or
-shaped-label geometry. Divider probes compare the observed card-outline color,
-centered span, stroke coverage, and empty gaps at the actual scale.
+A frame closes preceding row/paint/viewport/native observations. The audit checks
+complete work/track captions against both real generations; fixture completion
+must join its fully exposed expected caption draw. Intermediate clipped text can
+demonstrate motion, not caption correctness. Canvas contrast is not OCR: exact text and shaped-label
+geometry remain required. Divider probes check card-outline color, centered span,
+stroke, and gaps at actual scale.
 
-The JavaScript probe copies bounds, divider rectangles, colors, and label
-rectangles borrowed from Wasm into owned arrays before deferring work. Before
-taking a canvas snapshot it checks the reporting owner, current request, and canvas
-geometry. Invalidated callbacks leave the replacement owner's canvas scratch
-and pixel-report count unchanged. Supersession, geometry restoration, and owner
-replacement retain an explicit drain before that observation settles. Disabled
-reporting creates no Dataset fixture/paint/probe collection.
+Before deferring, the JavaScript probe copies borrowed Wasm bounds, divider/label
+rectangles, and colors into owned arrays. Snapshots recheck owner, request, and
+canvas geometry. Invalidated callbacks leave replacement scratch/report counts
+unchanged; supersession, geometry restoration, and owner replacement explicitly
+drain before settlement. Disabled reporting collects no Dataset fixtures/paint/probes.
 
 Select the retained or DPI archive using [capture selection](#select-captures-and-histories),
 then replace `ARCHIVE_ID` with that run's identity:
@@ -671,8 +675,7 @@ archived-only input with the current run. Added sources carry `@discovery`
 metadata; rotation-based relationships remain labeled as inferred. Ordinary
 explicit path queries do not automatically add sibling files.
 
-Copy a session Status notice and paste its complete text, including its title
-and blank line:
+Paste a complete Status notice, including title and blank line:
 
 ```bash
 ./mmltk --logs --error 'Presentation unavailable
@@ -967,10 +970,9 @@ then query its successful observations explicitly. For example, replace
   --format jsonl --limit 100
 ```
 
-An empty result from a later capture does not establish that earlier records
-are missing.
-`--strict` checks parsing of the selected inputs; successful parsing and record
-presence remain separate from the rendered assertions and test outcome.
+A later capture's empty result says nothing about earlier records. `--strict`
+checks parsing, independently of record presence, rendered assertions, and test
+outcome.
 
 The current Wayland harness uses one rotation identity for its artifact family.
 Older or independently produced captures can have separate rotation IDs.

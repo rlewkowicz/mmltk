@@ -162,6 +162,10 @@ struct BrowserAudit final {
  Bounds advanced_container;
  std::array<Bounds, 8> advanced_fixed;
  std::array<Bounds, 2> advanced_effective;
+ Bounds advanced_rank_batch;
+ Bounds advanced_aggregate_batch;
+ Bounds advanced_train_lanes;
+ Bounds advanced_validation_lanes;
  Bounds advanced_assignment;
  std::array<Bounds, 3> advanced_match_free;
  Bounds advanced_denoising_toggle;

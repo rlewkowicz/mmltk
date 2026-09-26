@@ -159,6 +159,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  // The public host vocabulary is available to this CUDA-linked target;
  // request-only admission remains in the runtime boundary.
  validate_train_request(options);
+ TrainingPreparationWriter preparation(options);
  if (!options.distributed_worker && options.device_ids.size() > 1) { throw std::runtime_error("multi-GPU RF-DETR training requires one materialized worker request per selected partition"); }
  const int requested_train_lanes = effective_train_lanes(options);
  auto runtime_config = resolve_runtime_config(options.workers, requested_train_lanes, options.prefetch_factor, options.cpu_affinity, options.device_id, options.numa_node);
@@ -166,6 +167,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
  RuntimeContext train_runtime(runtime_config);
  const auto& placement = train_runtime.execution().placement;
  mmltk::common::system::ScopedExecutionPolicy boundary_policy({train_runtime.lane_cpus(), {}, 0, placement.numa_node, -10, false});
+ preparation.Stage(TrainingPreparationStage::Distributed);
  DistributedContext distributed = make_distributed_context(options);
  const bool main_process = is_rank_zero(distributed);
  TrainingSessionManifest session;
@@ -201,7 +203,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   // complete inode/version identity, then require it unchanged after admission;
   // do not reread every compiled pixel on every rank to calculate a digest.
   std::vector<std::pair<std::filesystem::path, mmltk::common::io::FileSnapshot>> admitted_files;
-  if (distributed.enabled) {
+  {
    admitted_files.reserve(5);
    for (const auto& [role, path] : std::array{std::pair{"train", options.train_compiled_path}, std::pair{"validation", options.val_compiled_path}, std::pair{"test", options.test_compiled_path},
          std::pair{"class-layout", options.class_layout_path}, std::pair{"initial-state", options.resume_path.empty() ? options.weights_path : options.resume_path}}) {
@@ -224,7 +226,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   auto execution_facts = derive_execution_facts(options, 0);
   execution_facts.admitted_capacity = train_lane_count;
   const auto admitted_microbatches = static_cast<std::size_t>(execution_facts.microbatches_per_attempt);
-  const auto rank_slice = TrainingDataPlan::rank_slice(options.batch_size, distributed.rank, distributed.world_size);
+  const auto rank_slice = training_rank_slice(options.batch_size, distributed.rank, distributed.world_size);
   const std::size_t local_batch_size = rank_slice.count;
   ScopedRuntimeContext worker_scope(&train_runtime);
   auto make_loader_config_for = [&](const std::filesystem::path& compiled_path, size_t loader_batch_size, bool shuffle, int prefetch_factor, bool shard_batches, bool drop_last) {
@@ -241,6 +243,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    return config;
   };
   const size_t val_batch_size = options.val_batch_size > 0 ? options.val_batch_size : options.batch_size;
+  preparation.Stage(TrainingPreparationStage::Dataset);
   auto admission_loader =
    std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.train_compiled_path, std::max<std::size_t>(1, local_batch_size), false, options.prefetch_factor, false, true));
   auto& train_loader = *admission_loader;
@@ -270,6 +273,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    if (!main_process) resumed.emplace(options.resume_path);
    if (resumed->plan().plan_hash != data_plan.hash() || resumed->plan().shards != data_plan.shards()) throw std::runtime_error("resume data plan differs from compiled membership");
   }
+  preparation.Stage(TrainingPreparationStage::Model);
   const auto source_checkpoint = resumed ? std::filesystem::canonical(options.resume_path).parent_path() / resumed->manifest().models.front().path : options.weights_path;
   if (train_loader.image_width() != train_loader.image_height()) throw std::runtime_error("train compiled RF-DETR input must be square");
   std::optional<ResolvedModelState> transferred;
@@ -402,17 +406,17 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    return std::string(static_cast<const char*>(host.const_data_ptr()), bytes);
   };
   const auto initialization = resumed ? resumed->manifest().initialization : share_identity(main_process ? native_state_fingerprint(collect_module_state(*common)) : std::string{}, 64);
-  const auto hash_text = [](std::string_view text) { return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes({reinterpret_cast<const std::uint8_t*>(text.data()), text.size()})); };
-  const auto source_fingerprint = [&](const std::filesystem::path& path) {
+  const auto source_fingerprint = [&](const mmltk::backend::data::DatasetLoader* loader) {
    if (!main_process) return std::string{};
-   const auto snapshot = mmltk::common::io::FileSnapshot::Read(path);
-   const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
-   snapshot.RequireUnchanged(path);
-   return hash_text(digest + resolved_signature.str());
+   const auto& source = *loader->compiled_source();
+   const auto admitted = std::ranges::find(admitted_files, source.path(), [](const auto& entry) -> const auto& { return entry.first; });
+   if (admitted == admitted_files.end()) throw std::logic_error("training source lacks admitted file metadata");
+   return training_dataset_identity(source.header(), admitted->second, resolved_signature.str());
   };
-  // Content is read once per source by rank zero, never once per model or rank.
-  const auto configuration_fingerprint = share_identity(source_fingerprint(options.train_compiled_path), 64);
-  const auto validation_fingerprint = options.val_compiled_path == options.train_compiled_path ? configuration_fingerprint : share_identity(source_fingerprint(options.val_compiled_path), 64);
+  // The compiled header and admitted file generation already identify each
+  // source. Starting training must not scan image or mask payloads for a hash.
+  const auto configuration_fingerprint = share_identity(source_fingerprint(&train_loader), 64);
+  const auto validation_fingerprint = options.val_compiled_path == options.train_compiled_path ? configuration_fingerprint : share_identity(source_fingerprint(val_loader.get()), 64);
   session = resumed ? resumed->manifest() : TrainingSessionManifest{};
   if (!resumed) {
    session.session_id = share_identity(main_process ? training_artifact_identity() : std::string{}, 32);
@@ -430,6 +434,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   result.gpu_augmentation = options.gpu_augmentation;
   result.output_dir = options.output_dir;
   result.checkpoint_path = options.output_dir / "session.json";
+  preparation.Stage(TrainingPreparationStage::Optimizers);
   std::vector<std::unique_ptr<TrainingModel>> models;
   // Keep trajectories alive until their first failure is published and their
   // communicator is aborted. Their GPU retirement may otherwise wait behind

@@ -26,7 +26,13 @@ fn hover_latch_click_leave_and_keyboard_touch_opening_have_independent_lifetimes
 #[test]
 fn popup_dimensions_remain_inside_narrow_and_wide_viewports() {
     for width in [320.0, 700.0, 1020.0, 1500.0, 2200.0] {
-        let rect = overlay::panel_bounds(iced::Size::new(width, 720.0), 600.0);
+        let trigger = iced::Rectangle {
+            x: (width - STATUS_WIDTH) * 0.5,
+            y: 9.0,
+            width: STATUS_WIDTH,
+            height: CONTROL_HEIGHT,
+        };
+        let rect = overlay::panel_bounds(iced::Size::new(width, 720.0), 600.0, trigger);
         assert_eq!(rect.width, (0.6 * width).min(width - 24.0));
         assert!(rect.x >= 12.0 && rect.x + rect.width <= width - 12.0);
         assert!(rect.y >= 12.0 && rect.y + rect.height <= 708.0);
@@ -43,6 +49,17 @@ fn healthy_and_alert_themes_preserve_exact_border_and_fill_rules() {
         assert_eq!(alert.border.width, 1.0);
         assert_eq!(alert.border.color, iced::Color::WHITE);
         assert_ne!(alert.background, alert_style(&theme, 1.0, true).background);
+        for state in [
+            iced::widget::button::Status::Active,
+            iced::widget::button::Status::Hovered,
+            iced::widget::button::Status::Pressed,
+        ] {
+            let settings = Control::Settings.style(&theme, state, 0.0, false);
+            let ordinary = crate::fluent_theme::button_secondary(&theme, state);
+            assert_eq!(settings.border, ordinary.border);
+            assert_eq!(settings.border.width, 1.0);
+            assert_eq!(settings.background, ordinary.background);
+        }
     }
 }
 #[test]

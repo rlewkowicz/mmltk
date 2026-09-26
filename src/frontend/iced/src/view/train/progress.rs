@@ -55,12 +55,14 @@ impl Presentation {
             losses: None,
         };
         let Some(record) = current else {
+            let progress = &snapshot.local.progress;
             result.heading = if stopping {
-                "Stopping"
+                "Stopping".into()
+            } else if progress.sequence != 0 && !progress.status.is_empty() {
+                progress.status.clone()
             } else {
-                "Preparing · awaiting current-run measurements"
-            }
-            .into();
+                "Preparing training".into()
+            };
             return Some(result);
         };
         let p = &record.progress;
@@ -196,10 +198,7 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.local.progress.sequence = 0;
         let facts = Presentation::from_snapshot(&snapshot).unwrap();
-        assert_eq!(
-            facts.heading,
-            "Preparing · awaiting current-run measurements"
-        );
+        assert_eq!(facts.heading, "Preparing training");
         assert!(facts.images.is_none() && facts.fraction.is_none());
         assert!(facts.rate.is_none() && facts.losses.is_none() && facts.timing.is_none());
         snapshot.local.progress.sequence = 1;
@@ -221,6 +220,21 @@ mod tests {
             snapshot.local.terminal.outcome = outcome;
             assert!(Presentation::from_snapshot(&snapshot).is_none());
         }
+    }
+
+    #[test]
+    fn preparation_stage_is_visible_without_fabricated_training_measurements() {
+        let mut snapshot = snapshot();
+        snapshot.metrics = None;
+        snapshot.local.progress.status = "Initializing model and GPU weights".into();
+        let facts = Presentation::from_snapshot(&snapshot).unwrap();
+        assert_eq!(facts.heading, "Initializing model and GPU weights");
+        assert!(facts.images.is_none() && facts.fraction.is_none());
+        assert!(facts.rate.is_none() && facts.losses.is_none() && facts.timing.is_none());
+        snapshot.local.terminal.outcome = ComputeOperationOutcome::CancellationRequested;
+        let facts = Presentation::from_snapshot(&snapshot).unwrap();
+        assert_eq!(facts.heading, "Stopping");
+        assert!(facts.fraction.is_none());
     }
 
     #[test]

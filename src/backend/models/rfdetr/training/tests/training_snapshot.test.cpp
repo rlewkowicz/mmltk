@@ -29,6 +29,29 @@ struct TrainingSnapshotTestAccess final {
 }  // namespace mmltk::backend::models::rfdetr::testsupport
 namespace {
 namespace r = mmltk::backend::models::rfdetr;
+TEST_CASE("Training dataset identity uses bounded metadata without opening image payloads", "[rfdetr][training][session]") {
+ mmltk::backend::data::FileHeader header{};
+ header.num_images = 1'000'000;
+ header.image_width = header.image_height = 312;
+ header.channels = 3;
+ header.total_file_size = 1ULL << 40;
+ mmltk::common::io::FileSnapshot generation{.device = 1, .inode = 2, .bytes = header.total_file_size, .modified_seconds = 100, .modified_nanoseconds = 200};
+ // No file exists: even a terabyte source identity uses these metadata alone.
+ const auto identity = r::training_dataset_identity(header, generation, "resolved-model");
+ CHECK(identity.size() == 64);
+ CHECK(r::training_dataset_identity(header, generation, "resolved-model") == identity);
+ auto moved = generation;
+ moved.device = 3;
+ moved.inode = 4;
+ moved.changed_seconds = 5;
+ CHECK(r::training_dataset_identity(header, moved, "resolved-model") == identity);
+ ++generation.modified_nanoseconds;
+ CHECK(r::training_dataset_identity(header, generation, "resolved-model") != identity);
+ --generation.modified_nanoseconds;
+ CHECK(r::training_dataset_identity(header, generation, "different-model") != identity);
+ ++header.label_offset;
+ CHECK(r::training_dataset_identity(header, generation, "resolved-model") != identity);
+}
 using Access = r::testsupport::TrainingSnapshotTestAccess;
 struct CopyAccounting final {
  std::map<const void*, std::size_t> reads;

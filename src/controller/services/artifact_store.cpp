@@ -14,6 +14,7 @@
 #include <fstream>
 #include <ranges>
 #include <span>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <tuple>
@@ -187,7 +188,9 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
    const auto info = mmltk::backend::data::inspect_compiled_dataset(path);
    if (const auto invalid = invalid_inspected_split(info)) { return rejected_inspection(*invalid); }
    if (info.width != info.height || info.channels != 3U || (resolution != 0U && info.width != resolution)) {
-    return rejected_inspection("compiled artifact does not match the configured square RGB resolution");
+    const auto expected = resolution == 0U ? std::string{"square RGB (3 channels)"} : std::to_string(resolution) + "x" + std::to_string(resolution) + " RGB (3 channels)";
+    return rejected_inspection("Compiled dataset is " + std::to_string(info.width) + "x" + std::to_string(info.height) + " with " + std::to_string(info.channels) +
+                               " channels; " + std::string{preset} + " requires " + expected + ". Select matching model/dataset settings or recompile for that resolution. File: " + path.string());
    }
    if (classes && !classes->ordered_equal(*info.class_catalog)) return rejected_inspection("compiled artifact class catalogs differ");
    classes = info.class_catalog;

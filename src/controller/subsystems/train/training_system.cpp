@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <future>
+#include <format>
 #include <thread>
 #include <ranges>
 #include <stdexcept>
@@ -18,6 +19,15 @@
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::controller {
 namespace {
+[[nodiscard]] std::string_view training_diagnostic_text(const std::string_view text) noexcept {
+ std::size_t size = 0;
+ while (size < text.size()) {
+  const auto length = mmltk::common::types::utf8_prefix_length(text.substr(size));
+  if (length == 0 || size + length > 1024U) break;
+  size += length;
+ }
+ return text.substr(0, size);
+}
 [[nodiscard]] contracts::ProviderEffectResult reconcile_result(const services::VastReconciliation& result, const int fallback) {
  const int instance = result.instance ? result.instance->instance_id : fallback;
  using Source = services::VastReconciliation::Disposition;
@@ -46,13 +56,6 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(
    }
    diagnostic_message += ' ';
    diagnostic_message.append(failure.substr(0, contracts::kComputeErrorCapacity));
-   std::size_t size = 0;
-   while (size < diagnostic_message.size()) {
-    const auto length = mmltk::common::types::utf8_prefix_length(std::string_view{diagnostic_message}.substr(size));
-    if (length == 0 || size + length > 1024U) break;
-    size += length;
-   }
-   diagnostic_message.resize(size);
    return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training,
     .event = terminal == nullptr            ? "training.failed"
              : terminal->signal_number != 0 ? "child.signaled"
@@ -61,7 +64,7 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(
     .detail = terminal ? static_cast<std::uint64_t>(terminal->signal_number) : 0U,
     .device = request.device_ids.empty() ? request.device_id : request.device_ids.front(),
     .context = {.document_resource = request.output_dir.native()},
-    .message = diagnostic_message};
+    .message = training_diagnostic_text(diagnostic_message)};
   });
  };
  try {
@@ -153,8 +156,9 @@ public:
   std::string launch_token;
  };
  Impl(
-  SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, std::optional<mmltk::common::system::ExecutionPolicyRequest> policy, RuntimeFactory factory, SystemEventSink<event_type> events)
-     : settings_(settings), dataset_(dataset), model_(model), factory_(std::move(factory)), events_(std::move(events)) {
+  SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, std::optional<mmltk::common::system::ExecutionPolicyRequest> policy, RuntimeFactory factory, SystemEventSink<event_type> events,
+  services::RuntimeDiagnosticTarget diagnostics)
+     : settings_(settings), dataset_(dataset), model_(model), factory_(std::move(factory)), events_(std::move(events)), diagnostics_(std::move(diagnostics)) {
   if (!factory_) throw contracts::UnavailableError("training runtime factory is unavailable");
   std::promise<void> initialized;
   auto ready = initialized.get_future();
@@ -332,12 +336,23 @@ public:
       throw;
      }
     },
-   .work = [this, settings = facts.settings, selection, admission](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+   .work = [this, settings = facts.settings, revision = facts.revision, selection, admission](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
     contracts::ComputeTerminal terminal;
     bool failed = false;
     std::atomic_bool malformed_progress = false;
     try {
      const auto& selected = settings.workflows.train.request;
+     const auto generation = [this] {
+      std::scoped_lock lock(mutex_);
+      return state_.local.generation_frontier;
+     }();
+     std::string diagnostic_message;
+     diagnostics_.Emit([&] {
+      diagnostic_message = std::format("requested_preset={} requested_resolution={} prepared_preset={} prepared_resolution={} validation={} test={}", selected.preset_name, selected.resolution, selection.key.preset,
+       selection.key.resolution, selected.val_compiled_path.native(), selected.test_compiled_path.native());
+      return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training, .event = "training.inputs", .participant = "train",
+       .sequence = generation, .value = revision, .detail = selection.key.resolution, .context = {.document_resource = selected.train_compiled_path.native()}, .message = training_diagnostic_text(diagnostic_message)};
+     });
      contracts::ArtifactInspection inspection;
      if (!stop.stop_requested()) {
       inspection = dataset_.Inspect({selected.train_compiled_path, selected.val_compiled_path, selected.test_compiled_path}, selection.key.preset, selection.key.resolution, stop);
@@ -366,10 +381,6 @@ public:
       }
       direct::PublishLazyNoexcept(events_, [&] { return event_type{TrainingChanged{snapshot()}}; });
       if (admission) admission->RequireUnchanged(stop);
-      const auto generation = [this] {
-       std::scoped_lock lock(mutex_);
-       return state_.local.generation_frontier;
-      }();
       terminal = runtime().Train(
        std::move(*request), stop,
        [this, &malformed_progress](const services::TrainProcessProgress& update) {
@@ -401,6 +412,10 @@ public:
           .persistence = state_.persistence,
          };
         }
+        if (!update.metrics) diagnostics_.Emit([&] {
+         return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training, .event = "training.preparation", .participant = "train",
+          .sequence = observation.local.generation_frontier, .value = progress.completed, .detail = progress.total, .message = progress.status};
+        });
         direct::PublishLazyNoexcept(events_, [&] { return event_type{std::move(observation)}; });
        },
        generation);
@@ -411,21 +426,8 @@ public:
      failed = true;
      terminal = contracts::compute_failure_terminal(std::current_exception(), "local training failed");
     }
-    if (failed) runtime_.reset();
-    {
-     std::scoped_lock lock(mutex_);
-     if (stop.stop_requested() && !failed) terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
-     terminal.generation = state_.local.generation_frontier;
-     state_.local.active = false;
-     state_.local.terminal = terminal;
-     state_.activity = TrainingActivity::Idle;
-     AdvanceObservation();
-    }
-    settings_.UnlockTrainingConfiguration();
-    auto settled = snapshot();
-    auto publish = notification(event_type{TrainingChanged{std::move(settled)}});
-    if (failed) mmltk::common::logging::report_fatal("local training", terminal.detail);
-    return publish;
+    if (stop.stop_requested() && !failed) terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+    return SettleLocal(std::move(terminal));
    },
    .failure = [this](std::exception_ptr failure) { return FailLocal(failure); },
   });
@@ -533,23 +535,29 @@ public:
   });
   return snapshot();
  }
- [[nodiscard]] direct::LocalRun::Notification FailLocal(std::exception_ptr failure) {
-  const auto terminal = contracts::compute_failure_terminal(failure, "local training worker failed");
-  mmltk::common::logging::report_fatal("local training", terminal.detail);
-  runtime_.reset();
+ [[nodiscard]] direct::LocalRun::Notification SettleLocal(contracts::ComputeTerminal terminal) {
+  const bool failed = terminal.outcome == contracts::ComputeOperationOutcome::Failed;
+  if (failed) runtime_.reset();
   {
    std::scoped_lock lock(mutex_);
+   terminal.generation = state_.local.generation_frontier;
    state_.local.active = false;
    state_.activity = TrainingActivity::Idle;
-   state_.local.terminal.outcome = contracts::ComputeOperationOutcome::Failed;
-   state_.local.terminal.generation = state_.local.generation_frontier;
-   state_.local.terminal.completed = 0;
-   state_.local.terminal.output.clear();
-   state_.local.terminal.detail = terminal.detail;
+   state_.local.terminal = std::move(terminal);
    AdvanceObservation();
   }
   settings_.UnlockTrainingConfiguration();
-  return notification(event_type{TrainingChanged{snapshot()}});
+  auto settled = snapshot();
+  diagnostics_.Emit([&] {
+   return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::Training, .event = failed ? "training.operation.failed" : "training.operation.settled",
+    .participant = "train", .sequence = settled.local.terminal.generation, .value = settled.revision, .detail = static_cast<std::uint64_t>(settled.local.terminal.outcome),
+    .context = {.document_resource = settled.local.output.directory}, .message = training_diagnostic_text(settled.local.terminal.detail)};
+  });
+  if (failed) mmltk::common::logging::report_fatal("local training", settled.local.terminal.detail);
+  return notification(event_type{TrainingChanged{std::move(settled)}});
+ }
+ [[nodiscard]] direct::LocalRun::Notification FailLocal(std::exception_ptr failure) {
+  return SettleLocal(contracts::compute_failure_terminal(failure, "local training worker failed"));
  }
  [[nodiscard]] direct::LocalRun::Notification FailQuery() {
   runtime_.reset();
@@ -628,6 +636,7 @@ private:
  ModelSystem& model_;
  RuntimeFactory factory_;
  SystemEventSink<event_type> events_;
+ services::RuntimeDiagnosticTarget diagnostics_;
  mutable std::mutex mutex_;
  TrainingSnapshot state_{};
  std::unique_ptr<TrainingRuntime> runtime_;
@@ -643,8 +652,9 @@ private:
  direct::LocalRun run_;
 };
 TrainingSystem::TrainingSystem(
- SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, std::optional<mmltk::common::system::ExecutionPolicyRequest> policy, RuntimeFactory factory, SystemEventSink<event_type> events)
-    : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(policy), std::move(factory), std::move(events))) {}
+ SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, std::optional<mmltk::common::system::ExecutionPolicyRequest> policy, RuntimeFactory factory, SystemEventSink<event_type> events,
+ services::RuntimeDiagnosticTarget diagnostics)
+    : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(policy), std::move(factory), std::move(events), std::move(diagnostics))) {}
 TrainingSystem::~TrainingSystem() = default;
 mmltk::backend::models::rfdetr::TrainingOpenedRun TrainingSystem::OpenRun(mmltk::backend::models::rfdetr::TrainingDirectoryQuery query) {
  std::lock_guard store_lock(impl_->run_store_mutex_);

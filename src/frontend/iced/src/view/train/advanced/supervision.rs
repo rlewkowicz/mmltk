@@ -1,8 +1,9 @@
 use crate::fluent_theme::Element;
 use crate::generated::TrainAssignmentKind;
 use crate::view::settings::{EditCadence, EditSchedule, SettingsModel};
+use crate::view::shared::{CardHeading, card_section};
 use crate::view::workflow::fields;
-use iced::widget::{button, checkbox, column, container, row, text};
+use iced::widget::{button, checkbox, column, container, row};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Message {
@@ -88,7 +89,6 @@ pub fn view(train: &crate::generated::TrainViewState, enabled: bool) -> Element<
         denoising_toggle.into()
     };
     let mut controls = column![
-        text("Assignment"),
         container(assignment_choices).id(
             crate::generated::constraint_workflowstrainrequesttrainingsupervisionassignment()
                 .stable_field_id
@@ -161,7 +161,7 @@ pub fn view(train: &crate::generated::TrainViewState, enabled: bool) -> Element<
                 )),
         );
     }
-    controls.into()
+    card_section("Assignment", CardHeading::H2, controls)
 }
 
 #[cfg(test)]

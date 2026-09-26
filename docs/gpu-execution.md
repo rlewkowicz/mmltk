@@ -50,10 +50,9 @@ select Firefox's graphics device. Firefox follows the Wayland graphics session.
 The [shared-workspace path](#shared-workspace-interoperability) handles products
 whose compute, native receiver, and graphics devices differ.
 
-Every logical training model uses the complete selected rank set. DDP replicates
-model and optimizer storage on each GPU; it does not combine their VRAM.
-Logical lanes, global batch, and physical worker admission have distinct roles
-in the [training contract](rfdetr-training.md#logical-lanes-and-global-batch).
+The [training contract](rfdetr-training.md#logical-lanes-and-global-batch) defines
+DDP replication across the full rank set, per-GPU memory, logical lanes/global
+batch, and independent physical capacity.
 
 ## Device and NUMA placement
 
@@ -90,9 +89,8 @@ priority. The implementation starts in
 
 ## H2D and GDRCopy
 
-Compiled-image loading defaults to H2D with persistent local pinned staging
-and asynchronous DMA. Use `--gdrcopy` explicitly where the command exposes
-that option:
+[Compiled loading](datasets.md#default-h2d-path) defaults to pinned H2D staging.
+Select [GDRCopy](datasets.md#gdrcopy-path) explicitly where exposed:
 
 ```bash
 ./mmltk --gui --gdrcopy
@@ -105,10 +103,8 @@ reconstructs its runtime when the relevant saved device, placement, or
 transport configuration changes. GDRCopy selection has no automatic transport
 fallback.
 
-Train, Validate, and Predict hide the H2D/NUMA widgets; their saved settings,
-desktop transport override, and native execution remain supported. Explore
-retains its controls. GUI prediction's fixed batch size 1 is independent of
-transport selection.
+[GUI control visibility](gui-interaction.md#training-validation-and-prediction)
+does not remove saved placement/transport support or change Predict's fixed batch.
 
 The GPU framework builds its private static GDRCopy library from
 `third_party/gdrcopy`. Runtime notices install under
@@ -230,10 +226,8 @@ isolated-context creation's stack entry before ordinary binding and retirement.
 Context identity and physical completion, rather than a reported device index
 alone, govern safe resource use.
 
-Optional perceptual resizing has a separate reusable CUDA owner with explicit
-source/destination custody and bounded workspace. Its color, geometry, and
-CPU/CUDA contracts are documented with
-[dataset resizing](datasets.md#optional-perceptual-downscaling).
+[Perceptual resizing](datasets.md#optional-perceptual-downscaling) owns its
+separate reusable CUDA workspace and source/destination custody.
 
 ## Shared-workspace interoperability
 
@@ -295,13 +289,11 @@ callbacks; final detach emits its display wake independently of the ordinary
 availability gate. Callback exceptions are contained, and a wake itself grants
 no read or write permission.
 
-The independent backing reference survives browser resource retirement,
-replacement, and exporter process exit while native aliases or GPU work remain.
-Firefox's physical image and semaphore owners likewise retain their Vulkan
-device through partial construction and final destruction, even after registry
-or IPC removal. Exporter exit alone proves neither GPU completion nor safe
-native reuse. [Presentation lifetime](gui-interaction.md#native-gpu-custody-and-completion)
-owns source-read, callback, draw, and terminal-settlement rules.
+Backing survives browser retirement/replacement/exporter exit while native aliases
+or work remain. Firefox image/semaphore owners retain their Vulkan device through
+partial construction, registry/IPC removal, and final destruction. Exit proves
+neither completion nor safe reuse; [presentation custody](gui-interaction.md#native-gpu-custody-and-completion)
+owns source-read, callback, draw, and terminal settlement.
 
 [SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.cpp) binds its
 execution context before model release and again before destroying the released
@@ -439,11 +431,9 @@ outlives the operator. These internals are declared in
 the existing Upscale executable owns the real-provider capture, replay,
 counter-isolation, and independent raster-oracle cases.
 
-The capture/counter cases do not require the external raster-oracle files.
-Running them establishes those specific behaviors, not the numerical coverage
-of the full oracle suite. See [validation evidence](validation.md#gui-behavior-and-evidence-ownership)
-and [ShiftLUT tooling](commands.md#shiftlut-model-tooling) for the respective
-commands.
+Capture/counter cases run without external raster-oracle files and cannot prove
+full-oracle numerical coverage. See [validation](validation.md#gui-behavior-and-evidence-ownership)
+and [ShiftLUT tooling](commands.md#shiftlut-model-tooling).
 
 ## Read-only capability inspection
 

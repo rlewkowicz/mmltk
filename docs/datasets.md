@@ -138,19 +138,14 @@ counts still come from the source runs.
 
 ## Compiled binary format
 
-The compiler writes one self-contained, versioned `.bin` file per split. It
-stores the expensive source transformations—not PNG or JSON—so runtime loading
-does not decode images, parse annotations, resize masks, resize inputs, or
-convert pixel layouts.
-
-The current format is **version 9**. Format-8 and other older files fail the
-ordinary version check and must be recompiled; there is no legacy reader or
-migration path. Its authoritative definitions and validation rules are
+Each split becomes a self-contained `.bin` containing transformed pixels and
+annotations; runtime loading needs no decode, parsing, resizing, or pixel-layout
+conversion. **Version 9** is a native little-endian Linux format of packed
+fixed-width structures, defined and validated by
 [compiled_format.h](../src/backend/data/compiled_format.h) and
-[compiled_file_utils.h](../src/backend/data/compiled_file_utils.h). The file is
-a native little-endian Linux format written from packed fixed-width
-structures; consumers must reject an unknown magic or version instead of
-guessing a compatible layout.
+[compiled_file_utils.h](../src/backend/data/compiled_file_utils.h).
+Readers reject unknown magic/version. Format 8 and all older files require
+recompilation; there is no legacy reader or migration.
 
 ```text
 byte 0
@@ -308,11 +303,11 @@ Supplying width without height makes the target square. The RF-DETR-specific
 `rfdetr compile` command handles its train/validation dataset preparation;
 consult its own help for model-specific dimensions and options.
 
-Both `compile` and `rfdetr compile` accept `--resize-mode Stretch` (default),
-`--resize-mode Letterbox`, and `--perceptual-downscale`. The GUI exposes the
-geometry radios and separate perceptual option with its Dataset compilation
-controls. CLI `rfdetr validate` also accepts `--resize-mode` for source
-compilation; it does not reinterpret an existing bin's stored mode.
+Both compilers expose [resize geometry](#resize-geometry) through `--resize-mode`
+and [perceptual shrinking](#optional-perceptual-downscaling) through
+`--perceptual-downscale`; the [Dataset card](gui-interaction.md#dataset-compilation-controls)
+provides matching controls. `rfdetr validate --resize-mode` affects source
+compilation only; existing bins retain their stored mode.
 
 To measure actual loading rather than inspect metadata:
 
@@ -331,25 +326,19 @@ supports **Coco custom**, the existing COCO/Objects365/Open Images recipe, and
 **Coconut**, the full COCONut training recipe with three validation choices.
 It shares the compiled layout, resizer, and loader described here.
 
-[Built-in benchmark datasets](benchmark-datasets.md) owns recipe membership,
-native import and physical provenance, persistent archive/JPEG/index reuse,
-optional original-annotation mask recovery, bounded archive/image repair,
-overlapping acquisition/labels/pixels, independent progress, partial downloads,
-and cache-format limits. The [progress reference](benchmark-datasets.md#reading-compilation-progress)
-also defines Directory compilation's image counts and unnecessary acquisition.
-Use [Dataset controls](gui-interaction.md#dataset-compilation-controls) for GUI
-selection and [benchmark cache selection](commands.md#benchmark-cache-selection)
-for wrapper/CLI configuration.
+[Benchmark datasets](benchmark-datasets.md) owns recipes, import/provenance,
+mask recovery, acquisition/cache/repair, and capacity. Its
+[progress reference](benchmark-datasets.md#reading-compilation-progress) also
+covers Directory compilation. See [Dataset controls](gui-interaction.md#dataset-compilation-controls)
+and [cache configuration](commands.md#benchmark-cache-selection).
 
 ## Optional perceptual downscaling
 
-Compilation and GPU augmentation each expose an independent
-`perceptual_downscale` setting, false by default. RF-DETR CLI compilation uses
-`--perceptual-downscale`, also exposed by root `compile`; training augmentation
-uses `--aug-perceptual-downscale` alongside enabled GPU augmentation. The
-ordinary resizing policy applies when the option is off.
-The option affects shrinking RGB pixels, not categorical masks, boxes, class
-identity, selected resize geometry, or compiled record layout.
+Compilation and GPU augmentation have independent, default-false
+`perceptual_downscale` settings: root/RF-DETR compile use
+`--perceptual-downscale`; enabled training augmentation uses
+`--aug-perceptual-downscale`. Off retains ordinary resizing. The option changes
+shrinking RGB only, preserving masks, boxes, classes, geometry, and record layout.
 
 [RgbImageResizer](../src/backend/imaging/resample/image_resize.h) owns CPU execution and
 [GpuPerceptualDownscaler](../src/backend/imaging/resample/image_resize_cuda.h) owns reusable
@@ -394,23 +383,15 @@ accumulation traverses rows directly with the same sample and compensated-sum
 order. Large-footprint accumulation retains its strided traversal and reduction
 tree; filtering, thresholds, alpha handling, and rounding are unchanged.
 
-Compilation records the selected resampling policy in its benchmark compilation
-facts without changing downloaded source-cache identity. Recompile when changing
-the policy; an existing `.bin` already contains its transformed pixels.
-Perceptual downscaling can emphasize noise and makes no detector-accuracy or
-measured performance claim.
+Benchmark compilation facts record resampling policy independently of source-cache
+identity. Changed policy requires recompilation. Perceptual downscaling can
+emphasize noise; no detector-accuracy or measured performance benefit is claimed.
 
 ## Loading a compiled file
 
-Metadata-only inspection reads and validates the header and section extents:
-
-```bash
-./mmltk info --compiled ./compiled/train.bin
-```
-
-Product loading opens the file through
-[`CompiledDataset`](../src/backend/data/compiled_dataset.h). Opening performs
-the complete structural check before exposing any view:
+[Metadata-only `info`](#compile-and-inspect) checks the header and section
+extents. Product loading through [CompiledDataset](../src/backend/data/compiled_dataset.h)
+performs the full structural check before exposing views:
 
 1. map the regular file read-only with `MAP_SHARED`;
 2. copy and validate the header magic, version, dimensions, stride, and limits;
@@ -474,14 +455,11 @@ independently of retained backing capacity.
 
 ## Why compiled loading is fast
 
-Most of the speed comes from moving variable-cost work out of the hot path:
+The [compiled format](#compiled-binary-format) moves decoding, RGB conversion,
+resizing/padding, annotation parsing/transforms, and validation out of runtime.
+Fixed `float32` stride gives O(1) image addresses; labels/masks are packed arrays
+rather than per-image object graphs. Loading additionally uses:
 
-- PNG decode, RGB conversion, resizing, optional padding, JSON parsing, mask
-  transformation, source-box transformation, and validation happen once during
-  compilation.
-- Runtime images have a fixed `float32` stride and O(1) address calculation.
-  Labels and masks are compact packed arrays rather than per-image object
-  graphs.
 - The 2 MiB-aligned pixel blob is friendly to huge-page-backed file-cache
   mappings. The loader supplies Linux `madvise` hints separately for the
   sequential index/metadata and for normal, sequential, or random pixel access.
@@ -506,14 +484,9 @@ The default path copies demanded mapped pixels into persistent GPU-local,
 NUMA-bound pinned host storage, then submits one asynchronous
 `cudaMemcpyAsync` for the packed batch on a nonblocking high-priority copy
 stream. A CUDA event hands the finished device slot to the consumer stream.
-This path works without GDRCopy:
-
-```bash
-./mmltk bench --compiled ./compiled/train.bin --batch-size 32 --epochs 1
-```
-
-For a contiguous CPU batch, `host_images` can alias the mapped pixel blob
-directly. Other CPU views are materialized only when requested.
+This is the default [benchmark path](#compile-and-inspect) and needs no GDRCopy.
+For contiguous CPU batches, `host_images` can alias the mapped pixels; other CPU
+views materialize only on demand.
 
 ### GDRCopy path
 
@@ -630,10 +603,9 @@ calculation used by rendering, atlas copies, and probes. Callers combine that
 row with the actual buffer pitch; demand size and vector capacity do not
 define physical tile addresses.
 
-Host-page pinning and device-cache residency describe different resources.
-Host pages remain registered through H2D/D2H completion. Cached GPU pixels stay
-resident by retaining device allocations and read/write custody; GPU storage
-is not registered as host memory.
+Host pages stay registered through H2D/D2H completion. GPU cache residency
+instead retains device allocations and read/write custody; it is not host
+memory registration.
 
 [GalleryAtlas](../src/controller/subsystems/explore/detail/gallery_atlas.h)
 keeps a separate directory for each physical output owner.

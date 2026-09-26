@@ -50,7 +50,9 @@ struct Button<'a> {
 #[derive(Default)]
 struct ButtonState {
     focused: bool,
+    focus_visible: bool,
     reported: bool,
+    hovered: bool,
     pressed: bool,
     epoch: Option<iced::time::Instant>,
     pulse: f32,
@@ -61,9 +63,11 @@ impl widget::operation::Focusable for ButtonState {
     }
     fn focus(&mut self) {
         self.focused = true;
+        self.focus_visible = true;
     }
     fn unfocus(&mut self) {
         self.focused = false;
+        self.focus_visible = false;
     }
 }
 pub(super) fn control<'a>(
@@ -141,13 +145,35 @@ impl Widget<Message, Theme, iced::Renderer> for Button<'_> {
             shell.request_redraw();
         }
         let over = cursor.is_over(layout.bounds());
+        if self.control == Control::Trigger && !self.alert && state.focused {
+            let visible = match event {
+                Event::Mouse(mouse::Event::CursorMoved { .. }) => over,
+                Event::Mouse(mouse::Event::CursorLeft) => false,
+                Event::Keyboard(_) => true,
+                _ => state.focus_visible,
+            };
+            if state.focus_visible != visible {
+                state.focus_visible = visible;
+                shell.request_redraw();
+            }
+        }
+        if self.control == Control::Settings && state.hovered != over {
+            state.hovered = over;
+            shell.request_redraw();
+        }
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if over => {
                 state.pressed = true;
+                if self.control == Control::Settings {
+                    shell.request_redraw();
+                }
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.pressed => {
                 state.pressed = false;
+                if self.control == Control::Settings {
+                    shell.request_redraw();
+                }
                 if over {
                     shell.publish(Message::Activate(self.control, Opening::Mouse));
                 }
@@ -208,8 +234,18 @@ impl Widget<Message, Theme, iced::Renderer> for Button<'_> {
         viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_ref::<ButtonState>();
-        let style = alert_style(theme, state.pulse, self.alert);
-        if state.focused {
+        let status = if cursor.is_over(layout.bounds()) {
+            if state.pressed {
+                iced::widget::button::Status::Pressed
+            } else {
+                iced::widget::button::Status::Hovered
+            }
+        } else {
+            iced::widget::button::Status::Active
+        };
+        let style = self.control.style(theme, status, state.pulse, self.alert);
+        if state.focused && (state.focus_visible || self.control != Control::Trigger || self.alert)
+        {
             let bounds = layout.bounds();
             renderer.fill_quad(
                 renderer::Quad {
@@ -233,6 +269,8 @@ impl Widget<Message, Theme, iced::Renderer> for Button<'_> {
             renderer::Quad {
                 bounds: layout.bounds(),
                 border: style.border,
+                shadow: style.shadow,
+                snap: style.snap,
                 ..renderer::Quad::default()
             },
             style.background.unwrap_or(Color::TRANSPARENT.into()),
@@ -281,8 +319,10 @@ struct Host<'a> {
 }
 // Pointer transitions are widget state: Iced can deliver several moves before
 // applying the resulting application messages. Keep every edge in that batch.
+#[derive(Default)]
 struct PointerRegion {
     inside: bool,
+    trigger: Rectangle,
 }
 impl PointerRegion {
     fn observe(&mut self, event: &Event, inside: bool) -> Option<Message> {
@@ -314,22 +354,14 @@ pub(super) fn host<'a>(
         nonempty: !notices.is_empty(),
     })
 }
-pub(super) fn trigger(bounds: Size) -> Rectangle {
-    Rectangle {
-        x: (bounds.width - STATUS_WIDTH - SETTINGS_WIDTH - 18.0).max(0.0),
-        y: 9.0,
-        width: STATUS_WIDTH,
-        height: CONTROL_HEIGHT,
-    }
-}
-pub(super) fn panel_bounds(bounds: Size, height: f32) -> Rectangle {
+pub(super) fn panel_bounds(bounds: Size, height: f32, trigger: Rectangle) -> Rectangle {
     let width = (bounds.width * 0.6).min((bounds.width - 24.0).max(1.0));
     let height = height.min((bounds.height - 24.0).max(1.0));
     Rectangle {
-        x: trigger(bounds)
+        x: trigger
             .x
-            .min((bounds.width - width - 12.0).max(12.0)),
-        y: 51.0_f32.min((bounds.height - height - 12.0).max(12.0)),
+            .clamp(12.0, (bounds.width - width - 12.0).max(12.0)),
+        y: (trigger.y + trigger.height + 8.0).min((bounds.height - height - 12.0).max(12.0)),
         width,
         height,
     }
@@ -371,6 +403,7 @@ impl Widget<AppMessage, Theme, iced::Renderer> for Host<'_> {
     fn state(&self) -> widget::tree::State {
         widget::tree::State::new(PointerRegion {
             inside: self.component.hover,
+            ..Default::default()
         })
     }
     fn size(&self) -> Size<Length> {
@@ -385,9 +418,40 @@ impl Widget<AppMessage, Theme, iced::Renderer> for Host<'_> {
         renderer: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        self.content
+        let node = self
+            .content
             .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits)
+            .layout(&mut tree.children[0], renderer, limits);
+        // Resolve once per layout, stopping at the header control before the
+        // page body. Hover and popup placement then use the same painted bounds.
+        struct Anchor {
+            id: widget::Id,
+            bounds: Option<Rectangle>,
+        }
+        impl widget::Operation for Anchor {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn widget::Operation)) {
+                if self.bounds.is_none() {
+                    operate(self);
+                }
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if id == Some(&self.id) {
+                    self.bounds = Some(bounds);
+                }
+            }
+        }
+        let mut anchor = Anchor {
+            id: TRIGGER_ID.into(),
+            bounds: None,
+        };
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            Layout::new(&node),
+            renderer,
+            &mut anchor,
+        );
+        tree.state.downcast_mut::<PointerRegion>().trigger = anchor.bounds.unwrap_or_default();
+        node
     }
     fn operate(
         &mut self,
@@ -411,7 +475,9 @@ impl Widget<AppMessage, Theme, iced::Renderer> for Host<'_> {
         viewport: &Rectangle,
     ) {
         if !self.component.open {
-            let inside = cursor.is_over(trigger(layout.bounds().size()));
+            let trigger = tree.state.downcast_ref::<PointerRegion>().trigger
+                + (layout.position() - Point::ORIGIN);
+            let inside = cursor.is_over(trigger);
             if let Some(message) = tree
                 .state
                 .downcast_mut::<PointerRegion>()
@@ -482,12 +548,16 @@ impl Widget<AppMessage, Theme, iced::Renderer> for Host<'_> {
         translation: Vector,
     ) -> Option<overlay::Element<'b, AppMessage, Theme, iced::Renderer>> {
         if self.component.open && self.nonempty {
+            let trigger = tree.state.downcast_ref::<PointerRegion>().trigger
+                + (layout.position() - Point::ORIGIN)
+                + translation;
             Some(overlay::Element::new(Box::new(Popup {
                 content: &mut self.panel,
                 tree: &mut tree.children[1],
                 pointer_region: tree.state.downcast_mut::<PointerRegion>(),
                 component: self.component,
                 viewport: *viewport,
+                trigger,
             })))
         } else {
             self.content.as_widget_mut().overlay(
@@ -506,11 +576,16 @@ struct Popup<'a, 'b> {
     pointer_region: &'a mut PointerRegion,
     component: &'a Component,
     viewport: Rectangle,
+    trigger: Rectangle,
 }
 impl overlay::Overlay<AppMessage, Theme, iced::Renderer> for Popup<'_, '_> {
     fn layout(&mut self, renderer: &iced::Renderer, bounds: Size) -> layout::Node {
         self.viewport = Rectangle::with_size(bounds);
-        let rect = panel_bounds(bounds, (bounds.height - 64.0).clamp(1.0, 600.0));
+        let rect = panel_bounds(
+            bounds,
+            (bounds.height - 64.0).clamp(1.0, 600.0),
+            self.trigger,
+        );
         self.content
             .as_widget_mut()
             .layout(
@@ -556,7 +631,7 @@ impl overlay::Overlay<AppMessage, Theme, iced::Renderer> for Popup<'_, '_> {
         renderer: &iced::Renderer,
         shell: &mut Shell<'_, AppMessage>,
     ) {
-        let trigger = trigger(self.viewport.size());
+        let trigger = self.trigger;
         let panel = layout.bounds();
         let gap = Rectangle {
             x: trigger.x.max(panel.x),
@@ -763,12 +838,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn healthy_trigger_pointer_exit_removes_outline_without_losing_keyboard_focus() {
+        use iced::advanced::renderer::Headless;
+        use iced::advanced::widget::operation::Focusable;
+        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            Default::default(),
+            Some("wgpu"),
+        ))
+        .expect("Status paint requires the container renderer");
+        let viewport = iced::widget::shader::Viewport::with_physical_size(Size::new(240, 64), 1.0);
+        let bounds = Rectangle::with_size(Size::new(240.0, 64.0));
+        let theme = crate::fluent_theme::app_theme(false);
+        let mut control = control(
+            Control::Trigger,
+            container(iced::widget::space::horizontal())
+                .center(Fill)
+                .into(),
+            STATUS_WIDTH,
+            false,
+            environment::State::default(),
+        );
+        let mut tree = widget::Tree::new(&control);
+        tree.diff(control.as_widget_mut());
+        let node = control
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, bounds.size()),
+            )
+            .move_to(Point::new(16.0, 16.0));
+        let paint = |control: &Element<'_, Message>,
+                     renderer: &mut iced::Renderer,
+                     tree: &widget::Tree| {
+            renderer.reset(bounds);
+            control.as_widget().draw(
+                tree,
+                renderer,
+                &theme,
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &bounds,
+            );
+            renderer
+                .screenshot(&viewport, Color::WHITE)
+                .chunks_exact(4)
+                .filter(|pixel| pixel[0] < 30 && pixel[1] > 80 && pixel[1] < 160 && pixel[2] > 170)
+                .count()
+        };
+        tree.state.downcast_mut::<ButtonState>().focus();
+        assert!(paint(&control, &mut renderer, &tree) > 10);
+        let mut messages = Vec::new();
+        control.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::ORIGIN,
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Available(Point::ORIGIN),
+            &renderer,
+            &mut Shell::new(
+                &iced::window::Headless,
+                iced_runtime::core::shell::Waker::new(|| {}),
+                &mut messages,
+            ),
+            &bounds,
+        );
+        assert!(tree.state.downcast_ref::<ButtonState>().is_focused());
+        assert_eq!(
+            paint(&control, &mut renderer, &tree),
+            0,
+            "healthy Status retained its blue outline after pointer exit"
+        );
+        tree.state.downcast_mut::<ButtonState>().focus();
+        assert!(paint(&control, &mut renderer, &tree) > 10);
+    }
+
+    #[test]
     fn batched_pointer_edges_rearm_a_manually_closed_panel_without_focus_changes() {
         let mut component = Component::default();
         component.hover(true, true);
         component.close();
         component.focus = Some(Control::Trigger);
-        let mut region = PointerRegion { inside: true };
+        let mut region = PointerRegion {
+            inside: true,
+            ..Default::default()
+        };
         let moved = Event::Mouse(mouse::Event::CursorMoved {
             position: Point::ORIGIN,
         });
@@ -801,7 +957,10 @@ mod tests {
         let mut component = Component::default();
         component.hover(true, true);
         component.close();
-        let mut region = PointerRegion { inside: true };
+        let mut region = PointerRegion {
+            inside: true,
+            ..Default::default()
+        };
         let Some(Message::Hover(inside)) =
             region.observe(&Event::Mouse(mouse::Event::CursorLeft), true)
         else {

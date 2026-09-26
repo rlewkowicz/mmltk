@@ -98,7 +98,8 @@ class TrainingSystem final {
 public:
  using event_type = std::variant<TrainingProgress, TrainingChanged, TrainingInspectionChanged>;
  using RuntimeFactory = std::function<std::unique_ptr<TrainingRuntime>()>;
- TrainingSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, std::optional<mmltk::common::system::ExecutionPolicyRequest>, RuntimeFactory, SystemEventSink<event_type> = {});
+ TrainingSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, std::optional<mmltk::common::system::ExecutionPolicyRequest>, RuntimeFactory, SystemEventSink<event_type> = {},
+  services::RuntimeDiagnosticTarget = {});
  ~TrainingSystem();
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Start(contracts::WorkflowIntent<contracts::FeatureId::Train>);
  [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingOpenedRun OpenRun(mmltk::backend::models::rfdetr::TrainingDirectoryQuery);

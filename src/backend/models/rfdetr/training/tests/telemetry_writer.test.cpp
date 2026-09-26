@@ -61,6 +61,31 @@ void test_telemetry_pressure_preserves_a_terminal_boundary() {
 }
 }  // namespace
 TEST_CASE("test_telemetry_persistence_failure_is_nonfatal", "[model][rfdetr][training][telemetry]") { test_telemetry_persistence_failure_is_nonfatal(); }
+TEST_CASE("Training preparation publishes stages only from rank zero", "[rfdetr][training][telemetry]") {
+ mmltk::testsupport::ScopedTempDir temp{"mmltk-training-preparation"};
+ r::TrainRequest request;
+ request.output_dir = temp.path();
+ const auto read = [&] {
+  std::ifstream stream(temp.path() / r::kTrainingPreparationFile);
+  const std::string text{std::istreambuf_iterator<char>(stream), {}};
+  return mmltk::frameworks::serialization::decode_reflected_json<r::TrainingPreparationProgress>(text, {.max_bytes = 1024, .max_items = 16, .max_depth = 4});
+ };
+ r::TrainingPreparationWriter writer(request);
+ CHECK(read().stage == r::TrainingPreparationStage::Runtime);
+ writer.Stage(r::TrainingPreparationStage::Dataset);
+ CHECK(read().stage == r::TrainingPreparationStage::Dataset);
+ request.distributed_worker = true;
+ request.distributed_rank = 1;
+ r::TrainingPreparationWriter peer(request);
+ peer.Stage(r::TrainingPreparationStage::Model);
+ CHECK(read().stage == r::TrainingPreparationStage::Dataset);
+ writer.Stage(r::TrainingPreparationStage::Optimizers);
+ CHECK(read().stage == r::TrainingPreparationStage::Optimizers);
+ request.distributed_rank = 0;
+ std::filesystem::remove(temp.path() / r::kTrainingPreparationFile);
+ std::filesystem::create_directory(temp.path() / r::kTrainingPreparationFile);
+ REQUIRE_NOTHROW(r::TrainingPreparationWriter(request).Stage(r::TrainingPreparationStage::Model));
+}
 TEST_CASE("test_telemetry_pressure_preserves_a_terminal_boundary", "[model][rfdetr][training][telemetry]") { test_telemetry_pressure_preserves_a_terminal_boundary(); }
 namespace {
 // The writer's actual Initialize open blocks on this FIFO until Release. No

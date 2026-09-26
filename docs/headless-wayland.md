@@ -17,13 +17,9 @@ runtime image. It installs pinned Weston packages, a Wayland inspection client,
 and a validation-only input-seat module compiled in the build image. It does
 not rebuild or replace the packaged application or Firefox.
 
-The [workflow case](validation.md#packaged-wayland-acceptance) runs real local
-training through the packaged sibling CLI, evaluation with six retained
-samples, compiled/image/video prediction, and export. It checks each workflow's
-selected GPU against native execution evidence and requires actual canvas
-observations for charts, the live progress bar, and image viewers in addition
-to typed operation completion and physical graphics settlement. It uses the
-same private compositor and progress deadlines as other packaged acceptance.
+The [acceptance reference](validation.md#packaged-wayland-acceptance) owns the
+workflow cases and their independent native, rendered, and physical-settlement
+assertions. Headless cases share this compositor and the same progress deadlines.
 
 Two focused checks avoid building the native acceptance graph:
 
@@ -36,10 +32,10 @@ The first starts the real NVIDIA compositor, checks the initialized EGL/GL
 vendor and DMA-BUF import-modifier extension, performs a Wayland roundtrip,
 checks the output, shell and DMA-BUF protocol globals and an input seat with
 both pointer and keyboard capabilities, then shuts down.
-It validates compositor availability; only `workspace-wayland` validates the
-application's native import, WebGPU/Vulkan, swapchain, presentation and shutdown.
-The second exercises supervisor ownership, readiness, failure, deadline and
-signal handling in the existing build image without GPU access.
+Only `workspace-wayland` additionally validates application native import,
+WebGPU/Vulkan, swapchain, presentation, and shutdown. The second check exercises
+supervisor ownership, readiness, failure, deadlines, and signals in the existing
+build image without GPU access.
 
 `headless-compositor` also accepts a command after `--`; its default command
 is `/usr/bin/true`. This is the wrapper entrypoint for diagnostics that need
@@ -105,8 +101,6 @@ from `/usr/lib/weston/mmltk-headless-seat.so` before the readiness module.
 the package pin and module build; [headless_compositor.py](../tools/headless_compositor.py)
 owns session startup, seat/protocol readiness, and teardown.
 
-This synthetic seat provides the capabilities required by Firefox/GTK and
-the browser-driven acceptance workflows. It does not certify a physical input
-device or host-desktop focus behavior. A successful compositor preflight
-proves setup and teardown; the retained application scenarios still own the
-interaction and image assertions.
+The synthetic seat supplies Firefox/GTK and acceptance capabilities; it certifies
+neither physical input devices nor host-desktop focus. Preflight proves setup
+and teardown; application scenarios own interaction and image assertions.

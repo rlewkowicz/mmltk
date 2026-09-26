@@ -543,15 +543,18 @@ void run_compile(const CompileCliRequest& request) {
   bar.close();
  }
 }
-[[noreturn]] void exec_onnx_info_tool(const std::filesystem::path& model_path, const logging::CliOverrides& logging_options) {
- const auto tool = mmltk::entrypoints::cli::resolve_sibling_tool_path("mmltk-rfdetr-onnx-info").string();
- std::vector<std::string> arguments{tool, model_path.string()};
+void append_logging_arguments(std::vector<std::string>& arguments, const logging::CliOverrides& logging_options) {
  if (logging_options.level) {
   const auto level_name = spdlog::level::to_string_view(*logging_options.level);
   arguments.push_back("--log-level=" + std::string(level_name.data(), level_name.size()));
  }
  if (logging_options.log_file) arguments.push_back("--log-file=" + logging_options.log_file->string());
  if (logging_options.log_dir) arguments.push_back("--log-dir=" + logging_options.log_dir->string());
+}
+[[noreturn]] void exec_onnx_info_tool(const std::filesystem::path& model_path, const logging::CliOverrides& logging_options) {
+ const auto tool = mmltk::entrypoints::cli::resolve_sibling_tool_path("mmltk-rfdetr-onnx-info").string();
+ std::vector<std::string> arguments{tool, model_path.string()};
+ append_logging_arguments(arguments, logging_options);
  auto argv = mmltk::entrypoints::cli::make_exec_argv(arguments);
  ::execv(argv.front(), argv.data());
  throw std::system_error(errno, std::generic_category(), "failed to exec ONNX info helper");
@@ -599,9 +602,10 @@ void apply_train_presence(TrainCliRequest& state, const reflection::PresenceSet&
 }
 class DistributedTrainingProcess final {
 public:
- static int Run(const TrainRequest& request) {
+ static int Run(const TrainRequest& request, const logging::CliOverrides& logging_options) {
   const auto partitions = rfdetr::select_distributed_training_partitions(request);
   if (partitions.size() < 2U) throw std::logic_error("distributed training requires multiple partitions");
+  const auto logging_config = logging::merge(logging::config_from_env("mmltk"), logging_options);
   const auto store = std::filesystem::temp_directory_path() / ("mmltk_rfdetr_train_" + std::to_string(static_cast<long long>(::getpid())) + ".store");
   std::filesystem::remove(store);
   std::vector<pid_t> children;
@@ -615,6 +619,14 @@ public:
     worker.distributed_store_path = store;
     rfdetr::apply_training_partition(worker, partition);
     auto arguments = services::build_train_command_arguments(worker);
+    auto worker_logging = logging_options;
+    if (logging_config.enabled()) {
+     // Rotating sinks belong to one process; ranks must not rotate or replace
+     // one another's file when they start or reach the rotation limit.
+     const auto base = logging_config.log_file.value_or(logging_config.log_dir.value_or(request.output_dir) / "mmltk.log");
+     worker_logging.log_file = base.parent_path() / (base.stem().string() + ".rank-" + std::to_string(partition.rank) + base.extension().string());
+    }
+    append_logging_arguments(arguments, worker_logging);
     arguments.insert(arguments.begin(), mmltk::common::system::runtime_paths::current_executable_path().string());
     const pid_t pid = ::fork();
     if (pid < 0) throw std::system_error(errno, std::generic_category(), "failed to fork RF-DETR worker");
@@ -749,7 +761,7 @@ int dispatch_command(const rfdetr::RfdetrCommandDescriptor& descriptor, const st
    }
    auto state = parse_train_request(arguments);
    auto request = rfdetr::finalize_train_request(std::move(state.request));
-   if (!request.distributed_worker && request.device_ids.size() > 1U) { return DistributedTrainingProcess::Run(request); }
+   if (!request.distributed_worker && request.device_ids.size() > 1U) { return DistributedTrainingProcess::Run(request, logging_options); }
    const auto result = rfdetr::run_training(request);
    rfdetr::print_training_summary(request, result);
    return 0;

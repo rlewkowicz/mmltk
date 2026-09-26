@@ -7,7 +7,9 @@
 #include "src/common/io/file_memory.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
 #include <algorithm>
+#include <array>
 #include <limits>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <stdexcept>
@@ -17,6 +19,18 @@
 #include <fcntl.h>
 #include <unistd.h>
 namespace mmltk::backend::models::rfdetr {
+std::string training_dataset_identity(const mmltk::backend::data::FileHeader& header, const mmltk::common::io::FileSnapshot& file, std::string_view configuration) {
+ namespace io = mmltk::common::io;
+ static_assert(std::has_unique_object_representations_v<mmltk::backend::data::FileHeader>);
+ io::Sha256Hasher identity;
+ identity.Update({reinterpret_cast<const std::uint8_t*>(&header), sizeof(header)});
+ // Exclude inode/device and ctime so moving or copying an immutable dataset
+ // with its modification time preserved retains the same session identity.
+ const std::array<std::uint64_t, 3> generation{file.bytes, static_cast<std::uint64_t>(file.modified_seconds), static_cast<std::uint64_t>(file.modified_nanoseconds)};
+ identity.Update({reinterpret_cast<const std::uint8_t*>(generation.data()), sizeof(generation)});
+ identity.Update({reinterpret_cast<const std::uint8_t*>(configuration.data()), configuration.size()});
+ return io::sha256_hex(identity.Finish());
+}
 namespace {
 namespace io = mmltk::common::io;
 namespace serial = mmltk::frameworks::serialization;

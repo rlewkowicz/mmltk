@@ -294,10 +294,9 @@ impl Router {
 
     pub fn navigation(
         &self,
-        connection: &'static str,
         typography: crate::view_model::Typography,
     ) -> Element<'static, Message> {
-        navigation::view(self.active, connection, typography).map(Message::Navigation)
+        navigation::view(self.active, typography).map(Message::Navigation)
     }
 
     pub fn view<'a>(

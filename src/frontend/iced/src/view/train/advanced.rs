@@ -1,14 +1,17 @@
 use crate::fluent_theme::Element;
 use crate::generated::{TrainLrSchedulerKind, TrainOptimizerKind, TrainRecipeSettingsEdit};
 use crate::view::settings::{EditCadence, EditSchedule, SettingsModel};
+use crate::view::shared::{CardHeading, card_section};
 use crate::view::workflow::fields;
 use iced::widget::{button, column, container, row, text};
 
 mod supervision;
 
+const DIVIDER_SPACING: f32 = 10.0;
+
 #[derive(Debug, Clone)]
 pub enum Message {
-    Loading(crate::view::workflow::loading::Message),
+    Lanes(super::lanes::Message),
     BatchSize(u64),
     ValidationBatchSize(u64),
     Epochs(i32),
@@ -53,14 +56,10 @@ const fn scheduler_label(scheduler: TrainLrSchedulerKind) -> &'static str {
     }
 }
 
-pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedule, String> {
+pub fn update(model: &mut SettingsModel, message: Message) -> Result<Option<EditSchedule>, String> {
     let cadence = EditCadence::Debounced;
     match message {
-        Message::Loading(message) => crate::view::workflow::loading::update(
-            crate::generated::FeatureId::Train,
-            model,
-            message,
-        ),
+        Message::Lanes(message) => return super::lanes::update(model, message),
         Message::BatchSize(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstrainrequestbatchsize(draft, value)
         }),
@@ -99,6 +98,21 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedul
         }),
         Message::Supervision(message) => supervision::update(model, message),
     }
+    .map(Some)
+}
+
+fn card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    // The shared card already inserts one field gap after its subtitle.
+    let divider = crate::view::shared::card_section_divider().padding(
+        iced::Padding::ZERO
+            .top(DIVIDER_SPACING - crate::view::workflow::FIELD_SPACING)
+            .bottom(DIVIDER_SPACING),
+    );
+    crate::view::shared::card(
+        "Advanced",
+        "Batching, model recipes, data, and supervision.",
+        column![divider, content.into()].spacing(0),
+    )
 }
 
 pub fn view<'a>(
@@ -108,11 +122,7 @@ pub fn view<'a>(
     model: &crate::view_model::ApplicationModel,
 ) -> Element<'a, Message> {
     let Some(train) = train else {
-        return crate::view::shared::card(
-            "Advanced",
-            "Optimizer, schedule, precision, and supervision controls.",
-            iced::widget::text("Training settings unavailable"),
-        );
+        return card(text("Training settings unavailable"));
     };
     let request = &train.request;
     let scoped_recipe = settings
@@ -170,33 +180,39 @@ pub fn view<'a>(
                     }),
             )
         });
-    crate::view::shared::card(
-        "Advanced",
-        "Optimizer, schedule, precision, and supervision controls.",
+    let divider = || crate::view::shared::card_section_divider().padding([DIVIDER_SPACING, 0.0]);
+    let mut distribution = column![].spacing(6);
+    if let Some(training) = &model.workflow.training {
+        for facts in &training.sources.distributions {
+            distribution = distribution.push(text(format!(
+                "Model {} · epoch {} · {} unique images · {} scheduled draws · {} class support · {} class exposure · {} missing classes · {} unused tail",
+                facts.modelid, facts.epoch + 1, facts.uniqueimages, facts.scheduleddraws,
+                facts.uniqueclasssupport, facts.repeatedclassexposure, facts.missingclasses, facts.unusedtail,
+            )).size(12));
+        }
+    }
+    card(
         column![
-            crate::view::workflow::loading::view(
-                crate::generated::FeatureId::Train,
-                settings,
-                enabled
-            )
-            .map(Message::Loading),
+            card_section("Training batches and lanes", CardHeading::H2, column![
+            super::lanes::execution(request, settings, enabled).map(Message::Lanes),
             fields::numeric_grid()
                 .push(fields::number_u64(
-                    "Train batch size",
+                    "Global batch (all GPUs)",
                     request.batchsize,
                     crate::generated::constraint_workflowstrainrequestbatchsize(),
                     enabled,
                     Message::BatchSize,
                 ))
-                .push(fields::effective_batch(crate::generated::FeatureId::Train, false, model, settings))
-                .push(fields::number_u64(
-                    "Validation batch size",
-                    request.valbatchsize,
-                    crate::generated::constraint_workflowstrainrequestvalbatchsize(),
+                .push(fields::rank_batch(model, settings))
+                .push(fields::number_i32(
+                    "Gradient accumulation",
+                    request.gradaccumsteps,
+                    crate::generated::constraint_workflowstrainrequestgradaccumsteps(),
                     enabled,
-                    Message::ValidationBatchSize,
+                    Message::GradientAccumulation,
                 ))
-                .push(fields::effective_batch(crate::generated::FeatureId::Train, true, model, settings))
+                .push(fields::effective_batch(crate::generated::FeatureId::Train, false, model, settings))
+                .push(fields::number_i32("Training lanes", request.lanes, crate::generated::constraint_workflowstrainrequestlanes(), enabled, |value| Message::Lanes(super::lanes::Message::Count(value))))
                 .push(fields::number_i32(
                     "Epochs",
                     request.epochs,
@@ -204,15 +220,33 @@ pub fn view<'a>(
                     enabled,
                     Message::Epochs,
                 ))
-                .push(fields::number_i32(
-                    "Gradient accumulation",
-                    request.gradaccumsteps,
-                    crate::generated::constraint_workflowstrainrequestgradaccumsteps(),
+                .push(fields::read_only("Images / session round", "train.aggregate_batch", fields::execution_facts(crate::generated::FeatureId::Train, false, model, settings).map_or_else(|| "Updating".into(), |facts| facts.aggregateroundimages.to_string()))),
+            text("Global batch is split across the selected GPUs for each microbatch. Every model uses all selected GPUs; lanes do not select GPUs.").size(12),
+            text(if request.laneconfiguration.mode == crate::generated::TrainLaneMode::SharedGradients {
+                "One model: effective batch per update = global batch × training lanes × gradient accumulation."
+            } else {
+                "One model per lane: effective batch per model update = global batch × gradient accumulation. A session round includes every model."
+            }).size(12),
+            ].spacing(crate::view::workflow::FIELD_SPACING)),
+            divider(),
+            card_section("Validation during training", CardHeading::H2, column![
+            fields::numeric_grid()
+                .push(fields::number_u64(
+                    "Batch / validation lane",
+                    request.valbatchsize,
+                    crate::generated::constraint_workflowstrainrequestvalbatchsize(),
                     enabled,
-                    Message::GradientAccumulation,
-                )),
-            fields::read_only("Aggregate session round", "train.aggregate_batch", fields::execution_facts(crate::generated::FeatureId::Train, false, model, settings).map_or_else(|| "Updating".into(), |facts| facts.aggregateroundimages.to_string())),
-            text(if settings.recipe_model.is_some() { "Model optimizer" } else { "Global optimizer defaults" }),
+                    Message::ValidationBatchSize,
+                ))
+                .push(fields::number_i32("Validation lanes", request.validationlanes, crate::generated::constraint_workflowstrainrequestvalidationlanes(), enabled, |value| Message::Lanes(super::lanes::Message::ValidationCount(value))))
+                .push(fields::effective_batch(crate::generated::FeatureId::Train, true, model, settings))
+                ,
+            text("Validation runs on the primary training GPU. A batch of 0 uses the global training batch size.").size(12),
+            ].spacing(crate::view::workflow::FIELD_SPACING)),
+            divider(),
+            card_section("Model recipe and optimizer", CardHeading::H2, column![
+            super::lanes::recipe_scope(request, settings, enabled).map(Message::Lanes),
+            card_section(if settings.recipe_model.is_some() { "Model optimizer" } else { "Global optimizer defaults" }, CardHeading::H3, column![
             optimizer_choices,
             fields::numeric_grid()
                 .push(fields::number_f64(
@@ -243,6 +277,14 @@ pub fn view<'a>(
                     enabled,
                     |value| Message::Recipe(TrainRecipeSettingsEdit::Momentum(value)),
                 )),
+            fields::toggle("Nesterov momentum", crate::generated::effective_trainrecipesettings_nesterov(scoped_recipe), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::Nesterov(value))),
+            button("Use optimizer defaults")
+                .on_press_maybe(enabled.then_some(Message::Recipe(TrainRecipeSettingsEdit::Reset))),
+            ].spacing(crate::view::workflow::FIELD_SPACING)),
+            ].spacing(2.0 * crate::view::workflow::FIELD_SPACING)),
+            divider(),
+            card_section("Learning-rate schedule", CardHeading::H2, column![
+            scheduler_choices,
             fields::numeric_grid()
                 .push(fields::number_f64("Component LR factor", crate::generated::effective_trainrecipesettings_lrcomponentdecay(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipelrcomponentdecay(), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::LrComponentDecay(value))))
                 .push(fields::number_f64("Encoder layer LR factor", crate::generated::effective_trainrecipesettings_encoderlayerdecay(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipeencoderlayerdecay(), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::EncoderLayerDecay(value))))
@@ -251,9 +293,9 @@ pub fn view<'a>(
                 .push(fields::number_f64("Minimum LR factor", crate::generated::effective_trainrecipesettings_lrminfactor(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipelrminfactor(), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::LrMinFactor(value))))
                 .push(fields::number_i32("LR drop epoch", crate::generated::effective_trainrecipesettings_lrdrop(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipelrdrop(), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::LrDrop(value))))
                 .push(fields::number_f64("Bias warmup LR", crate::generated::effective_trainrecipesettings_warmupbiaslr(scoped_recipe), crate::generated::constraint_workflowstrainrequestrecipewarmupbiaslr(), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::WarmupBiasLr(value)))),
-            fields::toggle("Nesterov momentum", crate::generated::effective_trainrecipesettings_nesterov(scoped_recipe), enabled, |value| Message::Recipe(TrainRecipeSettingsEdit::Nesterov(value))),
-            text("Learning-rate scheduler"),
-            scheduler_choices,
+            ].spacing(crate::view::workflow::FIELD_SPACING)),
+            divider(),
+            card_section("Precision and encoder", CardHeading::H2, column![
             fields::toggle(
                 "Automatic mixed precision",
                 request.amp,
@@ -273,16 +315,23 @@ pub fn view<'a>(
                 Message::FreezeEncoder,
             ),
             fields::number_i32("Unfreeze encoder: final epochs", request.unfreezeencoderlastepochs, crate::generated::constraint_workflowstrainrequestunfreezeencoderlastepochs(), enabled, Message::UnfreezeLast),
+            ].spacing(crate::view::workflow::FIELD_SPACING)),
+            divider(),
+            card_section("Data sampling and augmentation", CardHeading::H2, column![
+            super::lanes::balancing(request, enabled).map(Message::Lanes),
+            distribution,
             container(fields::toggle("GPU augmentation", request.gpuaugmentation.enabled, enabled, Message::Augmentation))
                 .id(crate::generated::constraint_workflowstrainrequestgpuaugmentationenabled().stable_field_id.to_string()),
             fields::number_i32("Disable augmentation: final epochs", request.disableaugmentationlastepochs, crate::generated::constraint_workflowstrainrequestdisableaugmentationlastepochs(), enabled, Message::DisableAugmentationLast),
             container(fields::toggle("Perceptual augmentation downscaling", request.gpuaugmentation.perceptualdownscale, enabled, Message::PerceptualDownscale))
                 .id(crate::generated::constraint_workflowstrainrequestgpuaugmentationperceptualdownscale().stable_field_id.to_string()),
+            ].spacing(crate::view::workflow::FIELD_SPACING)),
+            divider(),
             supervision::view(train, enabled).map(Message::Supervision),
-            button("Use optimizer defaults")
-                .on_press_maybe(enabled.then_some(Message::Recipe(TrainRecipeSettingsEdit::Reset))),
+            divider(),
+            super::lanes::merging(request, enabled).map(Message::Lanes),
         ]
-        .spacing(crate::view::workflow::FIELD_SPACING),
+        .spacing(0),
     )
 }
 

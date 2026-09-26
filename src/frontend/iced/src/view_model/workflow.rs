@@ -1765,6 +1765,13 @@ pub(super) fn observe_compute(
     state: &crate::generated::ComputeTerminal,
 ) {
     use crate::generated::ComputeOperationOutcome as Outcome;
+    if matches!(
+        state.outcome,
+        Outcome::Running | Outcome::CancellationRequested
+    ) {
+        notices.ongoing(Origin::Compute(feature), 0, state.generation);
+        return;
+    }
     notices.terminal(
         Origin::Compute(feature),
         0,

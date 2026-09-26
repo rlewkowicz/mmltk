@@ -1914,7 +1914,7 @@ impl State {
                 None
             }
             Phase::AdvancedLayout(index) => {
-                driver.phase = if index < 19 {
+                driver.phase = if index < 23 {
                     Phase::AdvancedLayout(index + 1)
                 } else {
                     Phase::TriggerError
@@ -2125,7 +2125,7 @@ pub(super) fn perceptual_control_values(train: &crate::generated::TrainViewState
 
 pub(super) fn advanced_layout_field(index: usize) -> (String, String) {
     match index {
-        0 => ("workflow.advanced".into(), "container".into()),
+        0 => ("train.card.advanced".into(), "container".into()),
         1..=8 => (advanced_field_id(index - 1), format!("fixed-{}", index - 1)),
         9 => (train::MATCH_FREE_ASSIGNMENT_ID.into(), "assignment".into()),
         10 => (
@@ -2143,7 +2143,21 @@ pub(super) fn advanced_layout_field(index: usize) -> (String, String) {
             format!("Train.{}.effective_batch", index == 19),
             format!("effective-{}", index - 18),
         ),
-        _ => unreachable!("Advanced layout has twenty measured controls"),
+        20 => ("train.rank_batch".into(), "rank-batch".into()),
+        21 => ("train.aggregate_batch".into(), "aggregate-batch".into()),
+        22 => (
+            crate::generated::constraint_workflowstrainrequestlanes()
+                .stable_field_id
+                .to_string(),
+            "train-lanes".into(),
+        ),
+        23 => (
+            crate::generated::constraint_workflowstrainrequestvalidationlanes()
+                .stable_field_id
+                .to_string(),
+            "validation-lanes".into(),
+        ),
+        _ => unreachable!("Advanced layout has twenty-four measured controls"),
     }
 }
 

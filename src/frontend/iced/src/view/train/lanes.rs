@@ -1,6 +1,7 @@
 use crate::fluent_theme::Element;
 use crate::generated::*;
 use crate::view::settings::{EditCadence, EditSchedule, SettingsModel};
+use crate::view::shared::{CardHeading, card_section};
 use crate::view::workflow::fields;
 use iced::widget::{button, column, row, text};
 
@@ -133,7 +134,7 @@ pub fn update(
     settings.replace_training_lanes(configuration).map(Some)
 }
 
-pub fn view<'a>(
+pub fn execution<'a>(
     request: &'a TrainRequest,
     settings: &SettingsModel,
     enabled: bool,
@@ -157,6 +158,16 @@ pub fn view<'a>(
                 }),
         );
     }
+    modes.into()
+}
+
+pub fn recipe_scope<'a>(
+    request: &'a TrainRequest,
+    settings: &SettingsModel,
+    enabled: bool,
+) -> Element<'a, Message> {
+    let configuration = &request.laneconfiguration;
+    let enabled = enabled && !settings.training_membership_pending();
     let mut scopes = row![button("Global defaults").on_press(Message::Scope(None))].spacing(6);
     for model in &configuration.models {
         scopes = scopes.push(
@@ -169,10 +180,8 @@ pub fn view<'a>(
                 }),
         );
     }
-    let mut content = column![text("Training lanes"), modes,
-        fields::numeric_grid().push(fields::number_i32("Train lanes", request.lanes, constraint_workflowstrainrequestlanes(), enabled, Message::Count))
-            .push(fields::number_i32("Training-validation lanes", request.validationlanes, constraint_workflowstrainrequestvalidationlanes(), enabled, Message::ValidationCount)),
-        text("Recipe scope"), iced::widget::scrollable(scopes).direction(iced::widget::scrollable::Direction::Horizontal(iced::widget::scrollable::Scrollbar::default())),
+    let mut content = column![
+        iced::widget::scrollable(scopes).direction(iced::widget::scrollable::Direction::Horizontal(iced::widget::scrollable::Scrollbar::default())),
         text("New models copy the settled global recipe. Existing model recipes and overrides remain independent.").size(12),
     ].spacing(8);
     if let Some(model) = configuration
@@ -199,6 +208,10 @@ pub fn view<'a>(
                 )),
         );
     }
+    card_section("Recipe scope", CardHeading::H3, content)
+}
+
+pub fn balancing<'a>(request: &'a TrainRequest, enabled: bool) -> Element<'a, Message> {
     let mut balancing = row![].spacing(6);
     for choice in TRAIN_BALANCING_VALUES {
         let label = match choice {
@@ -216,8 +229,8 @@ pub fn view<'a>(
                 }),
         );
     }
-    content = content.push(text("Class balancing")).push(balancing)
-        .push(text("Balancing changes exposure; it cannot create missing class support. Unique images and repeated draws remain distinct.").size(12));
+    let mut content = column![text("Class balancing"), balancing,
+        text("Balancing changes exposure; it cannot create missing class support. Unique images and repeated draws remain distinct.").size(12)].spacing(crate::view::workflow::FIELD_SPACING);
     if request.datapolicy.balancing == TrainBalancing::RareRepeatsStratified {
         content = content.push(
             fields::numeric_grid()
@@ -244,6 +257,12 @@ pub fn view<'a>(
                 )),
         );
     }
+    content.into()
+}
+
+pub fn merging<'a>(request: &'a TrainRequest, enabled: bool) -> Element<'a, Message> {
+    let configuration = &request.laneconfiguration;
+    let mut content = column![].spacing(crate::view::workflow::FIELD_SPACING);
     if configuration.mode == TrainLaneMode::PeriodicAveraging {
         let mut cadence = row![].spacing(6);
         for value in TRAIN_MERGE_CADENCE_VALUES {
@@ -285,6 +304,10 @@ pub fn view<'a>(
                 }),
         );
     }
-    content.push(text("Final model soup")).push(policies)
-        .push(text("Experimental: RF-DETR soups select native ordinary or EMA artifacts using validation. Individual models remain available.").size(12)).into()
+    content.push(card_section(
+        "Final model soup",
+        CardHeading::H2,
+        column![policies, text("Experimental: RF-DETR soups select native ordinary or EMA artifacts using validation. Individual models remain available.").size(12)]
+            .spacing(crate::view::workflow::FIELD_SPACING),
+    )).into()
 }
