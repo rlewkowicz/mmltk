@@ -100,7 +100,7 @@ TEST_EVENTS = tuple(f"{runner}.test_{state}" for runner in ("catch", "tap", "lib
                     for state in ("started", "passed", "failed", "skipped"))
 TEST_START_EVENTS = tuple(event for event in TEST_EVENTS if event.endswith("started"))
 TEST_TERMINAL_EVENTS = tuple(event for event in TEST_EVENTS if event not in TEST_START_EVENTS)
-CATCH_FAILURE = re.compile(r"^(.+?):(\d+): (failed|skipped|warning|fatal error): (.*)$")
+CATCH_FAILURE = re.compile(r"^(.+?):(\d+): (failed|skipped|warning|fatal error):\s*(.*)$", re.IGNORECASE)
 CONTEXT_LABEL = re.compile(
     r"(?:^['\"]?|['\"] and ['\"]|\bwith \d+ messages?:\s*['\"])"
     r"(native diagnostics|native runtime log|Firefox diagnostics|acceptance diagnostics|Mozilla diagnostics|application log):\s*"
@@ -781,12 +781,15 @@ def transcript_data(text):
         return {"event": "libtest.summary", "level": "error" if text.startswith("test result: FAILED.") else "info", "message": text}
     failure = CATCH_FAILURE.match(text)
     if failure:
+        state = failure[3].lower()
         return {
-            "event": "catch.assertion_" + failure[3].replace(" ", "_"),
+            "event": "catch.assertion_" + state.replace(" ", "_"),
             "source_file": failure[1], "source_line": int(failure[2]),
-            "level": "error" if failure[3] in ("failed", "fatal error") else "info",
+            "level": "error" if state in ("failed", "fatal error") else "info",
             "message": failure[4],
         }
+    if text.strip() == "{Unknown expression after the reported line}":
+        return {"event": "catch.expression", "message": text}
     if text.startswith("Filters:"):
         return {"event": "catch.filters", "filters": text.removeprefix("Filters:").strip(), "message": text}
     if text.startswith("No test cases matched "):

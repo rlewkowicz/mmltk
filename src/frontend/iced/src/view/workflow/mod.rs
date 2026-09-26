@@ -397,9 +397,9 @@ mod tests {
             assert_eq!(
                 composition.audit_regions().len(),
                 match page {
-                    crate::generated::FeatureId::Live => 6,
-                    crate::generated::FeatureId::Annotate => 7,
-                    _ => 9,
+                    crate::generated::FeatureId::Live => 5,
+                    crate::generated::FeatureId::Annotate => 6,
+                    _ => 8,
                 }
             );
             assert_eq!(

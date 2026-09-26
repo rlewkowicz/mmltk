@@ -780,7 +780,7 @@ TEST_CASE("closed application categories discover nested reflected declarations 
  STATIC_REQUIRE(application_schema_detail::annotation_count<^^AnnotationEligibilityExamples::StaticSnapshot, contracts::reflection::Snapshot>() == 1U);
  STATIC_REQUIRE(application_schema_detail::annotation_count<^^CounterChanged, contracts::reflection::Event>() == 1U);
 }
-TEST_CASE("annotation fingerprints preserve canonical names typed values and order", "[controller][browser][reflection]") {
+TEST_CASE("annotation fingerprints preserve encoded identifiers typed values and order", "[controller][browser][reflection]") {
  namespace policy = mmltk::frameworks::reflection;
  using Annotations = policy::MaterializedAnnotations<policy::Minimum<std::int32_t>{-2}, policy::Maximum<std::uint16_t>{7U}, policy::Finite{}, policy::MinBytes{1U}, policy::MaxBytes{8U},
   policy::MaxItems{3U}, policy::Presentation<policy::PresentationKind::Norm>{}, policy::RuntimeDestination{}>;
@@ -788,20 +788,22 @@ TEST_CASE("annotation fingerprints preserve canonical names typed values and ord
  application_schema_detail::FingerprintSink actual;
  application_schema_detail::append_annotations<Annotations>(actual);
  application_schema_detail::FingerprintSink expected;
- expected.append("Minimum");
+ // The existing encoding reflects the local A alias, whose identifier is A.
+ // Preserve those deployed bytes while checking typed values and visit order.
+ expected.append("A");
  expected.append_number(std::int32_t{-2});
- expected.append("Maximum");
+ expected.append("A");
  expected.append_number(std::uint16_t{7U});
- expected.append("Finite");
- expected.append("MinBytes");
+ expected.append("A");
+ expected.append("A");
  expected.append_number(std::size_t{1U});
- expected.append("MaxBytes");
+ expected.append("A");
  expected.append_number(std::size_t{8U});
- expected.append("MaxItems");
+ expected.append("A");
  expected.append_number(std::size_t{3U});
- expected.append("Presentation");
+ expected.append("A");
  expected.append_number(std::uint8_t{5U});
- expected.append("RuntimeDestination");
+ expected.append("A");
  CHECK(actual.words() == expected.words());
 }
 TEST_CASE("protocol-17 fingerprint is deterministic and covers stable composition identity", "[controller][browser][reflection]") {

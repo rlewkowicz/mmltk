@@ -941,6 +941,8 @@ void test_copy_paste_ring_support_and_cache_cycles() {
    (void)augmenter.finish_batch(batch);
    rfdetr::TargetConsumerLease lease(scratch, targets, 0);
    lease.handoff();
+   // This cache-only consumer has no readback to settle the single staging slot.
+   REQUIRE(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(scratch.copy_stream_handle())) == cudaSuccess);
   };
   // Warm the cache from original donor pixels and RLE, with no prior donor.
   batch.device_images = donor_pixels.data_ptr<float>();

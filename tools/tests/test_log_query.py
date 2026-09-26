@@ -7,6 +7,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -401,6 +402,28 @@ class LogFormatTests(unittest.TestCase):
         terminal = logs.parse_record("test.log", 21, "native host terminal status: exit 139")
         self.assertEqual(terminal.get("@exit_code"), 139)
         self.assertIs(terminal.get("@signal"), logs.MISSING)
+
+    def test_catch_console_exception_keeps_location_and_placeholder_without_json_damage(self):
+        context = logs.TranscriptContext()
+        lines = (
+            "[ RUN ] copy_paste_cache",
+            "/workspace/training.test.cpp:1009: FAILED:",
+            "  {Unknown expression after the reported line}",
+            "due to unexpected exception with message:",
+            "  RF-DETR target staging capacity is exhausted",
+            "[ FAILED ] copy_paste_cache",
+        )
+        rows = [row for number, text in enumerate(lines, 1)
+                for row in context.parse_line("test.log", number, text, {}, {})]
+        self.assertTrue(all(not row.parse_error for row in rows))
+        self.assertTrue(all(row.get("@test") == "copy_paste_cache" for row in rows))
+        self.assertEqual(rows[1].get("@event"), "catch.assertion_failed")
+        self.assertEqual(rows[1].get("source_line"), 1009)
+        self.assertTrue(rows[1].get("@error"))
+        self.assertEqual(rows[2].get("@event"), "catch.expression")
+        self.assertIn("staging capacity", rows[4].get("message"))
+        damaged = list(context.parse_line("test.log", 7, '  {"event":"partial', {}, {}))
+        self.assertTrue(damaged[0].parse_error)
 
 
 class TriageSelectionTests(unittest.TestCase):
@@ -1963,6 +1986,127 @@ class FileQueryTests(unittest.TestCase):
         self.assertIn("--correlate", output.getvalue())
         wrapper = Path(logs.__file__).resolve().parent.parent / "mmltk"
         subprocess.run(["bash", "-n", str(wrapper)], check=True, capture_output=True, text=True)
+
+    def wrapper_fixture(self, docker_script):
+        repository = Path(logs.__file__).resolve().parent.parent
+        wrapper = self.write("mmltk", (repository / "mmltk").read_text())
+        self.write("tools/runtime_package.sh", (repository / "tools/runtime_package.sh").read_text())
+        docker = self.write("bin/docker", docker_script)
+        docker.chmod(0o755)
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("MMLTK_")}
+        environment["PATH"] = str(docker.parent) + os.pathsep + environment["PATH"]
+        return wrapper, environment
+
+    def test_wrapper_retains_both_streams_and_queryable_terminal_status(self):
+        wrapper, environment = self.wrapper_fixture("""#!/usr/bin/env bash
+case "$1" in
+    version|rm) exit 0 ;;
+    image) printf 'fake-build-image\n' ;;
+    run)
+        for ((index = 0; index < 512; ++index)); do
+            printf 'captured stdout %s\n' "$index"
+            printf 'captured stderr %s\n' "$index" >&2
+        done
+        exit "${TEST_COMMAND_STATUS}"
+        ;;
+    *) exit 99 ;;
+esac
+""")
+        for suite, expected in (("log-query-tool", 0), ("log-query-tool", 42), ("unknown-suite", 1)):
+            with self.subTest(suite=suite, exit_status=expected):
+                log_path = self.root / "captured logs" / f"{expected}.log"
+                environment.update(MMLTK_TEST_LOG_FILE=str(log_path.relative_to(self.root)),
+                                   TEST_COMMAND_STATUS=str(expected))
+                result = subprocess.run(["bash", str(wrapper), "--test", suite], cwd=self.root,
+                                        env=environment, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                contents = log_path.read_text()
+                self.assertTrue(contents.endswith(f"mmltk: test exited with status {expected}\n"))
+                self.assertIn(f"test exited with status {expected}", result.stderr)
+                if suite == "log-query-tool":
+                    self.assertEqual(result.stdout.count("captured stdout "), 512)
+                    self.assertEqual(result.stderr.count("captured stderr "), 512)
+                    self.assertNotIn("captured stderr ", result.stdout)
+                    self.assertNotIn("captured stdout ", result.stderr)
+                    self.assertEqual(contents.count("captured stdout "), 512)
+                    self.assertEqual(contents.count("captured stderr "), 512)
+                else:
+                    self.assertIn("unknown test suite 'unknown-suite'", contents)
+                status, rows, _ = self.exported(str(log_path), "-q", "@event=process.terminal")
+                self.assertEqual(status, 0)
+                self.assertEqual([row["data"]["exit_code"] for row in rows], [expected])
+        help_log = self.root / "help.log"
+        environment["MMLTK_TEST_LOG_FILE"] = str(help_log)
+        result = subprocess.run(["bash", str(wrapper), "--test", "help"], cwd=self.root,
+                                env=environment, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(help_log.exists())
+        self.assertEqual(list((self.root / ".cache/locks").glob("test-run-*.owner")), [])
+
+    def test_fresh_all_stops_registered_tests_and_orphans_but_preserves_other_owners(self):
+        wrapper, environment = self.wrapper_fixture("""#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${TEST_DOCKER_CALLS}"
+case "$1" in
+    ps) cat "${TEST_CONTAINER_RECORDS}" ;;
+    stop) exit 0 ;;
+    rm) if [[ "$3" == orphan-container ]]; then : >"${TEST_CONTAINER_RECORDS}"; fi ;;
+    version|run) exit 0 ;;
+    image) printf 'fake-build-image\n' ;;
+    *) exit 99 ;;
+esac
+""")
+        calls = self.write("docker-calls.log", "")
+        containers = self.write("containers.txt", "orphan-container 99999999 1\n")
+        environment.update(TEST_DOCKER_CALLS=str(calls), TEST_CONTAINER_RECORDS=str(containers))
+        children = []
+        try:
+            for _ in range(3):
+                child = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"])
+                children.append(child)
+            owner, stale, unrelated = children
+            stubborn = subprocess.Popen([sys.executable, "-c",
+                "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); signal.pause()"],
+                stdout=subprocess.PIPE, text=True)
+            children.append(stubborn)
+            self.assertEqual(stubborn.stdout.readline().strip(), "ready")
+            stubborn.stdout.close()
+            def start_ticks(pid):
+                return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+            self.write(f".cache/locks/test-run-{owner.pid}.owner", f"{owner.pid} {start_ticks(owner.pid)}\n")
+            self.write(f".cache/locks/test-run-{stubborn.pid}.owner", f"{stubborn.pid} {start_ticks(stubborn.pid)}\n")
+            self.write(f".cache/locks/test-run-{stale.pid}.owner", f"{stale.pid} 0\n")
+            self.write(f"other-checkout/.cache/locks/test-run-{unrelated.pid}.owner",
+                       f"{unrelated.pid} {start_ticks(unrelated.pid)}\n")
+            focused = subprocess.run(["bash", str(wrapper), "--test", "log-query-tool"], cwd=self.root,
+                                     env=environment, capture_output=True, text=True, timeout=15)
+            self.assertEqual(focused.returncode, 0, focused.stderr)
+            self.assertIsNone(owner.poll())
+            self.assertIsNone(stubborn.poll())
+            result = subprocess.run(["bash", str(wrapper), "--test", "all"], cwd=self.root,
+                                    env=environment, capture_output=True, text=True, timeout=20)
+            # This isolated checkout has no build inputs; inspect admission effects.
+            self.assertIn(f"stopping previous test run pid={owner.pid}", result.stderr)
+            self.assertEqual(owner.wait(timeout=5), -signal.SIGTERM)
+            self.assertIn(f"forcing previous test run to stop pid={stubborn.pid}", result.stderr)
+            self.assertEqual(stubborn.wait(timeout=5), -signal.SIGKILL)
+            self.assertIsNone(stale.poll())
+            self.assertIsNone(unrelated.poll())
+            commands = calls.read_text().splitlines()
+            self.assertTrue(any("stop --time 22 orphan-container" in line for line in commands))
+            self.assertTrue(any("rm -f orphan-container" in line for line in commands), result.stderr + "\n" + calls.read_text())
+            # The first two snapshots own test replacement; normal startup may
+            # subsequently inspect stale containers of other wrapper modes.
+            cleanup_queries = [line for line in commands if line.startswith("ps ")]
+            self.assertGreaterEqual(len(cleanup_queries), 2)
+            for command in cleanup_queries[:2]:
+                self.assertIn(f"label=com.mmltk.repo={self.root}", command)
+                self.assertIn("label=com.mmltk.mode=test", command)
+            self.assertEqual(list((self.root / ".cache/locks").glob("test-run-*.owner")), [])
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
 
     def family_fixture(self):
         self.write("build/validation/session.jsonl", [

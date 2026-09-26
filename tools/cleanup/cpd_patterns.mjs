@@ -480,7 +480,7 @@ export class SourceIndex {
         ? JSON.stringify(["operations", operations])
         : assertions.length >= 2
           ? JSON.stringify(["assertions", executable])
-          : executable.some((text) => ["if", "for", "while", "switch", "return", "throw", "+", "-", "/", "%"].includes(text))
+          : executable.some((text) => ["if", "for", "while", "switch", "return", "throw", "+", "-", "*", "/", "%"].includes(text))
             ? JSON.stringify(["statements", executable])
             : null
       : record !== null

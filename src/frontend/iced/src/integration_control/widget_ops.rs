@@ -601,8 +601,13 @@ impl RevealState {
             return Task::none();
         }
         self.location_pending = true;
+        let control = control.into();
         iced::widget::operation::snap_to(crate::view::PAGE_SCROLL_ID, offset)
-            .chain(locate(control.into(), driver.generation))
+            .chain(scroll_control_into_view(
+                control.clone(),
+                AnnotationReveal::Control,
+            ))
+            .chain(locate(control, driver.generation))
     }
 }
 

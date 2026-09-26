@@ -474,7 +474,7 @@ test("scalar calculations remain candidates despite different local roles", () =
   ]) assert.equal(classifySources({
     "a.cpp": `void A() {\n${bodies[0]}\n}`,
     "b.cpp": `void B() {\n${bodies[1]}\n}`,
-  }, ranges).duplications.length, 1);
+  }, ranges).duplications.length, 1, bodies.join("\nversus\n"));
 });
 
 test("repeated admission guards remain candidates despite different input roles", () => {

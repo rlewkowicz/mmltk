@@ -259,27 +259,33 @@ active_build_container_names=()
 wrapper_pid="$$"
 wrapper_start_ticks="$(awk '{ print $22 }' "/proc/${wrapper_pid}/stat")"
 invocation_mode="initializing"
+operation_log_file=""
+operation_log_pids=()
+operation_stdout_fd=-1
+operation_stderr_fd=-1
+active_test_registration=""
 
-build_process_start_ticks() {
-    local pid="$1" expected_parent="$2" state
+process_start_ticks() {
+    local pid="$1" expected_parent="${2:-}" state
     local -a fields=()
     [[ -r "/proc/${pid}/stat" ]] || return 1
     state="$(<"/proc/${pid}/stat")"
     read -r -a fields <<<"${state##*) }"
-    [[ "${fields[1]:-}" == "${expected_parent}" ]] || return 1
+    [[ "${fields[0]:-}" != Z ]] || return 1
+    [[ -z "${expected_parent}" || "${fields[1]:-}" == "${expected_parent}" ]] || return 1
     printf '%s\n' "${fields[19]}"
 }
 
 track_build_pid() {
     local pid="$1" owner_pid="${BASHPID}"
     active_build_pids+=("${pid}")
-    active_build_start_ticks["${pid}"]="$(build_process_start_ticks "${pid}" "${owner_pid}" || true)"
+    active_build_start_ticks["${pid}"]="$(process_start_ticks "${pid}" "${owner_pid}" || true)"
 }
 
-stop_owned_build_process() {
+stop_owned_process() {
     local pid="$1" expected_start="$2" expected_parent="$3" actual_start
     [[ -n "${expected_start}" ]] || return 0
-    actual_start="$(build_process_start_ticks "${pid}" "${expected_parent}" || true)"
+    actual_start="$(process_start_ticks "${pid}" "${expected_parent}" || true)"
     [[ "${actual_start}" == "${expected_start}" ]] || return 0
     # Freeze this owned parent before enumerating its children. This reaches
     # foreground Docker clients under traced shells without waiting for Bash
@@ -291,10 +297,10 @@ stop_owned_build_process() {
     fi
     local child child_start
     for child in "${children[@]}"; do
-        child_start="$(build_process_start_ticks "${child}" "${pid}" || true)"
-        stop_owned_build_process "${child}" "${child_start}" "${pid}"
+        child_start="$(process_start_ticks "${child}" "${pid}" || true)"
+        stop_owned_process "${child}" "${child_start}" "${pid}"
     done
-    actual_start="$(build_process_start_ticks "${pid}" "${expected_parent}" || true)"
+    actual_start="$(process_start_ticks "${pid}" "${expected_parent}" || true)"
     if [[ "${actual_start}" == "${expected_start}" ]]; then
         kill -KILL "${pid}" >/dev/null 2>&1 || true
     fi
@@ -309,7 +315,7 @@ terminate_active_builds() {
 
     local pid
     for pid in "${active_build_pids[@]}"; do
-        stop_owned_build_process "${pid}" "${active_build_start_ticks[${pid}]:-}" "${BASHPID}"
+        stop_owned_process "${pid}" "${active_build_start_ticks[${pid}]:-}" "${BASHPID}"
     done
     for pid in "${active_build_pids[@]}"; do
         wait "${pid}" >/dev/null 2>&1 || true
@@ -417,6 +423,27 @@ cleanup_owned_container() {
             fi
         fi
     fi
+    if ((${#operation_log_pids[@]})); then
+        # Close both pipe writers and drain them before publishing the terminal.
+        exec 1>&"${operation_stdout_fd}" 2>&"${operation_stderr_fd}"
+        exec {operation_stdout_fd}>&- {operation_stderr_fd}>&-
+        local log_pid
+        for log_pid in "${operation_log_pids[@]}"; do
+            if ! wait "${log_pid}"; then
+                error "${invocation_mode} log capture failed: ${operation_log_file}"
+                if (( exit_status == 0 )); then exit_status=1; fi
+            fi
+        done
+        local terminal="${invocation_mode} exited with status ${exit_status}"
+        log "${terminal}"
+        if ! printf 'mmltk: %s\n' "${terminal}" >>"${operation_log_file}"; then
+            error "could not record terminal status in ${operation_log_file}"
+            if (( exit_status == 0 )); then exit_status=1; fi
+        fi
+    fi
+    if [[ -n "${active_test_registration}" ]]; then
+        rm -f -- "${active_test_registration}"
+    fi
     exit "${exit_status}"
 }
 
@@ -487,14 +514,14 @@ shutdown_gui_runtime_in_container() {
 wait_for_local_pid_exit() {
     local target_pid="$1"
     local timeout_ms="$2"
-    if ! kill -0 "${target_pid}" >/dev/null 2>&1; then
-        return 0
-    fi
+    local target_start
+    target_start="$(process_start_ticks "${target_pid}" || true)"
+    [[ -n "${target_start}" ]] || return 0
     if timeout --foreground --signal=KILL "$(milliseconds_duration "${timeout_ms}")" \
-            pidwait -p "${target_pid}"; then
+            pidwait -F /dev/stdin <<<"${target_pid}"; then
         return 0
     fi
-    ! kill -0 "${target_pid}" >/dev/null 2>&1
+    [[ "$(process_start_ticks "${target_pid}" || true)" != "${target_start}" ]]
 }
 
 terminate_active_docker_exec() {
@@ -636,6 +663,75 @@ prepare_lock_file() {
     chmod 0664 "${lock_file}" 2>/dev/null || true
     [[ -r "${lock_file}" && -w "${lock_file}" ]] || die \
         "lock file '${lock_file}' is not accessible to uid ${uid}"
+}
+
+stop_previous_test_runs() {
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    local container_records container owner_pid owner_start registration extra live_start
+    local -a containers=() registrations=()
+    local -A owners=()
+    container_records="$(timeout --foreground --signal=KILL 15s docker ps -a \
+        --filter label=com.mmltk.wrapper=1 --filter "label=com.mmltk.repo=${repo_root}" \
+        --filter label=com.mmltk.mode=test \
+        --format '{{.ID}} {{.Label "com.mmltk.owner-pid"}} {{.Label "com.mmltk.owner-start"}}')" ||
+        die "could not enumerate previous test containers"
+    while read -r container owner_pid owner_start; do
+        [[ -n "${container}" && "${owner_pid}" != "${wrapper_pid}" ]] || continue
+        containers+=("${container}")
+        if [[ "${owner_pid}" =~ ^[1-9][0-9]*$ && "${owner_start}" =~ ^[0-9]+$ ]]; then
+            owners["${owner_pid}"]="${owner_start}"
+        fi
+    done <<<"${container_records}"
+    # Registrations cover the gaps between containers and the tooling suites.
+    for registration in "${repository_cache_root}/locks"/test-run-*.owner; do
+        [[ -f "${registration}" ]] || continue
+        registrations+=("${registration}")
+        if read -r owner_pid owner_start extra <"${registration}" &&
+            [[ "${owner_pid}" =~ ^[1-9][0-9]*$ && "${owner_start}" =~ ^[0-9]+$ && -z "${extra}" ]]; then
+            [[ "${owner_pid}" != "${wrapper_pid}" ]] || continue
+            owners["${owner_pid}"]="${owner_start}"
+        fi
+    done
+    for owner_pid in "${!owners[@]}"; do
+        live_start="$(process_start_ticks "${owner_pid}" || true)"
+        if [[ "${live_start}" == "${owners[${owner_pid}]}" ]]; then
+            log "stopping previous test run pid=${owner_pid}"
+            kill -TERM "${owner_pid}" 2>/dev/null || true
+        fi
+    done
+    # Retiring the container also releases a wrapper waiting on foreground Docker.
+    for container in "${containers[@]}"; do
+        timeout --foreground --signal=KILL 25s docker stop --time 22 "${container}" >/dev/null 2>&1 || true
+    done
+    for owner_pid in "${!owners[@]}"; do
+        live_start="$(process_start_ticks "${owner_pid}" || true)"
+        if [[ "${live_start}" == "${owners[${owner_pid}]}" ]] && ! wait_for_local_pid_exit "${owner_pid}" 5000; then
+            log "forcing previous test run to stop pid=${owner_pid}"
+            stop_owned_process "${owner_pid}" "${owners[${owner_pid}]}" ""
+            wait_for_local_pid_exit "${owner_pid}" 5000 || die "previous test wrapper did not stop"
+        fi
+    done
+    for container in "${containers[@]}"; do
+        timeout --foreground --signal=KILL 15s docker rm -f "${container}" >/dev/null 2>&1 || true
+    done
+    container_records="$(timeout --foreground --signal=KILL 15s docker ps -aq \
+        --filter label=com.mmltk.wrapper=1 --filter "label=com.mmltk.repo=${repo_root}" \
+        --filter label=com.mmltk.mode=test)" || die "could not verify previous test container cleanup"
+    [[ -z "${container_records}" ]] || die "previous test containers remain; new all suite did not start"
+    if ((${#registrations[@]})); then rm -f -- "${registrations[@]}"; fi
+}
+
+begin_test_run() {
+    local suite="$1" admission_fd
+    local admission_lock="${repository_cache_root}/locks/test-admission.lock"
+    prepare_lock_file "${admission_lock}"
+    exec {admission_fd}>>"${admission_lock}"
+    flock -x "${admission_fd}"
+    if [[ "${suite}" == all ]]; then stop_previous_test_runs; fi
+    active_test_registration="${repository_cache_root}/locks/test-run-${wrapper_pid}.owner"
+    printf '%s %s\n' "${wrapper_pid}" "${wrapper_start_ticks}" >"${active_test_registration}"
+    flock -u "${admission_fd}"
+    exec {admission_fd}>&-
 }
 
 acquire_mutation_locks() {
@@ -1212,22 +1308,25 @@ ensure_analysis_image() {
     fi
 }
 
-prepare_tidy_logging() {
-    local tidy_log_file="${MMLTK_TIDY_LOG_FILE:-}"
-    if [[ -z "${tidy_log_file}" ]]; then
-        tidy_log_file="${repo_root}/build/logs/mmltk-tidy-$(date +%Y%m%d-%H%M%S).log"
-    elif [[ "${tidy_log_file}" != /* ]]; then
-        tidy_log_file="${host_workdir}/${tidy_log_file}"
+prepare_operation_logging() {
+    local log_file="$1"
+    if [[ -z "${log_file}" ]]; then
+        log_file="${repo_root}/build/logs/mmltk-${invocation_mode}-$(date +%Y%m%d-%H%M%S)-$$.log"
+    elif [[ "${log_file}" != /* ]]; then
+        log_file="${host_workdir}/${log_file}"
     fi
 
-    mkdir -p "$(dirname "${tidy_log_file}")"
-    touch "${tidy_log_file}"
-    chown "${uid}:${gid}" "$(dirname "${tidy_log_file}")" "${tidy_log_file}" 2>/dev/null || true
-    export MMLTK_TIDY_LOG_FILE="${tidy_log_file}"
-    export MMLTK_TIDY_TEE_STARTED=1
-    exec > >(tee -a "${tidy_log_file}") 2>&1
-    if (( ! gui_diagnostics_quiet )); then log "writing tidy log to ${tidy_log_file}"; fi
-    if (( ! gui_diagnostics_quiet )); then log "tail with: tail -f ${tidy_log_file}"; fi
+    mkdir -p "$(dirname "${log_file}")"
+    touch "${log_file}"
+    chown "${uid}:${gid}" "$(dirname "${log_file}")" "${log_file}" 2>/dev/null || true
+    # Preserve stderr for callers while retaining both streams in one transcript.
+    exec {operation_stdout_fd}>&1 {operation_stderr_fd}>&2
+    exec > >(tee --output-error=warn -a "${log_file}")
+    operation_log_pids+=("$!")
+    exec 2> >(tee --output-error=warn -a "${log_file}" >&2)
+    operation_log_pids+=("$!")
+    operation_log_file="${log_file}"
+    log "writing ${invocation_mode} log to ${operation_log_file}"
 }
 
 container_exists() {
@@ -1939,8 +2038,10 @@ build_exec_env_args() {
 }
 
 run_tidy() {
+    prepare_operation_logging "${MMLTK_TIDY_LOG_FILE:-}"
+    export MMLTK_TIDY_LOG_FILE="${operation_log_file}"
+    export MMLTK_TIDY_TEE_STARTED=1
     acquire_mutation_locks
-    prepare_tidy_logging
     ensure_docker
     ensure_analysis_image
     prepare_compiler_cache_dirs
@@ -2584,9 +2685,9 @@ run_log_tool() {
         --workdir /workspace
         --entrypoint python3
     )
-    append_wrapper_labels diagnostic_args "logs"
+    append_wrapper_labels diagnostic_args "${invocation_mode}"
     if [[ "${tool_mode}" == "test" ]]; then
-        diagnostic_args+=(--tmpfs /tmp:rw,nosuid,nodev,size=32m)
+        diagnostic_args+=(--tmpfs /tmp:rw,exec,nosuid,nodev,size=32m)
         if (($# == 0)); then
             diagnostic_args+=("${diagnostic_image_id}" -m unittest discover
                 -s /workspace/tools/tests -p test_log_query.py -v)
@@ -2838,7 +2939,7 @@ run_gpu_program_diagnostic() {
     log "standalone diagnostic artifacts: ${artifact_directory}"
     run_owned_docker_command "${diagnostic_container}-build" "${compile_args[@]}" \
         "${build_id}" --signal=KILL 120s /bin/bash -c '
-            exec /opt/gcc-16.2/bin/g++ -std=c++26 -O2 -g -Wall -Wextra \
+            exec /opt/gcc-16.2/bin/g++ -std=c++26 -freflection -O2 -g -Wall -Wextra \
                 -Wno-missing-field-initializers \
                 -I"${CUDA_HOME}/include" "/diagnostic/source/${MMLTK_DIAGNOSTIC_SOURCE}" \
                 -L"${CUDA_HOME}/lib64/stubs" -lcuda -lvulkan \
@@ -3171,7 +3272,7 @@ run_headless_compositor_tool_tests() {
         --tmpfs /tmp:rw,nosuid,nodev,size=32m
         --workdir /workspace --entrypoint /bin/bash
     )
-    append_wrapper_labels diagnostic_args headless-compositor-tool
+    append_wrapper_labels diagnostic_args "${invocation_mode}"
     diagnostic_args+=("${diagnostic_image_id}" -c
         'bash -n /workspace/mmltk && python3 -m unittest discover -s /workspace/tools/tests -p test_headless_compositor.py -v')
     run_owned_docker_command "${diagnostic_container}" "${diagnostic_args[@]}"
@@ -3342,6 +3443,7 @@ run_tests() {
         [[ -z "${test_executable}" ]] || die "--test ${suite} does not accept --executable"
         (( ! test_debugger )) || die "--test ${suite} does not accept --gdb or --gdb-command"
         ((${#test_environment[@]} == 0)) || die "--test ${suite} does not accept --env"
+        begin_test_run "${suite}"
         if [[ "${suite}" == "headless-compositor-tool" ]]; then
             (($# == 0)) || die "--test ${suite} does not accept additional arguments"
             run_headless_compositor_tool_tests
@@ -3368,6 +3470,7 @@ run_tests() {
             die "--test browser-app does not accept --gdb"
         ((${#test_environment[@]} == 0)) ||
             die "--test browser-app does not yet consume native test environments"
+        begin_test_run "${suite}"
         local browser_status=0
         run_browser_app_tests browser_status "$@"
         return "${browser_status}"
@@ -3381,6 +3484,7 @@ run_tests() {
             die "--test cleanup-tool does not accept --gdb or --gdb-command"
         ((${#test_environment[@]} == 0)) ||
             die "--test cleanup-tool does not accept --env"
+        begin_test_run "${suite}"
         run_cleanup_tool_tests "$@"
         return $?
     fi
@@ -3393,6 +3497,7 @@ run_tests() {
             die "--test log-query-tool does not accept --gdb or --gdb-command"
         ((${#test_environment[@]} == 0)) ||
             die "--test log-query-tool does not accept --env"
+        begin_test_run "${suite}"
         if (( ! gui_diagnostics_quiet )); then log "running log query tooling fixture tests"; fi
         run_log_tool test "$@"
         return 0
@@ -3596,6 +3701,7 @@ run_tests() {
         die "--gdb requires a suite with one executable or an explicit --executable"
     fi
 
+    begin_test_run "${suite}"
     acquire_mutation_locks
     ensure_docker
     prepare_cache_layout
@@ -4148,6 +4254,13 @@ fi
 
 if (( test_mode )); then
     invocation_mode="test"
+    case "${test_suite}" in
+        list|help|-h|--help) ;;
+        *)
+            prepare_operation_logging "${MMLTK_TEST_LOG_FILE:-}"
+            log "test suite: ${test_suite}"
+            ;;
+    esac
     run_tests "${test_suite}" "${test_args[@]}"
     exit $?
 fi
@@ -4177,6 +4290,7 @@ if (( build_mode )); then
         die "--build does not accept application arguments"
     fi
     invocation_mode="build"
+    prepare_operation_logging "${MMLTK_BUILD_LOG_FILE:-}"
     run_build
     exit $?
 fi
