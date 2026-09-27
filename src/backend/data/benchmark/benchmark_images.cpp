@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
@@ -64,7 +65,7 @@ class CachedImageWritePool {
 public:
  CachedImageWritePool(const std::size_t worker_count, const std::size_t expected_writes, std::filesystem::path output_root, CachedImageProgress progress, const std::uint64_t initially_completed,
   const mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready, StorageReservationPool* storage)
-     : storage_(storage), ready_(std::move(ready)), output_root_(std::move(output_root)), progress_(std::move(progress), initially_completed, expected_writes), cancellation_(cancellation) {
+     : storage_(output_root, {}, storage), ready_(std::move(ready)), output_root_(std::move(output_root)), progress_(std::move(progress), initially_completed, expected_writes), cancellation_(cancellation) {
   const std::size_t bounded_workers = std::min<std::size_t>(8U, worker_count);
   inline_mode_ = bounded_workers == 0U;
   if (!inline_mode_) workers_ = std::make_unique<mmltk::common::concurrency::WorkerPool>(bounded_workers, mmltk::common::system::allowed_cpu_set(), "cache_write", bounded_workers);
@@ -150,7 +151,7 @@ public:
  }
 
 private:
- StorageReservationPool* storage_;
+ StorageReservationPool storage_;
  CachedImageReadySink ready_;
  struct Task {
   std::uint64_t image_id = 0U;
@@ -318,26 +319,17 @@ std::size_t format_cached_image_relative_path(const std::uint64_t image_id, cons
  if (length != static_cast<int>(kPathCharacters)) { throw std::runtime_error("cannot format cached benchmark image ID"); }
  return static_cast<std::size_t>(length);
 }
-void write_cached_image_atomically(const std::filesystem::path& path, const std::span<const std::uint8_t> encoded, const mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage) {
- if (encoded.empty()) { throw std::runtime_error("cannot cache an empty benchmark image"); }
+void write_cached_image_atomically(const std::filesystem::path& path, const std::span<const std::uint8_t> encoded,
+ const mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool& destination) {
+ if (encoded.empty()) throw std::runtime_error("cannot cache an empty benchmark image");
+ auto staging = BenchmarkStagedArtifact::create(destination, path, encoded.size(), "cached image staging", ".tmp.XXXXXX", 0600);
+ staging.file().pwrite_all(encoded.data(), encoded.size(), 0U);
+ staging.publish(path, cancellation, BenchmarkStagedArtifact::Publication::Rename);
+}
+void write_cached_image_atomically(const std::filesystem::path& path, const std::span<const std::uint8_t> encoded,
+ const mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage) {
  StorageReservationPool destination(path, {}, storage);
- auto allocation = destination.reserve(encoded.size(), "cached image staging");
- std::string staging_text = path.string() + ".tmp.XXXXXX";
- std::vector<char> writable_path(staging_text.begin(), staging_text.end());
- writable_path.push_back('\0');
- const int descriptor = ::mkostemp(writable_path.data(), O_CLOEXEC);
- if (descriptor < 0) { throw errno_error("cannot create cached benchmark image", staging_text); }
- FileHandle staging(descriptor);
- try {
-  allocation.watch(writable_path.data());
-  staging.pwrite_all(encoded.data(), encoded.size(), 0U);
-  staging = FileHandle{};
-  throw_if_benchmark_cancelled(cancellation);
-  std::filesystem::rename(writable_path.data(), path);
- } catch (...) {
-  (void)::unlink(writable_path.data());
-  throw;
- }
+ write_cached_image_atomically(path, encoded, cancellation, destination);
 }
 void invalidate_cached_image_proofs(const std::filesystem::path& root) {
  remove_cache_path(root / ".complete.json");
@@ -389,7 +381,7 @@ bool validate_cached_image_group(const std::filesystem::path& root, const std::f
 }
 void complete_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, const std::string_view identity,
  const std::span<const std::uint64_t> expected_image_ids, const std::uint64_t image_bytes, const mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
- const std::span<const CachedImageRejection> quarantined) {
+ const std::span<const CachedImageRejection> quarantined, StorageReservationPool* storage) {
  const std::vector<std::uint64_t> available = available_image_ids(expected_image_ids, quarantined);
  nlohmann::json quarantined_records = nlohmann::json::array();
  for (const CachedImageRejection& image : quarantined) { quarantined_records.push_back({{"image_id", image.image_id}, {"reason", image.reason}}); }
@@ -403,7 +395,7 @@ void complete_cached_image_group(const std::filesystem::path& root, const std::f
   manifest["quarantined"] = std::move(quarantined_records);
  }
  throw_if_benchmark_cancelled(cancellation);
- write_json_atomically(completion_path, manifest, cancellation);
+ write_json_atomically(completion_path, manifest, cancellation, storage);
  trace_benchmark_event(
   trace, "benchmark.images.complete", [&] { return nlohmann::json{{"root", root.string()}, {"identity", identity}, {"images", available.size()}, {"quarantined", quarantined.size()}}; });
 }
@@ -433,9 +425,9 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  completed.reserve(request.selected_image_ids.size());
  std::unordered_set<std::uint64_t> unavailable;
  unavailable.reserve(64U);
- auto directory_allowance = request.execution ? request.execution->reserve(BenchmarkResources::handles(2, true, 2), request.parent_allowance) : BenchmarkCompilePipeline::Allowance{};
- BenchmarkCompilePipeline::Allowance cached_encoded_allowance;
- BenchmarkCompilePipeline::Allowance stream_allowance;
+ auto directory_allowance = request.execution ? request.execution->reserve(BenchmarkResources::handles(2, true, 2), request.parent_allowance) : BenchmarkAllowance{};
+ BenchmarkAllowance cached_encoded_allowance;
+ BenchmarkAllowance stream_allowance;
  std::vector<std::uint8_t> encoded;
  const int output_descriptor = ::open(request.output_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
  if (output_descriptor < 0) { throw errno_error("cannot open cached benchmark image directory", request.output_root.string()); }
@@ -621,7 +613,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
    request.activity("Quarantined " + std::to_string(quarantined.size()) + " unavailable training images; publishing cache status");
   }
  }
- complete_cached_image_group(request.output_root, completion, identity, request.selected_image_ids, image_bytes, request.cancel_requested, request.trace, quarantined);
+ complete_cached_image_group(request.output_root, completion, identity, request.selected_image_ids, image_bytes, request.cancel_requested, request.trace, quarantined, request.storage);
  return make_cached_image_directory(request.source, request.shard, std::move(request.output_root), identity, request.selected_image_ids, image_bytes, false, std::move(quarantined));
 }
 }  // namespace mmltk::backend::data::benchmark_internal

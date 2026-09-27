@@ -266,7 +266,17 @@ struct HttpResponseHeaderFields {
  }
 };
 [[nodiscard]] bool is_header_block_terminator(const std::string_view header) noexcept { return header == "\r\n" || header == "\n"; }
+// Resumable partials keep their checkpoint lifetime on unwind. This owner only
+// settles their growth promise; discard policy remains in the transfer engine.
+struct DownloadStorage {
+ StorageReservationPool filesystem;
+ StorageReservationPool::Reservation growth;
+ DownloadStorage(const DownloadRequest& request, StorageReservationPool& shared, const BenchmarkTraceSink& trace)
+  : filesystem(request.destination, trace, &shared),
+    growth(filesystem.reserve_download(request.destination, std::max(request.expected_size, request.storage_estimate), "benchmark download and replacement")) {}
+};
 struct Transfer {
+ DownloadStorage& storage;
  static constexpr DownloadWriteContext kWriteContext{
   .offset_overflow = "partial write offset overflow",
   .write_failure = "cannot write benchmark partial download",
@@ -298,8 +308,8 @@ struct Transfer {
  Clock::time_point last_progress{};
  curl_off_t last_reported_download_now = -1;
  Transfer(const DownloadRequest& request_value, DownloadProgressSink progress_value, BenchmarkTraceSink trace_value, mmltk::common::concurrency::CancellationObservation cancel,
-  const std::uint32_t attempt_value, const bool redownload_value)
-     : request(request_value),
+  const std::uint32_t attempt_value, const bool redownload_value, DownloadStorage& destination)
+     : storage(destination), request(request_value),
        progress(std::move(progress_value)),
        trace(std::move(trace_value)),
        cancel_requested(cancel),
@@ -325,6 +335,7 @@ struct Transfer {
    }
   }
   if (!metadata_matches) {
+   storage.growth.withdraw_allocation();
    std::error_code ignored;
    std::filesystem::remove(part_path, ignored);
    std::filesystem::remove(metadata_path, ignored);
@@ -338,18 +349,21 @@ struct Transfer {
   if (::fstat(descriptor, &status) != 0) { throw errno_error("cannot inspect benchmark partial download", part_path.string()); }
   resume_offset = checked_cast<std::uint64_t>(status.st_size, "partial download size overflow");
   if (request.expected_size != 0U && resume_offset > request.expected_size) {
+   storage.growth.withdraw_allocation();
    if (::ftruncate(descriptor, 0) != 0) { throw errno_error("cannot reset oversized benchmark partial download", part_path.string()); }
    resume_offset = 0U;
   }
   if (resume_offset != 0U && resume_etag.empty() && resume_last_modified.empty()) {
+   storage.growth.withdraw_allocation();
    if (::ftruncate(descriptor, 0) != 0) { throw errno_error("cannot reset unvalidated benchmark partial download", part_path.string()); }
    resume_offset = 0U;
   }
+  storage.growth.reconcile(descriptor);
   requested_resume_offset = resume_offset;
   write_offset = resume_offset;
   resumed = resume_offset != 0U;
   write_json_atomically(metadata_path,
-   nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", resume_etag}, {"last_modified", resume_last_modified}, {"bytes", resume_offset}}, cancel_requested);
+   nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", resume_etag}, {"last_modified", resume_last_modified}, {"bytes", resume_offset}}, cancel_requested, &storage.filesystem);
  }
  void prepare_easy() {
   easy.reset(curl_easy_init());
@@ -394,7 +408,9 @@ struct Transfer {
     transfer.callback_retryable = true;
     throw std::runtime_error("benchmark response body exceeds its declared artifact size");
    }
+   transfer.storage.growth.grow(checked_u64_add(transfer.write_offset, bytes_u64, "download storage extent overflow"), "additional benchmark download bytes");
    append_transfer_bytes(&transfer.write_offset, Transfer::kWriteContext, transfer.partial.get(), data, bytes);
+   transfer.storage.growth.reconcile(transfer.partial.get());
    return bytes;
   });
  }
@@ -431,7 +447,9 @@ struct Transfer {
    throw std::runtime_error("benchmark server returned an invalid HTTP byte range");
   }
   if (http.response_code == 200L && requested_resume_offset != 0U) {
+   storage.growth.withdraw_allocation();
    if (::ftruncate(partial.get(), 0) != 0) { throw errno_error("cannot restart benchmark partial download"); }
+   storage.growth.reconcile(partial.get());
    write_offset = 0U;
    resume_offset = 0U;
    response_restarted = true;
@@ -474,8 +492,9 @@ struct Transfer {
  [[nodiscard]] const std::string& effective_etag() const noexcept { return !response_headers_valid || http.etag.empty() ? resume_etag : http.etag; }
  [[nodiscard]] const std::string& effective_last_modified() const noexcept { return !response_headers_valid || http.last_modified.empty() ? resume_last_modified : http.last_modified; }
  void persist_partial_metadata() const {
+  storage.growth.reconcile(partial.get());
   write_json_atomically(partial_metadata_path(request),
-   nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", effective_etag()}, {"last_modified", effective_last_modified()}, {"bytes", write_offset}}, {});
+   nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", effective_etag()}, {"last_modified", effective_last_modified()}, {"bytes", write_offset}}, {}, &storage.filesystem);
   trace_benchmark_event(trace, "benchmark.download.partial_checkpoint",
    [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"bytes", write_offset}, {"resume_eligible", !effective_etag().empty() || !effective_last_modified().empty()}}; });
  }
@@ -577,10 +596,11 @@ struct DownloadSegment {
  std::uint32_t attempts = 0U;
 };
 class SegmentedDownloadState {
+ DownloadStorage& storage_;
 public:
  SegmentedDownloadState(const DownloadRequest& request, const RemoteArtifactIdentity& identity, const std::size_t segment_count, const DownloadProgressSink& progress, const BenchmarkTraceSink& trace,
-  const int descriptor, const mmltk::common::concurrency::CancellationObservation cancellation)
-     : request_(request), identity_(identity), progress_(progress), trace_(trace), descriptor_(descriptor), cancellation_(cancellation) {
+  const int descriptor, const mmltk::common::concurrency::CancellationObservation cancellation, DownloadStorage& storage)
+     : storage_(storage), request_(request), identity_(identity), progress_(progress), trace_(trace), descriptor_(descriptor), cancellation_(cancellation) {
   segments_.reserve(segment_count);
   const std::uint64_t segment_count_u64 = checked_cast<std::uint64_t>(segment_count, "segmented download count overflow");
   const std::uint64_t base_size = request.expected_size / segment_count_u64;
@@ -690,6 +710,7 @@ private:
     segment.completed = 0U;
     segment.attempts = 0U;
    }
+   storage_.growth.withdraw_allocation();
    if (::ftruncate(descriptor_, 0) != 0 || ::ftruncate(descriptor_, checked_cast<off_t>(request_.expected_size, "segmented download allocation overflow")) != 0) {
     throw errno_error("cannot allocate segmented benchmark download", partial_path(request_).string());
    }
@@ -703,7 +724,13 @@ private:
   emit_progress_locked(false);
   trace_benchmark_event(trace_, "benchmark.download.segmented_resume_state", [&] { return nlohmann::json{{"artifact", request_.artifact_id}, {"segments", segments_.size()}, {"resumed", resumed_}}; });
  }
- void persist_locked() const { write_json_atomically(partial_metadata_path(request_), metadata_locked(), cancellation_); }
+ void persist_locked() const {
+  storage_.growth.reconcile(descriptor_);
+  write_json_atomically(partial_metadata_path(request_), metadata_locked(), cancellation_, &storage_.filesystem);
+ }
+public:
+ void settle_written() { storage_.growth.reconcile(descriptor_); }
+private:
  void emit_progress_locked(const bool force) const {
   if (!progress_ && !trace_) { return; }
   std::uint64_t durable = 0U;
@@ -806,6 +833,7 @@ struct SegmentTransfer {
    if (!transfer.response_headers_valid) { return 0U; }
    if (bytes > transfer.range_end + 1U - transfer.write_offset) { throw BenchmarkDownloadUnavailable("segmented response exceeds its validated byte range"); }
    append_transfer_bytes(&transfer.write_offset, SegmentTransfer::kWriteContext, transfer.descriptor, data, bytes);
+   transfer.state.settle_written();
    transfer.state.report_in_flight(transfer.segment_index, transfer.transferred());
    return bytes;
   });
@@ -821,7 +849,7 @@ struct SegmentTransfer {
  }
 };
 [[nodiscard]] DownloadResult download_segmented_artifact(const DownloadRequest& request, const std::size_t maximum_concurrency, mmltk::common::concurrency::CancellationObservation cancel_requested,
- const DownloadProgressSink& progress, const BenchmarkTraceSink& trace) {
+ const DownloadProgressSink& progress, const BenchmarkTraceSink& trace, DownloadStorage& storage) {
  CurlGlobal::initialize();
  const RemoteArtifactIdentity identity = probe_remote_identity(request, cancel_requested, trace);
  const std::uint64_t segments_for_size = request.expected_size / kMinimumSegmentBytes + static_cast<std::uint64_t>(request.expected_size % kMinimumSegmentBytes != 0U);
@@ -831,7 +859,7 @@ struct SegmentTransfer {
  const int descriptor = ::open(partial_path(request).c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
  if (descriptor < 0) { throw errno_error("cannot open segmented benchmark download", partial_path(request).string()); }
  ScopedFd partial(descriptor);
- SegmentedDownloadState state(request, identity, segment_count, progress, trace, descriptor, cancel_requested);
+ SegmentedDownloadState state(request, identity, segment_count, progress, trace, descriptor, cancel_requested, storage);
  trace_benchmark_event(trace, "benchmark.download.segmented_start",
   [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"segments", segment_count}, {"bytes", request.expected_size}, {"resumed", state.resumed()}}; });
  std::exception_ptr transfer_error;
@@ -915,11 +943,13 @@ struct SegmentTransfer {
  transfers.join();
  if (transfer_error) { std::rethrow_exception(transfer_error); }
  if (::fdatasync(descriptor) != 0) { throw errno_error("cannot flush segmented benchmark download", partial_path(request).string()); }
+ storage.growth.reconcile(descriptor);
  partial = ScopedFd{};
  throw_if_benchmark_cancelled(cancel_requested);
  const std::string identity_digest = artifact_identity(request, request.expected_size, identity.etag, identity.last_modified);
  throw_if_benchmark_cancelled(cancel_requested);
  std::filesystem::rename(partial_path(request), request.destination);
+ storage.growth.reconcile_download(request.destination);
  sync_parent_directory(request.destination);
  const std::uint32_t attempts = state.maximum_attempts();
  write_json_atomically(complete_metadata_path(request),
@@ -927,7 +957,7 @@ struct SegmentTransfer {
    {"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"url", request.url}, {"size", request.expected_size}, {"identity", identity_digest}, {"integrity_mode", "http_identity_size"},
    {"etag", identity.etag}, {"last_modified", identity.last_modified}, {"attempts", attempts}, {"segments", segment_count}
   },
-  cancel_requested);
+  cancel_requested, &storage.filesystem);
  std::error_code remove_error;
  std::filesystem::remove(partial_metadata_path(request), remove_error);
  if (remove_error) { throw std::filesystem::filesystem_error("cannot remove segmented download metadata", partial_metadata_path(request), remove_error); }
@@ -952,6 +982,7 @@ struct SegmentTransfer {
 [[nodiscard]] DownloadResult publish_completed_transfer(Transfer& transfer) {
  const DownloadRequest& request = transfer.request;
  if (::fdatasync(transfer.partial.get()) != 0) { throw errno_error("cannot flush benchmark partial download", partial_path(request).string()); }
+ transfer.storage.growth.reconcile(transfer.partial.get());
  transfer.partial = ScopedFd{};
  const std::uint64_t size = regular_file_size(partial_path(request));
  if (size == 0U || (request.expected_size != 0U && size != request.expected_size)) { throw DownloadVerificationError("benchmark download size does not match its catalog"); }
@@ -959,13 +990,14 @@ struct SegmentTransfer {
  const std::string identity = artifact_identity(request, size, transfer.effective_etag(), transfer.effective_last_modified());
  throw_if_benchmark_cancelled(transfer.cancel_requested);
  std::filesystem::rename(partial_path(request), request.destination);
+ transfer.storage.growth.reconcile_download(request.destination);
  sync_parent_directory(request.destination);
  write_json_atomically(complete_metadata_path(request),
   nlohmann::json{
    {"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"url", request.url}, {"size", size}, {"identity", identity}, {"integrity_mode", "http_identity_size"},
    {"etag", transfer.effective_etag()}, {"last_modified", transfer.effective_last_modified()}, {"attempts", transfer.attempt}
   },
-  transfer.cancel_requested);
+  transfer.cancel_requested, &transfer.storage.filesystem);
  std::error_code ignored;
  std::filesystem::remove(partial_metadata_path(request), ignored);
  transfer.emit_progress(size, size, size);
@@ -989,7 +1021,7 @@ struct SegmentTransfer {
 }  // namespace
 std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, const std::size_t requested_concurrency,
  mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready,
- BenchmarkCompilePipeline* execution, const BenchmarkCompilePipeline::Allowance& parent) {
+ BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool* storage) {
  std::mutex progress_mutex;
  const DownloadProgressSink progress = observer ? DownloadProgressSink{[&](const DownloadProgress& value) {
   const std::lock_guard lock(progress_mutex);
@@ -1008,16 +1040,9 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
  // Locks, open output files, socket/DNS handles and Curl's wake descriptors
  // belong to this session, including segmented fallback and repair. Its
  // allowance precedes all of them and retires after durable publication.
- BenchmarkCompilePipeline::Allowance resources;
- if (execution) std::tie(maximum_concurrency, resources) = execution->reserve_transfers(maximum_concurrency, checked_add(requests.size(), std::size_t{8}, "benchmark transfer descriptor overflow"), 256U << 10, 0, parent);
- std::vector<StorageReservationPool::Reservation> storage_promises;
- if (execution) {
-  storage_promises.reserve(requests.size());
-  for (const auto& request : requests) {
-   StorageReservationPool destination(request.destination, trace, &execution->storage());
-   storage_promises.push_back(destination.reserve_download(request.destination, request.expected_size, "benchmark download and replacement"));
-  }
- }
+ BenchmarkAllowance resources;
+ if (execution) std::tie(maximum_concurrency, resources) = execution->reserve_transfers(maximum_concurrency, benchmark_curl_envelope(requests.size()), parent);
+ auto shared_storage = execution ? execution->storage() : storage ? *storage : StorageReservationPool(requests.front().destination, trace);
  std::unordered_set<std::string> unique_lock_paths;
  std::vector<std::size_t> lock_order(requests.size());
  for (std::size_t index = 0U; index < lock_order.size(); ++index) {
@@ -1025,8 +1050,11 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
   lock_order[index] = index;
  }
  std::ranges::sort(lock_order, [&](const std::size_t left, const std::size_t right) { return requests[left].lock_path.string() < requests[right].lock_path.string(); });
- std::vector<ArtifactLease> leases(requests.size());
- for (const std::size_t index : lock_order) { leases[index] = ArtifactLease::acquire(requests[index].lock_path, cancel_requested); }
+ std::vector<std::shared_ptr<ArtifactLease>> leases(requests.size());
+ for (const std::size_t index : lock_order) { leases[index] = ArtifactLease::acquire_charged(requests[index].lock_path, cancel_requested, resources); }
+ std::vector<DownloadStorage> storage_promises;
+ storage_promises.reserve(requests.size());
+ for (const auto& request : requests) storage_promises.emplace_back(request, shared_storage, trace);
  std::vector<std::optional<DownloadResult>> results(requests.size());
  std::list<PendingTransfer> pending;
  for (std::size_t index = 0U; index < requests.size(); ++index) {
@@ -1034,7 +1062,8 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
   std::optional<DownloadResult>& result = results[index];
   result = validate_complete_artifact(requests[index], cancel_requested, progress, trace);
   if (result.has_value()) {
-   leases[index] = ArtifactLease{};
+   leases[index].reset();
+   storage_promises[index].growth.release();
    if (ready) ready({index, *result});
    const DownloadResult& completed_result = *result;
    if (progress) {
@@ -1047,7 +1076,9 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
     });
    }
   } else {
+   storage_promises[index].growth.withdraw_allocation();
    remove_invalid_complete_artifact(requests[index]);
+   storage_promises[index].growth.reconcile_download(requests[index].destination);
    pending.push_back(PendingTransfer{index, 1U, Clock::now()});
   }
  }
@@ -1062,11 +1093,13 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
  }
  if (requests.size() == 1U && maximum_concurrency > 1U && requests.front().expected_size >= kSegmentedDownloadThreshold) {
   try {
-   auto result = download_segmented_artifact(requests.front(), maximum_concurrency, cancel_requested, progress, trace);
-   leases.front() = ArtifactLease{};
+   auto result = download_segmented_artifact(requests.front(), maximum_concurrency, cancel_requested, progress, trace, storage_promises.front());
+   leases.front().reset();
+   storage_promises.front().growth.release();
    if (ready) ready({0, result});
    return {std::move(result)};
   } catch (const SegmentedDownloadUnsupported& error) {
+   storage_promises.front().growth.withdraw_allocation();
    std::error_code cleanup_error;
    pending.front().redownload = std::filesystem::remove(partial_path(requests.front()), cleanup_error);
    if (cleanup_error) { throw std::filesystem::filesystem_error("cannot reset unsupported segmented download", partial_path(requests.front()), cleanup_error); }
@@ -1074,6 +1107,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
    const bool removed_metadata = std::filesystem::remove(partial_metadata_path(requests.front()), cleanup_error);
    pending.front().redownload = pending.front().redownload || removed_metadata;
    if (cleanup_error) { throw std::filesystem::filesystem_error("cannot reset unsupported segmented metadata", partial_metadata_path(requests.front()), cleanup_error); }
+   storage_promises.front().growth.reconcile_download(requests.front().destination);
    trace_benchmark_event(trace, "benchmark.download.segmented_fallback",
     [&] { return nlohmann::json{{"artifact", requests.front().artifact_id}, {"reason", error.what()}, {"redownload", requests.front().redownload || pending.front().redownload}}; });
   }
@@ -1112,6 +1146,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
   throw_if_benchmark_cancelled(cancel_requested);
   reject_local_curl_failure(curl_code);
   if (reset_partial) {
+   transfer.storage.growth.withdraw_allocation();
    transfer.partial = ScopedFd{};
    std::error_code error;
    std::filesystem::remove(partial_path(transfer.request), error);
@@ -1120,6 +1155,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
    std::filesystem::remove(partial_metadata_path(transfer.request), error);
    if (error) { throw std::filesystem::filesystem_error("cannot reset benchmark partial metadata", partial_metadata_path(transfer.request), error); }
   }
+  transfer.storage.growth.reconcile_download(transfer.request.destination);
   trace_benchmark_event(trace, "benchmark.download.attempt_failed", [&] {
    return nlohmann::json{
     {"artifact", transfer.request.artifact_id}, {"attempt", transfer.attempt}, {"curl_code", static_cast<int>(curl_code)}, {"http_status", transfer.http.response_code},
@@ -1146,7 +1182,8 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
      } catch (const DownloadVerificationError& error) { schedule_retry(*item.transfer, index, true, CURLE_OK, error.what()); }
     } else {
      results[index] = std::move(*item.result);
-     leases[index] = ArtifactLease{};
+     leases[index].reset();
+     storage_promises[index].growth.release();
      if (ready) ready({index, *results[index]});
     }
    }
@@ -1159,7 +1196,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
     }
     const PendingTransfer task = *iterator;
     iterator = pending.erase(iterator);
-    active.add(std::make_unique<Transfer>(requests[task.request_index], progress, trace, cancel_requested, task.attempt, task.redownload));
+    active.add(std::make_unique<Transfer>(requests[task.request_index], progress, trace, cancel_requested, task.attempt, task.redownload, storage_promises[task.request_index]));
     trace_benchmark_event(trace, "benchmark.download.start", [&] { return nlohmann::json{{"artifact", requests[task.request_index].artifact_id}, {"attempt", task.attempt}}; });
    }
    active.perform();
@@ -1234,6 +1271,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
    try {
     transfer.persist_partial_metadata();
    } catch (...) {
+    transfer.storage.growth.withdraw_allocation();
     transfer.partial = ScopedFd{};
     try {
      std::error_code error;
@@ -1258,9 +1296,9 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
  }
  return complete;
 }
-void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace) {
+void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
  if (request.artifact_id.empty() || request.destination.empty() || request.lock_path.empty()) { throw std::runtime_error("benchmark download invalidation request is incomplete"); }
- ArtifactLease lease = ArtifactLease::acquire(request.lock_path, cancel_requested);
+ auto lease = ArtifactLease::acquire_charged(request.lock_path, cancel_requested, execution, BenchmarkResources::handles(1, true), parent);
  const std::array paths{
   request.destination,
   complete_metadata_path(request),

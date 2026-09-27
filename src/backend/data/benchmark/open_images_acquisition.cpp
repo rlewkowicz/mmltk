@@ -78,8 +78,8 @@ public:
   std::string retry_reason;
   std::exception_ptr fatal_error;
  };
- OpenImageCacheWorkers(const std::size_t worker_count, std::filesystem::path image_root, const mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready, BenchmarkCompilePipeline* execution = nullptr, BenchmarkCompilePipeline::Allowance allowance = {})
-     : execution_(execution), allowance_(std::move(allowance)), image_ready_(std::move(ready)), image_root_(std::move(image_root)), cancellation_(cancellation) {
+ OpenImageCacheWorkers(const std::size_t worker_count, std::filesystem::path image_root, const mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready, BenchmarkCompilePipeline* execution = nullptr, BenchmarkAllowance allowance = {})
+     : storage_(image_root, {}, execution ? &execution->storage() : nullptr), execution_(execution), allowance_(std::move(allowance)), image_ready_(std::move(ready)), image_root_(std::move(image_root)), cancellation_(cancellation) {
   if (worker_count == 0U) {
    inline_validator_ = std::make_unique<BenchmarkImageValidator>();
    return;
@@ -143,8 +143,9 @@ public:
  }
 
 private:
+ StorageReservationPool storage_;
  BenchmarkCompilePipeline* execution_ = nullptr;
- BenchmarkCompilePipeline::Allowance allowance_;
+ BenchmarkAllowance allowance_;
  CachedImageReadySink image_ready_;
  struct Task {
   std::uint64_t image_id = 0U;
@@ -165,7 +166,7 @@ private:
    };
    if (execution_) execution_->run(BenchmarkStage::Header, {}, read_header, allowance_);
    else read_header(0);
-   write_cached_image_atomically(cached_image_path(image_root_, result.image_id), result.encoded, cancellation_, execution_ ? &execution_->storage() : nullptr);
+   write_cached_image_atomically(cached_image_path(image_root_, result.image_id), result.encoded, cancellation_, storage_);
    if (image_ready_) image_ready_({image_root_, result.image_id, {}, 0, std::pair{result.width, result.height}, execution_ != nullptr});
    throw_if_benchmark_cancelled(cancellation_);
   } catch (const InvalidImageError& error) { result.retry_reason = error.what(); } catch (...) {
@@ -230,7 +231,7 @@ private:
 void download_open_images(const std::span<const std::uint64_t> expected_ids, const std::filesystem::path& image_root, NormalizedAnnotationIndex* annotation_index,
  std::vector<QuarantinedImage>* quarantined, mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, std::uint64_t* completed_images,
  const std::uint64_t total_images, std::uint64_t* cached_image_bytes, const std::size_t requested_concurrency, const std::size_t cache_workers, const BenchmarkTraceSink& trace,
- const CachedImageReadySink& image_ready, const std::string& progress_group, std::uint64_t progress_begin, BenchmarkCompilePipeline* execution, BenchmarkCompilePipeline::Allowance allowance) {
+ const CachedImageReadySink& image_ready, const std::string& progress_group, std::uint64_t progress_begin, BenchmarkCompilePipeline* execution, BenchmarkAllowance allowance) {
  const auto transfer_concurrency = requested_concurrency;
  ensure_curl_global();
  CurlMulti multi(curl_multi_init());
@@ -447,7 +448,7 @@ struct CachedOpenImagesGroup {
 }
 void complete_open_images_group(const std::filesystem::path& image_root, const std::filesystem::path& completion, const std::string_view identity,
  const std::span<const std::uint64_t> requested_image_ids, const std::span<const std::uint64_t> available_image_ids, const std::span<const QuarantinedImage> quarantined,
- const NormalizedAnnotationIndex& index, const std::uint64_t image_bytes, const mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace) {
+ const NormalizedAnnotationIndex& index, const std::uint64_t image_bytes, const mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, StorageReservationPool* storage) {
  nlohmann::json quarantine_records = nlohmann::json::array();
  for (const QuarantinedImage& image : quarantined) { quarantine_records.push_back({{"image_id", image.image_id}, {"reason", image.reason}}); }
  nlohmann::json dimensions = nlohmann::json::array();
@@ -471,7 +472,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
    {"dimensions", std::move(dimensions)},
    {"quarantined", std::move(quarantine_records)},
   },
-  cancellation);
+  cancellation, storage);
  trace_benchmark_event(trace, "benchmark.images.complete",
   [&] { return nlohmann::json{{"root", image_root.string()}, {"identity", identity}, {"images", available_image_ids.size()}, {"quarantined", quarantined.size()}}; });
 }
@@ -492,9 +493,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
  const std::size_t configured_workers = common_math::checked_cast<std::size_t>(num_workers, "Open Images configured worker count overflow");
  if (configured_workers > std::numeric_limits<std::size_t>::max() / 10U) { throw std::overflow_error("Open Images transfer concurrency overflow"); }
  const auto requested_concurrency = std::min<std::size_t>(256U, configured_workers * 10U);
- const auto transfer_concurrency = execution ? std::min({requested_concurrency,
-  std::max<std::size_t>(1, execution->descriptor_limit() / 3 > 4 ? execution->descriptor_limit() / 3 - 4 : 1),
-  std::max<std::size_t>(1, execution->transient_target() / (4 * kMaximumOpenImagesJpegBytes))}) : requested_concurrency;
+ const auto transfer_concurrency = requested_concurrency;
  if (transfer_concurrency == 0U) { throw std::runtime_error("Open Images transfer budget must be positive"); }
  progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Open Images downloader ready with " + std::to_string(transfer_concurrency) + " concurrent requests and " +
                                                                    (cache_workers == 0U ? std::string{"inline cache writes"} : std::to_string(cache_workers) + " cache workers"));
@@ -505,17 +504,17 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   const std::string shard = open_images_group_name(begin / kOpenImagesGroupImages);
   const std::filesystem::path completion = image_root / ".groups" / (shard + ".complete.json");
   progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Waiting for Open Images " + shard + " image lock");
-  auto group_handles = execution ? execution->reserve(BenchmarkResources::handles(1, true, 11)) : BenchmarkCompilePipeline::Allowance{};
-  auto lease = group_handles.retain(ArtifactLease::acquire(cache.locks / ("open-images-" + shard + ".images.lock"), cancel_requested));
+  auto lease = ArtifactLease::acquire_charged(cache.locks / ("open-images-" + shard + ".images.lock"), cancel_requested, execution,
+   BenchmarkResources::handles(1, true, benchmark_curl_envelope().demand(1).descriptors));
   // One admission covers this group's state, retained transfer capacities and
   // header consumers; no network producer waits for a second byte allowance
   // while holding all of the input needed by its consumer.
   const auto repair_workspace = decode_probe && std::ranges::binary_search(group, decode_probe->image_id)
    ? common_math::checked_multiply(std::uint64_t{decode_probe->expected_width} * decode_probe->expected_height, 96U, "Open Images repair workspace overflow") : 0;
   auto group_concurrency = transfer_concurrency;
-  BenchmarkCompilePipeline::Allowance group_work;
-  if (execution) std::tie(group_concurrency, group_work) = execution->reserve_transfers(transfer_concurrency, 8, kMaximumOpenImagesJpegBytes * 2 + 262144,
-   common_math::checked_add(group.size() * 1024U, repair_workspace, "Open Images group workspace overflow"), group_handles);
+  BenchmarkAllowance group_work;
+  if (execution) std::tie(group_concurrency, group_work) = execution->reserve_transfers(transfer_concurrency,
+   benchmark_curl_envelope(0, common_math::checked_add(group.size() * 1024U, repair_workspace, "Open Images group workspace overflow"), kMaximumOpenImagesJpegBytes * 2), lease->allowance());
   const auto generation = execution ? execution->source_generation(image_root) : 0;
   const auto replacement_generation = execution && decode_probe ? execution->image_generation(image_root, decode_probe->image_id) : generation;
   std::optional<CachedImageReady> repaired_ready;
@@ -644,7 +643,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   const std::span<const QuarantinedImage> group_quarantined(quarantined->data() + quarantine_begin, quarantined->size() - quarantine_begin);
   if (group_available.size() + group_quarantined.size() != group.size()) { throw std::runtime_error("Open Images group completion count is inconsistent"); }
   progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Finalizing Open Images " + shard + " cache");
-  complete_open_images_group(image_root, completion, identity, group, group_available, group_quarantined, index, cached_image_bytes - group_bytes_begin, cancel_requested, trace);
+  complete_open_images_group(image_root, completion, identity, group, group_available, group_quarantined, index, cached_image_bytes - group_bytes_begin, cancel_requested, trace, execution ? &execution->storage() : nullptr);
   available.insert(available.end(), group_available.begin(), group_available.end());
   progress->transfers().images(BenchmarkDatasetSource::kOpenImagesV7, shard, completed_images - begin, ids.size(), *progress);
  }

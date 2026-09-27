@@ -3,10 +3,11 @@
 #include "src/pch_linux.h"
 #include "src/pch_std.h"
 #include "src/common/io/file_memory.h"
+#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
+#include "src/backend/data/benchmark/detail/benchmark_staging.h"
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::common::io::errno_error;
-using mmltk::common::io::FileHandle;
-using mmltk::common::io::sync_parent_directory;
+namespace common_io = mmltk::common::io;
 namespace {
 [[nodiscard]] std::filesystem::path require_cache_root(const std::filesystem::path& root) {
  if (root.empty()) { throw std::runtime_error("benchmark cache root must not be empty"); }
@@ -41,16 +42,18 @@ namespace {
 std::filesystem::path BenchmarkCacheLayout::source_downloads(const std::string_view source) const { return ensured_source_subdirectory(downloads, source); }
 std::filesystem::path BenchmarkCacheLayout::source_images(const std::string_view source) const { return ensured_source_subdirectory(images, source); }
 std::filesystem::path BenchmarkCacheLayout::source_indexes(const std::string_view source) const { return ensured_source_subdirectory(indexes, source); }
-ArtifactLease::ArtifactLease(ArtifactLease&& other) noexcept : descriptor_(std::move(other.descriptor_)) {}
+ArtifactLease::ArtifactLease(ArtifactLease&& other) noexcept : allowance_(std::move(other.allowance_)), descriptor_(std::move(other.descriptor_)) {}
 ArtifactLease& ArtifactLease::operator=(ArtifactLease&& other) noexcept {
  if (this != &other) {
   release();
+  allowance_ = std::move(other.allowance_);
   descriptor_ = std::move(other.descriptor_);
  }
  return *this;
 }
 ArtifactLease::~ArtifactLease() { release(); }
 ArtifactLease ArtifactLease::acquire(const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+ throw_if_benchmark_cancelled(cancel_requested);
  (void)mmltk::common::io::ensure_parent_directory(lock_path);
  const int descriptor = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
  if (descriptor < 0) { throw errno_error("cannot open benchmark cache lock", lock_path.string()); }
@@ -61,13 +64,30 @@ ArtifactLease ArtifactLease::acquire(const std::filesystem::path& lock_path, mml
   // flock has no readiness fd; this bounded retry exists solely to retain cancellation responsiveness.
   std::this_thread::sleep_for(std::chrono::milliseconds{100});
  }
+ throw_if_benchmark_cancelled(cancel_requested);
  return ArtifactLease(owned.release());
+}
+std::shared_ptr<ArtifactLease> ArtifactLease::acquire_charged(const std::filesystem::path& path,
+ mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkCompilePipeline* execution, BenchmarkResources demand, const BenchmarkAllowance& parent) {
+ if (!demand.descriptors) throw std::invalid_argument("benchmark lease requires a descriptor allowance");
+ return acquire_charged(path, cancellation, execution ? execution->reserve(demand, parent) : BenchmarkAllowance{});
+}
+std::shared_ptr<ArtifactLease> ArtifactLease::acquire_charged(const std::filesystem::path& path,
+ mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkAllowance admitted) {
+ if (admitted && !admitted.descriptors()) throw std::invalid_argument("benchmark lease envelope has no descriptor");
+ auto result = std::make_shared<ArtifactLease>();
+ result->allowance_ = std::move(admitted);
+ // Assign only the physical handle: custody must precede open and survive it.
+ auto physical = acquire(path, cancellation);
+ result->descriptor_ = std::move(physical.descriptor_);
+ return result;
 }
 void ArtifactLease::release() noexcept {
  if (descriptor_.get() >= 0) {
   (void)::flock(descriptor_.get(), LOCK_UN);
   descriptor_.reset();
  }
+ allowance_ = {};
 }
 void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation cancel_requested) {
  if (cancel_requested.requested()) { throw std::runtime_error("benchmark dataset compilation cancelled"); }
@@ -75,24 +95,16 @@ void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObserv
 bool is_benchmark_capacity_failure(const std::exception& error) noexcept {
  return dynamic_cast<const std::bad_alloc*>(&error) != nullptr || dynamic_cast<const std::length_error*>(&error) != nullptr || dynamic_cast<const std::overflow_error*>(&error) != nullptr;
 }
-void write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value, const mmltk::common::concurrency::CancellationObservation cancellation) {
- (void)mmltk::common::io::ensure_parent_directory(path);
+void write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value,
+ const mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage) {
+ (void)common_io::ensure_parent_directory(path);
  const std::string serialized = value.dump(2);
- std::string staging_text = path.string() + ".next.XXXXXX";
- FileHandle staging = FileHandle::create_unique_output(staging_text, serialized.size());
- staging.pwrite_all(serialized.data(), serialized.size(), 0U);
- staging.sync_data();
- staging = FileHandle{};
- const std::filesystem::path staging_path(staging_text);
- try {
-  throw_if_benchmark_cancelled(cancellation);
-  std::filesystem::rename(staging_path, path);
-  sync_parent_directory(path);
- } catch (...) {
-  std::error_code ignored;
-  std::filesystem::remove(staging_path, ignored);
-  throw;
- }
+ StorageReservationPool destination(path, {}, storage);
+ auto staging = BenchmarkStagedArtifact::create(destination, path, serialized.size(), "benchmark metadata staging", ".next.XXXXXX");
+ staging.preallocate(serialized.size());
+ staging.file().pwrite_all(serialized.data(), serialized.size(), 0U);
+ staging.file().sync_data();
+ staging.publish(path, cancellation, BenchmarkStagedArtifact::Publication::RenameAndSync);
 }
 nlohmann::json read_json_file(const std::filesystem::path& path) {
  std::ifstream input(path);

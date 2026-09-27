@@ -1,5 +1,6 @@
 #pragma once  // backend.data private implementation boundary
 #include <curl/curl.h>
+#include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include <atomic>
 #include <cstddef>
 #include <exception>
@@ -14,6 +15,10 @@
 #include <utility>
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
+// Shared transport demand: multi wake/setup/publication handles plus socket,
+// resolver and output custody per active transfer. Source owners add their
+// simultaneous lifecycle/batch locks and actual retained payload workspace.
+[[nodiscard]] BenchmarkTransferEnvelope benchmark_curl_envelope(std::size_t lease_descriptors = 0, std::uint64_t fixed_bytes = 0, std::uint64_t payload_bytes_per_transfer = 0);
 // Every benchmark HTTP transfer targets the same infrastructure, so it shares one hardening policy.
 inline constexpr long kBenchmarkConnectTimeoutSeconds = 30L;
 inline constexpr long kBenchmarkLowSpeedLimitBytes = 1024L;

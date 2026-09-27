@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -38,7 +39,6 @@ import mmltk.common.logging.profile_utils;
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
-#include "src/backend/data/detail/staging_file_cleanup.h"
 namespace mmltk::backend::data::benchmark_internal {
 namespace common_concurrency = mmltk::common::concurrency;
 namespace common_io = mmltk::common::io;
@@ -134,14 +134,11 @@ struct BenchmarkSplitWriter::Impl {
   return *value;
  }
  BenchmarkCompilePipeline* execution = nullptr;
- BenchmarkCompilePipeline::Allowance writer_handles;
+ BenchmarkAllowance writer_handles;
  std::mutex directory_mutex;
  common_io::FileHandle directory;
  std::uint16_t directory_source = std::numeric_limits<std::uint16_t>::max();
- std::string staging_text;
- std::filesystem::path staging_path;
- std::unique_ptr<StagingFileCleanup> cleanup;
- common_io::FileHandle output;
+ BenchmarkStagedArtifact staging;
  std::unique_ptr<WritablePixelRange> pixels;
  FileLayout layout;
  std::uint32_t resolution;
@@ -170,20 +167,10 @@ struct BenchmarkSplitWriter::Impl {
   if (resolution == 0 || resolution > MAX_IMAGE_EXTENT || images.empty() || sources.empty()) throw std::runtime_error("benchmark pixel membership is incomplete");
   layout = compute_pixel_layout(common_math::checked_cast<std::uint32_t>(images.size(), "benchmark image count overflow"), stride);
   (void)common_io::ensure_parent_directory(request.output_path);
-  staging_text = request.output_path.string() + ".tmp.XXXXXX";
   StorageReservationPool storage(request.output_path, {}, execution ? &execution->storage() : nullptr);
-  auto allocation = storage.reserve(layout.pixel_offset + layout.pixel_blob_size, "benchmark pixel staging");
-  output = common_io::FileHandle::create_unique_output(staging_text, 0);
-  try {
-   staging_path = staging_text;
-   cleanup = std::make_unique<StagingFileCleanup>(staging_path);
-  } catch (...) {
-   (void)::unlink(staging_text.c_str());
-   throw;
-  }
-  allocation.watch(staging_path);
-  output.preallocate(layout.pixel_offset + layout.pixel_blob_size);
-  pixels = std::make_unique<WritablePixelRange>(output.get(), layout.pixel_offset, layout.pixel_blob_size);
+  staging = BenchmarkStagedArtifact::create(storage, request.output_path, layout.pixel_offset + layout.pixel_blob_size, "benchmark pixel staging");
+  staging.preallocate(layout.pixel_offset + layout.pixel_blob_size);
+  pixels = std::make_unique<WritablePixelRange>(staging.file().get(), layout.pixel_offset, layout.pixel_blob_size);
   const auto lanes = std::max(1, request.num_workers);
   scratch.reserve(lanes);
   for (int i = 0; i < lanes; ++i) scratch.push_back(std::make_unique<Scratch>(request.perceptual_downscale));
@@ -292,6 +279,7 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const
   {state.pixels->image(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow"), state.stride),
    {state.resolution, state.resolution, static_cast<std::size_t>(state.resolution) * sizeof(float), static_cast<std::size_t>(state.resolution) * state.resolution * sizeof(float), state.stride,
     mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}}, state.resize_mode);
+ state.staging.reconcile();
  BenchmarkWriteProgressEvent progress;
  {
   const std::lock_guard lock(state.facts_mutex);
@@ -302,7 +290,7 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const
 }
 std::uint64_t BenchmarkSplitWriter::allocated_bytes() const {
  struct stat status{};
- if (::fstat(impl_->output.get(), &status) != 0) throw common_io::errno_error("cannot inspect benchmark staging allocation");
+ if (::fstat(impl_->staging.file().get(), &status) != 0) throw common_io::errno_error("cannot inspect benchmark staging allocation");
  return common_math::checked_multiply(common_math::checked_cast<std::uint64_t>(status.st_blocks, "benchmark allocation overflow"), std::uint64_t{512}, "benchmark allocation overflow");
 }
 std::optional<std::pair<std::uint32_t, std::uint32_t>> BenchmarkSplitWriter::header_dimensions(std::size_t slot) const {
@@ -386,10 +374,11 @@ void BenchmarkSplitWriter::retain_completed(const BenchmarkSplitWriter& previous
   const auto output = after.layout.pixel_offset + slot * after.stride;
   for (std::size_t offset = 0; offset < after.stride;) {
    const auto bytes = std::min(buffer.size(), after.stride - offset);
-   before.output.pread_all(buffer.data(), bytes, input + offset);
-   after.output.pwrite_all(buffer.data(), bytes, output + offset);
+   before.staging.file().pread_all(buffer.data(), bytes, input + offset);
+   after.staging.file().pwrite_all(buffer.data(), bytes, output + offset);
    offset += bytes;
   }
+  after.staging.reconcile();
   image.source_width = old_image.source_width;
   image.source_height = old_image.source_height;
   after.complete[slot] = 1;
@@ -459,12 +448,8 @@ void BenchmarkSplitWriter::finish(const BenchmarkWriteRequest& request) {
  const std::size_t used_rle = validate_compiled_label_entries(request.split.labels, header, layout.rle_block_size, request.cancel_requested);
  if (used_rle != layout.rle_block_size) { throw std::runtime_error("benchmark labels do not reference the complete mask block"); }
  validate_compiled_rle_pairs(request.split.labels, request.split.rle_pairs, static_cast<std::size_t>(request.resolution) * request.resolution, request.cancel_requested);
- const auto allocated = allocated_bytes();
- StorageReservationPool storage(request.output_path, {}, state.execution ? &state.execution->storage() : nullptr);
- auto allocation = storage.reserve(layout.total_size > allocated ? layout.total_size - allocated : 0, "additional benchmark metadata staging");
- allocation.watch(state.staging_path, allocated);
- auto& output = state.output;
- const auto& staging_path = state.staging_path;
+ auto& output = state.staging.file();
+ const auto& staging_path = state.staging.path();
  if (slots.size() != state.images.size()) {
   // Destination always precedes source, including the exact final index prefix.
   // One fixed-size scratch handles even a single very large image safely.
@@ -485,14 +470,13 @@ void BenchmarkSplitWriter::finish(const BenchmarkWriteRequest& request) {
  }
  state.pixels.reset();
  { const std::lock_guard lock(state.directory_mutex); state.directory = {}; state.directory_source = std::numeric_limits<std::uint16_t>::max(); }
- if (::ftruncate(output.get(), common_math::checked_cast<off_t>(layout.total_size, "benchmark output size overflow")) != 0) throw common_io::errno_error("cannot size benchmark output");
- output.preallocate(layout.total_size);
+ state.staging.resize(layout.total_size, "additional benchmark metadata staging");
  output.pwrite_all(&header, sizeof(header), 0U);
  output.pwrite_all(index.data(), layout.index_size, layout.index_offset);
  output.pwrite_all(request.split.labels.data(), layout.label_block_size, layout.label_offset);
  output.pwrite_all(request.split.rle_pairs.data(), layout.rle_block_size, layout.rle_offset);
  output.sync_data();
- output = common_io::FileHandle{};
+ state.staging.close();
  const common_io::FileHandle staged = common_io::FileHandle::open_readonly(staging_path.string());
  const FileHeader staged_header = read_compiled_header(staged);
  const CompiledFileSections sections = validate_compiled_file_sections(staged_header, staged.size());
@@ -512,8 +496,7 @@ void BenchmarkSplitWriter::finish(const BenchmarkWriteRequest& request) {
  const auto persisted_rle_span = std::span(reinterpret_cast<const RLEPair*>(persisted_rle.data()), request.split.rle_pairs.size());
  validate_compiled_rle_pairs(persisted_label_span, persisted_rle_span, static_cast<std::size_t>(request.resolution) * request.resolution, request.cancel_requested);
  throw_if_benchmark_cancelled(request.cancel_requested);
- common_io::publish_staged_path_atomically(staging_path, request.output_path, request.overwrite);
- state.cleanup->published();
+ state.staging.publish(request.output_path, request.cancel_requested, BenchmarkStagedArtifact::Publication::DurableReplace, request.overwrite);
 }
 void write_benchmark_split(const BenchmarkWriteRequest& request) {
  for (const auto& image : request.split.images)

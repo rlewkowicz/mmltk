@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -71,11 +72,13 @@ void invalidate_cached_image_proofs(const std::filesystem::path& root);
 void prepare_cached_image_directory(const std::filesystem::path& root);
 [[nodiscard]] std::size_t format_cached_image_relative_path(std::uint64_t image_id, std::span<char> output);
 void write_cached_image_atomically(const std::filesystem::path& path, std::span<const std::uint8_t> encoded, mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage = nullptr);
+void write_cached_image_atomically(const std::filesystem::path& path, std::span<const std::uint8_t> encoded,
+ mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool& destination);
 [[nodiscard]] bool validate_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, std::string_view identity,
  std::span<const std::uint64_t> expected_image_ids, std::uint64_t* image_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {},
  std::vector<CachedImageRejection>* quarantined = nullptr);
 void complete_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, std::string_view identity, std::span<const std::uint64_t> expected_image_ids,
- std::uint64_t image_bytes, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace = {}, std::span<const CachedImageRejection> quarantined = {});
+ std::uint64_t image_bytes, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace = {}, std::span<const CachedImageRejection> quarantined = {}, StorageReservationPool* storage = nullptr);
 // Everything one archive extraction needs. The knobs live here instead of in a positional parameter
 // list so the entry point keeps a single signature that callers and the definition cannot drift.
 struct ArchiveExtractionRequest {
@@ -100,7 +103,7 @@ struct ArchiveExtractionRequest {
  StorageReservationPool* storage = nullptr;
  // Synchronous validation scratch is admitted with its retained encoded input.
  std::uint64_t validator_workspace_bytes = 0;
- BenchmarkCompilePipeline::Allowance parent_allowance;
+ BenchmarkAllowance parent_allowance;
 };
 [[nodiscard]] CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest request);
 }  // namespace mmltk::backend::data::benchmark_internal

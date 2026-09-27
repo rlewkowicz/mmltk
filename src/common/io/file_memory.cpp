@@ -80,7 +80,7 @@ FileHandle FileHandle::create_output(const std::string& path, const std::size_t 
  file.preallocate(bytes);
  return file;
 }
-FileHandle FileHandle::create_unique_output(std::string& path_template, const std::size_t bytes) {
+FileHandle FileHandle::create_unique_output(std::string& path_template, const std::size_t bytes, const mode_t mode) {
  std::vector<char> writable(path_template.begin(), path_template.end());
  writable.push_back('\0');
  const int fd = ::mkostemp(writable.data(), O_CLOEXEC);
@@ -88,8 +88,8 @@ FileHandle FileHandle::create_unique_output(std::string& path_template, const st
  FileHandle file(fd);
  try {
   path_template.assign(writable.data());
-  if (::fchmod(fd, 0644) != 0) throw errno_error("fchmod failed", path_template);
-  file.preallocate(bytes);
+  if (mode != 0600 && ::fchmod(fd, mode) != 0) throw errno_error("fchmod failed", path_template);
+  if (bytes != 0) file.preallocate(bytes);
  } catch (...) {
   (void)::unlink(writable.data());
   throw;

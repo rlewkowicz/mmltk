@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <sys/types.h>
 #include <system_error>
 namespace mmltk::common::io {
 [[nodiscard]] std::runtime_error errno_error(const char* action, const std::string& path = {});
@@ -25,7 +26,8 @@ public:
  FileHandle& operator=(FileHandle&&) noexcept = default;
  [[nodiscard]] static FileHandle open_readonly(const std::string& path);
  [[nodiscard]] static FileHandle create_output(const std::string& path, std::size_t bytes);
- [[nodiscard]] static FileHandle create_unique_output(std::string& path_template, std::size_t bytes);
+ // Private mode retains mkostemp's native umask behavior; other modes are explicit.
+ [[nodiscard]] static FileHandle create_unique_output(std::string& path_template, std::size_t bytes, mode_t mode = 0644);
  [[nodiscard]] int get() const noexcept;
  [[nodiscard]] std::size_t size() const;
  void preallocate(std::size_t bytes) const;

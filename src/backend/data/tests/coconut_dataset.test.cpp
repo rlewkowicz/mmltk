@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h"
@@ -581,7 +582,12 @@ TEST_CASE("COCONut version-1 physical inventory has fixed bytes and admits exist
  const std::array<std::pair<std::string, std::string>, 3> members{{{".", ""}, {"./", ""}, {"./image//./objects365_v1_00091105.jpg", "jpeg"}}};
  tar(archive, members);
  const auto emitted = root.path() / "emitted.bin";
- CHECK(coconut_image_archive_inventory(archive, emitted, CoconutImageNamespace::Objects365V1, 0x1234, "a") == wanted);
+ StorageReservationPool storage(root.path(), {});
+ CHECK(coconut_image_archive_inventory(archive, emitted, CoconutImageNamespace::Objects365V1, 0x1234, "a", {}, &storage) == wanted);
+ CHECK(storage.outstanding() == 0);
+ struct stat status{};
+ REQUIRE(::stat(emitted.c_str(), &status) == 0);
+ CHECK((status.st_mode & 0777) == 0644);
  CHECK(file_bytes(emitted) == expected);
  CHECK(expected.size() == 114 + 32);
  CHECK(file_bytes(cache) == expected);
@@ -617,7 +623,9 @@ TEST_CASE("COCONut version-1 component inventory pins nested physical release an
  component.index.annotation_sha256 = "c5304ca7a16f7e76d6c21bfd7bda2b39a025cc268dde2336d95a2157eb9d4632";
  component.index.images.push_back({.source_image_id = 91105, .width = 1, .height = 1, .source_shard = 0x1234});
  const auto path = root.path() / "component.bin";
- store_coconut_component(path, component);
+ StorageReservationPool storage(root.path(), {});
+ store_coconut_component(path, component, {}, &storage);
+ CHECK(storage.outstanding() == 0);
  const auto index_bytes = file_bytes(path);
  const auto inventory_path = path.string() + ".inventory";
  CHECK(file_bytes(inventory_path) == expected);
@@ -626,12 +634,14 @@ TEST_CASE("COCONut version-1 component inventory pins nested physical release an
  mmltk::testsupport::write_text_file(inventory_path, expected);
  const auto loaded = load_coconut_component(path, component.edition, component.source, "i");
  REQUIRE(loaded);
+ CHECK(loaded->index.annotation_sha256 == component.index.annotation_sha256);
  CHECK(loaded->inventory == component.inventory);
  REQUIRE(loaded->index.images.size() == 1);
  CHECK(loaded->index.images[0].source_image_id == 91105);
  CHECK(loaded->index.boxes.empty());
  CHECK_FALSE(load_coconut_component(path, component.edition, component.source, "changed"));
- store_coconut_component(path, *loaded);
+ store_coconut_component(path, *loaded, {}, &storage);
+ CHECK(storage.outstanding() == 0);
  CHECK(file_bytes(inventory_path) == expected);
  CHECK(file_bytes(path) == index_bytes);
 }
@@ -3465,7 +3475,7 @@ TEST_CASE("cold benchmark readers finish oversized grants with retained release 
  ScopedTempDir root("cold-shared-readers");
  std::atomic<bool> cancelled{false};
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536, .descriptors = 32}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
- auto release = execution.reserve(BenchmarkResources::handles(2, true, 15));
+ auto release = execution.reserve(BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
  const std::array<std::uint32_t, 1> ids{1};
  const auto mask = png(1, 1, ids);
  const std::array physical{coco(7), objects(1)};
@@ -3627,13 +3637,13 @@ TEST_CASE("custom preparation retains its prerequisite beside prefetched archive
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.descriptors = 64}, cancellation);
- auto preparation = execution.reserve(BenchmarkResources::handles(0, true, 18));
- auto train = execution.reserve(BenchmarkResources::handles(1, true, 12));
- auto validation = execution.reserve(BenchmarkResources::handles(1, true, 12));
- auto train_lease = train.retain(ArtifactLease::acquire(local.cache.locks / "coco-train2017.images.lock", cancellation));
- auto validation_lease = validation.retain(ArtifactLease::acquire(local.cache.locks / "coco-val2017.images.lock", cancellation));
+ auto preparation = execution.reserve(BenchmarkResources::handles(0, true, custom_annotation_resources().descriptors + custom_annotation_resources().continuation_descriptors));
+ auto train = execution.reserve(BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
+ auto validation = execution.reserve(BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
+ auto train_lease = ArtifactLease::acquire_charged(local.cache.locks / "coco-train2017.images.lock", cancellation, train);
+ auto validation_lease = ArtifactLease::acquire_charged(local.cache.locks / "coco-val2017.images.lock", cancellation, validation);
  auto competing = execution.reserve({0, 12, true});
- CHECK_FALSE(execution.try_reserve(BenchmarkResources::handles(3, true, 15)).has_value());
+ CHECK_FALSE(execution.try_reserve(custom_annotation_resources()).has_value());
  BenchmarkTraceSink trace;
  CHECK(download_artifacts({make_download_request(local.cache, "coco", catalog.coco_train_images)}, 1, cancellation, {}, trace, {}, &execution, train).size() == 1);
  CHECK(download_artifacts({make_download_request(local.cache, "coco", catalog.coco_val_images)}, 1, cancellation, {}, trace, {}, &execution, validation).size() == 1);
@@ -3648,7 +3658,7 @@ TEST_CASE("custom preparation retains its prerequisite beside prefetched archive
  REQUIRE(result.coco_val);
  CHECK(result.coco_train->images.size() == 2);
  CHECK(result.coco_val->images.size() == 1);
- CHECK(execution.try_reserve({0, 18, true}).has_value());
+ CHECK(execution.try_reserve({0, custom_annotation_resources().descriptors + custom_annotation_resources().continuation_descriptors, true}).has_value());
  // Both source owners still hold their lease and can use their own promise.
  CHECK(execution.try_reserve({0, 12, true}, train).has_value());
  CHECK(execution.try_reserve({0, 12, true}, validation).has_value());
@@ -3663,12 +3673,12 @@ TEST_CASE("COCONut inventory and originals retain activation capacity beside a r
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.descriptors = 40}, cancellation);
- auto preparation = execution.reserve(BenchmarkResources::handles(0, true, 15));
+ auto preparation = execution.reserve(BenchmarkResources::handles(0, true, coco_annotation_resources().descriptors + coco_annotation_resources().continuation_descriptors));
  std::vector<CoconutPhysicalImage> physical;
  std::vector<AdmittedRecipeArchive> admitted;
  for (const auto& archive : catalog.images) {
   const auto path = local.cache.source_downloads(benchmark_source_name(archive.artifact.source)) / archive.artifact.filename;
-  auto inventory = execution.reserve(BenchmarkResources::handles(1, true, 12), preparation);
+  auto inventory = execution.reserve(BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors), preparation);
   auto rows = coconut_image_archive_inventory(path, {}, archive.source, archive.shard, archive.artifact.artifact_id, cancellation, &execution.storage(), &execution, inventory);
   physical.insert(physical.end(), std::make_move_iterator(rows.begin()), std::make_move_iterator(rows.end()));
   admitted.push_back({archive, {.path = path, .size = archive.artifact.expected_size, .identity = archive.artifact.artifact_id}});
@@ -3686,7 +3696,7 @@ TEST_CASE("COCONut inventory and originals retain activation capacity beside a r
  auto inputs = acquire_coconut_recipe_inputs(local.cache, catalog, progress, 1, cancellation, trace, 1, {}, {}, &execution);
  const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); release_acquired.Release(); });
  REQUIRE(release_acquired.WaitEntered(2s));
- CHECK_FALSE(execution.try_reserve(BenchmarkResources::handles(3, true, 12)).has_value());
+ CHECK_FALSE(execution.try_reserve(coco_annotation_resources()).has_value());
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock});
  auto work = std::async(std::launch::async, [&] {
   return prepare_coconut_recipe(config, local.cache, catalog, admitted, membership, progress, failures, 1, cancellation, trace, {}, false, inputs, &execution, std::move(preparation));

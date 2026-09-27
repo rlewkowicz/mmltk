@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h"
@@ -7,7 +8,6 @@
 #include "src/common/io/file_digest.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
-#include "src/backend/data/detail/staging_file_cleanup.h"
 #include "src/frameworks/serialization/json_scalar.h"
 #include "src/pch_std.h"
 #include <iterator>
@@ -73,8 +73,8 @@ void validate_physical(const CoconutPhysicalImage& image) {
 }
 class Archive final {
 public:
- explicit Archive(const std::filesystem::path& path, BenchmarkCompilePipeline* execution = nullptr, std::uint64_t workspace = 0, const BenchmarkCompilePipeline::Allowance& parent = {})
-  : execution_(execution), allowance_(execution ? execution->reserve({mmltk::common::math::checked_add(64ULL << 20, workspace, "COCONut archive workspace overflow"), 1, true}, parent) : BenchmarkCompilePipeline::Allowance{}),
+ explicit Archive(const std::filesystem::path& path, BenchmarkCompilePipeline* execution = nullptr, std::uint64_t workspace = 0, const BenchmarkAllowance& parent = {})
+  : execution_(execution), allowance_(execution ? execution->reserve({mmltk::common::math::checked_add(64ULL << 20, workspace, "COCONut archive workspace overflow"), 1, true}, parent) : BenchmarkAllowance{}),
     handle_(archive_read_new(), archive_read_free) {
   if (!handle_) invalid("cannot allocate archive reader");
   archive_read_support_filter_all(handle_.get());
@@ -111,7 +111,7 @@ public:
   }
   return bytes_;
  }
- [[nodiscard]] BenchmarkCompilePipeline::Allowance allowance() const { return allowance_; }
+ [[nodiscard]] BenchmarkAllowance allowance() const { return allowance_; }
  void cpu(const std::function<void()>& work) const {
   if (execution_) execution_->run(BenchmarkStage::Archive, {}, [&](std::size_t) { work(); }, allowance_);
   else work();
@@ -123,7 +123,7 @@ private:
   invalid(context + ": " + (detail ? detail : "archive failure"));
  }
  BenchmarkCompilePipeline* execution_ = nullptr;
- BenchmarkCompilePipeline::Allowance allowance_;
+ BenchmarkAllowance allowance_;
  std::unique_ptr<archive, decltype(&archive_read_free)> handle_;
  archive_entry* entry_ = nullptr;
  std::string member_;
@@ -173,7 +173,7 @@ concept InventoryRecord = std::same_as<T, CoconutPhysicalImage> || std::same_as<
 // are transient; records remain in their ordinary typed inventory owner.
 class InventoryOutput final {
 public:
- InventoryOutput(mmltk::common::io::FileHandle* file, Cancellation cancellation, bool count_only = false) : file_(file), cancellation_(cancellation), count_only_(count_only) {}
+ InventoryOutput(BenchmarkStagedArtifact* file, Cancellation cancellation, bool count_only = false) : file_(file), cancellation_(cancellation), count_only_(count_only) {}
  template <class T>
  void value(const T& item) {
   if constexpr (InventoryRecord<T>) {
@@ -203,7 +203,7 @@ public:
   if (count_only_) return {};
   flush();
   const auto digest = hash_.Finish();
-  if (file_) file_->pwrite_all(digest.data(), digest.size(), offset_);
+  if (file_) { file_->file().pwrite_all(digest.data(), digest.size(), offset_); file_->reconcile(); }
   throw_if_benchmark_cancelled(cancellation_);
   return mmltk::common::io::sha256_hex(digest);
  }
@@ -227,11 +227,11 @@ private:
   if (!used_) return;
   if (used_ > std::numeric_limits<std::size_t>::max() - offset_) invalid("inventory size overflow");
   hash_.Update(std::span(buffer_.data(), used_));
-  if (file_) file_->pwrite_all(buffer_.data(), used_, offset_);
+  if (file_) { file_->file().pwrite_all(buffer_.data(), used_, offset_); file_->reconcile(); }
   offset_ += used_;
   used_ = 0;
  }
- mmltk::common::io::FileHandle* file_;
+ BenchmarkStagedArtifact* file_;
  Cancellation cancellation_;
  bool count_only_ = false;
  mmltk::common::io::Sha256Hasher hash_;
@@ -357,19 +357,14 @@ std::string store_inventory(const std::filesystem::path& path, const InventoryHe
  InventoryOutput extent(nullptr, cancellation, true);
  (void)encode_inventory(extent, header, records, cancellation, recovery);
  StorageReservationPool destination(path, {}, storage);
- auto allocation = destination.reserve(extent.byte_size(), "COCONut inventory staging");
- std::string temporary = path.string() + ".tmp.XXXXXX";
- auto file = mmltk::common::io::FileHandle::create_unique_output(temporary, 0);
- StagingFileCleanup cleanup(temporary);
- allocation.watch(temporary);
- InventoryOutput output(&file, cancellation);
+ auto staging = BenchmarkStagedArtifact::create(destination, path, extent.byte_size(), "COCONut inventory staging");
+ staging.preallocate(mmltk::common::math::checked_cast<std::size_t>(extent.byte_size(), "COCONut inventory extent overflow"));
+ auto& file = staging.file();
+ InventoryOutput output(&staging, cancellation);
  const auto identity = encode_inventory(output, header, records, cancellation, recovery);
  if (!expected_identity.empty() && identity != expected_identity) invalid("component inventory/index identity mismatch");
  file.sync_data();
- file = mmltk::common::io::FileHandle{};
- throw_if_benchmark_cancelled(cancellation);
- mmltk::common::io::publish_staged_path_atomically(temporary, path, true);
- cleanup.published();
+ staging.publish(path, cancellation);
  return identity;
 }
 BenchmarkDatasetSource index_source(CoconutImageNamespace source) {
@@ -433,7 +428,7 @@ public:
   support_ = decltype(support_){};
   if (request_.recovery) request_.recovery->retire_scratch();
  }
- void consume(const CoconutRecord& record, std::span<const std::uint8_t> png, BenchmarkCompilePipeline::Allowance allowance = {}) {
+ void consume(const CoconutRecord& record, std::span<const std::uint8_t> png, BenchmarkAllowance allowance = {}) {
   if (!request_.execution) { consume_record(record, png); return; }
   // This is a synchronous borrow of the row/batch, and one image is the largest
   // nonpreemptible decode. Other releases' metadata and pixels keep advancing.
@@ -692,7 +687,7 @@ struct CooperativeJsonIterator {
 // immediately discards that row from the parser's array. Two sequential passes
 // permit either top-level field order without a release-sized JSON DOM.
 void json_rows(const CoconutImportRequest& request, std::span<const std::string_view> fields, const std::function<void(std::string_view, const Json&)>& consume) {
- auto handles = request.execution ? request.execution->reserve(BenchmarkResources::handles(1, true), request.parent_allowance) : BenchmarkCompilePipeline::Allowance{};
+ auto handles = request.execution ? request.execution->reserve(BenchmarkResources::handles(1, true), request.parent_allowance) : BenchmarkAllowance{};
  const auto input = mmltk::common::io::MappedFile::open_readonly(request.annotation_json.string());
  std::size_t selected = fields.size();
  std::vector<bool> found(fields.size(), false);
@@ -1049,7 +1044,7 @@ std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& compon
 }
 std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(
  const std::filesystem::path& archive_path, const std::filesystem::path& cache_path, CoconutImageNamespace source, std::uint16_t shard, std::string archive_identity, Cancellation cancellation, StorageReservationPool* storage,
- BenchmarkCompilePipeline* execution, const BenchmarkCompilePipeline::Allowance& parent) {
+ BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
  if (archive_identity.empty()) invalid("archive inventory needs a physical identity");
  (void)coconut_namespace_name(source);
  throw_if_benchmark_cancelled(cancellation);
@@ -1122,7 +1117,7 @@ void store_coconut_component(const std::filesystem::path& index_path, const Coco
   {"recovery_images", component.recovery.size()}
  };
  throw_if_benchmark_cancelled(cancellation);
- write_json_atomically(manifest_path, manifest, cancellation);
+ write_json_atomically(manifest_path, manifest, cancellation, storage);
 }
 std::optional<CoconutComponent> load_coconut_component(
  const std::filesystem::path& index_path, CoconutEdition edition, CoconutImageNamespace source, std::string_view input_identity, Cancellation cancellation) {

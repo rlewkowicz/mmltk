@@ -36,15 +36,21 @@ std::size_t descriptor_headroom() {
 BenchmarkResources BenchmarkResources::handles(std::size_t count, bool producer, std::size_t continuation) {
  return {mmltk::common::math::checked_multiply(std::uint64_t{8192}, static_cast<std::uint64_t>(count), "benchmark handle custody overflow"), count, producer, 0, true, continuation};
 }
+BenchmarkResources BenchmarkTransferEnvelope::demand(std::size_t count) const {
+ using mmltk::common::math::checked_add;
+ using mmltk::common::math::checked_multiply;
+ return {checked_add(fixed.bytes, checked_multiply(per_transfer.bytes, static_cast<std::uint64_t>(count), "benchmark transfer workspace overflow"), "benchmark transfer workspace overflow"),
+  checked_add(fixed.descriptors, checked_multiply(per_transfer.descriptors, count, "benchmark transfer descriptor overflow"), "benchmark transfer descriptor overflow"), true};
+}
 // Credits form only the actual dependent ownership chain. Children keep their
 // producing commitment alive, never workers, sources, callbacks or writers.
-struct BenchmarkCompilePipeline::Credits {
- std::shared_ptr<Admission> owner;
+struct BenchmarkAllowance::Credits {
+ std::shared_ptr<BenchmarkCompilePipeline::Admission> owner;
  BenchmarkResources resources;
  std::shared_ptr<Credits> parent;
  std::size_t available = 0, borrowed = 0;
  bool charged = false;
- Credits(std::shared_ptr<Admission> value, BenchmarkResources demand, std::shared_ptr<Credits> producing)
+ Credits(std::shared_ptr<BenchmarkCompilePipeline::Admission> value, BenchmarkResources demand, std::shared_ptr<Credits> producing)
   : owner(std::move(value)), resources(demand), parent(std::move(producing)), available(demand.continuation_descriptors) {}
  ~Credits();
 };
@@ -128,7 +134,7 @@ struct BenchmarkCompilePipeline::Admission {
   Waiter& operator=(const Waiter&) = delete;
  };
 };
-BenchmarkCompilePipeline::Credits::~Credits() { if (charged) owner->release(*this); }
+BenchmarkAllowance::Credits::~Credits() { if (charged) owner->release(*this); }
 struct BenchmarkCompilePipeline::Impl {
  bool consume(BenchmarkCompilePipeline&, std::size_t lane, bool wait);
  struct Job;
@@ -155,7 +161,7 @@ struct BenchmarkCompilePipeline::Impl {
  struct Job {
   BenchmarkStage stage = BenchmarkStage::Metadata;
   BenchmarkResources resources{};
-  Allowance allowance;
+  BenchmarkAllowance allowance;
   const std::function<void(std::size_t)>* callback = nullptr;
   Job* next = nullptr;
   Job* previous = nullptr;
@@ -185,7 +191,7 @@ struct BenchmarkCompilePipeline::Impl {
   bool submitted = false, retiring = false;
   std::shared_ptr<const ArtifactLease> custody;
   std::shared_ptr<BenchmarkPixelInput> input;
-  Allowance input_allowance;
+  BenchmarkAllowance input_allowance;
  };
  struct Source {
   std::filesystem::path root;
@@ -200,7 +206,7 @@ struct BenchmarkCompilePipeline::Impl {
  struct IdleScratch {
   BenchmarkSplitWriter* writer = nullptr;
   const std::function<void(std::size_t)>* retire = nullptr;
-  Allowance allowance;
+  BenchmarkAllowance allowance;
   WorkGroup* group = nullptr;
   const void* owner() const { return writer ? static_cast<const void*>(writer) : retire; }
   std::exception_ptr release(std::size_t lane) noexcept {
@@ -223,7 +229,7 @@ struct BenchmarkCompilePipeline::Impl {
   std::size_t lane;
   Frame* parent = nullptr;
   Frame* previous = nullptr;
-  Allowance allowance;
+  BenchmarkAllowance allowance;
   const void* scratch = nullptr;
   bool entered = false;
   static thread_local Frame* current;
@@ -232,7 +238,7 @@ struct BenchmarkCompilePipeline::Impl {
   Frame(const Frame&) = delete;
   Frame& operator=(const Frame&) = delete;
   // enter is protected by the scheduler mutex; each lane's stack has one CPU.
-  void enter(Allowance value, const void* identity) {
+  void enter(BenchmarkAllowance value, const void* identity) {
    parent = owner.lanes[lane].active;
    previous = current;
    allowance = std::move(value);
@@ -257,7 +263,7 @@ struct BenchmarkCompilePipeline::Impl {
  std::vector<Lane> lanes;
  StorageReservationPool storage{".", {}};
  std::vector<int> cpus;
- std::shared_ptr<Admission> admission = std::make_shared<Admission>();
+ std::shared_ptr<BenchmarkCompilePipeline::Admission> admission = std::make_shared<Admission>();
  std::mutex& mutex = admission->mutex;
  std::condition_variable& changed = admission->changed;
  std::array<Job*, stage_count> heads{}, tails{};
@@ -279,10 +285,10 @@ struct BenchmarkCompilePipeline::Impl {
    if (cancellation.requested()) changed.notify_all();
   }
  }
- Allowance charge(BenchmarkResources resources, const Allowance& parent = {}) {
+ BenchmarkAllowance charge(BenchmarkResources resources, const BenchmarkAllowance& parent = {}) {
   auto credits = std::make_shared<Credits>(admission, resources, parent.credits_);
   admission->charge(*credits);
-  return Allowance(std::move(credits));
+  return BenchmarkAllowance(std::move(credits));
  }
  void check_admission() const {
   if (failure) std::rethrow_exception(failure);
@@ -322,15 +328,8 @@ struct BenchmarkCompilePipeline::Impl {
   return position->second;
  }
 };
-std::uint64_t BenchmarkCompilePipeline::Allowance::bytes() const noexcept { return credits_ ? credits_->resources.bytes : 0; }
-std::shared_ptr<ArtifactLease> BenchmarkCompilePipeline::Allowance::retain(ArtifactLease lease) const {
- return std::shared_ptr<ArtifactLease>(new ArtifactLease(std::move(lease)), [credits = credits_](ArtifactLease* value) mutable {
-  delete value;
-  // Weak observers may retain the shared control block, but no physical reader
-  // remains after its deleter. Return admission at that last-reader boundary.
-  credits.reset();
- });
-}
+std::uint64_t BenchmarkAllowance::bytes() const noexcept { return credits_ ? credits_->resources.bytes : 0; }
+std::size_t BenchmarkAllowance::descriptors() const noexcept { return credits_ ? credits_->resources.descriptors : 0; }
 thread_local BenchmarkCompilePipeline::Impl::Frame* BenchmarkCompilePipeline::Impl::Frame::current = nullptr;
 bool BenchmarkCompilePipeline::Impl::Lane::owns(const void* identity) const {
  if (!identity) return false;
@@ -656,14 +655,14 @@ void BenchmarkCompilePipeline::notify_admission_change() noexcept {
  { const std::lock_guard lock(impl_->mutex); ++impl_->admission->generation; }
  impl_->changed.notify_all();
 }
-std::optional<BenchmarkCompilePipeline::Allowance> BenchmarkCompilePipeline::try_reserve(BenchmarkResources resources, const Allowance& parent) {
+std::optional<BenchmarkAllowance> BenchmarkCompilePipeline::try_reserve(BenchmarkResources resources, const BenchmarkAllowance& parent) {
  const std::lock_guard lock(impl_->mutex);
  impl_->check_admission();
  if (parent.credits_ && parent.credits_->owner != impl_->admission) throw std::invalid_argument("benchmark parent allowance belongs to another compile");
  if (!impl_->admission->fits(resources, parent.credits_.get())) return std::nullopt;
  return impl_->charge(resources, parent);
 }
-BenchmarkCompilePipeline::Allowance BenchmarkCompilePipeline::reserve(BenchmarkResources resources, const Allowance& parent) {
+BenchmarkAllowance BenchmarkCompilePipeline::reserve(BenchmarkResources resources, const BenchmarkAllowance& parent) {
  const auto* frame = Impl::Frame::current;
  if (frame && &frame->owner == impl_.get()) throw std::logic_error("benchmark CPU lane cannot wait for resource credits");
  auto& ledger = *impl_->admission;
@@ -677,16 +676,14 @@ BenchmarkCompilePipeline::Allowance BenchmarkCompilePipeline::reserve(BenchmarkR
   impl_->wait(lock, [&] { return impl_->stopping || impl_->failure || impl_->cancellation.requested() || ledger.fits(resources, parent.credits_.get()); });
  }
 }
-std::pair<std::size_t, BenchmarkCompilePipeline::Allowance> BenchmarkCompilePipeline::reserve_transfers(std::size_t requested, std::size_t fixed_descriptors, std::uint64_t per_connection, std::uint64_t fixed_bytes, const Allowance& parent) {
- if (!requested) throw std::invalid_argument("benchmark transfer concurrency must be positive");
+std::pair<std::size_t, BenchmarkAllowance> BenchmarkCompilePipeline::reserve_transfers(std::size_t requested, BenchmarkTransferEnvelope envelope, const BenchmarkAllowance& parent) {
+ if (!requested || !envelope.per_transfer.descriptors) throw std::invalid_argument("benchmark transfer admission requires positive concurrency and descriptor demand");
  const auto* frame = Impl::Frame::current;
  if (frame && &frame->owner == impl_.get()) throw std::logic_error("benchmark CPU lane cannot wait for transfers");
- const auto demand = [&](std::size_t count) {
-  using mmltk::common::math::checked_add;
-  using mmltk::common::math::checked_multiply;
-  return BenchmarkResources{checked_add(fixed_bytes, checked_multiply(per_connection, static_cast<std::uint64_t>(count), "benchmark transfer workspace overflow"), "benchmark transfer workspace overflow"),
-   checked_add(fixed_descriptors, checked_multiply(std::size_t{3}, count, "benchmark transfer descriptor overflow"), "benchmark transfer descriptor overflow"), true};
- };
+ const auto demand = [&](std::size_t count) { return envelope.demand(count); };
+ const auto fixed_descriptors = envelope.fixed.descriptors;
+ const auto per_connection = envelope.per_transfer.bytes;
+ const auto fixed_bytes = envelope.fixed.bytes;
  auto& ledger = *impl_->admission;
  if (parent.credits_ && parent.credits_->owner != impl_->admission) throw std::invalid_argument("benchmark parent allowance belongs to another compile");
  const auto minimum = demand(1);
@@ -695,7 +692,7 @@ std::pair<std::size_t, BenchmarkCompilePipeline::Allowance> BenchmarkCompilePipe
  for (;;) {
   impl_->check_admission();
   if (ledger.fits(minimum, parent.credits_.get())) {
-   auto count = std::min(requested, (ledger.descriptor_room(minimum, parent.credits_.get()) - fixed_descriptors) / 3);
+   auto count = std::min(requested, (ledger.descriptor_room(minimum, parent.credits_.get()) - fixed_descriptors) / envelope.per_transfer.descriptors);
    if (per_connection && fixed_bytes < ledger.target && ledger.bytes <= ledger.target - fixed_bytes)
     count = std::min(count, std::max<std::size_t>(1, (ledger.target - fixed_bytes - ledger.bytes) / per_connection));
    else count = 1;
@@ -705,7 +702,7 @@ std::pair<std::size_t, BenchmarkCompilePipeline::Allowance> BenchmarkCompilePipe
   impl_->wait(lock, [&] { return impl_->stopping || impl_->failure || impl_->cancellation.requested() || ledger.fits(minimum, parent.credits_.get()); });
  }
 }
-void BenchmarkCompilePipeline::run(BenchmarkStage stage, BenchmarkResources resources, const std::function<void(std::size_t)>& callback, Allowance allowance) {
+void BenchmarkCompilePipeline::run(BenchmarkStage stage, BenchmarkResources resources, const std::function<void(std::size_t)>& callback, BenchmarkAllowance allowance) {
  if (allowance.credits_ && allowance.credits_->owner != impl_->admission) throw std::invalid_argument("benchmark allowance belongs to another compile");
  { const std::lock_guard lock(impl_->mutex);
   if (allowance && !Admission::covers(*allowance.credits_, resources)) throw std::invalid_argument("benchmark job exceeds its transferred allowance");

@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +39,8 @@ struct DownloadRequest {
  // An owning acquisition invalidated an earlier artifact before this request.
  bool redownload = false;
  BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
+ // Source-owned estimate for an artifact whose HTTP/catalog size is unknown.
+ std::uint64_t storage_estimate = 0;
 };
 struct DownloadProgress {
  std::string artifact_id;
@@ -68,6 +71,7 @@ using DownloadReadySink = std::function<void(DownloadReady)>;
 using DownloadProgressSink = std::function<void(const DownloadProgress&)>;
 [[nodiscard]] std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t maximum_concurrency,
  mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& progress = {}, const BenchmarkTraceSink& trace = {}, const DownloadReadySink& ready = {},
- BenchmarkCompilePipeline* execution = nullptr, const BenchmarkCompilePipeline::Allowance& parent = {});
-void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested = {}, const BenchmarkTraceSink& trace = {});
+ BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {}, StorageReservationPool* storage = nullptr);
+void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested = {}, const BenchmarkTraceSink& trace = {},
+ BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {});
 }  // namespace mmltk::backend::data::benchmark_internal

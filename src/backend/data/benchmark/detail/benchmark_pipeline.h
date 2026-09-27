@@ -1,5 +1,6 @@
 #pragma once
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
+#include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/common/concurrency/cancellation_observation.h"
@@ -21,42 +22,11 @@ public:
  using std::runtime_error::runtime_error;
 };
 enum class BenchmarkStage : std::uint8_t { Metadata, Header, Pixels, Normalize, Recovery, Labels, Archive, CacheWrite, Count };
-struct BenchmarkResources {
- std::uint64_t bytes = 0;
- std::size_t descriptors = 0;
- // Producer allowances include their consumers' scratch/output, atomically.
- bool producer = false;
- // Fixed nonpreemptible library grant, including its calling CPU.
- std::size_t cpu_workers = 0;
- // Small retained file/lease control records are charged separately from the
- // workspace their consumer needs to finish. Never use this for data buffers.
- bool retained_handles = false;
- // Live descriptor commitment for explicitly bound dependent reservations.
- std::size_t continuation_descriptors = 0;
- [[nodiscard]] static BenchmarkResources handles(std::size_t count, bool producer = false, std::size_t continuation = 0);
-};
-struct BenchmarkExecutionLimits {
- std::uint64_t transient_bytes = 0;
- std::size_t descriptors = 0;
-};
 class BenchmarkCompilePipeline final {
  struct Admission;
- struct Credits;
+ using Credits = BenchmarkAllowance::Credits;
+ friend class BenchmarkAllowance;
 public:
- // Shared custody charges a backing allocation once, including across handoffs.
- // Last release wakes resource admission; copying custody does not charge again.
- // Custody may outlive this execution owner without retaining workers/borrowers.
- class Allowance {
- public:
-  Allowance() = default;
-  [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(credits_); }
-  [[nodiscard]] std::uint64_t bytes() const noexcept;
-  [[nodiscard]] std::shared_ptr<ArtifactLease> retain(ArtifactLease) const;
- private:
-  friend class BenchmarkCompilePipeline;
-  explicit Allowance(std::shared_ptr<Credits> value) : credits_(std::move(value)) {}
-  std::shared_ptr<Credits> credits_;
- };
  explicit BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus = {}, BenchmarkExecutionLimits = {},
   mmltk::common::concurrency::CancellationObservation = {});
  ~BenchmarkCompilePipeline();
@@ -74,17 +44,17 @@ public:
  [[nodiscard]] std::uint64_t admission_generation() const;
  void wait_for_admission_change(std::uint64_t);
  void notify_admission_change() noexcept;
- [[nodiscard]] std::optional<Allowance> try_reserve(BenchmarkResources, const Allowance& parent = {});
+ [[nodiscard]] std::optional<BenchmarkAllowance> try_reserve(BenchmarkResources, const BenchmarkAllowance& parent = {});
  // A dependent draw uses at most its parent's remaining commitment. Additional
  // demand needs uncommitted capacity; copied parents cannot lend twice.
  // Called by I/O/source owners only; never blocks a CPU lane on resources.
- [[nodiscard]] Allowance reserve(BenchmarkResources, const Allowance& parent = {});
+ [[nodiscard]] BenchmarkAllowance reserve(BenchmarkResources, const BenchmarkAllowance& parent = {});
  // Admit a complete HTTP envelope, reducing optional connections under pressure.
- [[nodiscard]] std::pair<std::size_t, Allowance> reserve_transfers(std::size_t requested, std::size_t fixed_descriptors, std::uint64_t bytes_per_connection, std::uint64_t fixed_bytes = 0, const Allowance& parent = {});
+ [[nodiscard]] std::pair<std::size_t, BenchmarkAllowance> reserve_transfers(std::size_t requested, BenchmarkTransferEnvelope, const BenchmarkAllowance& parent = {});
  // The borrowed callback and its inputs remain live through completion/failure.
  // Input ownership supplies an allowance when a producer already reserved the
  // complete input/work/output footprint; no second charge is made.
- void run(BenchmarkStage, BenchmarkResources, const std::function<void(std::size_t)>&, Allowance = {});
+ void run(BenchmarkStage, BenchmarkResources, const std::function<void(std::size_t)>&, BenchmarkAllowance = {});
  // Bounded records recycle on individual completion. Retirement finishes before
  // returning, including failure; it cannot retire suspended cooperative scratch.
  void for_each(BenchmarkStage, std::size_t count, BenchmarkResources, const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>& retire_scratch = {});

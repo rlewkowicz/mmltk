@@ -1,3 +1,5 @@
+#include "src/backend/data/benchmark/detail/benchmark_curl.h"
+#include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
 #include <algorithm>
 #include <array>
@@ -3178,11 +3180,16 @@ TEST_CASE("filesystem reservations share allocation settlement across destinatio
  auto right = second.reserve(8192, "second stage");
  CHECK(first.outstanding() == 24576);
  CHECK(second.outstanding() == 24576);
- left.allocated(4096);
- CHECK(second.outstanding() == 20480);
+ const auto path = root.path() / "allocated";
+ auto file = FileHandle::create_output(path.string(), 4096);
+ left.reconcile(file.get());
+ struct stat status{};
+ REQUIRE(::fstat(file.get(), &status) == 0);
+ const auto remaining = 16384U - std::min<std::uint64_t>(16384, static_cast<std::uint64_t>(status.st_blocks) * 512);
+ CHECK(second.outstanding() == remaining + 8192);
  auto moved = std::move(left);
  right.release();
- CHECK(first.outstanding() == 12288);
+ CHECK(first.outstanding() == remaining);
  moved.release();
  CHECK(second.outstanding() == 0);
 }
@@ -3242,11 +3249,13 @@ TEST_CASE("filesystem reservation follows allocation that is later withdrawn", "
  StorageReservationPool storage(root.path(), {});
  const auto path = root.path() / "staging";
  auto promised = storage.reserve(16384, "staged output");
- promised.watch(path);
  CHECK(storage.outstanding() == 16384);
  auto file = FileHandle::create_output(path.string(), 8192);
+ promised.reconcile(file.get());
  const auto settled = storage.outstanding();
  CHECK(settled <= 8192);
+ promised.withdraw_allocation();
+ CHECK(storage.outstanding() == 16384);
  file = {};
  fs::remove(path);
  CHECK(storage.outstanding() == 16384);
@@ -3257,7 +3266,7 @@ TEST_CASE("filesystem reservation follows allocation that is later withdrawn", "
 TEST_CASE("descriptor continuations admit a feasible transfer minimum before source work", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 16});
  auto source = execution.reserve(BenchmarkResources::handles(1, true, 11));
- auto [connections, transfer] = execution.reserve_transfers(8, 8, 64, 0, source);
+ auto [connections, transfer] = execution.reserve_transfers(8, {{0, 8}, {64, 3}}, source);
  CHECK(connections == 1);
  bool consumed = false;
  execution.run(BenchmarkStage::Header, {}, [&](std::size_t) { consumed = true; }, transfer);
@@ -3266,7 +3275,7 @@ TEST_CASE("descriptor continuations admit a feasible transfer minimum before sou
  CHECK(execution.try_reserve({33, 0, true}).has_value());
  BenchmarkCompilePipeline impossible(1, {}, {.transient_bytes = 32, .descriptors = 8});
  CHECK_THROWS(impossible.reserve(BenchmarkResources::handles(1, true, 11)));
- CHECK_THROWS(impossible.reserve_transfers(1, 8, 64));
+ CHECK_THROWS(impossible.reserve_transfers(1, {{0, 8}, {64, 3}}));
 }
 
 TEST_CASE("live descriptor commitments follow copied parents and nested dependent draws", "[backend][data][benchmark][pipeline]") {
@@ -3277,7 +3286,7 @@ TEST_CASE("live descriptor commitments follow copied parents and nested dependen
  // Consumers can occupy reserved headroom without obstructing the promised
  // producer completion. Copies all draw from the same remaining commitment.
  auto consumer = execution.reserve({0, 4});
- auto [connections, transfer] = execution.reserve_transfers(8, 8, 64, 0, copied);
+ auto [connections, transfer] = execution.reserve_transfers(8, {{0, 8}, {64, 3}}, copied);
  CHECK(connections == 1);
  CHECK_FALSE(execution.try_reserve({0, 1}, source).has_value());
  transfer = {};
@@ -3303,7 +3312,7 @@ TEST_CASE("live descriptor commitments follow copied parents and nested dependen
 TEST_CASE("dependent transfer concurrency can also use uncommitted capacity", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1024, .descriptors = 32});
  auto source = execution.reserve(BenchmarkResources::handles(1, true, 11));
- auto [connections, transfer] = execution.reserve_transfers(8, 8, 64, 0, source);
+ auto [connections, transfer] = execution.reserve_transfers(8, {{0, 8}, {64, 3}}, source);
  CHECK(connections == 5);
  CHECK(transfer.bytes() == 320);
  CHECK_FALSE(execution.try_reserve({0, 1, true}).has_value());
@@ -3340,7 +3349,7 @@ TEST_CASE("transferred allowances enforce producer and available continuation st
  BenchmarkCompilePipeline other(1, {}, {.descriptors = 16});
  CHECK_THROWS_AS(other.try_reserve({0, 1}, producer), std::invalid_argument);
  CHECK_THROWS_AS(other.reserve({0, 1}, producer), std::invalid_argument);
- CHECK_THROWS_AS(other.reserve_transfers(1, 8, 1, 0, producer), std::invalid_argument);
+ CHECK_THROWS_AS(other.reserve_transfers(1, {{0, 8}, {1, 3}}, producer), std::invalid_argument);
 }
 
 TEST_CASE("dependent commitments return on callback error and cancelled admission", "[backend][data][benchmark][pipeline]") {
@@ -3693,7 +3702,7 @@ TEST_CASE("last shared backing releases credits after borrower and execution ret
   BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 4});
   auto allowance = execution.reserve({32, 1, true, 0, false, 2});
   auto child = execution.reserve({0, 2, true}, allowance);
-  auto backing = child.retain(ArtifactLease::acquire(lock_path, {}));
+  auto backing = ArtifactLease::acquire_charged(lock_path, {}, child);
   last_reader = backing;
   execution.run(BenchmarkStage::Normalize, {32, 1}, [](std::size_t) {}, allowance);
   allowance = {};
@@ -3710,7 +3719,7 @@ TEST_CASE("last shared backing releases credits after borrower and execution ret
   // weak observer remains alive while its returned charge is reused.
   auto next = execution.reserve({32, 1, true, 0, false, 2});
   auto next_child = execution.reserve({0, 2, true}, next);
-  last_reader = next_child.retain(ArtifactLease::acquire(lock_path, {}));
+  last_reader = ArtifactLease::acquire_charged(lock_path, {}, next_child);
  }
  const mmltk::common::io::ScopedFd descriptor(::open(lock_path.c_str(), O_RDWR | O_CLOEXEC));
  REQUIRE(descriptor.get() >= 0);
@@ -3894,4 +3903,269 @@ TEST_CASE("a rejected pixel body leaves admitted writer siblings available for r
  CHECK(writer.image_complete(0));
  CHECK(writer.image_complete(1));
  CHECK(first_reads == 2);
+}
+
+TEST_CASE("charged lease acquisition owns its descriptor through cancellation and last reader", "[backend][data][benchmark][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("charged-lease-factory");
+ std::atomic<bool> cancelled{false};
+ const auto observation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.descriptors = 4}, observation);
+ const auto path = root.path() / "source.lock";
+ auto lease = ArtifactLease::acquire_charged(path, observation, &execution, BenchmarkResources::handles(1, true, 2));
+ auto reader = lease;
+ const std::weak_ptr<ArtifactLease> observer = reader;
+ lease.reset();
+ CHECK_FALSE(execution.try_reserve({0, 4}).has_value());
+ mmltk::testsupport::TestGate lock_wait("charged lease reached contended flock");
+ struct LeaseCancellation {
+  const std::atomic<bool>& cancelled_flag;
+  mmltk::testsupport::TestGate::Receipt reached;
+  mutable unsigned observations = 0;
+  bool cancelled() const noexcept {
+   // The factory observes once before open, then after a failed flock.
+   if (++observations == 2) reached.ArriveAndWait();
+   return cancelled_flag.load();
+  }
+ } contended{cancelled, lock_wait.receipt()};
+ auto waiter = std::async(std::launch::async, [&] {
+  return ArtifactLease::acquire_charged(path, mmltk::common::concurrency::CancellationObservation::Borrow(contended), &execution);
+ });
+ const mmltk::testsupport::ScopedTestCleanup stop([&] { cancelled.store(true); lock_wait.Release(); });
+ REQUIRE(lock_wait.WaitEntered(2s));
+ CHECK_FALSE(execution.try_reserve({0, 1}).has_value());
+ cancelled.store(true);
+ lock_wait.Release();
+ CHECK_THROWS(mmltk::testsupport::await_test_future(waiter, "cancelled charged lock acquisition"));
+ reader.reset();
+ CHECK(observer.expired());
+ cancelled.store(false);
+ CHECK(execution.try_reserve({0, 4}).has_value());
+ const mmltk::common::io::ScopedFd descriptor(::open(path.c_str(), O_RDWR | O_CLOEXEC));
+ REQUIRE(descriptor.get() >= 0);
+ CHECK(::flock(descriptor.get(), LOCK_EX | LOCK_NB) == 0);
+}
+
+TEST_CASE("direct storage settlement preserves sparse replacement promises and inode aliases", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("direct-download-storage");
+ StorageReservationPool storage(root.path(), {});
+ const auto final = root.path() / "artifact";
+ const auto partial = root.path() / "artifact.part";
+ auto file = FileHandle::create_output(partial.string(), 0);
+ REQUIRE(::ftruncate(file.get(), 65536) == 0);
+ auto reservation = storage.reserve_download(final, 65536, "sparse download");
+ struct stat status{};
+ REQUIRE(::fstat(file.get(), &status) == 0);
+ const auto outstanding_for = [&] {
+  return 65536U - std::min<std::uint64_t>(65536, static_cast<std::uint64_t>(status.st_blocks) * 512);
+ };
+ CHECK(storage.outstanding() == outstanding_for());
+ const std::array<std::uint8_t, 4096> bytes{};
+ file.pwrite_all(bytes.data(), bytes.size(), 32768);
+ reservation.reconcile(file.get());
+ REQUIRE(::fstat(file.get(), &status) == 0);
+ CHECK(storage.outstanding() == outstanding_for());
+ fs::create_hard_link(partial, final);
+ reservation.reconcile_download(final);
+ CHECK(storage.outstanding() == outstanding_for());
+ reservation.withdraw_allocation();
+ CHECK(storage.outstanding() == 65536);
+ REQUIRE(::ftruncate(file.get(), 0) == 0);
+ reservation.reconcile(file.get());
+ CHECK(storage.outstanding() == 65536);
+ // This reservation's directory anchor survives replacement of both names.
+ fs::remove(final);
+ fs::remove(partial);
+ reservation.grow(69632, "replacement growth");
+ CHECK(storage.outstanding() == 69632);
+ reservation.resize(65536, "replacement size");
+ file = FileHandle::create_output(partial.string(), 0);
+ file.preallocate(65536);
+ reservation.reconcile(file.get());
+ fs::rename(partial, final);
+ reservation.reconcile_download(final);
+ REQUIRE(::fstat(file.get(), &status) == 0);
+ CHECK(storage.outstanding() == outstanding_for());
+ reservation.release();
+ CHECK(storage.outstanding() == 0);
+ CHECK(fs::file_size(final) == 65536);
+}
+
+TEST_CASE("storage admission never reopens unrelated live backing paths", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("constant-storage-settlement");
+ StorageReservationPool storage(root.path(), {});
+ fs::create_directory(root.path() / "old");
+ auto file = FileHandle::create_output((root.path() / "old" / "file").string(), 4096);
+ auto first = storage.reserve(16384, "first");
+ first.reconcile(file.get());
+ const auto retained = storage.outstanding();
+ fs::rename(root.path() / "old", root.path() / "moved");
+ auto obstruction = FileHandle::create_output((root.path() / "old").string(), 0);
+ // The former backing path now raises ENOTDIR. Its live descriptor and credited
+ // allocation remain valid, and unrelated admission must not inspect that path.
+ auto second = storage.reserve(8192, "unrelated");
+ CHECK(storage.outstanding() == retained + 8192);
+ first.reconcile(file.get());
+ CHECK(storage.outstanding() == retained + 8192);
+ first = std::move(second);
+ CHECK(storage.outstanding() == 8192);
+ first.release();
+ CHECK(storage.outstanding() == 0);
+}
+
+TEST_CASE("staged artifact owns cleanup across file-operation and publication failures", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("staged-artifact-failures");
+ StorageReservationPool storage(root.path(), {});
+ const auto target = root.path() / "published";
+ { auto original = FileHandle::create_output(target.string(), 3); original.pwrite_all("old", 3, 0); }
+ SECTION("creation") {
+  CHECK_THROWS(BenchmarkStagedArtifact::create(storage, root.path() / "absent" / "file", 4096, "failed creation"));
+ }
+ SECTION("preallocation") {
+  fs::path temporary;
+  {
+   auto stage = BenchmarkStagedArtifact::create(storage, target, 4096, "failed preallocation");
+   temporary = stage.path();
+   stage.file() = {};
+   CHECK_THROWS(stage.preallocate(4096));
+  }
+  CHECK_FALSE(fs::exists(temporary));
+ }
+ SECTION("write and sync") {
+  fs::path temporary;
+  {
+   auto stage = BenchmarkStagedArtifact::create(storage, target, 4096, "failed write");
+   temporary = stage.path();
+   stage.file() = {};
+   CHECK_THROWS(stage.file().pwrite_all("new", 3, 0));
+   CHECK_THROWS(stage.file().sync_data());
+  }
+  CHECK_FALSE(fs::exists(temporary));
+ }
+ SECTION("rename and replacement") {
+  fs::path temporary;
+  {
+   auto stage = BenchmarkStagedArtifact::create(storage, target, 3, "failed replacement");
+   temporary = stage.path();
+   stage.file().pwrite_all("new", 3, 0);
+   stage.file().sync_data();
+   CHECK_THROWS(stage.publish(target, {}, BenchmarkStagedArtifact::Publication::DurableReplace, false));
+   CHECK(fs::exists(temporary));
+  }
+  CHECK_FALSE(fs::exists(temporary));
+ }
+ SECTION("rename syscall") {
+  fs::path temporary;
+  {
+   auto stage = BenchmarkStagedArtifact::create(storage, target, 3, "failed rename");
+   temporary = stage.path();
+   stage.file().pwrite_all("new", 3, 0);
+   CHECK_THROWS(stage.publish(root.path() / "absent" / "value", {}, BenchmarkStagedArtifact::Publication::Rename));
+  }
+  CHECK_FALSE(fs::exists(temporary));
+ }
+ SECTION("move assignment abandons the preceding stage") {
+  auto first = BenchmarkStagedArtifact::create(storage, target, 4096, "first stage");
+  const auto previous = first.path();
+  auto second = BenchmarkStagedArtifact::create(storage, target, 8192, "second stage");
+  first = std::move(second);
+  CHECK_FALSE(fs::exists(previous));
+  CHECK(storage.outstanding() == 8192);
+ }
+ SECTION("cancelled JSON publication") {
+  std::atomic<bool> cancelled{true};
+  CHECK_THROWS(write_json_atomically(target, nlohmann::json{{"replacement", true}}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), &storage));
+ }
+ CHECK(storage.outstanding() == 0);
+ auto original = FileHandle::open_readonly(target.string());
+ std::array<char, 3> bytes{};
+ original.pread_all(bytes.data(), bytes.size(), 0);
+ CHECK(std::string_view(bytes.data(), bytes.size()) == "old");
+ CHECK(std::distance(fs::directory_iterator(root.path()), fs::directory_iterator{}) == 1);
+}
+
+TEST_CASE("independent staged writers retain separate promises and publish after moves", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("independent-staged-writers");
+ StorageReservationPool storage(root.path(), {});
+ mmltk::testsupport::TestGate staged("two owned stages");
+ const auto write = [&](std::size_t index) {
+  auto stage = BenchmarkStagedArtifact::create(storage, root.path() / std::to_string(index), 16384, "independent stage");
+  staged.receipt().ArriveAndWait();
+  auto moved = std::move(stage);
+  moved.preallocate(16384);
+  moved.file().pwrite_all("data", 4, 0);
+  moved.file().sync_data();
+  moved.publish(root.path() / std::to_string(index), {});
+ };
+ auto first = std::async(std::launch::async, [&] { write(0); });
+ auto second = std::async(std::launch::async, [&] { write(1); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { staged.Release(); });
+ REQUIRE(staged.WaitEntered(2s, 2));
+ CHECK(storage.outstanding() == 32768);
+ staged.Release();
+ mmltk::testsupport::await_test_future(first, "first staged writer");
+ mmltk::testsupport::await_test_future(second, "second staged writer");
+ CHECK(storage.outstanding() == 0);
+ CHECK(fs::file_size(root.path() / "0") == 16384);
+ CHECK(fs::file_size(root.path() / "1") == 16384);
+}
+
+TEST_CASE("cached images and ordinary stages retain their modes and promises through publication", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("staged-output-modes");
+ StorageReservationPool storage(root.path(), {});
+ mode_t mask = 0022;
+ SECTION("ordinary process mask") {}
+ SECTION("private creation honors an owner permission mask") { mask = 0200; }
+ const auto previous_mask = ::umask(mask);
+ const mmltk::testsupport::ScopedTestCleanup restore_mask([&] { (void)::umask(previous_mask); });
+ const auto encoded = make_jpeg(240, 8, 8);
+ struct PublicationObservation {
+  StorageReservationPool& storage;
+  std::uint64_t promised;
+  mutable bool retained = false;
+  bool cancelled() const noexcept {
+   retained = storage.outstanding() == promised;
+   return false;
+  }
+ } observation{storage, encoded.size()};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(observation);
+ const auto image = root.path() / "image.jpg";
+ write_cached_image_atomically(image, encoded, cancellation, storage);
+ CHECK(observation.retained);
+ CHECK(storage.outstanding() == 0);
+ struct stat status{};
+ REQUIRE(::stat(image.c_str(), &status) == 0);
+ CHECK((status.st_mode & 0777) == (0600 & ~mask));
+ const auto ordinary = root.path() / "ordinary.bin";
+ auto stage = BenchmarkStagedArtifact::create(storage, ordinary, encoded.size(), "ordinary stage modes");
+ REQUIRE(::fstat(stage.file().get(), &status) == 0);
+ CHECK((status.st_mode & 0777) == 0644);
+ CHECK(status.st_size == 0);
+ stage.file().pwrite_all(encoded.data(), encoded.size(), 0);
+ stage.file().sync_data();
+ observation.retained = false;
+ const auto temporary = stage.path();
+ stage.publish(ordinary, cancellation);
+ CHECK(observation.retained);
+ CHECK(storage.outstanding() == 0);
+ CHECK_FALSE(fs::exists(temporary));
+ REQUIRE(::stat(ordinary.c_str(), &status) == 0);
+ CHECK((status.st_mode & 0777) == 0644);
+ for (const auto& path : {image, ordinary}) {
+  auto file = FileHandle::open_readonly(path.string());
+  REQUIRE(file.size() == encoded.size());
+  std::vector<std::uint8_t> persisted(encoded.size());
+  file.pread_all(persisted.data(), persisted.size(), 0);
+  CHECK(persisted == encoded);
+ }
+}
+
+TEST_CASE("Curl owns checked fixed and per-transfer resource composition", "[backend][data][benchmark][pipeline]") {
+ const auto envelope = benchmark_curl_envelope(2, 4096, 8192);
+ const auto single = envelope.demand(1);
+ const auto doubled = envelope.demand(2);
+ CHECK(single.descriptors == envelope.fixed.descriptors + envelope.per_transfer.descriptors);
+ CHECK(doubled.bytes == single.bytes + envelope.per_transfer.bytes);
+ CHECK_THROWS(benchmark_curl_envelope(std::numeric_limits<std::size_t>::max()));
+ CHECK_THROWS(benchmark_curl_envelope(0, 0, std::numeric_limits<std::uint64_t>::max()));
+ CHECK_THROWS(envelope.demand(std::numeric_limits<std::size_t>::max()));
 }

@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
@@ -81,10 +82,10 @@ struct CoconutImportLimits {
 using CoconutRecordConsumer = std::function<void(const CoconutRecord&, std::span<const std::uint8_t>)>;
 // PNG is borrowed for this call only. Reader and record batch remain alive through consumer.
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only = false, BenchmarkCompilePipeline* execution = nullptr, const std::function<void()>& retire_consumer_scratch = {}, const BenchmarkCompilePipeline::Allowance& parent = {});
+ const CoconutRecordConsumer& consumer, bool metadata_only = false, BenchmarkCompilePipeline* execution = nullptr, const std::function<void()>& retire_consumer_scratch = {}, const BenchmarkAllowance& parent = {});
 struct CoconutImportRequest {
  BenchmarkCompilePipeline* execution = nullptr;
- BenchmarkCompilePipeline::Allowance parent_allowance;
+ BenchmarkAllowance parent_allowance;
  CoconutEdition edition = CoconutEdition::Base;
  std::string input_identity;
  bool metadata_only = false;
@@ -111,7 +112,7 @@ struct CoconutImportRequest {
 [[nodiscard]] std::string canonical_coconut_archive_member(std::string_view raw);
 // Full archive inventory, independent of annotations/foreground selection. Cache is identity-bound.
 [[nodiscard]] std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(const std::filesystem::path& archive_path, const std::filesystem::path& cache_path, CoconutImageNamespace source,
- std::uint16_t shard, std::string archive_identity, mmltk::common::concurrency::CancellationObservation cancellation = {}, StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkCompilePipeline::Allowance& parent = {});
+ std::uint16_t shard, std::string archive_identity, mmltk::common::concurrency::CancellationObservation cancellation = {}, StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {});
 void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component, mmltk::common::concurrency::CancellationObservation cancellation = {}, StorageReservationPool* storage = nullptr);
 [[nodiscard]] std::optional<CoconutComponent> load_coconut_component(
  const std::filesystem::path& index_path, CoconutEdition edition, CoconutImageNamespace source, std::string_view input_identity, mmltk::common::concurrency::CancellationObservation cancellation = {});

@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include <simdjson.h>
 #include "src/pch_json.h"
@@ -1428,7 +1429,6 @@ void store_normalized_annotation_index(
  if (index.mask_rle_pairs.size() > (std::numeric_limits<std::uint64_t>::max() - mask_rle_offset) / sizeof(RLEPair)) { throw std::overflow_error("normalized mask block size overflow"); }
  const std::uint64_t total_size = mask_rle_offset + static_cast<std::uint64_t>(index.mask_rle_pairs.size()) * sizeof(RLEPair);
  StorageReservationPool destination(path, trace, storage);
- auto allocation = destination.reserve(total_size, "normalized annotation index staging");
  NormalizedIndexHeader header;
  header.source = static_cast<std::uint8_t>(index.source);
  header.image_count = checked_cast<std::uint32_t>(index.images.size(), "normalized image count overflow");
@@ -1443,43 +1443,34 @@ void store_normalized_annotation_index(
  std::memcpy(header.mapping_revision.data(), kBenchmarkMappingRevision.data(), kBenchmarkMappingRevision.size());
  header.rejected = encode_rejected(index.rejected);
  (void)mmltk::common::io::ensure_parent_directory(path);
- std::string staging_text = path.string() + ".tmp.XXXXXX";
- FileHandle staging = FileHandle::create_unique_output(staging_text, 0);
- std::filesystem::path staging_path;
- try {
-  staging_path = staging_text;
-  allocation.watch(staging_path);
-  staging.preallocate(checked_cast<std::size_t>(total_size, "normalized index size overflow"));
-  staging.pwrite_all(&header, sizeof(header), 0U);
-  staging.pwrite_all(index.images.data(), index.images.size() * sizeof(NormalizedImage), checked_cast<std::size_t>(image_offset, "normalized image offset overflow"));
-  staging.pwrite_all(index.boxes.data(), index.boxes.size() * sizeof(NormalizedBox), checked_cast<std::size_t>(box_offset, "normalized box offset overflow"));
-  staging.pwrite_all(index.mask_rle_pairs.data(), index.mask_rle_pairs.size() * sizeof(RLEPair), checked_cast<std::size_t>(mask_rle_offset, "normalized mask offset overflow"));
-  staging.sync_data();
-  staging = FileHandle{};
-  std::string identity_material = index.annotation_sha256 + "\n" + std::string(kBenchmarkMappingRevision) + "\n" + index.split + "\n" + std::to_string(total_size) + "\n" +
-                                  std::to_string(index.images.size()) + "\n" + std::to_string(index.boxes.size());
-  identity_material += "\n" + std::to_string(index.mask_rle_pairs.size());
-  const std::string identity = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(identity_material.data()), identity_material.size())));
-  const std::filesystem::path completion = normalized_manifest_path(path);
-  std::error_code error;
-  const bool removed = std::filesystem::remove(completion, error);
-  if (error) { throw std::filesystem::filesystem_error("cannot invalidate normalized annotation completion manifest", completion, error); }
-  if (removed) { sync_parent_directory(completion); }
-  throw_if_benchmark_cancelled(cancel_requested);
-  publish_staged_path_atomically(staging_path, path, true);
-  write_json_atomically(completion,
-   nlohmann::json{
-    {"schema_version", kBenchmarkCacheSchemaVersion}, {"index_version", kNormalizedAnnotationIndexVersion}, {"complete", true}, {"source", benchmark_source_name(index.source)}, {"split", index.split},
-    {"mapping_revision", kBenchmarkMappingRevision}, {"annotation_sha256", index.annotation_sha256}, {"size", total_size}, {"identity", identity}, {"integrity_mode", "atomic_layout_identity"},
-    {"images", index.images.size()}, {"mask_rle_pairs", index.mask_rle_pairs.size()}, {"boxes", index.boxes.size()}
-   },
-   cancel_requested);
-  trace_benchmark_event(trace, "benchmark.annotations.cache_store",
-   [&] { return nlohmann::json{{"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"bytes", total_size}}; });
- } catch (...) {
-  (void)::unlink(staging_text.c_str());
-  throw;
- }
+ auto staging = BenchmarkStagedArtifact::create(destination, path, total_size, "normalized annotation index staging");
+ staging.preallocate(checked_cast<std::size_t>(total_size, "normalized index size overflow"));
+ staging.file().pwrite_all(&header, sizeof(header), 0U);
+ staging.file().pwrite_all(index.images.data(), index.images.size() * sizeof(NormalizedImage), checked_cast<std::size_t>(image_offset, "normalized image offset overflow"));
+ staging.file().pwrite_all(index.boxes.data(), index.boxes.size() * sizeof(NormalizedBox), checked_cast<std::size_t>(box_offset, "normalized box offset overflow"));
+ staging.file().pwrite_all(index.mask_rle_pairs.data(), index.mask_rle_pairs.size() * sizeof(RLEPair), checked_cast<std::size_t>(mask_rle_offset, "normalized mask offset overflow"));
+ staging.file().sync_data();
+ staging.close();
+ std::string identity_material = index.annotation_sha256 + "\n" + std::string(kBenchmarkMappingRevision) + "\n" + index.split + "\n" + std::to_string(total_size) + "\n" +
+                                 std::to_string(index.images.size()) + "\n" + std::to_string(index.boxes.size());
+ identity_material += "\n" + std::to_string(index.mask_rle_pairs.size());
+ const std::string identity = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(identity_material.data()), identity_material.size())));
+ const std::filesystem::path completion = normalized_manifest_path(path);
+ std::error_code error;
+ const bool removed = std::filesystem::remove(completion, error);
+ if (error) { throw std::filesystem::filesystem_error("cannot invalidate normalized annotation completion manifest", completion, error); }
+ if (removed) { sync_parent_directory(completion); }
+ throw_if_benchmark_cancelled(cancel_requested);
+ staging.publish(path, cancel_requested);
+ write_json_atomically(completion,
+  nlohmann::json{
+   {"schema_version", kBenchmarkCacheSchemaVersion}, {"index_version", kNormalizedAnnotationIndexVersion}, {"complete", true}, {"source", benchmark_source_name(index.source)}, {"split", index.split},
+   {"mapping_revision", kBenchmarkMappingRevision}, {"annotation_sha256", index.annotation_sha256}, {"size", total_size}, {"identity", identity}, {"integrity_mode", "atomic_layout_identity"},
+   {"images", index.images.size()}, {"mask_rle_pairs", index.mask_rle_pairs.size()}, {"boxes", index.boxes.size()}
+  },
+  cancel_requested, &destination);
+ trace_benchmark_event(trace, "benchmark.annotations.cache_store",
+  [&] { return nlohmann::json{{"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"bytes", total_size}}; });
 }
 [[nodiscard]] std::vector<std::uint64_t> image_ids(const NormalizedAnnotationIndex& index, const std::optional<std::uint16_t> shard) {
  std::vector<std::uint64_t> ids;

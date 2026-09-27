@@ -1,11 +1,13 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/common/io/scoped_fd.h"
+#include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include <atomic>
 #include <concepts>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -27,6 +29,7 @@ struct BenchmarkCacheLayout {
  [[nodiscard]] std::filesystem::path source_images(std::string_view source) const;
  [[nodiscard]] std::filesystem::path source_indexes(std::string_view source) const;
 };
+class StorageReservationPool;
 class ArtifactLease {
 public:
  ArtifactLease() = default;
@@ -36,16 +39,22 @@ public:
  ArtifactLease& operator=(ArtifactLease&& other) noexcept;
  ~ArtifactLease();
  [[nodiscard]] static ArtifactLease acquire(const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancellation);
+ [[nodiscard]] static std::shared_ptr<ArtifactLease> acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation,
+  BenchmarkCompilePipeline*, BenchmarkResources = BenchmarkResources::handles(1), const BenchmarkAllowance& parent = {});
+ // The explicit envelope already includes this descriptor (e.g. a batch session).
+ [[nodiscard]] static std::shared_ptr<ArtifactLease> acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkAllowance admitted);
+ [[nodiscard]] const BenchmarkAllowance& allowance() const noexcept { return allowance_; }
 
 private:
  explicit ArtifactLease(int descriptor) noexcept;
  void release() noexcept;
+ BenchmarkAllowance allowance_;
  mmltk::common::io::ScopedFd descriptor_;
 };
 void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation cancellation);
 // Allocation and capacity failures cannot become cache misses or transfer retries.
 [[nodiscard]] bool is_benchmark_capacity_failure(const std::exception& error) noexcept;
-void write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value, mmltk::common::concurrency::CancellationObservation cancellation);
+void write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value, mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage = nullptr);
 [[nodiscard]] nlohmann::json read_json_file(const std::filesystem::path& path);
 [[nodiscard]] bool is_safe_cache_component(std::string_view value) noexcept;
 template <class Builder>

@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/pch_linux.h"
 #include "src/pch_std.h"
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
@@ -118,13 +119,14 @@ struct TracePath final {
 }
 void acquire_physical_inventory(AdmittedRecipeArchive& admitted, std::vector<CoconutPhysicalImage>& inventory, const BenchmarkCacheLayout& cache, ProgressReporter& progress,
  ArtifactProgressTotals& totals, StorageReservationPool& storage, std::size_t workers, common_concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
- std::string_view recovery_reason = {}, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkCompilePipeline::Allowance& parent = {}) {
+ std::string_view recovery_reason = {}, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {}) {
  const auto& archive = admitted.origin;
  const auto owner = benchmark_source_name(archive.artifact.source);
  auto request = make_download_request(cache, owner, archive.artifact);
  const auto inventory_path = cache.source_indexes(owner) / (archive.artifact.artifact_id + ".inventory.bin");
- auto inventory_handle = execution ? execution->reserve(BenchmarkResources::handles(1, true, 12), parent) : BenchmarkCompilePipeline::Allowance{};
- auto lease = ArtifactLease::acquire(cache.locks / (archive.artifact.artifact_id + ".inventory.lock"), cancellation);
+ auto lease = ArtifactLease::acquire_charged(cache.locks / (archive.artifact.artifact_id + ".inventory.lock"), cancellation, execution,
+  BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors), parent);
+ const auto& inventory_handle = lease->allowance();
  const auto diagnose = [&](std::string_view reason) {
   if (std::filesystem::is_regular_file(request.destination)) {
    const auto digest = common_io::sha256_hex(common_io::sha256_file(request.destination, [&] { return cancellation.requested(); }));
@@ -133,7 +135,7 @@ void acquire_physical_inventory(AdmittedRecipeArchive& admitted, std::vector<Coc
  };
  const auto invalidate = [&](std::string_view reason) {
   diagnose(reason);
-  invalidate_download_artifact(request, cancellation, trace);
+  invalidate_download_artifact(request, cancellation, trace, execution, inventory_handle);
   remove_cache_path(inventory_path);
   request.redownload = true;
  };
@@ -150,7 +152,7 @@ void acquire_physical_inventory(AdmittedRecipeArchive& admitted, std::vector<Coc
   progress.phase(DatasetCompilePhase::Downloading);
   {
    admitted.download = download_artifacts(
-    {request}, workers, cancellation, progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const auto& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, inventory_handle)
+    {request}, workers, cancellation, progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const auto& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, inventory_handle, &storage)
                         .front();
   }
   try {
@@ -187,18 +189,18 @@ public:
  StorageReservationPool* storage_reservations, const std::uint64_t source_total_images, const std::size_t decompression_workers, const std::size_t cache_write_workers,
  const std::size_t download_connections, const BenchmarkTraceSink& trace, const std::optional<ImageDecodeProbe> decode_probe = std::nullopt, const bool require_every_image = false,
  const ArchiveImageIdParser& member_parser = {}, std::string_view completion_slot = {}, AdmittedRecipeArchive* admitted_archive = nullptr, const CachedImageReadySink& image_ready = {},
- const DownloadResult* initial_download = nullptr, std::shared_ptr<ArtifactLease> initial_lease = {}, BenchmarkCompilePipeline* execution = nullptr, BenchmarkCompilePipeline::Allowance initial_allowance = {}) {
+ const DownloadResult* initial_download = nullptr, std::shared_ptr<ArtifactLease> initial_lease = {}, BenchmarkCompilePipeline* execution = nullptr, BenchmarkAllowance initial_allowance = {}) {
  if (expected_ids.empty()) { throw std::runtime_error("benchmark archive extraction cannot have an empty image selection"); }
  if (require_every_image && !admitted_archive) throw std::logic_error("strict image extraction requires an admitted physical owner");
  const std::string source_name(benchmark_source_name(source));
  const std::string archive_name = source_name + " " + shard;
  const std::filesystem::path image_root = cache.source_images(source_name) / shard;
  progress->source_activity(source, "Waiting for " + archive_name + " extraction lock");
- auto source_handle = std::move(initial_allowance);
- if (execution && initial_lease && !source_handle) throw std::logic_error("prefetched image lease has no continuation allowance");
- if (execution && !source_handle) source_handle = execution->reserve(BenchmarkResources::handles(1, true, 12));
- auto extraction_lease = initial_lease ? std::move(initial_lease) :
-  source_handle.retain(ArtifactLease::acquire(cache.locks / (source_name + "-" + shard + ".images.lock"), cancel_requested));
+ auto extraction_lease = initial_lease ? std::move(initial_lease) : initial_allowance ?
+  ArtifactLease::acquire_charged(cache.locks / (source_name + "-" + shard + ".images.lock"), cancel_requested, std::move(initial_allowance)) :
+  ArtifactLease::acquire_charged(cache.locks / (source_name + "-" + shard + ".images.lock"), cancel_requested, execution,
+   BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
+ const auto& source_handle = extraction_lease->allowance();
  const auto generation = execution ? execution->source_generation(image_root) : 0;
  const auto replacement_generation = execution && decode_probe ? execution->image_generation(image_root, decode_probe->image_id) : generation;
  const auto image_generation = [=](std::uint64_t id) { return decode_probe && decode_probe->image_id == id ? replacement_generation : generation; };
@@ -238,10 +240,8 @@ public:
   };
  }
  DownloadRequest request = make_download_request(cache, source_name, artifact);
- // Exact image staging reservations belong to each atomic cache write. The
- // download promise follows its .part/final inode as physical allocation grows.
- auto storage_reservation = admitted_archive || initial_download || (execution && artifact.expected_size) ? StorageReservationPool::Reservation{} :
-  storage_reservations->reserve_download(request.destination, artifact.expected_size ? artifact.expected_size : kArchiveScratchBytes, "pending image archive");
+ // Unknown source sizes keep the prior source-specific staging estimate.
+ request.storage_estimate = artifact.expected_size ? 0 : kArchiveScratchBytes;
  std::optional<DownloadResult> retained = initial_download ? std::optional(*initial_download) : std::nullopt;
  std::exception_ptr last_error;
  const std::uint32_t extraction_attempts = admitted_archive ? 1U : 3U;
@@ -252,7 +252,7 @@ public:
    if (!admitted_archive && !retained) {
     progress->source_activity(source, "Downloading " + archive_name + " image archive with " + std::to_string(download_connections) + " download connections");
     retained = download_artifacts({request}, download_connections, cancel_requested,
-     progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { transfer_progress->update(update, *progress); }} : DownloadProgressSink{}, trace, {}, execution, source_handle)
+     progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { transfer_progress->update(update, *progress); }} : DownloadProgressSink{}, trace, {}, execution, source_handle, storage_reservations)
                 .front();
    }
    progress->source_activity(source, "Opening " + archive_name + " image archive");
@@ -335,7 +335,7 @@ public:
    }
    if (attempt == 3U) { break; }
    progress->source_activity(source, "Repairing " + archive_name + " extraction for retry " + std::to_string(attempt + 1U));
-   invalidate_download_artifact(request, cancel_requested, trace);
+   invalidate_download_artifact(request, cancel_requested, trace, execution, source_handle);
    retained.reset();
    request.redownload = true;
    // The root is shared by selections. Archive corruption invalidates
@@ -388,7 +388,7 @@ SourceCompileCount append_source_plan(const NormalizedAnnotationIndex& index, co
   }
  }
  SourceCompileCount counts{index.source, index.images.size(), 0U, 0U};
- auto scratch_allowance = execution ? execution->reserve({std::uint64_t{resolution} * resolution + std::uint64_t{resolution} * 8, 0}) : BenchmarkCompilePipeline::Allowance{};
+ auto scratch_allowance = execution ? execution->reserve({std::uint64_t{resolution} * resolution + std::uint64_t{resolution} * 8, 0}) : BenchmarkAllowance{};
  std::vector<PlannedBenchmarkInstance> image_labels;
  dataset::MaskResizeScratch mask_resize_scratch;
  std::size_t unavailable_index = 0U;
@@ -566,7 +566,7 @@ void write_split_with_progress(BenchmarkSplitWriter& writer, const BenchmarkWrit
 }  // namespace
 bool archive_selection_allows_quarantine(const BenchmarkDatasetSource source, const std::string_view split) noexcept { return source != BenchmarkDatasetSource::kCoco2017 || split == "train2017"; }
 void publish_benchmark_manifest(const BenchmarkCompilerConfig& config, const std::filesystem::path& staging_dir, const std::filesystem::path& cache_root, nlohmann::json facts,
- const common_concurrency::CancellationObservation cancelled) {
+ const common_concurrency::CancellationObservation cancelled, StorageReservationPool* storage) {
  facts["schema_version"] = 3U;
  facts["compiled_format_version"] = FORMAT_VERSION;
  facts["normalized_annotation_version"] = kNormalizedAnnotationIndexVersion;
@@ -586,7 +586,7 @@ void publish_benchmark_manifest(const BenchmarkCompilerConfig& config, const std
   if (!facts.contains("source_catalog")) facts["source_catalog"] = source_catalog_manifest(custom_recipe_catalog());
   facts["recipe"] = {{"dataset", "coco-custom"}};
  }
- write_json_atomically(staging_dir / "benchmark_manifest.json", facts, cancelled);
+ write_json_atomically(staging_dir / "benchmark_manifest.json", facts, cancelled, storage);
 }
 }  // namespace benchmark_internal
 void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config, const CoconutRecipeCatalog* explicit_catalog, const CustomRecipeCatalog* explicit_custom_catalog,
@@ -701,14 +701,14 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   std::vector<CoconutPhysicalImage> inventory;
   auto& physical_progress = progress.transfers();
   StorageReservationPool physical_storage(cache.root, trace, &pipeline.storage());
-  BenchmarkCompilePipeline::Allowance preparation_allowance;
+  BenchmarkAllowance preparation_allowance;
   std::shared_ptr<CoconutRecipeInputs> retained_annotation_inputs;
   StopFailedAttempt stop_failed_inputs{cancel_signal, pipeline};
   const auto input_budget = coconut ? coconut_catalog.releases.size() : std::size_t{2};
   const auto acquire_annotations = [&] {
    // Release controllers retain source leases until activation. Protect their
    // inventory/original-index prerequisite before admitting those controllers.
-   preparation_allowance = pipeline.reserve(BenchmarkResources::handles(0, true, 15));
+   preparation_allowance = pipeline.reserve(BenchmarkResources::handles(0, true, coco_annotation_resources().descriptors + coco_annotation_resources().continuation_descriptors));
    return acquire_coconut_recipe_inputs(cache, coconut_catalog, progress, input_budget, cancel_requested, trace, std::min<std::size_t>(8, effective_num_workers),
     compile_cpus, fail_compile, &pipeline);
   };
@@ -768,7 +768,6 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     struct PrefetchedArchive {
      std::optional<DownloadResult> download;
      std::shared_ptr<ArtifactLease> lease;
-     BenchmarkCompilePipeline::Allowance allowance;
     };
     std::mutex archive_readiness_mutex;
     std::array<bool, 2> prefetched_ready{};
@@ -779,7 +778,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     if (custom_transfer_budget) {
      // Prefetched leases may wait for metadata to select images. Reserve that
      // metadata's existing envelope before either prefetch can retain capacity.
-     preparation_allowance = pipeline.reserve(BenchmarkResources::handles(0, true, 18));
+     preparation_allowance = pipeline.reserve(BenchmarkResources::handles(0, true, custom_annotation_resources().descriptors + custom_annotation_resources().continuation_descriptors));
      const auto cpus = std::span(compile_cpus);
      custom_transfer_worker = std::make_unique<common_concurrency::WorkerPool>(custom_transfer_budget, std::vector<int>(cpus.begin(), cpus.end()), "bench_sources", 2);
      for (std::size_t source = 0; source < 2; ++source)
@@ -802,13 +801,13 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
         // A proof allows the selection-aware owner to admit a warm group without
         // requiring its original archive to remain present.
         if (std::filesystem::is_regular_file(root / ".complete.json")) return PrefetchedArchive{};
-        auto lease_credit = pipeline.reserve(BenchmarkResources::handles(1, true, 12));
-        auto lease = lease_credit.retain(ArtifactLease::acquire(cache.locks / ("coco-" + shard + ".images.lock"), cancel_requested));
+        auto lease = ArtifactLease::acquire_charged(cache.locks / ("coco-" + shard + ".images.lock"), cancel_requested, &pipeline,
+         BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
         const auto request = make_download_request(cache, "coco", source ? custom_catalog.coco_val_images : custom_catalog.coco_train_images);
         auto download = download_artifacts({request}, std::min<std::size_t>(8, effective_num_workers), cancel_requested,
-         progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { physical_progress.update(update, progress); }} : DownloadProgressSink{}, trace, {}, &pipeline, lease_credit)
+         progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { physical_progress.update(update, progress); }} : DownloadProgressSink{}, trace, {}, &pipeline, lease->allowance())
                          .front();
-        return PrefetchedArchive{std::move(download), std::move(lease), std::move(lease_credit)};
+        return PrefetchedArchive{std::move(download), std::move(lease)};
        } catch (...) {
         fail_compile(std::current_exception());
         throw;
@@ -1090,7 +1089,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
        const auto observed = pipeline.admission_generation();
        std::unique_lock lock(archive_readiness_mutex);
        const auto coco_ready = [&](std::size_t source) { return !coco_claimed[source] && (!custom_transfers[source].valid() || prefetched_ready[source]); };
-       std::pair<std::size_t, BenchmarkCompilePipeline::Allowance> selected{archive_tasks.size(), {}};
+       std::pair<std::size_t, BenchmarkAllowance> selected{archive_tasks.size(), {}};
        const auto select = [&] {
         if (cancel_requested.requested()) return true;
         if (!coconut)
@@ -1105,7 +1104,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
          if (pending_prefetch) {
           // A sole controller must stay available to retire a prefetched lease.
           // Claim independent work only with its source allowance already owned.
-          auto grant = pipeline.try_reserve(BenchmarkResources::handles(1, true, 12));
+          auto grant = pipeline.try_reserve(BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
           if (!grant) return false;
           selected.second = std::move(*grant);
          }
@@ -1140,7 +1139,6 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
         try {
          PrefetchedArchive prefetch;
          if (!coconut && task_index < custom_transfers.size() && custom_transfers[task_index].valid()) prefetch = custom_transfers[task_index].get();
-         if (prefetch.allowance) source_allowance = std::move(prefetch.allowance);
          archive_results[task_index] = acquire_archive_images(cache, task.source, task.shard, task.image_ids, task.artifact, cancel_requested, &progress, &image_transfer_progress,
           &cache_storage_reservations, source_total, decompression_workers, archive_cache_workers, archive_download_connections, trace, {}, coconut, archive_member_parser(task), completion_slot,
           task.admitted, image_ready, prefetch.download ? &*prefetch.download : nullptr, std::move(prefetch.lease), &pipeline, std::move(source_allowance));
@@ -1640,7 +1638,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      manifest["quarantined_images"].push_back({{"source", benchmark_source_name(image.source)}, {"image_id", image.image_id}, {"reason", image.reason}});
     }
     progress.activity("Writing benchmark manifest");
-    publish_benchmark_manifest(config, staging_dir, cache.root, std::move(manifest), cancel_requested);
+    publish_benchmark_manifest(config, staging_dir, cache.root, std::move(manifest), cancel_requested, &pipeline.storage());
     progress.phase(DatasetCompilePhase::Syncing, 3U, kSyncStepCount);
     progress.activity("Syncing staged benchmark dataset");
     sync_directory(staging_dir);
