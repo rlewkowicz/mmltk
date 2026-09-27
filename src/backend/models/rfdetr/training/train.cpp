@@ -238,6 +238,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   const std::size_t local_batch_size = rank_slice.count;
   ScopedRuntimeContext worker_scope(&train_runtime);
   std::shared_ptr<mmltk::common::concurrency::WorkerPool> reader_pool;
+  const auto training_file = std::ranges::find(admitted_files, std::filesystem::absolute(options.train_compiled_path), &AdmittedFile::path);
+  if (training_file == admitted_files.end()) throw std::logic_error("training source lacks admitted file metadata");
   auto make_loader_config_for = [&](const std::filesystem::path& compiled_path, size_t loader_batch_size, int prefetch_factor, bool shard_batches, bool drop_last) {
    auto config = make_loader_config(compiled_path.string(), loader_batch_size, false, prefetch_factor, train_runtime.split().gather_threads, train_runtime.loader_affinity_string(),
     options.device_id, static_cast<uint64_t>(options.seed));
@@ -255,8 +257,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     // Training uses explicit randomly drawn schedules, irrespective of the
     // loader's legacy shuffle switch. Preserve that policy for evaluation aliases
     // of the same admitted file; distinct evaluation sources stay sequential.
-    const auto training = std::ranges::find(admitted_files, std::filesystem::absolute(options.train_compiled_path), &AdmittedFile::path);
-    const auto access = admitted->snapshot == training->snapshot ? Dataset::AccessPattern::Random : Dataset::AccessPattern::Sequential;
+    const auto access = admitted->snapshot == training_file->snapshot ? Dataset::AccessPattern::Random : Dataset::AccessPattern::Sequential;
     admitted->dataset = shared != admitted_files.end() ? shared->dataset : std::make_shared<const Dataset>(Dataset::open(admitted->path, access));
    }
    config.source = admitted->dataset;

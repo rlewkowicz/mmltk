@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -15,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <span>
 #include <vector>
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/compiled/compiled_file_layout.h"
@@ -254,7 +256,23 @@ void exercise_schedule_capacity(const std::string& path, const bool h2d) {
 }
 void exercise_independent_completions(const std::string& path, const bool h2d) {
  namespace gpu = mmltk::frameworks::gpu;
- const auto source = CompiledDataset::open(path);
+ // The ordinary roundtrip fixture uses identical RGB stubs. Give each image
+ // in this private copy a distinct marker so destination-order checks can fail.
+ const mmltk::testsupport::ScopedTempDir locality("compiled-locality");
+ const auto locality_path = locality.path() / "images.bin";
+ REQUIRE(fs::copy_file(path, locality_path));
+ {
+  const auto original = CompiledDataset::open(path);
+  std::fstream pixels(locality_path, std::ios::in | std::ios::out | std::ios::binary);
+  for (std::uint32_t index = 0U; index < original.header().num_images; ++index) {
+   const float marker = static_cast<float>(index + 1U) / static_cast<float>(original.header().num_images + 1U);
+   pixels.seekp(static_cast<std::streamoff>(original.image_entry(index).pixel_offset));
+   pixels.write(reinterpret_cast<const char*>(&marker), sizeof(marker));
+  }
+  pixels.flush();
+  REQUIRE(pixels.good());
+ }
+ const auto source = CompiledDataset::open(locality_path);
  const auto stride = static_cast<std::size_t>(source.header().image_stride);
  const std::array reads{CompiledImageRead{3U, 0U}, CompiledImageRead{1U, stride}, CompiledImageRead{3U, 2U * stride}};
  const gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::PrimaryInterop);
@@ -266,7 +284,10 @@ void exercise_independent_completions(const std::string& path, const bool h2d) {
  const mmltk::testsupport::ScopedTestCleanup free_gate([&] { (void)cuMemFree(gate); });
  gpu::ensure_cuda_driver_ok(cuStreamWriteValue32(release_stream, gate, 0U, CU_STREAM_WRITE_VALUE_DEFAULT), "compiled consumer gate initialization");
  releaser.Synchronize();
- std::array<std::promise<std::exception_ptr>, 3> transfers;
+ std::array<std::promise<std::exception_ptr>, 5> transfers;
+ const auto transfer_complete = +[](void* raw, std::size_t, std::exception_ptr error) noexcept {
+  static_cast<std::promise<std::exception_ptr>*>(raw)->set_value(error);
+ };
  std::atomic<bool> consumed{false};
  CompiledImageStream stream({.slots = 2U, .workers = 2U, .device = 0, .loading = data_loading_options(h2d)});
  stream.bind_current_context();
@@ -293,10 +314,8 @@ void exercise_independent_completions(const std::string& path, const bool h2d) {
  CHECK_THROWS_AS(stream.prepare_host(0U, reads.size() * stride), std::logic_error);
  CHECK_THROWS_AS(stream.submit(0U, source, reads, {}), std::logic_error);
  CHECK_THROWS_AS(stream.prepare_images(2U, stride), std::out_of_range);
- for (auto& transfer : transfers) {
-  stream.submit(1U, source, reads, {}, {.context = &transfer, .complete = [](void* raw, std::size_t, std::exception_ptr error) noexcept {
-   static_cast<std::promise<std::exception_ptr>*>(raw)->set_value(error);
-  }});
+ for (auto& transfer : std::span{transfers}.first(3U)) {
+  stream.submit(1U, source, reads, {}, {.context = &transfer, .complete = transfer_complete});
   CHECK_FALSE(mmltk::testsupport::await_test_promise(transfer, "independent compiled transfer"));
   stream.synchronize(1U);
   CHECK_FALSE(consumed.load(std::memory_order_acquire));
@@ -308,6 +327,16 @@ void exercise_independent_completions(const std::string& path, const bool h2d) {
   const auto pixels = stream.host_images(1U);
   for (const auto& read : reads) CHECK(std::memcmp(pixels.data() + read.destination_offset, source.image_pixels(read.index), stride) == 0);
  }
+ const std::array invalid{CompiledImageRead{source.header().num_images, 0U}};
+ stream.submit(1U, source, invalid, {}, {.context = &transfers[3], .complete = transfer_complete});
+ CHECK(mmltk::testsupport::await_test_promise(transfers[3], "independent compiled read failure"));
+ REQUIRE_THROWS_AS(stream.wait_read(1U), std::out_of_range);
+ stream.synchronize(1U);
+ stream.submit(1U, source, reads, {.before = [](void*, std::size_t) { return false; }}, {.context = &transfers[4], .complete = transfer_complete});
+ CHECK_FALSE(mmltk::testsupport::await_test_promise(transfers[4], "independent cancelled compiled read"));
+ REQUIRE_FALSE(stream.wait_read(1U));
+ stream.synchronize(1U);
+ CHECK_FALSE(consumed.load(std::memory_order_acquire));
  gpu::ensure_cuda_driver_ok(cuStreamWriteValue32(release_stream, gate, 1U, CU_STREAM_WRITE_VALUE_DEFAULT), "compiled delayed consumer release");
  stream.synchronize();
  CHECK(consumed.load(std::memory_order_acquire));

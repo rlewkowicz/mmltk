@@ -344,7 +344,12 @@ void CompiledImageStream::bind_current_context() {
     gpu::ensure_cuda_ok(cudaEventCreateWithFlags(event, cudaEventDisableTiming | cudaEventBlockingSync), "compiled image stream event allocation");
   }
   if (impl_->config.loading.h2d_dataloader) gpu::ensure_cuda_ok(gpu::cuda_stream_create_with_highest_priority(&impl_->copy, cudaStreamNonBlocking), "compiled image copy stream");
-  for (const bool consumer : {false, true}) impl_->completions[consumer].worker = std::thread([this, consumer] { impl_->complete_loop(consumer); });
+  for (const bool consumer : {false, true}) {
+   if (consumer || impl_->config.loading.h2d_dataloader)
+    impl_->completions[consumer].worker = std::thread([this, consumer] { impl_->complete_loop(consumer); });
+   else
+    impl_->completions[consumer].started = true;
+  }
   {
    std::unique_lock lock(impl_->mutex);
    impl_->changed.wait(lock, [&] { return std::ranges::all_of(impl_->completions, &Impl::CompletionQueue::started) || impl_->failure; });
