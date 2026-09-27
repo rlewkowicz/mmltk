@@ -1,4 +1,6 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
+#include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -83,7 +85,8 @@ public:
  BenchmarkSplitWriter& operator=(const BenchmarkSplitWriter&) = delete;
  void prepare_lanes(std::size_t);
  void retire_scratch(std::size_t) noexcept;
- [[nodiscard]] std::shared_ptr<BenchmarkPixelInput> prepare_pixel(std::size_t slot, std::size_t lane);
+ [[nodiscard]] std::shared_ptr<BenchmarkPixelInput> prepare_pixel(std::size_t slot, std::size_t lane,
+  BenchmarkSourcePublication publication = {}, BenchmarkAllowance allowance = {});
  [[nodiscard]] std::uint64_t pixel_workspace_bytes(const BenchmarkPixelInput&) const;
  void write_pixel(std::size_t slot, std::size_t lane, const std::shared_ptr<BenchmarkPixelInput>&);
  void write_pixel(std::size_t slot, std::size_t lane);

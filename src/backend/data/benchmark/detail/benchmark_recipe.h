@@ -6,7 +6,6 @@
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
-#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
 #include <span>
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
@@ -28,6 +27,7 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 namespace mmltk::backend::data::benchmark_internal {
+class BenchmarkCompilePipeline;
 [[nodiscard]] BenchmarkResources custom_annotation_resources();
 struct CustomRecipeCatalog {
  CatalogArtifact coco_annotations, coco_train_images, coco_val_images, objects_annotations, open_images_boxes, open_images_classes;

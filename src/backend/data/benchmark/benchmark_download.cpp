@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include <curl/curl.h>
 #include "src/pch_linux.h"
 #include "src/pch_std.h"

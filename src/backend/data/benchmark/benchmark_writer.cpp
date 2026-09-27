@@ -111,10 +111,16 @@ PackedInstance benchmark_canvas_box(
  return result;
 }
 struct BenchmarkPixelInput {
+ // Reverse destruction order releases mapped bytes and the descriptor before
+ // their allowance and finally the physical source mutation lease.
+ BenchmarkSourcePublication publication;
+ BenchmarkAllowance allowance;
  common_io::FileHandle file;
  common_io::MappedByteRegion mapping;
  std::span<const std::uint8_t> encoded;
  BenchmarkImageHeader header;
+ BenchmarkPixelInput(BenchmarkSourcePublication source, BenchmarkAllowance credits)
+  : publication(std::move(source)), allowance(std::move(credits)) {}
 };
 struct BenchmarkSplitWriter::Impl {
  struct Scratch {
@@ -198,13 +204,14 @@ void BenchmarkSplitWriter::retire_scratch(std::size_t lane) noexcept { impl_->sc
 void BenchmarkSplitWriter::prepare_lanes(std::size_t lanes) {
  while (impl_->scratch.size() < lanes) impl_->scratch.push_back(std::make_unique<Impl::Scratch>(impl_->perceptual));
 }
-std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::size_t slot, std::size_t lane) {
+std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::size_t slot, std::size_t lane,
+ BenchmarkSourcePublication publication, BenchmarkAllowance allowance) {
  auto& state = *impl_;
  auto& image = state.images.at(slot);
  if (image_complete(slot)) return {};
  throw_if_benchmark_cancelled(state.cancellation);
  auto& scratch = state.lane_scratch(lane);
- auto input = std::make_shared<BenchmarkPixelInput>();
+ auto input = std::make_shared<BenchmarkPixelInput>(std::move(publication), std::move(allowance));
  try {
   // The mapping and its opened inode survive header admission and queued pixel
   // work. Header parsing touches only its necessary source bytes; there is no

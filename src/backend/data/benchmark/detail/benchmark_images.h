@@ -16,8 +16,8 @@
 #include <vector>
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
-#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 namespace mmltk::backend::data::benchmark_internal {
+class BenchmarkCompilePipeline;
 class StorageReservationPool;
 // Parses the "quarantined" manifest array shared by the cached-image manifests: each record must
 // carry a reason and reference a requested image id. Returns false when the array is malformed.

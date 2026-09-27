@@ -9,12 +9,13 @@
 #include <string>
 #include <vector>
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
-#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/compiler/dataset_compile_progress.h"
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include <string_view>
 #include <stdexcept>
 namespace mmltk::backend::data::benchmark_internal {
+class BenchmarkCompilePipeline;
+class StorageReservationPool;
 // Only remote/source unavailability or rejected response content. Local setup, allocation,
 // invalid requests, callback failures, storage failures, and cancellation propagate
 // separately and must never permit optional-source omission.

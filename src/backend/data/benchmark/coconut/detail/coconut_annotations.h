@@ -1,7 +1,6 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
-#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/compiled/compiled_format.h"
@@ -19,6 +18,8 @@
 #include <utility>
 #include <unordered_map>
 namespace mmltk::backend::data::benchmark_internal {
+class BenchmarkCompilePipeline;
+class StorageReservationPool;
 class CoconutPhysicalMembershipError final : public std::runtime_error {
 public:
  CoconutPhysicalMembershipError(CoconutImageNamespace source, std::uint64_t image_id, std::string message) : std::runtime_error(std::move(message)), source_(source), image_id_(image_id) {}

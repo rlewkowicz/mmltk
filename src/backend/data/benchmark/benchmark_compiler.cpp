@@ -188,8 +188,7 @@ public:
  const CatalogArtifact& artifact, mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, ArtifactProgressTotals* transfer_progress,
  StorageReservationPool* storage_reservations, const std::uint64_t source_total_images, const std::size_t decompression_workers, const std::size_t cache_write_workers,
  const std::size_t download_connections, const BenchmarkTraceSink& trace, const std::optional<ImageDecodeProbe> decode_probe = std::nullopt, const bool require_every_image = false,
- const ArchiveImageIdParser& member_parser = {}, std::string_view completion_slot = {}, AdmittedRecipeArchive* admitted_archive = nullptr, const CachedImageReadySink& image_ready = {},
- const DownloadResult* initial_download = nullptr, std::shared_ptr<ArtifactLease> initial_lease = {}, BenchmarkCompilePipeline* execution = nullptr, BenchmarkAllowance initial_allowance = {}) {
+ const ArchiveImageIdParser& member_parser = {}, std::string_view completion_slot = {}, AdmittedRecipeArchive* admitted_archive = nullptr, const DownloadResult* initial_download = nullptr, std::shared_ptr<ArtifactLease> initial_lease = {}, BenchmarkCompilePipeline* execution = nullptr, BenchmarkAllowance initial_allowance = {}) {
  if (expected_ids.empty()) { throw std::runtime_error("benchmark archive extraction cannot have an empty image selection"); }
  if (require_every_image && !admitted_archive) throw std::logic_error("strict image extraction requires an admitted physical owner");
  const std::string source_name(benchmark_source_name(source));
@@ -201,17 +200,9 @@ public:
   ArtifactLease::acquire_charged(cache.locks / (source_name + "-" + shard + ".images.lock"), cancel_requested, execution,
    BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
  const auto& source_handle = extraction_lease->allowance();
- const auto generation = execution ? execution->source_generation(image_root) : 0;
- const auto replacement_generation = execution && decode_probe ? execution->image_generation(image_root, decode_probe->image_id) : generation;
- const auto image_generation = [=](std::uint64_t id) { return decode_probe && decode_probe->image_id == id ? replacement_generation : generation; };
- const CachedImageReadySink publish_image = image_ready ? CachedImageReadySink{[&, extraction_lease, image_generation](const CachedImageReady& image) {
-  auto owned = image;
-  owned.custody = extraction_lease;
-  owned.generation = image_generation(image.image_id);
-  owned.defer_pixels = execution != nullptr;
-  image_ready(owned);
- }}
-                                                        : CachedImageReadySink{};
+ const auto publication = execution ? execution->source_publication(image_root, extraction_lease,
+  decode_probe ? std::optional(decode_probe->image_id) : std::nullopt, true) : BenchmarkSourcePublication{};
+ const CachedImageReadySink publish_image = publication ? CachedImageReadySink{publication} : CachedImageReadySink{};
  const auto completion =
   require_every_image ? image_root / ".recipe-proofs" / (std::string(completion_slot) + "-" + cached_image_selection_digest(expected_ids) + ".json") : image_root / ".complete.json";
  if (decode_probe) {
@@ -288,7 +279,7 @@ public:
       probe_validator.validate_decodable(encoded, decode_probe->expected_width, decode_probe->expected_height);
      } else {
       const auto dimensions = image_validator.read_header(encoded);
-      if (execution) execution->geometry_ready({image_root, image_id, image_generation(image_id), dimensions.first, dimensions.second});
+      publication.geometry_ready(image_id, dimensions);
      }
     } catch (const InvalidImageError& error) {
      if (decode_probe && decode_probe->image_id == image_id && !quarantine_unavailable) {
@@ -1014,7 +1005,6 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     pipeline.membership_ready();
     pipeline.register_split(train_writer, pixel_train);
     pipeline.register_split(validation_writer, pixel_validation);
-    const CachedImageReadySink image_ready = [&](const CachedImageReady& image) { pipeline.image_ready(image); };
     std::vector<std::optional<CachedImageDirectory>> archive_results(archive_tasks.size());
     std::array<PreparedBenchmarkSplit, 4> custom_label_plans;
     std::array<SourceCompileCount, 4> custom_label_counts{};
@@ -1075,7 +1065,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       try {
        const auto cpus = pipeline.cpus();
        common_system::set_thread_affinity(std::vector<int>(cpus.begin(), cpus.end()));
-       open_image_result = acquire_open_images(cache, *open_images, &quarantined, cancel_requested, &progress, acquisition_num_workers, open_cache_workers, trace, {}, image_ready, &pipeline);
+       open_image_result = acquire_open_images(cache, *open_images, &quarantined, cancel_requested, &progress, acquisition_num_workers, open_cache_workers, trace, {}, &pipeline);
        prepare_source_labels(2, *open_images, {open_image_result->directory});
       } catch (...) { record_pipeline_error(); }
      });
@@ -1141,7 +1131,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
          if (!coconut && task_index < custom_transfers.size() && custom_transfers[task_index].valid()) prefetch = custom_transfers[task_index].get();
          archive_results[task_index] = acquire_archive_images(cache, task.source, task.shard, task.image_ids, task.artifact, cancel_requested, &progress, &image_transfer_progress,
           &cache_storage_reservations, source_total, decompression_workers, archive_cache_workers, archive_download_connections, trace, {}, coconut, archive_member_parser(task), completion_slot,
-          task.admitted, image_ready, prefetch.download ? &*prefetch.download : nullptr, std::move(prefetch.lease), &pipeline, std::move(source_allowance));
+          task.admitted, prefetch.download ? &*prefetch.download : nullptr, std::move(prefetch.lease), &pipeline, std::move(source_allowance));
          archive_labels_ready(task_index);
         } catch (...) {
          record_pipeline_error();
@@ -1154,7 +1144,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     if (!coconut && !overlap_open_images && !pipeline_error) {
      try {
       common_concurrency::parallel_for_range_indexed<int>(0, 1, 1, pipeline.cpus(), [&](int, int, int) {
-       open_image_result = acquire_open_images(cache, *open_images, &quarantined, cancel_requested, &progress, acquisition_num_workers, open_cache_workers, trace, {}, image_ready, &pipeline);
+       open_image_result = acquire_open_images(cache, *open_images, &quarantined, cancel_requested, &progress, acquisition_num_workers, open_cache_workers, trace, {}, &pipeline);
        prepare_source_labels(2, *open_images, {open_image_result->directory});
       });
      } catch (...) { record_pipeline_error(); }
@@ -1431,7 +1421,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      if (open_image_result && source_root == open_image_result->directory.path) {
       progress.source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Repairing failed Open Images JPEG " + std::to_string(error.source_image_id()));
       std::vector<QuarantinedImage> repaired_quarantined;
-      AcquiredOpenImages repaired = acquire_open_images(cache, *open_images, &repaired_quarantined, cancel_requested, &progress, acquisition_num_workers, open_cache_workers, trace, decode_probe, image_ready, &pipeline);
+      AcquiredOpenImages repaired = acquire_open_images(cache, *open_images, &repaired_quarantined, cancel_requested, &progress, acquisition_num_workers, open_cache_workers, trace, decode_probe, &pipeline);
       quarantined = std::move(repaired_quarantined);
       open_image_result = std::move(repaired);
       open_image_directories.front() = open_image_result->directory;
@@ -1450,7 +1440,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      progress.source_activity(task->source, "Repairing failed cached JPEG " + std::to_string(error.source_image_id()) + " from " + task->shard);
      CachedImageDirectory repaired = acquire_archive_images(cache, task->source, task->shard, task->image_ids, task->artifact, cancel_requested, &progress, &repair_transfer_progress,
       &cache_storage_reservations, source_totals.at(task->source), decompression_workers, archive_cache_workers, archive_download_connections, trace, decode_probe, coconut,
-      archive_member_parser(*task), completion_slot, task->admitted, image_ready, nullptr, {}, &pipeline);
+      archive_member_parser(*task), completion_slot, task->admitted, nullptr, {}, &pipeline);
      if (repaired.image_count + repaired.quarantined.size() != task->image_ids.size()) {
       throw std::runtime_error(
        "archive repair did not resolve every selected "

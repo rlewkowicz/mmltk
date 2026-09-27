@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"

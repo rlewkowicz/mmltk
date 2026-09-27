@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_writer.h"
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
@@ -3776,7 +3777,7 @@ TEST_CASE("COCONut JSON parsing yields one shared CPU before its source pass fin
  auto work = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
  const mmltk::testsupport::ScopedTestCleanup release([&] { entered.Release(); later.Release(); });
  REQUIRE(entered.WaitEntered(std::chrono::seconds(2)));
- execution.image_ready({images, 7, {}, execution.source_generation(images), {}, true});
+ execution.source_publication(images, {})({images, 7, {}, true});
  entered.Release();
  REQUIRE(later.WaitEntered(std::chrono::seconds(2)));
  CHECK(writer.image_complete(0));

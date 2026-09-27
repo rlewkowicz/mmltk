@@ -4,7 +4,6 @@
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
-#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -15,6 +14,8 @@
 #include <string_view>
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
+class BenchmarkCompilePipeline;
+class StorageReservationPool;
 class ProgressReporter;
 class ArtifactProgressTotals;
 [[nodiscard]] std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequest>, BenchmarkDatasetSource, std::string_view, ProgressReporter&, ArtifactProgressTotals&, std::size_t,

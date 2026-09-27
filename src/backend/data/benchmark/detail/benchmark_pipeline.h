@@ -1,8 +1,6 @@
 #pragma once
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
-#include "src/backend/data/benchmark/detail/benchmark_writer.h"
-#include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +12,9 @@
 #include <stdexcept>
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
+class BenchmarkSplitWriter;
+struct PreparedBenchmarkSplit;
+class StorageReservationPool;
 // Only runnable CPU work enters this owner. Source controllers retain their I/O,
 // locks and dependency waits outside its lanes. Stages are scheduling policy,
 // never a replacement for recipe/source ownership or a product task graph.
@@ -23,6 +24,7 @@ public:
 };
 enum class BenchmarkStage : std::uint8_t { Metadata, Header, Pixels, Normalize, Recovery, Labels, Archive, CacheWrite, Count };
 class BenchmarkCompilePipeline final {
+ friend class BenchmarkSourcePublication;
  struct Admission;
  using Credits = BenchmarkAllowance::Credits;
  friend class BenchmarkAllowance;
@@ -64,7 +66,10 @@ public:
  void cooperate();
  void membership_ready();
  void register_split(BenchmarkSplitWriter&, const PreparedBenchmarkSplit&);
- void image_ready(const CachedImageReady&);
+ // Capture once while the producer holds its physical mutation lease. A repair
+ // captures only its replacement image; all other events keep the source epoch.
+ [[nodiscard]] BenchmarkSourcePublication source_publication(const std::filesystem::path&, std::shared_ptr<const ArtifactLease>,
+  std::optional<std::uint64_t> repaired_image = {}, bool defer_pixels = false);
  [[nodiscard]] BenchmarkSourceGeneration source_generation(const std::filesystem::path&);
  [[nodiscard]] BenchmarkSourceGeneration image_generation(const std::filesystem::path&, std::uint64_t);
  void retire_image(const std::filesystem::path&, std::uint64_t);
