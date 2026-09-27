@@ -515,7 +515,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   auto group_concurrency = transfer_concurrency;
   BenchmarkCompilePipeline::Allowance group_work;
   if (execution) std::tie(group_concurrency, group_work) = execution->reserve_transfers(transfer_concurrency, 8, kMaximumOpenImagesJpegBytes * 2 + 262144,
-   common_math::checked_add(group.size() * 1024U, repair_workspace, "Open Images group workspace overflow"));
+   common_math::checked_add(group.size() * 1024U, repair_workspace, "Open Images group workspace overflow"), group_handles);
   const auto generation = execution ? execution->source_generation(image_root) : 0;
   const auto replacement_generation = execution && decode_probe ? execution->image_generation(image_root, decode_probe->image_id) : generation;
   std::optional<CachedImageReady> repaired_ready;

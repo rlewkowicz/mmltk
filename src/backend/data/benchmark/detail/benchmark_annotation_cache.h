@@ -3,6 +3,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
+#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -16,13 +17,13 @@ namespace mmltk::backend::data::benchmark_internal {
 class ProgressReporter;
 class ArtifactProgressTotals;
 [[nodiscard]] std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequest>, BenchmarkDatasetSource, std::string_view, ProgressReporter&, ArtifactProgressTotals&, std::size_t,
- mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, BenchmarkCompilePipeline* execution = nullptr);
+ mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkCompilePipeline::Allowance& parent = {});
 [[nodiscard]] std::string extract_archive_member(const std::filesystem::path&, std::string_view, const std::filesystem::path&, std::string_view, const std::filesystem::path&,
- mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr);
+ mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkCompilePipeline::Allowance& parent = {});
 [[nodiscard]] std::optional<NormalizedAnnotationIndex> discover_cached_index(
  const std::filesystem::path&, BenchmarkDatasetSource, std::string_view, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
 [[nodiscard]] NormalizedAnnotationIndex load_or_build_index(const BenchmarkCacheLayout&, const std::filesystem::path&, BenchmarkDatasetSource, std::string_view, std::string_view,
- mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, const std::function<NormalizedAnnotationIndex()>&, StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr);
+ mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, const std::function<NormalizedAnnotationIndex()>&, StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkCompilePipeline::Allowance& parent = {});
 // Three body attempts; cancellation and local capacity failures never repair source data.
 void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservation, const std::function<void()>&, const std::function<void(const std::exception&)>&);
 enum class CocoSplitAdmission : std::uint8_t { Unselected, Optional, Required };
@@ -41,7 +42,7 @@ struct CocoAnnotationIndexes {
 class CocoAnnotationCache final {
 public:
  CocoAnnotationCache(const BenchmarkCacheLayout&, const CatalogArtifact&, CocoAnnotationRequest, std::uint32_t train_count, std::uint32_t validation_count, int parse_workers,
-  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, BenchmarkCompilePipeline* execution = nullptr);
+  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkCompilePipeline::Allowance& parent = {});
  void discover(ProgressReporter&);
  [[nodiscard]] std::uint64_t completed_indexes() const noexcept;
  [[nodiscard]] const std::optional<DownloadRequest>& pending_download() const noexcept { return pending_; }
@@ -62,6 +63,7 @@ private:
  int parse_workers_;
  mmltk::common::concurrency::CancellationObservation cancellation_;
  const BenchmarkTraceSink& trace_;
+ BenchmarkCompilePipeline::Allowance allowance_;
  ArtifactLease lease_;
  BenchmarkCompilePipeline* execution_ = nullptr;
  CocoAnnotationIndexes indexes_;

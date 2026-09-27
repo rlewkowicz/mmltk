@@ -3257,7 +3257,7 @@ TEST_CASE("filesystem reservation follows allocation that is later withdrawn", "
 TEST_CASE("descriptor continuations admit a feasible transfer minimum before source work", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 16});
  auto source = execution.reserve(BenchmarkResources::handles(1, true, 11));
- auto [connections, transfer] = execution.reserve_transfers(8, 8, 64);
+ auto [connections, transfer] = execution.reserve_transfers(8, 8, 64, 0, source);
  CHECK(connections == 1);
  bool consumed = false;
  execution.run(BenchmarkStage::Header, {}, [&](std::size_t) { consumed = true; }, transfer);
@@ -3267,6 +3267,100 @@ TEST_CASE("descriptor continuations admit a feasible transfer minimum before sou
  BenchmarkCompilePipeline impossible(1, {}, {.transient_bytes = 32, .descriptors = 8});
  CHECK_THROWS(impossible.reserve(BenchmarkResources::handles(1, true, 11)));
  CHECK_THROWS(impossible.reserve_transfers(1, 8, 64));
+}
+
+TEST_CASE("live descriptor commitments follow copied parents and nested dependent draws", "[backend][data][benchmark][pipeline]") {
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 16});
+ auto source = execution.reserve(BenchmarkResources::handles(1, true, 11));
+ auto copied = source;
+ CHECK_FALSE(execution.try_reserve({0, 11, true}).has_value());
+ // Consumers can occupy reserved headroom without obstructing the promised
+ // producer completion. Copies all draw from the same remaining commitment.
+ auto consumer = execution.reserve({0, 4});
+ auto [connections, transfer] = execution.reserve_transfers(8, 8, 64, 0, copied);
+ CHECK(connections == 1);
+ CHECK_FALSE(execution.try_reserve({0, 1}, source).has_value());
+ transfer = {};
+ auto directory = execution.reserve(BenchmarkResources::handles(2, true, 2), source);
+ auto stream = execution.reserve({0, 2, true}, directory);
+ auto rest = execution.reserve({0, 7, true}, copied);
+ CHECK_FALSE(execution.try_reserve({0, 1}, copied).has_value());
+ CHECK_FALSE(execution.try_reserve({0, 1}, directory).has_value());
+ // Returning a grandchild makes only that parent's promise available again.
+ stream = {};
+ CHECK_FALSE(execution.try_reserve({0, 1}, copied).has_value());
+ CHECK(execution.try_reserve({0, 2, true}, directory).has_value());
+ directory = {};
+ CHECK(execution.try_reserve({0, 4, true}, source).has_value());
+ source = {};
+ copied = {};
+ CHECK_FALSE(execution.try_reserve({0, 6}).has_value());
+ rest = {};
+ consumer = {};
+ CHECK(execution.try_reserve({32, 16}).has_value());
+}
+
+TEST_CASE("dependent transfer concurrency can also use uncommitted capacity", "[backend][data][benchmark][pipeline]") {
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1024, .descriptors = 32});
+ auto source = execution.reserve(BenchmarkResources::handles(1, true, 11));
+ auto [connections, transfer] = execution.reserve_transfers(8, 8, 64, 0, source);
+ CHECK(connections == 5);
+ CHECK(transfer.bytes() == 320);
+ CHECK_FALSE(execution.try_reserve({0, 1, true}).has_value());
+ transfer = {};
+ CHECK(execution.try_reserve({0, 12, true}).has_value());
+ CHECK_FALSE(execution.try_reserve({0, 13, true}).has_value());
+}
+
+TEST_CASE("transferred allowances enforce producer and available continuation strength", "[backend][data][benchmark][pipeline]") {
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 16});
+ auto consumer = execution.reserve({16, 1});
+ bool invoked = false;
+ CHECK_THROWS_AS(execution.run(BenchmarkStage::Metadata, {16, 1, true}, [&](std::size_t) { invoked = true; }, consumer), std::invalid_argument);
+ CHECK_FALSE(invoked);
+ bool nested_rejected = false;
+ execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) {
+  try { execution.for_each(BenchmarkStage::Normalize, 1, {0, 0, true}, [&](std::size_t) { invoked = true; }); }
+  catch (const std::logic_error&) { nested_rejected = true; }
+ }, consumer);
+ CHECK(nested_rejected);
+ CHECK_FALSE(invoked);
+ consumer = {};
+ auto producer = execution.reserve({16, 1, true, 0, false, 3});
+ auto child = execution.reserve({0, 2, true}, producer);
+ CHECK_THROWS_AS(execution.run(BenchmarkStage::Metadata, {16, 1, true, 0, false, 2}, [&](std::size_t) { invoked = true; }, producer), std::invalid_argument);
+ execution.run(BenchmarkStage::Metadata, {16, 1, true, 0, false, 1}, [&](std::size_t) { invoked = true; }, producer);
+ CHECK(invoked);
+ child = {};
+ bool nested_valid = false;
+ execution.run(BenchmarkStage::Metadata, {16, 1, true, 0, false, 3}, [&](std::size_t) {
+  execution.for_each(BenchmarkStage::Normalize, 1, {16, 1, true, 0, false, 3}, [&](std::size_t) { nested_valid = true; });
+ }, producer);
+ CHECK(nested_valid);
+ BenchmarkCompilePipeline other(1, {}, {.descriptors = 16});
+ CHECK_THROWS_AS(other.try_reserve({0, 1}, producer), std::invalid_argument);
+ CHECK_THROWS_AS(other.reserve({0, 1}, producer), std::invalid_argument);
+ CHECK_THROWS_AS(other.reserve_transfers(1, 8, 1, 0, producer), std::invalid_argument);
+}
+
+TEST_CASE("dependent commitments return on callback error and cancelled admission", "[backend][data][benchmark][pipeline]") {
+ std::atomic<bool> cancelled{false};
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 16}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ auto source = execution.reserve(BenchmarkResources::handles(1, true, 11));
+ CHECK_THROWS_WITH([&] {
+  auto child = execution.reserve({32, 11, true}, source);
+  execution.run(BenchmarkStage::Normalize, {32, 11, true}, [](std::size_t) { throw AnnotationDocumentRejected("dependent body failed"); }, std::move(child));
+ }(), "dependent body failed");
+ CHECK_FALSE(execution.try_reserve({0, 11, true}).has_value());
+ auto child = execution.reserve({32, 11, true}, source);
+ bool invoked = false;
+ cancelled.store(true);
+ CHECK_THROWS(execution.run(BenchmarkStage::Normalize, {32, 11, true}, [&](std::size_t) { invoked = true; }, std::move(child)));
+ CHECK_FALSE(invoked);
+ cancelled.store(false);
+ CHECK(execution.try_reserve({32, 11, true}, source).has_value());
+ source = {};
+ CHECK(execution.try_reserve({32, 16}).has_value());
 }
 
 TEST_CASE("failed shared batches withdraw queued siblings and preserve independent sources", "[backend][data][benchmark][pipeline]") {
@@ -3482,4 +3576,322 @@ TEST_CASE("a failed body keeps geometry and reaches repair without another faile
  CHECK(execution.geometry(images, 1)->width == 6);
  CHECK_THROWS_AS(writer.write_remaining(request), BenchmarkImageReadError);
  CHECK(reads == 1);
+}
+
+TEST_CASE("borrowed callback records recycle while an early member remains held", "[backend][data][benchmark][pipeline]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ BenchmarkCompilePipeline execution(2, {}, {.transient_bytes = 128});
+ mmltk::testsupport::TestGate early("early borrowed member"), later("member beyond two lane windows");
+ std::array<std::atomic<unsigned>, 13> visits{};
+ auto work = std::async(std::launch::async, [&] {
+  execution.for_each(BenchmarkStage::Normalize, visits.size(), {32, 0}, [&](std::size_t index) {
+   visits.at(index).fetch_add(1);
+   if (index == 0) early.receipt().ArriveAndWait();
+   if (index + 1 == visits.size()) later.receipt().ArriveAndWait();
+  });
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { early.Release(); later.Release(); });
+ REQUIRE(early.WaitEntered(2s));
+ REQUIRE(later.WaitEntered(2s));
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ for (const auto& count : visits) CHECK(count.load() == 1);
+ later.Release();
+ early.Release();
+ mmltk::testsupport::await_test_future(work, "individually recycled borrowed members");
+ CHECK(execution.try_reserve({128, 0}).has_value());
+}
+
+TEST_CASE("remaining pixel slots advance beyond a held early reader", "[backend][data][benchmark][pipeline]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ mmltk::testsupport::ScopedTempDir root("recycled-pixel-members");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images.clear();
+ for (std::uint64_t id = 1; id <= 9; ++id) {
+  write_cached_image_atomically(cached_image_path(images, id), make_jpeg(240, 8, 8), {});
+  split.images.push_back({id, 16, 8, 0, 0, 0});
+ }
+ BenchmarkCompilePipeline execution(2);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ request.execution = &execution;
+ mmltk::testsupport::TestGate early("early pixel reader"), later("all independent pixels completed");
+ request.image_opened = [&](const fs::path&, std::uint64_t id) { if (id == 1) early.receipt().ArriveAndWait(); };
+ struct Completion {
+  std::atomic<unsigned> count{0};
+  mmltk::testsupport::TestGate& later;
+ } completion{{0}, later};
+ request.progress = {.context = &completion, .image_completed = [](void* opaque) {
+  auto& state = *static_cast<Completion*>(opaque);
+  if (state.count.fetch_add(1) == 7) state.later.receipt().ArriveAndWait();
+ }};
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ auto work = std::async(std::launch::async, [&] { writer.write_remaining(request); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { early.Release(); later.Release(); });
+ REQUIRE(early.WaitEntered(2s));
+ REQUIRE(later.WaitEntered(2s));
+ CHECK_FALSE(writer.image_complete(0));
+ for (std::size_t index = 1; index < split.images.size(); ++index) CHECK(writer.image_complete(index));
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ later.Release();
+ early.Release();
+ mmltk::testsupport::await_test_future(work, "recycled canonical pixel slots");
+ CHECK(writer.completed() == split.images.size());
+}
+
+TEST_CASE("cooperative frames retain outer scratch and its grant through child retirement", "[backend][data][benchmark][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("suspended-scratch");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images = {{1, 16, 8, 0, 0, 0}};
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536});
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ mmltk::testsupport::TestGate outer("reused outer scratch");
+ std::vector<unsigned> scratch;
+ std::size_t retirements = 0;
+ bool retained_after_child = false, outer_charged = false;
+ auto work = std::async(std::launch::async, [&] {
+  execution.for_each(BenchmarkStage::Metadata, 2, {32768, 0}, [&](std::size_t index) {
+   if (index == 0) { scratch.assign(8, 47); return; }
+   require_condition(scratch.size() == 8 && scratch.front() == 47, "adjacent callback lost its retained scratch");
+   outer.receipt().ArriveAndWait();
+   execution.cooperate();
+   execution.cooperate();
+   require_condition(writer.image_complete(0), "cooperative pixel work did not finish");
+   // A larger new consumer would fit if the child had released or replaced the
+   // outer allowance. Suspended storage remains live through both frames.
+   outer_charged = !execution.try_reserve({32769, 0}).has_value();
+   retained_after_child = scratch.size() == 8 && scratch.front() == 47 && retirements == 0;
+  }, [&](std::size_t lane) {
+   require_condition(lane == 0, "scratch retired on another lane");
+   scratch.clear();
+   ++retirements;
+  });
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { outer.Release(); });
+ REQUIRE(outer.WaitEntered(2s));
+ execution.image_ready({images, 1, {}, execution.source_generation(images), {}, true});
+ outer.Release();
+ mmltk::testsupport::await_test_future(work, "suspended outer scratch custody");
+ CHECK(retained_after_child);
+ CHECK(outer_charged);
+ CHECK(scratch.empty());
+ CHECK(retirements == 1);
+ auto entire_target = execution.reserve({65536, 0});
+ CHECK(entire_target.bytes() == 65536);
+ CHECK(writer.image_complete(0));
+}
+
+TEST_CASE("last shared backing releases credits after borrower and execution retirement", "[backend][data][benchmark][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("detached-allowance-custody");
+ const auto lock_path = root.path() / "source.lock";
+ std::shared_ptr<ArtifactLease> last_reader;
+ {
+  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 4});
+  auto allowance = execution.reserve({32, 1, true, 0, false, 2});
+  auto child = execution.reserve({0, 2, true}, allowance);
+  auto backing = child.retain(ArtifactLease::acquire(lock_path, {}));
+  last_reader = backing;
+  execution.run(BenchmarkStage::Normalize, {32, 1}, [](std::size_t) {}, allowance);
+  allowance = {};
+  child = {};
+  backing.reset();
+  CHECK_FALSE(execution.try_reserve({1, 0}).has_value());
+  execution.retire_attempt();
+  CHECK_FALSE(execution.try_reserve({1, 0}).has_value());
+  const std::weak_ptr<ArtifactLease> observer = last_reader;
+  last_reader.reset();
+  CHECK(observer.expired());
+  CHECK(execution.try_reserve({32, 4}).has_value());
+  // A new physical lease then outlives the workers themselves. The previous
+  // weak observer remains alive while its returned charge is reused.
+  auto next = execution.reserve({32, 1, true, 0, false, 2});
+  auto next_child = execution.reserve({0, 2, true}, next);
+  last_reader = next_child.retain(ArtifactLease::acquire(lock_path, {}));
+ }
+ const mmltk::common::io::ScopedFd descriptor(::open(lock_path.c_str(), O_RDWR | O_CLOEXEC));
+ REQUIRE(descriptor.get() >= 0);
+ CHECK(::flock(descriptor.get(), LOCK_EX | LOCK_NB) == -1);
+ CHECK((errno == EWOULDBLOCK || errno == EAGAIN));
+ last_reader.reset();
+ REQUIRE(::flock(descriptor.get(), LOCK_EX | LOCK_NB) == 0);
+ REQUIRE(::flock(descriptor.get(), LOCK_UN) == 0);
+}
+
+TEST_CASE("borrowed scratch failure settles its group before the callback owner leaves", "[backend][data][benchmark][pipeline]") {
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32});
+ bool released = false;
+ CHECK_THROWS_WITH(execution.for_each(BenchmarkStage::Normalize, 1, {32, 0}, [](std::size_t) {}, [&](std::size_t) {
+  released = true;
+  throw AnnotationDocumentRejected("scratch retirement failed");
+ }), "scratch retirement failed");
+ CHECK(released);
+ bool healthy = false;
+ execution.for_each(BenchmarkStage::Labels, 5, {32, 0}, [&](std::size_t) { healthy = true; });
+ CHECK(healthy);
+ CHECK(execution.try_reserve({32, 0}).has_value());
+}
+
+TEST_CASE("cancelled work groups settle queued members and retained scratch", "[backend][data][benchmark][pipeline]") {
+ std::atomic<bool> cancelled{false};
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ mmltk::testsupport::TestGate active("active borrower at cancellation");
+ std::size_t calls = 0, retirements = 0;
+ auto work = std::async(std::launch::async, [&] {
+  execution.for_each(BenchmarkStage::Normalize, 12, {32, 0}, [&](std::size_t) {
+   ++calls;
+   active.receipt().ArriveAndWait();
+  }, [&](std::size_t) { ++retirements; });
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { active.Release(); });
+ REQUIRE(active.WaitEntered(2s));
+ cancelled.store(true);
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ active.Release();
+ CHECK_THROWS(mmltk::testsupport::await_test_future(work, "cancelled group settlement"));
+ CHECK(calls == 1);
+ CHECK(retirements == 1);
+ cancelled.store(false);
+ CHECK(execution.try_reserve({32, 0}).has_value());
+}
+
+TEST_CASE("checked resource admission leaves no partial charge after overflow", "[backend][data][benchmark][pipeline]") {
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 4});
+ BenchmarkResources maximal{std::numeric_limits<std::uint64_t>::max(), 1, false, 0, true};
+ auto retained = execution.reserve(maximal);
+ CHECK_THROWS_AS(execution.try_reserve(BenchmarkResources::handles(1)), std::overflow_error);
+ // Failed byte charging must not consume the remaining descriptors. A legal
+ // oversized data job still coexists with its separately retained control.
+ auto completion = execution.reserve({33, 3});
+ CHECK(completion.bytes() == 33);
+ completion = {};
+ retained = {};
+ CHECK(execution.try_reserve({32, 4}).has_value());
+}
+
+TEST_CASE("writer group admission exceptions join earlier borrowed readers", "[backend][data][benchmark][pipeline]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ mmltk::testsupport::ScopedTempDir root("pixel-group-admission-unwind");
+ auto split = cached_pixel_membership(root.path() / "images");
+ split.images = {{1, 16, 8, 0, 0, 0}};
+ BenchmarkCompilePipeline execution(2);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ mmltk::testsupport::TestGate reader("reader borrowed before malformed tail admission");
+ request.image_opened = [&](const fs::path&, std::uint64_t) { reader.receipt().ArriveAndWait(); };
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ execution.image_ready({split.sources.front().root, 1, {}, execution.source_generation(split.sources.front().root), {}, true});
+ const mmltk::testsupport::ScopedTestCleanup release([&] { reader.Release(); });
+ REQUIRE(reader.WaitEntered(2s));
+ const std::array<std::size_t, 2> slots{0, split.images.size()};
+ auto work = std::async(std::launch::async, [&] { execution.write_remaining(writer, split, slots); });
+ const mmltk::testsupport::ScopedTestCleanup release_before_join([&] { reader.Release(); });
+ bool independent = false;
+ execution.run(BenchmarkStage::Labels, {32, 0}, [&](std::size_t) { independent = true; });
+ CHECK(independent);
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ reader.Release();
+ CHECK_THROWS_AS(mmltk::testsupport::await_test_future(work, "exceptional writer group settlement"), std::out_of_range);
+ execution.drain();
+ CHECK(writer.image_complete(0));
+}
+
+TEST_CASE("local retirement preserves another source queued in the same writer group", "[backend][data][benchmark][pipeline]") {
+ bool whole_source = false;
+ SECTION("source generation") { whole_source = true; }
+ SECTION("one image generation") {}
+ mmltk::testsupport::ScopedTempDir root("writer-group-local-retirement");
+ const auto first = root.path() / "first", other = root.path() / "other";
+ auto split = cached_pixel_membership(first);
+ prepare_cached_image_directory(other);
+ write_cached_image_atomically(cached_image_path(other, 2), make_jpeg(240, 8, 8), {});
+ split.sources.push_back({other});
+ split.images = {{1, 16, 8, 0, 0, 0}, {2, 16, 8, 0, 0, 1}};
+ mmltk::testsupport::TestGate held("affected active reader"), joining("retirement has withdrawn the generation");
+ struct RetirementObservation {
+  mmltk::testsupport::TestGate& joining;
+  static bool& retirement_thread() { thread_local bool value = false; return value; }
+  bool cancelled() const noexcept {
+   // Retirement observes cancellation only in its join wait, after withdrawing
+   // the generation. This receipt proves the sibling is still queued then.
+   if (retirement_thread()) joining.receipt().ArriveAndWait();
+   return false;
+  }
+ } observation{joining};
+ BenchmarkCompilePipeline execution(1, {}, {}, mmltk::common::concurrency::CancellationObservation::Borrow(observation));
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ request.execution = &execution;
+ request.image_opened = [&](const fs::path& path, std::uint64_t) { if (path == first) held.receipt().ArriveAndWait(); };
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ const auto before = execution.image_generation(first, 1);
+ execution.geometry_ready({first, 1, before, 16, 8});
+ auto work = std::async(std::launch::async, [&] { writer.write_remaining(request); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); joining.Release(); });
+ REQUIRE(held.WaitEntered(2s));
+ CHECK_FALSE(writer.image_complete(1));
+ auto retirement = std::async(std::launch::async, [&] {
+  RetirementObservation::retirement_thread() = true;
+  if (whole_source) execution.retire_source(first);
+  else execution.retire_image(first, 1);
+ });
+ const mmltk::testsupport::ScopedTestCleanup release_before_join([&] { held.Release(); joining.Release(); });
+ REQUIRE(joining.WaitEntered(2s));
+ CHECK(retirement.wait_for(0ms) == std::future_status::timeout);
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ joining.Release();
+ held.Release();
+ mmltk::testsupport::await_test_future(retirement, "local generation joins its reader");
+ CHECK_THROWS(mmltk::testsupport::await_test_future(work, "writer joins unrelated queued pixels"));
+ CHECK_FALSE(writer.image_complete(0));
+ CHECK(writer.image_complete(1));
+ CHECK_FALSE(execution.geometry(first, 1));
+ execution.image_ready({first, 1, {}, before, std::pair{16U, 8U}});
+ execution.drain();
+ CHECK_FALSE(writer.image_complete(0));
+ CHECK_FALSE(execution.geometry(first, 1));
+ const auto repaired = execution.image_generation(first, 1);
+ CHECK(repaired != before);
+ execution.image_ready({first, 1, {}, repaired});
+ execution.drain();
+ CHECK(writer.image_complete(0));
+ CHECK(writer.image_complete(1));
+}
+
+TEST_CASE("a rejected pixel body leaves admitted writer siblings available for repair", "[backend][data][benchmark][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("writer-body-local-failure");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images = {{1, 16, 8, 0, 0, 0}, {2, 16, 8, 0, 0, 0}};
+ std::vector<std::uint8_t> encoded;
+ const std::array<std::uint8_t, 6 * 4 * 3> rgb{};
+ REQUIRE(stbi_write_png_to_func(append_bytes, &encoded, 6, 4, 3, rgb.data(), 6 * 3) != 0);
+ encoded.resize(41);
+ write_cached_image_atomically(cached_image_path(images, 1), encoded, {});
+ write_cached_image_atomically(cached_image_path(images, 2), make_jpeg(240, 8, 8), {});
+ BenchmarkCompilePipeline execution(1);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ request.execution = &execution;
+ std::size_t first_reads = 0;
+ request.image_opened = [&](const fs::path&, std::uint64_t id) { if (id == 1) ++first_reads; };
+ BenchmarkSplitWriter writer(request, true);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ CHECK_THROWS_AS(writer.write_remaining(request), BenchmarkImageReadError);
+ CHECK_FALSE(writer.image_complete(0));
+ CHECK(writer.image_complete(1));
+ REQUIRE(execution.geometry(images, 1));
+ CHECK(execution.geometry(images, 1)->width == 6);
+ CHECK_THROWS_AS(writer.write_remaining(request), BenchmarkImageReadError);
+ CHECK(first_reads == 1);
+ execution.retire_image(images, 1);
+ write_cached_image_atomically(cached_image_path(images, 1), make_jpeg(240, 8, 8), {});
+ writer.write_remaining(request);
+ CHECK(writer.image_complete(0));
+ CHECK(writer.image_complete(1));
+ CHECK(first_reads == 2);
 }

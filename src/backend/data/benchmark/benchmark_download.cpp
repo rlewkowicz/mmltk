@@ -989,7 +989,7 @@ struct SegmentTransfer {
 }  // namespace
 std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, const std::size_t requested_concurrency,
  mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready,
- BenchmarkCompilePipeline* execution) {
+ BenchmarkCompilePipeline* execution, const BenchmarkCompilePipeline::Allowance& parent) {
  std::mutex progress_mutex;
  const DownloadProgressSink progress = observer ? DownloadProgressSink{[&](const DownloadProgress& value) {
   const std::lock_guard lock(progress_mutex);
@@ -1009,7 +1009,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
  // belong to this session, including segmented fallback and repair. Its
  // allowance precedes all of them and retires after durable publication.
  BenchmarkCompilePipeline::Allowance resources;
- if (execution) std::tie(maximum_concurrency, resources) = execution->reserve_transfers(maximum_concurrency, checked_add(requests.size(), std::size_t{8}, "benchmark transfer descriptor overflow"), 256U << 10);
+ if (execution) std::tie(maximum_concurrency, resources) = execution->reserve_transfers(maximum_concurrency, checked_add(requests.size(), std::size_t{8}, "benchmark transfer descriptor overflow"), 256U << 10, 0, parent);
  std::vector<StorageReservationPool::Reservation> storage_promises;
  if (execution) {
   storage_promises.reserve(requests.size());

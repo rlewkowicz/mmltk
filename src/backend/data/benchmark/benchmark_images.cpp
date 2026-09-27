@@ -433,7 +433,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  completed.reserve(request.selected_image_ids.size());
  std::unordered_set<std::uint64_t> unavailable;
  unavailable.reserve(64U);
- auto directory_allowance = request.execution ? request.execution->reserve(BenchmarkResources::handles(2, true, 2)) : BenchmarkCompilePipeline::Allowance{};
+ auto directory_allowance = request.execution ? request.execution->reserve(BenchmarkResources::handles(2, true, 2), request.parent_allowance) : BenchmarkCompilePipeline::Allowance{};
  BenchmarkCompilePipeline::Allowance cached_encoded_allowance;
  BenchmarkCompilePipeline::Allowance stream_allowance;
  std::vector<std::uint8_t> encoded;
@@ -504,10 +504,10 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
    return checked_byte_add(checked_byte_add(checked_byte_add(chunks * (84ULL << 20), 36ULL << 20), windows), request.validator_workspace_bytes);
   };
   if (wanted) {
-   auto grant = request.execution->try_reserve({stream_bytes(wanted), 2, true, wanted});
+   auto grant = request.execution->try_reserve({stream_bytes(wanted), 2, true, wanted}, directory_allowance);
    if (grant) { stream_allowance = std::move(*grant); stream_cpus = wanted; }
   }
-  if (!stream_allowance) stream_allowance = request.execution->reserve({stream_bytes(0), 2, true});
+  if (!stream_allowance) stream_allowance = request.execution->reserve({stream_bytes(0), 2, true}, directory_allowance);
   request.decompression_workers = stream_cpus > 2 ? stream_cpus - 1 : 1;
   request.cache_write_workers = 0;
  }

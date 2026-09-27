@@ -118,12 +118,12 @@ struct TracePath final {
 }
 void acquire_physical_inventory(AdmittedRecipeArchive& admitted, std::vector<CoconutPhysicalImage>& inventory, const BenchmarkCacheLayout& cache, ProgressReporter& progress,
  ArtifactProgressTotals& totals, StorageReservationPool& storage, std::size_t workers, common_concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
- std::string_view recovery_reason = {}, BenchmarkCompilePipeline* execution = nullptr) {
+ std::string_view recovery_reason = {}, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkCompilePipeline::Allowance& parent = {}) {
  const auto& archive = admitted.origin;
  const auto owner = benchmark_source_name(archive.artifact.source);
  auto request = make_download_request(cache, owner, archive.artifact);
  const auto inventory_path = cache.source_indexes(owner) / (archive.artifact.artifact_id + ".inventory.bin");
- auto inventory_handle = execution ? execution->reserve(BenchmarkResources::handles(1, true, 12)) : BenchmarkCompilePipeline::Allowance{};
+ auto inventory_handle = execution ? execution->reserve(BenchmarkResources::handles(1, true, 12), parent) : BenchmarkCompilePipeline::Allowance{};
  auto lease = ArtifactLease::acquire(cache.locks / (archive.artifact.artifact_id + ".inventory.lock"), cancellation);
  const auto diagnose = [&](std::string_view reason) {
   if (std::filesystem::is_regular_file(request.destination)) {
@@ -150,11 +150,11 @@ void acquire_physical_inventory(AdmittedRecipeArchive& admitted, std::vector<Coc
   progress.phase(DatasetCompilePhase::Downloading);
   {
    admitted.download = download_artifacts(
-    {request}, workers, cancellation, progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const auto& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution)
+    {request}, workers, cancellation, progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const auto& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, inventory_handle)
                         .front();
   }
   try {
-   auto rows = coconut_image_archive_inventory(admitted.download.path, inventory_path, archive.source, archive.shard, admitted.download.identity, cancellation, &storage, execution);
+   auto rows = coconut_image_archive_inventory(admitted.download.path, inventory_path, archive.source, archive.shard, admitted.download.identity, cancellation, &storage, execution, inventory_handle);
    std::erase_if(inventory, [&](const auto& row) { return row.source == archive.source && row.shard == archive.shard; });
    inventory.insert(inventory.end(), std::make_move_iterator(rows.begin()), std::make_move_iterator(rows.end()));
    return;
@@ -187,14 +187,16 @@ public:
  StorageReservationPool* storage_reservations, const std::uint64_t source_total_images, const std::size_t decompression_workers, const std::size_t cache_write_workers,
  const std::size_t download_connections, const BenchmarkTraceSink& trace, const std::optional<ImageDecodeProbe> decode_probe = std::nullopt, const bool require_every_image = false,
  const ArchiveImageIdParser& member_parser = {}, std::string_view completion_slot = {}, AdmittedRecipeArchive* admitted_archive = nullptr, const CachedImageReadySink& image_ready = {},
- const DownloadResult* initial_download = nullptr, std::shared_ptr<ArtifactLease> initial_lease = {}, BenchmarkCompilePipeline* execution = nullptr) {
+ const DownloadResult* initial_download = nullptr, std::shared_ptr<ArtifactLease> initial_lease = {}, BenchmarkCompilePipeline* execution = nullptr, BenchmarkCompilePipeline::Allowance initial_allowance = {}) {
  if (expected_ids.empty()) { throw std::runtime_error("benchmark archive extraction cannot have an empty image selection"); }
  if (require_every_image && !admitted_archive) throw std::logic_error("strict image extraction requires an admitted physical owner");
  const std::string source_name(benchmark_source_name(source));
  const std::string archive_name = source_name + " " + shard;
  const std::filesystem::path image_root = cache.source_images(source_name) / shard;
  progress->source_activity(source, "Waiting for " + archive_name + " extraction lock");
- auto source_handle = execution && !initial_lease ? execution->reserve(BenchmarkResources::handles(1, true, 12)) : BenchmarkCompilePipeline::Allowance{};
+ auto source_handle = std::move(initial_allowance);
+ if (execution && initial_lease && !source_handle) throw std::logic_error("prefetched image lease has no continuation allowance");
+ if (execution && !source_handle) source_handle = execution->reserve(BenchmarkResources::handles(1, true, 12));
  auto extraction_lease = initial_lease ? std::move(initial_lease) :
   source_handle.retain(ArtifactLease::acquire(cache.locks / (source_name + "-" + shard + ".images.lock"), cancel_requested));
  const auto generation = execution ? execution->source_generation(image_root) : 0;
@@ -250,7 +252,7 @@ public:
    if (!admitted_archive && !retained) {
     progress->source_activity(source, "Downloading " + archive_name + " image archive with " + std::to_string(download_connections) + " download connections");
     retained = download_artifacts({request}, download_connections, cancel_requested,
-     progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { transfer_progress->update(update, *progress); }} : DownloadProgressSink{}, trace, {}, execution)
+     progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { transfer_progress->update(update, *progress); }} : DownloadProgressSink{}, trace, {}, execution, source_handle)
                 .front();
    }
    progress->source_activity(source, "Opening " + archive_name + " image archive");
@@ -305,6 +307,7 @@ public:
     .execution = execution,
     .storage = storage_reservations,
     .validator_workspace_bytes = decode_probe ? common_math::checked_multiply(std::uint64_t{decode_probe->expected_width} * decode_probe->expected_height, 96U, "benchmark repair workspace overflow") : 0,
+    .parent_allowance = source_handle,
    });
    progress->source_activity(source, "Retaining completed " + archive_name + " archive in cache");
    extracted.cache_hit = false;
@@ -587,7 +590,7 @@ void publish_benchmark_manifest(const BenchmarkCompilerConfig& config, const std
 }
 }  // namespace benchmark_internal
 void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config, const CoconutRecipeCatalog* explicit_catalog, const CustomRecipeCatalog* explicit_custom_catalog,
- const std::function<void(BenchmarkDatasetSource, std::string_view)>& source_labels_started, const BenchmarkImageReadObserver& image_opened) {
+ const std::function<void(BenchmarkDatasetSource, std::string_view)>& source_labels_started, const BenchmarkImageReadObserver& image_opened, BenchmarkExecutionLimits limits) {
  if (!valid_benchmark_selection(config.selection)) throw std::invalid_argument("invalid benchmark dataset selection");
  using namespace benchmark_internal;
  if (config.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Stretch && config.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Letterbox)
@@ -624,9 +627,13 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
  try {
   struct StopFailedAttempt {
    std::atomic<bool>* stop;
+   BenchmarkCompilePipeline& execution;
    int exceptions = std::uncaught_exceptions();
    ~StopFailedAttempt() {
-    if (std::uncaught_exceptions() > exceptions) stop->store(true, std::memory_order_relaxed);
+    if (std::uncaught_exceptions() > exceptions) {
+     stop->store(true, std::memory_order_relaxed);
+     execution.notify_admission_change();
+    }
    }
   };
   const BenchmarkTraceSink trace = make_trace_sink(config.trace);
@@ -683,19 +690,27 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   config.num_workers = common_math::checked_cast<int>(effective_num_workers, "benchmark effective worker count overflow");
   auto compile_cpus = common_system::allowed_cpu_set();
   compile_cpus.resize(effective_num_workers);
-  BenchmarkCompilePipeline pipeline(effective_num_workers, compile_cpus, {}, cancel_requested);
+  BenchmarkCompilePipeline pipeline(effective_num_workers, compile_cpus, limits, cancel_requested);
+  const auto fail_compile = [&](std::exception_ptr error) {
+   cancellation_state.fail(std::move(error));
+   pipeline.notify_admission_change();
+  };
   const auto custom_catalog = explicit_custom_catalog ? *explicit_custom_catalog : coconut ? CustomRecipeCatalog{} : custom_recipe_catalog();
   const auto coconut_catalog = coconut ? (explicit_catalog ? *explicit_catalog : coconut_recipe_catalog(config.selection.validation)) : CoconutRecipeCatalog{};
   std::vector<AdmittedRecipeArchive> admitted;
   std::vector<CoconutPhysicalImage> inventory;
   auto& physical_progress = progress.transfers();
   StorageReservationPool physical_storage(cache.root, trace, &pipeline.storage());
+  BenchmarkCompilePipeline::Allowance preparation_allowance;
   std::shared_ptr<CoconutRecipeInputs> retained_annotation_inputs;
-  StopFailedAttempt stop_failed_inputs{cancel_signal};
+  StopFailedAttempt stop_failed_inputs{cancel_signal, pipeline};
   const auto input_budget = coconut ? coconut_catalog.releases.size() : std::size_t{2};
   const auto acquire_annotations = [&] {
+   // Release controllers retain source leases until activation. Protect their
+   // inventory/original-index prerequisite before admitting those controllers.
+   preparation_allowance = pipeline.reserve(BenchmarkResources::handles(0, true, 15));
    return acquire_coconut_recipe_inputs(cache, coconut_catalog, progress, input_budget, cancel_requested, trace, std::min<std::size_t>(8, effective_num_workers),
-    compile_cpus, [&](std::exception_ptr error) { cancellation_state.fail(std::move(error)); }, &pipeline);
+    compile_cpus, fail_compile, &pipeline);
   };
   if (coconut) retained_annotation_inputs = acquire_annotations();
   if (coconut) {
@@ -712,7 +727,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       const auto index = next.fetch_add(1, std::memory_order_relaxed);
       if (index >= admitted.size()) break;
       acquire_physical_inventory(
-       admitted[index], inventories[index], cache, progress, physical_progress, physical_storage, std::max<std::size_t>(1, physical_workers / concurrency), cancel_requested, trace, {}, &pipeline);
+       admitted[index], inventories[index], cache, progress, physical_progress, physical_storage, std::max<std::size_t>(1, physical_workers / concurrency), cancel_requested, trace, {}, &pipeline, preparation_allowance);
      }
     }
    });
@@ -753,31 +768,34 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     struct PrefetchedArchive {
      std::optional<DownloadResult> download;
      std::shared_ptr<ArtifactLease> lease;
+     BenchmarkCompilePipeline::Allowance allowance;
     };
     std::mutex archive_readiness_mutex;
-    std::condition_variable archive_readiness_changed;
     std::array<bool, 2> prefetched_ready{};
     std::array<std::future<PrefetchedArchive>, 2> custom_transfers;
     std::unique_ptr<common_concurrency::WorkerPool> custom_transfer_worker;
-    StopFailedAttempt stop_failed_attempt{cancel_signal};
+    StopFailedAttempt stop_failed_attempt{cancel_signal, pipeline};
     const auto custom_transfer_budget = coconut ? 0 : input_budget;
     if (custom_transfer_budget) {
+     // Prefetched leases may wait for metadata to select images. Reserve that
+     // metadata's existing envelope before either prefetch can retain capacity.
+     preparation_allowance = pipeline.reserve(BenchmarkResources::handles(0, true, 18));
      const auto cpus = std::span(compile_cpus);
      custom_transfer_worker = std::make_unique<common_concurrency::WorkerPool>(custom_transfer_budget, std::vector<int>(cpus.begin(), cpus.end()), "bench_sources", 2);
      for (std::size_t source = 0; source < 2; ++source)
       custom_transfers[source] = custom_transfer_worker->enqueue([&, source] {
        struct ReadyOnExit {
         std::mutex& mutex;
-        std::condition_variable& changed;
+        BenchmarkCompilePipeline& execution;
         bool& ready;
         ~ReadyOnExit() {
          {
           const std::lock_guard lock(mutex);
           ready = true;
          }
-         changed.notify_all();
+         execution.notify_admission_change();
         }
-       } completion{archive_readiness_mutex, archive_readiness_changed, prefetched_ready[source]};
+       } completion{archive_readiness_mutex, pipeline, prefetched_ready[source]};
        try {
         const std::string shard = source ? "val2017" : "train2017";
         const auto root = cache.source_images("coco") / shard;
@@ -788,11 +806,11 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
         auto lease = lease_credit.retain(ArtifactLease::acquire(cache.locks / ("coco-" + shard + ".images.lock"), cancel_requested));
         const auto request = make_download_request(cache, "coco", source ? custom_catalog.coco_val_images : custom_catalog.coco_train_images);
         auto download = download_artifacts({request}, std::min<std::size_t>(8, effective_num_workers), cancel_requested,
-         progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { physical_progress.update(update, progress); }} : DownloadProgressSink{}, trace, {}, &pipeline)
+         progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { physical_progress.update(update, progress); }} : DownloadProgressSink{}, trace, {}, &pipeline, lease_credit)
                          .front();
-        return PrefetchedArchive{std::move(download), std::move(lease)};
+        return PrefetchedArchive{std::move(download), std::move(lease), std::move(lease_credit)};
        } catch (...) {
-        cancellation_state.fail(std::current_exception());
+        fail_compile(std::current_exception());
         throw;
        }
       });
@@ -802,11 +820,11 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      const auto preparation_budget = effective_num_workers;
      common_concurrency::parallel_for_range_indexed<int>(0, 1, 1, std::span(compile_cpus).last(preparation_budget), [&](int, int, int) {
       enhanced = prepare_coconut_recipe(
-       config, cache, coconut_catalog, admitted, *membership, progress, coconut_failures, preparation_budget, cancel_requested, trace, refreshed_sources, true, retained_annotation_inputs, &pipeline);
+       config, cache, coconut_catalog, admitted, *membership, progress, coconut_failures, preparation_budget, cancel_requested, trace, refreshed_sources, true, retained_annotation_inputs, &pipeline, std::move(preparation_allowance));
      });
     } else {
      const auto preparation_budget = effective_num_workers;
-     custom = prepare_custom_recipe(config, cache, custom_catalog, progress, preparation_budget, cancel_requested, trace, std::span(compile_cpus).last(preparation_budget), &pipeline);
+     custom = prepare_custom_recipe(config, cache, custom_catalog, progress, preparation_budget, cancel_requested, trace, std::span(compile_cpus).last(preparation_budget), &pipeline, std::move(preparation_allowance));
     }
     auto& coco_train_index_path = custom.coco_train_index_path;
     auto& coco_val_index_path = custom.coco_val_index_path;
@@ -993,7 +1011,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     auto& train_writer = *retained_train_pixels;
     auto& validation_writer = *retained_validation_pixels;
     BenchmarkCompilePipeline::Attempt retire_pixels(pipeline);
-    StopFailedAttempt stop_pixel_attempt{cancel_signal};
+    StopFailedAttempt stop_pixel_attempt{cancel_signal, pipeline};
     pipeline.membership_ready();
     pipeline.register_split(train_writer, pixel_train);
     pipeline.register_split(validation_writer, pixel_validation);
@@ -1039,8 +1057,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      const std::lock_guard lock(pipeline_error_mutex);
      if (!pipeline_error) {
       pipeline_error = std::current_exception();
-      cancellation_state.fail(pipeline_error);
-      archive_readiness_changed.notify_all();
+      fail_compile(pipeline_error);
      }
     };
     const std::size_t configured_workers = pipeline.workers();
@@ -1068,35 +1085,65 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      std::size_t next_archive_task = coconut ? 0 : 2;
      std::array<bool, 2> coco_claimed{};
      const auto take_archive = [&] {
-      std::unique_lock lock(archive_readiness_mutex);
-      const auto coco_ready = [&](std::size_t source) { return !coco_claimed[source] && (!custom_transfers[source].valid() || prefetched_ready[source]); };
-      if (!coconut)
-       archive_readiness_changed.wait(
-        lock, [&] { return cancel_requested.requested() || coco_ready(0) || coco_ready(1) || next_archive_task < archive_tasks.size() || (coco_claimed[0] && coco_claimed[1]); });
-      if (cancel_requested.requested()) return archive_tasks.size();
-      if (!coconut)
-       for (std::size_t source = 0; source < 2; ++source)
-        if (coco_ready(source)) {
-         coco_claimed[source] = true;
-         return source;
+      for (;;) {
+       trace_benchmark_event(trace, "benchmark.archive.selection", [] { return nlohmann::json::object(); });
+       const auto observed = pipeline.admission_generation();
+       std::unique_lock lock(archive_readiness_mutex);
+       const auto coco_ready = [&](std::size_t source) { return !coco_claimed[source] && (!custom_transfers[source].valid() || prefetched_ready[source]); };
+       std::pair<std::size_t, BenchmarkCompilePipeline::Allowance> selected{archive_tasks.size(), {}};
+       const auto select = [&] {
+        if (cancel_requested.requested()) return true;
+        if (!coconut)
+         for (std::size_t source = 0; source < 2; ++source)
+          if (coco_ready(source)) {
+           coco_claimed[source] = true;
+           selected.first = source;
+           return true;
+          }
+        const bool pending_prefetch = !coconut && !(coco_claimed[0] && coco_claimed[1]);
+        if (next_archive_task < archive_tasks.size()) {
+         if (pending_prefetch) {
+          // A sole controller must stay available to retire a prefetched lease.
+          // Claim independent work only with its source allowance already owned.
+          auto grant = pipeline.try_reserve(BenchmarkResources::handles(1, true, 12));
+          if (!grant) return false;
+          selected.second = std::move(*grant);
+         }
+         selected.first = next_archive_task++;
+         return true;
         }
-      return next_archive_task < archive_tasks.size() ? next_archive_task++ : archive_tasks.size();
+        return !pending_prefetch;
+       };
+       if (select()) {
+        lock.unlock();
+        if (!coconut && selected.first < 2) pipeline.notify_admission_change();
+        return selected;
+       }
+       lock.unlock();
+       trace_benchmark_event(trace, "benchmark.archive.admission_wait", [&] { return nlohmann::json{{"reason", "pending_prefetch"}}; });
+       try { pipeline.wait_for_admission_change(observed); }
+       catch (...) {
+        trace_benchmark_event(trace, "benchmark.archive.admission_stopped", [] { return nlohmann::json::object(); });
+        throw;
+       }
+      }
      };
      common_concurrency::parallel_for_range_indexed<int>(0, archive_workers, archive_workers, pipeline.cpus(), [&](const int, const int begin, const int end) {
       for (int worker = begin; worker < end; ++worker) {
        const auto cpus = pipeline.cpus();
        common_system::set_thread_affinity(std::vector<int>(cpus.begin(), cpus.end()));
        while (true) {
-        const std::size_t task_index = take_archive();
+        auto [task_index, source_allowance] = take_archive();
         if (task_index >= archive_tasks.size()) { break; }
         const ArchiveTask& task = archive_tasks[task_index];
         const std::uint64_t source_total = source_totals.at(task.source);
         try {
          PrefetchedArchive prefetch;
          if (!coconut && task_index < custom_transfers.size() && custom_transfers[task_index].valid()) prefetch = custom_transfers[task_index].get();
+         if (prefetch.allowance) source_allowance = std::move(prefetch.allowance);
          archive_results[task_index] = acquire_archive_images(cache, task.source, task.shard, task.image_ids, task.artifact, cancel_requested, &progress, &image_transfer_progress,
           &cache_storage_reservations, source_total, decompression_workers, archive_cache_workers, archive_download_connections, trace, {}, coconut, archive_member_parser(task), completion_slot,
-          task.admitted, image_ready, prefetch.download ? &*prefetch.download : nullptr, std::move(prefetch.lease), &pipeline);
+          task.admitted, image_ready, prefetch.download ? &*prefetch.download : nullptr, std::move(prefetch.lease), &pipeline, std::move(source_allowance));
          archive_labels_ready(task_index);
         } catch (...) {
          record_pipeline_error();

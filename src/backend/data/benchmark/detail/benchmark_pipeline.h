@@ -1,5 +1,5 @@
 #pragma once
-#include "src/backend/data/benchmark/detail/benchmark_images.h"
+#include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/common/concurrency/cancellation_observation.h"
@@ -31,7 +31,7 @@ struct BenchmarkResources {
  // Small retained file/lease control records are charged separately from the
  // workspace their consumer needs to finish. Never use this for data buffers.
  bool retained_handles = false;
- // Admission leaves this many descriptors for the next indispensable step.
+ // Live descriptor commitment for explicitly bound dependent reservations.
  std::size_t continuation_descriptors = 0;
  [[nodiscard]] static BenchmarkResources handles(std::size_t count, bool producer = false, std::size_t continuation = 0);
 };
@@ -40,10 +40,12 @@ struct BenchmarkExecutionLimits {
  std::size_t descriptors = 0;
 };
 class BenchmarkCompilePipeline final {
+ struct Admission;
  struct Credits;
 public:
  // Shared custody charges a backing allocation once, including across handoffs.
  // Last release wakes resource admission; copying custody does not charge again.
+ // Custody may outlive this execution owner without retaining workers/borrowers.
  class Allowance {
  public:
   Allowance() = default;
@@ -66,15 +68,25 @@ public:
  [[nodiscard]] std::span<const int> cpus() const noexcept;
  [[nodiscard]] std::uint64_t transient_target() const noexcept;
  [[nodiscard]] std::size_t descriptor_limit() const noexcept;
- [[nodiscard]] std::optional<Allowance> try_reserve(BenchmarkResources);
+ // Source controllers capture before checking readiness/resource fit, then
+ // wait without holding source locks. Readiness publishers signal after their
+ // own state changes; returned credits advance this same admission event.
+ [[nodiscard]] std::uint64_t admission_generation() const;
+ void wait_for_admission_change(std::uint64_t);
+ void notify_admission_change() noexcept;
+ [[nodiscard]] std::optional<Allowance> try_reserve(BenchmarkResources, const Allowance& parent = {});
+ // A dependent draw uses at most its parent's remaining commitment. Additional
+ // demand needs uncommitted capacity; copied parents cannot lend twice.
  // Called by I/O/source owners only; never blocks a CPU lane on resources.
- [[nodiscard]] Allowance reserve(BenchmarkResources);
+ [[nodiscard]] Allowance reserve(BenchmarkResources, const Allowance& parent = {});
  // Admit a complete HTTP envelope, reducing optional connections under pressure.
- [[nodiscard]] std::pair<std::size_t, Allowance> reserve_transfers(std::size_t requested, std::size_t fixed_descriptors, std::uint64_t bytes_per_connection, std::uint64_t fixed_bytes = 0);
+ [[nodiscard]] std::pair<std::size_t, Allowance> reserve_transfers(std::size_t requested, std::size_t fixed_descriptors, std::uint64_t bytes_per_connection, std::uint64_t fixed_bytes = 0, const Allowance& parent = {});
  // The borrowed callback and its inputs remain live through completion/failure.
  // Input ownership supplies an allowance when a producer already reserved the
  // complete input/work/output footprint; no second charge is made.
  void run(BenchmarkStage, BenchmarkResources, const std::function<void(std::size_t)>&, Allowance = {});
+ // Bounded records recycle on individual completion. Retirement finishes before
+ // returning, including failure; it cannot retire suspended cooperative scratch.
  void for_each(BenchmarkStage, std::size_t count, BenchmarkResources, const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>& retire_scratch = {});
  void write_remaining(BenchmarkSplitWriter&, const PreparedBenchmarkSplit&, std::span<const std::size_t>);
  // A synchronous library parser yields between bounded progress points.

@@ -121,6 +121,7 @@ mmltk_register_private_headers(mmltk_backend_data
     benchmark/detail/open_images_acquisition.h
     benchmark/detail/benchmark_curl.h
     benchmark/detail/benchmark_download.h
+    benchmark/detail/benchmark_image_facts.h
     benchmark/detail/benchmark_images.h
     benchmark/detail/benchmark_image_decoder.h
     benchmark/detail/benchmark_sampling.h

@@ -164,7 +164,7 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
 }
 }  // namespace
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only, BenchmarkCompilePipeline* execution, const std::function<void()>& retire_consumer_scratch) {
+ const CoconutRecordConsumer& consumer, bool metadata_only, BenchmarkCompilePipeline* execution, const std::function<void()>& retire_consumer_scratch, const BenchmarkCompilePipeline::Allowance& parent) {
  std::uint64_t row_ordinal = 0, segment_ordinal = 0;
  for (const auto& path : shards) {
   throw_if_benchmark_cancelled(cancellation);
@@ -175,7 +175,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    // oversized row progress without holding input while waiting for scratch.
    const auto workspace = metadata_only ? std::uint64_t{0} : mmltk::common::math::checked_multiply(limits.max_pixels, 32U, "COCONut Parquet consumer workspace overflow");
    const auto bytes = mmltk::common::math::checked_add(256ULL << 20, workspace, "COCONut Parquet allowance overflow");
-   auto allowance = execution ? execution->reserve({bytes, 1, true}) : BenchmarkCompilePipeline::Allowance{};
+   auto allowance = execution ? execution->reserve({bytes, 1, true}, parent) : BenchmarkCompilePipeline::Allowance{};
    struct RetireConsumer {
     const std::function<void()>& callback;
     ~RetireConsumer() { if (callback) callback(); }

@@ -3471,6 +3471,7 @@ TEST_CASE("cold benchmark readers finish oversized grants with retained release 
  const std::array physical{coco(7), objects(1)};
  auto input = request(physical);
  input.execution = &execution;
+ input.parent_allowance = release;
  SECTION("Parquet retains its complete batch and consumer grant") {
   const auto path = root.path() / "input.parquet";
   parquet_file(path, Json::array({hf_row(7, mask, Json::array({segment()}), 1, 1)}));
@@ -3491,7 +3492,7 @@ TEST_CASE("cold benchmark readers finish oversized grants with retained release 
   const std::array<std::uint64_t, 1> selected{7};
   auto work = std::async(std::launch::async, [&] {
    return extract_selected_archive_images({.archive_path = path, .source_identity = "cold-gzip", .output_root = root.path() / "images", .source = "coco", .shard = "train2017",
-    .selected_image_ids = selected, .image_id_parser = [](std::string_view) { return std::optional<std::uint64_t>{7}; }, .execution = &execution});
+    .selected_image_ids = selected, .image_id_parser = [](std::string_view) { return std::optional<std::uint64_t>{7}; }, .execution = &execution, .parent_allowance = release});
   });
   const mmltk::testsupport::ScopedTestCleanup cancel([&] { cancelled.store(true); });
   CHECK(mmltk::testsupport::await_test_future(work, "cold gzip shared grant").image_count == 1);
@@ -3503,6 +3504,201 @@ TEST_CASE("cold benchmark readers finish oversized grants with retained release 
  REQUIRE(result.size() == 1);
  CHECK(result.front().index.images.size() == 1);
  CHECK(execution.try_reserve({65537, 0, true}).has_value());
+}
+
+TEST_CASE("one archive controller selects independent or prefetched work from real capacity", "[benchmark][pipeline]") {
+ using namespace std::chrono_literals;
+ bool pressure = false, release_capacity = false, cancel_wait = false, fail_wait = false;
+ SECTION("admitted prefetch progresses when another source cannot fit") { pressure = true; }
+ SECTION("independent extraction progresses while prefetch remains held") {}
+ SECTION("last pixel credit wakes independent extraction with both prefetches held") { release_capacity = true; }
+ SECTION("external cancellation releases an admission waiter with both prefetches held") { release_capacity = cancel_wait = true; }
+ SECTION("source failure releases an admission waiter with both prefetches held") { release_capacity = fail_wait = true; }
+ ScopedTempDir root("custom-controller-descriptor-dependency");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local_custom_catalog(local);
+ auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
+ config.num_workers = 1;
+ std::atomic<bool> cancelled{false}, first_selection{true};
+ mmltk::testsupport::TestGate selection("metadata finished before archive selection"), prefetch("prefetch owns its source envelope"),
+  denied("independent source has no admission"), independent("Objects365 pixel before COCO prefetch settlement"),
+  archive_selection("archive controller before source choice"), pixel("last Open Images reader owns group custody"),
+  source_returned("Open Images acquisition has returned"), waiting("archive controller registered its admission wait"), stopped("archive admission wait stopped");
+ struct AdmissionObservation {
+  const std::atomic<bool>& cancelled_flag;
+  mmltk::testsupport::TestGate& waiting;
+  struct Local { mmltk::testsupport::TestGate* next = nullptr; bool armed = false; unsigned polls = 0; };
+  static Local& local() { thread_local Local value; return value; }
+  bool cancelled() const noexcept {
+   auto& state = local();
+   // Trace delivery is serialized. Hold the source at its next cancellation
+   // boundary after that callback returns, leaving other sources observable.
+   if (auto* gate = std::exchange(state.next, nullptr)) gate->receipt().ArriveAndWait();
+   // The first observation checks the admission predicate. The second follows
+   // an actual condition wait. Selection resets this on an intervening retry.
+   if (state.armed && ++state.polls == 2) waiting.receipt().ArriveAndWait();
+   return cancelled_flag.load();
+  }
+ } observation{cancelled, waiting};
+ config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Borrow(observation);
+ config.progress = [&](const BenchmarkCompileProgress& value) {
+  if (value.phase == DatasetCompilePhase::Extracting && first_selection.exchange(false)) selection.receipt().ArriveAndWait();
+ };
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event == "benchmark.storage.reserved") {
+   const auto path = std::filesystem::path(Json::parse(fields).at("path").get<std::string>());
+   if (path == local.cache.source_downloads("coco") / catalog.coco_train_images.filename || path == local.cache.source_downloads("coco") / catalog.coco_val_images.filename)
+    AdmissionObservation::local().next = &prefetch;
+  }
+  if (event == "benchmark.archive.selection") {
+   AdmissionObservation::local() = {};
+   if (release_capacity) AdmissionObservation::local().next = &archive_selection;
+  }
+  if ((pressure || release_capacity) && event == "benchmark.archive.admission_wait") {
+   AdmissionObservation::local() = {.next = &denied, .armed = release_capacity};
+  }
+  if (release_capacity && event == "benchmark.archive.admission_stopped") {
+   AdmissionObservation::local() = {};
+   stopped.receipt().ArriveAndWait();
+  }
+ };
+ const auto objects_root = local.cache.source_images("objects365") / "patch-32";
+ const auto open_images_root = local.cache.source_images("open-images") / "train";
+ auto work = std::async(std::launch::async, [&] {
+  compile_benchmark_recipe(config, nullptr, &catalog, [&](BenchmarkDatasetSource source, std::string_view) {
+   if (release_capacity && source == BenchmarkDatasetSource::kOpenImagesV7) {
+    source_returned.receipt().ArriveAndWait();
+    if (fail_wait) throw std::runtime_error("Open Images label owner failed");
+   }
+  }, [&](const std::filesystem::path& source, std::uint64_t) {
+   if (!pressure && source == objects_root) independent.receipt().ArriveAndWait();
+   if (release_capacity && source == open_images_root) pixel.receipt().ArriveAndWait();
+  }, {.descriptors = release_capacity ? 48U : pressure ? 24U : 64U});
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled.store(true);
+  selection.Release(); prefetch.Release(); denied.Release(); independent.Release();
+  archive_selection.Release(); pixel.Release(); source_returned.Release(); waiting.Release(); stopped.Release();
+ });
+ REQUIRE(selection.WaitEntered(5s));
+ REQUIRE(prefetch.WaitEntered(5s, release_capacity ? 2 : 1));
+ selection.Release();
+ if (release_capacity) {
+  REQUIRE(archive_selection.WaitEntered(5s));
+  REQUIRE(pixel.WaitEntered(5s));
+  REQUIRE(source_returned.WaitEntered(5s));
+  // Acquisition has dropped its own handles. Only the pixel retains this
+  // group's promise; both COCO downloads continue to hold their envelopes.
+  archive_selection.Release();
+  REQUIRE(denied.WaitEntered(5s));
+  denied.Release();
+  REQUIRE(waiting.WaitEntered(5s));
+  if (cancel_wait) cancelled.store(true);
+  if (fail_wait) source_returned.Release();
+  waiting.Release();
+  if (cancel_wait || fail_wait) REQUIRE(stopped.WaitEntered(5s));
+  else {
+   pixel.Release();
+   // No prefetch/readiness publisher runs between the denial and this open.
+   // The last reader's returned credit alone must make selection progress.
+   REQUIRE(independent.WaitEntered(5s));
+  }
+ } else if (pressure) REQUIRE(denied.WaitEntered(5s));
+ else REQUIRE(independent.WaitEntered(5s));
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ denied.Release();
+ independent.Release();
+ pixel.Release();
+ source_returned.Release();
+ stopped.Release();
+ prefetch.Release();
+ if (cancel_wait) CHECK_THROWS(mmltk::testsupport::await_test_future(work, "cancelled source admission", 5s));
+ else if (fail_wait) CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(work, "failed source admission", 5s), "Open Images label owner failed");
+ else {
+  mmltk::testsupport::await_test_future(work, "one-controller source admission", 5s);
+  check_custom_compilation(local.output);
+ }
+}
+
+TEST_CASE("custom preparation retains its prerequisite beside prefetched archive leases", "[benchmark][pipeline]") {
+ ScopedTempDir root("custom-prefetch-descriptor-dependency");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local_custom_catalog(local);
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.descriptors = 64}, cancellation);
+ auto preparation = execution.reserve(BenchmarkResources::handles(0, true, 18));
+ auto train = execution.reserve(BenchmarkResources::handles(1, true, 12));
+ auto validation = execution.reserve(BenchmarkResources::handles(1, true, 12));
+ auto train_lease = train.retain(ArtifactLease::acquire(local.cache.locks / "coco-train2017.images.lock", cancellation));
+ auto validation_lease = validation.retain(ArtifactLease::acquire(local.cache.locks / "coco-val2017.images.lock", cancellation));
+ auto competing = execution.reserve({0, 12, true});
+ CHECK_FALSE(execution.try_reserve(BenchmarkResources::handles(3, true, 15)).has_value());
+ BenchmarkTraceSink trace;
+ CHECK(download_artifacts({make_download_request(local.cache, "coco", catalog.coco_train_images)}, 1, cancellation, {}, trace, {}, &execution, train).size() == 1);
+ CHECK(download_artifacts({make_download_request(local.cache, "coco", catalog.coco_val_images)}, 1, cancellation, {}, trace, {}, &execution, validation).size() == 1);
+ ProgressReporter progress({}, trace);
+ const auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
+ auto work = std::async(std::launch::async, [&] {
+  return prepare_custom_recipe(config, local.cache, catalog, progress, 1, cancellation, trace, {}, &execution, std::move(preparation));
+ });
+ const mmltk::testsupport::ScopedTestCleanup cancel([&] { cancelled.store(true); });
+ const auto result = mmltk::testsupport::await_test_future(work, "metadata beside retained prefetch commitments");
+ REQUIRE(result.coco_train);
+ REQUIRE(result.coco_val);
+ CHECK(result.coco_train->images.size() == 2);
+ CHECK(result.coco_val->images.size() == 1);
+ CHECK(execution.try_reserve({0, 18, true}).has_value());
+ // Both source owners still hold their lease and can use their own promise.
+ CHECK(execution.try_reserve({0, 12, true}, train).has_value());
+ CHECK(execution.try_reserve({0, 12, true}, validation).has_value());
+}
+
+TEST_CASE("COCONut inventory and originals retain activation capacity beside a release", "[benchmark][coconut][pipeline]") {
+ using namespace std::chrono_literals;
+ ScopedTempDir root("coconut-activation-descriptor-dependency");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local.selected(CoconutValidation::Stock);
+ catalog.releases.resize(1);
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.descriptors = 40}, cancellation);
+ auto preparation = execution.reserve(BenchmarkResources::handles(0, true, 15));
+ std::vector<CoconutPhysicalImage> physical;
+ std::vector<AdmittedRecipeArchive> admitted;
+ for (const auto& archive : catalog.images) {
+  const auto path = local.cache.source_downloads(benchmark_source_name(archive.artifact.source)) / archive.artifact.filename;
+  auto inventory = execution.reserve(BenchmarkResources::handles(1, true, 12), preparation);
+  auto rows = coconut_image_archive_inventory(path, {}, archive.source, archive.shard, archive.artifact.artifact_id, cancellation, &execution.storage(), &execution, inventory);
+  physical.insert(physical.end(), std::make_move_iterator(rows.begin()), std::make_move_iterator(rows.end()));
+  admitted.push_back({archive, {.path = path, .size = archive.artifact.expected_size, .identity = archive.artifact.artifact_id}});
+ }
+ const CoconutPhysicalMembership membership(physical);
+ mmltk::testsupport::TestGate release_acquired("release holds its source allowance before activation");
+ std::promise<void> originals_admitted;
+ BenchmarkTraceSink trace = [&](std::string_view event, const Json& fields) {
+  if (event == "benchmark.download.preseeded" && fields.at("artifact") == catalog.releases.front().annotations.front().artifact_id)
+   release_acquired.receipt().ArriveAndWait();
+  if (event == "benchmark.annotations.originals_begin") originals_admitted.set_value();
+ };
+ ProgressReporter progress({}, trace);
+ CoconutFailureReport failures(local.cache.root, progress);
+ auto inputs = acquire_coconut_recipe_inputs(local.cache, catalog, progress, 1, cancellation, trace, 1, {}, {}, &execution);
+ const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); release_acquired.Release(); });
+ REQUIRE(release_acquired.WaitEntered(2s));
+ CHECK_FALSE(execution.try_reserve(BenchmarkResources::handles(3, true, 12)).has_value());
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock});
+ auto work = std::async(std::launch::async, [&] {
+  return prepare_coconut_recipe(config, local.cache, catalog, admitted, membership, progress, failures, 1, cancellation, trace, {}, false, inputs, &execution, std::move(preparation));
+ });
+ const mmltk::testsupport::ScopedTestCleanup release_before_join([&] { cancelled.store(true); release_acquired.Release(); });
+ mmltk::testsupport::await_test_promise(originals_admitted, "originals draw their explicit preparation commitment");
+ release_acquired.Release();
+ const auto result = mmltk::testsupport::await_test_future(work, "release activation after prerequisite settlement", 5s);
+ CHECK(result.components.size() == 2);
+ REQUIRE(result.stock_validation);
+ CHECK(result.stock_validation->images.size() == 1);
+ CHECK(execution.try_reserve({0, 32, true}).has_value());
 }
 
 TEST_CASE("COCONut JSON source rejection leaves shared CPU admission usable", "[benchmark][coconut][pipeline]") {
