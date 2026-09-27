@@ -195,7 +195,7 @@ void TrainingModel::start(std::shared_ptr<mmltk::common::concurrency::WorkerPool
  p.reducer =
   std::make_unique<TrainingGradientReducer>(p.distributed, p.options.device_id, mmltk::backend::ml::cuda::getCurrentCUDAStream(mmltk::backend::ml::cuda::checked_device_index(p.options.device_id)),
    p.optimizer_build.optimizer.parameter_names(), p.optimizer_build.optimizer.parameters(), p.lanes->gradient_leaves());
- p.counts = std::make_shared<TrainingTargetCounts>(p.lane_capacity, p.options.device_id, p.distributed);
+ p.counts = std::make_shared<TrainingTargetCounts>(p.lane_capacity, p.contributions, p.options.device_id, p.distributed);
 }
 void TrainingModel::begin_epoch(std::uint64_t epoch, TrainingEpochDraws draws) {
  auto& p = *impl_;
@@ -256,6 +256,7 @@ std::uint64_t TrainingModel::attempt() {
   if (exhausted()) return 0;
   auto& optimizer = p.optimizer_build.optimizer;
   p.reducer->begin_attempt(p.contributions);
+  p.counts->begin_attempt();
   p.metrics.begin_attempt(p.contributions);
   auto ready = record_current_stream_event(p.events.pool(), p.options.device_id, "record trajectory parameters");
   if (!ready) throw std::runtime_error("training event capacity exhausted");
@@ -265,7 +266,7 @@ std::uint64_t TrainingModel::attempt() {
   std::size_t contributed = 0;
   while (contributed < p.contributions) {
    const auto wave_size = std::min(static_cast<std::size_t>(p.lane_capacity), p.contributions - contributed);
-   ParallelTrainingWave<TrainLaneResult> wave(wave_size, true, p.options.device_id, p.distributed, p.counts);
+   ParallelTrainingWave<TrainLaneResult> wave(wave_size, p.counts);
    try {
     for (std::size_t lane = 0; lane < wave_size; ++lane) {
      const auto microbatch = p.cursor;
@@ -316,10 +317,12 @@ std::uint64_t TrainingModel::attempt() {
    }
    ++p.waves;
   }
+  p.counts->finish_attempt();
   const auto& gradients = p.reducer->finish_attempt();
   mmltk::common::logging::ScopedProfile profile_optimizer{"rfdetr.train.optimizer"};
   const auto found_inf = p.scaler.check_and_unscale_gradients_(gradients, optimizer.parameters().front().device());
   p.last_metrics = p.metrics.complete_step(found_inf, p.contributions, p.cursor, p.distributed);
+  p.counts->finalize_attempt();
   p.reducer->finalize_attempt();
   const bool overflow = !p.last_metrics.gradients_finite;
   if (!p.last_metrics.loss_finite || (overflow && !p.scaler.enabled())) {

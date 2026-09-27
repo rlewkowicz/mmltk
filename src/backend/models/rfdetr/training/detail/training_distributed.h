@@ -78,6 +78,8 @@ public:
  void join(std::size_t slot);
  // Fence only this operation before unrelated launch-stream work is queued.
  void record_completion();
+ // Order an already-recorded completion fence onto this device's current stream.
+ void block_current_stream();
  void settle();
  // Reclaim only when a previously recorded physical fence has completed.
  // This never waits; callers may use a later, already-settled stream handoff.

@@ -15,6 +15,7 @@
 #include <ATen/cuda/CUDAEvent.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include <chrono>
+#include <array>
 #include <cstdio>
 #include <algorithm>
 #include <cmath>
@@ -25,6 +26,7 @@
 #include <functional>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -469,7 +471,7 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
     require(facts.microbatches_per_attempt == k && facts.effective_batch_per_model == batch * k, "physical capacity changed logical K or batch");
     auto leaves = lane_leaves(optimizer, physical);
     TrainingGradientReducer reducer(distributed, device, launch, optimizer.parameter_names(), optimizer.parameters(), leaves, 16);
-    TrainingTargetCounts counts(physical, device, distributed);
+    TrainingTargetCounts counts(physical, k, device, distributed);
     TrainingMetricHandoff metrics(device);
     metrics.reset_epoch();
     require(metrics.epoch_average() == 0 && metrics.state().microbatches == 0, "empty settled epoch mean differs");
@@ -510,13 +512,14 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
      at::cuda::CUDAEvent parameters_ready;
      parameters_ready.record(launch);
      reducer.begin_attempt(k);
+     counts.begin_attempt();
      metrics.begin_attempt(k);
      expected_optimizer.zero_grad(true);
      double attempt_loss = 0;
      const auto slice = training_rank_slice(batch, distributed.rank, distributed.world_size);
      for (std::size_t start = 0; start < k; start += physical) {
       const auto slots = std::min(physical, k - start);
-      counts.begin(slots);
+      counts.begin_wave(slots);
       std::vector<std::future<torch::Tensor>> futures(slots);
       std::vector<std::promise<void>> completed(slots);
       std::vector<std::shared_future<void>> completion;
@@ -591,7 +594,9 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
        epoch_class_error += global_count ? errors / static_cast<double>(global_count) : 100;
        epoch_cardinality += cardinality / static_cast<double>(batch);
       }
+      counts.end_wave();
      }
+     counts.finish_attempt();
      const auto& gradients = reducer.finish_attempt();
      std::size_t checked = 0;
      for (std::size_t p = 0; p < optimizer.parameters().size(); ++p) {
@@ -609,6 +614,7 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
      if (attempt == 1 && distributed.rank == distributed.world_size - 1) gradients.front().fill_(std::numeric_limits<float>::infinity());
      const auto found_inf = scaler.check_and_unscale_gradients_(gradients, optimizer.parameters().front().device());
      const auto snapshot = metrics.complete_step(found_inf, k, (attempt + 1) * k, distributed);
+     counts.finalize_attempt();
      reducer.finalize_attempt();
      static_cast<void>(expected_scaler.check_and_unscale_(expected_optimizer));
      for (std::size_t p = 0; p < optimizer.parameters().size(); ++p)
@@ -700,6 +706,43 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
     }
    }
 }
+void exercise_target_count_handoff(const DistributedContext& distributed, int device) {
+ tc::TorchCudaDeviceGuard guard(tc::checked_device_index(device));
+ const auto count_stream = tc::getStreamFromPool(false, tc::checked_device_index(device));
+ const auto metric_stream = tc::getStreamFromPool(false, tc::checked_device_index(device));
+ const auto consumer = tc::getStreamFromPool(false, tc::checked_device_index(device));
+ constexpr std::size_t k = 5;
+ const std::size_t capacity = distributed.rank == 0 ? 2 : 1;
+ tc::TorchCudaStreamGuard count_guard(count_stream);
+ TrainingTargetCounts counts(capacity, k, device, distributed);
+ tc::TorchCudaStreamGuard metric_guard(metric_stream);
+ TrainingMetricHandoff metrics(device);
+ const auto finite = torch::zeros({}, torch::TensorOptions().device(tc::cuda_device(device)));
+ for (std::size_t attempt = 0; attempt < 3; ++attempt) {
+  counts.begin_attempt();
+  metrics.begin_attempt(k);
+  std::array<torch::Tensor, k> values;
+  for (std::size_t start = 0; start < k; start += capacity) {
+   const auto slots = std::min(capacity, k - start);
+   counts.begin_wave(slots);
+   for (std::size_t lane = 0; lane < slots; ++lane) counts.publish(lane, distributed.rank == 0 ? 16777217 + 2 * (attempt * k + start + lane) : 0);
+   counts.resolve();
+   for (std::size_t lane = 0; lane < slots; ++lane) {
+    // Rank one contributes counts without a loss, conversion or gradient path.
+    if (distributed.rank == 0) values[start + lane] = counts.consume(lane, consumer.stream()).target_count;
+    metrics.accumulate_empty();
+   }
+   counts.end_wave();
+  }
+  counts.finish_attempt();
+  const auto snapshot = metrics.complete_step(finite, k, (attempt + 1) * k, distributed);
+  counts.finalize_attempt();
+  require(snapshot.loss_finite && snapshot.gradients_finite && snapshot.step_loss == 0, "empty count handoff changed numerical controls");
+  if (distributed.rank == 0)
+   for (std::size_t micro = 0; micro < k; ++micro)
+    require(values[micro].item<float>() == static_cast<float>(16777217 + 2 * (attempt * k + micro)), "cross-stream count handoff changed scalar SUM or conversion");
+ }
+}
 namespace {
 enum class CollectiveOutcome { Success, SubmitThrow, WaitFalse, WaitThrow };
 struct CollectiveGate final {
@@ -752,8 +795,9 @@ private:
 };
 class FixtureCollectiveBackend final : public c10d::Backend {
 public:
- FixtureCollectiveBackend(int device, CollectiveOutcome outcome, std::shared_ptr<CollectiveFacts> facts, std::shared_ptr<CollectiveGate> gate = {})
-     : c10d::Backend(0, 2), stream_(tc::getStreamFromPool(false, tc::checked_device_index(device))), outcome_(outcome), facts_(std::move(facts)), gate_(std::move(gate)) {}
+ FixtureCollectiveBackend(int device, CollectiveOutcome outcome, std::shared_ptr<CollectiveFacts> facts, std::shared_ptr<CollectiveGate> gate = {}, int successful_submissions = 0)
+     : c10d::Backend(0, 2), stream_(tc::getStreamFromPool(false, tc::checked_device_index(device))), outcome_(outcome), facts_(std::move(facts)), gate_(std::move(gate)),
+       successful_submissions_(successful_submissions) {}
  const std::string getBackendName() const override { return "training-custody-fixture"; }
  c10::intrusive_ptr<c10d::Work> allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& = {}) override {
   ++facts_->reductions;
@@ -790,13 +834,15 @@ private:
   }
   if (gate_) require(cudaLaunchHostFunc(stream_.stream(), &CollectiveGate::hold, gate_.get()) == cudaSuccess, "could not hold collective device work");
   tensors.front().add_(increment);
-  if (outcome_ == CollectiveOutcome::SubmitThrow) throw std::runtime_error("injected collective exception after queue");
-  return c10::make_intrusive<FixtureCollectiveWork>(facts_, outcome_, stream_);
+  const auto outcome = facts_->reductions + facts_->broadcasts <= successful_submissions_ ? CollectiveOutcome::Success : outcome_;
+  if (outcome == CollectiveOutcome::SubmitThrow) throw std::runtime_error("injected collective exception after queue");
+  return c10::make_intrusive<FixtureCollectiveWork>(facts_, outcome, stream_);
  }
  tc::TorchCudaStream stream_;
  CollectiveOutcome outcome_;
  std::shared_ptr<CollectiveFacts> facts_;
  std::shared_ptr<CollectiveGate> gate_;
+ int successful_submissions_;
  bool prepared_ = false;
 };
 class CollectiveRelease final {
@@ -973,37 +1019,136 @@ void exercise_collective_custody(int device) {
   };
   require(facts->reduction_shapes == expected_shapes && facts->reduction_storage.size() == 3, "packed metric/reducer operations changed dtype, extent, order or persistent storage");
  }
- // Count publication preserves the first useful cause and drains all waiting
- // futures after an actual queued submission fails before returning Work.
- {
+ // K retained scalar collectives span multiple physical waves, including a
+ // held conversion and an entirely empty rank on another launch stream. The
+ // first pass warms the same Torch kernels and allocation sizes before gates.
+ for (const bool distributed : {false, true}) {
+  constexpr std::size_t k = 5, capacity = 2;
   auto facts = std::make_shared<CollectiveFacts>();
-  auto gate = std::make_shared<CollectiveGate>();
-  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, CollectiveOutcome::SubmitThrow, facts, gate);
+  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, CollectiveOutcome::Success, facts);
   auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
-  TrainingTargetCounts counts(2, device, group);
-  CollectiveRelease release(*backend);
-  const auto custody = TrainingDistributedTestAccess::custody(counts);
-  std::array<std::future<std::string>, 2> waiters;
-  for (std::size_t i = 0; i < waiters.size(); ++i)
-   waiters[i] = std::async(std::launch::async, [&, i] {
-    tc::TorchCudaDeviceGuard worker(tc::checked_device_index(device));
-    try {
-     static_cast<void>(counts.consume(i, tc::getCurrentCUDAStream(tc::checked_device_index(device)).stream()));
-    } catch (const std::exception& error) { return std::string(error.what()); }
-    return std::string{};
+  if (!distributed) {
+   group.enabled = false;
+   group.world_size = 1;
+  }
+  const auto launch = tc::getStreamFromPool(false, tc::checked_device_index(device));
+  const auto consumer = tc::getStreamFromPool(false, tc::checked_device_index(device));
+  const auto handoff = tc::getStreamFromPool(false, tc::checked_device_index(device));
+  tc::TorchCudaStreamGuard count_stream(launch);
+  TrainingTargetCounts counts(capacity, k, device, group);
+  tc::TorchCudaStreamGuard handoff_stream(handoff);
+  TrainingMetricHandoff metrics(device);
+  const auto finite = torch::zeros({}, options);
+  for (int attempt = 0; attempt < 3; ++attempt) {
+   std::array<torch::Tensor, k> values;
+   counts.begin_attempt();
+   metrics.begin_attempt(k);
+   for (std::size_t micro = 0; micro < k; ++micro) metrics.accumulate_empty();
+   std::optional<HeldCudaStream> held;
+   if (attempt) {
+    held.emplace(attempt == 1 ? consumer : launch);
+    require(held->await(), "count attempt did not enter its CUDA gate");
+   }
+   auto queued = std::async(std::launch::async, [&] {
+    tc::TorchCudaStreamGuard worker(handoff);
+    for (std::size_t start = 0; start < k; start += capacity) {
+     const auto slots = std::min(capacity, k - start);
+     counts.begin_wave(slots);
+     for (std::size_t lane = 0; lane < slots; ++lane) counts.publish(lane, 16777217 + 2 * (start + lane));
+     counts.resolve();
+     counts.resolve();
+     if (attempt != 2)
+      for (std::size_t lane = 0; lane < slots; ++lane) values[start + lane] = counts.consume(lane, consumer.stream()).target_count;
+     counts.end_wave();
+    }
+    counts.finish_attempt();
    });
-  counts.publish(0, 1);
-  counts.publish(1, 2);
-  std::string first;
-  try {
-   counts.resolve();
-  } catch (const std::exception& error) { first = error.what(); }
-  for (auto& waiter : waiters) require(waiter.get() == first && first == "injected collective exception after queue", "count waiters lost the initiating failure");
-  require(gate->await(), "count failure did not retain in-flight device work");
-  release.finish();
-  TrainingDistributedTestAccess::retire(counts);
-  require(TrainingDistributedTestAccess::terminal(counts) && !custody.expired(), "unjoined count custody was released");
+   // This timeout is solely a deadlock watchdog. Assertions below observe
+   // actual gated device work and owned Work handles, with no throughput target.
+   const bool returned = queued.wait_for(std::chrono::seconds(20)) == std::future_status::ready;
+   if (!returned && held) held->release();
+   queued.get();
+   require(returned, "count wave admission or attempt handoff waited for physical completion");
+   const auto retained = distributed ? static_cast<int>(k) : 0;
+   require(facts->live_work == retained, "count waves reclaimed Work early or exceeded K retained slots");
+   require(facts->reductions == (distributed ? attempt * static_cast<int>(k + 1) + static_cast<int>(k) : 0), "count waves changed scalar collective admission/order");
+   if (held) {
+    bool premature = false;
+    try {
+     counts.finalize_attempt();
+    } catch (const std::logic_error&) { premature = true; }
+    require(premature && facts->live_work == retained, "pending count work was reclaimed before the numerical boundary");
+    held->release();
+   }
+   static_cast<void>(metrics.complete_step(finite, k, (attempt + 1) * k, group));
+   require(facts->live_work == retained, "metric handoff changed count ownership before explicit finalization");
+   counts.finalize_attempt();
+   require(facts->live_work == 0, "metric completion did not reclaim retained count Work");
+   if (attempt != 2)
+    for (std::size_t micro = 0; micro < k; ++micro)
+     require(values[micro].item<float>() == static_cast<float>(16777217 + 2 * micro + (distributed ? 1 : 0)), "count scalar overwrite or FP32-before-SUM changed normalization");
+  }
+  require(facts->waits == facts->reductions && facts->aborts == 0, "successful count attempts changed stream joins or aborted transport");
+  require(facts->reduction_storage.size() == (distributed ? capacity + 1 : 0), "count/metric storage grew across waves or attempts");
+  if (distributed) {
+   constexpr auto metric_elements = 5 + 2 * TrainingScalarPacket::size + k * DetectionStatisticsPacket::size;
+   for (std::size_t operation = 0; operation < facts->reduction_shapes.size(); ++operation) {
+    const auto expected = operation % (k + 1) == k ? std::pair{at::kFloat, static_cast<std::int64_t>(metric_elements)} : std::pair{at::kLong, std::int64_t{1}};
+    require(facts->reduction_shapes[operation] == expected, "retained count attempts changed collective dtype, shape or order");
+   }
+  }
  }
+ // Count publication preserves the first useful cause and drains waiting
+ // futures after submit/wait failure, including an already-admitted wave.
+ for (const auto outcome : {CollectiveOutcome::SubmitThrow, CollectiveOutcome::WaitFalse, CollectiveOutcome::WaitThrow})
+  for (const int completed_wave : {0, 2}) {
+   auto facts = std::make_shared<CollectiveFacts>();
+   auto gate = std::make_shared<CollectiveGate>();
+   auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, outcome, facts, gate, completed_wave);
+   auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+   TrainingTargetCounts counts(2, 4, device, group);
+   counts.begin_attempt();
+   counts.begin_wave(2);
+   CollectiveRelease release(*backend);
+   const auto custody = TrainingDistributedTestAccess::custody(counts);
+   if (completed_wave) {
+    counts.publish(0, 0);
+    counts.publish(1, 1);
+    counts.resolve();
+    counts.end_wave();
+    counts.begin_wave(2);
+   }
+   std::array<std::future<std::string>, 2> waiters;
+   for (std::size_t i = 0; i < waiters.size(); ++i)
+    waiters[i] = std::async(std::launch::async, [&, i] {
+     tc::TorchCudaDeviceGuard worker(tc::checked_device_index(device));
+     try {
+      static_cast<void>(counts.consume(i, tc::getCurrentCUDAStream(tc::checked_device_index(device)).stream()));
+     } catch (const std::exception& error) { return std::string(error.what()); }
+     return std::string{};
+    });
+   counts.publish(0, 1);
+   counts.publish(1, 2);
+   std::string first;
+   try {
+    counts.resolve();
+   } catch (const std::exception& error) { first = error.what(); }
+   const std::string expected = outcome == CollectiveOutcome::SubmitThrow ? "injected collective exception after queue"
+                              : outcome == CollectiveOutcome::WaitFalse ? "training collective wait returned false"
+                                                                        : "injected collective wait exception";
+   for (auto& waiter : waiters) require(waiter.get() == first && first == expected, "count waiters lost the initiating failure");
+   require(gate->await(), "count failure did not retain in-flight device work");
+   require(facts->live_work == completed_wave + (outcome == CollectiveOutcome::SubmitThrow ? 0 : 1), "count failure lost previously submitted Work");
+   counts.fail(std::make_exception_ptr(std::runtime_error("secondary count cancellation")));
+   bool sealed = false;
+   try {
+    counts.begin_attempt();
+   } catch (const std::exception& error) { sealed = error.what() == first; }
+   require(sealed && facts->aborts == 1, "count failure reopened admission or replaced the first cause");
+   release.finish();
+   TrainingDistributedTestAccess::retire(counts);
+   require(TrainingDistributedTestAccess::terminal(counts) && !custody.expired(), "unjoined count custody was released");
+  }
  // The entire metric owner contains both its device inventory and pinned host
  // destination. A failed collective cannot leave only an event shell alive.
  for (const auto outcome : {CollectiveOutcome::SubmitThrow, CollectiveOutcome::WaitFalse, CollectiveOutcome::WaitThrow}) {
@@ -1078,13 +1223,18 @@ void exercise_collective_custody(int device) {
  // a delayed consumer's count-to-float conversion before scalar-slot overwrite.
  {
   DistributedContext local;
-  TrainingTargetCounts counts(1, device, local);
+  TrainingTargetCounts counts(1, 2, device, local);
+  counts.begin_attempt();
+  counts.begin_wave(1);
   auto count_owner = TrainingDistributedTestAccess::custody(counts);
   const auto stream = tc::getStreamFromPool(false, tc::checked_device_index(device));
   counts.publish(0, 7);
   counts.resolve();
   // Prepare the conversion kernel before deliberately preventing GPU progress.
-  static_cast<void>(counts.consume(0, stream.stream()));
+  {
+   tc::TorchCudaStreamGuard consumer(stream);
+   static_cast<void>(torch::ones({}, options.dtype(torch::kInt64)).to(torch::kFloat32));
+  }
   stream.synchronize();
   HeldCudaStream delayed(stream);
   torch::Tensor previous;
@@ -1093,12 +1243,17 @@ void exercise_collective_custody(int device) {
    previous = counts.consume(0, stream.stream()).target_count;
   }
   require(delayed.await(), "count consumer never entered its CUDA hold");
-  counts.begin(1);
+  counts.end_wave();
+  counts.begin_wave(1);
   counts.publish(0, 13);
   counts.resolve();
+  counts.end_wave();
+  counts.finish_attempt();
   delayed.release();
   stream.synchronize();
   require(previous.item<float>() == 7, "count storage reuse changed an earlier conversion");
+  tc::getCurrentCUDAStream(tc::checked_device_index(device)).synchronize();
+  counts.finalize_attempt();
   TrainingDistributedTestAccess::retire(counts);
   require(count_owner.expired(), "settled local counts leaked");
   TrainingMetricHandoff metrics(device);
@@ -1139,7 +1294,9 @@ void exercise_collective_cancellation(DistributedContext& group, int device, std
  const auto transport = TrainingDistributedTestAccess::custody(group);
  std::exception_ptr failure;
  if (operation == "count") {
-  TrainingTargetCounts counts(2, device, group);
+  TrainingTargetCounts counts(2, 2, device, group);
+  counts.begin_attempt();
+  counts.begin_wave(2);
   const auto custody = TrainingDistributedTestAccess::custody(counts);
   auto waiting = std::async(std::launch::async, [&] {
    tc::TorchCudaDeviceGuard worker(tc::checked_device_index(device));

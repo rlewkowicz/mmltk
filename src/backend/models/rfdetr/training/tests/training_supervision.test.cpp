@@ -3,6 +3,7 @@
 #include "src/backend/models/rfdetr/training/detail/model_merging.h"
 #include "training_gradient_fixture.h"
 #include "src/backend/models/rfdetr/training/detail/training_distributed.h"
+#include "src/backend/models/rfdetr/training/detail/training_metrics.h"
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include "src/backend/models/rfdetr/augmentation/annotation_support.h"
@@ -1247,10 +1248,13 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
 }
 void test_parallel_wave_drains_failures_and_cancellation() {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
+ const c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(0));
  const rfdetr::DistributedContext distributed;
  std::atomic<int> prepublication_drained = 0;
  {
-  rfdetr::ParallelTrainingWave<int> wave(2, true, 0, distributed);
+  auto counts = std::make_shared<rfdetr::TrainingTargetCounts>(2, 2, 0, distributed);
+  counts->begin_attempt();
+  rfdetr::ParallelTrainingWave<int> wave(2, counts);
   const auto normalizer = wave.normalizer();
   wave.add(std::async(std::launch::async, [normalizer, &prepublication_drained] {
    try {
@@ -1279,7 +1283,9 @@ void test_parallel_wave_drains_failures_and_cancellation() {
  auto failing_backend = c10::make_intrusive<FailingCollectiveBackend>();
  auto failing_distributed = rfdetr::testsupport::TrainingDistributedTestAccess::backend(failing_backend);
  {
-  rfdetr::ParallelTrainingWave<int> wave(2, true, 0, failing_distributed);
+  auto counts = std::make_shared<rfdetr::TrainingTargetCounts>(2, 2, 0, failing_distributed);
+  counts->begin_attempt();
+  rfdetr::ParallelTrainingWave<int> wave(2, counts);
   const auto normalizer = wave.normalizer();
   for (std::size_t lane = 0; lane < 2; ++lane) {
    wave.add(std::async(std::launch::async, [normalizer, lane, &collective_failure_drained]() -> int {
@@ -1304,7 +1310,9 @@ void test_parallel_wave_drains_failures_and_cancellation() {
 #endif
  std::atomic<int> cancellation_drained = 0;
  {
-  rfdetr::ParallelTrainingWave<int> wave(2, true, 0, distributed);
+  auto counts = std::make_shared<rfdetr::TrainingTargetCounts>(2, 2, 0, distributed);
+  counts->begin_attempt();
+  rfdetr::ParallelTrainingWave<int> wave(2, counts);
   const auto normalizer = wave.normalizer();
   for (std::size_t lane = 0; lane < 2; ++lane) {
    wave.add(std::async(std::launch::async, [normalizer, lane, &cancellation_drained]() -> int {
@@ -1322,7 +1330,7 @@ void test_parallel_wave_drains_failures_and_cancellation() {
  REQUIRE(cancellation_drained.load() == 2);
  std::atomic<int> inactive_drained = 0;
  {
-  rfdetr::ParallelTrainingWave<int> wave(2, false, 0, distributed);
+  rfdetr::ParallelTrainingWave<int> wave(2);
   wave.add(std::async(std::launch::async, [&inactive_drained] {
    ++inactive_drained;
    return 1;
@@ -1334,6 +1342,32 @@ void test_parallel_wave_drains_failures_and_cancellation() {
   REQUIRE_THROWS(wave.settle([](int&) {}));
  }
  REQUIRE(inactive_drained.load() == 2);
+ // A standalone wave shares the explicitly admitted attempt owner. Closing
+ // one wave must leave the remaining logical contribution slots available.
+ auto counts = std::make_shared<rfdetr::TrainingTargetCounts>(2, 3, 0, distributed);
+ rfdetr::TrainingMetricHandoff metrics(0);
+ for (int attempt = 0; attempt < 2; ++attempt) {
+  counts->begin_attempt();
+  metrics.begin_attempt(3);
+  int total = 0;
+  for (std::size_t start = 0; start < 3; start += 2) {
+   const auto slots = std::min<std::size_t>(2, 3 - start);
+   rfdetr::ParallelTrainingWave<int> wave(slots, counts);
+   for (std::size_t lane = 0; lane < slots; ++lane)
+    wave.add(std::async(std::launch::async, [counts, lane] {
+     counts->publish(lane, 0);
+     return 1;
+    }));
+   wave.settle([&](int& value) {
+    total += value;
+    metrics.accumulate_empty();
+   });
+  }
+  counts->finish_attempt();
+  static_cast<void>(metrics.complete_step(torch::zeros({}, torch::TensorOptions().device(torch::kCUDA)), 3, 3 * (attempt + 1)));
+  counts->finalize_attempt();
+  REQUIRE(total == 3);
+ }
 }
 void test_all_supervision_routes_execute_fixture_backed_training() {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }

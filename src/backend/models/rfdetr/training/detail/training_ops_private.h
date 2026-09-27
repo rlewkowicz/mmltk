@@ -29,14 +29,23 @@ struct TrainingDistributedTestAccess;
 }
 class TrainingTargetCounts final {
 public:
- TrainingTargetCounts(std::size_t lanes, int device_id, const DistributedContext& distributed);
+ // Scalar storage follows physical lanes; collective custody follows the
+ // execution plan's fixed logical contribution count for each attempt.
+ TrainingTargetCounts(std::size_t lanes, std::size_t contributions, int device_id, const DistributedContext& distributed);
  ~TrainingTargetCounts() noexcept;
  TrainingTargetCounts(const TrainingTargetCounts&) = delete;
  TrainingTargetCounts& operator=(const TrainingTargetCounts&) = delete;
- void begin(std::size_t slots);
+ void begin_attempt();
+ void begin_wave(std::size_t slots);
  void publish(std::size_t lane, std::int64_t target_count);
  void resolve();
  [[nodiscard]] DeviceLossNormalizer consume(std::size_t lane, cudaStream_t stream);
+ // Close admission only after the wave's CPU consumers have queued their reads.
+ void end_wave();
+ // Order physical count retirement onto the current numerical handoff stream.
+ void finish_attempt();
+ // The numerical handoff must already have completed; this never waits.
+ void finalize_attempt();
  void fail(std::exception_ptr failure) noexcept;
 
 private:
@@ -50,13 +59,11 @@ private:
 template <class Result>
 class ParallelTrainingWave final {
 public:
- ParallelTrainingWave(const std::size_t lane_count, const bool active, const int device_id, const DistributedContext& distributed, std::shared_ptr<TrainingTargetCounts> counts = {}) {
+ // The shared count owner must already have an admitted optimizer attempt.
+ ParallelTrainingWave(const std::size_t lane_count, std::shared_ptr<TrainingTargetCounts> counts = {}) : normalizer_(std::move(counts)) {
   futures_.reserve(lane_count);
   results_.reserve(lane_count);
-  if (active) {
-   normalizer_ = counts ? std::move(counts) : std::make_shared<TrainingTargetCounts>(lane_count, device_id, distributed);
-   normalizer_->begin(lane_count);
-  }
+  if (normalizer_) normalizer_->begin_wave(lane_count);
  }
  ~ParallelTrainingWave() noexcept {
   if (!settled_) {
@@ -82,6 +89,7 @@ public:
   if (failure_) { std::rethrow_exception(failure_); }
   try {
    for (auto& result : results_) { consume(result); }
+   if (normalizer_) normalizer_->end_wave();
   } catch (...) {
    fail(std::current_exception());
    std::rethrow_exception(failure_);

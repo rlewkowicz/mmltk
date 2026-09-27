@@ -29,7 +29,7 @@ TEST_CASE("Two selected GPUs retain the global training objective and early NCCL
  std::filesystem::remove(store);
  namespace process = mmltk::frameworks::process;
  std::string scenario;
- SECTION("complete trajectory and overlap") { scenario = "trajectory"; }
+ SECTION("complete trajectory, overlap and count handoff on empty ranks") { scenario = "trajectory"; }
  SECTION("first-rank cancellation aborts waiting peer") { scenario = "cancel"; }
  SECTION("failure after an early bucket retains custody and aborts waiting peer") { scenario = "early-failure"; }
  SECTION("cancellation retains a real in-flight count collective") { scenario = "cancel-count"; }

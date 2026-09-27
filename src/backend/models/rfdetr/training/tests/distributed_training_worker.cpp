@@ -36,6 +36,7 @@ int main(int argc, char** argv) {
   testsupport::exercise_training_initialization(group, device);
   testsupport::exercise_early_bucket_overlap(group, device);
   testsupport::exercise_gradient_trajectory(group, device);
+  testsupport::exercise_target_count_handoff(group, device);
   distributed_shutdown(group);
   return 0;
  } catch (const std::exception& error) {

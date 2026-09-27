@@ -14,11 +14,15 @@
 namespace mmltk::backend::models::rfdetr {
 namespace torch_cuda = mmltk::backend::ml::cuda;
 struct TrainingTargetCounts::State final {
- State(std::size_t capacity, int device, const DistributedContext&);
- void begin(std::size_t);
+ State(std::size_t capacity, std::size_t contributions, int device, const DistributedContext&);
+ void begin_attempt();
+ void begin_wave(std::size_t);
  void publish(std::size_t, std::int64_t);
  void resolve();
  DeviceLossNormalizer consume(std::size_t, cudaStream_t);
+ void end_wave();
+ void finish_attempt();
+ void finalize_attempt();
  void fail(std::exception_ptr) noexcept;
  void rethrow_failure_locked() const;
  torch_cuda::TorchCudaStream launch_;
@@ -30,40 +34,57 @@ struct TrainingTargetCounts::State final {
  torch::Tensor device_counts_;
  std::exception_ptr failure_;
  std::size_t slots_ = 0;
+ const std::size_t contributions_;
+ std::size_t admitted_ = 0;
+ bool active_ = false, finished_ = false;
  int device_id_ = -1;
  DistributedContext distributed_;
- TrainingCollectiveWork work_;
+ std::optional<TrainingCollectiveWork> work_;
+ at::cuda::CUDAEvent local_completed_;
  std::vector<at::cuda::CUDAEvent> ready_, consumed_;
  std::vector<bool> resolved_;
  bool distributed_abort_requested_ = false;
 };
-TrainingTargetCounts::State::State(const std::size_t capacity, const int device_id, const DistributedContext& distributed)
+TrainingTargetCounts::State::State(const std::size_t capacity, const std::size_t contributions, const int device_id, const DistributedContext& distributed)
     : launch_(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(device_id))),
       consumers_(capacity),
       host_counts_(capacity, 0),
       published_(capacity, false),
+      contributions_(contributions),
       device_id_(device_id),
       distributed_(distributed),
-      work_(device_id, capacity),
       ready_(capacity),
       consumed_(capacity),
       resolved_(capacity, false) {
- if (!capacity) throw std::invalid_argument("target count capacity must be positive");
+ if (!capacity || !contributions) throw std::invalid_argument("target count capacities must be positive");
+ if (capacity > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) throw std::overflow_error("target count capacity overflow");
+ if (distributed.enabled) work_.emplace(device_id, contributions);
  device_counts_ = torch::empty({static_cast<std::int64_t>(capacity)}, torch::TensorOptions().dtype(torch::kInt64).device(torch_cuda::cuda_device(device_id)));
- begin(capacity);
 }
-void TrainingTargetCounts::State::begin(std::size_t slots) {
+void TrainingTargetCounts::State::begin_attempt() {
  std::lock_guard lock(mutex_);
  rethrow_failure_locked();
+ if (active_) throw std::logic_error("target count attempt reused before finalization");
+ admitted_ = 0;
+ active_ = true;
+}
+void TrainingTargetCounts::State::begin_wave(std::size_t slots) {
+ std::lock_guard lock(mutex_);
+ rethrow_failure_locked();
+ if (!active_ || finished_ || slots_) throw std::logic_error("target count wave requires an open attempt and a drained previous wave");
  if (!slots || slots > host_counts_.size()) throw std::invalid_argument("invalid count slot admission");
- // Previous waves have drained their futures. Settle collective slots once,
- // then order any delayed count-to-float reads before overwriting scalar storage.
- work_.settle();
- for (std::size_t lane = 0; lane < consumers_.size(); ++lane)
+ if (slots > contributions_ - admitted_) throw std::logic_error("target count attempt capacity exhausted");
+ // CPU consumers have queued their reads, but neither their conversions nor
+ // the collectives need have physically completed. Retain Work through K and
+ // order each scalar overwrite after its previous int64-to-float conversion.
+ for (std::size_t lane = 0; lane < slots; ++lane) {
   if (consumers_[lane]) consumed_[lane].block(launch_);
+  consumers_[lane].reset();
+ }
  slots_ = slots;
- std::fill(published_.begin(), published_.end(), false);
- std::fill(resolved_.begin(), resolved_.end(), false);
+ admitted_ += slots;
+ std::fill_n(published_.begin(), slots, false);
+ std::fill_n(resolved_.begin(), slots, false);
 }
 void TrainingTargetCounts::State::publish(const std::size_t lane, const std::int64_t count) {
  std::lock_guard lock(mutex_);
@@ -74,6 +95,11 @@ void TrainingTargetCounts::State::publish(const std::size_t lane, const std::int
  condition_.notify_all();
 }
 void TrainingTargetCounts::State::resolve() {
+ {
+  std::lock_guard lock(mutex_);
+  rethrow_failure_locked();
+  if (!slots_) throw std::logic_error("target counts require an admitted wave");
+ }
  torch_cuda::TorchCudaStreamGuard guard(launch_);
  try {
   // Exactly one scalar collective per logical microbatch, in admission order.
@@ -87,7 +113,7 @@ void TrainingTargetCounts::State::resolve() {
    }
    auto count = device_counts_.narrow(0, static_cast<std::int64_t>(lane), 1);
    count.fill_(host_counts_[lane]);
-   work_.join(work_.all_reduce(distributed_, count));
+   if (work_) work_->join(work_->all_reduce(distributed_, count));
    ready_[lane].record(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(device_id_)));
    {
     std::lock_guard lock(mutex_);
@@ -96,7 +122,6 @@ void TrainingTargetCounts::State::resolve() {
    }
    condition_.notify_all();
   }
-  work_.record_completion();
  } catch (...) {
   fail(std::current_exception());
   std::lock_guard lock(mutex_);
@@ -106,9 +131,11 @@ void TrainingTargetCounts::State::resolve() {
 DeviceLossNormalizer TrainingTargetCounts::State::consume(const std::size_t lane, const cudaStream_t stream) {
  {
   std::unique_lock lock(mutex_);
+  rethrow_failure_locked();
   if (lane >= slots_) throw std::runtime_error("target count slot out of range");
   condition_.wait(lock, [&] { return failure_ || resolved_[lane]; });
   rethrow_failure_locked();
+  if (consumers_[lane]) throw std::logic_error("target count slot consumed twice");
   consumers_[lane] = torch_cuda::getStreamFromExternal(stream, torch_cuda::checked_device_index(device_id_));
  }
  const auto consumer = *consumers_[lane];
@@ -118,6 +145,43 @@ DeviceLossNormalizer TrainingTargetCounts::State::consume(const std::size_t lane
  auto value = device_counts_.select(0, static_cast<std::int64_t>(lane)).to(torch::kFloat32);
  consumed_[lane].record(consumer);
  return {std::move(value)};
+}
+void TrainingTargetCounts::State::end_wave() {
+ std::lock_guard lock(mutex_);
+ rethrow_failure_locked();
+ if (!slots_ || !std::all_of(resolved_.begin(), resolved_.begin() + slots_, [](bool resolved) { return resolved; }))
+  throw std::logic_error("target count wave closed before all counts resolved");
+ slots_ = 0;
+}
+void TrainingTargetCounts::State::finish_attempt() {
+ std::lock_guard lock(mutex_);
+ rethrow_failure_locked();
+ if (!active_ || finished_ || slots_ || admitted_ != contributions_) throw std::logic_error("incomplete target count attempt");
+ {
+  torch_cuda::TorchCudaStreamGuard guard(launch_);
+  // Include the final conversion reads, including those on distinct lane
+  // streams. Empty ranks still fence all scalar collectives on launch_.
+  for (std::size_t lane = 0; lane < consumers_.size(); ++lane)
+   if (consumers_[lane]) consumed_[lane].block(launch_);
+  if (work_) work_->record_completion();
+  else local_completed_.record(launch_);
+ }
+ // The metric handoff runs on the caller stream, which need not be launch_.
+ // Its physical completion must prove this fence without relying on gradients.
+ if (work_) work_->block_current_stream();
+ else {
+  const auto current = torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(device_id_));
+  if (current != launch_) local_completed_.block(current);
+ }
+ finished_ = true;
+}
+void TrainingTargetCounts::State::finalize_attempt() {
+ std::lock_guard lock(mutex_);
+ rethrow_failure_locked();
+ if (!finished_) throw std::logic_error("target count finalization before attempt handoff");
+ if (work_ ? !work_->release_completed() : !local_completed_.query()) throw std::logic_error("target count finalization before metric completion");
+ std::fill(consumers_.begin(), consumers_.end(), std::nullopt);
+ active_ = finished_ = false;
 }
 void TrainingTargetCounts::State::fail(std::exception_ptr failure) noexcept {
  bool abort = false;
@@ -135,14 +199,15 @@ void TrainingTargetCounts::State::fail(std::exception_ptr failure) noexcept {
 void TrainingTargetCounts::State::rethrow_failure_locked() const {
  if (failure_) std::rethrow_exception(failure_);
 }
-TrainingTargetCounts::TrainingTargetCounts(std::size_t capacity, int device, const DistributedContext& group) : state_(std::make_shared<State>(capacity, device, group)) {}
+TrainingTargetCounts::TrainingTargetCounts(std::size_t capacity, std::size_t contributions, int device, const DistributedContext& group)
+    : state_(std::make_shared<State>(capacity, contributions, device, group)) {}
 TrainingTargetCounts::~TrainingTargetCounts() noexcept { retire(); }
 void TrainingTargetCounts::retire() noexcept {
  if (!state_) return;
  // Waves drain their futures before the final borrower releases this owner.
  // Count conversions may have been queued before a worker failed, so settle
  // both the publisher and the bounded consumer-stream inventory.
- cudaError_t failure = state_->work_.retire();
+ cudaError_t failure = state_->work_ ? state_->work_->retire() : cudaSuccess;
  if (failure != cudaSuccess) {
   std::move(terminal_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(state_)), failure);
   return;
@@ -163,10 +228,14 @@ void TrainingTargetCounts::retire() noexcept {
  else
   state_.reset();
 }
-void TrainingTargetCounts::begin(std::size_t slots) { state_->begin(slots); }
+void TrainingTargetCounts::begin_attempt() { state_->begin_attempt(); }
+void TrainingTargetCounts::begin_wave(std::size_t slots) { state_->begin_wave(slots); }
 void TrainingTargetCounts::publish(std::size_t lane, std::int64_t count) { state_->publish(lane, count); }
 void TrainingTargetCounts::resolve() { state_->resolve(); }
 DeviceLossNormalizer TrainingTargetCounts::consume(std::size_t lane, cudaStream_t stream) { return state_->consume(lane, stream); }
+void TrainingTargetCounts::end_wave() { state_->end_wave(); }
+void TrainingTargetCounts::finish_attempt() { state_->finish_attempt(); }
+void TrainingTargetCounts::finalize_attempt() { state_->finalize_attempt(); }
 void TrainingTargetCounts::fail(std::exception_ptr failure) noexcept { state_->fail(std::move(failure)); }
 GradScaler::GradScaler(const bool enabled, const float init_scale, const float growth_factor, const float backoff_factor, const int growth_interval)
     : enabled_(enabled), scale_(init_scale), growth_factor_(growth_factor), backoff_factor_(backoff_factor), growth_interval_(growth_interval) {}

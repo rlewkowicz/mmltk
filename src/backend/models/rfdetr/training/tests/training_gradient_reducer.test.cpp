@@ -30,7 +30,9 @@ TEST_CASE("Gradient cancellation seals admission and wakes count consumers", "[r
  const rf::DistributedContext group;
  auto parameter = torch::ones({2}, torch::TensorOptions().device(tc::cuda_device(0)).requires_grad(true));
  rf::TrainingGradientReducer reducer(group, 0, tc::getCurrentCUDAStream(0), {"parameter"}, {parameter}, {{parameter}});
- rf::TrainingTargetCounts counts(1, 0, group);
+ rf::TrainingTargetCounts counts(1, 2, 0, group);
+ counts.begin_attempt();
+ counts.begin_wave(1);
  reducer.begin_attempt(2);
  reducer.arm(0);
  static_cast<void>(rf::TrainingStep(2, 1, false, at::kFloat).gradients(parameter.square().sum(), {parameter}));
@@ -58,4 +60,59 @@ TEST_CASE("Failure after an early bucket retains custody until retirement", "[rf
 TEST_CASE("Collective slots retain uncertain physical work and reclaim settled buffers", "[rfdetr][training][gradient][custody]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; collective custody unverified");
  REQUIRE_NOTHROW(rf::testsupport::exercise_collective_custody(0));
+}
+TEST_CASE("Target count attempts join the metric handoff across streams", "[rfdetr][training][gradient][custody]") {
+ if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; count handoff coverage unverified");
+ REQUIRE_NOTHROW(rf::testsupport::exercise_target_count_handoff({}, 0));
+}
+TEST_CASE("Target count admission seals each wave and exact logical attempt", "[rfdetr][training][gradient]") {
+ if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; count admission coverage unverified");
+ namespace tc = mmltk::backend::ml::cuda;
+ tc::TorchCudaDeviceGuard guard(tc::checked_device_index(0));
+ const rf::DistributedContext group;
+ CHECK_THROWS_AS((rf::TrainingTargetCounts{0, 1, 0, group}), std::invalid_argument);
+ CHECK_THROWS_AS((rf::TrainingTargetCounts{1, 0, 0, group}), std::invalid_argument);
+ rf::TrainingTargetCounts counts(2, 3, 0, group);
+ CHECK_THROWS(counts.begin_wave(1));
+ CHECK_THROWS(counts.resolve());
+ CHECK_THROWS(counts.end_wave());
+ CHECK_THROWS(counts.finish_attempt());
+ CHECK_THROWS(counts.finalize_attempt());
+ for (int attempt = 0; attempt < 2; ++attempt) {
+  counts.begin_attempt();
+  CHECK_THROWS(counts.begin_attempt());
+  CHECK_THROWS(counts.begin_wave(0));
+  CHECK_THROWS(counts.begin_wave(3));
+  counts.begin_wave(2);
+  CHECK_THROWS(counts.begin_wave(1));
+  CHECK_THROWS(counts.end_wave());
+  CHECK_THROWS(counts.publish(0, -1));
+  CHECK_THROWS(counts.publish(2, 1));
+  counts.publish(0, 7);
+  CHECK_THROWS(counts.publish(0, 7));
+  counts.publish(1, 0);
+  counts.resolve();
+  counts.resolve();  // Repeated resolution never resubmits scalar collectives.
+  auto value = counts.consume(0, tc::getCurrentCUDAStream(0).stream());
+  CHECK_THROWS(counts.consume(0, tc::getCurrentCUDAStream(0).stream()));
+  CHECK_THROWS(counts.finish_attempt());
+  counts.end_wave();
+  CHECK_THROWS(counts.consume(0, tc::getCurrentCUDAStream(0).stream()));
+  CHECK_THROWS(counts.end_wave());
+  CHECK_THROWS(counts.finish_attempt());
+  CHECK_THROWS(counts.begin_wave(2));
+  counts.begin_wave(1);
+  counts.publish(0, 13);
+  counts.resolve();
+  counts.end_wave();
+  CHECK_THROWS(counts.begin_wave(1));
+  CHECK_THROWS(counts.finalize_attempt());
+  counts.finish_attempt();
+  CHECK_THROWS(counts.finish_attempt());
+  CHECK_THROWS(counts.begin_attempt());
+  tc::getCurrentCUDAStream(0).synchronize();
+  counts.finalize_attempt();
+  CHECK(value.target_count.item<float>() == 7);
+  CHECK_THROWS(counts.finalize_attempt());
+ }
 }

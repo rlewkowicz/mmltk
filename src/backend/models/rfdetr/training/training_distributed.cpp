@@ -219,6 +219,17 @@ void TrainingCollectiveWork::record_completion() {
   throw;
  }
 }
+void TrainingCollectiveWork::block_current_stream() {
+ auto& state = *owner_->state;
+ if (!state.completion_recorded) throw std::logic_error("training collective completion was not recorded");
+ try {
+  const auto current = tc::getCurrentCUDAStream(tc::checked_device_index(state.device));
+  if (current != state.stream) state.completed.block(current);
+ } catch (...) {
+  state.failure = cudaErrorUnknown;
+  throw;
+ }
+}
 void TrainingCollectiveWork::settle() {
  auto& state = *owner_->state;
  if (uncertain()) throw std::runtime_error("training collective physical completion is unproved");
