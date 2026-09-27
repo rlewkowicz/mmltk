@@ -413,6 +413,25 @@ TEST_CASE("Continuation donor admission validates every descriptor before changi
  r::TrainingDonorHistory resumed(1, 2);
  resumed.restore(loader, valid->values.data.donors);
  CHECK(std::ranges::equal(resumed.plan(0, keys, images), expected));
+ const auto augmentation = r::test_support::isolated_augmentation_config(1.F);
+ const auto future = history.prepare(loader, 0, keys, images, augmentation);
+ const std::vector<r::TrainingDonorDescriptor> future_donors(future.begin(), future.end());
+ CHECK(history.state() == accepted);
+ // Archives produced while a future plan exists contain only admitted slots.
+ values.data.donors = history.state();
+ auto pending_archive = continuation_fixture(request, values);
+ const auto pending_saved = r::detail::read_training_continuation(pending_archive);
+ REQUIRE(pending_saved);
+ resumed.restore(loader, pending_saved->values.data.donors);
+ CHECK(std::ranges::equal(resumed.prepare(loader, 0, keys, images, augmentation), future_donors));
+ history.commit();
+ resumed.commit();
+ CHECK(history.state() == resumed.state());
+ history.restore(loader, accepted);
+ (void)history.prepare(loader, 0, keys, images, augmentation);
+ history.discard();
+ CHECK_THROWS(history.commit());
+ CHECK(history.state() == accepted);
  for (const auto invalid : {r::TrainingDonorDescriptor{3, 0, true}, r::TrainingDonorDescriptor{1, 1, true}, r::TrainingDonorDescriptor{2, 0, true}}) {
   values.data.donors = {{1, 0, true}, invalid};
   auto archive = continuation_fixture(request, values);
@@ -483,8 +502,11 @@ TEST_CASE("Logical donor admission preserves original RLE support and empty-mask
   box_only.mask_rle_pairs = 0;
   differs_from_box += original.visible != r::map_augmentation_instance(box_only, 8, 8, &plan).visible;
   history.replace(0, std::array{box});
-  const auto donors = history.admit(loader, 0, std::array{key}, std::array<std::uint32_t, 1>{0}, config);
+  const auto donors = history.prepare(loader, 0, std::array{key}, std::array<std::uint32_t, 1>{0}, config);
   CHECK(donors[0] == box);
+  CHECK(history.state()[0] == box);
+  history.commit();
+  CHECK_THROWS(history.commit());
   CHECK(history.state()[0] == (original.visible ? masked : box));
   visible += original.visible;
   hidden += !original.visible;
@@ -495,9 +517,12 @@ TEST_CASE("Logical donor admission preserves original RLE support and empty-mask
  resumed.restore(loader, history.state());
  for (std::uint64_t key = 256; key < 288; ++key) {
   const auto index = static_cast<std::uint32_t>(key % 3);
-  const auto expected = history.admit(loader, 0, std::array{key}, std::array{index}, config)[0];
-  const auto actual = resumed.admit(loader, 0, std::array{key}, std::array{index}, config)[0];
+  const auto expected = history.prepare(loader, 0, std::array{key}, std::array{index}, config)[0];
+  const auto actual = resumed.prepare(loader, 0, std::array{key}, std::array{index}, config)[0];
   CHECK(actual == expected);
+  CHECK(resumed.state() == history.state());
+  history.commit();
+  resumed.commit();
   CHECK(resumed.state() == history.state());
  }
  CHECK(visible > 0);
@@ -505,12 +530,15 @@ TEST_CASE("Logical donor admission preserves original RLE support and empty-mask
  CHECK(differs_from_box > 0);
  config = r::test_support::isolated_augmentation_config(std::numeric_limits<float>::min());
  for (const auto descriptor : {box, empty}) {
-  (void)history.admit(loader, 0, std::array<std::uint64_t, 1>{42}, std::array{descriptor.image_index}, config);
+  (void)history.prepare(loader, 0, std::array<std::uint64_t, 1>{42}, std::array{descriptor.image_index}, config);
+  history.commit();
   CHECK(history.state()[0] == descriptor);
  }
  const auto retained = history.state();
- (void)history.admit(loader, 0, std::array<std::uint64_t, 1>{42}, std::array<std::uint32_t, 1>{3}, config);
+ (void)history.prepare(loader, 0, std::array<std::uint64_t, 1>{42}, std::array<std::uint32_t, 1>{3}, config);
+ history.commit();
  CHECK((history.state() == retained));
- REQUIRE_THROWS_WITH(history.admit(loader, 0, std::array<std::uint64_t, 1>{42}, std::array<std::uint32_t, 1>{4}, config), "logical donor source image is outside dataset");
+ REQUIRE_THROWS_WITH(history.prepare(loader, 0, std::array<std::uint64_t, 1>{42}, std::array<std::uint32_t, 1>{4}, config), "logical donor source image is outside dataset");
  CHECK((history.state() == retained));
+ REQUIRE_THROWS(history.commit());
 }

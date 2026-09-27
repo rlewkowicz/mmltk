@@ -193,6 +193,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_gradient_fixture.h)
     target_include_directories(mmltk_rfdetr_distributed_training_worker PRIVATE ${CMAKE_SOURCE_DIR})
     target_link_libraries(mmltk_rfdetr_distributed_training_worker PRIVATE
+        mmltk_backend_data_test_support
         mmltk::backend::models::rfdetr::training
         mmltk::backend::ml::cuda
         mmltk::backend::ml::torch_dependencies)

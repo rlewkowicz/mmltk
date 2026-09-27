@@ -468,6 +468,7 @@ void GpuAugmentationExecutor::Finish() {
 }
 void GpuAugmentationExecutor::Reconfigure(const GpuAugmentationConfig& config) {
  RequireActive();
+ impl_->plan_prepared = false;
  if (impl_->config == config) return;
  require(gpu_augmentation_config_valid(config), "invalid GPU augmentation configuration");
  Finish();

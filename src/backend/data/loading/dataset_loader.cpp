@@ -329,6 +329,23 @@ void DatasetLoader::begin_epoch(std::shared_ptr<const DatasetIndexSchedule> sche
  for (size_t index = 0; index < impl_->slots.size(); ++index) impl_->refill(index);
 }
 bool DatasetLoader::next_batch(Batch& out) { return next_batch(out, {}); }
+Batch DatasetLoader::describe_batch(const DatasetIndexSchedule& schedule, std::size_t microbatch, std::size_t global_batch, std::size_t begin, std::size_t count) const {
+ if (!global_batch || begin > global_batch || count > global_batch - begin || microbatch >= schedule.image_indices.size() / global_batch ||
+     schedule.draw_keys.size() != schedule.image_indices.size() || microbatch >= schedule.microbatch_keys.size())
+  throw std::invalid_argument("scheduled annotation batch shape differs");
+ const auto offset = microbatch * global_batch + begin;
+ for (const auto image : std::span{schedule.image_indices}.subspan(offset, count))
+  if (image >= num_images()) throw std::invalid_argument("scheduled annotation image is outside dataset");
+ return {
+  .draw_keys = std::span{schedule.draw_keys}.subspan(offset, count),
+  .microbatch_key = schedule.microbatch_keys[microbatch],
+  .num_images = count,
+  .label_index = label_index(),
+  .labels = label_data(),
+  .rle_pairs = rle_data(),
+  .image_indices = schedule.image_indices.data() + offset,
+ };
+}
 bool DatasetLoader::next_batch(Batch& out, std::stop_token stop) {
  if (stop.stop_requested()) return false;
  const auto wake = [this] {

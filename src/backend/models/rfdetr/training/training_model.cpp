@@ -119,9 +119,11 @@ TrainingModel::TrainingModel(TrainRequest request, std::size_t index, RuntimeCon
  const TrainingDataPlan& plan, DistributedContext group, TrainingPrecision precision, DetectionConfig criterion, std::function<void(std::uint64_t, std::exception_ptr)> failure)
     : impl_(std::make_unique<Impl>(std::move(request), index, runtime, std::move(loader), std::move(model), plan, std::move(group), precision, std::move(criterion), std::move(failure))) {}
 TrainingModel::~TrainingModel() = default;
+TrainingLanes& TrainingModel::test_lanes() { return *impl_->lanes; }
 void TrainingModel::stage_resume(const DecodedNativeModelState& state, const detail::TrainingContinuation& saved) {
  auto& p = *impl_;
  p.snapshot.require_inactive();
+ if (p.lanes) p.lanes->discard_prepared();
  detail::require_active_training_continuation(saved, p.options);
  if (saved.values.data.model_id != p.shard.model_id || saved.values.data.plan_hash != p.data_plan.hash()) throw std::invalid_argument("resume model/data identity differs");
  p.donors.restore(*p.loader, saved.values.data.donors);
@@ -200,6 +202,7 @@ void TrainingModel::start(std::shared_ptr<mmltk::common::concurrency::WorkerPool
 void TrainingModel::begin_epoch(std::uint64_t epoch, TrainingEpochDraws draws) {
  auto& p = *impl_;
  p.snapshot.require_inactive();
+ p.lanes->discard_prepared();
  p.epoch = mmltk::common::math::checked_cast<int>(epoch, "training epoch exceeds request range");
  p.draws = std::move(draws);
  p.epoch_closed = false;
@@ -273,33 +276,42 @@ std::uint64_t TrainingModel::attempt() {
      const auto offset = checked_training_product(microbatch, p.options.batch_size);
      auto augmentation = p.options.gpu_augmentation;
      if (p.epoch_policy.state().augmentation_disabled) augmentation.enabled = false;
-     current_donors.clear();
-     if (augmentation.enabled && augmentation.copy_paste_probability > 0) {
-      const auto donors = p.donors.admit(*p.loader, microbatch % (p.options.lane_configuration.mode == TrainLaneMode::SharedGradients ? p.options.lanes : 1),
-       std::span{p.draws.schedule->draw_keys}.subspan(offset, p.options.batch_size), std::span{p.draws.schedule->image_indices}.subspan(offset, p.options.batch_size), augmentation);
-      current_donors.assign(donors.begin() + p.rank_slice.begin, donors.begin() + p.rank_slice.begin + p.rank_slice.count);
-     }
-     p.clock->consume_microbatch();
-     ++p.cursor;
-     if (!p.rank_slice.count) {
-      p.counts->publish(lane, 0);
-      p.reducer->contribute_empty();
-      p.metrics.accumulate_empty();
-     } else {
-      mmltk::backend::data::Batch batch{};
-      if (!p.loader->next_batch(batch)) throw std::runtime_error("global training plan ended before its admitted microbatch");
-      if (batch.num_images != p.rank_slice.count) {
-       p.loader->release_batch(batch);
-       throw std::runtime_error("rank batch differs from admitted slice");
+     mmltk::backend::data::Batch batch{};
+     try {
+      const bool prepared = p.lanes->has_prepared();
+      const auto acquire = [&] {
+       if (!p.loader->next_batch(batch)) throw std::runtime_error("global training plan ended before its admitted microbatch");
+       if (batch.num_images != p.rank_slice.count) throw std::runtime_error("rank batch differs from admitted slice");
+      };
+      if (prepared) {
+       p.lanes->await_preparation(p.epoch, p.distributed.rank, microbatch);
+       acquire();
+       p.lanes->admit_prepared(batch);
       }
-      try {
-       wave.add(p.lanes->enqueue(&p.runtime, *p.loader, batch, &*ready, p.contributions, p.scaler.enabled() ? p.scaler.current_scale() : 1.0, p.parameter_version, p.detection, *p.owner,
-        p.options.device_id, p.loader->image_height(), p.loader->image_width(), p.shard.seed, p.epoch, p.distributed.rank, microbatch, p.precision.autocast_dtype != torch::kFloat32,
+      current_donors.clear();
+      if (augmentation.enabled && augmentation.copy_paste_probability > 0) {
+       if (!prepared) {
+        const auto donors = p.donors.prepare(*p.loader, microbatch % (p.options.lane_configuration.mode == TrainLaneMode::SharedGradients ? p.options.lanes : 1),
+         std::span{p.draws.schedule->draw_keys}.subspan(offset, p.options.batch_size), std::span{p.draws.schedule->image_indices}.subspan(offset, p.options.batch_size), augmentation);
+        current_donors.assign(donors.begin() + p.rank_slice.begin, donors.begin() + p.rank_slice.begin + p.rank_slice.count);
+       }
+       p.donors.commit();
+      }
+      p.clock->consume_microbatch();
+      ++p.cursor;
+      if (!p.rank_slice.count) {
+       p.counts->publish(lane, 0);
+       p.reducer->contribute_empty();
+       p.metrics.accumulate_empty();
+      } else {
+       if (!prepared) acquire();
+       wave.add(p.lanes->enqueue(&p.runtime, *p.loader, batch, &*ready, p.contributions, p.scaler.enabled() ? p.scaler.current_scale() : 1.0, p.parameter_version, p.detection,
+        p.options.device_id, p.shard.seed, p.epoch, p.distributed.rank, microbatch, p.precision.autocast_dtype != torch::kFloat32,
         p.precision.autocast_dtype, supervision_route(p.options.training_supervision), p.counts, *p.reducer, lane, current_donors));
-      } catch (...) {
-       p.loader->release_batch(batch);
-       throw;
       }
+     } catch (...) {
+      if (batch.owner) p.loader->release_batch(batch);
+      throw;
      }
     }
     wave.resolve_counts();
@@ -321,6 +333,8 @@ std::uint64_t TrainingModel::attempt() {
   const auto& gradients = p.reducer->finish_attempt();
   mmltk::common::logging::ScopedProfile profile_optimizer{"rfdetr.train.optimizer"};
   const auto found_inf = p.scaler.check_and_unscale_gradients_(gradients, optimizer.parameters().front().device());
+  if (p.options.lane_configuration.mode == TrainLaneMode::SharedGradients && p.contributions == 1 && p.rank_slice.count && p.cursor < p.draws.microbatches)
+   p.lanes->prepare_next(p.donors, p.draws.schedule, p.rank_slice, p.shard.seed, p.epoch, p.distributed.rank, p.cursor, p.detection.include_masks);
   p.last_metrics = p.metrics.complete_step(found_inf, p.contributions, p.cursor, p.distributed);
   p.counts->finalize_attempt();
   p.reducer->finalize_attempt();
@@ -353,8 +367,10 @@ std::uint64_t TrainingModel::attempt() {
   p.continuation.data.next_microbatch = p.cursor;
   return overflow ? 0 : checked_training_product(p.contributions, p.options.batch_size);
  } catch (...) {
-  p.failure(p.shard.model_id, std::current_exception());
-  throw;
+  const auto error = std::current_exception();
+  p.failure(p.shard.model_id, error);
+  try { p.lanes->discard_prepared(); } catch (...) {}
+  std::rethrow_exception(error);
  }
 }
 void TrainingModel::end_epoch() {

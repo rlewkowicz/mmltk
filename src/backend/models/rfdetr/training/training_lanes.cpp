@@ -24,8 +24,26 @@ struct TrainLaneContext {
  std::vector<torch::Tensor> grad_params;
  std::vector<torch::Tensor> copy_sources, copy_destinations;
  std::vector<TrainingDonorDescriptor> donors;
+ std::optional<PreparedTargets> prepared;
  size_t synced_parameter_version = std::numeric_limits<size_t>::max();
 };
+namespace {
+void prepare_training_input(TrainLaneContext& lane, const mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
+ std::uint64_t seed, int epoch, int rank, std::uint64_t sequence, bool include_masks) {
+ if (!lane.augmenter) throw std::runtime_error("parallel RF-DETR train lane is missing its GPU augmenter");
+ {
+  mmltk::common::logging::ScopedProfile profile_augment{"rfdetr.train.parallel.augment"};
+  mmltk::common::logging::ScopedProfile profile_augmentation{"benchmark.rfdetr.train.augmentation"};
+  lane.augmenter->prepare(batch, seed, epoch, rank, sequence, &loader, lane.donors);
+ }
+ {
+  mmltk::common::logging::ScopedProfile profile_targets{"rfdetr.train.parallel.targets"};
+  const auto& config = lane.model->config();
+  lane.prepared = build_targets(batch, loader.image_height(), loader.image_width(), include_masks, include_masks, lane.stream.device_index(), lane.target_scratch,
+   "train", config.num_queries, config.training_supervision, static_cast<int>(lane.model->class_layout()->catalog()->size()), &lane.augmenter->batch_plan());
+ }
+}
+}  // namespace
 std::optional<mmltk::backend::ml::cuda::CudaEventPool::Lease> record_current_stream_event(mmltk::backend::ml::cuda::CudaEventPool& event_pool, const int device_id, const char* context) {
  return event_pool.record(reinterpret_cast<std::uintptr_t>(torch_cuda::current_torch_cuda_stream_object(torch_cuda::checked_device_index(device_id)).stream()), context);
 }
@@ -151,6 +169,17 @@ struct TrainingLanes::Impl {
  at::cuda::CUDAEvent source_ready;
  std::deque<TrainLaneContext> lanes;
  std::shared_ptr<mmltk::common::concurrency::WorkerPool> pool;
+ RuntimeContext* runtime = nullptr;
+ mmltk::backend::data::DatasetLoader* loader = nullptr;
+ GpuAugmentationConfig augmentation;
+ std::size_t global_batch = 0, donor_streams = 0;
+ std::future<void> preparation;
+ std::exception_ptr preparation_failure;
+ std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule> prepared_schedule;
+ mmltk::backend::data::Batch prepared_batch;
+ TrainingDonorHistory* prepared_history = nullptr;
+ int prepared_epoch = 0, prepared_rank = 0;
+ std::uint64_t prepared_microbatch = 0;
 };
 TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_runtime, mmltk::backend::data::DatasetLoader& train_loader, std::shared_ptr<NativeRfDetrModel> model_owner,
  const std::vector<std::string>& all_param_names, int train_lane_count, std::size_t local_batch, const mmltk::frameworks::gpu::DeviceContext& augmentation_context,
@@ -158,6 +187,11 @@ TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_
     : impl_(std::make_shared<Impl>()) {
  auto& model = *model_owner;
  impl_->failure = std::move(failure);
+ impl_->runtime = &train_runtime;
+ impl_->loader = &train_loader;
+ impl_->augmentation = options.gpu_augmentation;
+ impl_->global_batch = options.batch_size;
+ impl_->donor_streams = options.lane_configuration.mode == TrainLaneMode::SharedGradients ? options.lanes : 1;
  auto& train_lane_pool = impl_->pool;
  auto& train_lanes = impl_->lanes;
  try {
@@ -209,6 +243,9 @@ void TrainingLanes::retire() noexcept {
    impl_->pool->wait_idle();
   } catch (...) {}
  }
+ try {
+  discard_prepared();
+ } catch (...) {}
  impl_->pool.reset();
  cudaError_t failure = cudaSuccess;
  for (const auto& lane : impl_->lanes) {
@@ -225,6 +262,7 @@ void TrainingLanes::retire() noexcept {
 void TrainingLanes::reconfigure(NativeRfDetrModel& source, const std::vector<std::string>& names, const GpuAugmentationConfig& augmentation, int batch_size, CompilationMode mode) {
  // Called only at a drained epoch boundary. Replicas and allocations are retained.
  settle_targets();
+ impl_->augmentation = augmentation;
  impl_->source_ready.record(torch_cuda::getCurrentCUDAStream(impl_->lanes.front().stream.device_index()));
  for (auto& lane : impl_->lanes) {
   impl_->source_ready.block(lane.stream);
@@ -237,34 +275,128 @@ void TrainingLanes::reconfigure(NativeRfDetrModel& source, const std::vector<std
   lane.synced_parameter_version = std::numeric_limits<size_t>::max();
  }
 }
+void TrainingLanes::prepare_next(TrainingDonorHistory& history, std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule> schedule, TrainingRankSlice slice,
+ std::uint64_t seed, int epoch, int rank, std::uint64_t microbatch, bool include_masks) {
+ auto& p = *impl_;
+ if (p.prepared_schedule || p.preparation.valid() || p.lanes.front().prepared) throw std::logic_error("training already has a prepared draw");
+ if (!schedule || !slice.count || p.lanes.size() != 1 || !p.pool) throw std::logic_error("training lookahead requires one nonempty lane");
+ p.prepared_schedule = std::move(schedule);
+ p.prepared_history = &history;
+ p.prepared_epoch = epoch;
+ p.prepared_rank = rank;
+ p.prepared_microbatch = microbatch;
+ const auto notify_failure = [](const PreparationObserver& observer, std::exception_ptr failure) noexcept {
+  if (!observer) return;
+  try { observer(nullptr, 0, std::move(failure)); } catch (...) {}
+ };
+ // All preparation failures, including admission to the worker, are retained
+ // until this draw is admitted. No peer failure callback runs in this job.
+ try {
+  p.preparation = p.pool->enqueue([&p, &history, slice, seed, epoch, rank, microbatch, include_masks, completed = preparation_completed_, notify_failure] {
+   auto& lane = p.lanes.front();
+   bool observer_called = false;
+   try {
+    ScopedRuntimeContext worker_scope(p.runtime, 1);
+    torch_cuda::TorchCudaDeviceGuard device_guard(lane.stream.device_index());
+    torch_cuda::TorchCudaStreamGuard stream_guard(lane.stream);
+    p.prepared_batch = p.loader->describe_batch(*p.prepared_schedule, microbatch, p.global_batch, slice.begin, slice.count);
+    lane.donors.clear();
+    if (p.augmentation.enabled && p.augmentation.copy_paste_probability > 0) {
+     const auto offset = microbatch * p.global_batch;
+     const auto donors = history.prepare(*p.loader, microbatch % p.donor_streams,
+      std::span{p.prepared_schedule->draw_keys}.subspan(offset, p.global_batch), std::span{p.prepared_schedule->image_indices}.subspan(offset, p.global_batch), p.augmentation);
+     lane.donors.assign(donors.begin() + slice.begin, donors.begin() + slice.begin + slice.count);
+    }
+    prepare_training_input(lane, *p.loader, p.prepared_batch, seed, epoch, rank, microbatch, include_masks);
+    observer_called = true;
+    if (completed) completed(&*lane.prepared, lane.target_scratch.copy_stream_handle(), {});
+   } catch (...) {
+    if (!observer_called) notify_failure(completed, std::current_exception());
+    throw;
+   }
+  });
+ } catch (...) {
+  // Retaining an enqueue failure must not allocate another promise while the
+  // current optimizer attempt is still waiting for numerical completion.
+  p.preparation_failure = std::current_exception();
+  notify_failure(preparation_completed_, p.preparation_failure);
+ }
+}
+void TrainingLanes::await_preparation(int epoch, int rank, std::uint64_t microbatch) {
+ auto& p = *impl_;
+ if (!p.prepared_schedule) throw std::logic_error("training has no prepared draw to admit");
+ if (epoch != p.prepared_epoch || rank != p.prepared_rank || microbatch != p.prepared_microbatch)
+  throw std::logic_error("prepared training draw differs from admission");
+ if (p.preparation_failure) std::rethrow_exception(p.preparation_failure);
+ if (!p.preparation.valid()) throw std::logic_error("prepared training draw was already admitted");
+ try {
+  p.preparation.get();
+ } catch (...) {
+  p.preparation_failure = std::current_exception();
+  throw;
+ }
+}
+void TrainingLanes::admit_prepared(const mmltk::backend::data::Batch& batch) {
+ auto& p = *impl_;
+ if (!p.prepared_schedule || p.preparation.valid() || p.preparation_failure || !p.lanes.front().prepared)
+  throw std::logic_error("training preparation has not completed successfully");
+ const auto& expected = p.prepared_batch;
+ if (!batch.owner || !batch.device_images || batch.num_images != expected.num_images || batch.microbatch_key != expected.microbatch_key || !std::ranges::equal(batch.draw_keys, expected.draw_keys) ||
+     !std::ranges::equal(std::span{batch.image_indices, batch.num_images}, std::span{expected.image_indices, expected.num_images}))
+  throw std::logic_error("acquired training batch differs from its prepared draw");
+ p.prepared_batch = {};
+ p.prepared_schedule.reset();
+ p.prepared_history = nullptr;
+}
+bool TrainingLanes::has_prepared() const noexcept { return impl_->prepared_schedule != nullptr; }
+void TrainingLanes::discard_prepared() {
+ auto& p = *impl_;
+ if (p.preparation.valid()) {
+  // Discarded work never entered the logical trajectory. Join it without
+  // promoting an unadmitted batch error to a previous successful update.
+  try { p.preparation.get(); } catch (...) {}
+ }
+ if (p.prepared_history) p.prepared_history->discard();
+ p.preparation_failure = {};
+ p.prepared_history = nullptr;
+ p.prepared_batch = {};
+ p.prepared_schedule.reset();
+ for (auto& lane : p.lanes) {
+  if (!lane.prepared) continue;
+  torch_cuda::TorchCudaDeviceGuard device_guard(lane.stream.device_index());
+  const auto copy_stream = torch_cuda::external_torch_cuda_stream(lane.target_scratch.copy_stream_handle(), lane.stream.device_index());
+  torch_cuda::TorchCudaStreamGuard stream_guard(copy_stream);
+  TargetConsumerLease consumer(lane.target_scratch, *lane.prepared, lane.stream.device_index());
+  consumer.retire();
+  lane.prepared.reset();
+ }
+}
 std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
  const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, std::size_t admitted_microbatches, double gradient_scale, size_t parameter_version, const DetectionConfig& detection_config,
- const NativeRfDetrModel& model, int device_id, int image_height, int image_width, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled,
+ int device_id, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled,
  at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<TrainingTargetCounts> normalizer, TrainingGradientReducer& reducer, std::size_t lane_index,
  std::span<const TrainingDonorDescriptor> donors) {
  auto& lane = impl_->lanes.at(lane_index);
- lane.donors.assign(donors.begin(), donors.end());
+ if (impl_->prepared_schedule) throw std::logic_error("training prepared draw has not been admitted");
+ if (!lane.prepared) lane.donors.assign(donors.begin(), donors.end());
  auto& lane_pool = *impl_->pool;
  return lane_pool.enqueue(
-  [failure = impl_->failure, runtime, &loader, &lane, batch, params_ready, admitted_microbatches, gradient_scale, parameter_version, &detection_config, &model, device_id, image_height, image_width,
+  [failure = impl_->failure, runtime, &loader, &lane, batch, params_ready, admitted_microbatches, gradient_scale, parameter_version, &detection_config, device_id,
    seed, epoch, rank, augmentation_sequence, amp_enabled, autocast_dtype, route, normalizer = std::move(normalizer), &reducer, lane_index]() mutable {
   try {
    ScopedRuntimeContext worker_scope(runtime, lane_index + 1);
    torch_cuda::TorchCudaDeviceGuard device_guard(torch_cuda::checked_device_index(device_id));
    torch_cuda::TorchCudaStreamGuard stream_guard(lane.stream);
    LoaderBatchGuard batch_guard(loader, batch, device_id);
+   if (!lane.prepared) prepare_training_input(lane, loader, batch, seed, epoch, rank, augmentation_sequence, detection_config.include_masks);
+   auto prepared = std::move(*lane.prepared);
+   lane.prepared.reset();
+   TargetConsumerLease target_consumer(lane.target_scratch, prepared, device_id);
    torch::Tensor normalized;
    {
-    mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_augment{"rfdetr.train.parallel.augment"};
-    mmltk::common::logging::ScopedProfile profile_benchmark_rfdetr_train_augmentation{"benchmark.rfdetr.train.augmentation"};
-    if (!lane.augmenter) { throw std::runtime_error("parallel RF-DETR train lane is missing its GPU augmenter"); }
-    normalized = lane.augmenter->run(batch, seed, epoch, rank, augmentation_sequence, &loader, lane.donors);
-   }
-   PreparedTargets prepared;
-   {
-    mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets{"rfdetr.train.parallel.targets"};
-    prepared = build_targets(batch, image_height, image_width, detection_config.include_masks, detection_config.include_masks, device_id, lane.target_scratch, "train", model.config().num_queries,
-     model.config().training_supervision, static_cast<int>(model.class_layout()->catalog()->size()), &lane.augmenter->batch_plan());
+    mmltk::common::logging::ScopedProfile profile_augment{"rfdetr.train.parallel.augment"};
+    mmltk::common::logging::ScopedProfile profile_augmentation{"benchmark.rfdetr.train.augmentation"};
+    normalized = lane.augmenter->run_prepared(batch, &loader, lane.donors);
    }
    const auto target_count = prepared_target_count(prepared);
    normalizer->publish(lane_index, target_count);
@@ -287,7 +419,6 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mml
    TensorMap loss_terms;
    {
     RoutedTrainingLoss loss_result;
-    TargetConsumerLease target_consumer(lane.target_scratch, prepared, device_id);
     auto& lane_owner = (*lane.model);
     SupervisionTimingLease step_timing(lane_owner, route_is_active(route), SupervisionTimingLease::Kind::Step);
     const TrainingStep step(admitted_microbatches, gradient_scale, amp_enabled, autocast_dtype);
@@ -368,6 +499,7 @@ void TrainingLanes::harvest_timing() {
  for (auto& lane : impl_->lanes) static_cast<void>(lane.model->harvest_supervision_timing());
 }
 void TrainingLanes::settle_targets() {
+ discard_prepared();
  for (auto& lane : impl_->lanes) lane.target_scratch.wait_for_pending_copy();
 }
 }  // namespace mmltk::backend::models::rfdetr

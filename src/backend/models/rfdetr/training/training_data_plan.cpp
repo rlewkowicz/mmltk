@@ -192,6 +192,7 @@ TrainingDonorSource resolve_training_donor(const mmltk::backend::data::DatasetLo
  return result;
 }
 std::span<const TrainingDonorDescriptor> TrainingDonorHistory::plan(std::size_t stream, std::span<const std::uint64_t> keys, std::span<const std::uint32_t> images) {
+ discard();
  if (stream >= slots_.size() / batch_ || keys.size() != batch_ || images.size() != batch_) throw std::invalid_argument("logical donor plan shape differs");
  for (std::size_t slot = 0; slot < batch_; ++slot) {
   const auto& descriptor = slots_[stream * batch_ + slot];
@@ -206,11 +207,14 @@ std::span<const TrainingDonorDescriptor> TrainingDonorHistory::plan(std::size_t 
  }
  return planned_;
 }
-std::span<const TrainingDonorDescriptor> TrainingDonorHistory::admit(
+std::span<const TrainingDonorDescriptor> TrainingDonorHistory::prepare(
  const mmltk::backend::data::DatasetLoader& loader, std::size_t stream, std::span<const std::uint64_t> keys, std::span<const std::uint32_t> images, const GpuAugmentationConfig& config) {
  auto donors = plan(stream, keys, images);
- if (!config.enabled || config.copy_paste_probability <= 0) return donors;
  std::fill(replacements_.begin(), replacements_.end(), TrainingDonorDescriptor{});
+ if (!config.enabled || config.copy_paste_probability <= 0) {
+  prepared_stream_ = stream;
+  return donors;
+ }
  for (std::size_t image = 0; image < batch_; ++image) {
   if (images[image] >= loader.num_images()) throw std::invalid_argument("logical donor source image is outside dataset");
   const auto donor = resolve_training_donor(loader, donors[image]);
@@ -227,11 +231,16 @@ std::span<const TrainingDonorDescriptor> TrainingDonorHistory::admit(
    if (augmentation_reservoir_select(plan.cache_choice, ++candidates, ordinal)) replacements_[image] = {images[image], ordinal, true};
   }
  }
- replace(stream, replacements_);
+ prepared_stream_ = stream;
  return donors;
+}
+void TrainingDonorHistory::commit() {
+ if (!prepared_stream_) throw std::logic_error("logical donor commit requires a prepared draw");
+ replace(*prepared_stream_, replacements_);
 }
 void TrainingDonorHistory::replace(std::size_t stream, std::span<const TrainingDonorDescriptor> replacements) {
  if (stream >= slots_.size() / batch_ || replacements.size() != batch_) throw std::invalid_argument("logical donor replacement shape differs");
+ discard();
  for (std::size_t index = 0; index < batch_; ++index)
   if (replacements[index].valid) slots_[stream * batch_ + index] = replacements[index];
 }
@@ -241,6 +250,7 @@ void TrainingDonorHistory::restore(const mmltk::backend::data::DatasetLoader& lo
   if (!descriptor.valid) continue;
   (void)donor_instance(loader, descriptor);
  }
+ discard();
  std::copy(saved.begin(), saved.end(), slots_.begin());
 }
 }  // namespace mmltk::backend::models::rfdetr

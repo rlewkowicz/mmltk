@@ -1,5 +1,4 @@
 #pragma once
-#include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include "src/backend/models/rfdetr/core/detail/matcher_workspace.h"

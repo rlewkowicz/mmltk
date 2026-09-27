@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 #include "training_data_state.h"
@@ -54,10 +55,13 @@ private:
 class TrainingDonorHistory final {
 public:
  TrainingDonorHistory(std::size_t streams, std::size_t global_batch);
- // The planned span stays valid until the next plan/admit on this owner.
+ // Planning changes reusable scratch only; state() remains admitted history.
+ // The returned span stays valid until the next plan/prepare on this owner.
  [[nodiscard]] std::span<const TrainingDonorDescriptor> plan(std::size_t stream, std::span<const std::uint64_t> image_keys, std::span<const std::uint32_t> images);
- [[nodiscard]] std::span<const TrainingDonorDescriptor> admit(
+ [[nodiscard]] std::span<const TrainingDonorDescriptor> prepare(
   const mmltk::backend::data::DatasetLoader&, std::size_t stream, std::span<const std::uint64_t> keys, std::span<const std::uint32_t> images, const GpuAugmentationConfig&);
+ void commit();
+ void discard() noexcept { prepared_stream_.reset(); }
  void replace(std::size_t stream, std::span<const TrainingDonorDescriptor>);
  void restore(const mmltk::backend::data::DatasetLoader&, std::span<const TrainingDonorDescriptor>);
  [[nodiscard]] const std::vector<TrainingDonorDescriptor>& state() const noexcept { return slots_; }
@@ -69,5 +73,6 @@ private:
  std::vector<TrainingDonorDescriptor> replacements_;
  std::vector<GpuAugmentationDonor> metadata_;
  CachedAugmentationDonorIndex index_;
+ std::optional<std::size_t> prepared_stream_;
 };
 }  // namespace mmltk::backend::models::rfdetr

@@ -22,6 +22,10 @@ class NativeRfDetrModel;
 class TrainingDataPlan;
 class TrainingValidationRuntime;
 class TrainingSnapshotPublication;
+class TrainingLanes;
+namespace testsupport {
+struct TrainingPreparationTestAccess;
+}
 struct DistributedContext;
 struct TrainingPrecision;
 struct DetectionConfig;
@@ -46,7 +50,8 @@ public:
  void begin_epoch(std::uint64_t epoch, TrainingEpochDraws);
  [[nodiscard]] bool exhausted() const;
  // Returns successful global image count; an overflow consumes the attempt but
- // contributes zero merge weight. The return boundary is physically drained.
+ // contributes zero merge weight. Admitted numerical work is complete at the
+ // return boundary; one annotation-only preparation may remain in flight.
  [[nodiscard]] std::uint64_t attempt();
  void end_epoch();
  // Starts after attempts/merges drain and lives through the session's last
@@ -67,6 +72,8 @@ public:
  void ordinary_changed();
 
 private:
+ friend struct testsupport::TrainingPreparationTestAccess;
+ [[nodiscard]] TrainingLanes& test_lanes();
  struct Impl;
  std::unique_ptr<Impl> impl_;
 };

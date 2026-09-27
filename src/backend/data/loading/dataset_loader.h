@@ -64,6 +64,9 @@ public:
  bool next_batch(Batch& out);
  // Cancellation only wakes acquisition; joining and checked-out custody remain with the owner.
  bool next_batch(Batch& out, std::stop_token);
+ // Immutable scheduled annotation view. It has no pixel storage or lease and
+ // cannot be passed to image handoff/release APIs. The schedule must outlive it.
+ [[nodiscard]] Batch describe_batch(const DatasetIndexSchedule&, std::size_t microbatch, std::size_t global_batch, std::size_t begin, std::size_t count) const;
  // Optional CPU pixels for this checked-out lease; valid until release_batch.
  // Contiguous images alias the source. Scattered GDR images gather once here.
  [[nodiscard]] std::span<const float> host_images(const Batch& batch);

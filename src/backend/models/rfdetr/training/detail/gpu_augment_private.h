@@ -24,6 +24,10 @@ public:
  void reconfigure(const GpuAugmentationConfig& config);
  [[nodiscard]] torch::Tensor run(const mmltk::backend::data::Batch& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence, const mmltk::backend::data::DatasetLoader* source = nullptr,
   std::span<const TrainingDonorDescriptor> donors = {});
+ // Host planning accepts annotation-only Batch views and never touches pixels.
+ void prepare(const mmltk::backend::data::Batch&, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence, const mmltk::backend::data::DatasetLoader* source = nullptr,
+  std::span<const TrainingDonorDescriptor> donors = {});
+ [[nodiscard]] torch::Tensor run_prepared(const mmltk::backend::data::Batch&, const mmltk::backend::data::DatasetLoader* source = nullptr, std::span<const TrainingDonorDescriptor> donors = {});
  [[nodiscard]] inline AugmentationBatchPlan& batch_plan() {
   RequireActive();
   return batch_plan_;
@@ -49,6 +53,7 @@ private:
  friend struct test_support::GpuBatchAugmenterTestAccess;
  void materialize_donors(const mmltk::backend::data::DatasetLoader&, std::span<const TrainingDonorDescriptor>);
  void ensure_copy_paste_resources();
+ [[nodiscard]] GpuAugmentationBatchView batch_view(const mmltk::backend::data::Batch&) const;
  [[nodiscard]] cudaError_t release_copy_paste_resources() noexcept;
  GpuAugmentationConfig config_;
  struct Resources final {
@@ -76,6 +81,11 @@ private:
  std::vector<GpuAugmentationDonor> planned_donor_metadata_;
  std::vector<TrainingDonorDescriptor> materialized_donors_;
  std::vector<std::span<const mmltk::backend::data::RLEPair>> planned_support_;
+ std::vector<std::uint64_t> planned_keys_;
+ std::vector<TrainingDonorDescriptor> planned_donors_;
+ const mmltk::backend::data::DatasetLoader* planned_source_ = nullptr;
+ std::uint64_t planned_microbatch_key_ = 0;
+ bool plan_prepared_ = false;
  std::size_t next_staging_slot_ = 0;
  bool logical_donors_ = false;
  std::vector<std::vector<mmltk::backend::data::RLEPair>> donor_support_;

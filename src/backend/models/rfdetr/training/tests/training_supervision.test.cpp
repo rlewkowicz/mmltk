@@ -2708,6 +2708,10 @@ TEST_CASE("Target slots prime independent uploads and protect delayed backward i
   lease.handoff();
  }
 }
+TEST_CASE("Shared training prepares the next draw with exact continuation and live parameter versions", "[rfdetr][training_supervision][cuda]") {
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; shared training preparation unexecuted");
+ rfdetr::testsupport::exercise_prepared_training({}, 0);
+}
 TEST_CASE("Partial target DMA failure retains staging and permits bounded recovery", "[rfdetr][training_supervision][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; partial target upload unexecuted");
  c10::cuda::CUDAGuard device_guard(0);

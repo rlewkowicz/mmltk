@@ -42,6 +42,8 @@ GpuBatchAugmenter::GpuBatchAugmenter(const GpuAugmentationConfig& config, const 
  planned_donor_metadata_.resize(static_cast<std::size_t>(batch_capacity_));
  materialized_donors_.resize(static_cast<std::size_t>(batch_capacity_));
  planned_support_.resize(static_cast<std::size_t>(batch_capacity_));
+ planned_keys_.reserve(static_cast<std::size_t>(batch_capacity_));
+ planned_donors_.reserve(static_cast<std::size_t>(batch_capacity_));
  executor_ = std::make_unique<GpuAugmentationExecutor>(config_, static_cast<std::size_t>(batch_capacity_), height_, width_, resources_->context, retirement_);
  if (executor_->copy_paste_enabled()) { ensure_copy_paste_resources(); }
 }
@@ -105,6 +107,7 @@ void GpuBatchAugmenter::reconfigure(const GpuAugmentationConfig& config) {
  if (resources_->cache_stream_ != nullptr) { CheckSettlement(stream_wait_(resources_->cache_stream_), "cudaStreamSynchronize before augmentation reconfigure"); }
  cache_ready_pending_ = false;
  cache_upload_pending_ = false;
+ plan_prepared_ = false;
  executor_->Reconfigure(config);
  config_ = config;
  if (executor_->copy_paste_enabled()) { ensure_copy_paste_resources(); }
@@ -197,20 +200,39 @@ void GpuBatchAugmenter::materialize_donors(const mmltk::backend::data::DatasetLo
   throw;
  }
 }
+GpuAugmentationBatchView GpuBatchAugmenter::batch_view(const mmltk::backend::data::Batch& batch) const {
+ return {
+  .input = batch.device_images,
+  .output = resources_->output_.data_ptr<float>(),
+  .image_indices = {batch.image_indices, batch.num_images},
+  .height = height_,
+  .width = width_,
+  .output_domain = GpuAugmentationOutputDomain::ModelNormalized,
+  .input_custody = batch.image_custody.lock(),
+  .output_custody = resources_,
+  .input_capacity_bytes = batch.image_capacity_bytes,
+  .output_capacity_bytes = tensor_bytes(resources_->output_),
+ };
+}
 torch::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence,
+ const mmltk::backend::data::DatasetLoader* source, std::span<const TrainingDonorDescriptor> supplied_donors) {
+ prepare(batch, seed, epoch, rank, sequence, source, supplied_donors);
+ return run_prepared(batch, source, supplied_donors);
+}
+void GpuBatchAugmenter::prepare(const mmltk::backend::data::Batch& batch, const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence,
  const mmltk::backend::data::DatasetLoader* source, std::span<const TrainingDonorDescriptor> supplied_donors) {
  RequireActive();
  require(static_cast<std::int64_t>(batch.num_images) <= batch_capacity_, "GPU augmentation batch exceeds preallocated capacity");
- require(batch.num_images == 0U || (batch.device_images != nullptr && batch.image_indices != nullptr), "GPU augmentation requires loader device images and identities");
+ require(!batch_run_pending_, "GPU augmentation planning requires the previous batch to be finished");
+ plan_prepared_ = false;
+ require(batch.num_images == 0U || batch.image_indices != nullptr, "GPU augmentation requires image identities");
  const auto device_index = checked_device_index(device_id_);
  TorchCudaDeviceGuard device_guard(device_index);
  // A same-device Torch guard can leave a fresh lane thread unbound. Donor
  // staging must run in the retained context before its first pinned allocation.
  resources_->context.Bind();
- const cudaStream_t stream = current_torch_cuda_stream_object(device_index).stream();
  logical_donors_ = source != nullptr;
  if (source && executor_->copy_paste_enabled()) {
-  if (batch_run_pending_) throw std::logic_error("logical donor cache changed before batch completion");
   require(supplied_donors.size() == batch.num_images, "logical donors must align with the local image batch");
   require(source->image_width() == static_cast<std::uint32_t>(width_) && source->image_height() == static_cast<std::uint32_t>(height_), "logical donor source geometry differs");
   for (std::size_t slot = 0; slot < supplied_donors.size(); ++slot) {
@@ -223,18 +245,39 @@ torch::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, c
  current_rank_ = rank;
  current_sequence_ = sequence;
  cache_consumer_prepared_ = false;
- const GpuAugmentationBatchView raw_batch{
-  .input = batch.device_images,
-  .output = resources_->output_.data_ptr<float>(),
-  .image_indices = {batch.image_indices, batch.num_images},
-  .height = height_,
-  .width = width_,
-  .output_domain = GpuAugmentationOutputDomain::ModelNormalized,
-  .input_custody = batch.image_custody.lock(),
-  .output_custody = resources_,
-  .input_capacity_bytes = batch.image_capacity_bytes,
-  .output_capacity_bytes = tensor_bytes(resources_->output_),
- };
+ mmltk::common::logging::ScopedProfile profile_rfdetr_augment_plan{"rfdetr.augment.plan"};
+ const auto selection = logical_donors_ ? GpuAugmentationDonorSelection::Aligned : GpuAugmentationDonorSelection::Cached;
+ const auto metadata = logical_donors_ ? std::span{planned_donor_metadata_}.first(batch.num_images) : std::span{donor_metadata_};
+ const auto raw_batch = batch_view(batch);
+ batch_plan_ = batch.draw_keys.empty() ? executor_->PrepareTraining(raw_batch, seed, epoch, rank, sequence, metadata, selection, next_staging_slot_)
+                                      : executor_->Prepare(raw_batch, batch.draw_keys, metadata, selection, next_staging_slot_);
+ for (auto& image : batch_plan_.images) {
+  if (image.paste_donor_slot < 0) continue;
+  const auto slot = static_cast<std::size_t>(image.paste_donor_slot);
+  const auto support = logical_donors_ ? planned_support_[slot] : std::span<const mmltk::backend::data::RLEPair>{donor_support_[slot]};
+  image.paste_support = support.data();
+  image.paste_support_count = support.size();
+ }
+ planned_keys_.assign(batch.draw_keys.begin(), batch.draw_keys.end());
+ planned_donors_.assign(supplied_donors.begin(), supplied_donors.end());
+ planned_source_ = source;
+ planned_microbatch_key_ = batch.microbatch_key;
+ plan_prepared_ = true;
+}
+torch::Tensor GpuBatchAugmenter::run_prepared(const mmltk::backend::data::Batch& batch, const mmltk::backend::data::DatasetLoader* source,
+ std::span<const TrainingDonorDescriptor> supplied_donors) {
+ RequireActive();
+ require(plan_prepared_, "GPU augmentation execution requires a prepared batch");
+ require(source == planned_source_ && std::ranges::equal(supplied_donors, planned_donors_), "prepared GPU augmentation donors differ");
+ require(batch.num_images == batch_plan_.active_size, "prepared GPU augmentation batch shape differs");
+ require(batch.microbatch_key == planned_microbatch_key_ && std::ranges::equal(batch.draw_keys, planned_keys_), "prepared GPU augmentation draw keys differ");
+ require(batch.num_images == 0U || (batch.device_images != nullptr && batch.image_indices != nullptr), "GPU augmentation requires loader device images and identities");
+ plan_prepared_ = false;
+ const auto device_index = checked_device_index(device_id_);
+ TorchCudaDeviceGuard device_guard(device_index);
+ resources_->context.Bind();
+ const cudaStream_t stream = current_torch_cuda_stream_object(device_index).stream();
+ const auto raw_batch = batch_view(batch);
  const GpuAugmentationDonorBatchView donors{
   .images = executor_->copy_paste_enabled() ? resources_->donor_images_.data_ptr<float>() : nullptr,
   .masks = executor_->copy_paste_enabled() && resources_->donor_masks_.defined() ? resources_->donor_masks_.data_ptr<std::int64_t>() : nullptr,
@@ -244,27 +287,14 @@ torch::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, c
   .image_custody = resources_,
   .image_capacity_bytes = tensor_bytes(resources_->donor_images_),
  };
- {
-  mmltk::common::logging::ScopedProfile profile_rfdetr_augment_plan{"rfdetr.augment.plan"};
-  const auto selection = logical_donors_ ? GpuAugmentationDonorSelection::Aligned : GpuAugmentationDonorSelection::Cached;
-  const auto metadata = logical_donors_ ? std::span{planned_donor_metadata_}.first(batch.num_images) : std::span{donor_metadata_};
-  batch_plan_ = batch.draw_keys.empty() ? executor_->PrepareTraining(raw_batch, seed, epoch, rank, sequence, metadata, selection, next_staging_slot_)
-                                       : executor_->Prepare(raw_batch, batch.draw_keys, metadata, selection, next_staging_slot_);
-  if (source && executor_->copy_paste_enabled()) materialize_donors(*source, supplied_donors);
-  if (cache_ready_pending_) {
-   CheckSettlement(cudaStreamWaitEvent(stream, resources_->cache_ready_, 0), "cudaStreamWaitEvent for donor cache readiness");
-   cache_ready_pending_ = false;
-  }
-  executor_->RunPrepared(raw_batch, donors, stream);
-  next_staging_slot_ = (next_staging_slot_ + 1U) % 2U;
+ if (source && executor_->copy_paste_enabled()) materialize_donors(*source, supplied_donors);
+ if (cache_ready_pending_) {
+  CheckSettlement(cudaStreamWaitEvent(stream, resources_->cache_ready_, 0), "cudaStreamWaitEvent for donor cache readiness");
+  cache_ready_pending_ = false;
  }
+ executor_->RunPrepared(raw_batch, donors, stream);
+ next_staging_slot_ = (next_staging_slot_ + 1U) % 2U;
  current_batch_size_ = static_cast<std::int64_t>(batch.num_images);
- for (auto& image : batch_plan_.images) {
-  if (image.paste_donor_slot < 0) continue;
-  const auto& support = donor_support_[static_cast<std::size_t>(image.paste_donor_slot)];
-  image.paste_support = support.data();
-  image.paste_support_count = support.size();
- }
 #if MMLTK_ENABLE_PROFILING
  std::int64_t paste_count = 0;
  std::int64_t resized_count = 0;

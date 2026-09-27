@@ -1303,6 +1303,16 @@ TEST_CASE("Prepared augmentation binds image identities and donor selection befo
  CHECK(executor.prepared_image_diagnostic(0, 0) == planned);
  executor.RunPrepared(batch, donor_batch, pixels->stream);
  CHECK(read() == actual);
+ // Both an unchanged policy boundary and a changed configuration invalidate
+ // unexecuted parameters; only preparation under the new policy may run.
+ for (const auto next : {test_support::isolated_augmentation_config(1.F), disabled_config()}) {
+  prepare();
+  executor.Reconfigure(next);
+  REQUIRE_THROWS(executor.RunPrepared(batch, donor_batch, pixels->stream));
+  prepare();
+  REQUIRE_NOTHROW(executor.RunPrepared(batch, donor_batch, pixels->stream));
+  executor.Finish();
+ }
 }
 TEST_CASE("Augmentation host staging retires before delayed pixel consumers", "[backend][rfdetr][augmentation][cuda]") {
  if (!has_cuda_device()) SKIP("CUDA unavailable; staging retirement remains unverified");

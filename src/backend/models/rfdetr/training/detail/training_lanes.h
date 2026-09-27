@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <deque>
+#include <exception>
 #include <future>
 #include <functional>
 #include <limits>
@@ -24,7 +25,11 @@
 #include "training_gradient_reducer.h"
 #include "target_builder_private.h"
 #include "gpu_augment_private.h"
+#include "training_data_plan.h"
 namespace mmltk::backend::models::rfdetr {
+namespace testsupport {
+struct TrainingPreparationTestAccess;
+}
 namespace torch_cuda = mmltk::backend::ml::cuda;
 class TrainingEventOwner final {
 public:
@@ -78,10 +83,19 @@ public:
  ~TrainingLanes();
  TrainingLanes(const TrainingLanes&) = delete;
  TrainingLanes& operator=(const TrainingLanes&) = delete;
+ // One annotation-only job on the existing lane worker. Its errors belong to
+ // the next admission, never to the optimizer attempt currently completing.
+ // The caller drains current CPU lane jobs and admits counts/gradients first.
+ void prepare_next(TrainingDonorHistory&, std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule>, TrainingRankSlice, std::uint64_t seed, int epoch, int rank,
+  std::uint64_t microbatch, bool include_masks);
+ void await_preparation(int epoch, int rank, std::uint64_t microbatch);
+ void admit_prepared(const mmltk::backend::data::Batch&);
+ [[nodiscard]] bool has_prepared() const noexcept;
+ void discard_prepared();
  // CLEANUP-IGNORE: This API declaration repeats its out-of-line definition's parameter types, not implementation.
  std::future<TrainLaneResult> enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
   const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, std::size_t admitted_microbatches, double gradient_scale, size_t parameter_version, const DetectionConfig& detection_config,
-  const NativeRfDetrModel& model, int device_id, int image_height, int image_width, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled,
+  int device_id, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled,
   at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<TrainingTargetCounts> normalizer, TrainingGradientReducer& reducer, std::size_t lane_index,
   std::span<const TrainingDonorDescriptor> donors);
  void settle(TrainLaneResult&, int device_id);
@@ -91,6 +105,10 @@ public:
  void settle_targets();
 
 private:
+ friend struct testsupport::TrainingPreparationTestAccess;
+ // An unset fixture seam performs no observation or synchronization.
+ using PreparationObserver = std::function<void(const PreparedTargets*, std::uintptr_t, std::exception_ptr)>;
+ PreparationObserver preparation_completed_;
  void retire() noexcept;
  struct Impl;
  mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement_{1U};

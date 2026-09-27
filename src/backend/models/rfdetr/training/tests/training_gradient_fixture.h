@@ -22,6 +22,7 @@ void exercise_early_bucket_overlap(const DistributedContext&, int device, bool a
 void exercise_bounded_gradient_buckets(int device);
 void exercise_direct_gradients(int device);
 void exercise_target_count_handoff(const DistributedContext&, int device);
+void exercise_prepared_training(const DistributedContext&, int device);
 void exercise_collective_custody(int device);
 void exercise_collective_cancellation(DistributedContext&, int device, std::string_view operation);
 }  // namespace testsupport
