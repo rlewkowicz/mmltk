@@ -93,9 +93,9 @@ have different meanings. Segmentation consumers require explicit mask presence;
 box-only data remains usable for detection.
 
 The format and validation implementation is in
-[dataset_compiler_scan_labels.cpp](../src/backend/data/dataset_compiler_scan_labels.cpp);
+[dataset_compiler_scan_labels.cpp](../src/backend/data/compiler/dataset_compiler_scan_labels.cpp);
 compiled metadata is defined in
-[compiled_format.h](../src/backend/data/compiled_format.h).
+[compiled_format.h](../src/backend/data/compiled/compiled_format.h).
 
 ## Resize geometry
 
@@ -142,8 +142,8 @@ Each split becomes a self-contained `.bin` containing transformed pixels and
 annotations; runtime loading needs no decode, parsing, resizing, or pixel-layout
 conversion. **Version 9** is a native little-endian Linux format of packed
 fixed-width structures, defined and validated by
-[compiled_format.h](../src/backend/data/compiled_format.h) and
-[compiled_file_utils.h](../src/backend/data/compiled_file_utils.h).
+[compiled_format.h](../src/backend/data/compiled/compiled_format.h) and
+[compiled_file_utils.h](../src/backend/data/compiled/compiled_file_utils.h).
 Readers reject unknown magic/version. Format 8 and all older files require
 recompilation; there is no legacy reader or migration.
 
@@ -321,7 +321,7 @@ inspection that does not read dataset contents or benchmark transfers.
 
 ## Benchmark-source acquisition
 
-The [benchmark compiler](../src/backend/data/benchmark_dataset_compiler.h)
+The [benchmark compiler](../src/backend/data/benchmark/benchmark_dataset_compiler.h)
 supports **Coco custom**, the existing COCO/Objects365/Open Images recipe, and
 **Coconut**, the full COCONut training recipe with three validation choices.
 It shares the compiled layout, resizer, and loader described here.
@@ -390,7 +390,7 @@ emphasize noise; no detector-accuracy or measured performance benefit is claimed
 ## Loading a compiled file
 
 [Metadata-only `info`](#compile-and-inspect) checks the header and section
-extents. Product loading through [CompiledDataset](../src/backend/data/compiled_dataset.h)
+extents. Product loading through [CompiledDataset](../src/backend/data/compiled/compiled_dataset.h)
 performs the full structural check before exposing views:
 
 1. map the regular file read-only with `MAP_SHARED`;
@@ -406,7 +406,7 @@ metadata and pixel view, so callers do not retain pointers beyond the
 `CompiledDataset`.
 
 Training and inference use
-[`DatasetLoader`](../src/backend/data/dataset_loader.h), which turns those
+[`DatasetLoader`](../src/backend/data/loading/dataset_loader.h), which turns those
 mapped images into bounded, leased GPU batches. At a high level:
 
 ```cpp
@@ -516,7 +516,7 @@ for placement, transport, capability inspection, and functional GDR checks.
 ## Explore thumbnails and atlas residency
 
 Explore uses
-[CompiledImageStream](../src/backend/data/compiled_image_stream.h) for reusable
+[CompiledImageStream](../src/backend/data/compiled/compiled_image_stream.h) for reusable
 disk-read, host-transfer, and device lanes. Explore's read scheduler retains a
 separate detail lane, so selecting a full-resolution image can progress
 independently of unrelated gallery reads. The default H2D path retains pinned

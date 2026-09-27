@@ -9,8 +9,8 @@
 #include "src/backend/models/rfdetr/inference/validate.h"
 #include "src/backend/imaging/raster/rendered_image_writer.h"
 #include "src/controller/subsystems/system/detail/prediction_preview.h"
-#include "src/frameworks/gpu/cuda_context_scope.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/cuda_context_scope.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller::detail {
 // Run selection and save policy stay with Validation. One source capture feeds
 // required native output and optional presentation through immutable handles.

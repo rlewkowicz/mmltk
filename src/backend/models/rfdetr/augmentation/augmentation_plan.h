@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include "gpu_augment_types.h"
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 namespace mmltk::backend::models::rfdetr {
 struct GpuAugmentationConfig;
 inline constexpr std::size_t kAugmentationTransformSize = 6;

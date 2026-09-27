@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <functional>
 #include <exception>
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 namespace mmltk::backend::imaging::upscale {
 enum class ImageUpscalerPurpose : std::uint8_t { Normal, Warm };
 enum class ImageUpscalerOutcome : std::uint8_t { Completed, Cancelled };

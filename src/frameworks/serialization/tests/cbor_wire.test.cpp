@@ -1,5 +1,4 @@
-#include "src/frameworks/reflection/declaration_annotations.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <algorithm>
 #include <array>
 #include <catch2/catch_test_macros.hpp>

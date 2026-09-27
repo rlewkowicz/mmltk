@@ -18,8 +18,8 @@ module;
 #include <system_error>
 #include <utility>
 #include <vector>
-#include "src/backend/data/compiled_dataset.h"
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_dataset.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/io/file_memory.h"

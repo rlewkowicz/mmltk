@@ -2,10 +2,10 @@
 #include "video_frame_convert.h"
 #include "video_media_detail.h"
 #include "src/common/system/numa_memory.h"
-#include "src/frameworks/gpu/cuda_context_scope.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
-#include "src/frameworks/gpu/cuda_high_water_allocation.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/cuda_context_scope.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
+#include "src/frameworks/gpu/cuda/cuda_high_water_allocation.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include <cuda_runtime_api.h>
 #include <cuda.h>
 extern "C" {

@@ -3,7 +3,7 @@
 #endif
 #include "src/backend/imaging/raster/rendered_image_writer.h"
 #include "src/backend/imaging/raster/detail/checked_png.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/test_support/async_test_utils.hpp"

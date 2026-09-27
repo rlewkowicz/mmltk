@@ -189,18 +189,30 @@ The normal product graph uses target-local PCHs for these ordinary C++ sources:
 
 | Owner | Shared header contents |
 | --- | --- |
-| `mmltk_backend_data`, `mmltk_controller_direct_services` | `src/pch_std.h`, `src/pch_json.h` |
-| `mmltk_backend_ml_cuda`, `mmltk_backend_models_rfdetr_core`, `mmltk_backend_models_rfdetr_training` | `src/pch_std.h`, `src/pch_torch.h` |
+| `mmltk_backend_data`, `mmltk_controller_direct_services` | `src/pch_std.h`, `src/pch_linux.h`, `src/pch_json.h` |
+| `mmltk_backend_models_rfdetr_core`, `mmltk_backend_models_rfdetr_training` | `src/pch_std.h`, `src/pch_linux.h`, `src/pch_torch.h` |
+| `mmltk_backend_ml_cuda` | `src/pch_std.h`, `src/pch_torch.h` |
 
-The standard group contains common standard-library headers; the JSON group
-contains nlohmann JSON; the Torch group contains only C10 CUDA stream/guard
-declarations. These headers supply reusable parsing work, not missing
-declaration dependencies. Each owner creates its own compiled artifact with
+Implementations using a compiled PCH include its shared headers explicitly
+instead of repeating their member includes. The standard and Linux/POSIX groups collect headers
+found in at least three distinct first-party files in the initial inventory.
+The JSON group contains nlohmann JSON; the Torch group contains only C10 CUDA
+stream/guard declarations. C++26-only standard headers are language-gated;
+reflection also requires the compiler's reflection feature macro.
+
+Declaration headers, CUDA, module global fragments and targets without a compiled
+PCH retain their direct library includes. A header's `pch_` name alone does not
+justify replacing narrow includes with it. Each registered owner creates its own compiled artifact with
 its own compiler, options, definitions, and include environment. C, CUDA,
 retained module providers/implementations/importers, header-isolation units,
 and sources with distinct per-source compile settings do not consume it.
 For example, ordinary `native_optimizer.cpp` uses the training owner's PCH;
 that target's module importers do not.
+
+`./mmltk --audit-includes` inventories includes and previews or applies replacement
+from the checked-in groups. Reports default to `output/include-audit.{json,md}`.
+Group membership is reviewed; it is not automatically pruned when direct includes
+disappear after consolidation. Use `--help` for options.
 
 [MmltkComponent.cmake](../cmake/MmltkComponent.cmake) derives
 `CMakeFiles/<target>.dir/mmltk-pch-policy.txt` from the target registration.

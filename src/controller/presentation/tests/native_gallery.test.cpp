@@ -35,13 +35,13 @@
 #include <variant>
 #include <vector>
 #include "src/test_support/filesystem_test_utils.hpp"
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/presentation/presentation_system.h"
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/settings/settings_system.h"
 #include "src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
 #include "src/common/io/scoped_fd.h"
 namespace mmltk::controller::explore_detail {

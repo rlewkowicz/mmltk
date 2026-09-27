@@ -1,7 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
-#include "src/frameworks/gpu/image_buffer.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_authority.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>

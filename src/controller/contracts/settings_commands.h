@@ -1,7 +1,5 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
-#include "src/frameworks/reflection/field_policy.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <cstdint>
 #include <optional>
 #include "src/backend/models/rfdetr/contract/execution_plan.h"

@@ -40,19 +40,29 @@ annotation, Explore, Live, and Upscale have their own implementation directories
 file dialogs, external-provider access, Firefox process ownership, and
 diagnostics live under `src/controller/services/`.
 
+Services are grouped into `file_dialog/`, `settings/`, `training/`, `firefox/`,
+`vast/`, and `diagnostics/` within that owner. These folders retain the same
+component target and public declarations; they add no coordinating layer.
+
+`src/backend/data/` separates benchmark acquisition and recipes in `benchmark/`
+(including `benchmark/coconut/`), compiled-file storage in `compiled/`, dataset
+construction in `compiler/`, and loader configuration/execution in `loading/`.
+Private benchmark and compiler declarations live in each family's `detail/`.
+The root `compiled_file.h` provides the shared format/layout/validation surface.
+
 The neutral [controller runtime](../src/controller/runtime/local_run.h) owns a
 local job's worker, startup settlement, stop, and join; product systems retain
 admission, state, failure translation, and events. Visual workers use the
 [presentation runtime](#presentation-and-browser-integration).
 
-[SettingsSystem](../src/controller/services/settings_system.h) owns live
+[SettingsSystem](../src/controller/services/settings/settings_system.h) owns live
 settings and mutation admission, plus the immutable native CUDA inventory
 supplied by the shell outside persisted preferences. The
 [GPU execution reference](gpu-execution.md#workflow-device-selection) owns
 device facts, workflow selection, admission, and runtime retirement.
-[SettingsStore](../src/controller/services/settings_store.h) owns parsing,
+[SettingsStore](../src/controller/services/settings/settings_store.h) owns parsing,
 repair, revision admission, durable writes, and persistence failures;
-[SettingsLocation](../src/controller/services/settings_location.h) carries the
+[SettingsLocation](../src/controller/services/settings/settings_location.h) carries the
 owned path bytes across worker calls.
 
 | Workflow owner | Implementation and handoff |
@@ -131,12 +141,12 @@ annotation metadata, and provenance without a model-layer dependency.
 The [benchmark recipes](benchmark-datasets.md) supply source membership and
 annotation policy to the same acquisition, resize, writer, and publication
 owners. Native
-[BenchmarkDatasetSelection](../src/backend/data/benchmark_dataset_options.h)
+[BenchmarkDatasetSelection](../src/backend/data/benchmark/benchmark_dataset_options.h)
 owns the recipe/validation/recovery vocabulary and defaults. Settings persistence
 and generated Rust project that declaration; the Dataset component owns control
 copy, visibility, and interaction.
 
-[dataset_compile_progress.h](../src/backend/data/dataset_compile_progress.h)
+[dataset_compile_progress.h](../src/backend/data/compiler/dataset_compile_progress.h)
 owns the shared acquisition, labels/masks, and pixel tracks plus benchmark source
 observations. `ArtifactProgress` carries those declarations directly into generated
 Rust. The [benchmark guide](benchmark-datasets.md#overlapping-acquisition-labels-and-pixels)
@@ -187,7 +197,7 @@ remains private to the implementation.
 Canonical [WorkflowOutputSelection/WorkflowOutputFacts](../src/controller/contracts/workflow_output.h)
 separate configured destinations from run directory, committed artifacts,
 sample summaries and partial-video facts. The shared
-[run reservation](../src/controller/services/run_output.h) is an ordinary
+[run reservation](../src/controller/services/training/run_output.h) is an ordinary
 filesystem utility; workflow systems retain admission, execution and failure
 policy. `TrainRunStore` additionally owns current-format history and Resume.
 [ExportRunRequest](../src/controller/subsystems/export/export_run.h) retains
@@ -482,11 +492,16 @@ owns the Original/canvas, aspect-restoration, and import behavior.
 
 [VisualRuntimeOwner](../src/controller/presentation/visual_runtime_owner.h)
 runs dirty work and completion continuations on each producer's worker.
-[SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.h) owns retained
+The GPU framework groups CUDA execution, context and retirement facilities in
+`frameworks/gpu/cuda/`, pinned and GDRCopy buffers in `memory/`, image storage
+and graphics interop in `image/`, and image runtime/model/worker coordination
+in `runtime/`. These folders share the existing GPU component; each ordinary
+header exposes its own dependencies.
+[SystemImageRuntime](../src/frameworks/gpu/runtime/system_image_runtime.h) owns retained
 product storage and counted reads;
-[ImageWorkspace](../src/frameworks/gpu/image_workspace.h) owns native custody
+[ImageWorkspace](../src/frameworks/gpu/image/image_workspace.h) owns native custody
 of a final Vulkan allocation and its immutable display layout;
-[ImportedImageBuffer](../src/frameworks/gpu/imported_image_buffer.h) retains
+[ImportedImageBuffer](../src/frameworks/gpu/image/imported_image_buffer.h) retains
 its CUDA mapping, context, and independent backing descriptor. The controller's
 [finalization policy](../src/controller/presentation/visual_runtime.cpp)
 connects these GPU owners to the raster backend. The GPU framework has no

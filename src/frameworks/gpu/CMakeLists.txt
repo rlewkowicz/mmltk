@@ -7,51 +7,51 @@ mmltk_configure_component(mmltk_frameworks_gpu PUBLIC_DECLARATIONS)
 mmltk_register_public_headers(mmltk_frameworks_gpu
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
-        cuda_launch.cuh
-        cuda_error.h
-        device_execution.h
-        device_inventory.h
-        pinned_host_buffer.h
-        gdr_mapped_buffer.h
-        image_geometry.h
-        image_buffer.h
-        image_failure.h
-        image_product_pool.h
-        image_product_retirement.h
-        image_types.h
-        image_workspace.h
-        imported_image_buffer.h
-        external_graphics_timeline.h
-        system_image_worker.h
-        system_image_runtime.h
-        product_revision_sequence.h
-        system_image_model.h
-        cuda_high_water_allocation.h
-        cuda_priority.h
-        cuda_device_scope.h
-        cuda_context_scope.h
-        resource_owner_command_authority.h
-        terminal_cuda_retirement_authority.h
-        terminal_cuda_retirement_owner.h
+        cuda/cuda_context_scope.h
+        cuda/cuda_device_scope.h
+        cuda/cuda_error.h
+        cuda/cuda_high_water_allocation.h
+        cuda/cuda_launch.cuh
+        cuda/cuda_priority.h
+        cuda/device_execution.h
+        cuda/device_inventory.h
+        cuda/resource_owner_command_authority.h
+        cuda/terminal_cuda_retirement_authority.h
+        cuda/terminal_cuda_retirement_owner.h
+        image/external_graphics_timeline.h
+        image/image_buffer.h
+        image/image_failure.h
+        image/image_geometry.h
+        image/image_product_pool.h
+        image/image_product_retirement.h
+        image/image_types.h
+        image/image_workspace.h
+        image/imported_image_buffer.h
+        memory/gdr_mapped_buffer.h
+        memory/pinned_host_buffer.h
+        runtime/product_revision_sequence.h
+        runtime/system_image_model.h
+        runtime/system_image_runtime.h
+        runtime/system_image_worker.h
 )
 mmltk_register_ordinary_sources(
     mmltk_frameworks_gpu
-    terminal_cuda_retirement_owner.cpp
-    cuda_runtime.cpp
-    device_execution.cpp
-    pinned_host_buffer.cpp
-    gdr_mapped_buffer.cpp
-    detail/gdr_buffer_backend.cpp
-    imported_image_buffer.cpp
-    external_graphics_timeline.cpp
-    image_buffer.cpp
-    image_workspace.cpp
-    image_product_pool.cpp
-    system_image_runtime.cpp
-    system_image_worker.cpp)
+    cuda/cuda_runtime.cpp
+    cuda/device_execution.cpp
+    cuda/terminal_cuda_retirement_owner.cpp
+    image/external_graphics_timeline.cpp
+    image/image_buffer.cpp
+    image/image_product_pool.cpp
+    image/image_workspace.cpp
+    image/imported_image_buffer.cpp
+    memory/detail/gdr_buffer_backend.cpp
+    memory/gdr_mapped_buffer.cpp
+    memory/pinned_host_buffer.cpp
+    runtime/system_image_runtime.cpp
+    runtime/system_image_worker.cpp)
 mmltk_register_private_headers(
     mmltk_frameworks_gpu
-    detail/gdr_buffer_backend.h
+    memory/detail/gdr_buffer_backend.h
 )
 
 target_link_libraries(mmltk_frameworks_gpu

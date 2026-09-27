@@ -1,10 +1,8 @@
 #include "gpu_batch_preprocessor.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment_cuda.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include <stdexcept>
-#include <string>
-#include <string_view>
+#include "src/frameworks/gpu/cuda/cuda_error.h"
+#include "src/pch_std.h"
 // CLEANUP-IGNORE: These local aliases name the shared CUDA helpers; they contain no duplicated algorithm.
 namespace mmltk::backend::models::rfdetr {
 using mmltk::backend::ml::cuda::checked_device_index;

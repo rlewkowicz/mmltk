@@ -9,9 +9,9 @@
 #include <optional>
 #include <stop_token>
 #include <variant>
-#include "src/frameworks/gpu/system_image_runtime.h"
-#include "src/frameworks/gpu/product_revision_sequence.h"
-#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
+#include "src/frameworks/gpu/runtime/product_revision_sequence.h"
+#include "src/frameworks/gpu/runtime/system_image_worker.h"
 #include "src/common/system/execution_policy.h"
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/controller/presentation/visual_system_types.h"

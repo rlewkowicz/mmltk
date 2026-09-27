@@ -3,8 +3,8 @@
 #endif
 #include "rendered_image_writer.h"
 #include "detail/checked_png.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
-#include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
 #include "src/common/concurrency/worker_pool.h"
 #include <cuda_runtime.h>
 #include <stb_image_write.h>

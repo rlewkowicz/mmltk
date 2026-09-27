@@ -1,7 +1,6 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <sys/types.h>
-#include "src/frameworks/reflection/field_policy.h"
 #include <atomic>
 #include <cstddef>
 #include <filesystem>
@@ -11,15 +10,14 @@
 #include <string_view>
 #include "src/controller/browser/application_browser_host.h"
 #include "src/controller/shell/application_lifecycle_event.h"
-#include "src/controller/services/diagnostics_client.h"
-#include "src/controller/services/file_dialog_client.h"
-#include "src/controller/services/firefox_process_owner.h"
-#include "src/controller/services/runtime_diagnostics.h"
-#include "src/controller/services/settings_location.h"
-#include "src/controller/services/vast_provider_owner.h"
+#include "src/controller/services/diagnostics/diagnostics_client.h"
+#include "src/controller/services/file_dialog/file_dialog_client.h"
+#include "src/controller/services/firefox/firefox_process_owner.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
+#include "src/controller/services/settings/settings_location.h"
+#include "src/controller/services/vast/vast_provider_owner.h"
 #include "src/controller/shell/application_system_storage.h"
 #include "src/controller/subsystems/live/live_system.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/transport/browser_server.h"
 namespace mmltk::controller::shell {
 namespace browser = mmltk::controller::browser;

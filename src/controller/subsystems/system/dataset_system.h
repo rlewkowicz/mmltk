@@ -12,8 +12,8 @@
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/artifact.h"
 #include "src/controller/services/artifact_store.h"
-#include "src/controller/services/runtime_diagnostics.h"
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
+#include "src/controller/services/settings/settings_system.h"
 #include "src/controller/runtime/local_run.h"
 namespace mmltk::controller {
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] DatasetProgress final {

@@ -4,13 +4,13 @@
 #include <memory>
 #include <span>
 #include <vector>
-#include "src/backend/data/compiled_dataset.h"
+#include "src/backend/data/compiled/compiled_dataset.h"
 #include "src/backend/imaging/explore/detail/explore_render_cuda_abi.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller::explore_detail {
 struct GalleryStreamTestAccess;
 struct GalleryProductState final {

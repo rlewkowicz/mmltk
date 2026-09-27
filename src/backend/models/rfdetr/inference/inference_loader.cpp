@@ -5,7 +5,7 @@ module;
 #include <memory>
 #include <stdexcept>
 #include <utility>
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 module mmltk.backend.models.rfdetr.inference.loader;
 namespace mmltk::backend::models::rfdetr::inference_detail {

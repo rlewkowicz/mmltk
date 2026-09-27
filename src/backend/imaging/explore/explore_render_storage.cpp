@@ -5,7 +5,7 @@
 #include <exception>
 #include <limits>
 #include <memory>
-#include "src/frameworks/gpu/cuda_high_water_allocation.h"
+#include "src/frameworks/gpu/cuda/cuda_high_water_allocation.h"
 namespace mmltk::backend::imaging::explore {
 namespace {
 [[nodiscard]] cudaError_t cuda_status(const ExploreStorageStatus status) noexcept { return static_cast<cudaError_t>(status); }

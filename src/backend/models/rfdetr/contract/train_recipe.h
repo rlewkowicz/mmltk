@@ -1,5 +1,5 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <array>
 #include <concepts>
 #include <cstddef>
@@ -10,9 +10,6 @@
 #include <type_traits>
 #include "mmltk/frameworks/reflection/member_path.h"
 #include "mmltk/frameworks/reflection/member_relation.h"
-#include "src/frameworks/reflection/field_policy.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
 namespace mmltk::backend::models::rfdetr {
 enum class TrainOptimizerKind : std::uint8_t {
  AdamW,

@@ -52,81 +52,82 @@ mmltk_register_public_headers(
     mmltk_backend_data
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
-        benchmark_dataset_compiler.h
-        benchmark_dataset_options.h
-        compiled_image_stream.h
-        compiled_dataset.h
-        compiled_file_layout.h
-        compiled_format.h
-        compiled_format_limits.h
-        dataset_compile_phase.h
-        dataset_compile_progress.h
-        dataset_compiler.h
-        dataset_loader.h
-        data_loading_options.h
-        compiled_file_utils.h
-        benchmark_hash.h
+        benchmark/benchmark_dataset_compiler.h
+        benchmark/benchmark_dataset_options.h
+        compiled/compiled_image_stream.h
+        compiled/compiled_dataset.h
+        compiled/compiled_file_layout.h
+        compiled_file.h
+        compiled/compiled_format.h
+        compiled/compiled_format_limits.h
+        compiler/dataset_compile_phase.h
+        compiler/dataset_compile_progress.h
+        compiler/dataset_compiler.h
+        loading/dataset_loader.h
+        loading/data_loading_options.h
+        compiled/compiled_file_utils.h
+        benchmark/benchmark_hash.h
 )
 mmltk_register_ordinary_sources(mmltk_backend_data
-    compiled_file_layout.cpp
-    compiled_dataset.cpp
-    benchmark_annotations.cpp
-    coconut_annotations.cpp
-    coconut_mask_recovery.cpp
-    coconut_parquet.cpp
-    coconut_catalog.cpp
-    benchmark_annotation_cache.cpp
-    benchmark_cache.cpp
-    benchmark_catalog.cpp
-    benchmark_compiler.cpp
-    benchmark_custom_recipe.cpp
-    coconut_recipe.cpp
-    benchmark_pipeline.cpp
-    benchmark_progress.cpp
-    benchmark_storage.cpp
-    open_images_acquisition.cpp
-    benchmark_curl.cpp
-    benchmark_download.cpp
-    benchmark_hash.cpp
-    benchmark_images.cpp
-    benchmark_image_decoder.cpp
-    benchmark_sampling.cpp
-    dataset_compiler_progress.cpp
+    compiled/compiled_file_layout.cpp
+    compiled/compiled_dataset.cpp
+    benchmark/benchmark_annotations.cpp
+    benchmark/coconut/coconut_annotations.cpp
+    benchmark/coconut/coconut_mask_recovery.cpp
+    benchmark/coconut/coconut_parquet.cpp
+    benchmark/coconut/coconut_catalog.cpp
+    benchmark/benchmark_annotation_cache.cpp
+    benchmark/benchmark_cache.cpp
+    benchmark/benchmark_catalog.cpp
+    benchmark/benchmark_compiler.cpp
+    benchmark/benchmark_custom_recipe.cpp
+    benchmark/coconut/coconut_recipe.cpp
+    benchmark/benchmark_pipeline.cpp
+    benchmark/benchmark_progress.cpp
+    benchmark/benchmark_storage.cpp
+    benchmark/open_images_acquisition.cpp
+    benchmark/benchmark_curl.cpp
+    benchmark/benchmark_download.cpp
+    benchmark/benchmark_hash.cpp
+    benchmark/benchmark_images.cpp
+    benchmark/benchmark_image_decoder.cpp
+    benchmark/benchmark_sampling.cpp
+    compiler/dataset_compiler_progress.cpp
     mask_rle_utils.cpp
     staging_file_cleanup.cpp)
 mmltk_register_retained_module_importers(mmltk_backend_data
-    compiled_image_stream.cpp
-    benchmark_writer.cpp
-    dataset_compiler.cpp
-    dataset_compiler_layout.cpp
-    dataset_compiler_pixels.cpp
-    dataset_compiler_scan_labels.cpp
-    dataset_loader.cpp)
+    compiled/compiled_image_stream.cpp
+    benchmark/benchmark_writer.cpp
+    compiler/dataset_compiler.cpp
+    compiler/dataset_compiler_layout.cpp
+    compiler/dataset_compiler_pixels.cpp
+    compiler/dataset_compiler_scan_labels.cpp
+    loading/dataset_loader.cpp)
 mmltk_register_ordinary_sources(mmltk_backend_data
     writable_pixel_range.cpp)
 mmltk_register_private_headers(mmltk_backend_data
-    detail/benchmark_annotation_cache.h
-    detail/benchmark_annotations.h
-    detail/coconut_annotations.h
-    detail/coconut_mask_recovery.h
-    detail/coconut_catalog.h
-    detail/coconut_inventory.h
-    detail/benchmark_cache.h
-    detail/benchmark_catalog.h
-    detail/benchmark_compiler.h
-    detail/benchmark_recipe.h
-    detail/benchmark_progress.h
-    detail/benchmark_storage.h
-    detail/open_images_acquisition.h
-    detail/benchmark_curl.h
-    detail/benchmark_download.h
-    detail/benchmark_images.h
-    detail/benchmark_image_decoder.h
-    detail/benchmark_sampling.h
-    detail/benchmark_pipeline.h
-    detail/benchmark_writer.h
+    benchmark/detail/benchmark_annotation_cache.h
+    benchmark/detail/benchmark_annotations.h
+    benchmark/coconut/detail/coconut_annotations.h
+    benchmark/coconut/detail/coconut_mask_recovery.h
+    benchmark/coconut/detail/coconut_catalog.h
+    benchmark/coconut/detail/coconut_inventory.h
+    benchmark/detail/benchmark_cache.h
+    benchmark/detail/benchmark_catalog.h
+    benchmark/detail/benchmark_compiler.h
+    benchmark/detail/benchmark_recipe.h
+    benchmark/detail/benchmark_progress.h
+    benchmark/detail/benchmark_storage.h
+    benchmark/detail/open_images_acquisition.h
+    benchmark/detail/benchmark_curl.h
+    benchmark/detail/benchmark_download.h
+    benchmark/detail/benchmark_images.h
+    benchmark/detail/benchmark_image_decoder.h
+    benchmark/detail/benchmark_sampling.h
+    benchmark/detail/benchmark_pipeline.h
+    benchmark/detail/benchmark_writer.h
     detail/worker_queue.h
-    detail/dataset_compiler_internal.h
+    compiler/detail/dataset_compiler_internal.h
     detail/mask_rle_utils.h
     detail/staging_file_cleanup.h
     detail/writable_pixel_range.h)
@@ -170,7 +171,7 @@ target_link_libraries(mmltk_backend_data
 
 mmltk_register_header_isolation(mmltk_backend_data)
 
-mmltk_target_precompiled_headers(mmltk_backend_data std json)
+mmltk_target_precompiled_headers(mmltk_backend_data std linux json)
 
 function(mmltk_add_backend_data_tests)
     add_library(mmltk_backend_data_test_support STATIC EXCLUDE_FROM_ALL)

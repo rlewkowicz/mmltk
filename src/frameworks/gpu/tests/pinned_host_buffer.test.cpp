@@ -1,7 +1,7 @@
 #include "src/frameworks/gpu/tests/pinned_host_fault.h"
 #include "src/test_support/async_test_utils.hpp"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
-#include "src/frameworks/gpu/device_execution.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>

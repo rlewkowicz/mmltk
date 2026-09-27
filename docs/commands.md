@@ -23,6 +23,7 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --cleanup-report cpp\|frontend\|all` | Generate the selected deduplication reports |
 | `./mmltk --raw-cpd [--review] [--min-tokens N] [--output PATH]` | Save exact-spelling C++ CPD evidence; `--review` adds an authored-file queue and lexical families in JSON/Markdown |
 | `./mmltk --format-declarations check\|preview\|fix [--file PATH] [--report PATH]` | Report or safely shorten canonical reflection annotation syntax |
+| `./mmltk --audit-includes [--refresh] [report\|preview\|fix] [--output PREFIX] [--build-dir PATH]` | Attribute and sort include evidence, identify folder/header clusters, and replace includes owned by shared PCH headers |
 | `./mmltk --test list` | List supported suites and test options |
 | `./mmltk --test all` | Run ordinary native, browser JavaScript/Rust, cleanup/declaration, and log-query fixtures |
 | `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |
@@ -41,7 +42,7 @@ Build, test, tidy, cleanup, export, and diagnostics are separate operations.
 Put `--logs`, `--diagnose-io`, `--diagnose-nvidia-payload`,
 `--diagnose-gpu-environment`, `--diagnose-gpu-program`, `--diagnose-native-symbols`,
 `--diagnose-native-link`, `--diagnose-processes`, `--diagnose-benchmark-image`,
-`--cleanup-report`, `--raw-cpd`, or `--format-declarations`
+`--cleanup-report`, `--raw-cpd`, `--format-declarations`, or `--audit-includes`
 first when invoking that standalone operation.
 
 Detailed references: [CUDA/Vulkan diagnostics](validation.md#standalone-cudavulkan-diagnostic),

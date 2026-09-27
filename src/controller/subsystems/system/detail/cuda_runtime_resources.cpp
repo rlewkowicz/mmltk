@@ -5,10 +5,10 @@
 #include <utility>
 #include "src/common/system/execution_policy.h"
 #include "src/controller/contracts/application_boundary.h"
-#include "src/frameworks/gpu/cuda_device_scope.h"
-#include "src/frameworks/gpu/cuda_context_scope.h"
-#include "src/frameworks/gpu/image_failure.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
+#include "src/frameworks/gpu/cuda/cuda_device_scope.h"
+#include "src/frameworks/gpu/cuda/cuda_context_scope.h"
+#include "src/frameworks/gpu/image/image_failure.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_authority.h"
 namespace mmltk::controller::detail {
 void RunWithRetainedCudaContext(std::shared_ptr<void> state, frameworks::gpu::TerminalCudaRetirementAuthority& retirement, std::string_view operation_name, std::function_ref<void()> operation) {
  namespace gpu = frameworks::gpu;

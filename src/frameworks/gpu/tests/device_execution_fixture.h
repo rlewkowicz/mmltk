@@ -1,6 +1,6 @@
 #pragma once
-#include "src/frameworks/gpu/device_execution.h"
-#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
 #include "src/common/system/execution_policy.h"
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>

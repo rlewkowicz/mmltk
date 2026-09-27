@@ -3,7 +3,7 @@
 #include "detail/training_lanes.h"
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include "src/backend/models/rfdetr/core/detail/matcher_workspace.h"
-#include "src/frameworks/gpu/cuda_priority.h"
+#include "src/frameworks/gpu/cuda/cuda_priority.h"
 #include <torch/csrc/autograd/autograd.h>
 #include <ATen/ops/_foreach_copy.h>
 #include <algorithm>

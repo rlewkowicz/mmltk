@@ -1,7 +1,7 @@
 #include "src/controller/browser/application_materializer.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
-#include "src/frameworks/gpu/gdr_mapped_buffer.h"
+#include "src/frameworks/gpu/memory/gdr_mapped_buffer.h"
 #include "src/controller/subsystems/explore/tests/support/explore_system_fixture.h"
 #include "src/controller/presentation/tests/support/visual_system_fixture.h"
 #include "src/controller/subsystems/explore/explore_system.h"
@@ -13,10 +13,10 @@
 #include "src/controller/presentation/workspace_input.h"
 #include "src/controller/presentation/visual_runtime_owner.h"
 #include "src/controller/presentation/visual_diagnostics.h"
-#include "src/controller/services/settings_system.h"
-#include "src/controller/services/diagnostics_client.h"
-#include "src/controller/services/runtime_diagnostics.h"
-#include "src/frameworks/gpu/image_buffer.h"
+#include "src/controller/services/settings/settings_system.h"
+#include "src/controller/services/diagnostics/diagnostics_client.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
 #include <algorithm>
 #include <array>
 #include <atomic>

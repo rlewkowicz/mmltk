@@ -7,7 +7,7 @@
 #include "training_scalar_packet.h"
 #include "training_metric_state.h"
 #include "training_distributed.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::backend::models::rfdetr {
 struct TrainingMetricSnapshot {
  double loss_sum = 0.0;

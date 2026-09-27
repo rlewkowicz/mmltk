@@ -1,6 +1,6 @@
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/common/types/utf8.h"
-#include "src/frameworks/gpu/image_workspace.h"
+#include "src/frameworks/gpu/image/image_workspace.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>

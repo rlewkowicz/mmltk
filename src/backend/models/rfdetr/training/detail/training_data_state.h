@@ -1,12 +1,10 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <cstdint>
 #include <limits>
 #include <vector>
-#include "src/backend/data/compiled_format_limits.h"
+#include "src/backend/data/compiled/compiled_format_limits.h"
 #include "src/backend/models/rfdetr/contract/execution_plan.h"
-#include "src/frameworks/reflection/field_policy.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
 namespace mmltk::backend::models::rfdetr {
 struct TrainingShard final {
  std::uint64_t model_id = 0;

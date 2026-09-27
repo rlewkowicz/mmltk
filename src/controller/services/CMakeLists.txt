@@ -11,43 +11,43 @@ mmltk_register_public_headers(
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
         artifact_store.h
-        diagnostics_client.h
-        file_dialog_catalog.h
-        file_dialog_system.h
-        settings_system.h
-        file_dialog_client.h
-        file_dialog_types.h
-        firefox_process_observation.h
-        firefox_process_owner.h
+        diagnostics/diagnostics_client.h
+        file_dialog/file_dialog_catalog.h
+        file_dialog/file_dialog_system.h
+        settings/settings_system.h
+        file_dialog/file_dialog_client.h
+        file_dialog/file_dialog_types.h
+        firefox/firefox_process_observation.h
+        firefox/firefox_process_owner.h
         persistence_types.h
-        runtime_diagnostics.h
-        runtime_diagnostic_span.h
-        settings_location.h
-        settings_store.h
-        train_command.h
-        train_process_client.h
-        run_output.h
-        train_run_store.h
-        vast_client.h
-        vast_provider_owner.h)
+        diagnostics/runtime_diagnostics.h
+        diagnostics/runtime_diagnostic_span.h
+        settings/settings_location.h
+        settings/settings_store.h
+        training/train_command.h
+        training/train_process_client.h
+        training/run_output.h
+        training/train_run_store.h
+        vast/vast_client.h
+        vast/vast_provider_owner.h)
 mmltk_register_ordinary_sources(
     mmltk_controller_direct_services
     artifact_store.cpp
-    diagnostics_client.cpp
-    file_dialog_catalog.cpp
-    file_dialog_system.cpp
-    settings_system.cpp
-    file_dialog_client.cpp
-    firefox_process_owner.cpp
-    runtime_diagnostics.cpp
-    settings_store.cpp
-    train_command.cpp
-    train_process_client.cpp
-    run_output.cpp
-    train_run_store.cpp
-    vast_client.cpp
-    vast_provider_owner.cpp
-    vast_runtime.cpp)
+    diagnostics/diagnostics_client.cpp
+    file_dialog/file_dialog_catalog.cpp
+    file_dialog/file_dialog_system.cpp
+    settings/settings_system.cpp
+    file_dialog/file_dialog_client.cpp
+    firefox/firefox_process_owner.cpp
+    diagnostics/runtime_diagnostics.cpp
+    settings/settings_store.cpp
+    training/train_command.cpp
+    training/train_process_client.cpp
+    training/run_output.cpp
+    training/train_run_store.cpp
+    vast/vast_client.cpp
+    vast/vast_provider_owner.cpp
+    vast/vast_runtime.cpp)
 target_include_directories(mmltk_controller_direct_services PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mmltk_controller_direct_services
     PUBLIC
@@ -73,7 +73,7 @@ target_link_libraries(mmltk_controller_direct_services
 mmltk_register_header_isolation(mmltk_controller_direct_services)
 
 set(MMLTK_VAST_BRIDGE_SOURCE
-    "${CMAKE_CURRENT_SOURCE_DIR}/vast_bridge.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vast/vast_bridge.py"
     CACHE INTERNAL "Controller-owned Vast bridge")
 
 add_library(mmltk_controller_settings_test_support INTERFACE)
@@ -84,7 +84,7 @@ target_link_libraries(mmltk_controller_settings_test_support INTERFACE
     mmltk::controller::direct_services mmltk_test_support)
 mmltk_register_header_isolation(mmltk_controller_settings_test_support)
 
-mmltk_target_precompiled_headers(mmltk_controller_direct_services std json)
+mmltk_target_precompiled_headers(mmltk_controller_direct_services std linux json)
 
 function(mmltk_add_controller_services_tests)
     add_executable(mmltk_controller_services_file_dialog_fixture

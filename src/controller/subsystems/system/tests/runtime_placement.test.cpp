@@ -15,12 +15,12 @@
 #include "src/controller/runtime/local_run.h"
 #include "src/controller/subsystems/system/compute_runtime.h"
 #include "src/controller/subsystems/system/detail/cuda_runtime_resources.h"
-#include "src/frameworks/gpu/image_failure.h"
-#include "src/frameworks/gpu/cuda_context_scope.h"
+#include "src/frameworks/gpu/image/image_failure.h"
+#include "src/frameworks/gpu/cuda/cuda_context_scope.h"
 #include "src/common/system/numa_topology.h"
 #include "src/common/system/execution_policy.h"
 #include "src/common/system/tests/denied_syscall.h"
-#include "src/frameworks/gpu/device_execution.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
 #include <array>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>

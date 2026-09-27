@@ -20,13 +20,13 @@
 #include <type_traits>
 #include <utility>
 #include "src/backend/models/rfdetr/core/detection_types.h"
-#include "src/backend/data/compiled_format.h"
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/compiled/compiled_format.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
 #include "src/backend/models/rfdetr/augmentation/annotation_support.h"
 #include "src/common/io/noexcept_io.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include "src/frameworks/gpu/cuda_priority.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
+#include "src/frameworks/gpu/cuda/cuda_priority.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "detail/target_builder_private.h"

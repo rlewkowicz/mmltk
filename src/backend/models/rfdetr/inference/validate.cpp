@@ -1,6 +1,6 @@
 #include "src/backend/models/rfdetr/core/evaluator.h"
-#include "src/backend/data/compiled_format.h"
-#include "src/backend/data/dataset_compiler.h"
+#include "src/backend/data/compiled/compiled_format.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/common/io/staging_directory.h"
 #include "src/common/io/file_memory.h"
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"

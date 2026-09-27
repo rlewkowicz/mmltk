@@ -1,5 +1,5 @@
 #pragma once
-#include "src/backend/data/dataset_compiler.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include <span>
 #include <cstdint>

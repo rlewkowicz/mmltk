@@ -2,8 +2,8 @@
 #include <cerrno>
 #include <cuda.h>
 #include "src/backend/media/capture/capture_session.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
-#include "src/frameworks/gpu/device_execution.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
 #include "src/common/system/numa_memory.h"
 #include "src/common/system/execution_policy.h"
 #include <cuda_runtime_api.h>

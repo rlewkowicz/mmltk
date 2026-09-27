@@ -1,5 +1,5 @@
 #pragma once
-#include "src/controller/services/runtime_diagnostics.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
 #include <filesystem>
 #include <memory>
 #include <optional>

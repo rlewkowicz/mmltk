@@ -1,8 +1,8 @@
 #include "video_file_sink.h"
 #include "video_media_detail.h"
 #include "video_frame_convert.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
-#include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <algorithm>

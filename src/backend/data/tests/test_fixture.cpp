@@ -1,5 +1,5 @@
 #include "src/backend/data/tests/test_fixture.h"
-#include "src/backend/data/dataset_compiler.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
 #include <stb_image_write.h>
 #include <array>
 #include <algorithm>

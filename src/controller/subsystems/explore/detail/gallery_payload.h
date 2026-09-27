@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <cuda_runtime_api.h>
-#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
 #include "src/backend/imaging/explore/detail/explore_render_cuda_abi.h"
 #include <cstring>
 #include <span>

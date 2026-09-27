@@ -30,7 +30,7 @@
 #include "detail/selective_compilation.h"
 #include "detail/modules_technical.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include "detail/training_supervision.h"
 #include "src/backend/ml/layers/ms_deform_attn.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"

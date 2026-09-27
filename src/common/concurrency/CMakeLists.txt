@@ -7,6 +7,7 @@ mmltk_configure_component(mmltk_common_concurrency PUBLIC_DECLARATIONS)
 mmltk_register_public_headers(mmltk_common_concurrency
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
+        concurrency.h
         event_cancellation.h
         cancellation_observation.h
         parallel_range.h
@@ -25,6 +26,8 @@ target_link_libraries(mmltk_common_concurrency
         mmltk::common::types
         Threads::Threads
 )
+
+mmltk_register_header_isolation(mmltk_common_concurrency)
 
 function(mmltk_add_common_concurrency_tests)
     add_executable(mmltk_common_concurrency_tests EXCLUDE_FROM_ALL)

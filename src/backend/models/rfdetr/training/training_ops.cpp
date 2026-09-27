@@ -1,12 +1,10 @@
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include <torch/torch.h>
-#include <cmath>
+#include "src/pch_std.h"
 #include <ATen/cuda/CUDAContext.h>
-#include <optional>
-#include <numbers>
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
-#include "src/frameworks/gpu/cuda_device_scope.h"
-#include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/cuda/cuda_device_scope.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "src/backend/ml/cuda/torch_cuda_utils.h"

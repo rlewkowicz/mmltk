@@ -1,10 +1,10 @@
 #include "src/controller/presentation/annotation_palette.h"
 #include "src/common/math/deterministic_sampling.h"
-#include "src/backend/data/compiled_dataset.h"
+#include "src/backend/data/compiled/compiled_dataset.h"
 #include "src/controller/subsystems/explore/explore_system.h"
-#include "src/controller/services/runtime_diagnostics.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include "src/controller/subsystems/explore/detail/gallery_stream.h"
 #include "src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h"
 #include <poll.h>
@@ -34,7 +34,7 @@
 #include <utility>
 #include <vector>
 #include <unistd.h>
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/system/execution_policy.h"

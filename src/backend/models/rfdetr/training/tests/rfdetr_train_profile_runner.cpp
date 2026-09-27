@@ -10,8 +10,8 @@
 #include <functional>
 #include <string_view>
 #include "src/test_support/profile_runner_common.h"
-#include "src/backend/data/compiled_file_utils.h"
-#include "src/backend/data/dataset_compiler.h"
+#include "src/backend/data/compiled/compiled_file_utils.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"

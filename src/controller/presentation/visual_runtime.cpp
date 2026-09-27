@@ -1,7 +1,7 @@
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/common/system/numa_topology.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
-#include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
 #include <utility>
 import mmltk.backend.imaging.raster;
 namespace mmltk::controller {

@@ -5,7 +5,7 @@
 #include "src/controller/subsystems/annotation/tests/support/annotation_test_utils.hpp"
 #include "src/controller/browser/application_browser_host.h"
 #include "src/controller/browser/application_event_publisher.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <arpa/inet.h>
@@ -39,10 +39,10 @@
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/presentation/presentation_system.h"
-#include "src/controller/services/diagnostics_client.h"
-#include "src/controller/services/file_dialog_system.h"
-#include "src/controller/services/runtime_diagnostics.h"
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/diagnostics/diagnostics_client.h"
+#include "src/controller/services/file_dialog/file_dialog_system.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
+#include "src/controller/services/settings/settings_system.h"
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/controller/subsystems/explore/explore_system.h"

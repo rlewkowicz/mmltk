@@ -3,8 +3,8 @@
 #include "src/backend/models/rfdetr/augmentation/augmentation_plan.h"
 #include <algorithm>
 #include <array>
-#include "src/frameworks/gpu/image_buffer.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::backend::models::rfdetr::test_support {
 struct GpuAugmentationTestAccess final {
  static void FailEventWait(GpuAugmentationExecutor& executor) {

@@ -1,7 +1,5 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <sys/types.h>
 #include <cstdint>
 #include <cstddef>
@@ -18,7 +16,7 @@
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/controller/presentation/visual_diagnostics.h"
-#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
 namespace mmltk::controller {
 struct VisualSourceReader final {
  PresentationSourceIdentity source{};

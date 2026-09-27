@@ -5,9 +5,9 @@
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/controller/contracts/model_selection.h"
-#include "src/controller/services/file_dialog_catalog.h"
-#include "src/controller/services/file_dialog_system.h"
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/file_dialog/file_dialog_catalog.h"
+#include "src/controller/services/file_dialog/file_dialog_system.h"
+#include "src/controller/services/settings/settings_system.h"
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include <catch2/catch_test_macros.hpp>

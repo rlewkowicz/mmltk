@@ -6,8 +6,8 @@
 #include <string_view>
 #include <vector>
 #include "src/backend/models/rfdetr/core/detection_types.h"
-#include "src/backend/data/compiled_format.h"
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/compiled/compiled_format.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include "src/backend/models/rfdetr/augmentation/augmentation_plan.h"
 #include <torch/types.h>

@@ -19,8 +19,8 @@
 #include "src/backend/media/live/detail/live_output_callback_lifetime.h"
 #include "src/backend/media/live/detail/live_physical_retirement.h"
 #include "src/backend/media/live/detail/live_slot_state.h"
-#include "src/frameworks/gpu/device_execution.h"
-#include "src/frameworks/gpu/resource_owner_command_authority.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
+#include "src/frameworks/gpu/cuda/resource_owner_command_authority.h"
 namespace mmltk::backend::media::live {
 namespace {
 TEST_CASE("Live rejects placement belonging to a different capture receiver before allocating resources", "[live][numa]") {

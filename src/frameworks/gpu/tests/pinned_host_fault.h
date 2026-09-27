@@ -1,5 +1,5 @@
 #pragma once
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 #include <optional>
 namespace mmltk::frameworks::gpu::test_support {
 // Deterministic faults at real registered-page retirement boundaries. Zero

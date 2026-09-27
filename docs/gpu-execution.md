@@ -13,7 +13,7 @@ owns producer/raw/display inventories, completion, and redraw mechanics.
 Train, Validate, Export, and Predict share the
 [GPU selector card](gui-interaction.md#gpu-selection), while each workflow owns
 its persisted choice. Native
-[CudaDeviceFact](../src/frameworks/gpu/device_inventory.h) declares the CUDA
+[CudaDeviceFact](../src/frameworks/gpu/cuda/device_inventory.h) declares the CUDA
 ordinal, name, and total VRAM. The shell discovers the process-visible inventory
 once; `SettingsSystem` retains it as immutable `SettingsUiState.cuda_devices`,
 outside saved settings. C++ reflection projects these facts into generated Rust.
@@ -136,7 +136,7 @@ runtime object is returned. Terminal leases are reserved before CUDA work;
 diagnostic identities and object destruction do not establish safe retirement.
 
 Inference session close explicitly retires count, readback, and annotation storage.
-[PinnedHostBuffer](../src/frameworks/gpu/pinned_host_buffer.cpp) shares its
+[PinnedHostBuffer](../src/frameworks/gpu/memory/pinned_host_buffer.cpp) shares its
 terminal authority with the owning session/output and retained tensor views.
 Both explicit release failures and last-borrower unregister or context failures
 retain the storage and reach that same admission authority.
@@ -221,7 +221,7 @@ retain separate identities; enabled EMA updates themselves stay on the GPU.
 The shared [Torch stream boundary](../src/backend/ml/cuda/detail/torch_cuda_scope.cpp)
 establishes a driver context before pinned-host or tensor work on a newly
 started thread, including reuse after Torch's stream tables already exist.
-The [image context owner](../src/frameworks/gpu/image_buffer.cpp) balances
+The [image context owner](../src/frameworks/gpu/image/image_buffer.cpp) balances
 isolated-context creation's stack entry before ordinary binding and retirement.
 Context identity and physical completion, rather than a reported device index
 alone, govern safe resource use.
@@ -269,9 +269,9 @@ previous completed product. Subsequent source reads acquire/release the
 external image in `GENERAL`; copied sample storage returns to its shared
 shader-read layout.
 
-[ImageWorkspace](../src/frameworks/gpu/image_workspace.h) coordinates native
+[ImageWorkspace](../src/frameworks/gpu/image/image_workspace.h) coordinates native
 admission and physical access.
-[ImportedImageBuffer](../src/frameworks/gpu/imported_image_buffer.cpp) validates
+[ImportedImageBuffer](../src/frameworks/gpu/image/imported_image_buffer.cpp) validates
 the CUDA device UUID, retains the received backing FD, and gives CUDA a separate
 consuming duplicate. It imports and maps the full reported allocation at offset
 zero, then exposes `mapped_base + image_offset` with the negotiated row pitch.
@@ -295,7 +295,7 @@ partial construction, registry/IPC removal, and final destruction. Exit proves
 neither completion nor safe reuse; [presentation custody](gui-interaction.md#native-gpu-custody-and-completion)
 owns source-read, callback, draw, and terminal settlement.
 
-[SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.cpp) binds its
+[SystemImageRuntime](../src/frameworks/gpu/runtime/system_image_runtime.cpp) binds its
 execution context before model release and again before destroying the released
 model. Failed binding or incomplete release retains the model, context, and
 stream custody with the failure. Live's private
@@ -346,8 +346,8 @@ draw settlement requirements.
 This partial storage stays inside the workspace finalization boundary.
 Public `ImageProductBuffer::CopyFrom` operations continue to produce complete
 receiver-owned raw products. The implementation is in
-[image_buffer.cpp](../src/frameworks/gpu/image_buffer.cpp) and
-[image_workspace.cpp](../src/frameworks/gpu/image_workspace.cpp).
+[image_buffer.cpp](../src/frameworks/gpu/image/image_buffer.cpp) and
+[image_workspace.cpp](../src/frameworks/gpu/image/image_workspace.cpp).
 
 The [standalone CUDA/Vulkan diagnostic](validation.md#standalone-cudavulkan-diagnostic)
 exercises allocation, descriptor, timeline, pixel, and exporter-exit behavior

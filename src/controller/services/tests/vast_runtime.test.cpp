@@ -1,7 +1,7 @@
 #include <string>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
-#include "src/controller/services/vast_client.h"
+#include "src/controller/services/vast/vast_client.h"
 namespace {
 using namespace mmltk::controller::services;
 using namespace mmltk::controller::contracts;

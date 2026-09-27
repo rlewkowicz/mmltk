@@ -7,7 +7,7 @@
 #include <vector>
 #include <type_traits>
 #include <utility>
-#include "src/backend/data/compiled_dataset.h"
+#include "src/backend/data/compiled/compiled_dataset.h"
 #include "src/backend/imaging/explore/detail/explore_render_cuda_abi.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 namespace mmltk::controller::explore_detail {

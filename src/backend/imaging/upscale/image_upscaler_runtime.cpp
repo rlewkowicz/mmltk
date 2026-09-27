@@ -13,8 +13,8 @@ module;
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/common/system/runtime_paths.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 #include "upscale_execution.h"
 module mmltk.backend.imaging.upscale.image_upscaler;
 #include "detail/image_upscaler_internal.h"

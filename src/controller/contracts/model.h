@@ -1,5 +1,5 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -7,9 +7,6 @@
 #include <optional>
 #include <string_view>
 #include <type_traits>
-#include "src/frameworks/reflection/field_policy.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/controller/contracts/model_selection.h"
 #include "src/controller/contracts/model_selection_types.h"

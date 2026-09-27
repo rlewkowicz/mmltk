@@ -24,9 +24,9 @@
 #include "cli_output.h"
 #include "rfdetr_cli_options.h"
 #include "spdmon/spdmon.hpp"
-#include "src/backend/data/benchmark_dataset_compiler.h"
-#include "src/backend/data/dataset_compiler.h"
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/models/rfdetr/contract/cli.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
@@ -36,7 +36,7 @@
 #include "src/backend/models/rfdetr/training/train.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/common/system/runtime_paths.h"
-#include "src/controller/services/train_command.h"
+#include "src/controller/services/training/train_command.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.inference.analysis_provider;

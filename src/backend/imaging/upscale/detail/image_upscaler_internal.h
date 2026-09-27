@@ -10,8 +10,8 @@
 #include <utility>
 #include "src/backend/imaging/upscale/upscale_execution.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 namespace mmltk::backend::imaging::upscale {
 using mmltk::backend::ml::runtime::TensorRtEngine;
 // Cleanup visits every independent obligation. Failed dependencies retain their

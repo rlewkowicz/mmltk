@@ -1,6 +1,6 @@
 #pragma once
 #include "src/backend/media/capture/capture_session.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 #include "src/common/system/numa_memory.h"
 #include <cuda_runtime_api.h>
 #include <linux/videodev2.h>

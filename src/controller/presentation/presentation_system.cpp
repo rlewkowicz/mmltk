@@ -15,7 +15,7 @@
 #include "src/common/io/event_fd.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/common/types/generation.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller {
 VisualDiagnosticFact presentation_diagnostic_fact(const VisualDiagnosticOperation operation, const PresentationDiagnosticRecord& record, const int device, const std::uint64_t outcome) noexcept {
  const auto& capability = record.publication.capability;

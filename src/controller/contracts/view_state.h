@@ -1,7 +1,7 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include "prediction_output.h"
-#include "src/backend/data/benchmark_dataset_options.h"
+#include "src/backend/data/benchmark/benchmark_dataset_options.h"
 #include <array>
 #include "src/backend/imaging/resample/image_resize.h"
 #include <concepts>
@@ -11,9 +11,6 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include "src/frameworks/reflection/field_policy.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "mmltk/frameworks/reflection/member_path.h"
 #include "mmltk/frameworks/reflection/member_relation.h"

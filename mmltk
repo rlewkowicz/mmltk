@@ -3052,20 +3052,31 @@ run_declaration_tool() {
     local operation="$1"
     shift
     local script=/workspace/tools/generate_cleanup_json.mjs
+    local configure=""
     local -a arguments=(--raw-cpd)
     if [[ "${operation}" == "format" ]]; then
         script=/workspace/tools/format_declarations.mjs
         arguments=()
+    elif [[ "${operation}" == "includes" ]]; then
+        script=/workspace/tools/audit_includes.mjs
+        arguments=()
+        if [[ "${1:-}" == "--refresh" ]]; then
+            shift
+            configure='/workspace/tools/configure_cmake_graph.sh release "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release" -DBUILD_MMLTK_BROWSER_HOST=ON -DBUILD_MMLTK_FIREFOX_RUNTIME=ON -DMMLTK_BUILD_JOBS="${MMLTK_JOBS}" -DMMLTK_FIREFOX_CACHE_ROOT="${MMLTK_FIREFOX_CACHE_ROOT}"; '
+        fi
     fi
     arguments+=("$@")
     local command
     printf -v command '%q ' node "${script}" "${arguments[@]}"
     acquire_mutation_locks
+    if [[ "${operation}" == "includes" ]]; then
+        prepare_owned_dirs "${repo_root}/output"
+    fi
     ensure_docker
     prepare_cache_layout
     ensure_build_image
     local status=0
-    run_owned_toolchain_command "${cleanup_report_container_name}" "set -euo pipefail; ${command}" || status=$?
+    run_owned_toolchain_command "${cleanup_report_container_name}" "set -euo pipefail; ${configure}${command}" || status=$?
     release_mutation_locks
     return "${status}"
 }
@@ -3080,7 +3091,7 @@ run_cleanup_tool_tests() {
     local command
     printf -v command '%q ' node --test "${test_filters[@]}" \
         /workspace/tools/tests/generate_cleanup_json.test.mjs /workspace/tools/tests/format_declarations.test.mjs \
-        /workspace/tools/tests/review_candidates.test.mjs
+        /workspace/tools/tests/review_candidates.test.mjs /workspace/tools/tests/audit_includes.test.mjs
     acquire_mutation_locks
     ensure_docker
     prepare_cache_layout
@@ -4078,10 +4089,11 @@ if ((${#passthrough_args[@]} > 0)); then
             die "--diagnose-io requires exactly one compiled-file path"
         diagnose_io_path="${passthrough_args[1]}"
         passthrough_args=()
-    elif [[ "${passthrough_args[0]}" == "--raw-cpd" || "${passthrough_args[0]}" == "--format-declarations" ]]; then
+    elif [[ "${passthrough_args[0]}" == "--raw-cpd" || "${passthrough_args[0]}" == "--format-declarations" || "${passthrough_args[0]}" == "--audit-includes" ]]; then
         declaration_tool_mode=1
         declaration_tool_operation=raw
         [[ "${passthrough_args[0]}" != "--format-declarations" ]] || declaration_tool_operation=format
+        [[ "${passthrough_args[0]}" != "--audit-includes" ]] || declaration_tool_operation=includes
         declaration_tool_args=("${passthrough_args[@]:1}")
         passthrough_args=()
     elif [[ "${passthrough_args[0]}" == "--cleanup-report" ]]; then
@@ -4124,8 +4136,8 @@ if (( ! cleanup_report_mode )); then
 fi
 
 for arg in "${passthrough_args[@]}"; do
-    [[ "${arg}" != "--raw-cpd" && "${arg}" != "--format-declarations" ]] ||
-        die "--raw-cpd and --format-declarations must be standalone operations"
+    [[ "${arg}" != "--raw-cpd" && "${arg}" != "--format-declarations" && "${arg}" != "--audit-includes" ]] ||
+        die "--raw-cpd, --format-declarations and --audit-includes must be standalone operations"
     [[ "${arg}" != "--logs" ]] ||
         die "--logs must be the standalone operation; use './mmltk --logs --help'"
     [[ "${arg}" != "--diagnose-gpu-environment" ]] ||

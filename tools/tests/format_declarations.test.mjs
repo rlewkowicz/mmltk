@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { ANNOTATION_HEADER, classifyDeclarations, conflictingMacros, formatDeclarationSource, sourceOccurrence, lineStarts } from "../cleanup/declaration_patterns.mjs";
+import { ANNOTATION_HEADER, DECLARATION_SURFACE, classifyDeclarations, conflictingMacros, formatDeclarationSource, sourceOccurrence, lineStarts } from "../cleanup/declaration_patterns.mjs";
 import { tokenizeCpp } from "../cleanup/cpd_patterns.mjs";
 import { declarationFormatReport, parseFormatArgs } from "../format_declarations.mjs";
 import { CLEANUP_PROFILES, buildInventory, detectorArguments, parseArgs, parseCpdXml, rawCpdReport } from "../generate_cleanup_json.mjs";
@@ -9,6 +9,13 @@ import { CLEANUP_PROFILES, buildInventory, detectorArguments, parseArgs, parseCp
 const fixture = (name) => readFileSync(new URL(`fixtures/declarations/${name}.txt`, import.meta.url), "utf8");
 const canonical = fixture("canonical"), ambiguous = fixture("ambiguous");
 const sourcePath = "src/fixture.h";
+
+test("declaration formatter uses the registered authoring surface without adding a narrow include", () => {
+  const source = `#include "${DECLARATION_SURFACE}"\nstruct Request { MMLTK_MAX_BYTES(64) std::string name; };\n`;
+  assert.equal(formatDeclarationSource(sourcePath, source).output, source);
+  const conditional = `#if ENABLED\n#include "${DECLARATION_SURFACE}"\n#endif\nstruct Request { MMLTK_MAX_BYTES(64) std::string name; };\n`;
+  assert.ok(formatDeclarationSource(sourcePath, conditional).output.includes(`#include "${ANNOTATION_HEADER}"`));
+});
 
 test("declaration formatter preserves defaults, comments, literals and preprocessing", () => {
   const result = formatDeclarationSource(sourcePath, canonical);

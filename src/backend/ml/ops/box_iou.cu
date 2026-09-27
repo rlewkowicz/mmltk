@@ -5,7 +5,7 @@
 #include <torch/torch.h>
 #include <cmath>
 #include <cstdint>
-#include "src/frameworks/gpu/cuda_launch.cuh"
+#include "src/frameworks/gpu/cuda/cuda_launch.cuh"
 #include <limits>
 #include "box_iou.h"
 #include "box_geometry.cuh"

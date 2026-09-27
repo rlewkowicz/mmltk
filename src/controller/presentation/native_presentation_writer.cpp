@@ -22,8 +22,8 @@
 #include "src/controller/presentation/abi/workspace_frame_signal.h"
 #include "src/controller/presentation/detail/native_presentation_writer_test_access.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
-#include "src/frameworks/gpu/external_graphics_timeline.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/image/external_graphics_timeline.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 import mmltk.backend.imaging.raster;
 namespace mmltk::controller {
 void PresentationAcceptanceGate::SetWake(std::function<void()> wake) {

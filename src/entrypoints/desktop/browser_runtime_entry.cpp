@@ -25,10 +25,10 @@
 #include <system_error>
 #include <thread>
 #include <utility>
-#include "src/controller/services/firefox_process_owner.h"
-#include "src/controller/services/diagnostics_client.h"
-#include "src/controller/services/settings_location.h"
-#include "src/controller/services/train_command.h"
+#include "src/controller/services/firefox/firefox_process_owner.h"
+#include "src/controller/services/diagnostics/diagnostics_client.h"
+#include "src/controller/services/settings/settings_location.h"
+#include "src/controller/services/training/train_command.h"
 #include "src/controller/shell/application_shell.h"
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::entrypoints::desktop {

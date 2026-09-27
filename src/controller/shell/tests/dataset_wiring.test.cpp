@@ -8,7 +8,7 @@
 #include <string>
 #include <nlohmann/json.hpp>
 #include "src/controller/browser/application_materializer.h"
-#include "src/controller/services/settings_store.h"
+#include "src/controller/services/settings/settings_store.h"
 #include "src/controller/shell/application_system_storage.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/cuda_test_utils.hpp"

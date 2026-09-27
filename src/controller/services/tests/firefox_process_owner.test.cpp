@@ -12,7 +12,7 @@
 #include <utility>
 #include <catch2/catch_test_macros.hpp>
 #include "src/common/io/scoped_fd.h"
-#include "src/controller/services/firefox_process_owner.h"
+#include "src/controller/services/firefox/firefox_process_owner.h"
 namespace mmltk::test {
 class FirefoxProcessOwnerTestAccess final {
 public:

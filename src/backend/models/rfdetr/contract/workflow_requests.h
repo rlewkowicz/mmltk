@@ -1,11 +1,8 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
-#include "src/backend/data/data_loading_options.h"
-#include "src/frameworks/reflection/field_policy.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
+#include "src/backend/data/loading/data_loading_options.h"
 #include <cstddef>
 #include "src/backend/models/rfdetr/contract/execution_plan.h"
 #include <cstdint>

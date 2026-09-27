@@ -1,12 +1,12 @@
 #pragma once
 #include <functional>
 #include "src/controller/subsystems/system/compute_runtime.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include <memory>
 #include <optional>
 #include <variant>
 #include "src/controller/contracts/application_boundary.h"
-#include "src/frameworks/gpu/device_execution.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
 #include "validation_types.h"
 #include "src/backend/imaging/raster/rendered_image_writer.h"
 #include "src/controller/contracts/workspace_input.h"

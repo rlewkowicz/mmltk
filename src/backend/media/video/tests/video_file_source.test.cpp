@@ -19,11 +19,11 @@
 #include <utility>
 #include "src/test_support/async_test_utils.hpp"
 #include "src/backend/media/video/video_file_source.h"
-#include "src/frameworks/gpu/cuda_context_scope.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/cuda_context_scope.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include "src/common/system/execution_policy.h"
-#include "src/frameworks/gpu/device_execution.h"
-#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
 #include "src/backend/media/video/video_frame_convert.h"
 extern "C" {
 #include <libavcodec/avcodec.h>

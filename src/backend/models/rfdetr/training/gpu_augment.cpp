@@ -7,10 +7,10 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
-#include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "detail/gpu_augment_private.h"

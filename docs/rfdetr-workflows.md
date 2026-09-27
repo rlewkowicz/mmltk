@@ -186,7 +186,7 @@ directly; an occupied directory receives a fresh numbered child. An exclusive
 media/report saving disabled. Selecting or preparing inputs never reserves a
 run. Reservation follows native input admission, and filesystem errors refuse
 execution without overwriting earlier products. The shared
-[reservation utility](../src/controller/services/run_output.cpp) owns the
+[reservation utility](../src/controller/services/training/run_output.cpp) owns the
 filesystem algorithm; each workflow owns its run and terminal outcome.
 
 Configured selections remain distinct from active/completed paths. The card
@@ -248,7 +248,7 @@ layout match the current history. Otherwise
 Resume reserves a fresh child, including for an empty manual destination.
 Automatic mode always reserves a fresh child. The resolved path appears when
 the run is admitted. This GUI policy belongs to
-[TrainRunStore](../src/controller/services/train_run_store.cpp); CLI training
+[TrainRunStore](../src/controller/services/training/train_run_store.cpp); CLI training
 uses its explicit `--output-dir`.
 
 Validate's **Open Dataset** selects an independent override. While that override

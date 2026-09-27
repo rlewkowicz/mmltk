@@ -15,7 +15,7 @@
 #include "detail/model_ema.h"
 #include "detail/training_continuation.h"
 #include "detail/training_data_plan.h"
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/models/rfdetr/augmentation/annotation_support.h"
 #include "src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h"
 #include "detail/training_snapshot.h"

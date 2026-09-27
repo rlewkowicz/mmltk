@@ -4,15 +4,15 @@ module;
 #include "src/backend/models/rfdetr/core/evaluator.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
-#include "src/frameworks/gpu/cuda_context_scope.h"
+#include "src/frameworks/gpu/cuda/cuda_context_scope.h"
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
 #include "src/common/system/execution_policy.h"
 #include "src/common/math/checked_arithmetic.h"
-#include "src/frameworks/gpu/device_execution.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include "dataset_batch_lease.h"
 #include "src/backend/models/rfdetr/core/inference_lanes.h"
 #include <algorithm>
@@ -37,7 +37,7 @@ module;
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/postprocess.h"
 #include "src/backend/ml/torch/scalar_type.h"
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"

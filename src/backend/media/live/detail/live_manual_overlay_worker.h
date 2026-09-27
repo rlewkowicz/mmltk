@@ -1,7 +1,7 @@
 #pragma once
 #include "src/backend/media/live/manual_overlay_document.h"
 #include "src/backend/media/live/live_types.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 #include "live_slot_state.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>

@@ -2,7 +2,7 @@
 #include "src/controller/subsystems/explore/detail/gallery_descriptor_storage.h"
 #include "src/controller/subsystems/explore/detail/gallery_stream.h"
 #include "src/controller/subsystems/explore/detail/gallery_payload.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 #include <algorithm>
 #include <limits>
 #include <locale>

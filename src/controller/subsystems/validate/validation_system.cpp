@@ -1,5 +1,5 @@
 #include "validation_system.h"
-#include "src/controller/services/run_output.h"
+#include "src/controller/services/training/run_output.h"
 #include "validation_runtime.h"
 #include "detail/validation_samples.h"
 #include "detail/validation_sample_output.h"
@@ -12,7 +12,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <utility>
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/settings/settings_system.h"
 #include "src/controller/subsystems/system/dataset_system.h"
 #include "src/controller/subsystems/system/model_system.h"
 #include "src/controller/subsystems/system/detail/cuda_runtime_resources.h"
@@ -21,7 +21,7 @@
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/common/system/execution_policy.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 namespace mmltk::controller {
 class CudaValidationRuntime::Impl final : public detail::CudaSessionRuntimeState<mmltk::backend::models::rfdetr::ValidationSession> {
 public:

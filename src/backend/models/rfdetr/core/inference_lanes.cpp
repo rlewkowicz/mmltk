@@ -1,11 +1,9 @@
 #include "src/backend/models/rfdetr/core/inference_lanes.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-#include "src/frameworks/gpu/cuda_priority.h"
-#include "src/frameworks/gpu/cuda_context_scope.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/cuda_priority.h"
+#include "src/frameworks/gpu/cuda/cuda_context_scope.h"
 #include <cuda_runtime_api.h>
-#include <stdexcept>
-#include <utility>
-#include <vector>
+#include "src/pch_std.h"
 namespace mmltk::backend::models::rfdetr {
 namespace runtime = mmltk::backend::ml::runtime;
 namespace {

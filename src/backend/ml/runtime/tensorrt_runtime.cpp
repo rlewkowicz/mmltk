@@ -26,8 +26,8 @@
 #include "detail/tensorrt_engine_access.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 namespace mmltk::backend::ml::runtime {
 static_assert(NV_TENSORRT_MAJOR == 11, "mmltk requires TensorRT 11");
 namespace {

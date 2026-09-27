@@ -1,6 +1,5 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <array>
 #include "src/controller/contracts/validation_display.h"
 #include <compare>

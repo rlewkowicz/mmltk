@@ -3,7 +3,7 @@
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/controller/subsystems/train/training_system.h"
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/settings/settings_system.h"
 #include "src/common/system/tests/numa_topology_test_support.h"
 #include "src/common/system/tests/denied_syscall.h"
 #include "src/frameworks/reflection/record_projection.h"

@@ -1,4 +1,4 @@
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include "src/controller/presentation/tests/support/visual_runtime_fixture.h"
 #include "src/controller/subsystems/live/tests/support/live_system_fixture.h"
 #include "src/controller/presentation/tests/support/visual_system_fixture.h"
@@ -7,7 +7,7 @@
 #include "src/controller/presentation/visual_runtime_owner.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
-#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>

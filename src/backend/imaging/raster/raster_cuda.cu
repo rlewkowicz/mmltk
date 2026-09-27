@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
-#include "src/frameworks/gpu/cuda_launch.cuh"
+#include "src/frameworks/gpu/cuda/cuda_launch.cuh"
 #include "detail/raster_math.cuh"
 #include "class_palette.h"
 #include "detail/raster_cuda_abi.h"

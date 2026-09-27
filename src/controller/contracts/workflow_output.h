@@ -1,14 +1,11 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <stdexcept>
 #include <vector>
-#include "src/frameworks/reflection/field_policy.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/controller/contracts/workflows.h"
 namespace mmltk::controller::contracts {
 inline constexpr std::size_t kWorkflowArtifactCapacity = 8U;

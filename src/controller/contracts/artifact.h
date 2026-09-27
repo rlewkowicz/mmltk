@@ -1,5 +1,5 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -7,11 +7,8 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
-#include "src/backend/data/dataset_compile_phase.h"
-#include "src/backend/data/dataset_compile_progress.h"
-#include "src/frameworks/reflection/field_policy.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
+#include "src/backend/data/compiler/dataset_compile_phase.h"
+#include "src/backend/data/compiler/dataset_compile_progress.h"
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/controller/contracts/terminal_presentation.h"
 #include "src/backend/data/catalog/class_catalog.h"

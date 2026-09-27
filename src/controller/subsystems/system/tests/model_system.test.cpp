@@ -5,7 +5,7 @@
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 #include "src/controller/contracts/default_state.h"
 #include "src/controller/contracts/model_selection.h"
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/settings/settings_system.h"
 #include <atomic>
 #include <array>
 #include <vector>

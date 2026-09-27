@@ -14,7 +14,7 @@
 #include "src/common/math/checked_arithmetic.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
-#include "src/frameworks/gpu/cuda_context_scope.h"
+#include "src/frameworks/gpu/cuda/cuda_context_scope.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/model.h"
@@ -32,7 +32,7 @@
 #include "src/test_support/subprocess_test_utils.hpp"
 #include "src/entrypoints/cli/tests/support/cli_path.h"
 #include "src/backend/data/tests/test_fixture.h"
-#include "src/backend/data/compiled_dataset.h"
+#include "src/backend/data/compiled/compiled_dataset.h"
 #include "src/backend/models/rfdetr/inference/dataset_batch_lease.h"
 #include <array>
 #include <cmath>

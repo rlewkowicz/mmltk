@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <span>
 #include <vector>
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/imaging/resample/image_resize.h"
 namespace mmltk::backend::data::dataset {
 struct MaskDimensions {

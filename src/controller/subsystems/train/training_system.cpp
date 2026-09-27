@@ -11,8 +11,8 @@
 #include <stdexcept>
 #include <utility>
 #include "src/common/concurrency/event_cancellation.h"
-#include "src/controller/services/train_process_client.h"
-#include "src/controller/services/train_run_store.h"
+#include "src/controller/services/training/train_process_client.h"
+#include "src/controller/services/training/train_run_store.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"

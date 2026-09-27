@@ -1,10 +1,8 @@
 #include <cuda_runtime_api.h>
-#include <condition_variable>
-#include <mutex>
-#include <new>
-#include "src/frameworks/gpu/cuda_device_scope.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
+#include "src/pch_std.h"
+#include "src/frameworks/gpu/cuda/cuda_device_scope.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_authority.h"
 #include "shared_cuda_event.h"
 #include "detail/shared_cuda_event_runtime.inc"
 namespace mmltk::backend::ml::cuda {

@@ -6,7 +6,7 @@
 #include <cstdint>
 #include "detail/gpu_augment_cuda_launch.h"
 #include "detail/gpu_augment_plan_math.h"
-#include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
 namespace mmltk::backend::models::rfdetr {
 using mmltk::frameworks::gpu::ensure_cuda_ok;
 namespace {

@@ -6,7 +6,7 @@ module;
 #include <cstdint>
 #include "detail/explore_render_cuda_abi.h"
 #include "explore_render_storage.h"
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 export module mmltk.backend.imaging.explore.explore_render_core;
 import mmltk.backend.imaging.explore.compiled_explore_store;
 export namespace mmltk::backend::imaging::explore {

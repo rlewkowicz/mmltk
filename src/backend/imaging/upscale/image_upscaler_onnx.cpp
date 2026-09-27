@@ -22,8 +22,8 @@ module;
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/onnx_environment.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 #include "upscale_execution.h"
 module mmltk.backend.imaging.upscale.image_upscaler;
 import mmltk.common.logging.mmltk_logging;

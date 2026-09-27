@@ -9,7 +9,7 @@
 #include "src/controller/subsystems/annotation/tests/support/annotation_test_utils.hpp"
 #include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 #include "src/controller/presentation/workspace_input.h"
-#include "src/frameworks/gpu/image_workspace.h"
+#include "src/frameworks/gpu/image/image_workspace.h"
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>

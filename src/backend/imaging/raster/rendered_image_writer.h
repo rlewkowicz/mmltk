@@ -2,7 +2,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
-#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
 namespace mmltk::backend::imaging::raster {
 // One reusable pinned image and one asynchronous file write. The borrowed
 // device image is copied completely before Write returns. Flush publishes the

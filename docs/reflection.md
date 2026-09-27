@@ -17,6 +17,11 @@ need neither re-reflection nor include-order assumptions.
 source/header membership and generation inputs, without a parallel scanner or
 field inventory.
 
+Use [reflected_declarations.h](../src/frameworks/reflection/reflected_declarations.h)
+when authoring annotated reflected types. This ordinary surface includes
+annotations, field policies, field materialization, and enum metadata. A caller
+using only one facility may include that facility's declaration header directly.
+
 [reflected_field_policy.h](../src/frameworks/reflection/reflected_field_policy.h)
 provides `MMLTK_REFLECT_FIELDS(Type)`;
 [reflection_metadata.h](../src/frameworks/reflection/reflection_metadata.h)
@@ -35,9 +40,7 @@ For example:
 ```cpp
 #pragma once
 #include <filesystem>
-#include "src/frameworks/reflection/declaration_annotations.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 
 namespace example {
 struct ExportOptions final {

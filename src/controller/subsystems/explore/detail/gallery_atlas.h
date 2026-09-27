@@ -7,7 +7,7 @@
 #include <vector>
 #include "src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h"
 #include "src/controller/subsystems/explore/explore_system.h"
-#include "src/frameworks/gpu/image_types.h"
+#include "src/frameworks/gpu/image/image_types.h"
 namespace mmltk::controller::explore_detail {
 // Metadata only. ImageProductPool owns admission, storage, and read custody.
 // Each directory describes its own allocation, never the selected baseline.

@@ -11,7 +11,7 @@
 #include "src/controller/presentation/abi/workspace_surface_import_abi.h"
 #include "src/controller/presentation/abi/workspace_frame_signal.h"
 #include "src/controller/presentation/workspace_presentation_types.h"
-#include "src/frameworks/gpu/image_workspace.h"
+#include "src/frameworks/gpu/image/image_workspace.h"
 namespace mmltk::controller::browser {
 // This projection deliberately has no application codec vocabulary. Untrusted
 // enum fields use their integer wire representation, never Rust discriminants.

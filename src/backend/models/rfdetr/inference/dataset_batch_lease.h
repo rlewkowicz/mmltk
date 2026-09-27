@@ -5,9 +5,9 @@
 #include <memory>
 #include <stdexcept>
 #include <utility>
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/ml/runtime/backend_factory.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::backend::models::rfdetr {
 class DatasetBatchLease final {
 public:

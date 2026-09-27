@@ -4,7 +4,7 @@
 #include "src/backend/media/live/live_types.h"
 #include "src/backend/media/capture/capture_session.h"
 #include "src/backend/media/capture/status.h"
-#include "src/frameworks/gpu/resource_owner_command_authority.h"
+#include "src/frameworks/gpu/cuda/resource_owner_command_authority.h"
 #include "live_analyzer_worker.h"
 #include "live_device_types.h"
 #include "live_frame_fanout.h"

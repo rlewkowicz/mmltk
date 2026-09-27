@@ -1,12 +1,12 @@
 #pragma once
-#include "src/controller/services/runtime_diagnostics.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
 #include <functional>
 #include "export_run.h"
 #include <memory>
 #include <optional>
 #include <variant>
 #include "src/controller/contracts/application_boundary.h"
-#include "src/frameworks/gpu/device_execution.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
 #include <stop_token>
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/controller/contracts/compute.h"

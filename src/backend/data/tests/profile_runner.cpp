@@ -7,13 +7,13 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
-#include "src/backend/data/dataset_compiler.h"
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/data/tests/test_fixture.h"
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 #include "src/common/system/execution_policy.h"
-#include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
 using namespace mmltk::backend::data;
 using namespace mmltk::common::logging;
 using namespace mmltk::common::system;

@@ -1,6 +1,6 @@
-#include "src/backend/data/compiled_dataset.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/compiled/compiled_dataset.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -23,12 +23,12 @@
 #include <catch2/generators/catch_generators.hpp>
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/test_support/async_test_utils.hpp"
-#include "src/backend/data/compiled_file_utils.h"
+#include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/backend/imaging/explore/tests/explore_dataset_fixture.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/browser/client_record.h"
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/settings/settings_system.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/frameworks/serialization/serialization.h"
 import mmltk.backend.imaging.explore.compiled_explore_store;

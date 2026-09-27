@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <utility>
 #include "src/controller/presentation/visual_diagnostics.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 namespace mmltk::controller {
 mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(const VisualFrame& frame, const detail::VisualRuntimeOwner& owner) {
  return borrow_matching_visual_product(frame, owner.Borrow());

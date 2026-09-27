@@ -18,10 +18,10 @@ and [compiled format 9](datasets.md#compiled-binary-format).
 
 Coco custom preserves its existing source catalogs, deterministic supplemental
 sampling, split membership, annotation order, and permitted quarantine policy.
-The [custom recipe](../src/backend/data/benchmark_custom_recipe.cpp),
-[sampler](../src/backend/data/benchmark_sampling.cpp), and
-[category mappings](../src/backend/data/benchmark_catalog.cpp) own those facts.
-The [Open Images acquisition owner](../src/backend/data/open_images_acquisition.cpp)
+The [custom recipe](../src/backend/data/benchmark/benchmark_custom_recipe.cpp),
+[sampler](../src/backend/data/benchmark/benchmark_sampling.cpp), and
+[category mappings](../src/backend/data/benchmark/benchmark_catalog.cpp) own those facts.
+The [Open Images acquisition owner](../src/backend/data/benchmark/open_images_acquisition.cpp)
 retains its source-specific acquisition and quarantine decisions.
 Its adapters retain supplied boxes, area, identities, crowd/raw-ignore facts,
 and source order. COCO-style polygon or RLE segmentation becomes source mask
@@ -36,7 +36,7 @@ every offered image and
 required panoptic mask after bounded repair. [Recovery](#optional-dropped-mask-recovery)
 preserves these memberships.
 
-The [pinned release catalog](../src/backend/data/coconut_catalog.cpp) owns exact
+The [pinned release catalog](../src/backend/data/benchmark/coconut/coconut_catalog.cpp) owns exact
 URLs, revisions, expected sizes, available SHA-256 identities, and patch lists:
 
 | Release | Native input and membership |
@@ -57,11 +57,11 @@ and validation membership.
 
 ## Native import and provenance
 
-[coconut_parquet.cpp](../src/backend/data/coconut_parquet.cpp) reads bounded
+[coconut_parquet.cpp](../src/backend/data/benchmark/coconut/coconut_parquet.cpp) reads bounded
 Arrow record batches for embedded PNG masks, `segments_info`, and `image_info`.
-[coconut_annotations.cpp](../src/backend/data/coconut_annotations.cpp) owns
+[coconut_annotations.cpp](../src/backend/data/benchmark/coconut/coconut_annotations.cpp) owns
 external JSON/archive admission, physical joins, and exact annotation
-normalization. [coconut_recipe.cpp](../src/backend/data/coconut_recipe.cpp)
+normalization. [coconut_recipe.cpp](../src/backend/data/benchmark/coconut/coconut_recipe.cpp)
 selects those components and the validation policy. Arrow/Parquet is a
 [private native format dependency](build.md#native-parquet-dependency);
 compilation has no Python or Hugging Face utility execution dependency.
@@ -126,7 +126,7 @@ from cache; retained source annotations and image bytes remain reusable.
 Current import admission bounds each encoded PNG to 64 MiB, each decoded image
 to 64 Mi pixels, each axis to 32,767, and each segment list to 65,535 entries.
 The canonical limits are in
-[CoconutImportLimits](../src/backend/data/detail/coconut_annotations.h).
+[CoconutImportLimits](../src/backend/data/benchmark/coconut/detail/coconut_annotations.h).
 These precede the separate compiled-format capacity checks below.
 
 ## Optional dropped-mask recovery
@@ -145,7 +145,7 @@ Coconut stock. Stock validation keeps its stock labels. COCO unlabeled and
 Objects365 components have no original-mask recovery source and retain their
 ordinary normalization.
 
-[CoconutMaskRecovery](../src/backend/data/coconut_mask_recovery.cpp) indexes
+[CoconutMaskRecovery](../src/backend/data/benchmark/coconut/coconut_mask_recovery.cpp) indexes
 admitted originals by physical image once and reuses bounded per-image RLE
 scratch. A dropped slot is a declared thing with zero panoptic support and no
 authoritative box. A boxed, present-empty mask is already a valid object and
@@ -184,7 +184,7 @@ they are not converted into optional-source omissions.
 
 ## Overlapping acquisition, labels, and pixels
 
-The [compiler](../src/backend/data/benchmark_compiler.cpp) fixes selected split
+The [compiler](../src/backend/data/benchmark/benchmark_compiler.cpp) fixes selected split
 membership and reserves pixel storage before final labels are available.
 Acquisition, annotation preparation, and pixel compilation can then advance
 independently, subject to their actual input dependencies and one compile-wide
@@ -208,11 +208,11 @@ normalization can overlap selected-image extraction and pixel compilation.
 Warm components retain their admitted normalized data across the metadata and
 full-label handoff instead of reopening the same product.
 
-The [download boundary](../src/backend/data/detail/benchmark_download.h) returns
-typed durable artifact results; [image readiness](../src/backend/data/detail/benchmark_images.h)
+The [download boundary](../src/backend/data/benchmark/detail/benchmark_download.h) returns
+typed durable artifact results; [image readiness](../src/backend/data/benchmark/detail/benchmark_images.h)
 is emitted only after admitted cache reuse or an atomic image write. Queued and
 active pixel work retain the source generation's lease until their reads settle.
-[BenchmarkCompilePipeline](../src/backend/data/benchmark_pipeline.cpp) registers
+[BenchmarkCompilePipeline](../src/backend/data/benchmark/benchmark_pipeline.cpp) registers
 one slot per selected physical image before admission, ignores duplicate
 readiness, and queues those retained slots without per-image task allocations.
 Its consumers block on notifications. A single-worker compilation handles pixel
@@ -221,7 +221,7 @@ readiness inline.
 Acquisition, parsing, decompression, cache writers, and pixel lanes receive
 bounded portions of the eligible CPUs. Each pixel lane owns reusable decoder
 and [resizer scratch](datasets.md#optional-perceptual-downscaling), with no nested
-resizer thread pool. [BenchmarkSplitWriter](../src/backend/data/benchmark_writer.cpp)
+resizer thread pool. [BenchmarkSplitWriter](../src/backend/data/benchmark/benchmark_writer.cpp)
 retains successful pixel slots through final label preparation and compatible
 repair. It validates final source dimensions, metadata, masks, and persisted
 sections before publication. Failure or cancellation retires queued custody
@@ -232,7 +232,7 @@ be replaced or destroyed.
 
 Source-image validation and decoding recognize JPEG or PNG from the encoded
 content, including PNG payloads stored under `.jpg` archive members. The shared
-[image decoder](../src/backend/data/benchmark_image_decoder.cpp) retains TurboJPEG
+[image decoder](../src/backend/data/benchmark/benchmark_image_decoder.cpp) retains TurboJPEG
 for JPEG and uses the existing PNG decoder without recompressing the source.
 Cached image paths keep their stable `.jpg` spelling and original encoded bytes;
 PNG pixels, dimensions, and annotation joins remain intact.
@@ -241,7 +241,7 @@ The persistent source cache survives compilation failure/cancellation, output
 replacement, and recipe changes. [Cache selection](commands.md#benchmark-cache-selection)
 owns the default location and wrapper/CLI precedence.
 
-[benchmark_compiler.cpp](../src/backend/data/benchmark_compiler.cpp) resolves
+[benchmark_compiler.cpp](../src/backend/data/benchmark/benchmark_compiler.cpp) resolves
 and checks both the compiler's staging output and the final publication
 destination against the cache. Equal paths, a cache inside either output, or
 an output inside the cache are rejected before publication can replace data.
@@ -249,7 +249,7 @@ The GUI's outer staging transaction supplies its final destination separately.
 Compilation validates and syncs staged outputs before atomic publication;
 failure or cancellation preserves the previous published output.
 
-The [cache layout](../src/backend/data/benchmark_cache.cpp) separates
+The [cache layout](../src/backend/data/benchmark/benchmark_cache.cpp) separates
 `downloads/`, `images/`, `indexes/`, and `locks/`. Downloaded archives and COCO/
 Objects365 JPEGs are shared physical data. COCONut label indexes are separated
 by annotation edition and physical namespace. Image completion proofs additionally
@@ -294,14 +294,14 @@ failure and available image ID. Opt-in `benchmark.images.validation_failed`
 records include the archive member, source/shard, image ID, encoded byte count,
 and rejection reason.
 
-[CocoAnnotationCache](../src/backend/data/detail/benchmark_annotation_cache.h)
+[CocoAnnotationCache](../src/backend/data/benchmark/detail/benchmark_annotation_cache.h)
 is the shared stock-annotation admission owner for Coco custom, Coconut's
 Stock validation, and optional recovery originals. It discovers valid normalized
 indexes before requesting raw annotations, so a valid stock index remains usable
 with the raw archive/JSON absent. A missing split can be rebuilt while an already
 settled split is retained. Typed storage-capacity failures and cancellation propagate directly;
 they do not trigger corruption repair or needless re-downloads.
-[benchmark_storage.cpp](../src/backend/data/benchmark_storage.cpp) owns capacity
+[benchmark_storage.cpp](../src/backend/data/benchmark/benchmark_storage.cpp) owns capacity
 checks and concurrent reservations.
 
 ### Recovery-derived annotation caches
@@ -315,7 +315,7 @@ and admitted original annotation identity. Changes to those facts require a
 different derived product. Original indexes, base components, physical
 inventories, downloads, image caches, and image-group proofs remain reusable.
 
-The canonical [inventory declarations](../src/backend/data/detail/coconut_inventory.h)
+The canonical [inventory declarations](../src/backend/data/benchmark/coconut/detail/coconut_inventory.h)
 derive the recovery trailer and its checked encoding. Each image retains
 recovered COCONut IDs, source ordinals/categories, original COCO IDs, and
 unresolved omissions. Joint index/inventory/completion admission verifies these
@@ -340,7 +340,7 @@ recovered/unresolved summary. These product/cache facts need no diagnostic log.
 
 ## Reading compilation progress
 
-[DatasetCompileTracks](../src/backend/data/dataset_compile_progress.h) declares
+[DatasetCompileTracks](../src/backend/data/compiler/dataset_compile_progress.h) declares
 three independent tracks shared by benchmark and Directory compilation. Each
 has completed work, a known/unknown total, activity, active/completed state, and
 explicit invalidated work. The native declaration also supplies generated Rust;
@@ -360,7 +360,7 @@ each count completed images. A completed acquisition track can coexist with
 active labels and pixels. All three completing still leaves validation, sync,
 and atomic publication to settle before the operation succeeds.
 
-[ProgressReporter](../src/backend/data/benchmark_progress.cpp) owns benchmark
+[ProgressReporter](../src/backend/data/benchmark/benchmark_progress.cpp) owns benchmark
 observations and compile-scoped artifact/indexing ledgers. An observed artifact
 with an unknown size makes its source and aggregate byte totals unknown; the
 GUI shows `?` and omits a determinate bar for that track. Totals can change as
@@ -416,7 +416,7 @@ Native activity and terminal results control the
 [progress area's cancellation and settlement](gui-interaction.md#dataset-compilation-controls).
 Its animation never decides completion. The CLI retains exact byte counts,
 unknown-total text, transfer attempts, retained bytes, resume, and retry details
-through [its source-status formatter](../src/backend/data/benchmark_compiler.cpp);
+through [its source-status formatter](../src/backend/data/benchmark/benchmark_compiler.cpp);
 native activity strings carry the operation description rather than a second
 encoded copy of the transfer quantities.
 
@@ -439,16 +439,16 @@ These formats have independent versions:
 | COCONut physical/component inventory | Version 1 (`CNUTIVN1`), declaration-order little-endian encoding with checked strings/counts and a SHA-256 trailer; derived components additionally bind the recovery-policy trailer |
 | `benchmark_manifest.json` | Schema 3 compilation facts, including recipe, source identities, recovery selection/counts, mappings, resolution, resize/resampling policy, and cache root |
 
-[benchmark_annotations.cpp](../src/backend/data/benchmark_annotations.cpp)
+[benchmark_annotations.cpp](../src/backend/data/benchmark/benchmark_annotations.cpp)
 owns normalized-index layout and staged publication. Its six
-[AnnotationRejectCounts](../src/backend/data/detail/benchmark_annotations.h)
+[AnnotationRejectCounts](../src/backend/data/benchmark/detail/benchmark_annotations.h)
 fields generate both binary and named JSON projections from one declaration.
 Compile-time format guards pin their names, `uint64` types, and declaration
 order. Each COCO-style fill worker retains parser, mask, and polygon scratch
 across records; box-only Open Images records avoid per-annotation empty-mask
 allocations.
 
-[coconut_inventory.h](../src/backend/data/detail/coconut_inventory.h) is the
+[coconut_inventory.h](../src/backend/data/benchmark/coconut/detail/coconut_inventory.h) is the
 canonical inventory declaration. Physical inventories bind records to their
 archive identity, namespace, shard, and canonical members. Component inventories
 are admitted together with their normalized index, input identity, edition,

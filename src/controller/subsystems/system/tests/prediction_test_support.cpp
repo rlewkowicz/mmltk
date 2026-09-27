@@ -1,6 +1,6 @@
 #include "prediction_test_support.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 #include <algorithm>
 #include <array>
 #include <cstring>

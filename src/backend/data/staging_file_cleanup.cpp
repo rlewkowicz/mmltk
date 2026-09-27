@@ -1,6 +1,6 @@
 
 #include "detail/staging_file_cleanup.h"
-#include <filesystem>
+#include "src/pch_std.h"
 namespace mmltk::backend::data {
 StagingFileCleanup::StagingFileCleanup(std::filesystem::path path) : path_(std::move(path)) {}
 StagingFileCleanup::~StagingFileCleanup() {

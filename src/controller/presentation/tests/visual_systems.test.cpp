@@ -15,7 +15,7 @@
 #include "src/controller/subsystems/annotation/tests/support/annotation_test_utils.hpp"
 #include "src/controller/presentation/presentation_system.h"
 #include "src/controller/presentation/workspace_input.h"
-#include "src/frameworks/gpu/image_workspace.h"
+#include "src/frameworks/gpu/image/image_workspace.h"
 #include "src/controller/contracts/diagnostic_context.h"
 #include <array>
 #include <atomic>

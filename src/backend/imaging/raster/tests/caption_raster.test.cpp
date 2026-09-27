@@ -1,5 +1,5 @@
 #include "src/backend/imaging/raster/caption_raster.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/test_support/cuda_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>

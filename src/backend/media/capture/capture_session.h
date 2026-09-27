@@ -4,7 +4,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
-#include "src/frameworks/gpu/device_execution.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
 #include <string>
 #include "src/backend/media/capture/capture_types.h"
 #include "src/backend/media/capture/live_video_source.h"

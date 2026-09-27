@@ -6,7 +6,7 @@
 #include <vector>
 #include <torch/types.h>
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::backend::models::rfdetr {
 namespace testsupport {
 struct TrainingGradientReducerTestAccess;

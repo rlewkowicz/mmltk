@@ -1,11 +1,10 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <cstdint>
 #include <vector>
-#include "src/frameworks/gpu/device_inventory.h"
+#include "src/frameworks/gpu/cuda/device_inventory.h"
 #include <string>
 #include <type_traits>
-#include "src/frameworks/reflection/reflected_field_policy.h"
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/controller/contracts/gui_settings_states.h"
 #include "src/controller/contracts/view_state.h"

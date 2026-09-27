@@ -17,7 +17,7 @@
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "src/backend/models/rfdetr/core/runtime.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include "training_ops_private.h"
 #include "training_scalar_packet.h"
 #include "training_gradient_reducer.h"

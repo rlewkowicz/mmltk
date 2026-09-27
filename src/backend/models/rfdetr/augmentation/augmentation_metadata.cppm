@@ -5,7 +5,7 @@ module;
 #include <cstddef>
 #include <span>
 #include <vector>
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/models/rfdetr/augmentation/annotation_support.h"
 export module mmltk.backend.models.rfdetr.augmentation.augmentation_metadata;
 export namespace mmltk::backend::models::rfdetr {

@@ -18,7 +18,7 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/models/rfdetr/augmentation/detail/gpu_augment_cuda_launch.h"
 #include "src/backend/models/rfdetr/augmentation/detail/gpu_augment_plan_math.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"

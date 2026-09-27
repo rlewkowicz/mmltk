@@ -1,13 +1,74 @@
 #pragma once
-// Shared by ordinary implementation units; declaration headers stay complete.
+// Explicit standard-library surface. CMake precompiles it only for registered C++ targets.
+// Inventory: ./mmltk --audit-includes report (three or more distinct first-party files).
+#ifdef __cplusplus
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <barrier>
+#include <bit>
+#include <cctype>
+#include <cerrno>
+#include <charconv>
+#include <chrono>
+#include <climits>
+#include <cmath>
+#include <compare>
+#include <concepts>
+#include <condition_variable>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <exception>
+#include <expected>
+#include <filesystem>
+#include <format>
+#include <fstream>
+#include <functional>
+#include <future>
+#include <initializer_list>
+#include <iomanip>
+#include <iostream>
+#include <iterator>
 #include <limits>
+#include <locale>
+#include <map>
 #include <memory>
+#include <memory_resource>
+#include <mutex>
+#include <new>
+#include <numbers>
+#include <numeric>
 #include <optional>
+#include <ostream>
+#include <random>
+#include <ranges>
+#include <semaphore>
+#include <set>
+#include <span>
+#include <sstream>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
+#include <string_view>
+#include <system_error>
+#include <thread>
+#include <tuple>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
+#if __cplusplus > 202302L
+#include <inplace_vector>
+#ifdef __cpp_impl_reflection
+#include <meta>
+#endif
+#endif
+#endif
+#include <signal.h>

@@ -4,7 +4,7 @@
 #include <string_view>
 #include <vector>
 #include "src/entrypoints/desktop/browser_runtime_options.h"
-#include "src/controller/services/firefox_process_owner.h"
+#include "src/controller/services/firefox/firefox_process_owner.h"
 #include "src/controller/shell/application_shell.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
 namespace {

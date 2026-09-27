@@ -1,5 +1,5 @@
 #pragma once
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 #include <cstddef>
 #include "src/backend/imaging/resample/image_resize.h"
 #include <cstdint>

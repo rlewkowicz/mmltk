@@ -13,8 +13,8 @@
 #include <span>
 #include <vector>
 #include "src/test_support/cuda_test_utils.hpp"
-#include "src/backend/data/compiled_format.h"
-#include "src/frameworks/gpu/cuda_high_water_allocation.h"
+#include "src/backend/data/compiled/compiled_format.h"
+#include "src/frameworks/gpu/cuda/cuda_high_water_allocation.h"
 #include "src/backend/imaging/explore/explore_render_storage.h"
 #include "src/backend/imaging/explore/detail/explore_render_cuda_abi.h"
 #include "src/controller/subsystems/explore/native_explore_storage.h"

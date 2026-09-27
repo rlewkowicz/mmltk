@@ -3,10 +3,8 @@
 #include <cstddef>
 #include <string>
 #include <vector>
-#include "src/common/concurrency/event_cancellation.h"
-#include "src/common/concurrency/parallel_range.h"
-#include "src/common/concurrency/worker_pool.h"
-#include "src/frameworks/gpu/device_execution.h"
+#include "src/common/concurrency/concurrency.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
 #include "src/common/system/numa_memory.h"
 #include "src/backend/models/rfdetr/core/detail/runtime_workspace_fwd.h"
 namespace mmltk::backend::models::rfdetr {

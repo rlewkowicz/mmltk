@@ -68,7 +68,7 @@
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "model_state_fixture.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
-#include "src/backend/data/dataset_compiler.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/backend/models/rfdetr/training/train.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include <torch/types.h>

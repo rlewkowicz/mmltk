@@ -1,6 +1,6 @@
 #include "src/frameworks/serialization/reflected_json.h"
 #include <catch2/matchers/catch_matchers_string.hpp>
-#include "src/controller/services/train_run_store.h"
+#include "src/controller/services/training/train_run_store.h"
 #include "src/backend/models/rfdetr/training/telemetry_writer.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>

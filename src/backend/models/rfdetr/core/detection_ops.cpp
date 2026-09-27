@@ -33,14 +33,12 @@
 #include "detail/traced_loss_cache.h"
 #include "src/common/system/execution_policy.h"
 #include "src/common/system/numa_memory.h"
-#include "src/frameworks/gpu/device_execution.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
 #include <span>
 #include "detail/training_mask_ops_cuda.h"
-#include "src/common/concurrency/event_cancellation.h"
-#include "src/common/concurrency/parallel_range.h"
-#include "src/common/concurrency/worker_pool.h"
+#include "src/common/concurrency/concurrency.h"
 #include "src/backend/models/rfdetr/core/runtime.h"
-#include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 import mmltk.backend.ml.cuda.gpu_quiescence;

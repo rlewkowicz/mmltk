@@ -4,7 +4,7 @@
 #include "live_state_signal.h"
 #include "src/backend/media/live/live_frame_id.h"
 #include "src/backend/media/capture/capture_types.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <atomic>

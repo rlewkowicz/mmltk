@@ -1,7 +1,6 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/controller/services/runtime_diagnostics.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
 #include "prediction_run_output.h"
 #include "src/controller/contracts/prediction_output.h"
 #include "src/controller/contracts/workflow_output.h"
@@ -23,15 +22,15 @@
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/controller/presentation/visual_source_projection.h"
 #include "src/controller/presentation/visual_system_types.h"
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/settings/settings_system.h"
 #include "src/controller/subsystems/system/compute_runtime.h"
 #include "src/controller/subsystems/system/dataset_system.h"
 #include "src/controller/subsystems/system/model_system.h"
-#include "src/frameworks/gpu/device_execution.h"
-#include "src/frameworks/gpu/image_buffer.h"
-#include "src/frameworks/gpu/image_product_pool.h"
-#include "src/frameworks/gpu/image_workspace.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
+#include "src/frameworks/gpu/image/image_product_pool.h"
+#include "src/frameworks/gpu/image/image_workspace.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller {
 struct PredictLabel final {
  contracts::AnnotationBox box{};

@@ -6,7 +6,7 @@
 #include <memory>
 #include "src/controller/contracts/annotation.h"
 #include "src/controller/presentation/visual_system_types.h"
-#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
 namespace mmltk::frameworks::serialization::wire {
 class Value;
 }

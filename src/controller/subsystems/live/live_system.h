@@ -1,6 +1,5 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include "src/controller/contracts/workspace_input.h"
 #include "src/controller/presentation/visual_source_projection.h"
 #include <chrono>
@@ -12,8 +11,8 @@
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/controller/presentation/visual_diagnostics.h"
-#include "src/frameworks/gpu/image_types.h"
-#include "src/frameworks/gpu/system_image_model.h"
+#include "src/frameworks/gpu/image/image_types.h"
+#include "src/frameworks/gpu/runtime/system_image_model.h"
 namespace mmltk::controller {
 struct LiveStart final {
  VisualExtent extent{};

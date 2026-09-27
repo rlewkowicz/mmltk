@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <span>
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 namespace mmltk::backend::models::rfdetr::test_support {
 // Explicit pixel fixture, independent of augmentation's support resolver.
 // ........

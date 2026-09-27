@@ -2,8 +2,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include "src/frameworks/gpu/device_execution.h"
-#include "src/frameworks/gpu/image_workspace.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
+#include "src/frameworks/gpu/image/image_workspace.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 namespace mmltk::frameworks::gpu {
 class SystemImageRuntime;

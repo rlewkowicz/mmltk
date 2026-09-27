@@ -1,9 +1,9 @@
 #include "src/controller/presentation/workspace_input.h"
 #include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/controller/presentation/visual_runtime_owner.h"
-#include "src/frameworks/gpu/image_failure.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
-#include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/image/image_failure.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
 #include <cuda.h>
 #include <mutex>
 #include <limits>

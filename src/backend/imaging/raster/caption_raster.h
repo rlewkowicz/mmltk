@@ -6,8 +6,8 @@
 #include <string>
 #include <string_view>
 #include "native_caption_metrics.h"
-#include "src/frameworks/gpu/image_types.h"
-#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/image/image_types.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
 namespace mmltk::backend::imaging::raster {
 struct NamedCaption final {
  std::uint32_t name = 0U;

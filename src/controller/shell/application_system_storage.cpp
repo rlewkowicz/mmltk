@@ -1,4 +1,4 @@
-#include "src/frameworks/gpu/device_inventory.h"
+#include "src/frameworks/gpu/cuda/device_inventory.h"
 #include "src/controller/shell/application_system_storage.h"
 #include <array>
 #include <algorithm>
@@ -14,7 +14,7 @@
 #include "src/controller/subsystems/validate/validation_runtime.h"
 #include "src/controller/subsystems/export/export_system.h"
 #include "src/controller/subsystems/system/predict_system.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 namespace mmltk::controller::shell {
 SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(
  ApplicationSystemStorage::EventSink& sink, UpscaleSystem& upscale, ApplicationSystemStorage::ContinuitySink continuity, std::function<void(PresentationSourceIdentity)> source) {

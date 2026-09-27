@@ -1,6 +1,6 @@
 #pragma once
 #include <optional>
-#include "src/controller/services/firefox_process_observation.h"
+#include "src/controller/services/firefox/firefox_process_observation.h"
 namespace mmltk::controller::shell {
 enum class ApplicationLifecycleEventSource : unsigned char {
  Shell,

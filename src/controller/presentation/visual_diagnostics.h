@@ -12,9 +12,9 @@
 #include <utility>
 #include "src/controller/contracts/diagnostic_context.h"
 #include "src/controller/presentation/visual_system_types.h"
-#include "src/controller/services/runtime_diagnostics.h"
-#include "src/controller/services/runtime_diagnostic_span.h"
-#include "src/frameworks/gpu/image_types.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
+#include "src/controller/services/diagnostics/runtime_diagnostic_span.h"
+#include "src/frameworks/gpu/image/image_types.h"
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 namespace mmltk::frameworks::gpu {

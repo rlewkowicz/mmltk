@@ -1,6 +1,5 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -13,7 +12,6 @@
 #include <variant>
 #include <vector>
 #include "mmltk/frameworks/reflection/materializer.h"
-#include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
 namespace mmltk::frameworks::serialization::test {
 namespace policy = mmltk::frameworks::reflection;

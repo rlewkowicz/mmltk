@@ -2,7 +2,7 @@
 #include "src/backend/media/live/live_session_controller.h"
 #include "src/backend/media/live/live_types.h"
 #include "src/controller/subsystems/live/live_system.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include <cuda_runtime_api.h>
 #include <optional>
 #include <atomic>
@@ -10,7 +10,7 @@
 #include <thread>
 #include <utility>
 #include "src/controller/subsystems/live/live_receiver_copy.h"
-#include "src/frameworks/gpu/resource_owner_command_authority.h"
+#include "src/frameworks/gpu/cuda/resource_owner_command_authority.h"
 namespace mmltk::controller {
 namespace {
 namespace capture = mmltk::backend::media::capture;

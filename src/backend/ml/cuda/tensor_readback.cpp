@@ -3,8 +3,8 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include "src/common/system/numa_memory.h"
-#include "src/frameworks/gpu/device_execution.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::backend::ml::cuda {
 namespace gpu = mmltk::frameworks::gpu;
 namespace sys = mmltk::common::system;

@@ -4,7 +4,7 @@
 #include "detail/training_distributed.h"
 #include "detail/evaluation_runtime.h"
 #include "detail/native_optimizer_private.h"
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "detail/training_lanes.h"
 #include "detail/training_gradient_reducer.h"
 #include "detail/training_metrics.h"

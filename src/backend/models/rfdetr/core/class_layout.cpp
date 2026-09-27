@@ -1,8 +1,5 @@
 #include "src/backend/models/rfdetr/core/class_layout.h"
-#include <algorithm>
-#include <array>
-#include <stdexcept>
-#include <utility>
+#include "src/pch_std.h"
 #include "src/common/io/file_digest.h"
 #include "src/frameworks/serialization/json_wire.h"
 #include "src/backend/data/catalog/coco_catalog.h"

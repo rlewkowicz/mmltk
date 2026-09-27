@@ -14,8 +14,8 @@
 #include <stdexcept>
 #include <utility>
 #include "src/backend/ml/cuda/numa_host_tensor.h"
-#include "src/frameworks/gpu/gdr_mapped_buffer.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/memory/gdr_mapped_buffer.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include "src/common/io/scoped_fd.h"
 import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr {

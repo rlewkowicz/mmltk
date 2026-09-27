@@ -1,16 +1,6 @@
 #include "telemetry_writer.h"
-#include <cerrno>
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <fstream>
-#include <format>
-#include <inplace_vector>
-#include <mutex>
-#include <random>
-#include <span>
-#include <thread>
-#include <unistd.h>
+#include "src/pch_std.h"
+#include "src/pch_linux.h"
 #include "src/common/io/json_file.h"
 #include "src/frameworks/serialization/reflected_json.h"
 namespace mmltk::backend::models::rfdetr {

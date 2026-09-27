@@ -13,7 +13,7 @@
 #include <span>
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/contract/training_artifacts.h"
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/common/io/file_digest.h"
 namespace mmltk::backend::models::rfdetr {
 // Uses the admitted header and file metadata only; never reads dataset payloads.

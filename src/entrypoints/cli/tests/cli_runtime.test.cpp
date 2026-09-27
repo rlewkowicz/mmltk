@@ -1,4 +1,4 @@
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <unistd.h>
 #include <algorithm>
 #include <array>
@@ -20,16 +20,13 @@
 #include <utility>
 #include <catch2/catch_test_macros.hpp>
 #include "mmltk/frameworks/reflection/materializer.h"
-#include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
 #include "src/frameworks/reflection/cli_declarations.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/entrypoints/cli/tests/support/cli_path.h"
 #include "src/test_support/subprocess_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/tests/test_fixture.h"
-#include "src/backend/data/compiled_dataset.h"
+#include "src/backend/data/compiled/compiled_dataset.h"
 namespace {
 thread_local bool g_count_cli_allocations = false;
 thread_local std::size_t g_cli_allocation_count = 0U;

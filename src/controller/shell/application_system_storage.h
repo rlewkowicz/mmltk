@@ -11,8 +11,8 @@
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/controller/presentation/visual_runtime.h"
-#include "src/controller/services/runtime_diagnostics.h"
-#include "src/frameworks/gpu/device_execution.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
 namespace mmltk::controller::shell {
 struct ApplicationSystemConfiguration final {
  VisualDeviceSettings base_visual{};

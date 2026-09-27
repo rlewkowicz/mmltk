@@ -4,7 +4,7 @@
 #include "src/controller/presentation/visual_diagnostics.h"
 #include <memory>
 #include <unordered_map>
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 #include "src/backend/imaging/explore/explore_render_storage.h"
 namespace mmltk::controller::explore_detail {
 void ensure_gallery_buffer(mmltk::backend::imaging::explore::ExploreHighWaterBuffer&, std::size_t, const char*, VisualDiagnosticSink, int, std::uint64_t);

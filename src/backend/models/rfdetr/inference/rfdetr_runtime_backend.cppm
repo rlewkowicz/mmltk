@@ -4,7 +4,7 @@ module;
 #include <filesystem>
 #include <functional>
 #include <memory>
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 #include <optional>
 #include <span>
 #include <stop_token>

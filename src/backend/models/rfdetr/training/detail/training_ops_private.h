@@ -1,7 +1,7 @@
 #pragma once
 #include "src/backend/models/rfdetr/core/detection_statistics.h"
 #include "training_schedule.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include <array>
 #include <numeric>
 #include <span>

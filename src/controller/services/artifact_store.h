@@ -1,5 +1,5 @@
 #pragma once
-#include "src/backend/data/benchmark_dataset_options.h"
+#include "src/backend/data/benchmark/benchmark_dataset_options.h"
 #include <array>
 #include <filesystem>
 #include <expected>
@@ -8,10 +8,8 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include "src/common/concurrency/event_cancellation.h"
+#include "src/common/concurrency/concurrency.h"
 #include "src/common/concurrency/cancellation_observation.h"
-#include "src/common/concurrency/parallel_range.h"
-#include "src/common/concurrency/worker_pool.h"
 #include "src/controller/contracts/artifact.h"
 #include "src/backend/data/catalog/class_catalog.h"
 #include "src/backend/imaging/resample/image_resize.h"

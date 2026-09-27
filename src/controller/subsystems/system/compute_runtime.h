@@ -7,8 +7,8 @@
 #include <exception>
 #include "src/common/system/execution_policy.h"
 #include "src/controller/contracts/compute.h"
-#include "src/frameworks/gpu/device_execution.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 namespace mmltk::controller {
 struct DirectComputeConfiguration final {
  std::optional<mmltk::frameworks::gpu::DeviceExecution> execution{};

@@ -5,10 +5,10 @@
 #include "src/backend/imaging/resample/detail/perceptual_downscale_accumulation.cuh"
 #include "src/backend/imaging/resample/detail/perceptual_downscale_completion.h"
 #include "src/common/math/checked_arithmetic.h"
-#include "src/frameworks/gpu/image_buffer.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include "src/frameworks/gpu/cuda_high_water_allocation.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_authority.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
+#include "src/frameworks/gpu/cuda/cuda_high_water_allocation.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <algorithm>

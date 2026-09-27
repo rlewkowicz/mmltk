@@ -1,6 +1,6 @@
 #pragma once
 #include <mutex>
-#include "src/controller/services/diagnostics_client.h"
+#include "src/controller/services/diagnostics/diagnostics_client.h"
 namespace mmltk::controller::services {
 struct DiagnosticsClientTestAccess final {
  [[nodiscard]] static bool WaitForCapacityWaiter(DiagnosticsClient& client) { return client.wait_for_capacity_waiter_for_test(); }

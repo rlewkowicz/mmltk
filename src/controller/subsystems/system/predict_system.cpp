@@ -21,11 +21,11 @@
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/controller/presentation/workspace_input.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
-#include "src/controller/services/run_output.h"
+#include "src/controller/services/training/run_output.h"
 #include "src/controller/runtime/local_run.h"
-#include "src/frameworks/gpu/cuda_context_scope.h"
-#include "src/frameworks/gpu/image_failure.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/cuda/cuda_context_scope.h"
+#include "src/frameworks/gpu/image/image_failure.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 import mmltk.backend.models.rfdetr.inference.prediction;
 namespace mmltk::controller {
 class CudaPredictRuntime::Impl final : public detail::CudaSessionRuntimeState<mmltk::backend::models::rfdetr::PredictionSession> {

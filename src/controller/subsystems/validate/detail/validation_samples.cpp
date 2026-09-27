@@ -6,7 +6,7 @@
 #include "validation_samples.h"
 #include "src/controller/subsystems/system/detail/prediction_preview.h"
 #include "src/controller/presentation/visual_runtime_owner.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 #include <algorithm>
 #include <array>
 #include <mutex>

@@ -1,6 +1,6 @@
 module;
 #include "src/backend/ml/cuda/tensor_readback.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "src/backend/ml/runtime/analysis_provider.h"

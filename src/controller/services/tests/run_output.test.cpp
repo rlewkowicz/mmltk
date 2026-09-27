@@ -1,4 +1,4 @@
-#include "src/controller/services/run_output.h"
+#include "src/controller/services/training/run_output.h"
 #include "src/controller/contracts/compute.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>

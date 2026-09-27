@@ -1,8 +1,8 @@
 #pragma once
 #include "src/backend/media/capture/capture_types.h"
 #include "src/backend/media/live/live_frame_id.h"
-#include "src/frameworks/gpu/cuda_device_scope.h"
-#include "src/frameworks/gpu/resource_owner_command_authority.h"
+#include "src/frameworks/gpu/cuda/cuda_device_scope.h"
+#include "src/frameworks/gpu/cuda/resource_owner_command_authority.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <atomic>

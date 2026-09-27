@@ -7,8 +7,8 @@
 #include <string>
 #include <c10/cuda/CUDAGuard.h>
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
-#include "src/backend/data/compiled_dataset.h"
-#include "src/backend/data/dataset_compiler.h"
+#include "src/backend/data/compiled/compiled_dataset.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/model_state.h"

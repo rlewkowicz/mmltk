@@ -1,6 +1,6 @@
 #include "detail/live_session_owner.h"
 #include "src/common/system/execution_policy.h"
-#include "src/frameworks/gpu/device_execution.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
 #include <cuda_runtime_api.h>
 #include <cstddef>
 #include <cstdint>
@@ -16,8 +16,8 @@
 #include <utility>
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
-#include "src/frameworks/gpu/cuda_device_scope.h"
-#include "src/frameworks/gpu/resource_owner_command_authority.h"
+#include "src/frameworks/gpu/cuda/cuda_device_scope.h"
+#include "src/frameworks/gpu/cuda/resource_owner_command_authority.h"
 namespace mmltk::backend::media::live {
 namespace capture = mmltk::backend::media::capture;
 namespace gpu = mmltk::frameworks::gpu;

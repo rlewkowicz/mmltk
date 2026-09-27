@@ -1,6 +1,6 @@
 #include "src/controller/presentation/visual_system_types.h"
 #include <utility>
-#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
 namespace mmltk::controller {
 bool visual_product_matches_frame(const VisualFrame& frame, const mmltk::frameworks::gpu::BorrowedImageProductReadView& product) noexcept {
  if (!frame.valid() || !product.valid() || (product.plane_count() != 1U && product.plane_count() != 2U)) return false;

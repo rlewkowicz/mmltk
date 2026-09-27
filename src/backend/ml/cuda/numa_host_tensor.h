@@ -2,7 +2,7 @@
 #include <ATen/ATen.h>
 #include <memory>
 #include <source_location>
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 namespace mmltk::backend::ml::cuda {
 // Tensor storage retains the registered extent, including when a view escapes
 // its original owner. Shapes describe active elements, never reserved capacity.

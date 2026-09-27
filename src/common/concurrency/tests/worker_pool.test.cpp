@@ -1,6 +1,6 @@
 #include "src/common/system/tests/numa_topology_test_support.h"
 #include "src/test_support/async_test_utils.hpp"
-#include "src/common/concurrency/worker_pool.h"
+#include "src/common/concurrency/concurrency.h"
 #include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
@@ -13,8 +13,6 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
-#include "src/common/concurrency/event_cancellation.h"
-#include "src/common/concurrency/parallel_range.h"
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/execution_policy.h"
 namespace {

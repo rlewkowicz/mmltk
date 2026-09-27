@@ -1,10 +1,10 @@
 #pragma once
 #include <cstdint>
 #include <memory>
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include <cuda_runtime_api.h>
 #include <torch/types.h>
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/loading/dataset_loader.h"
 namespace mmltk::backend::models::rfdetr {
 class GpuBatchPreprocessor final {
 public:

@@ -5,7 +5,7 @@
 #include "src/backend/imaging/raster/rendered_image_writer.h"
 #include "src/backend/imaging/raster/class_palette.h"
 #include "src/backend/media/video/video_file_sink.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 #include <array>
 #include <charconv>
 #include <chrono>

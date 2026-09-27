@@ -165,7 +165,7 @@ set_target_properties(mmltk_backend_models_rfdetr_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
-mmltk_target_precompiled_headers(mmltk_backend_models_rfdetr_core std torch)
+mmltk_target_precompiled_headers(mmltk_backend_models_rfdetr_core std linux torch)
 
 function(mmltk_add_backend_models_rfdetr_core_tests)
     add_library(mmltk_backend_models_rfdetr_training_fixture INTERFACE)

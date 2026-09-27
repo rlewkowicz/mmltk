@@ -12,7 +12,7 @@
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include "spdmon/spdmon.hpp"
-#include "src/backend/data/dataset_compiler.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/test_support/console_output.h"
 #include "src/test_support/environment_test_utils.hpp"
 namespace {

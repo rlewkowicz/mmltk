@@ -2,7 +2,7 @@
 #include "src/controller/contracts/application_systems.h"
 #include <memory>
 #include "src/controller/browser/client_record.h"
-#include "src/controller/services/runtime_diagnostics.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
 #include "src/frameworks/transport/browser_server.h"
 namespace mmltk::controller {
 struct ApplicationSystems;

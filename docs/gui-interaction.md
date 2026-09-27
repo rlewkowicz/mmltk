@@ -841,7 +841,7 @@ Even if a cross-device transfer has released its raw input read, that product
 cannot detach, replace its workspace, or become writable before final display
 work settles. Raw-reader release and completed finalization are separate facts.
 
-The linked runtime factories and [SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.h)
+The linked runtime factories and [SystemImageRuntime](../src/frameworks/gpu/runtime/system_image_runtime.h)
 define these inventories. `VisualRuntimeOwner` services layout/admission on the
 producer worker; `ImageWorkspace` owns the admitted Vulkan layout and native
 custody. [Workspace interoperability](gpu-execution.md#shared-workspace-interoperability)

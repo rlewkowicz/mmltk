@@ -1,6 +1,6 @@
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <array>
@@ -11,9 +11,9 @@
 #include <utility>
 #include <iterator>
 #include <optional>
-#include "src/frameworks/gpu/cuda_high_water_allocation.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/cuda/cuda_high_water_allocation.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 #include "src/backend/imaging/raster/class_palette.h"
 import mmltk.backend.imaging.raster;
 namespace mmltk::controller {

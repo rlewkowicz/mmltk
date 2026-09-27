@@ -1,6 +1,6 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include "detail/training_data_plan.h"
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "detail/training_epoch_policy.h"
 #include "detail/training_schedule.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"

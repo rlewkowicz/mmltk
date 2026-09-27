@@ -3,8 +3,7 @@
 #include <ATen/ops/convolution_backward.h>
 #include <ATen/ops/conv2d.h>
 #include <torch/csrc/autograd/custom_function.h>
-#include <array>
-#include <optional>
+#include "src/pch_std.h"
 namespace mmltk::backend::models::rfdetr {
 namespace {
 // RF-DETR e9a138f, models/heads/segmentation.py::_DepthwiseConvWithoutCuDNN.

@@ -1,6 +1,6 @@
 #include "src/test_support/async_test_utils.hpp"
-#include "src/frameworks/gpu/gdr_mapped_buffer.h"
-#include "src/frameworks/gpu/detail/gdr_buffer_backend.h"
+#include "src/frameworks/gpu/memory/gdr_mapped_buffer.h"
+#include "src/frameworks/gpu/memory/detail/gdr_buffer_backend.h"
 #include "third_party/gdrcopy/src/gdr_backend_selection.h"
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>

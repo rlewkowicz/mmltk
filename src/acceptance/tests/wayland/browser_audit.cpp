@@ -1,7 +1,7 @@
-#include "src/backend/data/compiled_file_utils.h"
-#include "src/backend/data/dataset_compiler.h"
-#include "src/backend/data/dataset_compile_phase.h"
-#include "src/backend/data/dataset_compile_progress.h"
+#include "src/backend/data/compiled/compiled_file_utils.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
+#include "src/backend/data/compiler/dataset_compile_phase.h"
+#include "src/backend/data/compiler/dataset_compile_progress.h"
 #include <charconv>
 #include <system_error>
 #include <algorithm>

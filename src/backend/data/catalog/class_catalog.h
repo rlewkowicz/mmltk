@@ -1,6 +1,5 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -10,8 +9,6 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
-#include "src/frameworks/reflection/field_policy.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
 #include "mmltk/frameworks/reflection/materializer.h"
 namespace mmltk::backend::data::catalog {
 inline constexpr std::size_t kClassCatalogCapacity = 256U;

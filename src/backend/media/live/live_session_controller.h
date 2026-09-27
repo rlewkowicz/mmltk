@@ -6,7 +6,7 @@
 #include <utility>
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
-#include "src/frameworks/gpu/resource_owner_command_authority.h"
+#include "src/frameworks/gpu/cuda/resource_owner_command_authority.h"
 #include "src/backend/media/live/live_types.h"
 #include "src/backend/media/live/manual_overlay_document.h"
 #include "src/backend/media/capture/capture_session.h"

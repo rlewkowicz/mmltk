@@ -3,7 +3,7 @@
 #include <functional>
 #include <cstddef>
 #include "src/backend/imaging/raster/chw_image.h"
-#include "src/frameworks/gpu/cuda_context_scope.h"
+#include "src/frameworks/gpu/cuda/cuda_context_scope.h"
 #include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -15,10 +15,10 @@
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
 #include "src/controller/presentation/visual_system_types.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
-#include "src/frameworks/gpu/image_types.h"
-#include "src/frameworks/gpu/image_buffer.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
+#include "src/frameworks/gpu/image/image_types.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller::detail {
 [[nodiscard]] mmltk::frameworks::gpu::DeviceContext CreatePredictionPreviewContext(
  const mmltk::frameworks::gpu::DeviceExecution&, const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>&, mmltk::frameworks::gpu::CudaContextApi = {});

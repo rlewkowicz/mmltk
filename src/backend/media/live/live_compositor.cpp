@@ -14,7 +14,7 @@
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/common/system/time_utils.h"
-#include "src/frameworks/gpu/resource_owner_command_authority.h"
+#include "src/frameworks/gpu/cuda/resource_owner_command_authority.h"
 import mmltk.backend.imaging.raster;
 namespace mmltk::backend::media::live {
 namespace raster = mmltk::backend::imaging::raster;

@@ -8,7 +8,7 @@ module;
 #include <functional>
 #include <limits>
 #include <memory>
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 #include "upscale_execution.h"
 export module mmltk.backend.imaging.upscale.image_upscaler;
 export namespace mmltk::backend::imaging::upscale {

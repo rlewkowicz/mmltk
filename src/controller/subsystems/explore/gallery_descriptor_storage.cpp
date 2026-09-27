@@ -1,5 +1,5 @@
 #include "src/controller/subsystems/explore/detail/gallery_descriptor_storage.h"
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include <algorithm>
 #include <stdexcept>
 import mmltk.backend.imaging.explore.explore_render_core;

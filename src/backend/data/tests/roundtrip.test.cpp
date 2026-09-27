@@ -16,26 +16,24 @@
 #include <fstream>
 #include <string>
 #include <vector>
-#include "src/backend/data/compiled_format.h"
-#include "src/backend/data/compiled_file_layout.h"
+#include "src/backend/data/compiled/compiled_format.h"
+#include "src/backend/data/compiled/compiled_file_layout.h"
 #include "src/common/io/file_memory.h"
 #include <limits>
-#include "src/backend/data/compiled_dataset.h"
-#include "src/backend/data/compiled_image_stream.h"
-#include "src/frameworks/gpu/image_buffer.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-#include "src/backend/data/dataset_compiler.h"
-#include "src/backend/data/dataset_loader.h"
-#include "src/common/concurrency/event_cancellation.h"
-#include "src/common/concurrency/parallel_range.h"
-#include "src/common/concurrency/worker_pool.h"
+#include "src/backend/data/compiled/compiled_dataset.h"
+#include "src/backend/data/compiled/compiled_image_stream.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
+#include "src/backend/data/loading/dataset_loader.h"
+#include "src/common/concurrency/concurrency.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/imaging/resample/tests/perceptual_downscale_reference.h"
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 #include "src/common/system/cpu_affinity.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include "src/frameworks/gpu/gdr_mapped_buffer.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
+#include "src/frameworks/gpu/memory/gdr_mapped_buffer.h"
 namespace fs = std::filesystem;
 using namespace mmltk::backend::data;
 using namespace mmltk::common::concurrency;

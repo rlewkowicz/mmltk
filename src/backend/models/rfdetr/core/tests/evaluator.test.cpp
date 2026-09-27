@@ -16,8 +16,8 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 #include "src/test_support/filesystem_test_utils.hpp"
-#include "src/backend/data/dataset_compiler.h"
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
 #include "src/frameworks/serialization/reflected_cbor.h"

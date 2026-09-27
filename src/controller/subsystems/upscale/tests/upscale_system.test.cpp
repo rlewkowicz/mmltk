@@ -16,10 +16,10 @@
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/presentation/presentation_system.h"
 #include "src/controller/presentation/visual_diagnostics.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 #include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>

@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
-#include "src/backend/data/compiled_image_stream.h"
+#include "src/backend/data/compiled/compiled_image_stream.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h"
 #include "src/controller/subsystems/explore/detail/gallery_payload.h"

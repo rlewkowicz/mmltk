@@ -1,13 +1,11 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <cstdint>
 #include <cstddef>
 #include <concepts>
 #include <type_traits>
 #include <meta>
 #include <string>
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
 namespace mmltk::controller::contracts {
 // Explicit acceptance control, carried only by an installed integration driver.
 // These receipts never participate in ordinary product state or diagnostics.

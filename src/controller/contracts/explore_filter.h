@@ -1,13 +1,11 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <span>
 #include <vector>
-#include "src/backend/data/compiled_format_limits.h"
+#include "src/backend/data/compiled/compiled_format_limits.h"
 #include "src/controller/contracts/application_boundary.h"
 #include "src/backend/data/catalog/class_catalog.h"
 namespace mmltk::controller {

@@ -1,12 +1,12 @@
 #include "src/backend/imaging/raster/image_containment.h"
 #include "prediction_preview.h"
 #include "src/backend/ml/runtime/backend_factory.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 #include "src/backend/imaging/raster/chw_image.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include "src/backend/models/rfdetr/contract/class_layout.h"
-#include "src/frameworks/gpu/cuda_high_water_allocation.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/cuda/cuda_high_water_allocation.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 #include "src/controller/contracts/annotation.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>

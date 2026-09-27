@@ -9,9 +9,9 @@
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/controller/contracts/compute.h"
 #include "src/controller/subsystems/system/compute_runtime.h"
-#include "src/frameworks/gpu/device_execution.h"
-#include "src/frameworks/gpu/cuda_device_scope.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
+#include "src/frameworks/gpu/cuda/cuda_device_scope.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::frameworks::gpu {
 class TerminalCudaRetirementAuthority;
 }

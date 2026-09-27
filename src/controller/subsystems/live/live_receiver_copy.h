@@ -2,7 +2,7 @@
 #include <cuda_runtime_api.h>
 #include <cstddef>
 #include <cstdint>
-#include "src/frameworks/gpu/image_types.h"
+#include "src/frameworks/gpu/image/image_types.h"
 namespace mmltk::controller::detail {
 struct LiveReceiverCopyOperations final {
  cudaError_t (*wait)(std::uintptr_t stream, std::uintptr_t event) noexcept = nullptr;

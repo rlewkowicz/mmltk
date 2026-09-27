@@ -5,7 +5,7 @@ module;
 #include <type_traits>
 #include "detail/explore_render_cuda_launch.h"
 #include "explore_render_storage.h"
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 module mmltk.backend.imaging.explore.explore_render_core;
 namespace mmltk::backend::imaging::explore {
 namespace {

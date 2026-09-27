@@ -4,8 +4,8 @@
 #include <stdexcept>
 #include <iomanip>
 #include <sstream>
-#include "src/backend/data/compiled_format.h"
-#include "src/backend/data/dataset_compiler.h"
+#include "src/backend/data/compiled/compiled_format.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
 namespace mmltk::testsupport {

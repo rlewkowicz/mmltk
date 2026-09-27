@@ -12,7 +12,7 @@
 #include "src/controller/subsystems/explore/detail/gallery_read_scheduler.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
 #include "src/controller/subsystems/explore/detail/gallery_host_allocations.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 namespace mmltk::controller::explore_detail {
 struct GalleryProductState;
 class GalleryDescriptorStorage;

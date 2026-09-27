@@ -6,8 +6,8 @@
 #include <vector>
 #include "training_data_state.h"
 #include <cuda_runtime_api.h>
-#include "src/backend/data/dataset_loader.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/backend/data/loading/dataset_loader.h"
+#include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include <torch/types.h>
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
 namespace mmltk::backend::models::rfdetr {

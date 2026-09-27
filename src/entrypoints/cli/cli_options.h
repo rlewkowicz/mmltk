@@ -2,12 +2,11 @@
 #include <array>
 #include <cstddef>
 #include <string>
-#include "src/backend/data/data_loading_options.h"
-#include "src/backend/data/dataset_compiler.h"
+#include "src/backend/data/loading/data_loading_options.h"
+#include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/frameworks/reflection/cli_declarations.h"
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
 namespace mmltk::entrypoints::cli::root_options {
 namespace data = mmltk::backend::data;
 namespace reflection = mmltk::frameworks::reflection;

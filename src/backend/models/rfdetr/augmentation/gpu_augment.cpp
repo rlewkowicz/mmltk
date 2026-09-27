@@ -1,6 +1,6 @@
 #include "src/backend/models/rfdetr/augmentation/sampling.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 #include <algorithm>
 #include <cuda.h>
 #include <functional>
@@ -23,7 +23,7 @@
 #include "detail/gpu_augment_cuda_launch.h"
 #include "detail/gpu_augment_plan_math.h"
 #include "gpu_augmentation_donor_index.h"
-#include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 namespace mmltk::backend::models::rfdetr {
 using mmltk::frameworks::gpu::ensure_cuda_ok;

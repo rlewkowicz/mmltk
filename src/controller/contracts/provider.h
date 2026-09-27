@@ -1,5 +1,5 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -8,9 +8,6 @@
 #include <string>
 #include <type_traits>
 #include <vector>
-#include "src/frameworks/reflection/field_policy.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/frameworks/reflection/reflection_metadata.h"
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/controller/contracts/terminal_presentation.h"
 #include "src/controller/contracts/workflows.h"

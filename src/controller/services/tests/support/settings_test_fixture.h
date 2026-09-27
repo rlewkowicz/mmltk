@@ -2,8 +2,8 @@
 #include <filesystem>
 #include <catch2/catch_test_macros.hpp>
 #include "src/controller/contracts/gui_settings_mutation.h"
-#include "src/controller/services/settings_store.h"
-#include "src/controller/services/settings_location.h"
+#include "src/controller/services/settings/settings_store.h"
+#include "src/controller/services/settings/settings_location.h"
 namespace mmltk::controller::test_support {
 [[nodiscard]] inline services::SettingsLocation install_settings(const std::filesystem::path& root) {
  auto settings = contracts::default_gui_settings_state();

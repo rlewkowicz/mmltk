@@ -131,7 +131,7 @@ it must not be called from a fatal signal handler.
 
 ## Local training failures
 
-[TrainProcessClient](../src/controller/services/train_process_client.cpp) scans
+[TrainProcessClient](../src/controller/services/training/train_process_client.cpp) scans
 the child's consumed output for line-start `fatal: ` envelopes even after the
 64 KiB console-retention budget fills. Its current-line and retained-cause
 buffers are each bounded to 3072 bytes. It finishes chunked and unterminated
@@ -364,8 +364,8 @@ Explicit Wayland integration with a lifecycle sink selects complete delivery
 on this same bounded queue and writer. It may wait for capacity. Encoding or
 delivery failure is an acceptance failure, and shutdown drains the writer.
 Complete delivery is an acceptance mode, not the ordinary GUI's policy.
-Sources are [diagnostics_client.h](../src/controller/services/diagnostics_client.h),
-[runtime_diagnostics.cpp](../src/controller/services/runtime_diagnostics.cpp),
+Sources are [diagnostics_client.h](../src/controller/services/diagnostics/diagnostics_client.h),
+[runtime_diagnostics.cpp](../src/controller/services/diagnostics/runtime_diagnostics.cpp),
 and [desktop startup](../src/entrypoints/desktop/browser_runtime_entry.cpp).
 
 Quiet acceptance still uses real receipts/input, accepted-unsent pressure,

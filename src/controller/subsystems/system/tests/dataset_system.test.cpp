@@ -3,9 +3,9 @@
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/controller/subsystems/system/dataset_system.h"
 #include "src/controller/services/artifact_store.h"
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/settings/settings_system.h"
 #include "src/common/concurrency/cancellation_observation.h"
-#include "src/backend/data/detail/benchmark_progress.h"
+#include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/tests/benchmark_http_fixture.h"
 #include "src/common/io/file_digest.h"
 #include <vector>

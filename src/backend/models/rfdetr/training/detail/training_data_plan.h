@@ -5,7 +5,7 @@
 #include <span>
 #include <vector>
 #include "training_data_state.h"
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/models/rfdetr/augmentation/augmentation_plan.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augmentation_donor_index.h"
 #include "src/backend/models/rfdetr/contract/execution_plan.h"

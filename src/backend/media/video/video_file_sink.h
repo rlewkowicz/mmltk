@@ -5,7 +5,7 @@
 #include <functional>
 #include <cstddef>
 #include "video_media.h"
-#include "src/frameworks/gpu/image_types.h"
+#include "src/frameworks/gpu/image/image_types.h"
 namespace mmltk::backend::media::video {
 // Synchronous worker-side backpressure. Each call settles its borrowed device
 // read; encoder and mux packet custody remains entirely inside the media owner.

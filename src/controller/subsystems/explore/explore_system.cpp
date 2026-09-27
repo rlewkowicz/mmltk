@@ -1,8 +1,8 @@
 #include "src/controller/presentation/workspace_input.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/presentation/visual_runtime_owner.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
 #include <algorithm>
 #include <array>
@@ -17,9 +17,9 @@
 #include <type_traits>
 #include <utility>
 #include "src/common/types/generation.h"
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/settings/settings_system.h"
 #include "src/common/system/cpu_affinity.h"
-#include "src/frameworks/gpu/gdr_mapped_buffer.h"
+#include "src/frameworks/gpu/memory/gdr_mapped_buffer.h"
 namespace mmltk::controller {
 namespace {
 static_assert(std::is_nothrow_move_assignable_v<ExploreSnapshot>);

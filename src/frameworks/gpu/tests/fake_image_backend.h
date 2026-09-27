@@ -18,11 +18,11 @@
 #include <algorithm>
 #include <utility>
 #include <vector>
-#include "src/frameworks/gpu/image_buffer.h"
-#include "src/frameworks/gpu/image_failure.h"
-#include "src/frameworks/gpu/image_workspace.h"
-#include "src/frameworks/gpu/imported_image_buffer.h"
-#include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/image/image_buffer.h"
+#include "src/frameworks/gpu/image/image_failure.h"
+#include "src/frameworks/gpu/image/image_workspace.h"
+#include "src/frameworks/gpu/image/imported_image_buffer.h"
+#include "src/frameworks/gpu/runtime/system_image_runtime.h"
 namespace mmltk::frameworks::gpu::test_support {
 // The fixture records the physical mapped-base release before external-memory
 // destruction. A failed mapping release must retain backing and context.

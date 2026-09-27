@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <cmath>
-#include "src/frameworks/gpu/cuda_launch.cuh"
+#include "src/frameworks/gpu/cuda/cuda_launch.cuh"
 #include <initializer_list>
 #include <limits>
 namespace mmltk::backend::models::rfdetr {

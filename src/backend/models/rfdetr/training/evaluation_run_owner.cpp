@@ -39,12 +39,10 @@
 #include <vector>
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include "src/backend/models/rfdetr/core/postprocess.h"
-#include "src/backend/data/dataset_loader.h"
+#include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
-#include "src/common/concurrency/event_cancellation.h"
-#include "src/common/concurrency/parallel_range.h"
-#include "src/common/concurrency/worker_pool.h"
-#include "src/frameworks/gpu/cuda_priority.h"
+#include "src/common/concurrency/concurrency.h"
+#include "src/frameworks/gpu/cuda/cuda_priority.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "detail/evaluation_runtime.h"

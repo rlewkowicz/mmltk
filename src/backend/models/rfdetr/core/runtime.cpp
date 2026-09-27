@@ -2,7 +2,7 @@
 #include <ATen/Parallel.h>
 #include <atomic>
 #include <mutex>
-#include "src/frameworks/gpu/device_execution.h"
+#include "src/frameworks/gpu/cuda/device_execution.h"
 #include <torch/script.h>
 #include <algorithm>
 #include <cstdio>

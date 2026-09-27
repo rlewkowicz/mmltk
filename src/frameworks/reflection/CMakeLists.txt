@@ -13,6 +13,7 @@ mmltk_register_public_headers(mmltk_frameworks_reflection
         declaration_annotations.h
         field_policy.h
         reflected_descriptors.h
+        reflected_declarations.h
         reflected_field_policy.h
         record_projection.h
         reflection_metadata.h
@@ -30,3 +31,5 @@ target_link_libraries(mmltk_frameworks_reflection
     PUBLIC
         mmltk::common::types
 )
+
+mmltk_register_header_isolation(mmltk_frameworks_reflection)

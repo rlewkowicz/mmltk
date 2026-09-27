@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 #include "mmltk/frameworks/reflection/member_relation.h"
-#include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/models/rfdetr/contract/execution_plan.h"
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
@@ -19,10 +19,8 @@
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/inference/evaluation.h"
 #include "src/frameworks/reflection/cli_declarations.h"
-#include "src/frameworks/reflection/declaration_annotations.h"
-#include "src/frameworks/reflection/field_policy.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
 namespace mmltk::entrypoints::cli::rfdetr_options {
 namespace data = mmltk::backend::data;
 namespace reflection = mmltk::frameworks::reflection;

@@ -3,6 +3,7 @@
 import { SourceIndex, sourceRange, tokenizeCpp } from "./cpd_patterns.mjs";
 
 export const ANNOTATION_HEADER = "src/frameworks/reflection/declaration_annotations.h";
+export const DECLARATION_SURFACE = "src/frameworks/reflection/reflected_declarations.h";
 const POLICY_NAMESPACE = "mmltk::frameworks::reflection";
 export const ANNOTATION_MACROS = Object.freeze({
   MaxBytes: "MMLTK_MAX_BYTES", MinBytes: "MMLTK_MIN_BYTES", MaxItems: "MMLTK_MAX_ITEMS",
@@ -354,7 +355,7 @@ export function formatDeclarationSource(path, source, options) {
     .map(({ start_offset: start, end_offset: end, replacement, reason }) => ({ start, end, replacement: replacement + (/\S/u.test(source[end] ?? "") ? " " : ""), reason }));
   const { regions, conditional } = preprocessorRegions(source);
   const hasInclude = regions.some((region) => region.directive === "include" && !inside(conditional, region.start) &&
-    region.text.match(/^#\s*include\s*[<"]([^>"]+)[>"]/u)?.[1] === ANNOTATION_HEADER);
+    [ANNOTATION_HEADER, DECLARATION_SURFACE].includes(region.text.match(/^#\s*include\s*[<"]([^>"]+)[>"]/u)?.[1]));
   const usesAnnotationMacros = result.candidates.some((candidate) => candidate.disposition === "retained" && candidate.categories.includes("shortened_annotation"));
   if ((edits.length || usesAnnotationMacros) && !hasInclude) {
     const firstInclude = regions.find((region) => region.directive === "include" && !inside(conditional, region.start));

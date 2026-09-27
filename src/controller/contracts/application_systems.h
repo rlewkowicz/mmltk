@@ -1,7 +1,7 @@
 #pragma once
 #include "src/controller/presentation/presentation_system.h"
-#include "src/controller/services/file_dialog_system.h"
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/file_dialog/file_dialog_system.h"
+#include "src/controller/services/settings/settings_system.h"
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/subsystems/live/live_system.h"

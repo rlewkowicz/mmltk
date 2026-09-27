@@ -2,8 +2,8 @@
 #include "src/common/types/utf8.h"
 #include "detail/caption_raster_cuda.h"
 #include "caption_font_data.h"
-#include "src/frameworks/gpu/cuda_error.h"
-#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/cuda/cuda_error.h"
+#include "src/frameworks/gpu/memory/pinned_host_buffer.h"
 #include <cstring>
 #include <stb_truetype.h>
 #include <cuda_runtime_api.h>

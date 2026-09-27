@@ -4,7 +4,7 @@
 #include "src/backend/imaging/raster/caption_raster.h"
 #include "src/backend/imaging/raster/class_palette.h"
 #include "src/backend/imaging/raster/rendered_image_writer.h"
-#include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/image/image_failure.h"
 #include <algorithm>
 #include <array>
 #include <cmath>

@@ -1,7 +1,5 @@
 #pragma once
-#include "src/frameworks/reflection/declaration_annotations.h"
-#include "src/frameworks/reflection/field_policy.h"
-#include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflected_declarations.h"
 namespace mmltk::controller {
 struct ValidationOverlays final {
  bool prediction_boxes = true, prediction_masks = true;

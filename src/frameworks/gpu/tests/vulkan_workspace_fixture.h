@@ -1,7 +1,7 @@
 #pragma once
 #include <memory>
 #include "src/common/io/scoped_fd.h"
-#include "src/frameworks/gpu/image_workspace.h"
+#include "src/frameworks/gpu/image/image_workspace.h"
 namespace mmltk::frameworks::gpu::test_support {
 // Hardware-only fixture; Vulkan never enters the production GPU target.
 class VulkanWorkspaceFixture final {

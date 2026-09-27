@@ -1,10 +1,7 @@
 #include "detail/mask_rle_utils.h"
 #include <immintrin.h>
-#include <algorithm>
-#include <limits>
-#include <stdexcept>
-#include <span>
-#include "src/backend/data/compiled_format.h"
+#include "src/pch_std.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data::dataset {

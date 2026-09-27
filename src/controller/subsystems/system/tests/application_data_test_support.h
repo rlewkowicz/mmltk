@@ -7,7 +7,7 @@
 #include <variant>
 #include "src/test_support/async_test_utils.hpp"
 #include "src/controller/services/tests/support/settings_test_fixture.h"
-#include "src/controller/services/settings_system.h"
+#include "src/controller/services/settings/settings_system.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 #include "src/controller/subsystems/system/dataset_system.h"
 #include "src/controller/subsystems/system/model_system.h"
