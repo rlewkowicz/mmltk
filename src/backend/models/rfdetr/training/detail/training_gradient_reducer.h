@@ -29,7 +29,12 @@ public:
  void collect(std::size_t slot);
  void contribute_empty();
  void enable_gradient_launch_after_counts();
- void finish_attempt();
+ // Order reduced gradients onto the caller's stream for finite checking and
+ // unscaling. DDP usage remains pending; no optimizer .grad is published yet.
+ [[nodiscard]] const std::vector<torch::Tensor>& finish_attempt();
+ // Call after the metric/control host handoff on that stream. Projects global
+ // usage and reclaims physically completed collectives without another wait.
+ void finalize_attempt();
  void abort(std::exception_ptr first_error) noexcept;
  [[nodiscard]] std::size_t launched_buckets() const;
  [[nodiscard]] std::size_t bucket_count() const;

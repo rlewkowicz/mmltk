@@ -19,6 +19,10 @@ TEST_CASE("Early gradient bucket launches before a held late backward returns", 
  const rf::DistributedContext group;
  REQUIRE_NOTHROW(rf::testsupport::exercise_early_bucket_overlap(group, 0));
 }
+TEST_CASE("Single-contribution gradients retain exclusive storage and isolate aliases", "[rfdetr][training][gradient]") {
+ if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; direct gradient coverage unverified");
+ REQUIRE_NOTHROW(rf::testsupport::exercise_direct_gradients(0));
+}
 TEST_CASE("Gradient cancellation seals admission and wakes count consumers", "[rfdetr][training][gradient][cancel]") {
  if (!mmltk::testsupport::checked_cuda_device_count()) SKIP("CUDA unavailable; cancellation coverage unverified");
  namespace tc = mmltk::backend::ml::cuda;

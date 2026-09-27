@@ -316,10 +316,11 @@ std::uint64_t TrainingModel::attempt() {
    }
    ++p.waves;
   }
-  p.reducer->finish_attempt();
+  const auto& gradients = p.reducer->finish_attempt();
   mmltk::common::logging::ScopedProfile profile_optimizer{"rfdetr.train.optimizer"};
-  const auto found_inf = p.scaler.check_and_unscale_(optimizer);
+  const auto found_inf = p.scaler.check_and_unscale_gradients_(gradients, optimizer.parameters().front().device());
   p.last_metrics = p.metrics.complete_step(found_inf, p.contributions, p.cursor, p.distributed);
+  p.reducer->finalize_attempt();
   const bool overflow = !p.last_metrics.gradients_finite;
   if (!p.last_metrics.loss_finite || (overflow && !p.scaler.enabled())) {
    const auto failure = losses.failure(optimizer.parameters(), optimizer.parameter_names());

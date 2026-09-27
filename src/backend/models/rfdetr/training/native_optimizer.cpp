@@ -62,16 +62,6 @@ torch::Device step_device_for_backend(const torch::Tensor& param, NativeOptimize
 torch::Tensor make_step_tensor(const torch::Tensor& param, NativeOptimizerBackend backend) {
  return torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(step_device_for_backend(param, backend)));
 }
-struct AdamWBatch {
- std::vector<torch::Tensor> params;
- std::vector<torch::Tensor> grads;
- std::vector<torch::Tensor> exp_avgs;
- std::vector<torch::Tensor> exp_avg_sqs;
- std::vector<torch::Tensor> max_exp_avg_sqs;
- std::vector<torch::Tensor> steps;
-};
-using AdamWBatchKey = std::pair<int, int>;
-using AdamWBatchMap = std::map<AdamWBatchKey, AdamWBatch>;
 template <typename GroupCollection>
 void set_scaled_group_lrs(GroupCollection& groups, const std::vector<double>& base_lrs, const double scale, const char* size_mismatch_message) {
  if (base_lrs.size() != groups.size()) { throw std::runtime_error(size_mismatch_message); }
@@ -269,18 +259,6 @@ void align_adamw_state_tensors(torch::Tensor& step, torch::Tensor& exp_avg, torc
  ensure_aligned(grad, param);
  if (amsgrad) { ensure_aligned(max_exp_avg_sq, param); }
 }
-void collect_adamw_batch(std::map<std::pair<int, int>, AdamWBatch>& batches, const torch::Tensor& param, const torch::Tensor& grad, const torch::Tensor& exp_avg, const torch::Tensor& exp_avg_sq,
- const torch::Tensor& max_exp_avg_sq, const torch::Tensor& step, const bool amsgrad) {
- const auto device_index = static_cast<int>(param.device().index());
- const auto key = std::make_pair(device_index, static_cast<int>(param.scalar_type()));
- auto& batch = batches[key];
- batch.params.push_back(param);
- batch.grads.push_back(grad);
- batch.exp_avgs.push_back(exp_avg);
- batch.exp_avg_sqs.push_back(exp_avg_sq);
- if (amsgrad) { batch.max_exp_avg_sqs.push_back(max_exp_avg_sq); }
- batch.steps.push_back(step);
-}
 template <typename Params, typename States, typename Group, typename Fn>
 void for_each_adamw_grad_state(Params& params, States& states, const Group& group, const NativeOptimizerBackend backend, Fn&& fn) {
  for (const auto index : group.param_indices) {
@@ -289,56 +267,6 @@ void for_each_adamw_grad_state(Params& params, States& states, const Group& grou
   auto grad = param.grad();
   validate_adamw_param_for_backend(param, grad, backend);
   fn(index, param, grad, states[index]);
- }
-}
-template <typename Params, typename States, typename Group>
-AdamWBatchMap collect_adamw_batches(Params& params, States& states, const Group& group, const NativeOptimizerBackend backend) {
- AdamWBatchMap batches;
- for_each_adamw_grad_state(params, states, group, backend, [&](const auto, auto& param, auto grad, auto& state) {
-  align_adamw_state_tensors(state.step, state.exp_avg, state.exp_avg_sq, state.max_exp_avg_sq, grad, param, backend, group.config.amsgrad);
-  collect_adamw_batch(batches, param, grad, state.exp_avg, state.exp_avg_sq, state.max_exp_avg_sq, state.step, group.config.amsgrad);
- });
- return batches;
-}
-void apply_foreach_adamw_batch(AdamWBatch& batch, const NativeAdamWGroupConfig& config) {
- torch::_foreach_add_(batch.steps, 1.0);
- if (config.weight_decay != 0.0) { torch::_foreach_mul_(batch.params, 1.0 - config.lr * config.weight_decay); }
- torch::_foreach_mul_(batch.exp_avgs, kAdamBeta1);
- torch::_foreach_add_(batch.exp_avgs, batch.grads, 1.0 - kAdamBeta1);
- torch::_foreach_mul_(batch.exp_avg_sqs, kAdamBeta2);
- torch::_foreach_addcmul_(batch.exp_avg_sqs, batch.grads, batch.grads, 1.0 - kAdamBeta2);
- // Each tensor owns its successful-update age, including delayed gradients and Resume.
- auto correction1 = at::_foreach_pow(kAdamBeta1, batch.steps);
- auto correction2 = at::_foreach_pow(kAdamBeta2, batch.steps);
- torch::_foreach_neg_(correction1);
- torch::_foreach_add_(correction1, 1.0);
- torch::_foreach_neg_(correction2);
- torch::_foreach_add_(correction2, 1.0);
- torch::_foreach_sqrt_(correction2);
- if (config.amsgrad) { torch::_foreach_maximum_(batch.max_exp_avg_sqs, batch.exp_avg_sqs); }
- auto denoms = torch::_foreach_sqrt(config.amsgrad ? batch.max_exp_avg_sqs : batch.exp_avg_sqs);
- torch::_foreach_div_(denoms, correction2);
- torch::_foreach_add_(denoms, kAdamEps);
- // Fold the first bias correction into the denominator, retaining scalar-list
- // tensor operations and avoiding any device-to-host age read.
- torch::_foreach_mul_(denoms, correction1);
- torch::_foreach_addcdiv_(batch.params, batch.exp_avgs, denoms, -config.lr);
-}
-void apply_fused_adamw_batch(AdamWBatch& batch, const NativeAdamWGroupConfig& config) {
- torch::_foreach_add_(batch.steps, 1.0);
- at::_fused_adamw_(batch.params, batch.grads, batch.exp_avgs, batch.exp_avg_sqs, batch.max_exp_avg_sqs, batch.steps, config.lr, kAdamBeta1, kAdamBeta2, config.weight_decay, kAdamEps, config.amsgrad,
-  false, std::nullopt, std::nullopt);
-}
-template <typename Params, typename States, typename Group>
-void step_adamw_group_batched(Params& params, States& states, const Group& group, const NativeOptimizerBackend backend) {
- auto batches = collect_adamw_batches(params, states, group, backend);
- for (auto& [_, batch] : batches) {
-  if (batch.params.empty()) { continue; }
-  if (backend == NativeOptimizerBackend::fused) {
-   apply_fused_adamw_batch(batch, group.config);
-  } else {
-   apply_foreach_adamw_batch(batch, group.config);
-  }
  }
 }
 torch::Tensor muon_update(const torch::Tensor& grad, torch::Tensor& momentum, const double beta, const bool nesterov) {
@@ -459,10 +387,8 @@ void NativeAdamW::set_lrs(const std::vector<double>& base_lrs, const double scal
 void NativeAdamW::step() {
  torch::NoGradGuard no_grad;
  for (const auto& group : groups_) {
-  if (backend_ == NativeOptimizerBackend::fused) {
-   step_group_fused(group);
-  } else if (backend_ == NativeOptimizerBackend::foreach) {
-   step_group_foreach(group);
+  if (backend_ != NativeOptimizerBackend::eager) {
+   step_group_batched(group);
   } else {
    step_group_eager(group);
   }
@@ -489,8 +415,59 @@ void NativeAdamW::step_group_eager(const Group& group) {
   param.addcdiv_(state.exp_avg, denom, -group.config.lr / bias_correction1);
  });
 }
-void NativeAdamW::step_group_foreach(const Group& group) { step_adamw_group_batched(params_, state_, group, NativeOptimizerBackend::foreach); }
-void NativeAdamW::step_group_fused(const Group& group) { step_adamw_group_batched(params_, state_, group, NativeOptimizerBackend::fused); }
+void NativeAdamW::Batch::clear() {
+ template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Batch, std::meta::access_context::current()))) {
+  (*this).[:member:].clear();
+ }
+}
+void NativeAdamW::step_group_batched(const Group& group) {
+ // Keep device/dtype grouping and all tensor-vector capacities across groups,
+ // attempts and activation. Only the current defined gradients enter a batch.
+ for (auto& [key, batch] : batches_) batch.clear();
+ for_each_adamw_grad_state(params_, state_, group, backend_, [&](const auto, auto& param, auto grad, auto& state) {
+  align_adamw_state_tensors(state.step, state.exp_avg, state.exp_avg_sq, state.max_exp_avg_sq, grad, param, backend_, group.config.amsgrad);
+  auto& batch = batches_[{param.device().type(), param.device().index(), param.scalar_type()}];
+  batch.params.push_back(param);
+  batch.grads.push_back(grad);
+  batch.exp_avgs.push_back(state.exp_avg);
+  batch.exp_avg_sqs.push_back(state.exp_avg_sq);
+  if (group.config.amsgrad) batch.max_exp_avg_sqs.push_back(state.max_exp_avg_sq);
+  batch.steps.push_back(state.step);
+ });
+ for (auto& [key, batch] : batches_) {
+  if (batch.params.empty()) continue;
+  const auto& config = group.config;
+  torch::_foreach_add_(batch.steps, 1.0);
+  if (backend_ == NativeOptimizerBackend::fused) {
+   at::_fused_adamw_(batch.params, batch.grads, batch.exp_avgs, batch.exp_avg_sqs, batch.max_exp_avg_sqs, batch.steps, config.lr, kAdamBeta1, kAdamBeta2, config.weight_decay, kAdamEps, config.amsgrad,
+    false, std::nullopt, std::nullopt);
+  } else {
+   if (config.weight_decay != 0.0) { torch::_foreach_mul_(batch.params, 1.0 - config.lr * config.weight_decay); }
+   torch::_foreach_mul_(batch.exp_avgs, kAdamBeta1);
+   torch::_foreach_add_(batch.exp_avgs, batch.grads, 1.0 - kAdamBeta1);
+   torch::_foreach_mul_(batch.exp_avg_sqs, kAdamBeta2);
+   torch::_foreach_addcmul_(batch.exp_avg_sqs, batch.grads, batch.grads, 1.0 - kAdamBeta2);
+   // Each tensor owns its successful-update age, including delayed gradients and Resume.
+   auto correction1 = at::_foreach_pow(kAdamBeta1, batch.steps);
+   auto correction2 = at::_foreach_pow(kAdamBeta2, batch.steps);
+   torch::_foreach_neg_(correction1);
+   torch::_foreach_add_(correction1, 1.0);
+   torch::_foreach_neg_(correction2);
+   torch::_foreach_add_(correction2, 1.0);
+   torch::_foreach_sqrt_(correction2);
+   if (config.amsgrad) { torch::_foreach_maximum_(batch.max_exp_avg_sqs, batch.exp_avg_sqs); }
+   auto denoms = torch::_foreach_sqrt(config.amsgrad ? batch.max_exp_avg_sqs : batch.exp_avg_sqs);
+   torch::_foreach_div_(denoms, correction2);
+   torch::_foreach_add_(denoms, kAdamEps);
+   // Fold the first bias correction into the denominator, retaining scalar-list
+   // tensor operations and avoiding any device-to-host age read.
+   torch::_foreach_mul_(denoms, correction1);
+   torch::_foreach_addcdiv_(batch.params, batch.exp_avgs, denoms, -config.lr);
+  }
+  // Preserve capacity without keeping old gradients or checkpoint state alive.
+  batch.clear();
+ }
+}
 template <typename GroupConfig, typename ParamStateT>
 void NativeOptimizerStorage<GroupConfig, ParamStateT>::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
  std::vector<torch::Tensor> tensors;

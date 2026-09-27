@@ -12,6 +12,7 @@ struct TrainingGradientReducer::Impl final {
   std::string name;
   torch::Tensor master;
   torch::Tensor view;
+  torch::Tensor gradient;
   std::size_t bucket = 0;
  };
  struct Bucket {
@@ -59,6 +60,7 @@ struct TrainingGradientReducer::Impl final {
   for (const auto& tensor : master)
    if (!tensor.requires_grad() || !tensor.is_leaf() || !tensor.is_cuda() || tensor.device().index() != device || !tensor.is_floating_point() || !tensor.is_non_overlapping_and_dense())
     throw std::invalid_argument("gradient reducer requires active dense CUDA leaves");
+  direct_layout = std::ranges::all_of(master, [](const auto& parameter) { return parameter.is_contiguous(); });
   // c10d groups across intervening dtypes and checks limits after insertion.
   // Bound its input to contiguous backward-order regions so ready early
   // tensors cannot wait for a later region, nor overflow a multi-tensor bucket.
@@ -82,7 +84,7 @@ struct TrainingGradientReducer::Impl final {
     std::int64_t elements = 0;
     for (auto reverse : indices) {
      const auto i = region_end - 1 - reverse;
-     parameters[i] = {names[i], master[i], {}, buckets.size() - 1};
+     parameters[i] = {names[i], master[i], {}, {}, buckets.size() - 1};
      bucket.parameters.push_back(i);
      elements += master[i].numel();
     }
@@ -95,9 +97,16 @@ struct TrainingGradientReducer::Impl final {
     }
    }
   }
-  work = std::make_unique<TrainingCollectiveWork>(device, buckets.size() + 1);
-  usage = torch::zeros({static_cast<std::int64_t>(parameters.size())}, torch::TensorOptions().dtype(torch::kInt32).device(tc::cuda_device(device)));
-  host_usage = tc::numa_empty({static_cast<std::int64_t>(parameters.size())}, torch::kInt32, device);
+  const auto usage_size = static_cast<std::int64_t>(parameters.size());
+  if (distributed.enabled) {
+   work = std::make_unique<TrainingCollectiveWork>(device, buckets.size() + 1);
+   usage = torch::empty({usage_size}, torch::TensorOptions().dtype(torch::kInt32).device(tc::cuda_device(device)));
+   host_usage = tc::numa_empty({usage_size}, torch::kInt32, device);
+  } else {
+   host_usage = torch::empty({usage_size}, torch::TensorOptions().dtype(torch::kInt32));
+  }
+  finite_gradients.clear();
+  finite_gradients.reserve(parameters.size());
   sources.reserve(parameters.size());
   destinations.reserve(parameters.size());
   slots.resize(leaves.size());
@@ -125,13 +134,13 @@ struct TrainingGradientReducer::Impl final {
   accumulation.synchronize();
  }
  void launch_ready() {
-  if (!counts_submitted) return;
+  if (!counts_submitted || direct) return;
   tc::TorchCudaStreamGuard guard(launch);
   while (next_bucket < buckets.size() && buckets[next_bucket].closed == expected) {
    auto& bucket = buckets[next_bucket];
    bucket.ready.block(launch);
    bucket.values.record_stream(launch);
-   bucket.work_slot = work->all_reduce(distributed, bucket.values);
+   if (work) bucket.work_slot = work->all_reduce(distributed, bucket.values);
    ++next_bucket;
   }
  }
@@ -166,6 +175,9 @@ struct TrainingGradientReducer::Impl final {
   auto& slot = slots.at(s);
   if (!active || !slot.armed || slot.gradients[i].defined() || slot.closed[parameters[i].bucket]) throw std::logic_error("gradient hook outside its contribution");
   slot.gradients[i] = gradient;
+  // For one producer, autograd joins its internal backward streams onto the
+  // caller before returning. collect() fences that complete inventory once.
+  if (direct) return;
   slot.produced[i].record(tc::getCurrentCUDAStream(tc::checked_device_index(device)));
   auto& remaining = slot.remaining[parameters[i].bucket];
   if (--remaining == 0) close(slot, parameters[i].bucket);
@@ -175,6 +187,7 @@ struct TrainingGradientReducer::Impl final {
  int device;
  tc::TorchCudaStream launch;
  tc::TorchCudaStream accumulation;
+ std::optional<tc::TorchCudaStream> direct_producer;
  std::size_t bucket_bytes;
  mutable std::mutex mutex;
  std::exception_ptr failure;
@@ -182,11 +195,11 @@ struct TrainingGradientReducer::Impl final {
  std::vector<Bucket> buckets;
  std::vector<Slot> slots;
  at::cuda::CUDAEvent optimizer_done, completed;
- std::vector<torch::Tensor> sources, destinations;
+ std::vector<torch::Tensor> sources, destinations, finite_gradients;
  torch::Tensor usage, host_usage;
  std::unique_ptr<TrainingCollectiveWork> work;
  std::size_t expected = 0, admitted = 0, finished = 0, next_bucket = 0;
- bool active = false, counts_submitted = false;
+ bool active = false, counts_submitted = false, direct_layout = false, direct = false, handed_off = false;
 };
 TrainingGradientReducer::TrainingGradientReducer(const DistributedContext& group, int device, tc::TorchCudaStream stream, const std::vector<std::string>& names,
  const std::vector<torch::Tensor>& master, const std::vector<std::vector<torch::Tensor>>& leaves, std::size_t bytes)
@@ -219,6 +232,10 @@ void TrainingGradientReducer::retire() noexcept {
   if (status == cudaSuccess) status = accumulation_status;
   const auto launch_status = cudaStreamSynchronize(impl_->launch.stream());
   if (status == cudaSuccess) status = launch_status;
+  if (impl_->direct_producer) {
+   const auto producer_status = cudaStreamSynchronize(impl_->direct_producer->stream());
+   if (status == cudaSuccess) status = producer_status;
+  }
  } catch (...) { status = cudaErrorUnknown; }
  if (status != cudaSuccess)
   std::move(terminal_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), status);
@@ -234,20 +251,25 @@ void TrainingGradientReducer::begin_attempt(std::size_t count) {
  p.check();
  if (p.active || !count) throw std::logic_error("invalid gradient attempt admission");
  torch::NoGradGuard no_grad;
+ p.direct = !p.distributed.enabled && count == 1 && p.slots.size() == 1 && p.direct_layout;
  // The optimizer's preceding reads/writes must finish before bucket reuse.
  p.optimizer_done.record(tc::getCurrentCUDAStream(tc::checked_device_index(p.device)));
  p.optimizer_done.block(p.accumulation);
  tc::TorchCudaStreamGuard guard(p.accumulation);
- for (auto& parameter : p.parameters) parameter.master.mutable_grad() = torch::Tensor{};
+ p.finite_gradients.clear();
+ for (auto& parameter : p.parameters) {
+  parameter.master.mutable_grad() = torch::Tensor{};
+  parameter.gradient = {};
+ }
  for (auto& bucket : p.buckets) {
-  bucket.values.zero_();
+  if (!p.direct) bucket.values.zero_();
   bucket.closed = 0;
  }
  p.host_usage.zero_();
- p.usage.zero_();
  p.expected = count;
  p.admitted = p.finished = p.next_bucket = 0;
  p.counts_submitted = false;
+ p.handed_off = false;
  p.active = true;
 }
 void TrainingGradientReducer::arm(std::size_t index) {
@@ -256,6 +278,10 @@ void TrainingGradientReducer::arm(std::size_t index) {
  p.check();
  auto& slot = p.slots.at(index);
  if (!p.active || slot.armed || p.admitted == p.expected) throw std::logic_error("invalid gradient contribution admission");
+ if (p.direct) {
+  p.direct_producer = tc::getCurrentCUDAStream(tc::checked_device_index(p.device));
+  p.optimizer_done.block(*p.direct_producer);
+ }
  slot.armed = true;
  ++p.admitted;
  std::fill(slot.closed.begin(), slot.closed.end(), false);
@@ -267,7 +293,34 @@ void TrainingGradientReducer::collect(std::size_t index) {
  p.check();
  auto& slot = p.slots.at(index);
  if (!slot.armed) throw std::logic_error("gradient graph returned without an armed contribution");
- for (std::size_t b = 0; b < p.buckets.size(); ++b) p.close(slot, b);
+ if (p.direct) {
+  torch::NoGradGuard no_grad;
+  const auto producer = tc::getCurrentCUDAStream(tc::checked_device_index(p.device));
+  if (producer != *p.direct_producer) throw std::logic_error("direct gradient contribution changed its caller stream");
+  for (std::size_t i = 0; i < p.parameters.size(); ++i) {
+   auto& gradient = slot.gradients[i];
+   if (!gradient.defined()) continue;
+   auto& parameter = p.parameters[i];
+   // Autograd may return aliased or expanded derivatives. Only exclusively
+   // owned dense storage can be unscaled/clipped in place without changing
+   // another gradient or a saved/input tensor. Others use the existing view.
+   if (gradient.use_count() == 1 && gradient.storage().use_count() == 1 && gradient.storage().resizable() && gradient.is_non_overlapping_and_dense() &&
+       gradient.strides() == parameter.master.strides()) {
+    parameter.gradient = std::move(gradient);
+   } else {
+    gradient.record_stream(producer);
+    parameter.view.record_stream(producer);
+    parameter.view.copy_(gradient);
+    parameter.gradient = parameter.view;
+    gradient = {};
+   }
+   p.host_usage.data_ptr<std::int32_t>()[i] = 1;
+  }
+  p.completed.record(producer);
+  p.completed.block(p.launch);
+ } else {
+  for (std::size_t b = 0; b < p.buckets.size(); ++b) p.close(slot, b);
+ }
  slot.armed = false;
  ++p.finished;
 }
@@ -291,29 +344,46 @@ void TrainingGradientReducer::enable_gradient_launch_after_counts() {
  p.counts_submitted = true;
  p.launch_ready();
 }
-void TrainingGradientReducer::finish_attempt() {
+const std::vector<torch::Tensor>& TrainingGradientReducer::finish_attempt() {
  auto& p = *impl_;
  std::lock_guard lock(p.mutex);
  p.check();
- if (!p.active || p.finished != p.expected || p.next_bucket != p.buckets.size()) throw std::logic_error("incomplete gradient attempt");
+ if (!p.active || p.handed_off || !p.counts_submitted || p.finished != p.expected || (!p.direct && p.next_bucket != p.buckets.size()))
+  throw std::logic_error("incomplete gradient attempt");
  const auto optimizer_stream = tc::getCurrentCUDAStream(tc::checked_device_index(p.device));
  {
   tc::TorchCudaStreamGuard guard(p.launch);
-  for (auto& bucket : p.buckets) {
-   bucket.values.record_stream(optimizer_stream);
-   p.work->join(bucket.work_slot);
+  if (p.work) {
+   for (auto& bucket : p.buckets) p.work->join(bucket.work_slot);
+   p.usage.copy_(p.host_usage, true);
+   p.work->join(p.work->all_reduce(p.distributed, p.usage));
+   p.host_usage.copy_(p.usage, true);
+   // Retain Work and both usage buffers through the later metric host fence.
+   p.work->record_completion();
   }
-  p.usage.copy_(p.host_usage, true);
-  p.work->join(p.work->all_reduce(p.distributed, p.usage));
-  p.host_usage.copy_(p.usage, true);
-  // One physical boundary settles every gradient bucket and the usage readback.
-  p.work->settle();
-  const auto* used = p.host_usage.const_data_ptr<std::int32_t>();
-  for (std::size_t i = 0; i < p.parameters.size(); ++i)
-   if (used[i]) p.parameters[i].master.mutable_grad() = p.parameters[i].view;
+  for (std::size_t i = 0; i < p.parameters.size(); ++i) {
+   auto& parameter = p.parameters[i];
+   if (!p.direct && (p.work || p.host_usage.const_data_ptr<std::int32_t>()[i])) parameter.gradient = parameter.view;
+   if (parameter.gradient.defined()) {
+    parameter.gradient.record_stream(optimizer_stream);
+    p.finite_gradients.push_back(parameter.gradient);
+   }
+  }
   p.completed.record(p.launch);
   p.completed.block(optimizer_stream);
  }
+ p.handed_off = true;
+ return p.finite_gradients;
+}
+void TrainingGradientReducer::finalize_attempt() {
+ auto& p = *impl_;
+ std::lock_guard lock(p.mutex);
+ p.check();
+ if (!p.active || !p.handed_off) throw std::logic_error("gradient usage projection before device handoff");
+ if (p.work && !p.work->release_completed()) throw std::logic_error("gradient usage projection before metric completion");
+ const auto* used = p.host_usage.const_data_ptr<std::int32_t>();
+ for (std::size_t i = 0; i < p.parameters.size(); ++i)
+  if (used[i]) p.parameters[i].master.mutable_grad() = p.parameters[i].gradient;
  p.active = false;
 }
 void TrainingGradientReducer::abort(std::exception_ptr error) noexcept {

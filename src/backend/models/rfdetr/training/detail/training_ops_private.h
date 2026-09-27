@@ -125,13 +125,13 @@ public:
   }
   const auto& parameters = optimizer.parameters();
   if (parameters.empty()) { throw std::runtime_error("gradient finite check requires optimizer parameters"); }
-  ensure_device_state(parameters.front().device());
-  found_inf_device_.zero_();
-  inverse_scale_device_.fill_(enabled_ ? 1.0f / scale_ : 1.0f);
-  if (!gradient_scratch_.empty()) { at::_amp_foreach_non_finite_check_and_unscale_(gradient_scratch_, found_inf_device_, inverse_scale_device_); }
+  const auto result = check_and_unscale_gradients_(gradient_scratch_, parameters.front().device());
   gradient_scratch_.clear();
-  return found_inf_device_;
+  return result;
  }
+ // Reducer-owned values can be checked before CPU global-usage projection;
+ // zero bucket views for globally absent gradients never become optimizer .grad.
+ torch::Tensor check_and_unscale_gradients_(const std::vector<torch::Tensor>& gradients, const torch::Device& device);
  template <typename OptimizerLike>
  void step(OptimizerLike& optimizer, bool found_inf) {
   if (!found_inf) { optimizer.step(); }

@@ -8,17 +8,17 @@ namespace torch_cuda = mmltk::backend::ml::cuda;
 struct TrainingMetricHandoff::Impl {
  static constexpr std::int64_t scalar_offset = 9;
  static constexpr std::int64_t packet_size = scalar_offset + static_cast<std::int64_t>(TrainingScalarPacket::size);
+ static constexpr std::int64_t attempt_size = 3 + 2 * static_cast<std::int64_t>(TrainingScalarPacket::size);
+ static constexpr std::int64_t control_size = 2;
 
 public:
- explicit Impl(int device_id) : device_id_(device_id), launch_(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(device_id))), work_(device_id, 3) {}
+ explicit Impl(int device_id) : device_id_(device_id), launch_(torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(device_id))), work_(device_id) {}
  void initialize() {
   const auto device_options = torch::TensorOptions().dtype(torch::kFloat32).device(mmltk::backend::ml::cuda::cuda_device(device_id_));
   device_values_ = torch::zeros({packet_size}, device_options);
   device_values_.select(0, 6).fill_(1.0f);
   scalar_values_ = torch::empty({static_cast<int64_t>(TrainingScalarPacket::size)}, device_options);
   unavailable_ = torch::zeros({}, device_options);
-  attempt_values_ = torch::zeros({3 + 2 * static_cast<int64_t>(TrainingScalarPacket::size)}, device_options);
-  control_ = torch::zeros({2}, device_options);
   host_values_ = torch_cuda::numa_empty({packet_size}, torch::kFloat32, device_id_);
  }
  cudaError_t retire() noexcept {
@@ -54,13 +54,20 @@ public:
  const TrainingEpochMetricState& state() const noexcept { return epoch_state_; }
  void begin_attempt(std::size_t contributions) {
   check();
-  attempt_values_.zero_();
-  control_.zero_();
+  constexpr auto maximum_rows = (std::numeric_limits<std::int64_t>::max() - control_size - attempt_size) / static_cast<std::int64_t>(DetectionStatisticsPacket::size);
+  if (contributions > static_cast<std::size_t>(maximum_rows)) throw std::overflow_error("training metric contribution extent overflow");
+  const auto rows = static_cast<std::int64_t>(contributions);
+  if (!statistics_.defined() || statistics_.size(0) != rows) {
+   const auto size = control_size + attempt_size + rows * static_cast<std::int64_t>(DetectionStatisticsPacket::size);
+   if (!reduction_storage_.defined() || reduction_storage_.numel() < size) reduction_storage_ = torch::empty({size}, device_values_.options());
+   reduction_values_ = reduction_storage_.narrow(0, 0, size);
+   control_ = reduction_values_.narrow(0, 0, control_size);
+   attempt_values_ = reduction_values_.narrow(0, control_size, attempt_size);
+   statistics_ = reduction_values_.narrow(0, control_size + attempt_size, rows * static_cast<std::int64_t>(DetectionStatisticsPacket::size))
+                  .view({rows, static_cast<std::int64_t>(DetectionStatisticsPacket::size)});
+  }
+  reduction_values_.zero_();
   contribution_ = 0;
-  if (!statistics_.defined() || statistics_.size(0) != static_cast<std::int64_t>(contributions))
-   statistics_ = torch::zeros({static_cast<std::int64_t>(contributions), static_cast<std::int64_t>(DetectionStatisticsPacket::size)}, device_values_.options());
-  else
-   statistics_.zero_();
  }
  void accumulate_empty() { ++contribution_; }
  void accumulate(
@@ -84,11 +91,11 @@ public:
  TrainingMetricSnapshot complete_step(const torch::Tensor& found_inf, int64_t attempt_micro_batches, int64_t epoch_micro_batches, const DistributedContext& distributed) {
   check();
   control_.select(0, 1).copy_(found_inf);
-  work_.join(work_.all_reduce(distributed, control_));
+  // All controls, sums, availability flags and per-microbatch sufficient
+  // statistics use the same FP32 SUM. Keep row ratios after this single SUM.
+  if (distributed.enabled) work_.join(work_.all_reduce(distributed, reduction_values_));
   device_values_.select(0, 6).copy_(control_.select(0, 0).eq(0));
   device_values_.select(0, 7).copy_(control_.select(0, 1));
-  work_.join(work_.all_reduce(distributed, attempt_values_));
-  work_.join(work_.all_reduce(distributed, statistics_));
   device_values_.narrow(0, 0, 3).add_(attempt_values_.narrow(0, 0, 3));
   device_values_.narrow(0, 3, 3).copy_(attempt_values_.narrow(0, 0, 3));
   auto scalar_sums = attempt_values_.narrow(0, 3, TrainingScalarPacket::size);
@@ -149,7 +156,7 @@ private:
  torch::Tensor host_values_;
  torch::Tensor scalar_values_;
  torch::Tensor unavailable_;
- torch::Tensor attempt_values_, control_, statistics_;
+ torch::Tensor reduction_storage_, reduction_values_, attempt_values_, control_, statistics_;
  std::int64_t contribution_ = 0;
  TrainingScalarPacket::Tensors scalar_sources_;
  torch_cuda::TorchCudaStream launch_;

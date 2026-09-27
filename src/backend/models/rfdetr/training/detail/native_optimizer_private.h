@@ -21,6 +21,9 @@
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 namespace mmltk::backend::models::rfdetr {
 struct DistributedContext;
+namespace testsupport {
+struct NativeAdamWTestAccess;
+}
 enum class NativeOptimizerBackend : std::uint8_t {
  eager,
  foreach,
@@ -144,8 +147,14 @@ private:
  void read_checkpoint(torch::serialize::InputArchive&, std::stop_token, bool materialize);
  void initialize_state();
  void step_group_eager(const Group& group);
- void step_group_foreach(const Group& group);
- void step_group_fused(const Group& group);
+ void step_group_batched(const Group& group);
+ struct Batch {
+  std::vector<torch::Tensor> params, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, steps;
+  void clear();
+ };
+ using BatchKey = std::tuple<c10::DeviceType, c10::DeviceIndex, c10::ScalarType>;
+ std::map<BatchKey, Batch> batches_;
+ friend struct testsupport::NativeAdamWTestAccess;
  NativeOptimizerBackend backend_ = NativeOptimizerBackend::eager;
 };
 bool native_optimizer_supports_foreach(const std::vector<torch::Tensor>& params);

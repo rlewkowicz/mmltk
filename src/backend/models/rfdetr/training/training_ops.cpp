@@ -196,6 +196,13 @@ void GradScaler::ensure_device_state(const torch::Device& device) {
  found_inf_device_ = torch::zeros({}, options);
  inverse_scale_device_ = torch::ones({}, options);
 }
+torch::Tensor GradScaler::check_and_unscale_gradients_(const std::vector<torch::Tensor>& gradients, const torch::Device& device) {
+ ensure_device_state(device);
+ found_inf_device_.zero_();
+ inverse_scale_device_.fill_(enabled_ ? 1.0f / scale_ : 1.0f);
+ if (!gradients.empty()) at::_amp_foreach_non_finite_check_and_unscale_(gradients, found_inf_device_, inverse_scale_device_);
+ return found_inf_device_;
+}
 torch::Tensor loss_value_or_zero(const TensorMap& loss_dict, const torch::Device& device, std::string_view key) {
  const auto found = loss_dict.find(std::string(key));
  if (found != loss_dict.end()) { return found->second; }

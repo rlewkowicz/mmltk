@@ -51,6 +51,13 @@ namespace {
 void require(bool condition, const char* message) {
  if (!condition) throw std::runtime_error(message);
 }
+void finish_gradients(TrainingGradientReducer& reducer, int device) {
+ static_cast<void>(reducer.finish_attempt());
+ // Standalone gradient fixtures have no metric consumer; settle their caller
+ // stream explicitly before exercising the same CPU usage projection.
+ tc::getCurrentCUDAStream(tc::checked_device_index(device)).synchronize();
+ reducer.finalize_attempt();
+}
 void equal(const torch::Tensor& actual, const torch::Tensor& expected, const char* message) {
  require(actual.defined() == expected.defined(), message);
  if (actual.defined()) require(torch::allclose(actual, expected, 2e-5, 2e-6), message);
@@ -192,7 +199,8 @@ void mixed_early_bucket_overlap(const DistributedContext& distributed, int devic
  auto unused = torch::ones({2}, options).set_requires_grad(true);
  std::vector<torch::Tensor> parameters{unused, late, wide, early};
  TrainingGradientReducer reducer(distributed, device, launch, {"unused", "late", "wide", "early"}, parameters, {parameters}, 128);
- reducer.begin_attempt(1);
+ reducer.begin_attempt(2);
+ reducer.contribute_empty();
  reducer.enable_gradient_launch_after_counts();
  HeldGradientBackward backward(device, launch, reducer, parameters, [&] { return late + wide; }, early);
  auto& gate = backward.gate;
@@ -201,7 +209,7 @@ void mixed_early_bucket_overlap(const DistributedContext& distributed, int devic
  const auto launched_while_held = reducer.launched_buckets();
  gate.release();
  future.get();
- reducer.finish_attempt();
+ finish_gradients(reducer, device);
  require(entered && launched_while_held == 1, "interleaved dtype early bucket did not launch during held late backward");
  require(reducer.bucket_count() == 3, "interleaved dtype regions lost contiguous backward ordering");
  require(late.grad().strides() == late.strides(), "interleaved bucket lost dense parameter strides");
@@ -256,7 +264,8 @@ void exercise_early_bucket_overlap(const DistributedContext& distributed, int de
  auto early = late.detach().clone().set_requires_grad(true);
  std::vector<torch::Tensor> parameters{late, early};
  TrainingGradientReducer reducer(distributed, device, launch, {"late", "early"}, parameters, {parameters}, 16);
- reducer.begin_attempt(1);
+ reducer.begin_attempt(2);
+ reducer.contribute_empty();
  auto count = torch::zeros({1}, late.options().requires_grad(false));
  distributed_all_reduce_tensor(distributed, count);
  reducer.enable_gradient_launch_after_counts();
@@ -277,7 +286,7 @@ void exercise_early_bucket_overlap(const DistributedContext& distributed, int de
     // The late bucket has no rank-zero counterpart. Tell the initiating
     // rank that this peer is now waiting for real collective completion.
     TrainingDistributedTestAccess::store(distributed)->set("failure-peer-waiting", std::vector<std::uint8_t>{1});
-    reducer.finish_attempt();
+    finish_gradients(reducer, device);
     throw std::runtime_error("cancelled peer unexpectedly completed its collective");
    }
    if (distributed.enabled) static_cast<void>(TrainingDistributedTestAccess::store(distributed)->get("failure-peer-waiting"));
@@ -309,7 +318,7 @@ void exercise_early_bucket_overlap(const DistributedContext& distributed, int de
  }
  gate.release();
  future.get();
- reducer.finish_attempt();
+ finish_gradients(reducer, device);
  require(entered, "late backward did not reach its hold event");
  require(launched_while_held == 1, "early bucket did not launch while late backward was held");
  equal(early.grad(), torch::full_like(early, 2 * distributed.world_size), "early NCCL SUM differs");
@@ -334,7 +343,7 @@ void exercise_bounded_gradient_buckets(int device) {
   reducer.arm(0);
   static_cast<void>(TrainingStep(1, 1, false, at::kFloat).gradients((first.square().sum() + second.sum()) * attempt, parameters));
   reducer.collect(0);
-  reducer.finish_attempt();
+  finish_gradients(reducer, device);
   equal(first.grad(), torch::full_like(first, 2 * attempt), "bounded bucket reused stale gradient values");
   equal(second.grad(), torch::full_like(second, attempt), "bounded second gradient differs");
   for (const auto& parameter : parameters) {
@@ -347,6 +356,64 @@ void exercise_bounded_gradient_buckets(int device) {
   } else
    require(first_storage == first.grad().data_ptr() && second_storage == second.grad().data_ptr(), "settled bucket storage was not reused");
  }
+}
+void exercise_direct_gradients(int device) {
+ tc::TorchCudaDeviceGuard guard(tc::checked_device_index(device));
+ const auto launch = tc::getCurrentCUDAStream(tc::checked_device_index(device));
+ const auto producer = tc::getStreamFromPool(false, tc::checked_device_index(device));
+ const auto options = torch::TensorOptions().device(tc::cuda_device(device));
+ auto exclusive = torch::full({4}, 3, options).set_requires_grad(true);
+ auto expanded = torch::full({4}, 5, options).set_requires_grad(true);
+ auto unused = torch::full({4}, 7, options).set_requires_grad(true);
+ std::vector<torch::Tensor> parameters{exclusive, expanded, unused};
+ TrainingGradientReducer reducer({}, device, launch, {"exclusive", "expanded", "unused"}, parameters, {parameters});
+ TrainingMetricHandoff metrics(device);
+ GradScaler scaler(true, 8);
+ const void* produced = nullptr;
+ const auto hook = exclusive.register_hook([&](const torch::Tensor& gradient) {
+  produced = gradient.const_data_ptr();
+  return gradient;
+ });
+ for (int attempt = 0; attempt < 3; ++attempt) {
+  reducer.begin_attempt(1);
+  metrics.begin_attempt(1);
+  reducer.enable_gradient_launch_after_counts();
+  at::cuda::CUDAEvent ready;
+  ready.record(launch);
+  std::vector<torch::Tensor> returned;
+  {
+   tc::TorchCudaStreamGuard stream(producer);
+   ready.block(producer);
+   const auto loss = exclusive.square().sum() + expanded.sum();
+   reducer.arm(0);
+   // Keeping a borrowed autograd result alive must prohibit direct mutation.
+   returned = TrainingStep(1, scaler.current_scale(), false, at::kFloat).gradients(loss, parameters);
+   if (attempt != 1) returned.clear();
+   reducer.collect(0);
+  }
+  const auto& gradients = reducer.finish_attempt();
+  require(gradients.size() == 2, "direct finite-check inventory includes an unused parameter");
+  require((gradients.front().const_data_ptr() == produced) == (attempt != 1), "direct storage admission ignored exclusive derivative ownership");
+  require(reducer.launched_buckets() == 0, "single-producer local attempt launched gradient buckets");
+  for (const auto& parameter : parameters) require(!parameter.grad().defined(), "direct handoff published optimizer gradients too early");
+  const auto found_inf = scaler.check_and_unscale_gradients_(gradients, exclusive.device());
+  metrics.accumulate_empty();
+  const auto snapshot = metrics.complete_step(found_inf, 1, attempt + 1);
+  reducer.finalize_attempt();
+  require(snapshot.gradients_finite && !unused.grad().defined(), "direct gradients lost finite/unused semantics");
+  if (!returned.empty()) equal(returned.front(), torch::full_like(exclusive, 48), "unscale mutated an externally retained derivative");
+  equal(exclusive.grad(), torch::full_like(exclusive, 6), "direct unscale differs");
+  equal(expanded.grad(), torch::ones_like(expanded), "expanded derivative was not safely materialized");
+  require(exclusive.eq(3).all().item<bool>() && expanded.eq(5).all().item<bool>(), "gradient preparation changed model parameters");
+ }
+ exclusive.remove_hook(hook);
+ // Zero-image single-rank admission still closes without creating a gradient.
+ reducer.begin_attempt(1);
+ reducer.contribute_empty();
+ reducer.enable_gradient_launch_after_counts();
+ require(reducer.finish_attempt().empty(), "empty direct contribution acquired a gradient");
+ reducer.finalize_attempt();
+ for (const auto& parameter : parameters) require(!parameter.grad().defined(), "empty direct attempt retained a preceding gradient");
 }
 void exercise_gradient_trajectory(const DistributedContext& distributed, int device) {
  tc::TorchCudaDeviceGuard guard(tc::checked_device_index(device));
@@ -365,7 +432,7 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
    static_cast<void>(TrainingStep(2, 1, false, at::kFloat).gradients(strided.square().sum() + wide.square().sum(), parameters));
    reducer.collect(0);
   }
-  reducer.finish_attempt();
+  finish_gradients(reducer, device);
   require(strided.grad().strides() == strided.strides(), "reducer lost a dense noncontiguous parameter stride");
   require(wide.grad().scalar_type() == torch::kFloat64 && !unused.grad().defined(), "mixed buckets lost dtype or global unused semantics");
   equal(strided.grad(), strided.detach() * distributed.world_size, "strided c10d bucket SUM differs");
@@ -525,15 +592,27 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
        epoch_cardinality += cardinality / static_cast<double>(batch);
       }
      }
-     reducer.finish_attempt();
-     for (std::size_t p = 0; p < optimizer.parameters().size(); ++p)
-      equal(optimizer.parameters()[p].grad(), expected_optimizer.parameters()[p].grad(), "fixed-K global gradients differ across capacity/rank slicing");
+     const auto& gradients = reducer.finish_attempt();
+     std::size_t checked = 0;
+     for (std::size_t p = 0; p < optimizer.parameters().size(); ++p) {
+      require(!optimizer.parameters()[p].grad().defined(), "gradient handoff projected usage before the numerical boundary");
+      const auto& expected = expected_optimizer.parameters()[p].grad();
+      if (distributed.enabled || expected.defined()) {
+       if (expected.defined()) equal(gradients.at(checked), expected, "fixed-K global gradients differ across capacity/rank slicing");
+       else require(gradients.at(checked).eq(0).all().item<bool>(), "globally unused finite-check view is not zero");
+       ++checked;
+      }
+     }
+     require(checked == gradients.size(), "reducer finite-check inventory differs");
      // Inject an overflow on one rank only after SUM, so the finite control
      // itself must agree the skipped update and scaler/EMA clocks.
-     if (attempt == 1 && distributed.rank == distributed.world_size - 1) optimizer.parameters()[0].mutable_grad().fill_(std::numeric_limits<float>::infinity());
-     const auto found_inf = scaler.check_and_unscale_(optimizer);
+     if (attempt == 1 && distributed.rank == distributed.world_size - 1) gradients.front().fill_(std::numeric_limits<float>::infinity());
+     const auto found_inf = scaler.check_and_unscale_gradients_(gradients, optimizer.parameters().front().device());
      const auto snapshot = metrics.complete_step(found_inf, k, (attempt + 1) * k, distributed);
+     reducer.finalize_attempt();
      static_cast<void>(expected_scaler.check_and_unscale_(expected_optimizer));
+     for (std::size_t p = 0; p < optimizer.parameters().size(); ++p)
+      require(optimizer.parameters()[p].grad().defined() == expected_optimizer.parameters()[p].grad().defined(), "global unused-gradient projection differs");
      const bool skipped = attempt == 1;
      require(snapshot.loss_finite && snapshot.gradients_finite == !skipped, "global overflow decision differs");
      epoch_loss += attempt_loss;
@@ -647,6 +726,8 @@ struct CollectiveGate final {
 struct CollectiveFacts final {
  int reductions = 0, broadcasts = 0, waits = 0, live_work = 0, aborts = 0;
  std::set<const void*> broadcast_storage;
+ std::set<const void*> reduction_storage;
+ std::vector<std::pair<at::ScalarType, std::int64_t>> reduction_shapes;
 };
 class FixtureCollectiveWork final : public c10d::Work {
 public:
@@ -676,6 +757,8 @@ public:
  const std::string getBackendName() const override { return "training-custody-fixture"; }
  c10::intrusive_ptr<c10d::Work> allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& = {}) override {
   ++facts_->reductions;
+  facts_->reduction_storage.insert(tensors.front().const_data_ptr());
+  facts_->reduction_shapes.emplace_back(tensors.front().scalar_type(), tensors.front().numel());
   return queue(tensors, 1);
  }
  c10::intrusive_ptr<c10d::Work> broadcast(std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& = {}) override {
@@ -826,13 +909,69 @@ void exercise_collective_custody(int device) {
   CollectiveRelease release(*backend);
   for (int attempt = 0; attempt < 4; ++attempt) {
    work.join(work.all_reduce(group, tensor));
+   work.record_completion();
    require(gate->await(), "joined collective fixture never entered its device hold");
    require(tensor.use_count() > 1 && facts->live_work == 1, "stream join prematurely released collective storage");
+   if (attempt == 0) require(!work.release_completed(), "in-flight collective was reclaimed by a nonblocking completion check");
    release.finish();
-   work.settle();
+   tc::getCurrentCUDAStream(tc::checked_device_index(device)).synchronize();
+   require(work.release_completed(), "later stream completion did not reclaim the collective without another wait");
    require(tensor.use_count() == 1 && facts->live_work == 0, "settled collective failed to reclaim its bounded slot");
   }
   require(tensor.eq(5).all().item<bool>(), "delayed device writes did not settle before collective reuse");
+ }
+ // The reducer returns while the launch stream is deliberately held. Its two
+ // Work handles survive the metric's single collective and are reclaimed only
+ // after the shared physical handoff. The timeout is a deadlock watchdog.
+ {
+  auto facts = std::make_shared<CollectiveFacts>();
+  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, CollectiveOutcome::Success, facts);
+  const auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  const auto launch = tc::getCurrentCUDAStream(tc::checked_device_index(device));
+  auto parameter = torch::ones({4}, options).set_requires_grad(true);
+  TrainingGradientReducer reducer(group, device, launch, {"parameter"}, {parameter}, {{parameter}});
+  TrainingMetricHandoff metrics(device);
+  const auto found_inf = torch::zeros({}, options);
+  for (int attempt = 0; attempt < 2; ++attempt) {
+   reducer.begin_attempt(1);
+   reducer.enable_gradient_launch_after_counts();
+   metrics.begin_attempt(1);
+   metrics.accumulate_empty();
+   reducer.arm(0);
+   static_cast<void>(TrainingStep(1, 1, false, at::kFloat).gradients(parameter.square().sum(), {parameter}));
+   reducer.collect(0);
+   if (attempt == 0) {
+    static_cast<void>(reducer.finish_attempt());
+   } else {
+    HeldCudaStream held(launch);
+    require(held.await(), "reducer launch stream did not reach the deliberate hold");
+    auto handoff = std::async(std::launch::async, [&] {
+     tc::TorchCudaDeviceGuard worker(tc::checked_device_index(device));
+     tc::TorchCudaStreamGuard stream(launch);
+     static_cast<void>(reducer.finish_attempt());
+     bool rejected = false;
+     try {
+      reducer.finalize_attempt();
+     } catch (const std::logic_error&) { rejected = true; }
+     require(rejected, "pending usage readback was projected before physical completion");
+    });
+    const bool returned = handoff.wait_for(std::chrono::seconds(20)) == std::future_status::ready;
+    held.release();
+    handoff.get();
+    require(returned, "reducer device handoff waited on host completion");
+   }
+   require(!parameter.grad().defined() && facts->live_work == 2, "reducer published usage or retired Work before the metric handoff");
+   require(facts->reductions == 3 * attempt + 2, "reducer changed its canonical bucket/usage collective count");
+   static_cast<void>(metrics.complete_step(found_inf, 1, attempt + 1, group));
+   require(facts->reductions == 3 * (attempt + 1) && facts->live_work == 2, "metric control/sums/statistics were not one collective");
+   reducer.finalize_attempt();
+   require(parameter.grad().defined() && facts->live_work == 0, "numerical handoff failed to publish usage and reclaim reducer Work");
+  }
+  constexpr auto metric_elements = 5 + 2 * TrainingScalarPacket::size + DetectionStatisticsPacket::size;
+  const std::vector<std::pair<at::ScalarType, std::int64_t>> expected_shapes{
+   {at::kFloat, 4}, {at::kInt, 1}, {at::kFloat, metric_elements}, {at::kFloat, 4}, {at::kInt, 1}, {at::kFloat, metric_elements}
+  };
+  require(facts->reduction_shapes == expected_shapes && facts->reduction_storage.size() == 3, "packed metric/reducer operations changed dtype, extent, order or persistent storage");
  }
  // Count publication preserves the first useful cause and drains all waiting
  // futures after an actual queued submission fails before returning Work.

@@ -60,8 +60,9 @@ void distributed_abort(const DistributedContext&) noexcept;
 // turns fail. The first concrete cause is claimed before peer cancellation.
 [[nodiscard]] TrainingFailure claim_training_failure(const DistributedContext&, const TrainingFailure&);
 // An operation owns a fixed number of submissions. join() orders the launch
-// stream only. settle() proves physical completion at a drained boundary and
-// reuses its slots/event. Unjoined, aborted, or failed work stays in terminal
+// stream only. settle() proves physical completion at a drained boundary;
+// release_completed() checks an already-recorded fence without another wait.
+// Both reclaim the slots/event. Unjoined, aborted, or failed work stays in terminal
 // CUDA custody; even a submission throwing before it returns Work is retained.
 class TrainingCollectiveWork final {
 public:
@@ -78,12 +79,16 @@ public:
  // Fence only this operation before unrelated launch-stream work is queued.
  void record_completion();
  void settle();
+ // Reclaim only when a previously recorded physical fence has completed.
+ // This never waits; callers may use a later, already-settled stream handoff.
+ [[nodiscard]] bool release_completed();
  [[nodiscard]] cudaError_t retire() noexcept;
  [[nodiscard]] bool uncertain() const noexcept;
 
 private:
  enum class Operation { Sum, Broadcast };
  std::size_t submit(const DistributedContext&, const torch::Tensor&, Operation);
+ void clear_completed();
  struct Owner;
  std::unique_ptr<Owner> owner_;
  friend struct testsupport::TrainingDistributedTestAccess;

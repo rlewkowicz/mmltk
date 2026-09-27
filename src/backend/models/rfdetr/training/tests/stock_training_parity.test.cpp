@@ -14,12 +14,28 @@
 #include <torch/csrc/autograd/custom_function.h>
 #include <numbers>
 #include <limits>
+#include <meta>
 #include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 #include "training_continuation_fixture.h"
 #include "src/backend/ml/torch/archive.h"
+namespace mmltk::backend::models::rfdetr::testsupport {
+struct NativeAdamWTestAccess {
+ static std::vector<std::pair<const void*, std::size_t>> storage(const NativeAdamW& optimizer) {
+  std::vector<std::pair<const void*, std::size_t>> result;
+  for (const auto& [key, batch] : optimizer.batches_) {
+   template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeAdamW::Batch, std::meta::access_context::current()))) {
+    const auto& values = batch.[:member:];
+    if (!values.empty()) throw std::runtime_error("AdamW retained a completed gradient/state inventory");
+    result.emplace_back(values.data(), values.capacity());
+   }
+  }
+  return result;
+ }
+};
+}
 namespace {
 namespace rf = mmltk::backend::models::rfdetr;
 namespace tensor_fixture = mmltk::backend::ml::testsupport;
@@ -46,6 +62,49 @@ torch::serialize::InputArchive optimizer_checkpoint(rf::NativeOptimizer& optimiz
 // Independent equations: RF-DETR e9a138f module_model.py:607-611,1296;
 // Lightning 2.6.0 ClosureResult; PyTorch 2.9 Adam and AveragedModel.
 // Native FP32/FP64 policy, no TF32 changes, no epoch-trajectory/AP claim.
+TEST_CASE("AdamW reuses batch inventories across missing gradients and activation", "[rfdetr][training][parity]") {
+ for (const auto device : tensor_fixture::available_devices())
+  for (const auto backend : {rf::NativeOptimizerBackend::foreach, rf::NativeOptimizerBackend::fused}) {
+   if (backend == rf::NativeOptimizerBackend::fused && device.is_cpu()) continue;
+   const auto options = torch::TensorOptions().dtype(torch::kFloat64).device(device);
+   auto a = torch::full({4}, .7, options).set_requires_grad(true);
+   auto b = torch::full({4}, -.3, options).set_requires_grad(true);
+   auto expected_a = a.detach().clone().set_requires_grad(true);
+   auto expected_b = b.detach().clone().set_requires_grad(true);
+   const rf::NativeAdamW::Group group{{.003, .07, true}, {0, 1}};
+   rf::NativeAdamW optimizer({group}, {{"a", a}, {"b", b}}, backend);
+   rf::NativeAdamW reference({group}, {{"a", expected_a}, {"b", expected_b}}, rf::NativeOptimizerBackend::eager);
+   std::vector<std::pair<const void*, std::size_t>> retained;
+   for (int attempt = 0; attempt < 5; ++attempt) {
+    CAPTURE(device, backend, attempt);
+    optimizer.zero_grad(true);
+    reference.zero_grad(true);
+    a.set_requires_grad(attempt != 3);
+    expected_a.set_requires_grad(attempt != 3);
+    optimizer.activate();
+    reference.activate();
+    if (attempt != 1 && attempt != 3) {
+     a.mutable_grad() = torch::full_like(a, attempt == 2 ? 0 : .2);
+     expected_a.mutable_grad() = a.grad().clone();
+    }
+    if (attempt != 2) {
+     b.mutable_grad() = torch::full_like(b, -.4);
+     expected_b.mutable_grad() = b.grad().clone();
+    }
+    optimizer.step();
+    reference.step();
+    CHECK(torch::allclose(a, expected_a, 2e-6, 2e-8));
+    CHECK(torch::allclose(b, expected_b, 2e-6, 2e-8));
+    const auto storage = rf::testsupport::NativeAdamWTestAccess::storage(optimizer);
+    if (!attempt) {
+     REQUIRE_FALSE(storage.empty());
+     retained = storage;
+    } else {
+     CHECK(storage == retained);
+    }
+   }
+  }
+}
 TEST_CASE("Stock AdamW owns each parameter age and double accumulation division", "[rfdetr][training][parity]") {
  for (const auto device : tensor_fixture::available_devices())
   for (const auto backend : {rf::NativeOptimizerBackend::eager, rf::NativeOptimizerBackend::foreach, rf::NativeOptimizerBackend::fused}) {

@@ -229,6 +229,23 @@ void TrainingCollectiveWork::settle() {
   state.failure = cudaErrorUnknown;
   throw;
  }
+ clear_completed();
+}
+bool TrainingCollectiveWork::release_completed() {
+ auto& state = *owner_->state;
+ if (uncertain()) throw std::runtime_error("training collective physical completion is unproved");
+ if (!state.completion_recorded) throw std::logic_error("training collective completion was not recorded");
+ try {
+  if (!state.completed.query()) return false;
+ } catch (...) {
+  state.failure = cudaErrorUnknown;
+  throw;
+ }
+ clear_completed();
+ return true;
+}
+void TrainingCollectiveWork::clear_completed() {
+ auto& state = *owner_->state;
  for (std::size_t i = 0; i < state.used; ++i) {
   auto& slot = state.slots[i];
   slot.work.reset();
