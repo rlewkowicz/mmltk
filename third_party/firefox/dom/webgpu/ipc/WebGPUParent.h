@@ -130,7 +130,7 @@ class WebGPUParent final : public PWebGPUParent, public SupportsWeakPtr {
                                        ffi::WGPUTextureId aTextureId,
                                        uint32_t aWidth, uint32_t aHeight,
                                        struct ffi::WGPUTextureFormat aFormat,
-                                       ffi::WGPUTextureUsages aUsage);
+                                       ffi::WGPUTextureUsages aUsage, int32_t* aOutError);
 
   void EnsureSharedTextureForReadBackPresent(
       ffi::WGPUSwapChainId aSwapChainId, ffi::WGPUDeviceId aDeviceId,
@@ -141,7 +141,7 @@ class WebGPUParent final : public PWebGPUParent, public SupportsWeakPtr {
       const layers::RemoteTextureOwnerId& aOwnerId, ffi::WGPUDeviceId aDeviceId,
       ffi::WGPUTextureId aTextureId, uint32_t aWidth, uint32_t aHeight,
       const struct ffi::WGPUTextureFormat aFormat,
-      ffi::WGPUTextureUsages aUsage);
+      ffi::WGPUTextureUsages aUsage, int32_t* aOutError);
 
   std::shared_ptr<SharedTexture> GetSharedTexture(ffi::WGPUTextureId aId);
 

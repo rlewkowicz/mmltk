@@ -425,6 +425,30 @@ class LogFormatTests(unittest.TestCase):
         damaged = list(context.parse_line("test.log", 7, '  {"event":"partial', {}, {}))
         self.assertTrue(damaged[0].parse_error)
 
+    def test_catch_report_title_recovers_delayed_stderr_test_identity(self):
+        context = logs.TranscriptContext()
+        lines = (
+            "[ RUN ] training failure before cleanup",
+            "[ FAILED ] training failure before cleanup",
+            "[ RUN ] unrelated preview",
+            "-" * 79,
+            "training failure",
+            "before cleanup",
+            "  a selected section",
+            "-" * 79,
+            "/workspace/training.test.cpp:1457",
+            "." * 79,
+            "/workspace/training.test.cpp:1479: FAILED:",
+            "  trace file was not yet drained",
+            "[ OK ] unrelated preview",
+        )
+        rows = [row for number, text in enumerate(lines, 1)
+                for row in context.parse_line("test.log", number, text, {}, {})]
+        self.assertEqual(rows[10].get("@event"), "catch.assertion_failed")
+        self.assertEqual(rows[10].get("@test"), "training failure before cleanup")
+        self.assertEqual(rows[11].get("@test"), "training failure before cleanup")
+        self.assertEqual(rows[-1].get("@test"), "unrelated preview")
+
 
 class TriageSelectionTests(unittest.TestCase):
     def setUp(self):

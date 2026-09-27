@@ -79,8 +79,12 @@ TEST_CASE("Training preparation publishes stages only from rank zero", "[rfdetr]
  r::TrainingPreparationWriter peer(request);
  peer.Stage(r::TrainingPreparationStage::Model);
  CHECK(read().stage == r::TrainingPreparationStage::Dataset);
- writer.Stage(r::TrainingPreparationStage::Optimizers);
- CHECK(read().stage == r::TrainingPreparationStage::Optimizers);
+ for (const auto stage :
+  {r::TrainingPreparationStage::Checkpoint, r::TrainingPreparationStage::Model, r::TrainingPreparationStage::Weights, r::TrainingPreparationStage::Synchronization,
+   r::TrainingPreparationStage::Optimizers}) {
+  writer.Stage(stage);
+  CHECK(read().stage == stage);
+ }
  request.distributed_rank = 0;
  std::filesystem::remove(temp.path() / r::kTrainingPreparationFile);
  std::filesystem::create_directory(temp.path() / r::kTrainingPreparationFile);

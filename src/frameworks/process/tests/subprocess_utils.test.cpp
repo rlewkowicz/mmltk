@@ -1,5 +1,6 @@
 #include "src/frameworks/process/subprocess_utils.h"
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <array>
@@ -7,6 +8,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -69,6 +71,31 @@ TEST_CASE("captured_child_runner_collects_output", "[frameworks][process]") {
  REQUIRE(WIFEXITED(result.status));
  CHECK(WEXITSTATUS(result.status) == 0);
  CHECK_FALSE(result.setup_failure.has_value());
+}
+TEST_CASE("captured children receive termination independently of the parent signal mask", "[frameworks][process]") {
+ sigset_t blocked, previous;
+ REQUIRE(::sigemptyset(&blocked) == 0);
+ for (const int signal : {SIGINT, SIGTERM, SIGUSR1}) REQUIRE(::sigaddset(&blocked, signal) == 0);
+ REQUIRE(::pthread_sigmask(SIG_BLOCK, &blocked, &previous) == 0);
+ struct RestoreMask final {
+  sigset_t previous;
+  ~RestoreMask() {
+   if (::pthread_sigmask(SIG_SETMASK, &previous, nullptr) != 0) std::terminate();
+  }
+ } restore{previous};
+ const auto result = process::run_captured_child_process("signal child", "signal child output: ", [](const int output, const int setup) {
+  process::prepare_captured_output_child(output, setup);
+  sigset_t current;
+  if (::sigprocmask(SIG_SETMASK, nullptr, &current) != 0 || ::sigismember(&current, SIGINT) != 0 || ::sigismember(&current, SIGTERM) != 0 || ::sigismember(&current, SIGUSR1) != 1) std::_Exit(126);
+  ::execl("/bin/sh", "sh", "-c", "kill -TERM $$", static_cast<char*>(nullptr));
+  process::fail_child_setup(setup, process::ChildSetupStage::Exec);
+ }, {}, std::chrono::seconds(5));
+ CHECK_FALSE(result.setup_failure);
+ REQUIRE(WIFSIGNALED(result.status));
+ CHECK(WTERMSIG(result.status) == SIGTERM);
+ sigset_t current;
+ REQUIRE(::pthread_sigmask(SIG_SETMASK, nullptr, &current) == 0);
+ for (const int signal : {SIGINT, SIGTERM, SIGUSR1}) CHECK(::sigismember(&current, signal) == 1);
 }
 TEST_CASE("captured_child_runner_reports_setup_failure", "[frameworks][process]") {
  const auto result = process::run_captured_child_process("test child", "failed to read test child output: ", [](const int, const int setup_fd) {

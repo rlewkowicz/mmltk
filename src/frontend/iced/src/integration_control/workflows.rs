@@ -99,6 +99,8 @@ pub(super) enum Step {
     TrainingFixturePending(u8),
     TrainingFixtureReady(u8),
     Training,
+    TrainingResize,
+    TrainingRecovery,
     LeaveTrain,
     HiddenTrain,
     ReturnTrain,
@@ -2074,7 +2076,11 @@ impl State {
                 driver.phase = Phase::Workflows(match picture {
                     Picture::Confidence if index < 8 => Step::ConfidenceEdit(index + 1),
                     Picture::Confidence => Step::ConfidenceLayer(true),
-                    Picture::Progress => Step::LeaveTrain,
+                    Picture::Progress => {
+                        #[cfg(target_arch = "wasm32")]
+                        super::restore_canvas_size_js();
+                        Step::LeaveTrain
+                    },
                     Picture::Train => Step::TrainingFixture(0),
                     Picture::Sources if index < 9 => Step::TrainingFixture(index + 1),
                     Picture::Sources => { self.source_fixture = None; Step::NoImageWorkspace },
@@ -2631,9 +2637,11 @@ impl State {
                 }
             }
             let work = match step {
-                Step::Training | Step::HiddenTrain | Step::Trained => {
-                    train.map(|value| (FeatureId::Train, &value.local))
-                }
+                Step::Training
+                | Step::TrainingResize
+                | Step::TrainingRecovery
+                | Step::HiddenTrain
+                | Step::Trained => train.map(|value| (FeatureId::Train, &value.local)),
                 Step::Validating | Step::ProgressiveSettling => {
                     validation.map(|value| (FeatureId::Validate, &value.operation))
                 }
@@ -2796,7 +2804,39 @@ impl State {
                         ],
                     )
                 });
+                #[cfg(target_arch = "wasm32")]
+                if !super::canvas_size_js(1234.0, 1000.0) {
+                    driver.fail("Cannot resize during active training");
+                    return Task::none();
+                }
+                self.hidden_sequence = record.unwrap().sequence;
+                self.workflow_step(
+                    driver,
+                    if driver.viewer_scenario == "workflows-oom" {
+                        Step::TrainingRecovery
+                    } else {
+                        Step::TrainingResize
+                    },
+                )
+            }
+            Step::TrainingResize => {
+                #[cfg(target_arch = "wasm32")]
+                if !super::canvas_size_settled_js(1234.0, 1000.0) {
+                    return Task::none();
+                }
                 self.workflow_step(driver, Step::Pixels(Picture::Progress, 0))
+            }
+            Step::TrainingRecovery if train.is_some_and(|value| success(&value.local)) => {
+                let Some(record) = record.filter(|value| value.sequence > self.hidden_sequence)
+                else {
+                    driver.fail("Training did not advance after the resize failure");
+                    return Task::none();
+                };
+                completed(
+                    "train-after-graphics-failure",
+                    [record.progress.globaloptimizerstep as f64, 0.0, 0.0, 0.0],
+                );
+                driver.advance_to(Phase::Complete)
             }
             Step::LeaveTrain | Step::Validate => {
                 if step == Step::LeaveTrain {

@@ -524,14 +524,14 @@ standalone evidence-audit cases.
 | Hardware entrypoint | Process lifetimes and required behavior |
 | --- | --- |
 | `workspace_wayland_retained` | One H2D browser: Dataset presentation/disclosure/input and real cancel/restart, square/capacity growth, full controls including integer typing/paste, cached and held-miss gallery/detail returns, Detail-open resizing in both orientations, augmentation retention, fractional rows, circular wrap, partial final row, wide/tall layouts, local labels/native semantics, light/dark copy with shared Annotate layout and long lists, FPS, rapid changes, then SIGINT |
-| `workspace_wayland_workflows` | One H2D browser: GPU selection and execution for Train/Validate/Predict/Export, actual Train start, live progress pixels and hidden-tab progress, retained chart interaction, validation metrics and progressive sample/detail returns, confidence editing/filtering and responsive groups, direct Validate-to-Explore pixels, compiled/image/video prediction, Pause/Resume/EOF/Stop, export/cancellation, light/dark and minimum-width pixels, then SIGINT |
+| `workspace_wayland_workflows` | Two H2D browsers: GPU selection and execution for Train/Validate/Predict/Export, actual Train start, resize during training, live progress pixels and hidden-tab progress, retained chart interaction, validation metrics and progressive sample/detail returns, confidence editing/filtering and responsive groups, direct Validate-to-Explore pixels, compiled/image/video prediction, Pause/Resume/EOF/Stop, export/cancellation, light/dark and minimum-width pixels; a second lifetime injects a resized canvas allocation failure and requires visible manual recovery plus completed native training; both end with SIGINT |
 | `workspace_wayland_dpi` | One H2D browser at DPI 1.5: Dataset presentation fixtures, light/dark copy, and rapid changes |
 | `workspace_wayland_terminal` | Two H2D browsers: a real window close and abrupt browser-peer loss after an Annotation edit, exact completed draw, and independent redraw |
 | `workspace_wayland_probe_recovery` | Four H2D browsers with startup-latched allocation, reset, begin, or end probe failure; exact-content recovery and complete final pixel/semantic evidence |
 | `workspace_wayland_quiet` | Two H2D browsers: blocked reads and a completed gesture with diagnostics/reporting/probes inactive |
 | `workspace_wayland_gdr` | One optional GDR browser; unavailable hardware remains an explicit skip |
 
-This is eleven required H2D lifetimes and one independently optional GDR lifetime.
+This is twelve required H2D lifetimes and one independently optional GDR lifetime.
 Compatible scenarios reuse a browser; startup-latched DPI, transport, and
 fault settings and destructive exits retain separate lifetimes. Window-close
 coverage enables lifecycle diagnostics with pixel probes off. Quiet coverage

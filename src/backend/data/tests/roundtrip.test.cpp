@@ -62,7 +62,10 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
   std::atomic<bool> done = false;
   std::exception_ptr failure;
  } completion;
- CompiledImageStream stream({.slots = 1U, .workers = 1U, .device = 0, .loading = data_loading_options(h2d)});
+ const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, NumaTopology::Capture());
+ auto readers = std::make_shared<WorkerPool>(1U, execution.placement.cpus, "shared-read", 2U, &execution.placement, true);
+ CompiledImageStream stream({.slots = 1U, .workers = 1U, .device = 0, .loading = data_loading_options(h2d), .execution = execution, .reader_pool = readers});
+ CHECK(&stream.workers() == readers.get());
  context.emplace(0, mmltk::frameworks::gpu::cuda_image_copy_backend());
  context->Bind();
  stream.bind_current_context();
@@ -159,6 +162,18 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
  CHECK(std::memcmp(received.data() + stride, source.image_pixels(1U), stride) == 0);
  REQUIRE(stream.reset_storage() == cudaSuccess);
  REQUIRE_FALSE(stream.owns_allocation());
+ {
+  mmltk::testsupport::TestGate gate("unrelated shared reader work");
+  auto held = readers->enqueue([receipt = gate.receipt()] { receipt.ArriveAndWait(); });
+  std::future<void> stopped;
+  const mmltk::testsupport::ScopedTestCleanup release([&] { gate.Release(); });
+  REQUIRE(gate.WaitEntered(std::chrono::seconds(2)));
+  stopped = std::async(std::launch::async, [&] { stream.stop_workers(); });
+  REQUIRE_NOTHROW(mmltk::testsupport::await_test_future(stopped, "stream retirement independent of shared readers"));
+  gate.Release();
+  held.get();
+  CHECK(readers->enqueue([] { return 42; }).get() == 42);
+ }
  stream.close();
  REQUIRE_FALSE(stream.owns_resources());
 }
@@ -237,6 +252,68 @@ void exercise_schedule_capacity(const std::string& path, const bool h2d) {
  overflow.drop_last = true;
  CHECK_THROWS_AS(DatasetLoader(overflow), std::overflow_error);
 }
+void exercise_independent_completions(const std::string& path, const bool h2d) {
+ namespace gpu = mmltk::frameworks::gpu;
+ const auto source = CompiledDataset::open(path);
+ const auto stride = static_cast<std::size_t>(source.header().image_stride);
+ const std::array reads{CompiledImageRead{3U, 0U}, CompiledImageRead{1U, stride}, CompiledImageRead{3U, 2U * stride}};
+ const gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::PrimaryInterop);
+ gpu::ImageStream consumer(context), releaser(context);
+ const auto consumer_stream = reinterpret_cast<cudaStream_t>(consumer.native_handle());
+ const auto release_stream = reinterpret_cast<CUstream>(releaser.native_handle());
+ CUdeviceptr gate = 0U;
+ gpu::ensure_cuda_driver_ok(cuMemAlloc(&gate, sizeof(std::uint32_t)), "compiled consumer gate allocation");
+ const mmltk::testsupport::ScopedTestCleanup free_gate([&] { (void)cuMemFree(gate); });
+ gpu::ensure_cuda_driver_ok(cuStreamWriteValue32(release_stream, gate, 0U, CU_STREAM_WRITE_VALUE_DEFAULT), "compiled consumer gate initialization");
+ releaser.Synchronize();
+ std::array<std::promise<std::exception_ptr>, 3> transfers;
+ std::atomic<bool> consumed{false};
+ CompiledImageStream stream({.slots = 2U, .workers = 2U, .device = 0, .loading = data_loading_options(h2d)});
+ stream.bind_current_context();
+ for (std::size_t slot = 0U; slot < 2U; ++slot) stream.prepare_images(slot, reads.size() * stride);
+ stream.prepare_host(1U, reads.size() * stride);
+ stream.prepare_metadata(0U, reads.size() * stride);
+ const auto* second_device = stream.device_storage(1U).data();
+ const auto* second_host = stream.host_storage(1U).data();
+ stream.submit(0U, source, reads, {});
+ REQUIRE(stream.wait_read(0U));
+ stream.synchronize(0U);
+ // A device-side gate holds a real consumer without tying up CUDA callbacks.
+ // Cleanup always opens the gate before any GPU owner can join or release it.
+ const mmltk::testsupport::ScopedTestCleanup release_gate([&] {
+  (void)cuStreamWriteValue32(release_stream, gate, 1U, CU_STREAM_WRITE_VALUE_DEFAULT);
+  (void)consumer.Settle();
+ });
+ gpu::ensure_cuda_driver_ok(cuStreamWaitValue32(reinterpret_cast<CUstream>(consumer_stream), gate, 1U, CU_STREAM_WAIT_VALUE_EQ), "compiled delayed consumer");
+ stream.handoff(0U, consumer_stream);
+ ensure_cuda_ok(cudaMemcpyAsync(stream.metadata_storage(0U).data(), stream.device_storage(0U).data(), reads.size() * stride, cudaMemcpyDeviceToHost, consumer_stream), "compiled delayed consumer pixels");
+ stream.release(0U, consumer_stream, {.context = &consumed, .complete = [](void* raw, std::size_t, std::exception_ptr error) noexcept {
+  if (!error) static_cast<std::atomic<bool>*>(raw)->store(true, std::memory_order_release);
+ }});
+ CHECK_THROWS_AS(stream.prepare_host(0U, reads.size() * stride), std::logic_error);
+ CHECK_THROWS_AS(stream.submit(0U, source, reads, {}), std::logic_error);
+ CHECK_THROWS_AS(stream.prepare_images(2U, stride), std::out_of_range);
+ for (auto& transfer : transfers) {
+  stream.submit(1U, source, reads, {}, {.context = &transfer, .complete = [](void* raw, std::size_t, std::exception_ptr error) noexcept {
+   static_cast<std::promise<std::exception_ptr>*>(raw)->set_value(error);
+  }});
+  CHECK_FALSE(mmltk::testsupport::await_test_promise(transfer, "independent compiled transfer"));
+  stream.synchronize(1U);
+  CHECK_FALSE(consumed.load(std::memory_order_acquire));
+  CHECK(stream.reset_storage() == cudaErrorNotReady);
+  if (h2d) {
+   CHECK(stream.device_storage(1U).data() == second_device);
+   CHECK(stream.host_storage(1U).data() == second_host);
+  }
+  const auto pixels = stream.host_images(1U);
+  for (const auto& read : reads) CHECK(std::memcmp(pixels.data() + read.destination_offset, source.image_pixels(read.index), stride) == 0);
+ }
+ gpu::ensure_cuda_driver_ok(cuStreamWriteValue32(release_stream, gate, 1U, CU_STREAM_WRITE_VALUE_DEFAULT), "compiled delayed consumer release");
+ stream.synchronize();
+ CHECK(consumed.load(std::memory_order_acquire));
+ const auto* received = static_cast<const std::byte*>(stream.metadata_storage(0U).data());
+ for (const auto& read : reads) CHECK(std::memcmp(received + read.destination_offset, source.image_pixels(read.index), stride) == 0);
+}
 void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cudaStream_t compute_stream) {
  const std::string bin_path = compiled_bin_path(fixture);
  const std::string dataset_dir_path = dataset_dir(fixture);
@@ -250,6 +327,7 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  exercise_schedule_capacity(bin_path, h2d);
  exercise_compiled_stream(bin_path, h2d);
  ensure_cuda_ok(cudaSetDevice(0), "restore primary training context after isolated stream coverage");
+ exercise_independent_completions(bin_path, h2d);
  {
   DatasetLoader::Config direct_cfg;
   direct_cfg.loading.h2d_dataloader = h2d;
@@ -503,6 +581,15 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  CHECK(std::vector<std::uint32_t>(batch.image_indices, batch.image_indices + batch.num_images) == std::vector<std::uint32_t>{2, 4, 2, 6});
  CHECK(std::vector<std::uint64_t>(batch.draw_keys.begin(), batch.draw_keys.end()) == std::vector<std::uint64_t>{15, 16, 17, 18});
  CHECK(batch.microbatch_key == 102);
+ planned_loader.wait_batch(batch);
+ const auto planned_pixels = planned_loader.host_images(batch);
+ std::vector<float> delivered_pixels(planned_pixels.size());
+ ensure_cuda_ok(cudaMemcpy(delivered_pixels.data(), batch.device_images, batch.image_capacity_bytes, cudaMemcpyDeviceToHost), "explicit schedule destination order");
+ for (std::size_t image = 0U; image < batch.num_images; ++image) {
+  const auto* expected = planned_loader.compiled_source()->image_pixels(batch.image_indices[image]);
+  CHECK(std::memcmp(planned_pixels.data() + image * STRIDE_FLOATS, expected, IMAGE_STRIDE) == 0);
+  CHECK(std::memcmp(delivered_pixels.data() + image * STRIDE_FLOATS, expected, IMAGE_STRIDE) == 0);
+ }
  REQUIRE_THROWS(planned_loader.begin_epoch());
  planned_loader.release_batch(batch);
  REQUIRE(planned_loader.next_batch(batch));
@@ -532,6 +619,9 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  // Independent cursors and cancellation share one immutable mapping/index.
  auto shared_config = planned_cfg;
  shared_config.source = planned_loader.compiled_source();
+ const auto shared_execution = mmltk::frameworks::gpu::resolve_device_execution(shared_config.device_id, NumaTopology::Capture());
+ shared_config.execution = shared_execution;
+ shared_config.reader_pool = std::make_shared<WorkerPool>(1U, shared_execution.placement.cpus, "shared-data", 4U, &shared_execution.placement, true);
  auto shared_owner = std::make_unique<DatasetLoader>(shared_config);
  DatasetLoader shared_peer(shared_config);
  CHECK(shared_owner->compiled_source() == shared_peer.compiled_source());
@@ -544,6 +634,7 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  shared_peer.begin_epoch(other_schedule);
  shared_owner->stop_workers();
  shared_owner.reset();
+ CHECK(shared_config.reader_pool->enqueue([] { return 42; }).get() == 42);
  shared_config.source.reset();
  REQUIRE(shared_peer.next_batch(batch));
  CHECK(batch.image_indices[0] == 4);

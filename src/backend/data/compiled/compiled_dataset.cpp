@@ -95,6 +95,27 @@ bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> re
   if (read.index >= image_entries_.size() || read.destination_offset > destination.capacity || stride > destination.capacity - read.destination_offset)
    throw std::out_of_range("compiled image read exceeds source or destination");
  }
+ // Request the admitted slot's source runs before copying any of them. Source
+ // locality is independent of destination order; repeated images need advice
+ // only once, but still have a separate destination for each logical draw.
+ for (std::size_t first = 0; first < reads.size();) {
+  std::size_t end = first + 1;
+  auto last_index = reads[first].index;
+  while (end < reads.size() && reads[end].index >= last_index &&
+         static_cast<std::uint64_t>(reads[end].index) <= static_cast<std::uint64_t>(last_index) + 1U &&
+         static_cast<std::size_t>(reads[end].index - reads[first].index) < std::max<std::size_t>(1U, kReadExtent / stride)) {
+   last_index = reads[end++].index;
+  }
+  const auto source_offset = image_entries_[reads[first].index].pixel_offset;
+  const auto bytes = (static_cast<std::size_t>(last_index - reads[first].index) + 1U) * stride;
+  for (std::size_t offset = 0; offset < bytes;) {
+   if (cancelled.load(std::memory_order_acquire)) return false;
+   const auto extent = std::min(kReadExtent, bytes - offset);
+   mapping_.advise_aligned_range(source_offset + offset, extent, MADV_WILLNEED);
+   offset += extent;
+  }
+  first = end;
+ }
  for (std::size_t first = 0; first < reads.size();) {
   std::size_t count = 1;
   while (first + count < reads.size() && reads[first + count].index == reads[first].index + count && reads[first + count].destination_offset == reads[first].destination_offset + count * stride &&
@@ -105,7 +126,6 @@ bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> re
   for (std::size_t offset = 0; offset < bytes;) {
    if (cancelled.load(std::memory_order_acquire)) return false;
    const auto extent = std::min(kReadExtent, bytes - offset);
-   mapping_.advise_aligned_range(source_offset + offset, extent, MADV_WILLNEED);
    if (prefault) mapping_.advise_aligned_range(source_offset + offset, extent, MADV_POPULATE_READ);
    destination.write(destination.context, reads[first].destination_offset + offset, {reinterpret_cast<const std::byte*>(mapping_.data() + source_offset + offset), extent});
    offset += extent;

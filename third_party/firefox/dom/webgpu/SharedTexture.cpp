@@ -18,13 +18,13 @@ UniquePtr<SharedTexture> SharedTexture::Create(
     WebGPUParent* aParent, const ffi::WGPUDeviceId aDeviceId,
     const uint32_t aWidth, const uint32_t aHeight,
     const struct ffi::WGPUTextureFormat aFormat,
-    const ffi::WGPUTextureUsages aUsage) {
+    const ffi::WGPUTextureUsages aUsage, int32_t* aOutError) {
   MOZ_ASSERT(aParent);
 
   UniquePtr<SharedTexture> texture;
 #if defined(XP_LINUX) && !0
   texture = SharedTextureDMABuf::Create(aParent, aDeviceId, aWidth, aHeight,
-                                        aFormat, aUsage);
+                                        aFormat, aUsage, aOutError);
 #endif
   return texture;
 }

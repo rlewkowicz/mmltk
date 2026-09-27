@@ -71,7 +71,7 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(
  };
  try {
   if (config_.training_executable.empty()) throw contracts::UnavailableError("local training executable is unavailable");
-  auto process = services::TrainProcessClient::launch(request, config_.training_executable);
+  auto process = services::TrainProcessClient::launch(request, config_.training_executable, {}, {.diagnostics = config_.diagnostics});
   if (config_.diagnostics.valid()) {
    const std::span<const int> ranks = request.device_ids.empty() ? std::span<const int>{&request.device_id, 1U} : std::span<const int>{request.device_ids};
    for (std::size_t rank = 0; rank < ranks.size(); ++rank)
@@ -401,15 +401,23 @@ public:
       {
        std::scoped_lock lock(mutex_);
        if (!state_.local.active || !contracts::compute_progress_follows(progress, state_.local.progress.sequence)) return;
-       state_.local.progress = progress;
+       if (update.metrics || update.failure.empty()) {
+        state_.local.progress = progress;
+        state_.sources = update.sources;
+        state_.persistence = update.persistence;
+       } else {
+        state_.local.progress.sequence = progress.sequence;
+        state_.local.progress.status = progress.status;
+       }
        if (update.metrics) state_.metrics = update.metrics;
-       state_.sources = update.sources;
        if (state_.sources.execution) {
         state_.sources.execution->training.operation_generation = state_.local.generation_frontier;
         state_.sources.execution->validation.operation_generation = state_.local.generation_frontier;
        }
-       state_.persistence = update.persistence;
-       if (state_.local.terminal.outcome == contracts::ComputeOperationOutcome::Running) state_.local.terminal.detail.clear();
+       if (!update.failure.empty())
+        state_.local.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Failed, state_.local.generation_frontier, state_.local.progress.completed, {}, update.failure);
+       else if (state_.local.terminal.outcome == contracts::ComputeOperationOutcome::Running)
+        state_.local.terminal.detail.clear();
        AdvanceObservation();
        observation = {
         .revision = state_.revision,
@@ -420,7 +428,7 @@ public:
         .persistence = state_.persistence,
        };
       }
-      if (!update.metrics)
+      if (!update.metrics && update.failure.empty())
        diagnostics_.Emit([&] {
         return services::RuntimeDiagnosticFact{
          .owner = contracts::DiagnosticOwner::Training,

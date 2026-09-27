@@ -43,7 +43,7 @@
     </style>
     <script>
       (() => {
-        let reloadScheduled = false;
+        let recoveryStarted = false;
 
         const showRecovery = (message, manual) => {
           const recovery = document.getElementById("mmltk-recovery");
@@ -55,6 +55,7 @@
           detail.textContent = message;
           button.hidden = !manual;
           recovery.hidden = false;
+          window.mmltkIntegrationRecovery?.(message, manual);
         };
 
         // One automatic reload per failure episode. A failure arriving after an
@@ -64,14 +65,21 @@
         setTimeout(() => sessionStorage.removeItem(recoveryEpisodeKey), 30000);
 
         window.mmltkRecoverWebGpu = (cause = "WebGPU device lost") => {
-          if (reloadScheduled) {
+          if (recoveryStarted) {
+            return;
+          }
+          recoveryStarted = true;
+          // Reloading while training still occupies GPU memory creates another
+          // device and more allocations. Keep the native job running and let
+          // the user retry after memory becomes available.
+          if (/out of memory|not enough memory|no more memory/i.test(cause)) {
+            showRecovery(`${cause}. GPU rendering is paused; native work continues. Free GPU memory, then reload the GUI.`, true);
             return;
           }
           if (sessionStorage.getItem(recoveryEpisodeKey) === "1") {
             showRecovery(`${cause}. Automatic reload did not recover WebGPU.`, true);
             return;
           }
-          reloadScheduled = true;
           sessionStorage.setItem(recoveryEpisodeKey, "1");
           showRecovery(`${cause}. Reloading the GUI in this Firefox window…`, false);
           window.location.reload();

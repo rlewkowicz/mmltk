@@ -96,6 +96,8 @@ pub enum SurfaceError {
     Lost,
         #[error("There is no more memory left to allocate a new frame")]
     OutOfMemory,
+    #[error("WebGPU device failed: {0}")]
+    Device(String),
         #[error("The surface is occluded and must not be drawn to")]
     Occluded,
         #[error("Acquiring a texture failed with a generic error")]

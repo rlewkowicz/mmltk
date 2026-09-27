@@ -203,6 +203,7 @@ public:
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION", "1", 1) == 0 && ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DPI", high_dpi ? "1.5" : "1", 1) == 0 &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO", viewer_scenario.c_str(), 1) == 0 && ::setenv("MMLTK_GUI_PIXEL_TRACE", logging && pixel_probes ? "1" : "0", 1) == 0 &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PROBE_FAILURE", probe_failure.c_str(), 1) == 0 &&
+    (viewer_scenario != "workflows-oom" || ::setenv("MMLTK_TEST_CANVAS_OOM_WIDTH", "1234", 1) == 0) &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PIXEL_FIXTURE", fixture.pixel_evidence && (viewer_scenario == "retained" || viewer_scenario == "dpi") ? "1" : "0", 1) == 0 &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPLETION_GATE", viewer_scenario == "retained" ? "1" : "0", 1) == 0 &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PENDING_SUPERSESSION", logging && (viewer_scenario == "retained" || viewer_scenario == "dpi") ? "1" : "0", 1) == 0 &&
@@ -522,7 +523,7 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
  initial_settings.ui.ui_scale = 1.0F;
  initial_settings.workflows.explore.h2d_dataloader = h2d;
  initial_settings.workflows.train.request.h2d_dataloader = h2d;
- if (profile_ == "workflows") inputs_->workflows().Configure(initial_settings, working.path());
+ if (profile_ == "workflows" || profile_ == "workflows-oom") inputs_->workflows().Configure(initial_settings, working.path());
  std::filesystem::create_directories(working.path() / ".mmltk-data");
  std::ofstream settings_file{working.path() / ".mmltk-data" / "gui.json"};
  REQUIRE(settings_file);
@@ -552,6 +553,15 @@ void WaylandSession::ConsumeRecords(const bool final) {
   if (logging) browser.prediction_failure.report(acceptance_log, "acceptance.prediction.failed", firefox_log, browser_cursor_->line());
   const auto event = record.value("event", "");
   if (event == "firefox.adapter.selected") display_adapter_seen_ = true;
+  if (event == "firefox.canvas.allocation_fault" && record.value("width", 0) == 1234) canvas_allocation_failed_ = true;
+  if (event == "integration.graphics.recovery") {
+   REQUIRE(record.value("manual", false));
+   REQUIRE(record.value("visible", false));
+   REQUIRE(record.value("reload", false));
+   REQUIRE(record.value("detail", std::string{}).contains("out of memory"));
+   REQUIRE(profile_ == "workflows-oom");
+   graphics_recovery_visible_ = true;
+  }
   if (event == "integration.workflow.completed") workflow_steps_.insert(record.value("detail", ""));
   if (event == "integration.workflow.pixels") workflow_pixels_.insert(record.value("detail", ""));
   report_consumed_record(record, "firefox");
@@ -639,56 +649,62 @@ void WaylandSession::RunWorkflows() {
   }
  }
  CHECK(display_adapter_seen_);
- CHECK(
-  (workflow_steps_ == std::set<std::string>{
-                       "train", "validation", "validation_layer_settled", "validation_original", "compiled", "image", "video", "stop", "export_stop", "export_stop_narrow_dark", "theme", "narrow",
-                       "chart_legend", "chart_pan", "chart_retained_expanded", "chart_retained_back", "chart_retained_hidden", "chart_retained_revealed", "chart_retained_navigation", "chart_tile_0",
-                       "chart_tile_1", "chart_tile_2", "chart_tile_3", "chart_tile_4", "chart_tile_5", "chart_expanded", "chart_aspect_0", "chart_aspect_1", "chart_aspect_2", "chart_aspect_3",
-                       "chart_aspect_4", "chart_aspect_5", "chart_wheel_grid_0", "chart_wheel_grid_1", "chart_wheel_grid_2", "chart_wheel_grid_3", "chart_wheel_grid_4", "chart_wheel_grid_5",
-                       "chart_wheel_expanded_0", "chart_wheel_expanded_1", "chart_wheel_expanded_2", "chart_wheel_expanded_3", "chart_wheel_expanded_4", "chart_wheel_expanded_5"
-                      }));
- CHECK((workflow_pixels_ == std::set<std::string>{"progress", "train", "validation", "validate-to-explore", "detail", "compiled", "image", "video", "stop", "theme", "narrow"}));
- CHECK(browser.validate_to_explore_pixels);
- const auto prediction_output_blocker = browser.prediction_output_blocker();
- if (logging && !prediction_output_blocker.empty() && browser.prediction_failure.record().is_null())
-  append_acceptance_record(acceptance_log, {{"event", "acceptance.prediction.incomplete"}, {"level", "error"}, {"detail", prediction_output_blocker}, {"media_disabled", browser.prediction_no_outputs},
-                                            {"saving_controls", browser.prediction_saving_controls}, {"saved_media", browser.prediction_outputs}});
- INFO(prediction_output_blocker);
- CHECK(prediction_output_blocker.empty());
- INFO(browser.validation_progressive);
- INFO(browser.validation_restored_tiles);
- REQUIRE(browser.validation_samples_complete());
- for (const auto& record : browser.validation_saved_samples) {
-  const auto directory = std::filesystem::path(record.value("control", ""));
-  const auto file = (directory.is_absolute() ? directory : working.path() / directory) / record.value("detail", "");
-  INFO(file.string());
-  REQUIRE(std::filesystem::is_regular_file(file));
-  REQUIRE(std::filesystem::file_size(file) > 32U);
-  std::ifstream png(file, std::ios::binary);
-  std::array<unsigned char, 8> signature{};
-  png.read(reinterpret_cast<char*>(signature.data()), signature.size());
-  CHECK(signature == std::array<unsigned char, 8>{137U, 80U, 78U, 71U, 13U, 10U, 26U, 10U});
-  CHECK_FALSE(std::filesystem::exists(file.string() + ".partial"));
+ if (profile_ == "workflows-oom") {
+  REQUIRE(canvas_allocation_failed_);
+  REQUIRE(graphics_recovery_visible_);
+  REQUIRE(workflow_steps_.contains("train-after-graphics-failure"));
+ } else {
+  CHECK(
+   (workflow_steps_ == std::set<std::string>{
+                        "train", "validation", "validation_layer_settled", "validation_original", "compiled", "image", "video", "stop", "export_stop", "export_stop_narrow_dark", "theme", "narrow",
+                        "chart_legend", "chart_pan", "chart_retained_expanded", "chart_retained_back", "chart_retained_hidden", "chart_retained_revealed", "chart_retained_navigation", "chart_tile_0",
+                        "chart_tile_1", "chart_tile_2", "chart_tile_3", "chart_tile_4", "chart_tile_5", "chart_expanded", "chart_aspect_0", "chart_aspect_1", "chart_aspect_2", "chart_aspect_3",
+                        "chart_aspect_4", "chart_aspect_5", "chart_wheel_grid_0", "chart_wheel_grid_1", "chart_wheel_grid_2", "chart_wheel_grid_3", "chart_wheel_grid_4", "chart_wheel_grid_5",
+                        "chart_wheel_expanded_0", "chart_wheel_expanded_1", "chart_wheel_expanded_2", "chart_wheel_expanded_3", "chart_wheel_expanded_4", "chart_wheel_expanded_5"
+                       }));
+  CHECK((workflow_pixels_ == std::set<std::string>{"progress", "train", "validation", "validate-to-explore", "detail", "compiled", "image", "video", "stop", "theme", "narrow"}));
+  CHECK(browser.validate_to_explore_pixels);
+  const auto prediction_output_blocker = browser.prediction_output_blocker();
+  if (logging && !prediction_output_blocker.empty() && browser.prediction_failure.record().is_null())
+   append_acceptance_record(acceptance_log, {{"event", "acceptance.prediction.incomplete"}, {"level", "error"}, {"detail", prediction_output_blocker}, {"media_disabled", browser.prediction_no_outputs},
+                                             {"saving_controls", browser.prediction_saving_controls}, {"saved_media", browser.prediction_outputs}});
+  INFO(prediction_output_blocker);
+  CHECK(prediction_output_blocker.empty());
+  INFO(browser.validation_progressive);
+  INFO(browser.validation_restored_tiles);
+  REQUIRE(browser.validation_samples_complete());
+  for (const auto& record : browser.validation_saved_samples) {
+   const auto directory = std::filesystem::path(record.value("control", ""));
+   const auto file = (directory.is_absolute() ? directory : working.path() / directory) / record.value("detail", "");
+   INFO(file.string());
+   REQUIRE(std::filesystem::is_regular_file(file));
+   REQUIRE(std::filesystem::file_size(file) > 32U);
+   std::ifstream png(file, std::ios::binary);
+   std::array<unsigned char, 8> signature{};
+   png.read(reinterpret_cast<char*>(signature.data()), signature.size());
+   CHECK(signature == std::array<unsigned char, 8>{137U, 80U, 78U, 71U, 13U, 10U, 26U, 10U});
+   CHECK_FALSE(std::filesystem::exists(file.string() + ".partial"));
+  }
+  CHECK(browser.validation_confidence_complete());
+  CHECK(browser.validation_layout_complete());
+  CHECK(browser.workflow_gpus_complete());
+  CHECK(browser.training_sources_complete());
+  mmltk::controller::contracts::GuiSettingsState persisted;
+  REQUIRE(mmltk::controller::contracts::load_gui_settings_file((working.path() / ".mmltk-data" / "gui.json").string(), persisted));
+  REQUIRE(persisted.workflows.train.request.device_ids.size() == 1U);
+  CHECK(persisted.workflows.train.request.device_ids.front() == browser.workflow_gpu_selected.at("train")[0]);
+  CHECK(persisted.workflows.validate.request.device_id == browser.workflow_gpu_selected.at("validate")[0]);
+  CHECK(persisted.workflows.predict.request.device_id == browser.workflow_gpu_selected.at("predict")[0]);
+  CHECK(persisted.workflows.export_state.device_id == browser.workflow_gpu_selected.at("export")[0]);
+  CHECK(browser.primary_phase_progress.contains("train.primary:light"));
+  CHECK(browser.primary_phase_progress.contains("validate.primary:light"));
+  CHECK(browser.primary_phase_progress.contains("predict.primary:light"));
+  CHECK(browser.primary_phase_progress.contains("export.primary:light"));
+  CHECK(browser.primary_phase_progress.contains("export.primary:dark"));
+  CHECK(browser.primary_active_themes.contains(false));
+  CHECK(browser.primary_active_themes.contains(true));
+  CHECK_FALSE(surface_audit.surfaces.empty());
  }
- CHECK(browser.validation_confidence_complete());
- CHECK(browser.validation_layout_complete());
- CHECK(browser.workflow_gpus_complete());
- CHECK(browser.training_sources_complete());
- mmltk::controller::contracts::GuiSettingsState persisted;
- REQUIRE(mmltk::controller::contracts::load_gui_settings_file((working.path() / ".mmltk-data" / "gui.json").string(), persisted));
- REQUIRE(persisted.workflows.train.request.device_ids.size() == 1U);
- CHECK(persisted.workflows.train.request.device_ids.front() == browser.workflow_gpu_selected.at("train")[0]);
- CHECK(persisted.workflows.validate.request.device_id == browser.workflow_gpu_selected.at("validate")[0]);
- CHECK(persisted.workflows.predict.request.device_id == browser.workflow_gpu_selected.at("predict")[0]);
- CHECK(persisted.workflows.export_state.device_id == browser.workflow_gpu_selected.at("export")[0]);
- CHECK(browser.primary_phase_progress.contains("train.primary:light"));
- CHECK(browser.primary_phase_progress.contains("validate.primary:light"));
- CHECK(browser.primary_phase_progress.contains("predict.primary:light"));
- CHECK(browser.primary_phase_progress.contains("export.primary:light"));
- CHECK(browser.primary_phase_progress.contains("export.primary:dark"));
- CHECK(browser.primary_active_themes.contains(false));
- CHECK(browser.primary_active_themes.contains(true));
- CHECK_FALSE(surface_audit.surfaces.empty());
  process.interrupt();
  arm_timerfd(deadline.get(), kWaylandShutdownDeadline, "workflow shutdown");
  const auto terminal = await_shutdown(process, deadline.get());

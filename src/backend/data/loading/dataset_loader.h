@@ -10,6 +10,7 @@
 #include <stop_token>
 #include "src/frameworks/gpu/cuda/device_execution.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
+#include "src/common/concurrency/worker_pool.h"
 #include "src/backend/imaging/resample/image_resize.h"
 namespace mmltk::frameworks::gpu {
 class TerminalCudaRetirementOwner;
@@ -40,6 +41,7 @@ public:
  struct Config {
   std::string compiled_path;
   std::shared_ptr<const CompiledDataset> source{};
+  std::shared_ptr<mmltk::common::concurrency::WorkerPool> reader_pool{};
   size_t batch_size = 32;
   bool shuffle = true;
   uint64_t seed = 42;

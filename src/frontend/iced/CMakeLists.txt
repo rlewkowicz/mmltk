@@ -228,6 +228,7 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
                 ${_mmltk_frontend_js_arguments}
                 "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/integration_control.test.mjs"
                 "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/workspace_graphics.test.mjs"
+                "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/graphics_recovery.test.mjs"
         )
     endif()
     if("${MMLTK_ICED_JS_TEST_PATTERN}" STREQUAL "" AND NOT MMLTK_ICED_TEST_PACKAGE STREQUAL "iced_aw")

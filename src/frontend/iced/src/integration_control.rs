@@ -2430,7 +2430,7 @@ impl Driver {
                 });
                 self.reporting
                     .observe(|reporting| reporting.bootstrap(model, settings));
-                if self.viewer_scenario == "workflows" {
+                if matches!(self.viewer_scenario.as_str(), "workflows" | "workflows-oom") {
                     return self.advance_to(Phase::Workflows(workflows::Step::Train));
                 }
                 if !self.viewer_scenario.is_empty() {

@@ -29,7 +29,7 @@ class SharedTexture {
       WebGPUParent* aParent, const ffi::WGPUDeviceId aDeviceId,
       const uint32_t aWidth, const uint32_t aHeight,
       const struct ffi::WGPUTextureFormat aFormat,
-      const ffi::WGPUTextureUsages aUsage);
+      const ffi::WGPUTextureUsages aUsage, int32_t* aOutError);
 
   SharedTexture(const uint32_t aWidth, const uint32_t aHeight,
                 const struct ffi::WGPUTextureFormat aFormat,
@@ -61,7 +61,7 @@ class SharedTexture {
     return mOwnerId;
   }
 
-  virtual void onBeforeQueueSubmit(RawId aQueueId) {}
+  virtual bool onBeforeQueueSubmit(RawId aQueueId) { return true; }
 
   virtual void CleanForRecycling() { mSubmissionIndex = 0; }
 

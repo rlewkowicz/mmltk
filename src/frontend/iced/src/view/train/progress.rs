@@ -54,6 +54,10 @@ impl Presentation {
             rate: None,
             losses: None,
         };
+        if snapshot.local.terminal.outcome == ComputeOperationOutcome::Failed {
+            result.heading = format!("Training failed: {}", snapshot.local.terminal.detail);
+            return Some(result);
+        }
         let Some(record) = current else {
             let progress = &snapshot.local.progress;
             result.heading = if stopping {
@@ -226,15 +230,28 @@ mod tests {
     fn preparation_stage_is_visible_without_fabricated_training_measurements() {
         let mut snapshot = snapshot();
         snapshot.metrics = None;
-        snapshot.local.progress.status = "Initializing model and GPU weights".into();
+        snapshot.local.progress.status = "Synchronizing training GPUs and session".into();
         let facts = Presentation::from_snapshot(&snapshot).unwrap();
-        assert_eq!(facts.heading, "Initializing model and GPU weights");
+        assert_eq!(facts.heading, "Synchronizing training GPUs and session");
         assert!(facts.images.is_none() && facts.fraction.is_none());
         assert!(facts.rate.is_none() && facts.losses.is_none() && facts.timing.is_none());
         snapshot.local.terminal.outcome = ComputeOperationOutcome::CancellationRequested;
         let facts = Presentation::from_snapshot(&snapshot).unwrap();
         assert_eq!(facts.heading, "Stopping");
         assert!(facts.fraction.is_none());
+    }
+
+    #[test]
+    fn worker_failure_is_visible_while_resources_are_still_retiring() {
+        let mut snapshot = snapshot();
+        snapshot.local.terminal.outcome = ComputeOperationOutcome::Failed;
+        snapshot.local.terminal.detail = "training source lacks admitted file metadata".into();
+        let facts = Presentation::from_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            facts.heading,
+            "Training failed: training source lacks admitted file metadata"
+        );
+        assert!(facts.fraction.is_none() && facts.losses.is_none());
     }
 
     #[test]

@@ -1454,6 +1454,39 @@ TEST_CASE("Train process retains bounded late fatal causes independently of cons
  CHECK(result.terminal.error.find("Reduce batch size or training lanes") != std::string::npos);
  CHECK_FALSE(client.consume_exit().has_value());
 }
+TEST_CASE("Train process publishes fatal causes before bounded peer retirement", "[gui][services][train]") {
+ const bool long_cause = GENERATE(false, true);
+ mmltk::testsupport::ScopedTempDir temp("mmltk-train-failed-peer");
+ const std::string cause = "training source lacks admitted file metadata" + (long_cause ? std::string(1100, 'x') : std::string{});
+ const auto executable = script(temp, "trap '' TERM\nprintf 'fatal: mmltk rfdetr error: " + cause + "\\n'\nexec sleep 60\n");
+ const auto path = temp.path() / "trace.jsonl";
+ services::DiagnosticsClient diagnostics{path};
+ services::RuntimeDiagnostics runtime_diagnostics{diagnostics.producer()};
+ auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable, {}, {.escalation_delay = std::chrono::milliseconds(50), .diagnostics = runtime_diagnostics.target()});
+ std::string discarded;
+ REQUIRE(ready(client.stdout_fd()));
+ client.consume_output(discarded);
+ const auto progress = client.consume_progress();
+ REQUIRE(progress);
+ CHECK(progress->failure == cause);
+ CHECK(progress->progress.status == "Training failed: " + progress->failure);
+ CHECK(client.active());
+ CHECK_FALSE(client.consume_exit());
+ CHECK(diagnostics.counters().accepted == 1);
+ diagnostics.close();
+ diagnostics.wait_closed();
+ REQUIRE(diagnostics.terminal() == services::DiagnosticsTerminal::Drained);
+ std::ifstream diagnostic_input(path);
+ const auto diagnostic = nlohmann::json::parse(diagnostic_input);
+ CHECK(diagnostic.at("event") == "training.worker_failed");
+ CHECK(diagnostic.at("message") == progress->failure);
+ auto [source, token] = TrainProcessStopSource::Mint();
+ const auto result = client.Run(std::move(token));
+ CHECK(result.terminal.outcome == TrainProcessExitOutcome::Failed);
+ CHECK(result.terminal.signal_number == SIGKILL);
+ CHECK(result.terminal.error.contains(progress->failure));
+ CHECK_FALSE(client.active());
+}
 TEST_CASE("Train process distinguishes fatal causes from warnings and generic parent failures", "[gui][services]") {
  const auto scenario = GENERATE(0, 1, 2, 3, 4, 5);
  mmltk::testsupport::ScopedTempDir temp("mmltk-train-fatal-order");

@@ -139,6 +139,14 @@ fatal lines before publishing the terminal and preserves a useful worker cause
 when a later parent line reports only generic distributed failure. Progress
 text and allocator warnings do not select a cause.
 
+A complete fatal line publishes a failed training observation immediately,
+while the process group remains active until physical retirement. The Train
+view and session Status panel show the cause during that interval, and Start
+remains unavailable. The first fatal cause also arms the existing five-second
+cleanup deadline; surviving peers receive SIGKILL when it expires. Captured
+children unblock SIGINT and SIGTERM inherited from the desktop's signal owner,
+so ordinary distributed peer termination works without waiting for escalation.
+
 [NativeTrainingRuntime](../src/controller/subsystems/train/training_system.cpp)
 projects the decoded exit/signal status and UTF-8-safe cause into the existing
 `ComputeTerminal.detail` for the [session Status panel](gui-interaction.md#session-status).
@@ -151,6 +159,10 @@ independent of diagnostic activation.
 
 Enabled GUI trace records `child.exited`, `child.signaled`, and `training.failed`
 include bounded batch/lane, output, device, and available run/attempt context.
+`training.worker_failed` records each newly selected fatal cause before process
+retirement, with the process-group ID in `value` and the output directory in
+`document_resource`. Its message admits the complete retained cause and OOM
+guidance within a 4096-byte bound.
 
 The training system also emits `training.inputs` before dataset inspection,
 including the operation generation (`sequence`), captured settings revision
@@ -159,7 +171,7 @@ including the operation generation (`sequence`), captured settings revision
 typed terminal, including failures before a training process exists. Their
 `sequence` is the operation generation and `value` is the snapshot revision.
 Resolution errors identify the file, actual geometry/channels, and required
-geometry. Diagnostic messages remain bounded to 1024 UTF-8 bytes; the UI retains
+geometry. These diagnostic messages remain bounded to 1024 UTF-8 bytes; the UI retains
 the full bounded terminal detail.
 
 `training.preparation` reports the worker's startup stage before metrics exist.
@@ -167,7 +179,8 @@ Its `sequence` is the operation generation. The small native
 `preparation.json` document is watched alongside metric documents and changes
 only at stage transitions. No console parsing is needed for startup
 progress. Query `@event=training.preparation` for GPU connection, dataset
-admission, model initialization, and optimizer setup. [Dataset identity](model-merging.md#whole-session-resume)
+admission, checkpoint loading, model construction, GPU weight loading,
+GPU/session synchronization, and optimizer setup. [Dataset identity](model-merging.md#whole-session-resume)
 uses admitted metadata without scanning image payloads.
 Distributed CLI training forwards explicit logging options to each worker, so
 `--log-level` and `--log-file` also cover the native training processes. Each
@@ -620,6 +633,22 @@ Clipboard acceptance and its opt-in permission gate are documented in
 include Mozilla `Clipboard` and `WidgetClipboard` module logs alongside the
 existing graphics modules.
 
+### Canvas allocation and recovery
+
+Canvas allocation failures emit gated `firefox.canvas.allocation_failed` with
+the requested width, height, allocation bytes, and Vulkan status. Packaged
+resize recovery coverage additionally records `firefox.canvas.allocation_fault`
+and `integration.graphics.recovery`; the latter checks that the recovery overlay
+and manual reload button are visible and retains the displayed cause. The fault
+setting `MMLTK_TEST_CANVAS_OOM_WIDTH` is read only with packaged acceptance
+diagnostics enabled and fails one canvas allocation without consuming VRAM.
+
+```bash
+./mmltk --logs --family latest-wayland-test \
+  -q '@event:firefox.canvas.allocation OR @event:integration.graphics.recovery' \
+  --format timeline --limit 20
+```
+
 ### Prediction media acceptance
 
 The existing [BrowserAudit](../src/acceptance/tests/wayland/browser_audit.cpp)
@@ -763,7 +792,9 @@ actual terminal result.
 
 Catch assertion/exception headers retain `source_file` and `source_line`,
 including uppercase `FAILED:` or `FATAL ERROR:` and a header with no inline
-message. Following exception text stays under the active test context. The
+message. A dashed report title followed by its source location restores the
+reported test identity when delayed stderr follows another test's stdout
+`RUN` record. Following exception text stays under that test context. The
 exact `{Unknown expression after the reported line}` placeholder becomes
 `catch.expression` transcript text. This narrow handling does not make
 malformed JSON diagnostics valid; genuine malformed/truncated records still

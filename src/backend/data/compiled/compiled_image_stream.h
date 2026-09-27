@@ -49,6 +49,8 @@ public:
   bool prefault = false;
   DataLoadingOptions loading{};
   std::optional<mmltk::frameworks::gpu::DeviceExecution> execution{};
+  // Optional session-owned readers with the same CPU/NUMA placement.
+  std::shared_ptr<mmltk::common::concurrency::WorkerPool> reader_pool{};
   decltype(&cudaStreamSynchronize) settle = &cudaStreamSynchronize;
   decltype(&cudaEventRecord) record_consumer = &cudaEventRecord;
  };
@@ -82,7 +84,8 @@ public:
  [[nodiscard]] const Buffer& host_storage(std::size_t slot) const;
  [[nodiscard]] const Buffer& device_storage(std::size_t index) const;
  [[nodiscard]] mmltk::common::concurrency::WorkerPool& workers() noexcept;
- // Copies the compact read list into reused slot storage. At most one read
+ // Copies the compact read list into reused slot storage, then gathers in
+ // source order while preserving packed destination offsets. At most one read
  // job per slot is admitted. Visible work can cancel queued prefetch jobs.
  void submit(std::size_t slot, const CompiledDataset& source, std::span<const CompiledImageRead> reads, ReadObserver observer, CompletionObserver transfer = {nullptr, nullptr});
  void cancel_reads() noexcept;
@@ -101,7 +104,8 @@ public:
  void synchronize(std::size_t slot);
  void synchronize();
  // Terminal physical release, called before the owning CUDA context leaves scope.
- // Terminal CPU quiescence, independent of retained GPU slots and their external consumers.
+ // Settle this stream's CPU work and detach its shared pool (or join private
+ // workers), independently of retained GPU slots and their external consumers.
  void stop_workers();
  void close();
  [[nodiscard]] int reset_storage() noexcept;

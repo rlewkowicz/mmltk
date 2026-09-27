@@ -118,6 +118,15 @@ constructing an empty forward batch and still participates in the collective
 protocol. Every model must have at least one complete window in an admitted
 epoch. Unused tails are reported separately.
 
+Each GPU rank shares one immutable compiled mapping/index per admitted file
+and one NUMA-local reader pool across its model, validation, and final-test
+loaders. Relative paths resolve before matching admitted metadata; alternate
+path spellings and hard links reuse the same file generation. Loaders retain
+independent schedules, cursors, staging buffers, and cancellation. Stopping one
+loader settles its own reads without stopping other users of the pool.
+Separate rank processes retain their own GPU/NUMA execution resources while
+file-backed pages share the operating system's page cache.
+
 The [training session](../src/backend/models/rfdetr/training/train.cpp) orders
 communication by epoch, round, and stable model ID. A round attempts at most
 one update per nonexhausted model. Count collectives precede gradient buckets,

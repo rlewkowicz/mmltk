@@ -17,7 +17,8 @@ void workspace_wayland_retained() {
  session.RunScenario("rapid", true);
 }
 void workspace_wayland_workflows() {
- WaylandSession session{wayland_inputs(false), TerminationMode::SignalInterrupt, "workflows", true, false, true, {}, false};
+ const std::string profile = GENERATE("workflows", "workflows-oom");
+ WaylandSession session{wayland_inputs(false), TerminationMode::SignalInterrupt, profile, true, false, true, {}, false};
  session.RunScenario("workflows", true);
 }
 void workspace_wayland_dpi() {

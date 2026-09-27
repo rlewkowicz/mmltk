@@ -20,6 +20,7 @@ enum class ChildSetupStage : std::uint8_t {
  PreserveDescriptor,
  SetEnvironment,
  Exec,
+ RestoreSignals,
 };
 [[nodiscard]] const char* child_setup_stage_label(ChildSetupStage stage) noexcept;
 struct ChildSetupFailure {

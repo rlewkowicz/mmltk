@@ -229,6 +229,7 @@ DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::framew
    .cpu_affinity = config.cpu_affinity,
    .loading = config.loading,
    .execution = execution,
+   .reader_pool = config.reader_pool,
    .record_consumer = record_consumer
   },
   std::move(retirement));

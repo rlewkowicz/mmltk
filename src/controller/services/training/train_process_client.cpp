@@ -16,6 +16,30 @@ namespace {
 constexpr std::size_t kProgressDocumentLimit = mmltk::backend::models::rfdetr::kTrainingProgressDocumentBytes;
 constexpr std::size_t kProgressEdgeReadBudget = std::size_t{16U} * 1024U;
 [[nodiscard]] std::string bounded_error(std::string value) { return mmltk::controller::contracts::bounded_compute_error(std::move(value)); }
+[[nodiscard]] std::string failure_text(std::string_view cause) {
+ std::string text;
+ const bool oom = cause.starts_with("CUDA out of memory");
+ if (oom) {
+  const auto advice = cause.find(" If reserved");
+  if (advice != std::string_view::npos) cause = cause.substr(0, advice);
+ }
+ while (!cause.empty()) {
+  const auto length = mmltk::common::types::utf8_prefix_length(cause);
+  if (length == 0U) {
+   text += '?';
+   cause.remove_prefix(1U);
+   continue;
+  }
+  const auto byte = static_cast<unsigned char>(cause.front());
+  if (length == 1U && (byte < 32U || byte == 127U))
+   text += ' ';
+  else
+   text.append(cause.substr(0, length));
+  cause.remove_prefix(length);
+ }
+ if (oom) text += " Reduce batch size or training lanes to lower GPU memory use, then start again.";
+ return text;
+}
 void validate_progress_fields(const std::string& status, const std::string& checkpoint) {
  if (!mmltk::controller::contracts::valid_compute_text(status, mmltk::controller::contracts::kComputeStatusCapacity)) { throw std::runtime_error("train progress status exceeds fixed capacity"); }
  if (!mmltk::controller::contracts::valid_compute_text(checkpoint, mmltk::controller::contracts::kComputePathCapacity)) { throw std::runtime_error("train checkpoint path exceeds fixed capacity"); }
@@ -137,7 +161,25 @@ void TrainProcessClient::State::finish_failure_line() {
  };
  if (!cause.empty()) {
   const auto incoming = specificity(cause), retained = specificity(failure_cause);
-  if (failure_cause.empty() || incoming > retained || (incoming == retained && cause < failure_cause)) failure_cause.assign(cause);
+  if (failure_cause.empty() || incoming > retained || (incoming == retained && cause < failure_cause)) {
+   // A failed rank can leave peers inside GPU work. Publish its cause now and
+   // bound physical cleanup even if the launcher cannot finish normally.
+   if (failure_cause.empty() && !reaped && !term_sent && !kill_sent) arm_escalation(escalation_fd.get(), escalation_delay);
+   failure_cause.assign(cause);
+   status_dirty = true;
+   std::string message;
+   diagnostics.Emit([&] {
+    message = failure_text(failure_cause);
+    return RuntimeDiagnosticFact{
+     .owner = contracts::DiagnosticOwner::Training,
+     .event = "training.worker_failed",
+     .participant = "train",
+     .value = static_cast<std::uint64_t>(group),
+     .context = {.document_resource = output_directory.native()},
+     .message = message
+    };
+   });
+  }
  }
  failure_line.clear();
 }
@@ -252,6 +294,7 @@ TrainProcessClient TrainProcessClient::launch(
   state.stdout_fd.reset(child.release_stdout_fd());
   state.setup_fd.reset(child.release_setup_error_fd());
   state.output_directory = request.output_dir;
+  state.diagnostics = options.diagnostics;
   state.source_catalog = mmltk::backend::models::rfdetr::training_source_catalog(request);
   state.status_dirty = true;
   state.progress_fd.reset(progress_descriptor(state.output_directory, state.progress_watch));
@@ -344,6 +387,12 @@ std::optional<TrainProcessProgress> TrainProcessClient::consume_progress() {
 }
 std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
  if (state_->progress_sequence == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("train progress sequence exhausted");
+ if (!state_->failure_cause.empty() && !state_->group_quiesced) {
+  auto failure = failure_text(state_->failure_cause);
+  TrainProcessProgress update{.progress = {.sequence = ++state_->progress_sequence, .status = "Training failed: " + failure}, .failure = std::move(failure)};
+  update.sources.catalog = state_->source_catalog;
+  return update;
+ }
  const auto progress = nlohmann::json::parse(bounded_file(state_->output_directory / "progress.json"), nullptr, false);
  const auto result = nlohmann::json::parse(bounded_file(state_->output_directory / "results.json"), nullptr, false);
  namespace r = mmltk::backend::models::rfdetr;
@@ -358,8 +407,11 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
    case r::TrainingPreparationStage::Runtime: status = "Preparing runtime"; break;
    case r::TrainingPreparationStage::Distributed: status = "Connecting training GPUs"; break;
    case r::TrainingPreparationStage::Dataset: status = "Preparing dataset and sampling plan"; break;
-   case r::TrainingPreparationStage::Model: status = "Initializing model and GPU weights"; break;
+   case r::TrainingPreparationStage::Model: status = "Constructing training model"; break;
    case r::TrainingPreparationStage::Optimizers: status = "Preparing optimizers and validation"; break;
+   case r::TrainingPreparationStage::Checkpoint: status = "Loading model checkpoint"; break;
+   case r::TrainingPreparationStage::Weights: status = "Loading GPU weights"; break;
+   case r::TrainingPreparationStage::Synchronization: status = "Synchronizing training GPUs and session"; break;
   }
   TrainProcessProgress update{.progress = {.sequence = ++state_->progress_sequence, .status = std::move(status)}};
   update.sources.catalog = state_->source_catalog;
@@ -425,7 +477,8 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
   .checkpoint_path = std::move(checkpoint),
   .metrics = std::move(metrics),
   .sources = std::move(sources),
-  .persistence = std::move(persistence)
+  .persistence = std::move(persistence),
+  .failure = state_->failure_cause.empty() ? std::string{} : failure_text(state_->failure_cause)
  };
 }
 std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* retained_output) {
@@ -465,37 +518,14 @@ std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* re
  if (setup) exit.error = bounded_error(mmltk::frameworks::process::format_child_setup_failure(*setup, "local training") + " (exit status " + std::to_string(exit.exit_code) + ")");
  if (setup)
   exit.outcome = TrainProcessExitOutcome::Failed;
- else if (state_->stop_requested)
+ else if (state_->stop_requested && state_->failure_cause.empty())
   exit.outcome = TrainProcessExitOutcome::Cancelled;
- else if (WIFEXITED(state_->wait_status) && WEXITSTATUS(state_->wait_status) == 0)
+ else if (WIFEXITED(state_->wait_status) && WEXITSTATUS(state_->wait_status) == 0 && state_->failure_cause.empty())
   exit.outcome = TrainProcessExitOutcome::Succeeded;
  else {
   exit.outcome = TrainProcessExitOutcome::Failed;
   exit.error = "local training " + (exit.signal_number != 0 ? "terminated by signal " + std::to_string(exit.signal_number) : "exited with status " + std::to_string(exit.exit_code));
-  if (!state_->failure_cause.empty()) {
-   std::string_view cause = state_->failure_cause;
-   const bool oom = cause.starts_with("CUDA out of memory");
-   if (oom) {
-    const auto advice = cause.find(" If reserved");
-    if (advice != std::string_view::npos) cause = cause.substr(0, advice);
-   }
-   exit.error += ": ";
-   while (!cause.empty()) {
-    const auto length = mmltk::common::types::utf8_prefix_length(cause);
-    if (length == 0U) {
-     exit.error += '?';
-     cause.remove_prefix(1U);
-     continue;
-    }
-    const auto byte = static_cast<unsigned char>(cause.front());
-    if (length == 1U && (byte < 32U || byte == 127U))
-     exit.error += ' ';
-    else
-     exit.error.append(cause.substr(0, length));
-    cause.remove_prefix(length);
-   }
-   if (oom) exit.error += " Reduce batch size or training lanes to lower GPU memory use, then start again.";
-  }
+  if (!state_->failure_cause.empty()) exit.error += ": " + failure_text(state_->failure_cause);
  }
  state_->terminal_consumed = true;
  state_->group = -1;

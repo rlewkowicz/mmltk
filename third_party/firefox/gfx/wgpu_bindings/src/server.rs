@@ -1213,6 +1213,16 @@ impl Drop for VkImageHandle {
     }
 }
 
+fn canvas_vk_error(status: vk::Result) -> ErrMsg {
+    ErrMsg {
+        message: format!("WebGPU canvas allocation failed: {status:?}").into(),
+        r#type: match status {
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY => ErrorType::OutOfMemory,
+            _ => ErrorType::Internal,
+        },
+    }
+}
+
 #[no_mangle]
 
 pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
@@ -1221,6 +1231,7 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
     width: u32,
     height: u32,
     out_memory_size: *mut u64,
+    out_error: *mut i32,
 ) -> *mut VkImageHandle {
     unsafe {
         let Some(hal_device) = global.device_as_hal::<wgc::api::Vulkan>(device_id) else {
@@ -1337,6 +1348,7 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
 
         let image = match device.create_image(&vk_info, None) {
             Err(err) => {
+                *out_error = err.as_raw();
                 let msg = CString::new(format!("create_image() failed: {:?}", err)).unwrap();
                 gfx_critical_note(msg.as_ptr());
                 return ptr::null_mut();
@@ -1399,10 +1411,19 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
             .push_next(&mut dedicated_memory_info)
             .push_next(&mut export_memory_alloc_info);
 
-        let memory = match device.allocate_memory(&memory_allocate_info, None) {
+        let allocation = if mmltk_canvas_allocation_failure(width, height) {
+            Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
+        } else {
+            device.allocate_memory(&memory_allocate_info, None)
+        };
+        let memory = match allocation {
             Err(err) => {
+                *out_error = err.as_raw();
                 let msg = CString::new(format!("allocate_memory() failed: {:?}", err)).unwrap();
                 gfx_critical_note(msg.as_ptr());
+                mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+                    "{{\"event\":\"firefox.canvas.allocation_failed\",\"width\":{width},\"height\":{height},\"memory_size\":{},\"vk_status\":{}}}",
+                    memory_req.size, err.as_raw()));
                 return ptr::null_mut();
             }
             Ok(memory) => memory,
@@ -1410,7 +1431,8 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
         image_handle.memory = memory;
 
         let result = device.bind_image_memory(image, memory, 0);
-        if result.is_err() {
+        if let Err(err) = result {
+            *out_error = err.as_raw();
             let msg = CString::new(format!("bind_image_memory() failed: {:?}", result)).unwrap();
             gfx_critical_note(msg.as_ptr());
             return ptr::null_mut();
@@ -1528,6 +1550,7 @@ extern "C" {
         height: u32,
         format: wgt::TextureFormat,
         usage: wgt::TextureUsages,
+        out_error: *mut i32,
     ) -> bool;
     fn wgpu_server_ensure_shared_texture_for_readback(
         parent: WebGPUParentPtr,
@@ -2112,6 +2135,19 @@ impl MmltkWorkspaceMailboxes {
 }
 
 static MMLTK_WORKSPACE_ACCEPTANCE_TRACE: OnceLock<bool> = OnceLock::new();
+
+// Packaged acceptance can fail one resized canvas allocation without consuming
+// the desktop's VRAM. Ordinary runs never read the fault setting.
+fn mmltk_canvas_allocation_failure(width: u32, height: u32) -> bool {
+    if !mmltk_workspace_acceptance_trace_enabled() { return false; }
+    static WIDTH: OnceLock<Option<u32>> = OnceLock::new();
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    let selected = WIDTH.get_or_init(|| std::env::var("MMLTK_TEST_CANVAS_OOM_WIDTH").ok()?.parse().ok());
+    if *selected != Some(width) || FIRED.swap(true, Ordering::Relaxed) { return false; }
+    mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+        "{{\"event\":\"firefox.canvas.allocation_fault\",\"width\":{width},\"height\":{height}}}"));
+    true
+}
 
 fn mmltk_workspace_acceptance_trace_enabled() -> bool {
     MMLTK_WORKSPACE_ACCEPTANCE_TRACE.get().copied().unwrap_or(false)
@@ -4775,8 +4811,25 @@ impl Global {
         texture_id: id::TextureId,
         desc: &wgc::resource::TextureDescriptor,
         swap_chain_id: Option<SwapChainId>,
+        error_buf: &mut OwnedErrorBuffer,
     ) -> bool {
+        // Keep partial imports owned until wgpu takes both Vulkan handles.
+        // In particular, allocating imported memory can fail under pressure.
+        struct PendingImage<'a> {
+            device: &'a ash::Device,
+            image: vk::Image,
+            memory: vk::DeviceMemory,
+        }
+        impl Drop for PendingImage<'_> {
+            fn drop(&mut self) {
+                unsafe {
+                    self.device.destroy_image(self.image, None);
+                    self.device.free_memory(self.memory, None);
+                }
+            }
+        }
         unsafe {
+            let mut export_error = vk::Result::SUCCESS.as_raw();
             let ret = wgpu_server_ensure_shared_texture_for_swap_chain(
                 self.owner,
                 swap_chain_id.unwrap(),
@@ -4786,8 +4839,12 @@ impl Global {
                 desc.size.height,
                 desc.format,
                 desc.usage,
+                &mut export_error,
             );
             if ret != true {
+                if export_error != vk::Result::SUCCESS.as_raw() {
+                    error_buf.init(canvas_vk_error(vk::Result::from_raw(export_error)), device_id);
+                }
                 let msg = c"Failed to create shared texture";
                 gfx_critical_note(msg.as_ptr());
                 return false;
@@ -4861,6 +4918,7 @@ impl Global {
 
             let image = match device.create_image(&vk_info, None) {
                 Err(err) => {
+                    error_buf.init(canvas_vk_error(err), device_id);
                     let msg = CString::new(format!(
                         "Failed to get vk::Image: create_image() failed: {:?}",
                         err
@@ -4872,6 +4930,7 @@ impl Global {
                 Ok(image) => image,
             };
 
+            let mut pending = PendingImage { device, image, memory: vk::DeviceMemory::null() };
             let memory_req = device.get_image_memory_requirements(image);
             if memory_req.size > vk_image_wrapper.memory_size {
                 let msg = c"Invalid memory size";
@@ -4883,7 +4942,7 @@ impl Global {
 
             let mut import_memory_fd_info = vk::ImportMemoryFdInfoKHR::default()
                 .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-                .fd(owned_fd.into_raw_fd());
+                .fd(owned_fd.as_raw_fd());
 
             let memory_allocate_info = vk::MemoryAllocateInfo::default()
                 .allocation_size(vk_image_wrapper.memory_size)
@@ -4893,6 +4952,7 @@ impl Global {
 
             let memory = match device.allocate_memory(&memory_allocate_info, None) {
                 Err(err) => {
+                    error_buf.init(canvas_vk_error(err), device_id);
                     let msg = CString::new(format!(
                         "Failed to get vk::Image: allocate_memory() failed: {:?}",
                         err
@@ -4903,10 +4963,14 @@ impl Global {
                 }
                 Ok(memory) => memory,
             };
+            // Vulkan takes the descriptor only when allocation succeeds.
+            let _ = owned_fd.into_raw_fd();
+            pending.memory = memory;
 
             match device.bind_image_memory(image, memory, 0) {
                 Ok(()) => {}
                 Err(err) => {
+                    error_buf.init(canvas_vk_error(err), device_id);
                     let msg = CString::new(format!(
                         "Failed to get vk::Image: bind_image_memory() failed: {:?}",
                         err
@@ -4938,6 +5002,8 @@ impl Global {
                 None,
                 wgh::vulkan::TextureMemory::Dedicated(memory),
             );
+            pending.image = vk::Image::null();
+            pending.memory = vk::DeviceMemory::null();
             // The swap chain recycles DMA-BUF storage under fresh image IDs.
             // A new UNDEFINED image still aliases the preceding canvas, whose
             // final use can be a snapshot copy rather than a render attachment.
@@ -4953,10 +5019,10 @@ impl Global {
                 Some(texture_id),
             );
             if let Some(err) = error {
-                let msg =
-                    CString::new(format!("create_texture_from_hal() failed: {:?}", err)).unwrap();
-                gfx_critical_note(msg.as_ptr());
-                return false;
+                error_buf.init(err, device_id);
+                // create_texture_from_hal registered this ID, including on
+                // failure. A fallback must not register the same ID again.
+                return true;
             }
 
             if mmltk_workspace_channel::workspace_diagnostics_enabled() {
@@ -5167,8 +5233,16 @@ impl Global {
                             id,
                             &desc,
                             swap_chain_id,
+                            error_buf,
                         );
                         if is_created {
+                            return;
+                        }
+                        if error_buf.get_inner_data().is_some() {
+                            // Memory pressure is not a capability negotiation.
+                            // Register the failed frame once and report it;
+                            // allocating readback resources would compound it.
+                            self.create_texture_error(device_id, Some(id), &desc);
                             return;
                         }
                     }

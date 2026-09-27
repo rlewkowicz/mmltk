@@ -1007,9 +1007,36 @@ class TranscriptContext:
         self.active_run = None
         self.capture = 0
         self.last_timestamp = None
+        self.catch_header = None
+        self.catch_candidate = ""
 
     def decorate(self, record, metadata, anchors):
         event = record.get("@event")
+        # Catch's stderr report may arrive after the next stdout RUN record.
+        # Its dashed title and source location identify the actual failing test.
+        if event in TEST_EVENTS:
+            self.catch_header = None
+            self.catch_candidate = ""
+        elif record.format in ("text", "transcript"):
+            clean = ANSI.sub("", record.raw)
+            text = clean.strip()
+            if re.fullmatch(r"-{20,}", text):
+                if self.catch_header is None:
+                    self.catch_header = []
+                else:
+                    self.catch_candidate = " ".join(self.catch_header)
+                    self.catch_header = None
+            elif self.catch_header is not None:
+                if not clean[:1].isspace() and text:
+                    self.catch_header.append(text)
+                if len(self.catch_header) > 16 or sum(map(len, self.catch_header)) > 2048:
+                    self.catch_header = None
+                    self.catch_candidate = ""
+            elif self.catch_candidate:
+                if re.fullmatch(r".+:\d+", text):
+                    self.test = self.catch_candidate
+                    self.tap_test = False
+                self.catch_candidate = ""
         if event == "catch.filters":
             self.tags = re.findall(r"\[([^]]+)\]", record.data["filters"])
         if event in TEST_EVENTS or event == "libtest.output":

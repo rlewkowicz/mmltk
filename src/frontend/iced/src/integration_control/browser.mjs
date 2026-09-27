@@ -28,6 +28,7 @@ export function mmltkIntegrationInitialize(enabled) {
       }
       const retired = integrationState;
       integrationState = undefined;
+      delete window.mmltkIntegrationRecovery;
       for (const complete of retired.completions) complete('invalidated', 0, 0);
     }
     return;
@@ -60,6 +61,14 @@ export function mmltkIntegrationInitialize(enabled) {
     onInput: undefined,
   };
   const owner = integrationState;
+  window.mmltkIntegrationRecovery = (message, manual) => {
+    if (integrationState !== owner) return;
+    const overlay = document.getElementById('mmltk-recovery');
+    const button = document.getElementById('mmltk-recovery-button');
+    report({event: 'integration.graphics.recovery', detail: message, manual,
+      visible: !!overlay && !overlay.hidden && getComputedStyle(overlay).display !== 'none',
+      reload: !!button && !button.hidden && getComputedStyle(button).display !== 'none'});
+  };
   integrationState.onInput = (event) => {
     if (integrationState !== owner) return;
     ++owner.statusInput;

@@ -17,7 +17,7 @@ UniquePtr<SharedTextureDMABuf> SharedTextureDMABuf::Create(
     WebGPUParent* aParent, const ffi::WGPUDeviceId aDeviceId,
     const uint32_t aWidth, const uint32_t aHeight,
     const struct ffi::WGPUTextureFormat aFormat,
-    const ffi::WGPUTextureUsages aUsage) {
+    const ffi::WGPUTextureUsages aUsage, int32_t* aOutError) {
   if (aFormat.tag != ffi::WGPUTextureFormat_Bgra8Unorm) {
     gfxCriticalNoteOnce << "Non supported format: " << aFormat.tag;
     return nullptr;
@@ -26,7 +26,7 @@ UniquePtr<SharedTextureDMABuf> SharedTextureDMABuf::Create(
   auto* context = aParent->GetContext();
   uint64_t memorySize = 0;
   ffi::WGPUVkImageHandle* vkImage = wgpu_vkimage_create_with_dma_buf(
-      context, aDeviceId, aWidth, aHeight, &memorySize);
+      context, aDeviceId, aWidth, aHeight, &memorySize, aOutError);
   if (!vkImage) {
     gfxCriticalNoteOnce << "Failed to create VkImage";
     return nullptr;
@@ -103,6 +103,9 @@ void SharedTextureDMABuf::CleanForRecycling() {
 
 Maybe<layers::SurfaceDescriptor> SharedTextureDMABuf::ToSurfaceDescriptor() {
   MOZ_ASSERT(mSubmissionIndex > 0);
+  if (mSemaphoreFds.IsEmpty()) {
+    return Nothing();
+  }
 
   layers::SurfaceDescriptor sd;
   if (!mSurface->Serialize(sd)) {
@@ -167,22 +170,23 @@ const ffi::WGPUVkImageHandle* SharedTextureDMABuf::GetHandle() {
   return mVkImageHandle->Get();
 }
 
-void SharedTextureDMABuf::onBeforeQueueSubmit(RawId aQueueId) {
-  SharedTexture::onBeforeQueueSubmit(aQueueId);
+bool SharedTextureDMABuf::onBeforeQueueSubmit(RawId aQueueId) {
+  // A failed new submission must not reuse a preceding completion fence.
+  mSubmissionIndex = 0;
   if (!mParent) {
-    return;
+    return false;
   }
 
   auto* context = mParent->GetContext();
   if (!context) {
-    return;
+    return false;
   }
 
   ffi::WGPUVkSemaphoreHandle* vkSemaphore =
       wgpu_vksemaphore_create_signal_semaphore(context, aQueueId);
   if (!vkSemaphore) {
     gfxCriticalNoteOnce << "Failed to create VkSemaphore";
-    return;
+    return false;
   }
   auto handle = MakeUnique<VkSemaphoreHandle>(vkSemaphore);
 
@@ -190,12 +194,13 @@ void SharedTextureDMABuf::onBeforeQueueSubmit(RawId aQueueId) {
       wgpu_vksemaphore_get_file_descriptor(context, mDeviceId, vkSemaphore);
   if (rawFd < 0) {
     gfxCriticalNoteOnce << "Failed to get fd from VkSemaphore";
-    return;
+    return false;
   }
 
   mVkSemaphoreHandles.AppendElement(std::move(handle));
   mSemaphoreFds.AppendElement(
       new gfx::FileHandleWrapper(UniqueFileHandle(rawFd)));
+  return true;
 }
 
 }  

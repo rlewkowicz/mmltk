@@ -3,6 +3,7 @@
 #include <cuda.h>
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -138,6 +139,7 @@ struct CompiledImageStream::Impl {
   bool reading = false;
   std::size_t read_callbacks = 0U;
   std::size_t callbacks = 0U;
+  std::size_t transfer_callbacks = 0U;
   bool read = false;
   bool host_materialized = false;
   std::exception_ptr read_failure;
@@ -150,35 +152,46 @@ struct CompiledImageStream::Impl {
  };
  struct Completion {
   std::size_t slot = 0;
-  bool consumer = false;
   CompletionObserver observer;
+ };
+ struct CompletionQueue {
+  std::vector<Completion> jobs;
+  std::size_t head = 0, queued = 0, active = 0;
+  bool started = false;
+  std::thread worker;
+  [[nodiscard]] bool idle() const noexcept { return queued == 0U && active == 0U; }
  };
  explicit Impl(Config selected)
      : config(std::move(selected)),
        execution(config.execution ? *config.execution : gpu::resolve_device_execution(config.device, mmltk::common::system::NumaTopology::Capture(), config.loading.numa_node, config.cpu_affinity)),
        cpus(execution.placement.cpus),
-       pool(std::make_unique<mmltk::common::concurrency::WorkerPool>(config.workers, cpus, "compiled-read", config.slots, &execution.placement, true)),
+       private_pool(!config.reader_pool),
+       pool(config.reader_pool ? config.reader_pool : std::make_shared<mmltk::common::concurrency::WorkerPool>(config.workers, cpus, "compiled-read", config.slots, &execution.placement, true)),
        slots(config.slots),
-       devices(config.slots),
-       completions(config.slots * 2) {
+       devices(config.slots) {
   if (execution.device != config.device || (config.loading.numa_node >= 0 && config.loading.numa_node != execution.placement.numa_node))
    throw std::invalid_argument("compiled stream placement contradicts selected GPU/NUMA node");
-  for (std::size_t worker = 0; worker < pool->size(); ++worker)
+  for (std::size_t worker = 0; worker < pool->size(); ++worker) {
+   const auto& policy = pool->policy(worker);
+   if (policy.numa_node != execution.placement.numa_node || policy.affinity.empty() || !std::ranges::all_of(policy.affinity, [&](const int cpu) { return std::ranges::find(cpus, cpu) != cpus.end(); }))
+    throw std::invalid_argument("compiled reader pool contradicts selected CPU/NUMA placement");
    mmltk::common::logging::debug([&](auto& log) {
-    const auto& policy = pool->policy(worker);
     log.debug(
      "event=execution.placement owner=compiled-read device={} pci={} node={} eligible={} worker={} "
      "cpu={} nice={} scheduler={} io_class={} io_priority={}",
      execution.device, execution.pci_identity, execution.placement.numa_node, mmltk::common::system::format_cpu_list(cpus), worker, policy.affinity.front(), policy.nice_value, policy.scheduler_policy,
      policy.io_class, policy.io_priority_data);
    });
+  }
   for (auto& slot : slots) slot = std::make_unique<Slot>(execution.placement);
   for (auto& device : devices) device = std::make_unique<Buffer>(false, nullptr, !config.loading.h2d_dataloader);
+  for (auto& queue : completions) queue.jobs.resize(config.slots);
  }
  Config config;
  gpu::DeviceExecution execution;
  std::vector<int> cpus;
- std::unique_ptr<mmltk::common::concurrency::WorkerPool> pool;
+ bool private_pool;
+ std::shared_ptr<mmltk::common::concurrency::WorkerPool> pool;
  std::vector<std::unique_ptr<Slot>> slots;
  std::vector<std::unique_ptr<Buffer>> devices;
  CUcontext context = nullptr;
@@ -187,28 +200,27 @@ struct CompiledImageStream::Impl {
  std::mutex mutex;
  std::mutex submission;
  std::condition_variable changed;
- std::vector<Completion> completions;
- std::size_t head = 0, queued = 0, active = 0;
- std::size_t consumers = 0U;
+ // Upload completion never waits behind a consumer on an unrelated stream.
+ // Each queue retains at most one pending event per physical slot.
+ std::array<CompletionQueue, 2> completions;
  bool stopping = false;
  std::exception_ptr failure;
  bool completion_failed = false;
- bool completion_started = false;
- std::thread completion_worker;
  void enqueue(const std::size_t index, const bool consumer, cudaStream_t stream, CompletionObserver observer) {
   std::lock_guard lock(mutex);
   if (failure) std::rethrow_exception(failure);
   auto& slot = *slots.at(index);
   auto& pending = consumer ? slot.consumer_pending : slot.transfer_pending;
-  if (stopping || pending || queued == completions.size()) throw std::logic_error("compiled image completion capacity unavailable");
+  auto& queue = completions[consumer];
+  if (stopping || pending || queue.queued == queue.jobs.size()) throw std::logic_error("compiled image completion capacity unavailable");
   const auto record = consumer ? config.record_consumer : &cudaEventRecord;
   gpu::ensure_cuda_ok(record(consumer ? slot.consumer : slot.transfer, stream), "compiled image completion event");
-  completions[(head + queued) % completions.size()] = {index, consumer, observer};
+  queue.jobs[(queue.head + queue.queued) % queue.jobs.size()] = {index, observer};
   pending = true;
   ++slot.callbacks;
-  if (consumer) ++consumers;
+  if (!consumer) ++slot.transfer_callbacks;
   if (slot.unfenced && slot.unfenced_stream == stream) slot.unfenced = false;
-  ++queued;
+  ++queue.queued;
   changed.notify_all();
  }
  void settle_unfenced(Slot& slot) {
@@ -225,30 +237,34 @@ struct CompiledImageStream::Impl {
  void settle_unfenced() {
   for (auto& slot : slots) settle_unfenced(*slot);
  }
- void complete_loop() noexcept {
+ void complete_loop(const bool consumer) noexcept {
+  auto& queue = completions[consumer];
   try {
-   (void)mmltk::common::system::apply_worker_execution_policy({cpus, "compiled-done", config.workers, execution.placement.numa_node, -10, false});
+   (void)mmltk::common::system::apply_worker_execution_policy({cpus, consumer ? "compiled-retire" : "compiled-upload", config.workers + consumer, execution.placement.numa_node, -10, false});
    gpu::ensure_cuda_driver_ok(cuCtxSetCurrent(context), "compiled image completion worker context");
    {
     std::lock_guard lock(mutex);
-    completion_started = true;
+    queue.started = true;
    }
    changed.notify_all();
    for (;;) {
     Completion job;
     {
      std::unique_lock lock(mutex);
-     changed.wait(lock, [&] { return stopping || queued != 0; });
-     if (queued == 0) return;
-     job = completions[head];
-     head = (head + 1) % completions.size();
-     --queued;
-     ++active;
+     changed.wait(lock, [&] { return stopping || queue.queued != 0; });
+     if (queue.queued == 0) return;
+     job = queue.jobs[queue.head];
+     queue.head = (queue.head + 1) % queue.jobs.size();
+     --queue.queued;
+     ++queue.active;
+     // Retain this slot's observer order even though unrelated uploads can
+     // now finish while this worker waits for a consumer's physical event.
+     if (consumer) changed.wait(lock, [&] { return slots[job.slot]->transfer_callbacks == 0U; });
     }
     std::exception_ptr error;
     try {
      const auto& slot = *slots[job.slot];
-     gpu::ensure_cuda_ok(cudaEventSynchronize(job.consumer ? slot.consumer : slot.transfer), "compiled image GPU completion");
+     gpu::ensure_cuda_ok(cudaEventSynchronize(consumer ? slot.consumer : slot.transfer), "compiled image GPU completion");
     } catch (...) { error = std::current_exception(); }
     {
      std::lock_guard lock(mutex);
@@ -257,7 +273,7 @@ struct CompiledImageStream::Impl {
       if (!failure) failure = error;
      }
      auto& slot = *slots[job.slot];
-     (job.consumer ? slot.consumer_pending : slot.transfer_pending) = false;
+     (consumer ? slot.consumer_pending : slot.transfer_pending) = false;
     }
     // This is an ordinary system-owned worker, never a CUDA host
     // callback. Context errors still deliver a terminal notification.
@@ -265,27 +281,27 @@ struct CompiledImageStream::Impl {
     {
      std::lock_guard lock(mutex);
      --slots[job.slot]->callbacks;
-     if (job.consumer) --consumers;
-     --active;
+     if (!consumer) --slots[job.slot]->transfer_callbacks;
+     --queue.active;
     }
     changed.notify_all();
    }
   } catch (...) {
    std::unique_lock lock(mutex);
-   failure = std::current_exception();
-   completion_failed = queued != 0 || active != 0;
-   while (queued != 0) {
-    const auto job = completions[head];
-    head = (head + 1) % completions.size();
-    --queued;
+   if (!failure) failure = std::current_exception();
+   completion_failed |= !queue.idle();
+   while (queue.queued != 0) {
+    const auto job = queue.jobs[queue.head];
+    queue.head = (queue.head + 1) % queue.jobs.size();
+    --queue.queued;
     auto& slot = *slots[job.slot];
-    (job.consumer ? slot.consumer_pending : slot.transfer_pending) = false;
+    (consumer ? slot.consumer_pending : slot.transfer_pending) = false;
     const auto error = failure;
     lock.unlock();
     if (job.observer.complete) job.observer.complete(job.observer.context, job.slot, error);
     lock.lock();
     --slot.callbacks;
-    if (job.consumer) --consumers;
+    if (!consumer) --slot.transfer_callbacks;
    }
    changed.notify_all();
   }
@@ -328,15 +344,16 @@ void CompiledImageStream::bind_current_context() {
     gpu::ensure_cuda_ok(cudaEventCreateWithFlags(event, cudaEventDisableTiming | cudaEventBlockingSync), "compiled image stream event allocation");
   }
   if (impl_->config.loading.h2d_dataloader) gpu::ensure_cuda_ok(gpu::cuda_stream_create_with_highest_priority(&impl_->copy, cudaStreamNonBlocking), "compiled image copy stream");
-  impl_->completion_worker = std::thread([this] { impl_->complete_loop(); });
+  for (const bool consumer : {false, true}) impl_->completions[consumer].worker = std::thread([this, consumer] { impl_->complete_loop(consumer); });
   {
    std::unique_lock lock(impl_->mutex);
-   impl_->changed.wait(lock, [&] { return impl_->completion_started || impl_->failure; });
+   impl_->changed.wait(lock, [&] { return std::ranges::all_of(impl_->completions, &Impl::CompletionQueue::started) || impl_->failure; });
    if (impl_->failure) std::rethrow_exception(impl_->failure);
   }
   impl_->initialized = true;
  } catch (...) {
-  impl_->failure = std::current_exception();
+  std::lock_guard lock(impl_->mutex);
+  if (!impl_->failure) impl_->failure = std::current_exception();
   throw;
  }
 }
@@ -368,20 +385,22 @@ void CompiledImageStream::stop_workers() {
  }
  cancel_reads();
  if (impl_->pool) {
-  // All stream read tasks catch their failures. Detached failures in
-  // unrelated catalog tasks still join through WorkerPool destruction.
+  // Shared pools retain unrelated work. A private pool also settles external
+  // catalog tasks before its final owner releases the workers.
   std::exception_ptr failure;
   try {
-   impl_->pool->wait_idle();
+   wait_reads();
   } catch (...) { failure = std::current_exception(); }
   impl_->pool.reset();
+  impl_->config.reader_pool.reset();
   if (failure) {
    std::lock_guard lock(impl_->mutex);
    if (!impl_->failure) impl_->failure = failure;
   }
  }
  impl_->changed.notify_all();
- if (impl_->completion_worker.joinable()) impl_->completion_worker.join();
+ for (auto& queue : impl_->completions)
+  if (queue.worker.joinable()) queue.worker.join();
 }
 void CompiledImageStream::close() {
  stop_workers();
@@ -513,6 +532,10 @@ void CompiledImageStream::read_slot(const std::size_t index) noexcept {
  mmltk::common::logging::ScopedProfile profile{"compiled.stream.read"};
  try {
   if (!current.cancelled.load(std::memory_order_acquire) && (!observer.before || observer.before(observer.context, index))) {
+   // The compiled layout fixes source offsets in index order. Keep every
+   // logical occurrence and its destination, reusing only this slot's inventory.
+   // Sequential batches avoid sorting and retain their coalesced gather copy.
+   if (!std::ranges::is_sorted(current.reads, {}, &CompiledImageRead::index)) std::ranges::sort(current.reads, {}, &CompiledImageRead::index);
    if (impl_->config.loading.h2d_dataloader) {
     read = source.read_images(current.reads, {static_cast<std::byte*>(current.host.data()), current.host.capacity_bytes()}, current.cancelled, impl_->config.prefault);
    } else {
@@ -551,8 +574,10 @@ void CompiledImageStream::read_slot(const std::size_t index) noexcept {
  {
   std::lock_guard lock(impl_->mutex);
   --current.read_callbacks;
+  // A shared pool's owner may retire this stream as soon as its last callback
+  // completes. Notify before releasing the lock and make no later owner access.
+  impl_->changed.notify_all();
  }
- impl_->changed.notify_all();
 }
 void CompiledImageStream::cancel_reads() noexcept {
  for (auto& slot : impl_->slots) slot->cancelled.store(true, std::memory_order_release);
@@ -563,7 +588,13 @@ void CompiledImageStream::cancel_read(const std::size_t index) noexcept {
  impl_->changed.notify_all();
 }
 void CompiledImageStream::wait_reads() {
- if (impl_->pool) impl_->pool->wait_idle();
+ if (!impl_->pool) return;
+ if (impl_->private_pool) {
+  impl_->pool->wait_idle();
+  return;
+ }
+ std::unique_lock lock(impl_->mutex);
+ impl_->changed.wait(lock, [&] { return std::ranges::all_of(impl_->slots, [](const auto& slot) { return !slot->reading && slot->read_callbacks == 0; }); });
 }
 bool CompiledImageStream::wait_read(const std::size_t index) {
  std::unique_lock lock(impl_->mutex);
@@ -612,7 +643,7 @@ void CompiledImageStream::fence(const std::size_t slot, void* stream, Completion
 }
 void CompiledImageStream::wait_consumers() {
  std::unique_lock lock(impl_->mutex);
- impl_->changed.wait(lock, [&] { return impl_->consumers == 0U; });
+ impl_->changed.wait(lock, [&] { return impl_->completions[1].idle(); });
  if (impl_->failure) std::rethrow_exception(impl_->failure);
 }
 void CompiledImageStream::synchronize(const std::size_t index) {
@@ -628,7 +659,7 @@ void CompiledImageStream::synchronize() {
  wait_reads();
  if (impl_->context) on_context(impl_->context, [&] { impl_->settle_unfenced(); });
  std::unique_lock lock(impl_->mutex);
- impl_->changed.wait(lock, [&] { return impl_->queued == 0 && impl_->active == 0; });
+ impl_->changed.wait(lock, [&] { return std::ranges::all_of(impl_->completions, &Impl::CompletionQueue::idle); });
  if (impl_->failure) std::rethrow_exception(impl_->failure);
 }
 std::weak_ptr<const void> CompiledImageStream::storage_custody() const noexcept { return impl_; }
@@ -637,7 +668,7 @@ int CompiledImageStream::reset_storage() noexcept {
  {
   std::lock_guard lock(impl_->mutex);
   if (impl_->completion_failed) return cudaErrorUnknown;
-  if (impl_->queued != 0 || impl_->active != 0 ||
+  if (!std::ranges::all_of(impl_->completions, &Impl::CompletionQueue::idle) ||
       std::ranges::any_of(impl_->slots, [](const auto& slot) { return slot->reading || slot->transfer_pending || slot->consumer_pending || slot->unfenced; }))
    return cudaErrorNotReady;
  }

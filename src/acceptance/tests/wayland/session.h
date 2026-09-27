@@ -98,6 +98,8 @@ private:
  bool pressure_entered_ = false;
  bool browser_failed_ = false;
  bool display_adapter_seen_ = false;
+ bool canvas_allocation_failed_ = false;
+ bool graphics_recovery_visible_ = false;
  std::set<std::string> workflow_steps_;
  std::set<std::string> workflow_pixels_;
 };

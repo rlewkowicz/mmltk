@@ -259,8 +259,12 @@ and error modals. Static help and validation rules remain local. Diagnostics
 retain separate opt-in detailed evidence and do not drive product state.
 
 The browser's [emergency recovery page](../src/frontend/iced/index.html) remains
-available when Iced cannot render. It allows one automatic reload per failure
-episode and then manual recovery; a healthy interval clears that episode.
+available when Iced cannot render. Asynchronous WebGPU errors stop further
+canvas configuration and rendering, preserving the first failure. GPU memory
+exhaustion shows a manual reload button immediately: native work continues,
+and the user can free GPU memory before retrying. Other device failures allow
+one automatic reload per failure episode and then manual recovery; a healthy
+interval clears that episode.
 Its session-storage counter is separate from the nonpersistent notice store.
 
 ## Shared form expansion and dividers

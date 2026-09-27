@@ -51,7 +51,9 @@ public:
  [[nodiscard]] std::span<const LabelIndexEntry> label_index() const noexcept;
  [[nodiscard]] const float* pixel_blob() const noexcept;
  // Called only by image-stream I/O workers. Each advised/populated range is
- // bounded; successful advice does not replace the actual gather copy.
+ // bounded; successful advice does not replace the actual gather copy. Source
+ // runs across this admitted batch are advised before gathering, independently
+ // of destination adjacency. Source-ordered inventories maximize coalescing.
  struct ImageDestination {
   void* context;
   std::size_t capacity;

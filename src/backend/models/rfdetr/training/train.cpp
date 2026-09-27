@@ -202,7 +202,12 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   // The launcher selects local GPUs and shares these exact files. Agree the
   // complete inode/version identity, then require it unchanged after admission;
   // do not reread every compiled pixel on every rank to calculate a digest.
-  std::vector<std::pair<std::filesystem::path, mmltk::common::io::FileSnapshot>> admitted_files;
+  struct AdmittedFile final {
+   std::filesystem::path path;
+   mmltk::common::io::FileSnapshot snapshot;
+   std::shared_ptr<const mmltk::backend::data::CompiledDataset> dataset;
+  };
+  std::vector<AdmittedFile> admitted_files;
   {
    admitted_files.reserve(5);
    for (const auto& [role, path] : std::array{
@@ -216,7 +221,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
       template for (constexpr auto field : std::define_static_array(std::meta::nonstatic_data_members_of(^^Snapshot, std::meta::access_context::current()))) signature << value.[:field:] << ':';
      }(snapshot);
      agree_training_text(distributed, role, signature.str());
-     admitted_files.emplace_back(path, snapshot);
+     // Loader configuration resolves relative paths before opening its source.
+     admitted_files.push_back({std::filesystem::absolute(path), snapshot, {}});
     }
    }
   }
@@ -231,12 +237,29 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   const auto rank_slice = training_rank_slice(options.batch_size, distributed.rank, distributed.world_size);
   const std::size_t local_batch_size = rank_slice.count;
   ScopedRuntimeContext worker_scope(&train_runtime);
-  auto make_loader_config_for = [&](const std::filesystem::path& compiled_path, size_t loader_batch_size, bool shuffle, int prefetch_factor, bool shard_batches, bool drop_last) {
-   auto config = make_loader_config(compiled_path.string(), loader_batch_size, shuffle, prefetch_factor, train_runtime.split().gather_threads, train_runtime.loader_affinity_string(),
+  std::shared_ptr<mmltk::common::concurrency::WorkerPool> reader_pool;
+  auto make_loader_config_for = [&](const std::filesystem::path& compiled_path, size_t loader_batch_size, int prefetch_factor, bool shard_batches, bool drop_last) {
+   auto config = make_loader_config(compiled_path.string(), loader_batch_size, false, prefetch_factor, train_runtime.split().gather_threads, train_runtime.loader_affinity_string(),
     options.device_id, static_cast<uint64_t>(options.seed));
    config.loading = options;
    config.execution = train_runtime.execution();
    config.execution->placement.cpus = train_runtime.loader_cpus();
+   config.reader_pool = reader_pool;
+   const auto admitted = std::ranges::find(admitted_files, std::filesystem::path(config.compiled_path), &AdmittedFile::path);
+   if (admitted == admitted_files.end()) throw std::logic_error("training source lacks admitted file metadata");
+   if (!admitted->dataset) {
+    // Different path spellings and hard links may select the same immutable
+    // file. Every trajectory and evaluation loader borrows that one mapping.
+    const auto shared = std::ranges::find_if(admitted_files, [&](const auto& file) { return file.dataset && file.snapshot == admitted->snapshot; });
+    using Dataset = mmltk::backend::data::CompiledDataset;
+    // Training uses explicit randomly drawn schedules, irrespective of the
+    // loader's legacy shuffle switch. Preserve that policy for evaluation aliases
+    // of the same admitted file; distinct evaluation sources stay sequential.
+    const auto training = std::ranges::find(admitted_files, std::filesystem::absolute(options.train_compiled_path), &AdmittedFile::path);
+    const auto access = admitted->snapshot == training->snapshot ? Dataset::AccessPattern::Random : Dataset::AccessPattern::Sequential;
+    admitted->dataset = shared != admitted_files.end() ? shared->dataset : std::make_shared<const Dataset>(Dataset::open(admitted->path, access));
+   }
+   config.source = admitted->dataset;
    config.drop_last = drop_last;
    if (distributed.enabled && shard_batches) {
     config.batch_shard_rank = static_cast<uint32_t>(distributed.rank);
@@ -246,8 +269,10 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   };
   const size_t val_batch_size = options.val_batch_size > 0 ? options.val_batch_size : options.batch_size;
   preparation.Stage(TrainingPreparationStage::Dataset);
+  reader_pool = std::make_shared<mmltk::common::concurrency::WorkerPool>(std::max(1, train_runtime.split().gather_threads), train_runtime.loader_cpus(), "rfdetr-read",
+   static_cast<std::size_t>(options.prefetch_factor) * (options.lane_configuration.models.size() + 3U), &placement, true);
   auto admission_loader =
-   std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.train_compiled_path, std::max<std::size_t>(1, local_batch_size), false, options.prefetch_factor, false, true));
+   std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.train_compiled_path, std::max<std::size_t>(1, local_batch_size), options.prefetch_factor, false, true));
   auto& train_loader = *admission_loader;
   TrainingDataPlan data_plan(train_loader, options);
   // Admit every logical model before training publishes or updates any state.
@@ -255,7 +280,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   for (std::size_t model_index = 1; model_index < data_plan.shards().size(); ++model_index) (void)data_plan.epoch(model_index, 0);
   std::unique_ptr<mmltk::backend::data::DatasetLoader> val_loader;
   if (main_process) {
-   val_loader = std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.val_compiled_path, val_batch_size, false, options.prefetch_factor, false, false));
+   val_loader = std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.val_compiled_path, val_batch_size, options.prefetch_factor, false, false));
   }
   const std::uint32_t val_max_instances = val_loader ? val_loader->max_instances_per_image() : mmltk::backend::data::inspect_compiled_dataset(options.val_compiled_path).max_instances_per_image;
   std::optional<mmltk::backend::data::CompiledDatasetInfo> test_info;
@@ -275,7 +300,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
    if (!main_process) resumed.emplace(options.resume_path);
    if (resumed->plan().plan_hash != data_plan.hash() || resumed->plan().shards != data_plan.shards()) throw std::runtime_error("resume data plan differs from compiled membership");
   }
-  preparation.Stage(TrainingPreparationStage::Model);
+  preparation.Stage(TrainingPreparationStage::Checkpoint);
   const auto source_checkpoint = resumed ? std::filesystem::canonical(options.resume_path).parent_path() / resumed->manifest().models.front().path : options.weights_path;
   if (train_loader.image_width() != train_loader.image_height()) throw std::runtime_error("train compiled RF-DETR input must be square");
   std::optional<ResolvedModelState> transferred;
@@ -365,9 +390,11 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   resolved_signature << encode_class_layout(artifacts.class_layout);
   agree_training_text(distributed, "resolved-model", resolved_signature.str());
   agree_training_text(distributed, "data-plan", std::to_string(data_plan.hash()) + ":" + std::to_string(epoch_draws.microbatches));
+  preparation.Stage(TrainingPreparationStage::Model);
   auto common = std::make_shared<NativeRfDetrModel>(artifacts.config, artifacts.class_layout);
   common->initialize_training_supervision(static_cast<std::uint64_t>(options.seed));
   agree_model_inventory(distributed, *common, "initialized-cpu-inventory");
+  preparation.Stage(TrainingPreparationStage::Weights);
   common->to(mmltk::backend::ml::cuda::cuda_device(options.device_id));
   if (!resumed) {
    const auto loaded = load_training_model_weights(*common, transferred->model_state, supervision_route(options.training_supervision));
@@ -382,6 +409,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     });
    }
   }
+  preparation.Stage(TrainingPreparationStage::Synchronization);
   broadcast_training_model(distributed, *common);
   const auto precision = agree_training_precision(distributed, options.device_id, options.amp, options.fused_optimizer);
   if (main_process)
@@ -411,9 +439,9 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   const auto source_fingerprint = [&](const mmltk::backend::data::DatasetLoader* loader) {
    if (!main_process) return std::string{};
    const auto& source = *loader->compiled_source();
-   const auto admitted = std::ranges::find(admitted_files, source.path(), [](const auto& entry) -> const auto& { return entry.first; });
+   const auto admitted = std::ranges::find(admitted_files, source.path(), &AdmittedFile::path);
    if (admitted == admitted_files.end()) throw std::logic_error("training source lacks admitted file metadata");
-   return training_dataset_identity(source.header(), admitted->second, resolved_signature.str());
+   return training_dataset_identity(source.header(), admitted->snapshot, resolved_signature.str());
   };
   // The compiled header and admitted file generation already identify each
   // source. Starting training must not scan image or mask payloads for a hash.
@@ -450,8 +478,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     // seeds are used only by each trajectory's immutable logical data identities.
     auto native = index == 0 ? common : make_train_lane_model(*common, options.device_id);
     native->configure_supervision_timing(SupervisionTimingSetup{mmltk::backend::ml::cuda::cuda_device(options.device_id), admitted_microbatches, mmltk::common::logging::profile_enabled()});
-    auto loader_config = make_loader_config_for(options.train_compiled_path, std::max<std::size_t>(1, local_batch_size), false, options.prefetch_factor, false, true);
-    loader_config.source = train_loader.compiled_source();
+    auto loader_config = make_loader_config_for(options.train_compiled_path, std::max<std::size_t>(1, local_batch_size), options.prefetch_factor, false, true);
     auto loader = index == 0 ? std::move(admission_loader) : std::make_unique<mmltk::backend::data::DatasetLoader>(loader_config);
     models.push_back(std::make_unique<TrainingModel>(options, index, train_runtime, std::move(loader), std::move(native), data_plan, distributed, precision, detection, report_failure));
     if (resumed) {
@@ -459,7 +486,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
      if (const auto& best = resumed->manifest().models[index].best) models.back()->remember_candidate(TrainingArtifactCandidate{*best, resumed->best_admission(index)});
     }
    }
-   for (const auto& [path, snapshot] : admitted_files) snapshot.RequireUnchanged(path);
+   for (const auto& file : admitted_files) file.snapshot.RequireUnchanged(file.path);
    if (resumed) resumed->require_unchanged();
    // No live model/optimizer commit occurs until every trajectory passed staging.
    for (auto& trajectory : models) {
@@ -734,7 +761,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     };
     result.selected = select_training_artifact(candidates, effective_final_policy(options.lane_configuration), detection.include_masks, options.output_dir, evaluate_native);
     if (!options.test_compiled_path.empty()) {
-     auto test_loader = std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.test_compiled_path, val_batch_size, false, options.prefetch_factor, false, false));
+     auto test_loader = std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.test_compiled_path, val_batch_size, options.prefetch_factor, false, false));
      validate_loader(*test_loader, "test");
      TrainingValidationRuntime test(options, train_runtime, std::move(test_loader), val_batch_size, false, detection.include_masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox,
       artifacts.config.num_select, "test", dataset_limits.automatic);

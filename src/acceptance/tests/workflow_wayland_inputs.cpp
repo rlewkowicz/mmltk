@@ -107,8 +107,10 @@ void WorkflowWaylandInputs::Configure(contracts::GuiSettingsState& settings, con
  train.model_input = contracts::ModelArtifactInputKind::Weights;
  train.use_compiled_directory_defaults = false;
  train.request.weights_path = weights_;
- train.request.train_compiled_path = compiled;
- train.request.val_compiled_path = compiled;
+ // The browser runs from the session output root. Exercise relative admission
+ // while retaining a distinct spelling for the validation input.
+ train.request.train_compiled_path = std::filesystem::relative(compiled, output);
+ train.request.val_compiled_path = std::filesystem::path(".") / train.request.train_compiled_path;
  train.output.automatic = false;
  train.output.directory = (output / "training").string();
  std::filesystem::create_directories(train.output.directory);

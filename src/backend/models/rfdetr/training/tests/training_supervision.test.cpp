@@ -1480,8 +1480,8 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
    CAPTURE(route_index, lanes);
    rfdetr::TrainRequest request;
    request.h2d_dataloader = true;
-   request.train_compiled_path = mmltk::backend::data::testsupport::compiled_bin_path(fixture);
-   request.val_compiled_path = request.train_compiled_path;
+   request.train_compiled_path = std::filesystem::relative(mmltk::backend::data::testsupport::compiled_bin_path(fixture));
+   request.val_compiled_path = std::filesystem::path(".") / request.train_compiled_path;
    request.weights_path = weights;
    request.output_dir = root / ("route-" + std::to_string(route_index) + "-lanes-" + std::to_string(lanes));
    request.preset_name = config.preset_name;
@@ -1778,8 +1778,8 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     workers[static_cast<std::size_t>(rank)] = std::async(std::launch::async, [&, rank] {
      rfdetr::TrainRequest request;
      request.h2d_dataloader = true;
-     request.train_compiled_path = mmltk::backend::data::testsupport::compiled_bin_path(fixture);
-     request.val_compiled_path = request.train_compiled_path;
+     request.train_compiled_path = std::filesystem::relative(mmltk::backend::data::testsupport::compiled_bin_path(fixture));
+     request.val_compiled_path = std::filesystem::path(".") / request.train_compiled_path;
      request.weights_path = weights;
      request.output_dir = distributed_output;
      request.preset_name = config.preset_name;

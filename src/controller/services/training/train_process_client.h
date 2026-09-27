@@ -15,6 +15,7 @@
 #include "src/common/concurrency/concurrency.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/contracts/compute.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
 #include "src/frameworks/process/subprocess_utils.h"
 namespace mmltk::controller::services {
 inline constexpr std::size_t kTrainProcessReadBudget = std::size_t{64U} * 1024U;
@@ -24,6 +25,7 @@ struct TrainProcessProgress final {
  std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics{};
  mmltk::backend::models::rfdetr::TrainingSources sources{};
  mmltk::backend::models::rfdetr::TrainingPersistence persistence{};
+ std::string failure{};
 };
 // This is a service-process exit observation, not a second public compute
 // operation vocabulary.  LocalTrain maps it into mmltk::controller::contracts::ComputeTerminal.
@@ -39,6 +41,7 @@ struct TrainProcessExit final {
 };
 struct TrainProcessOptions final {
  std::chrono::milliseconds escalation_delay{std::chrono::seconds{5}};
+ RuntimeDiagnosticTarget diagnostics{};
 };
 // A stop capability is minted with its token for one run.  The source may be
 // retained by a system; the token is consumed exclusively by the process work.
@@ -100,6 +103,7 @@ private:
   void finish_failure_line();
   std::string failure_line;
   std::string failure_cause;
+  RuntimeDiagnosticTarget diagnostics;
   std::size_t fatal_marker = 0;
   bool capturing_failure = false;
   bool failure_line_start = true;

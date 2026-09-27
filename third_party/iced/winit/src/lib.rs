@@ -949,6 +949,15 @@ async fn run_instance<P>(
                                     #[cfg(not(target_arch = "wasm32"))]
                                     panic!("{error:?}");
                                 }
+                                compositor::SurfaceError::Device(ref message) => {
+                                    present_span.finish();
+
+                                    #[cfg(target_arch = "wasm32")]
+                                    request_webgpu_recovery(message);
+
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    panic!("WebGPU device failed: {message}");
+                                }
                                 compositor::SurfaceError::Outdated
                                 | compositor::SurfaceError::Lost => {
                                     present_span.finish();

@@ -5,6 +5,7 @@ use crate::graphics::color;
 use crate::graphics::compositor;
 use crate::graphics::{self, Antialiasing, Shell, Viewport};
 use crate::{Engine, Renderer};
+use std::sync::{Arc, OnceLock};
 
 pub struct Compositor {
     instance: wgpu::Instance,
@@ -13,6 +14,8 @@ pub struct Compositor {
     alpha_mode: wgpu::CompositeAlphaMode,
     engine: Engine,
     settings: Settings,
+    device_error: Arc<OnceLock<compositor::SurfaceError>>,
+    error_reported: bool,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -176,6 +179,31 @@ impl Compositor {
 
             match result {
                 Ok((device, queue)) => {
+                    // Browser errors arrive asynchronously, after acquisition
+                    // and submission have already returned successfully.
+                    let device_error = Arc::new(OnceLock::new());
+                    let error = Arc::clone(&device_error);
+                    let notifier = shell.clone();
+                    device.on_uncaptured_error(Arc::new(move |failure| {
+                        let failure = match failure {
+                            wgpu::Error::OutOfMemory { source } => {
+                                compositor::SurfaceError::Device(format!("WebGPU out of memory: {source}"))
+                            }
+                            other => compositor::SurfaceError::Device(other.to_string()),
+                        };
+                        if error.set(failure).is_ok() {
+                            notifier.request_redraw();
+                        }
+                    }));
+                    let error = Arc::clone(&device_error);
+                    let notifier = shell.clone();
+                    device.set_device_lost_callback(move |reason, message| {
+                        if reason != wgpu::DeviceLostReason::Destroyed
+                            && error.set(compositor::SurfaceError::Device(message)).is_ok()
+                        {
+                            notifier.request_redraw();
+                        }
+                    });
                     let engine = Engine::new(
                         &adapter,
                         device,
@@ -192,6 +220,8 @@ impl Compositor {
                         alpha_mode,
                         engine,
                         settings,
+                        device_error,
+                        error_reported: false,
                     });
                 }
                 Err(error) => {
@@ -303,6 +333,9 @@ impl graphics::Compositor for Compositor {
     }
 
     fn configure_surface(&mut self, surface: &mut Self::Surface, width: u32, height: u32) {
+        if self.device_error.get().is_some() {
+            return;
+        }
         surface.configure(
             &self.engine.device,
             &wgpu::SurfaceConfiguration {
@@ -335,6 +368,13 @@ impl graphics::Compositor for Compositor {
         background_color: Color,
         on_pre_present: impl FnOnce(),
     ) -> Result<(), compositor::SurfaceError> {
+        if let Some(error) = self.device_error.get() {
+            if self.error_reported {
+                return Err(compositor::SurfaceError::Occluded);
+            }
+            self.error_reported = true;
+            return Err(error.clone());
+        }
         present(
             renderer,
             surface,

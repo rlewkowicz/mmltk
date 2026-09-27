@@ -85,11 +85,11 @@ extern bool wgpu_server_ensure_shared_texture_for_swap_chain(
     WGPUWebGPUParentPtr aParent, WGPUSwapChainId aSwapChainId,
     WGPUDeviceId aDeviceId, WGPUTextureId aTextureId, uint32_t aWidth,
     uint32_t aHeight, struct WGPUTextureFormat aFormat,
-    WGPUTextureUsages aUsage) {
+    WGPUTextureUsages aUsage, int32_t* aOutError) {
   auto* parent = static_cast<WebGPUParent*>(aParent);
 
   return parent->EnsureSharedTextureForSwapChain(
-      aSwapChainId, aDeviceId, aTextureId, aWidth, aHeight, aFormat, aUsage);
+      aSwapChainId, aDeviceId, aTextureId, aWidth, aHeight, aFormat, aUsage, aOutError);
 }
 
 extern void wgpu_server_ensure_shared_texture_for_readback(
@@ -861,7 +861,11 @@ void WebGPUParent::QueueSubmit(RawId aQueueId, RawId aDeviceId,
     auto it = mSharedTextures.find(textureId);
     if (it != mSharedTextures.end()) {
       auto& sharedTexture = it->second;
-      sharedTexture->onBeforeQueueSubmit(aQueueId);
+      if (!sharedTexture->onBeforeQueueSubmit(aQueueId)) {
+        ReportError(aDeviceId, dom::GPUErrorFilter::Internal,
+                    nsCString("WebGPU canvas completion semaphore allocation failed"));
+        return;
+      }
     }
   }
 
@@ -1379,7 +1383,9 @@ void WebGPUParent::PostSharedTexture(
 
   Maybe<layers::SurfaceDescriptor> desc = aSharedTexture->ToSurfaceDescriptor();
   if (!desc) {
-    MOZ_ASSERT_UNREACHABLE("unexpected to be called");
+    mRemoteTextureOwner->PushDummyTexture(aRemoteTextureId, aOwnerId);
+    ReportError(data->mDeviceId, dom::GPUErrorFilter::Internal,
+                nsCString("WebGPU canvas has no completed surface descriptor"));
     return;
   }
 
@@ -1419,7 +1425,9 @@ void WebGPUParent::SwapChainPresent(
   if (data->mUseSharedTextureInSwapChain) {
     auto it = mSharedTextures.find(aTextureId);
     if (it == mSharedTextures.end()) {
-      MOZ_ASSERT_UNREACHABLE("unexpected to be called");
+      // Allocation already reported its device error. Settle this failed
+      // presentation without dereferencing or waiting for a missing texture.
+      mRemoteTextureOwner->PushDummyTexture(aRemoteTextureId, aOwnerId);
       return;
     }
     std::shared_ptr<SharedTexture> sharedTexture = it->second;
@@ -1795,7 +1803,7 @@ static bool SwapChainFormatMatches(
 bool WebGPUParent::EnsureSharedTextureForSwapChain(
     ffi::WGPUSwapChainId aSwapChainId, ffi::WGPUDeviceId aDeviceId,
     ffi::WGPUTextureId aTextureId, uint32_t aWidth, uint32_t aHeight,
-    struct ffi::WGPUTextureFormat aFormat, ffi::WGPUTextureUsages aUsage) {
+    struct ffi::WGPUTextureFormat aFormat, ffi::WGPUTextureUsages aUsage, int32_t* aOutError) {
   auto ownerId = layers::RemoteTextureOwnerId{aSwapChainId._0};
   const auto& lookup = mPresentationDataMap.find(ownerId);
   if (lookup == mPresentationDataMap.end()) {
@@ -1828,7 +1836,7 @@ bool WebGPUParent::EnsureSharedTextureForSwapChain(
   }
 
   auto sharedTexture = CreateSharedTexture(ownerId, aDeviceId, aTextureId,
-                                           aWidth, aHeight, aFormat, aUsage);
+                                           aWidth, aHeight, aFormat, aUsage, aOutError);
   return static_cast<bool>(sharedTexture);
 }
 
@@ -1870,11 +1878,11 @@ std::shared_ptr<SharedTexture> WebGPUParent::CreateSharedTexture(
     const layers::RemoteTextureOwnerId& aOwnerId, ffi::WGPUDeviceId aDeviceId,
     ffi::WGPUTextureId aTextureId, uint32_t aWidth, uint32_t aHeight,
     const struct ffi::WGPUTextureFormat aFormat,
-    ffi::WGPUTextureUsages aUsage) {
+    ffi::WGPUTextureUsages aUsage, int32_t* aOutError) {
   MOZ_RELEASE_ASSERT(mSharedTextures.find(aTextureId) == mSharedTextures.end());
 
   UniquePtr<SharedTexture> texture =
-      SharedTexture::Create(this, aDeviceId, aWidth, aHeight, aFormat, aUsage);
+      SharedTexture::Create(this, aDeviceId, aWidth, aHeight, aFormat, aUsage, aOutError);
   if (!texture) {
     return nullptr;
   }

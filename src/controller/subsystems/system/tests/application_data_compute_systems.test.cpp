@@ -112,8 +112,9 @@ TEST_CASE("native training projects a child OOM into the GUI terminal and shared
  CHECK(terminal.detail.find("42.00 MiB") != std::string::npos);
  CHECK(terminal.detail.find("Reduce batch size or training lanes") != std::string::npos);
  CHECK(terminal.output.empty());
- CHECK(diagnostics.counters().accepted == (enabled ? (multiple ? 3U : 2U) : 0U));
+ CHECK(diagnostics.counters().accepted == (enabled ? (multiple ? 4U : 3U) : 0U));
  diagnostics.close();
+ diagnostics.wait_closed();
  if (!enabled) {
   CHECK_FALSE(std::filesystem::exists(diagnostic_path));
   return;
@@ -131,6 +132,9 @@ TEST_CASE("native training projects a child OOM into the GUI terminal and shared
   CHECK(record["detail"] == devices.size());
   CHECK(record["device"] == devices[rank]);
  }
+ REQUIRE(static_cast<bool>(std::getline(input, line)));
+ CHECK(nlohmann::json::parse(line).at("event") == "training.worker_failed");
+ CHECK(line.find("CUDA out of memory") != std::string::npos);
  REQUIRE(static_cast<bool>(std::getline(input, line)));
  CHECK(line.find("training") != std::string::npos);
  CHECK(line.find("child.exited") != std::string::npos);
@@ -187,6 +191,7 @@ TEST_CASE("training operation reports preparation and native failures exactly on
  CHECK(*decoded == event.value);
  CHECK(diagnostics.counters().accepted == (tracing ? 2U : 0U));
  diagnostics.close();
+ diagnostics.wait_closed();
  if (!tracing) {
   CHECK_FALSE(std::filesystem::exists(diagnostic_path));
   return;

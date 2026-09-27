@@ -25,7 +25,7 @@ class SharedTextureDMABuf final : public SharedTexture {
       WebGPUParent* aParent, const ffi::WGPUDeviceId aDeviceId,
       const uint32_t aWidth, const uint32_t aHeight,
       const struct ffi::WGPUTextureFormat aFormat,
-      const ffi::WGPUTextureUsages aUsage);
+      const ffi::WGPUTextureUsages aUsage, int32_t* aOutError);
 
   SharedTextureDMABuf(
       WebGPUParent* aParent, const ffi::WGPUDeviceId aDeviceId,
@@ -41,7 +41,7 @@ class SharedTextureDMABuf final : public SharedTexture {
 
   SharedTextureDMABuf* AsSharedTextureDMABuf() override { return this; }
 
-  void onBeforeQueueSubmit(RawId aQueueId) override;
+  bool onBeforeQueueSubmit(RawId aQueueId) override;
 
   void CleanForRecycling() override;
 

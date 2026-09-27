@@ -32,6 +32,7 @@ const char* child_setup_stage_label(const ChildSetupStage stage) noexcept {
   case ChildSetupStage::PreserveDescriptor: return "descriptor preservation";
   case ChildSetupStage::SetEnvironment: return "setenv";
   case ChildSetupStage::Exec: return "exec";
+  case ChildSetupStage::RestoreSignals: return "termination signal mask";
  }
  return "unknown setup";
 }
@@ -232,6 +233,11 @@ void require_child_setup_step(const bool succeeded, const int setup_fd, const Ch
 }
 void prepare_captured_output_child(const int output_fd, const int setup_fd) noexcept {
  require_child_setup_step(::setpgid(0, 0) == 0, setup_fd, ChildSetupStage::SetProcessGroup);
+ // The desktop consumes these through signalfd. Executed workers must receive
+ // termination normally, including a distributed launcher's failed-peer stop.
+ sigset_t signals;
+ require_child_setup_step(::sigemptyset(&signals) == 0 && ::sigaddset(&signals, SIGINT) == 0 && ::sigaddset(&signals, SIGTERM) == 0 && ::sigprocmask(SIG_UNBLOCK, &signals, nullptr) == 0, setup_fd,
+  ChildSetupStage::RestoreSignals);
  require_child_setup_step(::dup2(output_fd, STDOUT_FILENO) >= 0 && ::dup2(output_fd, STDERR_FILENO) >= 0, setup_fd, ChildSetupStage::RedirectOutput);
  ::close(output_fd);
 }
