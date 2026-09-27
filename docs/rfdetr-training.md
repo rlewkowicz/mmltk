@@ -142,6 +142,94 @@ capacity to operation generation; [GUI controls](gui-interaction.md#lane-and-rec
 display them without repeating the arithmetic. More lanes cost memory without
 guaranteeing throughput.
 
+## Attempt execution and target lifetime
+
+[TrainingLanes](../src/backend/models/rfdetr/training/training_lanes.cpp) binds
+each physical lane to its device stream, model state, augmenter, matcher and
+target scratch. One physical lane uses the working model directly; parallel
+lanes retain versioned replicas and copy changed parameters before their next
+admitted forward. RF-DETR's active backbone/projector/decoder use LayerNorm,
+including spatial LayerNorm. There is no training SyncBatchNorm collective;
+parallel lanes reject models with mutable running-statistic buffers.
+
+[TargetScratch](../src/backend/models/rfdetr/training/target_builder.cpp) retains
+a per-lane ring of pinned metadata/packed-mask storage and device destinations.
+A nonempty lane has depth `max(2, A)`; empty lanes allocate no forward payload.
+Compatible shapes reuse allocations and bound views, and larger shapes retain
+high-water capacity. Host staging can be filled again after its own H2D event;
+device overwrite additionally waits on that slot's final consumer event on
+the copy stream. If every host slot is busy, bounded backpressure waits for
+one slot's DMA rather than synchronizing the whole device.
+
+A `TargetConsumerLease` accompanies each prepared target set. It orders the
+copy before DN forward when needed, otherwise before criterion consumption,
+and remains live through loss, backward/gradient harvesting and matcher
+assignment completion. Retirement records the actual consumer stream before
+allowing device reuse. Partial upload failures mark the destination unavailable
+for reuse until ownership is safely resolved; stale aliases do not authorize
+reuse of replacement storage. Loader pixel custody ends independently after
+augmentation's final source read.
+
+[TrainingTargetCounts](../src/backend/models/rfdetr/training/training_ops.cpp)
+publishes one int64 target count per global logical microbatch. Distributed
+SUMs retain that order even when physical wave packing differs across ranks.
+Each consumer waits through stream events and uses a device FP32 normalizer.
+The count owner reserves Work custody for all `K` contributions in the attempt;
+closing a wave neither waits for every collective on the host nor releases its
+Work. Count-slot reuse waits for the previous scalar conversion, and the
+attempt's final dependency joins the numerical decision stream.
+
+The reducer separately retains gradient and usage-reduction Work. On one rank
+it uses host usage bookkeeping without usage H2D/D2H or collective traffic.
+The single-rank, single-contribution, single-slot path can adopt exclusive,
+resizable dense gradient storage with matching layout directly. Aliased,
+expanded or otherwise unsuitable gradients copy into retained bucket views.
+Ordinary accumulated/distributed paths keep their bucket protocol. Device
+events order all paths with the optimizer; globally unused parameters retain
+undefined gradients. Each recipe applies its existing missing-gradient policy.
+
+[TrainingMetricHandoff](../src/backend/models/rfdetr/training/training_metrics.cpp)
+packs loss/gradient finite controls, loss sums, scalar sums/availability and
+per-microbatch detection sufficient statistics into one retained FP32 packet.
+Distributed execution performs one SUM for that packet; single-rank execution
+needs none. Ratios are calculated from globally reduced rows, then aggregated
+with the existing temporal weighting. A pinned readback and one physical
+completion expose the numerical decision to the host. Count and reducer
+finalization then release already-completed Work without another host wait.
+This is the optimizer decision boundary, not a claim that the whole training
+attempt has no other CPU or GPU synchronization.
+
+### Bounded next-batch preparation
+
+After current forward/backward submission and before the metric decision
+completes, [TrainingModel](../src/backend/models/rfdetr/training/training_model.cpp)
+may submit exactly one future preparation to the **existing lane worker pool**.
+Eligibility requires Shared gradients, `K = 1`, a nonempty local rank, and a
+next microbatch in the same epoch. The work reads immutable scheduled
+annotations and prospective logical donor descriptors, builds the augmentation
+plan, and prepares/uploads targets. It owns no future loader pixel lease and
+does not run a future model forward.
+
+Admission verifies epoch, rank, microbatch identity, draw keys, image indices
+and batch shape against the real acquired batch before using the preparation.
+Only then does ordinary execution commit donor history, consume the schedule
+clock/cursor, submit count collectives and forward work, and observe the current
+parameter version. Future pixel augmentation and selected donor upload also
+wait for this admission. No additional worker, speculative forward, future
+collective or completed-attempt accounting is introduced.
+
+The future's exception is retained and raised only if that batch is admitted.
+Discard joins the worker and retires prepared storage without making an
+unadmitted failure replace the current attempt's result. Epoch transitions,
+Resume admission, reconfiguration and failure discard pending preparation
+before changing ownership. Checkpoint publication can proceed while a future
+preparation exists and records only committed clocks, cursor and donor history;
+that transient state is reconstructed by
+[exact Resume](model-merging.md#whole-session-resume). Cancellation wakes count
+consumers and closes new admission. Submitted streams, collective Work, hooks
+and target storage retain custody through physical completion; an unprovable
+settlement cannot free live GPU resources.
+
 ## Accumulation, optimizer and EMA
 
 For the mode's `K` admitted global logical microbatches, each loss contributes
@@ -168,6 +256,13 @@ recoverable FP16 gradient overflow skips the update on every rank.
 keeps each AdamW parameter's own age, including undefined-gradient gaps and
 unequal resumed ages. Bias correction uses those device scalars, following
 [PyTorch multi-tensor Adam](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/optim/adam.py).
+Fused AdamW is requested by default. When requested, real floating-point CUDA
+parameters on devices with compute capability 8.0 or newer use LibTorch's fused
+multi-tensor update; otherwise the optimizer selects its supported foreach or
+eager implementation. Batches group compatible device/dtype parameters while
+retaining each parameter's age. Muon and SGD keep their own
+native update paths; selecting fused AdamW does not fuse those recipes or
+the training loop.
 Clipping retains the device global norm and
 `min(max_norm / (norm + 1e-6), 1)` scaling without requesting an unused host
 norm. Loss numerators and other sufficient statistics are reduced before
@@ -201,6 +296,9 @@ undefined gradients. Its first momentum buffer copies the
 decayed gradient; later buffers use `momentum × buffer + decayed_gradient`.
 Nesterov requires SGD with positive momentum. Existing AdamW/Muon equations,
 parameter-group LR factors, and decay selection retain their native policy.
+For trainable parameters, Muon substitutes zero for an undefined gradient in
+both its matrix and auxiliary Adam branches. Momentum, decay, and auxiliary
+Adam ages therefore still advance on an update.
 
 Encoder groups use encoder LR with layer-position decay and the square of
 the component factor; selected transformer groups use decoder LR times the
@@ -307,6 +405,37 @@ per contribution stream; physical decoded caches only supply the selected data.
 Session checkpoints retain/reconstruct these identities and cursors, as described
 under [exact Resume](model-merging.md#whole-session-resume).
 
+### Augmentation preparation and transfer
+
+The [training augmenter](../src/backend/models/rfdetr/training/gpu_augment.cpp)
+resolves the immutable plan before submission. Logical donor descriptors carry
+original image/annotation meaning. Only selected copy-paste donors that differ
+from the materialized slot trigger reads/uploads; selecting another annotation
+from an already resident image reuses its original pixels and updates the
+required support. Skipped pastes do not upload unselected donor images. Donor
+history follows admitted contributions whether or not a paste was selected.
+The separate physical cache path retains original source pixels and uploads
+support only for replaced slots.
+
+The shared [GPU executor](../src/backend/models/rfdetr/augmentation/gpu_augment.cpp)
+has two parameter-staging slots. Their completion event follows the last host
+staging read/upload, before final pixel work; a distinct consumer event retains
+images, donor storage and execution resources. The pointwise CUDA route processes
+four adjacent pixels per thread with aligned `float4` loads/stores where valid,
+including horizontal reversal, and scalar handling at incompatible widths/edges.
+Remapping and copy-paste retain their existing sampling path. These choices
+reduce transfers and repeated work; they do not establish a measured throughput
+gain.
+
+[Annotation support](../src/backend/models/rfdetr/augmentation/annotation_support.cpp)
+uses analytic continuous-box visibility for pure geometry when sufficient.
+Erasure, donor occlusion and mask support use output pixel-center semantics;
+visibility-only checks stop after the first surviving sample. Full target
+construction still calculates required area/bounds and keeps continuous
+detection boxes independent of raster mask disappearance. Original donor RLE,
+known-empty masks, half-open erasure edges and category identity retain the
+same meaning for training and preview.
+
 ## Match-Free and denoising adaptations
 
 The canonical [supervision declaration](../src/backend/models/rfdetr/contract/training_supervision.h)
@@ -367,6 +496,9 @@ Native **selective** mode uses LibTorch/TorchScript tracing; pinned upstream use
 suppressed failures. Their capture/optimization coverage differs: upstream
 partial compilation does not establish a single full graph; native tracing
 implies neither equivalent fusion nor speed.
+Selective mode is the native training default. It also enables lane-owned
+criterion traces; `none` runs those operators directly. Fused optimizer
+selection is independent of graph tracing.
 
 The current bounded tensor regions are:
 
@@ -413,6 +545,13 @@ uses explicit Q/K/V projections and scaled-dot-product attention, preserving
 distinct parameter/position gradients even for coincident tensor values.
 Grouping, padding and leakage protection remain ordinary native policy.
 This does not promise a particular SDPA kernel backend.
+
+Host scheduling, annotations/target topology, recipe clocks, failure handling,
+and the completed metric decision remain ordinary CPU work. Hungarian training
+also retains CPU assignment after GPU cost construction/readback. Match-Free
+uses its learned correspondence instead of Hungarian assignment, but still
+retains native host orchestration and target policy. Neither selective mode nor
+the next-batch preparation slot captures a complete training step.
 
 Training admits complete effective batches. Training-owned evaluation pads
 model input to its configured batch, zero-fills inactive images and trims

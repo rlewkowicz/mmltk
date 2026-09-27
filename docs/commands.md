@@ -23,7 +23,7 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --cleanup-report cpp\|frontend\|all` | Generate the selected deduplication reports |
 | `./mmltk --raw-cpd [--review] [--min-tokens N] [--output PATH]` | Save exact-spelling C++ CPD evidence; `--review` adds an authored-file queue and lexical families in JSON/Markdown |
 | `./mmltk --format-declarations check\|preview\|fix [--file PATH] [--report PATH]` | Report or safely shorten canonical reflection annotation syntax |
-| `./mmltk --audit-includes [--refresh] [report\|preview\|fix] [--output PREFIX] [--build-dir PATH]` | Attribute and sort include evidence, identify folder/header clusters, and replace includes owned by shared PCH headers |
+| `./mmltk --audit-includes [--refresh] [report\|preview\|fix] [--output PREFIX] [--build-dir PATH]` | Inventory all compiler contexts and include-retention reasons; preview/apply replacements only under verified target-local PCH policy |
 | `./mmltk --test list` | List supported suites and test options |
 | `./mmltk --test all` | Run ordinary native, browser JavaScript/Rust, cleanup/declaration, and log-query fixtures |
 | `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |
@@ -48,7 +48,8 @@ first when invoking that standalone operation.
 Detailed references: [CUDA/Vulkan diagnostics](validation.md#standalone-cudavulkan-diagnostic),
 [native symbols/links](validation.md#native-symbol-and-link-diagnostics),
 [test selectors](validation.md#selection-environment-deadlines-and-debugging),
-[declaration tooling](validation.md#raw-cpd-and-declaration-formatting), and
+[declaration tooling](validation.md#raw-cpd-and-declaration-formatting),
+[PCH include audits](validation.md#pch-include-audit), and
 [log queries/provenance](logging.md).
 
 Build, test, and tidy automatically retain both output streams in

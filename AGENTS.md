@@ -499,8 +499,7 @@ unnecessary blocking.
 ## Tidy
 
 All validation follows [Final Validation](#final-validation-workflow)'s stage
-order, commands, and completion rules; action plans include its single cleanup
-review before the final build.
+order, commands, and completion rules.
 
 The full suite formats first-party C/C++/CUDA and the Iced application Rust
 package, runs clang-tidy on supported native translation units, and validates

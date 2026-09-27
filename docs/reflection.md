@@ -1,11 +1,13 @@
 # Reflected declarations and authoring
 
-[Wiki index](README.md) · [Architecture](architecture.md#reflected-value-and-persistence-boundaries) · [Generated bindings](build.md#generated-bindings-and-dependency-maintenance) · [Declaration tooling](validation.md#raw-cpd-and-declaration-formatting)
+[Wiki index](README.md) · [Architecture](architecture.md#reflected-value-and-persistence-boundaries) · [Rust generator and CBOR](application-wire.md) · [Declaration tooling](validation.md#raw-cpd-and-declaration-formatting)
 
 Canonical C++ declarations own native vocabulary, defaults, constraints, field
 identity, and structural projections. Ordinary systems own resources, execution,
 and product policy; Rust/Iced owns presentation and interaction, as defined by
 [the contract](../CONTRACT.md#model-presentation-model-and-views).
+This page owns authoring syntax; [the application boundary](application-wire.md)
+owns schema admission, generated projections, wire representations and compatibility.
 
 ## Declare once, project structurally
 

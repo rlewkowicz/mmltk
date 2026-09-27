@@ -90,7 +90,11 @@ owns sparse membership and draws;
 [TrainingSchedule](../src/backend/models/rfdetr/training/detail/training_schedule.h)
 owns recipe clocks; the
 [gradient reducer](../src/backend/models/rfdetr/training/detail/training_gradient_reducer.h)
-owns asynchronous bucket custody. These are ordinary runtime owners. Canonical
+owns asynchronous gradient custody. [TrainingLanes](../src/backend/models/rfdetr/training/detail/training_lanes.h)
+owns physical workers, augmentation/target preparation and target consumer leases;
+the [count owner](../src/backend/models/rfdetr/training/detail/training_ops_private.h)
+retains attempt work until the [metric handoff](../src/backend/models/rfdetr/training/detail/training_metrics.h)
+completes the numerical decision. These are ordinary runtime owners. Canonical
 [execution](../src/backend/models/rfdetr/contract/execution_plan.h),
 [recipe](../src/backend/models/rfdetr/contract/train_recipe.h), and
 [artifact](../src/backend/models/rfdetr/contract/training_artifacts.h)
@@ -334,7 +338,7 @@ one lookup per incoming key. Validation still follows base/member declaration
 order, followed by the first unknown key in wire order. Opaque relations retain
 their separate wire-order decoding. Application positional
 records and named persistence retain their separate
-[wire policies](gui-interaction.md#typed-application-boundary).
+[wire policies](application-wire.md#record-shapes).
 
 The browser host moves owned Bootstrap, Reply, and Event temporaries into their
 server records. CBOR encoding measures the required byte count before reserving
@@ -362,29 +366,17 @@ retains the separate weight-filename and path-inference policies.
 
 ## Native/Rust boundary
 
-Start at
-[application_schema.h](../src/controller/browser/application_schema.h),
-[application_materializer.h](../src/controller/browser/application_materializer.h),
-and the generator targets in
-[src/controller/browser/CMakeLists.txt](../src/controller/browser/CMakeLists.txt).
-They connect canonical native facts to the browser protocol and generated
-typed Rust. Generated definitions are consumed through
-[generated.rs](../src/frontend/iced/src/generated.rs); the generated files
-themselves remain build output.
-
-The [outer-routing emitter](../src/controller/browser/application_outer_routing_emitter.h)
-derives system/endpoint identities, snapshot/event/reply variants, decoding,
-bootstrap completeness, and exhaustive dispatch to Rust projection traits.
+The [generated Rust and application CBOR reference](application-wire.md) owns
+canonical schema inputs, emitters, generation/consumption, record formats and
+connection compatibility. The native application schema/materializer connect
+system declarations to generated typed Rust and projection traits.
 [view_model/reduction.rs](../src/frontend/iced/src/view_model/reduction.rs)
 calls that generated dispatch; the owning modules under `view_model/`
 implement the traits and their presentation-state reductions.
 The [visual projection](../src/controller/presentation/visual_source_projection.h)
 declares each producer's frame/revision relation and image projection;
-schema materialization derives native readers and
-[generated Rust observations](../src/controller/browser/application_visual_projection_emitter.h)
-from the same facts.
-That emitter also derives checked scaling for canonical visual extents/regions
-and the native Upscale output-scale constant.
+schema materialization derives native readers and Rust observations from the
+same facts.
 [Canonical visual frames](../src/controller/presentation/visual_system_types.h)
 keep geometry and optional compiled resize provenance paired with each product.
 Upscale separately projects native input, prepared input, and output
@@ -393,19 +385,11 @@ their meaning. Rust owns the Original view preference and uses those facts for
 its sampling and display transform; it does not repeat native geometry inventories
 or infer a processing request from the currently retained fallback image.
 
-The [application binding generator](../src/controller/browser/application_binding_generator.cpp)
-also derives typed scalar selectors and inventories from canonical training
-and evaluation declarations. Nested reflected objects and fixed arrays retain
-their field identity; generated access checks array bounds and preserves
-optional values. Boolean/integer metadata participates in the inventory without
-being converted into floating-point chart values. The Rust chart catalog
-selects generated identities and owns visual grouping, labels, and ordering;
-it does not mirror native member access or introduce a runtime string registry.
-
-[application_workspace_abi_emitter.h](../src/controller/browser/application_workspace_abi_emitter.h)
-projects [native graphics declarations](../src/controller/presentation/abi) for
-Firefox independently of application CBOR. [Build outputs](build.md#generated-bindings-and-dependency-maintenance)
-defines the artifact, derived layout assertions, and invalidation rules.
+The Rust chart catalog selects generated scalar identities and owns visual
+grouping, labels, and ordering. Generated scalar access retains nested/array
+identity, checked indexes, optional values, and nonnumeric metadata without
+inventing floating-point chart values. [Build outputs](build.md#generated-bindings-and-dependency-maintenance)
+owns the separate native/Firefox graphics artifact and invalidation rules.
 
 The physical listener and transport owner is
 [BrowserServer](../src/frameworks/transport/browser_server.h).
@@ -452,9 +436,9 @@ session notice identity and acknowledgment; the root
 focus, clipboard, and presentation. Native system recovery and cancellation
 remain with their existing owners. See [session Status](gui-interaction.md#session-status).
 
-The [GUI interaction guide](gui-interaction.md#typed-application-boundary)
-owns the current protocol, compact input representation, native command
-ordering, and state-publication details. The physical transport ring lives in
+The [application wire reference](application-wire.md) owns the protocol and
+compact input representation; the [GUI interaction guide](gui-interaction.md#shared-immediate-workspace-input)
+owns command ordering and state publication. The physical transport ring lives in
 [browser_record_ring.h](../src/frameworks/transport/browser_record_ring.h);
 shared mouse capture and immediate submission live in
 [workspace_input.rs](../src/frontend/iced/src/workspace_input.rs), with ordered

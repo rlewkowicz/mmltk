@@ -22,15 +22,19 @@
 - [Reflected declarations and authoring](reflection.md): canonical schemas,
   registration, all twelve annotation macros, scoped CLI declarations,
   local macros/aliases, structural projection, and safe mechanical formatting.
+- [Generated Rust and application CBOR](application-wire.md): canonical native
+  schema, generator ownership and consumption, record representations,
+  encoding/decoding limits, compatibility, session admission, and failures.
 - [GUI interaction and presentation](gui-interaction.md): layout and controls,
-  session Status, retained editing/charts/viewers, wire protocol, input ordering,
+  session Status, retained editing/charts/viewers, input ordering,
   image geometry, rendering, graphics custody, and redraws.
 
 ## Data and backend systems
 
 - [RF-DETR training and selective compilation](rfdetr-training.md): reference
   equations, lanes/global batches, recipes/schedulers/EMA, sparse planning,
-  supervision adaptations, and guarded native tracing.
+  target/collective lifetimes, bounded next-batch preparation, supervision
+  adaptations, and guarded native tracing.
 - [Datasets and compilation](datasets.md): source annotations, format 9, resize
   geometry, perceptual downscaling, loading/leases, and Explore cache residency.
 - [Built-in benchmark datasets](benchmark-datasets.md): recipe membership,
@@ -43,9 +47,9 @@
 ## Engineering, validation, and operations
 
 - [Validation](validation.md): required gates, suite/filter selection, tidy,
-  test-run replacement, cleanup and raw-review tooling, declaration formatting,
-  diagnostics, evidence ownership, rendered acceptance, numerical coverage,
-  fixtures, and evidence limits.
+  test-run replacement, PCH include audits, cleanup and raw-review tooling,
+  declaration formatting, diagnostics, evidence ownership, rendered acceptance,
+  numerical coverage, fixtures, and evidence limits.
 - [Headless Wayland](headless-wayland.md): private NVIDIA Weston setup, input
   seat, readiness, deadlines, shutdown, artifacts, and limitations.
 - [Logging](logging.md): automatic build/test/tidy transcripts, opt-in runtime

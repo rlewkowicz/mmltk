@@ -87,6 +87,11 @@ priority. The implementation starts in
 [src/common/system](../src/common/system) and
 [src/frameworks/gpu](../src/frameworks/gpu).
 
+Each training rank resolves placement for its own device and can preload
+independently. [Training loader ownership](rfdetr-training.md#logical-lanes-and-global-batch)
+defines sharing and scoped cancellation. [Compiled loading](datasets.md#why-compiled-loading-is-fast)
+owns physical read order and independent upload/consumer retirement.
+
 ## H2D and GDRCopy
 
 [Compiled loading](datasets.md#default-h2d-path) defaults to pinned H2D staging.
@@ -119,6 +124,14 @@ with host-path rewriting. `MMLTK_NUMA_TRANSFER_TRACE_FILE` provides the separate
 NUMA transfer trace. See [logging](logging.md) for joining captured identities.
 
 ## Workflow runtime retirement
+
+Training has its own [attempt and target lifetime](rfdetr-training.md#attempt-execution-and-target-lifetime)
+boundary: pinned metadata/mask slots retire their DMA separately from device
+targets consumed through backward; count and gradient work join the metric
+completion before optimizer mutation. Augmentation likewise distinguishes
+parameter-upload completion from final image/donor consumption. Those events
+permit bounded reuse without making a stream submission proof of physical
+completion.
 
 Validate, Export, and Predict compare the complete captured execution
 configuration before reusing a runtime. Replacement first retires the actual

@@ -610,51 +610,15 @@ increments.
 
 ## Typed application boundary
 
-Application package protocol **17** derives typed Rust, compact codecs,
-validation, exhaustive dispatch, and schema identity from [canonical C++ declarations](reflection.md).
-Native endpoints/events/snapshots and presentation ownership follow
-[the contract](../CONTRACT.md#model-presentation-model-and-views).
-
-[client_record.h](../src/controller/browser/client_record.h) declares the
-outer records and protocol version;
-[application_schema.h](../src/controller/browser/application_schema.h) and
-[application_materializer.h](../src/controller/browser/application_materializer.h)
-derive the application boundary. The bootstrap supplies the schema
-fingerprint, current snapshots, and input peer epoch. The client validates
-agreement before installing native state. Compact workspace mouse and Explore
-interactions travel on the existing session-bound CBOR/WebSocket connection.
-System/endpoint routing, snapshot/event/reply variants, and visual observations
-also derive from the native schema; the [source guide](architecture.md#nativerust-boundary)
-locates their emitters and the handwritten presentation-state reducers.
-
-Application output objects in snapshots, replies, and events use positional
-CBOR arrays in canonical reflected member order. Each declared field has a
-slot, including null optionals, and generated decoders enforce the exact field
-count and constraints. Generated failures name the enclosing type/member;
-array decoding adds the failing index. Bootstrap and event errors retain their
-system/event context, with fixed-text failures reporting the actual size and
-allowed range. Schema agreement authorizes those positions; they are
-not handwritten field inventories. Scalars, byte strings, named variant
-discriminators, and opaque relation storage retain their canonical policies.
-Ordinary intent field IDs and named request values keep their existing
-representation. Settings and annotation persistence keep their named
-representation; application transport does not change saved formats.
-The separate transport projection is
-defined in [reflected_cbor.h](../src/frameworks/serialization/reflected_cbor.h).
-
-Compact interactions use numeric opcodes generated from canonical endpoint
-order; their envelopes do not repeat protocol and endpoint identities already
-established by the connection. Mouse records preserve fractional image
-coordinates, button values, modifiers, click counts, wheel units and deltas,
-and source/peer/document ownership. Optional coordinates also allow input to
-an empty workspace. CBOR floats use the smallest exact representation.
-
-Protocol 17 is a complete package boundary: native host, Iced bundle, generated
-bindings, and cross-language fixtures must agree. Follow
-[binding generation and packaging](build.md#generated-bindings-and-dependency-maintenance);
-generated Rust is build output. The separate native/Firefox graphics ABI
-projects physical import records and frame signals; it does not carry
-application intents or own UI behavior.
+The [generated Rust and CBOR reference](application-wire.md) owns canonical
+schema/generator inputs, record shapes, codec limits, session admission and
+failure policy. Native endpoints/events/snapshots and presentation ownership
+follow [the contract](../CONTRACT.md#model-presentation-model-and-views).
+The Iced client installs native state only after a compatible Bootstrap;
+workspace mouse and Explore interactions use the same session-bound WebSocket.
+Generated routing connects those native facts to the handwritten reducers
+located in the [source guide](architecture.md#nativerust-boundary). Rust owns
+the interaction and presentation behavior described on this page.
 
 The WebSocket carries controls and logical UI facts. The independent FD graphics
 channel carries completed images and immutable `WorkspaceImageMetadata`:

@@ -445,6 +445,16 @@ supplies draw order, rank slices, and Resume offset; the loader does not
 reshuffle them or choose model membership. Empty rank slices retain collective
 participation without allocating an empty forward batch.
 
+The stream sorts each slot's physical read descriptors by source image index
+while retaining their destination offsets. Image order, repeated draws,
+annotation pointers, draw keys and delivered batch identity therefore still
+follow the logical schedule. Source runs, including isolated or repeated images,
+receive bounded `MADV_WILLNEED` advice before copying; only source-and-destination-contiguous
+runs can become one copy. Training opens the shared pixel source with random
+access advice, then supplies these explicit local read ranges. Annotation-only
+`describe_batch` views support [next-batch preparation](rfdetr-training.md#bounded-next-batch-preparation)
+without consuming the loader cursor or obtaining pixel custody.
+
 The local schedule bounds storage: slot count is the smaller of prefetch depth
 and locally scheduled batch count, retaining one control slot when that count
 is zero. Worker count also respects useful slots and eligible CPUs. Pixel
@@ -466,17 +476,21 @@ rather than per-image object graphs. Loading additionally uses:
 - Consecutive source images with consecutive batch destinations are coalesced.
   File-cache population and copies are issued in bounded chunks of at most
   16 MiB, with cancellation checked between chunks.
-- The locality-aware shuffle avoids turning every batch into unrelated page
-  faults while still changing global and within-block order each epoch.
+- The ordinary locality-aware shuffle changes global and within-block order
+  each epoch. Explicit training schedules keep their own order while physical
+  read sorting improves source locality within each slot.
 - Prefetch slots, read workers, read lists, pinned host buffers, device
   buffers, CUDA events, and the copy stream are bounded and reused. Buffers
   grow only to a high-water mark instead of allocating per batch.
 - Workers and pinned pages use the resolved GPU-local CPU/NUMA placement.
   Host pages are bound, prefaulted, residency-checked, and then registered with
   CUDA.
-- I/O gathering, transfer, and model consumption overlap across slots.
-  Completion is event-driven on a dedicated owner worker; the design avoids
-  polling and avoids device-wide synchronization during ordinary batches.
+- I/O gathering, transfer, and model consumption overlap across slots. Separate
+  bounded upload-completion and consumer-retirement queues have device/NUMA-local
+  owner workers. A delayed model consumer cannot hold unrelated upload callbacks
+  behind its event wait. A slot's consumer retirement still follows its own
+  transfer callback. GDRCopy needs only the consumer worker. Completion is
+  event-driven, without polling or ordinary device-wide synchronization.
 
 ### Default H2D path
 

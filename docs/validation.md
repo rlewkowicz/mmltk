@@ -60,6 +60,49 @@ full passes required by the workflow. Tidy retains a
 available analysis overrides are in
 [run_static_analysis.sh](../tools/run_static_analysis.sh).
 
+## PCH include audit
+
+```bash
+./mmltk --audit-includes report
+./mmltk --audit-includes preview
+./mmltk --audit-includes fix
+```
+
+[audit_includes.mjs](../tools/audit_includes.mjs) is a lexical inventory and
+conservative replacement tool for the checked-in PCH groups. It is not semantic
+include-what-you-use analysis. `report` (the default) and `preview` write reports
+without changing sources; `fix` applies admitted replacements. The tool reads
+the existing release graph by default. Leading `--refresh` first reconfigures
+that release graph with browser-host and Firefox runtime enabled.
+`--build-dir PATH` selects the graph to inspect and `--output PREFIX` selects
+report paths. Use the wrapper for all three modes;
+the [build reference](build.md#target-declarations-and-precompiled-headers)
+owns PCH registration and generated policy paths.
+
+Default reports are `output/include-audit.json` and `.md`. They contain folder
+and large-file inventories, standard/Linux include frequencies, repeated local
+include bundles, per-source compiler contexts, proposed replacements, PCH
+issues, and retained includes with concrete reasons. Counts include lexical
+inactive branches and are inspection aids, not proof of redundant dependencies.
+
+Every compilation-database entry is retained. Eligibility requires each
+context's owner, generated policy and exact target-local forced PCH to agree;
+replacement uses the groups common to all eligible contexts. Conflicting
+use/skip registration, missing groups, wrong-target forced includes, mismatched
+output ownership, and hidden response-file evidence prevent rewriting.
+Declaration headers remain self-contained. CUDA, retained modules and their
+importers, standalone/no-PCH sources, excluded source contexts, and headers
+outside consumed groups retain direct includes. A retained include is not an
+unresolved cleanup finding merely because another target uses that header in a PCH.
+
+Before editing, `fix` runs
+[check_toolchain_invariants.py](../tools/check_toolchain_invariants.py) through
+the wrapper, including creation/use compiler-environment equality and exclusion
+checks. It preserves conditional branches and comments, verifies that each
+source still matches its inspected snapshot, and atomically replaces admitted
+files with their modes retained. Neither audit output nor successful rewriting
+establishes build/test success or a measured PCH speedup.
+
 ## Deduplication reports
 
 ```bash
@@ -883,7 +926,8 @@ Annotation, Explore, and Upscale executables require `all` or explicit
 
 The [training reference](rfdetr-training.md) owns the pinned equations and
 native adaptations. Coverage is colocated with these existing suites, selected
-by `all` and the standalone `rfdetr` route:
+by `all` and the standalone `rfdetr` route. This inventory describes source
+coverage, not a record that the current checkout passed these cases:
 
 | Source | Required evidence |
 | --- | --- |
@@ -891,11 +935,13 @@ by `all` and the standalone `rfdetr` route:
 | [training/tests/stock_training_parity.test.cpp](../src/backend/models/rfdetr/training/tests/stock_training_parity.test.cpp) | Literal two-stage K-squared scaling, per-parameter AdamW ages, managed warmup, device clipping, first/later/resumed EMA, recoverable AMP overflow cadence, backward outside autocast and distributed group/update equations |
 | [core/tests/training_supervision.test.cpp](../src/backend/models/rfdetr/core/tests/training_supervision.test.cpp) | Match-Free correspondence/probes and mask costs, background-only images, DN layout/noise/leakage protection, invalid and empty boundaries, direct mask gradients and sampling behavior |
 | [core/tests/selective_compilation.test.cpp](../src/backend/models/rfdetr/core/tests/selective_compilation.test.cpp) | First recording and retained live weights, signature/tail fallback, transactional replacement, dynamic query extents, direct grouped/DN SDPA and independent decoder-tail derivatives with outstanding backwards |
-| [training/tests/training_supervision.test.cpp](../src/backend/models/rfdetr/training/tests/training_supervision.test.cpp) | Production routed Hungarian/Match-Free and optional DN for boxes/masks; FP32/FP16/BF16; empty images, accumulated gradients and actual optimizer updates; current-format continuation; eager/selective values, recording/reuse/optimized execution, RNG and live state copies |
+| [training/tests/training_supervision.test.cpp](../src/backend/models/rfdetr/training/tests/training_supervision.test.cpp) | Production Hungarian/Match-Free and optional DN, FP32/FP16/BF16, empty images, accumulated updates, eager/selective values/RNG/live state; target-ring reuse and delayed backward protection, partial DMA failure, selected donor uploads, next-batch preparation with exact continuation and parameter versions |
 | [inference/tests/prediction_session.test.cpp](../src/backend/models/rfdetr/inference/tests/prediction_session.test.cpp) | Native weights compilation-request propagation and incremental inference behavior |
 | [training/tests/execution_policy.test.cpp](../src/backend/models/rfdetr/training/tests/execution_policy.test.cpp) | Literal SGD warmup exit/round-even behavior, native schedule reference clocks, final-epoch latches, sparse membership/repeats, semantic samples, and donor identity |
-| [training/tests/training_gradient_reducer.test.cpp](../src/backend/models/rfdetr/training/tests/training_gradient_reducer.test.cpp) | Logical objective under physical capacity changes, early-bucket overlap, cancellation, partial failure, and physical collective custody |
+| [training/tests/training_gradient_reducer.test.cpp](../src/backend/models/rfdetr/training/tests/training_gradient_reducer.test.cpp) | Logical objective across physical capacities, early-bucket overlap, direct exclusive-gradient storage and alias isolation, exact count-wave/attempt admission, cross-stream count/metric completion, cancellation, partial failure and physical collective custody |
+| [augmentation/tests/gpu_augment.test.cpp](../src/backend/models/rfdetr/augmentation/tests/gpu_augment.test.cpp) | Deterministic prepared identities/donors, RGB/output-domain paths, high-water reuse, host staging retirement before delayed pixels, exact visible support and erasure geometry, continuous boxes with empty raster masks, failure custody |
 | [training/tests/distributed_training.test.cpp](../src/backend/models/rfdetr/training/tests/distributed_training.test.cpp) | Two selected physical GPUs: global objective/update equivalence, uneven/empty-rank contributions, early NCCL overlap, and cancellation/failure retirement |
+| [training/tests/distributed_placement.test.cpp](../src/backend/models/rfdetr/training/tests/distributed_placement.test.cpp) | Independent known/unknown GPU locality resolution and explicit rank placement |
 | [training/tests/model_merging.test.cpp](../src/backend/models/rfdetr/training/tests/model_merging.test.cpp) | Native averaging, cadence and zero intervals, final policies/ties/duplicates, finite mask metrics, immutable publication faults, whole-session leases and replaced/mixed artifact rejection |
 | [training/tests/training_continuation.test.cpp](../src/backend/models/rfdetr/training/tests/training_continuation.test.cpp) | Exact continuation inventory, SGD held values, schedules/offsets/donor support, named optimizer/EMA state, and applied epoch policies |
 | [core/tests/inference_lanes.test.cpp](../src/backend/models/rfdetr/core/tests/inference_lanes.test.cpp) | Bounded lanes, ordered delivery, source-copy release, backpressure, failure, and drain |
@@ -906,6 +952,13 @@ or cross-rank cancellation. Controller/contract and frontend fixtures also
 cover recipe projection, source-specific live/saved metrics, selected-output
 metadata, and whole-session capability admission. These cases remain inside
 the existing `all` gate; they add no plan-specific acceptance command.
+
+The data suite's [roundtrip cases](../src/backend/data/tests/roundtrip.test.cpp)
+exercise reordered/repeated source reads with preserved destinations, an upload
+that completes while another slot's consumer is held, retained buffer reuse,
+and independent read failure/cancellation under both admitted transfer routes.
+They are included by `all`; their existence does not establish throughput or
+hardware coverage for an unexecuted route.
 
 The complete-model selective fixture compares four accumulated microbatches
 using the production `TrainingStep`, including the K-squared divisor, frozen
@@ -926,13 +979,14 @@ fixtures retain their tighter elementwise equation checks and explicit samples.
 The source assertions own the exact bounds for each case; a composed AMP
 tolerance is not a universal tolerance for arbitrary training inputs.
 
-The validated NGC payload's compilation capture contained 1,163 executor-reuse
-records: 26 evaluation-backbone records each contained 33 TensorExpr groups;
+A retained compilation capture from the validated NGC payload contained
+1,163 executor-reuse records: 26 evaluation-backbone records each contained 33 TensorExpr groups;
 the other 1,137 records, including reported training-region graphs, had no
 counted fusion group. The bounded extracted evidence is
 `build/validation/compilation-execution-evidence-attempt7.jsonl`, retaining
-original log provenance. This observation establishes graph fusion in that
-evaluation backbone only. Graph capture, executor reuse, available fuser flags
+original log provenance. This historical observation establishes graph fusion in
+that evaluation backbone only; it is not a fresh acceptance run of the current
+implementation. Graph capture, executor reuse, available fuser flags
 and fused ATen operations do not establish training graph fusion or throughput.
 The [diagnostic fields](logging.md#native-selective-compilation) distinguish
 those facts.

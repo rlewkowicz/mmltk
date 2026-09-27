@@ -207,12 +207,17 @@ its own compiler, options, definitions, and include environment. C, CUDA,
 retained module providers/implementations/importers, header-isolation units,
 and sources with distinct per-source compile settings do not consume it.
 For example, ordinary `native_optimizer.cpp` uses the training owner's PCH;
-that target's module importers do not.
+that target's module importers do not. The data owner's
+`compiled/compiled_image_stream.cpp` is a retained module importer without a
+forced PCH, so its direct standard/Linux includes remain necessary. Includes
+outside an actually consumed group's contents also remain direct.
 
-`./mmltk --audit-includes` inventories includes and previews or applies replacement
-from the checked-in groups. Reports default to `output/include-audit.{json,md}`.
-Group membership is reviewed; it is not automatically pruned when direct includes
-disappear after consolidation. Use `--help` for options.
+The [include audit](validation.md#pch-include-audit) inventories includes and
+previews or applies replacements from the checked-in groups. It retains every
+compiler context for a source and requires consistent target-local consumption
+in all of them before replacing a direct include. Group membership is reviewed;
+it is neither expanded by the audit nor automatically pruned when direct
+includes disappear after consolidation.
 
 [MmltkComponent.cmake](../cmake/MmltkComponent.cmake) derives
 `CMakeFiles/<target>.dir/mmltk-pch-policy.txt` from the target registration.
@@ -221,6 +226,9 @@ build directory.
 [check_toolchain_invariants.py](../tools/check_toolchain_invariants.py) checks
 the compilation database against this policy, including creation/use
 environment equality, exclusions, and fatal invalid-PCH diagnostics.
+The include tool checks those generated policies and forced-include paths;
+`fix` also runs the invariant checker before editing. Contradictory evidence is
+reported as an inconsistency, not permission to rewrite a source.
 The analysis graph retains these registrations and independent header-isolation
 checks; [tidy](validation.md#formatting-and-static-analysis) selects GCC objects
 or clang-tidy by reflection support. PCH use and declaration isolation are part
@@ -276,18 +284,21 @@ the bindings, package marker, graphics ABI, and both cross-language fixtures.
 Firefox runtime builds disabled. `--generate-protocol` uses the shared
 `.cache/cmake/release` graph.
 
+The [generator and wire reference](application-wire.md) owns canonical schema
+inputs, projection/validation rules, native/Rust consumption and compatibility.
+
 Under the selected graph's `generated/frontend/iced/`, generation owns:
 
 | Artifact | Purpose |
 | --- | --- |
 | `application_bindings.rs` | Typed native domain projection, codecs, schema fingerprint, interaction limits, and reflected metric scalar selectors |
-| `browser_protocol.marker` | Application package marker for the [current typed boundary](gui-interaction.md#typed-application-boundary), `MMLTK_HOST_API_PROTOCOL_17` |
+| `browser_protocol.marker` | Application package marker for the [current typed boundary](application-wire.md), `MMLTK_HOST_API_PROTOCOL_17` |
 | `protocol_v17_client_records.hex` | Rust-to-native application fixture |
 | `protocol_v17_server_records.cbor` | Native-to-Rust application fixture |
 | `workspace_graphics_abi.rs` | Data-only native graphics ABI projection for Firefox; current ABI version 14 |
 
 Generation alone neither repackages the host/bundle nor runs tests; the
-[typed boundary](gui-interaction.md#typed-application-boundary) requires matching
+[typed boundary](application-wire.md#connection-compatibility-and-failure-behavior) requires matching
 packaged artifacts.
 
 The graphics artifact derives records, field types, enum wire values, and
