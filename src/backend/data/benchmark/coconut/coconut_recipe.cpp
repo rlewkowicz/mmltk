@@ -1,4 +1,5 @@
 #include "src/backend/data/benchmark/detail/benchmark_recipe.h"
+#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
@@ -31,7 +32,7 @@ struct CoconutRecipeInputs {
    stopped.store(true, std::memory_order_relaxed);
   }
   changed.notify_all();
-  pool.reset();
+  controllers.clear();
  }
  [[nodiscard]] bool cancelled() const noexcept { return stopped.load(std::memory_order_relaxed) || external.requested(); }
  void fail(std::exception_ptr value) {
@@ -49,12 +50,13 @@ struct CoconutRecipeInputs {
  void acquire_release(std::size_t index) {
   const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(*this);
   const auto& release = catalog->releases[index];
+  auto handles = execution ? execution->reserve(BenchmarkResources::handles(2, true, 15)) : BenchmarkCompilePipeline::Allowance{};
   auto lease = ArtifactLease::acquire(cache->locks / (std::string(release.name) + ".annotations.lifecycle.lock"), cancellation);
   for (const auto& artifact : release.annotations) {
    const auto request = make_download_request(*cache, "coconut-" + std::string(release.name), artifact);
-   const auto reservation = reservations->reserve(additional_download_bytes(request.destination, request.expected_size), "additional COCONut annotation download bytes");
+   const auto reservation = execution ? StorageReservationPool::Reservation{} : reservations->reserve_download(request.destination, request.expected_size, "additional COCONut annotation download bytes");
    auto result = download_artifacts({request}, connections, cancellation,
-    progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { progress->transfers().update(update, *progress); }} : DownloadProgressSink{}, trace)
+    progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { progress->transfers().update(update, *progress); }} : DownloadProgressSink{}, trace, {}, execution)
                   .front();
    releases[index].inputs.artifacts.emplace(artifact.artifact_id, std::move(result));
   }
@@ -82,7 +84,7 @@ struct CoconutRecipeInputs {
   changed.notify_all();
   // With one configured CPU there is no concurrent receiver or spare lane.
   // Execute serially instead of waiting for work in an absent pool.
-  if (!pool)
+  if (controllers.empty())
    for (std::size_t index = 0; index < releases.size(); ++index) acquire_release(index);
  }
  void metadata_ready(std::size_t index, CoconutRecipePreparation value) {
@@ -109,7 +111,7 @@ struct CoconutRecipeInputs {
    std::unique_lock lock(mutex);
    changed.wait(lock, [&] { return error || completed == releases.size(); });
   }
-  pool.reset();
+  controllers.clear();
   if (error) std::rethrow_exception(error);
   prepare = {};
  }
@@ -136,7 +138,8 @@ struct CoconutRecipeInputs {
  std::function<void(std::size_t)> prepare;
  std::vector<std::size_t> ready;
  std::size_t consumed = 0, completed = 0;
- std::unique_ptr<mmltk::common::concurrency::WorkerPool> pool;
+ BenchmarkCompilePipeline* execution = nullptr;
+ std::vector<std::jthread> controllers;
 };
 namespace {
 std::string digest_text(std::string_view text) { return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()))); }
@@ -229,12 +232,12 @@ namespace {
 CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cache, const CoconutReleaseComponent& release, const std::map<CoconutImageNamespace, std::string>& physical_identities,
  const CoconutPhysicalMembership& physical, ProgressReporter& progress, CoconutFailureReport& failures, const CoconutRecoveryOriginals* originals, CoconutReleaseInputs& retained,
  mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, std::span<const CoconutImageNamespace> refreshed_sources, bool metadata_only,
- IndexingProgressTotals* indexing, std::size_t release_index) {
+ IndexingProgressTotals* indexing, std::size_t release_index, BenchmarkCompilePipeline* execution) {
  using namespace mmltk::common::math;
  CoconutRecipePreparation prepared;
  prepared.manifest = {{"components", nlohmann::json::array()}, {"artifacts", nlohmann::json::array()}};
  auto& totals = progress.transfers();
- StorageReservationPool reservations(cache.root, trace);
+ StorageReservationPool reservations(cache.root, trace, execution ? &execution->storage() : nullptr);
  constexpr std::size_t acquisition_workers = 1;
  std::optional<CoconutMaskRecovery> recovery;
  if (originals) recovery.emplace(*originals);
@@ -242,9 +245,9 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   if (!redownload) return retained.artifacts.at(artifact.artifact_id);
   auto request = make_download_request(cache, owner, artifact);
   request.redownload = true;
-  const auto reservation = reservations.reserve(additional_download_bytes(request.destination, artifact.expected_size), "additional COCONut annotation repair bytes");
+  const auto reservation = execution ? StorageReservationPool::Reservation{} : reservations.reserve_download(request.destination, artifact.expected_size, "additional COCONut annotation repair bytes");
   auto result = download_artifacts({request}, acquisition_workers, cancellation,
-   progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace)
+   progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution)
                  .front();
   retained.artifacts.insert_or_assign(artifact.artifact_id, result);
   return result;
@@ -317,6 +320,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   components.clear();
   progress.source_activity(BenchmarkDatasetSource::kCoconut, "Normalizing required " + std::string(release.name) + " annotations and masks", false);
   CoconutImportRequest request;
+  request.execution = execution;
   request.edition = release.edition;
   request.metadata_only = metadata_only;
   std::vector<CoconutImageNamespace> retained_sources(reusable.begin(), reusable.end());
@@ -353,7 +357,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
     }
     std::ranges::sort(components, {}, &CoconutComponent::source);
     break;
-   } catch (const CoconutPhysicalMembershipError&) { throw; } catch (const InsufficientBenchmarkStorage&) {
+   } catch (const CoconutPhysicalMembershipError&) { throw; } catch (const InsufficientBenchmarkResources&) { throw; } catch (const InsufficientBenchmarkStorage&) {
     throw;
    } catch (const std::exception& error) {
     throw_if_benchmark_cancelled(cancellation);
@@ -395,7 +399,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   for (const auto& component : components)
    if (std::ranges::find(sources, component.source) == sources.end()) throw std::runtime_error("COCONut release references a namespace outside its selected recipe");
   for (const auto& component : components) {
-   if (!metadata_only && !component.index.images.empty() && !reusable.contains(component.source)) store_coconut_component(path_for(component.source), component, cancellation);
+   if (!metadata_only && !component.index.images.empty() && !reusable.contains(component.source)) store_coconut_component(path_for(component.source), component, cancellation, &reservations);
   }
  }
  for (std::size_t i = 0; i < downloads.size(); ++i) prepared.manifest["artifacts"][first_artifact + i]["identity"] = downloads[i].identity;
@@ -422,22 +426,24 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
 }  // namespace
 std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const BenchmarkCacheLayout& cache, const CoconutRecipeCatalog& catalog, ProgressReporter& progress, std::size_t workers,
  mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, std::size_t download_connections, std::span<const int> cpus,
- std::function<void(std::exception_ptr)> failed) {
+ std::function<void(std::exception_ptr)> failed, BenchmarkCompilePipeline* execution) {
  auto inputs = std::make_shared<CoconutRecipeInputs>(catalog.releases.size(), cancellation, std::move(failed));
+ inputs->execution = execution;
  inputs->cache = &cache;
  inputs->catalog = &catalog;
  inputs->progress = &progress;
  inputs->trace = trace;
  inputs->connections = std::max<std::size_t>(1, download_connections ? download_connections : workers);
- inputs->reservations = std::make_unique<StorageReservationPool>(cache.root, trace);
- const auto lanes = std::min(workers, catalog.releases.size());
+ inputs->reservations = std::make_unique<StorageReservationPool>(cache.root, trace, execution ? &execution->storage() : nullptr);
+ const auto lanes = execution ? catalog.releases.size() : std::min(workers, catalog.releases.size());
  if (lanes) {
-  auto affinity = cpus.empty() ? mmltk::common::system::allowed_cpu_set() : std::vector<int>(cpus.begin(), cpus.end());
-  inputs->pool = std::make_unique<mmltk::common::concurrency::WorkerPool>(lanes, std::move(affinity), "bench_release", lanes);
+  const auto affinity = cpus.empty() ? mmltk::common::system::allowed_cpu_set() : std::vector<int>(cpus.begin(), cpus.end());
+  inputs->controllers.reserve(lanes);
   try {
    for (std::size_t lane = 0; lane < lanes; ++lane)
-    inputs->pool->enqueue_detached([owner = inputs.get()] {
+    inputs->controllers.emplace_back([owner = inputs.get(), affinity] {
      try {
+      mmltk::common::system::set_thread_affinity(affinity);
       for (;;) {
        throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation::Borrow(*owner));
        const auto index = owner->next.fetch_add(1, std::memory_order_relaxed);
@@ -456,15 +462,15 @@ std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const Benchma
 CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& config, const BenchmarkCacheLayout& cache, const CoconutRecipeCatalog& catalog,
  std::span<const AdmittedRecipeArchive> acquired, const CoconutPhysicalMembership& physical, ProgressReporter& progress, CoconutFailureReport& failures, std::size_t workers,
  mmltk::common::concurrency::CancellationObservation external_cancellation, const BenchmarkTraceSink& trace, std::span<const CoconutImageNamespace> refreshed_sources, bool metadata_only,
- std::shared_ptr<CoconutRecipeInputs> inputs) {
+ std::shared_ptr<CoconutRecipeInputs> inputs, BenchmarkCompilePipeline* execution) {
  using namespace mmltk::common::math;
  const auto cancellation = external_cancellation;
  CoconutRecipePreparation prepared;
  const bool initial_preparation = !inputs || metadata_only;
- prepared.inputs = inputs ? std::move(inputs) : acquire_coconut_recipe_inputs(cache, catalog, progress, 0, cancellation, trace, workers);
+ prepared.inputs = inputs ? std::move(inputs) : acquire_coconut_recipe_inputs(cache, catalog, progress, 0, cancellation, trace, workers, {}, {}, execution);
  auto& retained = *prepared.inputs;
  auto& totals = progress.transfers();
- StorageReservationPool reservations(cache.root, trace);
+ StorageReservationPool reservations(cache.root, trace, execution ? &execution->storage() : nullptr);
  const auto acquisition_workers = std::max<std::size_t>(1, workers);
  const auto parse_workers = acquisition_workers;
  if (initial_preparation) progress.phase(DatasetCompilePhase::Downloading);
@@ -475,6 +481,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  std::optional<CocoAnnotationCache> annotations;
  if (config.selection.recover_dropped_masks || config.selection.validation == CoconutValidation::Stock) {
   if (!retained.originals_ready) {
+   auto original_handles = execution ? execution->reserve(BenchmarkResources::handles(3, true, 12)) : BenchmarkCompilePipeline::Allowance{};
    const CocoAnnotationRequest selection{
     config.selection.recover_dropped_masks ? CocoSplitAdmission::Optional : CocoSplitAdmission::Unselected,
     config.selection.validation == CoconutValidation::Stock ? CocoSplitAdmission::Required : CocoSplitAdmission::Optional
@@ -482,14 +489,14 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
    trace_benchmark_event(
     trace, "benchmark.annotations.originals_begin", [&] { return nlohmann::json{{"recover_dropped_masks", config.selection.recover_dropped_masks}, {"validation", config.selection.validation}}; });
    annotations.emplace(cache, catalog.stock_annotations, selection, 0, checked_cast<std::uint32_t>(catalog.coco_validation_images, "COCO validation count overflow"), static_cast<int>(parse_workers),
-    cancellation, trace);
+    cancellation, trace, execution);
    annotations->discover(progress);
    if (annotations->pending_download()) {
     const auto& request = *annotations->pending_download();
-    const auto reservation = reservations.reserve(additional_download_bytes(request.destination, request.expected_size), "additional COCO annotation download bytes");
+    const auto reservation = execution ? StorageReservationPool::Reservation{} : reservations.reserve_download(request.destination, request.expected_size, "additional COCO annotation download bytes");
     try {
      auto archive = download_artifacts({request}, acquisition_workers, cancellation,
-      progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace)
+      progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution)
                      .front();
      auto completed = annotations->completed_indexes();
      annotations->settle(std::move(archive), progress, parse_workers, completed, config.selection.recover_dropped_masks ? 2 : 1);
@@ -513,19 +520,19 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   retained.indexing = progress.indexing(rows);
   if (!rows.empty()) retained.indexing->update(0, 0, progress);
  }
- retained.activate([&cache, &catalog, &physical, &progress, &failures, &retained, physical_identities, refreshed_sources, trace, metadata_only](std::size_t index) {
+ retained.activate([&cache, &catalog, &physical, &progress, &failures, &retained, physical_identities, refreshed_sources, trace, metadata_only, execution](std::size_t index) {
   const auto release_cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(retained);
   const auto& release = catalog.releases[index];
   auto& release_inputs = retained.releases[index].inputs;
   if (metadata_only) {
    auto metadata = prepare_coconut_release(cache, release, physical_identities, physical, progress, failures, retained.recovery_originals ? &*retained.recovery_originals : nullptr, release_inputs,
-    release_cancellation, trace, refreshed_sources, true, retained.indexing, index);
+    release_cancellation, trace, refreshed_sources, true, retained.indexing, index, execution);
    trace_benchmark_event(trace, "benchmark.annotations.release_metadata", [&] { return nlohmann::json{{"edition", release.edition}, {"cache_hit", metadata.annotation_cache_hit}}; });
    retained.metadata_ready(index, std::move(metadata));
   }
   if (catalog.release_observer) catalog.release_observer(release.edition, CoconutReleaseBoundary::MasksStarted);
   retained.releases[index].complete = prepare_coconut_release(cache, release, physical_identities, physical, progress, failures, retained.recovery_originals ? &*retained.recovery_originals : nullptr,
-   release_inputs, release_cancellation, trace, refreshed_sources, false, retained.indexing, index);
+   release_inputs, release_cancellation, trace, refreshed_sources, false, retained.indexing, index, execution);
   if (retained.indexing) retained.indexing->update(index, release.expected_rows, progress);
   trace_benchmark_event(
    trace, "benchmark.annotations.release_complete", [&] { return nlohmann::json{{"edition", release.edition}, {"cache_hit", retained.releases[index].complete->annotation_cache_hit}}; });

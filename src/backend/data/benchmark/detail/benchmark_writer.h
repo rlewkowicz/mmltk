@@ -14,6 +14,7 @@
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
+class BenchmarkCompilePipeline;
 struct CachedImageSource {
  std::filesystem::path root;
 };
@@ -68,20 +69,28 @@ struct BenchmarkWriteRequest {
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
  // Private effect-only boundary after opening a cached image, outside locks.
  BenchmarkImageReadObserver image_opened{};
+ BenchmarkCompilePipeline* execution = nullptr;
 };
 // Membership and physical pixel storage settle before annotations. Calls on different
 // slots may overlap; each lane has exclusive reusable decoder/resizer scratch.
 // The owner must drain pixel calls before finalization, repair, or destruction.
+struct BenchmarkPixelInput;
 class BenchmarkSplitWriter final {
 public:
  explicit BenchmarkSplitWriter(const BenchmarkWriteRequest&, bool use_actual_dimensions = false);
  ~BenchmarkSplitWriter();
  BenchmarkSplitWriter(const BenchmarkSplitWriter&) = delete;
  BenchmarkSplitWriter& operator=(const BenchmarkSplitWriter&) = delete;
+ void prepare_lanes(std::size_t);
+ void retire_scratch(std::size_t) noexcept;
+ [[nodiscard]] std::shared_ptr<BenchmarkPixelInput> prepare_pixel(std::size_t slot, std::size_t lane);
+ [[nodiscard]] std::uint64_t pixel_workspace_bytes(const BenchmarkPixelInput&) const;
+ void write_pixel(std::size_t slot, std::size_t lane, const std::shared_ptr<BenchmarkPixelInput>&);
  void write_pixel(std::size_t slot, std::size_t lane);
  void write_remaining(const BenchmarkWriteRequest&);
  [[nodiscard]] bool matches_membership(const PreparedBenchmarkSplit&) const;
  void invalidate_source(const std::filesystem::path&);
+ void invalidate_image(std::size_t slot);
  void retain_completed(const BenchmarkSplitWriter& previous);
  [[nodiscard]] std::uint64_t allocated_bytes() const;
  [[nodiscard]] std::optional<std::pair<std::uint32_t, std::uint32_t>> header_dimensions(std::size_t slot) const;

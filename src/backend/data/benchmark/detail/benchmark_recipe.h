@@ -42,7 +42,7 @@ struct CustomRecipePreparation {
  std::vector<CatalogArtifact> sampling_object_artifacts;
 };
 [[nodiscard]] CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CustomRecipeCatalog&, ProgressReporter&, std::size_t,
- mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::span<const int> worker_cpus = {});
+ mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::span<const int> worker_cpus = {}, BenchmarkCompilePipeline* execution = nullptr);
 }  // namespace mmltk::backend::data::benchmark_internal
 namespace mmltk::backend::data::benchmark_internal {
 struct RecipeImageArchive {
@@ -70,7 +70,7 @@ struct CoconutRecipeCatalog {
 struct CoconutRecipeInputs;
 [[nodiscard]] std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, ProgressReporter&, std::size_t,
  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::size_t download_connections = 0, std::span<const int> cpus = {},
- std::function<void(std::exception_ptr)> failed = {});
+ std::function<void(std::exception_ptr)> failed = {}, BenchmarkCompilePipeline* execution = nullptr);
 struct CoconutRecipePreparation {
  std::shared_ptr<CoconutRecipeInputs> inputs;
  std::vector<CoconutComponent> components;
@@ -98,7 +98,7 @@ private:
 [[nodiscard]] CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation);
 [[nodiscard]] CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, std::span<const AdmittedRecipeArchive>,
  const CoconutPhysicalMembership&, ProgressReporter&, CoconutFailureReport&, std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&,
- std::span<const CoconutImageNamespace> refreshed_sources = {}, bool metadata_only = false, std::shared_ptr<CoconutRecipeInputs> inputs = {});
+ std::span<const CoconutImageNamespace> refreshed_sources = {}, bool metadata_only = false, std::shared_ptr<CoconutRecipeInputs> inputs = {}, BenchmarkCompilePipeline* execution = nullptr);
 [[nodiscard]] bool coconut_validation_component(CoconutEdition) noexcept;
 [[nodiscard]] AnnotationSource coconut_annotation_source(CoconutImageNamespace);
 // Same compiler entry with explicit private source catalog, not a second execution path.

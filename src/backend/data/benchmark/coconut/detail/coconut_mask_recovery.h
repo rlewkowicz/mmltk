@@ -44,6 +44,8 @@ public:
  CoconutMaskRecovery(const CoconutMaskRecovery&) = delete;
  CoconutMaskRecovery& operator=(const CoconutMaskRecovery&) = delete;
  [[nodiscard]] std::string_view original_identity(CoconutImageNamespace source) const noexcept;
+ // The input owner's allowance covers this reusable workspace until retirement.
+ void retire_scratch() noexcept;
  // Support belongs to this decoded image. Facts are appended for successful
  // assignments; rejection counts are settled by the importer after carving.
  void apply(CoconutImageNamespace source, const CoconutRecord& record, std::uint32_t width, std::uint32_t height, std::span<CoconutSegmentSupport> support, CoconutRecoveryImage& facts,
@@ -67,12 +69,14 @@ private:
  [[nodiscard]] static bool intersects(const CoconutSegmentSupport& support, const Candidate& candidate, Cancellation cancellation);
  const CoconutRecoveryOriginals& originals_;
  // Flat image/group workspaces retain only high-water capacity, never historical keys.
- std::vector<Group> groups_;
- std::vector<std::size_t> ordinals_;
- std::vector<Candidate> candidates_;
- std::vector<std::uint8_t> represented_;
- std::vector<const Candidate*> remaining_;
- std::vector<std::uint64_t> identities_;
- std::vector<RLEPair> union_, scratch_;
+ struct Workspace {
+  std::vector<Group> groups;
+  std::vector<std::size_t> ordinals;
+  std::vector<Candidate> candidates;
+  std::vector<std::uint8_t> represented;
+  std::vector<const Candidate*> remaining;
+  std::vector<std::uint64_t> identities;
+  std::vector<RLEPair> combined, scratch;
+ } workspace_;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

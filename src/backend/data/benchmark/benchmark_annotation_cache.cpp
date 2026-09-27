@@ -1,4 +1,5 @@
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
+#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/detail/staging_file_cleanup.h"
@@ -8,6 +9,7 @@
 #include "src/common/math/checked_arithmetic.h"
 #include <archive.h>
 #include <archive_entry.h>
+#include <unistd.h>
 #include "src/pch_std.h"
 namespace mmltk::backend::data::benchmark_internal {
 namespace common_io = mmltk::common::io;
@@ -41,7 +43,13 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
 [[nodiscard]] std::filesystem::path extract_manifest_path(const std::filesystem::path& path) { return path.string() + ".extract.json"; }
 }  // namespace
 [[nodiscard]] std::string extract_archive_member(const std::filesystem::path& archive_path, const std::string_view member_suffix, const std::filesystem::path& output_path,
- const std::string_view archive_identity, const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace) {
+ const std::string_view archive_identity, const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, StorageReservationPool* storage,
+ BenchmarkCompilePipeline* execution) {
+ auto allowance = execution ? execution->reserve({64ULL << 20, 3, true}) : BenchmarkCompilePipeline::Allowance{};
+ const auto cpu = [&](const std::function<void()>& work) {
+  if (execution) execution->run(BenchmarkStage::Archive, {}, [&](std::size_t) { work(); }, allowance);
+  else work();
+ };
  ArtifactLease lease = ArtifactLease::acquire(lock_path, cancel_requested);
  const std::filesystem::path completion = extract_manifest_path(output_path);
  if (std::filesystem::is_regular_file(output_path) && std::filesystem::is_regular_file(completion)) {
@@ -79,35 +87,44 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
  common_io::FileHandle staging;
  std::filesystem::path staging_path;
  std::optional<StagingFileCleanup> staging_cleanup;
+ StorageReservationPool destination(output_path, trace, storage);
+ StorageReservationPool::Reservation allocation;
  std::uint64_t expected_size = 0U;
  while (true) {
   throw_if_benchmark_cancelled(cancel_requested);
   int status = ARCHIVE_RETRY;
-  for (std::uint32_t retry = 0U; status == ARCHIVE_RETRY && retry < 8U; ++retry) { status = archive_read_next_header(reader.get(), &entry); }
+  for (std::uint32_t retry = 0U; status == ARCHIVE_RETRY && retry < 8U; ++retry) { cpu([&] { status = archive_read_next_header(reader.get(), &entry); }); }
   if (status == ARCHIVE_EOF) { break; }
   if (status != ARCHIVE_OK && status != ARCHIVE_WARN) { throw_archive_read_failure(reader.get(), status, "cannot read benchmark annotation archive"); }
   const char* pathname = archive_entry_pathname(entry);
   const std::string_view name = pathname != nullptr ? std::string_view(pathname) : std::string_view{};
   if (!name.ends_with(member_suffix)) {
    int skip_status = ARCHIVE_RETRY;
-   for (std::uint32_t retry = 0U; skip_status == ARCHIVE_RETRY && retry < 8U; ++retry) { skip_status = archive_read_data_skip(reader.get()); }
+   for (std::uint32_t retry = 0U; skip_status == ARCHIVE_RETRY && retry < 8U; ++retry) { cpu([&] { skip_status = archive_read_data_skip(reader.get()); }); }
    if (skip_status < ARCHIVE_WARN) { throw_archive_read_failure(reader.get(), skip_status, "cannot skip benchmark annotation archive member"); }
    continue;
   }
   if (found || archive_entry_filetype(entry) != AE_IFREG || archive_entry_size(entry) <= 0) { throw AnnotationSourceUnavailable("benchmark annotation archive member is missing or ambiguous"); }
   found = true;
   expected_size = common_math::checked_cast<std::uint64_t>(archive_entry_size(entry), "extracted annotation size overflow");
-  require_storage(output_path, expected_size, "extracted annotation staging", trace);
-  staging = common_io::FileHandle::create_unique_output(staging_text, common_math::checked_cast<std::size_t>(expected_size, "extracted annotation size overflow"));
-  staging_path = staging_text;
-  staging_cleanup.emplace(staging_path);
+  allocation = destination.reserve(expected_size, "extracted annotation staging");
+  staging = common_io::FileHandle::create_unique_output(staging_text, 0);
+  try {
+   staging_path = staging_text;
+   staging_cleanup.emplace(staging_path);
+  } catch (...) {
+   (void)::unlink(staging_text.c_str());
+   throw;
+  }
+  allocation.watch(staging_path);
+  staging.preallocate(common_math::checked_cast<std::size_t>(expected_size, "extracted annotation size overflow"));
   std::vector<std::uint8_t> buffer(kArchiveReadBufferBytes);
   std::uint64_t offset = 0U;
   while (offset < expected_size) {
    throw_if_benchmark_cancelled(cancel_requested);
    const std::size_t remaining = common_math::checked_cast<std::size_t>(expected_size - offset, "extraction remaining size overflow");
    la_ssize_t count = ARCHIVE_RETRY;
-   for (std::uint32_t retry = 0U; count == ARCHIVE_RETRY && retry < 8U; ++retry) { count = archive_read_data(reader.get(), buffer.data(), std::min(buffer.size(), remaining)); }
+   for (std::uint32_t retry = 0U; count == ARCHIVE_RETRY && retry < 8U; ++retry) { cpu([&] { count = archive_read_data(reader.get(), buffer.data(), std::min(buffer.size(), remaining)); }); }
    if (count < 0) { throw_archive_read_failure(reader.get(), count, "cannot read benchmark annotation archive member"); }
    if (count == 0) { throw AnnotationSourceUnavailable("cannot read complete benchmark annotation archive member"); }
    staging.pwrite_all(buffer.data(), common_math::checked_cast<std::size_t>(count, "archive read overflow"), common_math::checked_cast<std::size_t>(offset, "archive write offset overflow"));
@@ -150,11 +167,12 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
 }
 [[nodiscard]] NormalizedAnnotationIndex load_or_build_index(const BenchmarkCacheLayout& cache, const std::filesystem::path& path, const BenchmarkDatasetSource source, const std::string_view split,
  const std::string_view annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace,
- const std::function<NormalizedAnnotationIndex()>& builder) {
+ const std::function<NormalizedAnnotationIndex()>& builder, StorageReservationPool* storage, BenchmarkCompilePipeline* execution) {
+ auto handles = execution ? execution->reserve(BenchmarkResources::handles(2, true)) : BenchmarkCompilePipeline::Allowance{};
  ArtifactLease lease = ArtifactLease::acquire(cache.locks / (std::string(benchmark_source_name(source)) + "-" + std::string(split) + ".index.lock"), cancel_requested);
  if (auto cached = load_normalized_annotation_index(path, source, split, annotation_sha256, cancel_requested, trace)) { return std::move(*cached); }
  NormalizedAnnotationIndex index = builder();
- store_normalized_annotation_index(path, index, cancel_requested, trace);
+ store_normalized_annotation_index(path, index, cancel_requested, trace, storage);
  return index;
 }
 // Runs an annotation indexing step with up to three attempts, invoking repair (cache invalidation
@@ -164,7 +182,7 @@ void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservati
   try {
    body();
    break;
-  } catch (const InsufficientBenchmarkStorage&) { throw; } catch (const std::exception& error) {
+  } catch (const InsufficientBenchmarkResources&) { throw; } catch (const InsufficientBenchmarkStorage&) { throw; } catch (const std::exception& error) {
    throw_if_benchmark_cancelled(cancel_requested);
    if (attempt == 3U) { throw; }
    repair(error);
@@ -172,7 +190,7 @@ void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservati
  }
 }
 std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequest> requests, BenchmarkDatasetSource source, std::string_view reason, ProgressReporter& progress,
- ArtifactProgressTotals& totals, std::size_t workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace) {
+ ArtifactProgressTotals& totals, std::size_t workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution) {
  for (auto& request : requests) {
   if (std::filesystem::is_regular_file(request.destination)) {
    progress.source_activity(source, "Failure-only SHA-256 diagnosis for " + request.artifact_id);
@@ -184,10 +202,10 @@ std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequ
  }
  progress.source_activity(source, "Redownloading annotation metadata after structural validation failure");
  return download_artifacts(requests, requests.size() == 1U ? std::min<std::size_t>(8U, workers) : std::min<std::size_t>({3U, requests.size(), workers}), cancellation,
-  progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace);
+  progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution);
 }
 CocoAnnotationCache::CocoAnnotationCache(const BenchmarkCacheLayout& cache, const CatalogArtifact& artifact, CocoAnnotationRequest selection, std::uint32_t train_count, std::uint32_t validation_count,
- int parse_workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace)
+ int parse_workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution)
     : cache_(cache),
       request_(make_download_request(cache, "coco", artifact)),
       selection_(selection),
@@ -196,7 +214,7 @@ CocoAnnotationCache::CocoAnnotationCache(const BenchmarkCacheLayout& cache, cons
       parse_workers_(parse_workers),
       cancellation_(cancellation),
       trace_(trace),
-      lease_(ArtifactLease::acquire(cache.locks / "coco-annotations.lifecycle.lock", cancellation)) {
+      lease_(ArtifactLease::acquire(cache.locks / "coco-annotations.lifecycle.lock", cancellation)), execution_(execution) {
  indexes_.train_path = cache.source_indexes("coco") / "train2017.normalized.bin";
  indexes_.validation_path = cache.source_indexes("coco") / "val2017.normalized.bin";
 }
@@ -225,17 +243,17 @@ void CocoAnnotationCache::build_split(bool training, const DownloadResult& archi
  std::filesystem::create_directories(json_path.parent_path());
  progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Extracting COCO " + label + " annotations");
  const auto digest = extract_archive_member(archive.path, "annotations/instances_" + split + ".json", json_path, archive.identity,
-  cache_.locks / (training ? "coco-train-json.extract.lock" : "coco-val-json.extract.lock"), cancellation_, trace_);
+  cache_.locks / (training ? "coco-train-json.extract.lock" : "coco-val-json.extract.lock"), cancellation_, trace_, execution_ ? &execution_->storage() : nullptr, execution_);
  index = load_or_build_index(cache_, training ? indexes_.train_path : indexes_.validation_path, BenchmarkDatasetSource::kCoco2017, split, digest, cancellation_, trace_, [&] {
   progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Parsing and indexing COCO " + label + " annotations");
   try {
    return parse_coco_style_annotations(json_path, digest, coco_category_mappings(),
-    AnnotationParseOptions{BenchmarkDatasetSource::kCoco2017, split, training ? train_count_ : validation_count_, parse_workers_, !training, cancellation_, trace_});
+    AnnotationParseOptions{BenchmarkDatasetSource::kCoco2017, split, training ? train_count_ : validation_count_, parse_workers_, !training, cancellation_, trace_, execution_});
   } catch (const AnnotationDocumentRejected& error) {
    throw_if_benchmark_cancelled(cancellation_);
    throw AnnotationSourceUnavailable(error.what());
   }
- });
+ }, execution_ ? &execution_->storage() : nullptr, execution_);
  progress.phase(DatasetCompilePhase::Indexing, ++completed, total);
 }
 void CocoAnnotationCache::invalidate_missing() {
@@ -264,7 +282,7 @@ void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progr
      throw_if_benchmark_cancelled(cancellation_);
      if (attempt == 3) throw;
      invalidate_missing();
-     archive = repair_annotation_artifacts({request_}, BenchmarkDatasetSource::kCoco2017, error.what(), progress, repair_progress, workers, cancellation_, trace_).front();
+     archive = repair_annotation_artifacts({request_}, BenchmarkDatasetSource::kCoco2017, error.what(), progress, repair_progress, workers, cancellation_, trace_, execution_).front();
     }
    }
   } catch (const AnnotationSourceUnavailable&) {

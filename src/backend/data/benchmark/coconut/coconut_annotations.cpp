@@ -1,4 +1,5 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
+#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
@@ -9,6 +10,7 @@
 #include "src/backend/data/detail/staging_file_cleanup.h"
 #include "src/frameworks/serialization/json_scalar.h"
 #include "src/pch_std.h"
+#include <iterator>
 #include <archive.h>
 #include <archive_entry.h>
 #include <stb_image.h>
@@ -71,7 +73,9 @@ void validate_physical(const CoconutPhysicalImage& image) {
 }
 class Archive final {
 public:
- explicit Archive(const std::filesystem::path& path) : handle_(archive_read_new(), archive_read_free) {
+ explicit Archive(const std::filesystem::path& path, BenchmarkCompilePipeline* execution = nullptr, std::uint64_t workspace = 0)
+  : execution_(execution), allowance_(execution ? execution->reserve({mmltk::common::math::checked_add(64ULL << 20, workspace, "COCONut archive workspace overflow"), 1, true}) : BenchmarkCompilePipeline::Allowance{}),
+    handle_(archive_read_new(), archive_read_free) {
   if (!handle_) invalid("cannot allocate archive reader");
   archive_read_support_filter_all(handle_.get());
   archive_read_support_format_tar(handle_.get());
@@ -80,7 +84,8 @@ public:
  }
  bool next(Cancellation cancellation) {
   throw_if_benchmark_cancelled(cancellation);
-  const int status = archive_read_next_header(handle_.get(), &entry_);
+  int status;
+  cpu([&] { status = archive_read_next_header(handle_.get(), &entry_); });
   if (status == ARCHIVE_EOF) return false;
   if (status != ARCHIVE_OK) fail("reading archive header");
   const char* name = archive_entry_pathname(entry_);
@@ -99,11 +104,17 @@ public:
   std::size_t offset = 0;
   while (offset < bytes_.size()) {
    throw_if_benchmark_cancelled(cancellation);
-   const auto count = archive_read_data(handle_.get(), bytes_.data() + offset, std::min<std::size_t>(bytes_.size() - offset, 128U * 1024U));
+   la_ssize_t count;
+   cpu([&] { count = archive_read_data(handle_.get(), bytes_.data() + offset, std::min<std::size_t>(bytes_.size() - offset, 128U * 1024U)); });
    if (count <= 0) fail("truncated archive member " + member_);
    offset += static_cast<std::size_t>(count);
   }
   return bytes_;
+ }
+ [[nodiscard]] BenchmarkCompilePipeline::Allowance allowance() const { return allowance_; }
+ void cpu(const std::function<void()>& work) const {
+  if (execution_) execution_->run(BenchmarkStage::Archive, {}, [&](std::size_t) { work(); }, allowance_);
+  else work();
  }
 
 private:
@@ -111,6 +122,8 @@ private:
   const char* detail = archive_error_string(handle_.get());
   invalid(context + ": " + (detail ? detail : "archive failure"));
  }
+ BenchmarkCompilePipeline* execution_ = nullptr;
+ BenchmarkCompilePipeline::Allowance allowance_;
  std::unique_ptr<archive, decltype(&archive_read_free)> handle_;
  archive_entry* entry_ = nullptr;
  std::string member_;
@@ -338,15 +351,17 @@ std::string component_identity(const CoconutComponent& component, Cancellation c
 }
 template <InventoryRecord T>
 std::string store_inventory(const std::filesystem::path& path, const InventoryHeader& header, std::span<const T> records, std::string_view expected_identity, Cancellation cancellation,
- const CoconutComponent* recovery = nullptr) {
+ const CoconutComponent* recovery = nullptr, StorageReservationPool* storage = nullptr) {
  throw_if_benchmark_cancelled(cancellation);
  (void)mmltk::common::io::ensure_parent_directory(path);
  InventoryOutput extent(nullptr, cancellation, true);
  (void)encode_inventory(extent, header, records, cancellation, recovery);
- require_storage(path, extent.byte_size(), "COCONut inventory staging", {});
+ StorageReservationPool destination(path, {}, storage);
+ auto allocation = destination.reserve(extent.byte_size(), "COCONut inventory staging");
  std::string temporary = path.string() + ".tmp.XXXXXX";
  auto file = mmltk::common::io::FileHandle::create_unique_output(temporary, 0);
  StagingFileCleanup cleanup(temporary);
+ allocation.watch(temporary);
  InventoryOutput output(&file, cancellation);
  const auto identity = encode_inventory(output, header, records, cancellation, recovery);
  if (!expected_identity.empty() && identity != expected_identity) invalid("component inventory/index identity mismatch");
@@ -413,7 +428,32 @@ public:
   if (!request.physical_membership) invalid("missing physical membership admission");
   if (request_.progress) request_.progress(0);
  }
- void consume(const CoconutRecord& record, std::span<const std::uint8_t> png) {
+ void retire_scratch() noexcept {
+  segment_by_id_ = decltype(segment_by_id_){};
+  support_ = decltype(support_){};
+  if (request_.recovery) request_.recovery->retire_scratch();
+ }
+ void consume(const CoconutRecord& record, std::span<const std::uint8_t> png, BenchmarkCompilePipeline::Allowance allowance = {}) {
+  if (!request_.execution) { consume_record(record, png); return; }
+  // This is a synchronous borrow of the row/batch, and one image is the largest
+  // nonpreemptible decode. Other releases' metadata and pixels keep advancing.
+  std::uint64_t pixels = std::uint64_t{record.width} * record.height;
+  if (png.size() >= 24) {
+   const auto dimension = [&](std::size_t offset) {
+    std::uint32_t value = 0;
+    for (std::size_t i = 0; i < 4; ++i) value = (value << 8) | png[offset + i];
+    return value;
+   };
+   pixels = std::uint64_t{dimension(16)} * dimension(20);
+  }
+  // The decoder still validates the actual PNG and source limits. This header
+  // estimate is scheduling input only, never geometry/membership admission.
+  pixels = std::min(pixels, request_.limits.max_pixels);
+  const auto bytes = request_.metadata_only ? std::uint64_t{0} : mmltk::common::math::checked_add(png.size(),
+   mmltk::common::math::checked_multiply(pixels, 32U, "COCONut workspace overflow"), "COCONut workspace overflow");
+  request_.execution->run(request_.metadata_only ? BenchmarkStage::Metadata : BenchmarkStage::Normalize, {bytes, 0}, [&](std::size_t) { consume_record(record, png); }, std::move(allowance));
+ }
+ void consume_record(const CoconutRecord& record, std::span<const std::uint8_t> png) {
   throw_if_benchmark_cancelled(request_.cancellation);
   const auto& physical = resolve(record);
   const auto key = physical_key(physical.source, physical.image_id);
@@ -629,16 +669,39 @@ std::uint32_t dimension(const Json& image, std::string_view field, const Coconut
  if (value == 0 || value > limits.max_dimension) invalid("image dimension exceeds admission");
  return static_cast<std::uint32_t>(value);
 }
+// Preserve the library parser and its input semantics while allowing its
+// suspended stack to return the lane to already-ready work at bounded bytes.
+struct CooperativeJsonIterator {
+ using value_type = std::uint8_t;
+ using difference_type = std::ptrdiff_t;
+ using pointer = const value_type*;
+ using reference = const value_type&;
+ using iterator_category = std::input_iterator_tag;
+ pointer position = nullptr, begin = nullptr;
+ BenchmarkCompilePipeline* execution = nullptr;
+ reference operator*() const { return *position; }
+ CooperativeJsonIterator& operator++() {
+  ++position;
+  if (execution && static_cast<std::size_t>(position - begin) % (256U << 10) == 0) execution->cooperate();
+  return *this;
+ }
+ CooperativeJsonIterator operator++(int) { auto previous = *this; ++*this; return previous; }
+ bool operator==(const CooperativeJsonIterator&) const = default;
+};
 // Parse one selected envelope row at a time. Returning false at object_end
 // immediately discards that row from the parser's array. Two sequential passes
 // permit either top-level field order without a release-sized JSON DOM.
 void json_rows(const CoconutImportRequest& request, std::span<const std::string_view> fields, const std::function<void(std::string_view, const Json&)>& consume) {
- std::ifstream input(request.annotation_json);
- if (!input) invalid("cannot open annotation JSON: " + request.annotation_json.string());
+ auto handles = request.execution ? request.execution->reserve(BenchmarkResources::handles(1, true)) : BenchmarkCompilePipeline::Allowance{};
+ const auto input = mmltk::common::io::MappedFile::open_readonly(request.annotation_json.string());
  std::size_t selected = fields.size();
  std::vector<bool> found(fields.size(), false);
  std::size_t record_events = 0;
- const auto parsed = Json::parse(input, [&](int depth, Json::parse_event_t event, Json& value) {
+ std::size_t scheduling_events = 0;
+ const auto parse = [&](std::size_t) {
+ const CooperativeJsonIterator begin{input.data(), input.data(), request.execution}, end{input.data() + input.size(), input.data(), request.execution};
+ const auto parsed = Json::parse(begin, end, [&](int depth, Json::parse_event_t event, Json& value) {
+  if (request.execution && ++scheduling_events % 128 == 0) request.execution->cooperate();
   if (depth > 16) invalid("annotation JSON nesting exceeds admission");
   if (depth == 0 && event == Json::parse_event_t::array_start) invalid("panoptic JSON requires an object envelope");
   if (depth == 1 && event == Json::parse_event_t::key) {
@@ -670,6 +733,9 @@ void json_rows(const CoconutImportRequest& request, std::span<const std::string_
  for (std::size_t i = 0; i < fields.size(); ++i) {
   if (!parsed.is_object() || !found[i]) invalid("missing panoptic envelope field " + std::string(fields[i]));
  }
+ };
+ if (request.execution) request.execution->run(BenchmarkStage::Metadata, {mmltk::common::math::checked_multiply(std::uint64_t{input.size()}, 32U, "COCONut JSON workspace overflow"), 0}, parse);
+ else parse(0);
 }
 std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
  throw_if_benchmark_cancelled(request.cancellation);
@@ -772,14 +838,20 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
   segment_ordinal += record.segments.size();
   result.push_back(std::move(record));
  });
- for (std::size_t i = 0; i < images.size(); ++i) {
-  throw_if_benchmark_cancelled(request.cancellation);
-  if (!joined_images[i]) invalid("offered JSON image has no annotation/mask join: " + images[i].file_name);
+ for (std::size_t begin = 0; begin < images.size(); begin += 256) {
+  const auto check_joins = [&](std::size_t) {
+   for (auto i = begin; i < std::min(images.size(), begin + 256); ++i) {
+    throw_if_benchmark_cancelled(request.cancellation);
+    if (!joined_images[i]) invalid("offered JSON image has no annotation/mask join: " + images[i].file_name);
+   }
+  };
+  if (request.execution) request.execution->run(BenchmarkStage::Metadata, {}, check_joins);
+  else check_joins(0);
  }
  return result;
 }
 std::vector<CoconutRecord> xlarge_records(const CoconutImportRequest& request) {
- Archive archive(request.mask_archive);
+ Archive archive(request.mask_archive, request.execution, 128ULL << 20);
  std::map<std::string, CoconutRecord> records;
  constexpr std::string_view prefix = "coconuts_xlarge/panseg_info/";
  while (archive.next(request.cancellation)) {
@@ -790,7 +862,7 @@ std::vector<CoconutRecord> xlarge_records(const CoconutImportRequest& request) {
   record.image_id = name.id;
   record.physical_stem = name.stem;
   const auto bytes = archive.read(16U * 1024U * 1024U, request.cancellation);
-  segments_from_json(Json::parse(bytes.begin(), bytes.end()), record, request.limits);
+  archive.cpu([&] { segments_from_json(Json::parse(bytes.begin(), bytes.end()), record, request.limits); });
   if (!records.emplace(name.stem, std::move(record)).second) invalid("duplicate XL info member: " + archive.member());
  }
  std::vector<CoconutRecord> result;
@@ -814,7 +886,16 @@ void consume_archive(const CoconutImportRequest& request, std::vector<CoconutRec
   if (!wanted.emplace(prefix + records[i].physical_stem + ".png", i).second) invalid("duplicate offered mask: " + records[i].physical_stem);
  }
  std::vector<bool> consumed(records.size(), false);
- Archive archive(request.mask_archive);
+ // The library keeps its decompressor and encoded capacity until stream close.
+ // Reserve that backing together with its largest legal synchronous consumer,
+ // so a borrowed PNG never waits for the scratch needed to retire its input.
+ const auto workspace = mmltk::common::math::checked_add(mmltk::common::math::checked_multiply(request.limits.max_png_bytes, 2U, "COCONut archive buffer overflow"),
+  mmltk::common::math::checked_multiply(request.limits.max_pixels, 32U, "COCONut archive consumer overflow"), "COCONut archive allowance overflow");
+ Archive archive(request.mask_archive, request.execution, workspace);
+ struct RetireConsumer {
+  Importer& importer;
+  ~RetireConsumer() { importer.retire_scratch(); }
+ } retire_consumer{importer};
  while (archive.next(request.cancellation)) {
   if (!archive.regular()) continue;
   const auto found = wanted.find(archive.member());
@@ -824,7 +905,7 @@ void consume_archive(const CoconutImportRequest& request, std::vector<CoconutRec
   }
   if (consumed[found->second]) invalid("duplicate archive mask: " + archive.member());
   const auto png = archive.read(request.limits.max_png_bytes, request.cancellation);
-  importer.consume(records[found->second], png);
+  importer.consume(records[found->second], png, archive.allowance());
   consumed[found->second] = true;
   std::vector<CoconutSegment>().swap(records[found->second].segments);
  }
@@ -926,7 +1007,8 @@ std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequ
  if (request.edition == CoconutEdition::Base || request.edition == CoconutEdition::RelabeledValidation) {
   if (request.parquet_shards.empty()) invalid("missing Parquet shards");
   read_coconut_parquet(
-   request.parquet_shards, request.limits, request.cancellation, [&](const CoconutRecord& record, std::span<const std::uint8_t> png) { importer.consume(record, png); }, request.metadata_only);
+   request.parquet_shards, request.limits, request.cancellation, [&](const CoconutRecord& record, std::span<const std::uint8_t> png) { importer.consume(record, png); }, request.metadata_only, request.execution,
+   [&] { importer.retire_scratch(); });
  } else {
   auto records = request.edition == CoconutEdition::XLarge ? xlarge_records(request) : json_records(request);
   if (request.metadata_only)
@@ -966,7 +1048,8 @@ std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& compon
  return removed;
 }
 std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(
- const std::filesystem::path& archive_path, const std::filesystem::path& cache_path, CoconutImageNamespace source, std::uint16_t shard, std::string archive_identity, Cancellation cancellation) {
+ const std::filesystem::path& archive_path, const std::filesystem::path& cache_path, CoconutImageNamespace source, std::uint16_t shard, std::string archive_identity, Cancellation cancellation, StorageReservationPool* storage,
+ BenchmarkCompilePipeline* execution) {
  if (archive_identity.empty()) invalid("archive inventory needs a physical identity");
  (void)coconut_namespace_name(source);
  throw_if_benchmark_cancelled(cancellation);
@@ -998,7 +1081,7 @@ std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(
    return result;
   } catch (const std::exception&) { throw_if_benchmark_cancelled(cancellation); }
  }
- Archive archive(archive_path);
+ Archive archive(archive_path, execution);
  std::vector<CoconutPhysicalImage> result;
  while (archive.next(cancellation)) {
   if (!archive.regular() || !archive.member().ends_with(".jpg")) continue;
@@ -1013,22 +1096,22 @@ std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(
   result.push_back(std::move(image));
  }
  throw_if_benchmark_cancelled(cancellation);
- std::ranges::sort(result, {}, &CoconutPhysicalImage::image_id);
+ archive.cpu([&] { std::ranges::sort(result, {}, &CoconutPhysicalImage::image_id); });
  throw_if_benchmark_cancelled(cancellation);
  for (std::size_t i = 0; i < result.size(); ++i) {
   throw_if_benchmark_cancelled(cancellation);
   if (i && result[i].image_id == result[i - 1].image_id) invalid("duplicate physical archive image ID");
  }
  expected.count = result.size();
- if (!cache_path.empty()) (void)store_inventory(cache_path, expected, std::span<const CoconutPhysicalImage>(result), {}, cancellation);
+ if (!cache_path.empty()) (void)store_inventory(cache_path, expected, std::span<const CoconutPhysicalImage>(result), {}, cancellation, nullptr, storage);
  throw_if_benchmark_cancelled(cancellation);
  return result;
 }
-void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component, Cancellation cancellation) {
+void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component, Cancellation cancellation, StorageReservationPool* storage) {
  validate_component(component, cancellation);
- const auto identity = store_inventory(index_path.string() + ".inventory", component_header(component), std::span(component.inventory), component.index.annotation_sha256, cancellation, &component);
+ const auto identity = store_inventory(index_path.string() + ".inventory", component_header(component), std::span(component.inventory), component.index.annotation_sha256, cancellation, &component, storage);
  throw_if_benchmark_cancelled(cancellation);
- store_normalized_annotation_index(index_path, component.index, cancellation);
+ store_normalized_annotation_index(index_path, component.index, cancellation, {}, storage);
  // The existing index completion jointly admits the binary inventory. A base
  // completion alone cannot be admitted if publication is interrupted here.
  const auto manifest_path = std::filesystem::path(index_path.string() + ".complete.json");

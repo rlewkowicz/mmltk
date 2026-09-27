@@ -11,6 +11,7 @@
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
+#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::common::concurrency::parallel_for_range_indexed;
@@ -61,6 +62,11 @@ struct ByteRange {
  std::size_t begin = 0U;
  std::size_t end = 0U;
 };
+
+void annotation_ranges(BenchmarkCompilePipeline* execution, std::size_t count, int workers, const std::function<void(int, std::size_t, std::size_t)>& consume, std::uint64_t workspace = 8U << 20, const std::function<void(std::size_t)>& retire = {}) {
+ if (execution) execution->for_each(BenchmarkStage::Metadata, count, {workspace, 0}, [&](std::size_t index) { consume(static_cast<int>(execution->current_lane()), index, index + 1); }, retire);
+ else parallel_for_range_indexed<std::size_t>(0U, count, workers, consume);
+}
 [[nodiscard]] bool consume_json_string_token(const char token, bool& in_string, bool& escaped) noexcept {
  if (!in_string) {
   if (token == '"') {
@@ -212,8 +218,8 @@ private:
  for (std::size_t index = 1U; index < boundaries.size(); ++index) { ranges.push_back(ByteRange{boundaries[index - 1U], boundaries[index]}); }
  return ranges;
 }
-[[nodiscard]] std::vector<ByteRange> partition_object_array(const PaddedMappedFile& file, const ByteRange array, const int requested_workers) {
- const int workers = effective_worker_count(requested_workers, array.end - array.begin);
+[[nodiscard]] std::vector<ByteRange> partition_object_array(const PaddedMappedFile& file, const ByteRange array, const int requested_workers, bool bounded = false) {
+ const std::size_t workers = bounded ? std::max<std::size_t>(1, (array.end - array.begin + 262143) / 262144) : static_cast<std::size_t>(effective_worker_count(requested_workers, array.end - array.begin));
  std::vector<std::size_t> boundaries;
  boundaries.reserve(static_cast<std::size_t>(workers) + 1U);
  boundaries.push_back(array.begin);
@@ -293,16 +299,31 @@ void for_each_object(const PaddedMappedFile& file, const ByteRange range, simdjs
  if (depth != 0 || in_string) { throw AnnotationDocumentRejected("partition ended inside a benchmark JSON object"); }
 }
 void parallel_object_array(const PaddedMappedFile& file, const ByteRange array, const int requested_workers, mmltk::common::concurrency::CancellationObservation cancel_requested,
- const std::function<void(int, simdjson::ondemand::object, std::uint64_t)>& callback) {
- const std::vector<ByteRange> ranges = partition_object_array(file, array, requested_workers);
+ const std::function<void(int, simdjson::ondemand::object, std::uint64_t)>& callback, BenchmarkCompilePipeline* execution = nullptr, std::uint64_t workspace = 0,
+ const std::function<void(int)>& retire = {}, const std::function<void(int)>& begin_chunk = {}) {
+ const std::vector<ByteRange> ranges = partition_object_array(file, array, requested_workers, execution != nullptr);
+ // Whole objects remain indivisible. Parser/coordinate capacity follows the
+ // largest actual partition, so a legal large object receives an oversized
+ // allowance instead of silently escaping the ordinary chunk estimate.
+ std::uint64_t largest = 0;
+ for (const auto range : ranges) largest = std::max(largest, std::uint64_t{range.end - range.begin});
+ const auto parser_bytes = largest > UINT64_MAX / 32 ? UINT64_MAX : largest * 32;
+ workspace = workspace > UINT64_MAX - parser_bytes ? UINT64_MAX : workspace + parser_bytes;
  const int workers = effective_worker_count(requested_workers, ranges.size());
- parallel_for_range_indexed<std::size_t>(0U, ranges.size(), workers, [&](const int worker, const std::size_t begin, const std::size_t end) {
-  simdjson::ondemand::parser parser;
+ std::vector<simdjson::ondemand::parser> parsers(execution ? execution->workers() : static_cast<std::size_t>(workers));
+ const auto release = [&](std::size_t worker) {
+  if (retire) retire(static_cast<int>(worker));
+  parsers[worker] = {};
+ };
+ const auto consume = [&](const int worker, const std::size_t begin, const std::size_t end) {
+  auto& parser = parsers[static_cast<std::size_t>(worker)];
+  if (begin_chunk) begin_chunk(worker);
   for (std::size_t range_index = begin; range_index < end; ++range_index) {
    throw_if_benchmark_cancelled(cancel_requested);
    for_each_object(file, ranges[range_index], parser, [&](simdjson::ondemand::object object, std::uint64_t ordinal) { callback(worker, object, ordinal); });
   }
- });
+ };
+ annotation_ranges(execution, ranges.size(), workers, consume, workspace, release);
 }
 [[nodiscard]] std::uint16_t parse_objects365_shard(const std::string_view file_name) {
  const std::size_t patch = file_name.find("patch");
@@ -909,12 +930,12 @@ struct OpenImagesCandidate {
   return std::nullopt;
  }
 }
-[[nodiscard]] std::vector<ByteRange> newline_ranges(const PaddedMappedFile& file, const int requested_workers) {
+[[nodiscard]] std::vector<ByteRange> newline_ranges(const PaddedMappedFile& file, const int requested_workers, bool bounded = false) {
  const char* data = file.data();
  const char* first_newline = static_cast<const char*>(std::memchr(data, '\n', file.size()));
  if (first_newline == nullptr) { throw std::runtime_error("benchmark CSV annotation file has no header line"); }
  const std::size_t data_begin = static_cast<std::size_t>(first_newline - data) + 1U;
- const int workers = effective_worker_count(requested_workers, file.size() - data_begin);
+ const auto workers = bounded ? checked_cast<int>(std::max<std::size_t>(1, (file.size() - data_begin + 262143) / 262144), "CSV chunk count overflow") : effective_worker_count(requested_workers, file.size() - data_begin);
  std::vector<std::size_t> boundaries;
  boundaries.reserve(static_cast<std::size_t>(workers) + 1U);
  boundaries.push_back(data_begin);
@@ -1154,10 +1175,10 @@ NormalizedAnnotationIndex parse_coco_style_annotations(
  const ByteRange categories_array = find_named_top_level_array(file, "categories");
  const CategoryLookup category_lookup = make_numeric_lookup(mappings);
  validate_numeric_categories(file, categories_array, category_lookup, options.cancel_requested);
- const int workers = effective_worker_count(options.num_workers, images_array.end - images_array.begin);
+ const int workers = options.execution ? static_cast<int>(options.execution->workers()) : effective_worker_count(options.num_workers, images_array.end - images_array.begin);
  std::vector<std::vector<ParsedImage>> worker_images(static_cast<std::size_t>(workers));
  parallel_object_array(file, images_array, workers, options.cancel_requested,
-  [&](const int worker, simdjson::ondemand::object object, std::uint64_t) { worker_images[static_cast<std::size_t>(worker)].push_back(parse_image_object(object, options.source)); });
+  [&](const int worker, simdjson::ondemand::object object, std::uint64_t) { worker_images[static_cast<std::size_t>(worker)].push_back(parse_image_object(object, options.source)); }, options.execution);
  std::size_t image_count = 0U;
  for (const auto& local : worker_images) { image_count += local.size(); }
  std::vector<ParsedImage> images;
@@ -1169,7 +1190,11 @@ NormalizedAnnotationIndex parse_coco_style_annotations(
  }
  std::unordered_map<std::uint64_t, std::uint32_t> image_lookup;
  image_lookup.reserve(images.size());
- for (std::size_t index = 0U; index < images.size(); ++index) { image_lookup.emplace(images[index].id, checked_cast<std::uint32_t>(index, "benchmark image index overflow")); }
+ std::uint64_t normalization_pixels = 0;
+ for (std::size_t index = 0U; index < images.size(); ++index) {
+  image_lookup.emplace(images[index].id, checked_cast<std::uint32_t>(index, "benchmark image index overflow"));
+  normalization_pixels = std::max(normalization_pixels, std::uint64_t{images[index].width} * images[index].height);
+ }
  std::vector<std::uint32_t> counts(images.size(), 0U);
  // Capacity only: inspect identities without constructing segmentation storage.
  // Semantic admission, rejection counters, and mask materialization have one owner below.
@@ -1194,7 +1219,7 @@ NormalizedAnnotationIndex parse_coco_style_annotations(
   }
   const auto previous = std::atomic_ref<std::uint32_t>(counts[*image_index]).fetch_add(1U, std::memory_order_relaxed);
   if (previous == std::numeric_limits<std::uint32_t>::max()) throw std::overflow_error("benchmark per-image annotation capacity overflow");
- });
+ }, options.execution);
  std::vector<std::uint64_t> offsets(images.size() + 1U, 0U);
  for (std::size_t index = 0U; index < images.size(); ++index) {
   if (counts[index] > std::numeric_limits<std::uint64_t>::max() - offsets[index]) { throw std::overflow_error("benchmark normalized annotation offset overflow"); }
@@ -1204,8 +1229,8 @@ NormalizedAnnotationIndex parse_coco_style_annotations(
  std::vector<std::vector<RLEPair>> masks(boxes.size());
  std::vector<std::uint64_t> cursors(offsets.begin(), offsets.end() - 1);
  std::vector<AnnotationRejectCounts> worker_rejected(static_cast<std::size_t>(workers));
- // Independent worker-local parsers retain their capacity and cannot invalidate
- // the outer document while decoding a borrowed segmentation slice.
+ // Independent parsers cannot invalidate a borrowed outer document. Capacity
+ // survives adjacent chunks with its charged lane, until pressure or pass retirement.
  std::vector<simdjson::ondemand::parser> segmentation_parsers(static_cast<std::size_t>(workers));
  std::vector<SegmentationScratch> segmentation_scratch(static_cast<std::size_t>(workers));
  parallel_object_array(file, annotations_array, workers, options.cancel_requested, [&](const int worker, simdjson::ondemand::object object, std::uint64_t ordinal) {
@@ -1234,6 +1259,13 @@ NormalizedAnnotationIndex parse_coco_style_annotations(
    boxes[target] = candidate->box;
    masks[target] = std::move(candidate->mask_rle);
   }
+ }, options.execution, normalization_pixels > UINT64_MAX / 2 ? UINT64_MAX : normalization_pixels * 2, [&](int worker) {
+  segmentation_scratch[static_cast<std::size_t>(worker)] = {};
+  segmentation_parsers[static_cast<std::size_t>(worker)] = {};
+ }, [&](int worker) {
+  trace_benchmark_event(options.trace, "benchmark.annotations.workspace", [&] {
+   return nlohmann::json{{"lane", worker}, {"retained_dense_bytes", segmentation_scratch[static_cast<std::size_t>(worker)].dense.capacity()}};
+  });
  });
  NormalizedAnnotationIndex result = begin_normalized_index_result(options.source, options.split, std::move(annotation_sha256), worker_rejected);
  compact_annotations(&result, images, offsets, cursors, std::move(boxes), std::move(masks), options.keep_images_without_mapped_boxes, options.cancel_requested);
@@ -1254,7 +1286,7 @@ NormalizedAnnotationIndex parse_open_images_annotations(const std::filesystem::p
   if (!category_lookup.emplace(mapping.source_id, mapping.target_id).second) { throw std::runtime_error("Open Images category mapping contains a duplicate MID"); }
  }
  PaddedMappedFile file(boxes_csv_path);
- const std::vector<ByteRange> ranges = newline_ranges(file, options.num_workers);
+ const std::vector<ByteRange> ranges = newline_ranges(file, options.num_workers, options.execution != nullptr);
  const int workers = effective_worker_count(options.num_workers, ranges.size());
  struct ImageRun {
   std::uint64_t image_id = 0U;
@@ -1262,7 +1294,7 @@ NormalizedAnnotationIndex parse_open_images_annotations(const std::filesystem::p
  };
  std::vector<std::vector<ImageRun>> worker_runs(ranges.size());
  std::vector<AnnotationRejectCounts> worker_rejected(ranges.size());
- parallel_for_range_indexed<std::size_t>(0U, ranges.size(), workers, [&](const int, const std::size_t begin, const std::size_t end) {
+ annotation_ranges(options.execution, ranges.size(), workers, [&](const int, const std::size_t begin, const std::size_t end) {
   for (std::size_t range_index = begin; range_index < end; ++range_index) {
    auto& runs = worker_runs[range_index];
    auto& rejected = worker_rejected[range_index];
@@ -1305,7 +1337,7 @@ NormalizedAnnotationIndex parse_open_images_annotations(const std::filesystem::p
  }
  std::vector<NormalizedBox> boxes(checked_cast<std::size_t>(offsets.back(), "Open Images box count overflow"));
  std::vector<std::uint64_t> cursors(offsets.begin(), offsets.end() - 1);
- parallel_for_range_indexed<std::size_t>(0U, ranges.size(), workers, [&](const int, const std::size_t begin, const std::size_t end) {
+ annotation_ranges(options.execution, ranges.size(), workers, [&](const int, const std::size_t begin, const std::size_t end) {
   for (std::size_t range_index = begin; range_index < end; ++range_index) {
    for_each_csv_line(file, ranges[range_index], options.cancel_requested, [&](const std::string_view line) {
     AnnotationRejectCounts ignored;
@@ -1382,7 +1414,7 @@ void remove_normalized_annotation_index(const std::filesystem::path& path) {
  remove_cache_path(path);
 }
 void store_normalized_annotation_index(
- const std::filesystem::path& path, const NormalizedAnnotationIndex& index, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace) {
+ const std::filesystem::path& path, const NormalizedAnnotationIndex& index, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, StorageReservationPool* storage) {
  validate_normalized_records(index, cancel_requested);
  if (index.split.empty() || index.annotation_sha256.empty() || index.split.size() >= NormalizedIndexHeader{}.split.size() ||
      kBenchmarkMappingRevision.size() >= NormalizedIndexHeader{}.mapping_revision.size()) {
@@ -1395,7 +1427,8 @@ void store_normalized_annotation_index(
  const std::uint64_t mask_rle_offset = box_offset + static_cast<std::uint64_t>(index.boxes.size()) * sizeof(NormalizedBox);
  if (index.mask_rle_pairs.size() > (std::numeric_limits<std::uint64_t>::max() - mask_rle_offset) / sizeof(RLEPair)) { throw std::overflow_error("normalized mask block size overflow"); }
  const std::uint64_t total_size = mask_rle_offset + static_cast<std::uint64_t>(index.mask_rle_pairs.size()) * sizeof(RLEPair);
- require_storage(path, total_size, "normalized annotation index staging", trace);
+ StorageReservationPool destination(path, trace, storage);
+ auto allocation = destination.reserve(total_size, "normalized annotation index staging");
  NormalizedIndexHeader header;
  header.source = static_cast<std::uint8_t>(index.source);
  header.image_count = checked_cast<std::uint32_t>(index.images.size(), "normalized image count overflow");
@@ -1411,9 +1444,12 @@ void store_normalized_annotation_index(
  header.rejected = encode_rejected(index.rejected);
  (void)mmltk::common::io::ensure_parent_directory(path);
  std::string staging_text = path.string() + ".tmp.XXXXXX";
- FileHandle staging = FileHandle::create_unique_output(staging_text, checked_cast<std::size_t>(total_size, "normalized index size overflow"));
- const std::filesystem::path staging_path(staging_text);
+ FileHandle staging = FileHandle::create_unique_output(staging_text, 0);
+ std::filesystem::path staging_path;
  try {
+  staging_path = staging_text;
+  allocation.watch(staging_path);
+  staging.preallocate(checked_cast<std::size_t>(total_size, "normalized index size overflow"));
   staging.pwrite_all(&header, sizeof(header), 0U);
   staging.pwrite_all(index.images.data(), index.images.size() * sizeof(NormalizedImage), checked_cast<std::size_t>(image_offset, "normalized image offset overflow"));
   staging.pwrite_all(index.boxes.data(), index.boxes.size() * sizeof(NormalizedBox), checked_cast<std::size_t>(box_offset, "normalized box offset overflow"));
@@ -1441,8 +1477,7 @@ void store_normalized_annotation_index(
   trace_benchmark_event(trace, "benchmark.annotations.cache_store",
    [&] { return nlohmann::json{{"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"bytes", total_size}}; });
  } catch (...) {
-  std::error_code ignored;
-  std::filesystem::remove(staging_path, ignored);
+  (void)::unlink(staging_text.c_str());
   throw;
  }
 }

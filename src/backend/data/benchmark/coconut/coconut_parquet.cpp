@@ -1,4 +1,6 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
+#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
+#include "src/common/math/checked_arithmetic.h"
 #include <arrow/api.h>
 #include <arrow/memory_pool.h>
 #include <parquet/arrow/reader.h>
@@ -162,11 +164,26 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
 }
 }  // namespace
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only) {
+ const CoconutRecordConsumer& consumer, bool metadata_only, BenchmarkCompilePipeline* execution, const std::function<void()>& retire_consumer_scratch) {
  std::uint64_t row_ordinal = 0, segment_ordinal = 0;
  for (const auto& path : shards) {
   throw_if_benchmark_cancelled(cancellation);
   try {
+   // The complete pool owner (pages/dictionaries/batches), descriptor and its
+   // synchronous consumers' maximum admitted workspace share one allowance.
+   // It precedes allocation, survives the last borrowed PNG, and lets a legal
+   // oversized row progress without holding input while waiting for scratch.
+   const auto workspace = metadata_only ? std::uint64_t{0} : mmltk::common::math::checked_multiply(limits.max_pixels, 32U, "COCONut Parquet consumer workspace overflow");
+   const auto bytes = mmltk::common::math::checked_add(256ULL << 20, workspace, "COCONut Parquet allowance overflow");
+   auto allowance = execution ? execution->reserve({bytes, 1, true}) : BenchmarkCompilePipeline::Allowance{};
+   struct RetireConsumer {
+    const std::function<void()>& callback;
+    ~RetireConsumer() { if (callback) callback(); }
+   } retire_consumer{retire_consumer_scratch};
+   const auto cpu = [&](const std::function<void()>& work) {
+    if (execution) execution->run(metadata_only ? BenchmarkStage::Metadata : BenchmarkStage::Normalize, {}, [&](std::size_t) { work(); }, allowance);
+    else work();
+   };
    // Private, single-threaded capped pool covers page/dictionary/batch allocations.
    // Fixed buffered input avoids whole column-region reads despite pre_buffer(false).
    arrow::ProxyMemoryPool tracked(arrow::system_memory_pool());
@@ -201,9 +218,9 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    while (true) {
     throw_if_benchmark_cancelled(cancellation);
     std::shared_ptr<arrow::RecordBatch> batch;
-    check(batches->ReadNext(&batch));
+    cpu([&] { check(batches->ReadNext(&batch)); });
     if (!batch) break;
-    read_batch(*batch, limits, cancellation, consumer, row_ordinal, segment_ordinal, metadata_only);
+    cpu([&] { read_batch(*batch, limits, cancellation, consumer, row_ordinal, segment_ordinal, metadata_only); });
    }
   } catch (const ParquetFormatError& error) {
    // Consumer failures retain the types used by scoped cache recovery.

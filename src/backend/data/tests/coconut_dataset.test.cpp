@@ -6,6 +6,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
+#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "benchmark_http_fixture.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
 #include <sys/stat.h>
@@ -70,6 +71,7 @@ std::string png(int width, int height, std::span<const std::uint32_t> ids) {
 void tar(const std::filesystem::path& path, std::span<const std::pair<std::string, std::string>> members, bool symlink = false) {
  std::unique_ptr<archive, decltype(&archive_write_free)> writer(archive_write_new(), archive_write_free);
  REQUIRE(archive_write_set_format_pax_restricted(writer.get()) == ARCHIVE_OK);
+ if (path.extension() == ".gz") REQUIRE(archive_write_add_filter_gzip(writer.get()) == ARCHIVE_OK);
  REQUIRE(archive_write_open_filename(writer.get(), path.c_str()) == ARCHIVE_OK);
  for (const auto& [name, bytes] : members) {
   std::unique_ptr<archive_entry, decltype(&archive_entry_free)> entry(archive_entry_new(), archive_entry_free);
@@ -3308,6 +3310,8 @@ TEST_CASE("COCONut receives metadata while a managed release lane is importing m
   if (edition != blocked && boundary == CoconutReleaseBoundary::MetadataConsumed && ++consumed == catalog.releases.size() - 1) received.set_value();
  };
  config.num_workers = 3;
+ SECTION("one shared CPU") { config.num_workers = 1; }
+ SECTION("three shared CPUs") {}
  std::atomic<bool> cancelled{false};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog); });
@@ -3455,4 +3459,123 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
   annotation_server->Check();
  }
  CHECK(CompiledDataset::open(local.output / "val.bin").image_entries().size() == 1);
+}
+
+TEST_CASE("cold benchmark readers finish oversized grants with retained release control on one CPU", "[benchmark][coconut][pipeline]") {
+ ScopedTempDir root("cold-shared-readers");
+ std::atomic<bool> cancelled{false};
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536, .descriptors = 32}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ auto release = execution.reserve(BenchmarkResources::handles(2, true, 15));
+ const std::array<std::uint32_t, 1> ids{1};
+ const auto mask = png(1, 1, ids);
+ const std::array physical{coco(7), objects(1)};
+ auto input = request(physical);
+ input.execution = &execution;
+ SECTION("Parquet retains its complete batch and consumer grant") {
+  const auto path = root.path() / "input.parquet";
+  parquet_file(path, Json::array({hf_row(7, mask, Json::array({segment()}), 1, 1)}));
+  input.parquet_shards = {path};
+ }
+ SECTION("raw masks retain their archive and consumer grant") {
+  input.edition = CoconutEdition::XLarge;
+  input.mask_archive = root.path() / "input.tar";
+  const std::array<std::pair<std::string, std::string>, 2> entries{{
+   {"coconuts_xlarge/panseg_info/objects365_v2_00000001.json", Json::array({segment()}).dump()},
+   {"coconuts_xlarge/panseg/objects365_v2_00000001.png", mask}}};
+  tar(input.mask_archive, entries);
+ }
+ SECTION("gzip extraction retains source and directory control") {
+  const auto path = root.path() / "images.tar.gz";
+  const std::array<std::pair<std::string, std::string>, 1> entries{{{"train2017/000000000007.jpg", mask}}};
+  tar(path, entries);
+  const std::array<std::uint64_t, 1> selected{7};
+  auto work = std::async(std::launch::async, [&] {
+   return extract_selected_archive_images({.archive_path = path, .source_identity = "cold-gzip", .output_root = root.path() / "images", .source = "coco", .shard = "train2017",
+    .selected_image_ids = selected, .image_id_parser = [](std::string_view) { return std::optional<std::uint64_t>{7}; }, .execution = &execution});
+  });
+  const mmltk::testsupport::ScopedTestCleanup cancel([&] { cancelled.store(true); });
+  CHECK(mmltk::testsupport::await_test_future(work, "cold gzip shared grant").image_count == 1);
+  return;
+ }
+ auto work = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
+ const mmltk::testsupport::ScopedTestCleanup cancel([&] { cancelled.store(true); });
+ const auto result = mmltk::testsupport::await_test_future(work, "cold annotation shared grant");
+ REQUIRE(result.size() == 1);
+ CHECK(result.front().index.images.size() == 1);
+ CHECK(execution.try_reserve({65537, 0, true}).has_value());
+}
+
+TEST_CASE("COCONut JSON source rejection leaves shared CPU admission usable", "[benchmark][coconut][pipeline]") {
+ ScopedTempDir root("shared-json-source-errors");
+ BenchmarkCompilePipeline execution(1);
+ const std::array physical{objects(1)};
+ auto input = request(physical, CoconutEdition::Large);
+ input.execution = &execution;
+ input.metadata_only = true;
+ input.annotation_json = root.path() / "annotations.json";
+ Json image{{"id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"width", 1}, {"height", 1}};
+ Json annotation{{"image_id", 1}, {"file_name", "objects365_v2_00000001.png"}, {"segments_info", Json::array({segment()})}};
+ json_file(input.annotation_json, {{"images", Json::array({image, image})}, {"annotations", Json::array({annotation})}});
+ CHECK_THROWS(import_coconut_annotations(input));
+ json_file(input.annotation_json, {{"images", Json::array({image})}, {"annotations", Json::array({annotation})}});
+ const auto result = import_coconut_annotations(input);
+ REQUIRE(result.size() == 1);
+ CHECK(result.front().index.images.size() == 1);
+}
+
+TEST_CASE("COCONut JSON parsing yields one shared CPU before its source pass finishes", "[benchmark][coconut][pipeline]") {
+ ScopedTempDir root("shared-json-fairness");
+ BenchmarkCompilePipeline execution(1);
+ const auto images = root.path() / "images";
+ prepare_cached_image_directory(images);
+ const std::array<std::uint32_t, 1> mask_ids{1};
+ const auto encoded = png(1, 1, mask_ids);
+ write_cached_image_atomically(cached_image_path(images, 7), {reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size()}, {});
+ PreparedBenchmarkSplit split;
+ split.name = "train";
+ split.class_names = {"person"};
+ split.sources = {{images}};
+ split.images = {{7, 1, 1, 0, 0, 0}};
+ BenchmarkWriteRequest pixels{.split = split, .output_path = root.path() / "result.bin", .resolution = 1, .num_workers = 1, .execution = &execution};
+ BenchmarkSplitWriter writer(pixels);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ std::vector<CoconutPhysicalImage> physical;
+ Json rows = Json::array(), annotations = Json::array();
+ for (unsigned id = 1; id <= 256; ++id) {
+  physical.push_back(objects(id));
+  const auto name = std::filesystem::path(physical.back().member).stem().string() + ".png";
+  rows.push_back({{"id", id}, {"file_name", name}, {"width", 1}, {"height", 1}});
+  annotations.push_back({{"image_id", id}, {"file_name", name}, {"segments_info", Json::array({segment()})}});
+ }
+ auto input = request(physical, CoconutEdition::Large);
+ input.metadata_only = true;
+ input.execution = &execution;
+ input.annotation_json = root.path() / "annotations.json";
+ json_file(input.annotation_json, {{"images", std::move(rows)}, {"annotations", std::move(annotations)}});
+ mmltk::testsupport::TestGate entered("JSON parser shared lane"), later("JSON parser remains in its source pass");
+ struct ObserveParser {
+  BenchmarkCompilePipeline& execution;
+  mmltk::testsupport::TestGate& entered;
+  mmltk::testsupport::TestGate& later;
+  mutable std::size_t polls = 0;
+  bool cancelled() const noexcept {
+   try { (void)execution.current_lane(); } catch (...) { return false; }
+   if (++polls == 1) entered.receipt().ArriveAndWait();
+   if (polls == 128) later.receipt().ArriveAndWait();
+   return false;
+  }
+ } observed{execution, entered, later};
+ input.cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(observed);
+ auto work = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { entered.Release(); later.Release(); });
+ REQUIRE(entered.WaitEntered(std::chrono::seconds(2)));
+ execution.image_ready({images, 7, {}, execution.source_generation(images), {}, true});
+ entered.Release();
+ REQUIRE(later.WaitEntered(std::chrono::seconds(2)));
+ CHECK(writer.image_complete(0));
+ later.Release();
+ const auto result = mmltk::testsupport::await_test_future(work, "shared JSON source pass");
+ REQUIRE(result.size() == 1);
+ CHECK(result.front().index.images.size() == 256);
 }

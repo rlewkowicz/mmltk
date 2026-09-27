@@ -61,17 +61,18 @@ std::string_view CoconutMaskRecovery::original_identity(CoconutImageNamespace so
  const auto* selected = originals_.originals(source);
  return selected && selected->index ? std::string_view(selected->index->annotation_sha256) : std::string_view{};
 }
+void CoconutMaskRecovery::retire_scratch() noexcept { workspace_ = Workspace{}; }
 void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecord& record, std::uint32_t width, std::uint32_t height, std::span<CoconutSegmentSupport> support,
  CoconutRecoveryImage& facts, Cancellation cancellation) {
  // Reset even after cancellation or an unavailable image; clear retains capacity.
- groups_.clear();
- ordinals_.clear();
- candidates_.clear();
- represented_.clear();
- remaining_.clear();
- identities_.clear();
- union_.clear();
- scratch_.clear();
+ workspace_.groups.clear();
+ workspace_.ordinals.clear();
+ workspace_.candidates.clear();
+ workspace_.represented.clear();
+ workspace_.remaining.clear();
+ workspace_.identities.clear();
+ workspace_.combined.clear();
+ workspace_.scratch.clear();
  throw_if_benchmark_cancelled(cancellation);
  const auto* selected = originals_.originals(source);
  if (!selected || !selected->index) return;
@@ -98,64 +99,64 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
  };
  for (std::size_t ordinal = 0; ordinal < record.segments.size(); ++ordinal) {
   throw_if_benchmark_cancelled(cancellation);
-  if (record.segments[ordinal].isthing) ordinals_.push_back(ordinal);
+  if (record.segments[ordinal].isthing) workspace_.ordinals.push_back(ordinal);
  }
- std::ranges::sort(ordinals_, [&](auto a, auto b) {
+ std::ranges::sort(workspace_.ordinals, [&](auto a, auto b) {
   throw_if_benchmark_cancelled(cancellation);
   if (key(a) != key(b)) return key(a) < key(b);
   if (dropped(a) != dropped(b)) return dropped(a);
   return dropped(a) ? record.segments[a].id < record.segments[b].id : a < b;
  });
- for (std::size_t i = 0; i < ordinals_.size(); ++i) {
+ for (std::size_t i = 0; i < workspace_.ordinals.size(); ++i) {
   throw_if_benchmark_cancelled(cancellation);
-  const auto group_key = key(ordinals_[i]);
-  if (groups_.empty() || groups_.back().key != group_key) groups_.push_back({.key = group_key, .begin = i});
-  auto& group = groups_.back();
+  const auto group_key = key(workspace_.ordinals[i]);
+  if (workspace_.groups.empty() || workspace_.groups.back().key != group_key) workspace_.groups.push_back({.key = group_key, .begin = i});
+  auto& group = workspace_.groups.back();
   group.end = i + 1;
-  if (dropped(ordinals_[i])) ++group.dropped;
+  if (dropped(workspace_.ordinals[i])) ++group.dropped;
  }
  for (const auto& box : std::span(index.boxes).subspan(image.first_box, image.box_count)) {
   throw_if_benchmark_cancelled(cancellation);
   const GroupKey group_key{box.source_category_id, (box.flags & kAnnotationCrowd) != 0, (box.flags & kAnnotationIgnore) != 0};
-  const auto group = std::ranges::lower_bound(groups_, group_key, {}, &Group::key);
-  if (group == groups_.end() || group->key != group_key || group->dropped == 0) continue;
-  Candidate candidate{.box = &box, .group = static_cast<std::size_t>(group - groups_.begin())};
+  const auto group = std::ranges::lower_bound(workspace_.groups, group_key, {}, &Group::key);
+  if (group == workspace_.groups.end() || group->key != group_key || group->dropped == 0) continue;
+  Candidate candidate{.box = &box, .group = static_cast<std::size_t>(group - workspace_.groups.begin())};
   if (!candidate_mask(index, width, height, candidate, cancellation)) group->valid = false;
-  candidates_.push_back(candidate);
+  workspace_.candidates.push_back(candidate);
   ++group->candidate_count;
  }
- std::ranges::sort(candidates_, [&](const Candidate& a, const Candidate& b) {
+ std::ranges::sort(workspace_.candidates, [&](const Candidate& a, const Candidate& b) {
   throw_if_benchmark_cancelled(cancellation);
   return a.group < b.group;
  });
  std::size_t candidate_begin = 0;
- for (const auto& group : groups_) {
+ for (const auto& group : workspace_.groups) {
   throw_if_benchmark_cancelled(cancellation);
-  const auto candidates = std::span(candidates_).subspan(candidate_begin, group.candidate_count);
+  const auto candidates = std::span(workspace_.candidates).subspan(candidate_begin, group.candidate_count);
   candidate_begin += group.candidate_count;
   if (!group.valid || group.dropped == 0 || candidates.size() != group.end - group.begin) continue;
-  identities_.clear();
+  workspace_.identities.clear();
   for (const auto& candidate : candidates) {
    throw_if_benchmark_cancelled(cancellation);
-   identities_.push_back(candidate.box->annotation_id);
+   workspace_.identities.push_back(candidate.box->annotation_id);
   }
-  std::ranges::sort(identities_, [&](auto a, auto b) {
+  std::ranges::sort(workspace_.identities, [&](auto a, auto b) {
    throw_if_benchmark_cancelled(cancellation);
    return a < b;
   });
   bool valid = true;
-  for (std::size_t i = 1; i < identities_.size(); ++i) {
+  for (std::size_t i = 1; i < workspace_.identities.size(); ++i) {
    throw_if_benchmark_cancelled(cancellation);
-   if (identities_[i - 1] == identities_[i]) {
+   if (workspace_.identities[i - 1] == workspace_.identities[i]) {
     valid = false;
     break;
    }
   }
   if (!valid) continue;
-  represented_.assign(candidates.size(), 0);
+  workspace_.represented.assign(candidates.size(), 0);
   for (std::size_t i = group.begin + group.dropped; i < group.end; ++i) {
    throw_if_benchmark_cancelled(cancellation);
-   const auto ordinal = ordinals_[i];
+   const auto ordinal = workspace_.ordinals[i];
    if (support[ordinal].runs.empty()) {
     valid = false;
     break;
@@ -170,27 +171,27 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
     }
     match = j;
    }
-   if (!valid || match == candidates.size() || represented_[match]) {
+   if (!valid || match == candidates.size() || workspace_.represented[match]) {
     valid = false;
     break;
    }
-   represented_[match] = 1;
+   workspace_.represented[match] = 1;
   }
   if (!valid) continue;
-  remaining_.clear();
+  workspace_.remaining.clear();
   for (std::size_t i = 0; i < candidates.size(); ++i) {
    throw_if_benchmark_cancelled(cancellation);
-   if (!represented_[i]) remaining_.push_back(&candidates[i]);
+   if (!workspace_.represented[i]) workspace_.remaining.push_back(&candidates[i]);
   }
-  if (remaining_.size() != group.dropped) continue;
-  std::ranges::sort(remaining_, [&](const Candidate* a, const Candidate* b) {
+  if (workspace_.remaining.size() != group.dropped) continue;
+  std::ranges::sort(workspace_.remaining, [&](const Candidate* a, const Candidate* b) {
    throw_if_benchmark_cancelled(cancellation);
    return a->box->annotation_id < b->box->annotation_id;
   });
-  for (std::size_t i = 0; i < remaining_.size(); ++i) {
+  for (std::size_t i = 0; i < workspace_.remaining.size(); ++i) {
    throw_if_benchmark_cancelled(cancellation);
-   const auto ordinal = ordinals_[group.begin + i];
-   const auto& candidate = *remaining_[i];
+   const auto ordinal = workspace_.ordinals[group.begin + i];
+   const auto& candidate = *workspace_.remaining[i];
    auto& target = support[ordinal];
    target.recovered = *candidate.box;
    target.runs.assign(candidate.runs.begin(), candidate.runs.end());
@@ -200,26 +201,26 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
     target.area += run.length;
    }
    target.bounds = candidate.bounds;
-   union_.insert(union_.end(), candidate.runs.begin(), candidate.runs.end());
+   workspace_.combined.insert(workspace_.combined.end(), candidate.runs.begin(), candidate.runs.end());
    if (ordinal > UINT64_MAX - record.first_segment_ordinal) throw std::runtime_error("COCONut: source ordinal overflow");
    facts.objects.push_back({record.segments[ordinal].id, record.first_segment_ordinal + ordinal, record.segments[ordinal].category_id, candidate.box->annotation_id});
   }
  }
- if (union_.empty()) return;
+ if (workspace_.combined.empty()) return;
  throw_if_benchmark_cancelled(cancellation);
- std::ranges::sort(union_, {}, [](RLEPair run) { return run.start; });
+ std::ranges::sort(workspace_.combined, {}, [](RLEPair run) { return run.start; });
  std::size_t used = 0;
- for (const auto run : union_) {
+ for (const auto run : workspace_.combined) {
   throw_if_benchmark_cancelled(cancellation);
-  if (used && run.start <= union_[used - 1].start + union_[used - 1].length) {
-   auto& prior = union_[used - 1];
+  if (used && run.start <= workspace_.combined[used - 1].start + workspace_.combined[used - 1].length) {
+   auto& prior = workspace_.combined[used - 1];
    prior.length = std::max(prior.start + prior.length, run.start + run.length) - prior.start;
   } else
-   union_[used++] = run;
+   workspace_.combined[used++] = run;
  }
- union_.resize(used);
+ workspace_.combined.resize(used);
  dataset::RowMajorMaskBounds recovered_bounds;
- for (const auto run : union_) {
+ for (const auto run : workspace_.combined) {
   throw_if_benchmark_cancelled(cancellation);
   dataset::include_row_major_mask_run(&recovered_bounds, run.start, run.start + run.length, width);
  }
@@ -229,21 +230,21 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
   if (!record.segments[ordinal].isthing || target.recovered || target.runs.empty() || target.bounds.max_x <= recovered_bounds.min_x || recovered_bounds.max_x <= target.bounds.min_x ||
       target.bounds.max_y <= recovered_bounds.min_y || recovered_bounds.max_y <= target.bounds.min_y)
    continue;
-  scratch_.clear();
+  workspace_.scratch.clear();
   std::uint64_t area = 0;
   dataset::RowMajorMaskBounds bounds;
   const auto emit = [&](std::uint32_t begin, std::uint32_t end) {
    if (begin == end) return;
-   scratch_.push_back({begin, end - begin});
+   workspace_.scratch.push_back({begin, end - begin});
    area += end - begin;
    dataset::include_row_major_mask_run(&bounds, begin, end, width);
   };
-  auto cut = std::lower_bound(union_.begin(), union_.end(), target.runs.front().start, [](RLEPair value, std::uint32_t position) { return value.start + value.length <= position; });
+  auto cut = std::lower_bound(workspace_.combined.begin(), workspace_.combined.end(), target.runs.front().start, [](RLEPair value, std::uint32_t position) { return value.start + value.length <= position; });
   for (const auto run : target.runs) {
    throw_if_benchmark_cancelled(cancellation);
    auto cursor = run.start;
    const auto end = run.start + run.length;
-   while (cut != union_.end() && cut->start < end) {
+   while (cut != workspace_.combined.end() && cut->start < end) {
     throw_if_benchmark_cancelled(cancellation);
     const auto cut_end = cut->start + cut->length;
     if (cut_end <= cursor) {
@@ -259,7 +260,7 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
    emit(cursor, end);
   }
   if (area == target.area) continue;
-  target.runs.swap(scratch_);
+  target.runs.swap(workspace_.scratch);
   target.area = area;
   target.carved = true;
   target.bounds = bounds;

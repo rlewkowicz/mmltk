@@ -13,6 +13,7 @@
 #include <string_view>
 #include <stdexcept>
 namespace mmltk::backend::data::benchmark_internal {
+class BenchmarkCompilePipeline;
 // Only remote/source unavailability or rejected response content. Local setup, allocation,
 // invalid requests, callback failures, storage failures, and cancellation propagate
 // separately and must never permit optional-source omission.
@@ -66,6 +67,7 @@ struct DownloadReady {
 using DownloadReadySink = std::function<void(DownloadReady)>;
 using DownloadProgressSink = std::function<void(const DownloadProgress&)>;
 [[nodiscard]] std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t maximum_concurrency,
- mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& progress = {}, const BenchmarkTraceSink& trace = {}, const DownloadReadySink& ready = {});
+ mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& progress = {}, const BenchmarkTraceSink& trace = {}, const DownloadReadySink& ready = {},
+ BenchmarkCompilePipeline* execution = nullptr);
 void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested = {}, const BenchmarkTraceSink& trace = {});
 }  // namespace mmltk::backend::data::benchmark_internal

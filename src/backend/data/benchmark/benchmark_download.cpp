@@ -12,6 +12,7 @@
 // CLEANUP-IGNORE: This download unit names its boundary-specific imports and private headers.
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
+#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 namespace mmltk::backend::data::benchmark_internal {
 [[nodiscard]] DownloadRequest make_download_request(const BenchmarkCacheLayout& cache, const std::string_view source, const CatalogArtifact& artifact) {
  DownloadRequest request;
@@ -30,6 +31,7 @@ using mmltk::common::io::ScopedFd;
 using mmltk::common::io::sync_parent_directory;
 using mmltk::common::math::checked_add;
 using mmltk::common::math::checked_cast;
+using mmltk::common::math::checked_multiply;
 using mmltk::common::types::trim_http_field_value;
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -985,8 +987,9 @@ struct SegmentTransfer {
  };
 }
 }  // namespace
-std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, const std::size_t maximum_concurrency,
- mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready) {
+std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, const std::size_t requested_concurrency,
+ mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready,
+ BenchmarkCompilePipeline* execution) {
  std::mutex progress_mutex;
  const DownloadProgressSink progress = observer ? DownloadProgressSink{[&](const DownloadProgress& value) {
   const std::lock_guard lock(progress_mutex);
@@ -994,12 +997,26 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
  }}
                                                 : DownloadProgressSink{};
  if (requests.empty()) { return {}; }
+ std::size_t maximum_concurrency = requested_concurrency;
  if (maximum_concurrency == 0U) { throw std::runtime_error("benchmark download concurrency must be positive"); }
  for (const DownloadRequest& request : requests) {
   if (request.artifact_id.empty() || request.url.empty() || request.destination.empty() || request.lock_path.empty() || request.maximum_attempts == 0U) {
    throw std::runtime_error("benchmark download request is incomplete");
   }
   if (request.expected_sha256) { (void)mmltk::common::io::parse_sha256_hex(*request.expected_sha256); }
+ }
+ // Locks, open output files, socket/DNS handles and Curl's wake descriptors
+ // belong to this session, including segmented fallback and repair. Its
+ // allowance precedes all of them and retires after durable publication.
+ BenchmarkCompilePipeline::Allowance resources;
+ if (execution) std::tie(maximum_concurrency, resources) = execution->reserve_transfers(maximum_concurrency, checked_add(requests.size(), std::size_t{8}, "benchmark transfer descriptor overflow"), 256U << 10);
+ std::vector<StorageReservationPool::Reservation> storage_promises;
+ if (execution) {
+  storage_promises.reserve(requests.size());
+  for (const auto& request : requests) {
+   StorageReservationPool destination(request.destination, trace, &execution->storage());
+   storage_promises.push_back(destination.reserve_download(request.destination, request.expected_size, "benchmark download and replacement"));
+  }
  }
  std::unordered_set<std::string> unique_lock_paths;
  std::vector<std::size_t> lock_order(requests.size());

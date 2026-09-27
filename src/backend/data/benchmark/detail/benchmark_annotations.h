@@ -19,6 +19,8 @@
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
 #include "src/backend/data/compiled/compiled_format.h"
 namespace mmltk::backend::data::benchmark_internal {
+class BenchmarkCompilePipeline;
+class StorageReservationPool;
 // Rejection of the annotation document itself, never a local execution failure.
 class AnnotationDocumentRejected final : public std::runtime_error {
 public:
@@ -98,6 +100,7 @@ struct AnnotationParseOptions {
  bool keep_images_without_mapped_boxes = false;
  mmltk::common::concurrency::CancellationObservation cancel_requested = {};
  BenchmarkTraceSink trace;
+ BenchmarkCompilePipeline* execution = nullptr;
 };
 [[nodiscard]] NormalizedAnnotationIndex parse_coco_style_annotations(
  const std::filesystem::path& json_path, std::string annotation_sha256, std::span<const NumericCategoryMapping> mappings, const AnnotationParseOptions& options);
@@ -106,7 +109,7 @@ struct AnnotationParseOptions {
 [[nodiscard]] std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const std::filesystem::path& path, BenchmarkDatasetSource expected_source, std::string_view expected_split,
  std::string_view expected_annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {});
 void store_normalized_annotation_index(
- const std::filesystem::path& path, const NormalizedAnnotationIndex& index, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {});
+ const std::filesystem::path& path, const NormalizedAnnotationIndex& index, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {}, StorageReservationPool* storage = nullptr);
 void remove_normalized_annotation_index(const std::filesystem::path& path);
 [[nodiscard]] std::vector<std::uint64_t> image_ids(const NormalizedAnnotationIndex&, std::optional<std::uint16_t> shard = std::nullopt);
 }  // namespace mmltk::backend::data::benchmark_internal
