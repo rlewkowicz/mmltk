@@ -489,6 +489,17 @@ TEST_CASE("Logical donor admission preserves original RLE support and empty-mask
   visible += original.visible;
   hidden += !original.visible;
  }
+ // A resumed history makes exactly the same subsequent admission decisions;
+ // physical cache contents never enter checkpoint vocabulary or logical draws.
+ r::TrainingDonorHistory resumed(1, 1);
+ resumed.restore(loader, history.state());
+ for (std::uint64_t key = 256; key < 288; ++key) {
+  const auto index = static_cast<std::uint32_t>(key % 3);
+  const auto expected = history.admit(loader, 0, std::array{key}, std::array{index}, config)[0];
+  const auto actual = resumed.admit(loader, 0, std::array{key}, std::array{index}, config)[0];
+  CHECK(actual == expected);
+  CHECK(resumed.state() == history.state());
+ }
  CHECK(visible > 0);
  CHECK(hidden > 0);
  CHECK(differs_from_box > 0);

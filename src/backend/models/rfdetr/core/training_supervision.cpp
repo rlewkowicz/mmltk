@@ -81,6 +81,15 @@ void require_denoising_variates(const DenoisingVariates& variates, const std::ve
  if (object_classes > 1) { require(variates.other_label, slot_shape, torch::kInt64, "other-label"); }
 }
 }  // namespace
+void TrainingSupervisionImpl::configure_compilation(bool training, bool selective) noexcept { selective_[training ? 1 : 0] = selective; }
+const torch::Tensor& TrainingSupervisionImpl::dummy_box(const torch::Device& device) {
+ // Immutable runtime scratch, deliberately absent from registered buffers and
+ // checkpoints. The synchronous initial literal transfer completes publication.
+ if (!dummy_box_.defined() || dummy_box_.device() != device)
+  dummy_box_ = torch::tensor({0.5F, 0.5F, 0.25F, 0.25F}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+ if (device.is_cuda()) dummy_box_.record_stream(c10::cuda::getCurrentCUDAStream(device.index()));
+ return dummy_box_;
+}
 struct TrainingSupervisionImpl::PaddedTargets {
  torch::Tensor labels;
  torch::Tensor boxes;
@@ -367,7 +376,7 @@ TrainingSupervisionImpl::PaddedTargets TrainingSupervisionImpl::pad_targets(cons
  auto labels = targets.all_labels.to(torch::kInt64).index({indices});
  auto boxes = targets.all_boxes.to(torch::kFloat32).index({indices});
  labels = torch::where(valid, labels, torch::zeros_like(labels));
- const auto dummy = torch::tensor({0.5F, 0.5F, 0.25F, 0.25F}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+ const auto& dummy = dummy_box(device);
  boxes = torch::where(valid.unsqueeze(-1), boxes, dummy.view({1, 1, 4}));
  return {std::move(labels), std::move(boxes), valid, indices, maximum_count};
 }
@@ -462,7 +471,6 @@ std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(
   const auto padded = pad_targets(targets, device, batch, true);
   const std::vector<int64_t> slot_shape{batch, groups, padded.maximum_count};
   const std::vector<int64_t> coordinate_shape{batch, groups, padded.maximum_count, 2};
-  const auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
   const auto integer_options = torch::TensorOptions().dtype(torch::kInt64).device(device);
   DenoisingVariates generated;
   const DenoisingVariates* variates = injected_variates;
@@ -489,7 +497,7 @@ std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(
   // of DN-DETR's appended indicator; it exists only on valid DN slots.
   const auto content_fp32 = denoising_label_embedding_->forward(transformed.labels) + denoising_task_embedding_->weight.index({0}).view({1, 1, 1, config_.hidden_dim});
   const auto content = torch::where(valid.unsqueeze(-1), content_fp32, torch::zeros_like(content_fp32)).reshape({batch, static_cast<int64_t>(dn_queries), config_.hidden_dim}).to(decoder_dtype);
-  const auto inert_box = torch::tensor({0.5F, 0.5F, 0.25F, 0.25F}, float_options).view({1, 1, 1, 4});
+  const auto inert_box = dummy_box(device).view({1, 1, 1, 4});
   transformed.boxes = torch::where(valid.unsqueeze(-1), transformed.boxes, inert_box);
   auto key_padding = ~valid;
   const auto empty_group = ~valid.any(-1);
@@ -625,7 +633,7 @@ TrainingLoss TrainingSupervisionImpl::empty_loss(const ModelOutputs& outputs) co
  return {zero, zero, zero, zero, zero, zero, config_.aux_loss ? zero : torch::Tensor{}, {zero, zero, zero}};
 }
 TrainingLoss TrainingSupervisionImpl::denoising_loss(
- const DenoisingOutputs& outputs, const PreparedTargets& target_inventory, const DeviceLossNormalizer& normalizer, std::span<const LayerMaskSamples> mask_samples) const {
+ const DenoisingOutputs& outputs, const PreparedTargets& target_inventory, const DeviceLossNormalizer& normalizer, std::span<const LayerMaskSamples> mask_samples, const bool compiled) const {
  if (!denoising_enabled() || !initialized_) { throw std::runtime_error("DN loss requires active initialized supervision"); }
  if (!normalizer.target_count.defined() || normalizer.target_count.dim() != 0 || normalizer.target_count.scalar_type() != torch::kFloat32 ||
      normalizer.target_count.device() != outputs.main.pred_logits.device()) {
@@ -750,8 +758,8 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(
      const DirectMaskRandomSeeds seeds{tagged_seed(layer_seed, 0x43414e4449444154ULL), tagged_seed(layer_seed, 0x52414e444f4dULL), semantic_rows};
      const auto sampled = sample_direct_masks(masks, target_inventory, mask_indices, config_.mask_point_sample_ratio, samples, seeds);
      const auto mask_zero = config_.mask_ce_loss_coef == 0.0 || config_.mask_dice_loss_coef == 0.0 ? sampled.logits.sum() * 0.0 : torch::Tensor{};
-     result.mask_ce = result.mask_ce + (config_.mask_ce_loss_coef == 0.0 ? mask_zero : config_.mask_ce_loss_coef * sigmoid_ce_loss(sampled.logits, sampled.targets, divisor, false, mask_valid));
-     result.mask_dice = result.mask_dice + (config_.mask_dice_loss_coef == 0.0 ? mask_zero : config_.mask_dice_loss_coef * dice_loss(sampled.logits, sampled.targets, divisor, false, mask_valid));
+     result.mask_ce = result.mask_ce + (config_.mask_ce_loss_coef == 0.0 ? mask_zero : config_.mask_ce_loss_coef * sigmoid_ce_loss(sampled.logits, sampled.targets, divisor, compiled, mask_valid));
+     result.mask_dice = result.mask_dice + (config_.mask_dice_loss_coef == 0.0 ? mask_zero : config_.mask_dice_loss_coef * dice_loss(sampled.logits, sampled.targets, divisor, compiled, mask_valid));
     }
    }
   }
@@ -770,7 +778,7 @@ TrainingLoss TrainingSupervisionImpl::loss(
  const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, const bool training_mode, std::span<const LayerMaskSamples> mask_samples) {
  if (!initialized_) { throw std::runtime_error("RF-DETR supervision loss requires one-shot initialization"); }
  if (!match_free_enabled()) {
-  if (outputs.denoising) { return denoising_loss(*outputs.denoising, targets, normalizer, mask_samples); }
+  if (outputs.denoising) { return denoising_loss(*outputs.denoising, targets, normalizer, mask_samples, selective_[training_mode ? 1 : 0]); }
   return empty_loss(outputs);
  }
  if (!normalizer.target_count.defined() || normalizer.target_count.dim() != 0 || normalizer.target_count.scalar_type() != torch::kFloat32) {
@@ -859,8 +867,8 @@ TrainingLoss TrainingSupervisionImpl::loss(
      total_cost = total_cost + cost;
      return objective(cost);
     };
-    if (config_.mask_ce_loss_coef != 0.0) ce_term = admit(batch_sigmoid_ce_loss(masks->logits, masks->targets, false), config_.mask_ce_loss_coef);
-    if (config_.mask_dice_loss_coef != 0.0) dice_term = admit(batch_dice_loss(masks->logits, masks->targets, false), config_.mask_dice_loss_coef);
+    if (config_.mask_ce_loss_coef != 0.0) ce_term = admit(batch_sigmoid_ce_loss(masks->logits, masks->targets, selective_[training_mode ? 1 : 0]), config_.mask_ce_loss_coef);
+    if (config_.mask_dice_loss_coef != 0.0) dice_term = admit(batch_dice_loss(masks->logits, masks->targets, selective_[training_mode ? 1 : 0]), config_.mask_dice_loss_coef);
    }
    return TrainingLoss{
     {},
@@ -889,7 +897,7 @@ TrainingLoss TrainingSupervisionImpl::loss(
  result.total = result.classification + result.box + result.giou + result.mask_ce + result.mask_dice;
  if (outputs.denoising) {
   mmltk::backend::ml::cuda::TorchAutocastScope forward_scope(forward_autocast, forward_dtype);
-  const auto dn = denoising_loss(*outputs.denoising, targets, normalizer, mask_samples);
+  const auto dn = denoising_loss(*outputs.denoising, targets, normalizer, mask_samples, selective_[training_mode ? 1 : 0]);
   result.total = result.total + dn.total;
   result.classification = result.classification + dn.classification;
   result.box = result.box + dn.box;

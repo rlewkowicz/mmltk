@@ -3,10 +3,32 @@
 #include "src/backend/models/rfdetr/augmentation/augmentation_plan.h"
 #include <algorithm>
 #include <array>
+#include <semaphore>
+#include <memory>
 #include "src/frameworks/gpu/image/image_buffer.h"
 #include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 namespace mmltk::backend::models::rfdetr::test_support {
 struct GpuAugmentationTestAccess final {
+ struct PixelGate {
+  std::binary_semaphore semaphore{0};
+  bool released = false;
+  ~PixelGate() { release(); }
+  void release() {
+   if (!released) {
+    released = true;
+    semaphore.release();
+   }
+  }
+ };
+ static inline PixelGate* pixel_gate = nullptr;
+ static void HoldPixelsAfterDma(GpuAugmentationExecutor& executor, PixelGate& gate) {
+  pixel_gate = &gate;
+  executor.staging_record_ = +[](cudaEvent_t event, cudaStream_t stream) {
+   const auto status = cudaEventRecord(event, stream);
+   if (status != cudaSuccess) return status;
+   return cudaLaunchHostFunc(stream, +[](void* state) { static_cast<PixelGate*>(state)->semaphore.acquire(); }, pixel_gate);
+  };
+ }
  static void FailEventWait(GpuAugmentationExecutor& executor) {
   executor.event_wait_ = +[](cudaEvent_t) { return cudaErrorLaunchFailure; };
  }

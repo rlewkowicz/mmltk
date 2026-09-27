@@ -1,6 +1,7 @@
 #pragma once
 #include <torch/torch.h>
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <optional>
 #include <span>
@@ -55,6 +56,7 @@ public:
  // Optional fixed DN samples follow main/auxiliary decoder order; omitted draws remain private.
  [[nodiscard]] TrainingLoss loss(
   const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, bool training_mode, std::span<const LayerMaskSamples> mask_samples = {});
+ void configure_compilation(bool training, bool selective) noexcept;
  void configure_timing(const SupervisionTimingSetup& setup);
  void begin_supervised_step_timing();
  void end_supervised_step_timing();
@@ -65,6 +67,7 @@ public:
  [[nodiscard]] SupervisionTimingHandoff harvest_timing();
 
 private:
+ [[nodiscard]] const torch::Tensor& dummy_box(const torch::Device& device);
  struct PaddedTargets;
  struct DenoisingScratch;
  class ProbeMlpImpl;
@@ -75,7 +78,7 @@ private:
  [[nodiscard]] torch::Tensor dense_correspondence(const torch::Tensor& probes, const torch::Tensor& query_features);
  [[nodiscard]] TrainingLoss empty_loss(const ModelOutputs& outputs) const;
  [[nodiscard]] TrainingLoss denoising_loss(
-  const DenoisingOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, std::span<const LayerMaskSamples> mask_samples) const;
+  const DenoisingOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, std::span<const LayerMaskSamples> mask_samples, bool compiled) const;
  NativeRfDetrConfig config_;
  std::int64_t foreground_count_;
  std::shared_ptr<ProbeMlpImpl> ground_truth_mlp_;
@@ -87,6 +90,8 @@ private:
  torch::nn::Embedding denoising_task_embedding_{nullptr};
  std::unique_ptr<DenoisingScratch> denoising_scratch_;
  std::unique_ptr<TimingState> timing_;
+ torch::Tensor dummy_box_;
+ std::array<bool, 2> selective_{};
  bool initialized_ = false;
 };
 }  // namespace mmltk::backend::models::rfdetr

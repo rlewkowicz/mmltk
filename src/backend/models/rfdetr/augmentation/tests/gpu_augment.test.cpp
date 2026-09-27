@@ -1202,5 +1202,134 @@ TEST_CASE("continuous augmentation boxes survive independent and empty mask supp
   CHECK(vanished_mask.output_area == 0.0F);
  }
 }
+TEST_CASE("Visibility-only admission agrees with full support for geometry erasure and paste", "[backend][rfdetr][augmentation][support]") {
+ using namespace mmltk::backend::data;
+ const std::array runs{RLEPair{0, 1}, RLEPair{27, 2}, RLEPair{63, 1}};
+ PackedInstance instance{.class_id = 0, .flags = kAnnotationMask, .bbox_x1 = 1.25F, .bbox_y1 = 2.5F, .bbox_x2 = 6.25F, .bbox_y2 = 7.25F};
+ for (const bool mask_present : {false, true})
+  for (const auto mask : {std::span<const RLEPair>{}, std::span<const RLEPair>{runs}})
+   for (unsigned mode = 0; mode < 7; ++mode)
+    for (std::uint64_t key = 0; key < 32; ++key) {
+     instance.flags = mask_present ? kAnnotationMask : 0;
+     auto plan = test_support::small_object_plan(mode % 4);
+     if (mode == 4) {
+      plan.forward = {.125F, 0, .5F, 0, .125F, .5F};
+      plan.inverse = {8, 0, -4, 0, 8, -4};
+     }
+     if (mode == 5) plan.erasure = {.key = key, .dropout_probability = .7F};
+     if (mode == 6) {
+      plan.paste_donor_slot = 0;
+      plan.paste_masked = key % 2;
+      plan.paste_source_box = {0, 0, .5F, 1};
+      plan.paste_output_box = plan.paste_source_box;
+      plan.paste_support = runs.data();
+      plan.paste_support_count = runs.size();
+     }
+     CAPTURE(mask_present, mask.size(), mode, key);
+     CHECK(augmentation_instance_visible(instance, 8, 8, &plan, mask) == map_augmentation_instance(instance, 8, 8, &plan, mask).visible);
+    }
+ AugmentationImagePlan malformed;
+ malformed.paste_donor_slot = 0;
+ malformed.paste_masked = true;
+ malformed.paste_support_count = 1;
+ CHECK_THROWS_AS(augmentation_instance_visible(instance, 8, 8, &malformed, runs), std::invalid_argument);
+ CHECK_THROWS_AS(map_augmentation_instance(instance, 8, 8, &malformed, runs), std::invalid_argument);
+ CHECK_THROWS_AS(augmentation_instance_visible(instance, 0, 8, nullptr), std::invalid_argument);
+}
+TEST_CASE("Prepared augmentation binds image identities and donor selection before submission", "[backend][rfdetr][augmentation][cuda]") {
+ if (!has_cuda_device()) SKIP("CUDA unavailable; prepared batch identity remains unverified");
+ const bool training_keys = GENERATE(false, true);
+ const auto selection = GENERATE(GpuAugmentationDonorSelection::Aligned, GpuAugmentationDonorSelection::Cached);
+ test_support::AugmentationExecution execution;
+ constexpr std::size_t values = 2 * 3 * 8 * 8;
+ auto pixels = std::make_shared<AugmentationPixels>(values);
+ pixels->donor = std::make_unique<TestDeviceBuffer<float>>(values);
+ pixels->boxes = std::make_unique<TestDeviceBuffer<float>>(8);
+ const std::vector<float> source(values, .25F), donor_pixels(values, .9F), sentinel(values, -7.F);
+ const std::array<float, 8> boxes{0, 0, 1, 1, 0, 0, 1, 1};
+ cuda_require(cudaMemcpy(pixels->input.data(), source.data(), pixels->input.size_bytes(), cudaMemcpyHostToDevice));
+ cuda_require(cudaMemcpy(pixels->donor->data(), donor_pixels.data(), pixels->donor->size_bytes(), cudaMemcpyHostToDevice));
+ cuda_require(cudaMemcpy(pixels->boxes->data(), boxes.data(), pixels->boxes->size_bytes(), cudaMemcpyHostToDevice));
+ cuda_require(cudaMemcpy(pixels->output.data(), sentinel.data(), pixels->output.size_bytes(), cudaMemcpyHostToDevice));
+ GpuAugmentationExecutor executor(test_support::isolated_augmentation_config(1.F), 2, 8, 8, execution.context, execution.retirement);
+ std::array<std::uint32_t, 2> identities{0, 1};
+ const std::array<std::uint64_t, 2> keys{19, 23};
+ const std::array donors{
+  GpuAugmentationDonor{.label = 0, .dataset_index = 1, .area = 64, .box = {0, 0, 1, 1}},
+  GpuAugmentationDonor{.label = 0, .dataset_index = 0, .area = 64, .box = {0, 0, 1, 1}}
+ };
+ // Preparation has no pixel pointers and borrows IDs only for this call.
+ const GpuAugmentationBatchView metadata{.image_indices = identities, .height = 8, .width = 8};
+ const auto prepare = [&] {
+  if (training_keys) (void)executor.PrepareTraining(metadata, 19, 2, 0, 4, donors, selection, 0);
+  else (void)executor.Prepare(metadata, keys, donors, selection, 0);
+ };
+ prepare();
+ const auto planned = executor.prepared_image_diagnostic(0, 0);
+ const GpuAugmentationBatchView batch{
+  .input = pixels->input.data(), .output = pixels->output.data(), .image_indices = identities, .height = 8, .width = 8,
+  .output_domain = GpuAugmentationOutputDomain::UnitRgb, .input_custody = pixels, .output_custody = pixels,
+  .input_capacity_bytes = pixels->input.size_bytes(), .output_capacity_bytes = pixels->output.size_bytes()
+ };
+ GpuAugmentationDonorBatchView donor_batch{
+  .images = pixels->donor->data(), .boxes = pixels->boxes->data(), .selection = selection,
+  .image_custody = pixels, .image_capacity_bytes = pixels->donor->size_bytes()
+ };
+ const auto read = [&] {
+  cuda_require(cudaStreamSynchronize(pixels->stream));
+  std::vector<float> result(values);
+  cuda_require(cudaMemcpy(result.data(), pixels->output.data(), pixels->output.size_bytes(), cudaMemcpyDeviceToHost));
+  return result;
+ };
+ identities[0] = 2;
+ REQUIRE_THROWS(executor.RunPrepared(batch, donor_batch, pixels->stream));
+ CHECK(read() == sentinel);
+ identities = {1, 0};
+ REQUIRE_THROWS(executor.RunPrepared(batch, donor_batch, pixels->stream));
+ CHECK(read() == sentinel);
+ identities = {0, 1};
+ donor_batch.selection = selection == GpuAugmentationDonorSelection::Aligned ? GpuAugmentationDonorSelection::Cached : GpuAugmentationDonorSelection::Aligned;
+ REQUIRE_THROWS(executor.RunPrepared(batch, donor_batch, pixels->stream));
+ CHECK(read() == sentinel);
+ CHECK(executor.prepared_image_diagnostic(0, 0) == planned);
+ donor_batch.selection = selection;
+ // Invalid execution attempts must leave the original valid preparation usable.
+ executor.RunPrepared(batch, donor_batch, pixels->stream);
+ const auto actual = read();
+ CHECK(std::ranges::all_of(actual, [](float value) { return value >= 0 && value <= 1; }));
+ CHECK(std::ranges::any_of(actual, [](float value) { return value > .25F; }));
+ REQUIRE_THROWS(executor.RunPrepared(batch, donor_batch, pixels->stream));
+ prepare();
+ CHECK(executor.prepared_image_diagnostic(0, 0) == planned);
+ executor.RunPrepared(batch, donor_batch, pixels->stream);
+ CHECK(read() == actual);
+}
+TEST_CASE("Augmentation host staging retires before delayed pixel consumers", "[backend][rfdetr][augmentation][cuda]") {
+ if (!has_cuda_device()) SKIP("CUDA unavailable; staging retirement remains unverified");
+ test_support::AugmentationExecution execution;
+ using Access = test_support::GpuAugmentationTestAccess;
+ auto pixels = std::make_shared<AugmentationPixels>(3 * 8 * 8);
+ std::weak_ptr<AugmentationPixels> retained = pixels;
+ GpuAugmentationExecutor executor(test_support::isolated_augmentation_config(), 1, 8, 8, execution.context, execution.retirement);
+ Access::PixelGate gate;
+ Access::HoldPixelsAfterDma(executor, gate);
+ const std::array<std::uint32_t, 1> identities{0};
+ const std::array<std::uint64_t, 1> keys{19};
+ GpuAugmentationBatchView batch{
+  .input = pixels->input.data(), .output = pixels->output.data(), .image_indices = identities, .height = 8, .width = 8,
+  .input_custody = pixels, .output_custody = pixels,
+ };
+ (void)executor.Run(batch, keys, {}, {}, pixels->stream, 0);
+ batch.input_custody.reset();
+ batch.output_custody.reset();
+ pixels.reset();
+ // Re-planning this host slot must not release the previous GPU owner. Its
+ // pixel kernel is deliberately held beyond the separately recorded DMA event.
+ (void)executor.Prepare(batch, keys, {}, GpuAugmentationDonorSelection::Aligned, 0);
+ CHECK_FALSE(retained.expired());
+ gate.release();
+ executor.Finish();
+ CHECK(retained.expired());
+}
 }  // namespace
 }  // namespace mmltk::backend::models::rfdetr

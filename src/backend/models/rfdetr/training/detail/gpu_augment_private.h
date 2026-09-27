@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <span>
 #include <utility>
@@ -42,6 +43,7 @@ private:
  void RequireActive() const;
  void Retire(cudaError_t) noexcept;
  void CheckSettlement(cudaError_t, const char*);
+ decltype(&cudaMemcpyAsync) copy_ = &cudaMemcpyAsync;
  decltype(&cudaEventSynchronize) event_wait_ = &cudaEventSynchronize;
  decltype(&cudaStreamSynchronize) stream_wait_ = &cudaStreamSynchronize;
  friend struct test_support::GpuBatchAugmenterTestAccess;
@@ -71,7 +73,10 @@ private:
  std::shared_ptr<Resources> resources_;
  AugmentationBatchPlan batch_plan_;
  std::vector<GpuAugmentationDonor> donor_metadata_;
+ std::vector<GpuAugmentationDonor> planned_donor_metadata_;
  std::vector<TrainingDonorDescriptor> materialized_donors_;
+ std::vector<std::span<const mmltk::backend::data::RLEPair>> planned_support_;
+ std::size_t next_staging_slot_ = 0;
  bool logical_donors_ = false;
  std::vector<std::vector<mmltk::backend::data::RLEPair>> donor_support_;
  std::unique_ptr<GpuAugmentationExecutor> executor_;

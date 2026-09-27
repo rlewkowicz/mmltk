@@ -172,7 +172,7 @@ TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_
            : std::make_shared<mmltk::common::concurrency::WorkerPool>(static_cast<size_t>(train_lane_count), train_runtime.lane_cpus(), "rfdtrtlane", 0U, &train_runtime.execution().placement, false);
   for (int lane_index = 0; lane_index < train_lane_count; ++lane_index) {
    train_lanes.emplace_back(
-    torch_cuda::get_priority_cuda_stream(options.device_id, mmltk::frameworks::gpu::current_cuda_highest_stream_priority()), static_cast<std::size_t>(std::max(1, options.grad_accum_steps)));
+    torch_cuda::get_priority_cuda_stream(options.device_id, mmltk::frameworks::gpu::current_cuda_highest_stream_priority()), target_staging_depth(options.grad_accum_steps));
   }
   for (auto& lane : train_lanes) {
    lane.donors.reserve(local_batch);

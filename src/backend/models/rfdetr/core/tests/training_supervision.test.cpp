@@ -7,10 +7,12 @@
 #include "src/backend/models/rfdetr/core/model.h"
 // RF-DETR Match-Free mathematical and topology coverage.
 #include <ATen/Context.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <ATen/CPUGeneratorImpl.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include "src/backend/models/rfdetr/core/runtime.h"
 #include "detail/matcher_workspace.h"
+#include "detail/traced_loss_cache.h"
 #include "src/common/system/numa_topology.h"
 #include <cuda_runtime.h>
 #include <cmath>
@@ -2228,5 +2230,49 @@ TEST_CASE("Disabled DN masks admit missing target masks in direct and combined o
   for (const auto& mask : selected) mmltk::backend::ml::testsupport::require_zero_gradients({mask.spatial_features, mask.query_features, mask.bias});
   outputs.denoising->main.sparse_pred_masks->query_features = torch::ones({1, 1, 2});
   REQUIRE_THROWS(owner.loss(outputs, targets, {torch::tensor(1.F)}, true));
+ }
+}
+
+TEST_CASE("Selective mask helpers preserve dynamic samples values and gradients", "[rfdetr][training_supervision][compilation][cuda]") {
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; selective mask coverage unexecuted");
+ rfdetr::testsupport::MatcherExecutionFixture fixture;
+ rfdetr::ScopedRuntimeContext runtime(nullptr, 0, &fixture.workspace);
+ for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
+  if (dtype == torch::kBFloat16 && at::cuda::getCurrentDeviceProperties()->major < 8) continue;
+  mmltk::backend::ml::cuda::TorchAutocastScope scope(dtype != torch::kFloat32, dtype);
+  const auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+  std::array<const void*, 4> recorded{};
+  for (const auto shape : {std::array<int64_t, 3>{2, 3, 7}, {4, 1, 11}, {1, 5, 3}}) {
+   CAPTURE(dtype, shape);
+   const auto [queries, targets, points] = shape;
+   auto logits = torch::linspace(-2, 2, 2 * queries * points, options).view({2, queries, points}).set_requires_grad(true);
+   auto eager_logits = logits.detach().clone().set_requires_grad(true);
+   auto labels = (torch::arange(2 * targets * points, options).view({2, targets, points}).remainder(3) == 0).to(torch::kFloat32);
+   const auto pair = [&](const torch::Tensor& input, bool traced) {
+    return 1.7 * rfdetr::batch_sigmoid_ce_loss(input, labels, traced) + 2.3 * rfdetr::batch_dice_loss(input, labels, traced);
+   };
+   const auto actual = pair(logits, true), expected = pair(eager_logits, false);
+   REQUIRE(torch::allclose(actual, expected, 2e-3, 2e-3));
+   actual.square().sum().backward();
+   expected.square().sum().backward();
+   REQUIRE(torch::allclose(logits.grad(), eager_logits.grad(), 3e-3, 3e-3));
+   auto direct = logits.detach().reshape({2 * queries, points}).clone().set_requires_grad(true);
+   auto reference = direct.detach().clone().set_requires_grad(true);
+   const auto direct_labels = (torch::arange(direct.numel(), options).reshape(direct.sizes()).remainder(2) == 0).to(torch::kFloat32);
+   const auto valid = torch::arange(2 * queries, options).remainder(2) == 0;
+   const auto count = torch::tensor(3.F, options);
+   const auto loss = [&](const torch::Tensor& input, bool traced) {
+    return rfdetr::sigmoid_ce_loss(input, direct_labels, count, traced, valid) + rfdetr::dice_loss(input, direct_labels, count, traced, valid);
+   };
+   const auto compiled = loss(direct, true), eager = loss(reference, false);
+   REQUIRE(torch::allclose(compiled, eager, 2e-5, 2e-5));
+   compiled.backward();
+   eager.backward();
+   REQUIRE(torch::allclose(direct.grad(), reference.grad(), 2e-5, 2e-5));
+   auto& cache = fixture.workspace.loss_cache();
+   const std::array<const void*, 4> identities{cache.batch_sigmoid_ce.identity(), cache.batch_dice.identity(), cache.sigmoid_ce.identity(), cache.dice.identity()};
+   if (recorded.front()) CHECK(identities == recorded);
+   else recorded = identities;
+  }
  }
 }

@@ -180,9 +180,9 @@ TrainingDonorSource resolve_training_donor(const mmltk::backend::data::DatasetLo
  if (!descriptor.valid) return result;
  const auto& instance = donor_instance(loader, descriptor);
  result.support = original_donor_support(loader, instance);
- const auto mapped = map_augmentation_instance(instance, loader.image_width(), loader.image_height(), nullptr, result.support);
+ const auto source_box = augmentation_instance_box(instance, loader.image_width(), loader.image_height());
  result.metadata = {
-  instance.class_id, descriptor.image_index, mapped.source_area_pixels, mapped.source_box_xyxy, instance.has_mask(),
+  instance.class_id, descriptor.image_index, augmentation_box_area(source_box) * static_cast<float>(loader.image_width()) * static_cast<float>(loader.image_height()), source_box, instance.has_mask(),
   (static_cast<std::uint64_t>(descriptor.image_index) << 32) | descriptor.annotation_index
  };
  if (instance.has_mask()) {
@@ -223,7 +223,7 @@ std::span<const TrainingDonorDescriptor> TrainingDonorHistory::admit(
    const auto& instance = loader.label_data()[entry.label_begin + ordinal];
    if (instance.is_crowd()) continue;
    const auto support = original_donor_support(loader, instance);
-   if (!map_augmentation_instance(instance, loader.image_width(), loader.image_height(), &plan, support).visible) continue;
+   if (!augmentation_instance_visible(instance, loader.image_width(), loader.image_height(), &plan, support)) continue;
    if (augmentation_reservoir_select(plan.cache_choice, ++candidates, ordinal)) replacements_[image] = {images[image], ordinal, true};
   }
  }

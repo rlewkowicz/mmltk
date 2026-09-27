@@ -1,7 +1,10 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <cuda_runtime.h>
 #include <span>
+#include <memory>
+#include "src/backend/ml/cuda/numa_host_tensor.h"
 #include <string>
 #include <string_view>
 #include <vector>
@@ -12,6 +15,9 @@
 #include "src/backend/models/rfdetr/augmentation/augmentation_plan.h"
 #include <torch/types.h>
 namespace mmltk::backend::models::rfdetr {
+namespace test_support {
+struct TargetScratchTestAccess;
+}
 [[nodiscard]] std::int64_t packed_mask_words_for_shape(int height, int width) noexcept;
 void pack_compiled_rle_pairs(std::span<const mmltk::backend::data::RLEPair> pairs, std::span<std::int64_t> words);
 struct BatchStaticTensors {
@@ -26,6 +32,14 @@ struct BatchStaticTensors {
  [[nodiscard]] torch::Tensor nested_mask_view(int64_t batch_size) const;
 };
 struct TargetStagingSlot {
+ std::shared_ptr<mmltk::backend::ml::cuda::NumaHostTensor> metadata_owner;
+ std::shared_ptr<mmltk::backend::ml::cuda::NumaHostTensor> mask_owner;
+ torch::Tensor metadata;
+ torch::Tensor device_metadata;
+ torch::Tensor device_masks;
+ std::uintptr_t consumers_retired_event = 0;
+ bool consumers_pending = false;
+ bool device_reusable = false;
  torch::Tensor sampling_keys;
  torch::Tensor boxes;
  torch::Tensor labels;
@@ -75,17 +89,25 @@ struct TargetScratch {
  void ensure_packed_mask_capacity(int64_t instances, int height, int width);
  void ensure_copy_resources(int target_device_id);
  TargetStagingSlot& acquire_staging_slot(std::size_t batch_size, int64_t instances, bool include_masks, int height, int width);
+ void upload_staging(const TargetStagingSlot& staging, int64_t instances, bool include_masks);
+ [[nodiscard]] torch::Tensor device_view(const TargetStagingSlot& staging, const torch::Tensor& host) const;
+ [[nodiscard]] torch::Tensor device_masks(int64_t instances) const;
  void record_staging_copy_on_stream(std::uintptr_t stream);
  void wait_for_pending_copy();
- void handoff_pending_copy_to_current_stream(int target_device_id) const;
+ void handoff_pending_copy_to_current_stream(int target_device_id, std::size_t slot = static_cast<std::size_t>(-1)) const;
  void wait_for_pending_copy_on_stream(std::uintptr_t stream) const;
  void record_pending_copy_on_stream(std::uintptr_t stream);
  void retire_consumers_on_current_stream(int target_device_id);
  void retire_consumer_on_stream(std::uintptr_t stream);
+ [[nodiscard]] std::size_t consumer_slot(const PreparedTargets& targets) const;
+ void retire_consumer_slot_on_stream(std::size_t slot, const torch::Tensor& boxes, std::uintptr_t stream);
  [[nodiscard]] inline std::uintptr_t copy_stream_handle() const noexcept { return copy_stream_; }
 
 private:
+ friend struct test_support::TargetScratchTestAccess;
+ decltype(&cudaEventSynchronize) staging_wait_ = &cudaEventSynchronize;
  void release_copy_resources();
+ bool device_slots_used_ = false;
  std::vector<TargetStagingSlot> staging_slots_;
  std::size_t next_staging_slot_ = 0;
  std::size_t active_staging_slot_ = 0;
@@ -109,6 +131,8 @@ public:
 private:
  TargetScratch* scratch_;
  int device_id_;
+ std::size_t slot_;
+ torch::Tensor boxes_;
  bool handed_off_ = false;
 };
 class LoaderBatchGuard {

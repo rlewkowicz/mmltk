@@ -65,6 +65,7 @@
 #include "detail/training_continuation.h"
 #include "training_continuation_fixture.h"
 #include "detail/target_builder_private.h"
+#include "detail/training_lanes.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "model_state_fixture.h"
@@ -80,7 +81,25 @@
 import mmltk.backend.models.rfdetr.augmentation.augmentation_metadata;
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::backend::models::rfdetr::test_support {
+struct TargetScratchTestAccess final {
+ static void BeforeStagingWait(TargetScratch& owner, decltype(&cudaEventSynchronize) wait) { owner.staging_wait_ = wait; }
+};
 struct GpuBatchAugmenterTestAccess final {
+ static inline std::size_t image_uploads = 0, metadata_uploads = 0, image_bytes = 0;
+ static void CountCopies(GpuBatchAugmenter& owner, std::size_t bytes) {
+  image_bytes = bytes;
+  image_uploads = metadata_uploads = 0;
+  owner.copy_ = +[](void* destination, const void* source, std::size_t count, cudaMemcpyKind kind, cudaStream_t stream) {
+   if (kind == cudaMemcpyHostToDevice) {
+    if (count == image_bytes) ++image_uploads;
+    else ++metadata_uploads;
+   }
+   return cudaMemcpyAsync(destination, source, count, kind, stream);
+  };
+ }
+ static std::size_t NextSlot(const GpuBatchAugmenter& owner) { return owner.next_staging_slot_; }
+ static const auto& Materialized(const GpuBatchAugmenter& owner) { return owner.materialized_donors_; }
+ static torch::Tensor Originals(const GpuBatchAugmenter& owner) { return owner.resources_->donor_images_; }
  static void FailCacheWait(GpuBatchAugmenter& owner) {
   owner.stream_wait_ = +[](cudaStream_t) { return cudaErrorLaunchFailure; };
  }
@@ -501,8 +520,20 @@ void test_target_staging_ring_recycles_completed_slots_without_host_wait() {
  const auto configured_copy_stream = scratch.copy_stream_handle();
  scratch.ensure_copy_resources(device_id);
  REQUIRE(scratch.copy_stream_handle() == configured_copy_stream);
+ auto copied_boxes = torch::empty({16}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
  TargetConsumerGate gate;
+ TargetConsumerGate second_gate;
  auto* copy_stream = reinterpret_cast<cudaStream_t>(scratch.copy_stream_handle());
+ struct SettleCopies {
+  TargetConsumerGate& first;
+  TargetConsumerGate& second;
+  cudaStream_t stream;
+  ~SettleCopies() {
+   first.release();
+   second.release();
+   (void)cudaStreamSynchronize(stream);
+  }
+ } settle{gate, second_gate, copy_stream};
  REQUIRE(cudaLaunchHostFunc(copy_stream, TargetConsumerGate::wait, &gate) == cudaSuccess);
  auto& first = scratch.acquire_staging_slot(1, 1, true, 8, 8);
  REQUIRE(first.batch_capacity == 1);
@@ -512,19 +543,40 @@ void test_target_staging_ring_recycles_completed_slots_without_host_wait() {
  REQUIRE(cuMemHostGetFlags(&registration_flags, first.labels.data_ptr()) == CUDA_SUCCESS);
  REQUIRE(cuMemHostGetFlags(&registration_flags, first.packed_masks.data_ptr()) == CUDA_SUCCESS);
  const auto* first_boxes = first.boxes.data_ptr();
+ first.boxes.fill_(3.F);
+ REQUIRE(cudaMemcpyAsync(copied_boxes.data_ptr<float>(), first_boxes, 4 * sizeof(float), cudaMemcpyHostToDevice, copy_stream) == cudaSuccess);
  scratch.record_staging_copy_on_stream(scratch.copy_stream_handle());
  auto& second = scratch.acquire_staging_slot(2, 3, true, 16, 16);
  REQUIRE(second.batch_capacity == 2);
  REQUIRE(second.instance_capacity == 3);
  REQUIRE(second.mask_height == 16);
+ second.boxes.fill_(7.F);
+ REQUIRE(cudaLaunchHostFunc(copy_stream, TargetConsumerGate::wait, &second_gate) == cudaSuccess);
+ REQUIRE(cudaMemcpyAsync(copied_boxes.data_ptr<float>() + 4, second.boxes.data_ptr(), 12 * sizeof(float), cudaMemcpyHostToDevice, copy_stream) == cudaSuccess);
  scratch.record_staging_copy_on_stream(scratch.copy_stream_handle());
- REQUIRE_THROWS(scratch.acquire_staging_slot(1, 1, false, 8, 8));
- gate.release();
- REQUIRE(cudaStreamSynchronize(copy_stream) == cudaSuccess);
+ static TargetConsumerGate* pending_gate;
+ static cudaEvent_t chosen_event;
+ static unsigned waits;
+ pending_gate = &gate;
+ chosen_event = reinterpret_cast<cudaEvent_t>(first.copy_complete_event);
+ waits = 0;
+ rfdetr::test_support::TargetScratchTestAccess::BeforeStagingWait(scratch, +[](cudaEvent_t event) {
+  CHECK(event == chosen_event);
+  CHECK(cudaEventQuery(event) == cudaErrorNotReady);
+  ++waits;
+  pending_gate->release();
+  return cudaEventSynchronize(event);
+ });
  auto& recycled = scratch.acquire_staging_slot(1, 1, false, 8, 8);
+ REQUIRE(waits == 1);
  REQUIRE(recycled.batch_capacity >= 1);
  REQUIRE(recycled.boxes.data_ptr() == first_boxes);
+ REQUIRE(cudaEventQuery(reinterpret_cast<cudaEvent_t>(second.copy_complete_event)) == cudaErrorNotReady);
+ recycled.boxes.fill_(11.F);
  scratch.record_staging_copy_on_stream(scratch.copy_stream_handle());
+ second_gate.release();
+ REQUIRE(cudaStreamSynchronize(copy_stream) == cudaSuccess);
+ REQUIRE(torch::equal(copied_boxes.cpu(), torch::cat({torch::full({4}, 3.F), torch::full({12}, 7.F)})));
 }
 void test_target_scratch_retires_cross_device_events_on_their_owner() {
  if (mmltk::testsupport::checked_cuda_device_count() < 2) { SKIP("Two CUDA devices required; peer coverage remains unverified"); }
@@ -2530,4 +2582,163 @@ TEST_CASE("CLI training quality follows the frozen selection rather than last mo
   CHECK(output.find("last_observed_model=9 train_loss=7.000000") != std::string::npos);
   CHECK(output.find("0.6000") == std::string::npos);
  }
+}
+
+TEST_CASE("Selected logical donors retain original pixels across annotation changes and skipped pastes", "[rfdetr][training_supervision][augmentation][cuda]") {
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; donor uploads unexecuted");
+ namespace data = mmltk::backend::data;
+ namespace fixture = data::testsupport;
+ using Access = rfdetr::test_support::GpuBatchAugmenterTestAccess;
+ mmltk::testsupport::ScopedTempDir root("selected-logical-donors");
+ fixture::FixtureSpec spec;
+ spec.root_dir = root.path().string();
+ spec.num_images = 3;
+ spec.background_images = 0;
+ spec.width = spec.height = 8;
+ fixture::create_synthetic_dataset(spec);
+ for (unsigned image = 1; image <= 3; ++image) {
+  std::ofstream output(std::filesystem::path(fixture::dataset_dir(spec)) / spec.split / ("00000" + std::to_string(image) + ".jsonl"));
+  output << R"({"class":"person","bbox_xyxy":[1,1,7,7]})" << '\n';
+  output << R"({"class":"person","bbox_xyxy":[2,2,6,6]})" << '\n';
+ }
+ fixture::compile_existing_fixture(spec);
+ data::DatasetLoader::Config loader_config;
+ loader_config.compiled_path = fixture::compiled_bin_path(spec);
+ loader_config.batch_size = 1;
+ data::DatasetLoader loader(loader_config);
+ rfdetr::test_support::AugmentationExecution execution;
+ auto config = rfdetr::test_support::isolated_augmentation_config(.5F);
+ config.perceptual_downscale = false;
+ rfdetr::GpuBatchAugmenter owner(config, 1, 8, 8, execution.context);
+ Access::CountCopies(owner, 3 * 8 * 8 * sizeof(float));
+ const auto input = torch::full({1, 3, 8, 8}, .125F, torch::TensorOptions().device(torch::kCUDA));
+ const std::array<std::uint32_t, 1> identities{0};
+ std::array<std::uint64_t, 1> keys{};
+ const data::Batch batch{.draw_keys = keys, .num_images = 1, .device_images = input.data_ptr<float>(), .image_indices = identities.data()};
+ std::uint64_t selected = 0, skipped = 0;
+ while (!rfdetr::augmentation_paste_admitted(config, selected)) ++selected;
+ while (rfdetr::augmentation_paste_admitted(config, skipped)) ++skipped;
+ const auto run = [&](std::uint64_t key, rfdetr::TrainingDonorDescriptor descriptor, std::uint64_t sequence) {
+  keys[0] = key;
+  const auto image = owner.run(batch, 42, 0, 0, sequence, &loader, std::span{&descriptor, 1U});
+  (void)owner.finish_batch(batch);
+  return image;
+ };
+ (void)run(skipped, {1, 0, true}, 0);
+ CHECK(Access::image_uploads == 0);
+ CHECK_FALSE(Access::Materialized(owner)[0].valid);
+ CHECK(Access::NextSlot(owner) == 1);
+ (void)run(selected, {1, 0, true}, 2);
+ CHECK(Access::image_uploads == 1);
+ CHECK(Access::NextSlot(owner) == 0); // Global even sequences do not pin one host slot.
+ auto originals = Access::Originals(owner).cpu();
+ const auto metadata_before = Access::metadata_uploads;
+ (void)run(skipped, {2, 0, true}, 4);
+ CHECK(Access::image_uploads == 1);
+ CHECK(Access::Materialized(owner)[0].image_index == 1);
+ (void)run(selected, {1, 1, true}, 6);
+ CHECK(Access::image_uploads == 1);
+ CHECK(Access::metadata_uploads > metadata_before);
+ CHECK(Access::Materialized(owner)[0].annotation_index == 1);
+ REQUIRE(torch::equal(originals, Access::Originals(owner).cpu()));
+ (void)run(selected, {2, 0, true}, 8);
+ CHECK(Access::image_uploads == 2);
+ CHECK(Access::Materialized(owner)[0].image_index == 2);
+}
+TEST_CASE("Target slots prime independent uploads and protect delayed backward inputs", "[rfdetr][training_supervision][cuda]") {
+ namespace data = mmltk::backend::data;
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; target overlap unexecuted");
+ c10::cuda::CUDAGuard device_guard(0);
+ const auto consumer = c10::cuda::getStreamFromPool(false, 0);
+ const auto releaser = c10::cuda::getStreamFromPool(false, 0);
+ const auto second_consumer = c10::cuda::getStreamFromPool(false, 0);
+ rfdetr::TrainRequest request;
+ request.grad_accum_steps = 1;
+ REQUIRE(rfdetr::TrainingLanes::target_staging_depth(request.grad_accum_steps) == 2);
+ REQUIRE(rfdetr::TrainingLanes::target_staging_depth(4) == 4);
+ rfdetr::TargetScratch scratch(rfdetr::TrainingLanes::target_staging_depth(request.grad_accum_steps));
+ const std::array<std::uint32_t, 1> identities{0};
+ const std::array<data::LabelIndexEntry, 1> entries{data::LabelIndexEntry{0, 1, 0}};
+ std::array<data::PackedInstance, 1> annotations{data::PackedInstance{0, 0, 1, 1, 5, 5, 0, 0}};
+ const data::Batch batch{.num_images = 1, .label_index = entries.data(), .labels = annotations.data(), .image_indices = identities.data()};
+ const auto build = [&] { return rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 8, {}, 1); };
+ auto first = build();
+ scratch.wait_for_pending_copy();
+ const auto initial = first.all_boxes.cpu();
+ const auto* first_storage = first.all_boxes.data_ptr();
+ auto gate = torch::zeros({1}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt32));
+ auto input = torch::ones({1, 4}, torch::TensorOptions().device(torch::kCUDA)).set_requires_grad(true);
+ REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+ struct ReleaseGate {
+  torch::Tensor word;
+  cudaStream_t stream;
+  ~ReleaseGate() {
+   (void)cuStreamWriteValue32(reinterpret_cast<CUstream>(stream), reinterpret_cast<CUdeviceptr>(word.data_ptr()), 1U, CU_STREAM_WRITE_VALUE_DEFAULT);
+   (void)cudaStreamSynchronize(stream);
+  }
+ } release_gate{gate, releaser.stream()};
+ {
+  c10::cuda::CUDAStreamGuard guard(consumer);
+  rfdetr::TargetConsumerLease lease(scratch, first, 0);
+  lease.handoff();
+  REQUIRE(cuStreamWaitValue32(reinterpret_cast<CUstream>(consumer.stream()), reinterpret_cast<CUdeviceptr>(gate.data_ptr()), 1U, CU_STREAM_WAIT_VALUE_EQ) == CUDA_SUCCESS);
+  (input * first.all_boxes).sum().backward();
+  lease.retire();
+ }
+ annotations[0].bbox_x2 = 7;
+ auto second = build();
+ REQUIRE(second.all_boxes.data_ptr() != first_storage);
+ // The second slot's DMA physically completes while backward still holds slot 0.
+ scratch.wait_for_pending_copy();
+ REQUIRE(second.all_boxes.cpu()[0][2].item<float>() == .75F);
+ {
+  c10::cuda::CUDAStreamGuard guard(second_consumer);
+  rfdetr::TargetConsumerLease lease(scratch, second, 0);
+  lease.handoff();
+  lease.retire();
+ }
+ auto third = build();
+ REQUIRE(third.all_boxes.data_ptr() == first_storage);
+ REQUIRE(cuStreamWriteValue32(reinterpret_cast<CUstream>(releaser.stream()), reinterpret_cast<CUdeviceptr>(gate.data_ptr()), 1U, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS);
+ scratch.wait_for_pending_copy();
+ REQUIRE(cudaStreamSynchronize(consumer.stream()) == cudaSuccess);
+ REQUIRE(torch::equal(input.grad().cpu(), initial));
+ {
+  rfdetr::TargetConsumerLease lease(scratch, third, 0);
+  lease.handoff();
+ }
+}
+TEST_CASE("Partial target DMA failure retains staging and permits bounded recovery", "[rfdetr][training_supervision][cuda]") {
+ if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; partial target upload unexecuted");
+ c10::cuda::CUDAGuard device_guard(0);
+ rfdetr::TargetScratch scratch(1);
+ scratch.ensure_batch(1, 8, 8, 0);
+ scratch.ensure_instance_capacity(1);
+ scratch.ensure_copy_resources(0);
+ auto& staging = scratch.acquire_staging_slot(1, 1, true, 8, 8);
+ auto old_host = staging.boxes;
+ const auto stream = c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(scratch.copy_stream_handle()), 0);
+ {
+  c10::cuda::CUDAStreamGuard guard(stream);
+  // Metadata is submitted first; the inconsistent mask extent then rejects the copy.
+  REQUIRE_THROWS(scratch.upload_staging(staging, 2, true));
+  scratch.record_pending_copy_on_stream(scratch.copy_stream_handle());
+  scratch.record_staging_copy_on_stream(scratch.copy_stream_handle());
+ }
+ scratch.wait_for_pending_copy();
+ auto& grown = scratch.acquire_staging_slot(2, 128, true, 16, 16);
+ REQUIRE(grown.boxes.data_ptr() != old_host.data_ptr());
+ // An escaped old CPU view remains valid across explicitly settled replacement.
+ old_host.fill_(.25F);
+ REQUIRE(old_host.sum().item<float>() == 1.F);
+ {
+  c10::cuda::CUDAStreamGuard guard(stream);
+  grown.metadata.zero_();
+  grown.packed_masks.zero_();
+  scratch.upload_staging(grown, 128, true);
+  scratch.record_pending_copy_on_stream(scratch.copy_stream_handle());
+  scratch.record_staging_copy_on_stream(scratch.copy_stream_handle());
+ }
+ scratch.wait_for_pending_copy();
+ REQUIRE(scratch.device_masks(128).cpu().sum().item<int64_t>() == 0);
 }

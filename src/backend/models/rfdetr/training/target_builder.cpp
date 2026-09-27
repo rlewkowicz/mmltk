@@ -94,6 +94,45 @@ public:
 private:
  cudaEvent_t event_ = nullptr;
 };
+// One layout is shared by pinned packing and device views. Each field remains
+// contiguous for the existing tensor and CUDA consumers; a single metadata DMA
+// replaces the small per-field copies. Masks retain their independent extent.
+int64_t bind_target_metadata(TargetStagingSlot& slot, const torch::Tensor& storage, int64_t batch, int64_t instances, bool masks) {
+ int64_t offset = 0;
+ const auto take = [&](at::IntArrayRef shape, at::ScalarType type) {
+  int64_t bytes = static_cast<int64_t>(c10::elementSize(type));
+  for (const auto extent : shape) {
+   if (extent < 0 || (extent && bytes > std::numeric_limits<int64_t>::max() / extent)) throw std::overflow_error("target staging shape overflows");
+   bytes *= extent;
+  }
+  constexpr int64_t alignment = alignof(std::int64_t);
+  if (offset > std::numeric_limits<int64_t>::max() - alignment - bytes) throw std::overflow_error("target staging layout overflows");
+  offset = (offset + alignment - 1) / alignment * alignment;
+  auto view = storage.defined() ? storage.narrow(0, offset, bytes).view(type).view(shape) : torch::Tensor{};
+  offset += bytes;
+  return view;
+ };
+ slot.image_ids = take({batch}, torch::kInt64);
+ slot.offsets = take({batch}, torch::kInt64);
+ slot.counts = take({batch}, torch::kInt64);
+ slot.boxes = take({instances, 4}, torch::kFloat32);
+ slot.sampling_keys = take({instances}, torch::kInt64);
+ slot.labels = take({instances}, torch::kInt64);
+ slot.area = take({instances}, torch::kFloat32);
+ slot.iscrowd = take({instances}, torch::kInt64);
+ slot.inverse_transforms = take({masks ? instances : 0, 6}, torch::kFloat32);
+ slot.occluder_mask_indices = take({masks ? instances : 0}, torch::kInt64);
+ slot.occluder_inverse_transforms = take({masks ? instances : 0, 6}, torch::kFloat32);
+ slot.erasure = take({masks ? instances : 0, static_cast<int64_t>(sizeof(AugmentationSpatialErasure))}, torch::kUInt8);
+ return offset;
+}
+void release_settled_staging(const std::shared_ptr<torch_cuda::NumaHostTensor>& owner) {
+ if (!owner) return;
+ const auto status = owner->ReleaseSettled();
+ // An escaped view still owns conservative retirement. Never weaken that
+ // contract merely because this scratch owner's own DMA has completed.
+ if (status != CUDA_SUCCESS && status != CUDA_ERROR_NOT_READY) throw std::runtime_error("release settled target staging: CUDA status " + std::to_string(status));
+}
 constexpr int64_t kMaskWordBits = 64;
 void require(const bool condition, const std::string_view message) {
  if (!condition) { throw std::runtime_error(std::string(message)); }
@@ -196,6 +235,15 @@ void TargetScratch::release_copy_resources() {
    }
    ensure_cuda_ok(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(slot.copy_complete_event)), "cudaEventDestroy for target staging copy");
    slot.copy_complete_event = 0U;
+   if (slot.consumers_pending)
+    ensure_cuda_ok(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(slot.consumers_retired_event)), "settle target slot consumers");
+   if (slot.consumers_retired_event)
+    ensure_cuda_ok(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(slot.consumers_retired_event)), "destroy target slot consumer event");
+   auto metadata_owner = slot.metadata_owner;
+   auto mask_owner = slot.mask_owner;
+   slot = {};
+   release_settled_staging(metadata_owner);
+   release_settled_staging(mask_owner);
   }
   if (copy_complete_event_ != 0U) {
    ensure_cuda_ok(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(copy_complete_event_)), "cudaEventDestroy for target copy");
@@ -208,6 +256,7 @@ void TargetScratch::release_copy_resources() {
  }
  copy_stream_ = 0U;
  copy_stream_device_id_ = -1;
+ device_slots_used_ = false;
 }
 void TargetScratch::ensure_batch(size_t batch_size, int height, int width, int target_device_id) {
  mmltk::common::logging::ScopedProfile profile_rfdetr_targets_ensure_batch{"rfdetr.targets.ensure_batch"};
@@ -217,6 +266,7 @@ void TargetScratch::ensure_batch(size_t batch_size, int height, int width, int t
  image_width = width;
  offsets.resize(batch_size);
  counts.resize(batch_size);
+ if (device_slots_used_) return;
  const auto target_device = mmltk::backend::ml::cuda::cuda_device(target_device_id);
  const int64_t capacity = std::max<int64_t>(batch.batch_capacity, static_cast<int64_t>(batch_size));
  const auto metadata_tensor_matches = [&](const torch::Tensor& tensor) {
@@ -252,75 +302,145 @@ TargetStagingSlot& TargetScratch::acquire_staging_slot(const std::size_t batch_s
  require(!staging_slot_acquired_, "target staging slot is already acquired");
  require(copy_stream_device_id_ >= 0, "target staging slot acquisition requires configured copy resources");
  torch_cuda::TorchCudaDeviceGuard device_guard(mmltk::backend::ml::cuda::checked_device_index(copy_stream_device_id_));
+ std::size_t index = next_staging_slot_;
+ bool available = false;
  for (std::size_t offset = 0; offset < staging_slots_.size(); ++offset) {
-  const std::size_t index = (next_staging_slot_ + offset) % staging_slots_.size();
-  auto& slot = staging_slots_[index];
+  const auto candidate = (next_staging_slot_ + offset) % staging_slots_.size();
+  auto& slot = staging_slots_[candidate];
   if (slot.copy_pending) {
    const cudaError_t status = cudaEventQuery(reinterpret_cast<cudaEvent_t>(slot.copy_complete_event));
    if (status == cudaErrorNotReady) { continue; }
    ensure_cuda_ok(status, "cudaEventQuery for target staging copy");
    slot.copy_pending = false;
   }
-  const int64_t required_batch = static_cast<int64_t>(batch_size);
-  const int64_t required_instances = std::max<int64_t>(instances, 1);
-  const int64_t batch_capacity = std::max(slot.batch_capacity, required_batch);
-  const int64_t slot_instance_capacity = std::max(slot.instance_capacity, required_instances);
-  const int64_t mask_words = include_masks ? packed_mask_words_for_shape(height, width) : 0;
-  const auto has_vector_capacity = [](const torch::Tensor& tensor, const int64_t capacity) { return tensor.defined() && tensor.dim() == 1 && tensor.size(0) >= capacity; };
-  const auto has_matrix_capacity = [](const torch::Tensor& tensor, const int64_t capacity, const int64_t columns) {
-   return tensor.defined() && tensor.dim() == 2 && tensor.size(0) >= capacity && tensor.size(1) == columns;
-  };
-  const bool replace_batch = slot.batch_capacity < required_batch || !has_vector_capacity(slot.image_ids, batch_capacity) || !has_vector_capacity(slot.offsets, batch_capacity) ||
-                             !has_vector_capacity(slot.counts, batch_capacity);
-  const bool replace_instances = slot.instance_capacity < required_instances || !has_matrix_capacity(slot.boxes, slot_instance_capacity, 4) ||
-                                 !has_vector_capacity(slot.labels, slot_instance_capacity) || !has_vector_capacity(slot.area, slot_instance_capacity) ||
-                                 !has_vector_capacity(slot.iscrowd, slot_instance_capacity) || !has_matrix_capacity(slot.inverse_transforms, slot_instance_capacity, 6) ||
-                                 !has_vector_capacity(slot.occluder_mask_indices, slot_instance_capacity) || !has_matrix_capacity(slot.occluder_inverse_transforms, slot_instance_capacity, 6) ||
-                                 (include_masks && !has_matrix_capacity(slot.erasure, slot_instance_capacity, sizeof(AugmentationSpatialErasure)));
-  const bool replace_masks = include_masks && (slot.mask_height != height || slot.mask_width != width || !has_matrix_capacity(slot.packed_masks, required_instances, mask_words));
-  const bool create_completion_event = slot.copy_complete_event == 0U;
-  if (replace_batch || replace_instances || replace_masks || create_completion_event) {
-   static_assert(std::is_nothrow_move_assignable_v<TargetStagingSlot>);
-   TargetStagingSlot replacement = slot;
-   PendingCudaEvent pending_event;
-   const auto allocate_staging = [device = copy_stream_device_id_](const at::IntArrayRef shape, const at::ScalarType type) { return torch_cuda::numa_empty(shape, type, device); };
-   if (create_completion_event) {
-    ensure_cuda_ok(cudaEventCreateWithFlags(pending_event.out(), cudaEventDisableTiming), "cudaEventCreateWithFlags for target staging copy");
-    replacement.copy_complete_event = reinterpret_cast<std::uintptr_t>(pending_event.get());
-   }
-   if (replace_batch) {
-    replacement.image_ids = allocate_staging({batch_capacity}, torch::kInt64);
-    replacement.offsets = allocate_staging({batch_capacity}, torch::kInt64);
-    replacement.counts = allocate_staging({batch_capacity}, torch::kInt64);
-    replacement.batch_capacity = batch_capacity;
-   }
-   if (replace_instances) {
-    replacement.boxes = allocate_staging({slot_instance_capacity, 4}, torch::kFloat32);
-    replacement.sampling_keys = allocate_staging({slot_instance_capacity}, torch::kInt64);
-    replacement.labels = allocate_staging({slot_instance_capacity}, torch::kInt64);
-    replacement.area = allocate_staging({slot_instance_capacity}, torch::kFloat32);
-    replacement.iscrowd = allocate_staging({slot_instance_capacity}, torch::kInt64);
-    replacement.inverse_transforms = allocate_staging({slot_instance_capacity, 6}, torch::kFloat32);
-    replacement.occluder_mask_indices = allocate_staging({slot_instance_capacity}, torch::kInt64);
-    replacement.occluder_inverse_transforms = allocate_staging({slot_instance_capacity, 6}, torch::kFloat32);
-    if (include_masks) { replacement.erasure = allocate_staging({slot_instance_capacity, static_cast<int64_t>(sizeof(AugmentationSpatialErasure))}, torch::kUInt8); }
-    replacement.instance_capacity = slot_instance_capacity;
-   }
-   if (replace_masks) {
-    replacement.packed_masks = allocate_staging({required_instances, mask_words}, torch::kInt64).zero_();
-    replacement.mask_height = height;
-    replacement.mask_width = width;
-    replacement.mask_words_per_instance = mask_words;
-   }
-   slot = std::move(replacement);
-   pending_event.release();
-  }
+  index = candidate;
+  available = true;
+  break;
+ }
+ auto& slot = staging_slots_[index];
+ if (!available) {
+  // Bounded backpressure settles only this pinned source's DMA. The device
+  // destination remains protected by upload_staging's final-consumer wait.
+  ensure_cuda_ok(staging_wait_(reinterpret_cast<cudaEvent_t>(slot.copy_complete_event)), "settle target staging copy for reuse");
+  slot.copy_pending = false;
+ }
+ const int64_t required_batch = static_cast<int64_t>(batch_size);
+ const int64_t required_instances = std::max<int64_t>(instances, 1);
+ const int64_t batch_capacity = std::max(slot.batch_capacity, required_batch);
+ const int64_t slot_instance_capacity = std::max(slot.instance_capacity, required_instances);
+ const int64_t mask_words = include_masks ? packed_mask_words_for_shape(height, width) : 0;
+ // The common shape keeps the already-bound views as well as its allocations.
+ if (slot.metadata.defined() && slot.image_ids.size(0) == required_batch && slot.boxes.size(0) == required_instances &&
+     slot.erasure.size(0) == (include_masks ? required_instances : 0) &&
+     (!include_masks || (slot.packed_masks.defined() && slot.mask_height == height && slot.mask_width == width && slot.packed_masks.size(0) == required_instances))) {
   active_staging_slot_ = index;
   next_staging_slot_ = (index + 1) % staging_slots_.size();
   staging_slot_acquired_ = true;
   return slot;
  }
- throw std::runtime_error("RF-DETR target staging capacity is exhausted");
+ TargetStagingSlot replacement;
+ const auto metadata_bytes = bind_target_metadata(replacement, {}, required_batch, required_instances, include_masks);
+ replacement.metadata_owner = slot.metadata_owner && slot.metadata_owner->capacity_bytes() >= static_cast<std::size_t>(metadata_bytes)
+                               ? slot.metadata_owner : std::make_shared<torch_cuda::NumaHostTensor>(copy_stream_device_id_);
+ replacement.metadata = replacement.metadata_owner->view({metadata_bytes}, torch::kUInt8);
+ (void)bind_target_metadata(replacement, replacement.metadata, required_batch, required_instances, include_masks);
+ replacement.mask_owner = slot.mask_owner;
+ if (include_masks) {
+  const auto mask_bytes = static_cast<std::size_t>(required_instances) * static_cast<std::size_t>(mask_words) * sizeof(std::int64_t);
+  if (!replacement.mask_owner || replacement.mask_owner->capacity_bytes() < mask_bytes)
+   replacement.mask_owner = std::make_shared<torch_cuda::NumaHostTensor>(copy_stream_device_id_);
+  replacement.packed_masks = replacement.mask_owner->view({required_instances, mask_words}, torch::kInt64);
+ }
+ PendingCudaEvent pending_event;
+ replacement.copy_complete_event = slot.copy_complete_event;
+ replacement.device_metadata = slot.device_metadata;
+ replacement.device_masks = slot.device_masks;
+ replacement.consumers_retired_event = slot.consumers_retired_event;
+ replacement.consumers_pending = slot.consumers_pending;
+ replacement.device_reusable = slot.device_reusable;
+ PendingCudaEvent pending_consumer;
+ if (replacement.consumers_retired_event == 0) {
+  ensure_cuda_ok(cudaEventCreateWithFlags(pending_consumer.out(), cudaEventDisableTiming), "create target slot consumer event");
+  replacement.consumers_retired_event = reinterpret_cast<std::uintptr_t>(pending_consumer.get());
+ }
+ if (replacement.copy_complete_event == 0) {
+  ensure_cuda_ok(cudaEventCreateWithFlags(pending_event.out(), cudaEventDisableTiming), "cudaEventCreateWithFlags for target staging copy");
+  replacement.copy_complete_event = reinterpret_cast<std::uintptr_t>(pending_event.get());
+ }
+ replacement.batch_capacity = batch_capacity;
+ replacement.instance_capacity = slot_instance_capacity;
+ replacement.mask_height = include_masks ? height : slot.mask_height;
+ replacement.mask_width = include_masks ? width : slot.mask_width;
+ replacement.mask_words_per_instance = include_masks ? mask_words : slot.mask_words_per_instance;
+ auto old_metadata = slot.metadata_owner;
+ auto old_masks = slot.mask_owner;
+ slot = std::move(replacement);
+ pending_event.release();
+ pending_consumer.release();
+ if (old_metadata != slot.metadata_owner) release_settled_staging(old_metadata);
+ if (old_masks != slot.mask_owner) release_settled_staging(old_masks);
+ active_staging_slot_ = index;
+ next_staging_slot_ = (index + 1) % staging_slots_.size();
+ staging_slot_acquired_ = true;
+ return slot;
+}
+void TargetScratch::upload_staging(const TargetStagingSlot& staging, int64_t instances, bool include_masks) {
+ auto& slot = staging_slots_[active_staging_slot_];
+ const auto device = torch_cuda::cuda_device(device_id);
+ if (slot.consumers_pending) {
+  ensure_cuda_ok(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(copy_stream_), reinterpret_cast<cudaEvent_t>(slot.consumers_retired_event), 0), "wait for target slot final consumers");
+  slot.consumers_pending = false;
+ }
+ const auto ensure = [&](torch::Tensor& tensor, const torch::Tensor& host) {
+  if (!slot.device_reusable || !tensor.defined() || tensor.device() != device || tensor.numel() < host.numel())
+   tensor = torch::empty({host.numel()}, host.options().device(device));
+ };
+ ensure(slot.device_metadata, staging.metadata);
+ if (include_masks) ensure(slot.device_masks, staging.packed_masks.reshape({-1}));
+ // Publish nonreusability before any transfer, including partial-copy failure.
+ slot.device_reusable = false;
+ device_slots_used_ = true;
+ slot.device_metadata.narrow(0, 0, staging.metadata.numel()).copy_(staging.metadata, true);
+ if (include_masks && instances > 0) {
+  const auto source = staging.packed_masks.narrow(0, 0, instances).reshape({-1});
+  slot.device_masks.narrow(0, 0, source.numel()).copy_(source, true);
+ }
+ offsets_gpu = device_view(staging, staging.offsets);
+ counts_gpu = device_view(staging, staging.counts);
+ mask_words_per_instance = staging.mask_words_per_instance;
+}
+torch::Tensor TargetScratch::device_view(const TargetStagingSlot& staging, const torch::Tensor& host) const {
+ const auto offset = host.storage_offset() * static_cast<int64_t>(host.element_size()) - staging.metadata.storage_offset();
+ return staging_slots_[active_staging_slot_].device_metadata.narrow(0, offset, host.numel() * host.element_size()).view(host.scalar_type()).view(host.sizes());
+}
+torch::Tensor TargetScratch::device_masks(int64_t instances) const {
+ return staging_slots_[active_staging_slot_].device_masks.narrow(0, 0, instances * mask_words_per_instance).view({instances, mask_words_per_instance});
+}
+std::size_t TargetScratch::consumer_slot(const PreparedTargets& targets) const {
+ // Normal admission leases the just-published slot in O(1). Retained batches
+ // can still acquire their lease after a later slot has been prepared.
+ if (targets.all_boxes.defined()) {
+  const auto& current = staging_slots_[active_staging_slot_].device_metadata;
+  if (current.defined() && current.is_alias_of(targets.all_boxes)) return active_staging_slot_;
+  for (std::size_t index = 0; index < staging_slots_.size(); ++index) {
+   const auto& tensor = staging_slots_[index].device_metadata;
+   if (tensor.defined() && tensor.is_alias_of(targets.all_boxes)) return index;
+  }
+ }
+ return staging_slots_.size();
+}
+void TargetScratch::retire_consumer_slot_on_stream(std::size_t index, const torch::Tensor& boxes, std::uintptr_t stream) {
+ retire_consumer_on_stream(stream);
+ if (index == staging_slots_.size()) return;
+ auto& slot = staging_slots_.at(index);
+ if (!slot.device_metadata.is_alias_of(boxes)) return;
+ const auto device_index = torch_cuda::checked_device_index(copy_stream_device_id_);
+ const auto cuda_stream = torch_cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(stream), device_index);
+ slot.device_metadata.record_stream(cuda_stream);
+ if (slot.device_masks.defined()) slot.device_masks.record_stream(cuda_stream);
+ ensure_cuda_ok(cudaEventRecord(reinterpret_cast<cudaEvent_t>(slot.consumers_retired_event), reinterpret_cast<cudaStream_t>(stream)), "record target slot final consumers");
+ slot.consumers_pending = true;
+ slot.device_reusable = true;
 }
 void TargetScratch::record_staging_copy_on_stream(const std::uintptr_t stream) {
  require(staging_slot_acquired_ && stream != 0U, "target staging completion requires an acquired slot and CUDA stream");
@@ -334,7 +454,7 @@ void TargetScratch::record_staging_copy_on_stream(const std::uintptr_t stream) {
 void TargetScratch::ensure_copy_resources(int target_device_id) {
  if (copy_stream_ != 0U && copy_stream_device_id_ == target_device_id && copy_complete_event_ != 0U && consumers_retired_event_ != 0U) {
   torch_cuda::TorchCudaDeviceGuard device_guard(mmltk::backend::ml::cuda::checked_device_index(copy_stream_device_id_));
-  if (consumers_pending_) {
+  if (consumers_pending_ && !device_slots_used_) {
    ensure_cuda_ok(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(copy_stream_), reinterpret_cast<cudaEvent_t>(consumers_retired_event_), 0), "cudaStreamWaitEvent for target consumer retirement");
    consumers_pending_ = false;
   }
@@ -361,14 +481,16 @@ void TargetScratch::wait_for_pending_copy() {
  ensure_cuda_ok(cudaEventSynchronize(copy_complete_event), "cudaEventSynchronize for target copy");
  copy_pending_ = false;
 }
-void TargetScratch::handoff_pending_copy_to_current_stream(int target_device_id) const {
- if (!copy_pending_) { return; }
- require(copy_complete_event_ != 0U && copy_stream_device_id_ >= 0, "pending target copy has no configured event owner");
+void TargetScratch::handoff_pending_copy_to_current_stream(int target_device_id, std::size_t slot) const {
+ const bool own_slot = slot < staging_slots_.size();
+ const bool pending = own_slot ? staging_slots_[slot].copy_pending : copy_pending_;
+ if (!pending) return;
+ const auto event = own_slot ? staging_slots_[slot].copy_complete_event : copy_complete_event_;
+ require(event != 0U && copy_stream_device_id_ >= 0, "pending target copy has no configured event owner");
  require(target_device_id == copy_stream_device_id_, "target copy handoff device does not match its event owner");
  const auto device_index = mmltk::backend::ml::cuda::checked_device_index(target_device_id);
  torch_cuda::TorchCudaDeviceGuard device_guard(device_index);
- ensure_cuda_ok(
-  cudaStreamWaitEvent(torch_cuda::current_torch_cuda_stream_object(device_index).stream(), reinterpret_cast<cudaEvent_t>(copy_complete_event_), 0), "cudaStreamWaitEvent for target copy");
+ ensure_cuda_ok(cudaStreamWaitEvent(torch_cuda::current_torch_cuda_stream_object(device_index).stream(), reinterpret_cast<cudaEvent_t>(event), 0), "cudaStreamWaitEvent for target copy");
 }
 void TargetScratch::wait_for_pending_copy_on_stream(const std::uintptr_t stream) const {
  if (!copy_pending_) return;
@@ -403,7 +525,7 @@ void TargetScratch::retire_consumer_on_stream(const std::uintptr_t stream) {
  ensure_cuda_ok(cudaEventRecord(reinterpret_cast<cudaEvent_t>(consumers_retired_event_), consumer_stream), "cudaEventRecord for target consumer retirement");
  consumers_pending_ = true;
 }
-TargetConsumerLease::TargetConsumerLease(TargetScratch& scratch, const PreparedTargets& targets, const int device_id) : scratch_(&scratch), device_id_(device_id) {
+TargetConsumerLease::TargetConsumerLease(TargetScratch& scratch, const PreparedTargets& targets, const int device_id) : scratch_(&scratch), device_id_(device_id), slot_(scratch.consumer_slot(targets)), boxes_(targets.all_boxes) {
  targets.record_stream(torch_cuda::current_torch_cuda_stream_object(torch_cuda::checked_device_index(device_id_)));
 }
 TargetConsumerLease::~TargetConsumerLease() noexcept {
@@ -420,12 +542,12 @@ TargetConsumerLease::~TargetConsumerLease() noexcept {
 }
 void TargetConsumerLease::retire() {
  if (scratch_ == nullptr) { return; }
- scratch_->retire_consumers_on_current_stream(device_id_);
+ scratch_->retire_consumer_slot_on_stream(slot_, boxes_, reinterpret_cast<std::uintptr_t>(torch_cuda::current_torch_cuda_stream_object(torch_cuda::checked_device_index(device_id_)).stream()));
  scratch_ = nullptr;
 }
 void TargetConsumerLease::handoff() {
  if (scratch_ == nullptr || handed_off_) { return; }
- scratch_->handoff_pending_copy_to_current_stream(device_id_);
+ scratch_->handoff_pending_copy_to_current_stream(device_id_, slot_);
  handed_off_ = true;
 }
 LoaderBatchGuard::LoaderBatchGuard(mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch, int device_id) : loader_(&loader), batch_(batch), device_id_(device_id) {
@@ -482,7 +604,6 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
  scratch.ensure_batch(batch.num_images, image_height, image_width, device_id);
  mmltk::common::logging::profile_add_value("rfdetr.targets.images", batch.num_images);
  const auto device = mmltk::backend::ml::cuda::cuda_device(device_id);
- const auto gpu_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
  const auto gpu_int64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
  auto& offsets = scratch.offsets;
  auto& counts = scratch.counts;
@@ -517,7 +638,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
 #endif
  if (maximum_instances > 0) {
   std::memset(staging.iscrowd.data_ptr<int64_t>(), 0, static_cast<size_t>(maximum_instances) * sizeof(int64_t));
-  std::fill_n(staging.occluder_mask_indices.data_ptr<int64_t>(), maximum_instances, int64_t{-1});
+  if (include_masks) std::fill_n(staging.occluder_mask_indices.data_ptr<int64_t>(), maximum_instances, int64_t{-1});
  }
  auto boxes = staging.boxes.accessor<float, 2>();
  auto labels = staging.labels.accessor<int64_t, 1>();
@@ -570,9 +691,11 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
     write_cxcywh_box(boxes, target_index, transformed);
     labels[target_index] = static_cast<int64_t>(instance.class_id);
     if (erasure_bytes != nullptr) { std::memcpy(erasure_bytes + target_index * sizeof(erasure), &erasure, sizeof(erasure)); }
-    std::copy(inverse.begin(), inverse.end(), &inverse_transforms[target_index][0]);
-    std::copy(
-     paste_plan != nullptr ? paste_plan->paste_inverse.begin() : identity.begin(), paste_plan != nullptr ? paste_plan->paste_inverse.end() : identity.end(), &occluder_transforms[target_index][0]);
+    if (include_masks) {
+     std::copy(inverse.begin(), inverse.end(), &inverse_transforms[target_index][0]);
+     std::copy(paste_plan != nullptr ? paste_plan->paste_inverse.begin() : identity.begin(), paste_plan != nullptr ? paste_plan->paste_inverse.end() : identity.end(),
+      &occluder_transforms[target_index][0]);
+    }
 #if MMLTK_ENABLE_PROFILING
     if (include_masks) ++mask_instances;
 #endif
@@ -609,11 +732,11 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
     labels[paste_index] = paste_plan->paste_label;
     if (erasure_bytes != nullptr) { std::memcpy(erasure_bytes + paste_index * sizeof(erasure), &erasure, sizeof(erasure)); }
     areas[paste_index] = donor_support.area_pixels;
-    std::copy(paste_plan->paste_inverse.begin(), paste_plan->paste_inverse.end(), &inverse_transforms[paste_index][0]);
-    std::copy(identity.begin(), identity.end(), &occluder_transforms[paste_index][0]);
-    occluder_indices[paste_index] = -1;
-    for (int64_t target_index = image_offset; target_index < original_end; ++target_index) { occluder_indices[target_index] = paste_index; }
     if (include_masks) {
+     std::copy(paste_plan->paste_inverse.begin(), paste_plan->paste_inverse.end(), &inverse_transforms[paste_index][0]);
+     std::copy(identity.begin(), identity.end(), &occluder_transforms[paste_index][0]);
+     occluder_indices[paste_index] = -1;
+     for (int64_t target_index = image_offset; target_index < original_end; ++target_index) occluder_indices[target_index] = paste_index;
      pack_compiled_rle_pairs(
       {paste_plan->paste_support, paste_plan->paste_support_count}, {packed_masks_data + paste_index * staging.mask_words_per_instance, static_cast<std::size_t>(staging.mask_words_per_instance)});
 #if MMLTK_ENABLE_PROFILING
@@ -635,10 +758,10 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
  mmltk::common::logging::profile_add_value("rfdetr.targets.mask_instances", mask_instances);
  mmltk::common::logging::profile_add_value("rfdetr.targets.augmentation_dropped", dropped_instances);
 #endif
- torch::Tensor boxes_gpu = torch::zeros({0, 4}, gpu_float);
- torch::Tensor labels_gpu = torch::zeros({0}, gpu_int64);
- torch::Tensor area_gpu = torch::zeros({0}, gpu_float);
- torch::Tensor iscrowd_gpu = torch::zeros({0}, gpu_int64);
+ torch::Tensor boxes_gpu;
+ torch::Tensor labels_gpu;
+ torch::Tensor area_gpu;
+ torch::Tensor iscrowd_gpu;
  std::optional<PackedTargetMasks> packed_masks_gpu;
  torch::Tensor image_ids_gpu;
  {
@@ -646,30 +769,29 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
   torch_cuda::TorchCudaDeviceGuard device_guard(mmltk::backend::ml::cuda::checked_device_index(device_id));
   const auto copy_stream = require_copy_stream(scratch);
   torch_cuda::TorchCudaStreamGuard stream_guard(copy_stream);
-  image_ids_gpu = image_ids_cpu.to(device, torch::kInt64, true, false);
-  scratch.offsets_gpu.narrow(0, 0, static_cast<int64_t>(batch.num_images)).copy_(offsets_cpu, true);
-  scratch.counts_gpu.narrow(0, 0, static_cast<int64_t>(batch.num_images)).copy_(counts_cpu, true);
+  scratch.upload_staging(staging, total_instances, include_masks);
+  image_ids_gpu = scratch.device_view(staging, image_ids_cpu);
+  boxes_gpu = scratch.device_view(staging, staging.boxes).narrow(0, 0, total_instances);
+  labels_gpu = scratch.device_view(staging, staging.labels).narrow(0, 0, total_instances);
+  area_gpu = scratch.device_view(staging, staging.area).narrow(0, 0, total_instances);
+  iscrowd_gpu = scratch.device_view(staging, staging.iscrowd).narrow(0, 0, total_instances);
   if (total_instances > 0) {
-   boxes_gpu = staging.boxes.narrow(0, 0, total_instances).to(device, torch::kFloat32, true, false);
-   if (!batch.draw_keys.empty()) prepared.sampling_keys = staging.sampling_keys.narrow(0, 0, total_instances).to(device, torch::kInt64, true, false);
-   labels_gpu = staging.labels.narrow(0, 0, total_instances).to(device, torch::kInt64, true, false);
-   area_gpu = staging.area.narrow(0, 0, total_instances).to(device, torch::kFloat32, true, false);
-   iscrowd_gpu = staging.iscrowd.narrow(0, 0, total_instances).to(device, torch::kInt64, true, false);
+   if (!batch.draw_keys.empty()) prepared.sampling_keys = scratch.device_view(staging, staging.sampling_keys).narrow(0, 0, total_instances);
    if (include_masks) {
     const bool transformed = augmentation_plan != nullptr && (augmentation_plan->transforms_geometry || augmentation_plan->copy_paste_enabled || augmentation_plan->erases_spatial_support);
     packed_masks_gpu = PackedTargetMasks{
-     staging.packed_masks.narrow(0, 0, total_instances).to(device, torch::kInt64, true, false),
+     scratch.device_masks(total_instances),
      image_height,
      image_width,
-     transformed ? staging.inverse_transforms.narrow(0, 0, total_instances).to(device, torch::kFloat32, true, false) : torch::Tensor{},
-     transformed ? staging.occluder_mask_indices.narrow(0, 0, total_instances).to(device, torch::kInt64, true, false) : torch::Tensor{},
-     transformed ? staging.occluder_inverse_transforms.narrow(0, 0, total_instances).to(device, torch::kFloat32, true, false) : torch::Tensor{},
-     augmentation_plan != nullptr && augmentation_plan->erases_spatial_support ? staging.erasure.narrow(0, 0, total_instances).to(device, torch::kUInt8, true, false) : torch::Tensor{},
+     transformed ? scratch.device_view(staging, staging.inverse_transforms).narrow(0, 0, total_instances) : torch::Tensor{},
+     transformed ? scratch.device_view(staging, staging.occluder_mask_indices).narrow(0, 0, total_instances) : torch::Tensor{},
+     transformed ? scratch.device_view(staging, staging.occluder_inverse_transforms).narrow(0, 0, total_instances) : torch::Tensor{},
+     augmentation_plan != nullptr && augmentation_plan->erases_spatial_support ? scratch.device_view(staging, staging.erasure).narrow(0, 0, total_instances) : torch::Tensor{},
     };
    }
   } else if (include_masks) {
    packed_masks_gpu = PackedTargetMasks{
-    torch::zeros({0, packed_mask_words_for_shape(image_height, image_width)}, gpu_int64),
+    scratch.device_masks(0),
     image_height,
     image_width,
     {},

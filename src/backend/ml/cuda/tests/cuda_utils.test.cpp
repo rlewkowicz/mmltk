@@ -63,3 +63,48 @@ TEST_CASE("NUMA tensors retain zero-copy storage and compact active shapes", "[c
  auto device = retained.to(at::Device(at::kCUDA, 0), at::kLong, true);
  REQUIRE(at::equal(mmltk::backend::ml::cuda::numa_readback(device), retained));
 }
+
+TEST_CASE("Settled NUMA handoff release avoids context waits and preserves escaped borrowers", "[cuda][numa][host-tensor]") {
+ int devices = 0;
+ if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA unavailable; settled host release unexecuted");
+ CUDA_ASSERT_OK(cudaSetDevice(0));
+ const mmltk::common::system::ScopedExecutionPolicy policy(mmltk::frameworks::gpu::test_support::selected_test_execution_policy(0));
+ struct Counts { unsigned waits = 0, releases = 0; } counts;
+ mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations;
+ operations.context.context = &counts;
+ operations.synchronize = +[](void* state) {
+  ++static_cast<Counts*>(state)->waits;
+  return cuCtxSynchronize();
+ };
+ operations.unregister = +[](void* state, void* address) {
+  ++static_cast<Counts*>(state)->releases;
+  return cuMemHostUnregister(address);
+ };
+ {
+  mmltk::backend::ml::cuda::NumaHostTensor owner(0, {}, {}, operations);
+  auto source = owner.view({64}, at::kFloat);
+  source.fill_(.5F);
+  auto destination = source.to(at::Device(at::kCUDA, 0), at::kFloat, true);
+  CUDA_ASSERT_OK(cudaDeviceSynchronize()); // The owning DMA is physically settled.
+  CHECK(owner.ReleaseSettled() == CUDA_ERROR_NOT_READY);
+  CHECK(counts.releases == 0);
+  source = {};
+  CHECK(owner.ReleaseSettled() == CUDA_SUCCESS);
+  CHECK(counts.releases == 1);
+  CHECK(counts.waits == 0);
+  CHECK(destination.cpu().sum().item<float>() == 32.F);
+ }
+ CHECK(counts.waits == 0);
+ at::Tensor escaped;
+ {
+  mmltk::backend::ml::cuda::NumaHostTensor owner(0, {}, {}, operations);
+  escaped = owner.view({64}, at::kFloat);
+  escaped.fill_(.25F);
+  CHECK(owner.ReleaseSettled() == CUDA_ERROR_NOT_READY);
+ }
+ CHECK(escaped.sum().item<float>() == 16.F);
+ CHECK(counts.waits == 0);
+ escaped = {};
+ CHECK(counts.waits == 1);
+ CHECK(counts.releases == 2);
+}

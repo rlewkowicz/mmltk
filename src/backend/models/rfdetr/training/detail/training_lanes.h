@@ -2,6 +2,7 @@
 #include "src/backend/models/rfdetr/core/detection_statistics.h"
 #include "src/common/concurrency/worker_pool.h"
 #include <atomic>
+#include <cstddef>
 #include <deque>
 #include <future>
 #include <functional>
@@ -68,6 +69,10 @@ std::optional<mmltk::backend::ml::cuda::CudaEventPool::Lease> record_current_str
 void ensure_train_lane_model_supported(NativeRfDetrModel&, int);
 class TrainingLanes final {
 public:
+ // Nonempty lanes retain an independent next upload even with one microbatch.
+ [[nodiscard]] static constexpr std::size_t target_staging_depth(int accumulation_steps) noexcept {
+  return accumulation_steps > 2 ? static_cast<std::size_t>(accumulation_steps) : 2U;
+ }
  TrainingLanes(const TrainRequest&, RuntimeContext&, mmltk::backend::data::DatasetLoader&, std::shared_ptr<NativeRfDetrModel>, const std::vector<std::string>&, int lane_count, std::size_t local_batch,
   const mmltk::frameworks::gpu::DeviceContext&, std::function<void(std::exception_ptr)> failure = {}, std::shared_ptr<mmltk::common::concurrency::WorkerPool> workers = {});
  ~TrainingLanes();

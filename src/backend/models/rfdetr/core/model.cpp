@@ -1391,6 +1391,7 @@ torch::Tensor make_dummy_pixel_values(const torch::nn::Module& model, const int6
 void NativeRfDetrModel::Impl::optimize_for_inference(int batch_size, bool for_training, CompilationMode mode) {
  this->train(for_training);
  const bool selective = mode == CompilationMode::kSelective;
+ if (training_supervision_) training_supervision_->configure_compilation(for_training, selective);
  backbone_region_.prepare(for_training, selective, batch_size);
  for (const auto& module : modules(false)) {
   if (auto* layer = dynamic_cast<NativeDecoderLayerImpl*>(module.get())) layer->prepare_selective(for_training, selective, batch_size);

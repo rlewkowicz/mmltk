@@ -185,14 +185,17 @@ struct GpuAugmentationExecutor::Impl final {
   ensure_cuda_ok(static_cast<cudaError_t>(cuCtxGetCurrent(&native_context)), "augmentation current context");
   plan.images.resize(capacity);
   training_keys.resize(capacity);
+  planned_images.reserve(capacity);
   std::size_t created = 0U;
   try {
    for (cudaEvent_t& event : staging_complete) {
     ensure_cuda_ok(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "cudaEventCreateWithFlags for augmentation staging");
     ++created;
    }
+   for (auto& event : consumer_complete) ensure_cuda_ok(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "augmentation consumer event");
    ensure_cuda_ok(cudaEventCreateWithFlags(&execution_complete, cudaEventDisableTiming), "cudaEventCreateWithFlags for augmentation execution");
   } catch (...) {
+   for (auto event : consumer_complete) if (event) (void)cudaEventDestroy(event);
    for (std::size_t slot = 0U; slot < created; ++slot) {
     (void)cudaEventDestroy(staging_complete[slot]);
     staging_complete[slot] = nullptr;
@@ -208,6 +211,7 @@ struct GpuAugmentationExecutor::Impl final {
    if (execution_pending) { (void)cudaEventSynchronize(execution_complete); }
    (void)cudaEventDestroy(execution_complete);
   }
+  for (auto event : consumer_complete) if (event) (void)cudaEventDestroy(event);
   for (std::size_t slot = 0U; slot < kStagingSlots; ++slot) {
    if (staging_complete[slot] == nullptr) { continue; }
    if (staging_pending[slot]) { (void)cudaEventSynchronize(staging_complete[slot]); }
@@ -371,6 +375,8 @@ struct GpuAugmentationExecutor::Impl final {
  bool copy_paste = false;
  AugmentationBatchPlan plan;
  std::vector<std::uint64_t> training_keys;
+ std::vector<std::uint32_t> planned_images;
+ GpuAugmentationDonorSelection planned_selection = GpuAugmentationDonorSelection::Aligned;
  CachedAugmentationDonorIndex donor_index;
  DeviceAllocation<float> converted_input;
  DeviceAllocation<float> parameters;
@@ -382,6 +388,12 @@ struct GpuAugmentationExecutor::Impl final {
  PinnedAllocation<float> staged_parameters;
  PinnedAllocation<float> staged_paste;
  std::array<cudaEvent_t, kStagingSlots> staging_complete{};
+ std::array<cudaEvent_t, kStagingSlots> consumer_complete{};
+ std::array<bool, kStagingSlots> consumer_pending{};
+ std::size_t planned_slot = 0, planned_donors = 0;
+ bool plan_prepared = false, explicit_keys = false;
+ std::uint64_t seed = 0, sequence = 0;
+ int epoch = 0, rank = 0;
  std::array<bool, kStagingSlots> staging_pending{};
  cudaEvent_t execution_complete = nullptr;
  bool execution_pending = false;
@@ -449,6 +461,7 @@ void GpuAugmentationExecutor::Finish() {
   throw;
  }
  impl_->execution_pending = false;
+ impl_->consumer_pending.fill(false);
  impl_->staging_pending.fill(false);  // Final execution follows every staging read on the ordered streams.
  for (auto& slot : impl_->custody) slot = {};
  impl_->reductions.clear();
@@ -463,51 +476,87 @@ void GpuAugmentationExecutor::Reconfigure(const GpuAugmentationConfig& config) {
 }
 const AugmentationBatchPlan& GpuAugmentationExecutor::Run(const GpuAugmentationBatchView& batch, const std::span<const std::uint64_t> image_keys, const std::span<const GpuAugmentationDonor> donors,
  const GpuAugmentationDonorBatchView& donor_batch, cudaStream_t stream, const std::size_t staging_slot) {
- return RunImpl(batch, image_keys, donors, donor_batch, stream, staging_slot, true, 0U, 0, 0, 0U);
+ (void)Prepare(batch, image_keys, donors, donor_batch.selection, staging_slot);
+ RunPrepared(batch, donor_batch, stream);
+ return plan();
 }
 const AugmentationBatchPlan& GpuAugmentationExecutor::RunTraining(const GpuAugmentationBatchView& batch, const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence,
  const std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch, cudaStream_t stream, const std::size_t staging_slot) {
+ (void)PrepareTraining(batch, seed, epoch, rank, sequence, donors, donor_batch.selection, staging_slot);
+ RunPrepared(batch, donor_batch, stream);
+ return plan();
+}
+const AugmentationBatchPlan& GpuAugmentationExecutor::Prepare(const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> keys,
+ std::span<const GpuAugmentationDonor> donors, GpuAugmentationDonorSelection selection, std::size_t staging_slot) {
+ return PrepareImpl(batch, keys, donors, selection, staging_slot, true, 0, 0, 0, 0);
+}
+const AugmentationBatchPlan& GpuAugmentationExecutor::PrepareTraining(const GpuAugmentationBatchView& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence,
+ std::span<const GpuAugmentationDonor> donors, GpuAugmentationDonorSelection selection, std::size_t staging_slot) {
  RequireActive();
  require(batch.image_indices.size() <= impl_->capacity, "GPU augmentation batch exceeds preallocated capacity");
- for (std::size_t image = 0U; image < batch.image_indices.size(); ++image) { impl_->training_keys[image] = training_augmentation_image_key(seed, epoch, rank, sequence, image); }
- return RunImpl(batch, std::span{impl_->training_keys}.first(batch.image_indices.size()), donors, donor_batch, stream, staging_slot, false, seed, epoch, rank, sequence);
+ for (std::size_t image = 0; image < batch.image_indices.size(); ++image) impl_->training_keys[image] = training_augmentation_image_key(seed, epoch, rank, sequence, image);
+ return PrepareImpl(batch, std::span{impl_->training_keys}.first(batch.image_indices.size()), donors, selection, staging_slot, false, seed, epoch, rank, sequence);
 }
-const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentationBatchView& batch, const std::span<const std::uint64_t> image_keys,
- const std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch, cudaStream_t stream, const std::size_t staging_slot, const bool explicit_keys,
+const AugmentationBatchPlan& GpuAugmentationExecutor::PrepareImpl(const GpuAugmentationBatchView& batch, const std::span<const std::uint64_t> image_keys,
+ const std::span<const GpuAugmentationDonor> donors, GpuAugmentationDonorSelection selection, const std::size_t staging_slot, const bool explicit_keys,
  const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence) {
  RequireActive();
+ impl_->plan_prepared = false;
  require(batch.height == impl_->height && batch.width == impl_->width, "GPU augmentation batch dimensions do not match the executor");
  require(batch.image_indices.size() <= impl_->capacity, "GPU augmentation batch exceeds preallocated capacity");
  require(image_keys.size() == batch.image_indices.size(), "GPU augmentation key count does not match the batch");
  require(staging_slot < kStagingSlots, "GPU augmentation staging slot is out of range");
- require(batch.input_slots.empty() || (batch.input_format == GpuAugmentationInputFormat::PlanarFloat32 && batch.input_slots.size() == batch.image_indices.size()),
-  "augmentation input slots have invalid shape");
- require(donor_batch.image_slots.empty() || (donor_batch.image_slots.size() == donors.size() && donor_batch.image_slots.size() <= impl_->capacity), "augmentation donor slots have invalid shape");
- for (const auto* input : batch.input_slots) require(input != nullptr, "augmentation input slot is null");
- for (const auto* input : donor_batch.image_slots) require(input != nullptr, "augmentation donor slot is null");
- require(batch.input_format == GpuAugmentationInputFormat::PlanarFloat32 || batch.input_format == GpuAugmentationInputFormat::Rgba8, "GPU augmentation input format is invalid");
- require(batch.output_domain == GpuAugmentationOutputDomain::ModelNormalized || batch.output_domain == GpuAugmentationOutputDomain::UnitRgb, "GPU augmentation output domain is invalid");
- require(donor_batch.selection == GpuAugmentationDonorSelection::Aligned || donor_batch.selection == GpuAugmentationDonorSelection::Cached, "GPU augmentation donor selection is invalid");
- if (batch.image_indices.empty()) {
-  impl_->prepare_plan(batch, image_keys, donors, donor_batch.selection, impl_->staged_paste.data(), impl_->staged_parameters.data());
-  return impl_->plan;
- }
- // A null handle is CUDA's valid default stream, including Torch's current default stream.
- require((batch.input != nullptr || batch.input_slots.size() == batch.image_indices.size()) && batch.output != nullptr, "GPU augmentation requires input and output storage");
+ require(selection == GpuAugmentationDonorSelection::Aligned || selection == GpuAugmentationDonorSelection::Cached, "GPU augmentation donor selection is invalid");
  if (impl_->copy_paste) {
-  const std::size_t expected_donors = donor_batch.selection == GpuAugmentationDonorSelection::Aligned ? batch.image_indices.size() : impl_->capacity;
+  const std::size_t expected_donors = selection == GpuAugmentationDonorSelection::Aligned ? batch.image_indices.size() : impl_->capacity;
   require(donors.size() == expected_donors, "GPU augmentation donor metadata does not match its selection policy");
  }
  if (impl_->staging_pending[staging_slot]) {
   CheckSettlement(event_wait_(impl_->staging_complete[staging_slot]), "cudaEventSynchronize for augmentation staging reuse");
   impl_->staging_pending[staging_slot] = false;
-  impl_->custody[staging_slot] = {};
  }
  std::uint64_t* staged_keys = impl_->staged_keys.data() + staging_slot * impl_->capacity;
  if (explicit_keys) { std::memcpy(staged_keys, image_keys.data(), image_keys.size_bytes()); }
  float* staged_paste = impl_->staged_paste.data() + staging_slot * impl_->capacity * static_cast<std::size_t>(kGpuCopyPasteParameterCount);
  float* staged_parameters = impl_->staged_parameters.data() + staging_slot * impl_->capacity * static_cast<std::size_t>(kGpuAugmentationParameterCount);
- impl_->prepare_plan(batch, image_keys, donors, donor_batch.selection, staged_paste, staged_parameters);
+ impl_->prepare_plan(batch, image_keys, donors, selection, staged_paste, staged_parameters);
+ impl_->planned_images.assign(batch.image_indices.begin(), batch.image_indices.end());
+ impl_->planned_selection = selection;
+ impl_->planned_slot = staging_slot;
+ impl_->planned_donors = donors.size();
+ impl_->explicit_keys = explicit_keys;
+ impl_->seed = seed;
+ impl_->epoch = epoch;
+ impl_->rank = rank;
+ impl_->sequence = sequence;
+ impl_->plan_prepared = true;
+ return impl_->plan;
+}
+void GpuAugmentationExecutor::RunPrepared(const GpuAugmentationBatchView& batch, const GpuAugmentationDonorBatchView& donor_batch, cudaStream_t stream) {
+ RequireActive();
+ require(impl_->plan_prepared, "augmentation execution requires a prepared plan");
+ require(batch.height == impl_->height && batch.width == impl_->width && batch.image_indices.size() == impl_->plan.active_size, "prepared augmentation batch shape differs");
+ require(std::ranges::equal(batch.image_indices, impl_->planned_images), "prepared augmentation image identities differ");
+ require(donor_batch.selection == impl_->planned_selection, "prepared augmentation donor selection differs");
+ require(batch.input_slots.empty() || (batch.input_format == GpuAugmentationInputFormat::PlanarFloat32 && batch.input_slots.size() == batch.image_indices.size()),
+  "augmentation input slots have invalid shape");
+ for (const auto* input : batch.input_slots) require(input != nullptr, "augmentation input slot is null");
+ require(batch.input_format == GpuAugmentationInputFormat::PlanarFloat32 || batch.input_format == GpuAugmentationInputFormat::Rgba8, "GPU augmentation input format is invalid");
+ require(batch.output_domain == GpuAugmentationOutputDomain::ModelNormalized || batch.output_domain == GpuAugmentationOutputDomain::UnitRgb, "GPU augmentation output domain is invalid");
+ // A null handle is CUDA's valid default stream, including Torch's current default stream.
+ require(batch.image_indices.empty() || ((batch.input != nullptr || batch.input_slots.size() == batch.image_indices.size()) && batch.output != nullptr), "GPU augmentation requires input and output storage");
+ require(donor_batch.image_slots.empty() || (donor_batch.image_slots.size() == impl_->planned_donors && donor_batch.image_slots.size() <= impl_->capacity), "augmentation donor slots have invalid shape");
+ for (const auto* input : donor_batch.image_slots) require(input != nullptr, "augmentation donor slot is null");
+ impl_->plan_prepared = false;
+ if (batch.image_indices.empty()) return;
+ const auto staging_slot = impl_->planned_slot;
+ const auto explicit_keys = impl_->explicit_keys;
+ const auto seed = impl_->seed, sequence = impl_->sequence;
+ const auto epoch = impl_->epoch, rank = impl_->rank;
+ const auto key_bytes = batch.image_indices.size() * sizeof(std::uint64_t);
+ auto* staged_keys = impl_->staged_keys.data() + staging_slot * impl_->capacity;
+ auto* staged_paste = impl_->staged_paste.data() + staging_slot * impl_->capacity * kGpuCopyPasteParameterCount;
+ auto* staged_parameters = impl_->staged_parameters.data() + staging_slot * impl_->capacity * kGpuAugmentationParameterCount;
  bool has_paste = false;
  bool needs_donor_masks = false;
  bool needs_donor_boxes = false;
@@ -516,7 +565,7 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentat
    const std::int64_t donor_slot = impl_->plan.images[image].paste_donor_slot;
    if (donor_slot < 0) { continue; }
    has_paste = true;
-   if (donors[static_cast<std::size_t>(donor_slot)].has_mask) {
+   if (impl_->plan.images[image].paste_masked) {
     needs_donor_masks = true;
    } else {
     needs_donor_boxes = true;
@@ -537,10 +586,15 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentat
  // From the first stream operation onward, every failure path must settle the stream before
  // executor-owned staging or device storage can be reused or destroyed. The final execution
  // event becomes the normal lifetime fence only after cudaEventRecord succeeds.
- impl_->custody[staging_slot] = {batch.input_custody, batch.output_custody, donor_batch.image_custody};
+ const std::array<std::shared_ptr<const void>, 3> custody{batch.input_custody, batch.output_custody, donor_batch.image_custody};
+ // DMA completion permits host writes only. Changing GPU owners must still
+ // settle the preceding final pixel read; stable owners need no host wait.
+ if (impl_->consumer_pending[staging_slot] && impl_->custody[staging_slot] != custody)
+  CheckSettlement(event_wait_(impl_->consumer_complete[staging_slot]), "augmentation prior GPU custody");
+ impl_->custody[staging_slot] = custody;
  try {
   if (impl_->execution_pending) { ensure_cuda_ok(cudaStreamWaitEvent(stream, impl_->execution_complete, 0), "cudaStreamWaitEvent for augmentation workspace reuse"); }
-  if (explicit_keys) { ensure_cuda_ok(cudaMemcpyAsync(impl_->keys.data(), staged_keys, image_keys.size_bytes(), cudaMemcpyHostToDevice, stream), "cudaMemcpyAsync for augmentation keys"); }
+  if (explicit_keys) { ensure_cuda_ok(cudaMemcpyAsync(impl_->keys.data(), staged_keys, key_bytes, cudaMemcpyHostToDevice, stream), "cudaMemcpyAsync for augmentation keys"); }
   if (impl_->copy_paste) {
    ensure_cuda_ok(
     cudaMemcpyAsync(impl_->paste_parameters.data(), staged_paste, batch.image_indices.size() * static_cast<std::size_t>(kGpuCopyPasteParameterCount) * sizeof(float), cudaMemcpyHostToDevice, stream),
@@ -568,6 +622,8 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentat
   }
   const bool has_prepared = impl_->prepare_reductions(
    batch, donor_batch, augmentation_input, batch.input_format == GpuAugmentationInputFormat::Rgba8 ? std::shared_ptr<const void>(impl_) : batch.input_custody, stream, staging_slot, *this);
+  ensure_cuda_ok(staging_record_(impl_->staging_complete[staging_slot], stream), "cudaEventRecord for augmentation staging consumption");
+  impl_->staging_pending[staging_slot] = true;
   const auto* prepared = has_prepared ? impl_->prepared->views.data() : nullptr;
   const auto batch_size = static_cast<std::int64_t>(batch.image_indices.size());
   auto* const paste_parameters = impl_->copy_paste ? impl_->paste_parameters.data() : nullptr;
@@ -582,8 +638,8 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentat
    launch_gpu_augmentation_images(augmentation_input, batch.output, impl_->parameters.data(), paste_parameters, donor_images, donor_masks, donor_boxes, donor_mask_words, batch_size, impl_->height,
     impl_->width, launch, seed, epoch, rank, sequence, impl_->remap, batch.output_domain, stream, input_slots, donor_slots, prepared);
   }
-  ensure_cuda_ok(cudaEventRecord(impl_->staging_complete[staging_slot], stream), "cudaEventRecord for augmentation staging consumption");
-  impl_->staging_pending[staging_slot] = true;
+  ensure_cuda_ok(cudaEventRecord(impl_->consumer_complete[staging_slot], stream), "augmentation GPU consumer completion");
+  impl_->consumer_pending[staging_slot] = true;
   ensure_cuda_ok(cudaEventRecord(impl_->execution_complete, stream), "cudaEventRecord for augmentation execution");
   impl_->execution_pending = true;
  } catch (...) {
@@ -602,7 +658,6 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentat
   }
   std::rethrow_exception(failure);
  }
- return impl_->plan;
 }
 const AugmentationBatchPlan& GpuAugmentationExecutor::plan() const {
  RequireActive();

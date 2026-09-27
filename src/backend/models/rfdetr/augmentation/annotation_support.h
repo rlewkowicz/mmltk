@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdint>
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/common/math/deterministic_sampling.h"
 #include <span>
 #include "augmentation_plan.h"
@@ -46,17 +48,24 @@ struct AugmentationMappedInstance {
  float output_area = 0.0F;
  bool visible = false;
 };
-[[nodiscard]] inline AugmentationMappedInstance map_augmentation_instance(
- const mmltk::backend::data::PackedInstance& instance, int image_width, int image_height, const AugmentationImagePlan* plan, std::span<const mmltk::backend::data::RLEPair> mask = {}) {
+[[nodiscard]] inline std::array<float, 4> augmentation_instance_box(const mmltk::backend::data::PackedInstance& instance, int image_width, int image_height) {
  const float inverse_width = 1.0F / static_cast<float>(image_width);
  const float inverse_height = 1.0F / static_cast<float>(image_height);
- AugmentationMappedInstance mapped;
- mapped.source_box_xyxy = {
+ return {
   static_cast<float>(instance.bbox_x1) * inverse_width,
   static_cast<float>(instance.bbox_y1) * inverse_height,
   static_cast<float>(instance.bbox_x2) * inverse_width,
   static_cast<float>(instance.bbox_y2) * inverse_height,
  };
+}
+// Uses precisely the support mapper's eligibility rules, without computing unused
+// area and bounds. Pure geometry retains continuous detection-box visibility.
+[[nodiscard]] bool augmentation_instance_visible(const mmltk::backend::data::PackedInstance& instance, int width, int height, const AugmentationImagePlan* plan,
+ std::span<const mmltk::backend::data::RLEPair> mask = {});
+[[nodiscard]] inline AugmentationMappedInstance map_augmentation_instance(
+ const mmltk::backend::data::PackedInstance& instance, int image_width, int image_height, const AugmentationImagePlan* plan, std::span<const mmltk::backend::data::RLEPair> mask = {}) {
+ AugmentationMappedInstance mapped;
+ mapped.source_box_xyxy = augmentation_instance_box(instance, image_width, image_height);
  mapped.source_area_pixels = augmentation_box_area(mapped.source_box_xyxy) * static_cast<float>(image_width) * static_cast<float>(image_height);
  const auto support = resolve_augmentation_annotation_support(mapped.source_box_xyxy, mask, image_width, image_height, plan, false, instance.has_mask());
  mapped.output_box_xyxy = support.box_xyxy;
