@@ -152,6 +152,18 @@ public:
  pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
  return ::poll(&descriptor, 1U, 2'000) > 0;
 }
+[[nodiscard]] TrainProcessRunResult run_train_failure_with_split_output(TrainProcessClient& client, std::size_t read_budget = 1U) {
+ std::string discarded;
+ while (client.stdout_fd() >= 0) {
+  REQUIRE(ready(client.stdout_fd()));
+  client.consume_output(discarded, read_budget, 0U);
+ }
+ auto [source, token] = TrainProcessStopSource::Mint();
+ auto result = client.Run(std::move(token));
+ REQUIRE(result.terminal.outcome == TrainProcessExitOutcome::Failed);
+ CHECK(discarded.empty());
+ return result;
+}
 [[nodiscard]] TrainProcessClient launch_train_ignoring_term(mmltk::testsupport::ScopedTempDir& temp) {
  const auto executable = script(temp, "trap '' TERM\nprintf ready\nexec sleep 30\n");
  auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable, {}, {.escalation_delay = std::chrono::milliseconds{10}});
@@ -1499,14 +1511,7 @@ TEST_CASE("Train process distinguishes fatal causes from warnings and generic pa
  if (scenario == 5) body = "printf 'nonfatal: CUDA out of memory warning\\n'\nexit 7\n";
  auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), script(temp, body));
  // Single-byte reads force every envelope and UTF-8 boundary across calls.
- std::string discarded;
- while (client.stdout_fd() >= 0) {
-  REQUIRE(ready(client.stdout_fd()));
-  client.consume_output(discarded, scenario == 4 ? 4096U : 1U, 0U);
- }
- auto [source, token] = TrainProcessStopSource::Mint();
- const auto result = client.Run(std::move(token));
- REQUIRE(result.terminal.outcome == services::TrainProcessExitOutcome::Failed);
+ const auto result = run_train_failure_with_split_output(client, scenario == 4 ? 4096U : 1U);
  CHECK(result.terminal.error.size() <= contracts::kComputeErrorCapacity);
  CHECK(mmltk::common::types::valid_utf8(result.terminal.error));
  if (scenario == 0) {
@@ -1549,19 +1554,11 @@ TEST_CASE("Train process selects distributed fatal detail independently of worke
  const auto executable = script(temp, "printf 'fatal: mmltk rfdetr error: " + first + "\\nfatal: mmltk rfdetr error: " + second + "\\n'\nexit 7\n");
  auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable);
  // Exercise split envelopes without retaining console text.
- std::string discarded;
- while (client.stdout_fd() >= 0) {
-  REQUIRE(ready(client.stdout_fd()));
-  client.consume_output(discarded, 1U, 0U);
- }
- auto [source, token] = TrainProcessStopSource::Mint();
- const auto result = client.Run(std::move(token));
- REQUIRE(result.terminal.outcome == services::TrainProcessExitOutcome::Failed);
+ const auto result = run_train_failure_with_split_output(client);
  CHECK(result.terminal.exit_code == 7);
  CHECK(result.terminal.error.starts_with("local training exited with status 7: " + expected));
  CHECK(result.terminal.error.size() <= contracts::kComputeErrorCapacity);
  CHECK(mmltk::common::types::valid_utf8(result.terminal.error));
- CHECK(discarded.empty());
 }
 TEST_CASE("Train consumes native selected results and typed degraded persistence", "[gui][services][train]") {
  const bool selected = GENERATE(false, true);

@@ -20,8 +20,7 @@ Use subagents only on explicit user request or while executing a specific
 directly to its designated reviewer. The main agent reviews remediation plans
 for scope and architectural alignment without duplicating implementation audits.
 These implementation-phase delegation rules do not apply to validation fixes;
-[Final Validation](#final-validation-workflow) defines their main-agent ownership
-and its single cleanup-stage review boundary.
+[Final Validation](#final-validation-workflow) defines their main-agent ownership.
 
 After more than three reviewer returns for one phase, the main agent pauses
 for a deep implementation audit of `CONTRACT.md`, phase requirements, and
@@ -213,6 +212,10 @@ the next agent.
 - After `COMPLETE` and removal of the phase, commit all outstanding tracked
   changes except `actionplan.md`, which must remain uncommitted, never force-added.
 
+For recurring similar findings, stop symptom patches. Re-read the complete
+system API, reflected vocabulary, concurrency, lifetime, failure, and integration
+paths; require one cohesive correction before phase closure.
+
 ### Post-main-phase framework audit
 
 Run one framework audit after each integer-numbered main implementation commit,
@@ -306,9 +309,8 @@ application code, tests, build wiring, diagnostics, tooling, cleanup, and tidy.
 Regardless of fix size or failed attempts, do not delegate validation
 implementation or troubleshooting, or turn fixes into implementation phases or
 detours invoking executor/reviewer cycles. Validation fixes receive no per-fix,
-phase, or framework review. The single cleanup review occurs before
-`post cleanup`; afterward the main agent edits and validates directly without
-starting or reopening reviews.
+phase, cleanup, or framework review. The main agent edits and validates directly
+throughout Final Validation without starting or reopening reviews.
 
 Final Validation ends when the required final build, tests, and acceptance pass.
 Commit all remaining tracked changes, then complete and commit the documentation
@@ -328,153 +330,30 @@ Both builds use `./mmltk --build`; both tidy passes use the complete configured
    every genuine hit, then run a final full pass of every profile. Once all are
    clean, run the second full tidy and resolve every genuine finding. If tidy
    remediation changes code, repeat cleanup then tidy before continuing.
-3. After clean cleanup/tidy and before the final rebuild, spawn exactly one fresh
-   sol xhigh cleanup adversarial reviewer. Supply the complete diff from
-   `pre cleanup` and the workflow-agnostic verifier prompt below exactly once.
-   Require it to prioritize time complexity and system-boundary demarcation
-   while auditing cohesive ordinary C++ systems, high-quality DRY object-oriented
-   design, appropriate public/private class ownership, properly sealed
-   interfaces, appropriately scoped ordinary functions, canonical reflected
-   schemas, physical RAII resource safety, performance, and absence of
-   detector-driven code distortion. It must reject brute-force suppression,
-   blind or overused templating, line compression, respelling, and indirection
-   added solely to quiet a detector. Schema/reflection and genuinely reusable
-   compile-time polymorphism may remain templated.
-4. On `NOT COMPLETE`, the cleanup reviewer writes `remediationplan.md`. The main
-   agent checks scope/architecture, implements corrections, and updates the plan
-   directly. After remediation, rerun every applicable cleanup profile, then
-   full tidy before following up with the same reviewer until `COMPLETE`; never
-   spawn another cleanup reviewer or reissue the prompt.
-5. After the reviewer returns `COMPLETE` and cleanup and tidy reruns are clean,
-   commit all outstanding tracked cleanup, tidy, and remediation changes with
-   the exact message `post cleanup`; keep
-   `actionplan.md` uncommitted.
-6. From `post cleanup`, run the final full build once, then the complete `all`
+3. After cleanup and tidy are clean, commit all outstanding tracked cleanup and
+   tidy changes with the exact message `post cleanup`; keep `actionplan.md`
+   uncommitted.
+4. From `post cleanup`, run the final full build once, then the complete `all`
    suite and Wayland acceptance, exactly `./mmltk --test all` followed by
    `./mmltk --test workspace-wayland --headless-compositor`, with no intervening
    cleanup/tidy. Both must pass. Do not replace or supplement this gate with
    focused tests, individual executables, additional suites, or plan-specific
    acceptance commands. Put required feature coverage in these existing suites;
    diagnostic investigation adds no acceptance gate.
-7. If validation fails after `post cleanup`, the main agent diagnoses and edits
+5. If validation fails after `post cleanup`, the main agent diagnoses and edits
    the cause, rebuilds affected product code with `./mmltk --build`, and reruns
-   both required test commands in order. Do not add review or delegation, repeat
-   cleanup/tidy, or reopen cleanup review for these fixes.
+   both required test commands in order. Do not add review or delegation or
+   repeat cleanup/tidy for these fixes.
 
 Group targeted cleanup and tidy follow-up paths in one invocation where
 practical, preserving stage order. Proven detector false positives may use the
 narrow inline suppressions [below](#deduplication-rules).
-
-### Workflow-agnostic verifier prompt
-
-Use this prompt verbatim, replacing `<WORK SCOPE>`, `<REQUIREMENTS SOURCE>`, and
-`<REVIEW SET>` with concrete values:
-
-> Audit the complete `<REVIEW SET>` for `<WORK SCOPE>` against every requirement
-> in `<REQUIREMENTS SOURCE>` and all applicable repository instructions. Review
-> from scratch, inspect the whole review set, and return all findings together.
->
-> First, translate the requirements into an explicit acceptance checklist.
-> Identify intended behavior, affected components, inputs and outputs,
-> invariants, integration points, performance constraints, and evidence needed
-> for each item. Inspect every changed artifact and relevant unchanged caller,
-> callee, dependency, configuration, build rule, generated artifact,
-> documentation file, and test.
->
-> Perform a first pass for functional correctness and system cohesion. Verify
-> ordinary APIs are direct and complete, each system has a focused product
-> purpose, reflected intents/events/snapshots come from canonical typed
-> declarations, complete cutovers remove obsolete routes, and repeated code is
-> consolidated into a clear reusable abstraction. Check normal, empty, limit,
-> invalid, duplicate, partial-progress, cancellation, retry, restart, shutdown,
-> and cleanup paths where applicable.
->
-> Unless the requirements explicitly change product logic, treat every
-> observable outcome and failure path in the prior implementation as required.
-> For each substantial deletion or interface replacement, reconstruct what the
-> removed code did from its callers, callees, persisted forms, and tests. Verify
-> the replacement retains those outcomes and reuses cohesive existing behavior
-> where possible; a smaller interface does not justify silent capability loss.
->
-> Check physical resource safety explicitly. Trace allocation, context binding,
-> buffer and view lifetime, synchronization, worker stop and join, partial
-> construction, exception cleanup, device or dependency loss, and cross-thread
-> access. Verify RAII releases each resource safely, receiver-owned image copies
-> complete before borrowed views release, and concurrency preserves valid data
-> without polling, unnecessary blocking, races, leaks, or unbounded growth.
->
-> Check failure propagation, integration behavior, observability, security,
-> deterministic validation evidence, allocation and memory churn, CPU/GPU
-> transfer count, blocking, and algorithmic complexity. Challenge assumptions at
-> component boundaries and interactions between individually correct changes.
-> Prioritize time-complexity regressions, boundary demarcation, public/private
-> class ownership, sealed interfaces, and whether repeated member-wise mappings
-> should derive from canonical C++26 reflection instead of handwritten parallel
-> code.
-> Mark a review dimension `NOT APPLICABLE` only with a concrete reason.
->
-> Perform a second adversarial pass beginning with invalid input, inconsistent
-> local conditions, boundary values, unavailable dependencies, exceptions,
-> partial execution, capacity
-> pressure, concurrency interleavings, cancellation, shutdown, and cleanup.
-> Re-read the complete review set from those paths and verify the implementation
-> remains cohesive, resource-safe, bounded, performant, and consistent with
-> `CONTRACT.md`.
->
-> In this adversarial pass, treat performant as doing only necessary work at the
-> necessary frequency. Trace complexity and work counts against input size,
-> image dimensions, object count, history growth, progressive delivery and
-> input/redraw cadence. Challenge repeated allocation, unnecessary destruction
-> and recreation of reusable resources, deep copies of owned data, oversized
-> buffers, temporary collections and copying or formatting under locks. Verify
-> bounded storage retains useful capacity and immutable data is shared where
-> ownership permits. Trace conversions, rasterization, blending, resampling,
-> uploads, readbacks and CPU/GPU transfers end to end; reject repeated source
-> preparation, full-image passes for local changes, premature uploads and
-> redraws that repeat completed product work. Keep clean pixels, semantic
-> overlays, metadata and presentation invalidation independent where their
-> inputs differ; reuse must describe actual allocations and content, invalidate
-> before writes and become valid only after successful settlement. Check growth,
-> replacement, partial failure and retry for both stale reuse and needless
-> recomputation. Inspect blocking, synchronization, lock scope, worker wakeups,
-> polling, duplicate submissions and backpressure for avoidable serialization
-> or churn; idle, hidden and unchanged work should remain quiet, and disabled
-> diagnostics should collect nothing. Preserve required initialization, copies,
-> ordering, physical completion and resource custody. Support findings with
-> concrete source paths and operation counts or complexity, distinguish necessary
-> work from avoidable work, and prefer cohesive fixes in the existing owner.
-> This is static code inspection; do not add or enable benchmarks or profiling.
->
-> Return one consolidated report. For every finding include severity, exact
-> artifact and location, failing execution path, violated requirement, and the
-> minimum required correction. Include a coverage ledger mapping every
-> requirement to `VERIFIED` or to a finding. Say `COMPLETE` only when both passes
-> find no unresolved issue.
->
-> Treat `<REVIEW SET>` as authoritative and verify it is complete and internally
-> consistent. Do not edit reviewed artifacts or their governing plan,
-> specification, ticket, or requirements source. Obey workflow-specific
-> validation timing and plan-file restrictions.
->
-> If the result is `NOT COMPLETE`, write or replace `remediationplan.md` with an
-> executable remediation plan before returning. This is the review agent's only
-> permitted mutation. Include the authoritative review set, consolidated
-> findings, concrete phases, important files, exact actions and locations,
-> architectural constraints, and post-cleanup concerns. Do not add a validation
-> or commit phase, do not edit `actionplan.md`, and do not modify implementation
-> or requirements artifacts.
-
-For recurring similar findings, stop symptom patches. Re-read the complete
-system API, reflected vocabulary, concurrency, lifetime, failure, and integration
-paths; require one cohesive correction before phase closure.
 
 ## remediationplan.md
 
 `remediationplan.md` is the reviewer's executable phased plan for the executor.
 After main-agent scope/architecture review, the same astra xhigh executor
 completes and updates it until no phases remain; only then resume review.
-For scheduled cleanup review, the main agent instead implements and updates it
-under Final Validation's ownership rules.
 
 Include a problem statement or goal, Summary, Scope, Architecture, authoritative
 review set, findings, concrete phases, important files, every expected changed

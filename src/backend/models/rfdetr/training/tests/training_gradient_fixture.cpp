@@ -864,6 +864,16 @@ private:
  int successful_submissions_;
  bool prepared_ = false;
 };
+struct CollectiveFixture final {
+ CollectiveFixture(int device, CollectiveOutcome outcome, bool held = false, int successful_submissions = 0)
+     : gate(held ? std::make_shared<CollectiveGate>() : nullptr),
+       backend(c10::make_intrusive<FixtureCollectiveBackend>(device, outcome, facts, gate, successful_submissions)),
+       group(TrainingDistributedTestAccess::backend(backend, 0, device)) {}
+ std::shared_ptr<CollectiveFacts> facts = std::make_shared<CollectiveFacts>();
+ std::shared_ptr<CollectiveGate> gate;
+ c10::intrusive_ptr<FixtureCollectiveBackend> backend;
+ DistributedContext group;
+};
 class CollectiveRelease final {
 public:
  explicit CollectiveRelease(FixtureCollectiveBackend& backend) : backend_(backend) {}
@@ -936,11 +946,9 @@ private:
 void exercise_collective_custody(int device) {
  tc::TorchCudaDeviceGuard guard(tc::checked_device_index(device));
  const auto options = torch::TensorOptions().device(tc::cuda_device(device)).dtype(torch::kFloat32);
+ // CLEANUP-IGNORE: All-reduce and broadcast share the fixture and weak custody probe; their device operations and retirement assertions are independent.
  for (const auto outcome : {CollectiveOutcome::SubmitThrow, CollectiveOutcome::WaitFalse, CollectiveOutcome::WaitThrow}) {
-  const auto gate = std::make_shared<CollectiveGate>();
-  const auto facts = std::make_shared<CollectiveFacts>();
-  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, outcome, facts, gate);
-  auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  auto [facts, gate, backend, group] = CollectiveFixture(device, outcome, true);
   const auto transport = TrainingDistributedTestAccess::custody(group);
   auto tensor = torch::ones({4}, options);
   std::string failure;
@@ -965,10 +973,7 @@ void exercise_collective_custody(int device) {
  // A checked join is asynchronous: retained tensors stay live until the
  // explicit drained boundary, then slots, Work and events can be reused.
  {
-  auto facts = std::make_shared<CollectiveFacts>();
-  auto gate = std::make_shared<CollectiveGate>();
-  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, CollectiveOutcome::Success, facts, gate);
-  auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  auto [facts, gate, backend, group] = CollectiveFixture(device, CollectiveOutcome::Success, true);
   auto tensor = torch::ones({4}, options);
   TrainingCollectiveWork work(device);
   CollectiveRelease release(*backend);
@@ -989,9 +994,7 @@ void exercise_collective_custody(int device) {
  // Work handles survive the metric's single collective and are reclaimed only
  // after the shared physical handoff. The timeout is a deadlock watchdog.
  {
-  auto facts = std::make_shared<CollectiveFacts>();
-  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, CollectiveOutcome::Success, facts);
-  const auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  auto [facts, gate, backend, group] = CollectiveFixture(device, CollectiveOutcome::Success);
   const auto launch = tc::getCurrentCUDAStream(tc::checked_device_index(device));
   auto parameter = torch::ones({4}, options).set_requires_grad(true);
   TrainingGradientReducer reducer(group, device, launch, {"parameter"}, {parameter}, {{parameter}});
@@ -1043,9 +1046,7 @@ void exercise_collective_custody(int device) {
  // first pass warms the same Torch kernels and allocation sizes before gates.
  for (const bool distributed : {false, true}) {
   constexpr std::size_t k = 5, capacity = 2;
-  auto facts = std::make_shared<CollectiveFacts>();
-  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, CollectiveOutcome::Success, facts);
-  auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  auto [facts, gate, backend, group] = CollectiveFixture(device, CollectiveOutcome::Success);
   if (!distributed) {
    group.enabled = false;
    group.world_size = 1;
@@ -1121,10 +1122,7 @@ void exercise_collective_custody(int device) {
  // futures after submit/wait failure, including an already-admitted wave.
  for (const auto outcome : {CollectiveOutcome::SubmitThrow, CollectiveOutcome::WaitFalse, CollectiveOutcome::WaitThrow})
   for (const int completed_wave : {0, 2}) {
-   auto facts = std::make_shared<CollectiveFacts>();
-   auto gate = std::make_shared<CollectiveGate>();
-   auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, outcome, facts, gate, completed_wave);
-   auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+   auto [facts, gate, backend, group] = CollectiveFixture(device, outcome, true, completed_wave);
    TrainingTargetCounts counts(2, 4, device, group);
    counts.begin_attempt();
    counts.begin_wave(2);
@@ -1171,10 +1169,7 @@ void exercise_collective_custody(int device) {
  // The entire metric owner contains both its device inventory and pinned host
  // destination. A failed collective cannot leave only an event shell alive.
  for (const auto outcome : {CollectiveOutcome::SubmitThrow, CollectiveOutcome::WaitFalse, CollectiveOutcome::WaitThrow}) {
-  auto facts = std::make_shared<CollectiveFacts>();
-  auto gate = std::make_shared<CollectiveGate>();
-  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, outcome, facts, gate);
-  auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  auto [facts, gate, backend, group] = CollectiveFixture(device, outcome, true);
   TrainingMetricHandoff metrics(device);
   metrics.begin_attempt(1);
   metrics.accumulate_empty();
@@ -1190,10 +1185,7 @@ void exercise_collective_custody(int device) {
   require(failed && TrainingDistributedTestAccess::terminal(metrics) && !custody.expired(), "uncertain metric device/pinned custody was released");
  }
  for (const auto outcome : {CollectiveOutcome::SubmitThrow, CollectiveOutcome::WaitFalse, CollectiveOutcome::WaitThrow}) {
-  auto facts = std::make_shared<CollectiveFacts>();
-  auto gate = std::make_shared<CollectiveGate>();
-  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, outcome, facts, gate);
-  auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  auto [facts, gate, backend, group] = CollectiveFixture(device, outcome, true);
   const auto transport = TrainingDistributedTestAccess::custody(group);
   std::vector<torch::Tensor> tensors;
   for (int i = 0; i < 4; ++i) tensors.push_back(torch::full({4}, i, options));
@@ -1212,9 +1204,7 @@ void exercise_collective_custody(int device) {
  // Coalescing is observable through the actual broadcast primitive. Eight
  // tensor inventories fit two reusable buffers, not one submission per tensor.
  {
-  auto facts = std::make_shared<CollectiveFacts>();
-  auto backend = c10::make_intrusive<FixtureCollectiveBackend>(device, CollectiveOutcome::Success, facts);
-  const auto group = TrainingDistributedTestAccess::backend(backend, 0, device);
+  auto [facts, gate, backend, group] = CollectiveFixture(device, CollectiveOutcome::Success);
   std::vector<torch::Tensor> tensors;
   for (int i = 0; i < 33; ++i) tensors.push_back(torch::full({2, 2}, i, options).transpose(0, 1));
   broadcast_training_tensors(group, tensors, 64);
