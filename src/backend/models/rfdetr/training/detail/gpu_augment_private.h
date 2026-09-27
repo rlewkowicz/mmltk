@@ -47,7 +47,7 @@ private:
  void RequireActive() const;
  void Retire(cudaError_t) noexcept;
  void CheckSettlement(cudaError_t, const char*);
- decltype(&cudaMemcpyAsync) copy_ = &cudaMemcpyAsync;
+ cudaError_t (*copy_)(void*, const void*, std::size_t, cudaMemcpyKind, cudaStream_t) = &cudaMemcpyAsync;
  decltype(&cudaEventSynchronize) event_wait_ = &cudaEventSynchronize;
  decltype(&cudaStreamSynchronize) stream_wait_ = &cudaStreamSynchronize;
  friend struct test_support::GpuBatchAugmenterTestAccess;

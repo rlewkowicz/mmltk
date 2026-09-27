@@ -195,7 +195,8 @@ struct GpuAugmentationExecutor::Impl final {
    for (auto& event : consumer_complete) ensure_cuda_ok(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "augmentation consumer event");
    ensure_cuda_ok(cudaEventCreateWithFlags(&execution_complete, cudaEventDisableTiming), "cudaEventCreateWithFlags for augmentation execution");
   } catch (...) {
-   for (auto event : consumer_complete) if (event) (void)cudaEventDestroy(event);
+   for (auto event : consumer_complete)
+    if (event) (void)cudaEventDestroy(event);
    for (std::size_t slot = 0U; slot < created; ++slot) {
     (void)cudaEventDestroy(staging_complete[slot]);
     staging_complete[slot] = nullptr;
@@ -211,7 +212,8 @@ struct GpuAugmentationExecutor::Impl final {
    if (execution_pending) { (void)cudaEventSynchronize(execution_complete); }
    (void)cudaEventDestroy(execution_complete);
   }
-  for (auto event : consumer_complete) if (event) (void)cudaEventDestroy(event);
+  for (auto event : consumer_complete)
+   if (event) (void)cudaEventDestroy(event);
   for (std::size_t slot = 0U; slot < kStagingSlots; ++slot) {
    if (staging_complete[slot] == nullptr) { continue; }
    if (staging_pending[slot]) { (void)cudaEventSynchronize(staging_complete[slot]); }
@@ -487,8 +489,8 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunTraining(const GpuAugme
  RunPrepared(batch, donor_batch, stream);
  return plan();
 }
-const AugmentationBatchPlan& GpuAugmentationExecutor::Prepare(const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> keys,
- std::span<const GpuAugmentationDonor> donors, GpuAugmentationDonorSelection selection, std::size_t staging_slot) {
+const AugmentationBatchPlan& GpuAugmentationExecutor::Prepare(
+ const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> keys, std::span<const GpuAugmentationDonor> donors, GpuAugmentationDonorSelection selection, std::size_t staging_slot) {
  return PrepareImpl(batch, keys, donors, selection, staging_slot, true, 0, 0, 0, 0);
 }
 const AugmentationBatchPlan& GpuAugmentationExecutor::PrepareTraining(const GpuAugmentationBatchView& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence,
@@ -499,8 +501,8 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::PrepareTraining(const GpuA
  return PrepareImpl(batch, std::span{impl_->training_keys}.first(batch.image_indices.size()), donors, selection, staging_slot, false, seed, epoch, rank, sequence);
 }
 const AugmentationBatchPlan& GpuAugmentationExecutor::PrepareImpl(const GpuAugmentationBatchView& batch, const std::span<const std::uint64_t> image_keys,
- const std::span<const GpuAugmentationDonor> donors, GpuAugmentationDonorSelection selection, const std::size_t staging_slot, const bool explicit_keys,
- const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence) {
+ const std::span<const GpuAugmentationDonor> donors, GpuAugmentationDonorSelection selection, const std::size_t staging_slot, const bool explicit_keys, const std::uint64_t seed, const int epoch,
+ const int rank, const std::uint64_t sequence) {
  RequireActive();
  impl_->plan_prepared = false;
  require(batch.height == impl_->height && batch.width == impl_->width, "GPU augmentation batch dimensions do not match the executor");
@@ -545,8 +547,10 @@ void GpuAugmentationExecutor::RunPrepared(const GpuAugmentationBatchView& batch,
  require(batch.input_format == GpuAugmentationInputFormat::PlanarFloat32 || batch.input_format == GpuAugmentationInputFormat::Rgba8, "GPU augmentation input format is invalid");
  require(batch.output_domain == GpuAugmentationOutputDomain::ModelNormalized || batch.output_domain == GpuAugmentationOutputDomain::UnitRgb, "GPU augmentation output domain is invalid");
  // A null handle is CUDA's valid default stream, including Torch's current default stream.
- require(batch.image_indices.empty() || ((batch.input != nullptr || batch.input_slots.size() == batch.image_indices.size()) && batch.output != nullptr), "GPU augmentation requires input and output storage");
- require(donor_batch.image_slots.empty() || (donor_batch.image_slots.size() == impl_->planned_donors && donor_batch.image_slots.size() <= impl_->capacity), "augmentation donor slots have invalid shape");
+ require(
+  batch.image_indices.empty() || ((batch.input != nullptr || batch.input_slots.size() == batch.image_indices.size()) && batch.output != nullptr), "GPU augmentation requires input and output storage");
+ require(
+  donor_batch.image_slots.empty() || (donor_batch.image_slots.size() == impl_->planned_donors && donor_batch.image_slots.size() <= impl_->capacity), "augmentation donor slots have invalid shape");
  for (const auto* input : donor_batch.image_slots) require(input != nullptr, "augmentation donor slot is null");
  impl_->plan_prepared = false;
  if (batch.image_indices.empty()) return;
@@ -590,8 +594,7 @@ void GpuAugmentationExecutor::RunPrepared(const GpuAugmentationBatchView& batch,
  const std::array<std::shared_ptr<const void>, 3> custody{batch.input_custody, batch.output_custody, donor_batch.image_custody};
  // DMA completion permits host writes only. Changing GPU owners must still
  // settle the preceding final pixel read; stable owners need no host wait.
- if (impl_->consumer_pending[staging_slot] && impl_->custody[staging_slot] != custody)
-  CheckSettlement(event_wait_(impl_->consumer_complete[staging_slot]), "augmentation prior GPU custody");
+ if (impl_->consumer_pending[staging_slot] && impl_->custody[staging_slot] != custody) CheckSettlement(event_wait_(impl_->consumer_complete[staging_slot]), "augmentation prior GPU custody");
  impl_->custody[staging_slot] = custody;
  try {
   if (impl_->execution_pending) { ensure_cuda_ok(cudaStreamWaitEvent(stream, impl_->execution_complete, 0), "cudaStreamWaitEvent for augmentation workspace reuse"); }

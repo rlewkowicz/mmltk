@@ -416,7 +416,7 @@ TEST_CASE("Continuation donor admission validates every descriptor before changi
  const auto augmentation = r::test_support::isolated_augmentation_config(1.F);
  const auto future = history.prepare(loader, 0, keys, images, augmentation);
  const std::vector<r::TrainingDonorDescriptor> future_donors(future.begin(), future.end());
- CHECK(history.state() == accepted);
+ CHECK((history.state() == accepted));
  // Archives produced while a future plan exists contain only admitted slots.
  values.data.donors = history.state();
  auto pending_archive = continuation_fixture(request, values);
@@ -426,12 +426,12 @@ TEST_CASE("Continuation donor admission validates every descriptor before changi
  CHECK(std::ranges::equal(resumed.prepare(loader, 0, keys, images, augmentation), future_donors));
  history.commit();
  resumed.commit();
- CHECK(history.state() == resumed.state());
+ CHECK((history.state() == resumed.state()));
  history.restore(loader, accepted);
  (void)history.prepare(loader, 0, keys, images, augmentation);
  history.discard();
  CHECK_THROWS(history.commit());
- CHECK(history.state() == accepted);
+ CHECK((history.state() == accepted));
  for (const auto invalid : {r::TrainingDonorDescriptor{3, 0, true}, r::TrainingDonorDescriptor{1, 1, true}, r::TrainingDonorDescriptor{2, 0, true}}) {
   values.data.donors = {{1, 0, true}, invalid};
   auto archive = continuation_fixture(request, values);
@@ -520,10 +520,10 @@ TEST_CASE("Logical donor admission preserves original RLE support and empty-mask
   const auto expected = history.prepare(loader, 0, std::array{key}, std::array{index}, config)[0];
   const auto actual = resumed.prepare(loader, 0, std::array{key}, std::array{index}, config)[0];
   CHECK(actual == expected);
-  CHECK(resumed.state() == history.state());
+  CHECK((resumed.state() == history.state()));
   history.commit();
   resumed.commit();
-  CHECK(resumed.state() == history.state());
+  CHECK((resumed.state() == history.state()));
  }
  CHECK(visible > 0);
  CHECK(hidden > 0);

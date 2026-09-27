@@ -119,8 +119,8 @@ AugmentationAnnotationSupport resolve_augmentation_annotation_support(
  const std::array<float, 4>& source_box, std::span<const mmltk::backend::data::RLEPair> source_mask, int width, int height, const AugmentationImagePlan* plan, bool donor, bool mask_present) {
  return annotation_support<false>(source_box, source_mask, width, height, plan, donor, mask_present);
 }
-bool augmentation_instance_visible(const mmltk::backend::data::PackedInstance& instance, int width, int height, const AugmentationImagePlan* plan,
- std::span<const mmltk::backend::data::RLEPair> mask) {
+bool augmentation_instance_visible(
+ const mmltk::backend::data::PackedInstance& instance, int width, int height, const AugmentationImagePlan* plan, std::span<const mmltk::backend::data::RLEPair> mask) {
  return annotation_support<true>(augmentation_instance_box(instance, width, height), mask, width, height, plan, false, instance.has_mask()).present;
 }
 }  // namespace mmltk::backend::models::rfdetr

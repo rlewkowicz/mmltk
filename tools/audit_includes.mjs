@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Lexical evidence, not an include-what-you-use or semantic dependency checker.
 import { readFileSync, existsSync, statSync, chmodSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { dirname, basename, resolve, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { AUTHORED_PROFILE, authoredLanguage, collectInventoryInputs, writeAtomic } from "./generate_cleanup_json.mjs";
@@ -51,28 +52,63 @@ export function commandWords(command) {
 export function compilationContexts(entries, root, reader = readFileSync, available = existsSync) {
   const contexts = new Map(), policies = new Map();
   for (const entry of entries) {
-    const file = relative(root, resolve(entry.directory, entry.file));
-    if (file.startsWith("../")) continue;
+    const source = resolve(entry.directory, entry.file), file = relative(root, source);
+    if (file === ".." || file.startsWith("../")) continue;
     const words = entry.arguments ?? commandWords(entry.command);
     const outputIndex = words.indexOf("-o");
     const output = entry.output ?? (outputIndex >= 0 ? words[outputIndex + 1] : undefined);
     if (!output) throw new Error(`compile command has no output: ${file}`);
-    const owner = /^(.*\/CMakeFiles\/([^/]+)\.dir)\//u.exec(resolve(entry.directory, output));
-    if (!owner) continue;
-    const includeDirs = [], quoteDirs = [];
+    const artifact = resolve(entry.directory, output);
+    const outputMismatch = entry.output && outputIndex >= 0 && resolve(entry.directory, words[outputIndex + 1]) !== artifact;
+    const owner = /^(.*\/CMakeFiles\/([^/]+)\.dir)\//u.exec(artifact);
+    const includeDirs = [], quoteDirs = [], forced = [];
     for (let i = 0; i < words.length; ++i) {
       const word = words[i];
-      if (["-I", "-isystem", "-iquote"].includes(word)) {
-        (word === "-iquote" ? quoteDirs : includeDirs).push(resolve(entry.directory, words[++i]));
+      if (["-I", "-isystem", "-iquote", "-include", "-include-pch", "-imacros"].includes(word)) {
+        if (!words[i + 1]) throw new Error(`compile option ${word} has no argument: ${file}`);
+        const path = resolve(entry.directory, words[++i]);
+        if (word === "-iquote") quoteDirs.push(path);
+        else if (["-I", "-isystem"].includes(word)) includeDirs.push(path);
+        else forced.push({ option: word, path });
       } else if (word.startsWith("-I")) includeDirs.push(resolve(entry.directory, word.slice(2)));
+      else if (word.startsWith("-isystem")) includeDirs.push(resolve(entry.directory, word.slice(8)));
+      else if (word.startsWith("-iquote")) quoteDirs.push(resolve(entry.directory, word.slice(7)));
     }
-    const policyPath = `${owner[1]}/mmltk-pch-policy.txt`;
-    if (!policies.has(policyPath)) policies.set(policyPath, available(policyPath) ? reader(policyPath, "utf8").trim().split("\n").map((row) => row.split("\t")) : []);
-    const policy = policies.get(policyPath);
-    const usesPch = policy.some(([kind, path]) => kind === "use" && relative(root, path) === file);
-    const context = { target: owner[2], include_dirs: includeDirs, quote_dirs: quoteDirs,
-      modules: words.some((word) => /^-fmodule/u.test(word)),
-      pch: usesPch ? policy.filter(([kind]) => kind === "header").map(([, path]) => relative(root, path)) : [] };
+    const policyPath = owner ? `${owner[1]}/mmltk-pch-policy.txt` : null;
+    if (policyPath && !policies.has(policyPath)) {
+      policies.set(policyPath, available(policyPath) ? reader(policyPath, "utf8").trim().split("\n").map((row) => row.split("\t")) : []);
+    }
+    const policy = policies.get(policyPath) ?? [];
+    const registered = policy.some(([kind, path]) => kind === "use" && resolve(entry.directory, path) === source);
+    const excluded = policy.some(([kind, path]) => kind === "skip" && resolve(entry.directory, path) === source);
+    const groups = policy.filter(([kind]) => kind === "header").map(([, path]) => relative(root, path));
+    const modules = words.some((word) => /^-fmodule/u.test(word));
+    const forcedPch = forced.filter(({ path }) => basename(path).startsWith("cmake_pch."));
+    const issues = [];
+    let reason, pch = [];
+    if (artifact.endsWith(".gch")) reason = "PCH artifact creation";
+    else {
+      if (outputMismatch) issues.push("compile output metadata differs from its compiler argument");
+      if (registered && excluded) issues.push("source is both used and excluded by its target policy");
+      if (forcedPch.length && (!owner || !registered)) issues.push("forced PCH has no matching target/source registration");
+      if (registered && (forcedPch.length !== 1 || forcedPch[0]?.option !== "-include" ||
+          forcedPch[0]?.path !== `${owner[1]}/cmake_pch.hxx`)) {
+        issues.push("registered use lacks the exact target-local forced PCH");
+      }
+      if (registered && !groups.length) issues.push("registered use has no PCH header groups");
+      if ((modules || !ordinaryCpp(file)) && forcedPch.length) issues.push("excluded language/module compilation forces a PCH");
+      if (registered && words.some((word) => word.startsWith("@"))) issues.push("response-file arguments hide the complete PCH environment");
+      if (issues.length) reason = "inconsistent PCH evidence";
+      else if (modules) reason = "module compilation does not consume a PCH";
+      else if (!owner) reason = "compile output has no registered CMake owner";
+      else if (excluded) reason = "source is excluded by its target PCH policy";
+      else if (!policy.length) reason = "target has no PCH registration";
+      else if (!registered) reason = "source is absent from its target PCH consumers";
+      else { reason = "target-local forced PCH"; pch = groups; }
+    }
+    const context = { target: owner?.[2] ?? "(unregistered)", include_dirs: includeDirs, quote_dirs: quoteDirs,
+      modules, pch, pch_reason: reason, pch_issues: issues,
+      forced_pch: forcedPch.map(({ option, path }) => ({ option, path: relative(root, path) })) };
     const records = contexts.get(file) ?? [];
     records.push(context); contexts.set(file, records);
   }
@@ -105,6 +141,13 @@ export function scanIncludes(source) {
   return { includes, regions, tokens };
 }
 
+function systemHeaderCategory(include) {
+  if (include.spelling !== "angle") return undefined;
+  if (STANDARD.has(include.header)) return "standard";
+  if (POSIX.has(include.header) || /^(?:sys|linux|asm|net|netinet)\//u.test(include.header)) return "linux-posix";
+  return undefined;
+}
+
 export function attributeInclude(include, path, paths, contexts, root) {
   if (include.spelling === "macro") return { category: "macro", resolution: "unresolved" };
   const dirs = include.spelling === "quote" ? [resolve(root, dirname(path)), root] : [];
@@ -112,8 +155,8 @@ export function attributeInclude(include, path, paths, contexts, root) {
   const matches = sorted(dirs.map((dir) => relative(root, resolve(dir, include.header))).filter((candidate) => paths.has(candidate)));
   if (matches.length === 1) return { category: isPch(matches[0]) ? "pch" : matches[0].startsWith("third_party/") ? "vendored" : "project", resolved: matches[0], resolution: "include-path" };
   if (matches.length > 1) return { category: "ambiguous", candidates: matches, resolution: "ambiguous" };
-  if (include.spelling === "angle" && STANDARD.has(include.header)) return { category: "standard", resolution: "header-name" };
-  if (include.spelling === "angle" && (POSIX.has(include.header) || /^(?:sys|linux|asm|net|netinet)\//u.test(include.header))) return { category: "linux-posix", resolution: "header-name" };
+  const systemCategory = systemHeaderCategory(include);
+  if (systemCategory) return { category: systemCategory, resolution: "header-name" };
   // Headers lack compile commands. A unique suffix is evidence, not proof of
   // include-path availability; expose the weaker attribution in the report.
   if (include.spelling === "quote") {
@@ -156,19 +199,34 @@ export function repeatedBundles(files) {
 }
 
 export function pchReplacement(path, source, scan, contexts, coverage) {
-  const retained = [];
-  if (isPch(path)) return { reason: "PCH definition", removed: 0, added: 0, retained };
-  // Source cleanup follows the actual compiled artifact, not just an umbrella
-  // header's name. Headers, CUDA, modules and unregistered targets stay narrow.
-  if (!ordinaryCpp(path) || !contexts.length || contexts.some((context) => context.modules || !context.pch.length)) {
-    return { reason: "no compiled PCH in every compile context", removed: 0, added: 0, retained };
+  const retained = [], headerSets = [...coverage.values()];
+  const tracked = scan.includes.filter((include) => systemHeaderCategory(include) ||
+    (include.spelling !== "macro" && headerSets.some((headers) => headers.has(include.header))));
+  const retain = (include, reason) => retained.push({ line: include.line, header: include.header,
+    category: systemHeaderCategory(include) ?? "PCH-covered", reason });
+  let reason;
+  if (isPch(path)) reason = "PCH definition";
+  else if (/\.(?:h|hh|hpp|hxx|cuh|tpp)(?:\.in)?$/u.test(path)) reason = "declaration header requires direct dependencies";
+  else if (/\.cu$/u.test(path)) reason = "CUDA source does not consume an ordinary C++ PCH";
+  else if (/\.(?:cppm|ixx)(?:\.in)?$/u.test(path)) reason = "module source does not consume a PCH";
+  else if (!ordinaryCpp(path)) reason = "not an ordinary C++ translation unit";
+  else if (!contexts.length) reason = "source has no compile command in this build graph";
+  else {
+    const exclusions = contexts.filter((context) => context.modules || !context.pch.length);
+    if (exclusions.length) reason = sorted(exclusions.map((context) => context.pch_reason ??
+      (context.modules ? "module compilation does not consume a PCH" : "compile context has no PCH"))).join("; ");
+  }
+  if (reason) {
+    for (const include of tracked) retain(include, reason);
+    return { reason, removed: 0, added: 0, retained };
   }
   const common = contexts[0].pch.filter((header) => contexts.every((context) => context.pch.includes(header)));
   const replacements = new Map();
-  for (const include of scan.includes) {
+  for (const include of tracked) {
     const owner = common.find((header) => coverage.get(header)?.has(include.header));
-    if (!owner || include.spelling !== "angle") continue;
-    if (include.include_next) { retained.push({ line: include.line, header: include.header, reason: "include_next changes lookup" }); continue; }
+    if (!owner) { retain(include, "header is not provided by a PCH shared by every compile context"); continue; }
+    if (include.spelling !== "angle") { retain(include, "non-angle include retains explicit lookup"); continue; }
+    if (include.include_next) { retain(include, "include_next changes lookup"); continue; }
     const key = `${owner}:${include.branch}`;
     const group = replacements.get(key) ?? { owner, includes: [] };
     group.includes.push(include); replacements.set(key, group);
@@ -205,6 +263,7 @@ export function buildIncludeReport(paths, sources, contexts, root) {
     const owners = contexts.get(path) ?? [];
     const includes = scan.includes.map((include) => ({ ...include, ...attributeInclude(include, path, allPaths, owners, root) }));
     files.push({ path, lines: source.split("\n").length - Number(source.endsWith("\n")), targets: sorted(owners.map((owner) => owner.target)),
+      compile_contexts: owners.map(({ target, modules, pch, pch_reason, pch_issues, forced_pch }) => ({ target, modules, pch, pch_reason, pch_issues, forced_pch })),
       includes: includes.sort((a, b) => a.category.localeCompare(b.category) || a.header.localeCompare(b.header) || a.line - b.line) });
     if (isPch(path)) continue;
     for (const include of includes) {
@@ -230,6 +289,12 @@ export function buildIncludeReport(paths, sources, contexts, root) {
   }).sort((a, b) => b.file_count - a.file_count || a.path.localeCompare(b.path));
   const frequencies = [...frequency.values()].map((item) => ({ ...item, files: sorted(item.files) })).sort(rank);
   const replacements = files.map((file) => ({ path: file.path, ...pchReplacement(file.path, sources.get(file.path), scans.get(file.path), contexts.get(file.path) ?? [], coverage) }));
+  const retainedReasons = new Map();
+  for (const file of replacements) for (const include of file.retained) {
+    if (!["standard", "linux-posix"].includes(include.category) || isPch(file.path)) continue;
+    const item = retainedReasons.get(include.reason) ?? { reason: include.reason, files: new Set(), includes: 0 };
+    item.files.add(file.path); ++item.includes; retainedReasons.set(include.reason, item);
+  }
   const pchCandidates = frequencies.filter((item) => ["standard", "linux-posix"].includes(item.category) && item.files.length >= 3).map((item) => ({ ...item,
     covered_by: [...coverage].filter(([, headers]) => headers.has(item.header)).map(([path]) => path) }));
   return { format: 1, scope: "Git tracked and untracked-unignored first-party files; generated/cache/output and vendored trees excluded. Includes are lexical, including inactive branches. PCH headers do not inflate frequency.",
@@ -239,7 +304,12 @@ export function buildIncludeReport(paths, sources, contexts, root) {
       removed: replacements.reduce((n, file) => n + file.removed, 0), added: replacements.reduce((n, file) => n + file.added, 0) },
     folders: directoryReport, pch_candidates: pchCandidates,
     pch_groups: [...coverage].map(([header, includes]) => ({ header, includes: sorted(includes),
-      consumers: files.filter((file) => file.includes.some((entry) => entry.resolved === header)).map((file) => file.path) })),
+      consumers: files.filter((file) => file.includes.some((entry) => entry.resolved === header)).map((file) => file.path),
+      compiled_consumers: files.filter((file) => {
+        const owners = contexts.get(file.path) ?? [];
+        return ordinaryCpp(file.path) && owners.length && owners.every((owner) => !owner.modules && owner.pch.includes(header));
+      }).map((file) => file.path) })),
+    retained_system_includes: [...retainedReasons.values()].map((item) => ({ ...item, files: sorted(item.files) })).sort((a, b) => b.includes - a.includes || a.reason.localeCompare(b.reason)),
     frequency: frequencies, bundles: repeatedBundles(files), replacements, files };
 }
 
@@ -251,6 +321,8 @@ export function renderIncludeMarkdown(report) {
   for (const folder of report.folders) rows.push(`| ${folder.path} | ${folder.file_count} | ${folder.prefixes.map((group) => `${group.prefix}_ (${group.files.length})`).join(", ")} | ${folder.over_500_lines.map((file) => `${basename(file.path)} (${file.lines})`).join(", ")} |`);
   rows.push("", "## Standard and Linux/POSIX includes in three or more files", "", "| Header | Category | Files | PCH |", "|---|---|---:|---|");
   for (const item of report.pch_candidates) rows.push(`| ${item.header} | ${item.category} | ${item.files.length} | ${item.covered_by.join(", ") || "candidate"} |`);
+  rows.push("", "## Retained standard and Linux/POSIX includes", "", "Every retained directive has a reason in the JSON; compile contexts include forced-PCH evidence and policy contradictions.", "", "| Reason | Files | Includes |", "|---|---:|---:|");
+  for (const item of report.retained_system_includes) rows.push(`| ${item.reason} | ${item.files.length} | ${item.includes} |`);
   rows.push("", "## Same-folder bundles", "", `Showing the first 25 of ${report.bundles.length} pair-derived clusters, ranked by consumers outside the folder, then total consumers. All clusters and every include remain in the JSON.`, "",
     "Pairs are expanded with the headers shared by all their consumers. This does not enumerate every possible larger subset. Full locations, attribution strength, conditional flags, compiler targets and rewrite reasons are in the JSON.");
   for (const bundle of report.bundles.slice(0, 25)) rows.push("", `### ${bundle.folder} (${bundle.consumers.length} consumers; ${bundle.outside_folder.length} outside folder)`, "",
@@ -275,7 +347,8 @@ function main() {
     console.log("Usage: ./mmltk --audit-includes [--refresh] [report|preview|fix] [--output PREFIX] [--build-dir PATH]\n" +
       "Wrapper --refresh configures the Release graph before scanning; use after changing CMake PCH registrations.\n" +
       "Writes PREFIX.json and PREFIX.md (default output/include-audit). Includes are sorted in the report; source order is preserved.\n" +
-      "Fix replaces literal includes only when every compile context actually precompiles the owning group.\n" +
+      "Fix checks build/toolchain invariants and replaces includes only with a target-local forced PCH in every compile context.\n" +
+      "Reports retain every compile context and explain remaining standard/Linux includes and contradictory PCH evidence.\n" +
       "Declaration headers, CUDA, modules and targets without compiled PCHs retain direct includes.\n" +
       "Macro includes and include_next remain explicit. PCH definitions are never rewritten.\n" +
       "PCH additions/registrations and folder/umbrella changes require source review; frequency is candidate evidence.");
@@ -288,6 +361,10 @@ function main() {
   const sources = new Map(paths.filter((path) => authoredLanguage(path) === "cpp").map((path) => [path, readFileSync(path, "utf8")]));
   const database = `${options.build}/compile_commands.json`;
   if (!existsSync(database)) throw new Error(`missing ${database}; run ./mmltk --build or select an existing --build-dir`);
+  // Reuse the build authority for creation/use compiler, flags, environment and
+  // generated-header agreement before any automatic source mutation.
+  if (options.mode === "fix") execFileSync("python3",
+    ["tools/check_toolchain_invariants.py", "--build-dir", options.build, "--repo-root", root], { stdio: "inherit" });
   const contexts = compilationContexts(JSON.parse(readFileSync(database, "utf8")), root);
   const report = buildIncludeReport(paths, sources, contexts, root);
   report.build_directory = options.build; report.mode = options.mode;

@@ -91,8 +91,10 @@ struct GpuBatchAugmenterTestAccess final {
   image_uploads = metadata_uploads = 0;
   owner.copy_ = +[](void* destination, const void* source, std::size_t count, cudaMemcpyKind kind, cudaStream_t stream) {
    if (kind == cudaMemcpyHostToDevice) {
-    if (count == image_bytes) ++image_uploads;
-    else ++metadata_uploads;
+    if (count == image_bytes)
+     ++image_uploads;
+    else
+     ++metadata_uploads;
    }
    return cudaMemcpyAsync(destination, source, count, kind, stream);
   };
@@ -2583,7 +2585,6 @@ TEST_CASE("CLI training quality follows the frozen selection rather than last mo
   CHECK(output.find("0.6000") == std::string::npos);
  }
 }
-
 TEST_CASE("Selected logical donors retain original pixels across annotation changes and skipped pastes", "[rfdetr][training_supervision][augmentation][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; donor uploads unexecuted");
  namespace data = mmltk::backend::data;
@@ -2630,7 +2631,7 @@ TEST_CASE("Selected logical donors retain original pixels across annotation chan
  CHECK(Access::NextSlot(owner) == 1);
  (void)run(selected, {1, 0, true}, 2);
  CHECK(Access::image_uploads == 1);
- CHECK(Access::NextSlot(owner) == 0); // Global even sequences do not pin one host slot.
+ CHECK(Access::NextSlot(owner) == 0);  // Global even sequences do not pin one host slot.
  auto originals = Access::Originals(owner).cpu();
  const auto metadata_before = Access::metadata_uploads;
  (void)run(skipped, {2, 0, true}, 4);

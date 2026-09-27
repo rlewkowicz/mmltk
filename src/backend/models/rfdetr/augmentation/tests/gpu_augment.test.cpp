@@ -1205,7 +1205,7 @@ TEST_CASE("continuous augmentation boxes survive independent and empty mask supp
 TEST_CASE("Visibility-only admission agrees with full support for geometry erasure and paste", "[backend][rfdetr][augmentation][support]") {
  using namespace mmltk::backend::data;
  const std::array runs{RLEPair{0, 1}, RLEPair{27, 2}, RLEPair{63, 1}};
- PackedInstance instance{.class_id = 0, .flags = kAnnotationMask, .bbox_x1 = 1.25F, .bbox_y1 = 2.5F, .bbox_x2 = 6.25F, .bbox_y2 = 7.25F};
+ PackedInstance instance{.class_id = 0, .flags = kAnnotationMask, .bbox_x1 = 1.25F, .bbox_y1 = 2.5F, .bbox_x2 = 6.25F, .bbox_y2 = 7.25F, .mask_rle_offset = 0, .mask_rle_pairs = 0};
  for (const bool mask_present : {false, true})
   for (const auto mask : {std::span<const RLEPair>{}, std::span<const RLEPair>{runs}})
    for (unsigned mode = 0; mode < 7; ++mode)
@@ -1254,26 +1254,31 @@ TEST_CASE("Prepared augmentation binds image identities and donor selection befo
  GpuAugmentationExecutor executor(test_support::isolated_augmentation_config(1.F), 2, 8, 8, execution.context, execution.retirement);
  std::array<std::uint32_t, 2> identities{0, 1};
  const std::array<std::uint64_t, 2> keys{19, 23};
- const std::array donors{
-  GpuAugmentationDonor{.label = 0, .dataset_index = 1, .area = 64, .box = {0, 0, 1, 1}},
-  GpuAugmentationDonor{.label = 0, .dataset_index = 0, .area = 64, .box = {0, 0, 1, 1}}
- };
+ const std::array donors{GpuAugmentationDonor{.label = 0, .dataset_index = 1, .area = 64, .box = {0, 0, 1, 1}}, GpuAugmentationDonor{.label = 0, .dataset_index = 0, .area = 64, .box = {0, 0, 1, 1}}};
  // Preparation has no pixel pointers and borrows IDs only for this call.
  const GpuAugmentationBatchView metadata{.image_indices = identities, .height = 8, .width = 8};
  const auto prepare = [&] {
-  if (training_keys) (void)executor.PrepareTraining(metadata, 19, 2, 0, 4, donors, selection, 0);
-  else (void)executor.Prepare(metadata, keys, donors, selection, 0);
+  if (training_keys)
+   (void)executor.PrepareTraining(metadata, 19, 2, 0, 4, donors, selection, 0);
+  else
+   (void)executor.Prepare(metadata, keys, donors, selection, 0);
  };
  prepare();
  const auto planned = executor.prepared_image_diagnostic(0, 0);
  const GpuAugmentationBatchView batch{
-  .input = pixels->input.data(), .output = pixels->output.data(), .image_indices = identities, .height = 8, .width = 8,
-  .output_domain = GpuAugmentationOutputDomain::UnitRgb, .input_custody = pixels, .output_custody = pixels,
-  .input_capacity_bytes = pixels->input.size_bytes(), .output_capacity_bytes = pixels->output.size_bytes()
+  .input = pixels->input.data(),
+  .output = pixels->output.data(),
+  .image_indices = identities,
+  .height = 8,
+  .width = 8,
+  .output_domain = GpuAugmentationOutputDomain::UnitRgb,
+  .input_custody = pixels,
+  .output_custody = pixels,
+  .input_capacity_bytes = pixels->input.size_bytes(),
+  .output_capacity_bytes = pixels->output.size_bytes()
  };
  GpuAugmentationDonorBatchView donor_batch{
-  .images = pixels->donor->data(), .boxes = pixels->boxes->data(), .selection = selection,
-  .image_custody = pixels, .image_capacity_bytes = pixels->donor->size_bytes()
+  .images = pixels->donor->data(), .boxes = pixels->boxes->data(), .selection = selection, .image_custody = pixels, .image_capacity_bytes = pixels->donor->size_bytes()
  };
  const auto read = [&] {
   cuda_require(cudaStreamSynchronize(pixels->stream));
@@ -1305,7 +1310,7 @@ TEST_CASE("Prepared augmentation binds image identities and donor selection befo
  CHECK(read() == actual);
  // Both an unchanged policy boundary and a changed configuration invalidate
  // unexecuted parameters; only preparation under the new policy may run.
- for (const auto next : {test_support::isolated_augmentation_config(1.F), disabled_config()}) {
+ for (const auto& next : {test_support::isolated_augmentation_config(1.F), disabled_config()}) {
   prepare();
   executor.Reconfigure(next);
   REQUIRE_THROWS(executor.RunPrepared(batch, donor_batch, pixels->stream));
@@ -1326,8 +1331,13 @@ TEST_CASE("Augmentation host staging retires before delayed pixel consumers", "[
  const std::array<std::uint32_t, 1> identities{0};
  const std::array<std::uint64_t, 1> keys{19};
  GpuAugmentationBatchView batch{
-  .input = pixels->input.data(), .output = pixels->output.data(), .image_indices = identities, .height = 8, .width = 8,
-  .input_custody = pixels, .output_custody = pixels,
+  .input = pixels->input.data(),
+  .output = pixels->output.data(),
+  .image_indices = identities,
+  .height = 8,
+  .width = 8,
+  .input_custody = pixels,
+  .output_custody = pixels,
  };
  (void)executor.Run(batch, keys, {}, {}, pixels->stream, 0);
  batch.input_custody.reset();

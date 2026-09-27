@@ -101,8 +101,7 @@ bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> re
  for (std::size_t first = 0; first < reads.size();) {
   std::size_t end = first + 1;
   auto last_index = reads[first].index;
-  while (end < reads.size() && reads[end].index >= last_index &&
-         static_cast<std::uint64_t>(reads[end].index) <= static_cast<std::uint64_t>(last_index) + 1U &&
+  while (end < reads.size() && reads[end].index >= last_index && static_cast<std::uint64_t>(reads[end].index) <= static_cast<std::uint64_t>(last_index) + 1U &&
          static_cast<std::size_t>(reads[end].index - reads[first].index) < std::max<std::size_t>(1U, kReadExtent / stride)) {
    last_index = reads[end++].index;
   }

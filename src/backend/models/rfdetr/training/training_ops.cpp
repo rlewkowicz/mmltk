@@ -149,8 +149,7 @@ DeviceLossNormalizer TrainingTargetCounts::State::consume(const std::size_t lane
 void TrainingTargetCounts::State::end_wave() {
  std::lock_guard lock(mutex_);
  rethrow_failure_locked();
- if (!slots_ || !std::all_of(resolved_.begin(), resolved_.begin() + slots_, [](bool resolved) { return resolved; }))
-  throw std::logic_error("target count wave closed before all counts resolved");
+ if (!slots_ || !std::all_of(resolved_.begin(), resolved_.begin() + slots_, [](bool resolved) { return resolved; })) throw std::logic_error("target count wave closed before all counts resolved");
  slots_ = 0;
 }
 void TrainingTargetCounts::State::finish_attempt() {
@@ -163,12 +162,15 @@ void TrainingTargetCounts::State::finish_attempt() {
   // streams. Empty ranks still fence all scalar collectives on launch_.
   for (std::size_t lane = 0; lane < consumers_.size(); ++lane)
    if (consumers_[lane]) consumed_[lane].block(launch_);
-  if (work_) work_->record_completion();
-  else local_completed_.record(launch_);
+  if (work_)
+   work_->record_completion();
+  else
+   local_completed_.record(launch_);
  }
  // The metric handoff runs on the caller stream, which need not be launch_.
  // Its physical completion must prove this fence without relying on gradients.
- if (work_) work_->block_current_stream();
+ if (work_)
+  work_->block_current_stream();
  else {
   const auto current = torch_cuda::getCurrentCUDAStream(torch_cuda::checked_device_index(device_id_));
   if (current != launch_) local_completed_.block(current);

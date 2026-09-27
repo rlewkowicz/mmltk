@@ -26,16 +26,18 @@ struct NativeAdamWTestAccess {
  static std::vector<std::pair<const void*, std::size_t>> storage(const NativeAdamW& optimizer) {
   std::vector<std::pair<const void*, std::size_t>> result;
   for (const auto& [key, batch] : optimizer.batches_) {
-   template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^NativeAdamW::Batch, std::meta::access_context::current()))) {
-    const auto& values = batch.[:member:];
-    if (!values.empty()) throw std::runtime_error("AdamW retained a completed gradient/state inventory");
-    result.emplace_back(values.data(), values.capacity());
-   }
+   [&]<class T>(const T& batch_view) {
+    template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()))) {
+     const auto& values = batch_view.[:member:];
+     if (!values.empty()) throw std::runtime_error("AdamW retained a completed gradient/state inventory");
+     result.emplace_back(values.data(), values.capacity());
+    }
+   }(batch);
   }
   return result;
  }
 };
-}
+}  // namespace mmltk::backend::models::rfdetr::testsupport
 namespace {
 namespace rf = mmltk::backend::models::rfdetr;
 namespace tensor_fixture = mmltk::backend::ml::testsupport;

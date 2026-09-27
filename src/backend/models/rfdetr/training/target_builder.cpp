@@ -235,10 +235,8 @@ void TargetScratch::release_copy_resources() {
    }
    ensure_cuda_ok(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(slot.copy_complete_event)), "cudaEventDestroy for target staging copy");
    slot.copy_complete_event = 0U;
-   if (slot.consumers_pending)
-    ensure_cuda_ok(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(slot.consumers_retired_event)), "settle target slot consumers");
-   if (slot.consumers_retired_event)
-    ensure_cuda_ok(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(slot.consumers_retired_event)), "destroy target slot consumer event");
+   if (slot.consumers_pending) ensure_cuda_ok(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(slot.consumers_retired_event)), "settle target slot consumers");
+   if (slot.consumers_retired_event) ensure_cuda_ok(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(slot.consumers_retired_event)), "destroy target slot consumer event");
    auto metadata_owner = slot.metadata_owner;
    auto mask_owner = slot.mask_owner;
    slot = {};
@@ -330,8 +328,7 @@ TargetStagingSlot& TargetScratch::acquire_staging_slot(const std::size_t batch_s
  const int64_t slot_instance_capacity = std::max(slot.instance_capacity, required_instances);
  const int64_t mask_words = include_masks ? packed_mask_words_for_shape(height, width) : 0;
  // The common shape keeps the already-bound views as well as its allocations.
- if (slot.metadata.defined() && slot.image_ids.size(0) == required_batch && slot.boxes.size(0) == required_instances &&
-     slot.erasure.size(0) == (include_masks ? required_instances : 0) &&
+ if (slot.metadata.defined() && slot.image_ids.size(0) == required_batch && slot.boxes.size(0) == required_instances && slot.erasure.size(0) == (include_masks ? required_instances : 0) &&
      (!include_masks || (slot.packed_masks.defined() && slot.mask_height == height && slot.mask_width == width && slot.packed_masks.size(0) == required_instances))) {
   active_staging_slot_ = index;
   next_staging_slot_ = (index + 1) % staging_slots_.size();
@@ -340,15 +337,14 @@ TargetStagingSlot& TargetScratch::acquire_staging_slot(const std::size_t batch_s
  }
  TargetStagingSlot replacement;
  const auto metadata_bytes = bind_target_metadata(replacement, {}, required_batch, required_instances, include_masks);
- replacement.metadata_owner = slot.metadata_owner && slot.metadata_owner->capacity_bytes() >= static_cast<std::size_t>(metadata_bytes)
-                               ? slot.metadata_owner : std::make_shared<torch_cuda::NumaHostTensor>(copy_stream_device_id_);
+ replacement.metadata_owner =
+  slot.metadata_owner && slot.metadata_owner->capacity_bytes() >= static_cast<std::size_t>(metadata_bytes) ? slot.metadata_owner : std::make_shared<torch_cuda::NumaHostTensor>(copy_stream_device_id_);
  replacement.metadata = replacement.metadata_owner->view({metadata_bytes}, torch::kUInt8);
  (void)bind_target_metadata(replacement, replacement.metadata, required_batch, required_instances, include_masks);
  replacement.mask_owner = slot.mask_owner;
  if (include_masks) {
   const auto mask_bytes = static_cast<std::size_t>(required_instances) * static_cast<std::size_t>(mask_words) * sizeof(std::int64_t);
-  if (!replacement.mask_owner || replacement.mask_owner->capacity_bytes() < mask_bytes)
-   replacement.mask_owner = std::make_shared<torch_cuda::NumaHostTensor>(copy_stream_device_id_);
+  if (!replacement.mask_owner || replacement.mask_owner->capacity_bytes() < mask_bytes) replacement.mask_owner = std::make_shared<torch_cuda::NumaHostTensor>(copy_stream_device_id_);
   replacement.packed_masks = replacement.mask_owner->view({required_instances, mask_words}, torch::kInt64);
  }
  PendingCudaEvent pending_event;
@@ -392,8 +388,7 @@ void TargetScratch::upload_staging(const TargetStagingSlot& staging, int64_t ins
   slot.consumers_pending = false;
  }
  const auto ensure = [&](torch::Tensor& tensor, const torch::Tensor& host) {
-  if (!slot.device_reusable || !tensor.defined() || tensor.device() != device || tensor.numel() < host.numel())
-   tensor = torch::empty({host.numel()}, host.options().device(device));
+  if (!slot.device_reusable || !tensor.defined() || tensor.device() != device || tensor.numel() < host.numel()) tensor = torch::empty({host.numel()}, host.options().device(device));
  };
  ensure(slot.device_metadata, staging.metadata);
  if (include_masks) ensure(slot.device_masks, staging.packed_masks.reshape({-1}));
@@ -525,7 +520,8 @@ void TargetScratch::retire_consumer_on_stream(const std::uintptr_t stream) {
  ensure_cuda_ok(cudaEventRecord(reinterpret_cast<cudaEvent_t>(consumers_retired_event_), consumer_stream), "cudaEventRecord for target consumer retirement");
  consumers_pending_ = true;
 }
-TargetConsumerLease::TargetConsumerLease(TargetScratch& scratch, const PreparedTargets& targets, const int device_id) : scratch_(&scratch), device_id_(device_id), slot_(scratch.consumer_slot(targets)), boxes_(targets.all_boxes) {
+TargetConsumerLease::TargetConsumerLease(TargetScratch& scratch, const PreparedTargets& targets, const int device_id)
+    : scratch_(&scratch), device_id_(device_id), slot_(scratch.consumer_slot(targets)), boxes_(targets.all_boxes) {
  targets.record_stream(torch_cuda::current_torch_cuda_stream_object(torch_cuda::checked_device_index(device_id_)));
 }
 TargetConsumerLease::~TargetConsumerLease() noexcept {
@@ -693,8 +689,8 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
     if (erasure_bytes != nullptr) { std::memcpy(erasure_bytes + target_index * sizeof(erasure), &erasure, sizeof(erasure)); }
     if (include_masks) {
      std::copy(inverse.begin(), inverse.end(), &inverse_transforms[target_index][0]);
-     std::copy(paste_plan != nullptr ? paste_plan->paste_inverse.begin() : identity.begin(), paste_plan != nullptr ? paste_plan->paste_inverse.end() : identity.end(),
-      &occluder_transforms[target_index][0]);
+     std::copy(
+      paste_plan != nullptr ? paste_plan->paste_inverse.begin() : identity.begin(), paste_plan != nullptr ? paste_plan->paste_inverse.end() : identity.end(), &occluder_transforms[target_index][0]);
     }
 #if MMLTK_ENABLE_PROFILING
     if (include_masks) ++mask_instances;

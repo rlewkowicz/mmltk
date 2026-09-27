@@ -63,13 +63,14 @@ TEST_CASE("NUMA tensors retain zero-copy storage and compact active shapes", "[c
  auto device = retained.to(at::Device(at::kCUDA, 0), at::kLong, true);
  REQUIRE(at::equal(mmltk::backend::ml::cuda::numa_readback(device), retained));
 }
-
 TEST_CASE("Settled NUMA handoff release avoids context waits and preserves escaped borrowers", "[cuda][numa][host-tensor]") {
  int devices = 0;
  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA unavailable; settled host release unexecuted");
  CUDA_ASSERT_OK(cudaSetDevice(0));
  const mmltk::common::system::ScopedExecutionPolicy policy(mmltk::frameworks::gpu::test_support::selected_test_execution_policy(0));
- struct Counts { unsigned waits = 0, releases = 0; } counts;
+ struct Counts {
+  unsigned waits = 0, releases = 0;
+ } counts;
  mmltk::frameworks::gpu::PinnedHostBuffer::Operations operations;
  operations.context.context = &counts;
  operations.synchronize = +[](void* state) {
@@ -85,10 +86,10 @@ TEST_CASE("Settled NUMA handoff release avoids context waits and preserves escap
   auto source = owner.view({64}, at::kFloat);
   source.fill_(.5F);
   auto destination = source.to(at::Device(at::kCUDA, 0), at::kFloat, true);
-  CUDA_ASSERT_OK(cudaDeviceSynchronize()); // The owning DMA is physically settled.
+  CUDA_ASSERT_OK(cudaDeviceSynchronize());  // The owning DMA is physically settled.
   CHECK(owner.ReleaseSettled() == CUDA_ERROR_NOT_READY);
   CHECK(counts.releases == 0);
-  source = {};
+  source = at::Tensor{};
   CHECK(owner.ReleaseSettled() == CUDA_SUCCESS);
   CHECK(counts.releases == 1);
   CHECK(counts.waits == 0);
@@ -104,7 +105,7 @@ TEST_CASE("Settled NUMA handoff release avoids context waits and preserves escap
  }
  CHECK(escaped.sum().item<float>() == 16.F);
  CHECK(counts.waits == 0);
- escaped = {};
+ escaped = at::Tensor{};
  CHECK(counts.waits == 1);
  CHECK(counts.releases == 2);
 }

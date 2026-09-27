@@ -60,8 +60,8 @@ struct AugmentationMappedInstance {
 }
 // Uses precisely the support mapper's eligibility rules, without computing unused
 // area and bounds. Pure geometry retains continuous detection-box visibility.
-[[nodiscard]] bool augmentation_instance_visible(const mmltk::backend::data::PackedInstance& instance, int width, int height, const AugmentationImagePlan* plan,
- std::span<const mmltk::backend::data::RLEPair> mask = {});
+[[nodiscard]] bool augmentation_instance_visible(
+ const mmltk::backend::data::PackedInstance& instance, int width, int height, const AugmentationImagePlan* plan, std::span<const mmltk::backend::data::RLEPair> mask = {});
 [[nodiscard]] inline AugmentationMappedInstance map_augmentation_instance(
  const mmltk::backend::data::PackedInstance& instance, int image_width, int image_height, const AugmentationImagePlan* plan, std::span<const mmltk::backend::data::RLEPair> mask = {}) {
  AugmentationMappedInstance mapped;

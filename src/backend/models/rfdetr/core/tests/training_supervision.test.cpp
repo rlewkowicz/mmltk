@@ -2232,7 +2232,6 @@ TEST_CASE("Disabled DN masks admit missing target masks in direct and combined o
   REQUIRE_THROWS(owner.loss(outputs, targets, {torch::tensor(1.F)}, true));
  }
 }
-
 TEST_CASE("Selective mask helpers preserve dynamic samples values and gradients", "[rfdetr][training_supervision][compilation][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; selective mask coverage unexecuted");
  rfdetr::testsupport::MatcherExecutionFixture fixture;
@@ -2248,9 +2247,7 @@ TEST_CASE("Selective mask helpers preserve dynamic samples values and gradients"
    auto logits = torch::linspace(-2, 2, 2 * queries * points, options).view({2, queries, points}).set_requires_grad(true);
    auto eager_logits = logits.detach().clone().set_requires_grad(true);
    auto labels = (torch::arange(2 * targets * points, options).view({2, targets, points}).remainder(3) == 0).to(torch::kFloat32);
-   const auto pair = [&](const torch::Tensor& input, bool traced) {
-    return 1.7 * rfdetr::batch_sigmoid_ce_loss(input, labels, traced) + 2.3 * rfdetr::batch_dice_loss(input, labels, traced);
-   };
+   const auto pair = [&](const torch::Tensor& input, bool traced) { return 1.7 * rfdetr::batch_sigmoid_ce_loss(input, labels, traced) + 2.3 * rfdetr::batch_dice_loss(input, labels, traced); };
    const auto actual = pair(logits, true), expected = pair(eager_logits, false);
    REQUIRE(torch::allclose(actual, expected, 2e-3, 2e-3));
    actual.square().sum().backward();
@@ -2271,8 +2268,10 @@ TEST_CASE("Selective mask helpers preserve dynamic samples values and gradients"
    REQUIRE(torch::allclose(direct.grad(), reference.grad(), 2e-5, 2e-5));
    auto& cache = fixture.workspace.loss_cache();
    const std::array<const void*, 4> identities{cache.batch_sigmoid_ce.identity(), cache.batch_dice.identity(), cache.sigmoid_ce.identity(), cache.dice.identity()};
-   if (recorded.front()) CHECK(identities == recorded);
-   else recorded = identities;
+   if (recorded.front())
+    CHECK(identities == recorded);
+   else
+    recorded = identities;
   }
  }
 }

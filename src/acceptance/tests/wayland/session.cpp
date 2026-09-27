@@ -202,8 +202,7 @@ public:
                 ::unsetenv("MMLTK_FIREFOX_LOG_FILE") == 0 && ::unsetenv("MOZ_LOG") == 0 && ::unsetenv("MOZ_LOG_FILE") == 0 && ::unsetenv("RUST_BACKTRACE") == 0)) &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION", "1", 1) == 0 && ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DPI", high_dpi ? "1.5" : "1", 1) == 0 &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO", viewer_scenario.c_str(), 1) == 0 && ::setenv("MMLTK_GUI_PIXEL_TRACE", logging && pixel_probes ? "1" : "0", 1) == 0 &&
-    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PROBE_FAILURE", probe_failure.c_str(), 1) == 0 &&
-    (viewer_scenario != "workflows-oom" || ::setenv("MMLTK_TEST_CANVAS_OOM_WIDTH", "1234", 1) == 0) &&
+    ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PROBE_FAILURE", probe_failure.c_str(), 1) == 0 && (viewer_scenario != "workflows-oom" || ::setenv("MMLTK_TEST_CANVAS_OOM_WIDTH", "1234", 1) == 0) &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PIXEL_FIXTURE", fixture.pixel_evidence && (viewer_scenario == "retained" || viewer_scenario == "dpi") ? "1" : "0", 1) == 0 &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPLETION_GATE", viewer_scenario == "retained" ? "1" : "0", 1) == 0 &&
     ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PENDING_SUPERSESSION", logging && (viewer_scenario == "retained" || viewer_scenario == "dpi") ? "1" : "0", 1) == 0 &&
@@ -666,8 +665,8 @@ void WaylandSession::RunWorkflows() {
   CHECK(browser.validate_to_explore_pixels);
   const auto prediction_output_blocker = browser.prediction_output_blocker();
   if (logging && !prediction_output_blocker.empty() && browser.prediction_failure.record().is_null())
-   append_acceptance_record(acceptance_log, {{"event", "acceptance.prediction.incomplete"}, {"level", "error"}, {"detail", prediction_output_blocker}, {"media_disabled", browser.prediction_no_outputs},
-                                             {"saving_controls", browser.prediction_saving_controls}, {"saved_media", browser.prediction_outputs}});
+   append_acceptance_record(acceptance_log, {{"event", "acceptance.prediction.incomplete"}, {"level", "error"}, {"detail", prediction_output_blocker},
+                                             {"media_disabled", browser.prediction_no_outputs}, {"saving_controls", browser.prediction_saving_controls}, {"saved_media", browser.prediction_outputs}});
   INFO(prediction_output_blocker);
   CHECK(prediction_output_blocker.empty());
   INFO(browser.validation_progressive);

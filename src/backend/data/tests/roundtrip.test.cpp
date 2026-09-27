@@ -285,9 +285,7 @@ void exercise_independent_completions(const std::string& path, const bool h2d) {
  gpu::ensure_cuda_driver_ok(cuStreamWriteValue32(release_stream, gate, 0U, CU_STREAM_WRITE_VALUE_DEFAULT), "compiled consumer gate initialization");
  releaser.Synchronize();
  std::array<std::promise<std::exception_ptr>, 5> transfers;
- const auto transfer_complete = +[](void* raw, std::size_t, std::exception_ptr error) noexcept {
-  static_cast<std::promise<std::exception_ptr>*>(raw)->set_value(error);
- };
+ const auto transfer_complete = +[](void* raw, std::size_t, std::exception_ptr error) noexcept { static_cast<std::promise<std::exception_ptr>*>(raw)->set_value(error); };
  std::atomic<bool> consumed{false};
  CompiledImageStream stream({.slots = 2U, .workers = 2U, .device = 0, .loading = data_loading_options(h2d)});
  stream.bind_current_context();
@@ -307,7 +305,8 @@ void exercise_independent_completions(const std::string& path, const bool h2d) {
  });
  gpu::ensure_cuda_driver_ok(cuStreamWaitValue32(reinterpret_cast<CUstream>(consumer_stream), gate, 1U, CU_STREAM_WAIT_VALUE_EQ), "compiled delayed consumer");
  stream.handoff(0U, consumer_stream);
- ensure_cuda_ok(cudaMemcpyAsync(stream.metadata_storage(0U).data(), stream.device_storage(0U).data(), reads.size() * stride, cudaMemcpyDeviceToHost, consumer_stream), "compiled delayed consumer pixels");
+ ensure_cuda_ok(
+  cudaMemcpyAsync(stream.metadata_storage(0U).data(), stream.device_storage(0U).data(), reads.size() * stride, cudaMemcpyDeviceToHost, consumer_stream), "compiled delayed consumer pixels");
  stream.release(0U, consumer_stream, {.context = &consumed, .complete = [](void* raw, std::size_t, std::exception_ptr error) noexcept {
   if (!error) static_cast<std::atomic<bool>*>(raw)->store(true, std::memory_order_release);
  }});

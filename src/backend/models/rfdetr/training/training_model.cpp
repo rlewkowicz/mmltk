@@ -305,9 +305,9 @@ std::uint64_t TrainingModel::attempt() {
        p.metrics.accumulate_empty();
       } else {
        if (!prepared) acquire();
-       wave.add(p.lanes->enqueue(&p.runtime, *p.loader, batch, &*ready, p.contributions, p.scaler.enabled() ? p.scaler.current_scale() : 1.0, p.parameter_version, p.detection,
-        p.options.device_id, p.shard.seed, p.epoch, p.distributed.rank, microbatch, p.precision.autocast_dtype != torch::kFloat32,
-        p.precision.autocast_dtype, supervision_route(p.options.training_supervision), p.counts, *p.reducer, lane, current_donors));
+       wave.add(p.lanes->enqueue(&p.runtime, *p.loader, batch, &*ready, p.contributions, p.scaler.enabled() ? p.scaler.current_scale() : 1.0, p.parameter_version, p.detection, p.options.device_id,
+        p.shard.seed, p.epoch, p.distributed.rank, microbatch, p.precision.autocast_dtype != torch::kFloat32, p.precision.autocast_dtype, supervision_route(p.options.training_supervision), p.counts,
+        *p.reducer, lane, current_donors));
       }
      } catch (...) {
       if (batch.owner) p.loader->release_batch(batch);
@@ -369,7 +369,9 @@ std::uint64_t TrainingModel::attempt() {
  } catch (...) {
   const auto error = std::current_exception();
   p.failure(p.shard.model_id, error);
-  try { p.lanes->discard_prepared(); } catch (...) {}
+  try {
+   p.lanes->discard_prepared();
+  } catch (...) {}
   std::rethrow_exception(error);
  }
 }

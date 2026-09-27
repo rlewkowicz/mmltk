@@ -85,8 +85,7 @@ void TrainingSupervisionImpl::configure_compilation(bool training, bool selectiv
 const torch::Tensor& TrainingSupervisionImpl::dummy_box(const torch::Device& device) {
  // Immutable runtime scratch, deliberately absent from registered buffers and
  // checkpoints. The synchronous initial literal transfer completes publication.
- if (!dummy_box_.defined() || dummy_box_.device() != device)
-  dummy_box_ = torch::tensor({0.5F, 0.5F, 0.25F, 0.25F}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+ if (!dummy_box_.defined() || dummy_box_.device() != device) dummy_box_ = torch::tensor({0.5F, 0.5F, 0.25F, 0.25F}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
  if (device.is_cuda()) dummy_box_.record_stream(c10::cuda::getCurrentCUDAStream(device.index()));
  return dummy_box_;
 }

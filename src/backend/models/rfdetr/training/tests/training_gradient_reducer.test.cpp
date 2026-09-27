@@ -112,7 +112,7 @@ TEST_CASE("Target count admission seals each wave and exact logical attempt", "[
   CHECK_THROWS(counts.begin_attempt());
   tc::getCurrentCUDAStream(0).synchronize();
   counts.finalize_attempt();
-  CHECK(value.target_count.item<float>() == 7);
+  CHECK(value.target_count.item<float>() == 7.F);
   CHECK_THROWS(counts.finalize_attempt());
  }
 }

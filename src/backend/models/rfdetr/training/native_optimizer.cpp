@@ -416,9 +416,9 @@ void NativeAdamW::step_group_eager(const Group& group) {
  });
 }
 void NativeAdamW::Batch::clear() {
- template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Batch, std::meta::access_context::current()))) {
-  (*this).[:member:].clear();
- }
+ []<class T>(T& batch) {
+  template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()))) { batch.[:member:].clear(); }
+ }(*this);
 }
 void NativeAdamW::step_group_batched(const Group& group) {
  // Keep device/dtype grouping and all tensor-vector capacities across groups,

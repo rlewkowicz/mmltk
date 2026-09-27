@@ -143,11 +143,9 @@ cudaError_t GpuBatchAugmenter::release_copy_paste_resources() noexcept {
 void GpuBatchAugmenter::materialize_donors(const mmltk::backend::data::DatasetLoader& source, std::span<const TrainingDonorDescriptor> descriptors) {
  require(descriptors.size() <= static_cast<std::size_t>(batch_capacity_), "logical donor batch exceeds physical capacity");
  bool needs_upload = false;
- for (std::size_t slot = 0; slot < descriptors.size(); ++slot)
-  needs_upload |= batch_plan_.images[slot].paste_donor_slot >= 0 && descriptors[slot] != materialized_donors_[slot];
+ for (std::size_t slot = 0; slot < descriptors.size(); ++slot) needs_upload |= batch_plan_.images[slot].paste_donor_slot >= 0 && descriptors[slot] != materialized_donors_[slot];
  if (!needs_upload) return;
- if (!resources_->donor_images_cpu_.defined())
-  resources_->donor_images_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_, 3, height_, width_}, torch::kFloat32, device_id_);
+ if (!resources_->donor_images_cpu_.defined()) resources_->donor_images_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_, 3, height_, width_}, torch::kFloat32, device_id_);
  const auto stream = resources_->cache_stream_;
  if (cache_upload_pending_) {
   CheckSettlement(event_wait_(resources_->cache_upload_complete_), "settle logical donor staging");
@@ -171,14 +169,13 @@ void GpuBatchAugmenter::materialize_donors(const mmltk::backend::data::DatasetLo
     const bool image_changed = !materialized_donors_[slot].valid || materialized_donors_[slot].image_index != descriptor.image_index;
     if (image_changed) {
      std::memcpy(image, reinterpret_cast<const std::byte*>(source.pixel_blob()) + descriptor.image_index * source.image_stride(), image_values * sizeof(float));
-     ensure_cuda_ok(
-      copy_(resources_->donor_images_.data_ptr<float>() + slot * image_values, image, image_values * sizeof(float), cudaMemcpyHostToDevice, stream), "upload logical donor image");
+     ensure_cuda_ok(copy_(resources_->donor_images_.data_ptr<float>() + slot * image_values, image, image_values * sizeof(float), cudaMemcpyHostToDevice, stream), "upload logical donor image");
     }
     if (donor_metadata_[slot].has_mask) {
      auto* mask = resources_->donor_masks_cpu_.data_ptr<std::int64_t>() + slot * mask_words_;
      pack_compiled_rle_pairs(support, {mask, static_cast<std::size_t>(mask_words_)});
-     ensure_cuda_ok(copy_(resources_->donor_masks_.data_ptr<std::int64_t>() + slot * mask_words_, mask, mask_words_ * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream),
-      "upload logical donor support");
+     ensure_cuda_ok(
+      copy_(resources_->donor_masks_.data_ptr<std::int64_t>() + slot * mask_words_, mask, mask_words_ * sizeof(std::int64_t), cudaMemcpyHostToDevice, stream), "upload logical donor support");
     } else {
      auto* box = resources_->donor_boxes_cpu_.data_ptr<float>() + slot * 4;
      std::copy(donor_metadata_[slot].box.begin(), donor_metadata_[slot].box.end(), box);
@@ -250,7 +247,7 @@ void GpuBatchAugmenter::prepare(const mmltk::backend::data::Batch& batch, const 
  const auto metadata = logical_donors_ ? std::span{planned_donor_metadata_}.first(batch.num_images) : std::span{donor_metadata_};
  const auto raw_batch = batch_view(batch);
  batch_plan_ = batch.draw_keys.empty() ? executor_->PrepareTraining(raw_batch, seed, epoch, rank, sequence, metadata, selection, next_staging_slot_)
-                                      : executor_->Prepare(raw_batch, batch.draw_keys, metadata, selection, next_staging_slot_);
+                                       : executor_->Prepare(raw_batch, batch.draw_keys, metadata, selection, next_staging_slot_);
  for (auto& image : batch_plan_.images) {
   if (image.paste_donor_slot < 0) continue;
   const auto slot = static_cast<std::size_t>(image.paste_donor_slot);
@@ -264,8 +261,7 @@ void GpuBatchAugmenter::prepare(const mmltk::backend::data::Batch& batch, const 
  planned_microbatch_key_ = batch.microbatch_key;
  plan_prepared_ = true;
 }
-torch::Tensor GpuBatchAugmenter::run_prepared(const mmltk::backend::data::Batch& batch, const mmltk::backend::data::DatasetLoader* source,
- std::span<const TrainingDonorDescriptor> supplied_donors) {
+torch::Tensor GpuBatchAugmenter::run_prepared(const mmltk::backend::data::Batch& batch, const mmltk::backend::data::DatasetLoader* source, std::span<const TrainingDonorDescriptor> supplied_donors) {
  RequireActive();
  require(plan_prepared_, "GPU augmentation execution requires a prepared batch");
  require(source == planned_source_ && std::ranges::equal(supplied_donors, planned_donors_), "prepared GPU augmentation donors differ");
@@ -411,8 +407,8 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
    std::copy(donor_metadata_[static_cast<std::size_t>(slot)].box.begin(), donor_metadata_[static_cast<std::size_t>(slot)].box.end(), donor_boxes + slot * 4);
   }
   const std::size_t map_bytes = static_cast<std::size_t>(current_batch_size_) * sizeof(std::int64_t);
-  ensure_cuda_ok(copy_(resources_->replacement_indices_gpu_.data_ptr<std::int64_t>(), replacements, map_bytes, cudaMemcpyHostToDevice, resources_->cache_stream_),
-   "cudaMemcpyAsync for donor replacements");
+  ensure_cuda_ok(
+   copy_(resources_->replacement_indices_gpu_.data_ptr<std::int64_t>(), replacements, map_bytes, cudaMemcpyHostToDevice, resources_->cache_stream_), "cudaMemcpyAsync for donor replacements");
   for (std::int64_t first = 0; first < current_batch_size_;) {
    if (replacements[first] < 0) {
     ++first;
@@ -426,8 +422,7 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
     "cudaMemcpyAsync for original donor support");
    first = end;
   }
-  ensure_cuda_ok(
-   copy_(resources_->donor_boxes_gpu_.data_ptr<float>(), donor_boxes, static_cast<std::size_t>(batch_capacity_) * 4 * sizeof(float), cudaMemcpyHostToDevice, resources_->cache_stream_),
+  ensure_cuda_ok(copy_(resources_->donor_boxes_gpu_.data_ptr<float>(), donor_boxes, static_cast<std::size_t>(batch_capacity_) * 4 * sizeof(float), cudaMemcpyHostToDevice, resources_->cache_stream_),
    "cudaMemcpyAsync for donor boxes");
   ensure_cuda_ok(cudaEventRecord(resources_->cache_upload_complete_, resources_->cache_stream_), "cudaEventRecord for donor upload staging");
   cache_upload_pending_ = true;

@@ -31,11 +31,16 @@ test("include audit attributes project paths before system names and exposes amb
   assert.equal(attr("missing.h").category, "unresolved");
 });
 
-test("include audit reads actual target policy across multiple compile environments", () => {
-  const entry = (target, extra = "") => ({ directory: "/repo/build", file: "/repo/src/a.cpp",
-    command: `g++ -I '/repo/include dir' -isystem /opt/lib ${extra} -o CMakeFiles/${target}.dir/a.o -c /repo/src/a.cpp` });
-  const contexts = compilationContexts([entry("one"), entry("two", "-fmodules")], "/repo",
-    () => "header\t/repo/src/pch_std.h\nuse\t/repo/src/a.cpp\n", () => true).get("src/a.cpp");
+const targetEntry = (target, extra = `-include CMakeFiles/${target}.dir/cmake_pch.hxx`) => ({
+  directory: "/repo/build", file: "/repo/src/a.cpp",
+  command: `g++ -I '/repo/include dir' -isystem /opt/lib ${extra} -o CMakeFiles/${target}.dir/a.o -c /repo/src/a.cpp`,
+});
+const registeredPolicy = "header\t/repo/src/pch_std.h\nuse\t/repo/src/a.cpp\n";
+const readContexts = (entries, policy = registeredPolicy) =>
+  compilationContexts(entries, "/repo", () => policy, () => Boolean(policy)).get("src/a.cpp");
+
+test("include audit verifies target-local forced PCH across every compile environment", () => {
+  const contexts = readContexts([targetEntry("one"), targetEntry("two", "-fmodules")]);
   assert.equal(contexts.length, 2);
   assert.deepEqual(contexts[0].include_dirs, ["/repo/include dir", "/opt/lib"]);
   assert.deepEqual(contexts[0].pch, [pch]);
@@ -111,4 +116,90 @@ test("include audit defaults to reports under output and rejects unknown modes",
   assert.equal(parseIncludeArgs(["fix", "--output", "output/custom"]).output, "output/custom");
   assert.throws(() => parseIncludeArgs(["sort"]));
   assert.throws(() => parseIncludeArgs(["fix", "--build-dir"]));
+});
+
+test("PCH evidence distinguishes registered use, exclusion, and contradictory compiler commands", () => {
+  const valid = readContexts([targetEntry("one")])[0];
+  assert.deepEqual(valid.forced_pch, [{ option: "-include", path: "build/CMakeFiles/one.dir/cmake_pch.hxx" }]);
+  assert.equal(valid.pch_reason, "target-local forced PCH");
+  assert.deepEqual(valid.pch_issues, []);
+  for (const extra of ["", "-include CMakeFiles/two.dir/cmake_pch.hxx",
+    "-include-pch CMakeFiles/one.dir/cmake_pch.hxx", "-include CMakeFiles/one.dir/cmake_pch.hxx -fmodules",
+    "-include CMakeFiles/one.dir/cmake_pch.hxx @hidden-options"]) {
+    const found = readContexts([targetEntry("one", extra)])[0];
+    assert.deepEqual(found.pch, [], extra);
+    assert.equal(found.pch_reason, "inconsistent PCH evidence", extra);
+    assert.ok(found.pch_issues.length > 0, extra);
+  }
+  const skippedPolicy = registeredPolicy.replace("use\t", "skip\t");
+  const skipped = readContexts([targetEntry("one", "")], skippedPolicy)[0];
+  assert.equal(skipped.pch_reason, "source is excluded by its target PCH policy");
+  assert.deepEqual(skipped.pch_issues, []);
+  const module = readContexts([targetEntry("one", "-fmodules-ts")], skippedPolicy)[0];
+  assert.equal(module.pch_reason, "module compilation does not consume a PCH");
+  assert.deepEqual(module.pch, []);
+  const missing = readContexts([targetEntry("one")], "")[0];
+  assert.equal(missing.pch_reason, "inconsistent PCH evidence");
+  const undeclared = readContexts([targetEntry("one", "")], "")[0];
+  assert.equal(undeclared.pch_reason, "target has no PCH registration");
+  const mismatch = readContexts([{ ...targetEntry("one"), output: "CMakeFiles/two.dir/a.o" }])[0];
+  assert.ok(mismatch.pch_issues.includes("compile output metadata differs from its compiler argument"));
+  const contradictory = readContexts([targetEntry("one")], registeredPolicy + "skip\t/repo/src/a.cpp\n")[0];
+  assert.ok(contradictory.pch_issues.includes("source is both used and excluded by its target policy"));
+});
+
+test("include audit retains unknown and ineligible secondary compile contexts", () => {
+  const unknown = targetEntry("other", "");
+  unknown.command = unknown.command.replace("CMakeFiles/other.dir/a.o", "objects/a.o");
+  const contexts = readContexts([targetEntry("one"), unknown]);
+  assert.equal(contexts.length, 2);
+  assert.equal(contexts[1].target, "(unregistered)");
+  assert.equal(contexts[1].pch_reason, "compile output has no registered CMake owner");
+  const source = "#include <vector>\n";
+  const result = rewrite("src/a.cpp", source, contexts);
+  assert.equal(result.after, undefined);
+  assert.equal(result.retained[0].reason, contexts[1].pch_reason);
+  const mixed = readContexts([targetEntry("one"), targetEntry("two", "")]);
+  assert.equal(mixed.length, 2);
+  assert.equal(rewrite("src/a.cpp", source, mixed).after, undefined);
+  assert.equal(mixed[1].pch_reason, "inconsistent PCH evidence");
+});
+
+test("PCH retention accounts for source kind and actual group coverage", () => {
+  for (const [path, reason] of [
+    ["src/a.h", "declaration header requires direct dependencies"],
+    ["src/a.cu", "CUDA source does not consume an ordinary C++ PCH"],
+    ["src/a.cppm", "module source does not consume a PCH"],
+    ["src/a.c", "not an ordinary C++ translation unit"],
+  ]) {
+    const result = rewrite(path, "#include <vector>\n");
+    assert.equal(result.retained.length, 1);
+    assert.equal(result.retained[0].reason, reason);
+  }
+  const absent = rewrite("src/a.cpp", "#include <vector>\n", []);
+  assert.equal(absent.retained[0].reason, "source has no compile command in this build graph");
+  const uncovered = rewrite("src/a.cpp", "#include <unistd.h>\n#include <array>\n");
+  assert.equal(uncovered.after, undefined);
+  assert.deepEqual(uncovered.retained.map(({ category }) => category), ["linux-posix", "standard"]);
+  assert.ok(uncovered.retained.every(({ reason }) => reason === "header is not provided by a PCH shared by every compile context"));
+  const quoted = rewrite("src/a.cpp", '#include "vector"\n');
+  assert.equal(quoted.retained[0].reason, "non-angle include retains explicit lookup");
+});
+
+test("include reports expose compiler evidence and every retained standard or Linux directive", () => {
+  const sources = new Map([
+    [pch, "#include <vector>\n"],
+    ["src/a.cpp", "#include <vector>\n#include <unistd.h>\n"],
+    ["src/b.h", "#include <vector>\n#include <array>\n"],
+  ]);
+  const contexts = compilationContexts([targetEntry("one")], "/repo", () => registeredPolicy, () => true);
+  const report = buildIncludeReport([...sources.keys()], sources, contexts, "/repo");
+  const file = report.files.find(({ path }) => path === "src/a.cpp");
+  assert.equal(file.compile_contexts.length, 1);
+  assert.equal(file.compile_contexts[0].forced_pch[0].path, "build/CMakeFiles/one.dir/cmake_pch.hxx");
+  assert.deepEqual(report.pch_groups[0].consumers, []);
+  assert.deepEqual(report.pch_groups[0].compiled_consumers, ["src/a.cpp"]);
+  assert.deepEqual(report.retained_system_includes.map(({ includes }) => includes), [2, 1]);
+  assert.equal(report.replacements.find(({ path }) => path === "src/a.cpp").retained[0].header, "unistd.h");
+  assert.equal(report.replacements.find(({ path }) => path === "src/b.h").retained.length, 2);
 });

@@ -616,8 +616,10 @@ void exercise_gradient_trajectory(const DistributedContext& distributed, int dev
       require(!optimizer.parameters()[p].grad().defined(), "gradient handoff projected usage before the numerical boundary");
       const auto& expected = expected_optimizer.parameters()[p].grad();
       if (distributed.enabled || expected.defined()) {
-       if (expected.defined()) equal(gradients.at(checked), expected, "fixed-K global gradients differ across capacity/rank slicing");
-       else require(gradients.at(checked).eq(0).all().item<bool>(), "globally unused finite-check view is not zero");
+       if (expected.defined())
+        equal(gradients.at(checked), expected, "fixed-K global gradients differ across capacity/rank slicing");
+       else
+        require(gradients.at(checked).eq(0).all().item<bool>(), "globally unused finite-check view is not zero");
        ++checked;
       }
      }
@@ -809,7 +811,11 @@ private:
 class FixtureCollectiveBackend final : public c10d::Backend {
 public:
  FixtureCollectiveBackend(int device, CollectiveOutcome outcome, std::shared_ptr<CollectiveFacts> facts, std::shared_ptr<CollectiveGate> gate = {}, int successful_submissions = 0)
-     : c10d::Backend(0, 2), stream_(tc::getStreamFromPool(false, tc::checked_device_index(device))), outcome_(outcome), facts_(std::move(facts)), gate_(std::move(gate)),
+     : c10d::Backend(0, 2),
+       stream_(tc::getStreamFromPool(false, tc::checked_device_index(device))),
+       outcome_(outcome),
+       facts_(std::move(facts)),
+       gate_(std::move(gate)),
        successful_submissions_(successful_submissions) {}
  const std::string getBackendName() const override { return "training-custody-fixture"; }
  c10::intrusive_ptr<c10d::Work> allreduce(std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& = {}) override {
@@ -1147,8 +1153,8 @@ void exercise_collective_custody(int device) {
     counts.resolve();
    } catch (const std::exception& error) { first = error.what(); }
    const std::string expected = outcome == CollectiveOutcome::SubmitThrow ? "injected collective exception after queue"
-                              : outcome == CollectiveOutcome::WaitFalse ? "training collective wait returned false"
-                                                                        : "injected collective wait exception";
+                                : outcome == CollectiveOutcome::WaitFalse ? "training collective wait returned false"
+                                                                          : "injected collective wait exception";
    for (auto& waiter : waiters) require(waiter.get() == first && first == expected, "count waiters lost the initiating failure");
    require(gate->await(), "count failure did not retain in-flight device work");
    require(facts->live_work == completed_wave + (outcome == CollectiveOutcome::SubmitThrow ? 0 : 1), "count failure lost previously submitted Work");
@@ -1351,12 +1357,10 @@ void exercise_collective_cancellation(DistributedContext& group, int device, std
  std::fprintf(stderr, "%.*s collective terminal custody verified\n", static_cast<int>(operation.size()), operation.data());
  std::rethrow_exception(failure);
 }
-
 namespace {
 struct PreparedBackwardGate final {
  explicit PreparedBackwardGate(int device)
-     : word(torch::zeros({1}, torch::TensorOptions().device(tc::cuda_device(device)).dtype(torch::kInt32))),
-       release_stream(tc::getStreamFromPool(false, tc::checked_device_index(device))) {
+     : word(torch::zeros({1}, torch::TensorOptions().device(tc::cuda_device(device)).dtype(torch::kInt32))), release_stream(tc::getStreamFromPool(false, tc::checked_device_index(device))) {
   tc::getCurrentCUDAStream(tc::checked_device_index(device)).synchronize();
  }
  ~PreparedBackwardGate() { release(); }
@@ -1365,7 +1369,9 @@ struct PreparedBackwardGate final {
   released = true;
   (void)cuStreamWriteValue32(reinterpret_cast<CUstream>(release_stream.stream()), reinterpret_cast<CUdeviceptr>(word.data_ptr()), 1, CU_STREAM_WRITE_VALUE_DEFAULT);
   (void)cudaStreamSynchronize(release_stream.stream());
-  if (!armed.load()) try { complete.synchronize(); } catch (...) {}
+  if (!armed.load()) try {
+    complete.synchronize();
+   } catch (...) {}
  }
  torch::Tensor hold(const torch::Tensor& gradient) {
   if (!armed.exchange(false)) return gradient;
@@ -1402,7 +1408,7 @@ void equal_training_state(const std::vector<NormalizedModelStateEntry>& actual, 
  for (std::size_t i = 0; i < actual.size(); ++i)
   require(actual[i].name == expected[i].name && torch::equal(actual[i].tensor, expected[i].tensor), "prepared training changed the exact parameter trajectory");
 }
-}
+}  // namespace
 void exercise_prepared_training(const DistributedContext& distributed, int device) {
  namespace data = mmltk::backend::data;
  tc::TorchCudaDeviceGuard device_guard(tc::checked_device_index(device));
@@ -1469,11 +1475,11 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
    native->initialize_training_supervision(request.seed);
    native->to(tc::cuda_device(device));
    native->set_force_pytorch_deformable_attn(true);
-   auto owner = std::make_unique<TrainingModel>(request, 0, runtime, std::make_unique<data::DatasetLoader>(loader_config), native, plan, distributed,
-    TrainingPrecision{}, detection, [&](std::uint64_t, std::exception_ptr error) {
-     ++failures;
-     if (signal) signal->fail(error);
-    });
+   auto owner = std::make_unique<TrainingModel>(
+    request, 0, runtime, std::make_unique<data::DatasetLoader>(loader_config), native, plan, distributed, TrainingPrecision{}, detection, [&](std::uint64_t, std::exception_ptr error) {
+    ++failures;
+    if (signal) signal->fail(error);
+   });
    if (!resume.empty()) {
     auto state = decode_model_state(resume);
     const auto saved = detail::read_training_continuation(*state.admitted_archive());
@@ -1562,8 +1568,9 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
         "prepared target identities differ from the exact future rank slice");
       TrainingDonorHistory extra(1, request.batch_size);
       bool duplicate_rejected = false;
-      try { lanes.prepare_next(extra, draws.schedule, slice, request.seed, 0, distributed.rank, 4, false); }
-      catch (const std::logic_error&) { duplicate_rejected = true; }
+      try {
+       lanes.prepare_next(extra, draws.schedule, slice, request.seed, 0, distributed.rank, 4, false);
+      } catch (const std::logic_error&) { duplicate_rejected = true; }
       require(duplicate_rejected, "training admitted a second future preparation");
       gate.release();
       require(attempt.get() == request.batch_size, "held training update was lost");
@@ -1579,7 +1586,9 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
      } catch (...) {
       gate.release();
       signal->release_worker.release();
-      if (attempt.valid()) try { (void)attempt.get(); } catch (...) {}
+      if (attempt.valid()) try {
+        (void)attempt.get();
+       } catch (...) {}
       parameter.remove_hook(hook);
       TrainingPreparationTestAccess::observe(lanes, {});
       workers->wait_idle();
@@ -1629,12 +1638,13 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
    require(cancelled->attempt() == request.batch_size, "discarded future failure leaked into normal admission");
    const auto before = prepare_invalid();
    bool original_failure = false;
-   try { (void)cancelled->attempt(); }
-   catch (const std::invalid_argument& error) { original_failure = std::string_view(error.what()) == "scheduled annotation image is outside dataset"; }
+   try {
+    (void)cancelled->attempt();
+   } catch (const std::invalid_argument& error) { original_failure = std::string_view(error.what()) == "scheduled annotation image is outside dataset"; }
    require(original_failure && failures > 0 && cancelled->schedule() == before, "future failure lost its original cause or advanced admission");
   }
-  require(draws.schedule->image_indices == initial_draws.image_indices && draws.schedule->draw_keys == initial_draws.draw_keys &&
-          draws.schedule->microbatch_keys == initial_draws.microbatch_keys, "preparation mutated the immutable sampler");
+  require(draws.schedule->image_indices == initial_draws.image_indices && draws.schedule->draw_keys == initial_draws.draw_keys && draws.schedule->microbatch_keys == initial_draws.microbatch_keys,
+   "preparation mutated the immutable sampler");
  }
 }
 }  // namespace mmltk::backend::models::rfdetr::testsupport

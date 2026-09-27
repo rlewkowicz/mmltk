@@ -75,9 +75,7 @@ void ensure_train_lane_model_supported(NativeRfDetrModel&, int);
 class TrainingLanes final {
 public:
  // Nonempty lanes retain an independent next upload even with one microbatch.
- [[nodiscard]] static constexpr std::size_t target_staging_depth(int accumulation_steps) noexcept {
-  return accumulation_steps > 2 ? static_cast<std::size_t>(accumulation_steps) : 2U;
- }
+ [[nodiscard]] static constexpr std::size_t target_staging_depth(int accumulation_steps) noexcept { return accumulation_steps > 2 ? static_cast<std::size_t>(accumulation_steps) : 2U; }
  TrainingLanes(const TrainRequest&, RuntimeContext&, mmltk::backend::data::DatasetLoader&, std::shared_ptr<NativeRfDetrModel>, const std::vector<std::string>&, int lane_count, std::size_t local_batch,
   const mmltk::frameworks::gpu::DeviceContext&, std::function<void(std::exception_ptr)> failure = {}, std::shared_ptr<mmltk::common::concurrency::WorkerPool> workers = {});
  ~TrainingLanes();
@@ -86,8 +84,8 @@ public:
  // One annotation-only job on the existing lane worker. Its errors belong to
  // the next admission, never to the optimizer attempt currently completing.
  // The caller drains current CPU lane jobs and admits counts/gradients first.
- void prepare_next(TrainingDonorHistory&, std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule>, TrainingRankSlice, std::uint64_t seed, int epoch, int rank,
-  std::uint64_t microbatch, bool include_masks);
+ void prepare_next(
+  TrainingDonorHistory&, std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule>, TrainingRankSlice, std::uint64_t seed, int epoch, int rank, std::uint64_t microbatch, bool include_masks);
  void await_preparation(int epoch, int rank, std::uint64_t microbatch);
  void admit_prepared(const mmltk::backend::data::Batch&);
  [[nodiscard]] bool has_prepared() const noexcept;
@@ -95,9 +93,8 @@ public:
  // CLEANUP-IGNORE: This API declaration repeats its out-of-line definition's parameter types, not implementation.
  std::future<TrainLaneResult> enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
   const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, std::size_t admitted_microbatches, double gradient_scale, size_t parameter_version, const DetectionConfig& detection_config,
-  int device_id, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled,
-  at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<TrainingTargetCounts> normalizer, TrainingGradientReducer& reducer, std::size_t lane_index,
-  std::span<const TrainingDonorDescriptor> donors);
+  int device_id, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled, at::ScalarType autocast_dtype, TrainingSupervisionRoute route,
+  std::shared_ptr<TrainingTargetCounts> normalizer, TrainingGradientReducer& reducer, std::size_t lane_index, std::span<const TrainingDonorDescriptor> donors);
  void settle(TrainLaneResult&, int device_id);
  [[nodiscard]] std::vector<std::vector<torch::Tensor>> gradient_leaves() const;
  void reconfigure(NativeRfDetrModel&, const std::vector<std::string>& active_names, const GpuAugmentationConfig&, int batch_size, CompilationMode);

@@ -28,8 +28,8 @@ struct TrainLaneContext {
  size_t synced_parameter_version = std::numeric_limits<size_t>::max();
 };
 namespace {
-void prepare_training_input(TrainLaneContext& lane, const mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
- std::uint64_t seed, int epoch, int rank, std::uint64_t sequence, bool include_masks) {
+void prepare_training_input(TrainLaneContext& lane, const mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch, std::uint64_t seed, int epoch, int rank,
+ std::uint64_t sequence, bool include_masks) {
  if (!lane.augmenter) throw std::runtime_error("parallel RF-DETR train lane is missing its GPU augmenter");
  {
   mmltk::common::logging::ScopedProfile profile_augment{"rfdetr.train.parallel.augment"};
@@ -39,8 +39,8 @@ void prepare_training_input(TrainLaneContext& lane, const mmltk::backend::data::
  {
   mmltk::common::logging::ScopedProfile profile_targets{"rfdetr.train.parallel.targets"};
   const auto& config = lane.model->config();
-  lane.prepared = build_targets(batch, loader.image_height(), loader.image_width(), include_masks, include_masks, lane.stream.device_index(), lane.target_scratch,
-   "train", config.num_queries, config.training_supervision, static_cast<int>(lane.model->class_layout()->catalog()->size()), &lane.augmenter->batch_plan());
+  lane.prepared = build_targets(batch, loader.image_height(), loader.image_width(), include_masks, include_masks, lane.stream.device_index(), lane.target_scratch, "train", config.num_queries,
+   config.training_supervision, static_cast<int>(lane.model->class_layout()->catalog()->size()), &lane.augmenter->batch_plan());
  }
 }
 }  // namespace
@@ -205,8 +205,7 @@ TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_
    workers ? std::move(workers)
            : std::make_shared<mmltk::common::concurrency::WorkerPool>(static_cast<size_t>(train_lane_count), train_runtime.lane_cpus(), "rfdtrtlane", 0U, &train_runtime.execution().placement, false);
   for (int lane_index = 0; lane_index < train_lane_count; ++lane_index) {
-   train_lanes.emplace_back(
-    torch_cuda::get_priority_cuda_stream(options.device_id, mmltk::frameworks::gpu::current_cuda_highest_stream_priority()), target_staging_depth(options.grad_accum_steps));
+   train_lanes.emplace_back(torch_cuda::get_priority_cuda_stream(options.device_id, mmltk::frameworks::gpu::current_cuda_highest_stream_priority()), target_staging_depth(options.grad_accum_steps));
   }
   for (auto& lane : train_lanes) {
    lane.donors.reserve(local_batch);
@@ -275,8 +274,8 @@ void TrainingLanes::reconfigure(NativeRfDetrModel& source, const std::vector<std
   lane.synced_parameter_version = std::numeric_limits<size_t>::max();
  }
 }
-void TrainingLanes::prepare_next(TrainingDonorHistory& history, std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule> schedule, TrainingRankSlice slice,
- std::uint64_t seed, int epoch, int rank, std::uint64_t microbatch, bool include_masks) {
+void TrainingLanes::prepare_next(TrainingDonorHistory& history, std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule> schedule, TrainingRankSlice slice, std::uint64_t seed, int epoch,
+ int rank, std::uint64_t microbatch, bool include_masks) {
  auto& p = *impl_;
  if (p.prepared_schedule || p.preparation.valid() || p.lanes.front().prepared) throw std::logic_error("training already has a prepared draw");
  if (!schedule || !slice.count || p.lanes.size() != 1 || !p.pool) throw std::logic_error("training lookahead requires one nonempty lane");
@@ -287,7 +286,9 @@ void TrainingLanes::prepare_next(TrainingDonorHistory& history, std::shared_ptr<
  p.prepared_microbatch = microbatch;
  const auto notify_failure = [](const PreparationObserver& observer, std::exception_ptr failure) noexcept {
   if (!observer) return;
-  try { observer(nullptr, 0, std::move(failure)); } catch (...) {}
+  try {
+   observer(nullptr, 0, std::move(failure));
+  } catch (...) {}
  };
  // All preparation failures, including admission to the worker, are retained
  // until this draw is admitted. No peer failure callback runs in this job.
@@ -303,8 +304,8 @@ void TrainingLanes::prepare_next(TrainingDonorHistory& history, std::shared_ptr<
     lane.donors.clear();
     if (p.augmentation.enabled && p.augmentation.copy_paste_probability > 0) {
      const auto offset = microbatch * p.global_batch;
-     const auto donors = history.prepare(*p.loader, microbatch % p.donor_streams,
-      std::span{p.prepared_schedule->draw_keys}.subspan(offset, p.global_batch), std::span{p.prepared_schedule->image_indices}.subspan(offset, p.global_batch), p.augmentation);
+     const auto donors = history.prepare(*p.loader, microbatch % p.donor_streams, std::span{p.prepared_schedule->draw_keys}.subspan(offset, p.global_batch),
+      std::span{p.prepared_schedule->image_indices}.subspan(offset, p.global_batch), p.augmentation);
      lane.donors.assign(donors.begin() + slice.begin, donors.begin() + slice.begin + slice.count);
     }
     prepare_training_input(lane, *p.loader, p.prepared_batch, seed, epoch, rank, microbatch, include_masks);
@@ -325,8 +326,7 @@ void TrainingLanes::prepare_next(TrainingDonorHistory& history, std::shared_ptr<
 void TrainingLanes::await_preparation(int epoch, int rank, std::uint64_t microbatch) {
  auto& p = *impl_;
  if (!p.prepared_schedule) throw std::logic_error("training has no prepared draw to admit");
- if (epoch != p.prepared_epoch || rank != p.prepared_rank || microbatch != p.prepared_microbatch)
-  throw std::logic_error("prepared training draw differs from admission");
+ if (epoch != p.prepared_epoch || rank != p.prepared_rank || microbatch != p.prepared_microbatch) throw std::logic_error("prepared training draw differs from admission");
  if (p.preparation_failure) std::rethrow_exception(p.preparation_failure);
  if (!p.preparation.valid()) throw std::logic_error("prepared training draw was already admitted");
  try {
@@ -338,8 +338,7 @@ void TrainingLanes::await_preparation(int epoch, int rank, std::uint64_t microba
 }
 void TrainingLanes::admit_prepared(const mmltk::backend::data::Batch& batch) {
  auto& p = *impl_;
- if (!p.prepared_schedule || p.preparation.valid() || p.preparation_failure || !p.lanes.front().prepared)
-  throw std::logic_error("training preparation has not completed successfully");
+ if (!p.prepared_schedule || p.preparation.valid() || p.preparation_failure || !p.lanes.front().prepared) throw std::logic_error("training preparation has not completed successfully");
  const auto& expected = p.prepared_batch;
  if (!batch.owner || !batch.device_images || batch.num_images != expected.num_images || batch.microbatch_key != expected.microbatch_key || !std::ranges::equal(batch.draw_keys, expected.draw_keys) ||
      !std::ranges::equal(std::span{batch.image_indices, batch.num_images}, std::span{expected.image_indices, expected.num_images}))
@@ -354,7 +353,9 @@ void TrainingLanes::discard_prepared() {
  if (p.preparation.valid()) {
   // Discarded work never entered the logical trajectory. Join it without
   // promoting an unadmitted batch error to a previous successful update.
-  try { p.preparation.get(); } catch (...) {}
+  try {
+   p.preparation.get();
+  } catch (...) {}
  }
  if (p.prepared_history) p.prepared_history->discard();
  p.preparation_failure = {};
@@ -373,16 +374,14 @@ void TrainingLanes::discard_prepared() {
 }
 std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
  const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready, std::size_t admitted_microbatches, double gradient_scale, size_t parameter_version, const DetectionConfig& detection_config,
- int device_id, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled,
- at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<TrainingTargetCounts> normalizer, TrainingGradientReducer& reducer, std::size_t lane_index,
- std::span<const TrainingDonorDescriptor> donors) {
+ int device_id, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled, at::ScalarType autocast_dtype, TrainingSupervisionRoute route,
+ std::shared_ptr<TrainingTargetCounts> normalizer, TrainingGradientReducer& reducer, std::size_t lane_index, std::span<const TrainingDonorDescriptor> donors) {
  auto& lane = impl_->lanes.at(lane_index);
  if (impl_->prepared_schedule) throw std::logic_error("training prepared draw has not been admitted");
  if (!lane.prepared) lane.donors.assign(donors.begin(), donors.end());
  auto& lane_pool = *impl_->pool;
- return lane_pool.enqueue(
-  [failure = impl_->failure, runtime, &loader, &lane, batch, params_ready, admitted_microbatches, gradient_scale, parameter_version, &detection_config, device_id,
-   seed, epoch, rank, augmentation_sequence, amp_enabled, autocast_dtype, route, normalizer = std::move(normalizer), &reducer, lane_index]() mutable {
+ return lane_pool.enqueue([failure = impl_->failure, runtime, &loader, &lane, batch, params_ready, admitted_microbatches, gradient_scale, parameter_version, &detection_config, device_id, seed, epoch,
+                           rank, augmentation_sequence, amp_enabled, autocast_dtype, route, normalizer = std::move(normalizer), &reducer, lane_index]() mutable {
   try {
    ScopedRuntimeContext worker_scope(runtime, lane_index + 1);
    torch_cuda::TorchCudaDeviceGuard device_guard(torch_cuda::checked_device_index(device_id));

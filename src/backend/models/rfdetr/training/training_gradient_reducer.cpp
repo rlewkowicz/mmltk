@@ -259,7 +259,7 @@ void TrainingGradientReducer::begin_attempt(std::size_t count) {
  p.finite_gradients.clear();
  for (auto& parameter : p.parameters) {
   parameter.master.mutable_grad() = torch::Tensor{};
-  parameter.gradient = {};
+  parameter.gradient = torch::Tensor{};
  }
  for (auto& bucket : p.buckets) {
   if (!p.direct) bucket.values.zero_();
@@ -312,7 +312,7 @@ void TrainingGradientReducer::collect(std::size_t index) {
     parameter.view.record_stream(producer);
     parameter.view.copy_(gradient);
     parameter.gradient = parameter.view;
-    gradient = {};
+    gradient = torch::Tensor{};
    }
    p.host_usage.data_ptr<std::int32_t>()[i] = 1;
   }
@@ -348,8 +348,7 @@ const std::vector<torch::Tensor>& TrainingGradientReducer::finish_attempt() {
  auto& p = *impl_;
  std::lock_guard lock(p.mutex);
  p.check();
- if (!p.active || p.handed_off || !p.counts_submitted || p.finished != p.expected || (!p.direct && p.next_bucket != p.buckets.size()))
-  throw std::logic_error("incomplete gradient attempt");
+ if (!p.active || p.handed_off || !p.counts_submitted || p.finished != p.expected || (!p.direct && p.next_bucket != p.buckets.size())) throw std::logic_error("incomplete gradient attempt");
  const auto optimizer_stream = tc::getCurrentCUDAStream(tc::checked_device_index(p.device));
  {
   tc::TorchCudaStreamGuard guard(p.launch);

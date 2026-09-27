@@ -72,8 +72,8 @@ public:
   std::span<const GpuAugmentationDonor> donors, const GpuAugmentationDonorBatchView& donor_batch, cudaStream_t stream, std::size_t staging_slot = 0U);
  // Planning requires only image identities and dimensions, without pixel storage. Call RunPrepared once after supplying
  // the selected donor pixels; it consumes exactly this plan without new draws.
- [[nodiscard]] const AugmentationBatchPlan& Prepare(const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> image_keys,
-  std::span<const GpuAugmentationDonor> donors, GpuAugmentationDonorSelection selection, std::size_t staging_slot);
+ [[nodiscard]] const AugmentationBatchPlan& Prepare(
+  const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> image_keys, std::span<const GpuAugmentationDonor> donors, GpuAugmentationDonorSelection selection, std::size_t staging_slot);
  [[nodiscard]] const AugmentationBatchPlan& PrepareTraining(const GpuAugmentationBatchView& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence,
   std::span<const GpuAugmentationDonor> donors, GpuAugmentationDonorSelection selection, std::size_t staging_slot);
  void RunPrepared(const GpuAugmentationBatchView& batch, const GpuAugmentationDonorBatchView& donors, cudaStream_t stream);

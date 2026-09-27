@@ -241,8 +241,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   const auto training_file = std::ranges::find(admitted_files, std::filesystem::absolute(options.train_compiled_path), &AdmittedFile::path);
   if (training_file == admitted_files.end()) throw std::logic_error("training source lacks admitted file metadata");
   auto make_loader_config_for = [&](const std::filesystem::path& compiled_path, size_t loader_batch_size, int prefetch_factor, bool shard_batches, bool drop_last) {
-   auto config = make_loader_config(compiled_path.string(), loader_batch_size, false, prefetch_factor, train_runtime.split().gather_threads, train_runtime.loader_affinity_string(),
-    options.device_id, static_cast<uint64_t>(options.seed));
+   auto config = make_loader_config(compiled_path.string(), loader_batch_size, false, prefetch_factor, train_runtime.split().gather_threads, train_runtime.loader_affinity_string(), options.device_id,
+    static_cast<uint64_t>(options.seed));
    config.loading = options;
    config.execution = train_runtime.execution();
    config.execution->placement.cpus = train_runtime.loader_cpus();
@@ -280,9 +280,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
   auto epoch_draws = data_plan.epoch(0, 0);
   for (std::size_t model_index = 1; model_index < data_plan.shards().size(); ++model_index) (void)data_plan.epoch(model_index, 0);
   std::unique_ptr<mmltk::backend::data::DatasetLoader> val_loader;
-  if (main_process) {
-   val_loader = std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.val_compiled_path, val_batch_size, options.prefetch_factor, false, false));
-  }
+  if (main_process) { val_loader = std::make_unique<mmltk::backend::data::DatasetLoader>(make_loader_config_for(options.val_compiled_path, val_batch_size, options.prefetch_factor, false, false)); }
   const std::uint32_t val_max_instances = val_loader ? val_loader->max_instances_per_image() : mmltk::backend::data::inspect_compiled_dataset(options.val_compiled_path).max_instances_per_image;
   std::optional<mmltk::backend::data::CompiledDatasetInfo> test_info;
   if (!options.test_compiled_path.empty()) { test_info = mmltk::backend::data::inspect_compiled_dataset(options.test_compiled_path); }
