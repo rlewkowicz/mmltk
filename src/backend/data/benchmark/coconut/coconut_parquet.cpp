@@ -219,6 +219,32 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
  }
 }
 constexpr std::uint64_t kParquetPoolBytes = 256ULL << 20;
+// Fixed for the entire call, including cold discovery and every later group.
+// Physical controls are acquired by their owner from this continuation; their
+// retained-handle role never becomes the role of decoder or Arrow backing.
+class ParquetCallEnvelope final {
+ enum class Mode { ColdMetadata, Full, WarmMetadata };
+ const Mode mode_;
+ const bool metadata_ready_;
+ const CoconutPhysicalInputRequirement physical_;
+public:
+ ParquetCallEnvelope(bool metadata_only, bool metadata_ready, CoconutPhysicalInputRequirement physical)
+  : mode_(metadata_only ? (metadata_ready ? Mode::WarmMetadata : Mode::ColdMetadata) : Mode::Full), metadata_ready_(metadata_ready), physical_(physical) {}
+ [[nodiscard]] bool full() const noexcept { return mode_ == Mode::Full; }
+ [[nodiscard]] bool needs_metadata() const noexcept { return !metadata_ready_; }
+ [[nodiscard]] bool reads_projection() const noexcept { return mode_ != Mode::WarmMetadata; }
+ [[nodiscard]] BenchmarkResources discovery_demand() const { return {kParquetPoolBytes, 1}; }
+ [[nodiscard]] BenchmarkResources demand(std::uint64_t workspace) const {
+  using mmltk::common::math::checked_add;
+  return {checked_add(checked_add(physical_.workspace_bytes(), reads_projection() ? kParquetPoolBytes : 0, "COCONut Parquet input overflow"),
+   workspace, "COCONut Parquet allowance overflow"), reads_projection() ? 1U : 0U, false, 0, false, physical_.continuation_descriptors()};
+ }
+ [[nodiscard]] std::uint64_t live_bytes(std::uint64_t pool_bytes) const {
+  // The future pool cap and its currently allocated bytes overlap. Every
+  // published batch shares this entire pool, including older live batches.
+  return mmltk::common::math::checked_add(physical_.workspace_bytes(), pool_bytes, "COCONut live input overflow");
+ }
+};
 // Allocation and cross-thread batch destruction share this heap owner. The
 // underlying cap remains 256 MiB; serializing its check makes that cap exact.
 class ParquetPool final : public arrow::MemoryPool {
@@ -276,18 +302,19 @@ void CoconutAnnotationRecords::rebase_parquet_segments() {
  }
 }
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only, BenchmarkCompilePipeline* execution, const std::function<void(std::size_t)>& retire_consumer_scratch, const BenchmarkAllowance& parent, BenchmarkResources consumer_resources, CoconutAnnotationRecords* retained,
+ const CoconutRecordConsumer& consumer, bool metadata_only, BenchmarkCompilePipeline* execution, const std::function<void(std::size_t)>& retire_consumer_scratch, const BenchmarkAllowance& parent, CoconutPhysicalInputRequirement physical_input, CoconutAnnotationRecords* retained,
  const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace, const std::function<void(const BenchmarkAllowance&)>& retire_consumer_input) {
  using mmltk::common::math::checked_add;
  using mmltk::common::math::checked_multiply;
  CoconutAnnotationRecords local;
  if (!retained) retained = &local;
+ const ParquetCallEnvelope envelope(metadata_only, retained->parquet && retained->parquet->metadata_ready, physical_input);
  if (!retained->parquet) {
   auto catalog = std::make_shared<CoconutParquetMetadata>();
   std::uint64_t rows = 0;
   for (const auto& path : shards) {
    throw_if_benchmark_cancelled(cancellation);
-   auto allowance = execution ? execution->reserve({kParquetPoolBytes, 1}, parent) : BenchmarkAllowance{};
+   auto allowance = execution ? execution->reserve(envelope.discovery_demand(), parent) : BenchmarkAllowance{};
    auto pool = std::make_shared<ParquetPool>(allowance);
    // Declared before reader/batches: all library readers close before this
    // guard returns descriptors, including cancellation and consumer throws.
@@ -325,24 +352,13 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
  auto catalog = retained->parquet;
  if (catalog->shards.size() != shards.size()) malformed("retained shard generation mismatch");
  for (std::size_t i = 0; i < shards.size(); ++i) if (catalog->shards[i].path != shards[i]) malformed("retained shard path mismatch");
- // The call mode fixes all future reader/descriptor needs. A warm metadata-only
- // call never creates Arrow state; every call that can read a projection reserves
- // the full pool cap and physical continuation before its first reader exists.
- const bool uses_arrow = !metadata_only || !catalog->metadata_ready;
- auto sequence_resources = consumer_resources;
- // The physical owner separately admits its small retained lease control.
- // These bytes include decoder backing, even when no Arrow projection is read.
- sequence_resources.retained_handles = false;
- if (uses_arrow) sequence_resources = {checked_add(kParquetPoolBytes, consumer_resources.bytes, "COCONut Parquet input overflow"), 1, false, 0, false,
-  checked_add(consumer_resources.descriptors, consumer_resources.continuation_descriptors, "COCONut Parquet continuation overflow")};
  // Each existing parallel range owns one forward Arrow/physical continuation.
  // Groups still publish independently; only their current batch is transient.
  struct Sequence {
   BenchmarkCompilePipeline* execution;
   const BenchmarkAllowance& parent;
   const std::function<void(const BenchmarkAllowance&)>& retire_input;
-  const BenchmarkResources resources;
-  const bool uses_arrow;
+  const ParquetCallEnvelope& envelope;
   bool active = false;
   BenchmarkAllowance allowance;
   std::shared_ptr<ParquetPool> pool;
@@ -364,14 +380,10 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    catch (...) { allowance.retire_descriptors(); } // Unwinding keeps any unsplit pool promise until its last batch.
   }
   std::uint64_t live_bytes() const {
-   // The future cap and the exact live pool are overlapping custody, not two
-   // allocations. Published batches keep all their pool bytes in this amount.
-   return mmltk::common::math::checked_add(resources.bytes - (uses_arrow ? kParquetPoolBytes : 0),
-    pool ? static_cast<std::uint64_t>(pool->bytes_allocated()) : 0, "COCONut live input overflow");
+   return envelope.live_bytes(pool ? static_cast<std::uint64_t>(pool->bytes_allocated()) : 0);
   }
   void ensure(std::uint64_t workspace) {
-   auto demand = resources;
-   demand.bytes = mmltk::common::math::checked_add(demand.bytes, workspace, "COCONut Parquet allowance overflow");
+   const auto demand = envelope.demand(workspace);
    // Every transition keeps the same future cap (hence every live pool/batch
    // allocation) and complete descriptor promise. Only excess group work varies.
    if (active && (!execution || allowance.try_resize_workspace(demand.bytes, !execution->resource_pressure()))) return;
@@ -380,21 +392,21 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    // typed row and group cursor survive; no Parquet prefix is skipped/reparsed.
    close();
    allowance = execution ? execution->reserve(demand, parent) : BenchmarkAllowance{};
-   if (uses_arrow) pool = std::make_shared<ParquetPool>(allowance);
+   if (envelope.reads_projection()) pool = std::make_shared<ParquetPool>(allowance);
    active = true;
   }
  };
  const auto workers = execution ? execution->workers() : std::size_t{1};
  mmltk::common::concurrency::parallel_for_range_indexed(std::size_t{0}, catalog->groups.size(), mmltk::common::math::checked_cast<int>(workers, "COCONut Parquet worker count overflow"),
   [&](int, std::size_t begin, std::size_t end) {
-   Sequence sequence{execution, parent, retire_consumer_input, sequence_resources, uses_arrow};
+   Sequence sequence{execution, parent, retire_consumer_input, envelope};
    const auto group_work = [&](std::size_t group_index, bool image_pass) {
     auto& group = retained->groups[group_index];
     const auto position = catalog->groups[group_index];
     const auto& shard = catalog->shards[position.shard];
     throw_if_benchmark_cancelled(cancellation);
     try {
-     if (image_pass && catalog->metadata_ready) {
+     if (image_pass && !envelope.needs_metadata()) {
       sequence.ensure(0);
       const auto& allowance = sequence.allowance;
       for (auto row = group.first_row; row < group.first_row + group.rows; ++row) consumer(group_index, retained->records[static_cast<std::size_t>(row)], CoconutAnnotationInput{{}, allowance, {}, sequence.live_bytes(), true});
@@ -472,13 +484,13 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
     // Cold imports publish metadata group by group, then grow using that
     // group's actual dimensions. Successful growth preserves the same decoder;
     // pressure may reopen it and replay a physical prefix, never a row prefix.
-    if (!metadata_only && !catalog->metadata_ready) group_work(group, true);
-    group_work(group, metadata_only);
+    if (envelope.full() && envelope.needs_metadata()) group_work(group, true);
+    group_work(group, !envelope.full());
    }
    sequence.close();
   });
  catalog->metadata_ready = true;
- if (!metadata_only) {
+ if (envelope.full()) {
   const auto rebase = [&](std::size_t) { retained->rebase_parquet_segments(); };
   if (execution) execution->run(BenchmarkStage::Metadata, {}, rebase); else rebase(0);
  }

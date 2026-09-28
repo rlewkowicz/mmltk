@@ -4469,14 +4469,16 @@ TEST_CASE("complete physical continuations progress beside Curl at low descripto
  std::future<void> first, second;
  const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); held.Release(); });
  const std::array paths{parquet};
- auto consumer = archive_image_resources();
- consumer.bytes = workspace;
+ const auto consumer = CoconutPhysicalInputRequirement::archive(workspace);
  const auto consume = [&](bool initial) {
   read_coconut_parquet(paths, {}, cancellation, [&](std::size_t, const CoconutRecord&, const CoconutAnnotationInput& batch) {
    const auto& allowance = batch.allowance;
    if (!initial) second_admitted.set_value();
    const std::lock_guard lock(reader_mutex);
-   auto physical = ArtifactLease::acquire_charged(root.path() / "physical.lock", cancellation, &execution, archive_image_resources(), allowance);
+   CHECK(allowance.bytes() >= (256ULL << 20) + consumer.workspace_bytes());
+   CHECK(allowance.descriptors() == 1);
+   CHECK(batch.live_bytes >= consumer.workspace_bytes());
+   auto physical = ArtifactLease::acquire_charged(root.path() / "physical.lock", cancellation, &execution, consumer.lease_controls(), allowance);
    BenchmarkArchive input(archive, &execution, 1024, physical->allowance(), 1, true, allowance);
    if (initial) held.receipt().ArriveAndWait();
    auto output_handles = execution.reserve(BenchmarkResources::handles(2, true), physical->allowance());
@@ -4913,8 +4915,11 @@ TEST_CASE("physical owner withdraws only affected routes and refreshes their con
  base.image_id = 7; base.file_name = "000000000007.jpg";
  CoconutRecord large;
  large.image_id = 601; large.physical_stem = "objects365_v2_00000001";
- const auto before = physical.resolution_resources(CoconutEdition::Base);
- const auto other = physical.resolution_resources(CoconutEdition::Large);
+ const auto before = physical.input_requirement(CoconutEdition::Base);
+ const auto other = physical.input_requirement(CoconutEdition::Large);
+ CHECK(before.lease_controls().retained_handles);
+ CHECK(before.lease_controls().bytes == archive_image_resources().bytes);
+ CHECK(before.continuation_descriptors() == 5);
  const auto original = physical.resolve(CoconutEdition::Base, "base", base, {});
  physical.release_readers(CoconutEdition::Base);
  const auto independent = physical.resolve(CoconutEdition::Large, "large", large, {});
@@ -4945,8 +4950,8 @@ TEST_CASE("physical owner withdraws only affected routes and refreshes their con
  std::filesystem::rename(replacement, train.download.path);
  train.download.identity = "changed-physical-generation";
  train.resolution_workspace = BenchmarkArchive::workspace_bytes(train.download.path, 64ULL << 20);
- CHECK(physical.resolution_resources(CoconutEdition::Base).bytes > before.bytes);
- CHECK(physical.resolution_resources(CoconutEdition::Large).bytes == other.bytes);
+ CHECK(physical.input_requirement(CoconutEdition::Base).workspace_bytes() > before.workspace_bytes());
+ CHECK(physical.input_requirement(CoconutEdition::Large).workspace_bytes() == other.workspace_bytes());
  CHECK(physical.resolve(CoconutEdition::Large, "large", large, {}) == independent);
  REQUIRE(::stat(other_path.c_str(), &second) == 0);
  CHECK(first.st_ino == second.st_ino);
@@ -5049,10 +5054,11 @@ TEST_CASE("oversized gzip storage admits its synchronous pixel continuation", "[
 }
 
 TEST_CASE("retained Parquet metadata joins group ordinals and owns batches after reader retirement", "[benchmark][coconut][parquet][pipeline]") {
- bool fail = false, cancel = false;
+ bool fail = false, cancel = false, allocation_failure = false;
  SECTION("successful reader retirement") {}
  SECTION("consumer failure with a retained batch") { fail = true; }
  SECTION("cancellation with a retained batch") { cancel = true; }
+ SECTION("partial consumer allocation with a retained batch") { allocation_failure = true; }
  ScopedTempDir root("parquet-batch-lifetime");
  const std::array<std::uint32_t, 1> pixels{1};
  const auto encoded = png(1, 1, pixels);
@@ -5074,18 +5080,20 @@ TEST_CASE("retained Parquet metadata joins group ordinals and owns batches after
   read_coconut_parquet(paths, {}, cancellation, [&](std::size_t, const CoconutRecord& record, const CoconutAnnotationInput& input) {
    CHECK_FALSE(input.membership);
    CHECK(record.file_name == names[record.source_ordinal]);
-   if (!retained.backing && (fail || cancel || record.source_ordinal == 2)) {
+   if (!retained.backing && (fail || cancel || allocation_failure || record.source_ordinal == 2)) {
     retained = input;
     if (cancel) cancelled.store(true);
+    if (allocation_failure) throw std::bad_alloc{};
     if (fail) throw std::runtime_error("retained PNG consumer failed");
    }
   }, false, &execution, {}, {}, {}, &records);
  };
- if (fail || cancel) CHECK_THROWS(consume()); else consume();
+ if (allocation_failure) CHECK_THROWS_AS(consume(), std::bad_alloc);
+ else if (fail || cancel) CHECK_THROWS(consume()); else consume();
  REQUIRE(retained.backing);
  CHECK(std::string(retained.png.begin(), retained.png.end()) == encoded);
  CHECK(retained.allowance.descriptors() == 0);
- if (!fail && !cancel) {
+ if (!fail && !cancel && !allocation_failure) {
   CHECK(records.records[0].first_segment_ordinal == 0);
   CHECK(records.records[1].first_segment_ordinal == 2);
   CHECK(records.records[2].first_segment_ordinal == 3);
@@ -5093,6 +5101,14 @@ TEST_CASE("retained Parquet metadata joins group ordinals and owns batches after
  }
  records.discard();
  CHECK(std::string(retained.png.begin(), retained.png.end()) == encoded);
+ // The batch keeps its whole heap pool, including array/offset storage beyond
+ // the borrowed PNG extent, after every reader/footer descriptor has retired.
+ CHECK_FALSE(execution.try_reserve({(256ULL << 20) - retained.png.size(), 13}));
+ for (const auto& descriptor : std::filesystem::directory_iterator("/proc/self/fd")) {
+  std::error_code error;
+  const auto path = std::filesystem::read_symlink(descriptor.path(), error);
+  if (!error) for (const auto& input : paths) CHECK(path != input);
+ }
  const std::weak_ptr<const void> backing = retained.backing;
  retained = {};
  CHECK(backing.expired());
@@ -5391,8 +5407,12 @@ TEST_CASE("consecutive Parquet groups retain compressed physical progress with b
  }, true, &execution, {}, {}, {}, &retained);
  BenchmarkAllowance first, blocker;
  std::size_t metadata_rows = 0, payload_rows = 0, retired_inputs = 0, retired_groups = 0;
+ const auto requirement = physical.input_requirement(CoconutEdition::Base);
  const auto consume = [&] {
   read_coconut_parquet(paths, {}, cancellation, [&](std::size_t group, const CoconutRecord& record, const CoconutAnnotationInput& input) {
+   CHECK(input.allowance.bytes() >= (256ULL << 20) + requirement.workspace_bytes());
+   CHECK(input.allowance.descriptors() == 1);
+   CHECK(input.live_bytes > requirement.workspace_bytes());
    CHECK(record.source_ordinal == group);
    CHECK(record.image_id == group + 1);
    const auto membership = physical.resolve(CoconutEdition::Base, "forward-gzip", record, input.allowance);
@@ -5421,7 +5441,7 @@ TEST_CASE("consecutive Parquet groups retain compressed physical progress with b
    if (!cancelled.load()) execution.with_unused_workspace(input.allowance, input.live_bytes, [&] {
     execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) { execution.cooperate(); }, input.allowance);
    });
-  }, false, &execution, [&](std::size_t) { ++retired_groups; }, {}, physical.resolution_resources(CoconutEdition::Base), &retained,
+  }, false, &execution, [&](std::size_t) { ++retired_groups; }, {}, requirement, &retained,
   [](const CoconutRecord& record) { return std::uint64_t{record.width} * record.height * 1024; },
   [&](const BenchmarkAllowance& producer) {
    ++retired_inputs;
@@ -5527,8 +5547,8 @@ TEST_CASE("repeated warm Parquet membership owns transient physical workspace wi
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13}, cancellation);
  CoconutPhysicalMembership physical(admitted, catalog, true, cache, execution.storage(), execution, cancellation);
- const auto resources = physical.resolution_resources(CoconutEdition::Base);
- REQUIRE(resources.retained_handles); // The physical lease-control vocabulary stays distinct.
+ const auto resources = physical.input_requirement(CoconutEdition::Base);
+ REQUIRE(resources.lease_controls().retained_handles);
  const std::array paths{root.path() / "records.parquet"};
  parquet_file(paths[0], rows);
  auto retained = std::make_shared<CoconutAnnotationRecords>();
@@ -5546,8 +5566,8 @@ TEST_CASE("repeated warm Parquet membership owns transient physical workspace wi
   read_coconut_parquet(paths, {}, cancellation, [&](std::size_t group, const CoconutRecord& record, const CoconutAnnotationInput& input) {
    CHECK(input.membership); CHECK(input.png.empty()); CHECK_FALSE(input.backing);
    CHECK(record.source_ordinal == group); CHECK(record.image_id == group + 1);
-   CHECK(input.allowance.bytes() == resources.bytes); CHECK(input.live_bytes == resources.bytes);
-   CHECK(input.allowance.descriptors() == resources.descriptors);
+   CHECK(input.allowance.bytes() == resources.workspace_bytes()); CHECK(input.live_bytes == resources.workspace_bytes());
+   CHECK(input.allowance.descriptors() == 0); // Every physical descriptor is a continuation, with no Arrow reader.
    if (!first) first = input.allowance; else CHECK(first.aliases(input.allowance));
    CHECK_FALSE(execution.try_reserve({execution.transient_target(), 0, true}));
    const auto member = physical.resolve(CoconutEdition::Base, "warm-membership", record, input.allowance);

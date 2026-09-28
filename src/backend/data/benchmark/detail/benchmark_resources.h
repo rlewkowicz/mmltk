@@ -46,6 +46,8 @@ public:
  // The backing owner calls this only after joining its workers and releasing
  // its own storage. Aliases keep descriptor commitments; split storage children
  // keep their separately charged bytes. External CPU capacity retires here too.
+ // Accounting waits for any remaining CPU frames and stable offer scope to
+ // settle; the request never releases physical storage on the owner's behalf.
  void retire_workspace() const noexcept;
  // After physically closing this owner's files and completing its descriptor
  // production, return its draw and unused promises. Published consumers must
@@ -53,7 +55,9 @@ public:
  // owner; aliases and split storage cannot return the same promise twice.
  void retire_descriptors() const noexcept;
  // Partition an already admitted storage envelope, without another ledger
- // charge. Use before publishing the allowance to readers.
+ // charge. Use before publishing the allowance to readers and outside any
+ // unused-workspace offer. Positive storage keeps its own workspace loans;
+ // descriptor-only aliases retain none after the backing owner retires bytes.
  [[nodiscard]] BenchmarkAllowance split_storage(std::uint64_t);
 private:
  friend class BenchmarkCompilePipeline;

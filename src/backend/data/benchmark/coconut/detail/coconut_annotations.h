@@ -2,6 +2,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/common/concurrency/cancellation_observation.h"
@@ -21,7 +22,6 @@
 namespace mmltk::backend::data::benchmark_internal {
 class BenchmarkCompilePipeline;
 class StorageReservationPool;
-class CoconutPhysicalMembership;
 class CoconutMaskRecovery;
 struct CoconutCompletionFacts {
  CoconutEdition edition = CoconutEdition::Base;
@@ -136,7 +136,7 @@ struct CoconutAnnotationInput {
 // is separate from noexcept input retirement at sequence end or failed growth.
 using CoconutRecordConsumer = std::function<void(std::size_t group, const CoconutRecord&, const CoconutAnnotationInput&)>;
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only = false, BenchmarkCompilePipeline* execution = nullptr, const std::function<void(std::size_t)>& retire_consumer_scratch = {}, const BenchmarkAllowance& parent = {}, BenchmarkResources consumer_resources = {}, CoconutAnnotationRecords* retained = nullptr,
+ const CoconutRecordConsumer& consumer, bool metadata_only = false, BenchmarkCompilePipeline* execution = nullptr, const std::function<void(std::size_t)>& retire_consumer_scratch = {}, const BenchmarkAllowance& parent = {}, CoconutPhysicalInputRequirement physical_input = {}, CoconutAnnotationRecords* retained = nullptr,
  const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace = {}, const std::function<void(const BenchmarkAllowance&)>& retire_consumer_input = {});
 struct CoconutImportRequest {
  BenchmarkCompilePipeline* execution = nullptr;

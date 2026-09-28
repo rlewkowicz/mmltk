@@ -54,14 +54,36 @@ struct BenchmarkWorkspaceOffer {
  std::size_t borrowers = 0;
 };
 struct BenchmarkAllowance::Credits {
+ // Mutation occurs under Admission::mutex. Snapshot allocation precedes every
+ // borrower-count change, so allocation failure leaves both custodians intact.
+ // Aliases share this set; a storage partition clones it before moving bytes.
+ class Loans final {
+  std::vector<std::shared_ptr<BenchmarkWorkspaceOffer>> offers_;
+ public:
+  Loans() = default;
+  Loans(const Loans&) = delete;
+  Loans& operator=(const Loans&) = delete;
+  [[nodiscard]] bool empty() const noexcept { return offers_.empty(); }
+  void attach(const std::vector<std::shared_ptr<BenchmarkWorkspaceOffer>>& offers) {
+   auto snapshot = offers;
+   retire();
+   offers_.swap(snapshot);
+   for (const auto& offer : offers_) ++offer->borrowers;
+  }
+  void clone(const Loans& source) { attach(source.offers_); }
+  void retire() noexcept {
+   for (const auto& offer : offers_) --offer->borrowers;
+   offers_.clear();
+  }
+ } workspace_loans;
  std::shared_ptr<BenchmarkCompilePipeline::Admission> owner;
  BenchmarkResources resources;
  std::shared_ptr<Credits> parent;
  std::size_t available = 0, borrowed = 0, cpu_users = 0;
  bool charged = false;
  bool descriptors_retired = false;
+ bool workspace_retirement_pending = false;
  std::shared_ptr<BenchmarkWorkspaceOffer> workspace_offer;
- std::vector<std::shared_ptr<BenchmarkWorkspaceOffer>> workspace_loans;
  Credits(std::shared_ptr<BenchmarkCompilePipeline::Admission> value, BenchmarkResources demand, std::shared_ptr<Credits> producing)
   : owner(std::move(value)), resources(demand), parent(std::move(producing)), available(demand.continuation_descriptors) {}
  ~Credits();
@@ -71,7 +93,9 @@ struct BenchmarkCompilePipeline::Admission {
  std::condition_variable changed;
  std::uint64_t generation = 0;
  std::function<void()> transport_wakeup;
- std::uint64_t target = 0, bytes = 0, handle_bytes = 0;
+ std::uint64_t target = 0, bytes = 0, handle_bytes = 0, offered_bytes = 0;
+ // Only positive offers participate. Zero-capacity scopes still retain their
+ // Credits sentinel, preventing reentry/resize without joining unrelated loans.
  std::vector<std::shared_ptr<BenchmarkWorkspaceOffer>> workspace_offers;
  std::size_t descriptor_capacity = 0, descriptors = 0, committed = 0;
  std::size_t cpu_capacity = 0, active = 0, external_cpus = 0, waiters = 0, resource_waiters = 0;
@@ -117,13 +141,7 @@ struct BenchmarkCompilePipeline::Admission {
   if (fits(value, parent)) return true;
   if (value.producer || value.cpu_workers || value.retained_handles || !value.bytes || !feasible(value) ||
       value.descriptors + value.continuation_descriptors > descriptor_room(value, parent) || value.bytes > target) return false;
-  std::uint64_t unused = 0;
-  for (const auto& offer : workspace_offers) unused += offer->bytes;
-  return unused <= bytes && bytes - unused <= target - value.bytes;
- }
- static void retire_loans(Credits& credit) noexcept {
-  for (const auto& offer : credit.workspace_loans) --offer->borrowers;
-  credit.workspace_loans.clear();
+  return offered_bytes <= bytes && bytes - offered_bytes <= target - value.bytes;
  }
  // Returned child promises pass through ancestors whose descriptor work has
  // explicitly ended. Only live ancestors can promise them to a new child.
@@ -142,7 +160,7 @@ struct BenchmarkCompilePipeline::Admission {
   return demand.bytes <= held.bytes && demand.descriptors <= held.descriptors && demand.cpu_workers <= held.cpu_workers && (!demand.bytes || demand.retained_handles == held.retained_handles) &&
    (!demand.producer || held.producer) && demand.continuation_descriptors <= credit.available;
  }
- void charge(Credits& credit) {
+ void charge(Credits& credit, bool borrow_workspace = false) {
   using mmltk::common::math::checked_add;
   const auto value = credit.resources;
   const auto claim = checked_add(value.descriptors, value.continuation_descriptors, "benchmark continuation admission overflow");
@@ -152,6 +170,9 @@ struct BenchmarkCompilePipeline::Admission {
   const auto next_descriptors = checked_add(descriptors, value.descriptors, "benchmark descriptor admission overflow");
   const auto next_commitment = checked_add(committed - borrowed, value.continuation_descriptors, "benchmark continuation admission overflow");
   const auto next_cpus = checked_add(external_cpus, value.cpu_workers, "benchmark CPU admission overflow");
+  // Every active positive offer participates conservatively. Allocate the
+  // snapshot before committing any ledger state; nothing below can throw.
+  if (borrow_workspace) credit.workspace_loans.attach(workspace_offers);
   storage = next_bytes;
   descriptors = next_descriptors;
   committed = next_commitment;
@@ -160,10 +181,26 @@ struct BenchmarkCompilePipeline::Admission {
   if (credit.parent) credit.parent->available -= borrowed;
   credit.charged = true;
  }
+ // The physical owner requests retirement after freeing its backing. A CPU
+ // frame or stable lending window may still use this credit's commitment.
+ // Return detached ancestry to a caller that destroys it outside the mutex.
+ [[nodiscard]] std::shared_ptr<Credits> retire_workspace(Credits& credit) noexcept {
+  if (!credit.workspace_retirement_pending || credit.cpu_users || credit.workspace_offer) return {};
+  credit.workspace_retirement_pending = false;
+  auto& value = credit.resources;
+  external_cpus -= std::exchange(value.cpu_workers, 0);
+  (value.retained_handles ? handle_bytes : bytes) -= std::exchange(value.bytes, 0);
+  credit.workspace_loans.retire();
+  ++generation;
+  if (transport_wakeup) transport_wakeup();
+  // Live descriptor draws still need their producing promise chain. Storage
+  // descendants retain their own charges and loans regardless of this parent.
+  return credit.borrowed ? std::shared_ptr<Credits>{} : std::move(credit.parent);
+ }
  void release(Credits& credit) noexcept {
   { const std::lock_guard lock(mutex);
    const auto value = credit.resources;
-   retire_loans(credit);
+   credit.workspace_loans.retire();
    (value.retained_handles ? handle_bytes : bytes) -= value.bytes;
    descriptors -= value.descriptors;
    external_cpus -= value.cpu_workers;
@@ -189,6 +226,48 @@ struct BenchmarkCompilePipeline::Admission {
   ~Waiter() { owner.change_waiters(false, resource); }
   Waiter(const Waiter&) = delete;
   Waiter& operator=(const Waiter&) = delete;
+ };
+ class OfferScope final {
+  std::shared_ptr<Credits> producer_;
+  std::shared_ptr<BenchmarkWorkspaceOffer> offer_ = std::make_shared<BenchmarkWorkspaceOffer>();
+ public:
+  // Construct only while holding the producing admission's mutex. Publication
+  // is the last throwing transition; this scope then owns withdrawal/reclaim.
+  OfferScope(std::shared_ptr<Credits> producer, std::uint64_t live_bytes) : producer_(std::move(producer)) {
+   auto& owner = *producer_->owner;
+   const auto& resources = producer_->resources;
+   if (resources.retained_handles || live_bytes > resources.bytes || !producer_->workspace_loans.empty() || producer_->workspace_retirement_pending)
+    throw std::invalid_argument("benchmark workspace offer exceeds stable input custody");
+   if (producer_->workspace_offer) throw std::invalid_argument("benchmark input already offers unused workspace");
+   offer_->bytes = resources.bytes - live_bytes;
+   const auto total = mmltk::common::math::checked_add(owner.offered_bytes, offer_->bytes, "benchmark workspace offer overflow");
+   if (offer_->bytes) owner.workspace_offers.push_back(offer_);
+   producer_->workspace_offer = offer_;
+   owner.offered_bytes = total;
+   ++owner.generation;
+   owner.changed.notify_all();
+  }
+  ~OfferScope() noexcept {
+   auto& owner = *producer_->owner;
+   std::shared_ptr<Credits> retired_parent;
+   std::unique_lock lock(owner.mutex);
+   if (offer_->bytes) std::erase(owner.workspace_offers, offer_);
+   owner.offered_bytes -= offer_->bytes;
+   ++owner.generation;
+   owner.changed.notify_all();
+   if (offer_->borrowers) {
+    // Withdrawal prevents new borrowers first. Actual idle/active storage must
+    // retire even on callback failure/cancellation; this wait needs no polling
+    // and never replaces the callback's original exception.
+    Waiter reclaim(owner, true);
+    owner.changed.wait(lock, [&] { return offer_->borrowers == 0; });
+   }
+   producer_->workspace_offer.reset();
+   retired_parent = owner.retire_workspace(*producer_);
+   owner.changed.notify_all();
+  }
+  OfferScope(const OfferScope&) = delete;
+  OfferScope& operator=(const OfferScope&) = delete;
  };
 };
 BenchmarkAllowance::Credits::~Credits() { if (charged) owner->release(*this); }
@@ -223,6 +302,7 @@ struct BenchmarkCompilePipeline::Impl {
   BenchmarkAllowance allowance, parent;
   std::variant<const std::function<void(std::size_t)>*, Slot*> work{static_cast<const std::function<void(std::size_t)>*>(nullptr)};
   [[nodiscard]] Slot* pixel() const { const auto* value = std::get_if<Slot*>(&work); return value ? *value : nullptr; }
+  [[nodiscard]] bool finite_borrower() const;
   Job* next = nullptr;
   Job* previous = nullptr;
   WorkGroup* group = nullptr;
@@ -395,8 +475,9 @@ struct BenchmarkCompilePipeline::Impl {
    if (!entered) return;
    auto retired = std::move(allowance);
    auto cpu = std::move(cpu_credit);
+   std::shared_ptr<Credits> retired_parent;
    { const std::lock_guard lock(owner.mutex);
-    if (cpu) --cpu->cpu_users;
+    if (cpu) { --cpu->cpu_users; retired_parent = owner.admission->retire_workspace(*cpu); }
     owner.lanes[lane].active = parent;
     if (!parent) { --owner.admission->active; ++owner.admission->generation; }
     current = previous;
@@ -433,13 +514,7 @@ struct BenchmarkCompilePipeline::Impl {
  }
  BenchmarkAllowance charge(BenchmarkResources resources, const BenchmarkAllowance& parent = {}, bool finite_pixel = false) {
   auto credits = std::make_shared<Credits>(admission, resources, parent.credits_);
-  if (finite_pixel && !admission->fits(resources, parent.credits_.get())) {
-   // Every concurrent offer participates in this finite admission. The small
-   // shared loan follows actual workspace through retirement and partitions.
-   credits->workspace_loans = admission->workspace_offers;
-  }
-  admission->charge(*credits);
-  for (const auto& offer : credits->workspace_loans) ++offer->borrowers;
+  admission->charge(*credits, finite_pixel && !admission->fits(resources, parent.credits_.get()));
   return BenchmarkAllowance(std::move(credits));
  }
  void check_admission() const {
@@ -505,15 +580,8 @@ void BenchmarkAllowance::retire_workspace() const noexcept {
  auto& owner = *credits_->owner;
  std::shared_ptr<Credits> parent;
  { const std::lock_guard lock(owner.mutex);
-  auto& resources = credits_->resources;
-  owner.external_cpus -= std::exchange(resources.cpu_workers, 0);
-  (resources.retained_handles ? owner.handle_bytes : owner.bytes) -= std::exchange(resources.bytes, 0);
-  BenchmarkCompilePipeline::Admission::retire_loans(*credits_);
-  // Descriptor commitments still follow their children. A stream without a
-  // descriptor draw no longer needs its producing directory/control chain.
-  if (!credits_->borrowed) parent = std::move(credits_->parent);
-  ++owner.generation;
-  if (owner.transport_wakeup) owner.transport_wakeup();
+  credits_->workspace_retirement_pending = true;
+  parent = owner.retire_workspace(*credits_);
  }
  owner.changed.notify_all();
 }
@@ -546,17 +614,22 @@ BenchmarkAllowance BenchmarkAllowance::split_storage(std::uint64_t bytes) {
  auto storage = std::make_shared<Credits>(credits_->owner, BenchmarkResources{bytes, 0}, credits_);
  { const std::lock_guard lock(owner.mutex);
   if (credits_->resources.retained_handles || bytes > credits_->resources.bytes) throw std::invalid_argument("benchmark storage partition exceeds its admitted envelope");
-  if (bytes) {
-   storage->workspace_loans = credits_->workspace_loans;
-   for (const auto& offer : storage->workspace_loans) ++offer->borrowers;
-  }
+  if (credits_->workspace_offer || credits_->workspace_retirement_pending) throw std::logic_error("benchmark storage partition requires a settled input window");
+  if (bytes) storage->workspace_loans.clone(credits_->workspace_loans);
   credits_->resources.bytes -= bytes;
-  if (!credits_->resources.bytes) BenchmarkCompilePipeline::Admission::retire_loans(*credits_);
+  if (!credits_->resources.bytes) credits_->workspace_loans.retire();
   storage->charged = true;
  }
  return BenchmarkAllowance(std::move(storage));
 }
 thread_local BenchmarkCompilePipeline::Impl::Frame* BenchmarkCompilePipeline::Impl::Frame::current = nullptr;
+bool BenchmarkCompilePipeline::Impl::Job::finite_borrower() const {
+ const auto* slot = pixel();
+ // Native ready pixels own their input and a writer with admitted output.
+ // The stage label alone cannot give arbitrary callbacks borrowing privilege.
+ return slot && stage == BenchmarkStage::Pixels && slot->input && slot->writer &&
+  !resources.producer && !resources.cpu_workers && !resources.retained_handles;
+}
 bool BenchmarkCompilePipeline::Impl::Lane::owns(const void* identity) const {
  if (!identity) return false;
  for (auto* frame = active; frame; frame = frame->parent) if (frame->scratch == identity) return true;
@@ -727,7 +800,7 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
     // still borrows, or steal that frame's grant during pressure retirement.
     if (local.owns(identity)) return false;
     const bool reusable = candidate.stage != BenchmarkStage::Header && identity && local.idle.owner() == identity && Admission::covers(*local.idle.allowance.credits_, candidate.resources);
-    return candidate.allowance || reusable || ((candidate.pixel() && candidate.stage == BenchmarkStage::Pixels)
+    return candidate.allowance || reusable || (candidate.finite_borrower()
      ? admission->finite_pixel_fits(candidate.resources, candidate.parent.credits_.get()) : admission->fits(candidate.resources, candidate.parent.credits_.get()));
    };
    const bool prefer_metadata = membership_pending && metadata_streak < 2;
@@ -762,7 +835,7 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
     } else if (local.idle.owner() != identity || job->stage != BenchmarkStage::Header) take_idle(lane);
    }
    if (invoke && !job->allowance) {
-    try { job->allowance = charge(job->resources, job->parent, job->pixel() && job->stage == BenchmarkStage::Pixels); } catch (...) { job->failure = std::current_exception(); }
+    try { job->allowance = charge(job->resources, job->parent, job->finite_borrower()); } catch (...) { job->failure = std::current_exception(); }
    }
    frame.enter(std::move(job->allowance), identity);
    return true;
@@ -1112,34 +1185,14 @@ void BenchmarkCompilePipeline::with_unused_workspace(const BenchmarkAllowance& a
  const auto* frame = Impl::Frame::current;
  if (frame && &frame->owner == impl_.get()) throw std::logic_error("benchmark workspace lending cannot wait inside a CPU lane");
  if (!allowance.credits_ || allowance.credits_->owner != impl_->admission) throw std::invalid_argument("benchmark workspace offer requires owned credits");
- auto offer = std::make_shared<BenchmarkWorkspaceOffer>();
  {
-  const std::lock_guard lock(impl_->mutex);
-  impl_->check_admission();
-  const auto& resources = allowance.credits_->resources;
-  if (resources.retained_handles || live_bytes > resources.bytes || !allowance.credits_->workspace_loans.empty())
-   throw std::invalid_argument("benchmark workspace offer exceeds stable input custody");
-  if (allowance.credits_->workspace_offer)
-   throw std::invalid_argument("benchmark input already offers unused workspace");
-  offer->bytes = resources.bytes - live_bytes;
-  impl_->admission->workspace_offers.push_back(offer);
-  allowance.credits_->workspace_offer = offer;
-  ++impl_->admission->generation;
+  const auto offer = [&] {
+   const std::lock_guard lock(impl_->mutex);
+   impl_->check_admission();
+   return Admission::OfferScope(allowance.credits_, live_bytes);
+  }();
+  callback();
  }
- impl_->changed.notify_all();
- std::exception_ptr failure;
- try { callback(); } catch (...) { failure = std::current_exception(); }
- {
-  std::unique_lock lock(impl_->mutex);
-  std::erase(impl_->admission->workspace_offers, offer);
-  ++impl_->admission->generation;
-  // Mark pressure even when no further job is queued. Idle scratch is real
-  // borrowed storage; a descriptor-only alias no longer carries its loan.
-  Admission::Waiter reclaim(*impl_->admission, true);
-  impl_->wait(lock, [&] { return offer->borrowers == 0; });
-  allowance.credits_->workspace_offer.reset();
- }
- if (failure) std::rethrow_exception(failure);
  const std::lock_guard lock(impl_->mutex);
  impl_->check_admission();
 }

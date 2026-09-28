@@ -1039,9 +1039,9 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
  return result;
 }
 std::vector<CoconutRecord> xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecords& retained) {
- const auto consumer = request.physical_membership->resolution_resources(request.edition);
- const auto workspace = mmltk::common::math::checked_add(128ULL << 20, consumer.bytes, "COCONut discovery consumer envelope overflow");
- auto owned = std::make_shared<Archive>(request.mask_archive, request.execution, workspace, request.parent_allowance, 1, true, BenchmarkAllowance{}, 1024, consumer.descriptors + consumer.continuation_descriptors);
+ const auto consumer = request.physical_membership->input_requirement(request.edition);
+ const auto workspace = mmltk::common::math::checked_add(128ULL << 20, consumer.workspace_bytes(), "COCONut discovery consumer envelope overflow");
+ auto owned = std::make_shared<Archive>(request.mask_archive, request.execution, workspace, request.parent_allowance, 1, true, BenchmarkAllowance{}, 1024, consumer.continuation_descriptors());
  auto& archive = *owned;
  retained.archive = owned;
  std::map<std::string, CoconutRecord> records;
@@ -1095,12 +1095,12 @@ void consume_archive(const CoconutImportRequest& request, std::vector<CoconutRec
  // The library keeps its decompressor and encoded capacity until stream close.
  // Reserve that backing together with its largest legal synchronous consumer,
  // so a borrowed PNG never waits for the scratch needed to retire its input.
- const auto consumer = request.physical_membership->resolution_resources(request.edition);
+ const auto consumer = request.physical_membership->input_requirement(request.edition);
  const auto workspace = mmltk::common::math::checked_add(mmltk::common::math::checked_multiply(request.limits.max_png_bytes, 2U, "COCONut archive buffer overflow"),
-  mmltk::common::math::checked_add(normalizer_workspace, consumer.bytes, "COCONut retained physical consumer overflow"), "COCONut archive allowance overflow");
+  mmltk::common::math::checked_add(normalizer_workspace, consumer.workspace_bytes(), "COCONut retained physical consumer overflow"), "COCONut archive allowance overflow");
  const bool discovered = static_cast<bool>(owned);
  if (owned) owned->resume(workspace);
- else owned = std::make_shared<Archive>(request.mask_archive, request.execution, workspace, request.parent_allowance, 1, true, BenchmarkAllowance{}, 1024, consumer.descriptors + consumer.continuation_descriptors);
+ else owned = std::make_shared<Archive>(request.mask_archive, request.execution, workspace, request.parent_allowance, 1, true, BenchmarkAllowance{}, 1024, consumer.continuation_descriptors());
  auto& archive = *owned;
  struct RetireConsumer {
   Importer& importer;
@@ -1109,7 +1109,7 @@ void consume_archive(const CoconutImportRequest& request, std::vector<CoconutRec
  if (request.edition == CoconutEdition::XLarge && discovered) {
   archive.visit_known(wanted, [&](std::size_t index) {
    const auto png = archive.read(request.limits.max_png_bytes, request.cancellation);
-   importer.consume(records[index], png, archive.allowance(), mmltk::common::math::checked_add(archive.retained_workspace_bytes(), consumer.bytes, "COCONut retained archive workspace overflow"));
+   importer.consume(records[index], png, archive.allowance(), mmltk::common::math::checked_add(archive.retained_workspace_bytes(), consumer.workspace_bytes(), "COCONut retained archive workspace overflow"));
   }, request.cancellation);
   archive.pause();
   return;
@@ -1128,7 +1128,7 @@ void consume_archive(const CoconutImportRequest& request, std::vector<CoconutRec
   }
   if (consumed[found->second]) invalid("duplicate archive mask: " + archive.member());
   const auto png = archive.read(request.limits.max_png_bytes, request.cancellation);
-  importer.consume(records[found->second], png, archive.allowance(), mmltk::common::math::checked_add(archive.retained_workspace_bytes(), consumer.bytes, "COCONut retained archive workspace overflow"));
+  importer.consume(records[found->second], png, archive.allowance(), mmltk::common::math::checked_add(archive.retained_workspace_bytes(), consumer.workspace_bytes(), "COCONut retained archive workspace overflow"));
   consumed[found->second] = true;
   --remaining;
   // Parsed canonical records remain reusable until their source generation retires.
@@ -1247,7 +1247,7 @@ std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequ
   if (request.parquet_shards.empty()) invalid("missing Parquet shards");
   read_coconut_parquet(
    request.parquet_shards, request.limits, request.cancellation, [&](std::size_t group, const CoconutRecord& record, const CoconutAnnotationInput& input) { importer.consume_group(group, record, input); }, request.metadata_only, request.execution,
-   [&](std::size_t group) { importer.retire_group(group); }, request.parent_allowance, request.physical_membership->resolution_resources(request.edition), retained.get(),
+   [&](std::size_t group) { importer.retire_group(group); }, request.parent_allowance, request.physical_membership->input_requirement(request.edition), retained.get(),
    [&](const CoconutRecord& record) { return importer.maximum_workspace(record); },
    [&](const BenchmarkAllowance& producer) { request.physical_membership->release_readers(request.edition, producer); });
   importer.collect_groups(retained->groups);

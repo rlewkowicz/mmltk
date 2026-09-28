@@ -98,6 +98,8 @@ public:
  // Reclaims every borrowed physical workspace before returning or throwing;
  // callback and reclaim execute outside CPU lanes. The input owner must keep
  // its allocation window stable and include all of its consumers in live_bytes.
+ // Even a fully occupied window excludes reentry/resize, but contributes no
+ // positive offer and does not join another producer's borrowed workspace.
  void with_unused_workspace(const BenchmarkAllowance&, std::uint64_t live_bytes, const std::function<void()>&);
  // A synchronous library parser yields between bounded progress points.
  // Runs only already-ready work on its current lane, without waiting.

@@ -2,6 +2,7 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include "src/common/concurrency/cancellation_observation.h"
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -27,6 +28,22 @@ struct CoconutPhysicalName {
 [[nodiscard]] std::uint64_t parse_coconut_coco_member(std::string_view);
 void validate_coconut_physical_image(const CoconutPhysicalImage&);
 [[nodiscard]] std::span<const CoconutImageNamespace> coconut_release_sources(CoconutEdition);
+// One physical reader's future input. Lease/file controls remain separately
+// charged retained handles; the decoder and encoded bytes are transient backing
+// inside its producer's complete allowance. All dependent descriptors must be
+// promised before that producer acquires any input.
+class CoconutPhysicalInputRequirement final {
+public:
+ CoconutPhysicalInputRequirement() = default;
+ [[nodiscard]] static CoconutPhysicalInputRequirement archive(std::uint64_t workspace_bytes);
+ [[nodiscard]] BenchmarkResources lease_controls() const noexcept { return lease_; }
+ [[nodiscard]] std::uint64_t workspace_bytes() const noexcept { return workspace_bytes_; }
+ [[nodiscard]] std::size_t continuation_descriptors() const noexcept { return lease_.descriptors + lease_.continuation_descriptors; }
+private:
+ CoconutPhysicalInputRequirement(BenchmarkResources lease, std::uint64_t bytes) : lease_(lease), workspace_bytes_(bytes) {}
+ BenchmarkResources lease_;
+ std::uint64_t workspace_bytes_ = 0;
+};
 class CoconutPhysicalMembershipError final : public std::runtime_error {
 public:
  CoconutPhysicalMembershipError(CoconutEdition edition, std::uint64_t image_id, std::string message) : std::runtime_error(std::move(message)), edition_(edition), image_id_(image_id) {}
@@ -56,12 +73,12 @@ public:
  ~CoconutPhysicalMembership();
  CoconutPhysicalMembership(const CoconutPhysicalMembership&) = delete;
  CoconutPhysicalMembership& operator=(const CoconutPhysicalMembership&) = delete;
- [[nodiscard]] BenchmarkResources resolution_resources(CoconutEdition) const;
+ [[nodiscard]] CoconutPhysicalInputRequirement input_requirement(CoconutEdition) const;
  // A sequence retires only the physical reader drawing on its own promise;
  // another concurrent sequence's reader remains live. Empty means all readers.
  void release_readers(CoconutEdition, const BenchmarkAllowance& producer = {}) const;
  [[nodiscard]] bool eligible(CoconutEdition, const AdmittedRecipeArchive&) const;
- // Invalidates affected routes/joins and their cached resource envelope before
+ // Invalidates affected routes/joins and their cached input requirement before
  // the compiler mutates the admitted artifact; independent readers survive.
  void withdraw(const AdmittedRecipeArchive&);
  [[nodiscard]] CoconutPhysicalImage resolve(CoconutEdition, std::string_view identity, const CoconutRecord&, const BenchmarkAllowance&) const;

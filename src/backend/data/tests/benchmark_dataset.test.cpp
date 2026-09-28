@@ -6416,9 +6416,10 @@ TEST_CASE("deferred mapped input exposes pressure to retained pixel scratch", "[
 }
 
 TEST_CASE("batch workspace loans finish pixels and retire scratch before reader continuation", "[backend][data][benchmark][pipeline]") {
- bool fail = false;
+ bool fail = false, allocation_failure = false;
  SECTION("ordinary reader continuation") {}
  SECTION("consumer exception unwinds the offer") { fail = true; }
+ SECTION("partial consumer allocation unwinds the offer") { allocation_failure = true; }
  mmltk::testsupport::ScopedTempDir root("batch-workspace-window");
  const auto images = root.path() / "images";
  auto split = cached_pixel_membership(images);
@@ -6440,10 +6441,12 @@ TEST_CASE("batch workspace loans finish pixels and retire scratch before reader 
    CHECK_FALSE(execution.try_reserve({1, 0, true}));
    CHECK_FALSE(execution.try_reserve({1, 0}));
    mmltk::testsupport::await_test_promise(completed, "pixel consumes unused reader workspace", 5s);
+   if (allocation_failure) throw std::bad_alloc{};
    if (fail) throw std::runtime_error("normalizer failed after independent pixels completed");
   });
  };
- if (fail) CHECK_THROWS(window()); else window();
+ if (allocation_failure) CHECK_THROWS_AS(window(), std::bad_alloc);
+ else if (fail) CHECK_THROWS(window()); else window();
  CHECK(writer.image_complete(0));
  CHECK(source.bytes() == target);
  // Reclaim has retired the borrower's real idle decoder/resizer capacity.
@@ -6456,12 +6459,79 @@ TEST_CASE("batch workspace loans finish pixels and retire scratch before reader 
  CHECK(execution.try_reserve({target, 13}));
 }
 
+TEST_CASE("a workspace window retains its producing credits through callback unwind", "[backend][data][benchmark][pipeline]") {
+ bool fail = false;
+ SECTION("successful callback releases its last external allowance") {}
+ SECTION("throwing callback releases its last external allowance") { fail = true; }
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 64, .descriptors = 13});
+ std::vector<std::uint8_t> input(16, 0x42);
+ auto producer = execution.reserve({64, 1});
+ const auto consume = [&] {
+  execution.with_unused_workspace(producer, input.capacity(), [&] {
+   producer = {};
+   CHECK_FALSE(execution.try_reserve({1, 0}));
+   CHECK(std::ranges::all_of(input, [](auto byte) { return byte == 0x42; }));
+   std::vector<std::uint8_t>().swap(input);
+   if (fail) throw std::runtime_error("consumer retains its original failure");
+  });
+ };
+ if (fail) CHECK_THROWS_WITH(consume(), "consumer retains its original failure");
+ else consume();
+ CHECK(input.capacity() == 0);
+ CHECK(execution.try_reserve({64, 13}));
+}
+
+TEST_CASE("physical workspace retirement waits for CPU frames and the stable offer to settle", "[backend][data][benchmark][pipeline]") {
+ bool fail = false, cancel = false;
+ SECTION("completed CPU and input window") {}
+ SECTION("consumer exception settles deferred retirement") { fail = true; }
+ SECTION("cancellation settles deferred retirement") { cancel = true; }
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ constexpr auto target = 128U << 10;
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = target, .descriptors = 13}, cancellation);
+ std::vector<std::uint8_t> storage(64U << 10, 0x6a);
+ auto producer = execution.reserve({target, 1});
+ const auto alias = producer;
+ mmltk::testsupport::TestGate retired("physical input freed but CPU and offer still live");
+ auto work = std::async(std::launch::async, [&] {
+  execution.with_unused_workspace(producer, storage.capacity(), [&] {
+   execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) {
+    std::vector<std::uint8_t>().swap(storage);
+    producer.retire_workspace();
+    CHECK(storage.capacity() == 0);
+    CHECK(alias.bytes() == target);
+    CHECK_THROWS(producer.split_storage(0));
+    retired.receipt().ArriveAndWait();
+    if (fail) throw std::runtime_error("deferred retirement consumer failed");
+    if (cancel) cancelled.store(true);
+   }, producer);
+   CHECK(alias.bytes() == target); // CPU ended; the stable input scope still owns its promise.
+  });
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { retired.Release(); });
+ REQUIRE(retired.WaitEntered(5s));
+ CHECK_FALSE(execution.try_reserve({1, 0}));
+ retired.Release();
+ REQUIRE(work.wait_for(5s) == std::future_status::ready);
+ if (fail) CHECK_THROWS_WITH(work.get(), "deferred retirement consumer failed");
+ else if (cancel) CHECK_THROWS(work.get());
+ else work.get();
+ cancelled.store(false);
+ CHECK(alias.bytes() == 0); CHECK(alias.descriptors() == 1);
+ CHECK(execution.try_reserve({target, 12}));
+ producer.retire_descriptors();
+ CHECK(execution.try_reserve({target, 13}));
+}
+
 TEST_CASE("retiring a reader returns only its closed descriptors while descendants remain", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 13});
  auto parent = execution.reserve({0, 1, true, 0, true, 6});
  auto reader = execution.reserve({24, 2, false, 0, false, 3}, parent);
  auto alias = reader;
  auto descendant = execution.reserve(BenchmarkResources::handles(2), reader);
+ CHECK_THROWS(reader.split_storage(25));
+ CHECK(reader.bytes() == 24);
  auto backing = reader.split_storage(8);
  reader.retire_descriptors();
  CHECK(alias.descriptors() == 0);
@@ -6627,6 +6697,64 @@ TEST_CASE("concurrent reader offers join a live pixel loan on cancellation", "[b
   first_reader.retire_workspace(); second_reader.retire_workspace();
   CHECK(execution.try_reserve({target, 0}));
  }
+}
+
+TEST_CASE("a zero-byte workspace offer keeps its scope without joining a live pixel loan", "[backend][data][benchmark][pipeline]") {
+ bool fail = false;
+ SECTION("zero-capacity window returns while positive loan stays active") {}
+ SECTION("zero-capacity callback failure keeps its original exception") { fail = true; }
+ mmltk::testsupport::ScopedTempDir root("zero-workspace-offer");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images); split.images = {{1, 16, 8, 0, 0, 0}};
+ constexpr auto target = 256ULL << 20;
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = target, .descriptors = 13});
+ std::vector<std::uint8_t> positive_storage(1U << 20, 0x7a), zero_storage(64U << 10, 0x3b);
+ auto positive = execution.reserve({target - zero_storage.capacity(), 1});
+ auto zero = execution.reserve({zero_storage.capacity(), 1});
+ const auto alias = zero;
+ mmltk::testsupport::TestGate positive_window("positive producer stopped"), zero_window("zero producer stopped"), pixels("pixel decoder backing is still live");
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8);
+ request.execution = &execution;
+ request.progress = {.context = &pixels, .image_completed = [](void* value) { static_cast<mmltk::testsupport::TestGate*>(value)->receipt().ArriveAndWait(); }};
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution); execution.register_split(writer, split);
+ std::future<void> positive_call, zero_call;
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { positive_window.Release(); zero_window.Release(); pixels.Release(); });
+ positive_call = std::async(std::launch::async, [&] {
+  execution.with_unused_workspace(positive, positive_storage.capacity(), [&] { positive_window.receipt().ArriveAndWait(); });
+ });
+ zero_call = std::async(std::launch::async, [&] {
+  execution.with_unused_workspace(zero, zero_storage.capacity(), [&] {
+   CHECK_THROWS(execution.with_unused_workspace(alias, alias.bytes(), [] {}));
+   CHECK_THROWS(alias.try_resize_workspace(alias.bytes()));
+   CHECK_THROWS(zero.split_storage(0));
+   zero_window.receipt().ArriveAndWait();
+   if (fail) throw std::runtime_error("zero-capacity consumer failed");
+  });
+ });
+ REQUIRE(positive_window.WaitEntered(5s)); REQUIRE(zero_window.WaitEntered(5s));
+ execution.source_publication(images, {})({1, {}, true});
+ REQUIRE(pixels.WaitEntered(5s));
+ zero_window.Release();
+ REQUIRE(zero_call.wait_for(5s) == std::future_status::ready);
+ if (fail) CHECK_THROWS_WITH(zero_call.get(), "zero-capacity consumer failed");
+ else zero_call.get();
+ CHECK(std::ranges::all_of(zero_storage, [](auto byte) { return byte == 0x3b; }));
+ CHECK(alias.bytes() == zero_storage.capacity());
+ CHECK(alias.try_resize_workspace(alias.bytes())); // Scope sentinel has retired.
+ positive_window.Release();
+ CHECK(positive_call.wait_for(0ms) == std::future_status::timeout);
+ pixels.Release();
+ mmltk::testsupport::await_test_future(positive_call, "positive offer reclaims physical pixel backing");
+ CHECK(writer.image_complete(0));
+ CHECK(std::ranges::all_of(positive_storage, [](auto byte) { return byte == 0x7a; }));
+ std::vector<std::uint8_t>().swap(positive_storage);
+ std::vector<std::uint8_t>().swap(zero_storage);
+ positive.retire_workspace(); zero.retire_workspace();
+ CHECK(alias.bytes() == 0); CHECK(alias.descriptors() == 1);
+ CHECK(execution.try_reserve({target, 11}));
+ positive.retire_descriptors(); zero.retire_descriptors();
+ CHECK(execution.try_reserve({target, 13}));
 }
 
 TEST_CASE("Open Images class fields retain escaped text beyond four quoted columns", "[backend][data][benchmark][annotations]") {
