@@ -25,6 +25,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_compiler.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_recipe.h"
+#include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/backend/data/benchmark/detail/open_images_acquisition.h"
@@ -118,13 +119,12 @@ struct TracePath final {
  if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size()) { return std::nullopt; }
  return image_id;
 }
-void acquire_physical_inventory(AdmittedRecipeArchive& admitted, std::vector<CoconutPhysicalImage>& inventory, const BenchmarkCacheLayout& cache, ProgressReporter& progress,
+void acquire_physical_archive(AdmittedRecipeArchive& admitted, const BenchmarkCacheLayout& cache, ProgressReporter& progress,
  ArtifactProgressTotals& totals, StorageReservationPool& storage, std::size_t workers, common_concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
  std::string_view recovery_reason = {}, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {}) {
  const auto& archive = admitted.origin;
  const auto owner = benchmark_source_name(archive.artifact.source);
  auto request = make_download_request(cache, owner, archive.artifact);
- const auto inventory_path = cache.source_indexes(owner) / (archive.artifact.artifact_id + ".inventory.bin");
  auto lease = ArtifactLease::acquire_charged(cache.locks / (archive.artifact.artifact_id + ".inventory.lock"), cancellation, execution,
   BenchmarkResources::handles(1, true, 3), parent);
  const auto& inventory_handle = lease->allowance();
@@ -137,7 +137,6 @@ void acquire_physical_inventory(AdmittedRecipeArchive& admitted, std::vector<Coc
  const auto invalidate = [&](std::string_view reason) {
   diagnose(reason);
   invalidate_download_artifact(request, cancellation, trace, execution, inventory_handle);
-  remove_cache_path(inventory_path);
   request.redownload = true;
  };
  if (!recovery_reason.empty()) {
@@ -156,40 +155,15 @@ void acquire_physical_inventory(AdmittedRecipeArchive& admitted, std::vector<Coc
     {request}, workers, cancellation, progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const auto& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, inventory_handle, &storage)
                         .front();
   }
-  try {
-   auto rows = coconut_image_archive_inventory(admitted.download.path, inventory_path, archive.source, archive.shard, admitted.download.identity, cancellation, &storage, execution, inventory_handle);
-   std::erase_if(inventory, [&](const auto& row) { return row.source == archive.source && row.shard == archive.shard; });
-   inventory.insert(inventory.end(), std::make_move_iterator(rows.begin()), std::make_move_iterator(rows.end()));
-   return;
-  } catch (const InsufficientBenchmarkResources&) { throw; } catch (const InsufficientBenchmarkStorage&) { throw; } catch (const std::exception& error) {
-   throw_if_benchmark_cancelled(cancellation);
-   if (admitted.structural_attempts == 3) {
-    diagnose(error.what());
-    throw;
-   }
-   invalidate(error.what());
-  }
+  auto format_allowance = execution ? execution->reserve(BenchmarkResources::handles(1, true), inventory_handle) : BenchmarkAllowance{};
+  admitted.resolution_workspace = BenchmarkArchive::workspace_bytes(admitted.download.path, 64ULL << 20);
+  return;
  }
 }
-// Carries the ordinary mutable physical owner out of joined extraction/writer work.
-// Recovery runs only at the compiler's preparation boundary, never in workers.
-class PhysicalArchiveRecovery final : public std::runtime_error {
-public:
- PhysicalArchiveRecovery(AdmittedRecipeArchive& archive, std::string reason) : std::runtime_error(std::move(reason)), archive_(&archive) {}
- [[nodiscard]] AdmittedRecipeArchive& archive() const noexcept { return *archive_; }
-
-private:
- AdmittedRecipeArchive* archive_;
-};
 class RequiredImageDecodeError : public std::runtime_error {
 public:
  using std::runtime_error::runtime_error;
 };
-[[nodiscard]] BenchmarkResources archive_lease_resources() {
- // The extraction owner needs its directory/input pair and two dependent
- // stream/output descriptors. HTTP requests have separate transport custody.
- return BenchmarkResources::handles(1, true, 4);
-}
 [[nodiscard]] CachedImageDirectory acquire_archive_images(const BenchmarkCacheLayout& cache, const BenchmarkDatasetSource source, std::string shard, const std::vector<std::uint64_t>& expected_ids,
  const CatalogArtifact& artifact, mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, ArtifactProgressTotals* transfer_progress,
  StorageReservationPool* storage_reservations, const std::uint64_t source_total_images, const std::size_t decompression_workers, const std::size_t cache_write_workers,
@@ -203,11 +177,23 @@ public:
  progress->source_activity(source, "Waiting for " + archive_name + " extraction lock");
  auto extraction_lease = initial_lease ? std::move(initial_lease) :
   ArtifactLease::acquire_charged(cache.locks / (source_name + "-" + shard + ".images.lock"), cancel_requested, execution,
-   archive_lease_resources());
+   archive_image_resources());
  const auto& source_handle = extraction_lease->allowance();
  const auto publication = execution ? execution->source_publication(image_root, extraction_lease,
   decode_probe ? std::optional(decode_probe->image_id) : std::nullopt, true) : BenchmarkSourcePublication{};
- const CachedImageReadySink publish_image = publication ? CachedImageReadySink{publication} : CachedImageReadySink{};
+ const CachedImageReadySink publish_image = [&, publication](const CachedImageReady& ready) {
+  if (decode_probe && ready.image_id == decode_probe->image_id && ready.payload) {
+   try {
+    if (!publication.consume(ready)) {
+     BenchmarkImageValidator validator;
+     validator.validate_decodable(ready.payload->encoded, decode_probe->expected_width, decode_probe->expected_height);
+    }
+   } catch (const BenchmarkImageReadError& error) {
+    if (require_every_image) throw RequiredImageDecodeError(error.what());
+    throw InvalidImageError(error.what());
+   }
+  } else publication(ready);
+ };
  const auto completion =
   require_every_image ? image_root / ".recipe-proofs" / (std::string(completion_slot) + "-" + cached_image_selection_digest(expected_ids) + ".json") : image_root / ".complete.json";
  if (decode_probe) {
@@ -229,7 +215,7 @@ public:
    if (!std::ranges::binary_search(cached_quarantine, image_id, {}, &CachedImageRejection::image_id)) { available_ids.push_back(image_id); }
   }
   if (publish_image)
-   for (const auto id : available_ids) publish_image({image_root, id});
+   for (const auto id : available_ids) publish_image({id});
   transfer_progress->images(source, artifact.artifact_id, expected_ids.size(), source_total_images, *progress, "Reusing cached " + archive_name + " images");
   return CachedImageDirectory{
    source_name, std::move(shard), image_root, source_identity, cached_image_selection_digest(available_ids), available_ids.size(), cached_image_bytes, true, std::move(cached_quarantine)
@@ -252,7 +238,7 @@ public:
                 .front();
    }
    progress->source_activity(source, "Opening " + archive_name + " image archive");
-   BenchmarkImageValidator image_validator;
+   BenchmarkImageDecoder image_validator;
    CachedImageDirectory extracted = extract_selected_archive_images(ArchiveExtractionRequest{
     .archive_path = admitted_archive ? admitted_archive->download.path : retained->path,
     .source_identity = source_identity,
@@ -280,13 +266,13 @@ public:
     }
     try {
      if (decode_probe && decode_probe->image_id == image_id) {
-      BenchmarkImageValidator probe_validator;
-      probe_validator.validate_decodable(encoded, decode_probe->expected_width, decode_probe->expected_height);
+      return image_validator.read_header(encoded, decode_probe->expected_width, decode_probe->expected_height);
      } else {
       const auto dimensions = image_validator.read_header(encoded);
-      publication.geometry_ready(image_id, dimensions);
+      publication.geometry_ready(image_id, {dimensions.width, dimensions.height});
+      return dimensions;
      }
-    } catch (const InvalidImageError& error) {
+    } catch (const BenchmarkImageError& error) {
      if (decode_probe && decode_probe->image_id == image_id && !quarantine_unavailable) {
       throw RequiredImageDecodeError("required archive image " + std::to_string(image_id) + " remains undecodable after bounded repair: " + error.what());
      }
@@ -312,8 +298,8 @@ public:
    if (!admitted_archive) throw;
    throw_if_benchmark_cancelled(cancel_requested);
    if (attempt_reported != 0U) transfer_progress->images(source, artifact.artifact_id, 0, source_total_images, *progress, "Withdrawing failed " + archive_name + " attempt");
-   throw PhysicalArchiveRecovery(*admitted_archive, error.what());
-  } catch (const InsufficientBenchmarkResources&) { throw; } catch (const InsufficientBenchmarkStorage&) { throw; } catch (...) {
+   throw PhysicalArchiveFailure(*admitted_archive, error.what());
+  } catch (const std::bad_alloc&) { throw; } catch (const InsufficientBenchmarkResources&) { throw; } catch (const InsufficientBenchmarkStorage&) { throw; } catch (...) {
    last_error = std::current_exception();
    std::string failure_reason = "non-standard exception";
    try {
@@ -323,7 +309,7 @@ public:
    }
    if (attempt_reported != 0U) { transfer_progress->images(source, artifact.artifact_id, 0, source_total_images, *progress, "Withdrawing failed " + archive_name + " attempt"); }
    throw_if_benchmark_cancelled(cancel_requested);
-   if (admitted_archive) throw PhysicalArchiveRecovery(*admitted_archive, failure_reason);
+   if (admitted_archive) throw PhysicalArchiveFailure(*admitted_archive, failure_reason);
    if (std::filesystem::is_regular_file(request.destination)) {
     progress->source_activity(source, "Failure-only SHA-256 diagnosis for " + archive_name);
     const std::string failure_sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(request.destination, [&] { return cancel_requested.requested(); }));
@@ -690,7 +676,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   // Inventory, annotation prerequisites, prefetched archives and later repair
   // may retain source leases before their first transfer. Protect their shared
   // fixed transport once, before any of those dependent producers are admitted.
-  auto source_transport = pipeline.curl().channel(BenchmarkCurl::Class::Artifact, cancel_requested, archive_lease_resources());
+  auto source_transport = pipeline.curl().channel(BenchmarkCurl::Class::Artifact, cancel_requested, archive_image_resources());
   const auto fail_compile = [&](std::exception_ptr error) {
    cancellation_state.fail(std::move(error));
    pipeline.notify_admission_change();
@@ -698,7 +684,6 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   const auto custom_catalog = explicit_custom_catalog ? *explicit_custom_catalog : coconut ? CustomRecipeCatalog{} : custom_recipe_catalog();
   const auto coconut_catalog = coconut ? (explicit_catalog ? *explicit_catalog : coconut_recipe_catalog(config.selection.validation)) : CoconutRecipeCatalog{};
   std::vector<AdmittedRecipeArchive> admitted;
-  std::vector<CoconutPhysicalImage> inventory;
   auto& physical_progress = progress.transfers();
   StorageReservationPool physical_storage(cache.root, trace, &pipeline.storage());
   BenchmarkAllowance preparation_allowance;
@@ -718,7 +703,6 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
    for (const auto& archive : coconut_catalog.images) admitted.push_back({archive, {}});
    const auto physical_workers = std::max<std::size_t>(1, effective_num_workers);
    const auto concurrency = std::min<std::size_t>({physical_workers, kArchivePipelineConcurrency, admitted.size()});
-   std::vector<std::vector<CoconutPhysicalImage>> inventories(admitted.size());
    std::atomic<std::size_t> next{0};
    common_concurrency::parallel_for_range_indexed<int>(0, static_cast<int>(concurrency), static_cast<int>(concurrency), std::span(compile_cpus).last(physical_workers), [&](int, int begin, int end) {
     for (int lane = begin; lane < end; ++lane) {
@@ -726,15 +710,161 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      for (;;) {
       const auto index = next.fetch_add(1, std::memory_order_relaxed);
       if (index >= admitted.size()) break;
-      acquire_physical_inventory(
-       admitted[index], inventories[index], cache, progress, physical_progress, physical_storage, std::max<std::size_t>(1, physical_workers / concurrency), cancel_requested, trace, {}, &pipeline, preparation_allowance);
+      acquire_physical_archive(
+       admitted[index], cache, progress, physical_progress, physical_storage, std::max<std::size_t>(1, physical_workers / concurrency), cancel_requested, trace, {}, &pipeline, preparation_allowance);
      }
     }
    });
-   for (auto& rows : inventories) inventory.insert(inventory.end(), std::make_move_iterator(rows.begin()), std::make_move_iterator(rows.end()));
   }
   std::optional<CoconutPhysicalMembership> membership;
-  if (coconut) membership.emplace(inventory, cancel_requested);
+  struct PhysicalRoute { AdmittedRecipeArchive* archive; BenchmarkArchive::MemberPosition locator; std::uint64_t position; bool consumed = false, conflict = false; };
+  struct PhysicalSource {
+   std::vector<AdmittedRecipeArchive*> archives;
+   std::size_t next = 0;
+   std::unordered_map<std::uint64_t, PhysicalRoute> members;
+   // One forward discovery cursor per shard, referencing the authoritative
+   // encountered member location. Late reads must not rewind future discovery.
+   std::unordered_map<AdmittedRecipeArchive*, std::uint64_t> scanned;
+  };
+  struct PhysicalRelease {
+   std::mutex mutex;
+   std::map<CoconutImageNamespace, PhysicalSource> sources;
+   std::set<std::filesystem::path> prepared_roots;
+   AdmittedRecipeArchive* active = nullptr;
+   std::shared_ptr<ArtifactLease> lease;
+   std::unique_ptr<BenchmarkArchive> reader;
+   BenchmarkAllowance directory_allowance;
+   common_io::FileHandle directory;
+   BenchmarkImageDecoder decoder;
+   void release_reader() {
+    directory = {}; directory_allowance = {};
+    reader.reset(); lease.reset(); active = nullptr;
+   }
+  };
+  std::map<CoconutEdition, PhysicalRelease> physical_releases;
+  // Routing is a one-time projection of the selected release catalog. The
+  // explicit private catalog supplies its own bounded fixture source set.
+  for (const auto& release : coconut_catalog.releases) for (const auto name : coconut_release_sources(release.edition)) {
+   auto& source = physical_releases[release.edition].sources[name];
+   for (auto& archive : admitted) {
+    if (archive.origin.source != name) continue;
+    if (!explicit_catalog && name == CoconutImageNamespace::Objects365V2) {
+     const auto shards = coconut_objects_training_shards(release.edition);
+     if (std::ranges::find(shards, archive.origin.shard) == shards.end()) continue;
+    }
+    source.archives.push_back(&archive);
+   }
+  }
+  const auto physical_resources = [&](CoconutEdition edition) {
+   std::uint64_t bytes = 0;
+   for (const auto source : coconut_release_sources(edition))
+    for (const auto* archive : physical_releases.at(edition).sources.at(source).archives) bytes = std::max(bytes, archive->resolution_workspace);
+   auto resources = archive_image_resources();
+   resources.bytes = bytes;
+   return resources;
+  };
+  // Each release retains one transport inside its admitted consumer envelope.
+  // Different releases have independent archive continuations; only requests
+  // sharing that release's cursor serialize. Shared artifact facts are immutable.
+  const auto release_physical_readers = [&](CoconutEdition edition) {
+   auto& state = physical_releases.at(edition);
+   const std::lock_guard lock(state.mutex);
+   state.release_reader();
+  };
+  const auto withdraw_physical_routes = [&](AdmittedRecipeArchive& archive) {
+   for (auto& [edition, state] : physical_releases) {
+    const std::lock_guard lock(state.mutex);
+    if (state.active == &archive) state.release_reader();
+    for (auto& [name, source] : state.sources) {
+     if (name != archive.origin.source) continue;
+     source.scanned.erase(&archive);
+     std::erase_if(source.members, [&](const auto& entry) { return entry.second.archive == &archive; });
+     source.next = std::min(source.next, static_cast<std::size_t>(std::ranges::find(source.archives, &archive) - source.archives.begin()));
+    }
+   }
+  };
+  const auto resolve_physical = [&](CoconutEdition edition, const CoconutRecord& record, const BenchmarkAllowance& parent) -> CoconutPhysicalImage {
+   auto& state = physical_releases.at(edition);
+   const std::lock_guard lock(state.mutex);
+   const bool coco_record = edition == CoconutEdition::Base || edition == CoconutEdition::RelabeledValidation;
+   const auto preferred = edition == CoconutEdition::RelabeledValidation ? std::optional(CoconutImageNamespace::CocoValidation) : record.namespace_hint;
+   const auto objects_source = record.physical_stem.starts_with("objects365_v1_") ? CoconutImageNamespace::Objects365V1 : CoconutImageNamespace::Objects365V2;
+   const auto requested_id = coco_record ? record.image_id : parse_archive_image_id(record.physical_stem).value_or(UINT64_MAX);
+   const auto eligible = coconut_release_sources(edition);
+   for (const bool preferred_pass : {true, false}) for (const auto source_name : eligible) {
+    if ((!coco_record && source_name != objects_source) || (preferred && source_name == *preferred) != preferred_pass) continue;
+    auto& source = state.sources.at(source_name);
+    for (;;) {
+     auto found = source.members.find(requested_id);
+     if (found == source.members.end() && source.next == source.archives.size()) break;
+     const bool known_member = found != source.members.end();
+     auto& archive = *(found != source.members.end() ? found->second.archive : source.archives[source.next]);
+     const auto root = cache.source_images(benchmark_source_name(archive.origin.artifact.source)) / archive.origin.cache_shard;
+     if (state.active != &archive) { state.release_reader(); state.active = &archive; }
+     try {
+      if (!state.lease) state.lease = ArtifactLease::acquire_charged(cache.locks / (std::string(benchmark_source_name(archive.origin.artifact.source)) + "-" + archive.origin.cache_shard + ".images.lock"), cancel_requested, &pipeline, archive_image_resources(), parent);
+      if (known_member && found->second.conflict) throw BenchmarkArchiveError("conflicting requested physical image identity");
+      const bool new_reader = !state.reader;
+      if (!state.reader) state.reader = std::make_unique<BenchmarkArchive>(archive.download.path, &pipeline, 64ULL << 20, state.lease->allowance(), 1, false,
+       parent.bytes() >= archive.resolution_workspace ? parent : BenchmarkAllowance{});
+      auto& reader = *state.reader;
+      bool located = found != source.members.end() && reader.seek(found->second.locator, cancel_requested);
+      if (!located) {
+       if (const auto cursor = source.scanned.find(&archive); cursor != source.scanned.end()) {
+        const auto& location = source.members.at(cursor->second);
+        if (new_reader || reader.position() != location.position) (void)reader.seek(location.locator, cancel_requested);
+       }
+      }
+      while (!located && reader.next(cancel_requested)) {
+       if (!reader.member().ends_with(".jpg")) continue;
+       const auto id = parse_archive_image_id(reader.member());
+       if (!id) continue;
+       const auto [entry, inserted] = source.members.emplace(*id, PhysicalRoute{&archive, reader.member_position(), reader.position()});
+       if (!inserted && (entry->second.archive != &archive || entry->second.position != reader.position())) entry->second.conflict = true;
+       if (entry->second.conflict && (entry->second.consumed || *id == requested_id)) throw BenchmarkArchiveError("conflicting consumed physical image identity");
+       for (const auto& [other_name, other_source] : state.sources) {
+        if (other_name == source_name) continue;
+        const auto other = other_source.members.find(*id);
+        if (other != other_source.members.end() && (other->second.consumed || *id == requested_id)) throw BenchmarkArchiveError("ambiguous encountered physical namespaces");
+       }
+       located = *id == requested_id;
+      }
+      if (!located && known_member) throw BenchmarkArchiveError("known requested member disappeared from its archive generation");
+      if (!located) { ++source.next; state.release_reader(); continue; }
+      const CoconutPhysicalImage physical{archive.origin.source, requested_id, archive.origin.shard, reader.member(), archive.download.identity};
+      try { validate_coconut_physical_image(physical); }
+      catch (const std::bad_alloc&) { throw; }
+      catch (const std::exception& error) { throw BenchmarkArchiveError(error.what()); }
+      const auto encoded = reader.read(32ULL << 20, cancel_requested);
+      BenchmarkImageHeader header;
+      reader.cpu([&] {
+       if (!has_complete_image_markers(encoded)) throw BenchmarkImageError("incomplete requested COCONut image");
+       header = state.decoder.read_header(encoded);
+      });
+      if (state.prepared_roots.insert(root).second) prepare_cached_image_directory(root);
+      if (state.directory.get() < 0) {
+       state.directory_allowance = pipeline.reserve(BenchmarkResources::handles(2, true), state.lease->allowance());
+       const int descriptor = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+       if (descriptor < 0) throw common_io::errno_error("cannot open physical image cache directory", root.string());
+       state.directory = common_io::FileHandle(descriptor);
+      }
+      std::array<char, 24> relative{}; const auto relative_size = format_cached_image_relative_path(requested_id, relative);
+      write_cached_image_atomically({}, encoded, cancel_requested, physical_storage, {}, {}, false, state.directory.get(), std::string_view(relative.data(), relative_size));
+      pipeline.source_publication(root, state.lease).geometry_ready(requested_id, {header.width, header.height});
+      auto& route = source.members.at(requested_id);
+      route.consumed = true; route.locator = reader.member_position();
+      const auto cursor = source.scanned.find(&archive);
+      if (cursor == source.scanned.end() || source.members.at(cursor->second).position < route.position) source.scanned[&archive] = requested_id;
+      return physical;
+     } catch (const BenchmarkArchiveError& error) { throw PhysicalArchiveFailure(archive, error.what()); }
+     catch (const BenchmarkImageError& error) { throw PhysicalArchiveFailure(archive, error.what()); }
+     catch (const std::bad_alloc&) { throw; }
+     catch (const std::exception& error) { throw PhysicalArchiveFailure(archive, error.what(), std::current_exception()); }
+    }
+   }
+   throw CoconutPhysicalMembershipError(edition, record.image_id, "missing requested physical archive member: " + record.file_name);
+  };
+  if (coconut) membership.emplace(CoconutPhysicalMembership::Resolver{resolve_physical}, release_physical_readers, physical_resources);
   std::vector<CoconutImageNamespace> refreshed_sources;
   // Release importers borrow physical membership and the refreshed-source span.
   // Retire them before either borrowed owner unwinds on every exit path.
@@ -802,7 +932,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
         // requiring its original archive to remain present.
         if (std::filesystem::is_regular_file(root / ".complete.json")) return PrefetchedArchive{};
         auto lease = ArtifactLease::acquire_charged(cache.locks / ("coco-" + shard + ".images.lock"), cancel_requested, &pipeline,
-         archive_lease_resources());
+         archive_image_resources());
         const auto request = make_download_request(cache, "coco", source ? custom_catalog.coco_val_images : custom_catalog.coco_train_images);
         auto download = download_artifacts({request}, pipeline.curl().limit(BenchmarkCurl::Class::Artifact), cancel_requested,
          progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { physical_progress.update(update, progress); }} : DownloadProgressSink{}, trace, {}, &pipeline, lease->allowance())
@@ -933,10 +1063,13 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      archive_tasks.reserve(object_artifacts.size() + 2U);
      archive_tasks.push_back(ArchiveTask{BenchmarkDatasetSource::kCoco2017, "train2017", coco_train_ids, custom_catalog.coco_train_images});
      archive_tasks.push_back(ArchiveTask{BenchmarkDatasetSource::kCoco2017, "val2017", coco_val_ids, custom_catalog.coco_val_images});
+     std::vector<std::vector<std::uint64_t>> shard_ids(object_artifacts.size());
+     for (const auto& image : objects->images)
+      if (image.source_shard < shard_ids.size()) shard_ids[image.source_shard].push_back(image.source_image_id);
      for (std::size_t shard = 0U; shard < object_artifacts.size(); ++shard) {
       const std::uint16_t numeric_shard = common_math::checked_cast<std::uint16_t>(shard, "Objects365 shard index overflow");
-      std::vector<std::uint64_t> ids = image_ids(*objects, numeric_shard);
-      if (!ids.empty()) { archive_tasks.push_back(ArchiveTask{BenchmarkDatasetSource::kObjects365V2, "patch-" + std::to_string(shard), std::move(ids), object_artifacts[shard]}); }
+      auto ids = std::move(shard_ids[shard]);
+      if (!ids.empty()) { archive_tasks.push_back(ArchiveTask{BenchmarkDatasetSource::kObjects365V2, "patch-" + std::to_string(shard), std::move(ids), object_artifacts[shard], {}, CoconutImageNamespace::Objects365V2, numeric_shard}); }
      }
     }
     if (archive_tasks.empty()) throw std::runtime_error("benchmark recipe has no physical image membership");
@@ -951,13 +1084,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      std::unordered_map<std::uint16_t, std::uint16_t> source_slots;
      for (const auto& task : archive_tasks) {
       if (physical_source ? task.image_namespace != *physical_source : task.source != index.source || (index.source == BenchmarkDatasetSource::kCoco2017 && task.shard != index.split)) continue;
-      std::uint16_t numeric = task.numeric_shard;
-      if (!physical_source && index.source == BenchmarkDatasetSource::kObjects365V2) {
-       const auto number = std::string_view(task.shard).substr(6);
-       const auto parsed = std::from_chars(number.data(), number.data() + number.size(), numeric);
-       if (parsed.ec != std::errc{}) throw std::logic_error("benchmark pixel source shard is invalid");
-      }
-      source_slots.emplace(numeric, common_math::checked_cast<std::uint16_t>(split.sources.size(), "benchmark pixel source count overflow"));
+      source_slots.emplace(task.numeric_shard, common_math::checked_cast<std::uint16_t>(split.sources.size(), "benchmark pixel source count overflow"));
       split.sources.push_back({cache.source_images(benchmark_source_name(task.source)) / task.shard});
      }
      if (index.source == BenchmarkDatasetSource::kOpenImagesV7) {
@@ -1108,7 +1235,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
         if (!lease) {
          // A sole controller never claims independent work while either its
          // physical lock or complete source continuation is unavailable.
-         auto grant = pipeline.try_reserve(archive_lease_resources());
+         auto grant = pipeline.try_reserve(archive_image_resources());
          if (!grant) continue;
          const auto& task = archive_tasks[index];
          const auto path = cache.locks / (std::string(benchmark_source_name(task.source)) + "-" + task.shard + ".images.lock");
@@ -1668,20 +1795,28 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      };
     });
     return;
-   } catch (const PhysicalArchiveRecovery& error) {
+   } catch (const PhysicalArchiveFailure& error) {
     // The extraction scheduler has joined all workers before propagating its
     // first failure. Clear only its internal stop, never external cancellation.
     progress.discard_label_plans();
     throw_if_benchmark_cancelled(cancellation_state.external);
+    if (auto fatal = error.fatal()) {
+     // Local I/O/storage failures arose while annotations requested a physical
+     // member. They bypass annotation repair and retain their original type.
+     retained_annotation_inputs.reset();
+     cancellation_state.clear_failure();
+     std::rethrow_exception(fatal);
+    }
     auto& archive = error.archive();
     invalidate_physical_pixels(archive);
     retained_annotation_inputs.reset();
     invalidate_normalization(archive.origin.source);
     cancellation_state.clear_failure();
     membership.reset();
-    acquire_physical_inventory(archive, inventory, cache, progress, physical_progress, physical_storage, effective_num_workers, cancel_requested, trace, error.what(), &pipeline);
+    withdraw_physical_routes(archive);
+    acquire_physical_archive(archive, cache, progress, physical_progress, physical_storage, effective_num_workers, cancel_requested, trace, error.what(), &pipeline);
     refreshed_sources.push_back(archive.origin.source);
-    membership.emplace(inventory, cancel_requested);
+    membership.emplace(CoconutPhysicalMembership::Resolver{resolve_physical}, release_physical_readers, physical_resources);
    } catch (const CoconutPhysicalMembershipError& error) {
     progress.discard_label_plans();
     throw_if_benchmark_cancelled(cancellation_state.external);
@@ -1690,16 +1825,18 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     membership.reset();
     bool repaired = false;
     for (auto& archive : admitted) {
-     if (archive.origin.source != error.source() && !(error.source() == CoconutImageNamespace::CocoTrain && archive.origin.source == CoconutImageNamespace::CocoUnlabeled)) continue;
+     const auto& sources = physical_releases.at(error.edition()).sources;
+     const auto eligible = sources.find(archive.origin.source);
+     if (eligible == sources.end() || std::ranges::find(eligible->second.archives, &archive) == eligible->second.archives.end()) continue;
      invalidate_physical_pixels(archive);
      invalidate_normalization(archive.origin.source);
-     acquire_physical_inventory(archive, inventory, cache, progress, physical_progress, physical_storage, effective_num_workers, cancel_requested, trace, error.what(), &pipeline);
+     withdraw_physical_routes(archive);
+     acquire_physical_archive(archive, cache, progress, physical_progress, physical_storage, effective_num_workers, cancel_requested, trace, error.what(), &pipeline);
      if (std::ranges::find(refreshed_sources, archive.origin.source) == refreshed_sources.end()) refreshed_sources.push_back(archive.origin.source);
      repaired = true;
-     if (std::ranges::any_of(inventory, [&](const auto& image) { return image.source == archive.origin.source && image.image_id == error.image_id(); })) break;
     }
     if (!repaired) throw;
-    membership.emplace(inventory, cancel_requested);
+    membership.emplace(CoconutPhysicalMembership::Resolver{resolve_physical}, release_physical_readers, physical_resources);
    }
   }
  } catch (...) {

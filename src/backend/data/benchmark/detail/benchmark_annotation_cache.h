@@ -58,7 +58,7 @@ public:
  [[nodiscard]] const BenchmarkAllowance& allowance() const noexcept { return lease_->allowance(); }
 
 private:
- void build_split(bool training, const DownloadResult&, ProgressReporter&, std::uint64_t&, std::uint64_t);
+ void build_split(bool training, const std::string&, ProgressReporter&);
  void invalidate_missing();
  void warn_unavailable(ProgressReporter&);
  [[nodiscard]] std::filesystem::path source_json(bool training) const;

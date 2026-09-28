@@ -17,29 +17,44 @@
 #include <vector>
 #include <utility>
 #include <unordered_map>
+#include <map>
+#include <mutex>
+#include <memory>
 namespace mmltk::backend::data::benchmark_internal {
 class BenchmarkCompilePipeline;
 class StorageReservationPool;
 class CoconutPhysicalMembershipError final : public std::runtime_error {
 public:
- CoconutPhysicalMembershipError(CoconutImageNamespace source, std::uint64_t image_id, std::string message) : std::runtime_error(std::move(message)), source_(source), image_id_(image_id) {}
- [[nodiscard]] CoconutImageNamespace source() const noexcept { return source_; }
+ CoconutPhysicalMembershipError(CoconutEdition edition, std::uint64_t image_id, std::string message) : std::runtime_error(std::move(message)), edition_(edition), image_id_(image_id) {}
+ [[nodiscard]] CoconutEdition edition() const noexcept { return edition_; }
  [[nodiscard]] std::uint64_t image_id() const noexcept { return image_id_; }
 
 private:
- CoconutImageNamespace source_;
+ CoconutEdition edition_;
  std::uint64_t image_id_;
 };
-// Borrows one immutable admitted inventory generation. The caller must keep its
-// rows alive and unchanged until this lookup and all import requests release it.
+// Resolves logical records within one source generation and retains canonical
+// joins. Immutable inventory inputs used by local importers remain borrowed.
+struct CoconutRecord;
 class CoconutPhysicalMembership final {
 public:
+ using Resolver = std::function<CoconutPhysicalImage(CoconutEdition, const CoconutRecord&, const BenchmarkAllowance&)>;
+ explicit CoconutPhysicalMembership(Resolver resolver, std::function<void(CoconutEdition)> release = {}, std::function<BenchmarkResources(CoconutEdition)> resources = {})
+  : resolver_(std::move(resolver)), release_(std::move(release)), resources_(std::move(resources)) {}
+ [[nodiscard]] BenchmarkResources resolution_resources(CoconutEdition edition) const { return resources_ ? resources_(edition) : BenchmarkResources{}; }
+ void release_readers(CoconutEdition edition) const { if (release_) release_(edition); }
+ [[nodiscard]] CoconutPhysicalImage resolve(CoconutEdition, std::string_view identity, const CoconutRecord&, const BenchmarkAllowance&) const;
  explicit CoconutPhysicalMembership(std::span<const CoconutPhysicalImage>, mmltk::common::concurrency::CancellationObservation = {});
  CoconutPhysicalMembership(const CoconutPhysicalMembership&) = delete;
  CoconutPhysicalMembership& operator=(const CoconutPhysicalMembership&) = delete;
  [[nodiscard]] const CoconutPhysicalImage* find(CoconutImageNamespace, std::uint64_t) const noexcept;
 
 private:
+ Resolver resolver_;
+ std::function<void(CoconutEdition)> release_;
+ std::function<BenchmarkResources(CoconutEdition)> resources_;
+ mutable std::mutex resolved_mutex_;
+ mutable std::map<CoconutEdition, std::pair<std::string, std::map<std::uint64_t, CoconutPhysicalImage>>> resolved_;
  std::unordered_map<CoconutImageNamespace, std::unordered_map<std::uint64_t, const CoconutPhysicalImage*>> namespaces_;
 };
 class CoconutMaskRecovery;
@@ -69,10 +84,18 @@ struct CoconutRecord {
  std::uint64_t image_id = 0;
  std::string file_name;
  std::string physical_stem;
+ std::optional<CoconutImageNamespace> namespace_hint;
  std::uint32_t width = 0, height = 0;
  std::uint64_t source_ordinal = 0;
  std::uint64_t first_segment_ordinal = 0;
  std::vector<CoconutSegment> segments;
+};
+class BenchmarkArchive;
+struct CoconutAnnotationRecords {
+ void discard() noexcept;
+ std::vector<CoconutRecord> records;
+ std::shared_ptr<BenchmarkArchive> archive;
+ std::string identity;
 };
 struct CoconutImportLimits {
  std::uint64_t max_png_bytes = 64U * 1024U * 1024U;
@@ -80,16 +103,17 @@ struct CoconutImportLimits {
  std::uint32_t max_segments = 65535U;
  std::uint32_t max_dimension = MAX_IMAGE_EXTENT;
 };
-using CoconutRecordConsumer = std::function<void(const CoconutRecord&, std::span<const std::uint8_t>)>;
+using CoconutRecordConsumer = std::function<void(const CoconutRecord&, std::span<const std::uint8_t>, const BenchmarkAllowance&)>;
 // PNG is borrowed for this call only. Reader and record batch remain alive through consumer.
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only = false, BenchmarkCompilePipeline* execution = nullptr, const std::function<void()>& retire_consumer_scratch = {}, const BenchmarkAllowance& parent = {});
+ const CoconutRecordConsumer& consumer, bool metadata_only = false, BenchmarkCompilePipeline* execution = nullptr, const std::function<void()>& retire_consumer_scratch = {}, const BenchmarkAllowance& parent = {}, BenchmarkResources consumer_resources = {});
 struct CoconutImportRequest {
  BenchmarkCompilePipeline* execution = nullptr;
  BenchmarkAllowance parent_allowance;
  CoconutEdition edition = CoconutEdition::Base;
  std::string input_identity;
  bool metadata_only = false;
+ std::shared_ptr<CoconutAnnotationRecords> records;
  std::span<const CoconutImageNamespace> retained_sources;
  std::vector<std::filesystem::path> parquet_shards;
  std::filesystem::path annotation_json;

@@ -17,6 +17,10 @@
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 namespace mmltk::backend::data::benchmark_internal {
+// Source lifecycle plus the directory/output and archive/decoder descriptor
+// pairs. A metadata producer commits this complete continuation before its
+// borrowed input can wait for an image reader.
+[[nodiscard]] BenchmarkResources archive_image_resources();
 class BenchmarkCompilePipeline;
 class StorageReservationPool;
 // Parses the "quarantined" manifest array shared by the cached-image manifests: each record must
@@ -49,7 +53,10 @@ private:
  std::uint64_t published_ = 0U;
  std::mutex mutex_;
 };
-using CachedImageValidator = std::function<void(std::uint64_t, std::span<const std::uint8_t>)>;
+using CachedImageValidator = std::function<BenchmarkImageHeader(std::uint64_t, std::span<const std::uint8_t>)>;
+// One opened inode supplies the warm header and encoded read across replacement.
+[[nodiscard]] std::shared_ptr<const BenchmarkEncodedImage> open_cached_image(int directory, std::uint64_t image_id,
+ const CachedImageValidator&, mmltk::common::concurrency::CancellationObservation, BenchmarkCompilePipeline* = nullptr, BenchmarkAllowance = {});
 struct CachedImageRejection {
  std::uint64_t image_id = 0U;
  std::string reason;
@@ -71,9 +78,9 @@ struct CachedImageDirectory {
 void invalidate_cached_image_proofs(const std::filesystem::path& root);
 void prepare_cached_image_directory(const std::filesystem::path& root);
 [[nodiscard]] std::size_t format_cached_image_relative_path(std::uint64_t image_id, std::span<char> output);
-void write_cached_image_atomically(const std::filesystem::path& path, std::span<const std::uint8_t> encoded, mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage = nullptr);
-void write_cached_image_atomically(const std::filesystem::path& path, std::span<const std::uint8_t> encoded,
- mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool& destination);
+std::shared_ptr<const BenchmarkEncodedImage> write_cached_image_atomically(const std::filesystem::path& path, std::span<const std::uint8_t> encoded, mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage = nullptr, std::optional<BenchmarkImageHeader> header = {}, BenchmarkAllowance mapping_allowance = {}, bool retain_mapping = true, int directory = -1, std::string_view relative = {});
+std::shared_ptr<const BenchmarkEncodedImage> write_cached_image_atomically(const std::filesystem::path& path, std::span<const std::uint8_t> encoded,
+ mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool& destination, std::optional<BenchmarkImageHeader> header = {}, BenchmarkAllowance mapping_allowance = {}, bool retain_mapping = true, int directory = -1, std::string_view relative = {});
 [[nodiscard]] bool validate_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, std::string_view identity,
  std::span<const std::uint64_t> expected_image_ids, std::uint64_t* image_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {},
  std::vector<CachedImageRejection>* quarantined = nullptr);

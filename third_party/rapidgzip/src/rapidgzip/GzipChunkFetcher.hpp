@@ -196,6 +196,22 @@ class GzipChunkFetcher final : public BlockFetcher<GzipBlockFinder, T_ChunkData,
         m_chunkConfiguration = configuration;
     }
 
+    void setIndexEntryLimit(size_t limit) {
+        if (!limit) return;
+        requireIndexCapacity(m_unsplitBlocks.size(), 0, limit);
+        m_unsplitBlocks.reserve(limit);
+        // Reserve once: no insertion below the entry ceiling can rehash. Bound
+        // the implementation-selected bucket count as well as live nodes.
+        if (m_unsplitBlocks.bucket_count() > limit * 2 + 1) throw IndexCapacityExceeded{};
+        m_indexEntryLimit = limit;
+    }
+
+    [[nodiscard]] size_t indexStorageBytes() const {
+        // Two size_t values, hash/link/allocation metadata and alignment fit
+        // comfortably within 128 bytes per native unordered-map node.
+        return m_unsplitBlocks.bucket_count() * sizeof(void*) + m_unsplitBlocks.size() * 128;
+    }
+
     void addChunkIndexingCallback(ProcessChunk processChunk) {
         m_indexFirstSeenChunkCallbacks.emplace_back(std::move(processChunk));
     }
@@ -290,6 +306,13 @@ class GzipChunkFetcher final : public BlockFetcher<GzipBlockFinder, T_ChunkData,
                                   const std::vector<typename ChunkData::Subchunk>& subchunks,
                                   const FasterVector<uint8_t>& lastWindow) {
         const auto t0 = now();
+
+        // Check the complete chunk before mutating any of its indexes. A later
+        // BGZF prefetch may also hit its ceiling; the caller must then retire
+        // this whole fetcher instead of using a partially advanced index.
+        m_blockMap->requireAdditionalEntries(subchunks.size());
+        m_blockFinder->requireAdditionalEntries(subchunks.size());
+        requireIndexCapacity(m_unsplitBlocks.size(), subchunks.size() > 1 ? subchunks.size() - 1 : 0, m_indexEntryLimit);
 
         for (const auto& subchunk : subchunks) {
             m_blockMap->push(subchunk.encodedOffset, subchunk.encodedSize, subchunk.decodedSize);
@@ -411,6 +434,12 @@ class GzipChunkFetcher final : public BlockFetcher<GzipBlockFinder, T_ChunkData,
     }
 
     void queuePrefetchedChunkPostProcessing() {
+        // Bounded readers keep speculative decoded chunks in the existing
+        // cache/future envelope. A marker future can otherwise outlive an
+        // evicted cache entry and retain another whole chunk. Required chunks
+        // are still postprocessed on the pool; parallel DEFLATE prefetch stays
+        // active. No speculative marker owner escapes into the next read.
+        if (m_indexEntryLimit) return;
         const auto& cacheElements = this->prefetchCache().contents();
         std::vector<size_t> sortedOffsets(cacheElements.size());
         std::transform(cacheElements.begin(), cacheElements.end(), sortedOffsets.begin(),
@@ -573,6 +602,7 @@ class GzipChunkFetcher final : public BlockFetcher<GzipBlockFinder, T_ChunkData,
 
     size_t m_nextUnprocessedBlockIndex{0};
 
+    size_t m_indexEntryLimit{0};
     std::unordered_map<size_t, size_t> m_unsplitBlocks;
 
     PostProcessingFutures m_markersBeingReplaced;

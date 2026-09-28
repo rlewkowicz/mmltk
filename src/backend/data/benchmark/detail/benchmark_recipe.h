@@ -24,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <stdexcept>
 #include <vector>
 #include <nlohmann/json.hpp>
 namespace mmltk::backend::data::benchmark_internal {
@@ -58,6 +59,16 @@ struct AdmittedRecipeArchive {
  RecipeImageArchive origin;
  DownloadResult download;
  unsigned structural_attempts = 0;
+ std::uint64_t resolution_workspace = 0;
+};
+class PhysicalArchiveFailure final : public std::runtime_error {
+public:
+ PhysicalArchiveFailure(AdmittedRecipeArchive& archive, std::string reason, std::exception_ptr fatal = {}) : std::runtime_error(std::move(reason)), archive_(&archive), fatal_(std::move(fatal)) {}
+ [[nodiscard]] AdmittedRecipeArchive& archive() const noexcept { return *archive_; }
+ [[nodiscard]] std::exception_ptr fatal() const noexcept { return fatal_; }
+private:
+ AdmittedRecipeArchive* archive_;
+ std::exception_ptr fatal_;
 };
 enum class CoconutReleaseBoundary { MetadataConsumed, MasksStarted };
 // Private ordinary catalog facts are also used by bounded local release fixtures.

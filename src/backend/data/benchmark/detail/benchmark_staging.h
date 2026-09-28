@@ -17,7 +17,7 @@ public:
  BenchmarkStagedArtifact& operator=(BenchmarkStagedArtifact&&) noexcept;
  ~BenchmarkStagedArtifact();
  [[nodiscard]] static BenchmarkStagedArtifact create(StorageReservationPool&, const std::filesystem::path& destination,
-  std::uint64_t promised, std::string_view description, std::string_view suffix = ".tmp.XXXXXX", mode_t mode = 0644);
+  std::uint64_t promised, std::string_view description, std::string_view suffix = ".tmp.XXXXXX", mode_t mode = 0644, int directory = -1);
  [[nodiscard]] mmltk::common::io::FileHandle& file() noexcept { return file_; }
  [[nodiscard]] const mmltk::common::io::FileHandle& file() const noexcept { return file_; }
  [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
@@ -33,6 +33,8 @@ private:
  std::filesystem::path path_;
  std::string temporary_;
  bool cleanup_ = false;
+ // Optional borrowed directory; its owner outlives this staged publication.
+ int directory_ = -1;
  mmltk::common::io::FileHandle file_;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

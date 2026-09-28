@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <cassert>
 #include <core/BlockFinderInterface.hpp>
+#include <core/BlockMap.hpp>
 #include <core/common.hpp>
 #include <deque>
 #include <indexed_bzip2/bzip2.hpp>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -42,6 +44,28 @@ class GzipBlockFinder final : public BlockFinderInterface {
         }
 
         m_blockOffsets.push_back(detectedFormat->second);
+    }
+
+    void setIndexEntryLimit(size_t limit, size_t prefetchEntries) {
+        const std::scoped_lock lock(m_mutex);
+        if (!limit) return;
+        if (limit >= std::numeric_limits<size_t>::max() - prefetchEntries) throw std::invalid_argument("Invalid finder ceiling");
+        m_indexEntryLimit = limit + 1 + prefetchEntries;
+        requireIndexCapacity(m_blockOffsets.size(), 0, m_indexEntryLimit);
+        m_boundedBatchFetchCount = std::min(m_batchFetchCount, prefetchEntries);
+    }
+
+    void requireAdditionalEntries(size_t count) const {
+        const std::scoped_lock lock(m_mutex);
+        requireIndexCapacity(m_blockOffsets.size(), count, m_indexEntryLimit);
+    }
+
+    [[nodiscard]] size_t indexStorageBytes() const {
+        const std::scoped_lock lock(m_mutex);
+        // The append-only deque retains at most its entry ceiling. Allow two
+        // 512-byte end blocks plus geometric pointer-map capacity and allocator
+        // metadata; this is an upper bound for the native libstdc++ deque.
+        return 2 * ((m_indexEntryLimit ? m_indexEntryLimit : m_blockOffsets.size()) + 1024) * sizeof(size_t);
     }
 
     [[nodiscard]] size_t size() const override {
@@ -124,6 +148,7 @@ class GzipBlockFinder final : public BlockFinderInterface {
     }
 
     void setBlockOffsets(const std::vector<size_t>& blockOffsets) {
+        requireIndexCapacity(blockOffsets.size(), 0, m_indexEntryLimit);
         m_blockOffsets.assign(blockOffsets.begin(), blockOffsets.end());
         finalize();
     }
@@ -162,6 +187,7 @@ class GzipBlockFinder final : public BlockFinderInterface {
             if (m_finalized) {
                 throw std::invalid_argument("Already finalized, may not insert further block offsets!");
             }
+            requireIndexCapacity(m_blockOffsets.size(), 1, m_indexEntryLimit);
             m_blockOffsets.insert(match, blockOffset);
             assert(std::is_sorted(m_blockOffsets.begin(), m_blockOffsets.end()));
         }
@@ -170,7 +196,9 @@ class GzipBlockFinder final : public BlockFinderInterface {
     }
 
     void gatherMoreBgzfBlocks(size_t blockIndex) {
-        while (blockIndex + m_batchFetchCount >= m_blockOffsets.size()) {
+        const auto batch = m_indexEntryLimit ? m_boundedBatchFetchCount : m_batchFetchCount;
+        while (blockIndex + batch >= m_blockOffsets.size()) {
+            requireIndexCapacity(m_blockOffsets.size(), 1, m_indexEntryLimit);
             const auto nextOffset = m_bgzfBlockFinder->find();
             if (nextOffset < m_blockOffsets.back() + m_spacingInBits) {
                 continue;
@@ -206,6 +234,8 @@ class GzipBlockFinder final : public BlockFinderInterface {
     const size_t m_spacingInBits;
 
     std::deque<size_t> m_blockOffsets;
+    size_t m_indexEntryLimit{0};
+    size_t m_boundedBatchFetchCount{0};
 
     FileType m_fileType{FileType::NONE};
     std::unique_ptr<blockfinder::Bgzf> m_bgzfBlockFinder;

@@ -3,12 +3,9 @@
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
-#include <archive.h>
-#include <archive_entry.h>
+#include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/pch_linux.h"
 #include "src/pch_std.h"
-#include <filereader/Standard.hpp>
-#include <rapidgzip/ParallelGzipReader.hpp>
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/system/cpu_affinity.h"
 #include "src/backend/data/benchmark/benchmark_hash.h"
@@ -17,6 +14,7 @@
 #include "src/common/math/checked_arithmetic.h"
 #include "src/backend/data/detail/worker_queue.h"
 namespace mmltk::backend::data::benchmark_internal {
+BenchmarkResources archive_image_resources() { return BenchmarkResources::handles(1, true, 4); }
 CachedImageWriteProgress::CachedImageWriteProgress(CachedImageProgress callback, const std::uint64_t initial, const std::uint64_t expected)
     : callback_(std::move(callback)), initial_(initial), expected_(expected) {}
 void CachedImageWriteProgress::completed(const std::uint64_t writes) {
@@ -31,48 +29,48 @@ using mmltk::common::io::FileHandle;
 using mmltk::common::math::checked_add;
 using mmltk::common::math::checked_cast;
 namespace {
-constexpr std::size_t kArchiveBlockBytes = std::size_t{4U} * 1024U * 1024U;
 constexpr std::size_t kMaximumRetainedImageBufferBytes = std::size_t{2U} * 1024U * 1024U;
 constexpr std::size_t kMaximumArchiveImageBytes = std::size_t{32U} * 1024U * 1024U;
-struct ArchiveDestroy {
- void operator()(archive* reader) const noexcept {
-  if (reader != nullptr) { (void)archive_read_free(reader); }
- }
-};
-using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
 [[nodiscard]] std::uint64_t checked_byte_add(std::uint64_t left, std::uint64_t right);
-struct ParallelGzipStream {
- ParallelGzipStream(const std::filesystem::path& path, const std::size_t workers)
-     : reader(std::make_unique<rapidgzip::StandardFileReader>(path), std::max<std::size_t>(1U, workers)), buffer(kArchiveBlockBytes) {
-  reader.setCRC32Enabled(false);
- }
- rapidgzip::ParallelGzipReader<> reader;
- std::vector<char> buffer;
- std::string error;
-};
-la_ssize_t read_parallel_gzip(archive* archive_reader, void* opaque, const void** output) noexcept {
- auto& stream = *static_cast<ParallelGzipStream*>(opaque);
- try {
-  const std::size_t bytes = stream.reader.read(stream.buffer.data(), stream.buffer.size());
-  *output = stream.buffer.data();
-  return checked_cast<la_ssize_t>(bytes, "parallel gzip read size overflow");
- } catch (const std::exception& error) { stream.error = error.what(); } catch (...) {
-  stream.error = "parallel gzip decompression failed";
- }
- archive_set_error(archive_reader, EIO, "%s", stream.error.c_str());
- return ARCHIVE_FATAL;
-}
 class CachedImageWritePool {
+ struct Buffers {
+  BenchmarkAllowance allowance;
+  std::mutex mutex;
+  std::condition_variable available;
+  std::vector<std::vector<std::uint8_t>> free;
+  bool stopped = false;
+ };
+ std::shared_ptr<Buffers> buffers_ = std::make_shared<Buffers>();
+ struct Payload {
+  std::shared_ptr<Buffers> pool;
+  std::vector<std::uint8_t> encoded;
+  ~Payload() {
+   if (encoded.capacity() > kMaximumRetainedImageBufferBytes) std::vector<std::uint8_t>().swap(encoded);
+   else encoded.clear();
+   { const std::lock_guard lock(pool->mutex); if (!pool->stopped) pool->free.push_back(std::move(encoded)); }
+   pool->available.notify_all();
+  }
+ };
+ std::shared_ptr<const BenchmarkEncodedImage> retain(std::vector<std::uint8_t> encoded, BenchmarkImageHeader header, std::shared_ptr<const BenchmarkEncodedImage> file) {
+  auto backing = std::make_shared<Payload>(buffers_, std::move(encoded));
+  return std::make_shared<BenchmarkEncodedImage>(buffers_->allowance, backing, std::span<const std::uint8_t>(backing->encoded), header, std::move(file));
+ }
+ std::shared_ptr<const BenchmarkEncodedImage> publish_file(std::uint64_t id, std::span<const std::uint8_t> encoded, BenchmarkImageHeader header) {
+  auto mapping = execution_ ? execution_->try_reserve(BenchmarkResources::handles(1)) : std::optional<BenchmarkAllowance>{};
+  std::array<char, 24> relative{}; const auto size = format_cached_image_relative_path(id, relative);
+  return write_cached_image_atomically({}, encoded, cancellation_, storage_, header, mapping.value_or(BenchmarkAllowance{}), !execution_ || mapping.has_value(), directory_, std::string_view(relative.data(), size));
+ }
 public:
  CachedImageWritePool(const std::size_t worker_count, const std::size_t expected_writes, std::filesystem::path output_root, CachedImageProgress progress, const std::uint64_t initially_completed,
-  const mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready, StorageReservationPool* storage)
-     : storage_(output_root, {}, storage), ready_(std::move(ready)), output_root_(std::move(output_root)), progress_(std::move(progress), initially_completed, expected_writes), cancellation_(cancellation) {
+  const mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready, StorageReservationPool* storage, BenchmarkAllowance allowance, BenchmarkCompilePipeline* execution, int directory)
+     : execution_(execution), directory_(directory), storage_(output_root, {}, storage), ready_(std::move(ready)), output_root_(std::move(output_root)), progress_(std::move(progress), initially_completed, expected_writes), cancellation_(cancellation) {
   const std::size_t bounded_workers = std::min<std::size_t>(8U, worker_count);
   inline_mode_ = bounded_workers == 0U;
   if (!inline_mode_) workers_ = std::make_unique<mmltk::common::concurrency::WorkerPool>(bounded_workers, mmltk::common::system::allowed_cpu_set(), "cache_write", bounded_workers);
   const std::size_t buffer_count = inline_mode_ ? 1U : workers_->size() * 2U + 2U;
-  free_buffers_.resize(buffer_count);
-  for (auto& buffer : free_buffers_) buffer.reserve(std::size_t{512U} * 1024U);
+  buffers_->allowance = std::move(allowance);
+  buffers_->free.resize(buffer_count);
+  for (auto& buffer : buffers_->free) buffer.reserve(std::size_t{512U} * 1024U);
   try {
    if (workers_)
     for (std::size_t lane = 0; lane < workers_->size(); ++lane) workers_->enqueue_borrowed(this, lane, [](void* owner, std::size_t) { static_cast<CachedImageWritePool*>(owner)->run(); });
@@ -85,17 +83,17 @@ public:
  CachedImageWritePool& operator=(const CachedImageWritePool&) = delete;
  ~CachedImageWritePool() { stop(); }
  [[nodiscard]] std::vector<std::uint8_t> acquire(const std::size_t size) {
-  std::unique_lock lock(mutex_);
-  available_.wait(lock, [&] { return failure_ || cancellation_.requested() || !free_buffers_.empty(); });
+  std::unique_lock lock(buffers_->mutex);
+  while (!buffers_->stopped && !cancellation_.requested() && buffers_->free.empty()) buffers_->available.wait_for(lock, std::chrono::milliseconds(100));
   throw_if_benchmark_cancelled(cancellation_);
-  rethrow_failure_locked();
-  std::vector<std::uint8_t> buffer = std::move(free_buffers_.back());
-  free_buffers_.pop_back();
+  if (buffers_->stopped) { lock.unlock(); const std::lock_guard failure_lock(mutex_); rethrow_failure_locked(); throw std::runtime_error("cache pool stopped"); }
+  std::vector<std::uint8_t> buffer = std::move(buffers_->free.back());
+  buffers_->free.pop_back();
   lock.unlock();
   buffer.resize(size);
   return buffer;
  }
- void submit(const std::uint64_t image_id, std::vector<std::uint8_t> encoded) {
+ void submit(const std::uint64_t image_id, std::vector<std::uint8_t> encoded, BenchmarkImageHeader header) {
   throw_if_benchmark_cancelled(cancellation_);
   if (inline_mode_) {
    const std::uint64_t bytes = encoded.size();
@@ -103,33 +101,24 @@ public:
     recycle(std::move(encoded));
     throw std::runtime_error("selected archive image " + std::to_string(image_id) + " is not a complete JPEG or PNG");
    }
-   write_cached_image_atomically(cached_image_path(output_root_, image_id), encoded, cancellation_, storage_);
-   if (ready_) ready_({output_root_, image_id});
+   auto file = publish_file(image_id, encoded, header);
+   auto payload = retain(std::move(encoded), header, std::move(file));
+   if (ready_) ready_({image_id, std::pair{header.width, header.height}, false, std::move(payload)});
    written_ids_.push_back(image_id);
    written_bytes_ = checked_byte_add(written_bytes_, bytes);
    const std::uint64_t completed = written_ids_.size();
    progress_.completed(completed);
-   recycle(std::move(encoded));
    return;
   }
   {
    const std::lock_guard lock(mutex_);
    rethrow_failure_locked();
-   tasks_.push_back(Task{image_id, std::move(encoded)});
+   tasks_.push_back(Task{image_id, std::move(encoded), header});
   }
   pending_.notify_one();
  }
  void recycle(std::vector<std::uint8_t> encoded) {
-  if (encoded.capacity() > kMaximumRetainedImageBufferBytes) {
-   encoded = {};
-  } else {
-   encoded.clear();
-  }
-  {
-   const std::lock_guard lock(mutex_);
-   free_buffers_.push_back(std::move(encoded));
-  }
-  available_.notify_one();
+  Payload returned{buffers_, std::move(encoded)};
  }
  [[nodiscard]] std::vector<std::uint64_t> finish(std::uint64_t* image_bytes) {
   if (inline_mode_) {
@@ -152,11 +141,14 @@ public:
  }
 
 private:
+ BenchmarkCompilePipeline* execution_;
+ int directory_;
  StorageReservationPool storage_;
  CachedImageReadySink ready_;
  struct Task {
   std::uint64_t image_id = 0U;
   std::vector<std::uint8_t> encoded;
+  BenchmarkImageHeader header;
  };
  void run() noexcept {
   bool active = false;
@@ -167,15 +159,16 @@ private:
      active = true;
     });
     if (!task) {
-     available_.notify_all();
+     buffers_->available.notify_all();
      finished_.notify_all();
      return;
     }
     const std::uint64_t bytes = task->encoded.size();
     if (!has_complete_image_markers(task->encoded)) { throw std::runtime_error("selected archive image " + std::to_string(task->image_id) + " is not a complete JPEG or PNG"); }
     throw_if_benchmark_cancelled(cancellation_);
-    write_cached_image_atomically(cached_image_path(output_root_, task->image_id), task->encoded, cancellation_, storage_);
-    if (ready_) ready_({output_root_, task->image_id});
+    auto file = publish_file(task->image_id, task->encoded, task->header);
+    auto payload = retain(std::move(task->encoded), task->header, std::move(file));
+    if (ready_) ready_({task->image_id, std::pair{task->header.width, task->header.height}, false, std::move(payload)});
     std::uint64_t completed = 0U;
     {
      const std::lock_guard lock(mutex_);
@@ -184,18 +177,11 @@ private:
      completed = written_ids_.size();
     }
     progress_.completed(completed);
-    if (task->encoded.capacity() > kMaximumRetainedImageBufferBytes) {
-     task->encoded = {};
-    } else {
-     task->encoded.clear();
-    }
     {
      const std::lock_guard lock(mutex_);
-     free_buffers_.push_back(std::move(task->encoded));
      --active_;
      active = false;
     }
-    available_.notify_one();
     finished_.notify_one();
    }
   } catch (...) {
@@ -207,7 +193,8 @@ private:
     tasks_.clear();
    }
    pending_.notify_all();
-   available_.notify_all();
+   { const std::lock_guard buffer_lock(buffers_->mutex); buffers_->stopped = true; }
+   buffers_->available.notify_all();
    finished_.notify_all();
   }
  }
@@ -222,7 +209,8 @@ private:
    tasks_.clear();
   }
   pending_.notify_all();
-  available_.notify_all();
+  { const std::lock_guard buffer_lock(buffers_->mutex); buffers_->stopped = true; }
+  buffers_->available.notify_all();
   finished_.notify_all();
   join();
  }
@@ -231,10 +219,8 @@ private:
  mmltk::common::concurrency::CancellationObservation cancellation_;
  std::mutex mutex_;
  std::condition_variable pending_;
- std::condition_variable available_;
  std::condition_variable finished_;
  std::deque<Task> tasks_;
- std::vector<std::vector<std::uint8_t>> free_buffers_;
  std::unique_ptr<mmltk::common::concurrency::WorkerPool> workers_;
  std::vector<std::uint64_t> written_ids_;
  std::uint64_t written_bytes_ = 0U;
@@ -243,10 +229,6 @@ private:
  bool inline_mode_ = false;
  std::exception_ptr failure_;
 };
-[[nodiscard]] std::string archive_error(archive* reader) {
- const char* message = archive_error_string(reader);
- return message != nullptr ? message : "unknown libarchive error";
-}
 [[nodiscard]] std::uint64_t checked_byte_add(const std::uint64_t left, const std::uint64_t right) { return checked_add(left, right, "cached image byte total overflow"); }
 [[nodiscard]] std::vector<std::uint64_t> available_image_ids(const std::span<const std::uint64_t> requested, const std::span<const CachedImageRejection> quarantined) {
  std::vector<std::uint64_t> available;
@@ -281,20 +263,37 @@ private:
  }
  return message;
 }
-[[nodiscard]] std::uint64_t regular_file_bytes_at(const int root_descriptor, const std::uint64_t image_id) {
- std::array<char, 24> relative{};
- (void)format_cached_image_relative_path(image_id, relative);
- struct stat status{};
- if (::fstatat(root_descriptor, relative.data(), &status, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(status.st_mode) || status.st_size <= 0) { return 0U; }
- return static_cast<std::uint64_t>(status.st_size);
-}
-void require_archive_setup(archive* reader, const int status, const char* operation, const std::filesystem::path& archive_path, const BenchmarkTraceSink& trace) {
- if (status != ARCHIVE_OK && status != ARCHIVE_WARN) { throw std::runtime_error(std::string("cannot ") + operation + ": " + archive_error(reader)); }
- if (status == ARCHIVE_WARN) {
-  trace_benchmark_event(trace, "benchmark.archive.warning", [&] { return nlohmann::json{{"archive", archive_path.filename().string()}, {"operation", operation}, {"error", archive_error(reader)}}; });
- }
-}
 }  // namespace
+std::shared_ptr<const BenchmarkEncodedImage> open_cached_image(int directory, std::uint64_t image_id, const CachedImageValidator& validator,
+ mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkCompilePipeline* execution, BenchmarkAllowance allowance) {
+ std::array<char, 24> relative{}; (void)format_cached_image_relative_path(image_id, relative);
+ const int descriptor = ::openat(directory, relative.data(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+ if (descriptor < 0) {
+  if (errno == ENOENT || errno == ENOTDIR || errno == ELOOP) return {};
+  throw errno_error("cannot open cached benchmark image", relative.data());
+ }
+ FileHandle file(descriptor);
+ struct stat status{};
+ if (::fstat(file.get(), &status) != 0) throw errno_error("cannot inspect cached benchmark image");
+ if (!S_ISREG(status.st_mode) || status.st_size <= 0) return {};
+ auto mapping = std::make_shared<mmltk::common::io::MappedByteRegion>();
+ const auto bytes = checked_cast<std::size_t>(status.st_size, "cached image extent overflow");
+ void* address = ::mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, file.get(), 0);
+ if (address == MAP_FAILED) throw errno_error("cannot map cached benchmark image");
+ mapping->adopt(address, bytes);
+ auto payload = std::make_shared<BenchmarkEncodedImage>(allowance, mapping, std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(address), bytes), BenchmarkImageHeader{});
+ try {
+  const auto header = [&](std::size_t) { payload->header = validator ? validator(image_id, payload->encoded) : BenchmarkImageDecoder{}.read_header(payload->encoded); };
+  if (execution) execution->run(BenchmarkStage::Header, {}, header, allowance); else header(0);
+ } catch (const std::bad_alloc&) { throw; }
+ catch (const std::exception& error) {
+  throw_if_benchmark_cancelled(cancellation);
+  if (is_benchmark_capacity_failure(error)) throw;
+  throw InvalidImageError(error.what());
+ }
+ throw_if_benchmark_cancelled(cancellation);
+ return payload;
+}
 std::string cached_image_selection_digest(const std::span<const std::uint64_t> image_ids) {
  return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(image_ids.data()), image_ids.size_bytes())));
 }
@@ -320,17 +319,28 @@ std::size_t format_cached_image_relative_path(const std::uint64_t image_id, cons
  if (length != static_cast<int>(kPathCharacters)) { throw std::runtime_error("cannot format cached benchmark image ID"); }
  return static_cast<std::size_t>(length);
 }
-void write_cached_image_atomically(const std::filesystem::path& path, const std::span<const std::uint8_t> encoded,
- const mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool& destination) {
+std::shared_ptr<const BenchmarkEncodedImage> write_cached_image_atomically(const std::filesystem::path& path, const std::span<const std::uint8_t> encoded,
+ const mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool& destination, std::optional<BenchmarkImageHeader> header, BenchmarkAllowance mapping_allowance, bool retain_mapping, int directory, std::string_view relative) {
  if (encoded.empty()) throw std::runtime_error("cannot cache an empty benchmark image");
- auto staging = BenchmarkStagedArtifact::create(destination, path, encoded.size(), "cached image staging", ".tmp.XXXXXX", 0600);
+ const auto target = directory >= 0 ? std::filesystem::path(relative) : path;
+ auto staging = BenchmarkStagedArtifact::create(destination, target, encoded.size(), "cached image staging", ".tmp.XXXXXX", 0600, directory);
  staging.file().pwrite_all(encoded.data(), encoded.size(), 0U);
- staging.publish(path, cancellation, BenchmarkStagedArtifact::Publication::Rename);
+ std::shared_ptr<BenchmarkEncodedImage> payload;
+ if (header && retain_mapping) {
+  auto mapping = std::make_shared<mmltk::common::io::MappedByteRegion>();
+  void* address = ::mmap(nullptr, encoded.size(), PROT_READ, MAP_PRIVATE, staging.file().get(), 0);
+  if (address == MAP_FAILED) throw errno_error("cannot map published benchmark image");
+  mapping->adopt(address, encoded.size());
+  payload = std::make_shared<BenchmarkEncodedImage>(std::move(mapping_allowance), mapping, std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(address), encoded.size()), *header);
+ }
+ if (header && !payload) { payload = std::make_shared<BenchmarkEncodedImage>(); payload->header = *header; }
+ staging.publish(target, cancellation, BenchmarkStagedArtifact::Publication::Rename);
+ return payload;
 }
-void write_cached_image_atomically(const std::filesystem::path& path, const std::span<const std::uint8_t> encoded,
- const mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage) {
+std::shared_ptr<const BenchmarkEncodedImage> write_cached_image_atomically(const std::filesystem::path& path, const std::span<const std::uint8_t> encoded,
+ const mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage, std::optional<BenchmarkImageHeader> header, BenchmarkAllowance mapping_allowance, bool retain_mapping, int directory, std::string_view relative) {
  StorageReservationPool destination(path, {}, storage);
- write_cached_image_atomically(path, encoded, cancellation, destination);
+ return write_cached_image_atomically(path, encoded, cancellation, destination, header, std::move(mapping_allowance), retain_mapping, directory, relative);
 }
 void invalidate_cached_image_proofs(const std::filesystem::path& root) {
  remove_cache_path(root / ".complete.json");
@@ -416,10 +426,15 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
       request.output_root, completion, identity, request.selected_image_ids, &image_bytes, request.cancel_requested, request.trace, request.quarantine_unavailable ? &quarantined : nullptr)) {
   if (request.image_ready)
    for (const auto id : request.selected_image_ids) {
-    if (!std::ranges::binary_search(quarantined, id, {}, &CachedImageRejection::image_id)) request.image_ready({request.output_root, id});
+    if (!std::ranges::binary_search(quarantined, id, {}, &CachedImageRejection::image_id)) request.image_ready({id});
    }
   if (request.progress) { request.progress(request.selected_image_ids.size(), request.selected_image_ids.size()); }
   return make_cached_image_directory(request.source, request.shard, std::move(request.output_root), identity, request.selected_image_ids, image_bytes, true, std::move(quarantined));
+ }
+ std::optional<BenchmarkImageDecoder> default_decoder;
+ if (!request.validator) {
+  default_decoder.emplace();
+  request.validator = [&](std::uint64_t, std::span<const std::uint8_t> bytes) { return default_decoder->read_header(bytes); };
  }
  const std::unordered_set<std::uint64_t> selected(request.selected_image_ids.begin(), request.selected_image_ids.end());
  std::unordered_set<std::uint64_t> completed;
@@ -427,7 +442,6 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  std::unordered_set<std::uint64_t> unavailable;
  unavailable.reserve(64U);
  auto directory_allowance = request.execution ? request.execution->reserve(BenchmarkResources::handles(2, true, 2), request.parent_allowance) : BenchmarkAllowance{};
- BenchmarkAllowance cached_encoded_allowance;
  BenchmarkAllowance stream_allowance;
  std::vector<std::uint8_t> encoded;
  const int output_descriptor = ::open(request.output_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -445,134 +459,78 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
    });
   }
   if (request.trace) { ++inspected; }
-  const std::uint64_t bytes = regular_file_bytes_at(output_directory.get(), image_id);
-  if (bytes != 0U) {
-   if (request.validator) {
-    const std::filesystem::path path = cached_image_path(request.output_root, image_id);
-    const FileHandle file = FileHandle::open_readonly(path.string());
-    if (request.execution && bytes > encoded.capacity()) {
-     std::vector<std::uint8_t>().swap(encoded);
-     cached_encoded_allowance = {};
-     cached_encoded_allowance = request.execution->reserve({checked_byte_add(bytes, request.validator_workspace_bytes), 0});
-    }
-    encoded.resize(checked_cast<std::size_t>(bytes, "cached benchmark image size overflow"));
-    file.pread_all(encoded.data(), encoded.size(), 0U);
-    try {
-     const auto validate = [&](std::size_t) { request.validator(image_id, encoded); };
-     if (request.execution) request.execution->run(BenchmarkStage::Header, {}, validate, cached_encoded_allowance);
-     else validate(0);
-    } catch (const std::exception&) {
-     invalidate_cached_image_proofs(request.output_root);
-     std::error_code error;
-     (void)std::filesystem::remove(path, error);
-     if (error) { throw std::filesystem::filesystem_error("cannot remove invalid cached benchmark image", path, error); }
-     continue;
-    }
-   }
-   if (request.image_ready) request.image_ready({request.output_root, image_id});
+  auto allowance = request.execution ? request.execution->reserve(BenchmarkResources::handles(1, true), directory_allowance) : BenchmarkAllowance{};
+  std::shared_ptr<const BenchmarkEncodedImage> payload;
+  try { payload = open_cached_image(output_directory.get(), image_id, request.validator, request.cancel_requested, request.execution, std::move(allowance)); }
+  catch (const InvalidImageError&) {
+   invalidate_cached_image_proofs(request.output_root); remove_cache_path(cached_image_path(request.output_root, image_id)); continue;
+  }
+  if (payload) {
+   image_bytes = checked_byte_add(image_bytes, payload->encoded.size());
+   const auto dimensions = std::pair{payload->header.width, payload->header.height};
+   if (request.image_ready) request.image_ready({image_id, dimensions, false, std::move(payload)});
    completed.emplace(image_id);
-   image_bytes = checked_byte_add(image_bytes, bytes);
   }
  }
  if (request.progress) { request.progress(completed.size(), selected.size()); }
  trace_benchmark_event(request.trace, "benchmark.images.cache_reuse",
   [&] { return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"inspected_images", selected.size()}, {"reused_images", completed.size()}, {"reused_bytes", image_bytes}}; });
- std::vector<std::uint8_t>().swap(encoded);
- cached_encoded_allowance = {};
- // Grant includes the reader's chunk cache, windows, application block, and
- // bounded encoded cache-write backing, not just the application read block.
- std::size_t stream_cpus = 0;
- if (request.execution) {
-  const auto limit = request.execution->workers();
-  auto wanted = limit > 1 ? std::min<std::size_t>(limit - 1, request.decompression_workers > 1 ? request.decompression_workers + 1 : 1) : 0;
-  if (wanted == 2) wanted = 1;  // Serial rapidgzip has no separate fetch worker.
-  const auto stream_bytes = [&](std::size_t cpus) {
-   if (request.archive_path.extension() != ".gz") return checked_byte_add(64ULL << 20, request.validator_workspace_bytes);
-   const auto decoders = cpus > 2 ? cpus - 1 : std::size_t{1};
-   // BlockFetcher owns max(16, P) cached and 2*P prefetched chunks, plus P
-   // decodes. ParallelGzipReader permits 20*4 MiB decompressed chunks. Include
-   // compressed chunks, application/encoded buffers and retained seek windows.
-   const auto chunks = std::max<std::size_t>(16, decoders) + 3 * decoders;
-   const auto windows = (std::filesystem::file_size(request.archive_path) / kArchiveBlockBytes + 1) * (64ULL << 10);
-   return checked_byte_add(checked_byte_add(checked_byte_add(chunks * (84ULL << 20), 36ULL << 20), windows), request.validator_workspace_bytes);
-  };
-  if (wanted) {
-   auto grant = request.execution->try_reserve({stream_bytes(wanted), 2, true, wanted}, directory_allowance);
-   if (grant) { stream_allowance = std::move(*grant); stream_cpus = wanted; }
-  }
-  if (!stream_allowance) stream_allowance = request.execution->reserve({stream_bytes(0), 2, true}, directory_allowance);
-  request.decompression_workers = stream_cpus > 2 ? stream_cpus - 1 : 1;
-  request.cache_write_workers = 0;
+ if (completed.size() == selected.size()) {
+  complete_cached_image_group(request.output_root, completion, identity, request.selected_image_ids, image_bytes, request.cancel_requested, request.trace, quarantined, request.storage);
+  return make_cached_image_directory(request.source, request.shard, std::move(request.output_root), identity, request.selected_image_ids, image_bytes, false, std::move(quarantined));
  }
- const auto archive_work = [&](const std::function<void()>& work) {
-  if (request.execution && !stream_cpus) request.execution->run(BenchmarkStage::Archive, {}, [&](std::size_t) { work(); }, stream_allowance);
-  else work();
- };
+ std::vector<std::uint8_t>().swap(encoded);
+ if (request.execution) request.cache_write_workers = 0;
  const std::size_t pending_writes = selected.size() - completed.size() - unavailable.size();
  if (request.activity) {
   request.activity(
    request.cache_write_workers == 0U ? "Preparing inline selected-image cache writes" : "Preparing bounded cache-write queue with " + std::to_string(request.cache_write_workers) + " workers");
  }
- CachedImageWritePool write_pool(request.cache_write_workers, pending_writes, request.output_root, request.progress, completed.size(), request.cancel_requested, request.image_ready, request.storage);
  std::unordered_set<std::uint64_t> scheduled;
  scheduled.reserve(pending_writes);
- ArchiveReader reader(archive_read_new());
- if (!reader) { throw std::runtime_error("cannot allocate benchmark archive reader"); }
- std::unique_ptr<ParallelGzipStream> parallel_gzip;
- if (request.archive_path.extension() == ".gz" && request.decompression_workers != 0U) {
-  if (request.activity) { request.activity("Parallel gzip decompression with " + std::to_string(request.decompression_workers) + " workers"); }
-  parallel_gzip = std::make_unique<ParallelGzipStream>(request.archive_path, request.decompression_workers);
-  require_archive_setup(reader.get(), archive_read_support_filter_none(reader.get()), "disable archive filters", request.archive_path, request.trace);
-  require_archive_setup(reader.get(), archive_read_support_format_tar(reader.get()), "enable tar archive support", request.archive_path, request.trace);
-  require_archive_setup(reader.get(), archive_read_open(reader.get(), parallel_gzip.get(), nullptr, read_parallel_gzip, nullptr), "open parallel gzip archive", request.archive_path, request.trace);
- } else {
-  if (request.activity) { request.activity("Scanning archive and extracting selected images"); }
-  require_archive_setup(reader.get(), archive_read_support_filter_all(reader.get()), "enable archive filters", request.archive_path, request.trace);
-  require_archive_setup(reader.get(), archive_read_support_format_tar(reader.get()), "enable tar archive support", request.archive_path, request.trace);
-  require_archive_setup(reader.get(), archive_read_support_format_zip(reader.get()), "enable zip archive support", request.archive_path, request.trace);
-  require_archive_setup(reader.get(), archive_read_open_filename(reader.get(), request.archive_path.c_str(), kArchiveBlockBytes), "open benchmark archive", request.archive_path, request.trace);
- }
+ std::unordered_map<std::uint64_t, std::uint64_t> required_positions;
+ required_positions.reserve(pending_writes);
+ BenchmarkArchive reader(request.archive_path, request.execution, checked_byte_add(64ULL << 20, request.validator_workspace_bytes), directory_allowance, request.decompression_workers, false);
+ stream_allowance = reader.allowance();
+ const auto archive_work = [&](const std::function<void()>& work) { reader.cpu(work); };
+ CachedImageWritePool write_pool(request.cache_write_workers, pending_writes, request.output_root, request.progress, completed.size(), request.cancel_requested, request.image_ready, request.storage, stream_allowance, request.execution, output_directory.get());
  if (request.activity) { request.activity("Scanning archive headers for selected images"); }
  bool extraction_announced = false;
  std::uint64_t inspected_headers = 0U;
- archive_entry* entry = nullptr;
  while (completed.size() + scheduled.size() + unavailable.size() != selected.size()) {
   throw_if_benchmark_cancelled(request.cancel_requested);
-  int status = ARCHIVE_RETRY;
-  archive_work([&] { for (int retry = 0; retry < 3 && status == ARCHIVE_RETRY; ++retry) { status = archive_read_next_header(reader.get(), &entry); } });
-  if (status == ARCHIVE_EOF) { break; }
-  if (status != ARCHIVE_OK && status != ARCHIVE_WARN) { throw std::runtime_error("cannot read benchmark archive header: " + archive_error(reader.get())); }
+  if (!reader.next(request.cancel_requested)) break;
   if (request.trace && (++inspected_headers % 1024U == 0U)) {
    trace_benchmark_event(request.trace, "benchmark.archive.scan", [&] {
     return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"inspected_headers", inspected_headers}, {"scheduled_images", scheduled.size()}, {"reused_images", completed.size()}};
    });
   }
-  const char* pathname = archive_entry_pathname(entry);
+  const char* pathname = reader.member().c_str();
   const std::optional<std::uint64_t> image_id = pathname != nullptr ? request.image_id_parser(pathname) : std::nullopt;
+  if (image_id && selected.contains(*image_id)) {
+   const auto [position, inserted] = required_positions.emplace(*image_id, reader.position());
+   if (!inserted && position->second != reader.position()) throw BenchmarkArchiveError("conflicting requested benchmark image identity");
+  }
   if (!image_id || !selected.contains(*image_id) || completed.contains(*image_id) || scheduled.contains(*image_id) || unavailable.contains(*image_id)) {
-   int skip_status = ARCHIVE_RETRY;
-   archive_work([&] { for (int retry = 0; retry < 3 && skip_status == ARCHIVE_RETRY; ++retry) { skip_status = archive_read_data_skip(reader.get()); } });
-   if (skip_status != ARCHIVE_OK && skip_status != ARCHIVE_WARN) { throw std::runtime_error("cannot skip benchmark archive entry"); }
    continue;
   }
-  const la_int64_t entry_size = archive_entry_size(entry);
+  reader.require_regular(kMaximumArchiveImageBytes);
+  const auto entry_size = reader.size();
   if (entry_size <= 0 || static_cast<std::uint64_t>(entry_size) > kMaximumArchiveImageBytes) { throw std::runtime_error("selected benchmark archive image has an invalid size"); }
   if (!extraction_announced && request.activity) {
    request.activity("Extracting selected image payloads into the cache-write queue");
    extraction_announced = true;
   }
   encoded = write_pool.acquire(checked_cast<std::size_t>(entry_size, "benchmark archive image size overflow"));
-  std::size_t offset = 0U;
-  while (offset < encoded.size()) {
-   la_ssize_t count = ARCHIVE_RETRY;
-   archive_work([&] { for (int retry = 0; retry < 3 && count == ARCHIVE_RETRY; ++retry) { count = archive_read_data(reader.get(), encoded.data() + offset, std::min<std::size_t>(encoded.size() - offset, kArchiveBlockBytes)); } });
-   if (count <= 0) { throw std::runtime_error("cannot read selected benchmark archive image"); }
-   offset += checked_cast<std::size_t>(count, "benchmark archive read size overflow");
-  }
-  if (request.validator) {
+  reader.read_into(encoded, request.cancel_requested);
+  BenchmarkImageHeader header;
+  {
    try {
-    archive_work([&] { request.validator(*image_id, encoded); });
-   } catch (const std::exception& error) {
+    archive_work([&] { header = request.validator(*image_id, encoded); });
+   } catch (const std::bad_alloc&) { throw; }
+   catch (const std::exception& error) {
+    throw_if_benchmark_cancelled(request.cancel_requested);
+    if (is_benchmark_capacity_failure(error)) throw;
     trace_benchmark_event(request.trace, "benchmark.images.validation_failed",
      [&] { return nlohmann::json{{"source", request.source}, {"shard", request.shard}, {"member", pathname}, {"image_id", *image_id}, {"bytes", encoded.size()}, {"reason", error.what()}}; });
     if (!request.quarantine_unavailable) { throw; }
@@ -580,18 +538,19 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
     unavailable.emplace(*image_id);
     write_pool.recycle(std::move(encoded));
     continue;
-   } catch (...) {
-    if (!request.quarantine_unavailable) { throw; }
-    quarantined.push_back(CachedImageRejection{*image_id, "benchmark image validation raised a non-standard exception"});
-    unavailable.emplace(*image_id);
-    write_pool.recycle(std::move(encoded));
-    continue;
    }
   }
   // New members cannot invalidate existing subsets; replacements already invalidated during the scan.
   if (std::filesystem::exists(cached_image_path(request.output_root, *image_id))) invalidate_cached_image_proofs(request.output_root);
-  scheduled.emplace(*image_id);
-  write_pool.submit(*image_id, std::move(encoded));
+  try {
+   write_pool.submit(*image_id, std::move(encoded), header);
+   scheduled.emplace(*image_id);
+  } catch (const InvalidImageError& error) {
+   if (!request.quarantine_unavailable) throw;
+   invalidate_cached_image_proofs(request.output_root);
+   remove_cache_path(cached_image_path(request.output_root, *image_id));
+   quarantined.push_back({*image_id, error.what()}); unavailable.emplace(*image_id);
+  }
  }
  if (request.activity && request.cache_write_workers != 0U) { request.activity("Draining selected image cache writes"); }
  for (const std::uint64_t image_id : write_pool.finish(&image_bytes)) { completed.emplace(image_id); }

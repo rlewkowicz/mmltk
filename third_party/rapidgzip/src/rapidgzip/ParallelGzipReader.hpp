@@ -502,6 +502,11 @@ class ParallelGzipReader final : public FileReader {
         return m_blockMap->blockOffsets();
     }
 
+    /** Current retained seek dictionaries, without completing or copying the index. */
+    [[nodiscard]] size_t availableWindowCount() const {
+        return m_windowMap->size();
+    }
+
     [[nodiscard]] auto statistics() const {
         if (!m_chunkFetcher) {
             throw std::invalid_argument("No chunk fetcher initialized!");
@@ -799,6 +804,24 @@ class ParallelGzipReader final : public FileReader {
         m_blockFinder.reset();
     }
 
+    // Optional control-table ceiling. Application retention/replay policy stays
+    // with the caller; native users that do not opt in retain existing behavior.
+    void setIndexEntryLimit(size_t limit) {
+        if (m_chunkFetcher || m_blockFinder || !m_blockMap->empty()) {
+            throw std::invalid_argument("Configure the index ceiling before reading");
+        }
+        if (limit > (std::numeric_limits<size_t>::max() - 1) / 2) throw std::invalid_argument("Invalid index ceiling");
+        m_blockMap->setIndexEntryLimit(limit);
+        m_indexEntryLimit = limit;
+    }
+
+    [[nodiscard]] size_t indexEntryCount() const { return m_blockMap->indexEntryCount(); }
+    [[nodiscard]] size_t indexStorageBytes() const {
+        return m_blockMap->indexStorageBytes() + (m_blockFinder ? m_blockFinder->indexStorageBytes() : 0)
+            + (m_chunkFetcher ? m_chunkFetcher->indexStorageBytes() : 0)
+            + m_newlineOffsets.capacity() * sizeof(NewlineOffset);
+    }
+
     void setKeepIndex(bool keep) {
         m_keepIndex = keep;
         applyChunkDataConfiguration();
@@ -856,6 +879,7 @@ class ParallelGzipReader final : public FileReader {
             throw std::logic_error("Block finder creator failed to create new block finder!");
         }
 
+        m_blockFinder->setIndexEntryLimit(m_indexEntryLimit, 2 * m_fetcherParallelization + 1);
         if (m_blockMap->finalized()) {
             setBlockFinderOffsets(m_blockMap->blockOffsets());
         }
@@ -877,6 +901,7 @@ class ParallelGzipReader final : public FileReader {
             throw std::logic_error("Block fetcher should have been initialized!");
         }
 
+        m_chunkFetcher->setIndexEntryLimit(m_indexEntryLimit);
         m_chunkFetcher->setShowProfileOnDestruction(m_showProfileOnDestruction);
         m_chunkFetcher->setStatisticsEnabled(m_statisticsEnabled);
         m_chunkFetcher->addChunkIndexingCallback([this](const auto& chunk, auto) { this->gatherLineOffsets(chunk); });
@@ -894,6 +919,10 @@ class ParallelGzipReader final : public FileReader {
             throw std::logic_error("ParallelGzipReader::gatherLineOffsets should only be called with valid chunk!");
         }
 
+        if (m_indexEntryLimit) {
+            requireIndexCapacity(m_newlineOffsets.size(), chunk->subchunks().size() + (m_newlineOffsets.empty() ? 1 : 0), m_indexEntryLimit + 1);
+            if (m_newlineOffsets.capacity() == 0) reserveIndexCapacity(m_newlineOffsets, m_indexEntryLimit + 1);
+        }
         for (const auto& subchunk : chunk->subchunks()) {
             if (!subchunk.newlineCount) {
                 throw std::logic_error("Newline count in subchunk is missing!");
@@ -1010,6 +1039,7 @@ class ParallelGzipReader final : public FileReader {
     std::shared_ptr<BlockFinder> m_blockFinder;
     std::shared_ptr<BlockMap> const m_blockMap{std::make_shared<BlockMap>()};
     std::shared_ptr<WindowMap> const m_windowMap{std::make_shared<WindowMap>()};
+    size_t m_indexEntryLimit{0};
     bool m_keepIndex{true};
     bool m_windowSparsity{true};
     std::optional<CompressionType> m_windowCompressionType;

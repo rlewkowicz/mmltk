@@ -115,6 +115,7 @@ struct BenchmarkPixelInput {
  // their allowance and finally the physical source mutation lease.
  BenchmarkSourcePublication publication;
  BenchmarkAllowance allowance;
+ std::shared_ptr<const BenchmarkEncodedImage> payload;
  common_io::FileHandle file;
  common_io::MappedByteRegion mapping;
  std::span<const std::uint8_t> encoded;
@@ -205,7 +206,7 @@ void BenchmarkSplitWriter::prepare_lanes(std::size_t lanes) {
  while (impl_->scratch.size() < lanes) impl_->scratch.push_back(std::make_unique<Impl::Scratch>(impl_->perceptual));
 }
 std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::size_t slot, std::size_t lane,
- BenchmarkSourcePublication publication, BenchmarkAllowance allowance) {
+ BenchmarkSourcePublication publication, BenchmarkAllowance allowance, std::shared_ptr<const BenchmarkEncodedImage> payload) {
  auto& state = *impl_;
  auto& image = state.images.at(slot);
  if (image_complete(slot)) return {};
@@ -213,6 +214,11 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::si
  auto& scratch = state.lane_scratch(lane);
  auto input = std::make_shared<BenchmarkPixelInput>(std::move(publication), std::move(allowance));
  try {
+  input->payload = std::move(payload);
+  if (input->payload && !input->payload->encoded.empty()) {
+   input->encoded = input->payload->encoded;
+   input->header = input->payload->header;
+  } else {
   // The mapping and its opened inode survive header admission and queued pixel
   // work. Header parsing touches only its necessary source bytes; there is no
   // second payload read, encoded vector, or header validation before decode.
@@ -233,7 +239,6 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::si
    if (descriptor < 0) throw common_io::errno_error("cannot open cached benchmark image", relative_path.data());
    input->file = common_io::FileHandle(descriptor);
   }
-  if (state.image_opened) state.image_opened(state.sources.at(image.source_index).root, image.source_image_id);
   throw_if_benchmark_cancelled(state.cancellation);
   const auto bytes = input->file.size();
   if (!bytes || bytes > std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("cached benchmark image has an invalid size");
@@ -241,7 +246,11 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::si
   if (mapping == MAP_FAILED) throw common_io::errno_error("cannot map cached benchmark image");
   input->mapping.adopt(mapping, bytes);
   input->encoded = {static_cast<const std::uint8_t*>(mapping), bytes};
-  input->header = scratch.decoder.read_header(input->encoded, state.actual_dimensions ? 0 : image.source_width, state.actual_dimensions ? 0 : image.source_height);
+  input->header = input->payload ? input->payload->header : scratch.decoder.read_header(input->encoded, state.actual_dimensions ? 0 : image.source_width, state.actual_dimensions ? 0 : image.source_height);
+  }
+  if (!state.actual_dimensions && ((image.source_width && image.source_width != input->header.width) || (image.source_height && image.source_height != input->header.height)))
+   throw BenchmarkImageError("benchmark image dimensions do not match annotations");
+  if (state.image_opened) state.image_opened(state.sources.at(image.source_index).root, image.source_image_id);
   {
    const std::lock_guard lock(state.facts_mutex);
    image.source_width = input->header.width;
@@ -254,12 +263,14 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::si
  }
  return input;
 }
-std::uint64_t BenchmarkSplitWriter::pixel_workspace_bytes(const BenchmarkPixelInput& input) const {
+BenchmarkAllowance BenchmarkSplitWriter::pixel_input_allowance(const BenchmarkPixelInput& input) const { return input.payload ? input.payload->allowance : BenchmarkAllowance{}; }
+std::uint64_t BenchmarkSplitWriter::pixel_workspace_bytes(const BenchmarkPixelInput& input) const { return pixel_workspace_bytes(input.header, input.payload && input.payload->file_backing ? 0 : input.encoded.size()); }
+std::uint64_t BenchmarkSplitWriter::pixel_workspace_bytes(const BenchmarkImageHeader& header, std::size_t encoded_bytes) const {
  // Source RGB/CMYK, decoder workspace and conservative perceptual filtering
  // intermediates, plus the mapped source working set. Final mmap pixels are a
  // retained product, not transient memory. Arithmetic never limits legal size.
- const auto source_pixels = common_math::checked_multiply(std::uint64_t{input.header.width}, input.header.height, "benchmark decode workspace overflow");
- return common_math::checked_add(input.encoded.size(),
+ const auto source_pixels = common_math::checked_multiply(std::uint64_t{header.width}, header.height, "benchmark decode workspace overflow");
+ return common_math::checked_add(encoded_bytes,
   common_math::checked_add(common_math::checked_multiply(source_pixels, 96U, "benchmark decode workspace overflow"),
    common_math::checked_multiply(std::uint64_t{impl_->resolution} * impl_->resolution, 96U, "benchmark resize workspace overflow"), "benchmark image workspace overflow"),
   "benchmark image workspace overflow");
@@ -274,15 +285,16 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const
  auto& scratch = state.lane_scratch(lane);
  const auto& header = input->header;
  throw_if_benchmark_cancelled(state.cancellation);
+ std::span<const std::uint8_t> decoded;
  try {
-  scratch.decoder.decode_rgb(input->encoded, header, &scratch.decoded, &scratch.cmyk);
+  decoded = scratch.decoder.decode_rgb(input->encoded, header, &scratch.decoded, &scratch.cmyk);
  } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
   throw_if_benchmark_cancelled(state.cancellation);
   const auto& image = state.images.at(slot);
   throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what());
  }
  scratch.resizer.resize_to_planar(
-  {scratch.decoded.data(), {header.width, header.height, static_cast<std::size_t>(header.width) * 3U, 0U, scratch.decoded.size(), mmltk::backend::imaging::resample::RgbPixelFormat::RGB8}},
+  {decoded.data(), {header.width, header.height, static_cast<std::size_t>(header.width) * 3U, 0U, decoded.size(), mmltk::backend::imaging::resample::RgbPixelFormat::RGB8}},
   {state.pixels->image(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow"), state.stride),
    {state.resolution, state.resolution, static_cast<std::size_t>(state.resolution) * sizeof(float), static_cast<std::size_t>(state.resolution) * state.resolution * sizeof(float), state.stride,
     mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}}, state.resize_mode);

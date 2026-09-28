@@ -78,8 +78,15 @@ struct BenchmarkCompilePipeline::Admission {
   if (value.cpu_workers && value.cpu_workers >= cpu_capacity) throw std::invalid_argument("external benchmark work must retain a CPU for consumers");
   if (!feasible(value)) throw InsufficientBenchmarkResources("benchmark operation exceeds resource admission");
  }
- [[nodiscard]] bool fits_bytes(BenchmarkResources value) const {
-  return value.retained_handles || !value.bytes || (value.bytes > target ? bytes == 0 : bytes <= target - value.bytes);
+ [[nodiscard]] bool fits_bytes(BenchmarkResources value, const Credits* parent = nullptr) const {
+  if (value.retained_handles || !value.bytes) return true;
+  if (value.bytes <= target && bytes <= target - value.bytes) return true;
+  // A legal oversized consumer may finish its own retained input. The complete
+  // lineage is charged, and unrelated transient users must first retire.
+  std::uint64_t lineage = 0;
+  for (auto* credit = parent; credit; credit = credit->parent.get())
+   if (!credit->resources.retained_handles) lineage += credit->resources.bytes;
+  return bytes == lineage;
  }
  [[nodiscard]] std::size_t descriptor_room(BenchmarkResources value, const Credits* parent = nullptr) const {
   const auto ceiling = descriptor_ceiling(value);
@@ -92,7 +99,7 @@ struct BenchmarkCompilePipeline::Admission {
  [[nodiscard]] bool fits(BenchmarkResources value, const Credits* parent = nullptr) const {
   if (!feasible(value)) return false;
   if (value.cpu_workers && external_cpus + active > cpu_capacity - value.cpu_workers) return false;
-  return value.descriptors + value.continuation_descriptors <= descriptor_room(value, parent) && fits_bytes(value);
+  return value.descriptors + value.continuation_descriptors <= descriptor_room(value, parent) && fits_bytes(value, parent);
  }
  static bool covers(const Credits& credit, BenchmarkResources demand) {
   const auto held = credit.resources;
@@ -169,7 +176,7 @@ struct BenchmarkCompilePipeline::Impl {
  struct Job {
   BenchmarkStage stage = BenchmarkStage::Metadata;
   BenchmarkResources resources{};
-  BenchmarkAllowance allowance;
+  BenchmarkAllowance allowance, parent;
   std::variant<const std::function<void(std::size_t)>*, Slot*> work{static_cast<const std::function<void(std::size_t)>*>(nullptr)};
   [[nodiscard]] Slot* pixel() const { const auto* value = std::get_if<Slot*>(&work); return value ? *value : nullptr; }
   Job* next = nullptr;
@@ -246,6 +253,8 @@ struct BenchmarkCompilePipeline::Impl {
   bool submitted = false, retiring = false;
   BenchmarkSourcePublication publication;
   std::shared_ptr<BenchmarkPixelInput> input;
+  std::shared_ptr<const BenchmarkEncodedImage> payload;
+  BenchmarkAllowance pixel_allowance;
  };
  struct Source {
   std::filesystem::path root;
@@ -269,7 +278,7 @@ struct BenchmarkCompilePipeline::Impl {
   void register_split(BenchmarkSplitWriter&, const PreparedBenchmarkSplit&, std::size_t);
   void admit(Slot&, bool independent);
   void publish(Source&, std::uint64_t, BenchmarkSourceGeneration, BenchmarkSourcePublication,
-   std::optional<std::pair<std::uint32_t, std::uint32_t>>, bool, std::uint64_t attempt);
+   std::optional<std::pair<std::uint32_t, std::uint32_t>>, bool, std::uint64_t attempt, std::shared_ptr<const BenchmarkEncodedImage>);
   void geometry_ready(Source&, std::uint64_t, BenchmarkSourceGeneration, std::pair<std::uint32_t, std::uint32_t>);
   [[nodiscard]] std::optional<BenchmarkImageGeometry> geometry(const std::filesystem::path&, std::uint64_t) const;
   void retire_image(const std::filesystem::path&, std::uint64_t);
@@ -464,7 +473,7 @@ void BenchmarkCompilePipeline::Impl::settle(Job& job, std::exception_ptr error, 
  }
  // Credits follow the actual input and source backing. A terminal notification
  // cannot let the borrower disappear while any of these releases is pending.
- if (slot) { slot->input.reset(); slot->publication = {}; }
+ if (slot) { slot->input.reset(); slot->payload.reset(); slot->pixel_allowance = {}; job.parent = {}; slot->publication = {}; }
  job.allowance = {};
  {
   const std::lock_guard lock(mutex);
@@ -568,7 +577,7 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
     // still borrows, or steal that frame's grant during pressure retirement.
     if (local.owns(identity)) return false;
     const bool reusable = candidate.stage != BenchmarkStage::Header && identity && local.idle.owner() == identity && Admission::covers(*local.idle.allowance.credits_, candidate.resources);
-    return candidate.allowance || reusable || admission->fits(candidate.resources);
+    return candidate.allowance || reusable || admission->fits(candidate.resources, candidate.parent.credits_.get());
    };
    const bool prefer_metadata = membership_pending && metadata_streak < 2;
    if (prefer_metadata) job = ready[0].take(eligible);
@@ -602,7 +611,7 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
     } else if (local.idle.owner() != identity || job->stage != BenchmarkStage::Header) take_idle(lane);
    }
    if (invoke && !job->allowance) {
-    try { job->allowance = charge(job->resources); } catch (...) { job->failure = std::current_exception(); }
+    try { job->allowance = charge(job->resources, job->parent); } catch (...) { job->failure = std::current_exception(); }
    }
    frame.enter(std::move(job->allowance), identity);
    return true;
@@ -630,7 +639,7 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
    throw_if_benchmark_cancelled(cancellation);
    if (!slot) (*std::get<const std::function<void(std::size_t)>*>(job->work))(job->indexed ? job->index : lane);
    else if (job->stage == BenchmarkStage::Header) {
-    slot->input = slot->writer->prepare_pixel(slot->index, lane, std::move(slot->publication), frame.allowance);
+    slot->input = slot->writer->prepare_pixel(slot->index, lane, std::move(slot->publication), frame.allowance, std::move(slot->payload));
     if (slot->input) {
      const auto dimensions = slot->writer->header_dimensions(slot->index);
      { const std::lock_guard lock(mutex); images.geometry_ready(*slot->source, slot->image_id, slot->generation, *dimensions); }
@@ -662,6 +671,8 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
   job->finish_started = stopping || static_cast<bool>(failure);
   job->stage = BenchmarkStage::Pixels;
   job->resources = {pixel_bytes, 0};
+  job->parent = slot->writer->pixel_input_allowance(*slot->input);
+  job->allowance = std::move(slot->pixel_allowance);
   push(*job);
   changed.notify_all();
  } else settle(*job, error, recoverable);
@@ -988,7 +999,7 @@ void BenchmarkCompilePipeline::Impl::ImageState::admit(Slot& slot, bool independ
  slot.submitted = true;
  auto& job = slot.job;
  job.stage = BenchmarkStage::Header;
- job.resources = BenchmarkResources::handles(1);
+ job.resources = slot.payload && !slot.payload->encoded.empty() ? BenchmarkResources{} : BenchmarkResources::handles(1);
  job.done = false;
  job.failure = {};
  job.finish_started = false;
@@ -1050,7 +1061,7 @@ std::optional<BenchmarkImageGeometry> BenchmarkCompilePipeline::Impl::ImageState
  return BenchmarkImageGeometry{source->root, id, found->second.generation, found->second.width, found->second.height};
 }
 void BenchmarkCompilePipeline::Impl::ImageState::publish(Source& source, std::uint64_t id, BenchmarkSourceGeneration generation, BenchmarkSourcePublication publication,
- std::optional<std::pair<std::uint32_t, std::uint32_t>> dimensions, bool defer_pixels, std::uint64_t attempt) {
+ std::optional<std::pair<std::uint32_t, std::uint32_t>> dimensions, bool defer_pixels, std::uint64_t attempt, std::shared_ptr<const BenchmarkEncodedImage> payload) {
  auto& execution = execution_;
  Job* accepted = nullptr;
  {
@@ -1066,6 +1077,16 @@ void BenchmarkCompilePipeline::Impl::ImageState::publish(Source& source, std::ui
   auto& slot = found->second;
   slot.generation = generation;
   slot.publication = std::move(publication);
+  if (payload && payload->file_backing) {
+   // Reserve input/work/output together before retaining a pooled input in a
+   // queued pixel slot. Under pressure use its already-opened immutable mapping;
+   // the producer can then recycle bytes while consumers admit their scratch.
+   const BenchmarkResources workspace{slot.writer->pixel_workspace_bytes(payload->header, 0), 0};
+   if (execution.admission->fits(workspace, payload->allowance.credits_.get()))
+    slot.pixel_allowance = execution.charge(workspace, payload->allowance);
+   else payload = payload->file_backing;
+  }
+  slot.payload = std::move(payload);
   admit(slot, true);
   accepted = &slot.job;
  }
@@ -1151,7 +1172,27 @@ BenchmarkSourcePublication BenchmarkCompilePipeline::source_publication(const st
 void BenchmarkSourcePublication::operator()(const CachedImageReady& ready) const {
  if (!state_) return;
  if (auto execution = state_->execution.lock()) execution->images.publish(*state_->source, ready.image_id, state_->image_generation(ready.image_id), *this,
-  ready.dimensions, ready.defer_pixels || state_->defer_pixels, state_->attempt);
+  ready.dimensions, ready.defer_pixels || state_->defer_pixels, state_->attempt, ready.payload);
+}
+bool BenchmarkSourcePublication::consume(const CachedImageReady& ready) const {
+ if (!state_) return false;
+ auto execution = state_->execution.lock();
+ if (!execution) return false;
+ {
+  const std::lock_guard lock(execution->mutex);
+  if (state_->attempt != execution->images.attempt()) throw std::runtime_error("benchmark repaired image attempt retired");
+  if (!state_->source->slots.contains(ready.image_id)) return false;
+ }
+ execution->images.publish(*state_->source, ready.image_id, state_->image_generation(ready.image_id), *this, ready.dimensions, false, state_->attempt, ready.payload);
+ std::unique_lock lock(execution->mutex);
+ const auto retired = [&] {
+  return execution->stopping || state_->attempt != execution->images.attempt() ||
+   state_->source->retiring || state_->source->image_generation(ready.image_id) != state_->image_generation(ready.image_id);
+ };
+ execution->wait(lock, [&] { return retired() || state_->source->slots.at(ready.image_id).job.done; });
+ if (retired()) throw std::runtime_error("benchmark repaired image generation retired");
+ if (const auto failure = state_->source->slots.at(ready.image_id).job.failure) std::rethrow_exception(failure);
+ return true;
 }
 void BenchmarkSourcePublication::geometry_ready(std::uint64_t id, std::pair<std::uint32_t, std::uint32_t> dimensions) const {
  if (!state_) return;

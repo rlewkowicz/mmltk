@@ -78,6 +78,7 @@ BenchmarkImageDecoder::BenchmarkImageDecoder() : handle_(tjInitDecompress()) {
  if (handle_ == nullptr) { throw BenchmarkImageError("cannot initialize benchmark TurboJPEG decoder"); }
 }
 BenchmarkImageDecoder::~BenchmarkImageDecoder() {
+ stbi_image_free(png_pixels_);
  if (handle_ != nullptr) { (void)tjDestroy(handle_); }
 }
 BenchmarkImageHeader BenchmarkImageDecoder::read_header(const std::span<const std::uint8_t> encoded, const std::uint32_t expected_width, const std::uint32_t expected_height) {
@@ -106,7 +107,8 @@ BenchmarkImageHeader BenchmarkImageDecoder::read_header(const std::span<const st
   actual_width, actual_height, colorspace, encoding == BenchmarkImageEncoding::Jpeg && (colorspace == TJCS_YCCK || (colorspace == TJCS_CMYK && has_adobe_app14(encoded))), encoding
  };
 }
-void BenchmarkImageDecoder::decode_rgb(const std::span<const std::uint8_t> encoded, const BenchmarkImageHeader& header, std::vector<std::uint8_t>* rgb, std::vector<std::uint8_t>* cmyk_scratch) {
+std::span<const std::uint8_t> BenchmarkImageDecoder::decode_rgb(const std::span<const std::uint8_t> encoded, const BenchmarkImageHeader& header, std::vector<std::uint8_t>* rgb, std::vector<std::uint8_t>* cmyk_scratch) {
+ stbi_image_free(std::exchange(png_pixels_, nullptr));
  if (rgb == nullptr || cmyk_scratch == nullptr) { throw BenchmarkImageError("benchmark image decode buffers are missing"); }
  if (header.encoding == BenchmarkImageEncoding::Png) {
   if (encoded.size() > INT_MAX) { throw BenchmarkImageError("benchmark PNG size overflow"); }
@@ -115,8 +117,8 @@ void BenchmarkImageDecoder::decode_rgb(const std::span<const std::uint8_t> encod
   if (!pixels) { png_error("cannot decode benchmark PNG"); }
   if (width <= 0 || height <= 0 || static_cast<std::uint32_t>(width) != header.width || static_cast<std::uint32_t>(height) != header.height)
    throw BenchmarkImageError("decoded benchmark PNG dimensions do not match its header");
-  rgb->assign(pixels.get(), pixels.get() + checked_pixel_bytes(header, 3U));
-  return;
+  png_pixels_ = pixels.release();
+  return {static_cast<const std::uint8_t*>(png_pixels_), checked_pixel_bytes(header, 3U)};
  }
  if (encoded.size() > std::numeric_limits<unsigned long>::max()) { throw BenchmarkImageError("benchmark JPEG size overflow"); }
  rgb->resize(checked_pixel_bytes(header, 3U));
@@ -127,13 +129,14 @@ void BenchmarkImageDecoder::decode_rgb(const std::span<const std::uint8_t> encod
   if (tjDecompress2(handle_, encoded.data(), encoded_bytes, rgb->data(), width, 0, height, TJPF_RGB, 0) < 0) {
    throw BenchmarkImageError(std::string("cannot decode benchmark JPEG: ") + tjGetErrorStr2(handle_));
   }
-  return;
+  return *rgb;
  }
  cmyk_scratch->resize(checked_pixel_bytes(header, 4U));
  if (tjDecompress2(handle_, encoded.data(), encoded_bytes, cmyk_scratch->data(), width, 0, height, TJPF_CMYK, 0) < 0) {
   throw BenchmarkImageError(std::string("cannot decode benchmark CMYK JPEG: ") + tjGetErrorStr2(handle_));
  }
  convert_cmyk_to_rgb(*cmyk_scratch, header.inverted_cmyk, *rgb);
+ return *rgb;
 }
 namespace {
 namespace common_io = mmltk::common::io;
@@ -163,8 +166,8 @@ private:
 }  // namespace
 std::pair<std::uint32_t, std::uint32_t> BenchmarkImageValidator::read_header(const std::span<const std::uint8_t> encoded, const std::uint32_t expected_width, const std::uint32_t expected_height) {
  try {
-  const BenchmarkImageHeader header = decoder_.read_header(encoded, expected_width, expected_height);
-  return {header.width, header.height};
+  header_ = decoder_.read_header(encoded, expected_width, expected_height);
+  return {header_.width, header_.height};
  } catch (const BenchmarkImageError& error) { throw InvalidImageError(error.what()); }
 }
 std::pair<std::uint32_t, std::uint32_t> BenchmarkImageValidator::validate_file(const std::filesystem::path& path, const std::uint32_t expected_width, const std::uint32_t expected_height) {
@@ -174,7 +177,7 @@ std::pair<std::uint32_t, std::uint32_t> BenchmarkImageValidator::validate_file(c
 void BenchmarkImageValidator::validate_decodable(const std::span<const std::uint8_t> encoded, const std::uint32_t expected_width, const std::uint32_t expected_height) {
  try {
   const BenchmarkImageHeader header = decoder_.read_header(encoded, expected_width, expected_height);
-  decoder_.decode_rgb(encoded, header, &decoded_, &cmyk_);
+  (void)decoder_.decode_rgb(encoded, header, &decoded_, &cmyk_);
  } catch (const BenchmarkImageError& error) { throw InvalidImageError(std::string("cannot fully decode benchmark image: ") + error.what()); }
 }
 void BenchmarkImageValidator::validate_decodable_file(const std::filesystem::path& path, const std::uint32_t expected_width, const std::uint32_t expected_height) {

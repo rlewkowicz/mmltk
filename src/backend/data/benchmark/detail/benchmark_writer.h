@@ -86,8 +86,10 @@ public:
  void prepare_lanes(std::size_t);
  void retire_scratch(std::size_t) noexcept;
  [[nodiscard]] std::shared_ptr<BenchmarkPixelInput> prepare_pixel(std::size_t slot, std::size_t lane,
-  BenchmarkSourcePublication publication = {}, BenchmarkAllowance allowance = {});
+  BenchmarkSourcePublication publication = {}, BenchmarkAllowance allowance = {}, std::shared_ptr<const BenchmarkEncodedImage> payload = {});
+ [[nodiscard]] BenchmarkAllowance pixel_input_allowance(const BenchmarkPixelInput&) const;
  [[nodiscard]] std::uint64_t pixel_workspace_bytes(const BenchmarkPixelInput&) const;
+ [[nodiscard]] std::uint64_t pixel_workspace_bytes(const BenchmarkImageHeader&, std::size_t encoded_bytes) const;
  void write_pixel(std::size_t slot, std::size_t lane, const std::shared_ptr<BenchmarkPixelInput>&);
  void write_pixel(std::size_t slot, std::size_t lane);
  void write_remaining(const BenchmarkWriteRequest&);

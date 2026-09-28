@@ -67,6 +67,7 @@ mmltk_register_public_headers(
         loading/data_loading_options.h
         compiled/compiled_file_utils.h
         benchmark/benchmark_hash.h
+        benchmark/detail/benchmark_archive.h
 )
 mmltk_register_ordinary_sources(mmltk_backend_data
     compiled/compiled_file_layout.cpp
@@ -90,6 +91,7 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     benchmark/benchmark_curl.cpp
     benchmark/benchmark_download.cpp
     benchmark/benchmark_hash.cpp
+    benchmark/benchmark_archive.cpp
     benchmark/benchmark_images.cpp
     benchmark/benchmark_image_decoder.cpp
     benchmark/benchmark_sampling.cpp
@@ -178,6 +180,7 @@ mmltk_register_header_isolation(mmltk_backend_data)
 mmltk_target_precompiled_headers(mmltk_backend_data std linux json)
 
 function(mmltk_add_backend_data_tests)
+    find_package(ZLIB REQUIRED)
     add_library(mmltk_backend_data_test_support STATIC EXCLUDE_FROM_ALL)
     mmltk_configure_component(
         mmltk_backend_data_test_support PUBLIC_DECLARATIONS)
@@ -228,6 +231,7 @@ function(mmltk_add_backend_data_tests)
         Arrow::arrow_static
         Parquet::parquet_static
         LibArchive::LibArchive
+        ZLIB::ZLIB
         stb
     )
     catch_discover_tests(

@@ -4,6 +4,7 @@
 #include <cassert>
 #include <core/common.hpp>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -13,6 +14,25 @@
 #include <vector>
 
 namespace rapidgzip {
+// Opt-in bounded readers retire their complete decoder after this signal. It
+// deliberately bypasses speculative corrupt-candidate std::exception handlers.
+struct IndexCapacityExceeded final {};
+
+inline void requireIndexCapacity(size_t used, size_t incoming, size_t limit) {
+    if (limit && ((used > limit) || (incoming > limit - used))) {
+        throw IndexCapacityExceeded{};
+    }
+}
+
+template<typename T>
+void reserveIndexCapacity(std::vector<T>& values, size_t limit) {
+    requireIndexCapacity(values.size(), 0, limit);
+    values.reserve(limit);
+    if (values.capacity() > limit) {
+        throw IndexCapacityExceeded{};
+    }
+}
+
 class BlockMap {
    public:
     struct BlockInfo {
@@ -43,6 +63,32 @@ class BlockMap {
    public:
     BlockMap() = default;
 
+    // Configure before decoding. The extra slot is the final EOF sentinel.
+    void setIndexEntryLimit(size_t limit) {
+        const std::scoped_lock lock(m_mutex);
+        if (!limit) return;
+        if (limit == std::numeric_limits<size_t>::max()) throw std::invalid_argument("Invalid index ceiling");
+        requireIndexCapacity(m_blockToDataOffsets.size(), 0, limit);
+        reserveIndexCapacity(m_blockToDataOffsets, limit + 1);
+        reserveIndexCapacity(m_eosBlocks, limit + 1);
+        m_indexEntryLimit = limit;
+    }
+
+    void requireAdditionalEntries(size_t count) const {
+        const std::scoped_lock lock(m_mutex);
+        requireIndexCapacity(m_blockToDataOffsets.size(), count, m_indexEntryLimit);
+    }
+
+    [[nodiscard]] size_t indexEntryCount() const {
+        const std::scoped_lock lock(m_mutex);
+        return m_blockToDataOffsets.size();
+    }
+
+    [[nodiscard]] size_t indexStorageBytes() const {
+        const std::scoped_lock lock(m_mutex);
+        return m_blockToDataOffsets.capacity() * sizeof(BlockOffsets::value_type) + m_eosBlocks.capacity() * sizeof(size_t);
+    }
+
     size_t push(size_t encodedBlockOffset, size_t encodedSize, size_t decodedSize) {
         const std::scoped_lock lock(m_mutex);
 
@@ -58,6 +104,7 @@ class BlockMap {
         }
 
         if (decodedOffset) {
+            requireIndexCapacity(m_blockToDataOffsets.size(), 1, m_indexEntryLimit);
             m_blockToDataOffsets.emplace_back(encodedBlockOffset, *decodedOffset);
             if (decodedSize == 0) {
                 m_eosBlocks.emplace_back(encodedBlockOffset);
@@ -155,6 +202,7 @@ class BlockMap {
     void setBlockOffsets(std::map<size_t, size_t> const& blockOffsets) {
         const std::scoped_lock lock(m_mutex);
 
+        requireIndexCapacity(blockOffsets.size(), 0, m_indexEntryLimit ? m_indexEntryLimit + 1 : 0);
         m_blockToDataOffsets.assign(blockOffsets.begin(), blockOffsets.end());
         m_lastBlockEncodedSize = 0;
         m_lastBlockDecodedSize = 0;
@@ -219,6 +267,7 @@ class BlockMap {
    private:
     mutable std::mutex m_mutex;
 
+    size_t m_indexEntryLimit{0};
     BlockOffsets m_blockToDataOffsets;
     std::vector<size_t> m_eosBlocks;
     bool m_finalized{false};

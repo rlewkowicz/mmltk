@@ -84,7 +84,13 @@ void read_image_record(const arrow::StructArray& images, std::int64_t row, const
  present(images, row, "image_info");
  record.image_id = integer(images, "id", row);
  record.file_name = text(images, "file_name", row);
- (void)text(images, "coco_url", row);
+ record.namespace_hint.reset();
+ const auto url = text(images, "coco_url", row);
+ for (const auto& [component, source] : std::array{
+      std::pair{std::string_view{"/train2017/"}, CoconutImageNamespace::CocoTrain},
+      std::pair{std::string_view{"/unlabeled2017/"}, CoconutImageNamespace::CocoUnlabeled},
+      std::pair{std::string_view{"/val2017/"}, CoconutImageNamespace::CocoValidation}})
+  if (url.find(component) != std::string_view::npos) { record.namespace_hint = source; break; }
  (void)text(images, "date_captured", row);
  (void)integer(images, "license", row);
  const auto width = integer(images, "width", row), height = integer(images, "height", row);
@@ -94,7 +100,7 @@ void read_image_record(const arrow::StructArray& images, std::int64_t row, const
  record.height = static_cast<std::uint32_t>(height);
  record.source_ordinal = ordinal;
 }
-void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation, const CoconutRecordConsumer& consumer,
+void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation, const std::function<void(const CoconutRecord&, std::span<const std::uint8_t>)>& consumer,
  std::uint64_t& row_ordinal, std::uint64_t& segment_ordinal, bool metadata_only) {
  check(batch.ValidateFull());  // Includes nested offsets and value-buffer bounds.
  if (metadata_only) {
@@ -164,7 +170,7 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
 }
 }  // namespace
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only, BenchmarkCompilePipeline* execution, const std::function<void()>& retire_consumer_scratch, const BenchmarkAllowance& parent) {
+ const CoconutRecordConsumer& consumer, bool metadata_only, BenchmarkCompilePipeline* execution, const std::function<void()>& retire_consumer_scratch, const BenchmarkAllowance& parent, BenchmarkResources consumer_resources) {
  std::uint64_t row_ordinal = 0, segment_ordinal = 0;
  for (const auto& path : shards) {
   throw_if_benchmark_cancelled(cancellation);
@@ -174,8 +180,11 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    // It precedes allocation, survives the last borrowed PNG, and lets a legal
    // oversized row progress without holding input while waiting for scratch.
    const auto workspace = metadata_only ? std::uint64_t{0} : mmltk::common::math::checked_multiply(limits.max_pixels, 32U, "COCONut Parquet consumer workspace overflow");
-   const auto bytes = mmltk::common::math::checked_add(256ULL << 20, workspace, "COCONut Parquet allowance overflow");
-   auto allowance = execution ? execution->reserve({bytes, 1, true}, parent) : BenchmarkAllowance{};
+   const auto bytes = mmltk::common::math::checked_add(256ULL << 20, mmltk::common::math::checked_add(workspace, consumer_resources.bytes, "COCONut retained physical consumer overflow"), "COCONut Parquet allowance overflow");
+   // The source transfer has settled. This complete input/consumer promise
+   // uses physical descriptor capacity, including reserved producer headroom;
+   // nested physical producers borrow its already committed slots.
+   auto allowance = execution ? execution->reserve({bytes, 1, false, 0, false, consumer_resources.descriptors + consumer_resources.continuation_descriptors}, parent) : BenchmarkAllowance{};
    struct RetireConsumer {
     const std::function<void()>& callback;
     ~RetireConsumer() { if (callback) callback(); }
@@ -220,7 +229,12 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
     std::shared_ptr<arrow::RecordBatch> batch;
     cpu([&] { check(batches->ReadNext(&batch)); });
     if (!batch) break;
-    cpu([&] { read_batch(*batch, limits, cancellation, consumer, row_ordinal, segment_ordinal, metadata_only); });
+    // A bounded batch retains its borrowed PNG owner while physical resolution
+    // runs on the source controller, never while occupying a CPU lane.
+    std::vector<std::pair<CoconutRecord, std::span<const std::uint8_t>>> records;
+    records.reserve(static_cast<std::size_t>(batch->num_rows()));
+    cpu([&] { read_batch(*batch, limits, cancellation, [&](const CoconutRecord& record, std::span<const std::uint8_t> png) { records.emplace_back(record, png); }, row_ordinal, segment_ordinal, metadata_only); });
+    for (const auto& [record, png] : records) consumer(record, png, allowance);
    }
   } catch (const ParquetFormatError& error) {
    // Consumer failures retain the types used by scoped cache recovery.
