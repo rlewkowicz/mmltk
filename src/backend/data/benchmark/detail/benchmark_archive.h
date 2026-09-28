@@ -69,6 +69,9 @@ public:
  struct GzipSeekState { std::size_t dictionaries; bool retained; bool streaming; bool rolling; bool control_capacity_reached; std::size_t index_entries; std::size_t index_bytes; };
  // Effect-only snapshot: no index export, read, allocation, or cache decision.
  [[nodiscard]] GzipSeekState gzip_seek_state() const;
+ // Full active decoder/prefetch envelope plus retained member capacity.
+ // Calling read does not quiesce native workers, so none of their bound is lent.
+ [[nodiscard]] std::uint64_t retained_workspace_bytes() const;
  [[nodiscard]] BenchmarkAllowance allowance() const;
  void cpu(const std::function<void()>&) const;
 private:

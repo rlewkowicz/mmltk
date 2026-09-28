@@ -121,12 +121,12 @@ struct CoconutPhysicalMembership::Impl {
   AdmittedRecipeArchive* active = nullptr;
   std::shared_ptr<ArtifactLease> lease;
   std::unique_ptr<BenchmarkArchive> reader;
-  BenchmarkAllowance directory_allowance;
+  BenchmarkAllowance directory_allowance, reader_parent;
   common_io::FileHandle directory;
   BenchmarkImageDecoder decoder;
   void release_reader() {
    directory = {}; directory_allowance = {};
-   reader.reset(); lease.reset(); active = nullptr;
+   reader.reset(); lease.reset(); reader_parent = {}; active = nullptr;
   }
  };
 
@@ -220,8 +220,11 @@ struct CoconutPhysicalMembership::Impl {
      if (!state.lease) state.lease = ArtifactLease::acquire_charged(cache->locks / (std::string(benchmark_source_name(archive.origin.artifact.source)) + "-" + archive.origin.cache_shard + ".images.lock"), cancellation, execution, archive_image_resources(), parent);
      if (known_member && found->second.conflict) throw BenchmarkArchiveError("conflicting requested physical image identity");
      const bool new_reader = !state.reader;
-     if (!state.reader) state.reader = std::make_unique<BenchmarkArchive>(archive.download.path, execution, 64ULL << 20, state.lease->allowance(), 1, false,
-      parent.bytes() >= archive.resolution_workspace ? parent : BenchmarkAllowance{});
+     if (!state.reader) {
+      state.reader_parent = parent;
+      state.reader = std::make_unique<BenchmarkArchive>(archive.download.path, execution, 64ULL << 20, state.lease->allowance(), 1, false,
+       parent.bytes() >= archive.resolution_workspace ? parent : BenchmarkAllowance{});
+     }
      auto& reader = *state.reader;
      bool located = found != source.members.end() && reader.seek(found->second.locator, cancellation);
      if (!located) {
@@ -297,11 +300,11 @@ BenchmarkResources CoconutPhysicalMembership::resolution_resources(CoconutEditio
  const std::lock_guard lock(state.mutex);
  return Impl::resources(state);
 }
-void CoconutPhysicalMembership::release_readers(CoconutEdition edition) const {
+void CoconutPhysicalMembership::release_readers(CoconutEdition edition, const BenchmarkAllowance& producer) const {
  if (!impl_->execution) return;
  auto& state = impl_->releases.at(edition);
  const std::lock_guard lock(state.mutex);
- state.release_reader();
+ if (!producer || state.reader_parent.aliases(producer)) state.release_reader();
 }
 bool CoconutPhysicalMembership::eligible(CoconutEdition edition, const AdmittedRecipeArchive& archive) const {
  const auto release = impl_->releases.find(edition);

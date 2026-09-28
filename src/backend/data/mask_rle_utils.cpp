@@ -106,20 +106,22 @@ EncodedRowMajorMask encode_dense_row_major_mask(const std::span<const std::uint8
  return encoded;
 }
 namespace {
-void inspect_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions dimensions, RowMajorMaskBounds* bounds) {
+void inspect_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions dimensions, RowMajorMaskBounds* bounds, std::uint64_t* foreground) {
  const auto pixels = checked_pixel_count(dimensions);
  if (bounds != nullptr) *bounds = {};
  std::size_t previous_end = 0U;
+ if (foreground) *foreground = 0;
  for (const auto pair : pairs) {
   if (pair.length == 0U || pair.start < previous_end || pair.start > pixels || pair.length > pixels - pair.start) throw std::runtime_error("row-major mask contains an invalid run");
   previous_end = static_cast<std::size_t>(pair.start) + pair.length;
   include_row_major_mask_run(bounds, pair.start, previous_end, dimensions.width);
+  if (foreground) *foreground += pair.length;
  }
 }
 }  // namespace
-RowMajorMaskBounds row_major_mask_bounds(const std::span<const RLEPair> pairs, const MaskDimensions dimensions) {
+RowMajorMaskBounds row_major_mask_bounds(const std::span<const RLEPair> pairs, const MaskDimensions dimensions, std::uint64_t* foreground) {
  RowMajorMaskBounds bounds;
- inspect_row_major_mask(pairs, dimensions, &bounds);
+ inspect_row_major_mask(pairs, dimensions, &bounds, foreground);
  return bounds;
 }
 void materialize_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions dimensions, std::vector<std::uint8_t>* dense, RowMajorMaskBounds* bounds) {
@@ -146,7 +148,7 @@ EncodedRowMajorMask resize_row_major_mask(const std::span<const RLEPair> pairs, 
   throw std::invalid_argument("mask resize parameters are invalid");
  }
  if (pairs.empty()) { return {}; }
- inspect_row_major_mask(pairs, source_dimensions, source_bounds);
+ inspect_row_major_mask(pairs, source_dimensions, source_bounds, nullptr);
  scratch->target_mask.resize(checked_pixel_count(target_dimensions));
  clear_padding(&scratch->target_mask, target_dimensions, letterbox);
  prepare_lookup(source_dimensions, letterbox.resized_width, letterbox.resized_height, scratch);

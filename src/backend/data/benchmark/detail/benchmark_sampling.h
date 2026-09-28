@@ -21,7 +21,7 @@ struct SupplementalSamplingStats {
  std::array<std::uint64_t, 80> selected_class_images{};
 };
 struct SupplementalSamplingResult {
- NormalizedAnnotationIndex index;
+ NormalizedAnnotationReadView view;
  SupplementalSamplingStats stats;
 };
 struct CombinedSupplementalSamplingResult {

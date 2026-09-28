@@ -61,8 +61,8 @@ private:
 void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation cancellation);
 // Allocation and capacity failures cannot become cache misses or transfer retries.
 [[nodiscard]] bool is_benchmark_capacity_failure(const std::exception& error) noexcept;
-void write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value, mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage = nullptr);
-[[nodiscard]] nlohmann::json read_json_file(const std::filesystem::path& path);
+std::uint64_t write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value, mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage = nullptr);
+[[nodiscard]] nlohmann::json read_json_file(const std::filesystem::path& path, std::uint64_t* extent = nullptr);
 [[nodiscard]] bool is_safe_cache_component(std::string_view value) noexcept;
 template <class Builder>
  requires std::invocable<Builder> && std::convertible_to<std::invoke_result_t<Builder>, nlohmann::json>

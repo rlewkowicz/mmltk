@@ -143,7 +143,7 @@ void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObserv
 bool is_benchmark_capacity_failure(const std::exception& error) noexcept {
  return dynamic_cast<const std::bad_alloc*>(&error) != nullptr || dynamic_cast<const std::length_error*>(&error) != nullptr || dynamic_cast<const std::overflow_error*>(&error) != nullptr;
 }
-void write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value,
+std::uint64_t write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value,
  const mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage) {
  (void)common_io::ensure_parent_directory(path);
  const std::string serialized = value.dump(2);
@@ -153,10 +153,18 @@ void write_json_atomically(const std::filesystem::path& path, const nlohmann::js
  staging.file().pwrite_all(serialized.data(), serialized.size(), 0U);
  staging.file().sync_data();
  staging.publish(path, cancellation, BenchmarkStagedArtifact::Publication::RenameAndSync);
+ return serialized.size();
 }
-nlohmann::json read_json_file(const std::filesystem::path& path) {
- std::ifstream input(path);
+nlohmann::json read_json_file(const std::filesystem::path& path, std::uint64_t* extent) {
+ std::ifstream input(path, extent ? std::ios::in | std::ios::ate : std::ios::in);
  if (!input.is_open()) { throw std::runtime_error("cannot open benchmark cache metadata: " + path.string()); }
+ if (extent) {
+  const auto end = input.tellg();
+  if (end < 0) throw std::runtime_error("cannot inspect opened benchmark cache metadata: " + path.string());
+  *extent = static_cast<std::uint64_t>(end);
+  input.seekg(0);
+  if (!input) throw std::runtime_error("cannot rewind benchmark cache metadata: " + path.string());
+ }
  try {
   return nlohmann::json::parse(input);
  } catch (const nlohmann::json::exception& error) { throw std::runtime_error("invalid benchmark cache metadata " + path.string() + ": " + error.what()); }

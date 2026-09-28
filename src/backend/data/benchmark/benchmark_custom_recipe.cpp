@@ -58,8 +58,8 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  const auto open_images_classes_request = make_download_request(cache, "open-images", catalog.open_images_classes);
  std::unordered_map<std::string, DownloadResult> annotation_downloads;
  for (const auto& artifact : {catalog.coco_annotations, catalog.objects_annotations, catalog.open_images_boxes, catalog.open_images_classes}) annotation_downloads.emplace(artifact.artifact_id, DownloadResult{});
- const auto annotation_parse_options = [&](BenchmarkDatasetSource source, std::string split, std::uint32_t expected, bool keep) {
-  return AnnotationParseOptions{source, std::move(split), expected, static_cast<int>(parse_workers), keep, cancel_requested, trace, execution};
+ const auto annotation_parse_options = [&](BenchmarkDatasetSource source, std::string split, std::uint32_t expected, bool keep, const BenchmarkAllowance& input_allowance) {
+  return AnnotationParseOptions{source, std::move(split), expected, static_cast<int>(parse_workers), keep, cancel_requested, trace, execution, input_allowance};
  };
  const auto acquire_lifecycle = [&](const std::string& name) {
   return ArtifactLease::acquire_charged(cache.locks / name, cancel_requested, execution, coco_annotation_resources(), preparation);
@@ -110,9 +110,9 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
     progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Extracting Objects365 train annotations");
     const std::string annotation_digest =
      extract_archive_member(annotation_archive.path, "zhiyuan_objv2_train.json", json_path, annotation_archive.identity, cache.locks / "objects365-train-json.extract.lock", cancel_requested, trace, &storage, execution, lifecycle_allowance);
-    objects = load_or_build_index(cache, objects_index_path, BenchmarkDatasetSource::kObjects365V2, "train", annotation_digest, cancel_requested, trace, [&] {
+    objects = load_or_build_index(cache, objects_index_path, BenchmarkDatasetSource::kObjects365V2, "train", annotation_digest, cancel_requested, trace, [&](const BenchmarkAllowance& input_allowance) {
      progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Parsing and indexing Objects365 annotations");
-     return parse_coco_style_annotations(json_path, annotation_digest, objects365_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kObjects365V2, "train", 0U, false));
+     return parse_coco_style_annotations(json_path, annotation_digest, objects365_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kObjects365V2, "train", 0U, false, input_allowance));
     }, &storage, execution, lifecycle_allowance);
     ++completed_indexes;
     progress.phase(DatasetCompilePhase::Indexing, completed_indexes.load(), kIndexCount);
@@ -138,10 +138,10 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
     const DownloadResult& boxes = annotation_downloads.at(catalog.open_images_boxes.artifact_id);
     const DownloadResult& classes = annotation_downloads.at(catalog.open_images_classes.artifact_id);
     const std::string annotation_identity = combined_artifact_digest(boxes.identity, classes.identity);
-    open_images = load_or_build_index(cache, open_images_index_path, BenchmarkDatasetSource::kOpenImagesV7, "train", annotation_identity, cancel_requested, trace, [&] {
+    open_images = load_or_build_index(cache, open_images_index_path, BenchmarkDatasetSource::kOpenImagesV7, "train", annotation_identity, cancel_requested, trace, [&](const BenchmarkAllowance& input_allowance) {
      progress.source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Parsing and indexing Open Images annotations");
      return parse_open_images_annotations(
-      boxes.path, classes.path, annotation_identity, open_images_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kOpenImagesV7, "train", 0U, false));
+      boxes.path, classes.path, annotation_identity, open_images_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kOpenImagesV7, "train", 0U, false, input_allowance));
     }, &storage, execution, lifecycle_allowance);
     ++completed_indexes;
     progress.phase(DatasetCompilePhase::Indexing, completed_indexes.load(), kIndexCount);
@@ -197,10 +197,8 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  CombinedSupplementalSamplingResult combined_sampling = sample_combined_supplemental_indices(*coco_train, *objects, *open_images, object_shard_bytes, cancel_requested);
  SupplementalSamplingResult objects_sampling = std::move(combined_sampling.objects365);
  SupplementalSamplingResult open_images_sampling = std::move(combined_sampling.open_images);
- *objects = std::move(objects_sampling.index);
  progress.phase(DatasetCompilePhase::Indexing, ++completed_indexes, kIndexCount);
  progress.source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Selecting Open Images class-deficit and diversity sample");
- *open_images = std::move(open_images_sampling.index);
  progress.phase(DatasetCompilePhase::Indexing, ++completed_indexes, kIndexCount);
  const auto trace_sampling = [&](const SupplementalSamplingStats& stats, const BenchmarkDatasetSource source) {
   trace_benchmark_event(trace, "benchmark.sampling.complete", [&] {
@@ -227,8 +225,8 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  });
  progress.activity("Finalizing normalized annotation cache");
  return CustomRecipePreparation{
-  std::move(coco_train_index_path), std::move(coco_val_index_path), std::move(objects_index_path), std::move(open_images_index_path), std::move(coco_train), std::move(coco_val), std::move(objects),
-  std::move(open_images), std::move(coco_indexes_cache_hit), std::move(objects_index_cache_hit), std::move(open_images_index_cache_hit), std::move(combined_sampling), std::move(objects_sampling),
+  std::move(coco_train_index_path), std::move(coco_val_index_path), std::move(objects_index_path), std::move(open_images_index_path), NormalizedAnnotationReadView(std::move(*coco_train)), NormalizedAnnotationReadView(std::move(*coco_val)), objects_sampling.view,
+  open_images_sampling.view, std::move(coco_indexes_cache_hit), std::move(objects_index_cache_hit), std::move(open_images_index_cache_hit), std::move(combined_sampling), std::move(objects_sampling),
   std::move(open_images_sampling), std::move(sampling_object_artifacts)
  };
 }

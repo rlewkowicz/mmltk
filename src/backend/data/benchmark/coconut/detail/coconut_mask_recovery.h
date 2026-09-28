@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <tuple>
@@ -43,13 +44,17 @@ public:
  explicit CoconutMaskRecovery(const CoconutRecoveryOriginals& originals) : originals_(originals) {}
  CoconutMaskRecovery(const CoconutMaskRecovery&) = delete;
  CoconutMaskRecovery& operator=(const CoconutMaskRecovery&) = delete;
+ [[nodiscard]] std::unique_ptr<CoconutMaskRecovery> make_workspace() const;
  [[nodiscard]] std::string_view original_identity(CoconutImageNamespace source) const noexcept;
+ // Uses admitted image/box endpoints; does not visit the original mask payload.
+ [[nodiscard]] std::uint64_t workspace_bytes(const CoconutRecord&) const;
+ [[nodiscard]] std::uint64_t retained_bytes() const noexcept;
  // The input owner's allowance covers this reusable workspace until retirement.
  void retire_scratch() noexcept;
  // Support belongs to this decoded image. Facts are appended for successful
  // assignments; rejection counts are settled by the importer after carving.
  void apply(CoconutImageNamespace source, const CoconutRecord& record, std::uint32_t width, std::uint32_t height, std::span<CoconutSegmentSupport> support, CoconutRecoveryImage& facts,
-  mmltk::common::concurrency::CancellationObservation cancellation = {});
+  mmltk::common::concurrency::CancellationObservation cancellation = {}, std::uint64_t* support_capacity_bytes = nullptr);
 
 private:
  using Cancellation = mmltk::common::concurrency::CancellationObservation;

@@ -13,6 +13,7 @@ constexpr std::uint64_t kShardCandidateHeadroomDenominator = 10U;
 struct ClassMembership {
  std::uint64_t low = 0U;
  std::uint64_t high = 0U;
+ std::size_t mask_runs = 0;
 };
 struct HashedImage {
  std::uint64_t hash = 0U;
@@ -30,7 +31,7 @@ struct SourceSelection {
  std::array<std::size_t, kClassCount> cursors{};
  std::vector<std::uint8_t> selected;
  SupplementalSamplingStats stats;
- std::size_t selected_boxes = 0U;
+ std::size_t selected_boxes = 0U, selected_runs = 0U;
 };
 struct ShardSummary {
  std::uint64_t images = 0U;
@@ -88,6 +89,7 @@ private:
    const NormalizedBox& box = source.boxes[checked_cast<std::size_t>(box_index, "supplemental box index overflow")];
    if (box.class_id >= kClassCount) { throw std::runtime_error("supplemental sampler received an invalid class id"); }
    add_class(&membership, box.class_id);
+   membership.mask_runs = mmltk::common::math::checked_add(membership.mask_runs, std::size_t{box.mask_rle_pairs}, "supplemental image mask count overflow");
   }
   if (membership.low == 0U && membership.high == 0U) { throw std::runtime_error("supplemental sampler received an image without mapped classes"); }
   memberships[image_index] = membership;
@@ -217,7 +219,8 @@ void select_image(SourceSelection* source, const std::uint32_t image_index, std:
  const NormalizedImage& image = source->source->images[image_index];
  source->selected[image_index] = 1U;
  ++source->stats.selected_images;
- source->selected_boxes += image.box_count;
+ source->selected_boxes = mmltk::common::math::checked_add(source->selected_boxes, std::size_t{image.box_count}, "supplemental selected box count overflow");
+ source->selected_runs = mmltk::common::math::checked_add(source->selected_runs, source->memberships[image_index].mask_runs, "supplemental selected mask count overflow");
  ClassMembershipCursor classes(source->memberships[image_index]);
  while (const auto class_id = classes.next()) {
   ++source->stats.selected_class_images[*class_id];
@@ -243,19 +246,14 @@ void select_image(SourceSelection* source, const std::uint32_t image_index, std:
  if (!class_candidate_available(source, class_id)) { throw std::runtime_error("supplemental class candidate unexpectedly exhausted"); }
  return source->candidates[class_id][cursor++];
 }
-[[nodiscard]] NormalizedAnnotationIndex materialize_selection(const SourceSelection& source, mmltk::common::concurrency::CancellationObservation cancellation) {
- NormalizedAnnotationIndex result;
- result.source = source.source->source;
- result.split = source.source->split;
- result.annotation_sha256 = source.source->annotation_sha256;
- result.rejected = source.source->rejected;
- result.images.reserve(checked_cast<std::size_t>(source.stats.selected_images, "supplemental selected image count overflow"));
- result.boxes.reserve(source.selected_boxes);
- for (std::size_t image_index = 0U; image_index < source.source->images.size(); ++image_index) {
-  if (source.selected[image_index] == 0U) { continue; }
-  append_normalized_image_slice(result, *source.source, image_index, cancellation);
+[[nodiscard]] NormalizedAnnotationReadView selected_view(const SourceSelection& source, mmltk::common::concurrency::CancellationObservation cancellation) {
+ std::vector<std::size_t> positions;
+ positions.reserve(checked_cast<std::size_t>(source.stats.selected_images, "supplemental selected image count overflow"));
+ for (std::size_t position = 0; position < source.selected.size(); ++position) {
+  if ((position & 4095U) == 0) throw_if_cancelled(cancellation);
+  if (source.selected[position]) positions.push_back(position);
  }
- return result;
+ return NormalizedAnnotationReadView(*source.source).select_images(std::move(positions), NormalizedAnnotationReadView::Counts{source.selected_boxes, source.selected_runs}, cancellation);
 }
 }  // namespace
 CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const NormalizedAnnotationIndex& coco_train, const NormalizedAnnotationIndex& objects365,
@@ -318,8 +316,8 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
  open_selection.stats.selected_boxes = open_selection.selected_boxes;
  result.objects365.stats = object_selection.stats;
  result.open_images.stats = open_selection.stats;
- result.objects365.index = materialize_selection(object_selection, cancel_requested);
- result.open_images.index = materialize_selection(open_selection, cancel_requested);
+ result.objects365.view = selected_view(object_selection, cancel_requested);
+ result.open_images.view = selected_view(open_selection, cancel_requested);
  return result;
 }
 }  // namespace mmltk::backend::data::benchmark_internal

@@ -40,7 +40,7 @@ struct CustomRecipeCatalog {
 [[nodiscard]] CustomRecipeCatalog custom_recipe_catalog();
 struct CustomRecipePreparation {
  std::filesystem::path coco_train_index_path, coco_val_index_path, objects_index_path, open_images_index_path;
- std::optional<NormalizedAnnotationIndex> coco_train, coco_val, objects, open_images;
+ std::optional<NormalizedAnnotationReadView> coco_train, coco_val, objects, open_images;
  bool coco_indexes_cache_hit, objects_index_cache_hit, open_images_index_cache_hit;
  CombinedSupplementalSamplingResult combined_sampling;
  SupplementalSamplingResult objects_sampling, open_images_sampling;

@@ -38,6 +38,21 @@ public:
  ~BenchmarkCompilePipeline();
  BenchmarkCompilePipeline(const BenchmarkCompilePipeline&) = delete;
  BenchmarkCompilePipeline& operator=(const BenchmarkCompilePipeline&) = delete;
+ // Source-scoped scratch keeps its charged capacity across adjacent groups.
+ // Its noexcept retirement releases physical buffers before returning credits.
+ // The source buffers and pipeline must outlive this stable, nonmovable owner.
+ class Workspace final {
+ public:
+  Workspace(BenchmarkCompilePipeline&, std::function<void(std::size_t)> retire);
+  ~Workspace();
+  Workspace(const Workspace&) = delete;
+  Workspace& operator=(const Workspace&) = delete;
+ private:
+  friend class BenchmarkCompilePipeline;
+  BenchmarkCompilePipeline& owner_;
+  std::function<void(std::size_t)> retire_;
+  bool active_ = false;
+ };
  [[nodiscard]] std::size_t workers() const noexcept;
  [[nodiscard]] std::size_t current_lane() const;
  [[nodiscard]] BenchmarkCurl& curl();
@@ -73,7 +88,17 @@ public:
  // Bounded records recycle on individual completion. Retirement finishes before
  // returning, including failure; it cannot retire suspended cooperative scratch.
  void for_each(BenchmarkStage, std::size_t count, BenchmarkResources, const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>& retire_scratch = {});
+ void for_each(BenchmarkStage, std::size_t count, const std::function<BenchmarkResources(std::size_t)>&,
+  const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>& retire_scratch = {});
+ void for_each(BenchmarkStage, std::size_t count, const std::function<BenchmarkResources(std::size_t)>&,
+  const std::function<void(std::size_t)>&, Workspace&);
  void write_remaining(BenchmarkSplitWriter&, const PreparedBenchmarkSplit&, std::span<const std::size_t>);
+ // A stopped input reader may expose unused promise bytes to ready pixel
+ // writes. Source/producer admission still sees its complete reservation.
+ // Reclaims every borrowed physical workspace before returning or throwing;
+ // callback and reclaim execute outside CPU lanes. The input owner must keep
+ // its allocation window stable and include all of its consumers in live_bytes.
+ void with_unused_workspace(const BenchmarkAllowance&, std::uint64_t live_bytes, const std::function<void()>&);
  // A synchronous library parser yields between bounded progress points.
  // Runs only already-ready work on its current lane, without waiting.
  void cooperate();
@@ -106,6 +131,8 @@ public:
   BenchmarkCompilePipeline& owner_;
  };
 private:
+ void for_each_impl(BenchmarkStage, std::size_t, const std::function<BenchmarkResources(std::size_t)>&,
+  const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>&, bool retain_scratch);
  void retire_workspace(const void*) noexcept;
  struct Impl;
  std::shared_ptr<Impl> impl_;

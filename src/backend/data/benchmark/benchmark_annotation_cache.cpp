@@ -113,9 +113,10 @@ std::string extract_archive_member(const std::filesystem::path& archive_path, st
 [[nodiscard]] std::optional<NormalizedAnnotationIndex> discover_cached_index(const std::filesystem::path& path, const BenchmarkDatasetSource source, const std::string_view split,
  mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace) {
  try {
-  const nlohmann::json manifest = read_json_file(path.string() + ".complete.json");
+  std::uint64_t extent = 0;
+  const nlohmann::json manifest = read_json_file(path.string() + ".complete.json", &extent);
   const std::string digest = manifest.at("annotation_sha256").get<std::string>();
-  return load_normalized_annotation_index(path, source, split, digest, cancel_requested, trace);
+  return load_normalized_annotation_index(path, source, split, digest, cancel_requested, trace, &manifest, false, extent);
  } catch (const std::exception& error) {
   if (is_benchmark_capacity_failure(error)) throw;
   throw_if_benchmark_cancelled(cancel_requested);
@@ -124,11 +125,11 @@ std::string extract_archive_member(const std::filesystem::path& archive_path, st
 }
 [[nodiscard]] NormalizedAnnotationIndex load_or_build_index(const BenchmarkCacheLayout& cache, const std::filesystem::path& path, const BenchmarkDatasetSource source, const std::string_view split,
  const std::string_view annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace,
- const std::function<NormalizedAnnotationIndex()>& builder, StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
+ const std::function<NormalizedAnnotationIndex(const BenchmarkAllowance&)>& builder, StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
  auto lease = ArtifactLease::acquire_charged(cache.locks / (std::string(benchmark_source_name(source)) + "-" + std::string(split) + ".index.lock"), cancel_requested, execution, BenchmarkResources::handles(2, true), parent);
  if (auto cached = load_normalized_annotation_index(path, source, split, annotation_sha256, cancel_requested, trace)) { return std::move(*cached); }
- NormalizedAnnotationIndex index = builder();
- store_normalized_annotation_index(path, index, cancel_requested, trace, storage);
+ NormalizedAnnotationIndex index = builder(lease->allowance());
+ index.completion = store_normalized_annotation_index(path, index, cancel_requested, trace, storage);
  return index;
 }
 // Runs an annotation indexing step with up to three attempts, invoking repair (cache invalidation
@@ -201,11 +202,11 @@ void CocoAnnotationCache::build_split(bool training, const std::string& digest, 
  const std::string label = training ? "train" : "validation";
  const auto json_path = source_json(training);
  std::filesystem::create_directories(json_path.parent_path());
- index = load_or_build_index(cache_, training ? indexes_.train_path : indexes_.validation_path, BenchmarkDatasetSource::kCoco2017, split, digest, cancellation_, trace_, [&] {
+ index = load_or_build_index(cache_, training ? indexes_.train_path : indexes_.validation_path, BenchmarkDatasetSource::kCoco2017, split, digest, cancellation_, trace_, [&](const BenchmarkAllowance& input_allowance) {
   progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Parsing and indexing COCO " + label + " annotations");
   try {
    return parse_coco_style_annotations(json_path, digest, coco_category_mappings(),
-    AnnotationParseOptions{BenchmarkDatasetSource::kCoco2017, split, training ? train_count_ : validation_count_, parse_workers_, !training, cancellation_, trace_, execution_});
+    AnnotationParseOptions{BenchmarkDatasetSource::kCoco2017, split, training ? train_count_ : validation_count_, parse_workers_, !training, cancellation_, trace_, execution_, input_allowance});
   } catch (const AnnotationDocumentRejected& error) {
    throw_if_benchmark_cancelled(cancellation_);
    throw AnnotationSourceUnavailable(error.what());
@@ -312,8 +313,10 @@ CocoAnnotationIndexes CocoAnnotationCache::take_indexes() {
   if ((training ? selection_.train : selection_.validation) == CocoSplitAdmission::Unselected) continue;
   const auto& path = training ? indexes_.train_path : indexes_.validation_path;
   const auto json = source_json(training);
-  account(path);
-  account(path.string() + ".complete.json");
+  const auto& index = training ? indexes_.train : indexes_.validation;
+  if (index && index->completion) storage = common_math::checked_add(storage,
+   common_math::checked_add(index->completion->size, index->completion->proof_bytes, "stock index storage overflow"), "stock annotation storage overflow");
+  else { account(path); account(path.string() + ".complete.json"); }
   account(json);
   account(json.string() + ".extract.json");
  }

@@ -37,10 +37,21 @@ public:
  [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(credits_); }
  [[nodiscard]] std::uint64_t bytes() const noexcept;
  [[nodiscard]] std::size_t descriptors() const noexcept;
+ [[nodiscard]] bool aliases(const BenchmarkAllowance& other) const noexcept { return credits_ && credits_ == other.credits_; }
+ // At a settled owner boundary, resize only this credit's unused promise.
+ // The caller preserves its live backing envelope; split children stay charged
+ // independently. Growth never waits and failure leaves custody unchanged.
+ // retain_capacity preserves high water only while no resource demand is blocked.
+ [[nodiscard]] bool try_resize_workspace(std::uint64_t, bool retain_capacity = false) const;
  // The backing owner calls this only after joining its workers and releasing
  // its own storage. Aliases keep descriptor commitments; split storage children
  // keep their separately charged bytes. External CPU capacity retires here too.
  void retire_workspace() const noexcept;
+ // After physically closing this owner's files and completing its descriptor
+ // production, return its draw and unused promises. Published consumers must
+ // already own their continuation. Live child returns pass through this retired
+ // owner; aliases and split storage cannot return the same promise twice.
+ void retire_descriptors() const noexcept;
  // Partition an already admitted storage envelope, without another ledger
  // charge. Use before publishing the allowance to readers.
  [[nodiscard]] BenchmarkAllowance split_storage(std::uint64_t);

@@ -1,5 +1,6 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
+#include "src/common/math/checked_arithmetic.h"
 #include "src/pch_std.h"
 namespace mmltk::backend::data::benchmark_internal {
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
@@ -57,13 +58,44 @@ const CoconutRecoveryOriginals::Originals* CoconutRecoveryOriginals::originals(C
  if (source == CoconutImageNamespace::CocoValidation) return &validation_;
  return nullptr;
 }
+std::unique_ptr<CoconutMaskRecovery> CoconutMaskRecovery::make_workspace() const { return std::make_unique<CoconutMaskRecovery>(originals_); }
 std::string_view CoconutMaskRecovery::original_identity(CoconutImageNamespace source) const noexcept {
  const auto* selected = originals_.originals(source);
  return selected && selected->index ? std::string_view(selected->index->annotation_sha256) : std::string_view{};
 }
 void CoconutMaskRecovery::retire_scratch() noexcept { workspace_ = Workspace{}; }
+std::uint64_t CoconutMaskRecovery::retained_bytes() const noexcept {
+ return workspace_.groups.capacity() * sizeof(Group) + workspace_.ordinals.capacity() * sizeof(std::size_t) +
+  workspace_.candidates.capacity() * sizeof(Candidate) + workspace_.represented.capacity() + workspace_.remaining.capacity() * sizeof(const Candidate*) +
+  workspace_.identities.capacity() * sizeof(std::uint64_t) + (workspace_.combined.capacity() + workspace_.scratch.capacity()) * sizeof(RLEPair);
+}
+std::uint64_t CoconutMaskRecovery::workspace_bytes(const CoconutRecord& record) const {
+ using mmltk::common::math::checked_add;
+ using mmltk::common::math::checked_multiply;
+ std::uint64_t maximum = 0;
+ for (const auto source : {CoconutImageNamespace::CocoTrain, CoconutImageNamespace::CocoValidation}) {
+  const auto* selected = originals_.originals(source);
+  if (!selected || !selected->index) continue;
+  const auto found = selected->images.find(record.image_id);
+  if (found == selected->images.end() || !found->second) continue;
+  const auto& image = *found->second;
+  const auto& index = *selected->index;
+  if ((record.width && record.width != image.width) || (record.height && record.height != image.height) || !image.box_count ||
+      image.first_box > index.boxes.size() || image.box_count > index.boxes.size() - image.first_box) continue;
+  const auto& first = index.boxes[image.first_box];
+  const auto& last = index.boxes[image.first_box + image.box_count - 1];
+  auto runs = static_cast<std::uint64_t>(index.mask_rle_pairs.size());
+  if (last.mask_rle_offset <= runs && last.mask_rle_pairs <= runs - last.mask_rle_offset && first.mask_rle_offset <= last.mask_rle_offset + last.mask_rle_pairs)
+   runs = last.mask_rle_offset + last.mask_rle_pairs - first.mask_rle_offset;
+  // Candidates and grouping, copied recovery support, union and carving
+  // scratch include vector growth and its old/new allocation overlap.
+  maximum = std::max(maximum, checked_add(checked_multiply(runs, std::uint64_t{128}, "COCONut recovery run workspace overflow"),
+   checked_multiply(std::uint64_t{image.box_count}, std::uint64_t{512}, "COCONut recovery candidate workspace overflow"), "COCONut recovery workspace overflow"));
+ }
+ return maximum;
+}
 void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecord& record, std::uint32_t width, std::uint32_t height, std::span<CoconutSegmentSupport> support,
- CoconutRecoveryImage& facts, Cancellation cancellation) {
+ CoconutRecoveryImage& facts, Cancellation cancellation, std::uint64_t* support_capacity_bytes) {
  // Reset even after cancellation or an unavailable image; clear retains capacity.
  workspace_.groups.clear();
  workspace_.ordinals.clear();
@@ -194,7 +226,9 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
    const auto& candidate = *workspace_.remaining[i];
    auto& target = support[ordinal];
    target.recovered = *candidate.box;
+   const auto previous_capacity = target.runs.capacity();
    target.runs.assign(candidate.runs.begin(), candidate.runs.end());
+   if (support_capacity_bytes) *support_capacity_bytes += (target.runs.capacity() - previous_capacity) * sizeof(RLEPair);
    target.area = 0;
    for (const auto run : target.runs) {
     throw_if_benchmark_cancelled(cancellation);
@@ -260,6 +294,7 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
    emit(cursor, end);
   }
   if (area == target.area) continue;
+  if (support_capacity_bytes) *support_capacity_bytes = *support_capacity_bytes - target.runs.capacity() * sizeof(RLEPair) + workspace_.scratch.capacity() * sizeof(RLEPair);
   target.runs.swap(workspace_.scratch);
   target.area = area;
   target.carved = true;

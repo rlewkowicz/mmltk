@@ -71,6 +71,7 @@ mmltk_register_public_headers(
 mmltk_register_ordinary_sources(mmltk_backend_data
     compiled/compiled_file_layout.cpp
     compiled/compiled_dataset.cpp
+    benchmark/benchmark_json.cpp
     benchmark/benchmark_annotations.cpp
     benchmark/coconut/coconut_annotations.cpp
     benchmark/coconut/coconut_physical.cpp
@@ -111,8 +112,10 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     writable_pixel_range.cpp)
 mmltk_register_private_headers(mmltk_backend_data
     benchmark/detail/benchmark_annotation_cache.h
+    benchmark/detail/benchmark_json.h
     benchmark/detail/benchmark_annotations.h
     benchmark/detail/benchmark_archive.h
+    benchmark/coconut/detail/coconut_parquet.h
     benchmark/coconut/detail/coconut_annotations.h
     benchmark/coconut/detail/coconut_physical.h
     benchmark/coconut/detail/coconut_mask_recovery.h

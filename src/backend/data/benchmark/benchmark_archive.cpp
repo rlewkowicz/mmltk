@@ -482,6 +482,10 @@ void BenchmarkArchive::pause() {
 void BenchmarkArchive::resume(std::uint64_t workspace) { impl_->resume(workspace); }
 BenchmarkArchive::GzipSeekState BenchmarkArchive::gzip_seek_state() const { return {impl_->gzip ? impl_->gzip->availableWindowCount() : 0, static_cast<bool>(impl_->gzip), impl_->streaming_mode, impl_->rolling_windows, impl_->control_capacity_reached,
  impl_->gzip ? impl_->gzip->indexEntryCount() : 0, impl_->gzip ? impl_->gzip->indexStorageBytes() : 0}; }
+std::uint64_t BenchmarkArchive::retained_workspace_bytes() const {
+ const auto& state = *impl_;
+ return checked_add(state.reader ? archive_workspace(state.compressed, state.decoders, 0) : std::uint64_t{0}, static_cast<std::uint64_t>(state.bytes.capacity()), "archive retained workspace overflow");
+}
 BenchmarkAllowance BenchmarkArchive::allowance() const { return impl_->credits; }
 void BenchmarkArchive::cpu(const std::function<void()>& work) const { impl_->cpu(work); }
 } // namespace mmltk::backend::data::benchmark_internal

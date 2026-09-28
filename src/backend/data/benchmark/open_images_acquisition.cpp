@@ -371,19 +371,14 @@ struct CachedOpenImagesGroup {
 }
 void complete_open_images_group(const std::filesystem::path& image_root, const std::filesystem::path& completion, const std::string_view identity,
  const std::span<const std::uint64_t> requested_image_ids, const std::span<const std::uint64_t> available_image_ids, const std::span<const QuarantinedImage> quarantined,
- std::span<const NormalizedImage> images, const std::uint64_t image_bytes, const mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, StorageReservationPool* storage) {
+ BenchmarkCompilePipeline& execution, const std::uint64_t image_bytes, const mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, StorageReservationPool* storage) {
  nlohmann::json quarantine_records = nlohmann::json::array();
  for (const QuarantinedImage& image : quarantined) { quarantine_records.push_back({{"image_id", image.image_id}, {"reason", image.reason}}); }
  nlohmann::json dimensions = nlohmann::json::array();
- std::size_t available = 0;
- for (const auto& image : images) {
-  if (available == available_image_ids.size()) break;
-  if (image.source_image_id != available_image_ids[available]) continue;
-  const auto image_id = available_image_ids[available++];
-  if (image.width == 0U || image.height == 0U) { throw std::runtime_error("Open Images cache completion has missing dimensions"); }
-  dimensions.push_back(image_id);
-  dimensions.push_back(image.width);
-  dimensions.push_back(image.height);
+ for (const auto image_id : available_image_ids) {
+  const auto geometry = execution.geometry(image_root, image_id);
+  if (!geometry || geometry->width == 0 || geometry->height == 0) throw std::runtime_error("Open Images cache completion has missing dimensions");
+  dimensions.push_back(image_id); dimensions.push_back(geometry->width); dimensions.push_back(geometry->height);
  }
  write_json_atomically(completion,
   nlohmann::json{
@@ -461,7 +456,7 @@ class OpenImagesAcquisition final {
  };
 
  const BenchmarkCacheLayout& cache;
- NormalizedAnnotationIndex& index;
+ const NormalizedAnnotationReadView& index;
  std::vector<QuarantinedImage>* quarantined;
  Cancellation cancellation;
  ProgressReporter* progress;
@@ -596,7 +591,6 @@ class OpenImagesAcquisition final {
      trace_benchmark_event(trace, "benchmark.images.cache_invalid", [&] { return nlohmann::json{{"source", "open-images"}, {"shard", group.name}, {"image_id", id}, {"error", result.retry_reason}}; });
     }
     if (result.file_payload) {
-     auto& image = index.images[result.input.position]; image.width = result.width; image.height = result.height;
      group.bytes = common_math::checked_add(group.bytes, result.file_payload->size(), "Open Images cached byte total overflow");
      group.images[result.input.position - group.begin] = ImageState::Available;
      finish_image(group);
@@ -609,7 +603,7 @@ class OpenImagesAcquisition final {
    if (!result.retry_reason.empty()) retry({result.input.position, result.input.attempt}, std::move(result.retry_reason));
    else {
     auto& group = *groups.at(result.input.position / kOpenImagesGroupImages * kOpenImagesGroupImages);
-    auto& image = index.images[result.input.position]; image.width = result.width; image.height = result.height;
+    const auto& image = index.image(result.input.position);
     group.bytes = common_math::checked_add(group.bytes, result.input.buffer->encoded.size(), "Open Images cached byte total overflow");
     group.images[result.input.position - group.begin] = ImageState::Available;
     const auto local = result.input.position - group.begin;
@@ -695,7 +689,7 @@ class OpenImagesAcquisition final {
    for (std::size_t position = 0; position < group.count; ++position) if (group.images[position] == ImageState::Available) group_available.push_back(ids[group.begin + position]);
    if (group_available.size() + group.quarantined.size() != group.count) throw std::runtime_error("Open Images group completion count is inconsistent");
    if (!group.cache_hit) complete_open_images_group(image_root, group.completion, group.identity, std::span(ids).subspan(group.begin, group.count), group_available, group.quarantined,
-    std::span(index.images).subspan(group.begin, group.count), group.bytes, cancellation, trace, execution ? &execution->storage() : nullptr);
+    *execution, group.bytes, cancellation, trace, execution ? &execution->storage() : nullptr);
    cached_bytes = common_math::checked_add(cached_bytes, group.bytes, "Open Images cached byte total overflow");
    available.insert(available.end(), group_available.begin(), group_available.end());
    quarantined->insert(quarantined->end(), std::make_move_iterator(group.quarantined.begin()), std::make_move_iterator(group.quarantined.end()));
@@ -785,9 +779,9 @@ class OpenImagesAcquisition final {
     std::size_t position = 0;
     for (std::size_t i = 0; i < cached.available_image_ids.size(); ++i) {
      while (ids[begin + position] != cached.available_image_ids[i]) ++position;
-     auto& image = index.images[begin + position]; image.width = cached.dimensions[i][0]; image.height = cached.dimensions[i][1];
+     const auto& image = index.image(begin + position);
      group.images[position++] = ImageState::Available;
-     publish(group, {image.source_image_id, std::pair{image.width, image.height}});
+     publish(group, {image.source_image_id, std::pair{cached.dimensions[i][0], cached.dimensions[i][1]}});
     }
     group.bytes = cached.image_bytes; group.quarantined = std::move(cached.quarantined); group.completed = group.count;
     queue_finished(group);
@@ -812,7 +806,7 @@ class OpenImagesAcquisition final {
   return group.scan_cursor != begin_cursor;
  }
 public:
- OpenImagesAcquisition(const BenchmarkCacheLayout& cache_value, NormalizedAnnotationIndex& index_value, std::vector<QuarantinedImage>* quarantined_value,
+ OpenImagesAcquisition(const BenchmarkCacheLayout& cache_value, const NormalizedAnnotationReadView& index_value, std::vector<QuarantinedImage>* quarantined_value,
   Cancellation cancel, ProgressReporter* reporter, int workers, std::size_t cache_workers, const BenchmarkTraceSink& trace_value,
   std::optional<ImageDecodeProbe> probe, BenchmarkCompilePipeline* pipeline, const std::function<std::string(std::uint64_t)>& urls, const std::function<void(std::uint64_t)>& warm_read)
   : cache(cache_value), index(index_value), quarantined(quarantined_value), cancellation(cancel), progress(reporter), trace(trace_value), decode_probe(probe), execution(pipeline), image_url(urls),
@@ -863,9 +857,11 @@ public:
  }
 };
 }  // namespace
-AcquiredOpenImages acquire_open_images(const BenchmarkCacheLayout& cache, NormalizedAnnotationIndex& index, std::vector<QuarantinedImage>* quarantined,
+AcquiredOpenImages acquire_open_images(const BenchmarkCacheLayout& cache, const NormalizedAnnotationReadView& index, std::vector<QuarantinedImage>* quarantined,
  mmltk::common::concurrency::CancellationObservation cancellation, ProgressReporter* progress, int num_workers, std::size_t cache_workers, const BenchmarkTraceSink& trace,
  std::optional<ImageDecodeProbe> decode_probe, BenchmarkCompilePipeline* execution, const std::function<std::string(std::uint64_t)>& image_url, const std::function<void(std::uint64_t)>& warm_read) {
+ std::unique_ptr<BenchmarkCompilePipeline> standalone;
+ if (!execution) { standalone = std::make_unique<BenchmarkCompilePipeline>(std::max(1, num_workers), std::span<const int>{}, BenchmarkExecutionLimits{}, cancellation); execution = standalone.get(); }
  OpenImagesAcquisition acquisition(cache, index, quarantined, cancellation, progress, num_workers, cache_workers, trace, decode_probe, execution, image_url, warm_read);
  return acquisition.run();
 }

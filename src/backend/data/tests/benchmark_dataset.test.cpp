@@ -25,6 +25,7 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <span>
+#include <simdjson.h>
 #include <stb_image_write.h>
 #include <stdexcept>
 #include <string>
@@ -47,6 +48,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/compiled_file.h"
+#include "src/backend/data/detail/mask_rle_utils.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
@@ -72,6 +74,10 @@ using namespace mmltk::backend::data;
 using namespace mmltk::backend::data::benchmark_internal;
 using mmltk::common::io::FileHandle;
 namespace {
+NormalizedAnnotationIndex fixture_index(const NormalizedAnnotationBuilder& builder) {
+ return seal_normalized_annotation_metadata(NormalizedAnnotationBuilder(builder));
+}
+const NormalizedAnnotationIndex& fixture_index(const NormalizedAnnotationIndex& index) { return index; }
 void require_condition(const bool condition, const char* message) {
  if (!condition) { throw std::runtime_error(message); }
 }
@@ -368,14 +374,14 @@ void test_benchmark_annotation_indexes() {
  REQUIRE(parsed.rejected.unmapped_categories == 1U);
  parsed.rejected = {.raw_records = 101U, .unmapped_categories = 23U, .unknown_images = 37U, .malformed_records = 41U, .degenerate_boxes = 53U, .duplicate_boxes = 67U};
  const fs::path index_path = root.path() / "mini-coco.index";
- store_normalized_annotation_index(index_path, parsed, {});
+ store_normalized_annotation_index(index_path, fixture_index(parsed), {});
  const RetainedArtifact retained_index{index_path};
  auto loaded = load_normalized_annotation_index(index_path, options.source, options.split, digest, {}, throwing_trace);
  retained_index.Check();
  if (!loaded.has_value()) { throw std::runtime_error("stored normalized annotation index did not reload"); }
  REQUIRE(loaded.value().images.size() == 2U);
  REQUIRE(loaded.value().boxes.size() == 2U);
- CHECK(image_ids(*loaded) == image_ids(parsed));
+ CHECK(image_ids(NormalizedAnnotationReadView(*loaded)) == image_ids(NormalizedAnnotationReadView(parsed)));
  CHECK(loaded->rejected.raw_records == 101U);
  CHECK(loaded->rejected.unmapped_categories == 23U);
  CHECK(loaded->rejected.unknown_images == 37U);
@@ -408,7 +414,7 @@ void test_benchmark_annotation_indexes() {
  corrupt_byte(index_path, 0U);
  loaded = load_normalized_annotation_index(index_path, options.source, options.split, digest, {});
  REQUIRE(!loaded);
- store_normalized_annotation_index(index_path, parsed, {});
+ store_normalized_annotation_index(index_path, fixture_index(parsed), {});
  const fs::path classes = root.path() / "classes.csv";
  const fs::path boxes = root.path() / "boxes.csv";
  write_text(classes, "/m/person,Person\n");
@@ -435,7 +441,7 @@ void test_benchmark_annotation_indexes() {
  REQUIRE(open.rejected.degenerate_boxes == 1U);
 }
 void test_benchmark_supplemental_sampling() {
- NormalizedAnnotationIndex source;
+ NormalizedAnnotationBuilder source;
  source.source = BenchmarkDatasetSource::kObjects365V2;
  source.split = "train";
  source.annotation_sha256 = "synthetic";
@@ -465,13 +471,13 @@ void test_benchmark_supplemental_sampling() {
    source.mask_rle_pairs.push_back({static_cast<std::uint32_t>(i + 100), 2});
   }
  }
- NormalizedAnnotationIndex coco;
+ NormalizedAnnotationBuilder coco;
  coco.source = BenchmarkDatasetSource::kCoco2017;
- NormalizedAnnotationIndex open_images = source;
+ NormalizedAnnotationBuilder open_images = source;
  open_images.source = BenchmarkDatasetSource::kOpenImagesV7;
  const std::array<std::uint64_t, 4U> shard_bytes{1U, 1U, 1U, 1U};
- const CombinedSupplementalSamplingResult first_combined = sample_combined_supplemental_indices(coco, source, open_images, shard_bytes);
- const CombinedSupplementalSamplingResult second_combined = sample_combined_supplemental_indices(coco, source, open_images, shard_bytes);
+ const CombinedSupplementalSamplingResult first_combined = sample_combined_supplemental_indices(fixture_index(coco), fixture_index(source), fixture_index(open_images), shard_bytes);
+ const CombinedSupplementalSamplingResult second_combined = sample_combined_supplemental_indices(fixture_index(coco), fixture_index(source), fixture_index(open_images), shard_bytes);
  const SupplementalSamplingResult& first = first_combined.objects365;
  const SupplementalSamplingResult& second = second_combined.objects365;
  REQUIRE(first.stats.full_images == kImageCount);
@@ -480,56 +486,45 @@ void test_benchmark_supplemental_sampling() {
  REQUIRE(first.stats.selected_images + first_combined.open_images.stats.selected_images == first_combined.target_images);
  REQUIRE(first_combined.open_images.stats.selected_images >= first_combined.open_images_floor);
  REQUIRE(first_combined.open_images.stats.selected_images <= first_combined.open_images_ceiling);
- for (const auto* selected : {&first_combined.objects365.index, &first_combined.open_images.index}) {
+ for (const auto* selected : {&first_combined.objects365.view, &first_combined.open_images.view}) {
   CHECK(reject_json(selected->rejected) == reject_json(source.rejected));
-  std::size_t box_position = 0, run_position = 0;
-  for (const auto& image : selected->images) {
-   auto expected_image = source.images[image.source_image_id];
-   const auto source_first = expected_image.first_box;
-   expected_image.first_box = box_position;
+  std::size_t boxes = 0, runs = 0;
+  for (const auto& image : selected->images()) {
+   const auto& expected_image = source.images[image.source_image_id];
    CHECK(std::memcmp(&image, &expected_image, sizeof(NormalizedImage)) == 0);
-   for (std::size_t j = 0; j < image.box_count; ++j) {
-    auto expected = source.boxes[source_first + j];
-    const auto source_run = expected.mask_rle_offset;
-    expected.mask_rle_offset = run_position;
-    REQUIRE(box_position < selected->boxes.size());
-    CHECK(std::memcmp(&selected->boxes[box_position++], &expected, sizeof(NormalizedBox)) == 0);
-    for (std::size_t r = 0; r < expected.mask_rle_pairs; ++r) {
-     REQUIRE(run_position < selected->mask_rle_pairs.size());
-     CHECK(selected->mask_rle_pairs[run_position].start == source.mask_rle_pairs[source_run + r].start);
-     CHECK(selected->mask_rle_pairs[run_position++].length == source.mask_rle_pairs[source_run + r].length);
+   CHECK(&image == &selected->storage().images[image.source_image_id]);
+   for (const auto& box : selected->storage().boxes.subspan(image.first_box, image.box_count)) {
+    for (const auto& run : selected->storage().mask_rle_pairs.subspan(box.mask_rle_offset, box.mask_rle_pairs)) {
+     CHECK(run.length != 0);
+     ++runs;
     }
+    ++boxes;
    }
   }
-  CHECK(box_position == selected->boxes.size());
-  CHECK(run_position == selected->mask_rle_pairs.size());
+  CHECK(boxes == selected->box_count());
+  CHECK(runs == selected->run_count());
+  CHECK(selected->storage().boxes.size() == source.boxes.size());
  }
- REQUIRE(!first.index.images.empty());
- REQUIRE(first.stats.selected_boxes == first.index.boxes.size());
- REQUIRE(first.index.images.size() == second.index.images.size());
- REQUIRE(first.index.boxes.size() == second.index.boxes.size());
- std::uint64_t previous_id = 0U;
- bool first_image = true;
- const auto boxes_equal = [](const NormalizedBox& left, const NormalizedBox& right) {
-  return left.x1 == right.x1 && left.y1 == right.y1 && left.x2 == right.x2 && left.y2 == right.y2 && left.class_id == right.class_id && std::ranges::equal(left.reserved, right.reserved);
- };
- for (std::size_t image_index = 0U; image_index < first.index.images.size(); ++image_index) {
-  const NormalizedImage& selected = first.index.images[image_index];
-  const NormalizedImage& repeated = second.index.images[image_index];
-  REQUIRE(selected.source_image_id == repeated.source_image_id);
-  REQUIRE(selected.box_count == repeated.box_count);
-  REQUIRE(selected.first_box == repeated.first_box);
-  REQUIRE((first_image || selected.source_image_id > previous_id));
-  first_image = false;
+ REQUIRE(first.view.image_count() != 0);
+ REQUIRE(first.stats.selected_boxes == first.view.box_count());
+ REQUIRE(first.view.image_count() == second.view.image_count());
+ REQUIRE(first.view.box_count() == second.view.box_count());
+ std::uint64_t previous_id = 0;
+ for (std::size_t position = 0; position < first.view.image_count(); ++position) {
+  const auto& selected = first.view.image(position);
+  const auto& repeated = second.view.image(position);
+  CHECK(std::memcmp(&selected, &repeated, sizeof(NormalizedImage)) == 0);
+  CHECK((position == 0 || selected.source_image_id > previous_id));
   previous_id = selected.source_image_id;
-  REQUIRE(selected.box_count == original_box_counts[static_cast<std::size_t>(selected.source_image_id)]);
-  for (std::uint32_t box_offset = 0U; box_offset < selected.box_count; ++box_offset) {
-   const NormalizedBox& selected_box = first.index.boxes[static_cast<std::size_t>(selected.first_box + box_offset)];
-   const NormalizedImage& original = source.images[static_cast<std::size_t>(selected.source_image_id)];
-   const NormalizedBox& original_box = source.boxes[static_cast<std::size_t>(original.first_box + box_offset)];
-   const NormalizedBox& repeated_box = second.index.boxes[static_cast<std::size_t>(repeated.first_box + box_offset)];
-   REQUIRE(boxes_equal(selected_box, original_box));
-   REQUIRE(boxes_equal(selected_box, repeated_box));
+  REQUIRE(selected.box_count == original_box_counts[selected.source_image_id]);
+  for (std::size_t offset = 0; offset < selected.box_count; ++offset) {
+   const auto& box = first.view.storage().boxes[selected.first_box + offset];
+   CHECK(std::memcmp(&box, &source.boxes[selected.first_box + offset], sizeof(NormalizedBox)) == 0);
+   CHECK(std::memcmp(&box, &second.view.storage().boxes[selected.first_box + offset], sizeof(NormalizedBox)) == 0);
+   for (std::size_t run = box.mask_rle_offset; run < box.mask_rle_offset + box.mask_rle_pairs; ++run) {
+    CHECK(first.view.storage().mask_rle_pairs[run].start == source.mask_rle_pairs[run].start);
+    CHECK(first.view.storage().mask_rle_pairs[run].length == source.mask_rle_pairs[run].length);
+   }
   }
  }
  std::array<std::uint64_t, 80U> combined_class_images{};
@@ -1182,7 +1177,7 @@ TEST_CASE("benchmark destination preparation preserves parent and obstruction be
 TEST_CASE("benchmark download cache lifecycle", "[backend][data][benchmark][download]") { test_benchmark_download_cache_lifecycle(); }
 TEST_CASE("benchmark annotation indexes", "[backend][data][benchmark][annotations]") { test_benchmark_annotation_indexes(); }
 TEST_CASE("normalized slices preserve exact fields and owned storage", "[backend][data][benchmark][annotations]") {
- NormalizedAnnotationIndex input;
+ NormalizedAnnotationBuilder input;
  input.split = "unsorted";
  input.annotation_sha256 = "identity";
  input.rejected = {13, 2, 3, 4, 5, 6};
@@ -1262,29 +1257,35 @@ TEST_CASE("normalized slice admission and cancellation cannot append partial dat
   std::size_t stop = SIZE_MAX;
   bool cancelled() const noexcept { return polls++ >= stop; }
  };
- NormalizedAnnotationIndex source, destination;
+ NormalizedAnnotationBuilder source, destination;
  source.images = {{1, 0, 1, 8, 8, 0, 0}};
  source.boxes.resize(1);
  source.boxes[0].mask_rle_pairs = 131073;
  source.mask_rle_pairs.resize(131073, RLEPair{1, 1});
- SECTION("image position") { CHECK_THROWS(append_normalized_image_slice(destination, source, 1)); }
+ SECTION("image position") { CHECK_THROWS(append_normalized_image_slice(destination, fixture_index(source), 1)); }
  SECTION("box offset") {
   source.images[0].first_box = UINT64_MAX;
-  CHECK_THROWS(append_normalized_image_slice(destination, source, 0));
+  CHECK_THROWS(append_normalized_image_slice(destination, fixture_index(source), 0));
  }
  SECTION("box count") {
   source.images[0].box_count = 2;
-  CHECK_THROWS(append_normalized_image_slice(destination, source, 0));
+  CHECK_THROWS(append_normalized_image_slice(destination, fixture_index(source), 0));
  }
  SECTION("mask offset") {
   source.boxes[0].mask_rle_offset = UINT64_MAX;
-  CHECK_THROWS(append_normalized_image_slice(destination, source, 0));
+  CHECK_THROWS(append_normalized_image_slice(destination, fixture_index(source), 0));
  }
  SECTION("mask count") {
   source.boxes[0].mask_rle_pairs++;
-  CHECK_THROWS(append_normalized_image_slice(destination, source, 0));
+  CHECK_THROWS(append_normalized_image_slice(destination, fixture_index(source), 0));
  }
- SECTION("self append") { CHECK_THROWS(append_normalized_image_slice(source, source, 0)); }
+ SECTION("owned immutable source survives builder retirement") {
+  const auto stable = seal_normalized_annotation_metadata(std::move(source));
+  source = {};
+  append_normalized_image_slice(destination, stable, 0);
+  REQUIRE(destination.images.size() == 1);
+  CHECK(destination.images.front().source_image_id == stable.images.front().source_image_id);
+ }
  SECTION("retention checks every span before compaction") {
   source.images.push_back({2, 1, 1, 8, 8, 0, 0});
   const std::array<std::size_t, 1> retained{1};
@@ -1321,11 +1322,11 @@ TEST_CASE("normalized slice admission and cancellation cannot append partial dat
  SECTION("every transfer cancellation point") {
   Cancellation observed;
   auto complete = destination;
-  append_normalized_image_slice(complete, source, 0, mmltk::common::concurrency::CancellationObservation::Borrow(observed));
+  append_normalized_image_slice(complete, fixture_index(source), 0, mmltk::common::concurrency::CancellationObservation::Borrow(observed));
   REQUIRE(observed.polls >= 5);
   for (std::size_t cut = 0; cut < observed.polls; ++cut) {
    Cancellation stop{0, cut};
-   CHECK_THROWS(append_normalized_image_slice(destination, source, 0, mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
+   CHECK_THROWS(append_normalized_image_slice(destination, fixture_index(source), 0, mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
    CHECK(destination.images.empty());
    CHECK(destination.boxes.empty());
    CHECK(destination.mask_rle_pairs.empty());
@@ -1383,7 +1384,7 @@ TEST_CASE("benchmark annotations retain provenance crowd area masks and determin
  CHECK(parallel.boxes.back().x2 == 1.0F / 16.0F);
  CHECK(parallel.boxes.back().y2 == 1.0F / 8.0F);
  const auto cache = root.path() / "normalized.index";
- store_normalized_annotation_index(cache, parallel, {});
+ store_normalized_annotation_index(cache, fixture_index(parallel), {});
  const auto loaded = load_normalized_annotation_index(cache, options.source, options.split, digest, {});
  REQUIRE(loaded);
  REQUIRE(loaded->boxes.size() == parallel.boxes.size());
@@ -1484,15 +1485,15 @@ TEST_CASE("benchmark semantic admission isolates malformed masks and numeric ove
  CHECK(parallel.mask_rle_pairs.empty());
  CHECK(parallel.boxes.front().mask_rle_offset == 0U);
  CHECK(parallel.boxes.front().mask_rle_pairs == 0U);
- store_normalized_annotation_index(root.path() / "open-sequential.index", sequential, {});
- store_normalized_annotation_index(root.path() / "open-parallel.index", parallel, {});
+ store_normalized_annotation_index(root.path() / "open-sequential.index", fixture_index(sequential), {});
+ store_normalized_annotation_index(root.path() / "open-parallel.index", fixture_index(parallel), {});
  CHECK(mmltk::common::io::sha256_file(root.path() / "open-sequential.index") == mmltk::common::io::sha256_file(root.path() / "open-parallel.index"));
 }
 TEST_CASE("normalized benchmark caches require source category presence", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("normalized-provenance");
  const std::string digest(64U, '0');
  for (const auto source : {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2, BenchmarkDatasetSource::kOpenImagesV7}) {
-  NormalizedAnnotationIndex index;
+  NormalizedAnnotationBuilder index;
   index.source = source;
   index.split = "train";
   index.annotation_sha256 = digest;
@@ -1505,12 +1506,12 @@ TEST_CASE("normalized benchmark caches require source category presence", "[back
   box.source_category_id = source == BenchmarkDatasetSource::kOpenImagesV7 ? encode_open_images_category("/m/person") : 0U;
   index.boxes.push_back(box);
   const auto path = root.path() / "normalized.index";
-  store_normalized_annotation_index(path, index, {});
+  store_normalized_annotation_index(path, fixture_index(index), {});
   REQUIRE(load_normalized_annotation_index(path, source, "train", digest, {}));
   box.flags &= ~kAnnotationCategory;
   box.source_category_id = 0U;
   index.boxes[0] = box;
-  CHECK_THROWS(store_normalized_annotation_index(root.path() / "missing.index", index, {}));
+  CHECK_THROWS(store_normalized_annotation_index(root.path() / "missing.index", fixture_index(index), {}));
   // Version 3 has a 256-byte header followed by this one image record.
   std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
   REQUIRE(file.is_open());
@@ -1843,8 +1844,8 @@ TEST_CASE("parser workers reset segmentation scratch across masks rejections and
    REQUIRE(parallel.boxes.size() == 256U * 5U);
    CHECK(parallel.rejected.malformed_records == 256U);
    CHECK(parallel.rejected.degenerate_boxes == 256U);
-   store_normalized_annotation_index(root.path() / "sequential.index", sequential, {});
-   store_normalized_annotation_index(root.path() / "parallel.index", parallel, {});
+   store_normalized_annotation_index(root.path() / "sequential.index", fixture_index(sequential), {});
+   store_normalized_annotation_index(root.path() / "parallel.index", fixture_index(parallel), {});
    CHECK(mmltk::common::io::sha256_file(root.path() / "sequential.index") == mmltk::common::io::sha256_file(root.path() / "parallel.index"));
    for (const auto& box : parallel.boxes) {
     const auto kind = box.annotation_id % 7U;
@@ -2070,7 +2071,7 @@ TEST_CASE("Open Images local JPEG and complete group reuse preserve dimensions a
  BenchmarkEncodedImage::publish(cached_image_path(images, 2U), jpeg, {});
  const RetainedArtifact first{cached_image_path(images, 1U)};
  const RetainedArtifact second{cached_image_path(images, 2U)};
- NormalizedAnnotationIndex index;
+ NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  index.images.resize(2U);
  index.images[0].source_image_id = 1U;
@@ -2080,30 +2081,34 @@ TEST_CASE("Open Images local JPEG and complete group reuse preserve dimensions a
  BenchmarkCompileProgress latest;
  ProgressReporter progress([&](const auto& update) { latest = update; }, quiet);
  progress.phase(DatasetCompilePhase::Extracting);
- auto acquired = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0U, quiet);
+ auto acquired = acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0U, quiet);
  REQUIRE(acquired.available_image_ids == std::vector<std::uint64_t>{1U, 2U});
  CHECK(latest.sources[2].completed_images == 2U);
- const auto width = index.images[0].width;
- const auto height = index.images[0].height;
+ const auto first_proof = read_json_file(images / ".groups" / "group-000000.complete.json");
+ const auto width = first_proof.at("dimensions").at(1).get<std::uint32_t>();
+ const auto height = first_proof.at("dimensions").at(2).get<std::uint32_t>();
  CHECK(width > 0U);
  CHECK(height > 0U);
  for (auto& image : index.images) { image.width = image.height = 0U; }
- acquired = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0U, quiet);
+ acquired = acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0U, quiet);
  CHECK(acquired.directory.cache_hit);
  CHECK(latest.sources[2].completed_images == 2U);
  CHECK(latest.sources[2].invalidated_images == 0U);
- CHECK(index.images[0].width == width);
- CHECK(index.images[0].height == height);
+ const auto reused_proof = read_json_file(images / ".groups" / "group-000000.complete.json");
+ CHECK(reused_proof.at("dimensions").at(1) == width);
+ CHECK(reused_proof.at("dimensions").at(2) == height);
+ CHECK(index.images[0].width == 0);
+ CHECK(index.images[0].height == 0);
  const auto proof = images / ".groups" / "group-000000.complete.json";
  auto manifest = read_json_file(proof);
  manifest["identity"] = "stale";
  write_json_atomically(proof, manifest, {});
- acquired = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0U, quiet);
+ acquired = acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0U, quiet);
  CHECK_FALSE(acquired.directory.cache_hit);
  manifest = read_json_file(proof);
  manifest["selection_sha256"] = "stale";
  write_json_atomically(proof, manifest, {});
- acquired = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0U, quiet);
+ acquired = acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0U, quiet);
  CHECK_FALSE(acquired.directory.cache_hit);
  manifest = read_json_file(proof);
  index.images.push_back(NormalizedImage{.source_image_id = 3U});
@@ -2112,7 +2117,7 @@ TEST_CASE("Open Images local JPEG and complete group reuse preserve dimensions a
  manifest["requested_selection_sha256"] = cached_image_selection_digest(requested);
  manifest["quarantined"] = {{{"image_id", 3U}, {"reason", "fixture unavailable image"}}};
  write_json_atomically(proof, manifest, {});
- acquired = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0U, quiet);
+ acquired = acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0U, quiet);
  CHECK(acquired.directory.cache_hit);
  CHECK(acquired.available_image_ids == std::vector<std::uint64_t>{1U, 2U});
  REQUIRE(quarantined.size() == 1U);
@@ -3834,7 +3839,8 @@ TEST_CASE("stock mask scratch survives adjacent chunks and retires for a waiting
  const auto path = root.path() / "annotations.json";
  nlohmann::json document{{"images", {{{"id", 1}, {"width", 16}, {"height", 8}, {"file_name", "1.jpg"}}}},
   {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
- for (unsigned id = 0; id < 2000; ++id) document["annotations"].push_back({{"id", id}, {"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, 2, 2}},
+ // Equal-width unique IDs keep adjacent full chunks at the same admitted size.
+ for (unsigned id = 0; id < 2000; ++id) document["annotations"].push_back({{"id", 10000 + id}, {"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, 2, 2}},
   {"segmentation", {{0, 0, 2, 0, 2, 2, 0, 2}}}, {"unused", std::string(256, 'x')}});
  write_text(path, document.dump());
  const std::array<NumericCategoryMapping, 1> mappings{{{1, 0, "person"}}};
@@ -3861,10 +3867,10 @@ TEST_CASE("stock mask scratch survives adjacent chunks and retires for a waiting
  options.trace = [&](std::string_view event, const nlohmann::json& fields) {
   if (event != "benchmark.annotations.workspace") return;
   if (++chunks == 2) {
-   capacity_reused = fields.at("retained_dense_bytes").get<std::size_t>() >= 128;
+   capacity_reused = fields.at("retained_sparse_bytes").get<std::size_t>() >= 128;
    reused.receipt().ArriveAndWait();
   }
-  if (chunks == 3) pressure_retired = fields.at("retained_dense_bytes").get<std::size_t>() == 0;
+  if (chunks == 3) pressure_retired = fields.at("retained_sparse_bytes").get<std::size_t>() == 0;
  };
  auto parse = std::async(std::launch::async, [&] { return parse_coco_style_annotations(path, std::string(64, 'a'), mappings, options); });
  const mmltk::testsupport::ScopedTestCleanup release([&] { reused.Release(); waiting.Release(); });
@@ -4837,7 +4843,7 @@ TEST_CASE("Open Images admits a third group while two earlier groups retry and p
  const auto jpeg = make_jpeg(10, 20, 30);
  const auto seed = root.path() / "seed.jpg";
  BenchmarkEncodedImage::publish(seed, jpeg, {});
- NormalizedAnnotationIndex index;
+ NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  constexpr std::size_t count = 8193;
  index.images.resize(count);
@@ -4865,7 +4871,7 @@ TEST_CASE("Open Images admits a third group while two earlier groups retry and p
  }, {});
  std::vector<QuarantinedImage> quarantined;
  auto work = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 0, trace, {}, &execution,
+  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, trace, {}, &execution,
    [&](std::uint64_t id) { return id == 1 ? first.url("first") : id == 4097 ? second.url("second") : third.url("third"); });
  });
  const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); first.ReleaseRequest(); second.ReleaseRequest(); });
@@ -4894,7 +4900,7 @@ TEST_CASE("Open Images admits a third group while two earlier groups retry and p
 TEST_CASE("Open Images remote absence is bounded and local capacity failure returns every allowance", "[backend][data][benchmark][images]") {
  mmltk::testsupport::ScopedTempDir root("open-images-failure-admission");
  const auto cache = BenchmarkCacheLayout::create(root.path());
- NormalizedAnnotationIndex index;
+ NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  index.images = {{.source_image_id = 1}};
  const auto jpeg = make_jpeg(10, 20, 30);
@@ -4904,15 +4910,15 @@ TEST_CASE("Open Images remote absence is bounded and local capacity failure retu
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32U << 20, .descriptors = 32});
  SECTION("remote 404 retains the complete quarantine proof") {
   server.fail_next(kMaximumAttempts, 0, 404);
-  const auto result = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) { return server.url("missing"); });
+  const auto result = acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) { return server.url("missing"); });
   CHECK(result.available_image_ids.empty());
   REQUIRE(quarantined.size() == 1);
   CHECK(server.requests() == kMaximumAttempts);
-  const auto cached = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) -> std::string { throw std::logic_error("cached proof requested HTTP"); });
+  const auto cached = acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) -> std::string { throw std::logic_error("cached proof requested HTTP"); });
   CHECK(cached.directory.cache_hit);
  }
  SECTION("local allocation failure is fatal") {
-  CHECK_THROWS_AS(acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0, {}, {}, &execution,
+  CHECK_THROWS_AS(acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0, {}, {}, &execution,
    [&](std::uint64_t) -> std::string { throw std::bad_alloc{}; }), std::bad_alloc);
   CHECK(quarantined.empty());
  }
@@ -5020,7 +5026,7 @@ TEST_CASE("Open Images returns idle input backing to an oversized pixel consumer
  mmltk::testsupport::ScopedTempDir root("open-images-tiny-input-target");
  const auto cache = BenchmarkCacheLayout::create(root.path());
  const auto images = cache.source_images("open-images") / "train";
- NormalizedAnnotationIndex index;
+ NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  index.images = {{.source_image_id = 1}, {.source_image_id = 2}};
  const auto jpeg = make_jpeg(10, 20, 30);
@@ -5034,7 +5040,7 @@ TEST_CASE("Open Images returns idle input backing to an oversized pixel consumer
  std::vector<QuarantinedImage> quarantined;
  mmltk::testsupport::TestGate consumer("oversized Open Images pixel consumer");
  auto acquisition = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution,
+  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution,
    [&](std::uint64_t id) { return id == 1 ? first.url("first") : later.url("later"); });
  });
  std::future<void> pixels;
@@ -5080,7 +5086,7 @@ TEST_CASE("Open Images consumes a repaired saved file before recycling its exclu
  const auto jpeg = make_jpeg(10, 20, 30);
  const auto seed = root.path() / "seed.jpg";
  BenchmarkEncodedImage::publish(seed, jpeg, {});
- NormalizedAnnotationIndex index;
+ NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  constexpr std::size_t count = 4097;
  index.images.resize(count);
@@ -5108,7 +5114,7 @@ TEST_CASE("Open Images consumes a repaired saved file before recycling its exclu
  std::vector<QuarantinedImage> quarantined;
  const ImageDecodeProbe probe{1, repair == Repair::Dimensions ? 17U : 16U, 8};
  auto acquisition = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 0, {}, probe, &execution,
+  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, probe, &execution,
    [&](std::uint64_t id) { return id == 1 ? first.url("repair") : id == 2 ? member.url("member") : later.url("later"); });
  });
  const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); validation.Release(); member.ReleaseRequest(); });
@@ -5143,8 +5149,10 @@ TEST_CASE("Open Images consumes a repaired saved file before recycling its exclu
   CHECK(result.available_image_ids.front() == (valid ? 1 : 2));
   CHECK(result.directory.image_bytes == result.available_image_ids.size() * jpeg.size());
   CHECK(static_cast<bool>(execution.geometry(images, 1)) == valid);
-  CHECK(index.images[0].width == 16);
-  CHECK(index.images[0].height == 8);
+  const auto geometry = execution.geometry(cache.source_images("open-images") / "train", index.images[0].source_image_id);
+  REQUIRE(geometry);
+  CHECK(geometry->width == 16);
+  CHECK(geometry->height == 8);
   CHECK(quarantined.size() == (valid ? 0 : 1));
   if (!valid) {
    CHECK(quarantined[0].image_id == 1);
@@ -5304,7 +5312,7 @@ TEST_CASE("Open Images retired backing admits pixel work while an unrelated ordi
  // workspace, but cannot fit beside even one retained encoded/header slot.
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = (32U << 20) + (256U << 10), .descriptors = 32}, cancellation);
  auto download = std::async(std::launch::async, [&] { return download_artifacts({request}, 1, cancellation, {}, {}, {}, &execution); });
- NormalizedAnnotationIndex index;
+ NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  index.images = {{.source_image_id = 1}};
  ProgressReporter progress({}, {});
@@ -5315,7 +5323,7 @@ TEST_CASE("Open Images retired backing admits pixel work while an unrelated ordi
  const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); image.ReleaseRequest(); ordinary.ReleasePartial(); consumed.Release(); });
  REQUIRE(ordinary.WaitPartial());
  acquisition = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) { return image.url("image"); });
+  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) { return image.url("image"); });
  });
  REQUIRE(image.WaitRequest());
  const auto observed = execution.admission_generation();
@@ -5878,7 +5886,7 @@ TEST_CASE("Open Images starts ready HTTP before later cold cache chunks finish",
  HttpServer server(jpeg);
  server.GateNextRequest();
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 64U << 20, .descriptors = 32});
- NormalizedAnnotationIndex index;
+ NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  for (std::uint64_t id = 1; id <= 65; ++id) {
   index.images.push_back({.source_image_id = id});
@@ -5893,7 +5901,7 @@ TEST_CASE("Open Images starts ready HTTP before later cold cache chunks finish",
  std::vector<QuarantinedImage> quarantined;
  ProgressReporter progress({}, {});
  auto acquisition = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, index, &quarantined, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), &progress, 1, 0, trace, {}, &execution,
+  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), &progress, 1, 0, trace, {}, &execution,
    [&](std::uint64_t) { return server.url("image"); });
  });
  const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); scan.Release(); server.ReleaseRequest(); });
@@ -6033,7 +6041,7 @@ TEST_CASE("registered Open Images repair accepts its one retained pixel consumpt
  prepare_cached_image_directory(images);
  const auto jpeg = make_jpeg(10, 20, 30);
  HttpServer server(jpeg);
- NormalizedAnnotationIndex index;
+ NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  index.images.push_back({.source_image_id = 1, .width = 16, .height = 8});
  PreparedBenchmarkSplit split;
@@ -6057,7 +6065,7 @@ TEST_CASE("registered Open Images repair accepts its one retained pixel consumpt
  }, {});
  std::vector<QuarantinedImage> quarantined;
  auto acquisition = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 0, {}, ImageDecodeProbe{1, 16, 8}, &execution,
+  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, ImageDecodeProbe{1, 16, 8}, &execution,
    [&](std::uint64_t) { return server.url("repair"); });
  });
  const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); });
@@ -6162,7 +6170,7 @@ TEST_CASE("held warm image reads allow HTTP results and pixels to finish on one 
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 64U << 20, .descriptors = 16}, cancellation);
- NormalizedAnnotationIndex index;
+ NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  for (std::uint64_t id : {1U, 2U, 3U}) index.images.push_back({.source_image_id = id});
  PreparedBenchmarkSplit split;
@@ -6184,7 +6192,7 @@ TEST_CASE("held warm image reads allow HTTP results and pixels to finish on one 
  ProgressReporter progress({}, {});
  std::vector<QuarantinedImage> quarantined;
  auto acquisition = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution,
+  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution,
    [&](std::uint64_t) { return server.url("image"); }, [&](std::uint64_t id) { if (id == 1) held.receipt().ArriveAndWait(); });
  });
  const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); held.Release(); });
@@ -6228,7 +6236,7 @@ TEST_CASE("small-target warm cache inputs complete after simultaneous admission"
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = descriptors}, cancellation);
- NormalizedAnnotationIndex index;
+ NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  PreparedBenchmarkSplit split;
  split.name = "train"; split.class_names = {"person"}; split.sources = {{images}};
@@ -6249,7 +6257,7 @@ TEST_CASE("small-target warm cache inputs complete after simultaneous admission"
  mmltk::testsupport::TestGate warm("three warm workers before mapped admission");
  std::array<std::atomic<unsigned>, 3> reads{};
  auto acquisition = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 4, {}, {}, &execution,
+  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 4, {}, {}, &execution,
    [](std::uint64_t) -> std::string { throw std::runtime_error("valid warm image unexpectedly requested HTTP"); },
    [&](std::uint64_t id) { ++reads.at(id - 1); warm.receipt().ArriveAndWait(); });
  });
@@ -6283,7 +6291,7 @@ TEST_CASE("deferred warm cache cancellation returns opened custody without waiti
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 16});
- NormalizedAnnotationIndex index;
+ NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  for (std::uint64_t id : {1U, 2U, 3U, 4U}) index.images.push_back({.source_image_id = id});
  ProgressReporter progress({}, {});
@@ -6291,7 +6299,7 @@ TEST_CASE("deferred warm cache cancellation returns opened custody without waiti
  mmltk::testsupport::TestGate warm("three warm requests before opening"), pressure("complete transient target on shared CPU"), next("worker returned an opened-file deferral");
  std::future<void> cpu;
  auto acquisition = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 4, {}, {}, &execution,
+  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 4, {}, {}, &execution,
    [](std::uint64_t) -> std::string { throw std::runtime_error("cancelled warm input unexpectedly requested HTTP"); },
    [&](std::uint64_t id) { (id == 4 ? next : warm).receipt().ArriveAndWait(); });
  });
@@ -6400,4 +6408,478 @@ TEST_CASE("deferred mapped input exposes pressure to retained pixel scratch", "[
  REQUIRE(payload);
  CHECK_FALSE(execution.resource_pressure());
  CHECK(std::ranges::equal(payload->encoded(), jpeg));
+}
+
+TEST_CASE("batch workspace loans finish pixels and retire scratch before reader continuation", "[backend][data][benchmark][pipeline]") {
+ bool fail = false;
+ SECTION("ordinary reader continuation") {}
+ SECTION("consumer exception unwinds the offer") { fail = true; }
+ mmltk::testsupport::ScopedTempDir root("batch-workspace-window");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images = {{1, 16, 8, 0, 0, 0}};
+ constexpr std::uint64_t target = 256ULL << 20;
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = target, .descriptors = 13});
+ auto source = execution.reserve({target, 1, false, 0, false, 2});
+ auto descriptor_alias = source;
+ std::promise<void> completed;
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8);
+ request.execution = &execution;
+ request.progress = {.context = &completed, .image_completed = [](void* value) { static_cast<std::promise<void>*>(value)->set_value(); }};
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ execution.source_publication(images, {})({1, {}, true});
+ const auto window = [&] {
+  execution.with_unused_workspace(source, 1U << 20, [&] {
+   CHECK_FALSE(execution.try_reserve({1, 0, true}));
+   CHECK_FALSE(execution.try_reserve({1, 0}));
+   mmltk::testsupport::await_test_promise(completed, "pixel consumes unused reader workspace", 5s);
+   if (fail) throw std::runtime_error("normalizer failed after independent pixels completed");
+  });
+ };
+ if (fail) CHECK_THROWS(window()); else window();
+ CHECK(writer.image_complete(0));
+ CHECK(source.bytes() == target);
+ // Reclaim has retired the borrower's real idle decoder/resizer capacity.
+ source.retire_workspace();
+ CHECK(descriptor_alias.bytes() == 0);
+ CHECK(execution.try_reserve({target, 0}));
+ source.retire_descriptors();
+ CHECK(descriptor_alias.descriptors() == 0);
+ source = {}; descriptor_alias = {};
+ CHECK(execution.try_reserve({target, 13}));
+}
+
+TEST_CASE("retiring a reader returns only its closed descriptors while descendants remain", "[backend][data][benchmark][pipeline]") {
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 13});
+ auto parent = execution.reserve({0, 1, true, 0, true, 6});
+ auto reader = execution.reserve({24, 2, false, 0, false, 3}, parent);
+ auto alias = reader;
+ auto descendant = execution.reserve(BenchmarkResources::handles(2), reader);
+ auto backing = reader.split_storage(8);
+ reader.retire_descriptors();
+ CHECK(alias.descriptors() == 0);
+ // Parent can reuse the two closed file slots; live children retain theirs.
+ auto replacement = execution.reserve(BenchmarkResources::handles(2), parent);
+ reader.retire_workspace();
+ CHECK(alias.bytes() == 0);
+ CHECK(backing.bytes() == 8);
+ CHECK_FALSE(execution.try_reserve({25, 0}));
+ parent.retire_descriptors();
+ CHECK(descendant.descriptors() == 2);
+ replacement = {}; descendant = {}; reader = {}; alias = {}; parent = {};
+ CHECK(execution.try_reserve({24, 13}));
+ backing = {};
+ CHECK(execution.try_reserve({32, 13}));
+}
+
+TEST_CASE("long JSON documents admit short chunks beside pixels on one CPU", "[backend][data][benchmark][annotations][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("bounded-json-chunks");
+ const auto path = root.path() / "annotations.json";
+ nlohmann::json document{{"categories", {{{"id", 1}, {"name", "person"}}}}, {"images", {{{"id", 1}, {"width", 16}, {"height", 8}}}}, {"annotations", nlohmann::json::array()}};
+ for (unsigned i = 0; i < 20000; ++i) document["annotations"].push_back({{"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, 2, 2}}, {"unused", std::string(256, 'x')}});
+ write_text(path, document.dump());
+ constexpr auto target = 256ULL << 20;
+ REQUIRE(fs::file_size(path) > target / 64);
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images = {{1, 16, 8, 0, 0, 0}};
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = target, .descriptors = 13});
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8);
+ request.execution = &execution;
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ mmltk::testsupport::TestGate chunk("first bounded annotation chunk");
+ bool first = true, overlapped = false;
+ AnnotationParseOptions options;
+ options.source = BenchmarkDatasetSource::kCoco2017; options.split = "train"; options.execution = &execution;
+ options.trace = [&](std::string_view event, const nlohmann::json&) {
+  if (event != "benchmark.annotations.workspace" || !std::exchange(first, false)) return;
+  chunk.receipt().ArriveAndWait();
+  execution.cooperate(); execution.cooperate();
+  overlapped = writer.image_complete(0);
+ };
+ const std::array<NumericCategoryMapping, 1> categories{{{1, 0, "person"}}};
+ auto parsing = std::async(std::launch::async, [&] { return parse_coco_style_annotations(path, std::string(64, 'a'), categories, options); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { chunk.Release(); });
+ REQUIRE(chunk.WaitEntered(5s));
+ execution.source_publication(images, {})({1, {}, true});
+ chunk.Release();
+ const auto parsed = mmltk::testsupport::await_test_future(parsing, "bounded JSON with independent pixels", 10s);
+ CHECK(overlapped);
+ CHECK(parsed.boxes.size() == 20000);
+ CHECK(parsed.rejected.raw_records == 20000);
+}
+
+TEST_CASE("mapped normalized generations survive replacement and admit masks only when consumed", "[backend][data][benchmark][annotations]") {
+ mmltk::testsupport::ScopedTempDir root("immutable-normalized-generation");
+ const auto path = root.path() / "annotations.bin";
+ NormalizedAnnotationBuilder builder;
+ builder.split = "train"; builder.annotation_sha256 = std::string(64, 'a');
+ builder.images.push_back({.source_image_id = 1, .first_box = 0, .box_count = 1, .width = 4, .height = 4});
+ NormalizedBox box;
+ box.x2 = box.y2 = 1; box.flags = kAnnotationMask | kAnnotationCategory; box.source_category_id = 1; box.mask_rle_pairs = 1;
+ builder.boxes.push_back(box); builder.mask_rle_pairs.push_back({0, 16});
+ auto product = fixture_index(builder);
+ const auto proof = store_normalized_annotation_index(path, product, {});
+ auto first = load_normalized_annotation_index(path, builder.source, builder.split, builder.annotation_sha256, {});
+ REQUIRE(first); REQUIRE(first->completion);
+ for (const auto& descriptor : fs::directory_iterator("/proc/self/fd")) {
+  std::error_code error;
+  const auto target = fs::read_symlink(descriptor.path(), error);
+  if (!error) CHECK(target != path);
+ }
+ CHECK(first->completion->proof_bytes == fs::file_size(path.string() + ".complete.json"));
+ CHECK(first->completion->identity == proof->identity);
+ auto selected = NormalizedAnnotationReadView(*first).select_images({0});
+ const auto* selected_runs = selected.storage().mask_rle_pairs.data();
+ CHECK(selected.completion == first->completion);
+ CHECK(&selected.image(0) == first->images.data());
+ builder.images.front().source_image_id = 2;
+ (void)store_normalized_annotation_index(path, fixture_index(builder), {});
+ auto second = load_normalized_annotation_index(path, builder.source, builder.split, builder.annotation_sha256, {});
+ REQUIRE(second);
+ CHECK(first->images.front().source_image_id == 1);
+ CHECK(second->images.front().source_image_id == 2);
+ CHECK(first->mask_rle_pairs.front().length == 16);
+ first.reset();
+ CHECK(selected.image(0).source_image_id == 1);
+ CHECK(selected.storage().mask_rle_pairs.data() == selected_runs);
+ CHECK(selected.completion->images == 1);
+ // Damage the new file's last RLE length without changing its layout or proof.
+ {
+  std::fstream output(path, std::ios::binary | std::ios::in | std::ios::out);
+  const std::uint32_t too_long = 17;
+  output.seekp(-static_cast<std::streamoff>(sizeof(too_long)), std::ios::end);
+  output.write(reinterpret_cast<const char*>(&too_long), sizeof(too_long));
+ }
+ auto metadata = load_normalized_annotation_index(path, builder.source, builder.split, builder.annotation_sha256, {}, {}, nullptr, true);
+ REQUIRE(metadata);
+ CHECK(metadata->images.front().source_image_id == 2);
+ CHECK_THROWS(admit_normalized_annotations(*metadata));
+ CHECK(selected.storage().mask_rle_pairs.front().length == 16);
+}
+
+TEST_CASE("sparse full and empty COCO masks do not require a canvas", "[backend][data][benchmark][annotations]") {
+ mmltk::testsupport::ScopedTempDir root("sparse-whole-mask");
+ const auto path = root.path() / "annotations.json";
+ constexpr std::uint32_t extent = 16000, pixels = extent * extent;
+ const nlohmann::json document{{"images", {{{"id", 1}, {"width", extent}, {"height", extent}}}}, {"categories", {{{"id", 1}, {"name", "person"}}}},
+  {"annotations", {{{"id", 1}, {"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, extent, extent}}, {"segmentation", {{"size", {extent, extent}}, {"counts", {0, pixels}}}}},
+                   {{"id", 2}, {"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, extent, extent}}, {"segmentation", {{"size", {extent, extent}}, {"counts", {pixels}}}}}}}};
+ write_text(path, document.dump());
+ const std::array<NumericCategoryMapping, 1> categories{{{1, 0, "person"}}};
+ AnnotationParseOptions options; options.split = "train";
+ const auto result = parse_coco_style_annotations(path, std::string(64, 'a'), categories, options);
+ REQUIRE(result.boxes.size() == 2); REQUIRE(result.mask_rle_pairs.size() == 1);
+ CHECK(result.mask_rle_pairs[0].start == 0); CHECK(result.mask_rle_pairs[0].length == pixels);
+ CHECK(result.boxes[0].mask_rle_pairs == 1); CHECK(result.boxes[1].mask_rle_pairs == 0);
+ CHECK((result.boxes[1].flags & kAnnotationMask) != 0);
+}
+
+TEST_CASE("concurrent reader offers join a live pixel loan on cancellation", "[backend][data][benchmark][pipeline]") {
+ bool cancel = false;
+ SECTION("two readers reclaim together") {}
+ SECTION("cancel while a pixel owns both offers") { cancel = true; }
+ mmltk::testsupport::ScopedTempDir root("concurrent-workspace-offers");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images); split.images = {{1, 16, 8, 0, 0, 0}};
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ constexpr auto target = 256ULL << 20;
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = target, .descriptors = 16}, cancellation);
+ auto first_reader = execution.reserve({target / 2, 1});
+ auto second_reader = execution.reserve({target / 2, 1});
+ mmltk::testsupport::TestGate first_window("first reader allocation window"), second_window("second reader allocation window"), pixels("pixel still owns workspace");
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8, cancellation);
+ request.execution = &execution;
+ request.progress = {.context = &pixels, .image_completed = [](void* value) { static_cast<mmltk::testsupport::TestGate*>(value)->receipt().ArriveAndWait(); }};
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ std::future<void> first, second;
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); first_window.Release(); second_window.Release(); pixels.Release(); });
+ first = std::async(std::launch::async, [&] { execution.with_unused_workspace(first_reader, 1U << 20, [&] { first_window.receipt().ArriveAndWait(); }); });
+ second = std::async(std::launch::async, [&] { execution.with_unused_workspace(second_reader, 1U << 20, [&] { second_window.receipt().ArriveAndWait(); }); });
+ REQUIRE(first_window.WaitEntered(5s)); REQUIRE(second_window.WaitEntered(5s));
+ CHECK_FALSE(execution.try_reserve({1, 0, true}));
+ execution.source_publication(images, {})({1, {}, true});
+ REQUIRE(pixels.WaitEntered(5s));
+ if (cancel) cancelled.store(true);
+ first_window.Release(); second_window.Release();
+ CHECK(first.wait_for(0ms) == std::future_status::timeout);
+ CHECK(second.wait_for(0ms) == std::future_status::timeout);
+ pixels.Release();
+ if (cancel) {
+  REQUIRE(first.wait_for(5s) == std::future_status::ready); CHECK_THROWS(first.get());
+  REQUIRE(second.wait_for(5s) == std::future_status::ready); CHECK_THROWS(second.get());
+ } else {
+  mmltk::testsupport::await_test_future(first, "first reader reclaims physical pixel scratch", 5s);
+  mmltk::testsupport::await_test_future(second, "second reader reclaims physical pixel scratch", 5s);
+  CHECK(writer.image_complete(0));
+  first_reader.retire_workspace(); second_reader.retire_workspace();
+  CHECK(execution.try_reserve({target, 0}));
+ }
+}
+
+TEST_CASE("Open Images class fields retain escaped text beyond four quoted columns", "[backend][data][benchmark][annotations]") {
+ mmltk::testsupport::ScopedTempDir root("open-images-quoted-fields");
+ const auto classes = root.path() / "classes.csv", boxes = root.path() / "boxes.csv";
+ write_text(classes, "\"/m/person\",\"Person\",\"one\",\"two\",\"three\",\"four\"\"five\"\n");
+ write_text(boxes, "ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax,IsOccluded,IsTruncated,IsGroupOf\n0000000000000001,x,/m/person,1,0,1,0,1,0,0,0\n");
+ const std::array<StringCategoryMapping, 1> mappings{{{"/m/person", 0, "person"}}};
+ AnnotationParseOptions options; options.split = "train";
+ const auto result = parse_open_images_annotations(boxes, classes, std::string(64, 'a'), mappings, options);
+ REQUIRE(result.images.size() == 1); REQUIRE(result.boxes.size() == 1);
+ CHECK(result.images[0].source_image_id == 1);
+ CHECK(result.boxes[0].source_ordinal == std::string_view("ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax,IsOccluded,IsTruncated,IsGroupOf\n").size());
+}
+
+TEST_CASE("progressive JSON semantics precede unrelated envelope tails", "[backend][data][benchmark][annotations][pipeline]") {
+ bool reversed = false, malformed = false, cancel = false;
+ SECTION("ordered arrays and valid tail") {}
+ SECTION("reversed arrays and escaped envelope names") { reversed = true; }
+ SECTION("malformed ignored tail after ready annotation") { malformed = true; }
+ SECTION("cancel after ready annotation before the tail") { cancel = true; }
+ mmltk::testsupport::ScopedTempDir root("progressive-json-tail");
+ const auto path = root.path() / "annotations.json";
+ const std::string categories = R"("categories":[{"id":1,"name":"person"}])";
+ const std::string images = R"("\u0069mages":[{"id":1,"width":16,"height":8}])";
+ const std::string row = R"({"image_id":1,"category_id":1,"bbox":[0,0,2,2]})";
+ const std::string annotations = "\"annotations\":[" + row + "]";
+ const auto prefix = "{" + (reversed ? annotations + "," + images + "," + categories : categories + "," + images + "," + annotations);
+ write_text(path, prefix + ",\"tail\":\"" + std::string(2U << 20, 'x') + (malformed ? "" : "\"}"));
+ const auto image_root = root.path() / "images";
+ auto split = cached_pixel_membership(image_root); split.images = {{1, 16, 8, 0, 0, 0}};
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13}, cancellation);
+ auto output = benchmark_write_request(split, root.path() / "pixels.bin", 8); output.execution = &execution;
+ BenchmarkSplitWriter writer(output);
+ BenchmarkCompilePipeline::Attempt attempt(execution); execution.register_split(writer, split);
+ bool visited = false, pixels_ready = false;
+ AnnotationParseOptions options;
+ options.split = "train"; options.execution = &execution; options.cancel_requested = cancellation;
+ options.trace = [&](std::string_view event, const nlohmann::json&) {
+  if (event != "benchmark.annotations.workspace" || std::exchange(visited, true)) return;
+  execution.source_publication(image_root, {})({1, {}, true});
+  execution.cooperate(); execution.cooperate();
+  pixels_ready = writer.image_complete(0);
+  if (cancel) cancelled.store(true);
+ };
+ const std::array<NumericCategoryMapping, 1> mappings{{{1, 0, "person"}}};
+ if (malformed || cancel) CHECK_THROWS(parse_coco_style_annotations(path, std::string(64, 'a'), mappings, options));
+ else {
+  const auto parsed = parse_coco_style_annotations(path, std::string(64, 'a'), mappings, options);
+  REQUIRE(parsed.boxes.size() == 1);
+  CHECK(parsed.boxes[0].source_ordinal == prefix.find(row));
+  CHECK(parsed.boxes[0].original_area == 4);
+ }
+ CHECK(visited); CHECK(pixels_ready);
+}
+
+TEST_CASE("sparse annotation bounds and area retain normalized and compiled meaning", "[benchmark][annotations][masks][writer]") {
+ mmltk::testsupport::ScopedTempDir root("sparse-mask-facts");
+ nlohmann::json rows = nlohmann::json::array();
+ for (unsigned kind = 0; kind != 4; ++kind) {
+  nlohmann::json row{{"id", kind}, {"image_id", 1}, {"category_id", 1},
+   {"segmentation", {{"size", {8, 16}}, {"counts", {9, 2, 6, 2, 109}}}}};
+  if (kind & 1U) row["area"] = 7.25;
+  if (kind & 2U) row["bbox"] = {1, 1, 2, 2};
+  rows.push_back(std::move(row));
+ }
+ const auto path = root.path() / "annotations.json";
+ write_text(path, nlohmann::json{{"images", {{{"id", 1}, {"width", 16}, {"height", 8}}}}, {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", rows}}.dump());
+ const std::array<NumericCategoryMapping, 1> categories{{{1, 0, "person"}}};
+ const auto index = parse_coco_style_annotations(path, "sparse-facts", categories, {.split = "train"});
+ REQUIRE(index.boxes.size() == 4);
+ PreparedBenchmarkSplit split;
+ split.name = "train"; split.class_names = {"person"}; split.sources = {{root.path() / "images"}};
+ split.images = {{1, 16, 8, 0, 4, 0, AnnotationSource::Coco}};
+ prepare_cached_image_directory(split.sources[0].root);
+ BenchmarkEncodedImage::publish(cached_image_path(split.sources[0].root, 1), make_jpeg(10, 20, 30), {});
+ const auto geometry = mmltk::backend::imaging::resample::compute_image_resize_geometry(16, 8, 16, 16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
+ dataset::MaskResizeScratch scratch;
+ for (const auto& box : index.boxes) {
+  CHECK(box.original_area == (box.annotation_id & 1U ? 7.25 : 4.0));
+  CHECK(box.x1 == 1.0F / 16); CHECK(box.y1 == 1.0F / 8);
+  CHECK(box.x2 == 3.0F / 16); CHECK(box.y2 == 3.0F / 8);
+  auto label = benchmark_canvas_box(box.class_id, box.x1, box.y1, box.x2, box.y2, geometry);
+  label.flags = box.flags; label.original_area = box.original_area; label.annotation_id = box.annotation_id;
+  label.source_category_id = box.source_category_id; label.source_ordinal = box.source_ordinal;
+  const auto resized = dataset::resize_row_major_mask(index.mask_rle_pairs.subspan(box.mask_rle_offset, box.mask_rle_pairs), {16, 8}, {16, 16}, geometry, &scratch);
+  label.mask_rle_offset = split.rle_pairs.size() * sizeof(RLEPair);
+  label.mask_rle_pairs = static_cast<std::uint16_t>(resized.pairs.size());
+  split.rle_pairs.insert(split.rle_pairs.end(), resized.pairs.begin(), resized.pairs.end());
+  split.labels.push_back(label);
+ }
+ const auto output = root.path() / "compiled.bin";
+ write_benchmark_split({.split = split, .output_path = output, .resolution = 16, .num_workers = 1,
+  .resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch});
+ const auto compiled = CompiledDataset::open(output);
+ REQUIRE(compiled.labels().size() == 4);
+ for (const auto& label : compiled.labels()) {
+  CHECK(label.original_area == (label.annotation_id & 1U ? 7.25 : 4.0));
+  CHECK(label.bbox_x1 == 1); CHECK(label.bbox_y1 == 2); CHECK(label.bbox_x2 == 3); CHECK(label.bbox_y2 == 6);
+  std::uint64_t area = 0;
+  const auto bounds = dataset::row_major_mask_bounds(compiled.instance_rle(label), {16, 16}, &area);
+  CHECK(area == 8); CHECK(bounds.min_x == 1); CHECK(bounds.min_y == 2); CHECK(bounds.max_x == 3); CHECK(bounds.max_y == 6);
+ }
+ std::uint64_t empty_area = 99;
+ CHECK_FALSE(dataset::row_major_mask_bounds({}, {16, 8}, &empty_area).has_foreground);
+ CHECK(empty_area == 0);
+ const std::array<RLEPair, 1> malformed{{{127, 2}}};
+ CHECK_THROWS(dataset::row_major_mask_bounds(malformed, {16, 8}, &empty_area));
+}
+
+TEST_CASE("settled workspace resize preserves aliases descendants and oversized continuation", "[benchmark][pipeline][resources]") {
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13});
+ auto producer = execution.reserve({200ULL << 20, 1, false, 0, false, 2});
+ const auto alias = producer;
+ auto storage = producer.split_storage(64ULL << 20);
+ auto handles = execution.reserve(BenchmarkResources::handles(1), producer);
+ CHECK(producer.aliases(alias)); CHECK_FALSE(producer.aliases(storage));
+ CHECK_FALSE(producer.try_resize_workspace(256ULL << 20)); // The live child is independent storage.
+ CHECK(producer.bytes() == 136ULL << 20);
+ REQUIRE(producer.try_resize_workspace(128ULL << 20));
+ auto independent = execution.try_reserve({64ULL << 20, 0});
+ REQUIRE(independent);
+ CHECK_FALSE(producer.try_resize_workspace(192ULL << 20));
+ independent.reset();
+ storage = {};
+ REQUIRE(producer.try_resize_workspace(512ULL << 20)); // One legal oversized lineage.
+ CHECK(alias.bytes() == 512ULL << 20);
+ std::promise<void> entered, release;
+ auto released = release.get_future();
+ auto active = std::async(std::launch::async, [&] {
+  execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) { entered.set_value(); released.wait(); }, alias);
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { mmltk::testsupport::release_test_promise(release); });
+ mmltk::testsupport::await_test_promise(entered, "active alias CPU frame");
+ CHECK_FALSE(producer.try_resize_workspace(1));
+ CHECK(alias.bytes() == 512ULL << 20);
+ mmltk::testsupport::release_test_promise(release);
+ mmltk::testsupport::await_test_future(active, "retired alias CPU frame");
+ CHECK_THROWS(execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) { (void)producer.try_resize_workspace(1); }, producer));
+ CHECK_THROWS(execution.with_unused_workspace(producer, 1, [&] { (void)producer.try_resize_workspace(1); }));
+ REQUIRE(producer.try_resize_workspace(512ULL << 20));
+ producer.retire_descriptors();
+ CHECK(alias.descriptors() == 0);
+ handles = {};
+ producer.retire_workspace();
+ CHECK(execution.try_reserve({256ULL << 20, 13}));
+}
+
+TEST_CASE("two failed workspace upgrades retire before complete one CPU reacquisition", "[benchmark][pipeline][resources]") {
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13});
+ auto first = execution.reserve({128ULL << 20, 1});
+ auto second = execution.reserve({128ULL << 20, 1});
+ std::promise<void> first_failed, second_failed;
+ const auto first_ready = first_failed.get_future().share(), second_ready = second_failed.get_future().share();
+ const auto upgrade = [&](BenchmarkAllowance allowance, std::promise<void>& failed, const std::shared_future<void>& other) {
+  const bool grew = allowance.try_resize_workspace(192ULL << 20);
+  failed.set_value(); other.wait();
+  if (grew) throw std::runtime_error("simultaneous retained upgrade exceeded target");
+  allowance.retire_descriptors(); allowance.retire_workspace(); allowance = {};
+  auto complete = execution.reserve({192ULL << 20, 1});
+  execution.run(BenchmarkStage::Normalize, {}, [](std::size_t) {}, complete);
+ };
+ auto a = std::async(std::launch::async, [&] { upgrade(std::move(first), first_failed, second_ready); });
+ auto b = std::async(std::launch::async, [&] { upgrade(std::move(second), second_failed, first_ready); });
+ mmltk::testsupport::await_test_future(a, "first complete upgrade");
+ mmltk::testsupport::await_test_future(b, "second complete upgrade");
+ CHECK(execution.try_reserve({256ULL << 20, 13}));
+}
+
+TEST_CASE("source parser workspace reuses charged capacity and yields under an unrelated scanner", "[benchmark][pipeline][annotations][resources]") {
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13});
+ simdjson::ondemand::parser parser;
+ std::atomic<unsigned> retirements{0};
+ const auto text = simdjson::padded_string(std::string_view{R"({"value":"retained"})"});
+ const auto demand = [](std::size_t) { return BenchmarkResources{192ULL << 20, 0}; };
+ {
+  BenchmarkCompilePipeline::Workspace workspace(execution, [&](std::size_t) noexcept { parser = {}; ++retirements; });
+  const auto parse = [&](std::size_t) {
+   auto document = parser.iterate(text);
+   const std::string_view value = document["value"].get_string().value();
+   CHECK(value == "retained");
+   CHECK_THROWS(execution.for_each(BenchmarkStage::Metadata, 1, demand, [](std::size_t) {}, workspace));
+   execution.cooperate();
+   CHECK(value == "retained");
+  };
+  execution.for_each(BenchmarkStage::Metadata, 1, demand, parse, workspace);
+  const auto capacity = parser.capacity();
+  REQUIRE(capacity > 0);
+  execution.for_each(BenchmarkStage::Metadata, 1, demand, parse, workspace);
+  CHECK(parser.capacity() == capacity);
+  CHECK(retirements.load() == 0);
+  CHECK_FALSE(execution.try_reserve({128ULL << 20, 0}));
+  std::promise<void> entered, release, pressure_ready;
+  const auto proceed = release.get_future();
+  auto scanner = std::async(std::launch::async, [&] {
+   execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) {
+    entered.set_value(); proceed.wait();
+    execution.cooperate(); // Idle parser identity differs from this live frame.
+    CHECK(parser.capacity() == 0);
+   });
+  });
+  const mmltk::testsupport::ScopedTestCleanup settle([&] { mmltk::testsupport::release_test_promise(release); });
+  mmltk::testsupport::await_test_promise(entered, "unrelated scanner owns the sole CPU");
+  auto consumer = std::async(std::launch::async, [&] {
+   auto pressure = execution.defer_resources();
+   pressure_ready.set_value();
+   auto allowance = execution.reserve({128ULL << 20, 0});
+   CHECK(retirements.load() == 1);
+  });
+  const mmltk::testsupport::ScopedTestCleanup release_before_consumer([&] { mmltk::testsupport::release_test_promise(release); });
+  mmltk::testsupport::await_test_promise(pressure_ready, "consumer requires idle parser capacity");
+  mmltk::testsupport::release_test_promise(release);
+  mmltk::testsupport::await_test_future(scanner, "scanner retired unrelated parser scratch");
+  mmltk::testsupport::await_test_future(consumer, "consumer admitted after physical retirement");
+  execution.for_each(BenchmarkStage::Metadata, 1, demand, parse, workspace);
+  CHECK(parser.capacity() > 0);
+ }
+ CHECK(retirements.load() == 2);
+ CHECK(parser.capacity() == 0);
+ CHECK(execution.try_reserve({256ULL << 20, 13}));
+}
+
+TEST_CASE("source parser workspace retires nested borrowing and failed groups before source destruction", "[benchmark][pipeline][annotations][resources]") {
+ bool fail = false, cancel = false;
+ SECTION("distinct nested parser preserves the outer borrowed string") {}
+ SECTION("throwing consumer releases source capacity") { fail = true; }
+ SECTION("cancelled consumer releases source capacity") { cancel = true; }
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13}, cancellation);
+ simdjson::ondemand::parser outer, inner;
+ unsigned outer_retirements = 0, inner_retirements = 0;
+ const auto text = simdjson::padded_string(std::string_view{R"({"value":"outer borrowed value"})"});
+ const auto demand = [](std::size_t) { return BenchmarkResources{1ULL << 20, 0}; };
+ {
+  BenchmarkCompilePipeline::Workspace outer_workspace(execution, [&](std::size_t) noexcept { outer = {}; ++outer_retirements; });
+  BenchmarkCompilePipeline::Workspace inner_workspace(execution, [&](std::size_t) noexcept { inner = {}; ++inner_retirements; });
+  const auto consume = [&] {
+   execution.for_each(BenchmarkStage::Metadata, 1, demand, [&](std::size_t) {
+    auto document = outer.iterate(text);
+    const std::string_view borrowed = document["value"].get_string().value();
+    execution.for_each(BenchmarkStage::Metadata, 1, demand, [&](std::size_t) {
+     auto nested = inner.iterate(text);
+     CHECK(nested["value"].get_string().value() == borrowed);
+    }, inner_workspace);
+    CHECK(inner.capacity() == 0);
+    CHECK(inner_retirements == 1);
+    CHECK(borrowed == "outer borrowed value");
+    if (fail) throw std::runtime_error("parser consumer failed");
+    if (cancel) cancelled.store(true);
+   }, outer_workspace);
+  };
+  if (fail || cancel) CHECK_THROWS(consume()); else consume();
+ }
+ CHECK(inner_retirements == 1);
+ CHECK(outer_retirements == 1);
+ CHECK(outer.capacity() == 0);
+ CHECK(inner.capacity() == 0);
 }

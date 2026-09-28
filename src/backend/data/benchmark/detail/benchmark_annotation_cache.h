@@ -28,7 +28,7 @@ class ArtifactProgressTotals;
 [[nodiscard]] std::optional<NormalizedAnnotationIndex> discover_cached_index(
  const std::filesystem::path&, BenchmarkDatasetSource, std::string_view, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
 [[nodiscard]] NormalizedAnnotationIndex load_or_build_index(const BenchmarkCacheLayout&, const std::filesystem::path&, BenchmarkDatasetSource, std::string_view, std::string_view,
- mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, const std::function<NormalizedAnnotationIndex()>&, StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {});
+ mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, const std::function<NormalizedAnnotationIndex(const BenchmarkAllowance&)>&, StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {});
 // Three body attempts; cancellation and local capacity failures never repair source data.
 void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservation, const std::function<void()>&, const std::function<void(const std::exception&)>&);
 enum class CocoSplitAdmission : std::uint8_t { Unselected, Optional, Required };

@@ -57,7 +57,9 @@ public:
  CoconutPhysicalMembership(const CoconutPhysicalMembership&) = delete;
  CoconutPhysicalMembership& operator=(const CoconutPhysicalMembership&) = delete;
  [[nodiscard]] BenchmarkResources resolution_resources(CoconutEdition) const;
- void release_readers(CoconutEdition) const;
+ // A sequence retires only the physical reader drawing on its own promise;
+ // another concurrent sequence's reader remains live. Empty means all readers.
+ void release_readers(CoconutEdition, const BenchmarkAllowance& producer = {}) const;
  [[nodiscard]] bool eligible(CoconutEdition, const AdmittedRecipeArchive&) const;
  // Invalidates affected routes/joins and their cached resource envelope before
  // the compiler mutates the admitted artifact; independent readers survive.

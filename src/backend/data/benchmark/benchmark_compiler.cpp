@@ -341,13 +341,13 @@ struct PlannedBenchmarkInstance {
  PackedInstance label{};
  std::vector<RLEPair> mask_rle;
 };
-SourceCompileCount append_source_plan(const NormalizedAnnotationIndex& index, const std::vector<CachedImageDirectory>& directories, const std::vector<std::uint64_t>* unavailable_image_ids,
+SourceCompileCount append_source_plan(const NormalizedAnnotationReadView& index, const std::vector<CachedImageDirectory>& directories, const std::vector<std::uint64_t>* unavailable_image_ids,
  const std::uint32_t resolution, const mmltk::backend::imaging::resample::ImageResizeMode resize_mode, const bool require_every_image, PreparedBenchmarkSplit* split,
  mmltk::common::concurrency::CancellationObservation cancel_requested, std::optional<AnnotationSource> provenance = {}, std::span<const std::uint16_t> image_sources = {},
  std::span<const std::pair<std::uint32_t, std::uint32_t>> source_dimensions = {}, BenchmarkCompilePipeline* execution = nullptr) {
  if (directories.empty()) { throw std::runtime_error("benchmark source has no cached image directories"); }
- if (!image_sources.empty() && image_sources.size() != index.images.size()) throw std::runtime_error("benchmark component source membership is misaligned");
- if (!source_dimensions.empty() && source_dimensions.size() != index.images.size()) throw std::runtime_error("benchmark component image geometry is misaligned");
+ if (!image_sources.empty() && image_sources.size() != index.image_count()) throw std::runtime_error("benchmark component source membership is misaligned");
+ if (!source_dimensions.empty() && source_dimensions.size() != index.image_count()) throw std::runtime_error("benchmark component image geometry is misaligned");
  if (unavailable_image_ids != nullptr && (!std::ranges::is_sorted(*unavailable_image_ids) || std::ranges::adjacent_find(*unavailable_image_ids) != unavailable_image_ids->end())) {
   throw std::runtime_error("benchmark unavailable image IDs must be sorted and unique");
  }
@@ -371,15 +371,15 @@ SourceCompileCount append_source_plan(const NormalizedAnnotationIndex& index, co
    objects_shards[shard] = directory_index;
   }
  }
- SourceCompileCount counts{index.source, index.images.size(), 0U, 0U};
+ SourceCompileCount counts{index.source, index.image_count(), 0U, 0U};
  auto scratch_allowance = execution ? execution->reserve({std::uint64_t{resolution} * resolution + std::uint64_t{resolution} * 8, 0}) : BenchmarkAllowance{};
  std::vector<PlannedBenchmarkInstance> image_labels;
  dataset::MaskResizeScratch mask_resize_scratch;
  std::size_t unavailable_index = 0U;
- for (std::size_t image_index = 0U; image_index < index.images.size(); ++image_index) {
+ for (std::size_t image_index = 0U; image_index < index.image_count(); ++image_index) {
   const auto convert = [&](std::size_t) {
   if ((image_index & 4095U) == 0U) { throw_if_benchmark_cancelled(cancel_requested); }
-  const NormalizedImage& image = index.images[image_index];
+  const NormalizedImage& image = index.image(image_index);
   while (unavailable_image_ids != nullptr && unavailable_index < unavailable_image_ids->size() && (*unavailable_image_ids)[unavailable_index] < image.source_image_id) { ++unavailable_index; }
   if (unavailable_image_ids != nullptr && unavailable_index < unavailable_image_ids->size() && (*unavailable_image_ids)[unavailable_index] == image.source_image_id) {
    if (require_every_image) { throw std::runtime_error("required benchmark image is unavailable"); }
@@ -393,28 +393,34 @@ SourceCompileCount append_source_plan(const NormalizedAnnotationIndex& index, co
   if (local_source >= directories.size()) throw std::runtime_error("benchmark component references an unacquired directory");
   image_labels.clear();
   image_labels.reserve(image.box_count);
-  const auto [source_width, source_height] = source_dimensions.empty() ? std::pair{image.width, image.height} : source_dimensions[image_index];
-  const bool matching_geometry = source_width == image.width && source_height == image.height;
+  auto dimensions = source_dimensions.empty() ? std::pair{image.width, image.height} : source_dimensions[image_index];
+  if (index.source == BenchmarkDatasetSource::kOpenImagesV7 && execution) {
+   const auto geometry = execution->geometry(directories[local_source].path, image.source_image_id);
+   if (!geometry) throw std::runtime_error("Open Images source geometry is unavailable");
+   dimensions = {geometry->width, geometry->height};
+  }
+  const auto [source_width, source_height] = dimensions;
+  const bool matching_geometry = index.source == BenchmarkDatasetSource::kOpenImagesV7 || (source_width == image.width && source_height == image.height);
   const auto box_count = matching_geometry ? image.box_count : 0U;
   counts.dropped_boxes += image.box_count - box_count;
   const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox =
    mmltk::backend::imaging::resample::compute_image_resize_geometry(source_width, source_height, resolution, resolution, resize_mode);
   for (std::uint64_t box_index = image.first_box; box_index < image.first_box + box_count; ++box_index) {
-   const NormalizedBox& box = index.boxes[common_math::checked_cast<std::size_t>(box_index, "box index overflow")];
+   const NormalizedBox& box = index.storage().boxes[common_math::checked_cast<std::size_t>(box_index, "box index overflow")];
    PackedInstance label = benchmark_canvas_box(box.class_id, box.x1, box.y1, box.x2, box.y2, letterbox);
    label.flags = box.flags;
    label.annotation_id = box.annotation_id;
    label.source_category_id = box.source_category_id;
    label.source_ordinal = box.source_ordinal;
    label.original_area = box.original_area;
-   if (index.source == BenchmarkDatasetSource::kOpenImagesV7) label.original_area *= static_cast<double>(image.width) * image.height;
+   if (index.source == BenchmarkDatasetSource::kOpenImagesV7) label.original_area *= static_cast<double>(source_width) * source_height;
    if (label.bbox_x2 <= label.bbox_x1 || label.bbox_y2 <= label.bbox_y1) { throw std::runtime_error("benchmark continuous box is not representable on the compiled canvas"); }
    std::vector<RLEPair> mask_rle;
    if (box.mask_rle_pairs != 0U) {
-    if (box.mask_rle_offset > index.mask_rle_pairs.size() || box.mask_rle_pairs > index.mask_rle_pairs.size() - box.mask_rle_offset) {
+    if (box.mask_rle_offset > index.storage().mask_rle_pairs.size() || box.mask_rle_pairs > index.storage().mask_rle_pairs.size() - box.mask_rle_offset) {
      throw std::runtime_error("benchmark source mask range is invalid");
     }
-    const auto source_mask = std::span(index.mask_rle_pairs).subspan(static_cast<std::size_t>(box.mask_rle_offset), box.mask_rle_pairs);
+    const auto source_mask = index.storage().mask_rle_pairs.subspan(static_cast<std::size_t>(box.mask_rle_offset), box.mask_rle_pairs);
     mask_rle = dataset::resize_row_major_mask(source_mask, dataset::MaskDimensions{image.width, image.height}, dataset::MaskDimensions{resolution, resolution}, letterbox, &mask_resize_scratch).pairs;
    }
    image_labels.push_back(PlannedBenchmarkInstance{label, std::move(mask_rle)});
@@ -827,18 +833,18 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     auto& sampling_object_artifacts = custom.sampling_object_artifacts;
     std::uint64_t selected_train_images = 0, selected_val_images = 0, selected_train_labels = 0, selected_val_labels = 0;
     std::uint64_t train_masks = 0, val_masks = 0;
-    const auto count_index = [&](const NormalizedAnnotationIndex& index, bool validation) {
+    const auto count_index = [&](const NormalizedAnnotationReadView& index, bool validation) {
      auto& images = validation ? selected_val_images : selected_train_images;
      auto& labels = validation ? selected_val_labels : selected_train_labels;
      auto& masks = validation ? val_masks : train_masks;
-     images = common_math::checked_add(images, index.images.size(), "benchmark selected image count overflow");
-     labels = common_math::checked_add(labels, index.boxes.size(), "benchmark selected label count overflow");
-     masks = common_math::checked_add(masks, index.mask_rle_pairs.size(), "benchmark selected mask count overflow");
+     images = common_math::checked_add(images, index.image_count(), "benchmark selected image count overflow");
+     labels = common_math::checked_add(labels, enhanced ? 0U : index.box_count(), "benchmark selected label count overflow");
+     masks = common_math::checked_add(masks, enhanced ? 0U : index.run_count(), "benchmark selected mask count overflow");
     };
     std::vector<std::uint64_t> archive_sizes;
     if (enhanced) {
      for (const auto& component : enhanced->components) count_index(component.index, coconut_validation_component(component.edition));
-     if (enhanced->stock_validation) count_index(*enhanced->stock_validation, true);
+     if (enhanced->stock_validation) count_index(NormalizedAnnotationReadView(*enhanced->stock_validation), true);
      for (const auto& archive : admitted) archive_sizes.push_back(archive.origin.artifact.expected_size);
     } else {
      count_index(*coco_train, false);
@@ -907,7 +913,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       }
      if (enhanced->stock_validation) {
       auto& task = archive_tasks.at(task_slots.at({CoconutImageNamespace::CocoValidation, 0}));
-      task.image_ids = image_ids(*enhanced->stock_validation);
+      task.image_ids = image_ids(NormalizedAnnotationReadView(*enhanced->stock_validation));
      }
      for (auto& task : archive_tasks) {
       std::ranges::sort(task.image_ids);
@@ -919,7 +925,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      archive_tasks.push_back(ArchiveTask{BenchmarkDatasetSource::kCoco2017, "train2017", coco_train_ids, custom_catalog.coco_train_images});
      archive_tasks.push_back(ArchiveTask{BenchmarkDatasetSource::kCoco2017, "val2017", coco_val_ids, custom_catalog.coco_val_images});
      std::vector<std::vector<std::uint64_t>> shard_ids(object_artifacts.size());
-     for (const auto& image : objects->images)
+     for (const auto& image : objects->images())
       if (image.source_shard < shard_ids.size()) shard_ids[image.source_shard].push_back(image.source_image_id);
      for (std::size_t shard = 0U; shard < object_artifacts.size(); ++shard) {
       const std::uint16_t numeric_shard = common_math::checked_cast<std::uint16_t>(shard, "Objects365 shard index overflow");
@@ -933,7 +939,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     // Reserve canonical format-9 slots as soon as normalized membership is
     // known. Label projection and acquisition never mutate this pixel inventory.
     PreparedBenchmarkSplit pixel_train = make_split("train"), pixel_validation = make_split("val");
-    const auto append_pixel_members = [&](const NormalizedAnnotationIndex& index, bool validation_split, std::optional<CoconutImageNamespace> physical_source = {},
+    const auto append_pixel_members = [&](const NormalizedAnnotationReadView& index, bool validation_split, std::optional<CoconutImageNamespace> physical_source = {},
                                        std::span<const CoconutInventoryImage> physical_rows = {}) {
      auto& split = validation_split ? pixel_validation : pixel_train;
      std::unordered_map<std::uint16_t, std::uint16_t> source_slots;
@@ -946,8 +952,8 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       source_slots.emplace(0, common_math::checked_cast<std::uint16_t>(split.sources.size(), "benchmark pixel source count overflow"));
       split.sources.push_back({cache.source_images("open-images") / "train"});
      }
-     for (std::size_t i = 0; i < index.images.size(); ++i) {
-      const auto& image = index.images[i];
+     for (std::size_t i = 0; i < index.image_count(); ++i) {
+      const auto& image = index.image(i);
       if (!physical_source && !validation_split && !image.box_count) continue;
       const auto shard = physical_rows.empty() ? image.source_shard : physical_rows[i].physical.shard;
       split.images.push_back({image.source_image_id, image.width, image.height, 0, 0, source_slots.at(shard)});
@@ -955,7 +961,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     };
     if (enhanced) {
      for (const auto& component : enhanced->components) append_pixel_members(component.index, coconut_validation_component(component.edition), component.source, component.inventory);
-     if (enhanced->stock_validation) append_pixel_members(*enhanced->stock_validation, true, CoconutImageNamespace::CocoValidation);
+     if (enhanced->stock_validation) append_pixel_members(NormalizedAnnotationReadView(*enhanced->stock_validation), true, CoconutImageNamespace::CocoValidation);
     } else {
      append_pixel_members(*coco_train, false);
      append_pixel_members(*objects, false);
@@ -1003,7 +1009,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     std::atomic<std::size_t> pending_object_archives{coconut ? 0 : archive_tasks.size() - 2};
     const std::size_t kLabelPlanCount = enhanced ? enhanced->components.size() + static_cast<std::size_t>(enhanced->stock_validation.has_value()) : 4U;
     progress.label_plans(kLabelPlanCount);
-    const auto prepare_source_labels = [&](std::size_t slot, const NormalizedAnnotationIndex& index, std::vector<CachedImageDirectory> directories) {
+    const auto prepare_source_labels = [&](std::size_t slot, const NormalizedAnnotationReadView& index, std::vector<CachedImageDirectory> directories) {
      std::vector<std::uint64_t> unavailable;
      for (const auto& directory : directories)
       for (const auto& rejected : directory.quarantined) unavailable.push_back(rejected.image_id);
@@ -1192,7 +1198,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
         "training image");
       }
      }
-     if (open_image_result->available_image_ids.size() + quarantined.size() != open_images->images.size() ||
+     if (open_image_result->available_image_ids.size() + quarantined.size() != open_images->image_count() ||
          open_image_result->directory.image_count != open_image_result->available_image_ids.size()) {
       throw std::runtime_error("Open Images acquisition resolution count is inconsistent");
      }
@@ -1324,16 +1330,16 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       auto& writer = is_validation ? validation_writer : train_writer;
       auto& next_slot = is_validation ? validation_slot : train_slot;
       std::vector<std::pair<std::uint32_t, std::uint32_t>> dimensions;
-      dimensions.reserve(component.index.images.size());
-      for (std::size_t i = 0; i < component.index.images.size(); ++i, ++next_slot) {
-       const auto& image = component.index.images[i];
+      dimensions.reserve(component.index.image_count());
+      for (std::size_t i = 0; i < component.index.image_count(); ++i, ++next_slot) {
+       const auto& image = component.index.image(i);
        const auto actual = writer.header_dimensions(next_slot).value_or(std::pair{image.width, image.height});
        dimensions.push_back(actual);
        if (actual == std::pair{image.width, image.height}) continue;
        const auto& identity = component.inventory[i];
        const auto reason = "annotation dimensions " + std::to_string(image.width) + "x" + std::to_string(image.height) + " do not match image dimensions " + std::to_string(actual.first) + "x" +
                            std::to_string(actual.second);
-       for (const auto& box : std::span(component.index.boxes).subspan(static_cast<std::size_t>(image.first_box), image.box_count))
+       for (const auto& box : component.index.storage().boxes.subspan(static_cast<std::size_t>(image.first_box), image.box_count))
         coconut_failures.reject(identity.physical, identity.release_image_id, release->name, box.annotation_id, box.source_category_id, reason);
       }
       auto& split = is_validation ? validation : train;
@@ -1349,7 +1355,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       const auto task = std::ranges::find(archive_tasks, CoconutImageNamespace::CocoValidation, &ArchiveTask::image_namespace);
       if (task == archive_tasks.end()) throw std::runtime_error("stock COCO validation archive is absent");
       validation_count =
-       append_source_plan(*enhanced->stock_validation, {*archive_results[task - archive_tasks.begin()]}, nullptr, config.resolution, config.resize_mode, true, &validation, cancel_requested, {}, {}, {}, &pipeline);
+       append_source_plan(NormalizedAnnotationReadView(*enhanced->stock_validation), {*archive_results[task - archive_tasks.begin()]}, nullptr, config.resolution, config.resize_mode, true, &validation, cancel_requested, {}, {}, {}, &pipeline);
       progress.label_plan_completed(label_slot);
      }
     };
@@ -1515,13 +1521,13 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     }
     trace_benchmark_event(trace, "benchmark.quarantine.final", [&] { return nlohmann::json{{"images", quarantined.size()}}; });
     std::uint64_t annotation_drops = 0U;
-    const auto add_annotation_drops = [&](const NormalizedAnnotationIndex& index) {
+    const auto add_annotation_drops = [&](const NormalizedAnnotationMetadata& index) {
      annotation_drops = common_math::checked_add(annotation_drops, index.rejected.degenerate_boxes, "benchmark rejected annotation count overflow");
      annotation_drops = common_math::checked_add(annotation_drops, index.rejected.duplicate_boxes, "benchmark rejected annotation count overflow");
     };
     if (enhanced) {
      for (const auto& component : enhanced->components) add_annotation_drops(component.index);
-     if (enhanced->stock_validation) add_annotation_drops(*enhanced->stock_validation);
+     if (enhanced->stock_validation) add_annotation_drops(NormalizedAnnotationReadView(*enhanced->stock_validation));
     } else {
      add_annotation_drops(*coco_train);
      add_annotation_drops(*coco_val);
@@ -1555,21 +1561,20 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      {"image_cache", nlohmann::json::array()},
      {"quarantined_images", nlohmann::json::array()},
     };
-    const auto append_source_manifest = [&](const NormalizedAnnotationIndex& source_index, const SourceCompileCount& count, const std::string_view annotation_url,
+    const auto append_source_manifest = [&](const NormalizedAnnotationReadView& source_index, const SourceCompileCount& count, const std::string_view annotation_url,
                                          const std::filesystem::path& normalized_index_path, const SupplementalSamplingStats* sampling) {
-     const nlohmann::json cache_identity = read_json_file(normalized_index_path.string() + ".complete.json");
      nlohmann::json source_manifest{
       {"name", benchmark_source_name(source_index.source)},
       {"version", benchmark_source_version(source_index.source)},
       {"annotation_url", annotation_url},
       {"annotation_sha256", source_index.annotation_sha256},
       {"normalized_index", normalized_index_path.lexically_relative(cache.root).string()},
-      {"normalized_index_identity", cache_identity.at("identity").get<std::string>()},
-      {"indexed_images", sampling != nullptr ? sampling->full_images : source_index.images.size()},
-      {"indexed_boxes", sampling != nullptr ? sampling->full_boxes : source_index.boxes.size()},
-      {"indexed_mask_rle_pairs", source_index.mask_rle_pairs.size()},
+      {"normalized_index_identity", source_index.completion->identity},
+      {"indexed_images", sampling != nullptr ? sampling->full_images : source_index.image_count()},
+      {"indexed_boxes", sampling != nullptr ? sampling->full_boxes : source_index.box_count()},
+      {"indexed_mask_rle_pairs", source_index.run_count()},
       {"selected_images", count.selected_images},
-      {"selected_boxes", source_index.boxes.size()},
+      {"selected_boxes", source_index.box_count()},
       {"compiled_images", count.compiled_images},
       {"compiled_boxes", count.compiled_boxes},
       {"rejected_records", reject_json(source_index.rejected)},
@@ -1588,13 +1593,12 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      append_source_manifest(*coco_train, source_counts[0], custom_catalog.coco_annotations.url, coco_train_index_path, nullptr);
      append_source_manifest(*objects, source_counts[1], custom_catalog.objects_annotations.url, objects_index_path, &objects_sampling.stats);
      append_source_manifest(*open_images, source_counts[2], custom_catalog.open_images_boxes.url, open_images_index_path, &open_images_sampling.stats);
-     const nlohmann::json val_cache_identity = read_json_file(coco_val_index_path.string() + ".complete.json");
      manifest["validation_source"] = {
       {"name", "coco"},
       {"version", benchmark_source_version(BenchmarkDatasetSource::kCoco2017)},
       {"annotation_sha256", coco_val->annotation_sha256},
       {"normalized_index", coco_val_index_path.lexically_relative(cache.root).string()},
-      {"normalized_index_identity", val_cache_identity.at("identity").get<std::string>()},
+      {"normalized_index_identity", coco_val->completion->identity},
       {"selected_images", validation_count.selected_images},
       {"compiled_images", validation_count.compiled_images},
       {"compiled_boxes", validation_count.compiled_boxes},
