@@ -75,15 +75,15 @@ struct CoconutRecipeInputs {
   CocoAnnotationSplit state;
   std::shared_ptr<const CoconutRecoveryOriginals> recovery;
  };
- void original_split(CocoAnnotationSplit value) {
+ void original_split(CocoAnnotationSplit value, bool recover) {
   const bool withdrew = !value.index;
   const bool training = value.training;
   const auto generation = value.generation;
   std::shared_ptr<const CoconutRecoveryOriginals> recovery;
   const auto index = [&](std::size_t) {
-   if (value.index) recovery = std::make_shared<CoconutRecoveryOriginals>(value.training ? &*value.index : nullptr, value.training ? nullptr : &*value.index, external);
+   if (recover && value.index) recovery = std::make_shared<CoconutRecoveryOriginals>(value.training ? &*value.index : nullptr, value.training ? nullptr : &*value.index, external);
   };
-  if (execution) execution->run(BenchmarkStage::Metadata, {}, index); else index(0);
+  if (recover && value.index) { if (execution) execution->run(BenchmarkStage::Metadata, {}, index); else index(0); }
   {
    const std::lock_guard lock(mutex);
    auto& split = value.training ? train_originals : validation_originals;
@@ -581,17 +581,17 @@ void retire_coconut_recipe_inputs(const std::shared_ptr<CoconutRecipeInputs>& in
    for (const auto& image : component.inventory())
     withdrawn += affected(image.physical) && image.physical.archive_identity == changed->download.identity;
   }
-  for (auto& chunk : records.normalized) if (chunk && affected(chunk->inventory.front().physical)) {
-   const auto& image = chunk->inventory.front().physical;
+  for (std::size_t row = 0; row < records.size(); ++row) if (const auto& chunk = records.row(row).native(); chunk && affected(chunk->inventory().physical)) {
+   const auto& image = chunk->inventory().physical;
    bool counted = false;
-   if (const auto full = release.inputs.components.find({chunk->edition, chunk->source}); full != release.inputs.components.end()) {
+   if (const auto full = release.inputs.components.find({chunk->lineage().component.edition, chunk->lineage().component.source}); full != release.inputs.components.end()) {
     const auto images = full->second.index().images();
     const auto row = std::ranges::lower_bound(images, image.image_id, {}, &NormalizedImage::source_image_id);
     counted = row != images.end() && (*row).source_image_id == image.image_id &&
      full->second.inventory_image(static_cast<std::size_t>(row - images.begin())).physical == image;
    }
    if (!counted && image.archive_identity == changed->download.identity) ++withdrawn;
-   chunk.reset();
+   records.native(row, {});
   }
   if (inputs->indexing && withdrawn) inputs->indexing->invalidate(i, *inputs->progress, withdrawn);
  }
@@ -657,11 +657,13 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  if (initial_preparation) progress.phase(DatasetCompilePhase::Downloading);
  prepared.manifest = {{"dataset", "coconut"}, {"validation", config.selection.validation}, {"components", nlohmann::json::array()}, {"artifacts", nlohmann::json::array()}};
  auto& originals = retained.originals;
+ const bool recover_train = config.selection.recover_dropped_masks && std::ranges::any_of(catalog.releases, [](const auto& release) { return release.edition == CoconutEdition::Base; });
+ const bool recover_validation = config.selection.recover_dropped_masks && std::ranges::any_of(catalog.releases, [](const auto& release) { return release.edition == CoconutEdition::RelabeledValidation; });
  const bool needs_originals = config.selection.recover_dropped_masks || config.selection.validation == CoconutValidation::Stock;
  if (needs_originals) {
   const bool recover = config.selection.recover_dropped_masks;
   const bool stock = config.selection.validation == CoconutValidation::Stock;
-  retained.start_originals([&retained, &cache, &catalog, &progress, execution, trace, recover, stock, acquisition_workers, parse_workers, preparation = std::move(preparation)] {
+  retained.start_originals([&retained, &cache, &catalog, &progress, execution, trace, recover, stock, recover_train, recover_validation, acquisition_workers, parse_workers, preparation = std::move(preparation)] {
    const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(retained);
    StorageReservationPool reservations(cache.root, trace, execution ? &execution->storage() : nullptr);
    // Declare fixed transport before retaining its dependent source lifecycle.
@@ -675,7 +677,10 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
    trace_benchmark_event(trace, "benchmark.annotations.originals_begin", [&] { return nlohmann::json{{"recover_dropped_masks", recover}, {"validation", stock ? CoconutValidation::Stock : CoconutValidation::Coconut}}; });
    CocoAnnotationCache annotations(cache, catalog.stock_annotations, selection, 0, checked_cast<std::uint32_t>(catalog.coco_validation_images, "COCO validation count overflow"), static_cast<int>(parse_workers),
     cancellation, trace, execution, &reservations, std::move(original_lease));
-   annotations.observe_splits([&retained](CocoAnnotationSplit split) { retained.original_split(std::move(split)); },
+   annotations.observe_splits([&retained, recover_train, recover_validation](CocoAnnotationSplit split) {
+    const bool selected = split.training ? recover_train : recover_validation;
+    retained.original_split(std::move(split), selected);
+   },
     {retained.train_originals.state.generation, retained.validation_originals.state.generation});
    annotations.discover(progress);
    if (annotations.pending_download()) {

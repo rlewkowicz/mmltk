@@ -47,7 +47,7 @@ template<> struct ArrowColumn<std::variant<std::int64_t, double>> { using type =
 // Resolved once while the existing reader owns its schema manifest. These
 // indices are immutable shard facts, not a second external-field inventory.
 struct ParquetProjection {
- std::vector<int> images, masks;
+ std::vector<int> images, masks, png;
  int segment_id = -1;
 };
 void append_leaf_columns(const parquet::arrow::SchemaField& field, std::vector<int>& columns) {
@@ -106,6 +106,8 @@ void resolve_fields(std::span<const parquet::arrow::SchemaField> fields, Parquet
    if constexpr (std::same_as<Shape, CoconutParquetRow>)
     member_image = Index == reflection::member_index<&CoconutParquetRow::image_info>(reflection::field_declarations<Shape>());
    resolve_value<typename Declaration::member_type>(field, projection, member_image);
+   if constexpr (std::same_as<Shape, CoconutParquetRow>)
+    if constexpr (Index == reflection::member_index<&CoconutParquetRow::mask>(reflection::field_declarations<Shape>())) append_leaf_columns(field, projection.png);
    if constexpr (std::same_as<Shape, CoconutParquetSegment>) {
     if constexpr (Index == reflection::member_index<&CoconutParquetSegment::id>(reflection::field_declarations<Shape>())) projection.segment_id = field.column_index;
    }
@@ -202,80 +204,85 @@ void read_image_record(const BoundColumns<CoconutParquetImage>& images, std::int
  record.height = static_cast<std::uint32_t>(height);
  record.source_ordinal = ordinal;
 }
-void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation, const std::function<void(CoconutRecord&&, std::span<const std::uint8_t>)>& consumer,
- std::uint64_t& row_ordinal, std::uint64_t& segment_ordinal, bool metadata_only, std::span<CoconutRecord> retained) {
+void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation, const std::function<void(const CoconutRecord&, std::span<const std::uint8_t>)>& consumer,
+ std::uint64_t& row_ordinal, std::uint64_t& segment_ordinal, bool metadata_only, CoconutAnnotationRecords& retained, bool annotation_projection) {
  check(batch.Validate());  // Includes nested offsets and value-buffer bounds.
  if (metadata_only) {
   const auto images = top_level_column<&CoconutParquetRow::image_info>(batch);
   const BoundColumns<CoconutParquetImage> image_fields(*images);
   for (std::int64_t row = 0; row < batch.num_rows(); ++row) {
    throw_if_benchmark_cancelled(cancellation);
-   CoconutRecord record;
-   present(*images, row, "image_info");
-   read_image_record(image_fields, row, limits, row_ordinal, record);
+   if (row_ordinal >= retained.size()) malformed("retained image row join");
+   if (!retained.row(row_ordinal).metadata_ready()) {
+    CoconutRecord record;
+    present(*images, row, "image_info");
+    read_image_record(image_fields, row, limits, row_ordinal, record);
+    retained.admit_metadata(row_ordinal, std::move(record));
+   }
    if (row_ordinal == UINT64_MAX) malformed("ordinal overflow");
-   consumer(std::move(record), {});
+   consumer(retained.record(row_ordinal), {});
    ++row_ordinal;
   }
   return;
  }
  const auto masks = top_level_column<&CoconutParquetRow::mask>(batch);
- const auto annotations = top_level_column<&CoconutParquetRow::segments_info>(batch);
+ const auto annotations = annotation_projection ? top_level_column<&CoconutParquetRow::segments_info>(batch) : nullptr;
  const BoundColumns<CoconutParquetMask> mask_fields(*masks);
- const BoundColumns<CoconutParquetAnnotation> annotation_fields(*annotations);
+ const auto annotation_fields = annotations ? std::make_unique<BoundColumns<CoconutParquetAnnotation>>(*annotations) : nullptr;
  const auto bytes = mask_fields.get<&CoconutParquetMask::bytes>();
  const auto mask_paths = mask_fields.get<&CoconutParquetMask::path>();  // HF path is nullable; embedded bytes are authoritative.
- const auto lists = annotation_fields.get<&CoconutParquetAnnotation::segments_info>();
- const auto segments = structure(lists->values(), "segment");
- const BoundColumns<CoconutParquetSegment> segment_fields(*segments);
- const auto areas = segment_fields.get<&CoconutParquetSegment::area>();
- const auto integer_areas = areas->type_id() == arrow::Type::INT64 ? static_cast<const arrow::Int64Array*>(areas.get()) : nullptr;
+ const auto lists = annotation_fields ? annotation_fields->get<&CoconutParquetAnnotation::segments_info>() : nullptr;
+ const auto segments = lists ? structure(lists->values(), "segment") : nullptr;
+ const auto segment_fields = segments ? std::make_unique<BoundColumns<CoconutParquetSegment>>(*segments) : nullptr;
+ const auto areas = segment_fields ? segment_fields->get<&CoconutParquetSegment::area>() : nullptr;
+ const auto integer_areas = areas && areas->type_id() == arrow::Type::INT64 ? static_cast<const arrow::Int64Array*>(areas.get()) : nullptr;
  const auto floating_areas = integer_areas ? nullptr : static_cast<const arrow::DoubleArray*>(areas.get());
- CoconutRecord record;
  for (std::int64_t row = 0; row < batch.num_rows(); ++row) {
   throw_if_benchmark_cancelled(cancellation);
   present(*masks, row, "mask");
   present(*bytes, row, "mask.bytes");
-  present(*annotations, row, "segments_info");
-  present(*lists, row, "segments list");
   const auto png = binary_value(*bytes, row, "mask.bytes");
   if (!mask_paths->IsNull(row) && !mmltk::common::types::valid_utf8(binary_value(*mask_paths, row, "mask.path"))) malformed("mask.path");
-  const auto begin = lists->value_offset(row), end = lists->value_offset(row + 1);
-  if (begin < 0 || end < begin || end > segments->length()) malformed("segment list offsets");
-  const auto length = end - begin;
-  if (png.empty() || png.size() > limits.max_png_bytes || length < 0 || static_cast<std::uint64_t>(length) > limits.max_segments) malformed("record exceeds PNG/segment admission");
-  if (row_ordinal >= retained.size()) malformed("retained image row join");
-  // Canonical row metadata survives a failed physical join or cancellation
-  // partway through this batch. Completed native chunks use the same positions.
-  record = retained[static_cast<std::size_t>(row_ordinal)];
-  if (integer(annotation_fields.get<&CoconutParquetAnnotation::image_id>(), row, "image_id") != record.image_id) malformed("image_id join");
-  const auto annotation_file = text(annotation_fields.get<&CoconutParquetAnnotation::file_name>(), row, "file_name");
-  if (std::filesystem::path(record.file_name).stem() != std::filesystem::path(annotation_file).stem() || std::filesystem::path(annotation_file).extension() != ".png")
-   malformed("mask/image filename join");
-  record.first_segment_ordinal = segment_ordinal;
-  record.segments.clear();
-  record.segments.reserve(static_cast<std::size_t>(length));
+  if (png.empty() || png.size() > limits.max_png_bytes) malformed("record exceeds PNG/segment admission");
+  if (row_ordinal >= retained.size() || !retained.row(row_ordinal).metadata_ready()) malformed("retained image row join");
+  const auto& record = retained.record(row_ordinal);
+  if (!retained.row(row_ordinal).complete()) {
+   if (!annotations) malformed("missing annotation projection");
+   present(*annotations, row, "segments_info");
+   present(*lists, row, "segments list");
+   const auto begin = lists->value_offset(row), end = lists->value_offset(row + 1);
+   if (begin < 0 || end < begin || end > segments->length()) malformed("segment list offsets");
+   const auto length = end - begin;
+   if (static_cast<std::uint64_t>(length) > limits.max_segments) malformed("record exceeds PNG/segment admission");
+   if (integer(annotation_fields->get<&CoconutParquetAnnotation::image_id>(), row, "image_id") != record.image_id) malformed("image_id join");
+   const auto annotation_file = text(annotation_fields->get<&CoconutParquetAnnotation::file_name>(), row, "file_name");
+   if (std::filesystem::path(record.file_name).stem() != std::filesystem::path(annotation_file).stem() || std::filesystem::path(annotation_file).extension() != ".png") malformed("mask/image filename join");
+   std::vector<CoconutSegment> parsed;
+   parsed.reserve(static_cast<std::size_t>(length));
   for (std::int64_t offset = 0; offset < length; ++offset) {
    const auto index = begin + offset;
    present(*segments, index, "segment");
    CoconutSegment segment;
-   const auto id = integer(segment_fields.get<&CoconutParquetSegment::id>(), index, "id");
+   const auto id = integer(segment_fields->get<&CoconutParquetSegment::id>(), index, "id");
    if (id == 0 || id > 0xffffffU) malformed("RGB segment id");
    segment.id = static_cast<std::uint32_t>(id);
-   segment.category_id = integer(segment_fields.get<&CoconutParquetSegment::category_id>(), index, "category_id");
-   segment.isthing = boolean(segment_fields.get<&CoconutParquetSegment::isthing>(), index, "isthing");
-   segment.crowd = boolean(segment_fields.get<&CoconutParquetSegment::iscrowd>(), index, "iscrowd");
-   segment.ignore = boolean(segment_fields.get<&CoconutParquetSegment::ignore>(), index, "ignore");
+   segment.category_id = integer(segment_fields->get<&CoconutParquetSegment::category_id>(), index, "category_id");
+   segment.isthing = boolean(segment_fields->get<&CoconutParquetSegment::isthing>(), index, "isthing");
+   segment.crowd = boolean(segment_fields->get<&CoconutParquetSegment::iscrowd>(), index, "iscrowd");
+   segment.ignore = boolean(segment_fields->get<&CoconutParquetSegment::ignore>(), index, "ignore");
    if (!areas->IsNull(index)) {
     segment.area = integer_areas ? static_cast<double>(integer_areas->Value(index)) : floating_areas->Value(index);
     if (!std::isfinite(*segment.area) || *segment.area < 0) malformed("area");
    }
-   record.segments.push_back(segment);
+   parsed.push_back(segment);
   }
+   retained.admit_segments(row_ordinal, std::move(parsed), segment_ordinal);
+  }
+  if (record.first_segment_ordinal != segment_ordinal) malformed("retained local segment offset");
   if (row_ordinal == UINT64_MAX || record.segments.size() > UINT64_MAX - segment_ordinal) malformed("ordinal overflow");
   throw_if_benchmark_cancelled(cancellation);
   segment_ordinal += record.segments.size();
-  consumer(std::move(record), {reinterpret_cast<const std::uint8_t*>(png.data()), png.size()});
+  consumer(record, {reinterpret_cast<const std::uint8_t*>(png.data()), png.size()});
   ++row_ordinal;
  }
 }
@@ -348,29 +355,32 @@ class CoconutParquetMetadata final {
 public:
  struct Shard { std::filesystem::path path; std::shared_ptr<ParquetPool> pool; std::shared_ptr<parquet::FileMetaData> footer; ParquetProjection projection; };
  struct Group { std::size_t shard; int group; };
- bool metadata_ready = false;
  std::vector<Shard> shards;
  std::vector<Group> groups;
 };
 void CoconutAnnotationRecords::rebase_parquet_segments() {
+ if (prefixes_sealed_) return;
  std::uint64_t prefix = 0;
  for (auto& group : groups) {
-  if (group.first_row > records.size() || group.rows > records.size() - group.first_row) malformed("retained group row extent");
+  if (group.first_row > size() || group.rows > size() - group.first_row) malformed("retained group row extent");
   group.first_segment = prefix;
-  for (auto& record : std::span(records).subspan(static_cast<std::size_t>(group.first_row), static_cast<std::size_t>(group.rows)))
-   record.first_segment_ordinal = mmltk::common::math::checked_add(record.first_segment_ordinal, prefix, "COCONut Parquet record ordinal overflow");
+  for (auto& row : std::span(rows_).subspan(static_cast<std::size_t>(group.first_row), static_cast<std::size_t>(group.rows))) {
+   if (!row.complete()) malformed("incomplete annotation prefix");
+   row.segment_ordinal_ = mmltk::common::math::checked_add(row.record_.first_segment_ordinal, prefix, "COCONut Parquet record ordinal overflow");
+  }
   prefix = mmltk::common::math::checked_add(prefix, group.segments, "COCONut Parquet segment prefix overflow");
  }
+ prefixes_sealed_ = true;
 }
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only, BenchmarkCompilePipeline* execution, const std::function<void(std::size_t)>& retire_consumer_scratch, const BenchmarkAllowance& parent, CoconutPhysicalInputRequirement physical_input, CoconutAnnotationRecords* retained,
+ const CoconutRecordConsumer& consumer, bool metadata_only, BenchmarkCompilePipeline* execution, const std::function<void(std::size_t)>& finish_consumer_group, const BenchmarkAllowance& parent, CoconutPhysicalInputRequirement physical_input, CoconutAnnotationRecords* retained,
  const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace, const std::function<void(const BenchmarkAllowance&)>& retire_consumer_input,
- const std::function<void(const std::function<void()>&)>& settle_consumer) {
+ const std::function<void(const std::function<void()>&)>& settle_consumer, const std::function<bool(const CoconutRecord&, const BenchmarkAllowance&)>& reusable_native) {
  using mmltk::common::math::checked_add;
  using mmltk::common::math::checked_multiply;
  CoconutAnnotationRecords local;
  if (!retained) retained = &local;
- const ParquetCallEnvelope envelope(metadata_only, retained->parquet && retained->parquet->metadata_ready, physical_input);
+ const ParquetCallEnvelope envelope(metadata_only, retained->parquet && retained->metadata_complete(), physical_input);
  if (!retained->parquet) {
   auto catalog = std::make_shared<CoconutParquetMetadata>();
   std::uint64_t rows = 0;
@@ -407,7 +417,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    }
    catalog->shards.push_back({path, std::move(pool), std::move(footer), std::move(projection)});
   }
-  retained->records.resize(mmltk::common::math::checked_cast<std::size_t>(rows, "COCONut Parquet row count overflow"));
+  retained->resize(mmltk::common::math::checked_cast<std::size_t>(rows, "COCONut Parquet row count overflow"));
   retained->parquet = std::move(catalog);
   // The first pass projects only image columns and publishes each ready row.
   // A full import then joins these same owned records from mask-only batches.
@@ -469,30 +479,39 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
     const auto& shard = catalog->shards[position.shard];
     throw_if_benchmark_cancelled(cancellation);
     try {
-     if (image_pass && !envelope.needs_metadata()) {
+     if (image_pass && (!envelope.needs_metadata() || std::ranges::all_of(retained->rows().subspan(group.first_row, group.rows), [](const auto& row) { return row.metadata_ready(); }))) {
       sequence.ensure(0);
       const auto& allowance = sequence.allowance;
-      for (auto row = group.first_row; row < group.first_row + group.rows; ++row) consumer(group_index, retained->records[static_cast<std::size_t>(row)], CoconutAnnotationInput{{}, allowance, {}, sequence.live_bytes(), true});
-      if (retire_consumer_scratch) retire_consumer_scratch(group_index);
+      for (auto row = group.first_row; row < group.first_row + group.rows; ++row) consumer(group_index, retained->record(static_cast<std::size_t>(row)), CoconutAnnotationInput{{}, allowance, {}, sequence.live_bytes(), true});
+      if (finish_consumer_group) finish_consumer_group(group_index);
       return;
      }
-     std::uint64_t bytes = 0;
-     const auto size_group = [&](std::size_t) {
-      std::uint64_t scratch = 0;
-      if (!image_pass && consumer_workspace) for (auto row = group.first_row; row < group.first_row + group.rows; ++row)
-       scratch = std::max(scratch, consumer_workspace(retained->records[static_cast<std::size_t>(row)]));
-      // The producer promise covers every possible allocation of the capped
-      // reader and the largest admitted image in this group, not import limits.
-      std::uint64_t batch_segments = 0;
-      if (!image_pass) {
-       const auto count = shard.footer->RowGroup(position.group)->ColumnChunk(shard.projection.segment_id)->num_values();
-       if (count < 0) malformed("negative segment value count");
-       batch_segments = std::min(static_cast<std::uint64_t>(count), checked_multiply(std::min<std::uint64_t>(8, group.rows), std::uint64_t{limits.max_segments}, "COCONut Parquet segment bound overflow"));
+     bool annotations_needed = false, png_needed = false;
+     std::uint64_t scratch = 0;
+     // Native reuse checks actual current physical/original dependencies. No
+     // cached presence bit alone can omit a mask projection.
+     if (!image_pass) for (auto row = group.first_row; row < group.first_row + group.rows; ++row) {
+      const auto& stored = retained->row(row);
+      annotations_needed |= !stored.complete();
+      const bool needed = !stored.complete() || !reusable_native || !reusable_native(stored.record(), sequence.active ? sequence.allowance : parent);
+      png_needed |= needed;
+      if (needed && consumer_workspace) scratch = std::max(scratch, consumer_workspace(stored.record()));
+     }
+     if (!image_pass && !png_needed) {
+      // No Arrow input is opened for a completely reusable group. Retained rows
+      // still enter the real duplicate/row-count/progress consumer exactly once.
+      std::uint64_t segments = 0;
+      for (auto row = group.first_row; row < group.first_row + group.rows; ++row) {
+       const auto& record = retained->record(row);
+       if (record.first_segment_ordinal != segments) malformed("retained local segment offset");
+       segments = checked_add(segments, std::uint64_t{record.segments.size()}, "COCONut Parquet segment count overflow");
+       consumer(group_index, record, CoconutAnnotationInput{{}, sequence.allowance, {}, sequence.active ? sequence.live_bytes() : 0, false});
       }
-      const auto typed = checked_add(checked_multiply(batch_segments, std::uint64_t{sizeof(CoconutSegment)}, "COCONut Parquet typed batch overflow"), 128ULL << 10, "COCONut Parquet row metadata overflow");
-      bytes = checked_add(scratch, typed, "COCONut Parquet batch workspace overflow");
-     };
-     if (execution) execution->run(BenchmarkStage::Metadata, {65536, 0}, size_group, sequence.allowance); else size_group(0);
+      group.segments = segments;
+      if (finish_consumer_group) finish_consumer_group(group_index);
+      return;
+     }
+     const auto bytes = checked_add(scratch, std::uint64_t{128ULL << 10}, "COCONut Parquet batch workspace overflow");
      sequence.ensure(bytes);
      const auto& allowance = sequence.allowance;
      const auto& pool = sequence.pool;
@@ -500,7 +519,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
       const std::function<void(std::size_t)>& callback; std::size_t group; bool pending = true;
       void finish() { if (std::exchange(pending, false) && callback) callback(group); }
       ~RetireConsumer() { if (pending) try { finish(); } catch (...) {} }
-     } retire{retire_consumer_scratch, group_index};
+     } retire{finish_consumer_group, group_index};
      const auto cpu = [&](const std::function<void()>& work) { if (execution) execution->run(image_pass ? BenchmarkStage::Metadata : BenchmarkStage::Normalize, {}, [&](std::size_t) { work(); }, allowance); else work(); };
      if (sequence.shard != position.shard) {
       sequence.reader.reset();
@@ -508,7 +527,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
       sequence.shard = position.shard;
      }
      auto& reader = sequence.reader;
-     const auto& columns = image_pass ? shard.projection.images : shard.projection.masks;
+     const auto& columns = image_pass ? shard.projection.images : annotations_needed ? shard.projection.masks : shard.projection.png;
      std::unique_ptr<arrow::RecordBatchReader> batches;
      cpu([&] { batches = take(reader->GetRecordBatchReader({position.group}, columns)); });
      auto row_ordinal = group.first_row;
@@ -518,17 +537,16 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
       auto chunk = std::make_shared<ParquetBatch>(); chunk->pool = pool;
       cpu([&] { check(batches->ReadNext(&chunk->batch)); });
       if (!chunk->batch) break;
-      std::vector<std::pair<CoconutRecord, std::span<const std::uint8_t>>> records;
+      std::vector<std::pair<const CoconutRecord*, std::span<const std::uint8_t>>> records;
       records.reserve(static_cast<std::size_t>(chunk->batch->num_rows()));
-      cpu([&] { read_batch(*chunk->batch, limits, cancellation, [&](CoconutRecord&& record, std::span<const std::uint8_t> png) { records.emplace_back(std::move(record), png); }, row_ordinal, segment_ordinal, image_pass, retained->records); });
-      std::uint64_t live = checked_add(sequence.live_bytes(), records.capacity() * sizeof(records.front()), "COCONut live batch overflow");
-      for (const auto& [record, png] : records) live = checked_add(live, record.segments.capacity() * sizeof(CoconutSegment) + record.file_name.capacity() + record.physical_stem.capacity(), "COCONut retained batch overflow");
-      // ReadNext is stopped here. Consumer source waits remain outside CPU lanes;
-      // its finite normalization may lend only the actually unused promise.
-      for (auto& [record, png] : records) {
-       consumer(group_index, record, CoconutAnnotationInput{png, allowance, chunk, live, image_pass});
-       retained->records[static_cast<std::size_t>(record.source_ordinal)] = std::move(record);
-      }
+      cpu([&] { read_batch(*chunk->batch, limits, cancellation, [&](const CoconutRecord& record, std::span<const std::uint8_t> png) {
+       records.emplace_back(&record, png);
+      }, row_ordinal, segment_ordinal, image_pass, *retained, annotations_needed); });
+      const auto live = checked_add(sequence.live_bytes(), records.capacity() * sizeof(records.front()), "COCONut live batch overflow");
+      // Successful parsing already committed the canonical immutable row. A
+      // physical consumer failure cannot destroy it or cause a second parse.
+      for (const auto& [record, png] : records)
+       consumer(group_index, *record, CoconutAnnotationInput{png, allowance, chunk, live, image_pass});
      }
      if (row_ordinal != group.first_row + group.rows) malformed("row group extent mismatch");
      if (!image_pass) group.segments = segment_ordinal;
@@ -538,7 +556,6 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      // reader promise. At this settled group boundary pressure may release the
      // actual reader/pool before reacquiring the next group's complete envelope.
      // Footer and row/group cursors survive; no consumed rows are replayed.
-     if (execution && execution->resource_pressure()) sequence.close();
      if (settle_consumer) settle_consumer([&] { sequence.close(); });
     } catch (const ParquetFormatError& error) { throw std::runtime_error("COCONut Parquet " + shard.path.string() + ": " + error.what()); }
    };
@@ -551,7 +568,6 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    }
    sequence.close();
   });
- catalog->metadata_ready = true;
  if (envelope.full()) {
   const auto rebase = [&](std::size_t) { retained->rebase_parquet_segments(); };
   if (execution) execution->run(BenchmarkStage::Metadata, {}, rebase); else rebase(0);

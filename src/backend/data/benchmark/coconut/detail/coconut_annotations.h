@@ -1,5 +1,6 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
@@ -8,6 +9,7 @@
 #include "src/common/concurrency/cancellation_observation.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <ranges>
 #include <cstdint>
@@ -38,16 +40,6 @@ struct CoconutCompletionFacts {
 MMLTK_REFLECT_FIELDS(CoconutCompletionFacts)
 class CoconutComponentBacking;
 class CoconutInventorySeal;
-struct CoconutComponentMetadata {
- CoconutEdition edition = CoconutEdition::Base;
- CoconutImageNamespace source = CoconutImageNamespace::CocoTrain;
- std::string input_identity;
- std::uint32_t recovery_policy = 0;
- std::string original_annotation_identity;
- // Compile-local annotation lineage; persisted input_identity seals this plus physical dependencies.
- std::string annotation_input_identity;
- std::uint64_t original_generation = 0;
-};
 class CoconutComponent final {
 public:
  [[nodiscard]] CoconutEdition edition() const noexcept;
@@ -89,51 +81,61 @@ struct CoconutComponentBuilder : CoconutComponentMetadata {
  // Standalone construction performs real admission; no caller-supplied seal.
  [[nodiscard]] CoconutComponent finish(mmltk::common::concurrency::CancellationObservation = {}, const std::filesystem::path& directory = {}, StorageReservationPool* = nullptr) &&;
 };
-struct CoconutSegment {
- std::uint32_t id = 0;
- std::uint64_t category_id = 0;
- bool isthing = false;
- bool crowd = false;
- bool ignore = false;
- std::optional<double> area = std::nullopt;
- // External COCO bbox convention: x, y, width, height.
- std::optional<std::array<double, 4>> bbox = std::nullopt;
-};
-struct CoconutRecord {
- std::uint64_t image_id = 0;
- std::string file_name;
- std::string physical_stem;
- std::optional<CoconutImageNamespace> namespace_hint;
- std::uint32_t width = 0, height = 0;
- std::uint64_t source_ordinal = 0;
- std::uint64_t first_segment_ordinal = 0;
- std::vector<CoconutSegment> segments;
-};
 class BenchmarkArchive;
 class CoconutParquetMetadata;
 struct CoconutRecordGroup {
  std::uint64_t first_row = 0, rows = 0, first_segment = 0, segments = 0;
 };
-struct CoconutAnnotationRecords {
+class CoconutAnnotationRecords final {
+public:
+ class Row final {
+ public:
+  [[nodiscard]] const CoconutRecord& record() const noexcept { return record_; }
+  [[nodiscard]] bool metadata_ready() const noexcept { return state_ != State::Unparsed; }
+  [[nodiscard]] std::optional<std::size_t> image_join() const noexcept { return image_join_; }
+  [[nodiscard]] bool complete() const noexcept { return state_ == State::Complete; }
+  [[nodiscard]] std::uint64_t segment_ordinal() const noexcept { return segment_ordinal_; }
+  [[nodiscard]] const std::shared_ptr<const CoconutNativeImage>& native() const noexcept { return native_; }
+ private:
+  friend class CoconutAnnotationRecords;
+  enum class State { Unparsed, Metadata, Complete };
+  CoconutRecord record_;
+  State state_ = State::Unparsed;
+  std::uint64_t segment_ordinal_ = 0;
+  std::optional<std::size_t> image_join_;
+  std::shared_ptr<const CoconutNativeImage> native_;
+ };
  void discard() noexcept;
- // Commit group-local segment ordinals in catalog order after every group settles.
+ void resize(std::size_t count) {
+  if (count < rows_.size()) throw std::logic_error("cannot shrink admitted annotation rows");
+  if (count != rows_.size()) { rows_.resize(count); prefixes_sealed_ = false; }
+ }
+ [[nodiscard]] std::size_t size() const noexcept { return rows_.size(); }
+ [[nodiscard]] bool metadata_complete() const noexcept { return metadata_rows_.load(std::memory_order_relaxed) == rows_.size(); }
+ [[nodiscard]] const Row& row(std::size_t i) const { return rows_.at(i); }
+ [[nodiscard]] const CoconutRecord& record(std::size_t i) const { return row(i).record(); }
+ [[nodiscard]] std::span<const Row> rows() const noexcept { return rows_; }
+ void admit_metadata(std::size_t, CoconutRecord);
+ void admit_segments(std::size_t, std::vector<CoconutSegment>, std::uint64_t local_ordinal);
+ void adopt(std::vector<CoconutRecord>);
+ void admit_json(std::size_t, CoconutRecord, std::optional<std::size_t> = {});
+ void json_prefix(std::size_t, std::uint64_t);
+ void seal_xlarge_order();
+ void native(std::size_t, std::shared_ptr<const CoconutNativeImage>);
+ void retire_native() noexcept;
+ // Immutable local offsets are never incremented again on retries. This only
+ // seals the separate canonical placement after all group producers settle.
  void rebase_parquet_segments();
- std::vector<CoconutRecord> records;
- // Completed native images align with canonical source row positions. They
- // survive a physical retry, never annotation replacement or final assembly.
- std::vector<std::shared_ptr<const CoconutComponentBuilder>> normalized;
  std::shared_ptr<BenchmarkArchive> archive;
  std::shared_ptr<CoconutParquetMetadata> parquet;
  std::vector<CoconutRecordGroup> groups;
- // Sealed inventories from membership survive into the unchanged full import.
  std::vector<CoconutComponent> inventories;
  std::string identity;
-};
-struct CoconutImportLimits {
- std::uint64_t max_png_bytes = 64U * 1024U * 1024U;
- std::uint64_t max_pixels = 64U * 1024U * 1024U;
- std::uint32_t max_segments = 65535U;
- std::uint32_t max_dimension = MAX_IMAGE_EXTENT;
+ bool document_complete = false;
+private:
+ std::vector<Row> rows_;
+ std::atomic<std::size_t> metadata_rows_{0};
+ bool prefixes_sealed_ = false;
 };
 struct CoconutAnnotationInput {
  std::span<const std::uint8_t> png;
@@ -144,13 +146,14 @@ struct CoconutAnnotationInput {
  std::uint64_t live_bytes = 0;
  bool membership = false;
 };
-// Consumers return before the next allocation window. Group scratch retirement
-// is separate from noexcept input retirement at sequence end or failed growth.
+// Consumers return before the next allocation window. Finishing a group keeps
+// reusable scratch with its input grant; input retirement releases that backing.
 using CoconutRecordConsumer = std::function<void(std::size_t group, const CoconutRecord&, const CoconutAnnotationInput&)>;
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only = false, BenchmarkCompilePipeline* execution = nullptr, const std::function<void(std::size_t)>& retire_consumer_scratch = {}, const BenchmarkAllowance& parent = {}, CoconutPhysicalInputRequirement physical_input = {}, CoconutAnnotationRecords* retained = nullptr,
+ const CoconutRecordConsumer& consumer, bool metadata_only = false, BenchmarkCompilePipeline* execution = nullptr, const std::function<void(std::size_t)>& finish_consumer_group = {}, const BenchmarkAllowance& parent = {}, CoconutPhysicalInputRequirement physical_input = {}, CoconutAnnotationRecords* retained = nullptr,
  const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace = {}, const std::function<void(const BenchmarkAllowance&)>& retire_consumer_input = {},
- const std::function<void(const std::function<void()>&)>& settle_consumer = {});
+ const std::function<void(const std::function<void()>&)>& settle_consumer = {},
+ const std::function<bool(const CoconutRecord&, const BenchmarkAllowance&)>& reusable_native = {});
 class CoconutOriginalChanged final : public std::runtime_error {
 public:
  explicit CoconutOriginalChanged(CoconutImageNamespace source) : std::runtime_error("COCONut original annotation generation changed"), source_(source) {}

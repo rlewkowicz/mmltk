@@ -1,6 +1,7 @@
 #pragma once  // backend.data private implementation boundary
-#include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
+#include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <cstddef>
@@ -14,12 +15,44 @@
 #include <utility>
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
+struct CoconutRecord;
 inline constexpr std::uint32_t kCoconutRecoveryPolicy = 1;
 // A support owns mutable native runs or borrows admitted immutable originals.
 // Borrowing retains the original mapping; capacity reports only physical owned
 // storage, including cleared reusable capacity, never the borrowed span twice.
 class CoconutSupportRuns final {
+ struct Accounting {
+  CoconutSupportRuns& runs;
+  std::uint64_t before;
+  explicit Accounting(CoconutSupportRuns& value) : runs(value), before(value.retained_bytes()) {}
+  ~Accounting() { if (runs.total_) *runs.total_ = *runs.total_ - before + runs.retained_bytes(); }
+ };
 public:
+ CoconutSupportRuns() = default;
+ CoconutSupportRuns(const CoconutSupportRuns& other) : owned_(other.owned_), borrowed_(other.borrowed_), owner_(other.owner_) {}
+ CoconutSupportRuns& operator=(const CoconutSupportRuns& other) {
+  if (this == &other) return *this;
+  Accounting accounting(*this);
+  owned_ = other.owned_; borrowed_ = other.borrowed_; owner_ = other.owner_;
+  return *this;
+ }
+ CoconutSupportRuns(CoconutSupportRuns&& other) noexcept
+  : owned_(std::move(other.owned_)), borrowed_(std::exchange(other.borrowed_, {})), owner_(std::move(other.owner_)), total_(std::exchange(other.total_, nullptr)) {}
+ CoconutSupportRuns& operator=(CoconutSupportRuns&& other) noexcept {
+  if (this == &other) return *this;
+  account(nullptr);
+  owned_ = std::move(other.owned_); borrowed_ = std::exchange(other.borrowed_, {});
+  owner_ = std::move(other.owner_); total_ = std::exchange(other.total_, nullptr);
+  return *this;
+ }
+ ~CoconutSupportRuns() { account(nullptr); }
+ // The owning workspace updates one total at real growth or custody changes.
+ void account(std::uint64_t* total) noexcept {
+  if (total == total_) return;
+  if (total_) *total_ -= retained_bytes();
+  total_ = total;
+  if (total_) *total_ += retained_bytes();
+ }
  [[nodiscard]] std::span<const RLEPair> view() const noexcept { return borrowed_.empty() ? std::span<const RLEPair>(owned_) : borrowed_; }
  [[nodiscard]] auto begin() const noexcept { return view().begin(); }
  [[nodiscard]] auto end() const noexcept { return view().end(); }
@@ -30,17 +63,19 @@ public:
  [[nodiscard]] const RLEPair& front() const { return view().front(); }
  [[nodiscard]] std::uint64_t retained_bytes() const noexcept { return owned_.capacity() * sizeof(RLEPair); }
  void clear() noexcept { owner_.reset(); borrowed_ = {}; owned_.clear(); }
- template<class Iterator> void assign(Iterator begin, Iterator end) { clear(); owned_.assign(begin, end); }
+ template<class Iterator> void assign(Iterator begin, Iterator end) { Accounting accounting(*this); clear(); owned_.assign(begin, end); }
  void append(std::uint32_t begin, std::uint32_t end) {
+  Accounting accounting(*this);
   if (!owned_.empty() && owned_.back().start + owned_.back().length == begin) owned_.back().length += end - begin;
   else owned_.push_back({begin, end - begin});
  }
  void borrow(std::span<const RLEPair> runs, std::shared_ptr<const void> owner) { clear(); borrowed_ = runs; owner_ = std::move(owner); }
- void replace(std::vector<RLEPair>& runs) noexcept { owner_.reset(); borrowed_ = {}; owned_.swap(runs); }
+ void replace(std::vector<RLEPair>& runs) noexcept { Accounting accounting(*this); owner_.reset(); borrowed_ = {}; owned_.swap(runs); }
 private:
  std::vector<RLEPair> owned_;
  std::span<const RLEPair> borrowed_;
  std::shared_ptr<const void> owner_;
+ std::uint64_t* total_ = nullptr;
 };
 struct CoconutSegmentSupport {
  std::uint64_t area = 0;
@@ -65,12 +100,16 @@ private:
   std::unordered_map<std::uint64_t, const NormalizedImage*> images;
  };
  [[nodiscard]] const Originals* originals(CoconutImageNamespace source) const noexcept;
- Originals train_, validation_;
+ // Workspaces share the immutable lookup and normalized backing, including
+ // when the caller's original-input facade or batch has already retired.
+ struct Share {};
+ CoconutRecoveryOriginals(const CoconutRecoveryOriginals& other, Share) : train_(other.train_), validation_(other.validation_) {}
+ std::shared_ptr<const Originals> train_, validation_;
 };
 // One synchronous importer owns this mutable, capacity-retaining workspace.
 class CoconutMaskRecovery final {
 public:
- explicit CoconutMaskRecovery(const CoconutRecoveryOriginals& originals) : originals_(originals) {}
+ explicit CoconutMaskRecovery(const CoconutRecoveryOriginals& originals) : originals_(originals, CoconutRecoveryOriginals::Share{}) {}
  CoconutMaskRecovery(const CoconutMaskRecovery&) = delete;
  CoconutMaskRecovery& operator=(const CoconutMaskRecovery&) = delete;
  [[nodiscard]] std::unique_ptr<CoconutMaskRecovery> make_workspace() const;
@@ -101,7 +140,7 @@ private:
  };
  [[nodiscard]] static bool candidate_mask(const NormalizedAnnotationIndex& index, std::uint32_t width, std::uint32_t height, Candidate& candidate, Cancellation cancellation);
  [[nodiscard]] static bool intersects(const CoconutSegmentSupport& support, const Candidate& candidate, Cancellation cancellation);
- const CoconutRecoveryOriginals& originals_;
+ const CoconutRecoveryOriginals originals_;
  // Flat image/group workspaces retain only high-water capacity, never historical keys.
  struct Workspace {
   std::vector<Group> groups;

@@ -1,4 +1,5 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "src/pch_std.h"
@@ -41,8 +42,10 @@ bool CoconutMaskRecovery::intersects(const CoconutSegmentSupport& support, const
 }
 CoconutRecoveryOriginals::CoconutRecoveryOriginals(const NormalizedAnnotationIndex* train, const NormalizedAnnotationIndex* validation, Cancellation cancellation) {
  throw_if_benchmark_cancelled(cancellation);
- const auto admit = [&](Originals& target, const NormalizedAnnotationIndex* index, std::string_view split) {
+ const auto admit = [&](std::shared_ptr<const Originals>& output, const NormalizedAnnotationIndex* index, std::string_view split) {
   if (!index || index->source != BenchmarkDatasetSource::kCoco2017 || index->split != split || index->annotation_sha256.empty()) return;
+  auto value = std::make_shared<Originals>();
+  auto& target = *value;
   target.index = *index;
   target.images.reserve(index->images.size());
   for (const auto& image : index->images) {
@@ -50,13 +53,14 @@ CoconutRecoveryOriginals::CoconutRecoveryOriginals(const NormalizedAnnotationInd
    const auto [entry, inserted] = target.images.emplace(static_cast<std::uint64_t>(image.source_image_id), &image);
    if (!inserted) entry->second = nullptr;  // Duplicate physical identity is unusable.
   }
+  output = std::move(value);
  };
  admit(train_, train, "train2017");
  admit(validation_, validation, "val2017");
 }
 const CoconutRecoveryOriginals::Originals* CoconutRecoveryOriginals::originals(CoconutImageNamespace source) const noexcept {
- if (source == CoconutImageNamespace::CocoTrain) return &train_;
- if (source == CoconutImageNamespace::CocoValidation) return &validation_;
+ if (source == CoconutImageNamespace::CocoTrain) return train_.get();
+ if (source == CoconutImageNamespace::CocoValidation) return validation_.get();
  return nullptr;
 }
 std::unique_ptr<CoconutMaskRecovery> CoconutMaskRecovery::make_workspace() const { return std::make_unique<CoconutMaskRecovery>(originals_); }
