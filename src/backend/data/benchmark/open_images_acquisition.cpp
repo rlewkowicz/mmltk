@@ -1,4 +1,6 @@
 #include "src/backend/data/benchmark/detail/open_images_acquisition.h"
+#include "src/backend/data/benchmark/detail/benchmark_annotations.h"
+#include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
@@ -8,6 +10,22 @@
 #include "src/common/math/checked_arithmetic.h"
 #include <curl/curl.h>
 #include <queue>
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <deque>
+#include <exception>
+#include <filesystem>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <stdexcept>
+#include <system_error>
+#include <unordered_map>
+#include <utility>
 #include "src/pch_std.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/system/cpu_affinity.h"
@@ -37,19 +55,22 @@ struct OpenImagesBuffer {
   allowance = {};
  }
 };
-struct OpenImagesTransfer {
+struct OpenImagesInput {
  std::uint64_t image_id = 0U;
  std::size_t position = 0;
- std::unique_ptr<OpenImagesBuffer> buffer;
  std::uint32_t attempt = 1U;
+ std::unique_ptr<OpenImagesBuffer> buffer;
+ CachedImageReadySink ready;
+};
+struct OpenImagesTransfer {
+ OpenImagesInput input;
  mmltk::common::concurrency::CancellationObservation cancel_requested = {};
  CurlEasy& easy;
  std::vector<std::uint8_t>& encoded;
  std::exception_ptr callback_error;
  std::array<char, CURL_ERROR_SIZE> error_buffer{};
- OpenImagesTransfer(const std::uint64_t id, const std::uint32_t attempt_value, mmltk::common::concurrency::CancellationObservation cancel,
-  std::unique_ptr<OpenImagesBuffer> input, const std::string& url)
-  : image_id(id), buffer(std::move(input)), attempt(attempt_value), cancel_requested(cancel), easy(buffer->easy), encoded(buffer->encoded) {
+ OpenImagesTransfer(OpenImagesInput work, mmltk::common::concurrency::CancellationObservation cancel, const std::string& url)
+  : input(std::move(work)), cancel_requested(cancel), easy(input.buffer->easy), encoded(input.buffer->encoded) {
   if (!easy) easy.reset(curl_easy_init());
   if (!easy) { throw std::runtime_error("cannot allocate Open Images transfer"); }
   encoded.clear();
@@ -79,15 +100,11 @@ struct OpenImagesTransfer {
 class OpenImageCacheWorkers {
 public:
  struct Result {
-  std::uint64_t image_id = 0U;
-  std::size_t position = 0;
-  std::unique_ptr<OpenImagesBuffer> buffer;
-  CachedImageReadySink ready;
-  std::uint32_t attempt = 0U;
+  OpenImagesInput input;
   std::uint32_t width = 0U;
   std::uint32_t height = 0U;
-  std::string retry_reason;
-  std::exception_ptr fatal_error;
+  std::string retry_reason{};
+  std::exception_ptr fatal_error{};
  };
  OpenImageCacheWorkers(const std::size_t worker_count, std::filesystem::path image_root, const mmltk::common::concurrency::CancellationObservation cancellation, std::function<void()> wake, BenchmarkCompilePipeline* execution = nullptr)
      : storage_(image_root, {}, execution ? &execution->storage() : nullptr), execution_(execution), wake_(std::move(wake)), image_root_(std::move(image_root)), cancellation_(cancellation) {
@@ -105,12 +122,12 @@ public:
  OpenImageCacheWorkers(const OpenImageCacheWorkers&) = delete;
  OpenImageCacheWorkers& operator=(const OpenImageCacheWorkers&) = delete;
  ~OpenImageCacheWorkers() { stop(); }
- void submit(const std::uint64_t image_id, const std::uint32_t attempt, std::size_t position, std::unique_ptr<OpenImagesBuffer> buffer, CachedImageReadySink ready) {
+ void submit(OpenImagesInput input) {
   throw_if_benchmark_cancelled(cancellation_);
   {
    const std::lock_guard lock(mutex_);
    rethrow_failure_locked();
-   tasks_.push_back(Task{image_id, position, std::move(buffer), std::move(ready), attempt});
+   tasks_.push_back(std::move(input));
    ++outstanding_;
   }
   pending_.notify_one();
@@ -135,33 +152,21 @@ private:
  StorageReservationPool storage_;
  BenchmarkCompilePipeline* execution_ = nullptr;
  std::function<void()> wake_;
- struct Task {
-  std::uint64_t image_id = 0U;
-  std::size_t position = 0;
-  std::unique_ptr<OpenImagesBuffer> buffer;
-  CachedImageReadySink ready;
-  std::uint32_t attempt = 0U;
- };
- [[nodiscard]] Result process(Task task) const {
-  Result result;
-  result.image_id = task.image_id;
-  result.position = task.position;
-  result.buffer = std::move(task.buffer);
-  result.ready = std::move(task.ready);
-  result.attempt = task.attempt;
+ [[nodiscard]] Result process(OpenImagesInput input) const {
+  Result result{std::move(input)};
   try {
    throw_if_benchmark_cancelled(cancellation_);
    const auto read_header = [&](std::size_t) {
-    auto& validator = result.buffer->validator;
+    auto& validator = result.input.buffer->validator;
     if (!validator) validator = std::make_unique<BenchmarkImageValidator>();
-    const auto dimensions = validator->read_header(result.buffer->encoded);
+    const auto dimensions = validator->read_header(result.input.buffer->encoded);
     result.width = dimensions.first;
     result.height = dimensions.second;
    };
-   if (execution_) execution_->run(BenchmarkStage::Header, {}, read_header, result.buffer->allowance);
+   if (execution_) execution_->run(BenchmarkStage::Header, {}, read_header, result.input.buffer->allowance);
    else read_header(0);
-   write_cached_image_atomically(cached_image_path(image_root_, result.image_id), result.buffer->encoded, cancellation_, storage_);
-   if (result.ready) result.ready({image_root_, result.image_id, std::pair{result.width, result.height}, execution_ != nullptr});
+   write_cached_image_atomically(cached_image_path(image_root_, result.input.image_id), result.input.buffer->encoded, cancellation_, storage_);
+   if (result.input.ready) result.input.ready({image_root_, result.input.image_id, std::pair{result.width, result.height}, execution_ != nullptr});
    throw_if_benchmark_cancelled(cancellation_);
   } catch (const InvalidImageError& error) { result.retry_reason = error.what(); } catch (...) {
    result.fatal_error = std::current_exception();
@@ -208,7 +213,7 @@ private:
  mmltk::common::concurrency::CancellationObservation cancellation_;
  mutable std::mutex mutex_;
  std::condition_variable pending_;
- std::deque<Task> tasks_;
+ std::deque<OpenImagesInput> tasks_;
  std::deque<Result> results_;
  std::unique_ptr<mmltk::common::concurrency::WorkerPool> workers_;
  std::exception_ptr failure_;
@@ -329,30 +334,58 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
  trace_benchmark_event(trace, "benchmark.images.complete",
   [&] { return nlohmann::json{{"root", image_root.string()}, {"identity", identity}, {"images", available_image_ids.size()}, {"quarantined", quarantined.size()}}; });
 }
-}  // namespace
-[[nodiscard]] AcquiredOpenImages acquire_open_images(const BenchmarkCacheLayout& cache, NormalizedAnnotationIndex& index, std::vector<QuarantinedImage>* quarantined,
- mmltk::common::concurrency::CancellationObservation cancellation, ProgressReporter* progress, int num_workers, std::size_t cache_workers, const BenchmarkTraceSink& trace,
- std::optional<ImageDecodeProbe> decode_probe, BenchmarkCompilePipeline* execution, const std::function<std::string(std::uint64_t)>& image_url) {
- const auto ids = image_ids(index);
- const auto image_root = cache.source_images("open-images") / "train";
- prepare_cached_image_directory(image_root);
- std::filesystem::create_directories(image_root / ".groups");
- const auto cpus = execution ? execution->workers() : common_math::checked_cast<std::size_t>(num_workers, "Open Images worker count overflow");
- if (!cpus) throw std::runtime_error("Open Images transfer budget must be positive");
- auto concurrency = std::min<std::size_t>(256, common_math::checked_multiply(cpus, std::size_t{10}, "Open Images concurrency overflow"));
+class OpenImagesAcquisition final {
+ using Cancellation = mmltk::common::concurrency::CancellationObservation;
+ static constexpr std::size_t kScanGrain = 64;
+ // This pool owns the one admission and retained-backing policy used by scans,
+ // HTTP, cache publication, and the saved-file repair check.
+ class Inputs final {
+  BenchmarkCompilePipeline* execution_;
+  BenchmarkResources demand_;
+  std::vector<std::unique_ptr<OpenImagesBuffer>> idle_;
+ public:
+  Inputs(BenchmarkCompilePipeline* execution, std::uint64_t repair_bytes) : execution_(execution),
+   demand_(benchmark_curl_input_resources(common_math::checked_add(std::uint64_t{kMaximumOpenImagesJpegBytes * 2}, repair_bytes, "Open Images input workspace overflow"))) {
+   demand_.producer = true;
+  }
+  std::unique_ptr<OpenImagesBuffer> acquire(const BenchmarkAllowance& parent) {
+   if (!idle_.empty()) { auto input = std::move(idle_.back()); idle_.pop_back(); return input; }
+   BenchmarkAllowance allowance;
+   if (execution_) {
+    auto value = execution_->try_reserve(demand_, parent);
+    if (!value) return {};
+    allowance = std::move(*value);
+   }
+   return std::make_unique<OpenImagesBuffer>(std::move(allowance));
+  }
+  void recycle(std::unique_ptr<OpenImagesBuffer> input) {
+   auto& encoded = input->encoded;
+   if (encoded.capacity() > kMaximumRetainedOpenImagesBufferBytes) { std::vector<std::uint8_t>().swap(encoded); encoded.reserve(kEstimatedJpegBytes); }
+   else encoded.clear();
+   idle_.push_back(std::move(input));
+  }
+  void retire_idle() noexcept { idle_.clear(); }
+  BenchmarkAllowance proof_allowance() const { return idle_.empty() ? BenchmarkAllowance{} : idle_.back()->allowance; }
+ };
+ const BenchmarkCacheLayout& cache;
+ NormalizedAnnotationIndex& index;
+ std::vector<QuarantinedImage>* quarantined;
+ Cancellation cancellation;
+ ProgressReporter* progress;
+ const BenchmarkTraceSink& trace;
+ std::optional<ImageDecodeProbe> decode_probe;
+ BenchmarkCompilePipeline* execution;
+ const std::function<std::string(std::uint64_t)>& image_url;
+ std::vector<std::uint64_t> ids;
+ std::filesystem::path image_root;
+ std::size_t cpus;
  std::unique_ptr<BenchmarkCurl> local_transport;
- if (!execution) local_transport = std::make_unique<BenchmarkCurl>(cpus);
- auto& transport = execution ? execution->curl() : *local_transport;
- // The group lease commits its input/proof descriptor; reject only an
- // impossible complete descriptor promise, preserving oversized image bytes.
- const auto group_resources = BenchmarkResources::handles(1, true, 1);
- CurlMultiTransfers<OpenImagesTransfer> active(transport, BenchmarkCurl::Class::OpenImages, cancellation, group_resources);
- // This I/O owner persists across groups. Header CPU work uses the shared lanes.
- OpenImageCacheWorkers cache_writer(std::max<std::size_t>(1, execution ? 1 : cache_workers), image_root, cancellation, [&] { active.wake(); }, execution);
- std::vector<std::unique_ptr<OpenImagesBuffer>> buffers;
+ BenchmarkCurl& transport;
+ std::size_t concurrency;
+ BenchmarkResources group_resources = BenchmarkResources::handles(1, true, 1);
  enum class ImageState : std::uint8_t { Pending, Available, Quarantined };
  struct Group {
-  std::size_t begin = 0, count = 0, completed = 0;
+  std::size_t begin = 0, count = 0, completed = 0, scan_cursor = 0;
   std::string name, identity;
   std::filesystem::path completion;
   std::shared_ptr<ArtifactLease> lease;
@@ -360,7 +393,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
   std::vector<ImageState> images;
   std::vector<QuarantinedImage> quarantined;
   std::uint64_t bytes = 0;
-  bool cache_hit = false;
+  bool cache_hit = false, proof_checked = false;
   std::optional<CachedImageReady> repaired;
   std::uint64_t control_bytes = 0;
  };
@@ -375,32 +408,73 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
  std::unordered_map<std::size_t, std::unique_ptr<Group>> groups;
  std::deque<std::size_t> waiting_groups, scanning_groups;
  std::priority_queue<Pending, std::vector<Pending>, std::greater<>> locked_groups;
- for (std::size_t begin = 0; begin < ids.size(); begin += kOpenImagesGroupImages) waiting_groups.push_back(begin);
+ // Credit precedes backing so it is the last of this pair to retire. Capacity
+ // is reserved once for the maximum live-group envelope, not for all groups.
+ BenchmarkAllowance finished_allowance;
  std::vector<std::size_t> finished;
  std::vector<std::uint64_t> available;
- available.reserve(ids.size());
- std::uint64_t cached_bytes = 0, successes = 0;
+ std::uint64_t cached_bytes = 0, successes = 0, control_bytes = 0;
  bool all_cache_hits = true, retry_turn = true;
- std::size_t active_limit = concurrency;
- auto minimum_limit = std::max<std::size_t>(1, concurrency / 8);
- const auto repair_bytes = decode_probe ? common_math::checked_multiply(common_math::checked_multiply(std::uint64_t{decode_probe->expected_width}, std::uint64_t{decode_probe->expected_height}, "Open Images repair workspace overflow"), std::uint64_t{96}, "Open Images repair workspace overflow") : 0;
- const auto payload_bytes = common_math::checked_add(std::uint64_t{kMaximumOpenImagesJpegBytes * 2}, repair_bytes, "Open Images input workspace overflow");
- auto input_resources = benchmark_curl_input_resources(payload_bytes);
- input_resources.producer = true;
- // 2 KiB per image bounds live state, pending/retry records, proof JSON and
- // quarantine text; 64 KiB covers group strings, maps and vector spare capacity.
- // These records contain no encoded/decoded/parser backing. Admission is bounded
- // by max(one complete group, the compile byte target), plus physical locks.
- const auto group_control = [](std::size_t count) { return std::uint64_t{64U << 10} + count * std::uint64_t{2048}; };
- const auto control_limit = std::max(group_control(std::min(kOpenImagesGroupImages, ids.size())), execution ? execution->transient_target() : group_control(kOpenImagesGroupImages) * concurrency);
- std::uint64_t control_bytes = 0;
- const auto report = [&](Group& group) { progress->transfers().images(BenchmarkDatasetSource::kOpenImagesV7, group.name, group.completed, ids.size(), *progress); };
- const auto finish_image = [&](Group& group) {
+ std::size_t active_limit, minimum_limit;
+ std::uint64_t repair_bytes, control_limit;
+ Inputs inputs;
+ struct Scan {
+  std::unique_ptr<OpenImagesBuffer> input;
+  std::size_t first, count;
+  std::array<std::uint64_t, kScanGrain> sizes{};
+ };
+ std::vector<Scan> scans;
+ // These are last and explicitly retired before any callback/group borrow.
+ CurlMultiTransfers<OpenImagesTransfer> active;
+ OpenImageCacheWorkers cache_writer;
+ static std::uint64_t group_control(std::size_t count) { return std::uint64_t{64U << 10} + count * std::uint64_t{2048}; }
+ static std::filesystem::path prepare_root(const BenchmarkCacheLayout& cache) {
+  auto root = cache.source_images("open-images") / "train";
+  prepare_cached_image_directory(root);
+  std::filesystem::create_directories(root / ".groups");
+  return root;
+ }
+ static std::size_t cpu_count(int workers, BenchmarkCompilePipeline* execution) {
+  const auto count = execution ? execution->workers() : common_math::checked_cast<std::size_t>(workers, "Open Images worker count overflow");
+  if (!count) throw std::runtime_error("Open Images transfer budget must be positive");
+  return count;
+ }
+ static std::uint64_t repair_workspace(const std::optional<ImageDecodeProbe>& probe) {
+  return probe ? common_math::checked_multiply(common_math::checked_multiply(std::uint64_t{probe->expected_width}, std::uint64_t{probe->expected_height}, "Open Images repair workspace overflow"), std::uint64_t{96}, "Open Images repair workspace overflow") : 0;
+ }
+ void prepare_completions() {
+  // All groups except the final short one have identical control demand.
+  const auto full = ids.size() / kOpenImagesGroupImages, tail = ids.size() % kOpenImagesGroupImages;
+  const auto full_limit = std::min<std::uint64_t>(full, control_limit / group_control(kOpenImagesGroupImages));
+  const auto with_tail = tail ? std::min<std::uint64_t>(full, (control_limit - group_control(tail)) / group_control(kOpenImagesGroupImages)) + 1 : 0;
+  auto bound = common_math::checked_cast<std::size_t>(std::max(full_limit, with_tail), "Open Images group envelope overflow");
+  if (execution) {
+   const auto fixed = benchmark_curl_envelope().demand(1).descriptors;
+   const auto ceiling = execution->descriptor_ceiling(group_resources);
+   bound = std::min(bound, (ceiling - fixed) / (group_resources.descriptors + group_resources.continuation_descriptors));
+  }
+  auto demand = BenchmarkResources::handles(0);
+  demand.bytes = common_math::checked_multiply(static_cast<std::uint64_t>(bound), std::uint64_t{sizeof(std::size_t)}, "Open Images completion capacity overflow");
+  if (execution) finished_allowance = execution->reserve(demand);
+  finished.reserve(bound);
+  // Account the implementation's actual retained capacity before publishing it.
+  if (execution && finished.capacity() != bound) {
+   demand.bytes = common_math::checked_multiply(static_cast<std::uint64_t>(finished.capacity()), std::uint64_t{sizeof(std::size_t)}, "Open Images completion capacity overflow");
+   finished_allowance = execution->reserve(demand);
+  }
+ }
+ void queue_finished(const Group& group) {
+  if (finished.size() == finished.capacity()) throw std::logic_error("Open Images completion exceeded its admitted group envelope");
+  finished.push_back(group.begin);
+  active.wake();
+ }
+ void report(Group& group) { progress->transfers().images(BenchmarkDatasetSource::kOpenImagesV7, group.name, group.completed, ids.size(), *progress); }
+ void finish_image(Group& group) {
   ++group.completed;
   if (group.completed == group.count || group.completed % 64 == 0) report(group);
-  if (group.completed == group.count) { finished.push_back(group.begin); active.wake(); }
- };
- const auto retry = [&](const Pending& task, std::string reason, bool throttle = false) {
+  if (group.completed == group.count) queue_finished(group);
+ }
+ void retry(const Pending& task, std::string reason, bool throttle = false) {
   const auto id = ids[task.position];
   trace_benchmark_event(trace, "benchmark.open_images.image_attempt_failed", [&] { return nlohmann::json{{"image_id", id}, {"attempt", task.attempt}, {"reason", reason}}; });
   if (task.attempt < kMaximumAttempts) {
@@ -413,33 +487,21 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
    finish_image(group);
    progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Quarantined unavailable Open Images training image " + std::to_string(id));
   }
- };
- const auto publish = [&](Group& group, const CachedImageReady& value) {
+ }
+ void publish(Group& group, const CachedImageReady& value) {
   if (decode_probe && value.image_id == decode_probe->image_id) group.repaired = value;
   else if (group.publication) group.publication(value);
- };
- const auto recycle = [&](std::unique_ptr<OpenImagesBuffer> buffer) {
-  auto& encoded = buffer->encoded;
-  if (encoded.capacity() > kMaximumRetainedOpenImagesBufferBytes) { std::vector<std::uint8_t>().swap(encoded); encoded.reserve(kEstimatedJpegBytes); }
-  else encoded.clear();
-  buffers.push_back(std::move(buffer));
- };
- struct RetireAcquisition {
-  CurlMultiTransfers<OpenImagesTransfer>& active;
-  OpenImageCacheWorkers& writer;
-  ~RetireAcquisition() { active.abandon_all([](OpenImagesTransfer&) noexcept {}); writer.retire(); }
- } retire{active, cache_writer};
- while (!waiting_groups.empty() || !locked_groups.empty() || !groups.empty()) {
-  throw_if_benchmark_cancelled(cancellation);
+ }
+ void consume_cache_results() {
   OpenImageCacheWorkers::Result result;
   while (cache_writer.try_pop(&result)) {
    if (result.fatal_error) std::rethrow_exception(result.fatal_error);
-   if (!result.retry_reason.empty()) retry({result.position, result.attempt}, std::move(result.retry_reason));
+   if (!result.retry_reason.empty()) retry({result.input.position, result.input.attempt}, std::move(result.retry_reason));
    else {
-    auto& group = *groups.at(result.position / kOpenImagesGroupImages * kOpenImagesGroupImages);
-    auto& image = index.images[result.position]; image.width = result.width; image.height = result.height;
-    group.bytes = common_math::checked_add(group.bytes, result.buffer->encoded.size(), "Open Images cached byte total overflow");
-    group.images[result.position - group.begin] = ImageState::Available;
+    auto& group = *groups.at(result.input.position / kOpenImagesGroupImages * kOpenImagesGroupImages);
+    auto& image = index.images[result.input.position]; image.width = result.width; image.height = result.height;
+    group.bytes = common_math::checked_add(group.bytes, result.input.buffer->encoded.size(), "Open Images cached byte total overflow");
+    group.images[result.input.position - group.begin] = ImageState::Available;
     if (decode_probe && image.source_image_id == decode_probe->image_id) {
      const auto path = cached_image_path(image_root, image.source_image_id);
      try {
@@ -451,13 +513,13 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
       // The saved file must be decoded while this result still exclusively owns
       // the complete input/repair slot. Sharing its allowance with a recycled
       // buffer would not reserve capacity for two simultaneous consumers.
-      if (execution) execution->run(BenchmarkStage::Pixels, {repair_bytes, 1, true}, check, result.buffer->allowance);
+      if (execution) execution->run(BenchmarkStage::Pixels, {repair_bytes, 1, true}, check, result.input.buffer->allowance);
       else check(0);
      } catch (const InvalidImageError& error) {
       const auto bytes = std::filesystem::file_size(path); remove_cache_path(path);
       if (bytes > group.bytes) throw std::runtime_error("Open Images repair byte count underflow");
       group.bytes -= bytes;
-      group.images[result.position - group.begin] = ImageState::Quarantined;
+      group.images[result.input.position - group.begin] = ImageState::Quarantined;
       group.repaired.reset();
       group.quarantined.push_back({BenchmarkDatasetSource::kOpenImagesV7, image.source_image_id, "permanently undecodable after bounded repair: " + std::string(error.what())});
       progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Quarantined permanently undecodable Open Images training image " + std::to_string(image.source_image_id));
@@ -465,18 +527,20 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
      }
     }
     finish_image(group);
-    recycle(std::move(result.buffer));
+    inputs.recycle(std::move(result.input.buffer));
    }
    result = {};
   }
+ }
+ void consume_transfer_results() {
   while (auto completion = active.next_completed()) {
    auto& transfer = *completion->transfer;
    long status = 0; (void)curl_easy_getinfo(transfer.easy.get(), CURLINFO_RESPONSE_CODE, &status);
-   Pending task{transfer.position, transfer.attempt};
+   Pending task{transfer.input.position, transfer.input.attempt};
    if (transfer.callback_error) {
     try { std::rethrow_exception(transfer.callback_error); }
     catch (const std::exception& error) { if (is_benchmark_capacity_failure(error)) throw; retry(task, error.what()); }
-    recycle(std::move(transfer.buffer));
+    inputs.recycle(std::move(transfer.input.buffer));
     continue;
    }
    throw_if_benchmark_cancelled(cancellation);
@@ -488,21 +552,23 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
      active_limit = std::max(minimum_limit, active_limit * 3 / 4); successes = 0;
      progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Open Images server throttled; continuing with " + std::to_string(active_limit) + " concurrent requests");
     }
-    recycle(std::move(transfer.buffer));
+    inputs.recycle(std::move(transfer.input.buffer));
     continue;
    }
    if (++successes >= 1024 && active_limit < concurrency) {
     active_limit = std::min(concurrency, active_limit + 8); successes = 0;
     progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Open Images concurrency recovered to " + std::to_string(active_limit));
    }
-   if (!has_complete_image_markers(transfer.encoded)) { retry(task, "Open Images response is not a complete JPEG or PNG"); recycle(std::move(transfer.buffer)); continue; }
+   if (!has_complete_image_markers(transfer.encoded)) { retry(task, "Open Images response is not a complete JPEG or PNG"); inputs.recycle(std::move(transfer.input.buffer)); continue; }
    auto& group = *groups.at(task.position / kOpenImagesGroupImages * kOpenImagesGroupImages);
    auto* group_pointer = &group;
-   cache_writer.submit(transfer.image_id, task.attempt, task.position, std::move(transfer.buffer),
-    [&, group_pointer](const CachedImageReady& value) { publish(*group_pointer, value); });
+   transfer.input.ready = [this, group_pointer](const CachedImageReady& value) { publish(*group_pointer, value); };
+   cache_writer.submit(std::move(transfer.input));
   }
-  auto settling_groups = std::exchange(finished, {});
-  for (const auto begin : settling_groups) {
+ }
+ void settle_groups() {
+  std::size_t deferred = 0;
+  for (const auto begin : finished) {
    auto& group = *groups.at(begin);
    if (group.repaired && group.publication) group.publication(*group.repaired);
    group.repaired.reset();
@@ -511,10 +577,10 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
     // A free slot can lend its descriptor for this synchronous proof. If every
     // slot is in use, draw the group's own commitment;
     // never block this controller while another slot must finish to release it.
-    if (!buffers.empty()) proof = buffers.back()->allowance;
+    if (auto idle = inputs.proof_allowance()) proof = std::move(idle);
     else {
      auto admitted = execution->try_reserve(BenchmarkResources::handles(1, true), group.lease->allowance());
-     if (!admitted) { finished.push_back(begin); continue; }
+     if (!admitted) { finished[deferred++] = begin; continue; }
      proof = std::move(*admitted);
     }
    }
@@ -531,12 +597,10 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
    control_bytes -= group.control_bytes;
    groups.erase(begin);
   }
-  // Idle capacity must not monopolize the byte ledger during delayed retries.
-  const bool ready_retry = !retries.empty() && retries.top().deadline <= Clock::now();
-  const bool pressure = execution && execution->resource_pressure();
-  if (pressure || (fresh.empty() && !ready_retry)) buffers.clear();
-  enum class GroupAdmission { Ready, Locked, Capacity };
-  const auto admit_group = [&](std::size_t begin) {
+  finished.resize(deferred);
+ }
+ enum class GroupAdmission { Ready, Locked, Capacity };
+ GroupAdmission admit_group(std::size_t begin, bool pressure) {
    const auto count = std::min(kOpenImagesGroupImages, ids.size() - begin);
    const auto group_ids = std::span(ids).subspan(begin, count);
    const auto name = open_images_group_name(begin / kOpenImagesGroupImages);
@@ -562,145 +626,175 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
    groups.emplace(begin, std::move(group));
    scanning_groups.push_back(begin);
    return GroupAdmission::Ready;
-  };
+ }
+ void admit_groups(bool pressure) {
   while (!waiting_groups.empty() || (!locked_groups.empty() && locked_groups.top().deadline <= Clock::now())) {
    std::size_t begin;
    if (!locked_groups.empty() && locked_groups.top().deadline <= Clock::now()) { begin = locked_groups.top().position; locked_groups.pop(); }
    else { begin = waiting_groups.front(); waiting_groups.pop_front(); }
-   const auto result = admit_group(begin);
+   const auto result = admit_group(begin, pressure);
    if (result == GroupAdmission::Locked) locked_groups.push({begin, 1, Clock::now() + std::chrono::milliseconds{100}});
    if (result != GroupAdmission::Capacity) continue;
    // Full groups have equal demand. The final short group is the sole possible
    // smaller candidate; try it directly without scanning all pending groups.
    if (!waiting_groups.empty() && ids.size() - waiting_groups.back() < kOpenImagesGroupImages) {
     const auto tail = waiting_groups.back(); waiting_groups.pop_back();
-    const auto tail_result = admit_group(tail);
+    const auto tail_result = admit_group(tail, pressure);
     if (tail_result == GroupAdmission::Locked) locked_groups.push({tail, 1, Clock::now() + std::chrono::milliseconds{100}});
     else if (tail_result == GroupAdmission::Capacity) waiting_groups.push_back(tail);
    }
    waiting_groups.push_front(begin);
    break;
   }
-  while (!pressure && !scanning_groups.empty()) {
-   const auto begin = scanning_groups.front();
-   auto* group = groups.at(begin).get();
-   const auto count = group->count;
-   const auto& name = group->name;
-   const auto group_ids = std::span(ids).subspan(begin, count);
-   std::unique_ptr<OpenImagesBuffer> scan;
-   if (!buffers.empty()) { scan = std::move(buffers.back()); buffers.pop_back(); }
-   else {
-    BenchmarkAllowance allowance;
-    if (execution) {
-     auto value = execution->try_reserve(input_resources, group->lease->allowance());
-     if (!value) break;
-     allowance = std::move(*value);
-    }
-    scan = std::make_unique<OpenImagesBuffer>(std::move(allowance));
-   }
-   auto cached = discover_cached_open_images_group(image_root, group->completion, group->identity, group_ids, cancellation, trace);
-   group->cache_hit = cached.valid;
-   if (cached.valid) {
-    std::fill(group->images.begin(), group->images.end(), ImageState::Quarantined);
-    std::size_t position = 0;
-    for (std::size_t i = 0; i < cached.available_image_ids.size(); ++i) {
-     while (ids[begin + position] != cached.available_image_ids[i]) { group->images[position++] = ImageState::Quarantined; }
-     auto& image = index.images[begin + position]; image.width = cached.dimensions[i][0]; image.height = cached.dimensions[i][1];
-     group->images[position++] = ImageState::Available;
-     publish(*group, {image_root, image.source_image_id, std::pair{image.width, image.height}});
-    }
-    group->bytes = cached.image_bytes; group->quarantined = std::move(cached.quarantined); group->completed = count;
-    finished.push_back(begin); active.wake();
-   } else {
-    all_cache_hits = false;
-    std::vector<std::uint64_t> sizes(count);
-    std::vector<std::unique_ptr<OpenImagesBuffer>> scans;
-    scans.push_back(std::move(scan));
-    while (scans.size() < std::min(cpus, count)) {
-     if (!buffers.empty()) { scans.push_back(std::move(buffers.back())); buffers.pop_back(); }
-     else {
-      BenchmarkAllowance allowance;
-      if (execution) {
-       auto value = execution->try_reserve(input_resources, group->lease->allowance());
-       if (!value) break;
-       allowance = std::move(*value);
-      }
-      scans.push_back(std::make_unique<OpenImagesBuffer>(std::move(allowance)));
-     }
-    }
-    const auto inspect = [&](std::size_t local, BenchmarkImageValidator& validator) {
-     const auto position = begin + local; const auto id = ids[position]; const auto path = cached_image_path(image_root, id);
-     std::error_code error;
-     if (!std::filesystem::is_regular_file(path, error) || error) return;
-     const auto bytes = std::filesystem::file_size(path, error);
-     if (error || !bytes) return;
-     try {
-      const auto dimensions = validator.validate_file(path);
-      index.images[position].width = dimensions.first; index.images[position].height = dimensions.second;
-      sizes[local] = bytes; group->images[local] = ImageState::Available;
-     } catch (const InvalidImageError& failure) {
-      remove_cache_path(path);
-      trace_benchmark_event(trace, "benchmark.images.cache_invalid", [&] { return nlohmann::json{{"source", "open-images"}, {"shard", name}, {"image_id", id}, {"error", failure.what()}}; });
-     }
-    };
-    const auto inspect_group = [&](std::size_t chunk) {
-     auto& validator = scans[chunk]->validator;
-     if (!validator) validator = std::make_unique<BenchmarkImageValidator>();
-     const auto first = count * chunk / scans.size(), last = count * (chunk + 1) / scans.size();
-     for (std::size_t local = first; local < last; ++local) {
-      throw_if_benchmark_cancelled(cancellation); inspect(local, *validator);
-      if (execution && local % 64 == 63) execution->cooperate();
-     }
-    };
-    // Every runnable chunk already owns one complete input/work slot. Jobs
-    // borrow those grants until for_each joins; no second byte admission occurs.
-    if (execution) execution->for_each(BenchmarkStage::Header, scans.size(), {}, inspect_group);
-    else for (std::size_t chunk = 0; chunk < scans.size(); ++chunk) inspect_group(chunk);
-    for (auto& input : scans) recycle(std::move(input));
-    for (std::size_t local = 0; local < count; ++local) {
-     const auto position = begin + local;
-     if (group->images[local] == ImageState::Available) {
-      group->bytes = common_math::checked_add(group->bytes, sizes[local], "Open Images cached byte total overflow");
-      ++group->completed;
-      publish(*group, {image_root, ids[position], std::pair{index.images[position].width, index.images[position].height}});
-     } else fresh.push_back({position});
-    }
-    if (group->completed == count) { finished.push_back(begin); active.wake(); }
-   }
-   if (scan) recycle(std::move(scan));
-   report(*group);
-   scanning_groups.pop_front();
-  }
+ }
+ void admit_http(bool pressure) {
   while (!pressure && active.size() < active_limit && cache_writer.outstanding() + active.size() < concurrency) {
    const bool due = !retries.empty() && retries.top().deadline <= Clock::now();
    if (fresh.empty() && !due) break;
    const auto position = due && (retry_turn || fresh.empty()) ? retries.top().position : fresh.front().position;
    auto& pending_group = *groups.at(position / kOpenImagesGroupImages * kOpenImagesGroupImages);
-   std::unique_ptr<OpenImagesBuffer> buffer;
-   if (!buffers.empty()) { buffer = std::move(buffers.back()); buffers.pop_back(); }
-   else {
-    BenchmarkAllowance allowance;
-    if (execution) {
-     auto value = execution->try_reserve(input_resources, pending_group.lease->allowance()); if (!value) break;
-     allowance = std::move(*value);
-    }
-    buffer = std::make_unique<OpenImagesBuffer>(std::move(allowance));
-   }
+   auto buffer = inputs.acquire(pending_group.lease->allowance());
+   if (!buffer) break;
    Pending task;
    if (due && (retry_turn || fresh.empty())) { task = retries.top(); retries.pop(); retry_turn = false; }
    else { task = fresh.front(); fresh.pop_front(); retry_turn = true; }
-   auto transfer = std::make_unique<OpenImagesTransfer>(ids[task.position], task.attempt, cancellation, std::move(buffer), image_url ? image_url(ids[task.position]) : open_images_train_image_url(ids[task.position]));
-   transfer->position = task.position;
-   auto input = transfer->buffer->allowance;
+   OpenImagesInput work{ids[task.position], task.position, task.attempt, std::move(buffer), {}};
+   auto transfer = std::make_unique<OpenImagesTransfer>(std::move(work), cancellation, image_url ? image_url(ids[task.position]) : open_images_train_image_url(ids[task.position]));
+   auto input = transfer->input.buffer->allowance;
    active.add(std::move(transfer), false, std::move(input));
   }
-  if (waiting_groups.empty() && locked_groups.empty() && groups.empty()) break;
-  auto deadline = Clock::now() + std::chrono::milliseconds{kBenchmarkTransferPollMilliseconds};
-  if (!retries.empty() && retries.top().deadline > Clock::now()) deadline = std::min(deadline, retries.top().deadline);
-  if (!locked_groups.empty()) deadline = std::min(deadline, locked_groups.top().deadline);
-  active.wait_until(deadline);
  }
- std::ranges::sort(available);
- return {{"open-images", "train", image_root, "open-images-v7:train:" + std::string(kBenchmarkCatalogRevision), cached_image_selection_digest(available), available.size(), cached_bytes, all_cache_hits, {}}, std::move(available)};
+ bool scan_chunk(bool pressure) {
+  if (pressure || scanning_groups.empty()) return false;
+  const auto begin = scanning_groups.front();
+  auto& group = *groups.at(begin);
+  auto input = inputs.acquire(group.lease->allowance());
+  if (!input) return false;
+  if (!group.proof_checked) {
+   group.proof_checked = true;
+   auto cached = discover_cached_open_images_group(image_root, group.completion, group.identity, std::span(ids).subspan(begin, group.count), cancellation, trace);
+   group.cache_hit = cached.valid;
+   if (cached.valid) {
+    std::fill(group.images.begin(), group.images.end(), ImageState::Quarantined);
+    std::size_t position = 0;
+    for (std::size_t i = 0; i < cached.available_image_ids.size(); ++i) {
+     while (ids[begin + position] != cached.available_image_ids[i]) ++position;
+     auto& image = index.images[begin + position]; image.width = cached.dimensions[i][0]; image.height = cached.dimensions[i][1];
+     group.images[position++] = ImageState::Available;
+     publish(group, {image_root, image.source_image_id, std::pair{image.width, image.height}});
+    }
+    group.bytes = cached.image_bytes; group.quarantined = std::move(cached.quarantined); group.completed = group.count;
+    queue_finished(group);
+    inputs.recycle(std::move(input)); scanning_groups.pop_front(); report(group);
+    return true;
+   }
+   all_cache_hits = false;
+  }
+  // One borrowed lane chunk is at most 64 entries. Join only this bounded
+  // batch, then let transfers and completions advance before the next chunk.
+  auto cursor = group.scan_cursor;
+  do {
+   const auto count = std::min(kScanGrain, group.count - cursor);
+   scans.push_back({std::move(input), cursor, count, {}});
+   cursor += count;
+   if (cursor == group.count || scans.size() == std::min(cpus, kOpenImagesGroupImages / kScanGrain)) break;
+   input = inputs.acquire(group.lease->allowance());
+  } while (input);
+  const auto inspect = [&](std::size_t chunk) {
+   auto& scan = scans[chunk];
+   auto& validator = scan.input->validator;
+   if (!validator) validator = std::make_unique<BenchmarkImageValidator>();
+   for (std::size_t offset = 0; offset < scan.count; ++offset) {
+    throw_if_benchmark_cancelled(cancellation);
+    const auto local = scan.first + offset, position = begin + local, id = ids[position];
+    const auto path = cached_image_path(image_root, id);
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error) || error) continue;
+    const auto bytes = std::filesystem::file_size(path, error);
+    if (error || !bytes) continue;
+    try {
+     const auto dimensions = validator->validate_file(path);
+     index.images[position].width = dimensions.first; index.images[position].height = dimensions.second;
+     scan.sizes[offset] = bytes;
+    } catch (const InvalidImageError& failure) {
+     remove_cache_path(path);
+     trace_benchmark_event(trace, "benchmark.images.cache_invalid", [&] { return nlohmann::json{{"source", "open-images"}, {"shard", group.name}, {"image_id", id}, {"error", failure.what()}}; });
+    }
+   }
+  };
+  if (execution) execution->for_each(BenchmarkStage::Header, scans.size(), {}, inspect);
+  else for (std::size_t chunk = 0; chunk < scans.size(); ++chunk) inspect(chunk);
+  for (auto& scan : scans) {
+   for (std::size_t offset = 0; offset < scan.count; ++offset) {
+    const auto local = scan.first + offset, position = begin + local;
+    if (scan.sizes[offset]) {
+     group.bytes = common_math::checked_add(group.bytes, scan.sizes[offset], "Open Images cached byte total overflow");
+     group.images[local] = ImageState::Available;
+     finish_image(group);
+     publish(group, {image_root, ids[position], std::pair{index.images[position].width, index.images[position].height}});
+    } else fresh.push_back({position});
+   }
+   inputs.recycle(std::move(scan.input));
+  }
+  scans.clear();
+  group.scan_cursor = cursor;
+  if (cursor == group.count) scanning_groups.pop_front();
+  report(group);
+  return true;
+ }
+public:
+ OpenImagesAcquisition(const BenchmarkCacheLayout& cache_value, NormalizedAnnotationIndex& index_value, std::vector<QuarantinedImage>* quarantined_value,
+  Cancellation cancel, ProgressReporter* reporter, int workers, std::size_t cache_workers, const BenchmarkTraceSink& trace_value,
+  std::optional<ImageDecodeProbe> probe, BenchmarkCompilePipeline* pipeline, const std::function<std::string(std::uint64_t)>& urls)
+  : cache(cache_value), index(index_value), quarantined(quarantined_value), cancellation(cancel), progress(reporter), trace(trace_value), decode_probe(probe), execution(pipeline), image_url(urls),
+    ids(image_ids(index)), image_root(prepare_root(cache)), cpus(cpu_count(workers, execution)), local_transport(execution ? nullptr : std::make_unique<BenchmarkCurl>(cpus)),
+    transport(execution ? execution->curl() : *local_transport), concurrency(transport.limit(BenchmarkCurl::Class::OpenImages)),
+    active_limit(concurrency), minimum_limit(std::max<std::size_t>(1, concurrency / 8)), repair_bytes(repair_workspace(probe)),
+    control_limit(std::max(group_control(std::min(kOpenImagesGroupImages, ids.size())), execution ? execution->transient_target() : group_control(kOpenImagesGroupImages) * concurrency)),
+    inputs(execution, repair_bytes), active(transport, BenchmarkCurl::Class::OpenImages, cancellation, group_resources),
+    cache_writer(std::max<std::size_t>(1, execution ? 1 : cache_workers), image_root, cancellation, [this] { active.wake(); }, execution) {
+  for (std::size_t begin = 0; begin < ids.size(); begin += kOpenImagesGroupImages) waiting_groups.push_back(begin);
+  available.reserve(ids.size());
+  prepare_completions();
+  scans.reserve(std::min(cpus, kOpenImagesGroupImages / kScanGrain));
+ }
+ ~OpenImagesAcquisition() {
+  active.abandon_all([](OpenImagesTransfer&) noexcept {});
+  cache_writer.retire();
+ }
+ OpenImagesAcquisition(const OpenImagesAcquisition&) = delete;
+ OpenImagesAcquisition& operator=(const OpenImagesAcquisition&) = delete;
+ AcquiredOpenImages run() {
+  while (!waiting_groups.empty() || !locked_groups.empty() || !groups.empty()) {
+   throw_if_benchmark_cancelled(cancellation);
+   consume_cache_results();
+   consume_transfer_results();
+   settle_groups();
+   const bool pressure = execution && execution->resource_pressure();
+   if (pressure) inputs.retire_idle();
+   admit_groups(pressure);
+   // Ready HTTP gets a turn both before and after one bounded local scan.
+   admit_http(pressure);
+   const bool scanned = scan_chunk(pressure);
+   admit_http(pressure);
+   if (waiting_groups.empty() && locked_groups.empty() && groups.empty()) break;
+   if (scanned) continue;
+   // Only an actual park or resource pressure retires useful idle backing.
+   inputs.retire_idle();
+   auto deadline = Clock::now() + std::chrono::milliseconds{kBenchmarkTransferPollMilliseconds};
+   if (!retries.empty() && retries.top().deadline > Clock::now()) deadline = std::min(deadline, retries.top().deadline);
+   if (!locked_groups.empty()) deadline = std::min(deadline, locked_groups.top().deadline);
+   active.wait_until(deadline);
+  }
+  std::ranges::sort(available);
+  return {{"open-images", "train", image_root, "open-images-v7:train:" + std::string(kBenchmarkCatalogRevision), cached_image_selection_digest(available), available.size(), cached_bytes, all_cache_hits, {}}, std::move(available)};
+ }
+};
+}  // namespace
+AcquiredOpenImages acquire_open_images(const BenchmarkCacheLayout& cache, NormalizedAnnotationIndex& index, std::vector<QuarantinedImage>* quarantined,
+ mmltk::common::concurrency::CancellationObservation cancellation, ProgressReporter* progress, int num_workers, std::size_t cache_workers, const BenchmarkTraceSink& trace,
+ std::optional<ImageDecodeProbe> decode_probe, BenchmarkCompilePipeline* execution, const std::function<std::string(std::uint64_t)>& image_url) {
+ OpenImagesAcquisition acquisition(cache, index, quarantined, cancellation, progress, num_workers, cache_workers, trace, decode_probe, execution, image_url);
+ return acquisition.run();
 }
 }  // namespace mmltk::backend::data::benchmark_internal

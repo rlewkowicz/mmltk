@@ -2,6 +2,14 @@
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/pch_linux.h"
 #include "src/pch_std.h"
+#include <cerrno>
+#include <chrono>
+#include <fstream>
+#include <stdexcept>
+#include <system_error>
+#include <thread>
+#include <fcntl.h>
+#include <sys/file.h>
 #include "src/common/io/file_memory.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
@@ -52,20 +60,27 @@ ArtifactLease& ArtifactLease::operator=(ArtifactLease&& other) noexcept {
  return *this;
 }
 ArtifactLease::~ArtifactLease() { release(); }
-ArtifactLease ArtifactLease::acquire(const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancel_requested) {
- throw_if_benchmark_cancelled(cancel_requested);
- (void)mmltk::common::io::ensure_parent_directory(lock_path);
- const int descriptor = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
- if (descriptor < 0) { throw errno_error("cannot open benchmark cache lock", lock_path.string()); }
- mmltk::common::io::ScopedFd owned(descriptor);
- while (::flock(owned.get(), LOCK_EX | LOCK_NB) != 0) {
-  if (errno != EWOULDBLOCK && errno != EAGAIN) { throw errno_error("cannot acquire benchmark cache lock", lock_path.string()); }
-  throw_if_benchmark_cancelled(cancel_requested);
-  // flock has no readiness fd; this bounded retry exists solely to retain cancellation responsiveness.
+namespace {
+enum class LeaseWait { Once, UntilAcquired };
+[[nodiscard]] common_io::ScopedFd acquire_physical_lease(const std::filesystem::path& path,
+ mmltk::common::concurrency::CancellationObservation cancellation, LeaseWait wait) {
+ throw_if_benchmark_cancelled(cancellation);
+ (void)common_io::ensure_parent_directory(path);
+ common_io::ScopedFd descriptor(::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644));
+ if (descriptor.get() < 0) throw errno_error("cannot open benchmark cache lock", path.string());
+ while (::flock(descriptor.get(), LOCK_EX | LOCK_NB) != 0) {
+  if (errno != EWOULDBLOCK && errno != EAGAIN) throw errno_error("cannot acquire benchmark cache lock", path.string());
+  if (wait == LeaseWait::Once) return {};
+  throw_if_benchmark_cancelled(cancellation);
+  // flock has no readiness fd. Only ordinary blocking callers retain this fd.
   std::this_thread::sleep_for(std::chrono::milliseconds{100});
  }
- throw_if_benchmark_cancelled(cancel_requested);
- return ArtifactLease(owned.release());
+ throw_if_benchmark_cancelled(cancellation);
+ return descriptor;
+}
+}
+ArtifactLease ArtifactLease::acquire(const std::filesystem::path& path, mmltk::common::concurrency::CancellationObservation cancellation) {
+ return ArtifactLease(acquire_physical_lease(path, cancellation, LeaseWait::UntilAcquired).release());
 }
 std::shared_ptr<ArtifactLease> ArtifactLease::acquire_charged(const std::filesystem::path& path,
  mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkCompilePipeline* execution, BenchmarkResources demand, const BenchmarkAllowance& parent) {
@@ -108,15 +123,8 @@ std::shared_ptr<ArtifactLease> ArtifactLease::try_acquire_charged(const std::fil
 }
 std::shared_ptr<ArtifactLease> ArtifactLease::try_acquire(const std::filesystem::path& path,
  mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkAllowance allowance) {
- throw_if_benchmark_cancelled(cancellation);
- (void)common_io::ensure_parent_directory(path);
- common_io::ScopedFd descriptor(::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644));
- if (descriptor.get() < 0) throw errno_error("cannot open benchmark cache lock", path.string());
- if (::flock(descriptor.get(), LOCK_EX | LOCK_NB) != 0) {
-  if (errno != EWOULDBLOCK && errno != EAGAIN) throw errno_error("cannot acquire benchmark cache lock", path.string());
-  return {};
- }
- throw_if_benchmark_cancelled(cancellation);
+ auto descriptor = acquire_physical_lease(path, cancellation, LeaseWait::Once);
+ if (descriptor.get() < 0) return {};
  auto result = std::make_shared<ArtifactLease>();
  result->allowance_ = std::move(allowance);
  result->descriptor_ = std::move(descriptor);

@@ -82,8 +82,8 @@ struct BenchmarkCurl::Channel::State {
  std::size_t descriptor_ceiling = 0;
  bool registered = true, ready = false;
  std::deque<Completed> completed;
- std::condition_variable changed;
- std::uint64_t generation = 0, observed = 0;
+ std::size_t outstanding = 0;
+ std::uint64_t generation = 0, observed = 0, admission_observed = 0;
  std::exception_ptr failure;
  State(Class value, BenchmarkResources demand) : kind(value), source(demand) {}
 };
@@ -94,12 +94,10 @@ struct BenchmarkCurl::Impl {
   BenchmarkAllowance work;
   Impl* owner;
   std::exception_ptr socket_failure;
+  bool extra_range = false;
  };
- struct Removal { CURL* handle; bool settled = false; Removal* next = nullptr; };
- struct Command {
-  std::unique_ptr<Request> request;
-  std::size_t queue = 0;
- };
+ using Queue = std::list<std::unique_ptr<Request>>;
+ struct Removal { CURL* handle; Channel::State* channel; bool settled = false; Removal* next = nullptr; };
  struct Socket {
   BenchmarkAllowance allowance;
   curl_socket_t descriptor = CURL_SOCKET_BAD;
@@ -110,8 +108,9 @@ struct BenchmarkCurl::Impl {
  // nonblocking ledger operations run on the worker without this mutex, so a
  // credit-return wake never reverses the ledger/transport lock order.
  std::mutex mutex;
- std::condition_variable changed;
- std::list<Command> commands;
+ std::condition_variable changed, readers_changed;
+ std::uint64_t admission_generation = 0;
+ Queue commands;
  Removal* removals = nullptr;
  std::vector<std::weak_ptr<Channel::State>> observers;
  std::size_t channels = 0;
@@ -121,9 +120,16 @@ struct BenchmarkCurl::Impl {
  CURLM* wake_handle = nullptr;
  CurlMulti multi;
  BenchmarkAllowance fixed, socket_commitment;
- std::array<std::deque<std::unique_ptr<Request>>, 3> pending;
+ struct ClassState { Queue pending; std::size_t active = 0, limit = 0; };
+ std::array<ClassState, kBenchmarkCurlClasses.size()> classes;
+ Queue extra_ranges;
  std::unordered_map<CURL*, std::unique_ptr<Request>> active;
- std::array<std::size_t, 2> active_counts{};
+ ClassState& policy(Class kind) noexcept { return classes[static_cast<std::size_t>(kind)]; }
+ const ClassState& policy(Class kind) const noexcept { return classes[static_cast<std::size_t>(kind)]; }
+ template<class Visitor> void each_queue(Visitor&& visitor) {
+  for (auto& state : classes) visitor(state.pending);
+  visitor(extra_ranges);
+ }
  // Callback data belongs to this owner, including cached connections after
  // their easy handle retires. No image/input/decoder backing enters this list.
  std::mutex socket_mutex;
@@ -133,11 +139,17 @@ struct BenchmarkCurl::Impl {
  // most two. L + A <= 2 * aggregate, including old cached connections.
  std::size_t open_sockets = 0, connection_limit = 0, idle_limit = 1, fixed_socket_grants = 0;
  bool socket_closed = false;
- std::size_t ordinary_limit, image_limit, cursor = 0;
+ std::size_t cursor = 0;
  std::jthread worker;
- explicit Impl(std::size_t cpus, BenchmarkCompilePipeline* pipeline) : execution(pipeline),
-  ordinary_limit(std::min<std::size_t>(8, std::max<std::size_t>(1, cpus))),
-  image_limit(std::min<std::size_t>(256, mmltk::common::math::checked_multiply(std::size_t{10}, std::max<std::size_t>(1, cpus), "benchmark connection limit overflow"))) {
+ explicit Impl(std::size_t cpus, BenchmarkCompilePipeline* pipeline) : execution(pipeline) {
+  cpus = std::max<std::size_t>(1, cpus);
+  template for (constexpr auto entry : kBenchmarkCurlClasses) {
+   static_assert(kBenchmarkCurlClasses[static_cast<std::size_t>(entry.value)].value == entry.value);
+   if constexpr (entry.value == Class::Artifact) policy(entry.value).limit = std::min<std::size_t>(8, cpus);
+   else if constexpr (entry.value == Class::OpenImages)
+    policy(entry.value).limit = std::min<std::size_t>(256, mmltk::common::math::checked_multiply(std::size_t{10}, cpus, "benchmark connection limit overflow"));
+   static_assert(entry.value == Class::Artifact || entry.value == Class::OpenImages, "benchmark Curl class needs a connection policy");
+  }
   ensure_curl_global_initialized("cannot initialize benchmark Curl: ");
   require_supported_curl();
   worker = std::jthread([this] { run(); });
@@ -152,7 +164,8 @@ struct BenchmarkCurl::Impl {
   changed.notify_all();
  }
  void notify_readers_locked() {
-  for (const auto& observer : observers) if (auto state = observer.lock()) { ++state->generation; state->changed.notify_all(); }
+  ++admission_generation;
+  readers_changed.notify_all();
  }
  static curl_socket_t open_socket(void* opaque, curlsocktype, struct curl_sockaddr* address) noexcept {
   auto& request = *static_cast<Request*>(opaque);
@@ -272,7 +285,7 @@ struct BenchmarkCurl::Impl {
    if (declarations_changed) {
     declarations_changed = false;
     updated = true;
-    idle_limit = images_selected ? image_limit : ordinary_limit;
+    idle_limit = policy(images_selected ? Class::OpenImages : Class::Artifact).limit;
     if (execution) for (const auto& observer : observers) if (auto state = observer.lock(); state && state->registered) {
      const auto source = state->source.descriptors + state->source.continuation_descriptors;
      const auto spare = state->descriptor_ceiling - benchmark_curl_envelope().demand(1).descriptors - source;
@@ -301,40 +314,52 @@ struct BenchmarkCurl::Impl {
  }
  void detach(std::unique_ptr<Request> request, CURLcode code, bool publish) {
   (void)curl_multi_remove_handle(multi.get(), request->handle);
-  --active_counts[static_cast<std::size_t>(request->channel->kind)];
+  --policy(request->channel->kind).active;
   // Callbacks are detached before either work credits or borrowed input custody
   // return. The source may now checkpoint, back off or publish independently.
   request->work = {};
   release_closed_sockets(true);
   const std::lock_guard lock(mutex);
   if (publish) {
-   if (request->socket_failure && code != CURLE_OK) request->channel->failure = request->socket_failure;
+   if (request->socket_failure && code != CURLE_OK) { request->channel->failure = request->socket_failure; --request->channel->outstanding; }
    else request->channel->completed.push_back({request->handle, code});
-   ++request->channel->generation; request->channel->changed.notify_all();
+   ++request->channel->generation; readers_changed.notify_all();
   }
  }
  void drain_commands() {
-  std::list<Command> incoming;
-  { const std::lock_guard lock(mutex); incoming.swap(commands); }
-  for (auto& command : incoming) pending[command.queue].push_back(std::move(command.request));
+  Queue incoming;
+  Removal* removing;
+  { const std::lock_guard lock(mutex); incoming.swap(commands); removing = std::exchange(removals, nullptr); }
+  while (!incoming.empty()) {
+   const auto& request = incoming.front();
+   auto& queue = request->extra_range ? extra_ranges : policy(request->channel->kind).pending;
+   queue.splice(queue.end(), incoming, incoming.begin());
+  }
   // Stack-owned removal receipts make cancellation and destructor settlement
   // allocation-free. Each caller stays parked until all callbacks detach.
-  Removal* removing;
-  { const std::lock_guard lock(mutex); removing = std::exchange(removals, nullptr); }
   while (removing) {
    auto* receipt = removing; removing = receipt->next;
-   const auto handle = receipt->handle;
-   for (auto& queue : pending) std::erase_if(queue, [handle](const auto& request) { return request->handle == handle; });
-   const auto found = active.find(handle);
-   if (found != active.end()) {
-    auto request = std::move(found->second); active.erase(found);
+   const auto matches = [receipt](const auto& request) {
+    return request->channel.get() == receipt->channel && (!receipt->handle || request->handle == receipt->handle);
+   };
+   std::size_t removed = 0;
+   each_queue([&](auto& queue) { removed += std::erase_if(queue, matches); });
+   for (auto it = active.begin(); it != active.end();) {
+    if (!matches(it->second)) { ++it; continue; }
+    auto request = std::move(it->second); it = active.erase(it);
     detach(std::move(request), CURLE_ABORTED_BY_CALLBACK, false);
+    ++removed;
    }
-   { const std::lock_guard lock(mutex); receipt->settled = true; changed.notify_all(); }
+   {
+    const std::lock_guard lock(mutex);
+    removed += std::erase_if(receipt->channel->completed, [receipt](const Completed& value) { return !receipt->handle || value.handle == receipt->handle; });
+    receipt->channel->outstanding -= removed;
+    receipt->settled = true; changed.notify_all();
+   }
   }
  }
- bool admit(std::size_t queue, std::size_t aggregate) {
-  auto& candidate = pending[queue].front();
+ bool admit(Queue& queue, std::size_t aggregate) {
+  auto& candidate = queue.front();
   BenchmarkAllowance work;
   if (execution && !candidate->work) {
    auto value = execution->try_reserve(benchmark_curl_input_resources(), fixed);
@@ -361,7 +386,7 @@ struct BenchmarkCurl::Impl {
   }
   { const std::lock_guard lock(socket_mutex); sockets.splice(sockets.end(), admitted); fixed_socket_grants += new_fixed; }
   if (connection_limit != next_limit) { connection_limit = next_limit; set_connection_limit(); }
-  auto request = std::move(candidate); pending[queue].pop_front();
+  auto request = std::move(candidate); queue.pop_front();
   if (!request->work) request->work = std::move(work);
   auto* handle = request->handle;
   set_curl_option_with_prefix(handle, CURLOPT_OPENSOCKETFUNCTION, &Impl::open_socket, "cannot configure benchmark socket: ", "open");
@@ -372,7 +397,7 @@ struct BenchmarkCurl::Impl {
   if (!inserted) throw std::logic_error("benchmark easy handle already active");
   const auto status = curl_multi_add_handle(multi.get(), handle);
   if (status != CURLM_OK) throw std::runtime_error(std::string("cannot admit benchmark transfer: ") + curl_multi_strerror(status));
-  ++active_counts[static_cast<std::size_t>(position->second->channel->kind)];
+  ++policy(position->second->channel->kind).active;
   return true;
  }
  void run() noexcept {
@@ -384,10 +409,11 @@ struct BenchmarkCurl::Impl {
     {
      const std::lock_guard lock(mutex);
      if (stopping) break;
-     observed = generation; aggregate = images_selected ? image_limit : ordinary_limit; no_channels = !channels;
+     observed = generation; aggregate = policy(images_selected ? Class::OpenImages : Class::Artifact).limit; no_channels = !channels;
     }
     (void)drain_commands();
-    const bool waiting = std::ranges::any_of(pending, [](const auto& queue) { return !queue.empty(); });
+    bool waiting = false;
+    each_queue([&](const auto& queue) { waiting = waiting || !queue.empty(); });
     // Establish fixed transport custody before a channel can admit source
     // groups. This is a nonblocking worker draw; constructing I/O controllers
     // wait for its event outside CPU lanes.
@@ -396,11 +422,12 @@ struct BenchmarkCurl::Impl {
     if (waiting && initialized) {
      while (active.size() < aggregate) {
       bool admitted = false;
-      for (std::size_t turn = 0; turn < 2; ++turn) {
-       const auto kind = (cursor + turn) % 2;
-       if (active_counts[kind] >= (kind ? image_limit : ordinary_limit)) continue;
-       const auto queue = kind ? 2U : !pending[0].empty() ? 0U : 1U;
-       if (!pending[queue].empty() && admit(queue, aggregate)) { cursor = 1 - kind; admitted = true; break; }
+      for (std::size_t turn = 0; turn < classes.size(); ++turn) {
+       const auto index = (cursor + turn) % classes.size();
+       auto& state = classes[index];
+       if (state.active >= state.limit) continue;
+       auto& queue = kBenchmarkCurlClasses[index].value == Class::Artifact && state.pending.empty() ? extra_ranges : state.pending;
+       if (!queue.empty() && admit(queue, aggregate)) { cursor = (index + 1) % classes.size(); admitted = true; break; }
       }
       if (!admitted) break;
      }
@@ -438,21 +465,22 @@ struct BenchmarkCurl::Impl {
    const auto error = std::current_exception();
    for (auto& [handle, request] : active) { (void)curl_multi_remove_handle(multi.get(), handle); request->work = {}; }
    active.clear();
-   for (auto& queue : pending) queue.clear();
+   each_queue([](auto& queue) { queue.clear(); });
    retire_multi();
-   std::list<Command> abandoned;
+   Queue abandoned;
    const std::lock_guard lock(mutex);
    failure = error;
-   for (const auto& observer : observers) if (auto state = observer.lock()) { state->failure = error; state->changed.notify_all(); }
+   for (const auto& observer : observers) if (auto state = observer.lock()) { state->failure = error; }
    for (auto* receipt = removals; receipt; receipt = receipt->next) receipt->settled = true;
    removals = nullptr;
-   abandoned.swap(commands); changed.notify_all();
+   abandoned.swap(commands); changed.notify_all(); readers_changed.notify_all();
   }
   retire_multi();
  }
 };
 BenchmarkCurl::BenchmarkCurl(std::size_t cpus, BenchmarkCompilePipeline* execution) : impl_(std::make_shared<Impl>(cpus, execution)) {}
 BenchmarkCurl::~BenchmarkCurl() = default;
+std::size_t BenchmarkCurl::limit(Class kind) const noexcept { return impl_->policy(kind).limit; }
 BenchmarkCurl::Channel::Channel(std::shared_ptr<Impl> owner, Class kind, mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkResources source)
  : owner_(std::move(owner)), state_(std::make_shared<State>(kind, source)) {
  throw_if_benchmark_cancelled(cancellation);
@@ -490,6 +518,7 @@ BenchmarkCurl::Channel::Channel(std::shared_ptr<Impl> owner, Class kind, mmltk::
  }
 }
 BenchmarkCurl::Channel::~Channel() {
+ remove_all();
  std::unique_lock lock(owner_->mutex);
  state_->registered = false; owner_->declarations_changed = true;
  --owner_->channels; owner_->wake_locked();
@@ -510,36 +539,41 @@ std::function<void()> BenchmarkCurl::admission_wakeup() const {
  };
 }
 void BenchmarkCurl::Channel::add(CURL* handle, bool range, BenchmarkAllowance input) {
- auto request = std::make_unique<Impl::Request>(Impl::Request{handle, state_, std::move(input), owner_.get(), {}});
+ auto request = std::make_unique<Impl::Request>(Impl::Request{handle, state_, std::move(input), owner_.get(), {}, state_->kind == Class::Artifact && range});
  const std::lock_guard lock(owner_->mutex);
  if (owner_->failure) std::rethrow_exception(owner_->failure);
- owner_->commands.push_back({std::move(request), state_->kind == Class::OpenImages ? 2U : range ? 1U : 0U});
+ owner_->commands.push_back(std::move(request));
+ ++state_->outstanding;
  owner_->wake_locked();
 }
 std::optional<BenchmarkCurl::Completed> BenchmarkCurl::Channel::next() {
  const std::lock_guard lock(owner_->mutex);
  if (state_->failure) std::rethrow_exception(state_->failure);
  if (state_->completed.empty()) return {};
- auto value = state_->completed.front(); state_->completed.pop_front(); return value;
+ auto value = state_->completed.front(); state_->completed.pop_front(); --state_->outstanding; return value;
 }
 void BenchmarkCurl::Channel::wait_until(std::chrono::steady_clock::time_point deadline) {
  std::unique_lock lock(owner_->mutex);
  const auto before = state_->observed;
- state_->changed.wait_until(lock, deadline, [&] { return state_->failure || !state_->completed.empty() || before != state_->generation; });
+ owner_->readers_changed.wait_until(lock, deadline, [&] { return state_->failure || !state_->completed.empty() || before != state_->generation || state_->admission_observed != owner_->admission_generation; });
+ state_->admission_observed = owner_->admission_generation;
  state_->observed = state_->generation;
  if (state_->failure) std::rethrow_exception(state_->failure);
 }
 void BenchmarkCurl::Channel::wake() noexcept {
  const std::lock_guard lock(owner_->mutex);
- ++state_->generation; state_->changed.notify_all();
+ ++state_->generation; owner_->readers_changed.notify_all();
 }
 void BenchmarkCurl::Channel::remove(CURL* handle) {
- Impl::Removal removal{handle};
+ // A null handle selects this channel in the same stack-owned receipt.
+ Impl::Removal removal{handle, state_.get()};
  std::unique_lock lock(owner_->mutex);
+ if (!handle && !state_->outstanding) return;
  if (!owner_->failure) {
   removal.next = owner_->removals; owner_->removals = &removal; owner_->wake_locked();
   owner_->changed.wait(lock, [&] { return removal.settled || owner_->failure; });
  }
- std::erase_if(state_->completed, [handle](const Completed& value) { return value.handle == handle; });
+ if (owner_->failure) { state_->completed.clear(); state_->outstanding = 0; }
 }
+void BenchmarkCurl::Channel::remove_all() { remove(nullptr); }
 }  // namespace mmltk::backend::data::benchmark_internal

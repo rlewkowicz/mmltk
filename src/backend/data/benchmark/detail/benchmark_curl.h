@@ -1,5 +1,6 @@
 #pragma once  // backend.data private implementation boundary
 #include <curl/curl.h>
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include <cstddef>
 #include <cstdint>
@@ -161,6 +162,7 @@ public:
   void wait_until(std::chrono::steady_clock::time_point);
   void wake() noexcept;
   void remove(CURL*);
+  void remove_all();
  private:
   Channel(std::shared_ptr<Impl>, Class, mmltk::common::concurrency::CancellationObservation, BenchmarkResources);
   std::shared_ptr<Impl> owner_;
@@ -173,9 +175,12 @@ public:
  // request bytes and native candidates separately at the active-request turn.
  [[nodiscard]] std::unique_ptr<Channel> channel(Class, mmltk::common::concurrency::CancellationObservation = {}, BenchmarkResources source = {});
  [[nodiscard]] std::function<void()> admission_wakeup() const;
+ [[nodiscard]] std::size_t limit(Class) const noexcept;
 private:
  std::shared_ptr<Impl> impl_;
 };
+MMLTK_REFLECT_ENUM(BenchmarkCurl::Class)
+inline constexpr auto kBenchmarkCurlClasses = mmltk::frameworks::reflection::enum_entries<BenchmarkCurl::Class>();
 template <typename Transfer>
 class CurlMultiTransfers {
 public:
@@ -209,7 +214,7 @@ public:
  void wake() noexcept { channel_->wake(); }
  template <typename Release> void abandon_all(Release&& release) {
   // First detach every callback; salvage cannot race a still-running write.
-  for (const auto& [handle, transfer] : active_) { (void)transfer; channel_->remove(handle); }
+  channel_->remove_all();
   for (auto& [handle, transfer] : active_) { (void)handle; release(*transfer); }
   active_.clear();
  }

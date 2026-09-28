@@ -7,6 +7,16 @@
 #include <numeric>
 #include <condition_variable>
 #include <thread>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <utility>
+#include <unordered_set>
 #include "src/backend/data/benchmark/benchmark_hash.h"
 #include "src/common/io/file_digest.h"
 #include "src/common/io/file_memory.h"
@@ -1100,6 +1110,127 @@ DownloadResult download_locked_artifact(const DownloadRequest& request, std::siz
  }
  throw std::logic_error("benchmark download exhausted its attempt loop");
 }
+class DownloadBatch final {
+ using Cancellation = mmltk::common::concurrency::CancellationObservation;
+ struct Job { std::size_t index; std::shared_ptr<ArtifactLease> lease; };
+ const std::vector<DownloadRequest>& requests_;
+ const DownloadProgressSink& observer_;
+ const BenchmarkTraceSink& trace_;
+ const DownloadReadySink& ready_;
+ BenchmarkCompilePipeline* execution_;
+ const BenchmarkAllowance& parent_;
+ Cancellation external_;
+ std::atomic<bool> stopped_{false};
+ std::unique_ptr<BenchmarkCurl> local_transport_;
+ BenchmarkCurl& transport_;
+ std::size_t concurrency_;
+ BenchmarkResources source_resources_ = BenchmarkResources::handles(1, true, 2);
+ std::unique_ptr<BenchmarkCurl::Channel> source_transport_;
+ StorageReservationPool storage_;
+ Cancellation cancellation_ = Cancellation::Borrow(*this);
+ std::mutex mutex_, observer_mutex_;
+ std::condition_variable changed_, jobs_changed_;
+ std::exception_ptr error_;
+ DownloadProgressSink progress_;
+ std::vector<DownloadResult> results_;
+ std::list<std::size_t> pending_;
+ std::vector<std::optional<Job>> jobs_;
+ std::vector<std::size_t> free_, completed_, done_;
+ std::size_t running_ = 0;
+ // Last member and explicitly joined: every borrow above survives each worker.
+ std::vector<std::jthread> controllers_;
+ void retire() noexcept {
+  stopped_.store(true, std::memory_order_relaxed);
+  jobs_changed_.notify_all();
+  controllers_.clear();
+ }
+ void consume(std::size_t slot) noexcept {
+  for (;;) {
+   std::optional<Job> job;
+   {
+    std::unique_lock lock(mutex_);
+    jobs_changed_.wait(lock, [&] { return stopped_.load(std::memory_order_relaxed) || jobs_[slot].has_value(); });
+    if (stopped_.load(std::memory_order_relaxed)) return;
+    job = std::move(jobs_[slot]); jobs_[slot].reset();
+   }
+   try {
+    results_[job->index] = download_locked_artifact(requests_[job->index], concurrency_, cancellation_, progress_, trace_, transport_, execution_, job->lease->allowance(), storage_);
+    job->lease.reset();
+    if (ready_) { const std::lock_guard lock(observer_mutex_); ready_({job->index, results_[job->index]}); }
+   } catch (...) {
+    const std::lock_guard lock(mutex_);
+    if (!error_) error_ = std::current_exception();
+    stopped_.store(true, std::memory_order_relaxed);
+    jobs_changed_.notify_all();
+   }
+   // The slot is reusable only after its complete borrowed job has retired.
+   job.reset();
+   { const std::lock_guard lock(mutex_); completed_.push_back(slot); }
+   changed_.notify_one();
+  }
+ }
+public:
+ DownloadBatch(const std::vector<DownloadRequest>& requests, std::size_t requested_concurrency, Cancellation cancellation,
+  const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready,
+  BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool* storage)
+  : requests_(requests), observer_(observer), trace_(trace), ready_(ready), execution_(execution), parent_(parent), external_(cancellation),
+    local_transport_(execution ? nullptr : std::make_unique<BenchmarkCurl>(requested_concurrency)),
+    transport_(execution ? execution->curl() : *local_transport_), concurrency_(std::min(requested_concurrency, transport_.limit(BenchmarkCurl::Class::Artifact))),
+    source_transport_(transport_.channel(BenchmarkCurl::Class::Artifact, cancellation, source_resources_)),
+    storage_(execution ? execution->storage() : storage ? *storage : StorageReservationPool(requests.front().destination, trace)), results_(requests.size()),
+    jobs_(std::min(requests.size(), concurrency_)), free_(jobs_.size()) {
+  if (observer_) progress_ = [this](const DownloadProgress& update) { const std::lock_guard lock(observer_mutex_); observer_(update); };
+  for (std::size_t index = 0; index < requests.size(); ++index) pending_.push_back(index);
+  std::iota(free_.begin(), free_.end(), 0);
+  completed_.reserve(jobs_.size()); done_.reserve(jobs_.size()); controllers_.reserve(jobs_.size());
+ }
+ ~DownloadBatch() { retire(); }
+ DownloadBatch(const DownloadBatch&) = delete;
+ DownloadBatch& operator=(const DownloadBatch&) = delete;
+ bool cancelled() const noexcept { return stopped_.load(std::memory_order_relaxed) || external_.requested(); }
+ std::vector<DownloadResult> run() try {
+  // Thread startup is inside the fully constructed owner's lifetime. A partial
+  // startup failure signals and joins every already-started controller.
+  for (std::size_t slot = 0; slot < jobs_.size(); ++slot) controllers_.emplace_back([this, slot] { consume(slot); });
+  while (!pending_.empty() || running_) {
+   {
+    const std::lock_guard lock(mutex_);
+    if (error_) std::rethrow_exception(error_);
+    done_.swap(completed_);
+   }
+   throw_if_benchmark_cancelled(external_);
+   for (const auto slot : done_) { free_.push_back(slot); --running_; }
+   done_.clear();
+   for (auto it = pending_.begin(); it != pending_.end() && !free_.empty();) {
+    const auto index = *it;
+    auto lease = ArtifactLease::try_acquire_charged(requests_[index].lock_path, cancellation_, execution_, source_resources_, parent_);
+    if (!lease) { ++it; continue; }
+    const auto slot = free_.back(); free_.pop_back(); it = pending_.erase(it); ++running_;
+    {
+     const std::lock_guard lock(mutex_);
+     if (error_) std::rethrow_exception(error_);
+     jobs_[slot].emplace(index, std::move(lease));
+    }
+    jobs_changed_.notify_all();
+   }
+   if (!pending_.empty() || running_) {
+    std::unique_lock lock(mutex_);
+    // Only source-lock retry has no readiness event. Completed jobs notify.
+    changed_.wait_for(lock, std::chrono::milliseconds{100}, [&] { return error_ || !completed_.empty() || external_.requested(); });
+   }
+  }
+  retire();
+  return std::move(results_);
+ } catch (...) {
+  {
+   const std::lock_guard lock(mutex_);
+   if (!error_) error_ = std::current_exception();
+  }
+  retire();
+  std::rethrow_exception(error_);
+ }
+};
+
 }
 std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t requested_concurrency,
  mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready,
@@ -1112,81 +1243,8 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
   if (request.expected_sha256) (void)mmltk::common::io::parse_sha256_hex(*request.expected_sha256);
   if (!locks.insert(request.lock_path).second) throw std::runtime_error("benchmark download batch contains a duplicate cache lock");
  }
- requested_concurrency = std::min<std::size_t>(8, execution ? std::min(requested_concurrency, execution->workers()) : requested_concurrency);
- std::unique_ptr<BenchmarkCurl> local_transport;
- if (!execution) local_transport = std::make_unique<BenchmarkCurl>(requested_concurrency);
- auto& transport = execution ? execution->curl() : *local_transport;
- // Establish the shared fixed promise before independent artifact leases can
- // fill their producer ceiling. This channel owns no active request window.
- const auto source_resources = BenchmarkResources::handles(1, true, 2);
- auto source_transport = transport.channel(BenchmarkCurl::Class::Artifact, cancel_requested, source_resources);
- auto shared_storage = execution ? execution->storage() : storage ? *storage : StorageReservationPool(requests.front().destination, trace);
- struct Controllers {
-  mmltk::common::concurrency::CancellationObservation external;
-  std::atomic<bool> stopped{false};
-  std::mutex mutex, observer_mutex;
-  std::condition_variable changed;
-  std::exception_ptr error;
-  std::size_t running = 0;
-  std::vector<std::size_t> completed;
-  std::vector<std::jthread> threads;
-  bool cancelled() const noexcept { return stopped.load(std::memory_order_relaxed) || external.requested(); }
-  ~Controllers() { stopped.store(true, std::memory_order_relaxed); threads.clear(); }
- } owner{cancel_requested};
- const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(owner);
- const DownloadProgressSink progress = observer ? DownloadProgressSink{[&](const DownloadProgress& update) { const std::lock_guard lock(owner.observer_mutex); observer(update); }} : DownloadProgressSink{};
- std::vector<DownloadResult> results(requests.size());
- std::list<std::size_t> pending;
- for (std::size_t index = 0; index < requests.size(); ++index) pending.push_back(index);
- // At most the ordinary class ceiling of controllers owns file/publication
- // work. A failed flock attempt owns neither a controller nor network capacity.
- owner.threads.resize(std::min(requests.size(), requested_concurrency));
- std::vector<std::size_t> slots(owner.threads.size());
- std::iota(slots.begin(), slots.end(), 0);
- std::vector<std::size_t> done;
- owner.completed.reserve(owner.threads.size()); done.reserve(owner.threads.size());
- struct RetireControllers {
-  Controllers& owner;
-  ~RetireControllers() { owner.stopped.store(true, std::memory_order_relaxed); owner.threads.clear(); }
- } retire{owner};
- while (!pending.empty() || owner.running) {
-  throw_if_benchmark_cancelled(cancel_requested);
-  {
-   const std::lock_guard lock(owner.mutex);
-   if (owner.error) std::rethrow_exception(owner.error);
-   done.swap(owner.completed);
-  }
-  for (const auto slot : done) { owner.threads[slot].join(); slots.push_back(slot); --owner.running; }
-  done.clear();
-  for (auto it = pending.begin(); it != pending.end() && !slots.empty();) {
-   const auto index = *it;
-   auto lease = ArtifactLease::try_acquire_charged(requests[index].lock_path, cancellation, execution,
-    source_resources, parent);
-   if (!lease) { ++it; continue; }
-   it = pending.erase(it);
-   const auto slot = slots.back(); slots.pop_back(); ++owner.running;
-   owner.threads[slot] = std::jthread([&, index, slot, lease = std::move(lease)]() mutable {
-    try {
-     results[index] = download_locked_artifact(requests[index], requested_concurrency, cancellation, progress, trace, transport, execution, lease->allowance(), shared_storage);
-     lease.reset();
-     if (ready) { const std::lock_guard lock(owner.observer_mutex); ready({index, results[index]}); }
-    } catch (...) {
-     const std::lock_guard lock(owner.mutex);
-     if (!owner.error) owner.error = std::current_exception();
-     owner.stopped.store(true, std::memory_order_relaxed);
-    }
-    { const std::lock_guard lock(owner.mutex); owner.completed.push_back(slot); }
-    owner.changed.notify_one();
-   });
-  }
-  if (!pending.empty() || owner.running) {
-   std::unique_lock lock(owner.mutex);
-   // flock has no readiness descriptor. Only this bounded controller retry
-   // polls locks; socket completion and publication signal their own event.
-   owner.changed.wait_for(lock, std::chrono::milliseconds{100}, [&] { return owner.error || !owner.completed.empty() || cancel_requested.requested(); });
-  }
- }
- return results;
+ DownloadBatch batch(requests, requested_concurrency, cancel_requested, observer, trace, ready, execution, parent, storage);
+ return batch.run();
 }
 void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
  if (request.artifact_id.empty() || request.destination.empty() || request.lock_path.empty()) { throw std::runtime_error("benchmark download invalidation request is incomplete"); }

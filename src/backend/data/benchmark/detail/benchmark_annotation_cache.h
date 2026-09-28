@@ -1,5 +1,6 @@
 #pragma once
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/common/concurrency/cancellation_observation.h"
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"

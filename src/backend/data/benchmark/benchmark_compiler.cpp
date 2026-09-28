@@ -709,7 +709,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
    // Release controllers retain source leases until activation. Protect their
    // inventory/original-index prerequisite before admitting those controllers.
    preparation_allowance = pipeline.reserve(BenchmarkResources::handles(0, true, coco_annotation_resources().descriptors + coco_annotation_resources().continuation_descriptors));
-   return acquire_coconut_recipe_inputs(cache, coconut_catalog, progress, input_budget, cancel_requested, trace, std::min<std::size_t>(8, effective_num_workers),
+   return acquire_coconut_recipe_inputs(cache, coconut_catalog, progress, input_budget, cancel_requested, trace, pipeline.curl().limit(BenchmarkCurl::Class::Artifact),
     compile_cpus, fail_compile, &pipeline);
   };
   if (coconut) retained_annotation_inputs = acquire_annotations();
@@ -804,7 +804,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
         auto lease = ArtifactLease::acquire_charged(cache.locks / ("coco-" + shard + ".images.lock"), cancel_requested, &pipeline,
          archive_lease_resources());
         const auto request = make_download_request(cache, "coco", source ? custom_catalog.coco_val_images : custom_catalog.coco_train_images);
-        auto download = download_artifacts({request}, std::min<std::size_t>(8, effective_num_workers), cancel_requested,
+        auto download = download_artifacts({request}, pipeline.curl().limit(BenchmarkCurl::Class::Artifact), cancel_requested,
          progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { physical_progress.update(update, progress); }} : DownloadProgressSink{}, trace, {}, &pipeline, lease->allowance())
                          .front();
         return PrefetchedArchive{std::move(download), std::move(lease)};
@@ -1067,7 +1067,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     const int archive_workers = static_cast<int>(std::min(archive_tasks.size(), configured_workers));
     const std::size_t decompression_workers = 1;
     const std::size_t archive_cache_workers = 0;
-    const std::size_t archive_download_connections = std::min<std::size_t>(8, configured_workers);
+    const std::size_t archive_download_connections = pipeline.curl().limit(BenchmarkCurl::Class::Artifact);
     std::thread open_images_thread;
     if (overlap_open_images) {
      open_images_thread = std::thread([&] {

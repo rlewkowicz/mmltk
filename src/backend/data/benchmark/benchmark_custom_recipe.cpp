@@ -71,7 +71,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
   for (const auto& request : requests) bytes = common_math::checked_add(bytes, request.expected_size, "benchmark annotation storage estimate overflow");
   const bool archive = std::ranges::any_of(requests, [](const DownloadRequest& request) { return request.source != BenchmarkDatasetSource::kOpenImagesV7; });
   require_storage(cache.root, archive ? common_math::checked_add(bytes, kArchiveScratchBytes, "benchmark annotation storage estimate overflow") : bytes, "benchmark annotation acquisition and indexing", trace);
-  auto results = download_artifacts(requests, std::min<std::size_t>(8, parse_workers), cancel_requested,
+  auto results = download_artifacts(requests, parse_workers, cancel_requested,
    progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { progress.transfers().update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, allowance, &storage);
   for (std::size_t i = 0; i < requests.size(); ++i) annotation_downloads.at(requests[i].artifact_id) = std::move(results[i]);
  };

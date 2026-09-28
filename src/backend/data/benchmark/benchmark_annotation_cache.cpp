@@ -188,7 +188,7 @@ std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequ
   request.redownload = true;
  }
  progress.source_activity(source, "Redownloading annotation metadata after structural validation failure");
- return download_artifacts(requests, requests.size() == 1U ? std::min<std::size_t>(8U, workers) : std::min<std::size_t>({3U, requests.size(), workers}), cancellation,
+ return download_artifacts(requests, requests.size() == 1U ? workers : std::min<std::size_t>({3U, requests.size(), workers}), cancellation,
   progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, parent, storage);
 }
 BenchmarkResources coco_annotation_resources() {

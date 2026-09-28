@@ -193,6 +193,7 @@ struct ObservedCurlTransfer {
  std::string url;
  std::vector<std::uint8_t> bytes;
  std::size_t responses = 0;
+ std::function<void()> before_write;
  std::array<char, CURL_ERROR_SIZE> error{};
  std::exception_ptr callback_error;
  mmltk::common::concurrency::CancellationObservation cancel_requested;
@@ -218,6 +219,7 @@ struct ObservedCurlTransfer {
  }
  static std::size_t write(char* data, std::size_t size, std::size_t count, void* opaque) {
   return curl_run_data_callback<ObservedCurlTransfer>(size, count, opaque, [&](ObservedCurlTransfer& self, std::size_t bytes) {
+   if (self.before_write) self.before_write();
    self.bytes.insert(self.bytes.end(), data, data + bytes);
    return bytes;
   });
@@ -5433,4 +5435,267 @@ TEST_CASE("large ordinary first attempts retain metadata meaning through reset c
  }
  CHECK(execution.try_reserve({256U << 10, 16}).has_value());
  server.ReleasePartial(); server.Check();
+}
+
+TEST_CASE("Curl class limits come from its reflected inventory and checked CPU budget", "[backend][data][benchmark][download]") {
+ BenchmarkCurl normalized(0), selected(3), capped(256);
+ CHECK(kBenchmarkCurlClasses.size() == 2);
+ CHECK(normalized.limit(BenchmarkCurl::Class::Artifact) == 1);
+ CHECK(normalized.limit(BenchmarkCurl::Class::OpenImages) == 10);
+ CHECK(selected.limit(BenchmarkCurl::Class::Artifact) == 3);
+ CHECK(selected.limit(BenchmarkCurl::Class::OpenImages) == 30);
+ CHECK(capped.limit(BenchmarkCurl::Class::Artifact) == 8);
+ CHECK(capped.limit(BenchmarkCurl::Class::OpenImages) == 256);
+ CHECK_THROWS_AS(BenchmarkCurl(std::numeric_limits<std::size_t>::max()), std::overflow_error);
+}
+
+TEST_CASE("standalone artifact batches retain selected controllers across multiple jobs", "[backend][data][benchmark][download]") {
+ mmltk::testsupport::ScopedTempDir root("persistent-artifact-controllers");
+ const auto payload = make_payload(4096);
+ HttpServer first(payload), second(payload);
+ first.GateNextRequest(); second.GateNextRequest();
+ std::vector<DownloadRequest> requests;
+ for (std::size_t i = 0; i < 6; ++i) requests.push_back(request_for(root.path(), "artifact-" + std::to_string(i), (i % 2 ? second : first).url("body"), payload));
+ std::mutex observations;
+ std::vector<std::thread::id> controllers;
+ std::vector<std::size_t> delivered;
+ std::atomic<bool> cancelled{false};
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json&) {
+  if (event != "benchmark.download.start") return;
+  const std::lock_guard lock(observations);
+  controllers.push_back(std::this_thread::get_id());
+ };
+ auto batch = std::async(std::launch::async, [&] {
+  return download_artifacts(requests, 2, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), {}, trace, [&](DownloadReady result) {
+   auto lease = ArtifactLease::try_acquire_charged(requests[result.request_index].lock_path, {}, BenchmarkAllowance{});
+   require_condition(static_cast<bool>(lease), "ready callback retained its artifact lock");
+   require_condition(result.artifact.path == requests[result.request_index].destination, "ready result lost input order");
+   delivered.push_back(result.request_index);
+  });
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); first.ReleaseRequest(); second.ReleaseRequest(); });
+ // No CPU-count skip: these are the selected standalone I/O controllers.
+ REQUIRE(first.WaitRequest()); REQUIRE(second.WaitRequest());
+ CHECK(batch.wait_for(0ms) == std::future_status::timeout);
+ first.ReleaseRequest(); second.ReleaseRequest();
+ const auto results = mmltk::testsupport::await_test_future(batch, "persistent artifact batch");
+ REQUIRE(results.size() == requests.size());
+ for (std::size_t i = 0; i < results.size(); ++i) { CHECK(results[i].path == requests[i].destination); CHECK(results[i].size == payload.size()); }
+ REQUIRE(controllers.size() == requests.size());
+ std::ranges::sort(controllers);
+ controllers.erase(std::unique(controllers.begin(), controllers.end()), controllers.end());
+ CHECK(controllers.size() == 2);
+ std::ranges::sort(delivered);
+ CHECK(delivered == std::vector<std::size_t>{0, 1, 2, 3, 4, 5});
+ first.Check(); second.Check();
+}
+
+TEST_CASE("artifact callback and startup failures settle all borrowed batch state", "[backend][data][benchmark][download]") {
+ bool startup = false;
+ SECTION("a throwing ready callback retires its peer") {}
+ SECTION("a source startup error retires an already active peer") { startup = true; }
+ mmltk::testsupport::ScopedTempDir root("artifact-batch-failure-custody");
+ const auto payload = make_payload(4096);
+ HttpServer first(payload), peer(payload);
+ peer.GateNextRequest();
+ auto request = request_for(root.path(), "first", first.url("first"), payload);
+ auto independent = request_for(root.path(), "peer", peer.url("peer"), payload);
+ mmltk::testsupport::TestGate callback("borrowed artifact ready result");
+ std::atomic<bool> cancelled{false};
+ std::promise<void> returned;
+ std::shared_ptr<ArtifactLease> blocked;
+ if (startup) {
+  // Hold selection until the peer is active, then fail ordinary source setup.
+  blocked = std::make_shared<ArtifactLease>(ArtifactLease::acquire(request.lock_path, {}));
+  write_text(request.destination / "retained-entry", "cannot remove this nonempty destination");
+ }
+ const std::vector requests{request, independent};
+ auto batch = std::async(std::launch::async, [&] {
+  return download_artifacts(requests, 2, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), {}, {}, [&](DownloadReady value) {
+   if (value.request_index != 0) return;
+   callback.receipt().ArriveAndWait();
+   require_condition(value.artifact.path == request.destination && value.artifact.size == payload.size(), "borrowed result changed before retirement");
+   returned.set_value();
+   throw std::runtime_error("artifact ready failure");
+  });
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); blocked.reset(); callback.Release(); peer.ReleaseRequest(); });
+ REQUIRE(peer.WaitRequest());
+ if (startup) blocked.reset();
+ else {
+  REQUIRE(callback.WaitEntered(5s));
+  CHECK(batch.wait_for(0ms) == std::future_status::timeout);
+  callback.Release();
+  mmltk::testsupport::await_test_promise(returned, "borrowed artifact result retirement");
+ }
+ REQUIRE(batch.wait_for(5s) == std::future_status::ready);
+ if (startup) CHECK_THROWS(batch.get());
+ else CHECK_THROWS_WITH(batch.get(), "artifact ready failure");
+ for (const auto& value : requests) CHECK(ArtifactLease::try_acquire_charged(value.lock_path, {}, BenchmarkAllowance{}));
+ CHECK_FALSE(fs::exists(independent.destination));
+ peer.ReleaseRequest(); first.Check(); peer.Check();
+}
+
+TEST_CASE("channel settlement detaches pending and active work while another channel stays live", "[backend][data][benchmark][download][pipeline]") {
+ const auto payload = make_payload(4096);
+ HttpServer retired(payload), queued(payload), independent(payload), reused(payload);
+ retired.GateNextRequest(); independent.GateNextRequest();
+ BenchmarkCompilePipeline execution(1, {}, {.descriptors = 32});
+ CurlSocketObservation sockets;
+ auto channel = execution.curl().channel(BenchmarkCurl::Class::Artifact);
+ auto other = execution.curl().channel(BenchmarkCurl::Class::OpenImages);
+ ObservedCurlTransfer first(retired.url("active"), sockets), pending(queued.url("pending"), sockets), live(independent.url("live"), sockets), later(reused.url("reused"), sockets);
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  retired.ReleaseRequest(); independent.ReleaseRequest();
+  if (channel) channel->remove_all();
+  if (other) other->remove_all();
+ });
+ channel->add(first.easy.get()); REQUIRE(retired.WaitRequest());
+ channel->add(pending.easy.get());
+ other->add(live.easy.get()); REQUIRE(independent.WaitRequest());
+ channel->remove_all();
+ CHECK_FALSE(channel->next());
+ CHECK(first.bytes.empty()); CHECK(pending.bytes.empty());
+ CHECK(queued.requests() == 0);
+ CHECK(sockets.live() == 1);
+ channel->remove_all(); // Already-empty settlement keeps the channel reusable.
+ channel->add(later.easy.get());
+ CHECK(await_curl(*channel).handle == later.easy.get());
+ CHECK(later.bytes == payload);
+ CHECK(live.bytes.empty());
+ channel.reset();
+ CHECK(sockets.live() == 1);
+ independent.ReleaseRequest();
+ CHECK(await_curl(*other).handle == live.easy.get());
+ CHECK(live.bytes == payload);
+ other.reset();
+ CHECK(sockets.live() == 0);
+ CHECK(execution.try_reserve({execution.transient_target(), 32}).has_value());
+ retired.ReleaseRequest(); retired.Check(); queued.Check(); independent.Check(); reused.Check();
+}
+
+TEST_CASE("shared Curl admission changes survive the check to park boundary for actual readers", "[backend][data][benchmark][download][pipeline]") {
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 4096, .descriptors = 32});
+ std::vector<std::unique_ptr<BenchmarkCurl::Channel>> declarations;
+ for (std::size_t i = 0; i < 32; ++i) declarations.push_back(execution.curl().channel(BenchmarkCurl::Class::Artifact));
+ auto first = execution.curl().channel(BenchmarkCurl::Class::Artifact);
+ auto second = execution.curl().channel(BenchmarkCurl::Class::OpenImages);
+ auto occupied = execution.reserve({4096, 0});
+ mmltk::testsupport::TestGate first_checked("first admission predicate checked"), second_checked("second admission predicate checked");
+ const auto wait = [&](BenchmarkCurl::Channel& channel, mmltk::testsupport::TestGate& checked) {
+  require_condition(!execution.try_reserve({1, 0}), "occupied bytes unexpectedly admitted");
+  channel.wait_until(std::chrono::steady_clock::now());
+  checked.receipt().ArriveAndWait();
+  channel.wait_until(std::chrono::steady_clock::time_point::max());
+  return execution.try_reserve({1, 0}).has_value();
+ };
+ auto a = std::async(std::launch::async, [&] { return wait(*first, first_checked); });
+ auto b = std::async(std::launch::async, [&] { return wait(*second, second_checked); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { occupied = {}; first_checked.Release(); second_checked.Release(); first->wake(); second->wake(); });
+ REQUIRE(first_checked.WaitEntered(5s)); REQUIRE(second_checked.WaitEntered(5s));
+ occupied = {}; // One common credit event, before either reader parks.
+ first_checked.Release(); second_checked.Release();
+ CHECK(mmltk::testsupport::await_test_future(a, "first shared admission reader"));
+ CHECK(mmltk::testsupport::await_test_future(b, "second shared admission reader"));
+}
+
+TEST_CASE("Open Images starts ready HTTP before later cold cache chunks finish", "[backend][data][benchmark][images][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("open-images-incremental-cache-scan");
+ const auto cache = BenchmarkCacheLayout::create(root.path());
+ const auto images = cache.source_images("open-images") / "train";
+ prepare_cached_image_directory(images);
+ const auto jpeg = make_jpeg(10, 20, 30);
+ HttpServer server(jpeg);
+ server.GateNextRequest();
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 64U << 20, .descriptors = 32});
+ NormalizedAnnotationIndex index;
+ index.source = BenchmarkDatasetSource::kOpenImagesV7;
+ for (std::uint64_t id = 1; id <= 65; ++id) {
+  index.images.push_back({.source_image_id = id});
+  if (id > 1 && id < 65) write_cached_image_atomically(cached_image_path(images, id), jpeg, {});
+ }
+ write_text(cached_image_path(images, 65), "invalid cached JPEG");
+ mmltk::testsupport::TestGate scan("later cold cache header");
+ std::atomic<bool> cancelled{false};
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
+  if (event == "benchmark.images.cache_invalid" && fields.at("image_id") == 65) scan.receipt().ArriveAndWait();
+ };
+ std::vector<QuarantinedImage> quarantined;
+ ProgressReporter progress({}, {});
+ auto acquisition = std::async(std::launch::async, [&] {
+  return acquire_open_images(cache, index, &quarantined, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), &progress, 1, 0, trace, {}, &execution,
+   [&](std::uint64_t) { return server.url("image"); });
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); scan.Release(); server.ReleaseRequest(); });
+ REQUIRE(scan.WaitEntered(5s));
+ REQUIRE(server.WaitRequest()); // The only CPU is still in the later scan chunk.
+ CHECK(acquisition.wait_for(0ms) == std::future_status::timeout);
+ CHECK_FALSE(fs::exists(images / ".groups" / "group-000000.complete.json"));
+ scan.Release(); server.ReleaseRequest();
+ const auto result = mmltk::testsupport::await_test_future(acquisition, "incremental cache scan acquisition");
+ CHECK(result.available_image_ids.size() == 65);
+ CHECK(result.directory.image_bytes == jpeg.size() * 65);
+ CHECK(quarantined.empty());
+ CHECK(server.requests() == 2);
+ const auto proof = read_json_file(images / ".groups" / "group-000000.complete.json");
+ CHECK(proof.at("image_count") == 65);
+ CHECK(proof.at("image_bytes") == jpeg.size() * 65);
+ CHECK(proof.at("dimensions").size() == 195);
+ CHECK(execution.try_reserve({64U << 20, 32}).has_value());
+ server.Check();
+}
+
+TEST_CASE("an already settled channel retires without waiting for another channel callback", "[backend][data][benchmark][download][pipeline]") {
+ const auto payload = make_payload(128);
+ HttpServer first(payload), second(payload);
+ BenchmarkCompilePipeline execution(1, {}, {.descriptors = 32});
+ CurlSocketObservation sockets;
+ auto retired = execution.curl().channel(BenchmarkCurl::Class::Artifact);
+ auto live = execution.curl().channel(BenchmarkCurl::Class::OpenImages);
+ ObservedCurlTransfer finished(first.url("finished"), sockets), held(second.url("held"), sockets);
+ mmltk::testsupport::TestGate callback("other channel's physical callback");
+ held.before_write = [&] { callback.receipt().ArriveAndWait(); };
+ retired->add(finished.easy.get());
+ CHECK(await_curl(*retired).result == CURLE_OK);
+ retired->remove_all();
+ std::future<void> retirement;
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { callback.Release(); if (retirement.valid()) retirement.wait(); if (retired) retired->remove_all(); if (live) live->remove_all(); });
+ live->add(held.easy.get());
+ REQUIRE(callback.WaitEntered(5s));
+ retirement = std::async(std::launch::async, [&] { retired->remove_all(); retired.reset(); });
+ mmltk::testsupport::await_test_future(retirement, "already-empty channel destruction");
+ callback.Release();
+ CHECK(await_curl(*live).result == CURLE_OK);
+ CHECK(held.bytes == payload);
+ live.reset();
+ CHECK(sockets.live() == 0);
+ CHECK(execution.try_reserve({execution.transient_target(), 32}).has_value());
+ first.Check(); second.Check();
+}
+
+TEST_CASE("transport failure wakes channel readers and permits request settlement", "[backend][data][benchmark][download][pipeline]") {
+ const auto payload = make_payload(128);
+ HttpServer first(payload), second(payload);
+ first.GateNextRequest(); second.GateNextRequest();
+ BenchmarkCompilePipeline execution(1, {}, {.descriptors = 32});
+ CurlSocketObservation sockets;
+ auto channel = execution.curl().channel(BenchmarkCurl::Class::Artifact);
+ auto peer = execution.curl().channel(BenchmarkCurl::Class::OpenImages);
+ ObservedCurlTransfer duplicate(first.url("duplicate"), sockets), held(second.url("held"), sockets);
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { first.ReleaseRequest(); second.ReleaseRequest(); if (channel) channel->remove_all(); if (peer) peer->remove_all(); });
+ channel->add(duplicate.easy.get()); REQUIRE(first.WaitRequest());
+ peer->add(held.easy.get()); REQUIRE(second.WaitRequest());
+ // A second registration of a still-active easy handle is a transport error.
+ // Its admission waits for an Artifact turn; remove the class restriction by
+ // submitting the duplicate through the independent image declaration.
+ peer->add(duplicate.easy.get());
+ CHECK_THROWS_WITH(await_curl(*channel), "benchmark easy handle already active");
+ CHECK_THROWS_WITH(peer->next(), "benchmark easy handle already active");
+ auto receipt = std::async(std::launch::async, [&] { peer->remove_all(); });
+ mmltk::testsupport::await_test_future(receipt, "failed transport removal receipt");
+ channel->remove_all();
+ peer.reset(); channel.reset();
+ CHECK(sockets.live() == 0);
+ CHECK(execution.try_reserve({execution.transient_target(), 32}).has_value());
+ first.ReleaseRequest(); second.ReleaseRequest(); first.Check(); second.Check();
 }

@@ -1,5 +1,6 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/common/concurrency/cancellation_observation.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>

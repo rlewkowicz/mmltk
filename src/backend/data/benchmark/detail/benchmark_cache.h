@@ -30,6 +30,7 @@ struct BenchmarkCacheLayout {
  [[nodiscard]] std::filesystem::path source_indexes(std::string_view source) const;
 };
 class StorageReservationPool;
+class BenchmarkCompilePipeline;
 class ArtifactLease {
 public:
  ArtifactLease() = default;

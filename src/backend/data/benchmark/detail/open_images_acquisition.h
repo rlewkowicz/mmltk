@@ -6,13 +6,15 @@
 #include <optional>
 #include <string>
 #include <vector>
-#include "src/backend/data/benchmark/detail/benchmark_annotations.h"
+#include "src/backend/data/compiler/dataset_compile_progress.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
-#include "src/backend/data/benchmark/detail/benchmark_progress.h"
 namespace mmltk::backend::data::benchmark_internal {
+struct NormalizedAnnotationIndex;
+class ProgressReporter;
+class BenchmarkCompilePipeline;
 struct QuarantinedImage {
  BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
  std::uint64_t image_id = 0U;
