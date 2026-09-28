@@ -15,6 +15,8 @@
 #include <functional>
 #include <optional>
 #include <span>
+#include <stop_token>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +25,7 @@ namespace mmltk::backend::data::benchmark_internal {
 class BenchmarkCompilePipeline;
 class StorageReservationPool;
 class CoconutMaskRecovery;
+class CoconutRecoveryOriginals;
 struct CoconutCompletionFacts {
  CoconutEdition edition = CoconutEdition::Base;
  CoconutImageNamespace source = CoconutImageNamespace::CocoTrain;
@@ -41,12 +44,17 @@ struct CoconutComponentMetadata {
  std::string input_identity;
  std::uint32_t recovery_policy = 0;
  std::string original_annotation_identity;
+ // Compile-local annotation lineage; persisted input_identity seals this plus physical dependencies.
+ std::string annotation_input_identity;
+ std::uint64_t original_generation = 0;
 };
 class CoconutComponent final {
 public:
  [[nodiscard]] CoconutEdition edition() const noexcept;
  [[nodiscard]] CoconutImageNamespace source() const noexcept;
  [[nodiscard]] const std::string& input_identity() const noexcept;
+ [[nodiscard]] std::string image_input_identity(std::size_t) const;
+ [[nodiscard]] bool matches_inputs(std::string_view, const CoconutPhysicalMembership&, const CoconutMaskRecovery*, bool current_physical = true) const;
  [[nodiscard]] std::uint32_t recovery_policy() const noexcept;
  [[nodiscard]] std::string_view original_annotation_identity() const noexcept;
  [[nodiscard]] const NormalizedAnnotationReadView& index() const noexcept { return index_; }
@@ -74,6 +82,7 @@ private:
  bool membership_ = false;
 };
 struct CoconutComponentBuilder : CoconutComponentMetadata {
+ std::uint64_t source_segment_begin = 0;
  NormalizedAnnotationBuilder index;
  std::vector<CoconutRecoveryImage> recovery;
  std::vector<CoconutInventoryImage> inventory;
@@ -110,6 +119,9 @@ struct CoconutAnnotationRecords {
  // Commit group-local segment ordinals in catalog order after every group settles.
  void rebase_parquet_segments();
  std::vector<CoconutRecord> records;
+ // Completed native images align with canonical source row positions. They
+ // survive a physical retry, never annotation replacement or final assembly.
+ std::vector<std::shared_ptr<const CoconutComponentBuilder>> normalized;
  std::shared_ptr<BenchmarkArchive> archive;
  std::shared_ptr<CoconutParquetMetadata> parquet;
  std::vector<CoconutRecordGroup> groups;
@@ -137,7 +149,21 @@ struct CoconutAnnotationInput {
 using CoconutRecordConsumer = std::function<void(std::size_t group, const CoconutRecord&, const CoconutAnnotationInput&)>;
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
  const CoconutRecordConsumer& consumer, bool metadata_only = false, BenchmarkCompilePipeline* execution = nullptr, const std::function<void(std::size_t)>& retire_consumer_scratch = {}, const BenchmarkAllowance& parent = {}, CoconutPhysicalInputRequirement physical_input = {}, CoconutAnnotationRecords* retained = nullptr,
- const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace = {}, const std::function<void(const BenchmarkAllowance&)>& retire_consumer_input = {});
+ const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace = {}, const std::function<void(const BenchmarkAllowance&)>& retire_consumer_input = {},
+ const std::function<void(const std::function<void()>&)>& settle_consumer = {});
+class CoconutOriginalChanged final : public std::runtime_error {
+public:
+ explicit CoconutOriginalChanged(CoconutImageNamespace source) : std::runtime_error("COCONut original annotation generation changed"), source_(source) {}
+ [[nodiscard]] CoconutImageNamespace source() const noexcept { return source_; }
+private:
+ CoconutImageNamespace source_;
+};
+struct CoconutOriginalInput {
+ std::shared_ptr<const CoconutRecoveryOriginals> originals;
+ bool terminal = false;
+ std::uint64_t generation = 0;
+};
+using CoconutOriginalProvider = std::function<CoconutOriginalInput(CoconutImageNamespace, bool wait, std::stop_token)>;
 struct CoconutImportRequest {
  BenchmarkCompilePipeline* execution = nullptr;
  BenchmarkAllowance parent_allowance;
@@ -146,6 +172,7 @@ struct CoconutImportRequest {
  bool metadata_only = false;
  std::shared_ptr<CoconutAnnotationRecords> records;
  std::span<const CoconutImageNamespace> retained_sources;
+ std::span<const CoconutComponent> reusable_images;
  std::vector<std::filesystem::path> parquet_shards;
  std::filesystem::path annotation_json;
  std::filesystem::path mask_archive;
@@ -153,14 +180,16 @@ struct CoconutImportRequest {
  const CoconutPhysicalMembership* physical_membership = nullptr;
  // Synchronous borrow; the owner and its original indexes outlive import.
  CoconutMaskRecovery* recovery = nullptr;
+ CoconutOriginalProvider originals;
  std::uint64_t expected_rows = 0;
  CoconutImportLimits limits;
  mmltk::common::concurrency::CancellationObservation cancellation;
  std::function<void(std::uint64_t)> progress;
  // Synchronous observation of discarded objects; report failures never reject an image.
- std::function<void(const CoconutPhysicalImage&, const CoconutRecord&, const CoconutSegment&, std::string_view)> rejected_object;
+ std::function<void(const CoconutPhysicalImage&, const CoconutRecord&, const CoconutSegment&, std::string_view, std::uint32_t recovery_policy)> rejected_object;
 };
-[[nodiscard]] std::string coconut_component_input_identity(std::string_view base, CoconutImageNamespace, const CoconutMaskRecovery*);
+[[nodiscard]] std::string coconut_component_input_identity(std::string_view base, CoconutImageNamespace, const CoconutMaskRecovery*, const CoconutPhysicalMembership* = nullptr, CoconutEdition = CoconutEdition::Base, std::span<const CoconutInventoryImage> = {}, bool current = true);
+[[nodiscard]] std::string coconut_image_input_identity(std::string_view annotations, const CoconutPhysicalImage&, std::string_view originals);
 // Every offered record is required. Unknown expected_rows means derive, never sample.
 [[nodiscard]] std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequest& request);
 // Removes only XL rows covered by Large, retaining B and all namespace distinctions.
@@ -172,5 +201,5 @@ void admit_coconut_component(const CoconutComponent&, mmltk::common::concurrency
 [[nodiscard]] std::uint64_t coconut_component_storage_bytes(const CoconutComponent&);
 void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component, mmltk::common::concurrency::CancellationObservation cancellation = {}, StorageReservationPool* storage = nullptr);
 [[nodiscard]] std::optional<CoconutComponent> load_coconut_component(
- const std::filesystem::path& index_path, CoconutEdition edition, CoconutImageNamespace source, std::string_view input_identity, mmltk::common::concurrency::CancellationObservation cancellation = {}, bool metadata_only = false);
+ const std::filesystem::path& index_path, CoconutEdition edition, CoconutImageNamespace source, std::string_view input_identity, mmltk::common::concurrency::CancellationObservation cancellation = {}, bool metadata_only = false, const CoconutPhysicalMembership* = nullptr, const CoconutMaskRecovery* = nullptr, bool allow_changed_physical = false);
 }  // namespace mmltk::backend::data::benchmark_internal

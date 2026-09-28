@@ -6,12 +6,6 @@
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data::dataset {
 using mmltk::common::math::checked_cast;
-void fill_center_scale_lookup(const std::span<std::uint32_t> lookup, const std::uint32_t target_extent, const std::uint32_t source_extent, const char* overflow_context) {
- const std::uint64_t target_twice = static_cast<std::uint64_t>(2U) * target_extent;
- for (std::uint32_t index = 0U; index < target_extent; ++index) {
-  lookup[index] = std::min<std::uint32_t>(source_extent - 1U, checked_cast<std::uint32_t>(((static_cast<std::uint64_t>(2U) * index + 1U) * source_extent) / target_twice, overflow_context));
- }
-}
 namespace {
 [[nodiscard]] std::size_t checked_pixel_count(const MaskDimensions dimensions) {
  if (dimensions.width == 0U || dimensions.height == 0U || dimensions.width > std::numeric_limits<std::size_t>::max() / dimensions.height) { throw std::runtime_error("mask dimensions are invalid"); }
@@ -43,31 +37,6 @@ void include_row_major_mask_run(RowMajorMaskBounds* bounds, const std::size_t be
   bounds->max_x = width;
  }
 }
-namespace {
-void prepare_lookup(const MaskDimensions source, const std::uint32_t width, const std::uint32_t height, MaskResizeScratch* scratch) {
- if (scratch->lookup_source.width == source.width && scratch->lookup_source.height == source.height && scratch->lookup_width == width && scratch->lookup_height == height) { return; }
- scratch->lookup_source = source;
- scratch->lookup_width = width;
- scratch->lookup_height = height;
- scratch->source_x.resize(width);
- scratch->source_y.resize(height);
- fill_center_scale_lookup(scratch->source_x, width, source.width, "scaled mask x overflow");
- fill_center_scale_lookup(scratch->source_y, height, source.height, "scaled mask y overflow");
-}
-void clear_padding(std::vector<std::uint8_t>* target, const MaskDimensions dimensions, const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
- const std::size_t top = static_cast<std::size_t>(letterbox.offset_y) * dimensions.width;
- std::fill_n(target->data(), top, std::uint8_t{0U});
- const std::uint32_t right = dimensions.width - letterbox.offset_x - letterbox.resized_width;
- for (std::uint32_t row = 0U; row < letterbox.resized_height; ++row) {
-  std::uint8_t* output = target->data() + static_cast<std::size_t>(letterbox.offset_y + row) * dimensions.width;
-  std::fill_n(output, letterbox.offset_x, std::uint8_t{0U});
-  std::fill_n(output + letterbox.offset_x + letterbox.resized_width, right, std::uint8_t{0U});
- }
- const std::uint32_t content_end = letterbox.offset_y + letterbox.resized_height;
- const std::size_t bottom = static_cast<std::size_t>(dimensions.height - content_end) * dimensions.width;
- std::fill_n(target->data() + static_cast<std::size_t>(content_end) * dimensions.width, bottom, std::uint8_t{0U});
-}
-}  // namespace
 EncodedRowMajorMask encode_dense_row_major_mask(const std::span<const std::uint8_t> dense, const MaskDimensions dimensions) {
  const std::size_t pixels = checked_pixel_count(dimensions);
  if (dense.size() != pixels) { throw std::runtime_error("dense mask size does not match its dimensions"); }
@@ -140,32 +109,89 @@ void materialize_row_major_mask(const std::span<const RLEPair> pairs, const Mask
   previous_end = end;
  }
 }
-EncodedRowMajorMask resize_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions source_dimensions, const MaskDimensions target_dimensions,
- const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch, RowMajorMaskBounds* source_bounds) {
+RowMajorMaskBounds append_resized_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions source_dimensions, const MaskDimensions target_dimensions,
+ const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch, std::vector<RLEPair>& output, RowMajorMaskBounds* source_bounds) {
  if (scratch == nullptr || letterbox.resized_width == 0U || letterbox.resized_height == 0U || letterbox.resized_width > target_dimensions.width ||
      letterbox.resized_height > target_dimensions.height || letterbox.offset_x > target_dimensions.width - letterbox.resized_width ||
      letterbox.offset_y > target_dimensions.height - letterbox.resized_height) {
   throw std::invalid_argument("mask resize parameters are invalid");
  }
- if (pairs.empty()) { return {}; }
- inspect_row_major_mask(pairs, source_dimensions, source_bounds, nullptr);
- scratch->target_mask.resize(checked_pixel_count(target_dimensions));
- clear_padding(&scratch->target_mask, target_dimensions, letterbox);
- prepare_lookup(source_dimensions, letterbox.resized_width, letterbox.resized_height, scratch);
- std::size_t run = 0U;
- for (std::uint32_t y = 0U; y < letterbox.resized_height; ++y) {
-  std::uint8_t* target = scratch->target_mask.data() + static_cast<std::size_t>(letterbox.offset_y + y) * target_dimensions.width + letterbox.offset_x;
-  if (y != 0U && scratch->source_y[y] == scratch->source_y[y - 1U]) {
-   std::copy_n(target - target_dimensions.width, letterbox.resized_width, target);
-   continue;
+ if (pairs.empty()) return {};
+ const auto pixels = checked_pixel_count(source_dimensions);
+ (void)checked_pixel_count(target_dimensions);
+ const auto output_begin = output.size();
+ RowMajorMaskBounds source, target;
+ // First target coordinate whose nearest-center source coordinate is >= bound.
+ // The wide intermediate covers every pair of uint32_t dimensions exactly.
+ const auto inverse = [](std::uint32_t bound, std::uint32_t source, std::uint32_t target) {
+  const auto numerator = static_cast<__uint128_t>(2) * target * bound;
+  if (numerator <= source) return std::uint32_t{0};
+  const auto denominator = std::uint64_t{2} * source;
+  return static_cast<std::uint32_t>(std::min<__uint128_t>(target, (numerator - source + denominator - 1) / denominator));
+ };
+ const auto append = [&](std::uint64_t begin, std::uint64_t end) {
+  if (begin == end) return;
+  const auto start = checked_cast<std::uint32_t>(begin, "mask run start overflow");
+  const auto length = checked_cast<std::uint32_t>(end - begin, "mask run length overflow");
+  if (output.size() > output_begin && std::uint64_t{output.back().start} + output.back().length == begin)
+   output.back().length = checked_cast<std::uint32_t>(end - output.back().start, "mask run length overflow");
+  else output.push_back({start, length});
+  include_row_major_mask_run(&target, begin, end, target_dimensions.width);
+ };
+ scratch->intervals.clear();
+ std::uint32_t pending_row = 0;
+ const auto slab = [&](std::uint32_t first, std::uint32_t last, std::span<const std::pair<std::uint32_t, std::uint32_t>> intervals) {
+  if (first == last || intervals.empty()) return;
+  first += letterbox.offset_y;
+  last += letterbox.offset_y;
+  if (intervals.size() == 1 && intervals.front().first == 0 && intervals.front().second == target_dimensions.width) {
+   append(std::uint64_t{first} * target_dimensions.width, std::uint64_t{last} * target_dimensions.width);
+   return;
   }
-  const auto row = static_cast<std::size_t>(scratch->source_y[y]) * source_dimensions.width;
-  for (std::uint32_t x = 0U; x < letterbox.resized_width; ++x) {
-   const auto pixel = row + scratch->source_x[x];
-   while (run < pairs.size() && static_cast<std::size_t>(pairs[run].start) + pairs[run].length <= pixel) ++run;
-   target[x] = static_cast<std::uint8_t>(run < pairs.size() && pairs[run].start <= pixel);
+  for (auto y = first; y < last; ++y)
+   for (const auto [begin, end] : intervals) append(std::uint64_t{y} * target_dimensions.width + begin, std::uint64_t{y} * target_dimensions.width + end);
+ };
+ const auto flush = [&] {
+  slab(inverse(pending_row, source_dimensions.height, letterbox.resized_height), inverse(pending_row + 1, source_dimensions.height, letterbox.resized_height), scratch->intervals);
+  scratch->intervals.clear();
+ };
+ const auto partial = [&](std::uint32_t row, std::uint32_t begin, std::uint32_t end) {
+  if (row != pending_row) { flush(); pending_row = row; }
+  const auto first = inverse(begin, source_dimensions.width, letterbox.resized_width) + letterbox.offset_x;
+  const auto last = inverse(end, source_dimensions.width, letterbox.resized_width) + letterbox.offset_x;
+  if (first == last) return;
+  if (!scratch->intervals.empty() && first == scratch->intervals.back().second) scratch->intervals.back().second = last;
+  else scratch->intervals.emplace_back(first, last);
+ };
+ const bool identity = source_dimensions.width == target_dimensions.width && source_dimensions.height == target_dimensions.height &&
+  letterbox.resized_width == source_dimensions.width && letterbox.resized_height == source_dimensions.height && !letterbox.offset_x && !letterbox.offset_y;
+ std::uint64_t previous_end = 0;
+ try {
+  for (const auto run : pairs) {
+   const auto end = std::uint64_t{run.start} + run.length;
+   if (!run.length || run.start < previous_end || end > pixels) throw std::runtime_error("row-major mask contains an invalid run");
+   previous_end = end;
+   include_row_major_mask_run(&source, run.start, end, source_dimensions.width);
+   if (identity) { append(run.start, end); continue; }
+   auto row = run.start / source_dimensions.width;
+   auto x = run.start % source_dimensions.width;
+   auto remaining = std::uint64_t{run.length};
+   if (x) {
+    const auto count = static_cast<std::uint32_t>(std::min(remaining, std::uint64_t{source_dimensions.width - x}));
+    partial(row, x, x + count); remaining -= count; ++row;
+   }
+   const auto rows = static_cast<std::uint32_t>(remaining / source_dimensions.width);
+   if (rows) {
+    flush();
+    const std::pair<std::uint32_t, std::uint32_t> full{letterbox.offset_x, letterbox.offset_x + letterbox.resized_width};
+    slab(inverse(row, source_dimensions.height, letterbox.resized_height), inverse(row + rows, source_dimensions.height, letterbox.resized_height), std::span(&full, 1));
+    row += rows; remaining %= source_dimensions.width;
+   }
+   if (remaining) partial(row, 0, static_cast<std::uint32_t>(remaining));
   }
- }
- return encode_dense_row_major_mask(scratch->target_mask, target_dimensions);
+  if (!identity) flush();
+ } catch (...) { output.resize(output_begin); throw; }
+ if (source_bounds) *source_bounds = source;
+ return target;
 }
 }  // namespace mmltk::backend::data::dataset

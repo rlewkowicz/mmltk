@@ -91,7 +91,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
    coco_cache.settle(std::move(annotation_downloads.at(catalog.coco_annotations.artifact_id)), progress, parse_workers, completed, kIndexCount);
    completed_indexes.fetch_add(completed - before);
   }
-  coco_indexes_result = coco_cache.take_indexes();
+  coco_indexes_result = coco_cache.finish();
  };
  const auto prepare_objects = [&] {
   auto lease = acquire_lifecycle("objects365-annotations.lifecycle.lock");

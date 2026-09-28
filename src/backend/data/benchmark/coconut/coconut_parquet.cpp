@@ -245,7 +245,9 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
   const auto length = end - begin;
   if (png.empty() || png.size() > limits.max_png_bytes || length < 0 || static_cast<std::uint64_t>(length) > limits.max_segments) malformed("record exceeds PNG/segment admission");
   if (row_ordinal >= retained.size()) malformed("retained image row join");
-  record = std::move(retained[static_cast<std::size_t>(row_ordinal)]);
+  // Canonical row metadata survives a failed physical join or cancellation
+  // partway through this batch. Completed native chunks use the same positions.
+  record = retained[static_cast<std::size_t>(row_ordinal)];
   if (integer(annotation_fields.get<&CoconutParquetAnnotation::image_id>(), row, "image_id") != record.image_id) malformed("image_id join");
   const auto annotation_file = text(annotation_fields.get<&CoconutParquetAnnotation::file_name>(), row, "file_name");
   if (std::filesystem::path(record.file_name).stem() != std::filesystem::path(annotation_file).stem() || std::filesystem::path(annotation_file).extension() != ".png")
@@ -362,7 +364,8 @@ void CoconutAnnotationRecords::rebase_parquet_segments() {
 }
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
  const CoconutRecordConsumer& consumer, bool metadata_only, BenchmarkCompilePipeline* execution, const std::function<void(std::size_t)>& retire_consumer_scratch, const BenchmarkAllowance& parent, CoconutPhysicalInputRequirement physical_input, CoconutAnnotationRecords* retained,
- const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace, const std::function<void(const BenchmarkAllowance&)>& retire_consumer_input) {
+ const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace, const std::function<void(const BenchmarkAllowance&)>& retire_consumer_input,
+ const std::function<void(const std::function<void()>&)>& settle_consumer) {
  using mmltk::common::math::checked_add;
  using mmltk::common::math::checked_multiply;
  CoconutAnnotationRecords local;
@@ -496,7 +499,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      struct RetireConsumer {
       const std::function<void(std::size_t)>& callback; std::size_t group; bool pending = true;
       void finish() { if (std::exchange(pending, false) && callback) callback(group); }
-      ~RetireConsumer() { finish(); }
+      ~RetireConsumer() { if (pending) try { finish(); } catch (...) {} }
      } retire{retire_consumer_scratch, group_index};
      const auto cpu = [&](const std::function<void()>& work) { if (execution) execution->run(image_pass ? BenchmarkStage::Metadata : BenchmarkStage::Normalize, {}, [&](std::size_t) { work(); }, allowance); else work(); };
      if (sequence.shard != position.shard) {
@@ -531,6 +534,12 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      if (!image_pass) group.segments = segment_ordinal;
      batches.reset();
      retire.finish();
+     // A ready independent recovery batch cannot borrow an arbitrary callback's
+     // reader promise. At this settled group boundary pressure may release the
+     // actual reader/pool before reacquiring the next group's complete envelope.
+     // Footer and row/group cursors survive; no consumed rows are replayed.
+     if (execution && execution->resource_pressure()) sequence.close();
+     if (settle_consumer) settle_consumer([&] { sequence.close(); });
     } catch (const ParquetFormatError& error) { throw std::runtime_error("COCONut Parquet " + shard.path.string() + ": " + error.what()); }
    };
    for (auto group = begin; group < end; ++group) {

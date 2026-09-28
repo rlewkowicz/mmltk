@@ -12,11 +12,15 @@
 #include <span>
 #include <stdexcept>
 #include <utility>
+#include <string_view>
+#include "src/backend/imaging/resample/image_resize.h"
 namespace mmltk::backend::data::benchmark_internal {
 class BenchmarkCurl;
 class BenchmarkResourceWait;
 class BenchmarkSplitWriter;
 struct PreparedBenchmarkSplit;
+struct BenchmarkLabelChunk;
+class NormalizedAnnotationReadView;
 class StorageReservationPool;
 // Only runnable CPU work enters this owner. Source controllers retain their I/O,
 // locks and dependency waits outside its lanes. Stages are scheduling policy,
@@ -118,6 +122,13 @@ public:
  [[nodiscard]] std::optional<BenchmarkImageGeometry> geometry(const std::filesystem::path&, std::uint64_t) const;
  // Withdraw admission first, join only this source, then clear affected facts.
  // Unrelated source tasks and completed products continue to be usable.
+ // The normalized owner remains alive for this synchronous image handoff.
+ // Geometry joins in ImageState; independent pixels need not finish first.
+ void labels_ready(const BenchmarkSourcePublication&, std::uint64_t, const NormalizedAnnotationReadView&, std::size_t,
+  std::string_view dependency, std::uint64_t original_generation = 0, const BenchmarkAllowance& = {});
+ [[nodiscard]] std::shared_ptr<const BenchmarkLabelChunk> take_image_labels(const std::filesystem::path&, std::uint64_t, std::string_view dependency);
+ void original_generation(const std::filesystem::path&, std::uint64_t, bool withdrawn);
+ void label_configuration(std::uint32_t, mmltk::backend::imaging::resample::ImageResizeMode);
  void retire_source(const std::filesystem::path&);
  void drain();
  // Explicit borrower boundary for construction before recipe/writer owners.

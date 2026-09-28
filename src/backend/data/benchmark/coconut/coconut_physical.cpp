@@ -9,6 +9,8 @@
 #include "src/backend/data/benchmark/detail/benchmark_recipe.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/common/io/file_memory.h"
+#include "src/common/io/file_digest.h"
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -108,6 +110,7 @@ struct CoconutPhysicalMembership::Impl {
  struct PhysicalRoute { AdmittedRecipeArchive* archive; BenchmarkArchive::MemberPosition locator; std::uint64_t position; bool consumed = false, conflict = false; };
  struct PhysicalSource {
   std::vector<AdmittedRecipeArchive*> archives;
+  std::unordered_map<std::uint16_t, AdmittedRecipeArchive*> artifacts;
   std::size_t next = 0;
   std::unordered_map<std::uint64_t, PhysicalRoute> members;
   // One forward discovery cursor per shard, referencing the authoritative
@@ -154,6 +157,7 @@ struct CoconutPhysicalMembership::Impl {
      if (std::ranges::find(shards, archive.origin.shard) == shards.end()) continue;
     }
     source.archives.push_back(&archive);
+    if (!source.artifacts.emplace(archive.origin.shard, &archive).second) invalid("duplicate physical shard in release catalog");
    }
   }
   for (auto& [edition, state] : releases) (void)requirement(state);
@@ -312,6 +316,44 @@ bool CoconutPhysicalMembership::eligible(CoconutEdition edition, const AdmittedR
  if (release == impl_->releases.end()) return false;
  const auto source = release->second.sources.find(archive.origin.source);
  return source != release->second.sources.end() && std::ranges::find(source->second.archives, &archive) != source->second.archives.end();
+}
+std::string CoconutPhysicalMembership::dependency_identity(CoconutEdition edition, CoconutImageNamespace source, std::span<const CoconutInventoryImage> images, bool current) const {
+ nlohmann::json tuples = nlohmann::json::array();
+ std::map<std::uint16_t, std::string_view> used;
+ for (const auto& image : images) {
+  const auto [entry, inserted] = used.emplace(image.physical.shard, image.physical.archive_identity);
+  if (!inserted && entry->second != image.physical.archive_identity) invalid("component mixes physical artifact generations");
+ }
+ const auto release = impl_->releases.find(edition);
+ if (release != impl_->releases.end()) {
+  const auto found = release->second.sources.find(source);
+  if (found != release->second.sources.end()) for (const auto* archive : found->second.archives)
+   if (images.empty() || used.contains(archive->origin.shard)) tuples.push_back({archive->origin.artifact.artifact_id, archive->origin.shard,
+    current || images.empty() ? std::string_view(archive->download.identity) : used.at(archive->origin.shard)});
+ } else {
+  // Standalone import fixtures have admitted physical members rather than a
+  // download catalog. Sort the distinct shard identities deterministically.
+  std::set<std::pair<std::uint16_t, std::string>> shards;
+  const auto found = impl_->namespaces.find(source);
+  if (found != impl_->namespaces.end()) for (const auto& [id, image] : found->second) { (void)id; if (images.empty() || used.contains(image->shard)) shards.emplace(image->shard, current || images.empty() ? image->archive_identity : std::string(used.at(image->shard))); }
+  for (const auto& [shard, identity] : shards) tuples.push_back({shard, identity});
+ }
+ return nlohmann::json{{"domain", "coconut-physical-artifacts-v1"}, {"edition", edition}, {"source", source}, {"artifacts", std::move(tuples)}}.dump();
+}
+BenchmarkSourcePublication CoconutPhysicalMembership::label_publication(CoconutEdition edition, const CoconutPhysicalImage& physical) const {
+ if (!impl_->execution) return {};
+ auto& release = impl_->releases.at(edition);
+ const std::lock_guard lock(release.mutex);
+ const auto& source = release.sources.at(physical.source);
+ const auto found = source.artifacts.find(physical.shard);
+ if (found == source.artifacts.end()) throw CoconutPhysicalMembershipError(edition, physical.image_id, "normalized image has no admitted physical dependency");
+ const auto& archive = *found->second;
+ if (archive.origin.shard != physical.shard || archive.download.identity != physical.archive_identity)
+  throw CoconutPhysicalMembershipError(edition, physical.image_id, "normalized image physical dependency retired");
+ const auto root = impl_->cache->source_images(benchmark_source_name(archive.origin.artifact.source)) / archive.origin.cache_shard;
+ // Native support owns its bytes. Retain the existing generation/attempt ticket,
+ // without extending the retired physical reader's descriptor or lock custody.
+ return impl_->execution->source_publication(root, {}, physical.image_id);
 }
 void CoconutPhysicalMembership::withdraw(const AdmittedRecipeArchive& archive) {
  for (auto& [edition, state] : impl_->releases) {

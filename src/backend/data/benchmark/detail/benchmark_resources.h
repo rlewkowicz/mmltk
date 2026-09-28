@@ -49,6 +49,9 @@ public:
  // Accounting waits for any remaining CPU frames and stable offer scope to
  // settle; the request never releases physical storage on the owner's behalf.
  void retire_workspace() const noexcept;
+ // A settled producer may return its unused continuation while retaining its
+ // actual open files. Every continuation child must already have returned.
+ void retire_continuation() const;
  // After physically closing this owner's files and completing its descriptor
  // production, return its draw and unused promises. Published consumers must
  // already own their continuation. Live child returns pass through this retired

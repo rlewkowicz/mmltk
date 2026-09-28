@@ -179,14 +179,35 @@ CocoAnnotationCache::CocoAnnotationCache(const BenchmarkCacheLayout& cache, cons
  indexes_.train_path = cache.source_indexes("coco") / "train2017.normalized.bin";
  indexes_.validation_path = cache.source_indexes("coco") / "val2017.normalized.bin";
 }
+void CocoAnnotationCache::publish_split(bool training, bool terminal) {
+ if (split_sink_) split_sink_({training, split_generations_[training ? 0 : 1], terminal, training ? indexes_.train : indexes_.validation});
+}
+void CocoAnnotationCache::withdraw_split(bool training) {
+ (training ? indexes_.train : indexes_.validation).reset();
+ ++split_generations_[training ? 0 : 1];
+ publish_split(training, false);
+}
 void CocoAnnotationCache::discover(ProgressReporter& progress) {
- if (selection_.train != CocoSplitAdmission::Unselected) {
-  progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Validating cached COCO train annotation index");
-  indexes_.train = discover_cached_index(indexes_.train_path, BenchmarkDatasetSource::kCoco2017, "train2017", cancellation_, trace_);
+ std::array<std::future<void>, 2> readers;
+ for (const bool training : {true, false}) {
+  if ((training ? selection_.train : selection_.validation) == CocoSplitAdmission::Unselected) continue;
+  readers[training ? 0 : 1] = std::async(std::launch::async, [&, training] {
+   progress.source_activity(BenchmarkDatasetSource::kCoco2017, training ? "Validating cached COCO train annotation index" : "Validating cached COCO validation annotation index");
+   auto& index = training ? indexes_.train : indexes_.validation;
+   const auto read = [&](std::size_t) { index = discover_cached_index(training ? indexes_.train_path : indexes_.validation_path,
+    BenchmarkDatasetSource::kCoco2017, training ? "train2017" : "val2017", cancellation_, trace_); };
+   if (execution_) {
+    auto input = execution_->reserve(BenchmarkResources::handles(1), lease_->allowance());
+    execution_->run(BenchmarkStage::Metadata, {}, read, input);
+   } else read(0);
+   if (index) publish_split(training, true);
+  });
  }
- progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Validating cached COCO validation annotation index");
- if (selection_.validation != CocoSplitAdmission::Unselected)
-  indexes_.validation = discover_cached_index(indexes_.validation_path, BenchmarkDatasetSource::kCoco2017, "val2017", cancellation_, trace_);
+ std::exception_ptr failure;
+ for (auto& reader : readers) if (reader.valid()) {
+  try { reader.get(); } catch (...) { if (!failure) failure = std::current_exception(); }
+ }
+ if (failure) std::rethrow_exception(failure);
  indexes_.cache_hit =
   (selection_.train == CocoSplitAdmission::Unselected || indexes_.train.has_value()) && (selection_.validation == CocoSplitAdmission::Unselected || indexes_.validation.has_value());
  if (!indexes_.cache_hit) pending_ = request_;
@@ -212,6 +233,7 @@ void CocoAnnotationCache::build_split(bool training, const std::string& digest, 
    throw AnnotationSourceUnavailable(error.what());
   }
  }, storage_, execution_, lease_->allowance());
+ publish_split(training, true);
 }
 void CocoAnnotationCache::invalidate_missing() {
  for (const bool training : {true, false}) {
@@ -266,15 +288,16 @@ void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progr
   for (const auto& member : members) if (member.failure) failure = member.failure;
   if (!failure) break;
   throw_if_benchmark_cancelled(cancellation_);
-  if (stream_error) {
-   // A consumed transport failure invalidates every newly dependent split of
-   // this attempt, while independently admitted warm indexes remain usable.
+  const auto withdraw_attempt = [&] {
+   // Only splits absent at the beginning of this archive attempt can depend
+   // on its bytes. Joined parsers cannot republish a withdrawn generation.
    for (const bool train : training) {
     auto& index = train ? indexes_.train : indexes_.validation;
-    if (index) { index.reset(); --completed; }
+    if (index) { withdraw_split(train); --completed; }
    }
    invalidate_missing();
-  }
+  };
+  if (stream_error) withdraw_attempt();
   if (attempt == 3) {
    if ((selection_.train == CocoSplitAdmission::Required && !indexes_.train) || (selection_.validation == CocoSplitAdmission::Required && !indexes_.validation)) std::rethrow_exception(failure);
    warn_unavailable(progress); break;
@@ -286,8 +309,14 @@ void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progr
     archive = repair_annotation_artifacts({request_}, BenchmarkDatasetSource::kCoco2017, error.what(), progress, progress.transfers(), workers, cancellation_, trace_, execution_, lease_->allowance(), storage_).front();
    }
   } catch (const BenchmarkDownloadUnavailable& error) { download_unavailable(error, progress); break; }
+  // Successful repair replaces the shared archive even when the consumed
+  // stream was valid and only a sibling parser rejected its member. A valid
+  // newly built sibling must be read from these replacement bytes as well.
+  if (!stream_error) withdraw_attempt();
  }
  pending_.reset();
+ for (const bool training : {true, false})
+  if ((training ? selection_.train : selection_.validation) != CocoSplitAdmission::Unselected && !(training ? indexes_.train : indexes_.validation)) publish_split(training, true);
 }
 void CocoAnnotationCache::warn_unavailable(ProgressReporter& progress) {
  if (warned_unavailable_) return;
@@ -298,9 +327,11 @@ void CocoAnnotationCache::download_unavailable(const BenchmarkDownloadUnavailabl
  throw_if_benchmark_cancelled(cancellation_);
  if ((selection_.train == CocoSplitAdmission::Required && !indexes_.train) || (selection_.validation == CocoSplitAdmission::Required && !indexes_.validation)) throw error;
  pending_.reset();
+ for (const bool training : {true, false})
+  if ((training ? selection_.train : selection_.validation) != CocoSplitAdmission::Unselected && !(training ? indexes_.train : indexes_.validation)) publish_split(training, true);
  warn_unavailable(progress);
 }
-CocoAnnotationIndexes CocoAnnotationCache::take_indexes() {
+CocoAnnotationIndexes CocoAnnotationCache::finish() {
  if (pending_ || (selection_.validation == CocoSplitAdmission::Required && !indexes_.validation) || (selection_.train == CocoSplitAdmission::Required && !indexes_.train))
   throw std::logic_error("COCO annotation indexes are not settled");
  std::uint64_t storage = 0;

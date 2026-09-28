@@ -858,7 +858,8 @@ TEST_CASE("categorical resize agrees exactly with dense nearest-center sampling"
      }
     }
     const auto expected = encode_dense_row_major_mask(target, target_size);
-    const auto actual = resize_row_major_mask(pairs, source_size, target_size, geometry, &scratch, &actual_source);
+    EncodedRowMajorMask actual;
+    actual.bounds = append_resized_row_major_mask(pairs, source_size, target_size, geometry, &scratch, actual.pairs, &actual_source);
     REQUIRE(actual.pairs.size() == expected.pairs.size());
     for (std::size_t i = 0; i < actual.pairs.size(); ++i) {
      CHECK(actual.pairs[i].start == expected.pairs[i].start);
@@ -868,12 +869,46 @@ TEST_CASE("categorical resize agrees exactly with dense nearest-center sampling"
     check_bounds(actual_source, expected_source);
    }
  const auto geometry = compute_image_resize_geometry(11U, 7U, 1U, 1U, ImageResizeMode::Stretch);
+ std::vector<RLEPair> output;
  for (const auto& invalid : std::vector<std::vector<RLEPair>>{{{0U, 1U}, {77U, 1U}}, {{0U, 1U}, {76U, 0U}}, {{0U, 5U}, {4U, 2U}}, {{70U, 8U}}, {{std::numeric_limits<std::uint32_t>::max(), 2U}}})
-  CHECK_THROWS_AS(resize_row_major_mask(invalid, source_size, {1U, 1U}, geometry, &scratch), std::runtime_error);
+  CHECK_THROWS_AS(append_resized_row_major_mask(invalid, source_size, {1U, 1U}, geometry, &scratch, output), std::runtime_error);
  const std::array<RLEPair, 1> valid{{{0U, 1U}}};
- CHECK_THROWS_AS(resize_row_major_mask(valid, source_size, {1U, 1U}, {1U, 1U, std::numeric_limits<std::uint32_t>::max(), 0U}, &scratch), std::invalid_argument);
+ CHECK_THROWS_AS(append_resized_row_major_mask(valid, source_size, {1U, 1U}, {1U, 1U, std::numeric_limits<std::uint32_t>::max(), 0U}, &scratch, output), std::invalid_argument);
  RowMajorMaskBounds sentinel{1U, 2U, 3U, 4U, true};
- CHECK(resize_row_major_mask({}, {}, {1U, 1U}, geometry, &scratch, &sentinel).pairs.empty());
+ CHECK_FALSE(append_resized_row_major_mask({}, {}, {1U, 1U}, geometry, &scratch, output, &sentinel).has_foreground);
+ CHECK(output.empty());
  CHECK(sentinel.min_x == 1U);
  CHECK(sentinel.has_foreground);
+}
+TEST_CASE("interval mask projection appends atomically and handles full slabs", "[backend][data][compiler][mask]") {
+ using namespace mmltk::backend::data::dataset;
+ using namespace mmltk::backend::imaging::resample;
+ MaskResizeScratch scratch;
+ const std::array<RLEPair, 3> adjacent{{{0, 2}, {2, 3}, {7, 1}}};
+ std::vector<RLEPair> output{{11, 2}};
+ const auto identity = compute_image_resize_geometry(4, 2, 4, 2, ImageResizeMode::Stretch);
+ const auto bounds = append_resized_row_major_mask(adjacent, {4, 2}, {4, 2}, identity, &scratch, output);
+ REQUIRE(output.size() == 3);
+ CHECK(output[0].start == 11); CHECK(output[0].length == 2);
+ CHECK(output[1].start == 0); CHECK(output[1].length == 5);
+ CHECK(output[2].start == 7); CHECK(output[2].length == 1);
+ CHECK(bounds.min_x == 0); CHECK(bounds.max_x == 4);
+ CHECK(bounds.min_y == 0); CHECK(bounds.max_y == 2);
+ const auto unchanged = output;
+ RowMajorMaskBounds sentinel{1, 2, 3, 4, true};
+ const std::array<RLEPair, 2> invalid{{{0, 1}, {7, 2}}};
+ const auto one = compute_image_resize_geometry(4, 2, 1, 1, ImageResizeMode::Stretch);
+ CHECK_THROWS(append_resized_row_major_mask(invalid, {4, 2}, {1, 1}, one, &scratch, output, &sentinel));
+ CHECK(std::ranges::equal(output, unchanged, [](auto a, auto b) { return a.start == b.start && a.length == b.length; }));
+ CHECK(sentinel.min_x == 1); CHECK(sentinel.min_y == 2); CHECK(sentinel.has_foreground);
+ const auto empty = append_resized_row_major_mask({}, {}, {1, 1}, one, &scratch, output, &sentinel);
+ CHECK_FALSE(empty.has_foreground); CHECK(output.size() == unchanged.size()); CHECK(sentinel.min_x == 1);
+ // Source-work coverage: neither the full source nor target canvas is visited.
+ const std::array<RLEPair, 1> full{{{0, 1000000000}}};
+ const auto large = compute_image_resize_geometry(1000000, 1000, 2000000, 2000, ImageResizeMode::Stretch);
+ output.clear(); scratch = {};
+ const auto complete = append_resized_row_major_mask(full, {1000000, 1000}, {2000000, 2000}, large, &scratch, output);
+ REQUIRE(output.size() == 1); CHECK(output[0].length == 4000000000U);
+ CHECK(complete.max_x == 2000000); CHECK(complete.max_y == 2000);
+ CHECK(scratch.intervals.capacity() == 0);
 }

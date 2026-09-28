@@ -392,13 +392,13 @@ void IndexingProgressTotals::update(std::size_t release, std::uint64_t completed
  observation.completed = admitted;
  reporter.phase(DatasetCompilePhase::Indexing, completed_, total_);
 }
-void IndexingProgressTotals::invalidate(std::size_t release, ProgressReporter& reporter) {
+void IndexingProgressTotals::invalidate(std::size_t release, ProgressReporter& reporter, std::uint64_t rows) {
  if (!reporter.normalization_observer_enabled()) return;
  const std::lock_guard lock(mutex_);
  auto& observation = releases_.at(release);
- const auto withdrawn = observation.completed;
+ const auto withdrawn = std::min(observation.completed, rows);
  completed_ -= withdrawn;
- observation.completed = 0;
+ observation.completed -= withdrawn;
  reporter.invalidate_indexing(withdrawn);
 }
 void ArtifactProgressTotals::update(const DownloadProgress& update, ProgressReporter& reporter) {

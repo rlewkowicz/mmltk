@@ -102,7 +102,7 @@ public:
  explicit IndexingProgressTotals(std::span<const std::uint64_t> totals);
  void update(std::size_t release, std::uint64_t completed, ProgressReporter& reporter);
  // The replaced importer must have returned or joined before withdrawal.
- void invalidate(std::size_t release, ProgressReporter& reporter);
+ void invalidate(std::size_t release, ProgressReporter& reporter, std::uint64_t rows = UINT64_MAX);
 
 private:
  struct Observation {

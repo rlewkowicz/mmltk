@@ -155,6 +155,16 @@ struct BenchmarkCompilePipeline::Admission {
    parent = parent->parent.get();
   }
  }
+ void return_descriptors(Credits& credit, std::size_t closed, std::size_t unused) noexcept {
+  descriptors -= closed;
+  committed -= unused;
+  const auto returned = std::min(closed + unused, credit.borrowed);
+  credit.borrowed -= returned;
+  committed += returned;
+  return_promise(credit.parent.get(), returned);
+  ++generation;
+  if (transport_wakeup) transport_wakeup();
+ }
  static bool covers(const Credits& credit, BenchmarkResources demand) {
   const auto held = credit.resources;
   return demand.bytes <= held.bytes && demand.descriptors <= held.descriptors && demand.cpu_workers <= held.cpu_workers && (!demand.bytes || demand.retained_handles == held.retained_handles) &&
@@ -383,13 +393,18 @@ struct BenchmarkCompilePipeline::Impl {
  struct Source {
   std::filesystem::path root;
   BenchmarkSourceGeneration generation = 1, counter = 1;
+  std::uint64_t label_generation = 1, label_attempt = 0;
   std::unordered_map<std::uint64_t, BenchmarkSourceGeneration> replacements;
   BenchmarkSourceGeneration image_generation(std::uint64_t id) const { const auto found = replacements.find(id); return found == replacements.end() ? generation : found->second; }
   bool retiring = false;
   std::size_t pending = 0;
   std::unordered_map<std::uint64_t, Slot> slots;
   std::vector<BenchmarkSplitWriter*> writers;
-  struct Geometry { BenchmarkSourceGeneration generation; std::uint32_t width, height; std::shared_ptr<const BenchmarkEncodedImage> input; };
+  struct Geometry {
+   BenchmarkSourceGeneration generation; std::uint32_t width, height; std::shared_ptr<const BenchmarkEncodedImage> input;
+   std::string label_dependency;
+   std::shared_ptr<const BenchmarkLabelChunk> labels;
+  };
   std::unordered_map<std::uint64_t, Geometry> geometry;
  };
  // The sole mutable physical image owner. Scheduler jobs borrow stable slots;
@@ -423,6 +438,8 @@ struct BenchmarkCompilePipeline::Impl {
   std::uint64_t attempt_ = 1;
   bool admitted_ = false;
  };
+ std::uint32_t label_resolution = 0;
+ mmltk::backend::imaging::resample::ImageResizeMode label_resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
  struct IdleScratch {
   BenchmarkSplitWriter* writer = nullptr;
   const std::function<void(std::size_t)>* retire = nullptr;
@@ -585,6 +602,19 @@ void BenchmarkAllowance::retire_workspace() const noexcept {
  }
  owner.changed.notify_all();
 }
+void BenchmarkAllowance::retire_continuation() const {
+ if (!credits_) return;
+ auto& owner = *credits_->owner;
+ {
+  const std::lock_guard lock(owner.mutex);
+  if (credits_->available != credits_->resources.continuation_descriptors)
+   throw std::logic_error("benchmark continuation still has live descriptor children");
+  const auto unused = std::exchange(credits_->available, 0);
+  credits_->resources.continuation_descriptors = 0;
+  owner.return_descriptors(*credits_, 0, unused);
+ }
+ owner.changed.notify_all();
+}
 void BenchmarkAllowance::retire_descriptors() const noexcept {
  if (!credits_) return;
  auto& owner = *credits_->owner;
@@ -594,14 +624,7 @@ void BenchmarkAllowance::retire_descriptors() const noexcept {
   const auto unused = std::exchange(credits_->available, 0);
   credits_->descriptors_retired = true;
   credits_->resources.continuation_descriptors = 0;
-  owner.descriptors -= closed;
-  owner.committed -= unused;
-  const auto returned = std::min(closed + unused, credits_->borrowed);
-  credits_->borrowed -= returned;
-  owner.committed += returned;
-  owner.return_promise(credits_->parent.get(), returned);
-  ++owner.generation;
-  if (owner.transport_wakeup) owner.transport_wakeup();
+  owner.return_descriptors(*credits_, closed, unused);
  }
  owner.changed.notify_all();
 }
@@ -1439,6 +1462,28 @@ void BenchmarkCompilePipeline::Impl::ImageState::retire_source(const std::filesy
  lock.unlock();
  execution.changed.notify_all();
 }
+void BenchmarkCompilePipeline::original_generation(const std::filesystem::path& root, std::uint64_t original_generation, bool withdrawn) {
+ const std::lock_guard lock(impl_->mutex);
+ auto& source = impl_->images.source(root);
+ if (source.label_attempt == impl_->images.attempt() && original_generation < source.label_generation) return;
+ source.label_attempt = impl_->images.attempt();
+ source.label_generation = original_generation;
+ if (withdrawn) for (auto& [id, fact] : source.geometry) { (void)id; fact.labels.reset(); fact.label_dependency.clear(); }
+ impl_->changed.notify_all();
+}
+void BenchmarkCompilePipeline::label_configuration(std::uint32_t resolution, mmltk::backend::imaging::resample::ImageResizeMode mode) {
+ const std::lock_guard lock(impl_->mutex);
+ impl_->label_resolution = resolution; impl_->label_resize_mode = mode;
+}
+std::shared_ptr<const BenchmarkLabelChunk> BenchmarkCompilePipeline::take_image_labels(const std::filesystem::path& root, std::uint64_t id, std::string_view dependency) {
+ const std::lock_guard lock(impl_->mutex);
+ auto& source = impl_->images.source(root);
+ if (source.retiring) return {};
+ const auto found = source.geometry.find(id);
+ if (found == source.geometry.end() || found->second.generation != source.image_generation(id) || found->second.label_dependency != dependency) return {};
+ found->second.label_dependency.clear();
+ return std::move(found->second.labels);
+}
 void BenchmarkCompilePipeline::register_split(BenchmarkSplitWriter& writer, const PreparedBenchmarkSplit& split) { impl_->images.register_split(writer, split, workers()); }
 BenchmarkSourceGeneration BenchmarkCompilePipeline::source_generation(const std::filesystem::path& root) {
  const std::lock_guard lock(impl_->mutex);
@@ -1453,6 +1498,7 @@ void BenchmarkCompilePipeline::retire_source(const std::filesystem::path& root) 
 void BenchmarkCompilePipeline::geometry_ready(const BenchmarkImageGeometry& fact) {
  const std::lock_guard lock(impl_->mutex);
  impl_->images.geometry_ready(impl_->images.source(fact.root), fact.image_id, fact.generation, {fact.width, fact.height});
+ impl_->changed.notify_all();
 }
 std::shared_ptr<const BenchmarkEncodedImage> BenchmarkCompilePipeline::image_input(const std::filesystem::path& root, std::uint64_t id) const {
  const std::lock_guard lock(impl_->mutex);
@@ -1473,6 +1519,47 @@ struct BenchmarkSourcePublication::State {
  bool defer_pixels;
  [[nodiscard]] BenchmarkSourceGeneration image_generation(std::uint64_t id) const { return replacement && replacement->first == id ? replacement->second : generation; }
 };
+void BenchmarkCompilePipeline::labels_ready(const BenchmarkSourcePublication& publication, std::uint64_t id,
+ const NormalizedAnnotationReadView& index, std::size_t image, std::string_view dependency, std::uint64_t original_generation, const BenchmarkAllowance& parent) {
+ if (!publication.state_ || publication.state_->execution.lock() != impl_) return;
+ const auto& ticket = *publication.state_;
+ const auto generation = ticket.image_generation(id);
+ auto& source = *ticket.source;
+ const auto retired = [&] { return impl_->stopping || ticket.attempt != impl_->images.attempt() || source.retiring || generation != source.image_generation(id) ||
+  (original_generation && original_generation != source.label_generation); };
+ std::pair<std::uint32_t, std::uint32_t> dimensions;
+ std::uint64_t label_generation = 0;
+ {
+  std::unique_lock lock(impl_->mutex);
+  if (!impl_->label_resolution) return;
+  // A repaired annotation can introduce an image outside this attempt's
+  // selected work list. Keep its native product for the placement restart;
+  // this attempt cannot produce its geometry.
+  const auto unselected = [&] { return !impl_->membership_pending && !source.slots.contains(id) && !source.geometry.contains(id); };
+  impl_->wait(lock, [&] { return retired() || unselected() || impl_->failure || impl_->cancellation.requested() || source.geometry.contains(id); });
+  if (impl_->failure) std::rethrow_exception(impl_->failure);
+  throw_if_benchmark_cancelled(impl_->cancellation);
+  if (retired() || unselected()) return;
+  label_generation = source.label_generation;
+  const auto& fact = source.geometry.at(id);
+  if (fact.labels && fact.label_dependency == dependency) return;
+  dimensions = {fact.width, fact.height};
+ }
+ dataset::MaskResizeScratch scratch;
+ std::shared_ptr<const BenchmarkLabelChunk> product;
+ run(BenchmarkStage::Labels, {std::uint64_t{index.image(image).width} * 32U + 65536U, 0}, [&](std::size_t) {
+  product = std::make_shared<BenchmarkLabelChunk>(compile_benchmark_image_labels(index, image, dimensions, impl_->label_resolution, impl_->label_resize_mode, scratch, impl_->cancellation));
+  scratch = {};
+ }, parent);
+ {
+  const std::lock_guard lock(impl_->mutex);
+  if (retired() || label_generation != source.label_generation) return;
+  auto& fact = source.geometry.at(id);
+  fact.label_dependency = dependency;
+  fact.labels = std::move(product);
+ }
+ impl_->changed.notify_all();
+}
 BenchmarkSourcePublication BenchmarkCompilePipeline::source_publication(const std::filesystem::path& root, std::shared_ptr<const ArtifactLease> custody, std::optional<std::uint64_t> repaired_image, bool defer_pixels) {
  const std::lock_guard lock(impl_->mutex);
  impl_->check_admission();
@@ -1511,6 +1598,7 @@ void BenchmarkSourcePublication::geometry_ready(std::uint64_t id, std::pair<std:
   const std::lock_guard lock(execution->mutex);
   if (state_->attempt != execution->images.attempt()) return;
   execution->images.geometry_ready(*state_->source, id, state_->image_generation(id), dimensions);
+  execution->changed.notify_all();
  }
 }
 void BenchmarkCompilePipeline::drain() {
@@ -1551,5 +1639,6 @@ void BenchmarkCompilePipeline::retire_attempt() noexcept {
   impl_->failure = {};
   impl_->stopping = false;
  }
+ impl_->changed.notify_all();
 }
 }  // namespace mmltk::backend::data::benchmark_internal

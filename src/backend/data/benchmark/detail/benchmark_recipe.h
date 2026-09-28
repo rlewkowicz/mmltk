@@ -74,6 +74,9 @@ struct CoconutRecipeCatalog {
  std::function<void(CoconutEdition, CoconutReleaseBoundary)> release_observer;
 };
 struct CoconutRecipeInputs;
+// Settle the failed attempt while retaining canonical annotation rows and native
+// image chunks; only chunks depending on the replaced physical artifact retire.
+void retire_coconut_recipe_inputs(const std::shared_ptr<CoconutRecipeInputs>&, const AdmittedRecipeArchive* = nullptr);
 [[nodiscard]] std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, ProgressReporter&, std::size_t,
  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::size_t download_connections = 0, std::span<const int> cpus = {},
  std::function<void(std::exception_ptr)> failed = {}, BenchmarkCompilePipeline* execution = nullptr);
@@ -83,6 +86,7 @@ struct CoconutRecipePreparation {
  std::optional<NormalizedAnnotationIndex> stock_validation;
  bool annotation_cache_hit = true;
  std::uint64_t annotation_storage_bytes = 0;
+ std::uint64_t original_generation = 0;
  std::uint64_t duplicate_xl_images = 0;
  std::uint64_t validation_images = 0;
  nlohmann::json manifest;
@@ -103,7 +107,7 @@ private:
 [[nodiscard]] CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation);
 [[nodiscard]] CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, std::span<const AdmittedRecipeArchive>,
  const CoconutPhysicalMembership&, ProgressReporter&, CoconutFailureReport&, std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&,
- std::span<const CoconutImageNamespace> refreshed_sources = {}, bool metadata_only = false, std::shared_ptr<CoconutRecipeInputs> inputs = {}, BenchmarkCompilePipeline* execution = nullptr, BenchmarkAllowance preparation = {});
+ bool metadata_only = false, std::shared_ptr<CoconutRecipeInputs> inputs = {}, BenchmarkCompilePipeline* execution = nullptr, BenchmarkAllowance preparation = {});
 [[nodiscard]] bool coconut_validation_component(CoconutEdition) noexcept;
 [[nodiscard]] AnnotationSource coconut_annotation_source(CoconutImageNamespace);
 // Same compiler entry with explicit private source catalog, not a second execution path.

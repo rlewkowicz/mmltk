@@ -1,6 +1,7 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <cstddef>
 #include <cstdint>
@@ -17,8 +18,10 @@ struct BenchmarkCacheLayout;
 class BenchmarkCompilePipeline;
 class StorageReservationPool;
 struct CoconutPhysicalImage;
+struct CoconutInventoryImage;
 struct CoconutRecipeCatalog;
 struct CoconutRecord;
+class NormalizedAnnotationReadView;
 struct CoconutPhysicalName {
  CoconutImageNamespace source;
  std::uint64_t id;
@@ -78,10 +81,12 @@ public:
  // another concurrent sequence's reader remains live. Empty means all readers.
  void release_readers(CoconutEdition, const BenchmarkAllowance& producer = {}) const;
  [[nodiscard]] bool eligible(CoconutEdition, const AdmittedRecipeArchive&) const;
+ [[nodiscard]] std::string dependency_identity(CoconutEdition, CoconutImageNamespace, std::span<const CoconutInventoryImage> = {}, bool current = true) const;
  // Invalidates affected routes/joins and their cached input requirement before
  // the compiler mutates the admitted artifact; independent readers survive.
  void withdraw(const AdmittedRecipeArchive&);
  [[nodiscard]] CoconutPhysicalImage resolve(CoconutEdition, std::string_view identity, const CoconutRecord&, const BenchmarkAllowance&) const;
+ [[nodiscard]] BenchmarkSourcePublication label_publication(CoconutEdition, const CoconutPhysicalImage&) const;
  [[nodiscard]] const CoconutPhysicalImage* find(CoconutImageNamespace, std::uint64_t) const noexcept;
 private:
  struct Impl;

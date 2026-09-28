@@ -255,7 +255,8 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
     metadata.flags |= kAnnotationMask;
     parsed_rle = parse_rle(record["mask_rle"].get_ref<const std::string&>());
    }
-   const auto source_bounds = dataset::row_major_mask_bounds(parsed_rle.pairs, source_dims);
+   dataset::RowMajorMaskBounds source_bounds;
+   (void)dataset::append_resized_row_major_mask(parsed_rle.pairs, source_dims, {target_width, target_height}, letterbox, &mask_scratch, instance.rle_pairs, &source_bounds);
    std::array<double, 4> source_box{};
    if (record.contains("bbox_xyxy")) {
     const auto& box = record["bbox_xyxy"];
@@ -303,7 +304,6 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
     instance.bbox[coordinate] = static_cast<float>(scaled);
    }
    if (instance.bbox[2] <= instance.bbox[0] || instance.bbox[3] <= instance.bbox[1]) throw std::runtime_error("transformed bbox loses strict corner ordering");
-   instance.rle_pairs = needs_resize ? dataset::resize_row_major_mask(parsed_rle.pairs, source_dims, {target_width, target_height}, letterbox, &mask_scratch).pairs : std::move(parsed_rle.pairs);
   } catch (const std::exception& error) {
    throw std::runtime_error(std::string(error.what()) + " in " + annotation_file.string() + " at line " + std::to_string(line_number) + " (source " + std::to_string(source_dims.width) + "x" +
                             std::to_string(source_dims.height) + ", target " + std::to_string(target_width) + "x" + std::to_string(target_height) + ")");

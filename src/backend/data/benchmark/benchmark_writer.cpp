@@ -40,6 +40,42 @@ import mmltk.common.logging.profile_utils;
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
 namespace mmltk::backend::data::benchmark_internal {
+BenchmarkLabelChunk compile_benchmark_image_labels(const NormalizedAnnotationReadView& index, std::size_t position,
+ std::pair<std::uint32_t, std::uint32_t> dimensions, std::uint32_t resolution, mmltk::backend::imaging::resample::ImageResizeMode resize_mode,
+ dataset::MaskResizeScratch& scratch, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+ namespace common_math = mmltk::common::math;
+ BenchmarkLabelChunk chunk;
+ const auto& image = index.image(position);
+ const auto [source_width, source_height] = dimensions;
+ chunk.width = source_width; chunk.height = source_height;
+  const bool matching_geometry = index.source == BenchmarkDatasetSource::kOpenImagesV7 || (source_width == image.width && source_height == image.height);
+  const auto box_count = matching_geometry ? image.box_count : 0U;
+  chunk.dropped = image.box_count - box_count;
+  const auto geometry = mmltk::backend::imaging::resample::compute_image_resize_geometry(source_width, source_height, resolution, resolution, resize_mode);
+  chunk.labels.reserve(box_count);
+  for (const auto& box : index.storage().boxes.subspan(common_math::checked_cast<std::size_t>(image.first_box, "box index overflow"), box_count)) {
+   throw_if_benchmark_cancelled(cancel_requested);
+   PackedInstance label = benchmark_canvas_box(box.class_id, box.x1, box.y1, box.x2, box.y2, geometry);
+   label.flags = box.flags;
+   label.annotation_id = box.annotation_id;
+   label.source_category_id = box.source_category_id;
+   label.source_ordinal = box.source_ordinal;
+   label.original_area = box.original_area;
+   if (index.source == BenchmarkDatasetSource::kOpenImagesV7) label.original_area *= static_cast<double>(source_width) * source_height;
+   if (label.bbox_x2 <= label.bbox_x1 || label.bbox_y2 <= label.bbox_y1) throw std::runtime_error("benchmark continuous box is not representable on the compiled canvas");
+   const auto begin = chunk.runs.size();
+   if (box.mask_rle_offset > index.storage().mask_rle_pairs.size() || box.mask_rle_pairs > index.storage().mask_rle_pairs.size() - box.mask_rle_offset)
+    throw std::runtime_error("benchmark source mask range is invalid");
+   const auto source_mask = index.storage().mask_rle_pairs.subspan(static_cast<std::size_t>(box.mask_rle_offset), box.mask_rle_pairs);
+   (void)dataset::append_resized_row_major_mask(source_mask, {image.width, image.height}, {resolution, resolution}, geometry,
+    &scratch, chunk.runs);
+   label.mask_rle_offset = common_math::checked_multiply<decltype(PackedInstance::mask_rle_offset)>(begin, sizeof(RLEPair), "benchmark mask offset overflow");
+   label.mask_rle_pairs = common_math::checked_cast<std::uint16_t>(chunk.runs.size() - begin, "benchmark instance mask run count overflow");
+   chunk.labels.push_back(label);
+  }
+ return chunk;
+}
+
 namespace common_concurrency = mmltk::common::concurrency;
 namespace common_io = mmltk::common::io;
 namespace common_math = mmltk::common::math;

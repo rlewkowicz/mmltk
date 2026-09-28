@@ -7,6 +7,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -42,6 +43,13 @@ struct CocoAnnotationIndexes {
  bool cache_hit = false;
  std::uint64_t retained_storage_bytes = 0;
 };
+struct CocoAnnotationSplit {
+ bool training = false;
+ std::uint64_t generation = 1;
+ bool terminal = false;
+ std::optional<NormalizedAnnotationIndex> index;
+};
+using CocoAnnotationSplitSink = std::function<void(CocoAnnotationSplit)>;
 // Holds the source lifecycle lease from independent discovery through settlement.
 // Callers may acquire other source leases after construction, before discovery.
 [[nodiscard]] BenchmarkResources coco_annotation_resources();
@@ -49,15 +57,22 @@ class CocoAnnotationCache final {
 public:
  CocoAnnotationCache(const BenchmarkCacheLayout&, const CatalogArtifact&, CocoAnnotationRequest, std::uint32_t train_count, std::uint32_t validation_count, int parse_workers,
   mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, BenchmarkCompilePipeline* execution = nullptr, StorageReservationPool* storage = nullptr, std::shared_ptr<ArtifactLease> custody = {});
+ // Installed before discovery; notifications retain immutable admitted backing.
+ // A withdrawal advances generation and reports pending until retries settle.
+ void observe_splits(CocoAnnotationSplitSink sink, std::array<std::uint64_t, 2> generations = {1, 1}) {
+  split_sink_ = std::move(sink); split_generations_ = generations;
+ }
  void discover(ProgressReporter&);
  [[nodiscard]] std::uint64_t completed_indexes() const noexcept;
  [[nodiscard]] const std::optional<DownloadRequest>& pending_download() const noexcept { return pending_; }
  void download_unavailable(const BenchmarkDownloadUnavailable&, ProgressReporter&);
  void settle(DownloadResult, ProgressReporter&, std::size_t workers, std::uint64_t& completed, std::uint64_t total);
- [[nodiscard]] CocoAnnotationIndexes take_indexes();
+ [[nodiscard]] CocoAnnotationIndexes finish();
  [[nodiscard]] const BenchmarkAllowance& allowance() const noexcept { return lease_->allowance(); }
 
 private:
+ void publish_split(bool training, bool terminal);
+ void withdraw_split(bool training);
  void build_split(bool training, const std::string&, ProgressReporter&);
  void invalidate_missing();
  void warn_unavailable(ProgressReporter&);
@@ -75,6 +90,8 @@ private:
  BenchmarkCompilePipeline* execution_ = nullptr;
  StorageReservationPool* storage_ = nullptr;
  CocoAnnotationIndexes indexes_;
+ CocoAnnotationSplitSink split_sink_;
+ std::array<std::uint64_t, 2> split_generations_{1, 1};
  std::optional<DownloadRequest> pending_;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

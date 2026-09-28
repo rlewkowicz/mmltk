@@ -464,11 +464,17 @@ std::span<const RLEPair> rasterize_coco_polygons(const std::vector<std::vector<d
  std::size_t next = 0;
  auto y = edges.empty() ? dimensions.height : edges.front().begin;
  while (next < edges.size() || !scratch.active.empty()) {
-  std::erase_if(scratch.active, [&](auto i) { return edges[i].end <= y; });
-  while (next < edges.size() && edges[next].begin <= y) scratch.active.push_back(next++);
+  bool changed = std::erase_if(scratch.active, [&](auto i) { return edges[i].end <= y; }) != 0;
+  while (next < edges.size() && edges[next].begin <= y) { scratch.active.push_back(next++); changed = true; }
   if (scratch.active.empty()) { if (next == edges.size()) break; y = edges[next].begin; continue; }
-  // Pair crossings within each polygon before unioning polygon support.
-  std::ranges::sort(scratch.active, [&](auto a, auto b) { return edges[a].polygon < edges[b].polygon; });
+  // Polygon membership changes only at edge events, independently of crossing
+  // order inside each polygon. Vertical crossings are constant to that event.
+  if (changed) std::ranges::sort(scratch.active, [&](auto a, auto b) { return edges[a].polygon < edges[b].polygon; });
+  auto slab_end = next < edges.size() ? edges[next].begin : dimensions.height;
+  for (const auto i : scratch.active) {
+   slab_end = std::min(slab_end, edges[i].end);
+   if (edges[i].x1 != edges[i].x2) slab_end = y + 1;
+  }
   scratch.intervals.clear();
   for (std::size_t first = 0; first < scratch.active.size();) {
    const auto polygon = edges[scratch.active[first]].polygon;
@@ -491,8 +497,8 @@ std::span<const RLEPair> rasterize_coco_polygons(const std::vector<std::vector<d
     scratch.intervals.push_back(covered_pixel_span(scratch.intersections[pair], scratch.intersections[pair + 1], dimensions.width));
   }
   merge_mask_intervals(scratch.intervals);
-  append_mask_slab(output, dimensions.width, y, y + 1, scratch.intervals, scratch.output_begin);
-  ++y;
+  append_mask_slab(output, dimensions.width, y, slab_end, scratch.intervals, scratch.output_begin);
+  y = slab_end;
  }
  return std::span(output).subspan(scratch.output_begin);
 }
