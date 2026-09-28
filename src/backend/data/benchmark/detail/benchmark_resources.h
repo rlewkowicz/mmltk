@@ -37,6 +37,13 @@ public:
  [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(credits_); }
  [[nodiscard]] std::uint64_t bytes() const noexcept;
  [[nodiscard]] std::size_t descriptors() const noexcept;
+ // The backing owner calls this only after joining its workers and releasing
+ // its own storage. Aliases keep descriptor commitments; split storage children
+ // keep their separately charged bytes. External CPU capacity retires here too.
+ void retire_workspace() const noexcept;
+ // Partition an already admitted storage envelope, without another ledger
+ // charge. Use before publishing the allowance to readers.
+ [[nodiscard]] BenchmarkAllowance split_storage(std::uint64_t);
 private:
  friend class BenchmarkCompilePipeline;
  explicit BenchmarkAllowance(std::shared_ptr<Credits> value) : credits_(std::move(value)) {}

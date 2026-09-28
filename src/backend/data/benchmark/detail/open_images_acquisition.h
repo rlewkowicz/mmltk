@@ -30,5 +30,7 @@ struct AcquiredOpenImages {
 [[nodiscard]] AcquiredOpenImages acquire_open_images(const BenchmarkCacheLayout& cache, NormalizedAnnotationIndex& index, std::vector<QuarantinedImage>* quarantined,
  mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, const int num_workers, const std::size_t cache_workers, const BenchmarkTraceSink& trace,
  const std::optional<ImageDecodeProbe> decode_probe = std::nullopt, BenchmarkCompilePipeline* execution = nullptr,
- const std::function<std::string(std::uint64_t)>& image_url = {});
+ const std::function<std::string(std::uint64_t)>& image_url = {},
+ // Effect-only observation before a bounded cache worker opens its warm input.
+ const std::function<void(std::uint64_t)>& warm_read = {});
 }  // namespace mmltk::backend::data::benchmark_internal

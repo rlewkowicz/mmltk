@@ -263,9 +263,9 @@ struct CoconutPhysicalMembership::Impl {
       if (descriptor < 0) throw common_io::errno_error("cannot open physical image cache directory", root.string());
       state.directory = common_io::FileHandle(descriptor);
      }
-     std::array<char, 24> relative{}; const auto relative_size = format_cached_image_relative_path(requested_id, relative);
-     write_cached_image_atomically({}, encoded, cancellation, storage, {}, {}, false, state.directory.get(), std::string_view(relative.data(), relative_size));
-     execution->source_publication(root, state.lease).geometry_ready(requested_id, {header.width, header.height});
+     StorageReservationPool destination(root, {}, storage);
+     auto input = BenchmarkEncodedImage::publish(state.directory.get(), requested_id, encoded, header, cancellation, destination, execution, {}, false);
+     execution->source_publication(root, state.lease)({requested_id, std::pair{header.width, header.height}, true, std::move(input)});
      auto& route = source.members.at(requested_id);
      route.consumed = true; route.locator = reader.member_position();
      const auto cursor = source.scanned.find(&archive);

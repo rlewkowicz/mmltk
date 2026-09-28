@@ -95,10 +95,6 @@ private:
  return index;
 }
 }  // namespace
-BenchmarkImageReadError::BenchmarkImageReadError(const std::uint16_t source_index, const std::uint64_t source_image_id, std::string detail)
-    : std::runtime_error("benchmark cached image " + std::to_string(source_image_id) + " cannot be read: " + std::move(detail)), source_index_(source_index), source_image_id_(source_image_id) {}
-std::uint16_t BenchmarkImageReadError::source_index() const noexcept { return source_index_; }
-std::uint64_t BenchmarkImageReadError::source_image_id() const noexcept { return source_image_id_; }
 PackedInstance benchmark_canvas_box(
  const std::uint8_t class_id, const float x1, const float y1, const float x2, const float y2, const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
  if (letterbox.resized_width == 0U || letterbox.resized_height == 0U) { throw std::runtime_error("benchmark box requires a valid letterbox"); }
@@ -111,17 +107,10 @@ PackedInstance benchmark_canvas_box(
  return result;
 }
 struct BenchmarkPixelInput {
- // Reverse destruction order releases mapped bytes and the descriptor before
- // their allowance and finally the physical source mutation lease.
  BenchmarkSourcePublication publication;
- BenchmarkAllowance allowance;
  std::shared_ptr<const BenchmarkEncodedImage> payload;
- common_io::FileHandle file;
- common_io::MappedByteRegion mapping;
- std::span<const std::uint8_t> encoded;
- BenchmarkImageHeader header;
- BenchmarkPixelInput(BenchmarkSourcePublication source, BenchmarkAllowance credits)
-  : publication(std::move(source)), allowance(std::move(credits)) {}
+ BenchmarkPixelInput(BenchmarkSourcePublication source, std::shared_ptr<const BenchmarkEncodedImage> image)
+  : publication(std::move(source)), payload(std::move(image)) {}
 };
 struct BenchmarkSplitWriter::Impl {
  struct Scratch {
@@ -212,49 +201,41 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::si
  if (image_complete(slot)) return {};
  throw_if_benchmark_cancelled(state.cancellation);
  auto& scratch = state.lane_scratch(lane);
- auto input = std::make_shared<BenchmarkPixelInput>(std::move(publication), std::move(allowance));
+ auto input = std::make_shared<BenchmarkPixelInput>(std::move(publication), std::move(payload));
  try {
-  input->payload = std::move(payload);
-  if (input->payload && !input->payload->encoded.empty()) {
-   input->encoded = input->payload->encoded;
-   input->header = input->payload->header;
-  } else {
-  // The mapping and its opened inode survive header admission and queued pixel
-  // work. Header parsing touches only its necessary source bytes; there is no
-  // second payload read, encoded vector, or header validation before decode.
-  {
-   const std::lock_guard lock(state.directory_mutex);
-   if (state.directory_source != image.source_index) {
-    state.directory = {};
-    state.directory_source = std::numeric_limits<std::uint16_t>::max();
-    const auto& root = state.sources.at(image.source_index).root;
-    const int descriptor = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (descriptor < 0) throw common_io::errno_error("cannot open cached benchmark image directory", root.string());
-    state.directory = common_io::FileHandle(descriptor);
-    state.directory_source = image.source_index;
+  if (!input->payload || input->payload->encoded().empty()) {
+   common_io::FileHandle file;
+   {
+    const std::lock_guard lock(state.directory_mutex);
+    if (state.directory_source != image.source_index) {
+     state.directory = {};
+     state.directory_source = std::numeric_limits<std::uint16_t>::max();
+     const auto& root = state.sources.at(image.source_index).root;
+     const int descriptor = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+     if (descriptor < 0) throw common_io::errno_error("cannot open cached benchmark image directory", root.string());
+     state.directory = common_io::FileHandle(descriptor);
+     state.directory_source = image.source_index;
+    }
+    std::array<char, 24> relative{}; (void)format_cached_image_relative_path(image.source_image_id, relative);
+    const int descriptor = ::openat(state.directory.get(), relative.data(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) throw common_io::errno_error("cannot open cached benchmark image", relative.data());
+    file = common_io::FileHandle(descriptor);
    }
-   std::array<char, 24> relative_path{};
-   (void)format_cached_image_relative_path(image.source_image_id, relative_path);
-   const int descriptor = ::openat(state.directory.get(), relative_path.data(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-   if (descriptor < 0) throw common_io::errno_error("cannot open cached benchmark image", relative_path.data());
-   input->file = common_io::FileHandle(descriptor);
+   const CachedImageValidator header = [&](std::uint64_t, std::span<const std::uint8_t> encoded) {
+    return scratch.decoder.read_header(encoded, state.actual_dimensions ? 0 : image.source_width, state.actual_dimensions ? 0 : image.source_height);
+   };
+   input->payload = BenchmarkEncodedImage::open(std::move(file), image.source_image_id, header, state.cancellation, nullptr,
+    std::move(allowance), input->payload, std::numeric_limits<std::uint32_t>::max());
+   if (!input->payload) throw std::runtime_error("cached benchmark image is missing or has an invalid size");
   }
-  throw_if_benchmark_cancelled(state.cancellation);
-  const auto bytes = input->file.size();
-  if (!bytes || bytes > std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("cached benchmark image has an invalid size");
-  void* mapping = ::mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, input->file.get(), 0);
-  if (mapping == MAP_FAILED) throw common_io::errno_error("cannot map cached benchmark image");
-  input->mapping.adopt(mapping, bytes);
-  input->encoded = {static_cast<const std::uint8_t*>(mapping), bytes};
-  input->header = input->payload ? input->payload->header : scratch.decoder.read_header(input->encoded, state.actual_dimensions ? 0 : image.source_width, state.actual_dimensions ? 0 : image.source_height);
-  }
-  if (!state.actual_dimensions && ((image.source_width && image.source_width != input->header.width) || (image.source_height && image.source_height != input->header.height)))
+  const auto& header = input->payload->header();
+  if (!state.actual_dimensions && ((image.source_width && image.source_width != header.width) || (image.source_height && image.source_height != header.height)))
    throw BenchmarkImageError("benchmark image dimensions do not match annotations");
   if (state.image_opened) state.image_opened(state.sources.at(image.source_index).root, image.source_image_id);
   {
    const std::lock_guard lock(state.facts_mutex);
-   image.source_width = input->header.width;
-   image.source_height = input->header.height;
+   image.source_width = header.width;
+   image.source_height = header.height;
    state.header_known[slot] = 1;
   }
  } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
@@ -263,8 +244,8 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::si
  }
  return input;
 }
-BenchmarkAllowance BenchmarkSplitWriter::pixel_input_allowance(const BenchmarkPixelInput& input) const { return input.payload ? input.payload->allowance : BenchmarkAllowance{}; }
-std::uint64_t BenchmarkSplitWriter::pixel_workspace_bytes(const BenchmarkPixelInput& input) const { return pixel_workspace_bytes(input.header, input.payload && input.payload->file_backing ? 0 : input.encoded.size()); }
+BenchmarkAllowance BenchmarkSplitWriter::pixel_input_allowance(const BenchmarkPixelInput& input) const { return input.payload->allowance(); }
+std::uint64_t BenchmarkSplitWriter::pixel_workspace_bytes(const BenchmarkPixelInput& input) const { return pixel_workspace_bytes(input.payload->header(), input.payload->charged_bytes() ? 0 : input.payload->size()); }
 std::uint64_t BenchmarkSplitWriter::pixel_workspace_bytes(const BenchmarkImageHeader& header, std::size_t encoded_bytes) const {
  // Source RGB/CMYK, decoder workspace and conservative perceptual filtering
  // intermediates, plus the mapped source working set. Final mmap pixels are a
@@ -283,11 +264,11 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const
  if (!input || image_complete(slot)) return;
  auto& state = *impl_;
  auto& scratch = state.lane_scratch(lane);
- const auto& header = input->header;
+ const auto& header = input->payload->header();
  throw_if_benchmark_cancelled(state.cancellation);
  std::span<const std::uint8_t> decoded;
  try {
-  decoded = scratch.decoder.decode_rgb(input->encoded, header, &scratch.decoded, &scratch.cmyk);
+  decoded = scratch.decoder.decode_rgb(input->payload->encoded(), header, &scratch.decoded, &scratch.cmyk);
  } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
   throw_if_benchmark_cancelled(state.cancellation);
   const auto& image = state.images.at(slot);

@@ -1,5 +1,6 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
+#include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include <atomic>
 #include <cstdint>
@@ -36,16 +37,6 @@ struct PreparedBenchmarkSplit {
  std::vector<EncodedImageRecord> images;
  std::vector<PackedInstance> labels;
  std::vector<RLEPair> rle_pairs;
-};
-class BenchmarkImageReadError final : public std::runtime_error {
-public:
- BenchmarkImageReadError(std::uint16_t source_index, std::uint64_t source_image_id, std::string detail);
- [[nodiscard]] std::uint16_t source_index() const noexcept;
- [[nodiscard]] std::uint64_t source_image_id() const noexcept;
-
-private:
- std::uint16_t source_index_ = 0U;
- std::uint64_t source_image_id_ = 0U;
 };
 [[nodiscard]] PackedInstance benchmark_canvas_box(std::uint8_t class_id, float x1, float y1, float x2, float y2, const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox);
 struct BenchmarkWriteProgressEvent final {

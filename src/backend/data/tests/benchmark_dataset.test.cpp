@@ -48,6 +48,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/compiled_file.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
+#include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/benchmark/detail/open_images_acquisition.h"
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -558,6 +559,18 @@ std::vector<std::uint8_t> make_jpeg(const std::uint8_t red, const std::uint8_t g
  require_condition(result != 0 && !jpeg.empty(), "failed to encode benchmark test JPEG");
  return jpeg;
 }
+std::vector<std::uint8_t> make_large_cached_jpeg() {
+ const auto jpeg = make_jpeg(10, 20, 30);
+ std::vector<std::uint8_t> encoded(jpeg.begin(), jpeg.begin() + 2);
+ // Two legal JPEG comment segments keep the tiny decoded geometry while
+ // making its immutable encoded extent larger than one 64 KiB header grant.
+ for (unsigned i = 0; i < 2; ++i) {
+  encoded.insert(encoded.end(), {0xff, 0xfe, 0xc0, 0x02});
+  encoded.insert(encoded.end(), 48U << 10, static_cast<std::uint8_t>('a' + i));
+ }
+ encoded.insert(encoded.end(), jpeg.begin() + 2, jpeg.end());
+ return encoded;
+}
 void write_tar_octal(std::array<std::uint8_t, 512U>* header, const std::size_t offset, const std::size_t width, const std::uint64_t value) {
  std::array<char, 32U> digits{};
  const auto converted = std::to_chars(digits.data(), digits.data() + digits.size(), value, 8);
@@ -659,8 +672,8 @@ void test_benchmark_cached_image_writer_and_loader() {
   {3U, "missing from verified training archive"},
  }};
  prepare_cached_image_directory(image_root);
- write_cached_image_atomically(cached_image_path(image_root, 1U), red, {});
- write_cached_image_atomically(cached_image_path(image_root, 2U), green, {});
+ BenchmarkEncodedImage::publish(cached_image_path(image_root, 1U), red, {});
+ BenchmarkEncodedImage::publish(cached_image_path(image_root, 2U), green, {});
  const fs::path completion = image_root / ".complete.json";
  const RetainedArtifact retained_red{cached_image_path(image_root, 1U)};
  const RetainedArtifact retained_green{cached_image_path(image_root, 2U)};
@@ -1617,7 +1630,7 @@ TEST_CASE("generic and benchmark writers share complete format headers", "[backe
  fixtures::create_synthetic_dataset(fixture);
  const auto image_root = root.path() / "cached";
  prepare_cached_image_directory(image_root);
- write_cached_image_atomically(cached_image_path(image_root, 1U), make_jpeg(128U, 64U, 32U), {});
+ BenchmarkEncodedImage::publish(cached_image_path(image_root, 1U), make_jpeg(128U, 64U, 32U), {});
  for (const auto mode : {resize::ImageResizeMode::Stretch, resize::ImageResizeMode::Letterbox}) {
   for (const std::string& annotation :
    {std::string{}, std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":""})"},
@@ -1736,7 +1749,7 @@ TEST_CASE("benchmark shrinking images preserve the RGB8 intermediate projection 
  SECTION("PNG") { REQUIRE(stbi_write_png_to_func(append_bytes, &encoded, width, height, 3, rgb.data(), width * 3U) != 0); }
  REQUIRE(has_complete_image_markers(encoded));
  CHECK_FALSE(has_complete_image_markers(std::span(encoded).first(encoded.size() - 1U)));
- write_cached_image_atomically(cached_image_path(image_root, 1U), encoded, {});
+ BenchmarkEncodedImage::publish(cached_image_path(image_root, 1U), encoded, {});
  BenchmarkImageDecoder decoder;
  std::vector<std::uint8_t> decoded, cmyk;
  const auto header = decoder.read_header(encoded, width, height);
@@ -1978,7 +1991,7 @@ TEST_CASE("archive image reuse reports initial and resolved counts without repla
   const auto jpeg = make_jpeg(10U, 20U, 30U);
   write_single_jpeg_tar(archive, 2U, jpeg);
   prepare_cached_image_directory(images);
-  write_cached_image_atomically(cached_image_path(images, 1U), jpeg, {});
+  BenchmarkEncodedImage::publish(cached_image_path(images, 1U), jpeg, {});
   const RetainedArtifact retained{cached_image_path(images, 1U)};
   const std::vector<std::uint64_t> ids{1U, 2U};
   std::vector<std::uint64_t> counts;
@@ -2053,8 +2066,8 @@ TEST_CASE("Open Images local JPEG and complete group reuse preserve dimensions a
  const auto images = cache.source_images("open-images") / "train";
  prepare_cached_image_directory(images);
  const auto jpeg = make_jpeg(10U, 20U, 30U);
- write_cached_image_atomically(cached_image_path(images, 1U), jpeg, {});
- write_cached_image_atomically(cached_image_path(images, 2U), jpeg, {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1U), jpeg, {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 2U), jpeg, {});
  const RetainedArtifact first{cached_image_path(images, 1U)};
  const RetainedArtifact second{cached_image_path(images, 2U)};
  NormalizedAnnotationIndex index;
@@ -2473,8 +2486,8 @@ TEST_CASE("progressive benchmark pixels survive quarantine without decoding reta
  mmltk::testsupport::ScopedTempDir root("progressive-compaction");
  const auto images = root.path() / "images";
  prepare_cached_image_directory(images);
- write_cached_image_atomically(cached_image_path(images, 1), make_jpeg(240, 8, 8), {});
- write_cached_image_atomically(cached_image_path(images, 2), make_jpeg(8, 240, 8), {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), make_jpeg(240, 8, 8), {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 2), make_jpeg(8, 240, 8), {});
  PreparedBenchmarkSplit membership;
  membership.name = "train";
  membership.class_names = {"person"};
@@ -2638,7 +2651,7 @@ TEST_CASE("cached pixels finish while label preparation is blocked", "[backend][
  mmltk::testsupport::ScopedTempDir root("blocked-labels");
  const auto images = root.path() / "images";
  prepare_cached_image_directory(images);
- write_cached_image_atomically(cached_image_path(images, 1), make_jpeg(240, 8, 8), {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), make_jpeg(240, 8, 8), {});
  PreparedBenchmarkSplit membership;
  membership.name = "train";
  membership.class_names = {"person"};
@@ -2668,7 +2681,7 @@ TEST_CASE("cached pixels finish while label preparation is blocked", "[backend][
 }
 PreparedBenchmarkSplit cached_pixel_membership(const fs::path& images) {
  prepare_cached_image_directory(images);
- write_cached_image_atomically(cached_image_path(images, 1), make_jpeg(240, 8, 8), {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), make_jpeg(240, 8, 8), {});
  PreparedBenchmarkSplit membership;
  membership.class_names = {"person"};
  membership.sources = {{images}};
@@ -2730,7 +2743,7 @@ TEST_CASE("pipeline failure retires queued custody and drains active readers bef
  mmltk::testsupport::ScopedTempDir root("exceptional-pixel-drain");
  const auto images = root.path() / "images";
  prepare_cached_image_directory(images);
- for (std::uint64_t id : {1U, 2U, 3U}) write_cached_image_atomically(cached_image_path(images, id), make_jpeg(240, 8, 8), {});
+ for (std::uint64_t id : {1U, 2U, 3U}) BenchmarkEncodedImage::publish(cached_image_path(images, id), make_jpeg(240, 8, 8), {});
  PreparedBenchmarkSplit membership;
  membership.class_names = {"person"};
  membership.sources = {{images}};
@@ -2792,7 +2805,7 @@ TEST_CASE("writer retains readable source geometry when its body fails", "[backe
  REQUIRE(stbi_write_png_to_func(append_bytes, &encoded, 6, 4, 3, rgb.data(), 6 * 3) != 0);
  const auto valid = encoded;
  encoded.resize(41);  // Keep the IDAT header required by stbi_info, but no image data.
- write_cached_image_atomically(cached_image_path(images, 1), encoded, {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {});
  PreparedBenchmarkSplit split;
  split.class_names = {"person"};
  split.sources = {{images}};
@@ -2805,7 +2818,7 @@ TEST_CASE("writer retains readable source geometry when its body fails", "[backe
  REQUIRE(writer.header_dimensions(0).has_value());
  CHECK(*writer.header_dimensions(0) == std::pair<std::uint32_t, std::uint32_t>{6, 4});
  CHECK_THROWS(writer.dimensions(0));
- write_cached_image_atomically(cached_image_path(images, 1), valid, {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), valid, {});
  writer.write_pixel(0, 0);
  CHECK(writer.image_complete(0));
  split.images[0].source_width = 6;
@@ -2818,7 +2831,7 @@ TEST_CASE("settled writer tail expands from one overlap scratch lane to the full
  mmltk::testsupport::ScopedTempDir root("full-pixel-tail");
  const auto images = root.path() / "images";
  prepare_cached_image_directory(images);
- for (std::uint64_t id : {1U, 2U}) write_cached_image_atomically(cached_image_path(images, id), make_jpeg(240, 8, 8), {});
+ for (std::uint64_t id : {1U, 2U}) BenchmarkEncodedImage::publish(cached_image_path(images, id), make_jpeg(240, 8, 8), {});
  PreparedBenchmarkSplit split;
  split.class_names = {"person"};
  split.sources = {{images}};
@@ -2986,7 +2999,7 @@ TEST_CASE("registered pixel readiness remains nonblocking under capacity pressur
  membership.class_names = {"person"};
  membership.sources = {{images}};
  for (std::uint64_t id = 1; id <= 18; ++id) {
-  write_cached_image_atomically(cached_image_path(images, id), make_jpeg(240, 8, 8), {});
+  BenchmarkEncodedImage::publish(cached_image_path(images, id), make_jpeg(240, 8, 8), {});
   membership.images.push_back({id, 16, 8, 0, 0, 0});
  }
  mmltk::testsupport::TestGate reader("first ready reader");
@@ -3053,7 +3066,7 @@ TEST_CASE("unrelated compile failure discards queued pixels before joining activ
  membership.class_names = {"person"};
  membership.sources = {{images}};
  for (std::uint64_t id = 1; id <= 5; ++id) {
-  write_cached_image_atomically(cached_image_path(images, id), make_jpeg(240, 8, 8), {});
+  BenchmarkEncodedImage::publish(cached_image_path(images, id), make_jpeg(240, 8, 8), {});
   membership.images.push_back({id, 16, 8, 0, 0, 0});
  }
  const auto output = root.path() / "result.bin";
@@ -3457,7 +3470,7 @@ TEST_CASE("retiring one generation waits for its reader while unrelated pixels r
  const auto first = root.path() / "first", other = root.path() / "other";
  auto split = cached_pixel_membership(first);
  prepare_cached_image_directory(other);
- write_cached_image_atomically(cached_image_path(other, 2), make_jpeg(240, 8, 8), {});
+ BenchmarkEncodedImage::publish(cached_image_path(other, 2), make_jpeg(240, 8, 8), {});
  split.sources.push_back({other});
  split.images = {{1, 16, 8, 0, 0, 0}, {2, 16, 8, 0, 0, 1}};
  mmltk::testsupport::TestGate held("retiring source reader");
@@ -3725,7 +3738,7 @@ TEST_CASE("shared remaining pixels use independent lanes and retain canonical sl
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
  mmltk::testsupport::ScopedTempDir root("shared-pixel-tail");
  auto split = cached_pixel_membership(root.path() / "images");
- write_cached_image_atomically(cached_image_path(root.path() / "images", 2), make_jpeg(240, 8, 8), {});
+ BenchmarkEncodedImage::publish(cached_image_path(root.path() / "images", 2), make_jpeg(240, 8, 8), {});
  split.images = {{1, 16, 8, 0, 0, 0}, {2, 16, 8, 0, 0, 0}};
  BenchmarkCompilePipeline execution(2);
  auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
@@ -3747,14 +3760,14 @@ TEST_CASE("image replacement retires one reader and rejects its earlier geometry
  mmltk::testsupport::ScopedTempDir root("image-replacement");
  const auto images = root.path() / "images";
  auto split = cached_pixel_membership(images);
- write_cached_image_atomically(cached_image_path(images, 2), make_jpeg(240, 8, 8), {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 2), make_jpeg(240, 8, 8), {});
  split.images = {{1, 16, 8, 0, 0, 0}, {2, 16, 8, 0, 0, 0}};
  std::vector<std::uint8_t> encoded;
  const std::array<std::uint8_t, 6 * 4 * 3> rgb{};
  REQUIRE(stbi_write_png_to_func(append_bytes, &encoded, 6, 4, 3, rgb.data(), 6 * 3) != 0);
  const auto replacement_bytes = encoded;
  encoded.resize(41);
- write_cached_image_atomically(cached_image_path(images, 1), encoded, {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {});
  BenchmarkCompilePipeline execution(1);
  auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
  mmltk::testsupport::TestGate held("affected image reader");
@@ -3779,7 +3792,7 @@ TEST_CASE("image replacement retires one reader and rejects its earlier geometry
  generation_publication({1});
  execution.drain();
  CHECK_FALSE(writer.image_complete(0));
- write_cached_image_atomically(cached_image_path(images, 1), replacement_bytes, {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), replacement_bytes, {});
  execution.source_publication(images, {}, 1)({1});
  execution.drain();
  CHECK(writer.image_complete(0));
@@ -3908,7 +3921,7 @@ TEST_CASE("a failed body keeps geometry and reaches repair without another faile
  const std::array<std::uint8_t, 6 * 4 * 3> rgb{};
  REQUIRE(stbi_write_png_to_func(append_bytes, &encoded, 6, 4, 3, rgb.data(), 6 * 3) != 0);
  encoded.resize(41);
- write_cached_image_atomically(cached_image_path(images, 1), encoded, {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {});
  BenchmarkCompilePipeline execution(1);
  auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
  request.execution = &execution;
@@ -3955,7 +3968,7 @@ TEST_CASE("remaining pixel slots advance beyond a held early reader", "[backend]
  auto split = cached_pixel_membership(images);
  split.images.clear();
  for (std::uint64_t id = 1; id <= 9; ++id) {
-  write_cached_image_atomically(cached_image_path(images, id), make_jpeg(240, 8, 8), {});
+  BenchmarkEncodedImage::publish(cached_image_path(images, id), make_jpeg(240, 8, 8), {});
   split.images.push_back({id, 16, 8, 0, 0, 0});
  }
  BenchmarkCompilePipeline execution(2);
@@ -4155,7 +4168,7 @@ TEST_CASE("local retirement preserves another source queued in the same writer g
  const auto first = root.path() / "first", other = root.path() / "other";
  auto split = cached_pixel_membership(first);
  prepare_cached_image_directory(other);
- write_cached_image_atomically(cached_image_path(other, 2), make_jpeg(240, 8, 8), {});
+ BenchmarkEncodedImage::publish(cached_image_path(other, 2), make_jpeg(240, 8, 8), {});
  split.sources.push_back({other});
  split.images = {{1, 16, 8, 0, 0, 0}, {2, 16, 8, 0, 0, 1}};
  mmltk::testsupport::TestGate held("affected active reader"), joining("retirement has withdrawn the generation");
@@ -4221,8 +4234,8 @@ TEST_CASE("a rejected pixel body leaves admitted writer siblings available for r
  const std::array<std::uint8_t, 6 * 4 * 3> rgb{};
  REQUIRE(stbi_write_png_to_func(append_bytes, &encoded, 6, 4, 3, rgb.data(), 6 * 3) != 0);
  encoded.resize(41);
- write_cached_image_atomically(cached_image_path(images, 1), encoded, {});
- write_cached_image_atomically(cached_image_path(images, 2), make_jpeg(240, 8, 8), {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 2), make_jpeg(240, 8, 8), {});
  BenchmarkCompilePipeline execution(1);
  auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
  request.execution = &execution;
@@ -4238,7 +4251,7 @@ TEST_CASE("a rejected pixel body leaves admitted writer siblings available for r
  CHECK_THROWS_AS(writer.write_remaining(request), BenchmarkImageReadError);
  CHECK(first_reads == 1);
  execution.retire_image(images, 1);
- write_cached_image_atomically(cached_image_path(images, 1), make_jpeg(240, 8, 8), {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), make_jpeg(240, 8, 8), {});
  writer.write_remaining(request);
  CHECK(writer.image_complete(0));
  CHECK(writer.image_complete(1));
@@ -4469,7 +4482,7 @@ TEST_CASE("cached images and ordinary stages retain their modes and promises thr
  } observation{storage, encoded.size()};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(observation);
  const auto image = root.path() / "image.jpg";
- write_cached_image_atomically(image, encoded, cancellation, storage);
+ BenchmarkEncodedImage::publish(image, encoded, cancellation, storage);
  CHECK(observation.retained);
  CHECK(storage.outstanding() == 0);
  struct stat status{};
@@ -4630,7 +4643,7 @@ TEST_CASE("detached retained writers withdraw affected pixels before remapping c
  const auto first = root.path() / "first", other = root.path() / "other";
  auto split = cached_pixel_membership(first);
  prepare_cached_image_directory(other);
- write_cached_image_atomically(cached_image_path(other, 2), make_jpeg(8, 240, 8), {});
+ BenchmarkEncodedImage::publish(cached_image_path(other, 2), make_jpeg(8, 240, 8), {});
  split.sources.push_back({other});
  split.images = {{1, 16, 8, 0, 0, 0}, {2, 16, 8, 0, 0, 1}};
  BenchmarkCompilePipeline execution(1);
@@ -4642,7 +4655,7 @@ TEST_CASE("detached retained writers withdraw affected pixels before remapping c
  BenchmarkSplitWriter retained(request);
  execution.register_split(retained, split);
  const auto old = execution.source_publication(first, {});
- old({first, 1});
+ old({1});
  execution.source_publication(other, {})({2});
  execution.retire_attempt();
  execution.retire_source(first);
@@ -4659,7 +4672,7 @@ TEST_CASE("detached retained writers withdraw affected pixels before remapping c
  CHECK_FALSE(remapped.image_complete(1));
  BenchmarkCompilePipeline::Attempt attempt(execution);
  execution.register_split(remapped, split);
- old({first, 1, std::pair{16U, 8U}});
+ old({1, std::pair{16U, 8U}});
  CHECK_FALSE(remapped.image_complete(1));
  execution.source_publication(first, {})({1});
  CHECK(remapped.image_complete(0));
@@ -4823,7 +4836,7 @@ TEST_CASE("Open Images admits a third group while two earlier groups retry and p
  prepare_cached_image_directory(images);
  const auto jpeg = make_jpeg(10, 20, 30);
  const auto seed = root.path() / "seed.jpg";
- write_cached_image_atomically(seed, jpeg, {});
+ BenchmarkEncodedImage::publish(seed, jpeg, {});
  NormalizedAnnotationIndex index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  constexpr std::size_t count = 8193;
@@ -5066,7 +5079,7 @@ TEST_CASE("Open Images consumes a repaired saved file before recycling its exclu
  prepare_cached_image_directory(images);
  const auto jpeg = make_jpeg(10, 20, 30);
  const auto seed = root.path() / "seed.jpg";
- write_cached_image_atomically(seed, jpeg, {});
+ BenchmarkEncodedImage::publish(seed, jpeg, {});
  NormalizedAnnotationIndex index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  constexpr std::size_t count = 4097;
@@ -5108,7 +5121,7 @@ TEST_CASE("Open Images consumes a repaired saved file before recycling its exclu
  if (repair == Repair::SavedFile) {
   auto damaged = jpeg;
   damaged[0] = 0;
-  write_cached_image_atomically(repaired_path, damaged, {});
+  BenchmarkEncodedImage::publish(repaired_path, damaged, {});
  } else if (repair == Repair::Missing) fs::remove(repaired_path);
  validation.Release();
  if (repair == Repair::Missing || repair == Repair::Allocation) {
@@ -5869,7 +5882,7 @@ TEST_CASE("Open Images starts ready HTTP before later cold cache chunks finish",
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  for (std::uint64_t id = 1; id <= 65; ++id) {
   index.images.push_back({.source_image_id = id});
-  if (id > 1 && id < 65) write_cached_image_atomically(cached_image_path(images, id), jpeg, {});
+  if (id > 1 && id < 65) BenchmarkEncodedImage::publish(cached_image_path(images, id), jpeg, {});
  }
  write_text(cached_image_path(images, 65), "invalid cached JPEG");
  mmltk::testsupport::TestGate scan("later cold cache header");
@@ -5964,7 +5977,7 @@ TEST_CASE("published image mappings retain their inode and header without a cach
  const auto encoded = make_jpeg(120, 16, 8);
  BenchmarkImageDecoder decoder;
  const auto header = decoder.read_header(encoded);
- auto payload = write_cached_image_atomically(cached_image_path(images, 1), encoded, {}, nullptr, header);
+ auto payload = BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {}, nullptr, header);
  REQUIRE(payload);
  std::filesystem::remove(cached_image_path(images, 1));
  PreparedBenchmarkSplit split;
@@ -5989,16 +6002,16 @@ TEST_CASE("warm image admission owns the opened generation across replacement", 
  const auto images = root.path() / "images";
  prepare_cached_image_directory(images);
  const auto first = make_jpeg(17, 16, 8), second = make_jpeg(90, 16, 8);
- write_cached_image_atomically(cached_image_path(images, 1), first, {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), first, {});
  FileHandle directory(::open(images.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
  REQUIRE(directory.get() >= 0);
- const auto admitted = open_cached_image(directory.get(), 1, {}, {});
+ const auto admitted = BenchmarkEncodedImage::open(directory.get(), 1, {}, {});
  REQUIRE(admitted);
- write_cached_image_atomically(cached_image_path(images, 1), second, {});
- CHECK(std::ranges::equal(admitted->encoded, first));
- const auto replacement = open_cached_image(directory.get(), 1, {}, {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), second, {});
+ CHECK(std::ranges::equal(admitted->encoded(), first));
+ const auto replacement = BenchmarkEncodedImage::open(directory.get(), 1, {}, {});
  REQUIRE(replacement);
- CHECK(std::ranges::equal(replacement->encoded, second));
+ CHECK(std::ranges::equal(replacement->encoded(), second));
 }
 TEST_CASE("PNG decoder views retain the stb allocation through pixel use", "[backend][data][benchmark][writer]") {
  std::vector<std::uint8_t> encoded;
@@ -6058,4 +6071,333 @@ TEST_CASE("registered Open Images repair accepts its one retained pixel consumpt
  execution.drain();
  writer.finish(request);
  CHECK(CompiledDataset::open(request.output_path).header().num_images == 1);
+}
+
+TEST_CASE("compact image facts reuse only their admitted file generation", "[backend][data][benchmark][images][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("compact-image-fact");
+ const auto images = root.path() / "images";
+ prepare_cached_image_directory(images);
+ const auto first = make_jpeg(17, 16, 8);
+ BenchmarkImageDecoder decoder;
+ auto fact = BenchmarkEncodedImage::publish(cached_image_path(images, 1), first, {}, nullptr, decoder.read_header(first), {}, false);
+ REQUIRE(fact);
+ CHECK(fact->storage() == BenchmarkEncodedImage::Storage::HeaderOnly);
+ CHECK_FALSE(fact->backing());
+ CHECK(fact->encoded().empty());
+ FileHandle directory(::open(images.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+ REQUIRE(directory.get() >= 0);
+ std::size_t headers = 0;
+ const CachedImageValidator admit = [&](std::uint64_t, std::span<const std::uint8_t> encoded) { ++headers; return decoder.read_header(encoded); };
+ auto same = BenchmarkEncodedImage::open(directory.get(), 1, admit, {}, nullptr, {}, fact);
+ REQUIRE(same);
+ CHECK(headers == 0);
+ CHECK(std::ranges::equal(same->encoded(), first));
+ const auto second = make_jpeg(90, 16, 8);
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), second, {});
+ auto changed = BenchmarkEncodedImage::open(directory.get(), 1, admit, {}, nullptr, {}, fact);
+ REQUIRE(changed);
+ CHECK(headers == 1);
+ CHECK(std::ranges::equal(changed->encoded(), second));
+ CHECK(std::ranges::equal(same->encoded(), first));
+ fs::remove(cached_image_path(images, 1));
+ CHECK_FALSE(BenchmarkEncodedImage::open(directory.get(), 1, admit, {}, nullptr, {}, fact));
+}
+
+TEST_CASE("preplacement image facts remain compact and withdraw with their source", "[backend][data][benchmark][images][pipeline]") {
+ bool pressure = false;
+ SECTION("mapped publication") {}
+ SECTION("descriptor pressure publication") { pressure = true; }
+ mmltk::testsupport::ScopedTempDir root("preplacement-image-facts");
+ const auto images = root.path() / "images";
+ prepare_cached_image_directory(images);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 13});
+ const auto encoded = make_jpeg(40, 16, 8);
+ BenchmarkImageDecoder decoder;
+ std::shared_ptr<const BenchmarkEncodedImage> payload;
+ if (pressure) {
+  auto occupied = execution.reserve(BenchmarkResources::handles(13));
+  FileHandle directory(::open(images.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+  REQUIRE(directory.get() >= 0);
+  StorageReservationPool storage(images, {});
+  payload = BenchmarkEncodedImage::publish(directory.get(), 1, encoded, decoder.read_header(encoded), {}, storage, &execution);
+  REQUIRE(payload);
+  CHECK(payload->storage() == BenchmarkEncodedImage::Storage::HeaderOnly);
+ } else payload = BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {}, nullptr, decoder.read_header(encoded));
+ const std::weak_ptr<const void> mapping = payload->backing();
+ const auto publication = execution.source_publication(images, {});
+ publication({1, std::pair{16U, 8U}, true, payload});
+ payload.reset();
+ CHECK(mapping.expired());
+ auto fact = execution.image_input(images, 1);
+ REQUIRE(fact);
+ CHECK(fact->storage() == BenchmarkEncodedImage::Storage::HeaderOnly);
+ PreparedBenchmarkSplit split;
+ split.name = "train"; split.class_names = {"person"}; split.sources = {{images}}; split.images = {{1, 16, 8, 0, 0, 0}};
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8);
+ request.execution = &execution;
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ CHECK(publication.consume({1}));
+ CHECK(writer.image_complete(0));
+ execution.retire_image(images, 1);
+ CHECK_FALSE(execution.image_input(images, 1));
+ publication({1, std::pair{16U, 8U}, true, fact});
+ CHECK_FALSE(execution.image_input(images, 1));
+ CHECK_FALSE(writer.image_complete(0));
+}
+
+TEST_CASE("held warm image reads allow HTTP results and pixels to finish on one CPU", "[backend][data][benchmark][images][pipeline]") {
+ bool cancel = false;
+ SECTION("complete group proof") {}
+ SECTION("cancel with a pending warm result") { cancel = true; }
+ mmltk::testsupport::ScopedTempDir root("open-images-independent-warm");
+ const auto cache = BenchmarkCacheLayout::create(root.path());
+ const auto images = cache.source_images("open-images") / "train";
+ prepare_cached_image_directory(images);
+ const auto jpeg = make_jpeg(10, 20, 30);
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), jpeg, {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 3), jpeg, {});
+ HttpServer server(jpeg);
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 64U << 20, .descriptors = 16}, cancellation);
+ NormalizedAnnotationIndex index;
+ index.source = BenchmarkDatasetSource::kOpenImagesV7;
+ for (std::uint64_t id : {1U, 2U, 3U}) index.images.push_back({.source_image_id = id});
+ PreparedBenchmarkSplit split;
+ split.name = "train"; split.class_names = {"person"}; split.sources = {{images}};
+ for (std::uint64_t id : {1U, 2U, 3U}) split.images.push_back({id, 16, 8, 0, 0, 0});
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8, cancellation);
+ request.execution = &execution;
+ mmltk::testsupport::TestGate held("warm read before filesystem acquisition");
+ std::promise<void> ready_pixels;
+ std::atomic<unsigned> completed{0};
+ struct Completion { std::atomic<unsigned>& count; std::promise<void>& ready; } completion{completed, ready_pixels};
+ request.progress = {.context = &completion, .image_completed = [](void* opaque) {
+  auto& value = *static_cast<Completion*>(opaque);
+  if (++value.count == 2) value.ready.set_value();
+ }};
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ ProgressReporter progress({}, {});
+ std::vector<QuarantinedImage> quarantined;
+ auto acquisition = std::async(std::launch::async, [&] {
+  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution,
+   [&](std::uint64_t) { return server.url("image"); }, [&](std::uint64_t id) { if (id == 1) held.receipt().ArriveAndWait(); });
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); held.Release(); });
+ REQUIRE(held.WaitEntered(5s));
+ mmltk::testsupport::await_test_promise(ready_pixels, "independent warm and HTTP pixels finish while the first read is held");
+ CHECK_FALSE(writer.image_complete(0));
+ CHECK(writer.image_complete(1)); CHECK(writer.image_complete(2));
+ CHECK(server.requests() == 1);
+ CHECK_FALSE(fs::exists(images / ".groups" / "group-000000.complete.json"));
+ if (cancel) cancelled.store(true);
+ held.Release();
+ if (cancel) {
+  CHECK_THROWS(mmltk::testsupport::await_test_future(acquisition, "pending warm reader cancellation"));
+  CHECK_FALSE(fs::exists(images / ".groups" / "group-000000.complete.json"));
+ } else {
+  const auto result = mmltk::testsupport::await_test_future(acquisition, "independent warm group completion");
+  execution.drain();
+  CHECK(result.available_image_ids == std::vector<std::uint64_t>{1, 2, 3});
+  CHECK(result.directory.image_bytes == jpeg.size() * 3);
+  CHECK(quarantined.empty());
+  CHECK(writer.completed() == 3);
+  const auto proof = read_json_file(images / ".groups" / "group-000000.complete.json");
+  CHECK(proof.at("image_count") == 3);
+  CHECK(proof.at("dimensions").size() == 9);
+ }
+ server.Check();
+}
+
+TEST_CASE("small-target warm cache inputs complete after simultaneous admission", "[backend][data][benchmark][images][pipeline]") {
+ std::size_t descriptors = 13;
+ SECTION("thirteen descriptors") {}
+ SECTION("sixteen descriptors") { descriptors = 16; }
+ mmltk::testsupport::ScopedTempDir root("open-images-small-warm");
+ const auto cache = BenchmarkCacheLayout::create(root.path());
+ const auto images = cache.source_images("open-images") / "train";
+ prepare_cached_image_directory(images);
+ const auto jpeg = make_large_cached_jpeg();
+ REQUIRE(jpeg.size() > (64U << 10));
+ REQUIRE(jpeg.size() < (8U << 20));
+ for (std::uint64_t id : {1U, 2U, 3U}) BenchmarkEncodedImage::publish(cached_image_path(images, id), jpeg, {});
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = descriptors}, cancellation);
+ NormalizedAnnotationIndex index;
+ index.source = BenchmarkDatasetSource::kOpenImagesV7;
+ PreparedBenchmarkSplit split;
+ split.name = "train"; split.class_names = {"person"}; split.sources = {{images}};
+ for (std::uint64_t id : {1U, 2U, 3U}) {
+  index.images.push_back({.source_image_id = id});
+  split.images.push_back({id, 16, 8, 0, 0, 0});
+ }
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8, cancellation);
+ request.execution = &execution;
+ // At 13 descriptors the three simultaneous opens exercise acquisition alone;
+ // 16 also leaves the writer's two handles and canonical pixel jobs admitted.
+ std::unique_ptr<BenchmarkSplitWriter> writer;
+ if (descriptors == 16) writer = std::make_unique<BenchmarkSplitWriter>(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ if (writer) execution.register_split(*writer, split);
+ ProgressReporter progress({}, {});
+ std::vector<QuarantinedImage> quarantined;
+ mmltk::testsupport::TestGate warm("three warm workers before mapped admission");
+ std::array<std::atomic<unsigned>, 3> reads{};
+ auto acquisition = std::async(std::launch::async, [&] {
+  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 4, {}, {}, &execution,
+   [](std::uint64_t) -> std::string { throw std::runtime_error("valid warm image unexpectedly requested HTTP"); },
+   [&](std::uint64_t id) { ++reads.at(id - 1); warm.receipt().ArriveAndWait(); });
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); warm.Release(); });
+ REQUIRE(warm.WaitEntered(5s, 3));
+ // Three old 64 KiB input grants occupied 192 KiB here, leaving no mapping
+ // eligible. Release all three readers together against the same 256 KiB target.
+ warm.Release();
+ const auto result = mmltk::testsupport::await_test_future(acquisition, "small-target simultaneous warm admission", 5s);
+ execution.drain();
+ if (writer) writer->finish(request);
+ CHECK(result.available_image_ids == std::vector<std::uint64_t>{1, 2, 3});
+ CHECK(result.directory.image_bytes == jpeg.size() * 3);
+ CHECK(quarantined.empty());
+ if (writer) CHECK(writer->completed() == 3);
+ for (const auto& count : reads) CHECK(count.load() == 1);
+ const auto proof = read_json_file(images / ".groups" / "group-000000.complete.json");
+ CHECK(proof.at("image_count") == 3);
+ CHECK(proof.at("image_bytes") == jpeg.size() * 3);
+ CHECK(proof.at("dimensions") == nlohmann::json::array({1, 16, 8, 2, 16, 8, 3, 16, 8}));
+ if (writer) CHECK(CompiledDataset::open(request.output_path).header().num_images == 3);
+}
+
+TEST_CASE("deferred warm cache cancellation returns opened custody without waiting for byte pressure", "[backend][data][benchmark][images][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("open-images-deferred-cancel");
+ const auto cache = BenchmarkCacheLayout::create(root.path());
+ const auto images = cache.source_images("open-images") / "train";
+ prepare_cached_image_directory(images);
+ const auto jpeg = make_large_cached_jpeg();
+ for (std::uint64_t id : {1U, 2U, 3U}) BenchmarkEncodedImage::publish(cached_image_path(images, id), jpeg, {});
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 16});
+ NormalizedAnnotationIndex index;
+ index.source = BenchmarkDatasetSource::kOpenImagesV7;
+ for (std::uint64_t id : {1U, 2U, 3U, 4U}) index.images.push_back({.source_image_id = id});
+ ProgressReporter progress({}, {});
+ std::vector<QuarantinedImage> quarantined;
+ mmltk::testsupport::TestGate warm("three warm requests before opening"), pressure("complete transient target on shared CPU"), next("worker returned an opened-file deferral");
+ std::future<void> cpu;
+ auto acquisition = std::async(std::launch::async, [&] {
+  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 4, {}, {}, &execution,
+   [](std::uint64_t) -> std::string { throw std::runtime_error("cancelled warm input unexpectedly requested HTTP"); },
+   [&](std::uint64_t id) { (id == 4 ? next : warm).receipt().ArriveAndWait(); });
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); warm.Release(); next.Release(); pressure.Release(); });
+ REQUIRE(warm.WaitEntered(5s, 3));
+ cpu = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Metadata, {256U << 10, 0}, [&](std::size_t) { pressure.receipt().ArriveAndWait(); }); });
+ REQUIRE(pressure.WaitEntered(5s));
+ warm.Release();
+ // A fourth request can reach its worker only after one of the first three
+ // opened files returned without mapping: the unrelated byte grant is still held.
+ REQUIRE(next.WaitEntered(5s));
+ cancelled.store(true);
+ next.Release();
+ REQUIRE(acquisition.wait_for(5s) == std::future_status::ready);
+ CHECK_THROWS(acquisition.get());
+ CHECK_FALSE(fs::exists(images / ".groups" / "group-000000.complete.json"));
+ for (const auto& descriptor : fs::directory_iterator("/proc/self/fd")) {
+  std::error_code error;
+  const auto target = fs::read_symlink(descriptor.path(), error);
+  if (!error) for (std::uint64_t id : {1U, 2U, 3U}) CHECK(target != cached_image_path(images, id));
+ }
+ CHECK_FALSE(execution.resource_pressure());
+ pressure.Release();
+ mmltk::testsupport::await_test_future(cpu, "independent shared CPU release");
+ CHECK(execution.try_reserve({256U << 10, 16}).has_value());
+}
+
+TEST_CASE("deferred image input preserves its inspected inode and returns complete byte custody", "[backend][data][benchmark][images][pipeline]") {
+ bool cancel = false;
+ SECTION("replacement and unlink before admission") {}
+ SECTION("cancellation while admission is deferred") { cancel = true; }
+ mmltk::testsupport::ScopedTempDir root("deferred-image-inode");
+ const auto images = root.path() / "images";
+ prepare_cached_image_directory(images);
+ const auto jpeg = make_large_cached_jpeg();
+ const auto path = cached_image_path(images, 1);
+ BenchmarkEncodedImage::publish(path, jpeg, {});
+ FileHandle directory(::open(images.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+ REQUIRE(directory.get() >= 0);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 13});
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ auto pressure = execution.reserve({256U << 10, 0});
+ auto opened = BenchmarkEncodedImage::open_deferred(directory.get(), 1, cancellation, execution.reserve(BenchmarkResources::handles(1, true)));
+ REQUIRE(opened);
+ CHECK_FALSE(opened->try_read(&execution, cancellation));
+ CHECK(execution.resource_pressure());
+ const auto observed = execution.admission_generation();
+ BenchmarkEncodedImage::publish(path, make_jpeg(99, 20, 30), {});
+ REQUIRE(fs::remove(path));
+ if (cancel) {
+  cancelled.store(true);
+  CHECK_THROWS(opened->try_read(&execution, cancellation));
+  CHECK_FALSE(execution.resource_pressure());
+  opened.reset();
+  pressure = {};
+ } else {
+  pressure = {};
+  CHECK(execution.admission_generation() != observed);
+  auto payload = opened->try_read(&execution, cancellation);
+  REQUIRE(payload);
+  opened.reset();
+  CHECK_FALSE(execution.resource_pressure());
+  CHECK(std::ranges::equal(payload->encoded(), jpeg));
+  CHECK(payload->allowance().bytes() == jpeg.size());
+  // All header scratch is physically gone; only the mapped extent stays charged.
+  auto remaining = execution.try_reserve({(256U << 10) - jpeg.size(), 13});
+  REQUIRE(remaining);
+  CHECK_FALSE(execution.try_reserve({1, 0}).has_value());
+  payload.reset();
+  CHECK(execution.try_reserve({jpeg.size(), 0}).has_value());
+ }
+ CHECK(execution.try_reserve({256U << 10, 13}).has_value());
+}
+
+TEST_CASE("deferred mapped input exposes pressure to retained pixel scratch", "[backend][data][benchmark][images][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("deferred-image-idle-pixels");
+ const auto images = root.path() / "images";
+ prepare_cached_image_directory(images);
+ BenchmarkEncodedImage::publish(cached_image_path(images, 1), make_jpeg(10, 20, 30), {});
+ const auto jpeg = make_large_cached_jpeg();
+ BenchmarkEncodedImage::publish(cached_image_path(images, 2), jpeg, {});
+ FileHandle directory(::open(images.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+ REQUIRE(directory.get() >= 0);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 13});
+ PreparedBenchmarkSplit split;
+ split.name = "train"; split.class_names = {"person"}; split.sources = {{images}}; split.images = {{1, 16, 8, 0, 0, 0}};
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 64);
+ request.execution = &execution;
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ REQUIRE(execution.source_publication(images, {}).consume({1}));
+ REQUIRE(writer.image_complete(0));
+ execution.drain();
+ // The legal oversized pixel workspace remains reusable after this completed
+ // image. No runnable job or blocking byte borrower currently asks it to retire.
+ CHECK_FALSE(execution.try_reserve({256U << 10, 0}).has_value());
+ auto opened = BenchmarkEncodedImage::open_deferred(directory.get(), 2, {}, execution.reserve(BenchmarkResources::handles(1, true)));
+ REQUIRE(opened);
+ const auto observed = execution.admission_generation();
+ CHECK_FALSE(opened->try_read(&execution, {}));
+ CHECK(execution.resource_pressure());
+ execution.wait_for_admission_change(observed, std::chrono::steady_clock::now() + 2s);
+ auto payload = opened->try_read(&execution, {});
+ REQUIRE(payload);
+ CHECK_FALSE(execution.resource_pressure());
+ CHECK(std::ranges::equal(payload->encoded(), jpeg));
 }

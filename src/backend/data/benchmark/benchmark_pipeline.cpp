@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
@@ -139,11 +140,17 @@ struct BenchmarkCompilePipeline::Admission {
   }
   changed.notify_all();
  }
+ void change_waiters(bool add, bool resource) {
+  if (add) { ++waiters; resource_waiters += resource; }
+  else { --waiters; resource_waiters -= resource; }
+  changed.notify_all();
+  if (transport_wakeup) transport_wakeup();
+ }
  struct Waiter {
   Admission& owner;
   bool resource;
-  explicit Waiter(Admission& value, bool needs_resources = false) : owner(value), resource(needs_resources) { ++owner.waiters; owner.resource_waiters += resource; owner.changed.notify_all(); if (owner.transport_wakeup) owner.transport_wakeup(); }
-  ~Waiter() { --owner.waiters; owner.resource_waiters -= resource; owner.changed.notify_all(); if (owner.transport_wakeup) owner.transport_wakeup(); }
+  explicit Waiter(Admission& value, bool needs_resources = false) : owner(value), resource(needs_resources) { owner.change_waiters(true, resource); }
+  ~Waiter() { owner.change_waiters(false, resource); }
   Waiter(const Waiter&) = delete;
   Waiter& operator=(const Waiter&) = delete;
  };
@@ -265,7 +272,7 @@ struct BenchmarkCompilePipeline::Impl {
   std::size_t pending = 0;
   std::unordered_map<std::uint64_t, Slot> slots;
   std::vector<BenchmarkSplitWriter*> writers;
-  struct Geometry { BenchmarkSourceGeneration generation; std::uint32_t width, height; };
+  struct Geometry { BenchmarkSourceGeneration generation; std::uint32_t width, height; std::shared_ptr<const BenchmarkEncodedImage> input; };
   std::unordered_map<std::uint64_t, Geometry> geometry;
  };
  // The sole mutable physical image owner. Scheduler jobs borrow stable slots;
@@ -411,8 +418,42 @@ struct BenchmarkCompilePipeline::Impl {
   return slot ? static_cast<const void*>(slot->writer) : job.retire;
  }
 };
-std::uint64_t BenchmarkAllowance::bytes() const noexcept { return credits_ ? credits_->resources.bytes : 0; }
+std::uint64_t BenchmarkAllowance::bytes() const noexcept {
+ if (!credits_) return 0;
+ const std::lock_guard lock(credits_->owner->mutex);
+ return credits_->resources.bytes;
+}
 std::size_t BenchmarkAllowance::descriptors() const noexcept { return credits_ ? credits_->resources.descriptors : 0; }
+void BenchmarkAllowance::retire_workspace() const noexcept {
+ if (!credits_) return;
+ auto& owner = *credits_->owner;
+ std::shared_ptr<Credits> parent;
+ { const std::lock_guard lock(owner.mutex);
+  auto& resources = credits_->resources;
+  owner.external_cpus -= std::exchange(resources.cpu_workers, 0);
+  (resources.retained_handles ? owner.handle_bytes : owner.bytes) -= std::exchange(resources.bytes, 0);
+  // Descriptor commitments still follow their children. A stream without a
+  // descriptor draw no longer needs its producing directory/control chain.
+  if (!credits_->borrowed) parent = std::move(credits_->parent);
+  ++owner.generation;
+  if (owner.transport_wakeup) owner.transport_wakeup();
+ }
+ owner.changed.notify_all();
+}
+BenchmarkAllowance BenchmarkAllowance::split_storage(std::uint64_t bytes) {
+ if (!credits_) return {};
+ auto& owner = *credits_->owner;
+ // The consumer may finish while its oversized producing stream is live.
+ // This lineage is accounting only: the stream explicitly retires its own
+ // capacity/CPUs when their physical backing settles, regardless of aliases.
+ auto storage = std::make_shared<Credits>(credits_->owner, BenchmarkResources{bytes, 0}, credits_);
+ { const std::lock_guard lock(owner.mutex);
+  if (credits_->resources.retained_handles || bytes > credits_->resources.bytes) throw std::invalid_argument("benchmark storage partition exceeds its admitted envelope");
+  credits_->resources.bytes -= bytes;
+  storage->charged = true;
+ }
+ return BenchmarkAllowance(std::move(storage));
+}
 thread_local BenchmarkCompilePipeline::Impl::Frame* BenchmarkCompilePipeline::Impl::Frame::current = nullptr;
 bool BenchmarkCompilePipeline::Impl::Lane::owns(const void* identity) const {
  if (!identity) return false;
@@ -652,6 +693,15 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
   error = std::current_exception();
   recoverable = slot != nullptr;
  } catch (...) { error = std::current_exception(); }
+ // Pixel scratch owns its own charged capacity. Its input remains in the slot
+ // until settlement, but idle scratch has no descriptor commitment to that input.
+ if (slot && job->stage == BenchmarkStage::Pixels && frame.allowance) {
+  std::shared_ptr<Credits> input;
+  { const std::lock_guard lock(mutex);
+   auto& credit = *frame.allowance.credits_;
+   if (!credit.borrowed) input = std::move(credit.parent);
+  }
+ }
  if (((slot && job->stage == BenchmarkStage::Pixels) || job->retire) && frame.allowance) {
   IdleScratch scratch{slot ? slot->writer : nullptr, job->retire, std::move(frame.allowance), job->retire ? job->group : nullptr};
   IdleScratch displaced;
@@ -756,6 +806,17 @@ void BenchmarkCompilePipeline::wait_for_admission_change(std::uint64_t observed,
 void BenchmarkCompilePipeline::notify_admission_change() noexcept {
  { const std::lock_guard lock(impl_->mutex); ++impl_->admission->generation; }
  impl_->changed.notify_all();
+}
+BenchmarkResourceWait::BenchmarkResourceWait(std::shared_ptr<BenchmarkCompilePipeline::Admission> owner) : owner_(std::move(owner)) {
+ const std::lock_guard lock(owner_->mutex);
+ owner_->change_waiters(true, true);
+}
+BenchmarkResourceWait::~BenchmarkResourceWait() {
+ const std::lock_guard lock(owner_->mutex);
+ owner_->change_waiters(false, true);
+}
+std::unique_ptr<BenchmarkResourceWait> BenchmarkCompilePipeline::defer_resources() {
+ return std::unique_ptr<BenchmarkResourceWait>(new BenchmarkResourceWait(impl_->admission));
 }
 std::size_t BenchmarkCompilePipeline::descriptor_ceiling(BenchmarkResources resources) const {
  const std::lock_guard lock(impl_->mutex);
@@ -991,6 +1052,8 @@ void BenchmarkCompilePipeline::Impl::ImageState::register_split(BenchmarkSplitWr
   slot.index = i;
   slot.image_id = image.source_image_id;
   slot.generation = source.image_generation(image.source_image_id);
+  if (const auto found = source.geometry.find(image.source_image_id); found != source.geometry.end() && found->second.generation == slot.generation)
+   slot.payload = found->second.input;
   slot.job.work = &slot;
   writer_slots[i] = &slot;
  }
@@ -999,7 +1062,8 @@ void BenchmarkCompilePipeline::Impl::ImageState::admit(Slot& slot, bool independ
  slot.submitted = true;
  auto& job = slot.job;
  job.stage = BenchmarkStage::Header;
- job.resources = slot.payload && !slot.payload->encoded.empty() ? BenchmarkResources{} : BenchmarkResources::handles(1);
+ job.resources = slot.payload && !slot.payload->encoded().empty() ? BenchmarkResources{} : BenchmarkResources::handles(1);
+ job.parent = slot.payload ? slot.payload->allowance() : BenchmarkAllowance{};
  job.done = false;
  job.failure = {};
  job.finish_started = false;
@@ -1048,7 +1112,7 @@ void BenchmarkCompilePipeline::Impl::ImageState::geometry_ready(Source& source, 
  const auto slot = source.slots.find(id);
  if (slot != source.slots.end() && slot->second.retiring) return;
  if (!dimensions.first || !dimensions.second) throw std::invalid_argument("benchmark geometry is empty");
- auto [position, inserted] = source.geometry.emplace(id, Source::Geometry{generation, dimensions.first, dimensions.second});
+ auto [position, inserted] = source.geometry.emplace(id, Source::Geometry{generation, dimensions.first, dimensions.second, {}});
  if (!inserted && (position->second.width != dimensions.first || position->second.height != dimensions.second)) throw std::runtime_error("benchmark source generation has contradictory geometry");
  position->second.generation = generation;
 }
@@ -1072,21 +1136,25 @@ void BenchmarkCompilePipeline::Impl::ImageState::publish(Source& source, std::ui
   if (execution.failure) std::rethrow_exception(execution.failure);
   if (source.retiring || generation != source.image_generation(id)) return;
   if (dimensions) geometry_ready(source, id, generation, *dimensions);
+  if (payload) {
+   geometry_ready(source, id, generation, {payload->header().width, payload->header().height});
+   source.geometry.at(id).input = payload->storage() == BenchmarkEncodedImage::Storage::HeaderOnly && !payload->allowance() ? payload : payload->header_only();
+  }
   const auto found = source.slots.find(id);
   if (found == source.slots.end() || found->second.submitted || found->second.retiring) return;
   auto& slot = found->second;
   slot.generation = generation;
   slot.publication = std::move(publication);
-  if (payload && payload->file_backing) {
-   // Reserve input/work/output together before retaining a pooled input in a
-   // queued pixel slot. Under pressure use its already-opened immutable mapping;
-   // the producer can then recycle bytes while consumers admit their scratch.
-   const BenchmarkResources workspace{slot.writer->pixel_workspace_bytes(payload->header, 0), 0};
-   if (execution.admission->fits(workspace, payload->allowance.credits_.get()))
-    slot.pixel_allowance = execution.charge(workspace, payload->allowance);
-   else payload = payload->file_backing;
+  if (payload && payload->charged_bytes()) {
+   // Admit input/work/output together before queueing retained bytes. Under
+   // pressure, pooled input yields to its published file; a charged warm map
+   // yields to its generation-bound header fact and the protected path read.
+   const BenchmarkResources workspace{slot.writer->pixel_workspace_bytes(payload->header(), 0), 0};
+   if (execution.admission->fits(workspace, payload->allowance().credits_.get()))
+    slot.pixel_allowance = execution.charge(workspace, payload->allowance());
+   else payload = payload->file_backing() ? payload->file_backing() : source.geometry.at(id).input;
   }
-  slot.payload = std::move(payload);
+  slot.payload = payload ? std::move(payload) : source.geometry.contains(id) ? source.geometry.at(id).input : nullptr;
   admit(slot, true);
   accepted = &slot.job;
  }
@@ -1150,6 +1218,14 @@ void BenchmarkCompilePipeline::retire_source(const std::filesystem::path& root) 
 void BenchmarkCompilePipeline::geometry_ready(const BenchmarkImageGeometry& fact) {
  const std::lock_guard lock(impl_->mutex);
  impl_->images.geometry_ready(impl_->images.source(fact.root), fact.image_id, fact.generation, {fact.width, fact.height});
+}
+std::shared_ptr<const BenchmarkEncodedImage> BenchmarkCompilePipeline::image_input(const std::filesystem::path& root, std::uint64_t id) const {
+ const std::lock_guard lock(impl_->mutex);
+ const auto* source = impl_->images.find(root);
+ if (!source || source->retiring) return {};
+ const auto found = source->geometry.find(id);
+ if (found == source->geometry.end() || found->second.generation != source->image_generation(id)) return {};
+ return found->second.input;
 }
 std::optional<BenchmarkImageGeometry> BenchmarkCompilePipeline::geometry(const std::filesystem::path& root, std::uint64_t id) const { return impl_->images.geometry(root, id); }
 struct BenchmarkSourcePublication::State {

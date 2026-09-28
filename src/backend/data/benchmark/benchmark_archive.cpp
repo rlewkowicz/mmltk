@@ -111,7 +111,7 @@ struct BenchmarkArchive::Impl {
  std::size_t block_size = 0;
  bool started = false, direct = false, is_regular = false, safe_name = true, raw_tar = false, compressed = false, verify_crc = true;
  std::size_t decoders = 1, requested_decoders = 1, retained_windows = 1024, index_entries = 32768;
- bool external_cpus = false;
+ bool external_cpus = false, owns_workspace = false;
  std::size_t consumer_descriptors = 0;
  std::uint64_t workspace_bytes = 0;
  Position current;
@@ -133,10 +133,15 @@ struct BenchmarkArchive::Impl {
   decoders = execution ? std::size_t{1} : requested_decoders;
   resume(workspace);
  }
+ ~Impl() {
+  reader.reset(); gzip.reset(); streaming.reset();
+  std::vector<std::uint8_t>().swap(bytes); std::vector<char>().swap(block);
+  if (owns_workspace) credits.retire_workspace();
+ }
  void resume(std::uint64_t workspace) {
   if (reader) return;
   workspace_bytes = workspace;
-  external_cpus = false;
+  external_cpus = false; owns_workspace = false;
   if (execution) {
    const auto bytes = [&](std::size_t workers) { return archive_workspace(compressed, workers, workspace); };
    if (supplied_workspace) {
@@ -148,13 +153,13 @@ struct BenchmarkArchive::Impl {
    if (!credits && compressed && requested_decoders > 1 && execution->workers() > 3) {
     for (auto wanted = std::min(execution->workers() - 1, requested_decoders + 1); wanted > 2; --wanted) {
      auto available = execution->try_reserve({bytes(wanted - 1), 0, consumer_descriptors == 0, wanted, false, consumer_descriptors}, parent_allowance);
-     if (available) { credits = std::move(*available); decoders = wanted - 1; external_cpus = true; break; }
+     if (available) { credits = std::move(*available); decoders = wanted - 1; external_cpus = true; owns_workspace = true; break; }
     }
    }
    // Metadata sources already committed their input descriptor pair before
    // transfer. The consumer continuation is admitted against physical capacity
    // before allocating a decoder or retaining any archive input bytes.
-   if (!credits) { decoders = 1; credits = execution->reserve({bytes(decoders), 0, consumer_descriptors == 0, 0, false, consumer_descriptors}, parent_allowance); }
+   if (!credits) { decoders = 1; credits = execution->reserve({bytes(decoders), 0, consumer_descriptors == 0, 0, false, consumer_descriptors}, parent_allowance); owns_workspace = true; }
   }
   block.resize(kBlock);
   if (compressed) reset_decoder();
@@ -471,6 +476,7 @@ void BenchmarkArchive::pause() {
  auto& s = *impl_;
  s.reader.reset(); s.entry = nullptr; s.gzip.reset(); s.streaming.reset();
  std::vector<std::uint8_t>().swap(s.bytes); std::vector<char>().swap(s.block);
+ if (s.owns_workspace) s.credits.retire_workspace();
  s.credits = {}; s.supplied_workspace = {};
 }
 void BenchmarkArchive::resume(std::uint64_t workspace) { impl_->resume(workspace); }

@@ -3843,7 +3843,7 @@ TEST_CASE("COCONut JSON parsing yields one shared CPU before its source pass fin
  prepare_cached_image_directory(images);
  const std::array<std::uint32_t, 1> mask_ids{1};
  const auto encoded = png(1, 1, mask_ids);
- write_cached_image_atomically(cached_image_path(images, 7), {reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size()}, {});
+ BenchmarkEncodedImage::publish(cached_image_path(images, 7), {reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size()}, {});
  PreparedBenchmarkSplit split;
  split.name = "train";
  split.class_names = {"person"};
@@ -4292,9 +4292,9 @@ TEST_CASE("archive image payloads outlive acquisition and exceptional pool retir
   .selected_image_ids = ids, .image_id_parser = [](std::string_view name) -> std::optional<std::uint64_t> { return name == "images/1.jpg" ? std::optional<std::uint64_t>{1} : std::nullopt; }, .cache_write_workers = 0};
  request.image_ready = [&](const CachedImageReady& ready) { retained = ready.payload; if (fail) throw std::runtime_error("retire acquisition"); };
  if (fail) CHECK_THROWS(extract_selected_archive_images(request)); else (void)extract_selected_archive_images(request);
- REQUIRE(retained); REQUIRE(retained->backing);
- CHECK(std::string(retained->encoded.begin(), retained->encoded.end()) == encoded);
- std::weak_ptr<const void> backing = retained->backing;
+ REQUIRE(retained); REQUIRE(retained->backing());
+ CHECK(std::string(retained->encoded().begin(), retained->encoded().end()) == encoded);
+ std::weak_ptr<const void> backing = retained->backing();
  retained.reset(); CHECK(backing.expired());
 }
 TEST_CASE("complete physical continuations progress beside Curl at low descriptor limits", "[benchmark][coconut][pipeline]") {
@@ -4779,7 +4779,19 @@ TEST_CASE("physical owner withdraws only affected routes and refreshes their con
  struct stat first{}, second{};
  REQUIRE(::stat(other_path.c_str(), &first) == 0);
  const auto train_root = local.cache.source_images("coco") / train.origin.cache_shard;
+ const auto admitted_image = execution.image_input(train_root, 7);
+ REQUIRE(admitted_image);
+ CHECK(admitted_image->storage() == BenchmarkEncodedImage::Storage::HeaderOnly);
+ {
+  mmltk::common::io::FileHandle directory(::open(train_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+  REQUIRE(directory.get() >= 0);
+  const auto image = BenchmarkEncodedImage::open(directory.get(), 7,
+   [](std::uint64_t, std::span<const std::uint8_t>) -> BenchmarkImageHeader { throw std::runtime_error("physical publication header must be reused"); }, {}, nullptr, {}, admitted_image);
+  REQUIRE(image);
+  CHECK(image->header().width == admitted_image->header().width);
+ }
  execution.retire_source(train_root);
+ CHECK_FALSE(execution.image_input(train_root, 7));
  physical.withdraw(train);
  const auto replacement = root.path() / "replacement.tar.gz";
  const std::array<std::uint32_t, 1> pixel{0x001234};
@@ -4803,4 +4815,91 @@ TEST_CASE("physical owner withdraws only affected routes and refreshes their con
  CHECK(geometry->height == 1);
  physical.release_readers(CoconutEdition::Base);
  CHECK(execution.try_reserve({execution.transient_target(), 16}).has_value());
+}
+
+TEST_CASE("retained archive images keep storage after decoder CPUs return", "[benchmark][coconut][archive][pipeline]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPU lanes");
+ bool failure = false, live_cpus_charged = false;
+ SECTION("successful stream") {}
+ SECTION("readiness callback failure") { failure = true; }
+ ScopedTempDir root("archive-execution-storage-split");
+ const auto path = root.path() / "images.tar.gz";
+ const auto encoded = white_jpeg();
+ const std::array<std::pair<std::string, std::string>, 1> members{{{"image.jpg", encoded}}};
+ tar(path, members);
+ BenchmarkCompilePipeline execution(4, {}, {.descriptors = 16});
+ std::shared_ptr<const BenchmarkEncodedImage> retained;
+ const std::array<std::uint64_t, 1> ids{1};
+ ArchiveExtractionRequest request{.archive_path = path, .source_identity = "retained-gzip", .output_root = root.path() / "images", .source = "coco", .shard = "train2017",
+  .selected_image_ids = ids, .image_id_parser = [](std::string_view) { return std::optional<std::uint64_t>{1}; }, .decompression_workers = 2, .cache_write_workers = 0,
+  .image_ready = [&](const CachedImageReady& ready) {
+   retained = ready.payload;
+   live_cpus_charged = !execution.try_reserve({0, 0, false, 3});
+   if (failure) throw std::runtime_error("readiness callback failure");
+  }, .execution = &execution};
+ if (failure) CHECK_THROWS(extract_selected_archive_images(request));
+ else CHECK(extract_selected_archive_images(request).image_count == 1);
+ CHECK(live_cpus_charged);
+ REQUIRE(retained);
+ CHECK(retained->storage() == BenchmarkEncodedImage::Storage::Pooled);
+ CHECK(std::string(retained->encoded().begin(), retained->encoded().end()) == encoded);
+ CHECK(retained->allowance().bytes() == (64ULL << 20));
+ CHECK(execution.try_reserve({0, 0, false, 3}).has_value());
+ CHECK_FALSE(execution.try_reserve({execution.transient_target(), 0}).has_value());
+ const std::weak_ptr<const void> backing = retained->backing();
+ retained.reset();
+ CHECK(backing.expired());
+ CHECK(execution.try_reserve({execution.transient_target(), 16}).has_value());
+}
+
+TEST_CASE("paused archive custody cannot retain retired external execution", "[benchmark][coconut][archive][pipeline]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPU lanes");
+ ScopedTempDir root("paused-archive-cpu-custody");
+ const auto path = root.path() / "archive.tar.gz";
+ const std::array<std::pair<std::string, std::string>, 1> members{{{"member", "bytes"}}};
+ tar(path, members);
+ BenchmarkCompilePipeline execution(4);
+ BenchmarkArchive archive(path, &execution, 1024, {}, 2);
+ REQUIRE(archive.next());
+ auto retained = archive.allowance();
+ CHECK_FALSE(execution.try_reserve({0, 0, false, 3}).has_value());
+ archive.pause();
+ CHECK(execution.try_reserve({0, 0, false, 3}).has_value());
+ CHECK(execution.try_reserve({execution.transient_target(), 0}).has_value());
+ retained = {};
+ CHECK(execution.try_reserve({execution.transient_target(), 0}).has_value());
+}
+
+TEST_CASE("oversized gzip storage admits its synchronous pixel continuation", "[benchmark][coconut][archive][pipeline]") {
+ using namespace std::chrono_literals;
+ ScopedTempDir root("gzip-pixel-continuation");
+ const auto path = root.path() / "images.tar.gz", images = root.path() / "images";
+ const auto encoded = white_jpeg();
+ const std::array<std::pair<std::string, std::string>, 2> members{{{"1.jpg", encoded}, {"2.jpg", encoded}}};
+ tar(path, members);
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 13}, cancellation);
+ PreparedBenchmarkSplit split;
+ split.name = "train"; split.class_names = {"person"}; split.sources = {{images}};
+ split.images = {{1, 3, 3, 0, 0, 0}, {2, 3, 3, 0, 0, 0}};
+ BenchmarkWriteRequest pixels{.split = split, .output_path = root.path() / "result.bin", .resolution = 1, .num_workers = 1, .cancel_requested = cancellation, .execution = &execution};
+ BenchmarkSplitWriter writer(pixels, true);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ const auto publication = execution.source_publication(images, {});
+ std::atomic<unsigned> consumed{0};
+ const std::array<std::uint64_t, 2> selected{1, 2};
+ auto extraction = std::async(std::launch::async, [&] {
+  return extract_selected_archive_images({.archive_path = path, .source_identity = "oversized-continuation", .output_root = images, .source = "coco", .shard = "train2017",
+   .selected_image_ids = selected, .image_id_parser = [](std::string_view name) { return std::optional<std::uint64_t>{name == "1.jpg" ? 1U : 2U}; }, .cancel_requested = cancellation,
+   .image_ready = [&](const CachedImageReady& ready) { if (!publication.consume(ready)) throw std::runtime_error("missing synchronous pixel consumer"); ++consumed; }, .execution = &execution});
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); });
+ CHECK(mmltk::testsupport::await_test_future(extraction, "oversized producer with required pixel continuation").image_count == 2);
+ CHECK(consumed.load() == 2);
+ CHECK(writer.completed() == 2);
+ execution.drain();
+ writer.finish(pixels);
+ CHECK(CompiledDataset::open(pixels.output_path).header().num_images == 2);
 }

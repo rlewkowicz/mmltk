@@ -14,6 +14,7 @@
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
 class BenchmarkCurl;
+class BenchmarkResourceWait;
 class BenchmarkSplitWriter;
 struct PreparedBenchmarkSplit;
 class StorageReservationPool;
@@ -30,6 +31,7 @@ class BenchmarkCompilePipeline final {
  struct Admission;
  using Credits = BenchmarkAllowance::Credits;
  friend class BenchmarkAllowance;
+ friend class BenchmarkResourceWait;
 public:
  explicit BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus = {}, BenchmarkExecutionLimits = {},
   mmltk::common::concurrency::CancellationObservation = {});
@@ -51,6 +53,9 @@ public:
  [[nodiscard]] std::uint64_t admission_generation() const;
  void wait_for_admission_change(std::uint64_t, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
  void notify_admission_change() noexcept;
+ // A deferred I/O input observes this same admission event while keeping idle
+ // scratch reclaimable. The token is retired on admission or abandonment.
+ [[nodiscard]] std::unique_ptr<BenchmarkResourceWait> defer_resources();
  // Reject impossible controller demands before a nonblocking admission loop.
  void require_feasible(BenchmarkResources) const;
  [[nodiscard]] std::size_t descriptor_ceiling(BenchmarkResources) const;
@@ -82,6 +87,7 @@ public:
  [[nodiscard]] BenchmarkSourceGeneration image_generation(const std::filesystem::path&, std::uint64_t);
  void retire_image(const std::filesystem::path&, std::uint64_t);
  void geometry_ready(const BenchmarkImageGeometry&);
+ [[nodiscard]] std::shared_ptr<const BenchmarkEncodedImage> image_input(const std::filesystem::path&, std::uint64_t) const;
  [[nodiscard]] std::optional<BenchmarkImageGeometry> geometry(const std::filesystem::path&, std::uint64_t) const;
  // Withdraw admission first, join only this source, then clear affected facts.
  // Unrelated source tasks and completed products continue to be usable.
@@ -103,5 +109,15 @@ private:
  void retire_workspace(const void*) noexcept;
  struct Impl;
  std::shared_ptr<Impl> impl_;
+};
+class BenchmarkResourceWait final {
+public:
+ ~BenchmarkResourceWait();
+ BenchmarkResourceWait(const BenchmarkResourceWait&) = delete;
+ BenchmarkResourceWait& operator=(const BenchmarkResourceWait&) = delete;
+private:
+ friend class BenchmarkCompilePipeline;
+ explicit BenchmarkResourceWait(std::shared_ptr<BenchmarkCompilePipeline::Admission>);
+ std::shared_ptr<BenchmarkCompilePipeline::Admission> owner_;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

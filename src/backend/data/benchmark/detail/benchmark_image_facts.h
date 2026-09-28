@@ -1,6 +1,4 @@
 #pragma once
-#include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include <span>
 #include <cstdint>
 #include <filesystem>
@@ -19,17 +17,7 @@ struct BenchmarkImageGeometry {
  BenchmarkSourceGeneration generation = 0;
  std::uint32_t width = 0, height = 0;
 };
-// The backing and its capacity grant follow the last reader. Producers may
-// supply a pooled vector or an opened mapping without copying encoded bytes.
-struct BenchmarkEncodedImage {
- BenchmarkAllowance allowance;
- std::shared_ptr<const void> backing;
- std::span<const std::uint8_t> encoded;
- BenchmarkImageHeader header;
- // Same published inode, mapped before its staging descriptor closes. Used
- // under pressure when retaining the pooled input would block its consumer.
- std::shared_ptr<const BenchmarkEncodedImage> file_backing;
-};
+class BenchmarkEncodedImage;
 // Emitted only after admitted cache reuse or atomic image publication.
 // Physical custody and generation come from the captured publication ticket.
 struct CachedImageReady {

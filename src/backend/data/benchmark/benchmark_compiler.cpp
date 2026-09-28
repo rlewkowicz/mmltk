@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
 #include <list>
 #include "src/pch_linux.h"
@@ -187,7 +188,7 @@ public:
    try {
     if (!publication.consume(ready)) {
      BenchmarkImageValidator validator;
-     validator.validate_decodable(ready.payload->encoded, decode_probe->expected_width, decode_probe->expected_height);
+     validator.validate_decodable(ready.payload->encoded(), decode_probe->expected_width, decode_probe->expected_height);
     }
    } catch (const BenchmarkImageReadError& error) {
     if (require_every_image) throw RequiredImageDecodeError(error.what());
