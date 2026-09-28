@@ -302,7 +302,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   const auto key = std::pair{release.edition, source};
   auto cached = retained.components.find(key);
   const auto expected_identity = coconut_component_input_identity(identity, source, recovery ? &*recovery : nullptr);
-  if (cached != retained.components.end() && cached->second.input_identity != expected_identity) {
+  if (cached != retained.components.end() && cached->second.input_identity() != expected_identity) {
    retained.components.erase(cached);
    cached = retained.components.end();
   }
@@ -314,7 +314,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    }
    cached = retained.components.emplace(key, std::move(*admitted)).first;
    trace_benchmark_event(trace, "benchmark.annotations.component_admitted",
-    [&] { return nlohmann::json{{"edition", release.edition}, {"source", coconut_namespace_name(source)}, {"images", cached->second.index.image_count()}}; });
+    [&] { return nlohmann::json{{"edition", release.edition}, {"source", coconut_namespace_name(source)}, {"images", cached->second.index().image_count()}}; });
   }
   reusable.insert(source);
   if (!metadata_only) {
@@ -322,15 +322,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    components.push_back(std::move(cached->second));
    retained.components.erase(cached);
   } else {
-   const auto& full = cached->second;
-   CoconutComponent membership;
-   membership.edition = full.edition;
-   membership.source = full.source;
-   membership.input_identity = full.input_identity;
-   membership.index = full.index;
-   membership.inventory = full.inventory;
-   membership.inventory_seal = full.inventory_seal;
-   components.push_back(std::move(membership));
+   components.push_back(cached->second.membership());
   }
  }
  if (!complete) {
@@ -371,7 +363,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    try {
     components = import_coconut_annotations(request);
     for (auto& cached : cached_components) {
-     const auto found = std::ranges::find(components, cached.source, &CoconutComponent::source);
+     const auto found = std::ranges::find(components, cached.source(), &CoconutComponent::source);
      if (found != components.end())
       *found = std::move(cached);
      else
@@ -422,27 +414,27 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    }
   }
   for (const auto& component : components)
-   if (std::ranges::find(sources, component.source) == sources.end()) throw std::runtime_error("COCONut release references a namespace outside its selected recipe");
+   if (std::ranges::find(sources, component.source()) == sources.end()) throw std::runtime_error("COCONut release references a namespace outside its selected recipe");
   for (const auto& component : components) {
-   if (!metadata_only && component.index.image_count() != 0 && !reusable.contains(component.source)) store_coconut_component(path_for(component.source), component, cancellation, &reservations);
+   if (!metadata_only && component.index().image_count() != 0 && !reusable.contains(component.source())) store_coconut_component(path_for(component.source()), component, cancellation, &reservations);
   }
  }
  for (std::size_t i = 0; i < downloads.size(); ++i) prepared.manifest["artifacts"][first_artifact + i]["identity"] = downloads[i].identity;
  for (const auto& component : components)
-  if (std::ranges::find(sources, component.source) == sources.end()) throw std::runtime_error("COCONut release references a namespace outside its selected recipe");
+  if (std::ranges::find(sources, component.source()) == sources.end()) throw std::runtime_error("COCONut release references a namespace outside its selected recipe");
  std::uint64_t admitted_rows = 0;
- for (const auto& component : components) admitted_rows = checked_add(admitted_rows, component.index.image_count(), "COCONut release count overflow");
+ for (const auto& component : components) admitted_rows = checked_add(admitted_rows, component.index().image_count(), "COCONut release count overflow");
  if (release.expected_rows != 0 && admitted_rows != release.expected_rows) throw std::runtime_error("COCONut cached release membership is incomplete");
  for (auto& component : components) {
-  const auto index_path = path_for(component.source);
+  const auto index_path = path_for(component.source());
   if (!metadata_only || complete)
    prepared.annotation_storage_bytes = checked_add(prepared.annotation_storage_bytes, coconut_component_storage_bytes(component), "COCONut index storage overflow");
   prepared.manifest["components"].push_back(
-   {{"edition", release.edition}, {"revision", release.revision}, {"physical_source", coconut_namespace_name(component.source)}, {"input_identity", component.input_identity},
-    {"recovery_policy", component.recovery_policy}, {"original_annotation_identity", component.original_annotation_identity}, {"offered_images", component.index.image_count()},
-    {"annotation_source", coconut_annotation_source(component.source)}, {"imported_annotation_sha256", component.index.annotation_sha256},
+   {{"edition", release.edition}, {"revision", release.revision}, {"physical_source", coconut_namespace_name(component.source())}, {"input_identity", component.input_identity()},
+    {"recovery_policy", component.recovery_policy()}, {"original_annotation_identity", component.original_annotation_identity()}, {"offered_images", component.index().image_count()},
+    {"annotation_source", coconut_annotation_source(component.source())}, {"imported_annotation_sha256", component.index().annotation_sha256},
     {"imported_index", index_path.lexically_relative(cache.root).string()},
-    {"imported_index_identity", metadata_only && !complete ? nlohmann::json(nullptr) : nlohmann::json(component.index.completion->identity)}});
+    {"imported_index_identity", metadata_only && !complete ? nlohmann::json(nullptr) : nlohmann::json(component.completion()->identity)}});
   prepared.components.push_back(std::move(component));
  }
  return prepared;
@@ -596,7 +588,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   prepared.components.insert(prepared.components.end(), std::make_move_iterator(release->components.begin()), std::make_move_iterator(release->components.end()));
  }
  prepared.duplicate_xl_images = reconcile_coconut_extensions(prepared.components, cancellation);
- std::erase_if(prepared.components, [](const CoconutComponent& component) { return component.index.image_count() == 0; });
+ std::erase_if(prepared.components, [](const CoconutComponent& component) { return component.index().image_count() == 0; });
  if (config.selection.validation == CoconutValidation::Stock) {
   prepared.stock_validation = metadata_only ? originals.validation : std::move(originals.validation);
   prepared.validation_images = prepared.stock_validation->images.size();
@@ -614,17 +606,17 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  };
  std::uint64_t coco_val_count = prepared.validation_images;
  for (const auto& component : prepared.components) {
-  if (!coconut_validation_component(component.edition)) {
-   const auto source = split_key(component.inventory.front().physical).first;
+  if (!coconut_validation_component(component.edition())) {
+   const auto source = split_key(component.inventory().front().physical).first;
    auto& membership = train_members[static_cast<std::size_t>(source)];
-   membership.reserve(checked_add(membership.size(), component.inventory.size(), "COCONut split membership overflow"));
-   for (const auto& image : component.inventory) {
+   membership.reserve(checked_add(membership.size(), component.inventory().size(), "COCONut split membership overflow"));
+   for (const auto& image : component.inventory()) {
     throw_if_benchmark_cancelled(cancellation);
     if (!membership.insert(image.physical.image_id).second) throw std::runtime_error("COCONut training contains an unreconciled physical member");
    }
   } else {
-   prepared.validation_images = checked_add(prepared.validation_images, component.index.image_count(), "COCONut validation count overflow");
-   if (component.source == CoconutImageNamespace::CocoValidation) coco_val_count = component.index.image_count();
+   prepared.validation_images = checked_add(prepared.validation_images, component.index().image_count(), "COCONut validation count overflow");
+   if (component.source() == CoconutImageNamespace::CocoValidation) coco_val_count = component.index().image_count();
   }
  }
  if (prepared.stock_validation)
@@ -632,17 +624,17 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
    if (train_members[static_cast<std::size_t>(CoconutImageNamespace::CocoTrain)].contains(image.source_image_id)) throw std::runtime_error("COCONut training reuses a stock validation physical ID");
  if (coco_val_count != catalog.coco_validation_images) throw std::runtime_error("COCONut COCO validation membership is incomplete");
  for (const auto& component : prepared.components) {
-  if (coconut_validation_component(component.edition))
-   for (const auto& image : component.inventory)
+  if (coconut_validation_component(component.edition()))
+   for (const auto& image : component.inventory())
     if (contains_training(image.physical)) throw std::runtime_error("COCONut train and validation reuse a physical member");
  }
  for (auto& facts : prepared.manifest["components"]) {
   const auto found = std::ranges::find_if(
-   prepared.components, [&](const CoconutComponent& component) { return facts["edition"] == component.edition && facts["physical_source"] == coconut_namespace_name(component.source); });
-  const auto admitted = found == prepared.components.end() ? 0U : found->index.image_count();
+   prepared.components, [&](const CoconutComponent& component) { return facts["edition"] == component.edition() && facts["physical_source"] == coconut_namespace_name(component.source()); });
+  const auto admitted = found == prepared.components.end() ? 0U : found->index().image_count();
   facts["admitted_images"] = admitted;
   facts["covered_by_large_images"] = facts["offered_images"].get<std::uint64_t>() - admitted;
-  facts["selected_annotation_sha256"] = found == prepared.components.end() ? nlohmann::json(nullptr) : nlohmann::json(found->index.annotation_sha256);
+  facts["selected_annotation_sha256"] = found == prepared.components.end() ? nlohmann::json(nullptr) : nlohmann::json(found->index().annotation_sha256);
  }
  for (const auto& admitted : acquired) {
   const auto& archive = admitted.origin;
@@ -657,14 +649,14 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  std::uint64_t recovered = 0, unresolved = 0;
  for (const auto& component : prepared.components) {
   std::uint64_t component_recovered = 0;
-  const bool eligible = component.source == CoconutImageNamespace::CocoTrain || component.source == CoconutImageNamespace::CocoValidation;
-  std::uint64_t component_unresolved = config.selection.recover_dropped_masks && eligible && !component.recovery_policy ? component.index.rejected.degenerate_boxes : 0;
-  for (std::size_t position = 0; position < component.recovery.size(); ++position) {
-   const auto& image = component.recovery[position];
-   const auto& inventory = component.inventory.at(position);
+  const bool eligible = component.source() == CoconutImageNamespace::CocoTrain || component.source() == CoconutImageNamespace::CocoValidation;
+  std::uint64_t component_unresolved = config.selection.recover_dropped_masks && eligible && !component.recovery_policy() ? component.index().rejected.degenerate_boxes : 0;
+  for (std::size_t position = 0; position < component.recovery().size(); ++position) {
+   const auto& image = component.recovery()[position];
+   const auto& inventory = component.inventory_image(position);
    if (inventory.physical.image_id != image.image_id) throw std::logic_error("recovery report image is absent from component inventory");
    for (const auto& object : image.omissions)
-    failures.reject(inventory.physical, inventory.release_image_id, coconut_release_component(component.edition).name, object.annotation_id, object.source_category_id,
+    failures.reject(inventory.physical, inventory.release_image_id, coconut_release_component(component.edition()).name, object.annotation_id, object.source_category_id,
      "thing segment remains without mask pixels or an authoritative bbox");
    component_recovered = checked_add(component_recovered, image.objects.size(), "recovery count overflow");
    component_unresolved = checked_add(component_unresolved, image.unresolved, "recovery omission count overflow");
@@ -672,7 +664,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   recovered = checked_add(recovered, component_recovered, "recovery count overflow");
   unresolved = checked_add(unresolved, component_unresolved, "recovery omission count overflow");
   for (auto& facts : prepared.manifest["components"])
-   if (facts["edition"] == component.edition && facts["physical_source"] == coconut_namespace_name(component.source)) {
+   if (facts["edition"] == component.edition() && facts["physical_source"] == coconut_namespace_name(component.source())) {
     facts["recovered_objects"] = component_recovered;
     facts["unresolved_objects"] = component_unresolved;
    }

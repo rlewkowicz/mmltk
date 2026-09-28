@@ -843,7 +843,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     };
     std::vector<std::uint64_t> archive_sizes;
     if (enhanced) {
-     for (const auto& component : enhanced->components) count_index(component.index, coconut_validation_component(component.edition));
+     for (const auto& component : enhanced->components) count_index(component.index(), coconut_validation_component(component.edition()));
      if (enhanced->stock_validation) count_index(NormalizedAnnotationReadView(*enhanced->stock_validation), true);
      for (const auto& archive : admitted) archive_sizes.push_back(archive.origin.artifact.expected_size);
     } else {
@@ -905,7 +905,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       archive_tasks.push_back({archive.artifact.source, archive.cache_shard, {}, archive.artifact, {}, archive.source, archive.shard, &acquired});
      }
      for (const auto& component : enhanced->components)
-      for (const auto& row : component.inventory) {
+      for (const auto& row : component.inventory()) {
        throw_if_benchmark_cancelled(cancel_requested);
        auto& task = archive_tasks.at(task_slots.at({row.physical.source, row.physical.shard}));
        task.image_ids.push_back(row.physical.image_id);
@@ -940,7 +940,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     // known. Label projection and acquisition never mutate this pixel inventory.
     PreparedBenchmarkSplit pixel_train = make_split("train"), pixel_validation = make_split("val");
     const auto append_pixel_members = [&](const NormalizedAnnotationReadView& index, bool validation_split, std::optional<CoconutImageNamespace> physical_source = {},
-                                       std::span<const CoconutInventoryImage> physical_rows = {}) {
+                                       const CoconutComponent* physical_rows = nullptr) {
      auto& split = validation_split ? pixel_validation : pixel_train;
      std::unordered_map<std::uint16_t, std::uint16_t> source_slots;
      for (const auto& task : archive_tasks) {
@@ -955,12 +955,12 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      for (std::size_t i = 0; i < index.image_count(); ++i) {
       const auto& image = index.image(i);
       if (!physical_source && !validation_split && !image.box_count) continue;
-      const auto shard = physical_rows.empty() ? image.source_shard : physical_rows[i].physical.shard;
+      const auto shard = physical_rows ? physical_rows->inventory_image(i).physical.shard : image.source_shard;
       split.images.push_back({image.source_image_id, image.width, image.height, 0, 0, source_slots.at(shard)});
      }
     };
     if (enhanced) {
-     for (const auto& component : enhanced->components) append_pixel_members(component.index, coconut_validation_component(component.edition), component.source, component.inventory);
+     for (const auto& component : enhanced->components) append_pixel_members(component.index(), coconut_validation_component(component.edition()), component.source(), &component);
      if (enhanced->stock_validation) append_pixel_members(NormalizedAnnotationReadView(*enhanced->stock_validation), true, CoconutImageNamespace::CocoValidation);
     } else {
      append_pixel_members(*coco_train, false);
@@ -1316,35 +1316,35 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       std::map<std::pair<CoconutImageNamespace, std::uint16_t>, std::uint16_t> slots;
       for (std::size_t task_index = 0; task_index < archive_tasks.size(); ++task_index) {
        const auto& task = archive_tasks[task_index];
-       if (task.image_namespace != component.source) continue;
+       if (task.image_namespace != component.source()) continue;
        if (!archive_results[task_index]) throw std::runtime_error("COCONut archive did not settle");
        slots.emplace(std::pair{task.image_namespace, task.numeric_shard}, common_math::checked_cast<std::uint16_t>(directories.size(), "COCONut directory count overflow"));
        directories.push_back(*archive_results[task_index]);
       }
       std::vector<std::uint16_t> image_sources;
-      image_sources.reserve(component.inventory.size());
-      for (const auto& row : component.inventory) image_sources.push_back(slots.at({row.physical.source, row.physical.shard}));
-      const auto release = std::ranges::find(coconut_catalog.releases, component.edition, &CoconutReleaseComponent::edition);
+      image_sources.reserve(component.inventory().size());
+      for (const auto& row : component.inventory()) image_sources.push_back(slots.at({row.physical.source, row.physical.shard}));
+      const auto release = std::ranges::find(coconut_catalog.releases, component.edition(), &CoconutReleaseComponent::edition);
       if (release == coconut_catalog.releases.end()) throw std::runtime_error("COCONut component release is absent");
-      const bool is_validation = coconut_validation_component(component.edition);
+      const bool is_validation = coconut_validation_component(component.edition());
       auto& writer = is_validation ? validation_writer : train_writer;
       auto& next_slot = is_validation ? validation_slot : train_slot;
       std::vector<std::pair<std::uint32_t, std::uint32_t>> dimensions;
-      dimensions.reserve(component.index.image_count());
-      for (std::size_t i = 0; i < component.index.image_count(); ++i, ++next_slot) {
-       const auto& image = component.index.image(i);
+      dimensions.reserve(component.index().image_count());
+      for (std::size_t i = 0; i < component.index().image_count(); ++i, ++next_slot) {
+       const auto& image = component.index().image(i);
        const auto actual = writer.header_dimensions(next_slot).value_or(std::pair{image.width, image.height});
        dimensions.push_back(actual);
        if (actual == std::pair{image.width, image.height}) continue;
-       const auto& identity = component.inventory[i];
+       const auto& identity = component.inventory()[i];
        const auto reason = "annotation dimensions " + std::to_string(image.width) + "x" + std::to_string(image.height) + " do not match image dimensions " + std::to_string(actual.first) + "x" +
                            std::to_string(actual.second);
-       for (const auto& box : component.index.storage().boxes.subspan(static_cast<std::size_t>(image.first_box), image.box_count))
+       for (const auto& box : component.index().storage().boxes.subspan(static_cast<std::size_t>(image.first_box), image.box_count))
         coconut_failures.reject(identity.physical, identity.release_image_id, release->name, box.annotation_id, box.source_category_id, reason);
       }
       auto& split = is_validation ? validation : train;
       auto count = append_source_plan(
-       component.index, directories, nullptr, config.resolution, config.resize_mode, true, &split, cancel_requested, coconut_annotation_source(component.source), image_sources, dimensions, &pipeline);
+       component.index(), directories, nullptr, config.resolution, config.resize_mode, true, &split, cancel_requested, coconut_annotation_source(component.source()), image_sources, dimensions, &pipeline);
       auto& dropped_boxes = is_validation ? validation_target_dropped_boxes : training_target_dropped_boxes;
       dropped_boxes = common_math::checked_add(dropped_boxes, count.dropped_boxes, "COCONut rejected annotation count overflow");
       source_counts.push_back(count);
@@ -1526,7 +1526,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      annotation_drops = common_math::checked_add(annotation_drops, index.rejected.duplicate_boxes, "benchmark rejected annotation count overflow");
     };
     if (enhanced) {
-     for (const auto& component : enhanced->components) add_annotation_drops(component.index);
+     for (const auto& component : enhanced->components) add_annotation_drops(component.index());
      if (enhanced->stock_validation) add_annotation_drops(NormalizedAnnotationReadView(*enhanced->stock_validation));
     } else {
      add_annotation_drops(*coco_train);

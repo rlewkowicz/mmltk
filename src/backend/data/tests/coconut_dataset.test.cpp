@@ -271,11 +271,23 @@ void check_publication_bytes(const std::filesystem::path& output, std::string_vi
  CHECK(file_bytes(output / "val.bin") == validation);
  CHECK(file_bytes(output / "benchmark_manifest.json") == manifest);
 }
+CoconutComponentBuilder component_builder(const CoconutComponent& component) {
+ CoconutComponentBuilder builder;
+ builder.edition = component.edition(); builder.source = component.source(); builder.input_identity = component.input_identity();
+ builder.recovery_policy = component.recovery_policy(); builder.original_annotation_identity = component.original_annotation_identity();
+ static_cast<NormalizedAnnotationMetadata&>(builder.index) = component.index();
+ for (std::size_t i = 0; i < component.index().image_count(); ++i) {
+  append_normalized_image_slice(builder.index, component.index().storage(), component.index().source_position(i));
+  builder.inventory.push_back(component.inventory_image(i));
+  if (builder.recovery_policy) builder.recovery.push_back(component.recovery_image(i));
+ }
+ return builder;
+}
 void expect_runs(const CoconutComponent& component, std::span<const RLEPair> expected) {
- REQUIRE(component.index.run_count() == expected.size());
+ REQUIRE(component.index().run_count() == expected.size());
  for (std::size_t i = 0; i < expected.size(); ++i) {
-  CHECK(component.index.storage().mask_rle_pairs[i].start == expected[i].start);
-  CHECK(component.index.storage().mask_rle_pairs[i].length == expected[i].length);
+  CHECK(component.index().storage().mask_rle_pairs[i].start == expected[i].start);
+  CHECK(component.index().storage().mask_rle_pairs[i].length == expected[i].length);
  }
 }
 NormalizedAnnotationBuilder recovery_originals(unsigned image_id, std::span<const RLEPair> masks) {
@@ -351,12 +363,12 @@ TEST_CASE("COCONut Parquet shards preserve exact holes singleton crowd null area
  auto components = import_coconut_annotations(input);
  REQUIRE(components.size() == 2);
  const auto& train = components[0];
- REQUIRE(train.index.image_count() == 2);
- REQUIRE(train.index.box_count() == 2);
- CHECK(train.index.images()[0].source_image_id == 7);
- CHECK(train.index.images()[1].source_image_id == 9);
- CHECK(train.index.images()[1].box_count == 0);
- const auto& box = train.index.storage().boxes[0];
+ REQUIRE(train.index().image_count() == 2);
+ REQUIRE(train.index().box_count() == 2);
+ CHECK(train.index().images()[0].source_image_id == 7);
+ CHECK(train.index().images()[1].source_image_id == 9);
+ CHECK(train.index().images()[1].box_count == 0);
+ const auto& box = train.index().storage().boxes[0];
  CHECK(box.original_area == 7);
  CHECK(box.x1 == 0.0F);
  CHECK(box.y1 == 0.0F);
@@ -366,7 +378,7 @@ TEST_CASE("COCONut Parquet shards preserve exact holes singleton crowd null area
  CHECK(box.annotation_id == 1);
  CHECK(box.source_ordinal == 0);
  CHECK(box.class_id == 0);
- const auto& singleton = train.index.storage().boxes[1];
+ const auto& singleton = train.index().storage().boxes[1];
  CHECK(singleton.x1 == 1.0F / 3.0F);
  CHECK(singleton.y1 == 1.0F / 3.0F);
  CHECK(singleton.x2 == 2.0F / 3.0F);
@@ -376,21 +388,21 @@ TEST_CASE("COCONut Parquet shards preserve exact holes singleton crowd null area
  CHECK(singleton.source_category_id == 2);
  const std::array<RLEPair, 4> runs{{{0, 4}, {5, 2}, {8, 1}, {4, 1}}};
  expect_runs(train, runs);
- CHECK(components[1].source == CoconutImageNamespace::CocoUnlabeled);
- REQUIRE(components[1].index.image_count() == 1);
- CHECK(components[1].index.images()[0].source_image_id == 8);
- CHECK(components[1].index.box_count() == 0);
+ CHECK(components[1].source() == CoconutImageNamespace::CocoUnlabeled);
+ REQUIRE(components[1].index().image_count() == 1);
+ CHECK(components[1].index().images()[0].source_image_id == 8);
+ CHECK(components[1].index().box_count() == 0);
  const auto cache = root.path() / "index.bin";
  store_coconut_component(cache, train);
- auto loaded = load_coconut_component(cache, train.edition, train.source, input.input_identity);
+ auto loaded = load_coconut_component(cache, train.edition(), train.source(), input.input_identity);
  REQUIRE(loaded);
- CHECK(loaded->inventory == train.inventory);
+ CHECK(std::ranges::equal(loaded->inventory(), train.inventory()));
  expect_runs(*loaded, runs);
- CHECK_FALSE(load_coconut_component(cache, train.edition, train.source, "another-edition"));
+ CHECK_FALSE(load_coconut_component(cache, train.edition(), train.source(), "another-edition"));
  auto manifest = read_json_file(cache.string() + ".complete.json");
  manifest["coconut"]["inventory_identity"] = std::string(64, '0');
  json_file(cache.string() + ".complete.json", manifest);
- CHECK_FALSE(load_coconut_component(cache, train.edition, train.source, input.input_identity));
+ CHECK_FALSE(load_coconut_component(cache, train.edition(), train.source(), input.input_identity));
 }
 TEST_CASE("COCONut Parquet rejects malformed nested records missing membership and bounded overflows", "[coconut]") {
  ScopedTempDir root("coconut-malformed");
@@ -475,12 +487,12 @@ TEST_CASE("COCONut JSON joins retain heterogeneous Large rows and validation phy
  tar(input.mask_archive, owned);
  auto components = import_coconut_annotations(input);
  REQUIRE(components.size() == 2);
- CHECK(components[0].source == CoconutImageNamespace::Objects365V1);
- CHECK(components[1].source == CoconutImageNamespace::Objects365V2);
- for (const auto& component : components) CHECK(component.index.images()[0].source_image_id == 91105);
- CHECK(components[0].inventory[0].release_image_id == 691105);
- CHECK(components[0].inventory[0].physical.member == "image/objects365_v1_00091105.jpg");
- const auto& box = components[0].index.storage().boxes[0];
+ CHECK(components[0].source() == CoconutImageNamespace::Objects365V1);
+ CHECK(components[1].source() == CoconutImageNamespace::Objects365V2);
+ for (const auto& component : components) CHECK(component.index().images()[0].source_image_id == 91105);
+ CHECK(components[0].inventory()[0].release_image_id == 691105);
+ CHECK(components[0].inventory()[0].physical.member == "image/objects365_v1_00091105.jpg");
+ const auto& box = components[0].index().storage().boxes[0];
  CHECK(box.x1 == 0.125F);
  CHECK(box.y1 == 0.25F);
  CHECK(box.x2 == 0.875F);
@@ -489,13 +501,13 @@ TEST_CASE("COCONut JSON joins retain heterogeneous Large rows and validation phy
  CHECK(box.original_area == 2);
  const std::array<RLEPair, 2> runs{{{0, 1}, {3, 1}}};
  expect_runs(components[0], runs);
- CHECK(components[0].index.storage().boxes[0].source_ordinal == 0);
- CHECK(components[1].index.storage().boxes[components[1].index.image(0).first_box].source_ordinal == 1);
+ CHECK(components[0].index().storage().boxes[0].source_ordinal == 0);
+ CHECK(components[1].index().storage().boxes[components[1].index().image(0).first_box].source_ordinal == 1);
  const auto cache = root.path() / "val.bin";
  store_coconut_component(cache, components[0]);
  auto loaded = load_coconut_component(cache, input.edition, CoconutImageNamespace::Objects365V1, input.input_identity);
  REQUIRE(loaded);
- CHECK(loaded->inventory[0].release_image_id == 691105);
+ CHECK(loaded->inventory()[0].release_image_id == 691105);
 }
 TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with Large precedence", "[coconut]") {
  ScopedTempDir root("coconut-extensions");
@@ -516,10 +528,10 @@ TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with La
  tar(input.mask_archive, members);
  auto components = import_coconut_annotations(input);
  REQUIRE(components.size() == 1);
- REQUIRE(components[0].index.image_count() == 2);
- CHECK(components[0].inventory[1].release_image_id == 900);
- CHECK(components[0].index.storage().boxes[0].source_ordinal == 1);
- CHECK(components[0].index.storage().boxes[1].source_ordinal == 0);
+ REQUIRE(components[0].index().image_count() == 2);
+ CHECK(components[0].inventory()[1].release_image_id == 900);
+ CHECK(components[0].index().storage().boxes[0].source_ordinal == 1);
+ CHECK(components[0].index().storage().boxes[1].source_ordinal == 0);
  input.edition = CoconutEdition::XLarge;
  input.annotation_json.clear();
  input.mask_archive = root.path() / "xl.tar";
@@ -530,24 +542,24 @@ TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with La
  tar(input.mask_archive, xl_members);
  auto xl = import_coconut_annotations(input);
  REQUIRE(xl.size() == 1);
- REQUIRE(xl[0].index.image_count() == 2);
- CHECK(xl[0].index.images()[0].source_image_id == 2);
- CHECK(xl[0].index.images()[0].width == 1);
- CHECK(xl[0].index.images()[0].height == 1);
- CHECK(xl[0].index.storage().boxes[0].source_ordinal == 0);
- CHECK(xl[0].index.storage().boxes[1].source_ordinal == 1);
+ REQUIRE(xl[0].index().image_count() == 2);
+ CHECK(xl[0].index().images()[0].source_image_id == 2);
+ CHECK(xl[0].index().images()[0].width == 1);
+ CHECK(xl[0].index().images()[0].height == 1);
+ CHECK(xl[0].index().storage().boxes[0].source_ordinal == 0);
+ CHECK(xl[0].index().storage().boxes[1].source_ordinal == 1);
  components.push_back(std::move(xl[0]));
  const auto full_path = root.path() / "full-xl.bin";
  store_coconut_component(full_path, components[1]);
- const auto full_component = load_coconut_component(full_path, components[1].edition, components[1].source, components[1].input_identity);
+ const auto full_component = load_coconut_component(full_path, components[1].edition(), components[1].source(), components[1].input_identity());
  REQUIRE(full_component);
  components[1] = *full_component;
  const auto original = components;
- const auto* retained_boxes = components[1].index.storage().boxes.data();
- const auto* retained_runs = components[1].index.storage().mask_rle_pairs.data();
- const auto* retained_inventory = components[1].inventory.data();
- const auto full_box_count = components[1].index.storage().boxes.size(), full_run_count = components[1].index.storage().mask_rle_pairs.size();
- const auto previous_identity = components[1].index.annotation_sha256;
+ const auto* retained_boxes = components[1].index().storage().boxes.data();
+ const auto* retained_runs = components[1].index().storage().mask_rle_pairs.data();
+ const auto* retained_inventory = &components[1].inventory_image(1);
+ const auto full_box_count = components[1].index().storage().boxes.size(), full_run_count = components[1].index().storage().mask_rle_pairs.size();
+ const auto previous_identity = components[1].index().annotation_sha256;
  PollCancellation observed;
  CHECK(reconcile_coconut_extensions(components, mmltk::common::concurrency::CancellationObservation::Borrow(observed)) == 1);
  for (std::size_t cut = 0; cut < observed.polls; ++cut) {
@@ -555,54 +567,54 @@ TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with La
   PollCancellation stop;
   stop.stop_at = cut;
   CHECK_THROWS(reconcile_coconut_extensions(interrupted, mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
-  if (interrupted[1].index.annotation_sha256.empty()) {
-   const auto rejected_path = root.path() / "interrupted.bin";
-   CHECK_THROWS(store_coconut_component(rejected_path, interrupted[1]));
-   CHECK_FALSE(std::filesystem::exists(rejected_path));
-  }
+  CHECK(interrupted[1].index().annotation_sha256 == previous_identity);
+  CHECK(&interrupted[1].inventory_image(1) == retained_inventory);
  }
- CHECK(components[1].index.storage().boxes.data() == retained_boxes);
- CHECK(components[1].index.storage().mask_rle_pairs.data() == retained_runs);
- CHECK(components[1].inventory.data() == retained_inventory);
- CHECK(components[1].index.storage().boxes.size() == full_box_count);
- CHECK(components[1].index.storage().mask_rle_pairs.size() == full_run_count);
- CHECK(components[1].index.annotation_sha256 != previous_identity);
- CHECK(components[1].inventory[0] == original[1].inventory[1]);
- CHECK(components[1].index.storage().mask_rle_pairs[0].start == 0);
- CHECK(components[1].index.storage().mask_rle_pairs[0].length == 1);
- REQUIRE(components[1].index.image_count() == 1);
- CHECK(components[1].index.images()[0].source_image_id == 3);
- CHECK(components[1].index.storage().boxes[components[1].index.image(0).first_box].source_ordinal == 1);
- CHECK(components[1].index.images()[0].first_box == original[1].index.image(1).first_box);
- CHECK(components[1].index.storage().boxes[components[1].index.image(0).first_box].mask_rle_offset == original[1].index.storage().boxes[original[1].index.image(1).first_box].mask_rle_offset);
+ CHECK(components[1].index().storage().boxes.data() == retained_boxes);
+ CHECK(components[1].index().storage().mask_rle_pairs.data() == retained_runs);
+ CHECK(&components[1].inventory_image(0) == retained_inventory);
+ CHECK(components[1].index().storage().boxes.size() == full_box_count);
+ CHECK(components[1].index().storage().mask_rle_pairs.size() == full_run_count);
+ CHECK(components[1].index().annotation_sha256 != previous_identity);
+ CHECK(components[1].inventory()[0] == original[1].inventory()[1]);
+ CHECK(components[1].index().storage().mask_rle_pairs[0].start == 0);
+ CHECK(components[1].index().storage().mask_rle_pairs[0].length == 1);
+ REQUIRE(components[1].index().image_count() == 1);
+ CHECK(components[1].index().images()[0].source_image_id == 3);
+ CHECK(components[1].index().storage().boxes[components[1].index().image(0).first_box].source_ordinal == 1);
+ CHECK(components[1].index().images()[0].first_box == original[1].index().image(1).first_box);
+ CHECK(components[1].index().storage().boxes[components[1].index().image(0).first_box].mask_rle_offset == original[1].index().storage().boxes[original[1].index().image(1).first_box].mask_rle_offset);
  CHECK(reconcile_coconut_extensions(components) == 0);
- CHECK(components[1].index.storage().boxes.data() == retained_boxes);
- CHECK(components[1].index.box_count() == 1);
- CHECK(components[1].index.run_count() == 1);
+ CHECK(components[1].index().storage().boxes.data() == retained_boxes);
+ CHECK(components[1].index().box_count() == 1);
+ CHECK(components[1].index().run_count() == 1);
  const auto selected_path = root.path() / "selected.bin";
  store_coconut_component(selected_path, components[1]);
- const auto persisted_selection = load_coconut_component(selected_path, components[1].edition, components[1].source, components[1].input_identity);
+ const auto persisted_selection = load_coconut_component(selected_path, components[1].edition(), components[1].source(), components[1].input_identity());
  REQUIRE(persisted_selection);
- CHECK(persisted_selection->index.image_count() == 1);
- CHECK(persisted_selection->index.image(0).first_box == 0);
- CHECK(persisted_selection->index.storage().boxes[0].mask_rle_offset == 0);
- CHECK(persisted_selection->index.annotation_sha256 == components[1].index.annotation_sha256);
- CHECK(components[1].index.completion == original[1].index.completion);
- CHECK(components[1].index.storage().completion == original[1].index.storage().completion);
- CHECK(components[1].index.completion->images == 2);
- REQUIRE(persisted_selection->index.completion);
- CHECK(persisted_selection->index.completion->images == 1);
- CHECK(persisted_selection->index.completion->identity != components[1].index.completion->identity);
- CHECK(components[1].index.storage().boxes.data() == retained_boxes);
+ CHECK(persisted_selection->index().image_count() == 1);
+ CHECK(persisted_selection->index().image(0).first_box == 0);
+ CHECK(persisted_selection->index().storage().boxes[0].mask_rle_offset == 0);
+ CHECK(persisted_selection->index().annotation_sha256 == components[1].index().annotation_sha256);
+ CHECK(components[1].completion() == original[1].completion());
+ CHECK(components[1].index().storage().completion == original[1].index().storage().completion);
+ CHECK(components[1].completion()->images == 2);
+ REQUIRE(persisted_selection->completion());
+ CHECK(persisted_selection->completion()->images == 1);
+ CHECK(persisted_selection->completion()->identity != components[1].completion()->identity);
+ CHECK(components[1].index().storage().boxes.data() == retained_boxes);
  auto covered = original;
- covered[0] = original[1];
- covered[0].edition = CoconutEdition::Large;
+ auto covering = component_builder(original[1]);
+ covering.edition = CoconutEdition::Large;
+ covering.index.split = "coconut-" + std::to_string(static_cast<unsigned>(covering.edition)) + "-" + std::to_string(static_cast<unsigned>(covering.source));
+ covering.index.annotation_sha256.clear();
+ covered[0] = std::move(covering).finish({}, root.path());
  CHECK(reconcile_coconut_extensions(covered) == 2);
- CHECK(covered[1].inventory.empty());
- CHECK(covered[1].index.image_count() == 0);
- CHECK(covered[1].index.box_count() == 0);
- CHECK(covered[1].index.run_count() == 0);
- CHECK(covered[0].inventory.size() == 2);
+ CHECK(covered[1].inventory().empty());
+ CHECK(covered[1].index().image_count() == 0);
+ CHECK(covered[1].index().box_count() == 0);
+ CHECK(covered[1].index().run_count() == 0);
+ CHECK(covered[0].inventory().size() == 2);
 }
 TEST_CASE("COCONut archives reject unresolved duplicate extra and unsafe offered members", "[coconut]") {
  ScopedTempDir root("coconut-archive-reject");
@@ -692,18 +704,16 @@ TEST_CASE("COCONut version-1 component inventory pins nested physical release an
                                                                                                                                        // at byte
                                                                                                                                        // 130
  const std::string expected(expected_bytes, sizeof(expected_bytes) - 1);
- CoconutComponent component;
- component.edition = CoconutEdition::ObjectsValidation;
- component.source = CoconutImageNamespace::Objects365V1;
- component.input_identity = "i";
- component.inventory = {{{CoconutImageNamespace::Objects365V1, 91105, 0x1234, "image/objects365_v1_00091105.jpg", "a"}, 691105, 2}};
- component.index.source = BenchmarkDatasetSource::kObjects365V2;
- component.index.split = "coconut-4-3";
- component.index.annotation_sha256 = "c5304ca7a16f7e76d6c21bfd7bda2b39a025cc268dde2336d95a2157eb9d4632";
- NormalizedAnnotationBuilder component_records;
- static_cast<NormalizedAnnotationMetadata&>(component_records) = component.index;
- component_records.images.push_back({.source_image_id = 91105, .width = 1, .height = 1, .source_shard = 0x1234});
- component.index = NormalizedAnnotationReadView(seal_normalized_annotations(std::move(component_records)));
+ CoconutComponentBuilder builder;
+ builder.edition = CoconutEdition::ObjectsValidation;
+ builder.source = CoconutImageNamespace::Objects365V1;
+ builder.input_identity = "i";
+ builder.inventory = {{{CoconutImageNamespace::Objects365V1, 91105, 0x1234, "image/objects365_v1_00091105.jpg", "a"}, 691105, 2}};
+ builder.index.source = BenchmarkDatasetSource::kObjects365V2;
+ builder.index.split = "coconut-4-3";
+ builder.index.annotation_sha256 = "c5304ca7a16f7e76d6c21bfd7bda2b39a025cc268dde2336d95a2157eb9d4632";
+ builder.index.images.push_back({.source_image_id = 91105, .width = 1, .height = 1, .source_shard = 0x1234});
+ const auto component = std::move(builder).finish({}, root.path());
  const auto path = root.path() / "component.bin";
  StorageReservationPool storage(root.path(), {});
  store_coconut_component(path, component, {}, &storage);
@@ -714,14 +724,14 @@ TEST_CASE("COCONut version-1 component inventory pins nested physical release an
  CHECK(expected.size() == 130 + 32);
  // Substitute independent v1 bytes, retaining the index's joint completion.
  mmltk::testsupport::write_text_file(inventory_path, expected);
- const auto loaded = load_coconut_component(path, component.edition, component.source, "i");
+ const auto loaded = load_coconut_component(path, component.edition(), component.source(), "i");
  REQUIRE(loaded);
- CHECK(loaded->index.annotation_sha256 == component.index.annotation_sha256);
- CHECK(loaded->inventory == component.inventory);
- REQUIRE(loaded->index.image_count() == 1);
- CHECK(loaded->index.images()[0].source_image_id == 91105);
- CHECK(loaded->index.box_count() == 0);
- CHECK_FALSE(load_coconut_component(path, component.edition, component.source, "changed"));
+ CHECK(loaded->index().annotation_sha256 == component.index().annotation_sha256);
+ CHECK(std::ranges::equal(loaded->inventory(), component.inventory()));
+ REQUIRE(loaded->index().image_count() == 1);
+ CHECK(loaded->index().images()[0].source_image_id == 91105);
+ CHECK(loaded->index().box_count() == 0);
+ CHECK_FALSE(load_coconut_component(path, component.edition(), component.source(), "changed"));
  store_coconut_component(path, *loaded, {}, &storage);
  CHECK(storage.outstanding() == 0);
  CHECK(file_bytes(inventory_path) == expected);
@@ -767,14 +777,14 @@ TEST_CASE("COCONut preserves RGB24 IDs across compressed Parquet batches and rel
  parquet_file(input.parquet_shards[0], rows, hf_schema(true), parquet::Compression::GZIP);
  auto components = import_coconut_annotations(input);
  REQUIRE(components.size() == 1);
- REQUIRE(components[0].index.image_count() == 18);
- REQUIRE(components[0].index.box_count() == 18);
+ REQUIRE(components[0].index().image_count() == 18);
+ REQUIRE(components[0].index().box_count() == 18);
  for (std::size_t i = 0; i < 18; ++i) {
-  CHECK(components[0].index.storage().boxes[i].annotation_id == 0x030201);
-  CHECK(components[0].index.storage().boxes[i].class_id == 79);
-  CHECK(components[0].index.storage().boxes[i].source_ordinal == i);
-  CHECK(components[0].index.storage().mask_rle_pairs[i].start == 0);
-  CHECK(components[0].index.storage().mask_rle_pairs[i].length == 1);
+  CHECK(components[0].index().storage().boxes[i].annotation_id == 0x030201);
+  CHECK(components[0].index().storage().boxes[i].class_id == 79);
+  CHECK(components[0].index().storage().boxes[i].source_ordinal == i);
+  CHECK(components[0].index().storage().mask_rle_pairs[i].start == 0);
+  CHECK(components[0].index().storage().mask_rle_pairs[i].length == 1);
  }
 }
 TEST_CASE("COCONut native selection admission precedes cache mutation", "[coconut]") {
@@ -830,8 +840,8 @@ TEST_CASE("COCONut authoritative box retains an empty supplied mask and rejects 
  }
  const auto components = import_coconut_annotations(input);
  REQUIRE(components.size() == 1);
- REQUIRE(components[0].index.box_count() == 1);
- const auto& box = components[0].index.storage().boxes[0];
+ REQUIRE(components[0].index().box_count() == 1);
+ const auto& box = components[0].index().storage().boxes[0];
  CHECK(box.x1 == -1.0F);
  CHECK(box.x2 == 2.0F);
  CHECK(box.original_area == 23);
@@ -868,11 +878,11 @@ TEST_CASE("COCONut JSON requires canonical categories and exact validation image
  }
  const auto components = import_coconut_annotations(input);
  REQUIRE(components.size() == 1);
- REQUIRE(components[0].index.box_count() == 1);
- CHECK(components[0].index.storage().boxes[0].class_id == 0);
- CHECK(components[0].index.storage().boxes[0].source_category_id == 1);
- CHECK(components[0].inventory[0].release_image_id == 11);
- CHECK(components[0].index.images()[0].source_image_id == 1);
+ REQUIRE(components[0].index().box_count() == 1);
+ CHECK(components[0].index().storage().boxes[0].class_id == 0);
+ CHECK(components[0].index().storage().boxes[0].source_category_id == 1);
+ CHECK(components[0].inventory()[0].release_image_id == 11);
+ CHECK(components[0].index().images()[0].source_image_id == 1);
 }
 TEST_CASE("COCONut preparatory arrays accept either order and reject duplicate arrays", "[coconut]") {
  ScopedTempDir root("coconut-envelope-order");
@@ -906,16 +916,16 @@ TEST_CASE("COCONut preparatory arrays accept either order and reject duplicate a
  }
  const auto components = import_coconut_annotations(input);
  REQUIRE(components.size() == 1);
- REQUIRE(components[0].index.box_count() == 3);
- const auto& boxes = components[0].index.storage().boxes;
+ REQUIRE(components[0].index().box_count() == 3);
+ const auto& boxes = components[0].index().storage().boxes;
  CHECK(boxes[0].source_category_id == 1);
  CHECK(boxes[0].class_id == 0);
  CHECK(boxes[1].source_category_id == 13);
  CHECK(boxes[1].class_id == 11);
  CHECK(boxes[2].source_category_id == 90);
  CHECK(boxes[2].class_id == 79);
- CHECK(components[0].inventory[0].release_image_id == 11);
- CHECK(components[0].index.images()[0].source_image_id == 1);
+ CHECK(components[0].inventory()[0].release_image_id == 11);
+ CHECK(components[0].index().images()[0].source_image_id == 1);
 }
 TEST_CASE("COCONut compact inventory is deterministic and jointly admitted under corruption and cancellation", "[coconut]") {
  ScopedTempDir root("coconut-compact-inventory");
@@ -927,17 +937,17 @@ TEST_CASE("COCONut compact inventory is deterministic and jointly admitted under
  const auto rebuilt = import_coconut_annotations(input);
  REQUIRE(first.size() == 1);
  REQUIRE(rebuilt.size() == 1);
- CHECK(first[0].index.annotation_sha256 == rebuilt[0].index.annotation_sha256);
- REQUIRE(first[0].index.image_count() == 2);
- REQUIRE(first[0].index.box_count() == 2);
- CHECK(first[0].index.images()[0].source_image_id == 7);
- CHECK(first[0].index.images()[1].source_image_id == 8);
- CHECK(first[0].index.images()[0].first_box == 0);
- CHECK(first[0].index.images()[1].first_box == 1);
- CHECK(first[0].index.storage().boxes[0].source_ordinal == 1);
- CHECK(first[0].index.storage().boxes[1].source_ordinal == 0);
- CHECK(first[0].inventory[0].release_image_id == 7);
- CHECK(first[0].inventory[1].release_image_id == 8);
+ CHECK(first[0].index().annotation_sha256 == rebuilt[0].index().annotation_sha256);
+ REQUIRE(first[0].index().image_count() == 2);
+ REQUIRE(first[0].index().box_count() == 2);
+ CHECK(first[0].index().images()[0].source_image_id == 7);
+ CHECK(first[0].index().images()[1].source_image_id == 8);
+ CHECK(first[0].index().images()[0].first_box == 0);
+ CHECK(first[0].index().images()[1].first_box == 1);
+ CHECK(first[0].index().storage().boxes[0].source_ordinal == 1);
+ CHECK(first[0].index().storage().boxes[1].source_ordinal == 0);
+ CHECK(first[0].inventory()[0].release_image_id == 7);
+ CHECK(first[0].inventory()[1].release_image_id == 8);
  const auto path = root.path() / "first.bin", second = root.path() / "second.bin";
  PollCancellation baseline;
  store_coconut_component(path, first[0], mmltk::common::concurrency::CancellationObservation::Borrow(baseline));
@@ -947,24 +957,98 @@ TEST_CASE("COCONut compact inventory is deterministic and jointly admitted under
  CHECK(file_bytes(path) == file_bytes(second));
  REQUIRE(original.size() > 64);
  CHECK(original.substr(0, 8) == "CNUTIVN1");
- const auto loaded = load_coconut_component(path, first[0].edition, first[0].source, input.input_identity);
+ const auto loaded = load_coconut_component(path, first[0].edition(), first[0].source(), input.input_identity);
  REQUIRE(loaded);
- CHECK(loaded->inventory == first[0].inventory);
+ CHECK(std::ranges::equal(loaded->inventory(), first[0].inventory()));
  SECTION("truncation") {
   std::filesystem::resize_file(path.string() + ".inventory", original.size() - 1);
-  CHECK_FALSE(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity));
+  CHECK_FALSE(load_coconut_component(path, first[0].edition(), first[0].source(), input.input_identity));
  }
  SECTION("corruption") {
   auto corrupt = original;
   corrupt[corrupt.size() / 2] ^= 1;
   mmltk::testsupport::write_text_file(path.string() + ".inventory", corrupt);
-  CHECK_FALSE(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity));
+  CHECK_FALSE(load_coconut_component(path, first[0].edition(), first[0].source(), input.input_identity));
  }
  SECTION("reordered inventory cannot replace an admitted index") {
-  auto reordered = first[0];
+  auto reordered = component_builder(first[0]);
   std::swap(reordered.inventory[0], reordered.inventory[1]);
-  CHECK_THROWS(store_coconut_component(path, reordered));
+  CHECK_THROWS(std::move(reordered).finish({}, root.path()));
   CHECK(file_bytes(path.string() + ".inventory") == original);
+ }
+ SECTION("shared aligned views outlive the opening component") {
+  const auto selected = [&] {
+   auto opened = load_coconut_component(path, first[0].edition(), first[0].source(), input.input_identity, {}, true);
+   REQUIRE(opened);
+   const auto* physical = &opened->inventory_image(1);
+   auto view = opened->select_images({1});
+   CHECK(&view.inventory_image(0) == physical);
+   CHECK(view.index().source_position(0) == 1);
+   return view;
+  }();
+  const auto membership = selected.membership();
+  CHECK(&membership.inventory_image(0) == &selected.inventory_image(0));
+  CHECK(membership.index().storage().boxes.data() == selected.index().storage().boxes.data());
+  CHECK(membership.recovery().empty());
+  CHECK(membership.recovery_policy() == 0);
+  CHECK(membership.original_annotation_identity().empty());
+  CHECK_THROWS(store_coconut_component(root.path() / "membership.bin", membership));
+  admit_coconut_component(selected);
+  const auto selection = root.path() / "selection.bin";
+  store_coconut_component(selection, selected);
+  CHECK(selected.completion()->images == 2);
+  const auto restored = load_coconut_component(selection, selected.edition(), selected.source(), selected.input_identity());
+  REQUIRE(restored);
+  REQUIRE(restored->index().image_count() == 1);
+  CHECK(restored->inventory_image(0) == selected.inventory_image(0));
+ }
+ SECTION("retained inventory survives replacement and unlink for every destination") {
+  const auto inventory_path = std::filesystem::path(path.string() + ".inventory");
+  const auto replacement = root.path() / "replacement.inventory";
+  mmltk::testsupport::write_text_file(replacement, std::string(original.size(), 'x'));
+  std::filesystem::rename(replacement, inventory_path);
+  store_coconut_component(path, *loaded);
+  CHECK(file_bytes(inventory_path) == original);
+  CHECK(load_coconut_component(path, loaded->edition(), loaded->source(), loaded->input_identity()));
+  std::filesystem::remove(inventory_path);
+  const auto elsewhere = root.path() / "elsewhere" / "component.bin";
+  store_coconut_component(elsewhere, *loaded);
+  CHECK(file_bytes(elsewhere.string() + ".inventory") == original);
+  CHECK(file_bytes(elsewhere) == file_bytes(path));
+  std::filesystem::remove(elsewhere.string() + ".inventory");
+  store_coconut_component(elsewhere, *loaded);
+  CHECK(file_bytes(elsewhere.string() + ".inventory") == original);
+  store_coconut_component(path, *loaded);
+  CHECK(file_bytes(inventory_path) == original);
+ }
+ SECTION("standalone construction admits all aligned facts") {
+  auto malformed = component_builder(first[0]);
+  SECTION("duplicate release-row ordinal") { malformed.inventory[1].source_ordinal = malformed.inventory[0].source_ordinal; }
+  SECTION("wrong source") { malformed.inventory[1].physical.source = CoconutImageNamespace::CocoUnlabeled; }
+  SECTION("wrong shard") { ++malformed.index.images[1].source_shard; }
+  SECTION("unreferenced box") { malformed.index.images.back().box_count = 0; }
+  SECTION("malformed run") { malformed.index.mask_rle_pairs.front().length = 0; }
+  SECTION("changed header cannot reuse identity") { malformed.input_identity = "different-generation"; }
+  CHECK_THROWS(std::move(malformed).finish({}, root.path()));
+  CHECK(file_bytes(path.string() + ".inventory") == original);
+ }
+ SECTION("membership defers malformed normalized masks until full admission") {
+  auto bytes = file_bytes(path);
+  REQUIRE(first[0].index().run_count() != 0);
+  const auto offset = bytes.size() - first[0].index().run_count() * sizeof(RLEPair);
+  const RLEPair malformed{0, 0};
+  std::memcpy(bytes.data() + offset, &malformed, sizeof(malformed));
+  const auto replacement = root.path() / "malformed-index.bin";
+  mmltk::testsupport::write_text_file(replacement, bytes);
+  std::filesystem::rename(replacement, path);
+  const auto deferred = load_coconut_component(path, first[0].edition(), first[0].source(), input.input_identity, {}, true);
+  REQUIRE(deferred);
+  const auto membership = deferred->membership();
+  CHECK(std::ranges::equal(membership.inventory(), first[0].inventory()));
+  CHECK_THROWS(admit_coconut_component(*deferred));
+  CHECK_THROWS(store_coconut_component(root.path() / "rejected.bin", *deferred));
+  CHECK_FALSE(load_coconut_component(path, first[0].edition(), first[0].source(), input.input_identity));
+  CHECK(loaded->index().storage().mask_rle_pairs.front().length != 0);
  }
  SECTION("every store cancellation point prevents fresh admission") {
   for (std::size_t cut = 0; cut < baseline.polls; ++cut) {
@@ -972,16 +1056,16 @@ TEST_CASE("COCONut compact inventory is deterministic and jointly admitted under
    PollCancellation stop;
    stop.stop_at = cut;
    CHECK_THROWS(store_coconut_component(cancelled_path, first[0], mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
-   CHECK_FALSE(load_coconut_component(cancelled_path, first[0].edition, first[0].source, input.input_identity));
+   CHECK_FALSE(load_coconut_component(cancelled_path, first[0].edition(), first[0].source(), input.input_identity));
   }
  }
  SECTION("load cancellation propagates instead of becoming a cache miss") {
   PollCancellation observed;
-  REQUIRE(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity, mmltk::common::concurrency::CancellationObservation::Borrow(observed)));
+  REQUIRE(load_coconut_component(path, first[0].edition(), first[0].source(), input.input_identity, mmltk::common::concurrency::CancellationObservation::Borrow(observed)));
   for (std::size_t cut = 0; cut < observed.polls; ++cut) {
    PollCancellation stop;
    stop.stop_at = cut;
-   CHECK_THROWS(load_coconut_component(path, first[0].edition, first[0].source, input.input_identity, mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
+   CHECK_THROWS(load_coconut_component(path, first[0].edition(), first[0].source(), input.input_identity, mmltk::common::concurrency::CancellationObservation::Borrow(stop)));
   }
  }
 }
@@ -1530,7 +1614,7 @@ TEST_CASE("COCONut normalization observations are bounded with exact unknown-tot
  parquet_file(input.parquet_shards[0], rows);
  std::vector<std::uint64_t> observed;
  input.progress = [&](auto value) { observed.push_back(value); };
- REQUIRE(import_coconut_annotations(input).front().index.image_count() == 130);
+ REQUIRE(import_coconut_annotations(input).front().index().image_count() == 130);
  CHECK(observed == std::vector<std::uint64_t>{0, 64, 128, 130});
  SECTION("disabled observation installs no callback") {
   const BenchmarkTraceSink silent;
@@ -1538,7 +1622,7 @@ TEST_CASE("COCONut normalization observations are bounded with exact unknown-tot
   CHECK_FALSE(reporter.normalization_observer_enabled());
   input.progress = {};
   observed.clear();
-  REQUIRE(import_coconut_annotations(input).front().index.image_count() == 130);
+  REQUIRE(import_coconut_annotations(input).front().index().image_count() == 130);
   CHECK(observed.empty());
   const BenchmarkTraceSink trace = [](std::string_view, const Json&) {};
   ProgressReporter traced({}, trace);
@@ -1950,11 +2034,11 @@ TEST_CASE("one physical admission budget governs membership extraction and write
   CHECK(input != old_input);
   const auto component = load_coconut_component(component_path, CoconutEdition::Base, CoconutImageNamespace::CocoTrain, input);
   REQUIRE(component);
-  REQUIRE(component->inventory.size() == 1);
+  REQUIRE(component->inventory().size() == 1);
   const auto manifest = read_json_file(config.output_dir / "benchmark_manifest.json");
   const auto physical = std::ranges::find_if(manifest["recipe"]["artifacts"], [&](const auto& item) { return item["artifact_id"] == served.source.artifact.artifact_id; });
   REQUIRE(physical != manifest["recipe"]["artifacts"].end());
-  CHECK(component->inventory.front().physical.archive_identity == physical->at("identity").get<std::string>());
+  CHECK(component->inventory().front().physical.archive_identity == physical->at("identity").get<std::string>());
   const auto facts = std::ranges::find_if(manifest["recipe"]["components"], [](const auto& item) { return item["physical_source"] == "coco-train2017"; });
   REQUIRE(facts != manifest["recipe"]["components"].end());
   CHECK(facts->at("input_identity") == input);
@@ -2294,31 +2378,31 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  const auto result = import_coconut_annotations(input);
  REQUIRE(result.size() == 1);
  const auto& component = result.front();
- REQUIRE(component.index.image_count() == 1);
- CHECK(component.index.images()[0].source_image_id == image_id);
+ REQUIRE(component.index().image_count() == 1);
+ CHECK(component.index().images()[0].source_image_id == image_id);
  if (!enabled) {
-  REQUIRE(component.index.box_count() == 1);
-  CHECK(component.index.storage().boxes[0].annotation_id == 30);
-  CHECK(component.index.storage().boxes[0].original_area == 99);
+  REQUIRE(component.index().box_count() == 1);
+  CHECK(component.index().storage().boxes[0].annotation_id == 30);
+  CHECK(component.index().storage().boxes[0].original_area == 99);
   CHECK(rejected == masks.size());
-  CHECK(component.recovery.empty());
+  CHECK(component.recovery().empty());
   const std::array<RLEPair, 1> unchanged{{{0, 9}}};
   expect_runs(component, unchanged);
   return;
  }
- REQUIRE(component.recovery.size() == 1);
- const auto& facts = component.recovery.front();
- CHECK(component.recovery_policy == kCoconutRecoveryPolicy);
- CHECK(component.original_annotation_identity == originals.annotation_sha256);
+ REQUIRE(component.recovery().size() == 1);
+ const auto& facts = component.recovery().front();
+ CHECK(component.recovery_policy() == kCoconutRecoveryPolicy);
+ CHECK(component.original_annotation_identity() == originals.annotation_sha256);
  CHECK(facts.image_id == image_id);
  CHECK(facts.unresolved == (empty_supporter ? 1U : 0U));
  CHECK(rejected == facts.unresolved);
  REQUIRE(facts.objects.size() == masks.size());
  CHECK(facts.objects.front().annotation_id == (masks.size() == 2 ? 10 : 20));
  CHECK(facts.objects.front().original_annotation_id == (masks.size() == 2 ? 100 : 200));
- REQUIRE(component.index.box_count() == masks.size() + (empty_supporter ? 0 : 1));
- for (const auto& box : component.index.storage().boxes) {
-  const auto runs = std::span(component.index.storage().mask_rle_pairs).subspan(box.mask_rle_offset, box.mask_rle_pairs);
+ REQUIRE(component.index().box_count() == masks.size() + (empty_supporter ? 0 : 1));
+ for (const auto& box : component.index().storage().boxes) {
+  const auto runs = std::span(component.index().storage().mask_rle_pairs).subspan(box.mask_rle_offset, box.mask_rle_pairs);
   REQUIRE(runs.size() == 1);
   if (box.annotation_id == 30) {
    CHECK(box.original_area == (masks.size() == 2 ? 6 : 7));
@@ -2339,12 +2423,12 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  }
  const auto cache = root.path() / "recovery.normalized.bin";
  store_coconut_component(cache, component);
- const auto cached = load_coconut_component(cache, component.edition, component.source, component.input_identity);
+ const auto cached = load_coconut_component(cache, component.edition(), component.source(), component.input_identity());
  REQUIRE(cached);
- CHECK(cached->recovery.front().unresolved == facts.unresolved);
- CHECK(cached->recovery.front().omissions.size() == facts.unresolved);
- CHECK(cached->index.annotation_sha256 == component.index.annotation_sha256);
- CHECK(cached->inventory == component.inventory);
+ CHECK(cached->recovery().front().unresolved == facts.unresolved);
+ CHECK(cached->recovery().front().omissions.size() == facts.unresolved);
+ CHECK(cached->index().annotation_sha256 == component.index().annotation_sha256);
+ CHECK(std::ranges::equal(cached->inventory(), component.inventory()));
  const auto roundtrip = root.path() / "recovery-roundtrip.normalized.bin";
  store_coconut_component(roundtrip, *cached);
  for (const auto suffix : {"", ".inventory", ".complete.json"}) CHECK(file_bytes(cache.string() + suffix) == file_bytes(roundtrip.string() + suffix));
@@ -2357,10 +2441,14 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  mmltk::testsupport::write_text_file(failed_completion / "blocker", "retain");
  CHECK_THROWS(store_coconut_component(failed, component));
  CHECK_FALSE(std::filesystem::is_regular_file(failed_completion));
- CHECK_FALSE(load_coconut_component(failed, component.edition, component.source, component.input_identity));
- auto malformed = component;
+ CHECK_FALSE(load_coconut_component(failed, component.edition(), component.source(), component.input_identity()));
+ auto malformed = component_builder(component);
  malformed.recovery.front().objects.front().original_annotation_id += 1;
- CHECK_THROWS(store_coconut_component(cache, malformed));
+ CHECK_THROWS(std::move(malformed).finish({}, root.path()));
+ auto invalid_join = component_builder(component);
+ invalid_join.index.annotation_sha256.clear();
+ ++invalid_join.recovery.front().objects.front().source_ordinal;
+ CHECK_THROWS(std::move(invalid_join).finish({}, root.path()));
  CHECK(file_bytes(cache) == settled);
 }
 TEST_CASE("COCONut recovery requires a unique represented match and exact remaining candidate count", "[coconut][benchmark]") {
@@ -2651,22 +2739,22 @@ TEST_CASE("retained COCO source dogs recover exactly and remain disjoint after c
   const auto result = import_coconut_annotations(input);
   REQUIRE(result.size() == 1);
   const auto& component = result.front();
-  REQUIRE(component.recovery.size() == 1);
-  REQUIRE(component.recovery.front().objects.size() == (id == 2212 ? 2 : 1));
-  CHECK(component.recovery.front().unresolved == 0);
-  const auto supporter = std::ranges::find(component.index.storage().boxes, id == 2212 ? 63U : 9U, &NormalizedBox::source_category_id);
-  REQUIRE(supporter != component.index.storage().boxes.end());
+  REQUIRE(component.recovery().size() == 1);
+  REQUIRE(component.recovery().front().objects.size() == (id == 2212 ? 2 : 1));
+  CHECK(component.recovery().front().unresolved == 0);
+  const auto supporter = std::ranges::find(component.index().storage().boxes, id == 2212 ? 63U : 9U, &NormalizedBox::source_category_id);
+  REQUIRE(supporter != component.index().storage().boxes.end());
   CHECK(supporter->original_area < (id == 2212 ? 192166 : 259651));
-  for (const auto& fact : component.recovery.front().objects) {
-   const auto dog = std::ranges::find(component.index.storage().boxes, fact.annotation_id, &NormalizedBox::annotation_id);
+  for (const auto& fact : component.recovery().front().objects) {
+   const auto dog = std::ranges::find(component.index().storage().boxes, fact.annotation_id, &NormalizedBox::annotation_id);
    const auto original_dog = std::ranges::find(index.boxes, fact.original_annotation_id, &NormalizedBox::annotation_id);
-   REQUIRE(dog != component.index.storage().boxes.end());
+   REQUIRE(dog != component.index().storage().boxes.end());
    REQUIRE(original_dog != index.boxes.end());
    CHECK(dog->source_category_id == 18);
-   const auto dog_runs = std::span(component.index.storage().mask_rle_pairs).subspan(dog->mask_rle_offset, dog->mask_rle_pairs);
+   const auto dog_runs = std::span(component.index().storage().mask_rle_pairs).subspan(dog->mask_rle_offset, dog->mask_rle_pairs);
    const auto expected = std::span(index.mask_rle_pairs).subspan(original_dog->mask_rle_offset, original_dog->mask_rle_pairs);
    CHECK(std::ranges::equal(dog_runs, expected, [](auto a, auto b) { return a.start == b.start && a.length == b.length; }));
-   const auto support_runs = std::span(component.index.storage().mask_rle_pairs).subspan(supporter->mask_rle_offset, supporter->mask_rle_pairs);
+   const auto support_runs = std::span(component.index().storage().mask_rle_pairs).subspan(supporter->mask_rle_offset, supporter->mask_rle_pairs);
    for (unsigned projection = 0; projection < 3; ++projection) {
     using namespace mmltk::backend::imaging::resample;
     const dataset::MaskDimensions target = projection == 0 ? dataset::MaskDimensions{width, height} : dataset::MaskDimensions{384, 384};
@@ -2684,20 +2772,20 @@ TEST_CASE("retained COCO source dogs recover exactly and remain disjoint after c
   }
   const auto path = root.path() / "recovered.normalized.bin";
   store_coconut_component(path, component);
-  const auto cached = load_coconut_component(path, component.edition, component.source, component.input_identity);
+  const auto cached = load_coconut_component(path, component.edition(), component.source(), component.input_identity());
   REQUIRE(cached);
-  CHECK(cached->index.annotation_sha256 == component.index.annotation_sha256);
-  CHECK(cached->recovery.front().objects.size() == component.recovery.front().objects.size());
+  CHECK(cached->index().annotation_sha256 == component.index().annotation_sha256);
+  CHECK(cached->recovery().front().objects.size() == component.recovery().front().objects.size());
   auto changed = index;
   changed.annotation_sha256 = std::string(64, 'a');
   const auto changed_recovery_originals_view = fixture_index(changed);
   CoconutRecoveryOriginals changed_recovery_originals(&changed_recovery_originals_view, nullptr);
   CoconutMaskRecovery changed_recovery(changed_recovery_originals);
-  CHECK_FALSE(load_coconut_component(path, component.edition, component.source, coconut_component_input_identity(input.input_identity, component.source, &changed_recovery)));
+  CHECK_FALSE(load_coconut_component(path, component.edition(), component.source(), coconut_component_input_identity(input.input_identity, component.source(), &changed_recovery)));
   auto corrupt = read_json_file(path.string() + ".complete.json");
   corrupt["coconut"]["recovery_policy"] = 99;
   write_json_atomically(path.string() + ".complete.json", corrupt, {});
-  CHECK_FALSE(load_coconut_component(path, component.edition, component.source, component.input_identity));
+  CHECK_FALSE(load_coconut_component(path, component.edition(), component.source(), component.input_identity()));
  }
 }
 TEST_CASE("optional COCO split admission is independent and never conceals output failures", "[coconut][benchmark][cache]") {
@@ -2963,21 +3051,21 @@ TEST_CASE("COCONut recovery facts follow physical images when import rows are re
  const auto& component = components.front();
  const auto path = root.path() / "ordered.normalized.bin";
  store_coconut_component(path, component);
- const auto cached = load_coconut_component(path, component.edition, component.source, component.input_identity);
+ const auto cached = load_coconut_component(path, component.edition(), component.source(), component.input_identity());
  REQUIRE(cached);
  for (const auto* product : {&component, &*cached}) {
-  REQUIRE(product->recovery.size() == physical.size());
-  REQUIRE(product->inventory.size() == physical.size());
-  REQUIRE(product->index.image_count() == physical.size());
-  CHECK(product->index.annotation_sha256 == component.index.annotation_sha256);
-  CHECK(product->input_identity == component.input_identity);
-  CHECK(product->recovery_policy == kCoconutRecoveryPolicy);
-  CHECK(product->original_annotation_identity == originals.annotation_sha256);
+  REQUIRE(product->recovery().size() == physical.size());
+  REQUIRE(product->inventory().size() == physical.size());
+  REQUIRE(product->index().image_count() == physical.size());
+  CHECK(product->index().annotation_sha256 == component.index().annotation_sha256);
+  CHECK(product->input_identity() == component.input_identity());
+  CHECK(product->recovery_policy() == kCoconutRecoveryPolicy);
+  CHECK(product->original_annotation_identity() == originals.annotation_sha256);
   for (std::size_t i = 0; i < physical.size(); ++i) {
    CAPTURE(i);
-   const auto& facts = product->recovery[i];
-   const auto& inventory = product->inventory[i];
-   const auto& image = product->index.images()[i];
+   const auto& facts = product->recovery()[i];
+   const auto& inventory = product->inventory()[i];
+   const auto& image = product->index().images()[i];
    CHECK(inventory.physical == physical[i]);
    CHECK(inventory.release_image_id == physical[i].image_id);
    CHECK(inventory.source_ordinal == image_ordinals[i]);
@@ -2994,11 +3082,11 @@ TEST_CASE("COCONut recovery facts follow physical images when import rows are re
     CHECK(object.source_ordinal == object_ordinals[i] + 1);
     CHECK(object.source_category_id == 18);
     CHECK(object.original_annotation_id == 200);
-    const auto& box = product->index.storage().boxes[image.first_box + 1];
+    const auto& box = product->index().storage().boxes[image.first_box + 1];
     CHECK(box.annotation_id == object.annotation_id);
     CHECK(box.source_ordinal == object.source_ordinal);
     REQUIRE(box.mask_rle_pairs == 1);
-    const auto run = product->index.storage().mask_rle_pairs[box.mask_rle_offset];
+    const auto run = product->index().storage().mask_rle_pairs[box.mask_rle_offset];
     CHECK(run.start == (i == 0 ? 4 : 0));
     CHECK(run.length == 1);
    }
@@ -3011,12 +3099,30 @@ TEST_CASE("COCONut recovery facts follow physical images when import rows are re
    }
   }
  }
+ const auto selected = cached->select_images({0, 2});
+ REQUIRE(selected.index().image_count() == 2);
+ for (std::size_t i = 0; i < 2; ++i) {
+  CHECK(&selected.inventory_image(i) == &cached->inventory_image(i * 2));
+  CHECK(&selected.recovery_image(i) == &cached->recovery_image(i * 2));
+  CHECK(selected.recovery_image(i).image_id == selected.index().image(i).source_image_id);
+ }
+ const auto membership = selected.membership();
+ CHECK(membership.recovery().empty());
+ CHECK(membership.index().annotation_sha256 == selected.index().annotation_sha256);
+ CHECK(membership.completion() == selected.completion());
+ const auto selected_path = root.path() / "selected-recovery.normalized.bin";
+ store_coconut_component(selected_path, selected);
+ const auto selected_cache = load_coconut_component(selected_path, selected.edition(), selected.source(), selected.input_identity());
+ REQUIRE(selected_cache);
+ CHECK(selected_cache->index().image_count() == 2);
+ CHECK(selected_cache->recovery_image(1).objects.front().source_ordinal == selected.recovery_image(1).objects.front().source_ordinal);
+ CHECK(selected.completion()->images == physical.size());
  const auto roundtrip = root.path() / "roundtrip.normalized.bin";
  store_coconut_component(roundtrip, *cached);
  for (const auto suffix : {"", ".inventory", ".complete.json"}) CHECK(file_bytes(path.string() + suffix) == file_bytes(roundtrip.string() + suffix));
  const auto rebuilt = import_coconut_annotations(input);
  REQUIRE(rebuilt.size() == 1);
- CHECK(rebuilt.front().index.annotation_sha256 == component.index.annotation_sha256);
+ CHECK(rebuilt.front().index().annotation_sha256 == component.index().annotation_sha256);
  store_coconut_component(roundtrip, rebuilt.front());
  CHECK(file_bytes(path.string() + ".inventory") == file_bytes(roundtrip.string() + ".inventory"));
 }
@@ -3031,10 +3137,10 @@ TEST_CASE("COCONut metadata membership precedes mask payload admission", "[cocon
  input.metadata_only = true;
  const auto membership = import_coconut_annotations(input);
  REQUIRE(membership.size() == 2);
- CHECK(membership[0].inventory[0].physical.image_id == 7);
- CHECK(membership[1].inventory[0].physical.image_id == 8);
- CHECK(membership[0].index.box_count() == 0);
- CHECK(membership[1].index.box_count() == 0);
+ CHECK(membership[0].inventory()[0].physical.image_id == 7);
+ CHECK(membership[1].inventory()[0].physical.image_id == 8);
+ CHECK(membership[0].index().box_count() == 0);
+ CHECK(membership[1].index().box_count() == 0);
  input.metadata_only = false;
  CHECK_THROWS(import_coconut_annotations(input));
 }
@@ -3650,7 +3756,7 @@ TEST_CASE("cold benchmark readers finish oversized grants with retained release 
  const mmltk::testsupport::ScopedTestCleanup cancel([&] { cancelled.store(true); });
  const auto result = mmltk::testsupport::await_test_future(work, "cold annotation shared grant");
  REQUIRE(result.size() == 1);
- CHECK(result.front().index.image_count() == 1);
+ CHECK(result.front().index().image_count() == 1);
  CHECK(execution.try_reserve({65537, 0, true}).has_value());
 }
 
@@ -3870,7 +3976,7 @@ TEST_CASE("COCONut JSON source rejection leaves shared CPU admission usable", "[
  json_file(input.annotation_json, {{"images", Json::array({image})}, {"annotations", Json::array({annotation})}});
  const auto result = import_coconut_annotations(input);
  REQUIRE(result.size() == 1);
- CHECK(result.front().index.image_count() == 1);
+ CHECK(result.front().index().image_count() == 1);
 }
 
 TEST_CASE("COCONut JSON parsing yields one shared CPU before its source pass finishes", "[benchmark][coconut][pipeline]") {
@@ -3927,7 +4033,7 @@ TEST_CASE("COCONut JSON parsing yields one shared CPU before its source pass fin
  later.Release();
  const auto result = mmltk::testsupport::await_test_future(work, "shared JSON source pass");
  REQUIRE(result.size() == 1);
- CHECK(result.front().index.image_count() == 256);
+ CHECK(result.front().index().image_count() == 256);
 }
 
 TEST_CASE("custom annotation sources acquire lifecycle custody independently on one CPU", "[benchmark][pipeline]") {
@@ -4762,20 +4868,20 @@ TEST_CASE("known XL masks preserve canonical ordinals across physical archive or
   auto result = import_coconut_annotations(input);
   REQUIRE(result.size() == 1);
   const auto& component = result.front();
-  REQUIRE(component.index.image_count() == 2);
-  REQUIRE(component.index.box_count() == 2);
-  CHECK(component.index.images()[0].source_image_id == 2);
-  CHECK(component.index.images()[1].source_image_id == 3);
-  CHECK(component.index.storage().boxes[0].source_ordinal == 1);
-  CHECK(component.index.storage().boxes[1].source_ordinal == 3);
-  CHECK(component.inventory[0].source_ordinal == 0);
-  CHECK(component.inventory[1].source_ordinal == 1);
+  REQUIRE(component.index().image_count() == 2);
+  REQUIRE(component.index().box_count() == 2);
+  CHECK(component.index().images()[0].source_image_id == 2);
+  CHECK(component.index().images()[1].source_image_id == 3);
+  CHECK(component.index().storage().boxes[0].source_ordinal == 1);
+  CHECK(component.index().storage().boxes[1].source_ordinal == 3);
+  CHECK(component.inventory()[0].source_ordinal == 0);
+  CHECK(component.inventory()[1].source_ordinal == 1);
   if (!expected) expected = component;
   else {
-   CHECK(component.inventory == expected->inventory);
-   CHECK(component.index.annotation_sha256 == expected->index.annotation_sha256);
-   CHECK(component.index.run_count() == expected->index.run_count());
-   CHECK(std::memcmp(component.index.storage().mask_rle_pairs.data(), expected->index.storage().mask_rle_pairs.data(), component.index.run_count() * sizeof(RLEPair)) == 0);
+   CHECK(std::ranges::equal(component.inventory(), expected->inventory()));
+   CHECK(component.index().annotation_sha256 == expected->index().annotation_sha256);
+   CHECK(component.index().run_count() == expected->index().run_count());
+   CHECK(std::memcmp(component.index().storage().mask_rle_pairs.data(), expected->index().storage().mask_rle_pairs.data(), component.index().run_count() * sizeof(RLEPair)) == 0);
   }
   for (const auto failure : {"missing", "duplicate", "invalid PNG", "actual geometry"}) {
    INFO(failure);
@@ -5013,25 +5119,35 @@ TEST_CASE("panoptic JSON keeps decoded metadata and one unchanged inventory seal
  REQUIRE(input.records->records.size() == 1);
  CHECK(input.records->records[0].file_name == "objects365_v2_00000007.png");
  CHECK(input.records->records[0].width == 2);
+ bool changed = false;
+ SECTION("identical admitted inventory is shared") {}
+ SECTION("changed release-row facts require a new inventory generation") {
+  input.records->records[0].source_ordinal = 7;
+  changed = true;
+ }
  std::filesystem::remove(input.annotation_json);
  input.metadata_only = false;
  auto full = import_coconut_annotations(input);
- REQUIRE(full.size() == 1); REQUIRE(full[0].index.box_count() == 1);
- CHECK(full[0].inventory_seal == metadata[0].inventory_seal);
- CHECK(full[0].index.storage().boxes[0].source_ordinal == 0);
+ REQUIRE(full.size() == 1); REQUIRE(full[0].index().box_count() == 1);
+ CHECK((&full[0].inventory_image(0) == &metadata[0].inventory_image(0)) == !changed);
+ CHECK((full[0].index().annotation_sha256 == metadata[0].index().annotation_sha256) == !changed);
+ CHECK(metadata[0].inventory_image(0).source_ordinal == 0);
+ CHECK(full[0].inventory_image(0).source_ordinal == (changed ? 7 : 0));
+ CHECK(full[0].index().storage().boxes[0].source_ordinal == 0);
  const auto path = root.path() / "component.bin";
  store_coconut_component(path, full[0]);
- REQUIRE(full[0].index.completion);
+ REQUIRE(full[0].completion());
+ CHECK_FALSE(metadata[0].completion());
  CHECK(coconut_component_storage_bytes(full[0]) == std::filesystem::file_size(path) + std::filesystem::file_size(path.string() + ".inventory") + std::filesystem::file_size(path.string() + ".complete.json"));
  const auto proof = read_json_file(path.string() + ".complete.json");
  CHECK(proof.contains("coconut"));
  for (const auto& field : {"edition", "source", "input_identity", "normalization", "inventory_identity", "inventory_count"}) {
   auto incomplete = proof; incomplete["coconut"].erase(field);
   write_json_atomically(path.string() + ".complete.json", incomplete, {});
-  CHECK_FALSE(load_coconut_component(path, full[0].edition, full[0].source, input.input_identity));
+  CHECK_FALSE(load_coconut_component(path, full[0].edition(), full[0].source(), input.input_identity));
  }
  write_json_atomically(path.string() + ".complete.json", proof, {});
- CHECK(load_coconut_component(path, full[0].edition, full[0].source, input.input_identity));
+ CHECK(load_coconut_component(path, full[0].edition(), full[0].source(), input.input_identity));
 }
 
 TEST_CASE("a live Parquet normalizer lends actual workspace to pixels on one CPU", "[benchmark][coconut][parquet][pipeline]") {
@@ -5068,8 +5184,8 @@ TEST_CASE("a live Parquet normalizer lends actual workspace to pixels on one CPU
  normalizing.Release();
  const auto result = mmltk::testsupport::await_test_future(importing, "Arrow reader resumes after pixel loan retirement", 10s);
  CHECK(completed_inside_normalizer);
- REQUIRE(result.size() == 1); REQUIRE(result[0].index.box_count() == 1);
- CHECK(result[0].index.rejected.degenerate_boxes == 1);
+ REQUIRE(result.size() == 1); REQUIRE(result[0].index().box_count() == 1);
+ CHECK(result[0].index().rejected.degenerate_boxes == 1);
  CHECK(execution.try_reserve({256ULL << 20, 13}));
 }
 
@@ -5103,7 +5219,7 @@ TEST_CASE("panoptic projection preserves document and consumed-row admission lim
   auto text = document.dump(); text.insert(1, "\"\\u0069mages\":[],"); raw = std::move(text);
  }
  mmltk::testsupport::write_text_file(input.annotation_json, raw.value_or(document.dump()));
- if (accepted) CHECK(import_coconut_annotations(input).front().index.image_count() == 1);
+ if (accepted) CHECK(import_coconut_annotations(input).front().index().image_count() == 1);
  else CHECK_THROWS(import_coconut_annotations(input));
 }
 
@@ -5152,11 +5268,11 @@ TEST_CASE("independent Parquet groups seal identical artifacts across shared CPU
   auto input = request(physical); input.execution = &execution; input.parquet_shards = {path};
   auto result = import_coconut_annotations(input);
   REQUIRE(result.size() == 1);
-  CHECK(result[0].index.storage().boxes[0].source_ordinal == 4);
-  CHECK(result[0].index.storage().boxes[1].source_ordinal == 7);
-  CHECK(result[0].index.storage().boxes[2].source_ordinal == 1);
-  CHECK(result[0].index.rejected.raw_records == 9);
-  CHECK(result[0].index.rejected.degenerate_boxes == 3);
+  CHECK(result[0].index().storage().boxes[0].source_ordinal == 4);
+  CHECK(result[0].index().storage().boxes[1].source_ordinal == 7);
+  CHECK(result[0].index().storage().boxes[2].source_ordinal == 1);
+  CHECK(result[0].index().rejected.raw_records == 9);
+  CHECK(result[0].index().rejected.degenerate_boxes == 3);
   store_coconut_component(root.path() / (std::to_string(workers) + ".bin"), result[0]);
  }
  for (const auto suffix : {"", ".inventory", ".complete.json"})
@@ -5223,8 +5339,8 @@ TEST_CASE("panoptic JSON publishes physical facts before unrelated envelope tail
  if (malformed || duplicate || cancel) CHECK_THROWS(import_coconut_annotations(input));
  else {
   const auto result = import_coconut_annotations(input);
-  REQUIRE(result.size() == 1); REQUIRE(result[0].inventory.size() == 1);
-  CHECK(result[0].inventory[0].source_ordinal == 0);
+  REQUIRE(result.size() == 1); REQUIRE(result[0].inventory().size() == 1);
+  CHECK(result[0].inventory()[0].source_ordinal == 0);
  }
  CHECK(file_bytes(cached_image_path(image_root, 3)) == jpeg);
  REQUIRE(execution.geometry(image_root, 3));
@@ -5471,11 +5587,11 @@ TEST_CASE("repeated warm Parquet membership owns transient physical workspace wi
   input.metadata_only = true; input.records = retained; input.parquet_shards.assign(paths.begin(), paths.end());
   input.physical_membership = &physical; input.expected_rows = 4; input.cancellation = cancellation;
   const auto components = import_coconut_annotations(input);
-  REQUIRE(components.size() == 1); CHECK(components[0].index.image_count() == 4);
-  REQUIRE(components[0].inventory.size() == 4);
+  REQUIRE(components.size() == 1); CHECK(components[0].index().image_count() == 4);
+  REQUIRE(components[0].inventory().size() == 4);
   for (std::size_t i = 0; i < 4; ++i) {
-   CHECK(components[0].inventory[i].source_ordinal == i);
-   CHECK(components[0].inventory[i].physical.image_id == i + 1);
+   CHECK(components[0].inventory()[i].source_ordinal == i);
+   CHECK(components[0].inventory()[i].physical.image_id == i + 1);
   }
  }
  retained->discard(); execution.retire_source(images);

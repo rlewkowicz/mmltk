@@ -5,7 +5,10 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/common/concurrency/cancellation_observation.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include <array>
+#include <cstddef>
+#include <ranges>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -30,23 +33,53 @@ struct CoconutCompletionFacts {
  std::optional<std::uint64_t> recovery_images;
 };
 MMLTK_REFLECT_FIELDS(CoconutCompletionFacts)
+class CoconutComponentBacking;
 class CoconutInventorySeal;
-template<class Index>
-struct CoconutComponentProduct {
+struct CoconutComponentMetadata {
  CoconutEdition edition = CoconutEdition::Base;
  CoconutImageNamespace source = CoconutImageNamespace::CocoTrain;
  std::string input_identity;
- Index index;
  std::uint32_t recovery_policy = 0;
  std::string original_annotation_identity;
- // Image-keyed recovery facts, independent of normalized storage offsets.
- std::vector<CoconutRecoveryImage> recovery;
- // Exactly one entry per normalized image, in the same order.
- std::vector<CoconutInventoryImage> inventory;
- mutable std::shared_ptr<CoconutInventorySeal> inventory_seal;
 };
-using CoconutComponent = CoconutComponentProduct<NormalizedAnnotationReadView>;
-using CoconutComponentBuilder = CoconutComponentProduct<NormalizedAnnotationBuilder>;
+class CoconutComponent final {
+public:
+ [[nodiscard]] CoconutEdition edition() const noexcept;
+ [[nodiscard]] CoconutImageNamespace source() const noexcept;
+ [[nodiscard]] const std::string& input_identity() const noexcept;
+ [[nodiscard]] std::uint32_t recovery_policy() const noexcept;
+ [[nodiscard]] std::string_view original_annotation_identity() const noexcept;
+ [[nodiscard]] const NormalizedAnnotationReadView& index() const noexcept { return index_; }
+ [[nodiscard]] const CoconutInventoryImage& inventory_image(std::size_t) const;
+ [[nodiscard]] const CoconutRecoveryImage& recovery_image(std::size_t) const;
+ [[nodiscard]] auto inventory() const {
+  return std::views::iota(std::size_t{0}, index_.image_count()) | std::views::transform([this](std::size_t i) -> const CoconutInventoryImage& { return inventory_image(i); });
+ }
+ [[nodiscard]] auto recovery() const {
+  return std::views::iota(std::size_t{0}, recovery_policy() ? index_.image_count() : 0) | std::views::transform([this](std::size_t i) -> const CoconutRecoveryImage& { return recovery_image(i); });
+ }
+ // The full source completion remains bound to its backing even after selection.
+ [[nodiscard]] std::shared_ptr<const NormalizedAnnotationCompletion> completion() const;
+ [[nodiscard]] CoconutComponent membership() const;
+ [[nodiscard]] CoconutComponent select_images(std::vector<std::size_t>, mmltk::common::concurrency::CancellationObservation = {}) const;
+private:
+ friend class CoconutComponentBacking;
+ friend void admit_coconut_component(const CoconutComponent&, mmltk::common::concurrency::CancellationObservation);
+ friend std::uint64_t coconut_component_storage_bytes(const CoconutComponent&);
+ friend void store_coconut_component(const std::filesystem::path&, const CoconutComponent&, mmltk::common::concurrency::CancellationObservation, StorageReservationPool*);
+ CoconutComponent(std::shared_ptr<const CoconutComponentBacking>, NormalizedAnnotationReadView, std::shared_ptr<CoconutInventorySeal>, bool);
+ std::shared_ptr<const CoconutComponentBacking> backing_;
+ NormalizedAnnotationReadView index_;
+ std::shared_ptr<CoconutInventorySeal> seal_;
+ bool membership_ = false;
+};
+struct CoconutComponentBuilder : CoconutComponentMetadata {
+ NormalizedAnnotationBuilder index;
+ std::vector<CoconutRecoveryImage> recovery;
+ std::vector<CoconutInventoryImage> inventory;
+ // Standalone construction performs real admission; no caller-supplied seal.
+ [[nodiscard]] CoconutComponent finish(mmltk::common::concurrency::CancellationObservation = {}, const std::filesystem::path& directory = {}, StorageReservationPool* = nullptr) &&;
+};
 struct CoconutSegment {
  std::uint32_t id = 0;
  std::uint64_t category_id = 0;
@@ -81,7 +114,7 @@ struct CoconutAnnotationRecords {
  std::shared_ptr<CoconutParquetMetadata> parquet;
  std::vector<CoconutRecordGroup> groups;
  // Sealed inventories from membership survive into the unchanged full import.
- std::vector<std::shared_ptr<CoconutInventorySeal>> inventories;
+ std::vector<CoconutComponent> inventories;
  std::string identity;
 };
 struct CoconutImportLimits {

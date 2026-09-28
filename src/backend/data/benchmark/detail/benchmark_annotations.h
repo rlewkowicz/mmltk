@@ -99,7 +99,7 @@ struct NormalizedAnnotationMetadata {
  AnnotationRejectCounts rejected;
  // Identity always describes the full persisted product, including on a
  // selected read view. Unpersisted membership has no completion.
- mutable std::shared_ptr<const NormalizedAnnotationCompletion> completion;
+ std::shared_ptr<const NormalizedAnnotationCompletion> completion;
 };
 struct NormalizedAnnotationBuilder : NormalizedAnnotationMetadata {
  std::vector<NormalizedImage> images;
@@ -126,7 +126,8 @@ public:
  [[nodiscard]] std::size_t box_count() const noexcept { return counts_.boxes; }
  [[nodiscard]] std::size_t run_count() const noexcept { return counts_.runs; }
  [[nodiscard]] bool selected() const noexcept { return static_cast<bool>(positions_); }
- [[nodiscard]] const NormalizedImage& image(std::size_t position) const { return storage_.images[positions_ ? positions_->at(position) : position]; }
+ [[nodiscard]] std::size_t source_position(std::size_t position) const { if (position >= image_count()) throw std::out_of_range("normalized image position is invalid"); return positions_ ? (*positions_)[position] : position; }
+ [[nodiscard]] const NormalizedImage& image(std::size_t position) const { return storage_.images[source_position(position)]; }
  [[nodiscard]] auto images() const {
   return std::views::iota(std::size_t{0}, image_count()) | std::views::transform([this](std::size_t position) -> const NormalizedImage& { return image(position); });
  }

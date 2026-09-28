@@ -506,6 +506,10 @@ void test_benchmark_supplemental_sampling() {
   CHECK(selected->storage().boxes.size() == source.boxes.size());
  }
  REQUIRE(first.view.image_count() != 0);
+ const auto nested = first.view.select_images({0});
+ CHECK(nested.source_position(0) == first.view.source_position(0));
+ CHECK(&nested.image(0) == &first.view.image(0));
+ CHECK_THROWS(nested.source_position(nested.image_count()));
  REQUIRE(first.stats.selected_boxes == first.view.box_count());
  REQUIRE(first.view.image_count() == second.view.image_count());
  REQUIRE(first.view.box_count() == second.view.box_count());
@@ -513,6 +517,7 @@ void test_benchmark_supplemental_sampling() {
  for (std::size_t position = 0; position < first.view.image_count(); ++position) {
   const auto& selected = first.view.image(position);
   const auto& repeated = second.view.image(position);
+  CHECK(first.view.source_position(position) == selected.source_image_id);
   CHECK(std::memcmp(&selected, &repeated, sizeof(NormalizedImage)) == 0);
   CHECK((position == 0 || selected.source_image_id > previous_id));
   previous_id = selected.source_image_id;
