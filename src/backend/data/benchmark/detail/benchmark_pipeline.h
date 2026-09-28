@@ -3,6 +3,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <stdexcept>
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
+class BenchmarkCurl;
 class BenchmarkSplitWriter;
 struct PreparedBenchmarkSplit;
 class StorageReservationPool;
@@ -36,16 +38,22 @@ public:
  BenchmarkCompilePipeline& operator=(const BenchmarkCompilePipeline&) = delete;
  [[nodiscard]] std::size_t workers() const noexcept;
  [[nodiscard]] std::size_t current_lane() const;
+ [[nodiscard]] BenchmarkCurl& curl();
  [[nodiscard]] StorageReservationPool& storage() noexcept;
  [[nodiscard]] std::span<const int> cpus() const noexcept;
  [[nodiscard]] std::uint64_t transient_target() const noexcept;
  [[nodiscard]] std::size_t descriptor_limit() const noexcept;
+ // Idle source buffers yield to blocked consumers and resource borrowers.
+ [[nodiscard]] bool resource_pressure() const;
  // Source controllers capture before checking readiness/resource fit, then
  // wait without holding source locks. Readiness publishers signal after their
  // own state changes; returned credits advance this same admission event.
  [[nodiscard]] std::uint64_t admission_generation() const;
- void wait_for_admission_change(std::uint64_t);
+ void wait_for_admission_change(std::uint64_t, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
  void notify_admission_change() noexcept;
+ // Reject impossible controller demands before a nonblocking admission loop.
+ void require_feasible(BenchmarkResources) const;
+ [[nodiscard]] std::size_t descriptor_ceiling(BenchmarkResources) const;
  [[nodiscard]] std::optional<BenchmarkAllowance> try_reserve(BenchmarkResources, const BenchmarkAllowance& parent = {});
  // A dependent draw uses at most its parent's remaining commitment. Additional
  // demand needs uncommitted capacity; copied parents cannot lend twice.

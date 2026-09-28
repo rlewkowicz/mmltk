@@ -1,10 +1,12 @@
 #pragma once  // backend.data private implementation boundary
 #include <curl/curl.h>
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
-#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
+#include <chrono>
 #include <limits>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -15,10 +17,13 @@
 #include <utility>
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
-// Shared transport demand: multi wake/setup/publication handles plus socket,
-// resolver and output custody per active transfer. Source owners add their
-// simultaneous lifecycle/batch locks and actual retained payload workspace.
+// Quantified transport envelope: the multi wake pair plus per-request native
+// TCP candidates and resolver custody. The live owner admits these distinct lifetimes;
+// source owners retain their locks, partial files and publication descriptors.
 [[nodiscard]] BenchmarkTransferEnvelope benchmark_curl_envelope(std::size_t lease_descriptors = 0, std::uint64_t fixed_bytes = 0, std::uint64_t payload_bytes_per_transfer = 0);
+[[nodiscard]] BenchmarkResources benchmark_curl_input_resources(std::uint64_t payload_bytes = 0);
+void reject_local_curl_failure(CURLcode);
+class BenchmarkCompilePipeline;
 // Every benchmark HTTP transfer targets the same infrastructure, so it shares one hardening policy.
 inline constexpr long kBenchmarkConnectTimeoutSeconds = 30L;
 inline constexpr long kBenchmarkLowSpeedLimitBytes = 1024L;
@@ -110,6 +115,11 @@ struct CurlTransferSetup {
 inline void configure_curl_transfer(CURL* handle, const CurlTransferSetup& setup, const char* failure_prefix) {
  set_curl_option_with_prefix(handle, CURLOPT_ERRORBUFFER, setup.error_buffer, failure_prefix, "error buffer");
  set_curl_option_with_prefix(handle, CURLOPT_URL, setup.url, failure_prefix, "URL");
+ // The inspected native socket envelope is the TCP HTTP/HTTPS path. Keep its
+ // protocol choice explicit for both the initial URL and every native redirect.
+ set_curl_option_with_prefix(handle, CURLOPT_PROTOCOLS_STR, "http,https", failure_prefix, "HTTP protocols");
+ set_curl_option_with_prefix(handle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https", failure_prefix, "redirect protocols");
+ set_curl_option_with_prefix(handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS, failure_prefix, "HTTP/2");
  set_curl_option_with_prefix(handle, CURLOPT_FOLLOWLOCATION, 1L, failure_prefix, "redirect following");
  set_curl_option_with_prefix(handle, CURLOPT_MAXREDIRS, setup.maximum_redirects, failure_prefix, "redirect limit");
  set_curl_option_with_prefix(handle, CURLOPT_NOSIGNAL, 1L, failure_prefix, "signal suppression");
@@ -128,10 +138,44 @@ inline void configure_curl_transfer(CURL* handle, const CurlTransferSetup& setup
  set_curl_option_with_prefix(handle, CURLOPT_XFERINFODATA, setup.owner, failure_prefix, "progress callback data");
  set_curl_option_with_prefix(handle, CURLOPT_PRIVATE, setup.owner, failure_prefix, "private transfer data");
 }
-// Owns the transfers in flight on a libcurl multi handle. Both benchmark transfer loops drive
-// through this type, so handle registration, completion demultiplexing, polling, abandonment, and
-// multi-API error reporting have one owner; callers keep only their admission and completion policy.
-// `Transfer` must expose an `easy` member holding its `CurlEasy` handle.
+// The compile owns one transport thread and connection cache. Source controllers
+// retain protocol, retry and publication policy. A channel settles every borrowed
+// easy handle before returning it, including cancellation and exceptional unwind.
+// Live source declarations also bound idle cache retention so native sockets
+// cannot permanently consume a declared source continuation. Active admission
+// retains its independent logical and guaranteed native candidate ceilings.
+class BenchmarkCurl final {
+ struct Impl;
+public:
+ enum class Class { Artifact, OpenImages };
+ struct Completed { CURL* handle; CURLcode result; };
+ class Channel final {
+  friend class BenchmarkCurl;
+  struct State;
+ public:
+  ~Channel();
+  Channel(const Channel&) = delete;
+  Channel& operator=(const Channel&) = delete;
+  void add(CURL*, bool extra_range = false, BenchmarkAllowance input = {});
+  [[nodiscard]] std::optional<Completed> next();
+  void wait_until(std::chrono::steady_clock::time_point);
+  void wake() noexcept;
+  void remove(CURL*);
+ private:
+  Channel(std::shared_ptr<Impl>, Class, mmltk::common::concurrency::CancellationObservation, BenchmarkResources);
+  std::shared_ptr<Impl> owner_;
+  std::shared_ptr<State> state_;
+ };
+ explicit BenchmarkCurl(std::size_t cpu_budget, BenchmarkCompilePipeline* = nullptr);
+ ~BenchmarkCurl();
+ // Source admission retains a channel before acquiring its dependent leases.
+ // The source demand checks descriptor feasibility only; Curl still admits
+ // request bytes and native candidates separately at the active-request turn.
+ [[nodiscard]] std::unique_ptr<Channel> channel(Class, mmltk::common::concurrency::CancellationObservation = {}, BenchmarkResources source = {});
+ [[nodiscard]] std::function<void()> admission_wakeup() const;
+private:
+ std::shared_ptr<Impl> impl_;
+};
 template <typename Transfer>
 class CurlMultiTransfers {
 public:
@@ -140,60 +184,37 @@ public:
   CURL* handle = nullptr;
   CURLcode result = CURLE_OK;
  };
- CurlMultiTransfers(CurlMulti multi, std::string label) : multi_(std::move(multi)), label_(std::move(label)) {}
+ CurlMultiTransfers(BenchmarkCurl& owner, BenchmarkCurl::Class kind, mmltk::common::concurrency::CancellationObservation cancellation = {}, BenchmarkResources source = {}) : channel_(owner.channel(kind, cancellation, source)) {}
+ ~CurlMultiTransfers() { abandon_all([](Transfer&) noexcept {}); }
  [[nodiscard]] bool empty() const noexcept { return active_.empty(); }
  [[nodiscard]] std::size_t size() const noexcept { return active_.size(); }
- void reserve(const std::size_t transfers) { active_.reserve(transfers); }
- // Registers an already-configured transfer and starts it on the multi handle.
- void add(std::unique_ptr<Transfer> transfer) {
-  CURL* handle = transfer->easy.get();
-  auto [iterator, inserted] = active_.emplace(handle, std::move(transfer));
-  if (!inserted) { throw std::runtime_error(label_ + " easy handle is already active"); }
-  const CURLMcode status = curl_multi_add_handle(multi_.get(), handle);
-  if (status != CURLM_OK) {
-   active_.erase(iterator);
-   throw std::runtime_error("cannot add " + label_ + ": " + curl_multi_strerror(status));
-  }
+ void add(std::unique_ptr<Transfer> transfer, bool extra_range = false, BenchmarkAllowance input = {}) {
+  auto* handle = transfer->easy.get();
+  const auto [position, inserted] = active_.emplace(handle, std::move(transfer));
+  if (!inserted) throw std::logic_error("benchmark easy handle already registered");
+  try { channel_->add(handle, extra_range, std::move(input)); }
+  catch (...) { active_.erase(position); throw; }
  }
- void perform() {
-  int running = 0;
-  const CURLMcode status = curl_multi_perform(multi_.get(), &running);
-  if (status != CURLM_OK) { throw std::runtime_error(label_ + " loop failed: " + curl_multi_strerror(status)); }
- }
- // Detaches the next finished transfer, or reports nothing when none has completed yet.
  [[nodiscard]] std::optional<Completion> next_completed() {
-  int remaining = 0;
-  while (CURLMsg* message = curl_multi_info_read(multi_.get(), &remaining)) {
-   if (message->msg != CURLMSG_DONE) { continue; }
-   const auto iterator = active_.find(message->easy_handle);
-   if (iterator == active_.end()) { throw std::runtime_error(label_ + " completion references an unknown handle"); }
-   Completion completion{std::move(iterator->second), message->easy_handle, message->data.result};
-   active_.erase(iterator);
-   (void)curl_multi_remove_handle(multi_.get(), completion.handle);
-   return std::optional<Completion>(std::move(completion));
-  }
-  return std::nullopt;
+  const auto result = channel_->next();
+  if (!result) return {};
+  const auto position = active_.find(result->handle);
+  if (position == active_.end()) throw std::logic_error("benchmark completion lost its owner");
+  Completion completed{std::move(position->second), result->handle, result->result};
+  active_.erase(position);
+  return completed;
  }
- void poll(const int timeout_milliseconds) {
-  int descriptors = 0;
-  const CURLMcode status = curl_multi_poll(multi_.get(), nullptr, 0, timeout_milliseconds, &descriptors);
-  if (status != CURLM_OK) { throw std::runtime_error(label_ + " poll failed: " + curl_multi_strerror(status)); }
- }
- // Detaches every still-running transfer on the failure path, handing each to `release` so the
- // caller can salvage or discard its partial work.
- template <typename Release>
- void abandon_all(Release&& release) {
-  // Cleanup outcome does not depend on CURL handle address order.
-  for (auto& [handle, transfer] : active_) {  // NOLINT(bugprone-nondeterministic-pointer-iteration-order)
-   (void)curl_multi_remove_handle(multi_.get(), handle);
-   release(*transfer);
-  }
+ void poll(int milliseconds) { channel_->wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds)); }
+ void wait_until(std::chrono::steady_clock::time_point deadline) { channel_->wait_until(deadline); }
+ void wake() noexcept { channel_->wake(); }
+ template <typename Release> void abandon_all(Release&& release) {
+  // First detach every callback; salvage cannot race a still-running write.
+  for (const auto& [handle, transfer] : active_) { (void)transfer; channel_->remove(handle); }
+  for (auto& [handle, transfer] : active_) { (void)handle; release(*transfer); }
   active_.clear();
  }
-
 private:
- CurlMulti multi_;
- std::string label_;
+ std::unique_ptr<BenchmarkCurl::Channel> channel_;
  std::unordered_map<CURL*, std::unique_ptr<Transfer>> active_;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

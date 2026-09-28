@@ -3,8 +3,10 @@
 #include "src/pch_linux.h"
 #include "src/pch_std.h"
 #include <list>
-#include "src/common/concurrency/worker_pool.h"
-#include "src/common/system/cpu_affinity.h"
+#include <queue>
+#include <numeric>
+#include <condition_variable>
+#include <thread>
 #include "src/backend/data/benchmark/benchmark_hash.h"
 #include "src/common/io/file_digest.h"
 #include "src/common/io/file_memory.h"
@@ -36,33 +38,6 @@ using mmltk::common::math::checked_multiply;
 using mmltk::common::types::trim_http_field_value;
 namespace {
 using Clock = std::chrono::steady_clock;
-void reject_local_curl_failure(const CURLcode result) {
- switch (result) {
-  case CURLE_OUT_OF_MEMORY: throw std::bad_alloc{};
-  case CURLE_UNSUPPORTED_PROTOCOL:
-  case CURLE_FAILED_INIT:
-  case CURLE_URL_MALFORMAT:
-  case CURLE_NOT_BUILT_IN:
-  case CURLE_READ_ERROR:
-  case CURLE_BAD_FUNCTION_ARGUMENT:
-  case CURLE_INTERFACE_FAILED:
-  case CURLE_UNKNOWN_OPTION:
-  case CURLE_SETOPT_OPTION_SYNTAX:
-  case CURLE_SSL_ENGINE_NOTFOUND:
-  case CURLE_SSL_ENGINE_SETFAILED:
-  case CURLE_SSL_ENGINE_INITFAILED:
-  case CURLE_SSL_CERTPROBLEM:
-  case CURLE_SSL_CIPHER:
-  case CURLE_SSL_CACERT_BADFILE:
-  case CURLE_SSL_CRL_BADFILE:
-  case CURLE_FILE_COULDNT_READ_FILE:
-  case CURLE_ABORTED_BY_CALLBACK:
-  case CURLE_AGAIN:
-  case CURLE_RECURSIVE_API_CALL:
-  case CURLE_UNRECOVERABLE_POLL: throw std::runtime_error(std::string("local benchmark CURL failure: ") + curl_easy_strerror(result));
-  default: break;
- }
-}
 void trace_transfer_progress(const BenchmarkTraceSink& trace, const DownloadRequest& request, const std::uint64_t completed, const std::uint64_t total, const std::uint32_t attempt, const bool resumed,
  const std::uint64_t retained, const std::uint64_t durable, const bool redownload) {
  trace_benchmark_event(trace, "benchmark.download.progress", [&] {
@@ -309,25 +284,25 @@ struct Transfer {
  Clock::time_point last_progress{};
  curl_off_t last_reported_download_now = -1;
  Transfer(const DownloadRequest& request_value, DownloadProgressSink progress_value, BenchmarkTraceSink trace_value, mmltk::common::concurrency::CancellationObservation cancel,
-  const std::uint32_t attempt_value, const bool redownload_value, DownloadStorage& destination)
+  const std::uint32_t attempt_value, const bool redownload_value, DownloadStorage& destination, std::optional<nlohmann::json> observed_metadata)
      : storage(destination), request(request_value),
        progress(std::move(progress_value)),
        trace(std::move(trace_value)),
        cancel_requested(cancel),
        attempt(attempt_value),
        redownload(request_value.redownload || redownload_value) {
-  prepare_partial();
+  prepare_partial(std::move(observed_metadata));
   prepare_easy();
  }
- void prepare_partial() {
+ void prepare_partial(std::optional<nlohmann::json> observed_metadata) {
   (void)mmltk::common::io::ensure_parent_directory(request.destination);
   const std::filesystem::path part_path = partial_path(request);
   bool metadata_matches = false;
   const std::filesystem::path metadata_path = partial_metadata_path(request);
-  if (std::filesystem::exists(metadata_path)) {
+  if (observed_metadata || std::filesystem::exists(metadata_path)) {
    try {
-    const nlohmann::json metadata = read_json_file(metadata_path);
-    metadata_matches = metadata.value("schema_version", 0U) == kBenchmarkCacheSchemaVersion && metadata.value("url", std::string{}) == request.url;
+    const nlohmann::json metadata = observed_metadata ? std::move(*observed_metadata) : read_json_file(metadata_path);
+    metadata_matches = metadata.value("schema_version", 0U) == kBenchmarkCacheSchemaVersion && metadata.value("url", std::string{}) == request.url && metadata.value("mode", std::string{}) != "segmented";
     resume_etag = metadata.value("etag", std::string{});
     resume_last_modified = metadata.value("last_modified", std::string{});
    } catch (const std::exception& error) {
@@ -500,12 +475,6 @@ struct Transfer {
    [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"bytes", write_offset}, {"resume_eligible", !effective_etag().empty() || !effective_last_modified().empty()}}; });
  }
 };
-struct PendingTransfer {
- std::size_t request_index = 0U;
- std::uint32_t attempt = 1U;
- Clock::time_point ready_at{};
- bool redownload = false;
-};
 class DownloadVerificationError final : public std::runtime_error {
 public:
  using std::runtime_error::runtime_error;
@@ -554,11 +523,15 @@ struct IdentityProbe {
  // The probe only needs the parsed response state; individual header kinds carry no policy.
  void on_header(HttpHeaderKind, std::string_view) const noexcept {}
 };
-[[nodiscard]] RemoteArtifactIdentity probe_remote_identity(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace) {
+[[nodiscard]] RemoteArtifactIdentity probe_remote_identity(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, BenchmarkCurl& transport) {
+ CurlMultiTransfers<IdentityProbe> active(transport, BenchmarkCurl::Class::Artifact, cancel_requested);
  for (std::uint32_t attempt = 1U; attempt <= request.maximum_attempts; ++attempt) {
   throw_if_benchmark_cancelled(cancel_requested);
-  IdentityProbe probe(request, cancel_requested);
-  const CURLcode result = curl_easy_perform(probe.easy.get());
+  active.add(std::make_unique<IdentityProbe>(request, cancel_requested));
+  std::optional<CurlMultiTransfers<IdentityProbe>::Completion> completed;
+  while (!(completed = active.next_completed())) { throw_if_benchmark_cancelled(cancel_requested); active.poll(kBenchmarkTransferPollMilliseconds); }
+  auto& probe = *completed->transfer;
+  const CURLcode result = completed->result;
   (void)curl_easy_getinfo(probe.easy.get(), CURLINFO_RESPONSE_CODE, &probe.http.response_code);
   if (probe.callback_error) { std::rethrow_exception(probe.callback_error); }
   throw_if_benchmark_cancelled(cancel_requested);
@@ -585,7 +558,8 @@ struct IdentityProbe {
   if (attempt == request.maximum_attempts) { throw BenchmarkDownloadUnavailable("cannot establish a stable ranged download identity for " + request.artifact_id); }
   // The remote probe retry is intentionally deadline-based HTTP backoff, not local status polling.
   throw_if_benchmark_cancelled(cancel_requested);
-  std::this_thread::sleep_for(std::chrono::milliseconds{std::min<std::uint64_t>(4000U, 250U << std::min<std::uint32_t>(attempt - 1U, 4U))});
+  const auto deadline = Clock::now() + std::chrono::milliseconds{std::min<std::uint64_t>(4000U, 250U << std::min<std::uint32_t>(attempt - 1U, 4U))};
+  while (Clock::now() < deadline) { throw_if_benchmark_cancelled(cancel_requested); active.wait_until(std::min(deadline, Clock::now() + std::chrono::milliseconds{250})); }
   throw_if_benchmark_cancelled(cancel_requested);
  }
  throw std::runtime_error("segmented identity probe did not run");
@@ -600,7 +574,7 @@ class SegmentedDownloadState {
  DownloadStorage& storage_;
 public:
  SegmentedDownloadState(const DownloadRequest& request, const RemoteArtifactIdentity& identity, const std::size_t segment_count, const DownloadProgressSink& progress, const BenchmarkTraceSink& trace,
-  const int descriptor, const mmltk::common::concurrency::CancellationObservation cancellation, DownloadStorage& storage)
+  const int descriptor, const mmltk::common::concurrency::CancellationObservation cancellation, DownloadStorage& storage, nlohmann::json cached)
      : storage_(storage), request_(request), identity_(identity), progress_(progress), trace_(trace), descriptor_(descriptor), cancellation_(cancellation) {
   segments_.reserve(segment_count);
   const std::uint64_t segment_count_u64 = checked_cast<std::uint64_t>(segment_count, "segmented download count overflow");
@@ -615,8 +589,9 @@ public:
    segments_.push_back(DownloadSegment{begin, next - 1U});
    next_begin = next;
   }
-  load_resume_state();
+  load_resume_state(cached);
  }
+ [[nodiscard]] std::size_t size() const noexcept { return segments_.size(); }
  [[nodiscard]] DownloadSegment segment(const std::size_t index) {
   const std::lock_guard lock(mutex_);
   return segments_.at(index);
@@ -624,6 +599,8 @@ public:
  void report_in_flight(const std::size_t index, const std::uint64_t bytes) {
   if (!progress_ && !trace_) return;
   const std::lock_guard lock(mutex_);
+  in_flight_bytes_ -= in_flight_.at(index);
+  in_flight_bytes_ = checked_u64_add(in_flight_bytes_, bytes, "segmented in-flight byte overflow");
   in_flight_.at(index) = bytes;
   const Clock::time_point now = Clock::now();
   if (last_progress_.time_since_epoch().count() != 0 && now - last_progress_ < std::chrono::milliseconds{100}) { return; }
@@ -634,29 +611,40 @@ public:
   if (!progress_ && !trace_) { return; }
   const std::lock_guard lock(mutex_);
   active_attempt_ = std::max(active_attempt_, attempt);
-  if (attempt > 1U) {
-   retained_bytes_ = 0U;
-   for (const auto& segment : segments_) { retained_bytes_ = checked_u64_add(retained_bytes_, segment.completed, "segmented retained byte overflow"); }
-  }
+  if (attempt > 1U) retained_bytes_ = committed_bytes_;
   emit_progress_locked(true);
  }
  void commit_attempt(const std::size_t index, const std::uint64_t attempt_begin, const std::uint64_t transferred, const std::uint32_t attempt) {
-  const std::lock_guard lock(mutex_);
-  DownloadSegment& segment = segments_.at(index);
-  const std::uint64_t expected_begin = checked_u64_add(segment.begin, segment.completed, "segmented download attempt offset overflow");
-  if (attempt_begin != expected_begin || transferred > segment.end + 1U - expected_begin) { throw std::runtime_error("segmented download attempt is outside its assigned range"); }
-  segment.completed = checked_u64_add(segment.completed, transferred, "segmented download completion overflow");
-  segment.attempts = std::max(segment.attempts, attempt);
-  in_flight_.at(index) = 0U;
-  persist_locked();
-  emit_progress_locked(segment.completed == segment.end + 1U - segment.begin);
+  std::vector<DownloadSegment> checkpoint;
+  bool complete = false;
+  {
+   const std::lock_guard lock(mutex_);
+   DownloadSegment& segment = segments_.at(index);
+   const auto expected_begin = checked_u64_add(segment.begin, segment.completed, "segmented download attempt offset overflow");
+   if (attempt_begin != expected_begin || transferred > segment.end + 1U - expected_begin) throw std::runtime_error("segmented download attempt is outside its assigned range");
+   segment.completed = checked_u64_add(segment.completed, transferred, "segmented download completion overflow");
+   committed_bytes_ = checked_u64_add(committed_bytes_, transferred, "segmented committed byte overflow");
+   maximum_attempt_ = std::max(maximum_attempt_, attempt);
+   segment.attempts = std::max(segment.attempts, attempt);
+   in_flight_bytes_ -= in_flight_.at(index);
+   in_flight_.at(index) = 0;
+   checkpoint = segments_;
+   complete = segment.completed == segment.end + 1U - segment.begin;
+  }
+  persist(checkpoint);
+  { const std::lock_guard lock(mutex_); emit_progress_locked(complete); }
  }
  void abandon_attempt(const std::size_t index, const std::uint32_t attempt) {
-  const std::lock_guard lock(mutex_);
-  DownloadSegment& segment = segments_.at(index);
-  segment.attempts = std::max(segment.attempts, attempt);
-  in_flight_.at(index) = 0U;
-  persist_locked();
+  std::vector<DownloadSegment> checkpoint;
+  {
+   const std::lock_guard lock(mutex_);
+   segments_.at(index).attempts = std::max(segments_.at(index).attempts, attempt);
+   maximum_attempt_ = std::max(maximum_attempt_, attempt);
+   in_flight_bytes_ -= in_flight_.at(index);
+   in_flight_.at(index) = 0;
+   checkpoint = segments_;
+  }
+  persist(checkpoint);
  }
  [[nodiscard]] bool resumed() const noexcept { return resumed_; }
  [[nodiscard]] std::uint64_t retained_bytes() const {
@@ -665,41 +653,45 @@ public:
  }
  [[nodiscard]] std::uint32_t maximum_attempts() const {
   const std::lock_guard lock(mutex_);
-  std::uint32_t maximum = 0U;
-  for (const DownloadSegment& segment : segments_) { maximum = std::max(maximum, segment.attempts); }
-  return maximum;
+  return maximum_attempt_;
  }
 
 private:
- [[nodiscard]] nlohmann::json metadata_locked() const {
+ [[nodiscard]] nlohmann::json metadata(std::span<const DownloadSegment> snapshot) const {
   nlohmann::json segments = nlohmann::json::array();
-  for (const DownloadSegment& segment : segments_) { segments.push_back({{"begin", segment.begin}, {"end", segment.end}, {"completed", segment.completed}, {"attempts", segment.attempts}}); }
+  for (const DownloadSegment& segment : snapshot) { segments.push_back({{"begin", segment.begin}, {"end", segment.end}, {"completed", segment.completed}, {"attempts", segment.attempts}}); }
   return nlohmann::json{
    {"schema_version", kBenchmarkCacheSchemaVersion}, {"mode", "segmented"}, {"url", request_.url}, {"size", request_.expected_size}, {"etag", identity_.etag},
    {"last_modified", identity_.last_modified}, {"segments", std::move(segments)}
   };
  }
- void load_resume_state() {
+ void load_resume_state(const nlohmann::json& cached) {
   bool valid = false;
-  const std::filesystem::path metadata = partial_metadata_path(request_);
-  if (std::filesystem::is_regular_file(metadata) && regular_file_size(partial_path(request_)) == request_.expected_size) {
+  struct stat partial_status{};
+  if (::fstat(descriptor_, &partial_status) != 0) throw errno_error("cannot inspect segmented partial", partial_path(request_).string());
+  if (!cached.is_null() && S_ISREG(partial_status.st_mode) && partial_status.st_size >= 0 && static_cast<std::uint64_t>(partial_status.st_size) == request_.expected_size) {
    try {
-    const nlohmann::json cached = read_json_file(metadata);
     const nlohmann::json& cached_segments = cached.at("segments");
     valid = cached.value("schema_version", 0U) == kBenchmarkCacheSchemaVersion && cached.value("mode", std::string{}) == "segmented" && cached.value("url", std::string{}) == request_.url &&
             cached.value("size", 0ULL) == request_.expected_size && cached.value("etag", std::string{}) == identity_.etag && cached.value("last_modified", std::string{}) == identity_.last_modified &&
-            cached_segments.is_array() && cached_segments.size() == segments_.size();
+            cached_segments.is_array() && !cached_segments.empty() &&
+            cached_segments.size() <= std::min<std::uint64_t>(8, request_.expected_size / kMinimumSegmentBytes + (request_.expected_size % kMinimumSegmentBytes != 0));
+    // Bound untrusted topology before allocation by what historical writers
+    // could emit, independently of the current connection budget.
     if (valid) {
-     for (std::size_t index = 0U; index < segments_.size(); ++index) {
-      DownloadSegment& segment = segments_[index];
-      const nlohmann::json& cached_segment = cached_segments[index];
-      const std::uint64_t completed = cached_segment.value("completed", 0ULL);
-      valid = cached_segment.value("begin", std::numeric_limits<std::uint64_t>::max()) == segment.begin && cached_segment.value("end", std::numeric_limits<std::uint64_t>::max()) == segment.end &&
-              completed <= segment.end + 1U - segment.begin;
-      if (!valid) { break; }
-      segment.completed = completed;
-      segment.attempts = 0U;
+     std::vector<DownloadSegment> admitted;
+     admitted.reserve(cached_segments.size());
+     std::uint64_t next = 0;
+     for (const auto& value : cached_segments) {
+      const auto begin = value.at("begin").get<std::uint64_t>();
+      const auto end = value.at("end").get<std::uint64_t>();
+      const auto completed = value.at("completed").get<std::uint64_t>();
+      if (begin != next || end < begin || end >= request_.expected_size || completed > end - begin + 1) { valid = false; break; }
+      admitted.push_back({begin, end, completed, 0});
+      next = end + 1;
      }
+     valid = valid && next == request_.expected_size;
+     if (valid) segments_ = std::move(admitted);
     }
    } catch (const std::exception& error) {
     if (is_benchmark_capacity_failure(error)) throw;
@@ -718,39 +710,34 @@ private:
   }
   resumed_ = std::ranges::any_of(segments_, [](const DownloadSegment& segment) { return segment.completed != 0U; });
   in_flight_.assign(segments_.size(), 0U);
-  if (progress_ || trace_) {
-   for (const auto& segment : segments_) { retained_bytes_ += segment.completed; }
-  }
-  persist_locked();
+  for (const auto& segment : segments_) committed_bytes_ = checked_u64_add(committed_bytes_, segment.completed, "segmented retained byte overflow");
+  retained_bytes_ = committed_bytes_;
+  persist(segments_);
   emit_progress_locked(false);
   trace_benchmark_event(trace_, "benchmark.download.segmented_resume_state", [&] { return nlohmann::json{{"artifact", request_.artifact_id}, {"segments", segments_.size()}, {"resumed", resumed_}}; });
  }
- void persist_locked() const {
+ // Only the artifact controller commits attempts. Ordered immutable snapshots
+ // persist outside the callback/progress mutex while other sockets keep running.
+ // Metadata sync does not make each partial data write power-loss durable.
+ void persist(std::span<const DownloadSegment> checkpoint) const {
   storage_.growth.reconcile(descriptor_);
-  write_json_atomically(partial_metadata_path(request_), metadata_locked(), cancellation_, &storage_.filesystem);
+  write_json_atomically(partial_metadata_path(request_), metadata(checkpoint), cancellation_, &storage_.filesystem);
  }
 public:
  void settle_written() { storage_.growth.reconcile(descriptor_); }
 private:
  void emit_progress_locked(const bool force) const {
   if (!progress_ && !trace_) { return; }
-  std::uint64_t durable = 0U;
-  std::uint64_t completed = 0U;
-  std::uint32_t attempts = 0U;
-  for (std::size_t index = 0U; index < segments_.size(); ++index) {
-   const std::uint64_t segment_completed = segments_[index].completed + in_flight_[index];
-   if (completed > request_.expected_size || segment_completed > request_.expected_size - completed) { throw std::runtime_error("segmented download progress exceeds artifact size"); }
-   completed += segment_completed;
-   durable += segments_[index].completed;
-   attempts = std::max({attempts, segments_[index].attempts, active_attempt_});
-  }
+  const auto completed = checked_u64_add(committed_bytes_, in_flight_bytes_, "segmented progress byte overflow");
+  if (completed > request_.expected_size) throw std::runtime_error("segmented download progress exceeds artifact size");
+  const auto attempts = std::max(maximum_attempt_, active_attempt_);
   if (force || completed <= request_.expected_size) {
    if (progress_) {
     progress_(DownloadProgress{
      request_.artifact_id, {completed, request_.expected_size, retained_bytes_, attempts, false, retained_bytes_ != 0U}, DownloadProgressPhase::kDownloading, request_.redownload, request_.source
     });
    }
-   trace_transfer_progress(trace_, request_, completed, request_.expected_size, attempts, retained_bytes_ != 0U, retained_bytes_, durable, request_.redownload);
+   trace_transfer_progress(trace_, request_, completed, request_.expected_size, attempts, retained_bytes_ != 0U, retained_bytes_, committed_bytes_, request_.redownload);
   }
  }
  const DownloadRequest& request_;
@@ -762,7 +749,8 @@ private:
  mutable std::mutex mutex_;
  std::vector<DownloadSegment> segments_;
  std::vector<std::uint64_t> in_flight_;
- std::uint32_t active_attempt_ = 0U;
+ std::uint32_t active_attempt_ = 0U, maximum_attempt_ = 0U;
+ std::uint64_t committed_bytes_ = 0U, in_flight_bytes_ = 0U;
  std::uint64_t retained_bytes_ = 0U;
  Clock::time_point last_progress_{};
  bool resumed_ = false;
@@ -850,99 +838,76 @@ struct SegmentTransfer {
  }
 };
 [[nodiscard]] DownloadResult download_segmented_artifact(const DownloadRequest& request, const std::size_t maximum_concurrency, mmltk::common::concurrency::CancellationObservation cancel_requested,
- const DownloadProgressSink& progress, const BenchmarkTraceSink& trace, DownloadStorage& storage) {
+ const DownloadProgressSink& progress, const BenchmarkTraceSink& trace, DownloadStorage& storage, BenchmarkCurl& transport, nlohmann::json cached) {
  CurlGlobal::initialize();
- const RemoteArtifactIdentity identity = probe_remote_identity(request, cancel_requested, trace);
+ const RemoteArtifactIdentity identity = probe_remote_identity(request, cancel_requested, trace, transport);
  const std::uint64_t segments_for_size = request.expected_size / kMinimumSegmentBytes + static_cast<std::uint64_t>(request.expected_size % kMinimumSegmentBytes != 0U);
- const std::size_t segment_count = checked_cast<std::size_t>(
+ const std::size_t initial_segment_count = checked_cast<std::size_t>(
   std::max<std::uint64_t>(1U, std::min(checked_cast<std::uint64_t>(maximum_concurrency, "segmented concurrency overflow"), segments_for_size)), "segmented download count overflow");
  (void)mmltk::common::io::ensure_parent_directory(request.destination);
  const int descriptor = ::open(partial_path(request).c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
  if (descriptor < 0) { throw errno_error("cannot open segmented benchmark download", partial_path(request).string()); }
  ScopedFd partial(descriptor);
- SegmentedDownloadState state(request, identity, segment_count, progress, trace, descriptor, cancel_requested, storage);
+ SegmentedDownloadState state(request, identity, initial_segment_count, progress, trace, descriptor, cancel_requested, storage, std::move(cached));
+ const auto segment_count = state.size();
  trace_benchmark_event(trace, "benchmark.download.segmented_start",
   [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"segments", segment_count}, {"bytes", request.expected_size}, {"resumed", state.resumed()}}; });
- std::exception_ptr transfer_error;
- std::mutex transfer_error_mutex;
- // Network connection concurrency is independent of CPU worker allocation.
- // This scope also retires partial launches before state and the descriptor.
- struct SegmentThreads {
-  mmltk::common::concurrency::CancellationObservation external;
-  std::atomic<bool> stopping{false};
-  std::vector<std::thread> threads{};
-  [[nodiscard]] bool cancelled() const noexcept { return stopping.load(std::memory_order_relaxed) || external.requested(); }
-  void join() noexcept {
-   for (auto& thread : threads)
-    if (thread.joinable()) thread.join();
-  }
-  ~SegmentThreads() {
-   stopping.store(true, std::memory_order_relaxed);
-   join();
-  }
- } transfers{cancel_requested};
- const auto transfer_cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(transfers);
- const auto download_segment = [&, transfer_cancellation](const std::size_t segment_index) {
-  while (true) {
-   throw_if_benchmark_cancelled(transfer_cancellation);
-   const DownloadSegment segment = state.segment(segment_index);
-   const std::uint64_t segment_size = segment.end + 1U - segment.begin;
-   if (segment.completed == segment_size) { break; }
-   const std::uint32_t attempt = segment.attempts + 1U;
-   if (attempt > request.maximum_attempts) { throw BenchmarkDownloadUnavailable("segmented benchmark download exhausted retries for " + request.artifact_id); }
-   const std::uint64_t attempt_begin = segment.begin + segment.completed;
-   state.begin_attempt(attempt);
-   SegmentTransfer transfer(request, identity, state, segment_index, attempt_begin, segment.end, attempt, descriptor, transfer_cancellation);
-   const CURLcode result = curl_easy_perform(transfer.easy.get());
-   (void)curl_easy_getinfo(transfer.easy.get(), CURLINFO_RESPONSE_CODE, &transfer.http.response_code);
-   if (transfer.callback_error) {
-    try {
-     std::rethrow_exception(transfer.callback_error);
-    } catch (const std::runtime_error&) {
-     if (!transfer.response_headers_valid) {
-      state.abandon_attempt(segment_index, attempt);
-     } else {
-      state.commit_attempt(segment_index, attempt_begin, transfer.transferred(), attempt);
-     }
-     throw;
-    }
-   }
-   const bool complete = result == CURLE_OK && transfer.response_headers_valid && transfer.write_offset == segment.end + 1U;
-   if (transfer.response_headers_valid) {
-    state.commit_attempt(segment_index, attempt_begin, transfer.transferred(), attempt);
-   } else {
-    state.abandon_attempt(segment_index, attempt);
-   }
-   throw_if_benchmark_cancelled(transfer_cancellation);
-   reject_local_curl_failure(result);
-   if (transfer.http.response_code == 200L) { throw SegmentedDownloadUnsupported("server ignored a segmented byte range"); }
-   if (complete) { break; }
-   trace_benchmark_event(trace, "benchmark.download.segment_retry", [&] {
-    return nlohmann::json{
-     {"artifact", request.artifact_id}, {"segment", segment_index}, {"attempt", attempt}, {"curl_code", static_cast<int>(result)}, {"http_status", transfer.http.response_code},
-     {"completed_bytes", transfer.transferred()}, {"detail", transfer.error_buffer[0] != '\0' ? transfer.error_buffer.data() : curl_easy_strerror(result)}
-    };
-   });
-   if (attempt == request.maximum_attempts) { throw BenchmarkDownloadUnavailable("segmented benchmark download failed after retries for " + request.artifact_id); }
-   // The remote segment retry is intentionally deadline-based HTTP backoff.
-   throw_if_benchmark_cancelled(transfer_cancellation);
-   std::this_thread::sleep_for(std::chrono::milliseconds{std::min<std::uint64_t>(4000U, 250U << std::min<std::uint32_t>(attempt - 1U, 4U))});
-   throw_if_benchmark_cancelled(transfer_cancellation);
-  }
+ struct PendingRange {
+  Clock::time_point deadline;
+  std::size_t index;
+  bool operator>(const PendingRange& other) const { return deadline > other.deadline || (deadline == other.deadline && index > other.index); }
  };
- transfers.threads.reserve(segment_count);
- for (std::size_t segment_index = 0U; segment_index < segment_count; ++segment_index) {
-  transfers.threads.emplace_back([&, segment_index, download_segment] {
-   try {
-    download_segment(segment_index);
-   } catch (...) {
-    const std::lock_guard lock(transfer_error_mutex);
-    if (!transfer_error) { transfer_error = std::current_exception(); }
-   }
-  });
+ std::priority_queue<PendingRange, std::vector<PendingRange>, std::greater<>> pending;
+ for (std::size_t index = 0; index < segment_count; ++index) {
+  const auto segment = state.segment(index);
+  if (segment.completed != segment.end - segment.begin + 1) pending.push({Clock::time_point{}, index});
  }
- transfers.join();
- if (transfer_error) { std::rethrow_exception(transfer_error); }
+ CurlMultiTransfers<SegmentTransfer> active(transport, BenchmarkCurl::Class::Artifact, cancel_requested);
+ const auto settle = [&](SegmentTransfer& transfer) {
+  if (transfer.response_headers_valid) state.commit_attempt(transfer.segment_index, transfer.range_begin, transfer.transferred(), transfer.attempt);
+  else state.abandon_attempt(transfer.segment_index, transfer.attempt);
+ };
+ try {
+  while (!pending.empty() || !active.empty()) {
+   throw_if_benchmark_cancelled(cancel_requested);
+   while (!pending.empty() && active.size() < maximum_concurrency && pending.top().deadline <= Clock::now()) {
+    const auto index = pending.top().index; pending.pop();
+    const auto segment = state.segment(index);
+    const auto attempt = segment.attempts + 1;
+    if (attempt > request.maximum_attempts) throw BenchmarkDownloadUnavailable("segmented benchmark download exhausted retries for " + request.artifact_id);
+    state.begin_attempt(attempt);
+    // The first live range gets an artifact turn; additional ranges yield to
+    // independent whole artifacts and identity probes in the shared transport.
+    const bool extra = !active.empty();
+    active.add(std::make_unique<SegmentTransfer>(request, identity, state, index, segment.begin + segment.completed, segment.end, attempt, descriptor, cancel_requested), extra);
+   }
+   while (auto completed = active.next_completed()) {
+    auto& transfer = *completed->transfer;
+    (void)curl_easy_getinfo(transfer.easy.get(), CURLINFO_RESPONSE_CODE, &transfer.http.response_code);
+    settle(transfer);
+    if (transfer.callback_error) std::rethrow_exception(transfer.callback_error);
+    throw_if_benchmark_cancelled(cancel_requested);
+    reject_local_curl_failure(completed->result);
+    if (transfer.http.response_code == 200L) throw SegmentedDownloadUnsupported("server ignored a segmented byte range");
+    if (completed->result == CURLE_OK && transfer.response_headers_valid && transfer.write_offset == transfer.range_end + 1) continue;
+    trace_benchmark_event(trace, "benchmark.download.segment_retry", [&] {
+     return nlohmann::json{{"artifact", request.artifact_id}, {"segment", transfer.segment_index}, {"attempt", transfer.attempt}, {"curl_code", static_cast<int>(completed->result)},
+      {"http_status", transfer.http.response_code}, {"completed_bytes", transfer.transferred()}, {"detail", transfer.error_buffer[0] ? transfer.error_buffer.data() : curl_easy_strerror(completed->result)}};
+    });
+    if (transfer.attempt >= request.maximum_attempts) throw BenchmarkDownloadUnavailable("segmented benchmark download failed after retries for " + request.artifact_id);
+    pending.push({Clock::now() + std::chrono::milliseconds{std::min<std::uint64_t>(4000, 250U << std::min<std::uint32_t>(transfer.attempt - 1, 4))}, transfer.segment_index});
+   }
+   if (!pending.empty() || !active.empty()) {
+    const auto now = Clock::now();
+    active.wait_until(std::min(now + std::chrono::milliseconds{250}, pending.empty() || pending.top().deadline <= now ? Clock::time_point::max() : pending.top().deadline));
+   }
+  }
+ } catch (...) {
+  const auto error = std::current_exception();
+  // Detach all callbacks before snapshots, fallback removal or truncation.
+  active.abandon_all([&](SegmentTransfer& transfer) { try { settle(transfer); } catch (...) {} });
+  std::rethrow_exception(error);
+ }
  if (::fdatasync(descriptor) != 0) { throw errno_error("cannot flush segmented benchmark download", partial_path(request).string()); }
  storage.growth.reconcile(descriptor);
  partial = ScopedFd{};
@@ -1020,282 +985,208 @@ struct SegmentTransfer {
  };
 }
 }  // namespace
-std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, const std::size_t requested_concurrency,
- mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready,
- BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool* storage) {
- std::mutex progress_mutex;
- const DownloadProgressSink progress = observer ? DownloadProgressSink{[&](const DownloadProgress& value) {
-  const std::lock_guard lock(progress_mutex);
-  observer(value);
- }}
-                                                : DownloadProgressSink{};
- if (requests.empty()) { return {}; }
- std::size_t maximum_concurrency = requested_concurrency;
- if (maximum_concurrency == 0U) { throw std::runtime_error("benchmark download concurrency must be positive"); }
- for (const DownloadRequest& request : requests) {
-  if (request.artifact_id.empty() || request.url.empty() || request.destination.empty() || request.lock_path.empty() || request.maximum_attempts == 0U) {
-   throw std::runtime_error("benchmark download request is incomplete");
+namespace {
+DownloadResult download_locked_artifact(const DownloadRequest& request, std::size_t concurrency,
+ mmltk::common::concurrency::CancellationObservation cancellation, const DownloadProgressSink& progress, const BenchmarkTraceSink& trace,
+ BenchmarkCurl& transport, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool& storage) {
+ DownloadStorage destination(request, storage, trace);
+ if (auto result = validate_complete_artifact(request, cancellation, progress, trace)) {
+  if (progress) progress({request.artifact_id, {result->size, result->size, 0, result->attempts, true, false}, DownloadProgressPhase::kDownloading, request.redownload, request.source});
+  return *result;
+ }
+ // The partial descriptor and atomic checkpoint/publication descriptor belong
+ // to this source. Active request workspace is admitted separately by Curl.
+ BenchmarkAllowance files;
+ if (execution) files = execution->reserve(BenchmarkResources::handles(2, true), parent);
+ destination.growth.withdraw_allocation();
+ remove_invalid_complete_artifact(request);
+ destination.growth.reconcile_download(request.destination);
+ bool redownload = false;
+ // Stored segmented topology is admitted against the current remote identity,
+ // independently of today's number of sockets (including a single socket).
+ std::optional<nlohmann::json> cached;
+ if (request.expected_size >= kSegmentedDownloadThreshold) {
+  // An engaged null document records an observed missing/invalid checkpoint.
+  // Only the first ordinary attempt consumes it; retries read their new state.
+  cached.emplace();
+  if (std::filesystem::is_regular_file(partial_metadata_path(request))) {
+   try { *cached = read_json_file(partial_metadata_path(request)); }
+   catch (const std::exception& error) { if (is_benchmark_capacity_failure(error)) throw; }
   }
-  if (request.expected_sha256) { (void)mmltk::common::io::parse_sha256_hex(*request.expected_sha256); }
  }
- // Locks, open output files, socket/DNS handles and Curl's wake descriptors
- // belong to this session, including segmented fallback and repair. Its
- // allowance precedes all of them and retires after durable publication.
- BenchmarkAllowance resources;
- if (execution) std::tie(maximum_concurrency, resources) = execution->reserve_transfers(maximum_concurrency, benchmark_curl_envelope(requests.size()), parent);
- auto shared_storage = execution ? execution->storage() : storage ? *storage : StorageReservationPool(requests.front().destination, trace);
- std::unordered_set<std::string> unique_lock_paths;
- std::vector<std::size_t> lock_order(requests.size());
- for (std::size_t index = 0U; index < lock_order.size(); ++index) {
-  if (!unique_lock_paths.emplace(requests[index].lock_path.string()).second) { throw std::runtime_error("benchmark download batch contains a duplicate cache lock"); }
-  lock_order[index] = index;
- }
- std::ranges::sort(lock_order, [&](const std::size_t left, const std::size_t right) { return requests[left].lock_path.string() < requests[right].lock_path.string(); });
- std::vector<std::shared_ptr<ArtifactLease>> leases(requests.size());
- for (const std::size_t index : lock_order) { leases[index] = ArtifactLease::acquire_charged(requests[index].lock_path, cancel_requested, resources); }
- std::vector<DownloadStorage> storage_promises;
- storage_promises.reserve(requests.size());
- for (const auto& request : requests) storage_promises.emplace_back(request, shared_storage, trace);
- std::vector<std::optional<DownloadResult>> results(requests.size());
- std::list<PendingTransfer> pending;
- for (std::size_t index = 0U; index < requests.size(); ++index) {
-  throw_if_benchmark_cancelled(cancel_requested);
-  std::optional<DownloadResult>& result = results[index];
-  result = validate_complete_artifact(requests[index], cancel_requested, progress, trace);
-  if (result.has_value()) {
-   leases[index].reset();
-   storage_promises[index].growth.release();
-   if (ready) ready({index, *result});
-   const DownloadResult& completed_result = *result;
-   if (progress) {
-    progress(DownloadProgress{
-     requests[index].artifact_id,
-     {completed_result.size, completed_result.size, 0U, completed_result.attempts, true, false},
-     DownloadProgressPhase::kDownloading,
-     requests[index].redownload,
-     requests[index].source,
-    });
+ const bool stored_segments = cached && cached->is_object() && cached->contains("mode") && (*cached)["mode"] == "segmented";
+ if (request.expected_size >= kSegmentedDownloadThreshold && (concurrency > 1 || stored_segments)) {
+  try { return download_segmented_artifact(request, concurrency, cancellation, progress, trace, destination, transport, std::move(*cached)); }
+  catch (const SegmentedDownloadUnsupported& error) {
+   destination.growth.withdraw_allocation();
+   for (const auto& path : {partial_path(request), partial_metadata_path(request)}) {
+    std::error_code failure;
+    redownload = std::filesystem::remove(path, failure) || redownload;
+    if (failure) throw std::filesystem::filesystem_error("cannot reset unsupported segmented download", path, failure);
    }
-  } else {
-   storage_promises[index].growth.withdraw_allocation();
-   remove_invalid_complete_artifact(requests[index]);
-   storage_promises[index].growth.reconcile_download(requests[index].destination);
-   pending.push_back(PendingTransfer{index, 1U, Clock::now()});
+   cached.emplace(); // The fallback removed both partial backing and metadata.
+   destination.growth.reconcile_download(request.destination);
+   trace_benchmark_event(trace, "benchmark.download.segmented_fallback", [&] {
+    return nlohmann::json{{"artifact", request.artifact_id}, {"reason", error.what()}, {"redownload", request.redownload || redownload}};
+   });
   }
  }
- if (pending.empty()) {
-  std::vector<DownloadResult> complete;
-  complete.reserve(results.size());
-  for (std::optional<DownloadResult>& result : results) {
-   if (!result.has_value()) { throw std::logic_error("completed benchmark download batch is missing a result"); }
-   complete.push_back(std::move(*result));
-  }
-  return complete;
- }
- if (requests.size() == 1U && maximum_concurrency > 1U && requests.front().expected_size >= kSegmentedDownloadThreshold) {
-  try {
-   auto result = download_segmented_artifact(requests.front(), maximum_concurrency, cancel_requested, progress, trace, storage_promises.front());
-   leases.front().reset();
-   storage_promises.front().growth.release();
-   if (ready) ready({0, result});
-   return {std::move(result)};
-  } catch (const SegmentedDownloadUnsupported& error) {
-   storage_promises.front().growth.withdraw_allocation();
-   std::error_code cleanup_error;
-   pending.front().redownload = std::filesystem::remove(partial_path(requests.front()), cleanup_error);
-   if (cleanup_error) { throw std::filesystem::filesystem_error("cannot reset unsupported segmented download", partial_path(requests.front()), cleanup_error); }
-   cleanup_error.clear();
-   const bool removed_metadata = std::filesystem::remove(partial_metadata_path(requests.front()), cleanup_error);
-   pending.front().redownload = pending.front().redownload || removed_metadata;
-   if (cleanup_error) { throw std::filesystem::filesystem_error("cannot reset unsupported segmented metadata", partial_metadata_path(requests.front()), cleanup_error); }
-   storage_promises.front().growth.reconcile_download(requests.front().destination);
-   trace_benchmark_event(trace, "benchmark.download.segmented_fallback",
-    [&] { return nlohmann::json{{"artifact", requests.front().artifact_id}, {"reason", error.what()}, {"redownload", requests.front().redownload || pending.front().redownload}}; });
-  }
- }
- CurlGlobal::initialize();
- CurlMulti multi(curl_multi_init());
- if (!multi) { throw std::runtime_error("cannot allocate benchmark libcurl multi handle"); }
- const CURLMcode connection_limit = curl_multi_setopt(multi.get(), CURLMOPT_MAX_TOTAL_CONNECTIONS, checked_cast<long>(maximum_concurrency, "benchmark download concurrency overflow"));
- if (connection_limit != CURLM_OK) { throw std::runtime_error(std::string("cannot set benchmark transfer concurrency: ") + curl_multi_strerror(connection_limit)); }
- CURLM* const wake_handle = multi.get();
- CurlMultiTransfers<Transfer> active(std::move(multi), "benchmark transfer");
- active.reserve(maximum_concurrency);
- struct SettledTransfer {
-  std::shared_ptr<Transfer> transfer;
-  std::optional<DownloadResult> result;
-  std::exception_ptr error;
- };
- std::mutex settlement_mutex;
- std::condition_variable settlement_ready;
- std::vector<SettledTransfer> settlements, completed_settlements;
- settlements.reserve(maximum_concurrency);
- completed_settlements.reserve(maximum_concurrency);
- std::size_t settling = 0;
- // One bounded durable-publication lane owns completed descriptors. The curl
- // controller keeps driving other sockets while fdatasync/rename settle.
- std::unique_ptr<mmltk::common::concurrency::WorkerPool> publication;
- // A single artifact has no other sockets to advance after completion. Batch
- // callers allocate maximum_concurrency CPU lanes; two suffice for the
- // controller and settlement worker regardless of the number of sockets.
- if (requests.size() > 1 && maximum_concurrency > 1)
-  publication = std::make_unique<mmltk::common::concurrency::WorkerPool>(1, mmltk::common::system::allowed_cpu_set(), "bench_publish", maximum_concurrency);
- const auto schedule_retry = [&](Transfer& transfer, const std::size_t request_index, const bool reset_partial, const CURLcode curl_code, const std::string& detail) {
-  // Completed handles have left the active set, so cancellation cleanup cannot
-  // checkpoint them. Preserve their validators before propagating cancellation.
-  if (!reset_partial) transfer.persist_partial_metadata();
-  throw_if_benchmark_cancelled(cancel_requested);
-  reject_local_curl_failure(curl_code);
-  if (reset_partial) {
+ CurlMultiTransfers<Transfer> active(transport, BenchmarkCurl::Class::Artifact, cancellation);
+ const auto salvage = [](Transfer& transfer) {
+  try { transfer.persist_partial_metadata(); }
+  catch (...) {
    transfer.storage.growth.withdraw_allocation();
    transfer.partial = ScopedFd{};
-   std::error_code error;
-   std::filesystem::remove(partial_path(transfer.request), error);
-   if (error) { throw std::filesystem::filesystem_error("cannot reset invalid benchmark partial download", partial_path(transfer.request), error); }
-   error.clear();
-   std::filesystem::remove(partial_metadata_path(transfer.request), error);
-   if (error) { throw std::filesystem::filesystem_error("cannot reset benchmark partial metadata", partial_metadata_path(transfer.request), error); }
+   for (const auto& path : {partial_path(transfer.request), partial_metadata_path(transfer.request)}) {
+    std::error_code error; std::filesystem::remove(path, error);
+    if (error) throw std::filesystem::filesystem_error("cannot invalidate interrupted benchmark partial download", path, error);
+   }
   }
-  transfer.storage.growth.reconcile_download(transfer.request.destination);
-  trace_benchmark_event(trace, "benchmark.download.attempt_failed", [&] {
-   return nlohmann::json{
-    {"artifact", transfer.request.artifact_id}, {"attempt", transfer.attempt}, {"curl_code", static_cast<int>(curl_code)}, {"http_status", transfer.http.response_code},
-    {"reset_partial", reset_partial}, {"detail", detail}
-   };
-  });
-  if (transfer.attempt >= transfer.request.maximum_attempts) { throw BenchmarkDownloadUnavailable("benchmark download failed after retries for " + transfer.request.artifact_id + ": " + detail); }
-  const auto backoff = std::chrono::milliseconds{std::min<std::uint64_t>(4000U, 250U << std::min<std::uint32_t>(transfer.attempt - 1U, 4U))};
-  pending.push_back(PendingTransfer{request_index, transfer.attempt + 1U, Clock::now() + backoff, transfer.redownload || reset_partial});
  };
  try {
-  while (!pending.empty() || !active.empty() || settling != 0) {
-   completed_settlements.clear();
-   {
-    const std::lock_guard lock(settlement_mutex);
-    completed_settlements.swap(settlements);
+  for (std::uint32_t attempt = 1; attempt <= request.maximum_attempts; ++attempt) {
+   throw_if_benchmark_cancelled(cancellation);
+   active.add(std::make_unique<Transfer>(request, progress, trace, cancellation, attempt, redownload, destination, std::exchange(cached, std::nullopt)));
+   trace_benchmark_event(trace, "benchmark.download.start", [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"attempt", attempt}}; });
+   std::optional<CurlMultiTransfers<Transfer>::Completion> completed;
+   while (!(completed = active.next_completed())) { throw_if_benchmark_cancelled(cancellation); active.poll(kBenchmarkTransferPollMilliseconds); }
+   auto& transfer = *completed->transfer;
+   (void)curl_easy_getinfo(transfer.easy.get(), CURLINFO_RESPONSE_CODE, &transfer.http.response_code);
+   bool reset = false;
+   std::string detail;
+   if (transfer.callback_error) {
+    if (!transfer.callback_retryable) { salvage(transfer); std::rethrow_exception(transfer.callback_error); }
+    reset = true;
+    try { std::rethrow_exception(transfer.callback_error); }
+    catch (const std::exception& error) { if (is_benchmark_capacity_failure(error)) throw; detail = error.what(); }
+    catch (...) { detail = "non-standard HTTP range callback exception"; }
+   } else {
+    const bool successful_status = transfer.response_headers_valid && (transfer.http.response_code == 200L || transfer.http.response_code == 206L ||
+     (transfer.http.response_code == 416L && transfer.response_total && regular_file_size(partial_path(request)) == transfer.response_total));
+    const bool complete_range = transfer.http.response_code != 206L || (transfer.response_total && regular_file_size(partial_path(request)) == transfer.response_total);
+    if (completed->result == CURLE_OK && successful_status && complete_range) {
+     // No connection slot is held during sync, metadata publication, or callbacks.
+     try { return publish_completed_transfer(transfer); }
+     catch (const DownloadVerificationError& error) { reset = true; detail = error.what(); }
+    } else detail = completed->result == CURLE_OK && successful_status && !complete_range ? "resumed transfer did not reach the declared Content-Range total" :
+     completed->result == CURLE_OK ? "HTTP response status or headers were not acceptable" : transfer.error_buffer[0] ? transfer.error_buffer.data() : curl_easy_strerror(completed->result);
    }
-   for (auto& item : completed_settlements) {
-    --settling;
-    const auto index = static_cast<std::size_t>(&item.transfer->request - requests.data());
-    if (item.error) {
-     try {
-      std::rethrow_exception(item.error);
-     } catch (const DownloadVerificationError& error) { schedule_retry(*item.transfer, index, true, CURLE_OK, error.what()); }
-    } else {
-     results[index] = std::move(*item.result);
-     leases[index].reset();
-     storage_promises[index].growth.release();
-     if (ready) ready({index, *results[index]});
+   if (!reset) transfer.persist_partial_metadata();
+   throw_if_benchmark_cancelled(cancellation);
+   reject_local_curl_failure(completed->result);
+   if (reset) {
+    destination.growth.withdraw_allocation();
+    transfer.partial = ScopedFd{};
+    for (const auto& path : {partial_path(request), partial_metadata_path(request)}) {
+     std::error_code error; std::filesystem::remove(path, error);
+     if (error) throw std::filesystem::filesystem_error("cannot reset invalid benchmark partial download", path, error);
     }
    }
-   throw_if_benchmark_cancelled(cancel_requested);
-   const Clock::time_point now = Clock::now();
-   for (auto iterator = pending.begin(); iterator != pending.end() && active.size() + settling < maximum_concurrency;) {
-    if (iterator->ready_at > now) {
-     ++iterator;
-     continue;
-    }
-    const PendingTransfer task = *iterator;
-    iterator = pending.erase(iterator);
-    active.add(std::make_unique<Transfer>(requests[task.request_index], progress, trace, cancel_requested, task.attempt, task.redownload, storage_promises[task.request_index]));
-    trace_benchmark_event(trace, "benchmark.download.start", [&] { return nlohmann::json{{"artifact", requests[task.request_index].artifact_id}, {"attempt", task.attempt}}; });
-   }
-   active.perform();
-   while (std::optional completion = active.next_completed()) {
-    std::unique_ptr<Transfer> transfer = std::move(completion->transfer);
-    (void)curl_easy_getinfo(completion->handle, CURLINFO_RESPONSE_CODE, &transfer->http.response_code);
-    const std::size_t request_index = checked_cast<std::size_t>(&transfer->request - requests.data(), "download request index overflow");
-    if (transfer->callback_error) {
-     if (!transfer->callback_retryable) { std::rethrow_exception(transfer->callback_error); }
-     std::string detail = "invalid HTTP range response";
-     try {
-      std::rethrow_exception(transfer->callback_error);
-     } catch (const std::exception& error) {
-      if (is_benchmark_capacity_failure(error)) throw;
-      detail = error.what();
-     } catch (...) { detail = "non-standard HTTP range callback exception"; }
-     schedule_retry(*transfer, request_index, true, completion->result, detail);
-     continue;
-    }
-    const bool successful_status =
-     transfer->response_headers_valid && (transfer->http.response_code == 200L || transfer->http.response_code == 206L ||
-                                          (transfer->http.response_code == 416L && transfer->response_total != 0U && regular_file_size(partial_path(transfer->request)) == transfer->response_total));
-    const bool complete_range = transfer->http.response_code != 206L || (transfer->response_total != 0U && regular_file_size(partial_path(transfer->request)) == transfer->response_total);
-    if (completion->result == CURLE_OK && successful_status && complete_range) {
-     auto owned = std::shared_ptr<Transfer>(std::move(transfer));
-     ++settling;
-     const auto publish = [&, owned] {
-      SettledTransfer item{owned, {}, {}};
-      try {
-       item.result = publish_completed_transfer(*owned);
-      } catch (...) { item.error = std::current_exception(); }
-      {
-       const std::lock_guard lock(settlement_mutex);
-       settlements.push_back(std::move(item));
-      }
-      settlement_ready.notify_one();
-      (void)curl_multi_wakeup(wake_handle);
-     };
-     if (publication)
-      publication->enqueue_detached(publish);
-     else
-      publish();
-     continue;
-    }
-    const std::string detail = completion->result == CURLE_OK && successful_status && !complete_range ? "resumed transfer did not reach the declared Content-Range total"
-                               : completion->result == CURLE_OK                                       ? "HTTP response status or headers were not acceptable"
-                                : transfer->error_buffer[0] != '\0'                                   ? transfer->error_buffer.data()
-                                                                                                      : curl_easy_strerror(completion->result);
-    schedule_retry(*transfer, request_index, false, completion->result, detail);
-   }
-   if (!active.empty()) {
-    active.poll(kBenchmarkTransferPollMilliseconds);
-   } else if (settling != 0) {
-    std::unique_lock lock(settlement_mutex);
-    settlement_ready.wait(lock, [&] { return !settlements.empty(); });
-   } else if (!pending.empty()) {
-    const Clock::time_point earliest = std::ranges::min_element(pending, {}, &PendingTransfer::ready_at)->ready_at;
-    const auto delay = std::min(std::chrono::duration_cast<std::chrono::milliseconds>(std::max(earliest - Clock::now(), Clock::duration::zero())), std::chrono::milliseconds{250});
-    if (delay.count() > 0) {
-     // Pending transfers become eligible only at their externally imposed retry deadlines.
-     throw_if_benchmark_cancelled(cancel_requested);
-     std::this_thread::sleep_for(delay);
-     throw_if_benchmark_cancelled(cancel_requested);
-    }
-   }
+   destination.growth.reconcile_download(request.destination);
+   trace_benchmark_event(trace, "benchmark.download.attempt_failed", [&] {
+    return nlohmann::json{{"artifact", request.artifact_id}, {"attempt", attempt}, {"curl_code", static_cast<int>(completed->result)}, {"http_status", transfer.http.response_code},
+     {"reset_partial", reset}, {"detail", detail}};
+   });
+   if (attempt == request.maximum_attempts) throw BenchmarkDownloadUnavailable("benchmark download failed after retries for " + request.artifact_id + ": " + detail);
+   redownload = transfer.redownload || reset;
+   completed.reset();
+   const auto deadline = Clock::now() + std::chrono::milliseconds{std::min<std::uint64_t>(4000, 250U << std::min<std::uint32_t>(attempt - 1, 4))};
+   while (Clock::now() < deadline) { throw_if_benchmark_cancelled(cancellation); active.wait_until(std::min(deadline, Clock::now() + std::chrono::milliseconds{250})); }
   }
  } catch (...) {
-  const std::exception_ptr original_error = std::current_exception();
-  if (publication) publication->wait_idle();
-  std::exception_ptr cleanup_error;
-  active.abandon_all([&cleanup_error](Transfer& transfer) {
-   try {
-    transfer.persist_partial_metadata();
-   } catch (...) {
-    transfer.storage.growth.withdraw_allocation();
-    transfer.partial = ScopedFd{};
+  const auto original = std::current_exception();
+  active.abandon_all(salvage);
+  std::rethrow_exception(original);
+ }
+ throw std::logic_error("benchmark download exhausted its attempt loop");
+}
+}
+std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t requested_concurrency,
+ mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready,
+ BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool* storage) {
+ if (requests.empty()) return {};
+ if (!requested_concurrency) throw std::runtime_error("benchmark download concurrency must be positive");
+ std::unordered_set<std::filesystem::path> locks;
+ for (const auto& request : requests) {
+  if (request.artifact_id.empty() || request.url.empty() || request.destination.empty() || request.lock_path.empty() || !request.maximum_attempts) throw std::runtime_error("benchmark download request is incomplete");
+  if (request.expected_sha256) (void)mmltk::common::io::parse_sha256_hex(*request.expected_sha256);
+  if (!locks.insert(request.lock_path).second) throw std::runtime_error("benchmark download batch contains a duplicate cache lock");
+ }
+ requested_concurrency = std::min<std::size_t>(8, execution ? std::min(requested_concurrency, execution->workers()) : requested_concurrency);
+ std::unique_ptr<BenchmarkCurl> local_transport;
+ if (!execution) local_transport = std::make_unique<BenchmarkCurl>(requested_concurrency);
+ auto& transport = execution ? execution->curl() : *local_transport;
+ // Establish the shared fixed promise before independent artifact leases can
+ // fill their producer ceiling. This channel owns no active request window.
+ const auto source_resources = BenchmarkResources::handles(1, true, 2);
+ auto source_transport = transport.channel(BenchmarkCurl::Class::Artifact, cancel_requested, source_resources);
+ auto shared_storage = execution ? execution->storage() : storage ? *storage : StorageReservationPool(requests.front().destination, trace);
+ struct Controllers {
+  mmltk::common::concurrency::CancellationObservation external;
+  std::atomic<bool> stopped{false};
+  std::mutex mutex, observer_mutex;
+  std::condition_variable changed;
+  std::exception_ptr error;
+  std::size_t running = 0;
+  std::vector<std::size_t> completed;
+  std::vector<std::jthread> threads;
+  bool cancelled() const noexcept { return stopped.load(std::memory_order_relaxed) || external.requested(); }
+  ~Controllers() { stopped.store(true, std::memory_order_relaxed); threads.clear(); }
+ } owner{cancel_requested};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(owner);
+ const DownloadProgressSink progress = observer ? DownloadProgressSink{[&](const DownloadProgress& update) { const std::lock_guard lock(owner.observer_mutex); observer(update); }} : DownloadProgressSink{};
+ std::vector<DownloadResult> results(requests.size());
+ std::list<std::size_t> pending;
+ for (std::size_t index = 0; index < requests.size(); ++index) pending.push_back(index);
+ // At most the ordinary class ceiling of controllers owns file/publication
+ // work. A failed flock attempt owns neither a controller nor network capacity.
+ owner.threads.resize(std::min(requests.size(), requested_concurrency));
+ std::vector<std::size_t> slots(owner.threads.size());
+ std::iota(slots.begin(), slots.end(), 0);
+ std::vector<std::size_t> done;
+ owner.completed.reserve(owner.threads.size()); done.reserve(owner.threads.size());
+ struct RetireControllers {
+  Controllers& owner;
+  ~RetireControllers() { owner.stopped.store(true, std::memory_order_relaxed); owner.threads.clear(); }
+ } retire{owner};
+ while (!pending.empty() || owner.running) {
+  throw_if_benchmark_cancelled(cancel_requested);
+  {
+   const std::lock_guard lock(owner.mutex);
+   if (owner.error) std::rethrow_exception(owner.error);
+   done.swap(owner.completed);
+  }
+  for (const auto slot : done) { owner.threads[slot].join(); slots.push_back(slot); --owner.running; }
+  done.clear();
+  for (auto it = pending.begin(); it != pending.end() && !slots.empty();) {
+   const auto index = *it;
+   auto lease = ArtifactLease::try_acquire_charged(requests[index].lock_path, cancellation, execution,
+    source_resources, parent);
+   if (!lease) { ++it; continue; }
+   it = pending.erase(it);
+   const auto slot = slots.back(); slots.pop_back(); ++owner.running;
+   owner.threads[slot] = std::jthread([&, index, slot, lease = std::move(lease)]() mutable {
     try {
-     std::error_code error;
-     std::filesystem::remove(partial_path(transfer.request), error);
-     if (error) { throw std::filesystem::filesystem_error("cannot invalidate interrupted benchmark partial download", partial_path(transfer.request), error); }
-     error.clear();
-     std::filesystem::remove(partial_metadata_path(transfer.request), error);
-     if (error) { throw std::filesystem::filesystem_error("cannot invalidate interrupted benchmark partial metadata", partial_metadata_path(transfer.request), error); }
+     results[index] = download_locked_artifact(requests[index], requested_concurrency, cancellation, progress, trace, transport, execution, lease->allowance(), shared_storage);
+     lease.reset();
+     if (ready) { const std::lock_guard lock(owner.observer_mutex); ready({index, results[index]}); }
     } catch (...) {
-     if (!cleanup_error) { cleanup_error = std::current_exception(); }
+     const std::lock_guard lock(owner.mutex);
+     if (!owner.error) owner.error = std::current_exception();
+     owner.stopped.store(true, std::memory_order_relaxed);
     }
-   }
-  });
-  if (cleanup_error) { std::rethrow_exception(cleanup_error); }
-  std::rethrow_exception(original_error);
+    { const std::lock_guard lock(owner.mutex); owner.completed.push_back(slot); }
+    owner.changed.notify_one();
+   });
+  }
+  if (!pending.empty() || owner.running) {
+   std::unique_lock lock(owner.mutex);
+   // flock has no readiness descriptor. Only this bounded controller retry
+   // polls locks; socket completion and publication signal their own event.
+   owner.changed.wait_for(lock, std::chrono::milliseconds{100}, [&] { return owner.error || !owner.completed.empty() || cancel_requested.requested(); });
+  }
  }
- std::vector<DownloadResult> complete;
- complete.reserve(results.size());
- for (std::optional<DownloadResult>& result : results) {
-  if (!result) { throw std::runtime_error("benchmark download loop ended with an incomplete artifact"); }
-  complete.push_back(std::move(*result));
- }
- return complete;
+ return results;
 }
 void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
  if (request.artifact_id.empty() || request.destination.empty() || request.lock_path.empty()) { throw std::runtime_error("benchmark download invalidation request is incomplete"); }

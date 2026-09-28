@@ -157,6 +157,80 @@ std::vector<std::uint8_t> make_payload(const std::size_t bytes) {
  return exact;
 }
 using mmltk::backend::data::testsupport::HttpServer;
+// Observe real descriptor identities from Curl's socket-options callback. A
+// reused descriptor number cannot conceal an overlapping address-race socket.
+struct CurlSocketObservation {
+ struct Opened { curl_socket_t descriptor; dev_t device; ino_t inode; };
+ std::mutex mutex;
+ std::vector<Opened> opened;
+ std::size_t peak = 0, attempts = 0;
+ std::exception_ptr failure;
+ [[nodiscard]] std::size_t live_locked() {
+  std::erase_if(opened, [](const Opened& value) {
+   struct stat status{};
+   return ::fstat(value.descriptor, &status) != 0 || value.device != status.st_dev || value.inode != status.st_ino;
+  });
+  return opened.size();
+ }
+ [[nodiscard]] std::size_t live() { const std::lock_guard lock(mutex); return live_locked(); }
+ static int observe(void* opaque, curl_socket_t descriptor, curlsocktype) noexcept {
+  auto& self = *static_cast<CurlSocketObservation*>(opaque);
+  const std::lock_guard lock(self.mutex);
+  try {
+   struct stat status{};
+   require_condition(::fstat(descriptor, &status) == 0 && S_ISSOCK(status.st_mode), "Curl fixture did not receive a physical socket");
+   (void)self.live_locked();
+   self.opened.push_back({descriptor, status.st_dev, status.st_ino});
+   self.peak = std::max(self.peak, self.opened.size());
+   ++self.attempts;
+   return CURL_SOCKOPT_OK;
+  } catch (...) { self.failure = std::current_exception(); return CURL_SOCKOPT_ERROR; }
+ }
+};
+struct ObservedCurlTransfer {
+ CurlEasy easy{curl_easy_init()};
+ CurlHeaders addresses;
+ std::string url;
+ std::vector<std::uint8_t> bytes;
+ std::size_t responses = 0;
+ std::array<char, CURL_ERROR_SIZE> error{};
+ std::exception_ptr callback_error;
+ mmltk::common::concurrency::CancellationObservation cancel_requested;
+ ObservedCurlTransfer(std::string location, CurlSocketObservation& sockets, std::string resolution = {}) : url(std::move(location)) {
+  require_condition(static_cast<bool>(easy), "cannot allocate observed Curl fixture");
+  configure_curl_transfer(easy.get(), {.url = url.c_str(), .error_buffer = error.data(), .owner = this,
+   .write_callback = &write, .header_callback = &header, .progress_callback = &curl_cancel_progress_callback<ObservedCurlTransfer>}, "observed Curl fixture: ");
+  const auto option = [&](CURLoption key, auto value) { set_curl_option_with_prefix(easy.get(), key, value, "observed Curl fixture: ", "option"); };
+  option(CURLOPT_PROXY, "");
+  option(CURLOPT_SOCKOPTFUNCTION, &CurlSocketObservation::observe);
+  option(CURLOPT_SOCKOPTDATA, &sockets);
+  if (!resolution.empty()) {
+   addresses.reset(curl_slist_append(nullptr, resolution.c_str()));
+   require_condition(static_cast<bool>(addresses), "cannot allocate fixture address list");
+   option(CURLOPT_RESOLVE, addresses.get());
+  }
+ }
+ static std::size_t header(char* data, std::size_t size, std::size_t count, void* opaque) {
+  return curl_run_data_callback<ObservedCurlTransfer>(size, count, opaque, [&](ObservedCurlTransfer& self, std::size_t bytes) {
+   if (std::string_view(data, bytes).starts_with("HTTP/")) ++self.responses;
+   return bytes;
+  });
+ }
+ static std::size_t write(char* data, std::size_t size, std::size_t count, void* opaque) {
+  return curl_run_data_callback<ObservedCurlTransfer>(size, count, opaque, [&](ObservedCurlTransfer& self, std::size_t bytes) {
+   self.bytes.insert(self.bytes.end(), data, data + bytes);
+   return bytes;
+  });
+ }
+};
+BenchmarkCurl::Completed await_curl(BenchmarkCurl::Channel& channel) {
+ const auto deadline = std::chrono::steady_clock::now() + 5s;
+ while (std::chrono::steady_clock::now() < deadline) {
+  if (auto result = channel.next()) return *result;
+  channel.wait_until(deadline);
+ }
+ throw std::runtime_error("benchmark Curl fixture did not settle");
+}
 DownloadRequest request_for(const fs::path& root, const std::string& id, const std::string& url, const std::vector<std::uint8_t>& payload) {
  return DownloadRequest{
   id,
@@ -1615,7 +1689,7 @@ TEST_CASE("segmented downloads retain durable ranges through failure cancellatio
  request.maximum_attempts = 3U;
  server.TruncateNextTransfer();
  std::atomic<bool> traced_retry{false}, traced_complete{false}, traced_bytes{false}, traced_second_attempt{false}, invalid_byte_facts{false};
- const auto resumed = download_artifacts({request}, 2U, {}, {}, [&](const std::string_view event, const nlohmann::json& fields) {
+ const auto resumed = download_artifacts({request}, 1U, {}, {}, [&](const std::string_view event, const nlohmann::json& fields) {
   if (event == "benchmark.download.progress") {
    traced_bytes.store(true, std::memory_order_relaxed);
    if (fields.at("attempt") == 2U) { traced_second_attempt.store(true, std::memory_order_relaxed); }
@@ -3939,7 +4013,7 @@ TEST_CASE("charged lease acquisition owns its descriptor through cancellation an
  });
  const mmltk::testsupport::ScopedTestCleanup stop([&] { cancelled.store(true); lock_wait.Release(); });
  REQUIRE(lock_wait.WaitEntered(2s));
- CHECK_FALSE(execution.try_reserve({0, 1}).has_value());
+ CHECK(execution.try_reserve({0, 1}).has_value());
  cancelled.store(true);
  lock_wait.Release();
  CHECK_THROWS(mmltk::testsupport::await_test_future(waiter, "cancelled charged lock acquisition"));
@@ -4171,6 +4245,7 @@ TEST_CASE("Curl owns checked fixed and per-transfer resource composition", "[bac
  const auto single = envelope.demand(1);
  const auto doubled = envelope.demand(2);
  CHECK(single.descriptors == envelope.fixed.descriptors + envelope.per_transfer.descriptors);
+ CHECK(benchmark_curl_envelope().demand(1).descriptors == 5);
  CHECK(doubled.bytes == single.bytes + envelope.per_transfer.bytes);
  CHECK_THROWS(benchmark_curl_envelope(std::numeric_limits<std::size_t>::max()));
  CHECK_THROWS(benchmark_curl_envelope(0, 0, std::numeric_limits<std::uint64_t>::max()));
@@ -4330,4 +4405,1032 @@ TEST_CASE("detached retained writers withdraw affected pixels before remapping c
  execution.source_publication(first, {})({first, 1});
  CHECK(remapped.image_complete(0));
  CHECK(remapped.image_complete(1));
+}
+
+namespace {
+void seed_segmented_tail(const DownloadRequest& request, std::uint64_t remaining = 2U << 20, std::size_t count = 2) {
+ const mmltk::common::io::ScopedFd partial(::open((request.destination.string() + ".part").c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
+ require_condition(partial.get() >= 0 && ::ftruncate(partial.get(), static_cast<off_t>(request.expected_size)) == 0, "cannot create sparse segmented fixture");
+ const auto width = request.expected_size / count;
+ nlohmann::json segments = nlohmann::json::array();
+ for (std::size_t i = 0; i < count; ++i) {
+  const auto begin = width * i, end = i + 1 == count ? request.expected_size : begin + width;
+  segments.push_back({{"begin", begin}, {"end", end - 1}, {"completed", end - begin - remaining}, {"attempts", 1}});
+ }
+ write_json_atomically(request.destination.string() + ".part.json",
+  nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion}, {"mode", "segmented"}, {"url", request.url}, {"size", request.expected_size},
+   {"etag", "\"benchmark-test-etag\""}, {"last_modified", "Thu, 23 Jul 2026 12:00:00 GMT"}, {"segments", std::move(segments)}}, {});
+}
+}
+TEST_CASE("a contended artifact lock returns its admission and independent ready files publish", "[backend][data][benchmark][download]") {
+ mmltk::testsupport::ScopedTempDir root("independent-lock-admission");
+ const auto payload = make_payload(16384);
+ HttpServer server(payload);
+ const std::vector requests{request_for(root.path(), "locked", server.url("locked"), payload), request_for(root.path(), "ready", server.url("ready"), payload)};
+ auto blocked = ArtifactLease::acquire(requests[0].lock_path, {});
+ BenchmarkCompilePipeline execution(1, {}, {.descriptors = 24});
+ CHECK_FALSE(ArtifactLease::try_acquire_charged(requests[0].lock_path, {}, &execution));
+ auto attempted = execution.reserve(BenchmarkResources::handles(1, true, 4));
+ CHECK_FALSE(ArtifactLease::try_acquire_charged(requests[0].lock_path, {}, std::move(attempted)));
+ CHECK(execution.try_reserve({0, 24}).has_value());
+ std::atomic<bool> cancelled{false};
+ std::promise<DownloadReady> ready;
+ auto work = std::async(std::launch::async, [&] {
+  return download_artifacts(requests, 1, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), {}, {},
+   [&](DownloadReady value) { if (value.request_index == 1) ready.set_value(std::move(value)); }, &execution);
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); blocked = {}; });
+ const auto result = mmltk::testsupport::await_test_promise(ready, "independent locked batch result");
+ CHECK(result.artifact.path == requests[1].destination);
+ CHECK_FALSE(fs::exists(requests[0].destination));
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ blocked = {};
+ const auto results = mmltk::testsupport::await_test_future(work, "released artifact lock");
+ REQUIRE(results.size() == 2);
+ CHECK(results[0].path == requests[0].destination);
+ CHECK(results[1].path == requests[1].destination);
+ CHECK(execution.try_reserve({0, 24}).has_value());
+ server.Check();
+}
+TEST_CASE("one-connection stored ranges coexist with independent whole artifacts in the compile transport", "[backend][data][benchmark][download]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ mmltk::testsupport::ScopedTempDir root("mixed-artifact-transport");
+ constexpr std::size_t bytes = 512U << 20;
+ HttpServer ranged(bytes);
+ const auto payload = make_payload(32768);
+ HttpServer whole(payload);
+ DownloadRequest large{"range", ranged.url("range"), root.path() / "large", root.path() / "large.lock", bytes};
+ const auto small = request_for(root.path(), "small", whole.url("small"), payload);
+ seed_segmented_tail(large);
+ ranged.GateNextTransfer();
+ BenchmarkCompilePipeline execution(2);
+ std::atomic<bool> cancelled{false};
+ auto work = std::async(std::launch::async, [&] {
+  return download_artifacts({large}, 1, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), {}, {}, {}, &execution);
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); ranged.ReleasePartial(); });
+ REQUIRE(ranged.WaitPartial());
+ auto independent = std::async(std::launch::async, [&] { return download_artifacts({small}, 1, {}, {}, {}, {}, &execution); });
+ const auto completed = mmltk::testsupport::await_test_future(independent, "whole artifact while a stored range is held");
+ CHECK(completed[0].size == payload.size());
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ ranged.ReleasePartial();
+ const auto result = mmltk::testsupport::await_test_future(work, "one-connection two-range resume");
+ CHECK(result[0].resumed);
+ CHECK(read_json_file(large.destination.string() + ".download.json").at("segments") == 2);
+ const auto ranges = ranged.ranges();
+ CHECK(std::ranges::find(ranges, std::pair<std::size_t, std::size_t>{bytes / 2 - (2U << 20), bytes / 2 - 1}) != ranges.end());
+ CHECK(std::ranges::find(ranges, std::pair<std::size_t, std::size_t>{bytes - (2U << 20), bytes - 1}) != ranges.end());
+ ranged.Check(); whole.Check();
+}
+TEST_CASE("stored range admission rejects invalid coverage and validators before any payload work", "[backend][data][benchmark][download]") {
+ mmltk::testsupport::ScopedTempDir root("range-topology-admission");
+ constexpr std::size_t bytes = 512U << 20;
+ HttpServer server(bytes);
+ DownloadRequest request{"range", server.url("range"), root.path() / "artifact", root.path() / "artifact.lock", bytes};
+ seed_segmented_tail(request);
+ const auto path = request.destination.string() + ".part.json";
+ auto metadata = read_json_file(path);
+ SECTION("gap") { metadata["segments"][1]["begin"] = bytes / 2 + 1; }
+ SECTION("overlap") { metadata["segments"][1]["begin"] = bytes / 2 - 1; }
+ SECTION("overflowing endpoint") { metadata["segments"][1]["end"] = std::numeric_limits<std::uint64_t>::max(); }
+ SECTION("completed length") { metadata["segments"][0]["completed"] = bytes; }
+ SECTION("changed identity") { metadata["etag"] = "\"older-etag\""; }
+ SECTION("overfragmented complete coverage") {
+  metadata["segments"] = nlohmann::json::array();
+  for (std::size_t i = 0; i < 16; ++i)
+   metadata["segments"].push_back({{"begin", bytes / 16 * i}, {"end", bytes / 16 * (i + 1) - 1}, {"completed", 0}, {"attempts", 1}});
+ }
+ write_json_atomically(path, metadata, {});
+ std::atomic<bool> cancelled{false};
+ bool empty_admission = false;
+ CHECK_THROWS(download_artifacts({request}, 1, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), [&](const DownloadProgress& update) {
+  if (update.transfer.attempt == 0) { empty_admission = update.transfer.completed_bytes == 0 && update.transfer.retained_bytes == 0; cancelled.store(true); }
+ }));
+ CHECK(empty_admission);
+ const auto reset = read_json_file(path);
+ REQUIRE(reset.at("segments").size() == 1);
+ CHECK(reset.at("segments")[0].at("completed") == 0);
+ CHECK(server.requests() == 1);
+ server.Check();
+}
+TEST_CASE("range retries preserve admitted tails and ordinary fallback quiesces their writers", "[backend][data][benchmark][download]") {
+ mmltk::testsupport::ScopedTempDir root("range-response-admission");
+ constexpr std::size_t bytes = 512U << 20;
+ HttpServer server(bytes);
+ DownloadRequest request{"range", server.url("range"), root.path() / "artifact", root.path() / "artifact.lock", bytes, {}, 2};
+ seed_segmented_tail(request);
+ bool fallback = false;
+ SECTION("malformed content range") { server.MalformNextRange(); }
+ SECTION("changing validator") { server.ChangeNextRangeIdentity(); }
+ SECTION("ordinary fallback cancellation") { server.RestartNextRangedTransfer(); fallback = true; }
+ SECTION("unsupported range probe") { server.IgnoreRanges(); fallback = true; }
+ std::atomic<bool> cancelled{false};
+ std::size_t retries = 0;
+ bool fallback_reset = false;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json&) {
+  if (event == "benchmark.download.segment_retry") ++retries;
+  if (event == "benchmark.download.segmented_fallback") {
+   fallback_reset = true;
+   CHECK_FALSE(fs::exists(request.destination.string() + ".part"));
+   CHECK_FALSE(fs::exists(request.destination.string() + ".part.json"));
+  }
+ };
+ const auto acquire = [&] {
+  return download_artifacts({request}, 1, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), [&](const DownloadProgress& update) {
+   if (fallback && update.redownload) cancelled.store(true);
+  }, trace);
+ };
+ if (fallback) {
+  CHECK_THROWS(acquire());
+  CHECK(fallback_reset);
+  const auto checkpoint = read_json_file(request.destination.string() + ".part.json");
+  CHECK(checkpoint.value("mode", std::string{}) != "segmented");
+  CHECK(checkpoint.at("url") == request.url);
+  CHECK(checkpoint.at("bytes") == fs::file_size(request.destination.string() + ".part"));
+  CHECK(fs::file_size(request.destination.string() + ".part") < bytes);
+ } else {
+  const auto result = acquire();
+  CHECK(result[0].resumed);
+  CHECK(result[0].attempts == 2);
+  CHECK(retries == 1);
+ }
+ server.Check();
+}
+TEST_CASE("Open Images admits a third group while two earlier groups retry and preserves each proof", "[backend][data][benchmark][images]") {
+ mmltk::testsupport::ScopedTempDir root("open-images-independent-groups");
+ const auto cache = BenchmarkCacheLayout::create(root.path());
+ const auto images = cache.source_images("open-images") / "train";
+ prepare_cached_image_directory(images);
+ const auto jpeg = make_jpeg(10, 20, 30);
+ const auto seed = root.path() / "seed.jpg";
+ write_cached_image_atomically(seed, jpeg, {});
+ NormalizedAnnotationIndex index;
+ index.source = BenchmarkDatasetSource::kOpenImagesV7;
+ constexpr std::size_t count = 8193;
+ index.images.resize(count);
+ for (std::size_t position = 0; position < count; ++position) {
+  const auto id = position + 1;
+  index.images[position].source_image_id = id;
+  if (id == 1 || id == 4097 || id == 8193) continue;
+  const auto path = cached_image_path(images, id);
+  fs::create_directories(path.parent_path());
+  fs::create_hard_link(seed, path);
+ }
+ HttpServer first(jpeg), second(jpeg), third(jpeg);
+ first.fail_next(1); second.fail_next(1);
+ first.GateNextRequest(); second.GateNextRequest();
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 64U << 20, .descriptors = 64}, cancellation);
+ std::promise<bool> later;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
+  if (event == "benchmark.images.complete" && fields.at("identity").get<std::string>().find("group-000002") != std::string::npos) later.set_value(true);
+ };
+ std::vector<std::string> throttle_updates;
+ ProgressReporter progress([&](const BenchmarkCompileProgress& update) {
+  if (update.activity.find("server throttled") != std::string::npos && (throttle_updates.empty() || throttle_updates.back() != update.activity)) throttle_updates.push_back(update.activity);
+ }, {});
+ std::vector<QuarantinedImage> quarantined;
+ auto work = std::async(std::launch::async, [&] {
+  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 0, trace, {}, &execution,
+   [&](std::uint64_t id) { return id == 1 ? first.url("first") : id == 4097 ? second.url("second") : third.url("third"); });
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); first.ReleaseRequest(); second.ReleaseRequest(); });
+ REQUIRE(mmltk::testsupport::await_test_promise(later, "third group publication while earlier retries are held", 10s));
+ CHECK_FALSE(fs::exists(images / ".groups" / "group-000000.complete.json"));
+ CHECK_FALSE(fs::exists(images / ".groups" / "group-000001.complete.json"));
+ REQUIRE(first.WaitRequest()); REQUIRE(second.WaitRequest());
+ first.ReleaseRequest(); second.ReleaseRequest();
+ const auto result = mmltk::testsupport::await_test_future(work, "independent Open Images group settlement", 10s);
+ CHECK(result.available_image_ids.size() == count);
+ CHECK(result.directory.image_bytes == count * jpeg.size());
+ CHECK(quarantined.empty());
+ REQUIRE(throttle_updates.size() == 2);
+ CHECK(throttle_updates[0].find("7 concurrent") != std::string::npos);
+ CHECK(throttle_updates[1].find("5 concurrent") != std::string::npos);
+ for (unsigned group = 0; group < 3; ++group) {
+  const auto proof = read_json_file(images / ".groups" / (std::string("group-00000") + std::to_string(group) + ".complete.json"));
+  const auto expected = group == 2 ? 1 : 4096;
+  CHECK(proof.at("image_count") == expected);
+  CHECK(proof.at("image_bytes") == expected * jpeg.size());
+  CHECK(proof.at("dimensions").size() == expected * 3U);
+ }
+ CHECK(execution.try_reserve({64U << 20, 64}).has_value());
+ first.Check(); second.Check(); third.Check();
+}
+TEST_CASE("Open Images remote absence is bounded and local capacity failure returns every allowance", "[backend][data][benchmark][images]") {
+ mmltk::testsupport::ScopedTempDir root("open-images-failure-admission");
+ const auto cache = BenchmarkCacheLayout::create(root.path());
+ NormalizedAnnotationIndex index;
+ index.source = BenchmarkDatasetSource::kOpenImagesV7;
+ index.images = {{.source_image_id = 1}};
+ const auto jpeg = make_jpeg(10, 20, 30);
+ HttpServer server(jpeg);
+ ProgressReporter progress({}, {});
+ std::vector<QuarantinedImage> quarantined;
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32U << 20, .descriptors = 32});
+ SECTION("remote 404 retains the complete quarantine proof") {
+  server.fail_next(kMaximumAttempts, 0, 404);
+  const auto result = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) { return server.url("missing"); });
+  CHECK(result.available_image_ids.empty());
+  REQUIRE(quarantined.size() == 1);
+  CHECK(server.requests() == kMaximumAttempts);
+  const auto cached = acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) -> std::string { throw std::logic_error("cached proof requested HTTP"); });
+  CHECK(cached.directory.cache_hit);
+ }
+ SECTION("local allocation failure is fatal") {
+  CHECK_THROWS_AS(acquire_open_images(cache, index, &quarantined, {}, &progress, 1, 0, {}, {}, &execution,
+   [&](std::uint64_t) -> std::string { throw std::bad_alloc{}; }), std::bad_alloc);
+  CHECK(quarantined.empty());
+ }
+ CHECK(execution.try_reserve({32U << 20, 32}).has_value());
+ server.Check();
+}
+TEST_CASE("a sixteen-descriptor artifact uses actual free and parent-committed capacity", "[backend][data][benchmark][download][pipeline]") {
+ bool parented = false;
+ SECTION("one cold artifact fits below five generic headroom descriptors") {}
+ SECTION("a source commitment remains usable beside unrelated producers") { parented = true; }
+ mmltk::testsupport::ScopedTempDir root("artifact-feasible-sixteen");
+ const auto payload = make_payload(4096);
+ HttpServer server(payload);
+ const auto request = request_for(root.path(), "small", server.url("small"), payload);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 16});
+ std::shared_ptr<ArtifactLease> source;
+ BenchmarkAllowance unrelated;
+ if (parented) {
+  source = ArtifactLease::acquire_charged(root.path() / "source.lock", {}, &execution, BenchmarkResources::handles(1, true, 3));
+  unrelated = execution.reserve(BenchmarkResources::handles(5, true));
+ }
+ const auto results = download_artifacts({request}, 1, {}, {}, {}, {}, &execution, source ? source->allowance() : BenchmarkAllowance{});
+ REQUIRE(results.size() == 1);
+ CHECK(results[0].size == payload.size());
+ CHECK(results[0].attempts == 1);
+ CHECK_FALSE(results[0].cache_hit);
+ std::ifstream saved(request.destination, std::ios::binary);
+ const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>{saved}, std::istreambuf_iterator<char>{}};
+ CHECK(bytes == payload);
+ const auto metadata = read_json_file(request.destination.string() + ".download.json");
+ CHECK(metadata.at("complete") == true);
+ CHECK(metadata.at("url") == request.url);
+ CHECK(metadata.at("size") == payload.size());
+ CHECK(metadata.at("attempts") == 1);
+ const auto warm = download_artifacts({request}, 1, {}, {}, {}, {}, &execution, source ? source->allowance() : BenchmarkAllowance{});
+ CHECK(warm[0].cache_hit);
+ CHECK(server.requests() == 1);
+ source.reset(); unrelated = {};
+ CHECK(execution.try_reserve({256U << 10, 16}).has_value());
+ auto unlocked = ArtifactLease::try_acquire_charged(request.lock_path, {}, &execution);
+ CHECK(static_cast<bool>(unlocked));
+ server.Check();
+}
+
+TEST_CASE("fixed Curl preparation waits before source locks and cancels without retained custody", "[backend][data][benchmark][download][pipeline]") {
+ bool cancel = false;
+ SECTION("returned consumer credits wake feasible preparation") {}
+ SECTION("cancellation settles preparation while capacity remains held") { cancel = true; }
+ mmltk::testsupport::ScopedTempDir root("artifact-fixed-preparation");
+ const auto payload = make_payload(128);
+ HttpServer server(payload);
+ const auto request = request_for(root.path(), "small", server.url("small"), payload);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 16});
+ auto pressure = execution.reserve(BenchmarkResources::handles(16));
+ std::atomic<bool> cancelled{false};
+ mmltk::testsupport::TestGate waiting("source observed cancellation after fixed admission wait");
+ struct Cancellation {
+  const std::atomic<bool>& cancelled_flag;
+  mmltk::testsupport::TestGate::Receipt waiting;
+  mutable std::atomic<unsigned> observations{0};
+  bool cancelled() const noexcept {
+   // This observation belongs only to the source controller. Its first call
+   // enters the channel; the second follows the fixed-preparation wait.
+   if (observations.fetch_add(1) == 1) waiting.ArriveAndWait();
+   return cancelled_flag.load();
+  }
+ } observation{cancelled, waiting.receipt()};
+ auto acquisition = std::async(std::launch::async, [&] {
+  return download_artifacts({request}, 1, mmltk::common::concurrency::CancellationObservation::Borrow(observation), {}, {}, {}, &execution);
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); waiting.Release(); pressure = {}; });
+ REQUIRE(waiting.WaitEntered(5s));
+ CHECK_FALSE(fs::exists(request.lock_path));
+ CHECK(server.requests() == 0);
+ if (cancel) cancelled.store(true);
+ else pressure = {};
+ waiting.Release();
+ if (cancel) CHECK_THROWS(mmltk::testsupport::await_test_future(acquisition, "cancelled fixed transport preparation"));
+ else {
+  const auto result = mmltk::testsupport::await_test_future(acquisition, "fixed transport credit-return wake");
+  REQUIRE(result.size() == 1);
+  CHECK(result[0].size == payload.size());
+  CHECK(read_json_file(request.destination.string() + ".download.json").at("complete") == true);
+ }
+ pressure = {};
+ CHECK(execution.try_reserve({256U << 10, 16}).has_value());
+ if (cancel) CHECK_FALSE(fs::exists(request.lock_path));
+ server.Check();
+}
+
+TEST_CASE("impossible artifact descriptor demand fails without retaining a lease", "[backend][data][benchmark][download]") {
+ mmltk::testsupport::ScopedTempDir root("artifact-descriptor-exhaustion");
+ const auto payload = make_payload(64);
+ HttpServer server(payload);
+ const auto request = request_for(root.path(), "small", server.url("small"), payload);
+ BenchmarkCompilePipeline execution(1, {}, {.descriptors = 8});
+ CHECK_THROWS_AS(download_artifacts({request}, 1, {}, {}, {}, {}, &execution), InsufficientBenchmarkResources);
+ CHECK(execution.try_reserve({0, 8}).has_value());
+ CHECK(server.requests() == 0);
+ CHECK_FALSE(fs::exists(request.lock_path));
+ server.Check();
+}
+
+TEST_CASE("Open Images returns idle input backing to an oversized pixel consumer under a tiny target", "[backend][data][benchmark][images][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("open-images-tiny-input-target");
+ const auto cache = BenchmarkCacheLayout::create(root.path());
+ const auto images = cache.source_images("open-images") / "train";
+ NormalizedAnnotationIndex index;
+ index.source = BenchmarkDatasetSource::kOpenImagesV7;
+ index.images = {{.source_image_id = 1}, {.source_image_id = 2}};
+ const auto jpeg = make_jpeg(10, 20, 30);
+ HttpServer first(jpeg), later(jpeg);
+ first.GateNextRequest();
+ later.fail_next(1, 0, 429);
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 32}, cancellation);
+ ProgressReporter progress({}, {});
+ std::vector<QuarantinedImage> quarantined;
+ mmltk::testsupport::TestGate consumer("oversized Open Images pixel consumer");
+ auto acquisition = std::async(std::launch::async, [&] {
+  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution,
+   [&](std::uint64_t id) { return id == 1 ? first.url("first") : later.url("later"); });
+ });
+ std::future<void> pixels;
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); first.ReleaseRequest(); consumer.Release(); });
+ REQUIRE(first.WaitRequest());
+ const auto before = execution.admission_generation();
+ pixels = std::async(std::launch::async, [&] {
+  execution.run(BenchmarkStage::Pixels, {32U << 20, 1}, [&](std::size_t) {
+   BenchmarkImageValidator validator;
+   validator.validate_decodable_file(cached_image_path(images, 1), 16, 8);
+   consumer.receipt().ArriveAndWait();
+  });
+ });
+ // No transfer can complete at this gate. The shared event observes the newly
+ // queued consumer; its complete grant cannot fit beside the encoded input.
+ execution.wait_for_admission_change(before);
+ CHECK(execution.resource_pressure());
+ first.ReleaseRequest();
+ REQUIRE(consumer.WaitEntered(5s));
+ CHECK(later.requests() == 0);
+ CHECK(acquisition.wait_for(0ms) == std::future_status::timeout);
+ consumer.Release();
+ mmltk::testsupport::await_test_future(pixels, "oversized pixel grant return");
+ const auto result = mmltk::testsupport::await_test_future(acquisition, "tiny-target Open Images retry settlement", 10s);
+ CHECK(result.available_image_ids == std::vector<std::uint64_t>{1, 2});
+ CHECK(quarantined.empty());
+ CHECK(later.requests() == 2);
+ CHECK(execution.try_reserve({32U << 20, 32}).has_value());
+ first.Check(); later.Check();
+}
+
+TEST_CASE("Open Images consumes a repaired saved file before recycling its exclusive input slot", "[backend][data][benchmark][images][pipeline]") {
+ enum class Repair { Valid, Dimensions, SavedFile, Missing, Allocation } repair = Repair::Valid;
+ SECTION("valid repair precedes the next member") {}
+ SECTION("changed dimensions are permanently quarantined") { repair = Repair::Dimensions; }
+ SECTION("the saved file is validated instead of the encoded buffer") { repair = Repair::SavedFile; }
+ SECTION("a missing saved file remains fatal") { repair = Repair::Missing; }
+ SECTION("repair allocation failure remains fatal") { repair = Repair::Allocation; }
+ mmltk::testsupport::ScopedTempDir root("open-images-exclusive-repair");
+ const auto cache = BenchmarkCacheLayout::create(root.path());
+ const auto images = cache.source_images("open-images") / "train";
+ prepare_cached_image_directory(images);
+ const auto jpeg = make_jpeg(10, 20, 30);
+ const auto seed = root.path() / "seed.jpg";
+ write_cached_image_atomically(seed, jpeg, {});
+ NormalizedAnnotationIndex index;
+ index.source = BenchmarkDatasetSource::kOpenImagesV7;
+ constexpr std::size_t count = 4097;
+ index.images.resize(count);
+ for (std::size_t position = 0; position < count; ++position) {
+  const auto id = position + 1;
+  index.images[position].source_image_id = id;
+  if (id == 1 || id == 2 || id == count) continue;
+  const auto path = cached_image_path(images, id);
+  fs::create_directories(path.parent_path());
+  fs::create_hard_link(seed, path);
+ }
+ HttpServer first(jpeg), member(jpeg), later(jpeg);
+ member.GateNextRequest();
+ later.fail_next(1, 0, 429);
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 32}, cancellation);
+ mmltk::testsupport::TestGate validation("repaired file before exclusive full decode");
+ std::atomic<unsigned> validations{0};
+ ProgressReporter progress([&](const BenchmarkCompileProgress& update) {
+  if (update.activity != "Full-decode checking repaired Open Images JPEG 1" || validations.fetch_add(1) != 0) return;
+  validation.receipt().ArriveAndWait();
+  if (repair == Repair::Allocation) throw std::bad_alloc{};
+ }, {});
+ std::vector<QuarantinedImage> quarantined;
+ const ImageDecodeProbe probe{1, repair == Repair::Dimensions ? 17U : 16U, 8};
+ auto acquisition = std::async(std::launch::async, [&] {
+  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 0, {}, probe, &execution,
+   [&](std::uint64_t id) { return id == 1 ? first.url("repair") : id == 2 ? member.url("member") : later.url("later"); });
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); validation.Release(); member.ReleaseRequest(); });
+ REQUIRE(validation.WaitEntered(5s));
+ CHECK(member.requests() == 0);
+ CHECK(later.requests() == 0); // Its group is pending under the original tiny target.
+ CHECK_FALSE(execution.geometry(images, 1));
+ CHECK_FALSE(execution.try_reserve({1, 0}).has_value());
+ const auto repaired_path = cached_image_path(images, 1);
+ if (repair == Repair::SavedFile) {
+  auto damaged = jpeg;
+  damaged[0] = 0;
+  write_cached_image_atomically(repaired_path, damaged, {});
+ } else if (repair == Repair::Missing) fs::remove(repaired_path);
+ validation.Release();
+ if (repair == Repair::Missing || repair == Repair::Allocation) {
+  if (repair == Repair::Allocation) CHECK_THROWS_AS(mmltk::testsupport::await_test_future(acquisition, "fatal repair allocation"), std::bad_alloc);
+  else CHECK_THROWS(mmltk::testsupport::await_test_future(acquisition, "missing saved repair file"));
+  CHECK(quarantined.empty());
+  CHECK(member.requests() == 0);
+  CHECK_FALSE(fs::exists(images / ".groups" / "group-000000.complete.json"));
+ } else {
+  REQUIRE(member.WaitRequest());
+  CHECK(validations.load() == 1);
+  CHECK_FALSE(execution.geometry(images, 1)); // Successful repair readiness remains deferred to group settlement.
+  const bool valid = repair == Repair::Valid;
+  CHECK(fs::exists(repaired_path) == valid);
+  CHECK_FALSE(fs::exists(images / ".groups" / "group-000000.complete.json"));
+  member.ReleaseRequest();
+  const auto result = mmltk::testsupport::await_test_future(acquisition, "repair slot reuse with a later group", 10s);
+  CHECK(result.available_image_ids.size() == count - (valid ? 0 : 1));
+  CHECK(result.available_image_ids.front() == (valid ? 1 : 2));
+  CHECK(result.directory.image_bytes == result.available_image_ids.size() * jpeg.size());
+  CHECK(static_cast<bool>(execution.geometry(images, 1)) == valid);
+  CHECK(index.images[0].width == 16);
+  CHECK(index.images[0].height == 8);
+  CHECK(quarantined.size() == (valid ? 0 : 1));
+  if (!valid) {
+   CHECK(quarantined[0].image_id == 1);
+   CHECK(quarantined[0].reason.starts_with("permanently undecodable after bounded repair:"));
+  }
+  const auto proof = read_json_file(images / ".groups" / "group-000000.complete.json");
+  CHECK(proof.at("image_count") == (valid ? 4096 : 4095));
+  CHECK(proof.at("image_bytes") == (valid ? 4096 : 4095) * jpeg.size());
+  CHECK(proof.at("dimensions").size() == (valid ? 4096 : 4095) * 3U);
+  CHECK(proof.at("quarantined").size() == (valid ? 0 : 1));
+  CHECK(read_json_file(images / ".groups" / "group-000001.complete.json").at("image_bytes") == jpeg.size());
+  CHECK(later.requests() == 2);
+ }
+ CHECK(first.requests() == 1);
+ CHECK(execution.try_reserve({32U << 20, 32}).has_value());
+ first.Check(); member.Check(); later.Check();
+}
+
+TEST_CASE("range cancellation after a committed checkpoint preserves that snapshot for restart", "[backend][data][benchmark][download]") {
+ mmltk::testsupport::ScopedTempDir root("range-checkpoint-cancellation");
+ constexpr std::size_t bytes = 512U << 20;
+ constexpr std::uint64_t tail = 2U << 20;
+ HttpServer server(bytes);
+ DownloadRequest request{"range", server.url("range"), root.path() / "artifact", root.path() / "artifact.lock", bytes};
+ seed_segmented_tail(request, tail);
+ const auto metadata_path = request.destination.string() + ".part.json";
+ std::atomic<bool> cancelled{false};
+ bool committed = false;
+ CHECK_THROWS(download_artifacts({request}, 1, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), [&](const DownloadProgress& update) {
+  if (update.transfer.completed_bytes <= bytes - tail * 2) return;
+  const auto snapshot = read_json_file(metadata_path);
+  if (snapshot.at("segments")[0].at("completed") == bytes / 2) {
+   committed = true;
+   cancelled.store(true);
+  }
+ }));
+ CHECK(committed);
+ const auto checkpoint = read_json_file(metadata_path);
+ CHECK(checkpoint.at("segments")[0].at("completed") == bytes / 2);
+ CHECK(checkpoint.at("segments")[1].at("completed") == bytes / 2 - tail);
+ CHECK_FALSE(fs::exists(request.destination));
+ const auto resumed = download_artifacts({request}, 2);
+ CHECK(resumed[0].resumed);
+ CHECK(resumed[0].size == bytes);
+ server.Check();
+}
+
+TEST_CASE("out-of-order redirected ranges checkpoint only committed writes and resume on one connection", "[backend][data][benchmark][download]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ mmltk::testsupport::ScopedTempDir root("out-of-order-range-checkpoint");
+ constexpr std::size_t bytes = 512U << 20;
+ constexpr std::uint64_t tail = 2U << 20;
+ HttpServer origin(bytes), earlier(bytes), later(bytes);
+ origin.RedirectRanges(earlier.url("earlier"), later.url("later"), bytes / 2);
+ earlier.GateNextTransfer();
+ DownloadRequest request{"range", origin.url("range"), root.path() / "artifact", root.path() / "artifact.lock", bytes};
+ seed_segmented_tail(request, tail);
+ const auto metadata_path = request.destination.string() + ".part.json";
+ std::atomic<bool> cancelled{false}, published{false};
+ BenchmarkCompilePipeline execution(2);
+ std::promise<nlohmann::json> later_checkpoint;
+ auto work = std::async(std::launch::async, [&] {
+  return download_artifacts({request}, 2, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), [&](const DownloadProgress& update) {
+   if (published.load() || update.transfer.completed_bytes < bytes - tail) return;
+   auto snapshot = read_json_file(metadata_path);
+   if (snapshot.at("segments")[1].at("completed") == bytes / 2 && !published.exchange(true)) later_checkpoint.set_value(std::move(snapshot));
+  }, {}, {}, &execution);
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); earlier.ReleasePartial(); });
+ REQUIRE(earlier.WaitPartial());
+ const auto checkpoint = mmltk::testsupport::await_test_promise(later_checkpoint, "later range committed checkpoint while an earlier write is held");
+ // The held first range has written bytes, but its attempt has not committed.
+ CHECK(checkpoint.at("segments")[0].at("completed") == bytes / 2 - tail);
+ CHECK(checkpoint.at("segments")[1].at("completed") == bytes / 2);
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ cancelled.store(true);
+ earlier.ReleasePartial();
+ CHECK_THROWS(mmltk::testsupport::await_test_future(work, "cancelled out-of-order ranges"));
+ const auto resumed = download_artifacts({request}, 1);
+ CHECK(resumed[0].resumed);
+ CHECK(read_json_file(request.destination.string() + ".download.json").at("segments") == 2);
+ CHECK(execution.try_reserve({execution.transient_target(), execution.descriptor_limit()}).has_value());
+ origin.Check(); earlier.Check(); later.Check();
+}
+
+TEST_CASE("many stored ranges leave fair transport admission for an independent whole artifact", "[backend][data][benchmark][download]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ mmltk::testsupport::ScopedTempDir root("many-range-fair-admission");
+ constexpr std::size_t bytes = 512U << 20;
+ HttpServer origin(bytes), held(bytes), later(bytes);
+ origin.RedirectRanges(held.url("held"), later.url("later"), bytes / 8);
+ held.GateNextTransfer();
+ const auto payload = make_payload(32768);
+ HttpServer whole(payload);
+ DownloadRequest large{"ranges", origin.url("ranges"), root.path() / "large", root.path() / "large.lock", bytes};
+ const auto small = request_for(root.path(), "whole", whole.url("whole"), payload);
+ seed_segmented_tail(large, 2U << 20, 8);
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(8, {}, {.transient_bytes = 2U << 20, .descriptors = 24}, cancellation);
+ auto ranges = std::async(std::launch::async, [&] { return download_artifacts({large}, 8, cancellation, {}, {}, {}, &execution); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); held.ReleasePartial(); });
+ REQUIRE(held.WaitPartial());
+ auto independent = std::async(std::launch::async, [&] { return download_artifacts({small}, 1, cancellation, {}, {}, {}, &execution); });
+ CHECK(mmltk::testsupport::await_test_future(independent, "whole-file turn beside eight stored ranges")[0].size == payload.size());
+ CHECK(ranges.wait_for(0ms) == std::future_status::timeout);
+ held.ReleasePartial();
+ CHECK(mmltk::testsupport::await_test_future(ranges, "eight-range settlement")[0].resumed);
+ CHECK(read_json_file(large.destination.string() + ".download.json").at("segments") == 8);
+ CHECK(execution.try_reserve({2U << 20, 24}).has_value());
+ origin.Check(); held.Check(); later.Check(); whole.Check();
+}
+
+TEST_CASE("ordinary retry and publication return active work before their source controller continues", "[backend][data][benchmark][download]") {
+ bool retry = false;
+ SECTION("retry processing before backoff") { retry = true; }
+ SECTION("durable publication callback") {}
+ mmltk::testsupport::ScopedTempDir root("ordinary-settled-request-work");
+ const auto payload = make_payload(32768);
+ HttpServer first(payload), second(payload);
+ if (retry) first.fail_next(1);
+ const auto request = request_for(root.path(), "first", first.url("first"), payload);
+ const auto independent = request_for(root.path(), "second", second.url("second"), payload);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 24});
+ mmltk::testsupport::TestGate boundary("ordinary source after Curl completion");
+ std::atomic<bool> cancelled{false}, once{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json&) {
+  if (event == (retry ? "benchmark.download.attempt_failed" : "benchmark.download.complete") && !once.exchange(true)) boundary.receipt().ArriveAndWait();
+ };
+ auto work = std::async(std::launch::async, [&] { return download_artifacts({request}, 1, cancellation, {}, trace, {}, &execution); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); boundary.Release(); });
+ REQUIRE(boundary.WaitEntered(5s));
+ CHECK(execution.try_reserve({256U << 10, 0}).has_value());
+ auto ready = std::async(std::launch::async, [&] { return download_artifacts({independent}, 1, cancellation, {}, {}, {}, &execution); });
+ CHECK(mmltk::testsupport::await_test_future(ready, "independent source while retry/publication owner is held")[0].size == payload.size());
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ boundary.Release();
+ CHECK(mmltk::testsupport::await_test_future(work, "ordinary source continuation")[0].attempts == (retry ? 2 : 1));
+ CHECK(execution.try_reserve({256U << 10, 24}).has_value());
+ first.Check(); second.Check();
+}
+
+TEST_CASE("Open Images retired backing admits pixel work while an unrelated ordinary socket remains open", "[backend][data][benchmark][images][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("independent-image-backing-retirement");
+ const auto cache = BenchmarkCacheLayout::create(root.path());
+ const auto jpeg = make_jpeg(10, 20, 30);
+ HttpServer image(jpeg);
+ image.GateNextRequest();
+ const auto payload = make_payload(1U << 20);
+ HttpServer ordinary(payload);
+ ordinary.GateNextTransfer();
+ const auto request = request_for(root.path(), "ordinary", ordinary.url("ordinary"), payload);
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ // The complete pixel grant fits beside the ordinary request's actual Curl
+ // workspace, but cannot fit beside even one retained encoded/header slot.
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = (32U << 20) + (256U << 10), .descriptors = 32}, cancellation);
+ auto download = std::async(std::launch::async, [&] { return download_artifacts({request}, 1, cancellation, {}, {}, {}, &execution); });
+ NormalizedAnnotationIndex index;
+ index.source = BenchmarkDatasetSource::kOpenImagesV7;
+ index.images = {{.source_image_id = 1}};
+ ProgressReporter progress({}, {});
+ std::vector<QuarantinedImage> quarantined;
+ std::future<AcquiredOpenImages> acquisition;
+ std::future<void> pixels;
+ mmltk::testsupport::TestGate consumed("pixel input after image backing retirement");
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); image.ReleaseRequest(); ordinary.ReleasePartial(); consumed.Release(); });
+ REQUIRE(ordinary.WaitPartial());
+ acquisition = std::async(std::launch::async, [&] {
+  return acquire_open_images(cache, index, &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) { return image.url("image"); });
+ });
+ REQUIRE(image.WaitRequest());
+ const auto observed = execution.admission_generation();
+ pixels = std::async(std::launch::async, [&] {
+  execution.run(BenchmarkStage::Pixels, {32U << 20, 1}, [&](std::size_t) {
+   BenchmarkImageValidator validator;
+   validator.validate_decodable_file(cached_image_path(cache.source_images("open-images") / "train", 1), 16, 8);
+   consumed.receipt().ArriveAndWait();
+  });
+ });
+ execution.wait_for_admission_change(observed);
+ CHECK(execution.resource_pressure());
+ image.ReleaseRequest();
+ REQUIRE(consumed.WaitEntered(5s));
+ CHECK(download.wait_for(0ms) == std::future_status::timeout);
+ consumed.Release();
+ mmltk::testsupport::await_test_future(pixels, "pixel work before unrelated network settlement");
+ CHECK(mmltk::testsupport::await_test_future(acquisition, "image acquisition beside held ordinary request").available_image_ids == std::vector<std::uint64_t>{1});
+ CHECK(download.wait_for(0ms) == std::future_status::timeout);
+ ordinary.ReleasePartial();
+ CHECK(mmltk::testsupport::await_test_future(download, "ordinary socket retirement")[0].size == payload.size());
+ CHECK(execution.try_reserve({(32U << 20) + (256U << 10), 32}).has_value());
+ image.Check(); ordinary.Check();
+}
+
+TEST_CASE("pending and active Curl cancellation detach callbacks and return request custody", "[backend][data][benchmark][download][pipeline]") {
+ bool pending = false;
+ SECTION("pending byte admission") { pending = true; }
+ SECTION("admitted physical socket") {}
+ mmltk::testsupport::ScopedTempDir root("transport-cancellation-custody");
+ const auto payload = make_payload(1U << 20);
+ HttpServer server(payload);
+ server.GateNextTransfer();
+ const auto request = request_for(root.path(), "cancel", server.url("cancel"), payload);
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 24});
+ BenchmarkAllowance pressure;
+ if (pending) pressure = execution.reserve({256U << 10, 0});
+ mmltk::testsupport::TestGate submitted("source submitted pending request");
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json&) {
+  if (pending && event == "benchmark.download.start") submitted.receipt().ArriveAndWait();
+ };
+ auto work = std::async(std::launch::async, [&] { return download_artifacts({request}, 1, cancellation, {}, trace, {}, &execution); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); submitted.Release(); server.ReleasePartial(); });
+ if (pending) REQUIRE(submitted.WaitEntered(5s));
+ else REQUIRE(server.WaitPartial());
+ cancelled.store(true);
+ submitted.Release();
+ CHECK_THROWS(mmltk::testsupport::await_test_future(work, "cancelled pending/active request settlement"));
+ if (pending) CHECK(server.requests() == 0);
+ pressure = {};
+ CHECK(execution.try_reserve({256U << 10, 24}).has_value());
+ server.ReleasePartial(); server.Check();
+}
+
+TEST_CASE("one logical Curl connection preserves simultaneous native fallback redirects and cancelled borrowers", "[backend][data][benchmark][download][pipeline]") {
+ enum class Cancel { None, Pending, Active } cancel = Cancel::None;
+ SECTION("both viable requests complete") {}
+ SECTION("pending cancellation keeps the active redirect alive") { cancel = Cancel::Pending; }
+ SECTION("active cancellation admits the pending request") { cancel = Cancel::Active; }
+ const auto payload = make_payload(128);
+ HttpServer origin(payload), destination(payload), independent(payload);
+ origin.RedirectNextTransfer(destination.url("redirected"));
+ destination.GateNextRequest();
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 512U << 10, .descriptors = 24});
+ CurlSocketObservation sockets;
+ auto channel = execution.curl().channel(BenchmarkCurl::Class::Artifact);
+ const auto port = std::to_string(origin.port());
+ mmltk::backend::data::testsupport::PendingIpv6Connect pending(origin.port());
+ // The IPv6 connect stays pending while the native IPv4 candidate succeeds.
+ ObservedCurlTransfer first("http://fixture.invalid:" + port + "/origin", sockets, "fixture.invalid:" + port + ":[::1],127.0.0.1");
+ ObservedCurlTransfer second(independent.url("independent"), sockets);
+ channel->add(first.easy.get());
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  destination.ReleaseRequest();
+  if (channel) { channel->remove(first.easy.get()); channel->remove(second.easy.get()); }
+ });
+ REQUIRE(destination.WaitRequest());
+ CHECK(sockets.live() == 1);
+ channel->add(second.easy.get());
+ if (cancel == Cancel::Pending) channel->remove(second.easy.get());
+ if (cancel == Cancel::Active) channel->remove(first.easy.get());
+ else destination.ReleaseRequest();
+ const auto expected = cancel == Cancel::None ? 2U : 1U;
+ unsigned completed = 0;
+ const auto deadline = std::chrono::steady_clock::now() + 5s;
+ while (completed < expected && std::chrono::steady_clock::now() < deadline) {
+  if (auto result = channel->next()) {
+   CHECK(result->result == CURLE_OK);
+   CHECK(result->handle == (cancel == Cancel::Active ? second.easy.get() : completed == 0 ? first.easy.get() : second.easy.get()));
+   ++completed;
+  } else channel->wait_until(deadline);
+ }
+ REQUIRE(completed == expected);
+ CHECK(first.bytes == (cancel == Cancel::Active ? std::vector<std::uint8_t>{} : payload));
+ CHECK(second.bytes == (cancel == Cancel::Pending ? std::vector<std::uint8_t>{} : payload));
+ CHECK_FALSE(sockets.failure);
+ CHECK(sockets.attempts >= 3);
+ CHECK(sockets.peak == 2);
+ CHECK(origin.requests() == 1);
+ CHECK(destination.requests() == 1);
+ CHECK(first.responses == (cancel == Cancel::Active ? 1 : 2));
+ channel.reset();
+ CHECK(sockets.live() == 0);
+ CHECK(execution.try_reserve({512U << 10, 24}).has_value());
+ destination.ReleaseRequest();
+ origin.Check(); destination.Check(); independent.Check();
+}
+
+TEST_CASE("warm Curl sockets supply native opportunity through reuse redirect and reconnect", "[backend][data][benchmark][download][pipeline]") {
+ const auto payload = make_payload(128);
+ HttpServer origin(payload), destination(payload);
+ origin.KeepConnectionsAlive();
+ destination.KeepConnectionsAlive();
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 512U << 10, .descriptors = 24});
+ CurlSocketObservation sockets;
+ auto channel = execution.curl().channel(BenchmarkCurl::Class::Artifact);
+ std::vector<std::unique_ptr<ObservedCurlTransfer>> transfers;
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  origin.ReleaseRequest(); destination.ReleaseRequest();
+  if (channel) for (const auto& transfer : transfers) channel->remove(transfer->easy.get());
+ });
+ const auto add = [&](std::string url, std::string addresses = {}) -> ObservedCurlTransfer& {
+  transfers.push_back(std::make_unique<ObservedCurlTransfer>(std::move(url), sockets, std::move(addresses)));
+  auto& transfer = *transfers.back();
+  channel->add(transfer.easy.get());
+  return transfer;
+ };
+ const auto complete = [&](ObservedCurlTransfer& transfer, std::size_t responses) {
+  const auto result = await_curl(*channel);
+  CHECK(result.handle == transfer.easy.get());
+  CHECK(result.result == CURLE_OK);
+  CHECK(transfer.bytes == payload);
+  CHECK(transfer.responses == responses);
+ };
+ complete(add(origin.url("warm")), 1);
+ REQUIRE(sockets.live() == 1);
+ CHECK(sockets.attempts == 1);
+ // The fixed five-descriptor minimum now includes the cached fd. Only its
+ // reusable candidate and resolver promises remain; no redundant fresh pair
+ // can be drawn beside this held consumer.
+ auto occupied = execution.reserve(BenchmarkResources::handles(19));
+ origin.GateNextRequest();
+ auto& reused = add(origin.url("reuse"));
+ REQUIRE(origin.WaitRequest());
+ CHECK(sockets.attempts == 1);
+ origin.ReleaseRequest();
+ complete(reused, 1);
+ const auto port = std::to_string(destination.port());
+ mmltk::backend::data::testsupport::PendingIpv6Connect pending(destination.port());
+ origin.RedirectNextTransfer("http://redirect.invalid:" + port + "/hop");
+ complete(add(origin.url("redirect"), "redirect.invalid:" + port + ":[::1],127.0.0.1"), 2);
+ CHECK(sockets.peak == 2);
+ CHECK(sockets.attempts == 3);
+ const auto origin_port = std::to_string(origin.port());
+ complete(add("http://reconnect.invalid:" + origin_port + "/reconnect", "reconnect.invalid:" + origin_port + ":127.0.0.2,127.0.0.1"), 1);
+ CHECK(sockets.attempts == 5);
+ CHECK(origin.requests() == 4);
+ CHECK(destination.requests() == 1);
+ CHECK(sockets.live() == 1);
+ CHECK_FALSE(sockets.failure);
+ channel.reset();
+ CHECK(sockets.live() == 0);
+ occupied = {};
+ CHECK(execution.try_reserve({512U << 10, 24}).has_value());
+ origin.Check(); destination.Check();
+}
+
+TEST_CASE("saturated mixed Curl admission guarantees native candidates and returns cancelled custody", "[backend][data][benchmark][download][pipeline]") {
+ const auto payload = make_payload(128);
+ constexpr std::size_t aggregate = 10, descriptors = 96;
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = aggregate * (256U << 10), .descriptors = descriptors});
+ CurlSocketObservation sockets;
+ std::vector<std::unique_ptr<HttpServer>> servers;
+ std::vector<std::unique_ptr<ObservedCurlTransfer>> transfers;
+ auto ordinary = execution.curl().channel(BenchmarkCurl::Class::Artifact);
+ auto images = execution.curl().channel(BenchmarkCurl::Class::OpenImages);
+ for (std::size_t i = 0; i <= aggregate; ++i) {
+  servers.push_back(std::make_unique<HttpServer>(payload));
+  servers.back()->GateNextRequest();
+ }
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  for (const auto& server : servers) server->ReleaseRequest();
+  for (std::size_t i = 0; i < transfers.size(); ++i) {
+   auto* channel = i == 0 || i == aggregate ? ordinary.get() : images.get();
+   if (channel) channel->remove(transfers[i]->easy.get());
+  }
+ });
+ for (std::size_t i = 0; i < aggregate - 1; ++i) {
+  transfers.push_back(std::make_unique<ObservedCurlTransfer>(servers[i]->url("held"), sockets));
+  (i ? images : ordinary)->add(transfers.back()->easy.get());
+  REQUIRE(servers[i]->WaitRequest());
+ }
+ REQUIRE(sockets.live() == aggregate - 1);
+ mmltk::backend::data::testsupport::PendingIpv6Connect pending(servers[aggregate - 1]->port());
+ const auto port = std::to_string(servers[aggregate - 1]->port());
+ transfers.push_back(std::make_unique<ObservedCurlTransfer>("http://saturated.invalid:" + port + "/last", sockets, "saturated.invalid:" + port + ":[::1],127.0.0.1"));
+ images->add(transfers.back()->easy.get());
+ REQUIRE(servers[aggregate - 1]->WaitRequest());
+ CHECK(sockets.live() == aggregate);
+ CHECK(sockets.peak == aggregate + 1); // Candidate overlap while all logical turns are occupied.
+ CHECK(sockets.peak <= 2 * aggregate);
+ const auto charged = benchmark_curl_envelope().demand(aggregate).descriptors;
+ CHECK(execution.try_reserve(BenchmarkResources::handles(descriptors - charged)).has_value());
+ CHECK_FALSE(execution.try_reserve(BenchmarkResources::handles(descriptors - charged + 1)).has_value());
+ transfers.push_back(std::make_unique<ObservedCurlTransfer>(servers[aggregate]->url("pending"), sockets));
+ ordinary->add(transfers.back()->easy.get());
+ ordinary->remove(transfers.back()->easy.get());
+ CHECK(servers[aggregate]->requests() == 0);
+ images->remove(transfers[aggregate - 1]->easy.get());
+ CHECK(transfers[aggregate - 1]->bytes.empty());
+ for (std::size_t i = 0; i < aggregate - 1; ++i) servers[i]->ReleaseRequest();
+ const auto first = await_curl(*ordinary);
+ CHECK(first.result == CURLE_OK);
+ CHECK(first.handle == transfers[0]->easy.get());
+ for (std::size_t i = 1; i < aggregate - 1; ++i) CHECK(await_curl(*images).result == CURLE_OK);
+ for (std::size_t i = 0; i < aggregate - 1; ++i) {
+  CHECK(transfers[i]->bytes == payload);
+  CHECK(transfers[i]->responses == 1);
+  CHECK(servers[i]->requests() == 1);
+ }
+ CHECK_FALSE(sockets.failure);
+ ordinary.reset(); images.reset();
+ CHECK(sockets.live() == 0);
+ CHECK(execution.try_reserve({aggregate * (256U << 10), descriptors}).has_value());
+ for (const auto& server : servers) { server->ReleaseRequest(); server->Check(); }
+}
+
+TEST_CASE("idle Curl cache leaves declared archive continuation feasible at thirteen descriptors", "[backend][data][benchmark][download][pipeline]") {
+ bool late = false;
+ SECTION("archive declaration precedes image work and native eviction rebalances custody") {}
+ SECTION("stronger archive declaration contracts an already idle native cache") { late = true; }
+ mmltk::testsupport::ScopedTempDir root("idle-cache-source-continuation");
+ const auto payload = make_payload(128);
+ const auto slot_bytes = (256U << 10) + payload.size();
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 3U * slot_bytes, .descriptors = 13});
+ const auto archive_resources = BenchmarkResources::handles(1, true, 4);
+ const auto group_resources = BenchmarkResources::handles(1, true, 1);
+ CHECK(execution.descriptor_ceiling(archive_resources) == 10);
+ CurlSocketObservation sockets;
+ std::unique_ptr<BenchmarkCurl::Channel> preparation;
+ if (!late) preparation = execution.curl().channel(BenchmarkCurl::Class::Artifact, {}, archive_resources);
+ auto images = execution.curl().channel(BenchmarkCurl::Class::OpenImages, {}, group_resources);
+ auto group = execution.reserve(group_resources);
+ std::vector<BenchmarkAllowance> inputs;
+ std::vector<std::unique_ptr<HttpServer>> servers;
+ std::vector<std::unique_ptr<ObservedCurlTransfer>> transfers;
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  for (const auto& server : servers) server->ReleaseRequest();
+  if (images) for (const auto& transfer : transfers) images->remove(transfer->easy.get());
+ });
+ for (std::size_t i = 0; i < 3; ++i) {
+  servers.push_back(std::make_unique<HttpServer>(payload));
+  servers.back()->KeepConnectionsAlive();
+  servers.back()->GateNextRequest();
+  inputs.push_back(execution.reserve(benchmark_curl_input_resources(payload.size()), group));
+  transfers.push_back(std::make_unique<ObservedCurlTransfer>(servers.back()->url("image"), sockets));
+  images->add(transfers.back()->easy.get(), false, inputs.back());
+  REQUIRE(servers.back()->WaitRequest());
+ }
+ REQUIRE(sockets.live() == 3);
+ CHECK(sockets.peak == 3);
+ CHECK_FALSE(execution.try_reserve(BenchmarkResources::handles(1)).has_value());
+ // Complete the first fixed-child socket while the other two are busy. At the
+ // smaller cache limit it is the only evictable connection, so surviving native
+ // sockets must receive its fixed custody before independent grants return.
+ for (std::size_t i = 0; i < 3; ++i) {
+  servers[i]->ReleaseRequest();
+  const auto result = await_curl(*images);
+  CHECK(result.handle == transfers[i]->easy.get());
+  CHECK(result.result == CURLE_OK);
+  CHECK(transfers[i]->bytes == payload);
+  CHECK(transfers[i]->responses == 1);
+  CHECK(servers[i]->requests() == 1);
+ }
+ inputs.clear(); group = {};
+ if (late) {
+  REQUIRE(sockets.live() == 3);
+  preparation = execution.curl().channel(BenchmarkCurl::Class::Artifact, {}, archive_resources);
+  CHECK(sockets.live() == 0); // Lowering MAXCONNECTS alone cannot satisfy this.
+ } else CHECK(sockets.live() == 2);
+ images.reset();
+ auto archive = ArtifactLease::try_acquire_charged(root.path() / "archive.lock", {}, &execution, archive_resources);
+ REQUIRE(archive);
+ // A retained endpoint is reused with the five-credit archive lease still
+ // present. After late contraction, warm it once and then prove native reuse.
+ HttpServer cancellation_server(payload);
+ cancellation_server.GateNextRequest();
+ ObservedCurlTransfer warm(servers[2]->url("warm"), sockets), reused(servers[2]->url("reuse"), sockets), cancelled(cancellation_server.url("cancel"), sockets);
+ const mmltk::testsupport::ScopedTestCleanup detach([&] {
+  cancellation_server.ReleaseRequest();
+  if (preparation) for (auto* transfer : {&warm, &reused, &cancelled}) preparation->remove(transfer->easy.get());
+ });
+ const auto before_warm = sockets.attempts;
+ preparation->add(warm.easy.get());
+ CHECK(await_curl(*preparation).result == CURLE_OK);
+ CHECK(warm.bytes == payload);
+ CHECK(sockets.attempts == before_warm + (late ? 1 : 0));
+ const auto before_reuse = sockets.attempts;
+ preparation->add(reused.easy.get());
+ CHECK(await_curl(*preparation).result == CURLE_OK);
+ CHECK(reused.bytes == payload);
+ CHECK(sockets.attempts == before_reuse);
+ CHECK(servers[2]->requests() == 3);
+ preparation->add(cancelled.easy.get());
+ REQUIRE(cancellation_server.WaitRequest());
+ preparation->remove(cancelled.easy.get());
+ CHECK(cancelled.bytes.empty());
+ CHECK(cancellation_server.requests() == 1);
+ CHECK_FALSE(sockets.failure);
+ archive.reset();
+ preparation.reset();
+ CHECK(sockets.live() == 0);
+ CHECK(execution.try_reserve({3U * slot_bytes, 13}).has_value());
+ cancellation_server.ReleaseRequest(); cancellation_server.Check();
+ for (const auto& server : servers) server->Check();
+}
+
+TEST_CASE("large ordinary first attempts retain metadata meaning through reset cancellation and retry", "[backend][data][benchmark][download]") {
+ enum class Metadata { Valid, Missing, Malformed, Schema, Url, Mode, Validator } metadata_kind = Metadata::Valid;
+ SECTION("valid checkpoint resumes and retry reads its newer checkpoint") {}
+ SECTION("missing checkpoint resets") { metadata_kind = Metadata::Missing; }
+ SECTION("malformed checkpoint resets") { metadata_kind = Metadata::Malformed; }
+ SECTION("different schema resets") { metadata_kind = Metadata::Schema; }
+ SECTION("different URL resets") { metadata_kind = Metadata::Url; }
+ SECTION("invalid mode type resets") { metadata_kind = Metadata::Mode; }
+ SECTION("missing validator resets") { metadata_kind = Metadata::Validator; }
+ mmltk::testsupport::ScopedTempDir root("large-ordinary-metadata");
+ constexpr std::size_t bytes = 512U << 20;
+ HttpServer server(bytes);
+ DownloadRequest request{"ordinary", server.url("ordinary"), root.path() / "artifact", root.path() / "artifact.lock", bytes};
+ const auto partial_path = request.destination.string() + ".part";
+ const auto metadata_path = request.destination.string() + ".part.json";
+ const auto prefix = make_payload(HttpServer::partial_bytes);
+ {
+  const mmltk::common::io::ScopedFd partial(::open(partial_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
+  REQUIRE(partial.get() >= 0);
+  REQUIRE(::write(partial.get(), prefix.data(), prefix.size()) == static_cast<ssize_t>(prefix.size()));
+ }
+ nlohmann::json metadata{{"schema_version", kBenchmarkCacheSchemaVersion}, {"url", request.url}, {"etag", "\"benchmark-test-etag\""}, {"bytes", prefix.size()}};
+ if (metadata_kind == Metadata::Schema) metadata["schema_version"] = 0;
+ if (metadata_kind == Metadata::Url) metadata["url"] = "http://different.invalid/artifact";
+ if (metadata_kind == Metadata::Mode) metadata["mode"] = 7;
+ if (metadata_kind == Metadata::Validator) metadata["etag"] = "";
+ if (metadata_kind == Metadata::Malformed) write_text(metadata_path, "{broken");
+ else if (metadata_kind != Metadata::Missing) write_json_atomically(metadata_path, metadata, {});
+ const bool valid = metadata_kind == Metadata::Valid;
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 16});
+ std::size_t failed_attempts = 0;
+ if (valid) server.TruncateNextTransfer();
+ else server.GateNextTransfer();
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json&) {
+  if (event != "benchmark.download.attempt_failed") return;
+  ++failed_attempts;
+  const auto checkpoint = read_json_file(metadata_path);
+  CHECK(checkpoint.at("bytes") == 2U * prefix.size());
+  CHECK(checkpoint.at("etag") == "\"benchmark-test-etag\"");
+ };
+ auto work = std::async(std::launch::async, [&] { return download_artifacts({request}, 1, cancellation, {}, trace, {}, &execution); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); server.ReleasePartial(); });
+ if (valid) {
+  const auto result = mmltk::testsupport::await_test_future(work, "large ordinary resume after truncated attempt", 20s);
+  REQUIRE(result.size() == 1);
+  CHECK(result[0].resumed);
+  CHECK(result[0].attempts == 2);
+  CHECK(result[0].size == bytes);
+  CHECK(failed_attempts == 1);
+  CHECK(has_generated_payload(request.destination, bytes));
+  const auto ranges = server.ranges();
+  REQUIRE(ranges.size() == 2);
+  CHECK(ranges[0].first == prefix.size());
+  CHECK(ranges[1].first == 2U * prefix.size());
+ } else {
+  REQUIRE(server.WaitPartial());
+  cancelled.store(true);
+  CHECK_THROWS(mmltk::testsupport::await_test_future(work, "cancelled reset ordinary partial"));
+  CHECK(server.ranged_requests() == 0);
+  CHECK_FALSE(fs::exists(request.destination));
+  const auto checkpoint = read_json_file(metadata_path);
+  CHECK(checkpoint.at("url") == request.url);
+  CHECK(checkpoint.value("mode", std::string{}) != "segmented");
+  CHECK(checkpoint.at("bytes") == fs::file_size(partial_path));
+  CHECK(fs::file_size(partial_path) <= prefix.size());
+ }
+ CHECK(execution.try_reserve({256U << 10, 16}).has_value());
+ server.ReleasePartial(); server.Check();
 }

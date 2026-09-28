@@ -1,4 +1,4 @@
-#include "src/backend/data/benchmark/detail/benchmark_curl.h"
+#include <list>
 #include "src/pch_linux.h"
 #include "src/pch_std.h"
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
@@ -17,6 +17,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
+#include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/benchmark/detail/benchmark_sampling.h"
@@ -125,7 +126,7 @@ void acquire_physical_inventory(AdmittedRecipeArchive& admitted, std::vector<Coc
  auto request = make_download_request(cache, owner, archive.artifact);
  const auto inventory_path = cache.source_indexes(owner) / (archive.artifact.artifact_id + ".inventory.bin");
  auto lease = ArtifactLease::acquire_charged(cache.locks / (archive.artifact.artifact_id + ".inventory.lock"), cancellation, execution,
-  BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors), parent);
+  BenchmarkResources::handles(1, true, 3), parent);
  const auto& inventory_handle = lease->allowance();
  const auto diagnose = [&](std::string_view reason) {
   if (std::filesystem::is_regular_file(request.destination)) {
@@ -184,21 +185,25 @@ class RequiredImageDecodeError : public std::runtime_error {
 public:
  using std::runtime_error::runtime_error;
 };
+[[nodiscard]] BenchmarkResources archive_lease_resources() {
+ // The extraction owner needs its directory/input pair and two dependent
+ // stream/output descriptors. HTTP requests have separate transport custody.
+ return BenchmarkResources::handles(1, true, 4);
+}
 [[nodiscard]] CachedImageDirectory acquire_archive_images(const BenchmarkCacheLayout& cache, const BenchmarkDatasetSource source, std::string shard, const std::vector<std::uint64_t>& expected_ids,
  const CatalogArtifact& artifact, mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, ArtifactProgressTotals* transfer_progress,
  StorageReservationPool* storage_reservations, const std::uint64_t source_total_images, const std::size_t decompression_workers, const std::size_t cache_write_workers,
  const std::size_t download_connections, const BenchmarkTraceSink& trace, const std::optional<ImageDecodeProbe> decode_probe = std::nullopt, const bool require_every_image = false,
- const ArchiveImageIdParser& member_parser = {}, std::string_view completion_slot = {}, AdmittedRecipeArchive* admitted_archive = nullptr, const DownloadResult* initial_download = nullptr, std::shared_ptr<ArtifactLease> initial_lease = {}, BenchmarkCompilePipeline* execution = nullptr, BenchmarkAllowance initial_allowance = {}) {
+ const ArchiveImageIdParser& member_parser = {}, std::string_view completion_slot = {}, AdmittedRecipeArchive* admitted_archive = nullptr, const DownloadResult* initial_download = nullptr, std::shared_ptr<ArtifactLease> initial_lease = {}, BenchmarkCompilePipeline* execution = nullptr) {
  if (expected_ids.empty()) { throw std::runtime_error("benchmark archive extraction cannot have an empty image selection"); }
  if (require_every_image && !admitted_archive) throw std::logic_error("strict image extraction requires an admitted physical owner");
  const std::string source_name(benchmark_source_name(source));
  const std::string archive_name = source_name + " " + shard;
  const std::filesystem::path image_root = cache.source_images(source_name) / shard;
  progress->source_activity(source, "Waiting for " + archive_name + " extraction lock");
- auto extraction_lease = initial_lease ? std::move(initial_lease) : initial_allowance ?
-  ArtifactLease::acquire_charged(cache.locks / (source_name + "-" + shard + ".images.lock"), cancel_requested, std::move(initial_allowance)) :
+ auto extraction_lease = initial_lease ? std::move(initial_lease) :
   ArtifactLease::acquire_charged(cache.locks / (source_name + "-" + shard + ".images.lock"), cancel_requested, execution,
-   BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
+   archive_lease_resources());
  const auto& source_handle = extraction_lease->allowance();
  const auto publication = execution ? execution->source_publication(image_root, extraction_lease,
   decode_probe ? std::optional(decode_probe->image_id) : std::nullopt, true) : BenchmarkSourcePublication{};
@@ -682,6 +687,10 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   auto compile_cpus = common_system::allowed_cpu_set();
   compile_cpus.resize(effective_num_workers);
   BenchmarkCompilePipeline pipeline(effective_num_workers, compile_cpus, limits, cancel_requested);
+  // Inventory, annotation prerequisites, prefetched archives and later repair
+  // may retain source leases before their first transfer. Protect their shared
+  // fixed transport once, before any of those dependent producers are admitted.
+  auto source_transport = pipeline.curl().channel(BenchmarkCurl::Class::Artifact, cancel_requested, archive_lease_resources());
   const auto fail_compile = [&](std::exception_ptr error) {
    cancellation_state.fail(std::move(error));
    pipeline.notify_admission_change();
@@ -793,7 +802,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
         // requiring its original archive to remain present.
         if (std::filesystem::is_regular_file(root / ".complete.json")) return PrefetchedArchive{};
         auto lease = ArtifactLease::acquire_charged(cache.locks / ("coco-" + shard + ".images.lock"), cancel_requested, &pipeline,
-         BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
+         archive_lease_resources());
         const auto request = make_download_request(cache, "coco", source ? custom_catalog.coco_val_images : custom_catalog.coco_train_images);
         auto download = download_artifacts({request}, std::min<std::size_t>(8, effective_num_workers), cancel_requested,
          progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { physical_progress.update(update, progress); }} : DownloadProgressSink{}, trace, {}, &pipeline, lease->allowance())
@@ -1071,46 +1080,61 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      });
     }
     try {
-     std::size_t next_archive_task = coconut ? 0 : 2;
-     std::array<bool, 2> coco_claimed{};
+     struct WaitingArchive { std::size_t index; Clock::time_point retry{}; };
+     std::list<WaitingArchive> waiting_archives;
+     for (std::size_t index = 0; index < archive_tasks.size(); ++index) waiting_archives.push_back({index});
+     // A completed prefetch hands its value into selection exactly once. Warm
+     // proofs can return without a lease; those sources use the same charged
+     // nonblocking lock admission as every other unclaimed archive.
+     std::array<PrefetchedArchive, 2> ready_prefetch;
      const auto take_archive = [&] {
       for (;;) {
        trace_benchmark_event(trace, "benchmark.archive.selection", [] { return nlohmann::json::object(); });
        const auto observed = pipeline.admission_generation();
        std::unique_lock lock(archive_readiness_mutex);
-       const auto coco_ready = [&](std::size_t source) { return !coco_claimed[source] && (!custom_transfers[source].valid() || prefetched_ready[source]); };
-       std::pair<std::size_t, BenchmarkAllowance> selected{archive_tasks.size(), {}};
-       const auto select = [&] {
-        if (cancel_requested.requested()) return true;
-        if (!coconut)
-         for (std::size_t source = 0; source < 2; ++source)
-          if (coco_ready(source)) {
-           coco_claimed[source] = true;
-           selected.first = source;
-           return true;
-          }
-        const bool pending_prefetch = !coconut && !(coco_claimed[0] && coco_claimed[1]);
-        if (next_archive_task < archive_tasks.size()) {
-         if (pending_prefetch) {
-          // A sole controller must stay available to retire a prefetched lease.
-          // Claim independent work only with its source allowance already owned.
-          auto grant = pipeline.try_reserve(BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
-          if (!grant) return false;
-          selected.second = std::move(*grant);
-         }
-         selected.first = next_archive_task++;
-         return true;
+       std::pair<std::size_t, PrefetchedArchive> selected{archive_tasks.size(), {}};
+       auto deadline = Clock::time_point::max();
+       throw_if_benchmark_cancelled(cancel_requested);
+       for (auto it = waiting_archives.begin(); it != waiting_archives.end(); ++it) {
+        const auto index = it->index;
+        const bool coco = !coconut && index < custom_transfers.size();
+        if (coco && custom_transfers[index].valid()) {
+         if (!prefetched_ready[index]) continue;
+         ready_prefetch[index] = custom_transfers[index].get();
         }
-        return !pending_prefetch;
-       };
-       if (select()) {
+        if (it->retry > Clock::now()) { deadline = std::min(deadline, it->retry); continue; }
+        std::shared_ptr<ArtifactLease> lease;
+        if (coco) lease = ready_prefetch[index].lease;
+        if (!lease) {
+         // A sole controller never claims independent work while either its
+         // physical lock or complete source continuation is unavailable.
+         auto grant = pipeline.try_reserve(archive_lease_resources());
+         if (!grant) continue;
+         const auto& task = archive_tasks[index];
+         const auto path = cache.locks / (std::string(benchmark_source_name(task.source)) + "-" + task.shard + ".images.lock");
+         lease = ArtifactLease::try_acquire_charged(path, cancel_requested, std::move(*grant));
+         if (!lease) {
+          // flock alone has no readiness fd. Failed attempts release all
+          // credits and cannot consume a controller or block a ready source.
+          it->retry = Clock::now() + std::chrono::milliseconds{100};
+          deadline = std::min(deadline, it->retry);
+          continue;
+         }
+        }
+        selected.first = index;
+        if (coco) selected.second = std::move(ready_prefetch[index]);
+        selected.second.lease = std::move(lease);
+        waiting_archives.erase(it);
+        break;
+       }
+       if (selected.first != archive_tasks.size() || waiting_archives.empty()) {
         lock.unlock();
-        if (!coconut && selected.first < 2) pipeline.notify_admission_change();
+        pipeline.notify_admission_change();
         return selected;
        }
        lock.unlock();
-       trace_benchmark_event(trace, "benchmark.archive.admission_wait", [&] { return nlohmann::json{{"reason", "pending_prefetch"}}; });
-       try { pipeline.wait_for_admission_change(observed); }
+       trace_benchmark_event(trace, "benchmark.archive.admission_wait", [&] { return nlohmann::json{{"reason", "source_admission"}}; });
+       try { pipeline.wait_for_admission_change(observed, deadline); }
        catch (...) {
         trace_benchmark_event(trace, "benchmark.archive.admission_stopped", [] { return nlohmann::json::object(); });
         throw;
@@ -1122,16 +1146,14 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
        const auto cpus = pipeline.cpus();
        common_system::set_thread_affinity(std::vector<int>(cpus.begin(), cpus.end()));
        while (true) {
-        auto [task_index, source_allowance] = take_archive();
+        auto [task_index, prefetch] = take_archive();
         if (task_index >= archive_tasks.size()) { break; }
         const ArchiveTask& task = archive_tasks[task_index];
         const std::uint64_t source_total = source_totals.at(task.source);
         try {
-         PrefetchedArchive prefetch;
-         if (!coconut && task_index < custom_transfers.size() && custom_transfers[task_index].valid()) prefetch = custom_transfers[task_index].get();
          archive_results[task_index] = acquire_archive_images(cache, task.source, task.shard, task.image_ids, task.artifact, cancel_requested, &progress, &image_transfer_progress,
           &cache_storage_reservations, source_total, decompression_workers, archive_cache_workers, archive_download_connections, trace, {}, coconut, archive_member_parser(task), completion_slot,
-          task.admitted, prefetch.download ? &*prefetch.download : nullptr, std::move(prefetch.lease), &pipeline, std::move(source_allowance));
+          task.admitted, prefetch.download ? &*prefetch.download : nullptr, std::move(prefetch.lease), &pipeline);
          archive_labels_ready(task_index);
         } catch (...) {
          record_pipeline_error();

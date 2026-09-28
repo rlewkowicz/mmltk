@@ -1,5 +1,4 @@
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
-#include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h"
@@ -3476,7 +3475,7 @@ TEST_CASE("cold benchmark readers finish oversized grants with retained release 
  ScopedTempDir root("cold-shared-readers");
  std::atomic<bool> cancelled{false};
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536, .descriptors = 32}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
- auto release = execution.reserve(BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
+ auto release = execution.reserve(BenchmarkResources::handles(1, true, 4));
  const std::array<std::uint32_t, 1> ids{1};
  const auto mask = png(1, 1, ids);
  const std::array physical{coco(7), objects(1)};
@@ -3584,7 +3583,7 @@ TEST_CASE("one archive controller selects independent or prefetched work from re
   }, [&](const std::filesystem::path& source, std::uint64_t) {
    if (!pressure && source == objects_root) independent.receipt().ArriveAndWait();
    if (release_capacity && source == open_images_root) pixel.receipt().ArriveAndWait();
-  }, {.descriptors = release_capacity ? 48U : pressure ? 24U : 64U});
+  }, {.descriptors = release_capacity ? 26U : pressure ? 24U : 64U});
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   cancelled.store(true);
@@ -3639,11 +3638,11 @@ TEST_CASE("custom preparation retains its prerequisite beside prefetched archive
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.descriptors = 64}, cancellation);
  auto preparation = execution.reserve(BenchmarkResources::handles(0, true, custom_annotation_resources().descriptors + custom_annotation_resources().continuation_descriptors));
- auto train = execution.reserve(BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
- auto validation = execution.reserve(BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors));
+ auto train = execution.reserve(BenchmarkResources::handles(1, true, 4));
+ auto validation = execution.reserve(BenchmarkResources::handles(1, true, 4));
  auto train_lease = ArtifactLease::acquire_charged(local.cache.locks / "coco-train2017.images.lock", cancellation, train);
  auto validation_lease = ArtifactLease::acquire_charged(local.cache.locks / "coco-val2017.images.lock", cancellation, validation);
- auto competing = execution.reserve({0, 12, true});
+ auto competing = execution.reserve({0, 42, true});
  CHECK_FALSE(execution.try_reserve(custom_annotation_resources()).has_value());
  BenchmarkTraceSink trace;
  CHECK(download_artifacts({make_download_request(local.cache, "coco", catalog.coco_train_images)}, 1, cancellation, {}, trace, {}, &execution, train).size() == 1);
@@ -3661,8 +3660,8 @@ TEST_CASE("custom preparation retains its prerequisite beside prefetched archive
  CHECK(result.coco_val->images.size() == 1);
  CHECK(execution.try_reserve({0, custom_annotation_resources().descriptors + custom_annotation_resources().continuation_descriptors, true}).has_value());
  // Both source owners still hold their lease and can use their own promise.
- CHECK(execution.try_reserve({0, 12, true}, train).has_value());
- CHECK(execution.try_reserve({0, 12, true}, validation).has_value());
+ CHECK(execution.try_reserve({0, 4, true}, train).has_value());
+ CHECK(execution.try_reserve({0, 4, true}, validation).has_value());
 }
 
 TEST_CASE("COCONut inventory and originals retain activation capacity beside a release", "[benchmark][coconut][pipeline]") {
@@ -3679,7 +3678,7 @@ TEST_CASE("COCONut inventory and originals retain activation capacity beside a r
  std::vector<AdmittedRecipeArchive> admitted;
  for (const auto& archive : catalog.images) {
   const auto path = local.cache.source_downloads(benchmark_source_name(archive.artifact.source)) / archive.artifact.filename;
-  auto inventory = execution.reserve(BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors), preparation);
+  auto inventory = execution.reserve(BenchmarkResources::handles(1, true, 3), preparation);
   auto rows = coconut_image_archive_inventory(path, {}, archive.source, archive.shard, archive.artifact.artifact_id, cancellation, &execution.storage(), &execution, inventory);
   physical.insert(physical.end(), std::make_move_iterator(rows.begin()), std::make_move_iterator(rows.end()));
   admitted.push_back({archive, {.path = path, .size = archive.artifact.expected_size, .identity = archive.artifact.artifact_id}});
@@ -3694,6 +3693,7 @@ TEST_CASE("COCONut inventory and originals retain activation capacity beside a r
  };
  ProgressReporter progress({}, trace);
  CoconutFailureReport failures(local.cache.root, progress);
+ auto competing = execution.reserve({0, 24, true});
  auto inputs = acquire_coconut_recipe_inputs(local.cache, catalog, progress, 1, cancellation, trace, 1, {}, {}, &execution);
  const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); release_acquired.Release(); });
  REQUIRE(release_acquired.WaitEntered(2s));
@@ -3709,6 +3709,7 @@ TEST_CASE("COCONut inventory and originals retain activation capacity beside a r
  CHECK(result.components.size() == 2);
  REQUIRE(result.stock_validation);
  CHECK(result.stock_validation->images.size() == 1);
+ competing = {};
  CHECK(execution.try_reserve({0, 32, true}).has_value());
 }
 
@@ -3785,4 +3786,194 @@ TEST_CASE("COCONut JSON parsing yields one shared CPU before its source pass fin
  const auto result = mmltk::testsupport::await_test_future(work, "shared JSON source pass");
  REQUIRE(result.size() == 1);
  CHECK(result.front().index.images.size() == 256);
+}
+
+TEST_CASE("custom annotation sources acquire lifecycle custody independently on one CPU", "[benchmark][pipeline]") {
+ using namespace std::chrono_literals;
+ ScopedTempDir root("custom-independent-lifecycle");
+ LocalCoconutRecipe local(root.path());
+ const auto catalog = local_custom_catalog(local);
+ auto blocked = ArtifactLease::acquire(local.cache.locks / "coco-annotations.lifecycle.lock", {});
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.descriptors = 24}, cancellation);
+ std::promise<void> independent;
+ std::atomic<unsigned> completed{0};
+ const BenchmarkTraceSink trace = [&](std::string_view event, const Json& fields) {
+  if (event == "benchmark.annotations.cache_hit" && fields.at("source") != "coco" && completed.fetch_add(1) == 1) independent.set_value();
+ };
+ ProgressReporter progress({}, trace);
+ const auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
+ auto work = std::async(std::launch::async, [&] { return prepare_custom_recipe(config, local.cache, catalog, progress, 1, cancellation, trace, {}, &execution); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); blocked = {}; });
+ mmltk::testsupport::await_test_promise(independent, "supplemental metadata while COCO lifecycle is locked");
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ blocked = {};
+ const auto result = mmltk::testsupport::await_test_future(work, "independent custom metadata settlement");
+ REQUIRE(result.coco_train);
+ REQUIRE(result.coco_val);
+ REQUIRE(result.objects);
+ REQUIRE(result.open_images);
+ CHECK(execution.try_reserve({0, 24}).has_value());
+}
+TEST_CASE("sixteen-descriptor annotation admission protects HTTP before independent lifecycle locks", "[benchmark][pipeline]") {
+ using namespace std::chrono_literals;
+ ScopedTempDir root("custom-fixed-transport-before-lifecycles");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local_custom_catalog(local);
+ const auto raw = local.cache.source_downloads("coco") / catalog.coco_annotations.filename;
+ const auto payload = file_bytes(raw);
+ mmltk::backend::data::testsupport::HttpServer server(payload);
+ catalog.coco_annotations.url = server.url("annotations");
+ catalog.coco_annotations.expected_size = payload.size();
+ std::filesystem::remove(raw);
+ std::filesystem::remove(raw.string() + ".download.json");
+ remove_normalized_annotation_index(local.cache.source_indexes("coco") / "val2017.normalized.bin");
+ auto blocked = ArtifactLease::acquire(local.cache.locks / "objects365-annotations.lifecycle.lock", {});
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.descriptors = 16}, cancellation);
+ std::promise<void> downloaded;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const Json& fields) {
+  if (event == "benchmark.download.complete" && fields.at("artifact") == catalog.coco_annotations.artifact_id) downloaded.set_value();
+ };
+ ProgressReporter progress({}, trace);
+ const auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
+ auto work = std::async(std::launch::async, [&] { return prepare_custom_recipe(config, local.cache, catalog, progress, 1, cancellation, trace, {}, &execution); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); blocked = {}; });
+ mmltk::testsupport::await_test_promise(downloaded, "COCO HTTP while independent Objects365 lifecycle is contended", 5s);
+ CHECK(file_bytes(raw) == payload);
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ blocked = {};
+ const auto result = mmltk::testsupport::await_test_future(work, "sixteen-descriptor annotation settlement", 5s);
+ REQUIRE(result.coco_train);
+ REQUIRE(result.coco_val);
+ REQUIRE(result.objects);
+ REQUIRE(result.open_images);
+ CHECK(result.coco_val->images.size() == 1);
+ CHECK(read_json_file((local.cache.source_indexes("coco") / "val2017.normalized.bin").string() + ".complete.json").at("complete") == true);
+ CHECK(execution.try_reserve({0, 16}).has_value());
+ const auto warm = prepare_custom_recipe(config, local.cache, catalog, progress, 1, cancellation, {}, {}, &execution);
+ CHECK(warm.coco_indexes_cache_hit);
+ CHECK(server.requests() == 1);
+ CHECK(execution.try_reserve({0, 16}).has_value());
+ server.Check();
+}
+
+TEST_CASE("COCONut annotation artifacts enter independently inside one release lifecycle", "[benchmark][coconut][pipeline]") {
+ using namespace std::chrono_literals;
+ std::size_t descriptors = 32;
+ SECTION("existing source budget") {}
+ SECTION("fixed preparation fits a sixteen-descriptor source") { descriptors = 16; }
+ ScopedTempDir root("coconut-independent-annotation-artifacts");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local.selected(CoconutValidation::CoconutStock);
+ catalog.releases.resize(1);
+ auto& release = catalog.releases.front();
+ release.annotations.resize(1);
+ auto artifact = release.annotations.front();
+ artifact.artifact_id += "-independent";
+ artifact.filename = "independent.parquet";
+ const std::string payload = "independently acquired annotation bytes";
+ mmltk::backend::data::testsupport::HttpServer server(payload);
+ artifact.url = server.url("annotation");
+ artifact.expected_size = payload.size();
+ artifact.expected_sha256.clear();
+ release.annotations.push_back(artifact);
+ auto blocked = ArtifactLease::acquire(local.cache.locks / (release.annotations.front().artifact_id + ".lock"), {});
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.descriptors = descriptors}, cancellation);
+ std::promise<void> independent;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const Json& fields) {
+  if (event == "benchmark.download.complete" && fields.at("artifact") == artifact.artifact_id) independent.set_value();
+ };
+ ProgressReporter progress({}, trace);
+ auto inputs = acquire_coconut_recipe_inputs(local.cache, catalog, progress, 1, cancellation, trace, 1, {}, {}, &execution);
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); blocked = {}; inputs.reset(); });
+ mmltk::testsupport::await_test_promise(independent, "second annotation while first artifact is locked");
+ CHECK(file_bytes(local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename) == payload);
+ cancelled.store(true);
+ blocked = {};
+ inputs.reset();
+ cancelled.store(false);
+ CHECK(execution.try_reserve({0, descriptors}).has_value());
+ server.Check();
+}
+
+TEST_CASE("a contended archive lock leaves the sole controller available to ready prefetched sources", "[benchmark][pipeline]") {
+ using namespace std::chrono_literals;
+ bool cancel_wait = false;
+ SECTION("ready archives and independent image work finish before unlock") {}
+ SECTION("cancellation retires prefetched leases while the unrelated lock stays held") { cancel_wait = true; }
+ ScopedTempDir root("contended-archive-selector");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local_custom_catalog(local);
+ auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
+ config.num_workers = 1;
+ auto blocked = ArtifactLease::acquire(local.cache.locks / "objects365-patch-32.images.lock", {});
+ mmltk::testsupport::TestGate train("train prefetch before cache admission"), validation("validation prefetch before cache admission"), waiting("selector returned failed lock custody");
+ std::atomic<bool> cancelled{false}, observed_wait{false};
+ struct Observation {
+  const std::atomic<bool>& cancelled_flag;
+  static mmltk::testsupport::TestGate*& next() { thread_local mmltk::testsupport::TestGate* value = nullptr; return value; }
+  bool cancelled() const noexcept {
+   if (auto* gate = std::exchange(next(), nullptr)) gate->receipt().ArriveAndWait();
+   return cancelled_flag.load();
+  }
+ } observation{cancelled};
+ config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Borrow(observation);
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event == "benchmark.storage.reserved") {
+   const auto path = std::filesystem::path(Json::parse(fields).at("path").get<std::string>());
+   if (path == local.cache.source_downloads("coco") / catalog.coco_train_images.filename) Observation::next() = &train;
+   if (path == local.cache.source_downloads("coco") / catalog.coco_val_images.filename) Observation::next() = &validation;
+  }
+  if (event == "benchmark.archive.admission_wait" && !observed_wait.exchange(true)) Observation::next() = &waiting;
+ };
+ std::promise<void> independent_ready, validation_ready, train_ready;
+ std::atomic<bool> reported_validation{false}, reported_train{false};
+ const auto descriptors = [&] {
+  std::size_t count = 0;
+  for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
+   std::error_code error;
+   const auto path = std::filesystem::read_symlink(entry.path(), error);
+   if (!error && path.native().starts_with(root.path().native() + "/")) ++count;
+  }
+  return count;
+ };
+ const auto before = descriptors();
+ auto work = std::async(std::launch::async, [&] {
+  compile_benchmark_recipe(config, nullptr, &catalog, [&](BenchmarkDatasetSource source, std::string_view) {
+   if (source == BenchmarkDatasetSource::kOpenImagesV7) independent_ready.set_value();
+  }, [&](const std::filesystem::path& source, std::uint64_t) {
+   if (source == local.cache.source_images("coco") / "val2017" && !reported_validation.exchange(true)) validation_ready.set_value();
+   if (source == local.cache.source_images("coco") / "train2017" && !reported_train.exchange(true)) train_ready.set_value();
+  }, {.descriptors = 52});
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); train.Release(); validation.Release(); waiting.Release(); blocked = {}; });
+ REQUIRE(train.WaitEntered(5s));
+ REQUIRE(validation.WaitEntered(5s));
+ REQUIRE(waiting.WaitEntered(5s));
+ mmltk::testsupport::await_test_promise(independent_ready, "independent Open Images beside contended archive", 5s);
+ // A formerly pregranted blocked Objects365 source could occupy this sole
+ // controller. The ready validation archive must now receive its turn.
+ validation.Release(); waiting.Release();
+ mmltk::testsupport::await_test_promise(validation_ready, "ready validation archive while Objects365 remains locked", 5s);
+ CHECK(work.wait_for(0ms) == std::future_status::timeout);
+ if (cancel_wait) cancelled.store(true);
+ train.Release();
+ if (cancel_wait) CHECK_THROWS(mmltk::testsupport::await_test_future(work, "cancelled archive selection custody", 5s));
+ else {
+  mmltk::testsupport::await_test_promise(train_ready, "second prefetched archive while Objects365 remains locked", 5s);
+  CHECK(work.wait_for(0ms) == std::future_status::timeout);
+  blocked = {};
+  mmltk::testsupport::await_test_future(work, "unlocked independent archive", 5s);
+  check_custom_compilation(local.output);
+ }
+ // All compile file descriptors and captured source leases have retired. Keep the
+ // external blocking descriptor in both snapshots for the cancellation case.
+ CHECK(descriptors() == before - (cancel_wait ? 0 : 1));
+ for (const auto& name : {"coco-train2017.images.lock", "coco-val2017.images.lock"})
+  CHECK(ArtifactLease::try_acquire_charged(local.cache.locks / name, {}, nullptr));
 }

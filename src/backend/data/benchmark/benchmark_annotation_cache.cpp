@@ -1,5 +1,4 @@
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
-#include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
@@ -46,12 +45,12 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
 [[nodiscard]] std::string extract_archive_member(const std::filesystem::path& archive_path, const std::string_view member_suffix, const std::filesystem::path& output_path,
  const std::string_view archive_identity, const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, StorageReservationPool* storage,
  BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
- auto allowance = execution ? execution->reserve({64ULL << 20, 3, true}, parent) : BenchmarkAllowance{};
+ auto lease = ArtifactLease::acquire_charged(lock_path, cancel_requested, execution, {64ULL << 20, 3, true}, parent);
+ const auto& allowance = lease->allowance();
  const auto cpu = [&](const std::function<void()>& work) {
   if (execution) execution->run(BenchmarkStage::Archive, {}, [&](std::size_t) { work(); }, allowance);
   else work();
  };
- auto lease = ArtifactLease::acquire_charged(lock_path, cancel_requested, allowance);
  const std::filesystem::path completion = extract_manifest_path(output_path);
  if (std::filesystem::is_regular_file(output_path) && std::filesystem::is_regular_file(completion)) {
   try {
@@ -157,8 +156,7 @@ using ArchiveReader = std::unique_ptr<archive, ArchiveDestroy>;
 [[nodiscard]] NormalizedAnnotationIndex load_or_build_index(const BenchmarkCacheLayout& cache, const std::filesystem::path& path, const BenchmarkDatasetSource source, const std::string_view split,
  const std::string_view annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace,
  const std::function<NormalizedAnnotationIndex()>& builder, StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
- auto handles = execution ? execution->reserve(BenchmarkResources::handles(2, true), parent) : BenchmarkAllowance{};
- auto lease = ArtifactLease::acquire_charged(cache.locks / (std::string(benchmark_source_name(source)) + "-" + std::string(split) + ".index.lock"), cancel_requested, std::move(handles));
+ auto lease = ArtifactLease::acquire_charged(cache.locks / (std::string(benchmark_source_name(source)) + "-" + std::string(split) + ".index.lock"), cancel_requested, execution, BenchmarkResources::handles(2, true), parent);
  if (auto cached = load_normalized_annotation_index(path, source, split, annotation_sha256, cancel_requested, trace)) { return std::move(*cached); }
  NormalizedAnnotationIndex index = builder();
  store_normalized_annotation_index(path, index, cancel_requested, trace, storage);
@@ -194,10 +192,10 @@ std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequ
   progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, parent, storage);
 }
 BenchmarkResources coco_annotation_resources() {
- return BenchmarkResources::handles(1, true, benchmark_curl_envelope(1).demand(1).descriptors);
+ return BenchmarkResources::handles(1, true, 3);
 }
 CocoAnnotationCache::CocoAnnotationCache(const BenchmarkCacheLayout& cache, const CatalogArtifact& artifact, CocoAnnotationRequest selection, std::uint32_t train_count, std::uint32_t validation_count,
- int parse_workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution, BenchmarkAllowance admitted, StorageReservationPool* storage)
+ int parse_workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution, StorageReservationPool* storage, std::shared_ptr<ArtifactLease> custody)
     : cache_(cache),
       request_(make_download_request(cache, "coco", artifact)),
       selection_(selection),
@@ -206,8 +204,8 @@ CocoAnnotationCache::CocoAnnotationCache(const BenchmarkCacheLayout& cache, cons
       parse_workers_(parse_workers),
       cancellation_(cancellation),
       trace_(trace),
-      lease_(admitted ? ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", cancellation, std::move(admitted)) :
-       ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", cancellation, execution, coco_annotation_resources())), execution_(execution), storage_(execution ? &execution->storage() : storage) {
+      source_transport_(execution ? execution->curl().channel(BenchmarkCurl::Class::Artifact, cancellation, coco_annotation_resources()) : nullptr),
+      lease_(custody ? std::move(custody) : ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", cancellation, execution, coco_annotation_resources())), execution_(execution), storage_(execution ? &execution->storage() : storage) {
  indexes_.train_path = cache.source_indexes("coco") / "train2017.normalized.bin";
  indexes_.validation_path = cache.source_indexes("coco") / "val2017.normalized.bin";
 }
@@ -320,6 +318,7 @@ CocoAnnotationIndexes CocoAnnotationCache::take_indexes() {
  indexes_.retained_storage_bytes = storage;
  auto result = std::move(indexes_);
  lease_.reset();
+ source_transport_.reset();
  return result;
 }
 }  // namespace mmltk::backend::data::benchmark_internal

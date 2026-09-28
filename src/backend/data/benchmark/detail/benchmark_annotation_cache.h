@@ -1,5 +1,6 @@
 #pragma once
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
@@ -9,6 +10,7 @@
 #include <exception>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -45,7 +47,7 @@ struct CocoAnnotationIndexes {
 class CocoAnnotationCache final {
 public:
  CocoAnnotationCache(const BenchmarkCacheLayout&, const CatalogArtifact&, CocoAnnotationRequest, std::uint32_t train_count, std::uint32_t validation_count, int parse_workers,
-  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, BenchmarkCompilePipeline* execution = nullptr, BenchmarkAllowance admitted = {}, StorageReservationPool* storage = nullptr);
+  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, BenchmarkCompilePipeline* execution = nullptr, StorageReservationPool* storage = nullptr, std::shared_ptr<ArtifactLease> custody = {});
  void discover(ProgressReporter&);
  [[nodiscard]] std::uint64_t completed_indexes() const noexcept;
  [[nodiscard]] const std::optional<DownloadRequest>& pending_download() const noexcept { return pending_; }
@@ -67,6 +69,7 @@ private:
  int parse_workers_;
  mmltk::common::concurrency::CancellationObservation cancellation_;
  const BenchmarkTraceSink& trace_;
+ std::unique_ptr<BenchmarkCurl::Channel> source_transport_;
  std::shared_ptr<ArtifactLease> lease_;
  BenchmarkCompilePipeline* execution_ = nullptr;
  StorageReservationPool* storage_ = nullptr;

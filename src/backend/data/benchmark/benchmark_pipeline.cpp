@@ -1,4 +1,5 @@
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
+#include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
@@ -61,9 +62,10 @@ struct BenchmarkCompilePipeline::Admission {
  std::mutex mutex;
  std::condition_variable changed;
  std::uint64_t generation = 0;
+ std::function<void()> transport_wakeup;
  std::uint64_t target = 0, bytes = 0, handle_bytes = 0;
  std::size_t descriptor_capacity = 0, descriptors = 0, committed = 0;
- std::size_t cpu_capacity = 0, active = 0, external_cpus = 0, waiters = 0;
+ std::size_t cpu_capacity = 0, active = 0, external_cpus = 0, waiters = 0, resource_waiters = 0;
  [[nodiscard]] std::size_t descriptor_ceiling(BenchmarkResources value) const {
   return descriptor_capacity - (value.producer ? std::min<std::size_t>(8, descriptor_capacity / 4) : 0);
  }
@@ -126,13 +128,15 @@ struct BenchmarkCompilePipeline::Admission {
    committed = committed - credit.available + credit.borrowed;
    if (credit.parent) credit.parent->available += credit.borrowed;
    ++generation;
+   if (transport_wakeup) transport_wakeup();
   }
   changed.notify_all();
  }
  struct Waiter {
   Admission& owner;
-  explicit Waiter(Admission& value) : owner(value) { ++owner.waiters; owner.changed.notify_all(); }
-  ~Waiter() { --owner.waiters; owner.changed.notify_all(); }
+  bool resource;
+  explicit Waiter(Admission& value, bool needs_resources = false) : owner(value), resource(needs_resources) { ++owner.waiters; owner.resource_waiters += resource; owner.changed.notify_all(); if (owner.transport_wakeup) owner.transport_wakeup(); }
+  ~Waiter() { --owner.waiters; owner.resource_waiters -= resource; owner.changed.notify_all(); if (owner.transport_wakeup) owner.transport_wakeup(); }
   Waiter(const Waiter&) = delete;
   Waiter& operator=(const Waiter&) = delete;
  };
@@ -297,6 +301,8 @@ struct BenchmarkCompilePipeline::Impl {
   }
  };
  std::vector<Lane> lanes;
+ std::mutex curl_mutex;
+ std::unique_ptr<BenchmarkCurl> curl;
  StorageReservationPool storage{".", {}};
  std::vector<int> cpus;
  std::shared_ptr<BenchmarkCompilePipeline::Admission> admission = std::make_shared<Admission>();
@@ -338,6 +344,8 @@ struct BenchmarkCompilePipeline::Impl {
   if (tails[stage]) tails[stage]->next = &job;
   else heads[stage] = &job;
   tails[stage] = &job;
+  ++admission->generation;
+  if (admission->transport_wakeup) admission->transport_wakeup();
  }
  void remove(Job& job) {
   const auto stage = static_cast<std::size_t>(job.stage);
@@ -651,6 +659,7 @@ BenchmarkCompilePipeline::BenchmarkCompilePipeline(std::size_t workers, std::spa
  }
 }
 BenchmarkCompilePipeline::~BenchmarkCompilePipeline() {
+ impl_->curl.reset();
  retire_attempt();
  { const std::lock_guard lock(impl_->mutex); impl_->stopping = impl_->shutdown = true; }
  impl_->changed.notify_all();
@@ -662,27 +671,50 @@ std::size_t BenchmarkCompilePipeline::current_lane() const {
  if (!frame || &frame->owner != impl_.get()) throw std::logic_error("benchmark lane requested outside CPU work");
  return frame->lane;
 }
+BenchmarkCurl& BenchmarkCompilePipeline::curl() {
+ const std::lock_guard lock(impl_->curl_mutex);
+ if (!impl_->curl) {
+  impl_->curl = std::make_unique<BenchmarkCurl>(workers(), this);
+  const std::lock_guard admission_lock(impl_->mutex);
+  impl_->admission->transport_wakeup = impl_->curl->admission_wakeup();
+ }
+ return *impl_->curl;
+}
 StorageReservationPool& BenchmarkCompilePipeline::storage() noexcept { return impl_->storage; }
 std::span<const int> BenchmarkCompilePipeline::cpus() const noexcept { return impl_->cpus; }
 std::uint64_t BenchmarkCompilePipeline::transient_target() const noexcept { return impl_->admission->target; }
 std::size_t BenchmarkCompilePipeline::descriptor_limit() const noexcept { return impl_->admission->descriptor_capacity; }
+bool BenchmarkCompilePipeline::resource_pressure() const {
+ const std::lock_guard lock(impl_->mutex);
+ return impl_->admission->resource_waiters || std::ranges::any_of(impl_->heads, [&](const auto* job) {
+  return job && !job->allowance && !impl_->admission->fits_bytes(job->resources);
+ });
+}
 std::uint64_t BenchmarkCompilePipeline::admission_generation() const {
  const std::lock_guard lock(impl_->mutex);
  return impl_->admission->generation;
 }
-void BenchmarkCompilePipeline::wait_for_admission_change(std::uint64_t observed) {
+void BenchmarkCompilePipeline::wait_for_admission_change(std::uint64_t observed, std::chrono::steady_clock::time_point deadline) {
  const auto* frame = Impl::Frame::current;
  if (frame && &frame->owner == impl_.get()) throw std::logic_error("benchmark CPU lane cannot wait for source admission");
  std::unique_lock lock(impl_->mutex);
  Admission::Waiter waiter(*impl_->admission);
  impl_->wait(lock, [&] {
   impl_->check_admission();
-  return impl_->admission->generation != observed;
+  return impl_->admission->generation != observed || std::chrono::steady_clock::now() >= deadline;
  });
 }
 void BenchmarkCompilePipeline::notify_admission_change() noexcept {
  { const std::lock_guard lock(impl_->mutex); ++impl_->admission->generation; }
  impl_->changed.notify_all();
+}
+std::size_t BenchmarkCompilePipeline::descriptor_ceiling(BenchmarkResources resources) const {
+ const std::lock_guard lock(impl_->mutex);
+ return impl_->admission->descriptor_ceiling(resources);
+}
+void BenchmarkCompilePipeline::require_feasible(BenchmarkResources resources) const {
+ const std::lock_guard lock(impl_->mutex);
+ impl_->admission->require(resources);
 }
 std::optional<BenchmarkAllowance> BenchmarkCompilePipeline::try_reserve(BenchmarkResources resources, const BenchmarkAllowance& parent) {
  const std::lock_guard lock(impl_->mutex);
@@ -701,7 +733,7 @@ BenchmarkAllowance BenchmarkCompilePipeline::reserve(BenchmarkResources resource
  for (;;) {
   impl_->check_admission();
   if (ledger.fits(resources, parent.credits_.get())) return impl_->charge(resources, parent);
-  Admission::Waiter waiter(ledger);
+  Admission::Waiter waiter(ledger, true);
   impl_->wait(lock, [&] { return impl_->stopping || impl_->failure || impl_->cancellation.requested() || ledger.fits(resources, parent.credits_.get()); });
  }
 }
@@ -727,7 +759,7 @@ std::pair<std::size_t, BenchmarkAllowance> BenchmarkCompilePipeline::reserve_tra
    else count = 1;
    return {count, impl_->charge(demand(count), parent)};
   }
-  Admission::Waiter waiter(ledger);
+  Admission::Waiter waiter(ledger, true);
   impl_->wait(lock, [&] { return impl_->stopping || impl_->failure || impl_->cancellation.requested() || ledger.fits(minimum, parent.credits_.get()); });
  }
 }

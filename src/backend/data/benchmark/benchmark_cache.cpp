@@ -70,7 +70,13 @@ ArtifactLease ArtifactLease::acquire(const std::filesystem::path& lock_path, mml
 std::shared_ptr<ArtifactLease> ArtifactLease::acquire_charged(const std::filesystem::path& path,
  mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkCompilePipeline* execution, BenchmarkResources demand, const BenchmarkAllowance& parent) {
  if (!demand.descriptors) throw std::invalid_argument("benchmark lease requires a descriptor allowance");
- return acquire_charged(path, cancellation, execution ? execution->reserve(demand, parent) : BenchmarkAllowance{});
+ for (;;) {
+  auto allowance = execution ? execution->reserve(demand, parent) : BenchmarkAllowance{};
+  if (auto lease = try_acquire(path, cancellation, std::move(allowance))) return lease;
+  throw_if_benchmark_cancelled(cancellation);
+  // Contended flock owns no admitted descriptor while its controller waits.
+  std::this_thread::sleep_for(std::chrono::milliseconds{100});
+ }
 }
 std::shared_ptr<ArtifactLease> ArtifactLease::acquire_charged(const std::filesystem::path& path,
  mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkAllowance admitted) {
@@ -80,6 +86,40 @@ std::shared_ptr<ArtifactLease> ArtifactLease::acquire_charged(const std::filesys
  // Assign only the physical handle: custody must precede open and survive it.
  auto physical = acquire(path, cancellation);
  result->descriptor_ = std::move(physical.descriptor_);
+ return result;
+}
+std::shared_ptr<ArtifactLease> ArtifactLease::try_acquire_charged(const std::filesystem::path& path,
+ mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkAllowance admitted) {
+ if (admitted && !admitted.descriptors()) throw std::invalid_argument("benchmark lease allowance has no descriptor");
+ return try_acquire(path, cancellation, std::move(admitted));
+}
+std::shared_ptr<ArtifactLease> ArtifactLease::try_acquire_charged(const std::filesystem::path& path,
+ mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkCompilePipeline* execution, BenchmarkResources demand, const BenchmarkAllowance& parent) {
+ if (!demand.descriptors) throw std::invalid_argument("benchmark lease requires a descriptor allowance");
+ throw_if_benchmark_cancelled(cancellation);
+ BenchmarkAllowance allowance;
+ if (execution) {
+  execution->require_feasible(demand);
+  auto admitted = execution->try_reserve(demand, parent);
+  if (!admitted) return {};
+  allowance = std::move(*admitted);
+ }
+ return try_acquire(path, cancellation, std::move(allowance));
+}
+std::shared_ptr<ArtifactLease> ArtifactLease::try_acquire(const std::filesystem::path& path,
+ mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkAllowance allowance) {
+ throw_if_benchmark_cancelled(cancellation);
+ (void)common_io::ensure_parent_directory(path);
+ common_io::ScopedFd descriptor(::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644));
+ if (descriptor.get() < 0) throw errno_error("cannot open benchmark cache lock", path.string());
+ if (::flock(descriptor.get(), LOCK_EX | LOCK_NB) != 0) {
+  if (errno != EWOULDBLOCK && errno != EAGAIN) throw errno_error("cannot acquire benchmark cache lock", path.string());
+  return {};
+ }
+ throw_if_benchmark_cancelled(cancellation);
+ auto result = std::make_shared<ArtifactLease>();
+ result->allowance_ = std::move(allowance);
+ result->descriptor_ = std::move(descriptor);
  return result;
 }
 void ArtifactLease::release() noexcept {

@@ -43,9 +43,15 @@ public:
   BenchmarkCompilePipeline*, BenchmarkResources = BenchmarkResources::handles(1), const BenchmarkAllowance& parent = {});
  // The explicit envelope already includes this descriptor (e.g. a batch session).
  [[nodiscard]] static std::shared_ptr<ArtifactLease> acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkAllowance admitted);
+ // A contended lock returns empty after closing its descriptor and releasing the
+ // attempted allowance. Controllers retry outside CPU lanes.
+ [[nodiscard]] static std::shared_ptr<ArtifactLease> try_acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkAllowance admitted);
+ [[nodiscard]] static std::shared_ptr<ArtifactLease> try_acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation,
+  BenchmarkCompilePipeline*, BenchmarkResources = BenchmarkResources::handles(1), const BenchmarkAllowance& parent = {});
  [[nodiscard]] const BenchmarkAllowance& allowance() const noexcept { return allowance_; }
 
 private:
+ [[nodiscard]] static std::shared_ptr<ArtifactLease> try_acquire(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkAllowance);
  explicit ArtifactLease(int descriptor) noexcept;
  void release() noexcept;
  BenchmarkAllowance allowance_;
