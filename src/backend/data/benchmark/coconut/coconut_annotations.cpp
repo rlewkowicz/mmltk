@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
 #include <exception>
@@ -19,33 +20,6 @@ namespace {
 using Json = nlohmann::json;
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
 [[noreturn]] void invalid(std::string_view detail) { throw std::runtime_error("COCONut: " + std::string(detail)); }
-std::uint64_t decimal(std::string_view value) {
- std::uint64_t id = 0;
- const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), id);
- if (value.empty() || error != std::errc{} || end != value.data() + value.size() || value.front() == '+' || value.front() == '-') invalid("invalid decimal image identity: " + std::string(value));
- return id;
-}
-struct PhysicalName {
- CoconutImageNamespace source;
- std::uint64_t id;
- std::string stem;
-};
-PhysicalName objects_name(std::string_view name) {
- const std::filesystem::path path(canonical_coconut_archive_member(name));
- const auto extension = path.extension().string();
- if (!extension.empty() && extension != ".png" && extension != ".jpg" && extension != ".json") invalid("unsupported Objects365 member: " + std::string(name));
- const auto stem = path.stem().string();
- constexpr std::string_view v1 = "objects365_v1_", v2 = "objects365_v2_";
- const auto source = stem.starts_with(v1) ? CoconutImageNamespace::Objects365V1 : CoconutImageNamespace::Objects365V2;
- const auto prefix = source == CoconutImageNamespace::Objects365V1 ? v1 : v2;
- if (!stem.starts_with(prefix) || stem.size() != prefix.size() + 8U) invalid("invalid full Objects365 namespace/member: " + std::string(name));
- return {source, decimal(std::string_view(stem).substr(prefix.size())), stem};
-}
-std::uint64_t coco_name(std::string_view name) {
- const std::filesystem::path path(canonical_coconut_archive_member(name));
- if ((path.extension() != ".jpg" && path.extension() != ".png") || path.stem().string().size() != 12U) invalid("invalid COCO filename: " + std::string(name));
- return decimal(path.stem().string());
-}
 struct PhysicalKey {
  CoconutImageNamespace source;
  std::uint64_t id;
@@ -60,18 +34,6 @@ const CategoryLookup& coconut_categories() {
  return lookup;
 }
 } // namespace
-void validate_coconut_physical_image(const CoconutPhysicalImage& image) {
- if (image.archive_identity.empty() || image.member != canonical_coconut_archive_member(image.member)) invalid("invalid physical inventory identity");
- if (std::filesystem::path(image.member).extension() != ".jpg") invalid("physical member is not JPEG: " + image.member);
- if (image.source == CoconutImageNamespace::Objects365V1 || image.source == CoconutImageNamespace::Objects365V2) {
-  const auto name = objects_name(image.member);
-  if (name.source != image.source || name.id != image.image_id) invalid("contradictory Objects365 physical identity: " + image.member);
- } else {
-  if (coco_name(image.member) != image.image_id) invalid("contradictory COCO physical identity: " + image.member);
-  const std::string_view directory = image.source == CoconutImageNamespace::CocoTrain ? "train2017/" : image.source == CoconutImageNamespace::CocoUnlabeled ? "unlabeled2017/" : "val2017/";
-  if (!image.member.starts_with(directory)) invalid("COCO physical subset disagrees with archive member: " + image.member);
- }
-}
 namespace {
 using Archive = BenchmarkArchive;
 std::uint64_t unsigned_field(const Json& value, std::string_view name) { return mmltk::frameworks::serialization::decode_json_integer_exact<std::uint64_t>(value.at(std::string(name))); }
@@ -675,7 +637,7 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
    if (found == row.end() || found->is_null()) continue;
    const auto& name = found->get_ref<const std::string&>();
    if (name.empty() || (std::string_view(field) == "file_name" && !std::filesystem::path(name).filename().string().starts_with("objects365_"))) continue;
-   const auto parsed = objects_name(name);
+   const auto parsed = parse_coconut_objects_member(name);
    if (!stem.empty() && stem != parsed.stem) invalid("contradictory declared Objects365 members");
    stem = parsed.stem;
   }
@@ -749,7 +711,7 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
   if (record.physical_stem.empty()) invalid("unresolved offered JSON annotation: " + record.file_name);
   if (!annotation.contains("image_id")) {
    const auto declared_id = image_index ? images[*image_index].id : std::nullopt;
-   record.image_id = declared_id ? *declared_id : objects_name(record.physical_stem).id;
+   record.image_id = declared_id ? *declared_id : parse_coconut_objects_member(record.physical_stem).id;
   }
   segments_from_json(annotation.at("segments_info"), record, request.limits);
   if (record.segments.size() > UINT64_MAX - segment_ordinal) invalid("segment ordinal overflow");
@@ -778,7 +740,7 @@ std::vector<CoconutRecord> xlarge_records(const CoconutImportRequest& request, C
  constexpr std::string_view prefix = "coconuts_xlarge/panseg_info/";
  while (archive.next(request.cancellation)) {
   if (!archive.regular() || !archive.member().starts_with(prefix) || !archive.member().ends_with(".json")) continue;
-  const auto name = objects_name(archive.member());
+  const auto name = parse_coconut_objects_member(archive.member());
   if (name.source != CoconutImageNamespace::Objects365V2 || archive.member() != std::string(prefix) + name.stem + ".json") invalid("unsupported XL info member: " + archive.member());
   CoconutRecord record;
   record.image_id = name.id;
@@ -806,12 +768,12 @@ std::vector<CoconutRecord> xlarge_records(const CoconutImportRequest& request, C
 }
 void consume_archive(const CoconutImportRequest& request, std::vector<CoconutRecord>& records, Importer& importer, std::shared_ptr<Archive> owned) {
  const std::string prefix = request.edition == CoconutEdition::XLarge ? "coconuts_xlarge/panseg/" : request.edition == CoconutEdition::Large ? "panoptic_object365/" : "panoptic_o365val_v3/";
- std::unordered_map<std::string, std::size_t> wanted;
- for (std::size_t i = 0; i < records.size(); ++i) {
+ std::vector<std::string> wanted;
+ wanted.reserve(records.size());
+ for (const auto& record : records) {
   throw_if_benchmark_cancelled(request.cancellation);
-  if (!wanted.emplace(prefix + records[i].physical_stem + ".png", i).second) invalid("duplicate offered mask: " + records[i].physical_stem);
+  wanted.push_back(prefix + record.physical_stem + ".png");
  }
- std::vector<bool> consumed(records.size(), false);
  // The library keeps its decompressor and encoded capacity until stream close.
  // Reserve that backing together with its largest legal synchronous consumer,
  // so a borrowed PNG never waits for the scratch needed to retire its input.
@@ -827,18 +789,21 @@ void consume_archive(const CoconutImportRequest& request, std::vector<CoconutRec
   ~RetireConsumer() { importer.retire_scratch(); }
  } retire_consumer{importer};
  if (request.edition == CoconutEdition::XLarge && discovered) {
-  for (const auto& record : records) {
-   const auto member = prefix + record.physical_stem + ".png";
-   if (!archive.seek(member, request.cancellation)) invalid("missing offered mask: " + member);
-   importer.consume(record, archive.read(request.limits.max_png_bytes, request.cancellation), archive.allowance());
-  }
+  archive.visit_known(wanted, [&](std::size_t index) {
+   importer.consume(records[index], archive.read(request.limits.max_png_bytes, request.cancellation), archive.allowance());
+  }, request.cancellation);
   archive.pause();
   return;
  }
+ std::unordered_map<std::string_view, std::size_t> by_member;
+ by_member.reserve(wanted.size());
+ for (std::size_t i = 0; i < wanted.size(); ++i)
+  if (!by_member.emplace(wanted[i], i).second) invalid("duplicate offered mask: " + records[i].physical_stem);
+ std::vector<bool> consumed(records.size(), false);
  std::size_t remaining = wanted.size();
  while (remaining && archive.next(request.cancellation)) {
-  const auto found = wanted.find(archive.member());
-  if (found == wanted.end()) {
+  const auto found = by_member.find(archive.member());
+  if (found == by_member.end()) {
    if (archive.member().starts_with(prefix) && archive.member().ends_with(".png")) invalid("extra mask without annotation: " + archive.member());
    continue;
   }
@@ -911,70 +876,6 @@ std::string coconut_component_input_identity(std::string_view base, CoconutImage
  const auto material = std::string(base) + "\nrecovery:" + std::to_string(kCoconutRecoveryPolicy) + "\n" + std::string(coconut_namespace_name(source)) + "\n" + std::string(original);
  return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(material.data()), material.size())));
 }
-std::string canonical_coconut_archive_member(std::string_view raw) { return canonical_benchmark_archive_member(raw); }
-CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<const CoconutPhysicalImage> images, Cancellation cancellation) {
- std::unordered_map<CoconutImageNamespace, std::size_t> counts;
- for (const auto& image : images) {
-  throw_if_benchmark_cancelled(cancellation);
-  ++counts[image.source];
- }
- for (const auto& [source, count] : counts) {
-  (void)coconut_namespace_name(source);
-  namespaces_[source].reserve(count);
- }
- for (const auto& image : images) {
-  throw_if_benchmark_cancelled(cancellation);
-  validate_coconut_physical_image(image);
-  if (!namespaces_.at(image.source).emplace(image.image_id, &image).second) invalid("duplicate physical member: " + image.member);
- }
-}
-const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespace source, std::uint64_t id) const noexcept {
- const auto space = namespaces_.find(source);
- if (space == namespaces_.end()) return nullptr;
- const auto found = space->second.find(id);
- return found == space->second.end() ? nullptr : found->second;
-}
-CoconutPhysicalImage CoconutPhysicalMembership::resolve(CoconutEdition edition, std::string_view identity, const CoconutRecord& record, const BenchmarkAllowance& parent) const {
- if (resolver_) {
-  if (edition == CoconutEdition::Base || edition == CoconutEdition::RelabeledValidation) {
-   if (coco_name(record.file_name) != record.image_id) invalid("COCO row filename/image_id mismatch: " + record.file_name);
-  } else {
-   const auto physical = objects_name(record.physical_stem);
-   if (edition != CoconutEdition::ObjectsValidation && physical.source != CoconutImageNamespace::Objects365V2) invalid("training extension requires Objects365 v2");
-  }
-  const auto logical_key = edition == CoconutEdition::XLarge ? record.image_id : record.source_ordinal;
-  { const std::lock_guard lock(resolved_mutex_);
-   auto& [generation, images] = resolved_[edition];
-   if (generation != identity) { images.clear(); generation = identity; }
-   const auto found = images.find(logical_key); if (found != images.end()) return found->second;
-  }
-  auto physical = resolver_(edition, record, parent);
-  validate_coconut_physical_image(physical);
-  { const std::lock_guard lock(resolved_mutex_); resolved_[edition].second.insert_or_assign(logical_key, physical); }
-  return physical;
- }
-  if (edition == CoconutEdition::Base || edition == CoconutEdition::RelabeledValidation) {
-   if (coco_name(record.file_name) != record.image_id) invalid("COCO row filename/image_id mismatch: " + record.file_name);
-   const CoconutPhysicalImage* match = nullptr;
-   for (auto source : {CoconutImageNamespace::CocoTrain, CoconutImageNamespace::CocoUnlabeled, CoconutImageNamespace::CocoValidation}) {
-    if ((source == CoconutImageNamespace::CocoValidation) != (edition == CoconutEdition::RelabeledValidation)) continue;
-    if (const auto* found = find(source, record.image_id)) {
-     if (match) invalid("ambiguous COCO train/unlabeled membership: " + record.file_name);
-     match = found;
-    }
-   }
-   if (!match)
-    throw CoconutPhysicalMembershipError(
-     edition, record.image_id, "missing physical COCO archive member: " + record.file_name);
-   return *match;
-  }
-  const auto name = objects_name(record.physical_stem);
-  if (edition != CoconutEdition::ObjectsValidation && name.source != CoconutImageNamespace::Objects365V2) invalid("training extension requires Objects365 v2");
-  const auto* found = find(name.source, name.id);
-  if (!found) throw CoconutPhysicalMembershipError(edition, record.image_id, "missing physical Objects365 archive member: " + record.physical_stem);
-  return *found;
- }
-
 void CoconutAnnotationRecords::discard() noexcept {
  archive.reset();
  std::vector<CoconutRecord>().swap(records);
@@ -1088,11 +989,11 @@ std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(
   if (!archive.regular() || !archive.member().ends_with(".jpg")) continue;
   CoconutPhysicalImage image{source, 0, shard, archive.member(), archive_identity};
   if (source == CoconutImageNamespace::Objects365V1 || source == CoconutImageNamespace::Objects365V2) {
-   const auto name = objects_name(image.member);
+   const auto name = parse_coconut_objects_member(image.member);
    if (name.source != source) invalid("physical archive namespace mismatch: " + image.member);
    image.image_id = name.id;
   } else
-   image.image_id = coco_name(image.member);
+   image.image_id = parse_coconut_coco_member(image.member);
   validate_coconut_physical_image(image);
   result.push_back(std::move(image));
  }

@@ -21,8 +21,6 @@ struct CoconutPhysicalImage {
  bool operator==(const CoconutPhysicalImage&) const = default;
 };
 MMLTK_REFLECT_FIELDS(CoconutPhysicalImage)
-// Validate observed member identity before cache publication or inventory use.
-void validate_coconut_physical_image(const CoconutPhysicalImage&);
 struct CoconutInventoryImage {
  CoconutPhysicalImage physical;
  std::uint64_t release_image_id = 0;

@@ -29,6 +29,7 @@
 #include <nlohmann/json.hpp>
 namespace mmltk::backend::data::benchmark_internal {
 class BenchmarkCompilePipeline;
+class CoconutPhysicalMembership;
 [[nodiscard]] BenchmarkResources custom_annotation_resources();
 struct CustomRecipeCatalog {
  CatalogArtifact coco_annotations, coco_train_images, coco_val_images, objects_annotations, open_images_boxes, open_images_classes;
@@ -60,15 +61,6 @@ struct AdmittedRecipeArchive {
  DownloadResult download;
  unsigned structural_attempts = 0;
  std::uint64_t resolution_workspace = 0;
-};
-class PhysicalArchiveFailure final : public std::runtime_error {
-public:
- PhysicalArchiveFailure(AdmittedRecipeArchive& archive, std::string reason, std::exception_ptr fatal = {}) : std::runtime_error(std::move(reason)), archive_(&archive), fatal_(std::move(fatal)) {}
- [[nodiscard]] AdmittedRecipeArchive& archive() const noexcept { return *archive_; }
- [[nodiscard]] std::exception_ptr fatal() const noexcept { return fatal_; }
-private:
- AdmittedRecipeArchive* archive_;
- std::exception_ptr fatal_;
 };
 enum class CoconutReleaseBoundary { MetadataConsumed, MasksStarted };
 // Private ordinary catalog facts are also used by bounded local release fixtures.
@@ -108,7 +100,6 @@ private:
  bool attempted_ = false;
  bool warned_ = false;
 };
-[[nodiscard]] std::span<const CoconutImageNamespace> coconut_release_sources(CoconutEdition);
 [[nodiscard]] CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation);
 [[nodiscard]] CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, std::span<const AdmittedRecipeArchive>,
  const CoconutPhysicalMembership&, ProgressReporter&, CoconutFailureReport&, std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&,

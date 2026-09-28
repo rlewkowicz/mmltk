@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
@@ -31,6 +32,7 @@
 #include <archive.h>
 #include <archive_entry.h>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_message.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 #include <stb_image_write.h>
 #include <zlib.h>
@@ -74,15 +76,16 @@ std::string png(int width, int height, std::span<const std::uint32_t> ids) {
           [](void* context, void* data, int size) { static_cast<std::string*>(context)->append(static_cast<const char*>(data), size); }, &encoded, width, height, 3, pixels.data(), width * 3) != 0);
  return encoded;
 }
-void tar(const std::filesystem::path& path, std::span<const std::pair<std::string, std::string>> members, bool symlink = false) {
+void tar(const std::filesystem::path& path, std::span<const std::pair<std::string, std::string>> members, bool symlink = false, int format = ARCHIVE_FORMAT_TAR_PAX_RESTRICTED) {
  std::unique_ptr<archive, decltype(&archive_write_free)> writer(archive_write_new(), archive_write_free);
- REQUIRE(archive_write_set_format_pax_restricted(writer.get()) == ARCHIVE_OK);
+ REQUIRE(archive_write_set_format(writer.get(), format) == ARCHIVE_OK);
  if (path.extension() == ".gz") REQUIRE(archive_write_add_filter_gzip(writer.get()) == ARCHIVE_OK);
  REQUIRE(archive_write_open_filename(writer.get(), path.c_str()) == ARCHIVE_OK);
  for (const auto& [name, bytes] : members) {
   std::unique_ptr<archive_entry, decltype(&archive_entry_free)> entry(archive_entry_new(), archive_entry_free);
   archive_entry_set_pathname(entry.get(), name.c_str());
   archive_entry_set_perm(entry.get(), 0644);
+  if (format == ARCHIVE_FORMAT_TAR_PAX_INTERCHANGE) archive_entry_set_mtime(entry.get(), 1, 1);
   const bool directory = name == "." || name == "./";
   archive_entry_set_filetype(entry.get(), symlink ? AE_IFLNK : directory ? AE_IFDIR : AE_IFREG);
   if (symlink) archive_entry_set_symlink(entry.get(), "other");
@@ -696,10 +699,10 @@ TEST_CASE("COCONut version-1 component inventory pins nested physical release an
  CHECK(file_bytes(path) == index_bytes);
 }
 TEST_CASE("COCONut physical member spelling preserves exact paths and rejects unsafe names", "[coconut]") {
- CHECK(canonical_coconut_archive_member("././train2017//./000000000007.jpg") == "train2017/000000000007.jpg");
- CHECK(canonical_coconut_archive_member("nested/./image//objects365_v1_00091105.jpg") == "nested/image/objects365_v1_00091105.jpg");
+ CHECK(canonical_benchmark_archive_member("././train2017//./000000000007.jpg") == "train2017/000000000007.jpg");
+ CHECK(canonical_benchmark_archive_member("nested/./image//objects365_v1_00091105.jpg") == "nested/image/objects365_v1_00091105.jpg");
  for (const std::string& raw : {std::string("/train2017/a.jpg"), std::string("../a.jpg"), std::string("train2017/../a.jpg"), std::string("train2017\\a.jpg"), std::string("train2017/a\0.jpg", 16)}) {
-  CHECK_THROWS(canonical_coconut_archive_member(raw));
+  CHECK_THROWS(canonical_benchmark_archive_member(raw));
  }
 }
 TEST_CASE("COCONut full physical inventories are identity-bound and independent of foreground labels", "[coconut]") {
@@ -1121,6 +1124,15 @@ struct LocalCoconutRecipe {
   return result;
  }
 };
+std::vector<AdmittedRecipeArchive> local_physical_archives(const BenchmarkCacheLayout& cache, const CoconutRecipeCatalog& catalog) {
+ std::vector<AdmittedRecipeArchive> admitted;
+ for (const auto& archive : catalog.images) {
+  const auto path = cache.source_downloads(benchmark_source_name(archive.artifact.source)) / archive.artifact.filename;
+  admitted.push_back({archive, {.path = path, .size = std::filesystem::file_size(path), .identity = archive.artifact.artifact_id}, 0,
+   BenchmarkArchive::workspace_bytes(path, 64ULL << 20)});
+ }
+ return admitted;
+}
 }  // namespace
 TEST_CASE("COCONut private catalog compiles all validation choices through the production transaction", "[coconut][benchmark]") {
  ScopedTempDir root("coconut-recipe");
@@ -1941,7 +1953,7 @@ TEST_CASE("one admitted physical membership lookup serves every release without 
  }
  PollCancellation construction;
  const CoconutPhysicalMembership membership(physical, mmltk::common::concurrency::CancellationObservation::Borrow(construction));
- REQUIRE(construction.polls == 2 * physical.size());
+ REQUIRE(construction.polls == physical.size());
  const auto construction_polls = construction.polls;
  // Any repeated use of the admission's cancellation observation now fails.
  construction.stop_at = construction.polls;
@@ -4126,6 +4138,15 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
  first = input.read(1024);
  CHECK(std::string(first.begin(), first.end()) == members[0].second);
  CHECK_FALSE(input.seek("missing.bin"));
+ input.pause();
+ const std::array required{members[1].first, members[0].first};
+ std::vector<std::size_t> order;
+ input.visit_known(required, [&](std::size_t index) {
+  order.push_back(index);
+  const auto actual = input.read(1024);
+  CHECK(std::string(actual.begin(), actual.end()) == members[1 - index].second);
+ });
+ CHECK(order == std::vector<std::size_t>{1, 0});
 }
 TEST_CASE("requested archive extraction closes before unsafe unused members", "[benchmark][coconut][archive]") {
  ScopedTempDir root("archive-unused-tail");
@@ -4178,6 +4199,13 @@ TEST_CASE("archive consumed-member checks retain sparse payloads and reject requ
   input.pause(); input.resume(bytes.size());
   REQUIRE(input.seek("sparse.bin")); actual = input.read(bytes.size());
   CHECK(std::string(actual.begin(), actual.end()) == bytes);
+  input.pause();
+  const std::array required{std::string("sparse.bin")};
+  input.visit_known(required, [&](std::size_t index) {
+   CHECK(index == 0);
+   const auto data = input.read(bytes.size());
+   CHECK(std::string(data.begin(), data.end()) == bytes);
+  });
  }
  SECTION("conflicting required names fail when encountered and consumed") {
   const std::array<std::pair<std::string, std::string>, 2> members{{{"same.bin", "first"}, {"same.bin", "second"}}};
@@ -4185,12 +4213,16 @@ TEST_CASE("archive consumed-member checks retain sparse payloads and reject requ
   REQUIRE(input.next()); (void)input.read(1024);
   REQUIRE(input.next()); CHECK_THROWS_AS(input.read(1024), BenchmarkArchiveError);
   CHECK_THROWS_AS(input.seek("same.bin"), BenchmarkArchiveError);
+  const std::array required{std::string("same.bin")};
+  CHECK_THROWS_AS(input.visit_known(required, [](std::size_t) {}), BenchmarkArchiveError);
  }
  SECTION("missing requests resolve only after the eligible stream ends") {
   const std::array<std::pair<std::string, std::string>, 1> members{{{"other.bin", "other"}}};
   tar(path, members); BenchmarkArchive input(path);
   REQUIRE(input.next()); CHECK_FALSE(input.seek("missing.bin"));
   CHECK_FALSE(input.next()); CHECK_FALSE(input.seek("missing.bin"));
+  const std::array required{std::string("missing.bin")};
+  CHECK_THROWS_AS(input.visit_known(required, [](std::size_t) {}), BenchmarkArchiveError);
  }
  SECTION("a consumed symbolic link is rejected") {
   std::unique_ptr<archive, decltype(&archive_write_free)> output(archive_write_new(), archive_write_free);
@@ -4497,6 +4529,17 @@ TEST_CASE("gzip dictionary eviction preserves parallel forward work and bounded 
    CHECK_FALSE(input.gzip_seek_state().retained);
    CHECK(input.gzip_seek_state().index_entries == 0);
    CHECK(input.gzip_seek_state().index_bytes == 0);
+   if (!cancel_replay) {
+    if (control_limit) input.pause();
+    const std::array required{std::string("last.bin"), std::string("first.bin")};
+    std::vector<std::size_t> order;
+    input.visit_known(required, [&](std::size_t index) {
+     order.push_back(index);
+     const auto value = input.read(1024);
+     CHECK(std::string(value.begin(), value.end()) == (index == 0 ? "last" : "first"));
+    });
+    CHECK(order == std::vector<std::size_t>{1, 0});
+   }
   }
   input.pause();
   CHECK(execution.try_reserve({workspace, 0}).has_value());
@@ -4561,18 +4604,30 @@ TEST_CASE("XL discovery resolves ready physical requests before later JSON parsi
   {"coconuts_xlarge/panseg_info/objects365_v2_00000002.json", "invalid later JSON"}
  }};
  tar(path, members);
- unsigned resolved = 0;
- CoconutPhysicalMembership physical(CoconutPhysicalMembership::Resolver{[&](CoconutEdition edition, const CoconutRecord& record, const BenchmarkAllowance&) {
-  CHECK(edition == CoconutEdition::XLarge);
-  CHECK(record.image_id == 3);
-  ++resolved;
-  return objects(3);
- }});
+ const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
+ const auto images = cache.source_downloads("objects365") / "physical.tar";
+ const auto jpeg = white_jpeg();
+ const std::array<std::pair<std::string, std::string>, 1> image_members{{{objects(3).member, jpeg}}};
+ tar(images, image_members);
+ CoconutRecipeCatalog catalog;
+ catalog.releases.push_back({CoconutEdition::XLarge, "fixture-xl", "fixture-v1", 1, {}});
+ catalog.images.push_back({CoconutImageNamespace::Objects365V2, 32, "patch-32",
+  {"physical", "unused", images.filename().string(), std::filesystem::file_size(images), "", BenchmarkDatasetSource::kObjects365V2}});
+ auto admitted = local_physical_archives(cache, catalog);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 16});
+ CoconutPhysicalMembership physical(admitted, catalog, true, cache, execution.storage(), execution);
  CoconutImportRequest input;
+ input.execution = &execution;
  input.edition = CoconutEdition::XLarge; input.input_identity = "xl-discovery";
  input.metadata_only = true; input.mask_archive = path; input.physical_membership = &physical;
  CHECK_THROWS(import_coconut_annotations(input));
- CHECK(resolved == 1);
+ const auto image_root = cache.source_images("objects365") / "patch-32";
+ CHECK(file_bytes(cached_image_path(image_root, 3)) == jpeg);
+ const auto geometry = execution.geometry(image_root, 3);
+ REQUIRE(geometry);
+ CHECK(geometry->width == 3);
+ CHECK(geometry->height == 3);
+ CHECK(execution.try_reserve({execution.transient_target(), 16}).has_value());
 }
 
 TEST_CASE("failed XL generations retire oversized backing before source repair", "[benchmark][coconut][pipeline]") {
@@ -4620,4 +4675,132 @@ TEST_CASE("failed XL generations retire oversized backing before source repair",
   CHECK(CompiledDataset::open(config.output_dir / "train.bin").image_entries().size() == 4);
  }
  server.Check();
+}
+
+TEST_CASE("known XL masks preserve canonical ordinals across physical archive order and formats", "[benchmark][coconut][archive]") {
+ int format = ARCHIVE_FORMAT_TAR_USTAR;
+ bool gzip = false;
+ SECTION("raw tar") {}
+ SECTION("gzip tar") { gzip = true; }
+ SECTION("ZIP") { format = ARCHIVE_FORMAT_ZIP; }
+ SECTION("PAX extended records") { format = ARCHIVE_FORMAT_TAR_PAX_INTERCHANGE; }
+ SECTION("GNU records") { format = ARCHIVE_FORMAT_TAR_GNUTAR; }
+ ScopedTempDir root("xl-ordered-masks");
+ const std::array physical{objects(2), objects(3)};
+ const std::array<std::uint32_t, 2> pixels{1, 1};
+ const auto mask = png(2, 1, pixels);
+ const std::string info_prefix = "coconuts_xlarge/panseg_info/", mask_prefix = "coconuts_xlarge/panseg/";
+ const std::string lower = "objects365_v2_00000002", upper = "objects365_v2_00000003";
+ const auto info = Json::array({segment(9, 200, false), segment()}).dump();
+ std::optional<CoconutComponent> expected;
+ for (const bool reverse : {false, true}) {
+  auto input = request(physical, CoconutEdition::XLarge);
+  input.mask_archive = root.path() / (gzip ? "xl.tar.gz" : "xl.archive");
+  input.records = std::make_shared<CoconutAnnotationRecords>();
+  const auto& first = reverse ? upper : lower;
+  const auto& second = reverse ? lower : upper;
+  const std::array<std::pair<std::string, std::string>, 6> members{{
+   {mask_prefix + first + ".png", mask},
+   {info_prefix + second + ".json", info},
+   {"unused/" + std::string(150, 'x'), std::string(256U << 10, 'x')},
+   {info_prefix + first + ".json", info},
+   {mask_prefix + second + ".png", mask},
+   // XL has always ignored masks with no offered JSON record.
+   {mask_prefix + "objects365_v2_00000099.png", "unused invalid PNG"}
+  }};
+  // USTAR cannot encode an oversized single path component. A long prefix is
+  // representable there, while PAX/GNU retain genuine extension records.
+  auto contents = std::vector(members.begin(), members.end());
+  if (format == ARCHIVE_FORMAT_TAR_USTAR) contents[2].first = "unused/payload.bin";
+  tar(input.mask_archive, contents, false, format);
+  input.metadata_only = true;
+  const auto metadata = import_coconut_annotations(input);
+  REQUIRE(metadata.size() == 1);
+  REQUIRE(input.records->records.size() == 2);
+  CHECK(input.records->records[0].image_id == 2);
+  CHECK(input.records->records[0].first_segment_ordinal == 0);
+  CHECK(input.records->records[1].first_segment_ordinal == 2);
+  input.metadata_only = false;
+  auto result = import_coconut_annotations(input);
+  REQUIRE(result.size() == 1);
+  const auto& component = result.front();
+  REQUIRE(component.index.images.size() == 2);
+  REQUIRE(component.index.boxes.size() == 2);
+  CHECK(component.index.images[0].source_image_id == 2);
+  CHECK(component.index.images[1].source_image_id == 3);
+  CHECK(component.index.boxes[0].source_ordinal == 1);
+  CHECK(component.index.boxes[1].source_ordinal == 3);
+  CHECK(component.inventory[0].source_ordinal == 0);
+  CHECK(component.inventory[1].source_ordinal == 1);
+  if (!expected) expected = component;
+  else {
+   CHECK(component.inventory == expected->inventory);
+   CHECK(component.index.annotation_sha256 == expected->index.annotation_sha256);
+   CHECK(component.index.mask_rle_pairs.size() == expected->index.mask_rle_pairs.size());
+   CHECK(std::memcmp(component.index.mask_rle_pairs.data(), expected->index.mask_rle_pairs.data(), component.index.mask_rle_pairs.size() * sizeof(RLEPair)) == 0);
+  }
+  for (const auto failure : {"missing", "duplicate", "invalid PNG", "actual geometry"}) {
+   INFO(failure);
+   // Retire the borrowed inode before replacing the fixture generation.
+   input.records->discard();
+   auto rejected = contents;
+   if (std::string_view(failure) == "missing") rejected.erase(rejected.begin());
+   else if (std::string_view(failure) == "duplicate") rejected.push_back(rejected.front());
+   else if (std::string_view(failure) == "invalid PNG") rejected.front().second = "invalid required PNG";
+   input.limits.max_pixels = std::string_view(failure) == "actual geometry" ? 1 : 64U * 1024U * 1024U;
+   tar(input.mask_archive, rejected, false, format);
+   CHECK_THROWS(import_coconut_annotations(input));
+  }
+ }
+}
+
+TEST_CASE("physical owner withdraws only affected routes and refreshes their consumer envelope", "[benchmark][coconut][archive]") {
+ ScopedTempDir root("physical-owner-withdrawal");
+ LocalCoconutRecipe local(root.path());
+ auto admitted = local_physical_archives(local.cache, local.catalog);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 16});
+ CoconutPhysicalMembership physical(admitted, local.catalog, true, local.cache, execution.storage(), execution);
+ auto& train = *std::ranges::find(admitted, CoconutImageNamespace::CocoTrain, [](const auto& row) { return row.origin.source; });
+ auto& objects_archive = *std::ranges::find(admitted, CoconutImageNamespace::Objects365V2, [](const auto& row) { return row.origin.source; });
+ CHECK(physical.eligible(CoconutEdition::Base, train));
+ CHECK_FALSE(physical.eligible(CoconutEdition::Large, train));
+ CHECK(physical.eligible(CoconutEdition::Large, objects_archive));
+ CoconutRecord base;
+ base.image_id = 7; base.file_name = "000000000007.jpg";
+ CoconutRecord large;
+ large.image_id = 601; large.physical_stem = "objects365_v2_00000001";
+ const auto before = physical.resolution_resources(CoconutEdition::Base);
+ const auto other = physical.resolution_resources(CoconutEdition::Large);
+ const auto original = physical.resolve(CoconutEdition::Base, "base", base, {});
+ physical.release_readers(CoconutEdition::Base);
+ const auto independent = physical.resolve(CoconutEdition::Large, "large", large, {});
+ physical.release_readers(CoconutEdition::Large);
+ const auto other_path = cached_image_path(local.cache.source_images("objects365") / objects_archive.origin.cache_shard, 1);
+ struct stat first{}, second{};
+ REQUIRE(::stat(other_path.c_str(), &first) == 0);
+ const auto train_root = local.cache.source_images("coco") / train.origin.cache_shard;
+ execution.retire_source(train_root);
+ physical.withdraw(train);
+ const auto replacement = root.path() / "replacement.tar.gz";
+ const std::array<std::uint32_t, 1> pixel{0x001234};
+ const auto encoded = png(1, 1, pixel);
+ const std::array<std::pair<std::string, std::string>, 1> members{{{coco(7).member, encoded}}};
+ tar(replacement, members);
+ std::filesystem::rename(replacement, train.download.path);
+ train.download.identity = "changed-physical-generation";
+ train.resolution_workspace = BenchmarkArchive::workspace_bytes(train.download.path, 64ULL << 20);
+ CHECK(physical.resolution_resources(CoconutEdition::Base).bytes > before.bytes);
+ CHECK(physical.resolution_resources(CoconutEdition::Large).bytes == other.bytes);
+ CHECK(physical.resolve(CoconutEdition::Large, "large", large, {}) == independent);
+ REQUIRE(::stat(other_path.c_str(), &second) == 0);
+ CHECK(first.st_ino == second.st_ino);
+ const auto changed = physical.resolve(CoconutEdition::Base, "base", base, {});
+ CHECK(changed.archive_identity != original.archive_identity);
+ CHECK(file_bytes(cached_image_path(train_root, 7)) == encoded);
+ const auto geometry = execution.geometry(train_root, 7);
+ REQUIRE(geometry);
+ CHECK(geometry->width == 1);
+ CHECK(geometry->height == 1);
+ physical.release_readers(CoconutEdition::Base);
+ CHECK(execution.try_reserve({execution.transient_target(), 16}).has_value());
 }

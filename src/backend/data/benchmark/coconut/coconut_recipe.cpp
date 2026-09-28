@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
 #include "src/backend/data/benchmark/detail/benchmark_recipe.h"
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
@@ -177,20 +178,6 @@ struct CoconutRecipeInputs {
 namespace {
 std::string digest_text(std::string_view text) { return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(text.data()), text.size()))); }
 }  // namespace
-std::span<const CoconutImageNamespace> coconut_release_sources(CoconutEdition edition) {
- static constexpr CoconutImageNamespace base[]{CoconutImageNamespace::CocoTrain, CoconutImageNamespace::CocoUnlabeled};
- static constexpr CoconutImageNamespace validation[]{CoconutImageNamespace::CocoValidation};
- static constexpr CoconutImageNamespace objects[]{CoconutImageNamespace::Objects365V2};
- static constexpr CoconutImageNamespace objects_validation[]{CoconutImageNamespace::Objects365V1};
- switch (edition) {
-  case CoconutEdition::Base: return base;
-  case CoconutEdition::RelabeledValidation: return validation;
-  case CoconutEdition::Large:
-  case CoconutEdition::XLarge: return objects;
-  case CoconutEdition::ObjectsValidation: return objects_validation;
- }
- throw std::invalid_argument("invalid COCONut edition");
-}
 CoconutFailureReport::CoconutFailureReport(const std::filesystem::path& cache_root, ProgressReporter& progress) : progress_(progress) {
  auto directory = cache_root;
  for (auto parent = cache_root; !parent.empty(); parent = parent.parent_path()) {

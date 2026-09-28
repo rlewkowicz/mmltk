@@ -109,7 +109,7 @@ struct BenchmarkArchive::Impl {
  std::uint64_t offset = 0, block_offset = 0, origin = 0, file_size = 0;
  std::array<std::uint64_t, 7> generation{};
  std::size_t block_size = 0;
- bool direct = false, is_regular = false, safe_name = true, raw_tar = false, compressed = false, verify_crc = true;
+ bool started = false, direct = false, is_regular = false, safe_name = true, raw_tar = false, compressed = false, verify_crc = true;
  std::size_t decoders = 1, requested_decoders = 1, retained_windows = 1024, index_entries = 32768;
  bool external_cpus = false;
  std::size_t consumer_descriptors = 0;
@@ -255,10 +255,25 @@ struct BenchmarkArchive::Impl {
   catch (const std::exception& error) { archive_set_error(reader, self.compressed ? EINVAL : EIO, "%s", error.what()); }
   return ARCHIVE_FATAL;
  }
+ static la_int64_t skip_callback(archive* reader, void* context, la_int64_t requested) noexcept {
+  auto& self = *static_cast<Impl*>(context);
+  // libarchive asks only after its format/filter has accounted for buffered
+  // data and format records. Never skip decoder state or sparse logical data.
+  if (requested <= 0 || self.compressed || !self.raw_tar || archive_format(reader) != ARCHIVE_FORMAT_TAR_USTAR ||
+      archive_filter_count(reader) != 1 || archive_filter_code(reader, 0) != ARCHIVE_FILTER_NONE || !self.entry || archive_entry_sparse_count(self.entry) != 0) return 0;
+  const auto count = static_cast<std::uint64_t>(requested);
+  if (self.offset > self.file_size || count > self.file_size - self.offset) {
+   archive_set_error(reader, EINVAL, "%s", "raw archive skip exceeds opened file extent");
+   return ARCHIVE_FATAL;
+  }
+  self.offset += count;
+  self.block_size = 0;
+  return requested;
+ }
  void open(std::uint64_t start, Cancellation requested_cancellation = {}) {
   cancellation = requested_cancellation;
   reader.reset();
-  entry = nullptr; direct = false; origin = offset = start;
+  entry = nullptr; started = false; raw_tar = false; direct = false; origin = offset = start;
   try { position_decoder(start); }
   catch (const std::bad_alloc&) { throw; }
   catch (const std::exception& error) { throw_if_benchmark_cancelled(cancellation); throw BenchmarkArchiveError(error.what()); }
@@ -266,7 +281,7 @@ struct BenchmarkArchive::Impl {
   if (!reader) throw std::bad_alloc{};
   if (archive_read_support_filter_all(reader.get()) < ARCHIVE_WARN || archive_read_support_format_tar(reader.get()) < ARCHIVE_WARN || archive_read_support_format_zip(reader.get()) < ARCHIVE_WARN)
    failure(reader.get(), "cannot configure archive");
-  const auto status = archive_read_open(reader.get(), this, nullptr, read_callback, nullptr);
+  const auto status = archive_read_open2(reader.get(), this, nullptr, read_callback, skip_callback, nullptr);
   throw_if_benchmark_cancelled(cancellation);
   if (status < ARCHIVE_WARN) failure(reader.get(), "cannot open archive");
  }
@@ -289,6 +304,7 @@ bool BenchmarkArchive::next(Cancellation cancellation) {
  int status = ARCHIVE_RETRY;
  s.cpu([&] { for (int retry = 0; retry < 8 && status == ARCHIVE_RETRY; ++retry) status = archive_read_next_header(s.reader.get(), &s.entry); });
  throw_if_benchmark_cancelled(cancellation);
+ s.started = true;
  if (status == ARCHIVE_EOF) return false;
  if (status != ARCHIVE_OK && status != ARCHIVE_WARN) failure(s.reader.get(), "cannot read archive header");
  const char* path = archive_entry_pathname(s.entry);
@@ -411,6 +427,45 @@ bool BenchmarkArchive::seek(std::string_view member, Cancellation cancellation) 
  s.cpu([&] { s.open(0, cancellation); });
  while (next(cancellation)) if (s.name == member) return true;
  throw BenchmarkArchiveError("archive member disappeared from opened generation");
+}
+void BenchmarkArchive::visit_known(std::span<const std::string> members, const std::function<void(std::size_t)>& consume, Cancellation cancellation) {
+ auto& s = *impl_;
+ struct Required { std::size_t index; Impl::Position position; };
+ std::vector<Required> ordered;
+ ordered.reserve(members.size());
+ for (std::size_t i = 0; i < members.size(); ++i) {
+  throw_if_benchmark_cancelled(cancellation);
+  const auto found = s.positions.find(members[i]);
+  if (found == s.positions.end()) throw BenchmarkArchiveError("missing requested archive member: " + members[i]);
+  ordered.push_back({i, found->second});
+ }
+ std::ranges::sort(ordered, {}, [](const Required& row) { return row.position.header; });
+ if (ordered.empty()) return;
+ for (std::size_t i = 1; i < ordered.size(); ++i)
+  if (ordered[i - 1].position.header == ordered[i].position.header) throw BenchmarkArchiveError("duplicate required archive member: " + members[ordered[i].index]);
+ if (!s.reader) s.resume(s.workspace_bytes);
+ const bool direct = std::ranges::all_of(ordered, [](const Required& row) { return row.position.extent.has_value(); });
+ // A fresh resumed reader is already at zero. Otherwise restart exactly once
+ // for the batch; all context-dependent members share this forward traversal.
+ if (!direct && (s.started || s.origin != 0 || s.direct)) s.cpu([&] { s.open(0, cancellation); });
+ for (const auto& required : ordered) {
+  throw_if_benchmark_cancelled(cancellation);
+  const auto& name = members[required.index];
+  if (required.position.conflict) throw BenchmarkArchiveError("conflicting requested archive member: " + name);
+  if (direct) {
+   if (!seek(name, cancellation)) throw BenchmarkArchiveError("archive member disappeared from opened generation");
+  } else {
+   bool found = false;
+   while (next(cancellation)) {
+    if (position() < required.position.header) continue;
+    if (position() != required.position.header || member() != name) throw BenchmarkArchiveError("archive visit identity mismatch");
+    found = true;
+    break;
+   }
+   if (!found) throw BenchmarkArchiveError("archive member disappeared from opened generation");
+  }
+  consume(required.index);
+ }
 }
 void BenchmarkArchive::pause() {
  auto& s = *impl_;

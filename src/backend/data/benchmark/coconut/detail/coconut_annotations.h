@@ -13,50 +13,12 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <stdexcept>
 #include <vector>
-#include <utility>
-#include <unordered_map>
-#include <map>
-#include <mutex>
 #include <memory>
 namespace mmltk::backend::data::benchmark_internal {
 class BenchmarkCompilePipeline;
 class StorageReservationPool;
-class CoconutPhysicalMembershipError final : public std::runtime_error {
-public:
- CoconutPhysicalMembershipError(CoconutEdition edition, std::uint64_t image_id, std::string message) : std::runtime_error(std::move(message)), edition_(edition), image_id_(image_id) {}
- [[nodiscard]] CoconutEdition edition() const noexcept { return edition_; }
- [[nodiscard]] std::uint64_t image_id() const noexcept { return image_id_; }
-
-private:
- CoconutEdition edition_;
- std::uint64_t image_id_;
-};
-// Resolves logical records within one source generation and retains canonical
-// joins. Immutable inventory inputs used by local importers remain borrowed.
-struct CoconutRecord;
-class CoconutPhysicalMembership final {
-public:
- using Resolver = std::function<CoconutPhysicalImage(CoconutEdition, const CoconutRecord&, const BenchmarkAllowance&)>;
- explicit CoconutPhysicalMembership(Resolver resolver, std::function<void(CoconutEdition)> release = {}, std::function<BenchmarkResources(CoconutEdition)> resources = {})
-  : resolver_(std::move(resolver)), release_(std::move(release)), resources_(std::move(resources)) {}
- [[nodiscard]] BenchmarkResources resolution_resources(CoconutEdition edition) const { return resources_ ? resources_(edition) : BenchmarkResources{}; }
- void release_readers(CoconutEdition edition) const { if (release_) release_(edition); }
- [[nodiscard]] CoconutPhysicalImage resolve(CoconutEdition, std::string_view identity, const CoconutRecord&, const BenchmarkAllowance&) const;
- explicit CoconutPhysicalMembership(std::span<const CoconutPhysicalImage>, mmltk::common::concurrency::CancellationObservation = {});
- CoconutPhysicalMembership(const CoconutPhysicalMembership&) = delete;
- CoconutPhysicalMembership& operator=(const CoconutPhysicalMembership&) = delete;
- [[nodiscard]] const CoconutPhysicalImage* find(CoconutImageNamespace, std::uint64_t) const noexcept;
-
-private:
- Resolver resolver_;
- std::function<void(CoconutEdition)> release_;
- std::function<BenchmarkResources(CoconutEdition)> resources_;
- mutable std::mutex resolved_mutex_;
- mutable std::map<CoconutEdition, std::pair<std::string, std::map<std::uint64_t, CoconutPhysicalImage>>> resolved_;
- std::unordered_map<CoconutImageNamespace, std::unordered_map<std::uint64_t, const CoconutPhysicalImage*>> namespaces_;
-};
+class CoconutPhysicalMembership;
 class CoconutMaskRecovery;
 struct CoconutComponent {
  CoconutEdition edition = CoconutEdition::Base;
@@ -133,8 +95,6 @@ struct CoconutImportRequest {
 [[nodiscard]] std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequest& request);
 // Removes only XL rows covered by Large, retaining B and all namespace distinctions.
 [[nodiscard]] std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& components, mmltk::common::concurrency::CancellationObservation cancellation = {});
-// Canonical relative member spelling; rejects absolute paths, traversal, backslashes and NUL.
-[[nodiscard]] std::string canonical_coconut_archive_member(std::string_view raw);
 // Full archive inventory, independent of annotations/foreground selection. Cache is identity-bound.
 [[nodiscard]] std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(const std::filesystem::path& archive_path, const std::filesystem::path& cache_path, CoconutImageNamespace source,
  std::uint16_t shard, std::string archive_identity, mmltk::common::concurrency::CancellationObservation cancellation = {}, StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {});

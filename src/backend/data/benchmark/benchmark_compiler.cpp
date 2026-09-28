@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
 #include <list>
 #include "src/pch_linux.h"
 #include "src/pch_std.h"
@@ -717,154 +718,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
    });
   }
   std::optional<CoconutPhysicalMembership> membership;
-  struct PhysicalRoute { AdmittedRecipeArchive* archive; BenchmarkArchive::MemberPosition locator; std::uint64_t position; bool consumed = false, conflict = false; };
-  struct PhysicalSource {
-   std::vector<AdmittedRecipeArchive*> archives;
-   std::size_t next = 0;
-   std::unordered_map<std::uint64_t, PhysicalRoute> members;
-   // One forward discovery cursor per shard, referencing the authoritative
-   // encountered member location. Late reads must not rewind future discovery.
-   std::unordered_map<AdmittedRecipeArchive*, std::uint64_t> scanned;
-  };
-  struct PhysicalRelease {
-   std::mutex mutex;
-   std::map<CoconutImageNamespace, PhysicalSource> sources;
-   std::set<std::filesystem::path> prepared_roots;
-   AdmittedRecipeArchive* active = nullptr;
-   std::shared_ptr<ArtifactLease> lease;
-   std::unique_ptr<BenchmarkArchive> reader;
-   BenchmarkAllowance directory_allowance;
-   common_io::FileHandle directory;
-   BenchmarkImageDecoder decoder;
-   void release_reader() {
-    directory = {}; directory_allowance = {};
-    reader.reset(); lease.reset(); active = nullptr;
-   }
-  };
-  std::map<CoconutEdition, PhysicalRelease> physical_releases;
-  // Routing is a one-time projection of the selected release catalog. The
-  // explicit private catalog supplies its own bounded fixture source set.
-  for (const auto& release : coconut_catalog.releases) for (const auto name : coconut_release_sources(release.edition)) {
-   auto& source = physical_releases[release.edition].sources[name];
-   for (auto& archive : admitted) {
-    if (archive.origin.source != name) continue;
-    if (!explicit_catalog && name == CoconutImageNamespace::Objects365V2) {
-     const auto shards = coconut_objects_training_shards(release.edition);
-     if (std::ranges::find(shards, archive.origin.shard) == shards.end()) continue;
-    }
-    source.archives.push_back(&archive);
-   }
-  }
-  const auto physical_resources = [&](CoconutEdition edition) {
-   std::uint64_t bytes = 0;
-   for (const auto source : coconut_release_sources(edition))
-    for (const auto* archive : physical_releases.at(edition).sources.at(source).archives) bytes = std::max(bytes, archive->resolution_workspace);
-   auto resources = archive_image_resources();
-   resources.bytes = bytes;
-   return resources;
-  };
-  // Each release retains one transport inside its admitted consumer envelope.
-  // Different releases have independent archive continuations; only requests
-  // sharing that release's cursor serialize. Shared artifact facts are immutable.
-  const auto release_physical_readers = [&](CoconutEdition edition) {
-   auto& state = physical_releases.at(edition);
-   const std::lock_guard lock(state.mutex);
-   state.release_reader();
-  };
-  const auto withdraw_physical_routes = [&](AdmittedRecipeArchive& archive) {
-   for (auto& [edition, state] : physical_releases) {
-    const std::lock_guard lock(state.mutex);
-    if (state.active == &archive) state.release_reader();
-    for (auto& [name, source] : state.sources) {
-     if (name != archive.origin.source) continue;
-     source.scanned.erase(&archive);
-     std::erase_if(source.members, [&](const auto& entry) { return entry.second.archive == &archive; });
-     source.next = std::min(source.next, static_cast<std::size_t>(std::ranges::find(source.archives, &archive) - source.archives.begin()));
-    }
-   }
-  };
-  const auto resolve_physical = [&](CoconutEdition edition, const CoconutRecord& record, const BenchmarkAllowance& parent) -> CoconutPhysicalImage {
-   auto& state = physical_releases.at(edition);
-   const std::lock_guard lock(state.mutex);
-   const bool coco_record = edition == CoconutEdition::Base || edition == CoconutEdition::RelabeledValidation;
-   const auto preferred = edition == CoconutEdition::RelabeledValidation ? std::optional(CoconutImageNamespace::CocoValidation) : record.namespace_hint;
-   const auto objects_source = record.physical_stem.starts_with("objects365_v1_") ? CoconutImageNamespace::Objects365V1 : CoconutImageNamespace::Objects365V2;
-   const auto requested_id = coco_record ? record.image_id : parse_archive_image_id(record.physical_stem).value_or(UINT64_MAX);
-   const auto eligible = coconut_release_sources(edition);
-   for (const bool preferred_pass : {true, false}) for (const auto source_name : eligible) {
-    if ((!coco_record && source_name != objects_source) || (preferred && source_name == *preferred) != preferred_pass) continue;
-    auto& source = state.sources.at(source_name);
-    for (;;) {
-     auto found = source.members.find(requested_id);
-     if (found == source.members.end() && source.next == source.archives.size()) break;
-     const bool known_member = found != source.members.end();
-     auto& archive = *(found != source.members.end() ? found->second.archive : source.archives[source.next]);
-     const auto root = cache.source_images(benchmark_source_name(archive.origin.artifact.source)) / archive.origin.cache_shard;
-     if (state.active != &archive) { state.release_reader(); state.active = &archive; }
-     try {
-      if (!state.lease) state.lease = ArtifactLease::acquire_charged(cache.locks / (std::string(benchmark_source_name(archive.origin.artifact.source)) + "-" + archive.origin.cache_shard + ".images.lock"), cancel_requested, &pipeline, archive_image_resources(), parent);
-      if (known_member && found->second.conflict) throw BenchmarkArchiveError("conflicting requested physical image identity");
-      const bool new_reader = !state.reader;
-      if (!state.reader) state.reader = std::make_unique<BenchmarkArchive>(archive.download.path, &pipeline, 64ULL << 20, state.lease->allowance(), 1, false,
-       parent.bytes() >= archive.resolution_workspace ? parent : BenchmarkAllowance{});
-      auto& reader = *state.reader;
-      bool located = found != source.members.end() && reader.seek(found->second.locator, cancel_requested);
-      if (!located) {
-       if (const auto cursor = source.scanned.find(&archive); cursor != source.scanned.end()) {
-        const auto& location = source.members.at(cursor->second);
-        if (new_reader || reader.position() != location.position) (void)reader.seek(location.locator, cancel_requested);
-       }
-      }
-      while (!located && reader.next(cancel_requested)) {
-       if (!reader.member().ends_with(".jpg")) continue;
-       const auto id = parse_archive_image_id(reader.member());
-       if (!id) continue;
-       const auto [entry, inserted] = source.members.emplace(*id, PhysicalRoute{&archive, reader.member_position(), reader.position()});
-       if (!inserted && (entry->second.archive != &archive || entry->second.position != reader.position())) entry->second.conflict = true;
-       if (entry->second.conflict && (entry->second.consumed || *id == requested_id)) throw BenchmarkArchiveError("conflicting consumed physical image identity");
-       for (const auto& [other_name, other_source] : state.sources) {
-        if (other_name == source_name) continue;
-        const auto other = other_source.members.find(*id);
-        if (other != other_source.members.end() && (other->second.consumed || *id == requested_id)) throw BenchmarkArchiveError("ambiguous encountered physical namespaces");
-       }
-       located = *id == requested_id;
-      }
-      if (!located && known_member) throw BenchmarkArchiveError("known requested member disappeared from its archive generation");
-      if (!located) { ++source.next; state.release_reader(); continue; }
-      const CoconutPhysicalImage physical{archive.origin.source, requested_id, archive.origin.shard, reader.member(), archive.download.identity};
-      try { validate_coconut_physical_image(physical); }
-      catch (const std::bad_alloc&) { throw; }
-      catch (const std::exception& error) { throw BenchmarkArchiveError(error.what()); }
-      const auto encoded = reader.read(32ULL << 20, cancel_requested);
-      BenchmarkImageHeader header;
-      reader.cpu([&] {
-       if (!has_complete_image_markers(encoded)) throw BenchmarkImageError("incomplete requested COCONut image");
-       header = state.decoder.read_header(encoded);
-      });
-      if (state.prepared_roots.insert(root).second) prepare_cached_image_directory(root);
-      if (state.directory.get() < 0) {
-       state.directory_allowance = pipeline.reserve(BenchmarkResources::handles(2, true), state.lease->allowance());
-       const int descriptor = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-       if (descriptor < 0) throw common_io::errno_error("cannot open physical image cache directory", root.string());
-       state.directory = common_io::FileHandle(descriptor);
-      }
-      std::array<char, 24> relative{}; const auto relative_size = format_cached_image_relative_path(requested_id, relative);
-      write_cached_image_atomically({}, encoded, cancel_requested, physical_storage, {}, {}, false, state.directory.get(), std::string_view(relative.data(), relative_size));
-      pipeline.source_publication(root, state.lease).geometry_ready(requested_id, {header.width, header.height});
-      auto& route = source.members.at(requested_id);
-      route.consumed = true; route.locator = reader.member_position();
-      const auto cursor = source.scanned.find(&archive);
-      if (cursor == source.scanned.end() || source.members.at(cursor->second).position < route.position) source.scanned[&archive] = requested_id;
-      return physical;
-     } catch (const BenchmarkArchiveError& error) { throw PhysicalArchiveFailure(archive, error.what()); }
-     catch (const BenchmarkImageError& error) { throw PhysicalArchiveFailure(archive, error.what()); }
-     catch (const std::bad_alloc&) { throw; }
-     catch (const std::exception& error) { throw PhysicalArchiveFailure(archive, error.what(), std::current_exception()); }
-    }
-   }
-   throw CoconutPhysicalMembershipError(edition, record.image_id, "missing requested physical archive member: " + record.file_name);
-  };
-  if (coconut) membership.emplace(CoconutPhysicalMembership::Resolver{resolve_physical}, release_physical_readers, physical_resources);
+  if (coconut) membership.emplace(admitted, coconut_catalog, explicit_catalog != nullptr, cache, physical_storage, pipeline, cancel_requested);
   std::vector<CoconutImageNamespace> refreshed_sources;
   // Release importers borrow physical membership and the refreshed-source span.
   // Retire them before either borrowed owner unwinds on every exit path.
@@ -1030,7 +884,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      return [&task](std::string_view raw) -> std::optional<std::uint64_t> {
       // Extraction visits directory headers too; inventory admits these roots.
       if (raw == "." || raw == "./") return std::nullopt;
-      const auto member = canonical_coconut_archive_member(raw);
+      const auto member = canonical_benchmark_archive_member(raw);
       const auto found = task.members.find(member);
       return found == task.members.end() ? std::nullopt : std::optional(found->second);
      };
@@ -1812,31 +1666,25 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     retained_annotation_inputs.reset();
     invalidate_normalization(archive.origin.source);
     cancellation_state.clear_failure();
-    membership.reset();
-    withdraw_physical_routes(archive);
+    membership->withdraw(archive);
     acquire_physical_archive(archive, cache, progress, physical_progress, physical_storage, effective_num_workers, cancel_requested, trace, error.what(), &pipeline);
     refreshed_sources.push_back(archive.origin.source);
-    membership.emplace(CoconutPhysicalMembership::Resolver{resolve_physical}, release_physical_readers, physical_resources);
    } catch (const CoconutPhysicalMembershipError& error) {
     progress.discard_label_plans();
     throw_if_benchmark_cancelled(cancellation_state.external);
     retained_annotation_inputs.reset();
     cancellation_state.clear_failure();
-    membership.reset();
     bool repaired = false;
     for (auto& archive : admitted) {
-     const auto& sources = physical_releases.at(error.edition()).sources;
-     const auto eligible = sources.find(archive.origin.source);
-     if (eligible == sources.end() || std::ranges::find(eligible->second.archives, &archive) == eligible->second.archives.end()) continue;
+     if (!membership->eligible(error.edition(), archive)) continue;
      invalidate_physical_pixels(archive);
      invalidate_normalization(archive.origin.source);
-     withdraw_physical_routes(archive);
+     membership->withdraw(archive);
      acquire_physical_archive(archive, cache, progress, physical_progress, physical_storage, effective_num_workers, cancel_requested, trace, error.what(), &pipeline);
      if (std::ranges::find(refreshed_sources, archive.origin.source) == refreshed_sources.end()) refreshed_sources.push_back(archive.origin.source);
      repaired = true;
     }
     if (!repaired) throw;
-    membership.emplace(CoconutPhysicalMembership::Resolver{resolve_physical}, release_physical_readers, physical_resources);
    }
   }
  } catch (...) {

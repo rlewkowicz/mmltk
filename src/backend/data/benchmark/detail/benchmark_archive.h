@@ -56,6 +56,12 @@ public:
  // live dictionary index while retained. Evicted state and context-dependent
  // formats explicitly reread the needed prefix.
  bool seek(std::string_view member, mmltk::common::concurrency::CancellationObservation = {});
+ // Visit already encountered required members in physical order. The callback
+ // receives its original input index and borrows this reader synchronously.
+ // One format context spans the batch, including ZIP/extended/sparse tar and
+ // paused or evicted gzip state. A missing/conflicting request is an error.
+ void visit_known(std::span<const std::string> members, const std::function<void(std::size_t)>&,
+  mmltk::common::concurrency::CancellationObservation = {});
  // Release decoder/buffer capacity between discovery and later consumption.
  // The opened inode and encountered positions stay bound to this generation.
  void pause();
