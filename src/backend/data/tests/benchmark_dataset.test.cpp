@@ -74,6 +74,15 @@ namespace {
 void require_condition(const bool condition, const char* message) {
  if (!condition) { throw std::runtime_error(message); }
 }
+// Call only while every available CPU is gated and no other admission mutation is in
+// flight. The generation change then proves this borrowed work was queued.
+// The caller owns the future before waiting, and releases its gates on unwind.
+void queue_benchmark_work(BenchmarkCompilePipeline& execution, std::future<void>& future, std::function<void()> work) {
+ const auto before = execution.admission_generation();
+ future = std::async(std::launch::async, std::move(work));
+ execution.wait_for_admission_change(before, std::chrono::steady_clock::now() + 2s);
+ require_condition(execution.admission_generation() != before, "benchmark work did not reach its ready queue");
+}
 [[nodiscard]] BenchmarkWriteRequest benchmark_write_request(
  const PreparedBenchmarkSplit& split, fs::path output, const std::uint32_t resolution, const mmltk::common::concurrency::CancellationObservation cancellation = {}) {
  return {
@@ -3173,6 +3182,252 @@ TEST_CASE("descriptor producer admission leaves handles for an admitted consumer
  bool consumed = false;
  execution.run(BenchmarkStage::Header, {}, [&](std::size_t) { consumed = true; }, *completion);
  CHECK(consumed);
+}
+TEST_CASE("same-stage ready work uses remaining capacity beside a held consumer", "[backend][data][benchmark][pipeline]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ BenchmarkResources held{40, 0}, head{48, 0}, later{16, 0};
+ bool preowned = false, external_cpu = false;
+ SECTION("byte capacity") {}
+ SECTION("descriptor capacity") { held = {0, 5}; head = {0, 6}; later = {0, 2}; }
+ SECTION("later work already owns a dependent allowance") { preowned = true; later.descriptors = 2; }
+ SECTION("oversized head requires exclusive workspace") { head.bytes = 65; }
+ SECTION("an external CPU grant leaves only the gated consumer lane") { external_cpu = true; }
+ std::atomic<bool> cancelled{false};
+ BenchmarkCompilePipeline execution(2, {}, {.transient_bytes = 64, .descriptors = 8}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ auto parent = preowned ? execution.reserve({0, 1, false, 0, false, 2}) : BenchmarkAllowance{};
+ auto allowance = preowned ? execution.reserve(later, parent) : BenchmarkAllowance{};
+ auto external = external_cpu ? execution.reserve({40, 0, false, 1}) : BenchmarkAllowance{};
+ mmltk::testsupport::TestGate holder("independent retained resources"), cpu("remaining CPU");
+ std::atomic<bool> head_ran{false}, later_ran{false};
+ std::array<std::future<void>, 4> work;
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled.store(true);
+  holder.Release(); cpu.Release(); execution.notify_admission_change();
+ });
+ if (!external_cpu) {
+  work[0] = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Archive, held, [&](std::size_t) { holder.receipt().ArriveAndWait(); }); });
+  REQUIRE(holder.WaitEntered(2s));
+ }
+ work[1] = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Archive, {}, [&](std::size_t) { cpu.receipt().ArriveAndWait(); }); });
+ REQUIRE(cpu.WaitEntered(2s));
+ queue_benchmark_work(execution, work[2], [&] {
+  execution.run(BenchmarkStage::Normalize, head, [&](std::size_t) {
+   head_ran.store(true);
+   require_condition(!execution.try_reserve(head), "head execution did not retain its full demand");
+  });
+ });
+ queue_benchmark_work(execution, work[3], [&] {
+  execution.run(BenchmarkStage::Normalize, later, [&](std::size_t) {
+   require_condition(!head_ran.load(), "blocked head ran while the independent holder remained live");
+   later_ran.store(true);
+  }, allowance);
+ });
+ CHECK(work[3].wait_for(0ms) == std::future_status::timeout);
+ cpu.Release();
+ mmltk::testsupport::await_test_future(work[3], "feasible same-stage work beside retained resources");
+ CHECK(later_ran.load());
+ CHECK_FALSE(head_ran.load());
+ if (external_cpu) CHECK(external.bytes() == 40);
+ else CHECK(work[0].wait_for(0ms) == std::future_status::timeout);
+ CHECK(work[2].wait_for(0ms) == std::future_status::timeout);
+ holder.Release();
+ external = {};
+ allowance = {};
+ parent = {};
+ for (auto& item : work) if (item.valid()) mmltk::testsupport::await_test_future(item, "same-stage resource settlement");
+ CHECK(head_ran.load());
+ CHECK(execution.try_reserve({64, 8}).has_value());
+}
+
+TEST_CASE("stage selection reconsiders its head and rotates beyond a rejected prefix", "[backend][data][benchmark][pipeline]") {
+ bool rotate = false;
+ SECTION("a feasible head regains priority") {}
+ SECTION("fallback resumes beyond its last successful bypass") { rotate = true; }
+ std::atomic<bool> cancelled{false};
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 64}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ auto held = execution.reserve({40, 0});
+ mmltk::testsupport::TestGate cpu("queue all candidates"), bypass("selected later candidate");
+ std::vector<unsigned> order;
+ std::array<std::future<void>, 5> work;
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled.store(true); held = {}; cpu.Release(); bypass.Release(); execution.notify_admission_change();
+ });
+ work[0] = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Archive, {}, [&](std::size_t) { cpu.receipt().ArriveAndWait(); }); });
+ REQUIRE(cpu.WaitEntered(2s));
+ for (std::size_t i = 1; i < work.size(); ++i) queue_benchmark_work(execution, work[i], [&, i] {
+  execution.run(BenchmarkStage::Normalize, {i == 1 ? 48U : i == 2 ? 32U : 16U, 0}, [&](std::size_t) {
+   order.push_back(static_cast<unsigned>(i));
+   if (i == 3) bypass.receipt().ArriveAndWait();
+  });
+ });
+ cpu.Release();
+ REQUIRE(bypass.WaitEntered(2s));
+ held = {};
+ if (rotate) held = execution.reserve({32, 0});
+ bypass.Release();
+ if (rotate) {
+  mmltk::testsupport::await_test_future(work[4], "fallback after the previous bypass");
+  mmltk::testsupport::await_test_future(work[2], "fallback wraps to the newly feasible prefix");
+  CHECK(work[1].wait_for(0ms) == std::future_status::timeout);
+  held = {};
+ }
+ for (auto& item : work) if (item.valid()) mmltk::testsupport::await_test_future(item, "head reconsideration");
+ if (rotate) CHECK(order == std::vector<unsigned>{3, 4, 2, 1});
+ else CHECK(order == std::vector<unsigned>{3, 1, 2, 4});
+}
+
+TEST_CASE("same-stage fallback preserves suspended scratch and withdraws its cursor safely", "[backend][data][benchmark][pipeline]") {
+ bool fail_outer = false;
+ SECTION("adjacent chunks reuse the suspended owner's scratch") {}
+ SECTION("outer failure withdraws the queued sibling at the cursor") { fail_outer = true; }
+ std::atomic<bool> cancelled{false};
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 64}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ mmltk::testsupport::TestGate outer("outer parser holds lane scratch");
+ std::vector<unsigned> scratch;
+ std::size_t chunks = 0, allocations = 0, retirements = 0;
+ bool child_ran = false;
+ std::array<std::future<void>, 2> work;
+ const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); outer.Release(); execution.notify_admission_change(); });
+ work[0] = std::async(std::launch::async, [&] {
+  execution.for_each(BenchmarkStage::Normalize, 3, {48, 0}, [&](std::size_t index) {
+   ++chunks;
+   if (index == 0) {
+    scratch.assign(8, 47);
+    ++allocations;
+    outer.receipt().ArriveAndWait();
+    execution.cooperate();
+    require_condition(child_ran && chunks == 1, "cooperative fallback reused its suspended owner's scratch");
+    if (fail_outer) throw AnnotationDocumentRejected("suspended parser failed");
+   }
+   require_condition(scratch.size() == 8 && scratch.front() == 47 && retirements == 0, "same-stage work lost reusable scratch");
+  }, [&](std::size_t) { scratch.clear(); ++retirements; });
+ });
+ REQUIRE(outer.WaitEntered(2s));
+ queue_benchmark_work(execution, work[1], [&] {
+  execution.run(BenchmarkStage::Normalize, {16, 0}, [&](std::size_t) {
+   child_ran = true;
+   require_condition(!execution.try_reserve({1, 0}), "child released the suspended frame's allowance");
+  });
+ });
+ outer.Release();
+ if (fail_outer) CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(work[0], "failed suspended parser"), "suspended parser failed");
+ else mmltk::testsupport::await_test_future(work[0], "same-owner scratch reuse");
+ mmltk::testsupport::await_test_future(work[1], "independent same-stage cooperative child");
+ CHECK(chunks == (fail_outer ? 1 : 3));
+ CHECK(allocations == 1);
+ CHECK(retirements == 1);
+ CHECK(scratch.empty());
+ // The removed cursor borrowed stack-backed group records which are now gone.
+ execution.run(BenchmarkStage::Normalize, {64, 0}, [](std::size_t) {});
+ CHECK(execution.try_reserve({64, 0}).has_value());
+}
+
+TEST_CASE("cancellation settles blocked and feasible same-stage jobs without new resources", "[backend][data][benchmark][pipeline]") {
+ std::atomic<bool> cancelled{false};
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 64}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ auto held = execution.reserve({40, 0});
+ mmltk::testsupport::TestGate cpu("cancel with the remaining CPU held");
+ std::atomic<unsigned> calls{0};
+ std::array<std::future<void>, 3> work;
+ const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); cpu.Release(); execution.notify_admission_change(); });
+ work[0] = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Archive, {}, [&](std::size_t) { cpu.receipt().ArriveAndWait(); }); });
+ REQUIRE(cpu.WaitEntered(2s));
+ for (std::size_t i = 1; i < work.size(); ++i) queue_benchmark_work(execution, work[i], [&, i] {
+  execution.run(BenchmarkStage::Normalize, {i == 1 ? 48U : 16U, 0}, [&](std::size_t) { calls.fetch_add(1); });
+ });
+ cancelled.store(true);
+ cpu.Release();
+ for (auto& item : work) CHECK_THROWS(mmltk::testsupport::await_test_future(item, "cancelled stage settlement"));
+ CHECK(calls.load() == 0);
+ CHECK(held.bytes() == 40);
+ cancelled.store(false);
+ held = {};
+ execution.run(BenchmarkStage::Normalize, {64, 0}, [](std::size_t) {});
+}
+
+TEST_CASE("source retirement removes the rotating candidate without obstructing unrelated ready work", "[backend][data][benchmark][pipeline]") {
+ bool whole_source = false;
+ SECTION("source retirement") { whole_source = true; }
+ SECTION("image retirement") {}
+ mmltk::testsupport::ScopedTempDir root("stage-cursor-source-retirement");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images = {{1, 16, 8, 0, 0, 0}};
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ std::atomic<unsigned> opens{0}, calls{0};
+ request.image_opened = [&](const fs::path&, std::uint64_t) { opens.fetch_add(1); };
+ BenchmarkSplitWriter writer(request);
+ std::atomic<bool> cancelled{false};
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536, .descriptors = 4}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ auto held = execution.reserve({0, 2});
+ mmltk::testsupport::TestGate cpu("populate header queue"), bypass("hold the selected header bypass");
+ std::array<std::future<void>, 4> work;
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled.store(true); cpu.Release(); bypass.Release(); execution.notify_admission_change();
+ });
+ work[0] = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Archive, {}, [&](std::size_t) { cpu.receipt().ArriveAndWait(); }); });
+ REQUIRE(cpu.WaitEntered(2s));
+ queue_benchmark_work(execution, work[1], [&] { execution.run(BenchmarkStage::Header, {0, 3}, [&](std::size_t) { calls.fetch_add(1); }); });
+ queue_benchmark_work(execution, work[2], [&] { execution.run(BenchmarkStage::Header, {0, 1}, [&](std::size_t) { bypass.receipt().ArriveAndWait(); }); });
+ const auto publication = execution.source_publication(images, {});
+ publication({images, 1, {}, true});
+ queue_benchmark_work(execution, work[3], [&] { execution.run(BenchmarkStage::Header, {0, 1}, [&](std::size_t) { calls.fetch_add(1); }); });
+ cpu.Release();
+ REQUIRE(bypass.WaitEntered(2s));
+ // The first bypass left the cursor on the queued physical image. Withdrawal
+ // unlinks that exact job before the next selection resumes past it.
+ if (whole_source) execution.retire_source(images);
+ else execution.retire_image(images, 1);
+ bypass.Release();
+ mmltk::testsupport::await_test_future(work[3], "unrelated header beyond a withdrawn cursor");
+ CHECK(calls.load() == 1);
+ CHECK(opens.load() == 0);
+ CHECK_FALSE(writer.image_complete(0));
+ CHECK(work[1].wait_for(0ms) == std::future_status::timeout);
+ held = {};
+ for (auto& item : work) if (item.valid()) mmltk::testsupport::await_test_future(item, "header cursor settlement");
+ publication({images, 1, {}, true});
+ execution.drain();
+ CHECK(opens.load() == 0);
+ execution.source_publication(images, {}, 1)({images, 1});
+ execution.drain();
+ CHECK(writer.image_complete(0));
+ CHECK(opens.load() == 1);
+ CHECK(calls.load() == 2);
+}
+
+TEST_CASE("independent pixel failure settles blocked and feasible stage work with the first error", "[backend][data][benchmark][pipeline]") {
+ mmltk::testsupport::ScopedTempDir root("stage-selection-first-error");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images = {{1, 16, 8, 0, 0, 0}};
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ mmltk::testsupport::TestGate failing("independent header fails before stage dispatch");
+ request.image_opened = [&](const fs::path&, std::uint64_t) { failing.receipt().ArriveAndWait(); throw std::bad_alloc(); };
+ BenchmarkSplitWriter writer(request);
+ std::atomic<bool> cancelled{false};
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ auto held = execution.reserve({40960, 0});
+ std::atomic<unsigned> calls{0};
+ std::array<std::future<void>, 2> work;
+ const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); failing.Release(); execution.notify_admission_change(); });
+ execution.source_publication(images, {})({images, 1, {}, true});
+ REQUIRE(failing.WaitEntered(2s));
+ for (std::size_t i = 0; i < work.size(); ++i) queue_benchmark_work(execution, work[i], [&, i] {
+  execution.run(BenchmarkStage::Normalize, {i == 0 ? 49152U : 16384U, 0}, [&](std::size_t) { calls.fetch_add(1); });
+ });
+ failing.Release();
+ for (auto& item : work) CHECK_THROWS_AS(mmltk::testsupport::await_test_future(item, "failed stage settlement"), std::bad_alloc);
+ CHECK_THROWS_AS(execution.drain(), std::bad_alloc);
+ CHECK(calls.load() == 0);
+ CHECK(held.bytes() == 40960);
+ held = {};
+ execution.retire_attempt();
+ execution.run(BenchmarkStage::Normalize, {65536, 0}, [](std::size_t) {});
 }
 TEST_CASE("geometry is generation bound before placement and independent of an undecodable body", "[backend][data][benchmark][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("generation-geometry");

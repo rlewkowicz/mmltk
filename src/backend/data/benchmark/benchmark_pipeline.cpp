@@ -188,6 +188,53 @@ struct BenchmarkCompilePipeline::Impl {
   bool done = false, finish_started = false;
   std::exception_ptr failure;
  };
+ // All links and the fallback cursor borrow the same stable Job records.
+ // Mutation and selection share the admission mutex, including withdrawal.
+ class StageReadyQueue {
+ public:
+  [[nodiscard]] const Job* head() const { return head_; }
+  void push(Job& job) {
+   job.next = nullptr;
+   job.previous = tail_;
+   job.queued = true;
+   if (tail_) tail_->next = &job;
+   else head_ = &job;
+   tail_ = &job;
+  }
+  void remove(Job& job) {
+   if (fallback_ == &job) fallback_ = job.next ? job.next : head_;
+   if (job.previous) job.previous->next = job.next; else head_ = job.next;
+   if (job.next) job.next->previous = job.previous; else tail_ = job.previous;
+   if (fallback_ == &job) fallback_ = nullptr;
+   job.next = job.previous = nullptr;
+   job.queued = false;
+  }
+  Job* pop() {
+   auto* job = head_;
+   if (job) remove(*job);
+   return job;
+  }
+  template <class Eligible>
+  Job* take(Eligible eligible) {
+   if (!head_) return nullptr;
+   if (eligible(*head_)) return pop();
+   auto* first = fallback_ && fallback_ != head_ ? fallback_ : head_->next;
+   if (!first) return nullptr;
+   auto* candidate = first;
+   do {
+    // Resume beyond the last successful bypass. The head still gets first
+    // refusal on every selection; a full unsuccessful lap does not notify.
+    fallback_ = candidate->next ? candidate->next : head_->next;
+    if (eligible(*candidate)) { remove(*candidate); return candidate; }
+    candidate = fallback_;
+   } while (candidate != first);
+   return nullptr;
+  }
+ private:
+  Job* head_ = nullptr;
+  Job* tail_ = nullptr;
+  Job* fallback_ = nullptr;
+ };
  struct Source;
  struct Slot {
   Job job;
@@ -308,7 +355,7 @@ struct BenchmarkCompilePipeline::Impl {
  std::shared_ptr<BenchmarkCompilePipeline::Admission> admission = std::make_shared<Admission>();
  std::mutex& mutex = admission->mutex;
  std::condition_variable& changed = admission->changed;
- std::array<Job*, stage_count> heads{}, tails{};
+ std::array<StageReadyQueue, stage_count> ready;
  ImageState images{*this};
  std::size_t cursor = 0, metadata_streak = 0, pending = 0;
  bool membership_pending = true, stopping = false, shutdown = false;
@@ -337,24 +384,13 @@ struct BenchmarkCompilePipeline::Impl {
   if (stopping) throw std::logic_error("benchmark admission after shutdown");
  }
  void push(Job& job) {
-  const auto stage = static_cast<std::size_t>(job.stage);
-  job.next = nullptr;
-  job.previous = tails[stage];
-  job.queued = true;
-  if (tails[stage]) tails[stage]->next = &job;
-  else heads[stage] = &job;
-  tails[stage] = &job;
+  ready[static_cast<std::size_t>(job.stage)].push(job);
   ++admission->generation;
   if (admission->transport_wakeup) admission->transport_wakeup();
  }
  void remove(Job& job) {
-  const auto stage = static_cast<std::size_t>(job.stage);
-  if (job.previous) job.previous->next = job.next; else heads[stage] = job.next;
-  if (job.next) job.next->previous = job.previous; else tails[stage] = job.previous;
-  job.next = job.previous = nullptr;
-  job.queued = false;
+  ready[static_cast<std::size_t>(job.stage)].remove(job);
  }
- Job* pop(std::size_t stage) { auto* job = heads[stage]; remove(*job); return job; }
  Job* fail_group(WorkGroup*, std::exception_ptr, bool withdraw = true);
  void settle(Job&, std::exception_ptr = {}, bool recoverable = false) noexcept;
  void settle_list(Job*, std::exception_ptr) noexcept;
@@ -406,8 +442,8 @@ BenchmarkCompilePipeline::Impl::Job* BenchmarkCompilePipeline::Impl::fail_group(
  if (!withdraw || group->withdrawn) return nullptr;
  group->withdrawn = true;
  Job* detached = nullptr;
- // A failure walks the bounded live membership once. Successful completion and
- // dispatch are O(1); there is no all-members predicate on each wake.
+ // A failure walks the bounded live membership once. Successful completion
+ // unlinks one member; there is no all-members predicate on each wake.
  for (auto* member = group->members; member; member = member->group_next) {
   if (!member->queued || member->independent) continue;
   remove(*member);
@@ -508,7 +544,8 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
    auto& local = lanes[lane];
    if (local.retiring || (wait_for_work && local.active)) return false;
    const bool discard = stopping || failure || cancellation.requested();
-   const bool pressure = admission->waiters || std::ranges::any_of(heads, [&](auto* candidate) {
+   const bool pressure = admission->waiters || std::ranges::any_of(ready, [&](const auto& queue) {
+    const auto* candidate = queue.head();
     if (!candidate || candidate->allowance || admission->fits_bytes(candidate->resources)) return false;
     const void* identity = scratch_owner(*candidate);
     return !identity || std::ranges::none_of(lanes, [&](const auto& value) {
@@ -521,35 +558,35 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
      take_idle(i);
      return true;
    }
-   const auto eligible = [&](std::size_t stage) {
-    const auto* candidate = heads[stage];
-    if (!candidate) return false;
-    const bool cancelled_group = !candidate->independent && candidate->group && candidate->group->withdrawn;
-    const auto* slot = candidate->pixel();
-    if (cancelled_group || (slot && (slot->retiring || slot->source->retiring)) || (discard && !candidate->finish_started)) return true;
+   const auto eligible = [&](const Job& candidate) {
+    const bool cancelled_group = !candidate.independent && candidate.group && candidate.group->withdrawn;
+    const auto* slot = candidate.pixel();
+    if (cancelled_group || (slot && (slot->retiring || slot->source->retiring)) || (discard && !candidate.finish_started)) return true;
     if (admission->active + admission->external_cpus >= cpus.size() + (local.active ? 1 : 0)) return false;
-    const void* identity = scratch_owner(*candidate);
+    const void* identity = scratch_owner(candidate);
     // A cooperative child must not mutate a decoder/parser that an outer frame
     // still borrows, or steal that frame's grant during pressure retirement.
     if (local.owns(identity)) return false;
-    const bool reusable = candidate->stage != BenchmarkStage::Header && identity && local.idle.owner() == identity && Admission::covers(*local.idle.allowance.credits_, candidate->resources);
-    return candidate->allowance || reusable || admission->fits(candidate->resources);
+    const bool reusable = candidate.stage != BenchmarkStage::Header && identity && local.idle.owner() == identity && Admission::covers(*local.idle.allowance.credits_, candidate.resources);
+    return candidate.allowance || reusable || admission->fits(candidate.resources);
    };
-   if (membership_pending && metadata_streak < 2 && eligible(0)) {
-    job = pop(0);
+   const bool prefer_metadata = membership_pending && metadata_streak < 2;
+   if (prefer_metadata) job = ready[0].take(eligible);
+   if (job) {
     ++metadata_streak;
    } else {
     for (std::size_t count = 0; count < stage_count; ++count) {
      const auto stage = (cursor + count) % stage_count;
-     if (!eligible(stage)) continue;
-     job = pop(stage);
+     if (stage == 0 && prefer_metadata) continue;
+     job = ready[stage].take(eligible);
+     if (!job) continue;
      cursor = (stage + 1) % stage_count;
      metadata_streak = 0;
      break;
     }
    }
    if (!job) {
-    if (admission->waiters || std::ranges::any_of(heads, [](auto* head) { return head != nullptr; }))
+    if (admission->waiters || std::ranges::any_of(ready, [](const auto& queue) { return queue.head() != nullptr; }))
      for (std::size_t i = 0; i < lanes.size(); ++i) {
       if (!lanes[i].busy() && lanes[i].idle.owner()) { take_idle(i); return true; }
      }
@@ -686,7 +723,8 @@ std::uint64_t BenchmarkCompilePipeline::transient_target() const noexcept { retu
 std::size_t BenchmarkCompilePipeline::descriptor_limit() const noexcept { return impl_->admission->descriptor_capacity; }
 bool BenchmarkCompilePipeline::resource_pressure() const {
  const std::lock_guard lock(impl_->mutex);
- return impl_->admission->resource_waiters || std::ranges::any_of(impl_->heads, [&](const auto* job) {
+ return impl_->admission->resource_waiters || std::ranges::any_of(impl_->ready, [&](const auto& queue) {
+  const auto* job = queue.head();
   return job && !job->allowance && !impl_->admission->fits_bytes(job->resources);
  });
 }
@@ -1133,9 +1171,8 @@ void BenchmarkCompilePipeline::retire_attempt() noexcept {
  {
   const std::lock_guard lock(impl_->mutex);
   impl_->stopping = true;
-  for (std::size_t stage = 0; stage < stage_count; ++stage) {
-   while (impl_->heads[stage]) {
-    auto* job = impl_->pop(stage);
+  for (auto& queue : impl_->ready) {
+   while (auto* job = queue.pop()) {
     job->next = discarded;
     discarded = job;
    }
