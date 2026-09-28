@@ -157,7 +157,7 @@ public:
    }
   }
  }
- void value(unsigned depth, bool numeric_admission = true) {
+ void value(unsigned depth) {
   if (depth > 16) throw AnnotationDocumentRejected("annotation JSON nesting exceeds admission");
   space();
   const auto token = peek();
@@ -167,7 +167,7 @@ public:
    if (peek() == closing) { take(); return; }
    for (;;) {
     if (token == '{') { (void)string(); space(); expect(':'); }
-    value(depth + 1, numeric_admission); space();
+    value(depth + 1); space();
     if (peek() == closing) { take(); return; }
     expect(','); space();
    }
@@ -181,12 +181,31 @@ public:
   else { if (!digit()) fail(); while (digit()) take(); }
   if (peek() == '.') { take(); if (!digit()) fail(); while (digit()) take(); }
   if (peek() == 'e' || peek() == 'E') { take(); if (peek() == '+' || peek() == '-') take(); if (!digit()) fail(); while (digit()) take(); }
-  if (numeric_admission) {
-   // strtod preserves the document parser's finite-overflow/underflow policy.
-   // The token ends at a structural delimiter in the padded mapping.
-   char* end = nullptr;
-   const auto number = std::strtod(input_.data() + begin, &end);
-   if (end != input_.data() + position || !std::isfinite(number)) fail();
+  // strtod preserves the document parser's finite-overflow/underflow policy.
+  // The token ends at a structural delimiter in the padded mapping.
+  char* end = nullptr;
+  const auto number = std::strtod(input_.data() + begin, &end);
+  if (end != input_.data() + position || !std::isfinite(number)) fail();
+ }
+ // Selected COCONut rows are consumed completely by their owning parser.
+ // Discover only their safe extent here: nesting and quoted delimiters need
+ // no scalar syntax, string decoding, Unicode, or number admission pass.
+ void selected_row() {
+  std::array<char, 15> closing{}; // The root row is already at document depth 2.
+  std::size_t depth = 1;
+  closing[0] = '}';
+  expect('{');
+  bool in_string = false, escaped = false;
+  while (depth) {
+   const auto token = take();
+   if (consume_json_string_token(token, in_string, escaped)) continue;
+   if (token == '{' || token == '[') {
+    if (depth == closing.size()) throw AnnotationDocumentRejected("annotation JSON nesting exceeds admission");
+    closing[depth++] = token == '{' ? '}' : ']';
+   } else if (token == '}' || token == ']') {
+    if (closing[depth - 1] != token) fail();
+    --depth;
+   }
   }
  }
  // Stock discovery historically only balanced structure; row parsers own its
@@ -242,7 +261,7 @@ void discover_json_arrays(const PaddedMappedFile& file, std::span<const std::str
       if (!reject_duplicates && input.peek() == ']') break;
       if (input.peek() != '{') throw AnnotationDocumentRejected("benchmark annotation array contains a non-object value");
       const auto begin = input.position;
-      if (reject_duplicates) input.value(2, false); else input.stock_value();
+      if (reject_duplicates) input.selected_row(); else input.stock_value();
       rows.push_back({begin, input.position});
       input.space(); need_separator = reject_duplicates;
       if (input.peek() == ']') break;

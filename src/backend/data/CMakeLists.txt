@@ -116,6 +116,7 @@ mmltk_register_private_headers(mmltk_backend_data
     benchmark/detail/benchmark_annotations.h
     benchmark/detail/benchmark_archive.h
     benchmark/coconut/detail/coconut_parquet.h
+    benchmark/coconut/detail/coconut_json.h
     benchmark/coconut/detail/coconut_annotations.h
     benchmark/coconut/detail/coconut_physical.h
     benchmark/coconut/detail/coconut_mask_recovery.h

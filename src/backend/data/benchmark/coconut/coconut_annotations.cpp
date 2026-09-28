@@ -1,4 +1,6 @@
 #include "src/backend/data/benchmark/detail/benchmark_json.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_json.h"
+#include <tuple>
 #include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
@@ -81,37 +83,73 @@ const CategoryLookup& coconut_categories() {
 } // namespace
 namespace {
 using Archive = BenchmarkArchive;
+namespace reflection = mmltk::frameworks::reflection;
 struct JsonAtom {
- struct Invalid {};
- using Value = std::variant<std::monostate, std::nullptr_t, bool, std::int64_t, std::uint64_t, double, std::string, Invalid>;
- Value value;
- explicit operator bool() const noexcept { return !std::holds_alternative<std::monostate>(value); }
- bool is_null() const noexcept { return std::holds_alternative<std::nullptr_t>(value); }
- bool is_bool() const noexcept { return std::holds_alternative<bool>(value); }
- bool boolean() const { if (const auto* result = std::get_if<bool>(&value)) return *result; invalid("flag must be boolean or integer"); }
+ bool present = false;
+ std::optional<CoconutJsonScalar> value;
+ void reset() { present = false; value.reset(); }
+ explicit operator bool() const noexcept { return present; }
+ template<class T> const T* get() const noexcept { return value ? std::get_if<T>(&*value) : nullptr; }
+ bool is_null() const noexcept { return get<std::nullptr_t>() != nullptr; }
+ bool is_bool() const noexcept { return get<bool>() != nullptr; }
+ bool boolean() const { if (const auto* result = get<bool>()) return *result; invalid("flag must be boolean or integer"); }
  std::uint64_t unsigned_integer() const {
-  if (const auto* result = std::get_if<std::uint64_t>(&value)) return *result;
-  if (const auto* result = std::get_if<std::int64_t>(&value); result && *result >= 0) return static_cast<std::uint64_t>(*result);
+  if (const auto* result = get<std::uint64_t>()) return *result;
+  if (const auto* result = get<std::int64_t>(); result && *result >= 0) return static_cast<std::uint64_t>(*result);
   invalid("integral field must decode from a nonnegative integer JSON number");
  }
  double number() const {
-  if (const auto* result = std::get_if<double>(&value)) return *result;
-  if (const auto* result = std::get_if<std::uint64_t>(&value)) return static_cast<double>(*result);
-  if (const auto* result = std::get_if<std::int64_t>(&value)) return static_cast<double>(*result);
+  if (const auto* result = get<double>()) return *result;
+  if (const auto* result = get<std::uint64_t>()) return static_cast<double>(*result);
+  if (const auto* result = get<std::int64_t>()) return static_cast<double>(*result);
   invalid("JSON field must be numeric");
  }
- std::string_view text() const { if (const auto* result = std::get_if<std::string>(&value)) return *result; invalid("JSON field must be text"); }
+ std::string_view text() const { if (const auto* result = get<std::string>()) return *result; invalid("JSON field must be text"); }
 };
-template<class T> struct JsonArray { bool present = false, valid = false; std::vector<T> values; };
-struct JsonSegment {
- JsonAtom id, category_id, isthing, iscrowd, ignore, area;
- JsonArray<JsonAtom> bbox;
- bool object = false;
+template<class T> struct JsonArray {
+ bool present = false, valid = false;
+ std::vector<T> values;
+ void reset() { present = valid = false; values.clear(); }
 };
-struct JsonRow {
- JsonAtom id, image_id, file_name, object365_file_name, object365_name, name, width, height;
- JsonArray<JsonSegment> segments_info;
+template<class Shape> class JsonObject;
+template<class Value> struct JsonStorage { using type = JsonObject<Value>; };
+template<> struct JsonStorage<CoconutJsonScalar> { using type = JsonAtom; };
+template<class Value> struct JsonStorage<std::vector<Value>> { using type = JsonArray<typename JsonStorage<Value>::type>; };
+template<class Fields> struct JsonMemberTuple;
+template<class Bases, class... Declaration>
+struct JsonMemberTuple<reflection::MaterializedFieldPolicyProduct<Bases, Declaration...>> {
+ using type = std::tuple<typename JsonStorage<typename Declaration::member_type>::type...>;
+};
+// The two wire declarations project reusable parser storage without reflecting
+// presence/type/object state or retaining unknown values as a DOM.
+template<class Shape> class JsonObject {
+ static_assert(std::same_as<Shape, CoconutJsonRow> || std::same_as<Shape, CoconutJsonSegment>);
+ using Fields = std::remove_cvref_t<decltype(reflection::field_declarations<Shape>())>;
+ typename JsonMemberTuple<Fields>::type fields_;
+public:
  bool object = false;
+ void reset() {
+  object = false;
+  Fields::Visit([&]<class Declaration, std::size_t Index>() { std::get<Index>(fields_).reset(); });
+ }
+ template<auto Member> const auto& get() const {
+  return std::get<reflection::member_index<Member>(reflection::field_declarations<Shape>())>(fields_);
+ }
+ template<class Visitor> void select(std::string_view key, Visitor&& visitor) {
+  bool selected = false;
+  Fields::Visit([&]<class Declaration, std::size_t Index>() {
+   if (!selected && key == reflection::field_declarations<Shape>()[Index].member_name) {
+    visitor(std::get<Index>(fields_));
+    selected = true;
+   }
+  });
+ }
+};
+using JsonSegment = JsonObject<CoconutJsonSegment>;
+using JsonRow = JsonObject<CoconutJsonRow>;
+struct JsonParser {
+ simdjson::ondemand::parser parser;
+ JsonRow row;
 };
 struct JsonConsumption {
  std::size_t events = 0, maximum;
@@ -125,7 +163,7 @@ struct JsonConsumption {
 void consume_json_value(simdjson::ondemand::value value, JsonConsumption& admission, std::size_t depth, JsonAtom* atom = nullptr,
  JsonRow* row = nullptr, JsonSegment* segment = nullptr, JsonArray<JsonSegment>* segments = nullptr, JsonArray<JsonAtom>* coordinates = nullptr) {
  admission.event(depth);
- if (atom) atom->value = JsonAtom::Invalid{};
+ if (atom) { atom->present = true; atom->value.reset(); }
  if (segments) { segments->present = true; segments->valid = false; segments->values.clear(); }
  if (coordinates) { coordinates->present = true; coordinates->valid = false; coordinates->values.clear(); }
  const auto type = value.type().value();
@@ -138,25 +176,13 @@ void consume_json_value(simdjson::ondemand::value value, JsonConsumption& admiss
    JsonAtom* destination = nullptr;
    JsonArray<JsonSegment>* list = nullptr;
    JsonArray<JsonAtom>* box = nullptr;
-   if (row) {
-    if (key == "id") destination = &row->id;
-    else if (key == "image_id") destination = &row->image_id;
-    else if (key == "file_name") destination = &row->file_name;
-    else if (key == "object365_file_name") destination = &row->object365_file_name;
-    else if (key == "object365_name") destination = &row->object365_name;
-    else if (key == "name") destination = &row->name;
-    else if (key == "width") destination = &row->width;
-    else if (key == "height") destination = &row->height;
-    else if (key == "segments_info") list = &row->segments_info;
-   } else if (segment) {
-    if (key == "id") destination = &segment->id;
-    else if (key == "category_id") destination = &segment->category_id;
-    else if (key == "isthing") destination = &segment->isthing;
-    else if (key == "iscrowd") destination = &segment->iscrowd;
-    else if (key == "ignore") destination = &segment->ignore;
-    else if (key == "area") destination = &segment->area;
-    else if (key == "bbox") box = &segment->bbox;
-   }
+   const auto select = [&]<class T>(T& target) {
+    if constexpr (std::same_as<T, JsonAtom>) destination = &target;
+    else if constexpr (std::same_as<T, JsonArray<JsonSegment>>) list = &target;
+    else if constexpr (std::same_as<T, JsonArray<JsonAtom>>) box = &target;
+   };
+   if (row) row->select(key, select);
+   else if (segment) segment->select(key, select);
    consume_json_value(field.value(), admission, depth + 1, destination, nullptr, nullptr, list, box);
   }
   admission.event(depth);
@@ -212,20 +238,20 @@ void segments_from_json(const JsonArray<JsonSegment>& input, CoconutRecord& reco
  for (const auto& value : input.values) {
   if (!value.object) invalid("segment must be an object");
   CoconutSegment segment;
-  const auto id = value.id.unsigned_integer();
+  const auto id = value.get<&CoconutJsonSegment::id>().unsigned_integer();
   if (id == 0 || id > 0xffffffU) invalid("segment ID exceeds RGB24");
   segment.id = static_cast<std::uint32_t>(id);
-  segment.category_id = value.category_id.unsigned_integer();
-  segment.isthing = flag(value.isthing, true);
-  segment.crowd = flag(value.iscrowd); segment.ignore = flag(value.ignore);
-  if (value.area && !value.area.is_null()) {
-   segment.area = value.area.number();
+  segment.category_id = value.get<&CoconutJsonSegment::category_id>().unsigned_integer();
+  segment.isthing = flag(value.get<&CoconutJsonSegment::isthing>(), true);
+  segment.crowd = flag(value.get<&CoconutJsonSegment::iscrowd>()); segment.ignore = flag(value.get<&CoconutJsonSegment::ignore>());
+  if (value.get<&CoconutJsonSegment::area>() && !value.get<&CoconutJsonSegment::area>().is_null()) {
+   segment.area = value.get<&CoconutJsonSegment::area>().number();
    if (!std::isfinite(*segment.area) || *segment.area < 0) invalid("invalid supplied segment area");
   }
-  if (value.bbox.present) {
-   if (!value.bbox.valid || value.bbox.values.size() != 4) invalid("invalid supplied COCO bbox");
+  if (value.get<&CoconutJsonSegment::bbox>().present) {
+   if (!value.get<&CoconutJsonSegment::bbox>().valid || value.get<&CoconutJsonSegment::bbox>().values.size() != 4) invalid("invalid supplied COCO bbox");
    segment.bbox.emplace();
-   for (std::size_t i = 0; i < 4; ++i) (*segment.bbox)[i] = value.bbox.values[i].number();
+   for (std::size_t i = 0; i < 4; ++i) (*segment.bbox)[i] = value.get<&CoconutJsonSegment::bbox>().values[i].number();
   }
   record.segments.push_back(std::move(segment));
  }
@@ -872,7 +898,7 @@ std::uint32_t dimension(const JsonAtom& field, const CoconutImportLimits& limits
  return static_cast<std::uint32_t>(value);
 }
 void json_rows(const CoconutImportRequest& request, const PaddedMappedFile& input, std::span<const ByteRange> rows,
- std::vector<simdjson::ondemand::parser>& parsers, BenchmarkCompilePipeline::Workspace* workspace,
+ std::vector<JsonParser>& parsers, BenchmarkCompilePipeline::Workspace* workspace,
  const std::function<void(const JsonRow&)>& consume, const std::function<void()>& ready = {}) {
  // Source/lane parser capacity survives bounded callbacks under IdleScratch
  // custody. The typed row borrows it only during this synchronous callback.
@@ -880,13 +906,14 @@ void json_rows(const CoconutImportRequest& request, const PaddedMappedFile& inpu
   auto end = first + 1;
   while (end < rows.size() && rows[end].end - rows[first].begin <= (256U << 10)) ++end;
   const auto parse = [&](std::size_t) {
-   auto& parser = parsers[request.execution ? request.execution->current_lane() : 0];
+   auto& storage = parsers[request.execution ? request.execution->current_lane() : 0];
    for (auto i = first; i < end; ++i) {
     throw_if_benchmark_cancelled(request.cancellation);
     const auto range = rows[i];
-    auto document = parser.iterate(simdjson::padded_string_view(input.data() + range.begin, range.end - range.begin, input.capacity_from(range.begin)));
+    auto document = storage.parser.iterate(simdjson::padded_string_view(input.data() + range.begin, range.end - range.begin, input.capacity_from(range.begin)));
     JsonConsumption admission{0, static_cast<std::size_t>(request.limits.max_segments) * 32U + 128U, true};
-    JsonRow row;
+    auto& row = storage.row;
+    row.reset();
     consume_json_value(document.get_value().value(), admission, 2, nullptr, &row);
     if (!row.object) invalid("panoptic row must be an object");
     consume(row);
@@ -915,10 +942,10 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
  std::unordered_map<std::string, std::size_t> by_file, by_physical_stem;
  const auto physical_stem = [](const JsonRow& row) {
   std::string stem;
-  for (const auto* field : {&row.object365_file_name, &row.object365_name, &row.file_name}) {
+  for (const auto* field : {&row.get<&CoconutJsonRow::object365_file_name>(), &row.get<&CoconutJsonRow::object365_name>(), &row.get<&CoconutJsonRow::file_name>()}) {
    if (!*field || field->is_null()) continue;
    const auto name = field->text();
-   if (name.empty() || (field == &row.file_name && !std::filesystem::path(name).filename().string().starts_with("objects365_"))) continue;
+   if (name.empty() || (field == &row.get<&CoconutJsonRow::file_name>() && !std::filesystem::path(name).filename().string().starts_with("objects365_"))) continue;
    const auto parsed = parse_coconut_objects_member(name);
    if (!stem.empty() && stem != parsed.stem) invalid("contradictory declared Objects365 members");
    stem = parsed.stem;
@@ -927,7 +954,7 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
  };
  auto handles = request.execution ? request.execution->reserve(BenchmarkResources::handles(1, true), request.parent_allowance) : BenchmarkAllowance{};
  const PaddedMappedFile input(request.annotation_json);
- std::vector<simdjson::ondemand::parser> parsers(request.execution ? request.execution->workers() : 1);
+ std::vector<JsonParser> parsers(request.execution ? request.execution->workers() : 1);
  std::optional<BenchmarkCompilePipeline::Workspace> parser_workspace;
  if (request.execution) parser_workspace.emplace(*request.execution, [&](std::size_t lane) noexcept { parsers[lane] = {}; });
  auto* workspace = parser_workspace ? &*parser_workspace : nullptr;
@@ -935,24 +962,24 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
  const auto category_row = [&](const JsonRow& row) {
    std::optional<std::uint32_t> id;
    std::optional<std::string> name;
-   if (row.id) id = mmltk::common::math::checked_cast<std::uint32_t>(row.id.unsigned_integer(), "category ID overflow");
-   if (row.name) name = std::string(row.name.text());
+   if (row.get<&CoconutJsonRow::id>()) id = mmltk::common::math::checked_cast<std::uint32_t>(row.get<&CoconutJsonRow::id>().unsigned_integer(), "category ID overflow");
+   if (row.get<&CoconutJsonRow::name>()) name = std::string(row.get<&CoconutJsonRow::name>().text());
    category_admission.observe(id, name ? std::optional<std::string_view>(*name) : std::nullopt);
  };
  const auto image_row = [&](const JsonRow& row) {
   ImageRow image;
-  if (row.id) {
-   image.id = row.id.unsigned_integer();
+  if (row.get<&CoconutJsonRow::id>()) {
+   image.id = row.get<&CoconutJsonRow::id>().unsigned_integer();
    if (!by_id.emplace(*image.id, images.size()).second) invalid("duplicate JSON image ID");
   }
-  if (row.file_name) {
-   image.file_name = std::string(row.file_name.text());
+  if (row.get<&CoconutJsonRow::file_name>()) {
+   image.file_name = std::string(row.get<&CoconutJsonRow::file_name>().text());
    if (!by_file.emplace(image.file_name, images.size()).second) invalid("duplicate JSON image filename");
   }
   image.physical_stem = physical_stem(row);
   if (!image.physical_stem.empty() && !by_physical_stem.emplace(image.physical_stem, images.size()).second) invalid("duplicate JSON physical image: " + image.physical_stem);
-  image.width = dimension(row.width, request.limits);
-  image.height = dimension(row.height, request.limits);
+  image.width = dimension(row.get<&CoconutJsonRow::width>(), request.limits);
+  image.height = dimension(row.get<&CoconutJsonRow::height>(), request.limits);
   images.push_back(std::move(image));
  };
  std::vector<CoconutRecord> result;
@@ -971,12 +998,12 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
    if (image_index && *image_index != found->second) invalid("contradictory JSON image joins: " + record.file_name);
    image_index = found->second;
   };
-  if (annotation.image_id) {
-   record.image_id = annotation.image_id.unsigned_integer();
+  if (annotation.get<&CoconutJsonRow::image_id>()) {
+   record.image_id = annotation.get<&CoconutJsonRow::image_id>().unsigned_integer();
    join(by_id, record.image_id);
   }
-  if (annotation.file_name) {
-   record.file_name = std::string(annotation.file_name.text());
+  if (annotation.get<&CoconutJsonRow::file_name>()) {
+   record.file_name = std::string(annotation.get<&CoconutJsonRow::file_name>().text());
    join(by_file, record.file_name);
   }
   record.physical_stem = physical_stem(annotation);
@@ -986,7 +1013,7 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
    const auto& image = images[*image_index];
    if (joined_images[*image_index]) invalid("multiple annotations join one image row: " + record.file_name);
    joined_images[*image_index] = true;
-   if (image.id && annotation.image_id && *image.id != record.image_id) invalid("annotation/image ID disagreement");
+   if (image.id && annotation.get<&CoconutJsonRow::image_id>() && *image.id != record.image_id) invalid("annotation/image ID disagreement");
    if (!image.physical_stem.empty()) {
     if (!record.physical_stem.empty() && record.physical_stem != image.physical_stem) invalid("contradictory declared Objects365 members");
     record.physical_stem = image.physical_stem;
@@ -995,11 +1022,11 @@ std::vector<CoconutRecord> json_records(const CoconutImportRequest& request) {
    record.height = image.height;
   }
   if (record.physical_stem.empty()) invalid("unresolved offered JSON annotation: " + record.file_name);
-  if (!annotation.image_id) {
+  if (!annotation.get<&CoconutJsonRow::image_id>()) {
    const auto declared_id = image_index ? images[*image_index].id : std::nullopt;
    record.image_id = declared_id ? *declared_id : parse_coconut_objects_member(record.physical_stem).id;
   }
-  segments_from_json(annotation.segments_info, record, request.limits);
+  segments_from_json(annotation.get<&CoconutJsonRow::segments_info>(), record, request.limits);
   if (record.segments.size() > UINT64_MAX - segment_ordinal) invalid("segment ordinal overflow");
   segment_ordinal += record.segments.size();
   result.push_back(std::move(record));

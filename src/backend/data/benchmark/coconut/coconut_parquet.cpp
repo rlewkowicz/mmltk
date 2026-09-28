@@ -7,6 +7,7 @@
 #include "src/common/concurrency/parallel_range.h"
 #include <arrow/memory_pool.h>
 #include <parquet/arrow/reader.h>
+#include <parquet/arrow/schema.h>
 #include <parquet/metadata.h>
 #include <parquet/properties.h>
 #include <parquet/schema.h>
@@ -43,30 +44,88 @@ template<> struct ArrowColumn<std::string> { using type = arrow::StringArray; st
 template<> struct ArrowColumn<std::vector<std::uint8_t>> { using type = arrow::BinaryArray; static constexpr auto id = arrow::Type::BINARY; };
 template<> struct ArrowColumn<std::vector<CoconutParquetSegment>> { using type = arrow::ListArray; static constexpr auto id = arrow::Type::LIST; };
 template<> struct ArrowColumn<std::variant<std::int64_t, double>> { using type = arrow::Array; };
-template<class T> void admit_type(const std::shared_ptr<arrow::DataType>& type, std::string_view name) {
+// Resolved once while the existing reader owns its schema manifest. These
+// indices are immutable shard facts, not a second external-field inventory.
+struct ParquetProjection {
+ std::vector<int> images, masks;
+ int segment_id = -1;
+};
+void append_leaf_columns(const parquet::arrow::SchemaField& field, std::vector<int>& columns) {
+ if (field.is_leaf()) columns.push_back(field.column_index);
+ else for (const auto& child : field.children) append_leaf_columns(child, columns);
+}
+template<class Shape>
+void resolve_fields(std::span<const parquet::arrow::SchemaField>, ParquetProjection&, bool);
+template<class T>
+void resolve_value(const parquet::arrow::SchemaField& field, ParquetProjection& projection, bool image) {
  using Value = reflection::OptionalValueT<T>;
+ if (!field.field) malformed("schema field");
+ const auto& type = field.field->type();
+ const auto& name = field.field->name();
  if constexpr (std::same_as<Value, std::variant<std::int64_t, double>>) {
   if (!type || (type->id() != arrow::Type::INT64 && type->id() != arrow::Type::DOUBLE)) malformed(name);
+ } else if (!type || type->id() != ArrowColumn<Value>::id) malformed(name);
+ if constexpr (std::same_as<Value, std::vector<CoconutParquetSegment>>) {
+  // The Arrow manifest already resolves Parquet's standard and legacy list
+  // wrappers. Their element names are format mechanics, never native fields.
+  if (field.children.size() != 1) malformed(name);
+  resolve_value<CoconutParquetSegment>(field.children.front(), projection, image);
+ } else if constexpr (std::same_as<typename ArrowColumn<Value>::type, arrow::StructArray>) {
+  resolve_fields<Value>(field.children, projection, image);
  } else {
-  if (!type || type->id() != ArrowColumn<Value>::id) malformed(name);
-  if constexpr (ArrowColumn<Value>::id == arrow::Type::STRUCT) {
-   const auto& structure = static_cast<const arrow::StructType&>(*type);
-   reflection::visit_materialized_members<Value>([&]<class Declaration>(const auto& field) {
-    const auto member = structure.GetFieldByName(std::string(field.member_name));
-    if (!member) { if constexpr (!reflection::OptionalValue<typename Declaration::member_type>::value) malformed(field.member_name); }
-    else admit_type<typename Declaration::member_type>(member->type(), field.member_name);
-   });
-  } else if constexpr (std::same_as<Value, std::vector<CoconutParquetSegment>>) {
-   admit_type<CoconutParquetSegment>(static_cast<const arrow::ListType&>(*type).value_type(), name);
-  }
+  if (!field.is_leaf()) malformed(name);
+  (image ? projection.images : projection.masks).push_back(field.column_index);
  }
 }
-void validate_schema(const arrow::Schema& schema) {
- reflection::visit_materialized_members<CoconutParquetRow>([&]<class Declaration>(const auto& field) {
-  const auto value = schema.GetFieldByName(std::string(field.member_name));
-  if (!value) malformed(field.member_name);
-  admit_type<typename Declaration::member_type>(value->type(), field.member_name);
+template<class Shape>
+void resolve_fields(std::span<const parquet::arrow::SchemaField> fields, ParquetProjection& projection, bool image) {
+ using Fields = std::remove_cvref_t<decltype(reflection::field_declarations<Shape>())>;
+ std::array<std::size_t, Fields::size()> matches{};
+ Fields::Visit([&]<class Declaration, std::size_t Index>() {
+  constexpr auto name = reflection::field_declarations<Shape>()[Index].member_name;
+  matches[Index] = std::ranges::count_if(fields, [&](const auto& candidate) { return candidate.field && candidate.field->name() == name; });
+  if constexpr (!reflection::OptionalValue<typename Declaration::member_type>::value)
+   if (matches[Index] != 1) malformed(name);
  });
+ for (const auto& field : fields) {
+  if (!field.field) malformed("schema field");
+  bool selected = false;
+  Fields::Visit([&]<class Declaration, std::size_t Index>() {
+   constexpr auto name = reflection::field_declarations<Shape>()[Index].member_name;
+   if (field.field->name() != name) return;
+   selected = true;
+   if constexpr (reflection::OptionalValue<typename Declaration::member_type>::value) {
+    // Arrow's existing GetFieldByName binding treats an ambiguous optional
+    // name as absent. Keep decoding those columns for structural validation.
+    if (matches[Index] != 1) {
+     append_leaf_columns(field, image ? projection.images : projection.masks);
+     return;
+    }
+   }
+   bool member_image = image;
+   if constexpr (std::same_as<Shape, CoconutParquetRow>)
+    member_image = Index == reflection::member_index<&CoconutParquetRow::image_info>(reflection::field_declarations<Shape>());
+   resolve_value<typename Declaration::member_type>(field, projection, member_image);
+   if constexpr (std::same_as<Shape, CoconutParquetSegment>) {
+    if constexpr (Index == reflection::member_index<&CoconutParquetSegment::id>(reflection::field_declarations<Shape>())) projection.segment_id = field.column_index;
+   }
+  });
+  // Preserve the previous selected-root projection's structural admission of
+  // extra nested columns. Unknown top-level columns remain unselected.
+  if constexpr (!std::same_as<Shape, CoconutParquetRow>)
+   if (!selected) append_leaf_columns(field, image ? projection.images : projection.masks);
+ }
+}
+ParquetProjection resolve_projection(const parquet::arrow::SchemaManifest& manifest) {
+ ParquetProjection result;
+ resolve_fields<CoconutParquetRow>(manifest.schema_fields, result, false);
+ if (result.images.empty() || result.masks.empty() || result.segment_id < 0 || result.segment_id >= manifest.descr->num_columns()) malformed("required nested columns");
+ return result;
+}
+template<auto Member> auto top_level_column(const arrow::RecordBatch& batch) {
+ using Value = std::remove_cvref_t<decltype(std::declval<CoconutParquetRow>().*Member)>;
+ constexpr auto name = reflection::materialized_member_name<Member>();
+ return as<typename ArrowColumn<Value>::type>(batch.GetColumnByName(std::string(name)), ArrowColumn<Value>::id, name);
 }
 template<class Fields> struct BoundColumnTuple;
 template<class Bases, class... Declaration>
@@ -147,7 +206,7 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
  std::uint64_t& row_ordinal, std::uint64_t& segment_ordinal, bool metadata_only, std::span<CoconutRecord> retained) {
  check(batch.Validate());  // Includes nested offsets and value-buffer bounds.
  if (metadata_only) {
-  const auto images = structure(batch.GetColumnByName("image_info"), "image_info");
+  const auto images = top_level_column<&CoconutParquetRow::image_info>(batch);
   const BoundColumns<CoconutParquetImage> image_fields(*images);
   for (std::int64_t row = 0; row < batch.num_rows(); ++row) {
    throw_if_benchmark_cancelled(cancellation);
@@ -160,8 +219,8 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
   }
   return;
  }
- const auto masks = structure(batch.GetColumnByName("mask"), "mask");
- const auto annotations = structure(batch.GetColumnByName("segments_info"), "segments_info");
+ const auto masks = top_level_column<&CoconutParquetRow::mask>(batch);
+ const auto annotations = top_level_column<&CoconutParquetRow::segments_info>(batch);
  const BoundColumns<CoconutParquetMask> mask_fields(*masks);
  const BoundColumns<CoconutParquetAnnotation> annotation_fields(*annotations);
  const auto bytes = mask_fields.get<&CoconutParquetMask::bytes>();
@@ -285,7 +344,7 @@ struct ParquetReaderDescriptors {
 }  // namespace
 class CoconutParquetMetadata final {
 public:
- struct Shard { std::filesystem::path path; std::shared_ptr<ParquetPool> pool; std::shared_ptr<parquet::FileMetaData> footer; };
+ struct Shard { std::filesystem::path path; std::shared_ptr<ParquetPool> pool; std::shared_ptr<parquet::FileMetaData> footer; ParquetProjection projection; };
  struct Group { std::size_t shard; int group; };
  bool metadata_ready = false;
  std::vector<Shard> shards;
@@ -321,9 +380,10 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    ParquetReaderDescriptors retire_reader{allowance};
    std::unique_ptr<parquet::arrow::FileReader> reader;
    std::shared_ptr<parquet::FileMetaData> footer;
+   ParquetProjection projection;
    const auto discover = [&](std::size_t) {
     reader = open_reader(path, *pool);
-    std::shared_ptr<arrow::Schema> schema; check(reader->GetSchema(&schema)); validate_schema(*schema);
+    projection = resolve_projection(reader->manifest());
     footer = reader->parquet_reader()->metadata();
     for (int group = 0; group < reader->num_row_groups(); ++group) {
      const auto count = footer->RowGroup(group)->num_rows();
@@ -342,7 +402,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
     auto backing = held ? allowance.split_storage(held) : BenchmarkAllowance{};
     allowance.retire_descriptors(); allowance.retire_workspace(); pool->allowance = std::move(backing);
    }
-   catalog->shards.push_back({path, std::move(pool), std::move(footer)});
+   catalog->shards.push_back({path, std::move(pool), std::move(footer), std::move(projection)});
   }
   retained->records.resize(mmltk::common::math::checked_cast<std::size_t>(rows, "COCONut Parquet row count overflow"));
   retained->parquet = std::move(catalog);
@@ -420,14 +480,12 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
        scratch = std::max(scratch, consumer_workspace(retained->records[static_cast<std::size_t>(row)]));
       // The producer promise covers every possible allocation of the capped
       // reader and the largest admitted image in this group, not import limits.
-      std::uint64_t segment_values = checked_multiply(group.rows, std::uint64_t{limits.max_segments}, "COCONut Parquet segment bound overflow");
-      for (int column = 0; column < shard.footer->num_columns(); ++column)
-       if (shard.footer->schema()->Column(column)->path()->ToDotString().ends_with("segments_info.list.element.id")) {
-        const auto count = shard.footer->RowGroup(position.group)->ColumnChunk(column)->num_values();
-        if (count < 0) malformed("negative segment value count");
-        segment_values = static_cast<std::uint64_t>(count);
-       }
-      const auto batch_segments = image_pass ? 0 : std::min(segment_values, checked_multiply(std::min<std::uint64_t>(8, group.rows), std::uint64_t{limits.max_segments}, "COCONut Parquet segment bound overflow"));
+      std::uint64_t batch_segments = 0;
+      if (!image_pass) {
+       const auto count = shard.footer->RowGroup(position.group)->ColumnChunk(shard.projection.segment_id)->num_values();
+       if (count < 0) malformed("negative segment value count");
+       batch_segments = std::min(static_cast<std::uint64_t>(count), checked_multiply(std::min<std::uint64_t>(8, group.rows), std::uint64_t{limits.max_segments}, "COCONut Parquet segment bound overflow"));
+      }
       const auto typed = checked_add(checked_multiply(batch_segments, std::uint64_t{sizeof(CoconutSegment)}, "COCONut Parquet typed batch overflow"), 128ULL << 10, "COCONut Parquet row metadata overflow");
       bytes = checked_add(scratch, typed, "COCONut Parquet batch workspace overflow");
      };
@@ -447,12 +505,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
       sequence.shard = position.shard;
      }
      auto& reader = sequence.reader;
-     std::vector<int> columns;
-     for (int i = 0; i < shard.footer->num_columns(); ++i) {
-      const auto field = shard.footer->schema()->Column(i)->path()->ToDotString();
-      if ((image_pass && field.starts_with("image_info.")) || (!image_pass && (field.starts_with("mask.") || field.starts_with("segments_info.")))) columns.push_back(i);
-     }
-     if (columns.empty()) malformed("required nested columns");
+     const auto& columns = image_pass ? shard.projection.images : shard.projection.masks;
      std::unique_ptr<arrow::RecordBatchReader> batches;
      cpu([&] { batches = take(reader->GetRecordBatchReader({position.group}, columns)); });
      auto row_ordinal = group.first_row;

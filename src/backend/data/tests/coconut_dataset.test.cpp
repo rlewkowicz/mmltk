@@ -161,7 +161,8 @@ void append_value(arrow::ArrayBuilder& builder, const Json& value) {
   default: throw std::runtime_error("unsupported fixture type");
  }
 }
-void parquet_file(const std::filesystem::path& path, const Json& rows, std::shared_ptr<arrow::Schema> schema = hf_schema(), parquet::Compression::type codec = parquet::Compression::SNAPPY) {
+void parquet_file(const std::filesystem::path& path, const Json& rows, std::shared_ptr<arrow::Schema> schema = hf_schema(), parquet::Compression::type codec = parquet::Compression::SNAPPY,
+ std::int64_t group_rows = 1, std::shared_ptr<parquet::ArrowWriterProperties> arrow_properties = parquet::default_arrow_writer_properties()) {
  std::vector<std::shared_ptr<arrow::Array>> columns;
  for (const auto& field : schema->fields()) {
   std::unique_ptr<arrow::ArrayBuilder> builder;
@@ -174,7 +175,7 @@ void parquet_file(const std::filesystem::path& path, const Json& rows, std::shar
  auto output = arrow_value(arrow::io::FileOutputStream::Open(path.string()));
  parquet::WriterProperties::Builder properties;
  properties.compression(codec);
- arrow_ok(parquet::arrow::WriteTable(*arrow::Table::Make(schema, columns), arrow::default_memory_pool(), output, 1, properties.build()));
+ arrow_ok(parquet::arrow::WriteTable(*arrow::Table::Make(schema, columns), arrow::default_memory_pool(), output, group_rows, properties.build(), std::move(arrow_properties)));
  arrow_ok(output->Close());
 }
 Json hf_row(unsigned id, std::string encoded, Json segments, int width = 3, int height = 3, std::string_view physical_source = "train2017") {
@@ -413,7 +414,14 @@ TEST_CASE("COCONut Parquet rejects malformed nested records missing membership a
  input.parquet_shards = {root.path() / "a.parquet"};
  input.expected_rows = 1;
  SECTION("null image metadata") { row["image_info"] = nullptr; }
+ SECTION("null required unused image license") { row["image_info"]["license"] = nullptr; }
+ SECTION("null required unused image date") { row["image_info"]["date_captured"] = nullptr; }
  SECTION("null required segment ID") { row["segments_info"]["segments_info"][0]["id"] = nullptr; }
+ SECTION("null optional present flag") { row["segments_info"]["segments_info"][0]["iscrowd"] = nullptr; }
+ SECTION("null segment struct") { row["segments_info"]["segments_info"][0] = nullptr; }
+ SECTION("null segment list") { row["segments_info"]["segments_info"] = nullptr; }
+ SECTION("null annotation struct") { row["segments_info"] = nullptr; }
+ SECTION("null mask struct") { row["mask"] = nullptr; }
  SECTION("mismatched release IDs") { row["segments_info"]["image_id"] = 8; }
  SECTION("unknown thing category") { row["segments_info"]["segments_info"][0]["category_id"] = 12; }
  SECTION("contradictory dimensions") { row["image_info"]["width"] = 4; }
@@ -5239,6 +5247,72 @@ TEST_CASE("panoptic projection preserves document and consumed-row admission lim
  else CHECK_THROWS(import_coconut_annotations(input));
 }
 
+TEST_CASE("panoptic rows consume unknown values and retain exact last-value semantics", "[benchmark][coconut][annotations]") {
+ ScopedTempDir root("panoptic-value-admission");
+ const std::array physical{objects(7)};
+ auto input = request(physical, CoconutEdition::Large);
+ input.metadata_only = true; input.annotation_json = root.path() / "annotations.json";
+ input.records = std::make_shared<CoconutAnnotationRecords>();
+ std::string extra;
+ bool valid = false;
+ SECTION("escaped nested names and valid unknown values") {
+  extra = R"("unknown":{"text":"\uD834\uDD1E","values":[null,false,-12.5,18446744073709551616]} ,)";
+  valid = true;
+ }
+ SECTION("unknown string escape") { extra = R"("unknown":"\q",)"; }
+ SECTION("unknown unpaired surrogate") { extra = R"("unknown":"\uD834",)"; }
+ SECTION("unknown raw UTF-8") { extra = "\"unknown\":\"" + std::string("\xc0\xaf") + "\","; }
+ SECTION("unknown raw control character") { extra = "\"unknown\":\"bad\ntext\","; }
+ SECTION("unknown overflowing number") { extra = R"("unknown":1e9999,)"; }
+ SECTION("unknown leading zero") { extra = R"("unknown":01,)"; }
+ SECTION("unknown truncated fraction") { extra = R"("unknown":1.,)"; }
+ SECTION("unknown malformed literal") { extra = R"("unknown":tru,)"; }
+ SECTION("unknown missing array separator") { extra = R"("unknown":[true false],)"; }
+ SECTION("unknown trailing array comma") { extra = R"("unknown":[1,],)"; }
+ SECTION("unknown trailing object comma") { extra = R"("unknown":{"a":1,},)"; }
+ SECTION("unknown mismatched delimiter") { extra = R"("unknown":{"a":1],)"; }
+ SECTION("selected value with invalid syntax cannot be superseded") { extra = R"("image_id":01,)"; }
+ SECTION("escaped unknown key is consumed") { extra = R"("\uD800":null,)"; }
+ SECTION("unknown selected-row depth") {
+  extra = "\"unknown\":" + std::string(16, '[') + "0" + std::string(16, ']') + ",";
+ }
+ SECTION("invalid shapes and nulls can be superseded") { extra = R"("image_id":{},"segments_info":null,)"; valid = true; }
+ const std::string image = R"({"id":[],"\u0069d":7,"width":"bad","width":2,"height":1,"file_name":"objects365_v2_00000007.jpg"})";
+ const std::string annotation = "{" + extra + R"("image_id":7,"file_name":"objects365_v2_00000007.png","segments_info":[{"id":false,"\u0069d":1,"category_id":1,"isthing":null,"isthing":true,"iscrowd":{},"iscrowd":1,"ignore":[],"ignore":false,"bbox":{},"bbox":[0,0,2,1],"area":18446744073709551616}]})";
+ mmltk::testsupport::write_text_file(input.annotation_json, "{\"categories\":" + category_catalog().dump() + ",\"images\":[" + image + "],\"annotations\":[" + annotation + "]}");
+ if (!valid) { CHECK_THROWS(import_coconut_annotations(input)); return; }
+ const auto components = import_coconut_annotations(input);
+ REQUIRE(components.size() == 1);
+ REQUIRE(input.records->records.size() == 1);
+ const auto& record = input.records->records[0];
+ CHECK(record.image_id == 7); CHECK(record.width == 2); CHECK(record.height == 1);
+ REQUIRE(record.segments.size() == 1);
+ const auto& value = record.segments[0];
+ CHECK(value.id == 1); CHECK(value.category_id == 1); CHECK(value.isthing); CHECK(value.crowd); CHECK_FALSE(value.ignore);
+ REQUIRE(value.area); CHECK(*value.area == 18446744073709551616.0);
+ const std::array<double, 4> bounds{0, 0, 2, 1};
+ REQUIRE(value.bbox); CHECK(*value.bbox == bounds);
+}
+
+TEST_CASE("XL segment projection retains its distinct text and nesting policy", "[benchmark][coconut][annotations]") {
+ ScopedTempDir root("xl-value-admission");
+ const std::array physical{objects(7)};
+ auto input = request(physical, CoconutEdition::XLarge);
+ input.metadata_only = true; input.mask_archive = root.path() / "annotations.tar";
+ input.records = std::make_shared<CoconutAnnotationRecords>();
+ Json ignored = std::string(4097, 'x');
+ for (int i = 0; i < 18; ++i) ignored = Json::array({std::move(ignored)});
+ auto value = segment();
+ value["unknown"] = std::move(ignored);
+ const std::array<std::pair<std::string, std::string>, 1> entries{{{"coconuts_xlarge/panseg_info/objects365_v2_00000007.json", Json::array({value}).dump()}}};
+ tar(input.mask_archive, entries);
+ const auto components = import_coconut_annotations(input);
+ REQUIRE(components.size() == 1);
+ REQUIRE(input.records->records.size() == 1);
+ REQUIRE(input.records->records[0].segments.size() == 1);
+ CHECK(input.records->records[0].segments[0].id == 1);
+}
+
 TEST_CASE("Parquet binding admits optional fields and rejects required schema during membership", "[benchmark][coconut][parquet]") {
  ScopedTempDir root("parquet-bound-fields");
  const std::array<std::uint32_t, 1> pixels{1};
@@ -5268,6 +5342,84 @@ TEST_CASE("Parquet binding admits optional fields and rejects required schema du
    REQUIRE(record.segments.size() == 1); CHECK_FALSE(record.segments[0].crowd); CHECK_FALSE(record.segments[0].ignore);
   });
  } else CHECK_THROWS(read_coconut_parquet(paths, {}, {}, [](std::size_t, const CoconutRecord&, const CoconutAnnotationInput&) {}, true));
+}
+
+TEST_CASE("Parquet projections retain reordered nested fields and list encodings across batches", "[benchmark][coconut][parquet]") {
+ bool legacy_list = false, integer_area = false;
+ SECTION("standard list element and floating area") {}
+ SECTION("external list element name and integer area") { legacy_list = integer_area = true; }
+ ScopedTempDir root("parquet-projected-batches");
+ const std::array<std::uint32_t, 1> pixels{1};
+ const auto encoded = png(1, 1, pixels);
+ auto segment_fields = static_cast<const arrow::StructType&>(*segment_type(integer_area)).fields();
+ segment_fields.push_back(arrow::field("ignore", arrow::int64()));
+ segment_fields.push_back(arrow::field("extra", arrow::utf8()));
+ std::ranges::reverse(segment_fields);
+ auto fields = hf_schema(integer_area)->fields();
+ auto annotation_fields = static_cast<const arrow::StructType&>(*fields[1]->type()).fields();
+ annotation_fields[2] = arrow::field("segments_info", arrow::list(arrow::field("segment_entry", arrow::struct_(segment_fields))));
+ std::ranges::reverse(annotation_fields);
+ fields[1] = arrow::field("segments_info", arrow::struct_(annotation_fields));
+ auto image_fields = static_cast<const arrow::StructType&>(*fields[2]->type()).fields();
+ image_fields.push_back(arrow::field("extra", arrow::utf8()));
+ std::ranges::reverse(image_fields);
+ fields[2] = arrow::field("image_info", arrow::struct_(image_fields));
+ auto mask_fields = static_cast<const arrow::StructType&>(*fields[0]->type()).fields();
+ std::ranges::reverse(mask_fields);
+ fields[0] = arrow::field("mask", arrow::struct_(mask_fields));
+ fields.push_back(arrow::field("unselected", arrow::utf8()));
+ std::ranges::reverse(fields);
+ Json rows = Json::array();
+ std::vector<std::uint64_t> prefixes;
+ std::uint64_t prefix = 0;
+ for (unsigned row = 0; row < 25; ++row) {
+  prefixes.push_back(prefix);
+  Json segments = Json::array();
+  for (unsigned i = 0; i < row % 4; ++i) {
+   auto value = segment(i + 1, i == 0 ? 200 : 1, i != 0);
+   value["ignore"] = 1; value["extra"] = "kept in the nested projection";
+   if (i != 0) value["area"] = integer_area ? 5.0 : 2.5;
+   segments.push_back(std::move(value));
+   ++prefix;
+  }
+  auto value = hf_row(row + 1, encoded, std::move(segments), 1, 1);
+  value["image_info"]["extra"] = "not a native field";
+  value["unselected"] = "not an image or mask column";
+  if (row % 2) value["mask"]["path"] = "external-mask.png";
+  rows.push_back(std::move(value));
+ }
+ parquet::ArrowWriterProperties::Builder properties;
+ if (legacy_list) properties.disable_compliant_nested_types();
+ const std::array paths{root.path() / "records.parquet"};
+ parquet_file(paths[0], rows, arrow::schema(fields), parquet::Compression::SNAPPY, 12, properties.build());
+ CoconutAnnotationRecords retained;
+ std::size_t observed = 0;
+ const auto membership = [&](std::size_t, const CoconutRecord& record, const CoconutAnnotationInput& input) {
+  REQUIRE(input.membership); CHECK(record.image_id == ++observed); CHECK(record.width == 1); CHECK(record.height == 1);
+ };
+ read_coconut_parquet(paths, {}, {}, membership, true, nullptr, {}, {}, {}, &retained);
+ REQUIRE(observed == 25); REQUIRE(retained.groups.size() == 3);
+ const auto hidden = root.path() / "retained-only.parquet";
+ std::filesystem::rename(paths[0], hidden);
+ observed = 0;
+ read_coconut_parquet(paths, {}, {}, membership, true, nullptr, {}, {}, {}, &retained);
+ CHECK(observed == 25);
+ std::filesystem::rename(hidden, paths[0]);
+ observed = 0;
+ read_coconut_parquet(paths, {}, {}, [&](std::size_t group, const CoconutRecord& record, const CoconutAnnotationInput& input) {
+  CHECK_FALSE(input.membership); CHECK(record.source_ordinal == observed); CHECK(record.image_id == ++observed);
+  CHECK(group == record.source_ordinal / 12);
+  CHECK(record.segments.size() == record.source_ordinal % 4);
+  CHECK(std::string(input.png.begin(), input.png.end()) == encoded);
+  for (std::size_t i = 0; i < record.segments.size(); ++i) {
+   CHECK(record.segments[i].id == i + 1); CHECK(record.segments[i].ignore);
+   CHECK(record.segments[i].isthing == (i != 0));
+   if (!i) CHECK_FALSE(record.segments[i].area);
+   else { REQUIRE(record.segments[i].area); CHECK(*record.segments[i].area == (integer_area ? 5.0 : 2.5)); }
+  }
+ }, false, nullptr, {}, {}, {}, &retained);
+ CHECK(observed == 25);
+ for (std::size_t row = 0; row < retained.records.size(); ++row) CHECK(retained.records[row].first_segment_ordinal == prefixes[row]);
 }
 
 TEST_CASE("independent Parquet groups seal identical artifacts across shared CPU counts", "[benchmark][coconut][parquet][pipeline]") {
@@ -5315,10 +5467,11 @@ TEST_CASE("Parquet segment prefixes include declared groups and reject unreprese
 }
 
 TEST_CASE("panoptic JSON publishes physical facts before unrelated envelope tails", "[benchmark][coconut][annotations][pipeline]") {
- bool reversed = false, malformed = false, duplicate = false, cancel = false;
+ bool reversed = false, malformed = false, duplicate = false, cancel = false, malformed_row = false;
  SECTION("ready arrays precede valid ignored tail") {}
  SECTION("reversed arrays and escaped selected field") { reversed = true; }
  SECTION("malformed ignored tail follows ready facts") { malformed = true; }
+ SECTION("malformed later selected row follows a bounded ready batch") { malformed_row = true; }
  SECTION("duplicate selected field follows ready facts") { duplicate = true; }
  SECTION("pixel completion cancels unread tail") { cancel = true; }
  ScopedTempDir root("json-incremental-physical");
@@ -5348,11 +5501,15 @@ TEST_CASE("panoptic JSON publishes physical facts before unrelated envelope tail
  input.metadata_only = true; input.annotation_json = root.path() / "annotations.json"; input.physical_membership = &physical;
  const std::string categories = "\"categories\":" + category_catalog().dump();
  const std::string images = R"("\u0069mages":[{"id":3,"width":3,"height":3,"file_name":"objects365_v2_00000003.jpg"}])";
- const std::string annotations = R"("annotations":[{"image_id":3,"file_name":"objects365_v2_00000003.png","segments_info":[]}])";
+ std::string annotations = R"("annotations":[{"image_id":3,"file_name":"objects365_v2_00000003.png","segments_info":[]}])";
+ if (malformed_row) {
+  Json row{{"image_id", 3}, {"file_name", "objects365_v2_00000003.png"}, {"segments_info", Json::array()}, {"unknown", std::vector<std::string>(65, std::string(4096, 'x'))}};
+  annotations = "\"annotations\":[" + row.dump() + R"(,{"unknown":1e9999}])";
+ }
  const auto prefix = "{" + (reversed ? annotations + "," + images + "," + categories : categories + "," + images + "," + annotations);
  const auto tail = ",\"ignored\":\"" + std::string(2U << 20, 'x') + (malformed ? "" : "\"") + (duplicate ? ",\"images\":[]}" : malformed ? "" : "}");
  mmltk::testsupport::write_text_file(input.annotation_json, prefix + tail);
- if (malformed || duplicate || cancel) CHECK_THROWS(import_coconut_annotations(input));
+ if (malformed || duplicate || cancel || malformed_row) CHECK_THROWS(import_coconut_annotations(input));
  else {
   const auto result = import_coconut_annotations(input);
   REQUIRE(result.size() == 1); REQUIRE(result[0].inventory().size() == 1);
