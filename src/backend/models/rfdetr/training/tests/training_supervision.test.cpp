@@ -89,9 +89,7 @@ struct TargetScratchTestAccess final {
  static auto CopyState(const TargetScratch& owner) {
   return std::tuple{owner.active_staging_slot_, owner.device_slots_used_, owner.consumers_pending_, owner.staging_slots_[owner.active_staging_slot_].consumers_pending};
  }
- static cudaError_t ConsumerStatus(const TargetScratch& owner, std::size_t slot) {
-  return cudaEventQuery(reinterpret_cast<cudaEvent_t>(owner.staging_slots_.at(slot).consumers_retired_event));
- }
+ static cudaError_t ConsumerStatus(const TargetScratch& owner, std::size_t slot) { return cudaEventQuery(reinterpret_cast<cudaEvent_t>(owner.staging_slots_.at(slot).consumers_retired_event)); }
 };
 struct GpuBatchAugmenterTestAccess final {
  static inline std::size_t image_uploads = 0, metadata_uploads = 0, image_bytes = 0;
@@ -2711,7 +2709,8 @@ TEST_CASE("Target slots prime independent uploads and protect delayed backward i
  REQUIRE(second.all_boxes.data_ptr() != first_storage);
  // The second slot's DMA physically completes while backward still holds slot 0.
  const auto copy_state = rfdetr::test_support::TargetScratchTestAccess::CopyState(scratch);
- CAPTURE(prior_copy_status, available_slot_status, std::get<0>(copy_state), std::get<1>(copy_state), std::get<2>(copy_state), std::get<3>(copy_state), copy_stream, ambient_stream, consumer.stream(), cudaStreamQuery(copy_stream));
+ CAPTURE(prior_copy_status, available_slot_status, std::get<0>(copy_state), std::get<1>(copy_state), std::get<2>(copy_state), std::get<3>(copy_state), copy_stream, ambient_stream, consumer.stream(),
+  cudaStreamQuery(copy_stream));
  std::atomic<unsigned> wait_stage{0};
  auto pending_copy = std::async(std::launch::async, [&] {
   wait_stage.store(1);

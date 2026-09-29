@@ -577,7 +577,8 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      if (!envelope.full()) sequence.close_projection();
      sequence.ensure(0, envelope.full(), true, true);
      for (auto row = group.first_row; row < group.first_row + group.rows; ++row)
-      consumer(group_index, retained->record(static_cast<std::size_t>(row)), CoconutAnnotationInput{{}, sequence.allowance, sequence.pool, sequence.live_bytes(), true});
+      consumer(group_index, retained->record(static_cast<std::size_t>(row)),
+       CoconutAnnotationInput{{}, sequence.allowance, sequence.pool, sequence.live_bytes(), true, [&] { sequence.close_projection(); }});
      if (finish_consumer_group) finish_consumer_group(group_index);
      return;
     }
@@ -596,8 +597,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      }
     // The native reuse callback resolves current physical membership before
     // mask allocation. Its immutable join now survives physical reader closure.
-    if (!image_pass && reusable_native && retire_consumer_input && (!sequence.active || sequence.physical))
-     retire_consumer_input(sequence.active ? sequence.allowance : parent);
+    if (!image_pass && reusable_native && retire_consumer_input && (!sequence.active || sequence.physical)) retire_consumer_input(sequence.active ? sequence.allowance : parent);
     if (!image_pass && !png_needed) {
      // No Arrow input is opened for a completely reusable group. Retained rows
      // still enter the real duplicate/row-count/progress consumer exactly once.
@@ -676,7 +676,8 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
       sequence.ensure(0, false, true, true);
      }
      for (auto row = group.first_row; row < group.first_row + group.rows; ++row)
-      consumer(group_index, retained->record(row), CoconutAnnotationInput{{}, sequence.allowance, sequence.pool, sequence.live_bytes(), true});
+      consumer(group_index, retained->record(row),
+       CoconutAnnotationInput{{}, sequence.allowance, sequence.pool, sequence.live_bytes(), true, [&] { sequence.close_projection(); }});
     }
     retire.finish();
     // A ready independent recovery batch cannot borrow an arbitrary callback's

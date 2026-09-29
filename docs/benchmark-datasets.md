@@ -235,7 +235,8 @@ Its sampling and permitted quarantine still determine final membership.
 COCONut metadata and physical resolution progress while optional originals or
 another release's masks remain pending. Train and validation originals publish
 independently; pending train recovery leaves B's unlabeled images runnable.
-Large-over-XL reconciliation remains a real membership dependency.
+Canonical membership is published independently of deferred original-mask
+recovery. Large-over-XL reconciliation remains a real membership dependency.
 
 Image publications capture source generation, attempt, and mutation custody.
 Before placement is known, the pipeline retains compact header/file facts or
@@ -279,6 +280,13 @@ Open Images parses CSV rows once, with image ordering checked across chunks.
 COCONut JSON retains parsed rows and physical joins across subsequent mask
 work and compatible repair. Sparse mask operations use intervals/RLE; RGB ID
 PNG normalization still reads the decoded pixels needed to establish support.
+Production imports discover records and normalize ready masks in the same
+release worker. JSON chunks and Parquet row groups can normalize before later
+records are parsed; XL consumes ready record/mask pairs while discovering its
+archive. PNG headers supply actual dimensions for archive normalization scratch.
+Uncompressed USTAR members support direct revisits; out-of-order compressed
+or context-dependent members share one ordered remainder traversal instead of
+replaying their archive prefix per annotation.
 
 Parquet binds external fields from the
 [canonical declarations](../src/backend/data/benchmark/coconut/detail/coconut_parquet.h).
@@ -288,8 +296,9 @@ later projections read missing segments/PNGs, skip reused fields, and omit
 payload reads for completely reusable groups. Each range keeps a forward
 Arrow reader and physical continuation across compatible groups. Resource
 pressure can close/reacquire readers without reparsing retained rows; physical
-archive prefixes may need replay. Borrowed PNG spans retain their record batch
-and its complete allocation pool after a reader closes.
+archive prefixes may need replay. A contended physical-source lock also lets
+settled metadata retire its Arrow projection before waiting. Borrowed PNG spans
+retain their record batch and its complete allocation pool after a reader closes.
 
 Completion order never supplies semantic order:
 
@@ -314,7 +323,7 @@ a stable allocation window; borrowers and their scratch settle before that
 reader allocates again. Idle oversized scratch yields under pressure.
 
 The private transient scheduling target is
-`min(2 GiB, max(256 MiB, 64 MiB × CPU count))`. It is neither a process-memory
+`min(6 GiB, max(256 MiB, 64 MiB × CPU count))`. It is neither a process-memory
 cap nor a public tuning option. A legal oversized operation can run without
 competing transient users and finish its dependent consumers. Canonical
 metadata, originals, normalized/native products, and final labels remain
@@ -494,9 +503,16 @@ the GUI and CLI format the same typed facts for their respective displays.
 | Pixels | Successfully compiled image slots across train and validation, retaining compatible completed work through preparation retries |
 
 Label totals can grow when final plans become known; they are work units, not
-image counts or a time estimate. COCONut metadata-only preparation does not
-count full-import rows a second time. Directory compilation marks Acquisition
-as unnecessary, with known zero completed and total work; its labels and pixels
+image counts or a time estimate. Explicit COCONut metadata-only imports do not
+count normalization work a second time.
+Source activity reports parsed image/annotation rows and resolved source images.
+XL also reports annotation-archive entries before its first JSON record arrives.
+Long physical-archive searches report the requested image, artifact, and actual
+archive cursor. These updates can advance before the first normalized row;
+they do not increment the Labels/masks completion count. Normalization reports
+its first completed row, then bounded batches and the exact final count.
+Directory compilation marks Acquisition as unnecessary, with known zero
+completed and total work; its labels and pixels
 each count completed images. A completed acquisition track can coexist with
 active labels and pixels. All three completing still leaves validation, sync,
 and atomic publication to settle before the operation succeeds.

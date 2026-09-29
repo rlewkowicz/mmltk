@@ -672,9 +672,18 @@ TEST_CASE("COCONut archives reject invalid consumed members and ignore unused ta
  std::vector<std::pair<std::string, std::string>> members{{"panoptic_object365/objects365_v2_00000001.png", mask}};
  bool link = false, unused_tail = false;
  SECTION("missing mask") { members.clear(); }
- SECTION("unused extra mask") { members.emplace_back("panoptic_object365/objects365_v2_00000002.png", mask); unused_tail = true; }
- SECTION("unused duplicate mask") { members.push_back(members.front()); unused_tail = true; }
- SECTION("unused traversal") { members.emplace_back("../outside", "x"); unused_tail = true; }
+ SECTION("unused extra mask") {
+  members.emplace_back("panoptic_object365/objects365_v2_00000002.png", mask);
+  unused_tail = true;
+ }
+ SECTION("unused duplicate mask") {
+  members.push_back(members.front());
+  unused_tail = true;
+ }
+ SECTION("unused traversal") {
+  members.emplace_back("../outside", "x");
+  unused_tail = true;
+ }
  SECTION("symlink") { link = true; }
  SECTION("duplicate offered annotation") { document["annotations"].push_back(annotation); }
  SECTION("unknown physical namespace") { document["annotations"][0]["file_name"] = "00000001.png"; }
@@ -1723,14 +1732,19 @@ TEST_CASE("COCONut normalization observations are bounded with exact unknown-tot
  parquet_file(input.parquet_shards[0], rows);
  std::vector<std::uint64_t> observed;
  input.progress = [&](auto value) { observed.push_back(value); };
+ std::map<CoconutPreparationStage, std::vector<std::uint64_t>> preparation;
+ input.preparation_progress = [&](auto stage, auto count) { preparation[stage].push_back(count); };
  unsigned report_terminals = 0;
  input.image_terminal = [&] { ++report_terminals; };
  REQUIRE(import_coconut_annotations(input).front().index().image_count() == 130);
- CHECK(observed == std::vector<std::uint64_t>{0, 64, 128, 130});
+ CHECK(observed == std::vector<std::uint64_t>{0, 1, 64, 128, 130});
  CHECK(report_terminals == 0);
  SECTION("healthy metadata rows have no report settlement") {
+  preparation.clear();
   input.metadata_only = true;
   REQUIRE(import_coconut_annotations(input).front().index().image_count() == 130);
+  CHECK(preparation.at(CoconutPreparationStage::Annotations) == std::vector<std::uint64_t>{1, 64, 128});
+  CHECK(preparation.at(CoconutPreparationStage::Membership) == std::vector<std::uint64_t>{1, 64, 128, 130});
   CHECK(report_terminals == 0);
  }
  SECTION("disabled observation installs no callback") {
@@ -1738,6 +1752,7 @@ TEST_CASE("COCONut normalization observations are bounded with exact unknown-tot
   ProgressReporter reporter({}, silent);
   CHECK_FALSE(reporter.normalization_observer_enabled());
   input.progress = {};
+  input.preparation_progress = {};
   observed.clear();
   REQUIRE(import_coconut_annotations(input).front().index().image_count() == 130);
   CHECK(observed.empty());
@@ -1758,7 +1773,7 @@ TEST_CASE("COCONut normalization observations are bounded with exact unknown-tot
    if (value == 64) stop.armed = true;
   };
   CHECK_THROWS(import_coconut_annotations(input));
-  CHECK(observed == std::vector<std::uint64_t>{0, 64});
+  CHECK(observed == std::vector<std::uint64_t>{0, 1, 64});
  }
 }
 namespace {
@@ -2113,8 +2128,8 @@ TEST_CASE("one physical admission budget governs membership extraction and write
   if (Json::parse(fields).value("artifact", std::string{}) == served.source.artifact.artifact_id) ++admissions;
  };
  if (exhausted) {
-  CHECK_THROWS_WITH(compile_benchmark_recipe(config, &catalog),
-   "physical archive remains unavailable after three admissions: " + served.source.artifact.artifact_id + ": incomplete requested COCONut image");
+  CHECK_THROWS_WITH(
+   compile_benchmark_recipe(config, &catalog), "physical archive remains unavailable after three admissions: " + served.source.artifact.artifact_id + ": incomplete requested COCONut image");
   CHECK(admissions == 3);
   CHECK(served.server.requests() == 2);
   CHECK(file_bytes(config.output_dir / "benchmark_manifest.json") == old_manifest);
@@ -3732,6 +3747,14 @@ TEST_CASE("COCONut receives metadata while a managed release lane is importing m
   config.num_workers = 1;
   descriptors = 13;
  }
+ CAPTURE(hold_two, descriptors, config.num_workers);
+ std::mutex trace_mutex;
+ Json release_events = Json::array();
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  if (!event.starts_with("benchmark.annotations.") && event != "benchmark.archive.resolution") return;
+  const std::lock_guard lock(trace_mutex);
+  release_events.push_back({{"event", event}, {"fields", Json::parse(fields)}});
+ };
  const auto held_release = [&](CoconutEdition edition) { return edition == blocked || (hold_two && edition == delayed.edition); };
  catalog.release_observer = [&](CoconutEdition edition, CoconutReleaseBoundary boundary) {
   if (held_release(edition) && boundary == CoconutReleaseBoundary::MasksStarted) receipt.ArriveAndWait();
@@ -3748,7 +3771,13 @@ TEST_CASE("COCONut receives metadata while a managed release lane is importing m
  REQUIRE(masks.WaitEntered(5s));
  acquisition.reset();
  if (hold_two) REQUIRE(masks.WaitEntered(5s, 2));
- mmltk::testsupport::await_test_promise(received, "metadata consumption during independent full-mask work", 5s);
+ try {
+  mmltk::testsupport::await_test_promise(received, "metadata consumption during independent full-mask work", 5s);
+ } catch (const std::exception& error) {
+  if (compiling.wait_for(0ms) == std::future_status::ready) compiling.get();
+  const std::lock_guard lock(trace_mutex);
+  throw std::runtime_error(std::string(error.what()) + ": " + release_events.dump());
+ }
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  masks.Release();
  mmltk::testsupport::await_test_future(compiling, "metadata receiver completion", 5s);
@@ -3761,7 +3790,7 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
  LocalCoconutRecipe local(root.path());
  auto catalog = local.selected(CoconutValidation::CoconutStock);
  bool repair_annotations = false;
- SECTION("independent releases settle while extraction remains foreground") {}
+ SECTION("independent releases normalize before complete placement membership") {}
  SECTION("partial annotation replacement withdraws only its release rows") { repair_annotations = true; }
  std::string annotation_payload;
  std::unique_ptr<mmltk::backend::data::testsupport::HttpServer> annotation_server;
@@ -3799,34 +3828,26 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
  for (const auto& release : catalog.releases) total += release.expected_rows;
  REQUIRE(catalog.releases[0].expected_rows != catalog.releases[1].expected_rows);
  const auto base_rows = catalog.releases[0].expected_rows;
- mmltk::testsupport::TestGate base("base cold mask import"), last_release("last independent cold mask import"), receiver("metadata receiver before pixel phase");
- const auto base_receipt = base.receipt(), last_receipt = last_release.receipt(), receiver_receipt = receiver.receipt();
+ mmltk::testsupport::TestGate base("base cold mask import"), last_release("last independent cold mask import");
+ const auto base_receipt = base.receipt(), last_receipt = last_release.receipt();
  catalog.release_observer = [&](CoconutEdition edition, CoconutReleaseBoundary boundary) {
   if (edition == CoconutEdition::Base) {
    if (boundary == CoconutReleaseBoundary::MasksStarted)
     base_receipt.ArriveAndWait();
-   else
-    receiver_receipt.ArriveAndWait();
   } else if (edition == catalog.releases.back().edition && boundary == CoconutReleaseBoundary::MasksStarted)
    last_receipt.ArriveAndWait();
  };
  std::vector<BenchmarkCompileProgress> indexing;
- std::promise<void> independent_settled, all_settled, extracting;
- bool extracting_reported = false;
+ std::promise<void> independent_settled, all_settled;
  bool independent_reported = false, all_reported = false;
- bool foreground_preserved = true, background_observed = false;
+ bool foreground_preserved = true;
  std::optional<BenchmarkCompileProgress> previous_update;
  config.progress = [&](const BenchmarkCompileProgress& value) {
   if (previous_update && previous_update->phase == DatasetCompilePhase::Extracting && value.tracks.labels.completed != previous_update->tracks.labels.completed) {
-   background_observed = true;
    foreground_preserved = foreground_preserved && value.phase == previous_update->phase && value.activity == previous_update->activity && value.current_source == previous_update->current_source &&
                           value.completed == previous_update->completed && value.total == previous_update->total && value.activity_elapsed_seconds >= previous_update->activity_elapsed_seconds;
   }
   previous_update = value;
-  if (value.phase == DatasetCompilePhase::Extracting && !extracting_reported) {
-   extracting_reported = true;
-   extracting.set_value();
-  }
   if (value.tracks.labels.total < total || value.tracks.labels.activity == DatasetCompileActivity::Preparing || value.tracks.labels.completed > total) return;
   indexing.push_back(value);
   if (value.tracks.labels.completed == total - base_rows && !independent_reported) {
@@ -3845,26 +3866,19 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
   cancelled.store(true);
   base.Release();
   last_release.Release();
-  receiver.Release();
  });
  REQUIRE(base.WaitEntered(5s));
  REQUIRE(last_release.WaitEntered(5s));
- REQUIRE(receiver.WaitEntered(5s));
- receiver.Release();
- mmltk::testsupport::await_test_promise(extracting, "foreground extraction while masks remain active", 5s);
  last_release.Release();
  mmltk::testsupport::await_test_promise(independent_settled, "independent cold releases indexed", 5s);
+ CHECK_FALSE(std::filesystem::exists(local.output / "train.bin"));
  base.Release();
  mmltk::testsupport::await_test_promise(all_settled, "aggregate indexing settlement", 5s);
- receiver.Release();
  mmltk::testsupport::await_test_future(compiling, "interleaved indexing compile", 5s);
  REQUIRE_FALSE(indexing.empty());
- CHECK(background_observed);
  CHECK(foreground_preserved);
  CHECK(indexing.front().tracks.labels.completed == 0);
  CHECK(indexing.back().tracks.labels.completed == total);
- const auto background = std::ranges::find_if(indexing, [&](const auto& value) { return value.phase == DatasetCompilePhase::Extracting && value.tracks.labels.completed == total; });
- REQUIRE(background != indexing.end());
  std::uint64_t previous = 0;
  for (const auto& value : indexing) {
   CHECK(value.tracks.labels.total >= total);
@@ -4996,6 +5010,11 @@ TEST_CASE("physical metadata and pixels progress while stock originals are held"
  std::promise<void> metadata, pixels;
  std::size_t releases = 0;
  std::atomic<bool> pixel_reported{false};
+ std::atomic<unsigned> preparation_updates{0}, archive_updates{0};
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event == "benchmark.annotations.preparation" && Json::parse(fields).at("completed").get<std::uint64_t>() != 0) ++preparation_updates;
+  if (event == "benchmark.archive.resolution" && Json::parse(fields).at("entries").get<std::uint64_t>() != 0) ++archive_updates;
+ };
  catalog.release_observer = [&](CoconutEdition, CoconutReleaseBoundary boundary) {
   if (boundary == CoconutReleaseBoundary::MetadataConsumed && ++releases == catalog.releases.size()) metadata.set_value();
  };
@@ -5009,6 +5028,8 @@ TEST_CASE("physical metadata and pixels progress while stock originals are held"
   originals.reset();
  });
  mmltk::testsupport::await_test_promise(metadata, "all canonical metadata while original parsing is held", 5s);
+ CHECK(preparation_updates.load() != 0);
+ CHECK(archive_updates.load() != 0);
  mmltk::testsupport::await_test_promise(pixels, "known pixel input while original parsing is held", 5s);
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  originals.reset();
@@ -5040,10 +5061,15 @@ TEST_CASE("independent physical archives resolve while one image source is held"
  mmltk::testsupport::await_test_future(compiling, "held source resolves after release", 5s);
 }
 TEST_CASE("XL discovery resolves ready physical requests before later JSON parsing", "[benchmark][coconut][archive]") {
+ bool metadata_only = true;
+ SECTION("metadata observations") {}
+ SECTION("normalize ready masks before discovering later records") { metadata_only = false; }
  ScopedTempDir root("xl-incremental-discovery");
  const auto path = root.path() / "xl.tar";
- const std::array<std::pair<std::string, std::string>, 2> members{
-  {{"coconuts_xlarge/panseg_info/objects365_v2_00000003.json", Json::array({segment()}).dump()}, {"coconuts_xlarge/panseg_info/objects365_v2_00000002.json", "invalid later JSON"}}
+ const std::array<std::uint32_t, 9> pixels{1, 1, 1, 1, 1, 1, 1, 1, 1};
+ const std::array<std::pair<std::string, std::string>, 3> members{
+  {{"coconuts_xlarge/panseg/objects365_v2_00000003.png", png(3, 3, pixels)}, {"coconuts_xlarge/panseg_info/objects365_v2_00000003.json", Json::array({segment()}).dump()},
+   {"coconuts_xlarge/panseg_info/objects365_v2_00000002.json", "invalid later JSON"}}
  };
  tar(path, members);
  const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
@@ -5062,10 +5088,26 @@ TEST_CASE("XL discovery resolves ready physical requests before later JSON parsi
  input.execution = &execution;
  input.edition = CoconutEdition::XLarge;
  input.input_identity = "xl-discovery";
- input.metadata_only = true;
+ input.metadata_only = metadata_only;
  input.mask_archive = path;
  input.physical_membership = &physical;
+ std::vector<std::uint64_t> discovered;
+ std::vector<std::uint64_t> archive_entries;
+ std::vector<std::uint64_t> normalized;
+ input.progress = [&](auto rows) { normalized.push_back(rows); };
+ input.preparation_progress = [&](auto stage, auto rows) {
+  if (stage == CoconutPreparationStage::Archive) {
+   CHECK(discovered.empty());
+   archive_entries.push_back(rows);
+  } else {
+   CHECK(stage == CoconutPreparationStage::Annotations);
+   discovered.push_back(rows);
+  }
+ };
  CHECK_THROWS(import_coconut_annotations(input));
+ CHECK(discovered == std::vector<std::uint64_t>{1});
+ CHECK(archive_entries == std::vector<std::uint64_t>{1});
+ if (!metadata_only) CHECK(normalized == std::vector<std::uint64_t>{0, 1});
  const auto image_root = cache.source_images("objects365") / "patch-32";
  CHECK(file_bytes(cached_image_path(image_root, 3)) == jpeg);
  const auto geometry = execution.geometry(image_root, 3);
@@ -5517,7 +5559,10 @@ TEST_CASE("panoptic JSON keeps decoded metadata and one unchanged inventory seal
  const std::array<std::pair<std::string, std::string>, 1> masks{{{"panoptic_object365/objects365_v2_00000007.png", png(2, 1, pixels)}}};
  tar(input.mask_archive, masks);
  input.metadata_only = true;
+ std::map<CoconutPreparationStage, std::vector<std::uint64_t>> preparation;
+ input.preparation_progress = [&](auto stage, auto count) { preparation[stage].push_back(count); };
  const auto metadata = import_coconut_annotations(input);
+ for (const auto stage : {CoconutPreparationStage::Images, CoconutPreparationStage::Annotations, CoconutPreparationStage::Membership}) CHECK(preparation.at(stage) == std::vector<std::uint64_t>{1});
  REQUIRE(metadata.size() == 1);
  REQUIRE(input.records->size() == 1);
  CHECK(input.records->record(0).file_name == "objects365_v2_00000007.png");
@@ -6396,10 +6441,10 @@ TEST_CASE("COCO original split publication is independent for warm and cold admi
  if (cold) {
   for (const auto split : {"train2017", "val2017"}) remove_normalized_annotation_index(local.cache.source_indexes("coco") / (std::string(split) + ".normalized.bin"));
   const auto path = local.cache.source_downloads("coco") / catalog.coco_annotations.filename;
-  const std::array<std::pair<std::string, std::string>, 2> members{{
-   {"annotations/instances_train2017.json", file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json")},
-   {"annotations/instances_val2017.json", file_bytes(local.cache.source_indexes("coco") / "val2017.fixture.json")}
-  }};
+  const std::array<std::pair<std::string, std::string>, 2> members{
+   {{"annotations/instances_train2017.json", file_bytes(local.cache.source_indexes("coco") / "train2017.fixture.json")},
+    {"annotations/instances_val2017.json", file_bytes(local.cache.source_indexes("coco") / "val2017.fixture.json")}}
+  };
   tar(path, members);
   catalog.coco_annotations.expected_size = std::filesystem::file_size(path);
  }
@@ -6574,7 +6619,8 @@ TEST_CASE("late original withdrawal retains physical work and remaps changed sto
  std::mutex reads_mutex;
  std::map<std::uint64_t, unsigned> validation_reads;
  auto compiling = std::async(std::launch::async, [&] {
-  compile_benchmark_recipe(config, &catalog, nullptr, {}, [&](const std::filesystem::path& image_root, std::uint64_t id) {
+  compile_benchmark_recipe(config, &catalog, nullptr, {},
+   [&](const std::filesystem::path& image_root, std::uint64_t id) {
    if (image_root != local.cache.source_images("coco") / "val2017") return;
    {
     const std::lock_guard lock(reads_mutex);
@@ -6657,6 +6703,7 @@ TEST_CASE("a Parquet group joins native recovery while final labels remain held"
  std::erase_if(catalog.releases, [](const auto& release) { return release.edition != CoconutEdition::Base; });
  std::erase_if(catalog.images, [](const auto& image) { return image.source != CoconutImageNamespace::CocoTrain; });
  const std::array<std::pair<std::string, std::string>, 3> members{{{coco(7).member, white_jpeg(1, 1)}, {coco(10).member, white_jpeg(1, 1)}, {coco(11).member, white_jpeg(1, 1)}}};
+ // CLEANUP-IGNORE: Only calls to existing archive/RAII fixture helpers and a structured binding match; the scenarios own different input generation and assertions.
  replace_physical_images(local.cache, catalog, CoconutImageNamespace::CocoTrain, members);
  PhysicalMembershipFixture fixture(local.cache, catalog, 1);
  auto& [admitted, cancelled, cancellation, execution, physical] = fixture;

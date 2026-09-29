@@ -596,7 +596,8 @@ void BenchmarkArchive::visit_known(std::span<const std::string> members, const s
     // Entry order is stable across both traversals of this opened generation.
     if (position() < required.position.ordinal) continue;
     if (position() != required.position.ordinal || member() != name || size() != required.position.bytes)
-     throw BenchmarkArchiveError("archive visit identity mismatch: expected " + name + " at entry " + std::to_string(required.position.ordinal) + ", found " + member() + " at entry " + std::to_string(position()));
+     throw BenchmarkArchiveError(
+      "archive visit identity mismatch: expected " + name + " at entry " + std::to_string(required.position.ordinal) + ", found " + member() + " at entry " + std::to_string(position()));
     found = true;
     break;
    }
@@ -621,6 +622,24 @@ void BenchmarkArchive::pause() {
 void BenchmarkArchive::resume(std::uint64_t workspace, std::size_t consumer_descriptors) {
  impl_->consumer_descriptors = consumer_descriptors;
  impl_->resume(workspace);
+}
+bool BenchmarkArchive::try_resize_workspace(std::uint64_t workspace) {
+ auto& s = *impl_;
+ if (!s.reader) {
+  s.resume(workspace);
+  return true;
+ }
+ if (s.execution && (!s.owns_workspace || !s.execution->try_resize_workspace(s.credits, archive_workspace(s.compressed, s.decoders, workspace)))) return false;
+ s.workspace_bytes = workspace;
+ return true;
+}
+void BenchmarkArchive::inspect_members(const std::function<void(std::string_view, bool)>& inspect) const {
+ for (const auto& [name, position] : impl_->positions) inspect(name, position.conflict);
+}
+bool BenchmarkArchive::has_member(const std::string& member) const { return impl_->positions.contains(member); }
+bool BenchmarkArchive::direct_member(const std::string& member) const {
+ const auto found = impl_->positions.find(member);
+ return found != impl_->positions.end() && !impl_->compressed && found->second.raw;
 }
 BenchmarkArchive::GzipSeekState BenchmarkArchive::gzip_seek_state() const {
  return {

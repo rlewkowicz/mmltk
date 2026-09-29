@@ -779,7 +779,7 @@ void test_wrapper_gui_tmpfs_uses_target_uid_gid() {
   REQUIRE((stream.is_open()));
   stream << "fake-wayland-socket";
  }
- write_fake_docker_script(temp_dir);
+ prepare_fake_docker_state(temp_dir, state_dir);
  const SubprocessResult result = run_subprocess_capture_output({
   "env",
   "PATH=" + prepend_path_env(temp_dir / "bin"),
@@ -788,7 +788,7 @@ void test_wrapper_gui_tmpfs_uses_target_uid_gid() {
   "MMLTK_USER=root",
   "WAYLAND_DISPLAY=wayland-0",
   "XDG_RUNTIME_DIR=" + runtime_dir.string(),
-  locate_repo_wrapper_path().string(),
+  (temp_dir / "mmltk").string(),
   "--prepare-gui-container",
  });
  INFO("wrapper stdout:\n" << result.stdout_text << "\nwrapper stderr:\n" << result.stderr_text);

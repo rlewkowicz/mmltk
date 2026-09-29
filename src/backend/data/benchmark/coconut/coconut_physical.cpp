@@ -144,9 +144,10 @@ struct CoconutPhysicalMembership::Impl {
  StorageReservationPool* storage = nullptr;
  BenchmarkCompilePipeline* execution = nullptr;
  Cancellation cancellation;
+ Progress progress;
  Impl(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& layout, StorageReservationPool& reservations,
-  BenchmarkCompilePipeline& pipeline, Cancellation cancel)
-     : cache(&layout), storage(&reservations), execution(&pipeline), cancellation(cancel) {
+  BenchmarkCompilePipeline& pipeline, Cancellation cancel, Progress observer)
+     : cache(&layout), storage(&reservations), execution(&pipeline), cancellation(cancel), progress(std::move(observer)) {
   // Routing is a one-time projection of the selected release catalog. The
   // explicit private catalog supplies its own bounded fixture source set.
   for (const auto& release : catalog.releases)
@@ -197,7 +198,8 @@ struct CoconutPhysicalMembership::Impl {
   }
   return *state.input;
  }
- CoconutPhysicalImage resolve(CoconutEdition edition, std::string_view identity, const CoconutRecord& record, const BenchmarkAllowance& parent, bool canonical_metadata) {
+ CoconutPhysicalImage resolve(CoconutEdition edition, std::string_view identity, const CoconutRecord& record, const BenchmarkAllowance& parent, bool canonical_metadata,
+  const std::function<void()>& retire_projection = {}) {
   const auto objects = admit_record(edition, record);
   if (!execution) {
    const CoconutPhysicalImage* match = nullptr;
@@ -248,9 +250,17 @@ struct CoconutPhysicalMembership::Impl {
      }
      try {
       if (!state.lease) {
+       if (progress) progress(edition, archive, requested_id, 0);
+       const auto lifecycle = cache->locks / (std::string(benchmark_source_name(archive.origin.artifact.source)) + "-" + archive.origin.cache_shard + ".images.lock");
+       if (retire_projection && !canonical_metadata) {
+        state.lease = ArtifactLease::try_acquire_charged(lifecycle, cancellation, execution, requirement(state).lease_controls(), parent);
+        if (!state.lease) {
+         retire_projection();
+         canonical_metadata = true;
+        }
+       }
        if (canonical_metadata && parent && !execution->try_resize_workspace(parent, 0)) throw std::logic_error("physical metadata retains unrelated workspace");
-       state.lease = ArtifactLease::acquire_charged(cache->locks / (std::string(benchmark_source_name(archive.origin.artifact.source)) + "-" + archive.origin.cache_shard + ".images.lock"),
-        cancellation, execution, requirement(state).lease_controls(), parent);
+       if (!state.lease) state.lease = ArtifactLease::acquire_charged(lifecycle, cancellation, execution, requirement(state).lease_controls(), parent);
        if (canonical_metadata && parent) {
         const auto workspace = requirement(state).workspace_bytes();
         if (!execution->try_resize_workspace(parent, workspace)) {
@@ -283,6 +293,7 @@ struct CoconutPhysicalMembership::Impl {
        }
       }
       while (!located && reader.next(cancellation)) {
+       if (progress && (reader.position() == 0 || (reader.position() + 1) % 1024 == 0)) progress(edition, archive, requested_id, reader.position() + 1);
        if (!reader.member().ends_with(".jpg")) continue;
        const auto id = benchmark_archive_image_candidate(reader.member());
        if (!id) continue;
@@ -323,7 +334,8 @@ struct CoconutPhysicalMembership::Impl {
       try {
        if (source.artifacts.at(archive.origin.shard).cache_reusable)
         input = BenchmarkEncodedImage::open(state.directory.get(), requested_id, validate, cancellation, execution, reader.allowance(), execution->image_input(root, requested_id), 32ULL << 20);
-      } catch (const InvalidImageError&) { /* The consumed source replaces this invalid cache entry below. */ }
+      } catch (const InvalidImageError&) { /* The consumed source replaces this invalid cache entry below. */
+      }
       if (input)
        input = input->header_only();
       else {
@@ -342,11 +354,11 @@ struct CoconutPhysicalMembership::Impl {
       if (cursor == source.scanned.end() || source.members.at(cursor->second).position < route.position) source.scanned[&archive] = requested_id;
       state.resolved.insert_or_assign(logical_key, physical);
       return physical;
-     } catch (const PhysicalArchiveFailure&) { throw; } catch (const BenchmarkArchiveError& error) { throw PhysicalArchiveFailure(archive, error.what()); } catch (const BenchmarkImageError& error) {
+     } catch (const PhysicalArchiveFailure&) { throw; } catch (const BenchmarkArchiveError& error) {
       throw PhysicalArchiveFailure(archive, error.what());
-     } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
-      throw PhysicalArchiveFailure(archive, error.what(), std::current_exception());
-     }
+     } catch (const BenchmarkImageError& error) { throw PhysicalArchiveFailure(archive, error.what()); } catch (const std::bad_alloc&) {
+      throw;
+     } catch (const std::exception& error) { throw PhysicalArchiveFailure(archive, error.what(), std::current_exception()); }
     }
    }
   // Resolve again after each bounded replacement. A valid alternative source
@@ -357,13 +369,14 @@ struct CoconutPhysicalMembership::Impl {
  }
 };
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& cache,
- StorageReservationPool& storage, BenchmarkCompilePipeline& execution, Cancellation cancellation)
-    : impl_(std::make_unique<Impl>(admitted, catalog, explicit_catalog, cache, storage, execution, cancellation)) {}
+ StorageReservationPool& storage, BenchmarkCompilePipeline& execution, Cancellation cancellation, Progress progress)
+    : impl_(std::make_unique<Impl>(admitted, catalog, explicit_catalog, cache, storage, execution, cancellation, std::move(progress))) {}
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<const CoconutPhysicalImage> images, Cancellation cancellation) : impl_(std::make_unique<Impl>(images, cancellation)) {}
 CoconutPhysicalMembership::~CoconutPhysicalMembership() = default;
 const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespace source, std::uint64_t id) const noexcept { return impl_->find(source, id); }
-CoconutPhysicalImage CoconutPhysicalMembership::resolve(CoconutEdition edition, std::string_view identity, const CoconutRecord& record, const BenchmarkAllowance& parent, bool canonical_metadata) const {
- return impl_->resolve(edition, identity, record, parent, canonical_metadata);
+CoconutPhysicalImage CoconutPhysicalMembership::resolve(
+ CoconutEdition edition, std::string_view identity, const CoconutRecord& record, const BenchmarkAllowance& parent, bool canonical_metadata, const std::function<void()>& retire_projection) const {
+ return impl_->resolve(edition, identity, record, parent, canonical_metadata, retire_projection);
 }
 // CLEANUP-IGNORE: Requirement and publication queries share only guard/lookup/lock setup; their returned facts and admission operations differ.
 CoconutPhysicalInputRequirement CoconutPhysicalMembership::input_requirement(CoconutEdition edition) const {

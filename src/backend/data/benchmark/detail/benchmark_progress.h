@@ -70,7 +70,7 @@ public:
  [[nodiscard]] ArtifactProgressTotals& transfers() noexcept { return transfers_; }
  void pixel_completed();
  void acquisition_complete();
- void source_activity(const BenchmarkDatasetSource source, std::string activity, bool foreground = true);
+ void source_activity(const BenchmarkDatasetSource source, std::string activity, bool foreground = true, bool preserve = true);
  [[nodiscard]] bool transfer_observer_enabled() const noexcept;
  [[nodiscard]] bool normalization_observer_enabled() const noexcept;
  [[nodiscard]] bool pixel_observer_enabled() const noexcept;

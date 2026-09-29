@@ -1152,7 +1152,7 @@ BenchmarkCompilePipeline::BenchmarkCompilePipeline(std::size_t workers, std::spa
  state.lanes.resize(workers);
  state.label_workspaces.resize(workers);
  state.admission->cpu_capacity = workers;
- state.admission->target = limits.transient_bytes ? limits.transient_bytes : std::min<std::uint64_t>(2ULL << 30, std::max<std::uint64_t>(256ULL << 20, workers * (64ULL << 20)));
+ state.admission->target = limits.transient_bytes ? limits.transient_bytes : std::min<std::uint64_t>(6ULL << 30, std::max<std::uint64_t>(256ULL << 20, workers * (64ULL << 20)));
  const auto headroom = descriptor_headroom();
  state.admission->descriptor_capacity = limits.descriptors ? std::min(limits.descriptors, headroom) : headroom;
  if (state.admission->descriptor_capacity < 2) throw std::invalid_argument("benchmark descriptor admission requires completion headroom");
@@ -1903,7 +1903,6 @@ std::shared_ptr<const BenchmarkEncodedImage> BenchmarkCompilePipeline::image_inp
  return image ? image->input : nullptr;
 }
 std::optional<BenchmarkImageGeometry> BenchmarkCompilePipeline::geometry(const std::filesystem::path& root, std::uint64_t id) const { return impl_->images.geometry(root, id); }
-
 bool BenchmarkCompilePipeline::labels_ready(
  const BenchmarkSourcePublication& publication, std::uint64_t id, BenchmarkLabelInput input, std::string_view dependency, std::uint64_t original_generation) {
  if (!publication.state_ || publication.state_->execution.lock() != impl_) return false;

@@ -326,8 +326,7 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
    const CachedImageValidator header = [&](std::uint64_t, std::span<const std::uint8_t> encoded) {
     return scratch.decoder.read_header(encoded, state.actual_dimensions ? 0 : image.source_width, state.actual_dimensions ? 0 : image.source_height);
    };
-   input->payload =
-    BenchmarkEncodedImage::open(std::move(file), image.source_image_id, header, state.cancellation, nullptr, allowance, input->payload, std::numeric_limits<std::uint32_t>::max());
+   input->payload = BenchmarkEncodedImage::open(std::move(file), image.source_image_id, header, state.cancellation, nullptr, allowance, input->payload, std::numeric_limits<std::uint32_t>::max());
    if (!input->payload) throw std::runtime_error("cached benchmark image is missing or has an invalid size");
   }
   const auto& header = input->payload->header();

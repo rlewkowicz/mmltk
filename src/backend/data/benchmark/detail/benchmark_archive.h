@@ -70,6 +70,12 @@ public:
  // The opened inode and encountered positions stay bound to this generation.
  void pause();
  void resume(std::uint64_t workspace, std::size_t consumer_descriptors = 0);
+ // Grow a live consumer envelope without reopening or discarding its seek state.
+ bool try_resize_workspace(std::uint64_t workspace);
+ [[nodiscard]] bool has_member(const std::string&) const;
+ // Random revisits that cannot replay a compressed or format-context prefix.
+ [[nodiscard]] bool direct_member(const std::string&) const;
+ void inspect_members(const std::function<void(std::string_view, bool conflict)>&) const;
  struct GzipSeekState {
   std::size_t dictionaries;
   bool retained;

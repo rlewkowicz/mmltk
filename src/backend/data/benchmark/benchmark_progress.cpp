@@ -252,7 +252,7 @@ void ProgressReporter::acquisition_complete() {
  state_.tracks.acquisition.activity = DatasetCompileActivity::Complete;
  emit(lock, true);
 }
-void ProgressReporter::source_activity(const BenchmarkDatasetSource source, std::string activity, bool foreground) {
+void ProgressReporter::source_activity(const BenchmarkDatasetSource source, std::string activity, bool foreground, bool preserve) {
  if (!callback_ && !trace_) { return; }
  std::unique_lock lock(mutex_);
  if (!callback_) {
@@ -264,7 +264,7 @@ void ProgressReporter::source_activity(const BenchmarkDatasetSource source, std:
   return;
  }
  set_source_activity_unlocked(source, std::move(activity), foreground);
- emit(lock, true);
+ emit(lock, preserve);
 }
 void ProgressReporter::set_source_activity_unlocked(const BenchmarkDatasetSource source, std::string activity, bool foreground) {
  BenchmarkSourceProgress& source_state = source_progress(source);

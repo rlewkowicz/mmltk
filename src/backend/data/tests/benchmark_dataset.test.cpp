@@ -5480,7 +5480,12 @@ TEST_CASE("Open Images consumes a repaired saved file before recycling its exclu
   validation.Release();
   member.ReleaseRequest();
  });
- REQUIRE(validation.WaitEntered(5s));
+ const bool entered = validation.WaitEntered(5s);
+ if (!entered) {
+  CAPTURE(first.requests(), member.requests(), later.requests(), validations.load());
+  if (acquisition.wait_for(0ms) == std::future_status::ready) (void)acquisition.get();
+  REQUIRE(entered);
+ }
  CHECK(member.requests() == 0);
  CHECK(later.requests() == 0);  // Its group is pending under the original tiny target.
  CHECK_FALSE(execution.geometry(images, 1));

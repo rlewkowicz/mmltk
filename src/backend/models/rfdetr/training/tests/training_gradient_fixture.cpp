@@ -1352,9 +1352,7 @@ void exercise_collective_cancellation(DistributedContext& group, int device, std
 }
 namespace {
 struct PreparedBackwardGate final {
- explicit PreparedBackwardGate(int device) {
-  tc::getCurrentCUDAStream(tc::checked_device_index(device)).synchronize();
- }
+ explicit PreparedBackwardGate(int device) { tc::getCurrentCUDAStream(tc::checked_device_index(device)).synchronize(); }
  ~PreparedBackwardGate() { release(); }
  void release() noexcept {
   if (released) return;
@@ -1399,8 +1397,8 @@ void equal_training_state(const std::vector<NormalizedModelStateEntry>& actual, 
   if (torch::equal(actual[i].tensor, expected[i].tensor)) continue;
   std::ostringstream message;
   message.precision(17);
-  message << transition << " changed the exact parameter trajectory: " << actual[i].name << ", maximum difference="
-          << (actual[i].tensor.to(torch::kFloat64) - expected[i].tensor.to(torch::kFloat64)).abs().max().item<double>();
+  message << transition << " changed the exact parameter trajectory: " << actual[i].name
+          << ", maximum difference=" << (actual[i].tensor.to(torch::kFloat64) - expected[i].tensor.to(torch::kFloat64)).abs().max().item<double>();
   throw std::runtime_error(message.str());
  }
 }

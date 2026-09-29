@@ -36,6 +36,7 @@ private:
 // Array completion may carry an empty batch. It always runs outside scan CPU
 // custody; consumers retain ranges only for unresolved semantic dependencies.
 void discover_json_arrays(const PaddedMappedFile&, std::span<const std::string_view>, bool reject_duplicates, const std::function<void(std::size_t, std::span<const ByteRange>, bool complete)>&,
- mmltk::common::concurrency::CancellationObservation = {}, BenchmarkCompilePipeline* = nullptr);
+ mmltk::common::concurrency::CancellationObservation = {}, BenchmarkCompilePipeline* = nullptr,
+ const std::function<void(const std::function<void()>&)>& metadata_work = {});
 [[noreturn]] void reject_json_document(const simdjson::simdjson_error&);
 }  // namespace mmltk::backend::data::benchmark_internal

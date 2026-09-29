@@ -9,6 +9,7 @@
 #include <memory>
 #include <map>
 #include <filesystem>
+#include <functional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -85,8 +86,10 @@ private:
 // only after withdrawal and settlement of its source publications/readers.
 class CoconutPhysicalMembership final {
 public:
+ // Synchronous observations of the requested image and actual archive cursor.
+ using Progress = std::function<void(CoconutEdition, const AdmittedRecipeArchive&, std::uint64_t image_id, std::uint64_t entries)>;
  CoconutPhysicalMembership(std::span<AdmittedRecipeArchive>, const CoconutRecipeCatalog&, bool explicit_catalog, const BenchmarkCacheLayout&, StorageReservationPool&, BenchmarkCompilePipeline&,
-  mmltk::common::concurrency::CancellationObservation = {});
+  mmltk::common::concurrency::CancellationObservation = {}, Progress = {});
  explicit CoconutPhysicalMembership(std::span<const CoconutPhysicalImage>, mmltk::common::concurrency::CancellationObservation = {});
  ~CoconutPhysicalMembership();
  CoconutPhysicalMembership(const CoconutPhysicalMembership&) = delete;
@@ -102,7 +105,8 @@ public:
  void withdraw(const AdmittedRecipeArchive&);
  // canonical_metadata means the allowance contains no live Arrow/PNG input;
  // its unused physical workspace can return while the lifecycle lock waits.
- [[nodiscard]] CoconutPhysicalImage resolve(CoconutEdition, std::string_view identity, const CoconutRecord&, const BenchmarkAllowance&, bool canonical_metadata = false) const;
+ [[nodiscard]] CoconutPhysicalImage resolve(CoconutEdition, std::string_view identity, const CoconutRecord&, const BenchmarkAllowance&, bool canonical_metadata = false,
+  const std::function<void()>& retire_projection = {}) const;
  [[nodiscard]] BenchmarkSourcePublication label_publication(CoconutEdition, const CoconutPhysicalImage&) const;
  [[nodiscard]] const CoconutPhysicalImage* find(CoconutImageNamespace, std::uint64_t) const noexcept;
 

@@ -131,7 +131,7 @@ public:
  void adopt(std::vector<CoconutRecord>);
  void admit_json(std::size_t, CoconutRecord, std::optional<std::size_t> = {});
  void json_prefix(std::size_t, std::uint64_t);
- void seal_xlarge_order();
+ [[nodiscard]] std::vector<std::size_t> seal_xlarge_order();
  void native(std::size_t, std::shared_ptr<const CoconutNativeImage>);
  void retire_native() noexcept;
  // Immutable local offsets are never incremented again on retries. This only
@@ -157,6 +157,9 @@ struct CoconutAnnotationInput {
  std::shared_ptr<const void> backing;
  std::uint64_t live_bytes = 0;
  bool membership = false;
+ // Settled metadata can close its forward projection before a physical lock
+ // wait. Healthy physical admission keeps the reader open for the next group.
+ std::function<void()> retire_projection{};
 };
 // Consumers return before the next allocation window. Finishing a group keeps
 // reusable scratch with its input grant; input retirement releases that backing.
@@ -180,6 +183,7 @@ struct CoconutOriginalInput {
  std::uint64_t generation = 0;
 };
 using CoconutOriginalProvider = std::function<CoconutOriginalInput(CoconutImageNamespace, bool wait, std::stop_token)>;
+enum class CoconutPreparationStage : std::uint8_t { Archive, Images, Annotations, Membership };
 struct CoconutImportRequest {
  BenchmarkCompilePipeline* execution = nullptr;
  BenchmarkAllowance parent_allowance;
@@ -201,6 +205,10 @@ struct CoconutImportRequest {
  CoconutImportLimits limits;
  mmltk::common::concurrency::CancellationObservation cancellation;
  std::function<void(std::uint64_t)> progress;
+ // Bounded preparation observations are separate from normalized row completion.
+ std::function<void(CoconutPreparationStage, std::uint64_t)> preparation_progress;
+ // Publish canonical image membership independently of label/recovery settlement.
+ std::function<void(std::vector<CoconutComponent>)> membership_ready;
  // Settle reports for freshly normalized discarded objects at image completion;
  // metadata, reused images and recovery-policy omissions produce no immediate report.
  std::function<void()> image_terminal;

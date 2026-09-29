@@ -293,7 +293,8 @@ public:
 };
 }  // namespace
 void discover_json_arrays(const PaddedMappedFile& file, std::span<const std::string_view> names, bool reject_duplicates,
- const std::function<void(std::size_t, std::span<const ByteRange>, bool)>& consume, mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkCompilePipeline* execution) {
+ const std::function<void(std::size_t, std::span<const ByteRange>, bool)>& consume, mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkCompilePipeline* execution,
+ const std::function<void(const std::function<void()>&)>& metadata_work) {
  JsonStructure input(file, cancellation, execution, reject_duplicates);
  std::vector<bool> found(names.size());
  std::size_t key_limit = 0;
@@ -396,10 +397,12 @@ void discover_json_arrays(const PaddedMappedFile& file, std::span<const std::str
     }
    }
   };
-  if (execution)
-   execution->run(BenchmarkStage::Metadata, {65536, 0}, scan);
-  else
-   scan(0);
+  const auto work = [&] {
+   if (execution) execution->run(BenchmarkStage::Metadata, {65536, 0}, scan);
+   else scan(0);
+  };
+  if (metadata_work) metadata_work(work);
+  else work();
   if (published) consume(*published, rows, complete);
  }
 }

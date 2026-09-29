@@ -331,6 +331,9 @@ artifact names and monotonic timestamps do not join different runs.
 | `benchmark.archive.admission_wait` | Source admission snapshot: `bytes`, `descriptors`, `committed_descriptors`, `descriptor_capacity`, `producer_ceiling`, and `active_cpus`; `reason` is `source_admission` |
 | `benchmark.annotations.originals_wait`, `.originals_begin` | Entry to stock-original lifecycle admission, then admitted work with `recover_dropped_masks` and numeric `validation` |
 | `benchmark.annotations.release_metadata`, `.release_complete` | COCONut release `edition` and `cache_hit` at metadata and full-mask completion respectively |
+| `benchmark.annotations.preparation` | COCONut `edition`, preparation `stage`, `completed`, `total` (zero means unknown), and `unit` (`rows` or `archive entries`), independently of normalized-row completion |
+| `benchmark.annotations.progress` | COCONut normalized `completed_rows` and `total_rows` by `edition`, including the first completed row |
+| `benchmark.archive.resolution` | COCONut `edition`, physical `artifact`, requested `image_id`, and archive cursor `entries`; zero announces source admission, positive values observe inspected headers |
 | `benchmark.annotations.component_admitted` | Reused COCONut component `edition`, physical `source`, and `images` |
 | `benchmark.annotations.assembled`, `.workspace` | Assembled image/box/run counts and retained vector capacities, or a parser lane's `retained_sparse_bytes` |
 | `benchmark.labels.placed` | Completed final split placement: `split`, `images`, `labels`, and `runs` |
@@ -376,6 +379,12 @@ process RSS, filesystem-wide reservations, or a deadlock diagnosis. The
 distinguishes transient workspace from retained canonical products.
 Metadata, originals, normalization, labels, and pixels can progress separately;
 `release_complete` is not a prerequisite for every image's label conversion.
+Preparation and physical-archive observations also update the visible source
+activity. Their row counts and archive cursors describe that specific stage;
+they are not extra normalized rows. Positive cursor observations establish
+that archive traversal advanced, while a lone zero entry may precede a resource
+or lifecycle wait. These work-based updates use bounded quanta without a timer
+or heartbeat, and the UI can coalesce intermediate observations.
 
 Failure hashing follows [cache repair policy](benchmark-datasets.md#persistent-cache-and-publication).
 Pinned annotation checksums used to decide replacement remain required without
