@@ -25,6 +25,9 @@ struct CachedImageReady {
  std::optional<std::pair<std::uint32_t, std::uint32_t>> dimensions{};
  bool defer_pixels = false;
  std::shared_ptr<const BenchmarkEncodedImage> payload{};
+ // A compile identity may join several archive shards. The immutable payload
+ // is reopened only in the physical cache directory that published it.
+ std::filesystem::path input_root{};
 };
 // Captures physical source, generation, attempt and lease once. Copies retain
 // custody, never a writer or a runnable execution owner. Delivery after source

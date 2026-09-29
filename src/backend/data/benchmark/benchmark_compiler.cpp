@@ -111,47 +111,14 @@ struct TracePath final {
  }
  return parent_iterator == parent.end();
 }
-void acquire_physical_archive(AdmittedRecipeArchive& admitted, const BenchmarkCacheLayout& cache, ProgressReporter& progress, ArtifactProgressTotals& totals, StorageReservationPool& storage,
- std::size_t workers, common_concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, std::string_view recovery_reason = {}, BenchmarkCompilePipeline* execution = nullptr,
- const BenchmarkAllowance& parent = {}) {
- const auto& archive = admitted.origin;
- const auto owner = benchmark_source_name(archive.artifact.source);
- auto request = make_download_request(cache, owner, archive.artifact);
- auto lease = ArtifactLease::acquire_charged(cache.locks / (archive.artifact.artifact_id + ".inventory.lock"), cancellation, execution, BenchmarkResources::handles(1, true, 3), parent);
- const auto& inventory_handle = lease->allowance();
- const auto diagnose = [&](std::string_view reason) {
-  if (!trace) return;
-  try {
-   const auto& digest = download_failure_sha256(admitted.download, cancellation);
-   trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", digest}, {"reason", reason}}; });
-  } catch (...) { throw_if_benchmark_cancelled(cancellation); }
- };
- const auto invalidate = [&](std::string_view reason) {
-  diagnose(reason);
-  invalidate_download_artifact(request, cancellation, trace, execution, inventory_handle);
-  request.redownload = true;
- };
- if (!recovery_reason.empty()) {
-  if (admitted.structural_attempts >= 3) {
-   diagnose(recovery_reason);
-   throw std::runtime_error("physical archive remains unavailable after three admissions: " + request.artifact_id + ": " + std::string(recovery_reason));
-  }
-  invalidate(recovery_reason);
- }
- while (admitted.structural_attempts < 3) {
-  ++admitted.structural_attempts;
-  throw_if_benchmark_cancelled(cancellation);
-  progress.phase(DatasetCompilePhase::Downloading);
-  {
-   admitted.download = download_artifacts({request}, workers, cancellation,
-    progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const auto& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, inventory_handle,
-    &storage)
-                        .front();
-  }
-  auto format_allowance = execution ? execution->reserve(BenchmarkResources::handles(1, true), inventory_handle) : BenchmarkAllowance{};
-  admitted.resolution_input = BenchmarkArchive::input_requirement(admitted.download.path, 64ULL << 20);
-  return;
- }
+DownloadResult acquire_physical_archive(const AdmittedRecipeArchive& admitted, const BenchmarkCacheLayout& cache, ProgressReporter& progress, ArtifactProgressTotals& totals, StorageReservationPool& storage,
+ std::size_t workers, common_concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution) {
+ const auto& artifact = admitted.origin.artifact;
+ const auto owner = benchmark_source_name(artifact.source);
+ auto lease = ArtifactLease::acquire_charged(cache.locks / (artifact.artifact_id + ".inventory.lock"), cancellation, execution, BenchmarkResources::handles(1, true, 3));
+ auto request = make_download_request(cache, owner, artifact);
+ return download_artifacts({request}, workers, cancellation,
+  progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const auto& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, lease->allowance(), &storage).front();
 }
 class RequiredImageDecodeError : public std::runtime_error {
 public:
@@ -160,11 +127,10 @@ public:
 [[nodiscard]] CachedImageDirectory acquire_archive_images(const BenchmarkCacheLayout& cache, const BenchmarkDatasetSource source, std::string shard, const std::vector<std::uint64_t>& expected_ids,
  const CatalogArtifact& artifact, mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, ArtifactProgressTotals* transfer_progress,
  StorageReservationPool* storage_reservations, const std::uint64_t source_total_images, const std::size_t decompression_workers, const std::size_t cache_write_workers,
- const std::size_t download_connections, const BenchmarkTraceSink& trace, const std::optional<ImageDecodeProbe> decode_probe = std::nullopt, const bool require_every_image = false,
- const ArchiveImageIdParser& member_parser = {}, std::string_view completion_slot = {}, AdmittedRecipeArchive* admitted_archive = nullptr, const DownloadResult* initial_download = nullptr,
+ const std::size_t download_connections, const BenchmarkTraceSink& trace, const std::optional<ImageDecodeProbe> decode_probe = std::nullopt,
+ const DownloadResult* initial_download = nullptr,
  std::shared_ptr<ArtifactLease> initial_lease = {}, BenchmarkCompilePipeline* execution = nullptr) {
  if (expected_ids.empty()) { throw std::runtime_error("benchmark archive extraction cannot have an empty image selection"); }
- if (require_every_image && !admitted_archive) throw std::logic_error("strict image extraction requires an admitted physical owner");
  const std::string source_name(benchmark_source_name(source));
  const std::string archive_name = source_name + " " + shard;
  const std::filesystem::path image_root = cache.source_images(source_name) / shard;
@@ -182,14 +148,12 @@ public:
      validator.validate_decodable(ready.payload->encoded(), decode_probe->expected_width, decode_probe->expected_height);
     }
    } catch (const BenchmarkImageReadError& error) {
-    if (require_every_image) throw RequiredImageDecodeError(error.what());
     throw InvalidImageError(error.what());
    }
   } else
    publication(ready);
  };
- const auto completion =
-  require_every_image ? image_root / ".recipe-proofs" / (std::string(completion_slot) + "-" + cached_image_selection_digest(expected_ids) + ".json") : image_root / ".complete.json";
+ const auto completion = image_root / ".complete.json";
  if (decode_probe) {
   if (!std::ranges::binary_search(expected_ids, decode_probe->image_id)) { throw std::runtime_error("benchmark archive decode probe ID is not selected"); }
   transfer_progress->images(source, artifact.artifact_id, 0, source_total_images, *progress);
@@ -199,7 +163,7 @@ public:
  }
  const std::string source_identity = source_name + ":" + shard + ":" + artifact.artifact_id + ":" + std::string(kBenchmarkCatalogRevision);
  progress->source_activity(source, "Checking " + archive_name + " cache completion status");
- const bool quarantine_unavailable = !require_every_image && archive_selection_allows_quarantine(source, shard);
+ const bool quarantine_unavailable = archive_selection_allows_quarantine(source, shard);
  std::uint64_t cached_image_bytes = 0U;
  std::vector<CachedImageRejection> cached_quarantine;
  if (validate_cached_image_group(image_root, completion, source_identity, expected_ids, &cached_image_bytes, cancel_requested, trace, quarantine_unavailable ? &cached_quarantine : nullptr)) {
@@ -220,12 +184,12 @@ public:
  request.storage_estimate = artifact.expected_size ? 0 : kArchiveScratchBytes;
  std::optional<DownloadResult> retained = initial_download ? std::optional(*initial_download) : std::nullopt;
  std::exception_ptr last_error;
- const std::uint32_t extraction_attempts = admitted_archive ? 1U : 3U;
+ const std::uint32_t extraction_attempts = 3U;
  for (std::uint32_t attempt = 1U; attempt <= extraction_attempts; ++attempt) {
   throw_if_benchmark_cancelled(cancel_requested);
   std::uint64_t attempt_reported = 0U;
   try {
-   if (!admitted_archive && !retained) {
+   if (!retained) {
     progress->source_activity(source, "Downloading " + archive_name + " image archive with " + std::to_string(download_connections) + " download connections");
     retained = download_artifacts({request}, download_connections, cancel_requested,
      progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { transfer_progress->update(update, *progress); }} : DownloadProgressSink{}, trace, {}, execution,
@@ -235,13 +199,13 @@ public:
    progress->source_activity(source, "Opening " + archive_name + " image archive");
    BenchmarkImageDecoder image_validator;
    CachedImageDirectory extracted = extract_selected_archive_images(ArchiveExtractionRequest{
-    .archive_path = admitted_archive ? admitted_archive->download.path : retained->path,
+    .archive_path = retained->path,
     .source_identity = source_identity,
     .output_root = image_root,
     .source = source_name,
     .shard = shard,
     .selected_image_ids = expected_ids,
-    .image_id_parser = member_parser ? member_parser : ArchiveImageIdParser{benchmark_archive_image_candidate},
+    .image_id_parser = benchmark_archive_image_candidate,
     .cancel_requested = cancel_requested,
     .progress =
      [&](const std::uint64_t completed, const std::uint64_t) {
@@ -290,12 +254,7 @@ public:
    progress->source_activity(source, "Retaining completed " + archive_name + " archive in cache");
    extracted.cache_hit = false;
    return extracted;
-  } catch (const RequiredImageDecodeError& error) {
-   if (!admitted_archive) throw;
-   throw_if_benchmark_cancelled(cancel_requested);
-   if (attempt_reported != 0U) transfer_progress->images(source, artifact.artifact_id, 0, source_total_images, *progress, "Withdrawing failed " + archive_name + " attempt");
-   throw PhysicalArchiveFailure(*admitted_archive, error.what());
-  } catch (const std::bad_alloc&) { throw; } catch (const InsufficientBenchmarkResources&) {
+  } catch (const RequiredImageDecodeError&) { throw; } catch (const std::bad_alloc&) { throw; } catch (const InsufficientBenchmarkResources&) {
    throw;
   } catch (const InsufficientBenchmarkStorage&) { throw; } catch (...) {
    last_error = std::current_exception();
@@ -307,7 +266,6 @@ public:
    }
    if (attempt_reported != 0U) { transfer_progress->images(source, artifact.artifact_id, 0, source_total_images, *progress, "Withdrawing failed " + archive_name + " attempt"); }
    throw_if_benchmark_cancelled(cancel_requested);
-   if (admitted_archive) throw PhysicalArchiveFailure(*admitted_archive, failure_reason);
    if (trace) try {
      if (std::filesystem::is_regular_file(request.destination)) {
       const auto digest = common_io::sha256_hex(common_io::sha256_file(request.destination, [&] { return cancel_requested.requested(); }));
@@ -341,19 +299,17 @@ struct SourceCompileCount {
 using BenchmarkImageRepair = std::function<bool(const std::filesystem::path&, const BenchmarkImageReadError&)>;
 template <std::ranges::random_access_range Directories>
 SourceCompileCount append_source_plan(BenchmarkCompilePipeline& execution, const BenchmarkImageRepair& repair, const NormalizedAnnotationReadView& index, const Directories& directories,
- const std::vector<std::uint64_t>* unavailable_image_ids, const bool require_every_image, BenchmarkSplitAssembly* split, mmltk::common::concurrency::CancellationObservation cancel_requested,
- std::uint64_t original_generation, std::optional<AnnotationSource> provenance = {}, std::span<const std::uint16_t> image_sources = {}, const CoconutComponent* label_owner = nullptr,
- const CoconutPhysicalMembership* physical = nullptr) {
+ const std::vector<std::uint64_t>* unavailable_image_ids, const bool require_every_image, PreparedBenchmarkSplit* split, BenchmarkSplitWriter& writer, mmltk::common::concurrency::CancellationObservation cancel_requested,
+ std::uint64_t original_generation) {
  if (directories.empty()) { throw std::runtime_error("benchmark source has no cached image directories"); }
- if (!image_sources.empty() && image_sources.size() != index.image_count()) throw std::runtime_error("benchmark component source membership is misaligned");
  if (unavailable_image_ids != nullptr && (!std::ranges::is_sorted(*unavailable_image_ids) || std::ranges::adjacent_find(*unavailable_image_ids) != unavailable_image_ids->end())) {
   throw std::runtime_error("benchmark unavailable image IDs must be sorted and unique");
  }
- const std::size_t source_base = split->data().sources.size();
- for (const CachedImageDirectory& directory : directories) { split->add_source(directory.path); }
+ const std::size_t source_base = split->sources.size();
+ for (const CachedImageDirectory& directory : directories) split->sources.push_back({directory.path});
  std::array<std::size_t, 51> objects_shards{};
  objects_shards.fill(std::numeric_limits<std::size_t>::max());
- if (image_sources.empty() && index.source == BenchmarkDatasetSource::kObjects365V2) {
+ if (index.source == BenchmarkDatasetSource::kObjects365V2) {
   for (std::size_t directory_index = 0U; directory_index < directories.size(); ++directory_index) {
    constexpr std::string_view prefix = "patch-";
    if (!std::string_view(directories[directory_index].shard).starts_with(prefix)) { throw std::runtime_error("Objects365 cache has an invalid shard identity"); }
@@ -387,25 +343,24 @@ SourceCompileCount append_source_plan(BenchmarkCompilePipeline& execution, const
    if (require_every_image) throw std::runtime_error("required benchmark image is unavailable");
    return;
   }
-  std::size_t local_source = image_sources.empty() ? 0U : image_sources[image_index];
-  if (image_sources.empty() && index.source == BenchmarkDatasetSource::kObjects365V2) {
+  std::size_t local_source = 0;
+  if (index.source == BenchmarkDatasetSource::kObjects365V2) {
    local_source = objects_shards[image.source_shard];
    if (local_source == std::numeric_limits<std::size_t>::max()) throw std::runtime_error("Objects365 image references an unacquired shard");
   }
   if (local_source >= directories.size()) throw std::runtime_error("benchmark component references an unacquired directory");
   auto& chunk = chunks[image_index];
   chunk.local_source = local_source;
-  chunk.dependency = label_owner ? label_owner->image_input_identity(image_index) : index.annotation_sha256;
+  chunk.dependency = index.annotation_sha256;
   const auto& root = directories[local_source].path;
   if (!execution.has_image_labels(root, image.source_image_id, chunk.dependency, original_generation) &&
       !execution.labels_ready(
-       label_owner ? physical->label_publication(label_owner->edition(), label_owner->inventory_image(image_index).physical) : execution.source_publication(root, {}, image.source_image_id),
-       image.source_image_id, label_owner ? label_owner->labels(image_index) : BenchmarkLabelInput(index, image_index), std::string(chunk.dependency), original_generation))
+       execution.source_publication(root, {}, image.source_image_id),
+       image.source_image_id, BenchmarkLabelInput(index, image_index), std::string(chunk.dependency), original_generation))
    throw RetiredBenchmarkLabelGeneration("benchmark required label generation retired before admission");
  };
  // All missing inputs enter the same per-image admission before any joins.
  // An early native conversion is either reused or joined, never raced by a fallback.
- for (std::size_t i = 0; i < chunks.size(); ++i) publish(i);
  SourceCompileCount counts{index.source, index.image_count(), 0U, 0U};
  const auto collect = [&](std::size_t image_index) {
   auto& chunk = chunks[image_index];
@@ -428,26 +383,25 @@ SourceCompileCount append_source_plan(BenchmarkCompilePipeline& execution, const
   }
   if (!product_owner) throw RetiredBenchmarkLabelGeneration("benchmark required label generation retired before assembly");
   const auto& product = *product_owner;
-  std::uint64_t ordinal_base = 0;
-  if (!product.labels.empty()) {
-   const auto canonical = index.storage().boxes[image.first_box].source_ordinal;
-   if (canonical < product.labels.front().source_ordinal) throw std::logic_error("benchmark provisional source ordinal exceeds canonical ordinal");
-   ordinal_base = canonical - product.labels.front().source_ordinal;
-  }
+  const auto physical_slot = execution.image_slot(directories[local_source].path, image.source_image_id);
+  if (!physical_slot) throw std::logic_error("benchmark label product has no physical slot");
+  const auto stored = writer.entry(*physical_slot);
   counts.dropped_boxes = common_math::checked_add(counts.dropped_boxes, product.dropped, "benchmark dropped box count overflow");
-  if (product.labels.empty() && !require_every_image) return;
+  if (!stored.num_instances && !require_every_image) return;
   EncodedImageRecord record{
-   image.source_image_id, product.width, product.height, common_math::checked_cast<std::uint16_t>(product.labels.size(), "per-image label count overflow"),
+   image.source_image_id, product.width, product.height, stored.num_instances,
    common_math::checked_cast<std::uint16_t>(source_base + local_source, "benchmark cached source index overflow"),
-   provenance.value_or(index.source == BenchmarkDatasetSource::kCoco2017       ? AnnotationSource::Coco
+   (index.source == BenchmarkDatasetSource::kCoco2017       ? AnnotationSource::Coco
                        : index.source == BenchmarkDatasetSource::kObjects365V2 ? AnnotationSource::Objects365
                                                                                : AnnotationSource::OpenImages)
   };
-  split->image(record, product_owner, ordinal_base);
+  split->images.push_back(record);
+  split->labels = common_math::checked_add(split->labels, static_cast<std::size_t>(stored.num_instances), "benchmark label count overflow");
+  split->runs = common_math::checked_add(split->runs, static_cast<std::size_t>(stored.num_runs), "benchmark run count overflow");
   counts.compiled_images = common_math::checked_add(counts.compiled_images, 1U, "benchmark compiled image count overflow");
-  counts.compiled_boxes = common_math::checked_add(counts.compiled_boxes, product.labels.size(), "benchmark compiled box count overflow");
+  counts.compiled_boxes = common_math::checked_add(counts.compiled_boxes, stored.num_instances, "benchmark compiled box count overflow");
  };
- for (std::size_t i = 0; i < chunks.size(); ++i) collect(i);
+ for (std::size_t i = 0; i < chunks.size(); ++i) { publish(i); collect(i); }
  return counts;
 }
 [[nodiscard]] PreparedBenchmarkSplit make_split(const std::string& name) {
@@ -578,6 +532,211 @@ void publish_benchmark_manifest(const BenchmarkCompilerConfig& config, const std
  write_json_atomically(staging_dir / "benchmark_manifest.json", facts, cancelled, storage);
 }
 }  // namespace benchmark_internal
+namespace benchmark_internal {
+namespace {
+void compile_coconut_sources(const BenchmarkCompilerConfig& config, const BenchmarkCacheLayout& cache, const CoconutRecipeCatalog& catalog, bool explicit_catalog,
+ BenchmarkCompilePipeline& pipeline, ProgressReporter& progress, CoconutFailureReport& failures, common_concurrency::CancellationObservation cancellation,
+ const BenchmarkTraceSink& trace, const BenchmarkImageReadObserver& image_opened, CocoAnnotationInputObserver stock_input, const std::function<void(std::exception_ptr)>& fail,
+ const std::function<void(BenchmarkDatasetSource, std::string_view)>& labels_started, const std::function<void()>& selection_started) {
+ common_io::StagingDirectory staging(config.output_dir, ".", ".benchmark.tmp.XXXXXX", "cannot create benchmark dataset staging directory");
+ auto train = make_split("train"), validation = make_split("val");
+ const BenchmarkWriteProgressEvent pixel_progress = progress.pixel_observer_enabled() ? BenchmarkWriteProgressEvent{
+  .context = &progress, .image_completed = [](void* owner) { static_cast<ProgressReporter*>(owner)->pixel_completed(); },
+  .images_invalidated = [](void* owner, std::uint64_t count) { static_cast<ProgressReporter*>(owner)->invalidate_pixels(count); }} : BenchmarkWriteProgressEvent{};
+ const auto request = [&](const PreparedBenchmarkSplit& split) {
+  return BenchmarkWriteRequest{split, staging.path() / (split.name + ".bin"), config.resolution, static_cast<int>(pipeline.workers()), pipeline.cpus(), false, cancellation,
+   pixel_progress, config.perceptual_downscale, config.resize_mode, image_opened, &pipeline};
+ };
+ BenchmarkSplitWriter train_writer(request(train), true), validation_writer(request(validation), true);
+ std::vector<AdmittedRecipeArchive> admitted;
+ admitted.reserve(catalog.images.size());
+ for (const auto& archive : catalog.images) admitted.push_back({archive, {}});
+ StorageReservationPool storage(cache.root, trace, &pipeline.storage());
+ CoconutPhysicalMembership membership(admitted, catalog, explicit_catalog, cache, storage, pipeline, cancellation,
+  [&](CoconutEdition, const AdmittedRecipeArchive& archive, std::uint64_t id, std::uint64_t entries) {
+   progress.transfers().images(archive.origin.artifact.source, archive.origin.artifact.artifact_id, entries, 0, progress);
+   trace_benchmark_event(trace, "benchmark.archive.image_ready", [&] { return nlohmann::json{{"artifact", archive.origin.artifact.artifact_id}, {"image_id", id}, {"entries", entries}}; });
+  });
+ BenchmarkCompilePipeline::Attempt retire(pipeline);
+ for (const auto source : {CoconutImageNamespace::CocoTrain, CoconutImageNamespace::CocoValidation, CoconutImageNamespace::Objects365V1, CoconutImageNamespace::Objects365V2}) {
+  const bool val = source == CoconutImageNamespace::CocoValidation || source == CoconutImageNamespace::Objects365V1;
+  pipeline.bind_source(membership.identity_root(source), val ? validation_writer : train_writer, source == CoconutImageNamespace::CocoValidation && config.selection.validation == CoconutValidation::Stock ? AnnotationSource::Coco : coconut_annotation_source(source));
+ }
+ if (trace) pipeline.label_configuration(config.resolution, config.resize_mode, {}, [&](const std::filesystem::path& root, std::uint64_t id) {
+  const bool validation = root == membership.identity_root(CoconutImageNamespace::CocoValidation) || root == membership.identity_root(CoconutImageNamespace::Objects365V1);
+  trace_benchmark_event(trace, "benchmark.labels.placed", [&] { return nlohmann::json{{"split", validation ? "val" : "train"}, {"image_id", id}}; });
+ });
+ pipeline.membership_ready();
+ if (progress.pixel_observer_enabled()) progress.pixels(0, 0, false);
+ std::mutex rejection_mutex;
+ nlohmann::json omitted = nlohmann::json::array();
+ const auto reject = [&](const CoconutPhysicalImage& image, std::string_view reason) {
+  failures.reject(image, image.image_id, "physical", 0, 0, reason);
+  const std::lock_guard lock(rejection_mutex);
+  omitted.push_back({{"source", coconut_namespace_name(image.source)}, {"image_id", image.image_id}, {"reason", reason}});
+ };
+ std::atomic<std::size_t> next{0};
+ std::vector<std::jthread> sources;
+ std::exception_ptr source_error;
+ std::mutex source_error_mutex;
+ // I/O controllers are independent of the CPU lane count. Even one assigned
+ // CPU can consume a ready archive while another connection is held.
+ const auto source_count = std::min<std::size_t>(kArchivePipelineConcurrency, admitted.size());
+ auto annotations = acquire_coconut_recipe_inputs(cache, catalog, progress, catalog.releases.size(), cancellation, trace,
+  pipeline.curl().limit(BenchmarkCurl::Class::Artifact), pipeline.cpus(), fail, &pipeline);
+ for (std::size_t lane = 0; lane < source_count; ++lane) sources.emplace_back([&] {
+  try {
+   for (;;) {
+    const auto index = next.fetch_add(1, std::memory_order_relaxed);
+    if (index >= admitted.size()) return;
+    auto& archive = admitted[index];
+    if (membership.consume(archive, reject, true)) continue;
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+     try {
+      auto download = acquire_physical_archive(archive, cache, progress, progress.transfers(), storage, pipeline.curl().limit(BenchmarkCurl::Class::Artifact), cancellation, trace, &pipeline);
+      membership.admitted(archive, std::move(download), attempt != 0);
+      membership.consume(archive, reject, false, attempt == 2);
+      break;
+     } catch (const BenchmarkDownloadUnavailable& error) {
+      progress.warning("Unavailable COCONut image source " + archive.origin.artifact.artifact_id + ": " + error.what());
+      membership.unavailable(archive);
+      break;
+     } catch (const BenchmarkArchiveError& error) {
+      if (attempt == 2) {
+       progress.warning("Rejected COCONut image source " + archive.origin.artifact.artifact_id + ": " + error.what());
+       membership.unavailable(archive);
+       break;
+      }
+      // A repair that is unavailable must retain readable rows from this input.
+      // Generation withdrawal occurs only after replacement bytes are admitted.
+      const auto artifact = make_download_request(cache, benchmark_source_name(archive.origin.artifact.source), archive.origin.artifact);
+      invalidate_download_artifact(artifact, cancellation, trace, &pipeline);
+     }
+    }
+   }
+  } catch (...) {
+   {
+    const std::lock_guard lock(source_error_mutex);
+    if (!source_error) source_error = std::current_exception();
+   }
+   fail(std::current_exception());
+  }
+ });
+ std::optional<CoconutRecipePreparation> recipe;
+ try {
+  recipe = prepare_coconut_recipe(config, cache, catalog, admitted, membership, progress, failures, pipeline.workers(), cancellation, trace,
+   annotations, &pipeline, {}, std::move(stock_input));
+ } catch (...) {
+  fail(std::current_exception());
+  sources.clear();
+  annotations.reset();
+  throw;
+ }
+ sources.clear();
+ if (source_error) std::rethrow_exception(source_error);
+ // Every producer has joined. Settle sibling claims before final selection so
+ // an active conversion cannot later replace a replay or borrow its ordinal base.
+ pipeline.drain();
+ if (selection_started) selection_started();
+ std::array<std::vector<std::uint32_t>, 2> selected;
+ std::array<std::uint64_t, 2> boxes{}, runs{};
+ std::map<BenchmarkDatasetSource, std::uint64_t> eligible_by_source;
+ const auto select = [&](const NormalizedAnnotationReadView& index, std::size_t position, const CoconutPhysicalImage& physical, const CoconutComponent* component,
+                         std::uint64_t original_generation, bool val) {
+  const auto& image = index.image(position);
+  const auto admitted = membership.find(physical.source, physical.image_id);
+  if (!admitted || *admitted != physical) { reject(physical, "ambiguous or unverified physical identity"); return; }
+  const auto root = membership.identity_root(physical.source);
+  auto& writer = val ? validation_writer : train_writer;
+  const auto slot = pipeline.image_slot(root, physical.image_id);
+  if (!slot || !writer.image_complete(*slot)) { reject(physical, "unreadable required pixels after bounded repair"); return; }
+  const auto actual = writer.dimensions(*slot);
+  if (actual != std::pair{image.width, image.height}) { reject(physical, "annotation canvas contradicts the image header"); return; }
+  if (component && !component->required_labels_valid(position)) { reject(physical, "all required foreground labels were rejected"); return; }
+  const auto dependency = component ? component->image_input_identity(position) : index.annotation_sha256;
+  const auto retained = pipeline.has_image_labels(root, physical.image_id, dependency, original_generation);
+  if (!retained && !pipeline.labels_ready(pipeline.source_publication(root, {}, physical.image_id), physical.image_id,
+   component ? component->labels(position) : BenchmarkLabelInput(index, position), dependency, original_generation,
+   component && component->edition() == CoconutEdition::Large ? 2U : 1U)) throw std::runtime_error("selected COCONut label generation retired before admission");
+  if (!pipeline.wait_image_labels(root, physical.image_id, dependency, original_generation)) throw std::runtime_error("selected COCONut label generation retired");
+  if (!pipeline.has_image_labels(root, physical.image_id, dependency, original_generation)) throw std::logic_error("selected COCONut label claim does not occupy its physical slot");
+  if (retained && component) writer.settle_labels(*slot, component->compiled_ordinal_base(position), !component->source_ordinals_complete(position));
+  const auto entry = writer.entry(*slot);
+  if (!entry.eligible()) { reject(physical, "required label product is unavailable"); return; }
+  selected[val].push_back(*slot);
+  ++eligible_by_source[physical.source == CoconutImageNamespace::Objects365V1 ? BenchmarkDatasetSource::kObjects365V1 : index.source];
+  boxes[val] += entry.num_instances;
+  runs[val] += entry.num_runs;
+ };
+ for (const auto& component : recipe->components) {
+  if (labels_started) labels_started(component.index().source, component.index().split);
+  const bool val = coconut_validation_component(component.edition());
+  for (std::size_t position = 0; position < component.index().image_count(); ++position)
+   select(component.index(), position, component.inventory_image(position).physical, &component, component.original_generation(), val);
+ }
+ if (recipe->stock_validation) {
+  const NormalizedAnnotationReadView index(*recipe->stock_validation);
+  for (std::size_t position = 0; position < index.image_count(); ++position) {
+   const auto id = index.image(position).source_image_id;
+   const auto* physical = membership.find(CoconutImageNamespace::CocoValidation, id);
+   if (physical) select(index, position, *physical, nullptr, recipe->stock_validation_generation, true);
+   else reject({CoconutImageNamespace::CocoValidation, id}, "stock validation image is unavailable");
+  }
+ }
+ pipeline.drain();
+ progress.source_images(BenchmarkDatasetSource::kCoconut, selected[0].size() + selected[1].size(), selected[0].size() + selected[1].size());
+ progress.source_complete(BenchmarkDatasetSource::kCoconut, recipe->annotation_cache_hit);
+ for (const auto source : {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2, BenchmarkDatasetSource::kObjects365V1}) {
+  std::uint64_t count = 0;
+  bool cached = true, present = false;
+  for (const auto& archive : admitted) if (archive.origin.artifact.source == source) { present = true; cached &= archive.download.cache_hit; }
+  count = eligible_by_source[source];
+  if (present) { progress.source_images(source, count, count); progress.source_complete(source, cached); }
+ }
+ progress.acquisition_complete();
+ if (selected[0].empty() || selected[1].empty()) throw std::runtime_error("required COCONut split contains no healthy samples");
+ progress.pixels(selected[0].size() + selected[1].size(), selected[0].size() + selected[1].size());
+ std::uint64_t rejected_objects = 0;
+ for (const auto& component : recipe->components) {
+  const auto& rejected = component.index().rejected;
+  for (const auto count : {rejected.malformed_records, rejected.degenerate_boxes, rejected.unmapped_categories}) rejected_objects = common_math::checked_add(rejected_objects, count, "COCONut rejection count overflow");
+ }
+ progress.rejected(rejected_objects, omitted.size());
+ progress.phase(DatasetCompilePhase::Syncing, 0, 3);
+ auto sealed_train = train_writer.seal_slots(request(train), selected[0]);
+ auto sealed_validation = validation_writer.seal_slots(request(validation), selected[1]);
+ sealed_train.artifact.publish(sealed_train.info.path, cancellation, BenchmarkStagedArtifact::Publication::DurableReplace, false);
+ sealed_validation.artifact.publish(sealed_validation.info.path, cancellation, BenchmarkStagedArtifact::Publication::DurableReplace, false);
+ progress.phase(DatasetCompilePhase::Syncing, 1, 3);
+ nlohmann::json manifest{{"recipe", recipe->manifest}, {"sources", recipe->manifest["components"]}, {"image_cache", nlohmann::json::array()}, {"quarantined_images", std::move(omitted)}};
+ std::uint64_t cached_image_bytes = 0;
+ for (const auto& archive : admitted) {
+  const auto facts = membership.summary(archive);
+  cached_image_bytes = common_math::checked_add(cached_image_bytes, facts.image_bytes, "COCONut cached image size overflow");
+  manifest["image_cache"].push_back({{"source", facts.source}, {"shard", facts.shard}, {"images", facts.image_count}, {"bytes", facts.image_bytes}, {"cache_hit", facts.cache_hit}, {"identity", facts.identity}});
+ }
+ manifest["cached_image_bytes"] = cached_image_bytes;
+ for (std::size_t i = 0; i < 2; ++i) {
+  const auto name = i ? "val" : "train";
+  manifest[name] = {{"images", selected[i].size()}, {"boxes", boxes[i]}, {"mask_rle_pairs", runs[i]}, {"bytes", std::filesystem::file_size(staging.path() / (std::string(name) + ".bin"))}};
+ }
+ manifest["compiled_bytes"] = manifest["train"]["bytes"].get<std::uint64_t>() + manifest["val"]["bytes"].get<std::uint64_t>();
+ manifest["projected_output_bytes"] = manifest["compiled_bytes"];
+ publish_benchmark_manifest(config, staging.path(), cache.root, std::move(manifest), cancellation, &pipeline.storage());
+ progress.phase(DatasetCompilePhase::Syncing, 2, 3);
+ sync_directory(staging.path());
+ progress.phase(DatasetCompilePhase::Syncing, 3, 3);
+ progress.phase(DatasetCompilePhase::Publishing, 0, 1);
+ progress.flush();
+ failures.flush();
+ publish_dataset_directory(staging.path(), config.output_dir, config.overwrite, cancellation, trace);
+ staging.published();
+ trace_benchmark_event(trace, "benchmark.publication.complete", [&] { return nlohmann::json{{"output", config.output_dir.string()}}; });
+ progress.phase(DatasetCompilePhase::Publishing, 1, 1);
+ progress.flush();
+}
+} // namespace
+} // namespace benchmark_internal
 void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config, const CoconutRecipeCatalog* explicit_catalog, const CustomRecipeCatalog* explicit_custom_catalog,
  const std::function<void(BenchmarkDatasetSource, std::string_view)>& source_labels_started, const BenchmarkImageReadObserver& image_opened, BenchmarkExecutionLimits limits,
  CocoAnnotationInputObserver stock_input, const std::function<void()>& selection_started) {
@@ -596,11 +755,6 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
    const std::lock_guard lock(failure_mutex);
    if (!failure) failure = std::move(error);
    internal.store(true, std::memory_order_relaxed);
-  }
-  void clear_failure() {
-   const std::lock_guard lock(failure_mutex);
-   failure = {};
-   internal.store(false, std::memory_order_relaxed);
   }
   void rethrow_failure() {
    std::exception_ptr error;
@@ -628,7 +782,6 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   };
   const BenchmarkTraceSink trace = make_trace_sink(config.trace);
   const bool coconut = config.selection.dataset == BenchmarkDatasetVariant::Coconut;
-  const std::string completion_slot = "coconut-" + std::to_string(static_cast<unsigned>(config.selection.validation));
   std::vector<BenchmarkDatasetSource> participating;
   if (coconut) {
    participating = {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2, BenchmarkDatasetSource::kCoconut};
@@ -692,72 +845,16 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   };
   const auto custom_catalog = explicit_custom_catalog ? *explicit_custom_catalog : coconut ? CustomRecipeCatalog{} : custom_recipe_catalog();
   const auto coconut_catalog = coconut ? (explicit_catalog ? *explicit_catalog : coconut_recipe_catalog(config.selection.validation)) : CoconutRecipeCatalog{};
-  std::vector<AdmittedRecipeArchive> admitted;
+  if (coconut) {
+   compile_coconut_sources(config, cache, coconut_catalog, explicit_catalog != nullptr, pipeline, progress, coconut_failures, cancel_requested, trace, image_opened, std::move(stock_input), fail_compile, source_labels_started, selection_started);
+   return;
+  }
   auto& physical_progress = progress.transfers();
-  StorageReservationPool physical_storage(cache.root, trace, &pipeline.storage());
   BenchmarkAllowance preparation_allowance;
-  std::shared_ptr<CoconutRecipeInputs> retained_annotation_inputs;
-  StopFailedAttempt stop_failed_inputs{cancel_signal, pipeline};
-  const auto input_budget = coconut ? coconut_catalog.releases.size() : std::size_t{2};
-  const auto acquire_annotations = [&] {
-   // Release controllers retain source leases until activation. Protect their
-   // inventory/original-index prerequisite before admitting those controllers.
-   preparation_allowance = pipeline.reserve(BenchmarkResources::handles(0, true, coco_annotation_resources().descriptors + coco_annotation_resources().continuation_descriptors));
-   return acquire_coconut_recipe_inputs(
-    cache, coconut_catalog, progress, input_budget, cancel_requested, trace, pipeline.curl().limit(BenchmarkCurl::Class::Artifact), compile_cpus, fail_compile, &pipeline);
-  };
-  if (coconut) retained_annotation_inputs = acquire_annotations();
-  if (coconut) {
-   admitted.reserve(coconut_catalog.images.size());
-   for (const auto& archive : coconut_catalog.images) admitted.push_back({archive, {}});
-   const auto physical_workers = std::max<std::size_t>(1, effective_num_workers);
-   const auto concurrency = std::min<std::size_t>({physical_workers, kArchivePipelineConcurrency, admitted.size()});
-   std::atomic<std::size_t> next{0};
-   common_concurrency::parallel_for_range_indexed<int>(0, static_cast<int>(concurrency), static_cast<int>(concurrency), std::span(compile_cpus).last(physical_workers), [&](int, int begin, int end) {
-    for (int lane = begin; lane < end; ++lane) {
-     (void)lane;
-     for (;;) {
-      const auto index = next.fetch_add(1, std::memory_order_relaxed);
-      if (index >= admitted.size()) break;
-      acquire_physical_archive(
-       admitted[index], cache, progress, physical_progress, physical_storage, std::max<std::size_t>(1, physical_workers / concurrency), cancel_requested, trace, {}, &pipeline, preparation_allowance);
-     }
-    }
-   });
-  }
-  std::optional<CoconutPhysicalMembership> membership;
-  if (coconut) {
-   CoconutPhysicalMembership::Progress observer;
-   if (progress.normalization_observer_enabled() || trace)
-    observer = [&](CoconutEdition edition, const AdmittedRecipeArchive& archive, std::uint64_t image_id, std::uint64_t entries) {
-     const auto& artifact = archive.origin.artifact.artifact_id;
-     progress.source_activity(
-      BenchmarkDatasetSource::kCoconut, "Resolving image " + std::to_string(image_id) + " in " + artifact + ": " + std::to_string(entries) + " archive entries inspected", false, false);
-     trace_benchmark_event(trace, "benchmark.archive.resolution", [&] { return nlohmann::json{{"edition", edition}, {"artifact", artifact}, {"image_id", image_id}, {"entries", entries}}; });
-    };
-   membership.emplace(admitted, coconut_catalog, explicit_catalog != nullptr, cache, physical_storage, pipeline, cancel_requested, std::move(observer));
-  }
-  // Release importers borrow the physical membership owner.
-  // Retire them before either borrowed owner unwinds on every exit path.
-  struct RetireCoconutInputs {
-   std::shared_ptr<CoconutRecipeInputs>& inputs;
-   ~RetireCoconutInputs() { inputs.reset(); }
-  } retire_coconut_inputs{retained_annotation_inputs};
+  constexpr std::size_t input_budget = 2;
   std::unique_ptr<common_io::StagingDirectory> staging_owner;
   std::unique_ptr<BenchmarkSplitWriter> retained_train_pixels, retained_validation_pixels;
-  const auto invalidate_physical_pixels = [&](const AdmittedRecipeArchive& archive) {
-   const auto root = cache.source_images(benchmark_source_name(archive.origin.artifact.source)) / archive.origin.cache_shard;
-   pipeline.retire_source(root);
-   if (retained_train_pixels) retained_train_pixels->invalidate_source(root);
-   if (retained_validation_pixels) retained_validation_pixels->invalidate_source(root);
-  };
-  // Keep the output lease, resource budgets and physical admissions alive across
-  // preparation attempts. Failed staged files and dependent plans unwind before
-  // the single physical owner advances; successful unrelated caches remain valid.
-  for (;;) {
-   try {
     CustomRecipePreparation custom{};
-    std::optional<CoconutRecipePreparation> enhanced;
     struct PrefetchedArchive {
      std::optional<DownloadResult> download;
      std::shared_ptr<ArtifactLease> lease;
@@ -766,7 +863,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     std::array<bool, 2> prefetched_ready{};
     std::array<std::future<PrefetchedArchive>, 2> custom_transfers;
     StopFailedAttempt stop_failed_attempt{cancel_signal, pipeline};
-    const auto custom_transfer_budget = coconut ? 0 : input_budget;
+    const auto custom_transfer_budget = input_budget;
     if (custom_transfer_budget) {
      // Prefetched leases may wait for metadata to select images. Reserve that
      // metadata's existing envelope before either prefetch can retain capacity.
@@ -809,14 +906,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
        }
       });
     }
-    if (coconut) {
-     if (!retained_annotation_inputs) retained_annotation_inputs = acquire_annotations();
-     const auto preparation_budget = effective_num_workers;
-     common_concurrency::parallel_for_range_indexed<int>(0, 1, 1, std::span(compile_cpus).last(preparation_budget), [&](int, int, int) {
-      enhanced = prepare_coconut_recipe(config, cache, coconut_catalog, admitted, *membership, progress, coconut_failures, preparation_budget, cancel_requested, trace, true,
-       retained_annotation_inputs, &pipeline, std::move(preparation_allowance), stock_input);
-     });
-    } else {
+    {
      const auto preparation_budget = effective_num_workers;
      custom = prepare_custom_recipe(
       config, cache, custom_catalog, progress, preparation_budget, cancel_requested, trace, std::span(compile_cpus).last(preparation_budget), &pipeline, std::move(preparation_allowance));
@@ -843,15 +933,11 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      auto& labels = validation ? selected_val_labels : selected_train_labels;
      auto& masks = validation ? val_masks : train_masks;
      images = common_math::checked_add(images, index.image_count(), "benchmark selected image count overflow");
-     labels = common_math::checked_add(labels, enhanced ? 0U : index.box_count(), "benchmark selected label count overflow");
-     masks = common_math::checked_add(masks, enhanced ? 0U : index.run_count(), "benchmark selected mask count overflow");
+     labels = common_math::checked_add(labels, index.box_count(), "benchmark selected label count overflow");
+     masks = common_math::checked_add(masks, index.run_count(), "benchmark selected mask count overflow");
     };
     std::vector<std::uint64_t> archive_sizes;
-    if (enhanced) {
-     for (const auto& component : enhanced->components) count_index(component.index(), coconut_validation_component(component.edition()));
-     if (enhanced->stock_validation) count_index(NormalizedAnnotationReadView(*enhanced->stock_validation), true);
-     for (const auto& archive : admitted) archive_sizes.push_back(archive.origin.artifact.expected_size);
-    } else {
+    {
      count_index(*coco_train, false);
      count_index(*objects, false);
      count_index(*open_images, false);
@@ -865,12 +951,12 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     std::uint64_t retained_archive_bytes = 0U;
     for (const std::uint64_t archive_size : archive_sizes) { retained_archive_bytes = common_math::checked_add(retained_archive_bytes, archive_size, "benchmark archive cache estimate overflow"); }
     const std::uint64_t projected_cache = common_math::checked_add(common_math::checked_multiply(selected_total_images, kEstimatedJpegBytes, "benchmark cache estimate overflow"),
-     common_math::checked_add(retained_archive_bytes, enhanced ? enhanced->annotation_storage_bytes : 0U, "benchmark annotation cache estimate overflow"), "benchmark cache estimate overflow");
+     common_math::checked_add(retained_archive_bytes, 0U, "benchmark annotation cache estimate overflow"), "benchmark cache estimate overflow");
     trace_benchmark_event(trace, "benchmark.storage.projection",
      [&] { return nlohmann::json{{"cache_bytes_upper_bound", projected_cache}, {"compiled_output_bytes", projected_output_bytes}, {"selected_images", selected_total_images}}; });
     progress.projected(projected_output_bytes);
     progress.activity("Checking projected benchmark storage");
-    if (!enhanced) require_storage(cache.root, projected_cache, "benchmark image cache and active archives", trace);
+    require_storage(cache.root, projected_cache, "benchmark image cache and active archives", trace);
     const auto retained_allocation = (retained_train_pixels ? retained_train_pixels->allocated_bytes() : 0) + (retained_validation_pixels ? retained_validation_pixels->allocated_bytes() : 0);
     require_storage(output_parent, projected_output_bytes > retained_allocation ? projected_output_bytes - retained_allocation : 0, "benchmark pixels and currently admitted annotations", trace);
     progress.phase(DatasetCompilePhase::Extracting);
@@ -878,8 +964,8 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     auto& image_transfer_progress = progress.transfers();
     StorageReservationPool cache_storage_reservations(cache.root, trace, &pipeline.storage());
     std::vector<QuarantinedImage> quarantined;
-    const std::vector<std::uint64_t> coco_train_ids = coconut ? std::vector<std::uint64_t>{} : image_ids(*coco_train);
-    const std::vector<std::uint64_t> coco_val_ids = coconut ? std::vector<std::uint64_t>{} : image_ids(*coco_val);
+    const std::vector<std::uint64_t> coco_train_ids = image_ids(*coco_train);
+    const std::vector<std::uint64_t> coco_val_ids = image_ids(*coco_val);
     const std::uint64_t coco_selected_images = common_math::checked_add(coco_train_ids.size(), coco_val_ids.size(), "COCO selected image count overflow");
     const std::vector<CatalogArtifact> object_artifacts = custom_catalog.objects_images;
     struct ArchiveTask {
@@ -887,47 +973,11 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      std::string shard;
      std::vector<std::uint64_t> image_ids;
      CatalogArtifact artifact;
-     std::unordered_map<std::string, std::uint64_t> members{};
-     CoconutImageNamespace image_namespace = CoconutImageNamespace::CocoTrain;
      std::uint16_t numeric_shard = 0;
-     AdmittedRecipeArchive* admitted = nullptr;
      std::filesystem::path root{};
     };
-    const auto archive_member_parser = [](const ArchiveTask& task) -> ArchiveImageIdParser {
-     if (task.members.empty()) return {};
-     return [&task](std::string_view raw) -> std::optional<std::uint64_t> {
-      // Extraction visits directory headers too; inventory admits these roots.
-      if (raw == "." || raw == "./") return std::nullopt;
-      const auto member = canonical_benchmark_archive_member(raw);
-      const auto found = task.members.find(member);
-      return found == task.members.end() ? std::nullopt : std::optional(found->second);
-     };
-    };
     std::vector<ArchiveTask> archive_tasks;
-    if (enhanced) {
-     std::map<std::pair<CoconutImageNamespace, std::uint16_t>, std::size_t> task_slots;
-     for (auto& acquired : admitted) {
-      const auto& archive = acquired.origin;
-      if (!task_slots.emplace(std::pair{archive.source, archive.shard}, archive_tasks.size()).second) throw std::runtime_error("COCONut physical archive catalog contains a duplicate source/shard");
-      archive_tasks.push_back({archive.artifact.source, archive.cache_shard, {}, archive.artifact, {}, archive.source, archive.shard, &acquired});
-     }
-     for (const auto& component : enhanced->components)
-      for (const auto& row : component.inventory()) {
-       throw_if_benchmark_cancelled(cancel_requested);
-       auto& task = archive_tasks.at(task_slots.at({row.physical.source, row.physical.shard}));
-       task.image_ids.push_back(row.physical.image_id);
-       if (!task.members.emplace(row.physical.member, row.physical.image_id).second) throw std::runtime_error("COCONut recipe repeats a physical archive member");
-      }
-     if (enhanced->stock_validation) {
-      auto& task = archive_tasks.at(task_slots.at({CoconutImageNamespace::CocoValidation, 0}));
-      task.image_ids = image_ids(NormalizedAnnotationReadView(*enhanced->stock_validation));
-     }
-     for (auto& task : archive_tasks) {
-      std::ranges::sort(task.image_ids);
-      if (std::ranges::adjacent_find(task.image_ids) != task.image_ids.end()) throw std::runtime_error("COCONut recipe repeats a physical image ID");
-     }
-     std::erase_if(archive_tasks, [](const auto& task) { return task.image_ids.empty(); });
-    } else {
+    {
      archive_tasks.reserve(object_artifacts.size() + 2U);
      archive_tasks.push_back(ArchiveTask{BenchmarkDatasetSource::kCoco2017, "train2017", coco_train_ids, custom_catalog.coco_train_images});
      archive_tasks.push_back(ArchiveTask{BenchmarkDatasetSource::kCoco2017, "val2017", coco_val_ids, custom_catalog.coco_val_images});
@@ -939,14 +989,12 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       auto ids = std::move(shard_ids[shard]);
       if (!ids.empty()) {
        archive_tasks.push_back(
-        ArchiveTask{BenchmarkDatasetSource::kObjects365V2, "patch-" + std::to_string(shard), std::move(ids), object_artifacts[shard], {}, CoconutImageNamespace::Objects365V2, numeric_shard});
+        ArchiveTask{BenchmarkDatasetSource::kObjects365V2, "patch-" + std::to_string(shard), std::move(ids), object_artifacts[shard], numeric_shard});
       }
      }
     }
     if (archive_tasks.empty()) throw std::runtime_error("benchmark recipe has no physical image membership");
     std::map<BenchmarkDatasetSource, std::uint64_t> source_totals;
-    std::map<CoconutImageNamespace, std::vector<std::size_t>> namespace_tasks;
-    std::map<std::pair<CoconutImageNamespace, std::uint16_t>, std::uint16_t> namespace_slots;
     std::map<std::pair<BenchmarkDatasetSource, std::string>, std::vector<std::size_t>> source_tasks;
     std::map<std::filesystem::path, std::size_t> root_tasks;
     for (std::size_t i = 0; i < archive_tasks.size(); ++i) {
@@ -954,19 +1002,15 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      task.root = cache.source_images(benchmark_source_name(task.source)) / task.shard;
      root_tasks.emplace(task.root, i);
      source_totals[task.source] = common_math::checked_add(source_totals[task.source], task.image_ids.size(), "benchmark source total overflow");
-     auto& group = namespace_tasks[task.image_namespace];
-     namespace_slots.emplace(std::pair{task.image_namespace, task.numeric_shard}, common_math::checked_cast<std::uint16_t>(group.size(), "benchmark directory count overflow"));
-     group.push_back(i);
      source_tasks[{task.source, task.source == BenchmarkDatasetSource::kCoco2017 ? task.shard : std::string{}}].push_back(i);
     }
     // Assign stable physical slots for the current normalized membership.
     // Label projection and acquisition publish independently into these slots.
     PreparedBenchmarkSplit pixel_train = make_split("train"), pixel_validation = make_split("val");
-    const auto append_pixel_members = [&](const NormalizedAnnotationReadView& index, bool validation_split, std::optional<CoconutImageNamespace> physical_source = {},
-                                       const CoconutComponent* physical_rows = nullptr) {
+    const auto append_pixel_members = [&](const NormalizedAnnotationReadView& index, bool validation_split) {
      auto& split = validation_split ? pixel_validation : pixel_train;
      std::unordered_map<std::uint16_t, std::uint16_t> source_slots;
-     const auto& tasks = physical_source ? namespace_tasks.at(*physical_source) : source_tasks[{index.source, index.source == BenchmarkDatasetSource::kCoco2017 ? index.split : std::string{}}];
+     const auto& tasks = source_tasks[{index.source, index.source == BenchmarkDatasetSource::kCoco2017 ? index.split : std::string{}}];
      for (const auto task_index : tasks) {
       const auto& task = archive_tasks[task_index];
       source_slots.emplace(task.numeric_shard, common_math::checked_cast<std::uint16_t>(split.sources.size(), "benchmark pixel source count overflow"));
@@ -978,15 +1022,12 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      }
      for (std::size_t i = 0; i < index.image_count(); ++i) {
       const auto& image = index.image(i);
-      if (!physical_source && !validation_split && !image.box_count) continue;
-      const auto shard = physical_rows ? physical_rows->inventory_image(i).physical.shard : image.source_shard;
+      if (!validation_split && !image.box_count) continue;
+      const auto shard = image.source_shard;
       split.images.push_back({image.source_image_id, image.width, image.height, 0, source_slots.at(shard)});
      }
     };
-    if (enhanced) {
-     for (const auto& component : enhanced->components) append_pixel_members(component.index(), coconut_validation_component(component.edition()), component.source(), &component);
-     if (enhanced->stock_validation) append_pixel_members(NormalizedAnnotationReadView(*enhanced->stock_validation), true, CoconutImageNamespace::CocoValidation);
-    } else {
+    {
      append_pixel_members(*coco_train, false);
      append_pixel_members(*objects, false);
      append_pixel_members(*open_images, false);
@@ -1002,38 +1043,40 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
                                                            .images_invalidated = [](void* context, std::uint64_t count) { static_cast<ProgressReporter*>(context)->invalidate_pixels(count); }
                                                           }
                                                         : BenchmarkWriteProgressEvent{};
+    const auto empty_train = make_split("train"), empty_validation = make_split("val");
     const BenchmarkWriteRequest train_pixel_request{
-     pixel_train, staging_dir / "train.bin", config.resolution, static_cast<int>(pixel_lanes), {}, false, cancel_requested, pixel_progress, config.perceptual_downscale, config.resize_mode,
+     empty_train, staging_dir / "train.bin", config.resolution, static_cast<int>(pixel_lanes), {}, false, cancel_requested, pixel_progress, config.perceptual_downscale, config.resize_mode,
      image_opened, &pipeline
     };
     const BenchmarkWriteRequest validation_pixel_request{
-     pixel_validation, staging_dir / "val.bin", config.resolution, static_cast<int>(pixel_lanes), {}, false, cancel_requested, pixel_progress, config.perceptual_downscale, config.resize_mode,
+     empty_validation, staging_dir / "val.bin", config.resolution, static_cast<int>(pixel_lanes), {}, false, cancel_requested, pixel_progress, config.perceptual_downscale, config.resize_mode,
      image_opened, &pipeline
     };
-    const auto reserve_pixels = [&](std::unique_ptr<BenchmarkSplitWriter>& retained, const BenchmarkWriteRequest& request, bool actual_dimensions) {
-     if (retained && retained->matches_membership(request.split)) return;
-     auto replacement = std::make_unique<BenchmarkSplitWriter>(request, actual_dimensions);
-     if (retained) replacement->retain_completed(*retained);
-     retained = std::move(replacement);
-    };
-    reserve_pixels(retained_train_pixels, train_pixel_request, coconut);
-    reserve_pixels(retained_validation_pixels, validation_pixel_request, coconut && config.selection.validation != CoconutValidation::Stock);
+    retained_train_pixels = std::make_unique<BenchmarkSplitWriter>(train_pixel_request, true);
+    retained_validation_pixels = std::make_unique<BenchmarkSplitWriter>(validation_pixel_request, true);
     if (progress.pixel_observer_enabled()) progress.pixels(retained_train_pixels->completed() + retained_validation_pixels->completed(), selected_total_images);
     auto& train_writer = *retained_train_pixels;
     auto& validation_writer = *retained_validation_pixels;
     BenchmarkCompilePipeline::Attempt retire_pixels(pipeline);
     StopFailedAttempt stop_pixel_attempt{cancel_signal, pipeline};
     pipeline.membership_ready();
-    pipeline.register_split(train_writer, pixel_train);
-    pipeline.register_split(validation_writer, pixel_validation);
+    for (const auto* membership : {&pixel_train, &pixel_validation})
+     for (const auto& source : membership->sources) {
+      const auto source_kind = source.root == cache.source_images("open-images") / "train" ? AnnotationSource::OpenImages : source.root.parent_path() == cache.source_images(benchmark_source_name(BenchmarkDatasetSource::kObjects365V2)) ? AnnotationSource::Objects365 : AnnotationSource::Coco;
+      pipeline.bind_source(source.root, membership == &pixel_train ? train_writer : validation_writer, source_kind);
+     }
     std::vector<std::optional<CachedImageDirectory>> archive_results(archive_tasks.size());
-    const auto make_assembly = [&](const std::string& name) { return BenchmarkSplitAssembly(name, coco80_class_names(), config.resolution, config.resize_mode); };
-    auto train = make_assembly("train");
-    auto validation = make_assembly("val");
-    const auto materialize = [&](BenchmarkSplitAssembly& split) {
-     split.materialize(pipeline, cancel_requested);
-     trace_benchmark_event(trace, "benchmark.labels.placed",
-      [&] { return nlohmann::json{{"split", split.data().name}, {"images", split.data().images.size()}, {"labels", split.label_count()}, {"runs", split.run_count()}}; });
+    auto train = make_split("train");
+    auto validation = make_split("val");
+    const auto append_metadata = [&](PreparedBenchmarkSplit& target, PreparedBenchmarkSplit source) {
+     const auto base = target.sources.size();
+     for (auto image : source.images) {
+      image.source_index = common_math::checked_cast<std::uint16_t>(base + image.source_index, "benchmark source count overflow");
+      target.images.push_back(image);
+     }
+     target.sources.insert(target.sources.end(), std::make_move_iterator(source.sources.begin()), std::make_move_iterator(source.sources.end()));
+     target.labels = common_math::checked_add(target.labels, source.labels, "benchmark label count overflow");
+     target.runs = common_math::checked_add(target.runs, source.runs, "benchmark run count overflow");
     };
     const std::size_t configured_workers = pipeline.workers();
     const int acquisition_num_workers = static_cast<int>(configured_workers);
@@ -1062,12 +1105,8 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      const auto geometry = pipeline.geometry(source_root, error.source_image_id());
      const ImageDecodeProbe decode_probe{
       error.source_image_id(),
-      geometry  ? geometry->width
-      : coconut ? 0U
-                : failed_record->source_width,
-      geometry  ? geometry->height
-      : coconut ? 0U
-                : failed_record->source_height
+      geometry ? geometry->width : failed_record->source_width,
+      geometry ? geometry->height : failed_record->source_height
      };
      trace_benchmark_event(
       trace, "benchmark.pixel_compile.cache_repair", [&] { return nlohmann::json{{"source", source_root.string()}, {"image_id", error.source_image_id()}, {"attempt", 1}, {"reason", error.what()}}; });
@@ -1098,19 +1137,18 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      const auto& task = archive_tasks[route->second];
      progress.source_activity(task.source, "Repairing failed cached JPEG " + std::to_string(error.source_image_id()) + " from " + task.shard);
      auto repaired = acquire_archive_images(cache, task.source, task.shard, task.image_ids, task.artifact, cancel_requested, &progress, &progress.transfers(), &cache_storage_reservations,
-      source_totals.at(task.source), decompression_workers, archive_cache_workers, archive_download_connections, trace, decode_probe, coconut, archive_member_parser(task), completion_slot,
-      task.admitted, nullptr, {}, &pipeline);
+      source_totals.at(task.source), decompression_workers, archive_cache_workers, archive_download_connections, trace, decode_probe, nullptr, {}, &pipeline);
      if (repaired.image_count + repaired.quarantined.size() != task.image_ids.size()) throw std::runtime_error("archive repair did not resolve every selected image");
      const bool available = std::ranges::none_of(repaired.quarantined, [&](const auto& rejected) { return rejected.image_id == error.source_image_id(); });
      archive_results[route->second] = std::move(repaired);
      return available;
     };
     std::mutex custom_labels_mutex;
-    std::array<BenchmarkSplitAssembly, 4> custom_label_plans;
+    std::array<PreparedBenchmarkSplit, 4> custom_label_plans;
     std::array<SourceCompileCount, 4> custom_label_counts{};
     std::array<bool, 4> custom_labels_ready{};
-    std::atomic<std::size_t> pending_object_archives{coconut ? 0 : archive_tasks.size() - 2};
-    const std::size_t kLabelPlanCount = enhanced ? enhanced->components.size() + static_cast<std::size_t>(enhanced->stock_validation.has_value()) : 4U;
+    std::atomic<std::size_t> pending_object_archives{archive_tasks.size() - 2};
+    const std::size_t kLabelPlanCount = 4U;
     progress.label_plans(kLabelPlanCount);
     const auto prepare_source_labels = [&](std::size_t slot, const NormalizedAnnotationReadView& index, std::vector<CachedImageDirectory> directories) {
      std::vector<std::uint64_t> unavailable;
@@ -1123,9 +1161,8 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      unavailable.erase(std::unique(unavailable.begin(), unavailable.end()), unavailable.end());
      progress.label_plan_started(slot);
      if (source_labels_started) source_labels_started(index.source, index.split);
-     auto plan = make_assembly(slot == 3 ? "val" : "train");
-     custom_label_counts[slot] = append_source_plan(pipeline, repair_image_input, index, directories, unavailable.empty() ? nullptr : &unavailable, slot == 3, &plan, cancel_requested, 0, {}, {});
-     bool place = slot == 3;
+     auto plan = make_split(slot == 3 ? "val" : "train");
+     custom_label_counts[slot] = append_source_plan(pipeline, repair_image_input, index, directories, unavailable.empty() ? nullptr : &unavailable, slot == 3, &plan, slot == 3 ? validation_writer : train_writer, cancel_requested, 0);
      {
       const std::lock_guard lock(custom_labels_mutex);
       custom_label_plans[slot] = std::move(plan);
@@ -1133,17 +1170,13 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       if (slot == 3)
        validation = std::move(custom_label_plans[slot]);
       else if (custom_labels_ready[0] && custom_labels_ready[1] && custom_labels_ready[2]) {
-       for (std::size_t source = 0; source < 3; ++source) train.append(std::move(custom_label_plans[source]));
-       place = true;
+       for (std::size_t source = 0; source < 3; ++source) append_metadata(train, std::move(custom_label_plans[source]));
       }
      }
-     // The last source controller places only its completed split. Independent
-     // acquisition and the other split never wait on this join or hold its lock.
-     if (place) materialize(slot == 3 ? validation : train);
      progress.label_plan_completed(slot);
     };
     const auto archive_labels_ready = [&](std::size_t task) {
-     if (coconut) return;
+
      if (task < 2)
       prepare_source_labels(task == 0 ? 0 : 3, task == 0 ? *coco_train : *coco_val, {*archive_results[task]});
      else if (pending_object_archives.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -1165,62 +1198,10 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     // physical geometry. It does not depend on training release completion.
     SourceCompileCount validation_count;
     std::uint64_t validation_target_dropped_boxes = 0;
-    std::optional<CoconutRecipePreparation> early_validation;
-    bool validation_placed = false;
-    const auto component_labels = [&](const CoconutComponent& component, BenchmarkSplitAssembly& split) {
-     const auto& tasks = namespace_tasks.at(component.source());
-     std::vector<CachedImageDirectory> directories;
-     directories.reserve(tasks.size());
-     for (const auto task : tasks) directories.push_back({.shard = archive_tasks[task].shard, .path = archive_tasks[task].root});
-     std::vector<std::uint16_t> image_sources;
-     image_sources.reserve(component.index().image_count());
-     for (const auto& row : component.inventory()) image_sources.push_back(namespace_slots.at({row.physical.source, row.physical.shard}));
-     return append_source_plan(pipeline, repair_image_input, component.index(), directories, nullptr, true, &split, cancel_requested, component.original_generation(),
-      coconut_annotation_source(component.source()), image_sources, &component, &*membership);
-    };
-    const auto prepare_validation = [&](const CoconutRecipePreparation& recipe) {
-     auto prepared = make_assembly("val");
-     std::uint64_t dropped = 0;
-     for (const auto& component : recipe.components) {
-      if (!coconut_validation_component(component.edition())) continue;
-      const auto found =
-       std::ranges::find_if(enhanced->components, [&](const CoconutComponent& expected) { return expected.edition() == component.edition() && expected.source() == component.source(); });
-      if (found == enhanced->components.end()) throw RetiredBenchmarkLabelGeneration("COCONut validation membership changed before placement");
-      const auto slot = static_cast<std::size_t>(found - enhanced->components.begin());
-      progress.label_plan_started(slot);
-      const auto count = component_labels(component, prepared);
-      dropped = common_math::checked_add(dropped, count.dropped_boxes, "COCONut rejected annotation count overflow");
-      progress.label_plan_completed(slot);
-     }
-     if (recipe.stock_validation) {
-      const auto slot = enhanced->components.size();
-      progress.label_plan_started(slot);
-      const auto task = namespace_tasks.at(CoconutImageNamespace::CocoValidation).front();
-      const std::array directories{CachedImageDirectory{.shard = archive_tasks[task].shard, .path = archive_tasks[task].root}};
-      validation_count = append_source_plan(
-       pipeline, repair_image_input, NormalizedAnnotationReadView(*recipe.stock_validation), directories, nullptr, true, &prepared, cancel_requested, recipe.stock_validation_generation);
-      progress.label_plan_completed(slot);
-     }
-     materialize(prepared);
-     validation = std::move(prepared);
-     validation_target_dropped_boxes = dropped;
-     validation_placed = true;
-    };
-    std::jthread validation_preparation;
-    if (enhanced)
-     validation_preparation = std::jthread([&] {
-      try {
-       early_validation = wait_coconut_validation(enhanced->inputs, config.selection.validation);
-       prepare_validation(*early_validation);
-      } catch (const RetiredBenchmarkLabelGeneration&) {
-       // Original repair may withdraw a provisional snapshot. Final recipe
-       // admission rebuilds it; the old immutable custody cannot publish.
-      } catch (...) { record_pipeline_error(); }
-     });
     StopFailedAttempt stop_validation_attempt{cancel_signal, pipeline};
     // These are I/O controllers. Their CPU chunks use the compile owner, with
     // no reserved pixel/input/archive partition or nested cache CPU pool.
-    const bool overlap_open_images = !coconut;
+    const bool overlap_open_images = true;
     const int archive_workers = static_cast<int>(std::min(archive_tasks.size(), configured_workers));
     std::thread open_images_thread;
     if (overlap_open_images) {
@@ -1254,7 +1235,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
        throw_if_benchmark_cancelled(cancel_requested);
        for (auto it = waiting_archives.begin(); it != waiting_archives.end(); ++it) {
         const auto index = it->index;
-        const bool coco = !coconut && index < custom_transfers.size();
+        const bool coco = index < custom_transfers.size();
         if (coco && custom_transfers[index].valid()) {
          if (!prefetched_ready[index]) continue;
          ready_prefetch[index] = custom_transfers[index].get();
@@ -1324,8 +1305,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
         const std::uint64_t source_total = source_totals.at(task.source);
         try {
          archive_results[task_index] = acquire_archive_images(cache, task.source, task.shard, task.image_ids, task.artifact, cancel_requested, &progress, &image_transfer_progress,
-          &cache_storage_reservations, source_total, decompression_workers, archive_cache_workers, archive_download_connections, trace, {}, coconut, archive_member_parser(task), completion_slot,
-          task.admitted, prefetch.download ? &*prefetch.download : nullptr, std::move(prefetch.lease), &pipeline);
+          &cache_storage_reservations, source_total, decompression_workers, archive_cache_workers, archive_download_connections, trace, {}, prefetch.download ? &*prefetch.download : nullptr, std::move(prefetch.lease), &pipeline);
          archive_labels_ready(task_index);
         } catch (...) {
          record_pipeline_error();
@@ -1335,7 +1315,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       }
      });
     } catch (...) { record_pipeline_error(); }
-    if (!coconut && !overlap_open_images && !pipeline_error) {
+    if (!overlap_open_images && !pipeline_error) {
      try {
       common_concurrency::parallel_for_range_indexed<int>(0, 1, 1, pipeline.cpus(), [&](int, int, int) {
        open_image_result = acquire_open_images(cache, *open_images, &quarantined, cancel_requested, &progress, acquisition_num_workers, open_cache_workers, trace, {}, &pipeline);
@@ -1344,7 +1324,6 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      } catch (...) { record_pipeline_error(); }
     }
     if (open_images_thread.joinable()) { open_images_thread.join(); }
-    if (validation_preparation.joinable()) validation_preparation.join();
     if (pipeline_error) {
      try {
       pipeline.drain();
@@ -1353,12 +1332,12 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      cancellation_state.rethrow_failure();
      std::rethrow_exception(pipeline_error);
     }
-    if (!coconut && !open_image_result) { throw std::runtime_error("Open Images acquisition did not complete"); }
+    if (!open_image_result) { throw std::runtime_error("Open Images acquisition did not complete"); }
     std::vector<CachedImageDirectory> coco_train_images;
     std::vector<CachedImageDirectory> coco_val_images;
     std::vector<CachedImageDirectory> object_images;
     std::vector<CachedImageDirectory> open_image_directories;
-    if (!coconut) {
+    {
      std::optional<CachedImageDirectory>& coco_train_result = archive_results[0];
      std::optional<CachedImageDirectory>& coco_val_result = archive_results[1];
      if (!coco_train_result.has_value() || !coco_val_result.has_value()) { throw std::runtime_error("COCO image extraction did not complete"); }
@@ -1420,138 +1399,49 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      sort_unique(&objects_unavailable_ids);
      sort_unique(&open_images_unavailable_ids);
     };
-    if (!coconut) {
+    {
      refresh_archive_availability();
      progress.source_images(BenchmarkDatasetSource::kCoco2017, coco_selected_images, coco_selected_images);
      progress.source_complete(BenchmarkDatasetSource::kCoco2017, coco_indexes_cache_hit && coco_train_images.front().cache_hit && coco_val_images.front().cache_hit);
      progress.source_complete(
       BenchmarkDatasetSource::kObjects365V2, objects_index_cache_hit && std::ranges::all_of(object_images, [](const CachedImageDirectory& directory) { return directory.cache_hit; }));
      progress.source_complete(BenchmarkDatasetSource::kOpenImagesV7, open_images_index_cache_hit && open_image_result->directory.cache_hit);
-    } else {
-     for (const auto& [source, total] : source_totals) {
-      progress.source_images(source, total, total);
-      bool cache_hit = enhanced->annotation_cache_hit;
-      for (std::size_t i = 0; i < archive_tasks.size(); ++i)
-       if (archive_tasks[i].source == source) cache_hit = cache_hit && archive_results[i] && archive_results[i]->cache_hit;
-      progress.source_complete(source, cache_hit);
-     }
     }
-    if (!enhanced) progress.acquisition_complete();
-    if (enhanced) {
-     auto complete =
-      prepare_coconut_recipe(config, cache, coconut_catalog, admitted, *membership, progress, coconut_failures, 1, cancel_requested, trace, false, enhanced->inputs, &pipeline, {}, stock_input);
-     const bool same_components = std::ranges::equal(enhanced->components, complete.components, [](const CoconutComponent& before, const CoconutComponent& after) {
-      return before.edition() == after.edition() && before.source() == after.source() &&
-             std::ranges::equal(before.index().images(), after.index().images(),
-              [](const NormalizedImage& a, const NormalizedImage& b) { return a.source_image_id == b.source_image_id && a.source_shard == b.source_shard; });
-     });
-     const bool same_stock =
-      enhanced->stock_validation.has_value() == complete.stock_validation.has_value() &&
-      (!complete.stock_validation || std::ranges::equal(enhanced->stock_validation->images, complete.stock_validation->images,
-                                      [](const NormalizedImage& a, const NormalizedImage& b) { return a.source_image_id == b.source_image_id && a.width == b.width && a.height == b.height; }));
-     enhanced = std::move(complete);
-     if (!same_components || !same_stock) {
-      // A repaired annotation generation can change provisional membership.
-      // The existing attempt joins jobs; the next placement retains completed
-      // physical keys and deterministically assigns the changed work list.
-      progress.discard_label_plans();
-      retire_coconut_recipe_inputs(retained_annotation_inputs);
-      continue;
-     }
-     progress.source_complete(BenchmarkDatasetSource::kCoconut, enhanced->annotation_cache_hit);
-     progress.acquisition_complete();
-    }
+    progress.acquisition_complete();
+    {}
     progress.phase(DatasetCompilePhase::Labels, 0, kLabelPlanCount);
     std::uint64_t training_target_dropped_boxes = 0U;
     std::vector<SourceCompileCount> source_counts;
     const auto prepare_training_plan = [&] {
-     auto prepared = make_assembly("train");
+     auto prepared = make_split("train");
      std::vector<SourceCompileCount> prepared_counts;
      prepared_counts.reserve(3U);
      std::uint64_t prepared_dropped_boxes = 0U;
      progress.label_plan_started(0);
      prepared_counts.push_back(append_source_plan(
-      pipeline, repair_image_input, *coco_train, coco_train_images, coco_train_unavailable_ids.empty() ? nullptr : &coco_train_unavailable_ids, false, &prepared, cancel_requested, 0, {}, {}));
+      pipeline, repair_image_input, *coco_train, coco_train_images, coco_train_unavailable_ids.empty() ? nullptr : &coco_train_unavailable_ids, false, &prepared, train_writer, cancel_requested, 0));
      progress.label_plan_completed(0);
      progress.label_plan_started(1);
      prepared_counts.push_back(
-      append_source_plan(pipeline, repair_image_input, *objects, object_images, objects_unavailable_ids.empty() ? nullptr : &objects_unavailable_ids, false, &prepared, cancel_requested, 0, {}, {}));
+      append_source_plan(pipeline, repair_image_input, *objects, object_images, objects_unavailable_ids.empty() ? nullptr : &objects_unavailable_ids, false, &prepared, train_writer, cancel_requested, 0));
      progress.label_plan_completed(1);
      progress.label_plan_started(2);
      prepared_counts.push_back(append_source_plan(
-      pipeline, repair_image_input, *open_images, open_image_directories, open_images_unavailable_ids.empty() ? nullptr : &open_images_unavailable_ids, false, &prepared, cancel_requested, 0, {}, {}));
+      pipeline, repair_image_input, *open_images, open_image_directories, open_images_unavailable_ids.empty() ? nullptr : &open_images_unavailable_ids, false, &prepared, train_writer, cancel_requested, 0));
      progress.label_plan_completed(2);
-     materialize(prepared);
      train = std::move(prepared);
      source_counts = std::move(prepared_counts);
      training_target_dropped_boxes = prepared_dropped_boxes;
     };
-    const auto prepare_enhanced_training = [&] {
-     auto prepared = make_assembly("train");
-     source_counts.clear();
-     training_target_dropped_boxes = 0;
-     for (std::size_t slot = 0; slot < enhanced->components.size(); ++slot) {
-      const auto& component = enhanced->components[slot];
-      if (coconut_validation_component(component.edition())) continue;
-      progress.label_plan_started(slot);
-      auto count = component_labels(component, prepared);
-      training_target_dropped_boxes = common_math::checked_add(training_target_dropped_boxes, count.dropped_boxes, "COCONut rejected annotation count overflow");
-      source_counts.push_back(count);
-      progress.label_plan_completed(slot);
-     }
-     materialize(prepared);
-     train = std::move(prepared);
-    };
-    if (enhanced) {
-     const auto same_validation = [&] {
-      if (!validation_placed || !early_validation) return false;
-      if (early_validation->stock_validation.has_value() != enhanced->stock_validation.has_value()) return false;
-      if (enhanced->stock_validation &&
-          (early_validation->stock_validation_generation != enhanced->stock_validation_generation || early_validation->stock_validation->backing != enhanced->stock_validation->backing))
-       return false;
-      auto complete = enhanced->components | std::views::filter([](const CoconutComponent& component) { return coconut_validation_component(component.edition()); });
-      return std::ranges::equal(early_validation->components, complete, [](const CoconutComponent& before, const CoconutComponent& after) {
-       // Validation selection is fixed by its release. These immutable backing
-       // and selected-view identities cover its order, fields and physical input.
-       return before.edition() == after.edition() && before.source() == after.source() && before.original_generation() == after.original_generation() &&
-              before.input_identity() == after.input_identity() && before.index().storage().backing == after.index().storage().backing &&
-              before.index().annotation_sha256 == after.index().annotation_sha256 && before.index().image_count() == after.index().image_count();
-      });
-     };
-     if (!same_validation()) prepare_validation(*enhanced);
-     early_validation.reset();
-     prepare_enhanced_training();
-     // Geometry diagnostics retain their original source/release facts. They
-     // run only against the final generation, including reused early placement.
-     for (const auto& component : enhanced->components) {
-      const auto release = std::ranges::find(coconut_catalog.releases, component.edition(), &CoconutReleaseComponent::edition);
-      if (release == coconut_catalog.releases.end()) throw std::runtime_error("COCONut component release is absent");
-      for (std::size_t i = 0; i < component.index().image_count(); ++i) {
-       const auto& image = component.index().image(i);
-       const auto& identity = component.inventory_image(i);
-       const auto task = namespace_tasks.at(component.source()).at(namespace_slots.at({identity.physical.source, identity.physical.shard}));
-       const auto ready = pipeline.geometry(archive_tasks[task].root, image.source_image_id);
-       if (!ready) throw std::runtime_error("COCONut image geometry is not ready");
-       const auto actual = std::pair{ready->width, ready->height};
-       if (actual == std::pair{image.width, image.height}) continue;
-       const auto reason = "annotation dimensions " + std::to_string(image.width) + "x" + std::to_string(image.height) + " do not match image dimensions " + std::to_string(actual.first) + "x" +
-                           std::to_string(actual.second);
-       for (const auto& box : component.index().storage().boxes.subspan(static_cast<std::size_t>(image.first_box), image.box_count))
-        coconut_failures.reject(identity.physical, identity.release_image_id, release->name, box.annotation_id, box.source_category_id, reason);
-       coconut_failures.flush();
-      }
-     }
-    } else {
-     if (!std::ranges::all_of(custom_labels_ready, [](bool ready) { return ready; })) throw std::logic_error("benchmark source label preparation did not settle");
-     for (std::size_t source = 0; source < 3; ++source) { source_counts.push_back(custom_label_counts[source]); }
-     validation_count = custom_label_counts[3];
-    }
+    if (!std::ranges::all_of(custom_labels_ready, [](bool ready) { return ready; })) throw std::logic_error("benchmark source label preparation did not settle");
+    for (std::size_t source = 0; source < 3; ++source) source_counts.push_back(custom_label_counts[source]);
+    validation_count = custom_label_counts[3];
     progress.phase(DatasetCompilePhase::Labels, kLabelPlanCount, kLabelPlanCount);
-    const auto expected_validation_images = enhanced ? enhanced->validation_images : custom_catalog.coco_validation_images_count;
-    if (validation.data().images.size() != expected_validation_images) throw std::runtime_error("compiled validation plan does not match admitted membership");
+    const auto expected_validation_images = custom_catalog.coco_validation_images_count;
+    if (validation.images.size() != expected_validation_images) throw std::runtime_error("compiled validation plan does not match admitted membership");
     const auto calculate_output_estimate = [&] {
-     return common_math::checked_add(estimate_output_bytes(train.data().images.size(), train.label_count(), config.resolution, train.run_count()),
-      estimate_output_bytes(validation.data().images.size(), validation.label_count(), config.resolution, validation.run_count()), "benchmark total output estimate overflow");
+     return common_math::checked_add(estimate_output_bytes(train.images.size(), train.labels, config.resolution, train.runs),
+      estimate_output_bytes(validation.images.size(), validation.labels, config.resolution, validation.runs), "benchmark total output estimate overflow");
     };
     std::uint64_t total_output_estimate = calculate_output_estimate();
     progress.projected(total_output_estimate);
@@ -1562,9 +1452,9 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     };
     require_additional_output(total_output_estimate);
     pipeline.drain();
-    std::uint64_t total_compile_images = common_math::checked_add(train.data().images.size(), validation.data().images.size(), "benchmark compile image count overflow");
+    std::uint64_t total_compile_images = common_math::checked_add(train.images.size(), validation.images.size(), "benchmark compile image count overflow");
     const auto refresh_output_after_rebuild = [&] {
-     total_compile_images = common_math::checked_add(train.data().images.size(), validation.data().images.size(), "benchmark compile image count overflow");
+     total_compile_images = common_math::checked_add(train.images.size(), validation.images.size(), "benchmark compile image count overflow");
      if (progress.pixel_observer_enabled()) progress.pixels(train_writer.completed() + validation_writer.completed(), total_compile_images);
      const std::uint64_t repaired_output_estimate = calculate_output_estimate();
      if (repaired_output_estimate > total_output_estimate) {
@@ -1602,22 +1492,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      const auto route = root_tasks.find(source_root);
      const auto task = archive_tasks.begin() + route->second;
      auto repaired = *archive_results[route->second];
-     if (enhanced) {
-      archive_results[task - archive_tasks.begin()] = std::move(repaired);
-      // The old placement is already settled. Rejoin current-generation
-      // chunks, retaining unaffected pipeline products, before replacing it.
-      if (&split == &validation.data())
-       prepare_validation(*enhanced);
-      else
-       prepare_enhanced_training();
-      refresh_output_after_rebuild();
-      bool cache_hit = enhanced->annotation_cache_hit;
-      for (std::size_t i = 0; i < archive_tasks.size(); ++i)
-       if (archive_tasks[i].source == task->source) cache_hit = cache_hit && archive_results[i] && archive_results[i]->cache_hit;
-      progress.source_complete(task->source, cache_hit);
-      progress.acquisition_complete();
-      return;
-     }
+     {}
      bool replaced = replace_cached_directory(&coco_train_images, repaired);
      replaced = replace_cached_directory(&coco_val_images, repaired) || replaced;
      replaced = replace_cached_directory(&object_images, std::move(repaired)) || replaced;
@@ -1630,10 +1505,9 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       refresh_archive_availability();
       rebuild_training_after_quarantine();
      } else {
-      auto prepared = make_assembly("val");
-      validation_count = append_source_plan(pipeline, repair_image_input, *coco_val, coco_val_images, nullptr, true, &prepared, cancel_requested, 0);
-      materialize(prepared);
-      validation = std::move(prepared);
+      auto prepared = make_split("val");
+      validation_count = append_source_plan(pipeline, repair_image_input, *coco_val, coco_val_images, nullptr, true, &prepared, validation_writer, cancel_requested, 0);
+       validation = std::move(prepared);
       refresh_output_after_rebuild();
      }
      const bool cache_hit = task->source == BenchmarkDatasetSource::kCoco2017
@@ -1674,8 +1548,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
         auto& product = i == 0 ? train : validation;
         auto& writer = i == 0 ? train_writer : validation_writer;
         sealed_splits[i] = writer.seal(
-         {product, staging_dir / (i == 0 ? "train.bin" : "val.bin"), config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode},
-         &product);
+         {product, staging_dir / (i == 0 ? "train.bin" : "val.bin"), config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode});
        } catch (...) {
         const std::lock_guard lock(seal_failure_mutex);
         if (!seal_failure) seal_failure = std::current_exception();
@@ -1699,10 +1572,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      annotation_drops = common_math::checked_add(annotation_drops, index.rejected.degenerate_boxes, "benchmark rejected annotation count overflow");
      annotation_drops = common_math::checked_add(annotation_drops, index.rejected.duplicate_boxes, "benchmark rejected annotation count overflow");
     };
-    if (enhanced) {
-     for (const auto& component : enhanced->components) add_annotation_drops(component.index());
-     if (enhanced->stock_validation) add_annotation_drops(NormalizedAnnotationReadView(*enhanced->stock_validation));
-    } else {
+    {
      add_annotation_drops(*coco_train);
      add_annotation_drops(*coco_val);
      add_annotation_drops(*objects);
@@ -1718,8 +1588,8 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     progress.activity("Inspecting staged validation dataset");
     const auto& val_info = sealed_splits[1]->info;
     progress.phase(DatasetCompilePhase::Syncing, 2U, kSyncStepCount);
-    if (train_info.image_count != train.data().images.size() || val_info.image_count != expected_validation_images || !std::ranges::equal(train_info.class_names(), train.data().class_names) ||
-        !std::ranges::equal(val_info.class_names(), validation.data().class_names)) {
+    if (train_info.image_count != train.images.size() || val_info.image_count != expected_validation_images || !std::ranges::equal(train_info.class_names(), train.class_names) ||
+        !std::ranges::equal(val_info.class_names(), validation.class_names)) {
      throw std::runtime_error("staged benchmark compiled files do not match their plans");
     }
     progress.activity("Building benchmark manifest");
@@ -1728,8 +1598,8 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
                                 {"open_images_ceiling", combined_sampling.open_images_ceiling}, {"objects365_shards", combined_sampling.objects365_shards},
                                 {"objects365_archive_bytes", combined_sampling.objects365_archive_bytes}}},
      {"projected_output_bytes", total_output_estimate},
-     {"train", {{"images", train.data().images.size()}, {"boxes", train.label_count()}, {"mask_rle_pairs", train.run_count()}, {"bytes", std::filesystem::file_size(staging_dir / "train.bin")}}},
-     {"val", {{"source", "coco"}, {"images", validation.data().images.size()}, {"boxes", validation.label_count()}, {"mask_rle_pairs", validation.run_count()},
+     {"train", {{"images", train.images.size()}, {"boxes", train.labels}, {"mask_rle_pairs", train.runs}, {"bytes", std::filesystem::file_size(staging_dir / "train.bin")}}},
+     {"val", {{"source", "coco"}, {"images", validation.images.size()}, {"boxes", validation.labels}, {"mask_rle_pairs", validation.runs},
               {"bytes", std::filesystem::file_size(staging_dir / "val.bin")}}},
      {"sources", nlohmann::json::array()},
      {"image_cache", nlohmann::json::array()},
@@ -1762,7 +1632,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      }
      manifest["sources"].push_back(std::move(source_manifest));
     };
-    if (!enhanced) {
+    {
      manifest["source_catalog"] = source_catalog_manifest(custom_catalog);
      append_source_manifest(*coco_train, source_counts[0], custom_catalog.coco_annotations.url, coco_train_index_path, nullptr);
      append_source_manifest(*objects, source_counts[1], custom_catalog.objects_annotations.url, objects_index_path, &objects_sampling.stats);
@@ -1776,14 +1646,9 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       {"selected_images", validation_count.selected_images},
       {"compiled_images", validation_count.compiled_images},
       {"compiled_boxes", validation_count.compiled_boxes},
-      {"compiled_mask_rle_pairs", validation.run_count()},
+      {"compiled_mask_rle_pairs", validation.runs},
       {"rejected_records", reject_json(coco_val->rejected)},
      };
-    } else {
-     manifest.erase("supplemental_sampling");
-     manifest["recipe"] = enhanced->manifest;
-     manifest["val"]["source"] = "selected-coconut-validation";
-     manifest["sources"] = enhanced->manifest["components"];
     }
     std::uint64_t cached_image_bytes = 0U;
     const auto append_image_cache = [&](const std::vector<CachedImageDirectory>& directories) {
@@ -1794,12 +1659,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       cached_image_bytes = common_math::checked_add(cached_image_bytes, directory.image_bytes, "benchmark cached image byte total overflow");
      }
     };
-    if (enhanced) {
-     for (const auto& result : archive_results) {
-      if (!result) throw std::runtime_error("COCONut image acquisition incomplete");
-      append_image_cache({*result});
-     }
-    }
+    {}
     append_image_cache(coco_train_images);
     append_image_cache(coco_val_images);
     append_image_cache(object_images);
@@ -1827,48 +1687,12 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     progress.flush();
     trace_benchmark_event(trace, "benchmark.publication.complete", [&] {
      return nlohmann::json{
-      {"output", config.output_dir.string()}, {"train_images", train.data().images.size()}, {"val_images", validation.data().images.size()}, {"train_mask_rle_pairs", train.run_count()},
-      {"val_mask_rle_pairs", validation.run_count()}, {"bytes", total_output_estimate}
+      {"output", config.output_dir.string()}, {"train_images", train.images.size()}, {"val_images", validation.images.size()}, {"train_mask_rle_pairs", train.runs},
+      {"val_mask_rle_pairs", validation.runs}, {"bytes", total_output_estimate}
      };
     });
     return;
-   } catch (const PhysicalArchiveFailure& error) {
-    // The extraction scheduler has joined all workers before propagating its
-    // first failure. Clear only its internal stop, never external cancellation.
-    progress.flush();
-    progress.discard_label_plans();
-    throw_if_benchmark_cancelled(cancellation_state.external);
-    if (auto fatal = error.fatal()) {
-     // Local I/O/storage failures arose while annotations requested a physical
-     // member. They bypass annotation repair and retain their original type.
-     retained_annotation_inputs.reset();
-     cancellation_state.clear_failure();
-     std::rethrow_exception(fatal);
-    }
-    auto& archive = error.archive();
-    retire_coconut_recipe_inputs(retained_annotation_inputs, &archive);
-    invalidate_physical_pixels(archive);
-    cancellation_state.clear_failure();
-    membership->withdraw(archive);
-    acquire_physical_archive(archive, cache, progress, physical_progress, physical_storage, effective_num_workers, cancel_requested, trace, error.what(), &pipeline);
-   } catch (const CoconutPhysicalMembershipError& error) {
-    progress.flush();
-    progress.discard_label_plans();
-    throw_if_benchmark_cancelled(cancellation_state.external);
-    retire_coconut_recipe_inputs(retained_annotation_inputs);
-    cancellation_state.clear_failure();
-    bool repaired = false;
-    for (auto& archive : admitted) {
-     if (!membership->eligible(error.edition(), archive)) continue;
-     retire_coconut_recipe_inputs(retained_annotation_inputs, &archive);
-     invalidate_physical_pixels(archive);
-     membership->withdraw(archive);
-     acquire_physical_archive(archive, cache, progress, physical_progress, physical_storage, effective_num_workers, cancel_requested, trace, error.what(), &pipeline);
-     repaired = true;
-    }
-    if (!repaired) throw;
-   }
-  }
+
  } catch (...) {
   cancellation_state.rethrow_failure();
   throw;

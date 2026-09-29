@@ -1060,7 +1060,7 @@ TEST_CASE("empty compiled datasets retain their format admission failure", "[bac
 TEST_CASE("compiled owner admits all record sections in its metadata construction", "[backend][data][roundtrip][admission]") {
  mmltk::testsupport::ScopedTempDir root("compiled-fused-admission");
  const auto path = root.path() / "dataset.bin";
- const auto defect = GENERATE("none", "extent", "dimensions", "source identity", "source category", "flags", "label span", "class", "zero run", "overlap", "canvas", "coverage");
+ const auto defect = GENERATE("none", "incomplete ordinal", "foreign incomplete ordinal", "extent", "dimensions", "source identity", "source category", "flags", "label span", "class", "zero run", "overlap", "canvas", "coverage");
  CAPTURE(defect);
  std::array<ImageEntry, 2> images{};
  std::array<PackedInstance, 2> labels{};
@@ -1081,6 +1081,11 @@ TEST_CASE("compiled owner admits all record sections in its metadata constructio
  labels[0].mask_rle_pairs = 2;
  labels[1].mask_rle_offset = 0;  // A present-empty mask.
  const std::string_view bad = defect;
+ if (bad == "incomplete ordinal" || bad == "foreign incomplete ordinal") {
+  labels[0].flags |= kAnnotationOrdinalIncomplete;
+  labels[0].source_ordinal = 17;
+  if (bad == "incomplete ordinal") images[0].source = AnnotationSource::CoconutCoco;
+ }
  if (bad == "dimensions") images[1].original_height = 0;
  if (bad == "source identity") images[0].has_source_image_id = 0;
  if (bad == "source category") {
@@ -1104,12 +1109,14 @@ TEST_CASE("compiled owner admits all record sections in its metadata constructio
  file.pwrite_all(&labels[0], sizeof(PackedInstance), layout.label_offset(0));
  file.pwrite_all(&labels[1], sizeof(PackedInstance), layout.label_offset(1));
  file.pwrite_all(runs.data(), runs.size() * sizeof(RLEPair), layout.label_offset(0) + annotation_layout(1, runs.size()).run_offset);
- if (bad != "none") {
+ if (bad != "none" && bad != "incomplete ordinal") {
   CHECK_THROWS(CompiledDataset::open(path));
   return;
  }
  const auto source = std::make_shared<const CompiledDataset>(CompiledDataset::open(path));
  CHECK(source->slot_count() == 2);
+ CHECK(source->image_labels(0).front().has_complete_source_ordinal() == (bad != "incomplete ordinal"));
+ if (bad == "incomplete ordinal") CHECK(source->image_labels(0).front().source_ordinal == 17);
  CHECK(source->masks_available());
  CHECK(source->image_labels(1).front().has_mask());
  CHECK(source->instance_rle(1, source->image_labels(1).front()).empty());

@@ -1,5 +1,6 @@
 #pragma once  // backend.data private implementation boundary
 #include <atomic>
+#include <functional>
 #include <array>
 #include <type_traits>
 #include <nlohmann/json.hpp>
@@ -150,19 +151,26 @@ private:
 // its admitted product without a later traversal over freshly produced masks.
 class NormalizedAnnotationAssembler final {
 public:
- explicit NormalizedAnnotationAssembler(NormalizedAnnotationMetadata, std::size_t images, std::size_t boxes, std::size_t runs, mmltk::common::concurrency::CancellationObservation = {});
+ explicit NormalizedAnnotationAssembler(NormalizedAnnotationMetadata, std::size_t images, std::size_t boxes, std::size_t runs, mmltk::common::concurrency::CancellationObservation = {},
+  const std::filesystem::path& staging_directory = {}, StorageReservationPool* = nullptr);
  void begin_image(NormalizedImage);
  void append_box(NormalizedBox, std::span<const RLEPair>);
  [[nodiscard]] NormalizedAnnotationIndex finish(const BenchmarkTraceSink& = {});
 
 private:
  NormalizedAnnotationBuilder builder_;
+ struct Mapped;
+ std::shared_ptr<Mapped> mapped_;
  mmltk::common::concurrency::CancellationObservation cancellation_;
  bool finished_ = false;
 };
 [[nodiscard]] NormalizedAnnotationIndex seal_normalized_annotations(NormalizedAnnotationBuilder&&, mmltk::common::concurrency::CancellationObservation = {});
 [[nodiscard]] NormalizedAnnotationIndex seal_normalized_annotation_metadata(NormalizedAnnotationBuilder&&);
 void admit_normalized_annotations(const NormalizedAnnotationIndex&, mmltk::common::concurrency::CancellationObservation = {});
+// Incremental cache admission proves an immutable prefix on the mapped backing.
+// Ordinary inputs still receive full admission before their first label borrow.
+void admit_normalized_annotation_image(const NormalizedAnnotationIndex&, std::size_t);
+using NormalizedAnnotationRowReady = std::function<void(const NormalizedAnnotationIndex&, std::size_t)>;
 // Source and destination must be distinct. Copies one complete slice, rebasing only
 // storage offsets; source IDs need not be sorted. Metadata belongs to the caller.
 void append_normalized_image_slice(
@@ -189,7 +197,7 @@ struct AnnotationParseOptions {
  std::span<const StringCategoryMapping> mappings, const AnnotationParseOptions& options);
 [[nodiscard]] std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const std::filesystem::path& path, BenchmarkDatasetSource expected_source, std::string_view expected_split,
  std::string_view expected_annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {}, const nlohmann::json* completion = nullptr,
- bool metadata_only = false, std::uint64_t completion_bytes = 0);
+ bool metadata_only = false, std::uint64_t completion_bytes = 0, const NormalizedAnnotationRowReady& ready = {});
 std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotation_index(const std::filesystem::path& path, const NormalizedAnnotationIndex& index,
  mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {}, StorageReservationPool* storage = nullptr, const nlohmann::json& extension = {});
 void remove_normalized_annotation_index(const std::filesystem::path& path);

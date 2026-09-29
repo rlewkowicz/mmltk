@@ -155,17 +155,22 @@ std::uint64_t write_json_atomically(
 }
 nlohmann::json read_json_file(const std::filesystem::path& path, std::uint64_t* extent) {
  std::ifstream input(path, extent ? std::ios::in | std::ios::ate : std::ios::in);
- if (!input.is_open()) { throw std::runtime_error("cannot open benchmark cache metadata: " + path.string()); }
+ if (!input.is_open()) { throw std::system_error(errno ? errno : EIO, std::generic_category(), "cannot open benchmark cache metadata: " + path.string()); }
  if (extent) {
   const auto end = input.tellg();
-  if (end < 0) throw std::runtime_error("cannot inspect opened benchmark cache metadata: " + path.string());
+  if (end < 0) throw std::system_error(errno ? errno : EIO, std::generic_category(), "cannot inspect opened benchmark cache metadata: " + path.string());
   *extent = static_cast<std::uint64_t>(end);
   input.seekg(0);
-  if (!input) throw std::runtime_error("cannot rewind benchmark cache metadata: " + path.string());
+  if (!input) throw std::system_error(errno ? errno : EIO, std::generic_category(), "cannot rewind benchmark cache metadata: " + path.string());
  }
  try {
-  return nlohmann::json::parse(input);
- } catch (const nlohmann::json::exception& error) { throw std::runtime_error("invalid benchmark cache metadata " + path.string() + ": " + error.what()); }
+  auto result = nlohmann::json::parse(input);
+  if (input.bad()) throw std::system_error(EIO, std::generic_category(), "cannot read benchmark cache metadata: " + path.string());
+  return result;
+ } catch (const nlohmann::json::exception& error) {
+  if (input.bad()) throw std::system_error(EIO, std::generic_category(), "cannot read benchmark cache metadata: " + path.string());
+  throw std::runtime_error("invalid benchmark cache metadata " + path.string() + ": " + error.what());
+ }
 }
 bool is_safe_cache_component(const std::string_view value) noexcept {
  if (value.empty() || value == "." || value == "..") { return false; }

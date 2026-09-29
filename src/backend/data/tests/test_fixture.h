@@ -1,11 +1,18 @@
 #pragma once
 #include "src/backend/data/compiler/dataset_compiler.h"
+#include "src/backend/data/benchmark/detail/benchmark_writer.h"
+#include "src/backend/data/benchmark/detail/benchmark_labels.h"
+#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include <span>
 #include <cstdint>
 #include <string>
 #include <vector>
 namespace mmltk::backend::data::testsupport {
+[[nodiscard]] std::string benchmark_semantics(const std::filesystem::path&);
+void bind_benchmark_slots(benchmark_internal::BenchmarkCompilePipeline&, benchmark_internal::BenchmarkSplitWriter&, const benchmark_internal::PreparedBenchmarkSplit&);
+[[nodiscard]] ImageEntry benchmark_entry(const benchmark_internal::EncodedImageRecord&);
+void write_benchmark_fixture(const benchmark_internal::BenchmarkWriteRequest&, std::span<const std::shared_ptr<benchmark_internal::BenchmarkLabelChunk>>);
 struct FixtureSpec {
  std::string root_dir;
  std::string split = "train";

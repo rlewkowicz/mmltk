@@ -1,3 +1,4 @@
+#include <system_error>
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include <curl/curl.h>
 #include "src/pch_linux.h"
@@ -126,7 +127,6 @@ void append_transfer_bytes(std::uint64_t* write_offset, const DownloadWriteConte
 }
 [[nodiscard]] std::optional<DownloadResult> validate_complete_artifact(
  const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& progress, const BenchmarkTraceSink& trace) {
- (void)progress;
  const std::uint64_t size = regular_file_size(request.destination);
  if (size == 0U || (request.expected_size != 0U && size != request.expected_size)) { return std::nullopt; }
  bool has_completion_metadata = false;
@@ -148,13 +148,14 @@ void append_transfer_bytes(std::uint64_t* write_offset, const DownloadWriteConte
    last_modified = metadata.value("last_modified", std::string{});
    attempts = metadata.value("attempts", 0U);
   } catch (const std::exception& error) {
-   if (is_benchmark_capacity_failure(error)) throw;
+   if (is_benchmark_capacity_failure(error) || dynamic_cast<const std::system_error*>(&error)) throw;
    return std::nullopt;
   }
  }
  throw_if_benchmark_cancelled(cancel_requested);
  const std::string identity = artifact_identity(request, size, etag, last_modified);
  if (has_completion_metadata && (metadata_identity.empty() || metadata_identity != identity)) { return std::nullopt; }
+ if (progress) progress({request.artifact_id, {size, size, 0, attempts, true, false}, DownloadProgressPhase::kDownloading, request.redownload, request.source});
  trace_benchmark_event(trace, has_completion_metadata ? "benchmark.download.cache_hit" : "benchmark.download.preseeded",
   [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"bytes", size}, {"integrity", has_completion_metadata ? "atomic_http_identity" : "pending_structural_validation"}}; });
  return DownloadResult{
@@ -329,7 +330,7 @@ struct Transfer {
     resume_etag = metadata.value("etag", std::string{});
     resume_last_modified = metadata.value("last_modified", std::string{});
    } catch (const std::exception& error) {
-    if (is_benchmark_capacity_failure(error)) throw;
+    if (is_benchmark_capacity_failure(error) || dynamic_cast<const std::system_error*>(&error)) throw;
     metadata_matches = false;
    }
   }
@@ -1041,7 +1042,6 @@ DownloadResult download_locked_artifact(const DownloadRequest& request, std::siz
  const BenchmarkTraceSink& trace, BenchmarkCurl& transport, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool& storage) {
  DownloadStorage destination(request, storage, trace);
  if (auto result = validate_complete_artifact(request, cancellation, progress, trace)) {
-  if (progress) progress({request.artifact_id, {result->size, result->size, 0, result->attempts, true, false}, DownloadProgressPhase::kDownloading, request.redownload, request.source});
   return *result;
  }
  // The partial descriptor and atomic checkpoint/publication descriptor belong
@@ -1063,7 +1063,7 @@ DownloadResult download_locked_artifact(const DownloadRequest& request, std::siz
    try {
     *cached = read_json_file(partial_metadata_path(request));
    } catch (const std::exception& error) {
-    if (is_benchmark_capacity_failure(error)) throw;
+    if (is_benchmark_capacity_failure(error) || dynamic_cast<const std::system_error*>(&error)) throw;
    }
   }
  }
@@ -1188,6 +1188,7 @@ class DownloadBatch final {
  const DownloadProgressSink& observer_;
  const BenchmarkTraceSink& trace_;
  const DownloadReadySink& ready_;
+ const DownloadUnavailableSink& unavailable_;
  BenchmarkCompilePipeline* execution_;
  const BenchmarkAllowance& parent_;
  Cancellation external_;
@@ -1226,9 +1227,15 @@ class DownloadBatch final {
     jobs_[slot].reset();
    }
    try {
+    try {
     results_[job->index] = download_locked_artifact(requests_[job->index], concurrency_, cancellation_, progress_, trace_, transport_, execution_, job->lease->allowance(), storage_);
+    } catch (const BenchmarkDownloadUnavailable& error) {
+     if (!unavailable_) throw;
+     job->lease.reset();
+     unavailable_(job->index, error);
+    }
     job->lease.reset();
-    if (ready_) {
+    if (ready_ && !results_[job->index].path.empty()) {
      const std::lock_guard lock(observer_mutex_);
      ready_({job->index, results_[job->index]});
     }
@@ -1250,11 +1257,12 @@ class DownloadBatch final {
 
 public:
  DownloadBatch(const std::vector<DownloadRequest>& requests, std::size_t requested_concurrency, Cancellation cancellation, const DownloadProgressSink& observer, const BenchmarkTraceSink& trace,
-  const DownloadReadySink& ready, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool* storage)
+  const DownloadReadySink& ready, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool* storage, const DownloadUnavailableSink& unavailable)
      : requests_(requests),
        observer_(observer),
        trace_(trace),
        ready_(ready),
+       unavailable_(unavailable),
        execution_(execution),
        parent_(parent),
        external_(cancellation),
@@ -1335,9 +1343,15 @@ public:
  }
 };
 }  // namespace
+std::optional<DownloadResult> try_cached_download(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancellation,
+ const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, const DownloadProgressSink& progress) {
+ auto lease = ArtifactLease::try_acquire_charged(request.lock_path, cancellation, execution, BenchmarkResources::handles(2, true), parent);
+ if (!lease) return std::nullopt;
+ return validate_complete_artifact(request, cancellation, progress, trace);
+}
 std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t requested_concurrency, mmltk::common::concurrency::CancellationObservation cancel_requested,
  const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent,
- StorageReservationPool* storage) {
+ StorageReservationPool* storage, const DownloadUnavailableSink& unavailable) {
  if (requests.empty()) return {};
  if (!requested_concurrency) throw std::runtime_error("benchmark download concurrency must be positive");
  std::unordered_set<std::filesystem::path> locks;
@@ -1347,7 +1361,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
   if (request.expected_sha256) (void)mmltk::common::io::parse_sha256_hex(*request.expected_sha256);
   if (!locks.insert(request.lock_path).second) throw std::runtime_error("benchmark download batch contains a duplicate cache lock");
  }
- DownloadBatch batch(requests, requested_concurrency, cancel_requested, observer, trace, ready, execution, parent, storage);
+ DownloadBatch batch(requests, requested_concurrency, cancel_requested, observer, trace, ready, execution, parent, storage, unavailable);
  return batch.run();
 }
 void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace,

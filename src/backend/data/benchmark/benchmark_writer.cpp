@@ -62,86 +62,6 @@ using detail::WritablePixelRange;
  return entry;
 }
 }  // namespace
-BenchmarkSplitAssembly::BenchmarkSplitAssembly(std::string name, std::span<const std::string_view> classes, std::uint32_t resolution, mmltk::backend::imaging::resample::ImageResizeMode resize)
-    : resolution_(resolution), resize_mode_(resize) {
- split_.name = std::move(name);
- for (const auto value : classes) split_.class_names.emplace_back(value);
- if (!resolution || resolution > MAX_IMAGE_EXTENT) throw std::runtime_error("benchmark resolution exceeds the compiled coordinate format");
- catalog_ = std::make_shared<const catalog::ClassCatalog>(split_.class_names, COMPILED_CLASS_NAME_CAPACITY);
- if (split_.class_names.empty() || split_.class_names.size() > MAX_CLASSES) throw std::runtime_error("benchmark split exceeds the compiled class limit");
-}
-void BenchmarkSplitAssembly::mutable_records() const {
- if (placement_started_ || sealed_) throw std::logic_error("benchmark metadata membership already placed");
-}
-void BenchmarkSplitAssembly::add_source(std::filesystem::path root) {
- mutable_records();
- if (split_.sources.size() >= UINT16_MAX) throw std::runtime_error("benchmark split exceeds its cached source representation");
- split_.sources.push_back({std::move(root)});
-}
-void BenchmarkSplitAssembly::image(EncodedImageRecord image, std::shared_ptr<const BenchmarkLabelChunk> chunk, std::uint64_t ordinal_base) {
- mutable_records();
- if (!chunk || image.source_index >= split_.sources.size() || image.label_count != chunk->labels.size() || image.source_width != chunk->width || image.source_height != chunk->height)
-  throw std::runtime_error("benchmark image assembly extent is invalid");
- const auto entry = benchmark_image_entry(image);
- CompiledRecordChecks::image(entry, split_.images.size());
- const auto labels = checked_size_add(labels_, chunk->labels.size(), "benchmark label count overflow");
- const auto runs = checked_size_add(runs_, chunk->runs.size(), "benchmark run count overflow");
- split_.images.push_back(image);
- split_.annotations.push_back({std::move(chunk), ordinal_base});
- labels_ = labels;
- runs_ = runs;
-}
-void BenchmarkSplitAssembly::append(BenchmarkSplitAssembly&& source) {
- mutable_records();
- source.mutable_records();
- if (resolution_ != source.resolution_ || resize_mode_ != source.resize_mode_ || split_.class_names != source.split_.class_names) throw std::logic_error("benchmark metadata merge changed format");
- if (split_.images.empty() && split_.sources.empty()) {
-  const auto name = split_.name;
-  *this = std::move(source);
-  split_.name = name;
-  source = {};
-  return;
- }
- const auto images = checked_size_add(split_.images.size(), source.split_.images.size(), "benchmark image count overflow");
- const auto labels = checked_size_add(labels_, source.labels_, "benchmark label count overflow");
- const auto runs = checked_size_add(runs_, source.runs_, "benchmark run count overflow");
- const auto source_base = split_.sources.size();
- if (source_base + source.split_.sources.size() > UINT16_MAX) throw std::runtime_error("benchmark cached source index overflow");
- split_.images.reserve(images);
- split_.annotations.reserve(images);
- for (auto image : source.split_.images) {
-  image.source_index = common_math::checked_cast<std::uint16_t>(image.source_index + source_base, "benchmark source index overflow");
-  split_.images.push_back(image);
- }
- split_.annotations.insert(split_.annotations.end(), std::make_move_iterator(source.split_.annotations.begin()), std::make_move_iterator(source.split_.annotations.end()));
- split_.sources.insert(split_.sources.end(), std::make_move_iterator(source.split_.sources.begin()), std::make_move_iterator(source.split_.sources.end()));
- labels_ = labels;
- runs_ = runs;
- source = {};
-}
-void BenchmarkSplitAssembly::materialize(BenchmarkCompilePipeline& execution, common_concurrency::CancellationObservation cancellation) {
- mutable_records();
- placement_started_ = true;
- execution.for_each(BenchmarkStage::Labels, split_.annotations.size(), BenchmarkResources{}, [&](std::size_t slot) {
-  const auto& product = *split_.annotations[slot].chunk;
-  auto entry = benchmark_image_entry(split_.images[slot]);
-  set_annotation_extent(entry, product.labels.size(), product.runs.size(), std::to_string(entry.source_image_id));
-  FileHeader checks{};
-  checks.num_classes = common_math::checked_cast<std::uint32_t>(split_.class_names.size(), "benchmark class count overflow");
-  checks.max_instances_per_image = UINT16_MAX;
-  checks.image_width = checks.image_height = resolution_;
-  (void)admit_compiled_annotations(entry, {product.labels, product.runs}, checks, slot, cancellation);
-  for (const auto& label : product.labels) (void)common_math::checked_add(label.source_ordinal, split_.annotations[slot].ordinal_base, "benchmark source ordinal overflow");
- });
- materialized_ = true;
-}
-void BenchmarkSplitAssembly::finish(common_concurrency::CancellationObservation cancellation) {
- if (sealed_) return;
- throw_if_compiled_validation_cancelled(0, cancellation);
- if (!materialized_) throw std::logic_error("benchmark metadata preparation has not completed");
- if (split_.images.empty() || split_.sources.empty() || !catalog_) throw std::runtime_error("benchmark split must contain images, sources and classes");
- sealed_ = true;
-}
 struct BenchmarkPixelInput {
  BenchmarkSourcePublication publication;
  std::shared_ptr<const BenchmarkEncodedImage> payload;
@@ -152,14 +72,13 @@ struct BenchmarkSplitWriter::Impl {
   BenchmarkImageDecoder decoder;
   mmltk::backend::imaging::resample::RgbImageResizer resizer;
   std::vector<std::uint8_t> decoded, cmyk;
-  std::array<std::byte, COMPILED_LABEL_CAPACITY> labels;
   explicit Scratch(bool perceptual) : resizer(1, perceptual) {}
  };
  std::deque<EncodedImageRecord> images;
  std::vector<CachedImageSource> sources;
  std::deque<std::uint8_t> complete, header_known, pixel_allocated, label_pages;
  std::deque<ImageEntry> entries;
- std::unordered_map<std::string, std::unordered_map<std::uint64_t, std::uint32_t>> identities;
+ std::deque<std::filesystem::path> input_roots;
  mutable std::mutex facts_mutex;
  std::vector<std::unique_ptr<Scratch>> scratch;
  Scratch& lane_scratch(std::size_t lane) {
@@ -172,6 +91,7 @@ struct BenchmarkSplitWriter::Impl {
  std::mutex directory_mutex;
  common_io::FileHandle directory;
  std::uint16_t directory_source = std::numeric_limits<std::uint16_t>::max();
+ std::filesystem::path directory_root;
  BenchmarkStagedArtifact staging;
  std::unique_ptr<WritablePixelRange> pixels;
  FileLayout layout;
@@ -212,11 +132,7 @@ struct BenchmarkSplitWriter::Impl {
   staging.resize_sparse(layout.total_size);
   pixels = std::make_unique<WritablePixelRange>(staging.file().get(), layout);
   entries.resize(images.size());
-  for (std::size_t slot = 0; slot < images.size(); ++slot) {
-   const auto& image = images[slot];
-   if (!identities[sources.at(image.source_index).root.string()].emplace(image.source_image_id, common_math::checked_cast<std::uint32_t>(slot, "benchmark slot overflow")).second)
-    throw std::runtime_error("duplicate benchmark physical identity");
-  }
+  input_roots.resize(images.size());
   const auto lanes = std::max(1, request.num_workers);
   scratch.reserve(lanes);
   for (int i = 0; i < lanes; ++i) scratch.push_back(std::make_unique<Scratch>(request.perceptual_downscale));
@@ -224,13 +140,17 @@ struct BenchmarkSplitWriter::Impl {
  [[nodiscard]] std::vector<std::size_t> slots(const PreparedBenchmarkSplit& split, bool finished = false) const {
   std::vector<std::size_t> result;
   result.reserve(split.images.size());
-  const std::lock_guard lock(facts_mutex);
   for (const auto& image : split.images) {
-   const auto family = identities.find(split.sources.at(image.source_index).root.string());
-   if (family == identities.end()) throw std::runtime_error("benchmark final source is absent");
-   const auto found = family->second.find(image.source_image_id);
-   if (found == family->second.end()) throw std::runtime_error("benchmark final image is absent");
-   const auto slot = found->second;
+   std::optional<std::uint32_t> bound;
+   const auto& root = split.sources.at(image.source_index).root;
+   if (execution) bound = execution->image_slot(root, image.source_image_id);
+   const std::lock_guard lock(facts_mutex);
+   if (!bound) {
+    for (std::size_t i = 0; i < images.size(); ++i)
+     if (images[i].source_image_id == image.source_image_id && sources.at(images[i].source_index).root == root) { bound = static_cast<std::uint32_t>(i); break; }
+   }
+   if (!bound) throw std::runtime_error("benchmark final image is absent");
+   const auto slot = *bound;
    if (finished) {
     if (!complete[slot]) throw std::runtime_error("benchmark publication has unfinished pixels");
     if (std::pair{images[slot].source_width, images[slot].source_height} != std::pair{image.source_width, image.source_height})
@@ -243,11 +163,14 @@ struct BenchmarkSplitWriter::Impl {
 };
 BenchmarkSplitWriter::BenchmarkSplitWriter(const BenchmarkWriteRequest& request, bool actual) : impl_(std::make_unique<Impl>(request, actual)) {}
 BenchmarkSplitWriter::~BenchmarkSplitWriter() = default;
+std::pair<std::filesystem::path, std::uint64_t> BenchmarkSplitWriter::identity(std::size_t slot) const {
+ const std::lock_guard lock(impl_->facts_mutex);
+ const auto& image = impl_->images.at(slot);
+ return {impl_->sources.at(image.source_index).root, image.source_image_id};
+}
 std::uint32_t BenchmarkSplitWriter::allocate_slot(EncodedImageRecord image, const CachedImageSource& source) {
  auto& state = *impl_;
  const std::lock_guard lock(state.facts_mutex);
- auto& family = state.identities[source.root.string()];
- if (const auto found = family.find(image.source_image_id); found != family.end()) return found->second;
  const auto slot = common_math::checked_cast<std::uint32_t>(state.images.size(), "benchmark slot overflow");
  const auto layout = compute_file_layout(common_math::checked_add(slot, 1U, "benchmark slot overflow"), state.stride);
  auto found = std::ranges::find(state.sources, source.root, &CachedImageSource::root);
@@ -263,9 +186,37 @@ std::uint32_t BenchmarkSplitWriter::allocate_slot(EncodedImageRecord image, cons
  state.pixel_allocated.push_back(0);
  state.label_pages.push_back(0);
  state.entries.emplace_back();
- family.emplace(image.source_image_id, slot);
+ state.input_roots.emplace_back();
  state.layout = layout;
  return slot;
+}
+void BenchmarkSplitWriter::input_root(std::uint32_t slot, const std::filesystem::path& root) {
+ const std::lock_guard lock(impl_->facts_mutex);
+ impl_->input_roots.at(slot) = root;
+}
+ImageEntry BenchmarkSplitWriter::entry(std::uint32_t slot) const {
+ const std::lock_guard lock(impl_->facts_mutex);
+ return impl_->entries.at(slot);
+}
+void BenchmarkSplitWriter::invalidate_labels(std::uint32_t slot) {
+ const std::lock_guard lock(impl_->facts_mutex);
+ impl_->entries.at(slot) = {};
+}
+void BenchmarkSplitWriter::settle_labels(std::uint32_t slot, std::uint64_t ordinal_base, bool ordinal_incomplete) {
+ if (!ordinal_base && !ordinal_incomplete) return;
+ const std::lock_guard lock(impl_->facts_mutex);
+ const auto& entry = impl_->entries.at(slot);
+ PackedInstance label;
+ for (std::size_t i = 0; i < entry.num_instances; ++i) {
+  const auto offset = impl_->layout.label_offset(slot) + i * sizeof(label);
+  impl_->staging.file().pread_all(&label, sizeof(label), offset);
+  label.source_ordinal = common_math::checked_add(label.source_ordinal, ordinal_base, "benchmark source ordinal overflow");
+  impl_->staging.file().pwrite_all(&label.source_ordinal, sizeof(label.source_ordinal), offset + offsetof(PackedInstance, source_ordinal));
+  if (ordinal_incomplete) {
+   label.flags |= kAnnotationOrdinalIncomplete;
+   impl_->staging.file().pwrite_all(&label.flags, sizeof(label.flags), offset + offsetof(PackedInstance, flags));
+  }
+ }
 }
 void BenchmarkSplitWriter::write_labels(std::uint32_t slot, ImageEntry entry, ImageAnnotations annotations, std::size_t lane, std::uint64_t ordinal_base) {
  auto& state = *impl_;
@@ -277,7 +228,8 @@ void BenchmarkSplitWriter::write_labels(std::uint32_t slot, ImageEntry entry, Im
  checks.max_instances_per_image = UINT16_MAX;
  checks.image_width = checks.image_height = state.resolution;
  (void)admit_compiled_annotations(entry, annotations, checks, slot, state.cancellation);
- auto& scratch = state.lane_scratch(lane).labels;
+ (void)lane;
+ alignas(PackedInstance) std::array<std::byte, COMPILED_LABEL_CAPACITY> scratch;
  const auto payload = annotation_layout(entry.num_instances, entry.num_runs);
  if (!annotations.labels.empty()) std::memcpy(scratch.data(), annotations.labels.data(), annotations.labels.size_bytes());
  auto* labels = reinterpret_cast<PackedInstance*>(scratch.data());
@@ -288,7 +240,7 @@ void BenchmarkSplitWriter::write_labels(std::uint32_t slot, ImageEntry entry, Im
  {
   const std::lock_guard lock(state.facts_mutex);
   const auto& image = state.images.at(slot);
-  if (image.source_image_id != entry.source_image_id || (state.header_known[slot] && (image.source_width != entry.original_width || image.source_height != entry.original_height)))
+  if (image.source_image_id != entry.source_image_id)
    throw std::runtime_error("benchmark label identity or canvas differs from pixels");
   offset = state.layout.label_offset(slot);
   const auto pages = compiled_align_up(entry.label_bytes, PAGE_SIZE) / PAGE_SIZE;
@@ -309,6 +261,7 @@ void BenchmarkSplitWriter::retire_scratch(std::size_t lane) noexcept {
  const std::lock_guard lock(impl_->directory_mutex);
  impl_->directory = {};
  impl_->directory_source = std::numeric_limits<std::uint16_t>::max();
+ impl_->directory_root.clear();
  impl_->directory_handles = {};
 }
 void BenchmarkSplitWriter::prepare_lanes(std::size_t lanes) {
@@ -322,7 +275,7 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
  {
   const std::lock_guard lock(state.facts_mutex);
   image = state.images.at(slot);
-  source_root = state.sources.at(image.source_index).root;
+  source_root = state.input_roots.at(slot).empty() ? state.sources.at(image.source_index).root : state.input_roots.at(slot);
  }
  if (image_complete(slot)) return {};
  throw_if_benchmark_cancelled(state.cancellation);
@@ -333,7 +286,7 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
    common_io::FileHandle file;
    {
     const std::lock_guard lock(state.directory_mutex);
-    if (state.directory_source != image.source_index) {
+    if (state.directory_root != source_root) {
      state.directory = {};
      state.directory_source = std::numeric_limits<std::uint16_t>::max();
      state.directory_handles = {};
@@ -347,18 +300,22 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
      if (descriptor < 0) throw common_io::errno_error("cannot open cached benchmark image directory", root.string());
      state.directory = common_io::FileHandle(descriptor);
      state.directory_source = image.source_index;
+     state.directory_root = source_root;
     }
     std::array<char, 24> relative{};
     (void)format_cached_image_relative_path(image.source_image_id, relative);
     const int descriptor = ::openat(state.directory.get(), relative.data(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (descriptor < 0) throw common_io::errno_error("cannot open cached benchmark image", relative.data());
+    if (descriptor < 0) {
+     if (errno == ENOENT) throw BenchmarkImageError("cached benchmark image is missing");
+     throw common_io::errno_error("cannot open cached benchmark image", relative.data());
+    }
     file = common_io::FileHandle(descriptor);
    }
    const CachedImageValidator header = [&](std::uint64_t, std::span<const std::uint8_t> encoded) {
     return scratch.decoder.read_header(encoded, state.actual_dimensions ? 0 : image.source_width, state.actual_dimensions ? 0 : image.source_height);
    };
    input->payload = BenchmarkEncodedImage::open(std::move(file), image.source_image_id, header, state.cancellation, nullptr, allowance, input->payload, std::numeric_limits<std::uint32_t>::max());
-   if (!input->payload) throw std::runtime_error("cached benchmark image is missing or has an invalid size");
+   if (!input->payload) throw BenchmarkImageError("cached benchmark image is missing or has an invalid size");
   }
   const auto& header = input->payload->header();
   if (!state.actual_dimensions && ((image.source_width && image.source_width != header.width) || (image.source_height && image.source_height != header.height)))
@@ -373,7 +330,7 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
   // The mapping owns its inode after the local image file closes. The cached
   // directory owns its separate child grant until reuse or scratch retirement.
   allowance.retire_descriptors();
- } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
+ } catch (const BenchmarkImageError& error) {
   throw_if_benchmark_cancelled(state.cancellation);
   throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what());
  }
@@ -406,7 +363,7 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const
  std::span<const std::uint8_t> decoded;
  try {
   decoded = scratch.decoder.decode_rgb(input->payload->encoded(), header, &scratch.decoded, &scratch.cmyk);
- } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
+ } catch (const BenchmarkImageError& error) {
   throw_if_benchmark_cancelled(state.cancellation);
   const std::lock_guard lock(state.facts_mutex);
   const auto& image = state.images.at(slot);
@@ -458,16 +415,6 @@ std::size_t BenchmarkSplitWriter::completed() const noexcept {
  const std::lock_guard lock(impl_->facts_mutex);
  return std::ranges::count(impl_->complete, std::uint8_t{1});
 }
-bool BenchmarkSplitWriter::matches_membership(const PreparedBenchmarkSplit& split) const {
- const std::lock_guard lock(impl_->facts_mutex);
- if (split.images.size() != impl_->images.size()) return false;
- for (std::size_t i = 0; i < split.images.size(); ++i) {
-  const auto& before = impl_->images[i];
-  const auto& after = split.images[i];
-  if (before.source_image_id != after.source_image_id || impl_->sources.at(before.source_index).root != split.sources.at(after.source_index).root) return false;
- }
- return true;
-}
 void BenchmarkSplitWriter::invalidate_image(std::size_t slot) {
  bool invalidated;
  BenchmarkWriteProgressEvent progress;
@@ -486,6 +433,7 @@ void BenchmarkSplitWriter::invalidate_source(const std::filesystem::path& root) 
   if (impl_->directory.get() >= 0 && impl_->sources.at(impl_->directory_source).root == root) {
    impl_->directory = {};
    impl_->directory_source = std::numeric_limits<std::uint16_t>::max();
+ impl_->directory_root.clear();
   }
  }
  std::uint64_t invalidated = 0;
@@ -502,45 +450,6 @@ void BenchmarkSplitWriter::invalidate_source(const std::filesystem::path& root) 
   }
  }
  if (invalidated && progress.images_invalidated) progress.images_invalidated(progress.context, invalidated);
-}
-void BenchmarkSplitWriter::retain_completed(const BenchmarkSplitWriter& previous) {
- const auto& before = *previous.impl_;
- auto& after = *impl_;
- if (before.resolution != after.resolution || before.resize_mode != after.resize_mode) throw std::logic_error("benchmark pixel reuse changed geometry");
- std::unordered_map<std::string, std::unordered_map<std::uint64_t, std::size_t>> retained;
- for (std::size_t slot = 0; slot < before.images.size(); ++slot) {
-  if (!before.complete[slot]) continue;
-  const auto& image = before.images[slot];
-  retained[before.sources.at(image.source_index).root.string()].emplace(image.source_image_id, slot);
- }
- std::vector<std::uint8_t> buffer(std::min<std::size_t>(after.stride, 1024U * 1024U));
- for (std::size_t slot = 0; slot < after.images.size(); ++slot) {
-  throw_if_benchmark_cancelled(after.cancellation);
-  auto& image = after.images[slot];
-  const auto source = retained.find(after.sources.at(image.source_index).root.string());
-  if (source == retained.end()) continue;
-  const auto found = source->second.find(image.source_image_id);
-  if (found == source->second.end()) continue;
-  const auto& old_image = before.images[found->second];
-  if (!after.actual_dimensions && ((image.source_width && image.source_width != old_image.source_width) || (image.source_height && image.source_height != old_image.source_height))) continue;
-  const auto input = before.layout.pixel_offset(common_math::checked_cast<std::uint32_t>(found->second, "benchmark retained slot overflow"));
-  const auto output = after.layout.pixel_offset(common_math::checked_cast<std::uint32_t>(slot, "benchmark retained slot overflow"));
-  if (!after.pixel_allocated[slot]) {
-   after.staging.allocate_range(output, after.layout.pixel_pitch);
-   after.pixel_allocated[slot] = 1;
-  }
-  for (std::size_t offset = 0; offset < after.stride;) {
-   const auto bytes = std::min(buffer.size(), after.stride - offset);
-   before.staging.file().pread_all(buffer.data(), bytes, input + offset);
-   after.staging.file().pwrite_all(buffer.data(), bytes, output + offset);
-   offset += bytes;
-  }
-  after.staging.reconcile();
-  image.source_width = old_image.source_width;
-  image.source_height = old_image.source_height;
-  after.complete[slot] = 1;
-  after.header_known[slot] = 1;
- }
 }
 void BenchmarkSplitWriter::write_remaining(const BenchmarkWriteRequest& request) {
  {
@@ -577,29 +486,15 @@ void BenchmarkSplitWriter::write_remaining(const BenchmarkWriteRequest& request)
  else
   common_concurrency::parallel_for_range_indexed<int>(0, workers, workers, request.worker_cpus, run);
 }
-BenchmarkSealedSplit BenchmarkSplitWriter::seal(const BenchmarkWriteRequest& request, BenchmarkSplitAssembly* product) {
+BenchmarkSealedSplit BenchmarkSplitWriter::seal(const BenchmarkWriteRequest& request) {
  auto& state = *impl_;
- if (request.resolution != state.resolution || request.resize_mode != state.resize_mode || request.split.class_names != state.class_names) throw std::runtime_error("benchmark final geometry or class catalog changed");
- if (request.split.images.empty() || (!request.split.annotations.empty() && request.split.images.size() != request.split.annotations.size())) throw std::runtime_error("benchmark final annotations are incomplete");
- if (product) {
-  if (&product->data() != &request.split) throw std::logic_error("benchmark sealed product differs");
-  product->finish(request.cancel_requested);
- }
+ if (request.split.images.empty()) throw std::runtime_error("benchmark final annotations are incomplete");
  const auto slots = state.slots(request.split, true);
- std::vector<ImageEntry> index(state.images.size());
- std::uint32_t maximum = 0;
- auto class_catalog = std::make_shared<const catalog::ClassCatalog>(request.split.class_names, COMPILED_CLASS_NAME_CAPACITY);
  for (std::size_t i = 0; i < slots.size(); ++i) {
   throw_if_compiled_validation_cancelled(i, request.cancel_requested);
   const auto physical_slot = common_math::checked_cast<std::uint32_t>(slots[i], "benchmark slot overflow");
-  if (index[physical_slot].eligible()) throw std::runtime_error("duplicate benchmark final image identity");
   const auto expected = benchmark_image_entry(request.split.images[i]);
-  const PreparedBenchmarkLabels annotations = request.split.annotations.empty() ? PreparedBenchmarkLabels{} : request.split.annotations[i];
-  if (annotations.chunk) {
-   const auto& chunk = *annotations.chunk;
-   if (expected.num_instances != chunk.labels.size()) throw std::runtime_error("benchmark final annotation count differs");
-   write_labels(physical_slot, expected, {chunk.labels, chunk.runs}, 0, annotations.ordinal_base);
-  } else if (!state.entries[physical_slot].eligible()) {
+  if (!state.entries[physical_slot].eligible()) {
    if (expected.num_instances) throw std::runtime_error("benchmark final label payload missing");
    write_labels(physical_slot, expected, {});
   }
@@ -607,7 +502,24 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal(const BenchmarkWriteRequest& req
   if (entry.num_instances != expected.num_instances || entry.original_width != expected.original_width || entry.original_height != expected.original_height ||
       entry.source != expected.source || entry.has_source_image_id != expected.has_source_image_id || entry.source_image_id != expected.source_image_id)
    throw std::runtime_error("benchmark final annotation facts differ from the published slot");
-  index[slots[i]] = entry;
+ }
+ std::vector<std::uint32_t> selected(slots.begin(), slots.end());
+ return seal_slots(request, selected);
+}
+BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteRequest& request, std::span<const std::uint32_t> slots) {
+ auto& state = *impl_;
+ if (request.resolution != state.resolution || request.resize_mode != state.resize_mode || request.split.class_names != state.class_names) throw std::runtime_error("benchmark final geometry or class catalog changed");
+ if (slots.empty()) throw std::runtime_error("required benchmark split contains no healthy images: " + request.split.name);
+ std::vector<ImageEntry> index(state.images.size());
+ std::uint32_t maximum = 0;
+ auto class_catalog = std::make_shared<const catalog::ClassCatalog>(state.class_names, COMPILED_CLASS_NAME_CAPACITY);
+ for (const auto slot : slots) {
+  throw_if_compiled_validation_cancelled(slot, request.cancel_requested);
+  const auto& entry = state.entries.at(slot);
+  const auto& image = state.images.at(slot);
+  if (index[slot].eligible() || !state.complete[slot] || !entry.eligible() || entry.original_width != image.source_width || entry.original_height != image.source_height)
+   throw std::runtime_error("benchmark publication has unfinished or contradictory sample " + std::to_string(image.source_image_id));
+  index[slot] = entry;
   maximum = std::max<std::uint32_t>(maximum, entry.num_instances);
  }
  const auto header = make_file_header({common_math::checked_cast<std::uint32_t>(slots.size(), "benchmark image count overflow"), state.resolution, state.resolution, 3U, maximum, state.stride, state.resize_mode}, class_catalog->names(), state.layout);

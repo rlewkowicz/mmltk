@@ -63,8 +63,6 @@ struct RecipeImageArchive {
 struct AdmittedRecipeArchive {
  RecipeImageArchive origin;
  DownloadResult download;
- unsigned structural_attempts = 0;
- BenchmarkArchive::InputRequirement resolution_input{};
 };
 enum class CoconutReleaseBoundary { MetadataConsumed, MasksStarted };
 // Private ordinary catalog facts are also used by bounded local release fixtures.
@@ -78,9 +76,6 @@ struct CoconutRecipeCatalog {
  std::function<void(CoconutEdition, CoconutReleaseBoundary)> release_observer;
 };
 struct CoconutRecipeInputs;
-// Settle the failed attempt while retaining canonical annotation rows and native
-// image chunks; only chunks depending on the replaced physical artifact retire.
-void retire_coconut_recipe_inputs(const std::shared_ptr<CoconutRecipeInputs>&, const AdmittedRecipeArchive* = nullptr);
 [[nodiscard]] std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, ProgressReporter&, std::size_t,
  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::size_t download_connections = 0, std::span<const int> cpus = {},
  std::function<void(std::exception_ptr)> failed = {}, BenchmarkCompilePipeline* execution = nullptr);
@@ -88,7 +83,6 @@ struct CoconutRecipePreparation {
  std::shared_ptr<CoconutRecipeInputs> inputs;
  std::vector<CoconutComponent> components;
  // Cached components need publication; freshly imported native images already published.
- std::vector<CoconutComponent> cached_label_inputs;
  std::optional<NormalizedAnnotationIndex> stock_validation;
  bool annotation_cache_hit = true;
  std::uint64_t annotation_storage_bytes = 0;
@@ -97,9 +91,6 @@ struct CoconutRecipePreparation {
  std::uint64_t validation_images = 0;
  nlohmann::json manifest;
 };
-// Read independently completed validation custody while training releases and
-// originals continue. The caller settles this read before final recipe repair.
-[[nodiscard]] CoconutRecipePreparation wait_coconut_validation(const std::shared_ptr<CoconutRecipeInputs>&, CoconutValidation);
 class CoconutFailureReport {
 public:
  CoconutFailureReport(const std::filesystem::path& cache_root, ProgressReporter& progress);
@@ -121,7 +112,7 @@ private:
 };
 [[nodiscard]] CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation);
 [[nodiscard]] CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, std::span<const AdmittedRecipeArchive>,
- const CoconutPhysicalMembership&, ProgressReporter&, CoconutFailureReport&, std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, bool metadata_only = false,
+ const CoconutPhysicalMembership&, ProgressReporter&, CoconutFailureReport&, std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&,
  std::shared_ptr<CoconutRecipeInputs> inputs = {}, BenchmarkCompilePipeline* execution = nullptr, BenchmarkAllowance preparation = {}, CocoAnnotationInputObserver stock_input = {});
 [[nodiscard]] bool coconut_validation_component(CoconutEdition) noexcept;
 [[nodiscard]] AnnotationSource coconut_annotation_source(CoconutImageNamespace);

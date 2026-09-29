@@ -1,6 +1,7 @@
 #pragma once
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/compiled/compiled_format.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <cstddef>
 #include <chrono>
@@ -116,7 +117,12 @@ public:
  // Runs only already-ready work on its current lane, without waiting.
  void cooperate();
  void membership_ready();
- void register_split(BenchmarkSplitWriter&, const PreparedBenchmarkSplit&);
+ void bind_slot(const std::filesystem::path&, std::uint64_t, BenchmarkSplitWriter&, std::uint32_t);
+ // Bind a source family before acquisition. Its first image or label allocates
+ // one stable physical slot through the sole compile-local identity join.
+ void bind_source(const std::filesystem::path&, BenchmarkSplitWriter&, AnnotationSource);
+ [[nodiscard]] std::optional<std::uint32_t> image_slot(const std::filesystem::path&, std::uint64_t) const;
+ void wait_image(const std::filesystem::path&, std::uint64_t);
  // Capture once while the producer holds its physical mutation lease. A repair
  // captures only its replacement image; all other events keep the source epoch.
  [[nodiscard]] BenchmarkSourcePublication source_publication(
@@ -130,15 +136,18 @@ public:
  // Publication retains native/normalized custody and never waits for geometry,
  // resources or CPU completion. ImageState owns the join with physical facts.
  // False means the publication generation withdrew before admission.
- bool labels_ready(const BenchmarkSourcePublication&, std::uint64_t, BenchmarkLabelInput, std::string_view dependency, std::uint64_t original_generation = 0);
+ bool labels_ready(const BenchmarkSourcePublication&, std::uint64_t, BenchmarkLabelInput, std::string_view dependency, std::uint64_t original_generation = 0, unsigned priority = 0);
  [[nodiscard]] std::shared_ptr<const BenchmarkLabelChunk> image_labels(const std::filesystem::path&, std::uint64_t, std::string_view dependency) const;
- // Includes pending, executing and completed inputs in the current generations.
+ // Pending claims remain reusable. Once settled, an incremental claim must
+ // occupy its slot; labels_ready can replay a displaced claim from mapped input.
  [[nodiscard]] bool has_image_labels(const std::filesystem::path&, std::uint64_t, std::string_view dependency, std::uint64_t original_generation = 0) const;
  // Required final assembly joins the same admission outside every CPU lane.
  [[nodiscard]] std::shared_ptr<const BenchmarkLabelChunk> wait_image_labels(const std::filesystem::path&, std::uint64_t, std::string_view dependency, std::uint64_t original_generation = 0);
+ void retire_labels(const std::filesystem::path&, std::uint64_t, std::string_view dependency);
  void original_generation(const std::filesystem::path&, std::uint64_t, bool withdrawn);
  // Effect-only observation after admission and before projection, outside locks.
- void label_configuration(std::uint32_t, mmltk::backend::imaging::resample::ImageResizeMode, std::function<void(const std::filesystem::path&, std::uint64_t, const BenchmarkLabelWorkspace&)> = {});
+ void label_configuration(std::uint32_t, mmltk::backend::imaging::resample::ImageResizeMode, std::function<void(const std::filesystem::path&, std::uint64_t, const BenchmarkLabelWorkspace&)> = {},
+  std::function<void(const std::filesystem::path&, std::uint64_t)> = {});
  // Withdraw admission first, join only this source, then clear affected facts.
  // Unrelated source tasks and completed products continue to be usable.
  void retire_source(const std::filesystem::path&);

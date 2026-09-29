@@ -10,24 +10,29 @@
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/io/file_digest.h"
+#include "src/common/math/checked_arithmetic.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <array>
 #include <charconv>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
+#include <condition_variable>
+#include <chrono>
 #include <optional>
 #include <set>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <fcntl.h>
 namespace mmltk::backend::data::benchmark_internal {
 namespace {
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
 namespace common_io = mmltk::common::io;
-[[noreturn]] void invalid(std::string_view detail) { throw std::runtime_error("COCONut: " + std::string(detail)); }
+[[noreturn]] void invalid(std::string_view detail) { throw CoconutInputError("COCONut: " + std::string(detail)); }
 std::uint64_t decimal(std::string_view value) {
  std::uint64_t id = 0;
  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), id);
@@ -61,6 +66,7 @@ std::uint64_t parse_coconut_coco_member(std::string_view name) {
  return decimal(path.stem().string());
 }
 void validate_coconut_physical_image(const CoconutPhysicalImage& image) {
+ (void)coconut_namespace_name(image.source);
  if (image.archive_identity.empty() || image.member != canonical_benchmark_archive_member(image.member)) invalid("invalid physical inventory identity");
  if (std::filesystem::path(image.member).extension() != ".jpg") invalid("physical member is not JPEG: " + image.member);
  if (image.source == CoconutImageNamespace::Objects365V1 || image.source == CoconutImageNamespace::Objects365V2) {
@@ -86,286 +92,106 @@ std::span<const CoconutImageNamespace> coconut_release_sources(CoconutEdition ed
  }
  throw std::invalid_argument("invalid COCONut edition");
 }
-CoconutPhysicalInputRequirement CoconutPhysicalInputRequirement::archive(std::uint64_t workspace_bytes, std::size_t reader_descriptors) {
- auto controls = BenchmarkResources::handles(1, false, reader_descriptors + 2);
- // This reader consumes an already admitted annotation producer. Its physical
- // input must be able to use the capacity reserved for dependent consumers.
- controls.producer = false;
- return {controls, workspace_bytes};
-}
 struct CoconutPhysicalMembership::Impl {
- struct PhysicalRoute {
+ struct Artifact {
   AdmittedRecipeArchive* archive;
-  BenchmarkArchive::MemberPosition locator;
-  std::uint64_t position;
-  bool consumed = false, conflict = false;
+  std::filesystem::path root;
+  bool complete = false, admitted = false, cache_hit = false;
+  std::string inspected_cache_identity;
+  bool cache_generation_known = false;
+  std::uint64_t completed_images = 0, bytes = 0;
  };
- struct PhysicalSource {
-  std::vector<AdmittedRecipeArchive*> archives;
-  struct Artifact {
-   AdmittedRecipeArchive* archive;
-   std::filesystem::path root;
-   std::size_t order;
-   bool cache_reusable = true;
-  };
-  std::unordered_map<std::uint16_t, Artifact> artifacts;
-  std::size_t next = 0;
-  std::unordered_map<std::uint64_t, PhysicalRoute> members;
-  // One forward discovery cursor per shard, referencing the authoritative
-  // encountered member location. Late reads must not rewind future discovery.
-  std::unordered_map<const AdmittedRecipeArchive*, std::uint64_t> scanned;
+ struct Fact {
+  CoconutPhysicalImage image;
+  bool conflict = false, pixels = false, verified = true;
+  std::uint64_t bytes = 0;
+  const CoconutPhysicalImage* borrowed = nullptr;
+  [[nodiscard]] const CoconutPhysicalImage& physical() const { return borrowed ? *borrowed : image; }
  };
- struct PhysicalRelease {
-  std::mutex mutex;
-  std::string identity;
-  std::map<std::uint64_t, CoconutPhysicalImage> resolved;
-  std::optional<CoconutPhysicalInputRequirement> input;
-  std::map<CoconutImageNamespace, PhysicalSource> sources;
-  std::set<std::filesystem::path> prepared_roots;
-  AdmittedRecipeArchive* active = nullptr;
-  std::shared_ptr<ArtifactLease> lease;
-  std::unique_ptr<BenchmarkArchive> reader;
-  BenchmarkAllowance directory_allowance, reader_parent;
-  common_io::FileHandle directory;
-  BenchmarkImageDecoder decoder;
-  void release_reader() {
-   directory = {};
-   directory_allowance = {};
-   reader.reset();
-   lease.reset();
-   reader_parent = {};
-   active = nullptr;
-  }
- };
- std::map<CoconutEdition, PhysicalRelease> releases;
- std::unordered_map<CoconutImageNamespace, std::unordered_map<std::uint64_t, const CoconutPhysicalImage*>> namespaces;
+ std::map<std::pair<CoconutImageNamespace, std::uint64_t>, Fact> images;
+ std::map<CoconutEdition, std::vector<Artifact*>> releases;
+ std::vector<Artifact> artifacts;
  std::map<CoconutImageNamespace, std::map<std::uint16_t, std::set<std::string>>> standalone_shards;
  const BenchmarkCacheLayout* cache = nullptr;
  StorageReservationPool* storage = nullptr;
  BenchmarkCompilePipeline* execution = nullptr;
  Cancellation cancellation;
  Progress progress;
+ mutable std::mutex mutex;
+ mutable std::condition_variable changed;
  Impl(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& layout, StorageReservationPool& reservations,
   BenchmarkCompilePipeline& pipeline, Cancellation cancel, Progress observer)
      : cache(&layout), storage(&reservations), execution(&pipeline), cancellation(cancel), progress(std::move(observer)) {
-  // Routing is a one-time projection of the selected release catalog. The
-  // explicit private catalog supplies its own bounded fixture source set.
+  artifacts.reserve(admitted.size());
+  for (auto& archive : admitted) artifacts.push_back({&archive, cache->source_images(benchmark_source_name(archive.origin.artifact.source)) / archive.origin.cache_shard});
   for (const auto& release : catalog.releases)
-   for (const auto name : coconut_release_sources(release.edition)) {
-    auto& state = releases[release.edition];
-    auto& source = state.sources[name];
-    for (auto& archive : admitted) {
-     if (archive.origin.source != name) continue;
-     if (!explicit_catalog && name == CoconutImageNamespace::Objects365V2) {
-      const auto shards = coconut_objects_training_shards(release.edition);
-      if (std::ranges::find(shards, archive.origin.shard) == shards.end()) continue;
-     }
-     source.archives.push_back(&archive);
-     if (!source.artifacts
-          .emplace(archive.origin.shard,
-           PhysicalSource::Artifact{&archive, cache->source_images(benchmark_source_name(archive.origin.artifact.source)) / archive.origin.cache_shard, source.archives.size() - 1})
-          .second)
-      invalid("duplicate physical shard in release catalog");
-    }
+   for (auto& artifact : artifacts) {
+    const auto& archive = artifact.archive->origin;
+    if (std::ranges::find(coconut_release_sources(release.edition), archive.source) == coconut_release_sources(release.edition).end()) continue;
+    if (!explicit_catalog && archive.source == CoconutImageNamespace::Objects365V2 &&
+        std::ranges::find(coconut_objects_training_shards(release.edition), archive.shard) == coconut_objects_training_shards(release.edition).end()) continue;
+    releases[release.edition].push_back(&artifact);
    }
-  for (auto& [edition, state] : releases) (void)requirement(state);
  }
- explicit Impl(std::span<const CoconutPhysicalImage> images, Cancellation cancel) : cancellation(cancel) {
-  for (const auto& image : images) {
+ explicit Impl(std::span<const CoconutPhysicalImage> values, Cancellation cancel) : cancellation(cancel) {
+  for (const auto& image : values) {
    throw_if_benchmark_cancelled(cancellation);
-   (void)coconut_namespace_name(image.source);
    validate_coconut_physical_image(image);
-   if (!namespaces[image.source].emplace(image.image_id, &image).second) invalid("duplicate physical member: " + image.member);
+   if (!images.emplace(std::pair{image.source, image.image_id}, Fact{.borrowed = &image}).second) invalid("duplicate physical member: " + image.member);
    standalone_shards[image.source][image.shard].insert(image.archive_identity);
   }
  }
+ std::filesystem::path root(CoconutImageNamespace source) const {
+  // Train and unlabeled share COCO's physical ID domain. The join is compile
+  // local; JPEG files retain their established source/shard cache locations.
+  if (source == CoconutImageNamespace::CocoUnlabeled) source = CoconutImageNamespace::CocoTrain;
+  return cache ? cache->source_indexes("coconut") / ("identity-" + std::to_string(static_cast<unsigned>(source))) : std::filesystem::path{};
+ }
  const CoconutPhysicalImage* find(CoconutImageNamespace source, std::uint64_t id) const noexcept {
-  const auto space = namespaces.find(source);
-  if (space == namespaces.end()) return nullptr;
-  const auto found = space->second.find(id);
-  return found == space->second.end() ? nullptr : found->second;
+  const auto found = images.find({source, id});
+  return found == images.end() || found->second.conflict || !found->second.verified ? nullptr : &found->second.physical();
  }
- static CoconutPhysicalInputRequirement requirement(PhysicalRelease& state) {
-  if (!state.input) {
-   std::uint64_t workspace = 0;
-   std::size_t descriptors = 0;
-   for (const auto& [name, source] : state.sources)
-    for (const auto* archive : source.archives) {
-     workspace = std::max(workspace, archive->resolution_input.workspace_bytes);
-     descriptors = std::max(descriptors, archive->resolution_input.descriptors);
-    }
-   state.input = CoconutPhysicalInputRequirement::archive(workspace, descriptors);
-  }
-  return *state.input;
+ Artifact& artifact(const AdmittedRecipeArchive& archive) {
+  const auto found = std::ranges::find_if(artifacts, [&](const auto& item) { return item.archive == &archive; });
+  if (found == artifacts.end()) throw std::logic_error("physical source is outside its controller");
+  return *found;
  }
- CoconutPhysicalImage resolve(CoconutEdition edition, std::string_view identity, const CoconutRecord& record, const BenchmarkAllowance& parent, bool canonical_metadata,
-  const std::function<void()>& retire_projection = {}) {
+ CoconutPhysicalImage resolve(CoconutEdition edition, const CoconutRecord& record, bool wait) const {
   const auto objects = admit_record(edition, record);
-  if (!execution) {
+  const auto id = objects ? objects->id : record.image_id;
+  std::unique_lock lock(mutex);
+  const auto lookup = [&]() -> const CoconutPhysicalImage* {
    const CoconutPhysicalImage* match = nullptr;
-   if (objects)
-    match = find(objects->source, objects->id);
-   else
-    for (const auto source : coconut_release_sources(edition)) {
-     if (const auto* found = find(source, record.image_id)) {
-      if (match) invalid("ambiguous COCO train/unlabeled membership: " + record.file_name);
-      match = found;
-     }
+   for (const auto source : coconut_release_sources(edition)) {
+    if (objects && objects->source != source) continue;
+    const auto found = images.find({source, id});
+    if (found == images.end() || !found->second.verified) continue;
+    if (found->second.conflict || match) throw CoconutPhysicalMembershipError(edition, id, "ambiguous physical image identity: " + record.file_name);
+    const auto& physical = found->second.physical();
+    if (execution) {
+     const auto selected = releases.find(edition);
+     if (selected == releases.end() || std::ranges::none_of(selected->second, [&](const auto* item) {
+      return item->archive->origin.source == physical.source && item->archive->origin.shard == physical.shard;
+     })) continue;
     }
-   if (!match)
-    throw CoconutPhysicalMembershipError(
-     edition, record.image_id, objects ? "missing physical Objects365 archive member: " + record.physical_stem : "missing physical COCO archive member: " + record.file_name);
-   return *match;
-  }
-  auto& state = releases.at(edition);
-  // The join and cursor share one release lock. Concurrent requests must check
-  // the cache here, before either can reopen or republish the same image.
-  std::unique_lock lock(state.mutex);
-  if (state.identity != identity) {
-   state.resolved.clear();
-   state.identity = identity;
-  }
-  const auto logical_key = edition == CoconutEdition::XLarge ? record.image_id : record.source_ordinal;
-  if (const auto found = state.resolved.find(logical_key); found != state.resolved.end()) return found->second;
-  const bool coco_record = !objects;
-  const auto preferred = edition == CoconutEdition::RelabeledValidation ? std::optional(CoconutImageNamespace::CocoValidation) : record.namespace_hint;
-  const auto requested_id = objects ? objects->id : record.image_id;
-  const auto eligible = coconut_release_sources(edition);
-  AdmittedRecipeArchive* repair_candidate = nullptr;
-  for (const bool preferred_pass : {true, false})
-   for (const auto source_name : eligible) {
-    if ((!coco_record && source_name != objects->source) || (preferred && source_name == *preferred) != preferred_pass) continue;
-    auto& source = state.sources.at(source_name);
-    for (auto* archive : source.archives)
-     if (!repair_candidate || archive->structural_attempts < repair_candidate->structural_attempts) repair_candidate = archive;
-    for (;;) {
-     auto found = source.members.find(requested_id);
-     if (found == source.members.end() && source.next == source.archives.size()) break;
-     const bool known_member = found != source.members.end();
-     auto& archive = *(found != source.members.end() ? found->second.archive : source.archives[source.next]);
-     const auto& root = source.artifacts.at(archive.origin.shard).root;
-     if (state.active != &archive) {
-      state.release_reader();
-      state.active = &archive;
-     }
-     try {
-      if (!state.lease) {
-       if (progress) progress(edition, archive, requested_id, 0);
-       const auto lifecycle = cache->locks / (std::string(benchmark_source_name(archive.origin.artifact.source)) + "-" + archive.origin.cache_shard + ".images.lock");
-       if (retire_projection && !canonical_metadata) {
-        state.lease = ArtifactLease::try_acquire_charged(lifecycle, cancellation, execution, requirement(state).lease_controls(), parent);
-        if (!state.lease) {
-         retire_projection();
-         canonical_metadata = true;
-        }
-       }
-       if (canonical_metadata && parent && !execution->try_resize_workspace(parent, 0)) throw std::logic_error("physical metadata retains unrelated workspace");
-       if (!state.lease) state.lease = ArtifactLease::acquire_charged(lifecycle, cancellation, execution, requirement(state).lease_controls(), parent);
-       if (canonical_metadata && parent) {
-        const auto workspace = requirement(state).workspace_bytes();
-        if (!execution->try_resize_workspace(parent, workspace)) {
-         // Another sequence may own the transient grant while approaching this
-         // release. Never wait for its bytes while holding the shared cursor.
-         state.release_reader();
-         lock.unlock();
-         for (;;) {
-          const auto observed = execution->admission_generation();
-          if (execution->try_resize_workspace(parent, workspace)) break;
-          execution->wait_for_admission_change(observed);
-         }
-         return resolve(edition, identity, record, parent, false);
-        }
-       }
-      }
-      if (known_member && found->second.conflict) throw BenchmarkArchiveError("conflicting requested physical image identity");
-      const bool new_reader = !state.reader;
-      if (!state.reader) {
-       state.reader_parent = parent;
-       state.reader = std::make_unique<BenchmarkArchive>(
-        archive.download.path, execution, 64ULL << 20, state.lease->allowance(), 1, false, parent.bytes() >= archive.resolution_input.workspace_bytes ? parent : BenchmarkAllowance{});
-      }
-      auto& reader = *state.reader;
-      bool located = found != source.members.end() && reader.seek(found->second.locator, cancellation);
-      if (!located) {
-       if (const auto cursor = source.scanned.find(&archive); cursor != source.scanned.end()) {
-        const auto& location = source.members.at(cursor->second);
-        if (new_reader || reader.position() != location.position) (void)reader.seek(location.locator, cancellation);
-       }
-      }
-      while (!located && reader.next(cancellation)) {
-       if (progress && (reader.position() == 0 || (reader.position() + 1) % 1024 == 0)) progress(edition, archive, requested_id, reader.position() + 1);
-       if (!reader.member().ends_with(".jpg")) continue;
-       const auto id = benchmark_archive_image_candidate(reader.member());
-       if (!id) continue;
-       const auto [entry, inserted] = source.members.emplace(*id, PhysicalRoute{&archive, reader.member_position(), reader.position()});
-       if (!inserted && (entry->second.archive != &archive || entry->second.position != reader.position())) entry->second.conflict = true;
-       if (entry->second.conflict && (entry->second.consumed || *id == requested_id)) throw BenchmarkArchiveError("conflicting consumed physical image identity");
-       for (const auto& [other_name, other_source] : state.sources) {
-        if (other_name == source_name) continue;
-        const auto other = other_source.members.find(*id);
-        if (other != other_source.members.end() && (other->second.consumed || *id == requested_id)) throw BenchmarkArchiveError("ambiguous encountered physical namespaces");
-       }
-       located = *id == requested_id;
-      }
-      if (!located && known_member) throw BenchmarkArchiveError("known requested member disappeared from its archive generation");
-      if (!located) {
-       ++source.next;
-       state.release_reader();
-       continue;
-      }
-      const CoconutPhysicalImage physical{archive.origin.source, requested_id, archive.origin.shard, reader.member(), archive.download.identity};
-      try {
-       validate_coconut_physical_image(physical);
-      } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
-       throw BenchmarkArchiveError(error.what());
-      }
-      if (state.prepared_roots.insert(root).second) prepare_cached_image_directory(root);
-      if (state.directory.get() < 0) {
-       state.directory_allowance = execution->reserve(BenchmarkResources::handles(2, true), state.lease->allowance());
-       const int descriptor = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-       if (descriptor < 0) throw common_io::errno_error("cannot open physical image cache directory", root.string());
-       state.directory = common_io::FileHandle(descriptor);
-      }
-      const CachedImageValidator validate = [&](std::uint64_t, std::span<const std::uint8_t> encoded) {
-       if (!has_complete_image_markers(encoded)) throw BenchmarkImageError("incomplete requested COCONut image");
-       return state.decoder.read_header(encoded);
-      };
-      BenchmarkEncodedImage::Ptr input;
-      try {
-       if (source.artifacts.at(archive.origin.shard).cache_reusable)
-        input = BenchmarkEncodedImage::open(state.directory.get(), requested_id, validate, cancellation, execution, reader.allowance(), execution->image_input(root, requested_id), 32ULL << 20);
-      } catch (const InvalidImageError&) { /* The consumed source replaces this invalid cache entry below. */
-      }
-      if (input)
-       input = input->header_only();
-      else {
-       const auto encoded = reader.read(32ULL << 20, cancellation);
-       BenchmarkImageHeader header;
-       reader.cpu([&] { header = validate(requested_id, encoded); });
-       StorageReservationPool destination(root, {}, storage);
-       input = BenchmarkEncodedImage::publish(state.directory.get(), requested_id, encoded, header, cancellation, destination, execution, {}, false);
-      }
-      const auto header = input->header();
-      execution->source_publication(root, state.lease)({requested_id, std::pair{header.width, header.height}, true, std::move(input)});
-      auto& route = source.members.at(requested_id);
-      route.consumed = true;
-      route.locator = reader.member_position();
-      const auto cursor = source.scanned.find(&archive);
-      if (cursor == source.scanned.end() || source.members.at(cursor->second).position < route.position) source.scanned[&archive] = requested_id;
-      state.resolved.insert_or_assign(logical_key, physical);
-      return physical;
-     } catch (const PhysicalArchiveFailure&) { throw; } catch (const BenchmarkArchiveError& error) {
-      throw PhysicalArchiveFailure(archive, error.what());
-     } catch (const BenchmarkImageError& error) { throw PhysicalArchiveFailure(archive, error.what()); } catch (const std::bad_alloc&) {
-      throw;
-     } catch (const std::exception& error) { throw PhysicalArchiveFailure(archive, error.what(), std::current_exception()); }
-    }
+    match = &physical;
    }
-  // Resolve again after each bounded replacement. A valid alternative source
-  // must not be replaced merely because a preferred archive omitted this image.
-  const auto missing = "missing requested physical archive member: " + record.file_name;
-  if (repair_candidate) throw PhysicalArchiveFailure(*repair_candidate, missing);
-  throw CoconutPhysicalMembershipError(edition, record.image_id, missing);
+   return match;
+  };
+  for (;;) {
+   if (const auto* image = lookup()) return *image;
+   if (!execution || !wait) break;
+   const auto selected = releases.find(edition);
+   if (selected == releases.end() || std::ranges::all_of(selected->second, [](const auto* item) { return item->complete; })) break;
+   throw_if_benchmark_cancelled(cancellation);
+   changed.wait_for(lock, std::chrono::milliseconds(100));
+  }
+  if (execution && !wait) {
+   const auto source = objects ? objects->source : edition == CoconutEdition::RelabeledValidation ? CoconutImageNamespace::CocoValidation : record.namespace_hint.value_or(CoconutImageNamespace::CocoTrain);
+   const auto member = objects ? objects->stem + ".jpg" : (source == CoconutImageNamespace::CocoValidation ? "val2017/" : source == CoconutImageNamespace::CocoUnlabeled ? "unlabeled2017/" : "train2017/") + std::filesystem::path(record.file_name).filename().string();
+   return {source, id, 0, member, "pending"};
+  }
+  throw CoconutPhysicalMembershipError(edition, id, "missing physical image: " + record.file_name);
  }
 };
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& cache,
@@ -373,110 +199,292 @@ CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<AdmittedRecipeArc
     : impl_(std::make_unique<Impl>(admitted, catalog, explicit_catalog, cache, storage, execution, cancellation, std::move(progress))) {}
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<const CoconutPhysicalImage> images, Cancellation cancellation) : impl_(std::make_unique<Impl>(images, cancellation)) {}
 CoconutPhysicalMembership::~CoconutPhysicalMembership() = default;
-const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespace source, std::uint64_t id) const noexcept { return impl_->find(source, id); }
-CoconutPhysicalImage CoconutPhysicalMembership::resolve(
- CoconutEdition edition, std::string_view identity, const CoconutRecord& record, const BenchmarkAllowance& parent, bool canonical_metadata, const std::function<void()>& retire_projection) const {
- return impl_->resolve(edition, identity, record, parent, canonical_metadata, retire_projection);
+const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespace source, std::uint64_t id) const noexcept {
+ const std::lock_guard lock(impl_->mutex);
+ return impl_->find(source, id);
 }
-// CLEANUP-IGNORE: Requirement and publication queries share only guard/lookup/lock setup; their returned facts and admission operations differ.
-CoconutPhysicalInputRequirement CoconutPhysicalMembership::input_requirement(CoconutEdition edition) const {
- if (!impl_->execution) return {};
- auto& state = impl_->releases.at(edition);
- const std::lock_guard lock(state.mutex);
- return Impl::requirement(state);
+CoconutPhysicalImage CoconutPhysicalMembership::identify(CoconutEdition edition, const CoconutRecord& record) const { return impl_->resolve(edition, record, false); }
+CoconutPhysicalImage CoconutPhysicalMembership::resolve(CoconutEdition edition, const CoconutRecord& record) const {
+ return impl_->resolve(edition, record, true);
 }
-void CoconutPhysicalMembership::release_readers(CoconutEdition edition, const BenchmarkAllowance& producer) const {
- if (!impl_->execution) return;
- auto& state = impl_->releases.at(edition);
- const std::lock_guard lock(state.mutex);
- if (!producer || state.reader_parent.aliases(producer)) state.release_reader();
-}
+std::filesystem::path CoconutPhysicalMembership::identity_root(CoconutImageNamespace source) const { return impl_->root(source); }
 bool CoconutPhysicalMembership::eligible(CoconutEdition edition, const AdmittedRecipeArchive& archive) const {
- const auto release = impl_->releases.find(edition);
- if (release == impl_->releases.end()) return false;
- const auto source = release->second.sources.find(archive.origin.source);
- if (source == release->second.sources.end()) return false;
- const auto found = source->second.artifacts.find(archive.origin.shard);
- return found != source->second.artifacts.end() && found->second.archive == &archive;
+ const auto found = impl_->releases.find(edition);
+ return found != impl_->releases.end() && std::ranges::any_of(found->second, [&](const auto* item) { return item->archive == &archive; });
+}
+void CoconutPhysicalMembership::admitted(AdmittedRecipeArchive& archive, DownloadResult download, bool replacement) {
+ {
+  const std::lock_guard lock(impl_->mutex);
+  replacement = replacement || std::ranges::any_of(impl_->images, [&](const auto& row) {
+   return row.first.first == archive.origin.source && row.second.image.shard == archive.origin.shard && row.second.image.archive_identity != download.identity;
+  });
+ }
+ if (replacement) {
+  withdraw(archive);
+  if (impl_->progress) impl_->progress(CoconutEdition::Base, archive, 0, 0);
+ }
+ const std::lock_guard lock(impl_->mutex);
+ archive.download = std::move(download);
+ impl_->artifact(archive).admitted = true;
+}
+bool CoconutPhysicalMembership::discovery_complete() const {
+ const std::lock_guard lock(impl_->mutex);
+ return std::ranges::all_of(impl_->artifacts, [](const auto& artifact) { return artifact.complete; });
+}
+void CoconutPhysicalMembership::wait_sources(std::optional<CoconutEdition> edition) const {
+ std::unique_lock lock(impl_->mutex);
+ const auto complete = [&] {
+  if (!edition) return std::ranges::all_of(impl_->artifacts, [](const auto& artifact) { return artifact.complete; });
+  const auto found = impl_->releases.find(*edition);
+  return found == impl_->releases.end() || std::ranges::all_of(found->second, [](const auto* artifact) { return artifact->complete; });
+ };
+ while (!complete()) {
+  throw_if_benchmark_cancelled(impl_->cancellation);
+  impl_->changed.wait_for(lock, std::chrono::milliseconds(100));
+ }
+}
+void CoconutPhysicalMembership::unavailable(AdmittedRecipeArchive& archive) {
+ {
+  const std::lock_guard lock(impl_->mutex);
+  impl_->artifact(archive).complete = true;
+ }
+ impl_->changed.notify_all();
+}
+bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const std::function<void(const CoconutPhysicalImage&, std::string_view)>& rejected, bool cache_only, bool accept_partial) {
+ auto& state = *impl_;
+ auto& artifact = state.artifact(archive);
+ const auto cancellation = state.cancellation;
+ auto& execution = *state.execution;
+ const auto lifecycle = state.cache->locks / (std::string(benchmark_source_name(archive.origin.artifact.source)) + "-" + archive.origin.cache_shard + ".images.lock");
+ auto lease = ArtifactLease::acquire_charged(lifecycle, cancellation, &execution, archive_image_resources());
+ const auto root = state.root(archive.origin.source);
+ const auto inventory_path = state.cache->source_indexes(benchmark_source_name(archive.origin.artifact.source)) / (archive.origin.cache_shard + ".images.inventory");
+ const auto proof_path = artifact.root / ".recipe-proofs/physical.inventory.complete.json";
+ const auto& catalog = archive.origin.artifact;
+ const nlohmann::json source_identity = nlohmann::json::array({catalog.artifact_id, catalog.url, catalog.filename, catalog.expected_size, catalog.expected_sha256});
+ if (cache_only) {
+  if (!std::filesystem::is_regular_file(inventory_path) || !std::filesystem::is_regular_file(proof_path)) return false;
+  auto controls = execution.reserve(BenchmarkResources::handles(1, false), lease->allowance());
+  std::ifstream input(proof_path);
+  if (!input) throw std::runtime_error("cannot read COCONut image cache proof: " + proof_path.string());
+  const auto proof = nlohmann::json::parse(input, nullptr, false);
+  if (input.bad()) throw std::runtime_error("cannot read COCONut image cache proof: " + proof_path.string());
+  if (proof.is_discarded()) return false;
+  if (!proof.is_object() || !proof.contains("schema_version") || proof["schema_version"] != kBenchmarkCacheSchemaVersion || !proof.contains("source") || proof["source"] != source_identity ||
+      !proof.contains("identity") || !proof["identity"].is_string() || !proof.contains("bytes") || !proof["bytes"].is_number_unsigned()) return false;
+  const std::lock_guard lock(state.mutex);
+  archive.download.identity = proof["identity"].get<std::string>();
+  archive.download.size = proof["bytes"].get<std::uint64_t>();
+  archive.download.cache_hit = true;
+  artifact.admitted = true;
+ }
+ prepare_cached_image_directory(artifact.root);
+ auto directory_allowance = execution.reserve(BenchmarkResources::handles(3, false), lease->allowance());
+ const int descriptor = ::open(artifact.root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+ if (descriptor < 0) throw common_io::errno_error("cannot open physical image cache", artifact.root.string());
+ common_io::FileHandle directory(descriptor);
+ BenchmarkImageDecoder decoder;
+ StorageReservationPool destination(artifact.root, {}, state.storage);
+ const CachedImageValidator validate = [&](std::uint64_t, std::span<const std::uint8_t> encoded) {
+  if (!has_complete_image_markers(encoded)) throw BenchmarkImageError("incomplete COCONut JPEG");
+  return decoder.read_header(encoded);
+ };
+ const auto fact = [&](const CoconutPhysicalImage& image, bool verified, bool duplicate = false) -> std::optional<bool> {
+  bool conflict = duplicate, pixels = false, retire = false;
+  {
+   const std::lock_guard lock(state.mutex);
+   const auto withdraw = [&](Impl::Fact& value) {
+    if (!value.pixels) return;
+    for (auto& owner : state.artifacts) if (owner.archive->origin.source == value.image.source && owner.archive->origin.shard == value.image.shard) {
+     --owner.completed_images;
+     owner.bytes -= value.bytes;
+     break;
+    }
+    value.pixels = false;
+    value.bytes = 0;
+    retire = true;
+   };
+   if (image.source == CoconutImageNamespace::CocoTrain || image.source == CoconutImageNamespace::CocoUnlabeled) {
+    const auto other = image.source == CoconutImageNamespace::CocoTrain ? CoconutImageNamespace::CocoUnlabeled : CoconutImageNamespace::CocoTrain;
+    if (const auto peer = state.images.find({other, image.image_id}); peer != state.images.end()) {
+     peer->second.conflict = true;
+     withdraw(peer->second);
+     conflict = true;
+    }
+   }
+   auto [found, inserted] = state.images.emplace(std::pair{image.source, image.image_id}, Impl::Fact{image, conflict, false, verified});
+   found->second.conflict = found->second.conflict || conflict || (!inserted && found->second.image != image);
+   if (verified) found->second.verified = true;
+   conflict = found->second.conflict;
+   pixels = found->second.pixels;
+   if (conflict) withdraw(found->second);
+   state.changed.notify_all();
+  }
+  if (conflict) {
+   if (retire) execution.retire_image(root, image.image_id);
+   if (rejected) rejected(image, "ambiguous physical image identity");
+   return std::nullopt;
+  }
+  return pixels;
+ };
+ const auto publish = [&](const CoconutPhysicalImage& image, BenchmarkEncodedImage::Ptr input) {
+  const auto bytes = input->size();
+  execution.source_publication(root, lease, image.image_id)({image.image_id, std::pair{input->header().width, input->header().height}, true, std::move(input), artifact.root});
+  if (execution.image_slot(root, image.image_id)) execution.wait_image(root, image.image_id);
+  bool conflict = false;
+  {
+   const std::lock_guard lock(state.mutex);
+   auto& fact = state.images.at({image.source, image.image_id});
+   conflict = fact.conflict;
+   if (!conflict) {
+    if (!fact.pixels) { ++artifact.completed_images; artifact.bytes = mmltk::common::math::checked_add(artifact.bytes, bytes, "COCONut image cache byte overflow"); }
+    fact.pixels = true;
+    fact.bytes = bytes;
+   }
+  }
+  // A peer can discover ambiguity while this decoder is active. Let that
+  // borrower finish before retiring its slot; unrelated readers keep moving.
+  if (conflict) execution.retire_image(root, image.image_id);
+ };
+ bool cache_generation_known = artifact.cache_generation_known && artifact.inspected_cache_identity == archive.download.identity;
+ if (artifact.inspected_cache_identity != archive.download.identity && std::filesystem::is_regular_file(inventory_path)) {
+  artifact.inspected_cache_identity = archive.download.identity;
+  try {
+   (void)load_coconut_physical_inventory(inventory_path, archive.origin.source, archive.origin.shard, archive.download.identity, cancellation, [&](const CoconutPhysicalImage& image) {
+    cache_generation_known = artifact.cache_generation_known = true;
+    const auto complete = fact(image, false);
+    if (!complete) return;
+    auto input = BenchmarkEncodedImage::open(directory.get(), image.image_id, validate, cancellation, &execution, lease->allowance(), {}, 32ULL << 20);
+    if (!input) throw BenchmarkImageError("cached inventory image is missing");
+    if (!*complete) publish(image, std::move(input));
+    if (state.progress) state.progress(CoconutEdition::Base, archive, image.image_id, artifact.completed_images);
+   });
+   {
+    const std::lock_guard lock(state.mutex);
+    for (auto& [key, value] : state.images) if (key.first == archive.origin.source && value.image.shard == archive.origin.shard) value.verified = true;
+   }
+   { const std::lock_guard lock(state.mutex); artifact.cache_hit = true; }
+   unavailable(archive);
+   return true;
+  } catch (const CoconutInputError&) { /* Repair the invalid inventory from its forward source. */ }
+    catch (const BenchmarkImageReadError& error) { execution.retire_image(root, error.source_image_id()); }
+    catch (const BenchmarkImageError&) { /* Only failed/missing cache rows need source bytes. */ }
+    catch (const InvalidImageError&) { /* Invalid encoded cache input is locally repairable. */ }
+ }
+ if (cache_only) {
+  const std::lock_guard lock(state.mutex);
+  artifact.admitted = false;
+  return false;
+ }
+ BenchmarkArchive reader(archive.download.path, &execution, 64ULL << 20, lease->allowance(), 1, true, {}, 1024, 2);
+ std::vector<CoconutPhysicalImage> inventory;
+ std::unordered_set<std::uint64_t> encountered;
+ bool unreadable = false;
+ const auto bad_image = [&](const CoconutPhysicalImage& image, std::string_view reason) {
+  unreadable = true;
+  if (accept_partial && rejected) rejected(image, reason);
+ };
+ while (reader.next(cancellation)) {
+  if (!reader.regular() || !reader.member().ends_with(".jpg")) continue;
+  const auto id = benchmark_archive_image_candidate(reader.member());
+  if (!id) continue;
+  CoconutPhysicalImage image{archive.origin.source, *id, archive.origin.shard, reader.member(), archive.download.identity};
+  try { validate_coconut_physical_image(image); } catch (const CoconutInputError& error) {
+   if (rejected) rejected(image, error.what());
+   continue;
+  }
+  const auto complete = fact(image, true, !encountered.insert(*id).second);
+  if (!complete) continue;
+  inventory.push_back(image);
+  if (*complete) continue;
+  for (unsigned attempt = 0; attempt < 2; ++attempt) {
+   try {
+    BenchmarkEncodedImage::Ptr input;
+    if (!attempt && cache_generation_known) input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution, reader.allowance(), {}, 32ULL << 20);
+    if (!input) {
+     const auto encoded = reader.read(32ULL << 20, cancellation);
+     BenchmarkImageHeader header;
+     reader.cpu([&] { header = validate(*id, encoded); });
+     if (std::filesystem::exists(cached_image_path(artifact.root, *id))) invalidate_cached_image_proofs(artifact.root);
+     input = BenchmarkEncodedImage::publish(directory.get(), *id, encoded, header, cancellation, destination, &execution, reader.allowance(), true);
+    }
+    publish(image, std::move(input));
+    break;
+   } catch (const BenchmarkImageReadError& error) {
+    if (attempt) bad_image(image, error.what());
+    execution.retire_image(root, *id);
+    if (attempt) break;
+   } catch (const BenchmarkImageError& error) {
+    if (attempt) bad_image(image, error.what());
+    if (attempt) break;
+   } catch (const InvalidImageError& error) {
+    if (attempt) bad_image(image, error.what());
+    if (attempt) break;
+   }
+  }
+  if (state.progress) state.progress(CoconutEdition::Base, archive, *id, artifact.completed_images);
+ }
+ if (unreadable && !accept_partial) throw BenchmarkArchiveError("COCONut archive contains unreadable JPEG payloads");
+ // An omitted ambiguous ID stays absent from the completed source inventory.
+ // It must never regain eligibility merely because one spelling had pixels.
+ std::erase_if(inventory, [&](const auto& image) {
+  const std::lock_guard lock(state.mutex);
+  return !state.find(image.source, image.image_id);
+ });
+ std::ranges::sort(inventory, {}, &CoconutPhysicalImage::image_id);
+ store_coconut_physical_inventory(inventory_path, inventory, archive.origin.source, archive.origin.shard, archive.download.identity, cancellation, state.storage);
+ write_json_atomically(proof_path, {{"schema_version", kBenchmarkCacheSchemaVersion}, {"source", source_identity}, {"identity", archive.download.identity}, {"bytes", archive.download.size}}, cancellation, state.storage);
+ unavailable(archive);
+ return true;
+}
+CachedImageDirectory CoconutPhysicalMembership::summary(const AdmittedRecipeArchive& archive) const {
+ const std::lock_guard lock(impl_->mutex);
+ const auto& value = impl_->artifact(archive);
+ return {std::string(benchmark_source_name(archive.origin.artifact.source)), archive.origin.cache_shard, value.root, archive.download.identity, {}, value.completed_images, value.bytes, value.cache_hit, {}};
 }
 void CoconutPhysicalDependencies::add(const CoconutPhysicalImage& image) {
  const auto [entry, inserted] = shards_.try_emplace(image.shard, image.archive_identity);
  if (!inserted && entry->second != image.archive_identity) invalid("component mixes physical artifact generations");
 }
 std::string CoconutPhysicalMembership::dependency_identity(CoconutEdition edition, CoconutImageNamespace source, const CoconutPhysicalDependencies& dependencies, bool current) const {
+ const std::lock_guard lock(impl_->mutex);
  nlohmann::json tuples = nlohmann::json::array();
  const auto& used = dependencies.shards_;
- const auto release = impl_->releases.find(edition);
- if (release != impl_->releases.end()) {
-  const auto found = release->second.sources.find(source);
-  if (found != release->second.sources.end()) {
-   const auto& routes = found->second;
-   const auto append = [&](const AdmittedRecipeArchive& archive) {
-    tuples.push_back(
-     {archive.origin.artifact.artifact_id, archive.origin.shard, current || used.empty() ? std::string_view(archive.download.identity) : std::string_view(used.at(archive.origin.shard))});
-   };
-   if (used.empty())
-    for (const auto* archive : routes.archives) append(*archive);
-   else {
-    // Restore catalog order without another inventory or whole-catalog scan.
-    std::vector<const Impl::PhysicalSource::Artifact*> selected;
-    selected.reserve(used.size());
-    for (const auto& [shard, identity] : used) {
-     (void)identity;
-     if (const auto route = routes.artifacts.find(shard); route != routes.artifacts.end()) selected.push_back(&route->second);
-    }
-    std::ranges::sort(selected, {}, &Impl::PhysicalSource::Artifact::order);
-    for (const auto* route : selected) append(*route->archive);
-   }
+ if (const auto release = impl_->releases.find(edition); release != impl_->releases.end()) {
+  for (const auto* item : release->second) {
+   const auto& archive = *item->archive;
+   if (archive.origin.source != source || (!used.empty() && !used.contains(archive.origin.shard))) continue;
+   tuples.push_back({archive.origin.artifact.artifact_id, archive.origin.shard, current || used.empty() ? (item->admitted ? archive.download.identity : std::string{}) : used.at(archive.origin.shard)});
   }
  } else if (const auto found = impl_->standalone_shards.find(source); found != impl_->standalone_shards.end()) {
-  const auto append = [&](const auto& entry) {
-   const auto& [shard, identities] = entry;
-   if (current || used.empty())
-    for (const auto& identity : identities) tuples.push_back({shard, identity});
-   else
-    tuples.push_back({shard, used.at(shard)});
-  };
-  if (used.empty())
-   for (const auto& entry : found->second) append(entry);
-  else
-   for (const auto& [shard, identity] : used) {
-    (void)identity;
-    if (const auto entry = found->second.find(shard); entry != found->second.end()) append(*entry);
-   }
+  for (const auto& [shard, identities] : found->second) {
+   if (!used.empty() && !used.contains(shard)) continue;
+   if (current || used.empty()) for (const auto& identity : identities) tuples.push_back({shard, identity});
+   else tuples.push_back({shard, used.at(shard)});
+  }
  }
  return nlohmann::json{{"domain", "coconut-physical-artifacts-v1"}, {"edition", edition}, {"source", source}, {"artifacts", std::move(tuples)}}.dump();
 }
-BenchmarkSourcePublication CoconutPhysicalMembership::label_publication(CoconutEdition edition, const CoconutPhysicalImage& physical) const {
- if (!impl_->execution) return {};
- auto& release = impl_->releases.at(edition);
- const std::lock_guard lock(release.mutex);
- const auto& source = release.sources.at(physical.source);
- const auto found = source.artifacts.find(physical.shard);
- if (found == source.artifacts.end()) throw CoconutPhysicalMembershipError(edition, physical.image_id, "normalized image has no admitted physical dependency");
- const auto& archive = *found->second.archive;
- if (archive.origin.shard != physical.shard || archive.download.identity != physical.archive_identity)
-  throw CoconutPhysicalMembershipError(edition, physical.image_id, "normalized image physical dependency retired");
- const auto& root = found->second.root;
- // Native support owns its bytes. Retain the existing generation/attempt ticket,
- // without extending the retired physical reader's descriptor or lock custody.
- return impl_->execution->source_publication(root, {}, physical.image_id);
+BenchmarkSourcePublication CoconutPhysicalMembership::label_publication(CoconutEdition, const CoconutPhysicalImage& image) const {
+ return impl_->execution ? impl_->execution->source_publication(impl_->root(image.source), {}, image.image_id) : BenchmarkSourcePublication{};
 }
 void CoconutPhysicalMembership::withdraw(const AdmittedRecipeArchive& archive) {
- for (auto& [edition, state] : impl_->releases) {
-  if (!eligible(edition, archive)) continue;
-  const std::lock_guard lock(state.mutex);
-  if (state.active == &archive) state.release_reader();
-  auto& source = state.sources.at(archive.origin.source);
-  source.artifacts.at(archive.origin.shard).cache_reusable = false;
-  source.scanned.erase(&archive);
-  std::erase_if(state.resolved, [&](const auto& entry) {
-   const auto& physical = entry.second;
-   return physical.source == archive.origin.source && physical.shard == archive.origin.shard && physical.archive_identity == archive.download.identity;
+ std::vector<std::uint64_t> withdrawn;
+ {
+  const std::lock_guard lock(impl_->mutex);
+  impl_->artifact(archive).complete = false;
+  impl_->artifact(archive).admitted = false;
+  impl_->artifact(archive).completed_images = impl_->artifact(archive).bytes = 0;
+  impl_->artifact(archive).cache_hit = false;
+  impl_->artifact(archive).inspected_cache_identity.clear();
+  impl_->artifact(archive).cache_generation_known = false;
+  std::erase_if(impl_->images, [&](const auto& item) {
+   const auto& image = item.second.image;
+   if (image.source != archive.origin.source || image.shard != archive.origin.shard) return false;
+   withdrawn.push_back(image.image_id);
+   return true;
   });
-  std::erase_if(source.members, [&](const auto& entry) { return entry.second.archive == &archive; });
-  source.next = std::min(source.next, static_cast<std::size_t>(std::ranges::find(source.archives, &archive) - source.archives.begin()));
-  state.input.reset();
  }
+ for (const auto id : withdrawn) impl_->execution->retire_image(impl_->root(archive.origin.source), id);
 }
 }  // namespace mmltk::backend::data::benchmark_internal

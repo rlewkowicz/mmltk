@@ -5,8 +5,7 @@
 #include <stdexcept>
 namespace mmltk::backend::data::benchmark_internal {
 BenchmarkLabelInput::BenchmarkLabelInput(NormalizedAnnotationReadView index, std::size_t image) : index_(std::move(index)), image_(image) {
- admit_normalized_annotations(index_.storage());
- (void)index_.image(image_);
+ admit_normalized_annotation_image(index_.storage(), index_.source_position(image_));
 }
 BenchmarkLabelInput::BenchmarkLabelInput(NormalizedAnnotationReadView index, std::shared_ptr<const CoconutNativeImage> native) : native_(std::move(native)), index_(std::move(index)) {
  if (!native_) throw std::invalid_argument("benchmark labels require native input custody");

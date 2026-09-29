@@ -1,3 +1,5 @@
+#include <system_error>
+#include <sys/mman.h>
 #include "src/backend/data/benchmark/detail/benchmark_json.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
@@ -35,6 +37,7 @@ public:
  std::span<const NormalizedBox> boxes;
  std::span<const RLEPair> runs;
  std::once_flag image_admission, full_admission;
+ std::atomic<std::size_t> admitted_rows{0};
 };
 namespace {
 constexpr std::uint64_t kNormalizedIndexMagic = 0x4D4D4C544B4E4931ULL;
@@ -924,13 +927,13 @@ std::uint64_t validate_run_value(RLEPair pair, std::uint64_t pixels, std::uint64
  return end;
 }
 template <class Index>
-void validate_normalized_records(const Index& index, mmltk::common::concurrency::CancellationObservation cancel_requested, bool metadata_only = false, bool images_admitted = false) {
+void validate_normalized_records(const Index& index, mmltk::common::concurrency::CancellationObservation cancel_requested, bool metadata_only = false, bool images_admitted = false, const std::function<void(std::size_t)>& ready = {}) {
  std::uint64_t expected_first = 0U;
  std::uint64_t expected_mask_offset = 0U;
  std::uint64_t previous_id = 0U;
  bool first = true;
  for (std::size_t image_index = 0U; image_index < index.images.size(); ++image_index) {
-  if ((image_index & 4095U) == 0U) { throw_if_benchmark_cancelled(cancel_requested); }
+  if (ready || (image_index & 4095U) == 0U) { throw_if_benchmark_cancelled(cancel_requested); }
   const NormalizedImage& image = index.images[image_index];
   if (!images_admitted &&
       ((!first && image.source_image_id <= previous_id) || image.first_box != expected_first || image.first_box > index.boxes.size() || image.box_count > index.boxes.size() - image.first_box ||
@@ -942,7 +945,7 @@ void validate_normalized_records(const Index& index, mmltk::common::concurrency:
   first = false;
   previous_id = image.source_image_id;
   expected_first += image.box_count;
-  if (metadata_only) continue;
+  if (metadata_only) { if (ready) ready(image_index); continue; }
   for (std::uint64_t box_index = image.first_box; box_index < image.first_box + image.box_count; ++box_index) {
    const NormalizedBox& box = index.boxes[checked_cast<std::size_t>(box_index, "box index overflow")];
    validate_box_value(box, index.source);
@@ -956,7 +959,9 @@ void validate_normalized_records(const Index& index, mmltk::common::concurrency:
    }
    expected_mask_offset += box.mask_rle_pairs;
   }
+  if (ready) ready(image_index);
  }
+ throw_if_benchmark_cancelled(cancel_requested);
  if (!images_admitted && expected_first != index.boxes.size()) { throw std::runtime_error("normalized benchmark box records are not fully referenced"); }
  if (!metadata_only && expected_mask_offset != index.mask_rle_pairs.size()) { throw std::runtime_error("normalized benchmark mask records are not fully referenced"); }
 }
@@ -1033,10 +1038,43 @@ NormalizedAnnotationIndex seal_normalized_annotation_metadata(NormalizedAnnotati
  result.backing = std::move(owner);
  return result;
 }
+struct NormalizedAnnotationAssembler::Mapped {
+ BenchmarkStagedArtifact staged;
+ mmltk::common::io::MappedByteRegion region;
+ std::span<NormalizedImage> images;
+ std::span<NormalizedBox> boxes;
+ std::span<RLEPair> runs;
+ std::size_t image_count = 0, box_count = 0, run_count = 0;
+};
 NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(
- NormalizedAnnotationMetadata metadata, std::size_t images, std::size_t boxes, std::size_t runs, mmltk::common::concurrency::CancellationObservation cancellation)
+ NormalizedAnnotationMetadata metadata, std::size_t images, std::size_t boxes, std::size_t runs, mmltk::common::concurrency::CancellationObservation cancellation,
+ const std::filesystem::path& staging_directory, StorageReservationPool* storage)
     : cancellation_(cancellation) {
  static_cast<NormalizedAnnotationMetadata&>(builder_) = std::move(metadata);
+ if (!staging_directory.empty()) {
+  const auto image_bytes = mmltk::common::math::checked_multiply(images, sizeof(NormalizedImage), "normalized image staging overflow");
+  const auto box_bytes = mmltk::common::math::checked_multiply(boxes, sizeof(NormalizedBox), "normalized box staging overflow");
+  const auto run_offset = mmltk::common::math::checked_add(image_bytes, box_bytes, "normalized staging overflow");
+  const auto bytes = mmltk::common::math::checked_add(run_offset, mmltk::common::math::checked_multiply(runs, sizeof(RLEPair), "normalized run staging overflow"), "normalized staging overflow");
+  if (bytes) {
+   std::filesystem::create_directories(staging_directory);
+   StorageReservationPool reservations(staging_directory, {}, storage);
+   auto file = BenchmarkStagedArtifact::create(reservations, staging_directory / ".normalized-assembly", bytes, "normalized annotation assembly");
+   file.resize(bytes, "normalized annotation assembly");
+   auto owner = std::make_shared<Mapped>();
+   void* address = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, file.file().get(), 0);
+   if (address == MAP_FAILED) throw mmltk::common::io::errno_error("map normalized annotation assembly");
+   owner->region.adopt(address, bytes);
+   file.close();
+   owner->staged = std::move(file);
+   auto* data = static_cast<std::byte*>(address);
+   owner->images = {reinterpret_cast<NormalizedImage*>(data), images};
+   owner->boxes = {reinterpret_cast<NormalizedBox*>(data + image_bytes), boxes};
+   owner->runs = {reinterpret_cast<RLEPair*>(data + run_offset), runs};
+   mapped_ = std::move(owner);
+   return;
+  }
+ }
  builder_.images.reserve(images);
  builder_.boxes.reserve(boxes);
  builder_.mask_rle_pairs.reserve(runs);
@@ -1044,6 +1082,14 @@ NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(
 void NormalizedAnnotationAssembler::begin_image(NormalizedImage image) {
  if (finished_) throw std::logic_error("normalized assembler is already sealed");
  throw_if_benchmark_cancelled(cancellation_);
+ if (mapped_) {
+  if (mapped_->image_count == mapped_->images.size() || (mapped_->image_count && image.source_image_id <= mapped_->images[mapped_->image_count - 1].source_image_id) || image.reserved ||
+      (builder_.source != BenchmarkDatasetSource::kOpenImagesV7 && (!image.width || !image.height))) throw std::runtime_error("normalized benchmark image record is invalid");
+  image.first_box = mapped_->box_count;
+  image.box_count = 0;
+  mapped_->images[mapped_->image_count++] = image;
+  return;
+ }
  if ((!builder_.images.empty() && image.source_image_id <= builder_.images.back().source_image_id) || image.reserved ||
      (builder_.source != BenchmarkDatasetSource::kOpenImagesV7 && (!image.width || !image.height)))
   throw std::runtime_error("normalized benchmark image record is invalid");
@@ -1053,6 +1099,24 @@ void NormalizedAnnotationAssembler::begin_image(NormalizedImage image) {
 }
 void NormalizedAnnotationAssembler::append_box(NormalizedBox box, std::span<const RLEPair> runs) {
  if (finished_) throw std::logic_error("normalized assembler is already sealed");
+ if (mapped_) {
+  if (!mapped_->image_count) throw std::logic_error("normalized box requires an owning image");
+  auto& image = mapped_->images[mapped_->image_count - 1];
+  if (mapped_->box_count == mapped_->boxes.size() || runs.size() > mapped_->runs.size() - mapped_->run_count || image.box_count == UINT32_MAX) throw std::overflow_error("normalized assembly extent exceeded");
+  box.mask_rle_offset = mapped_->run_count;
+  box.mask_rle_pairs = checked_cast<std::uint32_t>(runs.size(), "normalized mask run count overflow");
+  validate_box_value(box, builder_.source);
+  std::uint64_t previous = 0;
+  for (std::size_t i = 0; i < runs.size(); ++i) {
+   if ((i & 4095U) == 0) throw_if_benchmark_cancelled(cancellation_);
+   previous = validate_run_value(runs[i], std::uint64_t{image.width} * image.height, previous);
+  }
+  if (!runs.empty()) std::memcpy(mapped_->runs.data() + mapped_->run_count, runs.data(), runs.size_bytes());
+  mapped_->run_count += runs.size();
+  mapped_->boxes[mapped_->box_count++] = box;
+  ++image.box_count;
+  return;
+ }
  if (builder_.images.empty()) throw std::logic_error("normalized box requires an owning image");
  auto& image = builder_.images.back();
  box.mask_rle_offset = builder_.mask_rle_pairs.size();
@@ -1084,17 +1148,41 @@ NormalizedAnnotationIndex NormalizedAnnotationAssembler::finish(const BenchmarkT
    {"mask_rle_capacity", builder_.mask_rle_pairs.capacity()}
   };
  });
- auto result = seal_normalized_annotation_metadata(std::move(builder_));
+ NormalizedAnnotationIndex result;
+ if (mapped_) {
+  auto owner = std::make_shared<NormalizedAnnotationBacking>();
+  owner->source = builder_.source;
+  owner->storage = mapped_;
+  owner->images = mapped_->images.first(mapped_->image_count);
+  owner->boxes = mapped_->boxes.first(mapped_->box_count);
+  owner->runs = mapped_->runs.first(mapped_->run_count);
+  static_cast<NormalizedAnnotationMetadata&>(result) = std::move(static_cast<NormalizedAnnotationMetadata&>(builder_));
+  result.images = owner->images;
+  result.boxes = owner->boxes;
+  result.mask_rle_pairs = owner->runs;
+  result.backing = std::move(owner);
+  mapped_.reset();
+ } else result = seal_normalized_annotation_metadata(std::move(builder_));
  finished_ = true;
  std::call_once(result.backing->image_admission, [] {});
  std::call_once(result.backing->full_admission, [] {});
  return result;
 }
-void admit_normalized_annotations(const NormalizedAnnotationIndex& index, mmltk::common::concurrency::CancellationObservation cancellation) {
+namespace {
+void check_normalized_backing(const NormalizedAnnotationIndex& index) {
  if (!index.backing || index.source != index.backing->source || index.images.data() != index.backing->images.data() || index.images.size() != index.backing->images.size() ||
      index.boxes.data() != index.backing->boxes.data() || index.boxes.size() != index.backing->boxes.size() || index.mask_rle_pairs.data() != index.backing->runs.data() ||
      index.mask_rle_pairs.size() != index.backing->runs.size())
   throw std::runtime_error("normalized annotation view does not belong to its backing");
+ }
+}
+void admit_normalized_annotation_image(const NormalizedAnnotationIndex& index, std::size_t image) {
+ check_normalized_backing(index);
+ if (image >= index.images.size()) throw std::out_of_range("normalized image position is invalid");
+ if (index.backing->admitted_rows.load(std::memory_order_acquire) <= image) admit_normalized_annotations(index);
+}
+void admit_normalized_annotations(const NormalizedAnnotationIndex& index, mmltk::common::concurrency::CancellationObservation cancellation) {
+ check_normalized_backing(index);
  std::call_once(index.backing->full_admission, [&] {
   bool combined = false;
   std::call_once(index.backing->image_admission, [&] {
@@ -1381,7 +1469,8 @@ NormalizedAnnotationIndex parse_open_images_annotations(const std::filesystem::p
 }
 std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const std::filesystem::path& path, const BenchmarkDatasetSource expected_source, const std::string_view expected_split,
  const std::string_view expected_annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, const nlohmann::json* supplied_completion,
- bool metadata_only, std::uint64_t completion_bytes) {
+ bool metadata_only, std::uint64_t completion_bytes, const NormalizedAnnotationRowReady& ready) {
+ bool callback_failed = false, mapping_io = false;
  try {
   throw_if_benchmark_cancelled(cancel_requested);
   if (!std::filesystem::is_regular_file(path) || !std::filesystem::is_regular_file(normalized_manifest_path(path))) { return std::nullopt; }
@@ -1393,6 +1482,7 @@ std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const 
       manifest.value("split", std::string{}) != expected_split || manifest.value("annotation_sha256", std::string{}) != expected_annotation_sha256) {
    return std::nullopt;
   }
+  mapping_io = true;
   auto file = FileHandle::open_readonly(path.string());
   const auto mapped_bytes = file.size();
   if (mapped_bytes < sizeof(NormalizedIndexHeader)) return std::nullopt;
@@ -1403,6 +1493,7 @@ std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const 
   // Linux mapping custody retains the inode without retaining an open file
   // slot for every full index and every selected read view.
   file = {};
+  mapping_io = false;
   const auto* data = static_cast<const std::uint8_t*>(mapping->address());
   NormalizedIndexHeader header{};
   std::memcpy(&header, data, sizeof(header));
@@ -1441,7 +1532,14 @@ std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const 
   completion->mask_rle_pairs = header.mask_rle_pair_count;
   completion->proof_bytes = completion_bytes;
   index.completion = std::move(completion);
-  if (metadata_only)
+  if (ready) {
+   validate_normalized_records(index, cancel_requested, metadata_only, false, [&](std::size_t image) {
+    if (!metadata_only) index.backing->admitted_rows.store(image + 1, std::memory_order_release);
+    try { ready(index, image); } catch (...) { callback_failed = true; throw; }
+   });
+   std::call_once(index.backing->image_admission, [] {});
+   if (!metadata_only) std::call_once(index.backing->full_admission, [] {});
+  } else if (metadata_only)
    std::call_once(index.backing->image_admission, [&] { validate_normalized_records(index, cancel_requested, true); });
   else
    admit_normalized_annotations(index, cancel_requested);
@@ -1452,7 +1550,7 @@ std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const 
   });
   return index;
  } catch (const std::exception& error) {
-  if (is_benchmark_capacity_failure(error)) throw;
+  if (callback_failed || mapping_io || is_benchmark_capacity_failure(error) || dynamic_cast<const std::system_error*>(&error)) throw;
   if (cancel_requested.requested()) { throw; }
   trace_benchmark_event(trace, "benchmark.annotations.cache_invalid", [&] { return nlohmann::json{{"path", path.string()}, {"error", error.what()}}; });
   return std::nullopt;

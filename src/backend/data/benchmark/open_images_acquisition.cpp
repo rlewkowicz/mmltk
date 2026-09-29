@@ -386,7 +386,7 @@ struct CachedOpenImagesGroup {
   result.valid = true;
   return result;
  } catch (const std::exception& error) {
-  if (is_benchmark_capacity_failure(error)) throw;
+  if (is_benchmark_capacity_failure(error) || dynamic_cast<const std::system_error*>(&error)) throw;
   throw_if_benchmark_cancelled(cancel_requested);
   return CachedOpenImagesGroup{};
  }

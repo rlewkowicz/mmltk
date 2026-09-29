@@ -1,3 +1,4 @@
+#include <system_error>
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
@@ -333,7 +334,8 @@ bool validate_cached_image_group(const std::filesystem::path& root, const std::f
   trace_benchmark_event(
    trace, "benchmark.images.cache_hit", [&] { return nlohmann::json{{"identity", identity}, {"images", validated_ids.size()}, {"quarantined", quarantined != nullptr ? quarantined->size() : 0U}}; });
   return true;
- } catch (const std::exception&) {
+ } catch (const std::exception& error) {
+  if (is_benchmark_capacity_failure(error) || dynamic_cast<const std::system_error*>(&error)) throw;
   throw_if_benchmark_cancelled(cancel_requested);
   return false;
  }

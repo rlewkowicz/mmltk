@@ -78,10 +78,15 @@ struct DownloadReady {
 // Short enqueue-only consumer; called after releasing the completed artifact's
 // lock. Ownership of the durable result crosses this boundary by value.
 using DownloadReadySink = std::function<void(DownloadReady)>;
+using DownloadUnavailableSink = std::function<void(std::size_t, const BenchmarkDownloadUnavailable&)>;
 using DownloadProgressSink = std::function<void(const DownloadProgress&)>;
+// Opportunistic ordinary admission: resource/lock contention or an absent or
+// stale completion returns immediately. No transfer or repair is started.
+[[nodiscard]] std::optional<DownloadResult> try_cached_download(const DownloadRequest&, mmltk::common::concurrency::CancellationObservation = {},
+ const BenchmarkTraceSink& = {}, BenchmarkCompilePipeline* = nullptr, const BenchmarkAllowance& parent = {}, const DownloadProgressSink& = {});
 [[nodiscard]] std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t maximum_concurrency,
  mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& progress = {}, const BenchmarkTraceSink& trace = {}, const DownloadReadySink& ready = {},
- BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {}, StorageReservationPool* storage = nullptr);
+ BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {}, StorageReservationPool* storage = nullptr, const DownloadUnavailableSink& unavailable = {});
 void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested = {}, const BenchmarkTraceSink& trace = {},
  BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {});
 }  // namespace mmltk::backend::data::benchmark_internal

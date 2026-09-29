@@ -127,7 +127,7 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
  bool has_dropped = false;
  for (std::size_t ordinal = 0; ordinal < record.segments.size(); ++ordinal) {
   throw_if_benchmark_cancelled(cancellation);
-  if (record.segments[ordinal].isthing && dropped(ordinal)) {
+  if (record.segments[ordinal].valid && support[ordinal].valid && record.segments[ordinal].isthing && dropped(ordinal)) {
    has_dropped = true;
    break;
   }
@@ -139,7 +139,7 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
  };
  for (std::size_t ordinal = 0; ordinal < record.segments.size(); ++ordinal) {
   throw_if_benchmark_cancelled(cancellation);
-  if (record.segments[ordinal].isthing) workspace_.ordinals.push_back(ordinal);
+  if (record.segments[ordinal].valid && support[ordinal].valid && record.segments[ordinal].isthing) workspace_.ordinals.push_back(ordinal);
  }
  std::ranges::sort(workspace_.ordinals, [&](auto a, auto b) {
   throw_if_benchmark_cancelled(cancellation);

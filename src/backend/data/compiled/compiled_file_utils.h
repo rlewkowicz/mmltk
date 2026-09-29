@@ -88,6 +88,8 @@ public:
       instance.bbox_y2 <= instance.bbox_y1 || !std::isfinite(instance.original_area) || instance.original_area < 0.0 || (instance.flags & ~kAnnotationFlags) ||
       (!instance.has_mask() && instance.mask_rle_pairs) || (!instance.has_annotation_id() && instance.annotation_id) || (!instance.has_source_category() && instance.source_category_id))
    throw std::runtime_error("compiled instance annotation metadata is invalid at label " + std::to_string(position));
+  if (!instance.has_complete_source_ordinal() && source != AnnotationSource::CoconutCoco && source != AnnotationSource::CoconutObjects365V1 && source != AnnotationSource::CoconutObjects365V2)
+   throw std::runtime_error("incomplete source ordinal outside COCONut at label " + std::to_string(position));
   if (source != AnnotationSource::Generic) {
    if (!instance.has_source_category()) throw std::runtime_error("compiled benchmark annotation lacks source category");
    if (source == AnnotationSource::OpenImages && !valid_open_images_category(instance.source_category_id)) throw std::runtime_error("invalid compiled Open Images source category");

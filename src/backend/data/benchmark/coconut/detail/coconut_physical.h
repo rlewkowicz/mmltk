@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <map>
 #include <filesystem>
 #include <functional>
@@ -17,6 +18,7 @@
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
 struct AdmittedRecipeArchive;
+struct DownloadResult;
 struct BenchmarkCacheLayout;
 class BenchmarkCompilePipeline;
 class StorageReservationPool;
@@ -24,6 +26,7 @@ struct CoconutPhysicalImage;
 struct CoconutInventoryImage;
 struct CoconutRecipeCatalog;
 struct CoconutRecord;
+struct CachedImageDirectory;
 class NormalizedAnnotationReadView;
 struct CoconutPhysicalName {
  CoconutImageNamespace source;
@@ -34,23 +37,6 @@ struct CoconutPhysicalName {
 [[nodiscard]] std::uint64_t parse_coconut_coco_member(std::string_view);
 void validate_coconut_physical_image(const CoconutPhysicalImage&);
 [[nodiscard]] std::span<const CoconutImageNamespace> coconut_release_sources(CoconutEdition);
-// One physical reader's future input. Lease/file controls remain separately
-// charged retained handles; the decoder and encoded bytes are transient backing
-// inside its producer's complete allowance. All dependent descriptors must be
-// promised before that producer acquires any input.
-class CoconutPhysicalInputRequirement final {
-public:
- CoconutPhysicalInputRequirement() = default;
- [[nodiscard]] static CoconutPhysicalInputRequirement archive(std::uint64_t workspace_bytes, std::size_t reader_descriptors = 2);
- [[nodiscard]] BenchmarkResources lease_controls() const noexcept { return lease_; }
- [[nodiscard]] std::uint64_t workspace_bytes() const noexcept { return workspace_bytes_; }
- [[nodiscard]] std::size_t continuation_descriptors() const noexcept { return lease_.descriptors + lease_.continuation_descriptors; }
-
-private:
- CoconutPhysicalInputRequirement(BenchmarkResources lease, std::uint64_t bytes) : lease_(lease), workspace_bytes_(bytes) {}
- BenchmarkResources lease_;
- std::uint64_t workspace_bytes_ = 0;
-};
 class CoconutPhysicalMembershipError final : public std::runtime_error {
 public:
  CoconutPhysicalMembershipError(CoconutEdition edition, std::uint64_t image_id, std::string message) : std::runtime_error(std::move(message)), edition_(edition), image_id_(image_id) {}
@@ -60,16 +46,6 @@ public:
 private:
  CoconutEdition edition_;
  std::uint64_t image_id_;
-};
-class PhysicalArchiveFailure final : public std::runtime_error {
-public:
- PhysicalArchiveFailure(AdmittedRecipeArchive& archive, std::string reason, std::exception_ptr fatal = {}) : std::runtime_error(std::move(reason)), archive_(&archive), fatal_(std::move(fatal)) {}
- [[nodiscard]] AdmittedRecipeArchive& archive() const noexcept { return *archive_; }
- [[nodiscard]] std::exception_ptr fatal() const noexcept { return fatal_; }
-
-private:
- AdmittedRecipeArchive* archive_;
- std::exception_ptr fatal_;
 };
 // Full-backing dependencies are accumulated in the owning inventory traversal.
 // Selected views retain this same summary, including unselected source images.
@@ -86,7 +62,7 @@ private:
 // only after withdrawal and settlement of its source publications/readers.
 class CoconutPhysicalMembership final {
 public:
- // Synchronous observations of the requested image and actual archive cursor.
+ // Synchronous observations of independently completed images and the source cursor.
  using Progress = std::function<void(CoconutEdition, const AdmittedRecipeArchive&, std::uint64_t image_id, std::uint64_t entries)>;
  CoconutPhysicalMembership(std::span<AdmittedRecipeArchive>, const CoconutRecipeCatalog&, bool explicit_catalog, const BenchmarkCacheLayout&, StorageReservationPool&, BenchmarkCompilePipeline&,
   mmltk::common::concurrency::CancellationObservation = {}, Progress = {});
@@ -94,19 +70,24 @@ public:
  ~CoconutPhysicalMembership();
  CoconutPhysicalMembership(const CoconutPhysicalMembership&) = delete;
  CoconutPhysicalMembership& operator=(const CoconutPhysicalMembership&) = delete;
- [[nodiscard]] CoconutPhysicalInputRequirement input_requirement(CoconutEdition) const;
- // A sequence retires only the physical reader drawing on its own promise;
- // another concurrent sequence's reader remains live. Empty means all readers.
- void release_readers(CoconutEdition, const BenchmarkAllowance& producer = {}) const;
+ // Annotation identity admission has no physical I/O or readiness wait.
+ [[nodiscard]] CoconutPhysicalImage identify(CoconutEdition, const CoconutRecord&) const;
+ [[nodiscard]] std::filesystem::path identity_root(CoconutImageNamespace) const;
+ // One acquisition controller visits this source forward and publishes every
+ // admitted image immediately. Annotation consumers never own its cursor.
+ bool consume(AdmittedRecipeArchive&, const std::function<void(const CoconutPhysicalImage&, std::string_view)>& rejected = {}, bool cache_only = false, bool accept_partial = false);
+ [[nodiscard]] CachedImageDirectory summary(const AdmittedRecipeArchive&) const;
+ void admitted(AdmittedRecipeArchive&, DownloadResult, bool replacement = false);
+ void wait_sources(std::optional<CoconutEdition> = {}) const;
+ [[nodiscard]] bool discovery_complete() const;
+ void unavailable(AdmittedRecipeArchive&);
  [[nodiscard]] bool eligible(CoconutEdition, const AdmittedRecipeArchive&) const;
  [[nodiscard]] std::string dependency_identity(CoconutEdition, CoconutImageNamespace, const CoconutPhysicalDependencies& = {}, bool current = true) const;
- // Invalidates affected routes/joins and their cached input requirement before
+ // Invalidates affected routes and joins before
  // the compiler mutates the admitted artifact; independent readers survive.
  void withdraw(const AdmittedRecipeArchive&);
- // canonical_metadata means the allowance contains no live Arrow/PNG input;
- // its unused physical workspace can return while the lifecycle lock waits.
- [[nodiscard]] CoconutPhysicalImage resolve(CoconutEdition, std::string_view identity, const CoconutRecord&, const BenchmarkAllowance&, bool canonical_metadata = false,
-  const std::function<void()>& retire_projection = {}) const;
+ // Settle identity against independently published source inventories.
+ [[nodiscard]] CoconutPhysicalImage resolve(CoconutEdition, const CoconutRecord&) const;
  [[nodiscard]] BenchmarkSourcePublication label_publication(CoconutEdition, const CoconutPhysicalImage&) const;
  [[nodiscard]] const CoconutPhysicalImage* find(CoconutImageNamespace, std::uint64_t) const noexcept;
 

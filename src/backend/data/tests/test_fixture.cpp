@@ -1,4 +1,6 @@
 #include "src/backend/data/tests/test_fixture.h"
+#include "src/backend/data/compiled/compiled_dataset.h"
+#include <map>
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include <stb_image_write.h>
 #include <array>
@@ -13,6 +15,23 @@
 #include <vector>
 namespace fs = std::filesystem;
 namespace mmltk::backend::data::testsupport {
+std::string benchmark_semantics(const std::filesystem::path& path) {
+ const auto dataset = CompiledDataset::open(path);
+ std::map<std::pair<AnnotationSource, std::uint64_t>, std::string> samples;
+ const auto pixel_bytes = std::size_t{dataset.header().image_width} * dataset.header().image_height * 3 * sizeof(float);
+ for (const auto slot : dataset.eligible_slots()) {
+  const auto& entry = dataset.image_entry(slot);
+  std::string value(reinterpret_cast<const char*>(&entry), sizeof(entry));
+  const auto payload = dataset.label_payload(slot);
+  value.append(reinterpret_cast<const char*>(payload.data()), payload.size());
+  value.append(reinterpret_cast<const char*>(dataset.image_pixels(slot)), pixel_bytes);
+  if (!samples.emplace(std::pair{entry.source, entry.source_image_id}, std::move(value)).second) throw std::logic_error("duplicate compiled sample identity");
+ }
+ std::string result;
+ for (const auto& name : dataset.class_names()) { result += name; result.push_back('\0'); }
+ for (const auto& [identity, sample] : samples) { (void)identity; result += sample; }
+ return result;
+}
 namespace {
 std::vector<uint8_t> stub_rgb_pixels(const std::string& path, int width, int height) {
  std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 3);
@@ -152,3 +171,28 @@ void assert_image_matches(const float* actual, const std::vector<float>& expecte
  }
 }
 }  // namespace mmltk::backend::data::testsupport
+
+namespace mmltk::backend::data::testsupport {
+void bind_benchmark_slots(benchmark_internal::BenchmarkCompilePipeline& execution, benchmark_internal::BenchmarkSplitWriter& writer, const benchmark_internal::PreparedBenchmarkSplit& split) {
+ for (std::size_t i = 0; i < split.images.size(); ++i) {
+  const auto& image = split.images[i];
+  execution.bind_slot(split.sources.at(image.source_index).root, image.source_image_id, writer, static_cast<std::uint32_t>(i));
+ }
+}
+ImageEntry benchmark_entry(const benchmark_internal::EncodedImageRecord& image) {
+ ImageEntry entry{};
+ entry.source_image_id = image.source_image_id;
+ entry.has_source_image_id = 1;
+ entry.source = image.annotation_source;
+ entry.original_width = image.source_width;
+ entry.original_height = image.source_height;
+ return entry;
+}
+void write_benchmark_fixture(const benchmark_internal::BenchmarkWriteRequest& request, std::span<const std::shared_ptr<benchmark_internal::BenchmarkLabelChunk>> chunks) {
+ benchmark_internal::BenchmarkSplitWriter writer(request);
+ for (std::size_t i = 0; i < chunks.size(); ++i)
+  writer.write_labels(static_cast<std::uint32_t>(i), benchmark_entry(request.split.images.at(i)), {chunks[i]->labels, chunks[i]->runs});
+ writer.write_remaining(request);
+ writer.finish(request);
+}
+}

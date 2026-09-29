@@ -28,7 +28,7 @@ private:
 };
 class BenchmarkLabelWorkspace final {
 public:
- [[nodiscard]] static std::uint64_t required_bytes(std::uint32_t width) noexcept { return std::uint64_t{width} * 32U + 65536U; }
+ [[nodiscard]] static std::uint64_t required_bytes(std::uint32_t width) noexcept { return std::uint64_t{width} * 32U + 65536U + 2U * COMPILED_LABEL_CAPACITY; }
  [[nodiscard]] std::size_t retained_bytes() const noexcept { return scratch_.intervals.capacity() * sizeof(scratch_.intervals.front()); }
  void retire() noexcept { scratch_ = {}; }
  [[nodiscard]] dataset::MaskResizeScratch& scratch() noexcept { return scratch_; }

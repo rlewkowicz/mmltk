@@ -183,9 +183,14 @@ evaluation. Systems preserve the declared catalog and reference domain with
 their products.
 
 Compilation shares acquisition, retained source caching, and atomic publication
-across dataset recipes. Readers retain consistent source generations through
-completion and repair. Products retain source identity, annotation meaning,
-provenance, and the relationship between source and derived geometry through
+across dataset recipes. Each ready source makes useful progress independently;
+image and annotation production join by source identity before publication.
+Readers retain consistent source generations through completion and repair.
+Compilation retains healthy partial labels and valid background images after
+bounded source repair, reports omissions, and excludes unreadable samples.
+Required outputs publish together only when both contain healthy samples.
+Products retain source identity, annotation meaning, and explicit provenance
+completeness, and the relationship between source and derived geometry through
 compilation, preview, augmentation, upscaling, and editing. Clean pixels and
 semantic planes remain separate until final display composition.
 

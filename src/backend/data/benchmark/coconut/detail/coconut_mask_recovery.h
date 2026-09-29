@@ -111,6 +111,7 @@ struct CoconutSegmentSupport {
  CoconutSupportRuns runs;
  std::optional<NormalizedBox> recovered;
  bool carved = false;
+ bool valid = true;
 };
 // Immutable physical-ID lookup shared by concurrent importers. The normalized
 // backing stays owned by this index and every borrowed recovered span.

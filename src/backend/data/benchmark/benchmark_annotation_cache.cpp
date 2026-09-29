@@ -1,3 +1,4 @@
+#include <system_error>
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
@@ -54,7 +55,7 @@ void extract_annotation_members(const DownloadResult& archive, std::span<Annotat
        value.value("member", std::string{}) == member.suffix && value.value("size", 0ULL) == std::filesystem::file_size(member.output))
     member.identity = value.value("identity", std::string{});
   } catch (const std::exception& error) {
-   if (is_benchmark_capacity_failure(error)) throw;
+   if (is_benchmark_capacity_failure(error) || dynamic_cast<const std::system_error*>(&error)) throw;
   }
   if (!member.identity.empty()) complete(i, parent);
  }
@@ -129,12 +130,13 @@ std::string extract_archive_member(const std::filesystem::path& archive_path, st
 [[nodiscard]] std::optional<NormalizedAnnotationIndex> discover_cached_index(const std::filesystem::path& path, const BenchmarkDatasetSource source, const std::string_view split,
  mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace) {
  try {
+  if (!std::filesystem::is_regular_file(path.string() + ".complete.json")) return std::nullopt;
   std::uint64_t extent = 0;
   const nlohmann::json manifest = read_json_file(path.string() + ".complete.json", &extent);
   const std::string digest = manifest.at("annotation_sha256").get<std::string>();
   return load_normalized_annotation_index(path, source, split, digest, cancel_requested, trace, &manifest, false, extent);
  } catch (const std::exception& error) {
-  if (is_benchmark_capacity_failure(error)) throw;
+  if (is_benchmark_capacity_failure(error) || dynamic_cast<const std::system_error*>(&error)) throw;
   throw_if_benchmark_cancelled(cancel_requested);
   return std::nullopt;
  }
@@ -160,6 +162,7 @@ void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservati
    throw;
   } catch (const std::exception& error) {
    throw_if_benchmark_cancelled(cancel_requested);
+   if (is_benchmark_capacity_failure(error) || dynamic_cast<const std::system_error*>(&error)) throw;
    if (attempt == 3U) { throw; }
    repair(error);
   }

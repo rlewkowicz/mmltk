@@ -65,7 +65,7 @@ public:
  void label_plan_completed(std::size_t slot);
  void discard_label_plans();
  void activity(std::string activity);
- void pixels(std::uint64_t completed, std::uint64_t total);
+ void pixels(std::uint64_t completed, std::uint64_t total, bool total_known = true);
  void invalidate_pixels(std::uint64_t count);
  [[nodiscard]] ArtifactProgressTotals& transfers() noexcept { return transfers_; }
  void pixel_completed();
@@ -105,6 +105,7 @@ private:
  BenchmarkCompileProgress state_;
  std::chrono::steady_clock::time_point activity_started_{};
  std::chrono::steady_clock::time_point pixel_started_{};
+ std::atomic<bool> pixel_total_known_{true};
  std::uint64_t indexed_completed_ = 0, indexed_total_ = 0;
  ArtifactProgressTotals transfers_;
  std::unique_ptr<IndexingProgressTotals> indexing_;
@@ -140,6 +141,7 @@ class IndexingProgressTotals final {
 public:
  explicit IndexingProgressTotals(std::span<const std::uint64_t> totals);
  void update(std::size_t release, std::uint64_t completed, ProgressReporter& reporter);
+ void settle(std::size_t release, std::uint64_t completed, ProgressReporter& reporter);
  // The replaced importer must have returned or joined before withdrawal.
  void invalidate(std::size_t release, ProgressReporter& reporter, std::uint64_t rows = UINT64_MAX);
 

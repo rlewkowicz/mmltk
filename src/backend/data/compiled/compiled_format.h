@@ -17,7 +17,10 @@ inline constexpr size_t HUGE_PAGE_SIZE = size_t{2} * 1024 * 1024;
 using PackedCoordinate = float;
 inline constexpr std::uint32_t MAX_IMAGE_EXTENT = 32767U;
 inline constexpr std::uint8_t kAnnotationMask = 1U, kAnnotationCrowd = 2U, kAnnotationIgnore = 4U, kAnnotationId = 8U, kAnnotationCategory = 16U;
-inline constexpr std::uint8_t kAnnotationFlags = kAnnotationMask | kAnnotationCrowd | kAnnotationIgnore | kAnnotationId | kAnnotationCategory;
+// The retained ordinal is local to its known source extent when an earlier
+// annotation extent is unavailable. Its identity remains meaningful.
+inline constexpr std::uint8_t kAnnotationOrdinalIncomplete = 32U;
+inline constexpr std::uint8_t kAnnotationFlags = kAnnotationMask | kAnnotationCrowd | kAnnotationIgnore | kAnnotationId | kAnnotationCategory | kAnnotationOrdinalIncomplete;
 struct __attribute__((packed)) PackedInstance {
  uint8_t class_id;
  uint8_t flags;
@@ -28,6 +31,7 @@ struct __attribute__((packed)) PackedInstance {
  std::uint64_t annotation_id = 0;
  std::uint64_t source_category_id = 0;
  std::uint64_t source_ordinal = 0;
+ [[nodiscard]] bool has_complete_source_ordinal() const noexcept { return (flags & kAnnotationOrdinalIncomplete) == 0U; }
  [[nodiscard]] bool has_annotation_id() const noexcept { return (flags & kAnnotationId) != 0U; }
  [[nodiscard]] bool has_source_category() const noexcept { return (flags & kAnnotationCategory) != 0U; }
  [[nodiscard]] bool has_mask() const noexcept { return (flags & kAnnotationMask) != 0U; }

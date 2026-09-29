@@ -168,18 +168,19 @@ void ProgressReporter::activity(std::string activity) {
  set_activity_unlocked(std::move(activity));
  emit(lock, true);
 }
-void ProgressReporter::pixels(const std::uint64_t completed, const std::uint64_t total) {
+void ProgressReporter::pixels(const std::uint64_t completed, const std::uint64_t total, bool total_known) {
  if (!pixel_observer_enabled()) return;
  std::unique_lock lock(mutex_);
  flush_pixels_unlocked();
  auto& pixels = state_.tracks.pixels;
- if (completed > total) throw std::logic_error("benchmark pixel count exceeds total");
+ if (total_known && completed > total) throw std::logic_error("benchmark pixel count exceeds total");
  if (completed < pixels.completed) add_progress(pixels.invalidated, pixels.completed - completed, "benchmark invalidated pixels overflow");
  pixels.completed = completed;
  pixels.total = total;
- remaining_pixels_.store(total - completed, std::memory_order_release);
- pixels.total_known = true;
- pixels.complete = completed == total;
+ remaining_pixels_.store(total_known ? total - completed : 0, std::memory_order_release);
+ pixel_total_known_.store(total_known, std::memory_order_release);
+ pixels.total_known = total_known;
+ pixels.complete = total_known && completed == total;
  pixels.active = !pixels.complete;
  pixels.activity = pixels.complete ? DatasetCompileActivity::Complete : DatasetCompileActivity::Compiling;
  if (trace_ && pixel_started_.time_since_epoch().count() == 0) pixel_started_ = Clock::now();
@@ -192,7 +193,7 @@ void ProgressReporter::invalidate_pixels(std::uint64_t count) {
  auto& pixels = state_.tracks.pixels;
  if (count > pixels.completed) throw std::underflow_error("benchmark pixel invalidation underflow");
  pixels.completed -= count;
- remaining_pixels_.fetch_add(count, std::memory_order_release);
+ if (pixel_total_known_.load(std::memory_order_acquire)) remaining_pixels_.fetch_add(count, std::memory_order_release);
  add_progress(pixels.invalidated, count, "benchmark invalidated pixels overflow");
  pixels.complete = false;
  pixels.active = true;
@@ -207,9 +208,9 @@ void ProgressReporter::flush_pixels_unlocked() {
  std::uint64_t delta = 0;
  for (auto& lane : pixel_deltas_) add_progress(delta, lane.completed.exchange(0, std::memory_order_acq_rel), "benchmark pixel completion overflow");
  if (!delta) return;
- if (pixels.completed > pixels.total || delta > pixels.total - pixels.completed) throw std::overflow_error("benchmark pixel completion exceeds total");
- pixels.completed += delta;
- pixels.complete = pixels.completed == pixels.total;
+ if (pixels.total_known && (pixels.completed > pixels.total || delta > pixels.total - pixels.completed)) throw std::overflow_error("benchmark pixel completion exceeds total");
+ add_progress(pixels.completed, delta, "benchmark completed pixels overflow");
+ pixels.complete = pixels.total_known && pixels.completed == pixels.total;
  pixels.active = !pixels.complete;
  pixels.activity = pixels.complete ? DatasetCompileActivity::Complete : DatasetCompileActivity::Compiling;
  if (state_.phase == DatasetCompilePhase::Pixels) {
@@ -224,8 +225,9 @@ void ProgressReporter::pixel_completed() {
  const auto event = pixel_events_.fetch_add(1, std::memory_order_release) + 1;
  // First observation is kept. Remaining deltas are drained on a bounded work
  // quantum or any explicit state/terminal boundary, without a per-pixel lock.
- const auto remaining = remaining_pixels_.fetch_sub(1, std::memory_order_acq_rel);
- if (!remaining) throw std::overflow_error("benchmark pixel completion exceeds total");
+ const bool known = pixel_total_known_.load(std::memory_order_acquire);
+ const auto remaining = known ? remaining_pixels_.fetch_sub(1, std::memory_order_acq_rel) : UINT64_MAX;
+ if (known && !remaining) throw std::overflow_error("benchmark pixel completion exceeds total");
  if (event != 1 && event % 64 != 0 && remaining != 1) return;
  std::unique_lock lock(mutex_);
  flush_pixels_unlocked();
@@ -238,7 +240,7 @@ void ProgressReporter::pixel_completed() {
    return nlohmann::json{
     {"completed_images", pixels.completed}, {"total_images", pixels.total}, {"elapsed_seconds", elapsed}, {"split", "train and val"},
     {"images_per_second", elapsed > 0 ? static_cast<double>(pixels.completed) / elapsed : 0},
-    {"eta_seconds", pixels.completed ? static_cast<double>(pixels.total - pixels.completed) * elapsed / static_cast<double>(pixels.completed) : 0}
+    {"eta_seconds", pixels.total_known && pixels.completed ? static_cast<double>(pixels.total - pixels.completed) * elapsed / static_cast<double>(pixels.completed) : 0}
    };
   });
  }
@@ -438,9 +440,22 @@ void IndexingProgressTotals::update(std::size_t release, std::uint64_t completed
  auto& observation = releases_.at(release);
  // Ordinary observations remain monotonic within a retained release product.
  // Replacement explicitly withdraws that product before new callbacks begin.
- const auto admitted = std::max(observation.completed, std::min(completed, observation.total));
+ const auto admitted = std::max(observation.completed, observation.total ? std::min(completed, observation.total) : completed);
  completed_ += admitted - observation.completed;
  observation.completed = admitted;
+ reporter.phase_unlocked(lock, DatasetCompilePhase::Indexing, completed_, total_);
+}
+void IndexingProgressTotals::settle(std::size_t release, std::uint64_t completed, ProgressReporter& reporter) {
+ if (!reporter.normalization_observer_enabled()) return;
+ std::unique_lock lock(reporter.mutex_);
+ auto& observation = releases_.at(release);
+ completed_ = replace_progress(completed_, observation.completed, completed);
+ total_ = replace_progress(total_, observation.total, completed);
+ if (completed < observation.completed)
+  ProgressReporter::add_progress(reporter.state_.tracks.labels.invalidated, observation.completed - completed, "benchmark indexing settlement overflow");
+ observation = {completed, completed};
+ reporter.indexed_completed_ = completed_;
+ reporter.indexed_total_ = total_;
  reporter.phase_unlocked(lock, DatasetCompilePhase::Indexing, completed_, total_);
 }
 void IndexingProgressTotals::invalidate(std::size_t release, ProgressReporter& reporter, std::uint64_t rows) {
@@ -495,7 +510,7 @@ void ArtifactProgressTotals::images(BenchmarkDatasetSource source, const std::st
  const auto found = source_state.images.find(artifact);
  const auto previous = found == source_state.images.end() ? 0 : found->second;
  const auto aggregate = replace_progress(source_state.completed_images, previous, completed);
- if (aggregate > source_total) throw std::overflow_error("benchmark source images exceed admitted total");
+ if (source_total && aggregate > source_total) throw std::overflow_error("benchmark source images exceed admitted total");
  source_state.images.insert_or_assign(artifact, completed);
  source_state.completed_images = aggregate;
  reporter.source_images_unlocked(lock, source, aggregate, source_total, std::move(activity));

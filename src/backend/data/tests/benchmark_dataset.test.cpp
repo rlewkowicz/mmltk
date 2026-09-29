@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 #include <cerrno>
 #include <charconv>
@@ -78,6 +79,9 @@ using namespace mmltk::backend::data;
 using namespace mmltk::backend::data::benchmark_internal;
 using mmltk::common::io::FileHandle;
 namespace {
+using mmltk::backend::data::testsupport::bind_benchmark_slots;
+using mmltk::backend::data::testsupport::benchmark_entry;
+using mmltk::backend::data::testsupport::write_benchmark_fixture;
 NormalizedAnnotationIndex fixture_index(const NormalizedAnnotationBuilder& builder) { return seal_normalized_annotation_metadata(NormalizedAnnotationBuilder(builder)); }
 const NormalizedAnnotationIndex& fixture_index(const NormalizedAnnotationIndex& index) { return index; }
 void require_condition(const bool condition, const char* message) {
@@ -895,6 +899,7 @@ void test_benchmark_cached_image_writer_and_loader() {
  REQUIRE(letterbox.resized_height == 192U);
  REQUIRE(letterbox.offset_x == 0U);
  REQUIRE(letterbox.offset_y == 96U);
+ std::vector<std::shared_ptr<BenchmarkLabelChunk>> chunks;
  const std::array source_labels{
   benchmark_canvas_box(0U, 0.0F, 0.0F, 1.0F, 1.0F, letterbox),
   benchmark_canvas_box(0U, 0.125F, 0.25F, 0.875F, 0.75F, letterbox),
@@ -909,11 +914,12 @@ void test_benchmark_cached_image_writer_and_loader() {
   });
   auto annotations = std::make_shared<BenchmarkLabelChunk>();
   annotations->labels = {source_labels[index]};
-  split.annotations.push_back({std::move(annotations), 0});
+  chunks.push_back(std::move(annotations));
  }
+ const auto write_labeled = [&](const BenchmarkWriteRequest& request) { write_benchmark_fixture(request, chunks); };
  const fs::path output = root.path() / "validation.bin";
  std::atomic<std::uint64_t> producer_events{0U};
- write_benchmark_split(BenchmarkWriteRequest{
+ write_labeled(BenchmarkWriteRequest{
   split,
   output,
   kNanoResolution,
@@ -979,7 +985,7 @@ void test_benchmark_cached_image_writer_and_loader() {
  auto perceptual_request = benchmark_write_request(split, root.path() / "perceptual.bin", kNanoResolution);
  perceptual_request.perceptual_downscale = true;
  perceptual_request.resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox;
- write_benchmark_split(perceptual_request);
+ write_labeled(perceptual_request);
  // These sources enlarge; selecting perceptual shrinking changes no pixels or format facts.
  CHECK(mmltk::common::io::sha256_file(perceptual_request.output_path) == mmltk::common::io::sha256_file(output));
  CHECK(mmltk::common::io::sha256_file(cached_image_path(image_root, 1U)) == source_digest);
@@ -1013,7 +1019,7 @@ void test_benchmark_cached_image_writer_and_loader() {
  const std::string original_digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(output));
  bool refused = false;
  try {
-  write_benchmark_split(benchmark_write_request(split, output, kNanoResolution));
+  write_labeled(benchmark_write_request(split, output, kNanoResolution));
  } catch (const std::exception&) { refused = true; }
  REQUIRE(refused);
  REQUIRE(mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(output)) == original_digest);
@@ -1021,7 +1027,7 @@ void test_benchmark_cached_image_writer_and_loader() {
  const fs::path cancelled_output = root.path() / "cancelled.bin";
  bool cancelled = false;
  try {
-  write_benchmark_split(benchmark_write_request(split, cancelled_output, kNanoResolution, mmltk::common::concurrency::CancellationObservation::Atomic(cancel)));
+  write_labeled(benchmark_write_request(split, cancelled_output, kNanoResolution, mmltk::common::concurrency::CancellationObservation::Atomic(cancel)));
  } catch (const std::exception&) { cancelled = true; }
  REQUIRE(cancelled);
  REQUIRE(!fs::exists(cancelled_output));
@@ -1030,7 +1036,7 @@ void test_benchmark_cached_image_writer_and_loader() {
  const fs::path broken_output = root.path() / "broken.bin";
  bool failed = false;
  try {
-  write_benchmark_split(benchmark_write_request(broken, broken_output, kNanoResolution));
+  write_labeled(benchmark_write_request(broken, broken_output, kNanoResolution));
  } catch (const std::exception&) { failed = true; }
  REQUIRE(failed);
  REQUIRE(!fs::exists(broken_output));
@@ -1853,12 +1859,12 @@ TEST_CASE("generic and benchmark writers share complete format headers", "[backe
    auto annotations = std::make_shared<BenchmarkLabelChunk>();
    annotations->labels.assign(generic.image_labels(0).begin(), generic.image_labels(0).end());
    annotations->runs.assign(generic.annotations(0).runs.begin(), generic.annotations(0).runs.end());
-   split.annotations.push_back({std::move(annotations), 0});
+   const std::array chunks{annotations};
    const auto output = root.path() / "benchmark.bin";
    auto request = benchmark_write_request(split, output, 16U);
    request.overwrite = true;
    request.resize_mode = mode;
-   write_benchmark_split(request);
+   write_benchmark_fixture(request, chunks);
    const auto benchmark = CompiledDataset::open(output);
    CHECK(std::memcmp(&generic.header(), &benchmark.header(), sizeof(FileHeader)) == 0);
    (void)validate_compiled_file_sections(benchmark.header(), fs::file_size(output));
@@ -2653,6 +2659,19 @@ TEST_CASE("annotation retries distinguish source corruption from local capacity 
   CHECK(bodies == 1);
   CHECK(repairs == 0);
  }
+ SECTION("metadata I/O failure never enters source repair") {
+  CHECK_THROWS_AS(retry_annotation_indexing(cancellation, [&] {
+   ++bodies;
+   (void)read_json_file(root.path());
+  }, repair), std::system_error);
+  CHECK(bodies == 1);
+  CHECK(repairs == 0);
+ }
+ SECTION("allocation failure never enters source repair") {
+  CHECK_THROWS_AS(retry_annotation_indexing(cancellation, [&] { ++bodies; throw std::bad_alloc(); }, repair), std::bad_alloc);
+  CHECK(bodies == 1);
+  CHECK(repairs == 0);
+ }
  SECTION("cancellation never enters source repair") {
   CHECK_THROWS(retry_annotation_indexing(cancellation, [&] {
    ++bodies;
@@ -2770,7 +2789,6 @@ TEST_CASE("dynamic fixed slots publish labels before pixels and admit exactly th
  const EncodedImageRecord first{1, 16, 8, 1, 0};
  const auto first_slot = writer.allocate_slot(first, split.sources[0]);
  CHECK(first_slot == 0);
- CHECK(writer.allocate_slot(first, split.sources[0]) == first_slot);
  PackedInstance label{};
  label.bbox_x2 = label.bbox_y2 = 512;
  label.flags = kAnnotationMask;
@@ -2850,7 +2868,7 @@ TEST_CASE("one-worker image readiness resizes before archive completion and reus
  }, .images_invalidated = [](void* context, std::uint64_t count) { static_cast<ProgressReporter*>(context)->invalidate_pixels(count); }};
  BenchmarkSplitWriter writer(write);
  BenchmarkCompilePipeline pipeline(1);
- pipeline.register_split(writer, membership);
+ bind_benchmark_slots(pipeline, writer, membership);
  const std::array<std::uint64_t, 1> ids{1};
  std::size_t ready_count = 0;
  ArchiveExtractionRequest acquisition{
@@ -2972,7 +2990,7 @@ TEST_CASE("cached pixels finish while label preparation is blocked", "[backend][
  request.progress = {.context = &pixels_done, .image_completed = [](void* value) { static_cast<std::promise<void>*>(value)->set_value(); }};
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline pipeline(2);
- pipeline.register_split(writer, membership);
+ bind_benchmark_slots(pipeline, writer, membership);
  mmltk::testsupport::TestGate labels_gate("label preparation");
  auto labels = std::async(std::launch::async, [gate = labels_gate.receipt()] { gate.ArriveAndWait(); });
  const mmltk::testsupport::ScopedTestCleanup release([&] { labels_gate.Release(); });
@@ -3016,7 +3034,7 @@ TEST_CASE("queued pixel custody retains the source lease until its reader drains
  request.progress = {.context = &receipt, .image_completed = [](void* value) { static_cast<mmltk::testsupport::TestGate::Receipt*>(value)->ArriveAndWait(); }};
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline pipeline(2);
- pipeline.register_split(writer, membership);
+ bind_benchmark_slots(pipeline, writer, membership);
  const auto lock = root.path() / "source.lock";
  auto custody = std::make_shared<ArtifactLease>(ArtifactLease::acquire(lock, {}));
  pipeline.source_publication(images, custody)({1});
@@ -3079,7 +3097,7 @@ TEST_CASE("pipeline failure retires queued custody and drains active readers bef
  }};
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline pipeline(2);
- pipeline.register_split(writer, membership);
+ bind_benchmark_slots(pipeline, writer, membership);
  const mmltk::testsupport::ScopedTestCleanup release_readers([&] {
   first.Release();
   second.Release();
@@ -3152,7 +3170,7 @@ TEST_CASE("settled writer tail expands from one overlap scratch lane to the full
  split.images = {{1, 16, 8, 0, 0}, {2, 16, 8, 0, 0}};
  mmltk::testsupport::TestGate lanes("settled pixel lanes");
  auto receipt = lanes.receipt();
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  request.num_workers = 1;
  request.progress = {.context = &receipt, .image_completed = [](void* opaque) { static_cast<mmltk::testsupport::TestGate::Receipt*>(opaque)->ArriveAndWait(); }};
  BenchmarkSplitWriter writer(request);
@@ -3352,7 +3370,7 @@ TEST_CASE("registered pixel readiness remains nonblocking under capacity pressur
  };
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline pipeline(2);
- pipeline.register_split(writer, membership);
+ bind_benchmark_slots(pipeline, writer, membership);
  auto lease = std::make_shared<ArtifactLease>(ArtifactLease::acquire(root.path() / "source.lock", {}));
  std::weak_ptr<ArtifactLease> custody = lease;
  auto publication = pipeline.source_publication(images, lease);
@@ -3434,7 +3452,7 @@ TEST_CASE("unrelated compile failure discards queued pixels before joining activ
  const std::weak_ptr<const ArtifactLease> queued_custody = queued;
  auto failed = std::async(std::launch::async, [&, active = std::move(active), queued = std::move(queued)]() mutable {
   BenchmarkCompilePipeline pipeline(2);
-  pipeline.register_split(writer, membership);
+  bind_benchmark_slots(pipeline, writer, membership);
   pipeline.source_publication(images, active)({1});
   require_condition(reader.WaitEntered(2s), "active pixel reader did not open");
   pipeline.source_publication(images, active)({2});
@@ -3750,14 +3768,14 @@ TEST_CASE("source retirement removes the rotating candidate without obstructing 
  const auto images = root.path() / "images";
  auto split = cached_pixel_membership(images);
  split.images = {{1, 16, 8, 0, 0}};
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  std::atomic<unsigned> opens{0}, calls{0};
  request.image_opened = [&](const fs::path&, std::uint64_t) { opens.fetch_add(1); };
  BenchmarkSplitWriter writer(request);
  std::atomic<bool> cancelled{false};
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536, .descriptors = 4}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  auto held = execution.reserve({0, 2});
  mmltk::testsupport::TestGate cpu("populate header queue"), bypass("hold the selected header bypass");
  std::array<std::future<void>, 4> work;
@@ -3804,7 +3822,7 @@ TEST_CASE("independent pixel failure settles blocked and feasible stage work wit
  const auto images = root.path() / "images";
  auto split = cached_pixel_membership(images);
  split.images = {{1, 16, 8, 0, 0}};
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  mmltk::testsupport::TestGate failing("independent header fails before stage dispatch");
  request.image_opened = [&](const fs::path&, std::uint64_t) {
   failing.receipt().ArriveAndWait();
@@ -3814,7 +3832,7 @@ TEST_CASE("independent pixel failure settles blocked and feasible stage work wit
  std::atomic<bool> cancelled{false};
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  auto held = execution.reserve({40960, 0});
  std::atomic<unsigned> calls{0};
  std::array<std::future<void>, 2> work;
@@ -3864,14 +3882,14 @@ TEST_CASE("retiring one generation waits for its reader while unrelated pixels r
  add_cached_pixel_source(split, other, 2);
  split.images = {{1, 16, 8, 0, 0}, {2, 16, 8, 0, 1}};
  mmltk::testsupport::TestGate held("retiring source reader");
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  request.image_opened = [&](const fs::path& path, std::uint64_t) {
   if (path == first) held.receipt().ArriveAndWait();
  };
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline execution(2);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  const auto before_publication = execution.source_publication(first, {});
  execution.source_publication(other, {})({2});
  execution.drain();
@@ -3905,7 +3923,7 @@ TEST_CASE("an attempt retires writer borrows before an early execution owner", "
   auto request = benchmark_write_request(membership, root.path() / "result.bin", 8);
   BenchmarkSplitWriter writer(request);
   BenchmarkCompilePipeline::Attempt attempt(execution);
-  execution.register_split(writer, membership);
+  bind_benchmark_slots(execution, writer, membership);
   execution.source_publication(images, {})({1});
   throw std::runtime_error("construction after registration");
  }(), "construction after registration");
@@ -3944,7 +3962,7 @@ TEST_CASE("membership metadata shares one CPU with ready headers and pixels", "[
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536});
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, membership);
+ bind_benchmark_slots(execution, writer, membership);
  mmltk::testsupport::TestGate first("first metadata chunk");
  const mmltk::testsupport::ScopedTestCleanup release([&] { first.Release(); });
  bool pixels_during_metadata = false;
@@ -4129,7 +4147,7 @@ TEST_CASE("shared remaining pixels use independent lanes and retain canonical sl
  BenchmarkEncodedImage::publish(cached_image_path(root.path() / "images", 2), make_jpeg(240, 8, 8), {});
  split.images = {{1, 16, 8, 0, 0}, {2, 16, 8, 0, 0}};
  BenchmarkCompilePipeline execution(2);
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  request.execution = &execution;
  mmltk::testsupport::TestGate first("first late pixel"), second("second late pixel");
  request.image_opened = [&](const fs::path&, std::uint64_t id) { (id == 1 ? first : second).receipt().ArriveAndWait(); };
@@ -4161,14 +4179,14 @@ TEST_CASE("image replacement retires one reader and rejects its earlier geometry
  encoded.resize(41);
  BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {});
  BenchmarkCompilePipeline execution(1);
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  mmltk::testsupport::TestGate held("affected image reader");
  request.image_opened = [&](const fs::path&, std::uint64_t id) {
   if (id == 1) held.receipt().ArriveAndWait();
  };
  BenchmarkSplitWriter writer(request, true);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  const auto generation = execution.source_generation(images);
  const auto generation_publication = execution.source_publication(images, {});
  generation_publication({2});
@@ -4201,10 +4219,10 @@ TEST_CASE("cooperative parsing returns one CPU to ready consumer work", "[backen
  auto split = cached_pixel_membership(images);
  split.images = {{1, 16, 8, 0, 0}};
  BenchmarkCompilePipeline execution(1);
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  mmltk::testsupport::TestGate parsing("parser bounded progress");
  bool completed_during_parse = false;
  auto parser = std::async(std::launch::async, [&] {
@@ -4333,13 +4351,13 @@ TEST_CASE("a failed body keeps geometry and reaches repair without another faile
  encoded.resize(41);
  BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {});
  BenchmarkCompilePipeline execution(1);
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  request.execution = &execution;
  std::size_t reads = 0;
  request.image_opened = [&](const fs::path&, std::uint64_t) { ++reads; };
  BenchmarkSplitWriter writer(request, true);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  execution.source_publication(images, {})({1});
  CHECK_FALSE(writer.image_complete(0));
  REQUIRE(execution.geometry(images, 1));
@@ -4383,7 +4401,7 @@ TEST_CASE("remaining pixel slots advance beyond a held early reader", "[backend]
   split.images.push_back({id, 16, 8, 0, 0});
  }
  BenchmarkCompilePipeline execution(2);
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  request.execution = &execution;
  mmltk::testsupport::TestGate early("early pixel reader"), later("all independent pixels completed");
  request.image_opened = [&](const fs::path&, std::uint64_t id) {
@@ -4420,10 +4438,10 @@ TEST_CASE("cooperative frames retain outer scratch and its grant through child r
  auto split = cached_pixel_membership(images);
  split.images = {{1, 16, 8, 0, 0}};
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536});
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  mmltk::testsupport::TestGate outer("reused outer scratch");
  std::vector<unsigned> scratch;
  std::size_t retirements = 0;
@@ -4551,12 +4569,12 @@ TEST_CASE("writer group admission exceptions join earlier borrowed readers", "[b
  auto split = cached_pixel_membership(root.path() / "images");
  split.images = {{1, 16, 8, 0, 0}};
  BenchmarkCompilePipeline execution(2);
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  mmltk::testsupport::TestGate reader("reader borrowed before malformed tail admission");
  request.image_opened = [&](const fs::path&, std::uint64_t) { reader.receipt().ArriveAndWait(); };
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  execution.source_publication(split.sources.front().root, {})({1, {}, true});
  const mmltk::testsupport::ScopedTestCleanup release([&] { reader.Release(); });
  REQUIRE(reader.WaitEntered(2s));
@@ -4596,14 +4614,14 @@ TEST_CASE("local retirement preserves another source queued in the same writer g
   }
  } observation{joining};
  BenchmarkCompilePipeline execution(1, {}, {}, mmltk::common::concurrency::CancellationObservation::Borrow(observation));
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  request.execution = &execution;
  request.image_opened = [&](const fs::path& path, std::uint64_t) {
   if (path == first) held.receipt().ArriveAndWait();
  };
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  const auto before = execution.image_generation(first, 1);
  const auto before_publication = execution.source_publication(first, {});
  execution.geometry_ready({first, 1, before, 16, 8});
@@ -4659,7 +4677,7 @@ TEST_CASE("a rejected pixel body leaves admitted writer siblings available for r
  BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {});
  BenchmarkEncodedImage::publish(cached_image_path(images, 2), make_jpeg(240, 8, 8), {});
  BenchmarkCompilePipeline execution(1);
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  request.execution = &execution;
  std::size_t first_reads = 0;
  request.image_opened = [&](const fs::path&, std::uint64_t id) {
@@ -4949,10 +4967,10 @@ TEST_CASE("captured image publications retain their generation across replacemen
  auto split = cached_pixel_membership(images);
  split.images = {{1, 16, 8, 0, 0}};
  BenchmarkCompilePipeline execution(1);
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  auto writer = std::make_unique<BenchmarkSplitWriter>(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(*writer, split);
+ bind_benchmark_slots(execution, *writer, split);
  auto lease = ArtifactLease::acquire_charged(root.path() / "images.lock", {}, &execution);
  auto old = execution.source_publication(images, lease);
  const CachedImageReady ready{1, std::pair{16U, 8U}};
@@ -4972,7 +4990,7 @@ TEST_CASE("captured image publications retain their generation across replacemen
   execution.retire_attempt();
   writer.reset();
   writer = std::make_unique<BenchmarkSplitWriter>(request);
-  execution.register_split(*writer, split);
+  bind_benchmark_slots(execution, *writer, split);
  }
  delayed.Release();
  mmltk::testsupport::await_test_future(producer, "publication after generation withdrawal");
@@ -5031,7 +5049,7 @@ TEST_CASE("owned pixel input retains mapping and charged custody through its las
  std::weak_ptr<const ArtifactLease> retained = custody;
  std::shared_ptr<BenchmarkPixelInput> input;
  {
-  auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
+  auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
   BenchmarkSplitWriter writer(request);
   auto allowance = execution.reserve({32, 1});
   execution.run(BenchmarkStage::Header, {}, [&](std::size_t lane) { input = writer.prepare_pixel(0, lane, execution.source_publication(images, std::move(custody)), std::move(allowance)); });
@@ -5051,7 +5069,7 @@ TEST_CASE("owned pixel input retains mapping and charged custody through its las
  CHECK(retained.expired());
  CHECK(execution.try_reserve({32, 4}).has_value());
 }
-TEST_CASE("detached retained writers withdraw affected pixels before remapping completed sources", "[backend][data][benchmark][pipeline]") {
+TEST_CASE("retained writers withdraw affected pixels and keep healthy slots across attempts", "[backend][data][benchmark][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("detached-pixel-remapping");
  const auto first = root.path() / "first", other = root.path() / "other";
  auto split = cached_pixel_membership(first);
@@ -5064,7 +5082,7 @@ TEST_CASE("detached retained writers withdraw affected pixels before remapping c
  std::vector<std::uint64_t> invalidations;
  request.progress = {.context = &invalidations, .images_invalidated = [](void* value, std::uint64_t count) { static_cast<std::vector<std::uint64_t>*>(value)->push_back(count); }};
  BenchmarkSplitWriter retained(request);
- execution.register_split(retained, split);
+ bind_benchmark_slots(execution, retained, split);
  const auto old = execution.source_publication(first, {});
  old({1});
  execution.source_publication(other, {})({2});
@@ -5075,19 +5093,13 @@ TEST_CASE("detached retained writers withdraw affected pixels before remapping c
  CHECK_FALSE(retained.image_complete(0));
  CHECK(retained.image_complete(1));
  CHECK(invalidations == std::vector<std::uint64_t>{1});
- std::swap(split.images[0], split.images[1]);
- auto remapped_request = benchmark_write_request(split, root.path() / "remapped.bin", 8);
- BenchmarkSplitWriter remapped(remapped_request);
- remapped.retain_completed(retained);
- CHECK(remapped.image_complete(0));
- CHECK_FALSE(remapped.image_complete(1));
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(remapped, split);
+ bind_benchmark_slots(execution, retained, split);
  old({1, std::pair{16U, 8U}});
- CHECK_FALSE(remapped.image_complete(1));
+ CHECK_FALSE(retained.image_complete(0));
  execution.source_publication(first, {})({1});
- CHECK(remapped.image_complete(0));
- CHECK(remapped.image_complete(1));
+ CHECK(retained.image_complete(0));
+ CHECK(retained.image_complete(1));
 }
 namespace {
 void seed_segmented_tail(const DownloadRequest& request, std::uint64_t remaining = 2U << 20, std::size_t count = 2) {
@@ -6554,7 +6566,7 @@ TEST_CASE("published image mappings retain their inode and header without a cach
  request.num_workers = 1;
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  const auto publication = execution.source_publication(images, {});
  CHECK(publication.consume({1, std::pair{16U, 8U}, false, payload}));
  CHECK(writer.image_complete(0));
@@ -6619,7 +6631,7 @@ TEST_CASE("registered Open Images repair accepts its one retained pixel consumpt
  request.progress = {.context = &completions, .image_completed = [](void* value) { ++*static_cast<std::atomic<unsigned>*>(value); }};
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  bool unlinked = false;
  ProgressReporter progress({}, {});
  const auto repair_input = [&](std::uint64_t id) {
@@ -6712,7 +6724,7 @@ TEST_CASE("preplacement image facts remain compact and withdraw with their sourc
  request.execution = &execution;
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  CHECK(publication.consume({1}));
  CHECK(writer.image_complete(0));
  execution.retire_image(images, 1);
@@ -6759,7 +6771,7 @@ TEST_CASE("held warm image reads allow HTTP results and pixels to finish on one 
  }};
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  ProgressReporter progress({}, {});
  std::vector<QuarantinedImage> quarantined;
  auto acquisition = std::async(std::launch::async, [&] {
@@ -6829,7 +6841,7 @@ TEST_CASE("small-target warm cache inputs complete after simultaneous admission"
  std::unique_ptr<BenchmarkSplitWriter> writer;
  if (descriptors == 16) writer = std::make_unique<BenchmarkSplitWriter>(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- if (writer) execution.register_split(*writer, split);
+ if (writer) bind_benchmark_slots(execution, *writer, split);
  ProgressReporter progress({}, {});
  std::vector<QuarantinedImage> quarantined;
  mmltk::testsupport::TestGate warm("three warm workers before mapped admission");
@@ -6979,7 +6991,7 @@ TEST_CASE("deferred mapped input exposes pressure to retained pixel scratch", "[
  request.execution = &execution;
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  REQUIRE(execution.source_publication(images, {}).consume({1}));
  REQUIRE(writer.image_complete(0));
  execution.drain();
@@ -7016,7 +7028,7 @@ TEST_CASE("batch workspace loans finish pixels and retire scratch before reader 
  request.progress = {.context = &completed, .image_completed = [](void* value) { static_cast<std::promise<void>*>(value)->set_value(); }};
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  execution.source_publication(images, {})({1, {}, true});
  const auto window = [&] {
   execution.with_unused_workspace(source, 1U << 20, [&] {
@@ -7158,7 +7170,7 @@ TEST_CASE("long JSON documents admit short chunks beside pixels on one CPU", "[b
  request.execution = &execution;
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  mmltk::testsupport::TestGate chunk("first bounded annotation chunk");
  bool first = true, overlapped = false;
  AnnotationParseOptions options;
@@ -7279,7 +7291,7 @@ TEST_CASE("concurrent reader offers join a live pixel loan on cancellation", "[b
  request.progress = {.context = &pixels, .image_completed = [](void* value) { static_cast<mmltk::testsupport::TestGate*>(value)->receipt().ArriveAndWait(); }};
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  std::future<void> first, second;
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
   cancelled.store(true);
@@ -7334,7 +7346,7 @@ TEST_CASE("a zero-byte workspace offer keeps its scope without joining a live pi
  request.progress = {.context = &pixels, .image_completed = [](void* value) { static_cast<mmltk::testsupport::TestGate*>(value)->receipt().ArriveAndWait(); }};
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  std::future<void> positive_call, zero_call;
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
   positive_window.Release();
@@ -7419,7 +7431,7 @@ TEST_CASE("progressive JSON semantics precede unrelated envelope tails", "[backe
  output.execution = &execution;
  BenchmarkSplitWriter writer(output);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  bool visited = false, pixels_ready = false;
  AnnotationParseOptions options;
  options.split = "train";
@@ -7465,7 +7477,6 @@ TEST_CASE("sparse annotation bounds and area retain normalized and compiled mean
  split.sources = {{root.path() / "images"}};
  split.images = {{1, 16, 8, 4, 0, AnnotationSource::Coco}};
  auto annotations = std::make_shared<BenchmarkLabelChunk>();
- split.annotations = {{annotations, 0}};
  prepare_cached_image_directory(split.sources[0].root);
  BenchmarkEncodedImage::publish(cached_image_path(split.sources[0].root, 1), make_jpeg(10, 20, 30), {});
  const auto geometry = mmltk::backend::imaging::resample::compute_image_resize_geometry(16, 8, 16, 16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
@@ -7489,7 +7500,8 @@ TEST_CASE("sparse annotation bounds and area retain normalized and compiled mean
   annotations->labels.push_back(label);
  }
  const auto output = root.path() / "compiled.bin";
- write_benchmark_split({.split = split, .output_path = output, .resolution = 16, .num_workers = 1, .resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch});
+ const std::array chunks{annotations};
+ write_benchmark_fixture({.split = split, .output_path = output, .resolution = 16, .num_workers = 1, .resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch}, chunks);
  const auto compiled = CompiledDataset::open(output);
  REQUIRE(compiled.image_labels(0).size() == 4);
  for (const auto& label : compiled.image_labels(0)) {
@@ -7696,7 +7708,7 @@ TEST_CASE("native label readiness and physical pixels settle independently", "[b
  request.execution = &execution;
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  const auto physical = execution.source_publication(images, {}, 1);
  physical.geometry_ready(1, {16, 8});
  NormalizedAnnotationBuilder builder;
@@ -7882,7 +7894,7 @@ TEST_CASE("normalized label custody rejects unrelated backing for detached nativ
  CHECK(native_input.index().image(0).source_image_id == 1);
  CHECK_FALSE(native_input.index().storage().backing);
 }
-TEST_CASE("owned label inputs join only their own geometry and reuse completed dependencies", "[benchmark][pipeline][labels]") {
+TEST_CASE("owned label inputs use their annotation canvas and reuse completed dependencies", "[benchmark][pipeline][labels]") {
  BenchmarkCompilePipeline execution(1);
  std::array<unsigned, 3> conversions{};
  execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto id, const auto&) { ++conversions.at(id); });
@@ -7894,7 +7906,9 @@ TEST_CASE("owned label inputs join only their own geometry and reuse completed d
   pending = input.storage().backing;
   execution.labels_ready(publication, 1, BenchmarkLabelInput(input, 0), "first", 1);
  }
- CHECK_FALSE(pending.expired());
+ const auto first = execution.wait_image_labels(root, 1, "first");
+ REQUIRE(first);
+ CHECK(pending.expired());
  CHECK_FALSE(execution.geometry(root, 1));
  CHECK(execution.has_image_labels(root, 1, "first", 1));
  CHECK_FALSE(execution.has_image_labels(root, 1, "first", 2));
@@ -7904,7 +7918,7 @@ TEST_CASE("owned label inputs join only their own geometry and reuse completed d
  auto ready = execution.wait_image_labels(root, 2, "second");
  REQUIRE(ready);
  CHECK(conversions[2] == 1);
- CHECK(conversions[1] == 0);
+ CHECK(conversions[1] == 1);
  CHECK(execution.has_image_labels(root, 2, "second", 1));
  // Compiler fallback joins the exact product even after an earlier consumer read it.
  execution.labels_ready(publication, 2, BenchmarkLabelInput(second, 0), "second", 1);
@@ -7921,8 +7935,7 @@ TEST_CASE("owned label inputs join only their own geometry and reuse completed d
  CHECK(execution.wait_image_labels(root, 2, "second") == ready);
  CHECK(conversions[2] == 2);
  publication.geometry_ready(1, {8, 2});
- const auto first = execution.wait_image_labels(root, 1, "first");
- REQUIRE(first);
+ CHECK(execution.wait_image_labels(root, 1, "first") == first);
  CHECK(first->labels[0].annotation_id == 101);
  CHECK(first->labels[0].source_ordinal == 3);
  CHECK(pending.expired());
@@ -8198,7 +8211,7 @@ TEST_CASE("required label joins surface failed geometry readers without a pixel 
  request.execution = &execution;
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.register_split(writer, split);
+ bind_benchmark_slots(execution, writer, split);
  const auto publication = execution.source_publication(images, {});
  execution.labels_ready(publication, 1, BenchmarkLabelInput(label_projection_fixture(1), 0), "required");
  publication({1});
@@ -8305,7 +8318,6 @@ TEST_CASE("split sealing admits caller metadata and preserves publication on can
  label.bbox_x2 = label.bbox_y2 = 1;
  auto annotations = std::make_shared<BenchmarkLabelChunk>();
  annotations->labels = {label};
- split.annotations = {{annotations, 0}};
  const auto output = root.path() / "result.bin";
  write_text(output, "prior publication");
  const auto prior = mmltk::common::io::sha256_file(output);
@@ -8325,14 +8337,15 @@ TEST_CASE("split sealing admits caller metadata and preserves publication on can
     annotations->labels[0].mask_rle_pairs = 1;
     annotations->runs = {{63, 2}};
    }
-   CHECK_THROWS(writer.seal(request));
+   CHECK_THROWS([&] { writer.write_labels(0, benchmark_entry(split.images[0]), {annotations->labels, annotations->runs}); (void)writer.seal(request); }());
   }
   SECTION("cancel before sealing") {
    cancelled.store(true);
-   CHECK_THROWS(writer.seal(request));
+   CHECK_THROWS([&] { writer.write_labels(0, benchmark_entry(split.images[0]), {annotations->labels, annotations->runs}); (void)writer.seal(request); }());
   }
   SECTION("cancel after sync before publishing") {
    annotations->labels[0].flags = kAnnotationMask;  // Untrusted present-empty mask is valid.
+   writer.write_labels(0, benchmark_entry(split.images[0]), {annotations->labels, annotations->runs});
    auto sealed = writer.seal(request);
    CHECK(sealed.info.image_count == 1);
    CHECK(std::ranges::equal(sealed.info.class_names(), split.class_names));
@@ -8343,20 +8356,25 @@ TEST_CASE("split sealing admits caller metadata and preserves publication on can
  }
  check_preserved_split(output, prior);
 }
-TEST_CASE("split placement retains chunks and settles local payloads across source merges", "[backend][data][benchmark][writer]") {
+TEST_CASE("independent slots settle payloads and release chunks across source families", "[backend][data][benchmark][writer]") {
  mmltk::testsupport::ScopedTempDir root("split-final-placement");
  const std::array<std::string_view, 1> classes{"person"};
  constexpr auto mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
  std::vector<std::uint8_t> baseline;
  for (const auto workers : {1U, 3U}) {
   BenchmarkCompilePipeline execution(workers);
-  BenchmarkSplitAssembly final("train", classes, 8, mode);
+  PreparedBenchmarkSplit final;
+  final.name = "train";
+  final.class_names = {"person"};
+  auto request = benchmark_write_request(final, root.path() / ("placed-" + std::to_string(workers) + ".bin"), 8);
+  request.execution = &execution;
+  BenchmarkSplitWriter writer(request);
+  BenchmarkCompilePipeline::Attempt attempt(execution);
   std::array<std::weak_ptr<const BenchmarkLabelChunk>, 3> custody;
   for (std::size_t source = 0; source < custody.size(); ++source) {
    const auto images = root.path() / ("images-" + std::to_string(source));
    (void)cached_pixel_membership(images);
-   BenchmarkSplitAssembly part("source", classes, 8, mode);
-   part.add_source(images);
+   final.sources.push_back({images});
    auto chunk = std::make_shared<BenchmarkLabelChunk>();
    chunk->width = 16;
    chunk->height = 8;
@@ -8378,32 +8396,16 @@ TEST_CASE("split placement retains chunks and settles local payloads across sour
     }
    }
    custody[source] = chunk;
-   part.image({1, 16, 8, static_cast<std::uint16_t>(chunk->labels.size()), 0, AnnotationSource::Coco}, chunk, source == 0 ? 100 : 200);
+   const EncodedImageRecord record{1, 16, 8, static_cast<std::uint16_t>(chunk->labels.size()), static_cast<std::uint16_t>(source), AnnotationSource::Coco};
+   const auto slot = writer.allocate_slot(record, {images});
+   execution.bind_slot(images, 1, writer, slot);
+   final.images.push_back(record);
+   writer.write_labels(slot, benchmark_entry(record), {chunk->labels, chunk->runs}, 0, source == 0 ? 100 : 200);
    chunk.reset();
-   CHECK_FALSE(custody[source].expired());
-   CHECK(part.data().annotations.size() == 1);
-   final.append(std::move(part));
+   CHECK(custody[source].expired());
   }
-  CHECK(final.label_count() == 3);
-  CHECK(final.run_count() == 3);
-  CHECK(final.data().images.size() == 3);
-  CHECK(final.data().annotations.size() == 3);
-  auto request = benchmark_write_request(final, root.path() / ("placed-" + std::to_string(workers) + ".bin"), 8);
-  request.execution = &execution;
-  BenchmarkSplitWriter writer(request);
-  BenchmarkCompilePipeline::Attempt attempt(execution);
-  // Pixel membership is usable before final label/run storage exists.
   writer.write_remaining(request);
-  final.materialize(execution);
-  for (const auto& chunk : custody) CHECK_FALSE(chunk.expired());
-  CHECK(final.data().images[2].source_index == 2);
-  CHECK(final.data().annotations[0].chunk->labels[1].has_mask());
-  CHECK(final.data().annotations[0].chunk->labels[1].mask_rle_pairs == 0);
-  CHECK(final.data().annotations[0].chunk->labels[1].mask_rle_offset == 2 * sizeof(RLEPair));
-  CHECK(final.data().annotations[2].chunk->labels[0].mask_rle_offset == 0);
-  CHECK_THROWS(final.materialize(execution));
-  CHECK_THROWS(final.add_source("late"));
-  auto sealed = writer.seal(request, &final);
+  auto sealed = writer.seal(request);
   sealed.artifact.publish(request.output_path, {});
   const auto dataset = CompiledDataset::open(request.output_path);
   CHECK(dataset.header().max_instances_per_image == 2);
@@ -8421,13 +8423,13 @@ TEST_CASE("split placement retains chunks and settles local payloads across sour
    CHECK(bytes == baseline);
  }
 }
-TEST_CASE("final chunk placement rejects malformed records and cannot seal partial output", "[backend][data][benchmark][writer]") {
+TEST_CASE("direct slot publication rejects malformed records and cannot seal partial output", "[backend][data][benchmark][writer]") {
  mmltk::testsupport::ScopedTempDir root("split-placement-admission");
  const auto membership = cached_pixel_membership(root.path() / "images");
  const std::array<std::string_view, 1> classes{"person"};
  BenchmarkCompilePipeline execution(1);
- BenchmarkSplitAssembly assembly("train", classes, 8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
- assembly.add_source(membership.sources.front().root);
+ auto split = membership;
+ split.images[0].label_count = 1;
  auto chunk = std::make_shared<BenchmarkLabelChunk>();
  chunk->width = 16;
  chunk->height = 8;
@@ -8451,14 +8453,239 @@ TEST_CASE("final chunk placement rejects malformed records and cannot seal parti
  SECTION("run ordering") { chunk->runs[1].start = 0; }
  SECTION("unreferenced run") { chunk->labels[0].mask_rle_pairs = 1; }
  SECTION("source ordinal overflow") { chunk->labels[0].source_ordinal = UINT64_MAX; }
- SECTION("cancelled placement") { cancelled.store(true); }
- assembly.image({1, 16, 8, 1, 0, AnnotationSource::Coco}, chunk, 1);
- auto request = benchmark_write_request(assembly, root.path() / "result.bin", 8);
+ bool cancel_placement = false;
+ SECTION("cancelled placement") { cancel_placement = true; }
+ split.images[0].annotation_source = AnnotationSource::Coco;
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, cancellation);
  request.execution = &execution;
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  writer.write_remaining(request);
- CHECK_THROWS(assembly.materialize(execution, cancellation));
- CHECK_THROWS(writer.seal(request, &assembly));
+ cancelled.store(cancel_placement);
+ CHECK_THROWS(writer.write_labels(0, benchmark_entry(split.images[0]), {chunk->labels, chunk->runs}, 0, 1));
+ CHECK_THROWS(writer.seal(request));
  CHECK_FALSE(fs::exists(request.output_path));
+}
+TEST_CASE("image retirement keeps admission closed through writer invalidation", "[benchmark][pipeline][labels][writer]") {
+ mmltk::testsupport::ScopedTempDir temporary("slot-invalidation-custody");
+ const auto images = temporary.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images.clear();
+ BenchmarkCompilePipeline execution(1);
+ execution.label_configuration(8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
+ mmltk::testsupport::TestGate invalidating("old pixel invalidation");
+ auto request = benchmark_write_request(split, temporary.path() / "train.bin", 8);
+ request.execution = &execution;
+ request.progress = {.context = &invalidating, .images_invalidated = [](void* context, std::uint64_t) {
+  static_cast<mmltk::testsupport::TestGate*>(context)->receipt().ArriveAndWait();
+ }};
+ BenchmarkSplitWriter writer(request, true);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.bind_source(images, writer, AnnotationSource::Coco);
+ execution.source_publication(images, {})({1});
+ execution.wait_image(images, 1);
+ const auto slot = execution.image_slot(images, 1);
+ REQUIRE(slot);
+ auto retiring = std::async(std::launch::async, [&] { execution.retire_image(images, 1); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { invalidating.Release(); });
+ REQUIRE(invalidating.WaitEntered(5s));
+ const auto replacement = execution.source_publication(images, {}, 1);
+ const auto input = label_projection_fixture(1);
+ replacement.geometry_ready(1, {8, 2});
+ CHECK_FALSE(execution.geometry(images, 1));
+ CHECK_FALSE(execution.labels_ready(replacement, 1, BenchmarkLabelInput(input, 0), "replacement"));
+ CHECK_FALSE(writer.image_complete(*slot));
+ invalidating.Release();
+ mmltk::testsupport::await_test_future(retiring, "writer invalidation settles before replacement admission");
+ REQUIRE(execution.labels_ready(replacement, 1, BenchmarkLabelInput(input, 0), "replacement"));
+ REQUIRE(execution.wait_image_labels(images, 1, "replacement"));
+ replacement({1});
+ execution.wait_image(images, 1);
+ CHECK(writer.image_complete(*slot));
+ CHECK(writer.entry(*slot).num_instances == 1);
+ CHECK(execution.image_slot(images, 1) == slot);
+}
+TEST_CASE("dependency withdrawal retains the active label through overlapping generation retirement", "[benchmark][pipeline][labels][resources]") {
+ enum class Retire { Image, Source, Original };
+ const auto retirement = GENERATE(Retire::Image, Retire::Source, Retire::Original);
+ BenchmarkCompilePipeline execution(1);
+ mmltk::testsupport::TestGate held("retiring dependency borrower");
+ execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto, const auto&) { held.receipt().ArriveAndWait(); });
+ const std::filesystem::path root("overlapping-label-retirement");
+ const auto source = execution.source_publication(root, {});
+ source.geometry_ready(1, {8, 2});
+ const auto input = label_projection_fixture(1);
+ std::future<void> dependency, generation;
+ const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); });
+ REQUIRE(execution.labels_ready(source, 1, BenchmarkLabelInput(input, 0), "same-dependency", 1));
+ REQUIRE(held.WaitEntered(5s));
+ auto before = execution.admission_generation();
+ dependency = std::async(std::launch::async, [&] { execution.retire_labels(root, 1, "same-dependency"); });
+ execution.wait_for_admission_change(before);
+ CHECK_FALSE(execution.labels_ready(source, 1, BenchmarkLabelInput(input, 0), "same-dependency", 1));
+ before = execution.admission_generation();
+ generation = std::async(std::launch::async, [&] {
+  switch (retirement) {
+   case Retire::Image: execution.retire_image(root, 1); break;
+   case Retire::Source: execution.retire_source(root); break;
+   case Retire::Original: execution.original_generation(root, 2, true); break;
+  }
+ });
+ execution.wait_for_admission_change(before);
+ CHECK(dependency.wait_for(0ms) == std::future_status::timeout);
+ CHECK(generation.wait_for(0ms) == std::future_status::timeout);
+ held.Release();
+ mmltk::testsupport::await_test_future(dependency, "exact dependency retires its active borrower");
+ mmltk::testsupport::await_test_future(generation, "generation waits for the same borrower");
+ const auto replacement = execution.source_publication(root, {}, 1);
+ replacement.geometry_ready(1, {8, 2});
+ const auto original_generation = retirement == Retire::Original ? 2U : 1U;
+ REQUIRE(execution.labels_ready(replacement, 1, BenchmarkLabelInput(input, 0), "same-dependency", original_generation));
+ REQUIRE(execution.wait_image_labels(root, 1, "same-dependency", original_generation));
+}
+TEST_CASE("dynamic benchmark slots write labels before pixels and replace one dependency in place", "[benchmark][pipeline][labels][writer][resources]") {
+ mmltk::testsupport::ScopedTempDir temporary("independent-slot-products");
+ const auto images = temporary.path() / "images";
+ const bool contradiction = GENERATE(false, true);
+ const std::string_view selection = GENERATE("retain Large", "restore XL", "active XL");
+ const bool incomplete = GENERATE(false, true);
+ const bool restore = selection != "retain Large";
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 13});
+ execution.label_configuration(8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
+ PreparedBenchmarkSplit split;
+ split.name = "train";
+ split.class_names = {"person"};
+ auto output = benchmark_write_request(split, temporary.path() / "train.bin", 8);
+ output.execution = &execution;
+ BenchmarkSplitWriter writer(output, true);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.bind_source(images, writer, AnnotationSource::CoconutObjects365V2);
+ NormalizedAnnotationBuilder annotations;
+ annotations.images.push_back({7, 0, 1, contradiction ? 15U : 16U, 8, 0, 0});
+ NormalizedBox box;
+ box.x2 = box.y2 = 1;
+ box.flags = kAnnotationId | kAnnotationCategory | (incomplete ? kAnnotationOrdinalIncomplete : 0);
+ box.annotation_id = 101;
+ box.source_category_id = 1;
+ box.source_ordinal = 5;
+ annotations.boxes.push_back(box);
+ const NormalizedAnnotationReadView xl(fixture_index(annotations));
+ const auto source = execution.source_publication(images, {});
+ REQUIRE(execution.labels_ready(source, 7, BenchmarkLabelInput(xl, 0), "XL", 0, 1));
+ REQUIRE(execution.wait_image_labels(images, 7, "XL"));
+ const auto slot = execution.image_slot(images, 7);
+ REQUIRE(slot);
+ CHECK(writer.entry(*slot).num_instances == 1);
+ CHECK_FALSE(writer.image_complete(*slot));
+ CHECK_FALSE(std::filesystem::exists(images));
+ annotations.boxes[0].annotation_id = 202;
+ annotations.boxes[0].source_ordinal = 0;
+ const NormalizedAnnotationReadView large(fixture_index(annotations));
+ REQUIRE(execution.labels_ready(source, 7, BenchmarkLabelInput(large, 0), "Large", 0, 2));
+ REQUIRE(execution.wait_image_labels(images, 7, "Large"));
+ CHECK_FALSE(execution.has_image_labels(images, 7, "XL"));
+ CHECK(execution.has_image_labels(images, 7, "Large"));
+ CHECK(writer.entry(*slot).num_instances == 1);
+ CHECK(execution.image_slot(images, 7) == slot);
+ prepare_cached_image_directory(images);
+ BenchmarkEncodedImage::publish(cached_image_path(images, 7), make_jpeg(20, 30, 40), {});
+ source({7});
+ execution.wait_image(images, 7);
+ CHECK(writer.completed() == 1);
+ if (restore) {
+  // Final component input already carries its canonical ordinal. The early XL
+  // vectors were released after Large replaced them, so replay must use this input.
+  annotations.boxes[0].annotation_id = 101;
+  annotations.boxes[0].source_ordinal = 23;
+  const NormalizedAnnotationReadView final_xl(fixture_index(annotations));
+  mmltk::testsupport::TestGate active("XL borrower while the preferred claim retires");
+  const mmltk::testsupport::ScopedTestCleanup release([&] { active.Release(); execution.drain(); });
+  if (selection == "active XL") {
+   execution.label_configuration(8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
+    [&](const auto&, auto, const auto&) { active.receipt().ArriveAndWait(); });
+   REQUIRE(execution.labels_ready(source, 7, BenchmarkLabelInput(final_xl, 0), "XL", 0, 1));
+   REQUIRE(active.WaitEntered(5s));
+   CHECK(execution.has_image_labels(images, 7, "XL"));
+  }
+  execution.retire_labels(images, 7, "Large");
+  CHECK_FALSE(writer.entry(*slot).eligible());
+  active.Release();
+  execution.drain();
+  if (!execution.has_image_labels(images, 7, "XL")) {
+   REQUIRE(execution.labels_ready(source, 7, BenchmarkLabelInput(final_xl, 0), "XL", 0, 1));
+   REQUIRE(execution.wait_image_labels(images, 7, "XL"));
+  }
+  CHECK(execution.has_image_labels(images, 7, "XL"));
+  CHECK_FALSE(execution.has_image_labels(images, 7, "Large"));
+  execution.label_configuration(8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
+ } else execution.retire_labels(images, 7, "XL");
+ execution.drain();
+ CHECK(writer.completed() == 1);
+ CHECK(execution.image_slot(images, 7) == slot);
+ const std::array selected{*slot};
+ if (contradiction) {
+  CHECK_THROWS(writer.seal_slots(output, selected));
+  CHECK_FALSE(std::filesystem::exists(output.output_path));
+ } else {
+  if (!restore) writer.settle_labels(*slot, 11, incomplete);
+  auto sealed = writer.seal_slots(output, selected);
+  sealed.artifact.publish(output.output_path, {}, BenchmarkStagedArtifact::Publication::DurableReplace);
+  const auto compiled = CompiledDataset::open(output.output_path);
+  REQUIRE(compiled.image_labels(*slot).size() == 1);
+  CHECK(compiled.image_labels(*slot)[0].annotation_id == (restore ? 101 : 202));
+  CHECK(compiled.image_labels(*slot)[0].source_ordinal == (restore ? 23 : 11));
+  CHECK(compiled.image_labels(*slot)[0].has_complete_source_ordinal() == !incomplete);
+  CHECK(compiled.header().num_images == 1);
+  CHECK(compiled.header().num_slots == 1);
+ }
+}
+
+TEST_CASE("normalized cache row admission checks each payload before borrowing and retains mapping custody", "[backend][data][benchmark][annotations][cache]") {
+ const std::string_view outcome = GENERATE("valid", "late record", "cancel", "receiver failure");
+ mmltk::testsupport::ScopedTempDir root("normalized-incremental-admission");
+ const std::string digest(64U, '0');
+ NormalizedAnnotationBuilder builder;
+ builder.source = BenchmarkDatasetSource::kCoco2017;
+ builder.split = "train";
+ builder.annotation_sha256 = digest;
+ NormalizedBox box;
+ box.x2 = box.y2 = 1.0F;
+ box.original_area = 1;
+ box.flags = kAnnotationCategory;
+ box.source_category_id = 1;
+ for (unsigned i = 0; i < 2; ++i) {
+  builder.images.push_back({i + 1U, i, 1U, 1U, 1U, 0U, 0U});
+  builder.boxes.push_back(box);
+ }
+ const auto path = root.path() / "normalized.bin";
+ store_normalized_annotation_index(path, fixture_index(builder), {});
+ if (outcome == "late record") {
+  box.flags = 0;
+  box.source_category_id = 0;
+  std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+  file.seekp(256U + 2U * sizeof(NormalizedImage) + sizeof(NormalizedBox));
+  file.write(reinterpret_cast<const char*>(&box), sizeof(box));
+ }
+ std::atomic<bool> cancelled{false};
+ std::optional<BenchmarkLabelInput> first;
+ unsigned rows = 0;
+ const auto load = [&] {
+  return load_normalized_annotation_index(path, builder.source, builder.split, digest, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), {}, nullptr, false, 0,
+   [&](const NormalizedAnnotationIndex& mapped, std::size_t image) {
+    ++rows;
+    if (!image) {
+     first.emplace(NormalizedAnnotationReadView(mapped), image);
+     if (outcome == "cancel") cancelled = true;
+     if (outcome == "receiver failure") throw std::runtime_error("row receiver failed");
+    }
+   });
+ };
+ if (outcome == "cancel") CHECK_THROWS(load());
+ else if (outcome == "receiver failure") CHECK_THROWS_WITH(load(), "row receiver failed");
+ else CHECK(load().has_value() == (outcome == "valid"));
+ CHECK(rows == (outcome == "valid" ? 2U : 1U));
+ REQUIRE(first);
+ std::filesystem::remove(path);
+ CHECK(first->index().image(first->position()).source_image_id == 1);
+ CHECK(first->index().storage().boxes.front().source_category_id == 1);
 }
