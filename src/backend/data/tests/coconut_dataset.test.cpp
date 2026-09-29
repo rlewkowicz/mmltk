@@ -284,6 +284,9 @@ std::string gzip_fixture(std::string_view input, bool single_block = false) {
   for (unsigned shift = 0; shift < 32; shift += 8) encoded.push_back(static_cast<char>(value >> shift));
  return encoded;
 }
+std::array<std::string, 3> capture_publication_bytes(const std::filesystem::path& output) {
+ return {file_bytes(output / "train.bin"), file_bytes(output / "val.bin"), file_bytes(output / "benchmark_manifest.json")};
+}
 void check_publication_bytes(const std::filesystem::path& output, std::string_view train, std::string_view validation, std::string_view manifest) {
  CHECK(file_bytes(output / "train.bin") == train);
  CHECK(file_bytes(output / "val.bin") == validation);
@@ -1275,6 +1278,36 @@ std::vector<AdmittedRecipeArchive> local_physical_archives(const BenchmarkCacheL
  }
  return admitted;
 }
+struct PhysicalMembershipFixture {
+ std::vector<AdmittedRecipeArchive> admitted;
+ std::atomic<bool> cancelled{false};
+ mmltk::common::concurrency::CancellationObservation cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution;
+ CoconutPhysicalMembership physical;
+ PhysicalMembershipFixture(const BenchmarkCacheLayout& cache, const CoconutRecipeCatalog& catalog, std::uint64_t transient_bytes = 256ULL << 20)
+     : admitted(local_physical_archives(cache, catalog)),
+       execution(1, {}, {.transient_bytes = transient_bytes, .descriptors = 13}, cancellation),
+       physical(admitted, catalog, true, cache, execution.storage(), execution, cancellation) {}
+};
+CoconutRecipeCatalog base_physical_catalog(const std::filesystem::path& archive, std::uint32_t images) {
+ CoconutRecipeCatalog catalog;
+ catalog.releases.push_back({CoconutEdition::Base, "fixture-base", "fixture-v1", images, {}});
+ catalog.images.push_back(
+  {CoconutImageNamespace::CocoTrain, 0, "train2017", {"physical", "unused", archive.filename().string(), std::filesystem::file_size(archive), "", BenchmarkDatasetSource::kCoco2017}});
+ return catalog;
+}
+std::pair<PreparedBenchmarkSplit, std::string> cached_mask_pixel_fixture(const std::filesystem::path& images) {
+ prepare_cached_image_directory(images);
+ const std::array<std::uint32_t, 1> foreground{1};
+ auto encoded = png(1, 1, foreground);
+ BenchmarkEncodedImage::publish(cached_image_path(images, 7), {reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size()}, {});
+ PreparedBenchmarkSplit split;
+ split.name = "train";
+ split.class_names = {"person"};
+ split.sources = {{images}};
+ split.images = {{7, 1, 1, 0, 0, 0}};
+ return {std::move(split), std::move(encoded)};
+}
 }  // namespace
 TEST_CASE("COCONut private catalog compiles all validation choices through the production transaction", "[coconut][benchmark]") {
  ScopedTempDir root("coconut-recipe");
@@ -2265,8 +2298,7 @@ TEST_CASE("stock annotation cancellation preserves the previous recipe publicati
  auto catalog = local.selected(CoconutValidation::Stock);
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock}, true);
  compile_benchmark_recipe(config, &catalog);
- const auto train = file_bytes(config.output_dir / "train.bin"), val = file_bytes(config.output_dir / "val.bin");
- const auto manifest = file_bytes(config.output_dir / "benchmark_manifest.json");
+ const auto [train, val, manifest] = capture_publication_bytes(config.output_dir);
  const auto index = local.cache.source_indexes("coco") / "val2017.normalized.bin";
  remove_normalized_annotation_index(index);
  std::atomic<bool> cancel{false};
@@ -3249,8 +3281,7 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
  auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock}, true);
  compile_benchmark_recipe(config, nullptr, &custom);
  compile_benchmark_recipe(config, nullptr, &custom);
- const auto train = file_bytes(local.output / "train.bin"), validation = file_bytes(local.output / "val.bin");
- const auto manifest = file_bytes(local.output / "benchmark_manifest.json");
+ const auto [train, validation, manifest] = capture_publication_bytes(local.output);
  const auto image_root = local.cache.source_images("coco") / "train2017";
  mmltk::testsupport::TestGate reader("early COCO training reader"), labels("same COCO training labels");
  const auto reader_receipt = reader.receipt(), labels_receipt = labels.receipt();
@@ -3555,9 +3586,7 @@ TEST_CASE("COCONut consumes ready releases while an unrelated lifecycle lease is
  // No completed or failed release retains lifecycle custody after compilation.
  for (const auto& component : catalog.releases) {
   const auto path = local.cache.locks / (std::string(component.name) + ".annotations.lifecycle.lock");
-  const mmltk::common::io::ScopedFd descriptor(::open(path.c_str(), O_RDWR | O_CLOEXEC));
-  REQUIRE(descriptor.get() >= 0);
-  CHECK(::flock(descriptor.get(), LOCK_EX | LOCK_NB) == 0);
+  CHECK(mmltk::testsupport::probe_file_lock(path).available);
  }
 }
 TEST_CASE("concurrent recovery workspaces share immutable physical lookups", "[benchmark][coconut][recovery]") {
@@ -3605,8 +3634,7 @@ TEST_CASE("cancellation retires release work while original annotations are lock
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
  auto catalog = local.selected(config.selection.validation);
  compile_benchmark_recipe(config, &catalog);
- const auto train = file_bytes(local.output / "train.bin"), validation = file_bytes(local.output / "val.bin");
- const auto manifest = file_bytes(local.output / "benchmark_manifest.json");
+ const auto [train, validation, manifest] = capture_publication_bytes(local.output);
  auto originals = ArtifactLease::acquire(local.cache.locks / "coco-annotations.lifecycle.lock", {});
  config.selection.validation = CoconutValidation::Stock;
  catalog = local.selected(config.selection.validation);
@@ -3633,8 +3661,7 @@ TEST_CASE("COCONut receives metadata while a managed release lane is importing m
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
  compile_benchmark_recipe(config, &catalog);
  compile_benchmark_recipe(config, &catalog);
- const auto train = file_bytes(local.output / "train.bin"), validation = file_bytes(local.output / "val.bin");
- const auto manifest = file_bytes(local.output / "benchmark_manifest.json");
+ const auto [train, validation, manifest] = capture_publication_bytes(local.output);
  const auto facts = Json::parse(manifest);
  for (const auto& component : facts.at("recipe").at("components")) std::filesystem::remove(local.cache.root / component.at("imported_index").get<std::string>());
  REQUIRE(catalog.releases.size() > 2);
@@ -4106,15 +4133,7 @@ TEST_CASE("COCONut JSON parsing yields one shared CPU before its source pass fin
  ScopedTempDir root("shared-json-fairness");
  BenchmarkCompilePipeline execution(1);
  const auto images = root.path() / "images";
- prepare_cached_image_directory(images);
- const std::array<std::uint32_t, 1> mask_ids{1};
- const auto encoded = png(1, 1, mask_ids);
- BenchmarkEncodedImage::publish(cached_image_path(images, 7), {reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size()}, {});
- PreparedBenchmarkSplit split;
- split.name = "train";
- split.class_names = {"person"};
- split.sources = {{images}};
- split.images = {{7, 1, 1, 0, 0, 0}};
+ auto [split, encoded] = cached_mask_pixel_fixture(images);
  BenchmarkWriteRequest pixels{.split = split, .output_path = root.path() / "result.bin", .resolution = 1, .num_workers = 1, .execution = &execution};
  BenchmarkSplitWriter writer(pixels);
  BenchmarkCompilePipeline::Attempt attempt(execution);
@@ -4163,57 +4182,38 @@ TEST_CASE("COCONut JSON parsing yields one shared CPU before its source pass fin
  REQUIRE(result.size() == 1);
  CHECK(result.front().index().image_count() == 256);
 }
-TEST_CASE("custom annotation sources acquire lifecycle custody independently on one CPU", "[benchmark][pipeline]") {
+TEST_CASE("custom annotation sources preserve independent HTTP and lifecycle admission", "[benchmark][pipeline]") {
  using namespace std::chrono_literals;
+ bool download = false;
+ SECTION("custom annotation sources acquire lifecycle custody independently on one CPU") {}
+ SECTION("sixteen-descriptor annotation admission protects HTTP before independent lifecycle locks") { download = true; }
  ScopedTempDir root("custom-independent-lifecycle");
- LocalCoconutRecipe local(root.path());
- const auto catalog = local_custom_catalog(local);
- auto blocked = ArtifactLease::acquire(local.cache.locks / "coco-annotations.lifecycle.lock", {});
- std::atomic<bool> cancelled{false};
- const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- BenchmarkCompilePipeline execution(1, {}, {.descriptors = 24}, cancellation);
- std::promise<void> independent;
- std::atomic<unsigned> completed{0};
- const BenchmarkTraceSink trace = [&](std::string_view event, const Json& fields) {
-  if (event == "benchmark.annotations.cache_hit" && fields.at("source") != "coco" && completed.fetch_add(1) == 1) independent.set_value();
- };
- ProgressReporter progress({}, trace);
- const auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
- auto work = std::async(std::launch::async, [&] { return prepare_custom_recipe(config, local.cache, catalog, progress, 1, cancellation, trace, {}, &execution); });
- const mmltk::testsupport::ScopedTestCleanup release([&] {
-  cancelled.store(true);
-  blocked = {};
- });
- mmltk::testsupport::await_test_promise(independent, "supplemental metadata while COCO lifecycle is locked");
- CHECK(work.wait_for(0ms) == std::future_status::timeout);
- blocked = {};
- const auto result = mmltk::testsupport::await_test_future(work, "independent custom metadata settlement");
- REQUIRE(result.coco_train);
- REQUIRE(result.coco_val);
- REQUIRE(result.objects);
- REQUIRE(result.open_images);
- CHECK(execution.try_reserve({0, 24}).has_value());
-}
-TEST_CASE("sixteen-descriptor annotation admission protects HTTP before independent lifecycle locks", "[benchmark][pipeline]") {
- using namespace std::chrono_literals;
- ScopedTempDir root("custom-fixed-transport-before-lifecycles");
  LocalCoconutRecipe local(root.path());
  auto catalog = local_custom_catalog(local);
  const auto raw = local.cache.source_downloads("coco") / catalog.coco_annotations.filename;
- const auto payload = file_bytes(raw);
- mmltk::backend::data::testsupport::HttpServer server(payload);
- catalog.coco_annotations.url = server.url("annotations");
- catalog.coco_annotations.expected_size = payload.size();
- std::filesystem::remove(raw);
- std::filesystem::remove(raw.string() + ".download.json");
- remove_normalized_annotation_index(local.cache.source_indexes("coco") / "val2017.normalized.bin");
- auto blocked = ArtifactLease::acquire(local.cache.locks / "objects365-annotations.lifecycle.lock", {});
+ std::string payload;
+ std::optional<mmltk::backend::data::testsupport::HttpServer> server;
+ if (download) {
+  payload = file_bytes(raw);
+  server.emplace(payload);
+  catalog.coco_annotations.url = server->url("annotations");
+  catalog.coco_annotations.expected_size = payload.size();
+  std::filesystem::remove(raw);
+  std::filesystem::remove(raw.string() + ".download.json");
+  remove_normalized_annotation_index(local.cache.source_indexes("coco") / "val2017.normalized.bin");
+ }
+ auto blocked = ArtifactLease::acquire(local.cache.locks / (download ? "objects365-annotations.lifecycle.lock" : "coco-annotations.lifecycle.lock"), {});
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- BenchmarkCompilePipeline execution(1, {}, {.descriptors = 16}, cancellation);
- std::promise<void> downloaded;
+ const std::size_t descriptors = download ? 16 : 24;
+ BenchmarkCompilePipeline execution(1, {}, {.descriptors = descriptors}, cancellation);
+ std::promise<void> independent;
+ std::atomic<unsigned> completed{0};
  const BenchmarkTraceSink trace = [&](std::string_view event, const Json& fields) {
-  if (event == "benchmark.download.complete" && fields.at("artifact") == catalog.coco_annotations.artifact_id) downloaded.set_value();
+  if (download) {
+   if (event == "benchmark.download.complete" && fields.at("artifact") == catalog.coco_annotations.artifact_id) independent.set_value();
+  } else if (event == "benchmark.annotations.cache_hit" && fields.at("source") != "coco" && completed.fetch_add(1) == 1)
+   independent.set_value();
  };
  ProgressReporter progress({}, trace);
  const auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
@@ -4222,23 +4222,26 @@ TEST_CASE("sixteen-descriptor annotation admission protects HTTP before independ
   cancelled.store(true);
   blocked = {};
  });
- mmltk::testsupport::await_test_promise(downloaded, "COCO HTTP while independent Objects365 lifecycle is contended", 5s);
- CHECK(file_bytes(raw) == payload);
+ const auto deadline = download ? 5s : 2s;
+ mmltk::testsupport::await_test_promise(independent, download ? "COCO HTTP while independent Objects365 lifecycle is contended" : "supplemental metadata while COCO lifecycle is locked", deadline);
+ if (download) CHECK(file_bytes(raw) == payload);
  CHECK(work.wait_for(0ms) == std::future_status::timeout);
  blocked = {};
- const auto result = mmltk::testsupport::await_test_future(work, "sixteen-descriptor annotation settlement", 5s);
+ const auto result = mmltk::testsupport::await_test_future(work, "independent custom metadata settlement", deadline);
  REQUIRE(result.coco_train);
  REQUIRE(result.coco_val);
  REQUIRE(result.objects);
  REQUIRE(result.open_images);
- CHECK(result.coco_val->image_count() == 1);
- CHECK(read_json_file((local.cache.source_indexes("coco") / "val2017.normalized.bin").string() + ".complete.json").at("complete") == true);
- CHECK(execution.try_reserve({0, 16}).has_value());
- const auto warm = prepare_custom_recipe(config, local.cache, catalog, progress, 1, cancellation, {}, {}, &execution);
- CHECK(warm.coco_indexes_cache_hit);
- CHECK(server.requests() == 1);
- CHECK(execution.try_reserve({0, 16}).has_value());
- server.Check();
+ CHECK(execution.try_reserve({0, descriptors}).has_value());
+ if (download) {
+  CHECK(result.coco_val->image_count() == 1);
+  CHECK(read_json_file((local.cache.source_indexes("coco") / "val2017.normalized.bin").string() + ".complete.json").at("complete") == true);
+  const auto warm = prepare_custom_recipe(config, local.cache, catalog, progress, 1, cancellation, {}, {}, &execution);
+  CHECK(warm.coco_indexes_cache_hit);
+  CHECK(server->requests() == 1);
+  CHECK(execution.try_reserve({0, descriptors}).has_value());
+  server->Check();
+ }
 }
 TEST_CASE("COCONut annotation artifacts enter independently inside one release lifecycle", "[benchmark][coconut][pipeline]") {
  using namespace std::chrono_literals;
@@ -5497,15 +5500,7 @@ TEST_CASE("a live Parquet normalizer lends actual workspace to pixels on one CPU
  ScopedTempDir root("parquet-normalizer-pixels");
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13});
  const auto images = root.path() / "images";
- prepare_cached_image_directory(images);
- const std::array<std::uint32_t, 1> pixels{1};
- const auto encoded = png(1, 1, pixels);
- BenchmarkEncodedImage::publish(cached_image_path(images, 7), {reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size()}, {});
- PreparedBenchmarkSplit split;
- split.name = "train";
- split.class_names = {"person"};
- split.sources = {{images}};
- split.images = {{7, 1, 1, 0, 0, 0}};
+ auto [split, encoded] = cached_mask_pixel_fixture(images);
  BenchmarkWriteRequest output{.split = split, .output_path = root.path() / "pixels.bin", .resolution = 1, .num_workers = 1, .execution = &execution};
  BenchmarkSplitWriter writer(output);
  BenchmarkCompilePipeline::Attempt attempt(execution);
@@ -5866,11 +5861,8 @@ TEST_CASE("panoptic JSON publishes physical facts before unrelated envelope tail
  catalog.releases.push_back({CoconutEdition::Large, "fixture-large", "fixture-v1", 1, {}});
  catalog.images.push_back(
   {CoconutImageNamespace::Objects365V2, 32, "patch-32", {"physical", "unused", archive.filename().string(), std::filesystem::file_size(archive), "", BenchmarkDatasetSource::kObjects365V2}});
- auto admitted = local_physical_archives(cache, catalog);
- std::atomic<bool> cancelled{false};
- const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13}, cancellation);
- CoconutPhysicalMembership physical(admitted, catalog, true, cache, execution.storage(), execution, cancellation);
+ PhysicalMembershipFixture fixture(cache, catalog);
+ auto& [admitted, cancelled, cancellation, execution, physical] = fixture;
  const auto image_root = cache.source_images("objects365") / "patch-32";
  PreparedBenchmarkSplit split;
  split.name = "train";
@@ -5937,15 +5929,9 @@ TEST_CASE("consecutive Parquet groups retain compressed physical progress with b
   rows.push_back(hf_row(id, encoded, Json::array({segment(9, 200, false), segment()})));
  }
  tar(archive, members);
- CoconutRecipeCatalog catalog;
- catalog.releases.push_back({CoconutEdition::Base, "fixture-base", "fixture-v1", 4, {}});
- catalog.images.push_back(
-  {CoconutImageNamespace::CocoTrain, 0, "train2017", {"physical", "unused", archive.filename().string(), std::filesystem::file_size(archive), "", BenchmarkDatasetSource::kCoco2017}});
- auto admitted = local_physical_archives(cache, catalog);
- std::atomic<bool> cancelled{false};
- const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13}, cancellation);
- CoconutPhysicalMembership physical(admitted, catalog, true, cache, execution.storage(), execution, cancellation);
+ const auto catalog = base_physical_catalog(archive, 4);
+ PhysicalMembershipFixture fixture(cache, catalog);
+ auto& [admitted, cancelled, cancellation, execution, physical] = fixture;
  const auto images = cache.source_images("coco") / "train2017";
  PreparedBenchmarkSplit split;
  split.name = "train";
@@ -6093,15 +6079,9 @@ TEST_CASE("repeated warm Parquet membership owns transient physical workspace wi
   members.emplace_back(coco(id).member, jpeg);
  }
  tar(archive, members);
- CoconutRecipeCatalog catalog;
- catalog.releases.push_back({CoconutEdition::Base, "fixture-base", "fixture-v1", 4, {}});
- catalog.images.push_back(
-  {CoconutImageNamespace::CocoTrain, 0, "train2017", {"physical", "unused", archive.filename().string(), std::filesystem::file_size(archive), "", BenchmarkDatasetSource::kCoco2017}});
- auto admitted = local_physical_archives(cache, catalog);
- std::atomic<bool> cancelled{false};
- const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13}, cancellation);
- CoconutPhysicalMembership physical(admitted, catalog, true, cache, execution.storage(), execution, cancellation);
+ const auto catalog = base_physical_catalog(archive, 4);
+ PhysicalMembershipFixture fixture(cache, catalog);
+ auto& [admitted, cancelled, cancellation, execution, physical] = fixture;
  const auto resources = physical.input_requirement(CoconutEdition::Base);
  REQUIRE(resources.lease_controls().retained_handles);
  const std::array paths{root.path() / "records.parquet"};
@@ -6575,11 +6555,8 @@ TEST_CASE("a Parquet group joins native recovery while final labels remain held"
  std::erase_if(catalog.images, [](const auto& image) { return image.source != CoconutImageNamespace::CocoTrain; });
  const std::array<std::pair<std::string, std::string>, 3> members{{{coco(7).member, white_jpeg(1, 1)}, {coco(10).member, white_jpeg(1, 1)}, {coco(11).member, white_jpeg(1, 1)}}};
  replace_physical_images(local.cache, catalog, CoconutImageNamespace::CocoTrain, members);
- auto admitted = local_physical_archives(local.cache, catalog);
- std::atomic<bool> cancelled{false};
- const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 13}, cancellation);
- CoconutPhysicalMembership physical(admitted, catalog, true, local.cache, execution.storage(), execution, cancellation);
+ PhysicalMembershipFixture fixture(local.cache, catalog, 1);
+ auto& [admitted, cancelled, cancellation, execution, physical] = fixture;
  // Only the first image has a label. Its oversized target run supplies a real
  // conversion failure after native normalization succeeds in the failure case.
  execution.label_configuration(fail_labels ? 65536 : 1, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
@@ -7051,11 +7028,8 @@ TEST_CASE("recovery batches publish independent labels before withheld geometry"
   rows.push_back(hf_row(id, png(1, 1, foreground), Json::array({segment()}), 1, 1));
  }
  replace_physical_images(local.cache, catalog, CoconutImageNamespace::CocoTrain, members);
- auto admitted = local_physical_archives(local.cache, catalog);
- std::atomic<bool> cancelled{false};
- const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 13}, cancellation);
- CoconutPhysicalMembership physical(admitted, catalog, true, local.cache, execution.storage(), execution, cancellation);
+ PhysicalMembershipFixture fixture(local.cache, catalog, 1);
+ auto& [admitted, cancelled, cancellation, execution, physical] = fixture;
  std::map<std::uint64_t, unsigned> conversions;
  execution.label_configuration(1, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto id, const auto&) { ++conversions[id]; });
  const auto images = local.cache.source_images("coco") / "train2017";
@@ -7369,8 +7343,7 @@ TEST_CASE("validation places its final metadata while a training release remains
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, choice}, true);
  auto catalog = local.selected(choice);
  compile_benchmark_recipe(config, &catalog);
- const auto train = file_bytes(local.output / "train.bin"), validation = file_bytes(local.output / "val.bin");
- const auto manifest = file_bytes(local.output / "benchmark_manifest.json");
+ const auto [train, validation, manifest] = capture_publication_bytes(local.output);
  mmltk::testsupport::TestGate training("training release mask owner");
  std::atomic<bool> cancelled{false};
  std::atomic<unsigned> placements{0};

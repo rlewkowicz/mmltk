@@ -484,6 +484,8 @@ struct BenchmarkCompilePipeline::Impl {
   explicit ImageState(Impl& execution) : execution_(execution) {}
   Source& source(const std::filesystem::path&);
   [[nodiscard]] const Source* find(const std::filesystem::path&) const;
+  // Caller holds the execution mutex; a current image need not have geometry yet.
+  [[nodiscard]] const Image* find_image(const std::filesystem::path&, std::uint64_t) const;
   void register_split(BenchmarkSplitWriter&, const PreparedBenchmarkSplit&, std::size_t);
   void admit(Slot&, bool independent);
   void publish(Source&, std::uint64_t, BenchmarkSourceGeneration, BenchmarkSourcePublication, std::optional<std::pair<std::uint32_t, std::uint32_t>>, bool, std::uint64_t attempt,
@@ -641,6 +643,16 @@ struct BenchmarkCompilePipeline::Impl {
   if (failure) std::rethrow_exception(failure);
   throw_if_benchmark_cancelled(cancellation);
   if (stopping) throw std::logic_error("benchmark admission after shutdown");
+ }
+ void wait_resources(std::unique_lock<std::mutex>& lock, BenchmarkResources resources, const BenchmarkAllowance& parent) {
+  if (parent.credits_ && parent.credits_->owner != admission) throw std::invalid_argument("benchmark parent allowance belongs to another compile");
+  admission->require(resources);
+  for (;;) {
+   check_admission();
+   if (admission->fits(resources, parent.credits_.get())) return;
+   Admission::Waiter waiter(*admission, true);
+   wait(lock, [&] { return stopping || failure || cancellation.requested() || admission->fits(resources, parent.credits_.get()); });
+  }
  }
  void push(Job& job) {
   ready[static_cast<std::size_t>(job.stage)].push(job);
@@ -1216,16 +1228,9 @@ std::optional<BenchmarkAllowance> BenchmarkCompilePipeline::try_reserve(Benchmar
 BenchmarkAllowance BenchmarkCompilePipeline::reserve(BenchmarkResources resources, const BenchmarkAllowance& parent) {
  const auto* frame = Impl::Frame::current;
  if (frame && &frame->owner == impl_.get()) throw std::logic_error("benchmark CPU lane cannot wait for resource credits");
- auto& ledger = *impl_->admission;
- if (parent.credits_ && parent.credits_->owner != impl_->admission) throw std::invalid_argument("benchmark parent allowance belongs to another compile");
- ledger.require(resources);
  std::unique_lock lock(impl_->mutex);
- for (;;) {
-  impl_->check_admission();
-  if (ledger.fits(resources, parent.credits_.get())) return impl_->charge(resources, parent);
-  Admission::Waiter waiter(ledger, true);
-  impl_->wait(lock, [&] { return impl_->stopping || impl_->failure || impl_->cancellation.requested() || ledger.fits(resources, parent.credits_.get()); });
- }
+ impl_->wait_resources(lock, resources, parent);
+ return impl_->charge(resources, parent);
 }
 std::pair<std::size_t, BenchmarkAllowance> BenchmarkCompilePipeline::reserve_transfers(std::size_t requested, BenchmarkTransferEnvelope envelope, const BenchmarkAllowance& parent) {
  if (!requested || !envelope.per_transfer.descriptors) throw std::invalid_argument("benchmark transfer admission requires positive concurrency and descriptor demand");
@@ -1236,23 +1241,15 @@ std::pair<std::size_t, BenchmarkAllowance> BenchmarkCompilePipeline::reserve_tra
  const auto per_connection = envelope.per_transfer.bytes;
  const auto fixed_bytes = envelope.fixed.bytes;
  auto& ledger = *impl_->admission;
- if (parent.credits_ && parent.credits_->owner != impl_->admission) throw std::invalid_argument("benchmark parent allowance belongs to another compile");
  const auto minimum = demand(1);
- ledger.require(minimum);
  std::unique_lock lock(impl_->mutex);
- for (;;) {
-  impl_->check_admission();
-  if (ledger.fits(minimum, parent.credits_.get())) {
-   auto count = std::min(requested, (ledger.descriptor_room(minimum, parent.credits_.get()) - fixed_descriptors) / envelope.per_transfer.descriptors);
-   if (per_connection && fixed_bytes < ledger.target && ledger.bytes <= ledger.target - fixed_bytes)
-    count = std::min(count, std::max<std::size_t>(1, (ledger.target - fixed_bytes - ledger.bytes) / per_connection));
-   else
-    count = 1;
-   return {count, impl_->charge(demand(count), parent)};
-  }
-  Admission::Waiter waiter(ledger, true);
-  impl_->wait(lock, [&] { return impl_->stopping || impl_->failure || impl_->cancellation.requested() || ledger.fits(minimum, parent.credits_.get()); });
- }
+ impl_->wait_resources(lock, minimum, parent);
+ auto count = std::min(requested, (ledger.descriptor_room(minimum, parent.credits_.get()) - fixed_descriptors) / envelope.per_transfer.descriptors);
+ if (per_connection && fixed_bytes < ledger.target && ledger.bytes <= ledger.target - fixed_bytes)
+  count = std::min(count, std::max<std::size_t>(1, (ledger.target - fixed_bytes - ledger.bytes) / per_connection));
+ else
+  count = 1;
+ return {count, impl_->charge(demand(count), parent)};
 }
 void BenchmarkCompilePipeline::run(BenchmarkStage stage, BenchmarkResources resources, const std::function<void(std::size_t)>& callback, BenchmarkAllowance allowance) {
  if (allowance.credits_ && allowance.credits_->owner != impl_->admission) throw std::invalid_argument("benchmark allowance belongs to another compile");
@@ -1675,11 +1672,16 @@ void BenchmarkCompilePipeline::Impl::ImageState::geometry_ready(Source& source, 
 }
 std::optional<BenchmarkImageGeometry> BenchmarkCompilePipeline::Impl::ImageState::geometry(const std::filesystem::path& root, std::uint64_t id) const {
  const std::lock_guard lock(execution_.mutex);
+ const auto* image = find_image(root, id);
+ if (!image || !image->width) return std::nullopt;
+ return BenchmarkImageGeometry{image->source->root, id, image->generation, image->width, image->height};
+}
+const BenchmarkCompilePipeline::Impl::Image* BenchmarkCompilePipeline::Impl::ImageState::find_image(const std::filesystem::path& root, std::uint64_t id) const {
  const auto* source = find(root);
- if (!source || source->retiring) return std::nullopt;
+ if (!source || source->retiring) return nullptr;
  const auto found = source->geometry.find(id);
- if (found == source->geometry.end() || !found->second.width || found->second.generation != source->image_generation(id)) return std::nullopt;
- return BenchmarkImageGeometry{source->root, id, found->second.generation, found->second.width, found->second.height};
+ if (found == source->geometry.end() || found->second.generation != source->image_generation(id)) return nullptr;
+ return &found->second;
 }
 void BenchmarkCompilePipeline::Impl::ImageState::publish(Source& source, std::uint64_t id, BenchmarkSourceGeneration generation, BenchmarkSourcePublication publication,
  std::optional<std::pair<std::uint32_t, std::uint32_t>> dimensions, bool defer_pixels, std::uint64_t attempt, std::shared_ptr<const BenchmarkEncodedImage> payload) {
@@ -1804,11 +1806,8 @@ void BenchmarkCompilePipeline::label_configuration(
 }
 std::shared_ptr<const BenchmarkLabelChunk> BenchmarkCompilePipeline::image_labels(const std::filesystem::path& root, std::uint64_t id, std::string_view dependency) const {
  const std::lock_guard lock(impl_->mutex);
- const auto* source = impl_->images.find(root);
- if (!source || source->retiring) return {};
- const auto found = source->geometry.find(id);
- if (found == source->geometry.end() || found->second.generation != source->image_generation(id)) return {};
- const auto* label = found->second.find_labels(dependency);
+ const auto* image = impl_->images.find_image(root, id);
+ const auto* label = image ? image->find_labels(dependency) : nullptr;
  return label && !label->retired ? label->product : nullptr;
 }
 bool BenchmarkCompilePipeline::has_image_labels(const std::filesystem::path& root, std::uint64_t id, std::string_view dependency, std::uint64_t original_generation) const {
@@ -1863,11 +1862,8 @@ void BenchmarkCompilePipeline::geometry_ready(const BenchmarkImageGeometry& fact
 }
 std::shared_ptr<const BenchmarkEncodedImage> BenchmarkCompilePipeline::image_input(const std::filesystem::path& root, std::uint64_t id) const {
  const std::lock_guard lock(impl_->mutex);
- const auto* source = impl_->images.find(root);
- if (!source || source->retiring) return {};
- const auto found = source->geometry.find(id);
- if (found == source->geometry.end() || found->second.generation != source->image_generation(id)) return {};
- return found->second.input;
+ const auto* image = impl_->images.find_image(root, id);
+ return image ? image->input : nullptr;
 }
 std::optional<BenchmarkImageGeometry> BenchmarkCompilePipeline::geometry(const std::filesystem::path& root, std::uint64_t id) const { return impl_->images.geometry(root, id); }
 struct BenchmarkSourcePublication::State {

@@ -1,4 +1,5 @@
 #pragma once
+#include "src/common/io/file_memory.h"
 #include <filesystem>
 #include <cstdint>
 #include <functional>
@@ -7,6 +8,12 @@
 #include <string>
 #include <string_view>
 namespace mmltk::testsupport {
+struct FileLockProbe {
+ mmltk::common::io::FileHandle descriptor;
+ bool available;
+};
+// Retain the opened inode and any acquired lock until the caller retires the probe.
+[[nodiscard]] FileLockProbe probe_file_lock(const std::filesystem::path& path);
 [[nodiscard]] std::filesystem::path make_temp_root(const char* name_prefix);
 void write_text_file(const std::filesystem::path& path, std::string_view contents);
 void write_text_file(const std::filesystem::path& path, std::function_ref<void(std::ostream&)> write_contents);

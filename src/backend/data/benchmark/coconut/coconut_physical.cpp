@@ -34,21 +34,6 @@ std::uint64_t decimal(std::string_view value) {
  if (value.empty() || error != std::errc{} || end != value.data() + value.size() || value.front() == '+' || value.front() == '-') invalid("invalid decimal image identity: " + std::string(value));
  return id;
 }
-// Discovery records numeric candidates without admitting unused payloads. Exact
-// spelling, namespace, path, type and bytes are checked at their consumed join.
-[[nodiscard]] std::optional<std::uint64_t> physical_candidate_id(const std::string_view path) {
- const std::size_t slash = path.find_last_of('/');
- std::string_view filename = path.substr(slash == std::string_view::npos ? 0U : slash + 1U);
- const std::size_t dot = filename.find_last_of('.');
- if (dot != std::string_view::npos) { filename = filename.substr(0U, dot); }
- const std::size_t underscore = filename.find_last_of('_');
- const std::string_view digits = filename.substr(underscore == std::string_view::npos ? 0U : underscore + 1U);
- if (digits.empty()) { return std::nullopt; }
- std::uint64_t image_id = 0U;
- const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), image_id);
- if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size()) { return std::nullopt; }
- return image_id;
-}
 std::optional<CoconutPhysicalName> admit_record(CoconutEdition edition, const CoconutRecord& record) {
  if (edition == CoconutEdition::Base || edition == CoconutEdition::RelabeledValidation) {
   if (parse_coconut_coco_member(record.file_name) != record.image_id) invalid("COCO row filename/image_id mismatch: " + record.file_name);
@@ -268,7 +253,7 @@ struct CoconutPhysicalMembership::Impl {
       }
       while (!located && reader.next(cancellation)) {
        if (!reader.member().ends_with(".jpg")) continue;
-       const auto id = physical_candidate_id(reader.member());
+       const auto id = benchmark_archive_image_candidate(reader.member());
        if (!id) continue;
        const auto [entry, inserted] = source.members.emplace(*id, PhysicalRoute{&archive, reader.member_position(), reader.position()});
        if (!inserted && (entry->second.archive != &archive || entry->second.position != reader.position())) entry->second.conflict = true;
@@ -334,6 +319,7 @@ const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespac
 CoconutPhysicalImage CoconutPhysicalMembership::resolve(CoconutEdition edition, std::string_view identity, const CoconutRecord& record, const BenchmarkAllowance& parent) const {
  return impl_->resolve(edition, identity, record, parent);
 }
+// CLEANUP-IGNORE: Requirement and publication queries share only guard/lookup/lock setup; their returned facts and admission operations differ.
 CoconutPhysicalInputRequirement CoconutPhysicalMembership::input_requirement(CoconutEdition edition) const {
  if (!impl_->execution) return {};
  auto& state = impl_->releases.at(edition);

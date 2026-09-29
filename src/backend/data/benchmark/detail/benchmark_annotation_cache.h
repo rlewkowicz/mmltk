@@ -86,6 +86,7 @@ private:
  void build_split(bool training, const std::string&, ProgressReporter&);
  void invalidate_missing();
  void warn_unavailable(ProgressReporter&);
+ void settle_missing_splits();
  [[nodiscard]] std::filesystem::path source_json(bool training) const;
  const BenchmarkCacheLayout& cache_;
  DownloadRequest request_;

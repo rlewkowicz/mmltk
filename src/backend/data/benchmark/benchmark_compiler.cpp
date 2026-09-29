@@ -110,19 +110,6 @@ struct TracePath final {
  }
  return parent_iterator == parent.end();
 }
-[[nodiscard]] std::optional<std::uint64_t> parse_archive_image_id(const std::string_view path) {
- const std::size_t slash = path.find_last_of('/');
- std::string_view filename = path.substr(slash == std::string_view::npos ? 0U : slash + 1U);
- const std::size_t dot = filename.find_last_of('.');
- if (dot != std::string_view::npos) { filename = filename.substr(0U, dot); }
- const std::size_t underscore = filename.find_last_of('_');
- const std::string_view digits = filename.substr(underscore == std::string_view::npos ? 0U : underscore + 1U);
- if (digits.empty()) { return std::nullopt; }
- std::uint64_t image_id = 0U;
- const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), image_id);
- if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size()) { return std::nullopt; }
- return image_id;
-}
 void acquire_physical_archive(AdmittedRecipeArchive& admitted, const BenchmarkCacheLayout& cache, ProgressReporter& progress, ArtifactProgressTotals& totals, StorageReservationPool& storage,
  std::size_t workers, common_concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, std::string_view recovery_reason = {}, BenchmarkCompilePipeline* execution = nullptr,
  const BenchmarkAllowance& parent = {}) {
@@ -253,7 +240,7 @@ public:
     .source = source_name,
     .shard = shard,
     .selected_image_ids = expected_ids,
-    .image_id_parser = member_parser ? member_parser : ArchiveImageIdParser{parse_archive_image_id},
+    .image_id_parser = member_parser ? member_parser : ArchiveImageIdParser{benchmark_archive_image_candidate},
     .cancel_requested = cancel_requested,
     .progress =
      [&](const std::uint64_t completed, const std::uint64_t) {

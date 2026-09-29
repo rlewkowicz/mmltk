@@ -202,30 +202,17 @@ private:
     }
     finished_.notify_one();
    }
-  } catch (...) {
-   {
-    const std::lock_guard lock(mutex_);
-    if (active) --active_;
-    if (!failure_) failure_ = std::current_exception();
-    stopping_ = true;
-    tasks_.clear();
-   }
-   pending_.notify_all();
-   {
-    const std::lock_guard buffer_lock(buffers_->mutex);
-    buffers_->stopped = true;
-   }
-   buffers_->available.notify_all();
-   finished_.notify_all();
-  }
+  } catch (...) { stop_pending(std::current_exception(), active); }
  }
  void rethrow_failure_locked() const {
   if (failure_) { std::rethrow_exception(failure_); }
  }
  void join() noexcept { workers_.reset(); }
- void stop() noexcept {
+ void stop_pending(std::exception_ptr failure = {}, bool active = false) noexcept {
   {
    const std::lock_guard lock(mutex_);
+   if (active) --active_;
+   if (failure && !failure_) failure_ = std::move(failure);
    stopping_ = true;
    tasks_.clear();
   }
@@ -236,6 +223,9 @@ private:
   }
   buffers_->available.notify_all();
   finished_.notify_all();
+ }
+ void stop() noexcept {
+  stop_pending();
   join();
  }
  std::filesystem::path output_root_;

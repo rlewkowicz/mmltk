@@ -4,8 +4,18 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <utility>
+#include <fcntl.h>
+#include <sys/file.h>
 #include "src/common/io/file_memory.h"
 namespace mmltk::testsupport {
+FileLockProbe probe_file_lock(const std::filesystem::path& path) {
+ mmltk::common::io::FileHandle descriptor(::open(path.c_str(), O_RDWR | O_CLOEXEC));
+ if (descriptor.get() < 0) throw mmltk::common::io::errno_error("cannot open file lock probe", path.string());
+ const bool available = ::flock(descriptor.get(), LOCK_EX | LOCK_NB) == 0;
+ if (!available && errno != EWOULDBLOCK && errno != EAGAIN) throw mmltk::common::io::errno_error("cannot probe file lock", path.string());
+ return {std::move(descriptor), available};
+}
 std::filesystem::path make_temp_root(const char* const name_prefix) {
  std::string pattern = (std::filesystem::temp_directory_path() / (std::string{name_prefix} + ".XXXXXX")).string();
  const char* const created = ::mkdtemp(pattern.data());

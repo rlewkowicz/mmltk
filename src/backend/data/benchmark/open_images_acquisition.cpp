@@ -254,9 +254,10 @@ private:
  void rethrow_failure_locked() const {
   if (failure_) std::rethrow_exception(failure_);
  }
- void stop() noexcept {
+ void stop_pending(std::exception_ptr failure = {}) noexcept {
   {
    const std::lock_guard lock(mutex_);
+   if (failure && !failure_) failure_ = std::move(failure);
    stopping_ = true;
    tasks_.clear();
    warm_tasks_.clear();
@@ -264,6 +265,9 @@ private:
    results_.clear();
   }
   pending_.notify_all();
+ }
+ void stop() noexcept {
+  stop_pending();
   workers_.reset();
  }
  void run(std::size_t lane) noexcept {
@@ -293,16 +297,7 @@ private:
     if (wake_) wake_();
    }
   } catch (...) {
-   {
-    const std::lock_guard lock(mutex_);
-    if (!failure_) failure_ = std::current_exception();
-    stopping_ = true;
-    tasks_.clear();
-    warm_tasks_.clear();
-    deferred_.clear();
-    results_.clear();
-   }
-   pending_.notify_all();
+   stop_pending(std::current_exception());
    if (wake_) wake_();
   }
  }
@@ -799,7 +794,10 @@ class OpenImagesAcquisition final {
    control = std::move(*value);
   }
   auto lease = ArtifactLease::try_acquire_charged(cache.locks / ("open-images-" + name + ".images.lock"), cancellation, std::move(control));
-  if (!lease) return GroupAdmission::Locked;
+  if (!lease) {
+   locked_groups.push({begin, 1, Clock::now() + std::chrono::milliseconds{100}});
+   return GroupAdmission::Locked;
+  }
   auto group = std::make_unique<Group>();
   group->begin = begin;
   group->count = count;
@@ -830,7 +828,6 @@ class OpenImagesAcquisition final {
     waiting_groups.pop_front();
    }
    const auto result = admit_group(begin, pressure);
-   if (result == GroupAdmission::Locked) locked_groups.push({begin, 1, Clock::now() + std::chrono::milliseconds{100}});
    if (result != GroupAdmission::Capacity) continue;
    // Full groups have equal demand. The final short group is the sole possible
    // smaller candidate; try it directly without scanning all pending groups.
@@ -838,10 +835,7 @@ class OpenImagesAcquisition final {
     const auto tail = waiting_groups.back();
     waiting_groups.pop_back();
     const auto tail_result = admit_group(tail, pressure);
-    if (tail_result == GroupAdmission::Locked)
-     locked_groups.push({tail, 1, Clock::now() + std::chrono::milliseconds{100}});
-    else if (tail_result == GroupAdmission::Capacity)
-     waiting_groups.push_back(tail);
+    if (tail_result == GroupAdmission::Capacity) waiting_groups.push_back(tail);
    }
    waiting_groups.push_front(begin);
    break;

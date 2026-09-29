@@ -362,9 +362,7 @@ void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progr
   // newly built sibling must be read from these replacement bytes as well.
   if (!stream_error) withdraw_attempt();
  }
- pending_.reset();
- for (const bool training : {true, false})
-  if ((training ? selection_.train : selection_.validation) != CocoSplitAdmission::Unselected && !(training ? indexes_.train : indexes_.validation)) publish_split(training, true);
+ settle_missing_splits();
 }
 void CocoAnnotationCache::warn_unavailable(ProgressReporter& progress) {
  if (warned_unavailable_) return;
@@ -374,10 +372,13 @@ void CocoAnnotationCache::warn_unavailable(ProgressReporter& progress) {
 void CocoAnnotationCache::download_unavailable(const BenchmarkDownloadUnavailable& error, ProgressReporter& progress) {
  throw_if_benchmark_cancelled(cancellation_);
  if ((selection_.train == CocoSplitAdmission::Required && !indexes_.train) || (selection_.validation == CocoSplitAdmission::Required && !indexes_.validation)) throw error;
+ settle_missing_splits();
+ warn_unavailable(progress);
+}
+void CocoAnnotationCache::settle_missing_splits() {
  pending_.reset();
  for (const bool training : {true, false})
   if ((training ? selection_.train : selection_.validation) != CocoSplitAdmission::Unselected && !(training ? indexes_.train : indexes_.validation)) publish_split(training, true);
- warn_unavailable(progress);
 }
 CocoAnnotationIndexes CocoAnnotationCache::finish() {
  if (pending_ || (selection_.validation == CocoSplitAdmission::Required && !indexes_.validation) || (selection_.train == CocoSplitAdmission::Required && !indexes_.train))

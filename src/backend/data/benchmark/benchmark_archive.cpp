@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -93,6 +94,19 @@ std::string canonical_benchmark_archive_member(std::string_view raw) {
  for (const auto& part : path)
   if (part == "..") throw BenchmarkArchiveError("traversing archive member: " + std::string(raw));
  return path.lexically_normal().generic_string();
+}
+std::optional<std::uint64_t> benchmark_archive_image_candidate(std::string_view path) {
+ const std::size_t slash = path.find_last_of('/');
+ std::string_view filename = path.substr(slash == std::string_view::npos ? 0U : slash + 1U);
+ const std::size_t dot = filename.find_last_of('.');
+ if (dot != std::string_view::npos) filename = filename.substr(0U, dot);
+ const std::size_t underscore = filename.find_last_of('_');
+ const std::string_view digits = filename.substr(underscore == std::string_view::npos ? 0U : underscore + 1U);
+ if (digits.empty()) return std::nullopt;
+ std::uint64_t image_id = 0U;
+ const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), image_id);
+ if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size()) return std::nullopt;
+ return image_id;
 }
 struct BenchmarkArchive::Impl {
  struct Position {

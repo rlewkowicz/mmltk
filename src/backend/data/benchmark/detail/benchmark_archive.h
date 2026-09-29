@@ -87,4 +87,6 @@ private:
  std::unique_ptr<Impl> impl_;
 };
 [[nodiscard]] std::string canonical_benchmark_archive_member(std::string_view);
+// Discovery only: exact namespace, spelling and payload admission belong to the consumer.
+[[nodiscard]] std::optional<std::uint64_t> benchmark_archive_image_candidate(std::string_view);
 }  // namespace mmltk::backend::data::benchmark_internal
