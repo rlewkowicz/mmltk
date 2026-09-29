@@ -38,6 +38,8 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <tuple>
+#include "src/test_support/async_test_utils.hpp"
 #include <limits>
 #include <latch>
 #include <memory>
@@ -53,6 +55,7 @@
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "src/test_support/cuda_test_utils.hpp"
+#include "src/test_support/cuda_test_gate.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
@@ -83,6 +86,12 @@ import mmltk.common.logging.mmltk_logging;
 namespace mmltk::backend::models::rfdetr::test_support {
 struct TargetScratchTestAccess final {
  static void BeforeStagingWait(TargetScratch& owner, decltype(&cudaEventSynchronize) wait) { owner.staging_wait_ = wait; }
+ static auto CopyState(const TargetScratch& owner) {
+  return std::tuple{owner.active_staging_slot_, owner.device_slots_used_, owner.consumers_pending_, owner.staging_slots_[owner.active_staging_slot_].consumers_pending};
+ }
+ static cudaError_t ConsumerStatus(const TargetScratch& owner, std::size_t slot) {
+  return cudaEventQuery(reinterpret_cast<cudaEvent_t>(owner.staging_slots_.at(slot).consumers_retired_event));
+ }
 };
 struct GpuBatchAugmenterTestAccess final {
  static inline std::size_t image_uploads = 0, metadata_uploads = 0, image_bytes = 0;
@@ -2118,6 +2127,8 @@ TEST_CASE("training excludes crowds and retains continuous targets with known em
 TEST_CASE("Production Match-Free masks retain AMP accumulation gradients and current state", "[rfdetr][training_supervision][cuda]") {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; segmentation training remains unverified");
  mmltk::backend::ml::testsupport::FullMatrixPrecision precision;
+ rfdetr::testsupport::MatcherExecutionFixture fixture;
+ rfdetr::ScopedRuntimeContext runtime(nullptr, 0, &fixture.workspace);
  const auto floats = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
  const auto integers = floats.dtype(torch::kInt64);
  for (const int mode : {0, 1, 2, 3, 4})
@@ -2651,7 +2662,6 @@ TEST_CASE("Target slots prime independent uploads and protect delayed backward i
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; target overlap unexecuted");
  c10::cuda::CUDAGuard device_guard(0);
  const auto consumer = c10::cuda::getStreamFromPool(false, 0);
- const auto releaser = c10::cuda::getStreamFromPool(false, 0);
  const auto second_consumer = c10::cuda::getStreamFromPool(false, 0);
  rfdetr::TrainRequest request;
  request.grad_accum_steps = 1;
@@ -2663,34 +2673,59 @@ TEST_CASE("Target slots prime independent uploads and protect delayed backward i
  std::array<data::PackedInstance, 1> annotations{data::PackedInstance{0, 0, 1, 1, 5, 5, 0, 0}};
  const data::Batch batch{.num_images = 1, .label_index = entries.data(), .labels = annotations.data(), .image_indices = identities.data()};
  const auto build = [&] { return rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 8, {}, 1); };
+ // Prime both pinned/device destinations before the overlap hold. CUDA's
+ // first-use host allocation may synchronize otherwise independent streams.
+ for (unsigned slot = 0; slot < 2; ++slot) {
+  const auto targets = build();
+  scratch.wait_for_pending_copy();
+  rfdetr::TargetConsumerLease lease(scratch, targets, 0);
+  lease.handoff();
+ }
  auto first = build();
  scratch.wait_for_pending_copy();
  const auto initial = first.all_boxes.cpu();
  const auto* first_storage = first.all_boxes.data_ptr();
- auto gate = torch::zeros({1}, torch::TensorOptions().device(torch::kCUDA).dtype(torch::kInt32));
+ mmltk::testsupport::CudaTestGate gate;
  auto input = torch::ones({1, 4}, torch::TensorOptions().device(torch::kCUDA)).set_requires_grad(true);
+ // CUDA may materialize a kernel synchronously on its first launch. Complete
+ // this exact backward path before deliberately blocking a consumer stream.
+ (input * first.all_boxes).sum().backward();
+ input.mutable_grad() = torch::Tensor{};
  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
- struct ReleaseGate {
-  torch::Tensor word;
-  cudaStream_t stream;
-  ~ReleaseGate() {
-   (void)cuStreamWriteValue32(reinterpret_cast<CUstream>(stream), reinterpret_cast<CUdeviceptr>(word.data_ptr()), 1U, CU_STREAM_WRITE_VALUE_DEFAULT);
-   (void)cudaStreamSynchronize(stream);
-  }
- } release_gate{gate, releaser.stream()};
+ REQUIRE(rfdetr::test_support::TargetScratchTestAccess::ConsumerStatus(scratch, 0) == cudaSuccess);
+ REQUIRE(rfdetr::test_support::TargetScratchTestAccess::ConsumerStatus(scratch, 1) == cudaSuccess);
  {
   c10::cuda::CUDAStreamGuard guard(consumer);
   rfdetr::TargetConsumerLease lease(scratch, first, 0);
   lease.handoff();
-  REQUIRE(cuStreamWaitValue32(reinterpret_cast<CUstream>(consumer.stream()), reinterpret_cast<CUdeviceptr>(gate.data_ptr()), 1U, CU_STREAM_WAIT_VALUE_EQ) == CUDA_SUCCESS);
+  gate.hold(consumer.stream());
   (input * first.all_boxes).sum().backward();
   lease.retire();
  }
  annotations[0].bbox_x2 = 7;
+ const auto copy_stream = reinterpret_cast<cudaStream_t>(scratch.copy_stream_handle());
+ const auto ambient_stream = c10::cuda::getCurrentCUDAStream(0).stream();
+ const auto prior_copy_status = cudaStreamQuery(copy_stream);
+ const auto available_slot_status = rfdetr::test_support::TargetScratchTestAccess::ConsumerStatus(scratch, 1);
  auto second = build();
  REQUIRE(second.all_boxes.data_ptr() != first_storage);
  // The second slot's DMA physically completes while backward still holds slot 0.
- scratch.wait_for_pending_copy();
+ const auto copy_state = rfdetr::test_support::TargetScratchTestAccess::CopyState(scratch);
+ CAPTURE(prior_copy_status, available_slot_status, std::get<0>(copy_state), std::get<1>(copy_state), std::get<2>(copy_state), std::get<3>(copy_state), copy_stream, ambient_stream, consumer.stream(), cudaStreamQuery(copy_stream));
+ std::atomic<unsigned> wait_stage{0};
+ auto pending_copy = std::async(std::launch::async, [&] {
+  wait_stage.store(1);
+  c10::cuda::CUDAGuard guard(0);
+  wait_stage.store(2);
+  scratch.wait_for_pending_copy();
+  wait_stage.store(3);
+ });
+ const mmltk::testsupport::ScopedTestCleanup release_pending([&] { gate.release(); });
+ const bool independent_copy = pending_copy.wait_for(std::chrono::seconds{10}) == std::future_status::ready;
+ CAPTURE(wait_stage.load(), cudaStreamQuery(copy_stream));
+ if (!independent_copy) gate.release();
+ pending_copy.get();
+ REQUIRE(independent_copy);
  REQUIRE(second.all_boxes.cpu()[0][2].item<float>() == .75F);
  {
   c10::cuda::CUDAStreamGuard guard(second_consumer);
@@ -2700,7 +2735,7 @@ TEST_CASE("Target slots prime independent uploads and protect delayed backward i
  }
  auto third = build();
  REQUIRE(third.all_boxes.data_ptr() == first_storage);
- REQUIRE(cuStreamWriteValue32(reinterpret_cast<CUstream>(releaser.stream()), reinterpret_cast<CUdeviceptr>(gate.data_ptr()), 1U, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS);
+ gate.release();
  scratch.wait_for_pending_copy();
  REQUIRE(cudaStreamSynchronize(consumer.stream()) == cudaSuccess);
  REQUIRE(torch::equal(input.grad().cpu(), initial));

@@ -83,7 +83,7 @@ public:
 private:
  void publish_split(bool training, bool terminal);
  void withdraw_split(bool training);
- void build_split(bool training, const std::string&, ProgressReporter&);
+ void build_split(bool training, const std::string&, ProgressReporter&, const BenchmarkAllowance&);
  void invalidate_missing();
  void warn_unavailable(ProgressReporter&);
  void settle_missing_splits();

@@ -40,7 +40,7 @@ void validate_coconut_physical_image(const CoconutPhysicalImage&);
 class CoconutPhysicalInputRequirement final {
 public:
  CoconutPhysicalInputRequirement() = default;
- [[nodiscard]] static CoconutPhysicalInputRequirement archive(std::uint64_t workspace_bytes);
+ [[nodiscard]] static CoconutPhysicalInputRequirement archive(std::uint64_t workspace_bytes, std::size_t reader_descriptors = 2);
  [[nodiscard]] BenchmarkResources lease_controls() const noexcept { return lease_; }
  [[nodiscard]] std::uint64_t workspace_bytes() const noexcept { return workspace_bytes_; }
  [[nodiscard]] std::size_t continuation_descriptors() const noexcept { return lease_.descriptors + lease_.continuation_descriptors; }
@@ -100,7 +100,9 @@ public:
  // Invalidates affected routes/joins and their cached input requirement before
  // the compiler mutates the admitted artifact; independent readers survive.
  void withdraw(const AdmittedRecipeArchive&);
- [[nodiscard]] CoconutPhysicalImage resolve(CoconutEdition, std::string_view identity, const CoconutRecord&, const BenchmarkAllowance&) const;
+ // canonical_metadata means the allowance contains no live Arrow/PNG input;
+ // its unused physical workspace can return while the lifecycle lock waits.
+ [[nodiscard]] CoconutPhysicalImage resolve(CoconutEdition, std::string_view identity, const CoconutRecord&, const BenchmarkAllowance&, bool canonical_metadata = false) const;
  [[nodiscard]] BenchmarkSourcePublication label_publication(CoconutEdition, const CoconutPhysicalImage&) const;
  [[nodiscard]] const CoconutPhysicalImage* find(CoconutImageNamespace, std::uint64_t) const noexcept;
 

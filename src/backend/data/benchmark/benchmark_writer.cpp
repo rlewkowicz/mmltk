@@ -214,7 +214,7 @@ struct BenchmarkSplitWriter::Impl {
   return *value;
  }
  BenchmarkCompilePipeline* execution = nullptr;
- BenchmarkAllowance writer_handles;
+ BenchmarkAllowance writer_handles, directory_handles;
  std::mutex directory_mutex;
  common_io::FileHandle directory;
  std::uint16_t directory_source = std::numeric_limits<std::uint16_t>::max();
@@ -243,7 +243,7 @@ struct BenchmarkSplitWriter::Impl {
        perceptual(request.perceptual_downscale),
        stride(common_math::checked_cast<std::size_t>(static_cast<std::uint64_t>(resolution) * resolution * 3U * sizeof(float), "benchmark image stride overflow")) {
   execution = request.execution;
-  if (execution) writer_handles = execution->reserve(BenchmarkResources::handles(2));
+  if (execution) writer_handles = execution->reserve(BenchmarkResources::handles(1));
   if (resolution == 0 || resolution > MAX_IMAGE_EXTENT || images.empty() || sources.empty()) throw std::runtime_error("benchmark pixel membership is incomplete");
   layout = compute_pixel_layout(common_math::checked_cast<std::uint32_t>(images.size(), "benchmark image count overflow"), stride);
   (void)common_io::ensure_parent_directory(request.output_path);
@@ -279,7 +279,13 @@ struct BenchmarkSplitWriter::Impl {
 };
 BenchmarkSplitWriter::BenchmarkSplitWriter(const BenchmarkWriteRequest& request, bool actual) : impl_(std::make_unique<Impl>(request, actual)) {}
 BenchmarkSplitWriter::~BenchmarkSplitWriter() = default;
-void BenchmarkSplitWriter::retire_scratch(std::size_t lane) noexcept { impl_->scratch[lane].reset(); }
+void BenchmarkSplitWriter::retire_scratch(std::size_t lane) noexcept {
+ impl_->scratch[lane].reset();
+ const std::lock_guard lock(impl_->directory_mutex);
+ impl_->directory = {};
+ impl_->directory_source = std::numeric_limits<std::uint16_t>::max();
+ impl_->directory_handles = {};
+}
 void BenchmarkSplitWriter::prepare_lanes(std::size_t lanes) {
  while (impl_->scratch.size() < lanes) impl_->scratch.push_back(std::make_unique<Impl::Scratch>(impl_->perceptual));
 }
@@ -299,6 +305,12 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
     if (state.directory_source != image.source_index) {
      state.directory = {};
      state.directory_source = std::numeric_limits<std::uint16_t>::max();
+     state.directory_handles = {};
+     if (state.execution) {
+      auto granted = state.execution->try_reserve(BenchmarkResources::handles(1), allowance);
+      if (!granted) throw std::logic_error("benchmark image input lost its directory continuation");
+      state.directory_handles = std::move(*granted);
+     }
      const auto& root = state.sources.at(image.source_index).root;
      const int descriptor = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
      if (descriptor < 0) throw common_io::errno_error("cannot open cached benchmark image directory", root.string());
@@ -315,7 +327,7 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
     return scratch.decoder.read_header(encoded, state.actual_dimensions ? 0 : image.source_width, state.actual_dimensions ? 0 : image.source_height);
    };
    input->payload =
-    BenchmarkEncodedImage::open(std::move(file), image.source_image_id, header, state.cancellation, nullptr, std::move(allowance), input->payload, std::numeric_limits<std::uint32_t>::max());
+    BenchmarkEncodedImage::open(std::move(file), image.source_image_id, header, state.cancellation, nullptr, allowance, input->payload, std::numeric_limits<std::uint32_t>::max());
    if (!input->payload) throw std::runtime_error("cached benchmark image is missing or has an invalid size");
   }
   const auto& header = input->payload->header();
@@ -328,6 +340,9 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
    image.source_height = header.height;
    state.header_known[slot] = 1;
   }
+  // The mapping owns its inode after the local image file closes. The cached
+  // directory owns its separate child grant until reuse or scratch retirement.
+  allowance.retire_descriptors();
  } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
   throw_if_benchmark_cancelled(state.cancellation);
   throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what());

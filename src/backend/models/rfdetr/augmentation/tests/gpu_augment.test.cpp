@@ -1327,7 +1327,6 @@ TEST_CASE("Augmentation host staging retires before delayed pixel consumers", "[
  std::weak_ptr<AugmentationPixels> retained = pixels;
  GpuAugmentationExecutor executor(test_support::isolated_augmentation_config(), 1, 8, 8, execution.context, execution.retirement);
  Access::PixelGate gate;
- Access::HoldPixelsAfterDma(executor, gate);
  const std::array<std::uint32_t, 1> identities{0};
  const std::array<std::uint64_t, 1> keys{19};
  GpuAugmentationBatchView batch{
@@ -1339,6 +1338,11 @@ TEST_CASE("Augmentation host staging retires before delayed pixel consumers", "[
   .input_custody = pixels,
   .output_custody = pixels,
  };
+ // First-use CUDA kernel materialization can wait for active host callbacks.
+ // Settle that work before deliberately holding this stream's pixel consumer.
+ (void)executor.Run(batch, keys, {}, {}, pixels->stream, 0);
+ executor.Finish();
+ Access::HoldPixelsAfterDma(executor, gate);
  (void)executor.Run(batch, keys, {}, {}, pixels->stream, 0);
  batch.input_custody.reset();
  batch.output_custody.reset();

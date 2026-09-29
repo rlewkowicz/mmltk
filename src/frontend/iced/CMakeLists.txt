@@ -240,6 +240,9 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
         list(APPEND _mmltk_frontend_test_commands
             COMMAND "${CMAKE_COMMAND}" -E env
                 ${_mmltk_frontend_environment}
+                # Headless cases own independent Vulkan devices. Concurrent
+                # device teardown and submission can stall the NVIDIA driver.
+                "RUST_TEST_THREADS=1"
                 "${MMLTK_CARGO_EXECUTABLE}" test
                 --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
                 ${_mmltk_frontend_cargo_packages}

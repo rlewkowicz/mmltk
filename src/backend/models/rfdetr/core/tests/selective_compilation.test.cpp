@@ -223,6 +223,7 @@ TEST_CASE("Decoder SDPA preserves independent positional and target gradients in
  const tensor_fixture::FullMatrixPrecision precision;
  for (const auto& [device, dtype] : tensor_fixture::available_amp_precisions()) {
   for (const int64_t queries : {1, 3}) {
+   CAPTURE(device.str(), dtype, queries);
    AttentionPair pair(device);
    auto& actual = pair.actual;
    auto& oracle = pair.oracle;
@@ -258,7 +259,9 @@ TEST_CASE("Decoder SDPA preserves independent positional and target gradients in
    REQUIRE(torch::allclose(target.grad(), reference_target.grad(), 2e-2, 3e-3));
    REQUIRE(torch::allclose(position.grad(), reference_position.grad(), 2e-2, 3e-3));
    if (queries == 1) {
-    REQUIRE(position.grad().count_nonzero().item<int64_t>() == 0);
+    // Fused AMP backward can retain rounding residue in the cancelling Q/K
+    // derivatives. Use the same absolute bound as the dense gradient oracle.
+    REQUIRE(torch::allclose(position.grad(), torch::zeros_like(position.grad()), 0, 3e-3));
     REQUIRE(target.grad().abs().sum().item<float>() > 0.0F);
    }
    for (const auto& item : actual->named_parameters()) REQUIRE(torch::allclose(item.value().grad(), oracle->named_parameters()[item.key()].grad(), 2e-2, 3e-3));

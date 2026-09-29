@@ -301,9 +301,14 @@ void consume_json_value(simdjson::ondemand::value value, JsonConsumption& admiss
   if (admission.limited && text.size() > 4096) invalid("panoptic text exceeds admission");
   if (atom) atom->value = text;
  } else if (type == simdjson::ondemand::json_type::number) {
-  const auto token = value.raw_json_token();
+  auto token = value.raw_json_token();
+  while (!token.empty() && static_cast<unsigned char>(token.back()) <= ' ') token.remove_suffix(1);
   auto parsed = value.get_number();
-  if (parsed.error() == simdjson::BIGINT_ERROR) {
+  auto digits = token;
+  if (digits.starts_with('-')) digits.remove_prefix(1);
+  const bool large_integer = !digits.empty() && digits.front() >= '1' && digits.front() <= '9' &&
+                             std::ranges::all_of(digits, [](char character) { return character >= '0' && character <= '9'; });
+  if (parsed.error() == simdjson::BIGINT_ERROR || (parsed.error() == simdjson::NUMBER_ERROR && large_integer)) {
    double fallback = 0;
    const auto result = std::from_chars(token.data(), token.data() + token.size(), fallback);
    auto end = result.ptr;
@@ -711,8 +716,8 @@ public:
    "COCONut retained normalizer workspace overflow");
  }
  void consume_group(std::size_t group, const CoconutRecord& record, const CoconutAnnotationInput& input) {
+  if (input.membership) (void)request_.physical_membership->resolve(request_.edition, request_.input_identity, record, input.allowance, !input.backing);
   if (input.membership && !request_.metadata_only) {
-   (void)request_.physical_membership->resolve(request_.edition, request_.input_identity, record, input.allowance);
    if (request_.execution && input.allowance)
     request_.execution->with_unused_workspace(input.allowance, input.live_bytes, [&] { request_.execution->run(BenchmarkStage::Metadata, {}, [](std::size_t) {}, input.allowance); });
    return;
@@ -761,9 +766,9 @@ public:
   if (recovery_failure_) std::rethrow_exception(recovery_failure_);
  }
  bool reusable_native(const CoconutRecord& record, const BenchmarkAllowance& allowance) {
+  const auto physical = request_.physical_membership->resolve(request_.edition, request_.input_identity, record, allowance);
   const auto& row = request_.records->row(record.source_ordinal);
   if (!row.complete() || !row.native()) return false;
-  const auto physical = request_.physical_membership->resolve(request_.edition, request_.input_identity, record, allowance);
   auto original = original_input(physical.source);
   if (!original.terminal) return false;
   const auto& saved = row.native();
@@ -1385,6 +1390,11 @@ void json_records(const CoconutImportRequest& request, CoconutAnnotationRecords&
    // A ready chunk can start its physical images before later annotation rows
    // parse. Resolution may wait on sources, so it runs after CPU custody ends.
    while (ready_records < base + end) (void)request.physical_membership->resolve(request.edition, request.input_identity, retained.record(ready_records++), request.parent_allowance);
+   // This JSON chunk has no live physical input. Its reader cannot retain an
+   // oversized grant while the next independent structural scan needs a CPU
+   // workspace. Encountered routes keep their generation-bound seek positions.
+   if (request.execution && (request.execution->resource_pressure() || request.execution->transient_target() < request.physical_membership->input_requirement(request.edition).workspace_bytes()))
+    request.physical_membership->release_readers(request.edition);
   };
   json_rows(request, input, ranges, parsers, workspace, annotation_row, ready, true, [&](std::size_t i) { return retained.row(base + i).complete(); });
  };
@@ -1435,7 +1445,7 @@ void xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecord
   nested, mmltk::common::math::checked_add(576ULL << 20, consumer.workspace_bytes(), "COCONut discovery consumer envelope overflow"), "COCONut XL parser workspace overflow");
  auto owned = retained.archive;
  if (owned)
-  owned->resume(workspace);
+  owned->resume(workspace, consumer.continuation_descriptors());
  else
   owned = std::make_shared<Archive>(request.mask_archive, request.execution, workspace, request.parent_allowance, 1, true, BenchmarkAllowance{}, 1024, consumer.continuation_descriptors());
  auto& archive = *owned;
@@ -1493,18 +1503,19 @@ void consume_archive(const CoconutImportRequest& request, const CoconutAnnotatio
   throw_if_benchmark_cancelled(request.cancellation);
   wanted.push_back(prefix + record.physical_stem + ".png");
   normalizer_workspace = std::max(normalizer_workspace, importer.maximum_workspace(record));
+  (void)request.physical_membership->resolve(request.edition, request.input_identity, record, request.parent_allowance);
  }
+ request.physical_membership->release_readers(request.edition);
  // The library keeps its decompressor and encoded capacity until stream close.
  // Reserve that backing together with its largest legal synchronous consumer,
  // so a borrowed PNG never waits for the scratch needed to retire its input.
- const auto consumer = request.physical_membership->input_requirement(request.edition);
  const auto workspace = mmltk::common::math::checked_add(mmltk::common::math::checked_multiply(request.limits.max_png_bytes, 2U, "COCONut archive buffer overflow"),
-  mmltk::common::math::checked_add(normalizer_workspace, consumer.workspace_bytes(), "COCONut retained physical consumer overflow"), "COCONut archive allowance overflow");
+  normalizer_workspace, "COCONut archive allowance overflow");
  const bool discovered = static_cast<bool>(owned);
  if (owned)
   owned->resume(workspace);
  else
-  owned = std::make_shared<Archive>(request.mask_archive, request.execution, workspace, request.parent_allowance, 1, true, BenchmarkAllowance{}, 1024, consumer.continuation_descriptors());
+  owned = std::make_shared<Archive>(request.mask_archive, request.execution, workspace, request.parent_allowance);
  auto& archive = *owned;
  struct RetireConsumer {
   Importer& importer;
@@ -1513,8 +1524,7 @@ void consume_archive(const CoconutImportRequest& request, const CoconutAnnotatio
  if (request.edition == CoconutEdition::XLarge && discovered) {
   archive.visit_known(wanted, [&](std::size_t index) {
    const auto png = archive.read(request.limits.max_png_bytes, request.cancellation);
-   importer.consume(records.record(index), png, archive.allowance(),
-    mmltk::common::math::checked_add(archive.retained_workspace_bytes(), consumer.workspace_bytes(), "COCONut retained archive workspace overflow"), nullptr, index);
+   importer.consume(records.record(index), png, archive.allowance(), archive.retained_workspace_bytes(), nullptr, index);
   }, request.cancellation);
   archive.pause();
   return;
@@ -1533,8 +1543,7 @@ void consume_archive(const CoconutImportRequest& request, const CoconutAnnotatio
   }
   if (consumed[found->second]) invalid("duplicate archive mask: " + archive.member());
   const auto png = archive.read(request.limits.max_png_bytes, request.cancellation);
-  importer.consume(records.record(found->second), png, archive.allowance(),
-   mmltk::common::math::checked_add(archive.retained_workspace_bytes(), consumer.workspace_bytes(), "COCONut retained archive workspace overflow"), nullptr, found->second);
+  importer.consume(records.record(found->second), png, archive.allowance(), archive.retained_workspace_bytes(), nullptr, found->second);
   consumed[found->second] = true;
   --remaining;
   // Parsed canonical records remain reusable until their source generation retires.
@@ -1819,6 +1828,7 @@ std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequ
 }
 std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& components, Cancellation cancellation) {
  throw_if_benchmark_cancelled(cancellation);
+ auto replacement = components;
  std::unordered_set<PhysicalKey, PhysicalKeyHash> large, xlarge;
  for (const auto& component : components)
   if (component.edition() == CoconutEdition::Large) {
@@ -1828,7 +1838,7 @@ std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& compon
    }
   }
  std::uint64_t removed = 0;
- for (auto& component : components)
+ for (auto& component : replacement)
   if (component.edition() == CoconutEdition::XLarge) {
    std::vector<std::size_t> retained;
    for (std::size_t i = 0; i < component.inventory().size(); ++i) {
@@ -1844,6 +1854,7 @@ std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& compon
    if (retained.size() != component.inventory().size()) component = component.select_images(std::move(retained), cancellation);
   }
  throw_if_benchmark_cancelled(cancellation);
+ components = std::move(replacement);
  return removed;
 }
 std::vector<CoconutPhysicalImage> coconut_image_archive_inventory(const std::filesystem::path& archive_path, const std::filesystem::path& cache_path, CoconutImageNamespace source, std::uint16_t shard,

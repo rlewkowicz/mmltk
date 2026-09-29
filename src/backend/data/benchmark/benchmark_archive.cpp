@@ -110,12 +110,12 @@ std::optional<std::uint64_t> benchmark_archive_image_candidate(std::string_view 
 }
 struct BenchmarkArchive::Impl {
  struct Position {
-  std::uint64_t header = 0, bytes = 0;
+  std::uint64_t header = 0, bytes = 0, ordinal = 0;
   std::optional<std::uint64_t> extent;
   bool raw = false, conflict = false;
  };
  BenchmarkCompilePipeline* execution;
- BenchmarkAllowance parent_allowance, file_allowance, credits, supplied_workspace;
+ BenchmarkAllowance parent_allowance, file_allowance, decoder_allowance, credits, supplied_workspace;
  mmltk::common::io::FileHandle file;
  std::unique_ptr<rapidgzip::ParallelGzipReader<ArchiveChunk>> gzip;
  std::unique_ptr<rapidgzip::IsalInflateWrapper> streaming;
@@ -129,7 +129,7 @@ struct BenchmarkArchive::Impl {
  archive_entry* entry = nullptr;
  std::unordered_map<std::string, Position> positions;
  std::string name;
- std::uint64_t offset = 0, block_offset = 0, origin = 0, file_size = 0;
+ std::uint64_t offset = 0, block_offset = 0, origin = 0, file_size = 0, next_ordinal = 0;
  std::array<std::uint64_t, 7> generation{};
  std::size_t block_size = 0;
  bool started = false, direct = false, is_regular = false, safe_name = true, raw_tar = false, compressed = false, verify_crc = true;
@@ -142,7 +142,7 @@ struct BenchmarkArchive::Impl {
   BenchmarkAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t dependent_descriptors, std::size_t gzip_index_entries)
      : execution(owner),
        parent_allowance(parent),
-       file_allowance(owner ? owner->reserve(BenchmarkResources::handles(2, true), parent) : BenchmarkAllowance{}),
+       file_allowance(owner ? owner->reserve(BenchmarkResources::handles(1), parent) : BenchmarkAllowance{}),
        supplied_workspace(std::move(workspace_allowance)),
        file(mmltk::common::io::FileHandle::open_readonly(path.string())) {
   struct stat status{};
@@ -166,6 +166,10 @@ struct BenchmarkArchive::Impl {
   reader.reset();
   gzip.reset();
   streaming.reset();
+  decoder_allowance = {};
+  file = {};
+  file_allowance.retire_descriptors();
+  file_allowance.retire_workspace();
   std::vector<std::uint8_t>().swap(bytes);
   std::vector<char>().swap(block);
   if (owns_workspace) credits.retire_workspace();
@@ -213,6 +217,7 @@ struct BenchmarkArchive::Impl {
   // constructing a replacement under the same allowance.
   gzip.reset();
   streaming.reset();
+  if (execution && !decoder_allowance) decoder_allowance = execution->reserve(BenchmarkResources::handles(1), parent_allowance);
   if (streaming_mode) {
    streaming = std::make_unique<rapidgzip::IsalInflateWrapper>(rapidgzip::gzip::BitReader(std::make_unique<rapidgzip::StandardFileReader>(file.get())));
    streaming->setFileType(rapidgzip::FileType::GZIP);
@@ -335,7 +340,7 @@ struct BenchmarkArchive::Impl {
   self.block_size = 0;
   return requested;
  }
- void open(std::uint64_t start, Cancellation requested_cancellation = {}) {
+ void open(std::uint64_t start, Cancellation requested_cancellation = {}, std::uint64_t ordinal = 0) {
   cancellation = requested_cancellation;
   reader.reset();
   entry = nullptr;
@@ -343,6 +348,7 @@ struct BenchmarkArchive::Impl {
   raw_tar = false;
   direct = false;
   origin = offset = start;
+  next_ordinal = ordinal;
   try {
    position_decoder(start);
   } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
@@ -364,9 +370,10 @@ struct BenchmarkArchive::Impl {
    work();
  }
 };
-std::uint64_t BenchmarkArchive::workspace_bytes(const std::filesystem::path& path, std::uint64_t workspace, std::size_t workers) {
+BenchmarkArchive::InputRequirement BenchmarkArchive::input_requirement(const std::filesystem::path& path, std::uint64_t workspace, std::size_t workers) {
  const auto file = mmltk::common::io::FileHandle::open_readonly(path.string());
- return archive_workspace(gzip_magic(file, file.size()), std::max<std::size_t>(1, workers), workspace);
+ const bool compressed = gzip_magic(file, file.size());
+ return {archive_workspace(compressed, std::max<std::size_t>(1, workers), workspace), compressed ? 2U : 1U};
 }
 BenchmarkArchive::BenchmarkArchive(const std::filesystem::path& path, BenchmarkCompilePipeline* execution, std::uint64_t workspace, const BenchmarkAllowance& parent, std::size_t workers,
  bool verify_gzip_crc, BenchmarkAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t consumer_descriptors, std::size_t gzip_index_entries)
@@ -378,7 +385,7 @@ bool BenchmarkArchive::next(Cancellation cancellation) {
  throw_if_benchmark_cancelled(cancellation);
  if (!s.reader) s.resume(s.workspace_bytes);
  if (s.direct) {
-  s.cpu([&] { s.open(s.current.header, cancellation); });
+  s.cpu([&] { s.open(s.current.header, cancellation, s.current.ordinal); });
   s.direct = false;
   if (!next(cancellation)) return false;
  }
@@ -404,7 +411,7 @@ bool BenchmarkArchive::next(Cancellation cancellation) {
  if (size < 0) throw BenchmarkArchiveError("negative archive member size");
  s.current = {
   checked_add(s.origin, checked_cast<std::uint64_t>(archive_read_header_position(s.reader.get()), "archive header position overflow"), "archive position overflow"), static_cast<std::uint64_t>(size),
-  {}
+  s.next_ordinal++, {}
  };
  s.raw_tar = !s.compressed && archive_filter_count(s.reader.get()) == 1 && archive_filter_code(s.reader.get(), 0) == ARCHIVE_FILTER_NONE &&
              archive_format(s.reader.get()) == ARCHIVE_FORMAT_TAR_USTAR && archive_entry_sparse_count(s.entry) == 0;
@@ -413,19 +420,20 @@ bool BenchmarkArchive::next(Cancellation cancellation) {
  s.current.raw = archive_format(s.reader.get()) == ARCHIVE_FORMAT_TAR_USTAR && archive_entry_sparse_count(s.entry) == 0 && archive_filter_count(s.reader.get()) == 1 &&
                  archive_filter_code(s.reader.get(), 0) == ARCHIVE_FILTER_NONE;
  const auto [stored, inserted] = s.positions.try_emplace(s.name, s.current);
- if (!inserted && stored->second.header != s.current.header) stored->second.conflict = true;
+ if (!inserted && stored->second.ordinal != s.current.ordinal) stored->second.conflict = true;
  return true;
 }
 const std::string& BenchmarkArchive::member() const { return impl_->name; }
 bool BenchmarkArchive::regular() const { return impl_->is_regular; }
 std::uint64_t BenchmarkArchive::size() const { return impl_->current.bytes; }
-std::uint64_t BenchmarkArchive::position() const { return impl_->current.header; }
+std::uint64_t BenchmarkArchive::position() const { return impl_->current.ordinal; }
 BenchmarkArchive::MemberPosition BenchmarkArchive::member_position() const {
  const auto& s = *impl_;
  MemberPosition result;
  result.generation_ = s.generation;
  result.member_ = s.name;
  result.header_ = s.current.header;
+ result.ordinal_ = s.current.ordinal;
  result.bytes_ = s.current.bytes;
  result.extent_ = s.current.extent;
  result.raw_ = s.current.raw;
@@ -435,8 +443,8 @@ bool BenchmarkArchive::seek(const MemberPosition& position, Cancellation cancell
  auto& s = *impl_;
  if (position.generation_ != s.generation) throw BenchmarkArchiveError("archive member position belongs to a replaced source generation");
  if (position.extent_ && (*position.extent_ > s.file_size || position.bytes_ > s.file_size - *position.extent_)) throw BenchmarkArchiveError("archive member position exceeds opened file bounds");
- const auto [stored, inserted] = s.positions.try_emplace(position.member_, Impl::Position{position.header_, position.bytes_, position.extent_, position.raw_});
- if (!inserted && stored->second.header != position.header_) throw BenchmarkArchiveError("archive member position conflicts with consumed identity");
+ const auto [stored, inserted] = s.positions.try_emplace(position.member_, Impl::Position{position.header_, position.bytes_, position.ordinal_, position.extent_, position.raw_});
+ if (!inserted && (stored->second.ordinal != position.ordinal_ || stored->second.bytes != position.bytes_)) throw BenchmarkArchiveError("archive member position conflicts with consumed identity");
  return seek(position.member_, cancellation);
 }
 void BenchmarkArchive::require_regular(std::uint64_t limit) const {
@@ -540,7 +548,7 @@ bool BenchmarkArchive::seek(std::string_view member, Cancellation cancellation) 
   return true;
  }
  if (position.raw) {
-  s.cpu([&] { s.open(position.header, cancellation); });
+  s.cpu([&] { s.open(position.header, cancellation, position.ordinal); });
   if (!next(cancellation) || s.name != member) throw BenchmarkArchiveError("archive seek identity mismatch");
   return true;
  }
@@ -565,10 +573,10 @@ void BenchmarkArchive::visit_known(std::span<const std::string> members, const s
   if (found == s.positions.end()) throw BenchmarkArchiveError("missing requested archive member: " + members[i]);
   ordered.push_back({i, found->second});
  }
- std::ranges::sort(ordered, {}, [](const Required& row) { return row.position.header; });
+ std::ranges::sort(ordered, {}, [](const Required& row) { return row.position.ordinal; });
  if (ordered.empty()) return;
  for (std::size_t i = 1; i < ordered.size(); ++i)
-  if (ordered[i - 1].position.header == ordered[i].position.header) throw BenchmarkArchiveError("duplicate required archive member: " + members[ordered[i].index]);
+  if (ordered[i - 1].position.ordinal == ordered[i].position.ordinal) throw BenchmarkArchiveError("duplicate required archive member: " + members[ordered[i].index]);
  if (!s.reader) s.resume(s.workspace_bytes);
  const bool direct = std::ranges::all_of(ordered, [](const Required& row) { return row.position.extent.has_value(); });
  // A fresh resumed reader is already at zero. Otherwise restart exactly once
@@ -583,8 +591,12 @@ void BenchmarkArchive::visit_known(std::span<const std::string> members, const s
   } else {
    bool found = false;
    while (next(cancellation)) {
-    if (position() < required.position.header) continue;
-    if (position() != required.position.header || member() != name) throw BenchmarkArchiveError("archive visit identity mismatch");
+    // ZIP can consume a data descriptor during either read or skip. Its byte
+    // header position therefore depends on the earlier body-consumption path.
+    // Entry order is stable across both traversals of this opened generation.
+    if (position() < required.position.ordinal) continue;
+    if (position() != required.position.ordinal || member() != name || size() != required.position.bytes)
+     throw BenchmarkArchiveError("archive visit identity mismatch: expected " + name + " at entry " + std::to_string(required.position.ordinal) + ", found " + member() + " at entry " + std::to_string(position()));
     found = true;
     break;
    }
@@ -599,13 +611,17 @@ void BenchmarkArchive::pause() {
  s.entry = nullptr;
  s.gzip.reset();
  s.streaming.reset();
+ s.decoder_allowance = {};
  std::vector<std::uint8_t>().swap(s.bytes);
  std::vector<char>().swap(s.block);
  if (s.owns_workspace) s.credits.retire_workspace();
  s.credits = {};
  s.supplied_workspace = {};
 }
-void BenchmarkArchive::resume(std::uint64_t workspace) { impl_->resume(workspace); }
+void BenchmarkArchive::resume(std::uint64_t workspace, std::size_t consumer_descriptors) {
+ impl_->consumer_descriptors = consumer_descriptors;
+ impl_->resume(workspace);
+}
 BenchmarkArchive::GzipSeekState BenchmarkArchive::gzip_seek_state() const {
  return {
   impl_->gzip ? impl_->gzip->availableWindowCount() : 0, static_cast<bool>(impl_->gzip), impl_->streaming_mode, impl_->rolling_windows, impl_->control_capacity_reached,

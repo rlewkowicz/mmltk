@@ -1,3 +1,5 @@
+#include "src/test_support/cuda_test_gate.h"
+#include "src/test_support/async_test_utils.hpp"
 #include "training_gradient_fixture.h"
 #include "src/backend/models/rfdetr/training/detail/training_ops_private.h"
 #include <torch/csrc/distributed/c10d/Backend.hpp>
@@ -20,6 +22,7 @@
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "src/backend/ml/cuda/tensor_readback.h"
 #include <ATen/cuda/CUDAEvent.h>
+#include <ATen/Context.h>
 #include <torch/csrc/autograd/custom_function.h>
 #include <chrono>
 #include <array>
@@ -376,7 +379,7 @@ void exercise_direct_gradients(int device) {
  tc::TorchCudaDeviceGuard guard(tc::checked_device_index(device));
  const auto launch = tc::getCurrentCUDAStream(tc::checked_device_index(device));
  const auto producer = tc::getStreamFromPool(false, tc::checked_device_index(device));
- const auto options = torch::TensorOptions().device(tc::cuda_device(device));
+ const auto options = torch::TensorOptions().device(tc::cuda_device(device)).dtype(torch::kFloat32);
  auto exclusive = torch::full({4}, 3, options).set_requires_grad(true);
  auto expanded = torch::full({4}, 5, options).set_requires_grad(true);
  auto unused = torch::full({4}, 7, options).set_requires_grad(true);
@@ -1349,16 +1352,14 @@ void exercise_collective_cancellation(DistributedContext& group, int device, std
 }
 namespace {
 struct PreparedBackwardGate final {
- explicit PreparedBackwardGate(int device)
-     : word(torch::zeros({1}, torch::TensorOptions().device(tc::cuda_device(device)).dtype(torch::kInt32))), release_stream(tc::getStreamFromPool(false, tc::checked_device_index(device))) {
+ explicit PreparedBackwardGate(int device) {
   tc::getCurrentCUDAStream(tc::checked_device_index(device)).synchronize();
  }
  ~PreparedBackwardGate() { release(); }
  void release() noexcept {
   if (released) return;
   released = true;
-  (void)cuStreamWriteValue32(reinterpret_cast<CUstream>(release_stream.stream()), reinterpret_cast<CUdeviceptr>(word.data_ptr()), 1, CU_STREAM_WRITE_VALUE_DEFAULT);
-  (void)cudaStreamSynchronize(release_stream.stream());
+  gate.release();
   if (!armed.load()) try {
     complete.synchronize();
    } catch (...) {}
@@ -1366,16 +1367,14 @@ struct PreparedBackwardGate final {
  torch::Tensor hold(const torch::Tensor& gradient) {
   if (!armed.exchange(false)) return gradient;
   const auto stream = tc::getCurrentCUDAStream(tc::checked_device_index(gradient.get_device()));
-  require(cuStreamWaitValue32(reinterpret_cast<CUstream>(stream.stream()), reinterpret_cast<CUdeviceptr>(word.data_ptr()), 1, CU_STREAM_WAIT_VALUE_EQ) == CUDA_SUCCESS,
-   "could not hold training backward consumption");
+  gate.hold(stream.stream());
   // Autograd submits a real derivative after the device gate and returns to
   // the existing worker. It never blocks CPU submission on this test gate.
   auto retained = gradient.clone();
   complete.record(stream);
   return retained;
  }
- torch::Tensor word;
- tc::TorchCudaStream release_stream;
+ mmltk::testsupport::CudaTestGate gate;
  at::cuda::CUDAEvent complete;
  std::atomic<bool> armed{true};
  bool released = false;
@@ -1393,14 +1392,31 @@ std::vector<NormalizedModelStateEntry> host_training_state(TrainingModel& model)
  for (auto& value : state) value.tensor = value.tensor.detach().cpu().clone();
  return state;
 }
-void equal_training_state(const std::vector<NormalizedModelStateEntry>& actual, const std::vector<NormalizedModelStateEntry>& expected) {
+void equal_training_state(const std::vector<NormalizedModelStateEntry>& actual, const std::vector<NormalizedModelStateEntry>& expected, std::string_view transition) {
  require(actual.size() == expected.size(), "prepared training parameter inventory differs");
- for (std::size_t i = 0; i < actual.size(); ++i)
-  require(actual[i].name == expected[i].name && torch::equal(actual[i].tensor, expected[i].tensor), "prepared training changed the exact parameter trajectory");
+ for (std::size_t i = 0; i < actual.size(); ++i) {
+  require(actual[i].name == expected[i].name, "prepared training parameter identity differs");
+  if (torch::equal(actual[i].tensor, expected[i].tensor)) continue;
+  std::ostringstream message;
+  message.precision(17);
+  message << transition << " changed the exact parameter trajectory: " << actual[i].name << ", maximum difference="
+          << (actual[i].tensor.to(torch::kFloat64) - expected[i].tensor.to(torch::kFloat64)).abs().max().item<double>();
+  throw std::runtime_error(message.str());
+ }
 }
 }  // namespace
 void exercise_prepared_training(const DistributedContext& distributed, int device) {
  namespace data = mmltk::backend::data;
+ const bool deterministic = at::globalContext().deterministicCuDNN();
+ const bool benchmark = at::globalContext().benchmarkCuDNN();
+ const mmltk::testsupport::ScopedTestCleanup restore_convolution([=] {
+  at::globalContext().setDeterministicCuDNN(deterministic);
+  at::globalContext().setBenchmarkCuDNN(benchmark);
+ });
+ // Exact trajectory comparison requires repeatable convolution reductions;
+ // seeding alone does not select deterministic cuDNN backward algorithms.
+ at::globalContext().setDeterministicCuDNN(true);
+ at::globalContext().setBenchmarkCuDNN(false);
  tc::TorchCudaDeviceGuard device_guard(tc::checked_device_index(device));
  const auto launch = tc::getCurrentCUDAStream(tc::checked_device_index(device));
  const std::array batches{static_cast<std::size_t>(distributed.world_size), std::size_t{1}};
@@ -1429,6 +1445,8 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
   TrainRequest request;
   request.train_compiled_path = loader_config.compiled_path;
   request.val_compiled_path = request.train_compiled_path;
+  request.output_dir = root.path() / "training";
+  request.weights_path = root.path() / "seeded-native-fixture.pt";
   request.batch_size = batches[batch_case];
   request.device_id = device;
   request.epochs = 1;
@@ -1598,14 +1616,14 @@ void exercise_prepared_training(const DistributedContext& distributed, int devic
    require(!lanes.has_prepared(), "training prepared across an epoch boundary");
    require(prepared->attempt() == 0, "exhausted epoch admitted another draw");
    prepared->end_epoch();
-   equal_training_state(host_training_state(*prepared), expected);
+   equal_training_state(host_training_state(*prepared), expected, "lookahead");
   }
   {
    auto resumed = construct(checkpoint);
    require(resumed->schedule() == admitted.schedule, "Resume restored speculative progress");
    while (!resumed->exhausted()) require(resumed->attempt() == request.batch_size, "resumed training skipped a finite update");
    resumed->end_epoch();
-   equal_training_state(host_training_state(*resumed), expected);
+   equal_training_state(host_training_state(*resumed), expected, "resume");
   }
   require(failures == 0, "healthy preparation invoked the global failure path");
   if (!distributed.enabled) {

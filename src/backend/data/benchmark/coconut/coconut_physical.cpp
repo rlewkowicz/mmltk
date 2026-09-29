@@ -86,7 +86,13 @@ std::span<const CoconutImageNamespace> coconut_release_sources(CoconutEdition ed
  }
  throw std::invalid_argument("invalid COCONut edition");
 }
-CoconutPhysicalInputRequirement CoconutPhysicalInputRequirement::archive(std::uint64_t workspace_bytes) { return {archive_image_resources(), workspace_bytes}; }
+CoconutPhysicalInputRequirement CoconutPhysicalInputRequirement::archive(std::uint64_t workspace_bytes, std::size_t reader_descriptors) {
+ auto controls = BenchmarkResources::handles(1, false, reader_descriptors + 2);
+ // This reader consumes an already admitted annotation producer. Its physical
+ // input must be able to use the capacity reserved for dependent consumers.
+ controls.producer = false;
+ return {controls, workspace_bytes};
+}
 struct CoconutPhysicalMembership::Impl {
  struct PhysicalRoute {
   AdmittedRecipeArchive* archive;
@@ -100,6 +106,7 @@ struct CoconutPhysicalMembership::Impl {
    AdmittedRecipeArchive* archive;
    std::filesystem::path root;
    std::size_t order;
+   bool cache_reusable = true;
   };
   std::unordered_map<std::uint16_t, Artifact> artifacts;
   std::size_t next = 0;
@@ -180,13 +187,17 @@ struct CoconutPhysicalMembership::Impl {
  static CoconutPhysicalInputRequirement requirement(PhysicalRelease& state) {
   if (!state.input) {
    std::uint64_t workspace = 0;
+   std::size_t descriptors = 0;
    for (const auto& [name, source] : state.sources)
-    for (const auto* archive : source.archives) workspace = std::max(workspace, archive->resolution_workspace);
-   state.input = CoconutPhysicalInputRequirement::archive(workspace);
+    for (const auto* archive : source.archives) {
+     workspace = std::max(workspace, archive->resolution_input.workspace_bytes);
+     descriptors = std::max(descriptors, archive->resolution_input.descriptors);
+    }
+   state.input = CoconutPhysicalInputRequirement::archive(workspace, descriptors);
   }
   return *state.input;
  }
- CoconutPhysicalImage resolve(CoconutEdition edition, std::string_view identity, const CoconutRecord& record, const BenchmarkAllowance& parent) {
+ CoconutPhysicalImage resolve(CoconutEdition edition, std::string_view identity, const CoconutRecord& record, const BenchmarkAllowance& parent, bool canonical_metadata) {
   const auto objects = admit_record(edition, record);
   if (!execution) {
    const CoconutPhysicalImage* match = nullptr;
@@ -207,7 +218,7 @@ struct CoconutPhysicalMembership::Impl {
   auto& state = releases.at(edition);
   // The join and cursor share one release lock. Concurrent requests must check
   // the cache here, before either can reopen or republish the same image.
-  const std::lock_guard lock(state.mutex);
+  std::unique_lock lock(state.mutex);
   if (state.identity != identity) {
    state.resolved.clear();
    state.identity = identity;
@@ -218,10 +229,13 @@ struct CoconutPhysicalMembership::Impl {
   const auto preferred = edition == CoconutEdition::RelabeledValidation ? std::optional(CoconutImageNamespace::CocoValidation) : record.namespace_hint;
   const auto requested_id = objects ? objects->id : record.image_id;
   const auto eligible = coconut_release_sources(edition);
+  AdmittedRecipeArchive* repair_candidate = nullptr;
   for (const bool preferred_pass : {true, false})
    for (const auto source_name : eligible) {
     if ((!coco_record && source_name != objects->source) || (preferred && source_name == *preferred) != preferred_pass) continue;
     auto& source = state.sources.at(source_name);
+    for (auto* archive : source.archives)
+     if (!repair_candidate || archive->structural_attempts < repair_candidate->structural_attempts) repair_candidate = archive;
     for (;;) {
      auto found = source.members.find(requested_id);
      if (found == source.members.end() && source.next == source.archives.size()) break;
@@ -233,15 +247,32 @@ struct CoconutPhysicalMembership::Impl {
       state.active = &archive;
      }
      try {
-      if (!state.lease)
+      if (!state.lease) {
+       if (canonical_metadata && parent && !execution->try_resize_workspace(parent, 0)) throw std::logic_error("physical metadata retains unrelated workspace");
        state.lease = ArtifactLease::acquire_charged(cache->locks / (std::string(benchmark_source_name(archive.origin.artifact.source)) + "-" + archive.origin.cache_shard + ".images.lock"),
         cancellation, execution, requirement(state).lease_controls(), parent);
+       if (canonical_metadata && parent) {
+        const auto workspace = requirement(state).workspace_bytes();
+        if (!execution->try_resize_workspace(parent, workspace)) {
+         // Another sequence may own the transient grant while approaching this
+         // release. Never wait for its bytes while holding the shared cursor.
+         state.release_reader();
+         lock.unlock();
+         for (;;) {
+          const auto observed = execution->admission_generation();
+          if (execution->try_resize_workspace(parent, workspace)) break;
+          execution->wait_for_admission_change(observed);
+         }
+         return resolve(edition, identity, record, parent, false);
+        }
+       }
+      }
       if (known_member && found->second.conflict) throw BenchmarkArchiveError("conflicting requested physical image identity");
       const bool new_reader = !state.reader;
       if (!state.reader) {
        state.reader_parent = parent;
        state.reader = std::make_unique<BenchmarkArchive>(
-        archive.download.path, execution, 64ULL << 20, state.lease->allowance(), 1, false, parent.bytes() >= archive.resolution_workspace ? parent : BenchmarkAllowance{});
+        archive.download.path, execution, 64ULL << 20, state.lease->allowance(), 1, false, parent.bytes() >= archive.resolution_input.workspace_bytes ? parent : BenchmarkAllowance{});
       }
       auto& reader = *state.reader;
       bool located = found != source.members.end() && reader.seek(found->second.locator, cancellation);
@@ -277,12 +308,6 @@ struct CoconutPhysicalMembership::Impl {
       } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
        throw BenchmarkArchiveError(error.what());
       }
-      const auto encoded = reader.read(32ULL << 20, cancellation);
-      BenchmarkImageHeader header;
-      reader.cpu([&] {
-       if (!has_complete_image_markers(encoded)) throw BenchmarkImageError("incomplete requested COCONut image");
-       header = state.decoder.read_header(encoded);
-      });
       if (state.prepared_roots.insert(root).second) prepare_cached_image_directory(root);
       if (state.directory.get() < 0) {
        state.directory_allowance = execution->reserve(BenchmarkResources::handles(2, true), state.lease->allowance());
@@ -290,8 +315,25 @@ struct CoconutPhysicalMembership::Impl {
        if (descriptor < 0) throw common_io::errno_error("cannot open physical image cache directory", root.string());
        state.directory = common_io::FileHandle(descriptor);
       }
-      StorageReservationPool destination(root, {}, storage);
-      auto input = BenchmarkEncodedImage::publish(state.directory.get(), requested_id, encoded, header, cancellation, destination, execution, {}, false);
+      const CachedImageValidator validate = [&](std::uint64_t, std::span<const std::uint8_t> encoded) {
+       if (!has_complete_image_markers(encoded)) throw BenchmarkImageError("incomplete requested COCONut image");
+       return state.decoder.read_header(encoded);
+      };
+      BenchmarkEncodedImage::Ptr input;
+      try {
+       if (source.artifacts.at(archive.origin.shard).cache_reusable)
+        input = BenchmarkEncodedImage::open(state.directory.get(), requested_id, validate, cancellation, execution, reader.allowance(), execution->image_input(root, requested_id), 32ULL << 20);
+      } catch (const InvalidImageError&) { /* The consumed source replaces this invalid cache entry below. */ }
+      if (input)
+       input = input->header_only();
+      else {
+       const auto encoded = reader.read(32ULL << 20, cancellation);
+       BenchmarkImageHeader header;
+       reader.cpu([&] { header = validate(requested_id, encoded); });
+       StorageReservationPool destination(root, {}, storage);
+       input = BenchmarkEncodedImage::publish(state.directory.get(), requested_id, encoded, header, cancellation, destination, execution, {}, false);
+      }
+      const auto header = input->header();
       execution->source_publication(root, state.lease)({requested_id, std::pair{header.width, header.height}, true, std::move(input)});
       auto& route = source.members.at(requested_id);
       route.consumed = true;
@@ -300,14 +342,18 @@ struct CoconutPhysicalMembership::Impl {
       if (cursor == source.scanned.end() || source.members.at(cursor->second).position < route.position) source.scanned[&archive] = requested_id;
       state.resolved.insert_or_assign(logical_key, physical);
       return physical;
-     } catch (const BenchmarkArchiveError& error) { throw PhysicalArchiveFailure(archive, error.what()); } catch (const BenchmarkImageError& error) {
+     } catch (const PhysicalArchiveFailure&) { throw; } catch (const BenchmarkArchiveError& error) { throw PhysicalArchiveFailure(archive, error.what()); } catch (const BenchmarkImageError& error) {
       throw PhysicalArchiveFailure(archive, error.what());
      } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
       throw PhysicalArchiveFailure(archive, error.what(), std::current_exception());
      }
     }
    }
-  throw CoconutPhysicalMembershipError(edition, record.image_id, "missing requested physical archive member: " + record.file_name);
+  // Resolve again after each bounded replacement. A valid alternative source
+  // must not be replaced merely because a preferred archive omitted this image.
+  const auto missing = "missing requested physical archive member: " + record.file_name;
+  if (repair_candidate) throw PhysicalArchiveFailure(*repair_candidate, missing);
+  throw CoconutPhysicalMembershipError(edition, record.image_id, missing);
  }
 };
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& cache,
@@ -316,8 +362,8 @@ CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<AdmittedRecipeArc
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<const CoconutPhysicalImage> images, Cancellation cancellation) : impl_(std::make_unique<Impl>(images, cancellation)) {}
 CoconutPhysicalMembership::~CoconutPhysicalMembership() = default;
 const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespace source, std::uint64_t id) const noexcept { return impl_->find(source, id); }
-CoconutPhysicalImage CoconutPhysicalMembership::resolve(CoconutEdition edition, std::string_view identity, const CoconutRecord& record, const BenchmarkAllowance& parent) const {
- return impl_->resolve(edition, identity, record, parent);
+CoconutPhysicalImage CoconutPhysicalMembership::resolve(CoconutEdition edition, std::string_view identity, const CoconutRecord& record, const BenchmarkAllowance& parent, bool canonical_metadata) const {
+ return impl_->resolve(edition, identity, record, parent, canonical_metadata);
 }
 // CLEANUP-IGNORE: Requirement and publication queries share only guard/lookup/lock setup; their returned facts and admission operations differ.
 CoconutPhysicalInputRequirement CoconutPhysicalMembership::input_requirement(CoconutEdition edition) const {
@@ -409,6 +455,7 @@ void CoconutPhysicalMembership::withdraw(const AdmittedRecipeArchive& archive) {
   const std::lock_guard lock(state.mutex);
   if (state.active == &archive) state.release_reader();
   auto& source = state.sources.at(archive.origin.source);
+  source.artifacts.at(archive.origin.shard).cache_reusable = false;
   source.scanned.erase(&archive);
   std::erase_if(state.resolved, [&](const auto& entry) {
    const auto& physical = entry.second;

@@ -131,6 +131,8 @@ void ArtifactLease::release() noexcept {
   (void)::flock(descriptor_.get(), LOCK_UN);
   descriptor_.reset();
  }
+ allowance_.retire_descriptors();
+ allowance_.retire_workspace();
  allowance_ = {};
 }
 void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation cancel_requested) {

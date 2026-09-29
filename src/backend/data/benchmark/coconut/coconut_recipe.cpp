@@ -25,6 +25,7 @@ struct CoconutRecipeInputs {
   CoconutReleaseInputs inputs;
   std::optional<CoconutRecipePreparation> metadata, complete;
   std::jthread masks;
+  std::size_t annotation_descriptors = 1;
   bool labels_published = false;
  };
  CoconutRecipeInputs(std::size_t count, mmltk::common::concurrency::CancellationObservation cancellation, std::function<void(std::exception_ptr)> failure)
@@ -120,33 +121,69 @@ struct CoconutRecipeInputs {
   }
   return split;
  }
+ BenchmarkResources release_controls(std::size_t index) const {
+  const auto readers = physical->input_requirement(catalog->releases[index].edition).continuation_descriptors() + releases[index].annotation_descriptors;
+  return BenchmarkResources::handles(1, false, std::max(coco_annotation_resources().continuation_descriptors, readers));
+ }
  void acquire_release(std::size_t index) {
   const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(*this);
   const auto& release = catalog->releases[index];
-  auto lease = ArtifactLease::acquire_charged(cache->locks / (std::string(release.name) + ".annotations.lifecycle.lock"), cancellation, execution, coco_annotation_resources());
-  const auto& handles = lease->allowance();
+  const auto lifecycle = cache->locks / (std::string(release.name) + ".annotations.lifecycle.lock");
+  auto lease = ArtifactLease::acquire_charged(lifecycle, cancellation, execution, coco_annotation_resources());
   std::vector<DownloadRequest> requests;
   requests.reserve(release.annotations.size());
   for (const auto& artifact : release.annotations) requests.push_back(make_download_request(*cache, "coconut-" + std::string(release.name), artifact));
-  auto results = download_artifacts(requests, connections, cancellation,
-   progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { progress->transfers().update(update, *progress); }} : DownloadProgressSink{}, trace, {},
-   execution, handles, reservations.get());
-  for (std::size_t i = 0; i < requests.size(); ++i) releases[index].inputs.artifacts.emplace(requests[i].artifact_id, std::move(results[i]));
+  std::vector<mmltk::common::io::FileSnapshot> generations;
+  const auto download = [&] {
+   auto results = download_artifacts(requests, connections, cancellation,
+    progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { progress->transfers().update(update, *progress); }} : DownloadProgressSink{}, trace, {},
+    execution, lease->allowance(), reservations.get());
+   generations.clear();
+   releases[index].annotation_descriptors = 1;
+   const auto inspection = execution ? execution->reserve(BenchmarkResources::handles(1), lease->allowance()) : BenchmarkAllowance{};
+   for (std::size_t i = 0; i < requests.size(); ++i) {
+    const auto& path = results[i].path;
+    generations.push_back(mmltk::common::io::FileSnapshot::Read(path));
+    if (path.extension() != ".json" && path.extension() != ".parquet")
+     releases[index].annotation_descriptors = std::max(releases[index].annotation_descriptors, BenchmarkArchive::input_requirement(path, 0).descriptors);
+    releases[index].inputs.artifacts.insert_or_assign(requests[i].artifact_id, std::move(results[i]));
+   }
+  };
+  download();
+  // Published downloads need no open reader. Release their lifecycle admission
+  // before waiting for physical inputs, then admit the complete metadata chain.
+  lease = {};
   {
    std::unique_lock lock(mutex);
    changed.wait(lock, [&] { return activated || stopped.load(std::memory_order_relaxed); });
    throw_if_benchmark_cancelled(cancellation);
   }
+  for (;;) {
+   lease = ArtifactLease::acquire_charged(lifecycle, cancellation, execution, release_controls(index));
+   bool unchanged = true;
+   {
+    const auto inspection = execution ? execution->reserve(BenchmarkResources::handles(1), lease->allowance()) : BenchmarkAllowance{};
+    for (std::size_t i = 0; i < requests.size(); ++i)
+     unchanged &= std::filesystem::exists(requests[i].destination) && generations[i] == mmltk::common::io::FileSnapshot::Read(requests[i].destination);
+   }
+   if (unchanged) break;
+   // A different compiler may have replaced a published generation between
+   // stages. Re-admit only that changed handoff under the lifecycle lease.
+   download();
+   releases[index].inputs.records->discard();
+   releases[index].inputs.components.clear();
+   lease = {};
+  }
+  const auto& handles = lease->allowance();
   prepare(index, handles, false);
-  // Metadata readers and download continuations have settled. Keep the actual
-  // lifecycle lock, but let later release metadata use its unused promise.
-  // Full readers declare their own complete physical/Arrow input envelope.
-  handles.retire_continuation();
+  if (!releases[index].inputs.records->archive) handles.retire_continuation();
+  // XL retains its opened annotation generation through the mask handoff.
   // Metadata/download controllers return immediately. Fixed release-owned mask
   // controllers retain their own lease; only ready CPU jobs use shared lanes.
   releases[index].masks = std::jthread([this, index, lease = std::move(lease)]() mutable {
    try {
     prepare(index, lease->allowance(), true);
+    lease->allowance().retire_continuation();
     lease = {};
     publish_labels(index);
     {
@@ -228,7 +265,7 @@ struct CoconutRecipeInputs {
      release.inputs.components.insert_or_assign({component.edition(), component.source()}, component);
    if (indexing) indexing->invalidate(index, *progress, affected);
    const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(*this);
-   auto lease = ArtifactLease::acquire_charged(cache->locks / (std::string(catalog->releases[index].name) + ".annotations.lifecycle.lock"), cancellation, execution, coco_annotation_resources());
+   auto lease = ArtifactLease::acquire_charged(cache->locks / (std::string(catalog->releases[index].name) + ".annotations.lifecycle.lock"), cancellation, execution, release_controls(index));
    prepare(index, lease->allowance(), true);
    lease = {};
    publish_labels(index);
@@ -638,6 +675,10 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   if (!metadata_only) retained.components.insert_or_assign({component.edition(), component.source()}, component);
   prepared.components.push_back(std::move(component));
  }
+ // Metadata and masks share the opened archive generation. Completed immutable
+ // products and parsed records outlive this reader, whose descriptors must
+ // retire before the release returns its continuation promise.
+ if (!metadata_only) retained.records->archive.reset();
  return prepared;
 }
 }  // namespace

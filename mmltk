@@ -2836,8 +2836,9 @@ run_process_diagnostic() {
 run_native_symbols_diagnostic() {
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         printf '%s\n' \
-            'Usage: ./mmltk --diagnose-native-symbols [--match REGEX] [--limit N] ARTIFACT...' \
+            'Usage: ./mmltk --diagnose-native-symbols [--match REGEX] [--limit N] [--address HEX ...] ARTIFACT...' \
             'Inspect repository-relative or installed /opt dependency .a/.o files with the existing development image GCC nm.' \
+            'Repeat --address HEX with one ELF artifact to resolve crash addresses using addr2line.' \
             'Read-only JSONL, no builds, pulls, network, or GPU execution; 120-second deadline.'
         return 0
     fi
@@ -2901,12 +2902,18 @@ run_native_link_diagnostic() {
 run_gpu_program_diagnostic() {
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         printf '%s\n' \
-            'Usage: ./mmltk --diagnose-gpu-program SOURCE.cpp [PROGRAM_ARGS...]' \
+            'Usage: ./mmltk --diagnose-gpu-program [--torch] SOURCE.cpp [PROGRAM_ARGS...]' \
             'Build one standalone C++26 CUDA-driver/Vulkan diagnostic in the existing development image.' \
+            '--torch adds the pinned PyTorch headers, ABI setting, and native libraries.' \
             'Run it in the existing Wayland validation image, without starting the application or compositor.' \
             'Artifacts go under build/diagnostics; no image builds, pulls, or network.' \
             'Compilation and execution each have a 120-second deadline.'
         return 0
+    fi
+    local diagnostic_torch=0
+    if [[ "${1:-}" == "--torch" ]]; then
+        diagnostic_torch=1
+        shift
     fi
     (( $# >= 1 )) || die "--diagnose-gpu-program requires a C++ source path"
     local program_source program_directory artifact_directory build_id
@@ -2933,16 +2940,26 @@ run_gpu_program_diagnostic() {
         --volume "${program_directory}:/diagnostic/source:ro"
         --volume "${artifact_directory}:/diagnostic/output:rw"
         --env "MMLTK_DIAGNOSTIC_SOURCE=$(basename -- "${program_source}")"
+        --env "MMLTK_DIAGNOSTIC_TORCH=${diagnostic_torch}"
         --entrypoint /usr/bin/timeout
     )
     append_wrapper_labels compile_args "diagnose-gpu-program"
     log "standalone diagnostic artifacts: ${artifact_directory}"
     run_owned_docker_command "${diagnostic_container}-build" "${compile_args[@]}" \
         "${build_id}" --signal=KILL 120s /bin/bash -c '
+            torch_flags=()
+            if [[ "${MMLTK_DIAGNOSTIC_TORCH}" == 1 ]]; then
+                torch_root=$(python3 -c "import torch; print(torch.__path__[0])") || exit
+                torch_abi=$(python3 -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))") || exit
+                torch_flags=(-isystem "${torch_root}/include" -isystem "${torch_root}/include/torch/csrc/api/include"
+                    -D_GLIBCXX_USE_CXX11_ABI="${torch_abi}" -L"${torch_root}/lib"
+                    -L"${CUDA_HOME}/lib64" -ltorch -ltorch_cpu -ltorch_cuda -lc10 -lc10_cuda -lcudart)
+            fi
             exec /opt/gcc-16.2/bin/g++ -std=c++26 -freflection -O2 -g -Wall -Wextra \
                 -Wno-missing-field-initializers \
                 -I"${CUDA_HOME}/include" "/diagnostic/source/${MMLTK_DIAGNOSTIC_SOURCE}" \
                 -L"${CUDA_HOME}/lib64/stubs" -lcuda -lvulkan \
+                "${torch_flags[@]}" \
                 -o /diagnostic/output/probe
         '
     run_gpu_diagnostic_executable "${artifact_directory}/probe" "$@"

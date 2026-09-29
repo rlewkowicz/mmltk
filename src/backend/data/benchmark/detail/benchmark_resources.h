@@ -39,11 +39,6 @@ public:
  [[nodiscard]] std::uint64_t bytes() const noexcept;
  [[nodiscard]] std::size_t descriptors() const noexcept;
  [[nodiscard]] bool aliases(const BenchmarkAllowance& other) const noexcept { return credits_ && credits_ == other.credits_; }
- // At a settled owner boundary, resize only this credit's unused promise.
- // The caller preserves its live backing envelope; split children stay charged
- // independently. Growth never waits and failure leaves custody unchanged.
- // retain_capacity preserves high water only while no resource demand is blocked.
- [[nodiscard]] bool try_resize_workspace(std::uint64_t, bool retain_capacity = false) const;
  // The backing owner calls this only after joining its workers and releasing
  // its own storage. Aliases keep descriptor commitments; split storage children
  // keep their separately charged bytes. External CPU capacity retires here too.

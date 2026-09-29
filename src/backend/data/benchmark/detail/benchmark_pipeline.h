@@ -66,6 +66,8 @@ public:
  [[nodiscard]] std::span<const int> cpus() const noexcept;
  [[nodiscard]] std::uint64_t transient_target() const noexcept;
  [[nodiscard]] std::size_t descriptor_limit() const noexcept;
+ // Diagnostic snapshot only; admission decisions use the locked ledger.
+ [[nodiscard]] BenchmarkResources resource_usage() const;
  // Idle source buffers yield to blocked consumers and resource borrowers.
  [[nodiscard]] bool resource_pressure() const;
  // Source controllers capture before checking readiness/resource fit, then
@@ -81,6 +83,10 @@ public:
  void require_feasible(BenchmarkResources) const;
  [[nodiscard]] std::size_t descriptor_ceiling(BenchmarkResources) const;
  [[nodiscard]] std::optional<BenchmarkAllowance> try_reserve(BenchmarkResources, const BenchmarkAllowance& parent = {});
+ // Resize a settled input's promise, reclaiming idle lane scratch before
+ // rejecting growth. Never wait for active work or retire the input's backing;
+ // split children remain charged. Retain high water while no demand is blocked.
+ [[nodiscard]] bool try_resize_workspace(const BenchmarkAllowance&, std::uint64_t, bool retain_capacity = false);
  // A dependent draw uses at most its parent's remaining commitment. Additional
  // demand needs uncommitted capacity; copied parents cannot lend twice.
  // Called by I/O/source owners only; never blocks a CPU lane on resources.

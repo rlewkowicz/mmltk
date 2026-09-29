@@ -25,7 +25,11 @@ class BenchmarkArchive final {
 public:
  // Two-byte format inspection sizes source admission; it never enumerates or
  // decompresses members. The returned bound includes this reader's buffers.
- [[nodiscard]] static std::uint64_t workspace_bytes(const std::filesystem::path&, std::uint64_t consumer_workspace, std::size_t gzip_workers = 1);
+ struct InputRequirement {
+  std::uint64_t workspace_bytes = 0;
+  std::size_t descriptors = 1;
+ };
+ [[nodiscard]] static InputRequirement input_requirement(const std::filesystem::path&, std::uint64_t consumer_workspace, std::size_t gzip_workers = 1);
  explicit BenchmarkArchive(const std::filesystem::path&, BenchmarkCompilePipeline* = nullptr, std::uint64_t workspace = 0, const BenchmarkAllowance& parent = {}, std::size_t gzip_workers = 1,
   bool verify_gzip_crc = true, BenchmarkAllowance workspace_allowance = {}, std::size_t retained_gzip_windows = 1024, std::size_t consumer_descriptors = 0, std::size_t gzip_index_entries = 32768);
  ~BenchmarkArchive();
@@ -35,6 +39,7 @@ public:
  [[nodiscard]] const std::string& member() const;
  [[nodiscard]] bool regular() const;
  [[nodiscard]] std::uint64_t size() const;
+ // Stable entry ordinal, independent of format-specific read/skip byte offsets.
  [[nodiscard]] std::uint64_t position() const;
  // Compile-local location authority. It carries the opened inode generation,
  // and only this reader can construct or validate it; it is never persisted.
@@ -42,7 +47,7 @@ public:
   friend class BenchmarkArchive;
   std::array<std::uint64_t, 7> generation_{};
   std::string member_;
-  std::uint64_t header_ = 0, bytes_ = 0;
+  std::uint64_t header_ = 0, bytes_ = 0, ordinal_ = 0;
   std::optional<std::uint64_t> extent_;
   bool raw_ = false;
  };
@@ -64,7 +69,7 @@ public:
  // Release decoder/buffer capacity between discovery and later consumption.
  // The opened inode and encountered positions stay bound to this generation.
  void pause();
- void resume(std::uint64_t workspace);
+ void resume(std::uint64_t workspace, std::size_t consumer_descriptors = 0);
  struct GzipSeekState {
   std::size_t dictionaries;
   bool retained;

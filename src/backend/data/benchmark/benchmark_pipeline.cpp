@@ -671,6 +671,16 @@ struct BenchmarkCompilePipeline::Impl {
   return slot ? static_cast<const void*>(slot->writer) : job.retire;
  }
 };
+struct BenchmarkSourcePublication::State {
+ std::weak_ptr<BenchmarkCompilePipeline::Impl> execution;
+ BenchmarkCompilePipeline::Impl::Source* source;
+ std::shared_ptr<const ArtifactLease> custody;
+ std::uint64_t attempt;
+ BenchmarkSourceGeneration generation;
+ std::optional<std::pair<std::uint64_t, BenchmarkSourceGeneration>> replacement;
+ bool defer_pixels;
+ [[nodiscard]] BenchmarkSourceGeneration image_generation(std::uint64_t id) const { return replacement && replacement->first == id ? replacement->second : generation; }
+};
 std::uint64_t BenchmarkAllowance::bytes() const noexcept {
  if (!credits_) return 0;
  const std::lock_guard lock(credits_->owner->mutex);
@@ -681,29 +691,50 @@ std::size_t BenchmarkAllowance::descriptors() const noexcept {
  const std::lock_guard lock(credits_->owner->mutex);
  return credits_->resources.descriptors;
 }
-bool BenchmarkAllowance::try_resize_workspace(std::uint64_t bytes, bool retain_capacity) const {
- if (!credits_) return bytes == 0;
- auto& owner = *credits_->owner;
- const auto* frame = BenchmarkCompilePipeline::Impl::Frame::current;
- if (frame && frame->owner.admission.get() == &owner) throw std::logic_error("benchmark workspace resize inside a CPU lane");
- {
+bool BenchmarkCompilePipeline::try_resize_workspace(const BenchmarkAllowance& allowance, std::uint64_t bytes, bool retain_capacity) {
+ const auto& credits = allowance.credits_;
+ if (!credits) return bytes == 0;
+ if (credits->owner != impl_->admission) throw std::invalid_argument("benchmark allowance belongs to another compile");
+ auto& owner = *impl_->admission;
+ const auto* frame = Impl::Frame::current;
+ if (frame && &frame->owner == impl_.get()) throw std::logic_error("benchmark workspace resize inside a CPU lane");
+ enum class Resize { Complete, Active, Pressure };
+ const auto resize = [&] {
   const std::lock_guard lock(owner.mutex);
-  auto& resources = credits_->resources;
-  if (credits_->cpu_users) return false;
-  if (resources.retained_handles || !credits_->workspace_loans.empty() || credits_->workspace_offer) throw std::logic_error("benchmark workspace resize requires settled own custody");
-  if (bytes == resources.bytes || (retain_capacity && !owner.resource_waiters && bytes < resources.bytes)) return true;
+  impl_->check_admission();
+  auto& resources = credits->resources;
+  if (credits->cpu_users) return Resize::Active;
+  if (resources.retained_handles || !credits->workspace_loans.empty() || credits->workspace_offer) throw std::logic_error("benchmark workspace resize requires settled own custody");
+  if (bytes == resources.bytes || (retain_capacity && !owner.resource_waiters && bytes < resources.bytes)) return Resize::Complete;
   if (bytes > resources.bytes) {
    const auto growth = bytes - resources.bytes;
-   if (!owner.fits_bytes({growth, 0}, credits_.get())) return false;
+   if (!owner.fits_bytes({growth, 0}, credits.get())) return Resize::Pressure;
    owner.bytes = mmltk::common::math::checked_add(owner.bytes, growth, "benchmark workspace resize overflow");
   } else
    owner.bytes -= resources.bytes - bytes;
   resources.bytes = bytes;
   ++owner.generation;
   if (owner.transport_wakeup) owner.transport_wakeup();
+  return Resize::Complete;
+ };
+ auto result = resize();
+ // A completed pixel can retain reusable lane storage without borrowing the
+ // input's lending window. Reclaim that physical storage before surrendering
+ // an opened forward reader merely to reacquire the same complete envelope.
+ for (std::size_t lane = 0; result == Resize::Pressure && lane < impl_->lanes.size(); ++lane) {
+  Impl::IdleScratch scratch;
+  {
+   const std::lock_guard lock(owner.mutex);
+   auto& state = impl_->lanes[lane];
+   if (state.busy() || !state.idle.owner()) continue;
+   scratch = std::exchange(state.idle, {});
+   state.retiring = scratch.owner();
+  }
+  impl_->release_scratch(std::move(scratch), lane);
+  result = resize();
  }
  owner.changed.notify_all();
- return true;
+ return result == Resize::Complete;
 }
 void BenchmarkAllowance::retire_workspace() const noexcept {
  if (!credits_) return;
@@ -1172,6 +1203,11 @@ StorageReservationPool& BenchmarkCompilePipeline::storage() noexcept { return im
 std::span<const int> BenchmarkCompilePipeline::cpus() const noexcept { return impl_->cpus; }
 std::uint64_t BenchmarkCompilePipeline::transient_target() const noexcept { return impl_->admission->target; }
 std::size_t BenchmarkCompilePipeline::descriptor_limit() const noexcept { return impl_->admission->descriptor_capacity; }
+BenchmarkResources BenchmarkCompilePipeline::resource_usage() const {
+ const std::lock_guard lock(impl_->mutex);
+ const auto& state = *impl_->admission;
+ return {state.bytes + state.handle_bytes, state.descriptors, false, state.active + state.external_cpus, false, state.committed};
+}
 bool BenchmarkCompilePipeline::resource_pressure() const {
  const std::lock_guard lock(impl_->mutex);
  const auto* label = impl_->images.waiting_labels();
@@ -1522,8 +1558,9 @@ void BenchmarkCompilePipeline::Impl::ImageState::admit(Slot& slot, bool independ
  slot.submitted = true;
  auto& job = slot.job;
  job.stage = BenchmarkStage::Header;
- job.resources = slot.payload && !slot.payload->encoded().empty() ? BenchmarkResources{} : BenchmarkResources::handles(1);
+ job.resources = slot.payload && !slot.payload->encoded().empty() ? BenchmarkResources{} : BenchmarkResources::handles(1, false, 1);
  job.parent = slot.payload ? slot.payload->allowance() : BenchmarkAllowance{};
+ if (!job.parent && slot.publication.state_ && slot.publication.state_->custody) job.parent = slot.publication.state_->custody->allowance();
  job.done = false;
  job.failure = {};
  job.finish_started = false;
@@ -1866,16 +1903,7 @@ std::shared_ptr<const BenchmarkEncodedImage> BenchmarkCompilePipeline::image_inp
  return image ? image->input : nullptr;
 }
 std::optional<BenchmarkImageGeometry> BenchmarkCompilePipeline::geometry(const std::filesystem::path& root, std::uint64_t id) const { return impl_->images.geometry(root, id); }
-struct BenchmarkSourcePublication::State {
- std::weak_ptr<BenchmarkCompilePipeline::Impl> execution;
- BenchmarkCompilePipeline::Impl::Source* source;
- std::shared_ptr<const ArtifactLease> custody;
- std::uint64_t attempt;
- BenchmarkSourceGeneration generation;
- std::optional<std::pair<std::uint64_t, BenchmarkSourceGeneration>> replacement;
- bool defer_pixels;
- [[nodiscard]] BenchmarkSourceGeneration image_generation(std::uint64_t id) const { return replacement && replacement->first == id ? replacement->second : generation; }
-};
+
 bool BenchmarkCompilePipeline::labels_ready(
  const BenchmarkSourcePublication& publication, std::uint64_t id, BenchmarkLabelInput input, std::string_view dependency, std::uint64_t original_generation) {
  if (!publication.state_ || publication.state_->execution.lock() != impl_) return false;

@@ -227,11 +227,12 @@ private:
   constexpr std::size_t chunk = std::size_t{16U} * 1024U;
   if (request.starts_with("HEAD ")) return keep_alive;
   const bool gated = bytes >= partial_bytes && gate_next_.exchange(false, std::memory_order_acq_rel);
-  const bool truncated = bytes >= partial_bytes && truncate_next_.exchange(false, std::memory_order_acq_rel);
+  const bool truncated = bytes > 1 && truncate_next_.exchange(false, std::memory_order_acq_rel);
+  const auto stop_after = truncated ? std::min(partial_bytes, bytes / 2) : bytes;
   std::array<std::uint8_t, chunk> generated{};
   std::size_t offset = begin;
   while (offset <= end) {
-   const std::size_t current = std::min(chunk, end + 1U - offset);
+   const std::size_t current = std::min({chunk, end + 1U - offset, stop_after - (offset - begin)});
    const auto* data = payload_.data();
    if (payload_.empty()) {
     for (std::size_t i = 0; i < current; ++i) generated[i] = static_cast<std::uint8_t>(((offset + i) * 131U + 17U) & 0xFFU);
@@ -241,7 +242,7 @@ private:
    }
    if (!send_all(client, data, current)) { return false; }
    offset += current;
-   if (truncated && offset - begin >= partial_bytes) return false;
+   if (truncated && offset - begin == stop_after) return false;
    if (gated && offset - begin == partial_bytes) partial_.receipt().ArriveAndWait();
    if (stop_.load(std::memory_order_acquire)) return false;
   }

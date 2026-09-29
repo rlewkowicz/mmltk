@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
@@ -63,7 +64,7 @@ struct AdmittedRecipeArchive {
  RecipeImageArchive origin;
  DownloadResult download;
  unsigned structural_attempts = 0;
- std::uint64_t resolution_workspace = 0;
+ BenchmarkArchive::InputRequirement resolution_input{};
 };
 enum class CoconutReleaseBoundary { MetadataConsumed, MasksStarted };
 // Private ordinary catalog facts are also used by bounded local release fixtures.

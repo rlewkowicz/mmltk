@@ -493,8 +493,10 @@ public:
  bool query_count_automatic() const noexcept { return query_count_automatic_; }
 
 public:
- RuntimeContext runtime_;
+ // Runtime matcher tensors may record these streams. Their allocator retires
+ // those uses during runtime destruction, before the lane streams are closed.
  std::unique_ptr<InferenceLanes> pool_;
+ RuntimeContext runtime_;
  std::unique_ptr<TrainingEventOwner> events_;
  std::vector<std::unique_ptr<ForwardLane>> forward_;
  std::size_t active_ = 0;
