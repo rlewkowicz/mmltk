@@ -2116,7 +2116,7 @@ run_toolchain_command() {
     [[ "${toolchain_identity}" =~ ^sha256:[[:xdigit:]]{64}$ ]] || die \
         "build image lacks its validated compilation identity"
     local -a docker_args=(
-        run --rm --init
+        run --rm --init --pull never
         --security-opt seccomp=unconfined
         --cpuset-cpus "${build_cpu_list}"
         --user "${uid}:${gid}"
@@ -2754,6 +2754,7 @@ run_benchmark_image_diagnostic() {
     local diagnostic_image_id diagnostic_container="${container_name}-benchmark-image"
     diagnostic_image_id="$(docker image inspect "${build_image_name}" --format '{{.Id}}' 2>/dev/null)" ||
         die "diagnostic requires existing image '${build_image_name}'"
+    local build_image_name="${diagnostic_image_id}"
     prepare_owned_dirs "${repo_root}/build/validation/benchmark-image"
     local -a diagnostic_args=(
         run --rm --init --pull never --name "${diagnostic_container}"
@@ -2765,9 +2766,58 @@ run_benchmark_image_diagnostic() {
         --entrypoint /usr/bin/timeout
     )
     append_wrapper_labels diagnostic_args "diagnose-benchmark-image"
+
+    # Let the diagnostic's parser preserve every accepted argument spelling.
+    # This read-only query opens no input and never needs a configured graph.
+    local requirements query_status=0
+    active_build_container_names=("${diagnostic_container}")
+    requirements="$(run_owned_docker_command "${diagnostic_container}" "${diagnostic_args[@]}" \
+        --env MMLTK_BENCHMARK_NATIVE_REQUIREMENTS=1 \
+        "${diagnostic_image_id}" --signal=KILL 600s /usr/bin/python3 -I -B \
+        /workspace/tools/diagnose_benchmark_image.py "$@")" || query_status=$?
+    active_build_container_names=()
+    (( query_status == 0 )) || return "${query_status}"
+    local -a targets=()
+    case "${requirements}" in
+        native:) ;;
+        native:compiled) targets=(mmltk_diagnose_compiled_sample) ;;
+        native:mask) targets=(mmltk_diagnose_coconut_mask) ;;
+        native:compiled,mask) targets=(mmltk_diagnose_compiled_sample mmltk_diagnose_coconut_mask) ;;
+        *) printf '%s\n' "${requirements}"; return 0 ;; # argparse help
+    esac
+    if ((${#targets[@]})); then
+        acquire_mutation_locks
+        prepare_cache_layout
+        # Use the configured graph/cache owner without requiring product outputs
+        # or a Firefox build fingerprint. Only requested targets are built.
+        # Preparation output must never enter the diagnostic JSONL stream.
+        local preparation_status=0
+        run_owned_toolchain_command "${diagnostic_container}-build" \
+            "set -euo pipefail
+             /workspace/tools/configure_cmake_graph.sh \\
+                 release \"\${MMLTK_CONTAINER_CACHE_ROOT}/cmake/benchmark-image-release\" \\
+                 -DBUILD_MMLTK_BROWSER_HOST=OFF \\
+                 -DBUILD_MMLTK_FIREFOX_RUNTIME=OFF \\
+                 -DMMLTK_BUILD_JOBS=\"\${MMLTK_JOBS}\" \\
+                 -DMMLTK_FIREFOX_CACHE_ROOT=\"\${MMLTK_FIREFOX_CACHE_ROOT}\"
+             for target in ${targets[*]}; do
+                 timeout --signal=KILL 120s cmake --build \\
+                     \"\${MMLTK_CONTAINER_CACHE_ROOT}/cmake/benchmark-image-release\" \\
+                     --parallel \"\${MMLTK_JOBS}\" --target \"\${target}\"
+             done" >&2 || preparation_status=$?
+        if (( preparation_status != 0 )); then
+            error "benchmark image diagnostic target preparation failed (status=${preparation_status})"
+            release_mutation_locks
+            return "${preparation_status}"
+        fi
+        diagnostic_args+=(--env-file "${cmake_cache_root}/benchmark-image-release/benchmark-image-diagnostics.env")
+    fi
+    local diagnostic_status=0
     run_owned_docker_command "${diagnostic_container}" "${diagnostic_args[@]}" \
         "${diagnostic_image_id}" --signal=KILL 600s /usr/bin/python3 -I -B \
-        /workspace/tools/diagnose_benchmark_image.py "$@"
+        /workspace/tools/diagnose_benchmark_image.py "$@" || diagnostic_status=$?
+    release_mutation_locks
+    return "${diagnostic_status}"
 }
 
 run_process_diagnostic() {

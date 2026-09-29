@@ -2,12 +2,11 @@
 #include <arrow/memory_pool.h>
 #include <parquet/arrow/reader.h>
 #include <nlohmann/json.hpp>
-#define STB_IMAGE_IMPLEMENTATION
-#define STBI_ONLY_PNG
 #include <stb_image.h>
-#define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
+#include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -44,6 +43,8 @@ Json fields(const arrow::StructArray& array, std::int64_t row) {
 }
 void inspect(std::string_view encoded, std::uint64_t id, Json metadata, bool export_image) {
  if (encoded.size() > 64U * 1024U * 1024U) throw std::runtime_error("mask exceeds 64 MiB");
+ // The shared decoder supports other formats; panoptic masks admit PNG only.
+ if (!encoded.starts_with("\x89PNG\r\n\x1a\n")) throw std::runtime_error("invalid or oversized mask geometry");
  int width = 0, height = 0, channels = 0;
  const auto* bytes = reinterpret_cast<const unsigned char*>(encoded.data());
  if (!stbi_info_from_memory(bytes, static_cast<int>(encoded.size()), &width, &height, &channels) || width <= 0 || height <= 0 || width > 32767 || height > 32767 ||

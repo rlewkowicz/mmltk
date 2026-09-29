@@ -1,5 +1,29 @@
 include(MmltkComponent)
 
+add_executable(mmltk_diagnose_compiled_sample EXCLUDE_FROM_ALL)
+mmltk_configure_component(mmltk_diagnose_compiled_sample PRIVATE_DECLARATIONS)
+mmltk_register_ordinary_sources(mmltk_diagnose_compiled_sample
+    ${CMAKE_SOURCE_DIR}/tools/diagnose_compiled_sample.cpp)
+target_link_libraries(mmltk_diagnose_compiled_sample PRIVATE
+    mmltk::backend::data
+    mmltk::backend::data::catalog
+    mmltk::common::io
+    nlohmann_json)
+mmltk_enable_native_runtime_rpath(mmltk_diagnose_compiled_sample)
+
+add_executable(mmltk_diagnose_coconut_mask EXCLUDE_FROM_ALL)
+mmltk_configure_component(mmltk_diagnose_coconut_mask PRIVATE_DECLARATIONS)
+mmltk_register_ordinary_sources(mmltk_diagnose_coconut_mask
+    ${CMAKE_SOURCE_DIR}/tools/diagnose_coconut_mask.cpp)
+target_link_libraries(mmltk_diagnose_coconut_mask PRIVATE
+    Arrow::arrow_static
+    Parquet::parquet_static
+    nlohmann_json
+    stb)
+mmltk_enable_native_runtime_rpath(mmltk_diagnose_coconut_mask)
+file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/benchmark-image-diagnostics.env"
+    CONTENT "MMLTK_COMPILED_SAMPLE_DIAGNOSTIC=$<TARGET_FILE:mmltk_diagnose_compiled_sample>\nMMLTK_COCONUT_MASK_DIAGNOSTIC=$<TARGET_FILE:mmltk_diagnose_coconut_mask>\n")
+
 if(BUILD_RFDETR_NATIVE)
     add_library(mmltk_entrypoints_tools_support STATIC)
     mmltk_configure_component(
@@ -49,18 +73,33 @@ if(BUILD_RFDETR_NATIVE)
         mmltk_entrypoints_tools_onnx_simplify)
 
     function(mmltk_add_entrypoints_tools_tests)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
         add_executable(mmltk_entrypoints_tools_tests EXCLUDE_FROM_ALL)
         mmltk_register_retained_module_importers(
             mmltk_entrypoints_tools_tests
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/onnx_tool_main.test.cpp)
+        mmltk_register_ordinary_sources(mmltk_entrypoints_tools_tests
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/benchmark_image_diagnostic.test.cpp)
         mmltk_configure_component(
             mmltk_entrypoints_tools_tests PRIVATE_DECLARATIONS)
         target_include_directories(mmltk_entrypoints_tools_tests PRIVATE
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR})
         target_link_libraries(mmltk_entrypoints_tools_tests PRIVATE
             mmltk_test_support
+            mmltk::backend::data
+            Arrow::arrow_static
+            Parquet::parquet_static
+            nlohmann_json
+            stb
             mmltk::common::logging
             mmltk_entrypoints_tools_support)
+        target_compile_definitions(mmltk_entrypoints_tools_tests PRIVATE
+            MMLTK_TEST_COMPILED_DIAGNOSTIC="$<TARGET_FILE:mmltk_diagnose_compiled_sample>"
+            MMLTK_TEST_MASK_DIAGNOSTIC="$<TARGET_FILE:mmltk_diagnose_coconut_mask>"
+            MMLTK_TEST_BENCHMARK_DIAGNOSTIC="${CMAKE_SOURCE_DIR}/tools/diagnose_benchmark_image.py"
+            MMLTK_TEST_PYTHON="${Python3_EXECUTABLE}")
+        add_dependencies(mmltk_entrypoints_tools_tests
+            mmltk_diagnose_compiled_sample mmltk_diagnose_coconut_mask)
         catch_discover_tests(mmltk_entrypoints_tools_tests
             TEST_PREFIX "entrypoints::tools::"
             DISCOVERY_MODE PRE_TEST ADD_TAGS_AS_LABELS)

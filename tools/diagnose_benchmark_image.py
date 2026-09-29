@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import struct
@@ -15,19 +16,15 @@ def report(**fields):
     print(json.dumps(fields), flush=True)
 
 
+def native_helper(variable):
+    executable = os.environ.get(variable)
+    if not executable:
+        raise ValueError("native helper was not provided; invoke through ./mmltk")
+    return executable
+
+
 def compiled_sample(path, sample):
-    executable = Path("/evidence/diagnose_compiled_sample")
-    subprocess.run([
-        "/opt/gcc-16.2/bin/g++", "-std=c++26", "-freflection", "-O2",
-        "-I/workspace", "-I/workspace/src/frameworks/reflection/include",
-        "-I/workspace/third_party/json/include",
-        "/workspace/tools/diagnose_compiled_sample.cpp",
-        "/workspace/src/backend/data/compiled/compiled_file_layout.cpp",
-        "/workspace/src/backend/data/catalog/class_catalog.cpp",
-        "/workspace/src/common/io/file_memory.cpp",
-        "/workspace/src/common/io/path_cleanup.cpp",
-        "/workspace/src/common/io/scoped_fd.cpp", "-o", str(executable),
-    ], check=True, timeout=120)
+    executable = native_helper("MMLTK_COMPILED_SAMPLE_DIAGNOSTIC")
     completed = subprocess.run([str(executable), str(path), str(sample)],
                                check=False, capture_output=True, text=True, timeout=120)
     if completed.returncode:
@@ -185,6 +182,12 @@ def main():
     args = parser.parse_args()
     if (args.compiled is None) != (args.sample is None):
         parser.error("--compiled and --sample are required together")
+    # The wrapper asks the same parser which native capabilities are needed
+    # before preparing CMake targets. No inputs are opened during this query.
+    if os.environ.get("MMLTK_BENCHMARK_NATIVE_REQUIREMENTS") == "1":
+        print("native:" + ",".join(name for name, needed in
+              (("compiled", args.compiled), ("mask", args.parquet or args.panoptic)) if needed))
+        return
     if args.compiled:
         identity = compiled_sample(args.compiled, args.sample)
         if args.image_id is not None and identity != args.image_id:
@@ -199,14 +202,7 @@ def main():
     if args.export_mask_runs and len(args.index) != 1:
         parser.error("--export-mask-runs requires exactly one --index")
     if args.parquet or args.panoptic:
-        executable = Path("/evidence/diagnose_coconut_mask")
-        subprocess.run([
-            "/opt/gcc-16.2/bin/g++", "-std=c++26", "-O2",
-            "-isystem", "/opt/arrow/include", "-I/workspace/third_party/json/include", "-I/workspace/third_party/stb",
-            "/workspace/tools/diagnose_coconut_mask.cpp", "-L/opt/arrow/lib",
-            "-lparquet", "-larrow", "-larrow_bundled_dependencies", "-pthread", "-ldl",
-            "-o", str(executable),
-        ], check=True, timeout=120)
+        executable = native_helper("MMLTK_COCONUT_MASK_DIAGNOSTIC")
         for mode, path in (("parquet", args.parquet), ("png", args.panoptic)):
             if path:
                 subprocess.run([str(executable), mode, str(path), str(args.image_id), str(int(args.export))], check=True, timeout=120)
