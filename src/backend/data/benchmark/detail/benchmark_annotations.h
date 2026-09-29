@@ -153,6 +153,8 @@ class NormalizedAnnotationAssembler final {
 public:
  explicit NormalizedAnnotationAssembler(NormalizedAnnotationMetadata, std::size_t images, std::size_t boxes, std::size_t runs, mmltk::common::concurrency::CancellationObservation = {},
   const std::filesystem::path& staging_directory = {}, StorageReservationPool* = nullptr);
+ NormalizedAnnotationAssembler(const NormalizedAnnotationAssembler&) = delete;
+ NormalizedAnnotationAssembler& operator=(const NormalizedAnnotationAssembler&) = delete;
  void begin_image(NormalizedImage);
  void append_box(NormalizedBox, std::span<const RLEPair>);
  [[nodiscard]] NormalizedAnnotationIndex finish(const BenchmarkTraceSink& = {});

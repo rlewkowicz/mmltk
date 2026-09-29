@@ -4896,6 +4896,76 @@ TEST_CASE("independent staged writers retain separate promises and publish after
  CHECK(fs::file_size(root.path() / "0") == 16384);
  CHECK(fs::file_size(root.path() / "1") == 16384);
 }
+TEST_CASE("mapped artifacts retain fixed backing after descriptor and producer retirement", "[benchmark][storage][resources]") {
+ mmltk::testsupport::ScopedTempDir root("mapped-artifact-custody");
+ StorageReservationPool storage(root.path(), {});
+ auto owner = std::make_shared<BenchmarkMappedArtifact>(storage, root.path() / "payload", 4096, "mapped fixture");
+ const auto path = owner->path();
+ REQUIRE(fs::exists(path));
+ CHECK(fs::file_size(path) == 4096);
+ owner->write("data", 4, 0);
+ const char* bytes = nullptr;
+ SECTION("readonly private snapshot") { bytes = static_cast<const char*>(owner->map_readonly()); }
+ SECTION("writable shared assembly") {
+  auto* writable = static_cast<char*>(owner->map_writable());
+  writable[0] = 'D';
+  bytes = writable;
+  std::array<char, 4> persisted{};
+  FileHandle::open_readonly(path.string()).pread_all(persisted.data(), persisted.size(), 0);
+  CHECK(std::string_view(persisted.data(), persisted.size()) == "Data");
+ }
+ REQUIRE(bytes != nullptr);
+ CHECK_THROWS_AS(owner->write("x", 1, 0), std::logic_error);
+ CHECK_THROWS_AS(owner->map_readonly(), std::logic_error);
+ CHECK_THROWS_AS(owner->map_writable(), std::logic_error);
+ for (const auto& descriptor : fs::directory_iterator("/proc/self/fd")) {
+  std::error_code error;
+  const auto target = fs::read_symlink(descriptor.path(), error);
+  if (!error) CHECK(target != path);
+ }
+ const std::weak_ptr<const BenchmarkMappedArtifact> lifetime = owner;
+ std::shared_ptr<const BenchmarkMappedArtifact> reader = owner;
+ owner.reset();
+ CHECK_FALSE(lifetime.expired());
+ CHECK(fs::exists(path));
+ CHECK(std::string_view(bytes + 1, 3) == "ata");
+ reader.reset();
+ CHECK(lifetime.expired());
+ CHECK_FALSE(fs::exists(path));
+ CHECK(storage.outstanding() == 0);
+}
+TEST_CASE("mapped payload construction unwinds storage and empty extents need no file", "[benchmark][storage][resources]") {
+ mmltk::testsupport::ScopedTempDir root("mapped-artifact-failures");
+ StorageReservationPool storage(root.path(), {});
+ SECTION("file creation failure releases its promise") {
+  CHECK_THROWS(BenchmarkMappedArtifact(storage, root.path() / "absent" / "payload", 4096, "missing directory"));
+ }
+ SECTION("fixed extent write rejects overflow and unwinds the producer") {
+  const auto construct = [&] {
+   BenchmarkMappedArtifact owner(storage, root.path() / "payload", 4096, "invalid payload");
+   owner.write("x", 1, SIZE_MAX);
+  };
+  CHECK_THROWS_AS(construct(), std::out_of_range);
+ }
+ SECTION("metadata construction failure after mapping releases all custody") {
+  const auto construct = [&] {
+   BenchmarkMappedArtifact owner(storage, root.path() / "payload", 4096, "failed metadata");
+   (void)owner.map_readonly();
+   throw std::bad_alloc();
+  };
+  CHECK_THROWS_AS(construct(), std::bad_alloc);
+ }
+ SECTION("empty readonly and writable mappings") {
+  BenchmarkMappedArtifact readonly(storage, root.path() / "readonly", 0, "empty readonly");
+  CHECK(readonly.path().empty());
+  REQUIRE_NOTHROW(readonly.write(nullptr, 0, 0));
+  CHECK(readonly.map_readonly() == nullptr);
+  BenchmarkMappedArtifact writable(storage, root.path() / "writable", 0, "empty writable");
+  CHECK(writable.map_writable() == nullptr);
+ }
+ CHECK(storage.outstanding() == 0);
+ CHECK(fs::is_empty(root.path()));
+}
 TEST_CASE("cached images and ordinary stages retain their modes and promises through publication", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("staged-output-modes");
  StorageReservationPool storage(root.path(), {});
@@ -7867,7 +7937,202 @@ NormalizedAnnotationReadView label_projection_fixture(std::uint64_t id, std::uin
  return NormalizedAnnotationReadView(fixture_index(builder));
 }
 }  // namespace
+TEST_CASE("normalized assembly backings preserve identical used records and retained readers", "[benchmark][annotations][resources]") {
+ mmltk::testsupport::ScopedTempDir root("normalized-assembly-custody");
+ StorageReservationPool storage(root.path(), {});
+ const auto input = label_projection_fixture(7);
+ std::array<NormalizedAnnotationIndex, 2> products;
+ for (std::size_t backing = 0; backing < products.size(); ++backing) {
+  auto metadata = static_cast<const NormalizedAnnotationMetadata&>(input);
+  metadata.split = "assembly";
+  metadata.annotation_sha256 = std::string(64, 'a');
+  NormalizedAnnotationAssembler assembly(metadata, 4, 4, 9, {}, backing ? root.path() : fs::path{}, &storage);
+  auto image = input.image(0);
+  image.first_box = UINT64_MAX;  // Assembly owns offsets and used counts.
+  image.box_count = UINT32_MAX;
+  assembly.begin_image(image);
+  assembly.append_box(input.storage().boxes.front(), input.storage().mask_rle_pairs);
+  image.source_image_id = 8;
+  assembly.begin_image(image);
+  assembly.append_box(input.storage().boxes.front(), input.storage().mask_rle_pairs);
+  image.source_image_id = 9;
+  assembly.begin_image(image);  // A valid background remains present.
+  nlohmann::json event;
+  products[backing] = assembly.finish([&](std::string_view name, const nlohmann::json& fields) {
+   CHECK(name == "benchmark.annotations.assembled");
+   event = fields;
+  });
+  CHECK(event.at("images") == 3);
+  CHECK(event.at("boxes") == 2);
+  CHECK(event.at("mask_rle_pairs") == 6);
+  CHECK(event.at("image_capacity").get<std::size_t>() >= 4);
+  CHECK(event.at("box_capacity").get<std::size_t>() >= 4);
+  CHECK(event.at("mask_rle_capacity").get<std::size_t>() >= 9);
+  CHECK_THROWS_AS(assembly.begin_image(image), std::logic_error);
+  CHECK_THROWS_AS(assembly.append_box(input.storage().boxes.front(), {}), std::logic_error);
+  CHECK_THROWS_AS(assembly.finish(), std::logic_error);
+ }
+ for (const auto& product : products) {
+  REQUIRE(product.images.size() == 3);
+  REQUIRE(product.boxes.size() == 2);
+  REQUIRE(product.mask_rle_pairs.size() == 6);
+  CHECK(product.images[0].first_box == 0);
+  CHECK(product.images[1].first_box == 1);
+  CHECK(product.images[2].first_box == 2);
+  CHECK(product.images[2].box_count == 0);
+  CHECK(product.boxes[1].mask_rle_offset == 3);
+  CHECK(product.split == "assembly");
+  CHECK(product.annotation_sha256 == std::string(64, 'a'));
+  REQUIRE_NOTHROW(admit_normalized_annotations(product));
+ }
+ CHECK(std::memcmp(products[0].images.data(), products[1].images.data(), products[0].images.size_bytes()) == 0);
+ CHECK(std::memcmp(products[0].boxes.data(), products[1].boxes.data(), products[0].boxes.size_bytes()) == 0);
+ CHECK(std::memcmp(products[0].mask_rle_pairs.data(), products[1].mask_rle_pairs.data(), products[0].mask_rle_pairs.size_bytes()) == 0);
+ REQUIRE(std::distance(fs::directory_iterator(root.path()), fs::directory_iterator{}) == 1);
+ const auto staged = fs::directory_iterator(root.path())->path();
+ auto reader = NormalizedAnnotationReadView(products[1]).select_images({1});
+ products = {};
+ CHECK(fs::exists(staged));
+ CHECK(reader.image(0).source_image_id == 8);
+ CHECK(reader.storage().mask_rle_pairs[5].start == 4);
+ reader = {};
+ CHECK_FALSE(fs::exists(staged));
+ CHECK(storage.outstanding() == 0);
+}
+TEST_CASE("normalized assembler admits records and cancels atomically for both backings", "[benchmark][annotations][resources]") {
+ const bool mapped = GENERATE(false, true);
+ CAPTURE(mapped);
+ mmltk::testsupport::ScopedTempDir root("normalized-assembly-admission");
+ const auto input = label_projection_fixture(7);
+ std::atomic<bool> cancelled{false};
+ NormalizedAnnotationAssembler assembly(input, 2, 2, 6, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), mapped ? root.path() : fs::path{});
+ auto image = input.image(0);
+ auto box = input.storage().boxes.front();
+ CHECK_THROWS_AS(assembly.append_box(box, {}), std::logic_error);
+ SECTION("image dimensions and reserved bytes") {
+  for (unsigned field = 0; field < 3; ++field) {
+   auto invalid = image;
+   if (field == 0) invalid.width = 0;
+   else if (field == 1) invalid.height = 0;
+   else invalid.reserved = 1;
+   CHECK_THROWS(assembly.begin_image(invalid));
+  }
+ }
+ assembly.begin_image(image);
+ SECTION("sorted unique image identity") {
+  CHECK_THROWS(assembly.begin_image(image));
+  --image.source_image_id;
+  CHECK_THROWS(assembly.begin_image(image));
+ }
+ SECTION("box values and reserved bytes") {
+  for (unsigned field = 0; field < 5; ++field) {
+   auto invalid = box;
+   if (field == 0) invalid.class_id = UINT8_MAX;
+   else if (field == 1) invalid.x2 = invalid.x1;
+   else if (field == 2) invalid.original_area = -1;
+   else if (field == 3) invalid.flags = 0;
+   else invalid.reserved[1] = 1;
+   CHECK_THROWS(assembly.append_box(invalid, input.storage().mask_rle_pairs));
+  }
+ }
+ SECTION("late invalid runs leave no appended prefix") {
+  for (const auto invalid : {RLEPair{3, 0}, RLEPair{0, 1}, RLEPair{15, 2}}) {
+   const std::array<RLEPair, 2> runs{{{1, 1}, invalid}};
+   CHECK_THROWS(assembly.append_box(box, runs));
+  }
+ }
+ SECTION("cancellation includes empty mask append and finish") {
+  cancelled.store(true);
+  CHECK_THROWS(assembly.append_box(box, {}));
+  CHECK_THROWS(assembly.append_box(box, input.storage().mask_rle_pairs));
+  CHECK_THROWS(assembly.begin_image({8, 0, 0, 8, 2, 0, 0}));
+  CHECK_THROWS(assembly.finish());
+  cancelled.store(false);
+ }
+ assembly.append_box(box, input.storage().mask_rle_pairs);
+ const auto product = assembly.finish();
+ REQUIRE(product.images.size() == 1);
+ CHECK(product.images.front().box_count == 1);
+ REQUIRE(product.boxes.size() == 1);
+ CHECK(product.boxes.front().mask_rle_offset == 0);
+ REQUIRE(product.mask_rle_pairs.size() == input.storage().mask_rle_pairs.size());
+ CHECK(std::memcmp(product.mask_rle_pairs.data(), input.storage().mask_rle_pairs.data(), product.mask_rle_pairs.size_bytes()) == 0);
+}
+TEST_CASE("normalized assembly handles empty extents and mapped capacity boundaries", "[benchmark][annotations][resources]") {
+ mmltk::testsupport::ScopedTempDir root("normalized-assembly-limits");
+ const auto input = label_projection_fixture(7);
+ SECTION("empty vector and mapped products") {
+  for (const bool mapped : {false, true}) {
+   NormalizedAnnotationAssembler assembly({}, 0, 0, 0, {}, mapped ? root.path() : fs::path{});
+   const auto product = assembly.finish();
+   CHECK(product.images.empty());
+   CHECK(product.boxes.empty());
+   CHECK(product.mask_rle_pairs.empty());
+   REQUIRE_NOTHROW(admit_normalized_annotations(product));
+  }
+  CHECK(fs::is_empty(root.path()));
+ }
+ SECTION("zero mapped capacity admits no image") {
+  NormalizedAnnotationAssembler assembly({}, 0, 0, 0, {}, root.path());
+  CHECK_THROWS(assembly.begin_image(input.image(0)));
+  CHECK(assembly.finish().images.empty());
+ }
+ SECTION("fixed mapped image box and run limits preserve admitted prefixes") {
+  NormalizedAnnotationAssembler assembly({}, 1, 1, 3, {}, root.path());
+  assembly.begin_image(input.image(0));
+  const std::array<RLEPair, 4> too_many{{{0, 1}, {2, 1}, {4, 1}, {6, 1}}};
+  CHECK_THROWS_AS(assembly.append_box(input.storage().boxes.front(), too_many), std::overflow_error);
+  assembly.append_box(input.storage().boxes.front(), input.storage().mask_rle_pairs);
+  CHECK_THROWS_AS(assembly.append_box(input.storage().boxes.front(), {}), std::overflow_error);
+  CHECK_THROWS(assembly.begin_image({8, 0, 0, 8, 2, 0, 0}));
+  const auto product = assembly.finish();
+  CHECK(product.images.size() == 1);
+  CHECK(product.boxes.size() == 1);
+  CHECK(product.mask_rle_pairs.size() == 3);
+ }
+ SECTION("Open Images may omit dimensions") {
+  for (const bool mapped : {false, true}) {
+   NormalizedAnnotationMetadata metadata;
+   metadata.source = BenchmarkDatasetSource::kOpenImagesV7;
+   NormalizedAnnotationAssembler assembly(metadata, 1, 0, 0, {}, mapped ? root.path() : fs::path{});
+   REQUIRE_NOTHROW(assembly.begin_image({7}));
+   CHECK(assembly.finish().images.front().width == 0);
+  }
+ }
+ SECTION("cancelled construction leaves no staging payload") {
+  std::atomic<bool> cancelled{true};
+  for (const bool mapped : {false, true})
+   CHECK_THROWS(NormalizedAnnotationAssembler({}, 1, 1, 3, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), mapped ? root.path() : fs::path{}));
+  CHECK(fs::is_empty(root.path()));
+ }
+}
+TEST_CASE("normalized run admission cancellation preserves the preceding box", "[benchmark][annotations][resources]") {
+ const bool mapped = GENERATE(false, true);
+ mmltk::testsupport::ScopedTempDir root("normalized-run-cancellation");
+ struct Cancellation {
+  mutable std::size_t observations = 0;
+  std::size_t stop = SIZE_MAX;
+  bool cancelled() const noexcept { return observations++ >= stop; }
+ } cancellation;
+ const auto input = label_projection_fixture(7);
+ NormalizedAnnotationAssembler assembly({}, 1, 2, 8196, mmltk::common::concurrency::CancellationObservation::Borrow(cancellation), mapped ? root.path() : fs::path{});
+ assembly.begin_image({7, 0, 0, 16386, 1, 0, 0});
+ assembly.append_box(input.storage().boxes.front(), input.storage().mask_rle_pairs);
+ std::vector<RLEPair> runs(8193);
+ for (std::uint32_t i = 0; i < runs.size(); ++i) runs[i] = {i * 2, 1};
+ cancellation.stop = cancellation.observations + 2;
+ CHECK_THROWS(assembly.append_box(input.storage().boxes.front(), runs));
+ cancellation.stop = SIZE_MAX;
+ const auto product = assembly.finish();
+ REQUIRE(product.images.size() == 1);
+ CHECK(product.images.front().box_count == 1);
+ REQUIRE(product.boxes.size() == 1);
+ CHECK(product.boxes.front().mask_rle_offset == 0);
+ REQUIRE(product.mask_rle_pairs.size() == 3);
+ CHECK(product.mask_rle_pairs.back().start == 4);
+}
 TEST_CASE("normalized label custody rejects unrelated backing for detached native spans", "[benchmark][pipeline][labels][resources]") {
+ mmltk::testsupport::ScopedTempDir root("empty-native-custody");
  CoconutNativeWorkspace workspace(CoconutImportLimits{});
  CoconutRecord record;
  record.image_id = 1;
@@ -7879,6 +8144,8 @@ TEST_CASE("normalized label custody rejects unrelated backing for detached nativ
  lineage->component.source = physical.source;
  workspace.borrow_support(record, {}, {1, 1}, std::make_shared<const int>(0));
  auto native = workspace.finish(record, physical, {1, 1}, lineage, {});
+ CHECK(CoconutNativeImage::stage(native, root.path()) == native);
+ CHECK(fs::is_empty(root.path()));
  auto read = CoconutNativeImage::read(native);
  const auto ordinary = label_projection_fixture(1);
  auto detached = read.view.storage();

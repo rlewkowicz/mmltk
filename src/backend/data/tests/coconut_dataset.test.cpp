@@ -6907,6 +6907,9 @@ TEST_CASE("admitted Parquet rows survive physical consumers and omit reused proj
  CHECK(rows.size() == 0);
 }
 TEST_CASE("native image custody survives workspace reuse and physical retirement", "[benchmark][coconut][annotations][resources]") {
+ const bool staged = GENERATE(false, true);
+ ScopedTempDir root("native-image-mapped-custody");
+ StorageReservationPool storage(root.path(), {});
  CoconutNativeWorkspace workspace(CoconutImportLimits{});
  CoconutRecord wide;
  wide.image_id = 7;
@@ -6926,6 +6929,27 @@ TEST_CASE("native image custody survives workspace reuse and physical retirement
  lineage->component.source = CoconutImageNamespace::CocoTrain;
  lineage->component.annotation_input_identity = "native-custody";
  auto product = workspace.finish(wide, coco(7), dimensions, lineage, {});
+ const auto identity = product->input_identity();
+ if (staged) {
+  const auto original = product;
+  product = CoconutNativeImage::stage(std::move(product), root.path(), &storage);
+  CHECK(product->input_identity() == identity);
+  CHECK(&product->lineage() == &original->lineage());
+  CHECK(std::memcmp(product->boxes().data(), original->boxes().data(), original->boxes().size_bytes()) == 0);
+  CHECK(std::memcmp(product->runs().data(), original->runs().data(), original->runs().size_bytes()) == 0);
+  CHECK(CoconutNativeImage::stage(product, root.path(), &storage) == product);
+ }
+ auto physical = coco(7, CoconutImageNamespace::CocoUnlabeled);
+ physical.shard = 3;
+ const auto* staged_runs = product->runs().data();
+ product = CoconutNativeImage::bind(std::move(product), physical);
+ CHECK(product->inventory().physical == physical);
+ CHECK(product->image().source_shard == 3);
+ CHECK(product->lineage().component.source == CoconutImageNamespace::CocoUnlabeled);
+ CHECK(lineage->component.source == CoconutImageNamespace::CocoTrain);
+ CHECK(product->input_identity() == identity);
+ if (staged) CHECK(product->runs().data() == staged_runs);
+ CHECK(CoconutNativeImage::bind(product, physical) == product);
  CHECK(workspace.retained_bytes() == capacity);
  REQUIRE(product->boxes().size() == 2);
  CHECK(product->runs().size() == 64);
@@ -6951,10 +6975,68 @@ TEST_CASE("native image custody survives workspace reuse and physical retirement
   workspace.retire();
   CHECK(workspace.retained_bytes() == 0);
   CHECK_FALSE(lifetime.expired());
+  if (staged) CHECK_FALSE(std::filesystem::is_empty(root.path()));
   CHECK(retained.view.image(0).width == 64);
   CHECK(retained.view.storage().boxes[1].source_ordinal == 5);
  }
  CHECK(lifetime.expired());
+ CHECK(std::filesystem::is_empty(root.path()));
+ CHECK(storage.outstanding() == 0);
+}
+TEST_CASE("staged segments share immutable backing and detach only the mutated copy", "[benchmark][coconut][annotations][resources]") {
+ ScopedTempDir root("coconut-segment-custody");
+ StorageReservationPool storage(root.path(), {});
+ CoconutSegments original{{.id = 1, .category_id = 18, .isthing = true, .area = 2.0, .bbox = std::array<double, 4>{0, 0, 1, 2}}};
+ original.stage(root.path(), &storage);
+ REQUIRE(std::distance(std::filesystem::directory_iterator(root.path()), std::filesystem::directory_iterator{}) == 1);
+ const auto path = std::filesystem::directory_iterator(root.path())->path();
+ auto reader = original;
+ auto changed = original;
+ CHECK(reader.data() == original.data());
+ changed[0].id = 2;
+ CHECK(changed.data() != original.data());
+ CHECK(reader.view()[0].id == 1);
+ CHECK(changed.view()[0].id == 2);
+ CHECK(changed.view()[0].area == reader.view()[0].area);
+ CHECK(changed.view()[0].bbox == reader.view()[0].bbox);
+ original = {};
+ CHECK(std::filesystem::exists(path));
+ CHECK(reader.view()[0].category_id == 18);
+ reader = {};
+ CHECK_FALSE(std::filesystem::exists(path));
+ changed.stage(root.path(), &storage);
+ CHECK(changed.view()[0].id == 2);
+ changed = {};
+ CoconutSegments empty;
+ empty.stage(root.path(), &storage);
+ CHECK(std::filesystem::is_empty(root.path()));
+ CHECK(storage.outstanding() == 0);
+}
+TEST_CASE("borrowed native support retains the complete temporary backing", "[benchmark][coconut][recovery][resources]") {
+ ScopedTempDir root("coconut-support-custody");
+ StorageReservationPool storage(root.path(), {});
+ const std::array<RLEPair, 2> input{{{0, 2}, {4, 1}}};
+ auto owner = std::make_shared<BenchmarkMappedArtifact>(storage, root.path() / "support", sizeof(input), "native support fixture");
+ const auto path = owner->path();
+ owner->write(input.data(), sizeof(input), 0);
+ const auto runs = std::span(static_cast<const RLEPair*>(owner->map_readonly()), input.size());
+ const std::weak_ptr<const BenchmarkMappedArtifact> lifetime = owner;
+ CoconutSupportRuns support;
+ support.borrow(runs, owner);
+ owner.reset();
+ CHECK_FALSE(lifetime.expired());
+ CHECK(std::filesystem::exists(path));
+ auto copied = support;
+ support.clear();
+ CHECK(copied.retained_bytes() == 0);
+ REQUIRE(copied.size() == 2);
+ CHECK(copied[1].start == 4);
+ CHECK(copied[1].length == 1);
+ CHECK_FALSE(lifetime.expired());
+ copied.clear();
+ CHECK(lifetime.expired());
+ CHECK_FALSE(std::filesystem::exists(path));
+ CHECK(storage.outstanding() == 0);
 }
 TEST_CASE("support run accounting follows retained capacity and ownership transfer", "[benchmark][coconut][recovery][resources]") {
  std::uint64_t owned = 0;
@@ -7294,6 +7376,8 @@ TEST_CASE("recovery batches publish independent labels before withheld geometry"
 }
 TEST_CASE("asynchronous native labels retain their sealed image until conversion settles", "[benchmark][coconut][pipeline][labels][resources]") {
  using namespace std::chrono_literals;
+ ScopedTempDir backing_root("asynchronous-native-backing");
+ StorageReservationPool storage(backing_root.path(), {});
  CoconutNativeWorkspace workspace(CoconutImportLimits{});
  CoconutRecord record;
  record.image_id = 7;
@@ -7306,6 +7390,7 @@ TEST_CASE("asynchronous native labels retain their sealed image until conversion
  auto lineage = std::make_shared<CoconutNativeLineage>();
  lineage->component.source = CoconutImageNamespace::CocoTrain;
  auto native = workspace.finish(record, coco(7), {1, 1}, lineage, {});
+ native = CoconutNativeImage::stage(std::move(native), backing_root.path(), &storage);
  const std::weak_ptr<const CoconutNativeImage> lifetime = native;
  BenchmarkCompilePipeline execution(1);
  mmltk::testsupport::TestGate held("native label consumer retains its sealed source");
@@ -7323,12 +7408,15 @@ TEST_CASE("asynchronous native labels retain their sealed image until conversion
  publication.geometry_ready(7, {1, 1});
  REQUIRE(held.WaitEntered(5s));
  CHECK_FALSE(lifetime.expired());
+ CHECK_FALSE(std::filesystem::is_empty(backing_root.path()));
  held.Release();
  auto product = execution.wait_image_labels(root, 7, "native");
  REQUIRE(product);
  REQUIRE(product->labels.size() == 1);
  CHECK(product->runs.front().length == 1);
  CHECK(lifetime.expired());
+ CHECK(std::filesystem::is_empty(backing_root.path()));
+ CHECK(storage.outstanding() == 0);
  const std::weak_ptr<const BenchmarkLabelChunk> placed_custody = product;
  PreparedBenchmarkSplit split;
  split.name = "train";

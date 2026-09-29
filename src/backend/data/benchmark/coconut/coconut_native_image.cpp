@@ -9,9 +9,9 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <stb_image.h>
-#include <sys/mman.h>
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 namespace mmltk::backend::data::benchmark_internal {
 namespace {
@@ -53,10 +53,6 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::rejected(const Coc
  result->input_identity_ = coconut_image_input_identity(result->lineage().component.annotation_input_identity, physical, result->lineage().component.original_annotation_identity);
  return result;
 }
-struct CoconutSegments::Backing {
- BenchmarkStagedArtifact artifact;
- mmltk::common::io::MappedByteRegion region;
-};
 void CoconutSegments::writable() {
  if (!backing_) return;
  values_.assign(mapped_.begin(), mapped_.end());
@@ -69,36 +65,25 @@ void CoconutSegments::stage(const std::filesystem::path& directory, StorageReser
  const auto bytes = mmltk::common::math::checked_multiply(values_.size(), sizeof(CoconutSegment), "COCONut segment staging overflow");
  std::filesystem::create_directories(directory);
  StorageReservationPool reservations(directory, {}, storage);
- auto owner = std::make_shared<Backing>();
- owner->artifact = BenchmarkStagedArtifact::create(reservations, directory / ".native-segments", bytes, "COCONut segment metadata");
- owner->artifact.resize(bytes, "COCONut segment metadata");
- owner->artifact.file().pwrite_all(values_.data(), bytes, 0);
- void* address = ::mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, owner->artifact.file().get(), 0);
- if (address == MAP_FAILED) throw mmltk::common::io::errno_error("map COCONut segment metadata");
- owner->region.adopt(address, bytes);
- owner->artifact.close();
+ auto owner = std::make_shared<BenchmarkMappedArtifact>(reservations, directory / ".native-segments", bytes, "COCONut segment metadata");
+ owner->write(values_.data(), bytes, 0);
+ const void* address = owner->map_readonly();
  mapped_ = {static_cast<const CoconutSegment*>(address), values_.size()};
  backing_ = std::move(owner);
  std::vector<CoconutSegment>().swap(values_);
 }
 std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::stage(std::shared_ptr<const CoconutNativeImage> source, const std::filesystem::path& directory, StorageReservationPool* storage) {
- if (source->mapping_ || (source->boxes_.empty() && source->runs_.empty())) return source;
+ if (source->backing_ || (source->boxes_.empty() && source->runs_.empty())) return source;
  const auto boxes = source->boxes();
  const auto runs = source->runs();
  const auto bytes = mmltk::common::math::checked_add(boxes.size_bytes(), runs.size_bytes(), "native staging extent overflow");
  const auto root = directory.empty() ? std::filesystem::temp_directory_path() : directory;
  std::filesystem::create_directories(root);
  StorageReservationPool reservations(root, {}, storage);
- auto staged = BenchmarkStagedArtifact::create(reservations, root / ".native-image", bytes, "COCONut native image");
- staged.resize(bytes, "COCONut native image");
- staged.file().pwrite_all(boxes.data(), boxes.size_bytes(), 0);
- staged.file().pwrite_all(runs.data(), runs.size_bytes(), boxes.size_bytes());
- auto mapping = std::make_shared<mmltk::common::io::MappedByteRegion>();
- void* address = ::mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, staged.file().get(), 0);
- if (address == MAP_FAILED) throw mmltk::common::io::errno_error("map native annotation image");
- mapping->adopt(address, bytes);
- // Keep storage custody until the last mapped borrower retires, without a file handle.
- staged.close();
+ auto backing = std::make_shared<BenchmarkMappedArtifact>(reservations, root / ".native-image", bytes, "COCONut native image");
+ backing->write(boxes.data(), boxes.size_bytes(), 0);
+ backing->write(runs.data(), runs.size_bytes(), boxes.size_bytes());
+ const void* address = backing->map_readonly();
  auto result = std::shared_ptr<CoconutNativeImage>(new CoconutNativeImage(source->lineage_));
  result->input_identity_ = source->input_identity_;
  result->image_ = source->image_;
@@ -107,8 +92,7 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::stage(std::shared_
  result->rejected_ = source->rejected_;
  result->segment_begin_ = source->segment_begin_;
  result->required_labels_valid_ = source->required_labels_valid_;
- result->staged_ = std::make_shared<BenchmarkStagedArtifact>(std::move(staged));
- result->mapping_ = mapping;
+ result->backing_ = std::move(backing);
  result->mapped_boxes_ = {static_cast<const NormalizedBox*>(address), boxes.size()};
  result->mapped_runs_ = {reinterpret_cast<const RLEPair*>(static_cast<const std::byte*>(address) + boxes.size_bytes()), runs.size()};
  return result;
@@ -128,8 +112,7 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::bind(std::shared_p
  result->rejected_ = source->rejected_;
  result->segment_begin_ = source->segment_begin_;
  result->required_labels_valid_ = source->required_labels_valid_;
- result->staged_ = source->staged_;
- result->mapping_ = source->mapping_;
+ result->backing_ = source->backing_;
  result->mapped_boxes_ = source->mapped_boxes_;
  result->mapped_runs_ = source->mapped_runs_;
  result->boxes_ = source->boxes_;

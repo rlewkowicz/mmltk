@@ -22,8 +22,8 @@
 #include <string_view>
 #include <vector>
 #include <utility>
-#include "src/common/io/file_memory.h"
 namespace mmltk::backend::data::benchmark_internal {
+class BenchmarkMappedArtifact;
 class CoconutInputError final : public std::runtime_error {
 public:
  using std::runtime_error::runtime_error;
@@ -71,8 +71,7 @@ public:
  void stage(const std::filesystem::path&, StorageReservationPool*);
 private:
  void writable();
- struct Backing;
- std::shared_ptr<const Backing> backing_;
+ std::shared_ptr<const BenchmarkMappedArtifact> backing_;
  std::span<const CoconutSegment> mapped_;
  std::vector<CoconutSegment> values_;
 };
@@ -97,7 +96,6 @@ struct CoconutNativeLineage {
  CoconutComponentMetadata component;
  NormalizedAnnotationMetadata index;
 };
-class BenchmarkStagedArtifact;
 class CoconutNativeWorkspace;
 class CoconutNativeImage final {
 public:
@@ -129,8 +127,7 @@ private:
  NormalizedImage image_;
  std::vector<NormalizedBox> boxes_;
  std::vector<RLEPair> runs_;
- std::shared_ptr<BenchmarkStagedArtifact> staged_;
- std::shared_ptr<const mmltk::common::io::MappedByteRegion> mapping_;
+ std::shared_ptr<const BenchmarkMappedArtifact> backing_;
  std::span<const NormalizedBox> mapped_boxes_;
  std::span<const RLEPair> mapped_runs_;
  bool required_labels_valid_ = true;

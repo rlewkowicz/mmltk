@@ -1039,41 +1039,35 @@ NormalizedAnnotationIndex seal_normalized_annotation_metadata(NormalizedAnnotati
  return result;
 }
 struct NormalizedAnnotationAssembler::Mapped {
- BenchmarkStagedArtifact staged;
- mmltk::common::io::MappedByteRegion region;
+ BenchmarkMappedArtifact artifact;
  std::span<NormalizedImage> images;
  std::span<NormalizedBox> boxes;
  std::span<RLEPair> runs;
  std::size_t image_count = 0, box_count = 0, run_count = 0;
+ Mapped(StorageReservationPool& storage, const std::filesystem::path& path, std::size_t bytes) : artifact(storage, path, bytes, "normalized annotation assembly") {}
 };
 NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(
  NormalizedAnnotationMetadata metadata, std::size_t images, std::size_t boxes, std::size_t runs, mmltk::common::concurrency::CancellationObservation cancellation,
  const std::filesystem::path& staging_directory, StorageReservationPool* storage)
     : cancellation_(cancellation) {
+ throw_if_benchmark_cancelled(cancellation_);
  static_cast<NormalizedAnnotationMetadata&>(builder_) = std::move(metadata);
  if (!staging_directory.empty()) {
   const auto image_bytes = mmltk::common::math::checked_multiply(images, sizeof(NormalizedImage), "normalized image staging overflow");
   const auto box_bytes = mmltk::common::math::checked_multiply(boxes, sizeof(NormalizedBox), "normalized box staging overflow");
   const auto run_offset = mmltk::common::math::checked_add(image_bytes, box_bytes, "normalized staging overflow");
   const auto bytes = mmltk::common::math::checked_add(run_offset, mmltk::common::math::checked_multiply(runs, sizeof(RLEPair), "normalized run staging overflow"), "normalized staging overflow");
+  std::filesystem::create_directories(staging_directory);
+  StorageReservationPool reservations(staging_directory, {}, storage);
+  auto owner = std::make_shared<Mapped>(reservations, staging_directory / ".normalized-assembly", bytes);
+  auto* data = static_cast<std::byte*>(owner->artifact.map_writable());
   if (bytes) {
-   std::filesystem::create_directories(staging_directory);
-   StorageReservationPool reservations(staging_directory, {}, storage);
-   auto file = BenchmarkStagedArtifact::create(reservations, staging_directory / ".normalized-assembly", bytes, "normalized annotation assembly");
-   file.resize(bytes, "normalized annotation assembly");
-   auto owner = std::make_shared<Mapped>();
-   void* address = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, file.file().get(), 0);
-   if (address == MAP_FAILED) throw mmltk::common::io::errno_error("map normalized annotation assembly");
-   owner->region.adopt(address, bytes);
-   file.close();
-   owner->staged = std::move(file);
-   auto* data = static_cast<std::byte*>(address);
    owner->images = {reinterpret_cast<NormalizedImage*>(data), images};
    owner->boxes = {reinterpret_cast<NormalizedBox*>(data + image_bytes), boxes};
    owner->runs = {reinterpret_cast<RLEPair*>(data + run_offset), runs};
-   mapped_ = std::move(owner);
-   return;
   }
+  mapped_ = std::move(owner);
+  return;
  }
  builder_.images.reserve(images);
  builder_.boxes.reserve(boxes);
@@ -1082,70 +1076,59 @@ NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(
 void NormalizedAnnotationAssembler::begin_image(NormalizedImage image) {
  if (finished_) throw std::logic_error("normalized assembler is already sealed");
  throw_if_benchmark_cancelled(cancellation_);
- if (mapped_) {
-  if (mapped_->image_count == mapped_->images.size() || (mapped_->image_count && image.source_image_id <= mapped_->images[mapped_->image_count - 1].source_image_id) || image.reserved ||
-      (builder_.source != BenchmarkDatasetSource::kOpenImagesV7 && (!image.width || !image.height))) throw std::runtime_error("normalized benchmark image record is invalid");
-  image.first_box = mapped_->box_count;
-  image.box_count = 0;
-  mapped_->images[mapped_->image_count++] = image;
-  return;
- }
- if ((!builder_.images.empty() && image.source_image_id <= builder_.images.back().source_image_id) || image.reserved ||
+ const auto images = mapped_ ? mapped_->images.first(mapped_->image_count) : std::span(builder_.images);
+ if ((!images.empty() && image.source_image_id <= images.back().source_image_id) || image.reserved ||
      (builder_.source != BenchmarkDatasetSource::kOpenImagesV7 && (!image.width || !image.height)))
   throw std::runtime_error("normalized benchmark image record is invalid");
- image.first_box = builder_.boxes.size();
+ image.first_box = mapped_ ? mapped_->box_count : builder_.boxes.size();
  image.box_count = 0;
- builder_.images.push_back(image);
+ if (mapped_) {
+  if (mapped_->image_count == mapped_->images.size()) throw std::runtime_error("normalized benchmark image record is invalid");
+  mapped_->images[mapped_->image_count++] = image;
+ } else builder_.images.push_back(image);
 }
 void NormalizedAnnotationAssembler::append_box(NormalizedBox box, std::span<const RLEPair> runs) {
  if (finished_) throw std::logic_error("normalized assembler is already sealed");
+ throw_if_benchmark_cancelled(cancellation_);
+ const auto images = mapped_ ? mapped_->images.first(mapped_->image_count) : std::span(builder_.images);
+ if (images.empty()) throw std::logic_error("normalized box requires an owning image");
+ auto& image = images.back();
+ if (image.box_count == UINT32_MAX) throw std::overflow_error("normalized per-image box count overflow");
+ if (mapped_ && (mapped_->box_count == mapped_->boxes.size() || runs.size() > mapped_->runs.size() - mapped_->run_count))
+  throw std::overflow_error("normalized assembly extent exceeded");
+ const auto first_run = mapped_ ? mapped_->run_count : builder_.mask_rle_pairs.size();
+ box.mask_rle_offset = first_run;
+ box.mask_rle_pairs = checked_cast<std::uint32_t>(runs.size(), "normalized mask run count overflow");
+ validate_box_value(box, builder_.source);
+ std::uint64_t previous = 0;
+ for (std::size_t i = 0; i < runs.size(); ++i) {
+  if ((i & 4095U) == 0) throw_if_benchmark_cancelled(cancellation_);
+  previous = validate_run_value(runs[i], std::uint64_t{image.width} * image.height, previous);
+ }
  if (mapped_) {
-  if (!mapped_->image_count) throw std::logic_error("normalized box requires an owning image");
-  auto& image = mapped_->images[mapped_->image_count - 1];
-  if (mapped_->box_count == mapped_->boxes.size() || runs.size() > mapped_->runs.size() - mapped_->run_count || image.box_count == UINT32_MAX) throw std::overflow_error("normalized assembly extent exceeded");
-  box.mask_rle_offset = mapped_->run_count;
-  box.mask_rle_pairs = checked_cast<std::uint32_t>(runs.size(), "normalized mask run count overflow");
-  validate_box_value(box, builder_.source);
-  std::uint64_t previous = 0;
-  for (std::size_t i = 0; i < runs.size(); ++i) {
-   if ((i & 4095U) == 0) throw_if_benchmark_cancelled(cancellation_);
-   previous = validate_run_value(runs[i], std::uint64_t{image.width} * image.height, previous);
-  }
   if (!runs.empty()) std::memcpy(mapped_->runs.data() + mapped_->run_count, runs.data(), runs.size_bytes());
   mapped_->run_count += runs.size();
   mapped_->boxes[mapped_->box_count++] = box;
-  ++image.box_count;
-  return;
- }
- if (builder_.images.empty()) throw std::logic_error("normalized box requires an owning image");
- auto& image = builder_.images.back();
- box.mask_rle_offset = builder_.mask_rle_pairs.size();
- box.mask_rle_pairs = checked_cast<std::uint32_t>(runs.size(), "normalized mask run count overflow");
- validate_box_value(box, builder_.source);
- if (image.box_count == UINT32_MAX) throw std::overflow_error("normalized per-image box count overflow");
- const auto first_run = builder_.mask_rle_pairs.size();
- try {
-  std::uint64_t previous = 0;
-  for (std::size_t i = 0; i < runs.size(); ++i) {
-   if ((i & 4095U) == 0) throw_if_benchmark_cancelled(cancellation_);
-   previous = validate_run_value(runs[i], std::uint64_t{image.width} * image.height, previous);
-   builder_.mask_rle_pairs.push_back(runs[i]);
+ } else {
+  try {
+   builder_.mask_rle_pairs.insert(builder_.mask_rle_pairs.end(), runs.begin(), runs.end());
+   builder_.boxes.push_back(box);
+  } catch (...) {
+   builder_.mask_rle_pairs.resize(first_run);
+   throw;
   }
-  builder_.boxes.push_back(box);
-  ++image.box_count;
- } catch (...) {
-  builder_.mask_rle_pairs.resize(first_run);
-  throw;
  }
+ ++image.box_count;
 }
 NormalizedAnnotationIndex NormalizedAnnotationAssembler::finish(const BenchmarkTraceSink& trace) {
  if (finished_) throw std::logic_error("normalized assembler is already sealed");
  throw_if_benchmark_cancelled(cancellation_);
  trace_benchmark_event(trace, "benchmark.annotations.assembled", [&] {
   return nlohmann::json{
-   {"source", benchmark_source_name(builder_.source)}, {"split", builder_.split}, {"images", builder_.images.size()}, {"boxes", builder_.boxes.size()},
-   {"mask_rle_pairs", builder_.mask_rle_pairs.size()}, {"image_capacity", builder_.images.capacity()}, {"box_capacity", builder_.boxes.capacity()},
-   {"mask_rle_capacity", builder_.mask_rle_pairs.capacity()}
+   {"source", benchmark_source_name(builder_.source)}, {"split", builder_.split}, {"images", mapped_ ? mapped_->image_count : builder_.images.size()},
+   {"boxes", mapped_ ? mapped_->box_count : builder_.boxes.size()}, {"mask_rle_pairs", mapped_ ? mapped_->run_count : builder_.mask_rle_pairs.size()},
+   {"image_capacity", mapped_ ? mapped_->images.size() : builder_.images.capacity()}, {"box_capacity", mapped_ ? mapped_->boxes.size() : builder_.boxes.capacity()},
+   {"mask_rle_capacity", mapped_ ? mapped_->runs.size() : builder_.mask_rle_pairs.capacity()}
   };
  });
  NormalizedAnnotationIndex result;

@@ -699,8 +699,7 @@ struct PendingNativeImage {
  CoconutPhysicalImage physical;
  dataset::MaskDimensions dimensions;
  std::uint32_t unlisted_segment = 0;
- BenchmarkStagedArtifact staged;
- std::shared_ptr<const mmltk::common::io::MappedByteRegion> mapping;
+ std::shared_ptr<const BenchmarkMappedArtifact> backing;
  std::span<const Support> supports;
  std::span<const RLEPair> runs;
  std::shared_ptr<const CoconutNativeImage> product;
@@ -715,25 +714,19 @@ struct PendingNativeImage {
   const auto root = directory.empty() ? std::filesystem::temp_directory_path() : directory;
   std::filesystem::create_directories(root);
   StorageReservationPool reservations(root, {}, storage);
-  auto file = BenchmarkStagedArtifact::create(reservations, root / ".native-support", bytes, "pending native support");
-  file.resize(bytes, "pending native support");
+  auto owner = std::make_shared<BenchmarkMappedArtifact>(reservations, root / ".native-support", bytes, "pending native support");
   std::size_t offset = 0;
   for (std::size_t i = 0; i < input.size(); ++i) {
    const auto& item = input[i];
    const Support header{item.area, item.bounds, offset, item.runs.size(), item.valid};
-   file.file().pwrite_all(&header, sizeof(header), i * sizeof(header));
-   file.file().pwrite_all(item.runs.data(), item.runs.size() * sizeof(RLEPair), run_offset + offset * sizeof(RLEPair));
+   owner->write(&header, sizeof(header), i * sizeof(header));
+   owner->write(item.runs.data(), item.runs.size() * sizeof(RLEPair), run_offset + offset * sizeof(RLEPair));
    offset += item.runs.size();
   }
-  auto owner = std::make_shared<mmltk::common::io::MappedByteRegion>();
-  void* address = ::mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, file.file().get(), 0);
-  if (address == MAP_FAILED) throw mmltk::common::io::errno_error("map pending native support");
-  owner->adopt(address, bytes);
+  const void* address = owner->map_readonly();
   supports = {static_cast<const Support*>(address), input.size()};
   runs = {reinterpret_cast<const RLEPair*>(static_cast<const std::byte*>(address) + run_offset), static_cast<std::size_t>(count)};
-  mapping = std::move(owner);
-  file.close();
-  staged = std::move(file);
+  backing = std::move(owner);
  }
  std::vector<CoconutSegmentSupport> read_support() const {
   std::vector<CoconutSegmentSupport> result(supports.size());
@@ -741,7 +734,7 @@ struct PendingNativeImage {
    result[i].valid = supports[i].valid;
    result[i].area = supports[i].area;
    result[i].bounds = supports[i].bounds;
-   result[i].runs.borrow(runs.subspan(supports[i].first_run, supports[i].runs), mapping);
+   result[i].runs.borrow(runs.subspan(supports[i].first_run, supports[i].runs), backing);
   }
   return result;
  }
@@ -1079,7 +1072,6 @@ public:
   }
   worker.retained.store(workspace.retained_bytes(), std::memory_order_relaxed);
   if (complete) {
-   complete = CoconutNativeImage::stage(std::move(complete), request_.inventory_directory, request_.execution ? &request_.execution->storage() : nullptr);
    if (!saved && !reused) settle_report(*complete);
    if (!saved)
     retain_image(position, complete);
@@ -1353,7 +1345,6 @@ private:
   return nullptr;
  }
  void retain_image(std::size_t position, std::shared_ptr<const CoconutNativeImage> product) {
-  if (product) product = CoconutNativeImage::stage(std::move(product), request_.inventory_directory, request_.execution ? &request_.execution->storage() : nullptr);
   {
    const std::lock_guard lock(groups_mutex_);
    request_.records->native(position, std::move(product));
@@ -1465,7 +1456,6 @@ private:
    else
     for (std::size_t i = 0; i < batch.size(); ++i) recover(i);
    for (auto& native : batch) {
-    native->product = CoconutNativeImage::stage(std::move(native->product), request_.inventory_directory, request_.execution ? &request_.execution->storage() : nullptr);
     settle_report(*native->product);
     retain_image(native->position, native->product);
     publish_labels(std::move(native->product), native->publication);
