@@ -328,11 +328,17 @@ artifact names and monotonic timestamps do not join different runs.
 | `benchmark.images.cache_scan`, `.cache_reuse`, `.progress` | `source`/`shard`, inspected/reused/resolved images, and selection counts |
 | `benchmark.images.validation_failed` | Rejected archive `member`, `image_id`, `source`/`shard`, encoded `bytes`, and `reason` |
 | `benchmark.archive.scan`, `.extracted`, `.extract_cache_hit` | Archive traversal or annotation-member extraction/reuse |
+| `benchmark.archive.admission_wait` | Source admission snapshot: `bytes`, `descriptors`, `committed_descriptors`, `descriptor_capacity`, `producer_ceiling`, and `active_cpus`; `reason` is `source_admission` |
+| `benchmark.annotations.originals_wait`, `.originals_begin` | Entry to stock-original lifecycle admission, then admitted work with `recover_dropped_masks` and numeric `validation` |
 | `benchmark.annotations.release_metadata`, `.release_complete` | COCONut release `edition` and `cache_hit` at metadata and full-mask completion respectively |
 | `benchmark.annotations.component_admitted` | Reused COCONut component `edition`, physical `source`, and `images` |
+| `benchmark.annotations.assembled`, `.workspace` | Assembled image/box/run counts and retained vector capacities, or a parser lane's `retained_sparse_bytes` |
+| `benchmark.labels.placed` | Completed final split placement: `split`, `images`, `labels`, and `runs` |
 | `benchmark.images.archive_retry`, `benchmark.pixel_compile.cache_repair` | Bounded image/archive repair context |
+| `benchmark.download.failure_sha256`, `benchmark.images.failure_sha256` | Failure digest and cause for an artifact or image; COCONut annotation repair additionally reports `matches_expected` |
 | `benchmark.pixel_compile.throughput`, `.complete` | Completed/total images where available, `split`, elapsed seconds, images/second, and ETA observations |
-| `benchmark.storage.projection`, `benchmark.publication.complete` | Planned storage bounds, then actual successful publication facts |
+| `benchmark.storage.reserved`, `.projection` | Outstanding physical-growth reservation (`required_bytes`, aggregate `reserved_bytes`, `available_bytes`) or projected output bounds |
+| `benchmark.publication.complete` | Successful final publication facts |
 
 For a capture produced by [the GUI example](#capture-one-reproduction):
 
@@ -349,8 +355,12 @@ For a capture produced by [the GUI example](#capture-one-reproduction):
   --where 'source="objects365" AND shard="patch-17"' \
   --format timeline --limit 40
 ./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
-  -q '@event:benchmark.annotations OR @event:benchmark.pixel_compile' \
+  -q '@event:benchmark.annotations OR @event:benchmark.labels OR @event:benchmark.pixel_compile' \
   --format timeline --limit 60
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
+  -q '@event=benchmark.archive.admission_wait' \
+  --fields @event,reason,bytes,descriptors,committed_descriptors,descriptor_capacity,producer_ceiling,active_cpus \
+  --format timeline --limit 20
 ```
 
 [Compilation progress](benchmark-datasets.md#reading-compilation-progress) defines
@@ -359,6 +369,20 @@ source aggregation. Release/pixel/acquisition records can interleave; phase name
 are not exclusive execution states. These observations prove neither performance
 gains nor, from unchanged fractions or absent best-effort records, deadlock or
 network liveness.
+
+Admission snapshots describe the shared ledger at an observation point, not
+process RSS, filesystem-wide reservations, or a deadlock diagnosis. The
+[resource reference](benchmark-datasets.md#memory-descriptors-and-storage)
+distinguishes transient workspace from retained canonical products.
+Metadata, originals, normalization, labels, and pixels can progress separately;
+`release_complete` is not a prerequisite for every image's label conversion.
+
+Failure hashing follows [cache repair policy](benchmark-datasets.md#persistent-cache-and-publication).
+Pinned annotation checksums used to decide replacement remain required without
+tracing. Optional diagnostic hashes are collected only with a trace sink;
+enabling logs does not authorize cache reuse or repair. `failed.txt` is a
+separate append-only [omitted-object report](benchmark-datasets.md#native-import-and-provenance),
+not a trace or current recovery-count ledger.
 
 Transfer observers exist only for progress/tracing; unobserved segmented downloads
 skip progress locking and clock reads. Trace construction/serialization/callback

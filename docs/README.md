@@ -39,7 +39,8 @@
   geometry, perceptual downscaling, loading/leases, and Explore cache residency.
 - [Built-in benchmark datasets](benchmark-datasets.md): recipe membership,
   native import/provenance, optional mask recovery, persistent cache/repair,
-  overlapping compilation, progress units, and capacity limits.
+  shared execution/resource admission, archive and Parquet continuation,
+  immutable image/annotation custody, progress units, and capacity limits.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA selection,
   transfers, runtime retirement, inference lanes, readbacks, Vulkan/CUDA import,
   sparse display damage, Upscale preparation, and capability inspection.
@@ -48,8 +49,8 @@
 
 - [Validation](validation.md): required gates, suite/filter selection, tidy,
   test-run replacement, PCH include audits, cleanup and raw-review tooling,
-  declaration formatting, diagnostics, evidence ownership, rendered acceptance,
-  numerical coverage, fixtures, and evidence limits.
+  declaration formatting, symbol/address and GPU diagnostics, evidence ownership,
+  rendered acceptance, numerical coverage, fixtures, and evidence limits.
 - [Headless Wayland](headless-wayland.md): private NVIDIA Weston setup, input
   seat, readiness, deadlines, shutdown, artifacts, and limitations.
 - [Logging](logging.md): automatic build/test/tidy transcripts, opt-in runtime

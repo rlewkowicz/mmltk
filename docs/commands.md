@@ -32,9 +32,9 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --diagnose-benchmark-image --image-id ID [OPTIONS]` | Compare retained image headers with normalized annotation geometry |
 | `./mmltk --diagnose-io FILE` | Report a compiled file's storage/GPU capabilities |
 | `./mmltk --diagnose-gpu-environment runtime\|wayland-validation\|development` | Inspect an existing image's GPU, driver, library, and ICD environment |
-| `./mmltk --diagnose-gpu-program SOURCE.cpp ARGS...` | Compile and run a standalone CUDA-driver/Vulkan diagnostic using existing images |
+| `./mmltk --diagnose-gpu-program [--torch] SOURCE.cpp ARGS...` | Compile and run a standalone CUDA-driver/Vulkan diagnostic, optionally linked to pinned PyTorch, using existing images |
 | `./mmltk --diagnose-nvidia-payload donor\|development HEADER...` | Inspect public NVIDIA headers and payload selection |
-| `./mmltk --diagnose-native-symbols [OPTIONS] ARTIFACT...` | Inspect cached native `.a`/`.o` symbols with the existing development image |
+| `./mmltk --diagnose-native-symbols [OPTIONS] ARTIFACT...` | Inspect cached native `.a`/`.o` symbols or resolve `--address HEX` values in one ELF artifact with the existing development image |
 | `./mmltk --diagnose-native-link [OPTIONS] TARGET` | Repeat one generated Release link into separate diagnostic storage |
 
 The `|` entries above mean choose one value; they are not shell pipelines.

@@ -193,6 +193,9 @@ advancing. Pause stops new admission; Stop, exceptions, partial setup, and
 callback failures drain admitted work before releasing its resources.
 Training validation likewise drains before restoring EMA-selected working
 weights, optimizer mutation, model merging, or checkpoint publication.
+The [evaluation run owner](../src/backend/models/rfdetr/training/evaluation_run_owner.cpp)
+destroys matcher/runtime tensor storage before closing the lane pool: tensor
+allocator retirement may still reference those execution streams.
 
 ## Prediction preview storage
 

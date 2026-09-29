@@ -298,7 +298,10 @@ owns both execution and the corresponding `--no-run` check commands.
 The browser test route explicitly requests NVIDIA graphics access, selects the
 container's NVIDIA Vulkan ICD files, and sets the renderer backend to Vulkan.
 It applies this setup whether called directly or from `all`; missing NVIDIA
-Vulkan ICDs fail the route. `iced_plot` owns its native test dependencies in
+Vulkan ICDs fail the route. The browser-app/iced_plot Cargo invocation sets
+`RUST_TEST_THREADS=1` to serialize cases that own independent Vulkan devices.
+The separate iced_aw library invocation retains its
+own test scheduling. `iced_plot` owns its native test dependencies in
 its [manifest](../third_party/iced_plot/Cargo.toml), including package-selected
 tests and doctests.
 
@@ -476,6 +479,15 @@ expression over symbol records, `--mangled` for linker names, and a bounded
 `--limit` (default 200, range 1–10000). JSONL contains symbol records and a final
 matched/emitted/exit-status summary.
 
+Repeat `--address HEX` with exactly one repository or installed `/opt` ELF
+artifact to resolve instruction addresses through `addr2line`. Values accept
+hexadecimal digits with an optional `0x`; their count cannot exceed `--limit`.
+This route emits one JSONL `owner: "native-symbols"`, `event: "address"` record
+per result, with `artifact`, `address`, and the demangled location in `message`.
+It does not emit the symbol-list summary. Use addresses in that artifact's
+address space and retain the matching binary/debug information; unresolved
+locations or symbols alone do not establish an implementation defect.
+
 The link diagnostic reads the existing `.cache/cmake/release` Ninja executable
 rule, then repeats that direct GCC link into a unique
 `build/diagnostics/native-link.*` directory. Use the generated executable output
@@ -530,11 +542,16 @@ For a focused standalone `.cpp` diagnostic outside that retained target:
 
 ```bash
 ./mmltk --diagnose-gpu-program ./probe.cpp
+./mmltk --diagnose-gpu-program --torch ./probe.cpp
 ```
 
 This wrapper capability compiles one C++26 source against the CUDA driver and
 Vulkan using the existing development image, then runs it in the existing
-Wayland validation image. Extra arguments go directly to the program.
+Wayland validation image. `--torch` must precede the source path and adds the
+pinned PyTorch headers, its C++ ABI definition, Torch/C10 CPU and CUDA libraries,
+and the CUDA runtime. The wrapper queries that installed Torch package for its
+location and ABI; it does not install a diagnostic dependency. Extra arguments
+after the source go directly to the program.
 Compilation and execution each have a 120-second deadline; neither starts a
 compositor, builds/pulls images, nor uses the network. It writes its executable
 under a printed unique `build/diagnostics/gpu-program.*` directory. Use this
@@ -978,6 +995,11 @@ use relative `0.001` and absolute `0.0003`. Independent primitive/criterion
 fixtures retain their tighter elementwise equation checks and explicit samples.
 The source assertions own the exact bounds for each case; a composed AMP
 tolerance is not a universal tolerance for arbitrary training inputs.
+The one-query SDPA positional-gradient cancellation case permits the same
+`0.003` absolute rounding residue as its dense gradient oracle. The separate
+exact next-batch/Resume trajectory fixture enables deterministic cuDNN and
+disables cuDNN benchmarking for its comparison, then restores both settings.
+That fixture policy does not change ordinary training defaults.
 
 A retained compilation capture from the validated NGC payload contained
 1,163 executor-reuse records: 26 evaluation-backbone records each contained 33 TensorExpr groups;
@@ -1008,8 +1030,9 @@ behavior independently of rendered UI acceptance:
 
 | Owner | Evidence |
 | --- | --- |
-| [benchmark_dataset.test.cpp](../src/backend/data/tests/benchmark_dataset.test.cpp), `mmltk_backend_data_tests` | Cache-root precedence and staging/publication overlap, completed-group and individual-JPEG reuse, typed artifact/image readiness, pixels during held labels/acquisition, single-worker execution, source-lease retirement, startup/failure unwinding, independent progress and retry withdrawal, durable segmented resume, unknown-total downloads, lazy diagnostics, and typed storage failure |
-| [coconut_dataset.test.cpp](../src/backend/data/tests/coconut_dataset.test.cpp), same target | Pinned recipe selection, all validation choices, exact masks and physical/release joins, empty images, canonical paths/inventory bytes, cross-recipe reuse, immutable cold/partial/warm admissions, ready metadata during held masks/leases, aggregate indexing through repair, stock cache reuse, and unchanged prior publication on failure/cancellation |
+| [benchmark_dataset.test.cpp](../src/backend/data/tests/benchmark_dataset.test.cpp), `mmltk_backend_data_tests` | Cache-root and output overlap, retained image/index generations, shared CPU/byte/descriptor/storage admission, mixed ordinary/range transport, Open Images group continuation, independent pixels/labels, canonical final placement, cancellation/repair, progress, and lazy diagnostics |
+| [coconut_dataset.test.cpp](../src/backend/data/tests/coconut_dataset.test.cpp), same target | Pinned membership and validation choices, exact masks and physical/release joins, requested archive resolution, archive/Parquet continuation, independent originals/native recovery/label conversion, component dependency identity, cache reuse/repair, and atomic publication |
+| [roundtrip.test.cpp](../src/backend/data/tests/roundtrip.test.cpp), same target | Fused compiled-record admission, malformed section/record rejection, present-empty masks, Directory output equality across workers, and preservation of published output on failure |
 | [application_compute_services.test.cpp](../src/controller/subsystems/system/tests/application_compute_services.test.cpp), `mmltk_controller_data_compute_systems_tests` | Environment cache selection and staged/final output overlap through the artifact service, retained choices through materialization, and real resumed/restarted/unknown-total HTTP observations projected as typed transfer facts separately from bounded activity at an unchanged image fraction |
 | [dataset_system.test.cpp](../src/controller/subsystems/system/tests/dataset_system.test.cpp), same target | Explicit compile captures settled choices, later settings edits preserve the admitted request, owned diagnostics survive runtime reconstruction and stop/join, open-ended/recovered progress remains valid, and malformed progress including transfer/retained-byte bounds is rejected |
 | [dataset_wiring.test.cpp](../src/controller/shell/tests/dataset_wiring.test.cpp), `mmltk_controller_shell_tests` | Production shell/factory propagation of enabled and disabled diagnostics through the staged compiler path |
@@ -1034,11 +1057,23 @@ Dataset-system cases capture the recovery choice with the other settled compile
 settings, and later edits leave the admitted operation unchanged.
 
 Pipeline cases hold a specific source, label, mask, or reader boundary and
-require independent eligible work to complete before releasing it. They cover
-duplicate readiness under queue pressure, retained pixels after quarantine,
-compatible pixel reuse through repair, release-reader retirement, and staged
-output capacity. These causal fixtures establish overlap and bounded custody;
-they do not measure production-release throughput or live-download duration.
+require independent eligible work to complete before releasing it. Their
+causal coverage includes:
+
+| Boundary | Cases in the data suites |
+| --- | --- |
+| CPU admission | One CPU, jobs beyond a blocked stage head, cooperative parser yield, shared late pixel/label work, first failure, and cancellation of queued/active borrowers |
+| Memory and descriptors | Legal oversized inputs, retained Arrow/encoded backing, scratch reuse/retirement, stable workspace loans including zero-byte offers, nested descriptor commitments, low descriptor limits, and release before reacquisition |
+| Filesystem growth | Shared destination-filesystem reservations, sparse allocation, allocation withdrawal, inode aliases, staged moves/publication, and cleanup during exceptions |
+| Transport | Contended artifact locks, whole files alongside stored ranges, one-connection resume, rejected validators/coverage, durable out-of-order checkpoints, redirects, fair Curl admission, Open Images retries, and channel cancellation |
+| Archives and Parquet | Requested members before unused tails, consumed checksum/truncation errors, raw/ZIP/sparse/gzip continuation, bounded gzip dictionaries/controls, retained Parquet rows/batches, independent groups, and pressure-driven reader retirement |
+| Immutable products | Mapped indexes/images across path replacement, independent original split publication/withdrawal, retained native support through repair, full-backing component dependencies, and cached groups that omit payload projections |
+| Final labels | Per-image geometry joins, labels during held pixels and vice versa, canonical ordinals and offsets, present-empty masks, validation placement during held training, and malformed/partial assembly rejection |
+
+These fixtures establish overlap, ownership, deterministic artifacts, and the
+specified capacity behavior. They do not measure production-release throughput,
+peak process memory, or live-download duration. Resource targets are described
+in [benchmark memory and storage](benchmark-datasets.md#memory-descriptors-and-storage).
 Progress cases retain one artifact/release contribution across interleaving,
 repair, and preparation replacement, with explicit withdrawals instead of
 counting repeated attempts as completed work.
@@ -1076,6 +1111,7 @@ their owning components and publish their own declaration dependencies.
 | Fixture | Ownership and use |
 | --- | --- |
 | [ScopedTestStream](../src/test_support/cuda_test_utils.hpp) | Neutral nonblocking CUDA stream lifetime for media and inference tests |
+| [CudaTestGate](../src/test_support/cuda_test_gate.h) | Holds one compute stream until a CPU release while independent DMA remains runnable; destruction releases and joins the held stream |
 | [Dataset fixture](../src/backend/data/tests/test_fixture.h) | Synthetic inputs, one canonical compiler configuration, and compilation of existing deliberately modified inputs |
 | [NUMA topology support](../src/common/system/tests/numa_topology_test_support.h) | Value-only selection from a caller-captured topology; each scenario retains its own snapshot and worker budget |
 | [ClassArtifactFixture](../src/backend/models/rfdetr/core/tests/class_artifact_fixture.h) | RF-DETR artifact/descriptor seeding and independent SHA-256 preservation checks, including absence of staged directories |
@@ -1101,6 +1137,9 @@ cleanup. Borrowed GPU locks are acquired and released on their owning thread;
 contention is probed from another thread. Test-side failure must settle
 pending readers before runtime teardown. Physical lifecycle, inventory,
 frame identity, patch counts, and rendered samples keep independent assertions.
+GPU overlap fixtures prepare first-use kernels and pinned/device slots before
+placing deliberate holds. A hold is released on failure before joining its
+pending work; the shared CUDA gate needs no further GPU submission to release.
 Missing, mismatched, duplicate, or causally invalid evidence is not replaced by
 inference from another artifact. Exact draw identities allow valid non-FIFO
 completion while final release still requires every encoded reader to settle.

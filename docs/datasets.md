@@ -391,19 +391,28 @@ emphasize noise; no detector-accuracy or measured performance benefit is claimed
 
 [Metadata-only `info`](#compile-and-inspect) checks the header and section
 extents. Product loading through [CompiledDataset](../src/backend/data/compiled/compiled_dataset.h)
-performs the full structural check before exposing views:
+combines record admission with construction of its label lookup before exposing
+views:
 
 1. map the regular file read-only with `MAP_SHARED`;
 2. copy and validate the header magic, version, dimensions, stride, and limits;
 3. validate section order, exact sizes, 2 MiB pixel alignment, and end of file;
-4. validate every pixel and label index, original dimension, class ID,
-   continuous box, original area, flags, provenance, RLE span, and RLE run;
+4. traverse images, labels, and mask runs once, constructing the label lookup
+   and mask-availability fact while checking pixel/label indexes, original
+   dimensions, class IDs, continuous boxes, original areas, flags, provenance,
+   RLE spans, and runs;
 5. expose immutable spans over the mapped index, labels, and masks, plus direct
    fixed-stride pixel addresses.
 
 Invalid or truncated files fail at open. The mapping owns the lifetime of every
 metadata and pixel view, so callers do not retain pointers beyond the
 `CompiledDataset`.
+
+[CompiledRecordChecks](../src/backend/data/compiled/compiled_file_utils.h)
+supplies the same field rules to producers during encoding/copying. Benchmark
+split assembly retains its checked product through staging; a later untrusted
+file open still performs the admission above. Metadata-only `info` does not
+read every label or mask, and neither route hashes the pixel payload.
 
 Training and inference use
 [`DatasetLoader`](../src/backend/data/loading/dataset_loader.h), which turns those

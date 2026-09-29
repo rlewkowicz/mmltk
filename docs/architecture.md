@@ -158,6 +158,15 @@ locates the ordinary readiness, generation-custody, and split-writer owners;
 its [progress reference](benchmark-datasets.md#reading-compilation-progress)
 defines the units for both benchmark and Directory compilation.
 
+Benchmark execution and resource admission belong to
+[BenchmarkCompilePipeline](../src/backend/data/benchmark/detail/benchmark_pipeline.h).
+Recipes retain membership and recovery policy; the shared Curl owner retains
+transport, the archive owner retains opened generations, and split assembly
+and writing retain final placement and publication. The benchmark guide owns
+[parser continuation](benchmark-datasets.md#archive-and-parser-continuation),
+[memory/storage admission](benchmark-datasets.md#memory-descriptors-and-storage),
+and [immutable cache custody](benchmark-datasets.md#persistent-cache-and-publication).
+
 The shell supplies its shared `RuntimeDiagnosticTarget` to the dataset runtime
 factory. `ArtifactDatasetRuntime` retains the target by value and creates its
 borrowed artifact observer only for synchronous `Compile`. The data layer
@@ -358,6 +367,11 @@ persistence. Benchmark rejection counters
 likewise derive their binary and named JSON projections from one declaration;
 their [cache-format guards](benchmark-datasets.md#cache-formats-and-capacity) preserve
 the persisted order and representation.
+COCONut's external JSON/Parquet field projection uses its own canonical
+[JSON declarations](../src/backend/data/benchmark/coconut/detail/coconut_json.h)
+and [Parquet declarations](../src/backend/data/benchmark/coconut/detail/coconut_parquet.h).
+Parsing policy, resource admission, source joins, and execution remain ordinary
+data-layer ownership.
 
 RF-DETR's [preset catalog](../src/backend/models/rfdetr/contract/preset_catalog.h)
 owns exact, case-sensitive preset-name lookup.
