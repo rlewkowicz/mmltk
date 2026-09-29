@@ -22,6 +22,7 @@
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
 class BenchmarkCompilePipeline;
+struct BenchmarkLabelChunk;
 struct CachedImageSource {
  std::filesystem::path root;
 };
@@ -42,35 +43,48 @@ struct PreparedBenchmarkSplit {
  std::vector<PackedInstance> labels;
  std::vector<RLEPair> rle_pairs;
 };
-// Owns compiler-built metadata from checked copy through immutable sealing.
+// Owns immutable image chunks through their single final checked placement.
 // Callers can inspect the plan, but cannot mutate admitted records or forge a seal.
 class BenchmarkSplitAssembly final {
 public:
  BenchmarkSplitAssembly() = default;
  BenchmarkSplitAssembly(std::string name, std::span<const std::string_view> classes, std::uint32_t resolution,
   mmltk::backend::imaging::resample::ImageResizeMode);
+ BenchmarkSplitAssembly(BenchmarkSplitAssembly&&) = default;
+ BenchmarkSplitAssembly& operator=(BenchmarkSplitAssembly&&) = default;
+ BenchmarkSplitAssembly(const BenchmarkSplitAssembly&) = delete;
+ BenchmarkSplitAssembly& operator=(const BenchmarkSplitAssembly&) = delete;
  [[nodiscard]] const PreparedBenchmarkSplit& data() const noexcept { return split_; }
  operator const PreparedBenchmarkSplit&() const noexcept { return split_; }
+ [[nodiscard]] std::size_t label_count() const noexcept { return labels_; }
+ [[nodiscard]] std::size_t run_count() const noexcept { return runs_; }
  void add_source(std::filesystem::path);
- [[nodiscard]] std::size_t allocate(std::size_t additional_images, std::size_t labels, std::size_t runs);
- // Disjoint image/label/run placements may be assembled concurrently. finish
- // runs only after those jobs settle; it verifies their contiguous coverage.
- void image(std::size_t slot, EncodedImageRecord, std::span<const PackedInstance>, std::span<const RLEPair>, std::size_t first_run,
-  std::uint64_t ordinal_base, mmltk::common::concurrency::CancellationObservation);
+ void image(EncodedImageRecord, std::shared_ptr<const BenchmarkLabelChunk>, std::uint64_t ordinal_base);
  void append(BenchmarkSplitAssembly&&);
+ // The source controller calls this as soon as this split's counts settle,
+ // while acquisition/pixels may continue. Joins stay outside the CPU lanes.
+ // Return (also on failure) settles all borrowed placement jobs before rebuild.
+ void materialize(BenchmarkCompilePipeline&, mmltk::common::concurrency::CancellationObservation = {});
 private:
  friend class BenchmarkSplitWriter;
  void mutable_records() const;
  void finish(mmltk::common::concurrency::CancellationObservation);
  PreparedBenchmarkSplit split_;
+ struct Placement {
+  std::shared_ptr<const BenchmarkLabelChunk> chunk;
+  std::uint64_t ordinal_base = 0;
+  std::size_t first_run = 0;
+ };
+ std::vector<Placement> placements_;
  std::vector<ImageEntry> index_;
- std::vector<std::size_t> run_ends_;
- std::vector<std::uint8_t> complete_;
+ std::size_t labels_ = 0, runs_ = 0;
+ std::uint32_t maximum_ = 0;
  std::uint32_t resolution_ = 0;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode_{};
  FileLayout layout_{};
  FileHeader header_{};
  std::shared_ptr<const catalog::ClassCatalog> catalog_;
+ bool placement_started_ = false, materialized_ = false;
  bool sealed_ = false;
 };
 struct BenchmarkSealedSplit final {

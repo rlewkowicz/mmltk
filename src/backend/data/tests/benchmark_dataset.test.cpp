@@ -7558,7 +7558,11 @@ TEST_CASE("split sealing admits caller metadata and preserves publication on can
   BenchmarkSplitWriter writer(request);
   writer.write_remaining(request);
   SECTION("caller metadata receives full admission") {
-   split.labels[0].flags = 128;
+   SECTION("flags") { split.labels[0].flags = 128; }
+   SECTION("class") { split.labels[0].class_id = 1; }
+   SECTION("source identity") { split.images[0].source_width = 0; }
+   SECTION("unreferenced runs") { split.rle_pairs = {{0, 1}}; }
+   SECTION("run bounds") { split.labels[0].flags = kAnnotationMask; split.labels[0].mask_rle_pairs = 1; split.rle_pairs = {{63, 2}}; }
    CHECK_THROWS(writer.seal(request));
   }
   SECTION("cancel before sealing") {
@@ -7566,6 +7570,7 @@ TEST_CASE("split sealing admits caller metadata and preserves publication on can
    CHECK_THROWS(writer.seal(request));
   }
   SECTION("cancel after sync before publishing") {
+   split.labels[0].flags = kAnnotationMask; // Untrusted present-empty mask is valid.
    auto sealed = writer.seal(request);
    CHECK(sealed.info.image_count == 1);
    CHECK(std::ranges::equal(sealed.info.class_names(), split.class_names));
@@ -7576,4 +7581,100 @@ TEST_CASE("split sealing admits caller metadata and preserves publication on can
  }
  CHECK(mmltk::common::io::sha256_file(output) == prior);
  for (const auto& item : fs::directory_iterator(root.path())) CHECK_FALSE(item.path().filename().string().starts_with("result.bin.tmp."));
+}
+
+TEST_CASE("split placement retains chunks and fixes global offsets once across source merges", "[backend][data][benchmark][writer]") {
+ mmltk::testsupport::ScopedTempDir root("split-final-placement");
+ const std::array<std::string_view, 1> classes{"person"};
+ constexpr auto mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ std::vector<std::uint8_t> baseline;
+ for (const auto workers : {1U, 3U}) {
+  BenchmarkCompilePipeline execution(workers);
+  BenchmarkSplitAssembly final("train", classes, 8, mode);
+  std::array<std::weak_ptr<const BenchmarkLabelChunk>, 3> custody;
+  for (std::size_t source = 0; source < custody.size(); ++source) {
+   const auto images = root.path() / ("images-" + std::to_string(source));
+   (void)cached_pixel_membership(images);
+   BenchmarkSplitAssembly part("source", classes, 8, mode);
+   part.add_source(images);
+   auto chunk = std::make_shared<BenchmarkLabelChunk>();
+   chunk->width = 16; chunk->height = 8;
+   if (source != 1) {
+    PackedInstance label{};
+    label.bbox_x2 = label.bbox_y2 = 4;
+    label.flags = kAnnotationCategory | kAnnotationMask | kAnnotationId;
+    label.source_category_id = 1; label.annotation_id = 10 + source; label.source_ordinal = 3 + source;
+    chunk->runs = source == 0 ? std::vector<RLEPair>{{0, 1}, {4, 2}} : std::vector<RLEPair>{{2, 1}};
+    label.mask_rle_pairs = static_cast<std::uint16_t>(chunk->runs.size());
+    chunk->labels.push_back(label);
+    if (source == 0) {
+     label.mask_rle_pairs = 0; label.mask_rle_offset = chunk->runs.size() * sizeof(RLEPair); label.source_ordinal = 7;
+     chunk->labels.push_back(label); // Present-empty mask after nonempty runs.
+    }
+   }
+   custody[source] = chunk;
+   part.image({1, 16, 8, 0, static_cast<std::uint16_t>(chunk->labels.size()), 0, AnnotationSource::Coco}, chunk, source == 0 ? 100 : 200);
+   chunk.reset();
+   CHECK_FALSE(custody[source].expired());
+   CHECK(part.data().labels.empty()); CHECK(part.data().rle_pairs.empty());
+   final.append(std::move(part));
+  }
+  CHECK(final.label_count() == 3); CHECK(final.run_count() == 3);
+  CHECK(final.data().images.size() == 3); CHECK(final.data().labels.empty()); CHECK(final.data().rle_pairs.empty());
+  auto request = benchmark_write_request(final, root.path() / ("placed-" + std::to_string(workers) + ".bin"), 8);
+  request.execution = &execution;
+  BenchmarkSplitWriter writer(request);
+  BenchmarkCompilePipeline::Attempt attempt(execution);
+  // Pixel membership is usable before final label/run storage exists.
+  writer.write_remaining(request);
+  final.materialize(execution);
+  for (const auto& chunk : custody) CHECK(chunk.expired());
+  CHECK(final.data().images[1].first_label == 2); CHECK(final.data().images[2].first_label == 2);
+  CHECK(final.data().images[2].source_index == 2);
+  CHECK(final.data().labels[0].source_ordinal == 103); CHECK(final.data().labels[1].source_ordinal == 107); CHECK(final.data().labels[2].source_ordinal == 205);
+  CHECK(final.data().labels[1].has_mask()); CHECK(final.data().labels[1].mask_rle_pairs == 0);
+  CHECK(final.data().labels[1].mask_rle_offset == 2 * sizeof(RLEPair)); CHECK(final.data().labels[2].mask_rle_offset == 2 * sizeof(RLEPair));
+  CHECK_THROWS(final.materialize(execution)); CHECK_THROWS(final.add_source("late"));
+  auto sealed = writer.seal(request, &final);
+  sealed.artifact.publish(request.output_path, {});
+  const auto dataset = CompiledDataset::open(request.output_path);
+  CHECK(dataset.header().max_instances_per_image == 2); CHECK(dataset.image_labels(1).empty());
+  CHECK(dataset.instance_rle(dataset.image_labels(0)[1]).empty());
+  const auto file = FileHandle::open_readonly(request.output_path.string());
+  std::vector<std::uint8_t> bytes(file.size()); file.pread_all(bytes.data(), bytes.size(), 0);
+  if (baseline.empty()) baseline = std::move(bytes); else CHECK(bytes == baseline);
+ }
+}
+
+TEST_CASE("final chunk placement rejects malformed records and cannot seal partial output", "[backend][data][benchmark][writer]") {
+ mmltk::testsupport::ScopedTempDir root("split-placement-admission");
+ const auto membership = cached_pixel_membership(root.path() / "images");
+ const std::array<std::string_view, 1> classes{"person"};
+ BenchmarkCompilePipeline execution(1);
+ BenchmarkSplitAssembly assembly("train", classes, 8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
+ assembly.add_source(membership.sources.front().root);
+ auto chunk = std::make_shared<BenchmarkLabelChunk>(); chunk->width = 16; chunk->height = 8;
+ PackedInstance label{}; label.bbox_x2 = label.bbox_y2 = 4;
+ label.flags = kAnnotationMask | kAnnotationCategory; label.source_category_id = 1; label.mask_rle_pairs = 2;
+ chunk->labels = {label}; chunk->runs = {{0, 1}, {4, 2}};
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ SECTION("class identity") { chunk->labels[0].class_id = 1; }
+ SECTION("source provenance") { chunk->labels[0].flags &= ~kAnnotationCategory; chunk->labels[0].source_category_id = 0; }
+ SECTION("unknown flags") { chunk->labels[0].flags |= 128; }
+ SECTION("mask offset") { chunk->labels[0].mask_rle_offset = sizeof(RLEPair); }
+ SECTION("run extent") { chunk->runs[1] = {63, 2}; }
+ SECTION("run ordering") { chunk->runs[1].start = 0; }
+ SECTION("unreferenced run") { chunk->labels[0].mask_rle_pairs = 1; }
+ SECTION("source ordinal overflow") { chunk->labels[0].source_ordinal = UINT64_MAX; }
+ SECTION("cancelled placement") { cancelled.store(true); }
+ assembly.image({1, 16, 8, 0, 1, 0, AnnotationSource::Coco}, chunk, 1);
+ auto request = benchmark_write_request(assembly, root.path() / "result.bin", 8);
+ request.execution = &execution;
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ writer.write_remaining(request);
+ CHECK_THROWS(assembly.materialize(execution, cancellation));
+ CHECK_THROWS(writer.seal(request, &assembly));
+ CHECK_FALSE(fs::exists(request.output_path));
 }

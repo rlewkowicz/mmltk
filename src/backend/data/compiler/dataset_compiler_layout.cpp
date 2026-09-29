@@ -33,9 +33,6 @@ int resolve_num_workers(int configured_workers, const std::span<const int> worke
  }
  return static_cast<int>(allowed.size());
 }
-void assign_pixel_offsets(std::vector<ImageEntry>& index, size_t pixel_offset, size_t image_stride) {
- for (size_t i = 0; i < index.size(); ++i) { index[i].pixel_offset = pixel_offset + i * image_stride; }
-}
 void write_metadata_blocks(
  const FileHandle& fd, const FileLayout& layout, const FileHeader& header, const LabelBlocks& label_blocks, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  constexpr size_t kWriteChunkBytes = size_t{16U} * 1024U * 1024U;

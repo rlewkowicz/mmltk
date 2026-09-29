@@ -3215,10 +3215,12 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
   const std::lock_guard lock(observation_mutex);
   observed = update;
  };
- std::promise<void> subsequent_pixels;
+ std::promise<void> subsequent_pixels, validation_placed;
+ std::atomic<bool> placed{false};
  config.num_workers = 4;
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event == "benchmark.labels.placed" && Json::parse(fields).at("split") == "val" && !placed.exchange(true)) validation_placed.set_value();
   if (event == "benchmark.pixel_compile.throughput" && labels_started.load() && Json::parse(fields).at("completed_images") >= 64 && !delivered.exchange(true)) subsequent_pixels.set_value();
  };
  auto compiling = std::async(std::launch::async, [&] {
@@ -3239,6 +3241,7 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
  });
  REQUIRE(reader.WaitEntered(5s));
  REQUIRE(labels.WaitEntered(5s));
+ mmltk::testsupport::await_test_promise(validation_placed, "validation final metadata while training acquisition and reader remain held", 5s);
  CHECK_FALSE(delivered.load());
  {
   const std::lock_guard lock(observation_mutex);
@@ -6076,7 +6079,10 @@ TEST_CASE("late original withdrawal retains physical work and remaps changed sto
  mmltk::testsupport::TestGate incomplete_train("original source awaits its failing second member");
  std::atomic<bool> held{false}, opened{false}, cancelled{false};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ std::promise<void> provisional_placement;
+ std::atomic<unsigned> placements{0};
  config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event == "benchmark.labels.placed" && Json::parse(fields).at("split") == "val" && placements.fetch_add(1) == 0) provisional_placement.set_value();
   if (event != "benchmark.storage.reserved") return;
   const auto value = Json::parse(fields);
   if (value.at("path") == (local.cache.source_indexes("coco") / "source-json" / "instances_train2017.json").string() &&
@@ -6095,6 +6101,7 @@ TEST_CASE("late original withdrawal retains physical work and remaps changed sto
  const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); incomplete_train.Release(); });
  REQUIRE(incomplete_train.WaitEntered(5s));
  mmltk::testsupport::await_test_promise(provisional_stock, "stock pixels use the first independently admitted original split", 5s);
+ mmltk::testsupport::await_test_promise(provisional_placement, "stock metadata placement precedes unrelated original failure", 5s);
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  incomplete_train.Release();
  mmltk::testsupport::await_test_future(compiling, "replacement originals settle selected image placement", 5s);
@@ -6106,6 +6113,7 @@ TEST_CASE("late original withdrawal retains physical work and remaps changed sto
  CHECK(compiled.image_labels(0)[0].source_category_id == 4);
  CHECK(validation_reads[9] == 1);
  CHECK(validation_reads[10] == static_cast<unsigned>(changed));
+ CHECK(placements.load() >= 2); // The withdrawn original must not authorize its earlier placement.
  CHECK(server.requests() == 1); server.Check();
 }
 
@@ -6653,9 +6661,22 @@ TEST_CASE("asynchronous native labels retain their sealed image until conversion
  publication.geometry_ready(7, {1, 1});
  REQUIRE(held.WaitEntered(5s)); CHECK_FALSE(lifetime.expired());
  held.Release();
- const auto product = execution.wait_image_labels(root, 7, "native");
+ auto product = execution.wait_image_labels(root, 7, "native");
  REQUIRE(product); REQUIRE(product->labels.size() == 1); CHECK(product->runs.front().length == 1);
  CHECK(lifetime.expired());
+ const std::weak_ptr<const BenchmarkLabelChunk> placed_custody = product;
+ const std::array<std::string_view, 1> classes{"person"};
+ BenchmarkSplitAssembly assembly("train", classes, 1, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
+ assembly.add_source(root);
+ assembly.image({7, 1, 1, 0, 1, 0, AnnotationSource::CoconutCoco}, product, 19);
+ product.reset();
+ CHECK_FALSE(placed_custody.expired()); CHECK(assembly.data().labels.empty()); CHECK(assembly.label_count() == 1);
+ assembly.materialize(execution);
+ CHECK(assembly.data().labels.front().source_ordinal == 19);
+ CHECK(assembly.data().rle_pairs.front().length == 1);
+ CHECK(execution.wait_image_labels(root, 7, "native") == placed_custody.lock());
+ execution.retire_attempt();
+ CHECK(placed_custody.expired()); // Assembly released custody; pipeline reuse was the last owner.
 }
 
 TEST_CASE("component dependency summaries retain full backing and recorded generations", "[benchmark][coconut][cache]") {
@@ -6740,4 +6761,49 @@ TEST_CASE("progress failure before commit differs from terminal notification fai
  CHECK(std::filesystem::exists(previous) == !terminal);
  CHECK(std::filesystem::exists(config.output_dir / "train.bin") == terminal);
  if (terminal) CHECK(CompiledDataset::open(config.output_dir / "train.bin").header().num_images == 4);
+}
+
+TEST_CASE("validation places its final metadata while a training release remains pending", "[benchmark][coconut][pipeline][labels]") {
+ using namespace std::chrono_literals;
+ auto choice = CoconutValidation::Coconut;
+ bool fail_training = false;
+ SECTION("enhanced validation with one CPU") {}
+ SECTION("stock validation with one CPU") { choice = CoconutValidation::Stock; }
+ SECTION("first training failure preserves publication after independent placement") { fail_training = true; }
+ ScopedTempDir root("independent-validation-placement");
+ LocalCoconutRecipe local(root.path());
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, choice}, true);
+ auto catalog = local.selected(choice);
+ compile_benchmark_recipe(config, &catalog);
+ const auto train = file_bytes(local.output / "train.bin"), validation = file_bytes(local.output / "val.bin");
+ const auto manifest = file_bytes(local.output / "benchmark_manifest.json");
+ mmltk::testsupport::TestGate training("training release mask owner");
+ std::atomic<bool> cancelled{false};
+ std::atomic<unsigned> placements{0};
+ std::promise<void> validation_ready;
+ config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event == "benchmark.labels.placed" && Json::parse(fields).at("split") == "val" && placements.fetch_add(1) == 0) validation_ready.set_value();
+ };
+ catalog.release_observer = [&](CoconutEdition edition, CoconutReleaseBoundary boundary) {
+  if (edition != CoconutEdition::Base || boundary != CoconutReleaseBoundary::MasksStarted) return;
+  training.receipt().ArriveAndWait();
+  if (fail_training) throw std::runtime_error("held training release failed");
+ };
+ auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); training.Release(); });
+ REQUIRE(training.WaitEntered(5s));
+ mmltk::testsupport::await_test_promise(validation_ready, "validation final placement beside pending training on one CPU", 5s);
+ CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
+ CHECK(placements.load() == 1);
+ check_publication_bytes(local.output, train, validation, manifest);
+ training.Release();
+ if (fail_training) {
+  CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(compiling, "first failure after independent validation", 5s), "held training release failed");
+  check_publication_bytes(local.output, train, validation, manifest);
+ } else {
+  mmltk::testsupport::await_test_future(compiling, "training completion reuses validation placement", 5s);
+  CHECK(file_bytes(local.output / "train.bin") == train); CHECK(file_bytes(local.output / "val.bin") == validation);
+  CHECK(placements.load() == 1); // The final recipe consumes the same immutable generation.
+ }
 }

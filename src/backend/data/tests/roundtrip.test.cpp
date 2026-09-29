@@ -935,3 +935,57 @@ TEST_CASE("compiled owner admits all record sections in its metadata constructio
  CHECK(shared->labels().data() == source->labels().data());
  CHECK(shared->rle_pairs().data() == source->rle_pairs().data());
 }
+
+TEST_CASE("Directory metadata construction preserves empty masks offsets and publication across workers", "[backend][data][roundtrip][admission]") {
+ mmltk::testsupport::ScopedTempDir root("directory-final-construction");
+ const FixtureSpec fixture{.root_dir = root.path().string(), .width = 32, .height = 16, .num_images = 3, .background_images = 0};
+ create_synthetic_dataset(fixture);
+ auto config = compiler_config(fixture);
+ config.target_width = 16; config.target_height = 8;
+ const auto annotations = fs::path(config.source_dir) / "train";
+ const auto write = [&](const char* name, std::string_view contents) {
+  std::ofstream file(annotations / name, std::ios::trunc); file << contents; REQUIRE(file.good());
+ };
+ const std::string first = R"({"class":"person","image_id":0,"id":0,"category_id":0,"bbox_xyxy":[0,0,8,4],"iscrowd":true,"ignore":true,"area":32,"mask_rle_encoding":"row_major_start_length","mask_rle":"0:8 32:8 64:8 96:8","image_size_wh":[32,16]})";
+ const std::string empty = R"({"class":"ret","image_id":0,"id":9,"bbox_xyxy":[2,2,6,6],"mask_rle_encoding":"row_major_start_length","mask_rle":"","image_size_wh":[32,16]})";
+ write("000001.jsonl", first + "\n" + empty + "\n");
+ write("000002.jsonl", "");
+ write("000003.jsonl", empty + "\n");
+ const auto read_output = [&] {
+  const auto file = mmltk::common::io::FileHandle::open_readonly(compiled_bin_path(fixture));
+  std::vector<std::uint8_t> bytes(file.size()); file.pread_all(bytes.data(), bytes.size(), 0); return bytes;
+ };
+ std::vector<std::uint8_t> baseline;
+ for (const auto workers : {1, 2}) {
+  config.num_workers = workers;
+  const auto plan = DatasetCompiler::prepare(config, {"train"});
+  DatasetCompiler::compile(plan, 0);
+  const auto result = CompiledDataset::open(compiled_bin_path(fixture));
+  REQUIRE(result.image_entries().size() == 3); REQUIRE(result.labels().size() == 3);
+  CHECK(result.header().max_instances_per_image == 2); REQUIRE_FALSE(result.rle_pairs().empty());
+  CHECK(result.image_labels(1).empty());
+  CHECK(result.image_entry(0).has_source_image_id == 1); CHECK(result.image_entry(0).source_image_id == 0);
+  const auto& label = result.image_labels(0)[0];
+  CHECK(label.has_annotation_id()); CHECK(label.annotation_id == 0); CHECK(label.source_category_id == 0);
+  CHECK(label.is_crowd()); CHECK(label.original_area == 32); CHECK(label.source_ordinal == 1);
+  for (const auto image : {0U, 2U}) {
+   const auto& present_empty = result.image_labels(image).back();
+   CHECK(present_empty.has_mask()); CHECK(result.instance_rle(present_empty).empty());
+   CHECK(present_empty.mask_rle_offset == result.rle_pairs().size_bytes());
+  }
+  for (std::size_t image = 0; image < result.image_entries().size(); ++image)
+   CHECK(result.image_entry(image).pixel_offset == result.header().pixel_offset + image * result.header().image_stride);
+  const auto bytes = read_output();
+  if (baseline.empty()) baseline = bytes; else CHECK(bytes == baseline);
+ }
+ // Consumed input errors use the same parser, merge and publication transaction.
+ for (const auto malformed : {
+       R"({"class":"person","bbox_xyxy":[0,0,4,4],"iscrowd":2})",
+       R"({"class":"person","bbox_xyxy":[0,0,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:4 2:2"})",
+       R"({"class":"person","bbox_xyxy":[0,0,4,4],"category_id":-1})"}) {
+  write("000001.jsonl", malformed);
+  const auto plan = DatasetCompiler::prepare(config, {"train"});
+  CHECK_THROWS(DatasetCompiler::compile(plan, 0));
+  CHECK(read_output() == baseline);
+ }
+}

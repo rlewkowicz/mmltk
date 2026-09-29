@@ -256,7 +256,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  });
  try {
   label_blocks = compiler_internal::build_label_blocks(
-   split_dir, num_images, effective_config, class_catalog, plan.source_category_base, label_workers, label_cpus, telemetry != nullptr ? &label_progress : nullptr, &failure_requested, cancellation);
+   split_dir, num_images, effective_config, class_catalog, plan.source_category_base, layout, label_workers, label_cpus, telemetry != nullptr ? &label_progress : nullptr, &failure_requested, cancellation);
   if (telemetry != nullptr) { telemetry->set_dropped_instances(label_blocks.dropped_instances); }
  } catch (...) {
   failure_requested.store(true, std::memory_order_relaxed);
@@ -273,7 +273,6 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
   mmltk::common::logging::ScopedProfile layout_profile{"compiler.finalize_layout"};
   finalize_layout(layout, {label_blocks.labels.size(), label_blocks.rle_pairs.size()});
  }
- compiler_internal::assign_pixel_offsets(label_blocks.index, layout.pixel_offset, image_stride);
  throw_if_cancelled();
  mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Layout: total={:.2f} GB", static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
  fd.preallocate(layout.total_size);
@@ -288,7 +287,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
    effective_config.resize_mode,
   },
   class_catalog.names(), layout);
- (void)admit_compiled_records(label_blocks.index, label_blocks.labels, label_blocks.rle_pairs, header, [](const ImageEntry&) {}, cancellation);
+ validate_compiled_header(header);
  throw_if_cancelled();
  compiler_internal::write_metadata_blocks(fd, layout, header, label_blocks, cancellation);
  throw_if_cancelled();

@@ -26,6 +26,7 @@ struct CoconutRecipeInputs {
   CoconutReleaseInputs inputs;
   std::optional<CoconutRecipePreparation> metadata, complete;
   std::jthread masks;
+  bool labels_published = false;
  };
  CoconutRecipeInputs(std::size_t count, mmltk::common::concurrency::CancellationObservation cancellation, std::function<void(std::exception_ptr)> failure)
      : releases(count), external(cancellation), failed(std::move(failure)) {
@@ -142,7 +143,7 @@ struct CoconutRecipeInputs {
     prepare(index, lease->allowance(), true);
     lease = {};
     publish_labels(index);
-    { const std::lock_guard lock(mutex); ++completed; }
+    { const std::lock_guard lock(mutex); releases[index].labels_published = true; ++completed; }
     changed.notify_all();
    } catch (...) { fail(std::current_exception()); }
   });
@@ -586,6 +587,41 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
  return prepared;
 }
 }  // namespace
+CoconutRecipePreparation wait_coconut_validation(const std::shared_ptr<CoconutRecipeInputs>& inputs, CoconutValidation selection) {
+ if (!inputs) throw std::logic_error("COCONut validation requires admitted recipe inputs");
+ auto& owner = *inputs;
+ CoconutRecipePreparation result;
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(owner);
+ if (selection == CoconutValidation::Stock) {
+  auto original = owner.original(CoconutImageNamespace::CocoValidation, true);
+  if (!original.state.index) throw std::runtime_error("required COCO validation annotations are unavailable");
+  result.stock_validation = std::move(original.state.index);
+  result.stock_validation_generation = original.state.generation;
+  result.validation_images = result.stock_validation->images.size();
+ } else {
+  std::unique_lock lock(owner.mutex);
+  owner.changed.wait(lock, [&] {
+   if (owner.error || owner.cancelled()) return true;
+   for (std::size_t i = 0; i < owner.releases.size(); ++i)
+    if (coconut_validation_component(owner.catalog->releases[i].edition) && !owner.releases[i].labels_published) return false;
+   return true;
+  });
+  if (owner.error) std::rethrow_exception(owner.error);
+  throw_if_benchmark_cancelled(cancellation);
+  // Completion publication makes these immutable owners visible. Final recipe
+  // reconciliation starts only after the compiler settles this consumer.
+  for (std::size_t i = 0; i < owner.releases.size(); ++i) {
+   if (!coconut_validation_component(owner.catalog->releases[i].edition)) continue;
+   for (const auto& component : owner.releases[i].complete->components) {
+    if (!component.index().image_count()) continue;
+    result.validation_images = mmltk::common::math::checked_add(result.validation_images, component.index().image_count(), "COCONut validation count overflow");
+    result.components.push_back(component);
+   }
+  }
+ }
+ throw_if_benchmark_cancelled(cancellation);
+ return result;
+}
 void retire_coconut_recipe_inputs(const std::shared_ptr<CoconutRecipeInputs>& inputs, const AdmittedRecipeArchive* changed) {
  if (!inputs) return;
  inputs->settle();
@@ -593,7 +629,7 @@ void retire_coconut_recipe_inputs(const std::shared_ptr<CoconutRecipeInputs>& in
   auto& release = inputs->releases[i];
   if (release.complete) for (auto& component : release.complete->components)
    release.inputs.components.insert_or_assign({component.edition(), component.source()}, std::move(component));
-  release.metadata.reset(); release.complete.reset();
+  release.metadata.reset(); release.complete.reset(); release.labels_published = false;
   if (!changed) continue;
   const auto affected = [&](const CoconutPhysicalImage& image) { return image.source == changed->origin.source && image.shard == changed->origin.shard; };
   std::uint64_t withdrawn = 0;

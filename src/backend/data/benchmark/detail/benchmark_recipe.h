@@ -96,6 +96,9 @@ struct CoconutRecipePreparation {
  std::uint64_t validation_images = 0;
  nlohmann::json manifest;
 };
+// Read independently completed validation custody while training releases and
+// originals continue. The caller settles this read before final recipe repair.
+[[nodiscard]] CoconutRecipePreparation wait_coconut_validation(const std::shared_ptr<CoconutRecipeInputs>&, CoconutValidation);
 class CoconutFailureReport {
 public:
  CoconutFailureReport(const std::filesystem::path& cache_root, ProgressReporter& progress);
