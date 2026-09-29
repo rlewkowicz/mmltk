@@ -214,6 +214,7 @@ fn current_work_preserves_phase_counts_and_units_independently_of_tracks() {
     for phase in [
         DatasetCompilePhase::Downloading,
         DatasetCompilePhase::Extracting,
+        DatasetCompilePhase::Compacting,
     ] {
         dataset.progress.phase = phase;
         dataset.progress.completed = 1;

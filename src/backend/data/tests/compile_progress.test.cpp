@@ -3,10 +3,13 @@
 #include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -23,6 +26,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <sys/stat.h>
 #include <utility>
 #include <vector>
 #include "src/test_support/async_test_utils.hpp"
@@ -340,6 +344,7 @@ void test_compile_progress_reports_monotonic_updates() {
   CHECK(progress.tracks.acquisition.total == 0);
   CHECK(progress.tracks.acquisition.complete);
   CHECK(progress.tracks.acquisition.activity == DatasetCompileActivity::Unnecessary);
+  if (progress.phase == DatasetCompilePhase::Compacting) CHECK(progress.compacted_bytes <= progress.compaction_bytes);
   main_thread_observed |= observed[index].thread == main_thread_id;
   if (semantic_transitions.empty() || semantic_transitions.back() != progress.phase) semantic_transitions.push_back(progress.phase);
   if (index != 0U) {
@@ -353,7 +358,9 @@ void test_compile_progress_reports_monotonic_updates() {
   CHECK(progress.remaining_seconds == estimate.remaining_seconds);
   CHECK(progress.throughput_per_second == estimate.throughput_per_second);
  }
- REQUIRE(semantic_transitions == std::vector{DatasetCompilePhase::Planning, DatasetCompilePhase::Labels, DatasetCompilePhase::Pixels, DatasetCompilePhase::Syncing, DatasetCompilePhase::Publishing});
+ REQUIRE(
+  semantic_transitions ==
+  std::vector{DatasetCompilePhase::Planning, DatasetCompilePhase::Labels, DatasetCompilePhase::Pixels, DatasetCompilePhase::Compacting, DatasetCompilePhase::Syncing, DatasetCompilePhase::Publishing});
  const auto& completed = observed.back().progress;
  CHECK(completed.done == expected_total);
  CHECK(completed.phase == DatasetCompilePhase::Publishing);
@@ -585,7 +592,7 @@ TEST_CASE("compiled format admission rejects invalid metadata and old versions",
   change(header, label);
   file.seekp(0);
   file.write(reinterpret_cast<const char*>(&header), sizeof(header));
-  file.seekp(static_cast<std::streamoff>(compute_file_layout(original.header().num_slots, original.header().image_stride).label_offset(0)));
+  file.seekp(static_cast<std::streamoff>(compute_file_layout(original.header().num_slots, original.header().image_stride, original.header().max_label_bytes).label_offset(0)));
   file.write(reinterpret_cast<const char*>(&label), sizeof(label));
   file.close();
   CHECK_THROWS(CompiledDataset::open(path));
@@ -718,7 +725,7 @@ TEST_CASE("compiled benchmark provenance cannot be erased while Generic identiti
   auto file = mutable_compiled_copy(fixture, path);
   file.seekp(static_cast<std::streamoff>(original.header().index_offset));
   file.write(reinterpret_cast<const char*>(&image), sizeof(image));
-  file.seekp(static_cast<std::streamoff>(compute_file_layout(original.header().num_slots, original.header().image_stride).label_offset(0)));
+  file.seekp(static_cast<std::streamoff>(compute_file_layout(original.header().num_slots, original.header().image_stride, original.header().max_label_bytes).label_offset(0)));
   file.write(reinterpret_cast<const char*>(&label), sizeof(label));
  };
  for (const auto source :
@@ -782,6 +789,9 @@ TEST_CASE("compiled layout checks alignment and arithmetic without storage", "[b
  CHECK(layout.label_offset(0) == layout.data_offset + COMPILED_BLOCK_SLOTS * PAGE_SIZE);
  CHECK(layout.label_offset(64) == layout.block_offset(1) + COMPILED_BLOCK_SLOTS * PAGE_SIZE);
  CHECK(layout.label_pitch == 503808U);
+ CHECK_THROWS(compute_file_layout(1, 12, COMPILED_LABEL_CAPACITY + 8));
+ CHECK_THROWS(compute_file_layout(1, 12, 1));
+ CHECK(compute_file_layout(1, 12, 0).label_pitch == 0);
  CHECK_THROWS(layout.pixel_offset(65));
  constexpr auto maximum = std::numeric_limits<std::size_t>::max();
  CHECK_THROWS(compute_file_layout(2U, maximum));
@@ -831,7 +841,101 @@ TEST_CASE("fixed pixel mappings retain borrowed addresses across sparse block gr
  CHECK(last == 0.75F);
  CHECK_THROWS(pixels.grow(compute_file_layout(1, 12)));
  CHECK_THROWS(pixels.grow(compute_file_layout(COMPILED_BLOCK_SLOTS + 1, 24)));
+ CHECK_THROWS(pixels.grow(compute_file_layout(COMPILED_BLOCK_SLOTS + 1, 12, 0)));
  CHECK(pixels.image(0) == first);
+}
+TEST_CASE("compiled finalization compacts live partitions in place with bounded overlapping moves", "[backend][data][compiler][storage]") {
+ const std::size_t maximum = GENERATE(std::size_t{0}, std::size_t{72}, std::size_t{466944}, COMPILED_LABEL_CAPACITY);
+ CAPTURE(maximum);
+ const mmltk::testsupport::ScopedTempDir root("compiled-in-place-compaction");
+ const auto path = root.path() / "staged.bin";
+ constexpr std::uint32_t width = 1024, height = 512, slots = 131;
+ constexpr std::size_t stride = std::size_t{width} * height * 3 * sizeof(float);
+ const auto staging = compute_file_layout(slots, stride);
+ const auto file = FileHandle::create_output(path.string(), 0);
+ file.resize_sparse(staging.total_size);
+ std::vector<ImageEntry> entries(slots);
+ const std::array<std::uint32_t, 6> eligible{0, 2, 63, 64, 65, 130};
+ std::vector<std::byte> pixels(stride);
+ PackedInstance label{};
+ label.bbox_x2 = width;
+ label.bbox_y2 = height;
+ label.flags = kAnnotationMask;
+ label.source_ordinal = 19;
+ const auto run_count = maximum ? (maximum - annotation_layout(1, 0).run_offset) / sizeof(RLEPair) : 0;
+ std::vector<RLEPair> runs(run_count);
+ for (std::size_t i = 0; i < runs.size(); ++i) runs[i] = {static_cast<std::uint32_t>(2 * i), 1};
+ label.mask_rle_pairs = static_cast<std::uint16_t>(run_count);
+ for (const auto slot : eligible) {
+  std::fill(pixels.begin(), pixels.end(), static_cast<std::byte>(slot + 1));
+  file.pwrite_all(pixels.data(), pixels.size(), staging.pixel_offset(slot));
+  auto& entry = entries[slot];
+  entry.status = ImageStatus::Eligible;
+  entry.original_width = width;
+  entry.original_height = height;
+  if (maximum && slot != 0) {
+   set_annotation_extent(entry, 1, runs.size(), std::to_string(slot));
+   write_compiled_annotations(file, staging, slot, entry, {{&label, 1}, runs});
+  }
+ }
+ // A rejected specimen's larger retained bytes must not influence the maximum.
+ std::fill_n(pixels.begin(), COMPILED_LABEL_CAPACITY, std::byte{0x7f});
+ file.pwrite_all(pixels.data(), COMPILED_LABEL_CAPACITY, staging.label_offset(1));
+ struct stat before{}, after{};
+ REQUIRE(::fstat(file.get(), &before) == 0);
+ bool cancel_during = false, fail_storage = false;
+ SECTION("complete") {}
+ SECTION("cancel while moving") { cancel_during = true; }
+ SECTION("storage failure") { fail_storage = true; }
+ std::atomic<bool> cancelled{false};
+ std::size_t completed = 0, expected = 0;
+ const auto compact = [&] {
+  return compact_compiled_file(file, staging, entries, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), [&](std::size_t done, std::size_t total) {
+   CHECK(done >= completed);
+   CHECK(done <= total);
+   completed = done;
+   expected = total;
+   if (cancel_during && done) cancelled.store(true);
+  }, [&](std::size_t offset, std::size_t bytes) {
+   if (fail_storage) throw std::runtime_error("compaction storage failure");
+   file.allocate_range(offset, bytes);
+  });
+ };
+ if (cancel_during || (fail_storage && maximum != COMPILED_LABEL_CAPACITY)) {
+  CHECK_THROWS(compact());
+  return;
+ }
+ const auto layout = compact();
+ CHECK(completed == expected);
+ CHECK(layout.label_capacity == maximum);
+ CHECK(layout.label_pitch == compiled_align_up(maximum, PAGE_SIZE));
+ CHECK(file.size() == layout.total_size);
+ CHECK((layout.total_size < staging.total_size) == (maximum != COMPILED_LABEL_CAPACITY));
+ REQUIRE(::fstat(file.get(), &after) == 0);
+ CHECK(after.st_ino == before.st_ino);
+ CHECK(after.st_dev == before.st_dev);
+ CHECK(after.st_blocks <= before.st_blocks);
+ const std::vector<std::string> names{"sample"};
+ const auto header = make_file_header({static_cast<std::uint32_t>(eligible.size()), width, height, 3, maximum ? 1U : 0U, stride}, names, layout);
+ file.pwrite_all(entries.data(), layout.index_size, layout.index_offset);
+ file.pwrite_all(&header, sizeof(header), 0);
+ const auto source = CompiledDataset::open(path);
+ CHECK(source.header().max_label_bytes == maximum);
+ CHECK(std::ranges::equal(source.eligible_slots(), eligible));
+ for (const auto slot : eligible) {
+  std::fill(pixels.begin(), pixels.end(), static_cast<std::byte>(slot + 1));
+  CHECK(std::memcmp(source.image_pixels(slot), pixels.data(), pixels.size()) == 0);
+  if (maximum && slot != 0) {
+   const auto annotations = source.annotations(slot);
+   REQUIRE(annotations.labels.size() == 1);
+   CHECK(annotations.labels.front().source_ordinal == 19);
+   REQUIRE(annotations.runs.size() == runs.size());
+   CHECK(std::memcmp(annotations.runs.data(), runs.data(), runs.size() * sizeof(RLEPair)) == 0);
+  } else
+   CHECK(source.label_payload(slot).empty());
+ }
+ std::printf("compiled_compaction_fixture staging_bytes=%zu final_bytes=%zu max_label_bytes=%zu live_bytes=%zu inode_preserved=1 scratch_limit_bytes=4194304\n", staging.total_size, layout.total_size,
+  maximum, expected);
 }
 TEST_CASE("categorical resize agrees exactly with dense nearest-center sampling", "[backend][data][compiler][mask]") {
  using namespace mmltk::backend::data::dataset;

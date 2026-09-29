@@ -247,7 +247,8 @@ DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::framew
   },
   std::move(retirement));
  const auto stride = static_cast<size_t>(state.source->header().image_stride);
- if (config.batch_size > std::numeric_limits<size_t>::max() / stride || config.batch_size > std::numeric_limits<size_t>::max() / COMPILED_LABEL_CAPACITY)
+ const auto label_pitch = state.source->header().max_label_bytes;
+ if (config.batch_size > std::numeric_limits<size_t>::max() / stride || (label_pitch && config.batch_size > std::numeric_limits<size_t>::max() / label_pitch))
   throw std::overflow_error("dataset batch storage size overflow");
  mmltk::frameworks::gpu::CudaDeviceScope scope(config.device_id);
  if (!scope) { mmltk::frameworks::gpu::ensure_cuda_ok(scope.Finalize(), "dataset loader device binding"); }
@@ -256,7 +257,7 @@ DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::framew
   state.stream->bind_current_context();
   for (size_t index = 0; maximum_count != 0U && index < state.slots.size(); ++index) {
    state.stream->prepare_host(index, maximum_count * stride);
-   state.stream->prepare_reads(index, maximum_count, true);
+   state.stream->prepare_reads(index, maximum_count, label_pitch);
    state.stream->prepare_device(index, maximum_count * stride);
    state.slots[index].reads.reserve(maximum_count);
   }

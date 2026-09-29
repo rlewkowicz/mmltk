@@ -26,8 +26,8 @@ int main(int argc, char** argv) try {
  file.pread_all(&entry, sizeof(entry), sections.index_offset + std::size_t{slot} * sizeof(entry));
  if (!entry.eligible()) throw std::invalid_argument("sample slot is not eligible");
  const auto extent = data::annotation_layout(entry.num_instances, entry.num_runs);
- if (entry.label_bytes != extent.used_bytes) throw std::invalid_argument("compiled label extent differs");
- std::array<std::byte, data::COMPILED_LABEL_CAPACITY> payload;
+ if (entry.label_bytes != extent.used_bytes || entry.label_bytes > header.max_label_bytes) throw std::invalid_argument("compiled label extent differs");
+ auto payload = mmltk::common::io::OwnedBuffer<std::byte>::allocate(header.max_label_bytes);
  file.pread_all(payload.data(), extent.used_bytes, sections.layout.label_offset(slot));
  const auto annotations = data::annotation_view(entry, {payload.data(), extent.used_bytes});
  (void)data::admit_compiled_annotations(entry, annotations, header, slot);
@@ -42,7 +42,8 @@ int main(int argc, char** argv) try {
  const nlohmann::json result{
   {"kind", "compiled_sample"}, {"path", argv[1]}, {"sample", slot}, {"image_count", +header.num_images}, {"slot_count", +header.num_slots}, {"width", +header.image_width},
   {"height", +header.image_height}, {"original_width", +entry.original_width}, {"original_height", +entry.original_height}, {"source", static_cast<std::uint8_t>(entry.source)},
-  {"image_id", entry.has_source_image_id ? nlohmann::json(+entry.source_image_id) : nlohmann::json(nullptr)}, {"label_bytes", +entry.label_bytes}, {"instances", std::move(labels)}
+  {"image_id", entry.has_source_image_id ? nlohmann::json(+entry.source_image_id) : nlohmann::json(nullptr)}, {"label_bytes", +entry.label_bytes}, {"max_label_bytes", +header.max_label_bytes},
+  {"instances", std::move(labels)}
  };
  std::cout << result.dump() << '\n';
  return 0;

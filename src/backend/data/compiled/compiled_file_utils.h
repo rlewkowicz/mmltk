@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <span>
 #include <ranges>
@@ -47,6 +48,8 @@ inline void validate_compiled_header(const FileHeader& header) {
  }
  if (header.num_classes == 0U || header.num_classes > MAX_CLASSES) { throw std::runtime_error("compiled file has invalid class count"); }
  if (header.max_instances_per_image > std::numeric_limits<std::uint16_t>::max()) { throw std::runtime_error("compiled file maximum instance count exceeds the index representation"); }
+ if (header.max_label_bytes > COMPILED_LABEL_CAPACITY || header.max_label_bytes % sizeof(RLEPair) || annotation_layout(header.max_instances_per_image, 0).used_bytes > header.max_label_bytes)
+  throw std::runtime_error("compiled maximum label size is invalid");
  if (header.image_width > MAX_IMAGE_EXTENT || header.image_height > MAX_IMAGE_EXTENT || header.channels != 3U ||
      (header.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Stretch && header.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Letterbox))
   throw std::runtime_error("compiled image extent, channels or resize mode is invalid");
@@ -70,7 +73,7 @@ inline void throw_if_compiled_validation_cancelled(const size_t index, mmltk::co
 }
 inline CompiledFileSections validate_compiled_file_sections(const FileHeader& header, size_t file_size) {
  validate_compiled_header(header);
- const auto layout = compute_file_layout(header.num_slots, mmltk::common::math::checked_cast<size_t>(header.image_stride, "image stride overflow"));
+ const auto layout = compute_file_layout(header.num_slots, mmltk::common::math::checked_cast<size_t>(header.image_stride, "image stride overflow"), header.max_label_bytes);
  if (header.total_file_size != file_size || header.total_file_size != layout.total_size || header.index_offset != layout.index_offset || header.data_offset != layout.data_offset)
   throw std::runtime_error("compiled fixed slot layout or file size is invalid");
  return {layout.index_offset, layout.index_size, layout};
@@ -166,7 +169,7 @@ inline void write_compiled_label_ordinals(
 inline void write_compiled_annotations(
  const mmltk::common::io::FileHandle& file, const FileLayout& layout, std::uint32_t slot, const ImageEntry& entry, ImageAnnotations annotations, std::uint64_t ordinal_base = 0) {
  const auto payload = annotation_layout(entry.num_instances, entry.num_runs);
- if (annotations.labels.size() != entry.num_instances || annotations.runs.size() != entry.num_runs || entry.label_bytes != payload.used_bytes)
+ if (annotations.labels.size() != entry.num_instances || annotations.runs.size() != entry.num_runs || entry.label_bytes != payload.used_bytes || entry.label_bytes > layout.label_capacity)
   throw std::runtime_error("compiled annotation write extent differs");
  const auto offset = layout.label_offset(slot);
  if (ordinal_base)
@@ -177,6 +180,11 @@ inline void write_compiled_annotations(
  file.pwrite_all(&zero, payload.run_offset - annotations.labels.size_bytes(), offset + annotations.labels.size_bytes());
  file.pwrite_all(annotations.runs.data(), annotations.runs.size_bytes(), offset + payload.run_offset);
 }
+using CompiledCompactionProgress = std::function<void(std::size_t completed_bytes, std::size_t total_bytes)>;
+// All pixel/label borrowers must be drained. Compacts this private staged inode;
+// a failed or cancelled compaction is discarded by its existing publication owner.
+[[nodiscard]] FileLayout compact_compiled_file(const mmltk::common::io::FileHandle&, const FileLayout&, std::span<const ImageEntry>, mmltk::common::concurrency::CancellationObservation = {},
+ CompiledCompactionProgress = {}, const std::function<void(std::size_t, std::size_t)>& reserve = {});
 inline catalog::ClassCatalog compiled_class_catalog(const FileHeader& header) {
  std::vector<std::string> names;
  names.reserve(header.num_classes);

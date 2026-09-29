@@ -34,6 +34,7 @@ struct CompileProgress {
  DatasetCompileTracks tracks{};
  size_t active_workers = 0;
  std::uint64_t dropped_instances = 0;
+ std::size_t compacted_bytes = 0, compaction_bytes = 0;
 };
 struct ProgressEstimate final {
  std::uint64_t remaining_seconds = 0U;
@@ -70,6 +71,7 @@ private:
  void begin_pixel_worker() noexcept;
  void end_pixel_worker() noexcept;
  void enter_syncing() noexcept;
+ void compacting(std::size_t done, std::size_t total) noexcept;
  void enter_publishing() noexcept;
  void set_dropped_instances(std::uint64_t count) noexcept;
  [[nodiscard]] CompileProgress snapshot(DatasetCompilePhase phase) const noexcept;
@@ -77,6 +79,7 @@ private:
  void publish_counter() noexcept;
  StageProgress labels_;
  StageProgress pixels_;
+ std::atomic<std::size_t> compacted_bytes_{0U}, compaction_bytes_{0U};
  std::atomic<size_t> num_images_{0U};
  std::atomic<DatasetCompilePhase> phase_{DatasetCompilePhase::Planning};
  std::atomic<std::uint64_t> dropped_instances_{0U};

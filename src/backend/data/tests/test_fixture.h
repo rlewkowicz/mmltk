@@ -1,6 +1,7 @@
 #pragma once
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/backend/imaging/resample/image_resize.h"
+#include "src/common/io/file_memory.h"
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -9,6 +10,7 @@
 #include <vector>
 namespace mmltk::backend::data {
 struct ImageEntry;
+struct FileHeader;
 namespace benchmark_internal {
 class BenchmarkCompilePipeline;
 class BenchmarkSplitWriter;
@@ -19,6 +21,7 @@ struct BenchmarkLabelChunk;
 }  // namespace benchmark_internal
 }  // namespace mmltk::backend::data
 namespace mmltk::backend::data::testsupport {
+[[nodiscard]] mmltk::common::io::FileHandle create_compiled_fixture_file(const std::filesystem::path&, const FileHeader&);
 [[nodiscard]] std::string benchmark_semantics(const std::filesystem::path&);
 void bind_benchmark_slots(benchmark_internal::BenchmarkCompilePipeline&, benchmark_internal::BenchmarkSplitWriter&, const benchmark_internal::PreparedBenchmarkSplit&);
 [[nodiscard]] ImageEntry benchmark_entry(const benchmark_internal::EncodedImageRecord&);

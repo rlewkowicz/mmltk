@@ -6,7 +6,9 @@ namespace mmltk::backend::data::detail {
 WritablePixelRange::WritablePixelRange(int descriptor, const FileLayout& layout) : descriptor_(descriptor) { grow(layout); }
 void WritablePixelRange::grow(const FileLayout& layout) {
  const std::lock_guard lock(mutex_);
- if (layout_.image_stride && (layout_.image_stride != layout.image_stride || layout.num_slots < layout_.num_slots)) throw std::logic_error("writable compiled layout changed");
+ if (layout_.image_stride &&
+     (layout_.image_stride != layout.image_stride || layout.num_slots < layout_.num_slots || layout_.label_pitch != layout.label_pitch || layout_.block_bytes != layout.block_bytes))
+  throw std::logic_error("writable compiled layout changed");
  const auto count = layout.block_count();
  blocks_.reserve(count);
  while (blocks_.size() < count) {

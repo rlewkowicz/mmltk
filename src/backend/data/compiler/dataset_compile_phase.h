@@ -12,6 +12,7 @@ enum class DatasetCompilePhase : std::uint8_t {
  Extracting,
  Labels,
  Pixels,
+ Compacting,
  Syncing,
  Publishing,
 };
@@ -24,6 +25,7 @@ enum class DatasetCompilePhase : std::uint8_t {
   case DatasetCompilePhase::Extracting: return "extracting";
   case DatasetCompilePhase::Labels: return "labels";
   case DatasetCompilePhase::Pixels: return "pixels";
+  case DatasetCompilePhase::Compacting: return "compacting";
   case DatasetCompilePhase::Syncing: return "syncing";
   case DatasetCompilePhase::Publishing: return "publishing";
  }

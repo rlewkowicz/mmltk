@@ -40,14 +40,18 @@ namespace {
 [[nodiscard]] std::string bounded_progress_text(const std::string_view value) { return std::string{value.substr(0U, contracts::kArtifactProgressTextCapacity)}; }
 }  // namespace
 contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data::CompileProgress& value) {
+ const bool compacting = value.phase == mmltk::backend::data::DatasetCompilePhase::Compacting;
+ const auto completed = bounded_u64_count(compacting ? value.compacted_bytes : value.done);
+ const auto total = bounded_u64_count(compacting ? value.compaction_bytes : value.total);
+ const auto estimate = mmltk::backend::data::estimate_progress(completed, total, value.elapsed_seconds);
  return {
   .phase = value.phase,
   .activity = std::string{mmltk::backend::data::dataset_compile_phase_label(value.phase)},
-  .completed = bounded_u64_count(value.done),
-  .total = bounded_u64_count(value.total),
+  .completed = completed,
+  .total = total,
   .elapsed_seconds = value.elapsed_seconds,
-  .remaining_seconds = value.remaining_seconds,
-  .throughput_per_second = value.throughput_per_second,
+  .remaining_seconds = compacting ? estimate.remaining_seconds : value.remaining_seconds,
+  .throughput_per_second = compacting ? estimate.throughput_per_second : value.throughput_per_second,
   .dropped_instances = value.dropped_instances,
   .tracks = value.tracks
  };

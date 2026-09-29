@@ -18,6 +18,13 @@
 #include <vector>
 namespace fs = std::filesystem;
 namespace mmltk::backend::data::testsupport {
+mmltk::common::io::FileHandle create_compiled_fixture_file(const std::filesystem::path& path, const FileHeader& header) {
+ (void)validate_compiled_file_sections(header, header.total_file_size);
+ auto file = mmltk::common::io::FileHandle::create_output(path.string(), 0);
+ file.resize_sparse(header.total_file_size);
+ file.pwrite_all(&header, sizeof(header), 0);
+ return file;
+}
 std::string benchmark_semantics(const std::filesystem::path& path) {
  const auto dataset = CompiledDataset::open(path);
  std::map<std::pair<AnnotationSource, std::uint64_t>, std::string> samples;

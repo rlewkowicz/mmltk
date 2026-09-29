@@ -138,6 +138,7 @@ struct CompiledImageStream::Impl {
   Buffer labels;
   std::optional<mmltk::common::system::PreparedExecutionPolicy> host_policy;
   std::vector<ImageAnnotations> annotations;
+  std::size_t label_pitch = 0;
   std::vector<CompiledImageRead> reads;
   const CompiledDataset* source = nullptr;
   ReadObserver observer;
@@ -463,16 +464,19 @@ void CompiledImageStream::prepare_host(const std::size_t index, const std::size_
  if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced) throw std::logic_error("compiled image host storage is still borrowed");
  on_context(impl_->context, [&] { impl_->prepare_storage(StorageKind::HostImages, index, slot.host, [&] { slot.host.ensure_bytes(bytes); }); });
 }
-void CompiledImageStream::prepare_reads(std::size_t index, std::size_t count, bool annotations) {
+void CompiledImageStream::prepare_reads(std::size_t index, std::size_t count, std::optional<std::size_t> max_label_bytes) {
  const std::lock_guard lock(impl_->mutex);
  auto& slot = *impl_->slots.at(index);
  if (impl_->failure) std::rethrow_exception(impl_->failure);
  if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced) throw std::logic_error("compiled read storage is still borrowed");
- if (annotations || !slot.annotations.empty()) {
+ if (max_label_bytes && (*max_label_bytes > COMPILED_LABEL_CAPACITY || *max_label_bytes % sizeof(RLEPair))) throw std::invalid_argument("invalid prepared maximum label size");
+ if (max_label_bytes || !slot.annotations.empty()) {
   count = std::max(count, slot.annotations.size());
-  const auto bytes = mmltk::common::math::checked_multiply(count, COMPILED_LABEL_CAPACITY, "compiled batch labels overflow");
-  on_context(impl_->context, [&] { impl_->prepare_storage(StorageKind::Labels, index, slot.labels, [&] { slot.labels.ensure_bytes(bytes); }); });
+  const auto pitch = max_label_bytes.value_or(slot.label_pitch);
+  const auto bytes = mmltk::common::math::checked_multiply(count, pitch, "compiled batch labels overflow");
+  if (bytes) on_context(impl_->context, [&] { impl_->prepare_storage(StorageKind::Labels, index, slot.labels, [&] { slot.labels.ensure_bytes(bytes); }); });
   impl_->prepare_storage(StorageKind::AnnotationViews, index, slot.annotations, [&] { slot.annotations.resize(count); });
+  slot.label_pitch = pitch;
  }
  impl_->prepare_storage(StorageKind::ReadDescriptors, index, slot.reads, [&] { slot.reads.reserve(count); });
 }
@@ -575,6 +579,7 @@ void CompiledImageStream::submit(
   if (!impl_->initialized) throw std::logic_error("compiled image stream must bind its context before submitting reads");
   if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced || impl_->stopping) throw std::logic_error("compiled image slot is still in use");
   if (reads.size() > slot.reads.capacity() || (!slot.annotations.empty() && reads.size() > slot.annotations.size())) throw std::out_of_range("compiled read descriptors were not prepared");
+  if (!slot.annotations.empty() && source.header().max_label_bytes > slot.label_pitch) throw std::out_of_range("compiled labels exceed prepared maximum");
   slot.reads.assign(reads.begin(), reads.end());
   slot.cancelled.store(false, std::memory_order_release);
   slot.reading = true;
@@ -616,7 +621,11 @@ void CompiledImageStream::read_slot(const std::size_t index) noexcept {
      const auto& image_read = current.reads[i];
      const auto position = image_read.destination_offset / source.header().image_stride;
      const auto payload = source.label_payload(image_read.index);
-     auto* destination = static_cast<std::byte*>(current.labels.data()) + position * COMPILED_LABEL_CAPACITY;
+     if (payload.empty()) {
+      current.annotations[position] = {};
+      continue;
+     }
+     auto* destination = static_cast<std::byte*>(current.labels.data()) + position * current.label_pitch;
      std::memcpy(destination, payload.data(), payload.size());
      current.annotations[position] = annotation_view(source.image_entry(image_read.index), {destination, payload.size()});
     }

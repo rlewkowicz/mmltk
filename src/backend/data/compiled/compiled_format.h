@@ -110,7 +110,8 @@ struct __attribute__((packed)) FileHeader {
  std::array<std::array<char, 32>, MAX_CLASSES> class_names{};
  uint32_t max_instances_per_image;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
- std::array<uint8_t, 55> _reserved{};
+ uint32_t max_label_bytes = 0;
+ std::array<uint8_t, 51> _reserved{};
 };
 inline constexpr std::size_t COMPILED_CLASS_NAME_CAPACITY = FileHeader{}.class_names[0].size() - 1U;
 static_assert(sizeof(FileHeader) == 8320, "Format 10 header layout changed");

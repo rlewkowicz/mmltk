@@ -261,7 +261,9 @@ fn source_details(source: &BenchmarkSourceProgress) -> String {
 fn work_is_bytes(phase: DatasetCompilePhase) -> bool {
     matches!(
         phase,
-        DatasetCompilePhase::Downloading | DatasetCompilePhase::Extracting
+        DatasetCompilePhase::Downloading
+            | DatasetCompilePhase::Extracting
+            | DatasetCompilePhase::Compacting
     )
 }
 

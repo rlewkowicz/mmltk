@@ -28,13 +28,15 @@ ImageAnnotations annotation_view(const ImageEntry& entry, std::span<const std::b
  if (!layout.used_bytes) return {};
  return {{reinterpret_cast<const PackedInstance*>(payload.data()), entry.num_instances}, {reinterpret_cast<const RLEPair*>(payload.data() + layout.run_offset), entry.num_runs}};
 }
-FileLayout compute_file_layout(uint32_t slots, size_t stride) {
+FileLayout compute_file_layout(uint32_t slots, size_t stride, size_t label_capacity) {
  FileLayout layout;
  layout.num_slots = slots;
  layout.image_stride = stride;
  if (!stride || stride % sizeof(float)) throw std::invalid_argument("invalid compiled pixel stride");
+ if (label_capacity > COMPILED_LABEL_CAPACITY || label_capacity % sizeof(RLEPair)) throw std::invalid_argument("invalid compiled label capacity");
  layout.pixel_pitch = compiled_align_up(stride, PAGE_SIZE);
- layout.label_pitch = compiled_align_up(COMPILED_LABEL_CAPACITY, PAGE_SIZE);
+ layout.label_capacity = label_capacity;
+ layout.label_pitch = compiled_align_up(label_capacity, PAGE_SIZE);
  layout.pixel_block_bytes = checked_multiply(COMPILED_BLOCK_SLOTS, layout.pixel_pitch, "compiled pixel block overflow");
  layout.block_bytes =
   compiled_align_up(checked_multiply(COMPILED_BLOCK_SLOTS, checked_add(layout.pixel_pitch, layout.label_pitch, "compiled slot extent overflow"), "compiled block overflow"), HUGE_PAGE_SIZE);
@@ -70,6 +72,7 @@ FileHeader make_file_header(const FileHeaderInputs& inputs, std::span<const std:
  header.channels = inputs.channels;
  header.num_classes = checked_cast<uint32_t>(classes.size(), "too many classes for file header");
  header.max_instances_per_image = inputs.max_instances_per_image;
+ header.max_label_bytes = checked_cast<uint32_t>(layout.label_capacity, "compiled maximum label size overflow");
  header.index_offset = layout.index_offset;
  header.data_offset = layout.data_offset;
  header.total_file_size = layout.total_size;

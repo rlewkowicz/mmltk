@@ -77,6 +77,13 @@ CompileProgress CompileTelemetry::snapshot(const DatasetCompilePhase phase) cons
   };
  };
  if (phase == DatasetCompilePhase::Planning) { return progress(0U); }
+ if (phase == DatasetCompilePhase::Compacting) {
+  auto value = progress(label_done + pixel_done);
+  value.compacted_bytes = compacted_bytes_.load(std::memory_order_relaxed);
+  value.compaction_bytes = compaction_bytes_.load(std::memory_order_relaxed);
+  value.active_workers = 1;
+  return value;
+ }
  if (phase == DatasetCompilePhase::Syncing || phase == DatasetCompilePhase::Publishing) {
   CompileProgress complete = progress(total);
   complete.active_workers = 0U;
@@ -89,6 +96,8 @@ void CompileTelemetry::reset(const size_t num_images) noexcept {
  labels_.active_workers.store(0U, std::memory_order_relaxed);
  pixels_.done.store(0U, std::memory_order_relaxed);
  pixels_.active_workers.store(0U, std::memory_order_relaxed);
+ compacted_bytes_.store(0U, std::memory_order_relaxed);
+ compaction_bytes_.store(0U, std::memory_order_relaxed);
  dropped_instances_.store(0U, std::memory_order_relaxed);
  num_images_.store(num_images, std::memory_order_relaxed);
  published_counter_quantum_.store(0U, std::memory_order_relaxed);
@@ -111,6 +120,13 @@ void CompileTelemetry::end_label_worker() noexcept { labels_.active_workers.fetc
 void CompileTelemetry::begin_pixel_worker() noexcept { pixels_.active_workers.fetch_add(1U, std::memory_order_relaxed); }
 void CompileTelemetry::end_pixel_worker() noexcept { pixels_.active_workers.fetch_sub(1U, std::memory_order_relaxed); }
 void CompileTelemetry::enter_syncing() noexcept { publish_semantic(DatasetCompilePhase::Syncing); }
+void CompileTelemetry::compacting(std::size_t done, std::size_t total) noexcept {
+ const std::lock_guard lock(publication_mutex_);
+ compacted_bytes_.store(done, std::memory_order_relaxed);
+ compaction_bytes_.store(total, std::memory_order_relaxed);
+ phase_.store(DatasetCompilePhase::Compacting, std::memory_order_relaxed);
+ if (observer_.report) observer_(snapshot(DatasetCompilePhase::Compacting));
+}
 void CompileTelemetry::enter_publishing() noexcept { publish_semantic(DatasetCompilePhase::Publishing); }
 void CompileTelemetry::set_dropped_instances(const std::uint64_t count) noexcept {
  dropped_instances_.store(count, std::memory_order_relaxed);
@@ -271,6 +287,8 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  throw_if_cancelled();
  mmltk::common::logging::debug([](spdlog::logger& log) { log.debug("[compile] Labels and pixels complete"); });
  throw_if_cancelled();
+ layout = compact_compiled_file(fd, layout, label_blocks.index, cancellation,
+  telemetry ? CompiledCompactionProgress{[&](std::size_t done, std::size_t total) { telemetry->compacting(done, total); }} : CompiledCompactionProgress{});
  mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Layout: total={:.2f} GB", static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
  fd.allocate_range(0, compiled_align_up(sizeof(FileHeader), PAGE_SIZE));
  fd.allocate_range(layout.index_offset, compiled_align_up(layout.index_size, PAGE_SIZE));

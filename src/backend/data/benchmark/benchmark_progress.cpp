@@ -58,6 +58,12 @@ void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_
  std::unique_lock lock(mutex_);
  phase_unlocked(lock, phase, completed, total);
 }
+void ProgressReporter::compacting(std::size_t split, std::size_t completed, std::size_t total) {
+ if (!callback_ && !trace_) return;
+ std::unique_lock lock(mutex_);
+ compaction_.at(split) = {completed, total};
+ phase_unlocked(lock, DatasetCompilePhase::Compacting, compaction_[0].first + compaction_[1].first, compaction_[0].second + compaction_[1].second);
+}
 void ProgressReporter::phase_unlocked(std::unique_lock<std::mutex>& lock, const DatasetCompilePhase phase, const std::uint64_t completed, const std::uint64_t total) {
  flush_pixels_unlocked();
  const bool background_indexing = phase == DatasetCompilePhase::Indexing && (state_.phase == DatasetCompilePhase::Extracting || state_.phase == DatasetCompilePhase::Pixels);
@@ -78,7 +84,7 @@ void ProgressReporter::phase_unlocked(std::unique_lock<std::mutex>& lock, const 
   state_.tracks.acquisition.complete = false;
   state_.tracks.acquisition.activity = DatasetCompileActivity::Acquiring;
  }
- if (phase == DatasetCompilePhase::Syncing || phase == DatasetCompilePhase::Publishing) {
+ if (phase == DatasetCompilePhase::Compacting || phase == DatasetCompilePhase::Syncing || phase == DatasetCompilePhase::Publishing) {
   for (auto* track : {&state_.tracks.acquisition, &state_.tracks.labels, &state_.tracks.pixels}) {
    track->active = false;
    track->complete = true;
@@ -384,6 +390,7 @@ std::string ProgressReporter::default_phase_activity(const DatasetCompilePhase p
   case DatasetCompilePhase::Extracting: return "Acquiring and extracting source images";
   case DatasetCompilePhase::Labels: return "Preparing compiled labels";
   case DatasetCompilePhase::Pixels: return "Compiling image pixels";
+  case DatasetCompilePhase::Compacting: return "Compacting compiled label partitions";
   case DatasetCompilePhase::Syncing: return "Validating and syncing compiled output";
   case DatasetCompilePhase::Publishing: return "Publishing benchmark dataset";
  }
@@ -433,11 +440,13 @@ IndexingProgressTotals::IndexingProgressTotals(std::span<const std::uint64_t> to
   total_ += total;
   releases_.push_back({0, total});
  }
+ // CLEANUP-OFF: shared guard and locking only; update clamps observations while settle replaces final counts.
 }
 void IndexingProgressTotals::update(std::size_t release, std::uint64_t completed, ProgressReporter& reporter) {
  if (!reporter.normalization_observer_enabled()) return;
  std::unique_lock lock(reporter.mutex_);
  auto& observation = releases_.at(release);
+ // CLEANUP-ON
  // Ordinary observations remain monotonic within a retained release product.
  // Replacement explicitly withdraws that product before new callbacks begin.
  const auto admitted = std::max(observation.completed, observation.total ? std::min(completed, observation.total) : completed);

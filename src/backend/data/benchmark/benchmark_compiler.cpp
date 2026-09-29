@@ -558,10 +558,12 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
                                                        }
                                                      : BenchmarkWriteProgressEvent{};
  const auto request = [&](const PreparedBenchmarkSplit& split) {
-  return BenchmarkWriteRequest{
+  auto result = BenchmarkWriteRequest{
    split, staging.path() / (split.name + ".bin"), config.resolution, static_cast<int>(pipeline.workers()), pipeline.cpus(), false, cancellation, pixel_progress, config.perceptual_downscale,
    config.resize_mode, image_opened, &pipeline
   };
+  if (progress.pixel_observer_enabled()) result.compaction = [&, val = split.name == "val"](std::size_t done, std::size_t total) { progress.compacting(val ? 1U : 0U, done, total); };
+  return result;
  };
  BenchmarkSplitWriter train_writer(request(train), true), validation_writer(request(validation), true);
  std::vector<AdmittedRecipeArchive> admitted;
@@ -1592,8 +1594,11 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      try {
       auto& product = i == 0 ? train : validation;
       auto& writer = i == 0 ? train_writer : validation_writer;
-      sealed_splits[i] = writer.seal(
-       {product, staging_dir / (i == 0 ? "train.bin" : "val.bin"), config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode});
+      BenchmarkWriteRequest seal_request{
+       product, staging_dir / (i == 0 ? "train.bin" : "val.bin"), config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode
+      };
+      if (progress.pixel_observer_enabled()) seal_request.compaction = [&, i](std::size_t done, std::size_t total) { progress.compacting(i, done, total); };
+      sealed_splits[i] = writer.seal(seal_request);
      } catch (...) {
       const std::lock_guard lock(seal_failure_mutex);
       if (!seal_failure) seal_failure = std::current_exception();

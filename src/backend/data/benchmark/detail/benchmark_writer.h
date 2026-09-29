@@ -69,6 +69,7 @@ struct BenchmarkWriteRequest {
  // Private effect-only boundary after opening a cached image, outside locks.
  BenchmarkImageReadObserver image_opened{};
  BenchmarkCompilePipeline* execution = nullptr;
+ CompiledCompactionProgress compaction{};
 };
 // Physical slots are stable across sparse growth. Calls on different
 // slots may overlap; each lane has exclusive reusable decoder/resizer scratch.
@@ -106,7 +107,7 @@ public:
  [[nodiscard]] bool image_complete(std::size_t slot) const;
  [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> dimensions(std::size_t slot) const;
  [[nodiscard]] std::size_t completed() const noexcept;
- // Final membership publishes eligibility without moving healthy pixel or label slots.
+ // Final membership preserves slot IDs while compacting the staged partitions.
  [[nodiscard]] BenchmarkSealedSplit seal(const BenchmarkWriteRequest&);
  void finish(const BenchmarkWriteRequest&);
 

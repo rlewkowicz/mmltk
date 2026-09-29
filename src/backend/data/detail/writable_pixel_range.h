@@ -7,7 +7,7 @@
 #include "src/backend/data/compiled/compiled_file_layout.h"
 namespace mmltk::backend::data::detail {
 // Independently mapped blocks never relocate when later slots arrive. The owner
-// drains all borrowers before destruction; vector growth moves only map handles.
+// drains all borrowers before destruction or final compaction; vector growth moves only map handles.
 class WritablePixelRange final {
 public:
  WritablePixelRange(int file_descriptor, const FileLayout&);

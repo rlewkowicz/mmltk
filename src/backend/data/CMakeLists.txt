@@ -75,6 +75,7 @@ mmltk_register_public_headers(
 )
 mmltk_register_ordinary_sources(mmltk_backend_data
     compiled/compiled_file_layout.cpp
+    compiled/compiled_file_compaction.cpp
     compiled/compiled_dataset.cpp
     benchmark/benchmark_json.cpp
     benchmark/benchmark_annotations.cpp

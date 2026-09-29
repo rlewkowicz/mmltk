@@ -27,6 +27,7 @@ CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, 
  store.image_entries_.resize(store.header_.num_slots);
  std::memcpy(store.image_entries_.data(), store.mapping_.data() + sections.index_offset, sections.expected_index_bytes);
  std::size_t eligible = 0;
+ std::uint32_t maximum_label_bytes = 0;
  for (std::uint32_t slot = 0; slot < store.header_.num_slots; ++slot) {
   const auto& entry = store.image_entries_[slot];
   if (entry.status != ImageStatus::Inactive && entry.status != ImageStatus::Eligible) throw std::runtime_error("invalid compiled slot status");
@@ -35,11 +36,13 @@ CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, 
    continue;
   }
   ++eligible;
+  maximum_label_bytes = std::max(maximum_label_bytes, entry.label_bytes);
   store.masks_available_ |= admit_compiled_annotations(entry, store.annotations(slot), store.header_, slot);
   store.label_count_ += entry.num_instances;
   store.run_count_ += entry.num_runs;
  }
  if (eligible != store.header_.num_images) throw std::runtime_error("compiled eligible population differs from header");
+ if (maximum_label_bytes != store.header_.max_label_bytes) throw std::runtime_error("compiled maximum label size differs from eligible payloads");
  store.catalog_ = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(store.header_));
  const int advice = access == AccessPattern::Normal ? MADV_NORMAL : access == AccessPattern::Sequential ? MADV_SEQUENTIAL : MADV_RANDOM;
  store.mapping_.advise_aligned_range(store.layout_.data_offset, store.layout_.index_offset - store.layout_.data_offset, advice);
@@ -56,7 +59,7 @@ const ImageEntry& CompiledDataset::image_entry(std::uint32_t slot) const {
 }
 std::span<const std::byte> CompiledDataset::label_payload(std::uint32_t slot) const {
  const auto& entry = image_entry(slot);
- if (entry.label_bytes > COMPILED_LABEL_CAPACITY) throw std::runtime_error("compiled label payload exceeds capacity");
+ if (entry.label_bytes > header_.max_label_bytes) throw std::runtime_error("compiled label payload exceeds recorded maximum");
  return {reinterpret_cast<const std::byte*>(mapping_.data() + layout_.label_offset(slot)), entry.label_bytes};
 }
 ImageAnnotations CompiledDataset::annotations(std::uint32_t slot) const { return annotation_view(image_entry(slot), label_payload(slot)); }

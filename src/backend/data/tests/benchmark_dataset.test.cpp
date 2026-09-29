@@ -102,8 +102,8 @@ void occupy_benchmark_cpu(BenchmarkCompilePipeline& execution, std::future<void>
  work = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Archive, {}, [&](std::size_t) { gate.receipt().ArriveAndWait(); }); });
  REQUIRE(gate.WaitEntered(2s));
 }
-[[nodiscard]] BenchmarkWriteRequest benchmark_write_request(
- const PreparedBenchmarkSplit& split, fs::path output, const std::uint32_t resolution, const mmltk::common::concurrency::CancellationObservation cancellation = {}) {
+[[nodiscard]] BenchmarkWriteRequest benchmark_write_request(const PreparedBenchmarkSplit& split, fs::path output, const std::uint32_t resolution,
+ const mmltk::common::concurrency::CancellationObservation cancellation = {}, BenchmarkCompilePipeline* execution = nullptr) {
  return {
   .split = split,
   .output_path = std::move(output),
@@ -113,8 +113,21 @@ void occupy_benchmark_cpu(BenchmarkCompilePipeline& execution, std::future<void>
   .overwrite = false,
   .cancel_requested = cancellation,
   .progress = {},
+  .execution = execution,
  };
 }
+// The attempt retires every pipeline borrower before its referenced writer and
+// split storage. Tests may retain direct access to both output and slot owner.
+struct LiveBenchmarkWriter {
+ PreparedBenchmarkSplit split{.name = "train", .class_names = {"person"}, .sources = {}, .images = {}};
+ BenchmarkWriteRequest output;
+ BenchmarkSplitWriter writer;
+ BenchmarkCompilePipeline::Attempt attempt;
+ LiveBenchmarkWriter(BenchmarkCompilePipeline& execution, const fs::path& directory, AnnotationSource source)
+     : output(benchmark_write_request(split, directory / "train.bin", 8, {}, &execution)), writer(output, true), attempt(execution) {
+  execution.bind_source(directory / "images", writer, source);
+ }
+};
 void test_benchmark_trace_gate_is_lazy() {
  std::size_t builder_invocations = 0U;
  const BenchmarkTraceSink disabled;
@@ -8696,6 +8709,13 @@ TEST_CASE("split sealing admits caller metadata and preserves publication on can
     (void)writer.seal(request);
    }());
   }
+  SECTION("cancel during compaction preserves the published generation") {
+   writer.write_labels(0, benchmark_entry(split.images[0]), {annotations->labels, annotations->runs});
+   request.compaction = [&](std::size_t done, std::size_t) {
+    if (done) cancelled.store(true);
+   };
+   CHECK_THROWS(writer.finish(request));
+  }
   SECTION("cancel after sync before publishing") {
    annotations->labels[0].flags = kAnnotationMask;  // Untrusted present-empty mask is valid.
    writer.write_labels(0, benchmark_entry(split.images[0]), {annotations->labels, annotations->runs});
@@ -8897,14 +8917,9 @@ TEST_CASE("provenance settlement coalesces used record blocks while preserving m
  prepare_cached_image_directory(images);
  BenchmarkEncodedImage::publish(cached_image_path(images, 7), make_jpeg(20, 30, 40), {});
  BenchmarkCompilePipeline execution(1);
- PreparedBenchmarkSplit split;
- split.name = "train";
- split.class_names = {"person"};
- auto output = benchmark_write_request(split, temporary.path() / "train.bin", 8);
- output.execution = &execution;
- BenchmarkSplitWriter writer(output, true);
- BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.bind_source(images, writer, AnnotationSource::CoconutCoco);
+ LiveBenchmarkWriter fixture(execution, temporary.path(), AnnotationSource::CoconutCoco);
+ auto& writer = fixture.writer;
+ const auto& output = fixture.output;
  const auto publication = execution.source_publication(images, {});
  publication({7});
  execution.wait_image(images, 7);
@@ -8964,14 +8979,9 @@ TEST_CASE("dynamic benchmark slots write labels before pixels and replace one de
   if (projections < retained_before_projection.size()) retained_before_projection[projections] = workspace.retained_bytes();
   ++projections;
  });
- PreparedBenchmarkSplit split;
- split.name = "train";
- split.class_names = {"person"};
- auto output = benchmark_write_request(split, temporary.path() / "train.bin", 8);
- output.execution = &execution;
- BenchmarkSplitWriter writer(output, true);
- BenchmarkCompilePipeline::Attempt attempt(execution);
- execution.bind_source(images, writer, AnnotationSource::CoconutObjects365V2);
+ LiveBenchmarkWriter fixture(execution, temporary.path(), AnnotationSource::CoconutObjects365V2);
+ auto& writer = fixture.writer;
+ const auto& output = fixture.output;
  NormalizedAnnotationBuilder annotations;
  annotations.images.push_back({7, 0, 1, contradiction ? 15U : 16U, 8, 0, 0});
  NormalizedBox box;

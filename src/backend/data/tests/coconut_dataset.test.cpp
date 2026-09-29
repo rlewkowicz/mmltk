@@ -246,6 +246,12 @@ struct LocalCoconutImportRequest : CoconutImportRequest {
  }
 };
 LocalCoconutImportRequest request(std::span<const CoconutPhysicalImage> physical, CoconutEdition edition = CoconutEdition::Base) { return LocalCoconutImportRequest(physical, edition); }
+void check_rejected_coconut_labels(CoconutImportRequest& input) {
+ input.accept_partial = true;
+ const auto result = import_coconut_annotations(input);
+ REQUIRE(result.size() == 1);
+ CHECK_FALSE(result.front().required_labels_valid(0));
+}
 void reversed_coco_parquet(const std::filesystem::path& path) {
  const std::array<std::uint32_t, 1> ids{1};
  const auto mask = png(1, 1, ids);
@@ -556,10 +562,7 @@ TEST_CASE("COCONut Parquet rejects malformed nested records missing membership a
  }
  parquet_file(input.parquet_shards[0], Json::array({row}));
  if (rejected_labels) {
-  input.accept_partial = true;
-  const auto result = import_coconut_annotations(input);
-  REQUIRE(result.size() == 1);
-  CHECK_FALSE(result.front().required_labels_valid(0));
+  check_rejected_coconut_labels(input);
  } else
   CHECK_THROWS(import_coconut_annotations(input));
 }
@@ -790,10 +793,7 @@ TEST_CASE("COCONut archives reject invalid consumed members and ignore unused ta
  if (unused_tail)
   CHECK_NOTHROW(import_coconut_annotations(input));
  else if (rejected_labels) {
-  input.accept_partial = true;
-  const auto result = import_coconut_annotations(input);
-  REQUIRE(result.size() == 1);
-  CHECK_FALSE(result.front().required_labels_valid(0));
+  check_rejected_coconut_labels(input);
  } else
   CHECK_THROWS(import_coconut_annotations(input));
 }
@@ -2035,6 +2035,26 @@ CustomRecipeCatalog local_custom_catalog(LocalCoconutRecipe& local, std::span<co
  std::filesystem::create_directories(open_path.parent_path());
  mmltk::testsupport::write_text_file(open_path, white_jpeg());
  return catalog;
+}
+std::pair<CustomRecipeCatalog, std::vector<unsigned>> custom_training_window(LocalCoconutRecipe& local) {
+ // Seventy images cross both ready-window and pixel-progress boundaries.
+ std::vector<unsigned> ids;
+ std::vector<std::pair<std::string, std::string>> members;
+ for (unsigned id = 100; id < 170; ++id) {
+  ids.push_back(id);
+  members.emplace_back(coco(id).member, white_jpeg());
+ }
+ replace_physical_images(local.cache, local.catalog, CoconutImageNamespace::CocoTrain, members);
+ return {local_custom_catalog(local, ids), std::move(ids)};
+}
+// Keep the constrained recipe's asynchronous admission and shared resource
+// limits in one fixture driver. Callers release held inputs before joining.
+std::future<void> compile_constrained_coconut(const BenchmarkCompilerConfig& config, const CoconutRecipeCatalog& catalog) {
+ return std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog, nullptr, {}, {}, {.transient_bytes = 1, .descriptors = 13}); });
+}
+void remove_coconut_part_caches(const std::filesystem::path& directory) {
+ for (const auto& entry : std::filesystem::directory_iterator(directory))
+  if (entry.path().filename().string().find(".part-") != std::string::npos) std::filesystem::remove(entry.path());
 }
 void check_custom_compilation(const std::filesystem::path& output) {
  const auto train = CompiledDataset::open(output / "train.bin");
@@ -3516,16 +3536,7 @@ TEST_CASE("cached training labels start before pixel drain and overlap subsequen
  SECTION("cancellation drains the held reader and retains the old generation") { cancel_reader = true; }
  ScopedTempDir root("custom-label-overlap");
  LocalCoconutRecipe local(root.path());
- std::vector<unsigned> ids;
- std::vector<std::pair<std::string, std::string>> members;
- // Seventy selected images exceed both the former 3P readiness limit and the
- // normal 64-image progress quantum.
- for (unsigned id = 100; id < 170; ++id) {
-  ids.push_back(id);
-  members.emplace_back(coco(id).member, white_jpeg());
- }
- replace_physical_images(local.cache, local.catalog, CoconutImageNamespace::CocoTrain, members);
- auto custom = local_custom_catalog(local, ids);
+ auto [custom, ids] = custom_training_window(local);
  auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock}, true);
  compile_benchmark_recipe(config, nullptr, &custom);
  compile_benchmark_recipe(config, nullptr, &custom);
@@ -7998,7 +8009,7 @@ TEST_CASE("COCONut independently writes pixels and labels while every opposite i
  config.trace = [&](std::string_view event, std::string_view) {
   if (!hold_annotations && event == "benchmark.labels.placed" && !completed.exchange(true)) first.set_value();
  };
- auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog, nullptr, {}, {}, {.transient_bytes = 1, .descriptors = 13}); });
+ auto compiling = compile_constrained_coconut(config, catalog);
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   cancelled = true;
   held.clear();
@@ -8031,8 +8042,7 @@ TEST_CASE("ready Parquet artifact labels precede a held sibling and settle canon
   compile_benchmark_recipe(config, &catalog);
   if (prefix == "release cache only") {
    const auto directory = local.cache.source_indexes("coconut-" + std::string(release.name));
-   for (const auto& entry : std::filesystem::directory_iterator(directory))
-    if (entry.path().filename().string().find(".part-") != std::string::npos) std::filesystem::remove(entry.path());
+   remove_coconut_part_caches(directory);
   }
   if (prefix == "missing optional extents") {
    const auto directory = local.cache.source_indexes("coconut-" + std::string(release.name));
@@ -8072,7 +8082,7 @@ TEST_CASE("ready Parquet artifact labels precede a held sibling and settle canon
  config.trace = [&](std::string_view event, std::string_view fields) {
   if (event == "benchmark.labels.placed" && Json::parse(fields).at("image_id") == 11 && !published.exchange(true)) labels.set_value();
  };
- auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog, nullptr, {}, {}, {.transient_bytes = 1, .descriptors = 13}); });
+ auto compiling = compile_constrained_coconut(config, catalog);
  const mmltk::testsupport::ScopedTestCleanup release_inputs([&] {
   cancelled = true;
   held = {};
@@ -8240,7 +8250,7 @@ TEST_CASE("COCONut local identity rejection retains later archive and annotation
    };
    std::optional<std::array<std::string, 3>> previous;
    if (admission) previous = capture_publication_bytes(local.output);
-   auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog, nullptr, {}, {}, {.transient_bytes = 1, .descriptors = 13}); });
+   auto compiling = compile_constrained_coconut(config, catalog);
    const mmltk::testsupport::ScopedTestCleanup release_input([&] {
     cancelled = true;
     held = {};
@@ -8404,8 +8414,7 @@ TEST_CASE("version three COCONut completions reuse their proven rows without new
  const auto& release = *std::ranges::find(catalog.releases, edition, &CoconutReleaseComponent::edition);
  const auto directory = local.cache.source_indexes("coconut-" + std::string(release.name));
  // A real release-level v3 layout predates per-artifact caches entirely.
- for (const auto& entry : std::filesystem::directory_iterator(directory))
-  if (entry.path().filename().string().find(".part-") != std::string::npos) std::filesystem::remove(entry.path());
+ remove_coconut_part_caches(directory);
  std::vector<std::pair<std::filesystem::path, std::string>> stable;
  unsigned completions = 0;
  for (const auto& entry : std::filesystem::directory_iterator(directory)) {
@@ -8495,7 +8504,7 @@ TEST_CASE("failed part cache retracts its indexing while independent sibling lab
   else
    repair.receipt().ArriveAndWait();
  };
- auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog, nullptr, {}, {}, {.transient_bytes = 1, .descriptors = 13}); });
+ auto compiling = compile_constrained_coconut(config, catalog);
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   cancelled = true;
   held = {};
@@ -8617,14 +8626,7 @@ TEST_CASE("custom source admission keeps ready label peers useful while its firs
  if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPU lanes");
  ScopedTempDir root("custom-label-ready-window");
  LocalCoconutRecipe local(root.path());
- std::vector<unsigned> ids;
- std::vector<std::pair<std::string, std::string>> members;
- for (unsigned id = 100; id < 170; ++id) {
-  ids.push_back(id);
-  members.emplace_back(coco(id).member, white_jpeg());
- }
- replace_physical_images(local.cache, local.catalog, CoconutImageNamespace::CocoTrain, members);
- auto custom = local_custom_catalog(local, ids);
+ auto [custom, ids] = custom_training_window(local);
  auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock}, true);
  config.num_workers = 4;
  compile_benchmark_recipe(config, nullptr, &custom);

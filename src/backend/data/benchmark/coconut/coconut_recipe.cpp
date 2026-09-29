@@ -53,6 +53,9 @@ struct CoconutRecipeInputs {
   }
   changed.notify_all();
   if (execution) execution->notify_admission_change();
+  join_inputs();
+ }
+ void join_inputs() {
   controllers.clear();
   for (auto& release : releases) {
    release.masks = {};
@@ -329,14 +332,7 @@ struct CoconutRecipeInputs {
    std::unique_lock lock(mutex);
    changed.wait(lock, [&] { return error || completed == releases.size(); });
   }
-  controllers.clear();
-  for (auto& release : releases) {
-   release.masks = {};
-   release.metadata_reader = {};
-   release.mask_discovery = {};
-   for (auto& part : release.parts) part->worker = {};
-  }
-  original_controller = {};
+  join_inputs();
   if (error) std::rethrow_exception(error);
   for (std::size_t index = 0; index < releases.size(); ++index) {
    auto& release = releases[index];

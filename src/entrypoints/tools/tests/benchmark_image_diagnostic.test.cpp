@@ -48,7 +48,7 @@ void rejected(const SubprocessResult& result, const std::string& cause) {
 struct CompiledSampleFixture {
  ScopedTempDir root{"benchmark-diagnostic-compiled"};
  std::filesystem::path path = root.path() / "samples.bin";
- data::FileLayout layout = data::compute_file_layout(66, 4 * 3 * sizeof(float));
+ data::FileLayout layout = data::compute_file_layout(66, 4 * 3 * sizeof(float), data::annotation_layout(1, 1).used_bytes);
  std::array<std::string, 1> classes{"sample"};
  data::FileHeader header = data::make_file_header({.num_images = 2, .width = 2, .height = 2, .channels = 3, .max_instances_per_image = 1, .image_stride = layout.image_stride}, classes, layout);
  mmltk::common::io::FileHandle file = mmltk::common::io::FileHandle::create_output(path.string(), 0);
@@ -119,7 +119,7 @@ TEST_CASE("benchmark image diagnostic reads eligible physical slots and canonica
   record ==
   Json{
    {"kind", "compiled_sample"}, {"path", fixture.path.string()}, {"sample", 65}, {"image_count", 2}, {"slot_count", 66}, {"width", 2}, {"height", 2}, {"original_width", 4}, {"original_height", 3},
-   {"source", 4}, {"image_id", 2212}, {"label_bytes", +fixture.entry.label_bytes},
+   {"source", 4}, {"image_id", 2212}, {"label_bytes", +fixture.entry.label_bytes}, {"max_label_bytes", +fixture.header.max_label_bytes},
    {"instances",
     Json::array(
      {{{"class_id", 0}, {"class_name", "sample"}, {"flags", +fixture.label.flags}, {"bbox", {0, 0, 2, 1}}, {"mask_pairs", 1}, {"annotation_id", 8123}, {"source_category_id", 1}, {"original_area", 2.0}, {"source_ordinal", 9}}})}

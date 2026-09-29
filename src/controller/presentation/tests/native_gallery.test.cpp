@@ -36,6 +36,7 @@
 #include <vector>
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/compiled/compiled_file_utils.h"
+#include "src/backend/data/tests/test_fixture.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/presentation/presentation_system.h"
@@ -67,13 +68,11 @@ void check_labels(const std::span<const ExploreLabel> actual, const std::span<co
 // CUDA rendering, cache ownership and runtime publication in the test path.
 void write_gallery_artifact(const std::filesystem::path& path, const float red, const std::uint32_t mask_start, const std::uint32_t count = 203U, const std::uint32_t classes = 1U) {
  namespace data = mmltk::backend::data;
- const auto layout = data::compute_file_layout(count, 8U * 8U * 3U * sizeof(float));
+ const auto layout = data::compute_file_layout(count, 8U * 8U * 3U * sizeof(float), data::annotation_layout(1, 1).used_bytes);
  std::vector<std::string> names;
  for (std::uint32_t category = 0; category < classes; ++category) names.push_back("object" + std::to_string(category));
  const auto header = data::make_file_header({count, 8U, 8U, 3U, 1U, layout.image_stride}, names, layout);
- const auto output = mmltk::common::io::FileHandle::create_output(path.string(), 0);
- output.resize_sparse(layout.total_size);
- output.pwrite_all(&header, sizeof(header), 0);
+ const auto output = data::testsupport::create_compiled_fixture_file(path, header);
  for (std::uint32_t index = 0; index < count; ++index) {
   data::ImageEntry entry{};
   entry.status = data::ImageStatus::Eligible;

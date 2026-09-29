@@ -509,15 +509,18 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
   index[slot] = entry;
   maximum = std::max<std::uint32_t>(maximum, entry.num_instances);
  }
- const auto header =
-  make_file_header({common_math::checked_cast<std::uint32_t>(slots.size(), "benchmark image count overflow"), state.resolution, state.resolution, 3U, maximum, state.stride, state.resize_mode},
-   class_catalog->names(), state.layout);
  state.pixels.reset();
  {
   const std::lock_guard lock(state.directory_mutex);
   state.directory = {};
   state.directory_source = std::numeric_limits<std::uint16_t>::max();
  }
+ state.layout = compact_compiled_file(
+  state.staging.file(), state.layout, index, request.cancel_requested, request.compaction, [&](std::size_t offset, std::size_t bytes) { state.staging.allocate_range(offset, bytes); });
+ state.staging.reconcile();
+ const auto header =
+  make_file_header({common_math::checked_cast<std::uint32_t>(slots.size(), "benchmark image count overflow"), state.resolution, state.resolution, 3U, maximum, state.stride, state.resize_mode},
+   class_catalog->names(), state.layout);
  state.staging.allocate_range(0, compiled_align_up(sizeof(header), PAGE_SIZE));
  state.staging.allocate_range(state.layout.index_offset, compiled_align_up(state.layout.index_size, PAGE_SIZE));
  auto& output = state.staging.file();

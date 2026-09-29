@@ -122,6 +122,7 @@ function(mmltk_add_controller_presentation_tests)
         mmltk_controller_visual_systems_tests PRIVATE_DECLARATIONS)
     target_link_libraries(
         mmltk_controller_visual_systems_tests PRIVATE
+        mmltk_backend_data_test_support
         mmltk_controller_annotation_test_support
         mmltk_controller_visual_fixture
         mmltk_controller_explore_test_support

@@ -1,7 +1,8 @@
 #pragma once
+#include <array>
+#include <utility>
 #include <chrono>
 #include <atomic>
-#include <array>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -60,6 +61,7 @@ public:
  void invalidate_indexing(std::uint64_t count);
  [[nodiscard]] IndexingProgressTotals* indexing(std::span<const std::uint64_t> totals);
  void phase(const DatasetCompilePhase phase, const std::uint64_t completed = 0U, const std::uint64_t total = 0U);
+ void compacting(std::size_t split, std::size_t completed, std::size_t total);
  void label_plans(std::size_t total);
  void label_plan_started(std::size_t slot);
  void label_plan_completed(std::size_t slot);
@@ -103,6 +105,7 @@ private:
  std::function<void(std::exception_ptr)> failed_;
  BenchmarkTraceSink trace_;
  BenchmarkCompileProgress state_;
+ std::array<std::pair<std::size_t, std::size_t>, 2> compaction_{};
  std::chrono::steady_clock::time_point activity_started_{};
  std::chrono::steady_clock::time_point pixel_started_{};
  std::atomic<bool> pixel_total_known_{true};

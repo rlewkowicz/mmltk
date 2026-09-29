@@ -19,6 +19,7 @@ struct FileLayout {
  std::uint32_t num_slots = 0;
  size_t image_stride = 0;
  size_t pixel_pitch = 0;
+ size_t label_capacity = 0;
  size_t label_pitch = 0;
  size_t pixel_block_bytes = 0;
  size_t block_bytes = 0;
@@ -44,6 +45,6 @@ struct ImageAnnotations {
 [[nodiscard]] size_t compiled_align_up(size_t value, size_t alignment);
 [[nodiscard]] AnnotationLayout annotation_layout(size_t labels, size_t runs);
 [[nodiscard]] ImageAnnotations annotation_view(const ImageEntry&, std::span<const std::byte> payload);
-[[nodiscard]] FileLayout compute_file_layout(uint32_t num_slots, size_t image_stride);
+[[nodiscard]] FileLayout compute_file_layout(uint32_t num_slots, size_t image_stride, size_t label_capacity = COMPILED_LABEL_CAPACITY);
 [[nodiscard]] FileHeader make_file_header(const FileHeaderInputs&, std::span<const std::string> class_names, const FileLayout&);
 }  // namespace mmltk::backend::data
