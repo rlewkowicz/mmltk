@@ -2240,10 +2240,10 @@ TEST_CASE("stock annotation cancellation preserves the previous recipe publicati
  remove_normalized_annotation_index(index);
  std::atomic<bool> cancel{false};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancel);
- config.progress = [&](const auto& value) {
-  if (value.activity == "Parsing and indexing COCO validation annotations") cancel = true;
+ const CocoAnnotationInputObserver cancel_parse = [&](bool training, CocoAnnotationInputBoundary boundary) {
+  if (!training && boundary == CocoAnnotationInputBoundary::Parsing) cancel = true;
  };
- CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
+ CHECK_THROWS(compile_benchmark_recipe(config, &catalog, nullptr, {}, {}, {}, cancel_parse));
  CHECK(cancel.load());
  CHECK_FALSE(std::filesystem::exists(index.string() + ".complete.json"));
  check_publication_bytes(config.output_dir, train, val, manifest);
@@ -2296,13 +2296,14 @@ TEST_CASE("one stock request builds both splits and retains newly settled train 
  custom.coco_annotations.url = server.url("both-stock-splits");
  BenchmarkTraceSink trace;
  std::string settled_train, settled_metadata;
- ProgressReporter progress([&](const auto& update) {
-  if (update.activity == "Redownloading annotation metadata after structural validation failure" && settled_train.empty()) {
+ ProgressReporter progress({}, trace);
+ CocoAnnotationCache cache(local.cache, custom.coco_annotations, {CocoSplitAdmission::Required, CocoSplitAdmission::Required}, 2, 1, 1, {}, trace);
+ cache.observe_splits([&](CocoAnnotationSplit split) {
+  if (split.training && split.index && settled_train.empty()) {
    settled_train = file_bytes(train);
    settled_metadata = file_bytes(train.string() + ".complete.json");
   }
- }, trace);
- CocoAnnotationCache cache(local.cache, custom.coco_annotations, {CocoSplitAdmission::Required, CocoSplitAdmission::Required}, 2, 1, 1, {}, trace);
+ });
  cache.discover(progress);
  CHECK(cache.completed_indexes() == 0);
  REQUIRE(cache.pending_download());
@@ -2886,19 +2887,19 @@ TEST_CASE("optional COCO split admission is independent and never conceals outpu
  if (publication_failure) mmltk::testsupport::write_text_file(std::filesystem::path(missing.string() + ".complete.json") / "blocker", "retain");
  BenchmarkTraceSink trace;
  bool parser_entered = false, extraction_entered = false;
- ProgressReporter progress([&](const BenchmarkCompileProgress& update) {
-  if (local_archive_failure && update.activity == "Extracting COCO train annotations") {
+ ProgressReporter progress({}, trace);
+ CocoAnnotationCache cache(local.cache, artifact, {CocoSplitAdmission::Optional, required_validation ? CocoSplitAdmission::Required : CocoSplitAdmission::Optional}, 2, 1, 1, {}, trace);
+ cache.observe_input([&](bool training, CocoAnnotationInputBoundary boundary) {
+  if (!training) return;
+  if (local_archive_failure && boundary == CocoAnnotationInputBoundary::Extracting) {
    extraction_entered = true;
    REQUIRE(std::filesystem::remove(archive_path));
   }
-  if (local_parser_failure && update.activity == "Parsing and indexing COCO train annotations") {
+  if (local_parser_failure && boundary == CocoAnnotationInputBoundary::Parsing) {
    parser_entered = true;
-   // Remove the already-extracted input at the ordinary progress boundary.
-   // The parser's open failure is local, not evidence of unusable source bytes.
    REQUIRE(std::filesystem::remove(local.cache.source_indexes("coco") / "source-json/instances_train2017.json"));
   }
- }, trace);
- CocoAnnotationCache cache(local.cache, artifact, {CocoSplitAdmission::Optional, required_validation ? CocoSplitAdmission::Required : CocoSplitAdmission::Optional}, 2, 1, 1, {}, trace);
+ });
  std::mutex splits_mutex;
  std::vector<CocoAnnotationSplit> splits;
  cache.observe_splits([&](CocoAnnotationSplit split) { const std::lock_guard lock(splits_mutex); splits.push_back(std::move(split)); });
@@ -3840,9 +3841,7 @@ TEST_CASE("one archive controller selects independent or prefetched work from re
   }
  } observation{cancelled, waiting};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Borrow(observation);
- config.progress = [&](const BenchmarkCompileProgress& value) {
-  if (value.phase == DatasetCompilePhase::Extracting && first_selection.exchange(false)) selection.receipt().ArriveAndWait();
- };
+ const auto selecting = [&] { if (first_selection.exchange(false)) selection.receipt().ArriveAndWait(); };
  config.trace = [&](std::string_view event, std::string_view fields) {
   if (event == "benchmark.storage.reserved") {
    const auto path = std::filesystem::path(Json::parse(fields).at("path").get<std::string>());
@@ -3872,7 +3871,7 @@ TEST_CASE("one archive controller selects independent or prefetched work from re
   }, [&](const std::filesystem::path& source, std::uint64_t) {
    if (!pressure && source == objects_root) independent.receipt().ArriveAndWait();
    if (release_capacity && source == open_images_root) pixel.receipt().ArriveAndWait();
-  }, {.descriptors = release_capacity ? 26U : pressure ? 24U : 64U});
+  }, {.descriptors = release_capacity ? 26U : pressure ? 24U : 64U}, {}, selecting);
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   cancelled.store(true);
@@ -6234,7 +6233,9 @@ TEST_CASE("Large and XL component identities retain only their consumed physical
   image.archive_identity = "physical-" + std::to_string(shard);
   builder.inventory.push_back({image, id, 0});
   builder.index.images.push_back({id, 0, 0, 1, 1, shard, 0});
-  builder.input_identity = coconut_component_input_identity("annotations", builder.source, nullptr, &physical, edition, builder.inventory);
+  CoconutPhysicalDependencies dependencies;
+  dependencies.add(image);
+  builder.input_identity = coconut_component_input_identity("annotations", builder.source, nullptr, &physical, edition, dependencies);
   return std::move(builder).finish({}, root.path());
  };
  const auto large = make(CoconutEdition::Large, 1, 32), xl = make(CoconutEdition::XLarge, 2, 17);
@@ -6655,4 +6656,88 @@ TEST_CASE("asynchronous native labels retain their sealed image until conversion
  const auto product = execution.wait_image_labels(root, 7, "native");
  REQUIRE(product); REQUIRE(product->labels.size() == 1); CHECK(product->runs.front().length == 1);
  CHECK(lifetime.expired());
+}
+
+TEST_CASE("component dependency summaries retain full backing and recorded generations", "[benchmark][coconut][cache]") {
+ ScopedTempDir root("component-consumed-summary");
+ auto first = objects(1), second = objects(2), unused = objects(3);
+ first.shard = 1; first.archive_identity = "one";
+ second.shard = 2; second.archive_identity = "two";
+ unused.shard = 3; unused.archive_identity = "unused";
+ std::array physical_images{first, second, unused};
+ CoconutPhysicalMembership physical(physical_images);
+ CoconutPhysicalDependencies dependencies;
+ dependencies.add(first); dependencies.add(second);
+ const auto expected = Json{{"domain", "coconut-physical-artifacts-v1"}, {"edition", CoconutEdition::Large}, {"source", CoconutImageNamespace::Objects365V2},
+  {"artifacts", Json::array({Json::array({1, "one"}), Json::array({2, "two"})})}}.dump();
+ CHECK(physical.dependency_identity(CoconutEdition::Large, CoconutImageNamespace::Objects365V2, dependencies) == expected);
+ CoconutComponentBuilder builder;
+ builder.edition = CoconutEdition::Large; builder.source = CoconutImageNamespace::Objects365V2; builder.annotation_input_identity = "annotations";
+ builder.input_identity = coconut_component_input_identity("annotations", builder.source, nullptr, &physical, builder.edition, dependencies);
+ builder.index.source = BenchmarkDatasetSource::kObjects365V2; builder.index.split = "coconut-2-4";
+ for (const auto& image : std::array{first, second}) {
+  builder.index.images.push_back({image.image_id, 0, 0, 1, 1, image.shard, 0});
+  builder.inventory.push_back({image, image.image_id, image.image_id});
+ }
+ const auto component = std::move(builder).finish({}, root.path());
+ const auto selected = component.select_images({0});
+ CHECK(&selected.image_input_identity(0) == &component.image_input_identity(0));
+ CHECK(component.image_input_identity(0) == coconut_image_input_identity("annotations", first, {}));
+ physical_images[2].archive_identity = "unused replacement";
+ CoconutPhysicalMembership unused_changed(physical_images);
+ CHECK(selected.matches_inputs("annotations", unused_changed, nullptr));
+ physical_images[1].archive_identity = "consumed replacement";
+ CoconutPhysicalMembership changed(physical_images);
+ CHECK_FALSE(selected.matches_inputs("annotations", changed, nullptr));
+ CHECK(selected.matches_inputs("annotations", changed, nullptr, false));
+ auto contradictory = first; contradictory.archive_identity = "another generation";
+ CHECK_THROWS_WITH(dependencies.add(contradictory), "COCONut: component mixes physical artifact generations");
+}
+TEST_CASE("COCONut failure reports batch append and flush best effort through unwind", "[benchmark][coconut][report]") {
+ ScopedTempDir root("coconut-report-batches");
+ const BenchmarkTraceSink quiet;
+ unsigned warnings = 0;
+ ProgressReporter progress([&](const auto&) { ++warnings; throw std::runtime_error("ignored warning sink"); }, quiet);
+ const auto report_path = root.path() / "failed.txt";
+ bool unwritable = false;
+ SECTION("append accepted records on exceptional exit") {}
+ SECTION("failed report storage remains nonfatal") { unwritable = true; std::filesystem::create_directory(report_path); }
+ if (!unwritable) mmltk::testsupport::write_text_file(report_path, "{\"historical\":true}\n");
+ try {
+  CoconutFailureReport report(root.path(), progress);
+  for (unsigned i = 0; i < 1024; ++i) report.reject(coco(7), 77, "base", i, 1, "missing support");
+  throw std::runtime_error("image cancellation");
+ } catch (const std::runtime_error& error) { CHECK(std::string_view(error.what()) == "image cancellation"); }
+ CHECK_NOTHROW(progress.flush());
+ CHECK(warnings == 1);
+ if (!unwritable) {
+  std::ifstream input(report_path);
+  std::string line;
+  REQUIRE(std::getline(input, line)); CHECK(Json::parse(line).at("historical") == true);
+  unsigned records = 0;
+  while (std::getline(input, line)) {
+   const auto record = Json::parse(line);
+   CHECK(record.at("object_id") == records++); CHECK(record.at("release_image_id") == 77); CHECK(record.at("reason") == "missing support");
+  }
+  CHECK(records == 1024);
+ }
+}
+TEST_CASE("progress failure before commit differs from terminal notification failure", "[benchmark][coconut][publication]") {
+ ScopedTempDir root("coconut-publication-callback");
+ LocalCoconutRecipe local(root.path());
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
+ const auto catalog = local.selected(CoconutValidation::CoconutStock);
+ std::filesystem::create_directories(config.output_dir);
+ const auto previous = config.output_dir / "previous";
+ mmltk::testsupport::write_text_file(previous, "published before compile");
+ bool terminal = false;
+ SECTION("pending pre-publication callback prevents the rename") {}
+ SECTION("terminal callback fails after the successful rename") { terminal = true; }
+ config.progress = [&](const BenchmarkCompileProgress& value) {
+  if (value.phase == DatasetCompilePhase::Publishing && value.completed == (terminal ? 1U : 0U)) throw std::runtime_error("publication observer failure");
+ };
+ CHECK_THROWS_WITH(compile_benchmark_recipe(config, &catalog), "publication observer failure");
+ CHECK(std::filesystem::exists(previous) == !terminal);
+ CHECK(std::filesystem::exists(config.output_dir / "train.bin") == terminal);
+ if (terminal) CHECK(CompiledDataset::open(config.output_dir / "train.bin").header().num_images == 4);
 }

@@ -15,6 +15,7 @@
 namespace mmltk::backend::data::benchmark_internal {
 struct CoconutReleaseInputs {
  std::unordered_map<std::string, DownloadResult> artifacts;
+ std::unordered_map<std::string, std::string> failure_digests;
  std::shared_ptr<CoconutAnnotationRecords> records = std::make_shared<CoconutAnnotationRecords>();
  std::map<std::pair<CoconutEdition, CoconutImageNamespace>, CoconutComponent> components;
 };
@@ -264,28 +265,39 @@ CoconutFailureReport::CoconutFailureReport(const std::filesystem::path& cache_ro
  }
  path_ = directory / "failed.txt";
 }
-void CoconutFailureReport::reject(const CoconutPhysicalImage& image, const std::uint64_t release_image_id, const std::string_view release, const std::uint64_t object_id,
- const std::uint64_t category_id, const std::string_view reason) noexcept {
+CoconutFailureReport::~CoconutFailureReport() { flush(); }
+void CoconutFailureReport::flush_unlocked() {
+ if (!pending_.empty()) {
+  if (stream_) stream_.write(pending_.data(), static_cast<std::streamsize>(pending_.size()));
+  pending_.clear();
+ }
+ if (stream_) stream_.flush();
+}
+void CoconutFailureReport::flush() noexcept {
+ try { const std::lock_guard lock(mutex_); flush_unlocked(); } catch (...) {}
+}
+void CoconutFailureReport::reject(const CoconutPhysicalImage& image, std::uint64_t release_image_id, std::string_view release, std::uint64_t object_id,
+ std::uint64_t category_id, std::string_view reason) noexcept {
  try {
-  const std::lock_guard lock(mutex_);
-  if (!attempted_) {
-   attempted_ = true;
-   stream_.open(path_, std::ios::app);
+  auto record = nlohmann::json{{"image", image.member}, {"image_id", image.image_id}, {"release_image_id", release_image_id},
+   {"source", coconut_namespace_name(image.source)}, {"release", release}, {"object_id", object_id}, {"category_id", category_id}, {"reason", reason}}.dump();
+  record.push_back('\n');
+  bool warn = false, writable = false;
+  {
+   const std::lock_guard lock(mutex_);
+   if (!attempted_) { attempted_ = true; stream_.open(path_, std::ios::app); }
+   constexpr std::size_t kBatchBytes = 64U * 1024U;
+   if (record.size() > kBatchBytes - pending_.size()) flush_unlocked();
+   if (stream_) {
+    if (record.size() >= kBatchBytes) stream_.write(record.data(), static_cast<std::streamsize>(record.size()));
+    else pending_.append(record);
+   }
+   writable = static_cast<bool>(stream_);
+   warn = !std::exchange(warned_, true);
   }
-  if (stream_) {
-   stream_
-    << nlohmann::
-        json{{"image", image.member}, {"image_id", image.image_id}, {"release_image_id", release_image_id}, {"source", coconut_namespace_name(image.source)}, {"release", release}, {"object_id", object_id}, {"category_id", category_id}, {"reason", reason}}
-         .dump()
-    << '\n';
-   stream_.flush();
-  }
-  if (!warned_) {
-   warned_ = true;
-   progress_.activity(std::string("Skipping invalid COCONut objects; ") + (stream_ ? "details: " : "cannot write failure report: ") + path_.string());
-  }
+  if (warn) progress_.warning(std::string("Skipping invalid COCONut objects; ") + (writable ? "details: " : "cannot write failure report: ") + path_.string());
  } catch (...) {
-  // Reporting cannot make rejected object metadata fatal to compilation.
+  // I/O, allocation and warning failures never make an omitted object fatal.
  }
 }
 bool coconut_validation_component(CoconutEdition edition) noexcept { return edition == CoconutEdition::RelabeledValidation || edition == CoconutEdition::ObjectsValidation; }
@@ -324,10 +336,12 @@ CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation validation) {
  return catalog;
 }
 namespace {
+struct FlushReports { CoconutFailureReport& report; ~FlushReports() { report.flush(); } };
 CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cache, const CoconutReleaseComponent& release,
  const CoconutPhysicalMembership& physical, ProgressReporter& progress, CoconutFailureReport& failures, const CoconutOriginalProvider& original_provider, CoconutReleaseInputs& retained,
  mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, bool metadata_only,
  IndexingProgressTotals* indexing, std::size_t release_index, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
+ const FlushReports flush_reports{failures};
  using namespace mmltk::common::math;
  CoconutRecipePreparation prepared;
  prepared.manifest = {{"components", nlohmann::json::array()}, {"artifacts", nlohmann::json::array()}};
@@ -354,6 +368,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, parent, &reservations)
                  .front();
   retained.artifacts.insert_or_assign(artifact.artifact_id, result);
+  retained.failure_digests.erase(artifact.artifact_id);
   return result;
  };
  const auto sources = coconut_release_sources(release.edition);
@@ -446,6 +461,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   request.physical_membership = &physical;
   request.expected_rows = release.expected_rows;
   request.cancellation = cancellation;
+  request.image_terminal = [&] { failures.flush(); };
   request.rejected_object = [&](const CoconutPhysicalImage& physical_image, const CoconutRecord& record, const CoconutSegment& segment, std::string_view reason, std::uint32_t policy) {
    if (!policy) failures.reject(physical_image, record.image_id, release.name, segment.id, segment.category_id, reason);
   };
@@ -511,12 +527,15 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
      const auto& artifact = release.annotations[i];
      auto download_request = make_download_request(cache, owner, artifact);
      bool matches_expected = false;
-     if (std::filesystem::is_regular_file(download_request.destination)) {
-      const auto sha = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(download_request.destination, [&] { return cancellation.requested(); }));
-      matches_expected = !artifact.expected_sha256.empty() && sha == artifact.expected_sha256;
-      trace_benchmark_event(trace, "benchmark.download.failure_sha256",
-       [&] { return nlohmann::json{{"artifact", artifact.artifact_id}, {"sha256", sha}, {"matches_expected", matches_expected}, {"reason", error.what()}}; });
-     }
+     if (!artifact.expected_sha256.empty() || trace) try {
+      auto [digest, inserted] = retained.failure_digests.try_emplace(artifact.artifact_id);
+      if (inserted && std::filesystem::is_regular_file(download_request.destination))
+       digest->second = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(download_request.destination, [&] { return cancellation.requested(); }));
+      matches_expected = !artifact.expected_sha256.empty() && digest->second == artifact.expected_sha256;
+      if (!digest->second.empty()) trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] {
+       return nlohmann::json{{"artifact", artifact.artifact_id}, {"sha256", digest->second}, {"matches_expected", matches_expected}, {"reason", error.what()}};
+      });
+     } catch (...) { throw_if_benchmark_cancelled(cancellation); }
      if (!matches_expected) {
       // The failed importer and its row callbacks have unwound. Withdraw once
       // before replacing any artifact on which this release product depends.
@@ -645,7 +664,8 @@ std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const Benchma
 CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& config, const BenchmarkCacheLayout& cache, const CoconutRecipeCatalog& catalog,
  std::span<const AdmittedRecipeArchive> acquired, const CoconutPhysicalMembership& physical, ProgressReporter& progress, CoconutFailureReport& failures, std::size_t workers,
  mmltk::common::concurrency::CancellationObservation external_cancellation, const BenchmarkTraceSink& trace, bool metadata_only,
- std::shared_ptr<CoconutRecipeInputs> inputs, BenchmarkCompilePipeline* execution, BenchmarkAllowance preparation) {
+ std::shared_ptr<CoconutRecipeInputs> inputs, BenchmarkCompilePipeline* execution, BenchmarkAllowance preparation, CocoAnnotationInputObserver stock_input) {
+ const FlushReports flush_reports{failures};
  using namespace mmltk::common::math;
  const auto cancellation = external_cancellation;
  CoconutRecipePreparation prepared;
@@ -666,7 +686,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  if (needs_originals) {
   const bool recover = config.selection.recover_dropped_masks;
   const bool stock = config.selection.validation == CoconutValidation::Stock;
-  retained.start_originals([&retained, &cache, &catalog, &progress, execution, trace, recover, stock, recover_train, recover_validation, acquisition_workers, parse_workers, preparation = std::move(preparation)] {
+  retained.start_originals([&retained, &cache, &catalog, &progress, execution, trace, recover, stock, recover_train, recover_validation, acquisition_workers, parse_workers, preparation = std::move(preparation), stock_input = std::move(stock_input)] {
    const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(retained);
    StorageReservationPool reservations(cache.root, trace, execution ? &execution->storage() : nullptr);
    // Declare fixed transport before retaining its dependent source lifecycle.
@@ -680,6 +700,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
    trace_benchmark_event(trace, "benchmark.annotations.originals_begin", [&] { return nlohmann::json{{"recover_dropped_masks", recover}, {"validation", stock ? CoconutValidation::Stock : CoconutValidation::Coconut}}; });
    CocoAnnotationCache annotations(cache, catalog.stock_annotations, selection, 0, checked_cast<std::uint32_t>(catalog.coco_validation_images, "COCO validation count overflow"), static_cast<int>(parse_workers),
     cancellation, trace, execution, &reservations, std::move(original_lease));
+   annotations.observe_input(stock_input);
    annotations.observe_splits([&retained, recover_train, recover_validation](CocoAnnotationSplit split) {
     const bool selected = split.training ? recover_train : recover_validation;
     retained.original_split(std::move(split), selected);
@@ -834,6 +855,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
    for (const auto& object : image.omissions)
     failures.reject(inventory.physical, inventory.release_image_id, coconut_release_component(component.edition()).name, object.annotation_id, object.source_category_id,
      "thing segment remains without mask pixels or an authoritative bbox");
+   failures.flush();
    component_recovered = checked_add(component_recovered, image.objects.size(), "recovery count overflow");
    component_unresolved = checked_add(component_unresolved, image.unresolved, "recovery omission count overflow");
   }

@@ -1,4 +1,6 @@
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
+#include "src/common/io/file_digest.h"
+#include <nlohmann/json.hpp>
 #include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <algorithm>
@@ -12,6 +14,12 @@
 namespace mmltk::backend::data::benchmark_internal {
 namespace {
 [[noreturn]] void invalid(std::string_view detail) { throw std::runtime_error("COCONut: " + std::string(detail)); }
+}
+std::string coconut_image_input_identity(std::string_view annotations, const CoconutPhysicalImage& physical, std::string_view originals) {
+ const auto material = nlohmann::json{{"domain", "coconut-image-labels-v1"}, {"annotations", annotations},
+  {"physical", {physical.source, physical.shard, physical.image_id, physical.member, physical.archive_identity}},
+  {"recovery_policy", originals.empty() ? 0 : kCoconutRecoveryPolicy}, {"originals", originals}}.dump();
+ return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(material.data()), material.size())));
 }
 const CategoryLookup& coconut_categories() {
  static const auto lookup = make_numeric_lookup(coco_category_mappings());
@@ -226,11 +234,12 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::finish(const C
   product->inventory_ = {physical, record.image_id, record.source_ordinal};
   product->recovery_ = std::move(recovery);
   active_record_ = nullptr;
+  product->input_identity_ = coconut_image_input_identity(product->lineage().component.annotation_input_identity, physical, product->lineage().component.original_annotation_identity);
   return product;
  }
 std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::reuse(const CoconutRecord& record, const CoconutPhysicalImage& physical,
  const NormalizedAnnotationReadView& source, std::size_t position, const CoconutInventoryImage& inventory, const CoconutRecoveryImage* recovered,
- std::shared_ptr<const CoconutNativeLineage> lineage) {
+ std::shared_ptr<const CoconutNativeLineage> lineage, std::string_view dependency) {
   if (!lineage || lineage->component.source != physical.source || inventory.physical != physical) invalid("reused native image has no matching physical input");
   auto product = std::shared_ptr<CoconutNativeImage>(new CoconutNativeImage(std::move(lineage)));
   product->segment_begin_ = record.first_segment_ordinal;
@@ -268,6 +277,7 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::reuse(const Co
    for (auto* objects : {&recovery.objects, &recovery.omissions}) for (auto& object : *objects) object.source_ordinal = ordinal(object.annotation_id);
    product->recovery_ = std::move(recovery);
   }
+  product->input_identity_ = dependency;
   return product;
  }
 } // namespace mmltk::backend::data::benchmark_internal

@@ -464,6 +464,7 @@ class OpenImagesAcquisition final {
  std::optional<ImageDecodeProbe> decode_probe;
  BenchmarkCompilePipeline* execution;
  const std::function<std::string(std::uint64_t)>& image_url;
+ const std::function<void(std::uint64_t)>& repair_input;
  std::vector<std::uint64_t> ids;
  std::filesystem::path image_root;
  std::size_t cpus;
@@ -613,6 +614,7 @@ class OpenImagesAcquisition final {
      const auto path = cached_image_path(image_root, image.source_image_id);
      try {
       progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Full-decode checking repaired Open Images JPEG " + std::to_string(image.source_image_id));
+      if (repair_input) repair_input(image.source_image_id);
       try {
        if (!group.publication.consume(ready)) {
         // Standalone acquisition has no canonical pixel consumer. Its saved
@@ -808,8 +810,8 @@ class OpenImagesAcquisition final {
 public:
  OpenImagesAcquisition(const BenchmarkCacheLayout& cache_value, const NormalizedAnnotationReadView& index_value, std::vector<QuarantinedImage>* quarantined_value,
   Cancellation cancel, ProgressReporter* reporter, int workers, std::size_t cache_workers, const BenchmarkTraceSink& trace_value,
-  std::optional<ImageDecodeProbe> probe, BenchmarkCompilePipeline* pipeline, const std::function<std::string(std::uint64_t)>& urls, const std::function<void(std::uint64_t)>& warm_read)
-  : cache(cache_value), index(index_value), quarantined(quarantined_value), cancellation(cancel), progress(reporter), trace(trace_value), decode_probe(probe), execution(pipeline), image_url(urls),
+  std::optional<ImageDecodeProbe> probe, BenchmarkCompilePipeline* pipeline, const std::function<std::string(std::uint64_t)>& urls, const std::function<void(std::uint64_t)>& warm_read, const std::function<void(std::uint64_t)>& repair_input_value)
+  : cache(cache_value), index(index_value), quarantined(quarantined_value), cancellation(cancel), progress(reporter), trace(trace_value), decode_probe(probe), execution(pipeline), image_url(urls), repair_input(repair_input_value),
     ids(image_ids(index)), image_root(prepare_root(cache)), cpus(cpu_count(workers, execution)), local_transport(execution ? nullptr : std::make_unique<BenchmarkCurl>(cpus)),
     transport(execution ? execution->curl() : *local_transport), concurrency(transport.limit(BenchmarkCurl::Class::OpenImages)),
     active_limit(concurrency), minimum_limit(std::max<std::size_t>(1, concurrency / 8)), repair_bytes(repair_workspace(probe)),
@@ -859,10 +861,10 @@ public:
 }  // namespace
 AcquiredOpenImages acquire_open_images(const BenchmarkCacheLayout& cache, const NormalizedAnnotationReadView& index, std::vector<QuarantinedImage>* quarantined,
  mmltk::common::concurrency::CancellationObservation cancellation, ProgressReporter* progress, int num_workers, std::size_t cache_workers, const BenchmarkTraceSink& trace,
- std::optional<ImageDecodeProbe> decode_probe, BenchmarkCompilePipeline* execution, const std::function<std::string(std::uint64_t)>& image_url, const std::function<void(std::uint64_t)>& warm_read) {
+ std::optional<ImageDecodeProbe> decode_probe, BenchmarkCompilePipeline* execution, const std::function<std::string(std::uint64_t)>& image_url, const std::function<void(std::uint64_t)>& warm_read, const std::function<void(std::uint64_t)>& repair_input) {
  std::unique_ptr<BenchmarkCompilePipeline> standalone;
  if (!execution) { standalone = std::make_unique<BenchmarkCompilePipeline>(std::max(1, num_workers), std::span<const int>{}, BenchmarkExecutionLimits{}, cancellation); execution = standalone.get(); }
- OpenImagesAcquisition acquisition(cache, index, quarantined, cancellation, progress, num_workers, cache_workers, trace, decode_probe, execution, image_url, warm_read);
+ OpenImagesAcquisition acquisition(cache, index, quarantined, cancellation, progress, num_workers, cache_workers, trace, decode_probe, execution, image_url, warm_read, repair_input);
  return acquisition.run();
 }
 }  // namespace mmltk::backend::data::benchmark_internal

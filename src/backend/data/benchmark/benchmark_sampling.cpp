@@ -1,5 +1,6 @@
 #include "src/common/math/deterministic_sampling.h"
 #include "src/backend/data/benchmark/detail/benchmark_sampling.h"
+#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/pch_std.h"
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
 #include "src/common/math/checked_arithmetic.h"
@@ -73,11 +74,11 @@ private:
  std::uint64_t low_ = 0U;
  std::uint64_t high_ = 0U;
 };
-[[nodiscard]] std::vector<ClassMembership> build_memberships(
- const NormalizedAnnotationIndex& source, SupplementalSamplingStats* stats, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+void build_memberships(
+ const NormalizedAnnotationIndex& source, SupplementalSamplingStats* stats, std::vector<ClassMembership>* memberships, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  stats->full_images = source.images.size();
  stats->full_boxes = source.boxes.size();
- std::vector<ClassMembership> memberships(source.images.size());
+ if (memberships) memberships->resize(source.images.size());
  for (std::size_t image_index = 0U; image_index < source.images.size(); ++image_index) {
   if ((image_index & 4095U) == 0U) { throw_if_cancelled(cancel_requested); }
   const NormalizedImage& image = source.images[image_index];
@@ -92,22 +93,15 @@ private:
    membership.mask_runs = mmltk::common::math::checked_add(membership.mask_runs, std::size_t{box.mask_rle_pairs}, "supplemental image mask count overflow");
   }
   if (membership.low == 0U && membership.high == 0U) { throw std::runtime_error("supplemental sampler received an image without mapped classes"); }
-  memberships[image_index] = membership;
+  if (memberships) (*memberships)[image_index] = membership;
   ClassMembershipCursor classes(membership);
   while (const auto class_id = classes.next()) { ++stats->available_class_images[*class_id]; }
  }
- return memberships;
-}
-[[nodiscard]] std::array<std::uint64_t, kClassCount> coco_class_counts(const NormalizedAnnotationIndex& coco_train, mmltk::common::concurrency::CancellationObservation cancel_requested) {
- SupplementalSamplingStats ignored;
- const std::vector<ClassMembership> memberships = build_memberships(coco_train, &ignored, cancel_requested);
- return ignored.available_class_images;
 }
 [[nodiscard]] std::vector<std::uint16_t> choose_objects365_shards(const NormalizedAnnotationIndex& objects365, const std::span<const ClassMembership> memberships,
- const std::span<const std::uint64_t> shard_bytes, const std::uint64_t required_images, std::uint64_t* selected_archive_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+ const std::array<std::uint64_t, kClassCount>& full_class_images, const std::span<const std::uint64_t> shard_bytes, const std::uint64_t required_images, std::uint64_t* selected_archive_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  if (shard_bytes.empty()) { throw std::runtime_error("Objects365 sampler requires archive byte identities"); }
  std::vector<ShardSummary> summaries(shard_bytes.size());
- std::array<std::uint64_t, kClassCount> full_class_images{};
  for (std::size_t image_index = 0U; image_index < objects365.images.size(); ++image_index) {
   if ((image_index & 4095U) == 0U) { throw_if_cancelled(cancel_requested); }
   const std::uint16_t shard = objects365.images[image_index].source_shard;
@@ -117,7 +111,6 @@ private:
   ClassMembershipCursor classes(memberships[image_index]);
   while (const auto class_id = classes.next()) {
    ++summary.class_images[*class_id];
-   ++full_class_images[*class_id];
   }
  }
  const std::uint64_t headroom_images =
@@ -180,17 +173,12 @@ private:
  std::ranges::sort(result);
  return result;
 }
-[[nodiscard]] SourceSelection make_source_selection(const NormalizedAnnotationIndex& source, std::vector<ClassMembership> memberships, const std::span<const std::uint8_t> eligible_shards) {
+[[nodiscard]] SourceSelection make_source_selection(const NormalizedAnnotationIndex& source, std::vector<ClassMembership> memberships, SupplementalSamplingStats stats, const std::span<const std::uint8_t> eligible_shards) {
  SourceSelection result;
  result.source = &source;
  result.memberships = std::move(memberships);
  result.selected.assign(source.images.size(), std::uint8_t{0U});
- result.stats.full_images = source.images.size();
- result.stats.full_boxes = source.boxes.size();
- for (const ClassMembership membership : result.memberships) {
-  ClassMembershipCursor classes(membership);
-  while (const auto class_id = classes.next()) { ++result.stats.available_class_images[*class_id]; }
- }
+ result.stats = std::move(stats);
  result.hash_order.reserve(source.images.size());
  for (std::size_t image_index = 0U; image_index < source.images.size(); ++image_index) {
   const std::uint16_t shard = source.images[image_index].source_shard;
@@ -257,7 +245,7 @@ void select_image(SourceSelection* source, const std::uint32_t image_index, std:
 }
 }  // namespace
 CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const NormalizedAnnotationIndex& coco_train, const NormalizedAnnotationIndex& objects365,
- const NormalizedAnnotationIndex& open_images, const std::span<const std::uint64_t> objects365_shard_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+ const NormalizedAnnotationIndex& open_images, const std::span<const std::uint64_t> objects365_shard_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested, BenchmarkCompilePipeline* execution) {
  if (coco_train.source != BenchmarkDatasetSource::kCoco2017 || objects365.source != BenchmarkDatasetSource::kObjects365V2 || open_images.source != BenchmarkDatasetSource::kOpenImagesV7) {
   throw std::runtime_error("combined supplemental sampler received the wrong sources");
  }
@@ -269,16 +257,29 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
  result.open_images_floor = std::max<std::uint64_t>(1U, result.target_images / kOpenImagesDiversityDenominator);
  result.open_images_ceiling = std::max(result.open_images_floor, result.target_images / kOpenImagesMaximumDenominator);
  const std::uint64_t required_objects = result.target_images - result.open_images_floor;
- SupplementalSamplingStats object_membership_stats;
- std::vector<ClassMembership> object_memberships = build_memberships(objects365, &object_membership_stats, cancel_requested);
- SupplementalSamplingStats open_membership_stats;
- std::vector<ClassMembership> open_memberships = build_memberships(open_images, &open_membership_stats, cancel_requested);
- result.objects365_shards = choose_objects365_shards(objects365, object_memberships, objects365_shard_bytes, required_objects, &result.objects365_archive_bytes, cancel_requested);
- std::vector<std::uint8_t> eligible_shards(objects365_shard_bytes.size(), std::uint8_t{0U});
- for (const std::uint16_t shard : result.objects365_shards) { eligible_shards[shard] = 1U; }
- SourceSelection object_selection = make_source_selection(objects365, std::move(object_memberships), eligible_shards);
- SourceSelection open_selection = make_source_selection(open_images, std::move(open_memberships), {});
- std::array<std::uint64_t, kClassCount> combined_counts = coco_class_counts(coco_train, cancel_requested);
+ // Source-local membership, class counts, sorting and candidate construction
+ // share the existing CPU owner; the greedy cross-source choice stays serial.
+ const auto parallel = [&](std::size_t count, const std::function<void(std::size_t)>& work) {
+  if (execution) execution->for_each(BenchmarkStage::Metadata, count, {}, work);
+  else for (std::size_t i = 0; i < count; ++i) work(i);
+ };
+ SourceSelection object_selection, open_selection;
+ SupplementalSamplingStats coco_stats;
+ parallel(3, [&](std::size_t source) {
+  if (source == 2) { build_memberships(coco_train, &coco_stats, nullptr, cancel_requested); return; }
+  SupplementalSamplingStats stats;
+  std::vector<ClassMembership> memberships;
+  const auto& index = source == 0 ? objects365 : open_images;
+  build_memberships(index, &stats, &memberships, cancel_requested);
+  std::vector<std::uint8_t> eligible;
+  if (source == 0) {
+   result.objects365_shards = choose_objects365_shards(objects365, memberships, stats.available_class_images, objects365_shard_bytes, required_objects, &result.objects365_archive_bytes, cancel_requested);
+   eligible.resize(objects365_shard_bytes.size());
+   for (const auto shard : result.objects365_shards) eligible[shard] = 1;
+  }
+  (source == 0 ? object_selection : open_selection) = make_source_selection(index, std::move(memberships), std::move(stats), eligible);
+ });
+ auto combined_counts = coco_stats.available_class_images;
  std::uint64_t selected_total = 0U;
  while (selected_total < result.target_images) {
   if ((selected_total & 4095U) == 0U) { throw_if_cancelled(cancel_requested); }
@@ -316,8 +317,9 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
  open_selection.stats.selected_boxes = open_selection.selected_boxes;
  result.objects365.stats = object_selection.stats;
  result.open_images.stats = open_selection.stats;
- result.objects365.view = selected_view(object_selection, cancel_requested);
- result.open_images.view = selected_view(open_selection, cancel_requested);
+ parallel(2, [&](std::size_t source) {
+  (source == 0 ? result.objects365 : result.open_images).view = selected_view(source == 0 ? object_selection : open_selection, cancel_requested);
+ });
  return result;
 }
 }  // namespace mmltk::backend::data::benchmark_internal

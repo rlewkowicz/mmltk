@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <map>
+#include <filesystem>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -65,6 +67,15 @@ private:
  AdmittedRecipeArchive* archive_;
  std::exception_ptr fatal_;
 };
+// Full-backing dependencies are accumulated in the owning inventory traversal.
+// Selected views retain this same summary, including unselected source images.
+class CoconutPhysicalDependencies final {
+public:
+ void add(const CoconutPhysicalImage&);
+private:
+ friend class CoconutPhysicalMembership;
+ std::map<std::uint16_t, std::string> shards_;
+};
 // Compile-local physical joins. Borrowed catalog/acquisition storage is stable
 // until this owner and every importer retire. The compiler replaces an artifact
 // only after withdrawal and settlement of its source publications/readers.
@@ -81,7 +92,7 @@ public:
  // another concurrent sequence's reader remains live. Empty means all readers.
  void release_readers(CoconutEdition, const BenchmarkAllowance& producer = {}) const;
  [[nodiscard]] bool eligible(CoconutEdition, const AdmittedRecipeArchive&) const;
- [[nodiscard]] std::string dependency_identity(CoconutEdition, CoconutImageNamespace, std::span<const CoconutInventoryImage> = {}, bool current = true) const;
+ [[nodiscard]] std::string dependency_identity(CoconutEdition, CoconutImageNamespace, const CoconutPhysicalDependencies& = {}, bool current = true) const;
  // Invalidates affected routes/joins and their cached input requirement before
  // the compiler mutates the admitted artifact; independent readers survive.
  void withdraw(const AdmittedRecipeArchive&);

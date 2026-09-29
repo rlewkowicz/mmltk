@@ -288,21 +288,16 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
    effective_config.resize_mode,
   },
   class_catalog.names(), layout);
- validate_compiled_index_entries(label_blocks.index, header, label_blocks.labels.size(), cancellation);
- validate_compiled_original_image_dimensions(label_blocks.index, cancellation);
- const size_t used_rle_bytes = validate_compiled_label_entries(label_blocks.labels, header, layout.rle_block_size, cancellation);
- if (used_rle_bytes != layout.rle_block_size) { throw std::runtime_error("compiled RLE count does not match the referenced instance spans"); }
- validate_compiled_rle_pairs(label_blocks.labels, label_blocks.rle_pairs, static_cast<size_t>(width) * height, cancellation);
+ (void)admit_compiled_records(label_blocks.index, label_blocks.labels, label_blocks.rle_pairs, header, [](const ImageEntry&) {}, cancellation);
  throw_if_cancelled();
  compiler_internal::write_metadata_blocks(fd, layout, header, label_blocks, cancellation);
  throw_if_cancelled();
  if (telemetry != nullptr) { telemetry->enter_syncing(); }
  fd.sync_data();
  throw_if_cancelled();
+ const FileHeader staged_header = read_compiled_header(fd);
+ (void)validate_compiled_file_sections(staged_header, fd.size());
  fd = FileHandle{};
- const FileHandle staged_file = FileHandle::open_readonly(staging_path.string());
- const FileHeader staged_header = read_compiled_header(staged_file);
- (void)validate_compiled_file_sections(staged_header, staged_file.size());
  throw_if_cancelled();
  if (telemetry != nullptr) { telemetry->enter_publishing(); }
  throw_if_cancelled();

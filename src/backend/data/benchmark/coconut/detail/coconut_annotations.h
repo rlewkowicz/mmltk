@@ -46,7 +46,7 @@ public:
  [[nodiscard]] CoconutEdition edition() const noexcept;
  [[nodiscard]] CoconutImageNamespace source() const noexcept;
  [[nodiscard]] const std::string& input_identity() const noexcept;
- [[nodiscard]] std::string image_input_identity(std::size_t) const;
+ [[nodiscard]] const std::string& image_input_identity(std::size_t) const;
  [[nodiscard]] BenchmarkLabelInput labels(std::size_t) const;
  [[nodiscard]] std::uint64_t original_generation() const noexcept { return original_generation_; }
  // Bind a cached view to the admitted original input used to validate it.
@@ -194,11 +194,11 @@ struct CoconutImportRequest {
  CoconutImportLimits limits;
  mmltk::common::concurrency::CancellationObservation cancellation;
  std::function<void(std::uint64_t)> progress;
+ std::function<void()> image_terminal;
  // Synchronous observation of discarded objects; report failures never reject an image.
  std::function<void(const CoconutPhysicalImage&, const CoconutRecord&, const CoconutSegment&, std::string_view, std::uint32_t recovery_policy)> rejected_object;
 };
-[[nodiscard]] std::string coconut_component_input_identity(std::string_view base, CoconutImageNamespace, const CoconutMaskRecovery*, const CoconutPhysicalMembership* = nullptr, CoconutEdition = CoconutEdition::Base, std::span<const CoconutInventoryImage> = {}, bool current = true);
-[[nodiscard]] std::string coconut_image_input_identity(std::string_view annotations, const CoconutPhysicalImage&, std::string_view originals);
+[[nodiscard]] std::string coconut_component_input_identity(std::string_view base, CoconutImageNamespace, const CoconutMaskRecovery*, const CoconutPhysicalMembership* = nullptr, CoconutEdition = CoconutEdition::Base, const CoconutPhysicalDependencies& = {}, bool current = true);
 // Every offered record is required. Unknown expected_rows means derive, never sample.
 [[nodiscard]] std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequest& request);
 // Removes only XL rows covered by Large, retaining B and all namespace distinctions.

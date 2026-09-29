@@ -28,6 +28,7 @@
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/compiled_file.h"
+#include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/backend/data/loading/dataset_loader.h"
@@ -826,8 +827,10 @@ TEST_CASE("compiled layout checks alignment and arithmetic without storage", "[b
  const auto header = make_file_header({1U, 512U, 512U, 3U, static_cast<std::uint32_t>(labels.size()), 512U * 512U * 3U * sizeof(float)}, names, layout);
  validate_compiled_header(header);
  const auto sections = validate_compiled_file_sections(header, layout.total_size);
- CHECK(validate_compiled_label_entries(labels, header, sections.rle_region_bytes) == mask_bytes);
- CHECK_THROWS(validate_compiled_label_entries(labels, header, mask_bytes - sizeof(RLEPair)));
+ std::size_t used = 0;
+ for (const auto& label : labels) used = CompiledRecordChecks::label(label, header.num_classes, sections.rle_region_bytes, used, AnnotationSource::Generic);
+ CHECK(used == mask_bytes);
+ CHECK_THROWS(CompiledRecordChecks::label(labels.back(), header.num_classes, mask_bytes - sizeof(RLEPair), labels.back().mask_rle_offset, AnnotationSource::Generic));
 }
 TEST_CASE("categorical resize agrees exactly with dense nearest-center sampling", "[backend][data][compiler][mask]") {
  using namespace mmltk::backend::data::dataset;
@@ -937,4 +940,51 @@ TEST_CASE("independent mask slabs never merge across their append boundary", "[b
  CHECK_THROWS_WITH(overflow.run(std::uint64_t{UINT32_MAX} + 1, std::uint64_t{UINT32_MAX} + 2), "source start overflow");
  CHECK_THROWS_WITH(overflow.run(0, std::uint64_t{UINT32_MAX} + 1), "source length overflow");
  CHECK(std::ranges::equal(before, output, [](auto left, auto right) { return left.start == right.start && left.length == right.length; }));
+}
+
+TEST_CASE("benchmark progress drains outside producers and preserves withdrawal boundaries", "[backend][data][benchmark][progress]") {
+ using namespace mmltk::backend::data::benchmark_internal;
+ const BenchmarkTraceSink quiet;
+ mmltk::testsupport::TestGate held("first callback while producers advance");
+ std::vector<BenchmarkCompileProgress> updates;
+ ProgressReporter reporter([&](const auto& value) {
+  updates.push_back(value);
+  if (updates.size() == 1) held.receipt().ArriveAndWait();
+ }, quiet);
+ reporter.phase(DatasetCompilePhase::Planning);
+ const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); });
+ REQUIRE(held.WaitEntered(std::chrono::seconds{5}));
+ auto producing = std::async(std::launch::async, [&] {
+  reporter.pixels(0, 10000);
+  for (std::uint64_t i = 1; i <= 4095; ++i) {
+   reporter.pixel_completed();
+   reporter.transfers().update(DownloadProgress{.artifact_id = "one", .transfer = {.completed_bytes = i, .total_bytes = 10000}}, reporter);
+  }
+  reporter.invalidate_pixels(95); // Includes the 63 not yet in a pixel quantum.
+  reporter.transfers().update(DownloadProgress{.artifact_id = "one", .transfer = {.completed_bytes = 7, .total_bytes = 10000, .attempt = 2}}, reporter);
+ });
+ // The blocked callback cannot retain producer/reporter/source locks. Thousands
+ // of intermediate updates fit the bounded coalescing queue while it is held.
+ mmltk::testsupport::await_test_future(producing, "progress producers with a held callback", std::chrono::seconds{5});
+ held.Release(); reporter.flush();
+ REQUIRE(updates.size() < 128);
+ CHECK(updates.front().phase == DatasetCompilePhase::Planning);
+ CHECK(updates.back().tracks.pixels.completed == 4000);
+ CHECK(updates.back().tracks.pixels.invalidated == 95);
+ CHECK(updates.back().tracks.acquisition.completed == 7);
+ CHECK(updates.back().tracks.acquisition.invalidated == 4088);
+ CHECK(std::ranges::any_of(updates, [](const auto& value) { return value.tracks.pixels.invalidated == 95; }));
+}
+TEST_CASE("benchmark callback failures settle at explicit flush and warning failures stay nonfatal", "[backend][data][benchmark][progress]") {
+ using namespace mmltk::backend::data::benchmark_internal;
+ const BenchmarkTraceSink quiet;
+ std::exception_ptr failure;
+ ProgressReporter warning([](const auto&) { throw std::runtime_error("warning callback"); }, quiet);
+ warning.warning("best effort warning");
+ CHECK_NOTHROW(warning.flush());
+ ProgressReporter reporter([](const auto&) { throw std::runtime_error("progress callback"); }, quiet, {}, [&](std::exception_ptr value) { failure = value; });
+ reporter.phase(DatasetCompilePhase::Planning);
+ CHECK_THROWS_WITH(reporter.flush(), "progress callback");
+ REQUIRE(failure);
+ CHECK_THROWS_WITH(reporter.phase(DatasetCompilePhase::Publishing, 0, 1), "progress callback");
 }

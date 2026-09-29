@@ -1,5 +1,12 @@
 #pragma once
 #include <chrono>
+#include <atomic>
+#include <array>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <functional>
+#include <thread>
 #include <cstddef>
 #include <span>
 #include <cstdint>
@@ -17,7 +24,8 @@
 namespace mmltk::backend::data::benchmark_internal {
 class ProgressReporter;
 class IndexingProgressTotals;
-// One compile-owned ledger, keyed by admitted artifact identity.
+// One compile-owned ledger, keyed by admitted artifact identity. Its mutations
+// and reporter snapshots share the reporter lock; no source lock spans enqueue.
 class ArtifactProgressTotals final {
 public:
  void update(const DownloadProgress& update, ProgressReporter& reporter);
@@ -40,12 +48,14 @@ private:
   std::uint64_t retries = 0, resumed = 0, cached = 0;
  };
  std::map<BenchmarkDatasetSource, SourceTotals> sources_;
- std::mutex mutex_;
 };
 class ProgressReporter {
 public:
- ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace, std::span<const BenchmarkDatasetSource> sources = {});
+ ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace, std::span<const BenchmarkDatasetSource> sources = {}, std::function<void(std::exception_ptr)> failed = {});
  ~ProgressReporter();
+ // Join accepted callbacks before publication or releasing callback captures.
+ void flush();
+ void warning(std::string activity) noexcept;
  [[nodiscard]] IndexingProgressTotals* indexing() noexcept { return indexing_.get(); }
  void invalidate_indexing(std::uint64_t count);
  [[nodiscard]] IndexingProgressTotals* indexing(std::span<const std::uint64_t> totals);
@@ -71,6 +81,12 @@ public:
  void source_complete(const BenchmarkDatasetSource source, const bool cache_hit);
 
 private:
+ friend class ArtifactProgressTotals;
+ friend class IndexingProgressTotals;
+ void phase_unlocked(std::unique_lock<std::mutex>&, DatasetCompilePhase, std::uint64_t, std::uint64_t);
+ void invalidate_indexing_unlocked(std::unique_lock<std::mutex>&, std::uint64_t);
+ void source_transfer_unlocked(std::unique_lock<std::mutex>&, const DownloadProgress&, const BenchmarkSourceProgress&);
+ void source_images_unlocked(std::unique_lock<std::mutex>&, BenchmarkDatasetSource, std::uint64_t, std::uint64_t, std::string);
  [[nodiscard]] static std::string default_phase_activity(const DatasetCompilePhase phase);
  void set_activity_unlocked(std::string activity);
  static void add_progress(std::uint64_t& target, const std::uint64_t value, const char* context);
@@ -80,9 +96,12 @@ private:
  void set_source_activity_unlocked(BenchmarkDatasetSource source, std::string activity, bool foreground = true);
  void select_acquisition_source(BenchmarkDatasetSource source);
  void trace_activity(std::optional<BenchmarkDatasetSource> source, std::string_view activity);
- void emit();
+ void flush_pixels_unlocked();
+ void emit(std::unique_lock<std::mutex>&, bool preserve = false, bool nonfatal = false);
+ void drain();
  BenchmarkProgressCallback callback_;
- const BenchmarkTraceSink* trace_ = nullptr;
+ std::function<void(std::exception_ptr)> failed_;
+ BenchmarkTraceSink trace_;
  BenchmarkCompileProgress state_;
  std::chrono::steady_clock::time_point activity_started_{};
  std::chrono::steady_clock::time_point pixel_started_{};
@@ -93,7 +112,21 @@ private:
  std::vector<LabelPlan> label_plans_;
  std::uint64_t label_completed_ = 0, label_active_ = 0;
  bool labels_admitted_ = false, indexing_known_ = false;
+ struct Snapshot { BenchmarkCompileProgress value; bool preserve = false, nonfatal = false; std::uint64_t sequence = 0; };
+ static constexpr std::size_t kPendingSnapshots = 64;
+ std::deque<Snapshot> pending_;
+ std::condition_variable changed_;
+ std::exception_ptr callback_failure_;
+ std::uint64_t submitted_ = 0, enqueued_ = 0, delivered_ = 0;
+ bool stopping_ = false;
+ // Producers accumulate in cache-line-sized thread stripes. The bounded
+ // set is compile-owned, so withdrawal/total changes can flush every live lane.
+ struct alignas(64) PixelDelta { std::atomic<std::uint64_t> completed{0}; };
+ std::array<PixelDelta, 64> pixel_deltas_{};
+ std::atomic<std::uint64_t> pixel_events_{0}, remaining_pixels_{0};
+ std::uint64_t observed_pixel_events_ = 0;
  std::mutex mutex_;
+ std::jthread drainer_;
 };
 // One compile-owned instance. Each release contributes its full-import row
 // count once across retained products and repairs; metadata never counts twice.
@@ -110,6 +143,5 @@ private:
  };
  std::vector<Observation> releases_;
  std::uint64_t completed_ = 0, total_ = 0;
- std::mutex mutex_;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

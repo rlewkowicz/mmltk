@@ -149,11 +149,12 @@ void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservati
 std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequest> requests, BenchmarkDatasetSource source, std::string_view reason, ProgressReporter& progress,
  ArtifactProgressTotals& totals, std::size_t workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool* storage) {
  for (auto& request : requests) {
-  if (std::filesystem::is_regular_file(request.destination)) {
-   progress.source_activity(source, "Failure-only SHA-256 diagnosis for " + request.artifact_id);
-   const auto sha = common_io::sha256_hex(common_io::sha256_file(request.destination, [&] { return cancellation.requested(); }));
-   trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", sha}, {"reason", reason}}; });
-  }
+  if (trace) try {
+   if (std::filesystem::is_regular_file(request.destination)) {
+    const auto sha = common_io::sha256_hex(common_io::sha256_file(request.destination, [&] { return cancellation.requested(); }));
+    trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", sha}, {"reason", reason}}; });
+   }
+  } catch (...) { throw_if_benchmark_cancelled(cancellation); }
   invalidate_download_artifact(request, cancellation, trace, execution, parent);
   request.redownload = true;
  }
@@ -225,6 +226,7 @@ void CocoAnnotationCache::build_split(bool training, const std::string& digest, 
  std::filesystem::create_directories(json_path.parent_path());
  index = load_or_build_index(cache_, training ? indexes_.train_path : indexes_.validation_path, BenchmarkDatasetSource::kCoco2017, split, digest, cancellation_, trace_, [&](const BenchmarkAllowance& input_allowance) {
   progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Parsing and indexing COCO " + label + " annotations");
+  if (input_observer_) input_observer_(training, CocoAnnotationInputBoundary::Parsing);
   try {
    return parse_coco_style_annotations(json_path, digest, coco_category_mappings(),
     AnnotationParseOptions{BenchmarkDatasetSource::kCoco2017, split, training ? train_count_ : validation_count_, parse_workers_, !training, cancellation_, trace_, execution_, input_allowance});
@@ -261,8 +263,10 @@ void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progr
   std::mutex completion_mutex;
   std::vector<std::future<void>> parsers(members.size());
   try {
-   for (const bool train : training)
+   for (const bool train : training) {
     progress.source_activity(BenchmarkDatasetSource::kCoco2017, std::string("Extracting COCO ") + (train ? "train" : "validation") + " annotations");
+    if (input_observer_) input_observer_(train, CocoAnnotationInputBoundary::Extracting);
+   }
    extract_annotation_members(archive, members, cancellation_, trace_, storage_, execution_, lease_->allowance(), [&](std::size_t i) {
     const bool train = training[i];
     const auto identity = members[i].identity;

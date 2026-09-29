@@ -33,6 +33,8 @@ class ArtifactProgressTotals;
  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, const std::function<NormalizedAnnotationIndex(const BenchmarkAllowance&)>&, StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {});
 // Three body attempts; cancellation and local capacity failures never repair source data.
 void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservation, const std::function<void()>&, const std::function<void(const std::exception&)>&);
+enum class CocoAnnotationInputBoundary { Extracting, Parsing };
+using CocoAnnotationInputObserver = std::function<void(bool, CocoAnnotationInputBoundary)>;
 enum class CocoSplitAdmission : std::uint8_t { Unselected, Optional, Required };
 struct CocoAnnotationRequest {
  CocoSplitAdmission train = CocoSplitAdmission::Unselected;
@@ -63,6 +65,8 @@ public:
  void observe_splits(CocoAnnotationSplitSink sink, std::array<std::uint64_t, 2> generations = {1, 1}) {
   split_sink_ = std::move(sink); split_generations_ = generations;
  }
+ // Effect-only owner observation, installed before discovery and retained until settlement.
+ void observe_input(CocoAnnotationInputObserver observer) { input_observer_ = std::move(observer); }
  void discover(ProgressReporter&);
  [[nodiscard]] std::uint64_t completed_indexes() const noexcept;
  [[nodiscard]] const std::optional<DownloadRequest>& pending_download() const noexcept { return pending_; }
@@ -92,6 +96,7 @@ private:
  StorageReservationPool* storage_ = nullptr;
  CocoAnnotationIndexes indexes_;
  CocoAnnotationSplitSink split_sink_;
+ CocoAnnotationInputObserver input_observer_;
  std::array<std::uint64_t, 2> split_generations_{1, 1};
  std::optional<DownloadRequest> pending_;
 };

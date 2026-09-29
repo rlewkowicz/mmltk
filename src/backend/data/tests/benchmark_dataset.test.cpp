@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <sys/file.h>
+#include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <thread>
@@ -479,7 +480,8 @@ void test_benchmark_supplemental_sampling() {
  open_images.source = BenchmarkDatasetSource::kOpenImagesV7;
  const std::array<std::uint64_t, 4U> shard_bytes{1U, 1U, 1U, 1U};
  const CombinedSupplementalSamplingResult first_combined = sample_combined_supplemental_indices(fixture_index(coco), fixture_index(source), fixture_index(open_images), shard_bytes);
- const CombinedSupplementalSamplingResult second_combined = sample_combined_supplemental_indices(fixture_index(coco), fixture_index(source), fixture_index(open_images), shard_bytes);
+ BenchmarkCompilePipeline sampling_execution(3);
+ const CombinedSupplementalSamplingResult second_combined = sample_combined_supplemental_indices(fixture_index(coco), fixture_index(source), fixture_index(open_images), shard_bytes, {}, &sampling_execution);
  const SupplementalSamplingResult& first = first_combined.objects365;
  const SupplementalSamplingResult& second = second_combined.objects365;
  REQUIRE(first.stats.full_images == kImageCount);
@@ -746,11 +748,10 @@ void test_benchmark_cached_image_writer_and_loader() {
  std::vector<PackedInstance> labels(sections.label_count);
  file.pread_all(index.data(), index.size() * sizeof(ImageEntry), header.index_offset);
  file.pread_all(labels.data(), labels.size() * sizeof(PackedInstance), header.label_offset);
- validate_compiled_index_entries(index, header, labels.size());
- validate_compiled_original_image_dimensions(index);
+ (void)admit_compiled_records(index, labels, {}, header, [](const ImageEntry&) {});
  REQUIRE(index[0].original_width == 16U);
  REQUIRE(index[0].original_height == 8U);
- REQUIRE(validate_compiled_label_entries(labels, header, sections.rle_region_bytes) == 0U);
+ REQUIRE(sections.rle_region_bytes == 0U);
  REQUIRE(std::ranges::all_of(labels, [](const PackedInstance& label) { return label.mask_rle_offset == 0U && label.mask_rle_pairs == 0U; }));
  REQUIRE(labels[0].bbox_x1 == 0.0F);
  REQUIRE(labels[0].bbox_y1 == 96.0F);
@@ -967,7 +968,7 @@ TEST_CASE("benchmark cache roots share explicit environment and relative precede
  write_text(retained, "existing cached bytes");
  const auto retained_digest = mmltk::common::io::sha256_file(retained);
  const auto retained_time = fs::last_write_time(retained);
- std::atomic<bool> cancelled{false};
+ std::atomic<bool> cancelled{true};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  config.progress = [&](const BenchmarkCompileProgress&) { cancelled.store(true); };
  nlohmann::json paths;
@@ -1029,11 +1030,11 @@ TEST_CASE("benchmark publication admission preserves separate physical output an
   write_text(retained[index], "retained bytes");
   REQUIRE(::stat(retained[index].c_str(), &before[index]) == 0);
  }
- std::atomic<bool> cancelled{false};
+ std::atomic<bool> cancelled{true};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  config.progress = [&](const BenchmarkCompileProgress&) { cancelled.store(true); };
  CHECK_THROWS_WITH(compile_benchmark_dataset(config), overlap ? "benchmark output and cache directories must not overlap" : "benchmark dataset compilation cancelled");
- cancelled.store(false);
+ cancelled.store(true);
  std::size_t path_trace_calls = 0U;
  config.trace = [&](std::string_view event, std::string_view) {
   if (event == "benchmark.compile.paths") ++path_trace_calls;
@@ -1062,7 +1063,7 @@ TEST_CASE("benchmark overlap admission leaves an absent publication destination 
  config.cache_dir = config.publication_dir / "cache";
  config.resolution = 1U;
  config.num_workers = 1;
- std::atomic<bool> cancelled{false};
+ std::atomic<bool> cancelled{true};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  config.progress = [&](const BenchmarkCompileProgress&) { cancelled.store(true); };
  REQUIRE_FALSE(fs::exists(config.publication_dir));
@@ -1805,6 +1806,7 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
  CHECK(observed.pixel_observer_enabled());
  observed.phase(DatasetCompilePhase::Downloading);
  observed.transfers().update(DownloadProgress{"coco-fixture", {.completed_bytes = 5U, .total_bytes = 11U, .attempt = 3U, .resumed = true}}, observed);
+ observed.flush();
  REQUIRE_FALSE(updates.empty());
  CHECK(updates.back().sources[0].completed_bytes == 5U);
  CHECK(updates.back().sources[0].total_bytes == 11U);
@@ -1979,14 +1981,18 @@ TEST_CASE("source count additions serialize publication and permit retry withdra
  first.Release();
  mmltk::testsupport::await_test_future(first_add, "first source addition", 5s);
  mmltk::testsupport::await_test_future(second_add, "second source addition", 5s);
+ progress.flush();
  CHECK(latest.sources[1].completed_images == 384U);
  CHECK(std::ranges::is_sorted(counts));
  progress.transfers().images(source, "first", 0U, 512U, progress);
+ progress.flush();
  CHECK(latest.sources[1].completed_images == 256U);
  progress.transfers().images(source, "first", 256U, 512U, progress);
+ progress.flush();
  CHECK(latest.sources[1].completed_images == 512U);
  CHECK(latest.sources[1].invalidated_images == 128U);
  progress.transfers().images(source, "first", 256U, 512U, progress);
+ progress.flush();
  CHECK(latest.sources[1].completed_images == 512U);  // Warm repeat contributes once.
  CHECK_THROWS_AS(progress.transfers().images(source, "first", 513U, 512U, progress), std::overflow_error);
  CHECK_THROWS_AS(progress.transfers().images(source, "first", std::numeric_limits<std::uint64_t>::max(), std::numeric_limits<std::uint64_t>::max(), progress), std::overflow_error);
@@ -2090,6 +2096,7 @@ TEST_CASE("Open Images local JPEG and complete group reuse preserve dimensions a
  progress.phase(DatasetCompilePhase::Extracting);
  auto acquired = acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0U, quiet);
  REQUIRE(acquired.available_image_ids == std::vector<std::uint64_t>{1U, 2U});
+ progress.flush();
  CHECK(latest.sources[2].completed_images == 2U);
  const auto first_proof = read_json_file(images / ".groups" / "group-000000.complete.json");
  const auto width = first_proof.at("dimensions").at(1).get<std::uint32_t>();
@@ -2099,6 +2106,7 @@ TEST_CASE("Open Images local JPEG and complete group reuse preserve dimensions a
  for (auto& image : index.images) { image.width = image.height = 0U; }
  acquired = acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0U, quiet);
  CHECK(acquired.directory.cache_hit);
+ progress.flush();
  CHECK(latest.sources[2].completed_images == 2U);
  CHECK(latest.sources[2].invalidated_images == 0U);
  const auto reused_proof = read_json_file(images / ".groups" / "group-000000.complete.json");
@@ -2130,6 +2138,7 @@ TEST_CASE("Open Images local JPEG and complete group reuse preserve dimensions a
  REQUIRE(quarantined.size() == 1U);
  CHECK(quarantined.front().image_id == 3U);
  CHECK(quarantined.front().reason == "fixture unavailable image");
+ progress.flush();
  CHECK(latest.sources[2].completed_images == 3U);
  first.Check();
  second.Check();
@@ -2290,6 +2299,7 @@ TEST_CASE("artifact acquisition totals replace contributions without inventing u
  const auto observe = [&](const BenchmarkDatasetSource source, const char* artifact, const std::uint64_t completed, const std::uint64_t total, const std::uint64_t expected_completed,
                        const std::uint64_t expected_total) {
   totals.update(DownloadProgress{.artifact_id = artifact, .transfer = {.completed_bytes = completed, .total_bytes = total}, .source = source}, reporter);
+  reporter.flush();
   CHECK(latest.tracks.acquisition.completed == expected_completed);
   CHECK(latest.tracks.acquisition.total == expected_total);
   CHECK(latest.current_source == source);
@@ -2298,18 +2308,21 @@ TEST_CASE("artifact acquisition totals replace contributions without inventing u
  constexpr auto objects = BenchmarkDatasetSource::kObjects365V2;
  observe(coco, "known", 7U, 10U, 7U, 10U);
  observe(coco, "unknown", 4U, 0U, 11U, 0U);
+ reporter.flush();
  CHECK(latest.sources[0].completed_bytes == 11U);
  CHECK(latest.sources[0].total_bytes == 0U);
  CHECK_FALSE(latest.sources[0].byte_total_known);
  observe(objects, "known", 8U, 20U, 19U, 0U);  // Source-qualified equal artifact names.
  observe(coco, "unknown", 2U, 0U, 17U, 0U);    // Explicit retry withdrawal.
  observe(coco, "unknown", 4U, 4U, 19U, 34U);
+ reporter.flush();
  CHECK(latest.sources[0].byte_total_known);
  observe(objects, "unknown", 3U, 0U, 22U, 0U);
  observe(objects, "unknown", 3U, 3U, 22U, 37U);
  observe(coco, "known", 0U, 10U, 15U, 37U);  // Restart of a known artifact.
  observe(coco, "known", 10U, 10U, 25U, 37U);
  totals.update(DownloadProgress{"known", {.completed_bytes = 10U, .total_bytes = 10U, .attempt = 0U, .cache_hit = true, .resumed = false}}, reporter);
+ reporter.flush();
  CHECK(latest.tracks.acquisition.completed == 25U);
  CHECK(latest.tracks.acquisition.total == 37U);
  CHECK_FALSE(latest.sources[0].cache_hit);  // Only one of this source's artifacts was reused.
@@ -2588,12 +2601,15 @@ TEST_CASE("one-worker image readiness resizes before archive completion and reus
  CHECK(warm.cache_hit);
  CHECK(ready_count == 2);
  CHECK(writer.completed() == 1);
+ progress.flush();
  CHECK(observed.tracks.pixels.completed == 1);
  CHECK(observed.tracks.pixels.invalidated == 0);
  writer.invalidate_source(images);
+ progress.flush();
  CHECK(observed.tracks.pixels.completed == 0);
  CHECK(observed.tracks.pixels.invalidated == 1);
  writer.write_pixel(0, 0);
+ progress.flush();
  CHECK(observed.tracks.pixels.completed == 1);
  CHECK(observed.tracks.pixels.complete);
  writer.finish(write);
@@ -2873,17 +2889,20 @@ TEST_CASE("concurrent tracks preserve unique work through repair and settlement"
  progress.transfers().update(DownloadProgress{.artifact_id = "annotations", .transfer = {.completed_bytes = 8, .total_bytes = 10}}, progress);
  progress.pixels(0, 2);
  progress.pixel_completed();
+ progress.flush();
  CHECK(latest.tracks.acquisition.active);
  CHECK(latest.tracks.labels.active);
  CHECK(latest.tracks.pixels.active);
  CHECK(latest.tracks.labels.completed == 4);
  CHECK(latest.tracks.pixels.completed == 1);
  progress.transfers().update(DownloadProgress{.artifact_id = "images", .transfer = {.completed_bytes = 3}}, progress);
+ progress.flush();
  CHECK(latest.tracks.acquisition.completed == 11);
  CHECK_FALSE(latest.tracks.acquisition.total_known);
  const auto foreground = latest;
  progress.phase(DatasetCompilePhase::Indexing, 3, 6);
  progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Background masks", false);
+ progress.flush();
  CHECK(latest.phase == foreground.phase);
  CHECK(latest.activity == foreground.activity);
  CHECK(latest.completed == foreground.completed);
@@ -2891,11 +2910,13 @@ TEST_CASE("concurrent tracks preserve unique work through repair and settlement"
  CHECK(latest.tracks.labels.completed == 4);
  CHECK(latest.tracks.pixels.completed == 1);
  progress.invalidate_pixels(1);
+ progress.flush();
  CHECK(latest.tracks.pixels.completed == 0);
  CHECK(latest.tracks.pixels.invalidated == 1);
  progress.pixel_completed();
  progress.pixels(1, 2);  // Retained successful pixels, no attempt or copy contribution.
  progress.pixel_completed();
+ progress.flush();
  CHECK(latest.tracks.pixels.completed == 2);
  CHECK(latest.tracks.pixels.complete);
  CHECK(latest.tracks.labels.active);
@@ -2905,9 +2926,11 @@ TEST_CASE("concurrent tracks preserve unique work through repair and settlement"
  progress.label_plan_completed(0);
  progress.label_plan_started(1);
  progress.label_plan_completed(1);
+ progress.flush();
  CHECK(latest.tracks.labels.completed == 8);
  progress.discard_label_plans();
  progress.label_plans(2);
+ progress.flush();
  CHECK(latest.tracks.labels.completed == 6);
  CHECK(latest.tracks.labels.invalidated == 2);
  progress.label_plan_started(0);
@@ -2915,12 +2938,15 @@ TEST_CASE("concurrent tracks preserve unique work through repair and settlement"
  progress.label_plan_completed(0);
  progress.label_plan_started(1);
  progress.label_plan_completed(1);
+ progress.flush();
  CHECK(latest.tracks.labels.completed == 8);
  CHECK(latest.tracks.labels.complete);
  CHECK(latest.tracks.acquisition.active);
  progress.acquisition_complete();
+ progress.flush();
  CHECK(latest.tracks.acquisition.complete);
  progress.phase(DatasetCompilePhase::Publishing, 1, 1);
+ progress.flush();
  CHECK(latest.tracks.valid());
  CHECK(latest.tracks.pixels.invalidated == 1);
 }
@@ -2935,16 +2961,20 @@ TEST_CASE("compile-owned observations survive preparation replacement and source
  auto* replacement = reporter.indexing(rows);
  CHECK(replacement == first);
  replacement->update(1, 100, reporter);
+ reporter.flush();
  CHECK(latest.tracks.labels.completed == 200);
  replacement->update(0, 100, reporter);
+ reporter.flush();
  CHECK(latest.tracks.labels.completed == 200);
  auto& transfers = reporter.transfers();
  transfers.update(DownloadProgress{.artifact_id = "annotations", .transfer = {.completed_bytes = 8, .total_bytes = 8, .attempt = 3, .resumed = true}}, reporter);
  transfers.update(DownloadProgress{.artifact_id = "archive", .transfer = {.completed_bytes = 10, .total_bytes = 20, .attempt = 2}}, reporter);
+ reporter.flush();
  CHECK(latest.sources[0].retry_count == 3);
  CHECK(latest.sources[0].resumed);
  CHECK(latest.tracks.acquisition.completed == 18);
  transfers.update(DownloadProgress{.artifact_id = "annotations", .transfer = {.completed_bytes = 8, .total_bytes = 8, .cache_hit = true}}, reporter);
+ reporter.flush();
  CHECK(latest.sources[0].retry_count == 3);
  CHECK(latest.tracks.acquisition.completed == 18);
  ProgressReporter disabled({}, quiet);
@@ -2978,12 +3008,19 @@ TEST_CASE("preparation indexing totals preserve successful rows across owner rep
  const std::array<std::uint64_t, 2> rows{241602, 5000};
  IndexingProgressTotals attempt(rows);
  attempt.update(0, 0, reporter);
+ reporter.flush();
  attempt.update(0, 4096, reporter);
+ reporter.flush();
  attempt.update(1, 64, reporter);
+ reporter.flush();
  attempt.update(0, 4160, reporter);
+ reporter.flush();
  attempt.update(1, 0, reporter);  // Release-local parser retry retains admitted work.
+ reporter.flush();
  attempt.update(0, rows[0], reporter);
+ reporter.flush();
  attempt.update(1, rows[1] + 1, reporter);  // Bad rows cannot overrun the denominator.
+ reporter.flush();
  REQUIRE(updates.size() == 7);
  CHECK(updates[2].completed == 4160);
  CHECK(updates[3].completed == 4224);
@@ -2996,9 +3033,11 @@ TEST_CASE("preparation indexing totals preserve successful rows across owner rep
   CHECK(value.completed <= value.total);
   previous = value.completed;
  }
+ reporter.flush();
  CHECK(updates.back().completed == updates.back().total);
  IndexingProgressTotals replacement(rows);
  replacement.update(0, 0, reporter);
+ reporter.flush();
  CHECK(updates.back().tracks.labels.completed == rows[0] + rows[1]);
  CHECK(updates.back().tracks.labels.total == rows[0] + rows[1]);
 }
@@ -3141,20 +3180,26 @@ TEST_CASE("source transfer facts follow represented activity independently of ag
  reporter.phase(DatasetCompilePhase::Downloading);
  const DownloadProgress download{.artifact_id = "train-patch", .transfer = {.completed_bytes = 4096, .total_bytes = 8192, .retained_bytes = 1024, .attempt = 2, .resumed = true}};
  reporter.transfers().update(download, reporter);
+ reporter.flush();
  REQUIRE(latest.sources.front().transfer);
  CHECK(latest.sources.front().transfer->valid());
  CHECK(latest.sources.front().activity == "Resuming train-patch");
  CHECK(*latest.sources.front().transfer == download.transfer);
  reporter.source_images(download.source, 2, 3);
+ reporter.flush();
  CHECK(latest.sources.front().transfer == download.transfer);
  reporter.source_activity(download.source, "Resuming train-patch");
+ reporter.flush();
  CHECK(latest.sources.front().transfer == download.transfer);
  reporter.source_activity(download.source, "Extracting train-patch");
+ reporter.flush();
  CHECK_FALSE(latest.sources.front().transfer);
  reporter.transfers().update(download, reporter);
  reporter.source_images(download.source, 3, 3, "Normalizing annotations");
+ reporter.flush();
  CHECK_FALSE(latest.sources.front().transfer);
  reporter.transfers().update(DownloadProgress{.artifact_id = "metadata", .transfer = {.completed_bytes = 512}}, reporter);
+ reporter.flush();
  REQUIRE(latest.sources.front().transfer);
  CHECK(latest.sources.front().transfer->total_bytes == 0);
  CHECK(latest.sources.front().transfer->completed_bytes == 512);
@@ -3162,6 +3207,7 @@ TEST_CASE("source transfer facts follow represented activity independently of ag
  CHECK_FALSE(latest.sources.front().byte_total_known);
  CHECK(format_benchmark_source_status(latest.sources.front(), "Acquiring").find("512 bytes (total unknown)") != std::string::npos);
  reporter.source_complete(download.source, true);
+ reporter.flush();
  CHECK_FALSE(latest.sources.front().transfer);
  CHECK(latest.sources.front().complete);
  CHECK(latest.sources.front().retry_count == 1);
@@ -4891,6 +4937,7 @@ TEST_CASE("Open Images admits a third group while two earlier groups retry and p
  CHECK(result.available_image_ids.size() == count);
  CHECK(result.directory.image_bytes == count * jpeg.size());
  CHECK(quarantined.empty());
+ progress.flush();
  REQUIRE(throttle_updates.size() == 2);
  CHECK(throttle_updates[0].find("7 concurrent") != std::string::npos);
  CHECK(throttle_updates[1].find("5 concurrent") != std::string::npos);
@@ -5113,16 +5160,17 @@ TEST_CASE("Open Images consumes a repaired saved file before recycling its exclu
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 32}, cancellation);
  mmltk::testsupport::TestGate validation("repaired file before exclusive full decode");
  std::atomic<unsigned> validations{0};
- ProgressReporter progress([&](const BenchmarkCompileProgress& update) {
-  if (update.activity != "Full-decode checking repaired Open Images JPEG 1" || validations.fetch_add(1) != 0) return;
+ ProgressReporter progress({}, {});
+ const auto repair_input = [&](std::uint64_t id) {
+  if (id != 1 || validations.fetch_add(1) != 0) return;
   validation.receipt().ArriveAndWait();
   if (repair == Repair::Allocation) throw std::bad_alloc{};
- }, {});
+ };
  std::vector<QuarantinedImage> quarantined;
  const ImageDecodeProbe probe{1, repair == Repair::Dimensions ? 17U : 16U, 8};
  auto acquisition = std::async(std::launch::async, [&] {
   return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, probe, &execution,
-   [&](std::uint64_t id) { return id == 1 ? first.url("repair") : id == 2 ? member.url("member") : later.url("later"); });
+   [&](std::uint64_t id) { return id == 1 ? first.url("repair") : id == 2 ? member.url("member") : later.url("later"); }, {}, repair_input);
  });
  const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); validation.Release(); member.ReleaseRequest(); });
  REQUIRE(validation.WaitEntered(5s));
@@ -6065,15 +6113,12 @@ TEST_CASE("registered Open Images repair accepts its one retained pixel consumpt
  BenchmarkCompilePipeline::Attempt attempt(execution);
  execution.register_split(writer, split);
  bool unlinked = false;
- ProgressReporter progress([&](const BenchmarkCompileProgress& update) {
-  if (update.activity == "Full-decode checking repaired Open Images JPEG 1") {
-   unlinked = fs::remove(cached_image_path(images, 1));
-  }
- }, {});
+ ProgressReporter progress({}, {});
+ const auto repair_input = [&](std::uint64_t id) { if (id == 1) unlinked = fs::remove(cached_image_path(images, 1)); };
  std::vector<QuarantinedImage> quarantined;
  auto acquisition = std::async(std::launch::async, [&] {
   return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, ImageDecodeProbe{1, 16, 8}, &execution,
-   [&](std::uint64_t) { return server.url("repair"); });
+   [&](std::uint64_t) { return server.url("repair"); }, {}, repair_input);
  });
  const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); });
  const auto result = mmltk::testsupport::await_test_future(acquisition, "repair consumes admitted bytes without reopening its saved path");
@@ -7452,4 +7497,83 @@ TEST_CASE("required label joins surface failed geometry readers without a pixel 
  publication({1});
  CHECK_THROWS_AS(execution.wait_image_labels(images, 1, "required"), BenchmarkImageReadError);
  CHECK_FALSE(execution.geometry(images, 1)); CHECK_FALSE(execution.image_labels(images, 1, "required"));
+}
+
+TEST_CASE("annotation repair reads failed payloads only for enabled diagnostics", "[backend][data][benchmark][download][trace]") {
+ mmltk::testsupport::ScopedTempDir root("annotation-diagnostic-reads");
+ const auto payload = make_payload(4096);
+ HttpServer server(payload);
+ const auto request = request_for(root.path(), "metadata", server.url("metadata"), payload);
+ bool enabled = false;
+ SECTION("disabled diagnostics never open the failed inode") {}
+ SECTION("enabled diagnostics hash each replacement generation") { enabled = true; }
+ std::vector<std::string> digests;
+ const BenchmarkTraceSink trace = enabled ? BenchmarkTraceSink{[&](std::string_view event, const nlohmann::json& fields) {
+  if (event == "benchmark.download.failure_sha256") digests.push_back(fields.at("sha256").get<std::string>());
+ }} : BenchmarkTraceSink{};
+ ProgressReporter reporter({}, trace);
+ for (unsigned generation = 0; generation < 2; ++generation) {
+  const std::string failed(8192, static_cast<char>('a' + generation));
+  write_text(request.destination, failed);
+  const mmltk::common::io::ScopedFd events(::inotify_init1(IN_CLOEXEC | IN_NONBLOCK));
+  REQUIRE(events.get() >= 0);
+  REQUIRE(::inotify_add_watch(events.get(), request.destination.c_str(), IN_OPEN | IN_ACCESS) >= 0);
+  const auto repaired = repair_annotation_artifacts({request}, BenchmarkDatasetSource::kCoco2017, "malformed input", reporter, reporter.transfers(), 1, {}, trace);
+  REQUIRE(repaired.size() == 1);
+  std::array<char, 4096> buffer{};
+  bool opened = false, accessed = false;
+  for (;;) {
+   const auto bytes = ::read(events.get(), buffer.data(), buffer.size());
+   if (bytes < 0) { REQUIRE(errno == EAGAIN); break; }
+   REQUIRE(bytes > 0);
+   for (std::size_t offset = 0; offset < static_cast<std::size_t>(bytes);) {
+    inotify_event event{};
+    std::memcpy(&event, buffer.data() + offset, sizeof(event));
+    opened = opened || (event.mask & IN_OPEN); accessed = accessed || (event.mask & IN_ACCESS);
+    offset += sizeof(event) + event.len;
+   }
+  }
+  CHECK(opened == enabled); CHECK(accessed == enabled);
+  if (enabled) {
+   REQUIRE(digests.size() == generation + 1);
+   CHECK(digests.back() == mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(failed.data()), failed.size()))));
+  }
+ }
+ CHECK(digests.size() == (enabled ? 2 : 0));
+ server.Check();
+}
+TEST_CASE("split sealing admits caller metadata and preserves publication on cancellation", "[backend][data][benchmark][writer]") {
+ mmltk::testsupport::ScopedTempDir root("split-seal-publication");
+ auto split = cached_pixel_membership(root.path() / "images");
+ split.images = {{1, 16, 8, 0, 1, 0}};
+ PackedInstance label{}; label.bbox_x2 = label.bbox_y2 = 1;
+ split.labels = {label};
+ const auto output = root.path() / "result.bin";
+ write_text(output, "prior publication");
+ const auto prior = mmltk::common::io::sha256_file(output);
+ std::atomic<bool> cancelled{false};
+ auto request = benchmark_write_request(split, output, 8, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ request.overwrite = true;
+ {
+  BenchmarkSplitWriter writer(request);
+  writer.write_remaining(request);
+  SECTION("caller metadata receives full admission") {
+   split.labels[0].flags = 128;
+   CHECK_THROWS(writer.seal(request));
+  }
+  SECTION("cancel before sealing") {
+   cancelled.store(true);
+   CHECK_THROWS(writer.seal(request));
+  }
+  SECTION("cancel after sync before publishing") {
+   auto sealed = writer.seal(request);
+   CHECK(sealed.info.image_count == 1);
+   CHECK(std::ranges::equal(sealed.info.class_names(), split.class_names));
+   CHECK(mmltk::common::io::sha256_file(output) == prior);
+   cancelled.store(true);
+   CHECK_THROWS(sealed.artifact.publish(output, request.cancel_requested));
+  }
+ }
+ CHECK(mmltk::common::io::sha256_file(output) == prior);
+ for (const auto& item : fs::directory_iterator(root.path())) CHECK_FALSE(item.path().filename().string().starts_with("result.bin.tmp."));
 }

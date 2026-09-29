@@ -194,7 +194,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  std::vector<std::uint64_t> object_shard_bytes;
  object_shard_bytes.reserve(sampling_object_artifacts.size());
  for (const CatalogArtifact& artifact : sampling_object_artifacts) { object_shard_bytes.push_back(artifact.expected_size); }
- CombinedSupplementalSamplingResult combined_sampling = sample_combined_supplemental_indices(*coco_train, *objects, *open_images, object_shard_bytes, cancel_requested);
+ CombinedSupplementalSamplingResult combined_sampling = sample_combined_supplemental_indices(*coco_train, *objects, *open_images, object_shard_bytes, cancel_requested, execution);
  SupplementalSamplingResult objects_sampling = std::move(combined_sampling.objects365);
  SupplementalSamplingResult open_images_sampling = std::move(combined_sampling.open_images);
  progress.phase(DatasetCompilePhase::Indexing, ++completed_indexes, kIndexCount);

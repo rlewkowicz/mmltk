@@ -10,8 +10,8 @@ std::uint64_t replace_progress(const std::uint64_t aggregate, const std::uint64_
 }
 }  // namespace
 using Clock = std::chrono::steady_clock;
-ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace, std::span<const BenchmarkDatasetSource> sources)
-    : callback_(std::move(callback)), trace_(&trace) {
+ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace, std::span<const BenchmarkDatasetSource> sources, std::function<void(std::exception_ptr)> failed)
+    : callback_(std::move(callback)), failed_(std::move(failed)), trace_(trace) {
  if (!callback_) { return; }
  const auto source_progress = [](const BenchmarkDatasetSource source) {
   BenchmarkSourceProgress progress;
@@ -21,27 +21,40 @@ ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const Ben
  constexpr BenchmarkDatasetSource custom_sources[]{BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2, BenchmarkDatasetSource::kOpenImagesV7};
  if (sources.empty()) sources = custom_sources;
  for (const auto source : sources) state_.sources.push_back(source_progress(source));
+ drainer_ = std::jthread([this] { drain(); });
 }
-ProgressReporter::~ProgressReporter() = default;
+ProgressReporter::~ProgressReporter() {
+ try { flush(); } catch (...) {}
+ { std::unique_lock lock(mutex_); stopping_ = true; }
+ changed_.notify_all();
+ if (drainer_.joinable()) drainer_.join();
+}
 IndexingProgressTotals* ProgressReporter::indexing(std::span<const std::uint64_t> totals) {
  if (!callback_) return nullptr;
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
  if (!indexing_) indexing_ = std::make_unique<IndexingProgressTotals>(totals);
  return indexing_.get();
 }
 void ProgressReporter::invalidate_indexing(std::uint64_t count) {
  if (!callback_ || count == 0) return;
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
+ invalidate_indexing_unlocked(lock, count);
+}
+void ProgressReporter::invalidate_indexing_unlocked(std::unique_lock<std::mutex>& lock, std::uint64_t count) {
  if (count > indexed_completed_) throw std::underflow_error("benchmark indexing invalidation underflow");
  indexed_completed_ -= count;
  add_progress(state_.tracks.labels.invalidated, count, "benchmark indexing invalidation overflow");
  update_labels();
  if (state_.phase == DatasetCompilePhase::Indexing) state_.completed = indexed_completed_;
- emit();
+ emit(lock, true);
 }
 void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_t completed, const std::uint64_t total) {
- if (!callback_ && !*trace_) { return; }
- const std::lock_guard lock(mutex_);
+ if (!callback_ && !trace_) { return; }
+ std::unique_lock lock(mutex_);
+ phase_unlocked(lock, phase, completed, total);
+}
+void ProgressReporter::phase_unlocked(std::unique_lock<std::mutex>& lock, const DatasetCompilePhase phase, const std::uint64_t completed, const std::uint64_t total) {
+ flush_pixels_unlocked();
  const bool background_indexing = phase == DatasetCompilePhase::Indexing && (state_.phase == DatasetCompilePhase::Extracting || state_.phase == DatasetCompilePhase::Pixels);
  if (phase == DatasetCompilePhase::Indexing) {
   indexed_completed_ = std::max(indexed_completed_, completed);
@@ -50,7 +63,7 @@ void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_
   update_labels();
  }
  if (background_indexing) {
-  emit();
+  emit(lock, total != 0 && completed == total);
   return;
  }
  const bool phase_changed = state_.phase != phase;
@@ -77,7 +90,7 @@ void ProgressReporter::phase(const DatasetCompilePhase phase, const std::uint64_
   state_.current_source.reset();
   set_activity_unlocked(default_phase_activity(phase));
  }
- emit();
+ emit(lock, phase_changed || (total != 0 && completed == total));
 }
 void ProgressReporter::update_labels() {
  if (state_.phase == DatasetCompilePhase::Labels) {
@@ -99,30 +112,31 @@ void ProgressReporter::update_labels() {
 }
 void ProgressReporter::label_plans(std::size_t total) {
  if (!callback_) return;
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
  if (labels_admitted_) throw std::logic_error("benchmark label plans already admitted");
  label_plans_.assign(total, LabelPlan::Waiting);
  labels_admitted_ = true;
  update_labels();
- emit();
+ emit(lock, true);
 }
 void ProgressReporter::label_plan_started(std::size_t slot) {
  if (!callback_) return;
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
  auto& plan = label_plans_.at(slot);
  if (plan == LabelPlan::Active) return;
- if (plan == LabelPlan::Complete) {
+ const bool invalidated = plan == LabelPlan::Complete;
+ if (invalidated) {
   --label_completed_;
   add_progress(state_.tracks.labels.invalidated, 1, "benchmark label invalidation overflow");
  }
  plan = LabelPlan::Active;
  ++label_active_;
  update_labels();
- emit();
+ emit(lock, invalidated);
 }
 void ProgressReporter::label_plan_completed(std::size_t slot) {
  if (!callback_) return;
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
  auto& plan = label_plans_.at(slot);
  if (plan == LabelPlan::Complete) return;
  if (plan != LabelPlan::Active) throw std::logic_error("benchmark label plan has not started");
@@ -130,91 +144,107 @@ void ProgressReporter::label_plan_completed(std::size_t slot) {
  --label_active_;
  ++label_completed_;
  update_labels();
- emit();
+ emit(lock, state_.tracks.labels.complete);
 }
 void ProgressReporter::discard_label_plans() {
  if (!callback_) return;
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
  add_progress(state_.tracks.labels.invalidated, label_completed_, "benchmark label invalidation overflow");
  label_completed_ = label_active_ = 0;
  label_plans_.clear();
  labels_admitted_ = false;
  update_labels();
- emit();
+ emit(lock, true);
 }
 void ProgressReporter::activity(std::string activity) {
- if (!callback_ && !*trace_) { return; }
- const std::lock_guard lock(mutex_);
+ if (!callback_ && !trace_) { return; }
+ std::unique_lock lock(mutex_);
  state_.current_source.reset();
  set_activity_unlocked(std::move(activity));
- emit();
+ emit(lock, true);
 }
 void ProgressReporter::pixels(const std::uint64_t completed, const std::uint64_t total) {
  if (!pixel_observer_enabled()) return;
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
+ flush_pixels_unlocked();
  auto& pixels = state_.tracks.pixels;
  if (completed > total) throw std::logic_error("benchmark pixel count exceeds total");
  if (completed < pixels.completed) add_progress(pixels.invalidated, pixels.completed - completed, "benchmark invalidated pixels overflow");
  pixels.completed = completed;
  pixels.total = total;
+ remaining_pixels_.store(total - completed, std::memory_order_release);
  pixels.total_known = true;
  pixels.complete = completed == total;
  pixels.active = !pixels.complete;
  pixels.activity = pixels.complete ? DatasetCompileActivity::Complete : DatasetCompileActivity::Compiling;
- if (*trace_ && pixel_started_.time_since_epoch().count() == 0) pixel_started_ = Clock::now();
- emit();
+ if (trace_ && pixel_started_.time_since_epoch().count() == 0) pixel_started_ = Clock::now();
+ emit(lock, true);
 }
 void ProgressReporter::invalidate_pixels(std::uint64_t count) {
  if (!pixel_observer_enabled() || !count) return;
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
+ flush_pixels_unlocked();
  auto& pixels = state_.tracks.pixels;
  if (count > pixels.completed) throw std::underflow_error("benchmark pixel invalidation underflow");
  pixels.completed -= count;
+ remaining_pixels_.fetch_add(count, std::memory_order_release);
  add_progress(pixels.invalidated, count, "benchmark invalidated pixels overflow");
  pixels.complete = false;
  pixels.active = true;
  pixels.activity = DatasetCompileActivity::Compiling;
- emit();
+ emit(lock, true);
 }
-void ProgressReporter::pixel_completed() {
- if (!pixel_observer_enabled()) return;
- const std::lock_guard lock(mutex_);
+void ProgressReporter::flush_pixels_unlocked() {
+ const auto events = pixel_events_.load(std::memory_order_acquire);
+ if (events == observed_pixel_events_) return;
+ observed_pixel_events_ = events;
  auto& pixels = state_.tracks.pixels;
- if (pixels.completed >= pixels.total) throw std::overflow_error("benchmark pixel completion exceeds total");
- ++pixels.completed;
- if (state_.phase == DatasetCompilePhase::Pixels) {
-  state_.completed = pixels.completed;
-  state_.total = pixels.total;
- }
+ std::uint64_t delta = 0;
+ for (auto& lane : pixel_deltas_) add_progress(delta, lane.completed.exchange(0, std::memory_order_acq_rel), "benchmark pixel completion overflow");
+ if (!delta) return;
+ if (pixels.completed > pixels.total || delta > pixels.total - pixels.completed) throw std::overflow_error("benchmark pixel completion exceeds total");
+ pixels.completed += delta;
  pixels.complete = pixels.completed == pixels.total;
  pixels.active = !pixels.complete;
  pixels.activity = pixels.complete ? DatasetCompileActivity::Complete : DatasetCompileActivity::Compiling;
- constexpr std::uint64_t kPixelProgressQuantum = 64U;
- if (pixels.completed != 1 && pixels.completed % kPixelProgressQuantum != 0 && !pixels.complete) return;
- emit();
- if (*trace_) {
+ if (state_.phase == DatasetCompilePhase::Pixels) { state_.completed = pixels.completed; state_.total = pixels.total; }
+}
+void ProgressReporter::pixel_completed() {
+ if (!pixel_observer_enabled()) return;
+ const auto lane = std::hash<std::thread::id>{}(std::this_thread::get_id()) % pixel_deltas_.size();
+ pixel_deltas_[lane].completed.fetch_add(1, std::memory_order_release);
+ const auto event = pixel_events_.fetch_add(1, std::memory_order_release) + 1;
+ // First observation is kept. Remaining deltas are drained on a bounded work
+ // quantum or any explicit state/terminal boundary, without a per-pixel lock.
+ const auto remaining = remaining_pixels_.fetch_sub(1, std::memory_order_acq_rel);
+ if (!remaining) throw std::overflow_error("benchmark pixel completion exceeds total");
+ if (event != 1 && event % 64 != 0 && remaining != 1) return;
+ std::unique_lock lock(mutex_);
+ flush_pixels_unlocked();
+ emit(lock, event == 1 || remaining == 1);
+ if (trace_) {
+  const auto pixels = state_.tracks.pixels;
   const double elapsed = std::chrono::duration<double>(Clock::now() - pixel_started_).count();
-  trace_benchmark_event(*trace_, "benchmark.pixel_compile.throughput", [&] {
-   return nlohmann::json{
-    {"completed_images", pixels.completed}, {"total_images", pixels.total}, {"elapsed_seconds", elapsed}, {"split", "train and val"},
+  lock.unlock();
+  trace_benchmark_event(trace_, "benchmark.pixel_compile.throughput", [&] {
+   return nlohmann::json{{"completed_images", pixels.completed}, {"total_images", pixels.total}, {"elapsed_seconds", elapsed}, {"split", "train and val"},
     {"images_per_second", elapsed > 0 ? static_cast<double>(pixels.completed) / elapsed : 0},
-    {"eta_seconds", pixels.completed != 0 ? static_cast<double>(pixels.total - pixels.completed) * elapsed / static_cast<double>(pixels.completed) : 0}
-   };
+    {"eta_seconds", pixels.completed ? static_cast<double>(pixels.total - pixels.completed) * elapsed / static_cast<double>(pixels.completed) : 0}};
   });
  }
 }
 void ProgressReporter::acquisition_complete() {
  if (!callback_) return;
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
  if (state_.tracks.acquisition.complete) return;
  state_.tracks.acquisition.active = false;
  state_.tracks.acquisition.complete = true;
  state_.tracks.acquisition.activity = DatasetCompileActivity::Complete;
- emit();
+ emit(lock, true);
 }
 void ProgressReporter::source_activity(const BenchmarkDatasetSource source, std::string activity, bool foreground) {
- if (!callback_ && !*trace_) { return; }
- const std::lock_guard lock(mutex_);
+ if (!callback_ && !trace_) { return; }
+ std::unique_lock lock(mutex_);
  if (!callback_) {
   if (state_.activity != activity || state_.current_source != source) { trace_activity(source, activity); }
   if (foreground) {
@@ -224,7 +254,7 @@ void ProgressReporter::source_activity(const BenchmarkDatasetSource source, std:
   return;
  }
  set_source_activity_unlocked(source, std::move(activity), foreground);
- emit();
+ emit(lock, true);
 }
 void ProgressReporter::set_source_activity_unlocked(const BenchmarkDatasetSource source, std::string activity, bool foreground) {
  BenchmarkSourceProgress& source_state = source_progress(source);
@@ -239,37 +269,41 @@ void ProgressReporter::set_source_activity_unlocked(const BenchmarkDatasetSource
 }
 bool ProgressReporter::transfer_observer_enabled() const noexcept { return static_cast<bool>(callback_); }
 bool ProgressReporter::normalization_observer_enabled() const noexcept { return static_cast<bool>(callback_); }
-bool ProgressReporter::pixel_observer_enabled() const noexcept { return callback_ || (trace_ != nullptr && static_cast<bool>(*trace_)); }
+bool ProgressReporter::pixel_observer_enabled() const noexcept { return callback_ || static_cast<bool>(trace_); }
 void ProgressReporter::projected(const std::uint64_t bytes) {
  if (!callback_) { return; }
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
  state_.projected_output_bytes = bytes;
- emit();
+ emit(lock);
 }
 void ProgressReporter::rejected(const std::uint64_t dropped, const std::uint64_t quarantined) {
  if (!callback_) { return; }
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
  state_.dropped_instances = dropped;
  state_.quarantined_images = quarantined;
- emit();
+ emit(lock);
 }
 void ProgressReporter::source_images(const BenchmarkDatasetSource source, const std::uint64_t completed, const std::uint64_t total, std::string activity) {
  if (!callback_) { return; }
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
+ source_images_unlocked(lock, source, completed, total, std::move(activity));
+}
+void ProgressReporter::source_images_unlocked(std::unique_lock<std::mutex>& lock, const BenchmarkDatasetSource source, const std::uint64_t completed, const std::uint64_t total, std::string activity) {
  BenchmarkSourceProgress& progress = source_progress(source);
+ const bool boundary = completed < progress.completed_images || total != progress.total_images || (total && completed == total);
  if (completed < progress.completed_images) add_progress(progress.invalidated_images, progress.completed_images - completed, "benchmark source invalidation overflow");
  if (!activity.empty()) set_source_activity_unlocked(source, std::move(activity));
  progress.completed_images = completed;
  progress.total_images = total;
  select_acquisition_source(source);
  update_acquisition();
- emit();
+ emit(lock, boundary);
 }
 void ProgressReporter::select_acquisition_source(const BenchmarkDatasetSource source) {
  if (state_.phase == DatasetCompilePhase::Downloading || state_.phase == DatasetCompilePhase::Extracting) { state_.current_source = source; }
 }
 void ProgressReporter::trace_activity(const std::optional<BenchmarkDatasetSource> source, const std::string_view activity) {
- trace_benchmark_event(*trace_, "benchmark.progress.activity", [&] {
+ trace_benchmark_event(trace_, "benchmark.progress.activity", [&] {
   nlohmann::json fields{{"activity", activity}, {"phase", static_cast<unsigned>(state_.phase)}};
   if (source) { fields["source"] = static_cast<unsigned>(*source); }
   return fields;
@@ -277,9 +311,15 @@ void ProgressReporter::trace_activity(const std::optional<BenchmarkDatasetSource
 }
 void ProgressReporter::source_transfer(const DownloadProgress& update, const BenchmarkSourceProgress& aggregate) {
  if (!callback_) { return; }
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
+ source_transfer_unlocked(lock, update, aggregate);
+}
+void ProgressReporter::source_transfer_unlocked(std::unique_lock<std::mutex>& lock, const DownloadProgress& update, const BenchmarkSourceProgress& aggregate) {
  const auto source = update.source;
  auto& progress = source_progress(source);
+ bool boundary = !progress.transfer || progress.completed_bytes > aggregate.completed_bytes || progress.total_bytes != aggregate.total_bytes ||
+  progress.byte_total_known != aggregate.byte_total_known || progress.transfer->attempt != update.transfer.attempt ||
+  (update.transfer.total_bytes && update.transfer.completed_bytes == update.transfer.total_bytes);
  std::string operation;
  if (update.transfer.cache_hit) {
   operation = "Reusing cached ";
@@ -293,6 +333,7 @@ void ProgressReporter::source_transfer(const DownloadProgress& update, const Ben
   }
  }
  operation += update.artifact_id;
+ boundary = boundary || progress.activity != operation;
  select_acquisition_source(source);
  if (state_.current_source == source) {
   if (state_.activity != operation) { trace_activity(source, operation); }
@@ -308,18 +349,18 @@ void ProgressReporter::source_transfer(const DownloadProgress& update, const Ben
  progress.cache_hit = aggregate.cache_hit;
  progress.resumed = aggregate.resumed;
  update_acquisition();
- emit();
+ emit(lock, boundary);
 }
 void ProgressReporter::source_complete(const BenchmarkDatasetSource source, const bool cache_hit) {
  if (!callback_) { return; }
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(mutex_);
  BenchmarkSourceProgress& progress = source_progress(source);
  progress.transfer.reset();
  progress.complete = true;
  progress.cache_hit = cache_hit;
  progress.activity = cache_hit ? "Cache hit" : "Complete";
  update_acquisition();
- emit();
+ emit(lock, true);
 }
 std::string ProgressReporter::default_phase_activity(const DatasetCompilePhase phase) {
  // CLEANUP-IGNORE: exhaustive phase-to-activity descriptor; its switch shape intentionally follows the enum.
@@ -383,27 +424,28 @@ IndexingProgressTotals::IndexingProgressTotals(std::span<const std::uint64_t> to
 }
 void IndexingProgressTotals::update(std::size_t release, std::uint64_t completed, ProgressReporter& reporter) {
  if (!reporter.normalization_observer_enabled()) return;
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(reporter.mutex_);
  auto& observation = releases_.at(release);
  // Ordinary observations remain monotonic within a retained release product.
  // Replacement explicitly withdraws that product before new callbacks begin.
  const auto admitted = std::max(observation.completed, std::min(completed, observation.total));
  completed_ += admitted - observation.completed;
  observation.completed = admitted;
- reporter.phase(DatasetCompilePhase::Indexing, completed_, total_);
+ reporter.phase_unlocked(lock, DatasetCompilePhase::Indexing, completed_, total_);
 }
 void IndexingProgressTotals::invalidate(std::size_t release, ProgressReporter& reporter, std::uint64_t rows) {
  if (!reporter.normalization_observer_enabled()) return;
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(reporter.mutex_);
  auto& observation = releases_.at(release);
  const auto withdrawn = std::min(observation.completed, rows);
+ if (!withdrawn) return;
  completed_ -= withdrawn;
  observation.completed -= withdrawn;
- reporter.invalidate_indexing(withdrawn);
+ reporter.invalidate_indexing_unlocked(lock, withdrawn);
 }
 void ArtifactProgressTotals::update(const DownloadProgress& update, ProgressReporter& reporter) {
  if (!reporter.transfer_observer_enabled()) { return; }
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(reporter.mutex_);
  const auto source = update.source;
  auto& totals = sources_[source];
  const auto previous = totals.artifacts.find(update.artifact_id);
@@ -424,7 +466,7 @@ void ArtifactProgressTotals::update(const DownloadProgress& update, ProgressRepo
  totals.completed = completed;
  totals.known_total = known_total;
  totals.unknown_count = unknown_count;
- reporter.source_transfer(update, BenchmarkSourceProgress{
+ reporter.source_transfer_unlocked(lock, update, BenchmarkSourceProgress{
                                    .source = source,
                                    .activity = {},
                                    .completed_bytes = completed,
@@ -437,7 +479,7 @@ void ArtifactProgressTotals::update(const DownloadProgress& update, ProgressRepo
 }
 void ArtifactProgressTotals::images(BenchmarkDatasetSource source, const std::string& artifact, std::uint64_t completed, std::uint64_t source_total, ProgressReporter& reporter, std::string activity) {
  if (!reporter.transfer_observer_enabled()) return;
- const std::lock_guard lock(mutex_);
+ std::unique_lock lock(reporter.mutex_);
  auto& source_state = sources_[source];
  const auto found = source_state.images.find(artifact);
  const auto previous = found == source_state.images.end() ? 0 : found->second;
@@ -445,14 +487,72 @@ void ArtifactProgressTotals::images(BenchmarkDatasetSource source, const std::st
  if (aggregate > source_total) throw std::overflow_error("benchmark source images exceed admitted total");
  source_state.images.insert_or_assign(artifact, completed);
  source_state.completed_images = aggregate;
- reporter.source_images(source, aggregate, source_total, std::move(activity));
+ reporter.source_images_unlocked(lock, source, aggregate, source_total, std::move(activity));
 }
-void ProgressReporter::emit() {
- if (callback_) {
-  if (activity_started_.time_since_epoch().count() != 0) {
-   state_.activity_elapsed_seconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - activity_started_).count());
+void ProgressReporter::emit(std::unique_lock<std::mutex>& lock, bool preserve, bool nonfatal) {
+ flush_pixels_unlocked();
+ if (!callback_) return;
+ if (callback_failure_) { if (!nonfatal) std::rethrow_exception(callback_failure_); return; }
+ if (activity_started_.time_since_epoch().count())
+  state_.activity_elapsed_seconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - activity_started_).count());
+ const auto sequence = ++submitted_;
+ Snapshot snapshot{state_, preserve || sequence == 1, nonfatal, sequence};
+ // Preserve ordering even when a boundary waits for bounded queue space. The
+ // wait releases the state lock; the drainer never invokes user code under it.
+ changed_.wait(lock, [&] {
+  return callback_failure_ || (sequence == enqueued_ + 1 && (pending_.size() < kPendingSnapshots ||
+   std::ranges::any_of(pending_, [](const auto& value) { return !value.preserve; })));
+ });
+ if (callback_failure_) { if (!nonfatal) std::rethrow_exception(callback_failure_); return; }
+ if (!snapshot.preserve && !pending_.empty() && !pending_.back().preserve) pending_.back() = std::move(snapshot);
+ else {
+  if (pending_.size() == kPendingSnapshots) {
+   const auto stale = std::ranges::find_if(pending_, [](const auto& value) { return !value.preserve; });
+   pending_.erase(stale);
   }
-  callback_(state_);
+  pending_.push_back(std::move(snapshot));
  }
+ enqueued_ = sequence;
+ changed_.notify_all();
+}
+void ProgressReporter::drain() {
+ for (;;) {
+  Snapshot snapshot;
+  {
+   std::unique_lock lock(mutex_);
+   changed_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+   if (pending_.empty()) { if (stopping_) return; continue; }
+   snapshot = std::move(pending_.front()); pending_.pop_front();
+   changed_.notify_all();
+  }
+  std::exception_ptr failure;
+  try { callback_(snapshot.value); } catch (...) { if (!snapshot.nonfatal) failure = std::current_exception(); }
+  if (failure && failed_) { try { failed_(failure); } catch (...) {} }
+  {
+   const std::lock_guard lock(mutex_);
+   delivered_ = snapshot.sequence;
+   if (failure) { callback_failure_ = failure; pending_.clear(); }
+  }
+  changed_.notify_all();
+ }
+}
+void ProgressReporter::flush() {
+ if (!callback_ && !pixel_observer_enabled()) return;
+ std::unique_lock lock(mutex_);
+ const auto before = state_.tracks.pixels.completed;
+ flush_pixels_unlocked();
+ if (!callback_) return;
+ if (state_.tracks.pixels.completed != before) emit(lock, true);
+ const auto through = submitted_;
+ changed_.wait(lock, [&] { return callback_failure_ || delivered_ >= through; });
+ if (callback_failure_) std::rethrow_exception(callback_failure_);
+}
+void ProgressReporter::warning(std::string activity) noexcept {
+ try {
+  if (!callback_ && !trace_) return;
+  std::unique_lock lock(mutex_);
+  state_.current_source.reset(); set_activity_unlocked(std::move(activity));
+  emit(lock, true, true);
+ } catch (...) {}
 }
 }  // namespace mmltk::backend::data::benchmark_internal

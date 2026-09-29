@@ -13,8 +13,11 @@
 #include <utility>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "src/backend/data/compiled/compiled_format.h"
+#include "src/backend/data/compiled/compiled_file_utils.h"
+#include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
@@ -38,6 +41,41 @@ struct PreparedBenchmarkSplit {
  std::vector<EncodedImageRecord> images;
  std::vector<PackedInstance> labels;
  std::vector<RLEPair> rle_pairs;
+};
+// Owns compiler-built metadata from checked copy through immutable sealing.
+// Callers can inspect the plan, but cannot mutate admitted records or forge a seal.
+class BenchmarkSplitAssembly final {
+public:
+ BenchmarkSplitAssembly() = default;
+ BenchmarkSplitAssembly(std::string name, std::span<const std::string_view> classes, std::uint32_t resolution,
+  mmltk::backend::imaging::resample::ImageResizeMode);
+ [[nodiscard]] const PreparedBenchmarkSplit& data() const noexcept { return split_; }
+ operator const PreparedBenchmarkSplit&() const noexcept { return split_; }
+ void add_source(std::filesystem::path);
+ [[nodiscard]] std::size_t allocate(std::size_t additional_images, std::size_t labels, std::size_t runs);
+ // Disjoint image/label/run placements may be assembled concurrently. finish
+ // runs only after those jobs settle; it verifies their contiguous coverage.
+ void image(std::size_t slot, EncodedImageRecord, std::span<const PackedInstance>, std::span<const RLEPair>, std::size_t first_run,
+  std::uint64_t ordinal_base, mmltk::common::concurrency::CancellationObservation);
+ void append(BenchmarkSplitAssembly&&);
+private:
+ friend class BenchmarkSplitWriter;
+ void mutable_records() const;
+ void finish(mmltk::common::concurrency::CancellationObservation);
+ PreparedBenchmarkSplit split_;
+ std::vector<ImageEntry> index_;
+ std::vector<std::size_t> run_ends_;
+ std::vector<std::uint8_t> complete_;
+ std::uint32_t resolution_ = 0;
+ mmltk::backend::imaging::resample::ImageResizeMode resize_mode_{};
+ FileLayout layout_{};
+ FileHeader header_{};
+ std::shared_ptr<const catalog::ClassCatalog> catalog_;
+ bool sealed_ = false;
+};
+struct BenchmarkSealedSplit final {
+ BenchmarkStagedArtifact artifact;
+ CompiledDatasetInfo info;
 };
 struct BenchmarkWriteProgressEvent final {
  void* context = nullptr;
@@ -95,6 +133,7 @@ public:
  [[nodiscard]] std::size_t completed() const noexcept;
  // Final membership may only remove slots, preserving canonical order. This
  // performs one forward bounded compaction only when quarantine shrinks it.
+ [[nodiscard]] BenchmarkSealedSplit seal(const BenchmarkWriteRequest&, BenchmarkSplitAssembly* = nullptr);
  void finish(const BenchmarkWriteRequest&);
 
 private:

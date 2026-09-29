@@ -1427,11 +1427,11 @@ NormalizedAnnotationReadView NormalizedAnnotationReadView::select_images(std::ve
  result.positions_ = std::make_shared<const std::vector<std::size_t>>(std::move(positions));
  return result;
 }
-[[nodiscard]] std::vector<std::uint64_t> image_ids(const NormalizedAnnotationReadView& index, const std::optional<std::uint16_t> shard) {
+[[nodiscard]] std::vector<std::uint64_t> image_ids(const NormalizedAnnotationReadView& index) {
  std::vector<std::uint64_t> ids;
  ids.reserve(index.image_count());
  for (const NormalizedImage& image : index.images()) {
-  if (!shard || image.source_shard == *shard) { ids.push_back(image.source_image_id); }
+  ids.push_back(image.source_image_id);
  }
  return ids;
 }

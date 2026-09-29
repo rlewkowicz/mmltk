@@ -188,5 +188,5 @@ struct AnnotationParseOptions {
 std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotation_index(
  const std::filesystem::path& path, const NormalizedAnnotationIndex& index, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {}, StorageReservationPool* storage = nullptr, const nlohmann::json& extension = {});
 void remove_normalized_annotation_index(const std::filesystem::path& path);
-[[nodiscard]] std::vector<std::uint64_t> image_ids(const NormalizedAnnotationReadView&, std::optional<std::uint16_t> shard = std::nullopt);
+[[nodiscard]] std::vector<std::uint64_t> image_ids(const NormalizedAnnotationReadView&);
 }  // namespace mmltk::backend::data::benchmark_internal

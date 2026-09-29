@@ -21,6 +21,7 @@
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
 [[nodiscard]] const CategoryLookup& coconut_categories();
+[[nodiscard]] std::string coconut_image_input_identity(std::string_view annotations, const CoconutPhysicalImage&, std::string_view originals);
 struct CoconutComponentMetadata {
  CoconutEdition edition = CoconutEdition::Base;
  CoconutImageNamespace source = CoconutImageNamespace::CocoTrain;
@@ -72,6 +73,7 @@ public:
  };
  [[nodiscard]] static Read read(std::shared_ptr<const CoconutNativeImage>);
  [[nodiscard]] static BenchmarkLabelInput labels(std::shared_ptr<const CoconutNativeImage>);
+ [[nodiscard]] const std::string& input_identity() const noexcept { return input_identity_; }
  [[nodiscard]] const CoconutNativeLineage& lineage() const noexcept { return *lineage_; }
  [[nodiscard]] const NormalizedImage& image() const noexcept { return image_; }
  [[nodiscard]] std::span<const NormalizedBox> boxes() const noexcept { return boxes_; }
@@ -84,6 +86,7 @@ private:
  friend class CoconutNativeWorkspace;
  explicit CoconutNativeImage(std::shared_ptr<const CoconutNativeLineage> lineage) : lineage_(std::move(lineage)) {}
  std::shared_ptr<const CoconutNativeLineage> lineage_;
+ std::string input_identity_;
  NormalizedImage image_;
  std::vector<NormalizedBox> boxes_;
  std::vector<RLEPair> runs_;
@@ -113,7 +116,7 @@ public:
  [[nodiscard]] std::shared_ptr<const CoconutNativeImage> finish(const CoconutRecord&, const CoconutPhysicalImage&, dataset::MaskDimensions,
   std::shared_ptr<const CoconutNativeLineage>, const CoconutRejectedObject&);
  [[nodiscard]] std::shared_ptr<const CoconutNativeImage> reuse(const CoconutRecord&, const CoconutPhysicalImage&, const NormalizedAnnotationReadView&, std::size_t,
-  const CoconutInventoryImage&, const CoconutRecoveryImage*, std::shared_ptr<const CoconutNativeLineage>);
+  const CoconutInventoryImage&, const CoconutRecoveryImage*, std::shared_ptr<const CoconutNativeLineage>, std::string_view dependency);
  void retire() noexcept;
 private:
  struct SegmentEntry { std::uint32_t id = 0; std::size_t index = 0; };

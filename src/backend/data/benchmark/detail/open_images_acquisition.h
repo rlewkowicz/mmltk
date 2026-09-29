@@ -32,5 +32,7 @@ struct AcquiredOpenImages {
  const std::optional<ImageDecodeProbe> decode_probe = std::nullopt, BenchmarkCompilePipeline* execution = nullptr,
  const std::function<std::string(std::uint64_t)>& image_url = {},
  // Effect-only observation before a bounded cache worker opens its warm input.
- const std::function<void(std::uint64_t)>& warm_read = {});
+ const std::function<void(std::uint64_t)>& warm_read = {},
+ // Effect-only owner observation after repaired encoded input is retained, before its consumer.
+ const std::function<void(std::uint64_t)>& repair_input = {});
 }  // namespace mmltk::backend::data::benchmark_internal

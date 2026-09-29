@@ -4,6 +4,8 @@
 #include <array>
 #include <atomic>
 #include <future>
+#include <memory>
+#include <string_view>
 #include <optional>
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -882,4 +884,54 @@ TEST_CASE("empty compiled datasets retain their format admission failure", "[bac
  DatasetLoader::Config config;
  config.compiled_path = path.string();
  CHECK_THROWS_AS(DatasetLoader(config), std::runtime_error);
+}
+
+TEST_CASE("compiled owner admits all record sections in its metadata construction", "[backend][data][roundtrip][admission]") {
+ mmltk::testsupport::ScopedTempDir root("compiled-fused-admission");
+ const auto path = root.path() / "dataset.bin";
+ const auto defect = GENERATE("none", "extent", "dimensions", "source identity", "source category", "flags", "label span", "class", "zero run", "overlap", "canvas", "coverage");
+ CAPTURE(defect);
+ std::array<ImageEntry, 2> images{};
+ std::array<PackedInstance, 2> labels{};
+ std::vector<RLEPair> runs{{0, 1}, {4, 2}};
+ const std::array<std::string, 1> names{"person"};
+ for (std::size_t i = 0; i < images.size(); ++i) {
+  images[i].original_width = images[i].original_height = 4;
+  images[i].has_source_image_id = 1; images[i].source_image_id = i + 1; images[i].source = AnnotationSource::Coco;
+  images[i].num_instances = 1; images[i].label_offset = static_cast<std::uint32_t>(i * sizeof(PackedInstance)); images[i].label_bytes = sizeof(PackedInstance);
+  labels[i].bbox_x2 = labels[i].bbox_y2 = 4;
+  labels[i].flags = kAnnotationMask | kAnnotationCategory; labels[i].source_category_id = 1;
+ }
+ labels[0].mask_rle_pairs = 2;
+ labels[1].mask_rle_offset = runs.size() * sizeof(RLEPair); // A present-empty mask.
+ const std::string_view bad = defect;
+ if (bad == "dimensions") images[1].original_height = 0;
+ if (bad == "source identity") images[0].has_source_image_id = 0;
+ if (bad == "source category") { labels[0].flags &= ~kAnnotationCategory; labels[0].source_category_id = 0; }
+ if (bad == "flags") labels[1].flags |= 128;
+ if (bad == "label span") images[1].label_offset = 0;
+ if (bad == "class") labels[1].class_id = 1;
+ if (bad == "zero run") runs[0].length = 0;
+ if (bad == "overlap") runs[1].start = 0;
+ if (bad == "canvas") runs[1] = {15, 2};
+ if (bad == "coverage") runs.push_back({8, 1});
+ auto layout = compute_pixel_layout(images.size(), 4U * 4U * 3U * sizeof(float));
+ finalize_layout(layout, {labels.size(), runs.size()});
+ auto header = make_file_header({2, 4, 4, 3, 1, 4U * 4U * 3U * sizeof(float)}, names, layout);
+ for (std::size_t i = 0; i < images.size(); ++i) images[i].pixel_offset = layout.pixel_offset + i * header.image_stride;
+ if (bad == "extent") ++header.total_file_size;
+ const auto file = mmltk::common::io::FileHandle::create_output(path.string(), layout.total_size);
+ file.pwrite_all(&header, sizeof(header), 0);
+ file.pwrite_all(images.data(), sizeof(images), layout.index_offset);
+ file.pwrite_all(labels.data(), sizeof(labels), layout.label_offset);
+ file.pwrite_all(runs.data(), runs.size() * sizeof(RLEPair), layout.rle_offset);
+ if (bad != "none") { CHECK_THROWS(CompiledDataset::open(path)); return; }
+ const auto source = std::make_shared<const CompiledDataset>(CompiledDataset::open(path));
+ CHECK(source->label_index().size() == 2);
+ CHECK(source->masks_available());
+ CHECK(source->image_labels(1).front().has_mask());
+ CHECK(source->instance_rle(source->image_labels(1).front()).empty());
+ const auto shared = source;
+ CHECK(shared->labels().data() == source->labels().data());
+ CHECK(shared->rle_pairs().data() == source->rle_pairs().data());
 }
