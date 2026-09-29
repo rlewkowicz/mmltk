@@ -448,9 +448,11 @@ void test_benchmark_supplemental_sampling() {
  source.source = BenchmarkDatasetSource::kObjects365V2;
  source.split = "train";
  source.annotation_sha256 = "synthetic";
- constexpr std::size_t kImageCount = 60U;
+ // Every shard contributes 200 images to each class. Three shards meet the
+ // 512-image coverage floor, so unequal archive costs change the chosen set.
+ constexpr std::size_t kImageCount = 2400U;
  source.images.reserve(kImageCount);
- source.boxes.reserve(kImageCount + 12U);
+ source.boxes.reserve(kImageCount + kImageCount / 5U);
  std::array<std::uint32_t, kImageCount> original_box_counts{};
  for (std::size_t image_index = 0U; image_index < kImageCount; ++image_index) {
   const std::uint64_t first_box = source.boxes.size();
@@ -468,7 +470,7 @@ void test_benchmark_supplemental_sampling() {
   box.original_area = 3.25 + static_cast<double>(i);
   box.annotation_id = 800 + i;
   box.source_category_id = 30 + i;
-  box.source_ordinal = 900 - i;
+  box.source_ordinal = source.boxes.size() + 900 - i;
   if (box.mask_rle_pairs) {
    source.mask_rle_pairs.push_back({static_cast<std::uint32_t>(i), 1});
    source.mask_rle_pairs.push_back({static_cast<std::uint32_t>(i + 100), 2});
@@ -476,70 +478,232 @@ void test_benchmark_supplemental_sampling() {
  }
  NormalizedAnnotationBuilder coco;
  coco.source = BenchmarkDatasetSource::kCoco2017;
+ for (std::uint64_t id = 0; id < 12; ++id) {
+  coco.images.push_back(NormalizedImage{id, coco.boxes.size(), 2, 640, 480, 0, 0});
+  coco.boxes.push_back(NormalizedBox{0.1F, 0.2F, 0.8F, 0.9F, 0, 0, 0, {}});
+  coco.boxes.push_back(NormalizedBox{0.2F, 0.3F, 0.7F, 0.8F, 0, 0, 0, {}});
+ }
  NormalizedAnnotationBuilder open_images = source;
  open_images.source = BenchmarkDatasetSource::kOpenImagesV7;
+ source.completion = std::make_shared<NormalizedAnnotationCompletion>();
+ open_images.completion = std::make_shared<NormalizedAnnotationCompletion>();
+ auto object_index = fixture_index(source);
+ auto open_index = fixture_index(open_images);
+ const auto coco_index = fixture_index(coco);
  const std::array<std::uint64_t, 4U> shard_bytes{1U, 1U, 1U, 1U};
- const CombinedSupplementalSamplingResult first_combined = sample_combined_supplemental_indices(fixture_index(coco), fixture_index(source), fixture_index(open_images), shard_bytes);
- BenchmarkCompilePipeline sampling_execution(3);
- const CombinedSupplementalSamplingResult second_combined = sample_combined_supplemental_indices(fixture_index(coco), fixture_index(source), fixture_index(open_images), shard_bytes, {}, &sampling_execution);
+ const std::array<std::uint64_t, 4U> unequal_bytes{9U, 1U, 2U, 3U};
+ const CombinedSupplementalSamplingResult first_combined = sample_combined_supplemental_indices(coco_index, object_index, open_index, shard_bytes);
+ const CombinedSupplementalSamplingResult cheaper = sample_combined_supplemental_indices(coco_index, object_index, open_index, unequal_bytes);
+ CHECK(first_combined.objects365_shards == std::vector<std::uint16_t>{0U, 1U, 2U});
+ CHECK(first_combined.objects365_archive_bytes == 3U);
+ CHECK(cheaper.objects365_shards == std::vector<std::uint16_t>{1U, 2U, 3U});
+ CHECK(cheaper.objects365_archive_bytes == 6U);
  const SupplementalSamplingResult& first = first_combined.objects365;
- const SupplementalSamplingResult& second = second_combined.objects365;
  REQUIRE(first.stats.full_images == kImageCount);
  REQUIRE(first.stats.full_boxes == source.boxes.size());
  REQUIRE(first_combined.target_images == (kImageCount * 2U) / 6U);
  REQUIRE(first.stats.selected_images + first_combined.open_images.stats.selected_images == first_combined.target_images);
  REQUIRE(first_combined.open_images.stats.selected_images >= first_combined.open_images_floor);
  REQUIRE(first_combined.open_images.stats.selected_images <= first_combined.open_images_ceiling);
- for (const auto* selected : {&first_combined.objects365.view, &first_combined.open_images.view}) {
-  CHECK(reject_json(selected->rejected) == reject_json(source.rejected));
-  std::size_t boxes = 0, runs = 0;
-  for (const auto& image : selected->images()) {
-   const auto& expected_image = source.images[image.source_image_id];
-   CHECK(std::memcmp(&image, &expected_image, sizeof(NormalizedImage)) == 0);
-   CHECK(&image == &selected->storage().images[image.source_image_id]);
-   for (const auto& box : selected->storage().boxes.subspan(image.first_box, image.box_count)) {
-    for (const auto& run : selected->storage().mask_rle_pairs.subspan(box.mask_rle_offset, box.mask_rle_pairs)) {
-     CHECK(run.length != 0);
-     ++runs;
-    }
-    ++boxes;
-   }
+ // Repeated boxes of one class count once per image, in both class and shard
+ // summaries. This also fixes the baseline independently of worker agreement.
+ for (const auto* selected : {&first_combined.objects365, &first_combined.open_images}) {
+  for (std::size_t class_id = 0; class_id < selected->stats.available_class_images.size(); ++class_id) {
+   CHECK(selected->stats.available_class_images[class_id] == (class_id < 3U ? kImageCount / 3U : 0U));
   }
-  CHECK(boxes == selected->box_count());
-  CHECK(runs == selected->run_count());
-  CHECK(selected->storage().boxes.size() == source.boxes.size());
+ }
+ const auto check_views = [&](const CombinedSupplementalSamplingResult& sample) {
+  for (const auto* selected : {&sample.objects365, &sample.open_images}) {
+   const auto& view = selected->view;
+   const auto& backing = selected == &sample.objects365 ? object_index : open_index;
+   CHECK(view.source == backing.source);
+   CHECK(view.split == backing.split);
+   CHECK(view.annotation_sha256 == backing.annotation_sha256);
+   CHECK(view.completion == backing.completion);
+   CHECK(view.storage().backing == backing.backing);
+   CHECK(view.storage().images.data() == backing.images.data());
+   CHECK(view.storage().boxes.data() == backing.boxes.data());
+   CHECK(view.storage().mask_rle_pairs.data() == backing.mask_rle_pairs.data());
+   CHECK(reject_json(view.rejected) == reject_json(source.rejected));
+   REQUIRE(view.storage().images.size() == source.images.size());
+   REQUIRE(view.storage().boxes.size() == source.boxes.size());
+   REQUIRE(view.storage().mask_rle_pairs.size() == source.mask_rle_pairs.size());
+   CHECK(std::memcmp(view.storage().images.data(), source.images.data(), source.images.size() * sizeof(NormalizedImage)) == 0);
+   CHECK(std::memcmp(view.storage().boxes.data(), source.boxes.data(), source.boxes.size() * sizeof(NormalizedBox)) == 0);
+   CHECK(std::memcmp(view.storage().mask_rle_pairs.data(), source.mask_rle_pairs.data(), source.mask_rle_pairs.size() * sizeof(RLEPair)) == 0);
+   std::size_t boxes = 0, runs = 0;
+   std::array<std::uint64_t, 80> class_images{};
+   std::uint64_t previous_id = 0;
+   for (std::size_t position = 0; position < view.image_count(); ++position) {
+    const auto& image = view.image(position);
+    CHECK(view.source_position(position) == image.source_image_id);
+    CHECK(&image == &backing.images[image.source_image_id]);
+    CHECK((position == 0 || image.source_image_id > previous_id));
+    previous_id = image.source_image_id;
+    REQUIRE(image.box_count == original_box_counts[image.source_image_id]);
+    std::array<bool, 80> classes{};
+    for (const auto& box : view.storage().boxes.subspan(image.first_box, image.box_count)) {
+     classes[box.class_id] = true;
+     for (const auto& run : view.storage().mask_rle_pairs.subspan(box.mask_rle_offset, box.mask_rle_pairs)) {
+      CHECK(run.length != 0);
+      ++runs;
+     }
+     ++boxes;
+    }
+    for (std::size_t class_id = 0; class_id < classes.size(); ++class_id) class_images[class_id] += classes[class_id];
+   }
+   CHECK(class_images == selected->stats.selected_class_images);
+   CHECK(boxes == view.box_count());
+   CHECK(runs == view.run_count());
+   CHECK(selected->stats.selected_images == view.image_count());
+   CHECK(selected->stats.selected_boxes == view.box_count());
+  }
+ };
+ const auto check_agreement = [&](const CombinedSupplementalSamplingResult& expected, const CombinedSupplementalSamplingResult& actual) {
+  CHECK(actual.target_images == expected.target_images);
+  CHECK(actual.open_images_floor == expected.open_images_floor);
+  CHECK(actual.open_images_ceiling == expected.open_images_ceiling);
+  CHECK(actual.objects365_shards == expected.objects365_shards);
+  CHECK(actual.objects365_archive_bytes == expected.objects365_archive_bytes);
+  for (const bool objects : {true, false}) {
+   const auto& left = objects ? expected.objects365 : expected.open_images;
+   const auto& right = objects ? actual.objects365 : actual.open_images;
+   CHECK(right.stats.full_images == left.stats.full_images);
+   CHECK(right.stats.full_boxes == left.stats.full_boxes);
+   CHECK(right.stats.selected_images == left.stats.selected_images);
+   CHECK(right.stats.selected_boxes == left.stats.selected_boxes);
+   CHECK(right.stats.available_class_images == left.stats.available_class_images);
+   CHECK(right.stats.selected_class_images == left.stats.selected_class_images);
+   CHECK(image_ids(right.view) == image_ids(left.view));
+   CHECK(right.view.run_count() == left.view.run_count());
+  }
+  check_views(actual);
+ };
+ check_views(first_combined);
+ check_views(cheaper);
+ for (const std::size_t workers : {1U, 3U}) {
+  BenchmarkCompilePipeline sampling_execution(workers);
+  for (const bool unequal : {false, true}) {
+   const auto repeated = sample_combined_supplemental_indices(coco_index, object_index, open_index, unequal ? unequal_bytes : shard_bytes, {}, &sampling_execution);
+   check_agreement(unequal ? cheaper : first_combined, repeated);
+  }
+  CHECK(sampling_execution.try_reserve({sampling_execution.transient_target(), 0}).has_value());
+  for (const auto invalid_shard : {std::uint16_t{4}, std::numeric_limits<std::uint16_t>::max()}) {
+   auto invalid = source;
+   invalid.images.back().source_shard = invalid_shard;
+   CHECK_THROWS_WITH(sample_combined_supplemental_indices(coco_index, fixture_index(invalid), open_index, shard_bytes, {}, &sampling_execution),
+    "Objects365 annotation references an unknown image shard");
+   CHECK(sampling_execution.try_reserve({sampling_execution.transient_target(), 0}).has_value());
+  }
+  CHECK_THROWS_WITH(sample_combined_supplemental_indices(coco_index, object_index, open_index, {}, {}, &sampling_execution),
+   "Objects365 sampler requires archive byte identities");
+ }
+ enum class SelectionOutcome { Complete, CancelWaiting, CancelAdmitted };
+ for (const auto outcome : {SelectionOutcome::Complete, SelectionOutcome::CancelWaiting, SelectionOutcome::CancelAdmitted}) {
+  std::atomic<bool> cancelled{false};
+  std::promise<void> waiting;
+  mmltk::testsupport::TestGate admitted("sampler holds its complete workspace");
+  mmltk::testsupport::TestGate greedy("greedy sampler retains source selection storage");
+  mmltk::testsupport::TestGate positions("selected views retain construction allowance");
+  struct SelectionObservation {
+   mmltk::testsupport::TestGate& admitted;
+   mmltk::testsupport::TestGate& greedy;
+   mmltk::testsupport::TestGate& positions;
+   const std::atomic<bool>& stop;
+   std::thread::id controller;
+   mutable std::atomic<bool> observed{false}, building_views{false}, observed_view{false};
+   bool cancelled() const noexcept {
+    // Source jobs and final views run on the CPU owner. The controller's
+    // intervening cancellation point belongs to the dependent greedy loop.
+    if (std::this_thread::get_id() == controller) {
+     greedy.receipt().ArriveAndWait();
+     building_views.store(true);
+    } else if (building_views.load()) {
+     if (!observed_view.exchange(true)) positions.receipt().ArriveAndWait();
+    } else if (!observed.exchange(true)) admitted.receipt().ArriveAndWait();
+    return stop.load();
+   }
+  } observation{admitted, greedy, positions, cancelled, {}};
+  struct AdmissionObservation {
+   const std::atomic<bool>& stop;
+   std::promise<void>& waiting;
+   mutable std::size_t checks = 0;
+   static bool& sampler_thread() { thread_local bool value = false; return value; }
+   bool cancelled() const noexcept {
+    // reserve checks cancellation, records its resource waiter, then checks
+    // the wait predicate. Signal that existing causal boundary without
+    // blocking while the pipeline mutex is held.
+    if (sampler_thread() && ++checks == 2) mmltk::testsupport::release_test_promise(waiting);
+    return stop.load();
+   }
+  } admission{cancelled, waiting};
+  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1}, mmltk::common::concurrency::CancellationObservation::Borrow(admission));
+  auto held = execution.reserve({1, 0});
+  auto work = std::async(std::launch::async, [&] {
+   AdmissionObservation::sampler_thread() = true;
+   observation.controller = std::this_thread::get_id();
+   return sample_combined_supplemental_indices(coco_index, object_index, open_index, unequal_bytes,
+    mmltk::common::concurrency::CancellationObservation::Borrow(observation), &execution);
+  });
+  const mmltk::testsupport::ScopedTestCleanup release([&] {
+   cancelled.store(true); held = {}; admitted.Release(); greedy.Release(); positions.Release(); execution.notify_admission_change();
+  });
+  mmltk::testsupport::await_test_promise(waiting, "sampler waits for its complete allowance");
+  CHECK(execution.resource_pressure());
+  CHECK_FALSE(observation.observed.load());
+  CHECK(work.wait_for(0ms) == std::future_status::timeout);
+  // The waiting sampler has not taken the only CPU. Independent ready work
+  // can run before the competing transient allocation retires.
+  bool independent_ran = false;
+  execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) { independent_ran = true; });
+  CHECK(independent_ran);
+  if (outcome == SelectionOutcome::CancelWaiting) {
+   cancelled.store(true);
+   execution.notify_admission_change();
+  } else {
+   held = {};
+   REQUIRE(admitted.WaitEntered(2s));
+   CHECK_FALSE(execution.try_reserve({1, 0}).has_value());
+   cancelled.store(outcome == SelectionOutcome::CancelAdmitted);
+   admitted.Release();
+  }
+  if (outcome == SelectionOutcome::Complete) {
+   REQUIRE(greedy.WaitEntered(2s));
+   CHECK_FALSE(execution.try_reserve({1, 0}).has_value());
+   greedy.Release();
+   REQUIRE(positions.WaitEntered(2s));
+   CHECK_FALSE(execution.try_reserve({1, 0}).has_value());
+   positions.Release();
+   const auto sampled = mmltk::testsupport::await_test_future(work, "oversized sampling after resource pressure");
+   check_agreement(cheaper, sampled);
+   // Retained selected positions/backing outlive transient sampler credits.
+   CHECK(execution.try_reserve({1, 0}).has_value());
+  } else {
+   CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(work, "cancelled sampling"), "benchmark dataset compilation cancelled");
+  }
+  cancelled.store(false);
+  held = {};
+  CHECK(execution.try_reserve({1, 0}).has_value());
  }
  REQUIRE(first.view.image_count() != 0);
  const auto nested = first.view.select_images({0});
  CHECK(nested.source_position(0) == first.view.source_position(0));
  CHECK(&nested.image(0) == &first.view.image(0));
  CHECK_THROWS(nested.source_position(nested.image_count()));
- REQUIRE(first.stats.selected_boxes == first.view.box_count());
- REQUIRE(first.view.image_count() == second.view.image_count());
- REQUIRE(first.view.box_count() == second.view.box_count());
- std::uint64_t previous_id = 0;
- for (std::size_t position = 0; position < first.view.image_count(); ++position) {
-  const auto& selected = first.view.image(position);
-  const auto& repeated = second.view.image(position);
-  CHECK(first.view.source_position(position) == selected.source_image_id);
-  CHECK(std::memcmp(&selected, &repeated, sizeof(NormalizedImage)) == 0);
-  CHECK((position == 0 || selected.source_image_id > previous_id));
-  previous_id = selected.source_image_id;
-  REQUIRE(selected.box_count == original_box_counts[selected.source_image_id]);
-  for (std::size_t offset = 0; offset < selected.box_count; ++offset) {
-   const auto& box = first.view.storage().boxes[selected.first_box + offset];
-   CHECK(std::memcmp(&box, &source.boxes[selected.first_box + offset], sizeof(NormalizedBox)) == 0);
-   CHECK(std::memcmp(&box, &second.view.storage().boxes[selected.first_box + offset], sizeof(NormalizedBox)) == 0);
-   for (std::size_t run = box.mask_rle_offset; run < box.mask_rle_offset + box.mask_rle_pairs; ++run) {
-    CHECK(first.view.storage().mask_rle_pairs[run].start == source.mask_rle_pairs[run].start);
-    CHECK(first.view.storage().mask_rle_pairs[run].length == source.mask_rle_pairs[run].length);
-   }
-  }
- }
+ const std::weak_ptr<NormalizedAnnotationBacking> retained = object_index.backing;
+ const auto* retained_boxes = object_index.boxes.data();
+ object_index = {};
+ open_index = {};
+ CHECK_FALSE(retained.expired());
+ CHECK(first.view.storage().boxes.data() == retained_boxes);
+ CHECK(first.view.completion == source.completion);
+ CHECK(std::memcmp(first.view.storage().boxes.data(), source.boxes.data(), source.boxes.size() * sizeof(NormalizedBox)) == 0);
+ CHECK(std::memcmp(first.view.storage().mask_rle_pairs.data(), source.mask_rle_pairs.data(), source.mask_rle_pairs.size() * sizeof(RLEPair)) == 0);
  std::array<std::uint64_t, 80U> combined_class_images{};
  for (std::size_t class_id = 0U; class_id < combined_class_images.size(); ++class_id) {
   combined_class_images[class_id] = first.stats.selected_class_images[class_id] + first_combined.open_images.stats.selected_class_images[class_id];
  }
+ combined_class_images[0] += coco.images.size();
  const auto [minimum, maximum] = std::ranges::minmax_element(combined_class_images.begin(), combined_class_images.begin() + 3);
  REQUIRE(*maximum - *minimum <= 1U);
  REQUIRE(std::ranges::all_of(combined_class_images.begin() + 3, combined_class_images.end(), [](const std::uint64_t count) { return count == 0U; }));

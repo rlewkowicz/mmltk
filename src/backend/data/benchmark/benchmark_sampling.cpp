@@ -38,6 +38,36 @@ struct ShardSummary {
  std::uint64_t images = 0U;
  std::array<std::uint64_t, kClassCount> class_images{};
 };
+[[nodiscard]] std::uint64_t selection_workspace_bytes(const NormalizedAnnotationIndex& objects365, const NormalizedAnnotationIndex& open_images,
+ const std::size_t shards, const std::uint64_t selected_images) {
+ using mmltk::common::math::checked_add;
+ using mmltk::common::math::checked_multiply;
+ constexpr auto overflow = "supplemental selection workspace overflow";
+ // Fixed class arrays, vector/dispatch/view control records and routine call
+ // frames. This is a construction allowance, not a process RSS limit.
+ std::uint64_t bytes = 64U << 10;
+ const auto include = [&](const std::uint64_t count, const std::uint64_t width) {
+  bytes = checked_add(bytes, checked_multiply(count, width, overflow), overflow);
+ };
+ for (const auto* source : {&objects365, &open_images}) {
+  const auto images = checked_cast<std::uint64_t>(source->images.size(), overflow);
+  const auto boxes = checked_cast<std::uint64_t>(source->boxes.size(), overflow);
+  const auto incidences = std::min(boxes, checked_multiply(images, std::uint64_t{kClassCount}, overflow));
+  include(images, sizeof(ClassMembership) + sizeof(HashedImage) + sizeof(std::uint8_t));
+  // GCC's vector push growth doubles capacity. All class queues together have
+  // <2C slots, plus <=C old slots during a reallocation, where C <= min(A,80N).
+  include(incidences, 3U * sizeof(std::uint32_t));
+  // In-place introsort has at most two recursive levels per key-count bit;
+  // allow 512 bytes per frame, separately for the concurrent source sorts.
+  include(std::bit_width(images) + 1U, 2U * 512U);
+ }
+ include(checked_cast<std::uint64_t>(shards, overflow), sizeof(ShardSummary) + 2U * sizeof(std::uint8_t) + sizeof(std::uint16_t));
+ // Both final position arrays can be constructed concurrently. They and the
+ // chosen shard IDs become retained products; immutable source backing is
+ // already retained by the inputs and is not charged again here.
+ include(selected_images, sizeof(std::size_t));
+ return bytes;
+}
 [[nodiscard]] std::uint64_t sampling_hash(const BenchmarkDatasetSource source, const std::uint64_t image_id) noexcept {
  constexpr std::uint64_t kRevisionSeed = 0xC080BA1A6CED0002ULL;
  const std::uint64_t source_seed = static_cast<std::uint64_t>(source) * 0xD6E8FEB86659FD93ULL;
@@ -75,13 +105,20 @@ private:
  std::uint64_t high_ = 0U;
 };
 void build_memberships(
- const NormalizedAnnotationIndex& source, SupplementalSamplingStats* stats, std::vector<ClassMembership>* memberships, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+ const NormalizedAnnotationIndex& source, SupplementalSamplingStats* stats, std::vector<ClassMembership>* memberships, const std::span<ShardSummary> shards,
+ mmltk::common::concurrency::CancellationObservation cancel_requested) {
  stats->full_images = source.images.size();
  stats->full_boxes = source.boxes.size();
  if (memberships) memberships->resize(source.images.size());
  for (std::size_t image_index = 0U; image_index < source.images.size(); ++image_index) {
   if ((image_index & 4095U) == 0U) { throw_if_cancelled(cancel_requested); }
   const NormalizedImage& image = source.images[image_index];
+  ShardSummary* shard = nullptr;
+  if (!shards.empty()) {
+   if (image.source_shard >= shards.size()) { throw std::runtime_error("Objects365 annotation references an unknown image shard"); }
+   shard = &shards[image.source_shard];
+   ++shard->images;
+  }
   if (image.box_count == 0U || image.first_box > source.boxes.size() || image.box_count > source.boxes.size() - image.first_box) {
    throw std::runtime_error("supplemental sampler received an invalid image box span");
   }
@@ -95,24 +132,14 @@ void build_memberships(
   if (membership.low == 0U && membership.high == 0U) { throw std::runtime_error("supplemental sampler received an image without mapped classes"); }
   if (memberships) (*memberships)[image_index] = membership;
   ClassMembershipCursor classes(membership);
-  while (const auto class_id = classes.next()) { ++stats->available_class_images[*class_id]; }
- }
-}
-[[nodiscard]] std::vector<std::uint16_t> choose_objects365_shards(const NormalizedAnnotationIndex& objects365, const std::span<const ClassMembership> memberships,
- const std::array<std::uint64_t, kClassCount>& full_class_images, const std::span<const std::uint64_t> shard_bytes, const std::uint64_t required_images, std::uint64_t* selected_archive_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested) {
- if (shard_bytes.empty()) { throw std::runtime_error("Objects365 sampler requires archive byte identities"); }
- std::vector<ShardSummary> summaries(shard_bytes.size());
- for (std::size_t image_index = 0U; image_index < objects365.images.size(); ++image_index) {
-  if ((image_index & 4095U) == 0U) { throw_if_cancelled(cancel_requested); }
-  const std::uint16_t shard = objects365.images[image_index].source_shard;
-  if (shard >= summaries.size()) { throw std::runtime_error("Objects365 annotation references an unknown image shard"); }
-  ShardSummary& summary = summaries[shard];
-  ++summary.images;
-  ClassMembershipCursor classes(memberships[image_index]);
   while (const auto class_id = classes.next()) {
-   ++summary.class_images[*class_id];
+   ++stats->available_class_images[*class_id];
+   if (shard) ++shard->class_images[*class_id];
   }
  }
+}
+[[nodiscard]] std::vector<std::uint16_t> choose_objects365_shards(const std::span<const ShardSummary> summaries,
+ const std::array<std::uint64_t, kClassCount>& full_class_images, const std::span<const std::uint64_t> shard_bytes, const std::uint64_t required_images, std::uint64_t* selected_archive_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  const std::uint64_t headroom_images =
   checked_cast<std::uint64_t>((static_cast<unsigned long long>(required_images) * kShardCandidateHeadroomNumerator + kShardCandidateHeadroomDenominator - 1U) / kShardCandidateHeadroomDenominator,
    "Objects365 sampling headroom overflow");
@@ -252,8 +279,15 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
  if (objects365.images.size() < kSupplementalBudgetDenominator || open_images.images.size() < kSupplementalBudgetDenominator) {
   throw std::runtime_error("supplemental sources are too small for benchmark sampling");
  }
+ if (objects365_shard_bytes.empty()) { throw std::runtime_error("Objects365 sampler requires archive byte identities"); }
+ const auto target_images = objects365.images.size() / kSupplementalBudgetDenominator + open_images.images.size() / kSupplementalBudgetDenominator;
+ // Reserve once on the source controller, before any CPU job or allocation.
+ // Declaration order keeps credits until every transient vector and borrowed
+ // callback below has retired, including exceptional exits. Child jobs draw
+ // no additional credits and remain independently runnable when oversized.
+ const auto workspace = execution ? execution->reserve({selection_workspace_bytes(objects365, open_images, objects365_shard_bytes.size(), target_images), 0}) : BenchmarkAllowance{};
  CombinedSupplementalSamplingResult result;
- result.target_images = objects365.images.size() / kSupplementalBudgetDenominator + open_images.images.size() / kSupplementalBudgetDenominator;
+ result.target_images = target_images;
  result.open_images_floor = std::max<std::uint64_t>(1U, result.target_images / kOpenImagesDiversityDenominator);
  result.open_images_ceiling = std::max(result.open_images_floor, result.target_images / kOpenImagesMaximumDenominator);
  const std::uint64_t required_objects = result.target_images - result.open_images_floor;
@@ -266,14 +300,15 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
  SourceSelection object_selection, open_selection;
  SupplementalSamplingStats coco_stats;
  parallel(3, [&](std::size_t source) {
-  if (source == 2) { build_memberships(coco_train, &coco_stats, nullptr, cancel_requested); return; }
+  if (source == 2) { build_memberships(coco_train, &coco_stats, nullptr, {}, cancel_requested); return; }
   SupplementalSamplingStats stats;
   std::vector<ClassMembership> memberships;
+  std::vector<ShardSummary> shards(source == 0 ? objects365_shard_bytes.size() : 0);
   const auto& index = source == 0 ? objects365 : open_images;
-  build_memberships(index, &stats, &memberships, cancel_requested);
+  build_memberships(index, &stats, &memberships, shards, cancel_requested);
   std::vector<std::uint8_t> eligible;
   if (source == 0) {
-   result.objects365_shards = choose_objects365_shards(objects365, memberships, stats.available_class_images, objects365_shard_bytes, required_objects, &result.objects365_archive_bytes, cancel_requested);
+   result.objects365_shards = choose_objects365_shards(shards, stats.available_class_images, objects365_shard_bytes, required_objects, &result.objects365_archive_bytes, cancel_requested);
    eligible.resize(objects365_shard_bytes.size());
    for (const auto shard : result.objects365_shards) eligible[shard] = 1;
   }
