@@ -1,7 +1,9 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include <cstdint>
+#include <functional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
@@ -19,6 +21,23 @@ struct CoconutReleaseComponent {
  std::string_view revision;
  std::uint64_t expected_rows;
  std::vector<CatalogArtifact> annotations;
+};
+struct RecipeImageArchive {
+ CoconutImageNamespace source;
+ std::uint16_t shard = 0;
+ std::string cache_shard;
+ CatalogArtifact artifact;
+};
+enum class CoconutReleaseBoundary { MetadataConsumed, MasksStarted };
+// Private ordinary catalog facts are also used by bounded local release fixtures.
+struct CoconutRecipeCatalog {
+ std::vector<CoconutReleaseComponent> releases;
+ std::vector<RecipeImageArchive> images;
+ CatalogArtifact stock_annotations;
+ std::uint64_t coco_validation_images = 5000U;
+ // Effect-only production-boundary notification, called outside owner/reporter
+ // locks. It neither selects work nor supplies readiness or cache decisions.
+ std::function<void(CoconutEdition, CoconutReleaseBoundary)> release_observer;
 };
 inline constexpr std::string_view kCoconutNormalizationRevision = "coconut-exact-rgb-rle-v1";
 [[nodiscard]] std::span<const CoconutReleaseComponent> coconut_release_catalog();

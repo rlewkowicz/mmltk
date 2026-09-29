@@ -1,4 +1,7 @@
 #include "src/backend/data/tests/test_fixture.h"
+#include "src/backend/data/benchmark/detail/benchmark_writer.h"
+#include "src/backend/data/benchmark/detail/benchmark_labels.h"
+#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
 #include <map>
 #include "src/backend/data/compiler/dataset_compiler.h"

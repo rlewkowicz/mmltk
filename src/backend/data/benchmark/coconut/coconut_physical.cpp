@@ -1,12 +1,12 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
-#include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_inventory_io.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
-#include "src/backend/data/benchmark/detail/benchmark_recipe.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/io/file_digest.h"
@@ -14,7 +14,6 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -33,12 +32,6 @@ namespace {
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
 namespace common_io = mmltk::common::io;
 [[noreturn]] void invalid(std::string_view detail) { throw CoconutInputError("COCONut: " + std::string(detail)); }
-std::uint64_t decimal(std::string_view value) {
- std::uint64_t id = 0;
- const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), id);
- if (value.empty() || error != std::errc{} || end != value.data() + value.size() || value.front() == '+' || value.front() == '-') invalid("invalid decimal image identity: " + std::string(value));
- return id;
-}
 std::optional<CoconutPhysicalName> admit_record(CoconutEdition edition, const CoconutRecord& record) {
  if (edition == CoconutEdition::Base || edition == CoconutEdition::RelabeledValidation) {
   if (parse_coconut_coco_member(record.file_name) != record.image_id) invalid("COCO row filename/image_id mismatch: " + record.file_name);
@@ -49,35 +42,6 @@ std::optional<CoconutPhysicalName> admit_record(CoconutEdition edition, const Co
  return physical;
 }
 }  // namespace
-CoconutPhysicalName parse_coconut_objects_member(std::string_view name) {
- const std::filesystem::path path(canonical_benchmark_archive_member(name));
- const auto extension = path.extension().string();
- if (!extension.empty() && extension != ".png" && extension != ".jpg" && extension != ".json") invalid("unsupported Objects365 member: " + std::string(name));
- const auto stem = path.stem().string();
- constexpr std::string_view v1 = "objects365_v1_", v2 = "objects365_v2_";
- const auto source = stem.starts_with(v1) ? CoconutImageNamespace::Objects365V1 : CoconutImageNamespace::Objects365V2;
- const auto prefix = source == CoconutImageNamespace::Objects365V1 ? v1 : v2;
- if (!stem.starts_with(prefix) || stem.size() != prefix.size() + 8U) invalid("invalid full Objects365 namespace/member: " + std::string(name));
- return {source, decimal(std::string_view(stem).substr(prefix.size())), stem};
-}
-std::uint64_t parse_coconut_coco_member(std::string_view name) {
- const std::filesystem::path path(canonical_benchmark_archive_member(name));
- if ((path.extension() != ".jpg" && path.extension() != ".png") || path.stem().string().size() != 12U) invalid("invalid COCO filename: " + std::string(name));
- return decimal(path.stem().string());
-}
-void validate_coconut_physical_image(const CoconutPhysicalImage& image) {
- (void)coconut_namespace_name(image.source);
- if (image.archive_identity.empty() || image.member != canonical_benchmark_archive_member(image.member)) invalid("invalid physical inventory identity");
- if (std::filesystem::path(image.member).extension() != ".jpg") invalid("physical member is not JPEG: " + image.member);
- if (image.source == CoconutImageNamespace::Objects365V1 || image.source == CoconutImageNamespace::Objects365V2) {
-  const auto name = parse_coconut_objects_member(image.member);
-  if (name.source != image.source || name.id != image.image_id) invalid("contradictory Objects365 physical identity: " + image.member);
- } else {
-  if (parse_coconut_coco_member(image.member) != image.image_id) invalid("contradictory COCO physical identity: " + image.member);
-  const std::string_view directory = image.source == CoconutImageNamespace::CocoTrain ? "train2017/" : image.source == CoconutImageNamespace::CocoUnlabeled ? "unlabeled2017/" : "val2017/";
-  if (!image.member.starts_with(directory)) invalid("COCO physical subset disagrees with archive member: " + image.member);
- }
-}
 std::span<const CoconutImageNamespace> coconut_release_sources(CoconutEdition edition) {
  static constexpr CoconutImageNamespace base[]{CoconutImageNamespace::CocoTrain, CoconutImageNamespace::CocoUnlabeled};
  static constexpr CoconutImageNamespace validation[]{CoconutImageNamespace::CocoValidation};

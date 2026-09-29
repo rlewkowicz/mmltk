@@ -1,5 +1,5 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h"
-#include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "src/pch_std.h"

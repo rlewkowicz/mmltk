@@ -1,5 +1,6 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
+#include "src/backend/data/benchmark/detail/benchmark_download.h"
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 #include "src/common/concurrency/cancellation_observation.h"
@@ -17,25 +18,18 @@
 #include <string_view>
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
-struct AdmittedRecipeArchive;
-struct DownloadResult;
+struct AdmittedRecipeArchive {
+ RecipeImageArchive origin;
+ DownloadResult download;
+};
 struct BenchmarkCacheLayout;
 class BenchmarkCompilePipeline;
 class StorageReservationPool;
 struct CoconutPhysicalImage;
 struct CoconutInventoryImage;
-struct CoconutRecipeCatalog;
 struct CoconutRecord;
 struct CachedImageDirectory;
 class NormalizedAnnotationReadView;
-struct CoconutPhysicalName {
- CoconutImageNamespace source;
- std::uint64_t id;
- std::string stem;
-};
-[[nodiscard]] CoconutPhysicalName parse_coconut_objects_member(std::string_view);
-[[nodiscard]] std::uint64_t parse_coconut_coco_member(std::string_view);
-void validate_coconut_physical_image(const CoconutPhysicalImage&);
 [[nodiscard]] std::span<const CoconutImageNamespace> coconut_release_sources(CoconutEdition);
 class CoconutPhysicalMembershipError final : public std::runtime_error {
 public:

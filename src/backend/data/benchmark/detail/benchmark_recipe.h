@@ -33,6 +33,7 @@
 namespace mmltk::backend::data::benchmark_internal {
 class BenchmarkCompilePipeline;
 class CoconutPhysicalMembership;
+struct AdmittedRecipeArchive;
 [[nodiscard]] BenchmarkResources custom_annotation_resources();
 struct CustomRecipeCatalog {
  CatalogArtifact coco_annotations, coco_train_images, coco_val_images, objects_annotations, open_images_boxes, open_images_classes;
@@ -54,27 +55,6 @@ struct CustomRecipePreparation {
  BenchmarkAllowance preparation = {});
 }  // namespace mmltk::backend::data::benchmark_internal
 namespace mmltk::backend::data::benchmark_internal {
-struct RecipeImageArchive {
- CoconutImageNamespace source;
- std::uint16_t shard = 0;
- std::string cache_shard;
- CatalogArtifact artifact;
-};
-struct AdmittedRecipeArchive {
- RecipeImageArchive origin;
- DownloadResult download;
-};
-enum class CoconutReleaseBoundary { MetadataConsumed, MasksStarted };
-// Private ordinary catalog facts are also used by bounded local release fixtures.
-struct CoconutRecipeCatalog {
- std::vector<CoconutReleaseComponent> releases;
- std::vector<RecipeImageArchive> images;
- CatalogArtifact stock_annotations;
- std::uint64_t coco_validation_images = 5000U;
- // Effect-only production-boundary notification, called outside owner/reporter
- // locks. It neither selects work nor supplies readiness or cache decisions.
- std::function<void(CoconutEdition, CoconutReleaseBoundary)> release_observer;
-};
 struct CoconutRecipeInputs;
 [[nodiscard]] std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, ProgressReporter&, std::size_t,
  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::size_t download_connections = 0, std::span<const int> cpus = {},

@@ -1,3 +1,7 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_inventory_io.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
@@ -50,9 +54,12 @@
 #include <thread>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <new>
 #include <nlohmann/json.hpp>
 #include <span>
 #include <stdexcept>
+#include <system_error>
 #include <string>
 #include <utility>
 #include <vector>
@@ -784,6 +791,37 @@ TEST_CASE("COCONut version-1 physical inventory has fixed bytes and admits exist
  CHECK(file_bytes(emitted) == expected);
  CHECK(expected.size() == 114 + 32);
  CHECK(file_bytes(cache) == expected);
+ // Reading, hashing and durable publication share the existing v1 encoding.
+ const auto retained = [&] {
+  InventoryInput input(emitted, {});
+  InventoryHeader header;
+  input.value(header);
+  CoconutPhysicalImage image;
+  input.value(image);
+  CHECK(image == wanted.front());
+  auto seal = input.seal();
+  seal->identity = input.finish();
+  CHECK(seal->identity == "93e47afa75da695b47e8c5401fb230eade7266f798bcea057b528fbd0b945e17");
+  InventoryOutput hash(nullptr, {});
+  CHECK(encode_inventory(hash, header, wanted, {}) == seal->identity);
+  CHECK(hash.byte_size() == expected.size());
+  return seal;
+ }();
+ std::filesystem::remove(emitted);
+ mmltk::testsupport::write_text_file(emitted, std::string(expected.size(), 'x'));
+ CHECK(std::string(reinterpret_cast<const char*>(retained->data().data()), retained->data().size()) == expected);
+ {
+  const std::lock_guard lock(retained->mutex);
+  retained->publish(emitted, {}, &storage);
+ }
+ CHECK(file_bytes(emitted) == expected);
+ const auto snapshot = mmltk::common::io::FileSnapshot::Read(emitted);
+ {
+  const std::lock_guard lock(retained->mutex);
+  retained->publish(emitted, {}, &storage);
+ }
+ CHECK(mmltk::common::io::FileSnapshot::Read(emitted) == snapshot);
+ CHECK(storage.outstanding() == 0);
 }
 TEST_CASE("COCONut version-1 component inventory pins nested physical release and ordinal identities", "[coconut]") {
  ScopedTempDir root("coconut-component-v1");
@@ -821,6 +859,15 @@ TEST_CASE("COCONut version-1 component inventory pins nested physical release an
  store_coconut_component(path, component, {}, &storage);
  CHECK(storage.outstanding() == 0);
  const auto index_bytes = file_bytes(path);
+ const auto completion_bytes = file_bytes(path.string() + ".complete.json");
+ const auto completion = Json::parse(completion_bytes);
+ CHECK(completion.at("index_version") == 3);
+ const Json expected_completion{
+  {"edition", 4}, {"source", 3}, {"input_identity", "i"}, {"normalization", "coconut-exact-rgb-rle-v1"},
+  {"inventory_identity", "c5304ca7a16f7e76d6c21bfd7bda2b39a025cc268dde2336d95a2157eb9d4632"}, {"inventory_count", 1},
+  {"recovery_policy", 0}, {"original_annotation_identity", ""}, {"recovery_images", 0}, {"rejected_images", Json::array()},
+  {"source_rows", 0}, {"source_segments", 0}, {"source_extent_complete", false}, {"incomplete_ordinal_images", Json::array()}};
+ CHECK(completion.at("coconut") == expected_completion);
  const auto inventory_path = path.string() + ".inventory";
  CHECK(file_bytes(inventory_path) == expected);
  CHECK(expected.size() == 130 + 32);
@@ -838,6 +885,7 @@ TEST_CASE("COCONut version-1 component inventory pins nested physical release an
  CHECK(storage.outstanding() == 0);
  CHECK(file_bytes(inventory_path) == expected);
  CHECK(file_bytes(path) == index_bytes);
+ CHECK(file_bytes(path.string() + ".complete.json") == completion_bytes);
 }
 TEST_CASE("COCONut physical member spelling preserves exact paths and rejects unsafe names", "[coconut]") {
  CHECK(canonical_benchmark_archive_member("././train2017//./000000000007.jpg") == "train2017/000000000007.jpg");
@@ -858,6 +906,34 @@ TEST_CASE("COCONut full physical inventories are identity-bound and independent 
  std::filesystem::remove(archive);
  CHECK(fixture_physical_inventory(archive, cache, CoconutImageNamespace::CocoUnlabeled, 0, "pinned-archive") == result);
  CHECK_THROWS(fixture_physical_inventory(archive, cache, CoconutImageNamespace::CocoUnlabeled, 0, "changed-archive"));
+ SECTION("ready physical rows precede terminal digest rejection") {
+  auto bytes = file_bytes(cache);
+  bytes.back() ^= 1;
+  mmltk::testsupport::write_text_file(cache, bytes);
+  std::vector<CoconutPhysicalImage> ready;
+  CHECK_THROWS_AS(load_coconut_physical_inventory(cache, CoconutImageNamespace::CocoUnlabeled, 0, "pinned-archive", {},
+   [&](const CoconutPhysicalImage& image) { ready.push_back(image); }), CoconutInputError);
+  CHECK(ready == result);
+ }
+ SECTION("allocation failure in a physical consumer propagates") {
+  CHECK_THROWS_AS(load_coconut_physical_inventory(cache, CoconutImageNamespace::CocoUnlabeled, 0, "pinned-archive", {},
+   [](const CoconutPhysicalImage&) { throw std::bad_alloc(); }), std::bad_alloc);
+ }
+ SECTION("storage failure in a physical consumer propagates") {
+  CHECK_THROWS_AS(load_coconut_physical_inventory(cache, CoconutImageNamespace::CocoUnlabeled, 0, "pinned-archive", {},
+   [](const CoconutPhysicalImage&) { throw std::system_error(std::make_error_code(std::errc::io_error)); }), std::system_error);
+ }
+ SECTION("internal failure in a physical consumer propagates") {
+  CHECK_THROWS_AS(load_coconut_physical_inventory(cache, CoconutImageNamespace::CocoUnlabeled, 0, "pinned-archive", {},
+   [](const CoconutPhysicalImage&) { throw std::logic_error("physical consumer invariant"); }), std::logic_error);
+ }
+ SECTION("cancellation after a ready row remains fatal") {
+  std::atomic<bool> stopped{false};
+  std::size_t ready = 0;
+  CHECK_THROWS(load_coconut_physical_inventory(cache, CoconutImageNamespace::CocoUnlabeled, 0, "pinned-archive",
+   mmltk::common::concurrency::CancellationObservation::Atomic(stopped), [&](const CoconutPhysicalImage&) { ++ready; stopped = true; }));
+  CHECK(ready == 1);
+ }
  const std::array<std::pair<std::string, std::string>, 2> duplicate{{members[0], {"./unlabeled2017//./000000000007.jpg", "jpeg7"}}};
  tar(archive, duplicate);
  CHECK_THROWS(fixture_physical_inventory(archive, {}, CoconutImageNamespace::CocoUnlabeled, 0, "duplicate-archive"));
@@ -2962,6 +3038,15 @@ TEST_CASE("retained COCO source dogs recover exactly and remain disjoint after c
   REQUIRE(cached);
   CHECK(cached->index().annotation_sha256 == component.index().annotation_sha256);
   CHECK(cached->recovery().front().objects.size() == component.recovery().front().objects.size());
+  const std::array parts{CoconutComponentPart{{component}, 0, 0}};
+  const auto merged = merge_coconut_components(parts, input.input_identity, *input.physical_membership, root.path());
+  REQUIRE(merged.size() == 1);
+  CHECK(merged.front().input_identity() == component.input_identity());
+  CHECK(merged.front().index().annotation_sha256 == component.index().annotation_sha256);
+  const auto merged_path = root.path() / "recovered-merged.normalized.bin";
+  store_coconut_component(merged_path, merged.front());
+  CHECK(file_bytes(merged_path.string() + ".inventory") == file_bytes(path.string() + ".inventory"));
+  CHECK(file_bytes(merged_path.string() + ".complete.json") == file_bytes(path.string() + ".complete.json"));
   auto changed = index;
   changed.annotation_sha256 = std::string(64, 'a');
   const auto changed_recovery_originals_view = fixture_index(changed);
@@ -6822,6 +6907,13 @@ TEST_CASE("Large and XL component identities retain only their consumed physical
   return std::move(builder).finish({}, root.path());
  };
  const auto large = make(CoconutEdition::Large, 1, 32), xl = make(CoconutEdition::XLarge, 2, 17);
+ CHECK(large.input_identity() == "85e14b83bcc3edd56806c20c1b01d76ca95a74708bd4e2eb944cd77d1e670de2");
+ CHECK(xl.input_identity() == "e00877b60b7d5207b6d618da3dece3a828d8408ce674e17122ac57d1cae5c55e");
+ const std::array parts{CoconutComponentPart{{large}, 0, 0}};
+ const auto merged = merge_coconut_components(parts, "annotations", physical, root.path());
+ REQUIRE(merged.size() == 1);
+ CHECK(merged.front().input_identity() == large.input_identity());
+ CHECK(merged.front().index().annotation_sha256 == large.index().annotation_sha256);
  CHECK(physical.eligible(CoconutEdition::Large, admitted[0]));
  CHECK_FALSE(physical.eligible(CoconutEdition::XLarge, admitted[0]));
  const auto xl_identity = xl.input_identity();
@@ -6836,6 +6928,11 @@ TEST_CASE("Large and XL component identities retain only their consumed physical
  physical.admitted(admitted[0], admitted[0].download);
  CHECK_FALSE(large.matches_inputs("annotations", physical, nullptr));
  CHECK(large.matches_inputs("annotations", physical, nullptr, false));
+ const auto current = merge_coconut_components(parts, "annotations", physical, root.path());
+ REQUIRE(current.size() == 1);
+ CHECK(current.front().input_identity() == "c47f90f4b81841b04982901f3606d0923b5e9d66bdcb3b7d31b38dca2c3a56b1");
+ CHECK(current.front().matches_inputs("annotations", physical, nullptr));
+ CHECK_FALSE(current.front().matches_inputs("annotations", physical, nullptr, false));
  CHECK(xl.matches_inputs("annotations", physical, nullptr));
  CHECK(xl.input_identity() == xl_identity);
  CHECK(xl.index().storage().images.data() == xl_mapping);
@@ -8178,7 +8275,7 @@ TEST_CASE("version three COCONut completions reuse their proven rows without new
    auto bytes = stable.back().second;
    bytes.back() ^= 1;
    mmltk::testsupport::write_text_file(stable.back().first, bytes);
-  }
+  } else stable.emplace_back(entry.path(), file_bytes(entry.path()));
   ++completions;
  }
  REQUIRE(completions != 0);

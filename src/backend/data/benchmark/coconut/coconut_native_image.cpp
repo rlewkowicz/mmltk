@@ -53,25 +53,6 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::rejected(const Coc
  result->input_identity_ = coconut_image_input_identity(result->lineage().component.annotation_input_identity, physical, result->lineage().component.original_annotation_identity);
  return result;
 }
-void CoconutSegments::writable() {
- if (!backing_) return;
- values_.assign(mapped_.begin(), mapped_.end());
- mapped_ = {};
- backing_.reset();
-}
-void CoconutSegments::stage(const std::filesystem::path& directory, StorageReservationPool* storage) {
- if (backing_ || values_.empty() || directory.empty()) return;
- static_assert(std::is_trivially_copyable_v<CoconutSegment>);
- const auto bytes = mmltk::common::math::checked_multiply(values_.size(), sizeof(CoconutSegment), "COCONut segment staging overflow");
- std::filesystem::create_directories(directory);
- StorageReservationPool reservations(directory, {}, storage);
- auto owner = std::make_shared<BenchmarkMappedArtifact>(reservations, directory / ".native-segments", bytes, "COCONut segment metadata");
- owner->write(values_.data(), bytes, 0);
- const void* address = owner->map_readonly();
- mapped_ = {static_cast<const CoconutSegment*>(address), values_.size()};
- backing_ = std::move(owner);
- std::vector<CoconutSegment>().swap(values_);
-}
 std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::stage(std::shared_ptr<const CoconutNativeImage> source, const std::filesystem::path& directory, StorageReservationPool* storage) {
  if (source->backing_ || (source->boxes_.empty() && source->runs_.empty())) return source;
  const auto boxes = source->boxes();

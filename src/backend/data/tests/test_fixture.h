@@ -1,13 +1,23 @@
 #pragma once
 #include "src/backend/data/compiler/dataset_compiler.h"
-#include "src/backend/data/benchmark/detail/benchmark_writer.h"
-#include "src/backend/data/benchmark/detail/benchmark_labels.h"
-#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/imaging/resample/image_resize.h"
+#include <filesystem>
+#include <memory>
 #include <span>
 #include <cstdint>
 #include <string>
 #include <vector>
+namespace mmltk::backend::data {
+struct ImageEntry;
+namespace benchmark_internal {
+class BenchmarkCompilePipeline;
+class BenchmarkSplitWriter;
+struct PreparedBenchmarkSplit;
+struct EncodedImageRecord;
+struct BenchmarkWriteRequest;
+struct BenchmarkLabelChunk;
+}  // namespace benchmark_internal
+}  // namespace mmltk::backend::data
 namespace mmltk::backend::data::testsupport {
 [[nodiscard]] std::string benchmark_semantics(const std::filesystem::path&);
 void bind_benchmark_slots(benchmark_internal::BenchmarkCompilePipeline&, benchmark_internal::BenchmarkSplitWriter&, const benchmark_internal::PreparedBenchmarkSplit&);

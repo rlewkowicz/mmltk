@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
@@ -256,11 +257,6 @@ struct CoconutImportRequest {
 [[nodiscard]] std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequest& request);
 // Removes only XL rows covered by Large, retaining B and all namespace distinctions.
 [[nodiscard]] std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& components, mmltk::common::concurrency::CancellationObservation cancellation = {});
-// Full archive inventory, independent of annotations/foreground selection. Cache is identity-bound.
-[[nodiscard]] std::vector<CoconutPhysicalImage> load_coconut_physical_inventory(const std::filesystem::path&, CoconutImageNamespace, std::uint16_t, std::string_view,
- mmltk::common::concurrency::CancellationObservation, const std::function<void(const CoconutPhysicalImage&)>&);
-void store_coconut_physical_inventory(const std::filesystem::path&, std::span<const CoconutPhysicalImage>, CoconutImageNamespace, std::uint16_t, std::string_view,
- mmltk::common::concurrency::CancellationObservation, StorageReservationPool*);
 void admit_coconut_component(const CoconutComponent&, mmltk::common::concurrency::CancellationObservation = {});
 [[nodiscard]] std::uint64_t coconut_component_storage_bytes(const CoconutComponent&);
 void store_coconut_component(

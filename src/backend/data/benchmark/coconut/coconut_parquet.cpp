@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_parquet.h"
 #include "src/common/types/utf8.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"

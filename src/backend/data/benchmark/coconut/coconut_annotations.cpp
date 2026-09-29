@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include <system_error>
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/detail/benchmark_json.h"
@@ -7,11 +8,9 @@
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
 #include <exception>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h"
-#include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_inventory_io.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/common/io/file_digest.h"
@@ -25,32 +24,6 @@
 #include <thread>
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
 namespace mmltk::backend::data::benchmark_internal {
-class CoconutInventorySeal final {
-public:
- void capture(const mmltk::common::io::FileHandle& file) {
-  struct stat status{};
-  if (::fstat(file.get(), &status) != 0) throw mmltk::common::io::errno_error("stat COCONut inventory");
-  if (status.st_size < 32) throw CoconutInputError("COCONut: truncated inventory");
-  const auto size = mmltk::common::math::checked_cast<std::size_t>(status.st_size, "COCONut inventory size overflow");
-  if (bytes && bytes != size) throw std::logic_error("COCONut inventory custody changed extent");
-  if (!bytes) bytes = size;
-  void* address = ::mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, file.get(), 0);
-  if (address == MAP_FAILED) throw mmltk::common::io::errno_error("map COCONut inventory");
-  mapping.adopt(address, bytes);
-  device = status.st_dev;
-  inode = status.st_ino;
- }
- [[nodiscard]] std::span<const std::uint8_t> data() const { return {static_cast<const std::uint8_t*>(mapping.address()), bytes}; }
- // Custody changes are serialized; semantic fields and mapped bytes never change.
- mutable std::mutex mutex;
- BenchmarkStagedArtifact staged;
- mmltk::common::io::MappedByteRegion mapping;
- std::string identity;
- std::size_t bytes = 0;
- std::filesystem::path directory, published_path;
- dev_t device = 0;
- ino_t inode = 0;
-};
 class CoconutComponentBacking final : public CoconutComponentMetadata {
 public:
  NormalizedAnnotationReadView index;
@@ -74,6 +47,13 @@ namespace {
 using Json = nlohmann::json;
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
 [[noreturn]] void invalid(std::string_view detail) { throw CoconutInputError("COCONut: " + std::string(detail)); }
+std::string component_input_identity(std::string_view annotations, CoconutImageNamespace source, std::string_view physical, std::uint32_t policy, std::string_view original) {
+ const auto material = nlohmann::json{
+  {"domain", "coconut-component-input-v2"}, {"annotations", annotations}, {"source", source}, {"physical", physical},
+  {"recovery_policy", policy}, {"original", original}
+ }.dump();
+ return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(material.data()), material.size())));
+}
 struct PhysicalKey {
  CoconutImageNamespace source;
  std::uint64_t id;
@@ -408,157 +388,6 @@ void segments_from_json(const JsonArray<JsonSegment>& input, CoconutRecord& reco
   record.segments.push_back(std::move(segment));
  }
 }
-template <class T>
-concept InventoryRecord = std::same_as<T, CoconutPhysicalImage> || std::same_as<T, CoconutInventoryImage> || std::same_as<T, InventoryHeader> || std::same_as<T, CoconutRecoveryImage> ||
-                          std::same_as<T, CoconutRecoveredObject>;
-// A single reflected little-endian encoding is used by hashing, writing and reading.
-// Strings carry checked uint32 lengths. Only a fixed buffer and the current row
-// are transient; records remain in their ordinary typed inventory owner.
-class InventoryOutput final {
-public:
- InventoryOutput(BenchmarkStagedArtifact* file, Cancellation cancellation) : file_(file), cancellation_(cancellation) {}
- template <class T>
- void value(const T& item) {
-  if constexpr (InventoryRecord<T>) {
-   mmltk::frameworks::reflection::visit_materialized_members<T>([&]<class Declaration>(const auto&) { value(item.*Declaration::pointer); });
-  } else if constexpr (std::same_as<T, std::vector<CoconutRecoveredObject>>) {
-   value(static_cast<std::uint32_t>(item.size()));
-   for (const auto& object : item) value(object);
-  } else if constexpr (std::is_enum_v<T>) {
-   value(static_cast<std::underlying_type_t<T>>(item));
-  } else if constexpr (std::same_as<T, std::string>) {
-   if (item.size() > 4096) invalid("inventory text exceeds admission");
-   value(static_cast<std::uint32_t>(item.size()));
-   append({reinterpret_cast<const std::uint8_t*>(item.data()), item.size()});
-  } else {
-   static_assert(std::is_unsigned_v<T> || std::same_as<T, bool>);
-   std::array<std::uint8_t, sizeof(T)> bytes{};
-   auto number = static_cast<std::uint64_t>(item);
-   for (auto& byte : bytes) {
-    byte = static_cast<std::uint8_t>(number & 255U);
-    number >>= 8U;
-   }
-   append(bytes);
-  }
- }
- [[nodiscard]] std::uint64_t byte_size() const { return mmltk::common::math::checked_add<std::uint64_t>(offset_, 32U, "inventory extent overflow"); }
- std::string finish() {
-  flush();
-  const auto digest = hash_.Finish();
-  if (file_) {
-   file_->resize(byte_size(), "COCONut inventory digest extent");
-   file_->file().pwrite_all(digest.data(), digest.size(), offset_);
-   file_->reconcile();
-  }
-  throw_if_benchmark_cancelled(cancellation_);
-  return mmltk::common::io::sha256_hex(digest);
- }
-
-private:
- void append(std::span<const std::uint8_t> bytes) {
-  while (!bytes.empty()) {
-   const auto count = std::min(bytes.size(), buffer_.size() - used_);
-   std::memcpy(buffer_.data() + used_, bytes.data(), count);
-   used_ += count;
-   bytes = bytes.subspan(count);
-   if (used_ == buffer_.size()) flush();
-  }
- }
- void flush() {
-  throw_if_benchmark_cancelled(cancellation_);
-  if (!used_) return;
-  if (used_ > std::numeric_limits<std::size_t>::max() - offset_) invalid("inventory size overflow");
-  hash_.Update(std::span(buffer_.data(), used_));
-  if (file_) {
-   file_->resize(offset_ + used_ + 32, "COCONut inventory extent");
-   file_->file().pwrite_all(buffer_.data(), used_, offset_);
-   file_->reconcile();
-  }
-  offset_ += used_;
-  used_ = 0;
- }
- BenchmarkStagedArtifact* file_;
- Cancellation cancellation_;
- mmltk::common::io::Sha256Hasher hash_;
- std::array<std::uint8_t, 65536> buffer_{};
- std::size_t used_ = 0, offset_ = 0;
-};
-class InventoryInput final {
-public:
- InventoryInput(const std::filesystem::path& path, Cancellation cancellation) : seal_(std::make_shared<CoconutInventorySeal>()), cancellation_(cancellation) {
-  const auto file = mmltk::common::io::FileHandle::open_readonly(path.string());
-  seal_->capture(file);
-  seal_->directory = path.parent_path();
-  seal_->published_path = path;
-  content_size_ = seal_->bytes - 32;
- }
- std::shared_ptr<CoconutInventorySeal> seal() const { return seal_; }
- template <class T>
- void value(T& item) {
-  if constexpr (InventoryRecord<T>) {
-   mmltk::frameworks::reflection::visit_materialized_members<T>([&]<class Declaration>(const auto&) { value(item.*Declaration::pointer); });
-  } else if constexpr (std::same_as<T, std::vector<CoconutRecoveredObject>>) {
-   std::uint32_t count = 0;
-   value(count);
-   if (count > 65535U || count > maximum_records()) invalid("invalid recovery object count");
-   item.resize(count);
-   for (auto& object : item) value(object);
-  } else if constexpr (std::is_enum_v<T>) {
-   std::underlying_type_t<T> number{};
-   value(number);
-   item = static_cast<T>(number);
-  } else if constexpr (std::same_as<T, std::string>) {
-   std::uint32_t count = 0;
-   value(count);
-   if (count > 4096) invalid("inventory text exceeds admission");
-   item.resize(count);
-   read({reinterpret_cast<std::uint8_t*>(item.data()), count});
-  } else {
-   static_assert(std::is_unsigned_v<T> || std::same_as<T, bool>);
-   std::array<std::uint8_t, sizeof(T)> bytes{};
-   read(bytes);
-   std::uint64_t number = 0;
-   for (std::size_t i = 0; i < bytes.size(); ++i) number |= static_cast<std::uint64_t>(bytes[i]) << (8U * i);
-   if constexpr (std::same_as<T, bool>) {
-    if (number > 1) invalid("invalid inventory flag");
-   }
-   item = static_cast<T>(number);
-  }
- }
- std::uint64_t maximum_records() const { return content_size_ / 16U; }
- std::uint64_t byte_size() const { return content_size_ + 32U; }
- std::string finish() {
-  throw_if_benchmark_cancelled(cancellation_);
-  if (loaded_ != content_size_ || cursor_ != available_) invalid("inventory has trailing records");
-  mmltk::common::io::Sha256Digest expected{};
-  std::memcpy(expected.data(), seal_->data().data() + content_size_, expected.size());
-  const auto actual = hash_.Finish();
-  if (actual != expected) invalid("inventory checksum mismatch");
-  return mmltk::common::io::sha256_hex(actual);
- }
-
-private:
- void read(std::span<std::uint8_t> output) {
-  while (!output.empty()) {
-   if (cursor_ == available_) {
-    throw_if_benchmark_cancelled(cancellation_);
-    available_ = std::min(std::size_t{65536}, content_size_ - loaded_);
-    cursor_ = 0;
-    if (!available_) invalid("truncated inventory record");
-    hash_.Update(seal_->data().subspan(loaded_, available_));
-    loaded_ += available_;
-   }
-   const auto count = std::min(output.size(), available_ - cursor_);
-   std::memcpy(output.data(), seal_->data().data() + loaded_ - available_ + cursor_, count);
-   cursor_ += count;
-   output = output.subspan(count);
-  }
- }
- std::shared_ptr<CoconutInventorySeal> seal_;
- Cancellation cancellation_;
- mmltk::common::io::Sha256Hasher hash_;
- std::size_t content_size_ = 0, loaded_ = 0, cursor_ = 0, available_ = 0;
-};
 InventoryHeader component_header(const CoconutComponentMetadata& component, std::size_t count) {
  InventoryHeader header;
  header.component = true;
@@ -567,31 +396,6 @@ InventoryHeader component_header(const CoconutComponentMetadata& component, std:
  header.source = component.source;
  header.count = count;
  return header;
-}
-void validate_inventory_header(const InventoryHeader& header, const InventoryHeader& expected) {
- if (header.magic != expected.magic || header.version != expected.version || header.cache_schema != expected.cache_schema || header.normalization != expected.normalization ||
-     header.input_identity != expected.input_identity || header.edition != expected.edition || header.source != expected.source || header.shard != expected.shard ||
-     header.component != expected.component)
-  invalid("inventory identity mismatch");
-}
-template <class Records>
-std::string encode_inventory(InventoryOutput& output, const InventoryHeader& header, const Records& records, Cancellation cancellation, std::uint32_t policy = 0, std::string_view original = {},
- const CoconutComponent* recovery = nullptr) {
- output.value(header);
- for (const auto& record : records) {
-  throw_if_benchmark_cancelled(cancellation);
-  output.value(record);
- }
- if (policy) {
-  output.value(policy);
-  output.value(std::string(original));
-  output.value(static_cast<std::uint64_t>(recovery->recovery().size()));
-  for (const auto& image : recovery->recovery()) {
-   throw_if_benchmark_cancelled(cancellation);
-   output.value(image);
-  }
- }
- return output.finish();
 }
 std::shared_ptr<CoconutInventorySeal> seal_inventory(const CoconutComponent& component, Cancellation cancellation, const std::filesystem::path& directory, StorageReservationPool* storage) {
  auto seal = std::make_shared<CoconutInventorySeal>();
@@ -603,23 +407,11 @@ std::shared_ptr<CoconutInventorySeal> seal_inventory(const CoconutComponent& com
  InventoryOutput output(&seal->staged, cancellation);
  const CoconutComponentMetadata metadata{component.edition(), component.source(), component.input_identity(), component.recovery_policy(), std::string(component.original_annotation_identity())};
  seal->identity = encode_inventory(
-  output, component_header(metadata, component.index().image_count()), component.inventory(), cancellation, component.recovery_policy(), component.original_annotation_identity(), &component);
+  output, component_header(metadata, component.index().image_count()), component.inventory(), cancellation, component.recovery_policy(), component.original_annotation_identity(), component.recovery());
  seal->staged.file().sync_data();
  seal->capture(seal->staged.file());
  seal->staged.close();
  return seal;
-}
-template <InventoryRecord T>
-std::string store_inventory(const std::filesystem::path& path, const InventoryHeader& header, std::span<const T> records, Cancellation cancellation, StorageReservationPool* storage = nullptr) {
- throw_if_benchmark_cancelled(cancellation);
- (void)mmltk::common::io::ensure_parent_directory(path);
- StorageReservationPool destination(path, {}, storage);
- auto staging = BenchmarkStagedArtifact::create(destination, path, 0, "COCONut inventory staging");
- InventoryOutput output(&staging, cancellation);
- const auto identity = encode_inventory(output, header, records, cancellation);
- staging.file().sync_data();
- staging.publish(path, cancellation);
- return identity;
 }
 BenchmarkDatasetSource index_source(CoconutImageNamespace source) {
  return source == CoconutImageNamespace::Objects365V1 || source == CoconutImageNamespace::Objects365V2 ? BenchmarkDatasetSource::kObjects365V2 : BenchmarkDatasetSource::kCoco2017;
@@ -2069,11 +1861,7 @@ CoconutComponent CoconutComponentBuilder::finish(Cancellation cancellation, cons
 std::string coconut_component_input_identity(std::string_view base, CoconutImageNamespace source, const CoconutMaskRecovery* recovery, const CoconutPhysicalMembership* physical,
  CoconutEdition edition, const CoconutPhysicalDependencies& dependencies, bool current) {
  const auto original = recovery ? recovery->original_identity(source) : std::string_view{};
- const auto material = nlohmann::json{
-  {"domain", "coconut-component-input-v2"}, {"annotations", base}, {"source", source}, {"physical", physical ? physical->dependency_identity(edition, source, dependencies, current) : std::string{}},
-  {"recovery_policy", original.empty() ? 0 : kCoconutRecoveryPolicy}, {"original", original}
- }.dump();
- return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(material.data()), material.size())));
+ return component_input_identity(base, source, physical ? physical->dependency_identity(edition, source, dependencies, current) : std::string{}, original.empty() ? 0 : kCoconutRecoveryPolicy, original);
 }
 std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutComponentPart> parts, std::string_view identity, const CoconutPhysicalMembership& physical,
  const std::filesystem::path& directory, Cancellation cancellation, StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const CoconutImageRejection& rejected) {
@@ -2151,9 +1939,7 @@ std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutCo
     backing->recovery.push_back(std::move(recovery));
    }
   }
-  const auto material = nlohmann::json{{"domain", "coconut-component-input-v2"}, {"annotations", identity}, {"source", source},
-   {"physical", physical.dependency_identity(first.edition(), source, backing->dependencies)}, {"recovery_policy", backing->recovery_policy}, {"original", backing->original_annotation_identity}}.dump();
-  backing->input_identity = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(material.data()), material.size())));
+  backing->input_identity = component_input_identity(identity, source, physical.dependency_identity(first.edition(), source, backing->dependencies), backing->recovery_policy, backing->original_annotation_identity);
   backing->inventory = std::move(inventory);
   result.push_back(CoconutComponentBacking::finish(std::move(backing), assembled.finish(), false, cancellation, directory, storage));
  }
@@ -2370,44 +2156,6 @@ std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& compon
  components = std::move(replacement);
  return removed;
 }
-std::vector<CoconutPhysicalImage> load_coconut_physical_inventory(const std::filesystem::path& cache_path, CoconutImageNamespace source, std::uint16_t shard, std::string_view archive_identity,
- Cancellation cancellation, const std::function<void(const CoconutPhysicalImage&)>& ready) {
- InventoryHeader expected;
- expected.source = source;
- expected.shard = shard;
- expected.input_identity = archive_identity;
-
- InventoryInput input(cache_path, cancellation);
- InventoryHeader admitted;
- input.value(admitted);
- validate_inventory_header(admitted, expected);
- if (admitted.count > input.maximum_records()) invalid("inventory count exceeds file extent");
- std::vector<CoconutPhysicalImage> images;
- if (!ready) images.reserve(mmltk::common::math::checked_cast<std::size_t>(admitted.count, "physical inventory count overflow"));
- std::optional<std::uint64_t> previous;
- for (std::uint64_t i = 0; i < admitted.count; ++i) {
-  throw_if_benchmark_cancelled(cancellation);
-  CoconutPhysicalImage image;
-  input.value(image);
-  validate_coconut_physical_image(image);
-  if (image.source != source || image.shard != shard || image.archive_identity != archive_identity || (previous && image.image_id <= *previous)) invalid("invalid cached archive inventory");
-  previous = image.image_id;
-  if (ready) ready(image);
-  else images.push_back(std::move(image));
- }
- (void)input.finish();
- return images;
-}
-void store_coconut_physical_inventory(const std::filesystem::path& path, std::span<const CoconutPhysicalImage> images, CoconutImageNamespace source, std::uint16_t shard, std::string_view archive_identity,
- Cancellation cancellation, StorageReservationPool* storage) {
- InventoryHeader expected;
- expected.source = source;
- expected.shard = shard;
- expected.input_identity = archive_identity;
-
- expected.count = images.size();
- (void)store_inventory(path, expected, images, cancellation, storage);
-}
 void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component, Cancellation cancellation, StorageReservationPool* storage) {
  if (component.membership_ || component.backing_->metadata_only) invalid("membership cannot publish a full component");
  admit_coconut_component(component, cancellation);
@@ -2426,42 +2174,7 @@ void store_coconut_component(const std::filesystem::path& index_path, const Coco
  const auto inventory_path = std::filesystem::path(index_path.string() + ".inventory");
  auto& seal = *component.seal_;
  const std::lock_guard lock(seal.mutex);
- const auto directory = mmltk::common::io::ensure_parent_directory(inventory_path);
- struct stat destination{};
- if (::stat(directory.c_str(), &destination) != 0) throw mmltk::common::io::errno_error("stat COCONut inventory destination");
- struct stat current{};
- const bool published = seal.published_path == inventory_path && ::stat(inventory_path.c_str(), &current) == 0 && current.st_dev == seal.device && current.st_ino == seal.inode &&
-                        current.st_size >= 0 && static_cast<std::uint64_t>(current.st_size) == seal.bytes;
- if (!published) {
-  bool moved = false;
-  if (seal.published_path.empty() && destination.st_dev == seal.device && std::filesystem::is_regular_file(seal.staged.path())) {
-   try {
-    seal.staged.publish(inventory_path, cancellation);
-    moved = true;
-   } catch (const std::filesystem::filesystem_error& error) {
-    if (error.code() != std::errc::cross_device_link) throw;
-   }
-  }
-  if (!moved) {
-   StorageReservationPool reservations(inventory_path, {}, storage);
-   auto copy = BenchmarkStagedArtifact::create(reservations, inventory_path, seal.bytes, "COCONut sealed inventory copy");
-   copy.preallocate(seal.bytes);
-   for (std::size_t offset = 0; offset < seal.bytes;) {
-    throw_if_benchmark_cancelled(cancellation);
-    const auto bytes = std::min(std::size_t{65536}, seal.bytes - offset);
-    copy.file().pwrite_all(seal.data().data() + offset, bytes, offset);
-    offset += bytes;
-   }
-   copy.file().sync_data();
-   // Retain the inode we are about to publish, so inode-number reuse cannot
-   // make a later pathname stat authorize unrelated bytes. The copied bytes
-   // are already sealed; this mapping transition performs no decode or hash.
-   seal.capture(copy.file());
-   seal.staged = {};
-   copy.publish(inventory_path, cancellation);
-  }
-  seal.published_path = inventory_path;
- }
+ seal.publish(inventory_path, cancellation, storage);
  throw_if_benchmark_cancelled(cancellation);
  Json manifest = Json::object();
  std::vector<std::uint64_t> rejected_images, incomplete_images;

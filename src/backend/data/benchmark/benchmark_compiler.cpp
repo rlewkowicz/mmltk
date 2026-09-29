@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
