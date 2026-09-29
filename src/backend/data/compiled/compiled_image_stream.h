@@ -41,6 +41,13 @@ public:
   struct Impl;
   std::unique_ptr<Impl> impl_;
  };
+ enum class StorageKind : std::uint8_t { HostImages, DeviceImages, Labels, Metadata, ReadDescriptors, AnnotationViews };
+ struct StorageGrowthObserver {
+  void* context = nullptr;
+  // Successful owned capacity growth, not total malloc activity or lower-level
+  // allocator page counts. Called only at explicit storage preparation sites.
+  void (*grown)(void*, StorageKind, std::size_t slot, std::size_t previous_bytes, std::size_t retained_bytes) noexcept = nullptr;
+ };
  struct Config {
   std::size_t slots = 1;
   std::size_t workers = 1;
@@ -53,6 +60,7 @@ public:
   std::shared_ptr<mmltk::common::concurrency::WorkerPool> reader_pool{};
   decltype(&cudaStreamSynchronize) settle = &cudaStreamSynchronize;
   decltype(&cudaEventRecord) record_consumer = &cudaEventRecord;
+  StorageGrowthObserver storage_growth{};
  };
  struct ReadObserver {
   void* context = nullptr;

@@ -1,5 +1,6 @@
 #pragma once
 #include <memory>
+#include <array>
 #include <cmath>
 #include <algorithm>
 #include <atomic>
@@ -137,12 +138,35 @@ inline void set_annotation_extent(ImageEntry& entry, std::size_t labels, std::si
   entry.label_bytes = mmltk::common::math::checked_cast<std::uint32_t>(payload.used_bytes, "compiled label size overflow");
  } catch (const std::exception& error) { throw std::runtime_error("image " + std::string(identity) + ": " + error.what()); }
 }
-inline void write_compiled_annotations(const mmltk::common::io::FileHandle& file, const FileLayout& layout, std::uint32_t slot, const ImageEntry& entry, ImageAnnotations annotations) {
+// A bounded used-record transform serves new writes and provenance settlement.
+// Empty source reads existing records; neither path touches mask runs or pixels.
+inline void write_compiled_label_ordinals(const mmltk::common::io::FileHandle& file, std::size_t offset, std::size_t count,
+ std::span<const PackedInstance> source, std::uint64_t base, bool incomplete = false) {
+ if (!source.empty() && source.size() != count) throw std::invalid_argument("compiled ordinal source extent differs");
+ std::array<PackedInstance, 256> records;
+ for (std::size_t first = 0; first < count;) {
+  const auto size = std::min(records.size(), count - first);
+  const auto bytes = size * sizeof(PackedInstance);
+  const auto position = mmltk::common::math::checked_add(offset,
+   mmltk::common::math::checked_multiply(first, sizeof(PackedInstance), "compiled ordinal record extent overflow"), "compiled ordinal record offset overflow");
+  if (source.empty()) file.pread_all(records.data(), bytes, position);
+  else std::memcpy(records.data(), source.data() + first, bytes);
+  for (auto& record : std::span(records).first(size)) {
+   record.source_ordinal = mmltk::common::math::checked_add(record.source_ordinal, base, "benchmark source ordinal overflow");
+   if (incomplete) record.flags |= kAnnotationOrdinalIncomplete;
+  }
+  file.pwrite_all(records.data(), bytes, position);
+  first += size;
+ }
+}
+inline void write_compiled_annotations(const mmltk::common::io::FileHandle& file, const FileLayout& layout, std::uint32_t slot, const ImageEntry& entry, ImageAnnotations annotations,
+ std::uint64_t ordinal_base = 0) {
  const auto payload = annotation_layout(entry.num_instances, entry.num_runs);
  if (annotations.labels.size() != entry.num_instances || annotations.runs.size() != entry.num_runs || entry.label_bytes != payload.used_bytes)
   throw std::runtime_error("compiled annotation write extent differs");
  const auto offset = layout.label_offset(slot);
- file.pwrite_all(annotations.labels.data(), annotations.labels.size_bytes(), offset);
+ if (ordinal_base) write_compiled_label_ordinals(file, offset, annotations.labels.size(), annotations.labels, ordinal_base);
+ else file.pwrite_all(annotations.labels.data(), annotations.labels.size_bytes(), offset);
  const std::uint64_t zero = 0;
  file.pwrite_all(&zero, payload.run_offset - annotations.labels.size_bytes(), offset + annotations.labels.size_bytes());
  file.pwrite_all(annotations.runs.data(), annotations.runs.size_bytes(), offset + payload.run_offset);

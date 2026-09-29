@@ -1,8 +1,11 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
+#include <sys/mman.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <random>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -70,25 +73,35 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
  } completion;
  const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, NumaTopology::Capture());
  auto readers = std::make_shared<WorkerPool>(1U, execution.placement.cpus, "shared-read", 2U, &execution.placement, true);
- CompiledImageStream stream({.slots = 1U, .workers = 1U, .device = 0, .loading = data_loading_options(h2d), .execution = execution, .reader_pool = readers});
+ std::array<std::size_t, 6> storage_growths{};
+ CompiledImageStream stream({.slots = 1U, .workers = 1U, .device = 0, .loading = data_loading_options(h2d), .execution = execution, .reader_pool = readers,
+  .storage_growth = {&storage_growths, [](void* context, CompiledImageStream::StorageKind kind, std::size_t, std::size_t, std::size_t) noexcept {
+   ++(*static_cast<std::array<std::size_t, 6>*>(context))[static_cast<std::size_t>(kind)];
+  }}});
  CHECK(&stream.workers() == readers.get());
  context.emplace(0, mmltk::frameworks::gpu::cuda_image_copy_backend());
  context->Bind();
  stream.bind_current_context();
- stream.prepare_images(0, 2U * stride);
- stream.prepare_reads(0, 2U, true);
+ constexpr std::size_t maximum_batch = 30;
+ stream.prepare_images(0, maximum_batch * stride);
+ stream.prepare_reads(0, maximum_batch, true);
+ const auto prepared_growths = storage_growths;
  CHECK(stream.host_storage(0).owns_allocation());
+ CHECK(stream.host_storage(0).capacity_bytes() >= maximum_batch * stride);
+ CHECK(stream.device_storage(0).capacity_bytes() >= maximum_batch * stride);
  const auto* host = stream.host_storage(0).data();
  const auto* const prepared_host = host;
  auto* const labels = static_cast<std::byte*>(stream.label_storage(0).data());
  const auto label_capacity = stream.label_storage(0).capacity_bytes();
- REQUIRE(label_capacity >= 2U * COMPILED_LABEL_CAPACITY);
+ REQUIRE(label_capacity >= maximum_batch * COMPILED_LABEL_CAPACITY);
  std::memset(labels, 0x5a, 2U * COMPILED_LABEL_CAPACITY);
  const std::array reads{CompiledImageRead{13U, 0U}, CompiledImageRead{1U, stride}};
+ const auto caller_policy = capture_execution_policy_snapshot();
+ const auto first_read_started = std::chrono::steady_clock::now();
  stream.submit(0U, source, reads, {});
  REQUIRE(stream.wait_read(0U));
- const auto caller_policy = capture_execution_policy_snapshot();
  host = stream.host_images(0U).data();
+ const auto first_host_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - first_read_started).count();
  const auto restored_policy = capture_execution_policy_snapshot();
  CHECK(restored_policy.affinity == caller_policy.affinity);
  CHECK(restored_policy.memory_policy.mode == caller_policy.memory_policy.mode);
@@ -150,6 +163,12 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
   CHECK(stream.label_storage(0).capacity_bytes() == label_capacity);
   CHECK(std::memcmp(host, source.image_pixels(13U), stride) == 0);
  }
+ CHECK(storage_growths == prepared_growths);
+ std::size_t preparation_growths = 0;
+ for (const auto count : prepared_growths) preparation_growths += count;
+ std::printf("compiled_stream_fixture transport=%s first_host_pixels_labels_ns=%lld active_pixel_bytes=%zu active_label_bytes=%zu logical_label_capacity=%zu retained_label_bytes=%zu retained_host_bytes=%zu retained_device_bytes=%zu preparation_growths=%zu steady_growths=0 scope=owned_buffers_and_read_containers_not_total_malloc cache=warm_fixture\n",
+  h2d ? "h2d" : "gdrcopy", static_cast<long long>(first_host_ns), 2U * stride, used.size(), maximum_batch * COMPILED_LABEL_CAPACITY, label_capacity,
+  stream.host_storage(0).capacity_bytes(), stream.device_storage(0).capacity_bytes(), preparation_growths);
  const std::array invalid{CompiledImageRead{source.header().num_images, 0U}};
  stream.submit(0U, source, invalid, {});
  REQUIRE_THROWS_AS(stream.wait_read(0U), std::out_of_range);
@@ -930,6 +949,147 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  REQUIRE_FALSE(never_started.next_batch(batch));
  REQUIRE_THROWS(never_started.begin_epoch());
 }
+void exercise_used_read_measurements(const std::string& path) {
+ using Clock = std::chrono::steady_clock;
+ const auto source = CompiledDataset::open(path);
+ const auto count = source.header().num_images;
+ REQUIRE(count > 0);
+ REQUIRE(count <= 256);
+ REQUIRE(source.slot_count() == count);
+ const auto stride = static_cast<std::size_t>(source.header().image_stride);
+ const auto packed_path = fs::path(path).parent_path() / "used-packed-fixture.bin";
+ std::vector<std::size_t> label_offsets(count);
+ std::size_t packed_bytes = static_cast<std::size_t>(count) * stride;
+ {
+  std::ofstream packed(packed_path, std::ios::binary | std::ios::trunc);
+  REQUIRE(packed.is_open());
+  for (std::uint32_t i = 0; i < count; ++i) packed.write(reinterpret_cast<const char*>(source.image_pixels(i)), static_cast<std::streamsize>(stride));
+  for (std::uint32_t i = 0; i < count; ++i) {
+   label_offsets[i] = packed_bytes;
+   const auto used = source.label_payload(i);
+   packed.write(reinterpret_cast<const char*>(used.data()), static_cast<std::streamsize>(used.size()));
+   packed_bytes += used.size();
+  }
+  packed.close();
+  REQUIRE(packed.good());
+ }
+ auto packed = mmltk::common::io::MappedFile::try_open_readonly(packed_path.string());
+ REQUIRE(packed.has_value());
+ REQUIRE(packed->size() == packed_bytes);
+ std::vector<std::byte> pixels(static_cast<std::size_t>(count) * stride);
+ std::vector<std::byte> labels(static_cast<std::size_t>(count) * COMPILED_LABEL_CAPACITY);
+ std::vector<CompiledImageRead> reads(count);
+ struct Gather {
+  std::span<std::byte> pixels;
+  std::uint64_t pixel_bytes = 0, label_bytes = 0, pixel_copies = 0;
+  void copy(std::size_t offset, std::span<const std::byte> input) {
+   std::memcpy(pixels.data() + offset, input.data(), input.size());
+   pixel_bytes += input.size();
+   ++pixel_copies;
+  }
+ };
+ struct Measurement { std::uint64_t ns = 0, pixels = 0, labels = 0, copies = 0; };
+ const std::atomic<bool> cancelled{false};
+ constexpr std::size_t extent_limit = 16U * 1024U * 1024U;
+ const auto packed_pixels = [&](Gather& output) {
+  // Independent retained pixel algorithm from 3b1373b9: coalesce consecutive
+  // source advice and source+destination copies, bounded to 16 MiB. Only the
+  // fixture stores packed bytes; no historical dataset format is interpreted.
+  for (const auto& read : reads) {
+   if (read.index >= count || read.destination_offset > output.pixels.size() || stride > output.pixels.size() - read.destination_offset)
+    throw std::out_of_range("packed fixture read exceeds prepared extents");
+  }
+  for (std::size_t first = 0; first < reads.size();) {
+   auto end = first + 1;
+   auto last = reads[first].index;
+   while (end < reads.size() && reads[end].index >= last && std::uint64_t{reads[end].index} <= std::uint64_t{last} + 1U &&
+          static_cast<std::size_t>(reads[end].index - reads[first].index) < std::max<std::size_t>(1, extent_limit / stride)) last = reads[end++].index;
+   const auto offset = static_cast<std::size_t>(reads[first].index) * stride;
+   const auto bytes = (static_cast<std::size_t>(last - reads[first].index) + 1U) * stride;
+   for (std::size_t done = 0; done < bytes;) {
+    if (cancelled.load(std::memory_order_acquire)) throw std::runtime_error("packed fixture cancelled");
+    const auto extent = std::min(extent_limit, bytes - done);
+    packed->advise_aligned_range(offset + done, extent, MADV_WILLNEED);
+    done += extent;
+   }
+   first = end;
+  }
+  for (std::size_t first = 0; first < reads.size();) {
+   std::size_t consecutive = 1;
+   while (first + consecutive < reads.size() && reads[first + consecutive].index == reads[first].index + consecutive &&
+          reads[first + consecutive].destination_offset == reads[first].destination_offset + consecutive * stride && consecutive < std::max<std::size_t>(1, extent_limit / stride)) ++consecutive;
+   const auto offset = static_cast<std::size_t>(reads[first].index) * stride;
+   const auto bytes = consecutive * stride;
+   for (std::size_t done = 0; done < bytes;) {
+    if (cancelled.load(std::memory_order_acquire)) throw std::runtime_error("packed fixture cancelled");
+    const auto extent = std::min(extent_limit, bytes - done);
+    output.copy(reads[first].destination_offset + done, {reinterpret_cast<const std::byte*>(packed->data() + offset + done), extent});
+    done += extent;
+   }
+   first += consecutive;
+  }
+ };
+ const auto gather = [&](bool fixed) {
+  Gather output{pixels};
+  for (std::size_t i = 0; i < reads.size(); ++i) {
+   const auto index = reads[i].index;
+   const auto bytes = source.image_entry(index).label_bytes;
+   const auto* input = fixed ? source.label_payload(index).data() : reinterpret_cast<const std::byte*>(packed->data() + label_offsets[index]);
+   std::memcpy(labels.data() + i * COMPILED_LABEL_CAPACITY, input, bytes);
+   output.label_bytes += bytes;
+  }
+  if (fixed) {
+   const bool complete = source.read_images_to(reads, {&output, pixels.size(), [](void* context, std::size_t offset, std::span<const std::byte> bytes) {
+    static_cast<Gather*>(context)->copy(offset, bytes);
+   }}, cancelled, false);
+   if (!complete) throw std::runtime_error("fixed fixture cancelled");
+  } else packed_pixels(output);
+  return output;
+ };
+ constexpr unsigned repetitions = 16;
+ for (const bool shuffled : {false, true}) {
+  for (std::uint32_t i = 0; i < count; ++i) reads[i] = {i, static_cast<std::size_t>(i) * stride};
+  if (shuffled) {
+   std::mt19937 random(1729);
+   std::shuffle(reads.begin(), reads.end(), random);
+   for (std::size_t i = 0; i < reads.size(); ++i) reads[i].destination_offset = i * stride;
+  }
+  const auto verify = [&] {
+   for (std::size_t i = 0; i < reads.size(); ++i) {
+    CHECK(std::memcmp(pixels.data() + reads[i].destination_offset, source.image_pixels(reads[i].index), stride) == 0);
+    const auto used = source.label_payload(reads[i].index);
+    CHECK(std::memcmp(labels.data() + i * COMPILED_LABEL_CAPACITY, used.data(), used.size()) == 0);
+   }
+  };
+  for (const bool fixed : {false, true}) { (void)gather(fixed); verify(); }
+  std::array<Measurement, 2> measured{};
+  for (unsigned repetition = 0; repetition < repetitions; ++repetition) {
+   for (unsigned pass = 0; pass < 2; ++pass) {
+    const auto variant = (repetition + pass) % 2U;
+    const auto started = Clock::now();
+    const auto result = gather(variant == 0);
+    auto& total = measured[variant];
+    total.ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count());
+    total.pixels += result.pixel_bytes;
+    total.labels += result.label_bytes;
+    total.copies += result.pixel_copies;
+   }
+  }
+  CHECK(measured[0].pixels == measured[1].pixels);
+  CHECK(measured[0].labels == measured[1].labels);
+  CHECK(measured[0].pixels == static_cast<std::uint64_t>(repetitions) * count * stride);
+  verify();
+  for (std::size_t variant = 0; variant < measured.size(); ++variant) {
+   const auto& value = measured[variant];
+   const auto throughput = value.ns ? static_cast<double>(value.pixels + value.labels) * 1.0e9 / static_cast<double>(value.ns) : 0.0;
+   std::printf("compiled_used_read_fixture layout=%s order=%s repetitions=%u pixel_bytes=%llu label_bytes=%llu elapsed_ns=%llu used_bytes_per_second=%.0f pixel_copy_calls=%llu prepared_arena_bytes=%zu resident_metadata_bytes=%zu mapped_apparent_bytes=%zu cache=warm fixture_only=1 production_baseline=unavailable\n",
+    variant == 0 ? "fixed10" : "packed_algorithm_3b1373b9", shuffled ? "shuffled_seed_1729" : "sequential", repetitions,
+    static_cast<unsigned long long>(value.pixels), static_cast<unsigned long long>(value.labels), static_cast<unsigned long long>(value.ns), throughput,
+    static_cast<unsigned long long>(value.copies), pixels.capacity() + labels.capacity() + reads.capacity() * sizeof(CompiledImageRead), source.image_entries().size_bytes(),
+    variant == 0 ? static_cast<std::size_t>(source.header().total_file_size) : packed->size());
+  }
+ }
+}
 void test_roundtrip_end_to_end() {
  profile_set_run_label("test_roundtrip");
  const mmltk::testsupport::ScopedTempDir root("mmltk_roundtrip");
@@ -957,6 +1117,7 @@ void test_roundtrip_end_to_end() {
  const bool bin_exists = fs::exists(bin_path);
  REQUIRE(bin_exists);
  printf("Compiled file: %zu bytes\n", static_cast<size_t>(fs::file_size(bin_path)));
+ exercise_used_read_measurements(bin_path);
  // Run every H2D assertion before probing the optional GDR transport.
  for (const bool h2d : {true, false}) {
   try {

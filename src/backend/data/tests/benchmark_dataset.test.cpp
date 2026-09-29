@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -8434,6 +8435,70 @@ TEST_CASE("label interval capacity reuses charged lanes and retires borrowed win
   CHECK(retained[5] == 0);
  }
 }
+TEST_CASE("reused label output preserves immutable results and bounds complete mask extents", "[benchmark][labels][masks][resources]") {
+ const auto input = label_projection_fixture(7);
+ BenchmarkLabelWorkspace workspace;
+ std::size_t growths = 0;
+ workspace.observe_output_growth({&growths, [](void* context, bool, std::size_t, std::size_t) noexcept { ++*static_cast<std::size_t*>(context); }});
+ const auto mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ const auto reference = compile_benchmark_image_labels(input, 0, {8, 2}, 16, mode, workspace);
+ const auto start = std::chrono::steady_clock::now();
+ const auto& first = compile_benchmark_image_labels_reused(input, 0, {8, 2}, 16, mode, workspace);
+ const auto first_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+ REQUIRE(first.labels.size() == reference.labels.size());
+ REQUIRE(first.runs.size() == reference.runs.size());
+ REQUIRE(growths == 2);
+ const auto prepared_growths = growths;
+ const auto retained = workspace.retained_bytes();
+ const auto active = annotation_layout(first.labels.size(), first.runs.size()).used_bytes;
+ for (unsigned repetition = 0; repetition < 16; ++repetition) {
+  const auto& reused = compile_benchmark_image_labels_reused(input, 0, {8, 2}, 16, mode, workspace);
+  CHECK(reused.width == reference.width);
+  CHECK(reused.height == reference.height);
+  CHECK(reused.dropped == reference.dropped);
+  REQUIRE(reused.labels.size() == reference.labels.size());
+  REQUIRE(reused.runs.size() == reference.runs.size());
+  CHECK(std::memcmp(reused.labels.data(), reference.labels.data(), reused.labels.size() * sizeof(PackedInstance)) == 0);
+  CHECK(std::memcmp(reused.runs.data(), reference.runs.data(), reused.runs.size() * sizeof(RLEPair)) == 0);
+ }
+ CHECK(growths == prepared_growths);
+ CHECK(workspace.retained_bytes() == retained);
+ CHECK(retained <= BenchmarkLabelWorkspace::required_bytes(8));
+ std::printf("benchmark_label_fixture first_projection_ns=%lld active_label_bytes=%zu retained_workspace_bytes=%zu output_vector_growths=%zu steady_output_vector_growths=%zu scope=two_output_vectors_only mapped_backing=excluded production_baseline=unavailable\n",
+  static_cast<long long>(first_ns), active, retained, prepared_growths, growths - prepared_growths);
+ NormalizedAnnotationBuilder oversized;
+ oversized.images.push_back({99, 0, 2, 512, 512, 0, 0});
+ NormalizedBox box;
+ box.x2 = box.y2 = 1;
+ box.flags = kAnnotationMask | kAnnotationCategory;
+ box.source_category_id = 1;
+ box.mask_rle_pairs = 70000;
+ oversized.boxes.push_back(box);
+ for (std::uint32_t run = 0; run < 70000; ++run) oversized.mask_rle_pairs.push_back({run * 2, 1});
+ box.mask_rle_offset = oversized.mask_rle_pairs.size();
+ box.mask_rle_pairs = 3;
+ oversized.boxes.push_back(box);
+ for (std::uint32_t run = 0; run < 3; ++run) oversized.mask_rle_pairs.push_back({run * 2, 1});
+ const NormalizedAnnotationReadView large(fixture_index(oversized));
+ try {
+  (void)compile_benchmark_image_labels_reused(large, 0, {512, 512}, 512, mode, workspace);
+  FAIL("oversized complete mask must fail compilation");
+ } catch (const std::runtime_error& error) {
+  const std::string reason(error.what());
+  CHECK(reason.find("image 99") != std::string::npos);
+  CHECK(reason.find("required 560144 bytes") != std::string::npos);
+  CHECK(reason.find("capacity 500000") != std::string::npos);
+ }
+ CHECK(growths == prepared_growths);
+ CHECK(workspace.retained_bytes() <= BenchmarkLabelWorkspace::required_bytes(512));
+ const auto& restored = compile_benchmark_image_labels_reused(input, 0, {8, 2}, 16, mode, workspace);
+ REQUIRE(restored.runs.size() == reference.runs.size());
+ CHECK(std::memcmp(restored.runs.data(), reference.runs.data(), restored.runs.size() * sizeof(RLEPair)) == 0);
+ workspace.retire();
+ CHECK(workspace.retained_bytes() == 0);
+ (void)compile_benchmark_image_labels_reused(input, 0, {8, 2}, 16, mode, workspace);
+ CHECK(growths == prepared_growths + 2);
+}
 TEST_CASE("label projection preserves geometry provenance and present-empty masks", "[benchmark][labels][masks]") {
  auto input = label_projection_fixture(7);
  BenchmarkLabelWorkspace workspace;
@@ -8811,6 +8876,65 @@ TEST_CASE("dependency withdrawal retains the active label through overlapping ge
  REQUIRE(execution.labels_ready(replacement, 1, BenchmarkLabelInput(input, 0), "same-dependency", original_generation));
  REQUIRE(execution.wait_image_labels(root, 1, "same-dependency", original_generation));
 }
+TEST_CASE("provenance settlement coalesces used record blocks while preserving masks and identities", "[benchmark][pipeline][labels][writer]") {
+ mmltk::testsupport::ScopedTempDir temporary("settled-record-blocks");
+ const auto images = temporary.path() / "images";
+ prepare_cached_image_directory(images);
+ BenchmarkEncodedImage::publish(cached_image_path(images, 7), make_jpeg(20, 30, 40), {});
+ BenchmarkCompilePipeline execution(1);
+ PreparedBenchmarkSplit split;
+ split.name = "train";
+ split.class_names = {"person"};
+ auto output = benchmark_write_request(split, temporary.path() / "train.bin", 8);
+ output.execution = &execution;
+ BenchmarkSplitWriter writer(output, true);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.bind_source(images, writer, AnnotationSource::CoconutCoco);
+ const auto publication = execution.source_publication(images, {});
+ publication({7});
+ execution.wait_image(images, 7);
+ const auto slot = execution.image_slot(images, 7);
+ REQUIRE(slot);
+ constexpr std::size_t count = 519;
+ std::vector<PackedInstance> labels(count);
+ std::vector<RLEPair> runs(count, RLEPair{0, 1});
+ for (std::size_t i = 0; i < count; ++i) {
+  auto& label = labels[i];
+  label.bbox_x2 = label.bbox_y2 = 8;
+  label.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory;
+  label.annotation_id = 1000 + i;
+  label.source_category_id = 1;
+  label.source_ordinal = i;
+  label.original_area = 1;
+  label.mask_rle_offset = static_cast<decltype(label.mask_rle_offset)>(i * sizeof(RLEPair));
+  label.mask_rle_pairs = 1;
+ }
+ ImageEntry entry{};
+ entry.source = AnnotationSource::CoconutCoco;
+ entry.has_source_image_id = 1;
+ entry.source_image_id = 7;
+ const auto dimensions = writer.dimensions(*slot);
+ entry.original_width = dimensions.first;
+ entry.original_height = dimensions.second;
+ writer.write_labels(*slot, entry, {labels, runs}, 0, 19);
+ writer.settle_labels(*slot, 100, true);
+ const std::array selected{*slot};
+ auto sealed = writer.seal_slots(output, selected);
+ sealed.artifact.publish(output.output_path, {}, BenchmarkStagedArtifact::Publication::DurableReplace);
+ const auto compiled = CompiledDataset::open(output.output_path);
+ const auto actual = compiled.annotations(*slot);
+ REQUIRE(actual.labels.size() == count);
+ REQUIRE(actual.runs.size() == count);
+ for (std::size_t i = 0; i < count; ++i) {
+  CHECK(actual.labels[i].source_ordinal == i + 119);
+  CHECK(actual.labels[i].annotation_id == labels[i].annotation_id);
+  CHECK(actual.labels[i].flags == (labels[i].flags | kAnnotationOrdinalIncomplete));
+  CHECK(actual.labels[i].mask_rle_offset == labels[i].mask_rle_offset);
+  CHECK(actual.labels[i].original_area == labels[i].original_area);
+  CHECK(actual.runs[i].start == runs[i].start);
+  CHECK(actual.runs[i].length == runs[i].length);
+ }
+}
 TEST_CASE("dynamic benchmark slots write labels before pixels and replace one dependency in place", "[benchmark][pipeline][labels][writer][resources]") {
  mmltk::testsupport::ScopedTempDir temporary("independent-slot-products");
  const auto images = temporary.path() / "images";
@@ -8818,8 +8942,13 @@ TEST_CASE("dynamic benchmark slots write labels before pixels and replace one de
  const std::string_view selection = GENERATE("retain Large", "restore XL", "active XL");
  const bool incomplete = GENERATE(false, true);
  const bool restore = selection != "retain Large";
+ std::array<std::size_t, 2> retained_before_projection{};
+ std::size_t projections = 0;
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 13});
- execution.label_configuration(8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
+ execution.label_configuration(8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto, const BenchmarkLabelWorkspace& workspace) {
+  if (projections < retained_before_projection.size()) retained_before_projection[projections] = workspace.retained_bytes();
+  ++projections;
+ });
  PreparedBenchmarkSplit split;
  split.name = "train";
  split.class_names = {"person"};
@@ -8839,8 +8968,10 @@ TEST_CASE("dynamic benchmark slots write labels before pixels and replace one de
  annotations.boxes.push_back(box);
  const NormalizedAnnotationReadView xl(fixture_index(annotations));
  const auto source = execution.source_publication(images, {});
+ const auto labels_started = std::chrono::steady_clock::now();
  REQUIRE(execution.labels_ready(source, 7, BenchmarkLabelInput(xl, 0), "XL", 0, 1));
  REQUIRE(execution.wait_image_labels(images, 7, "XL"));
+ const auto first_labels_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - labels_started).count();
  const auto slot = execution.image_slot(images, 7);
  REQUIRE(slot);
  CHECK(writer.entry(*slot).num_instances == 1);
@@ -8851,15 +8982,23 @@ TEST_CASE("dynamic benchmark slots write labels before pixels and replace one de
  const NormalizedAnnotationReadView large(fixture_index(annotations));
  REQUIRE(execution.labels_ready(source, 7, BenchmarkLabelInput(large, 0), "Large", 0, 2));
  REQUIRE(execution.wait_image_labels(images, 7, "Large"));
+ CHECK(retained_before_projection[0] == 0);
+ CHECK(retained_before_projection[1] >= (COMPILED_LABEL_CAPACITY / sizeof(PackedInstance)) * sizeof(PackedInstance) + COMPILED_LABEL_CAPACITY);
  CHECK_FALSE(execution.has_image_labels(images, 7, "XL"));
  CHECK(execution.has_image_labels(images, 7, "Large"));
  CHECK(writer.entry(*slot).num_instances == 1);
  CHECK(execution.image_slot(images, 7) == slot);
  prepare_cached_image_directory(images);
  BenchmarkEncodedImage::publish(cached_image_path(images, 7), make_jpeg(20, 30, 40), {});
+ const auto pixels_started = std::chrono::steady_clock::now();
  source({7});
  execution.wait_image(images, 7);
+ const auto first_pixels_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pixels_started).count();
  CHECK(writer.completed() == 1);
+ if (!contradiction && selection == "retain Large" && !incomplete) {
+  std::printf("benchmark_pipeline_fixture first_label_slot_ns=%lld first_pixel_slot_ns=%lld used_label_bytes=%u reused_label_workspace_bytes=%zu labels_ready_before_JPEG=1 source_backing=fixture_owned_normalized_input timing_scope=ready_publication_to_slot_completion production_baseline=unavailable\n",
+   static_cast<long long>(first_labels_ns), static_cast<long long>(first_pixels_ns), writer.entry(*slot).label_bytes, retained_before_projection[1]);
+ }
  if (restore) {
   // Final component input already carries its canonical ordinal. The early XL
   // vectors were released after Large replaced them, so replay must use this input.

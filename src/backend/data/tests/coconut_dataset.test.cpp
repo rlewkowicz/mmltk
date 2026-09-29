@@ -45,6 +45,9 @@
 #include <stb_image_write.h>
 #include <zlib.h>
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <set>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -7003,6 +7006,64 @@ TEST_CASE("admitted Parquet rows survive physical consumers and omit reused proj
  rows.discard();
  CHECK(rows.size() == 0);
 }
+TEST_CASE("native RGB segment runs preserve exact IDs across dense prefixes unaligned boundaries and tails", "[benchmark][coconut][annotations][resources]") {
+ constexpr std::array<std::uint32_t, 5> ids{0x010203, 0x020203, 0x020303, 0x020304, 0xffffff};
+ constexpr std::uint32_t unknown = 0x800001;
+ CoconutNativeWorkspace workspace(CoconutImportLimits{});
+ std::uint64_t elapsed_ns = 0, total_pixels = 0, total_runs = 0, retained_peak = 0;
+ for (const std::uint32_t width : {1U, 2U, 10U, 11U, 18U, 19U, 20U, 21U, 31U, 32U, 33U, 63U, 64U, 65U, 127U, 4097U}) {
+  constexpr std::uint32_t height = 4;
+  CoconutRecord record;
+  record.image_id = 7;
+  record.width = width;
+  record.height = height;
+  for (const auto id : ids) record.segments.push_back({.id = id, .category_id = 1, .isthing = true});
+  std::vector<std::uint32_t> pixels(static_cast<std::size_t>(width) * height);
+  for (std::size_t i = 0; i < pixels.size(); ++i) {
+   pixels[i] = ids[(i / 37U + i / width) % ids.size()];
+   if (i % 113U == 0) pixels[i] = 0;
+   else if (i % 179U == 0) pixels[i] = unknown;
+  }
+  std::array<std::vector<RLEPair>, ids.size()> reference;
+  std::uint32_t first_unknown = 0;
+  for (std::size_t first = 0; first < pixels.size();) {
+   auto end = first + 1;
+   while (end < pixels.size() && pixels[end] == pixels[first]) ++end;
+   const auto found = std::ranges::find(ids, pixels[first]);
+   if (found != ids.end()) reference[static_cast<std::size_t>(found - ids.begin())].push_back({static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(end - first)});
+   else if (pixels[first] && !first_unknown) first_unknown = pixels[first];
+   first = end;
+  }
+  const auto encoded = png(static_cast<int>(width), height, pixels);
+  const auto input = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
+  const auto dimensions = workspace.admit_png(record, input);
+  const auto started = std::chrono::steady_clock::now();
+  workspace.decode(record, input, dimensions);
+  elapsed_ns += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+  retained_peak = std::max(retained_peak, workspace.retained_bytes());
+  total_pixels += pixels.size();
+  CHECK(workspace.unlisted_segment() == first_unknown);
+  auto support = workspace.take_support(record.segments.size());
+  REQUIRE(support.size() == ids.size());
+  for (std::size_t segment = 0; segment < ids.size(); ++segment) {
+   const auto actual = support[segment].runs.view();
+   REQUIRE(actual.size() == reference[segment].size());
+   std::uint64_t area = 0;
+   for (std::size_t run = 0; run < actual.size(); ++run) {
+    CHECK(actual[run].start == reference[segment][run].start);
+    CHECK(actual[run].length == reference[segment][run].length);
+    area += actual[run].length;
+   }
+   CHECK(support[segment].area == area);
+   CHECK(support[segment].valid);
+   total_runs += actual.size();
+  }
+ }
+ std::printf("native_png_fixture pixels=%llu runs=%llu decode_support_ns=%llu retained_workspace_peak=%llu reference=independent_scalar_ID_runs timing_scope=PNG_decode_and_support_not_SIMD_only production_baseline=unavailable\n",
+  static_cast<unsigned long long>(total_pixels), static_cast<unsigned long long>(total_runs), static_cast<unsigned long long>(elapsed_ns), static_cast<unsigned long long>(retained_peak));
+ workspace.retire();
+ CHECK(workspace.retained_bytes() == 0);
+}
 TEST_CASE("native image custody survives workspace reuse and physical retirement", "[benchmark][coconut][annotations][resources]") {
  const bool staged = GENERATE(false, true);
  ScopedTempDir root("native-image-mapped-custody");
@@ -8459,4 +8520,53 @@ TEST_CASE("artifact identity settlement withdraws exact labels and preserves pix
   CHECK(writer.image_complete(slots[i]));
  }
  CHECK(pixel_writes == 3);
+}
+TEST_CASE("custom source admission keeps ready label peers useful while its first projection is held", "[benchmark][coconut][pipeline][resources]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPU lanes");
+ ScopedTempDir root("custom-label-ready-window");
+ LocalCoconutRecipe local(root.path());
+ std::vector<unsigned> ids;
+ std::vector<std::pair<std::string, std::string>> members;
+ for (unsigned id = 100; id < 170; ++id) { ids.push_back(id); members.emplace_back(coco(id).member, white_jpeg()); }
+ replace_physical_images(local.cache, local.catalog, CoconutImageNamespace::CocoTrain, members);
+ auto custom = local_custom_catalog(local, ids);
+ auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::CoconutStock}, true);
+ config.num_workers = 4;
+ compile_benchmark_recipe(config, nullptr, &custom);
+ const auto image_root = local.cache.source_images("coco") / "train2017";
+ mmltk::testsupport::TestGate first("first ready custom label projection");
+ std::atomic<bool> cancelled{false}, armed{false}, peer_delivered{false};
+ DeferredCancellationGate observation{cancelled};
+ config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Borrow(observation);
+ std::promise<void> peer_written;
+ std::mutex mutex;
+ std::set<std::uint64_t> peers;
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event != "benchmark.labels.projection_started" && event != "benchmark.labels.slot_written") return;
+  const auto value = Json::parse(fields);
+  if (value.at("root").get<std::string>() != image_root.string()) return;
+  const auto id = value.at("image_id").get<std::uint64_t>();
+  if (event == "benchmark.labels.projection_started" && id == ids.front() && !armed.exchange(true)) {
+   DeferredCancellationGate::next() = &first;
+  } else if (event == "benchmark.labels.slot_written" && id != ids.front()) {
+   { const std::lock_guard lock(mutex); peers.insert(id); }
+   if (!peer_delivered.exchange(true)) peer_written.set_value();
+  }
+ };
+ auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, nullptr, &custom); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled = true; first.Release(); });
+ REQUIRE(first.WaitEntered(5s));
+ mmltk::testsupport::await_test_promise(peer_written, "independent ready label writes before the first selected result", 5s);
+ CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
+ { const std::lock_guard lock(mutex);
+  CHECK_FALSE(peers.empty());
+  CHECK(peers.size() <= 7); // Four lanes admit eight uncollected claims, including the held first image.
+ }
+ first.Release();
+ mmltk::testsupport::await_test_future(compiling, "bounded custom label ready-window completion", 5s);
+ const auto compiled = CompiledDataset::open(local.output / "train.bin");
+ std::set<std::uint64_t> observed;
+ for (const auto& entry : compiled.image_entries())
+  if (entry.eligible() && entry.source == AnnotationSource::Coco) observed.insert(entry.source_image_id);
+ CHECK(observed == std::set<std::uint64_t>(ids.begin(), ids.end()));
 }

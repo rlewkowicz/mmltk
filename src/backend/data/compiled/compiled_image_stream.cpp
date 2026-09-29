@@ -195,6 +195,19 @@ struct CompiledImageStream::Impl {
   for (auto& queue : completions) queue.jobs.resize(config.slots);
  }
  Config config;
+ template <class Storage, class Operation>
+ void prepare_storage(StorageKind kind, std::size_t index, Storage& storage, Operation&& operation) {
+  const auto observer = config.storage_growth;
+  if (!observer.grown) { operation(); return; }
+  const auto capacity = [&] {
+   if constexpr (requires { storage.capacity_bytes(); }) return storage.capacity_bytes();
+   else return storage.capacity() * sizeof(typename Storage::value_type);
+  };
+  const auto before = capacity();
+  operation();
+  const auto after = capacity();
+  if (after > before) observer.grown(observer.context, kind, index, before, after);
+ }
  gpu::DeviceExecution execution;
  std::vector<int> cpus;
  bool private_pool;
@@ -443,7 +456,7 @@ void CompiledImageStream::prepare_host(const std::size_t index, const std::size_
  auto& slot = *impl_->slots.at(index);
  if (impl_->failure) std::rethrow_exception(impl_->failure);
  if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced) throw std::logic_error("compiled image host storage is still borrowed");
- on_context(impl_->context, [&] { slot.host.ensure_bytes(bytes); });
+ on_context(impl_->context, [&] { impl_->prepare_storage(StorageKind::HostImages, index, slot.host, [&] { slot.host.ensure_bytes(bytes); }); });
 }
 void CompiledImageStream::prepare_reads(std::size_t index, std::size_t count, bool annotations) {
  const std::lock_guard lock(impl_->mutex);
@@ -453,10 +466,10 @@ void CompiledImageStream::prepare_reads(std::size_t index, std::size_t count, bo
  if (annotations || !slot.annotations.empty()) {
   count = std::max(count, slot.annotations.size());
   const auto bytes = mmltk::common::math::checked_multiply(count, COMPILED_LABEL_CAPACITY, "compiled batch labels overflow");
-  on_context(impl_->context, [&] { slot.labels.ensure_bytes(bytes); });
-  slot.annotations.resize(count);
+  on_context(impl_->context, [&] { impl_->prepare_storage(StorageKind::Labels, index, slot.labels, [&] { slot.labels.ensure_bytes(bytes); }); });
+  impl_->prepare_storage(StorageKind::AnnotationViews, index, slot.annotations, [&] { slot.annotations.resize(count); });
  }
- slot.reads.reserve(count);
+ impl_->prepare_storage(StorageKind::ReadDescriptors, index, slot.reads, [&] { slot.reads.reserve(count); });
 }
 const CompiledImageStream::Buffer& CompiledImageStream::label_storage(std::size_t index) const { return impl_->slots.at(index)->labels; }
 std::span<const ImageAnnotations> CompiledImageStream::annotations(std::size_t index) const {
@@ -471,7 +484,7 @@ void CompiledImageStream::prepare_metadata(std::size_t index, std::size_t bytes)
  auto& slot = *impl_->slots.at(index);
  std::lock_guard lock(impl_->mutex);
  if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced) throw std::logic_error("compiled image metadata is still borrowed");
- on_context(impl_->context, [&] { slot.metadata.ensure_bytes(bytes); });
+ on_context(impl_->context, [&] { impl_->prepare_storage(StorageKind::Metadata, index, slot.metadata, [&] { slot.metadata.ensure_bytes(bytes); }); });
 }
 const CompiledImageStream::Buffer& CompiledImageStream::metadata_storage(std::size_t index) { return impl_->slots.at(index)->metadata; }
 void CompiledImageStream::prepare_device(const std::size_t index, const std::size_t bytes) {
@@ -490,7 +503,7 @@ void CompiledImageStream::prepare_device(const std::size_t index, const std::siz
   // Slots have independent storage. Growing this idle slot does not
   // settle unrelated reads or GPU consumers.
   try {
-   buffer.ensure_bytes(bytes);
+   impl_->prepare_storage(StorageKind::DeviceImages, index, buffer, [&] { buffer.ensure_bytes(bytes); });
   } catch (const std::exception& error) {
    if (gpu::find_image_failure<gpu::GdrTransportUnavailable>(std::current_exception())) throw;
    throw std::runtime_error("compiled image loading on CUDA device " + std::to_string(impl_->config.device) +

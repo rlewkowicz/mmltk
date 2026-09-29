@@ -360,8 +360,9 @@ SourceCompileCount append_source_plan(BenchmarkCompilePipeline& execution, const
        image.source_image_id, BenchmarkLabelInput(index, image_index), std::string(chunk.dependency), original_generation))
    throw RetiredBenchmarkLabelGeneration("benchmark required label generation retired before admission");
  };
- // All missing inputs enter the same per-image admission before any joins.
- // An early native conversion is either reused or joined, never raced by a fallback.
+ // Keep a bounded ready window in the shared scheduler while collecting in
+ // selection order. Early native conversions are reused or joined.
+ std::size_t published_end = 0;
  SourceCompileCount counts{index.source, index.image_count(), 0U, 0U};
  const auto collect = [&](std::size_t image_index) {
   auto& chunk = chunks[image_index];
@@ -371,15 +372,17 @@ SourceCompileCount append_source_plan(BenchmarkCompilePipeline& execution, const
   std::shared_ptr<const BenchmarkLabelChunk> product_owner;
   for (;;) {
    try {
+    publish(image_index);
     product_owner = execution.wait_image_labels(directories[local_source].path, image.source_image_id, chunk.dependency, original_generation);
     break;
    } catch (const BenchmarkImageReadError& error) {
     if (!repair(directories[local_source].path, error)) {
      if (require_every_image) throw;
      chunk.available = false;
+     for (std::size_t peer = image_index + 1; peer < published_end; ++peer) publish(peer);
      return;
     }
-    publish(image_index);
+    for (std::size_t peer = image_index; peer < published_end; ++peer) publish(peer);
    }
   }
   if (!product_owner) throw RetiredBenchmarkLabelGeneration("benchmark required label generation retired before assembly");
@@ -402,7 +405,12 @@ SourceCompileCount append_source_plan(BenchmarkCompilePipeline& execution, const
   counts.compiled_images = common_math::checked_add(counts.compiled_images, 1U, "benchmark compiled image count overflow");
   counts.compiled_boxes = common_math::checked_add(counts.compiled_boxes, stored.num_instances, "benchmark compiled box count overflow");
  };
- for (std::size_t i = 0; i < chunks.size(); ++i) { publish(i); collect(i); }
+ const auto window = std::max<std::size_t>(1, std::min<std::size_t>(execution.workers(), 32) * 2);
+ for (std::size_t i = 0; i < chunks.size(); ++i) {
+  const auto end = i + std::min(window, chunks.size() - i);
+  while (published_end < end) publish(published_end++);
+  collect(i);
+ }
  return counts;
 }
 [[nodiscard]] PreparedBenchmarkSplit make_split(const std::string& name) {
@@ -835,7 +843,19 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   auto compile_cpus = common_system::allowed_cpu_set();
   compile_cpus.resize(effective_num_workers);
   BenchmarkCompilePipeline pipeline(effective_num_workers, compile_cpus, limits, cancel_requested);
-  pipeline.label_configuration(config.resolution, config.resize_mode);
+  std::function<void(const std::filesystem::path&, std::uint64_t, const BenchmarkLabelWorkspace&)> observe_label_projection;
+  std::function<void(const std::filesystem::path&, std::uint64_t)> observe_label_write;
+  if (trace) {
+   observe_label_projection = [&](const auto& root, auto id, const BenchmarkLabelWorkspace& workspace) {
+    trace_benchmark_event(trace, "benchmark.labels.projection_started", [&] {
+     return nlohmann::json{{"root", root.string()}, {"image_id", id}, {"retained_workspace_bytes", workspace.retained_bytes()}};
+    });
+   };
+   observe_label_write = [&](const auto& root, auto id) {
+    trace_benchmark_event(trace, "benchmark.labels.slot_written", [&] { return nlohmann::json{{"root", root.string()}, {"image_id", id}}; });
+   };
+  }
+  pipeline.label_configuration(config.resolution, config.resize_mode, std::move(observe_label_projection), std::move(observe_label_write));
   // Inventory, annotation prerequisites, prefetched archives and later repair
   // may retain source leases before their first transfer. Protect their shared
   // fixed transport once, before any of those dependent producers are admitted.

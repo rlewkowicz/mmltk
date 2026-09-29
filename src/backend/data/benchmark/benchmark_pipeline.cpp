@@ -1078,14 +1078,22 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
    if (label) {
     if (label_started) label_started(label->label->image->source->root, label->label->image->image_id, label_workspaces[lane]);
     const auto& input = *label->input;
-    auto product = std::make_shared<BenchmarkLabelChunk>(
-     compile_benchmark_image_labels(input.index(), input.position(), {label->width, label->height}, label_resolution, label_resize_mode, label_workspaces[lane], cancellation));
     auto& result = *label->label;
     auto& image = *result.image;
     Slot* target = nullptr;
     {
      const std::lock_guard lock(mutex);
      if (image.source->incremental_writer) target = images.bind_image(*image.source, image.image_id);
+    }
+    auto product = std::make_shared<BenchmarkLabelChunk>();
+    const BenchmarkLabelChunk* projected = product.get();
+    if (target) {
+     projected = &compile_benchmark_image_labels_reused(input.index(), input.position(), {label->width, label->height}, label_resolution, label_resize_mode, label_workspaces[lane], cancellation);
+     product->width = projected->width;
+     product->height = projected->height;
+     product->dropped = projected->dropped;
+    } else {
+     *product = compile_benchmark_image_labels(input.index(), input.position(), {label->width, label->height}, label_resolution, label_resize_mode, label_workspaces[lane], cancellation);
     }
     if (target) {
      const std::lock_guard write(target->label_write);
@@ -1102,17 +1110,16 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
       entry.source = image.source->annotation_source;
       entry.original_width = product->width;
       entry.original_height = product->height;
-      target->writer->write_labels(static_cast<std::uint32_t>(target->index), entry, {product->labels, product->runs}, lane);
+      target->writer->write_labels(static_cast<std::uint32_t>(target->index), entry, {projected->labels, projected->runs}, lane);
       {
        const std::lock_guard lock(mutex);
        target->selected_label = &result;
       }
       if (label_completed) label_completed(image.source->root, image.image_id);
      }
-     // Normalized/native custody is mapped; completed compiled payloads never
-     // accumulate behind unrelated acquisition or inventory settlement.
-     std::vector<PackedInstance>().swap(product->labels);
-     std::vector<RLEPair>().swap(product->runs);
+     // The frame owns this lane until the direct write and observation finish.
+     // Only the small immutable result survives; reusable output remains charged
+     // as lane scratch and mapped input remains the authority for claim replay.
     }
     const std::lock_guard lock(mutex);
     if (!stopping && !result.retired && !image.retiring && !image.source->retiring && result.attempt == images.attempt() && label->generation == image.source->image_generation(image.image_id) &&

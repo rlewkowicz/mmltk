@@ -8,6 +8,10 @@ struct MemoryPolicy final {
  std::vector<unsigned long> mask;
 };
 [[nodiscard]] MemoryPolicy capture_memory_policy();
+// Capture on the calling thread into storage prepared by an earlier capture.
+// This overload neither allocates nor changes the mask extent.
+void capture_memory_policy(MemoryPolicy& prepared);
+[[nodiscard]] MemoryPolicy prepare_bound_memory_policy(int node);
 void restore_memory_policy(const MemoryPolicy&);
 void bind_memory_node(int node);
 [[nodiscard]] int bound_memory_node(const MemoryPolicy&);

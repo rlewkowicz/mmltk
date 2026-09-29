@@ -61,4 +61,35 @@ TEST_CASE("Denied binding or page verification never publishes host storage", "[
   }) == 0);
  }
 }
+TEST_CASE("Prepared memory policy capture reuses storage and validates permitted nodes", "[common][system][numa-memory]") {
+ const auto facts = NumaTopology::Capture();
+ const auto before = capture_memory_policy();
+ auto captured = before;
+ auto* const storage = captured.mask.data();
+ const auto capacity = captured.mask.capacity();
+ const auto desired = prepare_bound_memory_policy(facts.permitted_nodes.front());
+ CHECK(bound_memory_node(desired) == facts.permitted_nodes.front());
+ for (unsigned i = 0; i < 4; ++i) {
+  capture_memory_policy(captured);
+  CHECK(captured.mode == before.mode);
+  CHECK(captured.mask == before.mask);
+  CHECK(captured.mask.data() == storage);
+  CHECK(captured.mask.capacity() == capacity);
+ }
+ CHECK_THROWS_AS(prepare_bound_memory_policy(-1), std::invalid_argument);
+ CHECK_THROWS_AS(prepare_bound_memory_policy(std::numeric_limits<int>::max()), std::invalid_argument);
+ MemoryPolicy empty;
+ CHECK_THROWS_AS(capture_memory_policy(empty), std::invalid_argument);
+ CHECK(test_support::with_denied_syscall(SYS_get_mempolicy, [&] {
+  try {
+   capture_memory_policy(captured);
+  } catch (const std::system_error& error) {
+   if (error.code().value() != EPERM || captured.mask.data() != storage) return false;
+   try {
+    (void)prepare_bound_memory_policy(facts.permitted_nodes.front());
+   } catch (const std::system_error& denied) { return denied.code().value() == EPERM; }
+  }
+  return false;
+ }) == 0);
+}
 }  // namespace

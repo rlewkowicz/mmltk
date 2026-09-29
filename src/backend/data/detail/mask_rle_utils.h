@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 #include <utility>
 #include "src/backend/data/compiled/compiled_format.h"
@@ -26,16 +28,26 @@ struct EncodedRowMajorMask {
 struct MaskResizeScratch {
  std::vector<std::pair<std::uint32_t, std::uint32_t>> intervals;
 };
+class MaskRunCapacityError final : public std::length_error {
+public:
+ explicit MaskRunCapacityError(std::size_t required) : std::length_error("row-major mask exceeds bounded output"), required_(required) {}
+ [[nodiscard]] std::size_t required_runs() const noexcept { return required_; }
+private:
+ std::size_t required_;
+};
 // Emits ordered, nonoverlapping runs of one independent mask. The explicit
 // boundary prevents adjacency coalescing with a preceding mask. Callers own
 // input validation and transactional rollback; overlap union is a separate algorithm.
 class MaskRunEmitter final {
 public:
  MaskRunEmitter(std::vector<RLEPair>& output, std::size_t first_run, std::uint32_t width, RowMajorMaskBounds* bounds = nullptr, const char* start_error = "mask run start overflow",
-  const char* length_error = "mask run length overflow")
-     : output_(output), first_(first_run), width_(width), bounds_(bounds), start_error_(start_error), length_error_(length_error) {}
+  const char* length_error = "mask run length overflow", std::size_t maximum_runs = std::numeric_limits<std::size_t>::max())
+     : output_(output), first_(first_run), width_(width), bounds_(bounds), start_error_(start_error), length_error_(length_error), maximum_(maximum_runs), required_(output.size()) {
+  if (required_ > first_) last_ = output.back();
+ }
  void run(std::uint64_t begin, std::uint64_t end);
  void slab(std::uint32_t first_row, std::uint32_t end_row, std::span<const std::pair<std::uint32_t, std::uint32_t>>);
+ void finish() const;
 
 private:
  std::vector<RLEPair>& output_;
@@ -44,6 +56,8 @@ private:
  RowMajorMaskBounds* bounds_;
  const char* start_error_;
  const char* length_error_;
+ std::size_t maximum_, required_;
+ RLEPair last_{};
 };
 // Accumulates one validated nonempty [begin, end) run at a nonzero width.
 // A null output skips geometry; validation and cancellation remain caller-owned.
@@ -55,5 +69,5 @@ void materialize_row_major_mask(std::span<const RLEPair> pairs, MaskDimensions d
 // Appends one independent mask, coalescing only within that mask. Failure leaves
 // output and source bounds unchanged; empty input leaves source bounds untouched.
 [[nodiscard]] RowMajorMaskBounds append_resized_row_major_mask(std::span<const RLEPair>, MaskDimensions source, MaskDimensions target, const mmltk::backend::imaging::resample::ImageResizeGeometry&,
- MaskResizeScratch*, std::vector<RLEPair>& output, RowMajorMaskBounds* source_bounds = nullptr);
+ MaskResizeScratch*, std::vector<RLEPair>& output, RowMajorMaskBounds* source_bounds = nullptr, std::size_t maximum_runs = std::numeric_limits<std::size_t>::max());
 }  // namespace mmltk::backend::data::dataset

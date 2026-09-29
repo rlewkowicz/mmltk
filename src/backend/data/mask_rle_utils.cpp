@@ -42,11 +42,26 @@ void MaskRunEmitter::run(std::uint64_t begin, std::uint64_t end) {
  const auto start = checked_cast<std::uint32_t>(begin, start_error_);
  if (end < begin) throw std::overflow_error(length_error_);
  const auto length = checked_cast<std::uint32_t>(end - begin, length_error_);
- if (output_.size() > first_ && std::uint64_t{output_.back().start} + output_.back().length == begin)
-  output_.back().length = checked_cast<std::uint32_t>(end - output_.back().start, length_error_);
- else
-  output_.push_back({start, length});
+ if (required_ > first_ && std::uint64_t{last_.start} + last_.length == begin) {
+  last_.length = checked_cast<std::uint32_t>(end - last_.start, length_error_);
+  if (required_ <= maximum_) output_.back() = last_;
+ } else {
+  const auto required = mmltk::common::math::checked_add(required_, std::size_t{1}, "mask run count overflow");
+  const RLEPair next{start, length};
+  if (required <= maximum_) {
+   if (output_.size() == output_.capacity() && maximum_ != std::numeric_limits<std::size_t>::max()) {
+    const auto growth = std::min(maximum_ - output_.capacity(), std::max(std::size_t{1}, output_.capacity()));
+    output_.reserve(output_.capacity() + growth);
+   }
+   output_.push_back(next);
+  }
+  required_ = required;
+  last_ = next;
+ }
  include_row_major_mask_run(bounds_, begin, end, width_);
+}
+void MaskRunEmitter::finish() const {
+ if (required_ > maximum_) throw MaskRunCapacityError(required_);
 }
 void MaskRunEmitter::slab(std::uint32_t first, std::uint32_t end, std::span<const std::pair<std::uint32_t, std::uint32_t>> intervals) {
  if (first == end || intervals.empty()) return;
@@ -127,7 +142,7 @@ void materialize_row_major_mask(const std::span<const RLEPair> pairs, const Mask
  }
 }
 RowMajorMaskBounds append_resized_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions source_dimensions, const MaskDimensions target_dimensions,
- const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch, std::vector<RLEPair>& output, RowMajorMaskBounds* source_bounds) {
+ const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch, std::vector<RLEPair>& output, RowMajorMaskBounds* source_bounds, std::size_t maximum_runs) {
  if (scratch == nullptr || letterbox.resized_width == 0U || letterbox.resized_height == 0U || letterbox.resized_width > target_dimensions.width ||
      letterbox.resized_height > target_dimensions.height || letterbox.offset_x > target_dimensions.width - letterbox.resized_width ||
      letterbox.offset_y > target_dimensions.height - letterbox.resized_height) {
@@ -146,7 +161,7 @@ RowMajorMaskBounds append_resized_row_major_mask(const std::span<const RLEPair> 
   const auto denominator = std::uint64_t{2} * source_extent;
   return static_cast<std::uint32_t>(std::min<__uint128_t>(target_extent, (numerator - source_extent + denominator - 1) / denominator));
  };
- MaskRunEmitter emitter(output, output_begin, target_dimensions.width, &target);
+ MaskRunEmitter emitter(output, output_begin, target_dimensions.width, &target, "mask run start overflow", "mask run length overflow", maximum_runs);
  scratch->intervals.clear();
  std::uint32_t pending_row = 0;
  const auto slab = [&](std::uint32_t first, std::uint32_t last, std::span<const std::pair<std::uint32_t, std::uint32_t>> intervals) {
@@ -202,6 +217,7 @@ RowMajorMaskBounds append_resized_row_major_mask(const std::span<const RLEPair> 
    if (remaining) partial(row, 0, static_cast<std::uint32_t>(remaining));
   }
   if (!identity) flush();
+  emitter.finish();
  } catch (...) {
   output.resize(output_begin);
   throw;

@@ -962,6 +962,38 @@ TEST_CASE("independent mask slabs never merge across their append boundary", "[b
  CHECK_THROWS_WITH(overflow.run(0, std::uint64_t{UINT32_MAX} + 1), "source length overflow");
  CHECK(std::ranges::equal(before, output, [](auto left, auto right) { return left.start == right.start && left.length == right.length; }));
 }
+TEST_CASE("bounded mask projection counts its complete coalesced extent without retaining overflow", "[backend][data][compiler][mask]") {
+ namespace masks = mmltk::backend::data::dataset;
+ using mmltk::backend::data::RLEPair;
+ const std::array source{RLEPair{0, 1}, RLEPair{1, 1}, RLEPair{4, 1}, RLEPair{6, 1}, RLEPair{9, 1}};
+ const auto geometry = mmltk::backend::imaging::resample::compute_image_resize_geometry(5, 2, 5, 2, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
+ masks::MaskResizeScratch scratch;
+ std::vector<RLEPair> output{{13, 2}};
+ masks::RowMajorMaskBounds bounds{99, 98, 97, 96, true};
+ try {
+  (void)masks::append_resized_row_major_mask(source, {5, 2}, {5, 2}, geometry, &scratch, output, &bounds, 3);
+  FAIL("bounded mask output must reject the complete required extent");
+ } catch (const masks::MaskRunCapacityError& error) {
+  CHECK(error.required_runs() == 5); // Four coalesced runs plus the preceding independent mask.
+ }
+ REQUIRE(output.size() == 1);
+ CHECK(output[0].start == 13);
+ CHECK(output[0].length == 2);
+ CHECK(output.capacity() <= 3);
+ CHECK(bounds.min_x == 99);
+ CHECK(bounds.max_y == 96);
+ (void)masks::append_resized_row_major_mask(source, {5, 2}, {5, 2}, geometry, &scratch, output, &bounds, 5);
+ REQUIRE(output.size() == 5);
+ CHECK(output[1].start == 0);
+ CHECK(output[1].length == 2);
+ CHECK(output.back().start == 9);
+ CHECK(bounds.min_x == 0);
+ CHECK(bounds.max_y == 2);
+ std::vector<RLEPair> empty;
+ CHECK_THROWS_AS(masks::append_resized_row_major_mask(source, {5, 2}, {5, 2}, geometry, &scratch, empty, nullptr, 0), masks::MaskRunCapacityError);
+ CHECK(empty.empty());
+ CHECK(empty.capacity() == 0);
+}
 TEST_CASE("benchmark progress drains outside producers and preserves withdrawal boundaries", "[backend][data][benchmark][progress]") {
  using namespace mmltk::backend::data::benchmark_internal;
  const BenchmarkTraceSink quiet;

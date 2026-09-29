@@ -8,9 +8,15 @@
 #include <sched.h>
 #include <system_error>
 #include <algorithm>
+#include <thread>
 #include "src/common/concurrency/worker_pool.h"
 namespace {
 using namespace mmltk::common::system;
+bool same_policy(const ExecutionPolicySnapshot& left, const ExecutionPolicySnapshot& right) {
+ return left.affinity == right.affinity && left.memory_policy.mode == right.memory_policy.mode && left.memory_policy.mask == right.memory_policy.mask &&
+        left.nice_value == right.nice_value && left.scheduler_policy == right.scheduler_policy && left.scheduler_priority == right.scheduler_priority &&
+        left.io_class == right.io_class && left.io_priority_data == right.io_priority_data && left.thread_name == right.thread_name;
+}
 NumaTopology topology() {
  return {.permitted_cpus = {2, 7, 19, 31, 42}, .permitted_nodes = {0, 3}, .cpus = {{2, 0, 0, 0}, {7, 0, 0, 0}, {19, 0, 0, 1}, {31, 3, 1, 0}, {42, 3, 1, 1}}, .nodes = {{0, 4096}, {3, 8192}}};
 }
@@ -73,6 +79,51 @@ TEST_CASE("Denied priority and NUMA policy fail required worker startup", "[comm
    return false;
   }) == 0);
  }
+}
+TEST_CASE("Prepared scopes recapture each caller and restore across serial reuse", "[common][system][policy]") {
+ const auto selected = test_support::first_permitted_cpu(NumaTopology::Capture());
+ PreparedExecutionPolicy prepared({{selected.cpu}, "prepared-active", 0, selected.node, -10, true});
+ const auto original = capture_execution_policy_snapshot();
+ bool restored = false;
+ std::thread caller([&] {
+  try {
+   set_thread_name("prepared-caller");
+   const auto before = capture_execution_policy_snapshot();
+   restored = true;
+   for (unsigned i = 0; i < 4; ++i) {
+    {
+     ScopedExecutionPolicy scope(prepared);
+     const auto active = capture_execution_policy_snapshot();
+     restored = restored && active.affinity == std::vector<int>{selected.cpu} && active.numa_node == selected.node && active.thread_name == "prepared-active";
+    }
+    restored = restored && same_policy(before, capture_execution_policy_snapshot());
+   }
+  } catch (...) { restored = false; }
+ });
+ caller.join();
+ CHECK(restored);
+ CHECK(same_policy(original, capture_execution_policy_snapshot()));
+ {
+  ScopedExecutionPolicy scope(prepared);
+  CHECK_THROWS_AS(ScopedExecutionPolicy(prepared), std::logic_error);
+ }
+ CHECK(same_policy(original, capture_execution_policy_snapshot()));
+}
+TEST_CASE("Prepared scopes remain reusable after partial policy failure", "[common][system][policy]") {
+ CHECK(test_support::with_denied_syscall(SYS_ioprio_set, [] {
+  const auto selected = test_support::first_permitted_cpu(NumaTopology::Capture());
+  PreparedExecutionPolicy prepared({{selected.cpu}, "prepared-denied", 0, selected.node, -10, true});
+  const auto before = capture_execution_policy_snapshot();
+  for (unsigned i = 0; i < 3; ++i) {
+   try {
+    ScopedExecutionPolicy scope(prepared);
+    return false;
+   } catch (const std::system_error& error) {
+    if (error.code().value() != EPERM || !same_policy(before, capture_execution_policy_snapshot())) return false;
+   }
+  }
+  return true;
+ }) == 0);
 }
 }  // namespace
 TEST_CASE("Synchronous policy failure restores every policy already changed", "[common][system][policy]") {

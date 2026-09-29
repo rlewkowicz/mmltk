@@ -206,17 +206,7 @@ void BenchmarkSplitWriter::settle_labels(std::uint32_t slot, std::uint64_t ordin
  if (!ordinal_base && !ordinal_incomplete) return;
  const std::lock_guard lock(impl_->facts_mutex);
  const auto& entry = impl_->entries.at(slot);
- PackedInstance label;
- for (std::size_t i = 0; i < entry.num_instances; ++i) {
-  const auto offset = impl_->layout.label_offset(slot) + i * sizeof(label);
-  impl_->staging.file().pread_all(&label, sizeof(label), offset);
-  label.source_ordinal = common_math::checked_add(label.source_ordinal, ordinal_base, "benchmark source ordinal overflow");
-  impl_->staging.file().pwrite_all(&label.source_ordinal, sizeof(label.source_ordinal), offset + offsetof(PackedInstance, source_ordinal));
-  if (ordinal_incomplete) {
-   label.flags |= kAnnotationOrdinalIncomplete;
-   impl_->staging.file().pwrite_all(&label.flags, sizeof(label.flags), offset + offsetof(PackedInstance, flags));
-  }
- }
+ write_compiled_label_ordinals(impl_->staging.file(), impl_->layout.label_offset(slot), entry.num_instances, {}, ordinal_base, ordinal_incomplete);
 }
 void BenchmarkSplitWriter::write_labels(std::uint32_t slot, ImageEntry entry, ImageAnnotations annotations, std::size_t lane, std::uint64_t ordinal_base) {
  auto& state = *impl_;
@@ -229,20 +219,14 @@ void BenchmarkSplitWriter::write_labels(std::uint32_t slot, ImageEntry entry, Im
  checks.image_width = checks.image_height = state.resolution;
  (void)admit_compiled_annotations(entry, annotations, checks, slot, state.cancellation);
  (void)lane;
- alignas(PackedInstance) std::array<std::byte, COMPILED_LABEL_CAPACITY> scratch;
- const auto payload = annotation_layout(entry.num_instances, entry.num_runs);
- if (!annotations.labels.empty()) std::memcpy(scratch.data(), annotations.labels.data(), annotations.labels.size_bytes());
- auto* labels = reinterpret_cast<PackedInstance*>(scratch.data());
- for (std::size_t i = 0; i < annotations.labels.size(); ++i) labels[i].source_ordinal = common_math::checked_add(labels[i].source_ordinal, ordinal_base, "benchmark source ordinal overflow");
- std::memset(scratch.data() + annotations.labels.size_bytes(), 0, payload.run_offset - annotations.labels.size_bytes());
- if (!annotations.runs.empty()) std::memcpy(scratch.data() + payload.run_offset, annotations.runs.data(), annotations.runs.size_bytes());
- std::size_t offset;
+ FileLayout layout;
  {
   const std::lock_guard lock(state.facts_mutex);
   const auto& image = state.images.at(slot);
   if (image.source_image_id != entry.source_image_id)
    throw std::runtime_error("benchmark label identity or canvas differs from pixels");
-  offset = state.layout.label_offset(slot);
+  layout = state.layout;
+  const auto offset = layout.label_offset(slot);
   const auto pages = compiled_align_up(entry.label_bytes, PAGE_SIZE) / PAGE_SIZE;
   const auto retained = state.label_pages[slot];
   if (pages > retained) {
@@ -250,7 +234,7 @@ void BenchmarkSplitWriter::write_labels(std::uint32_t slot, ImageEntry entry, Im
    state.label_pages[slot] = common_math::checked_cast<std::uint8_t>(pages, "benchmark label page count overflow");
   }
  }
- state.staging.file().pwrite_all(scratch.data(), payload.used_bytes, offset);
+ write_compiled_annotations(state.staging.file(), layout, slot, entry, annotations, ordinal_base);
  {
   const std::lock_guard lock(state.facts_mutex);
   state.entries[slot] = entry;
