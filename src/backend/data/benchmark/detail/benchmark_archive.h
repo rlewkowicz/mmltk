@@ -26,8 +26,8 @@ public:
  // Two-byte format inspection sizes source admission; it never enumerates or
  // decompresses members. The returned bound includes this reader's buffers.
  [[nodiscard]] static std::uint64_t workspace_bytes(const std::filesystem::path&, std::uint64_t consumer_workspace, std::size_t gzip_workers = 1);
- explicit BenchmarkArchive(const std::filesystem::path&, BenchmarkCompilePipeline* = nullptr,
-  std::uint64_t workspace = 0, const BenchmarkAllowance& parent = {}, std::size_t gzip_workers = 1, bool verify_gzip_crc = true, BenchmarkAllowance workspace_allowance = {}, std::size_t retained_gzip_windows = 1024, std::size_t consumer_descriptors = 0, std::size_t gzip_index_entries = 32768);
+ explicit BenchmarkArchive(const std::filesystem::path&, BenchmarkCompilePipeline* = nullptr, std::uint64_t workspace = 0, const BenchmarkAllowance& parent = {}, std::size_t gzip_workers = 1,
+  bool verify_gzip_crc = true, BenchmarkAllowance workspace_allowance = {}, std::size_t retained_gzip_windows = 1024, std::size_t consumer_descriptors = 0, std::size_t gzip_index_entries = 32768);
  ~BenchmarkArchive();
  BenchmarkArchive(const BenchmarkArchive&) = delete;
  BenchmarkArchive& operator=(const BenchmarkArchive&) = delete;
@@ -60,13 +60,20 @@ public:
  // receives its original input index and borrows this reader synchronously.
  // One format context spans the batch, including ZIP/extended/sparse tar and
  // paused or evicted gzip state. A missing/conflicting request is an error.
- void visit_known(std::span<const std::string> members, const std::function<void(std::size_t)>&,
-  mmltk::common::concurrency::CancellationObservation = {});
+ void visit_known(std::span<const std::string> members, const std::function<void(std::size_t)>&, mmltk::common::concurrency::CancellationObservation = {});
  // Release decoder/buffer capacity between discovery and later consumption.
  // The opened inode and encountered positions stay bound to this generation.
  void pause();
  void resume(std::uint64_t workspace);
- struct GzipSeekState { std::size_t dictionaries; bool retained; bool streaming; bool rolling; bool control_capacity_reached; std::size_t index_entries; std::size_t index_bytes; };
+ struct GzipSeekState {
+  std::size_t dictionaries;
+  bool retained;
+  bool streaming;
+  bool rolling;
+  bool control_capacity_reached;
+  std::size_t index_entries;
+  std::size_t index_bytes;
+ };
  // Effect-only snapshot: no index export, read, allocation, or cache decision.
  [[nodiscard]] GzipSeekState gzip_seek_state() const;
  // Full active decoder/prefetch envelope plus retained member capacity.
@@ -74,9 +81,10 @@ public:
  [[nodiscard]] std::uint64_t retained_workspace_bytes() const;
  [[nodiscard]] BenchmarkAllowance allowance() const;
  void cpu(const std::function<void()>&) const;
+
 private:
  struct Impl;
  std::unique_ptr<Impl> impl_;
 };
 [[nodiscard]] std::string canonical_benchmark_archive_member(std::string_view);
-} // namespace mmltk::backend::data::benchmark_internal
+}  // namespace mmltk::backend::data::benchmark_internal

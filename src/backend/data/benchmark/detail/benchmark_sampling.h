@@ -35,5 +35,6 @@ struct CombinedSupplementalSamplingResult {
  std::vector<std::uint16_t> objects365_shards;
 };
 [[nodiscard]] CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const NormalizedAnnotationIndex& coco_train, const NormalizedAnnotationIndex& objects365,
- const NormalizedAnnotationIndex& open_images, std::span<const std::uint64_t> objects365_shard_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested = {}, BenchmarkCompilePipeline* execution = nullptr);
+ const NormalizedAnnotationIndex& open_images, std::span<const std::uint64_t> objects365_shard_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested = {},
+ BenchmarkCompilePipeline* execution = nullptr);
 }  // namespace mmltk::backend::data::benchmark_internal

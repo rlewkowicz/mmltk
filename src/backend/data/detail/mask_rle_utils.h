@@ -31,11 +31,12 @@ struct MaskResizeScratch {
 // input validation and transactional rollback; overlap union is a separate algorithm.
 class MaskRunEmitter final {
 public:
- MaskRunEmitter(std::vector<RLEPair>& output, std::size_t first_run, std::uint32_t width,
-  RowMajorMaskBounds* bounds = nullptr, const char* start_error = "mask run start overflow", const char* length_error = "mask run length overflow")
-  : output_(output), first_(first_run), width_(width), bounds_(bounds), start_error_(start_error), length_error_(length_error) {}
+ MaskRunEmitter(std::vector<RLEPair>& output, std::size_t first_run, std::uint32_t width, RowMajorMaskBounds* bounds = nullptr, const char* start_error = "mask run start overflow",
+  const char* length_error = "mask run length overflow")
+     : output_(output), first_(first_run), width_(width), bounds_(bounds), start_error_(start_error), length_error_(length_error) {}
  void run(std::uint64_t begin, std::uint64_t end);
  void slab(std::uint32_t first_row, std::uint32_t end_row, std::span<const std::pair<std::uint32_t, std::uint32_t>>);
+
 private:
  std::vector<RLEPair>& output_;
  std::size_t first_;
@@ -53,6 +54,6 @@ void include_row_major_mask_run(RowMajorMaskBounds* bounds, std::size_t begin, s
 void materialize_row_major_mask(std::span<const RLEPair> pairs, MaskDimensions dimensions, std::vector<std::uint8_t>* dense, RowMajorMaskBounds* bounds = nullptr);
 // Appends one independent mask, coalescing only within that mask. Failure leaves
 // output and source bounds unchanged; empty input leaves source bounds untouched.
-[[nodiscard]] RowMajorMaskBounds append_resized_row_major_mask(std::span<const RLEPair>, MaskDimensions source, MaskDimensions target,
- const mmltk::backend::imaging::resample::ImageResizeGeometry&, MaskResizeScratch*, std::vector<RLEPair>& output, RowMajorMaskBounds* source_bounds = nullptr);
+[[nodiscard]] RowMajorMaskBounds append_resized_row_major_mask(std::span<const RLEPair>, MaskDimensions source, MaskDimensions target, const mmltk::backend::imaging::resample::ImageResizeGeometry&,
+ MaskResizeScratch*, std::vector<RLEPair>& output, RowMajorMaskBounds* source_bounds = nullptr);
 }  // namespace mmltk::backend::data::dataset

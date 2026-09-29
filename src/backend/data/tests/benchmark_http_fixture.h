@@ -94,7 +94,10 @@ public:
   failure_status_.store(status, std::memory_order_relaxed);
   failures_remaining_.store(count, std::memory_order_release);
  }
- void RedirectNextTransfer(std::string destination = "/redirected") { redirect_destination_ = std::move(destination); redirect_next_.store(true, std::memory_order_release); }
+ void RedirectNextTransfer(std::string destination = "/redirected") {
+  redirect_destination_ = std::move(destination);
+  redirect_next_.store(true, std::memory_order_release);
+ }
  void RedirectRanges(std::string earlier, std::string later, std::size_t split) {
   range_redirects_ = {std::move(earlier), std::move(later)};
   range_redirect_split_ = split;
@@ -189,7 +192,11 @@ private:
     ranged = begin <= end && end < payload_size_;
    }
   }
-  if (ignore_ranges_.load(std::memory_order_acquire)) { ranged = false; begin = 0; end = payload_size_ - 1; }
+  if (ignore_ranges_.load(std::memory_order_acquire)) {
+   ranged = false;
+   begin = 0;
+   end = payload_size_ - 1;
+  }
   if (ranged) {
    ranged_requests_.fetch_add(1U, std::memory_order_relaxed);
    const std::scoped_lock lock(client_mutex_);
@@ -274,7 +281,9 @@ private:
 class PendingIpv6Connect {
 public:
  explicit PendingIpv6Connect(std::uint16_t port) : listener_(::socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
-  const auto require = [](bool condition) { if (!condition) throw std::runtime_error("cannot prepare pending IPv6 connection fixture"); };
+  const auto require = [](bool condition) {
+   if (!condition) throw std::runtime_error("cannot prepare pending IPv6 connection fixture");
+  };
   require(listener_.get() >= 0);
   const int only_ipv6 = 1;
   require(::setsockopt(listener_.get(), IPPROTO_IPV6, IPV6_V6ONLY, &only_ipv6, sizeof(only_ipv6)) == 0);
@@ -292,6 +301,7 @@ public:
    require(::connect(filler.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
   }
  }
+
 private:
  mmltk::common::io::ScopedFd listener_;
  std::array<mmltk::common::io::ScopedFd, 2> fillers_;

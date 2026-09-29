@@ -63,7 +63,10 @@ struct CoconutRecipeInputs {
   original_controller = std::jthread([this, work = std::move(work)] {
    try {
     work();
-    { const std::lock_guard lock(mutex); originals_ready = true; }
+    {
+     const std::lock_guard lock(mutex);
+     originals_ready = true;
+    }
     changed.notify_all();
    } catch (...) { fail(std::current_exception()); }
   });
@@ -85,7 +88,12 @@ struct CoconutRecipeInputs {
   const auto index = [&](std::size_t) {
    if (recover && value.index) recovery = std::make_shared<CoconutRecoveryOriginals>(value.training ? &*value.index : nullptr, value.training ? nullptr : &*value.index, external);
   };
-  if (recover && value.index) { if (execution) execution->run(BenchmarkStage::Metadata, {}, index); else index(0); }
+  if (recover && value.index) {
+   if (execution)
+    execution->run(BenchmarkStage::Metadata, {}, index);
+   else
+    index(0);
+  }
   {
    const std::lock_guard lock(mutex);
    auto& split = value.training ? train_originals : validation_originals;
@@ -115,15 +123,14 @@ struct CoconutRecipeInputs {
  void acquire_release(std::size_t index) {
   const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(*this);
   const auto& release = catalog->releases[index];
-  auto lease = ArtifactLease::acquire_charged(cache->locks / (std::string(release.name) + ".annotations.lifecycle.lock"), cancellation, execution,
-   coco_annotation_resources());
+  auto lease = ArtifactLease::acquire_charged(cache->locks / (std::string(release.name) + ".annotations.lifecycle.lock"), cancellation, execution, coco_annotation_resources());
   const auto& handles = lease->allowance();
   std::vector<DownloadRequest> requests;
   requests.reserve(release.annotations.size());
   for (const auto& artifact : release.annotations) requests.push_back(make_download_request(*cache, "coconut-" + std::string(release.name), artifact));
   auto results = download_artifacts(requests, connections, cancellation,
-   progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { progress->transfers().update(update, *progress); }} : DownloadProgressSink{},
-   trace, {}, execution, handles, reservations.get());
+   progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { progress->transfers().update(update, *progress); }} : DownloadProgressSink{}, trace, {},
+   execution, handles, reservations.get());
   for (std::size_t i = 0; i < requests.size(); ++i) releases[index].inputs.artifacts.emplace(requests[i].artifact_id, std::move(results[i]));
   {
    std::unique_lock lock(mutex);
@@ -142,7 +149,11 @@ struct CoconutRecipeInputs {
     prepare(index, lease->allowance(), true);
     lease = {};
     publish_labels(index);
-    { const std::lock_guard lock(mutex); releases[index].labels_published = true; ++completed; }
+    {
+     const std::lock_guard lock(mutex);
+     releases[index].labels_published = true;
+     ++completed;
+    }
     changed.notify_all();
    } catch (...) { fail(std::current_exception()); }
   });
@@ -150,11 +161,11 @@ struct CoconutRecipeInputs {
  void publish_labels(std::size_t index) {
   if (!execution || !physical) return;
   auto& release = *releases[index].complete;
-  for (const auto& component : release.cached_label_inputs) for (std::size_t image = 0; image < component.index().image_count(); ++image) {
-   const auto& input = component.inventory_image(image).physical;
-   execution->labels_ready(physical->label_publication(component.edition(), input), input.image_id, component.labels(image),
-    component.image_input_identity(image), component.original_generation());
-  }
+  for (const auto& component : release.cached_label_inputs)
+   for (std::size_t image = 0; image < component.index().image_count(); ++image) {
+    const auto& input = component.inventory_image(image).physical;
+    execution->labels_ready(physical->label_publication(component.edition(), input), input.image_id, component.labels(image), component.image_input_identity(image), component.original_generation());
+   }
   release.cached_label_inputs.clear();
  }
  void activate(std::function<void(std::size_t, const BenchmarkAllowance&, bool)> work) {
@@ -206,7 +217,10 @@ struct CoconutRecipeInputs {
    for (const auto& component : release.complete->components) {
     if (component.source() != CoconutImageNamespace::CocoTrain && component.source() != CoconutImageNamespace::CocoValidation) continue;
     const auto current = original(component.source(), false);
-    if (component.original_generation() && component.original_generation() != current.state.generation) { stale = true; affected += component.index().image_count(); }
+    if (component.original_generation() && component.original_generation() != current.state.generation) {
+     stale = true;
+     affected += component.index().image_count();
+    }
    }
    if (!stale) continue;
    for (const auto& component : release.complete->components)
@@ -277,18 +291,26 @@ void CoconutFailureReport::flush_unlocked() {
 }
 void CoconutFailureReport::flush() noexcept {
  if (!dirty_.load(std::memory_order_acquire)) return;
- try { const std::lock_guard lock(mutex_); flush_unlocked(); } catch (...) {}
-}
-void CoconutFailureReport::reject(const CoconutPhysicalImage& image, std::uint64_t release_image_id, std::string_view release, std::uint64_t object_id,
- std::uint64_t category_id, std::string_view reason) noexcept {
  try {
-  auto record = nlohmann::json{{"image", image.member}, {"image_id", image.image_id}, {"release_image_id", release_image_id},
-   {"source", coconut_namespace_name(image.source)}, {"release", release}, {"object_id", object_id}, {"category_id", category_id}, {"reason", reason}}.dump();
+  const std::lock_guard lock(mutex_);
+  flush_unlocked();
+ } catch (...) {}
+}
+void CoconutFailureReport::reject(
+ const CoconutPhysicalImage& image, std::uint64_t release_image_id, std::string_view release, std::uint64_t object_id, std::uint64_t category_id, std::string_view reason) noexcept {
+ try {
+  auto record = nlohmann::json{
+   {"image", image.member}, {"image_id", image.image_id}, {"release_image_id", release_image_id}, {"source", coconut_namespace_name(image.source)}, {"release", release}, {"object_id", object_id},
+   {"category_id", category_id}, {"reason", reason}
+  }.dump();
   record.push_back('\n');
   bool warn = false, writable = false;
   {
    const std::lock_guard lock(mutex_);
-   if (!attempted_) { attempted_ = true; stream_.open(path_, std::ios::app); }
+   if (!attempted_) {
+    attempted_ = true;
+    stream_.open(path_, std::ios::app);
+   }
    constexpr std::size_t kBatchBytes = 64U * 1024U;
    if (record.size() > kBatchBytes - pending_.size()) flush_unlocked();
    if (stream_) {
@@ -348,11 +370,13 @@ CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation validation) {
  return catalog;
 }
 namespace {
-struct FlushReports { CoconutFailureReport& report; ~FlushReports() { report.flush(); } };
-CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cache, const CoconutReleaseComponent& release,
- const CoconutPhysicalMembership& physical, ProgressReporter& progress, CoconutFailureReport& failures, const CoconutOriginalProvider& original_provider, CoconutReleaseInputs& retained,
- mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, bool metadata_only,
- IndexingProgressTotals* indexing, std::size_t release_index, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
+struct FlushReports {
+ CoconutFailureReport& report;
+ ~FlushReports() { report.flush(); }
+};
+CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cache, const CoconutReleaseComponent& release, const CoconutPhysicalMembership& physical, ProgressReporter& progress,
+ CoconutFailureReport& failures, const CoconutOriginalProvider& original_provider, CoconutReleaseInputs& retained, mmltk::common::concurrency::CancellationObservation cancellation,
+ const BenchmarkTraceSink& trace, bool metadata_only, IndexingProgressTotals* indexing, std::size_t release_index, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
  const FlushReports flush_reports{failures};
  using namespace mmltk::common::math;
  CoconutRecipePreparation prepared;
@@ -377,7 +401,8 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   auto request = make_download_request(cache, owner, artifact);
   request.redownload = true;
   auto result = download_artifacts({request}, acquisition_workers, cancellation,
-   progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, parent, &reservations)
+   progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, parent,
+   &reservations)
                  .front();
   retained.artifacts.insert_or_assign(artifact.artifact_id, result);
   return result;
@@ -397,8 +422,8 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
  const auto annotation_identity = [&] {
   nlohmann::json artifacts = nlohmann::json::array();
   for (std::size_t i = 0; i < downloads.size(); ++i) artifacts.push_back({release.annotations[i].artifact_id, downloads[i].identity});
-  return digest_text(nlohmann::json{{"domain", "coconut-annotation-artifacts-v1"}, {"revision", release.revision},
-   {"normalization", kCoconutNormalizationRevision}, {"artifacts", std::move(artifacts)}}.dump());
+  return digest_text(
+   nlohmann::json{{"domain", "coconut-annotation-artifacts-v1"}, {"revision", release.revision}, {"normalization", kCoconutNormalizationRevision}, {"artifacts", std::move(artifacts)}}.dump());
  };
  identity = annotation_identity();
  const auto path_for = [&](CoconutImageNamespace source) {
@@ -410,7 +435,10 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
  std::unordered_set<CoconutImageNamespace> reusable;
  bool complete = true;
  for (auto source : sources) {
-  if (!metadata_only && original_provider && !initial_original.terminal && source == recovery_source) { complete = false; continue; }
+  if (!metadata_only && original_provider && !initial_original.terminal && source == recovery_source) {
+   complete = false;
+   continue;
+  }
   const auto key = std::pair{release.edition, source};
   auto cached = retained.components.find(key);
   if (cached != retained.components.end() && !cached->second.matches_inputs(identity, physical, recovery ? &*recovery : nullptr, false)) {
@@ -429,7 +457,10 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   }
   if (!cached->second.matches_inputs(identity, physical, recovery ? &*recovery : nullptr)) {
    complete = false;
-   if (!metadata_only) { admit_coconut_component(cached->second, cancellation); reusable_images.push_back(cached->second); }
+   if (!metadata_only) {
+    admit_coconut_component(cached->second, cancellation);
+    reusable_images.push_back(cached->second);
+   }
    continue;
   }
   reusable.insert(source);
@@ -465,7 +496,10 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    auto input = original_provider(source, wait, stop);
    if (input.terminal) {
     auto expected = std::uint64_t{0};
-    if (!used_original_generation.compare_exchange_strong(expected, input.generation) && expected != input.generation) { original_changed.store(true); throw CoconutOriginalChanged{source}; }
+    if (!used_original_generation.compare_exchange_strong(expected, input.generation) && expected != input.generation) {
+     original_changed.store(true);
+     throw CoconutOriginalChanged{source};
+    }
    }
    return input;
   }};
@@ -493,19 +527,22 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
     components = import_coconut_annotations(request);
     if (!metadata_only && original_provider) {
      const auto current_original = refresh_original(true);
-     const bool generation_changed = original_changed.load() ||
-      (used_original_generation.load() && used_original_generation.load() != current_original.generation);
-     const auto stale = generation_changed || std::ranges::any_of(components, [&](const CoconutComponent& component) {
-      return !component.matches_inputs(identity, physical, recovery ? &*recovery : nullptr);
-     });
+     const bool generation_changed = original_changed.load() || (used_original_generation.load() && used_original_generation.load() != current_original.generation);
+     const auto stale =
+      generation_changed || std::ranges::any_of(components, [&](const CoconutComponent& component) { return !component.matches_inputs(identity, physical, recovery ? &*recovery : nullptr); });
      if (stale) {
-      for (auto& component : components) if (component.source() != recovery_source && !reusable.contains(component.source())) {
-       reusable.insert(component.source()); retained_sources.push_back(component.source()); cached_components.push_back(std::move(component));
-      }
+      for (auto& component : components)
+       if (component.source() != recovery_source && !reusable.contains(component.source())) {
+        reusable.insert(component.source());
+        retained_sources.push_back(component.source());
+        cached_components.push_back(std::move(component));
+       }
       request.retained_sources = retained_sources;
       request.recovery = recovery ? &*recovery : nullptr;
-      reusable_images.clear(); request.reusable_images = {};
-      used_original_generation.store(0); original_changed.store(false);
+      reusable_images.clear();
+      request.reusable_images = {};
+      used_original_generation.store(0);
+      original_changed.store(false);
       continue;
      }
     }
@@ -521,13 +558,17 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    } catch (const CoconutOriginalChanged&) {
     (void)refresh_original(true);
     request.recovery = recovery ? &*recovery : nullptr;
-    reusable_images.clear(); request.reusable_images = {};
-    used_original_generation.store(0); original_changed.store(false);
+    reusable_images.clear();
+    request.reusable_images = {};
+    used_original_generation.store(0);
+    original_changed.store(false);
     --attempt;
     continue;
-   } catch (const std::bad_alloc&) { throw; } catch (const PhysicalArchiveFailure&) { throw; } catch (const CoconutPhysicalMembershipError&) { throw; } catch (const InsufficientBenchmarkResources&) { throw; } catch (const InsufficientBenchmarkStorage&) {
+   } catch (const std::bad_alloc&) { throw; } catch (const PhysicalArchiveFailure&) {
     throw;
-   } catch (const std::exception& error) {
+   } catch (const CoconutPhysicalMembershipError&) { throw; } catch (const InsufficientBenchmarkResources&) {
+    throw;
+   } catch (const InsufficientBenchmarkStorage&) { throw; } catch (const std::exception& error) {
     // The failed generation cannot retain input backing into artifact repair.
     // This also covers failures after a successful import returned its rows.
     retained.records->discard();
@@ -541,12 +582,15 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
      const auto diagnose = [&] {
       const auto& digest = download_failure_sha256(retained.artifacts.at(artifact.artifact_id), cancellation);
       matches_expected = !artifact.expected_sha256.empty() && digest == artifact.expected_sha256;
-      trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] {
-       return nlohmann::json{{"artifact", artifact.artifact_id}, {"sha256", digest}, {"matches_expected", matches_expected}, {"reason", error.what()}};
-      });
+      trace_benchmark_event(trace, "benchmark.download.failure_sha256",
+       [&] { return nlohmann::json{{"artifact", artifact.artifact_id}, {"sha256", digest}, {"matches_expected", matches_expected}, {"reason", error.what()}}; });
      };
-     if (!artifact.expected_sha256.empty()) diagnose();
-     else if (trace) try { diagnose(); } catch (...) { throw_if_benchmark_cancelled(cancellation); }
+     if (!artifact.expected_sha256.empty())
+      diagnose();
+     else if (trace)
+      try {
+       diagnose();
+      } catch (...) { throw_if_benchmark_cancelled(cancellation); }
      if (!matches_expected) {
       // The failed importer and its row callbacks have unwound. Withdraw once
       // before replacing any artifact on which this release product depends.
@@ -561,7 +605,8 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
     reusable.clear();
     cached_components.clear();
     prepared.cached_label_inputs.clear();
-    reusable_images.clear(); request.reusable_images = {};
+    reusable_images.clear();
+    request.reusable_images = {};
     retained_sources.clear();
     request.retained_sources = {};
     identity = annotation_identity();
@@ -583,8 +628,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
  if (release.expected_rows != 0 && admitted_rows != release.expected_rows) throw std::runtime_error("COCONut cached release membership is incomplete");
  for (auto& component : components) {
   const auto index_path = path_for(component.source());
-  if (!metadata_only || complete)
-   prepared.annotation_storage_bytes = checked_add(prepared.annotation_storage_bytes, coconut_component_storage_bytes(component), "COCONut index storage overflow");
+  if (!metadata_only || complete) prepared.annotation_storage_bytes = checked_add(prepared.annotation_storage_bytes, coconut_component_storage_bytes(component), "COCONut index storage overflow");
   prepared.manifest["components"].push_back(
    {{"edition", release.edition}, {"revision", release.revision}, {"physical_source", coconut_namespace_name(component.source())}, {"input_identity", component.input_identity()},
     {"recovery_policy", component.recovery_policy()}, {"original_annotation_identity", component.original_annotation_identity()}, {"offered_images", component.index().image_count()},
@@ -637,37 +681,42 @@ void retire_coconut_recipe_inputs(const std::shared_ptr<CoconutRecipeInputs>& in
  inputs->settle();
  for (std::size_t i = 0; i < inputs->releases.size(); ++i) {
   auto& release = inputs->releases[i];
-  if (release.complete) for (auto& component : release.complete->components)
-   release.inputs.components.insert_or_assign({component.edition(), component.source()}, std::move(component));
-  release.metadata.reset(); release.complete.reset(); release.labels_published = false;
+  if (release.complete)
+   for (auto& component : release.complete->components) release.inputs.components.insert_or_assign({component.edition(), component.source()}, std::move(component));
+  release.metadata.reset();
+  release.complete.reset();
+  release.labels_published = false;
   if (!changed) continue;
   const auto affected = [&](const CoconutPhysicalImage& image) { return image.source == changed->origin.source && image.shard == changed->origin.shard; };
   std::uint64_t withdrawn = 0;
   auto& records = *release.inputs.records;
   for (const auto& [key, component] : release.inputs.components) {
    (void)key;
-   for (const auto& image : component.inventory())
-    withdrawn += affected(image.physical) && image.physical.archive_identity == changed->download.identity;
+   for (const auto& image : component.inventory()) withdrawn += affected(image.physical) && image.physical.archive_identity == changed->download.identity;
   }
-  for (std::size_t row = 0; row < records.size(); ++row) if (const auto& chunk = records.row(row).native(); chunk && affected(chunk->inventory().physical)) {
-   const auto& image = chunk->inventory().physical;
-   bool counted = false;
-   if (const auto full = release.inputs.components.find({chunk->lineage().component.edition, chunk->lineage().component.source}); full != release.inputs.components.end()) {
-    const auto images = full->second.index().images();
-    const auto row = std::ranges::lower_bound(images, image.image_id, {}, &NormalizedImage::source_image_id);
-    counted = row != images.end() && (*row).source_image_id == image.image_id &&
-     full->second.inventory_image(static_cast<std::size_t>(row - images.begin())).physical == image;
+  for (std::size_t row = 0; row < records.size(); ++row)
+   if (const auto& chunk = records.row(row).native(); chunk && affected(chunk->inventory().physical)) {
+    const auto& image = chunk->inventory().physical;
+    bool counted = false;
+    if (const auto full = release.inputs.components.find({chunk->lineage().component.edition, chunk->lineage().component.source}); full != release.inputs.components.end()) {
+     const auto images = full->second.index().images();
+     const auto position = std::ranges::lower_bound(images, image.image_id, {}, &NormalizedImage::source_image_id);
+     counted = position != images.end() && (*position).source_image_id == image.image_id && full->second.inventory_image(static_cast<std::size_t>(position - images.begin())).physical == image;
+    }
+    if (!counted && image.archive_identity == changed->download.identity) ++withdrawn;
+    records.native(row, {});
    }
-   if (!counted && image.archive_identity == changed->download.identity) ++withdrawn;
-   records.native(row, {});
-  }
   if (inputs->indexing && withdrawn) inputs->indexing->invalidate(i, *inputs->progress, withdrawn);
  }
  inputs->prepare = {};
- inputs->ready.clear(); inputs->consumed = inputs->completed = 0; inputs->next.store(0);
- inputs->activated = false; inputs->error = {};
+ inputs->ready.clear();
+ inputs->consumed = inputs->completed = 0;
+ inputs->next.store(0);
+ inputs->activated = false;
+ inputs->error = {};
  inputs->originals_started = inputs->originals_ready;
- inputs->retiring = false; inputs->stopped.store(false);
+ inputs->retiring = false;
+ inputs->stopped.store(false);
 }
 std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const BenchmarkCacheLayout& cache, const CoconutRecipeCatalog& catalog, ProgressReporter& progress, std::size_t workers,
  mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, std::size_t download_connections, std::span<const int> cpus,
@@ -709,15 +758,16 @@ std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const Benchma
 }
 CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& config, const BenchmarkCacheLayout& cache, const CoconutRecipeCatalog& catalog,
  std::span<const AdmittedRecipeArchive> acquired, const CoconutPhysicalMembership& physical, ProgressReporter& progress, CoconutFailureReport& failures, std::size_t workers,
- mmltk::common::concurrency::CancellationObservation external_cancellation, const BenchmarkTraceSink& trace, bool metadata_only,
- std::shared_ptr<CoconutRecipeInputs> inputs, BenchmarkCompilePipeline* execution, BenchmarkAllowance preparation, CocoAnnotationInputObserver stock_input) {
+ mmltk::common::concurrency::CancellationObservation external_cancellation, const BenchmarkTraceSink& trace, bool metadata_only, std::shared_ptr<CoconutRecipeInputs> inputs,
+ BenchmarkCompilePipeline* execution, BenchmarkAllowance preparation, CocoAnnotationInputObserver stock_input) {
  const FlushReports flush_reports{failures};
  using namespace mmltk::common::math;
  const auto cancellation = external_cancellation;
  CoconutRecipePreparation prepared;
  const bool initial_preparation = !inputs || metadata_only;
  auto source_transport = execution ? execution->curl().channel(BenchmarkCurl::Class::Artifact, cancellation, coco_annotation_resources()) : nullptr;
- if (execution && initial_preparation && !preparation) preparation = execution->reserve(BenchmarkResources::handles(0, true, coco_annotation_resources().descriptors + coco_annotation_resources().continuation_descriptors));
+ if (execution && initial_preparation && !preparation)
+  preparation = execution->reserve(BenchmarkResources::handles(0, true, coco_annotation_resources().descriptors + coco_annotation_resources().continuation_descriptors));
  prepared.inputs = inputs ? std::move(inputs) : acquire_coconut_recipe_inputs(cache, catalog, progress, 0, cancellation, trace, workers, {}, {}, execution);
  auto& retained = *prepared.inputs;
  retained.physical = &physical;
@@ -727,37 +777,37 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  prepared.manifest = {{"dataset", "coconut"}, {"validation", config.selection.validation}, {"components", nlohmann::json::array()}, {"artifacts", nlohmann::json::array()}};
  auto& originals = retained.originals;
  const bool recover_train = config.selection.recover_dropped_masks && std::ranges::any_of(catalog.releases, [](const auto& release) { return release.edition == CoconutEdition::Base; });
- const bool recover_validation = config.selection.recover_dropped_masks && std::ranges::any_of(catalog.releases, [](const auto& release) { return release.edition == CoconutEdition::RelabeledValidation; });
+ const bool recover_validation =
+  config.selection.recover_dropped_masks && std::ranges::any_of(catalog.releases, [](const auto& release) { return release.edition == CoconutEdition::RelabeledValidation; });
  const bool needs_originals = config.selection.recover_dropped_masks || config.selection.validation == CoconutValidation::Stock;
  if (needs_originals) {
   const bool recover = config.selection.recover_dropped_masks;
   const bool stock = config.selection.validation == CoconutValidation::Stock;
-  retained.start_originals([&retained, &cache, &catalog, &progress, execution, trace, recover, stock, recover_train, recover_validation, acquisition_workers, parse_workers, preparation = std::move(preparation), stock_input = std::move(stock_input)] {
-   const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(retained);
+  retained.start_originals([&retained, &cache, &catalog, &progress, execution, trace, recover, stock, recover_train, recover_validation, acquisition_workers, parse_workers,
+                            preparation = std::move(preparation), stock_input = std::move(stock_input)] {
+   const auto original_cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(retained);
    StorageReservationPool reservations(cache.root, trace, execution ? &execution->storage() : nullptr);
    // Declare fixed transport before retaining its dependent source lifecycle.
-   auto transport = execution ? execution->curl().channel(BenchmarkCurl::Class::Artifact, cancellation, coco_annotation_resources()) : nullptr;
+   auto transport = execution ? execution->curl().channel(BenchmarkCurl::Class::Artifact, original_cancellation, coco_annotation_resources()) : nullptr;
    trace_benchmark_event(trace, "benchmark.annotations.originals_wait", [] { return nlohmann::json::object(); });
-   auto original_lease = ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", cancellation, execution, coco_annotation_resources(), preparation);
-   const CocoAnnotationRequest selection{
-    recover ? CocoSplitAdmission::Optional : CocoSplitAdmission::Unselected,
-    stock ? CocoSplitAdmission::Required : CocoSplitAdmission::Optional
-   };
-   trace_benchmark_event(trace, "benchmark.annotations.originals_begin", [&] { return nlohmann::json{{"recover_dropped_masks", recover}, {"validation", stock ? CoconutValidation::Stock : CoconutValidation::Coconut}}; });
-   CocoAnnotationCache annotations(cache, catalog.stock_annotations, selection, 0, checked_cast<std::uint32_t>(catalog.coco_validation_images, "COCO validation count overflow"), static_cast<int>(parse_workers),
-    cancellation, trace, execution, &reservations, std::move(original_lease));
+   auto original_lease = ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", original_cancellation, execution, coco_annotation_resources(), preparation);
+   const CocoAnnotationRequest selection{recover ? CocoSplitAdmission::Optional : CocoSplitAdmission::Unselected, stock ? CocoSplitAdmission::Required : CocoSplitAdmission::Optional};
+   trace_benchmark_event(
+    trace, "benchmark.annotations.originals_begin", [&] { return nlohmann::json{{"recover_dropped_masks", recover}, {"validation", stock ? CoconutValidation::Stock : CoconutValidation::Coconut}}; });
+   CocoAnnotationCache annotations(cache, catalog.stock_annotations, selection, 0, checked_cast<std::uint32_t>(catalog.coco_validation_images, "COCO validation count overflow"),
+    static_cast<int>(parse_workers), original_cancellation, trace, execution, &reservations, std::move(original_lease));
    annotations.observe_input(stock_input);
    annotations.observe_splits([&retained, recover_train, recover_validation](CocoAnnotationSplit split) {
     const bool selected = split.training ? recover_train : recover_validation;
     retained.original_split(std::move(split), selected);
-   },
-    {retained.train_originals.state.generation, retained.validation_originals.state.generation});
+   }, {retained.train_originals.state.generation, retained.validation_originals.state.generation});
    annotations.discover(progress);
    if (annotations.pending_download()) {
     const auto& request = *annotations.pending_download();
     try {
-     auto archive = download_artifacts({request}, acquisition_workers, cancellation,
-      progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { progress.transfers().update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, annotations.allowance(), &reservations)
+     auto archive = download_artifacts({request}, acquisition_workers, original_cancellation,
+      progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { progress.transfers().update(update, progress); }} : DownloadProgressSink{}, trace, {},
+      execution, annotations.allowance(), &reservations)
                      .front();
      auto completed = annotations.completed_indexes();
      annotations.settle(std::move(archive), progress, parse_workers, completed, recover ? 2 : 1);
@@ -779,14 +829,14 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  // Original preparation owns its prerequisite commitment. Release metadata
  // acquires only its own bounded source-consumer envelope and can start now.
  preparation = {};
- retained.activate([&cache, &catalog, &physical, &progress, &failures, &retained, trace, metadata_only, execution, recover = config.selection.recover_dropped_masks](std::size_t index, const BenchmarkAllowance& parent, bool masks) {
+ retained.activate([&cache, &catalog, &physical, &progress, &failures, &retained, trace, metadata_only, execution, recover = config.selection.recover_dropped_masks](
+                    std::size_t index, const BenchmarkAllowance& parent, bool masks) {
   const auto release_cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(retained);
   const auto& release = catalog.releases[index];
   auto& release_inputs = retained.releases[index].inputs;
   if (!masks) {
    if (!metadata_only) return;
-   auto metadata = prepare_coconut_release(cache, release, physical, progress, failures, {}, release_inputs,
-    release_cancellation, trace, true, retained.indexing, index, execution, parent);
+   auto metadata = prepare_coconut_release(cache, release, physical, progress, failures, {}, release_inputs, release_cancellation, trace, true, retained.indexing, index, execution, parent);
    trace_benchmark_event(trace, "benchmark.annotations.release_metadata", [&] { return nlohmann::json{{"edition", release.edition}, {"cache_hit", metadata.annotation_cache_hit}}; });
    retained.metadata_ready(index, std::move(metadata));
    return;
@@ -795,10 +845,11 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   const CoconutOriginalProvider recovery = eligible_recovery ? CoconutOriginalProvider{[&retained](CoconutImageNamespace source, bool wait, std::stop_token stop) {
    auto split = retained.original(source, wait, stop);
    return CoconutOriginalInput{split.recovery, split.state.terminal, split.state.generation};
-  }} : CoconutOriginalProvider{};
+  }}
+                                                             : CoconutOriginalProvider{};
   if (catalog.release_observer) catalog.release_observer(release.edition, CoconutReleaseBoundary::MasksStarted);
-  retained.releases[index].complete = prepare_coconut_release(cache, release, physical, progress, failures, recovery,
-   release_inputs, release_cancellation, trace, false, retained.indexing, index, execution, parent);
+  retained.releases[index].complete =
+   prepare_coconut_release(cache, release, physical, progress, failures, recovery, release_inputs, release_cancellation, trace, false, retained.indexing, index, execution, parent);
   if (retained.indexing) retained.indexing->update(index, release.expected_rows, progress);
   trace_benchmark_event(
    trace, "benchmark.annotations.release_complete", [&] { return nlohmann::json{{"edition", release.edition}, {"cache_hit", retained.releases[index].complete->annotation_cache_hit}}; });
@@ -819,7 +870,8 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   if (retained.originals_available()) {
    prepared.annotation_cache_hit = originals.cache_hit;
    prepared.annotation_storage_bytes = originals.retained_storage_bytes;
-  } else prepared.annotation_cache_hit = false;
+  } else
+   prepared.annotation_cache_hit = false;
  }
  for (auto& release : releases) {
   prepared.annotation_cache_hit = prepared.annotation_cache_hit && release->annotation_cache_hit;
@@ -895,7 +947,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   const bool eligible = component.source() == CoconutImageNamespace::CocoTrain || component.source() == CoconutImageNamespace::CocoValidation;
   std::uint64_t component_unresolved = config.selection.recover_dropped_masks && eligible && !component.recovery_policy() ? component.index().rejected.degenerate_boxes : 0;
   for (std::size_t position = 0; position < component.recovery().size(); ++position) {
-   const auto& image = component.recovery()[position];
+   const auto& image = component.recovery_image(position);
    const auto& inventory = component.inventory_image(position);
    if (inventory.physical.image_id != image.image_id) throw std::logic_error("recovery report image is absent from component inventory");
    for (const auto& object : image.omissions)

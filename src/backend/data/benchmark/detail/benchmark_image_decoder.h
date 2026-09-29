@@ -29,7 +29,8 @@ public:
  [[nodiscard]] BenchmarkImageHeader read_header(std::span<const std::uint8_t> encoded, std::uint32_t expected_width = 0U, std::uint32_t expected_height = 0U);
  // PNG storage remains owned by this decoder until its next decode or destruction;
  // JPEG storage is the supplied RGB vector. Both views remain valid through resize.
- [[nodiscard]] std::span<const std::uint8_t> decode_rgb(std::span<const std::uint8_t> encoded, const BenchmarkImageHeader& header, std::vector<std::uint8_t>* rgb, std::vector<std::uint8_t>* cmyk_scratch);
+ [[nodiscard]] std::span<const std::uint8_t> decode_rgb(
+  std::span<const std::uint8_t> encoded, const BenchmarkImageHeader& header, std::vector<std::uint8_t>* rgb, std::vector<std::uint8_t>* cmyk_scratch);
 
 private:
  void* handle_ = nullptr;

@@ -27,14 +27,12 @@ namespace {
 struct AnnotationMember {
  std::string suffix;
  std::filesystem::path output;
- std::string identity;
- std::exception_ptr failure;
- std::optional<std::uint64_t> encountered;
+ std::string identity{};
+ std::exception_ptr failure{};
+ std::optional<std::uint64_t> encountered{};
 };
-void extract_annotation_members(const DownloadResult& archive, std::span<AnnotationMember> members,
- mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
- StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent,
- const std::function<void(std::size_t)>& ready) {
+void extract_annotation_members(const DownloadResult& archive, std::span<AnnotationMember> members, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
+ StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, const std::function<void(std::size_t)>& ready) {
  // Keep the stream/output continuation available while independently ready
  // JSON parsers acquire their own index handles and scratch. Warm callbacks
  // cannot consume the descriptor pair needed by the still-missing sibling.
@@ -42,8 +40,9 @@ void extract_annotation_members(const DownloadResult& archive, std::span<Annotat
  std::size_t remaining = members.size();
  const auto complete = [&](std::size_t index) {
   --remaining;
-  try { if (ready && !members[index].failure) ready(index); }
-  catch (const AnnotationSourceUnavailable&) { members[index].failure = std::current_exception(); }
+  try {
+   if (ready && !members[index].failure) ready(index);
+  } catch (const AnnotationSourceUnavailable&) { members[index].failure = std::current_exception(); }
  };
  for (std::size_t i = 0; i < members.size(); ++i) {
   auto& member = members[i];
@@ -51,10 +50,12 @@ void extract_annotation_members(const DownloadResult& archive, std::span<Annotat
   if (!std::filesystem::is_regular_file(member.output) || !std::filesystem::is_regular_file(completion)) continue;
   try {
    const auto value = read_json_file(completion);
-   if (value.value("schema_version", 0U) == kBenchmarkCacheSchemaVersion && value.value("complete", false) &&
-       value.value("archive_identity", std::string{}) == archive.identity && value.value("member", std::string{}) == member.suffix &&
-       value.value("size", 0ULL) == std::filesystem::file_size(member.output)) member.identity = value.value("identity", std::string{});
-  } catch (const std::exception& error) { if (is_benchmark_capacity_failure(error)) throw; }
+   if (value.value("schema_version", 0U) == kBenchmarkCacheSchemaVersion && value.value("complete", false) && value.value("archive_identity", std::string{}) == archive.identity &&
+       value.value("member", std::string{}) == member.suffix && value.value("size", 0ULL) == std::filesystem::file_size(member.output))
+    member.identity = value.value("identity", std::string{});
+  } catch (const std::exception& error) {
+   if (is_benchmark_capacity_failure(error)) throw;
+  }
   if (!member.identity.empty()) complete(i);
  }
  if (!remaining) return;
@@ -69,12 +70,17 @@ void extract_annotation_members(const DownloadResult& archive, std::span<Annotat
   if (!found->identity.empty() || found->failure) continue;
   const auto index = static_cast<std::size_t>(found - members.begin());
   auto& member = *found;
-  try { reader.require_regular(std::numeric_limits<std::size_t>::max()); }
-  catch (const BenchmarkArchiveError& error) {
-   member.failure = std::make_exception_ptr(AnnotationSourceUnavailable(error.what())); complete(index); continue;
+  try {
+   reader.require_regular(std::numeric_limits<std::size_t>::max());
+  } catch (const BenchmarkArchiveError& error) {
+   member.failure = std::make_exception_ptr(AnnotationSourceUnavailable(error.what()));
+   complete(index);
+   continue;
   }
   if (!reader.size()) {
-   member.failure = std::make_exception_ptr(AnnotationSourceUnavailable("empty benchmark annotation archive member")); complete(index); continue;
+   member.failure = std::make_exception_ptr(AnnotationSourceUnavailable("empty benchmark annotation archive member"));
+   complete(index);
+   continue;
   }
   try {
    // The retained JSON is the required parse input; write it once. Only the
@@ -84,29 +90,38 @@ void extract_annotation_members(const DownloadResult& archive, std::span<Annotat
    StorageReservationPool destination(member.output, trace, storage);
    auto staging = BenchmarkStagedArtifact::create(destination, member.output, bytes, "extracted annotation staging");
    staging.preallocate(bytes);
-   reader.consume(bytes, [&](std::span<const std::uint8_t> block, std::uint64_t offset) { staging.file().pwrite_all(block.data(), block.size(), offset); staging.reconcile(); }, cancellation);
+   reader.consume(bytes, [&](std::span<const std::uint8_t> block, std::uint64_t offset) {
+    staging.file().pwrite_all(block.data(), block.size(), offset);
+    staging.reconcile();
+   }, cancellation);
    staging.file().sync_data();
    staging.publish(member.output, cancellation);
    const auto material = archive.identity + "\n" + member.suffix + "\n" + std::to_string(bytes);
    member.identity = common_io::sha256_hex(common_io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(material.data()), material.size())));
    write_json_atomically(extract_manifest_path(member.output),
-    nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"archive_identity", archive.identity}, {"member", member.suffix},
-     {"size", bytes}, {"identity", member.identity}, {"integrity_mode", "archive_structure_size"}}, cancellation, &destination);
+    nlohmann::json{
+     {"schema_version", kBenchmarkCacheSchemaVersion}, {"complete", true}, {"archive_identity", archive.identity}, {"member", member.suffix}, {"size", bytes}, {"identity", member.identity},
+     {"integrity_mode", "archive_structure_size"}
+    },
+    cancellation, &destination);
   } catch (const BenchmarkArchiveError& error) { throw AnnotationSourceUnavailable(error.what()); }
   complete(index);
  }
- for (auto& member : members) if (member.identity.empty() && !member.failure)
-  member.failure = std::make_exception_ptr(AnnotationSourceUnavailable("benchmark annotation archive does not contain " + member.suffix));
+ for (auto& member : members)
+  if (member.identity.empty() && !member.failure) member.failure = std::make_exception_ptr(AnnotationSourceUnavailable("benchmark annotation archive does not contain " + member.suffix));
 }
-} // namespace
-std::string extract_archive_member(const std::filesystem::path& archive_path, std::string_view suffix, const std::filesystem::path& output_path,
- std::string_view identity, const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancellation,
- const BenchmarkTraceSink& trace, StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
+}  // namespace
+std::string extract_archive_member(const std::filesystem::path& archive_path, std::string_view suffix, const std::filesystem::path& output_path, std::string_view identity,
+ const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, StorageReservationPool* storage,
+ BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
  auto lease = ArtifactLease::acquire_charged(lock_path, cancellation, execution, BenchmarkResources::handles(1, true, 3), parent);
  AnnotationMember member{std::string(suffix), output_path};
- DownloadResult archive; archive.path = archive_path; archive.identity = identity;
- try { extract_annotation_members(archive, std::span(&member, 1), cancellation, trace, storage, execution, lease->allowance(), {}); }
- catch (const BenchmarkArchiveError& error) { throw AnnotationSourceUnavailable(error.what()); }
+ DownloadResult archive;
+ archive.path = archive_path;
+ archive.identity = identity;
+ try {
+  extract_annotation_members(archive, std::span(&member, 1), cancellation, trace, storage, execution, lease->allowance(), {});
+ } catch (const BenchmarkArchiveError& error) { throw AnnotationSourceUnavailable(error.what()); }
  if (member.failure) std::rethrow_exception(member.failure);
  return member.identity;
 }
@@ -126,7 +141,8 @@ std::string extract_archive_member(const std::filesystem::path& archive_path, st
 [[nodiscard]] NormalizedAnnotationIndex load_or_build_index(const BenchmarkCacheLayout& cache, const std::filesystem::path& path, const BenchmarkDatasetSource source, const std::string_view split,
  const std::string_view annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace,
  const std::function<NormalizedAnnotationIndex(const BenchmarkAllowance&)>& builder, StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
- auto lease = ArtifactLease::acquire_charged(cache.locks / (std::string(benchmark_source_name(source)) + "-" + std::string(split) + ".index.lock"), cancel_requested, execution, BenchmarkResources::handles(2, true), parent);
+ auto lease = ArtifactLease::acquire_charged(
+  cache.locks / (std::string(benchmark_source_name(source)) + "-" + std::string(split) + ".index.lock"), cancel_requested, execution, BenchmarkResources::handles(2, true), parent);
  if (auto cached = load_normalized_annotation_index(path, source, split, annotation_sha256, cancel_requested, trace)) { return std::move(*cached); }
  NormalizedAnnotationIndex index = builder(lease->allowance());
  index.completion = store_normalized_annotation_index(path, index, cancel_requested, trace, storage);
@@ -139,7 +155,9 @@ void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservati
   try {
    body();
    break;
-  } catch (const InsufficientBenchmarkResources&) { throw; } catch (const InsufficientBenchmarkStorage&) { throw; } catch (const std::exception& error) {
+  } catch (const InsufficientBenchmarkResources&) { throw; } catch (const InsufficientBenchmarkStorage&) {
+   throw;
+  } catch (const std::exception& error) {
    throw_if_benchmark_cancelled(cancel_requested);
    if (attempt == 3U) { throw; }
    repair(error);
@@ -147,26 +165,27 @@ void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservati
  }
 }
 std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequest> requests, BenchmarkDatasetSource source, std::string_view reason, ProgressReporter& progress,
- ArtifactProgressTotals& totals, std::size_t workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool* storage) {
+ ArtifactProgressTotals& totals, std::size_t workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution,
+ const BenchmarkAllowance& parent, StorageReservationPool* storage) {
  for (auto& request : requests) {
   if (trace) try {
-   if (std::filesystem::is_regular_file(request.destination)) {
-    const auto sha = common_io::sha256_hex(common_io::sha256_file(request.destination, [&] { return cancellation.requested(); }));
-    trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", sha}, {"reason", reason}}; });
-   }
-  } catch (...) { throw_if_benchmark_cancelled(cancellation); }
+    if (std::filesystem::is_regular_file(request.destination)) {
+     const auto sha = common_io::sha256_hex(common_io::sha256_file(request.destination, [&] { return cancellation.requested(); }));
+     trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", sha}, {"reason", reason}}; });
+    }
+   } catch (...) { throw_if_benchmark_cancelled(cancellation); }
   invalidate_download_artifact(request, cancellation, trace, execution, parent);
   request.redownload = true;
  }
  progress.source_activity(source, "Redownloading annotation metadata after structural validation failure");
  return download_artifacts(requests, requests.size() == 1U ? workers : std::min<std::size_t>({3U, requests.size(), workers}), cancellation,
-  progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, parent, storage);
+  progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, parent,
+  storage);
 }
-BenchmarkResources coco_annotation_resources() {
- return BenchmarkResources::handles(1, true, 3);
-}
+BenchmarkResources coco_annotation_resources() { return BenchmarkResources::handles(1, true, 3); }
 CocoAnnotationCache::CocoAnnotationCache(const BenchmarkCacheLayout& cache, const CatalogArtifact& artifact, CocoAnnotationRequest selection, std::uint32_t train_count, std::uint32_t validation_count,
- int parse_workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution, StorageReservationPool* storage, std::shared_ptr<ArtifactLease> custody)
+ int parse_workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution, StorageReservationPool* storage,
+ std::shared_ptr<ArtifactLease> custody)
     : cache_(cache),
       request_(make_download_request(cache, "coco", artifact)),
       selection_(selection),
@@ -176,7 +195,9 @@ CocoAnnotationCache::CocoAnnotationCache(const BenchmarkCacheLayout& cache, cons
       cancellation_(cancellation),
       trace_(trace),
       source_transport_(execution ? execution->curl().channel(BenchmarkCurl::Class::Artifact, cancellation, coco_annotation_resources()) : nullptr),
-      lease_(custody ? std::move(custody) : ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", cancellation, execution, coco_annotation_resources())), execution_(execution), storage_(execution ? &execution->storage() : storage) {
+      lease_(custody ? std::move(custody) : ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", cancellation, execution, coco_annotation_resources())),
+      execution_(execution),
+      storage_(execution ? &execution->storage() : storage) {
  indexes_.train_path = cache.source_indexes("coco") / "train2017.normalized.bin";
  indexes_.validation_path = cache.source_indexes("coco") / "val2017.normalized.bin";
 }
@@ -195,19 +216,26 @@ void CocoAnnotationCache::discover(ProgressReporter& progress) {
   readers[training ? 0 : 1] = std::async(std::launch::async, [&, training] {
    progress.source_activity(BenchmarkDatasetSource::kCoco2017, training ? "Validating cached COCO train annotation index" : "Validating cached COCO validation annotation index");
    auto& index = training ? indexes_.train : indexes_.validation;
-   const auto read = [&](std::size_t) { index = discover_cached_index(training ? indexes_.train_path : indexes_.validation_path,
-    BenchmarkDatasetSource::kCoco2017, training ? "train2017" : "val2017", cancellation_, trace_); };
+   const auto read = [&](std::size_t) {
+    index = discover_cached_index(training ? indexes_.train_path : indexes_.validation_path, BenchmarkDatasetSource::kCoco2017, training ? "train2017" : "val2017", cancellation_, trace_);
+   };
    if (execution_) {
     auto input = execution_->reserve(BenchmarkResources::handles(1), lease_->allowance());
     execution_->run(BenchmarkStage::Metadata, {}, read, input);
-   } else read(0);
+   } else
+    read(0);
    if (index) publish_split(training, true);
   });
  }
  std::exception_ptr failure;
- for (auto& reader : readers) if (reader.valid()) {
-  try { reader.get(); } catch (...) { if (!failure) failure = std::current_exception(); }
- }
+ for (auto& reader : readers)
+  if (reader.valid()) {
+   try {
+    reader.get();
+   } catch (...) {
+    if (!failure) failure = std::current_exception();
+   }
+  }
  if (failure) std::rethrow_exception(failure);
  indexes_.cache_hit =
   (selection_.train == CocoSplitAdmission::Unselected || indexes_.train.has_value()) && (selection_.validation == CocoSplitAdmission::Unselected || indexes_.validation.has_value());
@@ -224,7 +252,8 @@ void CocoAnnotationCache::build_split(bool training, const std::string& digest, 
  const std::string label = training ? "train" : "validation";
  const auto json_path = source_json(training);
  std::filesystem::create_directories(json_path.parent_path());
- index = load_or_build_index(cache_, training ? indexes_.train_path : indexes_.validation_path, BenchmarkDatasetSource::kCoco2017, split, digest, cancellation_, trace_, [&](const BenchmarkAllowance& input_allowance) {
+ index = load_or_build_index(
+  cache_, training ? indexes_.train_path : indexes_.validation_path, BenchmarkDatasetSource::kCoco2017, split, digest, cancellation_, trace_, [&](const BenchmarkAllowance& input_allowance) {
   progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Parsing and indexing COCO " + label + " annotations");
   if (input_observer_) input_observer_(training, CocoAnnotationInputBoundary::Parsing);
   try {
@@ -276,20 +305,25 @@ void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progr
      progress.phase(DatasetCompilePhase::Indexing, completed_count.fetch_add(1) + 1, total);
     });
    });
-  } catch (const BenchmarkArchiveError& error) { stream_error = std::make_exception_ptr(AnnotationSourceUnavailable(error.what())); }
-  catch (const AnnotationSourceUnavailable&) { stream_error = std::current_exception(); }
+  } catch (const BenchmarkArchiveError& error) { stream_error = std::make_exception_ptr(AnnotationSourceUnavailable(error.what())); } catch (const AnnotationSourceUnavailable&) {
+   stream_error = std::current_exception();
+  }
   // The stream has closed before joining a parser waiting for oversized scratch.
   // Every future settles before split/index ownership can unwind or repair.
   std::exception_ptr fatal;
-  for (std::size_t i = 0; i < parsers.size(); ++i) if (parsers[i].valid()) {
-   try { parsers[i].get(); }
-   catch (const AnnotationSourceUnavailable&) { members[i].failure = std::current_exception(); }
-   catch (...) { if (!fatal) fatal = std::current_exception(); }
-  }
+  for (std::size_t i = 0; i < parsers.size(); ++i)
+   if (parsers[i].valid()) {
+    try {
+     parsers[i].get();
+    } catch (const AnnotationSourceUnavailable&) { members[i].failure = std::current_exception(); } catch (...) {
+     if (!fatal) fatal = std::current_exception();
+    }
+   }
   completed = completed_count.load();
   if (fatal) std::rethrow_exception(fatal);
   std::exception_ptr failure = stream_error;
-  for (const auto& member : members) if (member.failure) failure = member.failure;
+  for (const auto& member : members)
+   if (member.failure) failure = member.failure;
   if (!failure) break;
   throw_if_benchmark_cancelled(cancellation_);
   const auto withdraw_attempt = [&] {
@@ -297,22 +331,32 @@ void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progr
    // on its bytes. Joined parsers cannot republish a withdrawn generation.
    for (const bool train : training) {
     auto& index = train ? indexes_.train : indexes_.validation;
-    if (index) { withdraw_split(train); --completed; }
+    if (index) {
+     withdraw_split(train);
+     --completed;
+    }
    }
    invalidate_missing();
   };
   if (stream_error) withdraw_attempt();
   if (attempt == 3) {
    if ((selection_.train == CocoSplitAdmission::Required && !indexes_.train) || (selection_.validation == CocoSplitAdmission::Required && !indexes_.validation)) std::rethrow_exception(failure);
-   warn_unavailable(progress); break;
+   warn_unavailable(progress);
+   break;
   }
   invalidate_missing();
   try {
-   try { std::rethrow_exception(failure); }
-   catch (const std::exception& error) {
-    archive = repair_annotation_artifacts({request_}, BenchmarkDatasetSource::kCoco2017, error.what(), progress, progress.transfers(), workers, cancellation_, trace_, execution_, lease_->allowance(), storage_).front();
+   try {
+    std::rethrow_exception(failure);
+   } catch (const std::exception& error) {
+    archive =
+     repair_annotation_artifacts({request_}, BenchmarkDatasetSource::kCoco2017, error.what(), progress, progress.transfers(), workers, cancellation_, trace_, execution_, lease_->allowance(), storage_)
+      .front();
    }
-  } catch (const BenchmarkDownloadUnavailable& error) { download_unavailable(error, progress); break; }
+  } catch (const BenchmarkDownloadUnavailable& error) {
+   download_unavailable(error, progress);
+   break;
+  }
   // Successful repair replaces the shared archive even when the consumed
   // stream was valid and only a sibling parser rejected its member. A valid
   // newly built sibling must be read from these replacement bytes as well.
@@ -349,9 +393,12 @@ CocoAnnotationIndexes CocoAnnotationCache::finish() {
   const auto& path = training ? indexes_.train_path : indexes_.validation_path;
   const auto json = source_json(training);
   const auto& index = training ? indexes_.train : indexes_.validation;
-  if (index && index->completion) storage = common_math::checked_add(storage,
-   common_math::checked_add(index->completion->size, index->completion->proof_bytes, "stock index storage overflow"), "stock annotation storage overflow");
-  else { account(path); account(path.string() + ".complete.json"); }
+  if (index && index->completion)
+   storage = common_math::checked_add(storage, common_math::checked_add(index->completion->size, index->completion->proof_bytes, "stock index storage overflow"), "stock annotation storage overflow");
+  else {
+   account(path);
+   account(path.string() + ".complete.json");
+  }
   account(json);
   account(json.string() + ".extract.json");
  }

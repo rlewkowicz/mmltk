@@ -3,24 +3,22 @@
 #include "src/common/math/checked_arithmetic.h"
 #include <stdexcept>
 namespace mmltk::backend::data::benchmark_internal {
-BenchmarkLabelInput::BenchmarkLabelInput(NormalizedAnnotationReadView index, std::size_t image)
- : index_(std::move(index)), image_(image) {
+BenchmarkLabelInput::BenchmarkLabelInput(NormalizedAnnotationReadView index, std::size_t image) : index_(std::move(index)), image_(image) {
  admit_normalized_annotations(index_.storage());
  (void)index_.image(image_);
 }
-BenchmarkLabelInput::BenchmarkLabelInput(NormalizedAnnotationReadView index, std::shared_ptr<const CoconutNativeImage> native)
- : native_(std::move(native)), index_(std::move(index)) {
+BenchmarkLabelInput::BenchmarkLabelInput(NormalizedAnnotationReadView index, std::shared_ptr<const CoconutNativeImage> native) : native_(std::move(native)), index_(std::move(index)) {
  if (!native_) throw std::invalid_argument("benchmark labels require native input custody");
  (void)index_.image(0);
 }
-BenchmarkLabelChunk compile_benchmark_image_labels(const NormalizedAnnotationReadView& index, std::size_t position,
- std::pair<std::uint32_t, std::uint32_t> dimensions, std::uint32_t resolution, mmltk::backend::imaging::resample::ImageResizeMode resize_mode,
- BenchmarkLabelWorkspace& workspace, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+BenchmarkLabelChunk compile_benchmark_image_labels(const NormalizedAnnotationReadView& index, std::size_t position, std::pair<std::uint32_t, std::uint32_t> dimensions, std::uint32_t resolution,
+ mmltk::backend::imaging::resample::ImageResizeMode resize_mode, BenchmarkLabelWorkspace& workspace, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  namespace common_math = mmltk::common::math;
  BenchmarkLabelChunk chunk;
  const auto& image = index.image(position);
  const auto [source_width, source_height] = dimensions;
- chunk.width = source_width; chunk.height = source_height;
+ chunk.width = source_width;
+ chunk.height = source_height;
  const bool matching_geometry = index.source == BenchmarkDatasetSource::kOpenImagesV7 || (source_width == image.width && source_height == image.height);
  const auto box_count = matching_geometry ? image.box_count : 0U;
  chunk.dropped = image.box_count - box_count;
@@ -40,15 +38,13 @@ BenchmarkLabelChunk compile_benchmark_image_labels(const NormalizedAnnotationRea
   if (box.mask_rle_offset > index.storage().mask_rle_pairs.size() || box.mask_rle_pairs > index.storage().mask_rle_pairs.size() - box.mask_rle_offset)
    throw std::runtime_error("benchmark source mask range is invalid");
   const auto source_mask = index.storage().mask_rle_pairs.subspan(static_cast<std::size_t>(box.mask_rle_offset), box.mask_rle_pairs);
-  (void)dataset::append_resized_row_major_mask(source_mask, {image.width, image.height}, {resolution, resolution}, geometry,
-   &workspace.scratch(), chunk.runs);
+  (void)dataset::append_resized_row_major_mask(source_mask, {image.width, image.height}, {resolution, resolution}, geometry, &workspace.scratch(), chunk.runs);
   label.mask_rle_offset = common_math::checked_multiply<decltype(PackedInstance::mask_rle_offset)>(begin, sizeof(RLEPair), "benchmark mask offset overflow");
   label.mask_rle_pairs = common_math::checked_cast<std::uint16_t>(chunk.runs.size() - begin, "benchmark instance mask run count overflow");
   chunk.labels.push_back(label);
  }
  return chunk;
 }
-
 PackedInstance benchmark_canvas_box(
  const std::uint8_t class_id, const float x1, const float y1, const float x2, const float y2, const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
  if (letterbox.resized_width == 0U || letterbox.resized_height == 0U) { throw std::runtime_error("benchmark box requires a valid letterbox"); }
@@ -60,4 +56,4 @@ PackedInstance benchmark_canvas_box(
  result.bbox_y2 = y2 * static_cast<float>(letterbox.resized_height) + static_cast<float>(letterbox.offset_y);
  return result;
 }
-} // namespace mmltk::backend::data::benchmark_internal
+}  // namespace mmltk::backend::data::benchmark_internal

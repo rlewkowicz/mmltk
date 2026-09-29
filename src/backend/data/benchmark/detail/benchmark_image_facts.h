@@ -24,7 +24,7 @@ struct CachedImageReady {
  std::uint64_t image_id = 0;
  std::optional<std::pair<std::uint32_t, std::uint32_t>> dimensions{};
  bool defer_pixels = false;
- std::shared_ptr<const BenchmarkEncodedImage> payload;
+ std::shared_ptr<const BenchmarkEncodedImage> payload{};
 };
 // Captures physical source, generation, attempt and lease once. Copies retain
 // custody, never a writer or a runnable execution owner. Delivery after source
@@ -38,6 +38,7 @@ public:
  [[nodiscard]] bool consume(const CachedImageReady&) const;
  void geometry_ready(std::uint64_t, std::pair<std::uint32_t, std::uint32_t>) const;
  [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(state_); }
+
 private:
  friend class BenchmarkCompilePipeline;
  struct State;

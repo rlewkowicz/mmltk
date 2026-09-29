@@ -16,6 +16,7 @@ void require_storage(const std::filesystem::path&, std::uint64_t, const char*, c
 class StorageReservationPool {
  struct Ledger;
  struct Destination;
+
 public:
  class Reservation {
  public:
@@ -33,6 +34,7 @@ public:
   void resize(std::uint64_t promised, std::string_view description);
   void grow(std::uint64_t promised, std::string_view description);
   void release() noexcept;
+
  private:
   friend class StorageReservationPool;
   Reservation(std::shared_ptr<Destination>, std::uint64_t promised, std::uint64_t allocated);
@@ -47,6 +49,7 @@ public:
  [[nodiscard]] Reservation reserve(std::uint64_t required, std::string_view description);
  [[nodiscard]] Reservation reserve_download(const std::filesystem::path&, std::uint64_t expected, std::string_view description);
  [[nodiscard]] std::uint64_t outstanding() const;
+
 private:
  [[nodiscard]] Reservation reserve_backing(std::uint64_t promised, std::string_view description, const std::filesystem::path* download);
  std::shared_ptr<Destination> destination_;

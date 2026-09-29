@@ -29,7 +29,7 @@ struct CoconutComponentMetadata {
  std::uint32_t recovery_policy = 0;
  std::string original_annotation_identity;
  // Compile-local annotation lineage; persisted input_identity seals this plus physical dependencies.
- std::string annotation_input_identity;
+ std::string annotation_input_identity{};
  std::uint64_t original_generation = 0;
 };
 struct CoconutSegment {
@@ -58,7 +58,6 @@ struct CoconutImportLimits {
  std::uint32_t max_segments = 65535U;
  std::uint32_t max_dimension = MAX_IMAGE_EXTENT;
 };
-
 // Shared once per release/source/original generation; each image owns payload only.
 struct CoconutNativeLineage {
  CoconutComponentMetadata component;
@@ -82,6 +81,7 @@ public:
  [[nodiscard]] const CoconutInventoryImage& inventory() const noexcept { return inventory_; }
  [[nodiscard]] const CoconutRecoveryImage& recovery() const noexcept { return recovery_; }
  [[nodiscard]] std::uint64_t segment_begin() const noexcept { return segment_begin_; }
+
 private:
  friend class CoconutNativeWorkspace;
  explicit CoconutNativeImage(std::shared_ptr<const CoconutNativeLineage> lineage) : lineage_(std::move(lineage)) {}
@@ -113,13 +113,17 @@ public:
  void decode(const CoconutRecord&, std::span<const std::uint8_t>, dataset::MaskDimensions);
  [[nodiscard]] std::vector<CoconutSegmentSupport> take_support(std::size_t);
  void borrow_support(const CoconutRecord&, std::span<const CoconutSegmentSupport>, dataset::MaskDimensions, std::shared_ptr<const void>);
- [[nodiscard]] std::shared_ptr<const CoconutNativeImage> finish(const CoconutRecord&, const CoconutPhysicalImage&, dataset::MaskDimensions,
-  std::shared_ptr<const CoconutNativeLineage>, const CoconutRejectedObject&);
- [[nodiscard]] std::shared_ptr<const CoconutNativeImage> reuse(const CoconutRecord&, const CoconutPhysicalImage&, const NormalizedAnnotationReadView&, std::size_t,
-  const CoconutInventoryImage&, const CoconutRecoveryImage*, std::shared_ptr<const CoconutNativeLineage>, std::string_view dependency);
+ [[nodiscard]] std::shared_ptr<const CoconutNativeImage> finish(
+  const CoconutRecord&, const CoconutPhysicalImage&, dataset::MaskDimensions, std::shared_ptr<const CoconutNativeLineage>, const CoconutRejectedObject&);
+ [[nodiscard]] std::shared_ptr<const CoconutNativeImage> reuse(const CoconutRecord&, const CoconutPhysicalImage&, const NormalizedAnnotationReadView&, std::size_t, const CoconutInventoryImage&,
+  const CoconutRecoveryImage*, std::shared_ptr<const CoconutNativeLineage>, std::string_view dependency);
  void retire() noexcept;
+
 private:
- struct SegmentEntry { std::uint32_t id = 0; std::size_t index = 0; };
+ struct SegmentEntry {
+  std::uint32_t id = 0;
+  std::size_t index = 0;
+ };
  SegmentEntry& segment_entry(std::uint32_t);
  CoconutImportLimits limits_;
  mmltk::common::concurrency::CancellationObservation cancellation_;
@@ -131,4 +135,4 @@ private:
  std::vector<SegmentEntry> segment_by_id_;
  std::vector<CoconutSegmentSupport> support_;
 };
-} // namespace mmltk::backend::data::benchmark_internal
+}  // namespace mmltk::backend::data::benchmark_internal

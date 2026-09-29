@@ -69,9 +69,12 @@ using RejectFields = std::remove_cvref_t<decltype(mmltk::frameworks::reflection:
  RejectFields::Visit([&]<class Declaration, std::size_t Index>() { result[Index] = rejected.*Declaration::pointer; });
  return result;
 }
-void annotation_ranges(BenchmarkCompilePipeline* execution, std::size_t count, int workers, const std::function<void(int, std::size_t, std::size_t)>& consume, std::uint64_t workspace = 8U << 20, const std::function<void(std::size_t)>& retire = {}) {
- if (execution) execution->for_each(BenchmarkStage::Metadata, count, {workspace, 0}, [&](std::size_t index) { consume(static_cast<int>(execution->current_lane()), index, index + 1); }, retire);
- else parallel_for_range_indexed<std::size_t>(0U, count, workers, consume);
+void annotation_ranges(BenchmarkCompilePipeline* execution, std::size_t count, int workers, const std::function<void(int, std::size_t, std::size_t)>& consume, std::uint64_t workspace = 8U << 20,
+ const std::function<void(std::size_t)>& retire = {}) {
+ if (execution)
+  execution->for_each(BenchmarkStage::Metadata, count, {workspace, 0}, [&](std::size_t index) { consume(static_cast<int>(execution->current_lane()), index, index + 1); }, retire);
+ else
+  parallel_for_range_indexed<std::size_t>(0U, count, workers, consume);
 }
 [[nodiscard]] std::filesystem::path normalized_manifest_path(const std::filesystem::path& path) { return path.string() + ".complete.json"; }
 [[nodiscard]] int effective_worker_count(const int requested, const std::size_t work_items) {
@@ -79,17 +82,16 @@ void annotation_ranges(BenchmarkCompilePipeline* execution, std::size_t count, i
  const int bounded_work = work_items > static_cast<std::size_t>(std::numeric_limits<int>::max()) ? std::numeric_limits<int>::max() : static_cast<int>(std::max<std::size_t>(work_items, 1U));
  return std::max(1, std::min(std::max(available, 1), bounded_work));
 }
-void parallel_object_array(const PaddedMappedFile& file, std::span<const ByteRange> rows, int requested_workers,
- std::vector<simdjson::ondemand::parser>& parsers, BenchmarkCompilePipeline::Workspace* parser_workspace,
- mmltk::common::concurrency::CancellationObservation cancellation,
- const std::function<void(int, simdjson::ondemand::object, std::uint64_t)>& callback, BenchmarkCompilePipeline* execution = nullptr,
- const std::function<void(int)>& begin_chunk = {}) {
+void parallel_object_array(const PaddedMappedFile& file, std::span<const ByteRange> rows, int requested_workers, std::vector<simdjson::ondemand::parser>& parsers,
+ BenchmarkCompilePipeline::Workspace* parser_workspace, mmltk::common::concurrency::CancellationObservation cancellation,
+ const std::function<void(int, simdjson::ondemand::object, std::uint64_t)>& callback, BenchmarkCompilePipeline* execution = nullptr, const std::function<void(int)>& begin_chunk = {}) {
  const auto workers = execution ? execution->workers() : static_cast<std::size_t>(effective_worker_count(requested_workers, rows.size()));
  std::vector<ByteRange> chunks;
  for (std::size_t begin = 0; begin < rows.size();) {
   auto end = begin + 1;
   while (end < rows.size() && rows[end].end - rows[begin].begin <= (256U << 10)) ++end;
-  chunks.push_back({begin, end}); begin = end;
+  chunks.push_back({begin, end});
+  begin = end;
  }
  const auto consume = [&](std::size_t lane, std::size_t chunk) {
   if (begin_chunk) begin_chunk(static_cast<int>(lane));
@@ -106,14 +108,18 @@ void parallel_object_array(const PaddedMappedFile& file, std::span<const ByteRan
    if (execution && (row - chunks[chunk].begin + 1) % 32 == 0) execution->cooperate();
   }
  };
- if (execution) execution->for_each(BenchmarkStage::Metadata, chunks.size(), [&](std::size_t chunk) {
+ if (execution)
+  execution->for_each(BenchmarkStage::Metadata, chunks.size(), [&](std::size_t chunk) {
    const auto range = chunks[chunk];
    const auto bytes = std::uint64_t{rows[range.end - 1].end - rows[range.begin].begin};
-   return BenchmarkResources{mmltk::common::math::checked_add(std::uint64_t{65536}, mmltk::common::math::checked_multiply(bytes, 64U, "annotation workspace overflow"), "annotation workspace overflow"), 0};
+   return BenchmarkResources{
+    mmltk::common::math::checked_add(std::uint64_t{65536}, mmltk::common::math::checked_multiply(bytes, 64U, "annotation workspace overflow"), "annotation workspace overflow"), 0
+   };
   }, [&](std::size_t chunk) { consume(execution->current_lane(), chunk); }, *parser_workspace);
- else parallel_for_range_indexed<std::size_t>(0, chunks.size(), static_cast<int>(workers), [&](int lane, std::size_t begin, std::size_t end) {
-  for (auto chunk = begin; chunk < end; ++chunk) consume(static_cast<std::size_t>(lane), chunk);
- });
+ else
+  parallel_for_range_indexed<std::size_t>(0, chunks.size(), static_cast<int>(workers), [&](int lane, std::size_t begin, std::size_t end) {
+   for (auto chunk = begin; chunk < end; ++chunk) consume(static_cast<std::size_t>(lane), chunk);
+  });
 }
 [[nodiscard]] std::uint16_t parse_objects365_shard(const std::string_view file_name) {
  const std::size_t patch = file_name.find("patch");
@@ -281,8 +287,9 @@ void parse_segmentation(simdjson::ondemand::value value, ParsedAnnotation::Segme
  parsed.complete = have_image && have_category;
  return parsed;
 }
-void validate_numeric_categories(const PaddedMappedFile& file, std::span<const ByteRange> categories,
- std::vector<simdjson::ondemand::parser>& parsers, BenchmarkCompilePipeline::Workspace* parser_workspace, NumericCategoryAdmission& admission, bool complete, mmltk::common::concurrency::CancellationObservation cancel_requested, BenchmarkCompilePipeline* execution) try {
+void validate_numeric_categories(const PaddedMappedFile& file, std::span<const ByteRange> categories, std::vector<simdjson::ondemand::parser>& parsers,
+ BenchmarkCompilePipeline::Workspace* parser_workspace, NumericCategoryAdmission& admission, bool complete, mmltk::common::concurrency::CancellationObservation cancel_requested,
+ BenchmarkCompilePipeline* execution) try {
  std::mutex admission_mutex;
  parallel_object_array(file, categories, 1, parsers, parser_workspace, cancel_requested, [&](int, simdjson::ondemand::object object, std::uint64_t) {
   std::uint32_t id = 0U;
@@ -353,8 +360,15 @@ void decode_compressed_coco_counts(const std::string_view encoded, std::vector<s
  };
  return {boundary(low), boundary(high)};
 }
-struct MaskRowEvent { std::uint32_t y, x1, x2; int delta; };
-struct PolygonEdge { double x1, y1, x2, y2; std::uint32_t begin, end; std::size_t polygon; };
+struct MaskRowEvent {
+ std::uint32_t y, x1, x2;
+ int delta;
+};
+struct PolygonEdge {
+ double x1, y1, x2, y2;
+ std::uint32_t begin, end;
+ std::size_t polygon;
+};
 struct SegmentationScratch {
  std::vector<RLEPair>* output = nullptr;
  std::size_t output_begin = 0;
@@ -365,18 +379,28 @@ struct SegmentationScratch {
  std::vector<std::size_t> active;
  std::vector<std::pair<std::uint32_t, std::uint32_t>> intervals;
  [[nodiscard]] std::size_t retained_bytes() const noexcept {
-  return intersections.capacity() * sizeof(double) + counts.capacity() * sizeof(std::uint32_t) + events.capacity() * sizeof(MaskRowEvent) +
-   edges.capacity() * sizeof(PolygonEdge) + active.capacity() * sizeof(std::size_t) + intervals.capacity() * sizeof(intervals.front());
+  return intersections.capacity() * sizeof(double) + counts.capacity() * sizeof(std::uint32_t) + events.capacity() * sizeof(MaskRowEvent) + edges.capacity() * sizeof(PolygonEdge) +
+         active.capacity() * sizeof(std::size_t) + intervals.capacity() * sizeof(intervals.front());
  }
- void reset() noexcept { output = nullptr; intersections.clear(); counts.clear(); events.clear(); edges.clear(); active.clear(); intervals.clear(); }
+ void reset() noexcept {
+  output = nullptr;
+  intersections.clear();
+  counts.clear();
+  events.clear();
+  edges.clear();
+  active.clear();
+  intervals.clear();
+ }
 };
 void merge_mask_intervals(std::vector<std::pair<std::uint32_t, std::uint32_t>>& intervals) {
  std::ranges::sort(intervals);
  std::size_t count = 0;
  for (const auto interval : intervals) {
   if (interval.first == interval.second) continue;
-  if (count && interval.first <= intervals[count - 1].second) intervals[count - 1].second = std::max(interval.second, intervals[count - 1].second);
-  else intervals[count++] = interval;
+  if (count && interval.first <= intervals[count - 1].second)
+   intervals[count - 1].second = std::max(interval.second, intervals[count - 1].second);
+  else
+   intervals[count++] = interval;
  }
  intervals.resize(count);
 }
@@ -386,7 +410,8 @@ std::span<const RLEPair> convert_coco_counts(std::span<const std::uint32_t> coun
  events.clear();
  const auto rectangle = [&](std::uint32_t x1, std::uint32_t x2, std::uint32_t y1, std::uint32_t y2) {
   if (x1 == x2 || y1 == y2) return;
-  events.push_back({y1, x1, x2, 1}); events.push_back({y2, x1, x2, -1});
+  events.push_back({y1, x1, x2, 1});
+  events.push_back({y2, x1, x2, -1});
  };
  std::uint64_t position = 0;
  bool foreground = false;
@@ -397,12 +422,20 @@ std::span<const RLEPair> convert_coco_counts(std::span<const std::uint32_t> coun
    auto x = static_cast<std::uint32_t>(position / dimensions.height);
    auto y = static_cast<std::uint32_t>(position % dimensions.height);
    auto remaining = std::uint64_t{count};
-   if (y) { const auto length = std::min(remaining, std::uint64_t{dimensions.height - y}); rectangle(x, x + 1, y, static_cast<std::uint32_t>(y + length)); remaining -= length; ++x; }
+   if (y) {
+    const auto length = std::min(remaining, std::uint64_t{dimensions.height - y});
+    rectangle(x, x + 1, y, static_cast<std::uint32_t>(y + length));
+    remaining -= length;
+    ++x;
+   }
    const auto columns = static_cast<std::uint32_t>(remaining / dimensions.height);
-   rectangle(x, x + columns, 0, dimensions.height); x += columns; remaining %= dimensions.height;
+   rectangle(x, x + columns, 0, dimensions.height);
+   x += columns;
+   remaining %= dimensions.height;
    rectangle(x, x + 1, 0, static_cast<std::uint32_t>(remaining));
   }
-  position = end; foreground = !foreground;
+  position = end;
+  foreground = !foreground;
  }
  if (position != pixels) throw std::runtime_error("COCO mask runs do not cover their declared dimensions");
  std::ranges::sort(events, {}, &MaskRowEvent::y);
@@ -415,15 +448,21 @@ std::span<const RLEPair> convert_coco_counts(std::span<const std::uint32_t> coun
   const auto y = events[next].y;
   do {
    const auto event = events[next++];
-   const auto add = [&](auto x, auto delta) { auto& value = endpoints[x]; value += delta; if (!value) endpoints.erase(x); };
-   add(event.x1, event.delta); add(event.x2, -event.delta);
+   const auto add = [&](auto x, auto delta) {
+    auto& value = endpoints[x];
+    value += delta;
+    if (!value) endpoints.erase(x);
+   };
+   add(event.x1, event.delta);
+   add(event.x2, -event.delta);
   } while (next < events.size() && events[next].y == y);
   if (next == events.size()) break;
   scratch.intervals.clear();
   std::int64_t coverage = 0;
   std::uint32_t start = 0;
   for (const auto [x, delta] : endpoints) {
-   const auto previous = coverage; coverage += delta;
+   const auto previous = coverage;
+   coverage += delta;
    if (!previous && coverage) start = x;
    if (previous && !coverage) scratch.intervals.emplace_back(start, x);
   }
@@ -451,8 +490,15 @@ std::span<const RLEPair> rasterize_coco_polygons(const std::vector<std::vector<d
  auto y = edges.empty() ? dimensions.height : edges.front().begin;
  while (next < edges.size() || !scratch.active.empty()) {
   bool changed = std::erase_if(scratch.active, [&](auto i) { return edges[i].end <= y; }) != 0;
-  while (next < edges.size() && edges[next].begin <= y) { scratch.active.push_back(next++); changed = true; }
-  if (scratch.active.empty()) { if (next == edges.size()) break; y = edges[next].begin; continue; }
+  while (next < edges.size() && edges[next].begin <= y) {
+   scratch.active.push_back(next++);
+   changed = true;
+  }
+  if (scratch.active.empty()) {
+   if (next == edges.size()) break;
+   y = edges[next].begin;
+   continue;
+  }
   // Polygon membership changes only at edge events, independently of crossing
   // order inside each polygon. Vertical crossings are constant to that event.
   if (changed) std::ranges::sort(scratch.active, [&](auto a, auto b) { return edges[a].polygon < edges[b].polygon; });
@@ -494,7 +540,10 @@ std::span<const RLEPair> rasterize_coco_polygons(const std::vector<std::vector<d
  if (!segmentation.polygons.empty()) return rasterize_coco_polygons(segmentation.polygons, dimensions, scratch);
  if (segmentation.width != image.width || segmentation.height != image.height) throw std::runtime_error("COCO mask dimensions disagree with image metadata");
  std::span<const std::uint32_t> counts = segmentation.counts;
- if (counts.empty()) { decode_compressed_coco_counts(segmentation.compressed_counts, scratch.counts); counts = scratch.counts; }
+ if (counts.empty()) {
+  decode_compressed_coco_counts(segmentation.compressed_counts, scratch.counts);
+  counts = scratch.counts;
+ }
  return convert_coco_counts(counts, dimensions, scratch);
 }
 [[nodiscard]] std::span<const RLEPair> materialize_segmentation(
@@ -598,7 +647,7 @@ std::span<const RLEPair> rasterize_coco_polygons(const std::vector<std::vector<d
 // Shared payload of the `benchmark.annotations.indexed` trace event: provenance, the record counts every parser
 // produces, and the reject tally. Parser-specific fields are added by the caller to the returned object, which is
 // only built from inside the trace sink's lambda so untraced runs still pay nothing.
-template<class Index>
+template <class Index>
 [[nodiscard]] nlohmann::json normalized_index_trace_json(const Index& index) {
  return nlohmann::json{
   {"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"raw_records", index.rejected.raw_records},
@@ -606,7 +655,10 @@ template<class Index>
  };
 }
 struct AnnotationChunk {
- struct Entry { std::uint32_t image; NormalizedBox box; };
+ struct Entry {
+  std::uint32_t image;
+  NormalizedBox box;
+ };
  std::vector<Entry> boxes;
  std::vector<RLEPair> runs;
  void append(BoxCandidate candidate, std::uint64_t ordinal) {
@@ -616,9 +668,11 @@ struct AnnotationChunk {
   boxes.push_back({candidate.image_index, candidate.box});
  }
 };
-NormalizedAnnotationIndex assemble_annotation_chunks(NormalizedAnnotationBuilder metadata, std::span<const ParsedImage> images,
- std::vector<AnnotationChunk>& chunks, bool keep_empty, mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkCompilePipeline* execution) {
- struct Reference { std::size_t chunk, box; };
+NormalizedAnnotationIndex assemble_annotation_chunks(NormalizedAnnotationBuilder metadata, std::span<const ParsedImage> images, std::vector<AnnotationChunk>& chunks, bool keep_empty,
+ mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkCompilePipeline* execution, const BenchmarkTraceSink& trace) {
+ struct Reference {
+  std::size_t chunk, box;
+ };
  std::size_t total = 0, runs = 0;
  for (const auto& chunk : chunks) {
   total = mmltk::common::math::checked_add(total, chunk.boxes.size(), "normalized box count overflow");
@@ -626,37 +680,49 @@ NormalizedAnnotationIndex assemble_annotation_chunks(NormalizedAnnotationBuilder
  }
  NormalizedAnnotationIndex output;
  const auto assemble = [&](std::size_t) {
- std::vector<Reference> ordered;
- ordered.reserve(total);
- for (std::size_t chunk = 0; chunk < chunks.size(); ++chunk) for (std::size_t box = 0; box < chunks[chunk].boxes.size(); ++box) ordered.push_back({chunk, box});
- const auto entry = [&](Reference ref) -> const AnnotationChunk::Entry& { return chunks[ref.chunk].boxes[ref.box]; };
- std::ranges::sort(ordered, [&](Reference a, Reference b) { return std::pair{entry(a).image, entry(a).box.source_ordinal} < std::pair{entry(b).image, entry(b).box.source_ordinal}; });
- NormalizedAnnotationAssembler result(std::move(metadata), images.size(), total, runs, cancellation);
- std::size_t cursor = 0;
- for (std::size_t image = 0; image < images.size(); ++image) {
-  throw_if_benchmark_cancelled(cancellation);
-  const bool populated = cursor < ordered.size() && entry(ordered[cursor]).image == image;
-  if (keep_empty || populated) result.begin_image({images[image].id, 0, 0, images[image].width, images[image].height, images[image].shard, 0});
-  while (cursor < ordered.size() && entry(ordered[cursor]).image == image) {
-   const auto ref = ordered[cursor++]; auto box = entry(ref).box;
-   const auto mask = std::span(chunks[ref.chunk].runs).subspan(static_cast<std::size_t>(box.mask_rle_offset), box.mask_rle_pairs);
-   result.append_box(box, mask);
+  std::vector<Reference> ordered;
+  ordered.reserve(total);
+  for (std::size_t chunk = 0; chunk < chunks.size(); ++chunk)
+   for (std::size_t box = 0; box < chunks[chunk].boxes.size(); ++box) ordered.push_back({chunk, box});
+  const auto entry = [&](Reference ref) -> const AnnotationChunk::Entry& { return chunks[ref.chunk].boxes[ref.box]; };
+  std::ranges::sort(ordered, [&](Reference a, Reference b) { return std::pair{entry(a).image, entry(a).box.source_ordinal} < std::pair{entry(b).image, entry(b).box.source_ordinal}; });
+  NormalizedAnnotationAssembler result(std::move(metadata), images.size(), total, runs, cancellation);
+  std::size_t cursor = 0;
+  for (std::size_t image = 0; image < images.size(); ++image) {
+   throw_if_benchmark_cancelled(cancellation);
+   const bool populated = cursor < ordered.size() && entry(ordered[cursor]).image == image;
+   if (keep_empty || populated) result.begin_image({images[image].id, 0, 0, images[image].width, images[image].height, images[image].shard, 0});
+   while (cursor < ordered.size() && entry(ordered[cursor]).image == image) {
+    const auto ref = ordered[cursor++];
+    auto box = entry(ref).box;
+    const auto mask = std::span(chunks[ref.chunk].runs).subspan(static_cast<std::size_t>(box.mask_rle_offset), box.mask_rle_pairs);
+    result.append_box(box, mask);
+   }
   }
- }
- output = result.finish();
+  output = result.finish(trace);
  };
- const auto workspace = mmltk::common::math::checked_add(mmltk::common::math::checked_multiply(std::uint64_t{total}, std::uint64_t{sizeof(Reference)}, "normalized ordering workspace overflow"), std::uint64_t{65536}, "normalized ordering workspace overflow");
- if (execution) execution->run(BenchmarkStage::Metadata, {workspace, 0}, assemble); else assemble(0);
+ const auto workspace = mmltk::common::math::checked_add(mmltk::common::math::checked_multiply(std::uint64_t{total}, std::uint64_t{sizeof(Reference)}, "normalized ordering workspace overflow"),
+  std::uint64_t{65536}, "normalized ordering workspace overflow");
+ if (execution)
+  execution->run(BenchmarkStage::Metadata, {workspace, 0}, assemble);
+ else
+  assemble(0);
  return output;
 }
 class CsvFields final {
- struct Field { std::size_t begin, length; bool decoded; };
+ struct Field {
+  std::size_t begin, length;
+  bool decoded;
+ };
  std::vector<Field> positions_;
  std::vector<std::string_view> fields_;
  std::string decoded_;
+
 public:
  std::span<const std::string_view> parse(std::string_view line) {
-  positions_.clear(); fields_.clear(); decoded_.clear();
+  positions_.clear();
+  fields_.clear();
+  decoded_.clear();
   std::size_t begin = 0;
   while (begin <= line.size()) {
    if (begin < line.size() && line[begin] == '"') {
@@ -664,9 +730,18 @@ public:
     auto cursor = begin + 1;
     bool closed = false;
     while (cursor < line.size()) {
-     if (line[cursor] != '"') { decoded_.push_back(line[cursor++]); continue; }
-     if (cursor + 1 < line.size() && line[cursor + 1] == '"') { decoded_.push_back('"'); cursor += 2; }
-     else { ++cursor; closed = true; break; }
+     if (line[cursor] != '"') {
+      decoded_.push_back(line[cursor++]);
+      continue;
+     }
+     if (cursor + 1 < line.size() && line[cursor + 1] == '"') {
+      decoded_.push_back('"');
+      cursor += 2;
+     } else {
+      ++cursor;
+      closed = true;
+      break;
+     }
     }
     if (!closed || (cursor < line.size() && line[cursor] != ',')) throw std::runtime_error("malformed quoted CSV field in benchmark annotations");
     positions_.push_back({offset, decoded_.size() - offset, true});
@@ -774,7 +849,8 @@ struct OpenImagesCandidate {
  do {
   auto end = begin + std::min(step, file.size() - begin);
   while (end < file.size() && file.data()[end - 1] != '\n') ++end;
-  ranges.push_back({begin, end}); begin = end;
+  ranges.push_back({begin, end});
+  begin = end;
  } while (begin < file.size());
  return ranges;
 }
@@ -810,14 +886,14 @@ void validate_open_images_classes(const std::filesystem::path& path, const std::
     const auto fields = scratch.parse(line);
     if (fields.size() < 2U) throw std::runtime_error("Open Images class description row is malformed");
     const auto found = expected.find(fields[0]);
-    if (found != expected.end() && (fields[1] != found->second || !matched.emplace(found->first).second))
-     throw std::runtime_error("Open Images class metadata disagrees with its fixed mapping");
+    if (found != expected.end() && (fields[1] != found->second || !matched.emplace(found->first).second)) throw std::runtime_error("Open Images class metadata disagrees with its fixed mapping");
     if (options.execution && ++rows % 64 == 0) options.execution->cooperate();
    });
   };
-  if (options.execution) options.execution->run(BenchmarkStage::Metadata,
-   {mmltk::common::math::checked_multiply(std::uint64_t{range.end - range.begin}, 64U, "Open Images class workspace overflow"), 0}, consume);
-  else consume(0);
+  if (options.execution)
+   options.execution->run(BenchmarkStage::Metadata, {mmltk::common::math::checked_multiply(std::uint64_t{range.end - range.begin}, 64U, "Open Images class workspace overflow"), 0}, consume);
+  else
+   consume(0);
  }
  if (matched.size() != expected.size()) { throw std::runtime_error("Open Images class metadata is missing a required mapped class"); }
 }
@@ -847,7 +923,7 @@ std::uint64_t validate_run_value(RLEPair pair, std::uint64_t pixels, std::uint64
  if (!pair.length || pair.start < previous_end || end > pixels) throw std::runtime_error("normalized benchmark mask record is invalid");
  return end;
 }
-template<class Index>
+template <class Index>
 void validate_normalized_records(const Index& index, mmltk::common::concurrency::CancellationObservation cancel_requested, bool metadata_only = false, bool images_admitted = false) {
  std::uint64_t expected_first = 0U;
  std::uint64_t expected_mask_offset = 0U;
@@ -856,8 +932,9 @@ void validate_normalized_records(const Index& index, mmltk::common::concurrency:
  for (std::size_t image_index = 0U; image_index < index.images.size(); ++image_index) {
   if ((image_index & 4095U) == 0U) { throw_if_benchmark_cancelled(cancel_requested); }
   const NormalizedImage& image = index.images[image_index];
-  if (!images_admitted && ((!first && image.source_image_id <= previous_id) || image.first_box != expected_first || image.first_box > index.boxes.size() || image.box_count > index.boxes.size() - image.first_box ||
-      (index.source != BenchmarkDatasetSource::kOpenImagesV7 && (image.width == 0U || image.height == 0U)) || image.reserved != 0U)) {
+  if (!images_admitted &&
+      ((!first && image.source_image_id <= previous_id) || image.first_box != expected_first || image.first_box > index.boxes.size() || image.box_count > index.boxes.size() - image.first_box ||
+       (index.source != BenchmarkDatasetSource::kOpenImagesV7 && (image.width == 0U || image.height == 0U)) || image.reserved != 0U)) {
    throw std::runtime_error("normalized benchmark image record is invalid at index " + std::to_string(image_index) + " (source_image_id=" + std::to_string(image.source_image_id) +
                             ", previous_id=" + std::to_string(previous_id) + ", first_box=" + std::to_string(image.first_box) + ", expected_first_box=" + std::to_string(expected_first) +
                             ", box_count=" + std::to_string(image.box_count) + ", width=" + std::to_string(image.width) + ", height=" + std::to_string(image.height) + ")");
@@ -884,14 +961,14 @@ void validate_normalized_records(const Index& index, mmltk::common::concurrency:
  if (!metadata_only && expected_mask_offset != index.mask_rle_pairs.size()) { throw std::runtime_error("normalized benchmark mask records are not fully referenced"); }
 }
 // Slice admission deliberately does not require persisted sorted image IDs.
-template<class Index>
+template <class Index>
 std::span<const NormalizedBox> image_boxes(const Index& index, std::size_t position) {
  if (position >= index.images.size()) throw std::out_of_range("normalized image position is invalid");
  const auto& image = index.images[position];
  if (image.first_box > index.boxes.size() || image.box_count > index.boxes.size() - image.first_box) throw std::runtime_error("normalized image slice box range is invalid");
  return std::span(index.boxes).subspan(static_cast<std::size_t>(image.first_box), image.box_count);
 }
-template<class Index>
+template <class Index>
 std::size_t slice_run_count(const Index& index, std::span<const NormalizedBox> boxes, mmltk::common::concurrency::CancellationObservation cancellation) {
  std::size_t count = 0;
  for (std::size_t i = 0; i < boxes.size(); ++i) {
@@ -906,9 +983,9 @@ std::size_t slice_run_count(const Index& index, std::span<const NormalizedBox> b
 }
 // Append and forward compaction share the complete admitted slice transfer.
 // memmove handles overlapping runs, and each box is captured before overwriting it.
-template<class Index>
-void transfer_image_slice(NormalizedAnnotationBuilder& destination, const Index& source, std::size_t position, std::size_t image_destination, std::size_t box_destination,
- std::size_t& run_destination, mmltk::common::concurrency::CancellationObservation cancellation) {
+template <class Index>
+void transfer_image_slice(NormalizedAnnotationBuilder& destination, const Index& source, std::size_t position, std::size_t image_destination, std::size_t box_destination, std::size_t& run_destination,
+ mmltk::common::concurrency::CancellationObservation cancellation) {
  auto image = source.images[position];
  const auto first = image.first_box;
  image.first_box = box_destination;
@@ -943,30 +1020,43 @@ void transfer_image_slice(NormalizedAnnotationBuilder& destination, const Index&
 NormalizedAnnotationIndex seal_normalized_annotation_metadata(NormalizedAnnotationBuilder&& builder) {
  auto storage = std::make_shared<const NormalizedAnnotationBuilder>(std::move(builder));
  auto owner = std::make_shared<NormalizedAnnotationBacking>();
- owner->source = storage->source; owner->storage = storage; owner->images = storage->images; owner->boxes = storage->boxes; owner->runs = storage->mask_rle_pairs;
+ owner->source = storage->source;
+ owner->storage = storage;
+ owner->images = storage->images;
+ owner->boxes = storage->boxes;
+ owner->runs = storage->mask_rle_pairs;
  NormalizedAnnotationIndex result;
  static_cast<NormalizedAnnotationMetadata&>(result) = *storage;
- result.images = owner->images; result.boxes = owner->boxes; result.mask_rle_pairs = owner->runs; result.backing = std::move(owner);
+ result.images = owner->images;
+ result.boxes = owner->boxes;
+ result.mask_rle_pairs = owner->runs;
+ result.backing = std::move(owner);
  return result;
 }
-NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(NormalizedAnnotationMetadata metadata, std::size_t images, std::size_t boxes, std::size_t runs,
- mmltk::common::concurrency::CancellationObservation cancellation) : cancellation_(cancellation) {
+NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(
+ NormalizedAnnotationMetadata metadata, std::size_t images, std::size_t boxes, std::size_t runs, mmltk::common::concurrency::CancellationObservation cancellation)
+    : cancellation_(cancellation) {
  static_cast<NormalizedAnnotationMetadata&>(builder_) = std::move(metadata);
- builder_.images.reserve(images); builder_.boxes.reserve(boxes); builder_.mask_rle_pairs.reserve(runs);
+ builder_.images.reserve(images);
+ builder_.boxes.reserve(boxes);
+ builder_.mask_rle_pairs.reserve(runs);
 }
 void NormalizedAnnotationAssembler::begin_image(NormalizedImage image) {
  if (finished_) throw std::logic_error("normalized assembler is already sealed");
  throw_if_benchmark_cancelled(cancellation_);
  if ((!builder_.images.empty() && image.source_image_id <= builder_.images.back().source_image_id) || image.reserved ||
-     (builder_.source != BenchmarkDatasetSource::kOpenImagesV7 && (!image.width || !image.height))) throw std::runtime_error("normalized benchmark image record is invalid");
- image.first_box = builder_.boxes.size(); image.box_count = 0;
+     (builder_.source != BenchmarkDatasetSource::kOpenImagesV7 && (!image.width || !image.height)))
+  throw std::runtime_error("normalized benchmark image record is invalid");
+ image.first_box = builder_.boxes.size();
+ image.box_count = 0;
  builder_.images.push_back(image);
 }
 void NormalizedAnnotationAssembler::append_box(NormalizedBox box, std::span<const RLEPair> runs) {
  if (finished_) throw std::logic_error("normalized assembler is already sealed");
  if (builder_.images.empty()) throw std::logic_error("normalized box requires an owning image");
  auto& image = builder_.images.back();
- box.mask_rle_offset = builder_.mask_rle_pairs.size(); box.mask_rle_pairs = checked_cast<std::uint32_t>(runs.size(), "normalized mask run count overflow");
+ box.mask_rle_offset = builder_.mask_rle_pairs.size();
+ box.mask_rle_pairs = checked_cast<std::uint32_t>(runs.size(), "normalized mask run count overflow");
  validate_box_value(box, builder_.source);
  if (image.box_count == UINT32_MAX) throw std::overflow_error("normalized per-image box count overflow");
  const auto first_run = builder_.mask_rle_pairs.size();
@@ -977,15 +1067,23 @@ void NormalizedAnnotationAssembler::append_box(NormalizedBox box, std::span<cons
    previous = validate_run_value(runs[i], std::uint64_t{image.width} * image.height, previous);
    builder_.mask_rle_pairs.push_back(runs[i]);
   }
-  builder_.boxes.push_back(box); ++image.box_count;
+  builder_.boxes.push_back(box);
+  ++image.box_count;
  } catch (...) {
   builder_.mask_rle_pairs.resize(first_run);
   throw;
  }
 }
-NormalizedAnnotationIndex NormalizedAnnotationAssembler::finish() {
+NormalizedAnnotationIndex NormalizedAnnotationAssembler::finish(const BenchmarkTraceSink& trace) {
  if (finished_) throw std::logic_error("normalized assembler is already sealed");
  throw_if_benchmark_cancelled(cancellation_);
+ trace_benchmark_event(trace, "benchmark.annotations.assembled", [&] {
+  return nlohmann::json{
+   {"source", benchmark_source_name(builder_.source)}, {"split", builder_.split}, {"images", builder_.images.size()}, {"boxes", builder_.boxes.size()},
+   {"mask_rle_pairs", builder_.mask_rle_pairs.size()}, {"image_capacity", builder_.images.capacity()}, {"box_capacity", builder_.boxes.capacity()},
+   {"mask_rle_capacity", builder_.mask_rle_pairs.capacity()}
+  };
+ });
  auto result = seal_normalized_annotation_metadata(std::move(builder_));
  finished_ = true;
  std::call_once(result.backing->image_admission, [] {});
@@ -994,12 +1092,15 @@ NormalizedAnnotationIndex NormalizedAnnotationAssembler::finish() {
 }
 void admit_normalized_annotations(const NormalizedAnnotationIndex& index, mmltk::common::concurrency::CancellationObservation cancellation) {
  if (!index.backing || index.source != index.backing->source || index.images.data() != index.backing->images.data() || index.images.size() != index.backing->images.size() ||
-     index.boxes.data() != index.backing->boxes.data() || index.boxes.size() != index.backing->boxes.size() ||
-     index.mask_rle_pairs.data() != index.backing->runs.data() || index.mask_rle_pairs.size() != index.backing->runs.size())
+     index.boxes.data() != index.backing->boxes.data() || index.boxes.size() != index.backing->boxes.size() || index.mask_rle_pairs.data() != index.backing->runs.data() ||
+     index.mask_rle_pairs.size() != index.backing->runs.size())
   throw std::runtime_error("normalized annotation view does not belong to its backing");
  std::call_once(index.backing->full_admission, [&] {
   bool combined = false;
-  std::call_once(index.backing->image_admission, [&] { validate_normalized_records(index, cancellation); combined = true; });
+  std::call_once(index.backing->image_admission, [&] {
+   validate_normalized_records(index, cancellation);
+   combined = true;
+  });
   if (!combined) validate_normalized_records(index, cancellation, false, true);
  });
 }
@@ -1082,7 +1183,10 @@ void retain_normalized_image_slices(NormalizedAnnotationBuilder& index, std::spa
   next.images.reserve(order.size());
   next.boxes.reserve(box_count);
   next.mask_rle_pairs.reserve(run_count);
-  for (const auto position : order) { auto run = next.mask_rle_pairs.size(); transfer_image_slice(next, index, position, next.images.size(), next.boxes.size(), run, cancellation); }
+  for (const auto position : order) {
+   auto run = next.mask_rle_pairs.size();
+   transfer_image_slice(next, index, position, next.images.size(), next.boxes.size(), run, cancellation);
+  }
   throw_if_benchmark_cancelled(cancellation);
   index = std::move(next);
  }
@@ -1110,8 +1214,7 @@ NormalizedAnnotationIndex parse_coco_style_annotations(
   if (images.empty() || std::ranges::adjacent_find(images, {}, &ParsedImage::id) != images.end() || (options.expected_image_count != 0U && images.size() != options.expected_image_count))
    throw AnnotationDocumentRejected("benchmark source image metadata count or IDs are invalid");
   image_lookup.reserve(images.size());
-  for (std::size_t index = 0; index < images.size(); ++index)
-   image_lookup.emplace(images[index].id, checked_cast<std::uint32_t>(index, "benchmark image index overflow"));
+  for (std::size_t index = 0; index < images.size(); ++index) image_lookup.emplace(images[index].id, checked_cast<std::uint32_t>(index, "benchmark image index overflow"));
  };
  std::vector<AnnotationChunk> chunks(static_cast<std::size_t>(workers));
  std::vector<AnnotationRejectCounts> worker_rejected(static_cast<std::size_t>(workers));
@@ -1121,41 +1224,43 @@ NormalizedAnnotationIndex parse_coco_style_annotations(
  std::vector<simdjson::ondemand::parser> segmentation_parsers(static_cast<std::size_t>(workers));
  std::vector<SegmentationScratch> segmentation_scratch(static_cast<std::size_t>(workers));
  std::optional<BenchmarkCompilePipeline::Workspace> parser_workspace;
- if (options.execution) parser_workspace.emplace(*options.execution, [&](std::size_t lane) noexcept {
-  segmentation_scratch[lane] = {};
-  segmentation_parsers[lane] = {};
-  parsers[lane] = {};
- });
+ if (options.execution)
+  parser_workspace.emplace(*options.execution, [&](std::size_t lane) noexcept {
+   segmentation_scratch[lane] = {};
+   segmentation_parsers[lane] = simdjson::ondemand::parser{};
+   parsers[lane] = simdjson::ondemand::parser{};
+  });
  auto* workspace = parser_workspace ? &*parser_workspace : nullptr;
  const auto parse_annotations = [&](std::span<const ByteRange> rows) {
- parallel_object_array(file, rows, workers, parsers, workspace, options.cancel_requested, [&](const int worker, simdjson::ondemand::object object, std::uint64_t ordinal) {
-  auto& scratch = segmentation_scratch[static_cast<std::size_t>(worker)];
-  scratch.reset();
-  auto& rejected = worker_rejected[static_cast<std::size_t>(worker)];
-  ++rejected.raw_records;
-  auto& chunk = chunks[static_cast<std::size_t>(worker)];
-  const auto first_run = chunk.runs.size();
-  scratch.output = &chunk.runs;
-  std::optional<BoxCandidate> candidate;
-  try {
-   const auto annotation = parse_annotation_object(object);
-   candidate = normalize_coco_box(annotation, images, image_lookup, category_lookup, &rejected, file, segmentation_parsers[static_cast<std::size_t>(worker)], scratch);
-  } catch (const simdjson::simdjson_error&) {
-   chunk.runs.resize(first_run);
-   ++rejected.malformed_records;
-   return;
-  } catch (const std::runtime_error&) {
-   chunk.runs.resize(first_run);
-   ++rejected.malformed_records;
-   return;
-  }
-  if (candidate) chunk.append(std::move(*candidate), ordinal);
-  else chunk.runs.resize(first_run);
- }, options.execution, [&](int worker) {
-  trace_benchmark_event(options.trace, "benchmark.annotations.workspace", [&] {
-   return nlohmann::json{{"retained_sparse_bytes", segmentation_scratch[static_cast<std::size_t>(worker)].retained_bytes()}};
+  parallel_object_array(file, rows, workers, parsers, workspace, options.cancel_requested, [&](const int worker, simdjson::ondemand::object object, std::uint64_t ordinal) {
+   auto& scratch = segmentation_scratch[static_cast<std::size_t>(worker)];
+   scratch.reset();
+   auto& rejected = worker_rejected[static_cast<std::size_t>(worker)];
+   ++rejected.raw_records;
+   auto& chunk = chunks[static_cast<std::size_t>(worker)];
+   const auto first_run = chunk.runs.size();
+   scratch.output = &chunk.runs;
+   std::optional<BoxCandidate> candidate;
+   try {
+    const auto annotation = parse_annotation_object(object);
+    candidate = normalize_coco_box(annotation, images, image_lookup, category_lookup, &rejected, file, segmentation_parsers[static_cast<std::size_t>(worker)], scratch);
+   } catch (const simdjson::simdjson_error&) {
+    chunk.runs.resize(first_run);
+    ++rejected.malformed_records;
+    return;
+   } catch (const std::runtime_error&) {
+    chunk.runs.resize(first_run);
+    ++rejected.malformed_records;
+    return;
+   }
+   if (candidate)
+    chunk.append(std::move(*candidate), ordinal);
+   else
+    chunk.runs.resize(first_run);
+  }, options.execution, [&](int worker) {
+   trace_benchmark_event(
+    options.trace, "benchmark.annotations.workspace", [&] { return nlohmann::json{{"retained_sparse_bytes", segmentation_scratch[static_cast<std::size_t>(worker)].retained_bytes()}}; });
   });
- });
  };
  bool images_complete = false, categories_complete = false;
  std::vector<ByteRange> pending_annotations;
@@ -1164,21 +1269,26 @@ NormalizedAnnotationIndex parse_coco_style_annotations(
    parallel_object_array(file, rows, workers, parsers, workspace, options.cancel_requested,
     [&](int worker, simdjson::ondemand::object object, std::uint64_t) { worker_images[static_cast<std::size_t>(worker)].push_back(parse_image_object(object, options.source)); }, options.execution);
    if (complete) {
-    if (options.execution) options.execution->run(BenchmarkStage::Metadata, {65536, 0}, join_images); else join_images(0);
+    if (options.execution)
+     options.execution->run(BenchmarkStage::Metadata, {65536, 0}, join_images);
+    else
+     join_images(0);
     images_complete = true;
    }
   } else if (field == 2) {
    validate_numeric_categories(file, rows, parsers, workspace, category_admission, complete, options.cancel_requested, options.execution);
    categories_complete = complete;
-  } else if (images_complete && categories_complete) parse_annotations(rows);
-  else pending_annotations.insert(pending_annotations.end(), rows.begin(), rows.end());
+  } else if (images_complete && categories_complete)
+   parse_annotations(rows);
+  else
+   pending_annotations.insert(pending_annotations.end(), rows.begin(), rows.end());
   if (images_complete && categories_complete && !pending_annotations.empty()) {
    parse_annotations(pending_annotations);
    std::vector<ByteRange>().swap(pending_annotations);
   }
  }, options.cancel_requested, options.execution);
  auto metadata = begin_normalized_index_result(options.source, options.split, std::move(annotation_sha256), worker_rejected);
- auto result = assemble_annotation_chunks(std::move(metadata), images, chunks, options.keep_images_without_mapped_boxes, options.cancel_requested, options.execution);
+ auto result = assemble_annotation_chunks(std::move(metadata), images, chunks, options.keep_images_without_mapped_boxes, options.cancel_requested, options.execution, options.trace);
  trace_benchmark_event(options.trace, "benchmark.annotations.indexed", [&] {
   nlohmann::json event = normalized_index_trace_json(result);
   event["mask_rle_pairs"] = result.mask_rle_pairs.size();
@@ -1228,40 +1338,50 @@ NormalizedAnnotationIndex parse_open_images_annotations(const std::filesystem::p
  for (const auto& runs : worker_runs) run_count = mmltk::common::math::checked_add(run_count, std::uint64_t{runs.size()}, "Open Images boundary workspace overflow");
  NormalizedAnnotationIndex result;
  const auto assemble = [&](std::size_t) {
- std::vector<ImageRun> merged;
- merged.reserve(checked_cast<std::size_t>(run_count, "Open Images boundary run count overflow"));
- for (auto& runs : worker_runs) {
-  for (const ImageRun run : runs) {
-   if (!merged.empty() && merged.back().image_id == run.image_id) {
-    if (run.count > std::numeric_limits<std::uint32_t>::max() - merged.back().count) { throw std::overflow_error("Open Images merged per-image annotation count overflow"); }
-    merged.back().count += run.count;
-   } else {
-    if (!merged.empty() && run.image_id < merged.back().image_id) { throw std::runtime_error("Open Images partition merge is not ordered"); }
-    merged.push_back(run);
+  std::vector<ImageRun> merged;
+  merged.reserve(checked_cast<std::size_t>(run_count, "Open Images boundary run count overflow"));
+  for (auto& runs : worker_runs) {
+   for (const ImageRun run : runs) {
+    if (!merged.empty() && merged.back().image_id == run.image_id) {
+     if (run.count > std::numeric_limits<std::uint32_t>::max() - merged.back().count) { throw std::overflow_error("Open Images merged per-image annotation count overflow"); }
+     merged.back().count += run.count;
+    } else {
+     if (!merged.empty() && run.image_id < merged.back().image_id) { throw std::runtime_error("Open Images partition merge is not ordered"); }
+     merged.push_back(run);
+    }
    }
   }
- }
- if (merged.empty()) { throw std::runtime_error("Open Images has no mapped bounding-box images"); }
- std::vector<std::uint64_t> offsets(merged.size() + 1U, 0U);
- for (std::size_t index = 0; index < merged.size(); ++index)
-  offsets[index + 1] = mmltk::common::math::checked_add(offsets[index], std::uint64_t{merged[index].count}, "Open Images annotation offset overflow");
- auto metadata = begin_normalized_index_result(BenchmarkDatasetSource::kOpenImagesV7, options.split, std::move(annotation_sha256), worker_rejected);
- NormalizedAnnotationAssembler assembly(std::move(metadata), merged.size(), checked_cast<std::size_t>(offsets.back(), "Open Images box count overflow"), 0, options.cancel_requested);
- std::optional<std::uint64_t> previous;
- for (auto& chunk : candidates) for (auto& candidate : chunk) {
-  throw_if_benchmark_cancelled(options.cancel_requested);
-  if (!previous || *previous != candidate.image_id) { assembly.begin_image({candidate.image_id, 0, 0, 0, 0, 0, 0}); previous = candidate.image_id; }
-  assembly.append_box(candidate.box, {});
- }
- result = assembly.finish();
+  if (merged.empty()) { throw std::runtime_error("Open Images has no mapped bounding-box images"); }
+  std::vector<std::uint64_t> offsets(merged.size() + 1U, 0U);
+  for (std::size_t index = 0; index < merged.size(); ++index)
+   offsets[index + 1] = mmltk::common::math::checked_add(offsets[index], std::uint64_t{merged[index].count}, "Open Images annotation offset overflow");
+  auto metadata = begin_normalized_index_result(BenchmarkDatasetSource::kOpenImagesV7, options.split, std::move(annotation_sha256), worker_rejected);
+  NormalizedAnnotationAssembler assembly(std::move(metadata), merged.size(), checked_cast<std::size_t>(offsets.back(), "Open Images box count overflow"), 0, options.cancel_requested);
+  std::optional<std::uint64_t> previous;
+  for (auto& chunk : candidates)
+   for (auto& candidate : chunk) {
+    throw_if_benchmark_cancelled(options.cancel_requested);
+    if (!previous || *previous != candidate.image_id) {
+     assembly.begin_image({candidate.image_id, 0, 0, 0, 0, 0, 0});
+     previous = candidate.image_id;
+    }
+    assembly.append_box(candidate.box, {});
+   }
+  result = assembly.finish(options.trace);
  };
- const auto workspace = mmltk::common::math::checked_add(mmltk::common::math::checked_multiply(run_count, std::uint64_t{sizeof(ImageRun) + sizeof(std::uint64_t)}, "Open Images boundary workspace overflow"), std::uint64_t{65536}, "Open Images boundary workspace overflow");
- if (options.execution) options.execution->run(BenchmarkStage::Metadata, {workspace, 0}, assemble); else assemble(0);
+ const auto workspace =
+  mmltk::common::math::checked_add(mmltk::common::math::checked_multiply(run_count, std::uint64_t{sizeof(ImageRun) + sizeof(std::uint64_t)}, "Open Images boundary workspace overflow"),
+   std::uint64_t{65536}, "Open Images boundary workspace overflow");
+ if (options.execution)
+  options.execution->run(BenchmarkStage::Metadata, {workspace, 0}, assemble);
+ else
+  assemble(0);
  trace_benchmark_event(options.trace, "benchmark.annotations.indexed", [&] { return normalized_index_trace_json(result); });
  return result;
 }
 std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const std::filesystem::path& path, const BenchmarkDatasetSource expected_source, const std::string_view expected_split,
- const std::string_view expected_annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, const nlohmann::json* supplied_completion, bool metadata_only, std::uint64_t completion_bytes) {
+ const std::string_view expected_annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, const nlohmann::json* supplied_completion,
+ bool metadata_only, std::uint64_t completion_bytes) {
  try {
   throw_if_benchmark_cancelled(cancel_requested);
   if (!std::filesystem::is_regular_file(path) || !std::filesystem::is_regular_file(normalized_manifest_path(path))) { return std::nullopt; }
@@ -1303,18 +1423,28 @@ std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const 
   index.boxes = {reinterpret_cast<const NormalizedBox*>(data + header.box_offset), checked_cast<std::size_t>(header.box_count, "normalized box count overflow")};
   index.mask_rle_pairs = {reinterpret_cast<const RLEPair*>(data + header.mask_rle_offset), checked_cast<std::size_t>(header.mask_rle_pair_count, "normalized run count overflow")};
   index.backing = std::make_shared<NormalizedAnnotationBacking>();
-  index.backing->source = index.source; index.backing->storage = mapping; index.backing->images = index.images; index.backing->boxes = index.boxes; index.backing->runs = index.mask_rle_pairs;
+  index.backing->source = index.source;
+  index.backing->storage = mapping;
+  index.backing->images = index.images;
+  index.backing->boxes = index.boxes;
+  index.backing->runs = index.mask_rle_pairs;
   auto completion = std::make_shared<NormalizedAnnotationCompletion>();
   mmltk::frameworks::reflection::visit_materialized_members<NormalizedAnnotationCompletionFacts>([&]<class Declaration>(const auto& field) {
    // Required identity fields were admitted above. Informational fields have
    // historically not controlled admission; retain them when representable.
-   if (manifest.contains(field.member_name)) try { manifest.at(field.member_name).get_to(completion.get()->*Declaration::pointer); } catch (const nlohmann::json::exception&) {}
+   if (manifest.contains(field.member_name)) try {
+     manifest.at(field.member_name).get_to(completion.get()->*Declaration::pointer);
+    } catch (const nlohmann::json::exception&) {}
   });
-  completion->images = header.image_count; completion->boxes = header.box_count; completion->mask_rle_pairs = header.mask_rle_pair_count;
+  completion->images = header.image_count;
+  completion->boxes = header.box_count;
+  completion->mask_rle_pairs = header.mask_rle_pair_count;
   completion->proof_bytes = completion_bytes;
   index.completion = std::move(completion);
-  if (metadata_only) std::call_once(index.backing->image_admission, [&] { validate_normalized_records(index, cancel_requested, true); });
-  else admit_normalized_annotations(index, cancel_requested);
+  if (metadata_only)
+   std::call_once(index.backing->image_admission, [&] { validate_normalized_records(index, cancel_requested, true); });
+  else
+   admit_normalized_annotations(index, cancel_requested);
   trace_benchmark_event(trace, "benchmark.annotations.cache_hit", [&] {
    return nlohmann::json{
     {"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"mask_rle_pairs", index.mask_rle_pairs.size()}
@@ -1333,8 +1463,8 @@ void remove_normalized_annotation_index(const std::filesystem::path& path) {
  remove_cache_path(normalized_manifest_path(path));
  remove_cache_path(path);
 }
-std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotation_index(
- const std::filesystem::path& path, const NormalizedAnnotationIndex& index, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, StorageReservationPool* storage, const nlohmann::json& extension) {
+std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotation_index(const std::filesystem::path& path, const NormalizedAnnotationIndex& index,
+ mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, StorageReservationPool* storage, const nlohmann::json& extension) {
  admit_normalized_annotations(index, cancel_requested);
  if (index.split.empty() || index.annotation_sha256.empty() || index.split.size() >= NormalizedIndexHeader{}.split.size() ||
      kBenchmarkMappingRevision.size() >= NormalizedIndexHeader{}.mapping_revision.size()) {
@@ -1382,21 +1512,31 @@ std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotatio
  throw_if_benchmark_cancelled(cancel_requested);
  staging.publish(path, cancel_requested);
  auto facts = std::make_shared<NormalizedAnnotationCompletion>();
- facts->schema_version = kBenchmarkCacheSchemaVersion; facts->index_version = kNormalizedAnnotationIndexVersion; facts->complete = true;
- facts->source = benchmark_source_name(index.source); facts->split = index.split; facts->mapping_revision = kBenchmarkMappingRevision;
- facts->annotation_sha256 = index.annotation_sha256; facts->size = total_size; facts->identity = identity; facts->integrity_mode = "atomic_layout_identity";
- facts->images = index.images.size(); facts->mask_rle_pairs = index.mask_rle_pairs.size(); facts->boxes = index.boxes.size();
+ facts->schema_version = kBenchmarkCacheSchemaVersion;
+ facts->index_version = kNormalizedAnnotationIndexVersion;
+ facts->complete = true;
+ facts->source = benchmark_source_name(index.source);
+ facts->split = index.split;
+ facts->mapping_revision = kBenchmarkMappingRevision;
+ facts->annotation_sha256 = index.annotation_sha256;
+ facts->size = total_size;
+ facts->identity = identity;
+ facts->integrity_mode = "atomic_layout_identity";
+ facts->images = index.images.size();
+ facts->mask_rle_pairs = index.mask_rle_pairs.size();
+ facts->boxes = index.boxes.size();
  auto manifest = extension.is_object() ? extension : nlohmann::json::object();
- mmltk::frameworks::reflection::visit_materialized_members<NormalizedAnnotationCompletionFacts>([&]<class Declaration>(const auto& field) { manifest[field.member_name] = facts.get()->*Declaration::pointer; });
+ mmltk::frameworks::reflection::visit_materialized_members<NormalizedAnnotationCompletionFacts>(
+  [&]<class Declaration>(const auto& field) { manifest[field.member_name] = facts.get()->*Declaration::pointer; });
  facts->proof_bytes = write_json_atomically(completion, manifest, cancel_requested, &destination);
  trace_benchmark_event(trace, "benchmark.annotations.cache_store",
   [&] { return nlohmann::json{{"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"bytes", total_size}}; });
  return facts;
 }
 NormalizedAnnotationReadView::NormalizedAnnotationReadView(NormalizedAnnotationIndex storage)
- : NormalizedAnnotationMetadata(storage), storage_(std::move(storage)), counts_{storage_.boxes.size(), storage_.mask_rle_pairs.size()} {}
-NormalizedAnnotationReadView NormalizedAnnotationReadView::select_images(std::vector<std::size_t> positions, std::optional<Counts> known,
- mmltk::common::concurrency::CancellationObservation cancellation) const {
+    : NormalizedAnnotationMetadata(storage), storage_(std::move(storage)), counts_{storage_.boxes.size(), storage_.mask_rle_pairs.size()} {}
+NormalizedAnnotationReadView NormalizedAnnotationReadView::select_images(
+ std::vector<std::size_t> positions, std::optional<Counts> known, mmltk::common::concurrency::CancellationObservation cancellation) const {
  NormalizedAnnotationReadView result = *this;
  Counts counts;
  bool identity = positions.size() == image_count();
@@ -1416,7 +1556,8 @@ NormalizedAnnotationReadView NormalizedAnnotationReadView::select_images(std::ve
     const auto boxes = storage_.boxes.subspan(static_cast<std::size_t>(selected_image.first_box), selected_image.box_count);
     const auto end = mmltk::common::math::checked_add(boxes.back().mask_rle_offset, std::uint64_t{boxes.back().mask_rle_pairs}, "normalized selected mask extent overflow");
     if (end < boxes.front().mask_rle_offset || end > storage_.mask_rle_pairs.size()) throw std::runtime_error("invalid normalized selected mask extent");
-    counts.runs = mmltk::common::math::checked_add(counts.runs, checked_cast<std::size_t>(end - boxes.front().mask_rle_offset, "normalized selected mask count overflow"), "normalized selected mask count overflow");
+    counts.runs = mmltk::common::math::checked_add(
+     counts.runs, checked_cast<std::size_t>(end - boxes.front().mask_rle_offset, "normalized selected mask count overflow"), "normalized selected mask count overflow");
    }
   }
   if (positions_) positions[i] = (*positions_)[position];
@@ -1430,9 +1571,7 @@ NormalizedAnnotationReadView NormalizedAnnotationReadView::select_images(std::ve
 [[nodiscard]] std::vector<std::uint64_t> image_ids(const NormalizedAnnotationReadView& index) {
  std::vector<std::uint64_t> ids;
  ids.reserve(index.image_count());
- for (const NormalizedImage& image : index.images()) {
-  ids.push_back(image.source_image_id);
- }
+ for (const NormalizedImage& image : index.images()) { ids.push_back(image.source_image_id); }
  return ids;
 }
 }  // namespace mmltk::backend::data::benchmark_internal

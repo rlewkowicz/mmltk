@@ -1165,11 +1165,13 @@ TEST_CASE("artifact benchmark requests admit canonical selections and Directory 
 namespace mmltk::controller::subsystems::system {
 TEST_CASE("benchmark transfer projection preserves typed facts at the exact image plateau", "[gui][services][progress]") {
  using Source = data::BenchmarkDatasetSource;
- data::BenchmarkCompileProgress native{.phase = data::DatasetCompilePhase::Extracting, .projected_output_bytes = 1039610446176ULL};
+ data::BenchmarkCompileProgress native;
+ native.phase = data::DatasetCompilePhase::Extracting;
+ native.projected_output_bytes = 1039610446176ULL;
  native.sources = {
   {.source = Source::kCoco2017, .activity = "Old COCO activity", .completed_images = 123U, .total_images = 123U},
-  {.source = Source::kObjects365V2, .completed_images = 170161U, .total_images = 408551U},
-  {.source = Source::kOpenImagesV7, .completed_images = 56008U, .total_images = 56008U}
+  {.source = Source::kObjects365V2, .activity = {}, .completed_images = 170161U, .total_images = 408551U},
+  {.source = Source::kOpenImagesV7, .activity = {}, .completed_images = 56008U, .total_images = 56008U}
  };
  native.current_source = Source::kObjects365V2;
  native.tracks.acquisition.active = true;
@@ -1196,9 +1198,7 @@ TEST_CASE("benchmark transfer projection preserves typed facts at the exact imag
  for (const bool resumed : {false, true}) {
   for (const auto attempt : {1U, 2U}) {
    const auto operation = std::string(resumed ? "Resuming " : "Downloading ") + "objects365-patch-17";
-   data::BenchmarkTransferProgress transfer{
-    .completed_bytes = 100U, .total_bytes = 1000U, .retained_bytes = resumed ? 64U : 0U, .attempt = attempt, .resumed = resumed
-   };
+   data::BenchmarkTransferProgress transfer{.completed_bytes = 100U, .total_bytes = 1000U, .retained_bytes = resumed ? 64U : 0U, .attempt = attempt, .resumed = resumed};
    const auto first = project(transfer, operation);
    const auto detail = data::format_benchmark_source_status(first.sources[1], "Acquiring");
    CHECK(detail.find("100 / 1000 bytes") != std::string::npos);
@@ -1288,7 +1288,7 @@ TEST_CASE("real ranged HTTP restart reaches the bounded artifact activity as a r
  for (const auto& value : displayed) {
   CHECK(value.valid());
   const auto& source = value.sources[1];
-  if (!source.transfer) continue; // Initial source-image observations.
+  if (!source.transfer) continue;  // Initial source-image observations.
   const auto found = std::find_if(observed.begin() + next_observation, observed.end(), [&](const auto& update) { return update.transfer == *source.transfer; });
   REQUIRE(found != observed.end());
   next_observation = static_cast<std::size_t>(found - observed.begin()) + 1;
@@ -1396,11 +1396,7 @@ TEST_CASE("real unknown metadata bytes remain open ended through artifact projec
    (void)download_artifacts({known}, 1U, {}, [&](const auto& update) { totals.update(update, reporter); });
    REQUIRE(server.requests() == 0U);
   }
-  auto transfer = std::async(std::launch::async, [&] {
-   return download_artifacts({unknown}, 1U, {}, [&](const auto& update) {
-    totals.update(update, reporter);
-   });
-  });
+  auto transfer = std::async(std::launch::async, [&] { return download_artifacts({unknown}, 1U, {}, [&](const auto& update) { totals.update(update, reporter); }); });
   const mmltk::testsupport::ScopedTestCleanup settle([&] { server.ReleasePartial(); });
   REQUIRE(server.WaitPartial());
   mmltk::testsupport::await_test_future(observed, "positive unknown-length metadata progress");

@@ -30,9 +30,8 @@ CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, 
  store.labels_ = {labels, sections.label_count};
  store.rle_pairs_ = {rle_pairs, sections.rle_region_bytes / sizeof(mmltk::backend::data::RLEPair)};
  store.label_index_.reserve(store.image_entries_.size());
- store.masks_available_ = admit_compiled_records(store.image_entries_, store.labels_, store.rle_pairs_, store.header_, [&](const ImageEntry& entry) {
-  store.label_index_.push_back({static_cast<std::uint32_t>(entry.label_offset / sizeof(PackedInstance)), entry.num_instances, 0});
- });
+ store.masks_available_ = admit_compiled_records(store.image_entries_, store.labels_, store.rle_pairs_, store.header_,
+  [&](const ImageEntry& entry) { store.label_index_.push_back({static_cast<std::uint32_t>(entry.label_offset / sizeof(PackedInstance)), entry.num_instances, 0}); });
  store.catalog_ = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(store.header_));
  store.mapping_.advise_aligned_range(sections.index_offset, sections.expected_index_bytes, MADV_SEQUENTIAL);
  store.mapping_.advise_aligned_range(sections.pixel_offset, sections.pixel_blob_size, MADV_HUGEPAGE);

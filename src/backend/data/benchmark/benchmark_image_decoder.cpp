@@ -107,7 +107,8 @@ BenchmarkImageHeader BenchmarkImageDecoder::read_header(const std::span<const st
   actual_width, actual_height, colorspace, encoding == BenchmarkImageEncoding::Jpeg && (colorspace == TJCS_YCCK || (colorspace == TJCS_CMYK && has_adobe_app14(encoded))), encoding
  };
 }
-std::span<const std::uint8_t> BenchmarkImageDecoder::decode_rgb(const std::span<const std::uint8_t> encoded, const BenchmarkImageHeader& header, std::vector<std::uint8_t>* rgb, std::vector<std::uint8_t>* cmyk_scratch) {
+std::span<const std::uint8_t> BenchmarkImageDecoder::decode_rgb(
+ const std::span<const std::uint8_t> encoded, const BenchmarkImageHeader& header, std::vector<std::uint8_t>* rgb, std::vector<std::uint8_t>* cmyk_scratch) {
  stbi_image_free(std::exchange(png_pixels_, nullptr));
  if (rgb == nullptr || cmyk_scratch == nullptr) { throw BenchmarkImageError("benchmark image decode buffers are missing"); }
  if (header.encoding == BenchmarkImageEncoding::Png) {

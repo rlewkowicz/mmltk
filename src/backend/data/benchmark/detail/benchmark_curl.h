@@ -147,12 +147,17 @@ inline void configure_curl_transfer(CURL* handle, const CurlTransferSetup& setup
 // retains its independent logical and guaranteed native candidate ceilings.
 class BenchmarkCurl final {
  struct Impl;
+
 public:
  enum class Class { Artifact, OpenImages };
- struct Completed { CURL* handle; CURLcode result; };
+ struct Completed {
+  CURL* handle;
+  CURLcode result;
+ };
  class Channel final {
   friend class BenchmarkCurl;
   struct State;
+
  public:
   ~Channel();
   Channel(const Channel&) = delete;
@@ -163,6 +168,7 @@ public:
   void wake() noexcept;
   void remove(CURL*);
   void remove_all();
+
  private:
   Channel(std::shared_ptr<Impl>, Class, mmltk::common::concurrency::CancellationObservation, BenchmarkResources);
   std::shared_ptr<Impl> owner_;
@@ -176,6 +182,7 @@ public:
  [[nodiscard]] std::unique_ptr<Channel> channel(Class, mmltk::common::concurrency::CancellationObservation = {}, BenchmarkResources source = {});
  [[nodiscard]] std::function<void()> admission_wakeup() const;
  [[nodiscard]] std::size_t limit(Class) const noexcept;
+
 private:
  std::shared_ptr<Impl> impl_;
 };
@@ -189,16 +196,23 @@ public:
   CURL* handle = nullptr;
   CURLcode result = CURLE_OK;
  };
- CurlMultiTransfers(BenchmarkCurl& owner, BenchmarkCurl::Class kind, mmltk::common::concurrency::CancellationObservation cancellation = {}, BenchmarkResources source = {}) : channel_(owner.channel(kind, cancellation, source)) {}
- ~CurlMultiTransfers() { abandon_all([](Transfer&) noexcept {}); }
+ CurlMultiTransfers(BenchmarkCurl& owner, BenchmarkCurl::Class kind, mmltk::common::concurrency::CancellationObservation cancellation = {}, BenchmarkResources source = {})
+     : channel_(owner.channel(kind, cancellation, source)) {}
+ ~CurlMultiTransfers() {
+  abandon_all([](Transfer&) noexcept {});
+ }
  [[nodiscard]] bool empty() const noexcept { return active_.empty(); }
  [[nodiscard]] std::size_t size() const noexcept { return active_.size(); }
  void add(std::unique_ptr<Transfer> transfer, bool extra_range = false, BenchmarkAllowance input = {}) {
   auto* handle = transfer->easy.get();
   const auto [position, inserted] = active_.emplace(handle, std::move(transfer));
   if (!inserted) throw std::logic_error("benchmark easy handle already registered");
-  try { channel_->add(handle, extra_range, std::move(input)); }
-  catch (...) { active_.erase(position); throw; }
+  try {
+   channel_->add(handle, extra_range, std::move(input));
+  } catch (...) {
+   active_.erase(position);
+   throw;
+  }
  }
  [[nodiscard]] std::optional<Completion> next_completed() {
   const auto result = channel_->next();
@@ -212,12 +226,17 @@ public:
  void poll(int milliseconds) { channel_->wait_until(std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds)); }
  void wait_until(std::chrono::steady_clock::time_point deadline) { channel_->wait_until(deadline); }
  void wake() noexcept { channel_->wake(); }
- template <typename Release> void abandon_all(Release&& release) {
+ template <typename Release>
+ void abandon_all(Release&& release) {
   // First detach every callback; salvage cannot race a still-running write.
   channel_->remove_all();
-  for (auto& [handle, transfer] : active_) { (void)handle; release(*transfer); }
+  for (auto& [handle, transfer] : active_) {
+   (void)handle;
+   release(*transfer);
+  }
   active_.clear();
  }
+
 private:
  std::unique_ptr<BenchmarkCurl::Channel> channel_;
  std::unordered_map<CURL*, std::unique_ptr<Transfer>> active_;

@@ -5,7 +5,6 @@
 #include <string>
 #include <variant>
 #include <vector>
-
 namespace mmltk::backend::data::benchmark_internal {
 // JSON has its own numeric/null contract, distinct from the Parquet columns.
 // Missing fields, invalid shapes, and reusable parsing storage belong to the
@@ -21,4 +20,4 @@ struct CoconutJsonRow {
  std::vector<CoconutJsonSegment> segments_info;
 };
 MMLTK_REFLECT_FIELDS(CoconutJsonRow)
-} // namespace mmltk::backend::data::benchmark_internal
+}  // namespace mmltk::backend::data::benchmark_internal

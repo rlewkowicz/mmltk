@@ -892,30 +892,41 @@ TEST_CASE("interval mask projection appends atomically and handles full slabs", 
  const auto identity = compute_image_resize_geometry(4, 2, 4, 2, ImageResizeMode::Stretch);
  const auto bounds = append_resized_row_major_mask(adjacent, {4, 2}, {4, 2}, identity, &scratch, output);
  REQUIRE(output.size() == 3);
- CHECK(output[0].start == 11); CHECK(output[0].length == 2);
- CHECK(output[1].start == 0); CHECK(output[1].length == 5);
- CHECK(output[2].start == 7); CHECK(output[2].length == 1);
- CHECK(bounds.min_x == 0); CHECK(bounds.max_x == 4);
- CHECK(bounds.min_y == 0); CHECK(bounds.max_y == 2);
+ CHECK(output[0].start == 11);
+ CHECK(output[0].length == 2);
+ CHECK(output[1].start == 0);
+ CHECK(output[1].length == 5);
+ CHECK(output[2].start == 7);
+ CHECK(output[2].length == 1);
+ CHECK(bounds.min_x == 0);
+ CHECK(bounds.max_x == 4);
+ CHECK(bounds.min_y == 0);
+ CHECK(bounds.max_y == 2);
  const auto unchanged = output;
  RowMajorMaskBounds sentinel{1, 2, 3, 4, true};
  const std::array<RLEPair, 2> invalid{{{0, 1}, {7, 2}}};
  const auto one = compute_image_resize_geometry(4, 2, 1, 1, ImageResizeMode::Stretch);
  CHECK_THROWS(append_resized_row_major_mask(invalid, {4, 2}, {1, 1}, one, &scratch, output, &sentinel));
  CHECK(std::ranges::equal(output, unchanged, [](auto a, auto b) { return a.start == b.start && a.length == b.length; }));
- CHECK(sentinel.min_x == 1); CHECK(sentinel.min_y == 2); CHECK(sentinel.has_foreground);
+ CHECK(sentinel.min_x == 1);
+ CHECK(sentinel.min_y == 2);
+ CHECK(sentinel.has_foreground);
  const auto empty = append_resized_row_major_mask({}, {}, {1, 1}, one, &scratch, output, &sentinel);
- CHECK_FALSE(empty.has_foreground); CHECK(output.size() == unchanged.size()); CHECK(sentinel.min_x == 1);
+ CHECK_FALSE(empty.has_foreground);
+ CHECK(output.size() == unchanged.size());
+ CHECK(sentinel.min_x == 1);
  // Source-work coverage: neither the full source nor target canvas is visited.
  const std::array<RLEPair, 1> full{{{0, 1000000000}}};
  const auto large = compute_image_resize_geometry(1000000, 1000, 2000000, 2000, ImageResizeMode::Stretch);
- output.clear(); scratch = {};
+ output.clear();
+ scratch = {};
  const auto complete = append_resized_row_major_mask(full, {1000000, 1000}, {2000000, 2000}, large, &scratch, output);
- REQUIRE(output.size() == 1); CHECK(output[0].length == 4000000000U);
- CHECK(complete.max_x == 2000000); CHECK(complete.max_y == 2000);
+ REQUIRE(output.size() == 1);
+ CHECK(output[0].length == 4000000000U);
+ CHECK(complete.max_x == 2000000);
+ CHECK(complete.max_y == 2000);
  CHECK(scratch.intervals.capacity() == 0);
 }
-
 TEST_CASE("independent mask slabs never merge across their append boundary", "[backend][data][compiler][mask]") {
  using namespace mmltk::backend::data::dataset;
  using namespace mmltk::backend::imaging::resample;
@@ -926,22 +937,28 @@ TEST_CASE("independent mask slabs never merge across their append boundary", "[b
  first.slab(0, 2, std::span(&full, 1));
  MaskRunEmitter second(output, output.size(), 4, &second_bounds);
  second.slab(2, 4, std::span(&full, 1));
- REQUIRE(output.size() == 2); CHECK(output[0].length == 8); CHECK(output[1].start == 8); CHECK(output[1].length == 8);
- CHECK(first_bounds.max_y == 2); CHECK(second_bounds.min_y == 2); CHECK(second_bounds.max_y == 4);
+ REQUIRE(output.size() == 2);
+ CHECK(output[0].length == 8);
+ CHECK(output[1].start == 8);
+ CHECK(output[1].length == 8);
+ CHECK(first_bounds.max_y == 2);
+ CHECK(second_bounds.min_y == 2);
+ CHECK(second_bounds.max_y == 4);
  MaskResizeScratch scratch;
  const auto identity = compute_image_resize_geometry(4, 4, 4, 4, ImageResizeMode::Stretch);
  const std::array<RLEPair, 1> a{{{0, 8}}}, b{{{8, 8}}};
  output.clear();
  (void)append_resized_row_major_mask(a, {4, 4}, {4, 4}, identity, &scratch, output);
  (void)append_resized_row_major_mask(b, {4, 4}, {4, 4}, identity, &scratch, output);
- REQUIRE(output.size() == 2); CHECK(output[0].length == 8); CHECK(output[1].start == 8);
+ REQUIRE(output.size() == 2);
+ CHECK(output[0].length == 8);
+ CHECK(output[1].start == 8);
  const auto before = output;
  MaskRunEmitter overflow(output, output.size(), 4, nullptr, "source start overflow", "source length overflow");
  CHECK_THROWS_WITH(overflow.run(std::uint64_t{UINT32_MAX} + 1, std::uint64_t{UINT32_MAX} + 2), "source start overflow");
  CHECK_THROWS_WITH(overflow.run(0, std::uint64_t{UINT32_MAX} + 1), "source length overflow");
  CHECK(std::ranges::equal(before, output, [](auto left, auto right) { return left.start == right.start && left.length == right.length; }));
 }
-
 TEST_CASE("benchmark progress drains outside producers and preserves withdrawal boundaries", "[backend][data][benchmark][progress]") {
  using namespace mmltk::backend::data::benchmark_internal;
  const BenchmarkTraceSink quiet;
@@ -960,13 +977,14 @@ TEST_CASE("benchmark progress drains outside producers and preserves withdrawal 
    reporter.pixel_completed();
    reporter.transfers().update(DownloadProgress{.artifact_id = "one", .transfer = {.completed_bytes = i, .total_bytes = 10000}}, reporter);
   }
-  reporter.invalidate_pixels(95); // Includes the 63 not yet in a pixel quantum.
+  reporter.invalidate_pixels(95);  // Includes the 63 not yet in a pixel quantum.
   reporter.transfers().update(DownloadProgress{.artifact_id = "one", .transfer = {.completed_bytes = 7, .total_bytes = 10000, .attempt = 2}}, reporter);
  });
  // The blocked callback cannot retain producer/reporter/source locks. Thousands
  // of intermediate updates fit the bounded coalescing queue while it is held.
  mmltk::testsupport::await_test_future(producing, "progress producers with a held callback", std::chrono::seconds{5});
- held.Release(); reporter.flush();
+ held.Release();
+ reporter.flush();
  REQUIRE(updates.size() < 128);
  CHECK(updates.front().phase == DatasetCompilePhase::Planning);
  CHECK(updates.back().tracks.pixels.completed == 4000);

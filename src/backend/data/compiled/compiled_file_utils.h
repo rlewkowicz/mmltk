@@ -114,10 +114,10 @@ public:
  }
  [[nodiscard]] static std::size_t label(const PackedInstance& instance, std::uint32_t classes, std::size_t rle_bytes, std::size_t expected, AnnotationSource source, std::size_t position = 0) {
   if (instance.class_id >= classes) throw std::runtime_error("compiled instance class id is out of bounds at label " + std::to_string(position));
-  if (!std::isfinite(instance.bbox_x1) || !std::isfinite(instance.bbox_y1) || !std::isfinite(instance.bbox_x2) || !std::isfinite(instance.bbox_y2) ||
-      instance.bbox_x2 <= instance.bbox_x1 || instance.bbox_y2 <= instance.bbox_y1 || !std::isfinite(instance.original_area) || instance.original_area < 0.0 ||
-      (instance.flags & ~kAnnotationFlags) || (!instance.has_mask() && instance.mask_rle_pairs) || (!instance.has_annotation_id() && instance.annotation_id) ||
-      (!instance.has_source_category() && instance.source_category_id)) throw std::runtime_error("compiled instance annotation metadata is invalid at label " + std::to_string(position));
+  if (!std::isfinite(instance.bbox_x1) || !std::isfinite(instance.bbox_y1) || !std::isfinite(instance.bbox_x2) || !std::isfinite(instance.bbox_y2) || instance.bbox_x2 <= instance.bbox_x1 ||
+      instance.bbox_y2 <= instance.bbox_y1 || !std::isfinite(instance.original_area) || instance.original_area < 0.0 || (instance.flags & ~kAnnotationFlags) ||
+      (!instance.has_mask() && instance.mask_rle_pairs) || (!instance.has_annotation_id() && instance.annotation_id) || (!instance.has_source_category() && instance.source_category_id))
+   throw std::runtime_error("compiled instance annotation metadata is invalid at label " + std::to_string(position));
   if (source != AnnotationSource::Generic) {
    if (!instance.has_source_category()) throw std::runtime_error("compiled benchmark annotation lacks source category");
    if (source == AnnotationSource::OpenImages && !valid_open_images_category(instance.source_category_id)) throw std::runtime_error("invalid compiled Open Images source category");
@@ -128,16 +128,17 @@ public:
   return expected + bytes;
  }
  [[nodiscard]] static std::size_t run(const RLEPair& pair, std::size_t previous_end, std::size_t pixels, std::size_t label = 0, std::size_t position = 0) {
-  if (!pair.length || pair.start < previous_end || pair.start > pixels || pair.length > pixels - pair.start) throw std::runtime_error("compiled RLE run is invalid at label " + std::to_string(label) + ", pair " + std::to_string(position));
+  if (!pair.length || pair.start < previous_end || pair.start > pixels || pair.length > pixels - pair.start)
+   throw std::runtime_error("compiled RLE run is invalid at label " + std::to_string(label) + ", pair " + std::to_string(position));
   return std::size_t{pair.start} + pair.length;
  }
 };
 // The consumer constructs its required metadata in this traversal. Each image,
 // label and run is admitted exactly once, including present-empty masks.
-template<std::ranges::random_access_range ImageRange, class ImageConsumer>
+template <std::ranges::random_access_range ImageRange, class ImageConsumer>
  requires std::ranges::sized_range<ImageRange>
-[[nodiscard]] inline bool admit_compiled_records(const ImageRange& index, std::span<const PackedInstance> labels, std::span<const RLEPair> runs,
- const FileHeader& header, ImageConsumer&& consume, mmltk::common::concurrency::CancellationObservation cancellation = {}) {
+[[nodiscard]] inline bool admit_compiled_records(const ImageRange& index, std::span<const PackedInstance> labels, std::span<const RLEPair> runs, const FileHeader& header, ImageConsumer&& consume,
+ mmltk::common::concurrency::CancellationObservation cancellation = {}) {
  if (index.size() != header.num_images) throw std::runtime_error("compiled index entry count does not match header");
  const auto pixels = mmltk::common::math::checked_multiply<std::size_t>(header.image_width, header.image_height, "compiled mask size overflow");
  std::size_t label_offset = 0, run_offset = 0;
@@ -148,7 +149,8 @@ template<std::ranges::random_access_range ImageRange, class ImageConsumer>
   CompiledRecordChecks::image(entry, i);
   if (entry.pixel_offset != header.pixel_offset + std::uint64_t{i} * header.image_stride) throw std::runtime_error("compiled pixel index is inconsistent at image " + std::to_string(i));
   if (entry._pad || entry.num_instances > header.max_instances_per_image || entry.label_offset != label_offset * sizeof(PackedInstance) ||
-      entry.label_bytes != std::uint32_t{entry.num_instances} * sizeof(PackedInstance)) throw std::runtime_error("compiled label index is inconsistent at image " + std::to_string(i));
+      entry.label_bytes != std::uint32_t{entry.num_instances} * sizeof(PackedInstance))
+   throw std::runtime_error("compiled label index is inconsistent at image " + std::to_string(i));
   if (label_offset > labels.size() || entry.num_instances > labels.size() - label_offset) throw std::runtime_error("compiled label span is out of bounds at image " + std::to_string(i));
   consume(entry);
   for (const auto& label : labels.subspan(label_offset, entry.num_instances)) {

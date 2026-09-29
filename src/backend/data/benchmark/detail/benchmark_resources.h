@@ -32,6 +32,7 @@ struct BenchmarkTransferEnvelope {
 // Shared custody charges backing once and returns it after its last reader.
 class BenchmarkAllowance {
  struct Credits;
+
 public:
  BenchmarkAllowance() = default;
  [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(credits_); }
@@ -62,6 +63,7 @@ public:
  // unused-workspace offer. Positive storage keeps its own workspace loans;
  // descriptor-only aliases retain none after the backing owner retires bytes.
  [[nodiscard]] BenchmarkAllowance split_storage(std::uint64_t);
+
 private:
  friend class BenchmarkCompilePipeline;
  explicit BenchmarkAllowance(std::shared_ptr<Credits> value) : credits_(std::move(value)) {}

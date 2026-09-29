@@ -17,8 +17,10 @@ namespace io = mmltk::common::io;
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
 std::array<std::uint64_t, 5> identity(const struct stat& value) {
  // Rename/unlink can change ctime; neither changes the immutable payload.
- return {static_cast<std::uint64_t>(value.st_dev), static_cast<std::uint64_t>(value.st_ino), static_cast<std::uint64_t>(value.st_size),
-  static_cast<std::uint64_t>(value.st_mtim.tv_sec), static_cast<std::uint64_t>(value.st_mtim.tv_nsec)};
+ return {
+  static_cast<std::uint64_t>(value.st_dev), static_cast<std::uint64_t>(value.st_ino), static_cast<std::uint64_t>(value.st_size), static_cast<std::uint64_t>(value.st_mtim.tv_sec),
+  static_cast<std::uint64_t>(value.st_mtim.tv_nsec)
+ };
 }
 std::shared_ptr<io::MappedByteRegion> map_image(int descriptor, std::size_t bytes) {
  auto mapping = std::make_shared<io::MappedByteRegion>();
@@ -27,7 +29,7 @@ std::shared_ptr<io::MappedByteRegion> map_image(int descriptor, std::size_t byte
  mapping->adopt(address, bytes);
  return mapping;
 }
-}
+}  // namespace
 std::filesystem::path cached_image_path(const std::filesystem::path& root, const std::uint64_t image_id) {
  std::array<char, 24> relative{};
  const std::size_t length = format_cached_image_relative_path(image_id, relative);
@@ -42,25 +44,30 @@ std::size_t format_cached_image_relative_path(const std::uint64_t image_id, cons
  return static_cast<std::size_t>(length);
 }
 BenchmarkImageReadError::BenchmarkImageReadError(std::uint16_t source, std::uint64_t id, std::string detail)
- : std::runtime_error("benchmark cached image " + std::to_string(id) + " cannot be read: " + std::move(detail)), source_index_(source), source_image_id_(id) {}
+    : std::runtime_error("benchmark cached image " + std::to_string(id) + " cannot be read: " + std::move(detail)), source_index_(source), source_image_id_(id) {}
 std::uint16_t BenchmarkImageReadError::source_index() const noexcept { return source_index_; }
 std::uint64_t BenchmarkImageReadError::source_image_id() const noexcept { return source_image_id_; }
-BenchmarkEncodedImage::BenchmarkEncodedImage(BenchmarkAllowance allowance, std::shared_ptr<const void> backing, std::span<const std::uint8_t> encoded,
- BenchmarkImageHeader header, Identity stamp, Storage storage, bool charged, Ptr file)
- : allowance_(std::move(allowance)), backing_(std::move(backing)), encoded_(encoded), header_(header), identity_(stamp), storage_(storage), charged_bytes_(charged), file_backing_(std::move(file)) {}
+BenchmarkEncodedImage::BenchmarkEncodedImage(
+ BenchmarkAllowance allowance, std::shared_ptr<const void> backing, std::span<const std::uint8_t> encoded, BenchmarkImageHeader header, Identity stamp, Storage storage, bool charged, Ptr file)
+    : allowance_(std::move(allowance)),
+      backing_(std::move(backing)),
+      encoded_(encoded),
+      header_(header),
+      identity_(stamp),
+      storage_(storage),
+      charged_bytes_(charged),
+      file_backing_(std::move(file)) {}
 BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::pooled(BenchmarkAllowance allowance, std::shared_ptr<const void> backing, std::span<const std::uint8_t> encoded, Ptr file) {
  if (!backing || !file || encoded.empty() || encoded.size() != file->size()) throw std::invalid_argument("invalid pooled benchmark image custody");
- const auto header = file->header_; const auto stamp = file->identity_;
+ const auto header = file->header_;
+ const auto stamp = file->identity_;
  return Ptr(new BenchmarkEncodedImage(std::move(allowance), std::move(backing), encoded, header, stamp, Storage::Pooled, true, std::move(file)));
 }
-BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::header_only() const {
- return Ptr(new BenchmarkEncodedImage({}, {}, {}, header_, identity_, Storage::HeaderOnly, false));
-}
+BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::header_only() const { return Ptr(new BenchmarkEncodedImage({}, {}, {}, header_, identity_, Storage::HeaderOnly, false)); }
 BenchmarkEncodedImage::Opened::Opened(io::FileHandle file, std::uint64_t id, Identity stamp, BenchmarkAllowance controls, Ptr admitted)
- : controls_(std::move(controls)), file_(std::move(file)), image_id_(id), identity_(stamp), admitted_(std::move(admitted)) {}
+    : controls_(std::move(controls)), file_(std::move(file)), image_id_(id), identity_(stamp), admitted_(std::move(admitted)) {}
 BenchmarkEncodedImage::Opened::~Opened() = default;
-std::unique_ptr<BenchmarkEncodedImage::Opened> BenchmarkEncodedImage::inspect(io::FileHandle file, std::uint64_t id,
- BenchmarkAllowance allowance, Ptr admitted, std::uint64_t maximum_bytes) {
+std::unique_ptr<BenchmarkEncodedImage::Opened> BenchmarkEncodedImage::inspect(io::FileHandle file, std::uint64_t id, BenchmarkAllowance allowance, Ptr admitted, std::uint64_t maximum_bytes) {
  struct stat status{};
  if (::fstat(file.get(), &status) != 0) throw io::errno_error("cannot inspect cached benchmark image");
  if (!S_ISREG(status.st_mode) || status.st_size <= 0) return {};
@@ -68,10 +75,11 @@ std::unique_ptr<BenchmarkEncodedImage::Opened> BenchmarkEncodedImage::inspect(io
  if (bytes > maximum_bytes) throw InvalidImageError("cached benchmark image has an invalid size");
  return std::unique_ptr<Opened>(new Opened(std::move(file), id, identity(status), std::move(allowance), std::move(admitted)));
 }
-std::unique_ptr<BenchmarkEncodedImage::Opened> BenchmarkEncodedImage::open_deferred(int directory, std::uint64_t id, Cancellation cancellation,
- BenchmarkAllowance controls, Ptr admitted, std::uint64_t maximum_bytes) {
+std::unique_ptr<BenchmarkEncodedImage::Opened> BenchmarkEncodedImage::open_deferred(
+ int directory, std::uint64_t id, Cancellation cancellation, BenchmarkAllowance controls, Ptr admitted, std::uint64_t maximum_bytes) {
  throw_if_benchmark_cancelled(cancellation);
- std::array<char, 24> relative{}; (void)format_cached_image_relative_path(id, relative);
+ std::array<char, 24> relative{};
+ (void)format_cached_image_relative_path(id, relative);
  const int descriptor = ::openat(directory, relative.data(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
  if (descriptor < 0) {
   if (errno == ENOENT || errno == ENOTDIR || errno == ELOOP) return {};
@@ -79,13 +87,13 @@ std::unique_ptr<BenchmarkEncodedImage::Opened> BenchmarkEncodedImage::open_defer
  }
  return inspect(io::FileHandle(descriptor), id, std::move(controls), std::move(admitted), maximum_bytes);
 }
-BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::open(int directory, std::uint64_t id, const CachedImageValidator& validator, Cancellation cancellation,
- BenchmarkCompilePipeline* execution, BenchmarkAllowance allowance, Ptr admitted, std::uint64_t maximum_bytes) {
+BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::open(int directory, std::uint64_t id, const CachedImageValidator& validator, Cancellation cancellation, BenchmarkCompilePipeline* execution,
+ BenchmarkAllowance allowance, Ptr admitted, std::uint64_t maximum_bytes) {
  auto opened = open_deferred(directory, id, cancellation, allowance, std::move(admitted), maximum_bytes);
  return opened ? read_opened(*opened, validator, cancellation, execution, std::move(allowance), false) : Ptr{};
 }
-BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::open(io::FileHandle file, std::uint64_t id, const CachedImageValidator& validator, Cancellation cancellation,
- BenchmarkCompilePipeline* execution, BenchmarkAllowance allowance, Ptr admitted, std::uint64_t maximum_bytes) {
+BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::open(io::FileHandle file, std::uint64_t id, const CachedImageValidator& validator, Cancellation cancellation, BenchmarkCompilePipeline* execution,
+ BenchmarkAllowance allowance, Ptr admitted, std::uint64_t maximum_bytes) {
  auto opened = inspect(std::move(file), id, allowance, std::move(admitted), maximum_bytes);
  return opened ? read_opened(*opened, validator, cancellation, execution, std::move(allowance), false) : Ptr{};
 }
@@ -118,19 +126,22 @@ BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::Opened::try_read(BenchmarkComp
   throw;
  }
 }
-BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::read_opened(const Opened& opened, const CachedImageValidator& validator, Cancellation cancellation,
- BenchmarkCompilePipeline* execution, BenchmarkAllowance allowance, bool charged) {
+BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::read_opened(
+ const Opened& opened, const CachedImageValidator& validator, Cancellation cancellation, BenchmarkCompilePipeline* execution, BenchmarkAllowance allowance, bool charged) {
  const auto bytes = static_cast<std::size_t>(opened.identity_[2]);
  auto mapping = map_image(opened.file_.get(), bytes);
  const std::span<const std::uint8_t> encoded{static_cast<const std::uint8_t*>(mapping->address()), bytes};
  BenchmarkImageHeader header;
- if (opened.admitted_ && opened.admitted_->identity_ == opened.identity_) header = opened.admitted_->header_;
+ if (opened.admitted_ && opened.admitted_->identity_ == opened.identity_)
+  header = opened.admitted_->header_;
  else {
   try {
    const auto read = [&](std::size_t) { header = validator ? validator(opened.image_id_, encoded) : BenchmarkImageDecoder{}.read_header(encoded); };
-   if (execution) execution->run(BenchmarkStage::Header, {}, read, allowance); else read(0);
-  } catch (const std::bad_alloc&) { throw; }
-  catch (const std::exception& error) {
+   if (execution)
+    execution->run(BenchmarkStage::Header, {}, read, allowance);
+   else
+    read(0);
+  } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
    throw_if_benchmark_cancelled(cancellation);
    if (is_benchmark_capacity_failure(error)) throw;
    throw InvalidImageError(error.what());
@@ -139,8 +150,8 @@ BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::read_opened(const Opened& open
  throw_if_benchmark_cancelled(cancellation);
  return Ptr(new BenchmarkEncodedImage(std::move(allowance), mapping, encoded, header, opened.identity_, Storage::Mapped, charged));
 }
-BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(const std::filesystem::path& path, std::span<const std::uint8_t> encoded, Cancellation cancellation,
- StorageReservationPool& destination, std::optional<BenchmarkImageHeader> header, BenchmarkAllowance allowance, bool retain_mapping, int directory, std::string_view relative) {
+BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(const std::filesystem::path& path, std::span<const std::uint8_t> encoded, Cancellation cancellation, StorageReservationPool& destination,
+ std::optional<BenchmarkImageHeader> header, BenchmarkAllowance allowance, bool retain_mapping, int directory, std::string_view relative) {
  if (encoded.empty()) throw std::runtime_error("cannot cache an empty benchmark image");
  const auto target = directory >= 0 ? std::filesystem::path(relative) : path;
  auto staging = BenchmarkStagedArtifact::create(destination, target, encoded.size(), "cached image staging", ".tmp.XXXXXX", 0600, directory);
@@ -156,15 +167,17 @@ BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(const std::filesystem:
  staging.publish(target, cancellation, BenchmarkStagedArtifact::Publication::Rename);
  return result;
 }
-BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(int directory, std::uint64_t id, std::span<const std::uint8_t> encoded, BenchmarkImageHeader header,
- Cancellation cancellation, StorageReservationPool& storage, BenchmarkCompilePipeline* execution, BenchmarkAllowance input, bool retain_mapping) {
+BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(int directory, std::uint64_t id, std::span<const std::uint8_t> encoded, BenchmarkImageHeader header, Cancellation cancellation,
+ StorageReservationPool& storage, BenchmarkCompilePipeline* execution, BenchmarkAllowance input, bool retain_mapping) {
  auto mapping = execution && retain_mapping ? execution->try_reserve(BenchmarkResources::handles(1), input) : std::optional<BenchmarkAllowance>{};
- std::array<char, 24> relative{}; const auto length = format_cached_image_relative_path(id, relative);
- return publish({}, encoded, cancellation, storage, header, mapping.value_or(std::move(input)), retain_mapping && (!execution || mapping.has_value()), directory, std::string_view(relative.data(), length));
+ std::array<char, 24> relative{};
+ const auto length = format_cached_image_relative_path(id, relative);
+ return publish(
+  {}, encoded, cancellation, storage, header, mapping.value_or(std::move(input)), retain_mapping && (!execution || mapping.has_value()), directory, std::string_view(relative.data(), length));
 }
-BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(const std::filesystem::path& path, std::span<const std::uint8_t> encoded, Cancellation cancellation,
- StorageReservationPool* storage, std::optional<BenchmarkImageHeader> header, BenchmarkAllowance allowance, bool retain_mapping, int directory, std::string_view relative) {
+BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(const std::filesystem::path& path, std::span<const std::uint8_t> encoded, Cancellation cancellation, StorageReservationPool* storage,
+ std::optional<BenchmarkImageHeader> header, BenchmarkAllowance allowance, bool retain_mapping, int directory, std::string_view relative) {
  StorageReservationPool destination(path, {}, storage);
  return BenchmarkEncodedImage::publish(path, encoded, cancellation, destination, header, std::move(allowance), retain_mapping, directory, relative);
 }
-} // namespace mmltk::backend::data::benchmark_internal
+}  // namespace mmltk::backend::data::benchmark_internal

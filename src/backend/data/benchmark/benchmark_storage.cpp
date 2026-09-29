@@ -48,16 +48,17 @@ std::uint64_t download_allocation(const std::filesystem::path& destination) {
 void require_capacity(std::uint64_t available, std::uint64_t reserved, std::uint64_t required, std::string_view description) {
  if (reserved > available || required > available - reserved)
   throw InsufficientBenchmarkStorage("insufficient storage for " + std::string(description) + ": requires " + std::to_string(required) + " bytes with " + std::to_string(reserved) +
-   " bytes outstanding, available " + std::to_string(available));
+                                     " bytes outstanding, available " + std::to_string(available));
 }
-}
+}  // namespace
 std::uint64_t additional_download_bytes(const std::filesystem::path& destination, std::uint64_t expected) {
  const auto allocated = download_allocation(destination);
  return expected > allocated ? expected - allocated : 0;
 }
 void require_storage(const std::filesystem::path& path, std::uint64_t required, const char* description, const BenchmarkTraceSink& trace) {
  const auto available = available_bytes(existing_parent(path));
- trace_benchmark_event(trace, "benchmark.storage.preflight", [&] { return nlohmann::json{{"target", description}, {"path", path.string()}, {"required_bytes", required}, {"available_bytes", available}}; });
+ trace_benchmark_event(
+  trace, "benchmark.storage.preflight", [&] { return nlohmann::json{{"target", description}, {"path", path.string()}, {"required_bytes", required}, {"available_bytes", available}}; });
  require_capacity(available, 0, required, description);
 }
 struct StorageReservationPool::Ledger {
@@ -68,12 +69,12 @@ struct StorageReservationPool::Destination {
  std::filesystem::path path, probe;
  BenchmarkTraceSink trace;
  std::shared_ptr<Ledger> ledger;
- std::uint64_t* total = nullptr; // unordered_map references survive rehash; ledger outlives this view.
+ std::uint64_t* total = nullptr;  // unordered_map references survive rehash; ledger outlives this view.
 };
 StorageReservationPool::Reservation::Reservation(std::shared_ptr<Destination> destination, std::uint64_t promised, std::uint64_t allocated)
- : destination_(std::move(destination)), promised_(promised), allocated_(allocated), fully_allocated_(allocated >= promised) {}
+    : destination_(std::move(destination)), promised_(promised), allocated_(allocated), fully_allocated_(allocated >= promised) {}
 StorageReservationPool::Reservation::Reservation(Reservation&& other) noexcept
- : destination_(std::move(other.destination_)), promised_(other.promised_), allocated_(other.allocated_), fully_allocated_(other.fully_allocated_.load(std::memory_order_relaxed)) {}
+    : destination_(std::move(other.destination_)), promised_(other.promised_), allocated_(other.allocated_), fully_allocated_(other.fully_allocated_.load(std::memory_order_relaxed)) {}
 StorageReservationPool::Reservation& StorageReservationPool::Reservation::operator=(Reservation&& other) noexcept {
  if (this != &other) {
   release();
@@ -88,7 +89,10 @@ StorageReservationPool::Reservation::~Reservation() { release(); }
 std::uint64_t StorageReservationPool::Reservation::outstanding() const noexcept { return promised_ > allocated_ ? promised_ - allocated_ : 0; }
 void StorageReservationPool::Reservation::release() noexcept {
  if (!destination_) return;
- { const std::lock_guard lock(destination_->ledger->mutex); *destination_->total -= outstanding(); }
+ {
+  const std::lock_guard lock(destination_->ledger->mutex);
+  *destination_->total -= outstanding();
+ }
  destination_.reset();
 }
 void StorageReservationPool::Reservation::settle_locked(std::uint64_t allocated) {
@@ -129,8 +133,7 @@ void StorageReservationPool::Reservation::resize(std::uint64_t promised, std::st
  promised_ = promised;
  fully_allocated_.store(remaining == 0, std::memory_order_relaxed);
 }
-StorageReservationPool::StorageReservationPool(std::filesystem::path path, BenchmarkTraceSink trace, StorageReservationPool* compile)
- : destination_(std::make_shared<Destination>()) {
+StorageReservationPool::StorageReservationPool(std::filesystem::path path, BenchmarkTraceSink trace, StorageReservationPool* compile) : destination_(std::make_shared<Destination>()) {
  destination_->probe = existing_parent(path);
  destination_->path = std::move(path);
  destination_->trace = std::move(trace);
@@ -153,14 +156,11 @@ StorageReservationPool::Reservation StorageReservationPool::reserve_backing(std:
   result = Reservation(destination_, promised, allocated);
   *destination_->total = total;
  }
- trace_benchmark_event(destination_->trace, "benchmark.storage.reserved", [&] {
-  return nlohmann::json{{"target", description}, {"path", destination_->path.string()}, {"required_bytes", required}, {"reserved_bytes", total}, {"available_bytes", available}};
- });
+ trace_benchmark_event(destination_->trace, "benchmark.storage.reserved",
+  [&] { return nlohmann::json{{"target", description}, {"path", destination_->path.string()}, {"required_bytes", required}, {"reserved_bytes", total}, {"available_bytes", available}}; });
  return result;
 }
-StorageReservationPool::Reservation StorageReservationPool::reserve(std::uint64_t required, std::string_view description) {
- return reserve_backing(required, description, nullptr);
-}
+StorageReservationPool::Reservation StorageReservationPool::reserve(std::uint64_t required, std::string_view description) { return reserve_backing(required, description, nullptr); }
 StorageReservationPool::Reservation StorageReservationPool::reserve_download(const std::filesystem::path& path, std::uint64_t expected, std::string_view description) {
  return reserve_backing(expected, description, &path);
 }

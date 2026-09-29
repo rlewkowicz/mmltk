@@ -118,7 +118,9 @@ struct NormalizedAnnotationIndex : NormalizedAnnotationMetadata {
 // identity. Image offsets still address that source; only output assembly rebases.
 class NormalizedAnnotationReadView final : public NormalizedAnnotationMetadata {
 public:
- struct Counts { std::size_t boxes = 0, runs = 0; };
+ struct Counts {
+  std::size_t boxes = 0, runs = 0;
+ };
  NormalizedAnnotationReadView() = default;
  explicit NormalizedAnnotationReadView(NormalizedAnnotationIndex);
  [[nodiscard]] const NormalizedAnnotationIndex& storage() const noexcept { return storage_; }
@@ -126,7 +128,10 @@ public:
  [[nodiscard]] std::size_t box_count() const noexcept { return counts_.boxes; }
  [[nodiscard]] std::size_t run_count() const noexcept { return counts_.runs; }
  [[nodiscard]] bool selected() const noexcept { return static_cast<bool>(positions_); }
- [[nodiscard]] std::size_t source_position(std::size_t position) const { if (position >= image_count()) throw std::out_of_range("normalized image position is invalid"); return positions_ ? (*positions_)[position] : position; }
+ [[nodiscard]] std::size_t source_position(std::size_t position) const {
+  if (position >= image_count()) throw std::out_of_range("normalized image position is invalid");
+  return positions_ ? (*positions_)[position] : position;
+ }
  [[nodiscard]] const NormalizedImage& image(std::size_t position) const { return storage_.images[source_position(position)]; }
  [[nodiscard]] auto images() const {
   return std::views::iota(std::size_t{0}, image_count()) | std::views::transform([this](std::size_t position) -> const NormalizedImage& { return image(position); });
@@ -134,8 +139,8 @@ public:
  // Positions address this view and must be a strictly increasing subset. Known
  // counts come from the sampler's existing selection pass; otherwise admitted
  // image/box endpoints supply the counts without reading mask payloads.
- [[nodiscard]] NormalizedAnnotationReadView select_images(std::vector<std::size_t>, std::optional<Counts> = std::nullopt,
-  mmltk::common::concurrency::CancellationObservation = {}) const;
+ [[nodiscard]] NormalizedAnnotationReadView select_images(std::vector<std::size_t>, std::optional<Counts> = std::nullopt, mmltk::common::concurrency::CancellationObservation = {}) const;
+
 private:
  NormalizedAnnotationIndex storage_;
  std::shared_ptr<const std::vector<std::size_t>> positions_;
@@ -145,18 +150,17 @@ private:
 // its admitted product without a later traversal over freshly produced masks.
 class NormalizedAnnotationAssembler final {
 public:
- explicit NormalizedAnnotationAssembler(NormalizedAnnotationMetadata, std::size_t images, std::size_t boxes, std::size_t runs,
-  mmltk::common::concurrency::CancellationObservation = {});
+ explicit NormalizedAnnotationAssembler(NormalizedAnnotationMetadata, std::size_t images, std::size_t boxes, std::size_t runs, mmltk::common::concurrency::CancellationObservation = {});
  void begin_image(NormalizedImage);
  void append_box(NormalizedBox, std::span<const RLEPair>);
- [[nodiscard]] NormalizedAnnotationIndex finish();
+ [[nodiscard]] NormalizedAnnotationIndex finish(const BenchmarkTraceSink& = {});
+
 private:
  NormalizedAnnotationBuilder builder_;
  mmltk::common::concurrency::CancellationObservation cancellation_;
  bool finished_ = false;
 };
-[[nodiscard]] NormalizedAnnotationIndex seal_normalized_annotations(NormalizedAnnotationBuilder&&,
- mmltk::common::concurrency::CancellationObservation = {});
+[[nodiscard]] NormalizedAnnotationIndex seal_normalized_annotations(NormalizedAnnotationBuilder&&, mmltk::common::concurrency::CancellationObservation = {});
 [[nodiscard]] NormalizedAnnotationIndex seal_normalized_annotation_metadata(NormalizedAnnotationBuilder&&);
 void admit_normalized_annotations(const NormalizedAnnotationIndex&, mmltk::common::concurrency::CancellationObservation = {});
 // Source and destination must be distinct. Copies one complete slice, rebasing only
@@ -174,19 +178,20 @@ struct AnnotationParseOptions {
  int num_workers = 1;
  bool keep_images_without_mapped_boxes = false;
  mmltk::common::concurrency::CancellationObservation cancel_requested = {};
- BenchmarkTraceSink trace;
+ BenchmarkTraceSink trace{};
  BenchmarkCompilePipeline* execution = nullptr;
  // Existing index transaction custody covers its one live input mapping.
- BenchmarkAllowance input_allowance;
+ BenchmarkAllowance input_allowance{};
 };
 [[nodiscard]] NormalizedAnnotationIndex parse_coco_style_annotations(
  const std::filesystem::path& json_path, std::string annotation_sha256, std::span<const NumericCategoryMapping> mappings, const AnnotationParseOptions& options);
 [[nodiscard]] NormalizedAnnotationIndex parse_open_images_annotations(const std::filesystem::path& boxes_csv_path, const std::filesystem::path& classes_csv_path, std::string annotation_sha256,
  std::span<const StringCategoryMapping> mappings, const AnnotationParseOptions& options);
 [[nodiscard]] std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const std::filesystem::path& path, BenchmarkDatasetSource expected_source, std::string_view expected_split,
- std::string_view expected_annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {}, const nlohmann::json* completion = nullptr, bool metadata_only = false, std::uint64_t completion_bytes = 0);
-std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotation_index(
- const std::filesystem::path& path, const NormalizedAnnotationIndex& index, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {}, StorageReservationPool* storage = nullptr, const nlohmann::json& extension = {});
+ std::string_view expected_annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {}, const nlohmann::json* completion = nullptr,
+ bool metadata_only = false, std::uint64_t completion_bytes = 0);
+std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotation_index(const std::filesystem::path& path, const NormalizedAnnotationIndex& index,
+ mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {}, StorageReservationPool* storage = nullptr, const nlohmann::json& extension = {});
 void remove_normalized_annotation_index(const std::filesystem::path& path);
 [[nodiscard]] std::vector<std::uint64_t> image_ids(const NormalizedAnnotationReadView&);
 }  // namespace mmltk::backend::data::benchmark_internal

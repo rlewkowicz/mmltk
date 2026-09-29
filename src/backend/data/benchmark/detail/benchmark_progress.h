@@ -112,7 +112,11 @@ private:
  std::vector<LabelPlan> label_plans_;
  std::uint64_t label_completed_ = 0, label_active_ = 0;
  bool labels_admitted_ = false, indexing_known_ = false;
- struct Snapshot { BenchmarkCompileProgress value; bool preserve = false, nonfatal = false; std::uint64_t sequence = 0; };
+ struct Snapshot {
+  BenchmarkCompileProgress value;
+  bool preserve = false, nonfatal = false;
+  std::uint64_t sequence = 0;
+ };
  static constexpr std::size_t kPendingSnapshots = 64;
  std::deque<Snapshot> pending_;
  std::condition_variable changed_;
@@ -121,7 +125,9 @@ private:
  bool stopping_ = false;
  // Producers accumulate in cache-line-sized thread stripes. The bounded
  // set is compile-owned, so withdrawal/total changes can flush every live lane.
- struct alignas(64) PixelDelta { std::atomic<std::uint64_t> completed{0}; };
+ struct alignas(64) PixelDelta {
+  std::atomic<std::uint64_t> completed{0};
+ };
  std::array<PixelDelta, 64> pixel_deltas_{};
  std::atomic<std::uint64_t> pixel_events_{0}, remaining_pixels_{0};
  std::uint64_t observed_pixel_events_ = 0;

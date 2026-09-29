@@ -59,15 +59,15 @@ struct CachedImageRejection {
  std::string reason;
 };
 struct CachedImageDirectory {
- std::string source;
- std::string shard;
- std::filesystem::path path;
- std::string identity;
- std::string selection_sha256;
+ std::string source{};
+ std::string shard{};
+ std::filesystem::path path{};
+ std::string identity{};
+ std::string selection_sha256{};
  std::uint64_t image_count = 0U;
  std::uint64_t image_bytes = 0U;
  bool cache_hit = false;
- std::vector<CachedImageRejection> quarantined;
+ std::vector<CachedImageRejection> quarantined{};
 };
 [[nodiscard]] std::string cached_image_selection_digest(std::span<const std::uint64_t> image_ids);
 // Caller holds the physical root source lease through invalidation and mutation.
@@ -77,7 +77,8 @@ void prepare_cached_image_directory(const std::filesystem::path& root);
  std::span<const std::uint64_t> expected_image_ids, std::uint64_t* image_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {},
  std::vector<CachedImageRejection>* quarantined = nullptr);
 void complete_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, std::string_view identity, std::span<const std::uint64_t> expected_image_ids,
- std::uint64_t image_bytes, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace = {}, std::span<const CachedImageRejection> quarantined = {}, StorageReservationPool* storage = nullptr);
+ std::uint64_t image_bytes, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace = {}, std::span<const CachedImageRejection> quarantined = {},
+ StorageReservationPool* storage = nullptr);
 // Everything one archive extraction needs. The knobs live here instead of in a positional parameter
 // list so the entry point keeps a single signature that callers and the definition cannot drift.
 struct ArchiveExtractionRequest {
@@ -102,7 +103,7 @@ struct ArchiveExtractionRequest {
  StorageReservationPool* storage = nullptr;
  // Synchronous validation scratch is admitted with its retained encoded input.
  std::uint64_t validator_workspace_bytes = 0;
- BenchmarkAllowance parent_allowance;
+ BenchmarkAllowance parent_allowance{};
 };
 [[nodiscard]] CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest request);
 }  // namespace mmltk::backend::data::benchmark_internal

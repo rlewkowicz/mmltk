@@ -1,8 +1,13 @@
 include(MmltkComponent)
 
-find_package(simdjson 3.13.0 EXACT CONFIG REQUIRED
+find_package(simdjson 3.13.0 EXACT CONFIG REQUIRED GLOBAL
     PATHS /opt/simdjson/lib/cmake/simdjson
     NO_DEFAULT_PATH)
+# Make the imported target's default system classification available to the
+# header-isolation projection of the owner's compile requirements as well.
+set_property(TARGET simdjson::simdjson APPEND PROPERTY
+    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES
+    "$<TARGET_PROPERTY:simdjson::simdjson,INTERFACE_INCLUDE_DIRECTORIES>")
 find_package(Arrow 25.0.1 EXACT CONFIG REQUIRED GLOBAL
     PATHS /opt/arrow/lib/cmake/Arrow NO_DEFAULT_PATH)
 find_package(Parquet 25.0.1 EXACT CONFIG REQUIRED GLOBAL
@@ -240,6 +245,7 @@ function(mmltk_add_backend_data_tests)
         CUDA::cudart
         CUDA::cuda_driver
         nlohmann_json
+        simdjson::simdjson
         Arrow::arrow_static
         Parquet::parquet_static
         LibArchive::LibArchive

@@ -334,7 +334,7 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
    transfers.push_back(update);
    totals.update(update, reporter);
   });
-  reporter.flush(); // Settle this runtime's callback captures before returning.
+  reporter.flush();  // Settle this runtime's callback captures before returning.
  };
  DatasetSystem dataset{settings, [&] { return std::make_unique<AcquisitionDatasetRuntime>(work); }, [&](DatasetSystem::event_type event) {
   if (const auto* progress = std::get_if<DatasetProgress>(&event)) {
@@ -391,8 +391,14 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
   const auto found = std::find_if(transfers.begin() + next_transfer, transfers.end(), [&](const auto& value) { return value.transfer == *current->transfer; });
   REQUIRE(found != transfers.end());
   next_transfer = static_cast<std::size_t>(found - transfers.begin()) + 1;
-  if (current->transfer->attempt == 1U) { CHECK_FALSE(saw_retry); saw_first_attempt = true; }
-  if (current->transfer->attempt == 2U) { CHECK(saw_first_attempt); saw_retry = true; }
+  if (current->transfer->attempt == 1U) {
+   CHECK_FALSE(saw_retry);
+   saw_first_attempt = true;
+  }
+  if (current->transfer->attempt == 2U) {
+   CHECK(saw_first_attempt);
+   saw_retry = true;
+  }
  }
  CHECK(saw_first_attempt);
  CHECK(saw_retry == retry);

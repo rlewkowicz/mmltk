@@ -40,15 +40,15 @@ public:
  ArtifactLease& operator=(ArtifactLease&& other) noexcept;
  ~ArtifactLease();
  [[nodiscard]] static ArtifactLease acquire(const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancellation);
- [[nodiscard]] static std::shared_ptr<ArtifactLease> acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation,
-  BenchmarkCompilePipeline*, BenchmarkResources = BenchmarkResources::handles(1), const BenchmarkAllowance& parent = {});
+ [[nodiscard]] static std::shared_ptr<ArtifactLease> acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkCompilePipeline*,
+  BenchmarkResources = BenchmarkResources::handles(1), const BenchmarkAllowance& parent = {});
  // The explicit envelope already includes this descriptor (e.g. a batch session).
  [[nodiscard]] static std::shared_ptr<ArtifactLease> acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkAllowance admitted);
  // A contended lock returns empty after closing its descriptor and releasing the
  // attempted allowance. Controllers retry outside CPU lanes.
  [[nodiscard]] static std::shared_ptr<ArtifactLease> try_acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkAllowance admitted);
- [[nodiscard]] static std::shared_ptr<ArtifactLease> try_acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation,
-  BenchmarkCompilePipeline*, BenchmarkResources = BenchmarkResources::handles(1), const BenchmarkAllowance& parent = {});
+ [[nodiscard]] static std::shared_ptr<ArtifactLease> try_acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkCompilePipeline*,
+  BenchmarkResources = BenchmarkResources::handles(1), const BenchmarkAllowance& parent = {});
  [[nodiscard]] const BenchmarkAllowance& allowance() const noexcept { return allowance_; }
 
 private:
@@ -61,7 +61,8 @@ private:
 void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation cancellation);
 // Allocation and capacity failures cannot become cache misses or transfer retries.
 [[nodiscard]] bool is_benchmark_capacity_failure(const std::exception& error) noexcept;
-std::uint64_t write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value, mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage = nullptr);
+std::uint64_t write_json_atomically(
+ const std::filesystem::path& path, const nlohmann::json& value, mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage = nullptr);
 [[nodiscard]] nlohmann::json read_json_file(const std::filesystem::path& path, std::uint64_t* extent = nullptr);
 [[nodiscard]] bool is_safe_cache_component(std::string_view value) noexcept;
 template <class Builder>

@@ -78,9 +78,7 @@ using namespace mmltk::backend::data;
 using namespace mmltk::backend::data::benchmark_internal;
 using mmltk::common::io::FileHandle;
 namespace {
-NormalizedAnnotationIndex fixture_index(const NormalizedAnnotationBuilder& builder) {
- return seal_normalized_annotation_metadata(NormalizedAnnotationBuilder(builder));
-}
+NormalizedAnnotationIndex fixture_index(const NormalizedAnnotationBuilder& builder) { return seal_normalized_annotation_metadata(NormalizedAnnotationBuilder(builder)); }
 const NormalizedAnnotationIndex& fixture_index(const NormalizedAnnotationIndex& index) { return index; }
 void require_condition(const bool condition, const char* message) {
  if (!condition) { throw std::runtime_error(message); }
@@ -180,7 +178,11 @@ using mmltk::backend::data::testsupport::HttpServer;
 // Observe real descriptor identities from Curl's socket-options callback. A
 // reused descriptor number cannot conceal an overlapping address-race socket.
 struct CurlSocketObservation {
- struct Opened { curl_socket_t descriptor; dev_t device; ino_t inode; };
+ struct Opened {
+  curl_socket_t descriptor;
+  dev_t device;
+  ino_t inode;
+ };
  std::mutex mutex;
  std::vector<Opened> opened;
  std::size_t peak = 0, attempts = 0;
@@ -192,7 +194,10 @@ struct CurlSocketObservation {
   });
   return opened.size();
  }
- [[nodiscard]] std::size_t live() { const std::lock_guard lock(mutex); return live_locked(); }
+ [[nodiscard]] std::size_t live() {
+  const std::lock_guard lock(mutex);
+  return live_locked();
+ }
  static int observe(void* opaque, curl_socket_t descriptor, curlsocktype) noexcept {
   auto& self = *static_cast<CurlSocketObservation*>(opaque);
   const std::lock_guard lock(self.mutex);
@@ -204,7 +209,10 @@ struct CurlSocketObservation {
    self.peak = std::max(self.peak, self.opened.size());
    ++self.attempts;
    return CURL_SOCKOPT_OK;
-  } catch (...) { self.failure = std::current_exception(); return CURL_SOCKOPT_ERROR; }
+  } catch (...) {
+   self.failure = std::current_exception();
+   return CURL_SOCKOPT_ERROR;
+  }
  }
 };
 struct ObservedCurlTransfer {
@@ -219,8 +227,9 @@ struct ObservedCurlTransfer {
  mmltk::common::concurrency::CancellationObservation cancel_requested;
  ObservedCurlTransfer(std::string location, CurlSocketObservation& sockets, std::string resolution = {}) : url(std::move(location)) {
   require_condition(static_cast<bool>(easy), "cannot allocate observed Curl fixture");
-  configure_curl_transfer(easy.get(), {.url = url.c_str(), .error_buffer = error.data(), .owner = this,
-   .write_callback = &write, .header_callback = &header, .progress_callback = &curl_cancel_progress_callback<ObservedCurlTransfer>}, "observed Curl fixture: ");
+  configure_curl_transfer(easy.get(),
+   {.url = url.c_str(), .error_buffer = error.data(), .owner = this, .write_callback = &write, .header_callback = &header, .progress_callback = &curl_cancel_progress_callback<ObservedCurlTransfer>},
+   "observed Curl fixture: ");
   const auto option = [&](CURLoption key, auto value) { set_curl_option_with_prefix(easy.get(), key, value, "observed Curl fixture: ", "option"); };
   option(CURLOPT_PROXY, "");
   option(CURLOPT_SOCKOPTFUNCTION, &CurlSocketObservation::observe);
@@ -592,12 +601,11 @@ void test_benchmark_supplemental_sampling() {
   for (const auto invalid_shard : {std::uint16_t{4}, std::numeric_limits<std::uint16_t>::max()}) {
    auto invalid = source;
    invalid.images.back().source_shard = invalid_shard;
-   CHECK_THROWS_WITH(sample_combined_supplemental_indices(coco_index, fixture_index(invalid), open_index, shard_bytes, {}, &sampling_execution),
-    "Objects365 annotation references an unknown image shard");
+   CHECK_THROWS_WITH(
+    sample_combined_supplemental_indices(coco_index, fixture_index(invalid), open_index, shard_bytes, {}, &sampling_execution), "Objects365 annotation references an unknown image shard");
    CHECK(sampling_execution.try_reserve({sampling_execution.transient_target(), 0}).has_value());
   }
-  CHECK_THROWS_WITH(sample_combined_supplemental_indices(coco_index, object_index, open_index, {}, {}, &sampling_execution),
-   "Objects365 sampler requires archive byte identities");
+  CHECK_THROWS_WITH(sample_combined_supplemental_indices(coco_index, object_index, open_index, {}, {}, &sampling_execution), "Objects365 sampler requires archive byte identities");
  }
  enum class SelectionOutcome { Complete, CancelWaiting, CancelAdmitted };
  for (const auto outcome : {SelectionOutcome::Complete, SelectionOutcome::CancelWaiting, SelectionOutcome::CancelAdmitted}) {
@@ -621,7 +629,8 @@ void test_benchmark_supplemental_sampling() {
      building_views.store(true);
     } else if (building_views.load()) {
      if (!observed_view.exchange(true)) positions.receipt().ArriveAndWait();
-    } else if (!observed.exchange(true)) admitted.receipt().ArriveAndWait();
+    } else if (!observed.exchange(true))
+     admitted.receipt().ArriveAndWait();
     return stop.load();
    }
   } observation{admitted, greedy, positions, cancelled, {}};
@@ -629,7 +638,10 @@ void test_benchmark_supplemental_sampling() {
    const std::atomic<bool>& stop;
    std::promise<void>& waiting;
    mutable std::size_t checks = 0;
-   static bool& sampler_thread() { thread_local bool value = false; return value; }
+   static bool& sampler_thread() {
+    thread_local bool value = false;
+    return value;
+   }
    bool cancelled() const noexcept {
     // reserve checks cancellation, records its resource waiter, then checks
     // the wait predicate. Signal that existing causal boundary without
@@ -643,11 +655,15 @@ void test_benchmark_supplemental_sampling() {
   auto work = std::async(std::launch::async, [&] {
    AdmissionObservation::sampler_thread() = true;
    observation.controller = std::this_thread::get_id();
-   return sample_combined_supplemental_indices(coco_index, object_index, open_index, unequal_bytes,
-    mmltk::common::concurrency::CancellationObservation::Borrow(observation), &execution);
+   return sample_combined_supplemental_indices(coco_index, object_index, open_index, unequal_bytes, mmltk::common::concurrency::CancellationObservation::Borrow(observation), &execution);
   });
   const mmltk::testsupport::ScopedTestCleanup release([&] {
-   cancelled.store(true); held = {}; admitted.Release(); greedy.Release(); positions.Release(); execution.notify_admission_change();
+   cancelled.store(true);
+   held = {};
+   admitted.Release();
+   greedy.Release();
+   positions.Release();
+   execution.notify_admission_change();
   });
   mmltk::testsupport::await_test_promise(waiting, "sampler waits for its complete allowance");
   CHECK(execution.resource_pressure());
@@ -807,7 +823,11 @@ void test_benchmark_archive_training_quarantine() {
   progress_completed = completed;
   progress_total = total;
  },
-  .validator = [](const std::uint64_t, const std::span<const std::uint8_t> encoded) { require_condition(has_complete_image_markers(encoded), "archive test JPEG is incomplete"); return BenchmarkImageDecoder{}.read_header(encoded); },
+  .validator =
+   [](const std::uint64_t, const std::span<const std::uint8_t> encoded) {
+  require_condition(has_complete_image_markers(encoded), "archive test JPEG is incomplete");
+  return BenchmarkImageDecoder{}.read_header(encoded);
+ },
   .trace = {},
   .quarantine_unavailable = true,
   .decompression_workers = 0U,
@@ -1568,11 +1588,12 @@ TEST_CASE("benchmark annotations retain provenance crowd area masks and determin
  CHECK_FALSE(valid_open_images_category(0x610062U));
 }
 std::pair<NormalizedAnnotationIndex, NormalizedAnnotationIndex> parse_serial_and_parallel(
- const fs::path& path, const std::string& digest, std::span<const NumericCategoryMapping> mappings, BenchmarkDatasetSource source) {
+ const fs::path& path, const std::string& digest, std::span<const NumericCategoryMapping> mappings, BenchmarkDatasetSource source, const BenchmarkTraceSink& trace = {}) {
  AnnotationParseOptions options;
  options.source = source;
  options.split = "train";
  options.num_workers = 1;
+ options.trace = trace;
  auto sequential = parse_coco_style_annotations(path, digest, mappings, options);
  options.num_workers = 4;
  return {std::move(sequential), parse_coco_style_annotations(path, digest, mappings, options)};
@@ -1616,15 +1637,18 @@ TEST_CASE("benchmark semantic admission isolates malformed masks and numeric ove
  const std::array<NumericCategoryMapping, 1> mappings{{{1U, 0U, "person"}}};
  const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
  for (const auto source : {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2}) {
-  const auto [sequential, parallel] = parse_serial_and_parallel(path, digest, mappings, source);
+  unsigned assemblies = 0;
+  const auto [sequential, parallel] = parse_serial_and_parallel(path, digest, mappings, source, [&](std::string_view event, const nlohmann::json& fields) {
+   if (event != "benchmark.annotations.assembled") return;
+   ++assemblies;
+   CHECK(fields.at("box_capacity") == fields.at("boxes"));
+   CHECK(fields.at("mask_rle_capacity") == fields.at("mask_rle_pairs"));
+  });
+  CHECK(assemblies == 2);
   REQUIRE(sequential.boxes.size() == 3U);
   REQUIRE(parallel.boxes.size() == sequential.boxes.size());
   CHECK(parallel.rejected.raw_records == 9U + rejected_capacity);
   CHECK(parallel.rejected.malformed_records == 6U + rejected_capacity);
-  CHECK(sequential.boxes.capacity() == sequential.boxes.size());
-  CHECK(parallel.boxes.capacity() == parallel.boxes.size());
-  CHECK(sequential.mask_rle_pairs.capacity() == sequential.mask_rle_pairs.size());
-  CHECK(parallel.mask_rle_pairs.capacity() == parallel.mask_rle_pairs.size());
   CHECK(reject_json(parallel.rejected) == reject_json(sequential.rejected));
   CHECK(std::memcmp(parallel.boxes.data(), sequential.boxes.data(), parallel.boxes.size() * sizeof(NormalizedBox)) == 0);
   REQUIRE(parallel.mask_rle_pairs.size() == sequential.mask_rle_pairs.size());
@@ -3321,7 +3345,10 @@ TEST_CASE("unrelated compile failure discards queued pixels before joining activ
   queued.reset();
   throw std::runtime_error("injected non-pixel output admission failure");
  });
- const mmltk::testsupport::ScopedTestCleanup release([&] { reader.Release(); second.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  reader.Release();
+  second.Release();
+ });
  // Both consumers are still held. This receipt therefore proves destruction
  // has begun and discarded every queued lease without needing that consumer.
  mmltk::testsupport::await_test_promise(*discarded, "exception-time queued custody retirement");
@@ -3378,7 +3405,6 @@ TEST_CASE("source transfer facts follow represented activity independently of ag
  CHECK(latest.sources.front().retry_count == 1);
  CHECK(latest.sources.front().resumed);
 }
-
 TEST_CASE("shared benchmark admission preserves consumer capacity and oversized work on one CPU", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 4});
  // One allowance covers a held input and the scratch/output its consumer needs.
@@ -3390,7 +3416,9 @@ TEST_CASE("shared benchmark admission preserves consumer capacity and oversized 
  execution.run(BenchmarkStage::Normalize, {}, [&](std::size_t lane) {
   require_condition(lane == 0, "one CPU admission selected a different lane");
   consumed = true;
-  try { (void)execution.reserve({1, 0}); } catch (const std::logic_error&) { rejected_wait = true; }
+  try {
+   (void)execution.reserve({1, 0});
+  } catch (const std::logic_error&) { rejected_wait = true; }
  }, borrowed);
  CHECK(consumed);
  CHECK(rejected_wait);
@@ -3426,8 +3454,15 @@ TEST_CASE("same-stage ready work uses remaining capacity beside a held consumer"
  BenchmarkResources held{40, 0}, head{48, 0}, later{16, 0};
  bool preowned = false, external_cpu = false;
  SECTION("byte capacity") {}
- SECTION("descriptor capacity") { held = {0, 5}; head = {0, 6}; later = {0, 2}; }
- SECTION("later work already owns a dependent allowance") { preowned = true; later.descriptors = 2; }
+ SECTION("descriptor capacity") {
+  held = {0, 5};
+  head = {0, 6};
+  later = {0, 2};
+ }
+ SECTION("later work already owns a dependent allowance") {
+  preowned = true;
+  later.descriptors = 2;
+ }
  SECTION("oversized head requires exclusive workspace") { head.bytes = 65; }
  SECTION("an external CPU grant leaves only the gated consumer lane") { external_cpu = true; }
  std::atomic<bool> cancelled{false};
@@ -3440,7 +3475,9 @@ TEST_CASE("same-stage ready work uses remaining capacity beside a held consumer"
  std::array<std::future<void>, 4> work;
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   cancelled.store(true);
-  holder.Release(); cpu.Release(); execution.notify_admission_change();
+  holder.Release();
+  cpu.Release();
+  execution.notify_admission_change();
  });
  if (!external_cpu) {
   work[0] = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Archive, held, [&](std::size_t) { holder.receipt().ArriveAndWait(); }); });
@@ -3465,18 +3502,20 @@ TEST_CASE("same-stage ready work uses remaining capacity beside a held consumer"
  mmltk::testsupport::await_test_future(work[3], "feasible same-stage work beside retained resources");
  CHECK(later_ran.load());
  CHECK_FALSE(head_ran.load());
- if (external_cpu) CHECK(external.bytes() == 40);
- else CHECK(work[0].wait_for(0ms) == std::future_status::timeout);
+ if (external_cpu)
+  CHECK(external.bytes() == 40);
+ else
+  CHECK(work[0].wait_for(0ms) == std::future_status::timeout);
  CHECK(work[2].wait_for(0ms) == std::future_status::timeout);
  holder.Release();
  external = {};
  allowance = {};
  parent = {};
- for (auto& item : work) if (item.valid()) mmltk::testsupport::await_test_future(item, "same-stage resource settlement");
+ for (auto& item : work)
+  if (item.valid()) mmltk::testsupport::await_test_future(item, "same-stage resource settlement");
  CHECK(head_ran.load());
  CHECK(execution.try_reserve({64, 8}).has_value());
 }
-
 TEST_CASE("stage selection reconsiders its head and rotates beyond a rejected prefix", "[backend][data][benchmark][pipeline]") {
  bool rotate = false;
  SECTION("a feasible head regains priority") {}
@@ -3488,16 +3527,26 @@ TEST_CASE("stage selection reconsiders its head and rotates beyond a rejected pr
  std::vector<unsigned> order;
  std::array<std::future<void>, 5> work;
  const mmltk::testsupport::ScopedTestCleanup release([&] {
-  cancelled.store(true); held = {}; cpu.Release(); bypass.Release(); execution.notify_admission_change();
+  cancelled.store(true);
+  held = {};
+  cpu.Release();
+  bypass.Release();
+  execution.notify_admission_change();
  });
  work[0] = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Archive, {}, [&](std::size_t) { cpu.receipt().ArriveAndWait(); }); });
  REQUIRE(cpu.WaitEntered(2s));
- for (std::size_t i = 1; i < work.size(); ++i) queue_benchmark_work(execution, work[i], [&, i] {
-  execution.run(BenchmarkStage::Normalize, {i == 1 ? 48U : i == 2 ? 32U : 16U, 0}, [&](std::size_t) {
-   order.push_back(static_cast<unsigned>(i));
-   if (i == 3) bypass.receipt().ArriveAndWait();
+ for (std::size_t i = 1; i < work.size(); ++i)
+  queue_benchmark_work(execution, work[i], [&, i] {
+   execution.run(BenchmarkStage::Normalize,
+    {i == 1   ? 48U
+     : i == 2 ? 32U
+              : 16U,
+     0},
+    [&](std::size_t) {
+    order.push_back(static_cast<unsigned>(i));
+    if (i == 3) bypass.receipt().ArriveAndWait();
+   });
   });
- });
  cpu.Release();
  REQUIRE(bypass.WaitEntered(2s));
  held = {};
@@ -3509,11 +3558,13 @@ TEST_CASE("stage selection reconsiders its head and rotates beyond a rejected pr
   CHECK(work[1].wait_for(0ms) == std::future_status::timeout);
   held = {};
  }
- for (auto& item : work) if (item.valid()) mmltk::testsupport::await_test_future(item, "head reconsideration");
- if (rotate) CHECK(order == std::vector<unsigned>{3, 4, 2, 1});
- else CHECK(order == std::vector<unsigned>{3, 1, 2, 4});
+ for (auto& item : work)
+  if (item.valid()) mmltk::testsupport::await_test_future(item, "head reconsideration");
+ if (rotate)
+  CHECK(order == std::vector<unsigned>{3, 4, 2, 1});
+ else
+  CHECK(order == std::vector<unsigned>{3, 1, 2, 4});
 }
-
 TEST_CASE("same-stage fallback preserves suspended scratch and withdraws its cursor safely", "[backend][data][benchmark][pipeline]") {
  bool fail_outer = false;
  SECTION("adjacent chunks reuse the suspended owner's scratch") {}
@@ -3525,7 +3576,11 @@ TEST_CASE("same-stage fallback preserves suspended scratch and withdraws its cur
  std::size_t chunks = 0, allocations = 0, retirements = 0;
  bool child_ran = false;
  std::array<std::future<void>, 2> work;
- const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); outer.Release(); execution.notify_admission_change(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled.store(true);
+  outer.Release();
+  execution.notify_admission_change();
+ });
  work[0] = std::async(std::launch::async, [&] {
   execution.for_each(BenchmarkStage::Normalize, 3, {48, 0}, [&](std::size_t index) {
    ++chunks;
@@ -3538,7 +3593,10 @@ TEST_CASE("same-stage fallback preserves suspended scratch and withdraws its cur
     if (fail_outer) throw AnnotationDocumentRejected("suspended parser failed");
    }
    require_condition(scratch.size() == 8 && scratch.front() == 47 && retirements == 0, "same-stage work lost reusable scratch");
-  }, [&](std::size_t) { scratch.clear(); ++retirements; });
+  }, [&](std::size_t) {
+   scratch.clear();
+   ++retirements;
+  });
  });
  REQUIRE(outer.WaitEntered(2s));
  queue_benchmark_work(execution, work[1], [&] {
@@ -3548,8 +3606,10 @@ TEST_CASE("same-stage fallback preserves suspended scratch and withdraws its cur
   });
  });
  outer.Release();
- if (fail_outer) CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(work[0], "failed suspended parser"), "suspended parser failed");
- else mmltk::testsupport::await_test_future(work[0], "same-owner scratch reuse");
+ if (fail_outer)
+  CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(work[0], "failed suspended parser"), "suspended parser failed");
+ else
+  mmltk::testsupport::await_test_future(work[0], "same-owner scratch reuse");
  mmltk::testsupport::await_test_future(work[1], "independent same-stage cooperative child");
  CHECK(chunks == (fail_outer ? 1 : 3));
  CHECK(allocations == 1);
@@ -3559,7 +3619,6 @@ TEST_CASE("same-stage fallback preserves suspended scratch and withdraws its cur
  execution.run(BenchmarkStage::Normalize, {64, 0}, [](std::size_t) {});
  CHECK(execution.try_reserve({64, 0}).has_value());
 }
-
 TEST_CASE("cancellation settles blocked and feasible same-stage jobs without new resources", "[backend][data][benchmark][pipeline]") {
  std::atomic<bool> cancelled{false};
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 64}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
@@ -3567,12 +3626,15 @@ TEST_CASE("cancellation settles blocked and feasible same-stage jobs without new
  mmltk::testsupport::TestGate cpu("cancel with the remaining CPU held");
  std::atomic<unsigned> calls{0};
  std::array<std::future<void>, 3> work;
- const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); cpu.Release(); execution.notify_admission_change(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled.store(true);
+  cpu.Release();
+  execution.notify_admission_change();
+ });
  work[0] = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Archive, {}, [&](std::size_t) { cpu.receipt().ArriveAndWait(); }); });
  REQUIRE(cpu.WaitEntered(2s));
- for (std::size_t i = 1; i < work.size(); ++i) queue_benchmark_work(execution, work[i], [&, i] {
-  execution.run(BenchmarkStage::Normalize, {i == 1 ? 48U : 16U, 0}, [&](std::size_t) { calls.fetch_add(1); });
- });
+ for (std::size_t i = 1; i < work.size(); ++i)
+  queue_benchmark_work(execution, work[i], [&, i] { execution.run(BenchmarkStage::Normalize, {i == 1 ? 48U : 16U, 0}, [&](std::size_t) { calls.fetch_add(1); }); });
  cancelled.store(true);
  cpu.Release();
  for (auto& item : work) CHECK_THROWS(mmltk::testsupport::await_test_future(item, "cancelled stage settlement"));
@@ -3582,7 +3644,6 @@ TEST_CASE("cancellation settles blocked and feasible same-stage jobs without new
  held = {};
  execution.run(BenchmarkStage::Normalize, {64, 0}, [](std::size_t) {});
 }
-
 TEST_CASE("source retirement removes the rotating candidate without obstructing unrelated ready work", "[backend][data][benchmark][pipeline]") {
  bool whole_source = false;
  SECTION("source retirement") { whole_source = true; }
@@ -3603,7 +3664,10 @@ TEST_CASE("source retirement removes the rotating candidate without obstructing 
  mmltk::testsupport::TestGate cpu("populate header queue"), bypass("hold the selected header bypass");
  std::array<std::future<void>, 4> work;
  const mmltk::testsupport::ScopedTestCleanup release([&] {
-  cancelled.store(true); cpu.Release(); bypass.Release(); execution.notify_admission_change();
+  cancelled.store(true);
+  cpu.Release();
+  bypass.Release();
+  execution.notify_admission_change();
  });
  work[0] = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Archive, {}, [&](std::size_t) { cpu.receipt().ArriveAndWait(); }); });
  REQUIRE(cpu.WaitEntered(2s));
@@ -3616,8 +3680,10 @@ TEST_CASE("source retirement removes the rotating candidate without obstructing 
  REQUIRE(bypass.WaitEntered(2s));
  // The first bypass left the cursor on the queued physical image. Withdrawal
  // unlinks that exact job before the next selection resumes past it.
- if (whole_source) execution.retire_source(images);
- else execution.retire_image(images, 1);
+ if (whole_source)
+  execution.retire_source(images);
+ else
+  execution.retire_image(images, 1);
  bypass.Release();
  mmltk::testsupport::await_test_future(work[3], "unrelated header beyond a withdrawn cursor");
  CHECK(calls.load() == 1);
@@ -3625,7 +3691,8 @@ TEST_CASE("source retirement removes the rotating candidate without obstructing 
  CHECK_FALSE(writer.image_complete(0));
  CHECK(work[1].wait_for(0ms) == std::future_status::timeout);
  held = {};
- for (auto& item : work) if (item.valid()) mmltk::testsupport::await_test_future(item, "header cursor settlement");
+ for (auto& item : work)
+  if (item.valid()) mmltk::testsupport::await_test_future(item, "header cursor settlement");
  publication({1, {}, true});
  execution.drain();
  CHECK(opens.load() == 0);
@@ -3635,7 +3702,6 @@ TEST_CASE("source retirement removes the rotating candidate without obstructing 
  CHECK(opens.load() == 1);
  CHECK(calls.load() == 2);
 }
-
 TEST_CASE("independent pixel failure settles blocked and feasible stage work with the first error", "[backend][data][benchmark][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("stage-selection-first-error");
  const auto images = root.path() / "images";
@@ -3643,7 +3709,10 @@ TEST_CASE("independent pixel failure settles blocked and feasible stage work wit
  split.images = {{1, 16, 8, 0, 0, 0}};
  auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
  mmltk::testsupport::TestGate failing("independent header fails before stage dispatch");
- request.image_opened = [&](const fs::path&, std::uint64_t) { failing.receipt().ArriveAndWait(); throw std::bad_alloc(); };
+ request.image_opened = [&](const fs::path&, std::uint64_t) {
+  failing.receipt().ArriveAndWait();
+  throw std::bad_alloc();
+ };
  BenchmarkSplitWriter writer(request);
  std::atomic<bool> cancelled{false};
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
@@ -3652,12 +3721,15 @@ TEST_CASE("independent pixel failure settles blocked and feasible stage work wit
  auto held = execution.reserve({40960, 0});
  std::atomic<unsigned> calls{0};
  std::array<std::future<void>, 2> work;
- const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); failing.Release(); execution.notify_admission_change(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled.store(true);
+  failing.Release();
+  execution.notify_admission_change();
+ });
  execution.source_publication(images, {})({1, {}, true});
  REQUIRE(failing.WaitEntered(2s));
- for (std::size_t i = 0; i < work.size(); ++i) queue_benchmark_work(execution, work[i], [&, i] {
-  execution.run(BenchmarkStage::Normalize, {i == 0 ? 49152U : 16384U, 0}, [&](std::size_t) { calls.fetch_add(1); });
- });
+ for (std::size_t i = 0; i < work.size(); ++i)
+  queue_benchmark_work(execution, work[i], [&, i] { execution.run(BenchmarkStage::Normalize, {i == 0 ? 49152U : 16384U, 0}, [&](std::size_t) { calls.fetch_add(1); }); });
  failing.Release();
  for (auto& item : work) CHECK_THROWS_AS(mmltk::testsupport::await_test_future(item, "failed stage settlement"), std::bad_alloc);
  CHECK_THROWS_AS(execution.drain(), std::bad_alloc);
@@ -3698,7 +3770,9 @@ TEST_CASE("retiring one generation waits for its reader while unrelated pixels r
  split.images = {{1, 16, 8, 0, 0, 0}, {2, 16, 8, 0, 0, 1}};
  mmltk::testsupport::TestGate held("retiring source reader");
  auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
- request.image_opened = [&](const fs::path& path, std::uint64_t) { if (path == first) held.receipt().ArriveAndWait(); };
+ request.image_opened = [&](const fs::path& path, std::uint64_t) {
+  if (path == first) held.receipt().ArriveAndWait();
+ };
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline execution(2);
  BenchmarkCompilePipeline::Attempt attempt(execution);
@@ -3835,7 +3909,6 @@ TEST_CASE("filesystem reservation follows allocation that is later withdrawn", "
  promised.release();
  CHECK(storage.outstanding() == 0);
 }
-
 TEST_CASE("descriptor continuations admit a feasible transfer minimum before source work", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 16});
  auto source = execution.reserve(BenchmarkResources::handles(1, true, 11));
@@ -3850,7 +3923,6 @@ TEST_CASE("descriptor continuations admit a feasible transfer minimum before sou
  CHECK_THROWS(impossible.reserve(BenchmarkResources::handles(1, true, 11)));
  CHECK_THROWS(impossible.reserve_transfers(1, {{0, 8}, {64, 3}}));
 }
-
 TEST_CASE("live descriptor commitments follow copied parents and nested dependent draws", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 16});
  auto source = execution.reserve(BenchmarkResources::handles(1, true, 11));
@@ -3881,7 +3953,6 @@ TEST_CASE("live descriptor commitments follow copied parents and nested dependen
  consumer = {};
  CHECK(execution.try_reserve({32, 16}).has_value());
 }
-
 TEST_CASE("dependent transfer concurrency can also use uncommitted capacity", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1024, .descriptors = 32});
  auto source = execution.reserve(BenchmarkResources::handles(1, true, 11));
@@ -3893,7 +3964,6 @@ TEST_CASE("dependent transfer concurrency can also use uncommitted capacity", "[
  CHECK(execution.try_reserve({0, 12, true}).has_value());
  CHECK_FALSE(execution.try_reserve({0, 13, true}).has_value());
 }
-
 TEST_CASE("transferred allowances enforce producer and available continuation strength", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 16});
  auto consumer = execution.reserve({16, 1});
@@ -3902,8 +3972,9 @@ TEST_CASE("transferred allowances enforce producer and available continuation st
  CHECK_FALSE(invoked);
  bool nested_rejected = false;
  execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) {
-  try { execution.for_each(BenchmarkStage::Normalize, 1, {0, 0, true}, [&](std::size_t) { invoked = true; }); }
-  catch (const std::logic_error&) { nested_rejected = true; }
+  try {
+   execution.for_each(BenchmarkStage::Normalize, 1, {0, 0, true}, [&](std::size_t) { invoked = true; });
+  } catch (const std::logic_error&) { nested_rejected = true; }
  }, consumer);
  CHECK(nested_rejected);
  CHECK_FALSE(invoked);
@@ -3915,16 +3986,14 @@ TEST_CASE("transferred allowances enforce producer and available continuation st
  CHECK(invoked);
  child = {};
  bool nested_valid = false;
- execution.run(BenchmarkStage::Metadata, {16, 1, true, 0, false, 3}, [&](std::size_t) {
-  execution.for_each(BenchmarkStage::Normalize, 1, {16, 1, true, 0, false, 3}, [&](std::size_t) { nested_valid = true; });
- }, producer);
+ execution.run(BenchmarkStage::Metadata, {16, 1, true, 0, false, 3},
+  [&](std::size_t) { execution.for_each(BenchmarkStage::Normalize, 1, {16, 1, true, 0, false, 3}, [&](std::size_t) { nested_valid = true; }); }, producer);
  CHECK(nested_valid);
  BenchmarkCompilePipeline other(1, {}, {.descriptors = 16});
  CHECK_THROWS_AS(other.try_reserve({0, 1}, producer), std::invalid_argument);
  CHECK_THROWS_AS(other.reserve({0, 1}, producer), std::invalid_argument);
  CHECK_THROWS_AS(other.reserve_transfers(1, {{0, 8}, {1, 3}}, producer), std::invalid_argument);
 }
-
 TEST_CASE("dependent commitments return on callback error and cancelled admission", "[backend][data][benchmark][pipeline]") {
  std::atomic<bool> cancelled{false};
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 16}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
@@ -3944,14 +4013,15 @@ TEST_CASE("dependent commitments return on callback error and cancelled admissio
  source = {};
  CHECK(execution.try_reserve({32, 16}).has_value());
 }
-
 TEST_CASE("failed shared batches withdraw queued siblings and preserve independent sources", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1);
  std::size_t invoked = 0;
- CHECK_THROWS_WITH(execution.for_each(BenchmarkStage::Metadata, 12, {32, 0}, [&](std::size_t) {
+ CHECK_THROWS_WITH(execution.for_each(BenchmarkStage::Metadata, 12, {32, 0},
+                    [&](std::size_t) {
   ++invoked;
   throw AnnotationDocumentRejected("source row rejected");
- }), "source row rejected");
+ }),
+  "source row rejected");
  CHECK(invoked == 1);
  bool independent = false;
  execution.run(BenchmarkStage::Normalize, {32, 0}, [&](std::size_t) { independent = true; });
@@ -3971,10 +4041,14 @@ TEST_CASE("shared remaining pixels use independent lanes and retain canonical sl
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  auto work = std::async(std::launch::async, [&] { writer.write_remaining(request); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { first.Release(); second.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  first.Release();
+  second.Release();
+ });
  REQUIRE(first.WaitEntered(2s));
  REQUIRE(second.WaitEntered(2s));
- first.Release(); second.Release();
+ first.Release();
+ second.Release();
  mmltk::testsupport::await_test_future(work, "parallel late pixels");
  CHECK(writer.image_complete(0));
  CHECK(writer.image_complete(1));
@@ -3994,7 +4068,9 @@ TEST_CASE("image replacement retires one reader and rejects its earlier geometry
  BenchmarkCompilePipeline execution(1);
  auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
  mmltk::testsupport::TestGate held("affected image reader");
- request.image_opened = [&](const fs::path&, std::uint64_t id) { if (id == 1) held.receipt().ArriveAndWait(); };
+ request.image_opened = [&](const fs::path&, std::uint64_t id) {
+  if (id == 1) held.receipt().ArriveAndWait();
+ };
  BenchmarkSplitWriter writer(request, true);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  execution.register_split(writer, split);
@@ -4051,22 +4127,23 @@ TEST_CASE("cooperative parsing returns one CPU to ready consumer work", "[backen
  mmltk::testsupport::await_test_future(parser, "cooperative parser");
  CHECK(completed_during_parse);
 }
-
 TEST_CASE("stock mask scratch survives adjacent chunks and retires for a waiting allocation", "[backend][data][benchmark][annotations][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("charged-stock-scratch");
  const auto path = root.path() / "annotations.json";
- nlohmann::json document{{"images", {{{"id", 1}, {"width", 16}, {"height", 8}, {"file_name", "1.jpg"}}}},
-  {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
+ nlohmann::json document{{"images", {{{"id", 1}, {"width", 16}, {"height", 8}, {"file_name", "1.jpg"}}}}, {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
  // Equal-width unique IDs keep adjacent full chunks at the same admitted size.
- for (unsigned id = 0; id < 2000; ++id) document["annotations"].push_back({{"id", 10000 + id}, {"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, 2, 2}},
-  {"segmentation", {{0, 0, 2, 0, 2, 2, 0, 2}}}, {"unused", std::string(256, 'x')}});
+ for (unsigned id = 0; id < 2000; ++id)
+  document["annotations"].push_back({{"id", 10000 + id}, {"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, 2, 2}}, {"segmentation", {{0, 0, 2, 0, 2, 2, 0, 2}}}, {"unused", std::string(256, 'x')}});
  write_text(path, document.dump());
  const std::array<NumericCategoryMapping, 1> mappings{{{1, 0, "person"}}};
  mmltk::testsupport::TestGate waiting("stock scratch allocation is waiting");
  struct PressureObservation {
   mmltk::testsupport::TestGate& waiting;
   mutable std::size_t polls = 0;
-  static bool& pressure_thread() { thread_local bool value = false; return value; }
+  static bool& pressure_thread() {
+   thread_local bool value = false;
+   return value;
+  }
   bool cancelled() const noexcept {
    // The second poll is the reserve wait predicate, after the owner records
    // the waiter. Keep the parser held until that causal boundary is reached.
@@ -4091,12 +4168,21 @@ TEST_CASE("stock mask scratch survives adjacent chunks and retires for a waiting
   if (chunks == 3) pressure_retired = fields.at("retained_sparse_bytes").get<std::size_t>() == 0;
  };
  auto parse = std::async(std::launch::async, [&] { return parse_coco_style_annotations(path, std::string(64, 'a'), mappings, options); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { reused.Release(); waiting.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  reused.Release();
+  waiting.Release();
+ });
  REQUIRE(reused.WaitEntered(2s));
  CHECK(capacity_reused);
  CHECK_FALSE(execution.try_reserve({(16U << 20) + 1, 0}).has_value());
- auto pressure = std::async(std::launch::async, [&] { PressureObservation::pressure_thread() = true; return execution.reserve({(16U << 20) + 1, 0}); });
- const mmltk::testsupport::ScopedTestCleanup release_before_wait([&] { reused.Release(); waiting.Release(); });
+ auto pressure = std::async(std::launch::async, [&] {
+  PressureObservation::pressure_thread() = true;
+  return execution.reserve({(16U << 20) + 1, 0});
+ });
+ const mmltk::testsupport::ScopedTestCleanup release_before_wait([&] {
+  reused.Release();
+  waiting.Release();
+ });
  REQUIRE(waiting.WaitEntered(2s));
  waiting.Release();
  reused.Release();
@@ -4108,7 +4194,6 @@ TEST_CASE("stock mask scratch survives adjacent chunks and retires for a waiting
  CHECK(chunks > 2);
  CHECK(pressure_retired);
 }
-
 TEST_CASE("a failed batch joins active borrowers while another source keeps progressing", "[backend][data][benchmark][pipeline]") {
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
  BenchmarkCompilePipeline execution(2);
@@ -4119,12 +4204,18 @@ TEST_CASE("a failed batch joins active borrowers while another source keeps prog
    execution.for_each(BenchmarkStage::Metadata, 8, {32, 0}, [&](std::size_t index) {
     invoked.fetch_add(1);
     if (index == 0) reader.receipt().ArriveAndWait();
-    if (index == 1) { failure.receipt().ArriveAndWait(); throw AnnotationDocumentRejected("initiating source error"); }
+    if (index == 1) {
+     failure.receipt().ArriveAndWait();
+     throw AnnotationDocumentRejected("initiating source error");
+    }
    });
    return std::string{};
   } catch (const AnnotationDocumentRejected& error) { return std::string(error.what()); }
  });
- const mmltk::testsupport::ScopedTestCleanup release([&] { reader.Release(); failure.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  reader.Release();
+  failure.Release();
+ });
  REQUIRE(reader.WaitEntered(2s));
  REQUIRE(failure.WaitEntered(2s));
  failure.Release();
@@ -4161,7 +4252,6 @@ TEST_CASE("a failed body keeps geometry and reaches repair without another faile
  CHECK_THROWS_AS(writer.write_remaining(request), BenchmarkImageReadError);
  CHECK(reads == 1);
 }
-
 TEST_CASE("borrowed callback records recycle while an early member remains held", "[backend][data][benchmark][pipeline]") {
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
  BenchmarkCompilePipeline execution(2, {}, {.transient_bytes = 128});
@@ -4174,7 +4264,10 @@ TEST_CASE("borrowed callback records recycle while an early member remains held"
    if (index + 1 == visits.size()) later.receipt().ArriveAndWait();
   });
  });
- const mmltk::testsupport::ScopedTestCleanup release([&] { early.Release(); later.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  early.Release();
+  later.Release();
+ });
  REQUIRE(early.WaitEntered(2s));
  REQUIRE(later.WaitEntered(2s));
  CHECK(work.wait_for(0ms) == std::future_status::timeout);
@@ -4184,7 +4277,6 @@ TEST_CASE("borrowed callback records recycle while an early member remains held"
  mmltk::testsupport::await_test_future(work, "individually recycled borrowed members");
  CHECK(execution.try_reserve({128, 0}).has_value());
 }
-
 TEST_CASE("remaining pixel slots advance beyond a held early reader", "[backend][data][benchmark][pipeline]") {
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
  mmltk::testsupport::ScopedTempDir root("recycled-pixel-members");
@@ -4199,7 +4291,9 @@ TEST_CASE("remaining pixel slots advance beyond a held early reader", "[backend]
  auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
  request.execution = &execution;
  mmltk::testsupport::TestGate early("early pixel reader"), later("all independent pixels completed");
- request.image_opened = [&](const fs::path&, std::uint64_t id) { if (id == 1) early.receipt().ArriveAndWait(); };
+ request.image_opened = [&](const fs::path&, std::uint64_t id) {
+  if (id == 1) early.receipt().ArriveAndWait();
+ };
  struct Completion {
   std::atomic<unsigned> count{0};
   mmltk::testsupport::TestGate& later;
@@ -4211,7 +4305,10 @@ TEST_CASE("remaining pixel slots advance beyond a held early reader", "[backend]
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  auto work = std::async(std::launch::async, [&] { writer.write_remaining(request); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { early.Release(); later.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  early.Release();
+  later.Release();
+ });
  REQUIRE(early.WaitEntered(2s));
  REQUIRE(later.WaitEntered(2s));
  CHECK_FALSE(writer.image_complete(0));
@@ -4222,7 +4319,6 @@ TEST_CASE("remaining pixel slots advance beyond a held early reader", "[backend]
  mmltk::testsupport::await_test_future(work, "recycled canonical pixel slots");
  CHECK(writer.completed() == split.images.size());
 }
-
 TEST_CASE("cooperative frames retain outer scratch and its grant through child retirement", "[backend][data][benchmark][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("suspended-scratch");
  const auto images = root.path() / "images";
@@ -4239,7 +4335,10 @@ TEST_CASE("cooperative frames retain outer scratch and its grant through child r
  bool retained_after_child = false, outer_charged = false;
  auto work = std::async(std::launch::async, [&] {
   execution.for_each(BenchmarkStage::Metadata, 2, {32768, 0}, [&](std::size_t index) {
-   if (index == 0) { scratch.assign(8, 47); return; }
+   if (index == 0) {
+    scratch.assign(8, 47);
+    return;
+   }
    require_condition(scratch.size() == 8 && scratch.front() == 47, "adjacent callback lost its retained scratch");
    outer.receipt().ArriveAndWait();
    execution.cooperate();
@@ -4268,7 +4367,6 @@ TEST_CASE("cooperative frames retain outer scratch and its grant through child r
  CHECK(entire_target.bytes() == 65536);
  CHECK(writer.image_complete(0));
 }
-
 TEST_CASE("last shared backing releases credits after borrower and execution retirement", "[backend][data][benchmark][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("detached-allowance-custody");
  const auto lock_path = root.path() / "source.lock";
@@ -4304,21 +4402,21 @@ TEST_CASE("last shared backing releases credits after borrower and execution ret
  REQUIRE(::flock(descriptor.get(), LOCK_EX | LOCK_NB) == 0);
  REQUIRE(::flock(descriptor.get(), LOCK_UN) == 0);
 }
-
 TEST_CASE("borrowed scratch failure settles its group before the callback owner leaves", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32});
  bool released = false;
- CHECK_THROWS_WITH(execution.for_each(BenchmarkStage::Normalize, 1, {32, 0}, [](std::size_t) {}, [&](std::size_t) {
+ CHECK_THROWS_WITH(execution.for_each(BenchmarkStage::Normalize, 1, {32, 0}, [](std::size_t) {},
+                    [&](std::size_t) {
   released = true;
   throw AnnotationDocumentRejected("scratch retirement failed");
- }), "scratch retirement failed");
+ }),
+  "scratch retirement failed");
  CHECK(released);
  bool healthy = false;
  execution.for_each(BenchmarkStage::Labels, 5, {32, 0}, [&](std::size_t) { healthy = true; });
  CHECK(healthy);
  CHECK(execution.try_reserve({32, 0}).has_value());
 }
-
 TEST_CASE("cancelled work groups settle queued members and retained scratch", "[backend][data][benchmark][pipeline]") {
  std::atomic<bool> cancelled{false};
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
@@ -4341,7 +4439,6 @@ TEST_CASE("cancelled work groups settle queued members and retained scratch", "[
  cancelled.store(false);
  CHECK(execution.try_reserve({32, 0}).has_value());
 }
-
 TEST_CASE("checked resource admission leaves no partial charge after overflow", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 4});
  BenchmarkResources maximal{std::numeric_limits<std::uint64_t>::max(), 1, false, 0, true};
@@ -4355,7 +4452,6 @@ TEST_CASE("checked resource admission leaves no partial charge after overflow", 
  retained = {};
  CHECK(execution.try_reserve({32, 4}).has_value());
 }
-
 TEST_CASE("writer group admission exceptions join earlier borrowed readers", "[backend][data][benchmark][pipeline]") {
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
  mmltk::testsupport::ScopedTempDir root("pixel-group-admission-unwind");
@@ -4383,7 +4479,6 @@ TEST_CASE("writer group admission exceptions join earlier borrowed readers", "[b
  execution.drain();
  CHECK(writer.image_complete(0));
 }
-
 TEST_CASE("local retirement preserves another source queued in the same writer group", "[backend][data][benchmark][pipeline]") {
  bool whole_source = false;
  SECTION("source generation") { whole_source = true; }
@@ -4398,7 +4493,10 @@ TEST_CASE("local retirement preserves another source queued in the same writer g
  mmltk::testsupport::TestGate held("affected active reader"), joining("retirement has withdrawn the generation");
  struct RetirementObservation {
   mmltk::testsupport::TestGate& joining;
-  static bool& retirement_thread() { thread_local bool value = false; return value; }
+  static bool& retirement_thread() {
+   thread_local bool value = false;
+   return value;
+  }
   bool cancelled() const noexcept {
    // Retirement observes cancellation only in its join wait, after withdrawing
    // the generation. This receipt proves the sibling is still queued then.
@@ -4409,7 +4507,9 @@ TEST_CASE("local retirement preserves another source queued in the same writer g
  BenchmarkCompilePipeline execution(1, {}, {}, mmltk::common::concurrency::CancellationObservation::Borrow(observation));
  auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
  request.execution = &execution;
- request.image_opened = [&](const fs::path& path, std::uint64_t) { if (path == first) held.receipt().ArriveAndWait(); };
+ request.image_opened = [&](const fs::path& path, std::uint64_t) {
+  if (path == first) held.receipt().ArriveAndWait();
+ };
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  execution.register_split(writer, split);
@@ -4417,15 +4517,23 @@ TEST_CASE("local retirement preserves another source queued in the same writer g
  const auto before_publication = execution.source_publication(first, {});
  execution.geometry_ready({first, 1, before, 16, 8});
  auto work = std::async(std::launch::async, [&] { writer.write_remaining(request); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); joining.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  held.Release();
+  joining.Release();
+ });
  REQUIRE(held.WaitEntered(2s));
  CHECK_FALSE(writer.image_complete(1));
  auto retirement = std::async(std::launch::async, [&] {
   RetirementObservation::retirement_thread() = true;
-  if (whole_source) execution.retire_source(first);
-  else execution.retire_image(first, 1);
+  if (whole_source)
+   execution.retire_source(first);
+  else
+   execution.retire_image(first, 1);
  });
- const mmltk::testsupport::ScopedTestCleanup release_before_join([&] { held.Release(); joining.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release_before_join([&] {
+  held.Release();
+  joining.Release();
+ });
  REQUIRE(joining.WaitEntered(2s));
  CHECK(retirement.wait_for(0ms) == std::future_status::timeout);
  CHECK(work.wait_for(0ms) == std::future_status::timeout);
@@ -4448,7 +4556,6 @@ TEST_CASE("local retirement preserves another source queued in the same writer g
  CHECK(writer.image_complete(0));
  CHECK(writer.image_complete(1));
 }
-
 TEST_CASE("a rejected pixel body leaves admitted writer siblings available for repair", "[backend][data][benchmark][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("writer-body-local-failure");
  const auto images = root.path() / "images";
@@ -4464,7 +4571,9 @@ TEST_CASE("a rejected pixel body leaves admitted writer siblings available for r
  auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
  request.execution = &execution;
  std::size_t first_reads = 0;
- request.image_opened = [&](const fs::path&, std::uint64_t id) { if (id == 1) ++first_reads; };
+ request.image_opened = [&](const fs::path&, std::uint64_t id) {
+  if (id == 1) ++first_reads;
+ };
  BenchmarkSplitWriter writer(request, true);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  CHECK_THROWS_AS(writer.write_remaining(request), BenchmarkImageReadError);
@@ -4481,7 +4590,6 @@ TEST_CASE("a rejected pixel body leaves admitted writer siblings available for r
  CHECK(writer.image_complete(1));
  CHECK(first_reads == 2);
 }
-
 TEST_CASE("charged lease acquisition owns its descriptor through cancellation and last reader", "[backend][data][benchmark][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("charged-lease-factory");
  std::atomic<bool> cancelled{false};
@@ -4504,10 +4612,11 @@ TEST_CASE("charged lease acquisition owns its descriptor through cancellation an
    return cancelled_flag.load();
   }
  } contended{cancelled, lock_wait.receipt()};
- auto waiter = std::async(std::launch::async, [&] {
-  return ArtifactLease::acquire_charged(path, mmltk::common::concurrency::CancellationObservation::Borrow(contended), &execution);
+ auto waiter = std::async(std::launch::async, [&] { return ArtifactLease::acquire_charged(path, mmltk::common::concurrency::CancellationObservation::Borrow(contended), &execution); });
+ const mmltk::testsupport::ScopedTestCleanup stop([&] {
+  cancelled.store(true);
+  lock_wait.Release();
  });
- const mmltk::testsupport::ScopedTestCleanup stop([&] { cancelled.store(true); lock_wait.Release(); });
  REQUIRE(lock_wait.WaitEntered(2s));
  CHECK(execution.try_reserve({0, 1}).has_value());
  cancelled.store(true);
@@ -4521,7 +4630,6 @@ TEST_CASE("charged lease acquisition owns its descriptor through cancellation an
  REQUIRE(descriptor.get() >= 0);
  CHECK(::flock(descriptor.get(), LOCK_EX | LOCK_NB) == 0);
 }
-
 TEST_CASE("direct storage settlement preserves sparse replacement promises and inode aliases", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("direct-download-storage");
  StorageReservationPool storage(root.path(), {});
@@ -4532,9 +4640,7 @@ TEST_CASE("direct storage settlement preserves sparse replacement promises and i
  auto reservation = storage.reserve_download(final, 65536, "sparse download");
  struct stat status{};
  REQUIRE(::fstat(file.get(), &status) == 0);
- const auto outstanding_for = [&] {
-  return 65536U - std::min<std::uint64_t>(65536, static_cast<std::uint64_t>(status.st_blocks) * 512);
- };
+ const auto outstanding_for = [&] { return 65536U - std::min<std::uint64_t>(65536, static_cast<std::uint64_t>(status.st_blocks) * 512); };
  CHECK(storage.outstanding() == outstanding_for());
  const std::array<std::uint8_t, 4096> bytes{};
  file.pwrite_all(bytes.data(), bytes.size(), 32768);
@@ -4566,7 +4672,6 @@ TEST_CASE("direct storage settlement preserves sparse replacement promises and i
  CHECK(storage.outstanding() == 0);
  CHECK(fs::file_size(final) == 65536);
 }
-
 TEST_CASE("storage admission never reopens unrelated live backing paths", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("constant-storage-settlement");
  StorageReservationPool storage(root.path(), {});
@@ -4588,15 +4693,15 @@ TEST_CASE("storage admission never reopens unrelated live backing paths", "[back
  first.release();
  CHECK(storage.outstanding() == 0);
 }
-
 TEST_CASE("staged artifact owns cleanup across file-operation and publication failures", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("staged-artifact-failures");
  StorageReservationPool storage(root.path(), {});
  const auto target = root.path() / "published";
- { auto original = FileHandle::create_output(target.string(), 3); original.pwrite_all("old", 3, 0); }
- SECTION("creation") {
-  CHECK_THROWS(BenchmarkStagedArtifact::create(storage, root.path() / "absent" / "file", 4096, "failed creation"));
+ {
+  auto original = FileHandle::create_output(target.string(), 3);
+  original.pwrite_all("old", 3, 0);
  }
+ SECTION("creation") { CHECK_THROWS(BenchmarkStagedArtifact::create(storage, root.path() / "absent" / "file", 4096, "failed creation")); }
  SECTION("preallocation") {
   fs::path temporary;
   {
@@ -4659,7 +4764,6 @@ TEST_CASE("staged artifact owns cleanup across file-operation and publication fa
  CHECK(std::string_view(bytes.data(), bytes.size()) == "old");
  CHECK(std::distance(fs::directory_iterator(root.path()), fs::directory_iterator{}) == 1);
 }
-
 TEST_CASE("independent staged writers retain separate promises and publish after moves", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("independent-staged-writers");
  StorageReservationPool storage(root.path(), {});
@@ -4685,7 +4789,6 @@ TEST_CASE("independent staged writers retain separate promises and publish after
  CHECK(fs::file_size(root.path() / "0") == 16384);
  CHECK(fs::file_size(root.path() / "1") == 16384);
 }
-
 TEST_CASE("cached images and ordinary stages retain their modes and promises through publication", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("staged-output-modes");
  StorageReservationPool storage(root.path(), {});
@@ -4735,7 +4838,6 @@ TEST_CASE("cached images and ordinary stages retain their modes and promises thr
   CHECK(persisted == encoded);
  }
 }
-
 TEST_CASE("Curl owns checked fixed and per-transfer resource composition", "[backend][data][benchmark][pipeline]") {
  const auto envelope = benchmark_curl_envelope(2, 4096, 8192);
  const auto single = envelope.demand(1);
@@ -4747,7 +4849,6 @@ TEST_CASE("Curl owns checked fixed and per-transfer resource composition", "[bac
  CHECK_THROWS(benchmark_curl_envelope(0, 0, std::numeric_limits<std::uint64_t>::max()));
  CHECK_THROWS(envelope.demand(std::numeric_limits<std::size_t>::max()));
 }
-
 TEST_CASE("captured image publications retain their generation across replacement and attempt closure", "[backend][data][benchmark][pipeline]") {
  enum class Replacement { Image, Source, Attempt };
  auto replacement = Replacement::Image;
@@ -4774,8 +4875,10 @@ TEST_CASE("captured image publications retain their generation across replacemen
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] { delayed.Release(); });
  REQUIRE(delayed.WaitEntered(2s));
- if (replacement == Replacement::Image) execution.retire_image(images, 1);
- else if (replacement == Replacement::Source) execution.retire_source(images);
+ if (replacement == Replacement::Image)
+  execution.retire_image(images, 1);
+ else if (replacement == Replacement::Source)
+  execution.retire_source(images);
  else {
   execution.retire_attempt();
   writer.reset();
@@ -4803,11 +4906,10 @@ TEST_CASE("captured image publications retain their generation across replacemen
  CHECK_FALSE(execution.geometry(images, 1));
  repaired = execution.source_publication(images, lease, 1);
  repaired(ready);
- CHECK(writer->image_complete(0)); // One-CPU immediate ready delivery is retained.
+ CHECK(writer->image_complete(0));  // One-CPU immediate ready delivery is retained.
  REQUIRE(execution.geometry(images, 1));
  CHECK(execution.geometry(images, 1)->width == 16);
 }
-
 TEST_CASE("owned pixel input retains mapping and charged custody through its last reader", "[backend][data][benchmark][writer]") {
  mmltk::testsupport::ScopedTempDir root("last-pixel-input-reader");
  const auto images = root.path() / "images";
@@ -4825,7 +4927,8 @@ TEST_CASE("owned pixel input retains mapping and charged custody through its las
  const auto file_mapped = [&] {
   std::ifstream mappings("/proc/self/maps");
   std::string line;
-  while (std::getline(mappings, line)) if (line.find(path.string()) != std::string::npos) return true;
+  while (std::getline(mappings, line))
+   if (line.find(path.string()) != std::string::npos) return true;
   return false;
  };
  bool released_after_backing = false, released_after_credits = false;
@@ -4842,9 +4945,7 @@ TEST_CASE("owned pixel input retains mapping and charged custody through its las
   auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
   BenchmarkSplitWriter writer(request);
   auto allowance = execution.reserve({32, 1});
-  execution.run(BenchmarkStage::Header, {}, [&](std::size_t lane) {
-   input = writer.prepare_pixel(0, lane, execution.source_publication(images, std::move(custody)), std::move(allowance));
-  });
+  execution.run(BenchmarkStage::Header, {}, [&](std::size_t lane) { input = writer.prepare_pixel(0, lane, execution.source_publication(images, std::move(custody)), std::move(allowance)); });
   REQUIRE(input);
   REQUIRE(writer.header_dimensions(0));
  }
@@ -4861,7 +4962,6 @@ TEST_CASE("owned pixel input retains mapping and charged custody through its las
  CHECK(retained.expired());
  CHECK(execution.try_reserve({32, 4}).has_value());
 }
-
 TEST_CASE("detached retained writers withdraw affected pixels before remapping completed sources", "[backend][data][benchmark][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("detached-pixel-remapping");
  const auto first = root.path() / "first", other = root.path() / "other";
@@ -4873,9 +4973,7 @@ TEST_CASE("detached retained writers withdraw affected pixels before remapping c
  BenchmarkCompilePipeline execution(1);
  auto request = benchmark_write_request(split, root.path() / "retained.bin", 8);
  std::vector<std::uint64_t> invalidations;
- request.progress = {.context = &invalidations, .images_invalidated = [](void* value, std::uint64_t count) {
-  static_cast<std::vector<std::uint64_t>*>(value)->push_back(count);
- }};
+ request.progress = {.context = &invalidations, .images_invalidated = [](void* value, std::uint64_t count) { static_cast<std::vector<std::uint64_t>*>(value)->push_back(count); }};
  BenchmarkSplitWriter retained(request);
  execution.register_split(retained, split);
  const auto old = execution.source_publication(first, {});
@@ -4902,7 +5000,6 @@ TEST_CASE("detached retained writers withdraw affected pixels before remapping c
  CHECK(remapped.image_complete(0));
  CHECK(remapped.image_complete(1));
 }
-
 namespace {
 void seed_segmented_tail(const DownloadRequest& request, std::uint64_t remaining = 2U << 20, std::size_t count = 2) {
  const mmltk::common::io::ScopedFd partial(::open((request.destination.string() + ".part").c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
@@ -4914,10 +5011,13 @@ void seed_segmented_tail(const DownloadRequest& request, std::uint64_t remaining
   segments.push_back({{"begin", begin}, {"end", end - 1}, {"completed", end - begin - remaining}, {"attempts", 1}});
  }
  write_json_atomically(request.destination.string() + ".part.json",
-  nlohmann::json{{"schema_version", kBenchmarkCacheSchemaVersion}, {"mode", "segmented"}, {"url", request.url}, {"size", request.expected_size},
-   {"etag", "\"benchmark-test-etag\""}, {"last_modified", "Thu, 23 Jul 2026 12:00:00 GMT"}, {"segments", std::move(segments)}}, {});
+  nlohmann::json{
+   {"schema_version", kBenchmarkCacheSchemaVersion}, {"mode", "segmented"}, {"url", request.url}, {"size", request.expected_size}, {"etag", "\"benchmark-test-etag\""},
+   {"last_modified", "Thu, 23 Jul 2026 12:00:00 GMT"}, {"segments", std::move(segments)}
+  },
+  {});
 }
-}
+}  // namespace
 TEST_CASE("a contended artifact lock returns its admission and independent ready files publish", "[backend][data][benchmark][download]") {
  mmltk::testsupport::ScopedTempDir root("independent-lock-admission");
  const auto payload = make_payload(16384);
@@ -4932,10 +5032,14 @@ TEST_CASE("a contended artifact lock returns its admission and independent ready
  std::atomic<bool> cancelled{false};
  std::promise<DownloadReady> ready;
  auto work = std::async(std::launch::async, [&] {
-  return download_artifacts(requests, 1, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), {}, {},
-   [&](DownloadReady value) { if (value.request_index == 1) ready.set_value(std::move(value)); }, &execution);
+  return download_artifacts(requests, 1, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), {}, {}, [&](DownloadReady value) {
+   if (value.request_index == 1) ready.set_value(std::move(value));
+  }, &execution);
  });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); blocked = {}; });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  blocked = {};
+ });
  const auto result = mmltk::testsupport::await_test_promise(ready, "independent locked batch result");
  CHECK(result.artifact.path == requests[1].destination);
  CHECK_FALSE(fs::exists(requests[0].destination));
@@ -4961,10 +5065,11 @@ TEST_CASE("one-connection stored ranges coexist with independent whole artifacts
  ranged.GateNextTransfer();
  BenchmarkCompilePipeline execution(2);
  std::atomic<bool> cancelled{false};
- auto work = std::async(std::launch::async, [&] {
-  return download_artifacts({large}, 1, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), {}, {}, {}, &execution);
+ auto work = std::async(std::launch::async, [&] { return download_artifacts({large}, 1, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), {}, {}, {}, &execution); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  ranged.ReleasePartial();
  });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); ranged.ReleasePartial(); });
  REQUIRE(ranged.WaitPartial());
  auto independent = std::async(std::launch::async, [&] { return download_artifacts({small}, 1, {}, {}, {}, {}, &execution); });
  const auto completed = mmltk::testsupport::await_test_future(independent, "whole artifact while a stored range is held");
@@ -4977,7 +5082,8 @@ TEST_CASE("one-connection stored ranges coexist with independent whole artifacts
  const auto ranges = ranged.ranges();
  CHECK(std::ranges::find(ranges, std::pair<std::size_t, std::size_t>{bytes / 2 - (2U << 20), bytes / 2 - 1}) != ranges.end());
  CHECK(std::ranges::find(ranges, std::pair<std::size_t, std::size_t>{bytes - (2U << 20), bytes - 1}) != ranges.end());
- ranged.Check(); whole.Check();
+ ranged.Check();
+ whole.Check();
 }
 TEST_CASE("stored range admission rejects invalid coverage and validators before any payload work", "[backend][data][benchmark][download]") {
  mmltk::testsupport::ScopedTempDir root("range-topology-admission");
@@ -4994,14 +5100,16 @@ TEST_CASE("stored range admission rejects invalid coverage and validators before
  SECTION("changed identity") { metadata["etag"] = "\"older-etag\""; }
  SECTION("overfragmented complete coverage") {
   metadata["segments"] = nlohmann::json::array();
-  for (std::size_t i = 0; i < 16; ++i)
-   metadata["segments"].push_back({{"begin", bytes / 16 * i}, {"end", bytes / 16 * (i + 1) - 1}, {"completed", 0}, {"attempts", 1}});
+  for (std::size_t i = 0; i < 16; ++i) metadata["segments"].push_back({{"begin", bytes / 16 * i}, {"end", bytes / 16 * (i + 1) - 1}, {"completed", 0}, {"attempts", 1}});
  }
  write_json_atomically(path, metadata, {});
  std::atomic<bool> cancelled{false};
  bool empty_admission = false;
  CHECK_THROWS(download_artifacts({request}, 1, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), [&](const DownloadProgress& update) {
-  if (update.transfer.attempt == 0) { empty_admission = update.transfer.completed_bytes == 0 && update.transfer.retained_bytes == 0; cancelled.store(true); }
+  if (update.transfer.attempt == 0) {
+   empty_admission = update.transfer.completed_bytes == 0 && update.transfer.retained_bytes == 0;
+   cancelled.store(true);
+  }
  }));
  CHECK(empty_admission);
  const auto reset = read_json_file(path);
@@ -5019,8 +5127,14 @@ TEST_CASE("range retries preserve admitted tails and ordinary fallback quiesces 
  bool fallback = false;
  SECTION("malformed content range") { server.MalformNextRange(); }
  SECTION("changing validator") { server.ChangeNextRangeIdentity(); }
- SECTION("ordinary fallback cancellation") { server.RestartNextRangedTransfer(); fallback = true; }
- SECTION("unsupported range probe") { server.IgnoreRanges(); fallback = true; }
+ SECTION("ordinary fallback cancellation") {
+  server.RestartNextRangedTransfer();
+  fallback = true;
+ }
+ SECTION("unsupported range probe") {
+  server.IgnoreRanges();
+  fallback = true;
+ }
  std::atomic<bool> cancelled{false};
  std::size_t retries = 0;
  bool fallback_reset = false;
@@ -5074,8 +5188,10 @@ TEST_CASE("Open Images admits a third group while two earlier groups retry and p
   fs::create_hard_link(seed, path);
  }
  HttpServer first(jpeg), second(jpeg), third(jpeg);
- first.fail_next(1); second.fail_next(1);
- first.GateNextRequest(); second.GateNextRequest();
+ first.fail_next(1);
+ second.fail_next(1);
+ first.GateNextRequest();
+ second.GateNextRequest();
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 64U << 20, .descriptors = 64}, cancellation);
@@ -5089,15 +5205,22 @@ TEST_CASE("Open Images admits a third group while two earlier groups retry and p
  }, {});
  std::vector<QuarantinedImage> quarantined;
  auto work = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, trace, {}, &execution,
-   [&](std::uint64_t id) { return id == 1 ? first.url("first") : id == 4097 ? second.url("second") : third.url("third"); });
+  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, trace, {}, &execution, [&](std::uint64_t id) {
+   return id == 1 ? first.url("first") : id == 4097 ? second.url("second") : third.url("third");
+  });
  });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); first.ReleaseRequest(); second.ReleaseRequest(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  first.ReleaseRequest();
+  second.ReleaseRequest();
+ });
  REQUIRE(mmltk::testsupport::await_test_promise(later, "third group publication while earlier retries are held", 10s));
  CHECK_FALSE(fs::exists(images / ".groups" / "group-000000.complete.json"));
  CHECK_FALSE(fs::exists(images / ".groups" / "group-000001.complete.json"));
- REQUIRE(first.WaitRequest()); REQUIRE(second.WaitRequest());
- first.ReleaseRequest(); second.ReleaseRequest();
+ REQUIRE(first.WaitRequest());
+ REQUIRE(second.WaitRequest());
+ first.ReleaseRequest();
+ second.ReleaseRequest();
  const auto result = mmltk::testsupport::await_test_future(work, "independent Open Images group settlement", 10s);
  CHECK(result.available_image_ids.size() == count);
  CHECK(result.directory.image_bytes == count * jpeg.size());
@@ -5114,7 +5237,9 @@ TEST_CASE("Open Images admits a third group while two earlier groups retry and p
   CHECK(proof.at("dimensions").size() == expected * 3U);
  }
  CHECK(execution.try_reserve({64U << 20, 64}).has_value());
- first.Check(); second.Check(); third.Check();
+ first.Check();
+ second.Check();
+ third.Check();
 }
 TEST_CASE("Open Images remote absence is bounded and local capacity failure returns every allowance", "[backend][data][benchmark][images]") {
  mmltk::testsupport::ScopedTempDir root("open-images-failure-admission");
@@ -5129,16 +5254,19 @@ TEST_CASE("Open Images remote absence is bounded and local capacity failure retu
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32U << 20, .descriptors = 32});
  SECTION("remote 404 retains the complete quarantine proof") {
   server.fail_next(kMaximumAttempts, 0, 404);
-  const auto result = acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) { return server.url("missing"); });
+  const auto result =
+   acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) { return server.url("missing"); });
   CHECK(result.available_image_ids.empty());
   REQUIRE(quarantined.size() == 1);
   CHECK(server.requests() == kMaximumAttempts);
-  const auto cached = acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) -> std::string { throw std::logic_error("cached proof requested HTTP"); });
+  const auto cached = acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0, {}, {}, &execution,
+   [&](std::uint64_t) -> std::string { throw std::logic_error("cached proof requested HTTP"); });
   CHECK(cached.directory.cache_hit);
  }
  SECTION("local allocation failure is fatal") {
-  CHECK_THROWS_AS(acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0, {}, {}, &execution,
-   [&](std::uint64_t) -> std::string { throw std::bad_alloc{}; }), std::bad_alloc);
+  CHECK_THROWS_AS(
+   acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, {}, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) -> std::string { throw std::bad_alloc{}; }),
+   std::bad_alloc);
   CHECK(quarantined.empty());
  }
  CHECK(execution.try_reserve({32U << 20, 32}).has_value());
@@ -5175,13 +5303,13 @@ TEST_CASE("a sixteen-descriptor artifact uses actual free and parent-committed c
  const auto warm = download_artifacts({request}, 1, {}, {}, {}, {}, &execution, source ? source->allowance() : BenchmarkAllowance{});
  CHECK(warm[0].cache_hit);
  CHECK(server.requests() == 1);
- source.reset(); unrelated = {};
+ source.reset();
+ unrelated = {};
  CHECK(execution.try_reserve({256U << 10, 16}).has_value());
  auto unlocked = ArtifactLease::try_acquire_charged(request.lock_path, {}, &execution);
  CHECK(static_cast<bool>(unlocked));
  server.Check();
 }
-
 TEST_CASE("fixed Curl preparation waits before source locks and cancels without retained custody", "[backend][data][benchmark][download][pipeline]") {
  bool cancel = false;
  SECTION("returned consumer credits wake feasible preparation") {}
@@ -5205,17 +5333,22 @@ TEST_CASE("fixed Curl preparation waits before source locks and cancels without 
    return cancelled_flag.load();
   }
  } observation{cancelled, waiting.receipt()};
- auto acquisition = std::async(std::launch::async, [&] {
-  return download_artifacts({request}, 1, mmltk::common::concurrency::CancellationObservation::Borrow(observation), {}, {}, {}, &execution);
+ auto acquisition = std::async(std::launch::async, [&] { return download_artifacts({request}, 1, mmltk::common::concurrency::CancellationObservation::Borrow(observation), {}, {}, {}, &execution); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  waiting.Release();
+  pressure = {};
  });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); waiting.Release(); pressure = {}; });
  REQUIRE(waiting.WaitEntered(5s));
  CHECK_FALSE(fs::exists(request.lock_path));
  CHECK(server.requests() == 0);
- if (cancel) cancelled.store(true);
- else pressure = {};
+ if (cancel)
+  cancelled.store(true);
+ else
+  pressure = {};
  waiting.Release();
- if (cancel) CHECK_THROWS(mmltk::testsupport::await_test_future(acquisition, "cancelled fixed transport preparation"));
+ if (cancel)
+  CHECK_THROWS(mmltk::testsupport::await_test_future(acquisition, "cancelled fixed transport preparation"));
  else {
   const auto result = mmltk::testsupport::await_test_future(acquisition, "fixed transport credit-return wake");
   REQUIRE(result.size() == 1);
@@ -5227,7 +5360,6 @@ TEST_CASE("fixed Curl preparation waits before source locks and cancels without 
  if (cancel) CHECK_FALSE(fs::exists(request.lock_path));
  server.Check();
 }
-
 TEST_CASE("impossible artifact descriptor demand fails without retaining a lease", "[backend][data][benchmark][download]") {
  mmltk::testsupport::ScopedTempDir root("artifact-descriptor-exhaustion");
  const auto payload = make_payload(64);
@@ -5240,7 +5372,6 @@ TEST_CASE("impossible artifact descriptor demand fails without retaining a lease
  CHECK_FALSE(fs::exists(request.lock_path));
  server.Check();
 }
-
 TEST_CASE("Open Images returns idle input backing to an oversized pixel consumer under a tiny target", "[backend][data][benchmark][images][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("open-images-tiny-input-target");
  const auto cache = BenchmarkCacheLayout::create(root.path());
@@ -5263,7 +5394,11 @@ TEST_CASE("Open Images returns idle input backing to an oversized pixel consumer
    [&](std::uint64_t id) { return id == 1 ? first.url("first") : later.url("later"); });
  });
  std::future<void> pixels;
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); first.ReleaseRequest(); consumer.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  first.ReleaseRequest();
+  consumer.Release();
+ });
  REQUIRE(first.WaitRequest());
  const auto before = execution.admission_generation();
  pixels = std::async(std::launch::async, [&] {
@@ -5288,9 +5423,9 @@ TEST_CASE("Open Images returns idle input backing to an oversized pixel consumer
  CHECK(quarantined.empty());
  CHECK(later.requests() == 2);
  CHECK(execution.try_reserve({32U << 20, 32}).has_value());
- first.Check(); later.Check();
+ first.Check();
+ later.Check();
 }
-
 TEST_CASE("Open Images consumes a repaired saved file before recycling its exclusive input slot", "[backend][data][benchmark][images][pipeline]") {
  enum class Repair { Valid, Dimensions, SavedFile, Missing, Allocation } repair = Repair::Valid;
  SECTION("valid repair precedes the next member") {}
@@ -5334,13 +5469,18 @@ TEST_CASE("Open Images consumes a repaired saved file before recycling its exclu
  std::vector<QuarantinedImage> quarantined;
  const ImageDecodeProbe probe{1, repair == Repair::Dimensions ? 17U : 16U, 8};
  auto acquisition = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, probe, &execution,
-   [&](std::uint64_t id) { return id == 1 ? first.url("repair") : id == 2 ? member.url("member") : later.url("later"); }, {}, repair_input);
+  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, probe, &execution, [&](std::uint64_t id) {
+   return id == 1 ? first.url("repair") : id == 2 ? member.url("member") : later.url("later");
+  }, {}, repair_input);
  });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); validation.Release(); member.ReleaseRequest(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  validation.Release();
+  member.ReleaseRequest();
+ });
  REQUIRE(validation.WaitEntered(5s));
  CHECK(member.requests() == 0);
- CHECK(later.requests() == 0); // Its group is pending under the original tiny target.
+ CHECK(later.requests() == 0);  // Its group is pending under the original tiny target.
  CHECK_FALSE(execution.geometry(images, 1));
  CHECK_FALSE(execution.try_reserve({1, 0}).has_value());
  const auto repaired_path = cached_image_path(images, 1);
@@ -5348,11 +5488,14 @@ TEST_CASE("Open Images consumes a repaired saved file before recycling its exclu
   auto damaged = jpeg;
   damaged[0] = 0;
   BenchmarkEncodedImage::publish(repaired_path, damaged, {});
- } else if (repair == Repair::Missing) fs::remove(repaired_path);
+ } else if (repair == Repair::Missing)
+  fs::remove(repaired_path);
  validation.Release();
  if (repair == Repair::Missing || repair == Repair::Allocation) {
-  if (repair == Repair::Allocation) CHECK_THROWS_AS(mmltk::testsupport::await_test_future(acquisition, "fatal repair allocation"), std::bad_alloc);
-  else CHECK_THROWS(mmltk::testsupport::await_test_future(acquisition, "missing saved repair file"));
+  if (repair == Repair::Allocation)
+   CHECK_THROWS_AS(mmltk::testsupport::await_test_future(acquisition, "fatal repair allocation"), std::bad_alloc);
+  else
+   CHECK_THROWS(mmltk::testsupport::await_test_future(acquisition, "missing saved repair file"));
   CHECK(quarantined.empty());
   CHECK(member.requests() == 0);
   CHECK_FALSE(fs::exists(images / ".groups" / "group-000000.complete.json"));
@@ -5360,7 +5503,7 @@ TEST_CASE("Open Images consumes a repaired saved file before recycling its exclu
   REQUIRE(member.WaitRequest());
   CHECK(validations.load() == 1);
   const bool valid = repair == Repair::Valid;
-  CHECK(static_cast<bool>(execution.geometry(images, 1)) == valid); // Individually admitted geometry precedes group proof publication.
+  CHECK(static_cast<bool>(execution.geometry(images, 1)) == valid);  // Individually admitted geometry precedes group proof publication.
   CHECK(fs::exists(repaired_path) == valid);
   CHECK_FALSE(fs::exists(images / ".groups" / "group-000000.complete.json"));
   member.ReleaseRequest();
@@ -5388,9 +5531,10 @@ TEST_CASE("Open Images consumes a repaired saved file before recycling its exclu
  }
  CHECK(first.requests() == 1);
  CHECK(execution.try_reserve({32U << 20, 32}).has_value());
- first.Check(); member.Check(); later.Check();
+ first.Check();
+ member.Check();
+ later.Check();
 }
-
 TEST_CASE("range cancellation after a committed checkpoint preserves that snapshot for restart", "[backend][data][benchmark][download]") {
  mmltk::testsupport::ScopedTempDir root("range-checkpoint-cancellation");
  constexpr std::size_t bytes = 512U << 20;
@@ -5414,12 +5558,11 @@ TEST_CASE("range cancellation after a committed checkpoint preserves that snapsh
  CHECK(checkpoint.at("segments")[0].at("completed") == bytes / 2);
  CHECK(checkpoint.at("segments")[1].at("completed") == bytes / 2 - tail);
  CHECK_FALSE(fs::exists(request.destination));
- const auto resumed = download_artifacts({request}, 2);
+ const auto resumed = download_artifacts({request}, 2, {});
  CHECK(resumed[0].resumed);
  CHECK(resumed[0].size == bytes);
  server.Check();
 }
-
 TEST_CASE("out-of-order redirected ranges checkpoint only committed writes and resume on one connection", "[backend][data][benchmark][download]") {
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
  mmltk::testsupport::ScopedTempDir root("out-of-order-range-checkpoint");
@@ -5441,7 +5584,10 @@ TEST_CASE("out-of-order redirected ranges checkpoint only committed writes and r
    if (snapshot.at("segments")[1].at("completed") == bytes / 2 && !published.exchange(true)) later_checkpoint.set_value(std::move(snapshot));
   }, {}, {}, &execution);
  });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); earlier.ReleasePartial(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  earlier.ReleasePartial();
+ });
  REQUIRE(earlier.WaitPartial());
  const auto checkpoint = mmltk::testsupport::await_test_promise(later_checkpoint, "later range committed checkpoint while an earlier write is held");
  // The held first range has written bytes, but its attempt has not committed.
@@ -5451,13 +5597,14 @@ TEST_CASE("out-of-order redirected ranges checkpoint only committed writes and r
  cancelled.store(true);
  earlier.ReleasePartial();
  CHECK_THROWS(mmltk::testsupport::await_test_future(work, "cancelled out-of-order ranges"));
- const auto resumed = download_artifacts({request}, 1);
+ const auto resumed = download_artifacts({request}, 1, {});
  CHECK(resumed[0].resumed);
  CHECK(read_json_file(request.destination.string() + ".download.json").at("segments") == 2);
  CHECK(execution.try_reserve({execution.transient_target(), execution.descriptor_limit()}).has_value());
- origin.Check(); earlier.Check(); later.Check();
+ origin.Check();
+ earlier.Check();
+ later.Check();
 }
-
 TEST_CASE("many stored ranges leave fair transport admission for an independent whole artifact", "[backend][data][benchmark][download]") {
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
  mmltk::testsupport::ScopedTempDir root("many-range-fair-admission");
@@ -5474,7 +5621,10 @@ TEST_CASE("many stored ranges leave fair transport admission for an independent 
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(8, {}, {.transient_bytes = 2U << 20, .descriptors = 24}, cancellation);
  auto ranges = std::async(std::launch::async, [&] { return download_artifacts({large}, 8, cancellation, {}, {}, {}, &execution); });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); held.ReleasePartial(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  held.ReleasePartial();
+ });
  REQUIRE(held.WaitPartial());
  auto independent = std::async(std::launch::async, [&] { return download_artifacts({small}, 1, cancellation, {}, {}, {}, &execution); });
  CHECK(mmltk::testsupport::await_test_future(independent, "whole-file turn beside eight stored ranges")[0].size == payload.size());
@@ -5483,9 +5633,11 @@ TEST_CASE("many stored ranges leave fair transport admission for an independent 
  CHECK(mmltk::testsupport::await_test_future(ranges, "eight-range settlement")[0].resumed);
  CHECK(read_json_file(large.destination.string() + ".download.json").at("segments") == 8);
  CHECK(execution.try_reserve({2U << 20, 24}).has_value());
- origin.Check(); held.Check(); later.Check(); whole.Check();
+ origin.Check();
+ held.Check();
+ later.Check();
+ whole.Check();
 }
-
 TEST_CASE("ordinary retry and publication return active work before their source controller continues", "[backend][data][benchmark][download]") {
  bool retry = false;
  SECTION("retry processing before backoff") { retry = true; }
@@ -5504,7 +5656,10 @@ TEST_CASE("ordinary retry and publication return active work before their source
   if (event == (retry ? "benchmark.download.attempt_failed" : "benchmark.download.complete") && !once.exchange(true)) boundary.receipt().ArriveAndWait();
  };
  auto work = std::async(std::launch::async, [&] { return download_artifacts({request}, 1, cancellation, {}, trace, {}, &execution); });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); boundary.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  boundary.Release();
+ });
  REQUIRE(boundary.WaitEntered(5s));
  CHECK(execution.try_reserve({256U << 10, 0}).has_value());
  auto ready = std::async(std::launch::async, [&] { return download_artifacts({independent}, 1, cancellation, {}, {}, {}, &execution); });
@@ -5513,9 +5668,9 @@ TEST_CASE("ordinary retry and publication return active work before their source
  boundary.Release();
  CHECK(mmltk::testsupport::await_test_future(work, "ordinary source continuation")[0].attempts == (retry ? 2 : 1));
  CHECK(execution.try_reserve({256U << 10, 24}).has_value());
- first.Check(); second.Check();
+ first.Check();
+ second.Check();
 }
-
 TEST_CASE("Open Images retired backing admits pixel work while an unrelated ordinary socket remains open", "[backend][data][benchmark][images][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("independent-image-backing-retirement");
  const auto cache = BenchmarkCacheLayout::create(root.path());
@@ -5540,10 +5695,16 @@ TEST_CASE("Open Images retired backing admits pixel work while an unrelated ordi
  std::future<AcquiredOpenImages> acquisition;
  std::future<void> pixels;
  mmltk::testsupport::TestGate consumed("pixel input after image backing retirement");
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); image.ReleaseRequest(); ordinary.ReleasePartial(); consumed.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  image.ReleaseRequest();
+  ordinary.ReleasePartial();
+  consumed.Release();
+ });
  REQUIRE(ordinary.WaitPartial());
  acquisition = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) { return image.url("image"); });
+  return acquire_open_images(
+   cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) { return image.url("image"); });
  });
  REQUIRE(image.WaitRequest());
  const auto observed = execution.admission_generation();
@@ -5566,9 +5727,9 @@ TEST_CASE("Open Images retired backing admits pixel work while an unrelated ordi
  ordinary.ReleasePartial();
  CHECK(mmltk::testsupport::await_test_future(download, "ordinary socket retirement")[0].size == payload.size());
  CHECK(execution.try_reserve({(32U << 20) + (256U << 10), 32}).has_value());
- image.Check(); ordinary.Check();
+ image.Check();
+ ordinary.Check();
 }
-
 TEST_CASE("pending and active Curl cancellation detach callbacks and return request custody", "[backend][data][benchmark][download][pipeline]") {
  bool pending = false;
  SECTION("pending byte admission") { pending = true; }
@@ -5588,18 +5749,24 @@ TEST_CASE("pending and active Curl cancellation detach callbacks and return requ
   if (pending && event == "benchmark.download.start") submitted.receipt().ArriveAndWait();
  };
  auto work = std::async(std::launch::async, [&] { return download_artifacts({request}, 1, cancellation, {}, trace, {}, &execution); });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); submitted.Release(); server.ReleasePartial(); });
- if (pending) REQUIRE(submitted.WaitEntered(5s));
- else REQUIRE(server.WaitPartial());
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  submitted.Release();
+  server.ReleasePartial();
+ });
+ if (pending)
+  REQUIRE(submitted.WaitEntered(5s));
+ else
+  REQUIRE(server.WaitPartial());
  cancelled.store(true);
  submitted.Release();
  CHECK_THROWS(mmltk::testsupport::await_test_future(work, "cancelled pending/active request settlement"));
  if (pending) CHECK(server.requests() == 0);
  pressure = {};
  CHECK(execution.try_reserve({256U << 10, 24}).has_value());
- server.ReleasePartial(); server.Check();
+ server.ReleasePartial();
+ server.Check();
 }
-
 TEST_CASE("one logical Curl connection preserves simultaneous native fallback redirects and cancelled borrowers", "[backend][data][benchmark][download][pipeline]") {
  enum class Cancel { None, Pending, Active } cancel = Cancel::None;
  SECTION("both viable requests complete") {}
@@ -5620,14 +5787,19 @@ TEST_CASE("one logical Curl connection preserves simultaneous native fallback re
  channel->add(first.easy.get());
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
   destination.ReleaseRequest();
-  if (channel) { channel->remove(first.easy.get()); channel->remove(second.easy.get()); }
+  if (channel) {
+   channel->remove(first.easy.get());
+   channel->remove(second.easy.get());
+  }
  });
  REQUIRE(destination.WaitRequest());
  CHECK(sockets.live() == 1);
  channel->add(second.easy.get());
  if (cancel == Cancel::Pending) channel->remove(second.easy.get());
- if (cancel == Cancel::Active) channel->remove(first.easy.get());
- else destination.ReleaseRequest();
+ if (cancel == Cancel::Active)
+  channel->remove(first.easy.get());
+ else
+  destination.ReleaseRequest();
  const auto expected = cancel == Cancel::None ? 2U : 1U;
  unsigned completed = 0;
  const auto deadline = std::chrono::steady_clock::now() + 5s;
@@ -5636,7 +5808,8 @@ TEST_CASE("one logical Curl connection preserves simultaneous native fallback re
    CHECK(result->result == CURLE_OK);
    CHECK(result->handle == (cancel == Cancel::Active ? second.easy.get() : completed == 0 ? first.easy.get() : second.easy.get()));
    ++completed;
-  } else channel->wait_until(deadline);
+  } else
+   channel->wait_until(deadline);
  }
  REQUIRE(completed == expected);
  CHECK(first.bytes == (cancel == Cancel::Active ? std::vector<std::uint8_t>{} : payload));
@@ -5651,9 +5824,10 @@ TEST_CASE("one logical Curl connection preserves simultaneous native fallback re
  CHECK(sockets.live() == 0);
  CHECK(execution.try_reserve({512U << 10, 24}).has_value());
  destination.ReleaseRequest();
- origin.Check(); destination.Check(); independent.Check();
+ origin.Check();
+ destination.Check();
+ independent.Check();
 }
-
 TEST_CASE("warm Curl sockets supply native opportunity through reuse redirect and reconnect", "[backend][data][benchmark][download][pipeline]") {
  const auto payload = make_payload(128);
  HttpServer origin(payload), destination(payload);
@@ -5664,8 +5838,10 @@ TEST_CASE("warm Curl sockets supply native opportunity through reuse redirect an
  auto channel = execution.curl().channel(BenchmarkCurl::Class::Artifact);
  std::vector<std::unique_ptr<ObservedCurlTransfer>> transfers;
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
-  origin.ReleaseRequest(); destination.ReleaseRequest();
-  if (channel) for (const auto& transfer : transfers) channel->remove(transfer->easy.get());
+  origin.ReleaseRequest();
+  destination.ReleaseRequest();
+  if (channel)
+   for (const auto& transfer : transfers) channel->remove(transfer->easy.get());
  });
  const auto add = [&](std::string url, std::string addresses = {}) -> ObservedCurlTransfer& {
   transfers.push_back(std::make_unique<ObservedCurlTransfer>(std::move(url), sockets, std::move(addresses)));
@@ -5710,9 +5886,9 @@ TEST_CASE("warm Curl sockets supply native opportunity through reuse redirect an
  CHECK(sockets.live() == 0);
  occupied = {};
  CHECK(execution.try_reserve({512U << 10, 24}).has_value());
- origin.Check(); destination.Check();
+ origin.Check();
+ destination.Check();
 }
-
 TEST_CASE("saturated mixed Curl admission guarantees native candidates and returns cancelled custody", "[backend][data][benchmark][download][pipeline]") {
  const auto payload = make_payload(128);
  constexpr std::size_t aggregate = 10, descriptors = 96;
@@ -5745,7 +5921,7 @@ TEST_CASE("saturated mixed Curl admission guarantees native candidates and retur
  images->add(transfers.back()->easy.get());
  REQUIRE(servers[aggregate - 1]->WaitRequest());
  CHECK(sockets.live() == aggregate);
- CHECK(sockets.peak == aggregate + 1); // Candidate overlap while all logical turns are occupied.
+ CHECK(sockets.peak == aggregate + 1);  // Candidate overlap while all logical turns are occupied.
  CHECK(sockets.peak <= 2 * aggregate);
  const auto charged = benchmark_curl_envelope().demand(aggregate).descriptors;
  CHECK(execution.try_reserve(BenchmarkResources::handles(descriptors - charged)).has_value());
@@ -5767,12 +5943,15 @@ TEST_CASE("saturated mixed Curl admission guarantees native candidates and retur
   CHECK(servers[i]->requests() == 1);
  }
  CHECK_FALSE(sockets.failure);
- ordinary.reset(); images.reset();
+ ordinary.reset();
+ images.reset();
  CHECK(sockets.live() == 0);
  CHECK(execution.try_reserve({aggregate * (256U << 10), descriptors}).has_value());
- for (const auto& server : servers) { server->ReleaseRequest(); server->Check(); }
+ for (const auto& server : servers) {
+  server->ReleaseRequest();
+  server->Check();
+ }
 }
-
 TEST_CASE("idle Curl cache leaves declared archive continuation feasible at thirteen descriptors", "[backend][data][benchmark][download][pipeline]") {
  bool late = false;
  SECTION("archive declaration precedes image work and native eviction rebalances custody") {}
@@ -5794,7 +5973,8 @@ TEST_CASE("idle Curl cache leaves declared archive continuation feasible at thir
  std::vector<std::unique_ptr<ObservedCurlTransfer>> transfers;
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
   for (const auto& server : servers) server->ReleaseRequest();
-  if (images) for (const auto& transfer : transfers) images->remove(transfer->easy.get());
+  if (images)
+   for (const auto& transfer : transfers) images->remove(transfer->easy.get());
  });
  for (std::size_t i = 0; i < 3; ++i) {
   servers.push_back(std::make_unique<HttpServer>(payload));
@@ -5820,12 +6000,14 @@ TEST_CASE("idle Curl cache leaves declared archive continuation feasible at thir
   CHECK(transfers[i]->responses == 1);
   CHECK(servers[i]->requests() == 1);
  }
- inputs.clear(); group = {};
+ inputs.clear();
+ group = {};
  if (late) {
   REQUIRE(sockets.live() == 3);
   preparation = execution.curl().channel(BenchmarkCurl::Class::Artifact, {}, archive_resources);
-  CHECK(sockets.live() == 0); // Lowering MAXCONNECTS alone cannot satisfy this.
- } else CHECK(sockets.live() == 2);
+  CHECK(sockets.live() == 0);  // Lowering MAXCONNECTS alone cannot satisfy this.
+ } else
+  CHECK(sockets.live() == 2);
  images.reset();
  auto archive = ArtifactLease::try_acquire_charged(root.path() / "archive.lock", {}, &execution, archive_resources);
  REQUIRE(archive);
@@ -5836,7 +6018,8 @@ TEST_CASE("idle Curl cache leaves declared archive continuation feasible at thir
  ObservedCurlTransfer warm(servers[2]->url("warm"), sockets), reused(servers[2]->url("reuse"), sockets), cancelled(cancellation_server.url("cancel"), sockets);
  const mmltk::testsupport::ScopedTestCleanup detach([&] {
   cancellation_server.ReleaseRequest();
-  if (preparation) for (auto* transfer : {&warm, &reused, &cancelled}) preparation->remove(transfer->easy.get());
+  if (preparation)
+   for (auto* transfer : {&warm, &reused, &cancelled}) preparation->remove(transfer->easy.get());
  });
  const auto before_warm = sockets.attempts;
  preparation->add(warm.easy.get());
@@ -5859,10 +6042,10 @@ TEST_CASE("idle Curl cache leaves declared archive continuation feasible at thir
  preparation.reset();
  CHECK(sockets.live() == 0);
  CHECK(execution.try_reserve({3U * slot_bytes, 13}).has_value());
- cancellation_server.ReleaseRequest(); cancellation_server.Check();
+ cancellation_server.ReleaseRequest();
+ cancellation_server.Check();
  for (const auto& server : servers) server->Check();
 }
-
 TEST_CASE("large ordinary first attempts retain metadata meaning through reset cancellation and retry", "[backend][data][benchmark][download]") {
  enum class Metadata { Valid, Missing, Malformed, Schema, Url, Mode, Validator } metadata_kind = Metadata::Valid;
  SECTION("valid checkpoint resumes and retry reads its newer checkpoint") {}
@@ -5889,15 +6072,19 @@ TEST_CASE("large ordinary first attempts retain metadata meaning through reset c
  if (metadata_kind == Metadata::Url) metadata["url"] = "http://different.invalid/artifact";
  if (metadata_kind == Metadata::Mode) metadata["mode"] = 7;
  if (metadata_kind == Metadata::Validator) metadata["etag"] = "";
- if (metadata_kind == Metadata::Malformed) write_text(metadata_path, "{broken");
- else if (metadata_kind != Metadata::Missing) write_json_atomically(metadata_path, metadata, {});
+ if (metadata_kind == Metadata::Malformed)
+  write_text(metadata_path, "{broken");
+ else if (metadata_kind != Metadata::Missing)
+  write_json_atomically(metadata_path, metadata, {});
  const bool valid = metadata_kind == Metadata::Valid;
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 16});
  std::size_t failed_attempts = 0;
- if (valid) server.TruncateNextTransfer();
- else server.GateNextTransfer();
+ if (valid)
+  server.TruncateNextTransfer();
+ else
+  server.GateNextTransfer();
  const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json&) {
   if (event != "benchmark.download.attempt_failed") return;
   ++failed_attempts;
@@ -5906,7 +6093,10 @@ TEST_CASE("large ordinary first attempts retain metadata meaning through reset c
   CHECK(checkpoint.at("etag") == "\"benchmark-test-etag\"");
  };
  auto work = std::async(std::launch::async, [&] { return download_artifacts({request}, 1, cancellation, {}, trace, {}, &execution); });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); server.ReleasePartial(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  server.ReleasePartial();
+ });
  if (valid) {
   const auto result = mmltk::testsupport::await_test_future(work, "large ordinary resume after truncated attempt", 20s);
   REQUIRE(result.size() == 1);
@@ -5932,9 +6122,9 @@ TEST_CASE("large ordinary first attempts retain metadata meaning through reset c
   CHECK(fs::file_size(partial_path) <= prefix.size());
  }
  CHECK(execution.try_reserve({256U << 10, 16}).has_value());
- server.ReleasePartial(); server.Check();
+ server.ReleasePartial();
+ server.Check();
 }
-
 TEST_CASE("Curl class limits come from its reflected inventory and checked CPU budget", "[backend][data][benchmark][download]") {
  BenchmarkCurl normalized(0), selected(3), capped(256);
  CHECK(kBenchmarkCurlClasses.size() == 2);
@@ -5946,12 +6136,12 @@ TEST_CASE("Curl class limits come from its reflected inventory and checked CPU b
  CHECK(capped.limit(BenchmarkCurl::Class::OpenImages) == 256);
  CHECK_THROWS_AS(BenchmarkCurl(std::numeric_limits<std::size_t>::max()), std::overflow_error);
 }
-
 TEST_CASE("standalone artifact batches retain selected controllers across multiple jobs", "[backend][data][benchmark][download]") {
  mmltk::testsupport::ScopedTempDir root("persistent-artifact-controllers");
  const auto payload = make_payload(4096);
  HttpServer first(payload), second(payload);
- first.GateNextRequest(); second.GateNextRequest();
+ first.GateNextRequest();
+ second.GateNextRequest();
  std::vector<DownloadRequest> requests;
  for (std::size_t i = 0; i < 6; ++i) requests.push_back(request_for(root.path(), "artifact-" + std::to_string(i), (i % 2 ? second : first).url("body"), payload));
  std::mutex observations;
@@ -5971,23 +6161,32 @@ TEST_CASE("standalone artifact batches retain selected controllers across multip
    delivered.push_back(result.request_index);
   });
  });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); first.ReleaseRequest(); second.ReleaseRequest(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  first.ReleaseRequest();
+  second.ReleaseRequest();
+ });
  // No CPU-count skip: these are the selected standalone I/O controllers.
- REQUIRE(first.WaitRequest()); REQUIRE(second.WaitRequest());
+ REQUIRE(first.WaitRequest());
+ REQUIRE(second.WaitRequest());
  CHECK(batch.wait_for(0ms) == std::future_status::timeout);
- first.ReleaseRequest(); second.ReleaseRequest();
+ first.ReleaseRequest();
+ second.ReleaseRequest();
  const auto results = mmltk::testsupport::await_test_future(batch, "persistent artifact batch");
  REQUIRE(results.size() == requests.size());
- for (std::size_t i = 0; i < results.size(); ++i) { CHECK(results[i].path == requests[i].destination); CHECK(results[i].size == payload.size()); }
+ for (std::size_t i = 0; i < results.size(); ++i) {
+  CHECK(results[i].path == requests[i].destination);
+  CHECK(results[i].size == payload.size());
+ }
  REQUIRE(controllers.size() == requests.size());
  std::ranges::sort(controllers);
  controllers.erase(std::unique(controllers.begin(), controllers.end()), controllers.end());
  CHECK(controllers.size() == 2);
  std::ranges::sort(delivered);
  CHECK(delivered == std::vector<std::size_t>{0, 1, 2, 3, 4, 5});
- first.Check(); second.Check();
+ first.Check();
+ second.Check();
 }
-
 TEST_CASE("artifact callback and startup failures settle all borrowed batch state", "[backend][data][benchmark][download]") {
  bool startup = false;
  SECTION("a throwing ready callback retires its peer") {}
@@ -6017,9 +6216,15 @@ TEST_CASE("artifact callback and startup failures settle all borrowed batch stat
    throw std::runtime_error("artifact ready failure");
   });
  });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); blocked.reset(); callback.Release(); peer.ReleaseRequest(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  blocked.reset();
+  callback.Release();
+  peer.ReleaseRequest();
+ });
  REQUIRE(peer.WaitRequest());
- if (startup) blocked.reset();
+ if (startup)
+  blocked.reset();
  else {
   REQUIRE(callback.WaitEntered(5s));
   CHECK(batch.wait_for(0ms) == std::future_status::timeout);
@@ -6027,36 +6232,44 @@ TEST_CASE("artifact callback and startup failures settle all borrowed batch stat
   mmltk::testsupport::await_test_promise(returned, "borrowed artifact result retirement");
  }
  REQUIRE(batch.wait_for(5s) == std::future_status::ready);
- if (startup) CHECK_THROWS(batch.get());
- else CHECK_THROWS_WITH(batch.get(), "artifact ready failure");
+ if (startup)
+  CHECK_THROWS(batch.get());
+ else
+  CHECK_THROWS_WITH(batch.get(), "artifact ready failure");
  for (const auto& value : requests) CHECK(ArtifactLease::try_acquire_charged(value.lock_path, {}, BenchmarkAllowance{}));
  CHECK_FALSE(fs::exists(independent.destination));
- peer.ReleaseRequest(); first.Check(); peer.Check();
+ peer.ReleaseRequest();
+ first.Check();
+ peer.Check();
 }
-
 TEST_CASE("channel settlement detaches pending and active work while another channel stays live", "[backend][data][benchmark][download][pipeline]") {
  const auto payload = make_payload(4096);
  HttpServer retired(payload), queued(payload), independent(payload), reused(payload);
- retired.GateNextRequest(); independent.GateNextRequest();
+ retired.GateNextRequest();
+ independent.GateNextRequest();
  BenchmarkCompilePipeline execution(1, {}, {.descriptors = 32});
  CurlSocketObservation sockets;
  auto channel = execution.curl().channel(BenchmarkCurl::Class::Artifact);
  auto other = execution.curl().channel(BenchmarkCurl::Class::OpenImages);
  ObservedCurlTransfer first(retired.url("active"), sockets), pending(queued.url("pending"), sockets), live(independent.url("live"), sockets), later(reused.url("reused"), sockets);
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
-  retired.ReleaseRequest(); independent.ReleaseRequest();
+  retired.ReleaseRequest();
+  independent.ReleaseRequest();
   if (channel) channel->remove_all();
   if (other) other->remove_all();
  });
- channel->add(first.easy.get()); REQUIRE(retired.WaitRequest());
+ channel->add(first.easy.get());
+ REQUIRE(retired.WaitRequest());
  channel->add(pending.easy.get());
- other->add(live.easy.get()); REQUIRE(independent.WaitRequest());
+ other->add(live.easy.get());
+ REQUIRE(independent.WaitRequest());
  channel->remove_all();
  CHECK_FALSE(channel->next());
- CHECK(first.bytes.empty()); CHECK(pending.bytes.empty());
+ CHECK(first.bytes.empty());
+ CHECK(pending.bytes.empty());
  CHECK(queued.requests() == 0);
  CHECK(sockets.live() == 1);
- channel->remove_all(); // Already-empty settlement keeps the channel reusable.
+ channel->remove_all();  // Already-empty settlement keeps the channel reusable.
  channel->add(later.easy.get());
  CHECK(await_curl(*channel).handle == later.easy.get());
  CHECK(later.bytes == payload);
@@ -6069,9 +6282,12 @@ TEST_CASE("channel settlement detaches pending and active work while another cha
  other.reset();
  CHECK(sockets.live() == 0);
  CHECK(execution.try_reserve({execution.transient_target(), 32}).has_value());
- retired.ReleaseRequest(); retired.Check(); queued.Check(); independent.Check(); reused.Check();
+ retired.ReleaseRequest();
+ retired.Check();
+ queued.Check();
+ independent.Check();
+ reused.Check();
 }
-
 TEST_CASE("shared Curl admission changes survive the check to park boundary for actual readers", "[backend][data][benchmark][download][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 4096, .descriptors = 32});
  std::vector<std::unique_ptr<BenchmarkCurl::Channel>> declarations;
@@ -6089,14 +6305,21 @@ TEST_CASE("shared Curl admission changes survive the check to park boundary for 
  };
  auto a = std::async(std::launch::async, [&] { return wait(*first, first_checked); });
  auto b = std::async(std::launch::async, [&] { return wait(*second, second_checked); });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { occupied = {}; first_checked.Release(); second_checked.Release(); first->wake(); second->wake(); });
- REQUIRE(first_checked.WaitEntered(5s)); REQUIRE(second_checked.WaitEntered(5s));
- occupied = {}; // One common credit event, before either reader parks.
- first_checked.Release(); second_checked.Release();
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  occupied = {};
+  first_checked.Release();
+  second_checked.Release();
+  first->wake();
+  second->wake();
+ });
+ REQUIRE(first_checked.WaitEntered(5s));
+ REQUIRE(second_checked.WaitEntered(5s));
+ occupied = {};  // One common credit event, before either reader parks.
+ first_checked.Release();
+ second_checked.Release();
  CHECK(mmltk::testsupport::await_test_future(a, "first shared admission reader"));
  CHECK(mmltk::testsupport::await_test_future(b, "second shared admission reader"));
 }
-
 TEST_CASE("Open Images starts ready HTTP before later cold cache chunks finish", "[backend][data][benchmark][images][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("open-images-incremental-cache-scan");
  const auto cache = BenchmarkCacheLayout::create(root.path());
@@ -6121,15 +6344,20 @@ TEST_CASE("Open Images starts ready HTTP before later cold cache chunks finish",
  std::vector<QuarantinedImage> quarantined;
  ProgressReporter progress({}, {});
  auto acquisition = std::async(std::launch::async, [&] {
-  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), &progress, 1, 0, trace, {}, &execution,
-   [&](std::uint64_t) { return server.url("image"); });
+  return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), &progress, 1, 0, trace,
+   {}, &execution, [&](std::uint64_t) { return server.url("image"); });
  });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); scan.Release(); server.ReleaseRequest(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  scan.Release();
+  server.ReleaseRequest();
+ });
  REQUIRE(scan.WaitEntered(5s));
- REQUIRE(server.WaitRequest()); // The only CPU is still in the later scan chunk.
+ REQUIRE(server.WaitRequest());  // The only CPU is still in the later scan chunk.
  CHECK(acquisition.wait_for(0ms) == std::future_status::timeout);
  CHECK_FALSE(fs::exists(images / ".groups" / "group-000000.complete.json"));
- scan.Release(); server.ReleaseRequest();
+ scan.Release();
+ server.ReleaseRequest();
  const auto result = mmltk::testsupport::await_test_future(acquisition, "incremental cache scan acquisition");
  CHECK(result.available_image_ids.size() == 65);
  CHECK(result.directory.image_bytes == jpeg.size() * 65);
@@ -6142,7 +6370,6 @@ TEST_CASE("Open Images starts ready HTTP before later cold cache chunks finish",
  CHECK(execution.try_reserve({64U << 20, 32}).has_value());
  server.Check();
 }
-
 TEST_CASE("an already settled channel retires without waiting for another channel callback", "[backend][data][benchmark][download][pipeline]") {
  const auto payload = make_payload(128);
  HttpServer first(payload), second(payload);
@@ -6157,10 +6384,18 @@ TEST_CASE("an already settled channel retires without waiting for another channe
  CHECK(await_curl(*retired).result == CURLE_OK);
  retired->remove_all();
  std::future<void> retirement;
- const mmltk::testsupport::ScopedTestCleanup settle([&] { callback.Release(); if (retirement.valid()) retirement.wait(); if (retired) retired->remove_all(); if (live) live->remove_all(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  callback.Release();
+  if (retirement.valid()) retirement.wait();
+  if (retired) retired->remove_all();
+  if (live) live->remove_all();
+ });
  live->add(held.easy.get());
  REQUIRE(callback.WaitEntered(5s));
- retirement = std::async(std::launch::async, [&] { retired->remove_all(); retired.reset(); });
+ retirement = std::async(std::launch::async, [&] {
+  retired->remove_all();
+  retired.reset();
+ });
  mmltk::testsupport::await_test_future(retirement, "already-empty channel destruction");
  callback.Release();
  CHECK(await_curl(*live).result == CURLE_OK);
@@ -6168,21 +6403,29 @@ TEST_CASE("an already settled channel retires without waiting for another channe
  live.reset();
  CHECK(sockets.live() == 0);
  CHECK(execution.try_reserve({execution.transient_target(), 32}).has_value());
- first.Check(); second.Check();
+ first.Check();
+ second.Check();
 }
-
 TEST_CASE("transport failure wakes channel readers and permits request settlement", "[backend][data][benchmark][download][pipeline]") {
  const auto payload = make_payload(128);
  HttpServer first(payload), second(payload);
- first.GateNextRequest(); second.GateNextRequest();
+ first.GateNextRequest();
+ second.GateNextRequest();
  BenchmarkCompilePipeline execution(1, {}, {.descriptors = 32});
  CurlSocketObservation sockets;
  auto channel = execution.curl().channel(BenchmarkCurl::Class::Artifact);
  auto peer = execution.curl().channel(BenchmarkCurl::Class::OpenImages);
  ObservedCurlTransfer duplicate(first.url("duplicate"), sockets), held(second.url("held"), sockets);
- const mmltk::testsupport::ScopedTestCleanup settle([&] { first.ReleaseRequest(); second.ReleaseRequest(); if (channel) channel->remove_all(); if (peer) peer->remove_all(); });
- channel->add(duplicate.easy.get()); REQUIRE(first.WaitRequest());
- peer->add(held.easy.get()); REQUIRE(second.WaitRequest());
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  first.ReleaseRequest();
+  second.ReleaseRequest();
+  if (channel) channel->remove_all();
+  if (peer) peer->remove_all();
+ });
+ channel->add(duplicate.easy.get());
+ REQUIRE(first.WaitRequest());
+ peer->add(held.easy.get());
+ REQUIRE(second.WaitRequest());
  // A second registration of a still-active easy handle is a transport error.
  // Its admission waits for an Artifact turn; remove the class restriction by
  // submitting the duplicate through the independent image declaration.
@@ -6192,12 +6435,15 @@ TEST_CASE("transport failure wakes channel readers and permits request settlemen
  auto receipt = std::async(std::launch::async, [&] { peer->remove_all(); });
  mmltk::testsupport::await_test_future(receipt, "failed transport removal receipt");
  channel->remove_all();
- peer.reset(); channel.reset();
+ peer.reset();
+ channel.reset();
  CHECK(sockets.live() == 0);
  CHECK(execution.try_reserve({execution.transient_target(), 32}).has_value());
- first.ReleaseRequest(); second.ReleaseRequest(); first.Check(); second.Check();
+ first.ReleaseRequest();
+ second.ReleaseRequest();
+ first.Check();
+ second.Check();
 }
-
 TEST_CASE("published image mappings retain their inode and header without a cache reopen", "[backend][data][benchmark][images][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("retained-pixel-input");
  const auto images = root.path() / "images";
@@ -6209,10 +6455,14 @@ TEST_CASE("published image mappings retain their inode and header without a cach
  REQUIRE(payload);
  std::filesystem::remove(cached_image_path(images, 1));
  PreparedBenchmarkSplit split;
- split.name = "train"; split.class_names = {"person"}; split.sources = {{images}}; split.images = {{1, 16, 8, 0, 0, 0}};
+ split.name = "train";
+ split.class_names = {"person"};
+ split.sources = {{images}};
+ split.images = {{1, 16, 8, 0, 0, 0}};
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1024});
  auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8);
- request.execution = &execution; request.num_workers = 1;
+ request.execution = &execution;
+ request.num_workers = 1;
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  execution.register_split(writer, split);
@@ -6251,7 +6501,8 @@ TEST_CASE("PNG decoder views retain the stb allocation through pixel use", "[bac
  const auto view = decoder.decode_rgb(encoded, header, &rgb, &cmyk);
  CHECK(std::ranges::equal(view, expected));
  CHECK(rgb == std::vector<std::uint8_t>{251, 252, 253});
- encoded.clear(); encoded.shrink_to_fit();
+ encoded.clear();
+ encoded.shrink_to_fit();
  CHECK(std::ranges::equal(view, expected));
 }
 TEST_CASE("registered Open Images repair accepts its one retained pixel consumption", "[backend][data][benchmark][images][pipeline]") {
@@ -6265,7 +6516,10 @@ TEST_CASE("registered Open Images repair accepts its one retained pixel consumpt
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  index.images.push_back({.source_image_id = 1, .width = 16, .height = 8});
  PreparedBenchmarkSplit split;
- split.name = "train"; split.class_names = {"person"}; split.sources = {{images}}; split.images = {{1, 16, 8, 0, 0, 0}};
+ split.name = "train";
+ split.class_names = {"person"};
+ split.sources = {{images}};
+ split.images = {{1, 16, 8, 0, 0, 0}};
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 32}, cancellation);
@@ -6279,7 +6533,9 @@ TEST_CASE("registered Open Images repair accepts its one retained pixel consumpt
  execution.register_split(writer, split);
  bool unlinked = false;
  ProgressReporter progress({}, {});
- const auto repair_input = [&](std::uint64_t id) { if (id == 1) unlinked = fs::remove(cached_image_path(images, 1)); };
+ const auto repair_input = [&](std::uint64_t id) {
+  if (id == 1) unlinked = fs::remove(cached_image_path(images, 1));
+ };
  std::vector<QuarantinedImage> quarantined;
  auto acquisition = std::async(std::launch::async, [&] {
   return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, ImageDecodeProbe{1, 16, 8}, &execution,
@@ -6297,7 +6553,6 @@ TEST_CASE("registered Open Images repair accepts its one retained pixel consumpt
  writer.finish(request);
  CHECK(CompiledDataset::open(request.output_path).header().num_images == 1);
 }
-
 TEST_CASE("compact image facts reuse only their admitted file generation", "[backend][data][benchmark][images][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("compact-image-fact");
  const auto images = root.path() / "images";
@@ -6312,7 +6567,10 @@ TEST_CASE("compact image facts reuse only their admitted file generation", "[bac
  FileHandle directory(::open(images.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
  REQUIRE(directory.get() >= 0);
  std::size_t headers = 0;
- const CachedImageValidator admit = [&](std::uint64_t, std::span<const std::uint8_t> encoded) { ++headers; return decoder.read_header(encoded); };
+ const CachedImageValidator admit = [&](std::uint64_t, std::span<const std::uint8_t> encoded) {
+  ++headers;
+  return decoder.read_header(encoded);
+ };
  auto same = BenchmarkEncodedImage::open(directory.get(), 1, admit, {}, nullptr, {}, fact);
  REQUIRE(same);
  CHECK(headers == 0);
@@ -6327,7 +6585,6 @@ TEST_CASE("compact image facts reuse only their admitted file generation", "[bac
  fs::remove(cached_image_path(images, 1));
  CHECK_FALSE(BenchmarkEncodedImage::open(directory.get(), 1, admit, {}, nullptr, {}, fact));
 }
-
 TEST_CASE("preplacement image facts remain compact and withdraw with their source", "[backend][data][benchmark][images][pipeline]") {
  bool pressure = false;
  SECTION("mapped publication") {}
@@ -6347,7 +6604,8 @@ TEST_CASE("preplacement image facts remain compact and withdraw with their sourc
   payload = BenchmarkEncodedImage::publish(directory.get(), 1, encoded, decoder.read_header(encoded), {}, storage, &execution);
   REQUIRE(payload);
   CHECK(payload->storage() == BenchmarkEncodedImage::Storage::HeaderOnly);
- } else payload = BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {}, nullptr, decoder.read_header(encoded));
+ } else
+  payload = BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {}, nullptr, decoder.read_header(encoded));
  const std::weak_ptr<const void> mapping = payload->backing();
  const auto publication = execution.source_publication(images, {});
  publication({1, std::pair{16U, 8U}, true, payload});
@@ -6357,7 +6615,10 @@ TEST_CASE("preplacement image facts remain compact and withdraw with their sourc
  REQUIRE(fact);
  CHECK(fact->storage() == BenchmarkEncodedImage::Storage::HeaderOnly);
  PreparedBenchmarkSplit split;
- split.name = "train"; split.class_names = {"person"}; split.sources = {{images}}; split.images = {{1, 16, 8, 0, 0, 0}};
+ split.name = "train";
+ split.class_names = {"person"};
+ split.sources = {{images}};
+ split.images = {{1, 16, 8, 0, 0, 0}};
  auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8);
  request.execution = &execution;
  BenchmarkSplitWriter writer(request);
@@ -6371,7 +6632,6 @@ TEST_CASE("preplacement image facts remain compact and withdraw with their sourc
  CHECK_FALSE(execution.image_input(images, 1));
  CHECK_FALSE(writer.image_complete(0));
 }
-
 TEST_CASE("held warm image reads allow HTTP results and pixels to finish on one CPU", "[backend][data][benchmark][images][pipeline]") {
  bool cancel = false;
  SECTION("complete group proof") {}
@@ -6391,14 +6651,19 @@ TEST_CASE("held warm image reads allow HTTP results and pixels to finish on one 
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  for (std::uint64_t id : {1U, 2U, 3U}) index.images.push_back({.source_image_id = id});
  PreparedBenchmarkSplit split;
- split.name = "train"; split.class_names = {"person"}; split.sources = {{images}};
+ split.name = "train";
+ split.class_names = {"person"};
+ split.sources = {{images}};
  for (std::uint64_t id : {1U, 2U, 3U}) split.images.push_back({id, 16, 8, 0, 0, 0});
  auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8, cancellation);
  request.execution = &execution;
  mmltk::testsupport::TestGate held("warm read before filesystem acquisition");
  std::promise<void> ready_pixels;
  std::atomic<unsigned> completed{0};
- struct Completion { std::atomic<unsigned>& count; std::promise<void>& ready; } completion{completed, ready_pixels};
+ struct Completion {
+  std::atomic<unsigned>& count;
+  std::promise<void>& ready;
+ } completion{completed, ready_pixels};
  request.progress = {.context = &completion, .image_completed = [](void* opaque) {
   auto& value = *static_cast<Completion*>(opaque);
   if (++value.count == 2) value.ready.set_value();
@@ -6410,13 +6675,19 @@ TEST_CASE("held warm image reads allow HTTP results and pixels to finish on one 
  std::vector<QuarantinedImage> quarantined;
  auto acquisition = std::async(std::launch::async, [&] {
   return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution,
-   [&](std::uint64_t) { return server.url("image"); }, [&](std::uint64_t id) { if (id == 1) held.receipt().ArriveAndWait(); });
+   [&](std::uint64_t) { return server.url("image"); }, [&](std::uint64_t id) {
+   if (id == 1) held.receipt().ArriveAndWait();
+  });
  });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); held.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  held.Release();
+ });
  REQUIRE(held.WaitEntered(5s));
  mmltk::testsupport::await_test_promise(ready_pixels, "independent warm and HTTP pixels finish while the first read is held");
  CHECK_FALSE(writer.image_complete(0));
- CHECK(writer.image_complete(1)); CHECK(writer.image_complete(2));
+ CHECK(writer.image_complete(1));
+ CHECK(writer.image_complete(2));
  CHECK(server.requests() == 1);
  CHECK_FALSE(fs::exists(images / ".groups" / "group-000000.complete.json"));
  if (cancel) cancelled.store(true);
@@ -6437,7 +6708,6 @@ TEST_CASE("held warm image reads allow HTTP results and pixels to finish on one 
  }
  server.Check();
 }
-
 TEST_CASE("small-target warm cache inputs complete after simultaneous admission", "[backend][data][benchmark][images][pipeline]") {
  std::size_t descriptors = 13;
  SECTION("thirteen descriptors") {}
@@ -6456,7 +6726,9 @@ TEST_CASE("small-target warm cache inputs complete after simultaneous admission"
  NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  PreparedBenchmarkSplit split;
- split.name = "train"; split.class_names = {"person"}; split.sources = {{images}};
+ split.name = "train";
+ split.class_names = {"person"};
+ split.sources = {{images}};
  for (std::uint64_t id : {1U, 2U, 3U}) {
   index.images.push_back({.source_image_id = id});
   split.images.push_back({id, 16, 8, 0, 0, 0});
@@ -6475,10 +6747,15 @@ TEST_CASE("small-target warm cache inputs complete after simultaneous admission"
  std::array<std::atomic<unsigned>, 3> reads{};
  auto acquisition = std::async(std::launch::async, [&] {
   return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 4, {}, {}, &execution,
-   [](std::uint64_t) -> std::string { throw std::runtime_error("valid warm image unexpectedly requested HTTP"); },
-   [&](std::uint64_t id) { ++reads.at(id - 1); warm.receipt().ArriveAndWait(); });
+   [](std::uint64_t) -> std::string { throw std::runtime_error("valid warm image unexpectedly requested HTTP"); }, [&](std::uint64_t id) {
+   ++reads.at(id - 1);
+   warm.receipt().ArriveAndWait();
+  });
  });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); warm.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  warm.Release();
+ });
  REQUIRE(warm.WaitEntered(5s, 3));
  // Three old 64 KiB input grants occupied 192 KiB here, leaving no mapping
  // eligible. Release all three readers together against the same 256 KiB target.
@@ -6497,7 +6774,6 @@ TEST_CASE("small-target warm cache inputs complete after simultaneous admission"
  CHECK(proof.at("dimensions") == nlohmann::json::array({1, 16, 8, 2, 16, 8, 3, 16, 8}));
  if (writer) CHECK(CompiledDataset::open(request.output_path).header().num_images == 3);
 }
-
 TEST_CASE("deferred warm cache cancellation returns opened custody without waiting for byte pressure", "[backend][data][benchmark][images][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("open-images-deferred-cancel");
  const auto cache = BenchmarkCacheLayout::create(root.path());
@@ -6517,10 +6793,14 @@ TEST_CASE("deferred warm cache cancellation returns opened custody without waiti
  std::future<void> cpu;
  auto acquisition = std::async(std::launch::async, [&] {
   return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 4, {}, {}, &execution,
-   [](std::uint64_t) -> std::string { throw std::runtime_error("cancelled warm input unexpectedly requested HTTP"); },
-   [&](std::uint64_t id) { (id == 4 ? next : warm).receipt().ArriveAndWait(); });
+   [](std::uint64_t) -> std::string { throw std::runtime_error("cancelled warm input unexpectedly requested HTTP"); }, [&](std::uint64_t id) { (id == 4 ? next : warm).receipt().ArriveAndWait(); });
  });
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); warm.Release(); next.Release(); pressure.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  warm.Release();
+  next.Release();
+  pressure.Release();
+ });
  REQUIRE(warm.WaitEntered(5s, 3));
  cpu = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Metadata, {256U << 10, 0}, [&](std::size_t) { pressure.receipt().ArriveAndWait(); }); });
  REQUIRE(pressure.WaitEntered(5s));
@@ -6536,14 +6816,14 @@ TEST_CASE("deferred warm cache cancellation returns opened custody without waiti
  for (const auto& descriptor : fs::directory_iterator("/proc/self/fd")) {
   std::error_code error;
   const auto target = fs::read_symlink(descriptor.path(), error);
-  if (!error) for (std::uint64_t id : {1U, 2U, 3U}) CHECK(target != cached_image_path(images, id));
+  if (!error)
+   for (std::uint64_t id : {1U, 2U, 3U}) CHECK(target != cached_image_path(images, id));
  }
  CHECK_FALSE(execution.resource_pressure());
  pressure.Release();
  mmltk::testsupport::await_test_future(cpu, "independent shared CPU release");
  CHECK(execution.try_reserve({256U << 10, 16}).has_value());
 }
-
 TEST_CASE("deferred image input preserves its inspected inode and returns complete byte custody", "[backend][data][benchmark][images][pipeline]") {
  bool cancel = false;
  SECTION("replacement and unlink before admission") {}
@@ -6591,7 +6871,6 @@ TEST_CASE("deferred image input preserves its inspected inode and returns comple
  }
  CHECK(execution.try_reserve({256U << 10, 13}).has_value());
 }
-
 TEST_CASE("deferred mapped input exposes pressure to retained pixel scratch", "[backend][data][benchmark][images][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("deferred-image-idle-pixels");
  const auto images = root.path() / "images";
@@ -6603,7 +6882,10 @@ TEST_CASE("deferred mapped input exposes pressure to retained pixel scratch", "[
  REQUIRE(directory.get() >= 0);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 13});
  PreparedBenchmarkSplit split;
- split.name = "train"; split.class_names = {"person"}; split.sources = {{images}}; split.images = {{1, 16, 8, 0, 0, 0}};
+ split.name = "train";
+ split.class_names = {"person"};
+ split.sources = {{images}};
+ split.images = {{1, 16, 8, 0, 0, 0}};
  auto request = benchmark_write_request(split, root.path() / "pixels.bin", 64);
  request.execution = &execution;
  BenchmarkSplitWriter writer(request);
@@ -6626,7 +6908,6 @@ TEST_CASE("deferred mapped input exposes pressure to retained pixel scratch", "[
  CHECK_FALSE(execution.resource_pressure());
  CHECK(std::ranges::equal(payload->encoded(), jpeg));
 }
-
 TEST_CASE("batch workspace loans finish pixels and retire scratch before reader continuation", "[backend][data][benchmark][pipeline]") {
  bool fail = false, allocation_failure = false;
  SECTION("ordinary reader continuation") {}
@@ -6657,8 +6938,12 @@ TEST_CASE("batch workspace loans finish pixels and retire scratch before reader 
    if (fail) throw std::runtime_error("normalizer failed after independent pixels completed");
   });
  };
- if (allocation_failure) CHECK_THROWS_AS(window(), std::bad_alloc);
- else if (fail) CHECK_THROWS(window()); else window();
+ if (allocation_failure)
+  CHECK_THROWS_AS(window(), std::bad_alloc);
+ else if (fail)
+  CHECK_THROWS(window());
+ else
+  window();
  CHECK(writer.image_complete(0));
  CHECK(source.bytes() == target);
  // Reclaim has retired the borrower's real idle decoder/resizer capacity.
@@ -6667,10 +6952,10 @@ TEST_CASE("batch workspace loans finish pixels and retire scratch before reader 
  CHECK(execution.try_reserve({target, 0}));
  source.retire_descriptors();
  CHECK(descriptor_alias.descriptors() == 0);
- source = {}; descriptor_alias = {};
+ source = {};
+ descriptor_alias = {};
  CHECK(execution.try_reserve({target, 13}));
 }
-
 TEST_CASE("a workspace window retains its producing credits through callback unwind", "[backend][data][benchmark][pipeline]") {
  bool fail = false;
  SECTION("successful callback releases its last external allowance") {}
@@ -6687,12 +6972,13 @@ TEST_CASE("a workspace window retains its producing credits through callback unw
    if (fail) throw std::runtime_error("consumer retains its original failure");
   });
  };
- if (fail) CHECK_THROWS_WITH(consume(), "consumer retains its original failure");
- else consume();
+ if (fail)
+  CHECK_THROWS_WITH(consume(), "consumer retains its original failure");
+ else
+  consume();
  CHECK(input.capacity() == 0);
  CHECK(execution.try_reserve({64, 13}));
 }
-
 TEST_CASE("physical workspace retirement waits for CPU frames and the stable offer to settle", "[backend][data][benchmark][pipeline]") {
  bool fail = false, cancel = false;
  SECTION("completed CPU and input window") {}
@@ -6718,7 +7004,7 @@ TEST_CASE("physical workspace retirement waits for CPU frames and the stable off
     if (fail) throw std::runtime_error("deferred retirement consumer failed");
     if (cancel) cancelled.store(true);
    }, producer);
-   CHECK(alias.bytes() == target); // CPU ended; the stable input scope still owns its promise.
+   CHECK(alias.bytes() == target);  // CPU ended; the stable input scope still owns its promise.
   });
  });
  const mmltk::testsupport::ScopedTestCleanup settle([&] { retired.Release(); });
@@ -6726,16 +7012,19 @@ TEST_CASE("physical workspace retirement waits for CPU frames and the stable off
  CHECK_FALSE(execution.try_reserve({1, 0}));
  retired.Release();
  REQUIRE(work.wait_for(5s) == std::future_status::ready);
- if (fail) CHECK_THROWS_WITH(work.get(), "deferred retirement consumer failed");
- else if (cancel) CHECK_THROWS(work.get());
- else work.get();
+ if (fail)
+  CHECK_THROWS_WITH(work.get(), "deferred retirement consumer failed");
+ else if (cancel)
+  CHECK_THROWS(work.get());
+ else
+  work.get();
  cancelled.store(false);
- CHECK(alias.bytes() == 0); CHECK(alias.descriptors() == 1);
+ CHECK(alias.bytes() == 0);
+ CHECK(alias.descriptors() == 1);
  CHECK(execution.try_reserve({target, 12}));
  producer.retire_descriptors();
  CHECK(execution.try_reserve({target, 13}));
 }
-
 TEST_CASE("retiring a reader returns only its closed descriptors while descendants remain", "[backend][data][benchmark][pipeline]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 32, .descriptors = 13});
  auto parent = execution.reserve({0, 1, true, 0, true, 6});
@@ -6755,12 +7044,15 @@ TEST_CASE("retiring a reader returns only its closed descriptors while descendan
  CHECK_FALSE(execution.try_reserve({25, 0}));
  parent.retire_descriptors();
  CHECK(descendant.descriptors() == 2);
- replacement = {}; descendant = {}; reader = {}; alias = {}; parent = {};
+ replacement = {};
+ descendant = {};
+ reader = {};
+ alias = {};
+ parent = {};
  CHECK(execution.try_reserve({24, 13}));
  backing = {};
  CHECK(execution.try_reserve({32, 13}));
 }
-
 TEST_CASE("long JSON documents admit short chunks beside pixels on one CPU", "[backend][data][benchmark][annotations][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("bounded-json-chunks");
  const auto path = root.path() / "annotations.json";
@@ -6781,11 +7073,14 @@ TEST_CASE("long JSON documents admit short chunks beside pixels on one CPU", "[b
  mmltk::testsupport::TestGate chunk("first bounded annotation chunk");
  bool first = true, overlapped = false;
  AnnotationParseOptions options;
- options.source = BenchmarkDatasetSource::kCoco2017; options.split = "train"; options.execution = &execution;
+ options.source = BenchmarkDatasetSource::kCoco2017;
+ options.split = "train";
+ options.execution = &execution;
  options.trace = [&](std::string_view event, const nlohmann::json&) {
   if (event != "benchmark.annotations.workspace" || !std::exchange(first, false)) return;
   chunk.receipt().ArriveAndWait();
-  execution.cooperate(); execution.cooperate();
+  execution.cooperate();
+  execution.cooperate();
   overlapped = writer.image_complete(0);
  };
  const std::array<NumericCategoryMapping, 1> categories{{{1, 0, "person"}}};
@@ -6799,20 +7094,25 @@ TEST_CASE("long JSON documents admit short chunks beside pixels on one CPU", "[b
  CHECK(parsed.boxes.size() == 20000);
  CHECK(parsed.rejected.raw_records == 20000);
 }
-
 TEST_CASE("mapped normalized generations survive replacement and admit masks only when consumed", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("immutable-normalized-generation");
  const auto path = root.path() / "annotations.bin";
  NormalizedAnnotationBuilder builder;
- builder.split = "train"; builder.annotation_sha256 = std::string(64, 'a');
+ builder.split = "train";
+ builder.annotation_sha256 = std::string(64, 'a');
  builder.images.push_back({.source_image_id = 1, .first_box = 0, .box_count = 1, .width = 4, .height = 4});
  NormalizedBox box;
- box.x2 = box.y2 = 1; box.flags = kAnnotationMask | kAnnotationCategory; box.source_category_id = 1; box.mask_rle_pairs = 1;
- builder.boxes.push_back(box); builder.mask_rle_pairs.push_back({0, 16});
+ box.x2 = box.y2 = 1;
+ box.flags = kAnnotationMask | kAnnotationCategory;
+ box.source_category_id = 1;
+ box.mask_rle_pairs = 1;
+ builder.boxes.push_back(box);
+ builder.mask_rle_pairs.push_back({0, 16});
  auto product = fixture_index(builder);
  const auto proof = store_normalized_annotation_index(path, product, {});
  auto first = load_normalized_annotation_index(path, builder.source, builder.split, builder.annotation_sha256, {});
- REQUIRE(first); REQUIRE(first->completion);
+ REQUIRE(first);
+ REQUIRE(first->completion);
  for (const auto& descriptor : fs::directory_iterator("/proc/self/fd")) {
   std::error_code error;
   const auto target = fs::read_symlink(descriptor.path(), error);
@@ -6848,31 +7148,36 @@ TEST_CASE("mapped normalized generations survive replacement and admit masks onl
  CHECK_THROWS(admit_normalized_annotations(*metadata));
  CHECK(selected.storage().mask_rle_pairs.front().length == 16);
 }
-
 TEST_CASE("sparse full and empty COCO masks do not require a canvas", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("sparse-whole-mask");
  const auto path = root.path() / "annotations.json";
  constexpr std::uint32_t extent = 16000, pixels = extent * extent;
- const nlohmann::json document{{"images", {{{"id", 1}, {"width", extent}, {"height", extent}}}}, {"categories", {{{"id", 1}, {"name", "person"}}}},
+ const nlohmann::json document{
+  {"images", {{{"id", 1}, {"width", extent}, {"height", extent}}}}, {"categories", {{{"id", 1}, {"name", "person"}}}},
   {"annotations", {{{"id", 1}, {"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, extent, extent}}, {"segmentation", {{"size", {extent, extent}}, {"counts", {0, pixels}}}}},
-                   {{"id", 2}, {"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, extent, extent}}, {"segmentation", {{"size", {extent, extent}}, {"counts", {pixels}}}}}}}};
+                   {{"id", 2}, {"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, extent, extent}}, {"segmentation", {{"size", {extent, extent}}, {"counts", {pixels}}}}}}}
+ };
  write_text(path, document.dump());
  const std::array<NumericCategoryMapping, 1> categories{{{1, 0, "person"}}};
- AnnotationParseOptions options; options.split = "train";
+ AnnotationParseOptions options;
+ options.split = "train";
  const auto result = parse_coco_style_annotations(path, std::string(64, 'a'), categories, options);
- REQUIRE(result.boxes.size() == 2); REQUIRE(result.mask_rle_pairs.size() == 1);
- CHECK(result.mask_rle_pairs[0].start == 0); CHECK(result.mask_rle_pairs[0].length == pixels);
- CHECK(result.boxes[0].mask_rle_pairs == 1); CHECK(result.boxes[1].mask_rle_pairs == 0);
+ REQUIRE(result.boxes.size() == 2);
+ REQUIRE(result.mask_rle_pairs.size() == 1);
+ CHECK(result.mask_rle_pairs[0].start == 0);
+ CHECK(result.mask_rle_pairs[0].length == pixels);
+ CHECK(result.boxes[0].mask_rle_pairs == 1);
+ CHECK(result.boxes[1].mask_rle_pairs == 0);
  CHECK((result.boxes[1].flags & kAnnotationMask) != 0);
 }
-
 TEST_CASE("concurrent reader offers join a live pixel loan on cancellation", "[backend][data][benchmark][pipeline]") {
  bool cancel = false;
  SECTION("two readers reclaim together") {}
  SECTION("cancel while a pixel owns both offers") { cancel = true; }
  mmltk::testsupport::ScopedTempDir root("concurrent-workspace-offers");
  const auto images = root.path() / "images";
- auto split = cached_pixel_membership(images); split.images = {{1, 16, 8, 0, 0, 0}};
+ auto split = cached_pixel_membership(images);
+ split.images = {{1, 16, 8, 0, 0, 0}};
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  constexpr auto target = 256ULL << 20;
@@ -6887,37 +7192,47 @@ TEST_CASE("concurrent reader offers join a live pixel loan on cancellation", "[b
  BenchmarkCompilePipeline::Attempt attempt(execution);
  execution.register_split(writer, split);
  std::future<void> first, second;
- const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); first_window.Release(); second_window.Release(); pixels.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  cancelled.store(true);
+  first_window.Release();
+  second_window.Release();
+  pixels.Release();
+ });
  first = std::async(std::launch::async, [&] { execution.with_unused_workspace(first_reader, 1U << 20, [&] { first_window.receipt().ArriveAndWait(); }); });
  second = std::async(std::launch::async, [&] { execution.with_unused_workspace(second_reader, 1U << 20, [&] { second_window.receipt().ArriveAndWait(); }); });
- REQUIRE(first_window.WaitEntered(5s)); REQUIRE(second_window.WaitEntered(5s));
+ REQUIRE(first_window.WaitEntered(5s));
+ REQUIRE(second_window.WaitEntered(5s));
  CHECK_FALSE(execution.try_reserve({1, 0, true}));
  execution.source_publication(images, {})({1, {}, true});
  REQUIRE(pixels.WaitEntered(5s));
  if (cancel) cancelled.store(true);
- first_window.Release(); second_window.Release();
+ first_window.Release();
+ second_window.Release();
  CHECK(first.wait_for(0ms) == std::future_status::timeout);
  CHECK(second.wait_for(0ms) == std::future_status::timeout);
  pixels.Release();
  if (cancel) {
-  REQUIRE(first.wait_for(5s) == std::future_status::ready); CHECK_THROWS(first.get());
-  REQUIRE(second.wait_for(5s) == std::future_status::ready); CHECK_THROWS(second.get());
+  REQUIRE(first.wait_for(5s) == std::future_status::ready);
+  CHECK_THROWS(first.get());
+  REQUIRE(second.wait_for(5s) == std::future_status::ready);
+  CHECK_THROWS(second.get());
  } else {
   mmltk::testsupport::await_test_future(first, "first reader reclaims physical pixel scratch", 5s);
   mmltk::testsupport::await_test_future(second, "second reader reclaims physical pixel scratch", 5s);
   CHECK(writer.image_complete(0));
-  first_reader.retire_workspace(); second_reader.retire_workspace();
+  first_reader.retire_workspace();
+  second_reader.retire_workspace();
   CHECK(execution.try_reserve({target, 0}));
  }
 }
-
 TEST_CASE("a zero-byte workspace offer keeps its scope without joining a live pixel loan", "[backend][data][benchmark][pipeline]") {
  bool fail = false;
  SECTION("zero-capacity window returns while positive loan stays active") {}
  SECTION("zero-capacity callback failure keeps its original exception") { fail = true; }
  mmltk::testsupport::ScopedTempDir root("zero-workspace-offer");
  const auto images = root.path() / "images";
- auto split = cached_pixel_membership(images); split.images = {{1, 16, 8, 0, 0, 0}};
+ auto split = cached_pixel_membership(images);
+ split.images = {{1, 16, 8, 0, 0, 0}};
  constexpr auto target = 256ULL << 20;
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = target, .descriptors = 13});
  std::vector<std::uint8_t> positive_storage(1U << 20, 0x7a), zero_storage(64U << 10, 0x3b);
@@ -6929,12 +7244,15 @@ TEST_CASE("a zero-byte workspace offer keeps its scope without joining a live pi
  request.execution = &execution;
  request.progress = {.context = &pixels, .image_completed = [](void* value) { static_cast<mmltk::testsupport::TestGate*>(value)->receipt().ArriveAndWait(); }};
  BenchmarkSplitWriter writer(request);
- BenchmarkCompilePipeline::Attempt attempt(execution); execution.register_split(writer, split);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
  std::future<void> positive_call, zero_call;
- const mmltk::testsupport::ScopedTestCleanup settle([&] { positive_window.Release(); zero_window.Release(); pixels.Release(); });
- positive_call = std::async(std::launch::async, [&] {
-  execution.with_unused_workspace(positive, positive_storage.capacity(), [&] { positive_window.receipt().ArriveAndWait(); });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  positive_window.Release();
+  zero_window.Release();
+  pixels.Release();
  });
+ positive_call = std::async(std::launch::async, [&] { execution.with_unused_workspace(positive, positive_storage.capacity(), [&] { positive_window.receipt().ArriveAndWait(); }); });
  zero_call = std::async(std::launch::async, [&] {
   execution.with_unused_workspace(zero, zero_storage.capacity(), [&] {
    CHECK_THROWS(execution.with_unused_workspace(alias, alias.bytes(), [] {}));
@@ -6944,16 +7262,19 @@ TEST_CASE("a zero-byte workspace offer keeps its scope without joining a live pi
    if (fail) throw std::runtime_error("zero-capacity consumer failed");
   });
  });
- REQUIRE(positive_window.WaitEntered(5s)); REQUIRE(zero_window.WaitEntered(5s));
+ REQUIRE(positive_window.WaitEntered(5s));
+ REQUIRE(zero_window.WaitEntered(5s));
  execution.source_publication(images, {})({1, {}, true});
  REQUIRE(pixels.WaitEntered(5s));
  zero_window.Release();
  REQUIRE(zero_call.wait_for(5s) == std::future_status::ready);
- if (fail) CHECK_THROWS_WITH(zero_call.get(), "zero-capacity consumer failed");
- else zero_call.get();
+ if (fail)
+  CHECK_THROWS_WITH(zero_call.get(), "zero-capacity consumer failed");
+ else
+  zero_call.get();
  CHECK(std::ranges::all_of(zero_storage, [](auto byte) { return byte == 0x3b; }));
  CHECK(alias.bytes() == zero_storage.capacity());
- CHECK(alias.try_resize_workspace(alias.bytes())); // Scope sentinel has retired.
+ CHECK(alias.try_resize_workspace(alias.bytes()));  // Scope sentinel has retired.
  positive_window.Release();
  CHECK(positive_call.wait_for(0ms) == std::future_status::timeout);
  pixels.Release();
@@ -6962,26 +7283,29 @@ TEST_CASE("a zero-byte workspace offer keeps its scope without joining a live pi
  CHECK(std::ranges::all_of(positive_storage, [](auto byte) { return byte == 0x7a; }));
  std::vector<std::uint8_t>().swap(positive_storage);
  std::vector<std::uint8_t>().swap(zero_storage);
- positive.retire_workspace(); zero.retire_workspace();
- CHECK(alias.bytes() == 0); CHECK(alias.descriptors() == 1);
+ positive.retire_workspace();
+ zero.retire_workspace();
+ CHECK(alias.bytes() == 0);
+ CHECK(alias.descriptors() == 1);
  CHECK(execution.try_reserve({target, 11}));
- positive.retire_descriptors(); zero.retire_descriptors();
+ positive.retire_descriptors();
+ zero.retire_descriptors();
  CHECK(execution.try_reserve({target, 13}));
 }
-
 TEST_CASE("Open Images class fields retain escaped text beyond four quoted columns", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("open-images-quoted-fields");
  const auto classes = root.path() / "classes.csv", boxes = root.path() / "boxes.csv";
  write_text(classes, "\"/m/person\",\"Person\",\"one\",\"two\",\"three\",\"four\"\"five\"\n");
  write_text(boxes, "ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax,IsOccluded,IsTruncated,IsGroupOf\n0000000000000001,x,/m/person,1,0,1,0,1,0,0,0\n");
  const std::array<StringCategoryMapping, 1> mappings{{{"/m/person", 0, "person"}}};
- AnnotationParseOptions options; options.split = "train";
+ AnnotationParseOptions options;
+ options.split = "train";
  const auto result = parse_open_images_annotations(boxes, classes, std::string(64, 'a'), mappings, options);
- REQUIRE(result.images.size() == 1); REQUIRE(result.boxes.size() == 1);
+ REQUIRE(result.images.size() == 1);
+ REQUIRE(result.boxes.size() == 1);
  CHECK(result.images[0].source_image_id == 1);
  CHECK(result.boxes[0].source_ordinal == std::string_view("ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax,IsOccluded,IsTruncated,IsGroupOf\n").size());
 }
-
 TEST_CASE("progressive JSON semantics precede unrelated envelope tails", "[backend][data][benchmark][annotations][pipeline]") {
  bool reversed = false, malformed = false, cancel = false;
  SECTION("ordered arrays and valid tail") {}
@@ -6997,40 +7321,46 @@ TEST_CASE("progressive JSON semantics precede unrelated envelope tails", "[backe
  const auto prefix = "{" + (reversed ? annotations + "," + images + "," + categories : categories + "," + images + "," + annotations);
  write_text(path, prefix + ",\"tail\":\"" + std::string(2U << 20, 'x') + (malformed ? "" : "\"}"));
  const auto image_root = root.path() / "images";
- auto split = cached_pixel_membership(image_root); split.images = {{1, 16, 8, 0, 0, 0}};
+ auto split = cached_pixel_membership(image_root);
+ split.images = {{1, 16, 8, 0, 0, 0}};
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13}, cancellation);
- auto output = benchmark_write_request(split, root.path() / "pixels.bin", 8); output.execution = &execution;
+ auto output = benchmark_write_request(split, root.path() / "pixels.bin", 8);
+ output.execution = &execution;
  BenchmarkSplitWriter writer(output);
- BenchmarkCompilePipeline::Attempt attempt(execution); execution.register_split(writer, split);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
  bool visited = false, pixels_ready = false;
  AnnotationParseOptions options;
- options.split = "train"; options.execution = &execution; options.cancel_requested = cancellation;
+ options.split = "train";
+ options.execution = &execution;
+ options.cancel_requested = cancellation;
  options.trace = [&](std::string_view event, const nlohmann::json&) {
   if (event != "benchmark.annotations.workspace" || std::exchange(visited, true)) return;
   execution.source_publication(image_root, {})({1, {}, true});
-  execution.cooperate(); execution.cooperate();
+  execution.cooperate();
+  execution.cooperate();
   pixels_ready = writer.image_complete(0);
   if (cancel) cancelled.store(true);
  };
  const std::array<NumericCategoryMapping, 1> mappings{{{1, 0, "person"}}};
- if (malformed || cancel) CHECK_THROWS(parse_coco_style_annotations(path, std::string(64, 'a'), mappings, options));
+ if (malformed || cancel)
+  CHECK_THROWS(parse_coco_style_annotations(path, std::string(64, 'a'), mappings, options));
  else {
   const auto parsed = parse_coco_style_annotations(path, std::string(64, 'a'), mappings, options);
   REQUIRE(parsed.boxes.size() == 1);
   CHECK(parsed.boxes[0].source_ordinal == prefix.find(row));
   CHECK(parsed.boxes[0].original_area == 4);
  }
- CHECK(visited); CHECK(pixels_ready);
+ CHECK(visited);
+ CHECK(pixels_ready);
 }
-
 TEST_CASE("sparse annotation bounds and area retain normalized and compiled meaning", "[benchmark][annotations][masks][writer]") {
  mmltk::testsupport::ScopedTempDir root("sparse-mask-facts");
  nlohmann::json rows = nlohmann::json::array();
  for (unsigned kind = 0; kind != 4; ++kind) {
-  nlohmann::json row{{"id", kind}, {"image_id", 1}, {"category_id", 1},
-   {"segmentation", {{"size", {8, 16}}, {"counts", {9, 2, 6, 2, 109}}}}};
+  nlohmann::json row{{"id", kind}, {"image_id", 1}, {"category_id", 1}, {"segmentation", {{"size", {8, 16}}, {"counts", {9, 2, 6, 2, 109}}}}};
   if (kind & 1U) row["area"] = 7.25;
   if (kind & 2U) row["bbox"] = {1, 1, 2, 2};
   rows.push_back(std::move(row));
@@ -7041,7 +7371,9 @@ TEST_CASE("sparse annotation bounds and area retain normalized and compiled mean
  const auto index = parse_coco_style_annotations(path, "sparse-facts", categories, {.split = "train"});
  REQUIRE(index.boxes.size() == 4);
  PreparedBenchmarkSplit split;
- split.name = "train"; split.class_names = {"person"}; split.sources = {{root.path() / "images"}};
+ split.name = "train";
+ split.class_names = {"person"};
+ split.sources = {{root.path() / "images"}};
  split.images = {{1, 16, 8, 0, 4, 0, AnnotationSource::Coco}};
  prepare_cached_image_directory(split.sources[0].root);
  BenchmarkEncodedImage::publish(cached_image_path(split.sources[0].root, 1), make_jpeg(10, 20, 30), {});
@@ -7049,11 +7381,16 @@ TEST_CASE("sparse annotation bounds and area retain normalized and compiled mean
  dataset::MaskResizeScratch scratch;
  for (const auto& box : index.boxes) {
   CHECK(box.original_area == (box.annotation_id & 1U ? 7.25 : 4.0));
-  CHECK(box.x1 == 1.0F / 16); CHECK(box.y1 == 1.0F / 8);
-  CHECK(box.x2 == 3.0F / 16); CHECK(box.y2 == 3.0F / 8);
+  CHECK(box.x1 == 1.0F / 16);
+  CHECK(box.y1 == 1.0F / 8);
+  CHECK(box.x2 == 3.0F / 16);
+  CHECK(box.y2 == 3.0F / 8);
   auto label = benchmark_canvas_box(box.class_id, box.x1, box.y1, box.x2, box.y2, geometry);
-  label.flags = box.flags; label.original_area = box.original_area; label.annotation_id = box.annotation_id;
-  label.source_category_id = box.source_category_id; label.source_ordinal = box.source_ordinal;
+  label.flags = box.flags;
+  label.original_area = box.original_area;
+  label.annotation_id = box.annotation_id;
+  label.source_category_id = box.source_category_id;
+  label.source_ordinal = box.source_ordinal;
   const auto first = split.rle_pairs.size();
   (void)dataset::append_resized_row_major_mask(index.mask_rle_pairs.subspan(box.mask_rle_offset, box.mask_rle_pairs), {16, 8}, {16, 16}, geometry, &scratch, split.rle_pairs);
   label.mask_rle_offset = first * sizeof(RLEPair);
@@ -7061,16 +7398,22 @@ TEST_CASE("sparse annotation bounds and area retain normalized and compiled mean
   split.labels.push_back(label);
  }
  const auto output = root.path() / "compiled.bin";
- write_benchmark_split({.split = split, .output_path = output, .resolution = 16, .num_workers = 1,
-  .resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch});
+ write_benchmark_split({.split = split, .output_path = output, .resolution = 16, .num_workers = 1, .resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch});
  const auto compiled = CompiledDataset::open(output);
  REQUIRE(compiled.labels().size() == 4);
  for (const auto& label : compiled.labels()) {
   CHECK(label.original_area == (label.annotation_id & 1U ? 7.25 : 4.0));
-  CHECK(label.bbox_x1 == 1); CHECK(label.bbox_y1 == 2); CHECK(label.bbox_x2 == 3); CHECK(label.bbox_y2 == 6);
+  CHECK(label.bbox_x1 == 1.0F);
+  CHECK(label.bbox_y1 == 2.0F);
+  CHECK(label.bbox_x2 == 3.0F);
+  CHECK(label.bbox_y2 == 6.0F);
   std::uint64_t area = 0;
   const auto bounds = dataset::row_major_mask_bounds(compiled.instance_rle(label), {16, 16}, &area);
-  CHECK(area == 8); CHECK(bounds.min_x == 1); CHECK(bounds.min_y == 2); CHECK(bounds.max_x == 3); CHECK(bounds.max_y == 6);
+  CHECK(area == 8);
+  CHECK(bounds.min_x == 1);
+  CHECK(bounds.min_y == 2);
+  CHECK(bounds.max_x == 3);
+  CHECK(bounds.max_y == 6);
  }
  std::uint64_t empty_area = 99;
  CHECK_FALSE(dataset::row_major_mask_bounds({}, {16, 8}, &empty_area).has_foreground);
@@ -7078,15 +7421,15 @@ TEST_CASE("sparse annotation bounds and area retain normalized and compiled mean
  const std::array<RLEPair, 1> malformed{{{127, 2}}};
  CHECK_THROWS(dataset::row_major_mask_bounds(malformed, {16, 8}, &empty_area));
 }
-
 TEST_CASE("settled workspace resize preserves aliases descendants and oversized continuation", "[benchmark][pipeline][resources]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13});
  auto producer = execution.reserve({200ULL << 20, 1, false, 0, false, 2});
  const auto alias = producer;
  auto storage = producer.split_storage(64ULL << 20);
  auto handles = execution.reserve(BenchmarkResources::handles(1), producer);
- CHECK(producer.aliases(alias)); CHECK_FALSE(producer.aliases(storage));
- CHECK_FALSE(producer.try_resize_workspace(256ULL << 20)); // The live child is independent storage.
+ CHECK(producer.aliases(alias));
+ CHECK_FALSE(producer.aliases(storage));
+ CHECK_FALSE(producer.try_resize_workspace(256ULL << 20));  // The live child is independent storage.
  CHECK(producer.bytes() == 136ULL << 20);
  REQUIRE(producer.try_resize_workspace(128ULL << 20));
  auto independent = execution.try_reserve({64ULL << 20, 0});
@@ -7094,12 +7437,15 @@ TEST_CASE("settled workspace resize preserves aliases descendants and oversized 
  CHECK_FALSE(producer.try_resize_workspace(192ULL << 20));
  independent.reset();
  storage = {};
- REQUIRE(producer.try_resize_workspace(512ULL << 20)); // One legal oversized lineage.
+ REQUIRE(producer.try_resize_workspace(512ULL << 20));  // One legal oversized lineage.
  CHECK(alias.bytes() == 512ULL << 20);
  std::promise<void> entered, release;
  auto released = release.get_future();
  auto active = std::async(std::launch::async, [&] {
-  execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) { entered.set_value(); released.wait(); }, alias);
+  execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) {
+   entered.set_value();
+   released.wait();
+  }, alias);
  });
  const mmltk::testsupport::ScopedTestCleanup settle([&] { mmltk::testsupport::release_test_promise(release); });
  mmltk::testsupport::await_test_promise(entered, "active alias CPU frame");
@@ -7116,7 +7462,6 @@ TEST_CASE("settled workspace resize preserves aliases descendants and oversized 
  producer.retire_workspace();
  CHECK(execution.try_reserve({256ULL << 20, 13}));
 }
-
 TEST_CASE("two failed workspace upgrades retire before complete one CPU reacquisition", "[benchmark][pipeline][resources]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13});
  auto first = execution.reserve({128ULL << 20, 1});
@@ -7125,9 +7470,12 @@ TEST_CASE("two failed workspace upgrades retire before complete one CPU reacquis
  const auto first_ready = first_failed.get_future().share(), second_ready = second_failed.get_future().share();
  const auto upgrade = [&](BenchmarkAllowance allowance, std::promise<void>& failed, const std::shared_future<void>& other) {
   const bool grew = allowance.try_resize_workspace(192ULL << 20);
-  failed.set_value(); other.wait();
+  failed.set_value();
+  other.wait();
   if (grew) throw std::runtime_error("simultaneous retained upgrade exceeded target");
-  allowance.retire_descriptors(); allowance.retire_workspace(); allowance = {};
+  allowance.retire_descriptors();
+  allowance.retire_workspace();
+  allowance = {};
   auto complete = execution.reserve({192ULL << 20, 1});
   execution.run(BenchmarkStage::Normalize, {}, [](std::size_t) {}, complete);
  };
@@ -7137,7 +7485,6 @@ TEST_CASE("two failed workspace upgrades retire before complete one CPU reacquis
  mmltk::testsupport::await_test_future(b, "second complete upgrade");
  CHECK(execution.try_reserve({256ULL << 20, 13}));
 }
-
 TEST_CASE("source parser workspace reuses charged capacity and yields under an unrelated scanner", "[benchmark][pipeline][annotations][resources]") {
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256ULL << 20, .descriptors = 13});
  simdjson::ondemand::parser parser;
@@ -7145,7 +7492,10 @@ TEST_CASE("source parser workspace reuses charged capacity and yields under an u
  const auto text = simdjson::padded_string(std::string_view{R"({"value":"retained"})"});
  const auto demand = [](std::size_t) { return BenchmarkResources{192ULL << 20, 0}; };
  {
-  BenchmarkCompilePipeline::Workspace workspace(execution, [&](std::size_t) noexcept { parser = {}; ++retirements; });
+  BenchmarkCompilePipeline::Workspace workspace(execution, [&](std::size_t) noexcept {
+   parser = simdjson::ondemand::parser{};
+   ++retirements;
+  });
   const auto parse = [&](std::size_t) {
    auto document = parser.iterate(text);
    const std::string_view value = document["value"].get_string().value();
@@ -7165,8 +7515,9 @@ TEST_CASE("source parser workspace reuses charged capacity and yields under an u
   const auto proceed = release.get_future();
   auto scanner = std::async(std::launch::async, [&] {
    execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) {
-    entered.set_value(); proceed.wait();
-    execution.cooperate(); // Idle parser identity differs from this live frame.
+    entered.set_value();
+    proceed.wait();
+    execution.cooperate();  // Idle parser identity differs from this live frame.
     CHECK(parser.capacity() == 0);
    });
   });
@@ -7190,7 +7541,6 @@ TEST_CASE("source parser workspace reuses charged capacity and yields under an u
  CHECK(parser.capacity() == 0);
  CHECK(execution.try_reserve({256ULL << 20, 13}));
 }
-
 TEST_CASE("source parser workspace retires nested borrowing and failed groups before source destruction", "[benchmark][pipeline][annotations][resources]") {
  bool fail = false, cancel = false;
  SECTION("distinct nested parser preserves the outer borrowed string") {}
@@ -7204,8 +7554,14 @@ TEST_CASE("source parser workspace retires nested borrowing and failed groups be
  const auto text = simdjson::padded_string(std::string_view{R"({"value":"outer borrowed value"})"});
  const auto demand = [](std::size_t) { return BenchmarkResources{1ULL << 20, 0}; };
  {
-  BenchmarkCompilePipeline::Workspace outer_workspace(execution, [&](std::size_t) noexcept { outer = {}; ++outer_retirements; });
-  BenchmarkCompilePipeline::Workspace inner_workspace(execution, [&](std::size_t) noexcept { inner = {}; ++inner_retirements; });
+  BenchmarkCompilePipeline::Workspace outer_workspace(execution, [&](std::size_t) noexcept {
+   outer = simdjson::ondemand::parser{};
+   ++outer_retirements;
+  });
+  BenchmarkCompilePipeline::Workspace inner_workspace(execution, [&](std::size_t) noexcept {
+   inner = simdjson::ondemand::parser{};
+   ++inner_retirements;
+  });
   const auto consume = [&] {
    execution.for_each(BenchmarkStage::Metadata, 1, demand, [&](std::size_t) {
     auto document = outer.iterate(text);
@@ -7221,14 +7577,16 @@ TEST_CASE("source parser workspace retires nested borrowing and failed groups be
     if (cancel) cancelled.store(true);
    }, outer_workspace);
   };
-  if (fail || cancel) CHECK_THROWS(consume()); else consume();
+  if (fail || cancel)
+   CHECK_THROWS(consume());
+  else
+   consume();
  }
  CHECK(inner_retirements == 1);
  CHECK(outer_retirements == 1);
  CHECK(outer.capacity() == 0);
  CHECK(inner.capacity() == 0);
 }
-
 TEST_CASE("native label readiness and physical pixels settle independently", "[backend][data][benchmark][pipeline][labels]") {
  using namespace std::chrono_literals;
  bool hold_labels = false, cancel_after_labels = false;
@@ -7252,15 +7610,22 @@ TEST_CASE("native label readiness and physical pixels settle independently", "[b
  NormalizedAnnotationBuilder builder;
  builder.images.push_back({1, 0, 1, 16, 8, 0, 0});
  NormalizedBox box;
- box.x2 = box.y2 = 1; box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory; box.annotation_id = 4; box.source_category_id = 1;
- box.mask_rle_pairs = 1; box.original_area = 128;
- builder.boxes.push_back(box); builder.mask_rle_pairs.push_back({0, 128});
+ box.x2 = box.y2 = 1;
+ box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory;
+ box.annotation_id = 4;
+ box.source_category_id = 1;
+ box.mask_rle_pairs = 1;
+ box.original_area = 128;
+ builder.boxes.push_back(box);
+ builder.mask_rle_pairs.push_back({0, 128});
  const NormalizedAnnotationReadView index(fixture_index(builder));
  mmltk::testsupport::TestGate held("one independent image product");
  auto delayed = std::async(std::launch::async, [&] {
   held.receipt().ArriveAndWait();
-  if (hold_labels) execution.labels_ready(physical, 1, BenchmarkLabelInput(index, 0), "annotations/originals-1", 1);
-  else CHECK(physical.consume({1}));
+  if (hold_labels)
+   execution.labels_ready(physical, 1, BenchmarkLabelInput(index, 0), "annotations/originals-1", 1);
+  else
+   CHECK(physical.consume({1}));
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); });
  REQUIRE(held.WaitEntered(5s));
@@ -7286,8 +7651,11 @@ TEST_CASE("native label readiness and physical pixels settle independently", "[b
  held.Release();
  mmltk::testsupport::await_test_future(delayed, "independent label and pixel products");
  const auto labels = execution.wait_image_labels(images, 1, "annotations/originals-1");
- REQUIRE(labels); REQUIRE(labels->labels.size() == 1); REQUIRE(labels->runs.size() == 1);
- CHECK(labels->runs[0].start == 0); CHECK(labels->runs[0].length == 64);
+ REQUIRE(labels);
+ REQUIRE(labels->labels.size() == 1);
+ REQUIRE(labels->runs.size() == 1);
+ CHECK(labels->runs[0].start == 0);
+ CHECK(labels->runs[0].length == 64);
  CHECK(labels->labels[0].original_area == 128);
  CHECK(writer.image_complete(0));
  // Original withdrawal does not withdraw physical geometry or completed pixels.
@@ -7295,7 +7663,8 @@ TEST_CASE("native label readiness and physical pixels settle independently", "[b
  execution.original_generation(images, 2, true);
  execution.labels_ready(physical, 1, BenchmarkLabelInput(index, 0), "annotations/originals-1", 1);
  CHECK_FALSE(execution.image_labels(images, 1, "annotations/originals-1"));
- REQUIRE(execution.geometry(images, 1)); CHECK(writer.image_complete(0));
+ REQUIRE(execution.geometry(images, 1));
+ CHECK(writer.image_complete(0));
  execution.labels_ready(physical, 1, BenchmarkLabelInput(index, 0), "annotations/originals-2", 2);
  REQUIRE(execution.wait_image_labels(images, 1, "annotations/originals-2"));
  // A late label task cannot attach its old physical ticket to a replacement.
@@ -7314,12 +7683,14 @@ TEST_CASE("native label readiness and physical pixels settle independently", "[b
  const NormalizedAnnotationReadView added(fixture_index(builder));
  const auto added_publication = execution.source_publication(images, {}, 2);
  auto unselected = std::async(std::launch::async, [&] { execution.labels_ready(added_publication, 2, BenchmarkLabelInput(added, 0), "added-membership", 2); });
- const mmltk::testsupport::ScopedTestCleanup retire([&] { cancelled.store(true); execution.notify_admission_change(); });
+ const mmltk::testsupport::ScopedTestCleanup retire([&] {
+  cancelled.store(true);
+  execution.notify_admission_change();
+ });
  mmltk::testsupport::await_test_future(unselected, "new annotation membership yields to placement restart");
  CHECK_FALSE(execution.geometry(images, 2));
  CHECK_FALSE(execution.image_labels(images, 2, "added-membership"));
 }
-
 TEST_CASE("settled continuation retirement preserves open descriptors and upstream promises", "[benchmark][pipeline][resources]") {
  BenchmarkCompilePipeline execution(1, {}, {.descriptors = 13});
  auto source = execution.reserve(BenchmarkResources::handles(1, true, 4));
@@ -7329,61 +7700,79 @@ TEST_CASE("settled continuation retirement preserves open descriptors and upstre
  CHECK(producer.descriptors() == 1);
  child = {};
  producer.retire_continuation();
- CHECK(producer.descriptors() == 1); CHECK(source.descriptors() == 1);
- { auto restored = execution.try_reserve(BenchmarkResources::handles(3), source); REQUIRE(restored); }
- CHECK_THROWS_AS(source.retire_continuation(), std::logic_error); // Producer's actual descriptor still borrows one slot.
+ CHECK(producer.descriptors() == 1);
+ CHECK(source.descriptors() == 1);
+ {
+  auto restored = execution.try_reserve(BenchmarkResources::handles(3), source);
+  REQUIRE(restored);
+ }
+ CHECK_THROWS_AS(source.retire_continuation(), std::logic_error);  // Producer's actual descriptor still borrows one slot.
  producer.retire_descriptors();
  source.retire_continuation();
  CHECK(source.descriptors() == 1);
- { auto free = execution.try_reserve(BenchmarkResources::handles(12)); REQUIRE(free); }
+ {
+  auto free = execution.try_reserve(BenchmarkResources::handles(12));
+  REQUIRE(free);
+ }
  source.retire_descriptors();
  CHECK(execution.try_reserve(BenchmarkResources::handles(13)));
 }
-
 TEST_CASE("constant polygon slabs preserve full clipped and empty rectangular support", "[benchmark][annotations][masks]") {
  mmltk::testsupport::ScopedTempDir root("polygon-constant-slabs");
  const auto path = root.path() / "annotations.json";
  constexpr std::uint32_t extent = 16000;
- const nlohmann::json polygons = nlohmann::json::array({
-  nlohmann::json::array({-5.0, -5.0, 17000.0, -5.0, 17000.0, 17000.0, -5.0, 17000.0}),
-  nlohmann::json::array({-8.0, 0.0, -2.0, 0.0, -2.0, 16000.0, -8.0, 16000.0}),
-  nlohmann::json::array({0.0, 0.0, 16000.0, 0.0, 16000.0, 8000.0, 0.0, 8000.0}),
-  nlohmann::json::array({0.0, 8000.0, 16000.0, 8000.0, 16000.0, 16000.0, 0.0, 16000.0})});
+ const nlohmann::json polygons = nlohmann::json::array(
+  {nlohmann::json::array({-5.0, -5.0, 17000.0, -5.0, 17000.0, 17000.0, -5.0, 17000.0}), nlohmann::json::array({-8.0, 0.0, -2.0, 0.0, -2.0, 16000.0, -8.0, 16000.0}),
+   nlohmann::json::array({0.0, 0.0, 16000.0, 0.0, 16000.0, 8000.0, 0.0, 8000.0}), nlohmann::json::array({0.0, 8000.0, 16000.0, 8000.0, 16000.0, 16000.0, 0.0, 16000.0})});
  nlohmann::json annotations = nlohmann::json::array();
  for (std::size_t i = 0; i < polygons.size(); ++i)
   annotations.push_back({{"id", i + 1}, {"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, extent, extent}}, {"segmentation", nlohmann::json::array({polygons[i]})}});
  write_text(path, nlohmann::json{{"images", {{{"id", 1}, {"width", extent}, {"height", extent}}}}, {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", annotations}}.dump());
  const std::array<NumericCategoryMapping, 1> categories{{{1, 0, "person"}}};
- AnnotationParseOptions options; options.split = "train";
+ AnnotationParseOptions options;
+ options.split = "train";
  const auto result = parse_coco_style_annotations(path, std::string(64, 'a'), categories, options);
- REQUIRE(result.boxes.size() == 4); REQUIRE(result.mask_rle_pairs.size() == 3);
- CHECK(result.mask_rle_pairs[0].start == 0); CHECK(result.mask_rle_pairs[0].length == extent * extent);
- CHECK(result.boxes[0].mask_rle_pairs == 1); CHECK(result.boxes[1].mask_rle_pairs == 0);
+ REQUIRE(result.boxes.size() == 4);
+ REQUIRE(result.mask_rle_pairs.size() == 3);
+ CHECK(result.mask_rle_pairs[0].start == 0);
+ CHECK(result.mask_rle_pairs[0].length == extent * extent);
+ CHECK(result.boxes[0].mask_rle_pairs == 1);
+ CHECK(result.boxes[1].mask_rle_pairs == 0);
  CHECK((result.boxes[1].flags & kAnnotationMask) != 0);
- CHECK(result.mask_rle_pairs[1].start == 0); CHECK(result.mask_rle_pairs[1].length == extent * 8000);
- CHECK(result.mask_rle_pairs[2].start == extent * 8000); CHECK(result.mask_rle_pairs[2].length == extent * 8000);
- CHECK(result.boxes[2].mask_rle_pairs == 1); CHECK(result.boxes[3].mask_rle_pairs == 1);
+ CHECK(result.mask_rle_pairs[1].start == 0);
+ CHECK(result.mask_rle_pairs[1].length == extent * 8000);
+ CHECK(result.mask_rle_pairs[2].start == extent * 8000);
+ CHECK(result.mask_rle_pairs[2].length == extent * 8000);
+ CHECK(result.boxes[2].mask_rle_pairs == 1);
+ CHECK(result.boxes[3].mask_rle_pairs == 1);
 }
-
-
 namespace {
 NormalizedAnnotationReadView label_projection_fixture(std::uint64_t id, std::uint32_t width = 8) {
  NormalizedAnnotationBuilder builder;
  builder.images.push_back({id, 0, 1, width, 2, 0, 0});
  NormalizedBox box;
- box.x2 = box.y2 = 1; box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory;
- box.annotation_id = id + 100; box.source_category_id = 1; box.source_ordinal = id * 3;
- box.original_area = 3; box.mask_rle_pairs = 3;
- builder.boxes.push_back(box); builder.mask_rle_pairs = {{0, 1}, {2, 1}, {4, 1}};
+ box.x2 = box.y2 = 1;
+ box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory;
+ box.annotation_id = id + 100;
+ box.source_category_id = 1;
+ box.source_ordinal = id * 3;
+ box.original_area = 3;
+ box.mask_rle_pairs = 3;
+ builder.boxes.push_back(box);
+ builder.mask_rle_pairs = {{0, 1}, {2, 1}, {4, 1}};
  return NormalizedAnnotationReadView(fixture_index(builder));
 }
-}
-
+}  // namespace
 TEST_CASE("normalized label custody rejects unrelated backing for detached native spans", "[benchmark][pipeline][labels][resources]") {
  CoconutNativeWorkspace workspace(CoconutImportLimits{});
- CoconutRecord record; record.image_id = 1; record.width = record.height = 1;
- CoconutPhysicalImage physical; physical.source = CoconutImageNamespace::CocoTrain; physical.image_id = 1;
- auto lineage = std::make_shared<CoconutNativeLineage>(); lineage->component.source = physical.source;
+ CoconutRecord record;
+ record.image_id = 1;
+ record.width = record.height = 1;
+ CoconutPhysicalImage physical;
+ physical.source = CoconutImageNamespace::CocoTrain;
+ physical.image_id = 1;
+ auto lineage = std::make_shared<CoconutNativeLineage>();
+ lineage->component.source = physical.source;
  workspace.borrow_support(record, {}, {1, 1}, std::make_shared<const int>(0));
  auto native = workspace.finish(record, physical, {1, 1}, lineage, {});
  auto read = CoconutNativeImage::read(native);
@@ -7394,17 +7783,17 @@ TEST_CASE("normalized label custody rejects unrelated backing for detached nativ
  REQUIRE_NOTHROW(BenchmarkLabelInput(ordinary, 0));
  auto native_input = CoconutNativeImage::labels(native);
  const std::weak_ptr<const CoconutNativeImage> lifetime = native;
- read.owner.reset(); native.reset(); workspace.retire();
+ read.owner.reset();
+ native.reset();
+ workspace.retire();
  CHECK_FALSE(lifetime.expired());
  CHECK(native_input.index().image(0).source_image_id == 1);
  CHECK_FALSE(native_input.index().storage().backing);
 }
-
 TEST_CASE("owned label inputs join only their own geometry and reuse completed dependencies", "[benchmark][pipeline][labels]") {
  BenchmarkCompilePipeline execution(1);
  std::array<unsigned, 3> conversions{};
- execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
-  [&](const auto&, auto id, const auto&) { ++conversions.at(id); });
+ execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto id, const auto&) { ++conversions.at(id); });
  const std::filesystem::path root("label-geometry-join");
  const auto publication = execution.source_publication(root, {});
  std::weak_ptr<NormalizedAnnotationBacking> pending;
@@ -7413,31 +7802,40 @@ TEST_CASE("owned label inputs join only their own geometry and reuse completed d
   pending = input.storage().backing;
   execution.labels_ready(publication, 1, BenchmarkLabelInput(input, 0), "first", 1);
  }
- CHECK_FALSE(pending.expired()); CHECK_FALSE(execution.geometry(root, 1));
+ CHECK_FALSE(pending.expired());
+ CHECK_FALSE(execution.geometry(root, 1));
  CHECK(execution.has_image_labels(root, 1, "first", 1));
  CHECK_FALSE(execution.has_image_labels(root, 1, "first", 2));
  auto second = label_projection_fixture(2);
  publication.geometry_ready(2, {8, 2});
  execution.labels_ready(publication, 2, BenchmarkLabelInput(second, 0), "second", 1);
  auto ready = execution.wait_image_labels(root, 2, "second");
- REQUIRE(ready); CHECK(conversions[2] == 1); CHECK(conversions[1] == 0);
+ REQUIRE(ready);
+ CHECK(conversions[2] == 1);
+ CHECK(conversions[1] == 0);
  CHECK(execution.has_image_labels(root, 2, "second", 1));
  // Compiler fallback joins the exact product even after an earlier consumer read it.
  execution.labels_ready(publication, 2, BenchmarkLabelInput(second, 0), "second", 1);
- CHECK(execution.wait_image_labels(root, 2, "second") == ready); CHECK(conversions[2] == 1);
+ CHECK(execution.wait_image_labels(root, 2, "second") == ready);
+ CHECK(conversions[2] == 1);
  // Distinct annotation editions can share one physical image without replacing
  // each other's canonical product or forcing the final compiler to convert again.
  execution.labels_ready(publication, 2, BenchmarkLabelInput(second, 0), "alternate-edition", 1);
  const auto alternate = execution.wait_image_labels(root, 2, "alternate-edition");
- REQUIRE(alternate); CHECK(alternate != ready); CHECK(conversions[2] == 2);
+ REQUIRE(alternate);
+ CHECK(alternate != ready);
+ CHECK(conversions[2] == 2);
  execution.labels_ready(publication, 2, BenchmarkLabelInput(second, 0), "second", 1);
- CHECK(execution.wait_image_labels(root, 2, "second") == ready); CHECK(conversions[2] == 2);
+ CHECK(execution.wait_image_labels(root, 2, "second") == ready);
+ CHECK(conversions[2] == 2);
  publication.geometry_ready(1, {8, 2});
  const auto first = execution.wait_image_labels(root, 1, "first");
- REQUIRE(first); CHECK(first->labels[0].annotation_id == 101); CHECK(first->labels[0].source_ordinal == 3);
- CHECK(pending.expired()); CHECK(conversions[1] == 1);
+ REQUIRE(first);
+ CHECK(first->labels[0].annotation_id == 101);
+ CHECK(first->labels[0].source_ordinal == 3);
+ CHECK(pending.expired());
+ CHECK(conversions[1] == 1);
 }
-
 TEST_CASE("independent labels share workers while one admitted conversion is held", "[benchmark][pipeline][labels]") {
  const auto cpus = mmltk::common::system::allowed_cpu_set();
  if (cpus.size() < 2) SKIP("requires two assigned CPUs");
@@ -7445,27 +7843,33 @@ TEST_CASE("independent labels share workers while one admitted conversion is hel
  mmltk::testsupport::TestGate first("first admitted label conversion");
  std::array<unsigned, 3> conversions{};
  std::array<std::size_t, 3> lanes{};
- execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
-  [&](const auto&, auto id, const auto&) {
-   ++conversions.at(id); lanes.at(id) = execution.current_lane();
-   if (id == 1) first.receipt().ArriveAndWait();
-  });
- const mmltk::testsupport::ScopedTestCleanup release([&] { first.Release(); execution.retire_attempt(); });
+ execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto id, const auto&) {
+  ++conversions.at(id);
+  lanes.at(id) = execution.current_lane();
+  if (id == 1) first.receipt().ArriveAndWait();
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  first.Release();
+  execution.retire_attempt();
+ });
  const std::filesystem::path root("parallel-labels");
  const auto publication = execution.source_publication(root, {});
  const auto one = label_projection_fixture(1), two = label_projection_fixture(2);
- publication.geometry_ready(1, {8, 2}); publication.geometry_ready(2, {8, 2});
+ publication.geometry_ready(1, {8, 2});
+ publication.geometry_ready(2, {8, 2});
  execution.labels_ready(publication, 1, BenchmarkLabelInput(one, 0), "one");
  REQUIRE(first.WaitEntered(5s));
  CHECK(execution.has_image_labels(root, 1, "one"));
  execution.labels_ready(publication, 1, BenchmarkLabelInput(one, 0), "one");
  execution.labels_ready(publication, 2, BenchmarkLabelInput(two, 0), "two");
  REQUIRE(execution.wait_image_labels(root, 2, "two"));
- CHECK_FALSE(execution.image_labels(root, 1, "one")); CHECK(lanes[1] != lanes[2]);
- first.Release(); REQUIRE(execution.wait_image_labels(root, 1, "one"));
- CHECK(conversions[1] == 1); CHECK(conversions[2] == 1);
+ CHECK_FALSE(execution.image_labels(root, 1, "one"));
+ CHECK(lanes[1] != lanes[2]);
+ first.Release();
+ REQUIRE(execution.wait_image_labels(root, 1, "one"));
+ CHECK(conversions[1] == 1);
+ CHECK(conversions[2] == 1);
 }
-
 TEST_CASE("label withdrawal retains executing input and releases queued custody", "[benchmark][pipeline][labels][resources]") {
  enum class Retire { Original, Image, Source, Attempt, Cancellation };
  auto retirement = Retire::Original;
@@ -7474,23 +7878,34 @@ TEST_CASE("label withdrawal retains executing input and releases queued custody"
  SECTION("running original withdrawal") { running = true; }
  SECTION("a failed retired original consumer cannot fail its replacement") { running = fail_retired = true; }
  SECTION("queued physical image withdrawal") { retirement = Retire::Image; }
- SECTION("running physical image withdrawal") { retirement = Retire::Image; running = true; }
+ SECTION("running physical image withdrawal") {
+  retirement = Retire::Image;
+  running = true;
+ }
  SECTION("queued source withdrawal") { retirement = Retire::Source; }
- SECTION("running source withdrawal") { retirement = Retire::Source; running = true; }
+ SECTION("running source withdrawal") {
+  retirement = Retire::Source;
+  running = true;
+ }
  SECTION("queued attempt withdrawal") { retirement = Retire::Attempt; }
- SECTION("running attempt withdrawal") { retirement = Retire::Attempt; running = true; }
+ SECTION("running attempt withdrawal") {
+  retirement = Retire::Attempt;
+  running = true;
+ }
  SECTION("queued cancellation") { retirement = Retire::Cancellation; }
- SECTION("running cancellation") { retirement = Retire::Cancellation; running = true; }
+ SECTION("running cancellation") {
+  retirement = Retire::Cancellation;
+  running = true;
+ }
  std::atomic<bool> cancelled{false};
  BenchmarkCompilePipeline execution(1, {}, {}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
  mmltk::testsupport::TestGate held("consumer owns its input");
  std::atomic<unsigned> conversions{0};
- execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
-  [&](const auto&, auto, const auto&) {
-   ++conversions;
-   if (running) held.receipt().ArriveAndWait();
-   if (fail_retired) throw std::runtime_error("retired conversion failed");
-  });
+ execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto, const auto&) {
+  ++conversions;
+  if (running) held.receipt().ArriveAndWait();
+  if (fail_retired) throw std::runtime_error("retired conversion failed");
+ });
  const std::filesystem::path root("retired-label-custody");
  const auto publication = execution.source_publication(root, {});
  publication.geometry_ready(1, {8, 2});
@@ -7498,11 +7913,15 @@ TEST_CASE("label withdrawal retains executing input and releases queued custody"
  if (!running) {
   blocker = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) { held.receipt().ArriveAndWait(); }); });
  }
- const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); execution.retire_attempt(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  held.Release();
+  execution.retire_attempt();
+ });
  if (!running) REQUIRE(held.WaitEntered(5s));
  std::weak_ptr<NormalizedAnnotationBacking> custody;
  {
-  auto input = label_projection_fixture(1); custody = input.storage().backing;
+  auto input = label_projection_fixture(1);
+  custody = input.storage().backing;
   execution.labels_ready(publication, 1, BenchmarkLabelInput(input, 0), "old", 1);
  }
  if (running) REQUIRE(held.WaitEntered(5s));
@@ -7516,15 +7935,18 @@ TEST_CASE("label withdrawal retains executing input and releases queued custody"
    case Retire::Image: execution.retire_image(root, 1); break;
    case Retire::Source: execution.retire_source(root); break;
    case Retire::Attempt: execution.retire_attempt(); break;
-   case Retire::Cancellation: cancelled.store(true); execution.retire_attempt(); break;
+   case Retire::Cancellation:
+    cancelled.store(true);
+    execution.retire_attempt();
+    break;
   }
  });
  mmltk::testsupport::await_test_promise(withdrawing, "label withdrawal begins");
- if (retirement == Retire::Original || retirement == Retire::Image || retirement == Retire::Source)
-  execution.wait_for_admission_change(before_withdrawal);
+ if (retirement == Retire::Original || retirement == Retire::Image || retirement == Retire::Source) execution.wait_for_admission_change(before_withdrawal);
  if (!running && retirement != Retire::Attempt && retirement != Retire::Cancellation) {
   mmltk::testsupport::await_test_future(retiring, "queued input retires independently of unrelated CPU work");
-  CHECK(custody.expired()); CHECK(conversions == 0);
+  CHECK(custody.expired());
+  CHECK(conversions == 0);
  } else {
   CHECK(retiring.wait_for(0ms) == std::future_status::timeout);
   if (running) CHECK_FALSE(custody.expired());
@@ -7532,10 +7954,12 @@ TEST_CASE("label withdrawal retains executing input and releases queued custody"
  held.Release();
  if (retiring.valid()) mmltk::testsupport::await_test_future(retiring, "physical consumer settles before withdrawal returns");
  if (blocker.valid()) {
-  try { mmltk::testsupport::await_test_future(blocker, "unrelated worker settles"); }
-  catch (const std::runtime_error&) { REQUIRE((retirement == Retire::Cancellation || retirement == Retire::Attempt)); }
+  try {
+   mmltk::testsupport::await_test_future(blocker, "unrelated worker settles");
+  } catch (const std::runtime_error&) { REQUIRE((retirement == Retire::Cancellation || retirement == Retire::Attempt)); }
  }
- CHECK(custody.expired()); CHECK_FALSE(execution.image_labels(root, 1, "old"));
+ CHECK(custody.expired());
+ CHECK_FALSE(execution.image_labels(root, 1, "old"));
  if (retirement == Retire::Original) {
   REQUIRE(execution.geometry(root, 1));
   execution.run(BenchmarkStage::Metadata, {}, [](std::size_t) {});
@@ -7545,17 +7969,16 @@ TEST_CASE("label withdrawal retains executing input and releases queued custody"
   REQUIRE(execution.labels_ready(publication, 1, BenchmarkLabelInput(label_projection_fixture(1), 0), "old", 2));
   CHECK_FALSE(execution.wait_image_labels(root, 1, "old", 1));
   const auto replacement = execution.wait_image_labels(root, 1, "old", 2);
-  REQUIRE(replacement); CHECK(replacement->labels[0].annotation_id == 101);
+  REQUIRE(replacement);
+  CHECK(replacement->labels[0].annotation_id == 101);
   CHECK(conversions == (running ? 2 : 1));
  }
  if (retirement == Retire::Image || retirement == Retire::Source) CHECK_FALSE(execution.geometry(root, 1));
 }
-
 TEST_CASE("stock original fallback keeps its captured generation across withdrawal", "[benchmark][pipeline][labels]") {
  BenchmarkCompilePipeline execution(1);
  unsigned conversions = 0;
- execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
-  [&](const auto&, auto, const auto&) { ++conversions; });
+ execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto, const auto&) { ++conversions; });
  const std::filesystem::path root("stock-original-labels");
  CocoAnnotationSplit captured{false, 7, true, label_projection_fixture(1).storage()};
  execution.original_generation(root, captured.generation, false);
@@ -7574,7 +7997,8 @@ TEST_CASE("stock original fallback keeps its captured generation across withdraw
  execution.original_generation(root, replacement.generation, false);
  REQUIRE(execution.labels_ready(physical, 1, BenchmarkLabelInput(NormalizedAnnotationReadView(*replacement.index), 0), dependency, replacement.generation));
  const auto ready = execution.wait_image_labels(root, 1, dependency, replacement.generation);
- REQUIRE(ready); CHECK(conversions == 1);
+ REQUIRE(ready);
+ CHECK(conversions == 1);
  CHECK(execution.has_image_labels(root, 1, dependency, replacement.generation));
  CHECK_FALSE(execution.has_image_labels(root, 1, dependency, captured.generation));
  CHECK_FALSE(execution.wait_image_labels(root, 1, dependency, captured.generation));
@@ -7582,7 +8006,6 @@ TEST_CASE("stock original fallback keeps its captured generation across withdraw
  CHECK(execution.wait_image_labels(root, 1, dependency, replacement.generation) == ready);
  CHECK(conversions == 1);
 }
-
 TEST_CASE("label interval capacity reuses charged lanes and retires borrowed windows", "[benchmark][pipeline][labels][resources]") {
  bool fail_borrower = false, cancel_borrower = false;
  SECTION("successful borrowed window") {}
@@ -7592,12 +8015,11 @@ TEST_CASE("label interval capacity reuses charged lanes and retires borrowed win
  constexpr std::uint64_t target = 128U * 1024U;
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = target}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
  std::array<std::size_t, 6> retained{};
- execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
-  [&](const auto&, auto id, const BenchmarkLabelWorkspace& workspace) {
-   retained.at(id) = workspace.retained_bytes();
-   if (id == 4 && cancel_borrower) cancelled.store(true);
-   if (id == 4 && fail_borrower) throw std::runtime_error("label borrower failed");
-  });
+ execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto id, const BenchmarkLabelWorkspace& workspace) {
+  retained.at(id) = workspace.retained_bytes();
+  if (id == 4 && cancel_borrower) cancelled.store(true);
+  if (id == 4 && fail_borrower) throw std::runtime_error("label borrower failed");
+ });
  const std::filesystem::path root("label-workspace");
  const auto publication = execution.source_publication(root, {});
  const auto publish = [&](std::uint64_t id) {
@@ -7605,45 +8027,73 @@ TEST_CASE("label interval capacity reuses charged lanes and retires borrowed win
   execution.labels_ready(publication, id, BenchmarkLabelInput(label_projection_fixture(id), 0), std::to_string(id));
  };
  const auto join = [&](std::uint64_t id) { return execution.wait_image_labels(root, id, std::to_string(id)); };
- publish(1); REQUIRE(join(1)); publish(2); REQUIRE(join(2));
- CHECK(retained[1] == 0); CHECK(retained[2] > 0);
- auto pressure = execution.reserve({target, 0}); // Admission retires real idle intervals first.
- publish(3); CHECK_FALSE(execution.image_labels(root, 3, "3"));
- pressure = {}; REQUIRE(join(3)); CHECK(retained[3] == 0);
+ publish(1);
+ REQUIRE(join(1));
+ publish(2);
+ REQUIRE(join(2));
+ CHECK(retained[1] == 0);
+ CHECK(retained[2] > 0);
+ auto pressure = execution.reserve({target, 0});  // Admission retires real idle intervals first.
+ publish(3);
+ CHECK_FALSE(execution.image_labels(root, 3, "3"));
+ pressure = {};
+ REQUIRE(join(3));
+ CHECK(retained[3] == 0);
  auto producer = execution.reserve({target, 0});
  const auto borrowed = [&] {
-  execution.with_unused_workspace(producer, 16384, [&] { publish(4); REQUIRE(join(4)); });
+  execution.with_unused_workspace(producer, 16384, [&] {
+   publish(4);
+   REQUIRE(join(4));
+  });
  };
  if (fail_borrower || cancel_borrower) {
   CHECK_THROWS(borrowed());
-  cancelled.store(false); execution.retire_attempt();
- } else borrowed();
+  cancelled.store(false);
+  execution.retire_attempt();
+ } else
+  borrowed();
  // The lending window returned all borrowers while its producer remains charged.
- REQUIRE(producer.try_resize_workspace(0, false)); producer = {};
- if (!fail_borrower && !cancel_borrower) { publish(5); REQUIRE(join(5)); CHECK(retained[5] == 0); }
+ REQUIRE(producer.try_resize_workspace(0, false));
+ producer = {};
+ if (!fail_borrower && !cancel_borrower) {
+  publish(5);
+  REQUIRE(join(5));
+  CHECK(retained[5] == 0);
+ }
 }
-
 TEST_CASE("label projection preserves geometry provenance and present-empty masks", "[benchmark][labels][masks]") {
  auto input = label_projection_fixture(7);
  BenchmarkLabelWorkspace workspace;
  const auto mismatch = compile_benchmark_image_labels(input, 0, {9, 2}, 16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, workspace);
- CHECK(mismatch.labels.empty()); CHECK(mismatch.dropped == 1); CHECK(mismatch.width == 9);
+ CHECK(mismatch.labels.empty());
+ CHECK(mismatch.dropped == 1);
+ CHECK(mismatch.width == 9);
  NormalizedAnnotationBuilder builder;
  builder.source = BenchmarkDatasetSource::kOpenImagesV7;
  builder.images.push_back({7, 0, 1, 1, 1, 0, 0});
  NormalizedBox box;
- box.x2 = box.y2 = 1; box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory | kAnnotationCrowd | kAnnotationIgnore;
- box.annotation_id = 43; box.source_category_id = 1; box.source_ordinal = 92; box.original_area = 0.25;
+ box.x2 = box.y2 = 1;
+ box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory | kAnnotationCrowd | kAnnotationIgnore;
+ box.annotation_id = 43;
+ box.source_category_id = 1;
+ box.source_ordinal = 92;
+ box.original_area = 0.25;
  builder.boxes.push_back(box);
  const auto normalized = NormalizedAnnotationReadView(fixture_index(builder));
  const auto projected = compile_benchmark_image_labels(normalized, 0, {8, 2}, 16, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox, workspace);
- REQUIRE(projected.labels.size() == 1); CHECK(projected.runs.empty()); CHECK(projected.dropped == 0);
+ REQUIRE(projected.labels.size() == 1);
+ CHECK(projected.runs.empty());
+ CHECK(projected.dropped == 0);
  const auto& label = projected.labels.front();
- CHECK(label.flags == box.flags); CHECK(label.mask_rle_pairs == 0); CHECK(label.original_area == 4);
- CHECK(label.annotation_id == 43); CHECK(label.source_category_id == 1); CHECK(label.source_ordinal == 92);
- CHECK(label.bbox_y1 == 6); CHECK(label.bbox_y2 == 10);
+ CHECK(label.flags == box.flags);
+ CHECK(label.mask_rle_pairs == 0);
+ CHECK(label.original_area == 4);
+ CHECK(label.annotation_id == 43);
+ CHECK(label.source_category_id == 1);
+ CHECK(label.source_ordinal == 92);
+ CHECK(label.bbox_y1 == 6.0F);
+ CHECK(label.bbox_y2 == 10.0F);
 }
-
 TEST_CASE("required label joins surface failed geometry readers without a pixel drain", "[benchmark][pipeline][labels][failure]") {
  mmltk::testsupport::ScopedTempDir root("label-geometry-failure");
  const auto images = root.path() / "images";
@@ -7661,9 +8111,9 @@ TEST_CASE("required label joins surface failed geometry readers without a pixel 
  execution.labels_ready(publication, 1, BenchmarkLabelInput(label_projection_fixture(1), 0), "required");
  publication({1});
  CHECK_THROWS_AS(execution.wait_image_labels(images, 1, "required"), BenchmarkImageReadError);
- CHECK_FALSE(execution.geometry(images, 1)); CHECK_FALSE(execution.image_labels(images, 1, "required"));
+ CHECK_FALSE(execution.geometry(images, 1));
+ CHECK_FALSE(execution.image_labels(images, 1, "required"));
 }
-
 TEST_CASE("failed artifact digest custody follows the retained download generation", "[backend][data][benchmark][download][trace]") {
  mmltk::testsupport::ScopedTempDir root("download-digest-custody");
  const auto path = root.path() / "artifact.bin";
@@ -7685,7 +8135,6 @@ TEST_CASE("failed artifact digest custody follows the retained download generati
  CHECK_FALSE(artifact.failure_digest);
  CHECK(download_failure_sha256(artifact) == mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(second_bytes)));
  CHECK(download_failure_sha256(retained) == expected);
-
  DownloadResult failed{.path = root.path() / "missing.bin"};
  CHECK_THROWS(download_failure_sha256(failed));
  REQUIRE(failed.failure_digest);
@@ -7718,7 +8167,8 @@ TEST_CASE("annotation repair reads failed payloads only for enabled diagnostics"
  std::vector<std::string> digests;
  const BenchmarkTraceSink trace = enabled ? BenchmarkTraceSink{[&](std::string_view event, const nlohmann::json& fields) {
   if (event == "benchmark.download.failure_sha256") digests.push_back(fields.at("sha256").get<std::string>());
- }} : BenchmarkTraceSink{};
+ }}
+                                          : BenchmarkTraceSink{};
  ProgressReporter reporter({}, trace);
  for (unsigned generation = 0; generation < 2; ++generation) {
   const std::string failed(8192, static_cast<char>('a' + generation));
@@ -7732,16 +8182,21 @@ TEST_CASE("annotation repair reads failed payloads only for enabled diagnostics"
   bool opened = false, accessed = false;
   for (;;) {
    const auto bytes = ::read(events.get(), buffer.data(), buffer.size());
-   if (bytes < 0) { REQUIRE(errno == EAGAIN); break; }
+   if (bytes < 0) {
+    REQUIRE(errno == EAGAIN);
+    break;
+   }
    REQUIRE(bytes > 0);
    for (std::size_t offset = 0; offset < static_cast<std::size_t>(bytes);) {
     inotify_event event{};
     std::memcpy(&event, buffer.data() + offset, sizeof(event));
-    opened = opened || (event.mask & IN_OPEN); accessed = accessed || (event.mask & IN_ACCESS);
+    opened = opened || (event.mask & IN_OPEN);
+    accessed = accessed || (event.mask & IN_ACCESS);
     offset += sizeof(event) + event.len;
    }
   }
-  CHECK(opened == enabled); CHECK(accessed == enabled);
+  CHECK(opened == enabled);
+  CHECK(accessed == enabled);
   if (enabled) {
    REQUIRE(digests.size() == generation + 1);
    CHECK(digests.back() == mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(failed.data()), failed.size()))));
@@ -7754,7 +8209,8 @@ TEST_CASE("split sealing admits caller metadata and preserves publication on can
  mmltk::testsupport::ScopedTempDir root("split-seal-publication");
  auto split = cached_pixel_membership(root.path() / "images");
  split.images = {{1, 16, 8, 0, 1, 0}};
- PackedInstance label{}; label.bbox_x2 = label.bbox_y2 = 1;
+ PackedInstance label{};
+ label.bbox_x2 = label.bbox_y2 = 1;
  split.labels = {label};
  const auto output = root.path() / "result.bin";
  write_text(output, "prior publication");
@@ -7770,7 +8226,11 @@ TEST_CASE("split sealing admits caller metadata and preserves publication on can
    SECTION("class") { split.labels[0].class_id = 1; }
    SECTION("source identity") { split.images[0].source_width = 0; }
    SECTION("unreferenced runs") { split.rle_pairs = {{0, 1}}; }
-   SECTION("run bounds") { split.labels[0].flags = kAnnotationMask; split.labels[0].mask_rle_pairs = 1; split.rle_pairs = {{63, 2}}; }
+   SECTION("run bounds") {
+    split.labels[0].flags = kAnnotationMask;
+    split.labels[0].mask_rle_pairs = 1;
+    split.rle_pairs = {{63, 2}};
+   }
    CHECK_THROWS(writer.seal(request));
   }
   SECTION("cancel before sealing") {
@@ -7778,7 +8238,7 @@ TEST_CASE("split sealing admits caller metadata and preserves publication on can
    CHECK_THROWS(writer.seal(request));
   }
   SECTION("cancel after sync before publishing") {
-   split.labels[0].flags = kAnnotationMask; // Untrusted present-empty mask is valid.
+   split.labels[0].flags = kAnnotationMask;  // Untrusted present-empty mask is valid.
    auto sealed = writer.seal(request);
    CHECK(sealed.info.image_count == 1);
    CHECK(std::ranges::equal(sealed.info.class_names(), split.class_names));
@@ -7790,7 +8250,6 @@ TEST_CASE("split sealing admits caller metadata and preserves publication on can
  CHECK(mmltk::common::io::sha256_file(output) == prior);
  for (const auto& item : fs::directory_iterator(root.path())) CHECK_FALSE(item.path().filename().string().starts_with("result.bin.tmp."));
 }
-
 TEST_CASE("split placement retains chunks and fixes global offsets once across source merges", "[backend][data][benchmark][writer]") {
  mmltk::testsupport::ScopedTempDir root("split-final-placement");
  const std::array<std::string_view, 1> classes{"person"};
@@ -7806,29 +8265,38 @@ TEST_CASE("split placement retains chunks and fixes global offsets once across s
    BenchmarkSplitAssembly part("source", classes, 8, mode);
    part.add_source(images);
    auto chunk = std::make_shared<BenchmarkLabelChunk>();
-   chunk->width = 16; chunk->height = 8;
+   chunk->width = 16;
+   chunk->height = 8;
    if (source != 1) {
     PackedInstance label{};
     label.bbox_x2 = label.bbox_y2 = 4;
     label.flags = kAnnotationCategory | kAnnotationMask | kAnnotationId;
-    label.source_category_id = 1; label.annotation_id = 10 + source; label.source_ordinal = 3 + source;
+    label.source_category_id = 1;
+    label.annotation_id = 10 + source;
+    label.source_ordinal = 3 + source;
     chunk->runs = source == 0 ? std::vector<RLEPair>{{0, 1}, {4, 2}} : std::vector<RLEPair>{{2, 1}};
     label.mask_rle_pairs = static_cast<std::uint16_t>(chunk->runs.size());
     chunk->labels.push_back(label);
     if (source == 0) {
-     label.mask_rle_pairs = 0; label.mask_rle_offset = chunk->runs.size() * sizeof(RLEPair); label.source_ordinal = 7;
-     chunk->labels.push_back(label); // Present-empty mask after nonempty runs.
+     label.mask_rle_pairs = 0;
+     label.mask_rle_offset = chunk->runs.size() * sizeof(RLEPair);
+     label.source_ordinal = 7;
+     chunk->labels.push_back(label);  // Present-empty mask after nonempty runs.
     }
    }
    custody[source] = chunk;
    part.image({1, 16, 8, 0, static_cast<std::uint16_t>(chunk->labels.size()), 0, AnnotationSource::Coco}, chunk, source == 0 ? 100 : 200);
    chunk.reset();
    CHECK_FALSE(custody[source].expired());
-   CHECK(part.data().labels.empty()); CHECK(part.data().rle_pairs.empty());
+   CHECK(part.data().labels.empty());
+   CHECK(part.data().rle_pairs.empty());
    final.append(std::move(part));
   }
-  CHECK(final.label_count() == 3); CHECK(final.run_count() == 3);
-  CHECK(final.data().images.size() == 3); CHECK(final.data().labels.empty()); CHECK(final.data().rle_pairs.empty());
+  CHECK(final.label_count() == 3);
+  CHECK(final.run_count() == 3);
+  CHECK(final.data().images.size() == 3);
+  CHECK(final.data().labels.empty());
+  CHECK(final.data().rle_pairs.empty());
   auto request = benchmark_write_request(final, root.path() / ("placed-" + std::to_string(workers) + ".bin"), 8);
   request.execution = &execution;
   BenchmarkSplitWriter writer(request);
@@ -7837,23 +8305,33 @@ TEST_CASE("split placement retains chunks and fixes global offsets once across s
   writer.write_remaining(request);
   final.materialize(execution);
   for (const auto& chunk : custody) CHECK(chunk.expired());
-  CHECK(final.data().images[1].first_label == 2); CHECK(final.data().images[2].first_label == 2);
+  CHECK(final.data().images[1].first_label == 2);
+  CHECK(final.data().images[2].first_label == 2);
   CHECK(final.data().images[2].source_index == 2);
-  CHECK(final.data().labels[0].source_ordinal == 103); CHECK(final.data().labels[1].source_ordinal == 107); CHECK(final.data().labels[2].source_ordinal == 205);
-  CHECK(final.data().labels[1].has_mask()); CHECK(final.data().labels[1].mask_rle_pairs == 0);
-  CHECK(final.data().labels[1].mask_rle_offset == 2 * sizeof(RLEPair)); CHECK(final.data().labels[2].mask_rle_offset == 2 * sizeof(RLEPair));
-  CHECK_THROWS(final.materialize(execution)); CHECK_THROWS(final.add_source("late"));
+  CHECK(final.data().labels[0].source_ordinal == 103);
+  CHECK(final.data().labels[1].source_ordinal == 107);
+  CHECK(final.data().labels[2].source_ordinal == 205);
+  CHECK(final.data().labels[1].has_mask());
+  CHECK(final.data().labels[1].mask_rle_pairs == 0);
+  CHECK(final.data().labels[1].mask_rle_offset == 2 * sizeof(RLEPair));
+  CHECK(final.data().labels[2].mask_rle_offset == 2 * sizeof(RLEPair));
+  CHECK_THROWS(final.materialize(execution));
+  CHECK_THROWS(final.add_source("late"));
   auto sealed = writer.seal(request, &final);
   sealed.artifact.publish(request.output_path, {});
   const auto dataset = CompiledDataset::open(request.output_path);
-  CHECK(dataset.header().max_instances_per_image == 2); CHECK(dataset.image_labels(1).empty());
+  CHECK(dataset.header().max_instances_per_image == 2);
+  CHECK(dataset.image_labels(1).empty());
   CHECK(dataset.instance_rle(dataset.image_labels(0)[1]).empty());
   const auto file = FileHandle::open_readonly(request.output_path.string());
-  std::vector<std::uint8_t> bytes(file.size()); file.pread_all(bytes.data(), bytes.size(), 0);
-  if (baseline.empty()) baseline = std::move(bytes); else CHECK(bytes == baseline);
+  std::vector<std::uint8_t> bytes(file.size());
+  file.pread_all(bytes.data(), bytes.size(), 0);
+  if (baseline.empty())
+   baseline = std::move(bytes);
+  else
+   CHECK(bytes == baseline);
  }
 }
-
 TEST_CASE("final chunk placement rejects malformed records and cannot seal partial output", "[backend][data][benchmark][writer]") {
  mmltk::testsupport::ScopedTempDir root("split-placement-admission");
  const auto membership = cached_pixel_membership(root.path() / "images");
@@ -7861,14 +8339,23 @@ TEST_CASE("final chunk placement rejects malformed records and cannot seal parti
  BenchmarkCompilePipeline execution(1);
  BenchmarkSplitAssembly assembly("train", classes, 8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
  assembly.add_source(membership.sources.front().root);
- auto chunk = std::make_shared<BenchmarkLabelChunk>(); chunk->width = 16; chunk->height = 8;
- PackedInstance label{}; label.bbox_x2 = label.bbox_y2 = 4;
- label.flags = kAnnotationMask | kAnnotationCategory; label.source_category_id = 1; label.mask_rle_pairs = 2;
- chunk->labels = {label}; chunk->runs = {{0, 1}, {4, 2}};
+ auto chunk = std::make_shared<BenchmarkLabelChunk>();
+ chunk->width = 16;
+ chunk->height = 8;
+ PackedInstance label{};
+ label.bbox_x2 = label.bbox_y2 = 4;
+ label.flags = kAnnotationMask | kAnnotationCategory;
+ label.source_category_id = 1;
+ label.mask_rle_pairs = 2;
+ chunk->labels = {label};
+ chunk->runs = {{0, 1}, {4, 2}};
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  SECTION("class identity") { chunk->labels[0].class_id = 1; }
- SECTION("source provenance") { chunk->labels[0].flags &= ~kAnnotationCategory; chunk->labels[0].source_category_id = 0; }
+ SECTION("source provenance") {
+  chunk->labels[0].flags &= ~kAnnotationCategory;
+  chunk->labels[0].source_category_id = 0;
+ }
  SECTION("unknown flags") { chunk->labels[0].flags |= 128; }
  SECTION("mask offset") { chunk->labels[0].mask_rle_offset = sizeof(RLEPair); }
  SECTION("run extent") { chunk->runs[1] = {63, 2}; }

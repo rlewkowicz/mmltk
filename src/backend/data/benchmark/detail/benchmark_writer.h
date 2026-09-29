@@ -48,8 +48,7 @@ struct PreparedBenchmarkSplit {
 class BenchmarkSplitAssembly final {
 public:
  BenchmarkSplitAssembly() = default;
- BenchmarkSplitAssembly(std::string name, std::span<const std::string_view> classes, std::uint32_t resolution,
-  mmltk::backend::imaging::resample::ImageResizeMode);
+ BenchmarkSplitAssembly(std::string name, std::span<const std::string_view> classes, std::uint32_t resolution, mmltk::backend::imaging::resample::ImageResizeMode);
  BenchmarkSplitAssembly(BenchmarkSplitAssembly&&) = default;
  BenchmarkSplitAssembly& operator=(BenchmarkSplitAssembly&&) = default;
  BenchmarkSplitAssembly(const BenchmarkSplitAssembly&) = delete;
@@ -65,6 +64,7 @@ public:
  // while acquisition/pixels may continue. Joins stay outside the CPU lanes.
  // Return (also on failure) settles all borrowed placement jobs before rebuild.
  void materialize(BenchmarkCompilePipeline&, mmltk::common::concurrency::CancellationObservation = {});
+
 private:
  friend class BenchmarkSplitWriter;
  void mutable_records() const;
@@ -106,10 +106,10 @@ struct BenchmarkWriteRequest {
  std::filesystem::path output_path;
  std::uint32_t resolution = 0;
  int num_workers = 0;
- std::span<const int> worker_cpus;
+ std::span<const int> worker_cpus{};
  bool overwrite = false;
  mmltk::common::concurrency::CancellationObservation cancel_requested = {};
- BenchmarkWriteProgressEvent progress;
+ BenchmarkWriteProgressEvent progress{};
  bool perceptual_downscale = false;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
  // Private effect-only boundary after opening a cached image, outside locks.
@@ -128,8 +128,8 @@ public:
  BenchmarkSplitWriter& operator=(const BenchmarkSplitWriter&) = delete;
  void prepare_lanes(std::size_t);
  void retire_scratch(std::size_t) noexcept;
- [[nodiscard]] std::shared_ptr<BenchmarkPixelInput> prepare_pixel(std::size_t slot, std::size_t lane,
-  BenchmarkSourcePublication publication = {}, BenchmarkAllowance allowance = {}, std::shared_ptr<const BenchmarkEncodedImage> payload = {});
+ [[nodiscard]] std::shared_ptr<BenchmarkPixelInput> prepare_pixel(
+  std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication = {}, BenchmarkAllowance allowance = {}, std::shared_ptr<const BenchmarkEncodedImage> payload = {});
  [[nodiscard]] BenchmarkAllowance pixel_input_allowance(const BenchmarkPixelInput&) const;
  [[nodiscard]] std::uint64_t pixel_workspace_bytes(const BenchmarkPixelInput&) const;
  [[nodiscard]] std::uint64_t pixel_workspace_bytes(const BenchmarkImageHeader&, std::size_t encoded_bytes) const;

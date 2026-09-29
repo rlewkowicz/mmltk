@@ -38,17 +38,15 @@ struct ShardSummary {
  std::uint64_t images = 0U;
  std::array<std::uint64_t, kClassCount> class_images{};
 };
-[[nodiscard]] std::uint64_t selection_workspace_bytes(const NormalizedAnnotationIndex& objects365, const NormalizedAnnotationIndex& open_images,
- const std::size_t shards, const std::uint64_t selected_images) {
+[[nodiscard]] std::uint64_t selection_workspace_bytes(
+ const NormalizedAnnotationIndex& objects365, const NormalizedAnnotationIndex& open_images, const std::size_t shards, const std::uint64_t selected_images) {
  using mmltk::common::math::checked_add;
  using mmltk::common::math::checked_multiply;
  constexpr auto overflow = "supplemental selection workspace overflow";
  // Fixed class arrays, vector/dispatch/view control records and routine call
  // frames. This is a construction allowance, not a process RSS limit.
  std::uint64_t bytes = 64U << 10;
- const auto include = [&](const std::uint64_t count, const std::uint64_t width) {
-  bytes = checked_add(bytes, checked_multiply(count, width, overflow), overflow);
- };
+ const auto include = [&](const std::uint64_t count, const std::uint64_t width) { bytes = checked_add(bytes, checked_multiply(count, width, overflow), overflow); };
  for (const auto* source : {&objects365, &open_images}) {
   const auto images = checked_cast<std::uint64_t>(source->images.size(), overflow);
   const auto boxes = checked_cast<std::uint64_t>(source->boxes.size(), overflow);
@@ -104,8 +102,7 @@ private:
  std::uint64_t low_ = 0U;
  std::uint64_t high_ = 0U;
 };
-void build_memberships(
- const NormalizedAnnotationIndex& source, SupplementalSamplingStats* stats, std::vector<ClassMembership>* memberships, const std::span<ShardSummary> shards,
+void build_memberships(const NormalizedAnnotationIndex& source, SupplementalSamplingStats* stats, std::vector<ClassMembership>* memberships, const std::span<ShardSummary> shards,
  mmltk::common::concurrency::CancellationObservation cancel_requested) {
  stats->full_images = source.images.size();
  stats->full_boxes = source.boxes.size();
@@ -138,8 +135,8 @@ void build_memberships(
   }
  }
 }
-[[nodiscard]] std::vector<std::uint16_t> choose_objects365_shards(const std::span<const ShardSummary> summaries,
- const std::array<std::uint64_t, kClassCount>& full_class_images, const std::span<const std::uint64_t> shard_bytes, const std::uint64_t required_images, std::uint64_t* selected_archive_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+[[nodiscard]] std::vector<std::uint16_t> choose_objects365_shards(const std::span<const ShardSummary> summaries, const std::array<std::uint64_t, kClassCount>& full_class_images,
+ const std::span<const std::uint64_t> shard_bytes, const std::uint64_t required_images, std::uint64_t* selected_archive_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  const std::uint64_t headroom_images =
   checked_cast<std::uint64_t>((static_cast<unsigned long long>(required_images) * kShardCandidateHeadroomNumerator + kShardCandidateHeadroomDenominator - 1U) / kShardCandidateHeadroomDenominator,
    "Objects365 sampling headroom overflow");
@@ -200,7 +197,8 @@ void build_memberships(
  std::ranges::sort(result);
  return result;
 }
-[[nodiscard]] SourceSelection make_source_selection(const NormalizedAnnotationIndex& source, std::vector<ClassMembership> memberships, SupplementalSamplingStats stats, const std::span<const std::uint8_t> eligible_shards) {
+[[nodiscard]] SourceSelection make_source_selection(
+ const NormalizedAnnotationIndex& source, std::vector<ClassMembership> memberships, SupplementalSamplingStats stats, const std::span<const std::uint8_t> eligible_shards) {
  SourceSelection result;
  result.source = &source;
  result.memberships = std::move(memberships);
@@ -272,7 +270,8 @@ void select_image(SourceSelection* source, const std::uint32_t image_index, std:
 }
 }  // namespace
 CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const NormalizedAnnotationIndex& coco_train, const NormalizedAnnotationIndex& objects365,
- const NormalizedAnnotationIndex& open_images, const std::span<const std::uint64_t> objects365_shard_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested, BenchmarkCompilePipeline* execution) {
+ const NormalizedAnnotationIndex& open_images, const std::span<const std::uint64_t> objects365_shard_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested,
+ BenchmarkCompilePipeline* execution) {
  if (coco_train.source != BenchmarkDatasetSource::kCoco2017 || objects365.source != BenchmarkDatasetSource::kObjects365V2 || open_images.source != BenchmarkDatasetSource::kOpenImagesV7) {
   throw std::runtime_error("combined supplemental sampler received the wrong sources");
  }
@@ -294,13 +293,18 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
  // Source-local membership, class counts, sorting and candidate construction
  // share the existing CPU owner; the greedy cross-source choice stays serial.
  const auto parallel = [&](std::size_t count, const std::function<void(std::size_t)>& work) {
-  if (execution) execution->for_each(BenchmarkStage::Metadata, count, {}, work);
-  else for (std::size_t i = 0; i < count; ++i) work(i);
+  if (execution)
+   execution->for_each(BenchmarkStage::Metadata, count, BenchmarkResources{}, work);
+  else
+   for (std::size_t i = 0; i < count; ++i) work(i);
  };
  SourceSelection object_selection, open_selection;
  SupplementalSamplingStats coco_stats;
  parallel(3, [&](std::size_t source) {
-  if (source == 2) { build_memberships(coco_train, &coco_stats, nullptr, {}, cancel_requested); return; }
+  if (source == 2) {
+   build_memberships(coco_train, &coco_stats, nullptr, {}, cancel_requested);
+   return;
+  }
   SupplementalSamplingStats stats;
   std::vector<ClassMembership> memberships;
   std::vector<ShardSummary> shards(source == 0 ? objects365_shard_bytes.size() : 0);
@@ -352,9 +356,7 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
  open_selection.stats.selected_boxes = open_selection.selected_boxes;
  result.objects365.stats = object_selection.stats;
  result.open_images.stats = open_selection.stats;
- parallel(2, [&](std::size_t source) {
-  (source == 0 ? result.objects365 : result.open_images).view = selected_view(source == 0 ? object_selection : open_selection, cancel_requested);
- });
+ parallel(2, [&](std::size_t source) { (source == 0 ? result.objects365 : result.open_images).view = selected_view(source == 0 ? object_selection : open_selection, cancel_requested); });
  return result;
 }
 }  // namespace mmltk::backend::data::benchmark_internal

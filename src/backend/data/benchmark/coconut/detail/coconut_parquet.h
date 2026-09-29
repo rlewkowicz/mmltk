@@ -13,7 +13,10 @@ struct CoconutParquetImage {
  std::int64_t id, height, width, license;
 };
 MMLTK_REFLECT_FIELDS(CoconutParquetImage)
-struct CoconutParquetMask { std::vector<std::uint8_t> bytes; std::string path; };
+struct CoconutParquetMask {
+ std::vector<std::uint8_t> bytes;
+ std::string path;
+};
 MMLTK_REFLECT_FIELDS(CoconutParquetMask)
 struct CoconutParquetSegment {
  std::int64_t id, category_id, isthing;
@@ -33,4 +36,4 @@ struct CoconutParquetRow {
  CoconutParquetAnnotation segments_info;
 };
 MMLTK_REFLECT_FIELDS(CoconutParquetRow)
-} // namespace mmltk::backend::data::benchmark_internal
+}  // namespace mmltk::backend::data::benchmark_internal

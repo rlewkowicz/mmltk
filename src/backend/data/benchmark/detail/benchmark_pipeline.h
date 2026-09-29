@@ -37,9 +37,9 @@ class BenchmarkCompilePipeline final {
  using Credits = BenchmarkAllowance::Credits;
  friend class BenchmarkAllowance;
  friend class BenchmarkResourceWait;
+
 public:
- explicit BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus = {}, BenchmarkExecutionLimits = {},
-  mmltk::common::concurrency::CancellationObservation = {});
+ explicit BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus = {}, BenchmarkExecutionLimits = {}, mmltk::common::concurrency::CancellationObservation = {});
  ~BenchmarkCompilePipeline();
  BenchmarkCompilePipeline(const BenchmarkCompilePipeline&) = delete;
  BenchmarkCompilePipeline& operator=(const BenchmarkCompilePipeline&) = delete;
@@ -52,6 +52,7 @@ public:
   ~Workspace();
   Workspace(const Workspace&) = delete;
   Workspace& operator=(const Workspace&) = delete;
+
  private:
   friend class BenchmarkCompilePipeline;
   BenchmarkCompilePipeline& owner_;
@@ -93,10 +94,9 @@ public:
  // Bounded records recycle on individual completion. Retirement finishes before
  // returning, including failure; it cannot retire suspended cooperative scratch.
  void for_each(BenchmarkStage, std::size_t count, BenchmarkResources, const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>& retire_scratch = {});
- void for_each(BenchmarkStage, std::size_t count, const std::function<BenchmarkResources(std::size_t)>&,
-  const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>& retire_scratch = {});
- void for_each(BenchmarkStage, std::size_t count, const std::function<BenchmarkResources(std::size_t)>&,
-  const std::function<void(std::size_t)>&, Workspace&);
+ void for_each(
+  BenchmarkStage, std::size_t count, const std::function<BenchmarkResources(std::size_t)>&, const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>& retire_scratch = {});
+ void for_each(BenchmarkStage, std::size_t count, const std::function<BenchmarkResources(std::size_t)>&, const std::function<void(std::size_t)>&, Workspace&);
  void write_remaining(BenchmarkSplitWriter&, const PreparedBenchmarkSplit&, std::span<const std::size_t>);
  // A stopped input reader may expose unused promise bytes to ready pixel
  // and label writes. Source/producer admission still sees its complete reservation.
@@ -113,8 +113,8 @@ public:
  void register_split(BenchmarkSplitWriter&, const PreparedBenchmarkSplit&);
  // Capture once while the producer holds its physical mutation lease. A repair
  // captures only its replacement image; all other events keep the source epoch.
- [[nodiscard]] BenchmarkSourcePublication source_publication(const std::filesystem::path&, std::shared_ptr<const ArtifactLease>,
-  std::optional<std::uint64_t> repaired_image = {}, bool defer_pixels = false);
+ [[nodiscard]] BenchmarkSourcePublication source_publication(
+  const std::filesystem::path&, std::shared_ptr<const ArtifactLease>, std::optional<std::uint64_t> repaired_image = {}, bool defer_pixels = false);
  [[nodiscard]] BenchmarkSourceGeneration source_generation(const std::filesystem::path&);
  [[nodiscard]] BenchmarkSourceGeneration image_generation(const std::filesystem::path&, std::uint64_t);
  void retire_image(const std::filesystem::path&, std::uint64_t);
@@ -124,8 +124,7 @@ public:
  // Publication retains native/normalized custody and never waits for geometry,
  // resources or CPU completion. ImageState owns the join with physical facts.
  // False means the publication generation withdrew before admission.
- bool labels_ready(const BenchmarkSourcePublication&, std::uint64_t, BenchmarkLabelInput,
-  std::string_view dependency, std::uint64_t original_generation = 0);
+ bool labels_ready(const BenchmarkSourcePublication&, std::uint64_t, BenchmarkLabelInput, std::string_view dependency, std::uint64_t original_generation = 0);
  [[nodiscard]] std::shared_ptr<const BenchmarkLabelChunk> image_labels(const std::filesystem::path&, std::uint64_t, std::string_view dependency) const;
  // Includes pending, executing and completed inputs in the current generations.
  [[nodiscard]] bool has_image_labels(const std::filesystem::path&, std::uint64_t, std::string_view dependency, std::uint64_t original_generation = 0) const;
@@ -133,8 +132,7 @@ public:
  [[nodiscard]] std::shared_ptr<const BenchmarkLabelChunk> wait_image_labels(const std::filesystem::path&, std::uint64_t, std::string_view dependency, std::uint64_t original_generation = 0);
  void original_generation(const std::filesystem::path&, std::uint64_t, bool withdrawn);
  // Effect-only observation after admission and before projection, outside locks.
- void label_configuration(std::uint32_t, mmltk::backend::imaging::resample::ImageResizeMode,
-  std::function<void(const std::filesystem::path&, std::uint64_t, const BenchmarkLabelWorkspace&)> = {});
+ void label_configuration(std::uint32_t, mmltk::backend::imaging::resample::ImageResizeMode, std::function<void(const std::filesystem::path&, std::uint64_t, const BenchmarkLabelWorkspace&)> = {});
  // Withdraw admission first, join only this source, then clear affected facts.
  // Unrelated source tasks and completed products continue to be usable.
  void retire_source(const std::filesystem::path&);
@@ -148,12 +146,14 @@ public:
   ~Attempt() { owner_.retire_attempt(); }
   Attempt(const Attempt&) = delete;
   Attempt& operator=(const Attempt&) = delete;
+
  private:
   BenchmarkCompilePipeline& owner_;
  };
+
 private:
- void for_each_impl(BenchmarkStage, std::size_t, const std::function<BenchmarkResources(std::size_t)>&,
-  const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>&, bool retain_scratch);
+ void for_each_impl(
+  BenchmarkStage, std::size_t, const std::function<BenchmarkResources(std::size_t)>&, const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>&, bool retain_scratch);
  void retire_workspace(const void*) noexcept;
  struct Impl;
  std::shared_ptr<Impl> impl_;
@@ -163,6 +163,7 @@ public:
  ~BenchmarkResourceWait();
  BenchmarkResourceWait(const BenchmarkResourceWait&) = delete;
  BenchmarkResourceWait& operator=(const BenchmarkResourceWait&) = delete;
+
 private:
  friend class BenchmarkCompilePipeline;
  explicit BenchmarkResourceWait(std::shared_ptr<BenchmarkCompilePipeline::Admission>);

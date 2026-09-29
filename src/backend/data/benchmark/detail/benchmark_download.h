@@ -37,7 +37,7 @@ struct DownloadRequest {
  std::filesystem::path destination;
  std::filesystem::path lock_path;
  std::uint64_t expected_size = 0U;
- std::optional<std::string> expected_sha256;
+ std::optional<std::string> expected_sha256{};
  std::uint32_t maximum_attempts = kMaximumAttempts;
  // An owning acquisition invalidated an earlier artifact before this request.
  bool redownload = false;
@@ -53,18 +53,18 @@ struct DownloadProgress {
  BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
 };
 struct DownloadResult {
- std::filesystem::path path;
+ std::filesystem::path path{};
  std::uint64_t size = 0U;
- std::string identity;
+ std::string identity{};
  struct FailureDigest {
   std::string sha256;
   std::exception_ptr error;
  };
  // Populated only after source failure, under the generation owner's custody.
  // A failed read retains its original exception, including for required checks.
- std::optional<FailureDigest> failure_digest;
- std::string etag;
- std::string last_modified;
+ std::optional<FailureDigest> failure_digest{};
+ std::string etag{};
+ std::string last_modified{};
  std::uint32_t attempts = 0U;
  bool resumed = false;
  bool cache_hit = false;

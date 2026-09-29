@@ -25,24 +25,31 @@ class CoconutSupportRuns final {
   CoconutSupportRuns& runs;
   std::uint64_t before;
   explicit Accounting(CoconutSupportRuns& value) : runs(value), before(value.retained_bytes()) {}
-  ~Accounting() { if (runs.total_) *runs.total_ = *runs.total_ - before + runs.retained_bytes(); }
+  ~Accounting() {
+   if (runs.total_) *runs.total_ = *runs.total_ - before + runs.retained_bytes();
+  }
  };
+
 public:
  CoconutSupportRuns() = default;
  CoconutSupportRuns(const CoconutSupportRuns& other) : owned_(other.owned_), borrowed_(other.borrowed_), owner_(other.owner_) {}
  CoconutSupportRuns& operator=(const CoconutSupportRuns& other) {
   if (this == &other) return *this;
   Accounting accounting(*this);
-  owned_ = other.owned_; borrowed_ = other.borrowed_; owner_ = other.owner_;
+  owned_ = other.owned_;
+  borrowed_ = other.borrowed_;
+  owner_ = other.owner_;
   return *this;
  }
  CoconutSupportRuns(CoconutSupportRuns&& other) noexcept
-  : owned_(std::move(other.owned_)), borrowed_(std::exchange(other.borrowed_, {})), owner_(std::move(other.owner_)), total_(std::exchange(other.total_, nullptr)) {}
+     : owned_(std::move(other.owned_)), borrowed_(std::exchange(other.borrowed_, {})), owner_(std::move(other.owner_)), total_(std::exchange(other.total_, nullptr)) {}
  CoconutSupportRuns& operator=(CoconutSupportRuns&& other) noexcept {
   if (this == &other) return *this;
   account(nullptr);
-  owned_ = std::move(other.owned_); borrowed_ = std::exchange(other.borrowed_, {});
-  owner_ = std::move(other.owner_); total_ = std::exchange(other.total_, nullptr);
+  owned_ = std::move(other.owned_);
+  borrowed_ = std::exchange(other.borrowed_, {});
+  owner_ = std::move(other.owner_);
+  total_ = std::exchange(other.total_, nullptr);
   return *this;
  }
  ~CoconutSupportRuns() { account(nullptr); }
@@ -62,15 +69,36 @@ public:
  [[nodiscard]] const RLEPair& operator[](std::size_t i) const { return view()[i]; }
  [[nodiscard]] const RLEPair& front() const { return view().front(); }
  [[nodiscard]] std::uint64_t retained_bytes() const noexcept { return owned_.capacity() * sizeof(RLEPair); }
- void clear() noexcept { owner_.reset(); borrowed_ = {}; owned_.clear(); }
- template<class Iterator> void assign(Iterator begin, Iterator end) { Accounting accounting(*this); clear(); owned_.assign(begin, end); }
+ void clear() noexcept {
+  owner_.reset();
+  borrowed_ = {};
+  owned_.clear();
+ }
+ template <class Iterator>
+ void assign(Iterator begin, Iterator end) {
+  Accounting accounting(*this);
+  clear();
+  owned_.assign(begin, end);
+ }
  void append(std::uint32_t begin, std::uint32_t end) {
   Accounting accounting(*this);
-  if (!owned_.empty() && owned_.back().start + owned_.back().length == begin) owned_.back().length += end - begin;
-  else owned_.push_back({begin, end - begin});
+  if (!owned_.empty() && owned_.back().start + owned_.back().length == begin)
+   owned_.back().length += end - begin;
+  else
+   owned_.push_back({begin, end - begin});
  }
- void borrow(std::span<const RLEPair> runs, std::shared_ptr<const void> owner) { clear(); borrowed_ = runs; owner_ = std::move(owner); }
- void replace(std::vector<RLEPair>& runs) noexcept { Accounting accounting(*this); owner_.reset(); borrowed_ = {}; owned_.swap(runs); }
+ void borrow(std::span<const RLEPair> runs, std::shared_ptr<const void> owner) {
+  clear();
+  borrowed_ = runs;
+  owner_ = std::move(owner);
+ }
+ void replace(std::vector<RLEPair>& runs) noexcept {
+  Accounting accounting(*this);
+  owner_.reset();
+  borrowed_ = {};
+  owned_.swap(runs);
+ }
+
 private:
  std::vector<RLEPair> owned_;
  std::span<const RLEPair> borrowed_;
@@ -149,7 +177,10 @@ private:
   std::vector<std::uint8_t> represented;
   std::vector<const Candidate*> remaining;
   std::vector<std::uint64_t> identities;
-  struct Cursor { std::span<const RLEPair> runs; std::size_t next = 0; };
+  struct Cursor {
+   std::span<const RLEPair> runs;
+   std::size_t next = 0;
+  };
   std::vector<Cursor> merge;
   std::vector<RLEPair> combined, scratch;
  } workspace_;
