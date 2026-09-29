@@ -253,7 +253,7 @@ public:
   }
   opened_ = true;
   order_ = {0U};
-  return {.dataset = {.image_count = 1U, .image_width = 32U, .image_height = 32U, .class_names = {}}, .order = Visible({})};
+  return {.dataset = {.image_count = 1U, .slot_count = 1U, .image_width = 32U, .image_height = 32U, .class_names = {}}, .order = Visible({})};
  }
  ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, std::uint64_t seed, std::size_t, std::stop_token) override {
   return {.filter = filter, .order = Visible({}), .generation = seed + 1U};
@@ -295,7 +295,7 @@ public:
  explicit CancellableOpenPreparationAlgorithm(std::shared_ptr<OpenPreparationProbe> probe) : probe_(std::move(probe)) {}
  ExploreOpened Open(std::string_view, std::stop_token) override {
   candidate_order_ = {0U};
-  return {.dataset = {.image_count = 1U, .image_width = 32U, .image_height = 32U, .class_names = {{"person"}}}, .order = {.matching_count = 1U, .visible_indices = candidate_order_}};
+  return {.dataset = {.image_count = 1U, .slot_count = 1U, .image_width = 32U, .image_height = 32U, .class_names = {{"person"}}}, .order = {.matching_count = 1U, .visible_indices = candidate_order_}};
  }
  ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, const std::uint64_t seed, std::size_t, const std::stop_token stop) override {
   const auto call = probe_->prepare_calls.fetch_add(1U, std::memory_order_acq_rel);
@@ -346,7 +346,7 @@ public:
  AtomicFilterExploreAlgorithm(std::shared_ptr<CancellationProbe> probe, std::shared_ptr<std::atomic_uint64_t> commits) : probe_(std::move(probe)), commits_(std::move(commits)) {}
  ExploreOpened Open(std::string_view, std::stop_token) override {
   committed_ = {0U};
-  return {.dataset = {.image_count = 2U, .image_width = 32U, .image_height = 32U, .class_names = {}}, .order = {.matching_count = 1U, .visible_indices = {0U}}};
+  return {.dataset = {.image_count = 2U, .slot_count = 2U, .image_width = 32U, .image_height = 32U, .class_names = {}}, .order = {.matching_count = 1U, .visible_indices = {0U}}};
  }
  ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, std::uint64_t seed, std::size_t,
   // CLEANUP-IGNORE: Atomic-filter cancellation and reopen cancellation exercise different algorithm boundaries.

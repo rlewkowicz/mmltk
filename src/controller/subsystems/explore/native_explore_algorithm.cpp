@@ -532,7 +532,7 @@ public:
   open_candidate_.reset();
   auto opened = mmltk::backend::data::CompiledDataset::open_source(std::filesystem::path{source}, configuration_.image_limit);
   if (!opened) throw std::system_error(opened.error(), "Explore compiled source could not be opened");
-  if (opened->image_entries().empty()) throw contracts::InvalidIntentError("Explore compiled source contains no images");
+  if (opened->header().num_images == 0U) throw contracts::InvalidIntentError("Explore compiled source contains no images");
   if (opened->image_entries().size() > std::numeric_limits<std::uint32_t>::max()) throw contracts::InvalidIntentError("Explore image catalog exceeds the application boundary");
   if (opened->class_names().size() > kExploreClassCapacity) throw contracts::InvalidIntentError("Explore class catalog exceeds the application boundary");
   if (std::ranges::any_of(opened->class_names(), [](const auto& name) { return name.size() > mmltk::backend::data::catalog::kClassNameCapacity; }))
@@ -561,6 +561,7 @@ public:
   }
   ExploreDatasetFacts dataset{
    .image_count = store.header().num_images,
+   .slot_count = store.header().num_slots,
    .image_width = store.header().image_width,
    .image_height = store.header().image_height,
   };
@@ -576,10 +577,9 @@ public:
    .order = std::move(order),
    .scratch = std::move(scratch),
   };
-  candidate.annotated_indices.reserve(candidate.summaries.size());
-  for (std::size_t index = 0U; index != candidate.summaries.size(); ++index)
-   if (std::ranges::any_of(candidate.store.image_labels(static_cast<std::uint32_t>(index)), [](const auto& instance) { return !instance.is_crowd(); }))
-    candidate.annotated_indices.push_back(static_cast<std::uint32_t>(index));
+  candidate.annotated_indices.reserve(candidate.store.header().num_images);
+  for (const auto index : candidate.store.eligible_slots())
+   if (std::ranges::any_of(candidate.store.image_labels(index), [](const auto& instance) { return !instance.is_crowd(); })) candidate.annotated_indices.push_back(index);
   candidate.identity = explore_dataset_identity(source, candidate.store.header(), candidate.summaries);
   ExploreOrderFacts order_facts{
    .matching_count = static_cast<std::uint32_t>(candidate.order.size()),

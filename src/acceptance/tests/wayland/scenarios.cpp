@@ -52,6 +52,10 @@ void workspace_wayland_quiet() {
  session.RunScenario("quiet", true);
 }
 TEST_CASE("workspace_wayland_retained", "[workspace_hardware][workspace_wayland_integration][retained]") { workspace_wayland_retained(); }
+TEST_CASE("workspace_wayland_sparse", "[workspace_hardware][workspace_wayland_integration][sparse]") {
+ WaylandSession session{wayland_inputs(false), TerminationMode::SignalInterrupt, "sparse"};
+ session.RunScenario("sparse", true);
+}
 TEST_CASE("workspace_wayland_workflows", "[workspace_hardware][workspace_wayland_integration][workflows]") { workspace_wayland_workflows(); }
 TEST_CASE("workspace_wayland_dpi", "[workspace_hardware][workspace_wayland_integration][dpi]") { workspace_wayland_dpi(); }
 TEST_CASE("workspace_wayland_terminal", "[workspace_hardware][workspace_wayland_integration][terminal]") { workspace_wayland_terminal(); }

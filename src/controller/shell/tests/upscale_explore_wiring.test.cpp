@@ -56,7 +56,7 @@ private:
  return ExploreChanged{ExploreSnapshot{
   .revision = 7U,
   .ready = true,
-  .dataset = {.image_count = 3U, .image_width = 80U, .image_height = 45U},
+  .dataset = {.image_count = 3U, .slot_count = 3U, .image_width = 80U, .image_height = 45U},
   .viewport = {.extent = {80U, 40U}, .columns = 2U},
   .frame = visual_frame({PresentationSourceKind::Explore, 1U}, {80U, 40U}, 4U),
  }};

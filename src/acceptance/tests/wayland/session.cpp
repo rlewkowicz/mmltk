@@ -1,5 +1,6 @@
 #include "audit_facts.h"
 #include "session.h"
+#include "src/backend/imaging/explore/tests/explore_dataset_fixture.h"
 #include <cstddef>
 #include "src/controller/presentation/annotation_palette.h"
 #include <fcntl.h>
@@ -488,6 +489,14 @@ const mmltk::backend::data::testsupport::FixtureSpec& PreparedWaylandInputs::pro
  }
  return probe_;
 }
+const std::filesystem::path& PreparedWaylandInputs::sparse() {
+ if (sparse_compiled_.empty()) {
+  sparse_compiled_ = mmltk::testsupport::compile_explore_sparse_fixture(
+   root_.path(), 66U, {.source_width = 768, .source_height = 384, .compiled_width = kCompiledResolution, .compiled_height = kCompiledResolution,
+                      .resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}).parent_path();
+ }
+ return sparse_compiled_;
+}
 WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, const TerminationMode terminal, std::string profile, const bool diagnostics_enabled, const bool dpi,
  const bool host_to_device, std::string fault, const bool pixels_enabled, const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture)
     : inputs_(std::move(inputs)),
@@ -500,7 +509,7 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
       pixel_probes(logging && pixels_enabled),
       pixel_fixture(profile_ == "retained" || profile_ == "dpi"),
       probe_failure(std::move(fault)),
-      ordinary_compiled_(profile_ == "retained" ? working.path() / "compiled" : std::filesystem::path{mmltk::backend::data::testsupport::compiled_dir(ordinary_fixture_)}),
+      ordinary_compiled_(profile_ == "sparse" ? inputs_->sparse() : profile_ == "retained" ? working.path() / "compiled" : std::filesystem::path{mmltk::backend::data::testsupport::compiled_dir(ordinary_fixture_)}),
       pixel_audit(pixel_probes) {
  diagnostics = !logging ? quiet_artifacts.path() / "native.jsonl" : configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
  runtime_log = !logging ? quiet_artifacts.path() / "runtime.log" : configured_path("MMLTK_LOG_FILE", latest_wayland_artifact("latest-wayland-test-native.log"));
@@ -1273,6 +1282,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
  if (!viewer_scenario.empty()) {
   if (last && termination != TerminationMode::AbruptPeerLoss) CHECK(terminal == 0);
   CHECK(browser.viewer_complete);
+  if (viewer_scenario == "sparse") CHECK(browser.explore_integer_controls.size() == 2U);
   if (viewer_scenario == "rapid") {
    CHECK(browser.gallery_no_input_complete);
    CHECK(browser.owned_atlas_seen);

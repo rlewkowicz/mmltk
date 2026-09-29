@@ -12,6 +12,76 @@ use crate::integration_control::{
 use crate::view_model::{ApplicationModel, ConnectionState};
 use iced::Rectangle;
 #[test]
+fn sparse_numeric_controls_use_physical_extent_and_wait_for_persisted_high_ranges() {
+    let mut fixture = ProbeFixture::new("sparse");
+    let (mut model, settings) = fps_settings();
+    model.connection = ConnectionState::Connected;
+    let snapshot = model.explore.snapshot.as_mut().unwrap();
+    snapshot.ready = true;
+    snapshot.busy = false;
+    snapshot.revision = 17;
+    snapshot.dataset.imagecount = 2;
+    snapshot.dataset.slotcount = 66;
+    snapshot.filter.minimumcompiledindex = 0;
+    snapshot.filter.maximumcompiledindex = u64::MAX;
+    let router = crate::view::router::Router::default();
+    let drive = |driver: &mut Controller, model: &ApplicationModel| {
+        drop(driver.advance(
+            model,
+            &settings,
+            1.0,
+            &router,
+            FeatureId::Explore,
+            None,
+            false,
+        ));
+    };
+    let driver = &mut fixture.controller;
+    for index in [3, 4] {
+        driver.driver.phase = Phase::ExploreNumericStart(index);
+        drive(driver, &model);
+        assert_eq!(driver.retained.explore_integer_target, 65);
+        driver.driver.phase = Phase::AwaitExploreNumeric { index, step: 4 };
+        let snapshot = model.explore.snapshot.as_mut().unwrap();
+        snapshot.revision += 1;
+        if index == 3 {
+            snapshot.filter.minimumcompiledindex = 65;
+        } else {
+            snapshot.filter.maximumcompiledindex = 65;
+        }
+        drive(driver, &model);
+        assert_eq!(
+            driver.driver.phase,
+            Phase::AwaitExploreNumeric { index, step: 4 }
+        );
+        let saved = &mut model
+            .settings_snapshot
+            .as_mut()
+            .unwrap()
+            .settingsstate
+            .workflows
+            .explore;
+        if index == 3 {
+            saved.mincompiledindex = 65;
+        } else {
+            saved.maxcompiledindex = 65;
+        }
+        drive(driver, &model);
+        assert_eq!(driver.driver.phase, Phase::ExploreNumericStart(index + 1));
+    }
+    drive(driver, &model);
+    assert!(driver.retained.sparse_range_checked);
+    assert_eq!(driver.driver.phase, Phase::AwaitExploreReady);
+    // The ordinary numeric driver also uses the physical domain, while keeping
+    // its existing finite edit and restoration sequence.
+    model.explore.snapshot.as_mut().unwrap().filter.minimumcompiledindex = 0;
+    driver.driver.viewer_scenario = "square".into();
+    driver.driver.phase = Phase::ExploreNumericStart(4);
+    drive(driver, &model);
+    assert_eq!(driver.retained.explore_integer_target, 64);
+}
+
+#[test]
 fn numeric_seed_round_trip_reuses_one_distinct_exact_target_for_typing_and_paste() {
     for baseline in [0, 73, (1_u64 << 53) + 1, (1_u64 << 53) + 3, u64::MAX] {
         let mut fixture = ProbeFixture::new("square");

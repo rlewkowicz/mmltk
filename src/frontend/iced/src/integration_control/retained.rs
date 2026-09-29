@@ -36,6 +36,7 @@ use iced::{Rectangle, Task};
 /// Mutable observations owned by this scenario or mechanism.
 pub(super) struct State {
     explore_paste_read: bool,
+    sparse_range_checked: bool,
     original_roundtrip: u8,
     gallery_completion_held: Option<(u64, u32)>,
     sweep_baseline: Option<(u64, crate::generated::ExploreViewport)>,
@@ -79,6 +80,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             explore_paste_read: false,
+            sparse_range_checked: false,
             original_roundtrip: 0,
             gallery_completion_held: None,
             sweep_baseline: None,
@@ -776,6 +778,30 @@ impl State {
                             explore::Message::Gallery(explore::gallery::Message::ColumnsChanged(4)),
                         ));
                     }
+                    if driver.viewer_scenario == "sparse" {
+                        let expected: &[u32] = if self.sparse_range_checked {
+                            &[65]
+                        } else {
+                            &[0, 65]
+                        };
+                        if snapshot.dataset.imagecount != 2
+                            || snapshot.dataset.slotcount != 66
+                            || snapshot.order.visibleindices != expected
+                            || snapshot.order.matchingcount as usize != expected.len()
+                            || (self.sparse_range_checked
+                                && (snapshot.filter.minimumcompiledindex != 65
+                                    || snapshot.filter.maximumcompiledindex != 65))
+                        {
+                            driver.fail(
+                                "Sparse Explore count, physical range or rendered slot identity differs",
+                            );
+                            return Task::none();
+                        }
+                        if !self.sparse_range_checked {
+                            driver.phase = Phase::ExploreDatasetPane;
+                            return widgets.arm(driver, EXPLORE_DATASET_PANE);
+                        }
+                    }
                     if let Some(task) = pixel_checks.begin_workspace_fps(driver, settings) {
                         return task;
                     }
@@ -1028,6 +1054,10 @@ impl State {
                     return Task::none();
                 }
                 if index == 5 {
+                    if driver.viewer_scenario == "sparse" {
+                        self.sparse_range_checked = true;
+                        return driver.advance_to(Phase::AwaitExploreReady);
+                    }
                     driver.phase = Phase::ExplorePolicyOrderReady;
                     return iced::widget::operation::snap_to(
                         explore::DATASET_SCROLL_ID,
@@ -1037,6 +1067,9 @@ impl State {
                 let value = explore_integer_value(snapshot, index);
                 self.explore_integer_baseline = value;
                 self.explore_integer_target = match index {
+                    3 | 4 if driver.viewer_scenario == "sparse" => {
+                        u64::from(snapshot.dataset.slotcount.saturating_sub(1))
+                    }
                     0 => {
                         if value == 0 {
                             1
@@ -1060,7 +1093,7 @@ impl State {
                         }
                     }
                     _ => value
-                        .min(u64::from(snapshot.dataset.imagecount.saturating_sub(1)))
+                        .min(u64::from(snapshot.dataset.slotcount.saturating_sub(1)))
                         .saturating_sub(1),
                 };
                 self.explore_integer_revision = snapshot.revision;
@@ -1133,6 +1166,9 @@ impl State {
                         )
                     });
                     self.explore_integer_revision = snapshot.revision;
+                    if driver.viewer_scenario == "sparse" {
+                        return driver.advance_to(Phase::ExploreNumericStart(index + 1));
+                    }
                     widgets.replace_numeric_value(self.explore_integer_baseline.to_string());
                     if index == 4 && self.explore_integer_baseline == u64::MAX {
                         driver.phase = Phase::AwaitExploreNumeric { index, step: 5 };
@@ -4023,7 +4059,11 @@ impl State {
             }
             Phase::ExploreDetailsPane => {
                 self.explore_details_pane = Some(bounds);
-                driver.phase = Phase::ExploreNumericStart(0);
+                driver.phase = Phase::ExploreNumericStart(if driver.viewer_scenario == "sparse" {
+                    3
+                } else {
+                    0
+                });
                 None
             }
             Phase::ExploreNumericControl { index, step }
@@ -4224,7 +4264,11 @@ impl State {
                 } else if let Some(step) = away {
                     Phase::AwaitAtlasAwayDetail(step, 0)
                 } else {
-                    Phase::AwaitDetail(index)
+                    Phase::AwaitDetail(if driver.viewer_scenario == "sparse" {
+                        65
+                    } else {
+                        index
+                    })
                 };
                 if !click_after_surface_draw(selected, EXPLORE_GALLERY, revision, true) {
                     driver.fail("viewer first-image click failed");

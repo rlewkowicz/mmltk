@@ -596,12 +596,12 @@ void CompiledImageStream::read_slot(const std::size_t index) noexcept {
    if (!current.annotations.empty()) {
     for (std::size_t i = 0; i < current.reads.size(); ++i) {
      if (current.cancelled.load(std::memory_order_acquire)) break;
-     const auto& read = current.reads[i];
-     const auto position = read.destination_offset / source.header().image_stride;
-     const auto payload = source.label_payload(read.index);
+     const auto& image_read = current.reads[i];
+     const auto position = image_read.destination_offset / source.header().image_stride;
+     const auto payload = source.label_payload(image_read.index);
      auto* destination = static_cast<std::byte*>(current.labels.data()) + position * COMPILED_LABEL_CAPACITY;
      std::memcpy(destination, payload.data(), payload.size());
-     current.annotations[position] = annotation_view(source.image_entry(read.index), {destination, payload.size()});
+     current.annotations[position] = annotation_view(source.image_entry(image_read.index), {destination, payload.size()});
     }
    }
    if (!std::ranges::is_sorted(current.reads, {}, &CompiledImageRead::index)) std::ranges::sort(current.reads, {}, &CompiledImageRead::index);

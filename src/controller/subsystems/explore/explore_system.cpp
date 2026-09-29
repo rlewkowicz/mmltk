@@ -64,13 +64,13 @@ static_assert(std::is_nothrow_move_constructible_v<ExploreOrderCandidate>);
  return selection_valid(filter.class_selection, class_count);
 }
 [[nodiscard]] bool overlay_valid(const ExploreOverlay& overlay, const std::uint32_t class_count) { return selection_valid(overlay.class_selection, class_count); }
-[[nodiscard]] bool range_valid(const ExploreFilter& filter, const std::uint32_t image_count) {
- return image_count != 0U && filter.minimum_compiled_index < image_count && (filter.maximum_compiled_index == std::numeric_limits<std::uint64_t>::max() || filter.maximum_compiled_index < image_count);
+[[nodiscard]] bool range_valid(const ExploreFilter& filter, const std::uint32_t slot_count) {
+ return slot_count != 0U && filter.minimum_compiled_index < slot_count && (filter.maximum_compiled_index == std::numeric_limits<std::uint64_t>::max() || filter.maximum_compiled_index < slot_count);
 }
-void require_policy_valid(const ExploreFilterUpdate& policy, const std::uint32_t class_count, const std::uint32_t image_count, const std::string_view detail) {
- if (!filter_valid(policy.filter, class_count) || !overlay_valid(policy.overlay, class_count) || !range_valid(policy.filter, image_count)) throw contracts::InvalidIntentError(std::string{detail});
+void require_policy_valid(const ExploreFilterUpdate& policy, const std::uint32_t class_count, const std::uint32_t slot_count, const std::string_view detail) {
+ if (!filter_valid(policy.filter, class_count) || !overlay_valid(policy.overlay, class_count) || !range_valid(policy.filter, slot_count)) throw contracts::InvalidIntentError(std::string{detail});
 }
-[[nodiscard]] ExploreFilterUpdate normalize_policy(ExploreFilterUpdate policy, const std::uint32_t class_count, const std::uint32_t image_count) {
+[[nodiscard]] ExploreFilterUpdate normalize_policy(ExploreFilterUpdate policy, const std::uint32_t class_count, const std::uint32_t slot_count) {
  const auto normalize_selection = [class_count](ExploreClassSelection& selection) {
   if (selection.mode != ExploreClassSelectionMode::Subset) {
    selection.classes.clear();
@@ -81,7 +81,7 @@ void require_policy_valid(const ExploreFilterUpdate& policy, const std::uint32_t
  };
  normalize_selection(policy.filter.class_selection);
  normalize_selection(policy.overlay.class_selection);
- const auto last = static_cast<std::uint64_t>(image_count - 1U);
+ const auto last = static_cast<std::uint64_t>(slot_count - 1U);
  policy.filter.minimum_compiled_index = std::min(policy.filter.minimum_compiled_index, last);
  if (policy.filter.maximum_compiled_index != std::numeric_limits<std::uint64_t>::max()) policy.filter.maximum_compiled_index = std::min(policy.filter.maximum_compiled_index, last);
  if (policy.filter.maximum_compiled_index < policy.filter.minimum_compiled_index) policy.filter.minimum_compiled_index = policy.filter.maximum_compiled_index;
@@ -217,13 +217,13 @@ public:
      ExploreOpened opened = algorithm.Open(request.compiled_source, stop);
      if (opened.dataset.image_count == 0U) return cancel_open();
      opened.dataset.class_catalog_identity = explore_class_catalog_identity(opened.dataset.class_names);
-     auto preferences = normalize_policy(settings_candidate.preferences.policy, static_cast<std::uint32_t>(opened.dataset.class_names.size()), opened.dataset.image_count);
+     auto preferences = normalize_policy(settings_candidate.preferences.policy, static_cast<std::uint32_t>(opened.dataset.class_names.size()), opened.dataset.slot_count);
      const bool catalog_changed = settings_candidate.preferences.class_catalog_identity != opened.dataset.class_catalog_identity;
      if (catalog_changed) {
       preferences.filter.class_selection = {};
       preferences.overlay.class_selection = {};
      }
-     require_policy_valid(preferences, static_cast<std::uint32_t>(opened.dataset.class_names.size()), opened.dataset.image_count, "persisted Explore filter is invalid");
+     require_policy_valid(preferences, static_cast<std::uint32_t>(opened.dataset.class_names.size()), opened.dataset.slot_count, "persisted Explore filter is invalid");
      std::uint64_t seed;
      {
       std::scoped_lock policy_lock(mutex_);
@@ -341,7 +341,7 @@ public:
   {
    std::scoped_lock lock(mutex_);
    RequireReady();
-   require_policy_valid(request, static_cast<std::uint32_t>(state_.dataset.class_names.size()), state_.dataset.image_count, "Explore filter is invalid");
+   require_policy_valid(request, static_cast<std::uint32_t>(state_.dataset.class_names.size()), state_.dataset.slot_count, "Explore filter is invalid");
    seed = ResolveSeed(request.filter, false);
   }
   settings_system_.require_loaded();

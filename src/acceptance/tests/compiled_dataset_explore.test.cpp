@@ -10,9 +10,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <utility>
@@ -350,6 +352,119 @@ void require_explore_transport(const bool h2d) {
  int dmabuf = 0;
  const auto status = cuDeviceGetAttribute(&dmabuf, static_cast<CUdevice_attribute>(152), 0);
  if (!(status == CUDA_SUCCESS && dmabuf != 0) && ::access("/dev/gdrdrv", R_OK | W_OK) != 0) SKIP("GDR hardware unavailable; Explore GDR acceptance remains unverified");
+}
+void test_compiled_explore_sparse_physical_slots() {
+ const auto slot_count = GENERATE(66U, 68U);
+ mmltk::testsupport::ScopedTempDir root{"mmltk-explore-sparse"};
+ const auto path = mmltk::testsupport::compile_explore_sparse_fixture(root.path(), slot_count);
+ const auto store = data::CompiledDataset::open(path);
+ REQUIRE(store.header().num_images == 2U);
+ REQUIRE(store.slot_count() == slot_count);
+ REQUIRE(std::ranges::equal(store.eligible_slots(), std::array{0U, 65U}));
+ REQUIRE(store.image_labels(0U).empty());
+ REQUIRE_FALSE(store.image_labels(65U).empty());
+ CHECK_THROWS_AS(store.image_labels(1U), std::out_of_range);
+ const auto summaries = explore::build_explore_summaries(store);
+ CHECK(summaries.size() == slot_count);
+ CHECK(std::ranges::count(summaries, true, &explore::ExploreImageSummary::eligible) == 2);
+ controller::SettingsSystem settings;
+ load_explore_transport(settings, root.path() / "gui.json", true);
+ controller::contracts::SettingsUpdateRequest augmentation;
+ augmentation.updates.push_back({.path = "workflows.train.request.gpu_augmentation.copy_paste_probability", .value = mmltk::frameworks::serialization::wire::FlatValue{1.0}});
+ static_cast<void>(settings.Update(std::move(augmentation)));
+ NativeExploreFixture fixture(settings, true);
+ auto& system = fixture.system;
+ auto& audit = fixture.audit;
+ const controller::ExploreViewport viewport{.extent = {64U, 32U}, .row_count = 1U, .columns = 2U};
+ const auto settle = [&](const controller::ExploreSnapshot& admitted) {
+  REQUIRE(audit.Wait([&] {
+   const auto snapshot = system.snapshot();
+   return snapshot.ready && !snapshot.busy && !snapshot.render_pending && snapshot.revision > admitted.revision &&
+          snapshot.gallery.slots.size() == snapshot.order.visible_indices.size() && std::ranges::all_of(snapshot.gallery.slots, [](bool ready) { return ready; });
+  }));
+  REQUIRE(system.snapshot().failure.empty());
+  check_published_frame(system);
+ };
+ settle(system.Open({.viewport = viewport, .compiled_source = path.string()}));
+ CHECK(system.snapshot().dataset.image_count == 2U);
+ CHECK(system.snapshot().dataset.slot_count == slot_count);
+ CHECK(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{0U, 65U});
+ const auto filter = [&](const std::uint64_t minimum, const std::uint64_t maximum) {
+  auto policy = controller::ExploreFilterUpdate{.filter = system.snapshot().filter, .overlay = system.snapshot().overlay};
+  policy.filter.minimum_compiled_index = minimum;
+  policy.filter.maximum_compiled_index = maximum;
+  settle(system.UpdateFilter(policy));
+  CHECK(system.snapshot().filter.minimum_compiled_index == minimum);
+  CHECK(system.snapshot().filter.maximum_compiled_index == maximum);
+ };
+ filter(1U, 64U);
+ CHECK(system.snapshot().order.matching_count == 0U);
+ CHECK(system.snapshot().order.visible_indices.empty());
+ CHECK_THROWS_AS(system.Select({.compiled_index = 1U}), controller::contracts::InvalidIntentError);
+ filter(65U, 65U);
+ CHECK(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{65U});
+ filter(65U, std::numeric_limits<std::uint64_t>::max());
+ CHECK(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{65U});
+ if (slot_count > 66U) {
+  filter(66U, slot_count - 1U);
+  CHECK(system.snapshot().order.matching_count == 0U);
+ }
+ filter(0U, std::numeric_limits<std::uint64_t>::max());
+ auto outside = controller::ExploreFilterUpdate{.filter = system.snapshot().filter, .overlay = system.snapshot().overlay};
+ outside.filter.maximum_compiled_index = slot_count;
+ CHECK_THROWS_AS(system.UpdateFilter(outside), controller::contracts::InvalidIntentError);
+ outside.filter.maximum_compiled_index = std::numeric_limits<std::uint64_t>::max();
+ outside.filter.minimum_compiled_index = slot_count;
+ CHECK_THROWS_AS(system.UpdateFilter(outside), controller::contracts::InvalidIntentError);
+ // The only annotated donor is physical slot 65; every intervening and
+ // trailing slot was removed from the admitted population.
+ filter(0U, 0U);
+ settle(system.UpdateAugmentation({.enabled = true}));
+ REQUIRE(audit.Wait([&] { return audit.donor_count() != 0U && audit.last_valid_donors() != 0U; }));
+ settle(system.UpdateAugmentation({.enabled = false}));
+ filter(0U, std::numeric_limits<std::uint64_t>::max());
+ auto shuffled = controller::ExploreFilterUpdate{.filter = system.snapshot().filter, .overlay = system.snapshot().overlay};
+ shuffled.filter.order = controller::ExploreOrder::Shuffled;
+ shuffled.filter.shuffle_seed = 97U;
+ settle(system.UpdateFilter(shuffled));
+ auto order = system.snapshot().order.visible_indices;
+ std::ranges::sort(order);
+ CHECK(order == std::vector<std::uint32_t>{0U, 65U});
+ const auto detail = [&](const controller::ExploreSnapshot& admitted, const std::uint32_t selected) {
+  REQUIRE(audit.Wait([&] {
+   const auto snapshot = system.snapshot();
+   return !snapshot.busy && snapshot.revision > admitted.revision && snapshot.mode == controller::ExploreMode::Detail && snapshot.selected_image == selected;
+  }));
+  check_published_frame(system);
+ };
+ detail(system.Select({.compiled_index = 65U}), 65U);
+ CHECK_FALSE(system.snapshot().scene.objects.empty());
+ detail(system.Navigate({.direction = controller::ExploreNavigation::Next}), 0U);
+ CHECK(system.snapshot().scene.objects.empty());
+ detail(system.Navigate({.direction = controller::ExploreNavigation::Previous}), 65U);
+ settle(system.CloseDetail());
+ filter(65U, 65U);
+ const auto prior = system.snapshot();
+ const auto saved_policy = settings.explore_settings_candidate().preferences.policy;
+ const auto corrupt = mmltk::testsupport::corrupt_explore_label_index(path, root.path() / "corrupt.bin");
+ const auto failed = system.Open({.viewport = viewport, .compiled_source = corrupt.string()});
+ REQUIRE(audit.Wait([&] { return !system.snapshot().busy && system.snapshot().revision > failed.revision && !system.snapshot().failure.empty(); }));
+ CHECK(system.snapshot().ready);
+ CHECK(system.snapshot().dataset.identity == prior.dataset.identity);
+ CHECK(system.snapshot().dataset.image_count == 2U);
+ CHECK(system.snapshot().dataset.slot_count == slot_count);
+ CHECK(system.snapshot().filter == prior.filter);
+ CHECK(system.snapshot().order.visible_indices == prior.order.visible_indices);
+ CHECK(system.snapshot().frame == prior.frame);
+ CHECK(settings.explore_settings_candidate().preferences.policy.filter == saved_policy.filter);
+ CHECK(settings.explore_settings_candidate().preferences.policy.overlay == saved_policy.overlay);
+ check_published_frame(system);
+ // Reopening restores the saved high physical range rather than clamping it
+ // to the eligible population's last ordinal.
+ settle(system.Open({.viewport = viewport, .compiled_source = path.string()}));
+ CHECK(system.snapshot().filter.minimum_compiled_index == 65U);
+ CHECK(system.snapshot().filter.maximum_compiled_index == 65U);
+ CHECK(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{65U});
 }
 void test_compiled_dataset_explore_projection_navigation_and_streaming() {
  const bool h2d = GENERATE(true, false);
@@ -1462,3 +1577,4 @@ TEST_CASE("test_compiled_explore_cancelled_lane_preserves_atomic_product", "[acc
 TEST_CASE("test_native_explore_transaction_faults_and_inactive_release", "[acceptance][backend-data][explore][transaction]") { test_native_explore_transaction_faults_and_inactive_release(); }
 TEST_CASE("test_compiled_explore_magnified_tiny_mask_and_transfer", "[acceptance][backend-data][explore][support]") { test_compiled_explore_magnified_tiny_mask_and_transfer(); }
 TEST_CASE("test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer", "[acceptance][explore][copy_paste]") { test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer(); }
+TEST_CASE("test_compiled_explore_sparse_physical_slots", "[acceptance][backend-data][explore]") { test_compiled_explore_sparse_physical_slots(); }

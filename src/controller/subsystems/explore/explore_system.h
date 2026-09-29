@@ -77,7 +77,9 @@ struct ExploreNavigate final {
 };
 struct ExploreDatasetFacts final {
  std::uint64_t identity = 0U;
+ // Population counts eligible images; compiled indices address physical slots.
  std::uint32_t image_count = 0U;
+ std::uint32_t slot_count = 0U;
  std::uint32_t image_width = 0U;
  std::uint32_t image_height = 0U;
  ExploreClassCatalogIdentity class_catalog_identity = 0U;

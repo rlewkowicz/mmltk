@@ -155,7 +155,7 @@ pub(super) fn view<'a>(
         !settings_model.has_local_edits() && model.explore_mutation_available();
     let dialog = custom_compiled_dialog();
     let last_compiled_index =
-        snapshot.map_or(0, |value| value.dataset.imagecount.saturating_sub(1) as u64);
+        snapshot.map_or(0, |value| value.dataset.slotcount.saturating_sub(1) as u64);
 
     let sources = crate::generated::EXPLORE_DATASET_SOURCE_VALUES
         .iter()

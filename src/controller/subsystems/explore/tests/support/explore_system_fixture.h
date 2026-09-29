@@ -271,7 +271,7 @@ public:
   probe_->opened_source = source;
   order_ = {0U, 1U, 2U, 3U, 4U, 5U};
   return {
-   .dataset = {.image_count = 6U, .image_width = 4U, .image_height = 4U},
+   .dataset = {.image_count = 6U, .slot_count = 6U, .image_width = 4U, .image_height = 4U},
    .order = Visible({}),
   };
  }
@@ -547,7 +547,7 @@ public:
   const std::vector<mmltk::backend::data::catalog::ClassName> class_names =
    source == "/different-catalog" ? std::vector<mmltk::backend::data::catalog::ClassName>{{"animal"}, {"building"}} : std::vector<mmltk::backend::data::catalog::ClassName>{{"person"}, {"vehicle"}};
   return {
-   .dataset = {.image_count = 3U, .image_width = 64U, .image_height = 64U, .class_names = class_names},
+   .dataset = {.image_count = 3U, .slot_count = 3U, .image_width = 64U, .image_height = 64U, .class_names = class_names},
    .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()), .visible_indices = candidate_order_}
   };
  }

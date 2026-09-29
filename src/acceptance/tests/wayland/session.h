@@ -44,12 +44,14 @@ public:
  [[nodiscard]] const auto& mixed() const noexcept { return mixed_; }
  [[nodiscard]] const mmltk::testsupport::WorkflowWaylandInputs& workflows();
  [[nodiscard]] const mmltk::backend::data::testsupport::FixtureSpec& probe();
+ [[nodiscard]] const std::filesystem::path& sparse();
 
 private:
  ScopedTempDir root_;
  mmltk::backend::data::testsupport::FixtureSpec square_;
  mmltk::backend::data::testsupport::FixtureSpec mixed_;
  mmltk::backend::data::testsupport::FixtureSpec probe_;
+ std::filesystem::path sparse_compiled_;
  std::unique_ptr<mmltk::testsupport::WorkflowWaylandInputs> workflows_;
 };
 // One owner retains the process, resources, physical evidence and byte cursors.

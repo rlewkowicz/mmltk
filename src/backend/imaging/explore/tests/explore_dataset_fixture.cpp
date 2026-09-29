@@ -4,19 +4,23 @@
 #include <stdexcept>
 #include <iomanip>
 #include <sstream>
+#include <limits>
+#include <vector>
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
 namespace mmltk::testsupport {
 std::filesystem::path compile_explore_fixture(
- const std::filesystem::path& temporary_root, const std::string_view fixture_name, const int num_images, const ExploreFixtureDimensions dimensions, const ExploreFixtureAnnotations annotations) {
+ const std::filesystem::path& temporary_root, const std::string_view fixture_name, const int num_images, const ExploreFixtureDimensions dimensions, const ExploreFixtureAnnotations annotations,
+ const bool pixel_evidence) {
  const backend::data::testsupport::FixtureSpec fixture{
   .root_dir = (temporary_root / fixture_name).string(),
   .split = "train",
   .width = dimensions.source_width,
   .height = dimensions.source_height,
   .num_images = num_images,
+  .pixel_evidence = pixel_evidence,
  };
  backend::data::testsupport::create_synthetic_dataset(fixture);
  if (annotations.objects != 0U) {
@@ -83,6 +87,27 @@ std::filesystem::path compile_explore_fixture(
  return backend::data::testsupport::compiled_bin_path(fixture);
 }
 std::filesystem::path compile_explore_membership_fixture(const std::filesystem::path& temporary_root) { return compile_explore_fixture(temporary_root, "membership-fixture", 12); }
+std::filesystem::path compile_explore_sparse_fixture(const std::filesystem::path& temporary_root, const std::uint32_t slot_count, const ExploreFixtureDimensions dimensions) {
+ if (slot_count < 66U || slot_count > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) throw std::invalid_argument("Explore sparse fixture requires at least 66 physical slots");
+ const auto path = compile_explore_fixture(temporary_root, "sparse-fixture", static_cast<int>(slot_count), dimensions, {}, true);
+ std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
+ backend::data::FileHeader header{};
+ file.read(reinterpret_cast<char*>(&header), sizeof(header));
+ if (!file || header.num_slots != slot_count) throw std::runtime_error("Explore sparse fixture has an unexpected physical extent");
+ std::vector<backend::data::ImageEntry> entries(slot_count);
+ file.seekg(static_cast<std::streamoff>(header.index_offset));
+ file.read(reinterpret_cast<char*>(entries.data()), static_cast<std::streamsize>(entries.size() * sizeof(entries.front())));
+ if (!file || entries[0].num_instances != 0U || entries[65].num_instances == 0U) throw std::runtime_error("Explore sparse fixture requires background and annotated endpoints");
+ for (std::uint32_t slot = 0U; slot != slot_count; ++slot)
+  if (slot != 0U && slot != 65U) entries[slot] = {};
+ header.num_images = 2U;
+ file.seekp(0);
+ file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+ file.seekp(static_cast<std::streamoff>(header.index_offset));
+ file.write(reinterpret_cast<const char*>(entries.data()), static_cast<std::streamsize>(entries.size() * sizeof(entries.front())));
+ if (!file) throw std::runtime_error("Explore sparse fixture metadata write failed");
+ return path;
+}
 std::filesystem::path corrupt_explore_label_index(const std::filesystem::path& source, const std::filesystem::path& destination) {
  if (!std::filesystem::copy_file(source, destination, std::filesystem::copy_options::overwrite_existing)) throw std::runtime_error("failed to copy Explore corruption fixture");
  std::fstream file{destination, std::ios::binary | std::ios::in | std::ios::out};

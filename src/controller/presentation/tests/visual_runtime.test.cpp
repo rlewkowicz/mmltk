@@ -86,7 +86,7 @@ class FailingExploreAlgorithm final : public SynchronousExploreAlgorithm {
 public:
  ExploreOpened Open(std::string_view, std::stop_token) override {
   return {
-   .dataset = {.image_count = 1U, .image_width = 32U, .image_height = 32U},
+   .dataset = {.image_count = 1U, .slot_count = 1U, .image_width = 32U, .image_height = 32U},
    .order = {.matching_count = 1U, .visible_indices = {0U}},
   };
  }

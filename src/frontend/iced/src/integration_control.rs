@@ -1129,6 +1129,7 @@ impl SessionInputs {
                 .get(index)
                 .copied(),
             "terminal" => [("terminal", false)].get(index).copied(),
+            "sparse" => [("sparse", false)].get(index).copied(),
             _ => None,
         }
     }

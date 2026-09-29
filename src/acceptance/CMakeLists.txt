@@ -181,6 +181,7 @@ if(BUILD_RFDETR_NATIVE)
         mmltk::backend::ml::torch_dependencies
         mmltk_backend_data_test_support
         CUDA::cuda_driver
+        mmltk_backend_imaging_explore_test_support
         nlohmann_json)
     mmltk_link_declarations(mmltk_workspace_wayland_integration PRIVATE
         mmltk::backend::imaging::raster
