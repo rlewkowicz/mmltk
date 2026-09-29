@@ -132,8 +132,8 @@ private:
 };
 void validate_inventory_header(const InventoryHeader&, const InventoryHeader&);
 template <class Records, class Recovery = std::span<const CoconutRecoveryImage>>
-std::string encode_inventory(InventoryOutput& output, const InventoryHeader& header, const Records& records, mmltk::common::concurrency::CancellationObservation cancellation, std::uint32_t policy = 0, std::string_view original = {},
- const Recovery& recovery = {}) {
+std::string encode_inventory(InventoryOutput& output, const InventoryHeader& header, const Records& records, mmltk::common::concurrency::CancellationObservation cancellation, std::uint32_t policy = 0,
+ std::string_view original = {}, const Recovery& recovery = {}) {
  output.value(header);
  for (const auto& record : records) {
   throw_if_benchmark_cancelled(cancellation);
@@ -152,8 +152,8 @@ std::string encode_inventory(InventoryOutput& output, const InventoryHeader& hea
 }
 void validate_coconut_physical_image(const CoconutPhysicalImage&);
 // Full archive inventory, independent of annotations/foreground selection. Cache is identity-bound.
-[[nodiscard]] std::vector<CoconutPhysicalImage> load_coconut_physical_inventory(const std::filesystem::path&, CoconutImageNamespace, std::uint16_t, std::string_view,
- mmltk::common::concurrency::CancellationObservation, const std::function<void(const CoconutPhysicalImage&)>&);
+[[nodiscard]] std::vector<CoconutPhysicalImage> load_coconut_physical_inventory(
+ const std::filesystem::path&, CoconutImageNamespace, std::uint16_t, std::string_view, mmltk::common::concurrency::CancellationObservation, const std::function<void(const CoconutPhysicalImage&)>&);
 void store_coconut_physical_inventory(const std::filesystem::path&, std::span<const CoconutPhysicalImage>, CoconutImageNamespace, std::uint16_t, std::string_view,
  mmltk::common::concurrency::CancellationObservation, StorageReservationPool*);
 }  // namespace mmltk::backend::data::benchmark_internal

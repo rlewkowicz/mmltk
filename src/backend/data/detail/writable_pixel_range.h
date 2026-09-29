@@ -13,6 +13,7 @@ public:
  WritablePixelRange(int file_descriptor, const FileLayout&);
  void grow(const FileLayout&);
  [[nodiscard]] float* image(std::uint32_t slot) const;
+
 private:
  int descriptor_;
  FileLayout layout_;

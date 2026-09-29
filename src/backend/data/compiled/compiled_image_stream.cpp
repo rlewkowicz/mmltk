@@ -198,10 +198,15 @@ struct CompiledImageStream::Impl {
  template <class Storage, class Operation>
  void prepare_storage(StorageKind kind, std::size_t index, Storage& storage, Operation&& operation) {
   const auto observer = config.storage_growth;
-  if (!observer.grown) { operation(); return; }
+  if (!observer.grown) {
+   operation();
+   return;
+  }
   const auto capacity = [&] {
-   if constexpr (requires { storage.capacity_bytes(); }) return storage.capacity_bytes();
-   else return storage.capacity() * sizeof(typename Storage::value_type);
+   if constexpr (requires { storage.capacity_bytes(); })
+    return storage.capacity_bytes();
+   else
+    return storage.capacity() * sizeof(typename Storage::value_type);
   };
   const auto before = capacity();
   operation();
@@ -548,7 +553,6 @@ std::span<const std::byte> CompiledImageStream::host_images(const std::size_t in
   if (failure) std::rethrow_exception(failure);
   if (!complete) throw std::runtime_error("CPU image view read cancelled");
  }
-
  return {static_cast<const std::byte*>(slot.host.data()), bytes};
 }
 const CompiledImageStream::Buffer& CompiledImageStream::host_storage(const std::size_t slot) const { return impl_->slots.at(slot)->host; }
@@ -670,9 +674,7 @@ void CompiledImageStream::cancel_read(const std::size_t index) noexcept {
  impl_->changed.notify_all();
 }
 void CompiledImageStream::wait_reads() {
- if (impl_->pool && impl_->private_pool) {
-  impl_->pool->wait_idle();
- }
+ if (impl_->pool && impl_->private_pool) { impl_->pool->wait_idle(); }
  std::unique_lock lock(impl_->mutex);
  impl_->changed.wait(lock, [&] { return std::ranges::all_of(impl_->slots, [](const auto& slot) { return !slot->reading && slot->read_callbacks == 0; }); });
 }

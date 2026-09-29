@@ -19,7 +19,8 @@ namespace {
 }  // namespace
 std::string coconut_image_input_identity(std::string_view annotations, const CoconutPhysicalImage& physical, std::string_view originals) {
  const auto material = nlohmann::json{
-  {"domain", "coconut-image-labels-v1"}, {"annotations", annotations}, {"physical", {physical.source == CoconutImageNamespace::CocoUnlabeled ? CoconutImageNamespace::CocoTrain : physical.source, physical.image_id}},
+  {"domain", "coconut-image-labels-v1"}, {"annotations", annotations},
+  {"physical", {physical.source == CoconutImageNamespace::CocoUnlabeled ? CoconutImageNamespace::CocoTrain : physical.source, physical.image_id}},
   {"recovery_policy", originals.empty() ? 0 : kCoconutRecoveryPolicy}, {"originals", originals}
  }.dump();
  return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(material.data()), material.size())));
@@ -82,7 +83,8 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::bind(std::shared_p
  if (source->inventory_.physical == physical) return source;
  auto lineage = std::make_shared<CoconutNativeLineage>(*source->lineage_);
  lineage->component.source = physical.source;
- lineage->index.source = physical.source == CoconutImageNamespace::Objects365V1 || physical.source == CoconutImageNamespace::Objects365V2 ? BenchmarkDatasetSource::kObjects365V2 : BenchmarkDatasetSource::kCoco2017;
+ lineage->index.source =
+  physical.source == CoconutImageNamespace::Objects365V1 || physical.source == CoconutImageNamespace::Objects365V2 ? BenchmarkDatasetSource::kObjects365V2 : BenchmarkDatasetSource::kCoco2017;
  lineage->index.split = "coconut-" + std::to_string(static_cast<unsigned>(lineage->component.edition)) + "-" + std::to_string(static_cast<unsigned>(physical.source));
  auto result = std::shared_ptr<CoconutNativeImage>(new CoconutNativeImage(std::move(lineage)));
  result->image_ = source->image_;
@@ -136,7 +138,8 @@ std::vector<CoconutSegmentSupport> CoconutNativeWorkspace::take_support(std::siz
  }
  return result;
 }
-void CoconutNativeWorkspace::borrow_support(const CoconutRecord& record, std::span<const CoconutSegmentSupport> input, dataset::MaskDimensions dimensions, std::shared_ptr<const void> owner, std::uint32_t unlisted_segment) {
+void CoconutNativeWorkspace::borrow_support(
+ const CoconutRecord& record, std::span<const CoconutSegmentSupport> input, dataset::MaskDimensions dimensions, std::shared_ptr<const void> owner, std::uint32_t unlisted_segment) {
  unlisted_segment_ = unlisted_segment;
  if (input.size() != record.segments.size() || !owner || !dimensions.width || !dimensions.height) throw std::logic_error("COCONut: invalid native support custody");
  active_record_ = nullptr;
@@ -206,7 +209,10 @@ void CoconutNativeWorkspace::decode(const CoconutRecord& record, std::span<const
   support.valid = segment.valid && segment.id != 0 && segment.id <= 0xffffffU;
   if (!support.valid) continue;
   auto& entry = segment_entry(segment.id);
-  if (entry.id) { support_[entry.index].valid = support.valid = false; continue; }
+  if (entry.id) {
+   support_[entry.index].valid = support.valid = false;
+   continue;
+  }
   entry = {segment.id, i};
  }
  const std::uint32_t count = static_cast<std::uint32_t>(static_cast<std::uint64_t>(width) * height);
@@ -223,8 +229,15 @@ void CoconutNativeWorkspace::decode(const CoconutRecord& record, std::span<const
   while (end < row_end && id_at(end) == id) ++end;
   if (id != 0) {
    const auto& found = segment_entry(id);
-   if (!found.id) { if (!unlisted_segment_) unlisted_segment_ = id; begin = end; continue; }
-   if (!support_[found.index].valid) { begin = end; continue; }
+   if (!found.id) {
+    if (!unlisted_segment_) unlisted_segment_ = id;
+    begin = end;
+    continue;
+   }
+   if (!support_[found.index].valid) {
+    begin = end;
+    continue;
+   }
    auto& support = support_[found.index];
    support.area += end - begin;
    dataset::include_row_major_mask_run(&support.bounds, begin, end, static_cast<std::uint32_t>(width));
@@ -258,58 +271,58 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::finish(const C
   ++product->rejected_.raw_records;
   if (!segment.isthing) continue;
   try {
-  if (!segment.valid || !support.valid) invalid("malformed or ambiguous required segment");
-  const auto& categories = coconut_categories().target_by_id;
-  if (segment.category_id >= categories.size() || categories[segment.category_id] < 0) invalid("unknown COCO80 thing category " + std::to_string(segment.category_id));
-  if (segment.area && (!std::isfinite(*segment.area) || *segment.area < 0)) invalid("invalid supplied area");
-  NormalizedBox box;
-  if (support.recovered) {
-   box.x1 = support.recovered->x1;
-   box.y1 = support.recovered->y1;
-   box.x2 = support.recovered->x2;
-   box.y2 = support.recovered->y2;
-  } else if (segment.bbox) {
-   const auto& supplied = *segment.bbox;
-   if (!std::ranges::all_of(supplied, [](double value) { return std::isfinite(value); }) || supplied[2] <= 0 || supplied[3] <= 0 || !std::isfinite(supplied[0] + supplied[2]) ||
-       !std::isfinite(supplied[1] + supplied[3]))
-    invalid("invalid authoritative COCO bbox");
-   box.x1 = static_cast<float>(supplied[0] / width);
-   box.y1 = static_cast<float>(supplied[1] / height);
-   box.x2 = static_cast<float>((supplied[0] + supplied[2]) / width);
-   box.y2 = static_cast<float>((supplied[1] + supplied[3]) / height);
-  } else {
-   if (support.area == 0) {
-    ++product->rejected_.degenerate_boxes;
-    ++recovery.unresolved;
-    if (component.recovery_policy) recovery.omissions.push_back({segment.id, record.first_segment_ordinal + ordinal, segment.category_id, 0});
-    if (rejected_object) {
-     try {
-      rejected_object(physical, record, segment, "thing segment has neither mask pixels nor an authoritative bbox", component.recovery_policy);
-     } catch (...) {
-      // Reporting a discarded object cannot interrupt compilation.
+   if (!segment.valid || !support.valid) invalid("malformed or ambiguous required segment");
+   const auto& categories = coconut_categories().target_by_id;
+   if (segment.category_id >= categories.size() || categories[segment.category_id] < 0) invalid("unknown COCO80 thing category " + std::to_string(segment.category_id));
+   if (segment.area && (!std::isfinite(*segment.area) || *segment.area < 0)) invalid("invalid supplied area");
+   NormalizedBox box;
+   if (support.recovered) {
+    box.x1 = support.recovered->x1;
+    box.y1 = support.recovered->y1;
+    box.x2 = support.recovered->x2;
+    box.y2 = support.recovered->y2;
+   } else if (segment.bbox) {
+    const auto& supplied = *segment.bbox;
+    if (!std::ranges::all_of(supplied, [](double value) { return std::isfinite(value); }) || supplied[2] <= 0 || supplied[3] <= 0 || !std::isfinite(supplied[0] + supplied[2]) ||
+        !std::isfinite(supplied[1] + supplied[3]))
+     invalid("invalid authoritative COCO bbox");
+    box.x1 = static_cast<float>(supplied[0] / width);
+    box.y1 = static_cast<float>(supplied[1] / height);
+    box.x2 = static_cast<float>((supplied[0] + supplied[2]) / width);
+    box.y2 = static_cast<float>((supplied[1] + supplied[3]) / height);
+   } else {
+    if (support.area == 0) {
+     ++product->rejected_.degenerate_boxes;
+     ++recovery.unresolved;
+     if (component.recovery_policy) recovery.omissions.push_back({segment.id, record.first_segment_ordinal + ordinal, segment.category_id, 0});
+     if (rejected_object) {
+      try {
+       rejected_object(physical, record, segment, "thing segment has neither mask pixels nor an authoritative bbox", component.recovery_policy);
+      } catch (...) {
+       // Reporting a discarded object cannot interrupt compilation.
+      }
      }
+     continue;
     }
-    continue;
+    box.x1 = static_cast<float>(static_cast<double>(support.bounds.min_x) / width);
+    box.y1 = static_cast<float>(static_cast<double>(support.bounds.min_y) / height);
+    box.x2 = static_cast<float>(static_cast<double>(support.bounds.max_x) / width);
+    box.y2 = static_cast<float>(static_cast<double>(support.bounds.max_y) / height);
    }
-   box.x1 = static_cast<float>(static_cast<double>(support.bounds.min_x) / width);
-   box.y1 = static_cast<float>(static_cast<double>(support.bounds.min_y) / height);
-   box.x2 = static_cast<float>(static_cast<double>(support.bounds.max_x) / width);
-   box.y2 = static_cast<float>(static_cast<double>(support.bounds.max_y) / height);
-  }
-  if (!std::isfinite(box.x1) || !std::isfinite(box.y1) || !std::isfinite(box.x2) || !std::isfinite(box.y2) || box.x2 <= box.x1 || box.y2 <= box.y1)
-   invalid("normalized box coordinates are not representable");
-  if (support.runs.size() > UINT32_MAX) invalid("normalized RLE count overflow");
-  box.mask_rle_offset = product->runs_.size();
-  box.mask_rle_pairs = static_cast<std::uint32_t>(support.runs.size());
-  box.class_id = static_cast<std::uint8_t>(categories[segment.category_id]);
-  box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory | (segment.crowd ? kAnnotationCrowd : 0U) | (segment.ignore ? kAnnotationIgnore : 0U);
-  box.original_area = support.recovered ? support.recovered->original_area : support.carved ? static_cast<double>(support.area) : segment.area.value_or(static_cast<double>(support.area));
-  box.annotation_id = segment.id;
-  box.source_category_id = segment.category_id;
-  box.source_ordinal = record.first_segment_ordinal + ordinal;
-  product->runs_.insert(product->runs_.end(), support.runs.begin(), support.runs.end());
-  product->boxes_.push_back(box);
-  ++image.box_count;
+   if (!std::isfinite(box.x1) || !std::isfinite(box.y1) || !std::isfinite(box.x2) || !std::isfinite(box.y2) || box.x2 <= box.x1 || box.y2 <= box.y1)
+    invalid("normalized box coordinates are not representable");
+   if (support.runs.size() > UINT32_MAX) invalid("normalized RLE count overflow");
+   box.mask_rle_offset = product->runs_.size();
+   box.mask_rle_pairs = static_cast<std::uint32_t>(support.runs.size());
+   box.class_id = static_cast<std::uint8_t>(categories[segment.category_id]);
+   box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory | (segment.crowd ? kAnnotationCrowd : 0U) | (segment.ignore ? kAnnotationIgnore : 0U);
+   box.original_area = support.recovered ? support.recovered->original_area : support.carved ? static_cast<double>(support.area) : segment.area.value_or(static_cast<double>(support.area));
+   box.annotation_id = segment.id;
+   box.source_category_id = segment.category_id;
+   box.source_ordinal = record.first_segment_ordinal + ordinal;
+   product->runs_.insert(product->runs_.end(), support.runs.begin(), support.runs.end());
+   product->boxes_.push_back(box);
+   ++image.box_count;
   } catch (const CoconutInputError& error) {
    ++product->rejected_.malformed_records;
    if (rejected_object) rejected_object(physical, record, segment, error.what(), component.recovery_policy);
@@ -317,7 +330,8 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::finish(const C
  }
  if (unlisted_segment_) {
   ++product->rejected_.malformed_records;
-  if (rejected_object) rejected_object(physical, record, {.id = unlisted_segment_, .isthing = true, .valid = false}, "panoptic pixels have unlisted segment IDs; first unlisted ID reported", component.recovery_policy);
+  if (rejected_object)
+   rejected_object(physical, record, {.id = unlisted_segment_, .isthing = true, .valid = false}, "panoptic pixels have unlisted segment IDs; first unlisted ID reported", component.recovery_policy);
  }
  product->required_labels_valid_ = image.box_count != 0 || (!unlisted_segment_ && std::ranges::none_of(record.segments, [](const auto& segment) { return segment.isthing || !segment.valid; }));
  product->image_ = image;
@@ -328,7 +342,8 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::finish(const C
  return product;
 }
 std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::reuse(const CoconutRecord& record, const CoconutPhysicalImage& physical, const NormalizedAnnotationReadView& source,
- std::size_t position, const CoconutInventoryImage& inventory, const CoconutRecoveryImage* recovered, std::shared_ptr<const CoconutNativeLineage> lineage, std::string_view dependency, bool required_labels_valid) {
+ std::size_t position, const CoconutInventoryImage& inventory, const CoconutRecoveryImage* recovered, std::shared_ptr<const CoconutNativeLineage> lineage, std::string_view dependency,
+ bool required_labels_valid) {
  if (!lineage || lineage->component.source != physical.source || inventory.physical != physical) throw std::logic_error("COCONut: reused native image has no matching physical input");
  auto product = std::shared_ptr<CoconutNativeImage>(new CoconutNativeImage(std::move(lineage)));
  product->segment_begin_ = record.first_segment_ordinal;

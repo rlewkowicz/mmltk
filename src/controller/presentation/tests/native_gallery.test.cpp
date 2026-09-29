@@ -79,7 +79,9 @@ void write_gallery_artifact(const std::filesystem::path& path, const float red, 
   entry.status = data::ImageStatus::Eligible;
   entry.original_width = entry.original_height = 8;
   data::set_annotation_extent(entry, 1, 1, std::to_string(index));
-  const data::PackedInstance label{.class_id = 0, .flags = data::kAnnotationMask, .bbox_x1 = 1, .bbox_y1 = 1, .bbox_x2 = 7, .bbox_y2 = 7, .mask_rle_offset = 0, .mask_rle_pairs = 1, .original_area = 4};
+  const data::PackedInstance label{
+   .class_id = 0, .flags = data::kAnnotationMask, .bbox_x1 = 1, .bbox_y1 = 1, .bbox_x2 = 7, .bbox_y2 = 7, .mask_rle_offset = 0, .mask_rle_pairs = 1, .original_area = 4
+  };
   const data::RLEPair run{mask_start, 4};
   std::array<float, 8U * 8U * 3U> pixels{};
   for (std::size_t pixel = 0; pixel < 64; ++pixel) {
@@ -90,7 +92,6 @@ void write_gallery_artifact(const std::filesystem::path& path, const float red, 
   output.pwrite_all(pixels.data(), sizeof(pixels), layout.pixel_offset(index));
   data::write_compiled_annotations(output, layout, index, entry, {{&label, 1}, {&run, 1}});
  }
-
 }
 struct GalleryEvidence final {
  std::mutex mutex;

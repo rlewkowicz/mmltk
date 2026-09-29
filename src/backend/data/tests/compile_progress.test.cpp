@@ -810,7 +810,6 @@ TEST_CASE("compiled layout checks alignment and arithmetic without storage", "[b
  }
  CHECK_THROWS(make_file_header({1U, 1U, 1U, 3U, 65536U, 12U}, names, layout));
 }
-
 TEST_CASE("fixed pixel mappings retain borrowed addresses across sparse block growth", "[backend][data][compiler]") {
  const mmltk::testsupport::ScopedTempDir root("stable-compiled-blocks");
  const auto file = FileHandle::create_output((root.path() / "slots.bin").string(), 0);
@@ -834,7 +833,6 @@ TEST_CASE("fixed pixel mappings retain borrowed addresses across sparse block gr
  CHECK_THROWS(pixels.grow(compute_file_layout(COMPILED_BLOCK_SLOTS + 1, 24)));
  CHECK(pixels.image(0) == first);
 }
-
 TEST_CASE("categorical resize agrees exactly with dense nearest-center sampling", "[backend][data][compiler][mask]") {
  using namespace mmltk::backend::data::dataset;
  using namespace mmltk::backend::imaging::resample;
@@ -974,7 +972,7 @@ TEST_CASE("bounded mask projection counts its complete coalesced extent without 
   (void)masks::append_resized_row_major_mask(source, {5, 2}, {5, 2}, geometry, &scratch, output, &bounds, 3);
   FAIL("bounded mask output must reject the complete required extent");
  } catch (const masks::MaskRunCapacityError& error) {
-  CHECK(error.required_runs() == 5); // Four coalesced runs plus the preceding independent mask.
+  CHECK(error.required_runs() == 5);  // Four coalesced runs plus the preceding independent mask.
  }
  REQUIRE(output.size() == 1);
  CHECK(output[0].start == 13);

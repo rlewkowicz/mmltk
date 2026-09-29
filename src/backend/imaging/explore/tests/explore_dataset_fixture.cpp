@@ -11,9 +11,8 @@
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
 namespace mmltk::testsupport {
-std::filesystem::path compile_explore_fixture(
- const std::filesystem::path& temporary_root, const std::string_view fixture_name, const int num_images, const ExploreFixtureDimensions dimensions, const ExploreFixtureAnnotations annotations,
- const bool pixel_evidence) {
+std::filesystem::path compile_explore_fixture(const std::filesystem::path& temporary_root, const std::string_view fixture_name, const int num_images, const ExploreFixtureDimensions dimensions,
+ const ExploreFixtureAnnotations annotations, const bool pixel_evidence) {
  const backend::data::testsupport::FixtureSpec fixture{
   .root_dir = (temporary_root / fixture_name).string(),
   .split = "train",

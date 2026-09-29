@@ -379,8 +379,8 @@ void test_compiled_explore_sparse_physical_slots() {
  const auto settle = [&](const controller::ExploreSnapshot& admitted) {
   REQUIRE(audit.Wait([&] {
    const auto snapshot = system.snapshot();
-   return snapshot.ready && !snapshot.busy && !snapshot.render_pending && snapshot.revision > admitted.revision &&
-          snapshot.gallery.slots.size() == snapshot.order.visible_indices.size() && std::ranges::all_of(snapshot.gallery.slots, [](bool ready) { return ready; });
+   return snapshot.ready && !snapshot.busy && !snapshot.render_pending && snapshot.revision > admitted.revision && snapshot.gallery.slots.size() == snapshot.order.visible_indices.size() &&
+          std::ranges::all_of(snapshot.gallery.slots, [](bool ready) { return ready; });
   }));
   REQUIRE(system.snapshot().failure.empty());
   check_published_frame(system);
@@ -530,7 +530,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
  std::vector<std::uint32_t> sparse_order, sparse_scratch;
  REQUIRE(explore::rebuild_explore_order(sparse_summaries, filter, false, 0, sparse_order, sparse_scratch));
  CHECK(sparse_order == std::vector<std::uint32_t>{11U});
-
  const explore::ExploreViewport gallery_viewport{
   .first_row = 0U,
   .row_count = 1U,

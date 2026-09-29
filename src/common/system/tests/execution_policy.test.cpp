@@ -13,9 +13,9 @@
 namespace {
 using namespace mmltk::common::system;
 bool same_policy(const ExecutionPolicySnapshot& left, const ExecutionPolicySnapshot& right) {
- return left.affinity == right.affinity && left.memory_policy.mode == right.memory_policy.mode && left.memory_policy.mask == right.memory_policy.mask &&
-        left.nice_value == right.nice_value && left.scheduler_policy == right.scheduler_policy && left.scheduler_priority == right.scheduler_priority &&
-        left.io_class == right.io_class && left.io_priority_data == right.io_priority_data && left.thread_name == right.thread_name;
+ return left.affinity == right.affinity && left.memory_policy.mode == right.memory_policy.mode && left.memory_policy.mask == right.memory_policy.mask && left.nice_value == right.nice_value &&
+        left.scheduler_policy == right.scheduler_policy && left.scheduler_priority == right.scheduler_priority && left.io_class == right.io_class && left.io_priority_data == right.io_priority_data &&
+        left.thread_name == right.thread_name;
 }
 NumaTopology topology() {
  return {.permitted_cpus = {2, 7, 19, 31, 42}, .permitted_nodes = {0, 3}, .cpus = {{2, 0, 0, 0}, {7, 0, 0, 0}, {19, 0, 0, 1}, {31, 3, 1, 0}, {42, 3, 1, 1}}, .nodes = {{0, 4096}, {3, 8192}}};

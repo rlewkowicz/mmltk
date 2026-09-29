@@ -74,7 +74,13 @@ fn sparse_numeric_controls_use_physical_extent_and_wait_for_persisted_high_range
     assert_eq!(driver.driver.phase, Phase::AwaitExploreReady);
     // The ordinary numeric driver also uses the physical domain, while keeping
     // its existing finite edit and restoration sequence.
-    model.explore.snapshot.as_mut().unwrap().filter.minimumcompiledindex = 0;
+    model
+        .explore
+        .snapshot
+        .as_mut()
+        .unwrap()
+        .filter
+        .minimumcompiledindex = 0;
     driver.driver.viewer_scenario = "square".into();
     driver.driver.phase = Phase::ExploreNumericStart(4);
     drive(driver, &model);

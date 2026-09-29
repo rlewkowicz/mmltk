@@ -26,8 +26,7 @@ ImageAnnotations annotation_view(const ImageEntry& entry, std::span<const std::b
  const auto layout = annotation_layout(entry.num_instances, entry.num_runs);
  if (entry.label_bytes != layout.used_bytes || payload.size() < layout.used_bytes) throw std::runtime_error("compiled label payload extent differs");
  if (!layout.used_bytes) return {};
- return {{reinterpret_cast<const PackedInstance*>(payload.data()), entry.num_instances},
-  {reinterpret_cast<const RLEPair*>(payload.data() + layout.run_offset), entry.num_runs}};
+ return {{reinterpret_cast<const PackedInstance*>(payload.data()), entry.num_instances}, {reinterpret_cast<const RLEPair*>(payload.data() + layout.run_offset), entry.num_runs}};
 }
 FileLayout compute_file_layout(uint32_t slots, size_t stride) {
  FileLayout layout;
@@ -37,7 +36,8 @@ FileLayout compute_file_layout(uint32_t slots, size_t stride) {
  layout.pixel_pitch = compiled_align_up(stride, PAGE_SIZE);
  layout.label_pitch = compiled_align_up(COMPILED_LABEL_CAPACITY, PAGE_SIZE);
  layout.pixel_block_bytes = checked_multiply(COMPILED_BLOCK_SLOTS, layout.pixel_pitch, "compiled pixel block overflow");
- layout.block_bytes = compiled_align_up(checked_multiply(COMPILED_BLOCK_SLOTS, checked_add(layout.pixel_pitch, layout.label_pitch, "compiled slot extent overflow"), "compiled block overflow"), HUGE_PAGE_SIZE);
+ layout.block_bytes =
+  compiled_align_up(checked_multiply(COMPILED_BLOCK_SLOTS, checked_add(layout.pixel_pitch, layout.label_pitch, "compiled slot extent overflow"), "compiled block overflow"), HUGE_PAGE_SIZE);
  layout.data_offset = compiled_align_up(sizeof(FileHeader), HUGE_PAGE_SIZE);
  layout.index_size = checked_multiply(size_t{slots}, sizeof(ImageEntry), "compiled index overflow");
  if (layout.index_size > COMPILED_METADATA_CAPACITY) throw std::runtime_error("compiled resident metadata exceeds 1000000000 bytes");
@@ -55,7 +55,8 @@ size_t FileLayout::pixel_offset(uint32_t slot) const {
 size_t FileLayout::label_offset(uint32_t slot) const {
  if (slot >= num_slots) throw std::out_of_range("compiled label slot");
  const auto prefix = pixel_block_bytes;
- return checked_add(checked_add(block_offset(slot / COMPILED_BLOCK_SLOTS), prefix, "compiled label base overflow"), checked_multiply(size_t{slot} % COMPILED_BLOCK_SLOTS, label_pitch, "compiled label offset overflow"), "compiled label extent overflow");
+ return checked_add(checked_add(block_offset(slot / COMPILED_BLOCK_SLOTS), prefix, "compiled label base overflow"),
+  checked_multiply(size_t{slot} % COMPILED_BLOCK_SLOTS, label_pitch, "compiled label offset overflow"), "compiled label extent overflow");
 }
 FileHeader make_file_header(const FileHeaderInputs& inputs, std::span<const std::string> classes, const FileLayout& layout) {
  FileHeader header{};

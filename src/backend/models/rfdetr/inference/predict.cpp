@@ -1102,7 +1102,6 @@ PredictionRunResult PredictionSession::State::RunResolved(
  if (delivery.admitted) delivery.admitted(result.execution);
  if (delivery.begin) delivery.begin(result);
  if (loader) {
-
   started = std::chrono::steady_clock::now();
   loader->begin_epoch();
  }

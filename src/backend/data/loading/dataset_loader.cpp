@@ -41,7 +41,8 @@ void validate_config(const DatasetLoader::Config& config) {
  if (config.batch_shard_rank >= config.batch_shard_count) { throw std::invalid_argument("batch_shard_rank must be less than batch_shard_count"); }
 }
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-void build_block_shuffled_order(std::vector<uint32_t>& order, std::span<const std::uint32_t> eligible, size_t batch_size, std::mt19937_64& rng, std::vector<size_t>& block_order, std::vector<size_t>& chunk_order) {
+void build_block_shuffled_order(
+ std::vector<uint32_t>& order, std::span<const std::uint32_t> eligible, size_t batch_size, std::mt19937_64& rng, std::vector<size_t>& block_order, std::vector<size_t>& chunk_order) {
  if (eligible.empty()) { return; }
  const auto total_images = eligible.size();
  const auto [chunk_images, chunks_per_block, num_chunks, num_blocks] = shuffle_layout(total_images, batch_size);
@@ -151,9 +152,7 @@ struct DatasetLoader::Impl {
   const size_t step = explicit_schedule ? 1 : config.batch_shard_count;
   batch_count = first < batches ? (batches - 1 - first) / step + 1 : 0;
  }
- size_t batch_start(size_t batch) const {
-  return explicit_schedule ? resume_offset + batch * config.batch_size : (config.batch_shard_rank + batch * config.batch_shard_count) * config.batch_size;
- }
+ size_t batch_start(size_t batch) const { return explicit_schedule ? resume_offset + batch * config.batch_size : (config.batch_shard_rank + batch * config.batch_shard_count) * config.batch_size; }
  void refill(const size_t index) {
   check_failure();
   auto& slot = slots[index];

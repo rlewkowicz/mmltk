@@ -15,7 +15,8 @@ import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr {
 EvaluationMetricSet resolve_evaluation_metric_set(const mmltk::backend::data::DatasetLoader& loader, bool request_masks) {
- const bool masks = request_masks && std::ranges::all_of(loader.eligible_slots(), [&](auto slot) { return std::ranges::all_of(loader.annotations(slot).labels, [](const auto& annotation) { return annotation.has_mask(); }); });
+ const bool masks = request_masks && std::ranges::all_of(loader.eligible_slots(),
+                                      [&](auto slot) { return std::ranges::all_of(loader.annotations(slot).labels, [](const auto& annotation) { return annotation.has_mask(); }); });
  return masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox;
 }
 using CompactImageMatchRecord = EvaluationDatasetOwner::MatchRecord;
@@ -408,19 +409,17 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
  out.catalog_ = loader.class_catalog();
  const size_t rle_pair_count = loader.num_rle_pairs();
  if (metric_set == EvaluationMetricSet::BBoxAndMask) {
-  if (rle_pair_count > std::numeric_limits<std::uint32_t>::max()) {
-   throw std::runtime_error("bbox-and-mask evaluation requires a bounded mask RLE payload");
-  }
+  if (rle_pair_count > std::numeric_limits<std::uint32_t>::max()) { throw std::runtime_error("bbox-and-mask evaluation requires a bounded mask RLE payload"); }
   const uint64_t mask_pixels = static_cast<uint64_t>(loader.image_height()) * loader.image_width();
   if (mask_pixels == 0 || mask_pixels > std::numeric_limits<std::uint32_t>::max()) { throw std::runtime_error("evaluation masks exceed the encoded-mask area limit"); }
   out.ground_truth_mask_height_ = loader.image_height();
   out.ground_truth_mask_width_ = loader.image_width();
  }
  out.ground_truth_spans_.resize(image_count * static_cast<size_t>(num_classes));
- size_t image_index = 0;
+ size_t image_position = 0;
  for (const auto slot : loader.eligible_slots()) {
   const int image_id = mmltk::common::math::checked_cast<int>(std::uint64_t{slot} + 1U, "evaluation image ID overflow");
-  out.image_id_to_index_.emplace(image_id, image_index);
+  out.image_id_to_index_.emplace(image_id, image_position);
   out.image_ids_.push_back(image_id);
   const auto annotations = loader.annotations(slot);
   for (const auto& packed : annotations.labels) {
@@ -439,10 +438,10 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
     const size_t rle_end_index = rle_start_index + packed.mask_rle_pairs;
     if (rle_end_index < rle_start_index || rle_end_index > annotations.runs.size()) { throw std::runtime_error("compiled evaluation mask index exceeds the RLE payload"); }
    }
-   GroundTruthSpan& span = out.ground_truth_spans_[out.ground_truth_span_index(image_index, static_cast<size_t>(packed.class_id))];
+   GroundTruthSpan& span = out.ground_truth_spans_[out.ground_truth_span_index(image_position, static_cast<size_t>(packed.class_id))];
    ++span.count;
   }
-  ++image_index;
+  ++image_position;
  }
  std::uint64_t annotation_offset = 0;
  for (GroundTruthSpan& span : out.ground_truth_spans_) {
@@ -604,7 +603,8 @@ void CocoDataset::limit_images(const size_t limit) {
 bool CocoDataset::has_image(int image_id) const { return image_id_to_index_.contains(image_id); }
 ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t dataset_index, const BBoxPredictionView& bbox, const std::optional<PackedMaskPredictionView>& mask,
  const size_t max_dets_per_image, const std::span<const Prediction> encoded_masks) const {
- if (dataset_index < 0 || dataset_index >= std::numeric_limits<int>::max() || !image_id_to_index_.contains(static_cast<int>(dataset_index + 1))) throw std::out_of_range("staged prediction image index is outside the evaluation dataset");
+ if (dataset_index < 0 || dataset_index >= std::numeric_limits<int>::max() || !image_id_to_index_.contains(static_cast<int>(dataset_index + 1)))
+  throw std::out_of_range("staged prediction image index is outside the evaluation dataset");
  if (max_dets_per_image == 0 || bbox.count > std::numeric_limits<std::uint32_t>::max() ||
      (bbox.count != 0U && (bbox.scores == nullptr || bbox.labels_zero_based == nullptr || bbox.boxes_xyxy == nullptr)) || bbox.score_stride <= 0 || bbox.label_stride <= 0 || bbox.box_stride < 4) {
   throw std::invalid_argument("staged bbox prediction view is invalid");

@@ -18,38 +18,31 @@
 #include <string>
 #include <utility>
 #include <vector>
-
 namespace {
 namespace data = mmltk::backend::data;
 using Json = nlohmann::json;
 using mmltk::testsupport::ScopedTempDir;
 using mmltk::testsupport::SubprocessResult;
-
 SubprocessResult diagnose(const std::vector<std::string>& arguments, bool requirements = false) {
  std::vector<std::string> command{
-  "timeout", "--signal=KILL", "120s", "env",
-  "MMLTK_COMPILED_SAMPLE_DIAGNOSTIC=" MMLTK_TEST_COMPILED_DIAGNOSTIC,
-  "MMLTK_COCONUT_MASK_DIAGNOSTIC=" MMLTK_TEST_MASK_DIAGNOSTIC,
-  std::string("MMLTK_BENCHMARK_NATIVE_REQUIREMENTS=") + (requirements ? "1" : "0"),
-  MMLTK_TEST_PYTHON, "-I", "-B", MMLTK_TEST_BENCHMARK_DIAGNOSTIC};
+  "timeout", "--signal=KILL", "120s", "env", "MMLTK_COMPILED_SAMPLE_DIAGNOSTIC=" MMLTK_TEST_COMPILED_DIAGNOSTIC, "MMLTK_COCONUT_MASK_DIAGNOSTIC=" MMLTK_TEST_MASK_DIAGNOSTIC,
+  std::string("MMLTK_BENCHMARK_NATIVE_REQUIREMENTS=") + (requirements ? "1" : "0"), MMLTK_TEST_PYTHON, "-I", "-B", MMLTK_TEST_BENCHMARK_DIAGNOSTIC
+ };
  command.insert(command.end(), arguments.begin(), arguments.end());
  return mmltk::testsupport::run_subprocess_capture_output(command);
 }
-
 Json successful_record(const SubprocessResult& result) {
  INFO(result.output_text);
  REQUIRE(result.exit_code == 0);
  CHECK(result.stderr_text.empty());
  return Json::parse(result.stdout_text);
 }
-
 void rejected(const SubprocessResult& result, const std::string& cause) {
  INFO(result.output_text);
  CHECK(result.exit_code != 0);
  CHECK(result.stderr_text.find(cause) != std::string::npos);
  CHECK(result.stderr_text.find("Traceback") == std::string::npos);
 }
-
 // Sparse pixel/label capacity is intentionally never materialized by this
 // fixture. Two eligible slots straddle a block boundary with inactive holes.
 struct CompiledSampleFixture {
@@ -57,17 +50,26 @@ struct CompiledSampleFixture {
  std::filesystem::path path = root.path() / "samples.bin";
  data::FileLayout layout = data::compute_file_layout(66, 4 * 3 * sizeof(float));
  std::array<std::string, 1> classes{"sample"};
- data::FileHeader header = data::make_file_header(
-  {.num_images = 2, .width = 2, .height = 2, .channels = 3, .max_instances_per_image = 1, .image_stride = layout.image_stride}, classes, layout);
+ data::FileHeader header = data::make_file_header({.num_images = 2, .width = 2, .height = 2, .channels = 3, .max_instances_per_image = 1, .image_stride = layout.image_stride}, classes, layout);
  mmltk::common::io::FileHandle file = mmltk::common::io::FileHandle::create_output(path.string(), 0);
  data::ImageEntry entry{
-  .status = data::ImageStatus::Eligible, .has_source_image_id = 1, .original_width = 4, .original_height = 3, .source = data::AnnotationSource::CoconutCoco, .source_image_id = 2212};
+  .status = data::ImageStatus::Eligible, .has_source_image_id = 1, .original_width = 4, .original_height = 3, .source = data::AnnotationSource::CoconutCoco, .source_image_id = 2212
+ };
  data::PackedInstance label{
-  .class_id = 0, .flags = data::kAnnotationMask | data::kAnnotationId | data::kAnnotationCategory | data::kAnnotationCrowd,
-  .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 2, .bbox_y2 = 1, .mask_rle_offset = 0, .mask_rle_pairs = 1,
-  .original_area = 2.0, .annotation_id = 8123, .source_category_id = 1, .source_ordinal = 9};
+  .class_id = 0,
+  .flags = data::kAnnotationMask | data::kAnnotationId | data::kAnnotationCategory | data::kAnnotationCrowd,
+  .bbox_x1 = 0,
+  .bbox_y1 = 0,
+  .bbox_x2 = 2,
+  .bbox_y2 = 1,
+  .mask_rle_offset = 0,
+  .mask_rle_pairs = 1,
+  .original_area = 2.0,
+  .annotation_id = 8123,
+  .source_category_id = 1,
+  .source_ordinal = 9
+ };
  std::array<data::RLEPair, 1> runs{{{0, 2}}};
-
  CompiledSampleFixture() {
   file.resize_sparse(layout.total_size);
   write_header();
@@ -81,14 +83,12 @@ struct CompiledSampleFixture {
  void write_entry() { file.pwrite_all(&entry, sizeof(entry), layout.index_offset + 65 * sizeof(entry)); }
  SubprocessResult inspect(const std::string& slot = "65") const { return diagnose({"--compiled", path.string(), "--sample", slot}); }
 };
-
 template <class T>
 T arrow_result(arrow::Result<T> result) {
  INFO(result.status().ToString());
  REQUIRE(result.ok());
  return std::move(result).ValueOrDie();
 }
-
 // Only the fields consumed by the diagnostic are needed. The first row has a
 // different source ID and invalid bytes, proving selection precedes PNG decode.
 void write_parquet_mask(const std::filesystem::path& path, const std::string& png) {
@@ -112,15 +112,18 @@ void write_parquet_mask(const std::filesystem::path& path, const std::string& pn
  REQUIRE(output->Close().ok());
 }
 }  // namespace
-
 TEST_CASE("benchmark image diagnostic reads eligible physical slots and canonical annotations", "[entrypoints][tools][benchmark]") {
  CompiledSampleFixture fixture;
  const auto record = successful_record(fixture.inspect());
- CHECK(record == Json{
-  {"kind", "compiled_sample"}, {"path", fixture.path.string()}, {"sample", 65}, {"image_count", 2}, {"slot_count", 66},
-  {"width", 2}, {"height", 2}, {"original_width", 4}, {"original_height", 3}, {"source", 4}, {"image_id", 2212}, {"label_bytes", +fixture.entry.label_bytes},
-  {"instances", Json::array({{{"class_id", 0}, {"class_name", "sample"}, {"flags", +fixture.label.flags}, {"bbox", {0, 0, 2, 1}}, {"mask_pairs", 1},
-                             {"annotation_id", 8123}, {"source_category_id", 1}, {"original_area", 2.0}, {"source_ordinal", 9}}})}});
+ CHECK(
+  record ==
+  Json{
+   {"kind", "compiled_sample"}, {"path", fixture.path.string()}, {"sample", 65}, {"image_count", 2}, {"slot_count", 66}, {"width", 2}, {"height", 2}, {"original_width", 4}, {"original_height", 3},
+   {"source", 4}, {"image_id", 2212}, {"label_bytes", +fixture.entry.label_bytes},
+   {"instances",
+    Json::array(
+     {{{"class_id", 0}, {"class_name", "sample"}, {"flags", +fixture.label.flags}, {"bbox", {0, 0, 2, 1}}, {"mask_pairs", 1}, {"annotation_id", 8123}, {"source_category_id", 1}, {"original_area", 2.0}, {"source_ordinal", 9}}})}
+  });
  const auto background = successful_record(fixture.inspect("0"));
  CHECK(background.at("image_id").is_null());
  CHECK(background.at("label_bytes") == 0);
@@ -129,7 +132,6 @@ TEST_CASE("benchmark image diagnostic reads eligible physical slots and canonica
  rejected(diagnose({"--compiled", fixture.path.string(), "--sample", "65", "--image-id", "7"}), "--image-id disagrees with the compiled sample");
  rejected(diagnose({"--compiled", fixture.path.string(), "--sample", "0", "--image", "unused.png"}), "this compiled sample has no source image ID");
 }
-
 TEST_CASE("benchmark image diagnostic rejects holes range errors and malformed compiled metadata", "[entrypoints][tools][benchmark]") {
  CompiledSampleFixture fixture;
  SECTION("inactive slot") { rejected(fixture.inspect("64"), "sample slot is not eligible"); }
@@ -183,7 +185,6 @@ TEST_CASE("benchmark image diagnostic rejects holes range errors and malformed c
   rejected(fixture.inspect(), "empty or unterminated class name");
  }
 }
-
 TEST_CASE("benchmark image diagnostic selects PNG and Parquet masks with exact RGB segment IDs", "[entrypoints][tools][benchmark]") {
  ScopedTempDir root("benchmark-diagnostic-mask");
  const auto png = root.path() / "mask.png";
@@ -192,18 +193,17 @@ TEST_CASE("benchmark image diagnostic selects PNG and Parquet masks with exact R
  const Json support = Json::array({{{"id", 0}, {"pixels", 1}}, {{"id", 0x030201}, {"pixels", 3}}});
  const auto plain = successful_record(diagnose({"--image-id", "2212", "--panoptic", png.string()}));
  CHECK(plain == Json{{"kind", "panoptic_mask"}, {"path", png.string()}, {"image_id", 2212}, {"width", 2}, {"height", 2}, {"support", support}});
-
  std::ifstream stream(png, std::ios::binary);
  const std::string encoded{std::istreambuf_iterator<char>{stream}, std::istreambuf_iterator<char>{}};
  const auto parquet = root.path() / "mask.parquet";
  write_parquet_mask(parquet, encoded);
  const auto nested = successful_record(diagnose({"--image-id", "2212", "--parquet", parquet.string()}));
  CHECK(nested == Json{
-  {"kind", "panoptic_mask"}, {"path", parquet.string()}, {"image_id", 2212}, {"width", 2}, {"height", 2}, {"support", support}, {"row", 1}, {"image_info", {{"id", 2212}}},
-  {"segments", Json::array({{{"id", 0x030201}, {"observed_pixels", 3}}, {{"id", 42}, {"observed_pixels", 0}}})}});
+                  {"kind", "panoptic_mask"}, {"path", parquet.string()}, {"image_id", 2212}, {"width", 2}, {"height", 2}, {"support", support}, {"row", 1}, {"image_info", {{"id", 2212}}},
+                  {"segments", Json::array({{{"id", 0x030201}, {"observed_pixels", 3}}, {{"id", 42}, {"observed_pixels", 0}}})}
+                 });
  rejected(diagnose({"--image-id", "8", "--parquet", parquet.string()}), "image ID is absent from this Parquet shard");
  rejected(diagnose({"--image-id", "99", "--parquet", parquet.string()}), "invalid or oversized mask geometry");
-
  const auto jpeg = root.path() / "mask.jpg";
  REQUIRE(stbi_write_jpg(jpeg.c_str(), 2, 2, 3, pixels.data(), 90) != 0);
  rejected(diagnose({"--image-id", "2212", "--panoptic", jpeg.string()}), "invalid or oversized mask geometry");
@@ -212,13 +212,11 @@ TEST_CASE("benchmark image diagnostic selects PNG and Parquet masks with exact R
  CHECK(image.at("width") == 2);
  CHECK(image.at("height") == 2);
 }
-
 TEST_CASE("benchmark diagnostic preparation uses its argument parser without inspecting sources", "[entrypoints][tools][benchmark]") {
  for (const auto& [arguments, expected] : std::vector<std::pair<std::vector<std::string>, std::string>>{
-       {{"--image-id", "2212", "--image", "absent.jpg"}, "native:\n"},
-       {{"--comp=absent.bin", "--sample=65"}, "native:compiled\n"},
-       {{"--image-id", "2212", "--parq=absent.parquet", "--pano=absent.png"}, "native:mask\n"},
-       {{"--compiled", "absent.bin", "--sample", "65", "--panoptic", "absent.png"}, "native:compiled,mask\n"}}) {
+       {{"--image-id", "2212", "--image", "absent.jpg"}, "native:\n"}, {{"--comp=absent.bin", "--sample=65"}, "native:compiled\n"},
+       {{"--image-id", "2212", "--parq=absent.parquet", "--pano=absent.png"}, "native:mask\n"}, {{"--compiled", "absent.bin", "--sample", "65", "--panoptic", "absent.png"}, "native:compiled,mask\n"}
+      }) {
   const auto result = diagnose(arguments, true);
   INFO(result.output_text);
   CHECK(result.exit_code == 0);

@@ -398,11 +398,15 @@ void discover_json_arrays(const PaddedMappedFile& file, std::span<const std::str
    }
   };
   const auto work = [&] {
-   if (execution) execution->run(BenchmarkStage::Metadata, {65536, 0}, scan);
-   else scan(0);
+   if (execution)
+    execution->run(BenchmarkStage::Metadata, {65536, 0}, scan);
+   else
+    scan(0);
   };
-  if (metadata_work) metadata_work(work);
-  else work();
+  if (metadata_work)
+   metadata_work(work);
+  else
+   work();
   if (published) consume(*published, rows, complete);
  }
 }

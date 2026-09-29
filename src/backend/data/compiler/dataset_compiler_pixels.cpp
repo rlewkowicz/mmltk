@@ -60,8 +60,8 @@ void decode_pixel_image(const std::filesystem::path& split_dir, const WritablePi
 }
 // NOLINTEND(bugprone-easily-swappable-parameters)
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-void decode_pixel_worker(const std::filesystem::path& split_dir, const FileHandle& output, const FileLayout& layout, const WritablePixelRange& pixel_blob, std::atomic<uint32_t>& next_image, uint32_t num_images, uint32_t target_width,
- uint32_t target_height, size_t image_stride, int resize_threads_per_image, bool perceptual_downscale, ProgressCounter* completed_images,
+void decode_pixel_worker(const std::filesystem::path& split_dir, const FileHandle& output, const FileLayout& layout, const WritablePixelRange& pixel_blob, std::atomic<uint32_t>& next_image,
+ uint32_t num_images, uint32_t target_width, uint32_t target_height, size_t image_stride, int resize_threads_per_image, bool perceptual_downscale, ProgressCounter* completed_images,
  mmltk::common::concurrency::CancellationObservation cancel_requested, std::atomic<bool>* failure_requested, mmltk::backend::imaging::resample::ImageResizeMode resize_mode) {
  mmltk::common::logging::ScopedProfile profile{"compiler.pixels.decode_worker"};
  mmltk::backend::imaging::resample::RgbImageResizer image_resizer(resize_threads_per_image, perceptual_downscale);

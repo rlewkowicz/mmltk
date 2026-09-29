@@ -54,6 +54,5 @@ void write_metadata_blocks(
   mmltk::common::logging::ScopedProfile profile{"compiler.write_index"};
   write_block(label_blocks.index.data(), layout.index_size, layout.index_offset);
  }
-
 }
 }  // namespace mmltk::backend::data::compiler_internal

@@ -927,7 +927,8 @@ std::uint64_t validate_run_value(RLEPair pair, std::uint64_t pixels, std::uint64
  return end;
 }
 template <class Index>
-void validate_normalized_records(const Index& index, mmltk::common::concurrency::CancellationObservation cancel_requested, bool metadata_only = false, bool images_admitted = false, const std::function<void(std::size_t)>& ready = {}) {
+void validate_normalized_records(const Index& index, mmltk::common::concurrency::CancellationObservation cancel_requested, bool metadata_only = false, bool images_admitted = false,
+ const std::function<void(std::size_t)>& ready = {}) {
  std::uint64_t expected_first = 0U;
  std::uint64_t expected_mask_offset = 0U;
  std::uint64_t previous_id = 0U;
@@ -945,7 +946,10 @@ void validate_normalized_records(const Index& index, mmltk::common::concurrency:
   first = false;
   previous_id = image.source_image_id;
   expected_first += image.box_count;
-  if (metadata_only) { if (ready) ready(image_index); continue; }
+  if (metadata_only) {
+   if (ready) ready(image_index);
+   continue;
+  }
   for (std::uint64_t box_index = image.first_box; box_index < image.first_box + image.box_count; ++box_index) {
    const NormalizedBox& box = index.boxes[checked_cast<std::size_t>(box_index, "box index overflow")];
    validate_box_value(box, index.source);
@@ -1046,9 +1050,8 @@ struct NormalizedAnnotationAssembler::Mapped {
  std::size_t image_count = 0, box_count = 0, run_count = 0;
  Mapped(StorageReservationPool& storage, const std::filesystem::path& path, std::size_t bytes) : artifact(storage, path, bytes, "normalized annotation assembly") {}
 };
-NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(
- NormalizedAnnotationMetadata metadata, std::size_t images, std::size_t boxes, std::size_t runs, mmltk::common::concurrency::CancellationObservation cancellation,
- const std::filesystem::path& staging_directory, StorageReservationPool* storage)
+NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(NormalizedAnnotationMetadata metadata, std::size_t images, std::size_t boxes, std::size_t runs,
+ mmltk::common::concurrency::CancellationObservation cancellation, const std::filesystem::path& staging_directory, StorageReservationPool* storage)
     : cancellation_(cancellation) {
  throw_if_benchmark_cancelled(cancellation_);
  static_cast<NormalizedAnnotationMetadata&>(builder_) = std::move(metadata);
@@ -1077,15 +1080,15 @@ void NormalizedAnnotationAssembler::begin_image(NormalizedImage image) {
  if (finished_) throw std::logic_error("normalized assembler is already sealed");
  throw_if_benchmark_cancelled(cancellation_);
  const auto images = mapped_ ? mapped_->images.first(mapped_->image_count) : std::span(builder_.images);
- if ((!images.empty() && image.source_image_id <= images.back().source_image_id) || image.reserved ||
-     (builder_.source != BenchmarkDatasetSource::kOpenImagesV7 && (!image.width || !image.height)))
+ if ((!images.empty() && image.source_image_id <= images.back().source_image_id) || image.reserved || (builder_.source != BenchmarkDatasetSource::kOpenImagesV7 && (!image.width || !image.height)))
   throw std::runtime_error("normalized benchmark image record is invalid");
  image.first_box = mapped_ ? mapped_->box_count : builder_.boxes.size();
  image.box_count = 0;
  if (mapped_) {
   if (mapped_->image_count == mapped_->images.size()) throw std::runtime_error("normalized benchmark image record is invalid");
   mapped_->images[mapped_->image_count++] = image;
- } else builder_.images.push_back(image);
+ } else
+  builder_.images.push_back(image);
 }
 void NormalizedAnnotationAssembler::append_box(NormalizedBox box, std::span<const RLEPair> runs) {
  if (finished_) throw std::logic_error("normalized assembler is already sealed");
@@ -1094,8 +1097,7 @@ void NormalizedAnnotationAssembler::append_box(NormalizedBox box, std::span<cons
  if (images.empty()) throw std::logic_error("normalized box requires an owning image");
  auto& image = images.back();
  if (image.box_count == UINT32_MAX) throw std::overflow_error("normalized per-image box count overflow");
- if (mapped_ && (mapped_->box_count == mapped_->boxes.size() || runs.size() > mapped_->runs.size() - mapped_->run_count))
-  throw std::overflow_error("normalized assembly extent exceeded");
+ if (mapped_ && (mapped_->box_count == mapped_->boxes.size() || runs.size() > mapped_->runs.size() - mapped_->run_count)) throw std::overflow_error("normalized assembly extent exceeded");
  const auto first_run = mapped_ ? mapped_->run_count : builder_.mask_rle_pairs.size();
  box.mask_rle_offset = first_run;
  box.mask_rle_pairs = checked_cast<std::uint32_t>(runs.size(), "normalized mask run count overflow");
@@ -1145,7 +1147,8 @@ NormalizedAnnotationIndex NormalizedAnnotationAssembler::finish(const BenchmarkT
   result.mask_rle_pairs = owner->runs;
   result.backing = std::move(owner);
   mapped_.reset();
- } else result = seal_normalized_annotation_metadata(std::move(builder_));
+ } else
+  result = seal_normalized_annotation_metadata(std::move(builder_));
  finished_ = true;
  std::call_once(result.backing->image_admission, [] {});
  std::call_once(result.backing->full_admission, [] {});
@@ -1157,8 +1160,8 @@ void check_normalized_backing(const NormalizedAnnotationIndex& index) {
      index.boxes.data() != index.backing->boxes.data() || index.boxes.size() != index.backing->boxes.size() || index.mask_rle_pairs.data() != index.backing->runs.data() ||
      index.mask_rle_pairs.size() != index.backing->runs.size())
   throw std::runtime_error("normalized annotation view does not belong to its backing");
- }
 }
+}  // namespace
 void admit_normalized_annotation_image(const NormalizedAnnotationIndex& index, std::size_t image) {
  check_normalized_backing(index);
  if (image >= index.images.size()) throw std::out_of_range("normalized image position is invalid");
@@ -1518,7 +1521,12 @@ std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const 
   if (ready) {
    validate_normalized_records(index, cancel_requested, metadata_only, false, [&](std::size_t image) {
     if (!metadata_only) index.backing->admitted_rows.store(image + 1, std::memory_order_release);
-    try { ready(index, image); } catch (...) { callback_failed = true; throw; }
+    try {
+     ready(index, image);
+    } catch (...) {
+     callback_failed = true;
+     throw;
+    }
    });
    std::call_once(index.backing->image_admission, [] {});
    if (!metadata_only) std::call_once(index.backing->full_admission, [] {});

@@ -46,9 +46,18 @@ public:
  [[nodiscard]] auto begin() const noexcept { return view().begin(); }
  [[nodiscard]] auto end() const noexcept { return view().end(); }
  [[nodiscard]] const CoconutSegment& operator[](std::size_t i) const { return view()[i]; }
- CoconutSegment& operator[](std::size_t i) { writable(); return values_[i]; }
- void reserve(std::size_t n) { writable(); values_.reserve(n); }
- void push_back(CoconutSegment value) { writable(); values_.push_back(std::move(value)); }
+ CoconutSegment& operator[](std::size_t i) {
+  writable();
+  return values_[i];
+ }
+ void reserve(std::size_t n) {
+  writable();
+  values_.reserve(n);
+ }
+ void push_back(CoconutSegment value) {
+  writable();
+  values_.push_back(std::move(value));
+ }
  void stage(const std::filesystem::path&, StorageReservationPool*);
 
 private:

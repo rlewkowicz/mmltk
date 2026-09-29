@@ -43,7 +43,10 @@ public:
  [[nodiscard]] std::size_t retained_bytes() const noexcept {
   return scratch_.intervals.capacity() * sizeof(scratch_.intervals.front()) + output_.labels.capacity() * sizeof(PackedInstance) + output_.runs.capacity() * sizeof(RLEPair);
  }
- void retire() noexcept { scratch_ = {}; output_ = {}; }
+ void retire() noexcept {
+  scratch_ = {};
+  output_ = {};
+ }
  [[nodiscard]] dataset::MaskResizeScratch& scratch() noexcept { return scratch_; }
  // Borrow only until this lane writes its slot. Standalone products never alias it.
  [[nodiscard]] BenchmarkLabelChunk& output() {

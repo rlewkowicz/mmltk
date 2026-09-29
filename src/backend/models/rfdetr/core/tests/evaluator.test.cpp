@@ -37,8 +37,9 @@ r::Prediction box(int category, std::array<float, 4> bounds, float score = 1.0F)
 }
 class EvaluationFixture final {
 public:
- explicit EvaluationFixture(const std::vector<std::vector<r::Prediction>>& images, int resolution = 128, const std::vector<std::vector<nlohmann::json>>& metadata = {},
-  std::span<const std::uint32_t> inactive = {}) : root_("evaluator-answers") {
+ explicit EvaluationFixture(
+  const std::vector<std::vector<r::Prediction>>& images, int resolution = 128, const std::vector<std::vector<nlohmann::json>>& metadata = {}, std::span<const std::uint32_t> inactive = {})
+     : root_("evaluator-answers") {
   const data::testsupport::FixtureSpec fixture{root_.path().string(), "train", 128, 128, static_cast<int>(images.size()), 0, 0};
   data::testsupport::create_synthetic_dataset(fixture);
   constexpr std::array names{"person", "ret", "scope", "iron_sight", "anchor_dot", "glint"};
@@ -86,7 +87,6 @@ public:
    }
    REQUIRE(output.good());
   }
-
   loader = std::make_unique<data::DatasetLoader>(data::DatasetLoader::Config{
    .compiled_path = data::testsupport::compiled_bin_path(fixture), .batch_size = 1U, .shuffle = false, .prefetch_factor = 2, .gather_workers = 1, .loading = data::data_loading_options(true)
   });
@@ -347,8 +347,9 @@ TEST_CASE("evaluation retains duplicate fractional boxes and declared source are
  // Use the compiled categorical mask so this case isolates stored area.
  prediction.mask = {};
  prediction.mask.width = prediction.mask.height = 64;
- const auto& packed = fixture.loader->annotations(0).labels[0];
- const auto* runs = fixture.loader->annotations(0).instance_rle(packed).data();
+ const auto compiled_annotations = fixture.loader->annotations(0);
+ const auto& packed = compiled_annotations.labels[0];
+ const auto* runs = compiled_annotations.instance_rle(packed).data();
  for (std::size_t i = 0; i < packed.mask_rle_pairs; ++i) {
   prediction.mask.runs.emplace_back(runs[i].start, runs[i].length);
   prediction.mask.area += runs[i].length;

@@ -102,8 +102,9 @@ bool rebuild_explore_order(const std::span<const ExploreImageSummary> summaries,
    if ((image_index & 4095U) == 0U && (cancellation_requested(cancel_requested) || !generation_is_current(expected_generation, current_generation))) return;
    const ExploreImageSummary& summary = summaries[image_index];
    const std::uint64_t compiled_index = image_index;
-   if (!summary.eligible || compiled_index < filter.min_compiled_index || compiled_index > filter.max_compiled_index || summary.instance_count < filter.min_instances || summary.instance_count > filter.max_instances ||
-       (filter.require_boxes && summary.instance_count == 0U) || (filter.require_masks && !summary.has_masks) || (filter.restrict_classes && !class_masks_intersect(summary.classes, filter.classes)))
+   if (!summary.eligible || compiled_index < filter.min_compiled_index || compiled_index > filter.max_compiled_index || summary.instance_count < filter.min_instances ||
+       summary.instance_count > filter.max_instances || (filter.require_boxes && summary.instance_count == 0U) || (filter.require_masks && !summary.has_masks) ||
+       (filter.restrict_classes && !class_masks_intersect(summary.classes, filter.classes)))
     continue;
    scratch[image_index] = static_cast<std::uint32_t>(image_index);
    // CLEANUP-IGNORE: Summary production and filter classification use different callbacks; parallel_for already owns the shared mechanism.

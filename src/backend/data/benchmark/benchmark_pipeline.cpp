@@ -1101,7 +1101,8 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
      {
       const std::lock_guard lock(mutex);
       current = !stopping && !result.retired && !image.retiring && !image.source->retiring && result.attempt == images.attempt() &&
-                label->generation == image.source->image_generation(image.image_id) && result.generation == image.source->label_generation && (!target->selected_label || result.priority >= target->selected_label->priority);
+                label->generation == image.source->image_generation(image.image_id) && result.generation == image.source->label_generation &&
+                (!target->selected_label || result.priority >= target->selected_label->priority);
      }
      if (current) {
       ImageEntry entry{};
@@ -1648,8 +1649,8 @@ bool BenchmarkCompilePipeline::Impl::Label::needs_replay() const {
 }
 void BenchmarkCompilePipeline::Impl::ImageState::ready_labels(Label& label) {
  auto& image = *label.image;
- if (!label.input || (!image.width && !label.input->index().image(label.input->position()).width) || label.product || label.active || label.waiting || label.retired || image.retiring || image.source->retiring || image.source->labels_retiring ||
-     execution_.stopping)
+ if (!label.input || (!image.width && !label.input->index().image(label.input->position()).width) || label.product || label.active || label.waiting || label.retired || image.retiring ||
+     image.source->retiring || image.source->labels_retiring || execution_.stopping)
   return;
  label.previous = labels_tail_;
  label.next = nullptr;
@@ -1802,7 +1803,8 @@ const BenchmarkCompilePipeline::Impl::Image* BenchmarkCompilePipeline::Impl::Ima
  return &found->second;
 }
 void BenchmarkCompilePipeline::Impl::ImageState::publish(Source& source, std::uint64_t id, BenchmarkSourceGeneration generation, BenchmarkSourcePublication publication,
- std::optional<std::pair<std::uint32_t, std::uint32_t>> dimensions, bool defer_pixels, std::uint64_t attempt, std::shared_ptr<const BenchmarkEncodedImage> payload, const std::filesystem::path& input_root) {
+ std::optional<std::pair<std::uint32_t, std::uint32_t>> dimensions, bool defer_pixels, std::uint64_t attempt, std::shared_ptr<const BenchmarkEncodedImage> payload,
+ const std::filesystem::path& input_root) {
  auto& execution = execution_;
  Job* accepted = nullptr;
  {
@@ -1957,17 +1959,14 @@ void BenchmarkCompilePipeline::original_generation(const std::filesystem::path& 
    (void)id;
    image.selected_label = nullptr;
    image.labels.clear();
-   if (const auto found = source.images.find(id); found != source.images.end() && found->second.writer) {
-    found->second.writer->invalidate_labels(static_cast<std::uint32_t>(found->second.index));
-   }
+   if (const auto found = source.images.find(id); found != source.images.end() && found->second.writer) { found->second.writer->invalidate_labels(static_cast<std::uint32_t>(found->second.index)); }
   }
   source.labels_retiring = false;
  }
  impl_->changed.notify_all();
 }
-void BenchmarkCompilePipeline::label_configuration(
- std::uint32_t resolution, mmltk::backend::imaging::resample::ImageResizeMode mode, std::function<void(const std::filesystem::path&, std::uint64_t, const BenchmarkLabelWorkspace&)> observer,
- std::function<void(const std::filesystem::path&, std::uint64_t)> completed) {
+void BenchmarkCompilePipeline::label_configuration(std::uint32_t resolution, mmltk::backend::imaging::resample::ImageResizeMode mode,
+ std::function<void(const std::filesystem::path&, std::uint64_t, const BenchmarkLabelWorkspace&)> observer, std::function<void(const std::filesystem::path&, std::uint64_t)> completed) {
  const std::lock_guard lock(impl_->mutex);
  impl_->label_resolution = resolution;
  impl_->label_resize_mode = mode;

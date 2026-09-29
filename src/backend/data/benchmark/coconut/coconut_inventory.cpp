@@ -105,8 +105,8 @@ void CoconutInventorySeal::publish(const std::filesystem::path& inventory_path, 
  struct stat destination{};
  if (::stat(destination_directory.c_str(), &destination) != 0) throw mmltk::common::io::errno_error("stat COCONut inventory destination");
  struct stat current{};
- const bool published = published_path == inventory_path && ::stat(inventory_path.c_str(), &current) == 0 && current.st_dev == device && current.st_ino == inode &&
-                        current.st_size >= 0 && static_cast<std::uint64_t>(current.st_size) == bytes;
+ const bool published = published_path == inventory_path && ::stat(inventory_path.c_str(), &current) == 0 && current.st_dev == device && current.st_ino == inode && current.st_size >= 0 &&
+                        static_cast<std::uint64_t>(current.st_size) == bytes;
  if (!published) {
   bool moved = false;
   if (published_path.empty() && destination.st_dev == device && std::filesystem::is_regular_file(staged.path())) {
@@ -163,7 +163,6 @@ std::vector<CoconutPhysicalImage> load_coconut_physical_inventory(const std::fil
  expected.source = source;
  expected.shard = shard;
  expected.input_identity = archive_identity;
-
  InventoryInput input(cache_path, cancellation);
  InventoryHeader admitted;
  input.value(admitted);
@@ -179,19 +178,20 @@ std::vector<CoconutPhysicalImage> load_coconut_physical_inventory(const std::fil
   validate_coconut_physical_image(image);
   if (image.source != source || image.shard != shard || image.archive_identity != archive_identity || (previous && image.image_id <= *previous)) invalid("invalid cached archive inventory");
   previous = image.image_id;
-  if (ready) ready(image);
-  else images.push_back(std::move(image));
+  if (ready)
+   ready(image);
+  else
+   images.push_back(std::move(image));
  }
  (void)input.finish();
  return images;
 }
-void store_coconut_physical_inventory(const std::filesystem::path& path, std::span<const CoconutPhysicalImage> images, CoconutImageNamespace source, std::uint16_t shard, std::string_view archive_identity,
- Cancellation cancellation, StorageReservationPool* storage) {
+void store_coconut_physical_inventory(const std::filesystem::path& path, std::span<const CoconutPhysicalImage> images, CoconutImageNamespace source, std::uint16_t shard,
+ std::string_view archive_identity, Cancellation cancellation, StorageReservationPool* storage) {
  InventoryHeader expected;
  expected.source = source;
  expected.shard = shard;
  expected.input_identity = archive_identity;
-
  expected.count = images.size();
  (void)store_inventory(path, expected, images, cancellation, storage);
 }

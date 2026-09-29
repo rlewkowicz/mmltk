@@ -676,12 +676,7 @@ void test_copy_paste_cache_publication_recovers_without_targets() {
  const std::array entries{mmltk::backend::data::ImageAnnotations{{&instance, 1}, {&run, 1}}, mmltk::backend::data::ImageAnnotations{}};
  const std::array<std::uint32_t, 1> donor_index{0}, source_index{1};
  const mmltk::backend::data::Batch donor{
-  .num_images = 1,
-  .device_images = donor_pixels.data_ptr<float>(),
-  .annotation_views = entries.data(),
-  .image_indices = donor_index.data(),
-  .slot_index = 0,
-  .lease_id = 0
+  .num_images = 1, .device_images = donor_pixels.data_ptr<float>(), .annotation_views = entries.data(), .image_indices = donor_index.data(), .slot_index = 0, .lease_id = 0
  };
  auto source = donor;
  source.device_images = source_pixels.data_ptr<float>();
@@ -961,16 +956,13 @@ void test_copy_paste_ring_support_and_cache_cycles() {
   };
  }
  labels.back() = {7, mmltk::backend::data::kAnnotationMask, 1, 1, 7, 7, dot_runs.size() * sizeof(RLEPair), static_cast<std::uint16_t>(ring_runs.size())};
- const std::array entries{mmltk::backend::data::ImageAnnotations{std::span{labels}.first(dot_runs.size()), runs}, mmltk::backend::data::ImageAnnotations{std::span{labels}.last(1), runs}, mmltk::backend::data::ImageAnnotations{}};
- const std::array<std::uint32_t, 1> source_index{0}, donor_index{1}, empty_index{2};
- auto batch = mmltk::backend::data::Batch{
-  .num_images = 1,
-  .device_images = donor_pixels.data_ptr<float>(),
-  .annotation_views = &entries[1],
-  .image_indices = donor_index.data(),
-  .slot_index = 0,
-  .lease_id = 0
+ const std::array entries{
+  mmltk::backend::data::ImageAnnotations{std::span{labels}.first(dot_runs.size()), runs}, mmltk::backend::data::ImageAnnotations{std::span{labels}.last(1), runs},
+  mmltk::backend::data::ImageAnnotations{}
  };
+ const std::array<std::uint32_t, 1> source_index{0}, donor_index{1}, empty_index{2};
+ auto batch =
+  mmltk::backend::data::Batch{.num_images = 1, .device_images = donor_pixels.data_ptr<float>(), .annotation_views = &entries[1], .image_indices = donor_index.data(), .slot_index = 0, .lease_id = 0};
  std::vector<float> centers;
  for (int y = 0; y < 8; ++y)
   for (int x = 0; x < 8; ++x) {
@@ -1070,7 +1062,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
    labels.back().mask_rle_pairs = 0;
    labels.back().flags &= ~mmltk::backend::data::kAnnotationMask;
    batch.image_indices = donor_index.data();
-  batch.annotation_views = &entries[donor_index[0]];
+   batch.annotation_views = &entries[donor_index[0]];
    batch.device_images = donor_pixels.data_ptr<float>();
    (void)augmenter.run(batch, 127, 0, 0, 6);
    auto replacement = rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
@@ -1081,7 +1073,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
     lease.handoff();
    }
    batch.image_indices = empty_index.data();
-  batch.annotation_views = &entries[empty_index[0]];
+   batch.annotation_views = &entries[empty_index[0]];
    batch.device_images = source_pixels.data_ptr<float>();
    const auto rectangle = augmenter.run(batch, 127, 0, 0, 7);
    const auto box_plan = augmenter.batch_plan().images[0];
@@ -1158,9 +1150,7 @@ void test_native_augmentation_preview_target_support_parity() {
  const PackedInstance donor{4, mmltk::backend::data::kAnnotationMask, 0, 0, 5, 5, 3 * sizeof(RLEPair), 3};
  const std::array entries{mmltk::backend::data::ImageAnnotations{{&source, 1}, runs}};
  const std::array<std::uint32_t, 1> indices{0};
- const mmltk::backend::data::Batch batch{
-  .num_images = 1, .device_images = nullptr, .annotation_views = entries.data(), .image_indices = indices.data(), .slot_index = 0, .lease_id = 0
- };
+ const mmltk::backend::data::Batch batch{.num_images = 1, .device_images = nullptr, .annotation_views = entries.data(), .image_indices = indices.data(), .slot_index = 0, .lease_id = 0};
  for (const bool include_masks : {false, true})
   for (const bool erase_all : {false, true}) {
    rfdetr::AugmentationBatchPlan plan;
@@ -1214,9 +1204,7 @@ void test_tiny_mask_training_outer_edges() {
  for (const auto run : {RLEPair{0, 1}, RLEPair{7, 1}, RLEPair{24, 1}, RLEPair{31, 1}, RLEPair{11, 1}, RLEPair{11, 2}, RLEPair{10, 4}}) {
   const PackedInstance source{0, mmltk::backend::data::kAnnotationMask, 0, 0, 8, 4, 0, 1};
   const std::array entries{mmltk::backend::data::ImageAnnotations{{&source, 1}, {&run, 1}}};
-  const mmltk::backend::data::Batch batch{
-   .num_images = 1, .device_images = nullptr, .annotation_views = entries.data(), .image_indices = indices.data(), .slot_index = 0, .lease_id = 0
-  };
+  const mmltk::backend::data::Batch batch{.num_images = 1, .device_images = nullptr, .annotation_views = entries.data(), .image_indices = indices.data(), .slot_index = 0, .lease_id = 0};
   for (int geometry = 0; geometry < 4; ++geometry)
    for (const bool masks : {false, true}) {
     CAPTURE(run.start, run.length, geometry, masks);
@@ -1259,19 +1247,12 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
  auto pixels = torch::full({static_cast<int64_t>(count), 3, extent, extent}, 0.9F, floats);
  std::array<std::uint32_t, count> indices{};
  std::array<mmltk::backend::data::ImageAnnotations, count> annotation_views{};
- for (std::size_t image = 0U; image < count; ++image) {
-  indices[image] = static_cast<std::uint32_t>(image);
- }
+ for (std::size_t image = 0U; image < count; ++image) { indices[image] = static_cast<std::uint32_t>(image); }
  constexpr std::array labels{mmltk::backend::data::PackedInstance{0U, mmltk::backend::data::kAnnotationMask, 0, 0, extent, extent, 0U, 1U}};
  constexpr std::array rle{mmltk::backend::data::RLEPair{0U, extent * extent}};
  for (auto& view : annotation_views) view = {labels, rle};
  const mmltk::backend::data::Batch batch{
-  .num_images = count,
-  .device_images = pixels.data_ptr<float>(),
-  .annotation_views = annotation_views.data(),
-  .image_indices = indices.data(),
-  .slot_index = 0U,
-  .lease_id = 0U
+  .num_images = count, .device_images = pixels.data_ptr<float>(), .annotation_views = annotation_views.data(), .image_indices = indices.data(), .slot_index = 0U, .lease_id = 0U
  };
  rfdetr::test_support::AugmentationExecution execution_augmenter(0);
  rfdetr::GpuBatchAugmenter augmenter(rfdetr::test_support::spatial_occlusion_config(), count, extent, extent, execution_augmenter.context);

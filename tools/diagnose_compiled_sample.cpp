@@ -34,14 +34,16 @@ int main(int argc, char** argv) try {
  const auto catalog = data::compiled_class_catalog(header);
  auto labels = nlohmann::json::array();
  for (const auto& label : annotations.labels) {
-  labels.push_back({{"class_id", +label.class_id}, {"class_name", catalog.names()[label.class_id]}, {"flags", +label.flags},
-   {"bbox", {+label.bbox_x1, +label.bbox_y1, +label.bbox_x2, +label.bbox_y2}}, {"mask_pairs", +label.mask_rle_pairs}, {"annotation_id", +label.annotation_id},
-   {"source_category_id", +label.source_category_id}, {"original_area", +label.original_area}, {"source_ordinal", +label.source_ordinal}});
+  labels.push_back(
+   {{"class_id", +label.class_id}, {"class_name", catalog.names()[label.class_id]}, {"flags", +label.flags}, {"bbox", {+label.bbox_x1, +label.bbox_y1, +label.bbox_x2, +label.bbox_y2}},
+    {"mask_pairs", +label.mask_rle_pairs}, {"annotation_id", +label.annotation_id}, {"source_category_id", +label.source_category_id}, {"original_area", +label.original_area},
+    {"source_ordinal", +label.source_ordinal}});
  }
- const nlohmann::json result{{"kind", "compiled_sample"}, {"path", argv[1]}, {"sample", slot}, {"image_count", +header.num_images}, {"slot_count", +header.num_slots},
-  {"width", +header.image_width}, {"height", +header.image_height}, {"original_width", +entry.original_width}, {"original_height", +entry.original_height},
-  {"source", static_cast<std::uint8_t>(entry.source)}, {"image_id", entry.has_source_image_id ? nlohmann::json(+entry.source_image_id) : nlohmann::json(nullptr)},
-  {"label_bytes", +entry.label_bytes}, {"instances", std::move(labels)}};
+ const nlohmann::json result{
+  {"kind", "compiled_sample"}, {"path", argv[1]}, {"sample", slot}, {"image_count", +header.num_images}, {"slot_count", +header.num_slots}, {"width", +header.image_width},
+  {"height", +header.image_height}, {"original_width", +entry.original_width}, {"original_height", +entry.original_height}, {"source", static_cast<std::uint8_t>(entry.source)},
+  {"image_id", entry.has_source_image_id ? nlohmann::json(+entry.source_image_id) : nlohmann::json(nullptr)}, {"label_bytes", +entry.label_bytes}, {"instances", std::move(labels)}
+ };
  std::cout << result.dump() << '\n';
  return 0;
 } catch (const std::exception& error) {

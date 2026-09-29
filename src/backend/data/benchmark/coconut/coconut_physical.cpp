@@ -61,12 +61,12 @@ struct CoconutPhysicalMembership::Impl {
   AdmittedRecipeArchive* archive;
   std::filesystem::path root;
   bool complete = false, admitted = false, cache_hit = false;
-  std::string inspected_cache_identity;
+  std::string inspected_cache_identity{};
   bool cache_generation_known = false;
   std::uint64_t completed_images = 0, bytes = 0;
  };
  struct Fact {
-  CoconutPhysicalImage image;
+  CoconutPhysicalImage image{};
   bool conflict = false, pixels = false, verified = true;
   std::uint64_t bytes = 0;
   const CoconutPhysicalImage* borrowed = nullptr;
@@ -93,7 +93,8 @@ struct CoconutPhysicalMembership::Impl {
     const auto& archive = artifact.archive->origin;
     if (std::ranges::find(coconut_release_sources(release.edition), archive.source) == coconut_release_sources(release.edition).end()) continue;
     if (!explicit_catalog && archive.source == CoconutImageNamespace::Objects365V2 &&
-        std::ranges::find(coconut_objects_training_shards(release.edition), archive.shard) == coconut_objects_training_shards(release.edition).end()) continue;
+        std::ranges::find(coconut_objects_training_shards(release.edition), archive.shard) == coconut_objects_training_shards(release.edition).end())
+     continue;
     releases[release.edition].push_back(&artifact);
    }
  }
@@ -134,9 +135,9 @@ struct CoconutPhysicalMembership::Impl {
     const auto& physical = found->second.physical();
     if (execution) {
      const auto selected = releases.find(edition);
-     if (selected == releases.end() || std::ranges::none_of(selected->second, [&](const auto* item) {
-      return item->archive->origin.source == physical.source && item->archive->origin.shard == physical.shard;
-     })) continue;
+     if (selected == releases.end() ||
+         std::ranges::none_of(selected->second, [&](const auto* item) { return item->archive->origin.source == physical.source && item->archive->origin.shard == physical.shard; }))
+      continue;
     }
     match = &physical;
    }
@@ -151,8 +152,14 @@ struct CoconutPhysicalMembership::Impl {
    changed.wait_for(lock, std::chrono::milliseconds(100));
   }
   if (execution && !wait) {
-   const auto source = objects ? objects->source : edition == CoconutEdition::RelabeledValidation ? CoconutImageNamespace::CocoValidation : record.namespace_hint.value_or(CoconutImageNamespace::CocoTrain);
-   const auto member = objects ? objects->stem + ".jpg" : (source == CoconutImageNamespace::CocoValidation ? "val2017/" : source == CoconutImageNamespace::CocoUnlabeled ? "unlabeled2017/" : "train2017/") + std::filesystem::path(record.file_name).filename().string();
+   const auto source = objects                                          ? objects->source
+                       : edition == CoconutEdition::RelabeledValidation ? CoconutImageNamespace::CocoValidation
+                                                                        : record.namespace_hint.value_or(CoconutImageNamespace::CocoTrain);
+   const auto member = objects ? objects->stem + ".jpg"
+                               : (source == CoconutImageNamespace::CocoValidation  ? "val2017/"
+                                  : source == CoconutImageNamespace::CocoUnlabeled ? "unlabeled2017/"
+                                                                                   : "train2017/") +
+                                  std::filesystem::path(record.file_name).filename().string();
    return {source, id, 0, member, "pending"};
   }
   throw CoconutPhysicalMembershipError(edition, id, "missing physical image: " + record.file_name);
@@ -168,9 +175,7 @@ const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespac
  return impl_->find(source, id);
 }
 CoconutPhysicalImage CoconutPhysicalMembership::identify(CoconutEdition edition, const CoconutRecord& record) const { return impl_->resolve(edition, record, false); }
-CoconutPhysicalImage CoconutPhysicalMembership::resolve(CoconutEdition edition, const CoconutRecord& record) const {
- return impl_->resolve(edition, record, true);
-}
+CoconutPhysicalImage CoconutPhysicalMembership::resolve(CoconutEdition edition, const CoconutRecord& record) const { return impl_->resolve(edition, record, true); }
 std::filesystem::path CoconutPhysicalMembership::identity_root(CoconutImageNamespace source) const { return impl_->root(source); }
 bool CoconutPhysicalMembership::eligible(CoconutEdition edition, const AdmittedRecipeArchive& archive) const {
  const auto found = impl_->releases.find(edition);
@@ -235,7 +240,8 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   if (input.bad()) throw std::runtime_error("cannot read COCONut image cache proof: " + proof_path.string());
   if (proof.is_discarded()) return false;
   if (!proof.is_object() || !proof.contains("schema_version") || proof["schema_version"] != kBenchmarkCacheSchemaVersion || !proof.contains("source") || proof["source"] != source_identity ||
-      !proof.contains("identity") || !proof["identity"].is_string() || !proof.contains("bytes") || !proof["bytes"].is_number_unsigned()) return false;
+      !proof.contains("identity") || !proof["identity"].is_string() || !proof.contains("bytes") || !proof["bytes"].is_number_unsigned())
+   return false;
   const std::lock_guard lock(state.mutex);
   archive.download.identity = proof["identity"].get<std::string>();
   archive.download.size = proof["bytes"].get<std::uint64_t>();
@@ -259,11 +265,12 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
    const std::lock_guard lock(state.mutex);
    const auto withdraw = [&](Impl::Fact& value) {
     if (!value.pixels) return;
-    for (auto& owner : state.artifacts) if (owner.archive->origin.source == value.image.source && owner.archive->origin.shard == value.image.shard) {
-     --owner.completed_images;
-     owner.bytes -= value.bytes;
-     break;
-    }
+    for (auto& owner : state.artifacts)
+     if (owner.archive->origin.source == value.image.source && owner.archive->origin.shard == value.image.shard) {
+      --owner.completed_images;
+      owner.bytes -= value.bytes;
+      break;
+     }
     value.pixels = false;
     value.bytes = 0;
     retire = true;
@@ -298,12 +305,15 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   bool conflict = false;
   {
    const std::lock_guard lock(state.mutex);
-   auto& fact = state.images.at({image.source, image.image_id});
-   conflict = fact.conflict;
+   auto& image_fact = state.images.at({image.source, image.image_id});
+   conflict = image_fact.conflict;
    if (!conflict) {
-    if (!fact.pixels) { ++artifact.completed_images; artifact.bytes = mmltk::common::math::checked_add(artifact.bytes, bytes, "COCONut image cache byte overflow"); }
-    fact.pixels = true;
-    fact.bytes = bytes;
+    if (!image_fact.pixels) {
+     ++artifact.completed_images;
+     artifact.bytes = mmltk::common::math::checked_add(artifact.bytes, bytes, "COCONut image cache byte overflow");
+    }
+    image_fact.pixels = true;
+    image_fact.bytes = bytes;
    }
   }
   // A peer can discover ambiguity while this decoder is active. Let that
@@ -325,15 +335,19 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
    });
    {
     const std::lock_guard lock(state.mutex);
-    for (auto& [key, value] : state.images) if (key.first == archive.origin.source && value.image.shard == archive.origin.shard) value.verified = true;
+    for (auto& [key, value] : state.images)
+     if (key.first == archive.origin.source && value.image.shard == archive.origin.shard) value.verified = true;
    }
-   { const std::lock_guard lock(state.mutex); artifact.cache_hit = true; }
+   {
+    const std::lock_guard lock(state.mutex);
+    artifact.cache_hit = true;
+   }
    unavailable(archive);
    return true;
-  } catch (const CoconutInputError&) { /* Repair the invalid inventory from its forward source. */ }
-    catch (const BenchmarkImageReadError& error) { execution.retire_image(root, error.source_image_id()); }
-    catch (const BenchmarkImageError&) { /* Only failed/missing cache rows need source bytes. */ }
-    catch (const InvalidImageError&) { /* Invalid encoded cache input is locally repairable. */ }
+  } catch (const CoconutInputError&) { /* Repair the invalid inventory from its forward source. */
+  } catch (const BenchmarkImageReadError& error) { execution.retire_image(root, error.source_image_id()); } catch (const BenchmarkImageError&) { /* Only failed/missing cache rows need source bytes. */
+  } catch (const InvalidImageError&) { /* Invalid encoded cache input is locally repairable. */
+  }
  }
  if (cache_only) {
   const std::lock_guard lock(state.mutex);
@@ -353,7 +367,9 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   const auto id = benchmark_archive_image_candidate(reader.member());
   if (!id) continue;
   CoconutPhysicalImage image{archive.origin.source, *id, archive.origin.shard, reader.member(), archive.download.identity};
-  try { validate_coconut_physical_image(image); } catch (const CoconutInputError& error) {
+  try {
+   validate_coconut_physical_image(image);
+  } catch (const CoconutInputError& error) {
    if (rejected) rejected(image, error.what());
    continue;
   }
@@ -397,14 +413,17 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
  });
  std::ranges::sort(inventory, {}, &CoconutPhysicalImage::image_id);
  store_coconut_physical_inventory(inventory_path, inventory, archive.origin.source, archive.origin.shard, archive.download.identity, cancellation, state.storage);
- write_json_atomically(proof_path, {{"schema_version", kBenchmarkCacheSchemaVersion}, {"source", source_identity}, {"identity", archive.download.identity}, {"bytes", archive.download.size}}, cancellation, state.storage);
+ write_json_atomically(
+  proof_path, {{"schema_version", kBenchmarkCacheSchemaVersion}, {"source", source_identity}, {"identity", archive.download.identity}, {"bytes", archive.download.size}}, cancellation, state.storage);
  unavailable(archive);
  return true;
 }
 CachedImageDirectory CoconutPhysicalMembership::summary(const AdmittedRecipeArchive& archive) const {
  const std::lock_guard lock(impl_->mutex);
  const auto& value = impl_->artifact(archive);
- return {std::string(benchmark_source_name(archive.origin.artifact.source)), archive.origin.cache_shard, value.root, archive.download.identity, {}, value.completed_images, value.bytes, value.cache_hit, {}};
+ return {
+  std::string(benchmark_source_name(archive.origin.artifact.source)), archive.origin.cache_shard, value.root, archive.download.identity, {}, value.completed_images, value.bytes, value.cache_hit, {}
+ };
 }
 void CoconutPhysicalDependencies::add(const CoconutPhysicalImage& image) {
  const auto [entry, inserted] = shards_.try_emplace(image.shard, image.archive_identity);
@@ -418,13 +437,16 @@ std::string CoconutPhysicalMembership::dependency_identity(CoconutEdition editio
   for (const auto* item : release->second) {
    const auto& archive = *item->archive;
    if (archive.origin.source != source || (!used.empty() && !used.contains(archive.origin.shard))) continue;
-   tuples.push_back({archive.origin.artifact.artifact_id, archive.origin.shard, current || used.empty() ? (item->admitted ? archive.download.identity : std::string{}) : used.at(archive.origin.shard)});
+   tuples.push_back(
+    {archive.origin.artifact.artifact_id, archive.origin.shard, current || used.empty() ? (item->admitted ? archive.download.identity : std::string{}) : used.at(archive.origin.shard)});
   }
  } else if (const auto found = impl_->standalone_shards.find(source); found != impl_->standalone_shards.end()) {
   for (const auto& [shard, identities] : found->second) {
    if (!used.empty() && !used.contains(shard)) continue;
-   if (current || used.empty()) for (const auto& identity : identities) tuples.push_back({shard, identity});
-   else tuples.push_back({shard, used.at(shard)});
+   if (current || used.empty())
+    for (const auto& identity : identities) tuples.push_back({shard, identity});
+   else
+    tuples.push_back({shard, used.at(shard)});
   }
  }
  return nlohmann::json{{"domain", "coconut-physical-artifacts-v1"}, {"edition", edition}, {"source", source}, {"artifacts", std::move(tuples)}}.dump();

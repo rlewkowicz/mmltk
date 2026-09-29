@@ -31,8 +31,14 @@ std::string benchmark_semantics(const std::filesystem::path& path) {
   if (!samples.emplace(std::pair{entry.source, entry.source_image_id}, std::move(value)).second) throw std::logic_error("duplicate compiled sample identity");
  }
  std::string result;
- for (const auto& name : dataset.class_names()) { result += name; result.push_back('\0'); }
- for (const auto& [identity, sample] : samples) { (void)identity; result += sample; }
+ for (const auto& name : dataset.class_names()) {
+  result += name;
+  result.push_back('\0');
+ }
+ for (const auto& [identity, sample] : samples) {
+  (void)identity;
+  result += sample;
+ }
  return result;
 }
 namespace {
@@ -174,7 +180,6 @@ void assert_image_matches(const float* actual, const std::vector<float>& expecte
  }
 }
 }  // namespace mmltk::backend::data::testsupport
-
 namespace mmltk::backend::data::testsupport {
 void bind_benchmark_slots(benchmark_internal::BenchmarkCompilePipeline& execution, benchmark_internal::BenchmarkSplitWriter& writer, const benchmark_internal::PreparedBenchmarkSplit& split) {
  for (std::size_t i = 0; i < split.images.size(); ++i) {
@@ -193,9 +198,8 @@ ImageEntry benchmark_entry(const benchmark_internal::EncodedImageRecord& image) 
 }
 void write_benchmark_fixture(const benchmark_internal::BenchmarkWriteRequest& request, std::span<const std::shared_ptr<benchmark_internal::BenchmarkLabelChunk>> chunks) {
  benchmark_internal::BenchmarkSplitWriter writer(request);
- for (std::size_t i = 0; i < chunks.size(); ++i)
-  writer.write_labels(static_cast<std::uint32_t>(i), benchmark_entry(request.split.images.at(i)), {chunks[i]->labels, chunks[i]->runs});
+ for (std::size_t i = 0; i < chunks.size(); ++i) writer.write_labels(static_cast<std::uint32_t>(i), benchmark_entry(request.split.images.at(i)), {chunks[i]->labels, chunks[i]->runs});
  writer.write_remaining(request);
  writer.finish(request);
 }
-}
+}  // namespace mmltk::backend::data::testsupport

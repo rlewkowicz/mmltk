@@ -69,8 +69,8 @@ BenchmarkLabelChunk compile_benchmark_image_labels(const NormalizedAnnotationRea
  project_labels(index, position, dimensions, resolution, mode, workspace, result, cancellation);
  return result;
 }
-const BenchmarkLabelChunk& compile_benchmark_image_labels_reused(const NormalizedAnnotationReadView& index, std::size_t position, std::pair<std::uint32_t, std::uint32_t> dimensions, std::uint32_t resolution,
- mmltk::backend::imaging::resample::ImageResizeMode mode, BenchmarkLabelWorkspace& workspace, mmltk::common::concurrency::CancellationObservation cancellation) {
+const BenchmarkLabelChunk& compile_benchmark_image_labels_reused(const NormalizedAnnotationReadView& index, std::size_t position, std::pair<std::uint32_t, std::uint32_t> dimensions,
+ std::uint32_t resolution, mmltk::backend::imaging::resample::ImageResizeMode mode, BenchmarkLabelWorkspace& workspace, mmltk::common::concurrency::CancellationObservation cancellation) {
  auto& result = workspace.output();
  project_labels(index, position, dimensions, resolution, mode, workspace, result, cancellation);
  return result;

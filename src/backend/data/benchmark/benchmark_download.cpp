@@ -1041,9 +1041,7 @@ namespace {
 DownloadResult download_locked_artifact(const DownloadRequest& request, std::size_t concurrency, mmltk::common::concurrency::CancellationObservation cancellation, const DownloadProgressSink& progress,
  const BenchmarkTraceSink& trace, BenchmarkCurl& transport, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool& storage) {
  DownloadStorage destination(request, storage, trace);
- if (auto result = validate_complete_artifact(request, cancellation, progress, trace)) {
-  return *result;
- }
+ if (auto result = validate_complete_artifact(request, cancellation, progress, trace)) { return *result; }
  // The partial descriptor and atomic checkpoint/publication descriptor belong
  // to this source. Active request workspace is admitted separately by Curl.
  BenchmarkAllowance files;
@@ -1228,7 +1226,7 @@ class DownloadBatch final {
    }
    try {
     try {
-    results_[job->index] = download_locked_artifact(requests_[job->index], concurrency_, cancellation_, progress_, trace_, transport_, execution_, job->lease->allowance(), storage_);
+     results_[job->index] = download_locked_artifact(requests_[job->index], concurrency_, cancellation_, progress_, trace_, transport_, execution_, job->lease->allowance(), storage_);
     } catch (const BenchmarkDownloadUnavailable& error) {
      if (!unavailable_) throw;
      job->lease.reset();
@@ -1343,8 +1341,8 @@ public:
  }
 };
 }  // namespace
-std::optional<DownloadResult> try_cached_download(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancellation,
- const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, const DownloadProgressSink& progress) {
+std::optional<DownloadResult> try_cached_download(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
+ BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, const DownloadProgressSink& progress) {
  auto lease = ArtifactLease::try_acquire_charged(request.lock_path, cancellation, execution, BenchmarkResources::handles(2, true), parent);
  if (!lease) return std::nullopt;
  return validate_complete_artifact(request, cancellation, progress, trace);

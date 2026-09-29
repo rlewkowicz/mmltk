@@ -186,7 +186,6 @@ TEST_CASE("Sparse training shards preserve empty images distinct support and sta
  CHECK(std::ranges::all_of(draws.schedule->image_indices, [&](auto slot) { return sparse[slot].eligible; }));
  for (auto& image : sparse) image.eligible = false;
  CHECK_THROWS(r::TrainingDataPlan(sparse, 4, request));
-
 }
 TEST_CASE("Repeated global windows rank slicing and semantic keys survive physical packing", "[rfdetr][training][data_plan]") {
  r::TrainRequest request;

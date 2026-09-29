@@ -42,8 +42,7 @@ void set_scheduler(int policy, int priority) {
  if (error) throw std::system_error(error, std::generic_category(), "required normal worker scheduler denied");
 }
 void capture_affinity(std::vector<unsigned long>& mask) {
- if (::sched_getaffinity(0, mask.size() * sizeof(unsigned long), reinterpret_cast<cpu_set_t*>(mask.data())) != 0)
-  throw std::system_error(errno, std::generic_category(), "capture thread affinity");
+ if (::sched_getaffinity(0, mask.size() * sizeof(unsigned long), reinterpret_cast<cpu_set_t*>(mask.data())) != 0) throw std::system_error(errno, std::generic_category(), "capture thread affinity");
 }
 std::vector<unsigned long> prepare_affinity() {
  constexpr auto word_bits = sizeof(unsigned long) * 8U;
@@ -73,8 +72,12 @@ void capture_scheduler(int& policy, int& priority) {
 }  // namespace
 struct PreparedExecutionPolicy::Impl {
  explicit Impl(const ExecutionPolicyRequest& selected)
-     : request(selected), previous_affinity(prepare_affinity()), desired_affinity(previous_affinity.size()), observed_affinity(previous_affinity.size()),
-       previous_memory(capture_memory_policy()), observed_memory(previous_memory) {
+     : request(selected),
+       previous_affinity(prepare_affinity()),
+       desired_affinity(previous_affinity.size()),
+       observed_affinity(previous_affinity.size()),
+       previous_memory(capture_memory_policy()),
+       observed_memory(previous_memory) {
   if (request.target_nice < -20 || request.target_nice > -10) throw std::invalid_argument("boundary worker nice priority must be -10 or better");
   constexpr auto word_bits = sizeof(unsigned long) * 8U;
   if (!request.cpu_affinity.empty()) {
@@ -93,7 +96,9 @@ struct PreparedExecutionPolicy::Impl {
 };
 PreparedExecutionPolicy::PreparedExecutionPolicy(const ExecutionPolicyRequest& request) : impl_(std::make_unique<Impl>(request)) {}
 PreparedExecutionPolicy::~PreparedExecutionPolicy() {
- try { Restore(); } catch (...) { std::terminate(); }
+ try {
+  Restore();
+ } catch (...) { std::terminate(); }
 }
 void PreparedExecutionPolicy::Apply() {
  auto& state = *impl_;
@@ -178,7 +183,9 @@ ExecutionPolicySnapshot capture_execution_policy_snapshot() {
 ScopedExecutionPolicy::ScopedExecutionPolicy(const ExecutionPolicyRequest& request) : owned_(std::make_unique<PreparedExecutionPolicy>(request)), policy_(owned_.get()) { policy_->Apply(); }
 ScopedExecutionPolicy::ScopedExecutionPolicy(PreparedExecutionPolicy& policy) : policy_(&policy) { policy_->Apply(); }
 ScopedExecutionPolicy::~ScopedExecutionPolicy() noexcept {
- try { Restore(); } catch (...) { std::terminate(); }
+ try {
+  Restore();
+ } catch (...) { std::terminate(); }
 }
 void ScopedExecutionPolicy::Restore() {
  if (!policy_) return;

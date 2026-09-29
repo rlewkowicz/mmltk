@@ -32,6 +32,7 @@ class MaskRunCapacityError final : public std::length_error {
 public:
  explicit MaskRunCapacityError(std::size_t required) : std::length_error("row-major mask exceeds bounded output"), required_(required) {}
  [[nodiscard]] std::size_t required_runs() const noexcept { return required_; }
+
 private:
  std::size_t required_;
 };

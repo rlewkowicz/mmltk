@@ -74,10 +74,16 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
  const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, NumaTopology::Capture());
  auto readers = std::make_shared<WorkerPool>(1U, execution.placement.cpus, "shared-read", 2U, &execution.placement, true);
  std::array<std::size_t, 6> storage_growths{};
- CompiledImageStream stream({.slots = 1U, .workers = 1U, .device = 0, .loading = data_loading_options(h2d), .execution = execution, .reader_pool = readers,
-  .storage_growth = {&storage_growths, [](void* context, CompiledImageStream::StorageKind kind, std::size_t, std::size_t, std::size_t) noexcept {
-   ++(*static_cast<std::array<std::size_t, 6>*>(context))[static_cast<std::size_t>(kind)];
-  }}});
+ CompiledImageStream stream(
+  {.slots = 1U,
+   .workers = 1U,
+   .device = 0,
+   .loading = data_loading_options(h2d),
+   .execution = execution,
+   .reader_pool = readers,
+   .storage_growth = {&storage_growths, [](void* observer_context, CompiledImageStream::StorageKind kind, std::size_t, std::size_t, std::size_t) noexcept {
+  ++(*static_cast<std::array<std::size_t, 6>*>(observer_context))[static_cast<std::size_t>(kind)];
+ }}});
  CHECK(&stream.workers() == readers.get());
  context.emplace(0, mmltk::frameworks::gpu::cuda_image_copy_backend());
  context->Bind();
@@ -166,9 +172,11 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
  CHECK(storage_growths == prepared_growths);
  std::size_t preparation_growths = 0;
  for (const auto count : prepared_growths) preparation_growths += count;
- std::printf("compiled_stream_fixture transport=%s first_host_pixels_labels_ns=%lld active_pixel_bytes=%zu active_label_bytes=%zu logical_label_capacity=%zu retained_label_bytes=%zu retained_host_bytes=%zu retained_device_bytes=%zu preparation_growths=%zu steady_growths=0 scope=owned_buffers_and_read_containers_not_total_malloc cache=warm_fixture\n",
-  h2d ? "h2d" : "gdrcopy", static_cast<long long>(first_host_ns), 2U * stride, used.size(), maximum_batch * COMPILED_LABEL_CAPACITY, label_capacity,
-  stream.host_storage(0).capacity_bytes(), stream.device_storage(0).capacity_bytes(), preparation_growths);
+ std::printf(
+  "compiled_stream_fixture transport=%s first_host_pixels_labels_ns=%lld active_pixel_bytes=%zu active_label_bytes=%zu logical_label_capacity=%zu retained_label_bytes=%zu retained_host_bytes=%zu "
+  "retained_device_bytes=%zu preparation_growths=%zu steady_growths=0 scope=owned_buffers_and_read_containers_not_total_malloc cache=warm_fixture\n",
+  h2d ? "h2d" : "gdrcopy", static_cast<long long>(first_host_ns), 2U * stride, used.size(), maximum_batch * COMPILED_LABEL_CAPACITY, label_capacity, stream.host_storage(0).capacity_bytes(),
+  stream.device_storage(0).capacity_bytes(), preparation_growths);
  const std::array invalid{CompiledImageRead{source.header().num_images, 0U}};
  stream.submit(0U, source, invalid, {});
  REQUIRE_THROWS_AS(stream.wait_read(0U), std::out_of_range);
@@ -312,7 +320,8 @@ void exercise_sparse_capacity(const std::string& path, const bool h2d) {
  auto header = original.header();
  header.num_images = 2;
  auto entries = std::vector<ImageEntry>(original.image_entries().begin(), original.image_entries().end());
- for (std::size_t slot = 0; slot < entries.size(); ++slot) if (slot != 0 && slot != 13) entries[slot] = {};
+ for (std::size_t slot = 0; slot < entries.size(); ++slot)
+  if (slot != 0 && slot != 13) entries[slot] = {};
  const auto layout = compute_file_layout(header.num_slots, header.image_stride);
  {
   const auto file = mmltk::common::io::FileHandle::create_output(sparse_path.string(), 0);
@@ -371,7 +380,8 @@ void exercise_sparse_capacity(const std::string& path, const bool h2d) {
     CHECK(batch.image_indices[i] == slot);
     CHECK(batch.annotations(i).labels.size() == original.image_labels(slot).size());
     CHECK(std::memcmp(pixels.data() + i * header.image_stride / sizeof(float), original.image_pixels(slot), header.image_stride) == 0);
-    if (slot == 13) CHECK(reinterpret_cast<const std::byte*>(batch.annotations(i).labels.data()) - reinterpret_cast<const std::byte*>(labels) == static_cast<std::ptrdiff_t>((i - 1) * COMPILED_LABEL_CAPACITY));
+    if (slot == 13)
+     CHECK(reinterpret_cast<const std::byte*>(batch.annotations(i).labels.data()) - reinterpret_cast<const std::byte*>(labels) == static_cast<std::ptrdiff_t>((i - 1) * COMPILED_LABEL_CAPACITY));
    }
    ++batches;
    loader.release_batch(batch);
@@ -410,8 +420,7 @@ void exercise_demanded_host_shutdown(const std::string& path, const bool h2d) {
    if (prepared) CHECK(pixels.data() == prepared);
    CHECK(loader.host_images(batch).data() == pixels.data());
    const auto stride = loader.image_stride();
-   for (std::size_t image = 0; image < batch.num_images; ++image)
-    CHECK(std::memcmp(pixels.data() + image * stride / sizeof(float), loader.image_pixels(batch.image_indices[image]), stride) == 0);
+   for (std::size_t image = 0; image < batch.num_images; ++image) CHECK(std::memcmp(pixels.data() + image * stride / sizeof(float), loader.image_pixels(batch.image_indices[image]), stride) == 0);
   }
  }
 }
@@ -450,7 +459,10 @@ void exercise_independent_completions(const std::string& path, const bool h2d) {
  std::atomic<bool> consumed{false};
  CompiledImageStream stream({.slots = 2U, .workers = 1U, .device = 0, .loading = data_loading_options(h2d)});
  stream.bind_current_context();
- for (std::size_t slot = 0U; slot < 2U; ++slot) { stream.prepare_images(slot, reads.size() * stride); stream.prepare_reads(slot, reads.size()); }
+ for (std::size_t slot = 0U; slot < 2U; ++slot) {
+  stream.prepare_images(slot, reads.size() * stride);
+  stream.prepare_reads(slot, reads.size());
+ }
  stream.prepare_host(1U, reads.size() * stride);
  stream.prepare_metadata(0U, reads.size() * stride);
  const auto* second_device = stream.device_storage(1U).data();
@@ -474,9 +486,9 @@ void exercise_independent_completions(const std::string& path, const bool h2d) {
   const auto* prepared = stream.host_storage(0U).data();
   const auto capacity = stream.host_storage(0U).capacity_bytes();
   stream.submit(1U, source, reads, {.context = &boundary, .complete = [](void* raw, std::size_t, std::exception_ptr, bool) noexcept {
-   auto& boundary = *static_cast<CompletionBoundary*>(raw);
-   boundary.entered.set_value();
-   const std::lock_guard lock(boundary.mutex);
+   auto& completion_boundary = *static_cast<CompletionBoundary*>(raw);
+   completion_boundary.entered.set_value();
+   const std::lock_guard lock(completion_boundary.mutex);
   }});
   mmltk::testsupport::await_test_promise(boundary.entered, "second prefetch completion entered");
   demanded = std::async(std::launch::async, [&] { return stream.host_images(0U); });
@@ -585,7 +597,7 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  while (direct_loader.next_batch(batch)) {
   REQUIRE(batch.image_indices[0] == next_expected_idx);
   const bool contiguous = batch.num_images == 1 || (IMAGE_STRIDE % PAGE_SIZE == 0 && batch.image_indices[0] / COMPILED_BLOCK_SLOTS == batch.image_indices[batch.num_images - 1] / COMPILED_BLOCK_SLOTS);
-  REQUIRE((direct_loader.host_images(batch).data() == direct_loader.image_pixels(next_expected_idx)) == contiguous);
+  REQUIRE((direct_loader.host_images(batch).data() == direct_loader.image_pixels(batch.image_indices[0])) == contiguous);
   total += batch.num_images;
   for (size_t i = 0; i < batch.num_images; ++i) {
    const uint32_t idx = batch.image_indices[i];
@@ -988,7 +1000,9 @@ void exercise_used_read_measurements(const std::string& path) {
    ++pixel_copies;
   }
  };
- struct Measurement { std::uint64_t ns = 0, pixels = 0, labels = 0, copies = 0; };
+ struct Measurement {
+  std::uint64_t ns = 0, pixels = 0, labels = 0, copies = 0;
+ };
  const std::atomic<bool> cancelled{false};
  constexpr std::size_t extent_limit = 16U * 1024U * 1024U;
  const auto packed_pixels = [&](Gather& output) {
@@ -1003,7 +1017,8 @@ void exercise_used_read_measurements(const std::string& path) {
    auto end = first + 1;
    auto last = reads[first].index;
    while (end < reads.size() && reads[end].index >= last && std::uint64_t{reads[end].index} <= std::uint64_t{last} + 1U &&
-          static_cast<std::size_t>(reads[end].index - reads[first].index) < std::max<std::size_t>(1, extent_limit / stride)) last = reads[end++].index;
+          static_cast<std::size_t>(reads[end].index - reads[first].index) < std::max<std::size_t>(1, extent_limit / stride))
+    last = reads[end++].index;
    const auto offset = static_cast<std::size_t>(reads[first].index) * stride;
    const auto bytes = (static_cast<std::size_t>(last - reads[first].index) + 1U) * stride;
    for (std::size_t done = 0; done < bytes;) {
@@ -1017,7 +1032,8 @@ void exercise_used_read_measurements(const std::string& path) {
   for (std::size_t first = 0; first < reads.size();) {
    std::size_t consecutive = 1;
    while (first + consecutive < reads.size() && reads[first + consecutive].index == reads[first].index + consecutive &&
-          reads[first + consecutive].destination_offset == reads[first].destination_offset + consecutive * stride && consecutive < std::max<std::size_t>(1, extent_limit / stride)) ++consecutive;
+          reads[first + consecutive].destination_offset == reads[first].destination_offset + consecutive * stride && consecutive < std::max<std::size_t>(1, extent_limit / stride))
+    ++consecutive;
    const auto offset = static_cast<std::size_t>(reads[first].index) * stride;
    const auto bytes = consecutive * stride;
    for (std::size_t done = 0; done < bytes;) {
@@ -1039,11 +1055,11 @@ void exercise_used_read_measurements(const std::string& path) {
    output.label_bytes += bytes;
   }
   if (fixed) {
-   const bool complete = source.read_images_to(reads, {&output, pixels.size(), [](void* context, std::size_t offset, std::span<const std::byte> bytes) {
-    static_cast<Gather*>(context)->copy(offset, bytes);
-   }}, cancelled, false);
+   const bool complete = source.read_images_to(
+    reads, {&output, pixels.size(), [](void* context, std::size_t offset, std::span<const std::byte> bytes) { static_cast<Gather*>(context)->copy(offset, bytes); }}, cancelled, false);
    if (!complete) throw std::runtime_error("fixed fixture cancelled");
-  } else packed_pixels(output);
+  } else
+   packed_pixels(output);
   return output;
  };
  constexpr unsigned repetitions = 16;
@@ -1061,7 +1077,10 @@ void exercise_used_read_measurements(const std::string& path) {
     CHECK(std::memcmp(labels.data() + i * COMPILED_LABEL_CAPACITY, used.data(), used.size()) == 0);
    }
   };
-  for (const bool fixed : {false, true}) { (void)gather(fixed); verify(); }
+  for (const bool fixed : {false, true}) {
+   (void)gather(fixed);
+   verify();
+  }
   std::array<Measurement, 2> measured{};
   for (unsigned repetition = 0; repetition < repetitions; ++repetition) {
    for (unsigned pass = 0; pass < 2; ++pass) {
@@ -1082,10 +1101,12 @@ void exercise_used_read_measurements(const std::string& path) {
   for (std::size_t variant = 0; variant < measured.size(); ++variant) {
    const auto& value = measured[variant];
    const auto throughput = value.ns ? static_cast<double>(value.pixels + value.labels) * 1.0e9 / static_cast<double>(value.ns) : 0.0;
-   std::printf("compiled_used_read_fixture layout=%s order=%s repetitions=%u pixel_bytes=%llu label_bytes=%llu elapsed_ns=%llu used_bytes_per_second=%.0f pixel_copy_calls=%llu prepared_arena_bytes=%zu resident_metadata_bytes=%zu mapped_apparent_bytes=%zu cache=warm fixture_only=1 production_baseline=unavailable\n",
-    variant == 0 ? "fixed10" : "packed_algorithm_3b1373b9", shuffled ? "shuffled_seed_1729" : "sequential", repetitions,
-    static_cast<unsigned long long>(value.pixels), static_cast<unsigned long long>(value.labels), static_cast<unsigned long long>(value.ns), throughput,
-    static_cast<unsigned long long>(value.copies), pixels.capacity() + labels.capacity() + reads.capacity() * sizeof(CompiledImageRead), source.image_entries().size_bytes(),
+   std::printf(
+    "compiled_used_read_fixture layout=%s order=%s repetitions=%u pixel_bytes=%llu label_bytes=%llu elapsed_ns=%llu used_bytes_per_second=%.0f pixel_copy_calls=%llu prepared_arena_bytes=%zu "
+    "resident_metadata_bytes=%zu mapped_apparent_bytes=%zu cache=warm fixture_only=1 production_baseline=unavailable\n",
+    variant == 0 ? "fixed10" : "packed_algorithm_3b1373b9", shuffled ? "shuffled_seed_1729" : "sequential", repetitions, static_cast<unsigned long long>(value.pixels),
+    static_cast<unsigned long long>(value.labels), static_cast<unsigned long long>(value.ns), throughput, static_cast<unsigned long long>(value.copies),
+    pixels.capacity() + labels.capacity() + reads.capacity() * sizeof(CompiledImageRead), source.image_entries().size_bytes(),
     variant == 0 ? static_cast<std::size_t>(source.header().total_file_size) : packed->size());
   }
  }
@@ -1221,7 +1242,8 @@ TEST_CASE("empty compiled datasets retain their format admission failure", "[bac
 TEST_CASE("compiled owner admits all record sections in its metadata construction", "[backend][data][roundtrip][admission]") {
  mmltk::testsupport::ScopedTempDir root("compiled-fused-admission");
  const auto path = root.path() / "dataset.bin";
- const auto defect = GENERATE("none", "incomplete ordinal", "foreign incomplete ordinal", "extent", "dimensions", "source identity", "source category", "flags", "label span", "class", "zero run", "overlap", "canvas", "coverage");
+ const auto defect = GENERATE("none", "incomplete ordinal", "foreign incomplete ordinal", "extent", "dimensions", "source identity", "source category", "flags", "label span", "class", "zero run",
+  "overlap", "canvas", "coverage");
  CAPTURE(defect);
  std::array<ImageEntry, 2> images{};
  std::array<PackedInstance, 2> labels{};
@@ -1336,7 +1358,8 @@ TEST_CASE("Directory metadata construction preserves empty masks offsets and pub
    CHECK(result.instance_rle(image, present_empty).empty());
    CHECK(present_empty.mask_rle_offset == result.annotations(image).runs.size_bytes());
   }
-  for (std::uint32_t image = 0; image < result.image_entries().size(); ++image) CHECK(result.pixel_offset(image) == compute_file_layout(result.header().num_slots, result.header().image_stride).pixel_offset(image));
+  for (std::uint32_t image = 0; image < result.image_entries().size(); ++image)
+   CHECK(result.pixel_offset(image) == compute_file_layout(result.header().num_slots, result.header().image_stride).pixel_offset(image));
   const auto bytes = read_output();
   if (baseline.empty())
    baseline = bytes;

@@ -331,7 +331,6 @@ PackedInstance pack_instance(const ParsedInstance& instance) {
  packed.mask_rle_pairs = checked_cast<uint16_t>(instance.rle_pairs.size(), "too many RLE pairs for one instance");
  return packed;
 }
-
 }  // namespace
 std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) { return numbered_path(split_dir, zero_based_index + 1, ".png"); }
 std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) { return numbered_path(split_dir, zero_based_index + 1, ".jsonl"); }
@@ -397,8 +396,8 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
  return scan;
 }
 LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config, const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base,
- const mmltk::common::io::FileHandle& output, const FileLayout& pixel_layout, int num_workers, const std::span<const int> worker_cpus, ProgressCounter* completed_images, std::atomic<bool>* failure_requested,
- const mmltk::common::concurrency::CancellationObservation cancellation) {
+ const mmltk::common::io::FileHandle& output, const FileLayout& pixel_layout, int num_workers, const std::span<const int> worker_cpus, ProgressCounter* completed_images,
+ std::atomic<bool>* failure_requested, const mmltk::common::concurrency::CancellationObservation cancellation) {
  mmltk::common::logging::ScopedProfile profile{"compiler.labels.build_blocks"};
  auto record_worker_stats = [&](const std::vector<LabelWorkerStats>& worker_stats) {
 #if MMLTK_ENABLE_PROFILING

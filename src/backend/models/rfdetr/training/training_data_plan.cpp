@@ -48,7 +48,8 @@ TrainingDataPlan::TrainingDataPlan(std::vector<TrainingImageClasses> images, std
  std::ranges::sort(shards_, {}, &TrainingShard::model_id);
  std::vector<std::uint32_t> order;
  order.reserve(image_count_);
- for (std::uint32_t slot = 0; slot < membership_.size(); ++slot) if (membership_[slot].eligible) order.push_back(slot);
+ for (std::uint32_t slot = 0; slot < membership_.size(); ++slot)
+  if (membership_[slot].eligible) order.push_back(slot);
  if (!image_count_) throw std::invalid_argument("training image membership has no eligible images");
  std::vector<std::uint64_t> rarity;
  if (policy_.balancing != TrainBalancing::Off) {

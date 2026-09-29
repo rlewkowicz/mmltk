@@ -451,8 +451,7 @@ void IndexingProgressTotals::settle(std::size_t release, std::uint64_t completed
  auto& observation = releases_.at(release);
  completed_ = replace_progress(completed_, observation.completed, completed);
  total_ = replace_progress(total_, observation.total, completed);
- if (completed < observation.completed)
-  ProgressReporter::add_progress(reporter.state_.tracks.labels.invalidated, observation.completed - completed, "benchmark indexing settlement overflow");
+ if (completed < observation.completed) ProgressReporter::add_progress(reporter.state_.tracks.labels.invalidated, observation.completed - completed, "benchmark indexing settlement overflow");
  observation = {completed, completed};
  reporter.indexed_completed_ = completed_;
  reporter.indexed_total_ = total_;

@@ -11,7 +11,8 @@ void WritablePixelRange::grow(const FileLayout& layout) {
  blocks_.reserve(count);
  while (blocks_.size() < count) {
   const auto bytes = layout.pixel_block_bytes;
-  void* mapping = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, descriptor_, mmltk::common::math::checked_cast<off_t>(layout.block_offset(blocks_.size()), "compiled block mmap offset overflow"));
+  void* mapping =
+   ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, descriptor_, mmltk::common::math::checked_cast<off_t>(layout.block_offset(blocks_.size()), "compiled block mmap offset overflow"));
   if (mapping == MAP_FAILED) throw mmltk::common::io::errno_error("compiled pixel block mmap failed");
   mmltk::common::io::MappedByteRegion region;
   region.adopt(mapping, bytes);

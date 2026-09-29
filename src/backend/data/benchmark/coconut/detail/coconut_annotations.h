@@ -87,7 +87,8 @@ private:
  friend void admit_coconut_component(const CoconutComponent&, mmltk::common::concurrency::CancellationObservation);
  friend std::uint64_t coconut_component_storage_bytes(const CoconutComponent&);
  friend void store_coconut_component(const std::filesystem::path&, const CoconutComponent&, mmltk::common::concurrency::CancellationObservation, StorageReservationPool*);
- friend std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutComponentPart>, std::string_view, const CoconutPhysicalMembership&, const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, StorageReservationPool*, BenchmarkCompilePipeline*, const CoconutImageRejection&);
+ friend std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutComponentPart>, std::string_view, const CoconutPhysicalMembership&, const std::filesystem::path&,
+  mmltk::common::concurrency::CancellationObservation, StorageReservationPool*, BenchmarkCompilePipeline*, const CoconutImageRejection&);
  CoconutComponent(std::shared_ptr<const CoconutComponentBacking>, NormalizedAnnotationReadView, std::shared_ptr<CoconutInventorySeal>, bool);
  std::shared_ptr<const CoconutComponentBacking> backing_;
  NormalizedAnnotationReadView index_;
@@ -100,7 +101,7 @@ struct CoconutComponentPart {
  std::optional<std::uint64_t> row_base = 0, segment_base = 0;
  // Authoritative parser facts can complete an older immutable cache's absent
  // optional extent metadata without rewriting its records or completion.
- std::optional<std::pair<std::uint64_t, std::uint64_t>> source_extent;
+ std::optional<std::pair<std::uint64_t, std::uint64_t>> source_extent{};
 };
 [[nodiscard]] std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutComponentPart>, std::string_view, const CoconutPhysicalMembership&, const std::filesystem::path&,
  mmltk::common::concurrency::CancellationObservation = {}, StorageReservationPool* = nullptr, BenchmarkCompilePipeline* = nullptr, const CoconutImageRejection& = {});
@@ -194,9 +195,9 @@ struct CoconutAnnotationInput {
 using CoconutRecordConsumer = std::function<void(std::size_t group, const CoconutRecord&, const CoconutAnnotationInput&)>;
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
  const CoconutRecordConsumer& consumer, bool metadata_only = false, BenchmarkCompilePipeline* execution = nullptr, const std::function<void(std::size_t)>& finish_consumer_group = {},
- const BenchmarkAllowance& parent = {}, CoconutAnnotationRecords* retained = nullptr,
- const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace = {}, const std::function<void(const BenchmarkAllowance&)>& retire_consumer_input = {},
- const std::function<void(const std::function<void()>&)>& settle_consumer = {}, const std::function<bool(const CoconutRecord&, const BenchmarkAllowance&)>& reusable_native = {});
+ const BenchmarkAllowance& parent = {}, CoconutAnnotationRecords* retained = nullptr, const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace = {},
+ const std::function<void(const BenchmarkAllowance&)>& retire_consumer_input = {}, const std::function<void(const std::function<void()>&)>& settle_consumer = {},
+ const std::function<bool(const CoconutRecord&, const BenchmarkAllowance&)>& reusable_native = {});
 class CoconutOriginalChanged final : public std::runtime_error {
 public:
  explicit CoconutOriginalChanged(CoconutImageNamespace source) : std::runtime_error("COCONut original annotation generation changed"), source_(source) {}

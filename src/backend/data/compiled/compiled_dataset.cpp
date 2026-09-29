@@ -107,8 +107,8 @@ bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> re
  }
  for (std::size_t first = 0; first < reads.size();) {
   std::size_t count = 1;
-  while (first + count < reads.size() && layout_.pixel_offset(reads[first + count].index) == layout_.pixel_offset(reads[first].index) + count * stride && reads[first + count].destination_offset == reads[first].destination_offset + count * stride &&
-         count < std::max<std::size_t>(1, kReadExtent / stride))
+  while (first + count < reads.size() && layout_.pixel_offset(reads[first + count].index) == layout_.pixel_offset(reads[first].index) + count * stride &&
+         reads[first + count].destination_offset == reads[first].destination_offset + count * stride && count < std::max<std::size_t>(1, kReadExtent / stride))
    ++count;
   const auto source_offset = layout_.pixel_offset(reads[first].index);
   const auto bytes = count * stride;

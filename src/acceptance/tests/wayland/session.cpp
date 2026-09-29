@@ -491,9 +491,13 @@ const mmltk::backend::data::testsupport::FixtureSpec& PreparedWaylandInputs::pro
 }
 const std::filesystem::path& PreparedWaylandInputs::sparse() {
  if (sparse_compiled_.empty()) {
-  sparse_compiled_ = mmltk::testsupport::compile_explore_sparse_fixture(
-   root_.path(), 66U, {.source_width = 768, .source_height = 384, .compiled_width = kCompiledResolution, .compiled_height = kCompiledResolution,
-                      .resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}).parent_path();
+  sparse_compiled_ = mmltk::testsupport::compile_explore_sparse_fixture(root_.path(), 66U,
+   {.source_width = 768,
+    .source_height = 384,
+    .compiled_width = kCompiledResolution,
+    .compiled_height = kCompiledResolution,
+    .resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox})
+                      .parent_path();
  }
  return sparse_compiled_;
 }
@@ -509,7 +513,9 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
       pixel_probes(logging && pixels_enabled),
       pixel_fixture(profile_ == "retained" || profile_ == "dpi"),
       probe_failure(std::move(fault)),
-      ordinary_compiled_(profile_ == "sparse" ? inputs_->sparse() : profile_ == "retained" ? working.path() / "compiled" : std::filesystem::path{mmltk::backend::data::testsupport::compiled_dir(ordinary_fixture_)}),
+      ordinary_compiled_(profile_ == "sparse"     ? inputs_->sparse()
+                         : profile_ == "retained" ? working.path() / "compiled"
+                                                  : std::filesystem::path{mmltk::backend::data::testsupport::compiled_dir(ordinary_fixture_)}),
       pixel_audit(pixel_probes) {
  diagnostics = !logging ? quiet_artifacts.path() / "native.jsonl" : configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
  runtime_log = !logging ? quiet_artifacts.path() / "runtime.log" : configured_path("MMLTK_LOG_FILE", latest_wayland_artifact("latest-wayland-test-native.log"));
