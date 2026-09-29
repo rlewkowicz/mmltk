@@ -38,6 +38,7 @@ struct CoconutCompletionFacts {
  std::optional<std::uint64_t> recovery_images;
 };
 MMLTK_REFLECT_FIELDS(CoconutCompletionFacts)
+struct CoconutOriginalInput;
 class CoconutComponentBacking;
 class CoconutInventorySeal;
 class CoconutComponent final {
@@ -46,6 +47,10 @@ public:
  [[nodiscard]] CoconutImageNamespace source() const noexcept;
  [[nodiscard]] const std::string& input_identity() const noexcept;
  [[nodiscard]] std::string image_input_identity(std::size_t) const;
+ [[nodiscard]] BenchmarkLabelInput labels(std::size_t) const;
+ [[nodiscard]] std::uint64_t original_generation() const noexcept { return original_generation_; }
+ // Bind a cached view to the admitted original input used to validate it.
+ [[nodiscard]] CoconutComponent with_original(const CoconutOriginalInput&) const;
  [[nodiscard]] bool matches_inputs(std::string_view, const CoconutPhysicalMembership&, const CoconutMaskRecovery*, bool current_physical = true) const;
  [[nodiscard]] std::uint32_t recovery_policy() const noexcept;
  [[nodiscard]] std::string_view original_annotation_identity() const noexcept;
@@ -72,6 +77,7 @@ private:
  NormalizedAnnotationReadView index_;
  std::shared_ptr<CoconutInventorySeal> seal_;
  bool membership_ = false;
+ std::uint64_t original_generation_ = 0;
 };
 struct CoconutComponentBuilder : CoconutComponentMetadata {
  std::uint64_t source_segment_begin = 0;

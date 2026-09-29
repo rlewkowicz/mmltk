@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <algorithm>
@@ -23,6 +24,10 @@ CoconutNativeImage::Read CoconutNativeImage::read(std::shared_ptr<const CoconutN
  index.rejected = owner->rejected();
  index.images = {&owner->image_, 1}; index.boxes = owner->boxes_; index.mask_rle_pairs = owner->runs_;
  return {std::move(owner), NormalizedAnnotationReadView(std::move(index))};
+}
+BenchmarkLabelInput CoconutNativeImage::labels(std::shared_ptr<const CoconutNativeImage> owner) {
+ auto input = read(std::move(owner));
+ return BenchmarkLabelInput(std::move(input.view), std::move(input.owner));
 }
 CoconutNativeWorkspace::CoconutNativeWorkspace(const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation)
  : limits_(limits), cancellation_(cancellation) {}
@@ -77,7 +82,6 @@ std::uint64_t CoconutNativeWorkspace::workspace_bytes(const CoconutRecord& recor
   // carving; support, open-address lookup, recovery grouping and ordinals.
   auto bytes = checked_add(checked_multiply(pixels, 96U, "COCONut pixel workspace overflow"), checked_multiply(encoded, 2U, "COCONut encoded workspace overflow"), "COCONut decode workspace overflow");
   bytes = checked_add(bytes, checked_multiply(segments, 1024U, "COCONut segment workspace overflow"), "COCONut normalize workspace overflow");
-  bytes = checked_add(bytes, std::uint64_t{record.width ? record.width : limits_.max_dimension} * 32U + 65536U, "COCONut label workspace overflow");
   return checked_add(bytes, recover && recovery_ ? recovery_->workspace_bytes(record) : 0, "COCONut recovery workspace overflow");
  }
 dataset::MaskDimensions CoconutNativeWorkspace::admit_png(const CoconutRecord& record, std::span<const std::uint8_t> png) const {

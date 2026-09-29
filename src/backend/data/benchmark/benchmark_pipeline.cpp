@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
@@ -134,10 +135,10 @@ struct BenchmarkCompilePipeline::Admission {
   if (value.cpu_workers && external_cpus + active > cpu_capacity - value.cpu_workers) return false;
   return value.descriptors + value.continuation_descriptors <= descriptor_room(value, parent) && fits_bytes(value, parent);
  }
- // Only a ready Pixels job with its input and output continuation already
- // admitted is a borrower. Arbitrary callbacks and header continuations never
+ // Only a ready pixel job with admitted input/output, or an owning label
+ // projection with geometry, is a borrower. Arbitrary callbacks and headers never
  // use this path; the reader may resume without waiting on a new producer.
- [[nodiscard]] bool finite_pixel_fits(BenchmarkResources value, const Credits* parent) const {
+ [[nodiscard]] bool finite_consumer_fits(BenchmarkResources value, const Credits* parent) const {
   if (fits(value, parent)) return true;
   if (value.producer || value.cpu_workers || value.retained_handles || !value.bytes || !feasible(value) ||
       value.descriptors + value.continuation_descriptors > descriptor_room(value, parent) || value.bytes > target) return false;
@@ -285,6 +286,9 @@ struct BenchmarkCompilePipeline::Impl {
  bool consume(std::size_t lane, bool wait);
  struct Job;
  struct Slot;
+ struct Image;
+ struct Label;
+ struct LabelWork;
  struct WorkGroup {
   BenchmarkCompilePipeline& pipeline;
   Impl& owner;
@@ -310,8 +314,9 @@ struct BenchmarkCompilePipeline::Impl {
   BenchmarkStage stage = BenchmarkStage::Metadata;
   BenchmarkResources resources{};
   BenchmarkAllowance allowance, parent;
-  std::variant<const std::function<void(std::size_t)>*, Slot*> work{static_cast<const std::function<void(std::size_t)>*>(nullptr)};
+  std::variant<const std::function<void(std::size_t)>*, Slot*, LabelWork*> work{static_cast<const std::function<void(std::size_t)>*>(nullptr)};
   [[nodiscard]] Slot* pixel() const { const auto* value = std::get_if<Slot*>(&work); return value ? *value : nullptr; }
+  [[nodiscard]] LabelWork* label() const { const auto* value = std::get_if<LabelWork*>(&work); return value ? *value : nullptr; }
   [[nodiscard]] bool finite_borrower() const;
   Job* next = nullptr;
   Job* previous = nullptr;
@@ -390,6 +395,39 @@ struct BenchmarkCompilePipeline::Impl {
   std::shared_ptr<const BenchmarkEncodedImage> payload;
   BenchmarkAllowance pixel_allowance;
  };
+ // One physical image can have independent annotation-edition products (for
+ // example overlapping Large/XL membership). They remain under this sole image
+ // owner; replacing one dependency never evicts another required conversion.
+ struct Image {
+  BenchmarkSourceGeneration generation = 0;
+  std::uint32_t width = 0, height = 0;
+  std::shared_ptr<const BenchmarkEncodedImage> input;
+  Source* source = nullptr;
+  std::uint64_t id = 0;
+  bool retiring = false;
+  std::vector<std::unique_ptr<Label>> labels;
+  [[nodiscard]] Label* find_labels(std::string_view dependency) const;
+ };
+ struct Label {
+  Image* image = nullptr;
+  std::string dependency;
+  std::shared_ptr<const BenchmarkLabelChunk> product;
+  std::optional<BenchmarkLabelInput> input;
+  std::uint64_t attempt = 0, generation = 0;
+  Label* previous = nullptr;
+  Label* next = nullptr;
+  bool waiting = false, retired = false;
+  LabelWork* active = nullptr;
+  [[nodiscard]] BenchmarkResources demand() const { return {BenchmarkLabelWorkspace::required_bytes(input->index().image(input->position()).width), 0}; }
+ };
+ // One bounded record per lane; pending dataset products do not allocate jobs.
+ struct LabelWork {
+  Job job;
+  Label* label = nullptr;
+  std::optional<BenchmarkLabelInput> input;
+  BenchmarkSourceGeneration generation = 0;
+  std::uint32_t width = 0, height = 0;
+ };
  struct Source {
   std::filesystem::path root;
   BenchmarkSourceGeneration generation = 1, counter = 1;
@@ -397,15 +435,11 @@ struct BenchmarkCompilePipeline::Impl {
   std::unordered_map<std::uint64_t, BenchmarkSourceGeneration> replacements;
   BenchmarkSourceGeneration image_generation(std::uint64_t id) const { const auto found = replacements.find(id); return found == replacements.end() ? generation : found->second; }
   bool retiring = false;
-  std::size_t pending = 0;
+  std::size_t pending = 0, pending_labels = 0;
   std::unordered_map<std::uint64_t, Slot> slots;
   std::vector<BenchmarkSplitWriter*> writers;
-  struct Geometry {
-   BenchmarkSourceGeneration generation; std::uint32_t width, height; std::shared_ptr<const BenchmarkEncodedImage> input;
-   std::string label_dependency;
-   std::shared_ptr<const BenchmarkLabelChunk> labels;
-  };
-  std::unordered_map<std::uint64_t, Geometry> geometry;
+  bool labels_retiring = false;
+  std::unordered_map<std::uint64_t, Image> geometry;
  };
  // The sole mutable physical image owner. Scheduler jobs borrow stable slots;
  // source identity is bound once outside per-image production/registration.
@@ -420,6 +454,11 @@ struct BenchmarkCompilePipeline::Impl {
    std::optional<std::pair<std::uint32_t, std::uint32_t>>, bool, std::uint64_t attempt, std::shared_ptr<const BenchmarkEncodedImage>);
   void geometry_ready(Source&, std::uint64_t, BenchmarkSourceGeneration, std::pair<std::uint32_t, std::uint32_t>);
   [[nodiscard]] std::optional<BenchmarkImageGeometry> geometry(const std::filesystem::path&, std::uint64_t) const;
+  void ready_labels(Label&);
+  void unlink_labels(Label&);
+  void withdraw_labels(Image&);
+  [[nodiscard]] Job* admit_labels(std::size_t);
+  [[nodiscard]] const Label* waiting_labels() const { return labels_head_; }
   void retire_image(const std::filesystem::path&, std::uint64_t);
   void retire_source(const std::filesystem::path&);
   [[nodiscard]] bool registered(BenchmarkSplitWriter& writer) const { return writers_.contains(&writer); }
@@ -427,7 +466,11 @@ struct BenchmarkCompilePipeline::Impl {
   [[nodiscard]] std::uint64_t attempt() const { return attempt_; }
   void close() {
    ++attempt_;
-   for (auto& [root, source] : sources_) { (void)root; source.slots.clear(); source.writers.clear(); }
+   for (auto& [root, source] : sources_) {
+    (void)root;
+    for (auto& [id, image] : source.geometry) { (void)id; withdraw_labels(image); image.labels.clear(); }
+    source.slots.clear(); source.writers.clear();
+   }
    writers_.clear();
    admitted_ = false;
   }
@@ -437,9 +480,14 @@ struct BenchmarkCompilePipeline::Impl {
   std::unordered_map<BenchmarkSplitWriter*, std::vector<Slot*>> writers_;
   std::uint64_t attempt_ = 1;
   bool admitted_ = false;
+  Label* labels_head_ = nullptr;
+  Label* labels_tail_ = nullptr;
  };
  std::uint32_t label_resolution = 0;
  mmltk::backend::imaging::resample::ImageResizeMode label_resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ std::function<void(const std::filesystem::path&, std::uint64_t, const BenchmarkLabelWorkspace&)> label_started;
+ std::vector<BenchmarkLabelWorkspace> label_workspaces;
+ std::function<void(std::size_t)> retire_labels = [this](std::size_t lane) noexcept { label_workspaces[lane].retire(); };
  struct IdleScratch {
   BenchmarkSplitWriter* writer = nullptr;
   const std::function<void(std::size_t)>* retire = nullptr;
@@ -456,6 +504,7 @@ struct BenchmarkCompilePipeline::Impl {
  struct Frame;
  struct Lane {
   Frame* active = nullptr;
+  LabelWork labels;
   IdleScratch idle;
   const void* retiring = nullptr;
   [[nodiscard]] bool busy() const { return active || retiring; }
@@ -514,7 +563,7 @@ struct BenchmarkCompilePipeline::Impl {
  std::array<StageReadyQueue, stage_count> ready;
  ImageState images{*this};
  std::size_t cursor = 0, metadata_streak = 0, pending = 0;
- bool membership_pending = true, stopping = false, shutdown = false;
+ bool membership_pending = true, labels_first = true, stopping = false, shutdown = false;
  std::exception_ptr failure;
  std::exception_ptr retired_failure = std::make_exception_ptr(std::runtime_error("benchmark work retired before completion"));
  mmltk::common::concurrency::CancellationObservation cancellation;
@@ -529,9 +578,9 @@ struct BenchmarkCompilePipeline::Impl {
    if (cancellation.requested()) changed.notify_all();
   }
  }
- BenchmarkAllowance charge(BenchmarkResources resources, const BenchmarkAllowance& parent = {}, bool finite_pixel = false) {
+ BenchmarkAllowance charge(BenchmarkResources resources, const BenchmarkAllowance& parent = {}, bool finite_consumer = false) {
   auto credits = std::make_shared<Credits>(admission, resources, parent.credits_);
-  admission->charge(*credits, finite_pixel && !admission->fits(resources, parent.credits_.get()));
+  admission->charge(*credits, finite_consumer && !admission->fits(resources, parent.credits_.get()));
   return BenchmarkAllowance(std::move(credits));
  }
  void check_admission() const {
@@ -648,9 +697,9 @@ BenchmarkAllowance BenchmarkAllowance::split_storage(std::uint64_t bytes) {
 thread_local BenchmarkCompilePipeline::Impl::Frame* BenchmarkCompilePipeline::Impl::Frame::current = nullptr;
 bool BenchmarkCompilePipeline::Impl::Job::finite_borrower() const {
  const auto* slot = pixel();
- // Native ready pixels own their input and a writer with admitted output.
- // The stage label alone cannot give arbitrary callbacks borrowing privilege.
- return slot && stage == BenchmarkStage::Pixels && slot->input && slot->writer &&
+ // Native ready pixels own input/output; ready labels own immutable input and
+ // geometry. A stage name cannot give arbitrary callbacks borrowing privilege.
+ return ((slot && stage == BenchmarkStage::Pixels && slot->input && slot->writer) || (label() && label()->input)) &&
   !resources.producer && !resources.cpu_workers && !resources.retained_handles;
 }
 bool BenchmarkCompilePipeline::Impl::Lane::owns(const void* identity) const {
@@ -703,19 +752,29 @@ BenchmarkCompilePipeline::Impl::Job* BenchmarkCompilePipeline::Impl::fail_group(
 void BenchmarkCompilePipeline::Impl::settle(Job& job, std::exception_ptr error, bool recoverable) noexcept {
  Job* detached = nullptr;
  auto* slot = job.pixel();
+ auto* label = job.label();
  {
   const std::lock_guard lock(mutex);
+  if (label && (label->label->retired || label->label->image->retiring || label->label->image->source->retiring || label->label->attempt != images.attempt())) recoverable = true;
   if (error) {
    detached = fail_group(job.group, error, !slot || !recoverable);
-   if (slot && !recoverable && job.independent && !failure) { failure = error; ++admission->generation; }
+   if ((slot || label) && !recoverable && job.independent && !failure) { failure = error; ++admission->generation; }
   }
  }
  // Credits follow the actual input and source backing. A terminal notification
  // cannot let the borrower disappear while any of these releases is pending.
  if (slot) { slot->input.reset(); slot->payload.reset(); slot->pixel_allowance = {}; job.parent = {}; slot->publication = {}; }
+ if (label) { label->input.reset(); }
  job.allowance = {};
  {
   const std::lock_guard lock(mutex);
+  if (label) {
+   auto& product = *label->label;
+   --product.image->source->pending;
+   --product.image->source->pending_labels;
+   product.active = nullptr;
+   label->label = nullptr;
+  }
   job.failure = error;
   job.done = true;
   --pending;
@@ -799,7 +858,11 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
    auto& local = lanes[lane];
    if (local.retiring || (wait_for_work && local.active)) return false;
    const bool discard = stopping || failure || cancellation.requested();
-   const bool pressure = admission->waiters || std::ranges::any_of(ready, [&](const auto& queue) {
+   const auto* waiting_label = images.waiting_labels();
+   const bool label_pressure = waiting_label && !admission->fits_bytes(waiting_label->demand()) &&
+    std::ranges::none_of(lanes, [&](const auto& value) { return !value.busy() && value.idle.owner() == &retire_labels &&
+     Admission::covers(*value.idle.allowance.credits_, waiting_label->demand()); });
+   const bool pressure = admission->waiters || label_pressure || std::ranges::any_of(ready, [&](const auto& queue) {
     const auto* candidate = queue.head();
     if (!candidate || candidate->allowance || admission->fits_bytes(candidate->resources)) return false;
     const void* identity = scratch_owner(*candidate);
@@ -824,7 +887,7 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
     if (local.owns(identity)) return false;
     const bool reusable = candidate.stage != BenchmarkStage::Header && identity && local.idle.owner() == identity && Admission::covers(*local.idle.allowance.credits_, candidate.resources);
     return candidate.allowance || reusable || (candidate.finite_borrower()
-     ? admission->finite_pixel_fits(candidate.resources, candidate.parent.credits_.get()) : admission->fits(candidate.resources, candidate.parent.credits_.get()));
+     ? admission->finite_consumer_fits(candidate.resources, candidate.parent.credits_.get()) : admission->fits(candidate.resources, candidate.parent.credits_.get()));
    };
    const bool prefer_metadata = membership_pending && metadata_streak < 2;
    if (prefer_metadata) job = ready[0].take(eligible);
@@ -834,15 +897,19 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
     for (std::size_t count = 0; count < stage_count; ++count) {
      const auto stage = (cursor + count) % stage_count;
      if (stage == 0 && prefer_metadata) continue;
-     job = ready[stage].take(eligible);
+     const bool label_stage = stage == static_cast<std::size_t>(BenchmarkStage::Labels);
+     if (label_stage && labels_first && !discard) job = images.admit_labels(lane);
+     if (!job) job = ready[stage].take(eligible);
+     if (!job && label_stage && !discard) job = images.admit_labels(lane);
      if (!job) continue;
+     if (label_stage) labels_first = job->label() == nullptr;
      cursor = (stage + 1) % stage_count;
      metadata_streak = 0;
      break;
     }
    }
    if (!job) {
-    if (admission->waiters || std::ranges::any_of(ready, [](const auto& queue) { return queue.head() != nullptr; }))
+    if (admission->waiters || images.waiting_labels() || std::ranges::any_of(ready, [](const auto& queue) { return queue.head() != nullptr; }))
      for (std::size_t i = 0; i < lanes.size(); ++i) {
       if (!lanes[i].retiring && lanes[i].idle.owner() && !lanes[i].owns(lanes[i].idle.owner())) { take_idle(i); return true; }
      }
@@ -857,7 +924,7 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
      local.idle = {};
     } else if (local.idle.owner() != identity || job->stage != BenchmarkStage::Header) take_idle(lane);
    }
-   if (invoke && !job->allowance) {
+   if (invoke && !job->allowance && !job->failure) {
     try { job->allowance = charge(job->resources, job->parent, job->finite_borrower()); } catch (...) { job->failure = std::current_exception(); }
    }
    frame.enter(std::move(job->allowance), identity);
@@ -875,16 +942,28 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
  bool continue_pixels = false, recoverable = false;
  std::uint64_t pixel_bytes = 0;
  auto* slot = job->pixel();
+ auto* label = job->label();
  try {
   bool discarded;
   {
    const std::lock_guard lock(mutex);
-   discarded = ((stopping || failure) && !job->finish_started) || (slot && (slot->source->retiring || slot->retiring)) || (!job->independent && job->group && job->group->withdrawn);
+   discarded = ((stopping || failure) && !job->finish_started) || (label && (label->label->retired || label->label->image->retiring || label->label->image->source->retiring)) || (slot && (slot->source->retiring || slot->retiring)) || (!job->independent && job->group && job->group->withdrawn);
    if (discarded) error = job->group && job->group->failure ? job->group->failure : (failure ? failure : retired_failure);
   }
   if (!discarded && !error) {
    throw_if_benchmark_cancelled(cancellation);
-   if (!slot) (*std::get<const std::function<void(std::size_t)>*>(job->work))(job->indexed ? job->index : lane);
+   if (label) {
+    if (label_started) label_started(label->label->image->source->root, label->label->image->id, label_workspaces[lane]);
+    const auto& input = *label->input;
+    auto product = std::make_shared<BenchmarkLabelChunk>(compile_benchmark_image_labels(input.index(), input.position(), {label->width, label->height},
+     label_resolution, label_resize_mode, label_workspaces[lane], cancellation));
+    const std::lock_guard lock(mutex);
+    auto& result = *label->label;
+    auto& image = *result.image;
+    if (!stopping && !result.retired && !image.retiring && !image.source->retiring && result.attempt == images.attempt() &&
+     label->generation == image.source->image_generation(image.id) && result.generation == image.source->label_generation)
+     result.product = std::move(product);
+   } else if (!slot) (*std::get<const std::function<void(std::size_t)>*>(job->work))(job->indexed ? job->index : lane);
    else if (job->stage == BenchmarkStage::Header) {
     slot->input = slot->writer->prepare_pixel(slot->index, lane, std::move(slot->publication), frame.allowance, std::move(slot->payload));
     if (slot->input) {
@@ -942,6 +1021,7 @@ BenchmarkCompilePipeline::BenchmarkCompilePipeline(std::size_t workers, std::spa
  if (state.cpus.size() < workers) throw std::invalid_argument("benchmark worker budget exceeds assigned CPUs");
  state.cpus.resize(workers);
  state.lanes.resize(workers);
+ state.label_workspaces.resize(workers);
  state.admission->cpu_capacity = workers;
  state.admission->target = limits.transient_bytes ? limits.transient_bytes : std::min<std::uint64_t>(2ULL << 30, std::max<std::uint64_t>(256ULL << 20, workers * (64ULL << 20)));
  const auto headroom = descriptor_headroom();
@@ -990,7 +1070,8 @@ std::uint64_t BenchmarkCompilePipeline::transient_target() const noexcept { retu
 std::size_t BenchmarkCompilePipeline::descriptor_limit() const noexcept { return impl_->admission->descriptor_capacity; }
 bool BenchmarkCompilePipeline::resource_pressure() const {
  const std::lock_guard lock(impl_->mutex);
- return impl_->admission->resource_waiters || std::ranges::any_of(impl_->ready, [&](const auto& queue) {
+ const auto* label = impl_->images.waiting_labels();
+ return impl_->admission->resource_waiters || (label && !impl_->admission->fits_bytes(label->demand())) || std::ranges::any_of(impl_->ready, [&](const auto& queue) {
   const auto* job = queue.head();
   return job && !job->allowance && !impl_->admission->fits_bytes(job->resources);
  });
@@ -1331,6 +1412,57 @@ void BenchmarkCompilePipeline::Impl::ImageState::admit(Slot& slot, bool independ
  ++slot.source->pending;
  execution_.push(job);
 }
+BenchmarkCompilePipeline::Impl::Label* BenchmarkCompilePipeline::Impl::Image::find_labels(std::string_view dependency) const {
+ const auto found = std::ranges::find_if(labels, [&](const auto& label) { return label->dependency == dependency; });
+ return found == labels.end() ? nullptr : found->get();
+}
+void BenchmarkCompilePipeline::Impl::ImageState::ready_labels(Label& label) {
+ auto& image = *label.image;
+ if (!label.input || !image.width || label.product || label.active || label.waiting || label.retired || image.retiring || image.source->retiring || image.source->labels_retiring || execution_.stopping) return;
+ label.previous = labels_tail_; label.next = nullptr; label.waiting = true;
+ if (labels_tail_) labels_tail_->next = &label; else labels_head_ = &label;
+ labels_tail_ = &label;
+ ++execution_.admission->generation;
+}
+void BenchmarkCompilePipeline::Impl::ImageState::unlink_labels(Label& label) {
+ if (!label.waiting) return;
+ if (label.previous) label.previous->next = label.next; else labels_head_ = label.next;
+ if (label.next) label.next->previous = label.previous; else labels_tail_ = label.previous;
+ label.previous = label.next = nullptr; label.waiting = false;
+}
+void BenchmarkCompilePipeline::Impl::ImageState::withdraw_labels(Image& image) {
+ for (auto& label : image.labels) {
+  unlink_labels(*label);
+  label->retired = true;
+  label->input.reset(); label->product.reset();
+ }
+}
+BenchmarkCompilePipeline::Impl::Job* BenchmarkCompilePipeline::Impl::ImageState::admit_labels(std::size_t lane_index) {
+ auto& execution = execution_;
+ auto& lane = execution.lanes[lane_index];
+ if (!labels_head_ || lane.labels.label || lane.owns(&execution.retire_labels) ||
+  execution.admission->active + execution.admission->external_cpus >= execution.cpus.size() + (lane.active ? 1 : 0)) return nullptr;
+ auto& label = *labels_head_;
+ const auto demand = label.demand();
+ const bool reuse = lane.idle.owner() == &execution.retire_labels && Admission::covers(*lane.idle.allowance.credits_, demand);
+ if (!reuse && !execution.admission->finite_consumer_fits(demand, nullptr)) return nullptr;
+ auto& work = lane.labels;
+ auto& job = work.job;
+ job.failure = {};
+ try { job.allowance = reuse ? std::move(lane.idle.allowance) : execution.charge(demand, {}, true); }
+ catch (...) { job.failure = std::current_exception(); }
+ if (reuse) lane.idle = {};
+ unlink_labels(label);
+ work.label = &label;
+ work.input = std::move(label.input); label.input.reset();
+ work.generation = label.image->generation;
+ work.width = label.image->width; work.height = label.image->height;
+ label.active = &work;
+ job.stage = BenchmarkStage::Labels; job.resources = demand; job.work = &work;
+ job.retire = &execution.retire_labels; job.done = false; job.finish_started = false; job.independent = true;
+ ++execution.pending; ++label.image->source->pending; ++label.image->source->pending_labels;
+ return &job;
+}
 void BenchmarkCompilePipeline::Impl::ImageState::retire_image(const std::filesystem::path& root, std::uint64_t id) {
  auto& execution = execution_;
  std::unique_lock lock(execution.mutex);
@@ -1339,47 +1471,47 @@ void BenchmarkCompilePipeline::Impl::ImageState::retire_image(const std::filesys
  (void)inserted;
  const auto generation = ++value.counter;
  replacement->second = generation;
- value.geometry.erase(id);
+ ++execution.admission->generation;
+ const auto found_image = value.geometry.find(id);
+ auto* image = found_image == value.geometry.end() ? nullptr : &found_image->second;
+ if (image) { image->retiring = true; withdraw_labels(*image); }
  const auto found = value.slots.find(id);
- if (found == value.slots.end()) return;
- auto& slot = found->second;
- slot.retiring = true;
- auto* detached = execution.fail_group(slot.job.group, execution.retired_failure, false);
- if (slot.job.queued) {
-  execution.remove(slot.job);
-  slot.job.next = detached;
-  detached = &slot.job;
+ auto* slot = found == value.slots.end() ? nullptr : &found->second;
+ Job* detached = nullptr;
+ if (slot) {
+  slot->retiring = true;
+  detached = execution.fail_group(slot->job.group, execution.retired_failure, false);
+  if (slot->job.queued) { execution.remove(slot->job); slot->job.next = detached; detached = &slot->job; }
  }
- lock.unlock();
- execution.settle_list(detached, execution.retired_failure);
- lock.lock();
+ lock.unlock(); execution.settle_list(detached, execution.retired_failure); lock.lock();
  execution.changed.notify_all();
- execution.wait(lock, [&] { return !slot.submitted || slot.job.done; });
- slot.submitted = false;
- slot.job.failure = {};
- slot.generation = generation;
- lock.unlock();
- slot.writer->invalidate_image(slot.index);
- lock.lock();
- slot.retiring = false;
- lock.unlock();
- execution.changed.notify_all();
+ execution.wait(lock, [&] { return (!slot || !slot->submitted || slot->job.done) && (!image || std::ranges::none_of(image->labels, [](const auto& label) { return label->active != nullptr; })); });
+ value.geometry.erase(id);
+ if (slot) {
+  slot->submitted = false; slot->job.failure = {}; slot->generation = generation;
+  lock.unlock(); slot->writer->invalidate_image(slot->index); lock.lock();
+  slot->retiring = false;
+ }
+ lock.unlock(); execution.changed.notify_all();
 }
 void BenchmarkCompilePipeline::Impl::ImageState::geometry_ready(Source& source, std::uint64_t id, BenchmarkSourceGeneration generation, std::pair<std::uint32_t, std::uint32_t> dimensions) {
  if (execution_.stopping || source.retiring || source.image_generation(id) != generation) return;
  const auto slot = source.slots.find(id);
  if (slot != source.slots.end() && slot->second.retiring) return;
  if (!dimensions.first || !dimensions.second) throw std::invalid_argument("benchmark geometry is empty");
- auto [position, inserted] = source.geometry.emplace(id, Source::Geometry{generation, dimensions.first, dimensions.second, {}});
- if (!inserted && (position->second.width != dimensions.first || position->second.height != dimensions.second)) throw std::runtime_error("benchmark source generation has contradictory geometry");
- position->second.generation = generation;
+ auto [position, inserted] = source.geometry.try_emplace(id);
+ if (!inserted && position->second.width && (position->second.width != dimensions.first || position->second.height != dimensions.second)) throw std::runtime_error("benchmark source generation has contradictory geometry");
+ auto& image = position->second;
+ image.generation = generation; image.width = dimensions.first; image.height = dimensions.second;
+ image.source = &source; image.id = id;
+ for (auto& label : image.labels) ready_labels(*label);
 }
 std::optional<BenchmarkImageGeometry> BenchmarkCompilePipeline::Impl::ImageState::geometry(const std::filesystem::path& root, std::uint64_t id) const {
  const std::lock_guard lock(execution_.mutex);
  const auto* source = find(root);
  if (!source || source->retiring) return std::nullopt;
  const auto found = source->geometry.find(id);
- if (found == source->geometry.end() || found->second.generation != source->image_generation(id)) return std::nullopt;
+ if (found == source->geometry.end() || !found->second.width || found->second.generation != source->image_generation(id)) return std::nullopt;
  return BenchmarkImageGeometry{source->root, id, found->second.generation, found->second.width, found->second.height};
 }
 void BenchmarkCompilePipeline::Impl::ImageState::publish(Source& source, std::uint64_t id, BenchmarkSourceGeneration generation, BenchmarkSourcePublication publication,
@@ -1399,7 +1531,7 @@ void BenchmarkCompilePipeline::Impl::ImageState::publish(Source& source, std::ui
    source.geometry.at(id).input = payload->storage() == BenchmarkEncodedImage::Storage::HeaderOnly && !payload->allowance() ? payload : payload->header_only();
   }
   const auto found = source.slots.find(id);
-  if (found == source.slots.end() || found->second.submitted || found->second.retiring) return;
+  if (found == source.slots.end() || found->second.submitted || found->second.retiring) { execution.changed.notify_all(); return; }
   auto& slot = found->second;
   slot.generation = generation;
   slot.publication = std::move(publication);
@@ -1432,7 +1564,8 @@ void BenchmarkCompilePipeline::Impl::ImageState::retire_source(const std::filesy
  source.retiring = true;
  source.generation = ++source.counter;
  source.replacements.clear();
- source.geometry.clear();
+ ++execution.admission->generation;
+ for (auto& [id, image] : source.geometry) { (void)id; withdraw_labels(image); }
  // Every canonical source slot already owns its intrusive job handle. Visit
  // only affected work; unrelated stage queues and writer slots stay untouched.
  for (auto& [id, slot] : source.slots) {
@@ -1447,6 +1580,7 @@ void BenchmarkCompilePipeline::Impl::ImageState::retire_source(const std::filesy
  lock.lock();
  execution.changed.notify_all();
  execution.wait(lock, [&] { return source.pending == 0; });
+ source.geometry.clear();
  for (auto& [id, slot] : source.slots) {
   (void)id;
   slot.submitted = false;
@@ -1463,26 +1597,71 @@ void BenchmarkCompilePipeline::Impl::ImageState::retire_source(const std::filesy
  execution.changed.notify_all();
 }
 void BenchmarkCompilePipeline::original_generation(const std::filesystem::path& root, std::uint64_t original_generation, bool withdrawn) {
- const std::lock_guard lock(impl_->mutex);
+ std::unique_lock lock(impl_->mutex);
  auto& source = impl_->images.source(root);
  if (source.label_attempt == impl_->images.attempt() && original_generation < source.label_generation) return;
  source.label_attempt = impl_->images.attempt();
+ const bool changed = source.label_generation != original_generation;
  source.label_generation = original_generation;
- if (withdrawn) for (auto& [id, fact] : source.geometry) { (void)id; fact.labels.reset(); fact.label_dependency.clear(); }
+ ++impl_->admission->generation;
+ if (withdrawn || changed) {
+  source.labels_retiring = true;
+  for (auto& [id, image] : source.geometry) { (void)id; impl_->images.withdraw_labels(image); }
+  impl_->changed.notify_all();
+  // Only label consumers retire. Geometry, encoded custody and pixel jobs stay live.
+  impl_->wait(lock, [&] { return source.pending_labels == 0; });
+  for (auto& [id, image] : source.geometry) { (void)id; image.labels.clear(); }
+  source.labels_retiring = false;
+ }
  impl_->changed.notify_all();
 }
-void BenchmarkCompilePipeline::label_configuration(std::uint32_t resolution, mmltk::backend::imaging::resample::ImageResizeMode mode) {
+void BenchmarkCompilePipeline::label_configuration(std::uint32_t resolution, mmltk::backend::imaging::resample::ImageResizeMode mode,
+ std::function<void(const std::filesystem::path&, std::uint64_t, const BenchmarkLabelWorkspace&)> observer) {
  const std::lock_guard lock(impl_->mutex);
- impl_->label_resolution = resolution; impl_->label_resize_mode = mode;
+ impl_->label_resolution = resolution; impl_->label_resize_mode = mode; impl_->label_started = std::move(observer);
 }
-std::shared_ptr<const BenchmarkLabelChunk> BenchmarkCompilePipeline::take_image_labels(const std::filesystem::path& root, std::uint64_t id, std::string_view dependency) {
+std::shared_ptr<const BenchmarkLabelChunk> BenchmarkCompilePipeline::image_labels(const std::filesystem::path& root, std::uint64_t id, std::string_view dependency) const {
  const std::lock_guard lock(impl_->mutex);
- auto& source = impl_->images.source(root);
- if (source.retiring) return {};
- const auto found = source.geometry.find(id);
- if (found == source.geometry.end() || found->second.generation != source.image_generation(id) || found->second.label_dependency != dependency) return {};
- found->second.label_dependency.clear();
- return std::move(found->second.labels);
+ const auto* source = impl_->images.find(root);
+ if (!source || source->retiring) return {};
+ const auto found = source->geometry.find(id);
+ if (found == source->geometry.end() || found->second.generation != source->image_generation(id)) return {};
+ const auto* label = found->second.find_labels(dependency);
+ return label && !label->retired ? label->product : nullptr;
+}
+bool BenchmarkCompilePipeline::has_image_labels(const std::filesystem::path& root, std::uint64_t id, std::string_view dependency, std::uint64_t original_generation) const {
+ const std::lock_guard lock(impl_->mutex);
+ impl_->check_admission();
+ const auto* source = impl_->images.find(root);
+ if (!source || source->retiring || source->labels_retiring || (original_generation && original_generation != source->label_generation)) return false;
+ const auto found = source->geometry.find(id);
+ if (found == source->geometry.end() || found->second.retiring || found->second.generation != source->image_generation(id)) return false;
+ const auto* label = found->second.find_labels(dependency);
+ return label && !label->retired && label->attempt == impl_->images.attempt() && label->generation == source->label_generation;
+}
+std::shared_ptr<const BenchmarkLabelChunk> BenchmarkCompilePipeline::wait_image_labels(const std::filesystem::path& root, std::uint64_t id, std::string_view dependency, std::uint64_t original_generation) {
+ const auto* frame = Impl::Frame::current;
+ if (frame && &frame->owner == impl_.get()) throw std::logic_error("benchmark label dependency wait inside a CPU lane");
+ std::unique_lock lock(impl_->mutex);
+ const auto attempt = impl_->images.attempt();
+ std::shared_ptr<const BenchmarkLabelChunk> product;
+ impl_->wait(lock, [&] {
+  product.reset();
+  impl_->check_admission();
+  const auto* source = impl_->images.find(root);
+  if (attempt != impl_->images.attempt() || !source || source->retiring || source->labels_retiring ||
+   (original_generation && original_generation != source->label_generation)) return true;
+  const auto found = source->geometry.find(id);
+  if (found == source->geometry.end() || found->second.generation != source->image_generation(id)) return true;
+  const auto& image = found->second;
+  const auto slot = source->slots.find(id);
+  if (!image.width && slot != source->slots.end() && slot->second.job.done && slot->second.job.failure) std::rethrow_exception(slot->second.job.failure);
+  const auto* label = image.find_labels(dependency);
+  if (image.retiring || !label || label->retired || label->attempt != attempt || label->generation != source->label_generation) return true;
+  product = label->product;
+  return (product && !label->active) || (!impl_->membership_pending && !source->slots.contains(id) && !image.width);
+ });
+ return product;
 }
 void BenchmarkCompilePipeline::register_split(BenchmarkSplitWriter& writer, const PreparedBenchmarkSplit& split) { impl_->images.register_split(writer, split, workers()); }
 BenchmarkSourceGeneration BenchmarkCompilePipeline::source_generation(const std::filesystem::path& root) {
@@ -1519,46 +1698,32 @@ struct BenchmarkSourcePublication::State {
  bool defer_pixels;
  [[nodiscard]] BenchmarkSourceGeneration image_generation(std::uint64_t id) const { return replacement && replacement->first == id ? replacement->second : generation; }
 };
-void BenchmarkCompilePipeline::labels_ready(const BenchmarkSourcePublication& publication, std::uint64_t id,
- const NormalizedAnnotationReadView& index, std::size_t image, std::string_view dependency, std::uint64_t original_generation, const BenchmarkAllowance& parent) {
- if (!publication.state_ || publication.state_->execution.lock() != impl_) return;
+bool BenchmarkCompilePipeline::labels_ready(const BenchmarkSourcePublication& publication, std::uint64_t id,
+ BenchmarkLabelInput input, std::string_view dependency, std::uint64_t original_generation) {
+ if (!publication.state_ || publication.state_->execution.lock() != impl_) return false;
  const auto& ticket = *publication.state_;
  const auto generation = ticket.image_generation(id);
  auto& source = *ticket.source;
- const auto retired = [&] { return impl_->stopping || ticket.attempt != impl_->images.attempt() || source.retiring || generation != source.image_generation(id) ||
-  (original_generation && original_generation != source.label_generation); };
- std::pair<std::uint32_t, std::uint32_t> dimensions;
- std::uint64_t label_generation = 0;
- {
-  std::unique_lock lock(impl_->mutex);
-  if (!impl_->label_resolution) return;
-  // A repaired annotation can introduce an image outside this attempt's
-  // selected work list. Keep its native product for the placement restart;
-  // this attempt cannot produce its geometry.
-  const auto unselected = [&] { return !impl_->membership_pending && !source.slots.contains(id) && !source.geometry.contains(id); };
-  impl_->wait(lock, [&] { return retired() || unselected() || impl_->failure || impl_->cancellation.requested() || source.geometry.contains(id); });
-  if (impl_->failure) std::rethrow_exception(impl_->failure);
-  throw_if_benchmark_cancelled(impl_->cancellation);
-  if (retired() || unselected()) return;
-  label_generation = source.label_generation;
-  const auto& fact = source.geometry.at(id);
-  if (fact.labels && fact.label_dependency == dependency) return;
-  dimensions = {fact.width, fact.height};
- }
- dataset::MaskResizeScratch scratch;
- std::shared_ptr<const BenchmarkLabelChunk> product;
- run(BenchmarkStage::Labels, {std::uint64_t{index.image(image).width} * 32U + 65536U, 0}, [&](std::size_t) {
-  product = std::make_shared<BenchmarkLabelChunk>(compile_benchmark_image_labels(index, image, dimensions, impl_->label_resolution, impl_->label_resize_mode, scratch, impl_->cancellation));
-  scratch = {};
- }, parent);
  {
   const std::lock_guard lock(impl_->mutex);
-  if (retired() || label_generation != source.label_generation) return;
-  auto& fact = source.geometry.at(id);
-  fact.label_dependency = dependency;
-  fact.labels = std::move(product);
+  throw_if_benchmark_cancelled(impl_->cancellation);
+  if (!impl_->label_resolution || impl_->stopping || ticket.attempt != impl_->images.attempt() || source.retiring || source.labels_retiring ||
+   generation != source.image_generation(id) || (original_generation && original_generation != source.label_generation)) return false;
+  impl_->check_admission();
+  if (input.index().image(input.position()).source_image_id != id) throw std::invalid_argument("benchmark label input has a different physical image");
+  auto& image = source.geometry.try_emplace(id).first->second;
+  if (image.retiring) return false;
+  if (const auto* existing = image.find_labels(dependency))
+   return !existing->retired && existing->attempt == ticket.attempt && existing->generation == source.label_generation;
+  auto label = std::make_unique<Impl::Label>();
+  image.generation = generation; image.source = &source; image.id = id;
+  label->image = &image; label->attempt = ticket.attempt; label->generation = source.label_generation;
+  label->dependency = dependency; label->input = std::move(input);
+  image.labels.push_back(std::move(label));
+  impl_->images.ready_labels(*image.labels.back());
  }
  impl_->changed.notify_all();
+ return true;
 }
 BenchmarkSourcePublication BenchmarkCompilePipeline::source_publication(const std::filesystem::path& root, std::shared_ptr<const ArtifactLease> custody, std::optional<std::uint64_t> repaired_image, bool defer_pixels) {
  const std::lock_guard lock(impl_->mutex);
@@ -1603,7 +1768,8 @@ void BenchmarkSourcePublication::geometry_ready(std::uint64_t id, std::pair<std:
 }
 void BenchmarkCompilePipeline::drain() {
  std::unique_lock lock(impl_->mutex);
- impl_->wait(lock, [&] { return impl_->pending == 0; });
+ impl_->wait(lock, [&] { return impl_->pending == 0 && (impl_->failure || impl_->cancellation.requested() || !impl_->images.waiting_labels()); });
+ throw_if_benchmark_cancelled(impl_->cancellation);
  if (impl_->failure) std::rethrow_exception(impl_->failure);
 }
 void BenchmarkCompilePipeline::retire_attempt() noexcept {
@@ -1634,7 +1800,7 @@ void BenchmarkCompilePipeline::retire_attempt() noexcept {
   }
   impl_->wait(lock, [&] { return std::ranges::none_of(impl_->lanes, [](const auto& lane) { return lane.busy(); }); });
   impl_->images.close();
-  impl_->membership_pending = true;
+  impl_->membership_pending = impl_->labels_first = true;
   impl_->metadata_streak = impl_->cursor = 0;
   impl_->failure = {};
   impl_->stopping = false;

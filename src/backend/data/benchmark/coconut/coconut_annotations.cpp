@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/detail/benchmark_json.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_json.h"
 #include <tuple>
@@ -723,7 +724,7 @@ public:
   worker.retained.store(workspace.retained_bytes(), std::memory_order_relaxed);
   if (complete) {
    if (!saved) retain_image(position, complete); else complete_row();
-   publish_labels(complete, publication, allowance);
+   publish_labels(complete, publication);
   } else if (!normalize) complete_row();
  }
  std::vector<CoconutComponent> finish() {
@@ -907,13 +908,12 @@ private:
   ++completed_rows_;
   if (request_.progress && completed_rows_ % kProgressQuantum == 0) request_.progress(completed_rows_);
  }
- void publish_labels(std::shared_ptr<const CoconutNativeImage> image, const BenchmarkSourcePublication& publication, const BenchmarkAllowance& allowance = {}) {
+ void publish_labels(std::shared_ptr<const CoconutNativeImage> image, const BenchmarkSourcePublication& publication) {
   if (!request_.execution) return;
-  auto read = CoconutNativeImage::read(std::move(image));
-  const auto& physical = read.owner->inventory().physical;
-  const auto& lineage = read.owner->lineage().component;
-  request_.execution->labels_ready(publication, physical.image_id, read.view, 0,
-   coconut_image_input_identity(request_.input_identity, physical, lineage.original_annotation_identity), lineage.original_generation, allowance);
+  const auto& physical = image->inventory().physical;
+  const auto& lineage = image->lineage().component;
+  request_.execution->labels_ready(publication, physical.image_id, CoconutNativeImage::labels(image),
+   coconut_image_input_identity(request_.input_identity, physical, lineage.original_annotation_identity), lineage.original_generation);
  }
  void defer_native(std::shared_ptr<PendingNativeImage> native) {
   const std::lock_guard lock(groups_mutex_);
@@ -969,16 +969,13 @@ private:
    };
    if (request_.execution) request_.execution->for_each(BenchmarkStage::Recovery, batch.size(), demand, recover, *workspace);
    else for (std::size_t i = 0; i < batch.size(); ++i) recover(i);
-   std::vector<std::pair<std::shared_ptr<const CoconutNativeImage>, BenchmarkSourcePublication>> labels;
-   labels.reserve(batch.size());
    for (auto& native : batch) {
     retain_image(native->position, native->product);
-    labels.emplace_back(std::move(native->product), std::move(native->publication));
+    publish_labels(std::move(native->product), native->publication);
    }
    batch.clear();
    { const std::lock_guard lock(groups_mutex_); ++recovery_settled_; }
    pending_changed_.notify_all();
-   for (auto& [image, publication] : labels) publish_labels(std::move(image), publication);
   }
  }
  const CoconutImportRequest& request_;
@@ -1312,10 +1309,23 @@ void consume_archive(const CoconutImportRequest& request, const CoconutAnnotatio
 }
 }  // namespace
 CoconutComponent::CoconutComponent(std::shared_ptr<const CoconutComponentBacking> backing, NormalizedAnnotationReadView index,
- std::shared_ptr<CoconutInventorySeal> seal, bool membership) : backing_(std::move(backing)), index_(std::move(index)), seal_(std::move(seal)), membership_(membership) {}
+ std::shared_ptr<CoconutInventorySeal> seal, bool membership) : backing_(std::move(backing)), index_(std::move(index)), seal_(std::move(seal)), membership_(membership), original_generation_(backing_->original_generation) {}
 CoconutEdition CoconutComponent::edition() const noexcept { return backing_->edition; }
 CoconutImageNamespace CoconutComponent::source() const noexcept { return backing_->source; }
 const std::string& CoconutComponent::input_identity() const noexcept { return backing_->input_identity; }
+BenchmarkLabelInput CoconutComponent::labels(std::size_t image) const {
+ if (membership_ || backing_->metadata_only) invalid("membership has no normalized labels");
+ return BenchmarkLabelInput(index_, image);
+}
+CoconutComponent CoconutComponent::with_original(const CoconutOriginalInput& original) const {
+ if (membership_ || backing_->metadata_only || !original.terminal || !original.generation ||
+  (source() != CoconutImageNamespace::CocoTrain && source() != CoconutImageNamespace::CocoValidation)) invalid("component has no admitted original generation");
+ const auto identity = original.originals ? original.originals->identity(source()) : std::string_view{};
+ if (identity != backing_->original_annotation_identity) invalid("component has a different original input");
+ auto result = *this;
+ result.original_generation_ = original.generation;
+ return result;
+}
 std::string CoconutComponent::image_input_identity(std::size_t image) const {
  return coconut_image_input_identity(backing_->annotation_input_identity, inventory_image(image).physical, backing_->original_annotation_identity);
 }

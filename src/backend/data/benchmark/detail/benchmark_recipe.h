@@ -83,10 +83,12 @@ void retire_coconut_recipe_inputs(const std::shared_ptr<CoconutRecipeInputs>&, c
 struct CoconutRecipePreparation {
  std::shared_ptr<CoconutRecipeInputs> inputs;
  std::vector<CoconutComponent> components;
+ // Cached components need publication; freshly imported native images already published.
+ std::vector<CoconutComponent> cached_label_inputs;
  std::optional<NormalizedAnnotationIndex> stock_validation;
  bool annotation_cache_hit = true;
  std::uint64_t annotation_storage_bytes = 0;
- std::uint64_t original_generation = 0;
+ std::uint64_t stock_validation_generation = 0;
  std::uint64_t duplicate_xl_images = 0;
  std::uint64_t validation_images = 0;
  nlohmann::json manifest;

@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
@@ -276,6 +277,7 @@ CoconutComponentBuilder component_builder(const CoconutComponent& component) {
  CoconutComponentBuilder builder;
  builder.edition = component.edition(); builder.source = component.source(); builder.input_identity = component.input_identity();
  builder.recovery_policy = component.recovery_policy(); builder.original_annotation_identity = component.original_annotation_identity();
+ builder.original_generation = component.original_generation();
  static_cast<NormalizedAnnotationMetadata&>(builder.index) = component.index();
  for (std::size_t i = 0; i < component.index().image_count(); ++i) {
   append_normalized_image_slice(builder.index, component.index().storage(), component.index().source_position(i));
@@ -2368,8 +2370,8 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  SECTION("an emptied supporter is omitted without recursive recovery") { empty_supporter = true; }
  auto originals = recovery_originals(image_id, masks);
  const auto indexed_originals_view = fixture_index(originals);
- CoconutRecoveryOriginals indexed_originals(&indexed_originals_view, nullptr);
- CoconutMaskRecovery recovery(indexed_originals);
+ auto indexed_originals = std::make_shared<CoconutRecoveryOriginals>(&indexed_originals_view, nullptr);
+ CoconutMaskRecovery recovery(*indexed_originals);
  auto couch = segment(30, supporter_category);
  couch["area"] = 99;
  Json segments = Json::array({segment(20, 18), couch});
@@ -2380,6 +2382,7 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  auto input = request(physical);
  input.parquet_shards = {root.path() / "dogs.parquet"};
  input.recovery = enabled ? &recovery : nullptr;
+ if (enabled) input.originals = [&](CoconutImageNamespace, bool, std::stop_token) { return CoconutOriginalInput{indexed_originals, true, 11}; };
  std::uint64_t rejected = 0;
  input.rejected_object = [&](const auto&, const auto&, const auto&, auto, auto) { ++rejected; };
  parquet_file(input.parquet_shards[0], Json::array({hf_row(image_id, png(3, 3, pixels), segments)}));
@@ -2399,6 +2402,8 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
   return;
  }
  REQUIRE(component.recovery().size() == 1);
+ CHECK(component.original_generation() == 11);
+ CHECK(component.select_images({0}).original_generation() == 11);
  const auto& facts = component.recovery().front();
  CHECK(component.recovery_policy() == kCoconutRecoveryPolicy);
  CHECK(component.original_annotation_identity() == originals.annotation_sha256);
@@ -2433,6 +2438,13 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  store_coconut_component(cache, component);
  const auto cached = load_coconut_component(cache, component.edition(), component.source(), component.input_identity());
  REQUIRE(cached);
+ CHECK(cached->original_generation() == 0);
+ const auto admitted = cached->with_original({indexed_originals, true, 11});
+ CHECK(admitted.original_generation() == 11);
+ CHECK(admitted.membership().original_generation() == 11);
+ CHECK(admitted.select_images({0}).original_generation() == 11);
+ CHECK_THROWS(cached->with_original({{}, true, 11}));
+ CHECK_THROWS(cached->with_original({indexed_originals, false, 11}));
  CHECK(cached->recovery().front().unresolved == facts.unresolved);
  CHECK(cached->recovery().front().omissions.size() == facts.unresolved);
  CHECK(cached->index().annotation_sha256 == component.index().annotation_sha256);
@@ -6128,7 +6140,7 @@ TEST_CASE("a Parquet group joins native recovery while final labels remain held"
  using namespace std::chrono_literals;
  bool fail_labels = false;
  SECTION("the next group progresses before geometry permits final labels") {}
- SECTION("final importer completion propagates a later label conversion failure") { fail_labels = true; }
+ SECTION("required label join propagates a later conversion failure") { fail_labels = true; }
  ScopedTempDir root("coconut-native-recovery-boundary");
  LocalCoconutRecipe local(root.path());
  auto catalog = local.selected(CoconutValidation::Stock);
@@ -6187,16 +6199,15 @@ TEST_CASE("a Parquet group joins native recovery while final labels remain held"
  REQUIRE(execution.resource_pressure()); // Native recovery is ready before the group can retire.
  second_row.Release();
  mmltk::testsupport::await_test_future(advanced, "next Parquet group after native settlement with first labels held", 5s);
- REQUIRE(input.records->row(0).native());
- CHECK(input.records->row(0).native()->boxes().size() == 1);
+ // Native production and persistence settle without final geometry. Its owning
+ // label input survives record retirement and the next recovery batch.
+ const auto result = mmltk::testsupport::await_test_future(importing, "all native groups settle while first labels lack geometry", 5s);
+ REQUIRE(result.size() == 1); CHECK(result[0].index().image_count() == 3); CHECK(result[0].index().box_count() == 1);
  CHECK_FALSE(execution.geometry(images, 7));
- CHECK(importing.wait_for(0ms) == std::future_status::timeout);
  publication.geometry_ready(7, {1, 1});
- if (fail_labels) CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(importing, "held label conversion failure joins the importer", 5s), "mask run length overflow");
- else {
-  const auto result = mmltk::testsupport::await_test_future(importing, "held labels and all native groups complete", 5s);
-  REQUIRE(result.size() == 1); CHECK(result[0].index().image_count() == 3); CHECK(result[0].index().box_count() == 1);
- }
+ const auto dependency = result[0].image_input_identity(0);
+ if (fail_labels) CHECK_THROWS_WITH(execution.wait_image_labels(images, 7, dependency), "mask run length overflow");
+ else REQUIRE(execution.wait_image_labels(images, 7, dependency));
  execution.retire_attempt(); input.records->discard();
  CHECK(execution.try_reserve({1, 13}));
 }
@@ -6234,13 +6245,13 @@ TEST_CASE("Large and XL component identities retain only their consumed physical
  const auto publication = physical.label_publication(CoconutEdition::XLarge, xl.inventory_image(0).physical);
  publication.geometry_ready(2, {1, 1});
  execution.label_configuration(1, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
- execution.labels_ready(publication, 2, xl.index(), 0, xl.image_input_identity(0));
+ execution.labels_ready(publication, 2, xl.labels(0), xl.image_input_identity(0));
  physical.withdraw(admitted[0]); admitted[0].download.identity = "repaired-large-artifact";
  CHECK_FALSE(large.matches_inputs("annotations", physical, nullptr));
  CHECK(large.matches_inputs("annotations", physical, nullptr, false));
  CHECK(xl.matches_inputs("annotations", physical, nullptr)); CHECK(xl.input_identity() == xl_identity);
  CHECK(xl.index().storage().images.data() == xl_mapping);
- REQUIRE(execution.geometry(xl_root, 2)); REQUIRE(execution.take_image_labels(xl_root, 2, xl.image_input_identity(0)));
+ REQUIRE(execution.geometry(xl_root, 2)); REQUIRE(execution.wait_image_labels(xl_root, 2, xl.image_input_identity(0)));
  const auto path = root.path() / "component.bin";
  auto old = component_builder(xl); old.input_identity = "old-namespace-bound-identity"; old.index.annotation_sha256.clear();
  store_coconut_component(path, std::move(old).finish({}, root.path()));
@@ -6509,4 +6520,139 @@ TEST_CASE("JSON physical failure retains successfully parsed immutable rows", "[
  REQUIRE(result.size() == 1); CHECK(result.front().index().image_count() == 2);
  CHECK(retained->record(0).segments.data() == segments);
  CHECK(retained->row(1).segment_ordinal() == 1);
+}
+
+TEST_CASE("recovery batches publish independent labels before withheld geometry", "[benchmark][coconut][pipeline][labels][recovery]") {
+ using namespace std::chrono_literals;
+ ScopedTempDir root("coconut-label-recovery-batches");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local.selected(CoconutValidation::Stock);
+ std::erase_if(catalog.releases, [](const auto& release) { return release.edition != CoconutEdition::Base; });
+ std::erase_if(catalog.images, [](const auto& image) { return image.source != CoconutImageNamespace::CocoTrain; });
+ const std::array<std::uint64_t, 5> ids{7, 10, 11, 12, 13};
+ std::vector<std::pair<std::string, std::string>> members;
+ Json rows = Json::array();
+ const std::array<std::uint32_t, 1> foreground{1};
+ for (auto id : ids) {
+  members.emplace_back(coco(id).member, white_jpeg(1, 1));
+  rows.push_back(hf_row(id, png(1, 1, foreground), Json::array({segment()}), 1, 1));
+ }
+ replace_physical_images(local.cache, catalog, CoconutImageNamespace::CocoTrain, members);
+ auto admitted = local_physical_archives(local.cache, catalog);
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 13}, cancellation);
+ CoconutPhysicalMembership physical(admitted, catalog, true, local.cache, execution.storage(), execution, cancellation);
+ std::map<std::uint64_t, unsigned> conversions;
+ execution.label_configuration(1, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
+  [&](const auto&, auto id, const auto&) { ++conversions[id]; });
+ const auto images = local.cache.source_images("coco") / "train2017";
+ const auto publication = execution.source_publication(images, {});
+ for (auto id : ids) if (id != ids.front()) publication.geometry_ready(id, {1, 1});
+ CoconutImportRequest input;
+ input.edition = CoconutEdition::Base; input.input_identity = "label-recovery-batches";
+ input.physical_membership = &physical; input.execution = &execution; input.cancellation = cancellation;
+ input.records = std::make_shared<CoconutAnnotationRecords>(); input.expected_rows = ids.size();
+ input.parquet_shards = {root.path() / "batch.parquet"};
+ parquet_file(input.parquet_shards.front(), rows, hf_schema(), parquet::Compression::SNAPPY, 2);
+ NormalizedAnnotationBuilder stock; stock.annotation_sha256 = std::string(64, 'a'); stock.split = "train2017";
+ for (auto id : ids) stock.images.push_back({id, 0, 0, 1, 1, 0, 0});
+ const auto stock_index = fixture_index(stock);
+ const auto original_owner = std::make_shared<CoconutRecoveryOriginals>(&stock_index, nullptr);
+ CoconutMaskRecovery recovery(*original_owner);
+ mmltk::testsupport::TestGate originals("recovery waits after its first native input");
+ std::atomic<unsigned> offered{0};
+ std::promise<void> all_offered;
+ input.originals = [&](CoconutImageNamespace, bool wait, std::stop_token) {
+  if (wait) { originals.receipt().ArriveAndWait(); return CoconutOriginalInput{original_owner, true, 1}; }
+  if (++offered == ids.size()) all_offered.set_value();
+  return CoconutOriginalInput{{}, false, 1};
+ };
+ auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled.store(true); originals.Release(); execution.notify_admission_change(); });
+ REQUIRE(originals.WaitEntered(5s));
+ mmltk::testsupport::await_test_promise(all_offered, "every native input precedes original readiness");
+ originals.Release();
+ const auto result = mmltk::testsupport::await_test_future(importing, "later ready recovery batches settle without first-image geometry");
+ REQUIRE(result.size() == 1); REQUIRE(result[0].index().image_count() == ids.size());
+ REQUIRE(result[0].original_generation() == 1);
+ CHECK(result[0].recovery_policy() == kCoconutRecoveryPolicy);
+ CHECK_FALSE(execution.geometry(images, ids.front()));
+ unsigned fallbacks = 0;
+ const auto fallback = [&](const CoconutComponent& component, std::size_t i) {
+  const auto dependency = component.image_input_identity(i);
+  if (execution.has_image_labels(images, ids[i], dependency, component.original_generation())) return true;
+  ++fallbacks;
+  return execution.labels_ready(execution.source_publication(images, {}, ids[i]), ids[i], component.labels(i), dependency, component.original_generation());
+ };
+ // Every cold native product is already owned, including the pending image.
+ for (std::size_t i = 0; i < ids.size(); ++i) CHECK(fallback(result[0], i));
+ CHECK(fallbacks == 0);
+ for (std::size_t i = 1; i < ids.size(); ++i) REQUIRE(execution.wait_image_labels(images, ids[i], result[0].image_input_identity(i)));
+ CHECK(conversions[ids.front()] == 0);
+ publication.geometry_ready(ids.front(), {1, 1});
+ for (std::size_t i = 0; i < ids.size(); ++i) {
+  const auto dependency = result[0].image_input_identity(i);
+  const auto early = execution.wait_image_labels(images, ids[i], dependency);
+  REQUIRE(early);
+  CHECK(fallback(result[0], i));
+  CHECK(fallbacks == 0);
+  CHECK(execution.wait_image_labels(images, ids[i], dependency) == early);
+  CHECK(conversions[ids[i]] == 1);
+ }
+ // A new warm attempt owns the loaded mapping and publishes every cached image.
+ const auto path = root.path() / "warm.normalized.bin";
+ store_coconut_component(path, result[0]);
+ auto warm = load_coconut_component(path, CoconutEdition::Base, CoconutImageNamespace::CocoTrain, input.input_identity, {}, false, &physical, &recovery);
+ REQUIRE(warm);
+ CHECK(warm->original_generation() == 0);
+ *warm = warm->with_original({original_owner, true, 1});
+ CHECK(warm->select_images({0}).original_generation() == 1);
+ execution.retire_attempt();
+ // The preparation-captured warm input cannot become current merely because
+ // fallback obtains a fresh physical publication after original withdrawal.
+ execution.original_generation(images, 2, true);
+ CHECK_FALSE(fallback(*warm, 0));
+ CHECK_FALSE(execution.wait_image_labels(images, ids[0], warm->image_input_identity(0), warm->original_generation()));
+ *warm = warm->with_original({original_owner, true, 2});
+ execution.original_generation(images, 2, false);
+ fallbacks = 0;
+ for (std::size_t i = 0; i < ids.size(); ++i) CHECK(fallback(*warm, i));
+ CHECK(fallbacks == ids.size());
+ for (std::size_t i = 0; i < ids.size(); ++i) {
+  REQUIRE(execution.wait_image_labels(images, ids[i], warm->image_input_identity(i)));
+  CHECK(conversions[ids[i]] == 2);
+  CHECK(fallback(*warm, i));
+  CHECK(fallbacks == ids.size());
+ }
+}
+
+TEST_CASE("asynchronous native labels retain their sealed image until conversion settles", "[benchmark][coconut][pipeline][labels][resources]") {
+ using namespace std::chrono_literals;
+ CoconutNativeWorkspace workspace(CoconutImportLimits{});
+ CoconutRecord record; record.image_id = 7; record.width = record.height = 1;
+ record.segments = {{.id = 1, .category_id = 1, .isthing = true}};
+ const std::array<std::uint32_t, 1> pixel{1};
+ const auto encoded = png(1, 1, pixel);
+ const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
+ workspace.decode(record, bytes, workspace.admit_png(record, bytes));
+ auto lineage = std::make_shared<CoconutNativeLineage>(); lineage->component.source = CoconutImageNamespace::CocoTrain;
+ auto native = workspace.finish(record, coco(7), {1, 1}, lineage, {});
+ const std::weak_ptr<const CoconutNativeImage> lifetime = native;
+ BenchmarkCompilePipeline execution(1);
+ mmltk::testsupport::TestGate held("native label consumer retains its sealed source");
+ execution.label_configuration(1, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
+  [&](const auto&, auto, const auto&) { held.receipt().ArriveAndWait(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); execution.retire_attempt(); });
+ const std::filesystem::path root("native-label-lifetime");
+ const auto publication = execution.source_publication(root, {});
+ execution.labels_ready(publication, 7, CoconutNativeImage::labels(native), "native");
+ native.reset(); workspace.retire();
+ CHECK_FALSE(lifetime.expired());
+ publication.geometry_ready(7, {1, 1});
+ REQUIRE(held.WaitEntered(5s)); CHECK_FALSE(lifetime.expired());
+ held.Release();
+ const auto product = execution.wait_image_labels(root, 7, "native");
+ REQUIRE(product); REQUIRE(product->labels.size() == 1); CHECK(product->runs.front().length == 1);
+ CHECK(lifetime.expired());
 }

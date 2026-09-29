@@ -370,22 +370,6 @@ struct SegmentationScratch {
  }
  void reset() noexcept { output = nullptr; intersections.clear(); counts.clear(); events.clear(); edges.clear(); active.clear(); intervals.clear(); }
 };
-void append_mask_run(std::vector<RLEPair>& output, std::uint64_t begin, std::uint64_t end, std::size_t first) {
- if (begin == end) return;
- if (begin > UINT32_MAX || end - begin > UINT32_MAX) throw std::overflow_error("COCO mask run overflow");
- if (output.size() > first && std::uint64_t{output.back().start} + output.back().length == begin) {
-  output.back().length = checked_cast<std::uint32_t>(end - output.back().start, "COCO mask run overflow");
- } else output.push_back({static_cast<std::uint32_t>(begin), static_cast<std::uint32_t>(end - begin)});
-}
-void append_mask_slab(std::vector<RLEPair>& output, std::uint32_t width, std::uint32_t first, std::uint32_t end,
- std::span<const std::pair<std::uint32_t, std::uint32_t>> intervals, std::size_t output_begin) {
- if (intervals.empty()) return;
- if (intervals.size() == 1 && intervals.front().first == 0 && intervals.front().second == width) {
-  append_mask_run(output, std::uint64_t{first} * width, std::uint64_t{end} * width, output_begin);
-  return;
- }
- for (auto y = first; y < end; ++y) for (const auto [x1, x2] : intervals) append_mask_run(output, std::uint64_t{y} * width + x1, std::uint64_t{y} * width + x2, output_begin);
-}
 void merge_mask_intervals(std::vector<std::pair<std::uint32_t, std::uint32_t>>& intervals) {
  std::ranges::sort(intervals);
  std::size_t count = 0;
@@ -426,6 +410,7 @@ std::span<const RLEPair> convert_coco_counts(std::span<const std::uint32_t> coun
  // at most three rectangles; no foreground pixel is expanded.
  std::map<std::uint32_t, std::int64_t> endpoints;
  auto& output = *scratch.output;
+ dataset::MaskRunEmitter emitter(output, scratch.output_begin, dimensions.width, nullptr, "COCO mask run overflow", "COCO mask run overflow");
  for (std::size_t next = 0; next < events.size();) {
   const auto y = events[next].y;
   do {
@@ -442,7 +427,7 @@ std::span<const RLEPair> convert_coco_counts(std::span<const std::uint32_t> coun
    if (!previous && coverage) start = x;
    if (previous && !coverage) scratch.intervals.emplace_back(start, x);
   }
-  append_mask_slab(output, dimensions.width, y, events[next].y, scratch.intervals, scratch.output_begin);
+  emitter.slab(y, events[next].y, scratch.intervals);
  }
  return std::span(output).subspan(scratch.output_begin);
 }
@@ -461,6 +446,7 @@ std::span<const RLEPair> rasterize_coco_polygons(const std::vector<std::vector<d
  std::ranges::sort(edges, {}, &PolygonEdge::begin);
  scratch.active.clear();
  auto& output = *scratch.output;
+ dataset::MaskRunEmitter emitter(output, scratch.output_begin, dimensions.width, nullptr, "COCO mask run overflow", "COCO mask run overflow");
  std::size_t next = 0;
  auto y = edges.empty() ? dimensions.height : edges.front().begin;
  while (next < edges.size() || !scratch.active.empty()) {
@@ -497,7 +483,7 @@ std::span<const RLEPair> rasterize_coco_polygons(const std::vector<std::vector<d
     scratch.intervals.push_back(covered_pixel_span(scratch.intersections[pair], scratch.intersections[pair + 1], dimensions.width));
   }
   merge_mask_intervals(scratch.intervals);
-  append_mask_slab(output, dimensions.width, y, slab_end, scratch.intervals, scratch.output_begin);
+  emitter.slab(y, slab_end, scratch.intervals);
   y = slab_end;
  }
  return std::span(output).subspan(scratch.output_begin);

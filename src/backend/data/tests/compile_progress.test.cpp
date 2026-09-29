@@ -912,3 +912,29 @@ TEST_CASE("interval mask projection appends atomically and handles full slabs", 
  CHECK(complete.max_x == 2000000); CHECK(complete.max_y == 2000);
  CHECK(scratch.intervals.capacity() == 0);
 }
+
+TEST_CASE("independent mask slabs never merge across their append boundary", "[backend][data][compiler][mask]") {
+ using namespace mmltk::backend::data::dataset;
+ using namespace mmltk::backend::imaging::resample;
+ std::vector<RLEPair> output;
+ const std::pair<std::uint32_t, std::uint32_t> full{0, 4};
+ RowMajorMaskBounds first_bounds, second_bounds;
+ MaskRunEmitter first(output, output.size(), 4, &first_bounds);
+ first.slab(0, 2, std::span(&full, 1));
+ MaskRunEmitter second(output, output.size(), 4, &second_bounds);
+ second.slab(2, 4, std::span(&full, 1));
+ REQUIRE(output.size() == 2); CHECK(output[0].length == 8); CHECK(output[1].start == 8); CHECK(output[1].length == 8);
+ CHECK(first_bounds.max_y == 2); CHECK(second_bounds.min_y == 2); CHECK(second_bounds.max_y == 4);
+ MaskResizeScratch scratch;
+ const auto identity = compute_image_resize_geometry(4, 4, 4, 4, ImageResizeMode::Stretch);
+ const std::array<RLEPair, 1> a{{{0, 8}}}, b{{{8, 8}}};
+ output.clear();
+ (void)append_resized_row_major_mask(a, {4, 4}, {4, 4}, identity, &scratch, output);
+ (void)append_resized_row_major_mask(b, {4, 4}, {4, 4}, identity, &scratch, output);
+ REQUIRE(output.size() == 2); CHECK(output[0].length == 8); CHECK(output[1].start == 8);
+ const auto before = output;
+ MaskRunEmitter overflow(output, output.size(), 4, nullptr, "source start overflow", "source length overflow");
+ CHECK_THROWS_WITH(overflow.run(std::uint64_t{UINT32_MAX} + 1, std::uint64_t{UINT32_MAX} + 2), "source start overflow");
+ CHECK_THROWS_WITH(overflow.run(0, std::uint64_t{UINT32_MAX} + 1), "source length overflow");
+ CHECK(std::ranges::equal(before, output, [](auto left, auto right) { return left.start == right.start && left.length == right.length; }));
+}

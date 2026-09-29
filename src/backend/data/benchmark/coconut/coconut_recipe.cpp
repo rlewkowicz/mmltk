@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
 #include "src/backend/data/benchmark/detail/benchmark_recipe.h"
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
@@ -147,13 +148,13 @@ struct CoconutRecipeInputs {
  }
  void publish_labels(std::size_t index) {
   if (!execution || !physical) return;
-  const auto& release = *releases[index].complete;
-  for (const auto& component : release.components) for (std::size_t image = 0; image < component.index().image_count(); ++image) {
+  auto& release = *releases[index].complete;
+  for (const auto& component : release.cached_label_inputs) for (std::size_t image = 0; image < component.index().image_count(); ++image) {
    const auto& input = component.inventory_image(image).physical;
-   const auto generation = input.source == CoconutImageNamespace::CocoTrain || input.source == CoconutImageNamespace::CocoValidation ? release.original_generation : 0;
-   execution->labels_ready(physical->label_publication(component.edition(), input), input.image_id, component.index(), image,
-    component.image_input_identity(image), generation);
+   execution->labels_ready(physical->label_publication(component.edition(), input), input.image_id, component.labels(image),
+    component.image_input_identity(image), component.original_generation());
   }
+  release.cached_label_inputs.clear();
  }
  void activate(std::function<void(std::size_t, const BenchmarkAllowance&, bool)> work) {
   {
@@ -204,7 +205,7 @@ struct CoconutRecipeInputs {
    for (const auto& component : release.complete->components) {
     if (component.source() != CoconutImageNamespace::CocoTrain && component.source() != CoconutImageNamespace::CocoValidation) continue;
     const auto current = original(component.source(), false);
-    if (release.complete->original_generation && release.complete->original_generation != current.state.generation) { stale = true; affected += component.index().image_count(); }
+    if (component.original_generation() && component.original_generation() != current.state.generation) { stale = true; affected += component.index().image_count(); }
    }
    if (!stale) continue;
    for (const auto& component : release.complete->components)
@@ -339,7 +340,6 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
  const auto refresh_original = [&](bool wait) {
   if (!original_provider) return CoconutOriginalInput{};
   auto input = original_provider(recovery_source, wait, {});
-  prepared.original_generation = input.generation;
   originals = input.originals;
   recovery.reset();
   if (originals) recovery.emplace(*originals);
@@ -409,7 +409,9 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   reusable.insert(source);
   if (!metadata_only) {
    admit_coconut_component(cached->second, cancellation);
+   if (original_provider && source == recovery_source) cached->second = cached->second.with_original(initial_original);
    components.push_back(cached->second);
+   prepared.cached_label_inputs.push_back(cached->second);
   } else {
    components.push_back(cached->second.membership());
   }
@@ -528,6 +530,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
     for (const auto source : sources) retained.components.erase(std::pair{release.edition, source});
     reusable.clear();
     cached_components.clear();
+    prepared.cached_label_inputs.clear();
     reusable_images.clear(); request.reusable_images = {};
     retained_sources.clear();
     request.retained_sources = {};
@@ -761,7 +764,9 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  prepared.duplicate_xl_images = reconcile_coconut_extensions(prepared.components, cancellation);
  std::erase_if(prepared.components, [](const CoconutComponent& component) { return component.index().image_count() == 0; });
  if (config.selection.validation == CoconutValidation::Stock) {
-  prepared.stock_validation = retained.original(CoconutImageNamespace::CocoValidation, true).state.index;
+  auto original = retained.original(CoconutImageNamespace::CocoValidation, true);
+  prepared.stock_validation = std::move(original.state.index);
+  prepared.stock_validation_generation = original.state.generation;
   prepared.validation_images = prepared.stock_validation->images.size();
  }
  // COCO shares one physical ID domain across its archive subsets; Objects365 editions remain distinct.

@@ -20,7 +20,8 @@ class BenchmarkResourceWait;
 class BenchmarkSplitWriter;
 struct PreparedBenchmarkSplit;
 struct BenchmarkLabelChunk;
-class NormalizedAnnotationReadView;
+class BenchmarkLabelInput;
+class BenchmarkLabelWorkspace;
 class StorageReservationPool;
 // Only runnable CPU work enters this owner. Source controllers retain their I/O,
 // locks and dependency waits outside its lanes. Stages are scheduling policy,
@@ -98,7 +99,7 @@ public:
   const std::function<void(std::size_t)>&, Workspace&);
  void write_remaining(BenchmarkSplitWriter&, const PreparedBenchmarkSplit&, std::span<const std::size_t>);
  // A stopped input reader may expose unused promise bytes to ready pixel
- // writes. Source/producer admission still sees its complete reservation.
+ // and label writes. Source/producer admission still sees its complete reservation.
  // Reclaims every borrowed physical workspace before returning or throwing;
  // callback and reclaim execute outside CPU lanes. The input owner must keep
  // its allocation window stable and include all of its consumers in live_bytes.
@@ -120,15 +121,22 @@ public:
  void geometry_ready(const BenchmarkImageGeometry&);
  [[nodiscard]] std::shared_ptr<const BenchmarkEncodedImage> image_input(const std::filesystem::path&, std::uint64_t) const;
  [[nodiscard]] std::optional<BenchmarkImageGeometry> geometry(const std::filesystem::path&, std::uint64_t) const;
+ // Publication retains native/normalized custody and never waits for geometry,
+ // resources or CPU completion. ImageState owns the join with physical facts.
+ // False means the publication generation withdrew before admission.
+ bool labels_ready(const BenchmarkSourcePublication&, std::uint64_t, BenchmarkLabelInput,
+  std::string_view dependency, std::uint64_t original_generation = 0);
+ [[nodiscard]] std::shared_ptr<const BenchmarkLabelChunk> image_labels(const std::filesystem::path&, std::uint64_t, std::string_view dependency) const;
+ // Includes pending, executing and completed inputs in the current generations.
+ [[nodiscard]] bool has_image_labels(const std::filesystem::path&, std::uint64_t, std::string_view dependency, std::uint64_t original_generation = 0) const;
+ // Required final assembly joins the same admission outside every CPU lane.
+ [[nodiscard]] std::shared_ptr<const BenchmarkLabelChunk> wait_image_labels(const std::filesystem::path&, std::uint64_t, std::string_view dependency, std::uint64_t original_generation = 0);
+ void original_generation(const std::filesystem::path&, std::uint64_t, bool withdrawn);
+ // Effect-only observation after admission and before projection, outside locks.
+ void label_configuration(std::uint32_t, mmltk::backend::imaging::resample::ImageResizeMode,
+  std::function<void(const std::filesystem::path&, std::uint64_t, const BenchmarkLabelWorkspace&)> = {});
  // Withdraw admission first, join only this source, then clear affected facts.
  // Unrelated source tasks and completed products continue to be usable.
- // The normalized owner remains alive for this synchronous image handoff.
- // Geometry joins in ImageState; independent pixels need not finish first.
- void labels_ready(const BenchmarkSourcePublication&, std::uint64_t, const NormalizedAnnotationReadView&, std::size_t,
-  std::string_view dependency, std::uint64_t original_generation = 0, const BenchmarkAllowance& = {});
- [[nodiscard]] std::shared_ptr<const BenchmarkLabelChunk> take_image_labels(const std::filesystem::path&, std::uint64_t, std::string_view dependency);
- void original_generation(const std::filesystem::path&, std::uint64_t, bool withdrawn);
- void label_configuration(std::uint32_t, mmltk::backend::imaging::resample::ImageResizeMode);
  void retire_source(const std::filesystem::path&);
  void drain();
  // Explicit borrower boundary for construction before recipe/writer owners.

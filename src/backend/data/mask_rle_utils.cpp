@@ -37,10 +37,30 @@ void include_row_major_mask_run(RowMajorMaskBounds* bounds, const std::size_t be
   bounds->max_x = width;
  }
 }
+void MaskRunEmitter::run(std::uint64_t begin, std::uint64_t end) {
+ if (begin == end) return;
+ const auto start = checked_cast<std::uint32_t>(begin, start_error_);
+ if (end < begin) throw std::overflow_error(length_error_);
+ const auto length = checked_cast<std::uint32_t>(end - begin, length_error_);
+ if (output_.size() > first_ && std::uint64_t{output_.back().start} + output_.back().length == begin)
+  output_.back().length = checked_cast<std::uint32_t>(end - output_.back().start, length_error_);
+ else output_.push_back({start, length});
+ include_row_major_mask_run(bounds_, begin, end, width_);
+}
+void MaskRunEmitter::slab(std::uint32_t first, std::uint32_t end, std::span<const std::pair<std::uint32_t, std::uint32_t>> intervals) {
+ if (first == end || intervals.empty()) return;
+ if (intervals.size() == 1 && intervals.front().first == 0 && intervals.front().second == width_) {
+  run(std::uint64_t{first} * width_, std::uint64_t{end} * width_);
+  return;
+ }
+ for (auto y = first; y < end; ++y)
+  for (const auto [begin, last] : intervals) run(std::uint64_t{y} * width_ + begin, std::uint64_t{y} * width_ + last);
+}
 EncodedRowMajorMask encode_dense_row_major_mask(const std::span<const std::uint8_t> dense, const MaskDimensions dimensions) {
  const std::size_t pixels = checked_pixel_count(dimensions);
  if (dense.size() != pixels) { throw std::runtime_error("dense mask size does not match its dimensions"); }
  EncodedRowMajorMask encoded;
+ MaskRunEmitter emitter(encoded.pairs, 0, dimensions.width, &encoded.bounds);
  const __m256i zero = _mm256_setzero_si256();
  std::size_t cursor = 0U;
  while (cursor < pixels) {
@@ -66,11 +86,7 @@ EncodedRowMajorMask encode_dense_row_major_mask(const std::span<const std::uint8
    cursor += 32U;
   }
   while (cursor < pixels && dense[cursor] != 0U) { ++cursor; }
-  encoded.pairs.push_back({
-   checked_cast<std::uint32_t>(begin, "mask run start overflow"),
-   checked_cast<std::uint32_t>(cursor - begin, "mask run length overflow"),
-  });
-  include_row_major_mask_run(&encoded.bounds, begin, cursor, dimensions.width);
+  emitter.run(begin, cursor);
  }
  return encoded;
 }
@@ -129,27 +145,11 @@ RowMajorMaskBounds append_resized_row_major_mask(const std::span<const RLEPair> 
   const auto denominator = std::uint64_t{2} * source;
   return static_cast<std::uint32_t>(std::min<__uint128_t>(target, (numerator - source + denominator - 1) / denominator));
  };
- const auto append = [&](std::uint64_t begin, std::uint64_t end) {
-  if (begin == end) return;
-  const auto start = checked_cast<std::uint32_t>(begin, "mask run start overflow");
-  const auto length = checked_cast<std::uint32_t>(end - begin, "mask run length overflow");
-  if (output.size() > output_begin && std::uint64_t{output.back().start} + output.back().length == begin)
-   output.back().length = checked_cast<std::uint32_t>(end - output.back().start, "mask run length overflow");
-  else output.push_back({start, length});
-  include_row_major_mask_run(&target, begin, end, target_dimensions.width);
- };
+ MaskRunEmitter emitter(output, output_begin, target_dimensions.width, &target);
  scratch->intervals.clear();
  std::uint32_t pending_row = 0;
  const auto slab = [&](std::uint32_t first, std::uint32_t last, std::span<const std::pair<std::uint32_t, std::uint32_t>> intervals) {
-  if (first == last || intervals.empty()) return;
-  first += letterbox.offset_y;
-  last += letterbox.offset_y;
-  if (intervals.size() == 1 && intervals.front().first == 0 && intervals.front().second == target_dimensions.width) {
-   append(std::uint64_t{first} * target_dimensions.width, std::uint64_t{last} * target_dimensions.width);
-   return;
-  }
-  for (auto y = first; y < last; ++y)
-   for (const auto [begin, end] : intervals) append(std::uint64_t{y} * target_dimensions.width + begin, std::uint64_t{y} * target_dimensions.width + end);
+  emitter.slab(first + letterbox.offset_y, last + letterbox.offset_y, intervals);
  };
  const auto flush = [&] {
   slab(inverse(pending_row, source_dimensions.height, letterbox.resized_height), inverse(pending_row + 1, source_dimensions.height, letterbox.resized_height), scratch->intervals);
@@ -172,7 +172,7 @@ RowMajorMaskBounds append_resized_row_major_mask(const std::span<const RLEPair> 
    if (!run.length || run.start < previous_end || end > pixels) throw std::runtime_error("row-major mask contains an invalid run");
    previous_end = end;
    include_row_major_mask_run(&source, run.start, end, source_dimensions.width);
-   if (identity) { append(run.start, end); continue; }
+   if (identity) { emitter.run(run.start, end); continue; }
    auto row = run.start / source_dimensions.width;
    auto x = run.start % source_dimensions.width;
    auto remaining = std::uint64_t{run.length};

@@ -1,3 +1,5 @@
+#include "src/backend/data/benchmark/detail/benchmark_labels.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
@@ -7040,14 +7042,14 @@ TEST_CASE("native label readiness and physical pixels settle independently", "[b
  NormalizedAnnotationBuilder builder;
  builder.images.push_back({1, 0, 1, 16, 8, 0, 0});
  NormalizedBox box;
- box.x2 = box.y2 = 1; box.flags = kAnnotationMask | kAnnotationId; box.annotation_id = 4;
+ box.x2 = box.y2 = 1; box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory; box.annotation_id = 4; box.source_category_id = 1;
  box.mask_rle_pairs = 1; box.original_area = 128;
  builder.boxes.push_back(box); builder.mask_rle_pairs.push_back({0, 128});
  const NormalizedAnnotationReadView index(fixture_index(builder));
  mmltk::testsupport::TestGate held("one independent image product");
  auto delayed = std::async(std::launch::async, [&] {
   held.receipt().ArriveAndWait();
-  if (hold_labels) execution.labels_ready(physical, 1, index, 0, "annotations/originals-1", 1);
+  if (hold_labels) execution.labels_ready(physical, 1, BenchmarkLabelInput(index, 0), "annotations/originals-1", 1);
   else CHECK(physical.consume({1}));
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); });
@@ -7055,45 +7057,45 @@ TEST_CASE("native label readiness and physical pixels settle independently", "[b
  if (hold_labels) {
   CHECK(physical.consume({1}));
   CHECK(writer.image_complete(0));
-  CHECK_FALSE(execution.take_image_labels(images, 1, "annotations/originals-1"));
+  CHECK_FALSE(execution.image_labels(images, 1, "annotations/originals-1"));
  } else {
-  execution.labels_ready(physical, 1, index, 0, "annotations/originals-1", 1);
+  execution.labels_ready(physical, 1, BenchmarkLabelInput(index, 0), "annotations/originals-1", 1);
   CHECK_FALSE(writer.image_complete(0));
  }
  if (cancel_after_labels) {
-  REQUIRE(execution.take_image_labels(images, 1, "annotations/originals-1"));
+  REQUIRE(execution.wait_image_labels(images, 1, "annotations/originals-1"));
   cancelled.store(true);
   execution.retire_attempt();
-  CHECK_THROWS(execution.labels_ready(physical, 1, index, 0, "annotations/originals-1", 1));
+  CHECK_THROWS(execution.labels_ready(physical, 1, BenchmarkLabelInput(index, 0), "annotations/originals-1", 1));
   held.Release();
   CHECK_THROWS(mmltk::testsupport::await_test_future(delayed, "cancelled held pixel publication"));
   CHECK_FALSE(writer.image_complete(0));
-  CHECK_FALSE(execution.take_image_labels(images, 1, "annotations/originals-1"));
+  CHECK_FALSE(execution.image_labels(images, 1, "annotations/originals-1"));
   return;
  }
  held.Release();
  mmltk::testsupport::await_test_future(delayed, "independent label and pixel products");
- const auto labels = execution.take_image_labels(images, 1, "annotations/originals-1");
+ const auto labels = execution.wait_image_labels(images, 1, "annotations/originals-1");
  REQUIRE(labels); REQUIRE(labels->labels.size() == 1); REQUIRE(labels->runs.size() == 1);
  CHECK(labels->runs[0].start == 0); CHECK(labels->runs[0].length == 64);
  CHECK(labels->labels[0].original_area == 128);
  CHECK(writer.image_complete(0));
  // Original withdrawal does not withdraw physical geometry or completed pixels.
- execution.labels_ready(physical, 1, index, 0, "annotations/originals-1", 1);
+ execution.labels_ready(physical, 1, BenchmarkLabelInput(index, 0), "annotations/originals-1", 1);
  execution.original_generation(images, 2, true);
- execution.labels_ready(physical, 1, index, 0, "annotations/originals-1", 1);
- CHECK_FALSE(execution.take_image_labels(images, 1, "annotations/originals-1"));
+ execution.labels_ready(physical, 1, BenchmarkLabelInput(index, 0), "annotations/originals-1", 1);
+ CHECK_FALSE(execution.image_labels(images, 1, "annotations/originals-1"));
  REQUIRE(execution.geometry(images, 1)); CHECK(writer.image_complete(0));
- execution.labels_ready(physical, 1, index, 0, "annotations/originals-2", 2);
- REQUIRE(execution.take_image_labels(images, 1, "annotations/originals-2"));
+ execution.labels_ready(physical, 1, BenchmarkLabelInput(index, 0), "annotations/originals-2", 2);
+ REQUIRE(execution.wait_image_labels(images, 1, "annotations/originals-2"));
  // A late label task cannot attach its old physical ticket to a replacement.
  execution.retire_image(images, 1);
- execution.labels_ready(physical, 1, index, 0, "annotations/originals-2", 2);
- CHECK_FALSE(execution.take_image_labels(images, 1, "annotations/originals-2"));
+ execution.labels_ready(physical, 1, BenchmarkLabelInput(index, 0), "annotations/originals-2", 2);
+ CHECK_FALSE(execution.image_labels(images, 1, "annotations/originals-2"));
  const auto replacement = execution.source_publication(images, {}, 1);
  replacement.geometry_ready(1, {16, 8});
- execution.labels_ready(replacement, 1, index, 0, "annotations/originals-2", 2);
- REQUIRE(execution.take_image_labels(images, 1, "annotations/originals-2"));
+ execution.labels_ready(replacement, 1, BenchmarkLabelInput(index, 0), "annotations/originals-2", 2);
+ REQUIRE(execution.wait_image_labels(images, 1, "annotations/originals-2"));
  CHECK_FALSE(writer.image_complete(0));
  // Replacement annotations can introduce a key with no slot in this attempt.
  // Its retained native labels must return to the compiler's placement restart.
@@ -7101,11 +7103,11 @@ TEST_CASE("native label readiness and physical pixels settle independently", "[b
  builder.images.front().source_image_id = 2;
  const NormalizedAnnotationReadView added(fixture_index(builder));
  const auto added_publication = execution.source_publication(images, {}, 2);
- auto unselected = std::async(std::launch::async, [&] { execution.labels_ready(added_publication, 2, added, 0, "added-membership", 2); });
+ auto unselected = std::async(std::launch::async, [&] { execution.labels_ready(added_publication, 2, BenchmarkLabelInput(added, 0), "added-membership", 2); });
  const mmltk::testsupport::ScopedTestCleanup retire([&] { cancelled.store(true); execution.notify_admission_change(); });
  mmltk::testsupport::await_test_future(unselected, "new annotation membership yields to placement restart");
  CHECK_FALSE(execution.geometry(images, 2));
- CHECK_FALSE(execution.take_image_labels(images, 2, "added-membership"));
+ CHECK_FALSE(execution.image_labels(images, 2, "added-membership"));
 }
 
 TEST_CASE("settled continuation retirement preserves open descriptors and upstream promises", "[benchmark][pipeline][resources]") {
@@ -7134,7 +7136,9 @@ TEST_CASE("constant polygon slabs preserve full clipped and empty rectangular su
  constexpr std::uint32_t extent = 16000;
  const nlohmann::json polygons = nlohmann::json::array({
   nlohmann::json::array({-5.0, -5.0, 17000.0, -5.0, 17000.0, 17000.0, -5.0, 17000.0}),
-  nlohmann::json::array({-8.0, 0.0, -2.0, 0.0, -2.0, 16000.0, -8.0, 16000.0})});
+  nlohmann::json::array({-8.0, 0.0, -2.0, 0.0, -2.0, 16000.0, -8.0, 16000.0}),
+  nlohmann::json::array({0.0, 0.0, 16000.0, 0.0, 16000.0, 8000.0, 0.0, 8000.0}),
+  nlohmann::json::array({0.0, 8000.0, 16000.0, 8000.0, 16000.0, 16000.0, 0.0, 16000.0})});
  nlohmann::json annotations = nlohmann::json::array();
  for (std::size_t i = 0; i < polygons.size(); ++i)
   annotations.push_back({{"id", i + 1}, {"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, extent, extent}}, {"segmentation", nlohmann::json::array({polygons[i]})}});
@@ -7142,8 +7146,310 @@ TEST_CASE("constant polygon slabs preserve full clipped and empty rectangular su
  const std::array<NumericCategoryMapping, 1> categories{{{1, 0, "person"}}};
  AnnotationParseOptions options; options.split = "train";
  const auto result = parse_coco_style_annotations(path, std::string(64, 'a'), categories, options);
- REQUIRE(result.boxes.size() == 2); REQUIRE(result.mask_rle_pairs.size() == 1);
+ REQUIRE(result.boxes.size() == 4); REQUIRE(result.mask_rle_pairs.size() == 3);
  CHECK(result.mask_rle_pairs[0].start == 0); CHECK(result.mask_rle_pairs[0].length == extent * extent);
  CHECK(result.boxes[0].mask_rle_pairs == 1); CHECK(result.boxes[1].mask_rle_pairs == 0);
  CHECK((result.boxes[1].flags & kAnnotationMask) != 0);
+ CHECK(result.mask_rle_pairs[1].start == 0); CHECK(result.mask_rle_pairs[1].length == extent * 8000);
+ CHECK(result.mask_rle_pairs[2].start == extent * 8000); CHECK(result.mask_rle_pairs[2].length == extent * 8000);
+ CHECK(result.boxes[2].mask_rle_pairs == 1); CHECK(result.boxes[3].mask_rle_pairs == 1);
+}
+
+
+namespace {
+NormalizedAnnotationReadView label_projection_fixture(std::uint64_t id, std::uint32_t width = 8) {
+ NormalizedAnnotationBuilder builder;
+ builder.images.push_back({id, 0, 1, width, 2, 0, 0});
+ NormalizedBox box;
+ box.x2 = box.y2 = 1; box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory;
+ box.annotation_id = id + 100; box.source_category_id = 1; box.source_ordinal = id * 3;
+ box.original_area = 3; box.mask_rle_pairs = 3;
+ builder.boxes.push_back(box); builder.mask_rle_pairs = {{0, 1}, {2, 1}, {4, 1}};
+ return NormalizedAnnotationReadView(fixture_index(builder));
+}
+}
+
+TEST_CASE("normalized label custody rejects unrelated backing for detached native spans", "[benchmark][pipeline][labels][resources]") {
+ CoconutNativeWorkspace workspace(CoconutImportLimits{});
+ CoconutRecord record; record.image_id = 1; record.width = record.height = 1;
+ CoconutPhysicalImage physical; physical.source = CoconutImageNamespace::CocoTrain; physical.image_id = 1;
+ auto lineage = std::make_shared<CoconutNativeLineage>(); lineage->component.source = physical.source;
+ workspace.borrow_support(record, {}, {1, 1}, std::make_shared<const int>(0));
+ auto native = workspace.finish(record, physical, {1, 1}, lineage, {});
+ auto read = CoconutNativeImage::read(native);
+ const auto ordinary = label_projection_fixture(1);
+ auto detached = read.view.storage();
+ detached.backing = ordinary.storage().backing;
+ CHECK_THROWS_WITH(BenchmarkLabelInput(NormalizedAnnotationReadView(detached), 0), "normalized annotation view does not belong to its backing");
+ REQUIRE_NOTHROW(BenchmarkLabelInput(ordinary, 0));
+ auto native_input = CoconutNativeImage::labels(native);
+ const std::weak_ptr<const CoconutNativeImage> lifetime = native;
+ read.owner.reset(); native.reset(); workspace.retire();
+ CHECK_FALSE(lifetime.expired());
+ CHECK(native_input.index().image(0).source_image_id == 1);
+ CHECK_FALSE(native_input.index().storage().backing);
+}
+
+TEST_CASE("owned label inputs join only their own geometry and reuse completed dependencies", "[benchmark][pipeline][labels]") {
+ BenchmarkCompilePipeline execution(1);
+ std::array<unsigned, 3> conversions{};
+ execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
+  [&](const auto&, auto id, const auto&) { ++conversions.at(id); });
+ const std::filesystem::path root("label-geometry-join");
+ const auto publication = execution.source_publication(root, {});
+ std::weak_ptr<NormalizedAnnotationBacking> pending;
+ {
+  auto input = label_projection_fixture(1);
+  pending = input.storage().backing;
+  execution.labels_ready(publication, 1, BenchmarkLabelInput(input, 0), "first", 1);
+ }
+ CHECK_FALSE(pending.expired()); CHECK_FALSE(execution.geometry(root, 1));
+ CHECK(execution.has_image_labels(root, 1, "first", 1));
+ CHECK_FALSE(execution.has_image_labels(root, 1, "first", 2));
+ auto second = label_projection_fixture(2);
+ publication.geometry_ready(2, {8, 2});
+ execution.labels_ready(publication, 2, BenchmarkLabelInput(second, 0), "second", 1);
+ auto ready = execution.wait_image_labels(root, 2, "second");
+ REQUIRE(ready); CHECK(conversions[2] == 1); CHECK(conversions[1] == 0);
+ CHECK(execution.has_image_labels(root, 2, "second", 1));
+ // Compiler fallback joins the exact product even after an earlier consumer read it.
+ execution.labels_ready(publication, 2, BenchmarkLabelInput(second, 0), "second", 1);
+ CHECK(execution.wait_image_labels(root, 2, "second") == ready); CHECK(conversions[2] == 1);
+ // Distinct annotation editions can share one physical image without replacing
+ // each other's canonical product or forcing the final compiler to convert again.
+ execution.labels_ready(publication, 2, BenchmarkLabelInput(second, 0), "alternate-edition", 1);
+ const auto alternate = execution.wait_image_labels(root, 2, "alternate-edition");
+ REQUIRE(alternate); CHECK(alternate != ready); CHECK(conversions[2] == 2);
+ execution.labels_ready(publication, 2, BenchmarkLabelInput(second, 0), "second", 1);
+ CHECK(execution.wait_image_labels(root, 2, "second") == ready); CHECK(conversions[2] == 2);
+ publication.geometry_ready(1, {8, 2});
+ const auto first = execution.wait_image_labels(root, 1, "first");
+ REQUIRE(first); CHECK(first->labels[0].annotation_id == 101); CHECK(first->labels[0].source_ordinal == 3);
+ CHECK(pending.expired()); CHECK(conversions[1] == 1);
+}
+
+TEST_CASE("independent labels share workers while one admitted conversion is held", "[benchmark][pipeline][labels]") {
+ const auto cpus = mmltk::common::system::allowed_cpu_set();
+ if (cpus.size() < 2) SKIP("requires two assigned CPUs");
+ BenchmarkCompilePipeline execution(2, cpus);
+ mmltk::testsupport::TestGate first("first admitted label conversion");
+ std::array<unsigned, 3> conversions{};
+ std::array<std::size_t, 3> lanes{};
+ execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
+  [&](const auto&, auto id, const auto&) {
+   ++conversions.at(id); lanes.at(id) = execution.current_lane();
+   if (id == 1) first.receipt().ArriveAndWait();
+  });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { first.Release(); execution.retire_attempt(); });
+ const std::filesystem::path root("parallel-labels");
+ const auto publication = execution.source_publication(root, {});
+ const auto one = label_projection_fixture(1), two = label_projection_fixture(2);
+ publication.geometry_ready(1, {8, 2}); publication.geometry_ready(2, {8, 2});
+ execution.labels_ready(publication, 1, BenchmarkLabelInput(one, 0), "one");
+ REQUIRE(first.WaitEntered(5s));
+ CHECK(execution.has_image_labels(root, 1, "one"));
+ execution.labels_ready(publication, 1, BenchmarkLabelInput(one, 0), "one");
+ execution.labels_ready(publication, 2, BenchmarkLabelInput(two, 0), "two");
+ REQUIRE(execution.wait_image_labels(root, 2, "two"));
+ CHECK_FALSE(execution.image_labels(root, 1, "one")); CHECK(lanes[1] != lanes[2]);
+ first.Release(); REQUIRE(execution.wait_image_labels(root, 1, "one"));
+ CHECK(conversions[1] == 1); CHECK(conversions[2] == 1);
+}
+
+TEST_CASE("label withdrawal retains executing input and releases queued custody", "[benchmark][pipeline][labels][resources]") {
+ enum class Retire { Original, Image, Source, Attempt, Cancellation };
+ auto retirement = Retire::Original;
+ bool running = false, fail_retired = false;
+ SECTION("queued original withdrawal") {}
+ SECTION("running original withdrawal") { running = true; }
+ SECTION("a failed retired original consumer cannot fail its replacement") { running = fail_retired = true; }
+ SECTION("queued physical image withdrawal") { retirement = Retire::Image; }
+ SECTION("running physical image withdrawal") { retirement = Retire::Image; running = true; }
+ SECTION("queued source withdrawal") { retirement = Retire::Source; }
+ SECTION("running source withdrawal") { retirement = Retire::Source; running = true; }
+ SECTION("queued attempt withdrawal") { retirement = Retire::Attempt; }
+ SECTION("running attempt withdrawal") { retirement = Retire::Attempt; running = true; }
+ SECTION("queued cancellation") { retirement = Retire::Cancellation; }
+ SECTION("running cancellation") { retirement = Retire::Cancellation; running = true; }
+ std::atomic<bool> cancelled{false};
+ BenchmarkCompilePipeline execution(1, {}, {}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ mmltk::testsupport::TestGate held("consumer owns its input");
+ std::atomic<unsigned> conversions{0};
+ execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
+  [&](const auto&, auto, const auto&) {
+   ++conversions;
+   if (running) held.receipt().ArriveAndWait();
+   if (fail_retired) throw std::runtime_error("retired conversion failed");
+  });
+ const std::filesystem::path root("retired-label-custody");
+ const auto publication = execution.source_publication(root, {});
+ publication.geometry_ready(1, {8, 2});
+ std::future<void> blocker, retiring;
+ if (!running) {
+  blocker = std::async(std::launch::async, [&] { execution.run(BenchmarkStage::Metadata, {}, [&](std::size_t) { held.receipt().ArriveAndWait(); }); });
+ }
+ const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); execution.retire_attempt(); });
+ if (!running) REQUIRE(held.WaitEntered(5s));
+ std::weak_ptr<NormalizedAnnotationBacking> custody;
+ {
+  auto input = label_projection_fixture(1); custody = input.storage().backing;
+  execution.labels_ready(publication, 1, BenchmarkLabelInput(input, 0), "old", 1);
+ }
+ if (running) REQUIRE(held.WaitEntered(5s));
+ CHECK_FALSE(custody.expired());
+ const auto before_withdrawal = execution.admission_generation();
+ std::promise<void> withdrawing;
+ retiring = std::async(std::launch::async, [&] {
+  withdrawing.set_value();
+  switch (retirement) {
+   case Retire::Original: execution.original_generation(root, 2, true); break;
+   case Retire::Image: execution.retire_image(root, 1); break;
+   case Retire::Source: execution.retire_source(root); break;
+   case Retire::Attempt: execution.retire_attempt(); break;
+   case Retire::Cancellation: cancelled.store(true); execution.retire_attempt(); break;
+  }
+ });
+ mmltk::testsupport::await_test_promise(withdrawing, "label withdrawal begins");
+ if (retirement == Retire::Original || retirement == Retire::Image || retirement == Retire::Source)
+  execution.wait_for_admission_change(before_withdrawal);
+ if (!running && retirement != Retire::Attempt && retirement != Retire::Cancellation) {
+  mmltk::testsupport::await_test_future(retiring, "queued input retires independently of unrelated CPU work");
+  CHECK(custody.expired()); CHECK(conversions == 0);
+ } else {
+  CHECK(retiring.wait_for(0ms) == std::future_status::timeout);
+  if (running) CHECK_FALSE(custody.expired());
+ }
+ held.Release();
+ if (retiring.valid()) mmltk::testsupport::await_test_future(retiring, "physical consumer settles before withdrawal returns");
+ if (blocker.valid()) {
+  try { mmltk::testsupport::await_test_future(blocker, "unrelated worker settles"); }
+  catch (const std::runtime_error&) { REQUIRE((retirement == Retire::Cancellation || retirement == Retire::Attempt)); }
+ }
+ CHECK(custody.expired()); CHECK_FALSE(execution.image_labels(root, 1, "old"));
+ if (retirement == Retire::Original) {
+  REQUIRE(execution.geometry(root, 1));
+  execution.run(BenchmarkStage::Metadata, {}, [](std::size_t) {});
+  fail_retired = false;
+  execution.original_generation(root, 2, false);
+  CHECK_FALSE(execution.labels_ready(publication, 1, BenchmarkLabelInput(label_projection_fixture(1), 0), "old", 1));
+  REQUIRE(execution.labels_ready(publication, 1, BenchmarkLabelInput(label_projection_fixture(1), 0), "old", 2));
+  CHECK_FALSE(execution.wait_image_labels(root, 1, "old", 1));
+  const auto replacement = execution.wait_image_labels(root, 1, "old", 2);
+  REQUIRE(replacement); CHECK(replacement->labels[0].annotation_id == 101);
+  CHECK(conversions == (running ? 2 : 1));
+ }
+ if (retirement == Retire::Image || retirement == Retire::Source) CHECK_FALSE(execution.geometry(root, 1));
+}
+
+TEST_CASE("stock original fallback keeps its captured generation across withdrawal", "[benchmark][pipeline][labels]") {
+ BenchmarkCompilePipeline execution(1);
+ unsigned conversions = 0;
+ execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
+  [&](const auto&, auto, const auto&) { ++conversions; });
+ const std::filesystem::path root("stock-original-labels");
+ CocoAnnotationSplit captured{false, 7, true, label_projection_fixture(1).storage()};
+ execution.original_generation(root, captured.generation, false);
+ auto physical = execution.source_publication(root, {});
+ physical.geometry_ready(1, {8, 2});
+ const std::string dependency("same-original-bytes");
+ REQUIRE_FALSE(execution.has_image_labels(root, 1, dependency, captured.generation));
+ // Withdrawal after the missing-input query cannot stamp the captured input
+ // with the replacement generation, even when the physical ticket is fresh.
+ execution.original_generation(root, 8, true);
+ physical = execution.source_publication(root, {});
+ CHECK_FALSE(execution.labels_ready(physical, 1, BenchmarkLabelInput(NormalizedAnnotationReadView(*captured.index), 0), dependency, captured.generation));
+ CHECK_FALSE(execution.wait_image_labels(root, 1, dependency, captured.generation));
+ CHECK(conversions == 0);
+ CocoAnnotationSplit replacement{false, 8, true, label_projection_fixture(1).storage()};
+ execution.original_generation(root, replacement.generation, false);
+ REQUIRE(execution.labels_ready(physical, 1, BenchmarkLabelInput(NormalizedAnnotationReadView(*replacement.index), 0), dependency, replacement.generation));
+ const auto ready = execution.wait_image_labels(root, 1, dependency, replacement.generation);
+ REQUIRE(ready); CHECK(conversions == 1);
+ CHECK(execution.has_image_labels(root, 1, dependency, replacement.generation));
+ CHECK_FALSE(execution.has_image_labels(root, 1, dependency, captured.generation));
+ CHECK_FALSE(execution.wait_image_labels(root, 1, dependency, captured.generation));
+ CHECK_FALSE(execution.labels_ready(physical, 1, BenchmarkLabelInput(NormalizedAnnotationReadView(*captured.index), 0), dependency, captured.generation));
+ CHECK(execution.wait_image_labels(root, 1, dependency, replacement.generation) == ready);
+ CHECK(conversions == 1);
+}
+
+TEST_CASE("label interval capacity reuses charged lanes and retires borrowed windows", "[benchmark][pipeline][labels][resources]") {
+ bool fail_borrower = false, cancel_borrower = false;
+ SECTION("successful borrowed window") {}
+ SECTION("exception retires borrowed physical capacity") { fail_borrower = true; }
+ SECTION("cancellation retires borrowed physical capacity") { cancel_borrower = true; }
+ std::atomic<bool> cancelled{false};
+ constexpr std::uint64_t target = 128U * 1024U;
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = target}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ std::array<std::size_t, 6> retained{};
+ execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
+  [&](const auto&, auto id, const BenchmarkLabelWorkspace& workspace) {
+   retained.at(id) = workspace.retained_bytes();
+   if (id == 4 && cancel_borrower) cancelled.store(true);
+   if (id == 4 && fail_borrower) throw std::runtime_error("label borrower failed");
+  });
+ const std::filesystem::path root("label-workspace");
+ const auto publication = execution.source_publication(root, {});
+ const auto publish = [&](std::uint64_t id) {
+  publication.geometry_ready(id, {8, 2});
+  execution.labels_ready(publication, id, BenchmarkLabelInput(label_projection_fixture(id), 0), std::to_string(id));
+ };
+ const auto join = [&](std::uint64_t id) { return execution.wait_image_labels(root, id, std::to_string(id)); };
+ publish(1); REQUIRE(join(1)); publish(2); REQUIRE(join(2));
+ CHECK(retained[1] == 0); CHECK(retained[2] > 0);
+ auto pressure = execution.reserve({target, 0}); // Admission retires real idle intervals first.
+ publish(3); CHECK_FALSE(execution.image_labels(root, 3, "3"));
+ pressure = {}; REQUIRE(join(3)); CHECK(retained[3] == 0);
+ auto producer = execution.reserve({target, 0});
+ const auto borrowed = [&] {
+  execution.with_unused_workspace(producer, 16384, [&] { publish(4); REQUIRE(join(4)); });
+ };
+ if (fail_borrower || cancel_borrower) {
+  CHECK_THROWS(borrowed());
+  cancelled.store(false); execution.retire_attempt();
+ } else borrowed();
+ // The lending window returned all borrowers while its producer remains charged.
+ REQUIRE(producer.try_resize_workspace(0, false)); producer = {};
+ if (!fail_borrower && !cancel_borrower) { publish(5); REQUIRE(join(5)); CHECK(retained[5] == 0); }
+}
+
+TEST_CASE("label projection preserves geometry provenance and present-empty masks", "[benchmark][labels][masks]") {
+ auto input = label_projection_fixture(7);
+ BenchmarkLabelWorkspace workspace;
+ const auto mismatch = compile_benchmark_image_labels(input, 0, {9, 2}, 16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, workspace);
+ CHECK(mismatch.labels.empty()); CHECK(mismatch.dropped == 1); CHECK(mismatch.width == 9);
+ NormalizedAnnotationBuilder builder;
+ builder.source = BenchmarkDatasetSource::kOpenImagesV7;
+ builder.images.push_back({7, 0, 1, 1, 1, 0, 0});
+ NormalizedBox box;
+ box.x2 = box.y2 = 1; box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory | kAnnotationCrowd | kAnnotationIgnore;
+ box.annotation_id = 43; box.source_category_id = 1; box.source_ordinal = 92; box.original_area = 0.25;
+ builder.boxes.push_back(box);
+ const auto normalized = NormalizedAnnotationReadView(fixture_index(builder));
+ const auto projected = compile_benchmark_image_labels(normalized, 0, {8, 2}, 16, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox, workspace);
+ REQUIRE(projected.labels.size() == 1); CHECK(projected.runs.empty()); CHECK(projected.dropped == 0);
+ const auto& label = projected.labels.front();
+ CHECK(label.flags == box.flags); CHECK(label.mask_rle_pairs == 0); CHECK(label.original_area == 4);
+ CHECK(label.annotation_id == 43); CHECK(label.source_category_id == 1); CHECK(label.source_ordinal == 92);
+ CHECK(label.bbox_y1 == 6); CHECK(label.bbox_y2 == 10);
+}
+
+TEST_CASE("required label joins surface failed geometry readers without a pixel drain", "[benchmark][pipeline][labels][failure]") {
+ mmltk::testsupport::ScopedTempDir root("label-geometry-failure");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images = {{1, 8, 2, 0, 0, 0}};
+ fs::remove(cached_image_path(images, 1));
+ BenchmarkCompilePipeline execution(1);
+ execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 16);
+ request.execution = &execution;
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ execution.register_split(writer, split);
+ const auto publication = execution.source_publication(images, {});
+ execution.labels_ready(publication, 1, BenchmarkLabelInput(label_projection_fixture(1), 0), "required");
+ publication({1});
+ CHECK_THROWS_AS(execution.wait_image_labels(images, 1, "required"), BenchmarkImageReadError);
+ CHECK_FALSE(execution.geometry(images, 1)); CHECK_FALSE(execution.image_labels(images, 1, "required"));
 }

@@ -86,6 +86,7 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     benchmark/benchmark_custom_recipe.cpp
     benchmark/coconut/coconut_recipe.cpp
     benchmark/benchmark_pipeline.cpp
+    benchmark/benchmark_labels.cpp
     benchmark/benchmark_progress.cpp
     benchmark/benchmark_staging.cpp
     benchmark/benchmark_storage.cpp
@@ -141,6 +142,7 @@ mmltk_register_private_headers(mmltk_backend_data
     benchmark/detail/benchmark_image_decoder.h
     benchmark/detail/benchmark_sampling.h
     benchmark/detail/benchmark_pipeline.h
+    benchmark/detail/benchmark_labels.h
     benchmark/detail/benchmark_writer.h
     detail/worker_queue.h
     compiler/detail/dataset_compiler_internal.h

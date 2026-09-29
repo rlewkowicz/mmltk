@@ -3,6 +3,7 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
+#include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
@@ -70,6 +71,7 @@ public:
   NormalizedAnnotationReadView view;
  };
  [[nodiscard]] static Read read(std::shared_ptr<const CoconutNativeImage>);
+ [[nodiscard]] static BenchmarkLabelInput labels(std::shared_ptr<const CoconutNativeImage>);
  [[nodiscard]] const CoconutNativeLineage& lineage() const noexcept { return *lineage_; }
  [[nodiscard]] const NormalizedImage& image() const noexcept { return image_; }
  [[nodiscard]] std::span<const NormalizedBox> boxes() const noexcept { return boxes_; }

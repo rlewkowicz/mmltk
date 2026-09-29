@@ -1,7 +1,5 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
-#include "src/backend/data/benchmark/detail/benchmark_annotations.h"
-#include "src/backend/data/detail/mask_rle_utils.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include <atomic>
@@ -41,16 +39,6 @@ struct PreparedBenchmarkSplit {
  std::vector<PackedInstance> labels;
  std::vector<RLEPair> rle_pairs;
 };
-struct BenchmarkLabelChunk {
- std::uint32_t width = 0, height = 0;
- std::uint64_t dropped = 0;
- std::vector<PackedInstance> labels;
- std::vector<RLEPair> runs;
-};
-[[nodiscard]] BenchmarkLabelChunk compile_benchmark_image_labels(const NormalizedAnnotationReadView&, std::size_t image,
- std::pair<std::uint32_t, std::uint32_t> dimensions, std::uint32_t resolution, mmltk::backend::imaging::resample::ImageResizeMode,
- dataset::MaskResizeScratch&, mmltk::common::concurrency::CancellationObservation = {});
-[[nodiscard]] PackedInstance benchmark_canvas_box(std::uint8_t class_id, float x1, float y1, float x2, float y2, const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox);
 struct BenchmarkWriteProgressEvent final {
  void* context = nullptr;
  void (*image_completed)(void*) = nullptr;
