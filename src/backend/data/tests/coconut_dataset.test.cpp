@@ -43,6 +43,8 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <latch>
+#include <thread>
 #include <limits>
 #include <memory>
 #include <nlohmann/json.hpp>
@@ -1529,6 +1531,9 @@ TEST_CASE("COCONut rejects physical COCO train validation reuse before publicati
  CHECK(file_bytes(config.output_dir / "train.bin") == previous);
 }
 TEST_CASE("physical archive structural repair retains one admitted acquisition through extraction", "[coconut][benchmark][download]") {
+ bool diagnostics = false;
+ SECTION("disabled diagnostics preserve structural repair") {}
+ SECTION("enabled diagnostics observe retained generations") { diagnostics = true; }
  ScopedTempDir root("coconut-physical-repair");
  LocalCoconutRecipe local(root.path());
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
@@ -1545,7 +1550,7 @@ TEST_CASE("physical archive structural repair retains one admitted acquisition t
  std::filesystem::remove(local.cache.source_indexes("coco") / (served.source.artifact.artifact_id + ".inventory.bin"));
  mmltk::testsupport::write_text_file(served.path, std::string(served.payload.size(), 'x'));
  unsigned physical_settlements = 0, failure_hashes = 0, cached_admissions = 0;
- config.trace = [&](std::string_view event, std::string_view fields) {
+ if (diagnostics) config.trace = [&](std::string_view event, std::string_view fields) {
   const auto facts = Json::parse(fields);
   if (facts.value("artifact", std::string{}) != served.source.artifact.artifact_id) return;
   if (event == "benchmark.download.complete") ++physical_settlements;
@@ -1554,8 +1559,8 @@ TEST_CASE("physical archive structural repair retains one admitted acquisition t
  };
  compile_benchmark_recipe(config, &catalog);
  CHECK(served.server.requests() == 1);
- CHECK(physical_settlements == 1);
- CHECK(failure_hashes == 1);
+ CHECK(physical_settlements == (diagnostics ? 1 : 0));
+ CHECK(failure_hashes == (diagnostics ? 1 : 0));
  CHECK(file_bytes(config.output_dir / "train.bin") == before);
  struct stat after{};
  REQUIRE(::stat(unaffected.c_str(), &after) == 0);
@@ -1564,8 +1569,8 @@ TEST_CASE("physical archive structural repair retains one admitted acquisition t
  const auto admissions_before = cached_admissions;
  compile_benchmark_recipe(config, &catalog);
  CHECK(served.server.requests() == 1);
- CHECK(physical_settlements == 1);
- CHECK(cached_admissions == admissions_before + 1);
+ CHECK(physical_settlements == (diagnostics ? 1 : 0));
+ CHECK(cached_admissions == admissions_before + (diagnostics ? 1 : 0));
  std::ranges::fill(served.payload, 'x');
  mmltk::testsupport::write_text_file(served.path, std::string(served.payload.size(), 'x'));
  std::filesystem::remove(local.cache.source_indexes("coco") / (served.source.artifact.artifact_id + ".inventory.bin"));
@@ -1624,8 +1629,16 @@ TEST_CASE("COCONut normalization observations are bounded with exact unknown-tot
  parquet_file(input.parquet_shards[0], rows);
  std::vector<std::uint64_t> observed;
  input.progress = [&](auto value) { observed.push_back(value); };
+ unsigned report_terminals = 0;
+ input.image_terminal = [&] { ++report_terminals; };
  REQUIRE(import_coconut_annotations(input).front().index().image_count() == 130);
  CHECK(observed == std::vector<std::uint64_t>{0, 64, 128, 130});
+ CHECK(report_terminals == 0);
+ SECTION("healthy metadata rows have no report settlement") {
+  input.metadata_only = true;
+  REQUIRE(import_coconut_annotations(input).front().index().image_count() == 130);
+  CHECK(report_terminals == 0);
+ }
  SECTION("disabled observation installs no callback") {
   const BenchmarkTraceSink silent;
   ProgressReporter reporter({}, silent);
@@ -2385,9 +2398,12 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  input.recovery = enabled ? &recovery : nullptr;
  if (enabled) input.originals = [&](CoconutImageNamespace, bool, std::stop_token) { return CoconutOriginalInput{indexed_originals, true, 11}; };
  std::uint64_t rejected = 0;
+ unsigned report_terminals = 0;
  input.rejected_object = [&](const auto&, const auto&, const auto&, auto, auto) { ++rejected; };
+ input.image_terminal = [&] { ++report_terminals; };
  parquet_file(input.parquet_shards[0], Json::array({hf_row(image_id, png(3, 3, pixels), segments)}));
  const auto result = import_coconut_annotations(input);
+ CHECK(report_terminals == (enabled ? 0U : 1U));
  REQUIRE(result.size() == 1);
  const auto& component = result.front();
  REQUIRE(component.index().image_count() == 1);
@@ -4825,10 +4841,14 @@ TEST_CASE("XL discovery resolves ready physical requests before later JSON parsi
 
 TEST_CASE("failed XL generations retire oversized backing before source repair", "[benchmark][coconut][pipeline]") {
  using namespace std::chrono_literals;
- bool invalid_png = false, pinned = false;
+ bool invalid_png = false, pinned = false, diagnostics = false;
  SECTION("valid JSON followed by malformed JSON") {}
  SECTION("malformed consumed mask after successful discovery") { invalid_png = true; }
- SECTION("matching pinned malformed input keeps its source failure") { pinned = true; }
+ SECTION("matching pinned malformed input keeps its source failure") {
+  pinned = true;
+  SECTION("without tracing") {}
+  SECTION("with tracing") { diagnostics = true; }
+ }
  ScopedTempDir root("xl-repair-retirement");
  LocalCoconutRecipe local(root.path());
  auto catalog = local.selected(CoconutValidation::Coconut);
@@ -4852,12 +4872,20 @@ TEST_CASE("failed XL generations retire oversized backing before source repair",
  std::atomic<bool> cancelled{false};
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut});
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ unsigned matched_digests = 0;
+ if (diagnostics) config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event == "benchmark.download.failure_sha256") {
+   const auto facts = Json::parse(fields);
+   if (facts.at("artifact") == artifact.artifact_id && facts.at("matches_expected") == true) ++matched_digests;
+  }
+ };
  auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog, nullptr, {}, {}, {.transient_bytes = 1, .descriptors = 26}); });
  const mmltk::testsupport::ScopedTestCleanup settle([&] { cancelled.store(true); server.ReleaseRequest(); });
  if (pinned) {
   REQUIRE(compiling.wait_for(10s) == std::future_status::ready);
   CHECK_THROWS(compiling.get());
   CHECK(server.requests() == 0);
+  CHECK(matched_digests == (diagnostics ? 1U : 0U));
  } else {
   REQUIRE(server.WaitRequest());
   CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
@@ -4867,6 +4895,47 @@ TEST_CASE("failed XL generations retire oversized backing before source repair",
   CHECK(file_bytes(path) == payload);
   CHECK(CompiledDataset::open(config.output_dir / "train.bin").image_entries().size() == 4);
  }
+ server.Check();
+}
+
+TEST_CASE("required release checksum read failures remain fatal independently of tracing", "[benchmark][coconut][download][trace]") {
+ bool diagnostics = false;
+ SECTION("without tracing") {}
+ SECTION("with tracing") { diagnostics = true; }
+ ScopedTempDir root("coconut-required-checksum");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local.selected(CoconutValidation::CoconutStock);
+ auto& release = *std::ranges::find(catalog.releases, CoconutEdition::Large, &CoconutReleaseComponent::edition);
+ auto& artifact = release.annotations.front();
+ const auto path = local.cache.source_downloads("coconut-" + std::string(release.name)) / artifact.filename;
+ const auto mask_path = local.cache.source_downloads("coconut-" + std::string(release.name)) / release.annotations.back().filename;
+ const auto original = file_bytes(path);
+ mmltk::backend::data::testsupport::HttpServer server(original);
+ artifact.url = server.url("required-checksum");
+ artifact.expected_sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
+ bool reached = false;
+ catalog.release_observer = [&](CoconutEdition edition, CoconutReleaseBoundary boundary) {
+  if (edition != CoconutEdition::Large || boundary != CoconutReleaseBoundary::MasksStarted) return;
+  // Metadata consumption has settled. Fail the actual mask import and make
+  // the required catalog-checksum read encounter a distinct local I/O error.
+  std::filesystem::remove(path);
+  std::filesystem::create_directory(path);
+  mmltk::testsupport::write_text_file(mask_path, std::string(std::filesystem::file_size(mask_path), 'x'));
+  reached = true;
+ };
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, true);
+ std::filesystem::create_directories(config.output_dir);
+ const auto previous = config.output_dir / "previous";
+ mmltk::testsupport::write_text_file(previous, "retained publication");
+ unsigned repaired = 0;
+ if (diagnostics) config.trace = [&](std::string_view event, std::string_view) { if (event == "benchmark.download.invalidated") ++repaired; };
+ CHECK_THROWS_WITH(compile_benchmark_recipe(config, &catalog), "cannot inspect digest input file");
+ CHECK(reached);
+ CHECK(repaired == 0);
+ CHECK(server.requests() == 0);
+ CHECK(std::filesystem::is_directory(path));
+ CHECK(file_bytes(previous) == "retained publication");
+ CHECK_FALSE(std::filesystem::exists(config.output_dir / "train.bin"));
  server.Check();
 }
 
@@ -6720,27 +6789,66 @@ TEST_CASE("COCONut failure reports batch append and flush best effort through un
  unsigned warnings = 0;
  ProgressReporter progress([&](const auto&) { ++warnings; throw std::runtime_error("ignored warning sink"); }, quiet);
  const auto report_path = root.path() / "failed.txt";
- bool unwritable = false;
+ bool unwritable = false, empty = false, concurrent = false, oversized = false;
  SECTION("append accepted records on exceptional exit") {}
  SECTION("failed report storage remains nonfatal") { unwritable = true; std::filesystem::create_directory(report_path); }
- if (!unwritable) mmltk::testsupport::write_text_file(report_path, "{\"historical\":true}\n");
+ SECTION("empty image completions never create a report") { empty = true; }
+ SECTION("concurrent image completions preserve every producer's order") { concurrent = true; }
+ SECTION("direct oversized records remain dirty through image settlement") { oversized = true; }
+ if (!unwritable && !empty) mmltk::testsupport::write_text_file(report_path, "{\"historical\":true}\n");
+ const unsigned producers = concurrent ? 4U : 1U;
+ const unsigned count = empty ? 0U : oversized ? 4U : 1024U / producers;
+ const std::string reason = oversized ? std::string(80U * 1024U, 'x') : "missing support";
  try {
   CoconutFailureReport report(root.path(), progress);
-  for (unsigned i = 0; i < 1024; ++i) report.reject(coco(7), 77, "base", i, 1, "missing support");
+  const auto reject = [&](unsigned producer) {
+   for (unsigned i = 0; i < count; ++i) {
+    report.reject(coco(7 + producer), 77, "base", i, producer + 1, reason);
+    if (concurrent || oversized) report.flush(); // Actual image-terminal boundary.
+   }
+  };
+  if (concurrent) {
+   std::latch start(1);
+   std::vector<std::jthread> writers;
+   {
+    const mmltk::testsupport::ScopedTestCleanup release([&] { start.count_down(); });
+    for (unsigned producer = 0; producer < producers; ++producer)
+     writers.emplace_back([&, producer] { start.wait(); reject(producer); });
+   }
+   writers.clear();
+  } else reject(0);
+  if (empty) {
+   for (unsigned image = 0; image < 1024; ++image) report.flush();
+   CHECK_FALSE(std::filesystem::exists(report_path));
+  }
+  if (oversized) {
+   // Oversized records bypass pending_; flush must still expose their bytes.
+   std::ifstream visible(report_path);
+   std::string line;
+   unsigned lines = 0;
+   while (std::getline(visible, line)) ++lines;
+   CHECK(lines == count + 1U);
+  }
   throw std::runtime_error("image cancellation");
  } catch (const std::runtime_error& error) { CHECK(std::string_view(error.what()) == "image cancellation"); }
  CHECK_NOTHROW(progress.flush());
- CHECK(warnings == 1);
+ CHECK(warnings == (empty ? 0 : 1));
+ if (empty) { CHECK_FALSE(std::filesystem::exists(report_path)); return; }
  if (!unwritable) {
   std::ifstream input(report_path);
   std::string line;
   REQUIRE(std::getline(input, line)); CHECK(Json::parse(line).at("historical") == true);
-  unsigned records = 0;
+  std::array<unsigned, 4> records{};
   while (std::getline(input, line)) {
    const auto record = Json::parse(line);
-   CHECK(record.at("object_id") == records++); CHECK(record.at("release_image_id") == 77); CHECK(record.at("reason") == "missing support");
+   const auto producer = record.at("category_id").get<unsigned>() - 1;
+   REQUIRE(producer < producers);
+   CHECK(record.at("object_id") == records[producer]++);
+   CHECK(record.at("image_id") == 7U + producer);
+   CHECK(record.at("release_image_id") == 77);
+   CHECK(record.at("reason") == reason);
   }
-  CHECK(records == 1024);
+  for (unsigned producer = 0; producer < producers; ++producer) CHECK(records[producer] == count);
  }
 }
 TEST_CASE("progress failure before commit differs from terminal notification failure", "[benchmark][coconut][publication]") {
@@ -6754,10 +6862,15 @@ TEST_CASE("progress failure before commit differs from terminal notification fai
  bool terminal = false;
  SECTION("pending pre-publication callback prevents the rename") {}
  SECTION("terminal callback fails after the successful rename") { terminal = true; }
+ std::vector<std::pair<std::uint64_t, bool>> publication_observations;
  config.progress = [&](const BenchmarkCompileProgress& value) {
+  if (value.phase == DatasetCompilePhase::Publishing) publication_observations.emplace_back(value.completed, std::filesystem::exists(config.output_dir / "train.bin"));
   if (value.phase == DatasetCompilePhase::Publishing && value.completed == (terminal ? 1U : 0U)) throw std::runtime_error("publication observer failure");
  };
  CHECK_THROWS_WITH(compile_benchmark_recipe(config, &catalog), "publication observer failure");
+ REQUIRE_FALSE(publication_observations.empty());
+ CHECK(publication_observations.back().first == (terminal ? 1U : 0U));
+ for (const auto& [completed, published] : publication_observations) CHECK(published == (completed == 1U));
  CHECK(std::filesystem::exists(previous) == !terminal);
  CHECK(std::filesystem::exists(config.output_dir / "train.bin") == terminal);
  if (terminal) CHECK(CompiledDataset::open(config.output_dir / "train.bin").header().num_images == 4);

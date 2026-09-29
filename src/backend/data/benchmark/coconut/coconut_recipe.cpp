@@ -15,7 +15,6 @@
 namespace mmltk::backend::data::benchmark_internal {
 struct CoconutReleaseInputs {
  std::unordered_map<std::string, DownloadResult> artifacts;
- std::unordered_map<std::string, std::string> failure_digests;
  std::shared_ptr<CoconutAnnotationRecords> records = std::make_shared<CoconutAnnotationRecords>();
  std::map<std::pair<CoconutEdition, CoconutImageNamespace>, CoconutComponent> components;
 };
@@ -268,13 +267,16 @@ CoconutFailureReport::CoconutFailureReport(const std::filesystem::path& cache_ro
 }
 CoconutFailureReport::~CoconutFailureReport() { flush(); }
 void CoconutFailureReport::flush_unlocked() {
+ if (!dirty_.load(std::memory_order_relaxed)) return;
  if (!pending_.empty()) {
   if (stream_) stream_.write(pending_.data(), static_cast<std::streamsize>(pending_.size()));
   pending_.clear();
  }
  if (stream_) stream_.flush();
+ dirty_.store(false, std::memory_order_release);
 }
 void CoconutFailureReport::flush() noexcept {
+ if (!dirty_.load(std::memory_order_acquire)) return;
  try { const std::lock_guard lock(mutex_); flush_unlocked(); } catch (...) {}
 }
 void CoconutFailureReport::reject(const CoconutPhysicalImage& image, std::uint64_t release_image_id, std::string_view release, std::uint64_t object_id,
@@ -290,8 +292,17 @@ void CoconutFailureReport::reject(const CoconutPhysicalImage& image, std::uint64
    constexpr std::size_t kBatchBytes = 64U * 1024U;
    if (record.size() > kBatchBytes - pending_.size()) flush_unlocked();
    if (stream_) {
-    if (record.size() >= kBatchBytes) stream_.write(record.data(), static_cast<std::streamsize>(record.size()));
-    else pending_.append(record);
+    if (record.size() >= kBatchBytes) {
+     dirty_.store(true, std::memory_order_release);
+     stream_.write(record.data(), static_cast<std::streamsize>(record.size()));
+    } else {
+     // One lazy batch allocation, reused until report destruction. The logical
+     // pending bound is 64 KiB; actual retained storage is pending_.capacity().
+     // JSON and serialized record storage remain local to each active producer.
+     if (pending_.capacity() < kBatchBytes) pending_.reserve(kBatchBytes);
+     pending_.append(record);
+     dirty_.store(true, std::memory_order_release);
+    }
    }
    writable = static_cast<bool>(stream_);
    warn = !std::exchange(warned_, true);
@@ -369,7 +380,6 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, parent, &reservations)
                  .front();
   retained.artifacts.insert_or_assign(artifact.artifact_id, result);
-  retained.failure_digests.erase(artifact.artifact_id);
   return result;
  };
  const auto sources = coconut_release_sources(release.edition);
@@ -528,15 +538,15 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
      const auto& artifact = release.annotations[i];
      auto download_request = make_download_request(cache, owner, artifact);
      bool matches_expected = false;
-     if (!artifact.expected_sha256.empty() || trace) try {
-      auto [digest, inserted] = retained.failure_digests.try_emplace(artifact.artifact_id);
-      if (inserted && std::filesystem::is_regular_file(download_request.destination))
-       digest->second = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(download_request.destination, [&] { return cancellation.requested(); }));
-      matches_expected = !artifact.expected_sha256.empty() && digest->second == artifact.expected_sha256;
-      if (!digest->second.empty()) trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] {
-       return nlohmann::json{{"artifact", artifact.artifact_id}, {"sha256", digest->second}, {"matches_expected", matches_expected}, {"reason", error.what()}};
+     const auto diagnose = [&] {
+      const auto& digest = download_failure_sha256(retained.artifacts.at(artifact.artifact_id), cancellation);
+      matches_expected = !artifact.expected_sha256.empty() && digest == artifact.expected_sha256;
+      trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] {
+       return nlohmann::json{{"artifact", artifact.artifact_id}, {"sha256", digest}, {"matches_expected", matches_expected}, {"reason", error.what()}};
       });
-     } catch (...) { throw_if_benchmark_cancelled(cancellation); }
+     };
+     if (!artifact.expected_sha256.empty()) diagnose();
+     else if (trace) try { diagnose(); } catch (...) { throw_if_benchmark_cancelled(cancellation); }
      if (!matches_expected) {
       // The failed importer and its row callbacks have unwound. Withdraw once
       // before replacing any artifact on which this release product depends.
@@ -891,7 +901,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
    for (const auto& object : image.omissions)
     failures.reject(inventory.physical, inventory.release_image_id, coconut_release_component(component.edition()).name, object.annotation_id, object.source_category_id,
      "thing segment remains without mask pixels or an authoritative bbox");
-   failures.flush();
+   if (!image.omissions.empty()) failures.flush();
    component_recovered = checked_add(component_recovered, image.objects.size(), "recovery count overflow");
    component_unresolved = checked_add(component_unresolved, image.unresolved, "recovery omission count overflow");
   }

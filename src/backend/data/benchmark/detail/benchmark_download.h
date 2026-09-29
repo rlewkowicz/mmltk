@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <exception>
 #include <optional>
 #include <string>
 #include <vector>
@@ -55,13 +56,20 @@ struct DownloadResult {
  std::filesystem::path path;
  std::uint64_t size = 0U;
  std::string identity;
- std::string failure_sha256;
+ struct FailureDigest {
+  std::string sha256;
+  std::exception_ptr error;
+ };
+ // Populated only after source failure, under the generation owner's custody.
+ // A failed read retains its original exception, including for required checks.
+ std::optional<FailureDigest> failure_digest;
  std::string etag;
  std::string last_modified;
  std::uint32_t attempts = 0U;
  bool resumed = false;
  bool cache_hit = false;
 };
+[[nodiscard]] const std::string& download_failure_sha256(DownloadResult&, mmltk::common::concurrency::CancellationObservation = {});
 [[nodiscard]] DownloadRequest make_download_request(const BenchmarkCacheLayout&, std::string_view, const CatalogArtifact&);
 struct DownloadReady {
  std::size_t request_index = 0;

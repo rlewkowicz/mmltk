@@ -135,13 +135,9 @@ void acquire_physical_archive(AdmittedRecipeArchive& admitted, const BenchmarkCa
  const auto diagnose = [&](std::string_view reason) {
   if (!trace) return;
   try {
-   if (!admitted.failure_digest) {
-    admitted.failure_digest.emplace();
-    if (std::filesystem::is_regular_file(request.destination))
-     *admitted.failure_digest = common_io::sha256_hex(common_io::sha256_file(request.destination, [&] { return cancellation.requested(); }));
-   }
-   if (!admitted.failure_digest->empty()) trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] {
-    return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", *admitted.failure_digest}, {"reason", reason}};
+   const auto& digest = download_failure_sha256(admitted.download, cancellation);
+   trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] {
+    return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", digest}, {"reason", reason}};
    });
   } catch (...) { throw_if_benchmark_cancelled(cancellation); }
  };
@@ -149,7 +145,6 @@ void acquire_physical_archive(AdmittedRecipeArchive& admitted, const BenchmarkCa
   diagnose(reason);
   invalidate_download_artifact(request, cancellation, trace, execution, inventory_handle);
   request.redownload = true;
-  admitted.failure_digest.reset();
  };
  if (!recovery_reason.empty()) {
   if (admitted.structural_attempts >= 3) {

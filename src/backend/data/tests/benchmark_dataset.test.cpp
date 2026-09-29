@@ -22,6 +22,7 @@
 #include <future>
 #include <iterator>
 #include <memory>
+#include <new>
 #include <limits>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -7663,6 +7664,49 @@ TEST_CASE("required label joins surface failed geometry readers without a pixel 
  CHECK_FALSE(execution.geometry(images, 1)); CHECK_FALSE(execution.image_labels(images, 1, "required"));
 }
 
+TEST_CASE("failed artifact digest custody follows the retained download generation", "[backend][data][benchmark][download][trace]") {
+ mmltk::testsupport::ScopedTempDir root("download-digest-custody");
+ const auto path = root.path() / "artifact.bin";
+ const auto first_bytes = make_payload(4096);
+ const auto second_bytes = make_payload(8192);
+ mmltk::testsupport::write_binary_file(path, first_bytes);
+ DownloadResult artifact{.path = path};
+ const auto expected = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(first_bytes));
+ REQUIRE(download_failure_sha256(artifact) == expected);
+ REQUIRE(artifact.failure_digest);
+ CHECK_FALSE(artifact.failure_digest->error);
+ std::filesystem::rename(path, root.path() / "retired.bin");
+ // No path remains to reopen; the owner and a retained copy reuse that success.
+ CHECK(download_failure_sha256(artifact) == expected);
+ auto retained = artifact;
+ CHECK(download_failure_sha256(retained) == expected);
+ mmltk::testsupport::write_binary_file(path, second_bytes);
+ artifact = DownloadResult{.path = path};
+ CHECK_FALSE(artifact.failure_digest);
+ CHECK(download_failure_sha256(artifact) == mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(second_bytes)));
+ CHECK(download_failure_sha256(retained) == expected);
+
+ DownloadResult failed{.path = root.path() / "missing.bin"};
+ CHECK_THROWS(download_failure_sha256(failed));
+ REQUIRE(failed.failure_digest);
+ const auto original_failure = failed.failure_digest->error;
+ REQUIRE(original_failure);
+ mmltk::testsupport::write_binary_file(failed.path, first_bytes);
+ // Optional callers may ignore this error, but the next required use must
+ // retain the same cause without another diagnostic read of this generation.
+ CHECK_THROWS(download_failure_sha256(failed));
+ CHECK(failed.failure_digest->error == original_failure);
+ failed = DownloadResult{.path = failed.path};
+ CHECK(download_failure_sha256(failed) == expected);
+ std::atomic<bool> cancelled{true};
+ failed = DownloadResult{.path = path};
+ CHECK_THROWS_WITH(download_failure_sha256(failed, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled)), "file digest cancelled");
+ cancelled.store(false);
+ CHECK_THROWS_WITH(download_failure_sha256(failed), "file digest cancelled");
+ // Exception custody also retains the allocation-failure type unchanged.
+ failed.failure_digest->error = std::make_exception_ptr(std::bad_alloc{});
+ CHECK_THROWS_AS(download_failure_sha256(failed), std::bad_alloc);
+}
 TEST_CASE("annotation repair reads failed payloads only for enabled diagnostics", "[backend][data][benchmark][download][trace]") {
  mmltk::testsupport::ScopedTempDir root("annotation-diagnostic-reads");
  const auto payload = make_payload(4096);

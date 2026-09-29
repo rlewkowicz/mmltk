@@ -725,6 +725,7 @@ public:
   } catch (...) { workspace.retire(); worker.retained.store(0, std::memory_order_relaxed); throw; }
   worker.retained.store(workspace.retained_bytes(), std::memory_order_relaxed);
   if (complete) {
+   if (!saved && !reused) settle_report(*complete);
    if (!saved) retain_image(position, complete); else complete_row();
    publish_labels(complete, publication);
   } else if (!normalize) complete_row();
@@ -910,10 +911,14 @@ private:
   complete_row();
  }
  void complete_row() {
-  if (request_.image_terminal) request_.image_terminal();
   const std::lock_guard lock(progress_mutex_);
   ++completed_rows_;
   if (request_.progress && completed_rows_ % kProgressQuantum == 0) request_.progress(completed_rows_);
+ }
+ void settle_report(const CoconutNativeImage& image) {
+  // Recovery omissions are reported later by the recipe. Metadata, retained
+  // products and healthy rows must not flush another producer's report bytes.
+  if (image.rejected().degenerate_boxes && !image.lineage().component.recovery_policy && request_.image_terminal) request_.image_terminal();
  }
  void publish_labels(std::shared_ptr<const CoconutNativeImage> image, const BenchmarkSourcePublication& publication) {
   if (!request_.execution) return;
@@ -977,6 +982,7 @@ private:
    if (request_.execution) request_.execution->for_each(BenchmarkStage::Recovery, batch.size(), demand, recover, *workspace);
    else for (std::size_t i = 0; i < batch.size(); ++i) recover(i);
    for (auto& native : batch) {
+    settle_report(*native->product);
     retain_image(native->position, native->product);
     publish_labels(std::move(native->product), native->publication);
    }

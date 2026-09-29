@@ -14,6 +14,7 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
 #include <optional>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -62,8 +63,6 @@ struct AdmittedRecipeArchive {
  DownloadResult download;
  unsigned structural_attempts = 0;
  std::uint64_t resolution_workspace = 0;
- // Empty string records an attempted diagnostic read that failed for this generation.
- std::optional<std::string> failure_digest;
 };
 enum class CoconutReleaseBoundary { MetadataConsumed, MasksStarted };
 // Private ordinary catalog facts are also used by bounded local release fixtures.
@@ -112,6 +111,8 @@ private:
  void flush_unlocked();
  std::ofstream stream_;
  std::string pending_;
+ // Fast path only; pending bytes and every dirty transition stay under mutex_.
+ std::atomic<bool> dirty_{false};
  std::mutex mutex_;
  bool attempted_ = false;
  bool warned_ = false;

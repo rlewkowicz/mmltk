@@ -333,11 +333,8 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
   (void)download_artifacts({request}, 1U, {}, [&](const auto& update) {
    transfers.push_back(update);
    totals.update(update, reporter);
-   const auto current = std::ranges::find(produced.back().sources, update.source, &data::BenchmarkSourceProgress::source);
-   REQUIRE(current != produced.back().sources.end());
-   REQUIRE(current->transfer);
-   CHECK(*current->transfer == update.transfer);
   });
+  reporter.flush(); // Settle this runtime's callback captures before returning.
  };
  DatasetSystem dataset{settings, [&] { return std::make_unique<AcquisitionDatasetRuntime>(work); }, [&](DatasetSystem::event_type event) {
   if (const auto* progress = std::get_if<DatasetProgress>(&event)) {
@@ -384,6 +381,21 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
    REQUIRE(observed.transfer);
    CHECK(observed.transfer->attempt == (retry ? 2U : 1U));
   }
+ // Each delivered source transfer is an ordered observation of the real HTTP
+ // producer; counter-only observations may coalesce before delivery.
+ std::size_t next_transfer = 0;
+ bool saw_first_attempt = false, saw_retry = false;
+ for (const auto& progress : delivered) {
+  const auto current = std::ranges::find(progress.sources, source, &data::BenchmarkSourceProgress::source);
+  if (current == progress.sources.end() || !current->transfer || current->activity.find("metadata") == std::string::npos) continue;
+  const auto found = std::find_if(transfers.begin() + next_transfer, transfers.end(), [&](const auto& value) { return value.transfer == *current->transfer; });
+  REQUIRE(found != transfers.end());
+  next_transfer = static_cast<std::size_t>(found - transfers.begin()) + 1;
+  if (current->transfer->attempt == 1U) { CHECK_FALSE(saw_retry); saw_first_attempt = true; }
+  if (current->transfer->attempt == 2U) { CHECK(saw_first_attempt); saw_retry = true; }
+ }
+ CHECK(saw_first_attempt);
+ CHECK(saw_retry == retry);
  CHECK(delivered.back().tracks.acquisition.completed == payload.size() * (mixed ? 2U : 1U));
  CHECK(delivered.back().tracks.acquisition.total == delivered.back().tracks.acquisition.completed);
  REQUIRE_FALSE(transfers.empty());

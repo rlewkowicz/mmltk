@@ -194,6 +194,8 @@ struct CoconutImportRequest {
  CoconutImportLimits limits;
  mmltk::common::concurrency::CancellationObservation cancellation;
  std::function<void(std::uint64_t)> progress;
+ // Settle reports for freshly normalized discarded objects at image completion;
+ // metadata, reused images and recovery-policy omissions produce no immediate report.
  std::function<void()> image_terminal;
  // Synchronous observation of discarded objects; report failures never reject an image.
  std::function<void(const CoconutPhysicalImage&, const CoconutRecord&, const CoconutSegment&, std::string_view, std::uint32_t recovery_policy)> rejected_object;

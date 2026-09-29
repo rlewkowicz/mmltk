@@ -27,6 +27,17 @@
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 namespace mmltk::backend::data::benchmark_internal {
+const std::string& download_failure_sha256(DownloadResult& artifact, mmltk::common::concurrency::CancellationObservation cancellation) {
+ if (!artifact.failure_digest) {
+  auto& memo = artifact.failure_digest.emplace();
+  try {
+   memo.sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(artifact.path, [&] { return cancellation.requested(); }));
+  } catch (...) { memo.error = std::current_exception(); }
+ }
+ const auto& memo = *artifact.failure_digest;
+ if (memo.error) std::rethrow_exception(memo.error);
+ return memo.sha256;
+}
 [[nodiscard]] DownloadRequest make_download_request(const BenchmarkCacheLayout& cache, const std::string_view source, const CatalogArtifact& artifact) {
  DownloadRequest request;
  request.artifact_id = artifact.artifact_id;
