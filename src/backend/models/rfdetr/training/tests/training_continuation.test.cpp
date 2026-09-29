@@ -471,9 +471,9 @@ TEST_CASE("Logical donor admission preserves original RLE support and empty-mask
  data::DatasetLoader loader(loader_config);
  const r::TrainingDonorDescriptor masked{0, 0, true}, box{1, 0, true}, empty{2, 0, true};
  const auto source = r::resolve_training_donor(loader, masked);
- const auto& instance = loader.label_data()[loader.label_index()[0].label_begin];
+ const auto& instance = loader.annotations(0).labels.front();
  CHECK(instance.raw_ignore());
- CHECK(source.support.data() == loader.rle_data() + instance.mask_rle_offset / sizeof(data::RLEPair));
+ CHECK(source.support.data() == loader.annotations(0).instance_rle(instance).data());
  const std::array expected_support{data::RLEPair{0, 2}, data::RLEPair{8, 1}};
  CHECK(std::ranges::equal(source.support, expected_support, [](const auto& a, const auto& b) { return a.start == b.start && a.length == b.length; }));
  CHECK(source.metadata.box == std::array<float, 4>{.375F, .375F, .5F, .5F});

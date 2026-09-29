@@ -116,9 +116,9 @@ struct AlignmentSample final {
   if (delivery.sample && is_sample(record.dataset_index)) {
    ground_truth.clear();
    const auto sample_index = static_cast<std::uint32_t>(record.dataset_index);
-   const auto& entry = loader.label_index()[sample_index];
-   for (std::size_t ordinal = 0; ordinal < entry.num_instances; ++ordinal) {
-    const auto& packed = loader.label_data()[entry.label_begin + ordinal];
+   const auto entry = loader.annotations(sample_index);
+   for (std::size_t ordinal = 0; ordinal < entry.labels.size(); ++ordinal) {
+    const auto& packed = entry.labels[ordinal];
     Prediction gt;
     gt.image_id = static_cast<int>(record.image_id);
     // GT is expressed in the producing sample catalog, while metrics
@@ -129,7 +129,7 @@ struct AlignmentSample final {
     gt.mask.width = loader.image_width();
     gt.mask.height = loader.image_height();
     for (std::size_t run = 0; run < packed.mask_rle_pairs; ++run) {
-     const auto pair = loader.rle_data()[packed.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair) + run];
+     const auto pair = entry.instance_rle(packed)[run];
      gt.mask.runs.emplace_back(pair.start, pair.length);
      gt.mask.area += pair.length;
     }
@@ -408,6 +408,12 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
    samples.push_back(selected);
   }
   std::ranges::sort(samples);
+  std::size_t ordinal = 0, selected = 0;
+  for (const auto slot : loader->eligible_slots()) {
+   if (selected == samples.size()) break;
+   if (samples[selected] == ordinal) samples[selected++] = slot;
+   ++ordinal;
+  }
   if (delivery.samples_selected) delivery.samples_selected(samples, loader->class_catalog());
  }
  ValidationRunResult result;

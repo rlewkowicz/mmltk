@@ -11,6 +11,7 @@
 #include <ranges>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "src/common/concurrency/cancellation_observation.h"
 #include "src/backend/data/compiled/compiled_format.h"
@@ -21,14 +22,8 @@
 namespace mmltk::backend::data {
 struct CompiledFileSections {
  size_t index_offset = 0;
- size_t label_offset = 0;
- size_t rle_offset = 0;
- size_t pixel_offset = 0;
  size_t expected_index_bytes = 0;
- size_t label_bytes = 0;
- size_t label_count = 0;
- size_t rle_region_bytes = 0;
- size_t pixel_blob_size = 0;
+ FileLayout layout;
 };
 struct CompiledDatasetInfo {
  std::filesystem::path path;
@@ -46,7 +41,7 @@ inline void validate_compiled_header(const FileHeader& header) {
   throw std::runtime_error("compiled dataset format " + std::to_string(header.version) + " is unsupported; expected format " + std::to_string(FORMAT_VERSION) + "; recompile the dataset");
  }
  if (!std::ranges::all_of(header._reserved, [](std::uint8_t value) { return value == 0U; })) throw std::runtime_error("compiled header reserved fields are invalid");
- if (header.num_images == 0U || header.image_width == 0U || header.image_height == 0U || header.channels == 0U) { throw std::runtime_error("compiled file has invalid image dimensions"); }
+ if (header.num_images == 0U || header.num_images > header.num_slots || header.image_width == 0U || header.image_height == 0U || header.channels == 0U) { throw std::runtime_error("compiled file has invalid image dimensions"); }
  if (header.num_classes == 0U || header.num_classes > MAX_CLASSES) { throw std::runtime_error("compiled file has invalid class count"); }
  if (header.max_instances_per_image > std::numeric_limits<std::uint16_t>::max()) { throw std::runtime_error("compiled file maximum instance count exceeds the index representation"); }
  if (header.image_width > MAX_IMAGE_EXTENT || header.image_height > MAX_IMAGE_EXTENT || header.channels != 3U ||
@@ -71,36 +66,11 @@ inline void throw_if_compiled_validation_cancelled(const size_t index, mmltk::co
  if ((index & 4095U) == 0U && cancel_requested.requested()) { throw std::runtime_error("dataset compilation cancelled"); }
 }
 inline CompiledFileSections validate_compiled_file_sections(const FileHeader& header, size_t file_size) {
- const auto index_offset = mmltk::common::math::checked_cast<size_t>(header.index_offset, "index offset overflow");
- const auto label_offset = mmltk::common::math::checked_cast<size_t>(header.label_offset, "label offset overflow");
- const auto rle_offset = mmltk::common::math::checked_cast<size_t>(header.mask_rle_offset, "RLE offset overflow");
- const auto pixel_offset = mmltk::common::math::checked_cast<size_t>(header.pixel_offset, "pixel offset overflow");
- const auto total_file_size = mmltk::common::math::checked_cast<size_t>(header.total_file_size, "file size overflow");
- if (total_file_size != file_size) { throw std::runtime_error("compiled file size does not match header"); }
- if (index_offset != sizeof(FileHeader) || pixel_offset < index_offset || label_offset < pixel_offset || rle_offset < label_offset || total_file_size < rle_offset) {
-  throw std::runtime_error("compiled file layout is invalid");
- }
- const auto layout = compute_pixel_layout(header.num_images, mmltk::common::math::checked_cast<size_t>(header.image_stride, "image stride overflow"));
- const auto expected_index_bytes = layout.index_size;
- if (pixel_offset != layout.pixel_offset) { throw std::runtime_error("compiled file index or pixel alignment is invalid"); }
- const size_t label_bytes = rle_offset - label_offset;
- if (label_bytes % sizeof(PackedInstance) != 0) { throw std::runtime_error("label block is not aligned to PackedInstance"); }
- const size_t pixel_blob_size = label_offset - pixel_offset;
- const auto expected_pixel_blob_size = layout.pixel_blob_size;
- if (pixel_blob_size != expected_pixel_blob_size) { throw std::runtime_error("compiled pixel blob size mismatch"); }
- const size_t rle_region_bytes = total_file_size - rle_offset;
- if (rle_region_bytes % sizeof(RLEPair) != 0U) { throw std::runtime_error("compiled RLE block is not aligned to RLEPair"); }
- return CompiledFileSections{
-  index_offset,
-  label_offset,
-  rle_offset,
-  pixel_offset,
-  expected_index_bytes,
-  label_bytes,
-  label_bytes / sizeof(PackedInstance),
-  rle_region_bytes,
-  pixel_blob_size,
- };
+ validate_compiled_header(header);
+ const auto layout = compute_file_layout(header.num_slots, mmltk::common::math::checked_cast<size_t>(header.image_stride, "image stride overflow"));
+ if (header.total_file_size != file_size || header.total_file_size != layout.total_size || header.index_offset != layout.index_offset || header.data_offset != layout.data_offset)
+  throw std::runtime_error("compiled fixed slot layout or file size is invalid");
+ return {layout.index_offset, layout.index_size, layout};
 }
 // Field checks have one owner. Producers use these while copying/encoding;
 // mapped readers use the fused admission below before exposing bulk views.
@@ -108,7 +78,7 @@ class CompiledRecordChecks final {
 public:
  static void image(const ImageEntry& entry, std::size_t position = 0) {
   if (!entry.original_width || !entry.original_height || entry.has_source_image_id > 1U || entry.source > AnnotationSource::CoconutObjects365V2 ||
-      (!entry.has_source_image_id && entry.source_image_id) || entry._reserved)
+      (!entry.has_source_image_id && entry.source_image_id) || !std::ranges::all_of(entry._reserved, [](auto value) { return value == 0; }))
    throw std::runtime_error("compiled original image dimensions are invalid at image " + std::to_string(position));
   if (entry.source != AnnotationSource::Generic && entry.has_source_image_id != 1U) throw std::runtime_error("compiled benchmark image lacks source identity");
  }
@@ -133,42 +103,47 @@ public:
   return std::size_t{pair.start} + pair.length;
  }
 };
-// The consumer constructs its required metadata in this traversal. Each image,
-// label and run is admitted exactly once, including present-empty masks.
-template <std::ranges::random_access_range ImageRange, class ImageConsumer>
- requires std::ranges::sized_range<ImageRange>
-[[nodiscard]] inline bool admit_compiled_records(const ImageRange& index, std::span<const PackedInstance> labels, std::span<const RLEPair> runs, const FileHeader& header, ImageConsumer&& consume,
+// Producers and readers admit the same per-image payload, with local run offsets.
+[[nodiscard]] inline bool admit_compiled_annotations(const ImageEntry& entry, ImageAnnotations annotations, const FileHeader& header, std::size_t slot = 0,
  mmltk::common::concurrency::CancellationObservation cancellation = {}) {
- if (index.size() != header.num_images) throw std::runtime_error("compiled index entry count does not match header");
+ CompiledRecordChecks::image(entry, slot);
+ if (!entry.eligible() || entry.num_instances > header.max_instances_per_image || annotations.labels.size() != entry.num_instances || annotations.runs.size() != entry.num_runs ||
+     annotation_layout(entry.num_instances, entry.num_runs).used_bytes != entry.label_bytes)
+  throw std::runtime_error("compiled annotation counts differ at slot " + std::to_string(slot));
  const auto pixels = mmltk::common::math::checked_multiply<std::size_t>(header.image_width, header.image_height, "compiled mask size overflow");
- std::size_t label_offset = 0, run_offset = 0;
+ std::size_t consumed = 0;
  bool masks = false;
- for (std::size_t i = 0; i < index.size(); ++i) {
+ for (std::size_t i = 0; i < annotations.labels.size(); ++i) {
   throw_if_compiled_validation_cancelled(i, cancellation);
-  const auto& entry = index[i];
-  CompiledRecordChecks::image(entry, i);
-  if (entry.pixel_offset != header.pixel_offset + std::uint64_t{i} * header.image_stride) throw std::runtime_error("compiled pixel index is inconsistent at image " + std::to_string(i));
-  if (entry._pad || entry.num_instances > header.max_instances_per_image || entry.label_offset != label_offset * sizeof(PackedInstance) ||
-      entry.label_bytes != std::uint32_t{entry.num_instances} * sizeof(PackedInstance))
-   throw std::runtime_error("compiled label index is inconsistent at image " + std::to_string(i));
-  if (label_offset > labels.size() || entry.num_instances > labels.size() - label_offset) throw std::runtime_error("compiled label span is out of bounds at image " + std::to_string(i));
-  consume(entry);
-  for (const auto& label : labels.subspan(label_offset, entry.num_instances)) {
-   throw_if_compiled_validation_cancelled(label_offset, cancellation);
-   const auto begin = run_offset;
-   const auto end = CompiledRecordChecks::label(label, header.num_classes, runs.size_bytes(), run_offset, entry.source, label_offset);
-   masks = masks || label.has_mask();
-   std::size_t previous_end = 0;
-   for (; run_offset < end; run_offset += sizeof(RLEPair)) {
-    throw_if_compiled_validation_cancelled(run_offset / sizeof(RLEPair), cancellation);
-    previous_end = CompiledRecordChecks::run(runs[run_offset / sizeof(RLEPair)], previous_end, pixels, label_offset, (run_offset - begin) / sizeof(RLEPair));
-   }
-   ++label_offset;
+  const auto& label = annotations.labels[i];
+  const auto end = CompiledRecordChecks::label(label, header.num_classes, annotations.runs.size_bytes(), consumed, entry.source, i);
+  masks = masks || label.has_mask();
+  std::size_t previous_end = 0;
+  for (; consumed < end; consumed += sizeof(RLEPair)) {
+   throw_if_compiled_validation_cancelled(consumed / sizeof(RLEPair), cancellation);
+   previous_end = CompiledRecordChecks::run(annotations.runs[consumed / sizeof(RLEPair)], previous_end, pixels, i, consumed / sizeof(RLEPair));
   }
  }
- if (label_offset != labels.size()) throw std::runtime_error("compiled label index does not reference the complete label block");
- if (run_offset != runs.size_bytes()) throw std::runtime_error("compiled label metadata does not reference the complete RLE block");
+ if (consumed != annotations.runs.size_bytes()) throw std::runtime_error("compiled image has unreferenced mask runs");
  return masks;
+}
+inline void set_annotation_extent(ImageEntry& entry, std::size_t labels, std::size_t runs, std::string_view identity) {
+ try {
+  const auto payload = annotation_layout(labels, runs);
+  entry.num_instances = mmltk::common::math::checked_cast<std::uint16_t>(labels, "compiled instance count overflow");
+  entry.num_runs = mmltk::common::math::checked_cast<std::uint32_t>(runs, "compiled run count overflow");
+  entry.label_bytes = mmltk::common::math::checked_cast<std::uint32_t>(payload.used_bytes, "compiled label size overflow");
+ } catch (const std::exception& error) { throw std::runtime_error("image " + std::string(identity) + ": " + error.what()); }
+}
+inline void write_compiled_annotations(const mmltk::common::io::FileHandle& file, const FileLayout& layout, std::uint32_t slot, const ImageEntry& entry, ImageAnnotations annotations) {
+ const auto payload = annotation_layout(entry.num_instances, entry.num_runs);
+ if (annotations.labels.size() != entry.num_instances || annotations.runs.size() != entry.num_runs || entry.label_bytes != payload.used_bytes)
+  throw std::runtime_error("compiled annotation write extent differs");
+ const auto offset = layout.label_offset(slot);
+ file.pwrite_all(annotations.labels.data(), annotations.labels.size_bytes(), offset);
+ const std::uint64_t zero = 0;
+ file.pwrite_all(&zero, payload.run_offset - annotations.labels.size_bytes(), offset + annotations.labels.size_bytes());
+ file.pwrite_all(annotations.runs.data(), annotations.runs.size_bytes(), offset + payload.run_offset);
 }
 inline catalog::ClassCatalog compiled_class_catalog(const FileHeader& header) {
  std::vector<std::string> names;

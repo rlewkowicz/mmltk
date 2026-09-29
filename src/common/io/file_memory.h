@@ -31,6 +31,8 @@ public:
  [[nodiscard]] int get() const noexcept;
  [[nodiscard]] std::size_t size() const;
  void preallocate(std::size_t bytes) const;
+ void resize_sparse(std::size_t bytes) const;
+ void allocate_range(std::size_t offset, std::size_t bytes) const;
  void pwrite_all(const void* source, std::size_t bytes, std::size_t offset) const;
  void pread_all(void* destination, std::size_t bytes, std::size_t offset) const;
  void advise(std::size_t offset, std::size_t bytes, int advice) const;

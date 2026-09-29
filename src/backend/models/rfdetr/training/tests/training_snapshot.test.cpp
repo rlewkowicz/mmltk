@@ -49,7 +49,7 @@ TEST_CASE("Training dataset identity uses bounded metadata without opening image
  CHECK(r::training_dataset_identity(header, generation, "resolved-model") != identity);
  --generation.modified_nanoseconds;
  CHECK(r::training_dataset_identity(header, generation, "different-model") != identity);
- ++header.label_offset;
+ ++header.data_offset;
  CHECK(r::training_dataset_identity(header, generation, "resolved-model") != identity);
 }
 using Access = r::testsupport::TrainingSnapshotTestAccess;

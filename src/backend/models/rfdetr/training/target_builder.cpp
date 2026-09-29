@@ -605,8 +605,8 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
  auto& counts = scratch.counts;
  int64_t maximum_instances = 0;
  for (size_t image_pos = 0; image_pos < batch.num_images; ++image_pos) {
-  const auto& entry = batch.label_index[batch.image_indices[image_pos]];
-  maximum_instances += static_cast<int64_t>(entry.num_instances);
+  const auto entry = batch.annotations(image_pos);
+  maximum_instances += static_cast<int64_t>(entry.labels.size());
  }
  if (augmentation_plan != nullptr && augmentation_plan->copy_paste_enabled) { maximum_instances += static_cast<int64_t>(batch.num_images); }
  scratch.ensure_instance_capacity(std::max<int64_t>(maximum_instances, 1));
@@ -651,7 +651,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
   for (size_t image_pos = 0; image_pos < batch.num_images; ++image_pos) {
    const uint32_t dataset_index = batch.image_indices[image_pos];
    const auto image_key = batch.draw_keys.empty() ? static_cast<std::uint64_t>(dataset_index) : batch.draw_keys[image_pos];
-   const auto& entry = batch.label_index[dataset_index];
+   const auto entry = batch.annotations(image_pos);
    auto* image_plan = augmentation_plan != nullptr ? &augmentation_plan->images[image_pos] : nullptr;
    if (image_plan != nullptr) {
     image_plan->cache_source_ordinal = -1;
@@ -665,13 +665,11 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
    const int64_t image_offset = total_instances;
    int64_t retained_candidates = 0;
    image_ids[static_cast<int64_t>(image_pos)] = static_cast<int64_t>(dataset_index) + 1;
-   for (int64_t instance_index = 0; instance_index < static_cast<int64_t>(entry.num_instances); ++instance_index) {
-    const auto& instance = batch.labels[static_cast<size_t>(entry.label_begin) + static_cast<size_t>(instance_index)];
+   for (int64_t instance_index = 0; instance_index < static_cast<int64_t>(entry.labels.size()); ++instance_index) {
+    const auto& instance = entry.labels[static_cast<size_t>(instance_index)];
     if (instance.is_crowd()) continue;
     if (require_masks && !instance.has_mask()) throw std::runtime_error("segmentation training requires decodable masks for every instance");
-    if (instance.mask_rle_pairs != 0 && batch.rle_pairs == nullptr) throw std::runtime_error("mask_rle storage is missing");
-    const auto runs = instance.mask_rle_pairs != 0 ? std::span{batch.rle_pairs + instance.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair), static_cast<std::size_t>(instance.mask_rle_pairs)}
-                                                   : std::span<const mmltk::backend::data::RLEPair>{};
+    const auto runs = entry.instance_rle(instance);
     const AugmentationMappedInstance mapped = map_augmentation_instance(instance, image_width, image_height, image_plan, runs);
     if (!mapped.visible) {
 #if MMLTK_ENABLE_PROFILING

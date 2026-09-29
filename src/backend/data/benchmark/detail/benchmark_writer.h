@@ -30,18 +30,20 @@ struct EncodedImageRecord {
  std::uint64_t source_image_id = 0;
  std::uint32_t source_width = 0;
  std::uint32_t source_height = 0;
- std::uint32_t first_label = 0;
  std::uint16_t label_count = 0;
  std::uint16_t source_index = 0;
  AnnotationSource annotation_source = AnnotationSource::Generic;
+};
+struct PreparedBenchmarkLabels {
+ std::shared_ptr<const BenchmarkLabelChunk> chunk;
+ std::uint64_t ordinal_base = 0;
 };
 struct PreparedBenchmarkSplit {
  std::string name;
  std::vector<std::string> class_names;
  std::vector<CachedImageSource> sources;
  std::vector<EncodedImageRecord> images;
- std::vector<PackedInstance> labels;
- std::vector<RLEPair> rle_pairs;
+ std::vector<PreparedBenchmarkLabels> annotations;
 };
 // Owns immutable image chunks through their single final checked placement.
 // Callers can inspect the plan, but cannot mutate admitted records or forge a seal.
@@ -70,19 +72,9 @@ private:
  void mutable_records() const;
  void finish(mmltk::common::concurrency::CancellationObservation);
  PreparedBenchmarkSplit split_;
- struct Placement {
-  std::shared_ptr<const BenchmarkLabelChunk> chunk;
-  std::uint64_t ordinal_base = 0;
-  std::size_t first_run = 0;
- };
- std::vector<Placement> placements_;
- std::vector<ImageEntry> index_;
  std::size_t labels_ = 0, runs_ = 0;
- std::uint32_t maximum_ = 0;
  std::uint32_t resolution_ = 0;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode_{};
- FileLayout layout_{};
- FileHeader header_{};
  std::shared_ptr<const catalog::ClassCatalog> catalog_;
  bool placement_started_ = false, materialized_ = false;
  bool sealed_ = false;
@@ -116,7 +108,7 @@ struct BenchmarkWriteRequest {
  BenchmarkImageReadObserver image_opened{};
  BenchmarkCompilePipeline* execution = nullptr;
 };
-// Membership and physical pixel storage settle before annotations. Calls on different
+// Physical slots are stable across sparse growth. Calls on different
 // slots may overlap; each lane has exclusive reusable decoder/resizer scratch.
 // The owner must drain pixel calls before finalization, repair, or destruction.
 struct BenchmarkPixelInput;
@@ -126,6 +118,9 @@ public:
  ~BenchmarkSplitWriter();
  BenchmarkSplitWriter(const BenchmarkSplitWriter&) = delete;
  BenchmarkSplitWriter& operator=(const BenchmarkSplitWriter&) = delete;
+ // Slot allocation and label publication are independent of pixel readiness.
+ [[nodiscard]] std::uint32_t allocate_slot(EncodedImageRecord, const CachedImageSource&);
+ void write_labels(std::uint32_t slot, ImageEntry entry, ImageAnnotations, std::size_t lane = 0, std::uint64_t ordinal_base = 0);
  void prepare_lanes(std::size_t);
  void retire_scratch(std::size_t) noexcept;
  [[nodiscard]] std::shared_ptr<BenchmarkPixelInput> prepare_pixel(
@@ -145,8 +140,7 @@ public:
  [[nodiscard]] bool image_complete(std::size_t slot) const;
  [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> dimensions(std::size_t slot) const;
  [[nodiscard]] std::size_t completed() const noexcept;
- // Final membership may only remove slots, preserving canonical order. This
- // performs one forward bounded compaction only when quarantine shrinks it.
+ // Final membership publishes eligibility without moving healthy pixel or label slots.
  [[nodiscard]] BenchmarkSealedSplit seal(const BenchmarkWriteRequest&, BenchmarkSplitAssembly* = nullptr);
  void finish(const BenchmarkWriteRequest&);
 

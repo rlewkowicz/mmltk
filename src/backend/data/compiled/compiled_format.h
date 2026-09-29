@@ -11,12 +11,11 @@
 #include "src/backend/data/compiled/compiled_format_limits.h"
 namespace mmltk::backend::data {
 inline constexpr uint64_t MAGIC = 0x46415354'4C445232ULL;
-inline constexpr uint32_t FORMAT_VERSION = 9;
+inline constexpr uint32_t FORMAT_VERSION = 10;
 inline constexpr size_t PAGE_SIZE = 4096;
 inline constexpr size_t HUGE_PAGE_SIZE = size_t{2} * 1024 * 1024;
 using PackedCoordinate = float;
 inline constexpr std::uint32_t MAX_IMAGE_EXTENT = 32767U;
-inline size_t align_up(size_t val, size_t alignment) { return (val + alignment - 1) & ~(alignment - 1); }
 inline constexpr std::uint8_t kAnnotationMask = 1U, kAnnotationCrowd = 2U, kAnnotationIgnore = 4U, kAnnotationId = 8U, kAnnotationCategory = 16U;
 inline constexpr std::uint8_t kAnnotationFlags = kAnnotationMask | kAnnotationCrowd | kAnnotationIgnore | kAnnotationId | kAnnotationCategory;
 struct __attribute__((packed)) PackedInstance {
@@ -67,20 +66,21 @@ inline std::string decode_open_images_category(std::uint64_t encoded) {
  return mid;
 }
 static_assert(sizeof(PackedInstance) == 60);
+enum class ImageStatus : std::uint8_t { Inactive = 0, Eligible = 1 };
 struct __attribute__((packed)) ImageEntry {
- uint64_t pixel_offset;
- uint32_t label_offset;
- uint16_t num_instances;
- uint16_t _pad;
- uint32_t label_bytes;
- uint32_t original_width;
- uint32_t original_height;
+ uint16_t num_instances = 0;
+ ImageStatus status = ImageStatus::Inactive;
  std::uint8_t has_source_image_id = 0;
+ uint32_t label_bytes = 0;
+ uint32_t num_runs = 0;
+ uint32_t original_width = 0;
+ uint32_t original_height = 0;
  AnnotationSource source = AnnotationSource::Generic;
- std::uint16_t _reserved = 0;
+ std::array<std::uint8_t, 3> _reserved{};
  std::uint64_t source_image_id = 0;
+ [[nodiscard]] bool eligible() const noexcept { return status == ImageStatus::Eligible; }
 };
-static_assert(sizeof(ImageEntry) == 40, "ImageEntry must be 40 bytes");
+static_assert(sizeof(ImageEntry) == 32);
 struct SourceCategoryIdentity {
  enum class Kind : std::uint8_t { Missing, Numeric, OpenImagesMid };
  Kind kind = Kind::Missing;
@@ -94,23 +94,22 @@ struct __attribute__((packed)) FileHeader {
  uint64_t magic;
  uint32_t version;
  uint32_t num_images;
+ uint32_t num_slots;
  uint32_t image_width;
  uint32_t image_height;
  uint32_t channels;
  uint32_t num_classes;
  uint64_t index_offset;
- uint64_t label_offset;
- uint64_t pixel_offset;
- uint64_t mask_rle_offset;
+ uint64_t data_offset;
  uint64_t total_file_size;
  uint64_t image_stride;
  std::array<std::array<char, 32>, MAX_CLASSES> class_names{};
  uint32_t max_instances_per_image;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
- std::array<uint8_t, 51> _reserved{};
+ std::array<uint8_t, 55> _reserved{};
 };
 inline constexpr std::size_t COMPILED_CLASS_NAME_CAPACITY = FileHeader{}.class_names[0].size() - 1U;
-static_assert(sizeof(FileHeader) == 8328, "FileHeader must preserve the on-disk layout");
+static_assert(sizeof(FileHeader) == 8320, "Format 10 header layout changed");
 struct __attribute__((packed)) RLEPair {
  uint32_t start;
  uint32_t length;

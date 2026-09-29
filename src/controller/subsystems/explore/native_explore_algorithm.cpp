@@ -492,6 +492,7 @@ namespace rfdetr = mmltk::backend::models::rfdetr;
  mix(header.image_width);
  mix(header.image_height);
  mix(header.num_images);
+ mix(header.num_slots);
  mix(header.num_classes);
  for (const auto& summary : summaries) {
   mix(summary.classes);
@@ -559,7 +560,7 @@ public:
    mmltk::backend::imaging::raster::color::class_color(static_cast<int>(index), static_cast<int>(classes.size()), target.color[0], target.color[1], target.color[2]);
   }
   ExploreDatasetFacts dataset{
-   .image_count = static_cast<std::uint32_t>(store.image_entries().size()),
+   .image_count = store.header().num_images,
    .image_width = store.header().image_width,
    .image_height = store.header().image_height,
   };

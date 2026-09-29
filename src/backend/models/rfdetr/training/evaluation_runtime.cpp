@@ -505,7 +505,8 @@ PendingPredictionBatchEncoding enqueue_prediction_batch_encoding(
 }
 std::vector<PredictionBatchItem> collect_prediction_batch_encoding(PendingPredictionBatchEncoding&& pending) { return settle_prediction_batch_encoding(pending); }
 inline int64_t image_id_for_dataset_index(const std::vector<int>& image_ids, int64_t dataset_index) {
- if (dataset_index >= 0 && static_cast<size_t>(dataset_index) < image_ids.size()) { return image_ids[static_cast<size_t>(dataset_index)]; }
+ if (dataset_index < 0 || dataset_index >= std::numeric_limits<int>::max() || !std::binary_search(image_ids.begin(), image_ids.end(), static_cast<int>(dataset_index + 1)))
+  throw std::out_of_range("prediction dataset slot is not eligible");
  return dataset_index + 1;
 }
 // Projects a loader batch onto the per-image metadata every prediction and evaluation path consumes.

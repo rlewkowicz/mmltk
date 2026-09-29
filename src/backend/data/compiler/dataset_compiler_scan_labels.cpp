@@ -331,15 +331,7 @@ PackedInstance pack_instance(const ParsedInstance& instance) {
  packed.mask_rle_pairs = checked_cast<uint16_t>(instance.rle_pairs.size(), "too many RLE pairs for one instance");
  return packed;
 }
-std::pair<size_t, size_t> aggregate_worker_sizes(const std::vector<WorkerResult>& worker_results) {
- size_t total_labels = 0;
- size_t total_rle_pairs = 0;
- for (const WorkerResult& result : worker_results) {
-  total_labels = mmltk::common::math::checked_add(total_labels, result.labels.size(), "label count overflow");
-  total_rle_pairs = mmltk::common::math::checked_add(total_rle_pairs, result.rle_pairs.size(), "RLE count overflow");
- }
- return {total_labels, total_rle_pairs};
-}
+
 }  // namespace
 std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) { return numbered_path(split_dir, zero_based_index + 1, ".png"); }
 std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) { return numbered_path(split_dir, zero_based_index + 1, ".jsonl"); }
@@ -405,7 +397,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
  return scan;
 }
 LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config, const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base,
- const FileLayout& pixel_layout, int num_workers, const std::span<const int> worker_cpus, ProgressCounter* completed_images, std::atomic<bool>* failure_requested,
+ const mmltk::common::io::FileHandle& output, const FileLayout& pixel_layout, int num_workers, const std::span<const int> worker_cpus, ProgressCounter* completed_images, std::atomic<bool>* failure_requested,
  const mmltk::common::concurrency::CancellationObservation cancellation) {
  mmltk::common::logging::ScopedProfile profile{"compiler.labels.build_blocks"};
  auto record_worker_stats = [&](const std::vector<LabelWorkerStats>& worker_stats) {
@@ -443,7 +435,8 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
  std::atomic<bool> any_image_resize{false};
  std::atomic<bool> any_image_downscale{false};
  std::atomic<bool> worker_cancelled{false};
- std::vector<WorkerResult> worker_results(num_images);
+ LabelBlocks blocks;
+ blocks.index.resize(num_images);
  const int worker_count = std::max(1, std::min(num_workers, checked_cast<int>(num_images, "label worker count overflow")));
  std::vector<LabelWorkerStats> worker_stats(static_cast<size_t>(worker_count));
  std::vector<std::vector<CompileDiagnostic>> worker_diagnostics;
@@ -467,7 +460,7 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
     ParsedLabels parsed_labels = parse_jsonl(annotation_path(split_dir, image_index), image_path(split_dir, image_index), class_catalog, config, &resize_observation, mask_scratch, diagnostics);
     if (resize_observation.needs_resize) { any_image_resize.store(true, std::memory_order_relaxed); }
     if (resize_observation.needs_downscale) { any_image_downscale.store(true, std::memory_order_relaxed); }
-    WorkerResult& result = worker_results[image_index];
+    WorkerResult result;
     result.has_image_id = parsed_labels.has_image_id;
     result.image_id = parsed_labels.image_id;
     result.original_width = resize_observation.source_dimensions.width;
@@ -475,6 +468,7 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
     std::vector<ParsedInstance>& instances = parsed_labels.instances;
     result.labels.reserve(instances.size());
     const size_t instance_rle_pairs = parsed_rle_pair_count(instances);
+    set_annotation_extent(blocks.index[image_index], instances.size(), instance_rle_pairs, image_path(split_dir, image_index).string());
     result.rle_pairs.reserve(instance_rle_pairs);
     for (const ParsedInstance& instance : instances) {
      auto packed = pack_instance(instance);
@@ -482,9 +476,24 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
       packed.source_category_id = static_cast<std::uint64_t>(packed.class_id) + source_category_base;
       packed.flags |= kAnnotationCategory;
      }
+     packed.mask_rle_offset = result.rle_pairs.size() * sizeof(RLEPair);
      result.labels.push_back(packed);
      result.rle_pairs.insert(result.rle_pairs.end(), instance.rle_pairs.begin(), instance.rle_pairs.end());
     }
+    auto& entry = blocks.index[image_index];
+    entry.status = ImageStatus::Eligible;
+    entry.has_source_image_id = result.has_image_id;
+    entry.source_image_id = result.image_id;
+    entry.original_width = result.original_width;
+    entry.original_height = result.original_height;
+    FileHeader checks{};
+    checks.num_classes = checked_cast<std::uint32_t>(class_catalog.size(), "class count overflow");
+    checks.max_instances_per_image = UINT16_MAX;
+    checks.image_width = config.target_width;
+    checks.image_height = config.target_height;
+    (void)admit_compiled_annotations(entry, {result.labels, result.rle_pairs}, checks, image_index, cancellation);
+    output.allocate_range(pixel_layout.label_offset(image_index), compiled_align_up(entry.label_bytes, PAGE_SIZE));
+    write_compiled_annotations(output, pixel_layout, image_index, entry, {result.labels, result.rle_pairs});
 #if MMLTK_ENABLE_PROFILING
     ++stats.images;
     stats.instances += instances.size();
@@ -508,63 +517,18 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
   }
  }
  const std::uint64_t total_dropped_instances = record_worker_stats(worker_stats);
- const auto [total_labels, total_rle_pairs] = aggregate_worker_sizes(worker_results);
- LabelBlocks blocks;
- blocks.index.resize(num_images);
- blocks.labels.resize(total_labels);
- blocks.rle_pairs.resize(total_rle_pairs);
  blocks.any_image_resize = any_image_resize.load(std::memory_order_relaxed);
  blocks.any_image_downscale = any_image_downscale.load(std::memory_order_relaxed);
  blocks.dropped_instances = total_dropped_instances;
- mmltk::common::logging::profile_set_value("compiler.labels.total_labels", total_labels);
- mmltk::common::logging::profile_set_value("compiler.labels.total_rle_pairs", total_rle_pairs);
- const auto classes = checked_cast<std::uint32_t>(class_catalog.size(), "class count overflow");
- const auto pixels = std::size_t{config.target_width} * config.target_height;
- const auto stride = pixels * 3U * sizeof(float);
- size_t label_cursor = 0;
- size_t rle_cursor = 0;
- std::uint16_t max_instances_per_image = 0;
- {
-  mmltk::common::logging::ScopedProfile merge_profile{"compiler.labels.merge_blocks"};
-  for (uint32_t image_index = 0; image_index < num_images; ++image_index) {
-   throw_if_compiled_validation_cancelled(image_index, cancellation);
-   WorkerResult& result = worker_results[image_index];
-   ImageEntry& entry = blocks.index[image_index];
-   entry.has_source_image_id = result.has_image_id;
-   entry.source_image_id = result.image_id;
-   entry.original_width = result.original_width;
-   entry.original_height = result.original_height;
-   entry.num_instances = checked_cast<uint16_t>(result.labels.size(), "too many instances for one image");
-   max_instances_per_image = std::max(max_instances_per_image, entry.num_instances);
-   entry.label_offset = checked_cast<uint32_t>(mmltk::common::math::checked_multiply(label_cursor, sizeof(PackedInstance), "label offset overflow"), "label offset overflow");
-   entry.label_bytes = checked_cast<uint32_t>(result.labels.size() * sizeof(PackedInstance), "label bytes overflow");
-   entry.pixel_offset = pixel_layout.pixel_offset + image_index * stride;
-   CompiledRecordChecks::image(entry, image_index);
-   const auto image_rle_start = rle_cursor;
-   const auto image_rle_end = mmltk::common::math::checked_add(rle_cursor, result.rle_pairs.size(), "image RLE extent overflow");
-   const auto image_rle_bytes_end = mmltk::common::math::checked_multiply(image_rle_end, sizeof(RLEPair), "image RLE size overflow");
-   for (auto packed : result.labels) {
-    throw_if_compiled_validation_cancelled(label_cursor, cancellation);
-    const auto begin = rle_cursor;
-    packed.mask_rle_offset = mmltk::common::math::checked_multiply(rle_cursor, sizeof(RLEPair), "mask RLE offset overflow");
-    // The absolute image endpoint bounds the source span as well as the final
-    // destination. Offsets and their admission belong to this actual copy.
-    const auto end = CompiledRecordChecks::label(packed, classes, image_rle_bytes_end, packed.mask_rle_offset, entry.source, label_cursor) / sizeof(RLEPair);
-    std::size_t previous_end = 0;
-    for (; rle_cursor < end; ++rle_cursor) {
-     throw_if_compiled_validation_cancelled(rle_cursor, cancellation);
-     const auto run = result.rle_pairs[rle_cursor - image_rle_start];
-     previous_end = CompiledRecordChecks::run(run, previous_end, pixels, label_cursor, rle_cursor - begin);
-     blocks.rle_pairs[rle_cursor] = run;
-    }
-    blocks.labels[label_cursor++] = packed;
-   }
-   if (rle_cursor != image_rle_end) throw std::runtime_error("label and RLE counts diverged while assembling label blocks");
-  }
+ std::size_t labels = 0, runs = 0;
+ for (const auto& entry : blocks.index) {
+  blocks.max_instances_per_image = std::max<std::uint32_t>(blocks.max_instances_per_image, entry.num_instances);
+  labels += entry.num_instances;
+  runs += entry.num_runs;
  }
- if (label_cursor != total_labels || rle_cursor != total_rle_pairs) throw std::runtime_error("compiled metadata coverage is incomplete");
- blocks.max_instances_per_image = max_instances_per_image;
- if (mmltk::common::logging::profile_enabled()) { mmltk::common::logging::profile_set_value("compiler.labels.max_instances_per_image", max_instances_per_image); }
+ mmltk::common::logging::profile_set_value("compiler.labels.total_labels", labels);
+ mmltk::common::logging::profile_set_value("compiler.labels.total_rle_pairs", runs);
+ mmltk::common::logging::profile_set_value("compiler.labels.max_instances_per_image", blocks.max_instances_per_image);
  return blocks;
 }
 }  // namespace mmltk::backend::data::compiler_internal

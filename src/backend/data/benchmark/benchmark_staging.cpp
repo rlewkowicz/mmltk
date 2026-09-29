@@ -91,6 +91,18 @@ void BenchmarkStagedArtifact::resize(std::size_t bytes, std::string_view descrip
  file_.preallocate(bytes);
  reconcile();
 }
+void BenchmarkStagedArtifact::resize_sparse(std::size_t bytes) { file_.resize_sparse(bytes); }
+void BenchmarkStagedArtifact::allocate_range(std::size_t offset, std::size_t bytes) {
+ if (!bytes) return;
+ struct stat status{};
+ if (::fstat(file_.get(), &status) != 0) throw common_io::errno_error("cannot inspect staged allocation");
+ const auto allocated = mmltk::common::math::checked_multiply(mmltk::common::math::checked_cast<std::uint64_t>(status.st_blocks, "staged allocation overflow"), std::uint64_t{512}, "staged allocation overflow");
+ allocation_.resize(mmltk::common::math::checked_add(allocated, static_cast<std::uint64_t>(bytes), "staged growth overflow"), "benchmark occupied extent");
+ file_.allocate_range(offset, bytes);
+ allocation_.reconcile(file_.get());
+ if (::fstat(file_.get(), &status) != 0) throw common_io::errno_error("cannot inspect staged extent allocation");
+ allocation_.resize(mmltk::common::math::checked_multiply(mmltk::common::math::checked_cast<std::uint64_t>(status.st_blocks, "staged allocation overflow"), std::uint64_t{512}, "staged allocation overflow"), "benchmark occupied allocation");
+}
 void BenchmarkStagedArtifact::reconcile() { allocation_.reconcile(file_.get()); }
 void BenchmarkStagedArtifact::close() {
  if (file_.get() >= 0) {

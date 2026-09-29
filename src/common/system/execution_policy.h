@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 #include "src/common/system/numa_memory.h"
@@ -25,17 +26,35 @@ struct ExecutionPolicySnapshot {
  MemoryPolicy memory_policy;
  std::string thread_name;
 };
+// Prepare once, then borrow for serial scopes on any requesting thread. Each
+// concurrent scope needs its own storage; applying/restoring performs no allocation.
+class PreparedExecutionPolicy final {
+public:
+ explicit PreparedExecutionPolicy(const ExecutionPolicyRequest&);
+ ~PreparedExecutionPolicy();
+ PreparedExecutionPolicy(const PreparedExecutionPolicy&) = delete;
+ PreparedExecutionPolicy& operator=(const PreparedExecutionPolicy&) = delete;
+
+private:
+ friend class ScopedExecutionPolicy;
+ friend ExecutionPolicySnapshot apply_worker_execution_policy(const ExecutionPolicyRequest&);
+ void Apply();
+ void Restore();
+ struct Impl;
+ std::unique_ptr<Impl> impl_;
+};
 class ScopedExecutionPolicy final {
 public:
  explicit ScopedExecutionPolicy(const ExecutionPolicyRequest&);
+ explicit ScopedExecutionPolicy(PreparedExecutionPolicy&);
  ~ScopedExecutionPolicy() noexcept;
  ScopedExecutionPolicy(const ScopedExecutionPolicy&) = delete;
  ScopedExecutionPolicy& operator=(const ScopedExecutionPolicy&) = delete;
  void Restore();
 
 private:
- ExecutionPolicySnapshot previous_;
- bool active_ = true;
+ std::unique_ptr<PreparedExecutionPolicy> owned_;
+ PreparedExecutionPolicy* policy_;
 };
 [[nodiscard]] ExecutionPolicySnapshot apply_process_execution_policy();
 [[nodiscard]] ExecutionPolicySnapshot apply_worker_execution_policy(const ExecutionPolicyRequest& request);

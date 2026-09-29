@@ -24,6 +24,8 @@ public:
  // Storage-changing operations couple the physical mutation to its promise.
  void preallocate(std::size_t bytes);
  void resize(std::size_t bytes, std::string_view description);
+ void resize_sparse(std::size_t bytes);
+ void allocate_range(std::size_t offset, std::size_t bytes);
  void reconcile();
  void close();
  void publish(const std::filesystem::path& destination, mmltk::common::concurrency::CancellationObservation, Publication = Publication::DurableReplace, bool overwrite = true);

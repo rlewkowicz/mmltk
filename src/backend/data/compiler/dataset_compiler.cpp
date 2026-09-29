@@ -208,22 +208,23 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  });
  FileLayout layout;
  {
-  mmltk::common::logging::ScopedProfile layout_profile{"compiler.compute_pixel_layout"};
-  layout = compute_pixel_layout(num_images, image_stride);
+  mmltk::common::logging::ScopedProfile layout_profile{"compiler.compute_file_layout"};
+  layout = compute_file_layout(num_images, image_stride);
  }
  mmltk::common::logging::debug([&](spdlog::logger& log) {
-  log.debug("[compile] Pixel layout: pixel_offset={} ({:.1f} MB aligned), pixels={:.2f} GB", layout.pixel_offset, static_cast<double>(layout.pixel_offset) / (1024.0 * 1024.0),
-   static_cast<double>(layout.pixel_blob_size) / (1024.0 * 1024.0 * 1024.0));
+  log.debug("[compile] Pixel layout: pixel_offset={} ({:.1f} MB aligned), pixels={:.2f} GB", layout.data_offset, static_cast<double>(layout.data_offset) / (1024.0 * 1024.0),
+   static_cast<double>((static_cast<std::size_t>(num_images) * image_stride)) / (1024.0 * 1024.0 * 1024.0));
  });
  const std::filesystem::path out_path = out_dir / (effective_config.split + ".bin");
  std::string staging_path_text = out_path.string() + ".tmp.XXXXXX";
  FileHandle fd;
  {
   mmltk::common::logging::ScopedProfile output_profile{"compiler.open_output"};
-  fd = FileHandle::create_unique_output(staging_path_text, layout.pixel_offset + layout.pixel_blob_size);
+  fd = FileHandle::create_unique_output(staging_path_text, 0);
  }
  const std::filesystem::path staging_path(staging_path_text);
  StagingFileCleanup staging_cleanup(staging_path);
+ fd.resize_sparse(layout.total_size);
  compiler_internal::LabelBlocks label_blocks;
  std::exception_ptr pixel_error;
  std::exception_ptr label_error;
@@ -244,7 +245,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
                                             worker_cpus,
                                             initial_pixel_workers,
                                             &release_all_pixel_workers,
-                                            layout.pixel_offset,
+                                            layout,
                                             cancellation,
                                             &failure_requested,
                                             effective_config.resize_mode,
@@ -255,7 +256,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
   }
  });
  try {
-  label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, effective_config, class_catalog, plan.source_category_base, layout, label_workers, label_cpus,
+  label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, effective_config, class_catalog, plan.source_category_base, fd, layout, label_workers, label_cpus,
    telemetry != nullptr ? &label_progress : nullptr, &failure_requested, cancellation);
   if (telemetry != nullptr) { telemetry->set_dropped_instances(label_blocks.dropped_instances); }
  } catch (...) {
@@ -269,13 +270,11 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  if (label_error) { std::rethrow_exception(label_error); }
  throw_if_cancelled();
  mmltk::common::logging::debug([](spdlog::logger& log) { log.debug("[compile] Labels and pixels complete"); });
- {
-  mmltk::common::logging::ScopedProfile layout_profile{"compiler.finalize_layout"};
-  finalize_layout(layout, {label_blocks.labels.size(), label_blocks.rle_pairs.size()});
- }
  throw_if_cancelled();
  mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Layout: total={:.2f} GB", static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
- fd.preallocate(layout.total_size);
+ fd.allocate_range(0, compiled_align_up(sizeof(FileHeader), PAGE_SIZE));
+ fd.allocate_range(layout.index_offset, compiled_align_up(layout.index_size, PAGE_SIZE));
+ fd.resize_sparse(layout.total_size);
  const FileHeader header = make_file_header(
   FileHeaderInputs{
    num_images,

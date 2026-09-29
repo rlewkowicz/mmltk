@@ -6,6 +6,7 @@
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <string>
+#include <stdexcept>
 #include <optional>
 #include <stop_token>
 #include "src/frameworks/gpu/cuda/device_execution.h"
@@ -26,15 +27,20 @@ struct Batch {
  std::uint64_t microbatch_key = 0;
  size_t num_images = 0;
  const float* device_images = nullptr;
- const LabelIndexEntry* label_index = nullptr;
- const PackedInstance* labels = nullptr;
- const RLEPair* rle_pairs = nullptr;
+ const CompiledDataset* source = nullptr;
+ const ImageAnnotations* annotation_views = nullptr;
  const uint32_t* image_indices = nullptr;
  size_t slot_index = 0;
  uint64_t lease_id = 0;
  const void* owner = nullptr;
  std::weak_ptr<const void> image_custody{};
  std::size_t image_capacity_bytes = 0;
+ [[nodiscard]] ImageAnnotations annotations(std::size_t image) const {
+  if (image >= num_images) throw std::out_of_range("batch annotation image");
+  if (annotation_views) return annotation_views[image];
+  if (!source || !image_indices) throw std::logic_error("batch annotation source unavailable");
+  return source->annotations(image_indices[image]);
+ }
 };
 class DatasetLoader {
 public:
@@ -90,10 +96,10 @@ public:
  [[nodiscard]] size_t num_label_instances() const;
  [[nodiscard]] size_t num_rle_pairs() const;
  [[nodiscard]] bool masks_available() const noexcept;
- [[nodiscard]] const float* pixel_blob() const;
- [[nodiscard]] const LabelIndexEntry* label_index() const;
- [[nodiscard]] const PackedInstance* label_data() const;
- [[nodiscard]] const RLEPair* rle_data() const;
+ [[nodiscard]] ImageAnnotations annotations(std::uint32_t slot) const;
+ [[nodiscard]] const float* image_pixels(std::uint32_t slot) const;
+ [[nodiscard]] auto eligible_slots() const { return compiled_source()->eligible_slots(); }
+ [[nodiscard]] bool eligible(std::uint32_t slot) const { return compiled_source()->eligible(slot); }
  [[nodiscard]] mmltk::backend::imaging::resample::ImageResizeMode resize_mode() const;
  [[nodiscard]] const ImageEntry& image_entry(std::uint32_t index) const;
  [[nodiscard]] mmltk::backend::imaging::resample::ImageResizeGeometry geometry(std::uint32_t index) const;

@@ -7,27 +7,20 @@
 namespace mmltk::backend::models::rfdetr {
 namespace {
 const mmltk::backend::data::PackedInstance& donor_instance(const mmltk::backend::data::DatasetLoader& loader, const TrainingDonorDescriptor& descriptor) {
- if (descriptor.image_index >= loader.num_images()) throw std::invalid_argument("logical donor image is outside dataset");
- const auto& entry = loader.label_index()[descriptor.image_index];
- if (descriptor.annotation_index >= entry.num_instances) throw std::invalid_argument("logical donor annotation is outside image");
- const auto& instance = loader.label_data()[entry.label_begin + descriptor.annotation_index];
+ if (!loader.eligible(descriptor.image_index)) throw std::invalid_argument("logical donor image is outside dataset");
+ const auto entry = loader.annotations(descriptor.image_index);
+ if (descriptor.annotation_index >= entry.labels.size()) throw std::invalid_argument("logical donor annotation is outside image");
+ const auto& instance = entry.labels[descriptor.annotation_index];
  if (instance.is_crowd()) throw std::invalid_argument("crowd annotation cannot enter logical donor history");
  return instance;
 }
-std::span<const mmltk::backend::data::RLEPair> original_donor_support(const mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::PackedInstance& instance) {
- // DatasetLoader owns the immutable mapping and validates every annotation/RLE
- // span before exposing it. Borrow the original support without remapping it.
- if (!instance.mask_rle_pairs) return {};
- return {loader.rle_data() + instance.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair), instance.mask_rle_pairs};
-}
 std::vector<TrainingImageClasses> image_classes(const mmltk::backend::data::DatasetLoader& loader) {
- std::vector<TrainingImageClasses> images(loader.num_images());
- for (std::size_t image = 0; image < images.size(); ++image) {
-  const auto& index = loader.label_index()[image];
-  for (std::size_t annotation = 0; annotation < index.num_instances; ++annotation) {
-   const auto& instance = loader.label_data()[index.label_begin + annotation];
+ std::vector<TrainingImageClasses> images(loader.compiled_source()->slot_count());
+ for (auto& image : images) image.eligible = false;
+ for (const auto image : loader.eligible_slots()) {
+  images[image].eligible = true;
+  for (const auto& instance : loader.annotations(image).labels)
    if (!instance.is_crowd()) images[image].classes.push_back(instance.class_id);
-  }
  }
  return images;
 }
@@ -39,6 +32,8 @@ TrainingDataPlan::TrainingDataPlan(std::vector<TrainingImageClasses> images, std
  support_.resize(classes);
  if (membership_.empty() || membership_.size() > std::numeric_limits<std::uint32_t>::max()) throw std::invalid_argument("training image membership is empty or too large");
  for (auto& image : membership_) {
+  if (!image.eligible) continue;
+  ++image_count_;
   std::ranges::sort(image.classes);
   image.classes.erase(std::unique(image.classes.begin(), image.classes.end()), image.classes.end());
   for (auto cls : image.classes) {
@@ -51,8 +46,10 @@ TrainingDataPlan::TrainingDataPlan(std::vector<TrainingImageClasses> images, std
  else
   for (const auto& model : request.lane_configuration.models) shards_.push_back({model.model_id, model.seed, {}, std::vector<std::uint64_t>(classes)});
  std::ranges::sort(shards_, {}, &TrainingShard::model_id);
- std::vector<std::uint32_t> order(membership_.size());
- std::iota(order.begin(), order.end(), 0);
+ std::vector<std::uint32_t> order;
+ order.reserve(image_count_);
+ for (std::uint32_t slot = 0; slot < membership_.size(); ++slot) if (membership_[slot].eligible) order.push_back(slot);
+ if (!image_count_) throw std::invalid_argument("training image membership has no eligible images");
  std::vector<std::uint64_t> rarity;
  if (policy_.balancing != TrainBalancing::Off) {
   rarity.resize(membership_.size(), std::numeric_limits<std::uint64_t>::max());
@@ -62,7 +59,7 @@ TrainingDataPlan::TrainingDataPlan(std::vector<TrainingImageClasses> images, std
  std::mt19937_64 rng(static_cast<std::uint64_t>(request.seed));
  std::shuffle(order.begin(), order.end(), rng);
  if (policy_.balancing != TrainBalancing::Off) std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) { return rarity[a] < rarity[b]; });
- const auto capacity = [&](std::size_t shard) { return membership_.size() / shards_.size() + (shard < membership_.size() % shards_.size()); };
+ const auto capacity = [&](std::size_t shard) { return image_count_ / shards_.size() + (shard < image_count_ % shards_.size()); };
  for (auto image : order) {
   std::size_t chosen = shards_.size();
   double best = std::numeric_limits<double>::infinity();
@@ -112,7 +109,7 @@ TrainingEpochDraws TrainingDataPlan::epoch(std::size_t model, std::uint64_t epoc
   if (capacity)
    for (auto image : shard.images) {
     double repeat = 1;
-    for (auto cls : membership_[image].classes) repeat = std::max(repeat, std::sqrt(policy_.rare_threshold * static_cast<double>(membership_.size()) / static_cast<double>(support_[cls])));
+    for (auto cls : membership_[image].classes) repeat = std::max(repeat, std::sqrt(policy_.rare_threshold * static_cast<double>(image_count_) / static_cast<double>(support_[cls])));
     repeat = std::min(repeat, policy_.maximum_repeat_factor);
     const auto whole = static_cast<std::size_t>(repeat);
     const auto key = training_stochastic_key(seed, shard.model_id, epoch_number, image, 1);
@@ -179,7 +176,7 @@ TrainingDonorSource resolve_training_donor(const mmltk::backend::data::DatasetLo
  TrainingDonorSource result;
  if (!descriptor.valid) return result;
  const auto& instance = donor_instance(loader, descriptor);
- result.support = original_donor_support(loader, instance);
+ result.support = loader.annotations(descriptor.image_index).instance_rle(instance);
  const auto source_box = augmentation_instance_box(instance, loader.image_width(), loader.image_height());
  result.metadata = {
   instance.class_id, descriptor.image_index, augmentation_box_area(source_box) * static_cast<float>(loader.image_width()) * static_cast<float>(loader.image_height()), source_box, instance.has_mask(),
@@ -216,17 +213,17 @@ std::span<const TrainingDonorDescriptor> TrainingDonorHistory::prepare(
   return donors;
  }
  for (std::size_t image = 0; image < batch_; ++image) {
-  if (images[image] >= loader.num_images()) throw std::invalid_argument("logical donor source image is outside dataset");
+  if (!loader.eligible(images[image])) throw std::invalid_argument("logical donor source image is outside dataset");
   const auto donor = resolve_training_donor(loader, donors[image]);
   auto plan = plan_augmentation_image(config, keys[image], images[image], &donor.metadata, image);
   plan.paste_support = donor.support.data();
   plan.paste_support_count = donor.support.size();
-  const auto& entry = loader.label_index()[images[image]];
+  const auto entry = loader.annotations(images[image]);
   std::int64_t candidates = 0;
-  for (std::uint32_t ordinal = 0; ordinal < entry.num_instances; ++ordinal) {
-   const auto& instance = loader.label_data()[entry.label_begin + ordinal];
+  for (std::uint32_t ordinal = 0; ordinal < entry.labels.size(); ++ordinal) {
+   const auto& instance = entry.labels[ordinal];
    if (instance.is_crowd()) continue;
-   const auto support = original_donor_support(loader, instance);
+   const auto support = entry.instance_rle(instance);
    if (!augmentation_instance_visible(instance, loader.image_width(), loader.image_height(), &plan, support)) continue;
    if (augmentation_reservoir_select(plan.cache_choice, ++candidates, ordinal)) replacements_[image] = {images[image], ordinal, true};
   }

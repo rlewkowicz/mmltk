@@ -17,6 +17,7 @@
 #include <nlohmann/json.hpp>
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/compiler/dataset_compiler.h"
+#include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
@@ -36,7 +37,8 @@ r::Prediction box(int category, std::array<float, 4> bounds, float score = 1.0F)
 }
 class EvaluationFixture final {
 public:
- explicit EvaluationFixture(const std::vector<std::vector<r::Prediction>>& images, int resolution = 128, const std::vector<std::vector<nlohmann::json>>& metadata = {}) : root_("evaluator-answers") {
+ explicit EvaluationFixture(const std::vector<std::vector<r::Prediction>>& images, int resolution = 128, const std::vector<std::vector<nlohmann::json>>& metadata = {},
+  std::span<const std::uint32_t> inactive = {}) : root_("evaluator-answers") {
   const data::testsupport::FixtureSpec fixture{root_.path().string(), "train", 128, 128, static_cast<int>(images.size()), 0, 0};
   data::testsupport::create_synthetic_dataset(fixture);
   constexpr std::array names{"person", "ret", "scope", "iron_sight", "anchor_dot", "glint"};
@@ -70,6 +72,21 @@ public:
   config.num_workers = 1;
   const auto plan = data::DatasetCompiler::prepare(config, {config.split});
   data::DatasetCompiler::compile(plan, 0U);
+  if (!inactive.empty()) {
+   const auto path = data::testsupport::compiled_bin_path(fixture);
+   auto header = data::read_compiled_header(path);
+   header.num_images -= static_cast<std::uint32_t>(inactive.size());
+   std::fstream output(path, std::ios::in | std::ios::out | std::ios::binary);
+   output.write(reinterpret_cast<const char*>(&header), sizeof(header));
+   const data::ImageEntry empty;
+   for (const auto slot : inactive) {
+    REQUIRE(slot < header.num_slots);
+    output.seekp(static_cast<std::streamoff>(header.index_offset + slot * sizeof(empty)));
+    output.write(reinterpret_cast<const char*>(&empty), sizeof(empty));
+   }
+   REQUIRE(output.good());
+  }
+
   loader = std::make_unique<data::DatasetLoader>(data::DatasetLoader::Config{
    .compiled_path = data::testsupport::compiled_bin_path(fixture), .batch_size = 1U, .shuffle = false, .prefetch_factor = 2, .gather_workers = 1, .loading = data::data_loading_options(true)
   });
@@ -122,6 +139,20 @@ TEST_CASE("evaluation distinguishes unavailable categories, measured zero, masks
  CHECK_FALSE(summary.bbox.available);
  CHECK(summary.bbox.confidence.f1 == 0.0);
  CHECK_FALSE(summary.bbox.average_recall[0]);
+}
+TEST_CASE("evaluation matches eligible physical slots across inactive holes", "[rfdetr][evaluation][gpu]") {
+ const auto prediction = box(0, {0, 0, 32, 32});
+ const std::array inactive{0U};
+ EvaluationFixture fixture({{}, {prediction}}, 128, {}, inactive);
+ r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBoxAndMask);
+ REQUIRE(owner.image_count() == 1);
+ CHECK(owner.image_ids() == std::vector<int>{2});
+ CHECK_THROWS_AS(match(owner, 0, {}, 10, true), std::out_of_range);
+ owner.merge_matches(match(owner, 1, {prediction}, 10, true));
+ const auto result = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
+ CHECK(result.bbox.ap == Approx(1.0));
+ REQUIRE(result.mask);
+ CHECK(result.mask->ap == Approx(1.0));
 }
 TEST_CASE("evaluation uses the 101-point envelope and all ten inclusive IoU thresholds", "[rfdetr][evaluation][gpu]") {
  EvaluationFixture fixture({{box(0, {0, 0, 32, 32}), box(0, {64, 64, 96, 96})}});
@@ -283,7 +314,7 @@ TEST_CASE("COCO crowds repeat ignore matches while ordinary annotations retain p
  const auto ordinary = box(0, {10, 10, 30, 30});
  EvaluationFixture fixture({{crowd, ordinary, box(1, {0, 0, 128, 128})}}, 128, {{{{"iscrowd", true}}, {{"ignore", true}}, {{"iscrowd", true}, {"ignore", false}}}});
  r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBoxAndMask);
- CHECK(fixture.loader->label_data()[1].raw_ignore());
+ CHECK(fixture.loader->annotations(0).labels[1].raw_ignore());
  const auto prediction = box(0, {10, 10, 28, 30}, .9F);
  auto matches = match(owner, 0, {prediction, prediction, prediction, box(1, {4, 4, 8, 8})}, 10, true);
  REQUIRE(matches.bbox.size() == 4U);
@@ -316,8 +347,8 @@ TEST_CASE("evaluation retains duplicate fractional boxes and declared source are
  // Use the compiled categorical mask so this case isolates stored area.
  prediction.mask = {};
  prediction.mask.width = prediction.mask.height = 64;
- const auto& packed = fixture.loader->label_data()[0];
- const auto* runs = fixture.loader->rle_data() + packed.mask_rle_offset / sizeof(data::RLEPair);
+ const auto& packed = fixture.loader->annotations(0).labels[0];
+ const auto* runs = fixture.loader->annotations(0).instance_rle(packed).data();
  for (std::size_t i = 0; i < packed.mask_rle_pairs; ++i) {
   prediction.mask.runs.emplace_back(runs[i].start, runs[i].length);
   prediction.mask.area += runs[i].length;

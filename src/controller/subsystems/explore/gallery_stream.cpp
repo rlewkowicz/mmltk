@@ -1202,7 +1202,7 @@ explore::ExploreRenderCardDescriptor GalleryStream::Impl::AssembleImageMeaning(
   support_plan.paste_support_count = lane.layout.donor_rle.count;
  }
  rfdetr::build_augmentation_preview_annotations(source_instances, donor ? &*donor : nullptr, image_plan != nullptr ? &support_plan : nullptr, static_cast<int>(State().store->header().image_width),
-  static_cast<int>(State().store->header().image_height), projected_annotations_, State().store->rle_pairs());
+  static_cast<int>(State().store->header().image_height), projected_annotations_, State().store->annotations(lane.compiled_index).runs);
  auto card = load_payload<explore::ExploreRenderCardDescriptor>(lane.pinned.data(), lane.layout.card);
  card.pixels = pixels;
  card.erasure = image_plan != nullptr ? image_plan->erasure : rfdetr::AugmentationSpatialErasure{};

@@ -57,18 +57,18 @@ void require_not_cancelled(const std::atomic<bool>* cancel_requested) {
 std::vector<ExploreImageSummary> build_explore_summaries(
  const mmltk::backend::data::CompiledDataset& store, const std::atomic<bool>* cancel_requested, mmltk::common::concurrency::WorkerPool* workers) {
  const auto image_entries_ = store.image_entries();
- const auto labels_ = store.labels();
  std::vector<ExploreImageSummary> summaries(image_entries_.size());
  const auto summarize = [&](const std::size_t begin, const std::size_t end) {
   for (std::size_t image_index = begin; image_index < end; ++image_index) {
    if ((image_index & 4095U) == 0U && cancellation_requested(cancel_requested)) return;
    const mmltk::backend::data::ImageEntry& entry = image_entries_[image_index];
    ExploreImageSummary& summary = summaries[image_index];
+   summary.eligible = entry.eligible();
+   if (!summary.eligible) continue;
    summary.original_width = entry.original_width;
    summary.original_height = entry.original_height;
    summary.instance_count = entry.num_instances;
-   const std::size_t label_begin = entry.label_offset / sizeof(mmltk::backend::data::PackedInstance);
-   const mmltk::backend::data::PackedInstance* image_labels = labels_.data() + label_begin;
+   const auto image_labels = store.image_labels(static_cast<std::uint32_t>(image_index));
    for (std::size_t instance_index = 0U; instance_index < entry.num_instances; ++instance_index) {
     const mmltk::backend::data::PackedInstance& instance = image_labels[instance_index];
     summary.classes[instance.class_id >> 6U] |= std::uint64_t{1} << (instance.class_id & 63U);
@@ -102,7 +102,7 @@ bool rebuild_explore_order(const std::span<const ExploreImageSummary> summaries,
    if ((image_index & 4095U) == 0U && (cancellation_requested(cancel_requested) || !generation_is_current(expected_generation, current_generation))) return;
    const ExploreImageSummary& summary = summaries[image_index];
    const std::uint64_t compiled_index = image_index;
-   if (compiled_index < filter.min_compiled_index || compiled_index > filter.max_compiled_index || summary.instance_count < filter.min_instances || summary.instance_count > filter.max_instances ||
+   if (!summary.eligible || compiled_index < filter.min_compiled_index || compiled_index > filter.max_compiled_index || summary.instance_count < filter.min_instances || summary.instance_count > filter.max_instances ||
        (filter.require_boxes && summary.instance_count == 0U) || (filter.require_masks && !summary.has_masks) || (filter.restrict_classes && !class_masks_intersect(summary.classes, filter.classes)))
     continue;
    scratch[image_index] = static_cast<std::uint32_t>(image_index);

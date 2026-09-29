@@ -196,7 +196,7 @@ void GalleryReadScheduler::ReadLanePayload(Lane& lane) {
  std::size_t rle_cursor = 0U;
  for (std::size_t label_index = 0U; label_index != labels.size(); ++label_index) {
   const auto& label = labels[label_index];
-  const auto runs = lane.store->instance_rle(label);
+  const auto runs = lane.store->instance_rle(lane.compiled_index, label);
   store_payload(lane.pinned.data(), lane.layout.rle.offset + rle_cursor * sizeof(data::RLEPair), runs);
   const explore::ExploreRenderAnnotationDescriptor annotation{
    .mask_present = label.has_mask(),
@@ -238,7 +238,7 @@ void GalleryReadScheduler::ReadLanePayload(Lane& lane) {
    normalized(lane.donor_instance->bbox_y2, lane.store->header().image_height),
   };
   store_payload(lane.pinned.data(), lane.layout.donor_box, std::span{donor_box});
-  const auto donor_runs = lane.store->instance_rle(*lane.donor_instance);
+  const auto donor_runs = lane.store->instance_rle(lane.donor_index, *lane.donor_instance);
   store_payload(lane.pinned.data(), lane.layout.donor_rle.offset, donor_runs);
   auto* const donor_mask = reinterpret_cast<std::uint64_t*>(static_cast<std::byte*>(lane.pinned.data()) + lane.layout.donor_mask);
   pack_rle_mask(donor_runs, std::span{donor_mask, lane.layout.donor_mask_words}, static_cast<std::size_t>(lane.store->header().image_width) * lane.store->header().image_height);
@@ -315,7 +315,7 @@ GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(
  result.annotations.count = labels.size();
  if (result.annotations.count > explore::kExploreRenderAnnotationCapacity) throw contracts::BusyError("Explore thumbnail annotations exceed renderer capacity");
  for (const auto& label : labels) {
-  const auto run_count = product.store->instance_rle(label).size();
+  const auto run_count = product.store->instance_rle(compiled_index, label).size();
   if (run_count > explore::kExploreRenderRleCapacity - result.rle.count) throw contracts::BusyError("Explore thumbnail annotations exceed renderer capacity");
   result.rle.count += run_count;
  }
@@ -372,6 +372,7 @@ void GalleryReadScheduler::PrepareLaneStorage(const GalleryProductState& product
  lane.layout = LayoutFor(product, compiled_index, lane.donor_instance.has_value(), lane.donor_instance ? lane.donor_instance->mask_rle_pairs : 0U);
  image_stream_.prepare_metadata(lane.index, lane.layout.bytes);
  image_stream_.prepare_images(lane.index, 2U * lane.layout.pixel_bytes);
+ image_stream_.prepare_reads(lane.index, 2U);
  lane.generation = generation;
  lane.reserved_generation = generation;
  lane.tile_generation = ++next_tile_generation_;

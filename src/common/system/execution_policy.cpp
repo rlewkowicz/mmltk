@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #endif
 #include <linux/ioprio.h>
+#include <numaif.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/resource.h>
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <exception>
+#include <limits>
 #include <cerrno>
 #include <stdexcept>
 #include <string>
@@ -40,33 +42,136 @@ void set_scheduler(int policy, int priority) {
  const int error = ::pthread_setschedparam(::pthread_self(), policy, &parameter);
  if (error) throw std::system_error(error, std::generic_category(), "required normal worker scheduler denied");
 }
-void verify_pinned_cpu(const std::vector<int>& cpus, size_t worker_index) {
- if (cpus.empty()) { return; }
- const std::vector<int> effective = allowed_cpu_set();
- const int expected_cpu = cpus[worker_index % cpus.size()];
- if (effective.size() != 1 || effective.front() != expected_cpu) {
-  throw std::runtime_error("worker affinity verification failed: expected cpu " + std::to_string(expected_cpu) + ", got " + format_cpu_list(effective));
+void capture_memory(MemoryPolicy& policy) {
+ if (::get_mempolicy(&policy.mode, policy.mask.data(), policy.mask.size() * sizeof(unsigned long) * 8U, nullptr, 0) != 0)
+  throw std::system_error(errno, std::generic_category(), "capture thread memory policy");
+}
+void capture_affinity(std::vector<unsigned long>& mask) {
+ if (::sched_getaffinity(0, mask.size() * sizeof(unsigned long), reinterpret_cast<cpu_set_t*>(mask.data())) != 0)
+  throw std::system_error(errno, std::generic_category(), "capture thread affinity");
+}
+std::vector<unsigned long> prepare_affinity() {
+ constexpr auto word_bits = sizeof(unsigned long) * 8U;
+ auto count = static_cast<std::size_t>(std::max(1L, ::sysconf(_SC_NPROCESSORS_CONF)));
+ for (;;) {
+  std::vector<unsigned long> mask(count / word_bits + (count % word_bits != 0));
+  if (::sched_getaffinity(0, mask.size() * sizeof(unsigned long), reinterpret_cast<cpu_set_t*>(mask.data())) == 0) return mask;
+  if (errno != EINVAL || count > std::numeric_limits<std::size_t>::max() / 2U) throw std::system_error(errno, std::generic_category(), "prepare thread affinity");
+  count *= 2U;
  }
 }
-ExecutionPolicySnapshot apply_execution_policy(const ExecutionPolicyRequest& request) {
- if (request.target_nice < -20 || request.target_nice > -10) throw std::invalid_argument("boundary worker nice priority must be -10 or better");
- if (!request.thread_name.empty()) { set_thread_name(request.thread_name); }
- if (!request.cpu_affinity.empty()) {
-  pin_thread_to_cpu(request.cpu_affinity, request.worker_index);
-  verify_pinned_cpu(request.cpu_affinity, request.worker_index);
- }
- if (request.numa_node >= 0) bind_memory_node(request.numa_node);
- set_scheduler(SCHED_OTHER, 0);
- const int target = std::min(get_current_nice_value(), request.target_nice);
- set_nice(target);
- if (request.storage_worker) set_io(IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 0));
- auto result = capture_execution_policy_snapshot();
- if (result.nice_value != target || result.scheduler_policy != SCHED_OTHER || (request.storage_worker && (result.io_class != IOPRIO_CLASS_BE || result.io_priority_data != 0)) ||
-     (request.numa_node >= 0 && result.numa_node != request.numa_node))
-  throw std::runtime_error("required worker execution policy verification failed");
- return result;
+void set_affinity(const std::vector<unsigned long>& mask) {
+ const auto error = ::pthread_setaffinity_np(::pthread_self(), mask.size() * sizeof(unsigned long), reinterpret_cast<const cpu_set_t*>(mask.data()));
+ if (error) throw std::system_error(error, std::generic_category(), "set thread affinity");
+}
+int current_io() {
+ const auto value = ::syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0);
+ if (value < 0) throw std::system_error(errno, std::generic_category(), "ioprio_get failed");
+ return static_cast<int>(value);
+}
+void capture_scheduler(int& policy, int& priority) {
+ sched_param parameter{};
+ const auto error = ::pthread_getschedparam(::pthread_self(), &policy, &parameter);
+ if (error) throw std::system_error(error, std::generic_category(), "pthread_getschedparam failed");
+ priority = parameter.sched_priority;
 }
 }  // namespace
+struct PreparedExecutionPolicy::Impl {
+ explicit Impl(const ExecutionPolicyRequest& selected)
+     : request(selected), previous_affinity(prepare_affinity()), desired_affinity(previous_affinity.size()), observed_affinity(previous_affinity.size()),
+       previous_memory(capture_memory_policy()), desired_memory(previous_memory), observed_memory(previous_memory) {
+  if (request.target_nice < -20 || request.target_nice > -10) throw std::invalid_argument("boundary worker nice priority must be -10 or better");
+  constexpr auto word_bits = sizeof(unsigned long) * 8U;
+  if (!request.cpu_affinity.empty()) {
+   const auto cpu = request.cpu_affinity[request.worker_index % request.cpu_affinity.size()];
+   if (cpu < 0 || static_cast<std::size_t>(cpu) / word_bits >= desired_affinity.size()) throw std::invalid_argument("worker affinity CPU is invalid");
+   desired_affinity[static_cast<std::size_t>(cpu) / word_bits] = 1UL << (static_cast<std::size_t>(cpu) % word_bits);
+  }
+  if (request.numa_node >= 0) {
+   const auto node = static_cast<std::size_t>(request.numa_node);
+   if (node / word_bits >= desired_memory.mask.size()) throw std::invalid_argument("invalid worker NUMA node");
+   if (::get_mempolicy(nullptr, desired_memory.mask.data(), desired_memory.mask.size() * word_bits, nullptr, MPOL_F_MEMS_ALLOWED) != 0)
+    throw std::system_error(errno, std::generic_category(), "query permitted memory nodes");
+   if (!(desired_memory.mask[node / word_bits] & (1UL << (node % word_bits)))) throw std::invalid_argument("required NUMA memory node is forbidden");
+   std::ranges::fill(desired_memory.mask, 0UL);
+   desired_memory.mask[node / word_bits] = 1UL << (node % word_bits);
+   desired_memory.mode = MPOL_BIND | MPOL_F_STATIC_NODES;
+  }
+ }
+ ExecutionPolicyRequest request;
+ std::vector<unsigned long> previous_affinity, desired_affinity, observed_affinity;
+ MemoryPolicy previous_memory, desired_memory, observed_memory;
+ std::array<char, 16> previous_name{};
+ int previous_nice = 0, previous_io = 0, previous_scheduler = 0, previous_priority = 0;
+ bool active = false;
+};
+PreparedExecutionPolicy::PreparedExecutionPolicy(const ExecutionPolicyRequest& request) : impl_(std::make_unique<Impl>(request)) {}
+PreparedExecutionPolicy::~PreparedExecutionPolicy() {
+ try { Restore(); } catch (...) { std::terminate(); }
+}
+void PreparedExecutionPolicy::Apply() {
+ auto& state = *impl_;
+ if (state.active) throw std::logic_error("prepared execution policy is already borrowed");
+ capture_affinity(state.previous_affinity);
+ capture_memory(state.previous_memory);
+ const auto name_error = ::pthread_getname_np(::pthread_self(), state.previous_name.data(), state.previous_name.size());
+ if (name_error) throw std::system_error(name_error, std::generic_category(), "get thread name");
+ state.previous_nice = get_current_nice_value();
+ state.previous_io = current_io();
+ capture_scheduler(state.previous_scheduler, state.previous_priority);
+ state.active = true;
+ try {
+  const auto& request = state.request;
+  if (!request.thread_name.empty()) set_thread_name(request.thread_name);
+  if (!request.cpu_affinity.empty()) {
+   set_affinity(state.desired_affinity);
+   capture_affinity(state.observed_affinity);
+   if (state.observed_affinity != state.desired_affinity) throw std::runtime_error("worker affinity verification failed");
+  }
+  if (request.numa_node >= 0) {
+   restore_memory_policy(state.desired_memory);
+   capture_memory(state.observed_memory);
+   if (bound_memory_node(state.observed_memory) != request.numa_node) throw std::runtime_error("worker NUMA policy verification failed");
+  }
+  set_scheduler(SCHED_OTHER, 0);
+  const auto target = std::min(state.previous_nice, request.target_nice);
+  set_nice(target);
+  if (request.storage_worker) set_io(IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 0));
+  int scheduler = 0, priority = 0;
+  capture_scheduler(scheduler, priority);
+  if (get_current_nice_value() != target || scheduler != SCHED_OTHER || (request.storage_worker && current_io() != IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 0)))
+   throw std::runtime_error("required worker execution policy verification failed");
+ } catch (...) {
+  const auto error = std::current_exception();
+  Restore();
+  std::rethrow_exception(error);
+ }
+}
+void PreparedExecutionPolicy::Restore() {
+ auto& state = *impl_;
+ if (!state.active) return;
+ capture_affinity(state.observed_affinity);
+ if (state.observed_affinity != state.previous_affinity) {
+  set_affinity(state.previous_affinity);
+  capture_affinity(state.observed_affinity);
+  if (state.observed_affinity != state.previous_affinity) throw std::runtime_error("restored thread affinity differs from request");
+ }
+ capture_memory(state.observed_memory);
+ if (state.observed_memory.mode != state.previous_memory.mode || state.observed_memory.mask != state.previous_memory.mask) restore_memory_policy(state.previous_memory);
+ int scheduler = 0, priority = 0;
+ capture_scheduler(scheduler, priority);
+ if (scheduler != state.previous_scheduler || priority != state.previous_priority) set_scheduler(state.previous_scheduler, state.previous_priority);
+ set_nice(state.previous_nice);
+ if (current_io() != state.previous_io) set_io(state.previous_io);
+ std::array<char, 16> name{};
+ auto name_error = ::pthread_getname_np(::pthread_self(), name.data(), name.size());
+ if (name_error) throw std::system_error(name_error, std::generic_category(), "get thread name");
+ if (name != state.previous_name) {
+  name_error = ::pthread_setname_np(::pthread_self(), state.previous_name.data());
+  if (name_error) throw std::system_error(name_error, std::generic_category(), "restore thread name");
+ }
+ state.active = false;
+}
 ExecutionPolicySnapshot capture_execution_policy_snapshot() {
  ExecutionPolicySnapshot snapshot;
  snapshot.affinity = allowed_cpu_set();
@@ -78,48 +183,30 @@ ExecutionPolicySnapshot capture_execution_policy_snapshot() {
  snapshot.nice_value = get_current_nice_value();
  snapshot.memory_policy = capture_memory_policy();
  snapshot.numa_node = bound_memory_node(snapshot.memory_policy);
- sched_param param{};
- int policy = 0;
- const int sched_rc = ::pthread_getschedparam(::pthread_self(), &policy, &param);
- if (sched_rc != 0) { throw std::system_error(sched_rc, std::generic_category(), "pthread_getschedparam failed"); }
- snapshot.scheduler_policy = policy;
- snapshot.scheduler_priority = param.sched_priority;
- errno = 0;
- const long io_value = ::syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0);
- if (io_value < 0 && errno != 0) { throw std::system_error(errno, std::generic_category(), "ioprio_get failed"); }
- snapshot.io_class = IOPRIO_PRIO_CLASS(static_cast<int>(io_value));
- snapshot.io_priority_data = IOPRIO_PRIO_DATA(static_cast<int>(io_value));
+ capture_scheduler(snapshot.scheduler_policy, snapshot.scheduler_priority);
+ const auto io_value = current_io();
+ snapshot.io_class = IOPRIO_PRIO_CLASS(io_value);
+ snapshot.io_priority_data = IOPRIO_PRIO_DATA(io_value);
  return snapshot;
 }
-ScopedExecutionPolicy::ScopedExecutionPolicy(const ExecutionPolicyRequest& request) : previous_(capture_execution_policy_snapshot()) {
- try {
-  (void)apply_execution_policy(request);
- } catch (...) {
-  const auto error = std::current_exception();
-  Restore();
-  std::rethrow_exception(error);
- }
-}
+ScopedExecutionPolicy::ScopedExecutionPolicy(const ExecutionPolicyRequest& request) : owned_(std::make_unique<PreparedExecutionPolicy>(request)), policy_(owned_.get()) { policy_->Apply(); }
+ScopedExecutionPolicy::ScopedExecutionPolicy(PreparedExecutionPolicy& policy) : policy_(&policy) { policy_->Apply(); }
 ScopedExecutionPolicy::~ScopedExecutionPolicy() noexcept {
- if (active_) {
-  try {
-   Restore();
-  } catch (...) { std::terminate(); }
- }
+ try { Restore(); } catch (...) { std::terminate(); }
 }
 void ScopedExecutionPolicy::Restore() {
- if (!active_) return;
- const auto current = capture_execution_policy_snapshot();
- if (current.affinity != previous_.affinity) set_thread_affinity(previous_.affinity);
- if (current.memory_policy.mode != previous_.memory_policy.mode || current.memory_policy.mask != previous_.memory_policy.mask) restore_memory_policy(previous_.memory_policy);
- if (current.scheduler_policy != previous_.scheduler_policy || current.scheduler_priority != previous_.scheduler_priority) set_scheduler(previous_.scheduler_policy, previous_.scheduler_priority);
- set_nice(previous_.nice_value);
- if (current.io_class != previous_.io_class || current.io_priority_data != previous_.io_priority_data) set_io(IOPRIO_PRIO_VALUE(previous_.io_class, previous_.io_priority_data));
- if (current.thread_name != previous_.thread_name) set_thread_name(previous_.thread_name);
- active_ = false;
+ if (!policy_) return;
+ policy_->Restore();
+ policy_ = nullptr;
 }
-ExecutionPolicySnapshot apply_process_execution_policy() { return apply_execution_policy(ExecutionPolicyRequest{}); }
-ExecutionPolicySnapshot apply_worker_execution_policy(const ExecutionPolicyRequest& request) { return apply_execution_policy(request); }
+ExecutionPolicySnapshot apply_process_execution_policy() { return apply_worker_execution_policy(ExecutionPolicyRequest{}); }
+ExecutionPolicySnapshot apply_worker_execution_policy(const ExecutionPolicyRequest& request) {
+ PreparedExecutionPolicy policy(request);
+ policy.Apply();
+ auto result = capture_execution_policy_snapshot();
+ policy.impl_->active = false;
+ return result;
+}
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
 int clamp_worker_count_to_cpus(int requested_workers, size_t cpu_count, int reserved_cpus, int minimum_workers) {
  if (requested_workers <= 0) { throw std::invalid_argument("requested_workers must be positive"); }

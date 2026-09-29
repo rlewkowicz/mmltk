@@ -92,7 +92,7 @@ std::filesystem::path corrupt_explore_label_index(const std::filesystem::path& s
  mmltk::backend::data::ImageEntry entry{};
  file.seekg(static_cast<std::streamoff>(header.index_offset));
  file.read(reinterpret_cast<char*>(&entry), sizeof(entry));
- entry.label_offset = sizeof(mmltk::backend::data::PackedInstance);
+ entry.label_bytes = mmltk::backend::data::COMPILED_LABEL_CAPACITY + 1U;
  file.seekp(static_cast<std::streamoff>(header.index_offset));
  file.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
  if (!file) throw std::runtime_error("failed to mutate Explore corruption fixture");

@@ -23,55 +23,53 @@ CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, 
  mmltk::backend::data::validate_compiled_header(store.header_);
  if (store.header_.num_images > image_limit) { throw std::runtime_error("compiled dataset exceeds the caller image limit"); }
  const mmltk::backend::data::CompiledFileSections sections = mmltk::backend::data::validate_compiled_file_sections(store.header_, store.mapping_.size());
- const auto* image_entries = reinterpret_cast<const mmltk::backend::data::ImageEntry*>(store.mapping_.data() + sections.index_offset);
- const auto* labels = reinterpret_cast<const mmltk::backend::data::PackedInstance*>(store.mapping_.data() + sections.label_offset);
- const auto* rle_pairs = reinterpret_cast<const mmltk::backend::data::RLEPair*>(store.mapping_.data() + sections.rle_offset);
- store.image_entries_ = {image_entries, store.header_.num_images};
- store.labels_ = {labels, sections.label_count};
- store.rle_pairs_ = {rle_pairs, sections.rle_region_bytes / sizeof(mmltk::backend::data::RLEPair)};
- store.label_index_.reserve(store.image_entries_.size());
- store.masks_available_ = admit_compiled_records(store.image_entries_, store.labels_, store.rle_pairs_, store.header_,
-  [&](const ImageEntry& entry) { store.label_index_.push_back({static_cast<std::uint32_t>(entry.label_offset / sizeof(PackedInstance)), entry.num_instances, 0}); });
+ store.layout_ = sections.layout;
+ store.image_entries_.resize(store.header_.num_slots);
+ std::memcpy(store.image_entries_.data(), store.mapping_.data() + sections.index_offset, sections.expected_index_bytes);
+ std::size_t eligible = 0;
+ for (std::uint32_t slot = 0; slot < store.header_.num_slots; ++slot) {
+  const auto& entry = store.image_entries_[slot];
+  if (entry.status != ImageStatus::Inactive && entry.status != ImageStatus::Eligible) throw std::runtime_error("invalid compiled slot status");
+  if (!entry.eligible()) {
+   if (entry.num_instances || entry.num_runs || entry.label_bytes) throw std::runtime_error("inactive compiled slot has published annotations");
+   continue;
+  }
+  ++eligible;
+  store.masks_available_ |= admit_compiled_annotations(entry, store.annotations(slot), store.header_, slot);
+  store.label_count_ += entry.num_instances;
+  store.run_count_ += entry.num_runs;
+ }
+ if (eligible != store.header_.num_images) throw std::runtime_error("compiled eligible population differs from header");
  store.catalog_ = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(store.header_));
- store.mapping_.advise_aligned_range(sections.index_offset, sections.expected_index_bytes, MADV_SEQUENTIAL);
- store.mapping_.advise_aligned_range(sections.pixel_offset, sections.pixel_blob_size, MADV_HUGEPAGE);
  const int advice = access == AccessPattern::Normal ? MADV_NORMAL : access == AccessPattern::Sequential ? MADV_SEQUENTIAL : MADV_RANDOM;
- store.mapping_.advise_aligned_range(sections.pixel_offset, sections.pixel_blob_size, advice);
- store.mapping_.advise_aligned_range(sections.label_offset, sections.label_bytes + sections.rle_region_bytes, MADV_SEQUENTIAL);
+ store.mapping_.advise_aligned_range(store.layout_.data_offset, store.layout_.index_offset - store.layout_.data_offset, advice);
  return store;
 }
 const std::filesystem::path& CompiledDataset::path() const noexcept { return path_; }
 const mmltk::backend::data::FileHeader& CompiledDataset::header() const noexcept { return header_; }
 std::span<const std::string> CompiledDataset::class_names() const noexcept { return catalog_ ? catalog_->names() : std::span<const std::string>{}; }
 std::span<const mmltk::backend::data::ImageEntry> CompiledDataset::image_entries() const noexcept { return image_entries_; }
-std::span<const mmltk::backend::data::PackedInstance> CompiledDataset::labels() const noexcept { return labels_; }
-std::span<const mmltk::backend::data::RLEPair> CompiledDataset::rle_pairs() const noexcept { return rle_pairs_; }
 bool CompiledDataset::masks_available() const noexcept { return masks_available_; }
-const mmltk::backend::data::ImageEntry& CompiledDataset::image_entry(const std::uint32_t compiled_index) const noexcept {
- assert(compiled_index < image_entries_.size());
- return image_entries_[compiled_index];
+const ImageEntry& CompiledDataset::image_entry(std::uint32_t slot) const {
+ if (!eligible(slot)) throw std::out_of_range("compiled image slot is not eligible");
+ return image_entries_[slot];
 }
-std::span<const mmltk::backend::data::PackedInstance> CompiledDataset::image_labels(const std::uint32_t compiled_index) const noexcept {
- const mmltk::backend::data::ImageEntry& entry = image_entry(compiled_index);
- const std::size_t begin = entry.label_offset / sizeof(mmltk::backend::data::PackedInstance);
- return labels_.subspan(begin, entry.num_instances);
+std::span<const std::byte> CompiledDataset::label_payload(std::uint32_t slot) const {
+ const auto& entry = image_entry(slot);
+ if (entry.label_bytes > COMPILED_LABEL_CAPACITY) throw std::runtime_error("compiled label payload exceeds capacity");
+ return {reinterpret_cast<const std::byte*>(mapping_.data() + layout_.label_offset(slot)), entry.label_bytes};
 }
-std::span<const mmltk::backend::data::RLEPair> CompiledDataset::instance_rle(const mmltk::backend::data::PackedInstance& instance) const noexcept {
- const std::size_t begin = instance.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair);
- return rle_pairs_.subspan(begin, instance.mask_rle_pairs);
-}
-const float* CompiledDataset::image_pixels(const std::uint32_t compiled_index) const noexcept {
- const mmltk::backend::data::ImageEntry& entry = image_entry(compiled_index);
- // The compiled layout validates float alignment and byte extent when the mapping is opened.
- // cppcheck-suppress invalidPointerCast
- return reinterpret_cast<const float*>(mapping_.data() + entry.pixel_offset);
+ImageAnnotations CompiledDataset::annotations(std::uint32_t slot) const { return annotation_view(image_entry(slot), label_payload(slot)); }
+std::span<const PackedInstance> CompiledDataset::image_labels(std::uint32_t slot) const { return annotations(slot).labels; }
+std::span<const RLEPair> CompiledDataset::instance_rle(std::uint32_t slot, const PackedInstance& instance) const { return annotations(slot).instance_rle(instance); }
+const float* CompiledDataset::image_pixels(std::uint32_t slot) const {
+ (void)image_entry(slot);
+ return reinterpret_cast<const float*>(mapping_.data() + layout_.pixel_offset(slot));
 }
 mmltk::backend::imaging::resample::ImageResizeGeometry CompiledDataset::geometry(const std::uint32_t compiled_index) const {
  const mmltk::backend::data::ImageEntry& entry = image_entry(compiled_index);
  return mmltk::backend::imaging::resample::compute_image_resize_geometry(entry.original_width, entry.original_height, header_.image_width, header_.image_height, header_.resize_mode);
 }
-std::span<const LabelIndexEntry> CompiledDataset::label_index() const noexcept { return label_index_; }
-const float* CompiledDataset::pixel_blob() const noexcept { return reinterpret_cast<const float*>(mapping_.data() + header_.pixel_offset); }
 bool CompiledDataset::read_images(const std::span<const CompiledImageRead> reads, const std::span<std::byte> destination, const std::atomic<bool>& cancelled, const bool prefault) const {
  return read_images_to(reads,
   ImageDestination{
@@ -84,7 +82,7 @@ bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> re
  constexpr std::size_t kReadExtent = 16U * 1024U * 1024U;
  const auto stride = static_cast<std::size_t>(header_.image_stride);
  for (const auto& read : reads) {
-  if (read.index >= image_entries_.size() || read.destination_offset > destination.capacity || stride > destination.capacity - read.destination_offset)
+  if (!eligible(read.index) || read.destination_offset > destination.capacity || stride > destination.capacity - read.destination_offset)
    throw std::out_of_range("compiled image read exceeds source or destination");
  }
  // Request the admitted slot's source runs before copying any of them. Source
@@ -93,11 +91,11 @@ bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> re
  for (std::size_t first = 0; first < reads.size();) {
   std::size_t end = first + 1;
   auto last_index = reads[first].index;
-  while (end < reads.size() && reads[end].index >= last_index && static_cast<std::uint64_t>(reads[end].index) <= static_cast<std::uint64_t>(last_index) + 1U &&
+  while (end < reads.size() && reads[end].index >= last_index && (reads[end].index == last_index || layout_.pixel_offset(reads[end].index) == layout_.pixel_offset(last_index) + stride) &&
          static_cast<std::size_t>(reads[end].index - reads[first].index) < std::max<std::size_t>(1U, kReadExtent / stride)) {
    last_index = reads[end++].index;
   }
-  const auto source_offset = image_entries_[reads[first].index].pixel_offset;
+  const auto source_offset = layout_.pixel_offset(reads[first].index);
   const auto bytes = (static_cast<std::size_t>(last_index - reads[first].index) + 1U) * stride;
   for (std::size_t offset = 0; offset < bytes;) {
    if (cancelled.load(std::memory_order_acquire)) return false;
@@ -109,10 +107,10 @@ bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> re
  }
  for (std::size_t first = 0; first < reads.size();) {
   std::size_t count = 1;
-  while (first + count < reads.size() && reads[first + count].index == reads[first].index + count && reads[first + count].destination_offset == reads[first].destination_offset + count * stride &&
+  while (first + count < reads.size() && layout_.pixel_offset(reads[first + count].index) == layout_.pixel_offset(reads[first].index) + count * stride && reads[first + count].destination_offset == reads[first].destination_offset + count * stride &&
          count < std::max<std::size_t>(1, kReadExtent / stride))
    ++count;
-  const auto source_offset = image_entries_[reads[first].index].pixel_offset;
+  const auto source_offset = layout_.pixel_offset(reads[first].index);
   const auto bytes = count * stride;
   for (std::size_t offset = 0; offset < bytes;) {
    if (cancelled.load(std::memory_order_acquire)) return false;

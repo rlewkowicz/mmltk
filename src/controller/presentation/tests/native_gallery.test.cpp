@@ -35,7 +35,7 @@
 #include <variant>
 #include <vector>
 #include "src/test_support/filesystem_test_utils.hpp"
-#include "src/backend/data/compiled/compiled_format.h"
+#include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/presentation/presentation_system.h"
@@ -67,70 +67,30 @@ void check_labels(const std::span<const ExploreLabel> actual, const std::span<co
 // CUDA rendering, cache ownership and runtime publication in the test path.
 void write_gallery_artifact(const std::filesystem::path& path, const float red, const std::uint32_t mask_start, const std::uint32_t count = 203U, const std::uint32_t classes = 1U) {
  namespace data = mmltk::backend::data;
- data::FileHeader header{
-  .magic = data::MAGIC,
-  .version = data::FORMAT_VERSION,
-  .num_images = count,
-  .image_width = 8U,
-  .image_height = 8U,
-  .channels = 3U,
-  .num_classes = classes,
-  .index_offset = sizeof(data::FileHeader),
-  .label_offset = 0U,
-  .pixel_offset = 0U,
-  .mask_rle_offset = 0U,
-  .total_file_size = 0U,
-  .image_stride = 8U * 8U * 3U * sizeof(float),
-  .class_names = {},
-  .max_instances_per_image = 1U,
-  ._reserved = {}
- };
- header.pixel_offset = data::align_up(header.index_offset + count * sizeof(data::ImageEntry), data::HUGE_PAGE_SIZE);
- header.label_offset = header.pixel_offset + count * header.image_stride;
- header.mask_rle_offset = header.label_offset + count * sizeof(data::PackedInstance);
- header.total_file_size = header.mask_rle_offset + count * sizeof(data::RLEPair);
- for (std::uint32_t category = 0U; category < classes; ++category) {
-  const auto name = std::string{"object"} + std::to_string(category);
-  std::memcpy(header.class_names[category].data(), name.c_str(), name.size() + 1U);
- }
- std::vector<std::byte> bytes(header.total_file_size);
- std::memcpy(bytes.data(), &header, sizeof(header));
- for (std::uint32_t index = 0U; index < count; ++index) {
-  const data::ImageEntry entry{
-   .pixel_offset = header.pixel_offset + index * header.image_stride,
-   .label_offset = static_cast<std::uint32_t>(index * sizeof(data::PackedInstance)),
-   .num_instances = 1U,
-   ._pad = 0U,
-   .label_bytes = sizeof(data::PackedInstance),
-   .original_width = 8U,
-   .original_height = 8U,
-   ._reserved = 0U
-  };
-  const data::PackedInstance label{
-   .class_id = 0U,
-   .flags = data::kAnnotationMask,
-   .bbox_x1 = 1,
-   .bbox_y1 = 1,
-   .bbox_x2 = 7,
-   .bbox_y2 = 7,
-   .mask_rle_offset = static_cast<std::uint32_t>(index * sizeof(data::RLEPair)),
-   .mask_rle_pairs = 1U,
-   .original_area = 4.0
-  };
-  const data::RLEPair run{mask_start, 4U};
+ const auto layout = data::compute_file_layout(count, 8U * 8U * 3U * sizeof(float));
+ std::vector<std::string> names;
+ for (std::uint32_t category = 0; category < classes; ++category) names.push_back("object" + std::to_string(category));
+ const auto header = data::make_file_header({count, 8U, 8U, 3U, 1U, layout.image_stride}, names, layout);
+ const auto output = mmltk::common::io::FileHandle::create_output(path.string(), 0);
+ output.resize_sparse(layout.total_size);
+ output.pwrite_all(&header, sizeof(header), 0);
+ for (std::uint32_t index = 0; index < count; ++index) {
+  data::ImageEntry entry{};
+  entry.status = data::ImageStatus::Eligible;
+  entry.original_width = entry.original_height = 8;
+  data::set_annotation_extent(entry, 1, 1, std::to_string(index));
+  const data::PackedInstance label{.class_id = 0, .flags = data::kAnnotationMask, .bbox_x1 = 1, .bbox_y1 = 1, .bbox_x2 = 7, .bbox_y2 = 7, .mask_rle_offset = 0, .mask_rle_pairs = 1, .original_area = 4};
+  const data::RLEPair run{mask_start, 4};
   std::array<float, 8U * 8U * 3U> pixels{};
-  for (std::size_t pixel = 0U; pixel < 64U; ++pixel) {
+  for (std::size_t pixel = 0; pixel < 64; ++pixel) {
    pixels[pixel] = red;
-   pixels[64U + pixel] = static_cast<float>(index) / 255.0F;
+   pixels[64 + pixel] = static_cast<float>(index) / 255.F;
   }
-  std::memcpy(bytes.data() + header.index_offset + index * sizeof(entry), &entry, sizeof(entry));
-  std::memcpy(bytes.data() + entry.pixel_offset, pixels.data(), sizeof(pixels));
-  std::memcpy(bytes.data() + header.label_offset + entry.label_offset, &label, sizeof(label));
-  std::memcpy(bytes.data() + header.mask_rle_offset + label.mask_rle_offset, &run, sizeof(run));
+  output.pwrite_all(&entry, sizeof(entry), layout.index_offset + index * sizeof(entry));
+  output.pwrite_all(pixels.data(), sizeof(pixels), layout.pixel_offset(index));
+  data::write_compiled_annotations(output, layout, index, entry, {{&label, 1}, {&run, 1}});
  }
- std::ofstream output(path, std::ios::binary);
- output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
- REQUIRE(output.good());
+
 }
 struct GalleryEvidence final {
  std::mutex mutex;

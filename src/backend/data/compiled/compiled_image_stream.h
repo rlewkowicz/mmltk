@@ -76,6 +76,9 @@ public:
  [[nodiscard]] std::weak_ptr<const void> storage_custody() const noexcept;
  [[nodiscard]] const mmltk::frameworks::gpu::DeviceExecution& execution() const noexcept;
  void prepare_host(std::size_t slot, std::size_t bytes);
+ void prepare_reads(std::size_t slot, std::size_t count, bool annotations = false);
+ [[nodiscard]] std::span<const ImageAnnotations> annotations(std::size_t slot) const;
+ [[nodiscard]] const Buffer& label_storage(std::size_t slot) const;
  void prepare_metadata(std::size_t slot, std::size_t bytes);
  [[nodiscard]] const Buffer& metadata_storage(std::size_t slot);
  void prepare_images(std::size_t slot, std::size_t bytes);

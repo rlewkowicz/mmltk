@@ -1101,9 +1101,8 @@ PredictionRunResult PredictionSession::State::RunResolved(
  } source_readers{*this, loader, video, mmltk::frameworks::gpu::ReserveTerminalCudaLease(*source_retirement)};
  if (delivery.admitted) delivery.admitted(result.execution);
  if (delivery.begin) delivery.begin(result);
- std::vector<int> image_ids;
  if (loader) {
-  image_ids = EvaluationDatasetOwner(*loader, EvaluationMetricSet::BBox).image_ids();
+
   started = std::chrono::steady_clock::now();
   loader->begin_epoch();
  }
@@ -1136,8 +1135,8 @@ PredictionRunResult PredictionSession::State::RunResolved(
    const auto active = std::min(batch.num_images, total - admitted);
    for (std::size_t image = 0; image < active; ++image) {
     const auto dataset_index = batch.image_indices[image];
-    if (dataset_index >= image_ids.size()) throw std::runtime_error("RF-DETR dataset image index is out of range");
-    lane.records.push_back({.dataset_index = dataset_index, .image_id = image_ids[dataset_index], .source_name = std::to_string(dataset_index)});
+    if (!loader->eligible(dataset_index)) throw std::runtime_error("RF-DETR dataset image index is out of range");
+    lane.records.push_back({.dataset_index = dataset_index, .image_id = static_cast<std::int64_t>(dataset_index) + 1, .source_name = std::to_string(dataset_index)});
     lane.pixels.push_back({.width = loader->image_width(), .height = loader->image_height(), .device = device, .stream = stream.native_handle});
     lane.annotations.demand[image] = prediction_demand(options, backend, delivery, lane.records.back(), loader->image_width(), loader->image_height());
     if (lane.annotations.demand[image].pixels_admitted) {

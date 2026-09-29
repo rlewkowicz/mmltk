@@ -1,4 +1,5 @@
 #include "src/backend/data/compiled/compiled_image_stream.h"
+#include "src/common/math/checked_arithmetic.h"
 #include <cuda_runtime_api.h>
 #include <cuda.h>
 #include <spdlog/spdlog.h>
@@ -6,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstring>
 #include <mutex>
 #include <limits>
 #include <stdexcept>
@@ -128,9 +130,14 @@ void CompiledImageStream::Buffer::consumed(void* stream) {
 }
 struct CompiledImageStream::Impl {
  struct Slot {
-  explicit Slot(const mmltk::common::system::ExecutionPlacement& placement) : host(true, &placement), metadata(true, &placement) {}
+  explicit Slot(const mmltk::common::system::ExecutionPlacement& placement, bool demanded_host) : host(true, &placement), metadata(true, &placement), labels(true, &placement) {
+   if (demanded_host) host_policy.emplace(mmltk::common::system::ExecutionPolicyRequest{placement.cpus, {}, 0, placement.numa_node, -10, true});
+  }
   Buffer host;
   Buffer metadata;
+  Buffer labels;
+  std::optional<mmltk::common::system::PreparedExecutionPolicy> host_policy;
+  std::vector<ImageAnnotations> annotations;
   std::vector<CompiledImageRead> reads;
   const CompiledDataset* source = nullptr;
   ReadObserver observer;
@@ -183,7 +190,7 @@ struct CompiledImageStream::Impl {
      policy.io_class, policy.io_priority_data);
    });
   }
-  for (auto& slot : slots) slot = std::make_unique<Slot>(execution.placement);
+  for (auto& slot : slots) slot = std::make_unique<Slot>(execution.placement, !config.loading.h2d_dataloader);
   for (auto& device : devices) device = std::make_unique<Buffer>(false, nullptr, !config.loading.h2d_dataloader);
   for (auto& queue : completions) queue.jobs.resize(config.slots);
  }
@@ -438,8 +445,26 @@ void CompiledImageStream::prepare_host(const std::size_t index, const std::size_
  if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced) throw std::logic_error("compiled image host storage is still borrowed");
  on_context(impl_->context, [&] { slot.host.ensure_bytes(bytes); });
 }
+void CompiledImageStream::prepare_reads(std::size_t index, std::size_t count, bool annotations) {
+ const std::lock_guard lock(impl_->mutex);
+ auto& slot = *impl_->slots.at(index);
+ if (impl_->failure) std::rethrow_exception(impl_->failure);
+ if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced) throw std::logic_error("compiled read storage is still borrowed");
+ if (annotations || !slot.annotations.empty()) {
+  count = std::max(count, slot.annotations.size());
+  const auto bytes = mmltk::common::math::checked_multiply(count, COMPILED_LABEL_CAPACITY, "compiled batch labels overflow");
+  on_context(impl_->context, [&] { slot.labels.ensure_bytes(bytes); });
+  slot.annotations.resize(count);
+ }
+ slot.reads.reserve(count);
+}
+const CompiledImageStream::Buffer& CompiledImageStream::label_storage(std::size_t index) const { return impl_->slots.at(index)->labels; }
+std::span<const ImageAnnotations> CompiledImageStream::annotations(std::size_t index) const {
+ const auto& slot = *impl_->slots.at(index);
+ return {slot.annotations.data(), slot.annotations.empty() ? 0U : slot.reads.size()};
+}
 void CompiledImageStream::prepare_images(std::size_t index, std::size_t bytes) {
- if (impl_->config.loading.h2d_dataloader) prepare_host(index, bytes);
+ prepare_host(index, bytes);
  prepare_device(index, bytes);
 }
 void CompiledImageStream::prepare_metadata(std::size_t index, std::size_t bytes) {
@@ -478,12 +503,39 @@ std::span<const std::byte> CompiledImageStream::host_images(const std::size_t in
  auto& slot = *impl_->slots.at(index);
  std::size_t bytes = 0;
  for (const auto& read : slot.reads) bytes = std::max(bytes, read.destination_offset + slot.source->header().image_stride);
- if (!impl_->config.loading.h2d_dataloader && !slot.host_materialized) {
-  on_context(impl_->context, [&] { slot.host.ensure_bytes(bytes); });
-  mmltk::common::system::ScopedExecutionPolicy policy({impl_->cpus, {}, 0, impl_->execution.placement.numa_node, -10, true});
-  if (!slot.source->read_images(slot.reads, {static_cast<std::byte*>(slot.host.data()), bytes}, slot.cancelled, impl_->config.prefault)) throw std::runtime_error("CPU image view read cancelled");
-  slot.host_materialized = true;
+ bool materialize = false;
+ {
+  const std::lock_guard lock(impl_->mutex);
+  if (!impl_->config.loading.h2d_dataloader && !slot.host_materialized) {
+   if (bytes > slot.host.capacity_bytes()) throw std::logic_error("CPU image storage was not prepared");
+   if (slot.reading) throw std::logic_error("CPU image materialization already active");
+   slot.reading = true;
+   ++slot.read_callbacks;
+   materialize = true;
+  }
  }
+ if (materialize) {
+  std::exception_ptr failure;
+  bool complete = false;
+  try {
+   // The caller can hold its loader lease lock. Never wait behind a reader
+   // callback that needs that lock, or depend on a pool detached during stop.
+   mmltk::common::system::ScopedExecutionPolicy policy(*slot.host_policy);
+   complete = slot.source->read_images(slot.reads, {static_cast<std::byte*>(slot.host.data()), bytes}, slot.cancelled, impl_->config.prefault);
+   policy.Restore();
+  } catch (...) { failure = std::current_exception(); }
+  {
+   const std::lock_guard lock(impl_->mutex);
+   slot.host_materialized = complete && !failure;
+   slot.read_failure = failure;
+   slot.reading = false;
+   --slot.read_callbacks;
+   impl_->changed.notify_all();
+  }
+  if (failure) std::rethrow_exception(failure);
+  if (!complete) throw std::runtime_error("CPU image view read cancelled");
+ }
+
  return {static_cast<const std::byte*>(slot.host.data()), bytes};
 }
 const CompiledImageStream::Buffer& CompiledImageStream::host_storage(const std::size_t slot) const { return impl_->slots.at(slot)->host; }
@@ -505,6 +557,7 @@ void CompiledImageStream::submit(
   if (impl_->failure) std::rethrow_exception(impl_->failure);
   if (!impl_->initialized) throw std::logic_error("compiled image stream must bind its context before submitting reads");
   if (slot.reading || slot.transfer_pending || slot.consumer_pending || slot.unfenced || impl_->stopping) throw std::logic_error("compiled image slot is still in use");
+  if (reads.size() > slot.reads.capacity() || (!slot.annotations.empty() && reads.size() > slot.annotations.size())) throw std::out_of_range("compiled read descriptors were not prepared");
   slot.reads.assign(reads.begin(), reads.end());
   slot.cancelled.store(false, std::memory_order_release);
   slot.reading = true;
@@ -540,6 +593,17 @@ void CompiledImageStream::read_slot(const std::size_t index) noexcept {
    // The compiled layout fixes source offsets in index order. Keep every
    // logical occurrence and its destination, reusing only this slot's inventory.
    // Sequential batches avoid sorting and retain their coalesced gather copy.
+   if (!current.annotations.empty()) {
+    for (std::size_t i = 0; i < current.reads.size(); ++i) {
+     if (current.cancelled.load(std::memory_order_acquire)) break;
+     const auto& read = current.reads[i];
+     const auto position = read.destination_offset / source.header().image_stride;
+     const auto payload = source.label_payload(read.index);
+     auto* destination = static_cast<std::byte*>(current.labels.data()) + position * COMPILED_LABEL_CAPACITY;
+     std::memcpy(destination, payload.data(), payload.size());
+     current.annotations[position] = annotation_view(source.image_entry(read.index), {destination, payload.size()});
+    }
+   }
    if (!std::ranges::is_sorted(current.reads, {}, &CompiledImageRead::index)) std::ranges::sort(current.reads, {}, &CompiledImageRead::index);
    if (impl_->config.loading.h2d_dataloader) {
     read = source.read_images(current.reads, {static_cast<std::byte*>(current.host.data()), current.host.capacity_bytes()}, current.cancelled, impl_->config.prefault);
@@ -593,10 +657,8 @@ void CompiledImageStream::cancel_read(const std::size_t index) noexcept {
  impl_->changed.notify_all();
 }
 void CompiledImageStream::wait_reads() {
- if (!impl_->pool) return;
- if (impl_->private_pool) {
+ if (impl_->pool && impl_->private_pool) {
   impl_->pool->wait_idle();
-  return;
  }
  std::unique_lock lock(impl_->mutex);
  impl_->changed.wait(lock, [&] { return std::ranges::all_of(impl_->slots, [](const auto& slot) { return !slot->reading && slot->read_callbacks == 0; }); });
@@ -678,6 +740,8 @@ int CompiledImageStream::reset_storage() noexcept {
    return cudaErrorNotReady;
  }
  for (auto& slot : impl_->slots) {
+  const auto labels_status = slot->labels.reset();
+  if (labels_status != cudaSuccess) return labels_status;
   const auto metadata_status = slot->metadata.reset();
   if (metadata_status != cudaSuccess) return metadata_status;
   const auto status = slot->host.reset();
@@ -690,7 +754,7 @@ int CompiledImageStream::reset_storage() noexcept {
  return cudaSuccess;
 }
 bool CompiledImageStream::owns_allocation() const noexcept {
- return std::ranges::any_of(impl_->slots, [](const auto& slot) { return slot->host.owns_allocation() || slot->metadata.owns_allocation(); }) ||
+ return std::ranges::any_of(impl_->slots, [](const auto& slot) { return slot->host.owns_allocation() || slot->metadata.owns_allocation() || slot->labels.owns_allocation(); }) ||
         std::ranges::any_of(impl_->devices, [](const auto& device) { return device->owns_allocation(); });
 }
 bool CompiledImageStream::owns_resources() const noexcept {

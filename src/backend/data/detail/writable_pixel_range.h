@@ -1,19 +1,22 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <vector>
 #include "src/common/io/file_memory.h"
+#include "src/backend/data/compiled/compiled_file_layout.h"
 namespace mmltk::backend::data::detail {
+// Independently mapped blocks never relocate when later slots arrive. The owner
+// drains all borrowers before destruction; vector growth moves only map handles.
 class WritablePixelRange final {
 public:
- WritablePixelRange(int file_descriptor, std::size_t offset, std::size_t bytes);
- ~WritablePixelRange();
- WritablePixelRange(const WritablePixelRange&) = delete;
- WritablePixelRange& operator=(const WritablePixelRange&) = delete;
- WritablePixelRange(WritablePixelRange&&) noexcept;
- WritablePixelRange& operator=(WritablePixelRange&&) noexcept;
- [[nodiscard]] float* image(std::uint32_t image_index, std::size_t image_stride) const noexcept;
-
+ WritablePixelRange(int file_descriptor, const FileLayout&);
+ void grow(const FileLayout&);
+ [[nodiscard]] float* image(std::uint32_t slot) const;
 private:
- mmltk::common::io::MappedByteRegion region_;
+ int descriptor_;
+ FileLayout layout_;
+ mutable std::mutex mutex_;
+ std::vector<mmltk::common::io::MappedByteRegion> blocks_;
 };
 }  // namespace mmltk::backend::data::detail

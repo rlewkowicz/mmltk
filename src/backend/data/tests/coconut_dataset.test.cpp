@@ -56,6 +56,15 @@
 using namespace mmltk::backend::data;
 using namespace mmltk::backend::data::benchmark_internal;
 namespace {
+std::uint32_t compiled_slot(const CompiledDataset& dataset, std::uint64_t identity, AnnotationSource source) {
+ auto slots = dataset.eligible_slots();
+ const auto found = std::ranges::find_if(slots, [&](auto slot) {
+  const auto& entry = dataset.image_entry(slot);
+  return entry.has_source_image_id && entry.source_image_id == identity && entry.source == source;
+ });
+ if (found == slots.end()) throw std::runtime_error("expected source identity is absent from compiled output");
+ return *found;
+}
 NormalizedAnnotationIndex fixture_index(const NormalizedAnnotationBuilder& builder) { return seal_normalized_annotation_metadata(NormalizedAnnotationBuilder(builder)); }
 const NormalizedAnnotationIndex& fixture_index(const NormalizedAnnotationIndex& index) { return index; }
 using Json = nlohmann::json;
@@ -1340,7 +1349,7 @@ std::pair<PreparedBenchmarkSplit, std::string> cached_mask_pixel_fixture(const s
  split.name = "train";
  split.class_names = {"person"};
  split.sources = {{images}};
- split.images = {{7, 1, 1, 0, 0, 0}};
+ split.images = {{7, 1, 1, 0, 0}};
  return {std::move(split), std::move(encoded)};
 }
 }  // namespace
@@ -1402,13 +1411,14 @@ TEST_CASE("COCONut private catalog compiles all validation choices through the p
   config.trace = {};
   const auto train = CompiledDataset::open(config.output_dir / "train.bin");
   const auto val = CompiledDataset::open(config.output_dir / "val.bin");
-  REQUIRE(train.image_entries().size() == 4);
+  REQUIRE(train.header().num_images == 4);
   const std::array<std::uint64_t, 4> expected{7, 8, 1, 2};
-  for (std::uint32_t i = 0; i < expected.size(); ++i) CHECK(train.image_entry(i).source_image_id == expected[i]);
-  CHECK(train.image_entry(0).source == AnnotationSource::CoconutCoco);
-  CHECK(train.image_entry(2).source == AnnotationSource::CoconutObjects365V2);
+  std::array<std::uint32_t, 4> slots{};
+  for (std::uint32_t i = 0; i < expected.size(); ++i) slots[i] = compiled_slot(train, expected[i], i < 2 ? AnnotationSource::CoconutCoco : AnnotationSource::CoconutObjects365V2);
+  CHECK(train.image_entry(slots[0]).source == AnnotationSource::CoconutCoco);
+  CHECK(train.image_entry(slots[2]).source == AnnotationSource::CoconutObjects365V2);
   if (mismatched_geometry) {
-   for (const auto row : {2U, 3U}) {
+   for (const auto row : {slots[2], slots[3]}) {
     CHECK(train.image_labels(row).empty());
     CHECK(train.image_entry(row).original_width == 6U);
     CHECK(train.image_entry(row).original_height == 4U);
@@ -1426,15 +1436,15 @@ TEST_CASE("COCONut private catalog compiles all validation choices through the p
    CHECK(failures == 4U * static_cast<unsigned>(rebuild));
   }
   CHECK(dropped_instances == (mismatched_geometry ? 4U : 0U));
-  CHECK(train.image_labels(1).empty());
-  REQUIRE(train.image_labels(0).size() == 2);
-  CHECK(train.image_labels(0)[0].is_crowd());
-  CHECK(train.image_labels(0)[0].original_area == 7);
-  CHECK(train.image_labels(0)[1].original_area == 17);
-  CHECK(train.image_labels(0)[1].source_category_id == 2);
-  CHECK(train.image_labels(0)[0].source_ordinal == 0);
-  CHECK(train.image_labels(0)[1].source_ordinal == 1);
-  const auto runs = train.instance_rle(train.image_labels(0)[0]);
+  CHECK(train.image_labels(slots[1]).empty());
+  REQUIRE(train.image_labels(slots[0]).size() == 2);
+  CHECK(train.image_labels(slots[0])[0].is_crowd());
+  CHECK(train.image_labels(slots[0])[0].original_area == 7);
+  CHECK(train.image_labels(slots[0])[1].original_area == 17);
+  CHECK(train.image_labels(slots[0])[1].source_category_id == 2);
+  CHECK(train.image_labels(slots[0])[0].source_ordinal == 0);
+  CHECK(train.image_labels(slots[0])[1].source_ordinal == 1);
+  const auto runs = train.instance_rle(slots[0], train.image_labels(slots[0])[0]);
   REQUIRE(runs.size() == 3);
   CHECK(runs[0].start == 0);
   CHECK(runs[0].length == 4);
@@ -1442,17 +1452,19 @@ TEST_CASE("COCONut private catalog compiles all validation choices through the p
   CHECK(runs[1].length == 2);
   CHECK(runs[2].start == 8);
   CHECK(runs[2].length == 1);
-  for (std::size_t i = 0; i < 27; ++i) CHECK(train.image_pixels(0)[i] == 1.0F);
+  for (std::size_t i = 0; i < 27; ++i) CHECK(train.image_pixels(slots[0])[i] == 1.0F);
   REQUIRE(train.class_names().size() == 80);
   CHECK(train.class_names()[0] == "person");
   CHECK(train.class_names()[79] == "toothbrush");
-  CHECK(val.image_entries().size() == (choice == CoconutValidation::Coconut ? 2 : 1));
-  CHECK(val.image_entry(0).source_image_id == 9);
-  CHECK(val.image_entry(0).source == (choice == CoconutValidation::Stock ? AnnotationSource::Coco : AnnotationSource::CoconutCoco));
-  CHECK(val.image_labels(0).size() == (choice == CoconutValidation::Stock ? 1 : 2));
+  CHECK(val.header().num_images == (choice == CoconutValidation::Coconut ? 2 : 1));
+  const auto val_slot = compiled_slot(val, 9, choice == CoconutValidation::Stock ? AnnotationSource::Coco : AnnotationSource::CoconutCoco);
+  CHECK(val.image_entry(val_slot).source_image_id == 9);
+  CHECK(val.image_entry(val_slot).source == (choice == CoconutValidation::Stock ? AnnotationSource::Coco : AnnotationSource::CoconutCoco));
+  CHECK(val.image_labels(val_slot).size() == (choice == CoconutValidation::Stock ? 1 : 2));
   if (choice == CoconutValidation::Coconut) {
-   CHECK(val.image_entry(1).source_image_id == 1);
-   CHECK(val.image_entry(1).source == AnnotationSource::CoconutObjects365V1);
+   const auto objects_slot = compiled_slot(val, 1, AnnotationSource::CoconutObjects365V1);
+   CHECK(val.image_entry(objects_slot).source_image_id == 1);
+   CHECK(val.image_entry(objects_slot).source == AnnotationSource::CoconutObjects365V1);
   }
   const auto manifest = read_json_file(config.output_dir / "benchmark_manifest.json");
   CHECK_FALSE(manifest.contains("supplemental_sampling"));
@@ -1508,7 +1520,7 @@ TEST_CASE("COCONut fully covered XL keeps Large rows and rebuilds without an emp
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
  const auto catalog = local.selected(CoconutValidation::Coconut);
  compile_benchmark_recipe(config, &catalog);
- CHECK(CompiledDataset::open(config.output_dir / "train.bin").image_entries().size() == 3);
+ CHECK(CompiledDataset::open(config.output_dir / "train.bin").header().num_images == 3);
  const auto previous = file_bytes(config.output_dir / "train.bin");
  compile_benchmark_recipe(config, &catalog);
  CHECK(file_bytes(config.output_dir / "train.bin") == previous);
@@ -1604,7 +1616,7 @@ TEST_CASE("COCONut disjoint XL membership remains complete", "[coconut][benchmar
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock}, false);
  const auto catalog = local.selected(CoconutValidation::CoconutStock);
  compile_benchmark_recipe(config, &catalog);
- CHECK(CompiledDataset::open(config.output_dir / "train.bin").image_entries().size() == 4);
+ CHECK(CompiledDataset::open(config.output_dir / "train.bin").header().num_images == 4);
  CHECK(read_json_file(config.output_dir / "benchmark_manifest.json")["recipe"]["duplicate_xl_images"] == 0);
 }
 TEST_CASE("COCONut rejects physical COCO train validation reuse before publication", "[coconut][benchmark]") {
@@ -1858,18 +1870,19 @@ CustomRecipeCatalog local_custom_catalog(LocalCoconutRecipe& local, std::span<co
 void check_custom_compilation(const std::filesystem::path& output) {
  const auto train = CompiledDataset::open(output / "train.bin");
  const auto val = CompiledDataset::open(output / "val.bin");
- REQUIRE(train.image_entries().size() == 3);
- REQUIRE(val.image_entries().size() == 1);
+ REQUIRE(train.header().num_images == 3);
+ REQUIRE(val.header().num_images == 1);
  const std::array<std::uint64_t, 3> ids{7, 1, 17};
  const std::array<AnnotationSource, 3> sources{AnnotationSource::Coco, AnnotationSource::Objects365, AnnotationSource::OpenImages};
  const std::array<unsigned, 3> classes{2, 0, 1};
  // COCO preserves the annotation object's byte offset after {"annotations":[.
  const std::array<std::uint64_t, 3> source_ordinals{16, 0, 0};
  for (std::uint32_t i = 0; i < 3; ++i) {
-  CHECK(train.image_entry(i).source_image_id == ids[i]);
-  CHECK(train.image_entry(i).source == sources[i]);
-  REQUIRE(train.image_labels(i).size() == 1);
-  const auto& label = train.image_labels(i).front();
+  const auto slot = compiled_slot(train, ids[i], sources[i]);
+  CHECK(train.image_entry(slot).source_image_id == ids[i]);
+  CHECK(train.image_entry(slot).source == sources[i]);
+  REQUIRE(train.image_labels(slot).size() == 1);
+  const auto& label = train.image_labels(slot).front();
   CHECK(label.class_id == classes[i]);
   CHECK(label.bbox_x1 == 0.0F);
   CHECK(label.bbox_y1 == 0.0F);
@@ -1878,14 +1891,16 @@ void check_custom_compilation(const std::filesystem::path& output) {
   CHECK(label.original_area == 9);
   CHECK(label.source_ordinal == source_ordinals[i]);
   CHECK_FALSE(label.has_mask());
-  for (unsigned pixel = 0; pixel < 27; ++pixel) CHECK(train.image_pixels(i)[pixel] == 1.0F);
+  for (unsigned pixel = 0; pixel < 27; ++pixel) CHECK(train.image_pixels(slot)[pixel] == 1.0F);
  }
- CHECK(train.image_labels(0).front().annotation_id == 70);
- CHECK(train.image_labels(0).front().source_category_id == 3);
- CHECK(train.image_labels(0).front().is_crowd());
+ const auto coco_slot = compiled_slot(train, 7, AnnotationSource::Coco);
+ CHECK(train.image_labels(coco_slot).front().annotation_id == 70);
+ CHECK(train.image_labels(coco_slot).front().source_category_id == 3);
+ CHECK(train.image_labels(coco_slot).front().is_crowd());
  CHECK(train.class_names()[2] == "car");
- CHECK(val.image_entry(0).source_image_id == 9);
- CHECK(val.image_entry(0).source == AnnotationSource::Coco);
+ const auto validation_slot = compiled_slot(val, 9, AnnotationSource::Coco);
+ CHECK(val.image_entry(validation_slot).source_image_id == 9);
+ CHECK(val.image_entry(validation_slot).source == AnnotationSource::Coco);
  const auto manifest = read_json_file(output / "benchmark_manifest.json");
  CHECK(manifest["recipe"]["dataset"] == "coco-custom");
  CHECK(manifest["compiled_format_version"] == FORMAT_VERSION);
@@ -2388,7 +2403,7 @@ TEST_CASE("both stock recipes repair malformed admitted archives through their p
  auto config = local.compiler_config({enhanced ? BenchmarkDatasetVariant::Coconut : BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock}, false);
  compile_benchmark_recipe(config, enhanced ? &coconut : nullptr, enhanced ? nullptr : &custom);
  const auto compiled = CompiledDataset::open(config.output_dir / "val.bin");
- REQUIRE(compiled.image_entries().size() == 1);
+ REQUIRE(compiled.header().num_images == 1);
  CHECK(compiled.image_entry(0).source_image_id == 9);
  CHECK(compiled.image_entry(0).source == AnnotationSource::Coco);
  CHECK(server.requests() == 1);
@@ -3463,7 +3478,7 @@ TEST_CASE("COCONut annotation transfer settles while physical inventory acquisit
  } else {
   physical.server.ReleasePartial();
   mmltk::testsupport::await_test_future(compiling, "independent COCONut inputs", 5s);
-  CHECK(CompiledDataset::open(local.output / "train.bin").image_entries().size() == 4);
+  CHECK(CompiledDataset::open(local.output / "train.bin").header().num_images == 4);
  }
  physical.server.ReleasePartial();
  physical.server.Check();
@@ -3498,11 +3513,12 @@ TEST_CASE("COCONut readable mismatched geometry survives a failed body and cache
  CHECK(std::ranges::all_of(settled.sources, &BenchmarkSourceProgress::complete));
  CHECK(file_bytes(config.output_dir / "train.bin") == expected);
  const auto train = CompiledDataset::open(config.output_dir / "train.bin");
- CHECK(train.image_labels(2).empty());
- CHECK(train.image_entry(2).original_width == 6);
- CHECK(train.image_entry(2).original_height == 4);
+ const auto slot = compiled_slot(train, 1, AnnotationSource::CoconutObjects365V2);
+ CHECK(train.image_labels(slot).empty());
+ CHECK(train.image_entry(slot).original_width == 6);
+ CHECK(train.image_entry(slot).original_height == 4);
 }
-TEST_CASE("production output admission counts only unsettled format-9 extents", "[benchmark][coconut][storage]") {
+TEST_CASE("production output admission counts only unsettled occupied extents", "[benchmark][coconut][storage]") {
  ScopedTempDir root("output-additional-storage");
  LocalCoconutRecipe local(root.path());
  const auto catalog = local.selected(CoconutValidation::CoconutStock);
@@ -3515,9 +3531,10 @@ TEST_CASE("production output admission counts only unsettled format-9 extents", 
  };
  compile_benchmark_recipe(config, &catalog);
  REQUIRE(additional.has_value());
- // All fixture labels fit the already allocated last filesystem block. Pixel
- // staging has already paid for both aligned format-9 index/pixel prefixes.
- CHECK(*additional == 0);
+ // Pixels are already allocated. Labels and the two compact footers still
+ // require a few pages; sparse label capacity never becomes a disk promise.
+ CHECK(*additional > 0);
+ CHECK(*additional < 64 * 1024);
  CHECK(std::filesystem::file_size(config.output_dir / "train.bin") > 2 * 1024 * 1024);
 }
 TEST_CASE("COCONut cold partial and warm preparation admit each immutable product once", "[benchmark][coconut][pipeline]") {
@@ -3584,7 +3601,7 @@ TEST_CASE("custom production inspects a completed archive while an independent a
  CHECK(std::filesystem::is_regular_file(cached_image_path(local.cache.source_images("coco") / "val2017", 9)));
  train.server.ReleasePartial();
  mmltk::testsupport::await_test_future(compiling, "independent custom artifacts", 5s);
- CHECK(CompiledDataset::open(local.output / "train.bin").image_entries().size() == 4);
+ CHECK(CompiledDataset::open(local.output / "train.bin").header().num_images == 4);
  train.server.Check();
  validation.server.Check();
 }
@@ -3592,7 +3609,7 @@ TEST_CASE("COCONut consumes ready releases while an unrelated lifecycle lease is
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPU lanes");
  bool fail_blocked_release = false, cold_ready_release = false;
- SECTION("ready releases settle in canonical output order") {}
+ SECTION("ready releases retain their source identities") {}
  SECTION("a cold ready release normalizes before the blocked release settles") { cold_ready_release = true; }
  SECTION("a failed later release retains the published generation") { fail_blocked_release = true; }
  ScopedTempDir root("coconut-release-readiness");
@@ -3901,7 +3918,7 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
   CHECK(annotation_server->requests() == 1);
   annotation_server->Check();
  }
- CHECK(CompiledDataset::open(local.output / "val.bin").image_entries().size() == 1);
+ CHECK(CompiledDataset::open(local.output / "val.bin").header().num_images == 1);
 }
 TEST_CASE("cold benchmark readers finish oversized grants with retained release control on one CPU", "[benchmark][coconut][pipeline]") {
  ScopedTempDir root("cold-shared-readers");
@@ -4657,7 +4674,7 @@ TEST_CASE("COCONut physical routing consumes requests without an eager archive c
  artifact.expected_size = std::filesystem::file_size(parquet);
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Coconut}, true);
  compile_benchmark_recipe(config, &catalog);
- CHECK(CompiledDataset::open(config.output_dir / "train.bin").image_entries().size() == 4);
+ CHECK(CompiledDataset::open(config.output_dir / "train.bin").header().num_images == 4);
  // Warm component locators and individually cached images continue to use the
  // same physical generation without walking its unused suffix.
  const auto image = cached_image_path(local.cache.source_images("objects365") / "patch-32", 1);
@@ -5034,7 +5051,7 @@ TEST_CASE("physical metadata and pixels progress while stock originals are held"
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  originals.reset();
  mmltk::testsupport::await_test_future(compiling, "originals and independent pixels settle", 5s);
- CHECK(CompiledDataset::open(config.output_dir / "train.bin").image_entries().size() == 4);
+ CHECK(CompiledDataset::open(config.output_dir / "train.bin").header().num_images == 4);
 }
 TEST_CASE("independent physical archives resolve while one image source is held", "[benchmark][coconut][pipeline]") {
  using namespace std::chrono_literals;
@@ -5173,7 +5190,7 @@ TEST_CASE("failed XL generations retire oversized backing before source repair",
   mmltk::testsupport::await_test_future(compiling, "XL repair reuses the unchanged one-byte scheduling target", 10s);
   CHECK(server.requests() == 1);
   CHECK(file_bytes(path) == payload);
-  CHECK(CompiledDataset::open(config.output_dir / "train.bin").image_entries().size() == 4);
+  CHECK(CompiledDataset::open(config.output_dir / "train.bin").header().num_images == 4);
  }
  server.Check();
 }
@@ -5443,7 +5460,7 @@ TEST_CASE("oversized gzip storage admits its synchronous pixel continuation", "[
  split.name = "train";
  split.class_names = {"person"};
  split.sources = {{images}};
- split.images = {{1, 3, 3, 0, 0, 0}, {2, 3, 3, 0, 0, 0}};
+ split.images = {{1, 3, 3, 0, 0}, {2, 3, 3, 0, 0}};
  BenchmarkWriteRequest pixels{.split = split, .output_path = root.path() / "result.bin", .resolution = 1, .num_workers = 1, .cancel_requested = cancellation, .execution = &execution};
  BenchmarkSplitWriter writer(pixels, true);
  BenchmarkCompilePipeline::Attempt attempt(execution);
@@ -5975,7 +5992,7 @@ TEST_CASE("panoptic JSON publishes physical facts before unrelated envelope tail
  split.name = "train";
  split.class_names = {"person"};
  split.sources = {{image_root}};
- split.images = {{3, 3, 3, 0, 0, 0}};
+ split.images = {{3, 3, 3, 0, 0}};
  BenchmarkWriteRequest output{.split = split, .output_path = root.path() / "pixels.bin", .resolution = 3, .num_workers = 1, .execution = &execution};
  if (cancel) output.progress = {.context = &cancelled, .image_completed = [](void* state) { static_cast<std::atomic<bool>*>(state)->store(true); }};
  BenchmarkSplitWriter writer(output);
@@ -6045,7 +6062,7 @@ TEST_CASE("consecutive Parquet groups retain compressed physical progress with b
  split.name = "train";
  split.class_names = {"person"};
  split.sources = {{images}};
- for (unsigned id = 1; id <= 4; ++id) split.images.push_back({id, 3, 3, 0, 0, 0});
+ for (unsigned id = 1; id <= 4; ++id) split.images.push_back({id, 3, 3, 0, 0});
  BenchmarkWriteRequest output{.split = split, .output_path = root.path() / "pixels.bin", .resolution = 3, .num_workers = 1, .execution = &execution};
  BenchmarkSplitWriter writer(output);
  BenchmarkCompilePipeline::Attempt attempt(execution);
@@ -6653,11 +6670,11 @@ TEST_CASE("late original withdrawal retains physical work and remaps changed sto
  incomplete_train.Release();
  mmltk::testsupport::await_test_future(compiling, "replacement originals settle selected image placement", 5s);
  const auto compiled = CompiledDataset::open(local.output / "val.bin");
- REQUIRE(compiled.image_entries().size() == 1);
- CHECK(compiled.image_entry(0).source_image_id == selected_id);
- REQUIRE(compiled.image_labels(0).size() == 1);
- CHECK(compiled.image_labels(0)[0].annotation_id == 901);
- CHECK(compiled.image_labels(0)[0].source_category_id == 4);
+ REQUIRE(compiled.header().num_images == 1);
+ const auto slot = compiled_slot(compiled, selected_id, AnnotationSource::Coco);
+ REQUIRE(compiled.image_labels(slot).size() == 1);
+ CHECK(compiled.image_labels(slot)[0].annotation_id == 901);
+ CHECK(compiled.image_labels(slot)[0].source_category_id == 4);
  CHECK(validation_reads[9] == 1);
  CHECK(validation_reads[10] == static_cast<unsigned>(changed));
  CHECK(placements.load() >= 2);  // The withdrawn original must not authorize its earlier placement.
@@ -7324,17 +7341,20 @@ TEST_CASE("asynchronous native labels retain their sealed image until conversion
  const std::array<std::string_view, 1> classes{"person"};
  BenchmarkSplitAssembly assembly("train", classes, 1, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
  assembly.add_source(root);
- assembly.image({7, 1, 1, 0, 1, 0, AnnotationSource::CoconutCoco}, product, 19);
+ assembly.image({7, 1, 1, 1, 0, AnnotationSource::CoconutCoco}, product, 19);
  product.reset();
  CHECK_FALSE(placed_custody.expired());
- CHECK(assembly.data().labels.empty());
+ CHECK(assembly.data().annotations.size() == 1);
  CHECK(assembly.label_count() == 1);
  assembly.materialize(execution);
- CHECK(assembly.data().labels.front().source_ordinal == 19);
- CHECK(assembly.data().rle_pairs.front().length == 1);
+ CHECK(assembly.data().annotations.front().ordinal_base == 19);
+ CHECK(assembly.data().annotations.front().chunk->labels.front().source_ordinal == 0);
+ CHECK(assembly.data().annotations.front().chunk->runs.front().length == 1);
  CHECK(execution.wait_image_labels(root, 7, "native") == placed_custody.lock());
  execution.retire_attempt();
- CHECK(placed_custody.expired());  // Assembly released custody; pipeline reuse was the last owner.
+ CHECK_FALSE(placed_custody.expired());  // Final slot placement retains its immutable payload.
+ assembly = {};
+ CHECK(placed_custody.expired());
 }
 TEST_CASE("component dependency summaries retain full backing and recorded generations", "[benchmark][coconut][cache]") {
  ScopedTempDir root("component-consumed-summary");

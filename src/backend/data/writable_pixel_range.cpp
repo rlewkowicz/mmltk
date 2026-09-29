@@ -1,19 +1,29 @@
 #include "detail/writable_pixel_range.h"
-#include "src/pch_linux.h"
-#include "src/common/io/file_memory.h"
+#include <sys/mman.h>
+#include <sys/types.h>
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data::detail {
-WritablePixelRange::WritablePixelRange(const int file_descriptor, const std::size_t offset, const std::size_t bytes) {
- if (bytes == 0U) return;
- void* const mapping = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, file_descriptor, mmltk::common::math::checked_cast<off_t>(offset, "writable pixel mmap offset overflow"));
- if (mapping == MAP_FAILED) throw mmltk::common::io::errno_error("writable pixel mmap failed");
- region_.adopt(mapping, bytes);
- (void)::madvise(mapping, bytes, MADV_HUGEPAGE);
+WritablePixelRange::WritablePixelRange(int descriptor, const FileLayout& layout) : descriptor_(descriptor) { grow(layout); }
+void WritablePixelRange::grow(const FileLayout& layout) {
+ const std::lock_guard lock(mutex_);
+ if (layout_.image_stride && (layout_.image_stride != layout.image_stride || layout.num_slots < layout_.num_slots)) throw std::logic_error("writable compiled layout changed");
+ const auto count = layout.block_count();
+ blocks_.reserve(count);
+ while (blocks_.size() < count) {
+  const auto bytes = layout.pixel_block_bytes;
+  void* mapping = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, descriptor_, mmltk::common::math::checked_cast<off_t>(layout.block_offset(blocks_.size()), "compiled block mmap offset overflow"));
+  if (mapping == MAP_FAILED) throw mmltk::common::io::errno_error("compiled pixel block mmap failed");
+  mmltk::common::io::MappedByteRegion region;
+  region.adopt(mapping, bytes);
+  (void)::madvise(mapping, bytes, MADV_HUGEPAGE);
+  blocks_.push_back(std::move(region));
+ }
+ layout_ = layout;
 }
-WritablePixelRange::~WritablePixelRange() = default;
-WritablePixelRange::WritablePixelRange(WritablePixelRange&&) noexcept = default;
-WritablePixelRange& WritablePixelRange::operator=(WritablePixelRange&&) noexcept = default;
-float* WritablePixelRange::image(const std::uint32_t image_index, const std::size_t image_stride) const noexcept {
- return static_cast<float*>(region_.address()) + static_cast<std::size_t>(image_index) * (image_stride / sizeof(float));
+float* WritablePixelRange::image(std::uint32_t slot) const {
+ const std::lock_guard lock(mutex_);
+ if (slot >= layout_.num_slots) throw std::out_of_range("writable compiled pixel slot");
+ const auto block = layout_.block_index(slot);
+ return reinterpret_cast<float*>(static_cast<std::byte*>(blocks_[block].address()) + layout_.pixel_offset(slot) - layout_.block_offset(block));
 }
 }  // namespace mmltk::backend::data::detail

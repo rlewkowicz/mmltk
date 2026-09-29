@@ -168,7 +168,7 @@ void GpuBatchAugmenter::materialize_donors(const mmltk::backend::data::DatasetLo
     auto* image = resources_->donor_images_cpu_.data_ptr<float>() + slot * image_values;
     const bool image_changed = !materialized_donors_[slot].valid || materialized_donors_[slot].image_index != descriptor.image_index;
     if (image_changed) {
-     std::memcpy(image, reinterpret_cast<const std::byte*>(source.pixel_blob()) + descriptor.image_index * source.image_stride(), image_values * sizeof(float));
+     std::memcpy(image, source.image_pixels(descriptor.image_index), image_values * sizeof(float));
      ensure_cuda_ok(copy_(resources_->donor_images_.data_ptr<float>() + slot * image_values, image, image_values * sizeof(float), cudaMemcpyHostToDevice, stream), "upload logical donor image");
     }
     if (donor_metadata_[slot].has_mask) {
@@ -362,12 +362,12 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
   for (std::int64_t image = 0; image < current_batch_size_; ++image) {
    const auto& plan = batch_plan_.images[static_cast<std::size_t>(image)];
    if (plan.cache_source_ordinal < 0) continue;
-   require(batch.label_index != nullptr && batch.image_indices != nullptr && batch.labels != nullptr, "donor cache replacement requires source labels and identities");
-   const auto& entry = batch.label_index[batch.image_indices[image]];
-   require(plan.cache_source_ordinal < entry.num_instances, "donor cache source ordinal exceeds source labels");
-   const auto& instance = batch.labels[entry.label_begin + plan.cache_source_ordinal];
+   require(batch.image_indices != nullptr && (batch.source != nullptr || batch.annotation_views != nullptr), "donor cache replacement requires source labels and identities");
+   const auto entry = batch.annotations(image);
+   require(static_cast<std::size_t>(plan.cache_source_ordinal) < entry.labels.size(), "donor cache source ordinal exceeds source labels");
+   const auto& instance = entry.labels[plan.cache_source_ordinal];
    require(!instance.is_crowd(), "crowd annotation cannot enter the donor cache");
-   require(instance.mask_rle_pairs == 0 || batch.rle_pairs != nullptr, "donor cache source mask storage is missing");
+   (void)entry.instance_rle(instance);
    donor_support_[static_cast<std::size_t>(image)].reserve(instance.mask_rle_pairs);
   }
   auto* replacements = resources_->replacement_indices_cpu_.data_ptr<std::int64_t>();
@@ -383,13 +383,13 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
 #if MMLTK_ENABLE_PROFILING
     ++replacement_count;
 #endif
-    const auto& entry = batch.label_index[batch.image_indices[image]];
-    const auto& instance = batch.labels[entry.label_begin + plan.cache_source_ordinal];
+    const auto entry = batch.annotations(image);
+    const auto& instance = entry.labels[plan.cache_source_ordinal];
     auto& support = donor_support_[static_cast<std::size_t>(image)];
     support.clear();
     if (instance.mask_rle_pairs != 0) {
-     const auto* begin = batch.rle_pairs + instance.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair);
-     support.assign(begin, begin + instance.mask_rle_pairs);
+     const auto runs = entry.instance_rle(instance);
+     support.assign(runs.begin(), runs.end());
     }
     pack_compiled_rle_pairs(support, {packed_support + image * mask_words_, static_cast<std::size_t>(mask_words_)});
     materialized_donors_[static_cast<std::size_t>(image)] = {};

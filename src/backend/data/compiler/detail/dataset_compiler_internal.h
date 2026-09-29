@@ -18,8 +18,6 @@ struct DatasetScan {
 };
 struct LabelBlocks {
  std::vector<ImageEntry> index;
- std::vector<PackedInstance> labels;
- std::vector<RLEPair> rle_pairs;
  std::uint32_t max_instances_per_image = 0;
  bool any_image_resize = false;
  bool any_image_downscale = false;
@@ -60,7 +58,7 @@ struct PixelBlobWriteRequest {
  std::span<const int> worker_cpus;
  int initial_active_workers = 0;
  const std::atomic<bool>* release_all_workers = nullptr;
- size_t pixel_offset = 0;
+ FileLayout layout;
  mmltk::common::concurrency::CancellationObservation cancel_requested = {};
  std::atomic<bool>* failure_requested = nullptr;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
@@ -70,7 +68,7 @@ std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_
 std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);
 DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::string>& splits, mmltk::common::concurrency::CancellationObservation cancellation = {});
 LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config, const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base,
- const FileLayout& pixel_layout, int num_workers, std::span<const int> worker_cpus, ProgressCounter* completed_images = nullptr, std::atomic<bool>* failure_requested = nullptr,
+ const mmltk::common::io::FileHandle& output, const FileLayout& pixel_layout, int num_workers, std::span<const int> worker_cpus, ProgressCounter* completed_images = nullptr, std::atomic<bool>* failure_requested = nullptr,
  mmltk::common::concurrency::CancellationObservation cancellation = {});
 void write_metadata_blocks(const mmltk::common::io::FileHandle& fd, const FileLayout& layout, const FileHeader& header, const LabelBlocks& label_blocks,
  mmltk::common::concurrency::CancellationObservation cancel_requested = {});

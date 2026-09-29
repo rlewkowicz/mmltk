@@ -392,7 +392,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
   CHECK(std::abs(labels.front().bbox_y1 - (10.0F * static_cast<float>(letterbox.resized_height) / 24.0F + static_cast<float>(letterbox.offset_y))) < 1e-5F);
   CHECK(labels.front().bbox_x2 == 20.0F);
   CHECK(std::abs(labels.front().bbox_y2 - (23.0F * static_cast<float>(letterbox.resized_height) / 24.0F + static_cast<float>(letterbox.offset_y))) < 1e-5F);
-  const auto runs = non_square_store.instance_rle(labels.front());
+  const auto runs = non_square_store.instance_rle(image, labels.front());
   REQUIRE_FALSE(runs.empty());
   CHECK(runs.front().start >= letterbox.offset_y * 32U);
   CHECK(runs.back().start + runs.back().length <= (letterbox.offset_y + letterbox.resized_height) * 32U);
@@ -410,6 +410,12 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
  std::vector<std::uint32_t> sorted_order = first_order;
  std::ranges::sort(sorted_order);
  CHECK(sorted_order == std::vector<std::uint32_t>{10U, 11U});
+ auto sparse_summaries = summaries;
+ sparse_summaries[10].eligible = false;
+ std::vector<std::uint32_t> sparse_order, sparse_scratch;
+ REQUIRE(explore::rebuild_explore_order(sparse_summaries, filter, false, 0, sparse_order, sparse_scratch));
+ CHECK(sparse_order == std::vector<std::uint32_t>{11U});
+
  const explore::ExploreViewport gallery_viewport{
   .first_row = 0U,
   .row_count = 1U,
@@ -425,7 +431,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
  const auto adjacent = explore::adjacent_explore_index(first_order, first_order.front(), true);
  REQUIRE(adjacent);
  CHECK(store.image_pixels(*adjacent) != nullptr);
- CHECK(store.image_entry(*adjacent).pixel_offset != 0U);
+ CHECK(store.pixel_offset(*adjacent) != 0U);
  constexpr std::array<std::uint32_t, 3U> navigation{7U, 11U, 19U};
  CHECK(explore::adjacent_explore_index(navigation, 7U, false) == 19U);
  CHECK(explore::adjacent_explore_index(navigation, 19U, true) == 7U);
@@ -803,7 +809,7 @@ void test_compiled_explore_magnified_tiny_mask_and_transfer() {
  CHECK(labels[0].bbox_y1 == 0.0F);
  CHECK(labels[0].bbox_x2 == 1.0F);
  CHECK(labels[0].bbox_y2 == 1.0F);
- const auto runs = store.instance_rle(labels[0]);
+ const auto runs = store.instance_rle(10U, labels[0]);
  REQUIRE(runs.size() == 1);
  CHECK(runs[0].start == 0);
  CHECK(runs[0].length == 1);
@@ -902,7 +908,7 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
   for (const auto& label : labels) CHECK(label.has_mask());
   if (annotations.crowd_only) CHECK(std::ranges::all_of(labels, [](const auto& label) { return label.is_crowd(); }));
   std::size_t runs = 0U;
-  for (const auto& label : labels) runs += store.instance_rle(label).size();
+  for (const auto& label : labels) runs += store.instance_rle(10U, label).size();
   REQUIRE(runs == annotations.objects * annotations.runs_per_object);
   const bool donor_fits =
    !annotations.crowd_only && annotations.objects < controller::contracts::kAnnotationObjectCapacity && annotations.runs_per_object <= controller::contracts::kAnnotationMaskRunCapacity - runs;
@@ -1006,12 +1012,12 @@ void test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer() {
  const auto source_class = store.image_labels(0).front().class_id;
  namespace fixture = mmltk::backend::models::rfdetr::test_support;
  for (std::size_t i = 0; i < fixture::dot_runs.size(); ++i) {
-  const auto compiled_runs = store.instance_rle(store.image_labels(0)[i]);
+  const auto compiled_runs = store.instance_rle(0, store.image_labels(0)[i]);
   REQUIRE(compiled_runs.size() == 1);
   CHECK(compiled_runs[0].start == fixture::dot_runs[i].start);
   CHECK(compiled_runs[0].length == fixture::dot_runs[i].length);
  }
- const auto compiled_ring = store.instance_rle(store.image_labels(1).front());
+ const auto compiled_ring = store.instance_rle(1, store.image_labels(1).front());
  REQUIRE(compiled_ring.size() == fixture::ring_runs.size());
  for (std::size_t i = 0; i < compiled_ring.size(); ++i) {
   CHECK(compiled_ring[i].start == fixture::ring_runs[i].start);

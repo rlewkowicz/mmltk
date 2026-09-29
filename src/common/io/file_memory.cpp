@@ -106,6 +106,15 @@ void FileHandle::preallocate(const std::size_t bytes) const {
  const auto length = mmltk::common::math::checked_cast<off_t>(bytes, "file size overflow");
  if (::fallocate(get(), 0, 0, length) != 0 && ::ftruncate(get(), length) != 0) { throw errno_error("ftruncate failed"); }
 }
+void FileHandle::resize_sparse(std::size_t bytes) const {
+ if (::ftruncate(get(), mmltk::common::math::checked_cast<off_t>(bytes, "sparse file size overflow")) != 0) throw errno_error("sparse file resize failed");
+}
+void FileHandle::allocate_range(std::size_t offset, std::size_t bytes) const {
+ if (!bytes) return;
+ (void)mmltk::common::math::checked_cast<off_t>(mmltk::common::math::checked_add(offset, bytes, "file extent overflow"), "file extent overflow");
+ if (::fallocate(get(), 0, mmltk::common::math::checked_cast<off_t>(offset, "allocation offset overflow"), mmltk::common::math::checked_cast<off_t>(bytes, "allocation size overflow")) != 0)
+  throw errno_error("file extent allocation failed");
+}
 void FileHandle::pwrite_all(const void* source, const std::size_t bytes, const std::size_t offset) const {
  const auto* data = static_cast<const std::uint8_t*>(source);
  for (std::size_t written = 0; written < bytes;) {

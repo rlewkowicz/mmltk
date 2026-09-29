@@ -174,6 +174,19 @@ TEST_CASE("Sparse training shards preserve empty images distinct support and sta
  REQUIRE(shared.shards().size() == 1);
  CHECK(shared.shards()[0].images.size() == images.size());
  REQUIRE_THROWS(r::TrainingDataPlan({{{4}}}, 4, request));
+ auto sparse = images;
+ sparse[1].eligible = sparse[6].eligible = false;
+ r::TrainingDataPlan holes(sparse, 4, request);
+ REQUIRE(holes.shards().size() == 1);
+ CHECK(holes.shards()[0].images.size() == images.size() - 2);
+ CHECK(std::ranges::find(holes.shards()[0].images, 1) == holes.shards()[0].images.end());
+ CHECK(std::ranges::find(holes.shards()[0].images, 6) == holes.shards()[0].images.end());
+ CHECK(holes.shards()[0].unique_support == std::vector<std::uint64_t>{3, 1, 2, 0});
+ const auto draws = holes.epoch(0, 0);
+ CHECK(std::ranges::all_of(draws.schedule->image_indices, [&](auto slot) { return sparse[slot].eligible; }));
+ for (auto& image : sparse) image.eligible = false;
+ CHECK_THROWS(r::TrainingDataPlan(sparse, 4, request));
+
 }
 TEST_CASE("Repeated global windows rank slicing and semantic keys survive physical packing", "[rfdetr][training][data_plan]") {
  r::TrainRequest request;

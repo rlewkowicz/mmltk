@@ -615,30 +615,25 @@ void test_build_targets_recovers_after_staging_growth_and_failure() {
  if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
  constexpr int device_id = 0;
  using mmltk::backend::data::Batch;
- using mmltk::backend::data::LabelIndexEntry;
+ using mmltk::backend::data::ImageAnnotations;
  using mmltk::backend::data::PackedInstance;
  using mmltk::backend::data::RLEPair;
  const std::array indices{std::uint32_t{0}, std::uint32_t{1}};
- const std::array label_index{
-  LabelIndexEntry{0, 1, 0},
-  LabelIndexEntry{1, 2, 0},
- };
  std::array labels{
   PackedInstance{0, mmltk::backend::data::kAnnotationMask, 1, 1, 5, 5, 0, 1},
-  PackedInstance{1, mmltk::backend::data::kAnnotationMask, 2, 2, 6, 6, static_cast<std::uint32_t>(sizeof(RLEPair)), 1},
-  PackedInstance{0, mmltk::backend::data::kAnnotationMask, 3, 3, 7, 7, static_cast<std::uint32_t>(2 * sizeof(RLEPair)), 1},
+  PackedInstance{1, mmltk::backend::data::kAnnotationMask, 2, 2, 6, 6, 0, 1},
+  PackedInstance{0, mmltk::backend::data::kAnnotationMask, 3, 3, 7, 7, sizeof(RLEPair), 1},
  };
  const std::array rle_pairs{
   RLEPair{0, 16},
   RLEPair{8, 12},
   RLEPair{16, 8},
  };
+ const std::array annotation_views{ImageAnnotations{std::span{labels}.first(1), std::span{rle_pairs}.first(1)}, ImageAnnotations{std::span{labels}.subspan(1), std::span{rle_pairs}.subspan(1)}};
  const auto batch = [&](const std::size_t images) {
   return Batch{
    .num_images = images,
-   .label_index = label_index.data(),
-   .labels = labels.data(),
-   .rle_pairs = rle_pairs.data(),
+   .annotation_views = annotation_views.data(),
    .image_indices = indices.data(),
   };
  };
@@ -678,14 +673,12 @@ void test_copy_paste_cache_publication_recovers_without_targets() {
  const auto source_pixels = torch::full({1, 3, 8, 8}, .1F, options);
  constexpr PackedInstance instance{0, mmltk::backend::data::kAnnotationMask, 0, 0, 8, 8, 0, 1};
  constexpr RLEPair run{0, 64};
- const std::array<mmltk::backend::data::LabelIndexEntry, 2> entries{{{0, 1, 0}, {0, 0, 0}}};
+ const std::array entries{mmltk::backend::data::ImageAnnotations{{&instance, 1}, {&run, 1}}, mmltk::backend::data::ImageAnnotations{}};
  const std::array<std::uint32_t, 1> donor_index{0}, source_index{1};
  const mmltk::backend::data::Batch donor{
   .num_images = 1,
   .device_images = donor_pixels.data_ptr<float>(),
-  .label_index = entries.data(),
-  .labels = &instance,
-  .rle_pairs = &run,
+  .annotation_views = entries.data(),
   .image_indices = donor_index.data(),
   .slot_index = 0,
   .lease_id = 0
@@ -693,6 +686,7 @@ void test_copy_paste_cache_publication_recovers_without_targets() {
  auto source = donor;
  source.device_images = source_pixels.data_ptr<float>();
  source.image_indices = source_index.data();
+ source.annotation_views = &entries[1];
  REQUIRE_THROWS(augmenter.prepare_batch_consumer());
  REQUIRE_THROWS(augmenter.finish_batch(donor));
  // Cache input is the selected original instance. No target tensor, target
@@ -722,8 +716,9 @@ void test_copy_paste_cache_publication_recovers_without_targets() {
   select_original();
   (void)augmenter.prepare_batch_consumer();
   auto unavailable_support = donor;
-  unavailable_support.rle_pairs = nullptr;
-  REQUIRE_THROWS_WITH(augmenter.finish_batch(unavailable_support), "donor cache source mask storage is missing");
+  const mmltk::backend::data::ImageAnnotations missing{{&instance, 1}, {}};
+  unavailable_support.annotation_views = &missing;
+  REQUIRE_THROWS(augmenter.finish_batch(unavailable_support));
   REQUIRE_NOTHROW(augmenter.reconfigure(config));
   const auto recovered = augmenter.run(source, 127, 0, 0, cycle * 4 + 3);
   CHECK(augmenter.batch_plan().images[0].paste_donor_slot == -1);
@@ -760,18 +755,16 @@ void test_training_adapter_matches_raw_augmentation_executor() {
  };
  auto source_custody = std::make_shared<PixelCustody>(PixelCustody{source_execution.context, test_stream, {source_pixels, donor_pixels}});
  constexpr std::size_t image_bytes = 3U * height * width * sizeof(float);
- std::array<mmltk::backend::data::LabelIndexEntry, donor_index + 1U> label_index{};
- label_index[donor_index] = {0U, 1U, 0U};
  constexpr std::array donor_labels{
   mmltk::backend::data::PackedInstance{2U, mmltk::backend::data::kAnnotationMask, 1, 1, 7, 7, 0U, 1U},
  };
  constexpr std::array donor_rle{mmltk::backend::data::RLEPair{0U, height * width}};
+ const std::array donor_annotations{mmltk::backend::data::ImageAnnotations{donor_labels, donor_rle}};
+ const std::array empty_annotations{mmltk::backend::data::ImageAnnotations{}};
  const mmltk::backend::data::Batch donor_batch{
   .num_images = donor_indices.size(),
   .device_images = donor_pixels.data_ptr<float>(),
-  .label_index = label_index.data(),
-  .labels = donor_labels.data(),
-  .rle_pairs = donor_rle.data(),
+  .annotation_views = donor_annotations.data(),
   .image_indices = donor_indices.data(),
   .slot_index = 0U,
   .lease_id = 0U,
@@ -781,9 +774,7 @@ void test_training_adapter_matches_raw_augmentation_executor() {
  const mmltk::backend::data::Batch source_batch{
   .num_images = source_indices.size(),
   .device_images = source_pixels.data_ptr<float>(),
-  .label_index = label_index.data(),
-  .labels = donor_labels.data(),
-  .rle_pairs = donor_rle.data(),
+  .annotation_views = empty_annotations.data(),
   .image_indices = source_indices.data(),
   .slot_index = 0U,
   .lease_id = 0U,
@@ -970,14 +961,12 @@ void test_copy_paste_ring_support_and_cache_cycles() {
   };
  }
  labels.back() = {7, mmltk::backend::data::kAnnotationMask, 1, 1, 7, 7, dot_runs.size() * sizeof(RLEPair), static_cast<std::uint16_t>(ring_runs.size())};
- const std::array<mmltk::backend::data::LabelIndexEntry, 3> entries{{{0, 7, 0}, {7, 1, 0}, {0, 0, 0}}};
+ const std::array entries{mmltk::backend::data::ImageAnnotations{std::span{labels}.first(dot_runs.size()), runs}, mmltk::backend::data::ImageAnnotations{std::span{labels}.last(1), runs}, mmltk::backend::data::ImageAnnotations{}};
  const std::array<std::uint32_t, 1> source_index{0}, donor_index{1}, empty_index{2};
  auto batch = mmltk::backend::data::Batch{
   .num_images = 1,
   .device_images = donor_pixels.data_ptr<float>(),
-  .label_index = entries.data(),
-  .labels = labels.data(),
-  .rle_pairs = runs.data(),
+  .annotation_views = &entries[1],
   .image_indices = donor_index.data(),
   .slot_index = 0,
   .lease_id = 0
@@ -1009,6 +998,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
   // Warm the cache from original donor pixels and RLE, with no prior donor.
   batch.device_images = donor_pixels.data_ptr<float>();
   batch.image_indices = donor_index.data();
+  batch.annotation_views = &entries[donor_index[0]];
   (void)augmenter.run(batch, 127, 0, 0, 0);
   CHECK(augmenter.batch_plan().images[0].paste_donor_slot == -1);
   consume_cached_batch();
@@ -1019,6 +1009,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
   for (std::uint64_t cycle = 1; cycle <= 3; ++cycle) {
    batch.device_images = source_pixels.data_ptr<float>();
    batch.image_indices = cycle == 3 ? source_index.data() : empty_index.data();
+   batch.annotation_views = &entries[batch.image_indices[0]];
    const auto pixels = augmenter.run(batch, 127, 0, 0, cycle);
    const auto plan = augmenter.batch_plan().images[0];
    REQUIRE(plan.paste_donor_slot == 0);
@@ -1065,6 +1056,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
   // A disabled interval preserves the donor cache for a subsequent enable.
   augmenter.reconfigure(isolated_augmentation_config(0));
   batch.image_indices = empty_index.data();
+  batch.annotation_views = &entries[empty_index[0]];
   (void)augmenter.run(batch, 127, 0, 0, 4);
   CHECK(augmenter.batch_plan().images[0].paste_donor_slot == -1);
   consume_cached_batch();
@@ -1078,6 +1070,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
    labels.back().mask_rle_pairs = 0;
    labels.back().flags &= ~mmltk::backend::data::kAnnotationMask;
    batch.image_indices = donor_index.data();
+  batch.annotation_views = &entries[donor_index[0]];
    batch.device_images = donor_pixels.data_ptr<float>();
    (void)augmenter.run(batch, 127, 0, 0, 6);
    auto replacement = rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
@@ -1088,6 +1081,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
     lease.handoff();
    }
    batch.image_indices = empty_index.data();
+  batch.annotation_views = &entries[empty_index[0]];
    batch.device_images = source_pixels.data_ptr<float>();
    const auto rectangle = augmenter.run(batch, 127, 0, 0, 7);
    const auto box_plan = augmenter.batch_plan().images[0];
@@ -1129,6 +1123,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
   image.paste_support = ring_runs.data();
   image.paste_support_count = ring_runs.size();
   batch.image_indices = source_index.data();
+  batch.annotation_views = &entries[source_index[0]];
   std::vector<rfdetr::AugmentationPreviewAnnotation> preview;
   rfdetr::build_augmentation_preview_annotations(std::span{labels.data(), dot_runs.size()}, &labels.back(), &image, 8, 8, preview, runs);
   auto targets = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &plan);
@@ -1143,14 +1138,14 @@ void test_copy_paste_ring_support_and_cache_cycles() {
   lease.retire();
   // The first source lies in the ring's hole and survives its pasted donor:
   // augmentation grows one admitted target into two with one ordinary query.
-  const std::array<mmltk::backend::data::LabelIndexEntry, 1> one_source{{{0, 1, 0}}};
-  batch.label_index = one_source.data();
+  const std::array one_source{mmltk::backend::data::ImageAnnotations{std::span{labels}.first(1), runs}};
+  batch.annotation_views = one_source.data();
   auto grown = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 1, rfdetr::TrainingSupervisionConfig{}, 8, &plan);
   rfdetr::TargetConsumerLease grown_lease(scratch, grown, 0);
   grown_lease.handoff();
   REQUIRE(grown.counts == std::vector<int64_t>{2});
   REQUIRE(torch::equal(grown.all_labels.cpu(), torch::tensor({0, 7}, torch::TensorOptions().dtype(torch::kInt64))));
-  batch.label_index = entries.data();
+  batch.annotation_views = entries.data();
  }
 }
 void test_native_augmentation_preview_target_support_parity() {
@@ -1161,10 +1156,10 @@ void test_native_augmentation_preview_target_support_parity() {
  const std::array runs{RLEPair{9, 3}, RLEPair{17, 3}, RLEPair{25, 3}, RLEPair{10, 2}, RLEPair{18, 2}, RLEPair{26, 2}};
  const PackedInstance source{2, mmltk::backend::data::kAnnotationMask, 0, 0, 5, 5, 0, 3};
  const PackedInstance donor{4, mmltk::backend::data::kAnnotationMask, 0, 0, 5, 5, 3 * sizeof(RLEPair), 3};
- const std::array<mmltk::backend::data::LabelIndexEntry, 1> entries{{{0, 1, 0}}};
+ const std::array entries{mmltk::backend::data::ImageAnnotations{{&source, 1}, runs}};
  const std::array<std::uint32_t, 1> indices{0};
  const mmltk::backend::data::Batch batch{
-  .num_images = 1, .device_images = nullptr, .label_index = entries.data(), .labels = &source, .rle_pairs = runs.data(), .image_indices = indices.data(), .slot_index = 0, .lease_id = 0
+  .num_images = 1, .device_images = nullptr, .annotation_views = entries.data(), .image_indices = indices.data(), .slot_index = 0, .lease_id = 0
  };
  for (const bool include_masks : {false, true})
   for (const bool erase_all : {false, true}) {
@@ -1215,12 +1210,12 @@ void test_tiny_mask_training_outer_edges() {
  c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
  using mmltk::backend::data::PackedInstance;
  using mmltk::backend::data::RLEPair;
- const std::array<mmltk::backend::data::LabelIndexEntry, 1> entries{{{0, 1, 0}}};
  const std::array<std::uint32_t, 1> indices{0};
  for (const auto run : {RLEPair{0, 1}, RLEPair{7, 1}, RLEPair{24, 1}, RLEPair{31, 1}, RLEPair{11, 1}, RLEPair{11, 2}, RLEPair{10, 4}}) {
   const PackedInstance source{0, mmltk::backend::data::kAnnotationMask, 0, 0, 8, 4, 0, 1};
+  const std::array entries{mmltk::backend::data::ImageAnnotations{{&source, 1}, {&run, 1}}};
   const mmltk::backend::data::Batch batch{
-   .num_images = 1, .device_images = nullptr, .label_index = entries.data(), .labels = &source, .rle_pairs = &run, .image_indices = indices.data(), .slot_index = 0, .lease_id = 0
+   .num_images = 1, .device_images = nullptr, .annotation_views = entries.data(), .image_indices = indices.data(), .slot_index = 0, .lease_id = 0
   };
   for (int geometry = 0; geometry < 4; ++geometry)
    for (const bool masks : {false, true}) {
@@ -1263,19 +1258,17 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
  const auto floats = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
  auto pixels = torch::full({static_cast<int64_t>(count), 3, extent, extent}, 0.9F, floats);
  std::array<std::uint32_t, count> indices{};
- std::array<mmltk::backend::data::LabelIndexEntry, count> label_index{};
+ std::array<mmltk::backend::data::ImageAnnotations, count> annotation_views{};
  for (std::size_t image = 0U; image < count; ++image) {
   indices[image] = static_cast<std::uint32_t>(image);
-  label_index[image] = {0U, 1U, 0U};
  }
  constexpr std::array labels{mmltk::backend::data::PackedInstance{0U, mmltk::backend::data::kAnnotationMask, 0, 0, extent, extent, 0U, 1U}};
  constexpr std::array rle{mmltk::backend::data::RLEPair{0U, extent * extent}};
+ for (auto& view : annotation_views) view = {labels, rle};
  const mmltk::backend::data::Batch batch{
   .num_images = count,
   .device_images = pixels.data_ptr<float>(),
-  .label_index = label_index.data(),
-  .labels = labels.data(),
-  .rle_pairs = rle.data(),
+  .annotation_views = annotation_views.data(),
   .image_indices = indices.data(),
   .slot_index = 0U,
   .lease_id = 0U
@@ -2075,13 +2068,13 @@ TEST_CASE("training excludes crowds and retains continuous targets with known em
  if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
  c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
  using namespace mmltk::backend::data;
- const std::array entries{LabelIndexEntry{0, 2, 0}};
  const std::array indices{std::uint32_t{0}};
  std::array labels{
   PackedInstance{.class_id = 0, .flags = kAnnotationCrowd, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 8, .bbox_y2 = 8, .mask_rle_offset = 0, .mask_rle_pairs = 0},
   PackedInstance{.class_id = 1, .flags = kAnnotationMask, .bbox_x1 = 1.25F, .bbox_y1 = 2.5F, .bbox_x2 = 6.25F, .bbox_y2 = 7.5F, .mask_rle_offset = 0, .mask_rle_pairs = 0},
  };
- const Batch batch{.num_images = 1, .label_index = entries.data(), .labels = labels.data(), .image_indices = indices.data()};
+ const std::array entries{ImageAnnotations{labels, {}}};
+ const Batch batch{.num_images = 1, .annotation_views = entries.data(), .image_indices = indices.data()};
  rfdetr::TargetScratch scratch(1);
  for (const bool flipped : {false, true}) {
   rfdetr::AugmentationBatchPlan plan;
@@ -2667,9 +2660,9 @@ TEST_CASE("Target slots prime independent uploads and protect delayed backward i
  REQUIRE(rfdetr::TrainingLanes::target_staging_depth(4) == 4);
  rfdetr::TargetScratch scratch(rfdetr::TrainingLanes::target_staging_depth(request.grad_accum_steps));
  const std::array<std::uint32_t, 1> identities{0};
- const std::array<data::LabelIndexEntry, 1> entries{data::LabelIndexEntry{0, 1, 0}};
  std::array<data::PackedInstance, 1> annotations{data::PackedInstance{0, 0, 1, 1, 5, 5, 0, 0}};
- const data::Batch batch{.num_images = 1, .label_index = entries.data(), .labels = annotations.data(), .image_indices = identities.data()};
+ const std::array entries{data::ImageAnnotations{annotations, {}}};
+ const data::Batch batch{.num_images = 1, .annotation_views = entries.data(), .image_indices = identities.data()};
  const auto build = [&] { return rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 8, {}, 1); };
  // Prime both pinned/device destinations before the overlap hold. CUDA's
  // first-use host allocation may synchronize otherwise independent streams.

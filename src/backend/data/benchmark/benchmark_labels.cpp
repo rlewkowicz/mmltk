@@ -1,4 +1,5 @@
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
+#include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <stdexcept>
@@ -23,6 +24,8 @@ BenchmarkLabelChunk compile_benchmark_image_labels(const NormalizedAnnotationRea
  const auto box_count = matching_geometry ? image.box_count : 0U;
  chunk.dropped = image.box_count - box_count;
  const auto geometry = mmltk::backend::imaging::resample::compute_image_resize_geometry(source_width, source_height, resolution, resolution, resize_mode);
+ ImageEntry extent;
+ set_annotation_extent(extent, box_count, 0, std::to_string(image.source_image_id));
  chunk.labels.reserve(box_count);
  for (const auto& box : index.storage().boxes.subspan(common_math::checked_cast<std::size_t>(image.first_box, "box index overflow"), box_count)) {
   throw_if_benchmark_cancelled(cancel_requested);
@@ -40,6 +43,7 @@ BenchmarkLabelChunk compile_benchmark_image_labels(const NormalizedAnnotationRea
   const auto source_mask = index.storage().mask_rle_pairs.subspan(static_cast<std::size_t>(box.mask_rle_offset), box.mask_rle_pairs);
   (void)dataset::append_resized_row_major_mask(source_mask, {image.width, image.height}, {resolution, resolution}, geometry, &workspace.scratch(), chunk.runs);
   label.mask_rle_offset = common_math::checked_multiply<decltype(PackedInstance::mask_rle_offset)>(begin, sizeof(RLEPair), "benchmark mask offset overflow");
+  set_annotation_extent(extent, chunk.labels.size() + 1U, chunk.runs.size(), std::to_string(image.source_image_id));
   label.mask_rle_pairs = common_math::checked_cast<std::uint16_t>(chunk.runs.size() - begin, "benchmark instance mask run count overflow");
   chunk.labels.push_back(label);
  }

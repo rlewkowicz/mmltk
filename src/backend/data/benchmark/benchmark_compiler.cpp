@@ -437,7 +437,7 @@ SourceCompileCount append_source_plan(BenchmarkCompilePipeline& execution, const
   counts.dropped_boxes = common_math::checked_add(counts.dropped_boxes, product.dropped, "benchmark dropped box count overflow");
   if (product.labels.empty() && !require_every_image) return;
   EncodedImageRecord record{
-   image.source_image_id, product.width, product.height, 0, common_math::checked_cast<std::uint16_t>(product.labels.size(), "per-image label count overflow"),
+   image.source_image_id, product.width, product.height, common_math::checked_cast<std::uint16_t>(product.labels.size(), "per-image label count overflow"),
    common_math::checked_cast<std::uint16_t>(source_base + local_source, "benchmark cached source index overflow"),
    provenance.value_or(index.source == BenchmarkDatasetSource::kCoco2017       ? AnnotationSource::Coco
                        : index.source == BenchmarkDatasetSource::kObjects365V2 ? AnnotationSource::Objects365
@@ -460,9 +460,11 @@ SourceCompileCount append_source_plan(BenchmarkCompilePipeline& execution, const
 [[nodiscard]] std::uint64_t estimate_output_bytes(const std::uint64_t images, const std::uint64_t boxes, const std::uint32_t resolution, const std::uint64_t mask_rle_pairs = 0U) {
  const auto stride = common_math::checked_multiply<std::size_t>(
   common_math::checked_multiply<std::size_t>(resolution, resolution, "benchmark output resolution overflow"), 3U * sizeof(float), "benchmark image stride overflow");
- auto layout = compute_pixel_layout(common_math::checked_cast<std::uint32_t>(images, "benchmark image count overflow"), stride);
- finalize_layout(layout, {common_math::checked_cast<std::size_t>(boxes, "benchmark label count overflow"), common_math::checked_cast<std::size_t>(mask_rle_pairs, "benchmark mask count overflow")});
- return layout.total_size;
+ const auto layout = compute_file_layout(common_math::checked_cast<std::uint32_t>(images, "benchmark image count overflow"), stride);
+ const auto pixels = common_math::checked_multiply(images, static_cast<std::uint64_t>(layout.pixel_pitch), "benchmark occupied pixels overflow");
+ const auto labels = common_math::checked_add(common_math::checked_multiply(boxes, sizeof(PackedInstance), "benchmark label estimate overflow"), common_math::checked_multiply(mask_rle_pairs, sizeof(RLEPair), "benchmark run estimate overflow"), "benchmark annotation estimate overflow");
+ const auto padding = common_math::checked_multiply(images, std::uint64_t{PAGE_SIZE + sizeof(RLEPair)}, "benchmark label page estimate overflow");
+ return common_math::checked_add(common_math::checked_add(pixels, labels, "benchmark occupied estimate overflow"), common_math::checked_add(padding, static_cast<std::uint64_t>(layout.index_size + sizeof(FileHeader) + PAGE_SIZE), "benchmark metadata estimate overflow"), "benchmark output estimate overflow");
 }
 void sync_directory(const std::filesystem::path& path) {
  const int descriptor = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -957,8 +959,8 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
      group.push_back(i);
      source_tasks[{task.source, task.source == BenchmarkDatasetSource::kCoco2017 ? task.shard : std::string{}}].push_back(i);
     }
-    // Reserve canonical format-9 slots as soon as normalized membership is
-    // known. Label projection and acquisition never mutate this pixel inventory.
+    // Assign stable physical slots for the current normalized membership.
+    // Label projection and acquisition publish independently into these slots.
     PreparedBenchmarkSplit pixel_train = make_split("train"), pixel_validation = make_split("val");
     const auto append_pixel_members = [&](const NormalizedAnnotationReadView& index, bool validation_split, std::optional<CoconutImageNamespace> physical_source = {},
                                        const CoconutComponent* physical_rows = nullptr) {
@@ -978,7 +980,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
       const auto& image = index.image(i);
       if (!physical_source && !validation_split && !image.box_count) continue;
       const auto shard = physical_rows ? physical_rows->inventory_image(i).physical.shard : image.source_shard;
-      split.images.push_back({image.source_image_id, image.width, image.height, 0, 0, source_slots.at(shard)});
+      split.images.push_back({image.source_image_id, image.width, image.height, 0, source_slots.at(shard)});
      }
     };
     if (enhanced) {

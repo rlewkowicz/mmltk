@@ -27,6 +27,7 @@ struct ExploreImageSummary {
  std::uint32_t original_height = 0U;
  std::uint16_t instance_count = 0U;
  bool has_masks = false;
+ bool eligible = true;
 };
 struct ExploreSampleFilter {
  ExploreClassMask classes{};

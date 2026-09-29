@@ -37,6 +37,7 @@
 #include "src/common/math/checked_arithmetic.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
+#include "src/backend/data/detail/writable_pixel_range.h"
 using namespace mmltk::backend::data;
 using mmltk::common::io::FileHandle;
 using namespace mmltk::backend::data::testsupport;
@@ -121,9 +122,9 @@ void test_vanished_masks_retain_detection_annotations() {
  compile_resized_fixture(fixture);
  DatasetLoader loader(resized_fixture_loader_config(fixture));
  REQUIRE(loader.num_label_instances() == 10);
- const auto entry = loader.label_index()[10];
- REQUIRE(entry.num_instances == 1);
- const auto& annotation = loader.label_data()[entry.label_begin];
+ const auto entry = loader.annotations(10);
+ REQUIRE(entry.labels.size() == 1);
+ const auto& annotation = entry.labels[0];
  CHECK(annotation.has_mask());
  CHECK(annotation.mask_rle_pairs == 0U);
  CHECK(annotation.bbox_x2 == 0.5F);
@@ -144,9 +145,9 @@ void test_partial_mask_vanish_keeps_instance() {
  compile_resized_fixture(fixture);
  DatasetLoader loader(resized_fixture_loader_config(fixture));
  REQUIRE(loader.num_label_instances() == 10);
- const LabelIndexEntry& entry = loader.label_index()[10];
- REQUIRE(entry.num_instances == 1);
- const PackedInstance& instance = loader.label_data()[entry.label_begin];
+ const auto entry = loader.annotations(10);
+ REQUIRE(entry.labels.size() == 1);
+ const PackedInstance& instance = entry.labels[0];
  REQUIRE(instance.mask_rle_pairs == 2);
  REQUIRE(instance.bbox_x1 == 0.0F);
  REQUIRE(instance.bbox_y1 == 0.0F);
@@ -177,15 +178,15 @@ void test_native_compile_letterboxes_pixels_boxes_and_masks() {
  REQUIRE(compiled_index[0].original_height == 8U);
  constexpr size_t row = 8U;
  constexpr size_t plane = row * row;
- const float* first_image = loader.pixel_blob();
+ const float* first_image = loader.image_pixels(0);
  for (size_t channel = 0U; channel < 3U; ++channel) {
   REQUIRE(first_image[channel * plane] == 0.0F);
   REQUIRE(first_image[channel * plane + 7U * row] == 0.0F);
  }
  REQUIRE((first_image[2U * row] != 0.0F || first_image[plane + 2U * row] != 0.0F || first_image[plane * 2U + 2U * row] != 0.0F));
- const LabelIndexEntry& entry = loader.label_index()[10];
- REQUIRE(entry.num_instances == 1U);
- const PackedInstance& instance = loader.label_data()[entry.label_begin];
+ const auto entry = loader.annotations(10);
+ REQUIRE(entry.labels.size() == 1U);
+ const PackedInstance& instance = entry.labels[0];
  REQUIRE(instance.bbox_x1 == 2.0F);
  REQUIRE(instance.bbox_y1 == 3.0F);
  REQUIRE(instance.bbox_x2 == 6.0F);
@@ -194,7 +195,7 @@ void test_native_compile_letterboxes_pixels_boxes_and_masks() {
  std::vector<uint8_t> dense_mask(plane, uint8_t{0});
  const size_t first_pair = static_cast<size_t>(instance.mask_rle_offset) / sizeof(RLEPair);
  for (size_t pair_index = 0U; pair_index < instance.mask_rle_pairs; ++pair_index) {
-  const RLEPair& pair = loader.rle_data()[first_pair + pair_index];
+  const RLEPair& pair = entry.runs[first_pair + pair_index];
   REQUIRE(static_cast<size_t>(pair.start) + pair.length <= plane);
   std::fill(dense_mask.begin() + pair.start, dense_mask.begin() + pair.start + pair.length, uint8_t{1});
  }
@@ -216,17 +217,17 @@ void test_compiled_tiny_masks_keep_outer_pixel_edges() {
  overwrite_annotation(fs::path(dataset_dir(fixture)) / fixture.split / "000011.jsonl", annotations.str());
  compile_resized_fixture(fixture, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
  DatasetLoader loader(resized_fixture_loader_config(fixture));
- const auto& entry = loader.label_index()[10];
- REQUIRE(entry.num_instances == source_runs.size());
+ const auto entry = loader.annotations(10);
+ REQUIRE(entry.labels.size() == source_runs.size());
  for (std::size_t index = 0; index < source_runs.size(); ++index) {
-  const auto& instance = loader.label_data()[entry.label_begin + index];
+  const auto& instance = entry.labels[index];
   const auto source = source_runs[index];
   CHECK(instance.bbox_x1 == static_cast<PackedCoordinate>(source.start % 8));
   CHECK(instance.bbox_y1 == static_cast<PackedCoordinate>(source.start / 8 + 2));
   CHECK(instance.bbox_x2 == static_cast<PackedCoordinate>(source.start % 8 + source.length));
   CHECK(instance.bbox_y2 == static_cast<PackedCoordinate>(source.start / 8 + 3));
   REQUIRE(instance.mask_rle_pairs == 1);
-  const auto& compiled = loader.rle_data()[instance.mask_rle_offset / sizeof(RLEPair)];
+  const auto& compiled = entry.instance_rle(instance).front();
   CHECK(compiled.start == source.start + 16);
   CHECK(compiled.length == source.length);
  }
@@ -559,7 +560,7 @@ TEST_CASE("compiled annotations preserve continuous source meaning in both resiz
   CHECK(labels[0].source_category_id == 0U);
   CHECK(labels[1].source_category_id == 42U);
   CHECK_FALSE(labels[1].has_mask());
-  CHECK(store.instance_rle(labels[0]).empty());
+  CHECK(store.instance_rle(0, labels[0]).empty());
   CHECK(store.masks_available());
   CHECK(labels[0].source_ordinal < labels[1].source_ordinal);
   CHECK(labels[1].source_ordinal < labels[2].source_ordinal);
@@ -580,19 +581,20 @@ TEST_CASE("compiled format admission rejects invalid metadata and old versions",
   const auto path = root.path() / "invalid.bin";
   auto file = mutable_compiled_copy(fixture, path);
   auto header = original.header();
-  auto label = original.labels().front();
+  auto label = original.image_labels(0).front();
   change(header, label);
   file.seekp(0);
   file.write(reinterpret_cast<const char*>(&header), sizeof(header));
-  file.seekp(static_cast<std::streamoff>(original.header().label_offset));
+  file.seekp(static_cast<std::streamoff>(compute_file_layout(original.header().num_slots, original.header().image_stride).label_offset(0)));
   file.write(reinterpret_cast<const char*>(&label), sizeof(label));
   file.close();
   CHECK_THROWS(CompiledDataset::open(path));
  };
  mutate([](auto& header, auto&) { header.version = 7U; });
  mutate([](auto& header, auto&) { header.version = 8U; });
+ mutate([](auto& header, auto&) { header.version = 9U; });
  mutate([](auto& header, auto&) { header.resize_mode = static_cast<mmltk::backend::imaging::resample::ImageResizeMode>(255U); });
- mutate([](auto& header, auto&) { header.mask_rle_offset = header.total_file_size + 1U; });
+ mutate([](auto& header, auto&) { header.index_offset = header.total_file_size + 1U; });
  mutate([](auto&, auto& label) { label.original_area = std::numeric_limits<double>::infinity(); });
  mutate([](auto&, auto& label) { label.bbox_x1 = std::numeric_limits<float>::quiet_NaN(); });
  mutate([](auto&, auto& label) { label.flags = 128U; });
@@ -606,12 +608,12 @@ TEST_CASE("known empty masks declare availability without RLE storage", "[backen
  overwrite_annotation(fs::path(dataset_dir(fixture)) / "train/000001.jsonl", R"({"class":"person","bbox_xyxy":[1.25,2.5,7.75,9.5],"mask_rle_encoding":"row_major_start_length","mask_rle":""})");
  compile_existing_fixture(fixture);
  const auto store = CompiledDataset::open(compiled_bin_path(fixture));
- REQUIRE(store.labels().size() == 1U);
- CHECK(store.rle_pairs().empty());
+ REQUIRE(store.image_labels(0).size() == 1U);
+ CHECK(store.annotations(0).runs.empty());
  CHECK(store.masks_available());
- CHECK(store.labels()[0].has_mask());
- CHECK(store.labels()[0].original_area == 0.0);
- CHECK(store.labels()[0].bbox_x1 == 1.25F);
+ CHECK(store.image_labels(0)[0].has_mask());
+ CHECK(store.image_labels(0)[0].original_area == 0.0);
+ CHECK(store.image_labels(0)[0].bbox_x1 == 1.25F);
 }
 TEST_CASE("generic bbox narrowing rejects overflow and collapsed corners", "[backend][data][compiler]") {
  const mmltk::testsupport::ScopedTempDir root("bbox-narrowing");
@@ -656,8 +658,8 @@ TEST_CASE("generic annotation flags admit only exact boolean or integer zero and
     overwrite_annotation(annotation_path, record(field, value));
     compile();
     const auto store = CompiledDataset::open(compiled_bin_path(fixture));
-    REQUIRE(store.labels().size() == 1U);
-    const auto& label = store.labels().front();
+    REQUIRE(store.image_labels(0).size() == 1U);
+    const auto& label = store.image_labels(0).front();
     CHECK(label.is_crowd() == (std::string_view(field) == "iscrowd" && enabled));
     CHECK(label.raw_ignore() == (std::string_view(field) == "ignore" && enabled));
     CHECK_FALSE(label.has_mask());
@@ -716,13 +718,13 @@ TEST_CASE("compiled benchmark provenance cannot be erased while Generic identiti
   auto file = mutable_compiled_copy(fixture, path);
   file.seekp(static_cast<std::streamoff>(original.header().index_offset));
   file.write(reinterpret_cast<const char*>(&image), sizeof(image));
-  file.seekp(static_cast<std::streamoff>(original.header().label_offset));
+  file.seekp(static_cast<std::streamoff>(compute_file_layout(original.header().num_slots, original.header().image_stride).label_offset(0)));
   file.write(reinterpret_cast<const char*>(&label), sizeof(label));
  };
  for (const auto source :
   {AnnotationSource::Coco, AnnotationSource::Objects365, AnnotationSource::OpenImages, AnnotationSource::CoconutCoco, AnnotationSource::CoconutObjects365V1, AnnotationSource::CoconutObjects365V2}) {
   auto image = original.image_entry(0);
-  auto label = original.labels()[0];
+  auto label = original.image_labels(0)[0];
   image.source = source;
   image.has_source_image_id = 1U;
   image.source_image_id = 0U;
@@ -745,7 +747,7 @@ TEST_CASE("compiled benchmark provenance cannot be erased while Generic identiti
  }
  auto unknown = original.image_entry(0);
  unknown.source = static_cast<AnnotationSource>(255U);
- write(unknown, original.labels()[0]);
+ write(unknown, original.image_labels(0)[0]);
  CHECK_THROWS(CompiledDataset::open(path));
 }
 TEST_CASE("category IDs reject arithmetic identity loss before publication", "[backend][data][catalog]") {
@@ -773,65 +775,66 @@ TEST_CASE("category IDs reject arithmetic identity loss before publication", "[b
  }
 }
 TEST_CASE("compiled layout checks alignment and arithmetic without storage", "[backend][data][compiler]") {
- const auto boundary_count = static_cast<std::uint32_t>((HUGE_PAGE_SIZE - sizeof(FileHeader)) / sizeof(ImageEntry));
- CHECK(compute_pixel_layout(boundary_count, 12U).pixel_offset == HUGE_PAGE_SIZE);
- CHECK(compute_pixel_layout(boundary_count + 1U, 12U).pixel_offset == 2U * HUGE_PAGE_SIZE);
+ const auto layout = compute_file_layout(65U, 12U);
+ CHECK(layout.data_offset == HUGE_PAGE_SIZE);
+ CHECK(layout.pixel_offset(63) == layout.data_offset + 63U * PAGE_SIZE);
+ CHECK(layout.pixel_offset(64) == layout.data_offset + layout.block_bytes);
+ CHECK(layout.label_offset(0) == layout.data_offset + COMPILED_BLOCK_SLOTS * PAGE_SIZE);
+ CHECK(layout.label_offset(64) == layout.block_offset(1) + COMPILED_BLOCK_SLOTS * PAGE_SIZE);
+ CHECK(layout.label_pitch == 503808U);
+ CHECK_THROWS(layout.pixel_offset(65));
  constexpr auto maximum = std::numeric_limits<std::size_t>::max();
- CHECK_THROWS(compute_pixel_layout(2U, maximum));
- CHECK_THROWS(compute_pixel_layout(1U, maximum));
- auto layout = compute_pixel_layout(1U, 12U);
- CHECK_THROWS(finalize_layout(layout, {maximum, 0U}));
- CHECK_THROWS(finalize_layout(layout, {0U, maximum}));
- CHECK_THROWS(finalize_layout(layout, {maximum / sizeof(PackedInstance), 0U}));
- CHECK_THROWS(finalize_layout(layout, {0U, maximum / sizeof(RLEPair)}));
+ CHECK_THROWS(compute_file_layout(2U, maximum));
+ CHECK_THROWS(compute_file_layout(1U, maximum - 3U));
+ CHECK_THROWS(compute_file_layout(static_cast<std::uint32_t>(COMPILED_METADATA_CAPACITY / sizeof(ImageEntry) + 1U), 12U));
+ CHECK_THROWS(annotation_layout(maximum, 0U));
+ CHECK_THROWS(annotation_layout(0U, maximum));
+ CHECK(annotation_layout(0U, COMPILED_LABEL_CAPACITY / sizeof(RLEPair)).used_bytes == COMPILED_LABEL_CAPACITY);
+ CHECK(annotation_layout(1U, (COMPILED_LABEL_CAPACITY - 64U) / sizeof(RLEPair)).used_bytes == COMPILED_LABEL_CAPACITY);
+ CHECK_THROWS(annotation_layout(1U, (COMPILED_LABEL_CAPACITY - 64U) / sizeof(RLEPair) + 1U));
  const std::vector<std::string> names{"person"};
  for (const auto mode : {mmltk::backend::imaging::resample::ImageResizeMode::Stretch, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}) {
-  for (const std::size_t count : {0U, 1U}) {
-   layout = compute_pixel_layout(1U, 12U);
-   const auto pixel_offset = layout.pixel_offset;
-   finalize_layout(layout, {count, count});
-   CHECK(layout.pixel_offset == pixel_offset);
-   const auto header = make_file_header({1U, 1U, 1U, 3U, static_cast<std::uint32_t>(count), 12U, mode}, names, layout);
-   validate_compiled_header(header);
-   const auto sections = validate_compiled_file_sections(header, layout.total_size);
-   CHECK(sections.label_count == count);
-   CHECK(sections.rle_region_bytes == count * sizeof(RLEPair));
-   CHECK(sections.pixel_blob_size == 12U);
-   CHECK(std::ranges::all_of(header._reserved, [](auto value) { return value == 0U; }));
-   auto invalid = header;
-   invalid.pixel_offset += HUGE_PAGE_SIZE;
-   CHECK_THROWS(validate_compiled_file_sections(invalid, layout.total_size));
-   invalid = header;
-   invalid.image_stride = maximum;
-   CHECK_THROWS(validate_compiled_file_sections(invalid, layout.total_size));
-   invalid = header;
-   ++invalid.total_file_size;
-   CHECK_THROWS(validate_compiled_file_sections(invalid, invalid.total_file_size));
-  }
+  const auto header = make_file_header({1U, 1U, 1U, 3U, 1U, 12U, mode}, names, layout);
+  CHECK(header.num_slots == 65U);
+  CHECK(header.num_images == 1U);
+  CHECK(validate_compiled_file_sections(header, layout.total_size).index_offset == layout.index_offset);
+  auto invalid = header;
+  invalid.data_offset += HUGE_PAGE_SIZE;
+  CHECK_THROWS(validate_compiled_file_sections(invalid, layout.total_size));
+  invalid = header;
+  invalid.image_stride = maximum;
+  CHECK_THROWS(validate_compiled_file_sections(invalid, layout.total_size));
+  invalid = header;
+  ++invalid.total_file_size;
+  CHECK_THROWS(validate_compiled_file_sections(invalid, invalid.total_file_size));
  }
  CHECK_THROWS(make_file_header({1U, 1U, 1U, 3U, 65536U, 12U}, names, layout));
- constexpr auto runs_per_label = std::numeric_limits<std::uint16_t>::max();
- constexpr std::size_t label_count = std::numeric_limits<std::uint32_t>::max() / (std::size_t{runs_per_label} * sizeof(RLEPair)) + 2U;
- std::vector<PackedInstance> labels(label_count);
- std::uint64_t mask_bytes = 0U;
- for (auto& label : labels) {
-  label.flags = kAnnotationMask;
-  label.bbox_x2 = label.bbox_y2 = 1.0F;
-  label.mask_rle_offset = mmltk::common::math::checked_cast<decltype(label.mask_rle_offset)>(mask_bytes, "compiled mask offset overflow");
-  label.mask_rle_pairs = runs_per_label;
-  mask_bytes += std::uint64_t{runs_per_label} * sizeof(RLEPair);
- }
- REQUIRE(labels.back().mask_rle_offset > std::numeric_limits<std::uint32_t>::max());
- layout = compute_pixel_layout(1U, 512U * 512U * 3U * sizeof(float));
- finalize_layout(layout, {labels.size(), mask_bytes / sizeof(RLEPair)});
- const auto header = make_file_header({1U, 512U, 512U, 3U, static_cast<std::uint32_t>(labels.size()), 512U * 512U * 3U * sizeof(float)}, names, layout);
- validate_compiled_header(header);
- const auto sections = validate_compiled_file_sections(header, layout.total_size);
- std::size_t used = 0;
- for (const auto& label : labels) used = CompiledRecordChecks::label(label, header.num_classes, sections.rle_region_bytes, used, AnnotationSource::Generic);
- CHECK(used == mask_bytes);
- CHECK_THROWS(CompiledRecordChecks::label(labels.back(), header.num_classes, mask_bytes - sizeof(RLEPair), labels.back().mask_rle_offset, AnnotationSource::Generic));
 }
+
+TEST_CASE("fixed pixel mappings retain borrowed addresses across sparse block growth", "[backend][data][compiler]") {
+ const mmltk::testsupport::ScopedTempDir root("stable-compiled-blocks");
+ const auto file = FileHandle::create_output((root.path() / "slots.bin").string(), 0);
+ auto layout = compute_file_layout(1, 12);
+ file.resize_sparse(layout.total_size);
+ detail::WritablePixelRange pixels(file.get(), layout);
+ auto* const first = pixels.image(0);
+ file.allocate_range(layout.pixel_offset(0), layout.pixel_pitch);
+ first[0] = 0.25F;
+ layout = compute_file_layout(COMPILED_BLOCK_SLOTS + 1, 12);
+ file.resize_sparse(layout.total_size);
+ pixels.grow(layout);
+ CHECK(pixels.image(0) == first);
+ CHECK(first[0] == 0.25F);
+ file.allocate_range(layout.pixel_offset(COMPILED_BLOCK_SLOTS), layout.pixel_pitch);
+ pixels.image(COMPILED_BLOCK_SLOTS)[0] = 0.75F;
+ float last = 0;
+ file.pread_all(&last, sizeof(last), layout.pixel_offset(COMPILED_BLOCK_SLOTS));
+ CHECK(last == 0.75F);
+ CHECK_THROWS(pixels.grow(compute_file_layout(1, 12)));
+ CHECK_THROWS(pixels.grow(compute_file_layout(COMPILED_BLOCK_SLOTS + 1, 24)));
+ CHECK(pixels.image(0) == first);
+}
+
 TEST_CASE("categorical resize agrees exactly with dense nearest-center sampling", "[backend][data][compiler][mask]") {
  using namespace mmltk::backend::data::dataset;
  using namespace mmltk::backend::imaging::resample;

@@ -15,7 +15,7 @@ import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr {
 EvaluationMetricSet resolve_evaluation_metric_set(const mmltk::backend::data::DatasetLoader& loader, bool request_masks) {
- const bool masks = request_masks && std::ranges::all_of(std::span{loader.label_data(), loader.num_label_instances()}, [](const auto& annotation) { return annotation.has_mask(); });
+ const bool masks = request_masks && std::ranges::all_of(loader.eligible_slots(), [&](auto slot) { return std::ranges::all_of(loader.annotations(slot).labels, [](const auto& annotation) { return annotation.has_mask(); }); });
  return masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox;
 }
 using CompactImageMatchRecord = EvaluationDatasetOwner::MatchRecord;
@@ -406,17 +406,9 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
  }
  out.image_ids_.reserve(image_count);
  out.catalog_ = loader.class_catalog();
- const auto* label_index = loader.label_index();
- const auto* label_data = loader.label_data();
- if ((image_count != 0U && label_index == nullptr) || (label_count != 0U && label_data == nullptr)) {
-  throw std::runtime_error("compiled evaluation dataset does not contain usable bbox ground truth");
- }
- const mmltk::backend::data::RLEPair* rle_data = nullptr;
- size_t rle_pair_count = 0;
+ const size_t rle_pair_count = loader.num_rle_pairs();
  if (metric_set == EvaluationMetricSet::BBoxAndMask) {
-  rle_data = loader.rle_data();
-  rle_pair_count = loader.num_rle_pairs();
-  if ((rle_pair_count != 0U && rle_data == nullptr) || rle_pair_count > std::numeric_limits<std::uint32_t>::max()) {
+  if (rle_pair_count > std::numeric_limits<std::uint32_t>::max()) {
    throw std::runtime_error("bbox-and-mask evaluation requires a bounded mask RLE payload");
   }
   const uint64_t mask_pixels = static_cast<uint64_t>(loader.image_height()) * loader.image_width();
@@ -425,18 +417,13 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
   out.ground_truth_mask_width_ = loader.image_width();
  }
  out.ground_truth_spans_.resize(image_count * static_cast<size_t>(num_classes));
- size_t next_label_index = 0;
- for (size_t image_index = 0; image_index < image_count; ++image_index) {
-  const int image_id = static_cast<int>(image_index + 1U);
+ size_t image_index = 0;
+ for (const auto slot : loader.eligible_slots()) {
+  const int image_id = mmltk::common::math::checked_cast<int>(std::uint64_t{slot} + 1U, "evaluation image ID overflow");
   out.image_id_to_index_.emplace(image_id, image_index);
   out.image_ids_.push_back(image_id);
-  const auto& entry = label_index[image_index];
-  const size_t label_begin = entry.label_begin;
-  const size_t label_end = label_begin + entry.num_instances;
-  if (label_begin != next_label_index || label_end < label_begin || label_end > label_count) { throw std::runtime_error("compiled evaluation label index is not an exact contiguous partition"); }
-  next_label_index = label_end;
-  for (uint16_t annotation_ordinal = 0; annotation_ordinal < entry.num_instances; ++annotation_ordinal) {
-   const auto& packed = label_data[label_begin + annotation_ordinal];
+  const auto annotations = loader.annotations(slot);
+  for (const auto& packed : annotations.labels) {
    const std::array<float, 4> bbox = {
     static_cast<float>(packed.bbox_x1),
     static_cast<float>(packed.bbox_y1),
@@ -450,13 +437,13 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
     if (!packed.has_mask() || packed.mask_rle_offset % sizeof(mmltk::backend::data::RLEPair) != 0) { throw std::runtime_error("bbox-and-mask evaluation requires a mask for every annotation"); }
     const size_t rle_start_index = packed.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair);
     const size_t rle_end_index = rle_start_index + packed.mask_rle_pairs;
-    if (rle_end_index < rle_start_index || rle_end_index > rle_pair_count) { throw std::runtime_error("compiled evaluation mask index exceeds the RLE payload"); }
+    if (rle_end_index < rle_start_index || rle_end_index > annotations.runs.size()) { throw std::runtime_error("compiled evaluation mask index exceeds the RLE payload"); }
    }
    GroundTruthSpan& span = out.ground_truth_spans_[out.ground_truth_span_index(image_index, static_cast<size_t>(packed.class_id))];
    ++span.count;
   }
+  ++image_index;
  }
- if (next_label_index != label_count) { throw std::runtime_error("compiled evaluation annotation cardinality does not match the label index"); }
  std::uint64_t annotation_offset = 0;
  for (GroundTruthSpan& span : out.ground_truth_spans_) {
   span.offset = static_cast<std::uint32_t>(annotation_offset);
@@ -465,8 +452,8 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
  if (annotation_offset != label_count) { throw std::runtime_error("compiled evaluation dense-span cardinality mismatch"); }
  out.image_area_scale_.resize(image_count);
  for (size_t image = 0; image < image_count; ++image) {
-  const auto& entry = loader.image_entry(static_cast<std::uint32_t>(image));
-  const auto geometry = loader.geometry(static_cast<std::uint32_t>(image));
+  const auto& entry = loader.image_entry(static_cast<std::uint32_t>(out.image_ids_[image] - 1));
+  const auto geometry = loader.geometry(static_cast<std::uint32_t>(out.image_ids_[image] - 1));
   out.image_area_scale_[image] = (static_cast<double>(entry.original_width) / geometry.resized_width) * (static_cast<double>(entry.original_height) / geometry.resized_height);
  }
  out.ground_truth_areas_.resize(label_count);
@@ -486,9 +473,9 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
  for (const GroundTruthSpan& span : out.ground_truth_spans_) { span_cursors.push_back(span.offset); }
  const uint64_t mask_pixels = static_cast<uint64_t>(out.ground_truth_mask_height_) * out.ground_truth_mask_width_;
  for (size_t image_index = 0; image_index < image_count; ++image_index) {
-  const auto& entry = label_index[image_index];
-  for (uint16_t annotation_ordinal = 0; annotation_ordinal < entry.num_instances; ++annotation_ordinal) {
-   const auto& packed = label_data[static_cast<size_t>(entry.label_begin) + annotation_ordinal];
+  const auto annotations = loader.annotations(static_cast<std::uint32_t>(out.image_ids_[image_index] - 1));
+  for (uint16_t annotation_ordinal = 0; annotation_ordinal < annotations.labels.size(); ++annotation_ordinal) {
+   const auto& packed = annotations.labels[annotation_ordinal];
    const size_t span_index = out.ground_truth_span_index(image_index, packed.class_id);
    const std::uint32_t dense_index = span_cursors[span_index]++;
    out.ground_truth_boxes_[dense_index] = {
@@ -515,7 +502,7 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
     uint64_t previous_run_end = 0;
     uint64_t mask_area = 0;
     for (uint16_t run_index = 0; run_index < packed.mask_rle_pairs; ++run_index) {
-     const mmltk::backend::data::RLEPair& rle = rle_data[rle_start_index + run_index];
+     const mmltk::backend::data::RLEPair& rle = annotations.runs[rle_start_index + run_index];
      const uint64_t run_end = static_cast<uint64_t>(rle.start) + rle.length;
      if (rle.length == 0 || static_cast<uint64_t>(rle.start) < previous_run_end || run_end > mask_pixels) { throw std::runtime_error("compiled evaluation mask contains an invalid RLE run"); }
      previous_run_end = run_end;
@@ -617,12 +604,12 @@ void CocoDataset::limit_images(const size_t limit) {
 bool CocoDataset::has_image(int image_id) const { return image_id_to_index_.contains(image_id); }
 ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t dataset_index, const BBoxPredictionView& bbox, const std::optional<PackedMaskPredictionView>& mask,
  const size_t max_dets_per_image, const std::span<const Prediction> encoded_masks) const {
- if (dataset_index < 0 || static_cast<size_t>(dataset_index) >= image_ids_.size()) { throw std::out_of_range("staged prediction image index is outside the evaluation dataset"); }
+ if (dataset_index < 0 || dataset_index >= std::numeric_limits<int>::max() || !image_id_to_index_.contains(static_cast<int>(dataset_index + 1))) throw std::out_of_range("staged prediction image index is outside the evaluation dataset");
  if (max_dets_per_image == 0 || bbox.count > std::numeric_limits<std::uint32_t>::max() ||
      (bbox.count != 0U && (bbox.scores == nullptr || bbox.labels_zero_based == nullptr || bbox.boxes_xyxy == nullptr)) || bbox.score_stride <= 0 || bbox.label_stride <= 0 || bbox.box_stride < 4) {
   throw std::invalid_argument("staged bbox prediction view is invalid");
  }
- const size_t image_index = static_cast<size_t>(dataset_index);
+ const size_t image_index = image_id_to_index_.at(static_cast<int>(dataset_index + 1));
  if (bbox.image_id != image_ids_[image_index]) { throw std::invalid_argument("staged prediction image ID does not match the image matcher index"); }
  const bool mask_mode = metric_set_ == EvaluationMetricSet::BBoxAndMask;
  if ((!mask_mode && (mask || !encoded_masks.empty())) || (mask_mode && bbox.count != 0U && !mask && encoded_masks.size() != bbox.count)) {

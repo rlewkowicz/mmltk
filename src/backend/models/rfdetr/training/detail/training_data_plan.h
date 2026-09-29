@@ -17,6 +17,7 @@ struct DatasetIndexSchedule;
 namespace mmltk::backend::models::rfdetr {
 struct TrainingImageClasses final {
  std::vector<std::uint32_t> classes;
+ bool eligible = true;
 };
 struct TrainingEpochDraws final {
  std::shared_ptr<const mmltk::backend::data::DatasetIndexSchedule> schedule;
@@ -50,6 +51,7 @@ private:
  std::uint64_t batch_;
  std::uint64_t contributions_;
  std::uint64_t hash_ = 0;
+ std::size_t image_count_ = 0;
 };
 // Logical history owns descriptors; physical caches only materialize them.
 class TrainingDonorHistory final {

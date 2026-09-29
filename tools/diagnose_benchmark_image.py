@@ -16,35 +16,25 @@ def report(**fields):
 
 
 def compiled_sample(path, sample):
-    with path.open("rb") as stream:
-        header = stream.read(8328)
-        if len(header) != 8328 or struct.unpack_from("<QI", header) != (0x464153544C445232, 9):
-            raise ValueError(f"unsupported compiled dataset: {path}")
-        count, width, height = struct.unpack_from("<III", header, 12)
-        index_offset, label_offset = struct.unpack_from("<QQ", header, 32)
-        if sample < 0 or sample >= count:
-            raise ValueError("sample index is outside the compiled dataset")
-        stream.seek(index_offset + sample * 40)
-        entry = stream.read(40)
-        if len(entry) != 40:
-            raise ValueError("truncated compiled image entry")
-        _, first_label, instances, _, label_bytes, source_width, source_height, has_id, source, _, image_id = struct.unpack("<QIHHIIIBBHQ", entry)
-        if label_bytes != instances * 60:
-            raise ValueError("compiled label count disagrees with byte extent")
-        stream.seek(label_offset + first_label)
-        labels = []
-        for _ in range(instances):
-            payload = stream.read(60)
-            if len(payload) != 60:
-                raise ValueError("truncated compiled label")
-            category, flags, x1, y1, x2, y2, mask_offset, mask_pairs, area, annotation_id, source_category, ordinal = struct.unpack("<BBffffQHdQQQ", payload)
-            class_name = header[80 + category * 32:112 + category * 32].split(b"\0", 1)[0].decode("utf-8")
-            labels.append(dict(class_id=category, class_name=class_name, flags=flags, bbox=[x1, y1, x2, y2],
-                               mask_pairs=mask_pairs, annotation_id=annotation_id, source_category_id=source_category, original_area=area))
-        report(kind="compiled_sample", path=str(path), sample=sample, image_count=count,
-               width=width, height=height, original_width=source_width, original_height=source_height,
-               source=source, image_id=image_id if has_id else None, instances=labels)
-        return image_id if has_id else None
+    executable = Path("/evidence/diagnose_compiled_sample")
+    subprocess.run([
+        "/opt/gcc-16.2/bin/g++", "-std=c++26", "-freflection", "-O2",
+        "-I/workspace", "-I/workspace/src/frameworks/reflection/include",
+        "-I/workspace/third_party/json/include",
+        "/workspace/tools/diagnose_compiled_sample.cpp",
+        "/workspace/src/backend/data/compiled/compiled_file_layout.cpp",
+        "/workspace/src/backend/data/catalog/class_catalog.cpp",
+        "/workspace/src/common/io/file_memory.cpp",
+        "/workspace/src/common/io/path_cleanup.cpp",
+        "/workspace/src/common/io/scoped_fd.cpp", "-o", str(executable),
+    ], check=True, timeout=120)
+    completed = subprocess.run([str(executable), str(path), str(sample)],
+                               check=False, capture_output=True, text=True, timeout=120)
+    if completed.returncode:
+        raise ValueError(completed.stderr.strip() or f"compiled diagnostic exited with status {completed.returncode}")
+    record = json.loads(completed.stdout)
+    report(**record)
+    return record["image_id"]
 
 
 def annotation_rows(path, image_id, include_objects=False, export_mask_runs=False):
@@ -183,7 +173,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image-id", type=int)
     parser.add_argument("--compiled", type=Path)
-    parser.add_argument("--sample", type=int, help="zero-based compiled sample index")
+    parser.add_argument("--sample", type=int, help="zero-based eligible physical compiled sample slot")
     parser.add_argument("--index", type=Path, action="append", default=[])
     parser.add_argument("--objects", action="store_true", help="include normalized object records for each matching index row")
     parser.add_argument("--export-mask-runs", action="store_true", help="export bounded selected-image normalized RLEs and identities")

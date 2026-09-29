@@ -22,6 +22,15 @@ using mmltk::common::system::clamp_worker_count_to_cpus;
 namespace {
 constexpr size_t kShuffleChunkImages = 8;
 constexpr size_t kShuffleBlockImages = 256;
+struct ShuffleLayout {
+ size_t chunk_images, chunks_per_block, num_chunks, num_blocks;
+};
+ShuffleLayout shuffle_layout(size_t images, size_t batch_size) {
+ const auto chunk_images = std::min(images, std::max(kShuffleChunkImages, batch_size));
+ const auto chunks_per_block = std::max<size_t>(1, kShuffleBlockImages / chunk_images);
+ const auto num_chunks = images / chunk_images + (images % chunk_images != 0);
+ return {chunk_images, chunks_per_block, num_chunks, num_chunks / chunks_per_block + (num_chunks % chunks_per_block != 0)};
+}
 void validate_config(const DatasetLoader::Config& config) {
  if (config.compiled_path.empty()) { throw std::invalid_argument("compiled_path must not be empty"); }
  if (config.batch_size == 0) { throw std::invalid_argument("batch_size must be greater than zero"); }
@@ -32,13 +41,10 @@ void validate_config(const DatasetLoader::Config& config) {
  if (config.batch_shard_rank >= config.batch_shard_count) { throw std::invalid_argument("batch_shard_rank must be less than batch_shard_count"); }
 }
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-void build_block_shuffled_order(std::vector<uint32_t>& order, uint32_t num_images, size_t batch_size, std::mt19937_64& rng, std::vector<size_t>& block_order, std::vector<size_t>& chunk_order) {
- if (num_images == 0) { return; }
- const auto total_images = static_cast<size_t>(num_images);
- const size_t chunk_images = std::min(total_images, std::max(kShuffleChunkImages, batch_size));
- const size_t chunks_per_block = std::max<size_t>(1, kShuffleBlockImages / chunk_images);
- const size_t num_chunks = (total_images + chunk_images - 1) / chunk_images;
- const size_t num_blocks = (num_chunks + chunks_per_block - 1) / chunks_per_block;
+void build_block_shuffled_order(std::vector<uint32_t>& order, std::span<const std::uint32_t> eligible, size_t batch_size, std::mt19937_64& rng, std::vector<size_t>& block_order, std::vector<size_t>& chunk_order) {
+ if (eligible.empty()) { return; }
+ const auto total_images = eligible.size();
+ const auto [chunk_images, chunks_per_block, num_chunks, num_blocks] = shuffle_layout(total_images, batch_size);
  mmltk::common::logging::profile_set_value("loader.shuffle.chunk_images", chunk_images);
  mmltk::common::logging::profile_set_value("loader.shuffle.block_images", chunk_images * chunks_per_block);
  mmltk::common::logging::profile_set_value("loader.shuffle.chunks", num_chunks);
@@ -58,7 +64,7 @@ void build_block_shuffled_order(std::vector<uint32_t>& order, uint32_t num_image
   for (size_t chunk_id : chunk_order) {
    const size_t image_begin = chunk_id * chunk_images;
    const size_t image_end = std::min(image_begin + chunk_images, total_images);
-   for (size_t image = image_begin; image < image_end; ++image) { order[out++] = static_cast<uint32_t>(image); }
+   for (size_t image = image_begin; image < image_end; ++image) { order[out++] = eligible[image]; }
   }
  }
  if (out != total_images) { throw std::runtime_error("block shuffle failed to populate the full epoch order"); }
@@ -79,11 +85,12 @@ struct DatasetLoader::Impl {
  std::shared_ptr<const CompiledDataset> source;
  std::unique_ptr<CompiledImageStream> stream;
  std::vector<uint32_t> order;
+ std::vector<uint32_t> eligible;
  std::shared_ptr<const DatasetIndexSchedule> explicit_schedule;
  std::size_t resume_offset = 0;
  const std::vector<std::uint32_t>& indices() const { return explicit_schedule ? explicit_schedule->image_indices : order; }
  std::vector<size_t> shuffled_blocks, shuffled_chunks;
- std::vector<size_t> batch_starts;
+ size_t batch_count = 0;
  std::vector<Slot> slots;
  std::vector<size_t> batch_slots;
  size_t submitted = 0, consumed = 0;
@@ -138,34 +145,34 @@ struct DatasetLoader::Impl {
  static void transfer_complete(void* context, const size_t index, std::exception_ptr error) noexcept { static_cast<Impl*>(context)->completed(index, error, false); }
  static void consumer_complete(void* context, const size_t index, std::exception_ptr error) noexcept { static_cast<Impl*>(context)->completed(index, error, true); }
  void rebuild_schedule() {
-  batch_starts.clear();
   const size_t images = indices().size();
   const size_t batches = config.drop_last ? images / config.batch_size : images / config.batch_size + (images % config.batch_size != 0);
-  const size_t local_batches = config.batch_shard_rank < batches ? (batches - 1 - config.batch_shard_rank) / config.batch_shard_count + 1 : 0;
-  batch_starts.reserve(local_batches);
-  for (size_t batch = explicit_schedule ? resume_offset / config.batch_size : config.batch_shard_rank; batch < batches; batch += explicit_schedule ? 1 : config.batch_shard_count)
-   batch_starts.push_back(batch * config.batch_size);
-  batch_slots.resize(batch_starts.size());
+  const size_t first = explicit_schedule ? resume_offset / config.batch_size : config.batch_shard_rank;
+  const size_t step = explicit_schedule ? 1 : config.batch_shard_count;
+  batch_count = first < batches ? (batches - 1 - first) / step + 1 : 0;
+ }
+ size_t batch_start(size_t batch) const {
+  return explicit_schedule ? resume_offset + batch * config.batch_size : (config.batch_shard_rank + batch * config.batch_shard_count) * config.batch_size;
  }
  void refill(const size_t index) {
   check_failure();
   auto& slot = slots[index];
   if (slot.state == State::Released && !slot.transfer_pending && !slot.consumer_pending) slot.state = State::Free;
-  if (submitted == batch_starts.size() || slot.state != State::Free) return;
+  if (submitted == batch_count || slot.state != State::Free) return;
   slot.batch = submitted;
-  slot.start = batch_starts[submitted];
+  slot.start = batch_start(submitted);
   slot.count = std::min(config.batch_size, indices().size() - slot.start);
   slot.lease = next_lease++;
   slot.reads.clear();
   bool contiguous = true;
   for (size_t image = 0; image < slot.count; ++image) {
    slot.reads.push_back({indices()[slot.start + image], image * source->header().image_stride});
-   contiguous &= indices()[slot.start + image] == indices()[slot.start] + image;
+   contiguous &= source->pixel_offset(indices()[slot.start + image]) == source->pixel_offset(indices()[slot.start]) + image * source->header().image_stride;
   }
   slot.host = contiguous ? source->image_pixels(indices()[slot.start]) : nullptr;
   slot.transfer_pending = true;
   slot.state = State::Reading;
-  batch_slots[submitted++] = index;
+  batch_slots[submitted++ % batch_slots.size()] = index;
   try {
    stream->submit(index, *source, slot.reads, {.context = this, .complete = read_complete}, {.context = this, .complete = transfer_complete});
   } catch (...) {
@@ -208,19 +215,26 @@ DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::framew
  state.source = config.source ? config.source
                               : std::make_shared<const CompiledDataset>(
                                  CompiledDataset::open(config.compiled_path, config.shuffle ? CompiledDataset::AccessPattern::Normal : CompiledDataset::AccessPattern::Sequential));
- state.order.resize(state.source->header().num_images);
- std::iota(state.order.begin(), state.order.end(), 0U);
+ state.eligible.reserve(state.source->header().num_images);
+ for (const auto slot : state.source->eligible_slots()) state.eligible.push_back(slot);
+ state.order = state.eligible;
+ if (config.shuffle) {
+  const auto layout = shuffle_layout(state.order.size(), config.batch_size);
+  state.shuffled_blocks.reserve(layout.num_blocks);
+  state.shuffled_chunks.reserve(layout.chunks_per_block);
+ }
  state.rebuild_schedule();
  const auto execution = config.execution
                          ? *config.execution
                          : mmltk::frameworks::gpu::resolve_device_execution(config.device_id, mmltk::common::system::NumaTopology::Capture(), config.loading.numa_node, config.cpu_affinity);
  const auto& cpus = execution.placement.cpus;
  const int requested = config.gather_workers > 0 ? config.gather_workers : config.prefetch_factor;
- const auto useful_slots = std::max<std::size_t>(1U, std::min(static_cast<std::size_t>(config.prefetch_factor), state.batch_starts.size()));
+ const auto useful_slots = std::max<std::size_t>(1U, std::min(static_cast<std::size_t>(config.prefetch_factor), state.batch_count));
  const auto workers = static_cast<size_t>(clamp_worker_count_to_cpus(std::min(requested, static_cast<int>(useful_slots)), cpus.size(), 1, 1));
  state.slots.resize(useful_slots);
- // Scheduled starts increase; only the last global batch can be short.
- const auto maximum_count = state.batch_starts.empty() ? 0U : std::min(config.batch_size, state.order.size() - state.batch_starts.front());
+ state.batch_slots.resize(useful_slots);
+ // Explicit epochs may repeat eligible slots to fill the configured batch.
+ const auto maximum_count = config.batch_size;
  state.stream = std::make_unique<CompiledImageStream>(
   CompiledImageStream::Config{
    .slots = state.slots.size(),
@@ -234,14 +248,16 @@ DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::framew
   },
   std::move(retirement));
  const auto stride = static_cast<size_t>(state.source->header().image_stride);
- if (config.batch_size > std::numeric_limits<size_t>::max() / stride) throw std::overflow_error("dataset batch storage size overflow");
+ if (config.batch_size > std::numeric_limits<size_t>::max() / stride || config.batch_size > std::numeric_limits<size_t>::max() / COMPILED_LABEL_CAPACITY)
+  throw std::overflow_error("dataset batch storage size overflow");
  mmltk::frameworks::gpu::CudaDeviceScope scope(config.device_id);
  if (!scope) { mmltk::frameworks::gpu::ensure_cuda_ok(scope.Finalize(), "dataset loader device binding"); }
  try {
   mmltk::frameworks::gpu::ensure_cuda_ok(cudaFree(nullptr), "dataset loader context initialization");
   state.stream->bind_current_context();
   for (size_t index = 0; maximum_count != 0U && index < state.slots.size(); ++index) {
-   if (config.loading.h2d_dataloader) state.stream->prepare_host(index, maximum_count * stride);
+   state.stream->prepare_host(index, maximum_count * stride);
+   state.stream->prepare_reads(index, maximum_count, true);
    state.stream->prepare_device(index, maximum_count * stride);
    state.slots[index].reads.reserve(maximum_count);
   }
@@ -281,7 +297,7 @@ void DatasetLoader::begin_epoch(std::shared_ptr<const DatasetIndexSchedule> sche
       schedule->microbatch_keys.size() != (schedule->image_indices.size() / impl_->config.batch_size + (schedule->image_indices.size() % impl_->config.batch_size != 0)))
    throw std::invalid_argument("explicit microbatch key count differs");
   for (auto image : schedule->image_indices)
-   if (image >= impl_->source->header().num_images) throw std::invalid_argument("scheduled image is outside dataset");
+   if (!impl_->source->eligible(image)) throw std::invalid_argument("scheduled image is outside dataset");
  } else if (resume_offset)
   throw std::invalid_argument("resume offset requires an explicit dataset schedule");
  {
@@ -293,33 +309,13 @@ void DatasetLoader::begin_epoch(std::shared_ptr<const DatasetIndexSchedule> sche
  }
  impl_->stream->cancel_reads();
  impl_->stream->synchronize();
- try {
-  if (schedule && !schedule->image_indices.empty()) {
-   mmltk::frameworks::gpu::CudaDeviceScope scope(impl_->config.device_id);
-   mmltk::frameworks::gpu::ensure_cuda_ok(scope.status(), "explicit dataset schedule device binding");
-   const auto count = std::min(impl_->config.batch_size, schedule->image_indices.size());
-   const auto bytes = count * static_cast<std::size_t>(impl_->source->header().image_stride);
-   for (std::size_t slot = 0; slot < impl_->slots.size(); ++slot) {
-    if (impl_->config.loading.h2d_dataloader) impl_->stream->prepare_host(slot, bytes);
-    impl_->stream->prepare_device(slot, bytes);
-    impl_->slots[slot].reads.reserve(count);
-   }
-   mmltk::frameworks::gpu::ensure_cuda_ok(scope.Finalize(), "explicit dataset schedule caller restoration");
-  }
- } catch (...) {
-  std::lock_guard lock(impl_->mutex);
-  impl_->failure = std::current_exception();
-  impl_->resetting = false;
-  impl_->changed.notify_all();
-  throw;
- }
  std::lock_guard lock(impl_->mutex);
  impl_->check_failure();
  impl_->explicit_schedule = std::move(schedule);
  impl_->resume_offset = resume_offset;
  if (!impl_->explicit_schedule && impl_->config.shuffle) {
   std::mt19937_64 rng(impl_->config.seed++);
-  build_block_shuffled_order(impl_->order, impl_->source->header().num_images, impl_->config.batch_size, rng, impl_->shuffled_blocks, impl_->shuffled_chunks);
+  build_block_shuffled_order(impl_->order, impl_->eligible, impl_->config.batch_size, rng, impl_->shuffled_blocks, impl_->shuffled_chunks);
  }
  impl_->rebuild_schedule();
  impl_->submitted = impl_->consumed = 0;
@@ -335,14 +331,12 @@ Batch DatasetLoader::describe_batch(const DatasetIndexSchedule& schedule, std::s
   throw std::invalid_argument("scheduled annotation batch shape differs");
  const auto offset = microbatch * global_batch + begin;
  for (const auto image : std::span{schedule.image_indices}.subspan(offset, count))
-  if (image >= num_images()) throw std::invalid_argument("scheduled annotation image is outside dataset");
+  if (!impl_->source->eligible(image)) throw std::invalid_argument("scheduled annotation image is outside dataset");
  return {
   .draw_keys = std::span{schedule.draw_keys}.subspan(offset, count),
   .microbatch_key = schedule.microbatch_keys[microbatch],
   .num_images = count,
-  .label_index = label_index(),
-  .labels = label_data(),
-  .rle_pairs = rle_data(),
+  .source = impl_->source.get(),
   .image_indices = schedule.image_indices.data() + offset,
  };
 }
@@ -364,12 +358,12 @@ bool DatasetLoader::next_batch(Batch& out, std::stop_token stop) {
   if (impl_->stopping) return false;
   impl_->check_failure();
   if (stop.stop_requested()) return false;
-  if (impl_->consumed == impl_->batch_starts.size()) return false;
+  if (impl_->consumed == impl_->batch_count) return false;
   if (impl_->consumed == impl_->submitted) {
    impl_->changed.wait(lock);
    continue;
   }
-  const auto index = impl_->batch_slots[impl_->consumed];
+  const auto index = impl_->batch_slots[impl_->consumed % impl_->batch_slots.size()];
   auto& slot = impl_->slots[index];
   if (slot.batch == impl_->consumed && slot.state == Impl::State::Ready) {
    slot.state = Impl::State::CheckedOut;
@@ -380,9 +374,8 @@ bool DatasetLoader::next_batch(Batch& out, std::stop_token stop) {
     .microbatch_key = impl_->explicit_schedule && !impl_->explicit_schedule->microbatch_keys.empty() ? impl_->explicit_schedule->microbatch_keys.at(slot.start / impl_->config.batch_size) : 0,
     .num_images = slot.count,
     .device_images = static_cast<const float*>(impl_->stream->device_storage(index).data()),
-    .label_index = impl_->source->label_index().data(),
-    .labels = impl_->source->labels().data(),
-    .rle_pairs = impl_->source->rle_pairs().data(),
+    .source = impl_->source.get(),
+    .annotation_views = impl_->stream->annotations(index).data(),
     .image_indices = impl_->indices().data() + slot.start,
     .slot_index = index,
     .lease_id = slot.lease,
@@ -415,15 +408,15 @@ void DatasetLoader::release_batch(const Batch& batch) { impl_->release(batch, nu
 void DatasetLoader::release_batch(const Batch& batch, void* stream) { impl_->release(batch, stream, true); }
 void DatasetLoader::synchronize() { impl_->stream->synchronize(); }
 size_t DatasetLoader::num_images() const { return impl_->source->header().num_images; }
-size_t DatasetLoader::num_batches() const { return impl_->batch_starts.size(); }
+size_t DatasetLoader::num_batches() const { return impl_->batch_count; }
 uint32_t DatasetLoader::image_width() const { return impl_->source->header().image_width; }
 mmltk::backend::imaging::resample::ImageResizeMode DatasetLoader::resize_mode() const { return impl_->source->header().resize_mode; }
 const ImageEntry& DatasetLoader::image_entry(std::uint32_t index) const {
- if (index >= num_images()) throw std::out_of_range("dataset image geometry index");
+ if (!impl_->source->eligible(index)) throw std::out_of_range("dataset image geometry index");
  return impl_->source->image_entry(index);
 }
 mmltk::backend::imaging::resample::ImageResizeGeometry DatasetLoader::geometry(std::uint32_t index) const {
- if (index >= num_images()) throw std::out_of_range("dataset resize geometry index");
+ if (!impl_->source->eligible(index)) throw std::out_of_range("dataset resize geometry index");
  return impl_->source->geometry(index);
 }
 uint32_t DatasetLoader::image_height() const { return impl_->source->header().image_height; }
@@ -436,11 +429,9 @@ const char* DatasetLoader::class_name(uint32_t id) const {
  return impl_->source->class_names()[id].c_str();
 }
 size_t DatasetLoader::image_stride() const { return impl_->source->header().image_stride; }
-size_t DatasetLoader::num_label_instances() const { return impl_->source->labels().size(); }
-size_t DatasetLoader::num_rle_pairs() const { return impl_->source->rle_pairs().size(); }
+size_t DatasetLoader::num_label_instances() const { return impl_->source->label_count(); }
+size_t DatasetLoader::num_rle_pairs() const { return impl_->source->run_count(); }
 bool DatasetLoader::masks_available() const noexcept { return impl_->source->masks_available(); }
-const float* DatasetLoader::pixel_blob() const { return impl_->source->pixel_blob(); }
-const LabelIndexEntry* DatasetLoader::label_index() const { return impl_->source->label_index().data(); }
-const PackedInstance* DatasetLoader::label_data() const { return impl_->source->labels().data(); }
-const RLEPair* DatasetLoader::rle_data() const { return impl_->source->rle_pairs().data(); }
+ImageAnnotations DatasetLoader::annotations(std::uint32_t slot) const { return impl_->source->annotations(slot); }
+const float* DatasetLoader::image_pixels(std::uint32_t slot) const { return impl_->source->image_pixels(slot); }
 }  // namespace mmltk::backend::data

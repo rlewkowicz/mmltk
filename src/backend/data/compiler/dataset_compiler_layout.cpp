@@ -9,7 +9,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include "src/backend/data/compiled/compiled_format.h"
+#include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/execution_policy.h"
@@ -54,13 +54,6 @@ void write_metadata_blocks(
   mmltk::common::logging::ScopedProfile profile{"compiler.write_index"};
   write_block(label_blocks.index.data(), layout.index_size, layout.index_offset);
  }
- {
-  mmltk::common::logging::ScopedProfile profile{"compiler.write_labels"};
-  write_block(label_blocks.labels.data(), layout.label_block_size, layout.label_offset);
- }
- {
-  mmltk::common::logging::ScopedProfile profile{"compiler.write_rle"};
-  write_block(label_blocks.rle_pairs.data(), layout.rle_block_size, layout.rle_offset);
- }
+
 }
 }  // namespace mmltk::backend::data::compiler_internal
