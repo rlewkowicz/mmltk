@@ -335,7 +335,7 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
   if (state.image_opened) state.image_opened(source_root, image.source_image_id);
   if (!plan) plan = prepare_pixel_plan(slot, header);
   if (plan->header() != header) throw BenchmarkImageError("benchmark pixel input changed its prepared header");
-  if (plan->policy() != detail::CompilePixelPolicy{state.resolution, state.resize_mode, state.perceptual})
+  if (plan->policy() != detail::CompilePixelPolicy{state.resolution, state.resolution, state.resize_mode, state.perceptual})
    throw std::logic_error("benchmark pixel preparation changed its output policy");
   input->workspace = std::move(plan);
   throw_if_benchmark_cancelled(state.cancellation);
@@ -363,7 +363,7 @@ std::shared_ptr<const detail::CompilePixelWorkspacePlan> BenchmarkSplitWriter::p
  std::uint64_t id = 0;
  {
   const std::lock_guard lock(impl_->facts_mutex);
-  policy = {impl_->resolution, impl_->resize_mode, impl_->perceptual};
+  policy = {impl_->resolution, impl_->resolution, impl_->resize_mode, impl_->perceptual};
   if (impl_->pixel_preparing) {
    const auto& image = impl_->images.at(slot);
    id = image.source_image_id;
@@ -372,7 +372,7 @@ std::shared_ptr<const detail::CompilePixelWorkspacePlan> BenchmarkSplitWriter::p
  }
  throw_if_benchmark_cancelled(impl_->cancellation);
  if (impl_->pixel_preparing) impl_->pixel_preparing(root, id);
- auto plan = std::make_shared<const detail::CompilePixelWorkspacePlan>(detail::compile_pixel_workspace_plan(header, policy.resolution, policy.mode, policy.perceptual));
+ auto plan = std::make_shared<const detail::CompilePixelWorkspacePlan>(detail::compile_pixel_workspace_plan(header, policy));
  throw_if_benchmark_cancelled(impl_->cancellation);
  return plan;
 }
@@ -393,7 +393,7 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const
  (void)lane;
  const auto& header = input->payload->header();
  const auto& plan = *input->workspace;
- if (plan.policy() != detail::CompilePixelPolicy{state.resolution, state.resize_mode, state.perceptual})
+ if (plan.policy() != detail::CompilePixelPolicy{state.resolution, state.resolution, state.resize_mode, state.perceptual})
   throw std::logic_error("benchmark pixel output policy changed after preparation");
  auto memory = allowance.workspace();
  if (memory.size() < plan.bytes()) throw std::logic_error("benchmark pixels have no admitted arena");

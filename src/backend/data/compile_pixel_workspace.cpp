@@ -4,20 +4,23 @@
 namespace mmltk::backend::data::detail {
 CompilePixelWorkspacePlan::CompilePixelWorkspacePlan(const CompileImageHeader& header, CompilePixelPolicy policy)
  : header_(header), policy_(policy), decoder_(CompileImageDecoder::plan(header)),
-   resize_(imaging::resample::RgbImageResizer::workspace_plan(header.width, header.height, policy.resolution, policy.resolution, policy.mode, policy.perceptual)) {
+   resize_(imaging::resample::RgbImageResizer::workspace_plan(header.width, header.height, policy.width, policy.height, policy.mode, policy.perceptual)) {
  using common::math::checked_add;
  using common::math::checked_multiply;
  decoder_extent_ = checked_add(decoder_.bytes(), std::size_t{63}, "decode alignment overflow") / 64 * 64;
  resources_ = {.bytes = checked_add(decoder_extent_, resize_.bytes(), "pixel workspace overflow"),
   .supplied_workspace = true, .workspace_class = CompileWorkClass::Pixels, .opaque_bytes = decoder_.opaque_bytes};
- const auto row = checked_multiply<std::size_t>(policy.resolution, sizeof(float), "pixel row overflow");
- const auto plane = checked_multiply<std::size_t>(row, policy.resolution, "pixel plane overflow");
- destination_ = {policy.resolution, policy.resolution, row, plane, checked_multiply<std::size_t>(plane, 3, "pixel destination overflow"),
+ const auto row = checked_multiply<std::size_t>(policy.width, sizeof(float), "pixel row overflow");
+ const auto plane = checked_multiply<std::size_t>(row, policy.height, "pixel plane overflow");
+ destination_ = {policy.width, policy.height, row, plane, checked_multiply<std::size_t>(plane, 3, "pixel destination overflow"),
   imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32};
+}
+CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, CompilePixelPolicy policy) {
+ return CompilePixelWorkspacePlan(header, policy);
 }
 CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, std::uint32_t resolution,
  imaging::resample::ImageResizeMode mode, bool perceptual) {
- return CompilePixelWorkspacePlan(header, {resolution, mode, perceptual});
+ return compile_pixel_workspace_plan(header, {resolution, resolution, mode, perceptual});
 }
 void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::span<const std::uint8_t> encoded, const CompileImageHeader& header,
  std::span<std::byte> memory, imaging::resample::RgbMutableImageView destination, std::function_ref<void()> prepare_destination) {

@@ -1371,7 +1371,7 @@ TEST_CASE("Directory metadata construction preserves empty masks offsets and pub
   return bytes;
  };
  std::vector<std::uint8_t> baseline;
- for (const auto workers : {1, 2}) {
+ for (const auto workers : {1, 2, 3}) {
   config.num_workers = workers;
   const auto plan = DatasetCompiler::prepare(config, {"train"});
   DatasetCompiler::compile(plan, 0);
@@ -1404,6 +1404,22 @@ TEST_CASE("Directory metadata construction preserves empty masks offsets and pub
   else
    CHECK(bytes == baseline);
  }
+ // Pixel stores retain the rectangular Directory canvas through the shared
+ // checked plan in both numerical policies and both geometry modes.
+ for (const auto mode:{mmltk::backend::imaging::resample::ImageResizeMode::Stretch,mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}) {
+  config.resize_mode=mode;
+  for (const bool perceptual:{false,true}) {
+   config.perceptual_downscale=perceptual;
+   const auto plan=DatasetCompiler::prepare(config,{"train"});
+   DatasetCompiler::compile(plan,0);
+   const auto result=CompiledDataset::open(compiled_bin_path(fixture));
+   CHECK(result.header().image_width==16); CHECK(result.header().image_height==8);
+   CHECK(result.image_labels(0)[0].source_ordinal==1);
+  }
+ }
+ config.resize_mode=mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ config.perceptual_downscale=false;
+ DatasetCompiler::compile(DatasetCompiler::prepare(config,{"train"}),0);
  // Consumed input errors use the same parser, merge and publication transaction.
  for (const auto malformed :
   {R"({"class":"person","bbox_xyxy":[0,0,4,4],"iscrowd":2})", R"({"class":"person","bbox_xyxy":[0,0,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:4 2:2"})",

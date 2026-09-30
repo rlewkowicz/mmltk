@@ -148,6 +148,7 @@ mmltk_register_private_headers(mmltk_backend_data
     benchmark/detail/benchmark_recipe.h
     benchmark/detail/benchmark_progress.h
     detail/compile_workspace.h
+    detail/compile_json_number.h
     detail/compile_image_decoder.h
     detail/compile_pixel_workspace.h
     detail/compiled_label_workspace.h
@@ -170,6 +171,7 @@ mmltk_register_private_headers(mmltk_backend_data
     benchmark/detail/benchmark_writer.h
     detail/worker_queue.h
     compiler/detail/dataset_compiler_internal.h
+    compiler/detail/dataset_annotation_json.h
     detail/mask_rle_utils.h
     detail/storage_reservation.h
     detail/staged_artifact.h

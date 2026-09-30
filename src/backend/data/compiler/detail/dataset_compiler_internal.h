@@ -3,6 +3,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include "src/backend/data/detail/compile_image_decoder.h"
+#include "src/backend/data/detail/compile_execution.h"
+#include "src/backend/data/detail/compiled_label_workspace.h"
 #include <span>
 #include <string>
 #include <vector>
@@ -21,8 +25,6 @@ struct DatasetScan {
 struct LabelBlocks {
  std::vector<ImageEntry> index;
  std::uint32_t max_instances_per_image = 0;
- bool any_image_resize = false;
- bool any_image_downscale = false;
  std::uint64_t dropped_instances = 0;
 };
 struct ProgressCounter {
@@ -46,33 +48,37 @@ private:
  ProgressCounter* counter_ = nullptr;
  size_t pending_ = 0U;
 };
-struct PixelBlobWriteRequest {
- const std::filesystem::path& split_dir;
- uint32_t num_images = 0;
- uint32_t width = 0;
- uint32_t height = 0;
- size_t image_stride = 0;
- int num_workers = 0;
- bool any_resize = false;
- bool any_downscale = false;
- bool perceptual_downscale = false;
- ProgressCounter* completed_images = nullptr;
- std::span<const int> worker_cpus;
- int initial_active_workers = 0;
- const std::atomic<bool>* release_all_workers = nullptr;
- FileLayout layout;
- mmltk::common::concurrency::CancellationObservation cancel_requested = {};
- std::atomic<bool>* failure_requested = nullptr;
- mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+// A context owns all scratch across bounded label continuations. No borrowed
+// lane-local parser, input, mask scratch or output survives a return.
+class DirectoryLabels final {
+ struct Parser;
+ struct Impl;
+ std::unique_ptr<Parser> parser_;
+ std::unique_ptr<Impl> impl_;
+public:
+ explicit DirectoryLabels(detail::CompileExecution&);
+ ~DirectoryLabels();
+ DirectoryLabels(const DirectoryLabels&) = delete;
+ DirectoryLabels& operator=(const DirectoryLabels&) = delete;
+ [[nodiscard]] static detail::CompileResources resources(std::uint32_t width, std::size_t maximum_line);
+ void begin(std::uint32_t image_index, detail::CompileAllowance, std::span<const std::uint8_t> input, std::size_t maximum_line,
+  const detail::CompileImageHeader&, const CompilerConfig&, const catalog::ClassCatalog&, std::uint8_t category_base,
+  std::filesystem::path annotation, std::filesystem::path image);
+ [[nodiscard]] bool step(mmltk::common::concurrency::CancellationObservation);
+ [[nodiscard]] const ImageEntry& entry() const;
+ [[nodiscard]] detail::CompiledLabelWorkspace::OutputLease release_output();
+ void take_diagnostics(std::vector<CompileDiagnostic>&);
+ void reset() noexcept;
 };
+inline constexpr std::size_t directory_encoded_window = 32U << 20;
+inline constexpr std::size_t directory_line_window = 64U << 10;
+LabelBlocks compile_directory_images(const std::filesystem::path&, std::uint32_t images, const CompilerConfig&, const catalog::ClassCatalog&, std::uint8_t category_base,
+ detail::CompiledSlotStorage&, detail::CompileExecution&, detail::FileWorkQueue&, ProgressCounter* labels, ProgressCounter* pixels,
+ mmltk::common::concurrency::CancellationObservation);
 int resolve_num_workers(int configured_workers, std::span<const int> worker_cpus);
 std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);
 std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);
 DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::string>& splits, mmltk::common::concurrency::CancellationObservation cancellation = {});
-LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config, const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base,
- detail::CompiledSlotStorage& storage, detail::FileWorkQueue& files, int num_workers, std::span<const int> worker_cpus, ProgressCounter* completed_images = nullptr,
- std::atomic<bool>* failure_requested = nullptr, mmltk::common::concurrency::CancellationObservation cancellation = {});
 void write_metadata_blocks(const mmltk::common::io::FileHandle& fd, const FileLayout& layout, const FileHeader& header, const LabelBlocks& label_blocks,
  mmltk::common::concurrency::CancellationObservation cancel_requested = {});
-void write_pixel_blob(detail::CompiledSlotStorage&, detail::FileWorkQueue&, const PixelBlobWriteRequest& request);
 }  // namespace mmltk::backend::data::compiler_internal

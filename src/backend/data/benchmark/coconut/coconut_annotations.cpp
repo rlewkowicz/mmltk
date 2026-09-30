@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/compile_json_number.h"
 #include "src/backend/data/detail/staged_artifact.h"
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
@@ -325,30 +326,7 @@ void consume_json_value(simdjson::ondemand::value value, JsonConsumption& admiss
   if (admission.limited && text.size() > 4096) invalid("panoptic text exceeds admission");
   if (atom) atom->value = text;
  } else if (type == simdjson::ondemand::json_type::number) {
-  auto token = value.raw_json_token();
-  while (!token.empty() && static_cast<unsigned char>(token.back()) <= ' ') token.remove_suffix(1);
-  auto parsed = value.get_number();
-  auto digits = token;
-  if (digits.starts_with('-')) digits.remove_prefix(1);
-  const bool large_integer = !digits.empty() && digits.front() >= '1' && digits.front() <= '9' && std::ranges::all_of(digits, [](char character) { return character >= '0' && character <= '9'; });
-  if (parsed.error() == simdjson::BIGINT_ERROR || (parsed.error() == simdjson::NUMBER_ERROR && large_integer)) {
-   double fallback = 0;
-   const auto result = std::from_chars(token.data(), token.data() + token.size(), fallback);
-   auto end = result.ptr;
-   while (end != token.data() + token.size() && static_cast<unsigned char>(*end) <= ' ') ++end;
-   if (result.ec != std::errc{} || end != token.data() + token.size() || !std::isfinite(fallback)) invalid("JSON number exceeds admission");
-   if (atom) atom->value = fallback;
-   return;
-  }
-  const auto number = parsed.value();
-  if (atom) {
-   if (number.is_uint64())
-    atom->value = number.get_uint64();
-   else if (number.is_int64())
-    atom->value = number.get_int64();
-   else
-    atom->value = number.get_double();
-  }
+  detail::consume_compile_json_number(value,[&](auto number) { if (atom) atom->value=number; },[](const char* error) { invalid(error); });
  } else if (type == simdjson::ondemand::json_type::boolean) {
   const auto boolean = value.get_bool().value();
   if (atom) atom->value = boolean;

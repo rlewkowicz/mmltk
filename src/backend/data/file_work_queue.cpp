@@ -2,6 +2,7 @@
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/system/cpu_affinity.h"
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <mutex>
 #include <stdexcept>
@@ -27,7 +28,8 @@ struct FileWorkQueue::Impl {
  std::vector<std::jthread> services;
  CompileExecution* execution = nullptr;
  mmltk::common::concurrency::WorkerPool* pool = nullptr;
- std::optional<CompileExecution::Producer> producer;
+ std::array<std::optional<CompileExecution::Producer>,static_cast<std::size_t>(CompileWorkClass::Count)> producers;
+ std::array<std::size_t,static_cast<std::size_t>(CompileWorkClass::Count)> class_pending{};
  std::stop_source stop;
  const std::exception_ptr cancelled = std::make_exception_ptr(std::runtime_error("file operation cancelled before admission"));
  std::size_t pending = 0, cursor = 0;
@@ -39,12 +41,14 @@ struct FileWorkQueue::Impl {
   // Only the record's completion owner gets here. An admitted syscall has
   // returned, and all callbacks finish outside both queue and admission locks.
   if (operation.completed) try { operation.completed(error); } catch (...) { if (!error) error = std::current_exception(); }
+  const auto service_class=static_cast<std::size_t>(operation.service_class);
   operation = {};
   completion.settle(error);
   {
    const std::lock_guard lock(mutex);
    records[index].state = State::Free;
-   if (!--pending) producer.reset();
+   --pending;
+   if (!--class_pending[service_class]) producers[service_class].reset();
   }
   changed.notify_all();
   if (execution) execution->notify_admission_change();
@@ -54,7 +58,7 @@ struct FileWorkQueue::Impl {
   try {
    std::optional<CompileExecution::ServiceGrant> grant;
    if (execution) {
-    grant.emplace(execution->service_grant(CompileWorkClass::Output, stop.get_token()));
+    grant.emplace(execution->service_grant(records[index].operation.service_class, stop.get_token()));
     mmltk::common::system::set_thread_affinity({grant->cpu()});
    }
    {
@@ -117,15 +121,17 @@ FileWorkQueue::~FileWorkQueue() {
 }
 std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation operation) {
  if (!operation.call && !operation.work) throw std::invalid_argument("empty borrowed file operation");
+ const auto service_class=static_cast<std::size_t>(operation.service_class);
+ if (service_class>=impl_->class_pending.size()) throw std::invalid_argument("invalid file operation service class");
  std::unique_lock lock(impl_->mutex);
  if (impl_->stopping) throw std::runtime_error("file queue admission after stop");
  const auto position = std::ranges::find(impl_->records, Impl::State::Free, &Impl::Record::state);
  if (position == impl_->records.end()) return {};
  // Prepare every fallible owner before publishing the record. In particular,
- // completion allocation cannot leave an otherwise empty Output class live.
+ // completion allocation cannot leave an otherwise empty service class live.
  CompileExecution::CompletionSource completion{impl_->execution};
  std::optional<CompileExecution::Producer> producer;
- if (!impl_->pending && impl_->execution) producer.emplace(impl_->execution->open_class(CompileWorkClass::Output));
+ if (!impl_->class_pending[service_class] && impl_->execution) producer.emplace(impl_->execution->open_class(operation.service_class));
  position->completion = std::move(completion);
  auto result = position->completion.completion();
  position->operation = std::move(operation); position->state = Impl::State::Queued;
@@ -142,8 +148,8 @@ std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation 
    lock.unlock(); throw;
   }
  }
- if (producer) impl_->producer = std::move(producer);
- ++impl_->pending;
+ if (producer) impl_->producers[service_class] = std::move(producer);
+ ++impl_->class_pending[service_class]; ++impl_->pending;
  lock.unlock(); impl_->changed.notify_one(); return result;
 }
 CompileExecution::Completion FileWorkQueue::submit(Operation operation) {

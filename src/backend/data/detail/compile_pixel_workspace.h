@@ -8,7 +8,7 @@
 #include <span>
 namespace mmltk::backend::data::detail {
 struct CompilePixelPolicy {
- std::uint32_t resolution = 0;
+ std::uint32_t width = 0, height = 0;
  imaging::resample::ImageResizeMode mode = imaging::resample::ImageResizeMode::Stretch;
  bool perceptual = false;
  bool operator==(const CompilePixelPolicy&) const = default;
@@ -24,7 +24,7 @@ public:
  [[nodiscard]] const imaging::resample::RgbImageLayout& destination() const noexcept { return destination_; }
 private:
  friend class CompilePixelWorkspace;
- friend CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, std::uint32_t, imaging::resample::ImageResizeMode, bool);
+ friend CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, CompilePixelPolicy);
  CompilePixelWorkspacePlan(const CompileImageHeader&, CompilePixelPolicy);
  CompileImageHeader header_;
  CompilePixelPolicy policy_;
@@ -34,6 +34,7 @@ private:
  CompileResources resources_;
  imaging::resample::RgbImageLayout destination_;
 };
+[[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, CompilePixelPolicy);
 [[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, std::uint32_t resolution,
  imaging::resample::ImageResizeMode, bool perceptual);
 // Session-owned controls bind only to the current arena. Pixels go directly

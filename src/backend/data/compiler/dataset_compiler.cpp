@@ -1,6 +1,7 @@
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -192,7 +193,6 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
   if (cancellation.requested()) { throw std::runtime_error("dataset compilation cancelled"); }
  };
  throw_if_cancelled();
- std::atomic<bool> failure_requested{false};
  const std::filesystem::path split_dir = std::filesystem::path(effective_config.source_dir) / effective_config.split;
  const std::filesystem::path out_dir = effective_config.output_dir;
  std::filesystem::create_directories(out_dir);
@@ -201,13 +201,8 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  const uint32_t channels = 3;
  const size_t image_stride = static_cast<size_t>(channels) * height * width * sizeof(float);
  const int configured_workers = compiler_internal::resolve_num_workers(effective_config.num_workers, std::span<const int>(effective_config.worker_cpus));
- const int num_workers = std::max(1,configured_workers-1);
- const int initial_pixel_workers = num_workers == 1 ? 0 : (num_workers + 1) / 2;
- const int label_workers = num_workers - initial_pixel_workers;
- const int pixel_workers = num_workers;
- const std::span<const int> worker_cpus(effective_config.worker_cpus.data()+(configured_workers>1 ? 1 : 0), static_cast<size_t>(num_workers));
- const std::span<const int> label_cpus = worker_cpus.last(static_cast<size_t>(label_workers));
- mmltk::common::logging::profile_set_value("compiler.num_workers", static_cast<size_t>(num_workers));
+ const auto worker_cpus=std::span<const int>(effective_config.worker_cpus).first(static_cast<std::size_t>(configured_workers));
+ mmltk::common::logging::profile_set_value("compiler.num_workers",static_cast<std::size_t>(configured_workers));
  const auto& class_catalog = plan.class_catalog;
  if (class_catalog.empty() || plan.source_category_base > 1U) throw std::runtime_error("invalid generic compile catalog");
  const uint32_t num_images = plan.splits[split_index].image_count;
@@ -221,10 +216,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  compiler_internal::ProgressCounter label_progress{telemetry, compiler_internal::ProgressCounter::Stage::kLabels};
  compiler_internal::ProgressCounter pixel_progress{telemetry, compiler_internal::ProgressCounter::Stage::kPixels};
  mmltk::common::logging::debug([&](spdlog::logger& log) {
-  log.debug(
-   "[compile] {}: {} images, {} workers ({} pixel initial + {} label, {} pixel after handoff), target {}x{}, "
-   "stride={} bytes/img",
-   effective_config.split, num_images, num_workers, initial_pixel_workers, label_workers, pixel_workers, width, height, image_stride);
+  log.debug("[compile] {}: {} images, {} shared workers, target {}x{}, stride={} bytes/img",effective_config.split,num_images,configured_workers,width,height,image_stride);
  });
  FileLayout layout;
  {
@@ -240,61 +232,27 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  auto staged=detail::StagedArtifact::create(destination,out_path,0,"directory compiled staging");
  auto& fd=staged.file();
  detail::CompiledSlotStorage storage(staged,layout);
- // Until Directory's task cutover, physical calls use the same bounded file
- // service contract while its numbered source worker scheduling is retained.
- detail::CompileExecutionLimits file_limits;
- file_limits.workspace_plan=std::make_shared<detail::CompileWorkspacePlan>(detail::CompileWorkspacePlan::prepare(1,{},0,COMPILED_COMPACTION_SCRATCH_BYTES,COMPILED_COMPACTION_SCRATCH_BYTES));
- detail::CompileExecution file_execution(1,std::span<const int>(effective_config.worker_cpus).first(1),file_limits,cancellation);
- detail::FileWorkQueue files(file_execution,static_cast<std::size_t>(num_workers));
- compiler_internal::LabelBlocks label_blocks;
- std::exception_ptr pixel_error;
- std::exception_ptr label_error;
- std::atomic<bool> release_all_pixel_workers{false};
- std::thread pixel_thread([&] {
-  try {
-   compiler_internal::write_pixel_blob(storage, files, compiler_internal::PixelBlobWriteRequest{
-                                            split_dir,
-                                            num_images,
-                                            width,
-                                            height,
-                                            image_stride,
-                                            pixel_workers,
-                                            true,
-                                            true,
-                                            effective_config.perceptual_downscale,
-                                            telemetry != nullptr ? &pixel_progress : nullptr,
-                                            worker_cpus,
-                                            initial_pixel_workers,
-                                            &release_all_pixel_workers,
-                                            layout,
-                                            cancellation,
-                                            &failure_requested,
-                                            effective_config.resize_mode,
-                                           });
-  } catch (...) {
-   failure_requested.store(true, std::memory_order_relaxed);
-   pixel_error = std::current_exception();
-  }
- });
- try {
-  label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, effective_config, class_catalog, plan.source_category_base, storage, files, label_workers, label_cpus,
-   telemetry != nullptr ? &label_progress : nullptr, &failure_requested, cancellation);
-  if (telemetry != nullptr) { telemetry->set_dropped_instances(label_blocks.dropped_instances); }
- } catch (...) {
-  failure_requested.store(true, std::memory_order_relaxed);
-  label_error = std::current_exception();
- }
- release_all_pixel_workers.store(true, std::memory_order_release);
- release_all_pixel_workers.notify_all();
- pixel_thread.join();
- if (pixel_error) { std::rethrow_exception(pixel_error); }
- if (label_error) { std::rethrow_exception(label_error); }
- throw_if_cancelled();
- mmltk::common::logging::debug([](spdlog::logger& log) { log.debug("[compile] Labels and pixels complete"); });
+ constexpr std::array classes{detail::CompileWorkClass::Extraction,detail::CompileWorkClass::Annotations,detail::CompileWorkClass::Pixels,detail::CompileWorkClass::Output};
+ const auto label_window=compiler_internal::DirectoryLabels::resources(2048,compiler_internal::directory_line_window).bytes;
+ detail::CompileExecutionLimits limits;
+ limits.workspace_plan=std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(static_cast<std::size_t>(configured_workers),
+  {width,height,effective_config.resize_mode,effective_config.perceptual_downscale},classes,
+  {label_window,label_window},0,compiler_internal::directory_encoded_window));
+ detail::CompileExecution::Observer observer;
+ if (effective_config.observation && effective_config.observation->execution) observer=[&](std::string_view event,const detail::CompileExecutionSnapshot& snapshot) {
+  effective_config.observation->execution(effective_config.observation->context,event,snapshot);
+ };
+ detail::CompileExecution execution(static_cast<std::size_t>(configured_workers),worker_cpus,limits,cancellation,std::move(observer),
+  std::make_exception_ptr(std::runtime_error("dataset compilation cancelled")));
+ auto output=execution.open_class(detail::CompileWorkClass::Output);
+ detail::FileWorkQueue files(execution,std::max<std::size_t>(2,static_cast<std::size_t>(configured_workers)*2),std::min<std::size_t>(2,execution.workers()));
+ auto label_blocks=compiler_internal::compile_directory_images(split_dir,num_images,effective_config,class_catalog,plan.source_category_base,storage,execution,files,
+  telemetry ? &label_progress : nullptr,telemetry ? &pixel_progress : nullptr,cancellation);
+ if (telemetry) telemetry->set_dropped_instances(label_blocks.dropped_instances);
  throw_if_cancelled();
  files.join();
  storage.quiesce();
- auto compaction=file_execution.reserve({.bytes=COMPILED_COMPACTION_SCRATCH_BYTES,.supplied_workspace=true,.completion_workspace=true,
+ auto compaction=execution.reserve({.bytes=COMPILED_COMPACTION_SCRATCH_BYTES,.supplied_workspace=true,.completion_workspace=true,
   .workspace_class=detail::CompileWorkClass::Output,.workspace_window=detail::CompileWorkspaceWindow::Compaction});
  files.submit({.work=[&] {
  layout = compact_compiled_file(fd, layout, label_blocks.index, cancellation,

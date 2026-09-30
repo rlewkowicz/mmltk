@@ -21,6 +21,13 @@
 #include "src/backend/data/compiler/dataset_compile_phase.h"
 #include "src/backend/data/compiler/dataset_compile_progress.h"
 namespace mmltk::backend::data {
+namespace detail { enum class CompileTaskKind : std::uint8_t; struct CompileExecutionSnapshot; }
+// Optional effect-only observations. Callbacks never govern slot identity or admission.
+struct DirectoryCompileObservation {
+ void* context = nullptr;
+ void (*task)(void*, detail::CompileTaskKind, std::uint32_t, bool completed) = nullptr;
+ void (*execution)(void*, std::string_view, const detail::CompileExecutionSnapshot&) = nullptr;
+};
 namespace compiler_internal {
 struct ProgressCounter;
 }
@@ -125,6 +132,7 @@ struct CompilerConfig {
  MMLTK_MINIMUM(int, 0) int cuda_device_id = 0;
  MMLTK_MAX_ITEMS(mmltk::frameworks::reflection::kMaximumCpuIdentifiers) std::vector<int> worker_cpus;
  std::vector<CompileDiagnostic>* diagnostics = nullptr;
+ const DirectoryCompileObservation* observation = nullptr;
 };
 MMLTK_REFLECT_FIELDS(CompilerConfig)
 enum class CompilerConfigViolation : std::uint8_t {

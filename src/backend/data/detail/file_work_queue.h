@@ -18,6 +18,7 @@ public:
   void (*call)(void*) = nullptr;
   std::function<void(std::exception_ptr)> completed;
   std::function<void()> work;
+  CompileWorkClass service_class = CompileWorkClass::Output;
  };
  FileWorkQueue(CompileExecution&, std::size_t records, std::size_t services = 1);
  FileWorkQueue(mmltk::common::concurrency::WorkerPool&, std::size_t records);

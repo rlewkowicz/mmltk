@@ -1,4 +1,5 @@
 #include "src/backend/data/detail/compile_workspace.h"
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/common/system/numa_memory.h"
 #include "src/common/system/numa_topology.h"
 #include <algorithm>
@@ -1223,4 +1224,423 @@ TEST_CASE("compile arena windows prefer the smallest ordinary context and retain
  CHECK(bank.snapshot().reused==1);
  CHECK(bank.snapshot().resident==plan.budget);
  CHECK(bank.snapshot().physical_retirements==0);
+}
+TEST_CASE("Directory annotations preserve external JSON presence and last-key interpretation", "[backend][data][compiler]") {
+ const mmltk::testsupport::ScopedTempDir root("directory-json-presence");
+ const FixtureSpec fixture{.root_dir=root.path().string(),.width=16,.height=8,.num_images=1};
+ create_synthetic_dataset(fixture);
+ const auto path=fs::path(dataset_dir(fixture))/"train/000001.jsonl";
+ auto config=compiler_config(fixture); config.num_workers=1; config.target_width=8; config.target_height=4;
+ const auto compile=[&] { DatasetCompiler::compile(DatasetCompiler::prepare(config,{"train"}),0); };
+ overwrite_annotation(path,"\n" R"({"class":false,"class":"person","bbox_xyxy":null,"bbox_xyxy":[-0.5,1.25,12.5,6.75],"image_id":9,"image_id":0,"id":null,"id":0,"category_id":0,"iscrowd":2,"iscrowd":1,"ignore":false,"ignore":true,"area":null,"area":7.25,"mask_rle_encoding":"wrong","mask_rle_encoding":"row_major_start_length","mask_rle":3,"mask_rle":"","image_size_wh":[16.75,8.25],"unknown":{"nested":[null,false,"ignored",18446744073709551616]}})" "\n\n"
+  R"({"class":"person","bbox_xyxy":[1,1,2,2],"id":18446744073709551615,"image_id":0})" "\n"
+  +std::string(R"({"class":"person","bbox_xyxy":[0,0,18446744073709551616,18446744073709551616],"area":18446744073709551616,"unknown":)")
+  +std::string(2048,'[')+"18446744073709551616"+std::string(2048,']')+"}");
+ compile();
+ const auto store=CompiledDataset::open(compiled_bin_path(fixture));
+ REQUIRE(store.image_labels(0).size()==3);
+ const auto& first=store.image_labels(0)[0];
+ CHECK(first.source_ordinal==2); CHECK(first.annotation_id==0); CHECK(first.has_annotation_id());
+ CHECK(first.has_source_category()); CHECK(first.source_category_id==0); CHECK(first.is_crowd()); CHECK(first.raw_ignore());
+ CHECK(first.has_mask()); CHECK(first.mask_rle_pairs==0); CHECK(first.original_area==7.25);
+ CHECK(first.bbox_x1==-0.25F); CHECK(first.bbox_y1==0.625F); CHECK(first.bbox_x2==6.25F); CHECK(first.bbox_y2==3.375F);
+ CHECK(store.image_labels(0)[1].source_ordinal==4); CHECK(store.image_labels(0)[1].annotation_id==UINT64_MAX);
+ CHECK_FALSE(store.image_labels(0)[1].has_mask()); CHECK(store.image_entry(0).has_source_image_id); CHECK(store.image_entry(0).source_image_id==0);
+ CHECK(store.image_labels(0)[2].source_ordinal==5); CHECK(store.image_labels(0)[2].original_area==18446744073709551616.0);
+ CHECK(store.image_labels(0)[2].bbox_x2==9223372036854775808.0F);
+ for (const auto field: {"id","image_id","category_id"}) for (const auto value: {"-1","1.0","true","null","18446744073709551616"}) {
+  overwrite_annotation(path,std::string(R"({"class":"person","bbox_xyxy":[0,0,1,1],")")+field+"\":"+value+"}");
+  CHECK_THROWS(compile());
+  const auto retained=CompiledDataset::open(compiled_bin_path(fixture)); CHECK(retained.image_labels(0)[0].source_ordinal==2);
+ }
+ for (const auto record: {
+  R"({"class":"person","bbox_xyxy":[0,0,1,1]} {})",
+  R"({"class":"person","bbox_xyxy":[0,0,1,1],"unknown":[1e999]})",
+  R"({"class":"person","bbox_xyxy":[0,0,true,1]})",
+  R"({"class":"person","bbox_xyxy":[0,0,1,1],"area":true})"}) {
+  overwrite_annotation(path,record); CHECK_THROWS(compile());
+ }
+ fs::remove(path);
+ CHECK_THROWS(compile());
+ CHECK(CompiledDataset::open(compiled_bin_path(fixture)).image_labels(0).size()==3);
+}
+TEST_CASE("Directory counts complete oversized label output without retaining excess", "[backend][data][compiler]") {
+ const mmltk::testsupport::ScopedTempDir root("directory-complete-label-extent");
+ const FixtureSpec fixture{.root_dir=root.path().string(),.width=8,.height=8,.num_images=1};
+ create_synthetic_dataset(fixture);
+ const auto path=fs::path(dataset_dir(fixture))/"train/000001.jsonl";
+ constexpr auto count=COMPILED_LABEL_CAPACITY/sizeof(PackedInstance)+17;
+ {
+  std::ofstream file(path,std::ios::trunc);
+  for (std::size_t i=0;i<count;++i) file << R"({"class":"person","bbox_xyxy":[0,0,1,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:1"})" << '\n';
+ }
+ auto config=compiler_config(fixture); config.num_workers=1;
+ try {
+  DatasetCompiler::compile(DatasetCompiler::prepare(config,{"train"}),0);
+  FAIL("oversized image output was accepted");
+ } catch (const std::runtime_error& error) {
+  const std::string message=error.what();
+  const auto bytes=compiled_align_up(count*sizeof(PackedInstance),sizeof(RLEPair))+count*sizeof(RLEPair);
+  CHECK(message.find("000001.png")!=std::string::npos);
+  CHECK(message.find("required "+std::to_string(bytes)+" bytes")!=std::string::npos);
+  CHECK(message.find("capacity "+std::to_string(COMPILED_LABEL_CAPACITY))!=std::string::npos);
+ }
+ CHECK_FALSE(fs::exists(compiled_bin_path(fixture)));
+}
+TEST_CASE("Directory large source masks may compile to a small bounded payload", "[backend][data][compiler][mask]") {
+ const mmltk::testsupport::ScopedTempDir root("directory-source-mask-workspace");
+ const FixtureSpec fixture{.root_dir=root.path().string(),.width=512,.height=512,.num_images=1};
+ create_synthetic_dataset(fixture);
+ const auto path=fs::path(dataset_dir(fixture))/"train/000001.jsonl";
+ constexpr auto source_runs=512U*512U/2U;
+ static_assert(source_runs*sizeof(RLEPair)>COMPILED_LABEL_CAPACITY);
+ {
+  std::ofstream file(path,std::ios::trunc);
+  file << R"({"class":"person","bbox_xyxy":[0,0,512,512],"mask_rle_encoding":"row_major_start_length","mask_rle":")";
+  for (std::size_t i=0;i<source_runs;++i) file << i*2 << ":1 ";
+  file << "\"}\n";
+ }
+ auto config=compiler_config(fixture); config.num_workers=1; config.target_width=2; config.target_height=2;
+ DatasetCompiler::compile(DatasetCompiler::prepare(config,{"train"}),0);
+ const auto store=CompiledDataset::open(compiled_bin_path(fixture));
+ REQUIRE(store.image_labels(0).size()==1);
+ const auto& label=store.image_labels(0)[0];
+ CHECK(label.has_mask()); CHECK(label.original_area==source_runs); CHECK(label.mask_rle_pairs<=2);
+ CHECK(store.image_entry(0).label_bytes<=sizeof(PackedInstance)+2*sizeof(RLEPair));
+ const auto read_output=[&] {
+  auto file=FileHandle::open_readonly(compiled_bin_path(fixture));
+  std::vector<std::uint8_t> bytes(file.size()); file.pread_all(bytes.data(),bytes.size(),0); return bytes;
+ };
+ const auto baseline=read_output();
+ // Identity projection preserves each separated source run. Its bounded
+ // continuation must still count the whole mask after storage is exhausted.
+ config.target_width=fixture.width; config.target_height=fixture.height;
+ try {
+  DatasetCompiler::compile(DatasetCompiler::prepare(config,{"train"}),0);
+  FAIL("oversized projected mask was accepted");
+ } catch (const std::runtime_error& error) {
+  const std::string message=error.what();
+  const auto bytes=compiled_align_up(sizeof(PackedInstance),sizeof(RLEPair))+source_runs*sizeof(RLEPair);
+  CHECK(message.find("000001.png")!=std::string::npos);
+  CHECK(message.find("required "+std::to_string(bytes)+" bytes")!=std::string::npos);
+  CHECK(message.find("capacity "+std::to_string(COMPILED_LABEL_CAPACITY))!=std::string::npos);
+ }
+ CHECK(read_output()==baseline);
+}
+TEST_CASE("Directory one-core continuations keep ready labels running behind held physical output", "[backend][data][compiler][concurrency]") {
+ using namespace mmltk::backend::data::detail;
+ using mmltk::testsupport::release_test_promise;
+ const bool cancel=GENERATE(false,true);
+ const mmltk::testsupport::ScopedTempDir root("directory-one-core-ready");
+ const FixtureSpec fixture{.root_dir=root.path().string(),.width=16,.height=8,.num_images=2};
+ create_synthetic_dataset(fixture);
+ auto config=compiler_config(fixture); config.num_workers=1;
+ // More than one bounded quantum verifies that a continuation retains its own
+ // parser/output storage and that completing another stage does not release it.
+ {
+  std::ofstream file(fs::path(dataset_dir(fixture))/"train/000002.jsonl",std::ios::trunc);
+  for (std::size_t i=0;i<96;++i) file << R"({"class":"person","bbox_xyxy":[1,1,2,2],"id":0})" << '\n';
+ }
+ const auto baseline_plan=DatasetCompiler::prepare(config,{"train"});
+ DatasetCompiler::compile(baseline_plan,0);
+ const auto old_file=FileHandle::open_readonly(compiled_bin_path(fixture));
+ std::vector<std::uint8_t> old_bytes(old_file.size()); old_file.pread_all(old_bytes.data(),old_bytes.size(),0);
+ mmltk::testsupport::TestGate gate("Directory prepared extent physical completion");
+ struct Observations {
+  mmltk::testsupport::TestGate::Receipt receipt;
+  std::promise<void> held, labels;
+  std::shared_future<void> output_ready;
+  std::atomic<bool> holding{false}, label_seen{false}, invalid_budget{false};
+  std::atomic<std::uint64_t> locked{0};
+  std::atomic<std::size_t> continuations{0};
+  explicit Observations(mmltk::testsupport::TestGate::Receipt value) : receipt(std::move(value)),output_ready(held.get_future().share()) {}
+ } observations(gate.receipt());
+ const DirectoryCompileObservation observer{&observations,
+  [](void* context,CompileTaskKind kind,std::uint32_t image,bool complete) {
+   auto& state=*static_cast<Observations*>(context);
+   if (kind==CompileTaskKind::Output && image==0 && complete) {
+    state.holding.store(true); release_test_promise(state.held); state.receipt.ArriveAndWait(); state.holding.store(false);
+   }
+   if (kind==CompileTaskKind::Labels && image==1 && complete) {
+    const auto quantum=++state.continuations;
+    // Image 0 has no records, and both headers are already complete. At this
+    // first yield no other CPU task can precede the prepared-output service.
+    // Its returned CPU grant lets that service enter even on one CPU.
+    if (quantum==1) state.output_ready.wait();
+    else if (state.holding.load()) { state.label_seen.store(true); release_test_promise(state.labels); }
+   }
+  },
+  [](void* context,std::string_view,const CompileExecutionSnapshot& snapshot) {
+   auto& state=*static_cast<Observations*>(context);
+   if (snapshot.active+snapshot.external>1 || snapshot.live[static_cast<std::size_t>(CompileWorkClass::Acquisition)] || snapshot.live[static_cast<std::size_t>(CompileWorkClass::Gather)])
+    state.invalid_budget.store(true);
+   if (state.holding.load() && (!snapshot.live[static_cast<std::size_t>(CompileWorkClass::Annotations)] ||
+       !snapshot.live[static_cast<std::size_t>(CompileWorkClass::Pixels)] || !snapshot.live[static_cast<std::size_t>(CompileWorkClass::Output)])) state.invalid_budget.store(true);
+   const auto previous=state.locked.exchange(snapshot.normal_locked);
+   if (previous && previous!=snapshot.normal_locked) state.invalid_budget.store(true);
+  }};
+ config.observation=&observer;
+ const auto plan=DatasetCompiler::prepare(config,{"train"});
+ struct DirectoryCancellationTag {};
+ using CancellationSource=mmltk::common::concurrency::EventCancellationSource<DirectoryCancellationTag,false>;
+ auto [cancellation,token]=CancellationSource::Mint();
+ std::future<void> compile;
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+  (void)cancellation.RequestCancel(); release_test_promise(observations.held); gate.Release(); if (compile.valid()) compile.wait();
+ });
+ compile=std::async(std::launch::async,[&] { DatasetCompiler::compile(plan,0,nullptr,mmltk::common::concurrency::CancellationObservation::Borrow(token)); });
+ REQUIRE(gate.WaitEntered(std::chrono::seconds{30}));
+ mmltk::testsupport::await_test_promise(observations.labels,"ready Directory label continuation",std::chrono::seconds{30});
+ CHECK(observations.label_seen.load()); CHECK_FALSE(observations.invalid_budget.load()); CHECK(observations.locked.load()>0);
+ if (cancel) REQUIRE(cancellation.RequestCancel());
+ gate.Release();
+ if (cancel) CHECK_THROWS(mmltk::testsupport::await_test_future(compile,"cancelled Directory drain",std::chrono::seconds{30}));
+ else {
+  mmltk::testsupport::await_test_future(compile,"Directory completion",std::chrono::seconds{30});
+  CHECK(observations.continuations.load()>=3);
+ }
+ CHECK_FALSE(observations.invalid_budget.load());
+ const auto new_file=FileHandle::open_readonly(compiled_bin_path(fixture));
+ std::vector<std::uint8_t> new_bytes(new_file.size()); new_file.pread_all(new_bytes.data(),new_bytes.size(),0);
+ CHECK(new_bytes==old_bytes);
+}
+TEST_CASE("Directory independent pixels enter shared lanes while an input completion is held", "[backend][data][compiler][concurrency]") {
+ using namespace mmltk::backend::data::detail;
+ const mmltk::testsupport::ScopedTempDir root("directory-independent-pixels");
+ const FixtureSpec fixture{.root_dir=root.path().string(),.width=32,.height=16,.num_images=2};
+ create_synthetic_dataset(fixture);
+ auto config=DatasetCompiler::prepare(compiler_config(fixture),{"train"}).config;
+ if (config.worker_cpus.size()<3) SKIP("requires three admitted CPUs for held input completion and independent output");
+ config.num_workers=3; config.target_width=16; config.target_height=8;
+ mmltk::testsupport::TestGate gate("first Directory input completion");
+ struct Observations {
+  mmltk::testsupport::TestGate::Receipt receipt;
+  std::promise<void> first,peer;
+  std::shared_future<void> first_entered;
+  std::atomic<bool> holding{false}, observed{false};
+  explicit Observations(mmltk::testsupport::TestGate::Receipt value) : receipt(std::move(value)),first_entered(first.get_future().share()) {}
+ } observations(gate.receipt());
+ const DirectoryCompileObservation observer{&observations,[](void* context,CompileTaskKind kind,std::uint32_t image,bool complete) {
+  auto& state=*static_cast<Observations*>(context);
+  if (kind==CompileTaskKind::Header && complete && !image) {
+   state.holding.store(true); mmltk::testsupport::release_test_promise(state.first); state.receipt.ArriveAndWait(); state.holding.store(false);
+  }
+  if (kind==CompileTaskKind::Pixels && !complete && image==1) {
+   state.first_entered.wait(); if (state.holding.load()) { state.observed.store(true); mmltk::testsupport::release_test_promise(state.peer); }
+  }
+ }};
+ config.observation=&observer;
+ const auto plan=DatasetCompiler::prepare(config,{"train"});
+ struct DirectoryCancellationTag {};
+ using CancellationSource=mmltk::common::concurrency::EventCancellationSource<DirectoryCancellationTag,false>;
+ auto [cancellation,token]=CancellationSource::Mint();
+ std::future<void> compile;
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] { (void)cancellation.RequestCancel(); mmltk::testsupport::release_test_promise(observations.first); gate.Release(); if (compile.valid()) compile.wait(); });
+ compile=std::async(std::launch::async,[&] { DatasetCompiler::compile(plan,0,nullptr,mmltk::common::concurrency::CancellationObservation::Borrow(token)); });
+ REQUIRE(gate.WaitEntered(std::chrono::seconds{30}));
+ mmltk::testsupport::await_test_promise(observations.peer,"independent Directory resize",std::chrono::seconds{30});
+ CHECK(observations.observed.load());
+ gate.Release();
+ mmltk::testsupport::await_test_future(compile,"Directory peer settlement",std::chrono::seconds{30});
+ CHECK(CompiledDataset::open(compiled_bin_path(fixture)).image_entries().size()==2);
+}
+TEST_CASE("Directory file services preserve Extraction floors and peer pixels through held Output", "[backend][data][compiler][concurrency]") {
+ using namespace mmltk::backend::data::detail;
+ using mmltk::testsupport::release_test_promise;
+ const bool hold_completion=GENERATE(false,true);
+ const bool cancel=GENERATE(false,true);
+ const mmltk::testsupport::ScopedTempDir root("directory-file-service-floors");
+ const FixtureSpec fixture{.root_dir=root.path().string(),.width=32,.height=16,.num_images=2};
+ create_synthetic_dataset(fixture);
+ auto config=DatasetCompiler::prepare(compiler_config(fixture),{"train"}).config;
+ if (config.worker_cpus.size()<4) SKIP("requires four admitted CPUs for the four live class floors");
+ config.num_workers=4;
+ DatasetCompiler::compile(DatasetCompiler::prepare(config,{"train"}),0);
+ const auto read_output=[&] {
+  auto file=FileHandle::open_readonly(compiled_bin_path(fixture));
+  std::vector<std::uint8_t> bytes(file.size()); file.pread_all(bytes.data(),bytes.size(),0); return bytes;
+ };
+ const auto baseline=read_output();
+ mmltk::testsupport::TestGate input("Directory Extraction service"),output("Directory occupied Output service");
+ struct State {
+  mmltk::testsupport::TestGate::Receipt input,output;
+  std::promise<void> extraction,held,peer;
+  std::shared_future<void> output_entered;
+  bool completion;
+  std::atomic<bool> holding{false},observed{false},invalid_budget{false};
+  State(mmltk::testsupport::TestGate::Receipt in,mmltk::testsupport::TestGate::Receipt out,bool complete)
+   : input(std::move(in)),output(std::move(out)),output_entered(held.get_future().share()),completion(complete) {}
+ } state(input.receipt(),output.receipt(),hold_completion);
+ const DirectoryCompileObservation observer{&state,[](void* context,CompileTaskKind kind,std::uint32_t image,bool complete) {
+  auto& state=*static_cast<State*>(context);
+  if (kind==CompileTaskKind::Archive && !image && !complete) state.input.ArriveAndWait();
+  if (kind==CompileTaskKind::Output && !image && complete==state.completion) {
+   state.holding.store(true); release_test_promise(state.held); state.output.ArriveAndWait(); state.holding.store(false);
+  }
+  if (kind==CompileTaskKind::Pixels && image==1 && !complete) {
+   state.output_entered.wait();
+   if (state.holding.load()) { state.observed.store(true); release_test_promise(state.peer); }
+  }
+ },[](void* context,std::string_view,const CompileExecutionSnapshot& snapshot) {
+  auto& state=*static_cast<State*>(context);
+  if (snapshot.active+snapshot.external>4) state.invalid_budget.store(true);
+  if (snapshot.services && snapshot.running[static_cast<std::size_t>(CompileWorkClass::Extraction)]) release_test_promise(state.extraction);
+ }};
+ config.observation=&observer;
+ const auto plan=DatasetCompiler::prepare(config,{"train"});
+ struct CancellationTag {};
+ using Source=mmltk::common::concurrency::EventCancellationSource<CancellationTag,false>;
+ auto [cancellation,token]=Source::Mint();
+ std::future<void> compile;
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+  (void)cancellation.RequestCancel(); input.Release(); release_test_promise(state.held); output.Release(); if (compile.valid()) compile.wait();
+ });
+ compile=std::async(std::launch::async,[&] { DatasetCompiler::compile(plan,0,nullptr,mmltk::common::concurrency::CancellationObservation::Borrow(token)); });
+ REQUIRE(input.WaitEntered(std::chrono::seconds{30}));
+ mmltk::testsupport::await_test_promise(state.extraction,"Directory Extraction service grant",std::chrono::seconds{30});
+ input.Release();
+ REQUIRE(output.WaitEntered(std::chrono::seconds{30}));
+ mmltk::testsupport::await_test_promise(state.peer,"Directory peer pixel through occupied Output",std::chrono::seconds{30});
+ CHECK(state.observed.load()); CHECK_FALSE(state.invalid_budget.load());
+ if (cancel) REQUIRE(cancellation.RequestCancel());
+ CHECK(compile.wait_for(std::chrono::seconds{0})!=std::future_status::ready);
+ output.Release();
+ if (cancel) CHECK_THROWS(mmltk::testsupport::await_test_future(compile,"Directory file service cancellation drain",std::chrono::seconds{30}));
+ else mmltk::testsupport::await_test_future(compile,"Directory file service completion",std::chrono::seconds{30});
+ CHECK_FALSE(state.invalid_budget.load()); CHECK(read_output()==baseline);
+}
+TEST_CASE("mask continuations bound long slabs and preserve rollback and complete capacity counts", "[backend][data][compiler][mask]") {
+ using namespace mmltk::backend::data::dataset;
+ using namespace mmltk::backend::imaging::resample;
+ const std::array source{RLEPair{0,4096}};
+ const auto geometry=compute_image_resize_geometry(2,2048,5,4096,ImageResizeMode::Letterbox);
+ const std::vector<RLEPair> prefix{{17,2}};
+ MaskResizeScratch scratch;
+ std::vector<RLEPair> expected=prefix;
+ RowMajorMaskBounds expected_source;
+ const auto expected_target=append_resized_row_major_mask(source,{2,2048},{5,4096},geometry,&scratch,expected,&expected_source);
+ REQUIRE(expected.size()==4097);
+ const auto same_runs=[](const auto& left,const auto& right) {
+  return std::ranges::equal(left,right,[](const auto& a,const auto& b) { return a.start==b.start && a.length==b.length; });
+ };
+ const auto same_bounds=[](const auto& left,const auto& right) {
+  return left.has_foreground==right.has_foreground && left.min_x==right.min_x && left.min_y==right.min_y && left.max_x==right.max_x && left.max_y==right.max_y;
+ };
+ std::vector<RLEPair> output=prefix;
+ {
+  RowMajorMaskProjection projection(source,{2,2048},{5,4096},geometry,&scratch,output);
+  bool complete=false;
+  while (!complete) {
+   const auto before=output.size(); complete=projection.step(1);
+   CHECK(output.size()-before<=1);
+  }
+  CHECK(same_runs(output,expected)); CHECK(same_bounds(projection.source_bounds(),expected_source)); CHECK(same_bounds(projection.target_bounds(),expected_target));
+ }
+ output=prefix;
+ {
+  RowMajorMaskProjection abandoned(source,{2,2048},{5,4096},geometry,&scratch,output);
+  CHECK_FALSE(abandoned.step(32)); REQUIRE(output.size()>prefix.size());
+ }
+ CHECK(same_runs(output,prefix));
+ {
+  RowMajorMaskProjection bounded(source,{2,2048},{5,4096},geometry,&scratch,output,17);
+  try {
+   while (!bounded.step(7)) CHECK(output.size()<=17);
+   FAIL("bounded projection must report its complete extent");
+  } catch (const MaskRunCapacityError& error) {
+   CHECK(error.required_runs()==expected.size());
+   CHECK(same_bounds(bounded.source_bounds(),expected_source));
+  }
+ }
+ CHECK(same_runs(output,prefix));
+ RowMajorMaskBounds sentinel{9,8,7,6,true};
+ try {
+  (void)append_resized_row_major_mask(source,{2,2048},{5,4096},geometry,&scratch,output,&sentinel,17);
+  FAIL("one-shot projection must report the same complete extent");
+ } catch (const MaskRunCapacityError& error) { CHECK(error.required_runs()==expected.size()); }
+ CHECK(same_runs(output,prefix)); CHECK(sentinel.min_x==9); CHECK(sentinel.max_y==6);
+ const std::array invalid{RLEPair{0,2048},RLEPair{4096,1}};
+ {
+  RowMajorMaskProjection failed(invalid,{2,2048},{5,4096},geometry,&scratch,output);
+  CHECK_THROWS([&] { while (!failed.step(13)) {} }());
+ }
+ CHECK(same_runs(output,prefix));
+}
+TEST_CASE("Directory yields inside one long mask projection for peer pixels and cancellation", "[backend][data][compiler][mask][concurrency]") {
+ using namespace mmltk::backend::data::detail;
+ using namespace mmltk::backend::data::dataset;
+ using mmltk::backend::imaging::resample::ImageResizeMode;
+ using mmltk::testsupport::release_test_promise;
+ const bool cancel=GENERATE(false,true);
+ const mmltk::testsupport::ScopedTempDir root("directory-mask-projection-yield");
+ const FixtureSpec fixture{.root_dir=root.path().string(),.width=32,.height=4096,.num_images=2};
+ create_synthetic_dataset(fixture);
+ overwrite_annotation(fs::path(dataset_dir(fixture))/"train/000001.jsonl",
+  R"({"class":"person","id":0,"mask_rle_encoding":"row_major_start_length","mask_rle":"0:131072"})");
+ auto config=DatasetCompiler::prepare(compiler_config(fixture),{"train"}).config;
+ if (config.worker_cpus.size()<3) SKIP("requires three admitted CPUs for a held projection continuation and peer pixels");
+ config.num_workers=3; config.target_width=64; config.target_height=4096; config.resize_mode=ImageResizeMode::Letterbox;
+ DatasetCompiler::compile(DatasetCompiler::prepare(config,{"train"}),0);
+ const auto read_output=[&] {
+  auto file=FileHandle::open_readonly(compiled_bin_path(fixture));
+  std::vector<std::uint8_t> bytes(file.size()); file.pread_all(bytes.data(),bytes.size(),0); return bytes;
+ };
+ const auto baseline=read_output();
+ mmltk::testsupport::TestGate held("unfinished Directory mask projection");
+ struct State {
+  mmltk::testsupport::TestGate::Receipt receipt;
+  std::promise<void> projected,peer;
+  std::shared_future<void> projection_entered;
+  std::atomic<unsigned> quanta{0};
+  std::atomic<bool> holding{false},observed{false},published{false};
+  explicit State(mmltk::testsupport::TestGate::Receipt value) : receipt(std::move(value)),projection_entered(projected.get_future().share()) {}
+ } state(held.receipt());
+ const DirectoryCompileObservation observer{&state,[](void* context,CompileTaskKind kind,std::uint32_t image,bool complete) {
+  auto& state=*static_cast<State*>(context);
+  // One short RLE token expands to 4096 padded target rows. The first Labels
+  // return must be a projection yield, before a packed record can be published.
+  if (kind==CompileTaskKind::Labels && !image && complete && ++state.quanta==1) {
+   state.holding.store(true); release_test_promise(state.projected); state.receipt.ArriveAndWait(); state.holding.store(false);
+  }
+  if (kind==CompileTaskKind::CacheWrite && !image && !complete) state.published.store(true);
+  if (kind==CompileTaskKind::Pixels && image==1 && !complete) {
+   state.projection_entered.wait();
+   if (state.holding.load()) { state.observed.store(true); release_test_promise(state.peer); }
+  }
+ }};
+ config.observation=&observer;
+ const auto plan=DatasetCompiler::prepare(config,{"train"});
+ struct CancellationTag {};
+ using Source=mmltk::common::concurrency::EventCancellationSource<CancellationTag,false>;
+ auto [cancellation,token]=Source::Mint();
+ std::future<void> compile;
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+  (void)cancellation.RequestCancel(); release_test_promise(state.projected); held.Release(); if (compile.valid()) compile.wait();
+ });
+ compile=std::async(std::launch::async,[&] { DatasetCompiler::compile(plan,0,nullptr,mmltk::common::concurrency::CancellationObservation::Borrow(token)); });
+ REQUIRE(held.WaitEntered(std::chrono::seconds{30}));
+ mmltk::testsupport::await_test_promise(state.peer,"peer pixels during unfinished mask projection",std::chrono::seconds{30});
+ CHECK(state.observed.load()); CHECK_FALSE(state.published.load());
+ if (cancel) REQUIRE(cancellation.RequestCancel());
+ CHECK(compile.wait_for(std::chrono::seconds{0})!=std::future_status::ready);
+ held.Release();
+ if (cancel) CHECK_THROWS(mmltk::testsupport::await_test_future(compile,"cancelled mask continuation drain",std::chrono::seconds{30}));
+ else {
+  mmltk::testsupport::await_test_future(compile,"resumed mask projection",std::chrono::seconds{30});
+  CHECK(state.quanta.load()>1);
+ }
+ CHECK(read_output()==baseline);
+ const auto result=CompiledDataset::open(compiled_bin_path(fixture));
+ REQUIRE(result.image_labels(0).size()==1);
+ const auto& label=result.image_labels(0).front();
+ CHECK(label.original_area==131072); CHECK(label.bbox_x1==16); CHECK(label.bbox_x2==48); CHECK(label.bbox_y1==0); CHECK(label.bbox_y2==4096);
+ CHECK(label.mask_rle_offset==0); CHECK(label.source_ordinal==1); CHECK(label.annotation_id==0); CHECK(label.has_annotation_id());
+ const std::array source{RLEPair{0,131072}};
+ const auto geometry=mmltk::backend::imaging::resample::compute_image_resize_geometry(32,4096,64,4096,ImageResizeMode::Letterbox);
+ MaskResizeScratch scratch;
+ std::vector<RLEPair> expected;
+ RowMajorMaskBounds bounds;
+ (void)append_resized_row_major_mask(source,{32,4096},{64,4096},geometry,&scratch,expected,&bounds);
+ CHECK(bounds.min_x==0); CHECK(bounds.max_x==32); CHECK(bounds.min_y==0); CHECK(bounds.max_y==4096);
+ CHECK(std::ranges::equal(result.instance_rle(0,label),expected,[](const auto& a,const auto& b) { return a.start==b.start && a.length==b.length; }));
 }
