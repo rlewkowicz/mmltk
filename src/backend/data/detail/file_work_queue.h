@@ -24,6 +24,11 @@ public:
  ~FileWorkQueue();
  FileWorkQueue(const FileWorkQueue&) = delete;
  FileWorkQueue& operator=(const FileWorkQueue&) = delete;
+ // A returned completion transfers custody: completed runs exactly once, after
+ // physical return (or cancellation before the call), then the completion settles.
+ // Empty means temporarily full. A throw means rejected. Neither outcome calls
+ // completed or retains the operation, a pending record, or a new class producer;
+ // the caller still owns settlement and may retry only the full outcome.
  [[nodiscard]] std::optional<CompileExecution::Completion> try_submit(Operation);
  [[nodiscard]] CompileExecution::Completion submit(Operation);
  void join();

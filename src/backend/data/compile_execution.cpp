@@ -732,6 +732,10 @@ void CompileExecution::resume(const Completion& completion) noexcept {
 }
 void CompileExecution::fail(std::exception_ptr error) noexcept { const std::lock_guard lock(impl_->admission->mutex); if (!impl_->failure) impl_->failure = std::move(error); impl_->notify_locked(CompileAdmission::Change::Interruption); }
 void CompileExecution::cancel() noexcept { const std::lock_guard lock(impl_->admission->mutex); impl_->stopping = true; impl_->notify_locked(CompileAdmission::Change::Interruption); }
+std::exception_ptr CompileExecution::interruption() const noexcept {
+ const std::lock_guard lock(impl_->admission->mutex);
+ return impl_->failure ? impl_->failure : impl_->cancellation.requested() ? impl_->cancellation_error : impl_->stopping || impl_->shutdown ? impl_->retired : std::exception_ptr{};
+}
 void CompileExecution::join() {
  if (on_lane()) throw std::logic_error("compile CPU lane cannot join execution");
  std::unique_lock lock(impl_->admission->mutex);

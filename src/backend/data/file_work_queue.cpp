@@ -121,10 +121,14 @@ std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation 
  if (impl_->stopping) throw std::runtime_error("file queue admission after stop");
  const auto position = std::ranges::find(impl_->records, Impl::State::Free, &Impl::Record::state);
  if (position == impl_->records.end()) return {};
- if (!impl_->pending && impl_->execution) impl_->producer.emplace(impl_->execution->open_class(CompileWorkClass::Output));
- position->completion = CompileExecution::CompletionSource{impl_->execution};
+ // Prepare every fallible owner before publishing the record. In particular,
+ // completion allocation cannot leave an otherwise empty Output class live.
+ CompileExecution::CompletionSource completion{impl_->execution};
+ std::optional<CompileExecution::Producer> producer;
+ if (!impl_->pending && impl_->execution) producer.emplace(impl_->execution->open_class(CompileWorkClass::Output));
+ position->completion = std::move(completion);
  auto result = position->completion.completion();
- position->operation = std::move(operation); position->state = Impl::State::Queued; ++impl_->pending;
+ position->operation = std::move(operation); position->state = Impl::State::Queued;
  const auto index = static_cast<std::size_t>(position - impl_->records.begin());
  if (impl_->pool) {
   position->dispatch_owner = impl_;
@@ -133,8 +137,13 @@ std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation 
     auto owner = std::move(static_cast<Impl::Record*>(context)->dispatch_owner);
     owner->dispatch(record);
    });
-  } catch (...) { position->dispatch_owner.reset(); position->operation = {}; position->state = Impl::State::Free; --impl_->pending; throw; }
+  } catch (...) {
+   position->dispatch_owner.reset(); operation = std::move(position->operation); position->state = Impl::State::Free;
+   lock.unlock(); throw;
+  }
  }
+ if (producer) impl_->producer = std::move(producer);
+ ++impl_->pending;
  lock.unlock(); impl_->changed.notify_one(); return result;
 }
 CompileExecution::Completion FileWorkQueue::submit(Operation operation) {

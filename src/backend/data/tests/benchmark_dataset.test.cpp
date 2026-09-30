@@ -9188,10 +9188,12 @@ TEST_CASE("image retirement keeps admission closed through writer invalidation",
 TEST_CASE("dependency withdrawal retains the active label through overlapping generation retirement", "[benchmark][pipeline][labels][resources]") {
  enum class Retire { Image, Source, Original };
  const auto retirement = GENERATE(Retire::Image, Retire::Source, Retire::Original);
+ mmltk::testsupport::ScopedTempDir temporary("overlapping-label-retirement");
  BenchmarkCompilePipeline execution(1);
+ LiveBenchmarkWriter fixture(execution, temporary.path(), AnnotationSource::Coco);
  mmltk::testsupport::TestGate held("retiring dependency borrower");
  execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto, const auto&) { held.receipt().ArriveAndWait(); });
- const std::filesystem::path root("overlapping-label-retirement");
+ const auto root = temporary.path() / "images";
  const auto source = execution.source_publication(root, {});
  source.geometry_ready(1, {8, 2});
  const auto input = label_projection_fixture(1);
@@ -9231,6 +9233,172 @@ TEST_CASE("dependency withdrawal retains the active label through overlapping ge
  CHECK(settled == 2);
  CHECK(failed == 1);
  if (retirement == Retire::Original) CHECK_FALSE(execution.subscribe_labels(replacement, 1, "same-dependency", 1, [](std::exception_ptr) {}));
+}
+TEST_CASE("label output settles an interrupted projection without another file admission", "[benchmark][pipeline][labels][writer][resources]") {
+ enum class Rejection { Execution, OpenFileProducer, FileAdmission };
+ const auto rejection = GENERATE(Rejection::Execution, Rejection::OpenFileProducer, Rejection::FileAdmission);
+ const bool reject_file = rejection == Rejection::FileAdmission;
+ const bool held_peer = rejection == Rejection::OpenFileProducer;
+ if (held_peer && mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ mmltk::testsupport::ScopedTempDir temporary("label-output-rejection");
+ const auto output = temporary.path() / "train.bin";
+ write_text(output, "previous published generation");
+ const auto previous = mmltk::common::io::sha256_file(output);
+ BenchmarkCompilePipeline pipeline(held_peer ? 2 : 1);
+ LiveBenchmarkWriter fixture(pipeline, temporary.path(), AnnotationSource::Coco);
+ const auto root = temporary.path() / "images";
+ const auto original = std::make_exception_ptr(std::runtime_error("execution failed during label projection"));
+ mmltk::testsupport::TestGate projection("projection owns its input before file admission");
+ mmltk::testsupport::TestGate physical("already accepted file peer retains its call");
+ CompileExecution::Completion peer;
+ std::atomic<unsigned> settled{0}, written{0};
+ std::promise<std::exception_ptr> completion;
+ std::weak_ptr<NormalizedAnnotationBacking> input_custody;
+ std::future<void> draining;
+ const mmltk::testsupport::ScopedTestCleanup release([&] { projection.Release(); physical.Release(); pipeline.retire_attempt(); pipeline.files().join(); });
+ if (held_peer) {
+  peer = pipeline.files().submit({.work = [&] { physical.receipt().ArriveAndWait(); }});
+  REQUIRE(physical.WaitEntered(5s));
+ }
+ pipeline.label_configuration(8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
+  [&](const auto&, auto, const auto&) {
+   projection.receipt().ArriveAndWait();
+   if (reject_file) pipeline.files().cancel();
+   else pipeline.execution().fail(original);
+  }, [&](const auto&, auto) { ++written; });
+ auto publication = pipeline.source_publication(root, {});
+ {
+  auto input = label_projection_fixture(1);
+  input_custody = input.storage().backing;
+  REQUIRE(pipeline.labels_ready(publication, 1, BenchmarkLabelInput(input, 0), "required", 1));
+ }
+ REQUIRE(projection.WaitEntered(5s));
+ REQUIRE(pipeline.subscribe_labels(publication, 1, "required", 1, [&](std::exception_ptr error) { ++settled; completion.set_value(error); }));
+ CHECK_FALSE(input_custody.expired());
+ CHECK(pipeline.execution().resource_usage().bytes > 0);
+ CHECK(pipeline.execution().snapshot().live[static_cast<std::size_t>(CompileWorkClass::Output)] == held_peer);
+ projection.Release();
+ const auto error = mmltk::testsupport::await_test_promise(completion, "interrupted label settles its subscription");
+ REQUIRE(error);
+ const auto expected = reject_file ? "file queue admission after stop" : "execution failed during label projection";
+ CHECK_THROWS_WITH(std::rethrow_exception(error), expected);
+ if (!reject_file) CHECK(error == original);
+ draining = std::async(std::launch::async, [&] { pipeline.drain(); });
+ CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(draining, "failed pipeline drains unaccepted label output"), expected);
+ CHECK(settled == 1);
+ CHECK(written == 0);
+ CHECK(input_custody.expired());
+ CHECK(pipeline.execution().resource_usage().bytes == 0);
+ CHECK(mmltk::common::io::sha256_file(output) == previous);
+ if (held_peer) CHECK_FALSE(peer.ready());
+ physical.Release();
+ peer.wait();
+ pipeline.files().join();
+ publication = {};
+ pipeline.retire_attempt();
+ CHECK_FALSE(pipeline.execution().interruption());
+ CHECK(pipeline.execution().snapshot().live[static_cast<std::size_t>(CompileWorkClass::Output)] == 0);
+ if (!reject_file) {
+  pipeline.bind_source(root, fixture.writer, AnnotationSource::Coco);
+  pipeline.label_configuration(8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, {}, [&](const auto&, auto) { ++written; });
+  const auto replacement = pipeline.source_publication(root, {});
+  REQUIRE(pipeline.labels_ready(replacement, 2, BenchmarkLabelInput(label_projection_fixture(2), 0), "replacement", 1));
+  REQUIRE(pipeline.wait_image_labels(root, 2, "replacement"));
+  pipeline.drain();
+  CHECK(written == 1);
+  CHECK(settled == 1);
+  const auto slot = pipeline.image_slot(root, 2);
+  REQUIRE(slot);
+  CHECK(fixture.writer.entry(*slot).num_instances == 1);
+  CHECK(mmltk::common::io::sha256_file(output) == previous);
+ }
+}
+TEST_CASE("deferred label outputs retire independently of a full physical file queue", "[benchmark][pipeline][labels][writer][resources]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPUs");
+ enum class Outcome { Write, Dependency, Source, Cancellation, Failure };
+ const auto outcome = GENERATE(Outcome::Write, Outcome::Dependency, Outcome::Source, Outcome::Cancellation, Outcome::Failure);
+ mmltk::testsupport::ScopedTempDir temporary("full-label-output-queue");
+ std::atomic<bool> cancelled{false};
+ BenchmarkCompilePipeline pipeline(3, {}, {}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
+ LiveBenchmarkWriter fixture(pipeline, temporary.path(), AnnotationSource::Coco);
+ const auto root = temporary.path() / "images";
+ mmltk::testsupport::TestGate physical("accepted file peers retain physical custody");
+ std::array<CompileExecution::Completion, 6> files;
+ std::array<CompileExecution::Completion, 2> labels;
+ std::array<std::weak_ptr<NormalizedAnnotationBacking>, 2> input_custody;
+ std::array<std::promise<std::exception_ptr>, 2> completions;
+ std::array<std::atomic<unsigned>, 2> settled{};
+ std::atomic<unsigned> physical_returns{0}, written{0};
+ std::future<void> projecting, retiring;
+ const mmltk::testsupport::ScopedTestCleanup release([&] { physical.Release(); pipeline.retire_attempt(); pipeline.files().join(); });
+ pipeline.label_configuration(8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, {}, [&](const auto&, auto) { ++written; });
+ // Both service lanes enter before source producers open their live classes.
+ // The remaining CPU can finish projections while all prepared file records
+ // stay occupied; no elapsed-time inference establishes the output handoff.
+ for (auto& file : files) file = pipeline.files().submit({.work = [&] { physical.receipt().ArriveAndWait(); ++physical_returns; }});
+ REQUIRE(physical.WaitEntered(5s, 2));
+ CHECK_FALSE(pipeline.files().try_submit({.work = [] {}}));
+ auto publication = pipeline.source_publication(root, {});
+ for (std::size_t index = 0; index < labels.size(); ++index) {
+  auto input = label_projection_fixture(index + 1);
+  input_custody[index] = input.storage().backing;
+  REQUIRE(pipeline.labels_ready(publication, index + 1, BenchmarkLabelInput(input, 0), "required", 1));
+  labels[index] = pipeline.label_completion(root, index + 1, "required");
+  REQUIRE(pipeline.subscribe_labels(publication, index + 1, "required", 1, [&, index](std::exception_ptr error) { ++settled[index]; completions[index].set_value(error); }));
+ }
+ projecting = std::async(std::launch::async, [&] { pipeline.execution().join(); });
+ mmltk::testsupport::await_test_future(projecting, "CPU projections hand off both pinned outputs to the full queue");
+ for (std::size_t index = 0; index < labels.size(); ++index) {
+  CHECK_FALSE(labels[index].ready());
+  CHECK_FALSE(input_custody[index].expired());
+ }
+ CHECK(pipeline.execution().resource_usage().bytes > 0);
+ CHECK(written == 0);
+ const auto failure = std::make_exception_ptr(std::runtime_error("execution failed behind full file queue"));
+ switch (outcome) {
+  case Outcome::Write: break;
+  case Outcome::Dependency: retiring = std::async(std::launch::async, [&] { pipeline.retire_labels(root, 2, "required"); }); break;
+  case Outcome::Source: retiring = std::async(std::launch::async, [&] { pipeline.retire_source(root); }); break;
+  case Outcome::Cancellation: cancelled = true; pipeline.execution().notify_admission_change(); break;
+  case Outcome::Failure: pipeline.execution().fail(failure); break;
+ }
+ if (outcome != Outcome::Write) {
+  const auto error = mmltk::testsupport::await_test_promise(completions[1], "unaccepted output retires while physical peers remain held");
+  CHECK(error);
+  if (outcome == Outcome::Failure) CHECK(error == failure);
+  CHECK(input_custody[1].expired());
+  if (retiring.valid()) mmltk::testsupport::await_test_future(retiring, "source or dependency withdrawal does not wait on unrelated physical work");
+  if (outcome == Outcome::Dependency) {
+   CHECK_FALSE(labels[0].ready());
+   CHECK_FALSE(input_custody[0].expired());
+  } else {
+   const auto first = mmltk::testsupport::await_test_promise(completions[0], "every terminal pending output drains");
+   CHECK(first);
+   if (outcome == Outcome::Failure) CHECK(first == failure);
+   CHECK(input_custody[0].expired());
+   CHECK(pipeline.execution().resource_usage().bytes == 0);
+  }
+  CHECK_FALSE(files[0].ready());
+  CHECK_FALSE(files[1].ready());
+  CHECK(physical_returns == 0);
+  CHECK(written == 0);
+ }
+ physical.Release();
+ if (outcome == Outcome::Write || outcome == Outcome::Dependency) {
+  CHECK_FALSE(mmltk::testsupport::await_test_promise(completions[0], "live output resumes when file capacity returns"));
+  if (outcome == Outcome::Write) CHECK_FALSE(mmltk::testsupport::await_test_promise(completions[1], "second live output completes"));
+  CHECK(written == (outcome == Outcome::Write ? 2 : 1));
+ }
+ pipeline.files().join();
+ if (outcome == Outcome::Cancellation) CHECK_THROWS(pipeline.drain());
+ else if (outcome == Outcome::Failure) CHECK_THROWS_WITH(pipeline.drain(), "execution failed behind full file queue");
+ else pipeline.drain();
+ for (std::size_t index = 0; index < labels.size(); ++index) {
+  CHECK(settled[index] == 1);
+  CHECK(input_custody[index].expired());
+ }
+ CHECK(pipeline.execution().resource_usage().bytes == 0);
+ CHECK(physical_returns >= 2);
 }
 TEST_CASE("provenance settlement coalesces used record blocks while preserving masks and identities", "[benchmark][pipeline][labels][writer]") {
  mmltk::testsupport::ScopedTempDir temporary("settled-record-blocks");
@@ -9806,6 +9974,54 @@ TEST_CASE("borrowed runtime file cancellation retires context before delayed poo
  mmltk::testsupport::await_test_future(compute, "runtime reader pool drains stale dispatch");
  pool.wait_idle();
  CHECK(failed == 1); CHECK(calls == 0);
+}
+TEST_CASE("rejected file admission leaves no completion custody or output producer", "[backend][data][benchmark][pipeline]") {
+ const bool cancellation = GENERATE(false, true);
+ CompileExecution execution(1);
+ detail::FileWorkQueue files(execution, 1);
+ const auto original = std::make_exception_ptr(std::runtime_error("file admission execution failure"));
+ std::atomic<unsigned> completed{0}, calls{0};
+ auto custody = std::make_shared<unsigned>(7);
+ const std::weak_ptr<unsigned> borrowed = custody;
+ if (cancellation) execution.cancel();
+ else {
+  execution.fail(original);
+  execution.fail(std::make_exception_ptr(std::runtime_error("later file admission failure")));
+  execution.cancel();
+ }
+ REQUIRE(execution.interruption());
+ if (!cancellation) CHECK(execution.interruption() == original);
+ const auto expected = cancellation ? "compile admission after shutdown" : "file admission execution failure";
+ CHECK_THROWS_WITH(files.try_submit({.completed = [&, custody = std::move(custody)](std::exception_ptr) { ++*custody; ++completed; }, .work = [&] { ++calls; }}), expected);
+ files.join();
+ CHECK(borrowed.expired());
+ CHECK(completed == 0);
+ CHECK(calls == 0);
+ CHECK_FALSE(execution.snapshot().live[static_cast<std::size_t>(CompileWorkClass::Output)]);
+ execution.retire_attempt();
+ CHECK_FALSE(execution.interruption());
+ const auto accepted = files.submit({.completed = [&](std::exception_ptr error) { if (!error) ++completed; }, .work = [&] { ++calls; }});
+ accepted.wait(); files.join();
+ CHECK(completed == 1);
+ CHECK(calls == 1);
+ CHECK_FALSE(execution.snapshot().live[static_cast<std::size_t>(CompileWorkClass::Output)]);
+}
+TEST_CASE("rejected borrowed runtime dispatch releases its operation without a callback", "[backend][data][benchmark][pipeline]") {
+ mmltk::common::concurrency::WorkerPool pool(1);
+ detail::FileWorkQueue files(pool, 1);
+ pool.enqueue_detached([] { throw std::runtime_error("runtime reader pool failed"); });
+ CHECK_THROWS_WITH(pool.wait_idle(), "runtime reader pool failed");
+ std::atomic<unsigned> completed{0}, calls{0};
+ auto custody = std::make_shared<unsigned>(7);
+ const std::weak_ptr<unsigned> borrowed = custody;
+ CHECK_THROWS_WITH(files.try_submit({.completed = [&, custody = std::move(custody)](std::exception_ptr) { ++*custody; ++completed; }, .work = [&] { ++calls; }}), "runtime reader pool failed");
+ files.join();
+ CHECK(borrowed.expired());
+ CHECK(completed == 0);
+ CHECK(calls == 0);
+ // A second rejection reaches the same pool boundary, rather than finding a
+ // leaked occupied file record or a retained delayed-dispatch owner.
+ CHECK_THROWS_WITH(files.try_submit({.work = [] {}}), "runtime reader pool failed");
 }
 
 TEST_CASE("compile fixed arenas retain pinning while owned label outputs delay reuse", "[benchmark][pipeline][resources]") {

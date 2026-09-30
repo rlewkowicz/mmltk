@@ -165,6 +165,9 @@ public:
  void resume(const Completion&) noexcept;
  void fail(std::exception_ptr) noexcept;
  void cancel() noexcept;
+ // Observe the current terminal cause without admission or allocation: first
+ // failure, then cancellation, then retirement. Empty means still active.
+ [[nodiscard]] std::exception_ptr interruption() const noexcept;
  void join();
  void retire_attempt() noexcept;
  [[nodiscard]] bool on_lane() const noexcept;

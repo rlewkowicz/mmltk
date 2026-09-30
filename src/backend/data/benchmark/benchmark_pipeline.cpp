@@ -11,6 +11,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include <algorithm>
 #include <condition_variable>
+#include <cstddef>
 #include <deque>
 #include <mutex>
 #include <unordered_map>
@@ -235,6 +236,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  void header_input(Slot&);
  [[nodiscard]] bool submit_pixel(Job&);
  void run_pixel(Slot&, std::size_t, const CompileAllowance&);
+ [[nodiscard]] bool label_retired(const LabelWork&) const;
  void finish_label(const std::shared_ptr<LabelWork>&,std::exception_ptr) noexcept;
  void write_label(LabelWork&);
  void run_label(LabelWork&, std::size_t);
@@ -828,8 +830,8 @@ BenchmarkCompilePipeline::BenchmarkCompilePipeline(std::size_t workers, std::spa
    try { owner->dispatch(); }
    catch (...) {
     const auto error = std::current_exception();
-    { const std::lock_guard lock(owner->mutex); if (!owner->failure) owner->failure = error; }
-    owner->execution.fail(error); owner->dispatch();
+    { const std::lock_guard lock(owner->mutex); owner->execution.fail(error); if (!owner->failure) owner->failure = owner->execution.interruption(); }
+    owner->dispatch();
    }
    owner->changed.notify_all();
   }
@@ -976,17 +978,42 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
 }
 void BenchmarkCompilePipeline::Impl::dispatch() {
  std::unique_lock lock(mutex);
+ // A session can fail while projection or unrelated physical I/O still runs.
+ // Observe that cause even when file capacity cannot admit another operation.
+ if (!failure && !stopping) failure = execution.interruption();
  if (!retired_completions.empty()) {
   auto completions = std::exchange(retired_completions, {});
   lock.unlock(); for (auto& completion : completions) completion.completion.settle(retired_failure); lock.lock();
  }
- while (!label_outputs.empty()) {
-  auto work=label_outputs.front();
-  const auto weak=weak_from_this();
-  auto completion=files.try_submit({.completed=[weak,work](std::exception_ptr error) { if (auto owner=weak.lock()) owner->finish_label(work,error); },
-   .work=[weak,work] { if (auto owner=weak.lock()) owner->write_label(*work); }});
-  if (!completion) break;
-  work->handle=std::move(*completion); label_outputs.pop_front();
+ bool file_full = false;
+ // This dispatcher alone removes queued outputs; CPU completions only append.
+ // Inspect retired records even behind a live output waiting for file capacity.
+ for (std::size_t index = 0; index < label_outputs.size();) {
+  auto work = label_outputs[index];
+  auto error = failure;
+  if (!error && (label_retired(*work) || cancellation.requested())) error = retired_failure;
+  if (!error && !file_full) {
+   try {
+    const auto weak = weak_from_this();
+    auto completion = files.try_submit({.completed = [weak, work](std::exception_ptr result) { if (auto owner = weak.lock()) owner->finish_label(work, result); },
+     .work = [weak, work] { if (auto owner = weak.lock()) owner->write_label(*work); }});
+    if (completion) {
+     work->handle = std::move(*completion);
+     label_outputs.erase(label_outputs.begin() + static_cast<std::ptrdiff_t>(index));
+     continue;
+    }
+    file_full = true;
+   } catch (...) {
+    // Rejection transfers no physical custody. Preserve its cause before
+    // settling this record and draining every other unaccepted output.
+    execution.fail(std::current_exception());
+    error = failure = execution.interruption();
+   }
+  }
+  if (!error) { ++index; continue; }
+  label_outputs.erase(label_outputs.begin() + static_cast<std::ptrdiff_t>(index));
+  lock.unlock(); finish_label(work, error); lock.lock();
+  if (failure) index = 0;
  }
  if (stopping || failure || cancellation.requested()) {
   images.withdraw_all_labels();
@@ -1032,10 +1059,18 @@ void BenchmarkCompilePipeline::Impl::ImageState::admit_labels() {
    .finite_consumer = true, .retain_workspace = false,
    .completed = [weak,work](std::exception_ptr error) {
     auto owner=weak.lock(); if (!owner) return;
-    if (!error && work->target) {
-     { const std::lock_guard lock(owner->mutex); owner->label_outputs.push_back(work); }
-     owner->execution.notify_admission_change(); return;
-    }
+    try {
+     const std::lock_guard lock(owner->mutex);
+     if (owner->failure) error = owner->failure;
+     else if (const auto interrupted = owner->execution.interruption()) error = interrupted;
+     if (!error && (owner->label_retired(*work) || owner->cancellation.requested())) error = owner->retired_failure;
+     if (!error && work->target) {
+      owner->label_outputs.push_back(work);
+      owner->execution.notify_admission_change(); return;
+     }
+    } catch (...) { error = std::current_exception(); }
+    // CPU completion owns settlement until the pending queue accepts custody,
+    // including an allocation failure while appending the output continuation.
     owner->finish_label(work,error);
    }});
   if (!task) return;
@@ -1044,6 +1079,12 @@ void BenchmarkCompilePipeline::Impl::ImageState::admit_labels() {
   ++execution.pending; ++label.image->source->pending; ++label.image->source->pending_labels; ++label.image->pending_labels;
   candidate = next;
  }
+}
+bool BenchmarkCompilePipeline::Impl::label_retired(const LabelWork& work) const {
+ const auto& product = *work.label;
+ const auto& image = *product.image;
+ return stopping || product.retired || image.retiring || image.source->retiring || product.attempt != images.attempt() ||
+  work.generation != image.source->image_generation(image.image_id) || product.generation != image.source->label_generation;
 }
 void BenchmarkCompilePipeline::Impl::finish_label(const std::shared_ptr<LabelWork>& work,std::exception_ptr error) noexcept {
  auto* owner=this;
@@ -1055,9 +1096,11 @@ void BenchmarkCompilePipeline::Impl::finish_label(const std::shared_ptr<LabelWor
     {
      const std::lock_guard lock(owner->mutex);
      auto& image = *product.image;
-     const bool retired = owner->stopping || product.retired || image.retiring || image.source->retiring || product.attempt != owner->images.attempt();
+     const bool retired = owner->label_retired(*work);
+     if (!owner->failure && !owner->stopping) owner->failure = owner->execution.interruption();
+     if (owner->failure) error = owner->failure;
      if (retired && !error) error = owner->retired_failure;
-     if (error && !retired && !owner->failure) { owner->failure = error; owner->execution.fail(error); }
+     if (error && !retired && !owner->failure) { owner->execution.fail(error); error = owner->failure = owner->execution.interruption(); }
      --image.source->pending; --image.source->pending_labels; --image.pending_labels; --owner->pending;
      product.active = nullptr; producer = std::move(product.producer);
     }
