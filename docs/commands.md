@@ -105,7 +105,11 @@ builds a container. Wrapper action execution is bounded to 45 seconds.
 
 `./mmltk --diagnose-benchmark-image --help` describes the numeric image ID and
 repository-relative inputs. Alternatively, `--compiled PATH --sample N`
-resolves a zero-based Explore sample to its source identity and compiled objects.
+resolves an eligible zero-based physical compiled slot to its source identity
+and objects. `N` is the displayed compiled ID, not its filtered gallery position
+or a dense ordinal among eligible images. Inactive/out-of-range slots and
+unsupported formats fail. The native record includes eligible `image_count`,
+physical `slot_count`, used `label_bytes`, and header `max_label_bytes`.
 Repeat `--index PATH` to inspect version-3 normalized annotation rows; add
 `--objects` for their object records. Use `--image PATH` for a cached image or
 `--archive PATH` to find the image in a retained tar archive. JSONL output includes
@@ -114,9 +118,11 @@ orientation when present. Headers establish geometry, not full decodability.
 `--parquet PATH` inspects the matching COCONut row's original embedded PNG and
 segment metadata; `--panoptic PATH` inspects an extracted panoptic PNG. These
 count exact RGB segment IDs and report each declared segment's pixel support
-when metadata is available. They compile a bounded diagnostic helper with the
-existing development compiler, native Arrow libraries, and vendored PNG decoder;
-no Python Parquet package or new dependency is installed.
+when metadata is available. The wrapper prepares only the required
+[CMake diagnostic targets](build.md#benchmark-diagnostic-builds) with the existing
+development image. The compiled-sample helper uses the Dataset system's checked
+layout and record admission; the mask helper links native Arrow/Parquet and the
+vendored PNG decoder. No Python Parquet package or new dependency is installed.
 
 `--export-mask-runs` requires exactly one `--index` and writes the selected
 image's normalized objects to
@@ -134,8 +140,11 @@ runs per image. For example:
 This inspects the selected retained index; it does not compile or enable
 [mask recovery](benchmark-datasets.md#optional-dropped-mask-recovery).
 
-The command runs in the existing development image with networking disabled,
-read-only source mounts, no image build or pull, and a ten-minute deadline. Optional
+The inspection runs in the existing development image with networking disabled,
+read-only source mounts, no image build or pull, and a ten-minute deadline.
+Required native-target preparation uses the separate reusable CMake cache and
+writes build output to stderr, preserving JSONL on stdout. Help and Python-only
+index/image/archive queries do not configure or build native targets. Optional
 `--export` copies the matched encoded image to
 `build/validation/benchmark-image/ID.jpg` or `ID.png` for inspection, replacing
 an earlier diagnostic copy. Mask inspection additionally exports the exact

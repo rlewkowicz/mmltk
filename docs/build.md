@@ -89,6 +89,9 @@ First-party native links and owned Firefox links use mold; the Iced browser
 artifact targets WebAssembly.
 Ordinary host and CUDA host code use function/data sections for the native
 garbage-collecting link. Release C/C++ uses the configured IPO policy.
+Host compilation selects `-march=native` and `-mtune=native`; the x86-64 policy
+also enables SSSE3, SSE4.2, AVX2, and FMA. [Image and mask conversion](datasets.md#resize-geometry)
+uses these existing native facilities with bounded tails.
 The [native link diagnostics](validation.md#native-symbol-and-link-diagnostics)
 inspect existing objects and repeat one generated link without replacing the
 Release artifact.
@@ -242,6 +245,7 @@ These are the default repository-local locations:
 | --- | --- |
 | `.cache/cmake/release` | Shared Release build/test graph |
 | `.cache/cmake/gui`, `.cache/cmake/dev`, `.cache/cmake/analysis` | Other wrapper-selected graphs |
+| `.cache/cmake/benchmark-image-release` | CMake graph and native helpers for [benchmark image diagnostics](#benchmark-diagnostic-builds) |
 | `.cache/cargo/home`, `.cache/cargo/target/browser-app` | Cargo downloads and browser artifacts |
 | `.cache/ccache` | Core compiler results |
 | `.cache/firefox/obj-minimal-opt`, `mozbuild`, `sccache` | Firefox objects, toolchain/sysroot state, compiler cache |
@@ -267,6 +271,28 @@ the default build. `gui` selects browser work, while `dev` and `analysis`
 provide non-package development graphs. A `tsan` configure preset exists, but
 `./mmltk --test tsan` is currently rejected. Use the supported wrapper
 operations in [validation](validation.md).
+
+### Benchmark diagnostic builds
+
+`./mmltk --diagnose-benchmark-image` first asks its parser which native helpers
+the selected arguments need. `--compiled` selects
+`mmltk_diagnose_compiled_sample`; `--parquet` or `--panoptic` selects
+`mmltk_diagnose_coconut_mask`. Their
+[entrypoint CMake owner](../src/entrypoints/tools/CMakeLists.txt) registers both
+ordinary C++ executables as `EXCLUDE_FROM_ALL`, with explicit links and runtime
+paths. The compiled helper depends on the canonical Dataset layout/admission
+owner; the mask helper links Arrow, Parquet, JSON, and stb.
+
+The wrapper reuses the existing development image and configures
+`.cache/cmake/benchmark-image-release` with browser-host and Firefox runtime
+builds disabled. It builds only the requested targets, under the cache mutation
+lock and a 120-second deadline per target build. Generated
+`benchmark-image-diagnostics.env` in that graph supplies their exact executable
+paths to the read-only inspection container. Preparation output goes to stderr;
+the final diagnostic keeps JSONL on stdout. Help and Python-only queries need
+no graph, target build, product package, or Firefox fingerprint. See
+[command inputs and outputs](commands.md#benchmark-image-geometry) for inspection
+limits and evidence paths.
 
 ## Generated bindings and dependency maintenance
 

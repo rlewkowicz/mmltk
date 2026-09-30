@@ -108,6 +108,14 @@ reconstructs its runtime when the relevant saved device, placement, or
 transport configuration changes. GDRCopy selection has no automatic transport
 fallback.
 
+Compiled-loader slots prepare their configured host/device pixel capacity and
+metadata-sized label arena before reads. H2D gathers into prepared pinned
+storage; GDRCopy gathers pixels into the mapped device allocation while retaining
+prepared host space for optional CPU access. Labels use only their used prefix,
+with the exact header maximum as RAM pitch. The
+[batch-storage reference](datasets.md#prepared-batch-storage) owns capacity,
+zero-label, epoch-reuse, and physical-completion rules.
+
 [GUI control visibility](gui-interaction.md#training-validation-and-prediction)
 does not remove saved placement/transport support or change Predict's fixed batch.
 

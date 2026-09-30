@@ -377,8 +377,10 @@ owns selected-weight evaluation and saved artifacts.
 ## Sparse data planning and stochastic identity
 
 [TrainingDataPlan](../src/backend/models/rfdetr/training/training_data_plan.cpp)
-owns sparse distinct class presence per original image, immutable model shards,
-and deterministic epoch schedules. Crowd contributes no support; empty/crowd-only images
+owns sparse distinct class presence per eligible physical image, immutable model
+shards, and deterministic epoch schedules. Schedules and Resume identities keep
+the compiled physical slot IDs, skipping inactive holes without renumbering.
+Crowd contributes no support; empty/crowd-only images
 remain members. Shared mode uses one full-dataset shard; independent/periodic
 modes partition between models before rank-slicing global microbatches.
 

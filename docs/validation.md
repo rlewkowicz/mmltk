@@ -896,8 +896,9 @@ the separation between current selections and admitted output facts.
 
 The data cases also cover locally scheduled batch capacity, empty shards,
 categorical RLE sampling, parser scratch reuse, both resize modes, authoritative
-fractional boxes, source metadata/order/duplicates, present-empty masks, format-9
-admission, mask offsets beyond 4 GiB, and old-version rejection. RF-DETR core
+fractional boxes, source metadata/order/duplicates, present-empty masks, format-10
+arithmetic and admission, sample-local run offsets, inactive physical holes,
+measured label maxima, in-place compaction, and old-version rejection. RF-DETR core
 cases cover full physical-slot ranking, post-selection class filtering,
 query/mask alignment, focal-alpha assignment,
 crowd matching/ignore precedence, original-area ranges, per-category maxDets,
@@ -1033,9 +1034,10 @@ behavior independently of rendered UI acceptance:
 
 | Owner | Evidence |
 | --- | --- |
-| [benchmark_dataset.test.cpp](../src/backend/data/tests/benchmark_dataset.test.cpp), `mmltk_backend_data_tests` | Cache-root and output overlap, retained image/index generations, shared CPU/byte/descriptor/storage admission, mixed ordinary/range transport, Open Images group continuation, independent pixels/labels, canonical final placement, cancellation/repair, progress, and lazy diagnostics |
-| [coconut_dataset.test.cpp](../src/backend/data/tests/coconut_dataset.test.cpp), same target | Pinned membership and validation choices, exact masks and physical/release joins, requested archive resolution, archive/Parquet continuation, independent originals/native recovery/label conversion, component dependency identity, cache reuse/repair, and atomic publication |
-| [roundtrip.test.cpp](../src/backend/data/tests/roundtrip.test.cpp), same target | Fused compiled-record admission, malformed section/record rejection, present-empty masks, Directory output equality across workers, and preservation of published output on failure |
+| [benchmark_dataset.test.cpp](../src/backend/data/tests/benchmark_dataset.test.cpp), `mmltk_backend_data_tests` | Cache-root/output overlap, retained generations, shared CPU/byte/descriptor/storage admission, mixed ordinary/range transport, Open Images continuation, independent pixels/labels, stable slot writes and compaction, cancellation/repair, progress, and lazy diagnostics |
+| [coconut_dataset.test.cpp](../src/backend/data/tests/coconut_dataset.test.cpp), same target | Pinned recipe/validation choices, exact masks and physical/release joins, independent image/annotation acquisition, archive/Parquet continuation, native recovery, source ordinals and incomplete provenance, healthy subsets, Large/XL claim replacement, cache reuse/repair, and atomic publication |
+| [roundtrip.test.cpp](../src/backend/data/tests/roundtrip.test.cpp), same target | Fixed layout/record admission, capacity and measured maxima, malformed/inactive-slot rejection, present-empty masks, Directory output equality across workers, prepared stream reuse, and preservation of published output on failure |
+| [benchmark_image_diagnostic.test.cpp](../src/entrypoints/tools/tests/benchmark_image_diagnostic.test.cpp), `mmltk_entrypoints_tools_tests` | CMake-owned native helper execution, format-10 physical slot admission, malformed/old-format rejection, normalized mask export, and raw PNG/Parquet inspection |
 | [application_compute_services.test.cpp](../src/controller/subsystems/system/tests/application_compute_services.test.cpp), `mmltk_controller_data_compute_systems_tests` | Environment cache selection and staged/final output overlap through the artifact service, retained choices through materialization, and real resumed/restarted/unknown-total HTTP observations projected as typed transfer facts separately from bounded activity at an unchanged image fraction |
 | [dataset_system.test.cpp](../src/controller/subsystems/system/tests/dataset_system.test.cpp), same target | Explicit compile captures settled choices, later settings edits preserve the admitted request, owned diagnostics survive runtime reconstruction and stop/join, open-ended/recovered progress remains valid, and malformed progress including transfer/retained-byte bounds is rejected |
 | [dataset_wiring.test.cpp](../src/controller/shell/tests/dataset_wiring.test.cpp), `mmltk_controller_shell_tests` | Production shell/factory propagation of enabled and disabled diagnostics through the staged compiler path |
@@ -1054,7 +1056,8 @@ or rewrite production JPEGs/bins.
 Cache cases cover recovery on/off across every validation choice, unchanged
 base/physical products, original-identity changes, independently unavailable
 original splits, later retry, reordered image provenance, cancellation, and
-fatal local parser/archive/publication failures. Current counts come from
+source-local parser/archive rejection and fatal local I/O/publication failures.
+Current counts come from
 admitted recovery products, independently of historical failure-report lines.
 Dataset-system cases capture the recovery choice with the other settled compile
 settings, and later edits leave the admitted operation unchanged.
@@ -1071,10 +1074,13 @@ causal coverage includes:
 | Transport | Contended artifact locks, whole files alongside stored ranges, one-connection resume, rejected validators/coverage, durable out-of-order checkpoints, redirects, fair Curl admission, Open Images retries, and channel cancellation |
 | Archives and Parquet | Requested members before unused tails, consumed checksum/truncation errors, raw/ZIP/sparse/gzip continuation, bounded gzip dictionaries/controls, retained Parquet rows/batches, independent groups, and pressure-driven reader retirement |
 | Immutable products | Mapped indexes/images across path replacement, independent original split publication/withdrawal, retained native support through repair, full-backing component dependencies, and cached groups that omit payload projections |
-| Final labels | Per-image geometry joins, labels during held pixels and vice versa, canonical ordinals and offsets, present-empty masks, validation placement during held training, and malformed/partial assembly rejection |
+| Final labels | Labels before JPEG arrival and pixels before annotations, per-image geometry admission, canonical ordinal settlement/backpatches, explicit incomplete provenance across cache reuse and later repair, Large-over-XL claim restoration, present-empty masks, and validation progress during held training |
+| Healthy subsets | Partially valid labels, true backgrounds, rejected/unlisted physical holes, unreadable annotation artifacts and pixels, bounded repair, contradictory geometry, empty required splits, and preservation of old publication on fatal failure |
+| Fixed storage | 64-slot boundaries, checked extents, 500,000-byte payload overflow, eligible-only maxima including zero, same-inode compaction, cancellation/fault preservation, used-prefix reads, repeated physical IDs, and prepared capacities through epoch changes |
 
-These fixtures establish overlap, ownership, deterministic artifacts, and the
-specified capacity behavior. They do not measure production-release throughput,
+These fixtures establish overlap, ownership, source identity/order, and the
+specified capacity behavior. Benchmark arrival order can change physical slot
+order and file bytes. They do not measure production-release throughput,
 peak process memory, or live-download duration. Resource targets are described
 in [benchmark memory and storage](benchmark-datasets.md#memory-descriptors-and-storage).
 Progress cases retain one artifact/release contribution across interleaving,
@@ -1104,6 +1110,63 @@ proves rendering, input, cancellation/restart, and native caption agreement;
 [capacity/download limits](benchmark-datasets.md#cache-formats-and-capacity) bound
 these claims. Trace/serialization suites cover timestamps, effect-only delivery
 failure, Unicode scalars, and malformed wire-text rejection.
+
+### Fixed-storage measurements
+
+The final validation of implementation commit `23974612` retained these
+2026-09-29 wrapper transcripts:
+
+| Operation | Transcript and observed result |
+| --- | --- |
+| `./mmltk --build` | [mmltk-build-20260929-224513-2452962.log](../build/logs/mmltk-build-20260929-224513-2452962.log), exit 0 |
+| `./mmltk --test all` | [mmltk-test-20260929-232113-2554469.log](../build/logs/mmltk-test-20260929-232113-2554469.log), exit 0; nine native GDR-related cases skipped |
+| `./mmltk --test workspace-wayland --headless-compositor` | [mmltk-test-20260929-234032-2601309.log](../build/logs/mmltk-test-20260929-234032-2601309.log), exit 0; 89,357 assertions, 87 passed cases, one unavailable GDR scenario skipped |
+
+The data round-trip case completed its H2D checks before reporting its GDR
+skip. These results establish the executed H2D/CUDA/Wayland paths, not GDR
+mapping support on this host. The transcripts are local ignored build evidence,
+not files shipped by a fresh checkout. Use the
+[log-query examples](logging.md#benchmark-compilation-traces) to inspect complete
+measurement records and terminal status.
+
+The all-suite transcript contains bounded fixture observations:
+
+| Record | Observed value and scope |
+| --- | --- |
+| `benchmark_label_fixture` | First projection 1,161 ns; 256 active label bytes; 1,000,012 retained workspace bytes; zero steady output-vector growths. The growth observer covers two output vectors and excludes mapped backing. |
+| `benchmark_pipeline_fixture` | First label slot 81,691 ns; first pixel slot 1,026,153 ns; labels ready before JPEG arrival. Timings span ready publication to slot completion with fixture-owned normalized input. |
+| `compiled_stream_fixture` (H2D) | First host pixels/labels 53,668 ns; 6,720 logical label bytes and 8,192 retained label bytes; zero steady growths. Observation covers owned buffers/read containers, not every allocation. |
+| `native_png_fixture` | Exact independent scalar-ID/run equivalence across 18,456 pixels and 797 runs; combined PNG decode/support time 115,942 ns. This does not isolate SIMD performance. |
+
+The used-byte copy fixture compares format 10 with an independent reproduction
+of the packed algorithm at `3b1373b9`. Each reports sixteen repetitions totaling
+16,224,000 pixel bytes and 35,840 label bytes:
+
+| Warm order | Fixed format 10, bytes/s | Prior packed algorithm, bytes/s |
+| --- | ---: | ---: |
+| Sequential | 27,911,061,369 | 29,822,530,355 |
+| Shuffled, seed 1729 | 27,716,707,236 | 27,211,891,680 |
+
+The sequential fixed layout required 320 pixel copy calls versus 16 for packed
+storage; both shuffled paths required 320. Page padding prevents coalescing in
+that fixed fixture. These are warm in-memory used-byte copies, not cold storage
+or GPU end-to-end throughput. The comparison does not establish either layout
+as universally faster.
+
+Compaction started with a 1,310,724,192-byte apparent staged file:
+
+| Eligible maximum label bytes | Final apparent bytes |
+| ---: | ---: |
+| 0 | 1,210,060,896 |
+| 72 | 1,216,352,352 |
+| 466,944 | 1,304,432,736 |
+| 500,000 | 1,310,724,192 |
+
+The fixture verified unchanged inode identity and the 4 MiB scratch ceiling.
+Apparent lengths include sparse holes and padding; they do not measure allocated
+disk blocks or process RSS. None of these bounded observations is a production
+baseline for COCONut B's 241,602 images, a cold-cache benchmark, a full-release
+memory measurement, or an isolated SIMD speedup.
 
 ## Shared fixtures and evidence
 

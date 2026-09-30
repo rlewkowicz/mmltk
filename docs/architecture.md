@@ -14,7 +14,7 @@ architecture, product outcomes, resource lifetime, and shutdown.
 | [src/entrypoints/cli/cli_options.h](../src/entrypoints/cli/cli_options.h), [rfdetr_cli_options.h](../src/entrypoints/cli/rfdetr_cli_options.h) | Root and RF-DETR reflected option tables, scopes, explicit codecs, and exposure decisions |
 | [src/entrypoints/desktop/browser_runtime_entry.cpp](../src/entrypoints/desktop/browser_runtime_entry.cpp) | Packaged `mmltk-browser-host` startup |
 | [src/entrypoints/desktop/browser_runtime_options.h](../src/entrypoints/desktop/browser_runtime_options.h) | Reflected desktop execution options |
-| [src/entrypoints/tools](../src/entrypoints/tools) | ONNX inspection and simplification executables |
+| [src/entrypoints/tools](../src/entrypoints/tools) | ONNX inspection/simplification and CMake-owned benchmark diagnostic executables |
 | [src/controller/shell/application_shell.h](../src/controller/shell/application_shell.h) | Application construction, browser loop, and system lifetime |
 | [src/controller/shell/application_system_storage.h](../src/controller/shell/application_system_storage.h) | Owns the connected system instances and materialized visual-source readers |
 | [src/frontend/iced/src/main.rs](../src/frontend/iced/src/main.rs) | Browser application entrypoint |
@@ -142,6 +142,17 @@ geometry below the data layer; compilers apply it to pixels, continuous boxes,
 and categorical masks. Compiled readers expose stored mode, original extents,
 annotation metadata, and provenance without a model-layer dependency.
 
+[FileLayout](../src/backend/data/compiled/compiled_file_layout.h) owns checked
+fixed-block address and payload arithmetic. The shared
+[compactor](../src/backend/data/compiled/compiled_file_compaction.cpp) finalizes
+both directory and benchmark output in the staged inode.
+[CompiledDataset](../src/backend/data/compiled/compiled_dataset.h) owns bounded
+resident slot metadata and mapped per-image views; [DatasetLoader](../src/backend/data/loading/dataset_loader.h)
+owns eligible-ID schedules and leased batches over prepared
+[CompiledImageStream](../src/backend/data/compiled/compiled_image_stream.h) slots.
+The [format and loading reference](datasets.md#compiled-binary-format) owns the
+persisted layout, eligibility, capacity, and read rules.
+
 The [benchmark recipes](benchmark-datasets.md) supply source membership and
 annotation policy to the same acquisition, resize, writer, and publication
 owners. Native
@@ -161,8 +172,19 @@ defines the units for both benchmark and Directory compilation.
 Benchmark execution and resource admission belong to
 [BenchmarkCompilePipeline](../src/backend/data/benchmark/detail/benchmark_pipeline.h).
 Recipes retain membership and recovery policy; the shared Curl owner retains
-transport, the archive owner retains opened generations, and split assembly
-and writing retain final placement and publication. The benchmark guide owns
+transport, the archive owner retains opened generations, and the split writer
+retains stable physical placement and publication. The pipeline's compile-only
+source/image join admits pixel and label production independently; final
+selection settles recipe membership and the selected label claim.
+[coconut_input.h](../src/backend/data/benchmark/coconut/detail/coconut_input.h)
+owns parsed records, segment backing, import limits, and lexical member admission.
+Reflected inventory facts remain in
+[coconut_inventory.h](../src/backend/data/benchmark/coconut/detail/coconut_inventory.h);
+its [I/O boundary](../src/backend/data/benchmark/coconut/detail/coconut_inventory_io.h)
+owns checked encoding and retained serialization seals.
+[BenchmarkMappedArtifact](../src/backend/data/benchmark/detail/benchmark_staging.h)
+keeps temporary file, mapping, growth accounting, and last-consumer cleanup
+together. The benchmark guide owns
 [parser continuation](benchmark-datasets.md#archive-and-parser-continuation),
 [memory/storage admission](benchmark-datasets.md#memory-descriptors-and-storage),
 and [immutable cache custody](benchmark-datasets.md#persistent-cache-and-publication).

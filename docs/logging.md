@@ -329,14 +329,18 @@ artifact names and monotonic timestamps do not join different runs.
 | `benchmark.images.validation_failed` | Rejected archive `member`, `image_id`, `source`/`shard`, encoded `bytes`, and `reason` |
 | `benchmark.archive.scan`, `.extracted`, `.extract_cache_hit` | Archive traversal or annotation-member extraction/reuse |
 | `benchmark.archive.admission_wait` | Source admission snapshot: `bytes`, `descriptors`, `committed_descriptors`, `descriptor_capacity`, `producer_ceiling`, and `active_cpus`; `reason` is `source_admission` |
+| `benchmark.resource.wait` | First blocked reservation snapshot: requested/held bytes and descriptors, continuation commitments, limits, source location, parent chain, and live owner locations |
 | `benchmark.annotations.originals_wait`, `.originals_begin` | Entry to stock-original lifecycle admission, then admitted work with `recover_dropped_masks` and numeric `validation` |
-| `benchmark.annotations.release_metadata`, `.release_complete` | COCONut release `edition` and `cache_hit` at metadata and full-mask completion respectively |
+| `benchmark.annotations.release_metadata`, `.release_complete` | COCONut release `edition`, with `cache_hit` when available, at metadata and settled component completion; source-local omissions can leave a healthy subset |
 | `benchmark.annotations.preparation` | COCONut `edition`, preparation `stage`, `completed`, `total` (zero means unknown), and `unit` (`rows` or `archive entries`), independently of normalized-row completion |
 | `benchmark.annotations.progress` | COCONut normalized `completed_rows` and `total_rows` by `edition`, including the first completed row |
-| `benchmark.archive.resolution` | COCONut `edition`, physical `artifact`, requested `image_id`, and archive cursor `entries`; zero announces source admission, positive values observe inspected headers |
+| `benchmark.archive.image_ready` | Independent physical source `artifact`, encountered `image_id`, and `entries` containing its completed-image observation; the zero-image record also marks source invalidation |
+| `benchmark.annotations.mask_discovery` | XL annotation-archive `edition` and actual inspected `entries` |
+| `benchmark.annotations.cache_row` | A reused component row published independently: `edition`, physical `source`, `image_id`, and component `position` |
 | `benchmark.annotations.component_admitted` | Reused COCONut component `edition`, physical `source`, and `images` |
 | `benchmark.annotations.assembled`, `.workspace` | Assembled image/box/run counts and retained vector capacities, or a parser lane's `retained_sparse_bytes` |
-| `benchmark.labels.placed` | Completed final split placement: `split`, `images`, `labels`, and `runs` |
+| `benchmark.labels.projection_started`, `.slot_written` | Projection entry with `root`, `image_id`, and retained lane workspace bytes, or successful direct label-slot write with `root` and `image_id` |
+| `benchmark.labels.placed` | COCONut's successful per-image label-slot placement: `split` and `image_id`; this is not a final split seal |
 | `benchmark.images.archive_retry`, `benchmark.pixel_compile.cache_repair` | Bounded image/archive repair context |
 | `benchmark.download.failure_sha256`, `benchmark.images.failure_sha256` | Failure digest and cause for an artifact or image; COCONut annotation repair additionally reports `matches_expected` |
 | `benchmark.pixel_compile.throughput`, `.complete` | Completed/total images where available, `split`, elapsed seconds, images/second, and ETA observations |
@@ -364,12 +368,19 @@ For a capture produced by [the GUI example](#capture-one-reproduction):
   -q '@event=benchmark.archive.admission_wait' \
   --fields @event,reason,bytes,descriptors,committed_descriptors,descriptor_capacity,producer_ceiling,active_cpus \
   --format timeline --limit 20
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
+  -q '@event=benchmark.resource.wait' \
+  --format jsonl --limit 10
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
+  -q '@event=benchmark.archive.image_ready OR @event=benchmark.annotations.cache_row OR @event:benchmark.labels' \
+  --where 'image_id=2212' --format jsonl --limit 30
 ```
 
 [Compilation progress](benchmark-datasets.md#reading-compilation-progress) defines
-actual-write bytes, unknown totals, retry withdrawals, independent tracks, and
-source aggregation. Release/pixel/acquisition records can interleave; phase names
-are not exclusive execution states. These observations prove neither performance
+actual-write bytes, unknown totals, retry withdrawals, independent tracks,
+source aggregation, and compaction's live-byte progress. Release/pixel/acquisition
+records can interleave; phase names are not exclusive execution states.
+These observations prove neither performance
 gains nor, from unchanged fractions or absent best-effort records, deadlock or
 network liveness.
 
@@ -377,21 +388,46 @@ Admission snapshots describe the shared ledger at an observation point, not
 process RSS, filesystem-wide reservations, or a deadlock diagnosis. The
 [resource reference](benchmark-datasets.md#memory-descriptors-and-storage)
 distinguishes transient workspace from retained canonical products.
+`benchmark.resource.wait` is emitted once per blocked reservation with tracing
+enabled. Its `parents` chain records available and borrowed continuation
+capacity; `owners` records live allowances and their admission locations.
+Owner `id` and `parent` values are process-local addresses for that snapshot,
+and may be reused after retirement. The record is not a heartbeat: subsequent
+ledger changes during the same wait need not produce another snapshot. Disabled
+tracing does not collect this owner inventory.
+
 Metadata, originals, normalization, labels, and pixels can progress separately;
 `release_complete` is not a prerequisite for every image's label conversion.
-Preparation and physical-archive observations also update the visible source
-activity. Their row counts and archive cursors describe that specific stage;
-they are not extra normalized rows. Positive cursor observations establish
-that archive traversal advanced, while a lone zero entry may precede a resource
-or lifecycle wait. These work-based updates use bounded quanta without a timer
-or heartbeat, and the UI can coalesce intermediate observations.
+Preparation and physical-source observations also update visible source activity.
+Their row counts, completed-image counts, and archive cursors describe different
+work; they are not interchangeable normalized-row or final eligible-image
+counts. Slot placement can precede JPEG arrival, canonical ordinal settlement,
+and final membership. Compaction, sync, and `benchmark.publication.complete`
+remain separate from those per-image records. Work-based updates use bounded
+observation points, and the UI can coalesce intermediate observations.
 
 Failure hashing follows [cache repair policy](benchmark-datasets.md#persistent-cache-and-publication).
 Pinned annotation checksums used to decide replacement remain required without
 tracing. Optional diagnostic hashes are collected only with a trace sink;
 enabling logs does not authorize cache reuse or repair. `failed.txt` is a
-separate append-only [omitted-object report](benchmark-datasets.md#native-import-and-provenance),
-not a trace or current recovery-count ledger.
+separate append-only [omission/provenance report](benchmark-datasets.md#native-import-and-provenance),
+not a trace or current recovery-count ledger. Healthy images with incomplete
+source-ordinal provenance can appear in that report without being omitted;
+inspect its reason and the component manifest's `incomplete_ordinal_images`.
+
+For measured fixture output, query the retained wrapper transcript with JSONL
+projection so complete fields are visible:
+
+```bash
+./mmltk --logs build/logs/mmltk-test-20260929-232113-2554469.log \
+  -q 'benchmark_label_fixture OR benchmark_pipeline_fixture OR compiled_stream_fixture OR compiled_used_read_fixture OR compiled_compaction_fixture OR native_png_fixture' \
+  --fields @text --format jsonl --limit 20
+```
+
+[Validation](validation.md#fixed-storage-measurements) owns these recorded values
+and their scope. Output-vector growth and prepared-buffer growth are narrower
+observations than total allocation activity; mapped bytes and process RSS are
+different measures.
 
 Transfer observers exist only for progress/tracing; unobserved segmented downloads
 skip progress locking and clock reads. Trace construction/serialization/callback

@@ -198,6 +198,11 @@ compilation**, using the Dataset system's Stop operation. Progress shows the
 current work, separate **Acquisition**, **Labels/masks**, and **Pixels** tracks,
 and benchmark source details. The [progress reference](benchmark-datasets.md#reading-compilation-progress)
 defines their units, readable quantities, and source summaries.
+After those tracks settle, **Compacting** reports the live pixel/label bytes
+processed before sync and publication. Completed track bars alone do not settle
+the Compile action. Rejected-image and annotation counts remain distinct from
+successful pixel work; the benchmark guide owns
+[healthy-subset admission](benchmark-datasets.md#recipes-and-validation-membership).
 
 Progress retains its greatest measured height for the active generation/width,
 keeping the action stationary on shorter updates. Width changes remeasure; new
@@ -584,6 +589,9 @@ inputs. Both retain the native 0–10,000 range. Raising the minimum past the
 current maximum stops at that maximum; lowering the maximum past the current
 minimum stops at that minimum. Shuffle seed and compiled-index inputs retain
 their exact `u64` values and existing range/unlimited policy.
+First/last compiled indices bound physical sample IDs through `slot_count - 1`,
+which can exceed `image_count - 1`. Inactive holes are skipped by filters and
+navigation; typing a range does not make an inactive sample selectable.
 
 These filter inputs remain mounted with stable native field identities when
 mutation is temporarily unavailable. Disabling their input callback preserves
@@ -887,6 +895,13 @@ introduces no intentional frame delay, but makes no hard one-frame guarantee.
 cache, tile geometry, priority, and physical atlas rules. The GUI includes every
 partially visible row in demand. Its measured viewport may alternate between
 N and N+1 rows while card raster extent remains unchanged.
+
+The generated dataset facts expose eligible `image_count` separately from
+physical `slot_count`. Gallery matches and Next/Previous count eligible filtered
+samples, while displayed compiled IDs, detail selection, augmentation donors,
+and cache identities retain their physical IDs. Holes never become background
+samples or dense replacement indices. See the
+[compiled metadata rules](datasets.md#per-image-index).
 
 Native dataset readiness and a drawable atlas are independent. A ready,
 nonempty gallery without a paired image shows **Preparing visible tiles** while

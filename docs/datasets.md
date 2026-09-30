@@ -131,75 +131,128 @@ retain the same pixel values.
 
 Categorical mask resizing uses the
 [shared RLE sampler](../src/backend/data/mask_rle_utils.cpp). It validates sorted
-source runs and advances through them monotonically using retained nearest-pixel
-axis lookups. Repeated source rows reuse the sampled target row. Only the target
-bitmap is materialized for the existing encoder; source bounds and foreground
-counts still come from the source runs.
+source runs, maps interval boundaries with exact nearest-center inverse
+coordinates, and reuses row-interval scratch. The compiler emits transformed
+runs directly, coalescing adjacent support without a full target bitmap.
+Source bounds and foreground counts still
+come from the source runs. Dense-mask callers share the run emitter; their AVX2
+scan compares 32 bytes at a time with bounded scalar tails. The RGB-to-planar
+conversion processes sixteen pixels per SIMD step. These paths preserve exact
+mask support and the existing RGB normalization; [fixture evidence](validation.md#fixed-storage-measurements)
+does not establish an isolated SIMD speedup.
 
 ## Compiled binary format
 
 Each split becomes a self-contained `.bin` containing transformed pixels and
 annotations; runtime loading needs no decode, parsing, resizing, or pixel-layout
-conversion. **Version 9** is a native little-endian Linux format of packed
+conversion. **Version 10** is a native little-endian Linux format of packed
 fixed-width structures, defined and validated by
 [compiled_format.h](../src/backend/data/compiled/compiled_format.h) and
 [compiled_file_utils.h](../src/backend/data/compiled/compiled_file_utils.h).
-Readers reject unknown magic/version. Format 8 and all older files require
+Readers reject unknown magic/version. Format 9 and all older files require
 recompilation; there is no legacy reader or migration.
 
 ```text
 byte 0
-┌──────────────────────────────────────────┐
-│ FileHeader (8,328 bytes)                 │
-├──────────────────────────────────────────┤ index_offset = 8,328
-│ ImageEntry[num_images] (40 bytes each)   │
-├──────────────────────────────────────────┤
-│ zero padding to a 2 MiB boundary         │
-├──────────────────────────────────────────┤ pixel_offset
-│ image 0: planar RGB float32              │
-│ image 1: planar RGB float32              │ fixed image_stride
-│ ...                                      │
-├──────────────────────────────────────────┤ label_offset
-│ PackedInstance[sum(num_instances)]       │ 60 bytes each
-├──────────────────────────────────────────┤ mask_rle_offset
-│ RLEPair[sum(mask_rle_pairs)]             │ 8 bytes each
-└──────────────────────────────────────────┘ total_file_size
+┌────────────────────────────────────────────┐
+│ FileHeader (8,320 bytes)                    │
+│ padding to a 2 MiB boundary                 │
+├────────────────────────────────────────────┤ data_offset
+│ Block 0: 64 page-aligned pixel slots        │
+│          64 page-aligned label slots        │
+│          padding to a 2 MiB block extent    │
+├────────────────────────────────────────────┤
+│ Block 1: same fixed layout                  │
+│ ...                                        │
+├────────────────────────────────────────────┤ index_offset
+│ ImageEntry[num_slots] (32 bytes each)       │
+└────────────────────────────────────────────┘ total_file_size
 ```
 
-All offsets in `FileHeader` are absolute file offsets. `ImageEntry.pixel_offset`
-is also absolute. `ImageEntry.label_offset` is relative to the start of the
-label block, and `PackedInstance.mask_rle_offset` is relative to the start of
-the RLE block. Images, labels, and RLE pairs appear in compiled image order
-without holes inside their respective blocks.
+Each physical slot has arithmetic pixel and label locations. Labels in one
+slot contain its 60-byte instance records, padding to eight bytes, then its
+8-byte mask runs. `PackedInstance.mask_rle_offset` is relative to that sample's
+run region. There are no global label/run arrays or per-image pixel offsets.
+
+For logical pixel bytes `P = width × height × 3 × sizeof(float)` and label
+capacity `L`, the canonical
+[FileLayout](../src/backend/data/compiled/compiled_file_layout.cpp) computes:
+
+```text
+pixel_pitch     = align_up(P, 4096)
+label_pitch     = align_up(L, 4096)
+block_bytes     = align_up(64 × (pixel_pitch + label_pitch), 2 MiB)
+data_offset     = align_up(sizeof(FileHeader), 2 MiB)
+block_base(i)   = data_offset + (i / 64) × block_bytes
+pixel_offset(i) = block_base(i) + (i % 64) × pixel_pitch
+label_offset(i) = block_base(i) + 64 × pixel_pitch + (i % 64) × label_pitch
+block_count     = (num_slots + 63) / 64
+index_offset    = data_offset + block_count × block_bytes
+total_file_size = index_offset + num_slots × sizeof(ImageEntry)
+```
+
+Integer division is used. Arithmetic and native file-offset representation are
+checked before allocation, mapping, or access. Final partial blocks retain the
+same 64-slot extent. Inactive slots remain holes; physical slot IDs do not change
+during finalization. `num_images` counts eligible samples, while `num_slots`
+bounds physical IDs. Benchmark slots follow readiness arrival order, so
+recompilation does not promise the same physical order or byte-identical files.
+
+### Staging and in-place compaction
+
+Both compilers initially allow **500,000 usable bytes per sample** for the
+complete label payload, including instances, runs, and internal alignment.
+The page-aligned staging pitch is 503,808 bytes; its extra page padding does
+not enlarge the usable capacity. There is no annotation sizing scan. Overflow
+is fatal and identifies the image, required bytes, and capacity; exact masks
+are never truncated or simplified to fit.
+
+After writers and borrowed mappings settle, finalization measures the largest
+complete eligible `ImageEntry.label_bytes`, records that exact value as
+`FileHeader.max_label_bytes`, and derives the final layout from it. A split
+containing only background images has a maximum and label pitch of zero.
+Rejected or speculative slots do not influence the maximum.
+
+[Compaction](../src/backend/data/compiled/compiled_file_compaction.cpp) moves only
+live pixel and label prefixes forward within the same staged inode, using at
+most 4 MiB of reusable scratch. It preserves physical slot IDs and sample-local
+run offsets, reclaims unused extents where hole punching is supported, and
+truncates to the computed final length. No move buffer is needed when the label
+pitch is unchanged. Header and resident-metadata records are then written and synced
+before atomic publication. Failure or cancellation preserves the prior published
+output; the unpublished staging file is retired.
+
+Sparse file length and allocated storage are separate facts. Writers reserve
+and preallocate page-covered pixel and used-label writes, not the entire sparse
+prefix. Stable block mappings survive growth while borrowed. Final file length
+still includes arithmetic holes and block/page padding; it is not the total
+number of bytes physically allocated or read by the loader. The
+[benchmark storage ledger](benchmark-datasets.md#memory-descriptors-and-storage)
+coordinates outstanding growth on each destination filesystem.
 
 ### File header
 
-`FileHeader` is packed and exactly 8,328 bytes:
+`FileHeader` is packed and exactly 8,320 bytes. Its file offsets are absolute:
 
 | Byte | Type | Field | Meaning |
 | ---: | --- | --- | --- |
 | 0 | `uint64` | `magic` | `0x464153544c445232` |
-| 8 | `uint32` | `version` | Current value: `9` |
-| 12 | `uint32` | `num_images` | Number of images in this split |
-| 16 | `uint32` | `image_width` | Compiled image width |
-| 20 | `uint32` | `image_height` | Compiled image height |
-| 24 | `uint32` | `channels` | Channel count; compiled RGB data uses 3 |
-| 28 | `uint32` | `num_classes` | Used entries in `class_names`, 1–256 |
-| 32 | `uint64` | `index_offset` | Start of the `ImageEntry` array |
-| 40 | `uint64` | `label_offset` | Start of the packed instance block |
-| 48 | `uint64` | `pixel_offset` | Start of the image blob |
-| 56 | `uint64` | `mask_rle_offset` | Start of the RLE-pair block |
-| 64 | `uint64` | `total_file_size` | Exact expected file length |
-| 72 | `uint64` | `image_stride` | Bytes per image: `width × height × channels × 4` |
-| 80 | `char[256][32]` | `class_names` | NUL-terminated class names indexed by normalized class ID |
-| 8,272 | `uint32` | `max_instances_per_image` | Maximum instance count in any image |
-| 8,276 | `uint8` | `resize_mode` | `0`: Stretch; `1`: Letterbox |
-| 8,277 | `uint8[51]` | reserved | Zeroed space retained for format evolution |
-
-The pixel block begins at
-`align_up(sizeof(FileHeader) + num_images * 40, 2 MiB)`. Its size must be
-exactly `num_images * image_stride`; the label block follows it immediately,
-then the RLE block, then end of file.
+| 8 | `uint32` | `version` | Current value: `10` |
+| 12 | `uint32` | `num_images` | Eligible image count |
+| 16 | `uint32` | `num_slots` | Physical slot extent, including inactive holes |
+| 20 | `uint32` | `image_width` | Compiled image width |
+| 24 | `uint32` | `image_height` | Compiled image height |
+| 28 | `uint32` | `channels` | Channel count; compiled RGB data uses 3 |
+| 32 | `uint32` | `num_classes` | Used entries in `class_names`, 1–256 |
+| 36 | `uint64` | `index_offset` | Start of `ImageEntry[num_slots]` after the fixed blocks |
+| 44 | `uint64` | `data_offset` | Start of the fixed blocks, 2 MiB aligned |
+| 52 | `uint64` | `total_file_size` | Exact expected file length |
+| 60 | `uint64` | `image_stride` | Logical bytes per image: `width × height × channels × 4` |
+| 68 | `char[256][32]` | `class_names` | NUL-terminated class names indexed by normalized class ID |
+| 8,260 | `uint32` | `max_instances_per_image` | Maximum instance count in an eligible image |
+| 8,264 | `uint8` | `resize_mode` | `0`: Stretch; `1`: Letterbox |
+| 8,265 | `uint32` | `max_label_bytes` | Exact maximum eligible payload bytes, including internal alignment; at most 500,000 |
+| 8,269 | `uint8[51]` | reserved | Zeroed space retained for format evolution |
 
 Each image is already resized to the compiled dimensions and stored as
 three contiguous planes in `NCHW` order: all red pixels, then green, then blue.
@@ -210,25 +263,28 @@ owns that later GPU step.
 
 ### Per-image index
 
-Each packed `ImageEntry` is 40 bytes:
+Each packed `ImageEntry` is 32 bytes. The array is copied into resident
+application memory when the file opens, with a 1,000,000,000-byte bound checked
+before using untrusted slot counts to allocate or read metadata:
 
 | Byte | Type | Field | Meaning |
 | ---: | --- | --- | --- |
-| 0 | `uint64` | `pixel_offset` | Absolute start of this image's fixed-stride pixels |
-| 8 | `uint32` | `label_offset` | Byte offset into the label block |
-| 12 | `uint16` | `num_instances` | Number of instances for this image |
-| 14 | `uint16` | padding | Zero |
-| 16 | `uint32` | `label_bytes` | `num_instances * 60` |
-| 20 | `uint32` | `original_width` | Source width before compilation |
-| 24 | `uint32` | `original_height` | Source height before compilation |
-| 28 | `uint8` | `has_source_image_id` | Whether the source image ID is present |
-| 29 | `uint8` | `source` | Annotation provenance, using the values below |
-| 30 | `uint16` | reserved | Zero |
-| 32 | `uint64` | `source_image_id` | Original source identity; zero when absent |
+| 0 | `uint16` | `num_instances` | Number of instances in this slot |
+| 2 | `uint8` | `status` | `0`: inactive; `1`: eligible |
+| 3 | `uint8` | `has_source_image_id` | Whether the source image ID is present |
+| 4 | `uint32` | `label_bytes` | Complete used payload: `align_up(num_instances * 60, 8) + num_runs * 8` |
+| 8 | `uint32` | `num_runs` | Total mask runs in this sample |
+| 12 | `uint32` | `original_width` | Source width before compilation |
+| 16 | `uint32` | `original_height` | Source height before compilation |
+| 20 | `uint8` | `source` | Annotation provenance, using the values below |
+| 21 | `uint8[3]` | reserved | Zero |
+| 24 | `uint64` | `source_image_id` | Original source identity; zero when absent |
 
-Dense compiled image indices remain separate from source IDs. The original
-dimensions and header resize mode reconstruct the transform without redundant
-per-image scale and padding fields.
+Inactive entries publish no instances, runs, or label bytes. Eligible background
+entries retain valid dimensions and source facts with zero label bytes. Compiled
+physical slot IDs remain separate from source IDs and filtered positions. The
+original dimensions and header resize mode reconstruct the transform without
+redundant per-image scale and padding fields.
 
 | `source` | Annotation provenance |
 | ---: | --- |
@@ -252,22 +308,30 @@ Each packed `PackedInstance` is 60 bytes:
 | Byte | Type | Field | Meaning |
 | ---: | --- | --- | --- |
 | 0 | `uint8` | `class_id` | Dense zero-based index into `class_names` |
-| 1 | `uint8` | `flags` | Mask presence, crowd, raw ignore, annotation-ID presence, category-ID presence |
+| 1 | `uint8` | `flags` | Mask presence, crowd, raw ignore, identity presence, and incomplete source ordinal |
 | 2 | `float32` | `bbox_x1` | Continuous left corner in compiled pixels |
 | 6 | `float32` | `bbox_y1` | Continuous top corner |
 | 10 | `float32` | `bbox_x2` | Continuous right corner |
 | 14 | `float32` | `bbox_y2` | Continuous bottom corner |
-| 18 | `uint64` | `mask_rle_offset` | Byte offset into the RLE block |
+| 18 | `uint64` | `mask_rle_offset` | Byte offset into this sample's run region |
 | 26 | `uint16` | `mask_rle_pairs` | Number of runs owned by this instance |
 | 28 | `float64` | `original_area` | Supplied or fallback area before compilation |
 | 36 | `uint64` | `annotation_id` | Source annotation identity, when present |
 | 44 | `uint64` | `source_category_id` | Source category identity, when present |
-| 52 | `uint64` | `source_ordinal` | Deterministic source annotation order |
+| 52 | `uint64` | `source_ordinal` | Source annotation order; consult the incomplete-provenance flag |
 
 Flag bits are `1` for mask presence, `2` for crowd, `4` for raw ignore, `8` for
-annotation-ID presence, and `16` for category-ID presence. Unused bits must be
-zero. Presence bits distinguish an ID of zero from an absent identity, and a
-present empty mask from a missing mask. Absent identities have zero payloads.
+annotation-ID presence, `16` for category-ID presence, and `32` for incomplete
+source-ordinal provenance. Unused bits must be zero. Presence bits distinguish
+an ID of zero from an absent identity, and a present empty mask from a missing
+mask. Absent identities have zero payloads.
+
+Bit `32` is admitted only for COCONut. It means the retained ordinal is local to
+its known source extent because an earlier annotation extent is unavailable;
+it must not be presented as a proven release-global ordinal. Other known
+identities remain intact. [Provenance settlement](benchmark-datasets.md#native-import-and-provenance)
+preserves the flag through cache reuse and clears it only when authoritative
+source extents establish the exact ordinal.
 
 Every `RLEPair` is `{ uint32 start, uint32 length }` and therefore 8 bytes.
 Starts index the compiled `width × height` mask in row-major order. Runs are
@@ -283,9 +347,9 @@ to one foreground class.
 
 The packed limits are intentional: class IDs occupy one byte, compiled image
 axes remain bounded to 32,767, and an image's instance count and an instance's
-RLE pair count must each fit an unsigned 16-bit value. Label-block byte offsets
-must fit their unsigned 32-bit fields. RLE-block byte offsets use unsigned
-64-bit fields and support combined mask storage beyond 4 GiB. Boxes must remain
+RLE pair count must each fit an unsigned 16-bit value. Every complete sample
+payload must also fit 500,000 bytes; 64-bit run offsets remain sample-local.
+Total split storage is not constrained to 4 GiB. Boxes must remain
 finite and strictly ordered after conversion to float32. Compilation rejects
 values that cannot be represented before publication.
 
@@ -391,26 +455,27 @@ emphasize noise; no detector-accuracy or measured performance benefit is claimed
 
 [Metadata-only `info`](#compile-and-inspect) checks the header and section
 extents. Product loading through [CompiledDataset](../src/backend/data/compiled/compiled_dataset.h)
-combines record admission with construction of its label lookup before exposing
-views:
+admits the resident metadata and each eligible sample before exposing views:
 
 1. map the regular file read-only with `MAP_SHARED`;
 2. copy and validate the header magic, version, dimensions, stride, and limits;
-3. validate section order, exact sizes, 2 MiB pixel alignment, and end of file;
-4. traverse images, labels, and mask runs once, constructing the label lookup
-   and mask-availability fact while checking pixel/label indexes, original
-   dimensions, class IDs, continuous boxes, original areas, flags, provenance,
-   RLE spans, and runs;
-5. expose immutable spans over the mapped index, labels, and masks, plus direct
-   fixed-stride pixel addresses.
+3. compute the checked fixed layout, enforce the resident-metadata bound, and
+   validate exact section offsets and end of file;
+4. copy `ImageEntry[num_slots]` into resident memory, validate slot status and
+   every eligible sample's dimensions, counts, classes, boxes, areas, flags,
+   provenance, local RLE spans, and runs, and derive mask availability;
+5. require the eligible count and observed maximum label bytes to equal the
+   header, then expose resident image facts and mapped per-image annotation
+   spans and arithmetic pixel addresses.
 
-Invalid or truncated files fail at open. The mapping owns the lifetime of every
-metadata and pixel view, so callers do not retain pointers beyond the
-`CompiledDataset`.
+Invalid or truncated files fail at open. `eligible_slots()` visits physical IDs
+directly from status metadata; it does not construct a dense-index-to-offset
+remapping. Resident metadata and the mapping belong to `CompiledDataset`, so
+borrowed views cannot outlive it.
 
 [CompiledRecordChecks](../src/backend/data/compiled/compiled_file_utils.h)
 supplies the same field rules to producers during encoding/copying. Benchmark
-split assembly retains its checked product through staging; a later untrusted
+split writing retains its checked product through staging; a later untrusted
 file open still performs the admission above. Metadata-only `info` does not
 read every label or mask, and neither route hashes the pixel payload.
 
@@ -428,7 +493,7 @@ mmltk::backend::data::DatasetLoader loader({
 mmltk::backend::data::Batch batch{};
 while (loader.next_batch(batch)) {
     loader.handoff_batch(batch, consumer_cuda_stream);
-    // Enqueue GPU work using batch.device_images and its mapped metadata.
+    // Enqueue GPU work using batch.device_images and its per-image annotations.
     loader.release_batch(batch, consumer_cuda_stream);
 }
 ```
@@ -439,9 +504,10 @@ that stream; the slot cannot be refilled until the GPU consumer has finished.
 Batch pointers are leases, not independently owned allocations. A checked-out
 batch must be released, and stale or foreign leases are rejected.
 
-Sequential epochs retain file order. Shuffled epochs use chunks sized to the
-larger of eight images or one batch, capped by the dataset size. They shuffle
-chunks within locality blocks targeting 256 images and shuffle the blocks,
+Sequential epochs visit eligible physical slots in file order, skipping holes.
+Shuffled epochs use chunks sized to the larger of eight images or one batch,
+capped by the dataset size. They shuffle chunks within locality blocks targeting
+256 images and shuffle the blocks,
 while retaining image order inside each chunk. A block contains at least one
 whole chunk, so its actual extent depends on batch size. Batch sharding selects
 complete batch ordinals for a rank, and `drop_last` controls the partial final
@@ -454,7 +520,7 @@ supplies draw order, rank slices, and Resume offset; the loader does not
 reshuffle them or choose model membership. Empty rank slices retain collective
 participation without allocating an empty forward batch.
 
-The stream sorts each slot's physical read descriptors by source image index
+The stream sorts each slot's physical read descriptors by physical sample ID
 while retaining their destination offsets. Image order, repeated draws,
 annotation pointers, draw keys and delivered batch identity therefore still
 follow the logical schedule. Source runs, including isolated or repeated images,
@@ -464,33 +530,52 @@ access advice, then supplies these explicit local read ranges. Annotation-only
 `describe_batch` views support [next-batch preparation](rfdetr-training.md#bounded-next-batch-preparation)
 without consuming the loader cursor or obtaining pixel custody.
 
-The local schedule bounds storage: slot count is the smaller of prefetch depth
-and locally scheduled batch count, retaining one control slot when that count
-is zero. Worker count also respects useful slots and eligible CPUs. Pixel
-storage and read-list reservations cover the largest locally scheduled batch;
-an empty shard prepares no pixel payload. A delivered batch's
-`image_capacity_bytes` remains its active image count times `image_stride`,
-independently of retained backing capacity.
+### Prepared batch storage
+
+The local schedule bounds slot count to the smaller of prefetch depth and
+locally scheduled batch count, retaining one slot when that count is zero.
+Worker count also respects useful slots and eligible CPUs. Every retained slot
+prepares the full configured maximum batch size before reads, including an
+empty shard's retained slot; later epochs can use repeated draws without
+growing its buffers.
+
+For maximum batch size `B`, each slot owns `B × image_stride` host and device
+pixel capacity, `B × header.max_label_bytes` logical label capacity, bounded
+read descriptors, and per-image annotation views. A batch of 30 therefore
+reserves `30 × header.max_label_bytes` label bytes per prefetch slot. Allocator
+alignment can round backing capacity up; RAM label pitch remains the exact
+header maximum rather than the file's page-aligned pitch. A zero-label split
+needs no label arena.
+
+Reads copy only each image's used label prefix and logical pixel bytes, update
+active views/counts, and leave unused capacity untouched. Pixel buffers, label
+storage, and read containers do not grow during reads or epoch changes. Explicit
+capacity/configuration changes require settled users before replacement.
+`image_capacity_bytes` on a delivered batch remains its active image count
+times `image_stride`, independently of retained backing capacity. Annotation-only
+planning remains available without pixel reads.
 
 ## Why compiled loading is fast
 
 The [compiled format](#compiled-binary-format) moves decoding, RGB conversion,
-resizing/padding, annotation parsing/transforms, and validation out of runtime.
-Fixed `float32` stride gives O(1) image addresses; labels/masks are packed arrays
-rather than per-image object graphs. Loading additionally uses:
+resizing/padding, and source annotation parsing/transforms out of runtime.
+Compiled-record admission runs once when the dataset opens.
+Fixed block arithmetic gives O(1) image and label addresses; labels/masks are
+packed within each sample. Loading additionally uses:
 
-- The 2 MiB-aligned pixel blob is friendly to huge-page-backed file-cache
-  mappings. The loader supplies Linux `madvise` hints separately for the
-  sequential index/metadata and for normal, sequential, or random pixel access.
-- Consecutive source images with consecutive batch destinations are coalesced.
+- Fixed blocks start on 2 MiB boundaries and pixel/label slots on 4 KiB
+  boundaries. The loader supplies normal, sequential, or random Linux
+  `madvise` hints for the mapped data region.
+- Physically adjacent logical pixel extents with consecutive batch destinations
+  are coalesced. Page padding and block label partitions break adjacency.
   File-cache population and copies are issued in bounded chunks of at most
   16 MiB, with cancellation checked between chunks.
 - The ordinary locality-aware shuffle changes global and within-block order
   each epoch. Explicit training schedules keep their own order while physical
   read sorting improves source locality within each slot.
-- Prefetch slots, read workers, read lists, pinned host buffers, device
-  buffers, CUDA events, and the copy stream are bounded and reused. Buffers
-  grow only to a high-water mark instead of allocating per batch.
+- Prefetch slots, read workers, read lists, pinned host/label buffers, device
+  buffers, CUDA events, and the copy stream are bounded and reused. Batch
+  storage is allocated at preparation, before steady reads.
 - Workers and pinned pages use the resolved GPU-local CPU/NUMA placement.
   Host pages are bound, prefaulted, residency-checked, and then registered with
   CUDA.
@@ -508,8 +593,9 @@ NUMA-bound pinned host storage, then submits one asynchronous
 `cudaMemcpyAsync` for the packed batch on a nonblocking high-priority copy
 stream. A CUDA event hands the finished device slot to the consumer stream.
 This is the default [benchmark path](#compile-and-inspect) and needs no GDRCopy.
-For contiguous CPU batches, `host_images` can alias the mapped pixels; other CPU
-views materialize only on demand.
+The loader's `host_images` can alias mapped pixels when the selected arithmetic
+pixel extents are exactly contiguous. Otherwise it exposes the slot's prepared
+host buffer. Page padding and block boundaries can prevent that alias.
 
 ### GDRCopy path
 
@@ -529,12 +615,21 @@ into mapped GPU memory. GDRCopy has no automatic fallback; use the default H2D
 path if the selected GPU, driver, `/dev/gdrdrv`, or CUDA DMA-BUF mapping path
 cannot support it.
 
+GDR slots also prepare host pixel capacity before reading. Optional CPU access
+that cannot alias contiguous mapped pixels gathers into that existing buffer
+on the caller thread under the slot's prepared execution policy; it does not
+allocate storage or wait behind a loader callback that needs the caller's lease
+lock.
+
 Use `--prefetch-factor`, worker, CPU-affinity, and NUMA options only on commands
 that expose them; the exact surface is listed by that command's `--help`.
 Measure the real workload before increasing prefetch depth: each slot owns
-capacity for the local schedule's largest batch, so additional useful slots
+capacity for the configured maximum batch, so additional useful slots
 consume more pinned or device memory. See [GPU-local execution](gpu-execution.md)
 for placement, transport, capability inspection, and functional GDR checks.
+The [recorded bounded measurements](validation.md#fixed-storage-measurements)
+compare used-byte copies with the preceding packed algorithm; neither layout
+was faster in every measured order.
 
 ## Explore thumbnails and atlas residency
 

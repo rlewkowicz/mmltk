@@ -86,7 +86,7 @@ metrics, output files, and continuation. The
 whole-session manifests, deployment artifacts, and the custom chooser's current
 manifest-selection limit. Older application checkpoints and output-directory
 history are unsupported. Upstream weights keep their own supported input
-routes. Compiled datasets use format 9; recompile older
+routes. Compiled datasets use format 10; recompile older
 bins. Dataset compilation defaults to Stretch, with Letterbox available
 explicitly. Explore thumbnails preserve source proportions in padded cells.
 Every Upscale method prepares stretched compiled input at source aspect first.
@@ -104,7 +104,9 @@ The Dataset card's benchmark override offers Coco custom and Coconut.
 Coconut compiles the full COCONut training recipe with a choice of validation
 annotations and membership, reusing the persistent source cache. Its optional
 dropped-mask recovery is off by default; enable it before recompiling to recover
-eligible objects from original COCO annotations. See the
+eligible objects from original COCO annotations. Ready images and annotations
+compile independently. Bounded repair preserves healthy samples and reports
+omissions; both output splits still need usable data. See the
 [built-in dataset guide](docs/benchmark-datasets.md) for those choices and for
 reading the independent acquisition, labels/masks, and pixel progress.
 
