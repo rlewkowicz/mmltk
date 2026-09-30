@@ -38,7 +38,9 @@ CustomRecipeCatalog custom_recipe_catalog() {
 }
 CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout& cache, const CustomRecipeCatalog& catalog, ProgressReporter& progress,
  std::size_t effective_num_workers, mmltk::common::concurrency::CancellationObservation external_cancellation, const BenchmarkTraceSink& trace, std::span<const int> worker_cpus,
- BenchmarkCompilePipeline* execution, CompileAllowance preparation) {
+ BenchmarkCompilePipeline* execution, CompileAllowance preparation, CocoAnnotationSplitSink coco_ready,
+ std::function<void(const NormalizedAnnotationReadView&)> selected_ready) {
+ auto annotations = execution ? execution->execution().open_class(detail::CompileWorkClass::Annotations) : detail::CompileExecution::Producer{};
  struct SourceCancellation {
   mmltk::common::concurrency::CancellationObservation external;
   std::atomic<bool> stopped{false};
@@ -89,6 +91,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
   auto lease = acquire_lifecycle("coco-annotations.lifecycle.lock");
   CocoAnnotationCache coco_cache(cache, catalog.coco_annotations, CocoAnnotationRequest{CocoSplitAdmission::Required, CocoSplitAdmission::Required}, catalog.coco_train_images_count,
    catalog.coco_validation_images_count, static_cast<int>(parse_workers), cancel_requested, trace, execution, &storage, lease);
+  coco_cache.observe_splits(std::move(coco_ready));
   coco_cache.discover(progress);
   auto completed = coco_cache.completed_indexes();
   completed_indexes.fetch_add(completed);
@@ -226,6 +229,16 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  CombinedSupplementalSamplingResult combined_sampling = sample_combined_supplemental_indices(*coco_train, *objects, *open_images, object_shard_bytes, cancel_requested, (execution ? &execution->execution() : nullptr));
  SupplementalSamplingResult objects_sampling = std::move(combined_sampling.objects365);
  SupplementalSamplingResult open_images_sampling = std::move(combined_sampling.open_images);
+ if (selected_ready) {
+  // The combined sampler has settled both memberships. Their independent
+  // bounded label publishers retain the views through their own completion.
+  std::array<std::future<void>, 2> publishers;
+  publishers[0] = std::async(std::launch::async, [&] { selected_ready(objects_sampling.view); });
+  publishers[1] = std::async(std::launch::async, [&] { selected_ready(open_images_sampling.view); });
+  std::exception_ptr label_failure;
+  for (auto& publisher : publishers) try { publisher.get(); } catch (...) { if (!label_failure) label_failure = std::current_exception(); }
+  if (label_failure) std::rethrow_exception(label_failure);
+ }
  progress.phase(DatasetCompilePhase::Indexing, ++completed_indexes, kIndexCount);
  progress.source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Selecting Open Images class-deficit and diversity sample");
  progress.phase(DatasetCompilePhase::Indexing, ++completed_indexes, kIndexCount);

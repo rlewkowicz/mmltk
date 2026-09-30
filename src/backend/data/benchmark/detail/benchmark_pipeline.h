@@ -27,6 +27,26 @@ struct BenchmarkLabelChunk;
 class BenchmarkLabelInput;
 class BenchmarkLabelWorkspace;
 
+// Bounded physical completion custody shared by artifact publication and final
+// claim restoration. Completion order frees records; metadata order stays with
+// the caller. Destruction drains every accepted borrower even after failure.
+class BenchmarkCompletionWindow final {
+public:
+ explicit BenchmarkCompletionWindow(std::size_t capacity, detail::CompileExecution* = nullptr, std::function<void()> waiting = {});
+ ~BenchmarkCompletionWindow();
+ BenchmarkCompletionWindow(const BenchmarkCompletionWindow&) = delete;
+ BenchmarkCompletionWindow& operator=(const BenchmarkCompletionWindow&) = delete;
+ void make_room();
+ void push(detail::CompileExecution::Completion, std::function<void(std::exception_ptr)>);
+ void reap();
+ void wait_one();
+ void drain();
+ [[nodiscard]] std::size_t size() const noexcept;
+private:
+ struct Impl;
+ std::unique_ptr<Impl> impl_;
+};
+
 class BenchmarkCompilePipeline final {
  friend class BenchmarkSourcePublication;
 public:

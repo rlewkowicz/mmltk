@@ -59,6 +59,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_compiler.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
+#include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/backend/data/benchmark/detail/benchmark_sampling.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
@@ -889,7 +890,7 @@ void test_benchmark_archive_training_quarantine() {
   .trace = {},
   .quarantine_unavailable = true,
   .decompression_workers = 0U,
-  .cache_write_workers = 0U,
+
   .activity = {},
  });
  REQUIRE(extracted.image_count == 1U);
@@ -2277,7 +2278,7 @@ TEST_CASE("archive image reuse reports initial and resolved counts without repla
   const std::vector<std::uint64_t> ids{1U, 2U};
   std::vector<std::uint64_t> counts;
   std::unique_ptr<BenchmarkCompilePipeline> execution;
-  if (workers == 1U) execution = std::make_unique<BenchmarkCompilePipeline>(1, std::span<const int>{}, CompileExecutionLimits{.transient_bytes = 1U << 20});
+  if (workers) execution = std::make_unique<BenchmarkCompilePipeline>(std::min(workers, mmltk::common::system::allowed_cpu_set().size()));
   ArchiveExtractionRequest request{
    .archive_path = archive,
    .source_identity = "fixture:reuse",
@@ -2295,14 +2296,14 @@ TEST_CASE("archive image reuse reports initial and resolved counts without repla
     [&](const auto, const auto encoded) {
    if (!has_complete_image_markers(encoded)) { throw std::runtime_error("invalid cached JPEG"); }
    if (execution) {
-    require_condition(execution->execution().current_lane() == 0, "archive repair validation bypassed shared CPU admission");
+    if (workers == 1U) require_condition(execution->execution().current_lane() == 0, "archive repair validation bypassed shared CPU admission");
     BenchmarkImageValidator probe;
     probe.validate_decodable(encoded, 16, 8);
    }
    return BenchmarkImageDecoder{}.read_header(encoded);
   },
    .decompression_workers = 0U,
-   .cache_write_workers = workers,
+
    .execution = execution.get()
   };
   auto result = extract_selected_archive_images(request);
@@ -2449,6 +2450,8 @@ TEST_CASE("batched image writes settle before cancellation and preserve successf
   }
   std::atomic<bool> cancelled{false};
   std::vector<std::uint64_t> counts;
+  BenchmarkCompilePipeline execution(std::min<std::size_t>(3, mmltk::common::system::allowed_cpu_set().size()), {}, {},
+   mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
   ArchiveExtractionRequest request{
    .archive_path = archive,
    .source_identity = "fixture:batch",
@@ -2469,7 +2472,7 @@ TEST_CASE("batched image writes settle before cancellation and preserve successf
    if (cancel_after_batch && completed >= 128U) { cancelled.store(true); }
   },
    .decompression_workers = 0U,
-   .cache_write_workers = 3U
+   .execution = &execution
   };
   if (cancel_after_batch) {
    CHECK_THROWS(extract_selected_archive_images(request));
@@ -2973,7 +2976,7 @@ TEST_CASE("one-worker image readiness resizes before archive completion and reus
   .selected_image_ids = ids,
   .image_id_parser = [](std::string_view name) -> std::optional<std::uint64_t> { return name.ends_with("/1.jpg") ? std::optional<std::uint64_t>{1} : std::nullopt; },
   .decompression_workers = 0,
-  .cache_write_workers = 0
+
  };
  const auto publication = pipeline.source_publication(images, {});
  acquisition.image_ready = [&](const CachedImageReady& image) {
@@ -3022,6 +3025,7 @@ TEST_CASE("cache readiness failure joins held publication and retains completed 
  const std::array<std::uint64_t, 2> ids{1, 2};
  mmltk::testsupport::TestGate failing("failing cache publication"), held("held cache publication");
  std::promise<void> failure_delivered;
+ BenchmarkCompilePipeline execution(2);
  ArchiveExtractionRequest request{
   .archive_path = archive,
   .source_identity = "ready-failure-fixture",
@@ -3035,7 +3039,7 @@ TEST_CASE("cache readiness failure joins held publication and retains completed 
   return std::nullopt;
  },
   .decompression_workers = 0,
-  .cache_write_workers = 2
+  .execution = &execution
  };
  request.image_ready = [&](const CachedImageReady& image) {
   require_condition(fs::file_size(cached_image_path(images, image.image_id)) == jpeg.size(), "readiness preceded durable image publication");
@@ -10964,4 +10968,260 @@ TEST_CASE("split sealing joins a physical peer before propagating failure", "[ba
  CHECK_FALSE(fs::exists(temporary));
  CHECK(storage.outstanding()==0);
  CHECK(mmltk::common::io::sha256_file(output)==previous);
+}
+
+TEST_CASE("custom extraction retains a bounded pinned window through physical pixel completion", "[backend][data][benchmark][archive]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPUs");
+ mmltk::testsupport::ScopedTempDir directory("custom-pinned-image-window");
+ const auto archive = directory.path() / "images.tar";
+ const auto images = directory.path() / "images";
+ const auto jpeg = make_jpeg(80, 40, 20);
+ std::vector<std::uint64_t> ids;
+ {
+  std::ofstream output(archive, std::ios::binary);
+  for (unsigned id = 1; id <= 12; ++id) { ids.push_back(id); write_jpeg_tar_entry(output, id, jpeg); }
+  const std::array<char, 1024> end{}; output.write(end.data(), end.size());
+ }
+ bool cancel = false, cached = false;
+ SECTION("cold publication") {}
+ SECTION("individually cached peers") { cached = true; }
+ SECTION("cancellation joins a held physical completion") { cancel = true; }
+ if (cached) {
+  prepare_cached_image_directory(images);
+  for (auto id : ids) BenchmarkEncodedImage::publish(cached_image_path(images, id), jpeg, {});
+ }
+ BenchmarkCompilePipeline pipeline(4);
+ PreparedBenchmarkSplit split; split.name = "train"; split.class_names = {"person"};
+ struct Observed {
+  mmltk::testsupport::TestGate held{"first custom pixel retains its completion"};
+  std::atomic<unsigned> completed{0};
+  std::promise<void> peers;
+ } observed;
+ auto request = benchmark_write_request(split, directory.path() / "pixels.bin", 8);
+ request.execution = &pipeline;
+ request.progress = {.context = &observed, .image_completed = [](void* context) {
+  auto& value = *static_cast<Observed*>(context);
+  const auto count = value.completed.fetch_add(1);
+  if (!count) value.held.receipt().ArriveAndWait();
+  else if (count == 11) value.peers.set_value();
+ }};
+ BenchmarkSplitWriter writer(request, true);
+ BenchmarkCompilePipeline::Attempt attempt(pipeline);
+ pipeline.bind_source(images, writer, AnnotationSource::Coco);
+ const auto publication = pipeline.source_publication(images, {}, {}, true);
+ auto extracting = std::async(std::launch::async, [&] {
+  return extract_selected_archive_images({.archive_path = archive, .source_identity = "window", .output_root = images, .source = "coco", .shard = "train2017",
+   .selected_image_ids = ids, .image_id_parser = benchmark_archive_image_candidate, .image_ready = [publication](const CachedImageReady& ready) { publication(ready); }, .execution = &pipeline});
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { observed.held.Release(); });
+ REQUIRE(observed.held.WaitEntered(5s));
+ mmltk::testsupport::await_test_promise(observed.peers, "independent custom pixels complete through the bounded input window", 5s);
+ CHECK_FALSE(fs::exists(images / ".complete.json"));
+ if (cancel) pipeline.execution().cancel();
+ CHECK(extracting.wait_for(0ms) == std::future_status::timeout);
+ observed.held.Release();
+ if (cancel) CHECK_THROWS(mmltk::testsupport::await_test_future(extracting, "cancelled custom source physically drains", 5s));
+ else {
+  const auto result = mmltk::testsupport::await_test_future(extracting, "custom source proof follows physical completion", 5s);
+  CHECK(result.image_count == ids.size()); CHECK(result.image_bytes == ids.size() * jpeg.size());
+  CHECK(writer.completed() == ids.size());
+ }
+}
+
+TEST_CASE("an exceptional archive pixel releases its normal input and quiesces the source cursor", "[backend][data][benchmark][archive][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const bool below_window = GENERATE(false, true);
+ CAPTURE(below_window);
+ mmltk::testsupport::ScopedTempDir directory("exceptional-archive-pixel");
+ const auto archive = directory.path() / "images.tar", images = directory.path() / "images";
+ const auto jpeg = make_jpeg(24, 80, 160);
+ const std::array<std::uint64_t, 2> ids{1, 2};
+ {
+  std::ofstream output(archive, std::ios::binary);
+  for (auto id : ids) write_jpeg_tar_entry(output, id, jpeg);
+  const std::array<char, 1024> end{}; output.write(end.data(), end.size());
+ }
+ const std::array<CompileWorkspaceProfile, 1> profiles{{{64U << 10, 0}}};
+ auto plan = std::make_shared<CompileWorkspacePlan>(below_window
+  ? compile_workspace_plan(1, 128, false, 0, 1, BenchmarkEncodedImage::normal_window_bytes)
+  : CompileWorkspacePlan::prepare(1, profiles, BenchmarkEncodedImage::normal_window_bytes, 0, 40ULL << 20));
+ const auto header = BenchmarkImageDecoder{}.read_header(jpeg);
+ REQUIRE(compile_pixel_workspace_plan(header, {128, 128, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, false}).bytes() > plan->context_bytes);
+ const auto decoder_bytes = BenchmarkArchive::input_requirement(archive, 0).workspace_bytes;
+ BenchmarkCompilePipeline pipeline(1, {}, {.workspace_plan = plan});
+ const auto locked = pipeline.execution().snapshot().normal_locked;
+ PreparedBenchmarkSplit split; split.name = "train"; split.class_names = {"person"};
+ struct Observed {
+  mmltk::testsupport::TestGate held{"oversized pixel owns its exceptional arena"};
+  std::atomic<unsigned> completed{0};
+ } observed;
+ auto request = benchmark_write_request(split, directory.path() / "pixels.bin", 128);
+ request.execution = &pipeline;
+ request.progress = {.context = &observed, .image_completed = [](void* context) {
+  auto& value = *static_cast<Observed*>(context);
+  if (!value.completed.fetch_add(1)) value.held.receipt().ArriveAndWait();
+ }};
+ BenchmarkSplitWriter writer(request, true);
+ BenchmarkCompilePipeline::Attempt attempt(pipeline);
+ pipeline.bind_source(images, writer, AnnotationSource::Coco);
+ const auto publication = pipeline.source_publication(images, {}, {}, true);
+ std::atomic<unsigned> input_waits{0}, checked_inputs{0};
+ auto extracting = std::async(std::launch::async, [&] {
+  return extract_selected_archive_images({.archive_path = archive, .source_identity = "exceptional", .output_root = images, .source = "coco", .shard = "train2017",
+   .selected_image_ids = ids, .image_id_parser = benchmark_archive_image_candidate,
+   .validator = [&](std::uint64_t, std::span<const std::uint8_t> encoded) {
+    if (below_window) {
+     const auto snapshot = pipeline.execution().snapshot();
+     require_condition(snapshot.exceptional >= BenchmarkEncodedImage::normal_window_bytes, "below-window input lacks its admitted exceptional backing");
+     require_condition(snapshot.resources.bytes < BenchmarkEncodedImage::normal_window_bytes + decoder_bytes, "restored archive retained decoder ancestry through input publication");
+    }
+    ++checked_inputs;
+    return BenchmarkImageDecoder{}.read_header(encoded);
+   }, .trace = [&](std::string_view event, const nlohmann::json&) { if (event == "benchmark.images.input_wait") ++input_waits; },
+   .image_ready = [publication](const CachedImageReady& ready) { publication(ready); }, .execution = &pipeline});
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { observed.held.Release(); pipeline.execution().cancel(); });
+ REQUIRE(observed.held.WaitEntered(5s));
+ CHECK(pipeline.execution().snapshot().exceptional > 0);
+ CHECK(pipeline.execution().snapshot().normal_locked == locked);
+ CHECK_FALSE(fs::exists(images / ".complete.json"));
+ observed.held.Release();
+ const auto result = mmltk::testsupport::await_test_future(extracting, "exceptional pixel returns to the retained forward source", 5s);
+ CHECK(result.image_count == ids.size()); CHECK(writer.completed() == ids.size());
+ CHECK(checked_inputs == ids.size());
+ if (below_window) CHECK(input_waits >= ids.size());
+ CHECK(pipeline.execution().snapshot().exceptional == 0);
+ CHECK(pipeline.execution().snapshot().normal_locked == locked);
+}
+
+TEST_CASE("custom archive admission retires decoder and unaccepted input through a full physical queue", "[backend][data][benchmark][archive][resources]") {
+ using namespace mmltk::backend::data::detail;
+ if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPUs");
+ const bool cancel = GENERATE(false, true);
+ CAPTURE(cancel);
+ mmltk::testsupport::ScopedTempDir directory("archive-full-file-window");
+ const auto archive = directory.path() / "images.tar", images = directory.path() / "images";
+ const auto jpeg = make_jpeg(24, 80, 160);
+ const std::array<std::uint64_t, 3> ids{1, 2, 3};
+ {
+  std::ofstream output(archive, std::ios::binary);
+  for (auto id : ids) write_jpeg_tar_entry(output, id, jpeg);
+  const std::array<char, 1024> end{}; output.write(end.data(), end.size());
+ }
+ mmltk::testsupport::TestGate input_wait("source failed its own pinned input reservation"), checked("second member has a checked header"),
+  restoring("input admitted before decoder restoration"), restoration_peer("new oversized peer precedes decoder restoration"),
+  accepted("accepted source callback retains physical custody"), file_peer("independent accepted file callback"), pixel("oversized pixel owns its arena");
+ std::atomic<unsigned> validations{0}, callbacks{0}, file_returns{0}, file_waits{0};
+ std::atomic<bool> first_input_wait{false}, first_restoration{false}, testing_full_queue{false};
+ std::promise<void> restoration_waiting, pixel_waiting, source_full;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
+  if (event == "benchmark.images.input_wait" && !first_input_wait.exchange(true)) input_wait.receipt().ArriveAndWait();
+  if (event == "benchmark.images.decoder_admission" && !first_restoration.exchange(true)) restoring.receipt().ArriveAndWait();
+  if (event == "benchmark.images.file_wait") {
+   const auto count = ++file_waits;
+   if (count == 1) mmltk::testsupport::release_test_promise(source_full);
+  }
+  if (const auto parked = fields.find("parked"); parked != fields.end() && (*parked)[static_cast<std::size_t>(CompileParkReason::Bytes)].get<std::size_t>())
+   mmltk::testsupport::release_test_promise(testing_full_queue ? pixel_waiting : restoration_waiting);
+ };
+ const std::array<CompileWorkspaceProfile, 1> profiles{{{64U << 10, 0}}};
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(3, profiles, BenchmarkEncodedImage::normal_window_bytes, 0, 40ULL << 20));
+ BenchmarkCompilePipeline pipeline(3, {}, {.workspace_plan = plan}, {}, trace);
+ auto occupied = pipeline.execution().reserve({.bytes = BenchmarkEncodedImage::normal_window_bytes, .supplied_workspace = true,
+  .workspace_window = CompileWorkspaceWindow::SharedSource});
+ const auto locked = pipeline.execution().snapshot().normal_locked;
+ std::array<CompileExecution::Completion, 5> files;
+ const auto pixel_bytes = compile_pixel_workspace_plan(BenchmarkImageDecoder{}.read_header(jpeg),
+  {128, 128, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, false}).bytes();
+ REQUIRE(pixel_bytes > plan->context_bytes);
+ const auto pixel_task = [&](mmltk::testsupport::TestGate& gate) {
+  return pipeline.execution().submit({.kind = CompileTaskKind::Pixels,
+   .resources = {.bytes = pixel_bytes, .supplied_workspace = true, .workspace_class = CompileWorkClass::Pixels},
+   .work = [receipt = gate.receipt()](std::size_t, const CompileAllowance& allowance) { allowance.workspace().front() = std::byte{29}; receipt.ArriveAndWait(); }, .retain_workspace = false});
+ };
+ CompileExecution::Completion oversized, restoring_pixel;
+ std::future<CachedImageDirectory> extracting;
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  input_wait.Release(); checked.Release(); restoring.Release(); restoration_peer.Release(); accepted.Release(); file_peer.Release(); pixel.Release();
+  occupied = {}; pipeline.execution().cancel(); pipeline.files().join();
+ });
+ extracting = std::async(std::launch::async, [&] {
+  return extract_selected_archive_images({.archive_path = archive, .source_identity = "opened-full-window", .output_root = images, .source = "coco", .shard = "train2017",
+   .selected_image_ids = ids, .image_id_parser = benchmark_archive_image_candidate,
+   .validator = [&](std::uint64_t id, std::span<const std::uint8_t> encoded) {
+    ++validations;
+    const auto header = BenchmarkImageDecoder{}.read_header(encoded);
+    if (id == 2) checked.receipt().ArriveAndWait();
+    return header;
+   }, .trace = trace, .image_ready = [&](const CachedImageReady& ready) {
+    require_condition(ready.payload && !ready.payload->charged_bytes(), "accepted immutable file callback retained pinned source input");
+    if (ready.image_id == 1) accepted.receipt().ArriveAndWait();
+    ++callbacks;
+   }, .execution = &pipeline, .retain_encoded = false});
+ });
+ REQUIRE(input_wait.WaitEntered(5s));
+ CHECK_FALSE(pipeline.execution().resource_pressure());
+ CHECK(pipeline.execution().resource_usage().bytes == BenchmarkEncodedImage::normal_window_bytes + CompileResources::handles(2).bytes);
+ // This source's failed try_reserve must release decoder scratch without any
+ // unrelated preexisting waiter. Independent CPU work remains selectable.
+ auto independent = pipeline.execution().submit({.kind = CompileTaskKind::Metadata, .work = [](std::size_t, const CompileAllowance&) {}});
+ independent.wait();
+ CHECK(pipeline.execution().snapshot().normal_locked == locked);
+ occupied = {}; input_wait.Release();
+ REQUIRE(restoring.WaitEntered(5s));
+ restoring_pixel = pixel_task(restoration_peer);
+ mmltk::testsupport::await_test_promise(restoration_waiting, "new oversized work closes admission before decoder restoration", 5s);
+ restoring.Release();
+ REQUIRE(restoration_peer.WaitEntered(5s));
+ CHECK(validations == 0); CHECK(callbacks == 0);
+ CHECK(pipeline.execution().snapshot().leased == 0);
+ CHECK(pipeline.execution().snapshot().normal_locked == locked);
+ restoration_peer.Release(); restoring_pixel.wait();
+ REQUIRE(accepted.WaitEntered(5s));
+ REQUIRE(checked.WaitEntered(5s));
+ for (auto& file : files) file = pipeline.files().submit({.completed = [&](std::exception_ptr) { file_peer.receipt().ArriveAndWait(); ++file_returns; }, .work = [] {}});
+ REQUIRE(file_peer.WaitEntered(5s));
+ CHECK_FALSE(pipeline.files().has_capacity());
+ CHECK_FALSE(pipeline.files().try_submit({.work = [] {}}));
+ testing_full_queue = true;
+ oversized = pixel_task(pixel);
+ mmltk::testsupport::await_test_promise(pixel_waiting, "oversized pixel waits behind the source input and decoder", 5s);
+ // The unaccepted second member and later third member must still come from
+ // the opened inode, even after the source's pathname names different bytes.
+ fs::rename(archive, directory.path() / "opened.tar");
+ write_single_jpeg_tar(archive, 2, make_jpeg(200, 10, 30));
+ checked.Release();
+ mmltk::testsupport::await_test_promise(source_full, "source observes full physical file records", 5s);
+ REQUIRE(pixel.WaitEntered(5s));
+ CHECK(pipeline.execution().snapshot().exceptional > 0);
+ CHECK(pipeline.execution().snapshot().leased == 0);
+ CHECK(pipeline.execution().snapshot().normal_locked == locked);
+ CHECK(callbacks == 0); CHECK(file_returns == 0); CHECK(validations == 2);
+ CHECK_FALSE(fs::exists(cached_image_path(images, 2)));
+ CHECK_FALSE(fs::exists(images / ".complete.json"));
+ if (cancel) { pipeline.execution().cancel(); CHECK_THROWS(pipeline.files().has_capacity()); }
+ CHECK(extracting.wait_for(0ms) == std::future_status::timeout);
+ CHECK_FALSE(oversized.ready());
+ pixel.Release();
+ oversized.wait();
+ // Completion of the oversized peer returns resources, but neither it nor
+ // source-owned release notifications return a held physical file record.
+ CHECK(pipeline.execution().snapshot().leased == 0);
+ CHECK(file_waits == 1);
+ CHECK(extracting.wait_for(0ms) == std::future_status::timeout);
+ CHECK(validations == 2);
+ accepted.Release(); file_peer.Release();
+ if (cancel) CHECK_THROWS(mmltk::testsupport::await_test_future(extracting, "cancelled source joins its accepted callback", 5s));
+ else {
+  const auto result = mmltk::testsupport::await_test_future(extracting, "source resumes its opened archive generation", 5s);
+  CHECK(result.image_count == ids.size()); CHECK(result.image_bytes == ids.size() * jpeg.size());
+  CHECK(callbacks == ids.size()); CHECK(validations == ids.size());
+  const auto expected = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(jpeg));
+  for (auto id : ids) CHECK(mmltk::common::io::sha256_file(cached_image_path(images, id)) == expected);
+ }
+ pipeline.files().join();
+ if (!cancel) CHECK(pipeline.files().has_capacity());
+ CHECK(file_returns == files.size());
+ CHECK(pipeline.execution().snapshot().exceptional == 0);
+ CHECK(pipeline.execution().snapshot().normal_locked == locked);
 }

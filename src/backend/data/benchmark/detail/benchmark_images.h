@@ -99,13 +99,14 @@ struct ArchiveExtractionRequest {
  BenchmarkTraceSink trace = {};
  bool quarantine_unavailable = false;
  std::size_t decompression_workers = 1U;
- std::size_t cache_write_workers = 1U;
  std::function<void(std::string_view)> activity = {};
  std::filesystem::path completion_path = {};
  CachedImageReadySink image_ready = {};
  BenchmarkCompilePipeline* execution = nullptr;
  detail::StorageReservationPool* storage = nullptr;
  CompileAllowance parent_allowance{};
+ // Synchronous repair validation consumes immutable file backing after source release.
+ bool retain_encoded = true;
 };
 [[nodiscard]] CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest request);
 }  // namespace mmltk::backend::data::benchmark_internal

@@ -1757,7 +1757,7 @@ TEST_CASE("shared root repair invalidates all proofs and preserves valid JPEG al
   },
     .quarantine_unavailable = true,
     .decompression_workers = 0,
-    .cache_write_workers = 0});
+});
   CHECK(extracted.image_count == 2);
   CHECK_FALSE(std::filesystem::exists(proof));
  }
@@ -4746,10 +4746,15 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
   BenchmarkArchive changed_generation(path);
   CHECK_THROWS_AS(changed_generation.seek(first_position), BenchmarkArchiveError);
  }
+ input.suspend();
  REQUIRE(input.seek(first_position));
+ input.suspend();
  first = input.read(1024);
  CHECK(std::string(first.begin(), first.end()) == members[0].second);
  CHECK_FALSE(input.seek("missing.bin"));
+ input.suspend();
+ REQUIRE(input.next());
+ CHECK(input.member() == members[1].first);
  input.pause();
  const std::array required{members[1].first, members[0].first};
  std::vector<std::size_t> order;
@@ -4776,7 +4781,7 @@ TEST_CASE("requested archive extraction closes before unsafe unused members", "[
    .shard = "train2017",
    .selected_image_ids = ids,
    .image_id_parser = [](std::string_view name) -> std::optional<std::uint64_t> { return name == "images/1.jpg" ? std::optional<std::uint64_t>{1} : std::nullopt; },
-   .cache_write_workers = 0});
+});
  CHECK(result.image_count == 1);
  BenchmarkArchive reader(path);
  REQUIRE(reader.next());
@@ -4939,7 +4944,7 @@ TEST_CASE("archive image payloads outlive acquisition and exceptional pool retir
   .shard = "train2017",
   .selected_image_ids = ids,
   .image_id_parser = [](std::string_view name) -> std::optional<std::uint64_t> { return name == "images/1.jpg" ? std::optional<std::uint64_t>{1} : std::nullopt; },
-  .cache_write_workers = 0
+
  };
  request.image_ready = [&](const CachedImageReady& ready) {
   retained = ready.payload;
@@ -5049,13 +5054,15 @@ TEST_CASE("high-expansion gzip keeps a charged bounded dictionary working set", 
  }
  REQUIRE(std::filesystem::file_size(path) < expanded_bytes / 100);
  const auto workspace = BenchmarkArchive::input_requirement(path, 1024).workspace_bytes;
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = workspace, .descriptors = 16});
+ CHECK(workspace < (8ULL << 20));
+ CHECK(BenchmarkArchive::input_requirement(path, 1024, 2).workspace_bytes > workspace);
+ detail::CompileExecution execution(1, {}, {.transient_bytes = workspace, .descriptors = 16});
  {
-  BenchmarkArchive input(path, &execution.execution(), 1024);
-  // The single block is valid; retiring its oversized parallel representation
-  // must preserve the callback cursor and every subsequently consumed byte.
+  BenchmarkArchive input(path, &execution, 1024);
+  // The ordinary stream admits the valid expansion without a parallel cache.
+  // Replay preserves the callback cursor and every subsequently consumed byte.
   CHECK(input.allowance().bytes() == workspace);
-  CHECK_FALSE(execution.execution().try_reserve({1, 0}).has_value());
+  CHECK_FALSE(execution.try_reserve({1, 0}).has_value());
   REQUIRE(input.next());
   (void)input.read(1024);
   REQUIRE(input.next());
@@ -5078,9 +5085,9 @@ TEST_CASE("high-expansion gzip keeps a charged bounded dictionary working set", 
   CHECK(std::string(first.begin(), first.end()) == "first");
   input.pause();
   CHECK(input.gzip_seek_state().dictionaries == 0);
-  CHECK(execution.execution().try_reserve({workspace, 0}).has_value());
+  CHECK(execution.try_reserve({workspace, 0}).has_value());
  }
- CHECK(execution.execution().try_reserve({workspace, 16}).has_value());
+ CHECK(execution.try_reserve({workspace, 16}).has_value());
 }
 TEST_CASE("gzip dictionary eviction preserves parallel forward work and bounded controls", "[benchmark][coconut][archive]") {
  bool concatenated = false, control_limit = false, cancel_replay = false, corrupt_crc = false, bgzf = false;
@@ -5590,7 +5597,7 @@ TEST_CASE("retained archive images keep storage after decoder CPUs return", "[be
   .selected_image_ids = ids,
   .image_id_parser = [](std::string_view) { return std::optional<std::uint64_t>{1}; },
   .decompression_workers = 2,
-  .cache_write_workers = 0,
+
   .image_ready =
    [&](const CachedImageReady& ready) {
   retained = ready.payload;
@@ -8736,8 +8743,8 @@ TEST_CASE("custom source admission keeps ready label peers useful while its firs
    {
     const std::lock_guard lock(mutex);
     peers.insert(id);
+    if (peers.size() == ids.size() - 1 && !peer_delivered.exchange(true)) peer_written.set_value();
    }
-   if (!peer_delivered.exchange(true)) peer_written.set_value();
   }
  };
  auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, nullptr, &custom); });
@@ -8746,12 +8753,12 @@ TEST_CASE("custom source admission keeps ready label peers useful while its firs
   first.Release();
  });
  REQUIRE(first.WaitEntered(5s));
- mmltk::testsupport::await_test_promise(peer_written, "independent ready label writes before the first selected result", 5s);
+ mmltk::testsupport::await_test_promise(peer_written, "every independent label refills the window before the first selected result", 5s);
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  {
   const std::lock_guard lock(mutex);
   CHECK_FALSE(peers.empty());
-  CHECK(peers.size() <= 7);  // Four lanes admit eight uncollected claims, including the held first image.
+  CHECK(peers.size() == ids.size() - 1);
  }
  first.Release();
  mmltk::testsupport::await_test_future(compiling, "bounded custom label ready-window completion", 5s);
@@ -8792,4 +8799,138 @@ TEST_CASE("native PNG normalization borrows the pinned compile context with reta
   CHECK(execution.resource_usage().bytes==encoded.size());
  }
  row={}; CHECK(execution.resource_usage().bytes==0); CHECK(execution.snapshot().workspace_reuses>=1);
+}
+
+TEST_CASE("one physical artifact refills from completed pixels while its first consumer is held", "[benchmark][coconut][pipeline]") {
+ using namespace std::chrono_literals;
+ if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPUs");
+ ScopedTempDir directory("physical-publication-window");
+ const auto cache = BenchmarkCacheLayout::create(directory.path() / "cache");
+ const auto archive = cache.source_downloads("coco") / "physical.tar";
+ std::vector<std::pair<std::string, std::string>> members;
+ for (unsigned id = 1; id <= 12; ++id) members.emplace_back(coco(id).member, white_jpeg());
+ tar(archive, members);
+ const auto catalog = base_physical_catalog(archive, members.size());
+ bool warm = false, mixed = false;
+ SECTION("cold forward source") {}
+ SECTION("retained physical inventory") { warm = true; }
+ SECTION("retained healthy peers with missing input") { warm = mixed = true; }
+ if (warm) {
+  PhysicalMembershipFixture cached(cache, catalog);
+  if (mixed) std::filesystem::remove(cached_image_path(cache.source_images("coco") / "train2017", 2));
+ }
+ auto admitted = local_physical_archives(cache, catalog);
+ BenchmarkCompilePipeline pipeline(4);
+ CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline);
+ PreparedBenchmarkSplit split; split.name = "train"; split.class_names = {"person"};
+ struct Observed {
+  mmltk::testsupport::TestGate held{"first physical pixel retains its completion"};
+  std::atomic<unsigned> completed{0};
+  std::promise<void> independent;
+  unsigned expected = 12;
+ } observed;
+ observed.expected = mixed ? 11 : 12;
+ BenchmarkWriteRequest request{.split = split, .output_path = directory.path() / "pixels.bin", .resolution = 3, .num_workers = 4,
+  .progress = {.context = &observed, .image_completed = [](void* context) {
+   auto& value = *static_cast<Observed*>(context);
+   const auto count = value.completed.fetch_add(1);
+   if (!count) value.held.receipt().ArriveAndWait();
+   else if (count + 1 == value.expected) value.independent.set_value();
+  }}, .execution = &pipeline};
+ BenchmarkSplitWriter writer(request, true);
+ BenchmarkCompilePipeline::Attempt attempt(pipeline);
+ pipeline.bind_source(physical.identity_root(CoconutImageNamespace::CocoTrain), writer, AnnotationSource::CoconutCoco);
+ physical.admitted(admitted.front(), admitted.front().download);
+ auto consuming = std::async(std::launch::async, [&] { return physical.consume(admitted.front(), {}, warm && !mixed); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { observed.held.Release(); });
+ REQUIRE(observed.held.WaitEntered(5s));
+ mmltk::testsupport::await_test_promise(observed.independent, "same-artifact pixels refill past a held first completion", 5s);
+ CHECK(consuming.wait_for(0ms) == std::future_status::timeout);
+ CHECK_FALSE(physical.discovery_complete());
+ observed.held.Release();
+ const auto complete = mmltk::testsupport::await_test_future(consuming, "physical publication window drain", 5s);
+ if (!complete) REQUIRE(physical.consume(admitted.front()));
+ CHECK(writer.completed() == members.size());
+ CHECK(physical.summary(admitted.front()).image_count == members.size());
+ CHECK(physical.discovery_complete());
+}
+
+TEST_CASE("custom COCO labels and pixels progress before unrelated metadata and image inputs settle", "[benchmark][pipeline][annotations]") {
+ using namespace std::chrono_literals;
+ bool hold_images = false;
+ SECTION("COCO pixels and labels precede the supplemental metadata join") {}
+ SECTION("canvas labels precede their held JPEG source") { hold_images = true; }
+ ScopedTempDir directory("custom-independent-canvas-labels");
+ LocalCoconutRecipe local(directory.path());
+ auto catalog = local_custom_catalog(local);
+ auto config = local.compiler_config({BenchmarkDatasetVariant::CocoCustom, CoconutValidation::Stock});
+ config.num_workers = 1;
+ std::atomic<bool> cancelled{false}, label_seen{false}, image_seen{false};
+ config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ auto metadata = ArtifactLease::acquire(local.cache.locks / "objects365-annotations.lifecycle.lock", {});
+ auto images = hold_images ? ArtifactLease::acquire(local.cache.locks / "coco-train2017.images.lock", {}) : ArtifactLease{};
+ const auto root = local.cache.source_images("coco") / "train2017";
+ std::promise<void> labels, pixels;
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event == "benchmark.labels.slot_written") {
+   const auto value = Json::parse(fields);
+   if (value.at("root").get<std::string>() == root.string() && value.at("image_id") == 7 && !label_seen.exchange(true)) labels.set_value();
+  }
+  if (event == "benchmark.images.complete" && Json::parse(fields).at("root").get<std::string>() == root.string() && !image_seen.exchange(true)) pixels.set_value();
+ };
+ auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, nullptr, &catalog); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled = true; images = {}; metadata = {}; });
+ mmltk::testsupport::await_test_promise(labels, "canvas labels complete before held unrelated metadata", 5s);
+ if (hold_images) CHECK_FALSE(image_seen.load());
+ else mmltk::testsupport::await_test_promise(pixels, "physical COCO completion precedes the supplemental metadata join", 5s);
+ CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
+ images = {};
+ metadata = {};
+ mmltk::testsupport::await_test_future(compiling, "independent custom sources retain canonical final selection", 10s);
+ check_custom_compilation(local.output);
+}
+
+TEST_CASE("physical cached failures share bounded ordered repair on the retained archive generation", "[benchmark][coconut][archive][cache]") {
+ const bool compressed = GENERATE(false, true);
+ ScopedTempDir directory("physical-collected-cache-repair");
+ const auto cache = BenchmarkCacheLayout::create(directory.path() / "cache");
+ const auto archive = cache.source_downloads("coco") / (compressed ? "physical.tar.gz" : "physical.tar");
+ const auto jpeg = white_jpeg();
+ const std::array<std::pair<std::string, std::string>, 3> members{{{coco(1).member, jpeg}, {coco(2).member, jpeg}, {coco(3).member, jpeg}}};
+ tar(archive, members);
+ const auto catalog = base_physical_catalog(archive, members.size());
+ { PhysicalMembershipFixture cached(cache, catalog); }
+ const auto images = cache.source_images("coco") / "train2017";
+ const auto peer = cached_image_path(images, 3);
+ struct stat before{};
+ REQUIRE(::stat(peer.c_str(), &before) == 0);
+ auto admitted = local_physical_archives(cache, catalog);
+ BenchmarkCompilePipeline pipeline(1);
+ CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline);
+ PreparedBenchmarkSplit split; split.name = "train"; split.class_names = {"person"};
+ std::array<unsigned, 3> opens{};
+ BenchmarkSplitWriter writer({.split = split, .output_path = directory.path() / "pixels.bin", .resolution = 3, .num_workers = 1,
+  .image_opened = [&](const auto&, std::uint64_t id) {
+   const auto attempt = ++opens.at(id - 1);
+   if (id == 1 && attempt == 2) {
+    // The forward owner is open before the second cached decode. Collected
+    // raw extents or gzip replay must retain that inode after path replacement.
+    std::filesystem::rename(archive, archive.string() + ".opened");
+    mmltk::testsupport::write_text_file(archive, "replacement is not an archive");
+   }
+   if (id < 3 && attempt <= 2) throw BenchmarkImageError("injected cached image read failure");
+  }, .execution = &pipeline}, true);
+ BenchmarkCompilePipeline::Attempt attempt(pipeline);
+ pipeline.bind_source(physical.identity_root(CoconutImageNamespace::CocoTrain), writer, AnnotationSource::CoconutCoco);
+ physical.admitted(admitted.front(), admitted.front().download);
+ REQUIRE(physical.consume(admitted.front()));
+ CHECK(opens == std::array<unsigned, 3>{3, 3, 1});
+ CHECK(writer.completed() == members.size());
+ CHECK(physical.summary(admitted.front()).image_count == members.size());
+ CHECK(physical.summary(admitted.front()).image_bytes == members.size() * jpeg.size());
+ struct stat after{};
+ REQUIRE(::stat(peer.c_str(), &after) == 0);
+ CHECK(after.st_ino == before.st_ino);
+ CHECK(file_bytes(peer) == jpeg);
+ CHECK(physical.discovery_complete());
 }

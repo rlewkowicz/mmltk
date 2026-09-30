@@ -72,9 +72,19 @@ public:
  // Release decoder/buffer capacity between discovery and later consumption.
  // The opened inode and encountered positions stay bound to this generation.
  void pause();
+ // Quiesce an active forward cursor under resource pressure. The next read or
+ // advance restores this exact consumed position on the retained inode.
+ void suspend();
+ // Replace the next decoder's continuation only after its physical storage
+ // retires. The opened file retains its original descriptor ancestry.
+ void suspend(const CompileAllowance& parent);
  // The next consumer supplies its continuation; retained inode custody stays
  // with the original file allowance until that physical descriptor closes.
  void resume(std::uint64_t workspace, const CompileAllowance& parent = {}, std::size_t consumer_descriptors = 0);
+ // A source already retaining input cannot block behind a new exclusive
+ // lineage. Admit the complete serial decoder and descriptor before restoring;
+ // false retains only the opened inode and paused cursor.
+ [[nodiscard]] bool try_resume(std::uint64_t workspace, const CompileAllowance& parent = {}, std::size_t consumer_descriptors = 0);
  // Grow a live consumer envelope without reopening or discarding its seek state.
  bool try_resize_workspace(std::uint64_t workspace);
  [[nodiscard]] bool has_member(const std::string&) const;
@@ -99,6 +109,7 @@ public:
  void cpu(const std::function<void()>&) const;
 
 private:
+ void restore(mmltk::common::concurrency::CancellationObservation);
  struct Impl;
  std::unique_ptr<Impl> impl_;
 };

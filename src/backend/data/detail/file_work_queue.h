@@ -35,6 +35,10 @@ public:
  // the caller still owns settlement and may retry only the full outcome.
  // Execution interruption is checked before either acceptance or the full result.
  [[nodiscard]] std::optional<CompileExecution::Completion> try_submit(Operation);
+ // Advisory only: reserves no record and shares try_submit's terminal policy.
+ // Compile callers capture admission_generation before this predicate and wait
+ // on that observation; capacity return and cancellation notify the execution.
+ [[nodiscard]] bool has_capacity() const;
  [[nodiscard]] CompileExecution::Completion submit(Operation);
  void join();
  // Settle unstarted operations and interrupt local service admission. Running

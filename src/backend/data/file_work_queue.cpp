@@ -39,6 +39,10 @@ struct FileWorkQueue::Impl {
  std::uint64_t generation = 0;
  bool stopping = false, shutdown = false;
  explicit Impl(std::size_t capacity) : records(capacity) { if (!capacity) throw std::invalid_argument("file queue requires prepared records"); }
+ void check_admission() const {
+  if (stopping) throw std::runtime_error("file queue admission after stop");
+  if (execution) if (const auto error = execution->interruption()) std::rethrow_exception(error);
+ }
  // Lock order is queue then execution admission. Readiness delivery takes only
  // the queue lock, after the execution owner has released its admission lock.
  void update_demand() noexcept {
@@ -173,8 +177,7 @@ std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation 
  const auto service_class=static_cast<std::size_t>(operation.service_class);
  if (service_class>=impl_->class_pending.size()) throw std::invalid_argument("invalid file operation service class");
  std::unique_lock lock(impl_->mutex);
- if (impl_->stopping) throw std::runtime_error("file queue admission after stop");
- if (impl_->execution) if (const auto error = impl_->execution->interruption()) std::rethrow_exception(error);
+ impl_->check_admission();
  const auto position = std::ranges::find(impl_->records, Impl::State::Free, &Impl::Record::state);
  if (position == impl_->records.end()) return {};
  // Prepare every fallible owner before publishing the record. In particular,
@@ -203,6 +206,11 @@ std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation 
  impl_->update_demand(); ++impl_->generation;
  lock.unlock(); impl_->changed.notify_all(); return result;
 }
+bool FileWorkQueue::has_capacity() const {
+ const std::lock_guard lock(impl_->mutex);
+ impl_->check_admission();
+ return impl_->pending < impl_->records.size();
+}
 CompileExecution::Completion FileWorkQueue::submit(Operation operation) {
  if (impl_->execution && impl_->execution->on_lane()) throw std::logic_error("blocking file admission inside a compile lane");
  for (;;) {
@@ -219,6 +227,7 @@ void FileWorkQueue::cancel() noexcept {
  // here even while every service is in a physical call. Local stop withdraws
  // only this queue's demand and never interrupts the execution owner.
  impl_->changed.notify_all();
+ if (impl_->execution) impl_->execution->notify_admission_change();
  for (std::size_t index = 0; index < impl_->records.size(); ++index) {
   {
    const std::lock_guard lock(impl_->mutex);

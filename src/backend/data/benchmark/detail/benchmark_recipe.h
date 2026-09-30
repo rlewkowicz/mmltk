@@ -56,7 +56,8 @@ struct CustomRecipePreparation {
 };
 [[nodiscard]] CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CustomRecipeCatalog&, ProgressReporter&, std::size_t,
  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::span<const int> worker_cpus = {}, BenchmarkCompilePipeline* execution = nullptr,
- CompileAllowance preparation = {});
+ CompileAllowance preparation = {}, CocoAnnotationSplitSink coco_ready = {},
+ std::function<void(const NormalizedAnnotationReadView&)> selected_ready = {});
 }  // namespace mmltk::backend::data::benchmark_internal
 namespace mmltk::backend::data::benchmark_internal {
 struct CoconutRecipeInputs;

@@ -66,6 +66,8 @@ using Cancellation = mmltk::common::concurrency::CancellationObservation;
 using mmltk::common::math::checked_add;
 using mmltk::common::math::checked_cast;
 std::uint64_t archive_workspace(bool compressed, std::size_t workers, std::uint64_t workspace) {
+ // Ordinary forward gzip uses the ISA-L stream, the 128-KiB read block,
+ // compressed BitReader input, and bounded library state within 4 MiB.
  // Each parallel chunk retains at most 32 MiB of symbols (64 MiB while
  // markers are present), bounded control vectors, compressed input and decode
  // scratch. At most 1024 old 32-KiB windows (under 40 MiB with compression
@@ -75,7 +77,7 @@ std::uint64_t archive_workspace(bool compressed, std::size_t workers, std::uint6
  // C=max(16,w) cache slots, 2w prefetch slots and <=w decoder futures are live.
  // Opt-in bounded fetchers keep no detached speculative marker futures.
  // Control-table exhaustion retires all slots before serial replay.
- const auto backing = compressed ? checked_add((std::max<std::size_t>(16, workers) + 3 * workers) * (84ULL << 20), kGzipIndexBytes, "archive seek workspace overflow") : (4ULL << 20);
+ const auto backing = compressed && workers > 1 ? checked_add((std::max<std::size_t>(16, workers) + 3 * workers) * (84ULL << 20), kGzipIndexBytes, "archive seek workspace overflow") : (4ULL << 20);
  return checked_add(backing, workspace, "archive workspace overflow");
 }
 bool gzip_magic(const mmltk::common::io::FileHandle& file, std::uint64_t bytes) {
@@ -127,6 +129,7 @@ struct BenchmarkArchive::Impl {
  std::unique_ptr<rapidgzip::ParallelGzipReader<ArchiveChunk>> gzip;
  std::unique_ptr<rapidgzip::IsalInflateWrapper> streaming;
  rapidgzip::CRC32Calculator stream_crc;
+ std::uint32_t stream_member_bytes = 0;
  std::uint64_t stream_offset = 0;
  bool streaming_mode = false, stream_boundary = false, rolling_windows = false, control_capacity_reached = false;
  Cancellation cancellation;
@@ -145,6 +148,7 @@ struct BenchmarkArchive::Impl {
  std::size_t consumer_descriptors = 0;
  std::uint64_t workspace_bytes = 0;
  Position current;
+ std::optional<MemberPosition> suspended;
  Impl(const std::filesystem::path& path, CompileExecution* owner, std::uint64_t workspace, const CompileAllowance& parent, std::size_t workers, bool verify_gzip_crc,
   CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t dependent_descriptors, std::size_t gzip_index_entries)
      : execution(owner),
@@ -186,7 +190,7 @@ struct BenchmarkArchive::Impl {
   if (reader) return;
   workspace_bytes = workspace;
   external_cpus = false;
-  owns_workspace = false;
+  if (!credits) owns_workspace = false;
   if (execution) {
    const auto workspace_for = [&](std::size_t workers) { return archive_workspace(compressed, workers, workspace); };
    if (supplied_workspace) {
@@ -195,7 +199,7 @@ struct BenchmarkArchive::Impl {
    }
    // The fixed grant includes the calling CPU and decoder workers, leaving a
    // CPU for consumers. Otherwise use a cooperatively admitted serial reader.
-   if (!credits && compressed && requested_decoders > 1 && execution->workers() > 3) {
+   if (!credits && compressed && !streaming_mode && requested_decoders > 1 && execution->workers() > 3) {
     for (auto wanted = std::min(execution->workers() - 1, requested_decoders + 1); wanted > 2; --wanted) {
      auto available = execution->try_reserve({workspace_for(wanted - 1), 0, consumer_descriptors == 0, wanted, false, consumer_descriptors}, parent_allowance);
      if (available) {
@@ -216,6 +220,7 @@ struct BenchmarkArchive::Impl {
     owns_workspace = true;
    }
   }
+  streaming_mode = compressed && decoders == 1;
   block.resize(kBlock);
   if (compressed && execution && !decoder_allowance) decoder_allowance = execution->reserve(CompileResources::handles(1), parent_allowance);
   cpu([&] { if (compressed) reset_decoder(); open(0); });
@@ -232,6 +237,7 @@ struct BenchmarkArchive::Impl {
    streaming->setStartWithHeader(true);
    streaming->setStoppingPoints(rapidgzip::StoppingPoint::END_OF_STREAM);
    stream_offset = 0;
+   stream_member_bytes = 0;
    stream_boundary = false;
    stream_crc.reset();
    stream_crc.setEnabled(verify_crc);
@@ -257,9 +263,12 @@ struct BenchmarkArchive::Impl {
    throw_if_benchmark_cancelled(cancellation);
    const auto [read, footer] = streaming->readStream(reinterpret_cast<std::uint8_t*>(output), count);
    stream_crc.update(output, read);
+   stream_member_bytes += static_cast<std::uint32_t>(read);
    stream_offset = checked_add(stream_offset, read, "gzip stream offset overflow");
    if (footer) {
     (void)stream_crc.verify(footer->gzipFooter.crc32);
+    if (stream_member_bytes != footer->gzipFooter.uncompressedSize) throw BenchmarkArchiveError("consumed gzip member size mismatch");
+    stream_member_bytes = 0;
     stream_crc.reset();
     stream_boundary = true;
    } else if (read)
@@ -396,6 +405,7 @@ BenchmarkArchive::BenchmarkArchive(const std::filesystem::path& path, CompileExe
     : impl_(std::make_unique<Impl>(path, execution, workspace, parent, workers, verify_gzip_crc, std::move(workspace_allowance), retained_gzip_windows, consumer_descriptors, gzip_index_entries)) {}
 BenchmarkArchive::~BenchmarkArchive() = default;
 bool BenchmarkArchive::next(Cancellation cancellation) {
+ restore(cancellation);
  auto& s = *impl_;
  s.cancellation = cancellation;
  throw_if_benchmark_cancelled(cancellation);
@@ -469,6 +479,7 @@ void BenchmarkArchive::require_regular(std::uint64_t limit) const {
  if (impl_->positions.at(member()).conflict) throw BenchmarkArchiveError("conflicting consumed archive member: " + member());
 }
 void BenchmarkArchive::consume(std::uint64_t limit, const std::function<void(std::span<const std::uint8_t>, std::uint64_t)>& consumer, Cancellation cancellation) {
+ restore(cancellation);
  auto& s = *impl_;
  s.cancellation = cancellation;
  require_regular(limit);
@@ -533,6 +544,7 @@ void BenchmarkArchive::consume(std::uint64_t limit, const std::function<void(std
  }
 }
 void BenchmarkArchive::read_into(std::span<std::uint8_t> output, Cancellation cancellation) {
+ restore(cancellation);
  if (size() != output.size()) throw BenchmarkArchiveError("archive member size disagrees with destination");
  if (impl_->direct) {
   require_regular(output.size());
@@ -543,6 +555,7 @@ void BenchmarkArchive::read_into(std::span<std::uint8_t> output, Cancellation ca
  consume(output.size(), [&](std::span<const std::uint8_t> bytes, std::uint64_t offset) { std::memcpy(output.data() + offset, bytes.data(), bytes.size()); }, cancellation);
 }
 std::span<const std::uint8_t> BenchmarkArchive::read(std::uint64_t limit, Cancellation cancellation) {
+ restore(cancellation);
  require_regular(limit);
  impl_->bytes.resize(checked_cast<std::size_t>(size(), "archive member size overflow"));
  read_into(impl_->bytes, cancellation);
@@ -550,6 +563,7 @@ std::span<const std::uint8_t> BenchmarkArchive::read(std::uint64_t limit, Cancel
 }
 bool BenchmarkArchive::seek(std::string_view member, Cancellation cancellation) {
  auto& s = *impl_;
+ s.suspended.reset();
  const auto found = s.positions.find(std::string(member));
  if (found == s.positions.end()) return false;
  const auto position = found->second;
@@ -577,6 +591,7 @@ bool BenchmarkArchive::seek(std::string_view member, Cancellation cancellation) 
 }
 void BenchmarkArchive::visit_known(std::span<const std::string> members, const std::function<void(std::size_t)>& consume, Cancellation cancellation) {
  auto& s = *impl_;
+ s.suspended.reset();
  struct Required {
   std::size_t index;
   Impl::Position position;
@@ -622,6 +637,21 @@ void BenchmarkArchive::visit_known(std::span<const std::string> members, const s
   consume(required.index);
  }
 }
+void BenchmarkArchive::suspend() {
+ if (!impl_->reader) { pause(); return; }
+ const auto position = impl_->started || impl_->direct ? std::optional(member_position()) : std::nullopt;
+ pause();
+ impl_->suspended = position;
+}
+void BenchmarkArchive::suspend(const CompileAllowance& parent) {
+ suspend();
+ impl_->parent_allowance = parent;
+}
+void BenchmarkArchive::restore(Cancellation cancellation) {
+ if (!impl_->suspended) return;
+ auto position = std::exchange(impl_->suspended, {});
+ if (!seek(*position, cancellation)) throw BenchmarkArchiveError("suspended archive cursor disappeared from its opened generation");
+}
 void BenchmarkArchive::pause() {
  auto& s = *impl_;
  s.reader.reset();
@@ -641,6 +671,25 @@ void BenchmarkArchive::resume(std::uint64_t workspace, const CompileAllowance& p
  impl_->parent_allowance = parent;
  impl_->consumer_descriptors = consumer_descriptors;
  impl_->resume(workspace);
+}
+bool BenchmarkArchive::try_resume(std::uint64_t workspace, const CompileAllowance& parent, std::size_t consumer_descriptors) {
+ auto& s = *impl_;
+ if (s.reader) throw std::logic_error("archive continuation handoff requires a paused reader");
+ if (!s.execution) { resume(workspace, parent, consumer_descriptors); return true; }
+ auto admitted = s.execution->try_reserve({archive_workspace(s.compressed, 1, workspace), s.compressed ? 1U : 0U,
+  consumer_descriptors == 0, 0, false, consumer_descriptors}, parent);
+ if (!admitted) return false;
+ auto previous_parent = std::exchange(s.parent_allowance, parent);
+ s.consumer_descriptors = consumer_descriptors;
+ s.decoders = 1;
+ s.credits = std::move(*admitted);
+ s.owns_workspace = true;
+ // This complete grant includes the descriptor duplicated by the serial gzip
+ // decoder. Its alias suppresses any second, potentially blocking reservation.
+ if (s.compressed) s.decoder_allowance = s.credits;
+ try { s.resume(workspace); }
+ catch (...) { pause(); s.parent_allowance = std::move(previous_parent); throw; }
+ return true;
 }
 bool BenchmarkArchive::try_resize_workspace(std::uint64_t workspace) {
  auto& s = *impl_;

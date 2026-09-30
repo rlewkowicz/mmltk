@@ -175,11 +175,13 @@ BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(const std::filesystem:
 }
 BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(int directory, std::uint64_t id, std::span<const std::uint8_t> encoded, BenchmarkImageHeader header, Cancellation cancellation,
  detail::StorageReservationPool& storage, CompileExecution* execution, CompileAllowance input, bool retain_mapping) {
+ // The descriptor grant protects publication only. The returned mapping owns
+ // its inode without retaining the source arena that an exceptional pixel must drain.
  auto mapping = execution && retain_mapping ? execution->try_reserve(CompileResources::handles(1), input) : std::optional<CompileAllowance>{};
  std::array<char, 24> relative{};
  const auto length = format_cached_image_relative_path(id, relative);
  return publish(
-  {}, encoded, cancellation, storage, header, mapping.value_or(std::move(input)), retain_mapping && (!execution || mapping.has_value()), directory, std::string_view(relative.data(), length));
+  {}, encoded, cancellation, storage, header, {}, retain_mapping && (!execution || mapping.has_value()), directory, std::string_view(relative.data(), length));
 }
 BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(const std::filesystem::path& path, std::span<const std::uint8_t> encoded, Cancellation cancellation, detail::StorageReservationPool* storage,
  std::optional<BenchmarkImageHeader> header, CompileAllowance allowance, bool retain_mapping, int directory, std::string_view relative) {
