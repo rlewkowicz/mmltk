@@ -11,8 +11,10 @@
 #include <optional>
 #include <source_location>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <stop_token>
+#include <utility>
 #include <vector>
 
 namespace mmltk::backend::data::detail {
@@ -179,10 +181,33 @@ public:
  // destructor joins callbacks, so captured owner state cannot outlive custody.
  class Readiness final {
  public:
-  Readiness(CompileExecution&, std::function<void()>);
+  struct Changes {
+   bool resources = false, pressure = false, interrupted = false;
+   // Resource/pressure changes from outside an unsuccessful local attempt.
+   // CPU-only scheduler activity never requests a resource retry.
+   bool retry = false;
+  };
+  Readiness(CompileExecution&, std::function<void(Changes)>);
   ~Readiness();
   Readiness(const Readiness&) = delete;
   Readiness& operator=(const Readiness&) = delete;
+  // Thread-local provenance covers a nonblocking draw and all of its rollback.
+  // Readers still receive its changes; this registration retries only external
+  // changes unless the complete draw commits. Other registrations are unaffected.
+  class Attempt final {
+  public:
+   explicit Attempt(Readiness*);
+   ~Attempt();
+   Attempt(const Attempt&) = delete;
+   Attempt& operator=(const Attempt&) = delete;
+   void commit() noexcept { committed_ = true; }
+  private:
+   friend struct Impl;
+   static thread_local Attempt* current_;
+   Readiness* owner_;
+   Attempt* previous_;
+   bool resources_ = false, pressure_ = false, committed_ = false;
+  };
  private:
   struct State;
   friend struct Impl;

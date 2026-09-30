@@ -198,11 +198,11 @@ struct BenchmarkCurl::Impl {
   }
   ensure_curl_global_initialized("cannot initialize benchmark Curl: ");
   require_supported_curl();
-  if (execution) readiness = std::make_unique<CompileExecution::Readiness>(*execution, [this, prior = CompileResources{}]() mutable {
-   const auto now = execution->resource_usage();
-   if (now.bytes == prior.bytes && now.descriptors == prior.descriptors && now.continuation_descriptors == prior.continuation_descriptors) return;
-   prior = now;
-   const std::lock_guard lock(mutex); notify_readers_locked(); wake_locked();
+  if (execution) readiness = std::make_unique<CompileExecution::Readiness>(*execution, [this](CompileExecution::Readiness::Changes changes) {
+   if (!changes.resources && !changes.pressure && !changes.interrupted) return;
+   const std::lock_guard lock(mutex);
+   notify_readers_locked();
+   if (changes.retry || changes.interrupted) wake_locked();
   });
   worker = std::jthread([this] { run(); });
  }
@@ -454,6 +454,10 @@ struct BenchmarkCurl::Impl {
   }
  }
  bool admit(Queue& queue, std::size_t aggregate) {
+  // This scope precedes every temporary credit so failed partial draws unwind
+  // under their own provenance. A racing external return remains a retry even
+  // when the event owner coalesces it with this rollback.
+  CompileExecution::Readiness::Attempt attempt(readiness.get());
   auto& candidate = queue.front();
   const auto defer = [&] {
    // Nonblocking transport admission must advertise pressure too. Otherwise
@@ -512,6 +516,7 @@ struct BenchmarkCurl::Impl {
   const auto status = curl_multi_add_handle(multi.get(), handle);
   if (status != CURLM_OK) throw std::runtime_error(std::string("cannot admit benchmark transfer: ") + curl_multi_strerror(status));
   ++policy(position->second->channel->kind).active;
+  attempt.commit();
   return true;
  }
  void run() noexcept {

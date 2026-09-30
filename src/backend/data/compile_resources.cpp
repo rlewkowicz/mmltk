@@ -34,9 +34,9 @@ void CompileAllowance::retire_descriptors() const noexcept {
   const std::lock_guard lock(owner.mutex);
   const auto closed = std::exchange(credits_->resources.descriptors, 0);
   const auto unused = std::exchange(credits_->available, 0);
-  credits_->descriptors_retired = true;
+  const bool already_retired = std::exchange(credits_->descriptors_retired, true);
   credits_->resources.continuation_descriptors = 0;
-  owner.return_descriptors(*credits_, closed, unused);
+  if (!already_retired || closed || unused) owner.return_descriptors(*credits_, closed, unused);
  }
  owner.changed.notify_all();
 }
@@ -46,9 +46,9 @@ void CompileAllowance::release_unused_continuation() const noexcept {
  {
   const std::lock_guard lock(owner.mutex);
   const auto unused = std::exchange(credits_->available, 0);
-  credits_->continuations_released = true;
+  const bool already_released = std::exchange(credits_->continuations_released, true);
   credits_->resources.continuation_descriptors -= unused;
-  owner.return_descriptors(*credits_, 0, unused);
+  if (!already_released || unused) owner.return_descriptors(*credits_, 0, unused);
  }
  owner.changed.notify_all();
 }
@@ -67,6 +67,7 @@ CompileAllowance CompileAllowance::split_storage(std::uint64_t bytes) {
   credits_->resources.bytes -= bytes;
   if (!credits_->resources.bytes) credits_->workspace_loans.retire();
   storage->charged = true;
+  owner.notify(CompileAdmission::Change::Resources);
  }
  return CompileAllowance(std::move(storage));
 }

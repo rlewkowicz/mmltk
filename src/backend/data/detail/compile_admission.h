@@ -3,9 +3,15 @@
 #include "src/common/math/checked_arithmetic.h"
 #include <algorithm>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <source_location>
+#include <span>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 namespace mmltk::backend::data::detail {
 // Credits form only the actual dependent ownership chain. Children keep their
@@ -70,6 +76,7 @@ struct CompileAllowance::Credits {
 };
 struct CompileAdmission {
  using Credits = CompileAllowance::Credits;
+ enum class Change { Scheduling, Resources, Pressure, Interruption };
  struct Eligibility {
   bool fits = false;
   std::uint64_t loan_bytes = 0;
@@ -77,7 +84,9 @@ struct CompileAdmission {
  std::mutex mutex;
  std::condition_variable changed;
  std::uint64_t generation = 0;
- std::function<void()> transport_wakeup;
+ // Called only under mutex; publication records readiness and signals the
+ // existing event owner. User callbacks run later, outside this mutex.
+ std::function<void(Change)> publish_change;
  std::function<void(std::span<const std::size_t>)> release_cpus;
  std::size_t protected_cpus = 0;
  std::uint64_t target = 0, bytes = 0, handle_bytes = 0, offered_bytes = 0;
@@ -85,10 +94,24 @@ struct CompileAdmission {
  // Credits sentinel, preventing reentry/resize without joining unrelated loans.
  std::vector<std::shared_ptr<CompileWorkspaceOffer>> workspace_offers;
  std::size_t descriptor_capacity = 0, descriptors = 0, committed = 0;
- std::size_t cpu_capacity = 0, active = 0, external_cpus = 0, waiters = 0, resource_waiters = 0;
+ std::size_t cpu_capacity = 0, active = 0, external_cpus = 0, waiters = 0, resource_waiters = 0, resource_jobs = 0;
  std::size_t withdrawals = 0;
  bool tracing = false;
  std::vector<Credits*> observed_credits;
+ void notify(Change change) noexcept {
+  // Pressure registration must not invalidate its own failed reserve attempt.
+  if (change != Change::Pressure) ++generation;
+  changed.notify_all();
+  if (publish_change) publish_change(change);
+ }
+ [[nodiscard]] bool pressure() const noexcept { return resource_waiters || resource_jobs; }
+ void change_job_pressure(bool before, bool after) noexcept {
+  if (before == after) return;
+  const auto previous = pressure();
+  if (after) ++resource_jobs;
+  else --resource_jobs;
+  if (previous != pressure()) notify(Change::Pressure);
+ }
  [[nodiscard]] std::size_t descriptor_ceiling(CompileResources value) const {
   // An explicit dependent promise already reserves consumer headroom. Count
   // that capacity once; otherwise persistent output files can strand every
@@ -168,8 +191,7 @@ struct CompileAdmission {
   credit.borrowed -= returned;
   committed += returned;
   return_promise(credit.parent.get(), returned);
-  ++generation;
-  if (transport_wakeup) transport_wakeup();
+  notify(Change::Resources);
  }
  static bool covers(const Credits& credit, CompileResources demand) {
   const auto held = credit.resources;
@@ -196,6 +218,7 @@ struct CompileAdmission {
   credit.borrowed = borrowed;
   if (credit.parent) credit.parent->available -= borrowed;
   credit.charged = true;
+  notify(value.bytes || value.descriptors || value.continuation_descriptors ? Change::Resources : Change::Scheduling);
   if (tracing)
    try {
     observed_credits.push_back(&credit);
@@ -209,13 +232,13 @@ struct CompileAdmission {
   if (!credit.workspace_retirement_pending || credit.cpu_users || credit.workspace_offer) return {};
   credit.workspace_retirement_pending = false;
   auto& value = credit.resources;
+  const bool resources_changed = value.bytes || !credit.workspace_loans.empty() || (!credit.borrowed && credit.parent);
   external_cpus -= std::exchange(value.cpu_workers, 0);
   if (!credit.cpu_lanes.empty() && release_cpus) release_cpus(credit.cpu_lanes);
   credit.cpu_lanes.clear();
   (value.retained_handles ? handle_bytes : bytes) -= std::exchange(value.bytes, 0);
   credit.workspace_loans.retire();
-  ++generation;
-  if (transport_wakeup) transport_wakeup();
+  notify(resources_changed ? Change::Resources : Change::Scheduling);
   // Live descriptor draws still need their producing promise chain. Storage
   // descendants retain their own charges and loans regardless of this parent.
   return credit.borrowed ? std::shared_ptr<Credits>{} : std::move(credit.parent);
@@ -234,12 +257,12 @@ struct CompileAdmission {
    // destruction. Return the borrowed promise atomically with physical release.
    committed = committed - credit.available + credit.borrowed;
    return_promise(credit.parent.get(), credit.borrowed);
-   ++generation;
-   if (transport_wakeup) transport_wakeup();
+   notify(value.bytes || value.descriptors || credit.available || credit.borrowed ? Change::Resources : Change::Scheduling);
   }
   changed.notify_all();
  }
  void change_waiters(bool add, bool resource) {
+  const auto previous = pressure();
   if (add) {
    ++waiters;
    resource_waiters += resource;
@@ -248,7 +271,8 @@ struct CompileAdmission {
    resource_waiters -= resource;
   }
   changed.notify_all();
-  if (transport_wakeup) transport_wakeup();
+  if (previous != pressure()) notify(Change::Pressure);
+  else if (publish_change) publish_change(Change::Scheduling);
  }
  struct Waiter {
   CompileAdmission& owner;
@@ -276,8 +300,7 @@ struct CompileAdmission {
    if (offer_->bytes) owner.workspace_offers.push_back(offer_);
    producer_->workspace_offer = offer_;
    owner.offered_bytes = total;
-   ++owner.generation;
-   owner.changed.notify_all();
+   owner.notify(Change::Resources);
   }
   ~OfferScope() noexcept {
    auto& owner = *producer_->owner;
@@ -285,8 +308,7 @@ struct CompileAdmission {
    std::unique_lock lock(owner.mutex);
    if (offer_->bytes) std::erase(owner.workspace_offers, offer_);
    owner.offered_bytes -= offer_->bytes;
-   ++owner.generation;
-   owner.changed.notify_all();
+   owner.notify(Change::Resources);
    if (offer_->borrowers) {
     // Withdrawal prevents new borrowers first. Actual idle/active storage must
     // retire even on callback failure/cancellation; this wait needs no polling
@@ -298,7 +320,7 @@ struct CompileAdmission {
    }
    producer_->workspace_offer.reset();
    retired_parent = owner.retire_workspace(*producer_);
-   owner.changed.notify_all();
+   owner.notify(Change::Resources);
   }
   OfferScope(const OfferScope&) = delete;
   OfferScope& operator=(const OfferScope&) = delete;

@@ -65,7 +65,10 @@ struct CompileExecution::Job {
 struct CompileExecution::Readiness::State {
  std::mutex mutex;
  std::condition_variable changed;
- std::function<void()> callback;
+ std::function<void(Changes)> callback;
+ // Pending notices are published and acknowledged under admission->mutex.
+ Changes pending;
+ bool notified = false;
  bool active = false, removed = false;
 };
 struct CompileExecution::Impl {
@@ -134,7 +137,7 @@ struct CompileExecution::Impl {
  std::array<Class, class_count> classes;
  std::array<std::list<std::shared_ptr<Job>>, kind_count> ready;
  std::list<std::shared_ptr<Job>> jobs;
- std::vector<std::weak_ptr<Readiness::State>> observers;
+ std::vector<std::shared_ptr<Readiness::State>> observers;
  std::size_t cursor = 0, record_limit = 0, services = 0;
  std::uint64_t admitted = 0, completed = 0;
  bool stopping = false, shutdown = false, floors = true;
@@ -147,10 +150,33 @@ struct CompileExecution::Impl {
  mmltk::common::io::ScopedFd event;
  std::jthread notifier;
  std::unique_ptr<mmltk::common::concurrency::WorkerPool> pool;
- void notify_locked() noexcept {
-  ++admission->generation;
-  admission->changed.notify_all();
+ void publish_locked(CompileAdmission::Change change) noexcept {
+  for (const auto& state : observers) {
+   state->notified = true;
+   auto* local = Readiness::Attempt::current_;
+   while (local && (!local->owner_ || local->owner_->state_ != state)) local = local->previous_;
+   switch (change) {
+    case CompileAdmission::Change::Resources:
+     state->pending.resources = true;
+     if (local) local->resources_ = true;
+     else state->pending.retry = true;
+     break;
+    case CompileAdmission::Change::Pressure:
+     state->pending.pressure = true;
+     if (local) local->pressure_ = true;
+     else state->pending.retry = true;
+     break;
+    case CompileAdmission::Change::Interruption: state->pending.interrupted = true; break;
+    case CompileAdmission::Change::Scheduling: break;
+   }
+  }
   if (event.get() >= 0) signal_event(event.get());
+ }
+ void notify_locked(CompileAdmission::Change change = CompileAdmission::Change::Scheduling) noexcept { admission->notify(change); }
+ void park(Job& job, CompileParkReason reason) noexcept {
+  const auto resource = [](CompileParkReason value) { return value == CompileParkReason::Bytes || value == CompileParkReason::Descriptors; };
+  admission->change_job_pressure(resource(job.reason), resource(reason));
+  job.reason = reason;
  }
  [[nodiscard]] bool live(std::size_t kind) const { return classes[kind].producers || classes[kind].pending || classes[kind].running; }
  void reconcile() {
@@ -185,7 +211,7 @@ struct CompileExecution::Impl {
    // Internal dependency/resource changes and notifying cancellation use events.
    if (cancellation.descriptor() < 0) {
     admission->changed.wait_until(lock, std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(100)));
-    if (cancellation.requested()) notify_locked();
+    if (cancellation.requested()) notify_locked(CompileAdmission::Change::Interruption);
    } else if (deadline == std::chrono::steady_clock::time_point::max()) admission->changed.wait(lock);
    else admission->changed.wait_until(lock, deadline);
   }
@@ -233,7 +259,7 @@ struct CompileExecution::Impl {
  }
  CompileExecution* owner = nullptr;
  void enqueue(const std::shared_ptr<Job>& job) {
-  job->reason = CompileParkReason::None;
+  park(*job, CompileParkReason::None);
   job->blocked_generation = std::numeric_limits<std::uint64_t>::max();
   ready[static_cast<std::size_t>(job->task.kind)].push_back(job);
  }
@@ -256,7 +282,7 @@ struct CompileExecution::Impl {
    try { callback(error); } catch (...) {
     const std::lock_guard lock(admission->mutex);
     if (!failure) failure = std::current_exception();
-    notify_locked();
+    notify_locked(CompileAdmission::Change::Interruption);
    }
   }
   callbacks.clear();
@@ -367,7 +393,13 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
       const auto& task = job.task;
       const bool reusable = task.retain_workspace && task.workspace && lane.idle.workspace == task.workspace && CompileAdmission::covers(*lane.idle.allowance.credits_, task.resources);
       if (!job.cancelled && !discard) {
-       if (admission->active + admission->external_cpus >= cpus.size() + (lane.active ? 1 : 0)) { job.reason = CompileParkReason::Cpu; continue; }
+       if (admission->active + admission->external_cpus >= cpus.size() + (lane.active ? 1 : 0)) {
+        // A temporary service grant does not resolve a resource predicate that
+        // this record already checked. Retain its pressure until rechecked;
+        // otherwise CPU acquire/release would manufacture pressure wake loops.
+        if (job.reason != CompileParkReason::Bytes && job.reason != CompileParkReason::Descriptors) park(job, CompileParkReason::Cpu);
+        continue;
+       }
        if (lane.owns(task.workspace)) continue;
        // Transferred custody was excluded from reclaimable bytes by its queued
        // owner. The pressure pass above already retires unowned idle backing
@@ -381,7 +413,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
         // parent/alias custody already excludes dependent bytes from the estimate;
         // neither a parent pointer nor finite-loan eligibility grants a bypass.
         if (!fits || (aged && aged.get() != &job && task.resources.bytes && !task.resources.retained_handles)) {
-         job.reason = task.resources.descriptors + task.resources.continuation_descriptors > admission->descriptor_room(task.resources, parent) ? CompileParkReason::Descriptors : CompileParkReason::Bytes;
+         park(job, task.resources.descriptors + task.resources.continuation_descriptors > admission->descriptor_room(task.resources, parent) ? CompileParkReason::Descriptors : CompileParkReason::Bytes);
          if (job.age != std::numeric_limits<std::size_t>::max()) ++job.age;
          continue;
         }
@@ -392,7 +424,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
       job.running = true;
       lane.dispatching = true;
       if (!lane.active) ++admission->active;
-      job.reason = CompileParkReason::None;
+      park(job, CompileParkReason::None);
       ++classes[class_index].running;
       if (discard || job.cancelled) error = failure ? failure : cancellation.requested() ? cancellation_error : retired;
       if (!error) {
@@ -426,7 +458,13 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
   { const std::lock_guard lock(admission->mutex); if (!error && selected->cancelled) error = retired; }
   if (selected->task.finite_consumer && frame.allowance) {
    std::shared_ptr<Credits> parent;
-   { const std::lock_guard lock(admission->mutex); if (!frame.allowance.credits_->borrowed) parent = std::move(frame.allowance.credits_->parent); }
+   {
+    const std::lock_guard lock(admission->mutex);
+    if (!frame.allowance.credits_->borrowed) {
+     parent = std::move(frame.allowance.credits_->parent);
+     if (parent) notify_locked(CompileAdmission::Change::Resources);
+    }
+   }
   }
   if (selected->task.workspace && selected->task.retain_workspace && frame.allowance) {
    Idle displaced;
@@ -443,6 +481,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
 }
 void CompileExecution::Impl::events() noexcept {
  bool cancellation_observed = false;
+ std::vector<std::pair<std::shared_ptr<Readiness::State>, Readiness::Changes>> callbacks;
  for (;;) {
   std::array<pollfd, 2> descriptors{{{event.get(), POLLIN, 0}, {cancellation_observed ? -1 : cancellation.descriptor(), POLLIN, 0}}};
   int result;
@@ -454,27 +493,31 @@ void CompileExecution::Impl::events() noexcept {
    return;
   }
   if (descriptors[0].revents) { std::uint64_t value; while (::read(event.get(), &value, sizeof(value)) < 0 && errno == EINTR) {} }
-  std::vector<std::shared_ptr<Readiness::State>> callbacks;
   CompileExecutionSnapshot observation;
   bool cancelled;
   {
    const std::lock_guard lock(admission->mutex);
    if (shutdown) return;
    cancelled = cancellation.requested();
+   if (cancelled && !cancellation_observed) publish_locked(CompileAdmission::Change::Interruption);
    admission->changed.notify_all();
-   std::erase_if(observers, [](const auto& value) { return value.expired(); });
-   for (auto& value : observers) if (auto callback = value.lock()) callbacks.push_back(std::move(callback));
+   for (const auto& callback : observers) if (callback->notified) {
+    // Acknowledge exactly this batch. Mutations racing delivery accumulate in
+    // a fresh pending batch and retain their own eventfd wake.
+    callbacks.emplace_back(callback, std::exchange(callback->pending, {}));
+    callback->notified = false;
+   }
    if (observer) observation = snapshot_locked();
   }
-  for (const auto& value : callbacks) {
+  for (const auto& [value, changes] : callbacks) {
    { const std::lock_guard lock(value->mutex); if (value->removed) continue; value->active = true; }
-   try { value->callback(); } catch (...) {
+   try { value->callback(changes); } catch (...) {
     const std::lock_guard lock(admission->mutex);
-    if (!failure) failure = std::current_exception();
-    admission->changed.notify_all();
+    if (!failure) { failure = std::current_exception(); notify_locked(CompileAdmission::Change::Interruption); }
    }
    { const std::lock_guard lock(value->mutex); value->active = false; value->changed.notify_all(); }
   }
+  callbacks.clear();
   if (observer) try { observer("compile.execution", observation); } catch (...) {}
   // The token remains readable. Keep completion/readiness dispatch armed on
   // our event descriptor while physical users drain, without polling the token.
@@ -510,7 +553,7 @@ CompileExecution::CompileExecution(std::size_t workers, std::span<const int> eli
  state.admission->tracing = bool(state.observer);
  state.event = mmltk::common::io::ScopedFd(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
  if (state.event.get() < 0) throw std::system_error(errno, std::generic_category(), "cannot create compile event descriptor");
- state.admission->transport_wakeup = [weak = std::weak_ptr<Impl>(impl_)] { if (auto owner = weak.lock()) signal_event(owner->event.get()); };
+ state.admission->publish_change = [weak = std::weak_ptr<Impl>(impl_)](CompileAdmission::Change change) { if (auto owner = weak.lock()) owner->publish_locked(change); };
  state.admission->release_cpus = [weak = std::weak_ptr<Impl>(impl_)](std::span<const std::size_t> lanes) {
   if (auto owner = weak.lock()) { for (auto lane : lanes) owner->lanes[lane].external = false; owner->reconcile(); }
  };
@@ -558,7 +601,7 @@ void CompileExecution::Completion::wait() const {
   if (owner && owner->cancellation.descriptor() < 0) {
    state_->changed.wait_for(lock, std::chrono::milliseconds(100));
    lock.unlock();
-   if (owner->cancellation.requested()) { const std::lock_guard admission_lock(owner->admission->mutex); owner->notify_locked(); }
+   if (owner->cancellation.requested()) { const std::lock_guard admission_lock(owner->admission->mutex); owner->notify_locked(CompileAdmission::Change::Interruption); }
    lock.lock();
   } else state_->changed.wait(lock);
  }
@@ -587,7 +630,7 @@ void CompileExecution::CompletionSource::settle(std::exception_ptr error) const 
   if (auto owner = state_->owner.lock()) {
    const std::lock_guard lock(owner->admission->mutex);
    if (!owner->failure) owner->failure = std::current_exception();
-   owner->notify_locked();
+   owner->notify_locked(CompileAdmission::Change::Interruption);
   }
  }
 }
@@ -643,8 +686,8 @@ void CompileExecution::resume(const Completion& completion) noexcept {
  const std::lock_guard lock(impl_->admission->mutex);
  if (auto job = completion.state_->job.lock(); job && !job->done && job->reason == CompileParkReason::Dependency) { job->dependency.reset(); impl_->enqueue(job); impl_->notify_locked(); }
 }
-void CompileExecution::fail(std::exception_ptr error) noexcept { const std::lock_guard lock(impl_->admission->mutex); if (!impl_->failure) impl_->failure = std::move(error); impl_->notify_locked(); }
-void CompileExecution::cancel() noexcept { const std::lock_guard lock(impl_->admission->mutex); impl_->stopping = true; impl_->notify_locked(); }
+void CompileExecution::fail(std::exception_ptr error) noexcept { const std::lock_guard lock(impl_->admission->mutex); if (!impl_->failure) impl_->failure = std::move(error); impl_->notify_locked(CompileAdmission::Change::Interruption); }
+void CompileExecution::cancel() noexcept { const std::lock_guard lock(impl_->admission->mutex); impl_->stopping = true; impl_->notify_locked(CompileAdmission::Change::Interruption); }
 void CompileExecution::join() {
  if (on_lane()) throw std::logic_error("compile CPU lane cannot join execution");
  std::unique_lock lock(impl_->admission->mutex);
@@ -677,7 +720,7 @@ CompileResources CompileExecution::resource_usage() const {
 }
 bool CompileExecution::resource_pressure() const {
  const std::lock_guard lock(impl_->admission->mutex);
- return impl_->admission->resource_waiters || std::ranges::any_of(impl_->jobs, [](const auto& job) { return job->reason == CompileParkReason::Bytes || job->reason == CompileParkReason::Descriptors; });
+ return impl_->admission->pressure();
 }
 std::uint64_t CompileExecution::admission_generation() const { const std::lock_guard lock(impl_->admission->mutex); return impl_->admission->generation; }
 void CompileExecution::wait_for_admission_change(std::uint64_t observed, std::chrono::steady_clock::time_point deadline) {
@@ -687,14 +730,31 @@ void CompileExecution::wait_for_admission_change(std::uint64_t observed, std::ch
  impl_->wait(lock, [&] { impl_->check(); return impl_->admission->generation != observed || std::chrono::steady_clock::now() >= deadline; }, deadline);
 }
 void CompileExecution::notify_admission_change() noexcept { const std::lock_guard lock(impl_->admission->mutex); impl_->notify_locked(); }
-CompileExecution::Readiness::Readiness(CompileExecution& owner, std::function<void()> callback) : owner_(owner), state_(std::make_shared<State>()) {
+CompileExecution::Readiness::Readiness(CompileExecution& owner, std::function<void(Changes)> callback) : owner_(owner), state_(std::make_shared<State>()) {
  state_->callback = std::move(callback);
  const std::lock_guard lock(owner_.impl_->admission->mutex);
  if (owner_.impl_->observers.size() >= owner_.impl_->record_limit) throw std::length_error("compile readiness capacity exceeded");
  owner_.impl_->observers.push_back(state_);
 }
 CompileExecution::Readiness::~Readiness() {
+ // Keep state_ alive while unlinking. Publication never takes or destroys a
+ // final callback owner under the admission lock.
+ { const std::lock_guard lock(owner_.impl_->admission->mutex); std::erase(owner_.impl_->observers, state_); }
  std::unique_lock lock(state_->mutex); state_->removed = true; state_->changed.wait(lock, [&] { return !state_->active; });
+}
+thread_local CompileExecution::Readiness::Attempt* CompileExecution::Readiness::Attempt::current_ = nullptr;
+CompileExecution::Readiness::Attempt::Attempt(Readiness* owner) : owner_(owner), previous_(current_) { current_ = this; }
+CompileExecution::Readiness::Attempt::~Attempt() {
+ current_ = previous_;
+ if (!owner_ || !committed_ || (!resources_ && !pressure_)) return;
+ const auto& impl = owner_->owner_.impl_;
+ const std::lock_guard lock(impl->admission->mutex);
+ auto& state = *owner_->state_;
+ state.pending.resources |= resources_;
+ state.pending.pressure |= pressure_;
+ state.pending.retry = true;
+ state.notified = true;
+ signal_event(impl->event.get());
 }
 CompileResourceWait::CompileResourceWait(std::shared_ptr<CompileAdmission> owner) : owner_(std::move(owner)) { const std::lock_guard lock(owner_->mutex); owner_->change_waiters(true, true); }
 CompileResourceWait::~CompileResourceWait() { const std::lock_guard lock(owner_->mutex); owner_->change_waiters(false, true); }
@@ -763,7 +823,7 @@ bool CompileExecution::try_resize_workspace(const CompileAllowance& allowance, s
    if (!owner.fits_bytes({growth, 0}, credits.get())) return Resize::Pressure;
    owner.bytes = mmltk::common::math::checked_add(owner.bytes, growth, "compile workspace resize overflow");
   } else owner.bytes -= resources.bytes - bytes;
-  resources.bytes = bytes; impl_->notify_locked(); return Resize::Complete;
+  resources.bytes = bytes; impl_->notify_locked(CompileAdmission::Change::Resources); return Resize::Complete;
  };
  auto result = resize();
  for (std::size_t lane = 0; result == Resize::Pressure && lane < impl_->lanes.size(); ++lane) {
@@ -778,7 +838,6 @@ void CompileExecution::with_unused_workspace(const CompileAllowance& allowance, 
  if (!allowance.credits_ || allowance.credits_->owner != impl_->admission) throw std::invalid_argument("compile workspace offer requires owned credits");
  {
   const auto offer = [&] { const std::lock_guard lock(impl_->admission->mutex); impl_->check(); return CompileAdmission::OfferScope(allowance.credits_, live_bytes); }();
-  notify_admission_change();
   callback();
  }
  const std::lock_guard lock(impl_->admission->mutex); impl_->check();

@@ -6532,23 +6532,47 @@ TEST_CASE("channel settlement detaches pending and active work while another cha
  reused.Check();
 }
 TEST_CASE("shared Curl admission changes survive the check to park boundary for actual readers", "[backend][data][benchmark][download][pipeline]") {
+ enum class Event { Return, PressureEntry, PressureExit, RetainedReplacement, RecycledInput } event = Event::Return;
+ SECTION("returned transient bytes") {}
+ SECTION("pressure enters without changing charges") { event = Event::PressureEntry; }
+ SECTION("pressure exits without changing charges") { event = Event::PressureExit; }
+ SECTION("retained control replaces an equal transient charge") { event = Event::RetainedReplacement; }
+ SECTION("source owned input recycling") { event = Event::RecycledInput; }
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 4096, .descriptors = 32});
  std::vector<std::unique_ptr<BenchmarkCurl::Channel>> declarations;
  for (std::size_t i = 0; i < 32; ++i) declarations.push_back(execution.curl().channel(BenchmarkCurl::Class::Artifact));
  auto first = execution.curl().channel(BenchmarkCurl::Class::Artifact);
  auto second = execution.curl().channel(BenchmarkCurl::Class::OpenImages);
  auto occupied = execution.execution().reserve({4096, 0});
+ auto pressure = event == Event::PressureExit ? execution.execution().defer_resources() : nullptr;
+ CompileAllowance retained;
+ std::atomic<bool> recycled{false};
+ // Curl's earlier registration has delivered all previous notices before this
+ // gate engages. Hold the event owner so equal-total replacement coalesces into
+ // one delivery, then let both readers finish checking their actual predicate.
+ mmltk::testsupport::TestGate notifier("admission delivery before resource mutation");
+ std::atomic<bool> first_notice{true};
+ CompileExecution::Readiness delivery(execution.execution(), [&](CompileExecution::Readiness::Changes) {
+  if (first_notice.exchange(false)) notifier.receipt().ArriveAndWait();
+ });
+ const mmltk::testsupport::ScopedTestCleanup release_notifier([&] { notifier.Release(); });
+ execution.execution().notify_admission_change();
+ REQUIRE(notifier.WaitEntered(5s));
  mmltk::testsupport::TestGate first_checked("first admission predicate checked"), second_checked("second admission predicate checked");
  const auto wait = [&](BenchmarkCurl::Channel& channel, mmltk::testsupport::TestGate& checked) {
   require_condition(!execution.execution().try_reserve({1, 0}), "occupied bytes unexpectedly admitted");
   channel.wait_until(std::chrono::steady_clock::now());
   checked.receipt().ArriveAndWait();
   channel.wait_until(std::chrono::steady_clock::time_point::max());
+  if (event == Event::PressureEntry || event == Event::PressureExit)
+   return execution.execution().resource_pressure() == (event == Event::PressureEntry);
+  if (event == Event::RecycledInput) return recycled.load();
   return execution.execution().try_reserve({1, 0}).has_value();
  };
  auto a = std::async(std::launch::async, [&] { return wait(*first, first_checked); });
  auto b = std::async(std::launch::async, [&] { return wait(*second, second_checked); });
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  notifier.Release();
   occupied = {};
   first_checked.Release();
   second_checked.Release();
@@ -6557,11 +6581,173 @@ TEST_CASE("shared Curl admission changes survive the check to park boundary for 
  });
  REQUIRE(first_checked.WaitEntered(5s));
  REQUIRE(second_checked.WaitEntered(5s));
- occupied = {};  // One common credit event, before either reader parks.
+ const auto before = execution.execution().resource_usage();
+ switch (event) {
+  case Event::Return: occupied = {}; break;
+  case Event::PressureEntry: pressure = execution.execution().defer_resources(); break;
+  case Event::PressureExit: pressure.reset(); break;
+  case Event::RetainedReplacement:
+   occupied = {};
+   retained = execution.execution().reserve({4096, 0, false, 0, true});
+   break;
+  case Event::RecycledInput:
+   recycled = true;
+   execution.curl().admission_wakeup()();
+   break;
+ }
+ if (event != Event::Return) {
+  const auto after = execution.execution().resource_usage();
+  CHECK(after.bytes == before.bytes);
+  CHECK(after.descriptors == before.descriptors);
+  CHECK(after.continuation_descriptors == before.continuation_descriptors);
+ }
+ notifier.Release();
  first_checked.Release();
  second_checked.Release();
  CHECK(mmltk::testsupport::await_test_future(a, "first shared admission reader"));
  CHECK(mmltk::testsupport::await_test_future(b, "second shared admission reader"));
+}
+TEST_CASE("admission readiness retains external returns across local rollback and delivery acknowledgement", "[backend][data][benchmark][download][pipeline]") {
+ enum class Return { None, Rollback, Delivery } returned = Return::None;
+ SECTION("unchanged failed demand and CPU grants do not request a retry") {}
+ SECTION("external return coalesces with failed partial draw") { returned = Return::Rollback; }
+ SECTION("external return survives acknowledgement of the prior delivery") { returned = Return::Delivery; }
+ using Changes = CompileExecution::Readiness::Changes;
+ using mmltk::backend::data::detail::CompileWorkClass;
+ CompileExecution execution(1, {}, {.transient_bytes = 64, .descriptors = 8});
+ auto parent = execution.reserve(CompileResources::handles(0, false, 2));
+ auto external = execution.reserve(CompileResources::handles(5));
+ mmltk::testsupport::TestGate initial("hold readiness before partial admission"),
+  failed("last descriptor draw failed before rollback"), delivering("hold acknowledged readiness batch");
+ std::promise<Changes> rolled_back, rearmed;
+ std::atomic<unsigned> deliveries{0};
+ std::unique_ptr<mmltk::backend::data::detail::CompileResourceWait> pressure;
+ std::future<void> draw;
+ auto readiness = std::make_unique<CompileExecution::Readiness>(execution, [&](Changes changes) {
+  switch (++deliveries) {
+   case 1: initial.receipt().ArriveAndWait(); break;
+   case 2:
+    rolled_back.set_value(changes);
+    delivering.receipt().ArriveAndWait();
+    break;
+   case 3: rearmed.set_value(changes); break;
+   default: break;
+  }
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  initial.Release(); failed.Release(); delivering.Release();
+  if (draw.valid()) draw.wait();
+  readiness.reset();
+ });
+ execution.notify_admission_change();
+ REQUIRE(initial.WaitEntered(5s));
+ draw = std::async(std::launch::async, [&] {
+  CompileExecution::Readiness::Attempt attempt(readiness.get());
+  auto work = execution.try_reserve({32, 1}, parent);
+  auto promised_socket = execution.try_reserve(CompileResources::handles(1), parent);
+  auto independent_socket = execution.try_reserve(CompileResources::handles(1));
+  require_condition(work && promised_socket && independent_socket, "partial transport draw did not enter its available envelope");
+  require_condition(!execution.try_reserve(CompileResources::handles(1)), "exhausted descriptor draw unexpectedly fit");
+  pressure = execution.defer_resources();
+  failed.receipt().ArriveAndWait();
+  // Temporary grants return in reverse order before the uncommitted attempt
+  // leaves. Only the racing outside owner may request another pump attempt.
+ });
+ REQUIRE(failed.WaitEntered(5s));
+ if (returned == Return::Rollback) external = {};
+ failed.Release();
+ mmltk::testsupport::await_test_future(draw, "failed admission rollback");
+ initial.Release();
+ const auto rollback = mmltk::testsupport::await_test_promise(rolled_back, "coalesced admission changes");
+ REQUIRE(delivering.WaitEntered(5s));
+ CHECK(rollback.resources);
+ CHECK(rollback.pressure);
+ CHECK(rollback.retry == (returned == Return::Rollback));
+ CHECK_FALSE(rollback.interrupted);
+ CHECK(execution.resource_pressure());
+ // These are real scheduler grants, independent of diagnostic observations.
+ // Their readiness batch has no resource retry even after acknowledgement.
+ {
+  auto producer = execution.open_class(CompileWorkClass::Acquisition);
+  auto cpu = execution.service_grant(CompileWorkClass::Acquisition);
+ }
+ if (returned == Return::Delivery) external = {};
+ delivering.Release();
+ const auto next = mmltk::testsupport::await_test_promise(rearmed, "readiness rearmed during callback delivery");
+ CHECK(next.retry == (returned == Return::Delivery));
+ CHECK(next.resources == (returned == Return::Delivery));
+ CHECK_FALSE(next.pressure);
+ readiness.reset();
+ CHECK(execution.try_reserve(CompileResources::handles(0, false, 2), parent).has_value());
+ pressure.reset();
+ CHECK_FALSE(execution.resource_pressure());
+}
+TEST_CASE("readiness retirement joins an executing admission callback", "[backend][data][benchmark][pipeline]") {
+ CompileExecution execution(1);
+ mmltk::testsupport::TestGate callback("admission callback owns borrowed state"), retiring("readiness destruction started");
+ auto readiness = std::make_unique<CompileExecution::Readiness>(execution, [&](CompileExecution::Readiness::Changes) { callback.receipt().ArriveAndWait(); });
+ std::future<void> retirement;
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { callback.Release(); retiring.Release(); });
+ execution.notify_admission_change();
+ REQUIRE(callback.WaitEntered(5s));
+ retirement = std::async(std::launch::async, [&] { retiring.receipt().ArriveAndWait(); readiness.reset(); });
+ REQUIRE(retiring.WaitEntered(5s));
+ retiring.Release();
+ CHECK(retirement.wait_for(0ms) == std::future_status::timeout);
+ callback.Release();
+ mmltk::testsupport::await_test_future(retirement, "joined admission callback");
+}
+TEST_CASE("pending Curl admission parks through CPU notices and resumes on external credit return", "[backend][data][benchmark][download][pipeline]") {
+ using mmltk::backend::data::detail::CompileWorkClass;
+ using Changes = CompileExecution::Readiness::Changes;
+ const auto payload = make_payload(128);
+ HttpServer server(payload);
+ CompileExecution execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 24});
+ BenchmarkCurl curl(1, &execution);
+ auto channel = curl.channel(BenchmarkCurl::Class::Artifact);
+ auto occupied = execution.reserve({256U << 10, 0});
+ CurlSocketObservation sockets;
+ ObservedCurlTransfer transfer(server.url("pending"), sockets);
+ mmltk::testsupport::TestGate pending("Curl registered its unsuccessful byte demand");
+ std::promise<Changes> cpu_notices;
+ unsigned stage = 0;
+ CompileExecution::Readiness delivery(execution, [&](Changes changes) {
+  if (!stage && changes.pressure && execution.resource_pressure()) {
+   stage = 1;
+   pending.receipt().ArriveAndWait();
+  } else if (stage == 1) {
+   stage = 2;
+   cpu_notices.set_value(changes);
+  }
+ });
+ const mmltk::testsupport::ScopedTestCleanup settle([&] {
+  pending.Release();
+  if (channel) channel->remove_all();
+ });
+ channel->add(transfer.easy.get());
+ REQUIRE(pending.WaitEntered(5s));
+ // Taking the shared grant joins the failed pump's CPU-bearing work. Its own
+ // wait/release events are then delivered in one gated batch, with no new
+ // command, socket work or resource mutation capable of rearming the demand.
+ {
+  auto cpu = execution.service_grant(CompileWorkClass::Acquisition);
+ }
+ execution.notify_admission_change();
+ pending.Release();
+ const auto changes = mmltk::testsupport::await_test_promise(cpu_notices, "CPU-only readiness batch for pending Curl");
+ CHECK_FALSE(changes.resources);
+ CHECK_FALSE(changes.pressure);
+ CHECK_FALSE(changes.retry);
+ CHECK(execution.resource_pressure());
+ CHECK(server.requests() == 0);
+ occupied = {};
+ const auto completion = await_curl(*channel);
+ CHECK(completion.handle == transfer.easy.get());
+ CHECK(completion.result == CURLE_OK);
+ CHECK(transfer.bytes == payload);
+ channel.reset();
+ CHECK(execution.try_reserve({execution.transient_target(), 24}).has_value());
+ server.Check();
 }
 TEST_CASE("Open Images starts ready HTTP before later cold cache chunks finish", "[backend][data][benchmark][images][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("open-images-incremental-cache-scan");

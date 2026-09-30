@@ -809,7 +809,7 @@ void BenchmarkSourcePublication::geometry_ready(std::uint64_t id, std::pair<std:
 }
 BenchmarkCompilePipeline::BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus, detail::CompileExecutionLimits limits,
  mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkTraceSink trace) : impl_(std::make_shared<Impl>(workers, cpus, limits, cancellation, std::move(trace))) {
- impl_->readiness = std::make_unique<CompileExecution::Readiness>(impl_->execution, [weak = std::weak_ptr<Impl>(impl_)] {
+ impl_->readiness = std::make_unique<CompileExecution::Readiness>(impl_->execution, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness::Changes) {
   if (auto owner = weak.lock()) {
    try { owner->dispatch(); }
    catch (...) {

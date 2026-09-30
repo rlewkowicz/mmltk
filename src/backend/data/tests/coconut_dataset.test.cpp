@@ -67,11 +67,11 @@
 #include <string>
 #include <utility>
 #include <vector>
-using using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileResourceWait;
 using mmltk::backend::data::detail::CompileTaskKind;
-namespace mmltk::backend::data;
+using namespace mmltk::backend::data;
 using namespace mmltk::backend::data::benchmark_internal;
 namespace {
 using mmltk::backend::data::testsupport::benchmark_entry;
