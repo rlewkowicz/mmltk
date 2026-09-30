@@ -234,6 +234,7 @@ public:
  void cooperate();
  // File/Curl CPU-bearing pumps replace a compute lane while active. A service's
  // Producer retains the waiting baseline; this short grant covers only a pump.
+ class ServiceDemand;
  class ServiceGrant final {
  public:
   ServiceGrant() = default;
@@ -243,13 +244,36 @@ public:
   ServiceGrant(const ServiceGrant&) = delete;
   ServiceGrant& operator=(const ServiceGrant&) = delete;
   [[nodiscard]] int cpu() const noexcept;
+  [[nodiscard]] CompileWorkClass work_class() const noexcept { return class_; }
  private:
   friend class CompileExecution;
+  friend class ServiceDemand;
   ServiceGrant(std::shared_ptr<Impl>, CompileWorkClass, std::size_t);
   void release() noexcept;
   std::shared_ptr<Impl> owner_;
   CompileWorkClass class_ = CompileWorkClass::Count;
   std::size_t lane_ = 0;
+ };
+ // A bounded set of alternative classes an available service dispatcher can
+ // accept. Keep it armed across failed probes; update only when that actual
+ // ability changes. It owns neither a producer nor physical-operation custody.
+ class ServiceDemand final {
+ public:
+  using Classes = std::array<bool, static_cast<std::size_t>(CompileWorkClass::Count)>;
+  explicit ServiceDemand(CompileExecution&);
+  ~ServiceDemand();
+  ServiceDemand(const ServiceDemand&) = delete;
+  ServiceDemand& operator=(const ServiceDemand&) = delete;
+  void update(const Classes&) noexcept;
+  // Success clears this demand. Failure keeps it armed and publishes no change;
+  // the caller waits on Readiness before probing again. Serialize owner access.
+  [[nodiscard]] std::optional<ServiceGrant> try_grant(std::stop_token local_stop = {});
+ private:
+  friend class CompileExecution;
+  void update_locked(const Classes&) noexcept;
+  [[nodiscard]] std::optional<ServiceGrant> try_grant_locked(std::stop_token);
+  std::shared_ptr<Impl> owner_;
+  Classes pending_{};
  };
  // A local stop interrupts only this grant wait and never cancels the session.
  [[nodiscard]] ServiceGrant service_grant(CompileWorkClass, std::stop_token local_stop = {});

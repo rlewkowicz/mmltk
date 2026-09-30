@@ -95,6 +95,7 @@ using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileExecutionLimits;
 using mmltk::backend::data::detail::InsufficientCompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
+using mmltk::backend::data::detail::CompileWorkClass;
 using mmltk::backend::data::detail::CompileExecution;
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -9864,6 +9865,151 @@ TEST_CASE("compile one-core services yield their grant to an earlier ready class
  CHECK(ran);
  service = {}; work.wait();
 }
+TEST_CASE("compile service demand retains denied classes without publishing failed probes", "[backend][data][benchmark][pipeline]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPUs");
+ CompileExecution execution(4);
+ auto extraction = execution.open_class(CompileWorkClass::Extraction);
+ auto annotations = execution.open_class(CompileWorkClass::Annotations);
+ auto pixels = execution.open_class(CompileWorkClass::Pixels);
+ auto output = execution.open_class(CompileWorkClass::Output);
+ auto held = execution.service_grant(CompileWorkClass::Output);
+ CompileExecution::ServiceDemand demand(execution);
+ CompileExecution::ServiceDemand::Classes classes{};
+ classes[static_cast<std::size_t>(CompileWorkClass::Output)] = true;
+ demand.update(classes);
+ CHECK_FALSE(demand.try_grant());
+ const auto observed = execution.admission_generation();
+ demand.update(classes);
+ CHECK_FALSE(demand.try_grant());
+ CHECK(execution.admission_generation() == observed);
+ // A newly queued class remains visible after an actual unsuccessful probe.
+ classes[static_cast<std::size_t>(CompileWorkClass::Extraction)] = true;
+ demand.update(classes);
+ auto peer = demand.try_grant();
+ REQUIRE(peer);
+ CHECK(peer->work_class() == CompileWorkClass::Extraction);
+ CHECK(peer->cpu() != held.cpu());
+ const auto snapshot = execution.snapshot();
+ CHECK(snapshot.services == 2);
+ CHECK(snapshot.active + snapshot.external == 2);
+ CHECK(snapshot.parked[static_cast<std::size_t>(detail::CompileParkReason::Cpu)] == 0);
+ CHECK_FALSE(demand.try_grant());
+}
+TEST_CASE("borrowed file classes bypass a denied floor and release demand through completion custody", "[backend][data][benchmark][pipeline]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPUs");
+ const bool cancel = GENERATE(false, true);
+ const bool backlog = GENERATE(false, true);
+ const bool subscription = GENERATE(false, true);
+ std::promise<void> waiting;
+ std::atomic<bool> invalid_budget{false};
+ CompileExecution execution(4, {}, {}, {}, [&](std::string_view, const detail::CompileExecutionSnapshot& snapshot) {
+  if (snapshot.active + snapshot.external > 4) invalid_budget = true;
+  if (snapshot.services == 1 && snapshot.parked[static_cast<std::size_t>(detail::CompileParkReason::Cpu)])
+   mmltk::testsupport::release_test_promise(waiting);
+ });
+ auto extraction = execution.open_class(CompileWorkClass::Extraction);
+ auto annotations = execution.open_class(CompileWorkClass::Annotations);
+ auto pixels = execution.open_class(CompileWorkClass::Pixels);
+ auto output = execution.open_class(CompileWorkClass::Output);
+ detail::FileWorkQueue files(execution, 4, 2);
+ mmltk::testsupport::TestGate physical_output("Output owns its reserved floor"),
+  physical_input("Extraction bypasses queued Output"), callback("Extraction callback retains its dispatcher");
+ std::atomic<unsigned> second_output_calls{0}, second_input_calls{0}, completed{0}, failed{0};
+ const auto complete = [&](std::exception_ptr error) { ++completed; if (error) ++failed; };
+ const mmltk::testsupport::ScopedTestCleanup release([&] { physical_output.Release(); physical_input.Release(); callback.Release(); files.cancel(); files.join(); });
+ auto first = files.submit({.completed = complete, .work = [&] { physical_output.receipt().ArriveAndWait(); }});
+ REQUIRE(physical_output.WaitEntered(2s));
+ auto second = files.submit({.completed = complete, .work = [&] { ++second_output_calls; }});
+ mmltk::testsupport::await_test_promise(waiting, "queued Output service demand reaches admission");
+ auto input = files.submit({.completed = [&](std::exception_ptr error) {
+  complete(error); if (!subscription) callback.receipt().ArriveAndWait();
+ }, .work = [&] { physical_input.receipt().ArriveAndWait(); }, .service_class = CompileWorkClass::Extraction});
+ if (subscription) input.subscribe([&](std::exception_ptr) { callback.receipt().ArriveAndWait(); });
+ REQUIRE(physical_input.WaitEntered(2s));
+ CHECK_FALSE(first.ready()); CHECK_FALSE(second.ready()); CHECK(second_output_calls == 0);
+ CHECK(execution.snapshot().services == 2);
+ std::optional<CompileExecution::Completion> next_input;
+ if (backlog) next_input = files.submit({.completed = complete, .work = [&] { ++second_input_calls; }, .service_class = CompileWorkClass::Extraction});
+ physical_input.Release();
+ REQUIRE(callback.WaitEntered(2s));
+ extraction.close(); output.close();
+ const auto during = execution.snapshot();
+ CHECK(during.live[static_cast<std::size_t>(CompileWorkClass::Extraction)]);
+ CHECK(during.services == 1);
+ CHECK(during.active + during.external == 1);
+ CHECK(during.parked[static_cast<std::size_t>(detail::CompileParkReason::Cpu)] == 0);
+ // Both dispatchers remain occupied. Queued file demand cannot prevent normal
+ // CPU work from using the Extraction grant that its callback has returned.
+ execution.run(CompileTaskKind::Archive, {}, [](std::size_t) {});
+ CHECK(input.ready() == subscription); CHECK(second_input_calls == 0);
+ if (cancel) {
+  files.cancel();
+  CHECK_THROWS(second.wait());
+  if (next_input) CHECK_THROWS(next_input->wait());
+  CHECK_FALSE(first.ready()); CHECK(input.ready() == subscription);
+ }
+ // Retain all four class floors while checking the remaining queued records.
+ extraction = execution.open_class(CompileWorkClass::Extraction);
+ callback.Release(); input.wait();
+ if (!cancel && next_input) { next_input->wait(); CHECK(second_input_calls == 1); }
+ CHECK(second_output_calls == 0);
+ physical_output.Release(); first.wait();
+ if (!cancel) second.wait();
+ files.join();
+ extraction.close();
+ CHECK(completed == (backlog ? 4U : 3U));
+ CHECK(failed == (cancel ? (backlog ? 2U : 1U) : 0U));
+ CHECK(second_output_calls == (cancel ? 0U : 1U));
+ CHECK_FALSE(invalid_budget);
+ CHECK_FALSE(execution.snapshot().live[static_cast<std::size_t>(CompileWorkClass::Extraction)]);
+ CHECK_FALSE(execution.snapshot().live[static_cast<std::size_t>(CompileWorkClass::Output)]);
+}
+TEST_CASE("borrowed file dispatch admits multiple eligible records in one class", "[backend][data][benchmark][pipeline]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ CompileExecution execution(2);
+ detail::FileWorkQueue files(execution, 2, 2);
+ mmltk::testsupport::TestGate physical("two admitted Output records");
+ const mmltk::testsupport::ScopedTestCleanup release([&] { physical.Release(); files.cancel(); files.join(); });
+ const detail::FileWorkQueue::Operation operation{.work = [&] { physical.receipt().ArriveAndWait(); }};
+ auto first = files.submit(operation), second = files.submit(operation);
+ REQUIRE(physical.WaitEntered(2s, 2));
+ CHECK(execution.snapshot().services == 2);
+ CHECK(execution.snapshot().active + execution.snapshot().external == 2);
+ CHECK_FALSE(files.try_submit(operation));
+ files.cancel(); CHECK_FALSE(first.ready()); CHECK_FALSE(second.ready());
+ physical.Release(); first.wait(); second.wait(); files.join();
+ CHECK(execution.snapshot().services == 0);
+}
+TEST_CASE("borrowed file classes share the one-core cursor with ready compute", "[backend][data][benchmark][pipeline]") {
+ CompileExecution execution(1);
+ auto extraction = execution.open_class(CompileWorkClass::Extraction);
+ auto pixels = execution.open_class(CompileWorkClass::Pixels);
+ auto output = execution.open_class(CompileWorkClass::Output);
+ detail::FileWorkQueue files(execution, 3);
+ mmltk::testsupport::TestGate first_input("first Extraction pump"), compute("Pixels turn before queued Output"),
+  output_call("Output turn before queued Extraction");
+ std::atomic<unsigned> order{0}, pixel_order{0}, output_order{0}, input_order{0};
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  first_input.Release(); compute.Release(); output_call.Release(); files.cancel(); files.join(); execution.retire_attempt();
+ });
+ auto first = files.submit({.work = [&] { first_input.receipt().ArriveAndWait(); }, .service_class = CompileWorkClass::Extraction});
+ REQUIRE(first_input.WaitEntered(2s));
+ auto write = files.submit({.work = [&] { output_order = ++order; output_call.receipt().ArriveAndWait(); }});
+ auto read = files.submit({.work = [&] { input_order = ++order; }, .service_class = CompileWorkClass::Extraction});
+ auto pixels_ready = execution.submit({.kind = CompileTaskKind::Pixels, .work = [&](std::size_t, const CompileAllowance&) {
+  pixel_order = ++order; compute.receipt().ArriveAndWait();
+ }});
+ first_input.Release();
+ REQUIRE(compute.WaitEntered(2s));
+ CHECK(pixel_order == 1); CHECK(output_order == 0); CHECK(input_order == 0);
+ CHECK(execution.snapshot().active == 1); CHECK(execution.snapshot().services == 0);
+ compute.Release(); pixels_ready.wait();
+ REQUIRE(output_call.WaitEntered(2s));
+ CHECK(output_order == 2); CHECK(input_order == 0);
+ CHECK(execution.snapshot().active == 1); CHECK(execution.snapshot().services == 1);
+ output_call.Release(); first.wait(); write.wait(); read.wait(); files.join();
+ CHECK(input_order == 3);
+}
 TEST_CASE("compile finite loans withdraw only participating offers", "[backend][data][benchmark][pipeline]") {
  CompileExecution execution(1, {}, {.transient_bytes = 128, .descriptors = 16});
  auto first = execution.reserve({64, 0});
@@ -9922,6 +10068,38 @@ TEST_CASE("borrowed file cancellation interrupts a shared CPU grant wait locally
  CHECK(execution.snapshot().active == 1);
  unrelated.Release(); compute.wait();
  execution.run(CompileTaskKind::Pixels, {}, [](std::size_t) {});
+}
+TEST_CASE("borrowed file demand observes notifying and legacy cancellation through a held CPU peer", "[backend][data][benchmark][pipeline]") {
+ const bool notifying = GENERATE(false, true);
+ struct FileCancellationTag {};
+ using Source = mmltk::common::concurrency::EventCancellationSource<FileCancellationTag, false>;
+ using Observation = mmltk::common::concurrency::CancellationObservation;
+ auto [cancel, token] = Source::Mint();
+ std::atomic<bool> legacy{false};
+ std::promise<void> waiting, settled;
+ std::atomic<unsigned> calls{0};
+ const auto cause = std::make_exception_ptr(std::runtime_error("file admission cancellation cause"));
+ CompileExecution execution(1, {}, {}, notifying ? Observation::Borrow(token) : Observation::Atomic(legacy),
+  [&](std::string_view, const detail::CompileExecutionSnapshot& snapshot) {
+   if (snapshot.parked[static_cast<std::size_t>(detail::CompileParkReason::Cpu)]) mmltk::testsupport::release_test_promise(waiting);
+  }, cause);
+ detail::FileWorkQueue files(execution, 1);
+ mmltk::testsupport::TestGate physical("accepted compute retains its sole CPU grant");
+ const mmltk::testsupport::ScopedTestCleanup release([&] { physical.Release(); files.cancel(); files.join(); execution.retire_attempt(); });
+ auto peer = execution.submit({.kind = CompileTaskKind::Pixels,
+  .work = [&](std::size_t, const CompileAllowance&) { physical.receipt().ArriveAndWait(); }});
+ REQUIRE(physical.WaitEntered(2s));
+ auto queued = files.submit({.work = [&] { ++calls; }});
+ queued.subscribe([&](std::exception_ptr) { mmltk::testsupport::release_test_promise(settled); });
+ mmltk::testsupport::await_test_promise(waiting, "file demand parked behind an accepted peer");
+ if (notifying) REQUIRE(cancel.RequestCancel());
+ else legacy = true;
+ mmltk::testsupport::await_test_promise(settled, "cancellation retires queued custody before peer return");
+ CHECK(queued.failure() == cause); CHECK_THROWS(queued.wait());
+ files.join();
+ CHECK(calls == 0); CHECK_FALSE(peer.ready());
+ CHECK(execution.snapshot().active == 1); CHECK(execution.snapshot().services == 0);
+ physical.Release(); peer.wait();
 }
 TEST_CASE("borrowed file records retain physical completion and share compile service capacity", "[backend][data][benchmark][pipeline]") {
  using mmltk::backend::data::detail::FileWorkQueue;
@@ -9991,7 +10169,7 @@ TEST_CASE("rejected file admission leaves no completion custody or output produc
  }
  REQUIRE(execution.interruption());
  if (!cancellation) CHECK(execution.interruption() == original);
- const auto expected = cancellation ? "compile admission after shutdown" : "file admission execution failure";
+ const auto expected = cancellation ? "compile work retired before completion" : "file admission execution failure";
  CHECK_THROWS_WITH(files.try_submit({.completed = [&, custody = std::move(custody)](std::exception_ptr) { ++*custody; ++completed; }, .work = [&] { ++calls; }}), expected);
  files.join();
  CHECK(borrowed.expired());
@@ -10005,6 +10183,43 @@ TEST_CASE("rejected file admission leaves no completion custody or output produc
  CHECK(completed == 1);
  CHECK(calls == 1);
  CHECK_FALSE(execution.snapshot().live[static_cast<std::size_t>(CompileWorkClass::Output)]);
+}
+TEST_CASE("file terminal admission preserves accepted peers with full or free records", "[backend][data][benchmark][pipeline]") {
+ const bool cancellation = GENERATE(false, true);
+ const bool full = GENERATE(false, true);
+ CompileExecution execution(1);
+ detail::FileWorkQueue files(execution, full ? 1 : 2);
+ mmltk::testsupport::TestGate physical("accepted Output remains physically owned");
+ std::atomic<unsigned> completed{0}, rejected_callbacks{0}, rejected_calls{0};
+ const mmltk::testsupport::ScopedTestCleanup release([&] { physical.Release(); files.cancel(); files.join(); });
+ auto accepted = files.submit({.completed = [&](std::exception_ptr error) { if (!error) ++completed; },
+  .work = [&] { physical.receipt().ArriveAndWait(); }});
+ REQUIRE(physical.WaitEntered(2s));
+ const auto original = std::make_exception_ptr(std::runtime_error("first failure with accepted file custody"));
+ if (!cancellation) {
+  execution.fail(original);
+  execution.fail(std::make_exception_ptr(std::runtime_error("later failure")));
+ }
+ execution.cancel();
+ const auto expected = execution.interruption();
+ REQUIRE(expected);
+ if (!cancellation) CHECK(expected == original);
+ auto custody = std::make_shared<unsigned>(7);
+ const std::weak_ptr<unsigned> borrowed = custody;
+ std::exception_ptr rejected;
+ try {
+  (void)files.try_submit({.completed = [&, custody = std::move(custody)](std::exception_ptr) { ++*custody; ++rejected_callbacks; },
+   .work = [&] { ++rejected_calls; }});
+ } catch (...) { rejected = std::current_exception(); }
+ CHECK(rejected == expected);
+ CHECK(borrowed.expired()); CHECK(rejected_callbacks == 0); CHECK(rejected_calls == 0);
+ CHECK_FALSE(accepted.ready()); CHECK(completed == 0);
+ CHECK(execution.snapshot().live[static_cast<std::size_t>(CompileWorkClass::Output)]);
+ CHECK(execution.snapshot().services == 1);
+ physical.Release(); accepted.wait(); files.join();
+ CHECK(completed == 1);
+ CHECK_FALSE(execution.snapshot().live[static_cast<std::size_t>(CompileWorkClass::Output)]);
+ CHECK(execution.snapshot().services == 0);
 }
 TEST_CASE("rejected borrowed runtime dispatch releases its operation without a callback", "[backend][data][benchmark][pipeline]") {
  mmltk::common::concurrency::WorkerPool pool(1);

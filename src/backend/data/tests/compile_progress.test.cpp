@@ -1450,7 +1450,7 @@ TEST_CASE("Directory file services preserve Extraction floors and peer pixels th
  const bool hold_completion=GENERATE(false,true);
  const bool cancel=GENERATE(false,true);
  const mmltk::testsupport::ScopedTempDir root("directory-file-service-floors");
- const FixtureSpec fixture{.root_dir=root.path().string(),.width=32,.height=16,.num_images=2};
+ const FixtureSpec fixture{.root_dir=root.path().string(),.width=32,.height=16,.num_images=4};
  create_synthetic_dataset(fixture);
  auto config=DatasetCompiler::prepare(compiler_config(fixture),{"train"}).config;
  if (config.worker_cpus.size()<4) SKIP("requires four admitted CPUs for the four live class floors");
@@ -1468,11 +1468,14 @@ TEST_CASE("Directory file services preserve Extraction floors and peer pixels th
   std::shared_future<void> output_entered;
   bool completion;
   std::atomic<bool> holding{false},observed{false},invalid_budget{false};
+  std::atomic<unsigned> opened{0},pixels{0};
   State(mmltk::testsupport::TestGate::Receipt in,mmltk::testsupport::TestGate::Receipt out,bool complete)
    : input(std::move(in)),output(std::move(out)),output_entered(held.get_future().share()),completion(complete) {}
  } state(input.receipt(),output.receipt(),hold_completion);
  const DirectoryCompileObservation observer{&state,[](void* context,CompileTaskKind kind,std::uint32_t image,bool complete) {
   auto& state=*static_cast<State*>(context);
+  if (kind==CompileTaskKind::Archive && complete) ++state.opened;
+  if (kind==CompileTaskKind::Pixels && complete) ++state.pixels;
   if (kind==CompileTaskKind::Archive && !image && !complete) state.input.ArriveAndWait();
   if (kind==CompileTaskKind::Output && !image && complete==state.completion) {
    state.holding.store(true); release_test_promise(state.held); state.output.ArriveAndWait(); state.holding.store(false);
@@ -1507,6 +1510,7 @@ TEST_CASE("Directory file services preserve Extraction floors and peer pixels th
  output.Release();
  if (cancel) CHECK_THROWS(mmltk::testsupport::await_test_future(compile,"Directory file service cancellation drain",std::chrono::seconds{30}));
  else mmltk::testsupport::await_test_future(compile,"Directory file service completion",std::chrono::seconds{30});
+ if (!cancel) { CHECK(state.opened==fixture.num_images); CHECK(state.pixels==fixture.num_images); }
  CHECK_FALSE(state.invalid_budget.load()); CHECK(read_output()==baseline);
 }
 TEST_CASE("mask continuations bound long slabs and preserve rollback and complete capacity counts", "[backend][data][compiler][mask]") {

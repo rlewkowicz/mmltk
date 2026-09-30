@@ -11,6 +11,9 @@ namespace mmltk::backend::data::detail {
 // context, descriptors and output spans alive until the returned completion.
 // Compiler instances draw service grants from CompileExecution; runtime instances
 // use the already-owned reader pool and never create compile class reservations.
+// Unstarted compile records stay selectable by class until a dispatcher and its
+// grant are both available. Completion callbacks keep dispatcher/producer custody
+// after the physical call releases its CPU grant.
 class FileWorkQueue final {
 public:
  struct Operation {
@@ -30,6 +33,7 @@ public:
  // Empty means temporarily full. A throw means rejected. Neither outcome calls
  // completed or retains the operation, a pending record, or a new class producer;
  // the caller still owns settlement and may retry only the full outcome.
+ // Execution interruption is checked before either acceptance or the full result.
  [[nodiscard]] std::optional<CompileExecution::Completion> try_submit(Operation);
  [[nodiscard]] CompileExecution::Completion submit(Operation);
  void join();

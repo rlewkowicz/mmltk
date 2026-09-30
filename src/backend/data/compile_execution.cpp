@@ -404,7 +404,13 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
    for (std::size_t turn = 0; turn < class_count; ++turn) {
     const auto class_index = (cursor + turn) % class_count;
     if (!discard && floors && lane.baseline != CompileWorkClass::Count && index(lane.baseline) != class_index) continue;
-    if (!discard && service_waiters[class_index] && !lane.active) { cursor = class_index; admission->changed.notify_all(); return false; }
+    if (!discard && service_waiters[class_index] && !lane.active) {
+     // Nonblocking services wait through Readiness, while blocking pumps wait
+     // directly on admission. Publish only a real cursor handoff: notifying on
+     // an unchanged denied probe would wake this predicate indefinitely.
+     if (cursor != class_index) { cursor = class_index; notify_locked(); }
+     return false;
+    }
     auto& kind_cursor = classes[class_index].kind_cursor;
     for (std::size_t step = 0; step < kind_count; ++step) {
      const auto kind = (kind_cursor + step) % kind_count;
@@ -508,14 +514,23 @@ void CompileExecution::Impl::events() noexcept {
  std::vector<std::pair<std::shared_ptr<Readiness::State>, Readiness::Changes>> callbacks;
  for (;;) {
   std::array<pollfd, 2> descriptors{{{event.get(), POLLIN, 0}, {cancellation_observed ? -1 : cancellation.descriptor(), POLLIN, 0}}};
+  int timeout = -1;
+  if (cancellation.descriptor() < 0) {
+   const std::lock_guard lock(admission->mutex);
+   // Preserve the legacy blocking service wait's cancellation sampling for
+   // inputs without a notifying descriptor. Only armed service demand needs
+   // this compatibility wake; normal readiness and cancellation stay event driven.
+   if (std::ranges::any_of(service_waiters, [](std::size_t count) { return count != 0; })) timeout = 100;
+  }
   int result;
-  do { result = ::poll(descriptors.data(), descriptors.size(), -1); } while (result < 0 && errno == EINTR);
+  do { result = ::poll(descriptors.data(), descriptors.size(), timeout); } while (result < 0 && errno == EINTR);
   if (result < 0) {
    const std::lock_guard lock(admission->mutex);
    failure = std::make_exception_ptr(std::system_error(errno, std::generic_category(), "compile event wait"));
    admission->changed.notify_all();
    return;
   }
+  if (!result && !cancellation.requested()) continue;
   if (descriptors[0].revents) { std::uint64_t value; while (::read(event.get(), &value, sizeof(value)) < 0 && errno == EINTR) {} }
   CompileExecutionSnapshot observation;
   bool cancelled;
@@ -523,7 +538,7 @@ void CompileExecution::Impl::events() noexcept {
    const std::lock_guard lock(admission->mutex);
    if (shutdown) return;
    cancelled = cancellation.requested();
-   if (cancelled && !cancellation_observed) publish_locked(CompileAdmission::Change::Interruption);
+   if (cancelled && (!cancellation_observed || !result)) publish_locked(CompileAdmission::Change::Interruption);
    admission->changed.notify_all();
    for (const auto& callback : observers) if (callback->notified) {
     // Acknowledge exactly this batch. Mutations racing delivery accumulate in
@@ -785,7 +800,9 @@ void CompileExecution::notify_admission_change() noexcept { const std::lock_guar
 CompileExecution::Readiness::Readiness(CompileExecution& owner, std::function<void(Changes)> callback) : owner_(owner), state_(std::make_shared<State>()) {
  state_->callback = std::move(callback);
  const std::lock_guard lock(owner_.impl_->admission->mutex);
- if (owner_.impl_->observers.size() >= owner_.impl_->record_limit) throw std::length_error("compile readiness capacity exceeded");
+ // Control owners remain independently live even with one prepared CPU task
+ // record. Keep bounded class-owner headroom for their readiness registrations.
+ if (owner_.impl_->observers.size() >= std::max(owner_.impl_->record_limit, class_count)) throw std::length_error("compile readiness capacity exceeded");
  owner_.impl_->observers.push_back(state_);
 }
 CompileExecution::Readiness::~Readiness() {
@@ -1027,9 +1044,61 @@ void CompileExecution::ServiceGrant::release() noexcept {
  owner->lanes[lane_].service = false; --owner->admission->active; --owner->services; --owner->classes[index(class_)].running; owner->reconcile(); owner->notify_locked();
 }
 int CompileExecution::ServiceGrant::cpu() const noexcept { return owner_ ? owner_->cpus[lane_] : -1; }
+CompileExecution::ServiceDemand::ServiceDemand(CompileExecution& owner) : owner_(owner.impl_) {}
+CompileExecution::ServiceDemand::~ServiceDemand() { update({}); }
+void CompileExecution::ServiceDemand::update_locked(const Classes& classes) noexcept {
+ if (pending_ == classes) return;
+ for (std::size_t kind = 0; kind < class_count; ++kind) {
+  if (pending_[kind] == classes[kind]) continue;
+  if (classes[kind]) ++owner_->service_waiters[kind];
+  else --owner_->service_waiters[kind];
+ }
+ pending_ = classes;
+ owner_->notify_locked();
+}
+void CompileExecution::ServiceDemand::update(const Classes& classes) noexcept {
+ const std::lock_guard lock(owner_->admission->mutex);
+ update_locked(classes);
+}
+std::optional<CompileExecution::ServiceGrant> CompileExecution::ServiceDemand::try_grant_locked(std::stop_token local_stop) {
+ owner_->check();
+ if (local_stop.stop_requested()) throw std::runtime_error("compile service admission cancelled");
+ if (owner_->admission->active + owner_->admission->external_cpus >= owner_->lanes.size()) return {};
+ for (std::size_t turn = 0; turn < class_count; ++turn) {
+  const auto kind = (owner_->cursor + turn) % class_count;
+  if (!pending_[kind]) continue;
+  if (!owner_->floors) {
+   for (std::size_t earlier = 0; earlier < turn; ++earlier)
+    if (owner_->service_waiters[(owner_->cursor + earlier) % class_count]) return {};
+   // Compute and services use one cursor. Earlier runnable compute receives a
+   // bounded turn before handing the cursor to a waiting service class.
+   if (turn && std::ranges::any_of(owner_->ready, [](const auto& queue) { return !queue.empty(); })) return {};
+  }
+  const auto service_class = static_cast<CompileWorkClass>(kind);
+  for (bool baseline : {true, false}) for (std::size_t lane_index = 0; lane_index < owner_->lanes.size(); ++lane_index) {
+   auto& lane = owner_->lanes[lane_index];
+   if (lane.busy()) continue;
+   if (!((baseline && lane.baseline == service_class) || (!baseline && (!owner_->floors || lane.baseline == CompileWorkClass::Count)))) continue;
+   update_locked({});
+   owner_->cursor = (kind + 1) % class_count;
+   lane.service = true; ++owner_->admission->active; ++owner_->services; ++owner_->classes[kind].running;
+   owner_->notify_locked();
+   return ServiceGrant(owner_, service_class, lane_index);
+  }
+ }
+ return {};
+}
+std::optional<CompileExecution::ServiceGrant> CompileExecution::ServiceDemand::try_grant(std::stop_token local_stop) {
+ const std::lock_guard lock(owner_->admission->mutex);
+ return try_grant_locked(local_stop);
+}
 CompileExecution::ServiceGrant CompileExecution::service_grant(CompileWorkClass kind, std::stop_token local_stop) {
  if (index(kind) >= class_count) throw std::invalid_argument("invalid compile service class");
  if (on_lane()) throw std::logic_error("compile CPU lane cannot wait for a service grant");
+ ServiceDemand demand(*this);
+ ServiceDemand::Classes classes{};
+ classes[index(kind)] = true;
+ demand.update(classes);
  // Register before taking the admission lock. Cancellation synchronizes with
  // the predicate/wait transition; callback destruction follows lock release.
  const std::stop_callback interrupted(local_stop, [owner = impl_] {
@@ -1037,33 +1106,11 @@ CompileExecution::ServiceGrant CompileExecution::service_grant(CompileWorkClass 
   owner->admission->changed.notify_all();
  });
  std::unique_lock lock(impl_->admission->mutex);
- std::size_t selected = impl_->lanes.size();
- ++impl_->service_waiters[index(kind)];
- impl_->notify_locked();
- try { impl_->wait(lock, [&] {
-  impl_->check();
-  if (local_stop.stop_requested()) throw std::runtime_error("compile service admission cancelled");
-  if (impl_->admission->active + impl_->admission->external_cpus >= workers()) return false;
-  if (!impl_->floors) {
-   const auto distance = (index(kind) + class_count - impl_->cursor) % class_count;
-   for (std::size_t turn = 0; turn < distance; ++turn)
-    if (impl_->service_waiters[(impl_->cursor + turn) % class_count]) return false;
-   // Workers advance the same class cursor to this waiting service after
-   // offering earlier classes one bounded runnable task (or finding none fit).
-   if (distance && std::ranges::any_of(impl_->ready, [](const auto& queue) { return !queue.empty(); })) return false;
-  }
-  for (bool baseline : {true, false}) for (std::size_t i = 0; i < impl_->lanes.size(); ++i) {
-   const auto& lane = impl_->lanes[i];
-   if (lane.busy()) continue;
-   if ((baseline && lane.baseline == kind) || (!baseline && (!impl_->floors || lane.baseline == CompileWorkClass::Count))) { selected = i; return true; }
-  }
-  return false;
+ std::optional<ServiceGrant> grant;
+ impl_->admission->changed.wait(lock, [&] {
+  grant = demand.try_grant_locked(local_stop);
+  return bool(grant);
  });
- } catch (...) { --impl_->service_waiters[index(kind)]; impl_->notify_locked(); throw; }
- --impl_->service_waiters[index(kind)];
- impl_->cursor = (index(kind) + 1) % class_count;
- impl_->lanes[selected].service = true; ++impl_->admission->active; ++impl_->services; ++impl_->classes[index(kind)].running;
- impl_->notify_locked();
- return ServiceGrant(impl_, kind, selected);
+ return std::move(*grant);
 }
 }
