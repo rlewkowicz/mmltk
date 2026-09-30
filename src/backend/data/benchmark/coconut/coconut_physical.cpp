@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory_io.h"
@@ -81,14 +82,14 @@ struct CoconutPhysicalMembership::Impl {
  std::vector<Artifact> artifacts;
  std::map<CoconutImageNamespace, std::map<std::uint16_t, std::set<std::string>>> standalone_shards;
  const BenchmarkCacheLayout* cache = nullptr;
- StorageReservationPool* storage = nullptr;
+ detail::StorageReservationPool* storage = nullptr;
  BenchmarkCompilePipeline* execution = nullptr;
  Cancellation cancellation;
  Progress progress;
  Repair repair;
  mutable std::mutex mutex;
  mutable std::condition_variable changed;
- Impl(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& layout, StorageReservationPool& reservations,
+ Impl(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& layout, detail::StorageReservationPool& reservations,
   BenchmarkCompilePipeline& pipeline, Cancellation cancel, Progress observer, Repair recover)
      : cache(&layout), storage(&reservations), execution(&pipeline), cancellation(cancel), progress(std::move(observer)), repair(std::move(recover)) {
   artifacts.reserve(admitted.size());
@@ -209,7 +210,7 @@ struct CoconutPhysicalMembership::Impl {
  }
 };
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& cache,
- StorageReservationPool& storage, BenchmarkCompilePipeline& execution, Cancellation cancellation, Progress progress, Repair repair)
+ detail::StorageReservationPool& storage, BenchmarkCompilePipeline& execution, Cancellation cancellation, Progress progress, Repair repair)
     : impl_(std::make_unique<Impl>(admitted, catalog, explicit_catalog, cache, storage, execution, cancellation, std::move(progress), std::move(repair))) {}
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<const CoconutPhysicalImage> images, Cancellation cancellation) : impl_(std::make_unique<Impl>(images, cancellation)) {}
 CoconutPhysicalMembership::~CoconutPhysicalMembership() = default;
@@ -329,7 +330,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
  if (descriptor < 0) throw common_io::errno_error("cannot open physical image cache", artifact.root.string());
  common_io::FileHandle directory(descriptor);
  BenchmarkImageDecoder decoder;
- StorageReservationPool destination(artifact.root, {}, state.storage);
+ detail::StorageReservationPool destination(artifact.root, {}, state.storage);
  const CachedImageValidator validate = [&](std::uint64_t, std::span<const std::uint8_t> encoded) {
   if (!has_complete_image_markers(encoded)) throw BenchmarkImageError("incomplete COCONut JPEG");
   return decoder.read_header(encoded);

@@ -114,8 +114,7 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     benchmark/benchmark_image_decoder.cpp
     benchmark/benchmark_sampling.cpp
     compiler/dataset_compiler_progress.cpp
-    mask_rle_utils.cpp
-    staging_file_cleanup.cpp)
+    mask_rle_utils.cpp)
 mmltk_register_retained_module_importers(mmltk_backend_data
     compiled/compiled_image_stream.cpp
     benchmark/benchmark_writer.cpp
@@ -125,7 +124,9 @@ mmltk_register_retained_module_importers(mmltk_backend_data
     compiler/dataset_compiler_scan_labels.cpp
     loading/dataset_loader.cpp)
 mmltk_register_ordinary_sources(mmltk_backend_data
-    writable_pixel_range.cpp)
+    storage_reservation.cpp
+    staged_artifact.cpp
+    compiled_slot_storage.cpp)
 mmltk_register_private_headers(mmltk_backend_data
     benchmark/detail/benchmark_annotation_cache.h
     benchmark/detail/benchmark_json.h
@@ -170,8 +171,9 @@ mmltk_register_private_headers(mmltk_backend_data
     detail/worker_queue.h
     compiler/detail/dataset_compiler_internal.h
     detail/mask_rle_utils.h
-    detail/staging_file_cleanup.h
-    detail/writable_pixel_range.h)
+    detail/storage_reservation.h
+    detail/staged_artifact.h
+    detail/compiled_slot_storage.h)
 
 target_include_directories(mmltk_backend_data
     PRIVATE

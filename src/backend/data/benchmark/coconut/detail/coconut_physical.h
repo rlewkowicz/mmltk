@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
 #include "src/backend/data/detail/compile_resources.h"
@@ -24,7 +25,7 @@ struct AdmittedRecipeArchive {
 };
 struct BenchmarkCacheLayout;
 class BenchmarkCompilePipeline;
-class StorageReservationPool;
+
 struct CoconutPhysicalImage;
 struct CoconutInventoryImage;
 struct CoconutRecord;
@@ -59,7 +60,7 @@ public:
  // Synchronous observations of independently completed images and the source cursor.
  using Progress = std::function<void(CoconutEdition, const AdmittedRecipeArchive&, std::uint64_t image_id, std::uint64_t entries)>;
  using Repair = std::function<void(AdmittedRecipeArchive&, std::string)>;
- CoconutPhysicalMembership(std::span<AdmittedRecipeArchive>, const CoconutRecipeCatalog&, bool explicit_catalog, const BenchmarkCacheLayout&, StorageReservationPool&, BenchmarkCompilePipeline&,
+ CoconutPhysicalMembership(std::span<AdmittedRecipeArchive>, const CoconutRecipeCatalog&, bool explicit_catalog, const BenchmarkCacheLayout&, detail::StorageReservationPool&, BenchmarkCompilePipeline&,
   mmltk::common::concurrency::CancellationObservation = {}, Progress = {}, Repair = {});
  explicit CoconutPhysicalMembership(std::span<const CoconutPhysicalImage>, mmltk::common::concurrency::CancellationObservation = {});
  ~CoconutPhysicalMembership();

@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
@@ -54,7 +55,7 @@ public:
  [[nodiscard]] const NormalizedImage& image() const noexcept { return image_; }
  [[nodiscard]] std::span<const NormalizedBox> boxes() const noexcept { return mapped_boxes_.empty() ? std::span<const NormalizedBox>(boxes_) : mapped_boxes_; }
  [[nodiscard]] std::span<const RLEPair> runs() const noexcept { return mapped_runs_.empty() ? std::span<const RLEPair>(runs_) : mapped_runs_; }
- [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> stage(std::shared_ptr<const CoconutNativeImage>, const std::filesystem::path&, StorageReservationPool* = nullptr);
+ [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> stage(std::shared_ptr<const CoconutNativeImage>, const std::filesystem::path&, detail::StorageReservationPool* = nullptr);
  [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> bind(std::shared_ptr<const CoconutNativeImage>, const CoconutPhysicalImage&);
  [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> rejected(const CoconutRecord&, const CoconutPhysicalImage&, std::shared_ptr<const CoconutNativeLineage>);
  [[nodiscard]] bool required_labels_valid() const noexcept { return required_labels_valid_; }

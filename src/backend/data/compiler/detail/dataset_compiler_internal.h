@@ -10,6 +10,8 @@
 #include "src/backend/data/compiled/compiled_file_layout.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/common/io/file_memory.h"
+#include "src/backend/data/detail/compiled_slot_storage.h"
+#include "src/backend/data/detail/file_work_queue.h"
 namespace mmltk::backend::data::compiler_internal {
 struct DatasetScan {
  catalog::ClassCatalog class_catalog;
@@ -68,9 +70,9 @@ std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_
 std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);
 DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::string>& splits, mmltk::common::concurrency::CancellationObservation cancellation = {});
 LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config, const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base,
- const mmltk::common::io::FileHandle& output, const FileLayout& pixel_layout, int num_workers, std::span<const int> worker_cpus, ProgressCounter* completed_images = nullptr,
+ detail::CompiledSlotStorage& storage, detail::FileWorkQueue& files, int num_workers, std::span<const int> worker_cpus, ProgressCounter* completed_images = nullptr,
  std::atomic<bool>* failure_requested = nullptr, mmltk::common::concurrency::CancellationObservation cancellation = {});
 void write_metadata_blocks(const mmltk::common::io::FileHandle& fd, const FileLayout& layout, const FileHeader& header, const LabelBlocks& label_blocks,
  mmltk::common::concurrency::CancellationObservation cancel_requested = {});
-void write_pixel_blob(const mmltk::common::io::FileHandle& fd, const PixelBlobWriteRequest& request);
+void write_pixel_blob(detail::CompiledSlotStorage&, detail::FileWorkQueue&, const PixelBlobWriteRequest& request);
 }  // namespace mmltk::backend::data::compiler_internal

@@ -17,6 +17,7 @@ public:
   void* context = nullptr;
   void (*call)(void*) = nullptr;
   std::function<void(std::exception_ptr)> completed;
+  std::function<void()> work;
  };
  FileWorkQueue(CompileExecution&, std::size_t records, std::size_t services = 1);
  FileWorkQueue(mmltk::common::concurrency::WorkerPool&, std::size_t records);
@@ -24,6 +25,7 @@ public:
  FileWorkQueue(const FileWorkQueue&) = delete;
  FileWorkQueue& operator=(const FileWorkQueue&) = delete;
  [[nodiscard]] std::optional<CompileExecution::Completion> try_submit(Operation);
+ [[nodiscard]] CompileExecution::Completion submit(Operation);
  void join();
  // Settle unstarted operations and interrupt local service admission. Running
  // calls keep their context until physical return; join waits for that custody.

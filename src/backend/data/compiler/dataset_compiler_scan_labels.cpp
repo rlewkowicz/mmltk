@@ -396,7 +396,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
  return scan;
 }
 LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config, const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base,
- const mmltk::common::io::FileHandle& output, const FileLayout& pixel_layout, int num_workers, const std::span<const int> worker_cpus, ProgressCounter* completed_images,
+ detail::CompiledSlotStorage& storage, detail::FileWorkQueue& files, int num_workers, const std::span<const int> worker_cpus, ProgressCounter* completed_images,
  std::atomic<bool>* failure_requested, const mmltk::common::concurrency::CancellationObservation cancellation) {
  mmltk::common::logging::ScopedProfile profile{"compiler.labels.build_blocks"};
  auto record_worker_stats = [&](const std::vector<LabelWorkerStats>& worker_stats) {
@@ -446,6 +446,8 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
   const auto worker_start = std::chrono::steady_clock::now();
 #endif
   dataset::MaskResizeScratch mask_scratch;
+  detail::CompiledLabelWorkspace output;
+  output.prepare(0);
   ProgressBatch progress(completed_images);
   std::vector<CompileDiagnostic>* diagnostics = worker_diagnostics.empty() ? nullptr : &worker_diagnostics[static_cast<size_t>(worker_id)];
   for (uint32_t image_index = start; image_index < end; ++image_index) {
@@ -491,8 +493,11 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
     checks.image_width = config.target_width;
     checks.image_height = config.target_height;
     (void)admit_compiled_annotations(entry, {result.labels, result.rle_pairs}, checks, image_index, cancellation);
-    output.allocate_range(pixel_layout.label_offset(image_index), compiled_align_up(entry.label_bytes, PAGE_SIZE));
-    write_compiled_annotations(output, pixel_layout, image_index, entry, {result.labels, result.rle_pairs});
+    output.prepare(0);
+    output.labels.resize(result.labels.size()); output.runs.resize(result.rle_pairs.size());
+    std::ranges::copy(result.labels,output.labels.begin()); std::ranges::copy(result.rle_pairs,output.runs.begin());
+    auto payload=std::make_shared<detail::CompiledLabelWorkspace::OutputLease>(output.release_output());
+    files.submit({.work=[&storage,image_index,entry,payload] { storage.labels(image_index).write(entry,std::move(*payload)); }}).wait();
 #if MMLTK_ENABLE_PROFILING
     ++stats.images;
     stats.instances += instances.size();

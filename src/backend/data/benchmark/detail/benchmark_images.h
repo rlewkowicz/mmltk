@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include <algorithm>
@@ -26,7 +27,7 @@ using mmltk::backend::data::detail::CompileAllowance;
 // borrowed input can wait for an image reader.
 [[nodiscard]] CompileResources archive_image_resources();
 class BenchmarkCompilePipeline;
-class StorageReservationPool;
+
 // Parses the "quarantined" manifest array shared by the cached-image manifests: each record must
 // carry a reason and reference a requested image id. Returns false when the array is malformed.
 // append receives (image_id, reason) per record.
@@ -81,7 +82,7 @@ void prepare_cached_image_directory(const std::filesystem::path& root);
  std::vector<CachedImageRejection>* quarantined = nullptr);
 void complete_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, std::string_view identity, std::span<const std::uint64_t> expected_image_ids,
  std::uint64_t image_bytes, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace = {}, std::span<const CachedImageRejection> quarantined = {},
- StorageReservationPool* storage = nullptr);
+ detail::StorageReservationPool* storage = nullptr);
 // Everything one archive extraction needs. The knobs live here instead of in a positional parameter
 // list so the entry point keeps a single signature that callers and the definition cannot drift.
 struct ArchiveExtractionRequest {
@@ -103,7 +104,7 @@ struct ArchiveExtractionRequest {
  std::filesystem::path completion_path = {};
  CachedImageReadySink image_ready = {};
  BenchmarkCompilePipeline* execution = nullptr;
- StorageReservationPool* storage = nullptr;
+ detail::StorageReservationPool* storage = nullptr;
  CompileAllowance parent_allowance{};
 };
 [[nodiscard]] CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest request);

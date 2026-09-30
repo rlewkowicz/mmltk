@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include <array>
@@ -16,7 +17,7 @@
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
 class BenchmarkMappedArtifact;
-class StorageReservationPool;
+
 class CoconutInputError final : public std::runtime_error {
 public:
  using std::runtime_error::runtime_error;
@@ -58,7 +59,7 @@ public:
   writable();
   values_.push_back(std::move(value));
  }
- void stage(const std::filesystem::path&, StorageReservationPool*);
+ void stage(const std::filesystem::path&, detail::StorageReservationPool*);
 
 private:
  void writable();

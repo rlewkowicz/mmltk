@@ -64,7 +64,8 @@ struct FileWorkQueue::Impl {
     // precedes it or joins the admitted call through its actual return.
     records[index].state = State::Running;
    }
-   records[index].operation.call(records[index].operation.context);
+   if (records[index].operation.work) records[index].operation.work();
+   else records[index].operation.call(records[index].operation.context);
   } catch (...) { error = std::current_exception(); }
   {
    const std::lock_guard lock(mutex);
@@ -115,7 +116,7 @@ FileWorkQueue::~FileWorkQueue() {
  impl_->changed.notify_all(); impl_->services.clear();
 }
 std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation operation) {
- if (!operation.call) throw std::invalid_argument("empty borrowed file operation");
+ if (!operation.call && !operation.work) throw std::invalid_argument("empty borrowed file operation");
  std::unique_lock lock(impl_->mutex);
  if (impl_->stopping) throw std::runtime_error("file queue admission after stop");
  const auto position = std::ranges::find(impl_->records, Impl::State::Free, &Impl::Record::state);
@@ -135,6 +136,14 @@ std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation 
   } catch (...) { position->dispatch_owner.reset(); position->operation = {}; position->state = Impl::State::Free; --impl_->pending; throw; }
  }
  lock.unlock(); impl_->changed.notify_one(); return result;
+}
+CompileExecution::Completion FileWorkQueue::submit(Operation operation) {
+ if (impl_->execution && impl_->execution->on_lane()) throw std::logic_error("blocking file admission inside a compile lane");
+ for (;;) {
+  if (auto completion = try_submit(operation)) return std::move(*completion);
+  std::unique_lock lock(impl_->mutex);
+  impl_->changed.wait(lock,[&] { return impl_->stopping || std::ranges::any_of(impl_->records,[](const Impl::Record& record) { return record.state == Impl::State::Free; }); });
+ }
 }
 void FileWorkQueue::join() { std::unique_lock lock(impl_->mutex); impl_->changed.wait(lock, [&] { return !impl_->pending; }); }
 void FileWorkQueue::cancel() noexcept {

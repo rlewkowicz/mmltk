@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include <atomic>
 #include <functional>
@@ -28,7 +29,7 @@ namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
 
 using detail::CompileExecution;
-class StorageReservationPool;
+
 // Rejection of the annotation document itself, never a local execution failure.
 class AnnotationDocumentRejected final : public std::runtime_error {
 public:
@@ -155,7 +156,7 @@ private:
 class NormalizedAnnotationAssembler final {
 public:
  explicit NormalizedAnnotationAssembler(NormalizedAnnotationMetadata, std::size_t images, std::size_t boxes, std::size_t runs, mmltk::common::concurrency::CancellationObservation = {},
-  const std::filesystem::path& staging_directory = {}, StorageReservationPool* = nullptr);
+  const std::filesystem::path& staging_directory = {}, detail::StorageReservationPool* = nullptr);
  NormalizedAnnotationAssembler(const NormalizedAnnotationAssembler&) = delete;
  NormalizedAnnotationAssembler& operator=(const NormalizedAnnotationAssembler&) = delete;
  void begin_image(NormalizedImage);
@@ -204,7 +205,7 @@ struct AnnotationParseOptions {
  std::string_view expected_annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {}, const nlohmann::json* completion = nullptr,
  bool metadata_only = false, std::uint64_t completion_bytes = 0, const NormalizedAnnotationRowReady& ready = {});
 std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotation_index(const std::filesystem::path& path, const NormalizedAnnotationIndex& index,
- mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {}, StorageReservationPool* storage = nullptr, const nlohmann::json& extension = {});
+ mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {}, detail::StorageReservationPool* storage = nullptr, const nlohmann::json& extension = {});
 void remove_normalized_annotation_index(const std::filesystem::path& path);
 [[nodiscard]] std::vector<std::uint64_t> image_ids(const NormalizedAnnotationReadView&);
 }  // namespace mmltk::backend::data::benchmark_internal

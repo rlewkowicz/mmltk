@@ -1,10 +1,13 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/staged_artifact.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include "src/backend/data/detail/compile_resources.h"
+#include "src/backend/data/detail/compiled_label_workspace.h"
 #include "src/backend/data/detail/compile_pixel_workspace.h"
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <cstddef>
 #include <filesystem>
@@ -19,7 +22,6 @@
 #include <vector>
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/compiled/compiled_file_utils.h"
-#include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
@@ -48,7 +50,7 @@ struct PreparedBenchmarkSplit {
  std::size_t labels = 0, runs = 0;
 };
 struct BenchmarkSealedSplit final {
- BenchmarkStagedArtifact artifact;
+ detail::StagedArtifact artifact;
  CompiledDatasetInfo info;
 };
 struct BenchmarkWriteProgressEvent final {
@@ -78,6 +80,9 @@ struct BenchmarkWriteRequest {
  BenchmarkImageReadObserver pixel_preparing{};
  BenchmarkCompilePipeline* execution = nullptr;
  CompiledCompactionProgress compaction{};
+ std::span<std::byte> compaction_scratch{};
+ // Effect-only physical preparation observation, outside source/facts locks.
+ BenchmarkImageReadObserver extent_preparing{};
 };
 // Physical slots are stable across sparse growth. Calls on different
 // slots may overlap; execution lends an exclusive pixel context and arena.
@@ -97,7 +102,9 @@ public:
  void settle_labels(std::uint32_t, std::uint64_t ordinal_base, bool ordinal_incomplete = false);
  [[nodiscard]] ImageEntry entry(std::uint32_t) const;
  [[nodiscard]] BenchmarkSealedSplit seal_slots(const BenchmarkWriteRequest&, std::span<const std::uint32_t>);
- void write_labels(std::uint32_t slot, ImageEntry entry, ImageAnnotations, std::size_t lane = 0, std::uint64_t ordinal_base = 0);
+ void prepare_pixels(std::uint32_t);
+ void write_label_output(std::uint32_t, ImageEntry, detail::CompiledLabelWorkspace::OutputLease, std::uint64_t ordinal_base = 0);
+ void write_labels(std::uint32_t slot, ImageEntry entry, ImageAnnotations, std::uint64_t ordinal_base = 0);
  [[nodiscard]] std::shared_ptr<BenchmarkPixelInput> prepare_pixel(
   std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication = {}, CompileAllowance allowance = {}, std::shared_ptr<const BenchmarkEncodedImage> payload = {},
   std::shared_ptr<const detail::CompilePixelWorkspacePlan> plan = {});
@@ -123,4 +130,8 @@ private:
  std::unique_ptr<Impl> impl_;
 };
 void write_benchmark_split(const BenchmarkWriteRequest& request);
+// Joins both physical seals before returning either result or propagating an
+// error. Each callback receives admitted pinned compaction scratch.
+[[nodiscard]] std::array<BenchmarkSealedSplit,2> seal_benchmark_splits(BenchmarkCompilePipeline&,
+ const std::function<BenchmarkSealedSplit(std::size_t,std::span<std::byte>)>&);
 }  // namespace mmltk::backend::data::benchmark_internal

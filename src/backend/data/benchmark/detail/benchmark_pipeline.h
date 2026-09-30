@@ -1,7 +1,9 @@
 #pragma once
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/detail/compile_execution.h"
+#include "src/backend/data/detail/file_work_queue.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <cstddef>
@@ -24,7 +26,7 @@ struct PreparedBenchmarkSplit;
 struct BenchmarkLabelChunk;
 class BenchmarkLabelInput;
 class BenchmarkLabelWorkspace;
-class StorageReservationPool;
+
 class BenchmarkCompilePipeline final {
  friend class BenchmarkSourcePublication;
 public:
@@ -34,7 +36,8 @@ public:
  BenchmarkCompilePipeline& operator=(const BenchmarkCompilePipeline&) = delete;
  [[nodiscard]] detail::CompileExecution& execution() noexcept;
  [[nodiscard]] BenchmarkCurl& curl();
- [[nodiscard]] StorageReservationPool& storage() noexcept;
+ [[nodiscard]] detail::FileWorkQueue& files() noexcept;
+ [[nodiscard]] detail::StorageReservationPool& storage() noexcept;
  void write_remaining(BenchmarkSplitWriter&, const PreparedBenchmarkSplit&, std::span<const std::size_t>);
  [[nodiscard]] detail::CompileExecution::Completion image_completion(const std::filesystem::path&, std::uint64_t) const;
  [[nodiscard]] detail::CompileExecution::Completion label_completion(const std::filesystem::path&, std::uint64_t, std::string_view) const;

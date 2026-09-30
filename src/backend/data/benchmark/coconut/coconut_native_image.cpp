@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/common/io/file_digest.h"
 #include <nlohmann/json.hpp>
@@ -55,14 +56,14 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::rejected(const Coc
  result->input_identity_ = coconut_image_input_identity(result->lineage().component.annotation_input_identity, physical, result->lineage().component.original_annotation_identity);
  return result;
 }
-std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::stage(std::shared_ptr<const CoconutNativeImage> source, const std::filesystem::path& directory, StorageReservationPool* storage) {
+std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::stage(std::shared_ptr<const CoconutNativeImage> source, const std::filesystem::path& directory, detail::StorageReservationPool* storage) {
  if (source->backing_ || (source->boxes_.empty() && source->runs_.empty())) return source;
  const auto boxes = source->boxes();
  const auto runs = source->runs();
  const auto bytes = mmltk::common::math::checked_add(boxes.size_bytes(), runs.size_bytes(), "native staging extent overflow");
  const auto root = directory.empty() ? std::filesystem::temp_directory_path() : directory;
  std::filesystem::create_directories(root);
- StorageReservationPool reservations(root, {}, storage);
+ detail::StorageReservationPool reservations(root, {}, storage);
  auto backing = std::make_shared<BenchmarkMappedArtifact>(reservations, root / ".native-image", bytes, "COCONut native image");
  backing->write(boxes.data(), boxes.size_bytes(), 0);
  backing->write(runs.data(), runs.size_bytes(), boxes.size_bytes());

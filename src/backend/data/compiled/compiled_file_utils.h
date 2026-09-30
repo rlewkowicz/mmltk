@@ -172,20 +172,25 @@ inline void write_compiled_annotations(
  if (annotations.labels.size() != entry.num_instances || annotations.runs.size() != entry.num_runs || entry.label_bytes != payload.used_bytes || entry.label_bytes > layout.label_capacity)
   throw std::runtime_error("compiled annotation write extent differs");
  const auto offset = layout.label_offset(slot);
- if (ordinal_base)
-  write_compiled_label_ordinals(file, offset, annotations.labels.size(), annotations.labels, ordinal_base);
- else
-  file.pwrite_all(annotations.labels.data(), annotations.labels.size_bytes(), offset);
  const std::uint64_t zero = 0;
- file.pwrite_all(&zero, payload.run_offset - annotations.labels.size_bytes(), offset + annotations.labels.size_bytes());
- file.pwrite_all(annotations.runs.data(), annotations.runs.size_bytes(), offset + payload.run_offset);
+ if (ordinal_base) write_compiled_label_ordinals(file, offset, annotations.labels.size(), annotations.labels, ordinal_base);
+ const std::array spans{
+  mmltk::common::io::FileHandle::WriteSpan{annotations.labels.data(), ordinal_base ? 0 : annotations.labels.size_bytes()},
+  mmltk::common::io::FileHandle::WriteSpan{&zero,payload.run_offset-annotations.labels.size_bytes()},
+  mmltk::common::io::FileHandle::WriteSpan{annotations.runs.data(),annotations.runs.size_bytes()}};
+ file.pwritev_all(spans,offset+(ordinal_base ? annotations.labels.size_bytes() : 0));
 }
 inline constexpr std::size_t COMPILED_COMPACTION_SCRATCH_BYTES = 4U * 1024U * 1024U;
+struct CompiledStorageMutation {
+ std::function<void(std::size_t,std::size_t)> allocate;
+ std::function<bool(std::size_t,std::size_t)> reclaim;
+ std::function<void(std::size_t)> shrink;
+};
 using CompiledCompactionProgress = std::function<void(std::size_t completed_bytes, std::size_t total_bytes)>;
 // All pixel/label borrowers must be drained. Compacts this private staged inode;
 // a failed or cancelled compaction is discarded by its existing publication owner.
 [[nodiscard]] FileLayout compact_compiled_file(const mmltk::common::io::FileHandle&, const FileLayout&, std::span<const ImageEntry>, mmltk::common::concurrency::CancellationObservation = {},
- CompiledCompactionProgress = {}, const std::function<void(std::size_t, std::size_t)>& reserve = {});
+ CompiledCompactionProgress = {}, CompiledStorageMutation = {}, std::span<std::byte> scratch = {});
 inline catalog::ClassCatalog compiled_class_catalog(const FileHeader& header) {
  std::vector<std::string> names;
  names.reserve(header.num_classes);

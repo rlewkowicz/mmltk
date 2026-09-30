@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/storage_reservation.h"
 #include <system_error>
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include <curl/curl.h>
@@ -270,11 +271,11 @@ struct HttpResponseHeaderFields {
 // Resumable partials keep their checkpoint lifetime on unwind. This owner only
 // settles their growth promise; discard policy remains in the transfer engine.
 struct DownloadStorage {
- StorageReservationPool filesystem;
- StorageReservationPool::Reservation growth;
- DownloadStorage(const DownloadRequest& request, StorageReservationPool& shared, const BenchmarkTraceSink& trace)
-     : filesystem(request.destination, trace, &shared),
-       growth(filesystem.reserve_download(request.destination, std::max(request.expected_size, request.storage_estimate), "benchmark download and replacement")) {}
+ detail::StorageReservationPool filesystem;
+ detail::StorageReservationPool::Reservation growth;
+ DownloadStorage(const DownloadRequest& request, detail::StorageReservationPool& shared, const BenchmarkTraceSink& trace)
+     : filesystem(request.destination, storage_observer(trace), &shared),
+       growth(reserve_download(filesystem, request.destination, std::max(request.expected_size, request.storage_estimate), "benchmark download and replacement")) {}
 };
 struct Transfer {
  DownloadStorage& storage;
@@ -970,7 +971,7 @@ struct SegmentTransfer {
  const std::string identity_digest = artifact_identity(request, request.expected_size, identity.etag, identity.last_modified);
  throw_if_benchmark_cancelled(cancel_requested);
  std::filesystem::rename(partial_path(request), request.destination);
- storage.growth.reconcile_download(request.destination);
+ reconcile_download(storage.growth, request.destination);
  sync_parent_directory(request.destination);
  const std::uint32_t attempts = state.maximum_attempts();
  write_json_atomically(complete_metadata_path(request),
@@ -1011,7 +1012,7 @@ struct SegmentTransfer {
  const std::string identity = artifact_identity(request, size, transfer.effective_etag(), transfer.effective_last_modified());
  throw_if_benchmark_cancelled(transfer.cancel_requested);
  std::filesystem::rename(partial_path(request), request.destination);
- transfer.storage.growth.reconcile_download(request.destination);
+ reconcile_download(transfer.storage.growth, request.destination);
  sync_parent_directory(request.destination);
  write_json_atomically(complete_metadata_path(request),
   nlohmann::json{
@@ -1042,7 +1043,7 @@ struct SegmentTransfer {
 }  // namespace
 namespace {
 DownloadResult download_locked_artifact(const DownloadRequest& request, std::size_t concurrency, mmltk::common::concurrency::CancellationObservation cancellation, const DownloadProgressSink& progress,
- const BenchmarkTraceSink& trace, BenchmarkCurl& transport, BenchmarkCompilePipeline* execution, const CompileAllowance& parent, StorageReservationPool& storage) {
+ const BenchmarkTraceSink& trace, BenchmarkCurl& transport, BenchmarkCompilePipeline* execution, const CompileAllowance& parent, detail::StorageReservationPool& storage) {
  DownloadStorage destination(request, storage, trace);
  if (auto result = validate_complete_artifact(request, cancellation, progress, trace)) { return *result; }
  // The partial descriptor and atomic checkpoint/publication descriptor belong
@@ -1051,7 +1052,7 @@ DownloadResult download_locked_artifact(const DownloadRequest& request, std::siz
  if (execution) files = execution->execution().reserve(CompileResources::handles(2, true), parent);
  destination.growth.withdraw_allocation();
  remove_invalid_complete_artifact(request);
- destination.growth.reconcile_download(request.destination);
+ reconcile_download(destination.growth, request.destination);
  bool redownload = false;
  // Stored segmented topology is admitted against the current remote identity,
  // independently of today's number of sockets (including a single socket).
@@ -1080,7 +1081,7 @@ DownloadResult download_locked_artifact(const DownloadRequest& request, std::siz
     if (failure) throw std::filesystem::filesystem_error("cannot reset unsupported segmented download", path, failure);
    }
    cached.emplace();  // The fallback removed both partial backing and metadata.
-   destination.growth.reconcile_download(request.destination);
+   reconcile_download(destination.growth, request.destination);
    trace_benchmark_event(
     trace, "benchmark.download.segmented_fallback", [&] { return nlohmann::json{{"artifact", request.artifact_id}, {"reason", error.what()}, {"redownload", request.redownload || redownload}}; });
   }
@@ -1156,7 +1157,7 @@ DownloadResult download_locked_artifact(const DownloadRequest& request, std::siz
      if (error) throw std::filesystem::filesystem_error("cannot reset invalid benchmark partial download", path, error);
     }
    }
-   destination.growth.reconcile_download(request.destination);
+   reconcile_download(destination.growth, request.destination);
    trace_benchmark_event(trace, "benchmark.download.attempt_failed", [&] {
     return nlohmann::json{
      {"artifact", request.artifact_id}, {"attempt", attempt}, {"curl_code", static_cast<int>(completed->result)}, {"http_status", transfer.http.response_code}, {"reset_partial", reset},
@@ -1199,7 +1200,7 @@ class DownloadBatch final {
  std::size_t concurrency_;
  CompileResources source_resources_ = CompileResources::handles(1, true, 2);
  std::unique_ptr<BenchmarkCurl::Channel> source_transport_;
- StorageReservationPool storage_;
+ detail::StorageReservationPool storage_;
  Cancellation cancellation_ = Cancellation::Borrow(*this);
  std::mutex mutex_, observer_mutex_;
  std::condition_variable changed_, jobs_changed_;
@@ -1260,7 +1261,7 @@ class DownloadBatch final {
 
 public:
  DownloadBatch(const std::vector<DownloadRequest>& requests, std::size_t requested_concurrency, Cancellation cancellation, const DownloadProgressSink& observer, const BenchmarkTraceSink& trace,
-  const DownloadReadySink& ready, BenchmarkCompilePipeline* execution, const CompileAllowance& parent, StorageReservationPool* storage, const DownloadUnavailableSink& unavailable)
+  const DownloadReadySink& ready, BenchmarkCompilePipeline* execution, const CompileAllowance& parent, detail::StorageReservationPool* storage, const DownloadUnavailableSink& unavailable)
      : requests_(requests),
        observer_(observer),
        trace_(trace),
@@ -1275,7 +1276,7 @@ public:
        source_transport_(transport_.channel(BenchmarkCurl::Class::Artifact, cancellation, source_resources_)),
        storage_(execution ? execution->storage()
                 : storage ? *storage
-                          : StorageReservationPool(requests.front().destination, trace)),
+                          : detail::StorageReservationPool(requests.front().destination, storage_observer(trace))),
        results_(requests.size()),
        jobs_(std::min(requests.size(), concurrency_)),
        free_(jobs_.size()) {
@@ -1355,7 +1356,7 @@ std::optional<DownloadResult> try_cached_download(const DownloadRequest& request
 }
 std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t requested_concurrency, mmltk::common::concurrency::CancellationObservation cancel_requested,
  const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready, BenchmarkCompilePipeline* execution, const CompileAllowance& parent,
- StorageReservationPool* storage, const DownloadUnavailableSink& unavailable) {
+ detail::StorageReservationPool* storage, const DownloadUnavailableSink& unavailable) {
  if (requests.empty()) return {};
  if (!requested_concurrency) throw std::runtime_error("benchmark download concurrency must be positive");
  std::unordered_set<std::filesystem::path> locks;

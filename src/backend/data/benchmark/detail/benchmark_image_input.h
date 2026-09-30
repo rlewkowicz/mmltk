@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/detail/compile_resources.h"
@@ -21,7 +22,7 @@ using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileResourceWait;
 
 using detail::CompileExecution;
-class StorageReservationPool;
+
 using CachedImageValidator = std::function<BenchmarkImageHeader(std::uint64_t, std::span<const std::uint8_t>)>;
 class BenchmarkImageReadError final : public std::runtime_error {
 public:
@@ -51,12 +52,12 @@ public:
  // cache miss; an opened record keeps that exact inode through deferral.
  [[nodiscard]] static std::unique_ptr<Opened> open_deferred(int directory, std::uint64_t, mmltk::common::concurrency::CancellationObservation, CompileAllowance controls, Ptr admitted = {},
   std::uint64_t maximum_bytes = std::numeric_limits<std::uint64_t>::max());
- static Ptr publish(const std::filesystem::path&, std::span<const std::uint8_t>, mmltk::common::concurrency::CancellationObservation, StorageReservationPool&, std::optional<BenchmarkImageHeader> = {},
+ static Ptr publish(const std::filesystem::path&, std::span<const std::uint8_t>, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool&, std::optional<BenchmarkImageHeader> = {},
   CompileAllowance = {}, bool retain_mapping = true, int directory = -1, std::string_view relative = {});
- static Ptr publish(const std::filesystem::path&, std::span<const std::uint8_t>, mmltk::common::concurrency::CancellationObservation, StorageReservationPool* = nullptr,
+ static Ptr publish(const std::filesystem::path&, std::span<const std::uint8_t>, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool* = nullptr,
   std::optional<BenchmarkImageHeader> = {}, CompileAllowance = {}, bool retain_mapping = true, int directory = -1, std::string_view relative = {});
  // Shared source-worker publication choice, including nonblocking FD pressure.
- static Ptr publish(int directory, std::uint64_t, std::span<const std::uint8_t>, BenchmarkImageHeader, mmltk::common::concurrency::CancellationObservation, StorageReservationPool&,
+ static Ptr publish(int directory, std::uint64_t, std::span<const std::uint8_t>, BenchmarkImageHeader, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool&,
   CompileExecution*, CompileAllowance input = {}, bool retain_mapping = true);
  [[nodiscard]] Ptr header_only() const;
  [[nodiscard]] const BenchmarkImageHeader& header() const noexcept { return header_; }

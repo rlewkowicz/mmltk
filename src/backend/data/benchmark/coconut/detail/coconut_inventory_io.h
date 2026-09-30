@@ -1,9 +1,9 @@
 #pragma once  // backend.data private implementation boundary
-#include "src/backend/data/detail/compile_execution.h"
+#include "src/backend/data/detail/staged_artifact.h"
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
-#include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include "src/common/io/file_digest.h"
 #include "src/common/io/file_memory.h"
@@ -23,17 +23,16 @@
 #include <type_traits>
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
-using mmltk::backend::data::detail::CompileTaskKind;
 
 class CoconutInventorySeal final {
 public:
  void capture(const mmltk::common::io::FileHandle& file);
  [[nodiscard]] std::span<const std::uint8_t> data() const { return {static_cast<const std::uint8_t*>(mapping.address()), bytes}; }
  // The component publisher holds mutex through inventory and completion publication.
- void publish(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, StorageReservationPool*);
+ void publish(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool*);
  // Custody changes are serialized; semantic fields and mapped bytes never change.
  mutable std::mutex mutex;
- BenchmarkStagedArtifact staged;
+ detail::StagedArtifact staged;
  mmltk::common::io::MappedByteRegion mapping;
  std::string identity;
  std::size_t bytes = 0;
@@ -49,7 +48,7 @@ concept InventoryRecord = std::same_as<T, CoconutPhysicalImage> || std::same_as<
 // are transient; records remain in their ordinary typed inventory owner.
 class InventoryOutput final {
 public:
- InventoryOutput(BenchmarkStagedArtifact* file, mmltk::common::concurrency::CancellationObservation cancellation) : file_(file), cancellation_(cancellation) {}
+ InventoryOutput(detail::StagedArtifact* file, mmltk::common::concurrency::CancellationObservation cancellation) : file_(file), cancellation_(cancellation) {}
  template <class T>
  void value(const T& item) {
   if constexpr (InventoryRecord<T>) {
@@ -80,7 +79,7 @@ public:
 private:
  void append(std::span<const std::uint8_t> bytes);
  void flush();
- BenchmarkStagedArtifact* file_;
+ detail::StagedArtifact* file_;
  mmltk::common::concurrency::CancellationObservation cancellation_;
  mmltk::common::io::Sha256Hasher hash_;
  std::array<std::uint8_t, 65536> buffer_{};
@@ -158,5 +157,5 @@ void validate_coconut_physical_image(const CoconutPhysicalImage&);
 [[nodiscard]] std::vector<CoconutPhysicalImage> load_coconut_physical_inventory(
  const std::filesystem::path&, CoconutImageNamespace, std::uint16_t, std::string_view, mmltk::common::concurrency::CancellationObservation, const std::function<void(const CoconutPhysicalImage&)>&);
 void store_coconut_physical_inventory(const std::filesystem::path&, std::span<const CoconutPhysicalImage>, CoconutImageNamespace, std::uint16_t, std::string_view,
- mmltk::common::concurrency::CancellationObservation, StorageReservationPool*);
+ mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool*);
 }  // namespace mmltk::backend::data::benchmark_internal

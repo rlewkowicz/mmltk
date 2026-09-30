@@ -1,6 +1,6 @@
+#include "src/backend/data/detail/storage_reservation.h"
 #include <system_error>
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
-#include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
@@ -74,7 +74,7 @@ class CachedImageWritePool {
 
 public:
  CachedImageWritePool(const std::size_t worker_count, const std::size_t expected_writes, std::filesystem::path output_root, CachedImageProgress progress, const std::uint64_t initially_completed,
-  const mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready, StorageReservationPool* storage, CompileAllowance allowance,
+  const mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready, detail::StorageReservationPool* storage, CompileAllowance allowance,
   BenchmarkCompilePipeline* execution, int directory)
      : execution_(execution),
        directory_(directory),
@@ -165,7 +165,7 @@ public:
 private:
  BenchmarkCompilePipeline* execution_;
  int directory_;
- StorageReservationPool storage_;
+ detail::StorageReservationPool storage_;
  CachedImageReadySink ready_;
  struct Task {
   std::uint64_t image_id = 0U;
@@ -345,7 +345,7 @@ bool validate_cached_image_group(const std::filesystem::path& root, const std::f
 }
 void complete_cached_image_group(const std::filesystem::path& root, const std::filesystem::path& completion_path, const std::string_view identity,
  const std::span<const std::uint64_t> expected_image_ids, const std::uint64_t image_bytes, const mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
- const std::span<const CachedImageRejection> quarantined, StorageReservationPool* storage) {
+ const std::span<const CachedImageRejection> quarantined, detail::StorageReservationPool* storage) {
  const std::vector<std::uint64_t> available = available_image_ids(expected_image_ids, quarantined);
  nlohmann::json quarantined_records = nlohmann::json::array();
  for (const CachedImageRejection& image : quarantined) { quarantined_records.push_back({{"image_id", image.image_id}, {"reason", image.reason}}); }

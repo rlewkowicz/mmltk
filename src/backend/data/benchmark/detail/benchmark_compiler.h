@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/storage_reservation.h"
 #include <string_view>
 #include <filesystem>
 #include <nlohmann/json.hpp>
@@ -10,5 +11,5 @@ namespace mmltk::backend::data::benchmark_internal {
 // Completes the benchmark manifest envelope from acquired source/split facts
 // and atomically publishes it into the existing staging transaction.
 void publish_benchmark_manifest(const BenchmarkCompilerConfig&, const std::filesystem::path& staging_dir, const std::filesystem::path& cache_root, nlohmann::json facts,
- mmltk::common::concurrency::CancellationObservation, StorageReservationPool* storage = nullptr);
+ mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool* storage = nullptr);
 }  // namespace mmltk::backend::data::benchmark_internal

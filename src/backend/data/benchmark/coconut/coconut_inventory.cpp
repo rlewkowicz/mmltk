@@ -1,3 +1,5 @@
+#include "src/backend/data/detail/staged_artifact.h"
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory_io.h"
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
@@ -12,11 +14,11 @@ namespace {
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
 [[noreturn]] void invalid(std::string_view detail) { throw CoconutInputError("COCONut: " + std::string(detail)); }
 template <InventoryRecord T>
-std::string store_inventory(const std::filesystem::path& path, const InventoryHeader& header, std::span<const T> records, Cancellation cancellation, StorageReservationPool* storage = nullptr) {
+std::string store_inventory(const std::filesystem::path& path, const InventoryHeader& header, std::span<const T> records, Cancellation cancellation, detail::StorageReservationPool* storage = nullptr) {
  throw_if_benchmark_cancelled(cancellation);
  (void)mmltk::common::io::ensure_parent_directory(path);
- StorageReservationPool destination(path, {}, storage);
- auto staging = BenchmarkStagedArtifact::create(destination, path, 0, "COCONut inventory staging");
+ detail::StorageReservationPool destination(path, {}, storage);
+ auto staging = detail::StagedArtifact::create(destination, path, 0, "COCONut inventory staging");
  InventoryOutput output(&staging, cancellation);
  const auto identity = encode_inventory(output, header, records, cancellation);
  staging.file().sync_data();
@@ -103,7 +105,7 @@ void InventoryInput::read(std::span<std::uint8_t> output) {
   output = output.subspan(count);
  }
 }
-void CoconutInventorySeal::publish(const std::filesystem::path& inventory_path, Cancellation cancellation, StorageReservationPool* storage) {
+void CoconutInventorySeal::publish(const std::filesystem::path& inventory_path, Cancellation cancellation, detail::StorageReservationPool* storage) {
  const auto destination_directory = mmltk::common::io::ensure_parent_directory(inventory_path);
  struct stat destination{};
  if (::stat(destination_directory.c_str(), &destination) != 0) throw mmltk::common::io::errno_error("stat COCONut inventory destination");
@@ -121,8 +123,8 @@ void CoconutInventorySeal::publish(const std::filesystem::path& inventory_path, 
    }
   }
   if (!moved) {
-   StorageReservationPool reservations(inventory_path, {}, storage);
-   auto copy = BenchmarkStagedArtifact::create(reservations, inventory_path, bytes, "COCONut sealed inventory copy");
+   detail::StorageReservationPool reservations(inventory_path, {}, storage);
+   auto copy = detail::StagedArtifact::create(reservations, inventory_path, bytes, "COCONut sealed inventory copy");
    copy.preallocate(bytes);
    for (std::size_t offset = 0; offset < bytes;) {
     throw_if_benchmark_cancelled(cancellation);
@@ -190,7 +192,7 @@ std::vector<CoconutPhysicalImage> load_coconut_physical_inventory(const std::fil
  return images;
 }
 void store_coconut_physical_inventory(const std::filesystem::path& path, std::span<const CoconutPhysicalImage> images, CoconutImageNamespace source, std::uint16_t shard,
- std::string_view archive_identity, Cancellation cancellation, StorageReservationPool* storage) {
+ std::string_view archive_identity, Cancellation cancellation, detail::StorageReservationPool* storage) {
  InventoryHeader expected;
  expected.source = source;
  expected.shard = shard;

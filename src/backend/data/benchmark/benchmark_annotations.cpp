@@ -1,3 +1,5 @@
+#include "src/backend/data/detail/staged_artifact.h"
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include <system_error>
 #include <sys/mman.h>
@@ -1053,10 +1055,10 @@ struct NormalizedAnnotationAssembler::Mapped {
  std::span<NormalizedBox> boxes;
  std::span<RLEPair> runs;
  std::size_t image_count = 0, box_count = 0, run_count = 0;
- Mapped(StorageReservationPool& storage, const std::filesystem::path& path, std::size_t bytes) : artifact(storage, path, bytes, "normalized annotation assembly") {}
+ Mapped(detail::StorageReservationPool& storage, const std::filesystem::path& path, std::size_t bytes) : artifact(storage, path, bytes, "normalized annotation assembly") {}
 };
 NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(NormalizedAnnotationMetadata metadata, std::size_t images, std::size_t boxes, std::size_t runs,
- mmltk::common::concurrency::CancellationObservation cancellation, const std::filesystem::path& staging_directory, StorageReservationPool* storage)
+ mmltk::common::concurrency::CancellationObservation cancellation, const std::filesystem::path& staging_directory, detail::StorageReservationPool* storage)
     : cancellation_(cancellation) {
  throw_if_benchmark_cancelled(cancellation_);
  static_cast<NormalizedAnnotationMetadata&>(builder_) = std::move(metadata);
@@ -1066,7 +1068,7 @@ NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(NormalizedAnnotatio
   const auto run_offset = mmltk::common::math::checked_add(image_bytes, box_bytes, "normalized staging overflow");
   const auto bytes = mmltk::common::math::checked_add(run_offset, mmltk::common::math::checked_multiply(runs, sizeof(RLEPair), "normalized run staging overflow"), "normalized staging overflow");
   std::filesystem::create_directories(staging_directory);
-  StorageReservationPool reservations(staging_directory, {}, storage);
+  detail::StorageReservationPool reservations(staging_directory, {}, storage);
   auto owner = std::make_shared<Mapped>(reservations, staging_directory / ".normalized-assembly", bytes);
   auto* data = static_cast<std::byte*>(owner->artifact.map_writable());
   if (bytes) {
@@ -1560,7 +1562,7 @@ void remove_normalized_annotation_index(const std::filesystem::path& path) {
  remove_cache_path(path);
 }
 std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotation_index(const std::filesystem::path& path, const NormalizedAnnotationIndex& index,
- mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, StorageReservationPool* storage, const nlohmann::json& extension) {
+ mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, detail::StorageReservationPool* storage, const nlohmann::json& extension) {
  admit_normalized_annotations(index, cancel_requested);
  if (index.split.empty() || index.annotation_sha256.empty() || index.split.size() >= NormalizedIndexHeader{}.split.size() ||
      kBenchmarkMappingRevision.size() >= NormalizedIndexHeader{}.mapping_revision.size()) {
@@ -1573,7 +1575,7 @@ std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotatio
  const std::uint64_t mask_rle_offset = box_offset + static_cast<std::uint64_t>(index.boxes.size()) * sizeof(NormalizedBox);
  if (index.mask_rle_pairs.size() > (std::numeric_limits<std::uint64_t>::max() - mask_rle_offset) / sizeof(RLEPair)) { throw std::overflow_error("normalized mask block size overflow"); }
  const std::uint64_t total_size = mask_rle_offset + static_cast<std::uint64_t>(index.mask_rle_pairs.size()) * sizeof(RLEPair);
- StorageReservationPool destination(path, trace, storage);
+ detail::StorageReservationPool destination(path, storage_observer(trace), storage);
  NormalizedIndexHeader header;
  header.source = static_cast<std::uint8_t>(index.source);
  header.image_count = checked_cast<std::uint32_t>(index.images.size(), "normalized image count overflow");
@@ -1588,7 +1590,7 @@ std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotatio
  std::memcpy(header.mapping_revision.data(), kBenchmarkMappingRevision.data(), kBenchmarkMappingRevision.size());
  header.rejected = encode_rejected(index.rejected);
  (void)mmltk::common::io::ensure_parent_directory(path);
- auto staging = BenchmarkStagedArtifact::create(destination, path, total_size, "normalized annotation index staging");
+ auto staging = detail::StagedArtifact::create(destination, path, total_size, "normalized annotation index staging");
  staging.preallocate(checked_cast<std::size_t>(total_size, "normalized index size overflow"));
  staging.file().pwrite_all(&header, sizeof(header), 0U);
  staging.file().pwrite_all(index.images.data(), index.images.size() * sizeof(NormalizedImage), checked_cast<std::size_t>(image_offset, "normalized image offset overflow"));

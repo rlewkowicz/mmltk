@@ -1,4 +1,6 @@
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
+#include "src/backend/data/detail/file_work_queue.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/detail/compile_pixel_workspace.h"
 #include "src/backend/data/detail/compile_workspace.h"
@@ -87,6 +89,9 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
   std::optional<BenchmarkLabelInput> input;
   BenchmarkSourceGeneration generation = 0;
   std::uint32_t width = 0, height = 0;
+  Slot* target = nullptr;
+  std::shared_ptr<BenchmarkLabelChunk> product;
+  detail::CompiledLabelWorkspace::OutputLease output;
  };
  struct Source {
   std::filesystem::path root;
@@ -161,10 +166,12 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
   Label* labels_tail_ = nullptr;
  };
  CompileExecution execution;
+ detail::FileWorkQueue files;
  std::mutex mutex;
  std::condition_variable changed;
  ImageState images{*this};
  std::deque<Job*> pixels;
+ std::deque<std::shared_ptr<LabelWork>> label_outputs;
  struct RetiredCompletion { CompileExecution::CompletionSource completion; CompileExecution::Producer producer; };
  std::vector<RetiredCompletion> retired_completions;
  std::size_t pending = 0;
@@ -180,7 +187,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  std::vector<std::unique_ptr<detail::CompilePixelWorkspace>> pixel_workspaces;
  std::mutex curl_mutex;
  std::unique_ptr<BenchmarkCurl> curl;
- StorageReservationPool storage{".", {}};
+ detail::StorageReservationPool storage{".", {}};
  std::unique_ptr<CompileExecution::Readiness> readiness;
  Impl(std::size_t workers, std::span<const int> cpus, detail::CompileExecutionLimits limits, mmltk::common::concurrency::CancellationObservation cancel, BenchmarkTraceSink trace)
  : execution(workers, cpus, limits, cancel, trace ? CompileExecution::Observer{[trace](std::string_view event, const detail::CompileExecutionSnapshot& value) {
@@ -205,7 +212,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
       {"parked", value.parked}, {"running", value.running}, {"active", value.active}, {"external", value.external}, {"services", value.services},
       {"bytes", value.resources.bytes}, {"byte_target", value.byte_target}, {"normal_locked",value.normal_locked}, {"resident",value.resident}, {"leased",value.leased}, {"exceptional",value.exceptional}, {"exceptional_peak",value.exceptional_peak}, {"opaque_library",value.opaque_library}, {"protected_workspace",value.protected_workspace}, {"shared_workspace",value.shared_workspace}, {"compaction_workspace",value.compaction_workspace}, {"workspace_contexts",value.workspace_contexts}, {"context_capacity",value.context_capacity}, {"exceptional_reserved",value.exceptional_reserved}, {"workspace_reuses",value.workspace_reuses}, {"physical_retirements",value.physical_retirements}, {"descriptors", value.resources.descriptors}, {"descriptor_limit", value.descriptor_limit}, {"descriptor_promises", value.resources.continuation_descriptors},
       {"records", value.records}, {"record_limit", value.record_limit}, {"admitted", value.admitted}, {"completed", value.completed}}; });
-   }} : CompileExecution::Observer{}, std::make_exception_ptr(std::runtime_error("benchmark dataset compilation cancelled"))), cancellation(cancel), label_workspaces(execution.workers()) {
+   }} : CompileExecution::Observer{}, std::make_exception_ptr(std::runtime_error("benchmark dataset compilation cancelled"))), files(execution, std::max(std::size_t{4},workers*2), std::min(std::size_t{2},workers)), cancellation(cancel), label_workspaces(execution.workers()) {
   for (std::size_t i=0; i<execution.workers(); ++i) pixel_workspaces.push_back(std::make_unique<detail::CompilePixelWorkspace>());
  }
  template <class Predicate> void wait(std::unique_lock<std::mutex>& lock, Predicate ready) {
@@ -228,6 +235,8 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  void header_input(Slot&);
  [[nodiscard]] bool submit_pixel(Job&);
  void run_pixel(Slot&, std::size_t, const CompileAllowance&);
+ void finish_label(const std::shared_ptr<LabelWork>&,std::exception_ptr) noexcept;
+ void write_label(LabelWork&);
  void run_label(LabelWork&, std::size_t);
 };
 struct BenchmarkSourcePublication::State {
@@ -833,7 +842,8 @@ BenchmarkCurl& BenchmarkCompilePipeline::curl() {
  if (!impl_->curl) impl_->curl = std::make_unique<BenchmarkCurl>(impl_->execution.workers(), &impl_->execution);
  return *impl_->curl;
 }
-StorageReservationPool& BenchmarkCompilePipeline::storage() noexcept { return impl_->storage; }
+detail::FileWorkQueue& BenchmarkCompilePipeline::files() noexcept { return impl_->files; }
+detail::StorageReservationPool& BenchmarkCompilePipeline::storage() noexcept { return impl_->storage; }
 void BenchmarkCompilePipeline::Impl::settle(Job& job, std::exception_ptr error, bool recoverable) noexcept {
  auto& slot = *job.slot;
  slot.input.reset(); slot.payload.reset(); slot.pixel_allowance = {}; slot.publication = {}; job.allowance = {}; job.parent = {};
@@ -910,6 +920,29 @@ void BenchmarkCompilePipeline::Impl::run_pixel(Slot& slot, std::size_t lane, con
 bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
  auto& slot = *job.slot;
  const auto weak = weak_from_this();
+ if (job.stage == CompileTaskKind::Output) {
+  auto task = files.try_submit({.completed=[weak,&slot](std::exception_ptr error) {
+   auto owner = weak.lock(); if (!owner) return;
+   {
+    const std::lock_guard lock(owner->mutex);
+    if (!error && (owner->stopping || slot.retiring || slot.source->retiring || slot.generation != slot.source->image_generation(slot.image_id))) error=owner->retired_failure;
+    if (!error) {
+     slot.job.stage=CompileTaskKind::Pixels;
+     slot.job.resources=slot.writer->pixel_resources(*slot.input);
+     slot.job.parent=slot.writer->pixel_input_allowance(*slot.input);
+     owner->push(slot.job); owner->changed.notify_all(); return;
+    }
+   }
+   owner->settle(slot.job,error);
+  }, .work=[weak,&slot] {
+   if (auto owner=weak.lock()) {
+    { const std::lock_guard lock(owner->mutex); if (owner->stopping || slot.retiring || slot.source->retiring) std::rethrow_exception(owner->retired_failure); }
+    slot.writer->prepare_pixels(static_cast<std::uint32_t>(slot.index));
+   }
+  }});
+  if (!task) return false;
+  job.handle=std::move(*task); return true;
+ }
  auto task = execution.try_submit({.kind = job.stage, .resources = job.resources,
   .work = [weak, &slot](std::size_t lane, const CompileAllowance& allowance) { if (auto owner = weak.lock()) owner->run_pixel(slot, lane, allowance); },
   .allowance = job.stage == CompileTaskKind::Pixels ? slot.pixel_allowance : CompileAllowance{}, .parent = job.parent,
@@ -928,7 +961,7 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
     }
     if (!error && slot.job.stage == CompileTaskKind::Header && slot.input && !owner->stopping && !slot.retiring && !slot.source->retiring) {
      slot.headers.close();
-     slot.job.stage = CompileTaskKind::Pixels;
+     slot.job.stage = CompileTaskKind::Output;
      slot.job.resources = slot.writer->pixel_resources(*slot.input);
      slot.job.parent = slot.writer->pixel_input_allowance(*slot.input);
      owner->push(slot.job); owner->changed.notify_all(); return;
@@ -946,6 +979,14 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
  if (!retired_completions.empty()) {
   auto completions = std::exchange(retired_completions, {});
   lock.unlock(); for (auto& completion : completions) completion.completion.settle(retired_failure); lock.lock();
+ }
+ while (!label_outputs.empty()) {
+  auto work=label_outputs.front();
+  const auto weak=weak_from_this();
+  auto completion=files.try_submit({.completed=[weak,work](std::exception_ptr error) { if (auto owner=weak.lock()) owner->finish_label(work,error); },
+   .work=[weak,work] { if (auto owner=weak.lock()) owner->write_label(*work); }});
+  if (!completion) break;
+  work->handle=std::move(*completion); label_outputs.pop_front();
  }
  if (stopping || failure || cancellation.requested()) {
   images.withdraw_all_labels();
@@ -989,9 +1030,25 @@ void BenchmarkCompilePipeline::Impl::ImageState::admit_labels() {
   auto task = execution.execution.try_submit({.kind = CompileTaskKind::Labels, .resources = {.bytes=BenchmarkLabelWorkspace::required_bytes(work->width),.supplied_workspace=true,.completion_workspace=true},
    .work = [weak, work](std::size_t lane, const CompileAllowance&) { if (auto owner = weak.lock()) owner->run_label(*work, lane); },
    .finite_consumer = true, .retain_workspace = false,
-   .completed = [weak, work](std::exception_ptr error) {
-    auto owner = weak.lock(); if (!owner) return;
+   .completed = [weak,work](std::exception_ptr error) {
+    auto owner=weak.lock(); if (!owner) return;
+    if (!error && work->target) {
+     { const std::lock_guard lock(owner->mutex); owner->label_outputs.push_back(work); }
+     owner->execution.notify_admission_change(); return;
+    }
+    owner->finish_label(work,error);
+   }});
+  if (!task) return;
+  work->handle = std::move(*task);
+  unlink_labels(label); label.input.reset(); label.active = work.get();
+  ++execution.pending; ++label.image->source->pending; ++label.image->source->pending_labels; ++label.image->pending_labels;
+  candidate = next;
+ }
+}
+void BenchmarkCompilePipeline::Impl::finish_label(const std::shared_ptr<LabelWork>& work,std::exception_ptr error) noexcept {
+ auto* owner=this;
     work->input.reset();
+    work->output = {};
     auto& product = *work->label;
     auto completion = product.completion;
     CompileExecution::Producer producer;
@@ -1005,13 +1062,6 @@ void BenchmarkCompilePipeline::Impl::ImageState::admit_labels() {
      product.active = nullptr; producer = std::move(product.producer);
     }
     completion.settle(error); owner->execution.notify_admission_change(); owner->changed.notify_all();
-   }});
-  if (!task) return;
-  work->handle = std::move(*task);
-  unlink_labels(label); label.input.reset(); label.active = work.get();
-  ++execution.pending; ++label.image->source->pending; ++label.image->source->pending_labels; ++label.image->pending_labels;
-  candidate = next;
- }
 }
 void BenchmarkCompilePipeline::Impl::run_label(LabelWork& label, std::size_t lane) {
  {
@@ -1037,38 +1087,38 @@ void BenchmarkCompilePipeline::Impl::run_label(LabelWork& label, std::size_t lan
     if (!target) {
      product->labels.assign(output.labels.begin(),output.labels.end()); product->runs.assign(output.runs.begin(),output.runs.end());
     }
-    if (target) {
-     const std::lock_guard write(target->label_write);
-     bool current;
-     {
-      const std::lock_guard lock(mutex);
-      current = !stopping && !result.retired && !image.retiring && !image.source->retiring && result.attempt == images.attempt() &&
-                label.generation == image.source->image_generation(image.image_id) && result.generation == image.source->label_generation &&
-                (!target->selected_label || result.priority >= target->selected_label->priority);
-     }
-     if (current) {
-      ImageEntry entry{};
-      entry.source_image_id = image.image_id;
-      entry.has_source_image_id = 1;
-      entry.source = image.source->annotation_source;
-      entry.original_width = product->width;
-      entry.original_height = product->height;
-      target->writer->write_labels(static_cast<std::uint32_t>(target->index), entry, {output.labels, output.runs}, lane);
-      {
-       const std::lock_guard lock(mutex);
-       target->selected_label = &result;
-      }
-      if (label_completed) label_completed(image.source->root, image.image_id);
-     }
-     // The frame owns this lane until the direct write and observation finish.
-     // Only the small immutable result survives; reusable output remains charged
-     // as lane scratch and mapped input remains the authority for claim replay.
+    label.target=target; label.product=std::move(product); label.output=std::move(output);
+    if (!target) {
+     const std::lock_guard lock(mutex);
+     if (!stopping && !result.retired && !image.retiring && !image.source->retiring && result.attempt == images.attempt() && label.generation == image.source->image_generation(image.image_id) &&
+         result.generation == image.source->label_generation) result.product=label.product;
     }
-    const std::lock_guard lock(mutex);
-    if (!stopping && !result.retired && !image.retiring && !image.source->retiring && result.attempt == images.attempt() && label.generation == image.source->image_generation(image.image_id) &&
-        result.generation == image.source->label_generation)
-     result.product = std::move(product);
-
+}
+void BenchmarkCompilePipeline::Impl::write_label(LabelWork& label) {
+ auto& result=*label.label;
+ auto& image=*result.image;
+ auto* target=label.target;
+ const std::lock_guard write(target->label_write);
+ bool current;
+ {
+  const std::lock_guard lock(mutex);
+  current=!stopping && !result.retired && !image.retiring && !image.source->retiring && result.attempt==images.attempt() &&
+   label.generation==image.source->image_generation(image.image_id) && result.generation==image.source->label_generation &&
+   (!target->selected_label || result.priority>=target->selected_label->priority);
+ }
+ if (current) {
+  ImageEntry entry{};
+  entry.source_image_id=image.image_id; entry.has_source_image_id=1; entry.source=image.source->annotation_source;
+  entry.original_width=label.product->width; entry.original_height=label.product->height;
+  target->writer->write_label_output(static_cast<std::uint32_t>(target->index),entry,std::move(label.output));
+  { const std::lock_guard lock(mutex); target->selected_label=&result; }
+  if (label_completed) label_completed(image.source->root,image.image_id);
+ }
+ {
+  const std::lock_guard lock(mutex);
+  if (!stopping && !result.retired && !image.retiring && !image.source->retiring && result.attempt==images.attempt() &&
+      label.generation==image.source->image_generation(image.image_id) && result.generation==image.source->label_generation) result.product=label.product;
+ }
 }
 void BenchmarkCompilePipeline::write_remaining(BenchmarkSplitWriter& writer, const PreparedBenchmarkSplit& split, std::span<const std::size_t> slots) {
  for (std::size_t i = 0; i < split.images.size(); ++i) {

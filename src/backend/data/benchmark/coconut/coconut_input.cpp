@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
@@ -35,12 +36,12 @@ void CoconutSegments::writable() {
  mapped_ = {};
  backing_.reset();
 }
-void CoconutSegments::stage(const std::filesystem::path& directory, StorageReservationPool* storage) {
+void CoconutSegments::stage(const std::filesystem::path& directory, detail::StorageReservationPool* storage) {
  if (backing_ || values_.empty() || directory.empty()) return;
  static_assert(std::is_trivially_copyable_v<CoconutSegment>);
  const auto bytes = mmltk::common::math::checked_multiply(values_.size(), sizeof(CoconutSegment), "COCONut segment staging overflow");
  std::filesystem::create_directories(directory);
- StorageReservationPool reservations(directory, {}, storage);
+ detail::StorageReservationPool reservations(directory, {}, storage);
  auto owner = std::make_shared<BenchmarkMappedArtifact>(reservations, directory / ".native-segments", bytes, "COCONut segment metadata");
  owner->write(values_.data(), bytes, 0);
  const void* address = owner->map_readonly();

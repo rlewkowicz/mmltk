@@ -1,3 +1,5 @@
+#include "src/backend/data/detail/staged_artifact.h"
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include <system_error>
@@ -46,7 +48,7 @@ public:
  mutable std::shared_ptr<const NormalizedAnnotationCompletion> completion;
  bool metadata_only = false;
  static CoconutComponent finish(std::shared_ptr<CoconutComponentBacking>, NormalizedAnnotationIndex, bool, mmltk::common::concurrency::CancellationObservation, const std::filesystem::path&,
-  StorageReservationPool*, const CoconutComponent* reuse = nullptr);
+  detail::StorageReservationPool*, const CoconutComponent* reuse = nullptr);
  static CoconutComponent loaded(std::shared_ptr<CoconutComponentBacking> backing) { return CoconutComponent(backing, backing->index, backing->seal, false); }
 };
 namespace {
@@ -404,13 +406,13 @@ InventoryHeader component_header(const CoconutComponentMetadata& component, std:
  header.count = count;
  return header;
 }
-std::shared_ptr<CoconutInventorySeal> seal_inventory(const CoconutComponent& component, Cancellation cancellation, const std::filesystem::path& directory, StorageReservationPool* storage) {
+std::shared_ptr<CoconutInventorySeal> seal_inventory(const CoconutComponent& component, Cancellation cancellation, const std::filesystem::path& directory, detail::StorageReservationPool* storage) {
  auto seal = std::make_shared<CoconutInventorySeal>();
  seal->directory = directory.empty() ? std::filesystem::temp_directory_path() : directory;
  std::filesystem::create_directories(seal->directory);
  const auto destination = seal->directory / ".coconut-inventory";
- StorageReservationPool reservations(destination, {}, storage);
- seal->staged = BenchmarkStagedArtifact::create(reservations, destination, 0, "COCONut inventory staging");
+ detail::StorageReservationPool reservations(destination, {}, storage);
+ seal->staged = detail::StagedArtifact::create(reservations, destination, 0, "COCONut inventory staging");
  InventoryOutput output(&seal->staged, cancellation);
  const CoconutComponentMetadata metadata{component.edition(), component.source(), component.input_identity(), component.recovery_policy(), std::string(component.original_annotation_identity())};
  seal->identity = encode_inventory(output, component_header(metadata, component.index().image_count()), component.inventory(), cancellation, component.recovery_policy(),
@@ -504,7 +506,7 @@ struct PendingNativeImage {
  std::shared_ptr<const CoconutNativeImage> product;
  BenchmarkSourcePublication publication;
  std::string provisional_dependency;
- void stage_support(std::vector<CoconutSegmentSupport> input, const std::filesystem::path& directory, StorageReservationPool* storage) {
+ void stage_support(std::vector<CoconutSegmentSupport> input, const std::filesystem::path& directory, detail::StorageReservationPool* storage) {
   std::uint64_t count = 0;
   for (const auto& item : input) count = mmltk::common::math::checked_add(count, item.runs.size(), "pending support run count overflow");
   const auto run_offset = mmltk::common::math::checked_multiply(input.size(), sizeof(Support), "pending support extent overflow");
@@ -512,7 +514,7 @@ struct PendingNativeImage {
   if (!bytes) return;
   const auto root = directory.empty() ? std::filesystem::temp_directory_path() : directory;
   std::filesystem::create_directories(root);
-  StorageReservationPool reservations(root, {}, storage);
+  detail::StorageReservationPool reservations(root, {}, storage);
   auto owner = std::make_shared<BenchmarkMappedArtifact>(reservations, root / ".native-support", bytes, "pending native support");
   std::size_t offset = 0;
   for (std::size_t i = 0; i < input.size(); ++i) {
@@ -1873,7 +1875,7 @@ CoconutComponent CoconutComponent::select_images(std::vector<std::size_t> positi
  return result;
 }
 CoconutComponent CoconutComponentBacking::finish(std::shared_ptr<CoconutComponentBacking> backing, NormalizedAnnotationIndex normalized, bool metadata_only, Cancellation cancellation,
- const std::filesystem::path& directory, StorageReservationPool* storage, const CoconutComponent* reuse) {
+ const std::filesystem::path& directory, detail::StorageReservationPool* storage, const CoconutComponent* reuse) {
  admit_component_metadata(*backing, normalized, normalized.images.size(), backing->inventory->size(), backing->recovery.size());
  const auto expected_identity = std::exchange(normalized.annotation_sha256, {});
  normalized.completion.reset();
@@ -1891,7 +1893,7 @@ CoconutComponent CoconutComponentBacking::finish(std::shared_ptr<CoconutComponen
  auto result = loaded(std::move(backing));
  return metadata_only ? result.membership() : result;
 }
-CoconutComponent CoconutComponentBuilder::finish(Cancellation cancellation, const std::filesystem::path& directory, StorageReservationPool* storage) && {
+CoconutComponent CoconutComponentBuilder::finish(Cancellation cancellation, const std::filesystem::path& directory, detail::StorageReservationPool* storage) && {
  admit_component_metadata(*this, index, index.images.size(), inventory.size(), recovery.size());
  auto backing = std::make_shared<CoconutComponentBacking>();
  static_cast<CoconutComponentMetadata&>(*backing) = std::move(static_cast<CoconutComponentMetadata&>(*this));
@@ -1930,7 +1932,7 @@ std::string coconut_component_input_identity(std::string_view base, CoconutImage
   base, source, physical ? physical->dependency_identity(edition, source, dependencies, current) : std::string{}, original.empty() ? 0 : kCoconutRecoveryPolicy, original);
 }
 std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutComponentPart> parts, std::string_view identity, const CoconutPhysicalMembership& physical,
- const std::filesystem::path& directory, Cancellation cancellation, StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const CoconutImageRejection& rejected) {
+ const std::filesystem::path& directory, Cancellation cancellation, detail::StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const CoconutImageRejection& rejected) {
  struct Row {
   const CoconutComponent* component;
   std::size_t position;
@@ -2233,7 +2235,7 @@ std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& compon
  components = std::move(replacement);
  return removed;
 }
-void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component, Cancellation cancellation, StorageReservationPool* storage) {
+void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component, Cancellation cancellation, detail::StorageReservationPool* storage) {
  if (component.membership_ || component.backing_->metadata_only) invalid("membership cannot publish a full component");
  admit_coconut_component(component, cancellation);
  // Reassembled compact provenance can describe an already published immutable

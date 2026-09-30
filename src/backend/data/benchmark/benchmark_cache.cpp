@@ -1,3 +1,5 @@
+#include "src/backend/data/detail/staged_artifact.h"
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
@@ -12,7 +14,6 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include "src/common/io/file_memory.h"
-#include "src/backend/data/benchmark/detail/benchmark_staging.h"
 namespace mmltk::backend::data::benchmark_internal {
 using detail::CompileExecution;
 using mmltk::backend::data::detail::CompileResources;
@@ -147,15 +148,15 @@ bool is_benchmark_capacity_failure(const std::exception& error) noexcept {
  return dynamic_cast<const std::bad_alloc*>(&error) != nullptr || dynamic_cast<const std::length_error*>(&error) != nullptr || dynamic_cast<const std::overflow_error*>(&error) != nullptr;
 }
 std::uint64_t write_json_atomically(
- const std::filesystem::path& path, const nlohmann::json& value, const mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage) {
+ const std::filesystem::path& path, const nlohmann::json& value, const mmltk::common::concurrency::CancellationObservation cancellation, detail::StorageReservationPool* storage) {
  (void)common_io::ensure_parent_directory(path);
  const std::string serialized = value.dump(2);
- StorageReservationPool destination(path, {}, storage);
- auto staging = BenchmarkStagedArtifact::create(destination, path, serialized.size(), "benchmark metadata staging", ".next.XXXXXX");
+ detail::StorageReservationPool destination(path, {}, storage);
+ auto staging = detail::StagedArtifact::create(destination, path, serialized.size(), "benchmark metadata staging", ".next.XXXXXX");
  staging.preallocate(serialized.size());
  staging.file().pwrite_all(serialized.data(), serialized.size(), 0U);
  staging.file().sync_data();
- staging.publish(path, cancellation, BenchmarkStagedArtifact::Publication::RenameAndSync);
+ staging.publish(path, cancellation, detail::StagedArtifact::Publication::RenameAndSync);
  return serialized.size();
 }
 nlohmann::json read_json_file(const std::filesystem::path& path, std::uint64_t* extent) {

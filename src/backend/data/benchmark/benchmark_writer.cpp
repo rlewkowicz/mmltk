@@ -1,7 +1,8 @@
+#include "src/backend/data/detail/staged_artifact.h"
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/detail/compile_pixel_workspace.h"
 #include "src/backend/data/detail/compile_workspace.h"
-#include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -34,7 +35,8 @@
 #include <unordered_map>
 #include <deque>
 #include "src/backend/data/catalog/class_catalog.h"
-#include "src/backend/data/detail/writable_pixel_range.h"
+#include "src/backend/data/detail/compiled_slot_storage.h"
+#include "src/backend/data/detail/file_work_queue.h"
 #include "src/backend/data/compiled_file.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/concurrency/concurrency.h"
@@ -55,7 +57,7 @@ namespace common_concurrency = mmltk::common::concurrency;
 namespace common_io = mmltk::common::io;
 namespace common_math = mmltk::common::math;
 namespace {
-using detail::WritablePixelRange;
+using detail::CompiledSlotStorage;
 [[nodiscard]] ImageEntry benchmark_image_entry(const EncodedImageRecord& image) {
  ImageEntry entry{};
  entry.status = ImageStatus::Eligible;
@@ -77,25 +79,31 @@ struct BenchmarkPixelInput {
 struct BenchmarkSplitWriter::Impl {
  std::deque<EncodedImageRecord> images;
  std::vector<CachedImageSource> sources;
- std::deque<std::uint8_t> complete, header_known, pixel_allocated, label_pages;
+ std::deque<std::uint8_t> complete, header_known;
  std::deque<ImageEntry> entries;
  std::deque<std::filesystem::path> input_roots;
  mutable std::mutex facts_mutex;
  BenchmarkCompilePipeline* execution = nullptr;
+ std::unique_ptr<detail::CompileExecution> standalone_execution;
+ std::unique_ptr<detail::FileWorkQueue> standalone_files;
+ std::once_flag standalone_output;
+ std::optional<int> output_cpu;
+ detail::CompileExecution* output_execution = nullptr;
+ detail::FileWorkQueue* files = nullptr;
  CompileAllowance writer_handles, directory_handles;
  std::mutex directory_mutex;
  common_io::FileHandle directory;
  std::uint16_t directory_source = std::numeric_limits<std::uint16_t>::max();
  std::filesystem::path directory_root;
- BenchmarkStagedArtifact staging;
- std::unique_ptr<WritablePixelRange> pixels;
+ detail::StagedArtifact staging;
+ std::unique_ptr<CompiledSlotStorage> slots_storage;
  FileLayout layout;
  std::uint32_t resolution;
  std::vector<std::string> class_names;
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode;
  common_concurrency::CancellationObservation cancellation;
  BenchmarkWriteProgressEvent progress;
- BenchmarkImageReadObserver image_opened, pixel_preparing;
+ BenchmarkImageReadObserver image_opened, pixel_preparing, extent_preparing;
  bool actual_dimensions;
  bool perceptual;
  std::size_t stride;
@@ -104,8 +112,6 @@ struct BenchmarkSplitWriter::Impl {
        sources(request.split.sources),
        complete(images.size()),
        header_known(images.size()),
-       pixel_allocated(images.size()),
-       label_pages(images.size()),
        resolution(request.resolution),
        class_names(request.split.class_names),
        resize_mode(request.resize_mode),
@@ -113,24 +119,48 @@ struct BenchmarkSplitWriter::Impl {
        progress(request.progress),
        image_opened(request.image_opened),
        pixel_preparing(request.pixel_preparing),
+       extent_preparing(request.extent_preparing),
        actual_dimensions(actual),
        perceptual(request.perceptual_downscale),
        stride(common_math::checked_cast<std::size_t>(static_cast<std::uint64_t>(resolution) * resolution * 3U * sizeof(float), "benchmark image stride overflow")) {
   (void)catalog::ClassCatalog(class_names, COMPILED_CLASS_NAME_CAPACITY);
   if (class_names.empty() || class_names.size() > MAX_CLASSES) throw std::runtime_error("benchmark split exceeds the compiled class limit");
   execution = request.execution;
-  if (execution) writer_handles = execution->execution().reserve(CompileResources::handles(1));
+  if (!request.worker_cpus.empty()) output_cpu=request.worker_cpus.front();
+  if (execution) {
+   output_execution=&execution->execution(); files=&execution->files();
+   writer_handles=output_execution->reserve(CompileResources::handles(1));
+  }
   if (resolution == 0 || resolution > MAX_IMAGE_EXTENT) throw std::runtime_error("benchmark pixel membership is incomplete");
   layout = compute_file_layout(common_math::checked_cast<std::uint32_t>(images.size(), "benchmark image count overflow"), stride);
   (void)common_io::ensure_parent_directory(request.output_path);
-  StorageReservationPool storage(request.output_path, {}, execution ? &execution->storage() : nullptr);
-  staging = BenchmarkStagedArtifact::create(storage, request.output_path, 0, "benchmark sparse staging");
+  detail::StorageReservationPool storage(request.output_path, {}, execution ? &execution->storage() : nullptr);
+  staging = detail::StagedArtifact::create(storage, request.output_path, 0, "benchmark sparse staging");
   // The resident index is written only at seal. Keep the staging EOF aligned
   // so growth cannot allocate a partial EOF page in the next pixel block.
-  staging.resize_sparse(layout.index_offset);
-  pixels = std::make_unique<WritablePixelRange>(staging.file().get(), layout);
+  slots_storage = std::make_unique<CompiledSlotStorage>(staging, layout);
   entries.resize(images.size());
   input_roots.resize(images.size());
+ }
+ // The enclosing attempt drains a borrowed pipeline before either owner can
+ // retire. Only the locally owned service is safe to join from this destructor.
+ ~Impl() { if (standalone_files) standalone_files->join(); }
+ detail::FileWorkQueue& output() {
+  if (execution) return *files;
+  // Pixel-only standalone sessions retain their existing useful-worker bound.
+  // Initialize the reusable output owner only when a controller writes labels,
+  // settles provenance, or seals this writer.
+  std::call_once(standalone_output,[&] {
+   const auto label_bytes=detail::CompiledLabelWorkspace::required_bytes(0);
+   detail::CompileExecutionLimits limits;
+   const std::array<detail::CompileWorkspaceProfile,1> profiles{{{label_bytes,0}}};
+   limits.workspace_plan=std::make_shared<detail::CompileWorkspacePlan>(detail::CompileWorkspacePlan::prepare(1,profiles,0,COMPILED_COMPACTION_SCRATCH_BYTES,
+    common_math::checked_add(label_bytes,COMPILED_COMPACTION_SCRATCH_BYTES,"standalone output workspace overflow")));
+   standalone_execution=std::make_unique<detail::CompileExecution>(1,output_cpu ? std::span<const int>(&*output_cpu,1) : std::span<const int>{},limits,cancellation);
+   standalone_files=std::make_unique<detail::FileWorkQueue>(*standalone_execution,2);
+   output_execution=standalone_execution.get(); files=standalone_files.get();
+  });
+  return *files;
  }
  [[nodiscard]] std::vector<std::size_t> slots(const PreparedBenchmarkSplit& split, bool finished = false) const {
   std::vector<std::size_t> result;
@@ -177,13 +207,10 @@ std::uint32_t BenchmarkSplitWriter::allocate_slot(EncodedImageRecord image, cons
   state.sources.push_back(source);
  } else
   image.source_index = common_math::checked_cast<std::uint16_t>(std::distance(state.sources.begin(), found), "benchmark source index overflow");
- if (layout.index_offset != state.layout.index_offset) state.staging.resize_sparse(layout.index_offset);
- state.pixels->grow(layout);
+ if (state.slots_storage->reserve_slot() != slot) throw std::logic_error("benchmark storage slot identity differs");
  state.images.push_back(image);
  state.complete.push_back(0);
  state.header_known.push_back(0);
- state.pixel_allocated.push_back(0);
- state.label_pages.push_back(0);
  state.entries.emplace_back();
  state.input_roots.emplace_back();
  state.layout = layout;
@@ -203,36 +230,48 @@ void BenchmarkSplitWriter::invalidate_labels(std::uint32_t slot) {
 }
 void BenchmarkSplitWriter::settle_labels(std::uint32_t slot, std::uint64_t ordinal_base, bool ordinal_incomplete) {
  if (!ordinal_base && !ordinal_incomplete) return;
- const std::lock_guard lock(impl_->facts_mutex);
- const auto& entry = impl_->entries.at(slot);
- write_compiled_label_ordinals(impl_->staging.file(), impl_->layout.label_offset(slot), entry.num_instances, {}, ordinal_base, ordinal_incomplete);
+ const auto transform = [this,slot,ordinal_base,ordinal_incomplete] {
+  auto labels=impl_->slots_storage->labels(slot);
+  const auto selected=entry(slot);
+  labels.settle_ordinals(selected.num_instances,ordinal_base,ordinal_incomplete);
+ };
+ impl_->output().submit({.work=transform}).wait();
 }
-void BenchmarkSplitWriter::write_labels(std::uint32_t slot, ImageEntry entry, ImageAnnotations annotations, std::size_t lane, std::uint64_t ordinal_base) {
+void BenchmarkSplitWriter::prepare_pixels(std::uint32_t slot) {
+ if (impl_->extent_preparing) { const auto [root,id]=identity(slot); impl_->extent_preparing(root,id); }
+ impl_->slots_storage->prepare_pixels(slot);
+}
+void BenchmarkSplitWriter::write_labels(std::uint32_t slot, ImageEntry entry, ImageAnnotations annotations, std::uint64_t ordinal_base) {
+ set_annotation_extent(entry,annotations.labels.size(),annotations.runs.size(),std::to_string(entry.source_image_id));
+ // Direct controller callers also hand physical I/O an owned pinned payload.
+ auto& files=impl_->output();
+ detail::CompiledLabelWorkspace workspace;
+ workspace.prepare(0,impl_->output_execution->reserve({.bytes=detail::CompiledLabelWorkspace::required_bytes(0),.supplied_workspace=true,
+  .completion_workspace=true,.workspace_class=detail::CompileWorkClass::Output}));
+ workspace.labels.resize(annotations.labels.size());
+ workspace.runs.resize(annotations.runs.size());
+ std::ranges::copy(annotations.labels,workspace.labels.begin());
+ std::ranges::copy(annotations.runs,workspace.runs.begin());
+ auto output = std::make_shared<detail::CompiledLabelWorkspace::OutputLease>(workspace.release_output());
+ const auto write = [this,slot,entry,output,ordinal_base] { write_label_output(slot,entry,std::move(*output),ordinal_base); };
+ files.submit({.work=write}).wait();
+}
+void BenchmarkSplitWriter::write_label_output(std::uint32_t slot, ImageEntry entry, detail::CompiledLabelWorkspace::OutputLease output, std::uint64_t ordinal_base) {
  auto& state = *impl_;
  throw_if_benchmark_cancelled(state.cancellation);
  entry.status = ImageStatus::Eligible;
- set_annotation_extent(entry, annotations.labels.size(), annotations.runs.size(), std::to_string(entry.source_image_id));
+ set_annotation_extent(entry,output.labels.size(),output.runs.size(),std::to_string(entry.source_image_id));
  FileHeader checks{};
- checks.num_classes = common_math::checked_cast<std::uint32_t>(state.class_names.size(), "benchmark class count overflow");
+ checks.num_classes = common_math::checked_cast<std::uint32_t>(state.class_names.size(),"benchmark class count overflow");
  checks.max_instances_per_image = UINT16_MAX;
  checks.image_width = checks.image_height = state.resolution;
- (void)admit_compiled_annotations(entry, annotations, checks, slot, state.cancellation);
- (void)lane;
- FileLayout layout;
+ (void)admit_compiled_annotations(entry,{output.labels,output.runs},checks,slot,state.cancellation);
  {
   const std::lock_guard lock(state.facts_mutex);
-  const auto& image = state.images.at(slot);
-  if (image.source_image_id != entry.source_image_id) throw std::runtime_error("benchmark label identity or canvas differs from pixels");
-  layout = state.layout;
-  const auto offset = layout.label_offset(slot);
-  const auto pages = compiled_align_up(entry.label_bytes, PAGE_SIZE) / PAGE_SIZE;
-  const auto retained = state.label_pages[slot];
-  if (pages > retained) {
-   state.staging.allocate_range(offset + retained * PAGE_SIZE, (pages - retained) * PAGE_SIZE);
-   state.label_pages[slot] = common_math::checked_cast<std::uint8_t>(pages, "benchmark label page count overflow");
-  }
+  if (state.images.at(slot).source_image_id != entry.source_image_id) throw std::runtime_error("benchmark label identity or canvas differs from pixels");
  }
- write_compiled_annotations(state.staging.file(), layout, slot, entry, annotations, ordinal_base);
+ auto labels=state.slots_storage->labels(slot);
+ labels.write(entry,std::move(output),ordinal_base);
  {
   const std::lock_guard lock(state.facts_mutex);
   state.entries[slot] = entry;
@@ -344,6 +383,8 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane) {
  limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(1,impl_->resolution,impl_->perceptual,0,0,BenchmarkEncodedImage::normal_window_bytes));
  detail::CompileExecution execution(1,{},limits,impl_->cancellation);
  detail::CompilePixelWorkspace workspace;
+ detail::FileWorkQueue files(execution,1);
+ files.submit({.work=[&] { prepare_pixels(common_math::checked_cast<std::uint32_t>(slot,"benchmark pixel slot overflow")); }}).wait();
  execution.run(CompileTaskKind::Pixels,pixel_resources(*input),[&](std::size_t) { write_pixel(slot,lane,input,execution.current_allowance(),workspace); });
 }
 void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const std::shared_ptr<BenchmarkPixelInput>& input, CompileAllowance allowance, detail::CompilePixelWorkspace& scratch) {
@@ -358,14 +399,8 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const
  if (memory.size() < plan.bytes()) throw std::logic_error("benchmark pixels have no admitted arena");
  throw_if_benchmark_cancelled(state.cancellation);
  try {
-  scratch.write(plan, input->payload->encoded(), header, memory,
-   {state.pixels->image(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow")), plan.destination()}, [&] {
-    const std::lock_guard lock(state.facts_mutex);
-    if (!state.pixel_allocated[slot]) {
-     state.staging.allocate_range(state.layout.pixel_offset(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow")), state.layout.pixel_pitch);
-     state.pixel_allocated[slot] = 1;
-    }
-   });
+  auto destination = state.slots_storage->pixels(common_math::checked_cast<std::uint32_t>(slot,"benchmark pixel slot overflow"));
+  scratch.write(plan,input->payload->encoded(),header,memory,{destination.data(),plan.destination()});
  } catch (const detail::CompileImageError& error) {
   throw_if_benchmark_cancelled(state.cancellation);
   const std::lock_guard lock(state.facts_mutex);
@@ -419,8 +454,7 @@ void BenchmarkSplitWriter::invalidate_image(std::size_t slot) {
 void BenchmarkSplitWriter::invalidate_source(const std::filesystem::path& root) {
  {
   const std::lock_guard lock(impl_->directory_mutex);
-  const std::lock_guard facts(impl_->facts_mutex);
-  if (impl_->directory.get() >= 0 && impl_->sources.at(impl_->directory_source).root == root) {
+  if (impl_->directory.get() >= 0 && impl_->directory_root == root) {
    impl_->directory = {};
    impl_->directory_source = std::numeric_limits<std::uint16_t>::max();
    impl_->directory_root.clear();
@@ -459,6 +493,7 @@ void BenchmarkSplitWriter::write_remaining(const BenchmarkWriteRequest& request)
  detail::CompileExecutionLimits limits;
  limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(workers,impl_->resolution,impl_->perceptual,0,0,BenchmarkEncodedImage::normal_window_bytes));
  detail::CompileExecution execution(workers,cpus,limits,request.cancel_requested);
+ detail::FileWorkQueue files(execution,execution.workers());
  std::vector<std::unique_ptr<detail::CompilePixelWorkspace>> workspaces;
  for (std::size_t i=0; i<execution.workers(); ++i) workspaces.push_back(std::make_unique<detail::CompilePixelWorkspace>());
  std::vector<detail::CompileExecution::Completion> active;
@@ -469,6 +504,7 @@ void BenchmarkSplitWriter::write_remaining(const BenchmarkWriteRequest& request)
    // its actual workspace request; submitted pixels may finish independently.
    auto input = prepare_pixel(slot,0);
    if (!input) continue;
+   files.submit({.work=[&] { prepare_pixels(common_math::checked_cast<std::uint32_t>(slot,"benchmark pixel slot overflow")); }}).wait();
    active.push_back(execution.submit({.kind=CompileTaskKind::Pixels,.resources=pixel_resources(*input),
     .work=[this,slot,input,&workspaces](std::size_t lane,const CompileAllowance& allowance) { write_pixel(slot,lane,input,allowance,*workspaces[lane]); },.retain_workspace=false}));
    if (active.size()==execution.workers()) { for (const auto& work : active) work.wait(); active.clear(); }
@@ -486,7 +522,7 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal(const BenchmarkWriteRequest& req
   const auto expected = benchmark_image_entry(request.split.images[i]);
   if (!state.entries[physical_slot].eligible()) {
    if (expected.num_instances) throw std::runtime_error("benchmark final label payload missing");
-   write_labels(physical_slot, expected, {});
+   write_label_output(physical_slot, expected, {});
   }
   const auto entry = state.entries[physical_slot];
   if (entry.num_instances != expected.num_instances || entry.original_width != expected.original_width || entry.original_height != expected.original_height || entry.source != expected.source ||
@@ -513,14 +549,19 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
   index[slot] = entry;
   maximum = std::max<std::uint32_t>(maximum, entry.num_instances);
  }
- state.pixels.reset();
+ state.slots_storage->quiesce();
+ // Claimed but never prepared tail slots remain inactive sparse capacity.
+ state.staging.resize_sparse(state.layout.index_offset);
  {
   const std::lock_guard lock(state.directory_mutex);
   state.directory = {};
   state.directory_source = std::numeric_limits<std::uint16_t>::max();
  }
  state.layout = compact_compiled_file(
-  state.staging.file(), state.layout, index, request.cancel_requested, request.compaction, [&](std::size_t offset, std::size_t bytes) { state.staging.allocate_range(offset, bytes); });
+  state.staging.file(), state.layout, index, request.cancel_requested, request.compaction, {
+   [&](std::size_t offset,std::size_t bytes) { state.staging.allocate_range(offset,bytes); },
+   [&](std::size_t offset,std::size_t bytes) { return state.staging.reclaim_range(offset,bytes); },
+   [&](std::size_t bytes) { state.staging.resize_sparse(bytes); }},request.compaction_scratch);
  state.staging.reconcile();
  const auto header =
   make_file_header({common_math::checked_cast<std::uint32_t>(slots.size(), "benchmark image count overflow"), state.resolution, state.resolution, 3U, maximum, state.stride, state.resize_mode},
@@ -541,8 +582,15 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
  return {std::move(state.staging), std::move(info)};
 }
 void BenchmarkSplitWriter::finish(const BenchmarkWriteRequest& request) {
- auto sealed = seal(request);
- sealed.artifact.publish(request.output_path, request.cancel_requested, BenchmarkStagedArtifact::Publication::DurableReplace, request.overwrite);
+ auto& files=impl_->output();
+ auto scratch=impl_->output_execution->reserve({.bytes=COMPILED_COMPACTION_SCRATCH_BYTES,.supplied_workspace=true,
+  .completion_workspace=true,.workspace_class=detail::CompileWorkClass::Output,.workspace_window=detail::CompileWorkspaceWindow::Compaction});
+ std::optional<BenchmarkSealedSplit> sealed;
+ auto seal_request=request;
+ seal_request.compaction_scratch=scratch.workspace();
+ files.submit({.work=[&] { sealed=seal(seal_request); }}).wait();
+ scratch={};
+ sealed->artifact.publish(request.output_path, request.cancel_requested, detail::StagedArtifact::Publication::DurableReplace, request.overwrite);
 }
 void write_benchmark_split(const BenchmarkWriteRequest& request) {
  for (const auto& image : request.split.images)
@@ -550,5 +598,23 @@ void write_benchmark_split(const BenchmarkWriteRequest& request) {
  BenchmarkSplitWriter writer(request);
  writer.write_remaining(request);
  writer.finish(request);
+}
+std::array<BenchmarkSealedSplit,2> seal_benchmark_splits(BenchmarkCompilePipeline& pipeline,
+ const std::function<BenchmarkSealedSplit(std::size_t,std::span<std::byte>)>& seal) {
+ std::array<BenchmarkSealedSplit,2> results{};
+ std::array<detail::CompileExecution::Completion,2> completions;
+ std::exception_ptr failure;
+ for (std::size_t i=0;i<results.size();++i) {
+  try {
+   auto scratch=pipeline.execution().reserve({.bytes=COMPILED_COMPACTION_SCRATCH_BYTES,.supplied_workspace=true,
+    .completion_workspace=true,.workspace_class=detail::CompileWorkClass::Output,.workspace_window=detail::CompileWorkspaceWindow::Compaction});
+   completions[i]=pipeline.files().submit({.work=[&,i,scratch] { results[i]=seal(i,scratch.workspace()); }});
+  } catch (...) { if (!failure) failure=std::current_exception(); break; }
+ }
+ for (const auto& completion:completions) if (completion) {
+  try { completion.wait(); } catch (...) { if (!failure) failure=std::current_exception(); }
+ }
+ if (failure) std::rethrow_exception(failure);
+ return results;
 }
 }  // namespace mmltk::backend::data::benchmark_internal

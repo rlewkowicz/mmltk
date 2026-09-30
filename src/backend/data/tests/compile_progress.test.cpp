@@ -44,7 +44,7 @@
 #include "src/common/math/checked_arithmetic.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
-#include "src/backend/data/detail/writable_pixel_range.h"
+#include "src/backend/data/detail/compiled_slot_storage.h"
 using namespace mmltk::backend::data;
 using mmltk::common::io::FileHandle;
 using namespace mmltk::backend::data::testsupport;
@@ -825,27 +825,30 @@ TEST_CASE("compiled layout checks alignment and arithmetic without storage", "[b
 }
 TEST_CASE("fixed pixel mappings retain borrowed addresses across sparse block growth", "[backend][data][compiler]") {
  const mmltk::testsupport::ScopedTempDir root("stable-compiled-blocks");
- const auto file = FileHandle::create_output((root.path() / "slots.bin").string(), 0);
- auto layout = compute_file_layout(1, 12);
- file.resize_sparse(layout.total_size);
- detail::WritablePixelRange pixels(file.get(), layout);
- auto* const first = pixels.image(0);
- file.allocate_range(layout.pixel_offset(0), layout.pixel_pitch);
- first[0] = 0.25F;
- layout = compute_file_layout(COMPILED_BLOCK_SLOTS + 1, 12);
- file.resize_sparse(layout.total_size);
- pixels.grow(layout);
- CHECK(pixels.image(0) == first);
- CHECK(first[0] == 0.25F);
- file.allocate_range(layout.pixel_offset(COMPILED_BLOCK_SLOTS), layout.pixel_pitch);
- pixels.image(COMPILED_BLOCK_SLOTS)[0] = 0.75F;
- float last = 0;
- file.pread_all(&last, sizeof(last), layout.pixel_offset(COMPILED_BLOCK_SLOTS));
- CHECK(last == 0.75F);
- CHECK_THROWS(pixels.grow(compute_file_layout(1, 12)));
- CHECK_THROWS(pixels.grow(compute_file_layout(COMPILED_BLOCK_SLOTS + 1, 24)));
- CHECK_THROWS(pixels.grow(compute_file_layout(COMPILED_BLOCK_SLOTS + 1, 12, 0)));
- CHECK(pixels.image(0) == first);
+ detail::StorageReservationPool reservations(root.path());
+ auto artifact=detail::StagedArtifact::create(reservations,root.path()/"slots.bin",0,"stable slots");
+ auto layout=compute_file_layout(1,12);
+ detail::CompiledSlotStorage storage(artifact,layout);
+ storage.prepare_pixels(0);
+ auto first=storage.pixels(0);
+ auto* const address=first.data();
+ address[0]=0.25F;
+ for (std::size_t i=1;i<=COMPILED_BLOCK_SLOTS;++i) CHECK(storage.reserve_slot()==i);
+ storage.prepare_pixels(COMPILED_BLOCK_SLOTS);
+ auto last=storage.pixels(COMPILED_BLOCK_SLOTS);
+ last.data()[0]=0.75F;
+ CHECK(first.data()==address);
+ CHECK(address[0]==0.25F);
+ CHECK_THROWS(storage.pixels(0));
+ CHECK_THROWS(storage.pixels(1));
+ CHECK_THROWS(storage.prepare_pixels(COMPILED_BLOCK_SLOTS+1));
+ float persisted=0;
+ artifact.file().pread_all(&persisted,sizeof(persisted),storage.layout().pixel_offset(COMPILED_BLOCK_SLOTS));
+ CHECK(persisted==0.75F);
+ first={}; last={};
+ storage.quiesce();
+ CHECK_THROWS(storage.reserve_slot());
+ CHECK_THROWS(storage.pixels(0));
 }
 TEST_CASE("compiled finalization compacts live partitions in place with bounded overlapping moves", "[backend][data][compiler][storage]") {
  const std::size_t maximum = GENERATE(std::size_t{0}, std::size_t{72}, std::size_t{466944}, COMPILED_LABEL_CAPACITY);
@@ -899,10 +902,10 @@ TEST_CASE("compiled finalization compacts live partitions in place with bounded 
    completed = done;
    expected = total;
    if (cancel_during && done) cancelled.store(true);
-  }, [&](std::size_t offset, std::size_t bytes) {
+  }, {.allocate=[&](std::size_t offset, std::size_t bytes) {
    if (fail_storage) throw std::runtime_error("compaction storage failure");
    file.allocate_range(offset, bytes);
-  });
+  }});
  };
  if (cancel_during || (fail_storage && maximum != COMPILED_LABEL_CAPACITY)) {
   CHECK_THROWS(compact());

@@ -1,5 +1,5 @@
 #pragma once  // backend.data private implementation boundary
-#include "src/backend/data/detail/compile_execution.h"
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/backend/data/detail/compile_resources.h"
 #include <atomic>
@@ -15,6 +15,7 @@
 #include <utility>
 #include <nlohmann/json.hpp>
 #include "src/common/concurrency/cancellation_observation.h"
+namespace mmltk::backend::data::detail { class CompileExecution; }
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
@@ -33,7 +34,7 @@ struct BenchmarkCacheLayout {
  [[nodiscard]] std::filesystem::path source_images(std::string_view source) const;
  [[nodiscard]] std::filesystem::path source_indexes(std::string_view source) const;
 };
-class StorageReservationPool;
+
 using detail::CompileExecution;
 class ArtifactLease {
 public:
@@ -66,7 +67,7 @@ void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObserv
 // Allocation and capacity failures cannot become cache misses or transfer retries.
 [[nodiscard]] bool is_benchmark_capacity_failure(const std::exception& error) noexcept;
 std::uint64_t write_json_atomically(
- const std::filesystem::path& path, const nlohmann::json& value, mmltk::common::concurrency::CancellationObservation cancellation, StorageReservationPool* storage = nullptr);
+ const std::filesystem::path& path, const nlohmann::json& value, mmltk::common::concurrency::CancellationObservation cancellation, detail::StorageReservationPool* storage = nullptr);
 [[nodiscard]] nlohmann::json read_json_file(const std::filesystem::path& path, std::uint64_t* extent = nullptr);
 [[nodiscard]] bool is_safe_cache_component(std::string_view value) noexcept;
 template <class Builder>

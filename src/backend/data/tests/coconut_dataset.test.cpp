@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory_io.h"
@@ -341,7 +342,7 @@ void check_publication_bytes(const std::filesystem::path& output, std::string_vi
  CHECK((file_bytes(output / "benchmark_manifest.json") == manifest));
 }
 std::vector<CoconutPhysicalImage> fixture_physical_inventory(const std::filesystem::path& archive_path, const std::filesystem::path& cache_path, CoconutImageNamespace source, std::uint16_t shard,
- std::string identity, mmltk::common::concurrency::CancellationObservation cancelled = {}, StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr,
+ std::string identity, mmltk::common::concurrency::CancellationObservation cancelled = {}, detail::StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr,
  const CompileAllowance& parent = {}) {
  if (!cache_path.empty() && std::filesystem::exists(cache_path)) {
   try {
@@ -830,7 +831,7 @@ TEST_CASE("COCONut version-1 physical inventory has fixed bytes and admits exist
  const std::array<std::pair<std::string, std::string>, 3> members{{{".", ""}, {"./", ""}, {"./image//./objects365_v1_00091105.jpg", "jpeg"}}};
  tar(archive, members);
  const auto emitted = root.path() / "emitted.bin";
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  CHECK(fixture_physical_inventory(archive, emitted, CoconutImageNamespace::Objects365V1, 0x1234, "a", {}, &storage) == wanted);
  CHECK(storage.outstanding() == 0);
  struct stat status{};
@@ -903,7 +904,7 @@ TEST_CASE("COCONut version-1 component inventory pins nested physical release an
  builder.index.images.push_back({.source_image_id = 91105, .width = 1, .height = 1, .source_shard = 0x1234});
  const auto component = std::move(builder).finish({}, root.path());
  const auto path = root.path() / "component.bin";
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  store_coconut_component(path, component, {}, &storage);
  CHECK(storage.outstanding() == 0);
  const auto index_bytes = file_bytes(path);
@@ -7190,7 +7191,7 @@ TEST_CASE("native RGB segment runs preserve exact IDs across dense prefixes unal
 TEST_CASE("native image custody survives workspace reuse and physical retirement", "[benchmark][coconut][annotations][resources]") {
  const bool staged = GENERATE(false, true);
  ScopedTempDir root("native-image-mapped-custody");
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  CoconutNativeWorkspace workspace(CoconutImportLimits{});
  CoconutRecord wide;
  wide.image_id = 7;
@@ -7266,7 +7267,7 @@ TEST_CASE("native image custody survives workspace reuse and physical retirement
 }
 TEST_CASE("staged segments share immutable backing and detach only the mutated copy", "[benchmark][coconut][annotations][resources]") {
  ScopedTempDir root("coconut-segment-custody");
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  CoconutSegments original{{.id = 1, .category_id = 18, .isthing = true, .area = 2.0, .bbox = std::array<double, 4>{0, 0, 1, 2}}};
  original.stage(root.path(), &storage);
  REQUIRE(std::distance(std::filesystem::directory_iterator(root.path()), std::filesystem::directory_iterator{}) == 1);
@@ -7295,7 +7296,7 @@ TEST_CASE("staged segments share immutable backing and detach only the mutated c
 }
 TEST_CASE("borrowed native support retains the complete temporary backing", "[benchmark][coconut][recovery][resources]") {
  ScopedTempDir root("coconut-support-custody");
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  const std::array<RLEPair, 2> input{{{0, 2}, {4, 1}}};
  auto owner = std::make_shared<BenchmarkMappedArtifact>(storage, root.path() / "support", sizeof(input), "native support fixture");
  const auto path = owner->path();
@@ -7663,7 +7664,7 @@ TEST_CASE("recovery batches publish independent labels before withheld geometry"
 TEST_CASE("asynchronous native labels retain their sealed image until conversion settles", "[benchmark][coconut][pipeline][labels][resources]") {
  using namespace std::chrono_literals;
  ScopedTempDir backing_root("asynchronous-native-backing");
- StorageReservationPool storage(backing_root.path(), {});
+ detail::StorageReservationPool storage(backing_root.path(), {});
  CoconutNativeWorkspace workspace(CoconutImportLimits{});
  CoconutRecord record;
  record.image_id = 7;
@@ -7711,7 +7712,7 @@ TEST_CASE("asynchronous native labels retain their sealed image until conversion
  split.images = {{7, 1, 1, 1, 0, AnnotationSource::CoconutCoco}};
  ScopedTempDir destination("native-direct-labels");
  BenchmarkSplitWriter writer({.split = split, .output_path = destination.path() / "labels.bin", .resolution = 1, .num_workers = 1});
- writer.write_labels(0, benchmark_entry(split.images[0]), {product->labels, product->runs}, 0, 19);
+ writer.write_labels(0, benchmark_entry(split.images[0]), {product->labels, product->runs}, 19);
  CHECK(writer.entry(0).num_instances == 1);
  product.reset();
  execution.retire_attempt();

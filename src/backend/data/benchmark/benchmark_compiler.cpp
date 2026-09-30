@@ -1,3 +1,5 @@
+#include "src/backend/data/detail/staged_artifact.h"
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
@@ -125,7 +127,7 @@ struct TracePath final {
  return parent_iterator == parent.end();
 }
 DownloadResult acquire_physical_archive(const AdmittedRecipeArchive& admitted, const BenchmarkCacheLayout& cache, ProgressReporter& progress, ArtifactProgressTotals& totals,
- StorageReservationPool& storage, std::size_t workers, common_concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution) {
+ detail::StorageReservationPool& storage, std::size_t workers, common_concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution) {
  const auto& artifact = admitted.origin.artifact;
  const auto owner = benchmark_source_name(artifact.source);
  auto request = make_download_request(cache, owner, artifact);
@@ -140,7 +142,7 @@ public:
 };
 [[nodiscard]] CachedImageDirectory acquire_archive_images(const BenchmarkCacheLayout& cache, const BenchmarkDatasetSource source, std::string shard, const std::vector<std::uint64_t>& expected_ids,
  const CatalogArtifact& artifact, mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress, ArtifactProgressTotals* transfer_progress,
- StorageReservationPool* storage_reservations, const std::uint64_t source_total_images, const std::size_t decompression_workers, const std::size_t cache_write_workers,
+ detail::StorageReservationPool* storage_reservations, const std::uint64_t source_total_images, const std::size_t decompression_workers, const std::size_t cache_write_workers,
  const std::size_t download_connections, const BenchmarkTraceSink& trace, const std::optional<ImageDecodeProbe> decode_probe = std::nullopt, const DownloadResult* initial_download = nullptr,
  std::shared_ptr<ArtifactLease> initial_lease = {}, BenchmarkCompilePipeline* execution = nullptr) {
  if (expected_ids.empty()) { throw std::runtime_error("benchmark archive extraction cannot have an empty image selection"); }
@@ -275,7 +277,7 @@ public:
    return extracted;
   } catch (const RequiredImageDecodeError&) { throw; } catch (const std::bad_alloc&) {
    throw;
-  } catch (const InsufficientCompileResources&) { throw; } catch (const InsufficientBenchmarkStorage&) {
+  } catch (const InsufficientCompileResources&) { throw; } catch (const detail::InsufficientStorage&) {
    throw;
   } catch (...) {
    last_error = std::current_exception();
@@ -538,7 +540,7 @@ void write_split_with_progress(BenchmarkSplitWriter& writer, const BenchmarkWrit
 }  // namespace
 bool archive_selection_allows_quarantine(const BenchmarkDatasetSource source, const std::string_view split) noexcept { return source != BenchmarkDatasetSource::kCoco2017 || split == "train2017"; }
 void publish_benchmark_manifest(const BenchmarkCompilerConfig& config, const std::filesystem::path& staging_dir, const std::filesystem::path& cache_root, nlohmann::json facts,
- const common_concurrency::CancellationObservation cancelled, StorageReservationPool* storage) {
+ const common_concurrency::CancellationObservation cancelled, detail::StorageReservationPool* storage) {
  facts["schema_version"] = 3U;
  facts["compiled_format_version"] = FORMAT_VERSION;
  facts["normalized_annotation_version"] = kNormalizedAnnotationIndexVersion;
@@ -592,7 +594,7 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
  std::condition_variable source_work_changed;
  std::deque<std::pair<AdmittedRecipeArchive*, std::string>> source_work;
  for (auto& archive : admitted) source_work.emplace_back(&archive, std::string{});
- StorageReservationPool storage(cache.root, trace, &pipeline.storage());
+ detail::StorageReservationPool storage(cache.root, storage_observer(trace), &pipeline.storage());
  CoconutPhysicalMembership membership(
   admitted, catalog, explicit_catalog, cache, storage, pipeline, cancellation, [&](CoconutEdition, const AdmittedRecipeArchive& archive, std::uint64_t id, std::uint64_t entries) {
   progress.transfers().images(archive.origin.artifact.source, archive.origin.artifact.artifact_id, entries, 0, progress);
@@ -823,10 +825,11 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
  }
  progress.rejected(rejected_objects, omitted.size());
  progress.phase(DatasetCompilePhase::Syncing, 0, 3);
- auto sealed_train = train_writer.seal_slots(request(train), selected[0]);
- auto sealed_validation = validation_writer.seal_slots(request(validation), selected[1]);
- sealed_train.artifact.publish(sealed_train.info.path, cancellation, BenchmarkStagedArtifact::Publication::DurableReplace, false);
- sealed_validation.artifact.publish(sealed_validation.info.path, cancellation, BenchmarkStagedArtifact::Publication::DurableReplace, false);
+ auto sealed_splits=seal_benchmark_splits(pipeline,[&](std::size_t i,std::span<std::byte> scratch) {
+  auto seal_request=request(i ? validation : train); seal_request.compaction_scratch=scratch;
+  return (i ? validation_writer : train_writer).seal_slots(seal_request,selected[i]);
+ });
+ for (auto& sealed:sealed_splits) sealed.artifact.publish(sealed.info.path,cancellation,detail::StagedArtifact::Publication::DurableReplace,false);
  progress.phase(DatasetCompilePhase::Syncing, 1, 3);
  nlohmann::json manifest{{"recipe", recipe->manifest}, {"sources", recipe->manifest["components"]}, {"image_cache", nlohmann::json::array()}, {"quarantined_images", std::move(omitted)}};
  std::uint64_t cached_image_bytes = 0;
@@ -1099,7 +1102,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   progress.phase(DatasetCompilePhase::Extracting);
   if (selection_started) selection_started();
   auto& image_transfer_progress = progress.transfers();
-  StorageReservationPool cache_storage_reservations(cache.root, trace, &pipeline.storage());
+  detail::StorageReservationPool cache_storage_reservations(cache.root, storage_observer(trace), &pipeline.storage());
   std::vector<QuarantinedImage> quarantined;
   const std::vector<std::uint64_t> coco_train_ids = image_ids(*coco_train);
   const std::vector<std::uint64_t> coco_val_ids = image_ids(*coco_val);
@@ -1662,32 +1665,17 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
    BenchmarkWriteRequest{train, staging_dir / "train.bin", config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode});
   compile_split(validation_writer,
    BenchmarkWriteRequest{validation, staging_dir / "val.bin", config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode});
-  std::array<std::optional<BenchmarkSealedSplit>, 2> sealed_splits;
-  std::exception_ptr seal_failure;
-  std::mutex seal_failure_mutex;
-  {
-   // Each writer seals its already placed metadata, then performs independent
-   // I/O using its existing descriptor/storage reservation. Both settle
-   // before either staged artifact can be published or destroyed.
-   std::array<std::jthread, 2> sealing;
-   for (std::size_t i = 0; i < sealing.size(); ++i)
-    sealing[i] = std::jthread([&, i] {
-     try {
-      auto& product = i == 0 ? train : validation;
-      auto& writer = i == 0 ? train_writer : validation_writer;
-      BenchmarkWriteRequest seal_request{
-       product, staging_dir / (i == 0 ? "train.bin" : "val.bin"), config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode
-      };
-      if (progress.pixel_observer_enabled()) seal_request.compaction = [&, i](std::size_t done, std::size_t total) { progress.compacting(i, done, total); };
-      sealed_splits[i] = writer.seal(seal_request);
-     } catch (...) {
-      const std::lock_guard lock(seal_failure_mutex);
-      if (!seal_failure) seal_failure = std::current_exception();
-     }
-    });
-  }
-  if (seal_failure) std::rethrow_exception(seal_failure);
-  for (auto& sealed : sealed_splits) sealed->artifact.publish(sealed->info.path, cancel_requested, BenchmarkStagedArtifact::Publication::DurableReplace, false);
+  auto sealed_splits=seal_benchmark_splits(pipeline,[&](std::size_t i,std::span<std::byte> scratch) {
+   auto& product=i == 0 ? train : validation;
+   auto& writer=i == 0 ? train_writer : validation_writer;
+   BenchmarkWriteRequest seal_request{
+    product, staging_dir / (i == 0 ? "train.bin" : "val.bin"), config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode
+   };
+   if (progress.pixel_observer_enabled()) seal_request.compaction=[&,i](std::size_t done,std::size_t total) { progress.compacting(i,done,total); };
+   seal_request.compaction_scratch=scratch;
+   return writer.seal(seal_request);
+  });
+  for (auto& sealed : sealed_splits) sealed.artifact.publish(sealed.info.path, cancel_requested, detail::StagedArtifact::Publication::DurableReplace, false);
   progress.activity("Finalizing rejected and quarantined records");
   std::ranges::sort(quarantined);
   quarantined.erase(
@@ -1713,10 +1701,10 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   constexpr std::uint64_t kSyncStepCount = 4U;
   progress.phase(DatasetCompilePhase::Syncing, 0U, kSyncStepCount);
   progress.activity("Inspecting staged training dataset");
-  const auto& train_info = sealed_splits[0]->info;
+  const auto& train_info = sealed_splits[0].info;
   progress.phase(DatasetCompilePhase::Syncing, 1U, kSyncStepCount);
   progress.activity("Inspecting staged validation dataset");
-  const auto& val_info = sealed_splits[1]->info;
+  const auto& val_info = sealed_splits[1].info;
   progress.phase(DatasetCompilePhase::Syncing, 2U, kSyncStepCount);
   if (train_info.image_count != train.images.size() || val_info.image_count != expected_validation_images || !std::ranges::equal(train_info.class_names(), train.class_names) ||
       !std::ranges::equal(val_info.class_names(), validation.class_names)) {

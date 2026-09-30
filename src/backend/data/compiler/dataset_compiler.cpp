@@ -22,7 +22,10 @@
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 #include "src/backend/data/compiler/detail/dataset_compiler_internal.h"
-#include "src/backend/data/detail/staging_file_cleanup.h"
+#include "src/backend/data/detail/staged_artifact.h"
+#include "src/backend/data/detail/compiled_slot_storage.h"
+#include "src/backend/data/detail/file_work_queue.h"
+#include "src/backend/data/detail/compile_workspace.h"
 namespace mmltk::backend::data {
 using mmltk::common::io::FileHandle;
 using mmltk::common::io::publish_staged_path_atomically;
@@ -197,11 +200,12 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  const uint32_t height = effective_config.target_height;
  const uint32_t channels = 3;
  const size_t image_stride = static_cast<size_t>(channels) * height * width * sizeof(float);
- const int num_workers = compiler_internal::resolve_num_workers(effective_config.num_workers, std::span<const int>(effective_config.worker_cpus));
+ const int configured_workers = compiler_internal::resolve_num_workers(effective_config.num_workers, std::span<const int>(effective_config.worker_cpus));
+ const int num_workers = std::max(1,configured_workers-1);
  const int initial_pixel_workers = num_workers == 1 ? 0 : (num_workers + 1) / 2;
  const int label_workers = num_workers - initial_pixel_workers;
  const int pixel_workers = num_workers;
- const std::span<const int> worker_cpus(effective_config.worker_cpus.data(), static_cast<size_t>(num_workers));
+ const std::span<const int> worker_cpus(effective_config.worker_cpus.data()+(configured_workers>1 ? 1 : 0), static_cast<size_t>(num_workers));
  const std::span<const int> label_cpus = worker_cpus.last(static_cast<size_t>(label_workers));
  mmltk::common::logging::profile_set_value("compiler.num_workers", static_cast<size_t>(num_workers));
  const auto& class_catalog = plan.class_catalog;
@@ -232,22 +236,23 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
    static_cast<double>((static_cast<std::size_t>(num_images) * image_stride)) / (1024.0 * 1024.0 * 1024.0));
  });
  const std::filesystem::path out_path = out_dir / (effective_config.split + ".bin");
- std::string staging_path_text = out_path.string() + ".tmp.XXXXXX";
- FileHandle fd;
- {
-  mmltk::common::logging::ScopedProfile output_profile{"compiler.open_output"};
-  fd = FileHandle::create_unique_output(staging_path_text, 0);
- }
- const std::filesystem::path staging_path(staging_path_text);
- StagingFileCleanup staging_cleanup(staging_path);
- fd.resize_sparse(layout.total_size);
+ detail::StorageReservationPool destination(out_path);
+ auto staged=detail::StagedArtifact::create(destination,out_path,0,"directory compiled staging");
+ auto& fd=staged.file();
+ detail::CompiledSlotStorage storage(staged,layout);
+ // Until Directory's task cutover, physical calls use the same bounded file
+ // service contract while its numbered source worker scheduling is retained.
+ detail::CompileExecutionLimits file_limits;
+ file_limits.workspace_plan=std::make_shared<detail::CompileWorkspacePlan>(detail::CompileWorkspacePlan::prepare(1,{},0,COMPILED_COMPACTION_SCRATCH_BYTES,COMPILED_COMPACTION_SCRATCH_BYTES));
+ detail::CompileExecution file_execution(1,std::span<const int>(effective_config.worker_cpus).first(1),file_limits,cancellation);
+ detail::FileWorkQueue files(file_execution,static_cast<std::size_t>(num_workers));
  compiler_internal::LabelBlocks label_blocks;
  std::exception_ptr pixel_error;
  std::exception_ptr label_error;
  std::atomic<bool> release_all_pixel_workers{false};
  std::thread pixel_thread([&] {
   try {
-   compiler_internal::write_pixel_blob(fd, compiler_internal::PixelBlobWriteRequest{
+   compiler_internal::write_pixel_blob(storage, files, compiler_internal::PixelBlobWriteRequest{
                                             split_dir,
                                             num_images,
                                             width,
@@ -272,7 +277,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
   }
  });
  try {
-  label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, effective_config, class_catalog, plan.source_category_base, fd, layout, label_workers, label_cpus,
+  label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, effective_config, class_catalog, plan.source_category_base, storage, files, label_workers, label_cpus,
    telemetry != nullptr ? &label_progress : nullptr, &failure_requested, cancellation);
   if (telemetry != nullptr) { telemetry->set_dropped_instances(label_blocks.dropped_instances); }
  } catch (...) {
@@ -287,12 +292,20 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  throw_if_cancelled();
  mmltk::common::logging::debug([](spdlog::logger& log) { log.debug("[compile] Labels and pixels complete"); });
  throw_if_cancelled();
+ files.join();
+ storage.quiesce();
+ auto compaction=file_execution.reserve({.bytes=COMPILED_COMPACTION_SCRATCH_BYTES,.supplied_workspace=true,.completion_workspace=true,
+  .workspace_class=detail::CompileWorkClass::Output,.workspace_window=detail::CompileWorkspaceWindow::Compaction});
+ files.submit({.work=[&] {
  layout = compact_compiled_file(fd, layout, label_blocks.index, cancellation,
-  telemetry ? CompiledCompactionProgress{[&](std::size_t done, std::size_t total) { telemetry->compacting(done, total); }} : CompiledCompactionProgress{});
+  telemetry ? CompiledCompactionProgress{[&](std::size_t done, std::size_t total) { telemetry->compacting(done, total); }} : CompiledCompactionProgress{},
+  { [&](std::size_t offset,std::size_t bytes) { staged.allocate_range(offset,bytes); },
+    [&](std::size_t offset,std::size_t bytes) { return staged.reclaim_range(offset,bytes); },
+    [&](std::size_t bytes) { staged.resize_sparse(bytes); }},compaction.workspace());
  mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Layout: total={:.2f} GB", static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
- fd.allocate_range(0, compiled_align_up(sizeof(FileHeader), PAGE_SIZE));
- fd.allocate_range(layout.index_offset, compiled_align_up(layout.index_size, PAGE_SIZE));
- fd.resize_sparse(layout.total_size);
+ staged.allocate_range(0, compiled_align_up(sizeof(FileHeader), PAGE_SIZE));
+ staged.allocate_range(layout.index_offset, compiled_align_up(layout.index_size, PAGE_SIZE));
+ staged.resize_sparse(layout.total_size);
  const FileHeader header = make_file_header(
   FileHeaderInputs{
    num_images,
@@ -313,12 +326,13 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  throw_if_cancelled();
  const FileHeader staged_header = read_compiled_header(fd);
  (void)validate_compiled_file_sections(staged_header, fd.size());
- fd = FileHandle{};
+ staged.close();
+ }}).wait();
+ compaction={};
  throw_if_cancelled();
  if (telemetry != nullptr) { telemetry->enter_publishing(); }
  throw_if_cancelled();
- publish_staged_path_atomically(staging_path, out_path);
- staging_cleanup.published();
+ staged.publish(out_path,cancellation);
  mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Written {} ({:.2f} GB)", out_path.string(), static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
 }
 }  // namespace mmltk::backend::data

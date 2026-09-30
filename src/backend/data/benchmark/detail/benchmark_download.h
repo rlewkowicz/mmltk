@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_resources.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <atomic>
@@ -19,7 +20,7 @@ namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
 
 class BenchmarkCompilePipeline;
-class StorageReservationPool;
+
 // Only remote/source unavailability or rejected response content. Local setup, allocation,
 // invalid requests, callback failures, storage failures, and cancellation propagate
 // separately and must never permit optional-source omission.
@@ -88,7 +89,7 @@ using DownloadProgressSink = std::function<void(const DownloadProgress&)>;
  BenchmarkCompilePipeline* = nullptr, const CompileAllowance& parent = {}, const DownloadProgressSink& = {});
 [[nodiscard]] std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t maximum_concurrency,
  mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& progress = {}, const BenchmarkTraceSink& trace = {}, const DownloadReadySink& ready = {},
- BenchmarkCompilePipeline* execution = nullptr, const CompileAllowance& parent = {}, StorageReservationPool* storage = nullptr, const DownloadUnavailableSink& unavailable = {});
+ BenchmarkCompilePipeline* execution = nullptr, const CompileAllowance& parent = {}, detail::StorageReservationPool* storage = nullptr, const DownloadUnavailableSink& unavailable = {});
 void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested = {}, const BenchmarkTraceSink& trace = {},
  BenchmarkCompilePipeline* execution = nullptr, const CompileAllowance& parent = {});
 }  // namespace mmltk::backend::data::benchmark_internal

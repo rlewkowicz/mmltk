@@ -1,53 +1,15 @@
 #pragma once
-#include "src/backend/data/detail/compile_execution.h"
-#include "src/backend/data/benchmark/detail/benchmark_storage.h"
+#include "src/backend/data/detail/staged_artifact.h"
 #include "src/common/io/file_memory.h"
 #include <cstddef>
 #include <filesystem>
-#include <string>
 #include <string_view>
-#include <sys/types.h>
 namespace mmltk::backend::data::benchmark_internal {
-using mmltk::backend::data::detail::CompileTaskKind;
-
-class BenchmarkStagedArtifact final {
-public:
- enum class Publication { Rename, RenameAndSync, DurableReplace };
- BenchmarkStagedArtifact() = default;
- BenchmarkStagedArtifact(const BenchmarkStagedArtifact&) = delete;
- BenchmarkStagedArtifact& operator=(const BenchmarkStagedArtifact&) = delete;
- BenchmarkStagedArtifact(BenchmarkStagedArtifact&&) noexcept;
- BenchmarkStagedArtifact& operator=(BenchmarkStagedArtifact&&) noexcept;
- ~BenchmarkStagedArtifact();
- [[nodiscard]] static BenchmarkStagedArtifact create(StorageReservationPool&, const std::filesystem::path& destination, std::uint64_t promised, std::string_view description,
-  std::string_view suffix = ".tmp.XXXXXX", mode_t mode = 0644, int directory = -1);
- [[nodiscard]] mmltk::common::io::FileHandle& file() noexcept { return file_; }
- [[nodiscard]] const mmltk::common::io::FileHandle& file() const noexcept { return file_; }
- [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
- // Storage-changing operations couple the physical mutation to its promise.
- void preallocate(std::size_t bytes);
- void resize(std::size_t bytes, std::string_view description);
- void resize_sparse(std::size_t bytes);
- void allocate_range(std::size_t offset, std::size_t bytes);
- void reconcile();
- void close();
- void publish(const std::filesystem::path& destination, mmltk::common::concurrency::CancellationObservation, Publication = Publication::DurableReplace, bool overwrite = true);
-
-private:
- void discard() noexcept;
- StorageReservationPool::Reservation allocation_;
- std::filesystem::path path_;
- std::string temporary_;
- bool cleanup_ = false;
- // Optional borrowed directory; its owner outlives this staged publication.
- int directory_ = -1;
- mmltk::common::io::FileHandle file_;
-};
 // Fixed temporary storage has one custody: mapping, backing file and physical
 // reservation retire together. Mapping closes the construction descriptor.
 class BenchmarkMappedArtifact final {
 public:
- BenchmarkMappedArtifact(StorageReservationPool&, const std::filesystem::path&, std::size_t bytes, std::string_view description);
+ BenchmarkMappedArtifact(detail::StorageReservationPool&, const std::filesystem::path&, std::size_t bytes, std::string_view description);
  BenchmarkMappedArtifact(const BenchmarkMappedArtifact&) = delete;
  BenchmarkMappedArtifact& operator=(const BenchmarkMappedArtifact&) = delete;
  void write(const void* source, std::size_t bytes, std::size_t offset);
@@ -58,7 +20,7 @@ public:
 private:
  [[nodiscard]] void* map(int protection, int flags);
  // Reverse destruction order unmaps before removing the file or its promise.
- BenchmarkStagedArtifact staged_;
+ detail::StagedArtifact staged_;
  mmltk::common::io::MappedByteRegion region_;
  std::size_t bytes_;
  bool mapped_ = false;

@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_recipe.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
@@ -48,7 +49,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  const auto parse_workers = execution ? execution->execution().workers() : std::max<std::size_t>(1, effective_num_workers);
  // One fixed transport promise precedes all independently admitted lifecycles.
  auto source_transport = execution ? execution->curl().channel(BenchmarkCurl::Class::Artifact, cancel_requested, coco_annotation_resources()) : nullptr;
- StorageReservationPool storage(cache.root, trace, execution ? &execution->storage() : nullptr);
+ detail::StorageReservationPool storage(cache.root, storage_observer(trace), execution ? &execution->storage() : nullptr);
  const auto objects_index_path = cache.source_indexes("objects365") / "train.normalized.bin";
  const auto open_images_index_path = cache.source_indexes("open-images") / "train.normalized.bin";
  std::optional<CocoAnnotationIndexes> coco_indexes_result;

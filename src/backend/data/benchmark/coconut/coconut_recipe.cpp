@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
@@ -392,7 +393,7 @@ struct CoconutRecipeInputs {
  ProgressReporter* progress = nullptr;
  BenchmarkTraceSink trace;
  std::size_t connections = 1;
- std::unique_ptr<StorageReservationPool> reservations;
+ std::unique_ptr<detail::StorageReservationPool> reservations;
  IndexingProgressTotals* indexing = nullptr;
  mmltk::common::concurrency::CancellationObservation external;
  std::function<void(std::exception_ptr)> failed;
@@ -563,7 +564,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
  retain_inputs();
  prepared.manifest = {{"components", nlohmann::json::array()}, {"artifacts", nlohmann::json::array()}};
  auto& totals = progress.transfers();
- StorageReservationPool reservations(cache.root, trace, execution ? &execution->storage() : nullptr);
+ detail::StorageReservationPool reservations(cache.root, storage_observer(trace), execution ? &execution->storage() : nullptr);
  constexpr std::size_t acquisition_workers = 1;
  std::optional<CoconutMaskRecovery> recovery;
  std::shared_ptr<const CoconutRecoveryOriginals> originals;
@@ -839,7 +840,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
     continue;
    } catch (const std::bad_alloc&) { throw; } catch (const CoconutPhysicalMembershipError&) {
     throw;
-   } catch (const InsufficientCompileResources&) { throw; } catch (const InsufficientBenchmarkStorage&) {
+   } catch (const InsufficientCompileResources&) { throw; } catch (const detail::InsufficientStorage&) {
     throw;
    } catch (const CoconutInputError& error) {
     // The failed generation cannot retain input backing into artifact repair.
@@ -993,7 +994,7 @@ std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const Benchma
  inputs->progress = &progress;
  inputs->trace = trace;
  inputs->connections = std::max<std::size_t>(1, download_connections ? download_connections : workers);
- inputs->reservations = std::make_unique<StorageReservationPool>(cache.root, trace, execution ? &execution->storage() : nullptr);
+ inputs->reservations = std::make_unique<detail::StorageReservationPool>(cache.root, storage_observer(trace), execution ? &execution->storage() : nullptr);
  const auto lanes = execution ? catalog.releases.size() : std::min(workers, catalog.releases.size());
  if (lanes) {
   const auto affinity = cpus.empty() ? mmltk::common::system::allowed_cpu_set() : std::vector<int>(cpus.begin(), cpus.end());
@@ -1050,7 +1051,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   retained.start_originals([&retained, &cache, &catalog, &progress, execution, trace, recover, stock, recover_train, recover_validation, acquisition_workers, parse_workers,
                             preparation = std::move(preparation), stock_input = std::move(stock_input)] {
    const auto original_cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(retained);
-   StorageReservationPool reservations(cache.root, trace, execution ? &execution->storage() : nullptr);
+   detail::StorageReservationPool reservations(cache.root, storage_observer(trace), execution ? &execution->storage() : nullptr);
    // Declare fixed transport before retaining its dependent source lifecycle.
    auto transport = execution ? execution->curl().channel(BenchmarkCurl::Class::Artifact, original_cancellation, coco_annotation_resources()) : nullptr;
    trace_benchmark_event(trace, "benchmark.annotations.originals_wait", [] { return nlohmann::json::object(); });

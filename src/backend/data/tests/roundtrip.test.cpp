@@ -1,6 +1,9 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <signal.h>
+#include <pthread.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1409,5 +1412,49 @@ TEST_CASE("Directory metadata construction preserves empty masks offsets and pub
   const auto plan = DatasetCompiler::prepare(config, {"train"});
   CHECK_THROWS(DatasetCompiler::compile(plan, 0));
   CHECK(read_output() == baseline);
+ }
+}
+TEST_CASE("compiled scatter output checks bounded vectors and partial physical writes", "[backend][data][storage]") {
+ using mmltk::common::io::FileHandle;
+ const mmltk::testsupport::ScopedTempDir root("compiled-scatter-write");
+ auto file=FileHandle::create_output((root.path()/"scatter").string(),0);
+ SECTION("vector batches preserve empty spans and offsets") {
+  std::array<std::uint8_t,40> source{};
+  std::array<FileHandle::WriteSpan,80> spans{};
+  for (std::size_t i=0;i<source.size();++i) { source[i]=static_cast<std::uint8_t>(i); spans[i*2]={&source[i],1}; }
+  file.pwritev_all(spans,17);
+  std::array<std::uint8_t,40> stored{};
+  file.pread_all(stored.data(),stored.size(),17);
+  CHECK(stored==source);
+  CHECK_THROWS(file.pwritev_all(spans,SIZE_MAX-1));
+  CHECK(file.size()==57);
+ }
+ SECTION("short label write reports the later physical limit error") {
+  const auto layout=compute_file_layout(1,12);
+  PackedInstance label{};
+  label.source_ordinal=83;
+  ImageEntry entry{};
+  set_annotation_extent(entry,1,0,"short output");
+  struct rlimit original{};
+  REQUIRE(::getrlimit(RLIMIT_FSIZE,&original)==0);
+  sigset_t blocked{},previous{};
+  REQUIRE(::sigemptyset(&blocked)==0);
+  REQUIRE(::sigaddset(&blocked,SIGXFSZ)==0);
+  REQUIRE(::pthread_sigmask(SIG_BLOCK,&blocked,&previous)==0);
+  const mmltk::testsupport::ScopedTestCleanup restore([&] {
+   (void)::setrlimit(RLIMIT_FSIZE,&original);
+   timespec immediate{};
+   while (::sigtimedwait(&blocked,nullptr,&immediate)>=0) {}
+   (void)::pthread_sigmask(SIG_SETMASK,&previous,nullptr);
+  });
+  auto limited=original;
+  limited.rlim_cur=static_cast<rlim_t>(layout.label_offset(0)+17);
+  REQUIRE(limited.rlim_cur<=original.rlim_max);
+  REQUIRE(::setrlimit(RLIMIT_FSIZE,&limited)==0);
+  CHECK_THROWS(write_compiled_annotations(file,layout,0,entry,{{&label,1},{}}));
+  CHECK(file.size()==layout.label_offset(0)+17);
+  std::array<std::byte,17> prefix{};
+  file.pread_all(prefix.data(),prefix.size(),layout.label_offset(0));
+  CHECK(std::memcmp(prefix.data(),&label,prefix.size())==0);
  }
 }

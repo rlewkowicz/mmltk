@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/detail/open_images_acquisition.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
@@ -210,7 +211,7 @@ public:
  void retire() noexcept { stop(); }
 
 private:
- StorageReservationPool storage_;
+ detail::StorageReservationPool storage_;
  BenchmarkCompilePipeline* execution_ = nullptr;
  int directory_;
  std::function<void(std::uint64_t)> warm_read_;
@@ -400,7 +401,7 @@ struct CachedOpenImagesGroup {
 void complete_open_images_group(const std::filesystem::path& image_root, const std::filesystem::path& completion, const std::string_view identity,
  const std::span<const std::uint64_t> requested_image_ids, const std::span<const std::uint64_t> available_image_ids, const std::span<const QuarantinedImage> quarantined,
  BenchmarkCompilePipeline& execution, const std::uint64_t image_bytes, const mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
- StorageReservationPool* storage) {
+ detail::StorageReservationPool* storage) {
  nlohmann::json quarantine_records = nlohmann::json::array();
  for (const QuarantinedImage& image : quarantined) { quarantine_records.push_back({{"image_id", image.image_id}, {"reason", image.reason}}); }
  nlohmann::json dimensions = nlohmann::json::array();

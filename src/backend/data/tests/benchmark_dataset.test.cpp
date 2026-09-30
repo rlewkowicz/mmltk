@@ -1,3 +1,6 @@
+#include "src/backend/data/detail/staged_artifact.h"
+#include "src/backend/data/detail/compiled_slot_storage.h"
+#include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/file_work_queue.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
@@ -2173,7 +2176,7 @@ TEST_CASE("benchmark storage releases reservations after diagnostic rejection", 
   throw std::runtime_error("storage diagnostic failure");
  };
  CHECK_NOTHROW(require_storage(root.path(), 1U, "fixture", sink));
- StorageReservationPool pool{root.path(), sink};
+ detail::StorageReservationPool pool{root.path(), storage_observer(sink)};
  for (unsigned attempt = 0; attempt < 2U; ++attempt) { const auto reservation = pool.reserve(1U, "fixture"); }
  CHECK((reservations == std::vector<std::uint64_t>{1U, 1U}));
  // Admission inspects existing filesystem capacity; no disk filling occurs.
@@ -2704,9 +2707,9 @@ TEST_CASE("annotation retries distinguish source corruption from local capacity 
   CHECK_THROWS_AS(retry_annotation_indexing(cancellation,
                    [&] {
    ++bodies;
-   throw InsufficientBenchmarkStorage("fixture capacity");
+   throw detail::InsufficientStorage("fixture capacity");
   }, repair),
-   InsufficientBenchmarkStorage);
+   detail::InsufficientStorage);
   CHECK(bodies == 1);
   CHECK(repairs == 0);
  }
@@ -2860,7 +2863,7 @@ TEST_CASE("dynamic fixed slots publish labels before pixels and admit exactly th
  entry.source_image_id = 1;
  entry.original_width = 16;
  entry.original_height = 8;
- writer.write_labels(first_slot, entry, {{&label, 1}, runs}, 0, 100);
+ writer.write_labels(first_slot, entry, {{&label, 1}, runs}, 100);
  CHECK_FALSE(writer.image_complete(first_slot));
  const auto label_allocation = writer.allocated_bytes();
  CHECK(label_allocation >= COMPILED_LABEL_CAPACITY);
@@ -2912,11 +2915,15 @@ TEST_CASE("dynamic fixed slots publish labels before pixels and admit exactly th
  const auto second_slot = writer.allocate_slot(second, split.sources[0]);
  CHECK(second_slot == COMPILED_BLOCK_SLOTS + 1);
  writer.write_pixel(second_slot, 0);
+ const bool trailing_unprepared=GENERATE(false,true);
+ const auto final_slots=trailing_unprepared ? COMPILED_BLOCK_SLOTS*2+1 : COMPILED_BLOCK_SLOTS+2;
+ for (std::uint32_t slot=COMPILED_BLOCK_SLOTS+2;slot<final_slots;++slot)
+  CHECK(writer.allocate_slot({slot+100,16,8,0,0},split.sources[0])==slot);
  split.images = {second, first};
  writer.finish(request);
  const auto source = CompiledDataset::open(request.output_path);
  REQUIRE(source.header().num_images == 2);
- REQUIRE(source.slot_count() == COMPILED_BLOCK_SLOTS + 2);
+ REQUIRE(source.slot_count() == final_slots);
  CHECK(std::ranges::equal(source.eligible_slots(), std::array{first_slot, second_slot}));
  CHECK_THROWS_AS(source.annotations(1), std::out_of_range);
  CHECK(source.image_entry(first_slot).label_bytes == COMPILED_LABEL_CAPACITY);
@@ -4019,8 +4026,8 @@ TEST_CASE("an attempt retires writer borrows before an early execution owner", "
 }
 TEST_CASE("filesystem reservations share allocation settlement across destinations", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("shared-storage-ledger");
- StorageReservationPool first(root.path(), {});
- StorageReservationPool second(root.path() / "output", {}, &first);
+ detail::StorageReservationPool first(root.path(), {});
+ detail::StorageReservationPool second(root.path() / "output", {}, &first);
  auto left = first.reserve(16384, "first stage");
  auto right = second.reserve(8192, "second stage");
  CHECK(first.outstanding() == 24576);
@@ -4091,7 +4098,7 @@ TEST_CASE("cancelled shared admission releases a queued borrow with its input he
 }
 TEST_CASE("filesystem reservation follows allocation that is later withdrawn", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("reservation-growth");
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  const auto path = root.path() / "staging";
  auto promised = storage.reserve(16384, "staged output");
  CHECK(storage.outstanding() == 16384);
@@ -4825,12 +4832,12 @@ TEST_CASE("charged lease acquisition owns its descriptor through cancellation an
 }
 TEST_CASE("direct storage settlement preserves sparse replacement promises and inode aliases", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("direct-download-storage");
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  const auto final = root.path() / "artifact";
  const auto partial = root.path() / "artifact.part";
  auto file = FileHandle::create_output(partial.string(), 0);
  REQUIRE(::ftruncate(file.get(), 65536) == 0);
- auto reservation = storage.reserve_download(final, 65536, "sparse download");
+ auto reservation = reserve_download(storage, final, 65536, "sparse download");
  struct stat status{};
  REQUIRE(::fstat(file.get(), &status) == 0);
  const auto outstanding_for = [&] { return 65536U - std::min<std::uint64_t>(65536, static_cast<std::uint64_t>(status.st_blocks) * 512); };
@@ -4841,7 +4848,7 @@ TEST_CASE("direct storage settlement preserves sparse replacement promises and i
  REQUIRE(::fstat(file.get(), &status) == 0);
  CHECK(storage.outstanding() == outstanding_for());
  fs::create_hard_link(partial, final);
- reservation.reconcile_download(final);
+ reconcile_download(reservation, final);
  CHECK(storage.outstanding() == outstanding_for());
  reservation.withdraw_allocation();
  CHECK(storage.outstanding() == 65536);
@@ -4858,7 +4865,7 @@ TEST_CASE("direct storage settlement preserves sparse replacement promises and i
  file.preallocate(65536);
  reservation.reconcile(file.get());
  fs::rename(partial, final);
- reservation.reconcile_download(final);
+ reconcile_download(reservation, final);
  REQUIRE(::fstat(file.get(), &status) == 0);
  CHECK(storage.outstanding() == outstanding_for());
  reservation.release();
@@ -4867,7 +4874,7 @@ TEST_CASE("direct storage settlement preserves sparse replacement promises and i
 }
 TEST_CASE("storage admission never reopens unrelated live backing paths", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("constant-storage-settlement");
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  fs::create_directory(root.path() / "old");
  auto file = FileHandle::create_output((root.path() / "old" / "file").string(), 4096);
  auto first = storage.reserve(16384, "first");
@@ -4888,17 +4895,17 @@ TEST_CASE("storage admission never reopens unrelated live backing paths", "[back
 }
 TEST_CASE("staged artifact owns cleanup across file-operation and publication failures", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("staged-artifact-failures");
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  const auto target = root.path() / "published";
  {
   auto original = FileHandle::create_output(target.string(), 3);
   original.pwrite_all("old", 3, 0);
  }
- SECTION("creation") { CHECK_THROWS(BenchmarkStagedArtifact::create(storage, root.path() / "absent" / "file", 4096, "failed creation")); }
+ SECTION("creation") { CHECK_THROWS(detail::StagedArtifact::create(storage, root.path() / "absent" / "file", 4096, "failed creation")); }
  SECTION("preallocation") {
   fs::path temporary;
   {
-   auto stage = BenchmarkStagedArtifact::create(storage, target, 4096, "failed preallocation");
+   auto stage = detail::StagedArtifact::create(storage, target, 4096, "failed preallocation");
    temporary = stage.path();
    stage.file() = {};
    CHECK_THROWS(stage.preallocate(4096));
@@ -4908,7 +4915,7 @@ TEST_CASE("staged artifact owns cleanup across file-operation and publication fa
  SECTION("write and sync") {
   fs::path temporary;
   {
-   auto stage = BenchmarkStagedArtifact::create(storage, target, 4096, "failed write");
+   auto stage = detail::StagedArtifact::create(storage, target, 4096, "failed write");
    temporary = stage.path();
    stage.file() = {};
    CHECK_THROWS(stage.file().pwrite_all("new", 3, 0));
@@ -4919,11 +4926,11 @@ TEST_CASE("staged artifact owns cleanup across file-operation and publication fa
  SECTION("rename and replacement") {
   fs::path temporary;
   {
-   auto stage = BenchmarkStagedArtifact::create(storage, target, 3, "failed replacement");
+   auto stage = detail::StagedArtifact::create(storage, target, 3, "failed replacement");
    temporary = stage.path();
    stage.file().pwrite_all("new", 3, 0);
    stage.file().sync_data();
-   CHECK_THROWS(stage.publish(target, {}, BenchmarkStagedArtifact::Publication::DurableReplace, false));
+   CHECK_THROWS(stage.publish(target, {}, detail::StagedArtifact::Publication::DurableReplace, false));
    CHECK(fs::exists(temporary));
   }
   CHECK_FALSE(fs::exists(temporary));
@@ -4931,17 +4938,17 @@ TEST_CASE("staged artifact owns cleanup across file-operation and publication fa
  SECTION("rename syscall") {
   fs::path temporary;
   {
-   auto stage = BenchmarkStagedArtifact::create(storage, target, 3, "failed rename");
+   auto stage = detail::StagedArtifact::create(storage, target, 3, "failed rename");
    temporary = stage.path();
    stage.file().pwrite_all("new", 3, 0);
-   CHECK_THROWS(stage.publish(root.path() / "absent" / "value", {}, BenchmarkStagedArtifact::Publication::Rename));
+   CHECK_THROWS(stage.publish(root.path() / "absent" / "value", {}, detail::StagedArtifact::Publication::Rename));
   }
   CHECK_FALSE(fs::exists(temporary));
  }
  SECTION("move assignment abandons the preceding stage") {
-  auto first = BenchmarkStagedArtifact::create(storage, target, 4096, "first stage");
+  auto first = detail::StagedArtifact::create(storage, target, 4096, "first stage");
   const auto previous = first.path();
-  auto second = BenchmarkStagedArtifact::create(storage, target, 8192, "second stage");
+  auto second = detail::StagedArtifact::create(storage, target, 8192, "second stage");
   first = std::move(second);
   CHECK_FALSE(fs::exists(previous));
   CHECK(storage.outstanding() == 8192);
@@ -4959,10 +4966,10 @@ TEST_CASE("staged artifact owns cleanup across file-operation and publication fa
 }
 TEST_CASE("independent staged writers retain separate promises and publish after moves", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("independent-staged-writers");
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  mmltk::testsupport::TestGate staged("two owned stages");
  const auto write = [&](std::size_t index) {
-  auto stage = BenchmarkStagedArtifact::create(storage, root.path() / std::to_string(index), 16384, "independent stage");
+  auto stage = detail::StagedArtifact::create(storage, root.path() / std::to_string(index), 16384, "independent stage");
   staged.receipt().ArriveAndWait();
   auto moved = std::move(stage);
   moved.preallocate(16384);
@@ -4984,7 +4991,7 @@ TEST_CASE("independent staged writers retain separate promises and publish after
 }
 TEST_CASE("mapped artifacts retain fixed backing after descriptor and producer retirement", "[benchmark][storage][resources]") {
  mmltk::testsupport::ScopedTempDir root("mapped-artifact-custody");
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  auto owner = std::make_shared<BenchmarkMappedArtifact>(storage, root.path() / "payload", 4096, "mapped fixture");
  const auto path = owner->path();
  REQUIRE(fs::exists(path));
@@ -5022,7 +5029,7 @@ TEST_CASE("mapped artifacts retain fixed backing after descriptor and producer r
 }
 TEST_CASE("mapped payload construction unwinds storage and empty extents need no file", "[benchmark][storage][resources]") {
  mmltk::testsupport::ScopedTempDir root("mapped-artifact-failures");
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  SECTION("file creation failure releases its promise") { CHECK_THROWS(BenchmarkMappedArtifact(storage, root.path() / "absent" / "payload", 4096, "missing directory")); }
  SECTION("fixed extent write rejects overflow and unwinds the producer") {
   const auto construct = [&] {
@@ -5052,7 +5059,7 @@ TEST_CASE("mapped payload construction unwinds storage and empty extents need no
 }
 TEST_CASE("cached images and ordinary stages retain their modes and promises through publication", "[backend][data][benchmark][storage]") {
  mmltk::testsupport::ScopedTempDir root("staged-output-modes");
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  mode_t mask = 0022;
  SECTION("ordinary process mask") {}
  SECTION("private creation honors an owner permission mask") { mask = 0200; }
@@ -5060,7 +5067,7 @@ TEST_CASE("cached images and ordinary stages retain their modes and promises thr
  const mmltk::testsupport::ScopedTestCleanup restore_mask([&] { (void)::umask(previous_mask); });
  const auto encoded = make_jpeg(240, 8, 8);
  struct PublicationObservation {
-  StorageReservationPool& storage;
+  detail::StorageReservationPool& storage;
   std::uint64_t promised;
   mutable bool retained = false;
   bool cancelled() const noexcept {
@@ -5077,7 +5084,7 @@ TEST_CASE("cached images and ordinary stages retain their modes and promises thr
  REQUIRE(::stat(image.c_str(), &status) == 0);
  CHECK((status.st_mode & 0777) == (0600 & ~mask));
  const auto ordinary = root.path() / "ordinary.bin";
- auto stage = BenchmarkStagedArtifact::create(storage, ordinary, encoded.size(), "ordinary stage modes");
+ auto stage = detail::StagedArtifact::create(storage, ordinary, encoded.size(), "ordinary stage modes");
  REQUIRE(::fstat(stage.file().get(), &status) == 0);
  CHECK((status.st_mode & 0777) == 0644);
  CHECK(status.st_size == 0);
@@ -7057,7 +7064,7 @@ TEST_CASE("preplacement image facts remain compact and withdraw with their sourc
   auto occupied = execution.execution().reserve(CompileResources::handles(13));
   FileHandle directory(::open(images.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
   REQUIRE(directory.get() >= 0);
-  StorageReservationPool storage(images, {});
+  detail::StorageReservationPool storage(images, {});
   payload = BenchmarkEncodedImage::publish(directory.get(), 1, encoded, decoder.read_header(encoded), {}, storage, &execution.execution());
   REQUIRE(payload);
   CHECK(payload->storage() == BenchmarkEncodedImage::Storage::HeaderOnly);
@@ -8250,7 +8257,7 @@ NormalizedAnnotationReadView label_projection_fixture(std::uint64_t id, std::uin
 }  // namespace
 TEST_CASE("normalized assembly backings preserve identical used records and retained readers", "[benchmark][annotations][resources]") {
  mmltk::testsupport::ScopedTempDir root("normalized-assembly-custody");
- StorageReservationPool storage(root.path(), {});
+ detail::StorageReservationPool storage(root.path(), {});
  const auto input = label_projection_fixture(7);
  std::array<NormalizedAnnotationIndex, 2> products;
  for (std::size_t backing = 0; backing < products.size(); ++backing) {
@@ -9068,7 +9075,7 @@ TEST_CASE("independent slots settle payloads and release chunks across source fa
    const auto slot = writer.allocate_slot(record, {images});
    execution.bind_slot(images, 1, writer, slot);
    final.images.push_back(record);
-   writer.write_labels(slot, benchmark_entry(record), {chunk->labels, chunk->runs}, 0, source == 0 ? 100 : 200);
+   writer.write_labels(slot, benchmark_entry(record), {chunk->labels, chunk->runs}, source == 0 ? 100 : 200);
    chunk.reset();
    CHECK(custody[source].expired());
   }
@@ -9129,7 +9136,7 @@ TEST_CASE("direct slot publication rejects malformed records and cannot seal par
  BenchmarkCompilePipeline::Attempt attempt(execution);
  writer.write_remaining(request);
  cancelled.store(cancel_placement);
- CHECK_THROWS(writer.write_labels(0, benchmark_entry(split.images[0]), {chunk->labels, chunk->runs}, 0, 1));
+ CHECK_THROWS(writer.write_labels(0, benchmark_entry(split.images[0]), {chunk->labels, chunk->runs}, 1));
  CHECK_THROWS(writer.seal(request));
  CHECK_FALSE(fs::exists(request.output_path));
 }
@@ -9260,11 +9267,11 @@ TEST_CASE("provenance settlement coalesces used record blocks while preserving m
  const auto dimensions = writer.dimensions(*slot);
  entry.original_width = dimensions.first;
  entry.original_height = dimensions.second;
- writer.write_labels(*slot, entry, {labels, runs}, 0, 19);
+ writer.write_labels(*slot, entry, {labels, runs}, 19);
  writer.settle_labels(*slot, 100, true);
  const std::array selected{*slot};
  auto sealed = writer.seal_slots(output, selected);
- sealed.artifact.publish(output.output_path, {}, BenchmarkStagedArtifact::Publication::DurableReplace);
+ sealed.artifact.publish(output.output_path, {}, detail::StagedArtifact::Publication::DurableReplace);
  const auto compiled = CompiledDataset::open(output.output_path);
  const auto actual = compiled.annotations(*slot);
  REQUIRE(actual.labels.size() == count);
@@ -9380,7 +9387,7 @@ TEST_CASE("dynamic benchmark slots write labels before pixels and replace one de
  } else {
   if (!restore) writer.settle_labels(*slot, 11, incomplete);
   auto sealed = writer.seal_slots(output, selected);
-  sealed.artifact.publish(output.output_path, {}, BenchmarkStagedArtifact::Publication::DurableReplace);
+  sealed.artifact.publish(output.output_path, {}, detail::StagedArtifact::Publication::DurableReplace);
   const auto compiled = CompiledDataset::open(output.output_path);
   REQUIRE(compiled.image_labels(*slot).size() == 1);
   CHECK(compiled.image_labels(*slot)[0].annotation_id == (restore ? 101 : 202));
@@ -10377,4 +10384,153 @@ TEST_CASE("standalone pixel failure drains held completion and retains completed
  CHECK(writer.completed() == 2);
  CHECK(reads[0] == 1);
  CHECK(reads[1] == 2);
+}
+TEST_CASE("held occupied extent preparation leaves source claims and unrelated completion available", "[backend][data][benchmark][pipeline][storage]") {
+ if (mmltk::common::system::allowed_cpu_set().size()<4) SKIP("requires four assigned CPUs");
+ mmltk::testsupport::ScopedTempDir root("prepared-slot-independence");
+ auto split=cached_pixel_membership(root.path()/"images");
+ split.images={{1,16,8,0,0},{2,16,8,0,0}};
+ BenchmarkEncodedImage::publish(cached_image_path(split.sources.front().root,1),make_jpeg(128,64,32),{});
+ BenchmarkEncodedImage::publish(cached_image_path(split.sources.front().root,2),make_jpeg(32,64,128),{});
+ BenchmarkCompilePipeline pipeline(4);
+ auto request=benchmark_write_request(split,root.path()/"result.bin",8);
+ request.execution=&pipeline;
+ mmltk::testsupport::TestGate preparation("first occupied extent awaits physical preparation");
+ request.extent_preparing=[&](const fs::path&,std::uint64_t id) { if (id==1) preparation.receipt().ArriveAndWait(); };
+ BenchmarkSplitWriter writer(request,true);
+ BenchmarkCompilePipeline::Attempt attempt(pipeline);
+ bind_benchmark_slots(pipeline,writer,split);
+ const mmltk::testsupport::ScopedTestCleanup release([&] { preparation.Release(); });
+ auto publication=pipeline.source_publication(split.sources.front().root,{});
+ publication({1});
+ REQUIRE(preparation.WaitEntered(2s));
+ CHECK(writer.allocate_slot({.source_image_id=3},{split.sources.front().root})==2);
+ publication({2});
+ auto second=pipeline.image_completion(split.sources.front().root,2);
+ std::promise<void> completed;
+ second.subscribe([&](std::exception_ptr error) { if (error) completed.set_exception(error); else completed.set_value(); });
+ mmltk::testsupport::await_test_promise(completed,"independent pixel completion during held extent preparation");
+ CHECK(writer.image_complete(1));
+ CHECK_FALSE(writer.image_complete(0));
+ preparation.Release(); pipeline.drain(); CHECK(writer.image_complete(0));
+}
+TEST_CASE("occupied allocation distinguishes overwrite and reclaimed growth", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("occupied-page-mutations");
+ detail::StorageReservationPool reservations(root.path());
+ auto stage=detail::StagedArtifact::create(reservations,root.path()/"pixels",0,"occupied fixture");
+ stage.resize_sparse(32768);
+ stage.allocate_range(4096,8192);
+ const auto before=detail::StorageReservationPool::allocated_bytes(stage.file().get());
+ stage.file().pwrite_all("pixels",6,4096);
+ stage.allocate_range(4096,4096);
+ CHECK(detail::StorageReservationPool::allocated_bytes(stage.file().get())==before);
+ CHECK(reservations.outstanding()==0);
+ const bool punched=stage.reclaim_range(4096,4096);
+ if (punched) CHECK(detail::StorageReservationPool::allocated_bytes(stage.file().get())<before);
+ stage.allocate_range(4096,4096);
+ CHECK(reservations.outstanding()==0);
+ stage.resize_sparse(4096);
+ CHECK(stage.file().size()==4096);
+ CHECK(reservations.outstanding()==0);
+ stage.file()={};
+ CHECK_THROWS(stage.allocate_range(16384,4096));
+ CHECK_THROWS(stage.reclaim_range(0,4096));
+ CHECK_THROWS(stage.resize_sparse(0));
+}
+TEST_CASE("file output retains pinned labels until physical completion through cancellation", "[backend][data][benchmark][storage]") {
+ using detail::FileWorkQueue;
+ mmltk::testsupport::ScopedTempDir root("label-output-custody");
+ detail::StorageReservationPool reservations(root.path());
+ auto stage=detail::StagedArtifact::create(reservations,root.path()/"labels",0,"label output");
+ detail::CompiledSlotStorage storage(stage,compute_file_layout(2,12));
+ detail::CompiledLabelWorkspace workspace;
+ workspace.prepare(0);
+ PackedInstance label{}; label.bbox_x2=1; label.bbox_y2=1; label.source_ordinal=7;
+ workspace.labels.push_back(label);
+ auto payload=std::make_shared<detail::CompiledLabelWorkspace::OutputLease>(workspace.release_output());
+ const std::weak_ptr<const mmltk::common::system::NumaMemory> backing=payload->owned;
+ ImageEntry entry{}; entry.status=ImageStatus::Eligible; entry.original_width=entry.original_height=1;
+ set_annotation_extent(entry,1,0,"labels");
+ CompileExecution execution(1);
+ FileWorkQueue files(execution,1);
+ mmltk::testsupport::TestGate physical("borrowed label write in progress");
+ const mmltk::testsupport::ScopedTestCleanup release([&] { physical.Release(); });
+ auto output=files.submit({.work=[&,payload] {
+  physical.receipt().ArriveAndWait();
+  storage.labels(0).write(entry,std::move(*payload));
+ }});
+ REQUIRE(physical.WaitEntered(2s));
+ payload.reset();
+ workspace.prepare(0);
+ CHECK_FALSE(backing.expired());
+ files.cancel();
+ CHECK_FALSE(output.ready());
+ physical.Release(); output.wait(); files.join();
+ CHECK(backing.expired());
+ storage.labels(0).settle_ordinals(1,11,true);
+ PackedInstance stored{};
+ stage.file().pread_all(&stored,sizeof(stored),storage.layout().label_offset(0));
+ CHECK(stored.source_ordinal==18);
+ CHECK((stored.flags&kAnnotationOrdinalIncomplete)!=0);
+ storage.prepare_pixels(0);
+ auto pixel=storage.pixels(0);
+ pixel.data()[0]=0.75F;
+ workspace.prepare(0);
+ label.source_ordinal=99; label.flags=kAnnotationMask; label.mask_rle_pairs=1;
+ workspace.labels.push_back(label); workspace.runs.push_back({0,1});
+ set_annotation_extent(entry,1,1,"replacement labels");
+ storage.labels(0).write(entry,workspace.release_output());
+ stage.file().pread_all(&stored,sizeof(stored),storage.layout().label_offset(0));
+ CHECK(stored.source_ordinal==99);
+ RLEPair run{};
+ stage.file().pread_all(&run,sizeof(run),storage.layout().label_offset(0)+annotation_layout(1,1).run_offset);
+ CHECK(run.start==0); CHECK(run.length==1);
+ CHECK(pixel.data()[0]==0.75F);
+}
+TEST_CASE("split sealing joins a physical peer before propagating failure", "[backend][data][benchmark][writer][storage]") {
+ if (mmltk::common::system::allowed_cpu_set().size()<2) SKIP("requires two assigned CPUs");
+ mmltk::testsupport::ScopedTempDir root("split-seal-peer-custody");
+ const auto output=root.path()/"published.bin";
+ write_text(output,"previous generation");
+ const auto previous=mmltk::common::io::sha256_file(output);
+ const std::array<detail::CompileWorkspaceProfile,1> profiles{{{COMPILED_COMPACTION_SCRATCH_BYTES,0}}};
+ auto plan=std::make_shared<detail::CompileWorkspacePlan>(detail::CompileWorkspacePlan::prepare(2,profiles,0,
+  COMPILED_COMPACTION_SCRATCH_BYTES,COMPILED_COMPACTION_SCRATCH_BYTES*3));
+ BenchmarkCompilePipeline pipeline(2,{}, {.workspace_plan=plan});
+ detail::StorageReservationPool storage(root.path(),{},&pipeline.storage());
+ mmltk::testsupport::TestGate physical("first seal owns its inode and pinned scratch");
+ std::promise<void> failed;
+ fs::path temporary;
+ std::atomic<bool> physically_complete{false};
+ auto sealing=std::async(std::launch::async,[&] {
+  return seal_benchmark_splits(pipeline,[&](std::size_t split,std::span<std::byte> scratch)->BenchmarkSealedSplit {
+   if (split) {
+    if (!physical.WaitEntered(5s)) throw std::runtime_error("first split seal did not enter");
+    failed.set_value();
+    throw std::runtime_error("injected peer seal failure");
+   }
+   auto artifact=detail::StagedArtifact::create(storage,output,4096,"held split seal");
+   temporary=artifact.path();
+   artifact.preallocate(4096);
+   scratch.front()=std::byte{37};
+   physical.receipt().ArriveAndWait();
+   if (scratch.front()!=std::byte{37}) throw std::runtime_error("split scratch custody changed");
+   artifact.file().pwrite_all(scratch.data(),1,0);
+   artifact.close();
+   physically_complete=true;
+   return {std::move(artifact),{}};
+  });
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { physical.Release(); });
+ mmltk::testsupport::await_test_promise(failed,"peer seal fails while first split retains physical custody",5s);
+ CHECK(sealing.wait_for(0ms)==std::future_status::timeout);
+ CHECK_FALSE(physically_complete.load());
+ CHECK(fs::exists(temporary));
+ CHECK(pipeline.execution().snapshot().exceptional==0);
+ physical.Release();
+ CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(sealing,"failed split joins its admitted peer",5s),"injected peer seal failure");
+ CHECK(physically_complete.load());
+ CHECK_FALSE(fs::exists(temporary));
+ CHECK(storage.outstanding()==0);
+ CHECK(mmltk::common::io::sha256_file(output)==previous);
 }
