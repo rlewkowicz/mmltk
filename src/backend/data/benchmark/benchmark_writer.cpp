@@ -1,5 +1,6 @@
 #include "src/backend/data/detail/compile_execution.h"
-#include "src/backend/data/detail/compile_image_decoder.h"
+#include "src/backend/data/detail/compile_pixel_workspace.h"
+#include "src/backend/data/detail/compile_workspace.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include <fcntl.h>
 #include <unistd.h>
@@ -70,7 +71,7 @@ using detail::WritablePixelRange;
 struct BenchmarkPixelInput {
  BenchmarkSourcePublication publication;
  std::shared_ptr<const BenchmarkEncodedImage> payload;
- detail::CompilePixelWorkspacePlan workspace;
+ std::shared_ptr<const detail::CompilePixelWorkspacePlan> workspace;
  BenchmarkPixelInput(BenchmarkSourcePublication source, std::shared_ptr<const BenchmarkEncodedImage> image) : publication(std::move(source)), payload(std::move(image)) {}
 };
 struct BenchmarkSplitWriter::Impl {
@@ -94,7 +95,7 @@ struct BenchmarkSplitWriter::Impl {
  mmltk::backend::imaging::resample::ImageResizeMode resize_mode;
  common_concurrency::CancellationObservation cancellation;
  BenchmarkWriteProgressEvent progress;
- BenchmarkImageReadObserver image_opened;
+ BenchmarkImageReadObserver image_opened, pixel_preparing;
  bool actual_dimensions;
  bool perceptual;
  std::size_t stride;
@@ -111,6 +112,7 @@ struct BenchmarkSplitWriter::Impl {
        cancellation(request.cancel_requested),
        progress(request.progress),
        image_opened(request.image_opened),
+       pixel_preparing(request.pixel_preparing),
        actual_dimensions(actual),
        perceptual(request.perceptual_downscale),
        stride(common_math::checked_cast<std::size_t>(static_cast<std::uint64_t>(resolution) * resolution * 3U * sizeof(float), "benchmark image stride overflow")) {
@@ -237,7 +239,8 @@ void BenchmarkSplitWriter::write_labels(std::uint32_t slot, ImageEntry entry, Im
  }
 }
 std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
- std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication, CompileAllowance allowance, std::shared_ptr<const BenchmarkEncodedImage> payload) {
+ std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication, CompileAllowance allowance, std::shared_ptr<const BenchmarkEncodedImage> payload,
+ std::shared_ptr<const detail::CompilePixelWorkspacePlan> plan) {
  auto& state = *impl_;
  EncodedImageRecord image;
  std::filesystem::path source_root;
@@ -291,6 +294,12 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
   if (!state.actual_dimensions && ((image.source_width && image.source_width != header.width) || (image.source_height && image.source_height != header.height)))
    throw BenchmarkImageError("benchmark image dimensions do not match annotations");
   if (state.image_opened) state.image_opened(source_root, image.source_image_id);
+  if (!plan) plan = prepare_pixel_plan(slot, header);
+  if (plan->header() != header) throw BenchmarkImageError("benchmark pixel input changed its prepared header");
+  if (plan->policy() != detail::CompilePixelPolicy{state.resolution, state.resize_mode, state.perceptual})
+   throw std::logic_error("benchmark pixel preparation changed its output policy");
+  input->workspace = std::move(plan);
+  throw_if_benchmark_cancelled(state.cancellation);
   {
    const std::lock_guard lock(state.facts_mutex);
    state.images[slot].source_width = header.width;
@@ -305,14 +314,28 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
   throw_if_benchmark_cancelled(state.cancellation);
   throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what());
  }
- input->workspace=detail::compile_pixel_workspace_plan(input->payload->header(),state.resolution,state.resize_mode,state.perceptual);
  return input;
 }
 CompileAllowance BenchmarkSplitWriter::pixel_input_allowance(const BenchmarkPixelInput& input) const { return input.payload->allowance(); }
-CompileResources BenchmarkSplitWriter::pixel_resources(const BenchmarkPixelInput& input) const { return input.workspace.resources(); }
-CompileResources BenchmarkSplitWriter::pixel_resources(const BenchmarkImageHeader& header) const {
- const auto plan=detail::compile_pixel_workspace_plan(header,impl_->resolution,impl_->resize_mode,impl_->perceptual);
- return plan.resources();
+CompileResources BenchmarkSplitWriter::pixel_resources(const BenchmarkPixelInput& input) const { return input.workspace->resources(); }
+std::shared_ptr<const detail::CompilePixelWorkspacePlan> BenchmarkSplitWriter::prepare_pixel_plan(std::size_t slot, const BenchmarkImageHeader& header) const {
+ detail::CompilePixelPolicy policy;
+ std::filesystem::path root;
+ std::uint64_t id = 0;
+ {
+  const std::lock_guard lock(impl_->facts_mutex);
+  policy = {impl_->resolution, impl_->resize_mode, impl_->perceptual};
+  if (impl_->pixel_preparing) {
+   const auto& image = impl_->images.at(slot);
+   id = image.source_image_id;
+   root = impl_->input_roots.at(slot).empty() ? impl_->sources.at(image.source_index).root : impl_->input_roots.at(slot);
+  }
+ }
+ throw_if_benchmark_cancelled(impl_->cancellation);
+ if (impl_->pixel_preparing) impl_->pixel_preparing(root, id);
+ auto plan = std::make_shared<const detail::CompilePixelWorkspacePlan>(detail::compile_pixel_workspace_plan(header, policy.resolution, policy.mode, policy.perceptual));
+ throw_if_benchmark_cancelled(impl_->cancellation);
+ return plan;
 }
 void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane) {
  auto input = prepare_pixel(slot, lane);
@@ -328,33 +351,27 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const
  auto& state = *impl_;
  (void)lane;
  const auto& header = input->payload->header();
- const auto& plan = input->workspace;
+ const auto& plan = *input->workspace;
+ if (plan.policy() != detail::CompilePixelPolicy{state.resolution, state.resize_mode, state.perceptual})
+  throw std::logic_error("benchmark pixel output policy changed after preparation");
  auto memory = allowance.workspace();
  if (memory.size() < plan.bytes()) throw std::logic_error("benchmark pixels have no admitted arena");
- scratch.resizer.prepare(plan.resize,memory.subspan(plan.decoder_extent(),plan.resize.bytes()));
  throw_if_benchmark_cancelled(state.cancellation);
- std::span<const std::uint8_t> decoded;
  try {
-  decoded = scratch.decoder.decode_rgb(input->payload->encoded(), header, memory.first(plan.decoder.bytes()));
+  scratch.write(plan, input->payload->encoded(), header, memory,
+   {state.pixels->image(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow")), plan.destination()}, [&] {
+    const std::lock_guard lock(state.facts_mutex);
+    if (!state.pixel_allocated[slot]) {
+     state.staging.allocate_range(state.layout.pixel_offset(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow")), state.layout.pixel_pitch);
+     state.pixel_allocated[slot] = 1;
+    }
+   });
  } catch (const detail::CompileImageError& error) {
   throw_if_benchmark_cancelled(state.cancellation);
   const std::lock_guard lock(state.facts_mutex);
   const auto& image = state.images.at(slot);
   throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what());
  }
- {
-  const std::lock_guard lock(state.facts_mutex);
-  if (!state.pixel_allocated[slot]) {
-   state.staging.allocate_range(state.layout.pixel_offset(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow")), state.layout.pixel_pitch);
-   state.pixel_allocated[slot] = 1;
-  }
- }
- scratch.resizer.resize_to_planar(
-  {decoded.data(), {header.width, header.height, static_cast<std::size_t>(header.width) * 3U, 0U, decoded.size(), mmltk::backend::imaging::resample::RgbPixelFormat::RGB8}},
-  {state.pixels->image(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow")),
-   {state.resolution, state.resolution, static_cast<std::size_t>(state.resolution) * sizeof(float), static_cast<std::size_t>(state.resolution) * state.resolution * sizeof(float), state.stride,
-    mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}},
-  state.resize_mode);
  BenchmarkWriteProgressEvent progress;
  {
   const std::lock_guard lock(state.facts_mutex);
@@ -436,9 +453,12 @@ void BenchmarkSplitWriter::write_remaining(const BenchmarkWriteRequest& request)
   impl_->execution->write_remaining(*this, request.split, slots);
   return;
  }
+ const auto cpus = request.worker_cpus.empty() ? mmltk::common::system::allowed_cpu_set() : std::vector<int>(request.worker_cpus.begin(), request.worker_cpus.end());
+ const int workers = std::max(1, std::min({request.num_workers,
+  common_math::checked_cast<int>(cpus.size(), "benchmark CPU count overflow"), common_math::checked_cast<int>(slots.size(), "benchmark slot count overflow")}));
  detail::CompileExecutionLimits limits;
- limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(std::max(1,request.num_workers),impl_->resolution,impl_->perceptual,0,0,BenchmarkEncodedImage::normal_window_bytes));
- detail::CompileExecution execution(std::max(1,request.num_workers),request.worker_cpus,limits,request.cancel_requested);
+ limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(workers,impl_->resolution,impl_->perceptual,0,0,BenchmarkEncodedImage::normal_window_bytes));
+ detail::CompileExecution execution(workers,cpus,limits,request.cancel_requested);
  std::vector<std::unique_ptr<detail::CompilePixelWorkspace>> workspaces;
  for (std::size_t i=0; i<execution.workers(); ++i) workspaces.push_back(std::make_unique<detail::CompilePixelWorkspace>());
  std::vector<detail::CompileExecution::Completion> active;

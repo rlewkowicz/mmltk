@@ -1,6 +1,7 @@
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
-#include "src/backend/data/detail/compile_image_decoder.h"
+#include "src/backend/data/detail/compile_pixel_workspace.h"
+#include "src/backend/data/detail/compile_workspace.h"
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
@@ -43,7 +44,8 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
   std::size_t index = 0;
   std::uint64_t image_id = 0;
   BenchmarkSourceGeneration generation = 0;
-  bool submitted = false, retiring = false;
+  bool submitted = false, retiring = false, reopen = false;
+  std::shared_ptr<const detail::CompilePixelWorkspacePlan> plan;
   CompileExecution::Producer headers, pixels;
   BenchmarkSourcePublication publication;
   std::shared_ptr<BenchmarkPixelInput> input;
@@ -223,6 +225,8 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  void settle(Job&, std::exception_ptr = {}, bool recoverable = false) noexcept;
  void settle_list(Job*, std::exception_ptr) noexcept;
  void dispatch();
+ void header_input(Slot&);
+ [[nodiscard]] bool submit_pixel(Job&);
  void run_pixel(Slot&, std::size_t, const CompileAllowance&);
  void run_label(LabelWork&, std::size_t);
 };
@@ -303,15 +307,19 @@ void BenchmarkCompilePipeline::wait_image(const std::filesystem::path& root, std
  });
  if (source.images.at(id).job.failure) std::rethrow_exception(source.images.at(id).job.failure);
 }
+void BenchmarkCompilePipeline::Impl::header_input(Slot& slot) {
+ auto& job = slot.job;
+ job.resources = slot.payload && !slot.payload->encoded().empty() ? CompileResources{} : CompileResources::handles(1, false, 1);
+ job.parent = slot.payload ? slot.payload->allowance() : CompileAllowance{};
+ if (!job.parent && slot.publication.state_ && slot.publication.state_->custody) job.parent = slot.publication.state_->custody->allowance();
+}
 void BenchmarkCompilePipeline::Impl::ImageState::admit(Slot& slot, bool independent) {
  slot.headers = execution_.execution.open_class(CompileWorkClass::Extraction);
  slot.pixels = execution_.execution.open_class(CompileWorkClass::Pixels);
  slot.submitted = true;
  auto& job = slot.job;
  job.stage = CompileTaskKind::Header;
- job.resources = slot.payload && !slot.payload->encoded().empty() ? CompileResources{} : CompileResources::handles(1, false, 1);
- job.parent = slot.payload ? slot.payload->allowance() : CompileAllowance{};
- if (!job.parent && slot.publication.state_ && slot.publication.state_->custody) job.parent = slot.publication.state_->custody->allowance();
+ execution_.header_input(slot);
  job.done = false;
  job.failure = {};
  job.completion = CompileExecution::CompletionSource{&execution_.execution};
@@ -404,6 +412,7 @@ void BenchmarkCompilePipeline::Impl::ImageState::retire_image(const std::filesys
  if (image) {
   image->width = image->height = 0;
   image->encoded.reset();
+  image->plan.reset();
   image->selected_label = nullptr;
   image->labels.clear();
   image->generation = generation;
@@ -477,18 +486,20 @@ void BenchmarkCompilePipeline::Impl::ImageState::publish(Source& source, std::ui
   slot.generation = generation;
   if (!input_root.empty()) slot.writer->input_root(static_cast<std::uint32_t>(slot.index), input_root);
   slot.publication = std::move(publication);
-  if (payload && payload->charged_bytes()) {
-   // Admit input/work/output together before queueing retained bytes. Under
-   // pressure, pooled input yields to its published file; a charged warm map
-   // yields to its generation-bound header fact and the protected path read.
-   const auto workspace=slot.writer->pixel_resources(payload->header());
-   if (auto granted = execution.execution.try_reserve(workspace, payload->allowance()))
-    slot.pixel_allowance = std::move(*granted);
-   else
-    payload = payload->file_backing() ? payload->file_backing() : source.images.at(id).encoded;
-  }
   slot.payload = payload ? std::move(payload) : source.images.contains(id) ? source.images.at(id).encoded : nullptr;
   admit(slot, true);
+  // Only a bounded admitted Header record may retain charged source bytes
+  // before its pixel plan exists. A full record bank must not strand a source
+  // arena behind parked pixels that need that same arena to drain.
+  if (slot.payload && slot.payload->charged_bytes()) {
+   if (execution.submit_pixel(slot.job)) {
+    execution.pixels.pop_back();
+    slot.job.queued = false;
+   } else {
+    slot.payload = slot.payload->file_backing() ? slot.payload->file_backing() : slot.encoded;
+    execution.header_input(slot);
+   }
+  }
   accepted = &slot.job;
  }
  execution.changed.notify_all();
@@ -530,6 +541,7 @@ void BenchmarkCompilePipeline::Impl::ImageState::retire_source(const std::filesy
   (void)id;
   image.width = image.height = 0;
   image.encoded.reset();
+  image.plan.reset();
   image.selected_label = nullptr;
   image.labels.clear();
  }
@@ -840,19 +852,94 @@ void BenchmarkCompilePipeline::Impl::settle_list(Job* jobs, std::exception_ptr e
  while (jobs) { auto* job = jobs; jobs = job->next; job->next = nullptr; settle(*job, error, true); }
 }
 void BenchmarkCompilePipeline::Impl::run_pixel(Slot& slot, std::size_t lane, const CompileAllowance& allowance) {
+ BenchmarkSplitWriter* writer;
+ std::size_t index;
+ std::uint64_t attempt;
+ BenchmarkSourceGeneration generation;
  {
   const std::lock_guard lock(mutex);
   if (stopping || slot.retiring || slot.source->retiring) std::rethrow_exception(retired_failure);
+  writer = slot.writer; index = slot.index; attempt = images.attempt(); generation = slot.generation;
  }
+ // Source/attempt retirement drains this admitted Header/Pixels record before
+ // clearing its slot or destroying its writer. All fallible planning runs here,
+ // outside facts/admission locks and on the existing Header CPU grant.
+ const auto current = [&] {
+  return !stopping && !slot.retiring && !slot.source->retiring && attempt == images.attempt() &&
+   generation == slot.source->image_generation(slot.image_id) && slot.generation == generation && slot.writer == writer && slot.index == index;
+ };
  throw_if_benchmark_cancelled(cancellation);
- if (slot.job.stage == CompileTaskKind::Header) {
-  slot.input = slot.writer->prepare_pixel(slot.index, lane, std::move(slot.publication), allowance, std::move(slot.payload));
-  if (slot.input) {
-   const auto dimensions = slot.writer->header_dimensions(slot.index);
-   const std::lock_guard lock(mutex);
-   images.geometry_ready(*slot.source, slot.image_id, slot.generation, *dimensions);
+ if (slot.job.stage != CompileTaskKind::Header) {
+  writer->write_pixel(index, lane, slot.input, allowance, *pixel_workspaces[lane]);
+  return;
+ }
+ auto payload = slot.payload;
+ auto plan = slot.plan;
+ if (payload && !plan) plan = writer->prepare_pixel_plan(index, payload->header());
+ CompileAllowance pixel_allowance;
+ bool reopen = false;
+ if (payload && payload->charged_bytes()) {
+  // The plan is complete before nonblocking input/work admission. Never park
+  // a pixel demand while retaining a normal source arena that must drain for it.
+  if (auto granted = execution.try_reserve(plan->resources(), payload->allowance())) pixel_allowance = std::move(*granted);
+  else {
+   payload = payload->file_backing() ? payload->file_backing() : payload->header_only();
+   reopen = payload->encoded().empty();
   }
- } else slot.writer->write_pixel(slot.index, lane, slot.input, allowance,*pixel_workspaces[lane]);
+ }
+ {
+  const std::lock_guard lock(mutex);
+  if (!current()) std::rethrow_exception(retired_failure);
+  slot.plan = std::move(plan);
+  slot.payload = std::move(payload);
+  slot.pixel_allowance = std::move(pixel_allowance);
+  slot.reopen = reopen;
+ }
+ // Reopening needs its own descriptor admission. Return the current Header
+ // grant and retain only the immutable plan/file fact and publication custody.
+ if (reopen) return;
+ auto input = writer->prepare_pixel(index, lane, slot.publication, allowance, slot.payload, slot.plan);
+ const auto dimensions = input ? writer->header_dimensions(index) : std::nullopt;
+ {
+  const std::lock_guard lock(mutex);
+  if (!current()) std::rethrow_exception(retired_failure);
+  slot.input = std::move(input);
+  if (dimensions) images.geometry_ready(*slot.source, slot.image_id, generation, *dimensions);
+ }
+}
+bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
+ auto& slot = *job.slot;
+ const auto weak = weak_from_this();
+ auto task = execution.try_submit({.kind = job.stage, .resources = job.resources,
+  .work = [weak, &slot](std::size_t lane, const CompileAllowance& allowance) { if (auto owner = weak.lock()) owner->run_pixel(slot, lane, allowance); },
+  .allowance = job.stage == CompileTaskKind::Pixels ? slot.pixel_allowance : CompileAllowance{}, .parent = job.parent,
+  .finite_consumer = job.stage == CompileTaskKind::Pixels, .retain_workspace = false,
+  .completed = [weak, &slot](std::exception_ptr error) {
+   auto owner = weak.lock(); if (!owner) return;
+   bool recoverable = false;
+   if (error) try { std::rethrow_exception(error); } catch (const BenchmarkImageReadError&) { recoverable = true; } catch (...) {}
+   {
+    const std::lock_guard completed_lock(owner->mutex);
+    if (!error && (owner->stopping || slot.retiring || slot.source->retiring || slot.generation != slot.source->image_generation(slot.image_id))) { error = owner->retired_failure; recoverable = true; }
+    if (!error && slot.job.stage == CompileTaskKind::Header && slot.reopen) {
+     slot.reopen = false;
+     owner->header_input(slot);
+     owner->push(slot.job); owner->changed.notify_all(); return;
+    }
+    if (!error && slot.job.stage == CompileTaskKind::Header && slot.input && !owner->stopping && !slot.retiring && !slot.source->retiring) {
+     slot.headers.close();
+     slot.job.stage = CompileTaskKind::Pixels;
+     slot.job.resources = slot.writer->pixel_resources(*slot.input);
+     slot.job.parent = slot.writer->pixel_input_allowance(*slot.input);
+     owner->push(slot.job); owner->changed.notify_all(); return;
+    }
+   }
+   owner->settle(slot.job, error, recoverable);
+  }});
+ if (!task) return false;
+ job.handle = std::move(*task);
+ slot.pixel_allowance = {};
+ return true;
 }
 void BenchmarkCompilePipeline::Impl::dispatch() {
  std::unique_lock lock(mutex);
@@ -876,30 +963,7 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
   bool accepted = false;
   if (!pixels.empty()) {
    auto& job = *pixels.front();
-   auto& slot = *job.slot;
-   const auto weak = weak_from_this();
-   auto task = execution.try_submit({.kind = job.stage, .resources = job.resources,
-    .work = [weak, &slot](std::size_t lane, const CompileAllowance& allowance) { if (auto owner = weak.lock()) owner->run_pixel(slot, lane, allowance); },
-    .allowance = job.stage == CompileTaskKind::Pixels ? slot.pixel_allowance : CompileAllowance{}, .parent = job.parent,
-    .finite_consumer = job.stage == CompileTaskKind::Pixels, .retain_workspace = false,
-    .completed = [weak, &slot](std::exception_ptr error) {
-     auto owner = weak.lock(); if (!owner) return;
-     bool recoverable = false;
-     if (error) try { std::rethrow_exception(error); } catch (const BenchmarkImageReadError&) { recoverable = true; } catch (...) {}
-     {
-      const std::lock_guard completed_lock(owner->mutex);
-      if (!error && (owner->stopping || slot.retiring || slot.source->retiring || slot.generation != slot.source->image_generation(slot.image_id))) { error = owner->retired_failure; recoverable = true; }
-      if (!error && slot.job.stage == CompileTaskKind::Header && slot.input && !owner->stopping && !slot.retiring && !slot.source->retiring) {
-       slot.headers.close();
-       slot.job.stage = CompileTaskKind::Pixels;
-       slot.job.resources = slot.writer->pixel_resources(*slot.input);
-       slot.job.parent = slot.writer->pixel_input_allowance(*slot.input);
-       owner->push(slot.job); owner->changed.notify_all(); return;
-      }
-     }
-     owner->settle(slot.job, error, recoverable);
-    }});
-   if (task) { job.handle = std::move(*task); slot.pixel_allowance = {}; pixels.pop_front(); job.queued = false; accepted = true; }
+   if (submit_pixel(job)) { pixels.pop_front(); job.queued = false; accepted = true; }
   }
   if (!labels_first) images.admit_labels();
   labels_first = !labels_first;

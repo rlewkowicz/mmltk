@@ -36,7 +36,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_compiler.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_recipe.h"
-#include "src/backend/data/detail/compile_image_decoder.h"
+#include "src/backend/data/detail/compile_workspace.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_parquet.h"
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"

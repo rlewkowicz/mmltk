@@ -1,4 +1,9 @@
 #include "src/backend/data/detail/compile_workspace.h"
+#include "src/backend/data/detail/compile_pixel_workspace.h"
+#include "src/backend/data/detail/compiled_label_workspace.h"
+#include "src/backend/data/compiled/compiled_file_utils.h"
+#include <stb_image.h>
+#include <array>
 #include "src/backend/data/detail/compile_resources.h"
 #include "src/common/system/numa_memory.h"
 #include "src/common/math/checked_arithmetic.h"
@@ -16,6 +21,19 @@ using common::system::page_rounded_bytes;
 using common::math::checked_add;
 using common::math::checked_multiply;
 }
+CompileWorkspacePlan compile_workspace_plan(std::size_t workers,std::uint32_t resolution,bool perceptual,std::size_t reader_window,std::uint64_t explicit_budget,std::size_t encoded_window) {
+ if (explicit_budget) return CompileWorkspacePlan::prepare(workers,{},0,0,explicit_budget);
+ // Normal geometry chooses reusable capacity, never legal-input admission.
+ // Actual larger shapes use their own checked decoder/resizer plan.
+ constexpr std::uint32_t normal_extent=2048;
+ const CompileImageHeader normal{normal_extent,normal_extent,0,false,CompileImageEncoding::Png,stbi_workspace_png_profile(normal_extent,normal_extent,encoded_window)};
+ const auto pixels=compile_pixel_workspace_plan(normal,std::max(1U,resolution),imaging::resample::ImageResizeMode::Stretch,perceptual).bytes();
+ const auto labels=CompiledLabelWorkspace::required_bytes(normal_extent);
+ const std::array<CompileWorkspaceProfile,static_cast<std::size_t>(CompileWorkClass::Count)> profiles{{{64U<<10,64U<<10},{std::max(encoded_window,reader_window),64U<<10},
+  {std::max(labels,reader_window),labels},{pixels,64U<<10},{labels,64U<<10},{labels,labels}}};
+ return CompileWorkspacePlan::prepare(workers,profiles,encoded_window,COMPILED_COMPACTION_SCRATCH_BYTES);
+}
+
 CompileWorkspacePlan CompileWorkspacePlan::prepare(std::size_t workers, std::span<const CompileWorkspaceProfile> profiles,
  std::size_t shared, std::size_t compaction, std::uint64_t explicit_budget) {
  if (!workers || profiles.size()>static_cast<std::size_t>(CompileWorkClass::Count)) throw std::invalid_argument("compile workspace plan requires CPUs and canonical class profiles");

@@ -64,6 +64,7 @@
 #include "src/backend/data/detail/mask_rle_utils.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/detail/compile_workspace.h"
+#include "src/backend/data/detail/compile_pixel_workspace.h"
 #include "src/backend/data/detail/compiled_label_workspace.h"
 #include "src/common/system/numa_memory.h"
 #include "src/common/system/numa_topology.h"
@@ -7649,7 +7650,7 @@ TEST_CASE("concurrent reader offers join a live pixel loan on cancellation", "[b
  bind_benchmark_slots(execution, writer, split);
  // Each offer covers only half the finite consumer. Both physical lenders
  // must participate; unrelated positive offers are exercised separately.
- const auto demand = writer.pixel_resources({16, 8}).bytes;
+ const auto demand = writer.prepare_pixel_plan(0, {16, 8})->resources().bytes;
  const auto live_reader_bytes = target / 2 - (demand + 1) / 2;
  std::future<void> first, second;
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
@@ -10007,4 +10008,286 @@ TEST_CASE("Directory supplied JPEG GIF and 16-bit PNM match the existing STB cod
    CHECK_THROWS_AS(decoder.decode_rgb(malformed,header,workspace),CompileImageError);
    CHECK(denied.attempts==0);
   },.retain_workspace=false}).wait();
+}
+
+TEST_CASE("sealed pixel plans validate custody and geometry before writing the destination", "[backend][data][writer]") {
+ using namespace mmltk::backend::data::detail;
+ using namespace mmltk::backend::imaging::resample;
+ const auto mode = GENERATE(ImageResizeMode::Stretch, ImageResizeMode::Letterbox);
+ const auto perceptual = GENERATE(false, true);
+ const std::array<std::uint8_t, 24> rgb{1,2,3,4,5,6,7,8,9,10,11,12,19,20,21,40,50,60,70,80,90,110,120,130};
+ std::vector<std::uint8_t> encoded;
+ REQUIRE(stbi_write_png_to_func(append_bytes, &encoded, 4, 2, 3, rgb.data(), 12));
+ CompileImageDecoder decoder;
+ const auto header = decoder.read_header(encoded, CompileImagePolicy::Benchmark);
+ const auto plan = compile_pixel_workspace_plan(header, 2, mode, perceptual);
+ CompileExecution execution(1, {}, {.transient_bytes = plan.bytes()});
+ CompilePixelWorkspace workspace;
+ unsigned prepared = 0;
+ std::vector<float> output(12, -1.0F), reference(12, -1.0F);
+ auto destination = RgbMutableImageView{output.data(), plan.destination()};
+ execution.submit({.kind = CompileTaskKind::Pixels, .resources = plan.resources(),
+  .work = [&](std::size_t, const CompileAllowance& allowance) {
+   const auto memory = allowance.workspace();
+   auto wrong_header = header;
+   ++wrong_header.width;
+   CHECK_THROWS_AS(workspace.write(plan, encoded, wrong_header, memory, destination), CompileImageError);
+   CHECK_THROWS_AS(workspace.write(plan, encoded, header, memory.first(plan.bytes() - 1), destination), std::length_error);
+   auto wrong_destination = destination;
+   ++wrong_destination.layout.width;
+   CHECK_THROWS_AS(workspace.write(plan, encoded, header, memory, wrong_destination), std::invalid_argument);
+   wrong_destination = destination;
+   --wrong_destination.layout.capacity_bytes;
+   CHECK_THROWS_AS(workspace.write(plan, encoded, header, memory, wrong_destination), std::invalid_argument);
+   std::vector<std::uint8_t> changed;
+   REQUIRE(stbi_write_png_to_func(append_bytes, &changed, 2, 4, 3, rgb.data(), 6));
+   CHECK_THROWS_AS(workspace.write(plan, changed, header, memory, destination, [&] { ++prepared; }), CompileImageError);
+   CHECK(prepared == 0);
+   CHECK(std::ranges::all_of(output, [](float value) { return value == -1.0F; }));
+   workspace.write(plan, encoded, header, memory, destination, [&] { ++prepared; });
+   CHECK(prepared == 1);
+  }, .retain_workspace = false}).wait();
+ RgbImageResizer resizer(1, perceptual);
+ resizer.resize_to_planar({rgb.data(), {4, 2, 12, 0, rgb.size(), RgbPixelFormat::RGB8}}, {reference.data(), plan.destination()}, mode);
+ CHECK(output == reference);
+}
+
+TEST_CASE("pixel preparation permits independent publication completion and retirement", "[backend][data][benchmark][pipeline]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPUs");
+ mmltk::testsupport::ScopedTempDir root("pixel-plan-independent-facts");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ BenchmarkEncodedImage::publish(cached_image_path(images, 2), make_jpeg(8,240,8), {});
+ split.images = {{1,16,8,0,0}, {2,16,8,0,0}};
+ BenchmarkCompilePipeline execution(3, {}, {.transient_bytes = 16U << 20});
+ FileHandle directory(::open(images.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+ REQUIRE(directory.get() >= 0);
+ auto opened = BenchmarkEncodedImage::open_deferred(directory.get(), 1, {}, execution.execution().reserve(CompileResources::handles(1)));
+ REQUIRE(opened);
+ auto payload = opened->try_read(&execution.execution(), {});
+ REQUIRE(payload);
+ REQUIRE(payload->charged_bytes());
+ opened.reset();
+ mmltk::testsupport::TestGate preparation("first image pixel plan");
+ std::array<std::atomic<unsigned>, 2> plans{};
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8);
+ request.execution = &execution;
+ request.pixel_preparing = [&](const auto&, std::uint64_t id) {
+  ++plans.at(id - 1);
+  if (id == 1) preparation.receipt().ArriveAndWait();
+ };
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ bind_benchmark_slots(execution, writer, split);
+ std::future<void> independent;
+ const mmltk::testsupport::ScopedTestCleanup release([&] { preparation.Release(); });
+ const auto publication = execution.source_publication(images, {});
+ publication({1, {}, true, std::move(payload)});
+ REQUIRE(preparation.WaitEntered(5s));
+ independent = std::async(std::launch::async, [&] {
+  publication({2, {}, true});
+  execution.image_completion(images, 2).wait();
+  execution.retire_image(images, 2);
+ });
+ mmltk::testsupport::await_test_future(independent, "unrelated image completes and retires during pixel planning", 5s);
+ CHECK_FALSE(writer.image_complete(0));
+ CHECK_FALSE(writer.image_complete(1));
+ CHECK(plans[0] == 1);
+ CHECK(plans[1] == 1);
+ preparation.Release();
+ execution.drain();
+ CHECK(writer.image_complete(0));
+}
+
+TEST_CASE("active pixel preparation drains before cancellation repair or writer retirement", "[backend][data][benchmark][pipeline]") {
+ enum class Retire { Cancel, Image, Source, Attempt };
+ const auto retirement = GENERATE(Retire::Cancel, Retire::Image, Retire::Source, Retire::Attempt);
+ mmltk::testsupport::ScopedTempDir root("pixel-plan-retirement");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images = {{1,16,8,0,0}};
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 16U << 20}, cancellation);
+ mmltk::testsupport::TestGate preparation("admitted pixel preparation");
+ std::atomic<unsigned> plans{0};
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8, cancellation);
+ request.execution = &execution;
+ request.pixel_preparing = [&](const auto&, auto) { if (++plans == 1) preparation.receipt().ArriveAndWait(); };
+ auto writer = std::make_unique<BenchmarkSplitWriter>(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ bind_benchmark_slots(execution, *writer, split);
+ const auto publication = execution.source_publication(images, {});
+ std::future<void> retiring;
+ const mmltk::testsupport::ScopedTestCleanup release([&] { preparation.Release(); });
+ publication({1, {}, true});
+ REQUIRE(preparation.WaitEntered(5s));
+ const auto before = execution.execution().admission_generation();
+ retiring = std::async(std::launch::async, [&] {
+  switch (retirement) {
+   case Retire::Cancel: cancelled = true; execution.execution().notify_admission_change(); execution.retire_attempt(); break;
+   case Retire::Image: execution.retire_image(images, 1); break;
+   case Retire::Source: execution.retire_source(images); break;
+   case Retire::Attempt: execution.retire_attempt(); writer.reset(); break;
+  }
+ });
+ execution.execution().wait_for_admission_change(before);
+ CHECK(retiring.wait_for(0ms) == std::future_status::timeout);
+ CHECK_FALSE(writer->image_complete(0));
+ preparation.Release();
+ mmltk::testsupport::await_test_future(retiring, "retirement joins admitted pixel preparation", 5s);
+ if (retirement == Retire::Cancel) {
+  CHECK_FALSE(writer->image_complete(0));
+  CHECK_FALSE(writer->header_dimensions(0));
+  return;
+ }
+ if (!writer) {
+  writer = std::make_unique<BenchmarkSplitWriter>(request);
+  bind_benchmark_slots(execution, *writer, split);
+ }
+ CHECK_FALSE(writer->image_complete(0));
+ CHECK_FALSE(writer->header_dimensions(0));
+ publication({1, {}, true});
+ execution.drain();
+ CHECK(plans == 1);
+ const auto replacement = execution.source_publication(images, {}, 1);
+ CHECK(replacement.consume({1}));
+ CHECK(writer->image_complete(0));
+ CHECK(plans == 2);
+}
+
+TEST_CASE("pixel admission releases pooled input and reuses its plan through file fallback", "[backend][data][benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const bool mapped_file = GENERATE(false, true);
+ const bool record_pressure = GENERATE(false, true);
+ mmltk::testsupport::ScopedTempDir root("pixel-plan-file-fallback");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images = {{1,16,8,0,0}};
+ const auto encoded = make_jpeg(11,22,33);
+ const auto header = BenchmarkImageDecoder{}.read_header(encoded);
+ const auto page = mmltk::common::system::host_page_size();
+ REQUIRE(encoded.size() < page);
+ REQUIRE(compile_pixel_workspace_plan(header, 8, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, false).bytes() > page);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = page, .descriptors = 8, .task_records = 1});
+ auto backing = std::make_shared<CompileAllowance>(execution.execution().reserve({.bytes = page, .supplied_workspace = true}));
+ const auto memory = backing->workspace();
+ std::memcpy(memory.data(), encoded.data(), encoded.size());
+ const std::weak_ptr<CompileAllowance> input_lifetime = backing;
+ auto file = BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {}, nullptr, header, {}, mapped_file);
+ auto payload = BenchmarkEncodedImage::pooled(*backing, backing, {reinterpret_cast<const std::uint8_t*>(memory.data()), encoded.size()}, std::move(file));
+ backing.reset();
+ mmltk::testsupport::TestGate preparation("pooled input preparation"), occupied("bounded Header record is occupied");
+ std::future<void> header_record;
+ std::atomic<unsigned> plans{0}, reads{0};
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8);
+ request.execution = &execution;
+ request.pixel_preparing = [&](const auto&, auto) { ++plans; preparation.receipt().ArriveAndWait(); };
+ request.image_opened = [&](const auto&, auto) { ++reads; CHECK(input_lifetime.expired()); };
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(execution);
+ bind_benchmark_slots(execution, writer, split);
+ const mmltk::testsupport::ScopedTestCleanup release([&] { preparation.Release(); occupied.Release(); });
+ if (record_pressure) {
+  header_record = std::async(std::launch::async, [&] { execution.execution().run(CompileTaskKind::Header, {}, [&](std::size_t) { occupied.receipt().ArriveAndWait(); }); });
+  REQUIRE(occupied.WaitEntered(5s));
+ }
+ execution.source_publication(images, {})({1, {}, true, std::move(payload)});
+ if (record_pressure) {
+  CHECK(input_lifetime.expired());
+  CHECK(plans == 0);
+  if (mapped_file) REQUIRE(fs::remove(cached_image_path(images, 1)));
+  occupied.Release();
+  mmltk::testsupport::await_test_future(header_record, "bounded Header record becomes available", 5s);
+ } else {
+  REQUIRE(preparation.WaitEntered(5s));
+  CHECK_FALSE(input_lifetime.expired());
+  if (mapped_file) REQUIRE(fs::remove(cached_image_path(images, 1)));
+ }
+ REQUIRE(preparation.WaitEntered(5s));
+ preparation.Release();
+ execution.image_completion(images, 1).wait();
+ CHECK(input_lifetime.expired());
+ CHECK(writer.image_complete(0));
+ CHECK(plans == 1);
+ CHECK(reads == 1);
+ CHECK(execution.execution().snapshot().exceptional == 0);
+ CHECK(execution.execution().snapshot().normal_locked == page);
+}
+
+TEST_CASE("standalone pixel sessions clamp both CPUs and useful images before preparation", "[backend][data][benchmark][writer]") {
+ const auto available = mmltk::common::system::allowed_cpu_set();
+ REQUIRE_FALSE(available.empty());
+ bool cpu_limit = false;
+ SECTION("available CPU limit") { cpu_limit = true; }
+ SECTION("unfinished image limit") {}
+ mmltk::testsupport::ScopedTempDir root("standalone-pixel-worker-limit");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ split.images = {{1,16,8,0,0}};
+ if (cpu_limit) {
+  BenchmarkEncodedImage::publish(cached_image_path(images, 2), make_jpeg(11,22,33), {});
+  split.images.push_back({2,16,8,0,0});
+ }
+ const auto compile_threads = [] {
+  std::size_t result = 0;
+  for (const auto& task : fs::directory_iterator("/proc/self/task")) {
+   std::ifstream input(task.path() / "comm");
+   std::string name;
+   std::getline(input, name);
+   if (name.starts_with("compile") && name.size() > 7 && name[7] >= '0' && name[7] <= '9') ++result;
+  }
+  return result;
+ };
+ const auto before = compile_threads();
+ std::size_t prepared = 0;
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8);
+ request.num_workers = 3;
+ request.worker_cpus = cpu_limit ? std::span<const int>(available).first(1) : std::span<const int>(available);
+ request.pixel_preparing = [&](const auto&, auto) { ++prepared; CHECK(compile_threads() == before + 1); };
+ BenchmarkSplitWriter writer(request);
+ writer.write_remaining(request);
+ CHECK(writer.completed() == split.images.size());
+ CHECK(prepared == split.images.size());
+ writer.write_remaining(request);
+ CHECK(prepared == split.images.size());
+ CHECK(compile_threads() == before);
+}
+
+TEST_CASE("standalone pixel failure drains held completion and retains completed slots", "[backend][data][benchmark][writer]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ mmltk::testsupport::ScopedTempDir root("standalone-pixel-failure-drain");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ BenchmarkEncodedImage::publish(cached_image_path(images, 2), make_jpeg(11,22,33), {});
+ split.images = {{1,16,8,0,0}, {2,16,8,0,0}};
+ mmltk::testsupport::TestGate completion("completed standalone slot retains its call");
+ std::promise<void> failing;
+ std::atomic<bool> fail{true};
+ std::array<std::atomic<unsigned>, 2> reads{};
+ auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8);
+ request.image_opened = [&](const auto&, std::uint64_t id) {
+  ++reads.at(id - 1);
+  if (id == 2 && fail) {
+   if (!completion.WaitEntered(5s)) throw std::runtime_error("first standalone completion did not enter");
+   failing.set_value();
+   throw std::runtime_error("injected standalone input failure");
+  }
+ };
+ request.progress = {.context = &completion, .image_completed = [](void* context) { static_cast<mmltk::testsupport::TestGate*>(context)->receipt().ArriveAndWait(); }};
+ BenchmarkSplitWriter writer(request);
+ auto writing = std::async(std::launch::async, [&] { writer.write_remaining(request); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { completion.Release(); });
+ mmltk::testsupport::await_test_promise(failing, "second standalone input fails after first completion enters", 5s);
+ CHECK(writing.wait_for(0ms) == std::future_status::timeout);
+ CHECK(writer.image_complete(0));
+ CHECK_FALSE(writer.image_complete(1));
+ CHECK_FALSE(fs::exists(request.output_path));
+ completion.Release();
+ CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(writing, "standalone failure joins physical users", 5s), "injected standalone input failure");
+ fail = false;
+ writer.write_remaining(request);
+ CHECK(writer.completed() == 2);
+ CHECK(reads[0] == 1);
+ CHECK(reads[1] == 2);
 }
