@@ -95,6 +95,7 @@ struct BenchmarkCurl::Impl {
   Impl* owner;
   std::exception_ptr socket_failure;
   bool extra_range = false;
+  std::unique_ptr<BenchmarkResourceWait> deferred;
  };
  using Queue = std::list<std::unique_ptr<Request>>;
  struct Removal {
@@ -415,10 +416,17 @@ struct BenchmarkCurl::Impl {
  }
  bool admit(Queue& queue, std::size_t aggregate) {
   auto& candidate = queue.front();
+  const auto defer = [&] {
+   // Nonblocking transport admission must advertise pressure too. Otherwise
+   // an idle parser can retain the entire byte target while Curl waits for
+   // a credit event that no active owner remains able to produce.
+   if (!candidate->deferred) candidate->deferred = execution->defer_resources();
+   return false;
+  };
   BenchmarkAllowance work;
   if (execution && !candidate->work) {
    auto value = execution->try_reserve(benchmark_curl_input_resources(), fixed);
-   if (!value) return false;
+   if (!value) return defer();
    work = std::move(*value);
   }
   const auto next_limit = std::max(connection_limit, active.size() + 1);
@@ -436,7 +444,7 @@ struct BenchmarkCurl::Impl {
    const bool fixed_child = fixed_socket_grants + new_fixed < kCurlNativeSocketCandidates;
    if (execution) {
     auto value = execution->try_reserve(BenchmarkResources::handles(1), fixed_child ? socket_commitment : BenchmarkAllowance{});
-    if (!value) return false;  // Every partial draw and request workspace returns.
+    if (!value) return defer();  // Every partial draw and request workspace returns.
     allowance = std::move(*value);
    }
    admitted.push_back({std::move(allowance), CURL_SOCKET_BAD, fixed_child});
@@ -453,6 +461,7 @@ struct BenchmarkCurl::Impl {
   }
   auto request = std::move(candidate);
   queue.pop_front();
+  request->deferred.reset();
   if (!request->work) request->work = std::move(work);
   auto* handle = request->handle;
   set_curl_option_with_prefix(handle, CURLOPT_OPENSOCKETFUNCTION, &Impl::open_socket, "cannot configure benchmark socket: ", "open");
@@ -574,7 +583,7 @@ BenchmarkCurl::Channel::Channel(std::shared_ptr<Impl> owner, Class kind, mmltk::
   // worst-case producer headroom. Admission below draws from actual capacity.
   // Source bytes keep their ordinary independent/oversized admission policy.
   owner_->execution->require_feasible(BenchmarkResources::handles(complete, source.producer));
-  state_->descriptor_ceiling = owner_->execution->descriptor_ceiling(source);
+  state_->descriptor_ceiling = owner_->execution->descriptor_ceiling(BenchmarkResources::handles(complete, source.producer));
  }
  std::unique_lock lock(owner_->mutex);
  if (owner_->failure) std::rethrow_exception(owner_->failure);
@@ -628,7 +637,7 @@ std::function<void()> BenchmarkCurl::admission_wakeup() const {
  };
 }
 void BenchmarkCurl::Channel::add(CURL* handle, bool range, BenchmarkAllowance input) {
- auto request = std::make_unique<Impl::Request>(Impl::Request{handle, state_, std::move(input), owner_.get(), {}, state_->kind == Class::Artifact && range});
+ auto request = std::make_unique<Impl::Request>(Impl::Request{handle, state_, std::move(input), owner_.get(), {}, state_->kind == Class::Artifact && range, {}});
  const std::lock_guard lock(owner_->mutex);
  if (owner_->failure) std::rethrow_exception(owner_->failure);
  owner_->commands.push_back(std::move(request));

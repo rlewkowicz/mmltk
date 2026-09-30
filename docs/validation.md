@@ -12,8 +12,11 @@ required final full build, both gate commands must pass in this order:
 ```
 
 Unfiltered `all` runs native, browser JavaScript/Rust, cleanup/declaration, and
-log-query fixtures. The standalone capabilities below neither replace nor
-supplement this gate with focused filters, executables, or extra suites.
+log-query fixtures. Resume failed tests and tidy checks with the focused
+selections below; retain successful results and finish checks left unexecuted
+by an interruption. Rebuild changed product code through `./mmltk --build`
+before testing. Once focused retries pass, run the required full completion
+pass. Retries do not restart or reorder validation stages.
 
 ## Formatting and static analysis
 

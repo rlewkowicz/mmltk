@@ -40,6 +40,9 @@
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <linux/fiemap.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -2841,8 +2844,36 @@ TEST_CASE("dynamic fixed slots publish labels before pixels and admit exactly th
  }
  runs.pop_back();
  writer.write_pixel(first_slot, 0);
+ // Settle the written pages and their filesystem extent metadata before
+ // comparing physical allocation with a pure sparse-capacity extension.
+ FileHandle staged;
+ for (const auto& artifact : fs::directory_iterator(root.path()))
+  if (artifact.path().filename().string().starts_with("result.bin.tmp.")) {
+   staged = FileHandle::open_readonly(artifact.path().string());
+   staged.sync_data();
+  }
+ REQUIRE(staged.get() >= 0);
+ const auto extents = [&] {
+  constexpr std::size_t capacity = 32;
+  std::vector<std::byte> bytes(sizeof(fiemap) + capacity * sizeof(fiemap_extent));
+  auto* map = reinterpret_cast<fiemap*>(bytes.data());
+  map->fm_length = FIEMAP_MAX_OFFSET;
+  map->fm_flags = FIEMAP_FLAG_SYNC;
+  map->fm_extent_count = capacity;
+  REQUIRE(::ioctl(staged.get(), FS_IOC_FIEMAP, map) == 0);
+  REQUIRE(map->fm_mapped_extents < capacity);
+  nlohmann::json result = nlohmann::json::array();
+  for (std::uint32_t i = 0; i < map->fm_mapped_extents; ++i) {
+   const auto& extent = map->fm_extents[i];
+   result.push_back({extent.fe_logical, extent.fe_length, extent.fe_flags});
+  }
+  return result;
+ };
+ const auto before_extents = extents();
  const auto occupied = writer.allocated_bytes();
  for (std::uint32_t slot = 1; slot < COMPILED_BLOCK_SLOTS + 1; ++slot) CHECK(writer.allocate_slot({slot + 100, 16, 8, 0, 0}, split.sources[0]) == slot);
+ const auto after_extents = extents();
+ INFO("sparse growth extents before=" << before_extents.dump() << " after=" << after_extents.dump());
  CHECK(writer.allocated_bytes() == occupied);
  const EncodedImageRecord second{2, 16, 8, 0, 0};
  const auto second_slot = writer.allocate_slot(second, split.sources[0]);
@@ -5921,9 +5952,10 @@ TEST_CASE("Open Images retired backing admits pixel work while an unrelated ordi
  ordinary.Check();
 }
 TEST_CASE("pending and active Curl cancellation detach callbacks and return request custody", "[backend][data][benchmark][download][pipeline]") {
- bool pending = false;
+ bool pending = false, idle_parser = false;
  SECTION("pending byte admission") { pending = true; }
  SECTION("admitted physical socket") {}
+ SECTION("idle parser yields backing before HTTP admission") { idle_parser = true; }
  mmltk::testsupport::ScopedTempDir root("transport-cancellation-custody");
  const auto payload = make_payload(1U << 20);
  HttpServer server(payload);
@@ -5932,6 +5964,16 @@ TEST_CASE("pending and active Curl cancellation detach callbacks and return requ
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 24});
+ std::vector<std::byte> scratch;
+ std::atomic<bool> scratch_retired{false};
+ BenchmarkCompilePipeline::Workspace workspace(execution, [&](std::size_t) noexcept {
+  std::vector<std::byte>().swap(scratch);
+  scratch_retired.store(true);
+ });
+ if (idle_parser) {
+  execution.for_each(BenchmarkStage::Metadata, 1, [](std::size_t) { return BenchmarkResources{256U << 10, 0}; }, [&](std::size_t) { scratch.resize(256U << 10); }, workspace);
+  REQUIRE(execution.resource_usage().bytes == 256U << 10);
+ }
  BenchmarkAllowance pressure;
  if (pending) pressure = execution.reserve({256U << 10, 0});
  mmltk::testsupport::TestGate submitted("source submitted pending request");
@@ -5948,6 +5990,7 @@ TEST_CASE("pending and active Curl cancellation detach callbacks and return requ
   REQUIRE(submitted.WaitEntered(5s));
  else
   REQUIRE(server.WaitPartial());
+ if (idle_parser) CHECK(scratch_retired.load());
  cancelled.store(true);
  submitted.Release();
  CHECK_THROWS(mmltk::testsupport::await_test_future(work, "cancelled pending/active request settlement"));
@@ -6152,7 +6195,7 @@ TEST_CASE("idle Curl cache leaves declared archive continuation feasible at thir
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 3U * slot_bytes, .descriptors = 13});
  const auto archive_resources = BenchmarkResources::handles(1, true, 4);
  const auto group_resources = BenchmarkResources::handles(1, true, 1);
- CHECK(execution.descriptor_ceiling(archive_resources) == 10);
+ CHECK(execution.descriptor_ceiling(archive_resources) == execution.descriptor_limit());  // The dependent promise already protects its consumer capacity.
  CurlSocketObservation sockets;
  std::unique_ptr<BenchmarkCurl::Channel> preparation;
  if (!late) preparation = execution.curl().channel(BenchmarkCurl::Class::Artifact, {}, archive_resources);
@@ -7798,6 +7841,7 @@ TEST_CASE("native label readiness and physical pixels settle independently", "[b
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  bind_benchmark_slots(execution, writer, split);
+ execution.bind_source(images, writer, AnnotationSource::Generic);
  const auto physical = execution.source_publication(images, {}, 1);
  physical.geometry_ready(1, {16, 8});
  NormalizedAnnotationBuilder builder;
@@ -7845,11 +7889,7 @@ TEST_CASE("native label readiness and physical pixels settle independently", "[b
  mmltk::testsupport::await_test_future(delayed, "independent label and pixel products");
  const auto labels = execution.wait_image_labels(images, 1, "annotations/originals-1");
  REQUIRE(labels);
- REQUIRE(labels->labels.size() == 1);
- REQUIRE(labels->runs.size() == 1);
- CHECK(labels->runs[0].start == 0);
- CHECK(labels->runs[0].length == 64);
- CHECK(labels->labels[0].original_area == 128);
+ CHECK(writer.entry(0).num_instances == 1);
  CHECK(writer.image_complete(0));
  // Original withdrawal does not withdraw physical geometry or completed pixels.
  execution.labels_ready(physical, 1, BenchmarkLabelInput(index, 0), "annotations/originals-1", 1);
@@ -7869,8 +7909,8 @@ TEST_CASE("native label readiness and physical pixels settle independently", "[b
  execution.labels_ready(replacement, 1, BenchmarkLabelInput(index, 0), "annotations/originals-2", 2);
  REQUIRE(execution.wait_image_labels(images, 1, "annotations/originals-2"));
  CHECK_FALSE(writer.image_complete(0));
- // Replacement annotations can introduce a key with no slot in this attempt.
- // Its retained native labels must return to the compiler's placement restart.
+ // Replacement annotations allocate their own slot immediately, even before
+ // pixels supply geometry for the newly introduced image.
  execution.membership_ready();
  builder.images.front().source_image_id = 2;
  const NormalizedAnnotationReadView added(fixture_index(builder));
@@ -7880,28 +7920,52 @@ TEST_CASE("native label readiness and physical pixels settle independently", "[b
   cancelled.store(true);
   execution.notify_admission_change();
  });
- mmltk::testsupport::await_test_future(unselected, "new annotation membership yields to placement restart");
+ mmltk::testsupport::await_test_future(unselected, "new annotation membership enters fixed storage");
  CHECK_FALSE(execution.geometry(images, 2));
- CHECK_FALSE(execution.image_labels(images, 2, "added-membership"));
+ const auto added_labels = execution.wait_image_labels(images, 2, "added-membership");
+ REQUIRE(added_labels);
+ const auto added_slot = execution.image_slot(images, 2);
+ REQUIRE(added_slot);
+ CHECK(writer.entry(*added_slot).num_instances == 1);
+ CHECK_FALSE(writer.image_complete(*added_slot));
+ replacement({1});
+ execution.wait_image(images, 1);
+ const std::array selected{std::uint32_t{0}};
+ auto sealed = writer.seal_slots(request, selected);
+ sealed.artifact.publish(request.output_path, {});
+ const auto compiled = CompiledDataset::open(request.output_path);
+ const auto written = compiled.annotations(0);
+ REQUIRE(written.labels.size() == 1);
+ REQUIRE(written.runs.size() == 1);
+ CHECK(written.runs[0].start == 0);
+ CHECK(written.runs[0].length == 64);
+ CHECK(written.labels[0].original_area == 128);
 }
-TEST_CASE("settled continuation retirement preserves open descriptors and upstream promises", "[benchmark][pipeline][resources]") {
+TEST_CASE("unused continuation release preserves live children open descriptors and upstream promises", "[benchmark][pipeline][resources]") {
  BenchmarkCompilePipeline execution(1, {}, {.descriptors = 13});
  auto source = execution.reserve(BenchmarkResources::handles(1, true, 4));
  auto producer = execution.reserve(BenchmarkResources::handles(1, true, 3), source);
  auto child = execution.reserve(BenchmarkResources::handles(1), producer);
- CHECK_THROWS_AS(producer.retire_continuation(), std::logic_error);
+ producer.release_unused_continuation();
+ source.release_unused_continuation();
  CHECK(producer.descriptors() == 1);
+ CHECK(child.descriptors() == 1);
+ CHECK(execution.try_reserve(BenchmarkResources::handles(10)));
+ producer.release_unused_continuation();
+ CHECK(execution.try_reserve(BenchmarkResources::handles(10)));
  child = {};
- producer.retire_continuation();
+ CHECK(execution.try_reserve(BenchmarkResources::handles(11)));
+ producer.release_unused_continuation();
  CHECK(producer.descriptors() == 1);
  CHECK(source.descriptors() == 1);
  {
   auto restored = execution.try_reserve(BenchmarkResources::handles(3), source);
   REQUIRE(restored);
  }
- CHECK_THROWS_AS(source.retire_continuation(), std::logic_error);  // Producer's actual descriptor still borrows one slot.
+ source.release_unused_continuation();
+ CHECK(execution.try_reserve(BenchmarkResources::handles(11)));
  producer.retire_descriptors();
- source.retire_continuation();
+ source.release_unused_continuation();
  CHECK(source.descriptors() == 1);
  {
   auto free = execution.try_reserve(BenchmarkResources::handles(12));
@@ -8411,7 +8475,8 @@ TEST_CASE("label interval capacity reuses charged lanes and retires borrowed win
  SECTION("exception retires borrowed physical capacity") { fail_borrower = true; }
  SECTION("cancellation retires borrowed physical capacity") { cancel_borrower = true; }
  std::atomic<bool> cancelled{false};
- constexpr std::uint64_t target = 128U * 1024U;
+ // The fixed label output arenas are part of each consumer's real envelope.
+ constexpr std::uint64_t target = 2U * 1024U * 1024U;
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = target}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
  std::array<std::size_t, 6> retained{};
  execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto id, const BenchmarkLabelWorkspace& workspace) {
@@ -8577,7 +8642,10 @@ TEST_CASE("required label joins surface failed geometry readers without a pixel 
  publication({1});
  CHECK_THROWS_AS(execution.wait_image_labels(images, 1, "required"), BenchmarkImageReadError);
  CHECK_FALSE(execution.geometry(images, 1));
- CHECK_FALSE(execution.image_labels(images, 1, "required"));
+ // Native annotation geometry permits independent conversion; the failed
+ // physical join still prevents this completed label from becoming eligible.
+ CHECK(execution.image_labels(images, 1, "required"));
+ CHECK_FALSE(writer.image_complete(0));
 }
 TEST_CASE("failed artifact digest custody follows the retained download generation", "[backend][data][benchmark][download][trace]") {
  mmltk::testsupport::ScopedTempDir root("download-digest-custody");
@@ -8799,7 +8867,7 @@ TEST_CASE("direct slot publication rejects malformed records and cannot seal par
  const auto membership = cached_pixel_membership(root.path() / "images");
  BenchmarkCompilePipeline execution(1);
  auto split = membership;
- split.images[0].label_count = 1;
+ split.images = {{1, 16, 8, 1, 0}};
  auto chunk = std::make_shared<BenchmarkLabelChunk>();
  chunk->width = 16;
  chunk->height = 8;

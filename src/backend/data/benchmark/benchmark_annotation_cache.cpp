@@ -75,12 +75,12 @@ void extract_annotation_members(const DownloadResult& archive, std::span<Annotat
    reader.require_regular(std::numeric_limits<std::size_t>::max());
   } catch (const BenchmarkArchiveError& error) {
    member.failure = std::make_exception_ptr(AnnotationSourceUnavailable(error.what()));
-   complete(index, reader.allowance());
+   complete(index, parent);
    continue;
   }
   if (!reader.size()) {
    member.failure = std::make_exception_ptr(AnnotationSourceUnavailable("empty benchmark annotation archive member"));
-   complete(index, reader.allowance());
+   complete(index, parent);
    continue;
   }
   try {
@@ -107,7 +107,9 @@ void extract_annotation_members(const DownloadResult& archive, std::span<Annotat
     },
     cancellation, &destination);
   } catch (const BenchmarkArchiveError& error) { throw AnnotationSourceUnavailable(error.what()); }
-  complete(index, reader.allowance());
+  // The extracted JSON has its own published file. Its parser borrows from
+  // source custody, where the closed archive returns the stream's credits.
+  complete(index, parent);
  }
  for (auto& member : members)
   if (member.identity.empty() && !member.failure) member.failure = std::make_exception_ptr(AnnotationSourceUnavailable("benchmark annotation archive does not contain " + member.suffix));

@@ -58,8 +58,9 @@ class CoconutPhysicalMembership final {
 public:
  // Synchronous observations of independently completed images and the source cursor.
  using Progress = std::function<void(CoconutEdition, const AdmittedRecipeArchive&, std::uint64_t image_id, std::uint64_t entries)>;
+ using Repair = std::function<void(AdmittedRecipeArchive&, std::string)>;
  CoconutPhysicalMembership(std::span<AdmittedRecipeArchive>, const CoconutRecipeCatalog&, bool explicit_catalog, const BenchmarkCacheLayout&, StorageReservationPool&, BenchmarkCompilePipeline&,
-  mmltk::common::concurrency::CancellationObservation = {}, Progress = {});
+  mmltk::common::concurrency::CancellationObservation = {}, Progress = {}, Repair = {});
  explicit CoconutPhysicalMembership(std::span<const CoconutPhysicalImage>, mmltk::common::concurrency::CancellationObservation = {});
  ~CoconutPhysicalMembership();
  CoconutPhysicalMembership(const CoconutPhysicalMembership&) = delete;
@@ -69,9 +70,10 @@ public:
  [[nodiscard]] std::filesystem::path identity_root(CoconutImageNamespace) const;
  // One acquisition controller visits this source forward and publishes every
  // admitted image immediately. Annotation consumers never own its cursor.
- bool consume(AdmittedRecipeArchive&, const std::function<void(const CoconutPhysicalImage&, std::string_view)>& rejected = {}, bool cache_only = false, bool accept_partial = false);
+ bool consume(AdmittedRecipeArchive&, const std::function<void(const CoconutPhysicalImage&, std::string_view)>& rejected = {}, bool cache_only = false);
  [[nodiscard]] CachedImageDirectory summary(const AdmittedRecipeArchive&) const;
  void admitted(AdmittedRecipeArchive&, DownloadResult, bool replacement = false);
+ [[nodiscard]] bool can_retry(const AdmittedRecipeArchive&) const;
  void wait_sources(std::optional<CoconutEdition> = {}) const;
  [[nodiscard]] bool discovery_complete() const;
  void unavailable(AdmittedRecipeArchive&);
@@ -82,6 +84,7 @@ public:
  void withdraw(const AdmittedRecipeArchive&);
  // Settle identity against independently published source inventories.
  [[nodiscard]] CoconutPhysicalImage resolve(CoconutEdition, const CoconutRecord&) const;
+ [[nodiscard]] CoconutPhysicalImage resolve(CoconutEdition, const CoconutPhysicalImage&) const;
  [[nodiscard]] BenchmarkSourcePublication label_publication(CoconutEdition, const CoconutPhysicalImage&) const;
  [[nodiscard]] const CoconutPhysicalImage* find(CoconutImageNamespace, std::uint64_t) const noexcept;
 

@@ -850,9 +850,14 @@ public:
    ++rows_;
   };
   const auto run = [&] {
-   if (request_.execution)
-    request_.execution->run(request_.metadata_only ? BenchmarkStage::Metadata : BenchmarkStage::Normalize, {bytes, 1}, work, allowance);
-   else
+   if (request_.execution) {
+    const auto descriptors = normalize && !saved ? std::size_t{1} : std::size_t{0};
+    // Archive workspaces retain memory independently of their opened input.
+    // Borrow the promised staging handle before entering a CPU frame; Parquet
+    // projections already admit that handle in their complete envelope.
+    const auto staging = descriptors && allowance && !allowance.descriptors() ? request_.execution->reserve(BenchmarkResources::handles(descriptors), allowance) : BenchmarkAllowance{};
+    request_.execution->run(request_.metadata_only ? BenchmarkStage::Metadata : BenchmarkStage::Normalize, {bytes, staging ? 0 : descriptors}, work, allowance);
+   } else
     work(0);
   };
   try {
@@ -882,6 +887,12 @@ public:
   if (!partial && rows_ == 0) invalid("selected release contains no offered image rows");
   if (!partial && request_.expected_rows != 0 && rows_ != request_.expected_rows) invalid("offered row count does not match the selected release");
   const bool early_membership = request_.membership_ready && !request_.metadata_only && recovery_controller_.joinable();
+  if (!request_.metadata_only) {
+   request_.records->archive.reset();
+   request_.records->document_complete = request_.records->document_complete || bool(request_.records->parquet);
+   request_.records->parquet.reset();
+   if (request_.input_finished) request_.input_finished();
+  }
   if (early_membership) request_.membership_ready(assemble(true));
   {
    const std::lock_guard lock(groups_mutex_);
@@ -901,11 +912,12 @@ public:
    for (const auto& component : result) membership.push_back(component.membership());
    request_.membership_ready(std::move(membership));
   }
+  if (!request_.metadata_only) request_.records->retire_native();
   return result;
  }
  std::vector<CoconutComponent> assemble(bool metadata_only) {
   if (!metadata_only) {
-   request_.parent_allowance.retire_continuation();
+   request_.parent_allowance.release_unused_continuation();
    request_.physical_membership->wait_sources(request_.edition);
    for (std::size_t position = 0; position < request_.records->size(); ++position) {
     const auto& row = request_.records->row(position);
@@ -960,7 +972,7 @@ public:
    mmltk::common::math::checked_add(join_bytes, std::uint64_t{65536}, "COCONut merge workspace overflow"), "COCONut merge workspace overflow");
   // Layout references retain their credit through final assembly and intervening
   // inventory I/O; only finite CPU work enters the shared lane.
-  auto merge_allowance = request_.execution ? request_.execution->reserve({workspace, 1}) : BenchmarkAllowance{};
+  auto merge_allowance = request_.execution ? request_.execution->reserve({workspace, 1}, request_.parent_allowance) : BenchmarkAllowance{};
   std::map<CoconutImageNamespace, std::vector<ImageChunk>> images;
   std::map<CoconutImageNamespace, AnnotationRejectCounts> rejected;
   std::map<CoconutImageNamespace, std::pair<std::size_t, std::size_t>> extents;
@@ -1100,14 +1112,14 @@ public:
    sealed->input_identity =
     coconut_component_input_identity(request_.input_identity, source, metadata_only ? nullptr : assembly_workspace_.recovery(), request_.physical_membership, request_.edition, sealed->dependencies);
    sealed->inventory = std::move(inventory);
-   auto output = request_.execution && !reusable ? request_.execution->reserve(BenchmarkResources::handles(1, false), request_.parent_allowance) : BenchmarkAllowance{};
+   // The mapped normalized output closed its file before returning. Inventory
+   // sealing uses the same single output descriptor in merge_allowance.
    auto component = CoconutComponentBacking::finish(
     std::move(sealed), std::move(normalized), metadata_only, request_.cancellation, request_.inventory_directory, request_.execution ? &request_.execution->storage() : nullptr, reusable);
    if (request_.records && metadata_only) request_.records->inventories.push_back(component);
    result.push_back(std::move(component));
   }
   throw_if_benchmark_cancelled(request_.cancellation);
-  if (!metadata_only) request_.records->retire_native();
   return result;
  }
 
@@ -1430,8 +1442,11 @@ private:
   const auto workspace = mmltk::common::math::checked_add(metadata_workspace_,
    mmltk::common::math::checked_add(mmltk::common::math::checked_multiply(request_.limits.max_png_bytes, 2U, "COCONut mask input overflow"), normalizer_workspace_, "COCONut mask consumer overflow"),
    "COCONut streaming envelope overflow");
+  // A discovered archive retained its file generation without a staging
+  // promise. Admit the full consumer envelope at the first native mask.
+  if (archive_ && !workspace_) pause();
   if (!archive_) {
-   archive_ = std::make_shared<Archive>(request_.mask_archive, request_.execution, workspace, request_.parent_allowance, 1, true, BenchmarkAllowance{}, 1024, 0);
+   archive_ = std::make_shared<Archive>(request_.mask_archive, request_.execution, workspace, request_.parent_allowance, 1, true, BenchmarkAllowance{}, 1024, 1);
    records_.archive = archive_;
    workspace_ = workspace;
   } else if (paused_ || workspace > workspace_) {
@@ -1440,14 +1455,14 @@ private:
    workspace_ = workspace;
    const auto cursor = archive_->member_position();
    if (paused_) {
-    archive_->resume(workspace_, 0);
+    archive_->resume(workspace_, request_.parent_allowance, 1);
     paused_ = false;
     if (!archive_->member().empty()) (void)archive_->seek(cursor, request_.cancellation);
     return false;
    }
    if (!archive_->try_resize_workspace(workspace_)) {
     pause();
-    archive_->resume(workspace_, 0);
+    archive_->resume(workspace_, request_.parent_allowance, 1);
     paused_ = false;
     return false;
    }
@@ -1698,14 +1713,14 @@ void json_records(const CoconutImportRequest& request, CoconutAnnotationRecords&
  if (discovered_rows != retained.size()) invalid("retained JSON row count mismatch");
  retained.document_complete = true;
 }
-void xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecords& retained, Importer* importer = nullptr) {
+void xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecords& retained, Importer* importer = nullptr) try {
  const auto nested = mmltk::common::math::checked_multiply(
   std::min<std::uint64_t>(request.limits.max_segments, 8ULL << 20) + 1, std::uint64_t{3 * (sizeof(JsonSegment) + 4 * sizeof(JsonAtom))}, "COCONut XL nested storage overflow");
  const auto workspace =
   mmltk::common::math::checked_add(nested, mmltk::common::math::checked_add(576ULL << 20, 0U, "COCONut discovery consumer envelope overflow"), "COCONut XL parser workspace overflow");
  auto owned = retained.archive;
  if (owned)
-  owned->resume(workspace, 0);
+  owned->resume(workspace, request.parent_allowance);
  else
   owned = std::make_shared<Archive>(request.mask_archive, request.execution, workspace, request.parent_allowance, 1, true, BenchmarkAllowance{}, 1024, 0);
  auto& archive = *owned;
@@ -1752,6 +1767,7 @@ void xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecord
    padded.resize(bytes.size() + simdjson::SIMDJSON_PADDING);
    std::memcpy(padded.data(), bytes.data(), bytes.size());
    auto document = parser.iterate(simdjson::padded_string_view(padded.data(), bytes.size(), padded.size()));
+   if (document.type().value() != simdjson::ondemand::json_type::array) invalid("XL info member requires a segments array: " + archive.member());
    JsonConsumption admission{0, 0, false, request.limits.max_segments};
    segments.reset();
    consume_json_value(document.get_value().value(), admission, 0, nullptr, nullptr, nullptr, &segments);
@@ -1780,7 +1796,7 @@ void xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecord
   importer->canonical_ordinals(retained.seal_xlarge_order());
  } else
   (void)retained.seal_xlarge_order();
-}
+} catch (const simdjson::simdjson_error& error) { reject_json_document(error); }
 }  // namespace
 CoconutComponent::CoconutComponent(std::shared_ptr<const CoconutComponentBacking> backing, NormalizedAnnotationReadView index, std::shared_ptr<CoconutInventorySeal> seal, bool membership)
     : backing_(std::move(backing)), index_(std::move(index)), seal_(std::move(seal)), membership_(membership), original_generation_(backing_->original_generation) {}
@@ -1810,6 +1826,9 @@ std::uint64_t CoconutComponent::compiled_ordinal_base(std::size_t image) const {
 const std::string& CoconutComponent::image_input_identity(std::size_t image) const { return backing_->image_dependencies.at(index_.source_position(image)); }
 bool CoconutComponent::matches_inputs(std::string_view annotations, const CoconutPhysicalMembership& physical, const CoconutMaskRecovery* recovery, bool current_physical) const {
  return input_identity() == coconut_component_input_identity(annotations, source(), recovery, &physical, edition(), backing_->dependencies, current_physical);
+}
+bool CoconutComponent::matches_physical(const CoconutPhysicalMembership& physical) const {
+ return physical.dependency_identity(edition(), source(), backing_->dependencies) == physical.dependency_identity(edition(), source(), backing_->dependencies, false);
 }
 std::uint32_t CoconutComponent::recovery_policy() const noexcept { return membership_ ? 0 : backing_->recovery_policy; }
 std::string_view CoconutComponent::original_annotation_identity() const noexcept { return membership_ ? std::string_view{} : backing_->original_annotation_identity; }

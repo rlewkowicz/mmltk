@@ -619,7 +619,9 @@ void BenchmarkArchive::pause() {
  s.credits = {};
  s.supplied_workspace = {};
 }
-void BenchmarkArchive::resume(std::uint64_t workspace, std::size_t consumer_descriptors) {
+void BenchmarkArchive::resume(std::uint64_t workspace, const BenchmarkAllowance& parent, std::size_t consumer_descriptors) {
+ if (impl_->reader) throw std::logic_error("archive continuation handoff requires a paused reader");
+ impl_->parent_allowance = parent;
  impl_->consumer_descriptors = consumer_descriptors;
  impl_->resume(workspace);
 }

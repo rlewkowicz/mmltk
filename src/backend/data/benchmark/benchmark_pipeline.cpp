@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <exception>
+#include <format>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -85,8 +86,9 @@ struct BenchmarkAllowance::Credits {
  std::shared_ptr<Credits> parent;
  std::size_t available = 0, borrowed = 0, cpu_users = 0;
  bool charged = false;
- bool descriptors_retired = false;
+ bool descriptors_retired = false, continuations_released = false;
  bool workspace_retirement_pending = false;
+ std::source_location location;
  std::shared_ptr<BenchmarkWorkspaceOffer> workspace_offer;
  Credits(std::shared_ptr<BenchmarkCompilePipeline::Admission> value, BenchmarkResources demand, std::shared_ptr<Credits> producing)
      : owner(std::move(value)), resources(demand), parent(std::move(producing)), available(demand.continuation_descriptors) {}
@@ -103,7 +105,15 @@ struct BenchmarkCompilePipeline::Admission {
  std::vector<std::shared_ptr<BenchmarkWorkspaceOffer>> workspace_offers;
  std::size_t descriptor_capacity = 0, descriptors = 0, committed = 0;
  std::size_t cpu_capacity = 0, active = 0, external_cpus = 0, waiters = 0, resource_waiters = 0;
- [[nodiscard]] std::size_t descriptor_ceiling(BenchmarkResources value) const { return descriptor_capacity - (value.producer ? std::min<std::size_t>(8, descriptor_capacity / 4) : 0); }
+ bool tracing = false;
+ std::vector<Credits*> observed_credits;
+ [[nodiscard]] std::size_t descriptor_ceiling(BenchmarkResources value) const {
+  // An explicit dependent promise already reserves consumer headroom. Count
+  // that capacity once; otherwise persistent output files can strand every
+  // source before its first open even though its complete chain fits.
+  const auto headroom = value.producer ? std::min<std::size_t>(8, descriptor_capacity / 4) : 0;
+  return descriptor_capacity - (headroom - std::min(headroom, value.continuation_descriptors));
+ }
  [[nodiscard]] bool feasible(BenchmarkResources value) const {
   const auto ceiling = descriptor_ceiling(value);
   return (!value.cpu_workers || value.cpu_workers < cpu_capacity) && value.continuation_descriptors <= ceiling && value.descriptors <= ceiling - value.continuation_descriptors;
@@ -150,7 +160,7 @@ struct BenchmarkCompilePipeline::Admission {
  // explicitly ended. Only live ancestors can promise them to a new child.
  void return_promise(Credits* parent, std::size_t count) noexcept {
   while (parent && count) {
-   if (!parent->descriptors_retired) {
+   if (!parent->descriptors_retired && !parent->continuations_released) {
     parent->available += count;
     return;
    }
@@ -176,7 +186,7 @@ struct BenchmarkCompilePipeline::Admission {
   return demand.bytes <= held.bytes && demand.descriptors <= held.descriptors && demand.cpu_workers <= held.cpu_workers && (!demand.bytes || demand.retained_handles == held.retained_handles) &&
          (!demand.producer || held.producer) && demand.continuation_descriptors <= credit.available;
  }
- void charge(Credits& credit, bool borrow_workspace = false) {
+ void charge(Credits& credit, bool borrow_workspace = false, std::source_location location = std::source_location::current()) {
   using mmltk::common::math::checked_add;
   const auto value = credit.resources;
   const auto claim = checked_add(value.descriptors, value.continuation_descriptors, "benchmark continuation admission overflow");
@@ -196,6 +206,11 @@ struct BenchmarkCompilePipeline::Admission {
   credit.borrowed = borrowed;
   if (credit.parent) credit.parent->available -= borrowed;
   credit.charged = true;
+  if (tracing)
+   try {
+    observed_credits.push_back(&credit);
+    credit.location = location;
+   } catch (...) { /* Diagnostic tracking cannot change admission. */ }
  }
  // The physical owner requests retirement after freeing its backing. A CPU
  // frame or stable lending window may still use this credit's commitment.
@@ -217,6 +232,7 @@ struct BenchmarkCompilePipeline::Admission {
   {
    const std::lock_guard lock(mutex);
    const auto value = credit.resources;
+   if (tracing) std::erase(observed_credits, &credit);
    credit.workspace_loans.retire();
    (value.retained_handles ? handle_bytes : bytes) -= value.bytes;
    descriptors -= value.descriptors;
@@ -624,6 +640,7 @@ struct BenchmarkCompilePipeline::Impl {
  std::exception_ptr failure;
  std::exception_ptr retired_failure = std::make_exception_ptr(std::runtime_error("benchmark work retired before completion"));
  mmltk::common::concurrency::CancellationObservation cancellation;
+ BenchmarkTraceSink trace;
  std::unique_ptr<mmltk::common::concurrency::WorkerPool> pool;
  template <class Predicate>
  void wait(std::unique_lock<std::mutex>& lock, Predicate is_ready) {
@@ -635,9 +652,9 @@ struct BenchmarkCompilePipeline::Impl {
    if (cancellation.requested()) changed.notify_all();
   }
  }
- BenchmarkAllowance charge(BenchmarkResources resources, const BenchmarkAllowance& parent = {}, bool finite_consumer = false) {
+ BenchmarkAllowance charge(BenchmarkResources resources, const BenchmarkAllowance& parent = {}, bool finite_consumer = false, std::source_location location = std::source_location::current()) {
   auto credits = std::make_shared<Credits>(admission, resources, parent.credits_);
-  admission->charge(*credits, finite_consumer && !admission->fits(resources, parent.credits_.get()));
+  admission->charge(*credits, finite_consumer && !admission->fits(resources, parent.credits_.get()), location);
   return BenchmarkAllowance(std::move(credits));
  }
  void check_admission() const {
@@ -645,12 +662,35 @@ struct BenchmarkCompilePipeline::Impl {
   throw_if_benchmark_cancelled(cancellation);
   if (stopping) throw std::logic_error("benchmark admission after shutdown");
  }
- void wait_resources(std::unique_lock<std::mutex>& lock, BenchmarkResources resources, const BenchmarkAllowance& parent) {
+ void wait_resources(std::unique_lock<std::mutex>& lock, BenchmarkResources resources, const BenchmarkAllowance& parent, std::source_location location = std::source_location::current()) {
   if (parent.credits_ && parent.credits_->owner != admission) throw std::invalid_argument("benchmark parent allowance belongs to another compile");
   admission->require(resources);
+  bool reported = false;
   for (;;) {
    check_admission();
    if (admission->fits(resources, parent.credits_.get())) return;
+   if (trace && !std::exchange(reported, true)) {
+    nlohmann::json snapshot;
+    try {
+     snapshot = {{"file", location.file_name()}, {"line", location.line()}, {"function", location.function_name()}, {"requested_bytes", resources.bytes},
+                 {"requested_descriptors", resources.descriptors}, {"requested_continuation", resources.continuation_descriptors}, {"producer", resources.producer},
+                 {"held_bytes", admission->bytes}, {"byte_target", admission->target}, {"held_descriptors", admission->descriptors}, {"committed_descriptors", admission->committed},
+                 {"descriptor_limit", admission->descriptor_capacity}, {"parents", nlohmann::json::array()}, {"owners", nlohmann::json::array()}};
+     for (auto* credit = parent.credits_.get(); credit; credit = credit->parent.get())
+      snapshot["parents"].push_back({{"bytes", credit->resources.bytes}, {"descriptors", credit->resources.descriptors}, {"available", credit->available}, {"borrowed", credit->borrowed},
+                                    {"descriptors_retired", credit->descriptors_retired}, {"continuations_released", credit->continuations_released}});
+     for (const auto* credit : admission->observed_credits) {
+      if (!credit->resources.descriptors && !credit->available && !credit->resources.bytes) continue;
+      snapshot["owners"].push_back({{"id", reinterpret_cast<std::uintptr_t>(credit)}, {"parent", reinterpret_cast<std::uintptr_t>(credit->parent.get())},
+                                    {"file", credit->location.file_name()}, {"line", credit->location.line()}, {"bytes", credit->resources.bytes},
+                                    {"descriptors", credit->resources.descriptors}, {"available", credit->available}, {"borrowed", credit->borrowed}});
+     }
+    } catch (...) { snapshot = nullptr; }
+    lock.unlock();
+    trace_benchmark_event(trace, "benchmark.resource.wait", [&] { return std::move(snapshot); });
+    lock.lock();
+    continue;
+   }
    Admission::Waiter waiter(*admission, true);
    wait(lock, [&] { return stopping || failure || cancellation.requested() || admission->fits(resources, parent.credits_.get()); });
   }
@@ -748,18 +788,6 @@ void BenchmarkAllowance::retire_workspace() const noexcept {
  }
  owner.changed.notify_all();
 }
-void BenchmarkAllowance::retire_continuation() const {
- if (!credits_) return;
- auto& owner = *credits_->owner;
- {
-  const std::lock_guard lock(owner.mutex);
-  if (credits_->available != credits_->resources.continuation_descriptors) throw std::logic_error("benchmark continuation still has live descriptor children");
-  const auto unused = std::exchange(credits_->available, 0);
-  credits_->resources.continuation_descriptors = 0;
-  owner.return_descriptors(*credits_, 0, unused);
- }
- owner.changed.notify_all();
-}
 void BenchmarkAllowance::retire_descriptors() const noexcept {
  if (!credits_) return;
  auto& owner = *credits_->owner;
@@ -770,6 +798,18 @@ void BenchmarkAllowance::retire_descriptors() const noexcept {
   credits_->descriptors_retired = true;
   credits_->resources.continuation_descriptors = 0;
   owner.return_descriptors(*credits_, closed, unused);
+ }
+ owner.changed.notify_all();
+}
+void BenchmarkAllowance::release_unused_continuation() const noexcept {
+ if (!credits_) return;
+ auto& owner = *credits_->owner;
+ {
+  const std::lock_guard lock(owner.mutex);
+  const auto unused = std::exchange(credits_->available, 0);
+  credits_->continuations_released = true;
+  credits_->resources.continuation_descriptors -= unused;
+  owner.return_descriptors(*credits_, 0, unused);
  }
  owner.changed.notify_all();
 }
@@ -1184,7 +1224,8 @@ bool BenchmarkCompilePipeline::Impl::consume(std::size_t lane, bool wait_for_wor
   settle(*job, error, recoverable);
  return true;
 }
-BenchmarkCompilePipeline::BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus, BenchmarkExecutionLimits limits, mmltk::common::concurrency::CancellationObservation cancellation)
+BenchmarkCompilePipeline::BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus, BenchmarkExecutionLimits limits, mmltk::common::concurrency::CancellationObservation cancellation,
+ BenchmarkTraceSink trace)
     : impl_(std::make_shared<Impl>()) {
  auto& state = *impl_;
  state.cpus = cpus.empty() ? mmltk::common::system::allowed_cpu_set() : std::vector<int>(cpus.begin(), cpus.end());
@@ -1199,6 +1240,8 @@ BenchmarkCompilePipeline::BenchmarkCompilePipeline(std::size_t workers, std::spa
  state.admission->descriptor_capacity = limits.descriptors ? std::min(limits.descriptors, headroom) : headroom;
  if (state.admission->descriptor_capacity < 2) throw std::invalid_argument("benchmark descriptor admission requires completion headroom");
  state.cancellation = cancellation;
+ state.trace = std::move(trace);
+ state.admission->tracing = bool(state.trace);
  state.pool = std::make_unique<mmltk::common::concurrency::WorkerPool>(workers, state.cpus, "bench_cpu", workers);
  if (state.pool->size() != workers) throw std::invalid_argument("benchmark CPU assignment contains repeated CPUs");
  try {
@@ -1296,19 +1339,19 @@ void BenchmarkCompilePipeline::require_feasible(BenchmarkResources resources) co
  const std::lock_guard lock(impl_->mutex);
  impl_->admission->require(resources);
 }
-std::optional<BenchmarkAllowance> BenchmarkCompilePipeline::try_reserve(BenchmarkResources resources, const BenchmarkAllowance& parent) {
+std::optional<BenchmarkAllowance> BenchmarkCompilePipeline::try_reserve(BenchmarkResources resources, const BenchmarkAllowance& parent, std::source_location location) {
  const std::lock_guard lock(impl_->mutex);
  impl_->check_admission();
  if (parent.credits_ && parent.credits_->owner != impl_->admission) throw std::invalid_argument("benchmark parent allowance belongs to another compile");
  if (!impl_->admission->fits(resources, parent.credits_.get())) return std::nullopt;
- return impl_->charge(resources, parent);
+ return impl_->charge(resources, parent, false, location);
 }
-BenchmarkAllowance BenchmarkCompilePipeline::reserve(BenchmarkResources resources, const BenchmarkAllowance& parent) {
+BenchmarkAllowance BenchmarkCompilePipeline::reserve(BenchmarkResources resources, const BenchmarkAllowance& parent, std::source_location location) {
  const auto* frame = Impl::Frame::current;
  if (frame && &frame->owner == impl_.get()) throw std::logic_error("benchmark CPU lane cannot wait for resource credits");
  std::unique_lock lock(impl_->mutex);
- impl_->wait_resources(lock, resources, parent);
- return impl_->charge(resources, parent);
+ impl_->wait_resources(lock, resources, parent, location);
+ return impl_->charge(resources, parent, false, location);
 }
 std::pair<std::size_t, BenchmarkAllowance> BenchmarkCompilePipeline::reserve_transfers(std::size_t requested, BenchmarkTransferEnvelope envelope, const BenchmarkAllowance& parent) {
  if (!requested || !envelope.per_transfer.descriptors) throw std::invalid_argument("benchmark transfer admission requires positive concurrency and descriptor demand");
@@ -1333,7 +1376,13 @@ void BenchmarkCompilePipeline::run(BenchmarkStage stage, BenchmarkResources reso
  if (allowance.credits_ && allowance.credits_->owner != impl_->admission) throw std::invalid_argument("benchmark allowance belongs to another compile");
  {
   const std::lock_guard lock(impl_->mutex);
-  if (allowance && !Admission::covers(*allowance.credits_, resources)) throw std::invalid_argument("benchmark job exceeds its transferred allowance");
+  if (allowance && !Admission::covers(*allowance.credits_, resources)) {
+   const auto& held = allowance.credits_->resources;
+   throw std::invalid_argument(std::format(
+    "benchmark job exceeds its transferred allowance: bytes {}/{}, descriptors {}/{}, CPU workers {}/{}, producer {}/{}, retained handles {}/{}, continuation {}/{}",
+    resources.bytes, held.bytes, resources.descriptors, held.descriptors, resources.cpu_workers, held.cpu_workers, resources.producer, held.producer,
+    resources.retained_handles, held.retained_handles, resources.continuation_descriptors, allowance.credits_->available));
+  }
  }
  auto* parent = Impl::Frame::current;
  if (parent && &parent->owner == impl_.get()) {

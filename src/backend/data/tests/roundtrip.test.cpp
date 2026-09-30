@@ -220,7 +220,7 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
  stream.synchronize();
  REQUIRE(completion.done.load(std::memory_order_acquire));
  REQUIRE_FALSE(completion.failure);
- CHECK(std::memcmp(received.data(), source.image_pixels(3U), stride) == 0);
+ CHECK(std::memcmp(received.data(), source.image_pixels(13U), stride) == 0);
  CHECK(std::memcmp(received.data() + stride, source.image_pixels(1U), stride) == 0);
  REQUIRE(stream.reset_storage() == cudaSuccess);
  REQUIRE_FALSE(stream.owns_allocation());

@@ -2458,6 +2458,11 @@ TEST_CASE("native captions wait for complete exposure without forgiving corrupt 
 }
 TEST_CASE("successful compile cannot replace real active cancellation and restart", "[workspace][audit]") {
  BrowserAudit audit;
+ const auto bounds = [&](const char* control, const char* detail, double y, double height) {
+  audit.consume({{"event", "integration.control_bounds"}, {"control", control}, {"detail", detail}, {"a", 10}, {"b", y}, {"c", 200}, {"d", height}});
+ };
+ bounds("train.compile_dataset.progress", "compile-placement", 30.0, 180.0);
+ bounds("train.compile_dataset", "compile-placement", 214.0, 28.0);
  audit.consume({{"event", "integration.dataset_complete"}, {"a", 1U}});
  CHECK_FALSE(audit.dataset_complete);
  native_dataset_frame(audit, 1U);
@@ -2467,6 +2472,10 @@ TEST_CASE("successful compile cannot replace real active cancellation and restar
  native_dataset_frame(audit, 2U);
  audit.consume({{"event", "integration.dataset_complete"}, {"a", 2U}});
  CHECK(audit.dataset_complete);
+ // The terminal status reuses the progress widget, but belongs to a later layout.
+ bounds("train.compile_dataset.progress", "", 30.0, 220.0);
+ CHECK(audit.compile_progress.height == 180.0);
+ CHECK(audit.compile_action.y - audit.compile_progress.y - audit.compile_progress.height == 4.0);
  CHECK_FALSE(audit.dataset_presentation_complete());
 }
 TEST_CASE("drawn Coconut geometry rejects clipping, alignment and text regressions", "[workspace][audit]") {

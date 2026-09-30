@@ -66,6 +66,7 @@ public:
  // Bind a cached view to the admitted original input used to validate it.
  [[nodiscard]] CoconutComponent with_original(const CoconutOriginalInput&) const;
  [[nodiscard]] bool matches_inputs(std::string_view, const CoconutPhysicalMembership&, const CoconutMaskRecovery*, bool current_physical = true) const;
+ [[nodiscard]] bool matches_physical(const CoconutPhysicalMembership&) const;
  [[nodiscard]] std::uint32_t recovery_policy() const noexcept;
  [[nodiscard]] std::string_view original_annotation_identity() const noexcept;
  [[nodiscard]] const NormalizedAnnotationReadView& index() const noexcept { return index_; }
@@ -239,6 +240,9 @@ struct CoconutImportRequest {
  CoconutImportLimits limits;
  mmltk::common::concurrency::CancellationObservation cancellation;
  std::function<void(std::uint64_t)> progress;
+ // Immutable native products now own the consumed input. Release source I/O
+ // custody before waiting for independent pixels or original-label settlement.
+ std::function<void()> input_finished;
  // Bounded preparation observations are separate from normalized row completion.
  std::function<void(CoconutPreparationStage, std::uint64_t)> preparation_progress;
  // Publish canonical image membership independently of label/recovery settlement.

@@ -7,7 +7,7 @@ namespace mmltk::backend::data {
 FileLayout compact_compiled_file(const mmltk::common::io::FileHandle& file, const FileLayout& staging, std::span<const ImageEntry> entries,
  mmltk::common::concurrency::CancellationObservation cancellation, CompiledCompactionProgress progress, const std::function<void(std::size_t, std::size_t)>& reserve) {
  using namespace mmltk::common::math;
- if (entries.size() != staging.num_slots || file.size() < staging.total_size) throw std::runtime_error("compiled compaction staging extent differs");
+ if (entries.size() != staging.num_slots || file.size() < staging.index_offset) throw std::runtime_error("compiled compaction staging extent differs");
  const auto check_cancelled = [&] {
   if (cancellation.requested()) throw std::runtime_error("dataset compilation cancelled");
  };

@@ -904,7 +904,10 @@ impl State {
         SINK.record(
             "integration.control_bounds",
             control,
-            "",
+            match phase {
+                Phase::CompileProgress | Phase::CompileActionWithProgress => "compile-placement",
+                _ => "",
+            },
             [
                 f64::from(bounds.x),
                 f64::from(bounds.y),

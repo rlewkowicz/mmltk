@@ -1056,6 +1056,8 @@ impl State {
                 if index == 5 {
                     if driver.viewer_scenario == "sparse" {
                         self.sparse_range_checked = true;
+                        self.invalidate_atlas_draw();
+                        COMPLETION_WITHOUT_INPUT.with(|active| active.set(true));
                         return driver.advance_to(Phase::AwaitExploreReady);
                     }
                     driver.phase = Phase::ExplorePolicyOrderReady;

@@ -317,33 +317,49 @@ Commit all remaining tracked changes, then complete and commit the documentation
 pass. Do not add a full-plan or whole-plan review, post-validation audit, or
 another validation stage; documentation does not restart validation.
 
-Run these stages in order. Cleanup must follow successful initial tidy/build
-and never follow the final build; tests require a successful final build.
-Both builds use `./mmltk --build`; both tidy passes use the complete configured
-`./mmltk --tidy` suite regardless of changed files or commits.
+Resume failed test and tidy checks instead of restarting their full suites after
+each fix. Retain successful results; rerun failed checks and directly affected
+dependencies, and finish any checks left unexecuted by an interruption. Use the
+owning test suite with executable/case filters, and tidy `--file` or `--start-at`
+as appropriate. Rebuild changed product code through `./mmltk --build` before
+testing. A resumed session continues from its recorded failures and completed
+stages, not from the start of validation.
 
-1. Run full tidy and resolve every genuine finding, then the initial full build.
-   Immediately after both succeed, commit every outstanding tracked change with
-   the exact message `pre cleanup`; keep `actionplan.md` uncommitted.
+The stage order is: full tidy → initial build → `pre cleanup` commit → cleanup
+→ full tidy → `post cleanup` commit → final build → `all` tests → Wayland
+acceptance → final tracked-changes commit → documentation pass and commit.
+Focused retries stay within the failing stage. Cleanup never follows the final
+build; tests require a successful final build.
+Both builds use `./mmltk --build`. The two tidy stages each finish with a clean
+complete configured `./mmltk --tidy` pass; focused retries do not restart the
+stage order or replace its final full pass.
+
+1. Run full tidy and resolve every genuine finding using focused retries.
+   Once failed checks pass, run one final full tidy pass if remediation was
+   needed, then the initial full build. Immediately after both succeed, commit
+   outstanding tracked changes with the exact message `pre cleanup`; keep
+   `actionplan.md` uncommitted.
 2. Obtain a fresh full report from every applicable cleanup profile regardless
    of earlier commits or changed files; never reuse earlier reports. Resolve
    every genuine hit, then run a final full pass of every profile. Once all are
-   clean, run the second full tidy and resolve every genuine finding. If tidy
-   remediation changes code, repeat cleanup then tidy before continuing.
-3. After cleanup and tidy are clean, commit all outstanding tracked cleanup and
+   clean, run the second full tidy. Resolve findings with focused retries; if
+   remediation changes code, repeat cleanup, then one final full tidy pass
+   before continuing.
+3. After cleanup and tidy are clean, commit outstanding tracked cleanup and
    tidy changes with the exact message `post cleanup`; keep `actionplan.md`
    uncommitted.
-4. From `post cleanup`, run the final full build once, then the complete `all`
-   suite and Wayland acceptance, exactly `./mmltk --test all` followed by
+4. From `post cleanup`, run the final full build, then the complete `all` suite
+   and Wayland acceptance, exactly `./mmltk --test all` followed by
    `./mmltk --test workspace-wayland --headless-compositor`, with no intervening
-   cleanup/tidy. Both must pass. Do not replace or supplement this gate with
-   focused tests, individual executables, additional suites, or plan-specific
-   acceptance commands. Put required feature coverage in these existing suites;
-   diagnostic investigation adds no acceptance gate.
-5. If validation fails after `post cleanup`, the main agent diagnoses and edits
-   the cause, rebuilds affected product code with `./mmltk --build`, and reruns
-   both required test commands in order. Do not add review or delegation or
-   repeat cleanup/tidy for these fixes.
+   cleanup/tidy. Required feature coverage belongs in these existing suites.
+5. If tests fail, diagnose and fix them directly, rebuild changed product code
+   with `./mmltk --build`, and resume only failed tests and directly affected
+   checks, including any checks not reached before an interruption. Do not
+   rerun the full suites after every fix. Once focused checks pass, run one
+   final complete `./mmltk --test all` followed by
+   `./mmltk --test workspace-wayland --headless-compositor`; both must pass.
+   Do not reopen cleanup/tidy, review, or delegation for these fixes. A failure
+   in this final pass returns to focused remediation before another full pass.
 
 Group targeted cleanup and tidy follow-up paths in one invocation where
 practical, preserving stage order. Proven detector false positives may use the
@@ -458,6 +474,12 @@ commits. Leave non-plan work uncommitted. Never add or commit `actionplan.md`
 or `remediationplan.md`.
 
 ## Tests
+
+Tests must verify the desired outcomes in `actionplan.md` and `CONTRACT.md`.
+Do not fork production logic for tests or add or retain fallback paths merely
+to make tests pass. Fix the implementation to meet those requirements. Change
+stale expectations only when the required outcome explicitly supersedes them;
+never weaken required behavior to obtain a passing result.
 
 Do not add regression tests. You may add standard tests that exercise required
 behavior, boundaries, failure handling, resource safety, and integration.

@@ -18,6 +18,7 @@
 namespace mmltk::backend::data::benchmark_internal {
 struct CoconutReleaseInputs {
  std::unordered_map<std::string, DownloadResult> artifacts;
+ std::shared_ptr<ArtifactLease> lease;
  std::shared_ptr<CoconutAnnotationRecords> records = std::make_shared<CoconutAnnotationRecords>();
  std::map<std::pair<CoconutEdition, CoconutImageNamespace>, CoconutComponent> components;
 };
@@ -214,14 +215,16 @@ struct CoconutRecipeInputs {
    }
    auto& part = *state.parts.at(value.request_index);
    part.inputs.artifacts.emplace(requests[value.request_index].artifact_id, std::move(value.artifact));
-   part.worker = std::jthread([this, index, shard = value.request_index, lease] {
+   part.inputs.lease = lease;
+   part.worker = std::jthread([this, index, shard = value.request_index] {
     try {
      {
       std::unique_lock lock(mutex);
       changed.wait(lock, [&] { return activated || cancelled(); });
       throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation::Borrow(*this));
      }
-     releases[index].parts[shard]->complete = prepare_part(index, shard, lease->allowance());
+     const auto parent = releases[index].parts[shard]->inputs.lease->allowance();
+     releases[index].parts[shard]->complete = prepare_part(index, shard, parent);
     } catch (...) { fail(std::current_exception()); }
    });
   };
@@ -259,12 +262,15 @@ struct CoconutRecipeInputs {
      changed.wait(lock, [&] { return activated || cancelled(); });
      throw_if_benchmark_cancelled(cancellation);
     }
-    auto cached = prepare_cached_release(index, lease->allowance());
+    const auto parent = lease->allowance();
+    state.inputs.lease = std::move(lease);
+    auto cached = prepare_cached_release(index, parent);
     if (cached.annotation_cache_hit) {
      state.complete = std::move(cached);
      state.release_cache_selected = true;
      state.parts.clear();
     } else {
+     lease = state.inputs.lease ? std::move(state.inputs.lease) : ArtifactLease::acquire_charged(lifecycle, cancellation, execution, coco_annotation_resources());
      for (std::size_t i = 0; i < results.size(); ++i) ready({i, results[i]});
     }
    }
@@ -282,7 +288,6 @@ struct CoconutRecipeInputs {
     state.annotation_descriptors = std::max(state.annotation_descriptors, BenchmarkArchive::input_requirement(results[i].path, 0).descriptors);
    state.inputs.artifacts.insert_or_assign(requests[i].artifact_id, std::move(results[i]));
   }
-  for (auto& part : state.parts) part->worker = {};
   state.metadata_reader = {};
   state.mask_discovery.request_stop();
   state.mask_discovery = {};
@@ -293,17 +298,26 @@ struct CoconutRecipeInputs {
   }
   // Acquisition controllers return after handing the admitted generation to
   // its release worker. Discovery and normalization share that one import.
-  lease->allowance().retire_continuation();
-  releases[index].masks = std::jthread([this, index, lease = std::move(lease)]() mutable {
+  if (state.parts.empty())
+   state.inputs.lease = std::move(lease);
+  else
+   lease.reset();
+  // Parts own their input read custody. Once parsing has made immutable native
+  // products, it must not keep the acquisition controller's lease alive while
+  // final physical joins wait for unrelated archives.
+  for (auto& part : state.parts) part->worker = {};
+  releases[index].masks = std::jthread([this, index] {
    try {
     {
      std::unique_lock lock(mutex);
      changed.wait(lock, [&] { return activated || cancelled(); });
      throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation::Borrow(*this));
     }
-    if (!releases[index].release_cache_selected) prepare(index, lease->allowance());
-    lease->allowance().retire_continuation();
-    lease = {};
+    const auto parent = releases[index].inputs.lease ? releases[index].inputs.lease->allowance() : BenchmarkAllowance{};
+    if (!releases[index].release_cache_selected) prepare(index, parent);
+    releases[index].inputs.lease.reset();
+    trace_benchmark_event(trace, "benchmark.annotations.release_complete",
+     [&] { return nlohmann::json{{"edition", catalog->releases[index].edition}, {"cache_hit", releases[index].complete->annotation_cache_hit}}; });
     progress->label_plan_completed(index);
     {
      const std::lock_guard lock(mutex);
@@ -521,7 +535,24 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
  const FlushReports flush_reports{failures};
  using namespace mmltk::common::math;
  CoconutRecipePreparation prepared;
- auto consumer_allowance = parent;
+ BenchmarkAllowance consumer_allowance;
+ const auto lifecycle = cache.locks / (std::string(release.name) + ".annotations.lifecycle.lock");
+ const auto retain_inputs = [&] {
+  if (!retained.lease) retained.lease = ArtifactLease::acquire_charged(lifecycle, cancellation, execution, coco_annotation_resources(), parent);
+ };
+ const auto release_inputs = [&] {
+  // A normalized cache hit no longer consumes the discovery archive. Close
+  // that retained inode before waiting for independent physical generations;
+  // releasing only its lease would leave the reader's descriptor charged.
+  retained.records->archive.reset();
+  consumer_allowance.release_unused_continuation();
+  // A sibling acquisition can stay blocked after this reader reaches EOF.
+  // Retain its physical lease, but return idle promises so unrelated inputs
+  // can finish. Later readers admit their own complete continuation.
+  if (retained.lease) retained.lease->allowance().release_unused_continuation();
+  retained.lease.reset();
+ };
+ retain_inputs();
  prepared.manifest = {{"components", nlohmann::json::array()}, {"artifacts", nlohmann::json::array()}};
  auto& totals = progress.transfers();
  StorageReservationPool reservations(cache.root, trace, execution ? &execution->storage() : nullptr);
@@ -675,6 +706,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   request.edition = release.edition;
   request.inventory_directory = path_for(sources.front()).parent_path();
   request.records = retained.records;
+  request.input_finished = release_inputs;
   request.rejected_input = [&](std::string_view reason) {
    prepared.manifest["partial"] = true;
    progress.warning("COCONut " + std::string(release.name) + " retained its healthy annotation prefix: " + std::string(reason));
@@ -753,16 +785,17 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
     request.mask_archive = artifact.path;
   }
   if (masks_started) masks_started();
-  // An idle release retains only its lifecycle lock. Before opening payload
-  // input, commit the complete descriptor chain against physical capacity so
-  // producer headroom cannot strand a ready reader behind other idle releases.
-  if (execution) {
-   const auto readers = annotation_descriptors;
-   consumer_allowance = execution->reserve(BenchmarkResources::handles(0, false, std::max(coco_annotation_resources().continuation_descriptors, readers)), parent);
-  }
-  request.parent_allowance = consumer_allowance;
+  const auto retain_consumer = [&] {
+   retain_inputs();
+   // Discovery and consumption share the source's complete continuation.
+   // A paused archive still owns its file draw from that same reservation;
+   // admitting a second full envelope would count its input twice.
+   consumer_allowance = retained.lease->allowance();
+   request.parent_allowance = consumer_allowance;
+  };
   for (unsigned attempt = 1;; ++attempt) {
    try {
+    retain_consumer();
     request.accept_partial = accept_partial || attempt >= 3;
     components = import_coconut_annotations(request);
     if (original_provider) {
@@ -804,6 +837,9 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
     // The failed generation cannot retain input backing into artifact repair.
     // This also covers failures after a successful import returned its rows.
     throw_if_benchmark_cancelled(cancellation);
+    // A terminal membership observer can reject after EOF released the input
+    // lease. Repair reacquires the real source custody before changing files.
+    if (!retained.lease) retain_consumer();
     if (attempt >= 3) {
      progress.warning("COCONut annotation artifact exhausted repair: " + std::string(error.what()));
      request.accept_partial = true;
@@ -898,6 +934,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   std::ranges::sort(components, {}, &CoconutComponent::source);
   for (const auto& component : components)
    if (std::ranges::find(sources, component.source()) == sources.end()) throw std::runtime_error("COCONut release references a namespace outside its selected recipe");
+  retain_inputs();
   for (const auto& component : components) {
    if (component.index().image_count() != 0 && !reusable.contains(component.source())) store_coconut_component(path_for(component.source()), component, cancellation, &reservations);
   }
@@ -911,7 +948,14 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    }
    row_progress(std::max(rows, admitted));
   }
+  release_inputs();
   physical.wait_sources(release.edition);
+  for (const auto& component : components)
+   for (const auto& image : component.inventory()) {
+    try {
+     (void)physical.resolve(release.edition, image.physical);
+    } catch (const CoconutPhysicalMembershipError&) { /* Final membership excludes missing or ambiguous images. */ }
+   }
   if (std::ranges::any_of(components, [&](const auto& component) { return !component.matches_inputs(identity, physical, recovery ? &*recovery : nullptr); }))
    return prepare_coconut_release(cache, release, physical, progress, failures, original_provider, retained, cancellation, trace, indexing, release_index, execution, parent, annotation_descriptors,
     membership_ready, masks_started, cache_tag, row_progress, accept_partial, row_withdrawn, cache_only);
@@ -924,10 +968,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
  if (complete && masks_started) masks_started();
  for (std::size_t i = 0; i < downloads.size(); ++i) prepared.manifest["artifacts"][first_artifact + i]["identity"] = downloads[i].identity;
  for (const auto& component : components) retained.components.insert_or_assign({component.edition(), component.source()}, component);
- // Metadata and masks share the opened archive generation. Completed immutable
- // products and parsed records outlive this reader, whose descriptors must
- // retire before the release returns its continuation promise.
- retained.records->archive.reset();
+ release_inputs();
  return materialize(std::move(components));
 }
 }  // namespace
@@ -1069,7 +1110,10 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
      ready = true;
     }
    }
-   if (ready && catalog.release_observer) catalog.release_observer(release.edition, CoconutReleaseBoundary::MetadataConsumed);
+   if (ready) {
+    trace_benchmark_event(trace, "benchmark.annotations.release_metadata", [&] { return nlohmann::json{{"edition", release.edition}}; });
+    if (catalog.release_observer) catalog.release_observer(release.edition, CoconutReleaseBoundary::MetadataConsumed);
+   }
   }, [&] {
    if (catalog.release_observer) catalog.release_observer(release.edition, CoconutReleaseBoundary::MasksStarted);
   }, ".part-" + std::to_string(shard), [&](std::uint64_t completed) {
@@ -1099,6 +1143,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   auto result = prepare_coconut_release(cache, release, physical, progress, failures, original_provider, retained.releases[index].inputs,
    mmltk::common::concurrency::CancellationObservation::Borrow(retained), trace, retained.indexing, index, execution, parent, 1, [&](CoconutRecipePreparation) {
    retained.releases[index].metadata_published = true;
+   trace_benchmark_event(trace, "benchmark.annotations.release_metadata", [&] { return nlohmann::json{{"edition", release.edition}}; });
    if (catalog.release_observer) catalog.release_observer(release.edition, CoconutReleaseBoundary::MetadataConsumed);
   }, [&] {
    if (catalog.release_observer) catalog.release_observer(release.edition, CoconutReleaseBoundary::MasksStarted);
@@ -1153,16 +1198,14 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   partial.manifest = {{"components", nlohmann::json::array()}, {"artifacts", nlohmann::json::array()}, {"partial", true}};
   bool rejected_identity = false;
   if (!parts.empty()) {
-   if (recovery)
-    for (std::size_t shard = 0; shard < parts.size(); ++shard) {
-     auto& part = *parts[shard];
-     if (!part.complete) continue;
-     if (std::ranges::any_of(part.complete->components, [&](const auto& component) {
-      if (!component.original_generation()) return false;
-      return component.original_generation() != recovery(component.source(), true, {}).generation;
-     }))
-      part.complete = retained.prepare_part(index, shard, parent);
-    }
+   for (std::size_t shard = 0; shard < parts.size(); ++shard) {
+    auto& part = *parts[shard];
+    if (!part.complete) continue;
+    if (std::ranges::any_of(part.complete->components, [&](const auto& component) {
+     return !component.matches_physical(physical) || (recovery && component.original_generation() && component.original_generation() != recovery(component.source(), true, {}).generation);
+    }))
+     part.complete = retained.prepare_part(index, shard, parent);
+   }
    std::vector<CoconutComponentPart> products;
    std::optional<std::uint64_t> row_base = 0, segment_base = 0;
    std::uint64_t readable_rows = 0;
@@ -1220,6 +1263,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
     failures.reject(image.physical, image.release_image_id, release.name, 0, 0, reason);
    });
    failures.flush();
+   auto publication = ArtifactLease::acquire_charged(cache.locks / (std::string(release.name) + ".annotations.lifecycle.lock"), release_cancellation, execution, coco_annotation_resources());
    release_inputs.components.clear();
    for (auto& component : merged) {
     const auto source_original = recovery ? recovery(component.source(), true, {}) : CoconutOriginalInput{};
@@ -1265,11 +1309,22 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
    for (const auto& component : retained.releases[index].complete->components) rows = std::max(rows, component.source_extent().first);
    retained.indexing->settle(index, rows, progress);
   }
-  trace_benchmark_event(
-   trace, "benchmark.annotations.release_complete", [&] { return nlohmann::json{{"edition", release.edition}, {"cache_hit", retained.releases[index].complete->annotation_cache_hit}}; });
  });
  std::vector<std::optional<CoconutRecipePreparation>> releases(catalog.releases.size());
  retained.finish();
+ // A later missing-image repair may replace a source shared by releases that
+ // already assembled. Reuse their parsed caches while rebinding only stale
+ // products; never publish mixed physical generations.
+ for (;;) {
+  bool refreshed = false;
+  for (std::size_t index = 0; index < releases.size(); ++index)
+   if (std::ranges::any_of(retained.releases[index].complete->components, [&](const auto& component) { return !component.matches_physical(physical); })) {
+    retained.prepare(index, {});
+    progress.label_plan_completed(index);
+    refreshed = true;
+   }
+  if (!refreshed) break;
+ }
  for (std::size_t index = 0; index < releases.size(); ++index) releases[index] = std::move(retained.releases[index].complete);
  if (needs_originals) {
   if (config.selection.validation == CoconutValidation::Stock) (void)retained.original(CoconutImageNamespace::CocoValidation, true);

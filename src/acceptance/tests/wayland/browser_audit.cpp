@@ -941,9 +941,9 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
    explore_gallery = bounds;
   else if (control == EXPLORE_DETAILS_PANE)
    explore_details = bounds;
-  else if (control == COMPILE_DATASET)
+  else if (control == COMPILE_DATASET && record.value("detail", "") == "compile-placement")
    compile_action = bounds;
-  else if (control == COMPILE_PROGRESS)
+  else if (control == COMPILE_PROGRESS && record.value("detail", "") == "compile-placement")
    compile_progress = bounds;
   else if (control == TRAIN_MODEL_CARD)
    model_card = bounds;

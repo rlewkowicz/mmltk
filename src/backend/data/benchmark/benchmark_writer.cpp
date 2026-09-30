@@ -128,7 +128,9 @@ struct BenchmarkSplitWriter::Impl {
   (void)common_io::ensure_parent_directory(request.output_path);
   StorageReservationPool storage(request.output_path, {}, execution ? &execution->storage() : nullptr);
   staging = BenchmarkStagedArtifact::create(storage, request.output_path, 0, "benchmark sparse staging");
-  staging.resize_sparse(layout.total_size);
+  // The resident index is written only at seal. Keep the staging EOF aligned
+  // so growth cannot allocate a partial EOF page in the next pixel block.
+  staging.resize_sparse(layout.index_offset);
   pixels = std::make_unique<WritablePixelRange>(staging.file().get(), layout);
   entries.resize(images.size());
   input_roots.resize(images.size());
@@ -181,7 +183,7 @@ std::uint32_t BenchmarkSplitWriter::allocate_slot(EncodedImageRecord image, cons
   state.sources.push_back(source);
  } else
   image.source_index = common_math::checked_cast<std::uint16_t>(std::distance(state.sources.begin(), found), "benchmark source index overflow");
- state.staging.resize_sparse(layout.total_size);
+ if (layout.index_offset != state.layout.index_offset) state.staging.resize_sparse(layout.index_offset);
  state.pixels->grow(layout);
  state.images.push_back(image);
  state.complete.push_back(0);
@@ -316,7 +318,8 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
   // The mapping owns its inode after the local image file closes. The cached
   // directory owns its separate child grant until reuse or scratch retirement.
   allowance.retire_descriptors();
- } catch (const BenchmarkImageError& error) {
+ } catch (const std::exception& error) {
+  if (!dynamic_cast<const BenchmarkImageError*>(&error) && !dynamic_cast<const InvalidImageError*>(&error)) throw;
   throw_if_benchmark_cancelled(state.cancellation);
   throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what());
  }

@@ -69,7 +69,9 @@ public:
  // Release decoder/buffer capacity between discovery and later consumption.
  // The opened inode and encountered positions stay bound to this generation.
  void pause();
- void resume(std::uint64_t workspace, std::size_t consumer_descriptors = 0);
+ // The next consumer supplies its continuation; retained inode custody stays
+ // with the original file allowance until that physical descriptor closes.
+ void resume(std::uint64_t workspace, const BenchmarkAllowance& parent = {}, std::size_t consumer_descriptors = 0);
  // Grow a live consumer envelope without reopening or discarding its seek state.
  bool try_resize_workspace(std::uint64_t workspace);
  [[nodiscard]] bool has_member(const std::string&) const;

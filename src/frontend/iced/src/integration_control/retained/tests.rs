@@ -69,9 +69,11 @@ fn sparse_numeric_controls_use_physical_extent_and_wait_for_persisted_high_range
         drive(driver, &model);
         assert_eq!(driver.driver.phase, Phase::ExploreNumericStart(index + 1));
     }
+    crate::integration_control::COMPLETION_WITHOUT_INPUT.with(|active| active.set(false));
     drive(driver, &model);
     assert!(driver.retained.sparse_range_checked);
     assert_eq!(driver.driver.phase, Phase::AwaitExploreReady);
+    assert!(crate::integration_control::COMPLETION_WITHOUT_INPUT.with(std::cell::Cell::get));
     // The ordinary numeric driver also uses the physical domain, while keeping
     // its existing finite edit and restoration sequence.
     model

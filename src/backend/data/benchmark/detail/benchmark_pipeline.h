@@ -1,5 +1,6 @@
 #pragma once
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
+#include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_resources.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/common/concurrency/cancellation_observation.h"
@@ -11,6 +12,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <source_location>
 #include <stdexcept>
 #include <utility>
 #include <string_view>
@@ -40,7 +42,7 @@ class BenchmarkCompilePipeline final {
  friend class BenchmarkResourceWait;
 
 public:
- explicit BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus = {}, BenchmarkExecutionLimits = {}, mmltk::common::concurrency::CancellationObservation = {});
+ explicit BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus = {}, BenchmarkExecutionLimits = {}, mmltk::common::concurrency::CancellationObservation = {}, BenchmarkTraceSink = {});
  ~BenchmarkCompilePipeline();
  BenchmarkCompilePipeline(const BenchmarkCompilePipeline&) = delete;
  BenchmarkCompilePipeline& operator=(const BenchmarkCompilePipeline&) = delete;
@@ -83,7 +85,7 @@ public:
  // Reject impossible controller demands before a nonblocking admission loop.
  void require_feasible(BenchmarkResources) const;
  [[nodiscard]] std::size_t descriptor_ceiling(BenchmarkResources) const;
- [[nodiscard]] std::optional<BenchmarkAllowance> try_reserve(BenchmarkResources, const BenchmarkAllowance& parent = {});
+ [[nodiscard]] std::optional<BenchmarkAllowance> try_reserve(BenchmarkResources, const BenchmarkAllowance& parent = {}, std::source_location = std::source_location::current());
  // Resize a settled input's promise, reclaiming idle lane scratch before
  // rejecting growth. Never wait for active work or retire the input's backing;
  // split children remain charged. Retain high water while no demand is blocked.
@@ -91,7 +93,7 @@ public:
  // A dependent draw uses at most its parent's remaining commitment. Additional
  // demand needs uncommitted capacity; copied parents cannot lend twice.
  // Called by I/O/source owners only; never blocks a CPU lane on resources.
- [[nodiscard]] BenchmarkAllowance reserve(BenchmarkResources, const BenchmarkAllowance& parent = {});
+ [[nodiscard]] BenchmarkAllowance reserve(BenchmarkResources, const BenchmarkAllowance& parent = {}, std::source_location = std::source_location::current());
  // Admit a complete HTTP envelope, reducing optional connections under pressure.
  [[nodiscard]] std::pair<std::size_t, BenchmarkAllowance> reserve_transfers(std::size_t requested, BenchmarkTransferEnvelope, const BenchmarkAllowance& parent = {});
  // The borrowed callback and its inputs remain live through completion/failure.
