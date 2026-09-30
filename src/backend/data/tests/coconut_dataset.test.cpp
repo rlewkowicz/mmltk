@@ -4723,6 +4723,13 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
   REQUIRE(archive_write_close(output.get()) == ARCHIVE_OK);
  }
  BenchmarkArchive input(path);
+ // Before-first-header suspension is distinct from a saved member. Repeated
+ // teardown and decoder admission must retain that initial forward position.
+ input.suspend();
+ input.suspend();
+ CHECK(input.retained_workspace_bytes() == 0);
+ REQUIRE(input.try_resume(0));
+ input.suspend();
  REQUIRE(input.next());
  CHECK(input.member() == name);
  auto first = input.read(1024);
@@ -4747,7 +4754,16 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
   CHECK_THROWS_AS(changed_generation.seek(first_position), BenchmarkArchiveError);
  }
  input.suspend();
+ input.suspend();
+ CHECK(input.retained_workspace_bytes() == 0);
+ REQUIRE(input.try_resume(0));
+ // Admission itself does not consume the saved member; resuspending before a
+ // read must keep its metadata even though the fresh decoder starts at zero.
+ input.suspend();
+ const auto resumed_second = input.read(1024);
+ CHECK(std::string(resumed_second.begin(), resumed_second.end()) == members[1].second);
  REQUIRE(input.seek(first_position));
+ input.suspend();
  input.suspend();
  first = input.read(1024);
  CHECK(std::string(first.begin(), first.end()) == members[0].second);
@@ -4755,6 +4771,7 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
  input.suspend();
  REQUIRE(input.next());
  CHECK(input.member() == members[1].first);
+ CHECK(input.position() == 1);
  input.pause();
  const std::array required{members[1].first, members[0].first};
  std::vector<std::size_t> order;
@@ -4764,6 +4781,9 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
   CHECK(std::string(actual.begin(), actual.end()) == members[1 - index].second);
  });
  CHECK(order == std::vector<std::size_t>{1, 0});
+ input.suspend();
+ input.suspend();
+ CHECK_FALSE(input.next());
 }
 TEST_CASE("requested archive extraction closes before unsafe unused members", "[benchmark][coconut][archive]") {
  ScopedTempDir root("archive-unused-tail");

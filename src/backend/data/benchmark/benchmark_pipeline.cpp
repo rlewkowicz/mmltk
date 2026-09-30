@@ -26,15 +26,18 @@ using detail::CompileResources;
 using detail::CompileAllowance;
 struct BenchmarkCompletionWindow::Impl {
  struct Wake { std::mutex mutex; std::condition_variable changed; };
- struct Entry { CompileExecution::Completion completion; std::function<void(std::exception_ptr)> settled; };
+ struct Entry { CompileExecution::Completion completion; std::function<void(std::exception_ptr)> settled; bool subscribed = false; };
  std::shared_ptr<Wake> wake = std::make_shared<Wake>();
  std::vector<Entry> entries;
  std::size_t capacity;
  std::function<void()> waiting;
  CompileExecution* execution;
  bool interrupted = false;
+ bool waiting_failed = false;
+ std::exception_ptr failure;
  explicit Impl(std::size_t count, CompileExecution* owner, std::function<void()> parked)
      : capacity(std::max<std::size_t>(1, count)), waiting(std::move(parked)), execution(owner) { entries.reserve(capacity); }
+ void failed() noexcept { if (!failure) failure = std::current_exception(); }
  bool collect(bool wait) {
   std::unique_lock lock(wake->mutex);
   const auto ready = [&] { return std::ranges::find_if(entries, [](const auto& entry) { return entry.completion.ready(); }); };
@@ -44,12 +47,25 @@ struct BenchmarkCompletionWindow::Impl {
    // completion signal; a cancelled admission wait must not spin or abandon them.
    const auto observed = execution && !interrupted ? execution->admission_generation() : 0;
    lock.unlock();
-   if (waiting) waiting();
-   if (execution && !interrupted) {
+   if (waiting && !waiting_failed) try { waiting(); } catch (...) {
+    failed();
+    waiting_failed = interrupted = true;
+   }
+   // Registration can fail after physical acceptance. That entry has no wake
+   // to wait on; its own completion still retains the physical join protocol.
+   const auto unregistered = std::ranges::find_if(entries, [](const auto& entry) { return !entry.subscribed; });
+   if (unregistered != entries.end()) {
+    try { unregistered->completion.wait(); } catch (...) {
+     // Physical failures belong to settlement policy. Never consume a rejected
+     // wait (for example a CPU-lane join) as though the borrower had completed.
+     if (!unregistered->completion.ready()) throw;
+    }
+    lock.lock();
+   } else if (execution && !interrupted) {
     lock.lock();
     const bool pending = ready() == entries.end();
     lock.unlock();
-    if (pending) try { execution->wait_for_admission_change(observed); } catch (...) { interrupted = true; }
+    if (pending) try { execution->wait_for_admission_change(observed); } catch (...) { failed(); interrupted = true; }
     lock.lock();
    } else {
     lock.lock();
@@ -61,28 +77,33 @@ struct BenchmarkCompletionWindow::Impl {
   auto entry = std::move(*found);
   entries.erase(found);
   lock.unlock();
-  entry.settled(entry.completion.failure());
+  try { entry.settled(entry.completion.failure()); } catch (...) { failed(); }
   return true;
  }
 };
 BenchmarkCompletionWindow::BenchmarkCompletionWindow(std::size_t capacity, CompileExecution* execution, std::function<void()> waiting)
     : impl_(std::make_unique<Impl>(capacity, execution, std::move(waiting))) {}
 BenchmarkCompletionWindow::~BenchmarkCompletionWindow() { try { drain(); } catch (...) {} }
-void BenchmarkCompletionWindow::make_room() { reap(); while (impl_->entries.size() == impl_->capacity) impl_->collect(true); }
+void BenchmarkCompletionWindow::make_room() {
+ reap();
+ while (impl_->entries.size() == impl_->capacity) { impl_->collect(true); if (impl_->failure) drain(); }
+}
 void BenchmarkCompletionWindow::push(CompileExecution::Completion completion, std::function<void(std::exception_ptr)> settled) {
  if (impl_->entries.size() == impl_->capacity) throw std::logic_error("benchmark completion window is full");
  impl_->entries.push_back({completion, std::move(settled)});
- completion.subscribe([wake = impl_->wake, execution = impl_->execution](std::exception_ptr) {
-  { const std::lock_guard lock(wake->mutex); wake->changed.notify_all(); }
-  if (execution) execution->notify_admission_change();
- });
+ try {
+  completion.subscribe([wake = impl_->wake, execution = impl_->execution](std::exception_ptr) {
+   { const std::lock_guard lock(wake->mutex); wake->changed.notify_all(); }
+   if (execution) execution->notify_admission_change();
+  });
+  impl_->entries.back().subscribed = true;
+ } catch (...) { impl_->failed(); drain(); }
 }
-void BenchmarkCompletionWindow::reap() { while (impl_->collect(false)) {} }
-void BenchmarkCompletionWindow::wait_one() { if (!impl_->entries.empty()) impl_->collect(true); }
+void BenchmarkCompletionWindow::reap() { while (impl_->collect(false)) {} if (impl_->failure) drain(); }
+void BenchmarkCompletionWindow::wait_one() { if (!impl_->entries.empty()) impl_->collect(true); if (impl_->failure) drain(); }
 void BenchmarkCompletionWindow::drain() {
- std::exception_ptr failure;
- while (!impl_->entries.empty()) try { impl_->collect(true); } catch (...) { if (!failure) failure = std::current_exception(); }
- if (failure) std::rethrow_exception(failure);
+ while (!impl_->entries.empty()) impl_->collect(true);
+ if (auto failure = std::exchange(impl_->failure, {})) std::rethrow_exception(failure);
 }
 std::size_t BenchmarkCompletionWindow::size() const noexcept { return impl_->entries.size(); }
 

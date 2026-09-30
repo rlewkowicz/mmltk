@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -91,6 +92,35 @@
 #include "src/common/io/file_memory.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/common/system/cpu_affinity.h"
+namespace {
+// One-shot, thread-local allocation failure: only the guarded controller call
+// is affected. Completion storage/waits and archive teardown stay unchanged.
+thread_local std::optional<std::size_t> allocation_failure_countdown;
+class FailNextAllocation final {
+public:
+ explicit FailNextAllocation(std::size_t allowed) { allocation_failure_countdown = allowed; }
+ ~FailNextAllocation() { allocation_failure_countdown.reset(); }
+ FailNextAllocation(const FailNextAllocation&) = delete;
+ FailNextAllocation& operator=(const FailNextAllocation&) = delete;
+ [[nodiscard]] bool fired() const noexcept { return !allocation_failure_countdown; }
+};
+}
+[[gnu::noinline]] void* operator new(std::size_t size) {
+ if (allocation_failure_countdown) {
+  if (!*allocation_failure_countdown) { allocation_failure_countdown.reset(); throw std::bad_alloc{}; }
+  --*allocation_failure_countdown;
+ }
+ for (;;) {
+  if (void* allocation = std::malloc(size ? size : 1)) return allocation;
+  if (const auto handler = std::get_new_handler()) handler();
+  else throw std::bad_alloc{};
+ }
+}
+[[gnu::noinline]] void* operator new[](std::size_t size) { return ::operator new(size); }
+[[gnu::noinline]] void operator delete(void* allocation) noexcept { std::free(allocation); }
+[[gnu::noinline]] void operator delete[](void* allocation) noexcept { ::operator delete(allocation); }
+[[gnu::noinline]] void operator delete(void* allocation, std::size_t) noexcept { ::operator delete(allocation); }
+[[gnu::noinline]] void operator delete[](void* allocation, std::size_t) noexcept { ::operator delete(allocation); }
 using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileExecutionLimits;
@@ -10968,6 +10998,168 @@ TEST_CASE("split sealing joins a physical peer before propagating failure", "[ba
  CHECK_FALSE(fs::exists(temporary));
  CHECK(storage.outstanding()==0);
  CHECK(mmltk::common::io::sha256_file(output)==previous);
+}
+
+TEST_CASE("completion windows drain independent borrowers after a one-time wait hook failure", "[backend][data][benchmark][pipeline]") {
+ enum class Finish { Drain, WaitOne, MakeRoom, Destruction };
+ const auto finish = GENERATE(Finish::Drain, Finish::WaitOne, Finish::MakeRoom, Finish::Destruction);
+ const bool owned = GENERATE(false, true);
+ CAPTURE(finish, owned);
+ auto execution = owned ? std::make_unique<CompileExecution>(1) : nullptr;
+ CompileExecution::CompletionSource held(execution.get()), first(execution.get()), second(execution.get());
+ const auto initial = std::make_exception_ptr(std::runtime_error("initial wait hook failure"));
+ const auto later = std::make_exception_ptr(std::runtime_error("later physical failure"));
+ std::array<std::atomic<unsigned>, 3> callbacks{};
+ std::atomic<unsigned> hooks{0};
+ std::promise<void> waiting, first_settled, second_settled;
+ std::weak_ptr<int> borrowed;
+ auto draining = std::async(std::launch::async, [&] {
+  BenchmarkCompletionWindow window(3, execution.get(), [&] {
+   ++hooks;
+   mmltk::testsupport::release_test_promise(waiting);
+   std::rethrow_exception(initial);
+  });
+  auto owner = std::make_shared<int>(41);
+  borrowed = owner;
+  window.push(held.completion(), [&, owner](std::exception_ptr error) {
+   ++callbacks[0];
+   require_condition(held.completion().ready() && *owner == 41, "held borrower lost physical custody");
+   require_condition(error == later, "physical failure did not reach its settlement callback");
+   throw std::runtime_error("later held callback failure");
+  });
+  owner.reset();
+  window.push(first.completion(), [&](std::exception_ptr error) {
+   ++callbacks[1];
+   require_condition(!error, "healthy independent completion changed");
+   first_settled.set_value();
+   throw std::runtime_error("later ready callback failure");
+  });
+  window.push(second.completion(), [&](std::exception_ptr error) {
+   ++callbacks[2];
+   require_condition(!error, "second independent completion changed");
+   second_settled.set_value();
+  });
+  try {
+   switch (finish) {
+    case Finish::Drain: window.drain(); break;
+    case Finish::WaitOne: window.wait_one(); break;
+    case Finish::MakeRoom: window.make_room(); break;
+    case Finish::Destruction: return;
+   }
+  } catch (...) {
+   require_condition(window.size() == 0, "error propagated before accepted borrowers settled");
+   require_condition(std::current_exception() == initial, "completion window replaced its first failure");
+   throw;
+  }
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { first.settle(); second.settle(); held.settle(later); });
+ mmltk::testsupport::await_test_promise(waiting, "wait hook fails while physical work is held", 5s);
+ first.settle();
+ mmltk::testsupport::await_test_promise(first_settled, "first ready borrower bypasses held physical work", 5s);
+ second.settle();
+ mmltk::testsupport::await_test_promise(second_settled, "second ready borrower survives a peer callback failure", 5s);
+ CHECK(draining.wait_for(0ms) == std::future_status::timeout);
+ CHECK_FALSE(borrowed.expired());
+ CHECK(hooks == 1);
+ CHECK(callbacks[0] == 0);
+ if (execution) {
+  CHECK_FALSE(execution->interruption());
+  execution->run(CompileTaskKind::Metadata, {}, [](std::size_t) {});
+ }
+ held.settle(later);
+ if (finish == Finish::Destruction) mmltk::testsupport::await_test_future(draining, "destruction joins the held borrower", 5s);
+ else CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(draining, "first failure follows physical drain", 5s), "initial wait hook failure");
+ CHECK(borrowed.expired());
+ CHECK(hooks == 1);
+ for (const auto& calls : callbacks) CHECK(calls == 1);
+}
+
+TEST_CASE("completion subscription allocation failure retains accepted physical custody", "[backend][data][benchmark][pipeline]") {
+ // GCC's std::function first owns the wake capture, then Completion::subscribe
+ // grows its callback vector. Fail each real allocation after window acceptance.
+ const auto allowed = GENERATE(std::size_t{0}, std::size_t{1});
+ CAPTURE(allowed);
+ CompileExecution::CompletionSource held, unregistered;
+ const auto physical = std::make_exception_ptr(std::runtime_error("later physical failure"));
+ std::atomic<unsigned> held_calls{0}, unregistered_calls{0};
+ std::promise<void> waiting, unregistered_settled;
+ std::weak_ptr<int> borrowed;
+ auto pushing = std::async(std::launch::async, [&] {
+  BenchmarkCompletionWindow window(2, nullptr, [&] { mmltk::testsupport::release_test_promise(waiting); });
+  auto owner = std::make_shared<int>(17);
+  borrowed = owner;
+  window.push(held.completion(), [&, owner](std::exception_ptr error) {
+   ++held_calls;
+   require_condition(!error && *owner == 17, "held subscription peer lost custody");
+  });
+  owner.reset();
+  std::function<void(std::exception_ptr)> settled = [&](std::exception_ptr error) {
+   ++unregistered_calls;
+   require_condition(error == physical, "unregistered physical failure changed");
+   unregistered_settled.set_value();
+   throw std::runtime_error("later subscription peer callback failure");
+  };
+  const FailNextAllocation allocation(allowed);
+  try { window.push(unregistered.completion(), std::move(settled)); }
+  catch (...) {
+   require_condition(allocation.fired(), "completion subscription allocation was not exercised");
+   require_condition(window.size() == 0, "failed subscription released accepted work before drain");
+   throw;
+  }
+  throw std::runtime_error("completion subscription did not allocate");
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { unregistered.settle(physical); held.settle(); });
+ mmltk::testsupport::await_test_promise(waiting, "failed subscription joins an accepted unregistered borrower", 5s);
+ unregistered.settle(physical);
+ mmltk::testsupport::await_test_promise(unregistered_settled, "unregistered completion uses its physical wait", 5s);
+ CHECK(pushing.wait_for(0ms) == std::future_status::timeout);
+ CHECK_FALSE(borrowed.expired());
+ CHECK(held_calls == 0);
+ held.settle();
+ CHECK_THROWS_AS(mmltk::testsupport::await_test_future(pushing, "allocation failure follows all accepted completions", 5s), std::bad_alloc);
+ CHECK(borrowed.expired());
+ CHECK(held_calls == 1);
+ CHECK(unregistered_calls == 1);
+}
+
+TEST_CASE("archive suspension retires scratch without allocating a member checkpoint", "[backend][data][benchmark][archive]") {
+ mmltk::testsupport::ScopedTempDir root("archive-suspension-allocation");
+ const auto path = root.path() / "source.tar";
+ const auto jpeg = make_jpeg(40, 80, 120);
+ write_single_jpeg_tar(path, 1, jpeg);
+ BenchmarkArchive input(path);
+ const auto suspend = [&] {
+  bool allocated;
+  {
+   const FailNextAllocation allocation(0);
+   input.suspend();
+   input.suspend({});
+   allocated = allocation.fired();
+  }
+  CHECK_FALSE(allocated);
+  CHECK(input.retained_workspace_bytes() == 0);
+ };
+ suspend();
+ REQUIRE(input.next());
+ const auto expected = input.member_position();
+ REQUIRE(input.member().size() > 15);
+ CHECK(std::ranges::equal(input.read(jpeg.size()), jpeg));
+ suspend();
+ std::exception_ptr restore_failure;
+ {
+  const FailNextAllocation allocation(0);
+  try { (void)input.read(jpeg.size()); } catch (...) { restore_failure = std::current_exception(); }
+ }
+ REQUIRE(restore_failure);
+ CHECK_THROWS_AS(std::rethrow_exception(restore_failure), std::bad_alloc);
+ CHECK(input.retained_workspace_bytes() == 0);
+ // A failed restore keeps the original continuation across another suspension.
+ suspend();
+ CHECK(std::ranges::equal(input.read(jpeg.size()), jpeg));
+ REQUIRE(input.seek(expected));
+ suspend();
+ CHECK(std::ranges::equal(input.read(jpeg.size()), jpeg));
+ CHECK_FALSE(input.next());
 }
 
 TEST_CASE("custom extraction retains a bounded pinned window through physical pixel completion", "[backend][data][benchmark][archive]") {

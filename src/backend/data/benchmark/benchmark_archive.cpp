@@ -148,7 +148,11 @@ struct BenchmarkArchive::Impl {
  std::size_t consumer_descriptors = 0;
  std::uint64_t workspace_bytes = 0;
  Position current;
- std::optional<MemberPosition> suspended;
+ // Map nodes are never erased and survive rehash. Keep the already-owned key,
+ // not name (which replay mutates). A null member explicitly means before the
+ // first header; an absent optional means no suspended continuation.
+ struct Suspended { const std::string* member = nullptr; };
+ std::optional<Suspended> suspended;
  Impl(const std::filesystem::path& path, CompileExecution* owner, std::uint64_t workspace, const CompileAllowance& parent, std::size_t workers, bool verify_gzip_crc,
   CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t dependent_descriptors, std::size_t gzip_index_entries)
      : execution(owner),
@@ -637,22 +641,34 @@ void BenchmarkArchive::visit_known(std::span<const std::string> members, const s
   consume(required.index);
  }
 }
-void BenchmarkArchive::suspend() {
- if (!impl_->reader) { pause(); return; }
- const auto position = impl_->started || impl_->direct ? std::optional(member_position()) : std::nullopt;
+void BenchmarkArchive::suspend() noexcept {
+ auto& s = *impl_;
+ if (s.reader && !s.suspended) {
+  s.suspended.emplace();
+  if (s.started || s.direct) {
+   const auto found = s.positions.find(s.name);
+   if (found != s.positions.end()) s.suspended->member = &found->first;
+  }
+ }
  pause();
- impl_->suspended = position;
 }
-void BenchmarkArchive::suspend(const CompileAllowance& parent) {
+void BenchmarkArchive::suspend(const CompileAllowance& parent) noexcept {
  suspend();
  impl_->parent_allowance = parent;
 }
 void BenchmarkArchive::restore(Cancellation cancellation) {
  if (!impl_->suspended) return;
- auto position = std::exchange(impl_->suspended, {});
- if (!seek(*position, cancellation)) throw BenchmarkArchiveError("suspended archive cursor disappeared from its opened generation");
+ const auto position = std::exchange(impl_->suspended, {});
+ if (!position->member) return;
+ try {
+  if (!seek(*position->member, cancellation)) throw BenchmarkArchiveError("suspended archive cursor disappeared from its opened generation");
+ } catch (...) {
+  pause();
+  impl_->suspended = position;
+  throw;
+ }
 }
-void BenchmarkArchive::pause() {
+void BenchmarkArchive::pause() noexcept {
  auto& s = *impl_;
  s.reader.reset();
  s.entry = nullptr;

@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -29,7 +30,12 @@ class BenchmarkLabelWorkspace;
 
 // Bounded physical completion custody shared by artifact publication and final
 // claim restoration. Completion order frees records; metadata order stays with
-// the caller. Destruction drains every accepted borrower even after failure.
+// the caller. Use outside CPU lanes; execution and callback captures outlive the
+// window. A failed subscription or wait hook still drains accepted borrowers
+// before propagation, retaining the first error over later settlement errors.
+// Each entry leaves the window before its callback runs once; physical errors
+// are passed to that callback's policy. A throwing wait hook is never retried.
+// Destruction drains as well, suppressing only the final reported error.
 class BenchmarkCompletionWindow final {
 public:
  explicit BenchmarkCompletionWindow(std::size_t capacity, detail::CompileExecution* = nullptr, std::function<void()> waiting = {});

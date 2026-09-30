@@ -71,13 +71,16 @@ public:
  void visit_known(std::span<const std::string> members, const std::function<void(std::size_t)>&, mmltk::common::concurrency::CancellationObservation = {});
  // Release decoder/buffer capacity between discovery and later consumption.
  // The opened inode and encountered positions stay bound to this generation.
- void pause();
+ void pause() noexcept;
  // Quiesce an active forward cursor under resource pressure. The next read or
  // advance restores this exact consumed position on the retained inode.
- void suspend();
+ // Retirement allocates nothing: the cursor borrows this owner's stable member
+ // metadata, including repeated suspension before the first header. Restoration
+ // may allocate/fail; failure retains the continuation for another attempt.
+ void suspend() noexcept;
  // Replace the next decoder's continuation only after its physical storage
  // retires. The opened file retains its original descriptor ancestry.
- void suspend(const CompileAllowance& parent);
+ void suspend(const CompileAllowance& parent) noexcept;
  // The next consumer supplies its continuation; retained inode custody stays
  // with the original file allowance until that physical descriptor closes.
  void resume(std::uint64_t workspace, const CompileAllowance& parent = {}, std::size_t consumer_descriptors = 0);
