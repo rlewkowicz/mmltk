@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include <fcntl.h>
 #include <unistd.h>
@@ -44,6 +45,10 @@ import mmltk.common.logging.profile_utils;
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileTaskKind;
+
 namespace common_concurrency = mmltk::common::concurrency;
 namespace common_io = mmltk::common::io;
 namespace common_math = mmltk::common::math;
@@ -86,7 +91,7 @@ struct BenchmarkSplitWriter::Impl {
   return *value;
  }
  BenchmarkCompilePipeline* execution = nullptr;
- BenchmarkAllowance writer_handles, directory_handles;
+ CompileAllowance writer_handles, directory_handles;
  std::mutex directory_mutex;
  common_io::FileHandle directory;
  std::uint16_t directory_source = std::numeric_limits<std::uint16_t>::max();
@@ -122,7 +127,7 @@ struct BenchmarkSplitWriter::Impl {
   (void)catalog::ClassCatalog(class_names, COMPILED_CLASS_NAME_CAPACITY);
   if (class_names.empty() || class_names.size() > MAX_CLASSES) throw std::runtime_error("benchmark split exceeds the compiled class limit");
   execution = request.execution;
-  if (execution) writer_handles = execution->reserve(BenchmarkResources::handles(1));
+  if (execution) writer_handles = execution->execution().reserve(CompileResources::handles(1));
   if (resolution == 0 || resolution > MAX_IMAGE_EXTENT) throw std::runtime_error("benchmark pixel membership is incomplete");
   layout = compute_file_layout(common_math::checked_cast<std::uint32_t>(images.size(), "benchmark image count overflow"), stride);
   (void)common_io::ensure_parent_directory(request.output_path);
@@ -256,7 +261,7 @@ void BenchmarkSplitWriter::prepare_lanes(std::size_t lanes) {
  while (impl_->scratch.size() < lanes) impl_->scratch.push_back(std::make_unique<Impl::Scratch>(impl_->perceptual));
 }
 std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
- std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication, BenchmarkAllowance allowance, std::shared_ptr<const BenchmarkEncodedImage> payload) {
+ std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication, CompileAllowance allowance, std::shared_ptr<const BenchmarkEncodedImage> payload) {
  auto& state = *impl_;
  EncodedImageRecord image;
  std::filesystem::path source_root;
@@ -279,7 +284,7 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
      state.directory_source = std::numeric_limits<std::uint16_t>::max();
      state.directory_handles = {};
      if (state.execution) {
-      auto granted = state.execution->try_reserve(BenchmarkResources::handles(1), allowance);
+      auto granted = state.execution->execution().try_reserve(CompileResources::handles(1), allowance);
       if (!granted) throw std::logic_error("benchmark image input lost its directory continuation");
       state.directory_handles = std::move(*granted);
      }
@@ -325,7 +330,7 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
  }
  return input;
 }
-BenchmarkAllowance BenchmarkSplitWriter::pixel_input_allowance(const BenchmarkPixelInput& input) const { return input.payload->allowance(); }
+CompileAllowance BenchmarkSplitWriter::pixel_input_allowance(const BenchmarkPixelInput& input) const { return input.payload->allowance(); }
 std::uint64_t BenchmarkSplitWriter::pixel_workspace_bytes(const BenchmarkPixelInput& input) const {
  return pixel_workspace_bytes(input.payload->header(), input.payload->charged_bytes() ? 0 : input.payload->size());
 }

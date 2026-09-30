@@ -2,10 +2,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <utility>
-namespace mmltk::backend::data::benchmark_internal {
-class BenchmarkCompilePipeline;
-struct BenchmarkResources {
+#include <stdexcept>
+namespace mmltk::backend::data::detail {
+class CompileExecution;
+struct CompileAdmission;
+class InsufficientCompileResources : public std::runtime_error {
+public:
+ using std::runtime_error::runtime_error;
+};
+struct CompileResources {
  std::uint64_t bytes = 0;
  std::size_t descriptors = 0;
  // Producer allowances include their consumers' scratch/output, atomically.
@@ -17,28 +24,26 @@ struct BenchmarkResources {
  bool retained_handles = false;
  // Live descriptor commitment for explicitly bound dependent reservations.
  std::size_t continuation_descriptors = 0;
- [[nodiscard]] static BenchmarkResources handles(std::size_t count, bool producer = false, std::size_t continuation = 0);
+ [[nodiscard]] static CompileResources handles(std::size_t count, bool producer = false, std::size_t continuation = 0);
 };
-struct BenchmarkExecutionLimits {
+struct CompileExecutionLimits {
  std::uint64_t transient_bytes = 0;
  std::size_t descriptors = 0;
-};
-// Quantified fixed and per-transfer demand; transport policy belongs to Curl.
-struct BenchmarkTransferEnvelope {
- BenchmarkResources fixed;
- BenchmarkResources per_transfer;
- [[nodiscard]] BenchmarkResources demand(std::size_t transfers) const;
+ std::size_t task_records = 0;
 };
 // Shared custody charges backing once and returns it after its last reader.
-class BenchmarkAllowance {
+class CompileAllowance {
  struct Credits;
+ friend struct CompileAdmission;
 
 public:
- BenchmarkAllowance() = default;
+ CompileAllowance() = default;
  [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(credits_); }
  [[nodiscard]] std::uint64_t bytes() const noexcept;
  [[nodiscard]] std::size_t descriptors() const noexcept;
- [[nodiscard]] bool aliases(const BenchmarkAllowance& other) const noexcept { return credits_ && credits_ == other.credits_; }
+ // Stable for the admitted external grant until its physical retirement.
+ [[nodiscard]] std::span<const int> cpus() const noexcept;
+ [[nodiscard]] bool aliases(const CompileAllowance& other) const noexcept { return credits_ && credits_ == other.credits_; }
  // The backing owner calls this only after joining its workers and releasing
  // its own storage. Aliases keep descriptor commitments; split storage children
  // keep their separately charged bytes. External CPU capacity retires here too.
@@ -57,11 +62,11 @@ public:
  // charge. Use before publishing the allowance to readers and outside any
  // unused-workspace offer. Positive storage keeps its own workspace loans;
  // descriptor-only aliases retain none after the backing owner retires bytes.
- [[nodiscard]] BenchmarkAllowance split_storage(std::uint64_t);
+ [[nodiscard]] CompileAllowance split_storage(std::uint64_t);
 
 private:
- friend class BenchmarkCompilePipeline;
- explicit BenchmarkAllowance(std::shared_ptr<Credits> value) : credits_(std::move(value)) {}
+ friend class CompileExecution;
+ explicit CompileAllowance(std::shared_ptr<Credits> value) : credits_(std::move(value)) {}
  std::shared_ptr<Credits> credits_;
 };
-}  // namespace mmltk::backend::data::benchmark_internal
+}  // namespace mmltk::backend::data::detail

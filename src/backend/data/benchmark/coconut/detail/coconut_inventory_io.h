@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
@@ -22,6 +23,8 @@
 #include <type_traits>
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileTaskKind;
+
 class CoconutInventorySeal final {
 public:
  void capture(const mmltk::common::io::FileHandle& file);

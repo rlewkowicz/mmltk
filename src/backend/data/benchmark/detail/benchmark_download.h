@@ -1,5 +1,5 @@
 #pragma once  // backend.data private implementation boundary
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/detail/compile_resources.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <atomic>
 #include <cstddef>
@@ -16,6 +16,8 @@
 #include <string_view>
 #include <stdexcept>
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileAllowance;
+
 class BenchmarkCompilePipeline;
 class StorageReservationPool;
 // Only remote/source unavailability or rejected response content. Local setup, allocation,
@@ -83,10 +85,10 @@ using DownloadProgressSink = std::function<void(const DownloadProgress&)>;
 // Opportunistic ordinary admission: resource/lock contention or an absent or
 // stale completion returns immediately. No transfer or repair is started.
 [[nodiscard]] std::optional<DownloadResult> try_cached_download(const DownloadRequest&, mmltk::common::concurrency::CancellationObservation = {}, const BenchmarkTraceSink& = {},
- BenchmarkCompilePipeline* = nullptr, const BenchmarkAllowance& parent = {}, const DownloadProgressSink& = {});
+ BenchmarkCompilePipeline* = nullptr, const CompileAllowance& parent = {}, const DownloadProgressSink& = {});
 [[nodiscard]] std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t maximum_concurrency,
  mmltk::common::concurrency::CancellationObservation cancel_requested, const DownloadProgressSink& progress = {}, const BenchmarkTraceSink& trace = {}, const DownloadReadySink& ready = {},
- BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {}, StorageReservationPool* storage = nullptr, const DownloadUnavailableSink& unavailable = {});
+ BenchmarkCompilePipeline* execution = nullptr, const CompileAllowance& parent = {}, StorageReservationPool* storage = nullptr, const DownloadUnavailableSink& unavailable = {});
 void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested = {}, const BenchmarkTraceSink& trace = {},
- BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {});
+ BenchmarkCompilePipeline* execution = nullptr, const CompileAllowance& parent = {});
 }  // namespace mmltk::backend::data::benchmark_internal

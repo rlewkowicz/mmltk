@@ -1,6 +1,6 @@
 #pragma once
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/detail/compile_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_sampling.h"
@@ -31,10 +31,14 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileExecutionLimits;
+
 class BenchmarkCompilePipeline;
 class CoconutPhysicalMembership;
 struct AdmittedRecipeArchive;
-[[nodiscard]] BenchmarkResources custom_annotation_resources();
+[[nodiscard]] CompileResources custom_annotation_resources();
 struct CustomRecipeCatalog {
  CatalogArtifact coco_annotations, coco_train_images, coco_val_images, objects_annotations, open_images_boxes, open_images_classes;
  std::vector<CatalogArtifact> objects_images;
@@ -52,7 +56,7 @@ struct CustomRecipePreparation {
 };
 [[nodiscard]] CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CustomRecipeCatalog&, ProgressReporter&, std::size_t,
  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::span<const int> worker_cpus = {}, BenchmarkCompilePipeline* execution = nullptr,
- BenchmarkAllowance preparation = {});
+ CompileAllowance preparation = {});
 }  // namespace mmltk::backend::data::benchmark_internal
 namespace mmltk::backend::data::benchmark_internal {
 struct CoconutRecipeInputs;
@@ -93,13 +97,13 @@ private:
 [[nodiscard]] CoconutRecipeCatalog coconut_recipe_catalog(CoconutValidation);
 [[nodiscard]] CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CoconutRecipeCatalog&, std::span<const AdmittedRecipeArchive>,
  const CoconutPhysicalMembership&, ProgressReporter&, CoconutFailureReport&, std::size_t, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&,
- std::shared_ptr<CoconutRecipeInputs> inputs = {}, BenchmarkCompilePipeline* execution = nullptr, BenchmarkAllowance preparation = {}, CocoAnnotationInputObserver stock_input = {});
+ std::shared_ptr<CoconutRecipeInputs> inputs = {}, BenchmarkCompilePipeline* execution = nullptr, CompileAllowance preparation = {}, CocoAnnotationInputObserver stock_input = {});
 [[nodiscard]] bool coconut_validation_component(CoconutEdition) noexcept;
 [[nodiscard]] AnnotationSource coconut_annotation_source(CoconutImageNamespace);
 // Same compiler entry with explicit private source catalog, not a second execution path.
 // Optional effect-only notifications and private execution limits support
 // bounded local catalogs. Membership and scheduling remain compiler-owned.
 void compile_benchmark_recipe(BenchmarkCompilerConfig, const CoconutRecipeCatalog*, const CustomRecipeCatalog* = nullptr,
- const std::function<void(BenchmarkDatasetSource, std::string_view)>& source_labels_started = {}, const BenchmarkImageReadObserver& image_opened = {}, BenchmarkExecutionLimits = {},
+ const std::function<void(BenchmarkDatasetSource, std::string_view)>& source_labels_started = {}, const BenchmarkImageReadObserver& image_opened = {}, CompileExecutionLimits = {},
  CocoAnnotationInputObserver stock_input = {}, const std::function<void()>& selection_started = {});
 }  // namespace mmltk::backend::data::benchmark_internal

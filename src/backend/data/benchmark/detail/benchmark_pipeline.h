@@ -1,7 +1,7 @@
 #pragma once
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <cstddef>
@@ -19,105 +19,26 @@
 #include "src/backend/imaging/resample/image_resize.h"
 namespace mmltk::backend::data::benchmark_internal {
 class BenchmarkCurl;
-class BenchmarkResourceWait;
 class BenchmarkSplitWriter;
 struct PreparedBenchmarkSplit;
 struct BenchmarkLabelChunk;
 class BenchmarkLabelInput;
 class BenchmarkLabelWorkspace;
 class StorageReservationPool;
-// Only runnable CPU work enters this owner. Source controllers retain their I/O,
-// locks and dependency waits outside its lanes. Stages are scheduling policy,
-// never a replacement for recipe/source ownership or a product task graph.
-class InsufficientBenchmarkResources : public std::runtime_error {
-public:
- using std::runtime_error::runtime_error;
-};
-enum class BenchmarkStage : std::uint8_t { Metadata, Header, Pixels, Normalize, Recovery, Labels, Archive, CacheWrite, Count };
 class BenchmarkCompilePipeline final {
  friend class BenchmarkSourcePublication;
- struct Admission;
- using Credits = BenchmarkAllowance::Credits;
- friend class BenchmarkAllowance;
- friend class BenchmarkResourceWait;
-
 public:
- explicit BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus = {}, BenchmarkExecutionLimits = {}, mmltk::common::concurrency::CancellationObservation = {}, BenchmarkTraceSink = {});
+ explicit BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus = {}, detail::CompileExecutionLimits = {}, mmltk::common::concurrency::CancellationObservation = {}, BenchmarkTraceSink = {});
  ~BenchmarkCompilePipeline();
  BenchmarkCompilePipeline(const BenchmarkCompilePipeline&) = delete;
  BenchmarkCompilePipeline& operator=(const BenchmarkCompilePipeline&) = delete;
- // Source-scoped scratch keeps its charged capacity across adjacent groups.
- // Its noexcept retirement releases physical buffers before returning credits.
- // The source buffers and pipeline must outlive this stable, nonmovable owner.
- class Workspace final {
- public:
-  Workspace(BenchmarkCompilePipeline&, std::function<void(std::size_t)> retire);
-  ~Workspace();
-  Workspace(const Workspace&) = delete;
-  Workspace& operator=(const Workspace&) = delete;
-
- private:
-  friend class BenchmarkCompilePipeline;
-  BenchmarkCompilePipeline& owner_;
-  std::function<void(std::size_t)> retire_;
-  bool active_ = false;
- };
- [[nodiscard]] std::size_t workers() const noexcept;
- [[nodiscard]] std::size_t current_lane() const;
+ [[nodiscard]] detail::CompileExecution& execution() noexcept;
  [[nodiscard]] BenchmarkCurl& curl();
  [[nodiscard]] StorageReservationPool& storage() noexcept;
- [[nodiscard]] std::span<const int> cpus() const noexcept;
- [[nodiscard]] std::uint64_t transient_target() const noexcept;
- [[nodiscard]] std::size_t descriptor_limit() const noexcept;
- // Diagnostic snapshot only; admission decisions use the locked ledger.
- [[nodiscard]] BenchmarkResources resource_usage() const;
- // Idle source buffers yield to blocked consumers and resource borrowers.
- [[nodiscard]] bool resource_pressure() const;
- // Source controllers capture before checking readiness/resource fit, then
- // wait without holding source locks. Readiness publishers signal after their
- // own state changes; returned credits advance this same admission event.
- [[nodiscard]] std::uint64_t admission_generation() const;
- void wait_for_admission_change(std::uint64_t, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
- void notify_admission_change() noexcept;
- // A deferred I/O input observes this same admission event while keeping idle
- // scratch reclaimable. The token is retired on admission or abandonment.
- [[nodiscard]] std::unique_ptr<BenchmarkResourceWait> defer_resources();
- // Reject impossible controller demands before a nonblocking admission loop.
- void require_feasible(BenchmarkResources) const;
- [[nodiscard]] std::size_t descriptor_ceiling(BenchmarkResources) const;
- [[nodiscard]] std::optional<BenchmarkAllowance> try_reserve(BenchmarkResources, const BenchmarkAllowance& parent = {}, std::source_location = std::source_location::current());
- // Resize a settled input's promise, reclaiming idle lane scratch before
- // rejecting growth. Never wait for active work or retire the input's backing;
- // split children remain charged. Retain high water while no demand is blocked.
- [[nodiscard]] bool try_resize_workspace(const BenchmarkAllowance&, std::uint64_t, bool retain_capacity = false);
- // A dependent draw uses at most its parent's remaining commitment. Additional
- // demand needs uncommitted capacity; copied parents cannot lend twice.
- // Called by I/O/source owners only; never blocks a CPU lane on resources.
- [[nodiscard]] BenchmarkAllowance reserve(BenchmarkResources, const BenchmarkAllowance& parent = {}, std::source_location = std::source_location::current());
- // Admit a complete HTTP envelope, reducing optional connections under pressure.
- [[nodiscard]] std::pair<std::size_t, BenchmarkAllowance> reserve_transfers(std::size_t requested, BenchmarkTransferEnvelope, const BenchmarkAllowance& parent = {});
- // The borrowed callback and its inputs remain live through completion/failure.
- // Input ownership supplies an allowance when a producer already reserved the
- // complete input/work/output footprint; no second charge is made.
- void run(BenchmarkStage, BenchmarkResources, const std::function<void(std::size_t)>&, BenchmarkAllowance = {});
- // Bounded records recycle on individual completion. Retirement finishes before
- // returning, including failure; it cannot retire suspended cooperative scratch.
- void for_each(BenchmarkStage, std::size_t count, BenchmarkResources, const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>& retire_scratch = {});
- void for_each(
-  BenchmarkStage, std::size_t count, const std::function<BenchmarkResources(std::size_t)>&, const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>& retire_scratch = {});
- void for_each(BenchmarkStage, std::size_t count, const std::function<BenchmarkResources(std::size_t)>&, const std::function<void(std::size_t)>&, Workspace&);
  void write_remaining(BenchmarkSplitWriter&, const PreparedBenchmarkSplit&, std::span<const std::size_t>);
- // A stopped input reader may expose unused promise bytes to ready pixel
- // and label writes. Source/producer admission still sees its complete reservation.
- // Reclaims every borrowed physical workspace before returning or throwing;
- // callback and reclaim execute outside CPU lanes. The input owner must keep
- // its allocation window stable and include all of its consumers in live_bytes.
- // Even a fully occupied window excludes reentry/resize, but contributes no
- // positive offer and does not join another producer's borrowed workspace.
- void with_unused_workspace(const BenchmarkAllowance&, std::uint64_t live_bytes, const std::function<void()>&);
- // A synchronous library parser yields between bounded progress points.
- // Runs only already-ready work on its current lane, without waiting.
- void cooperate();
+ [[nodiscard]] detail::CompileExecution::Completion image_completion(const std::filesystem::path&, std::uint64_t) const;
+ [[nodiscard]] detail::CompileExecution::Completion label_completion(const std::filesystem::path&, std::uint64_t, std::string_view) const;
+ [[nodiscard]] bool subscribe_labels(const BenchmarkSourcePublication&, std::uint64_t, std::string_view, std::uint64_t original_generation, std::function<void(std::exception_ptr)>) const;
  void membership_ready();
  void bind_slot(const std::filesystem::path&, std::uint64_t, BenchmarkSplitWriter&, std::uint32_t);
  // Bind a source family before acquisition. Its first image or label allocates
@@ -169,21 +90,7 @@ public:
  };
 
 private:
- void for_each_impl(
-  BenchmarkStage, std::size_t, const std::function<BenchmarkResources(std::size_t)>&, const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>&, bool retain_scratch);
- void retire_workspace(const void*) noexcept;
  struct Impl;
  std::shared_ptr<Impl> impl_;
-};
-class BenchmarkResourceWait final {
-public:
- ~BenchmarkResourceWait();
- BenchmarkResourceWait(const BenchmarkResourceWait&) = delete;
- BenchmarkResourceWait& operator=(const BenchmarkResourceWait&) = delete;
-
-private:
- friend class BenchmarkCompilePipeline;
- explicit BenchmarkResourceWait(std::shared_ptr<BenchmarkCompilePipeline::Admission>);
- std::shared_ptr<BenchmarkCompilePipeline::Admission> owner_;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/compile_execution.h"
 #include <system_error>
 #include <sys/mman.h>
 #include "src/backend/data/benchmark/detail/benchmark_json.h"
@@ -15,9 +16,13 @@
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
-#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
 namespace mmltk::backend::data::benchmark_internal {
+using detail::CompileExecution;
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileTaskKind;
+
 using mmltk::common::concurrency::parallel_for_range_indexed;
 using mmltk::common::io::errno_error;
 using mmltk::common::io::FileHandle;
@@ -72,10 +77,10 @@ using RejectFields = std::remove_cvref_t<decltype(mmltk::frameworks::reflection:
  RejectFields::Visit([&]<class Declaration, std::size_t Index>() { result[Index] = rejected.*Declaration::pointer; });
  return result;
 }
-void annotation_ranges(BenchmarkCompilePipeline* execution, std::size_t count, int workers, const std::function<void(int, std::size_t, std::size_t)>& consume, std::uint64_t workspace = 8U << 20,
+void annotation_ranges(CompileExecution* execution, std::size_t count, int workers, const std::function<void(int, std::size_t, std::size_t)>& consume, std::uint64_t workspace = 8U << 20,
  const std::function<void(std::size_t)>& retire = {}) {
  if (execution)
-  execution->for_each(BenchmarkStage::Metadata, count, {workspace, 0}, [&](std::size_t index) { consume(static_cast<int>(execution->current_lane()), index, index + 1); }, retire);
+  execution->for_each(CompileTaskKind::Metadata, count, {workspace, 0}, [&](std::size_t index) { consume(static_cast<int>(execution->current_lane()), index, index + 1); }, retire);
  else
   parallel_for_range_indexed<std::size_t>(0U, count, workers, consume);
 }
@@ -86,8 +91,8 @@ void annotation_ranges(BenchmarkCompilePipeline* execution, std::size_t count, i
  return std::max(1, std::min(std::max(available, 1), bounded_work));
 }
 void parallel_object_array(const PaddedMappedFile& file, std::span<const ByteRange> rows, int requested_workers, std::vector<simdjson::ondemand::parser>& parsers,
- BenchmarkCompilePipeline::Workspace* parser_workspace, mmltk::common::concurrency::CancellationObservation cancellation,
- const std::function<void(int, simdjson::ondemand::object, std::uint64_t)>& callback, BenchmarkCompilePipeline* execution = nullptr, const std::function<void(int)>& begin_chunk = {}) {
+ CompileExecution::Workspace* parser_workspace, mmltk::common::concurrency::CancellationObservation cancellation,
+ const std::function<void(int, simdjson::ondemand::object, std::uint64_t)>& callback, CompileExecution* execution = nullptr, const std::function<void(int)>& begin_chunk = {}) {
  const auto workers = execution ? execution->workers() : static_cast<std::size_t>(effective_worker_count(requested_workers, rows.size()));
  std::vector<ByteRange> chunks;
  for (std::size_t begin = 0; begin < rows.size();) {
@@ -112,10 +117,10 @@ void parallel_object_array(const PaddedMappedFile& file, std::span<const ByteRan
   }
  };
  if (execution)
-  execution->for_each(BenchmarkStage::Metadata, chunks.size(), [&](std::size_t chunk) {
+  execution->for_each(CompileTaskKind::Metadata, chunks.size(), [&](std::size_t chunk) {
    const auto range = chunks[chunk];
    const auto bytes = std::uint64_t{rows[range.end - 1].end - rows[range.begin].begin};
-   return BenchmarkResources{
+   return CompileResources{
     mmltk::common::math::checked_add(std::uint64_t{65536}, mmltk::common::math::checked_multiply(bytes, 64U, "annotation workspace overflow"), "annotation workspace overflow"), 0
    };
   }, [&](std::size_t chunk) { consume(execution->current_lane(), chunk); }, *parser_workspace);
@@ -291,8 +296,8 @@ void parse_segmentation(simdjson::ondemand::value value, ParsedAnnotation::Segme
  return parsed;
 }
 void validate_numeric_categories(const PaddedMappedFile& file, std::span<const ByteRange> categories, std::vector<simdjson::ondemand::parser>& parsers,
- BenchmarkCompilePipeline::Workspace* parser_workspace, NumericCategoryAdmission& admission, bool complete, mmltk::common::concurrency::CancellationObservation cancel_requested,
- BenchmarkCompilePipeline* execution) try {
+ CompileExecution::Workspace* parser_workspace, NumericCategoryAdmission& admission, bool complete, mmltk::common::concurrency::CancellationObservation cancel_requested,
+ CompileExecution* execution) try {
  std::mutex admission_mutex;
  parallel_object_array(file, categories, 1, parsers, parser_workspace, cancel_requested, [&](int, simdjson::ondemand::object object, std::uint64_t) {
   std::uint32_t id = 0U;
@@ -672,7 +677,7 @@ struct AnnotationChunk {
  }
 };
 NormalizedAnnotationIndex assemble_annotation_chunks(NormalizedAnnotationBuilder metadata, std::span<const ParsedImage> images, std::vector<AnnotationChunk>& chunks, bool keep_empty,
- mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkCompilePipeline* execution, const BenchmarkTraceSink& trace) {
+ mmltk::common::concurrency::CancellationObservation cancellation, CompileExecution* execution, const BenchmarkTraceSink& trace) {
  struct Reference {
   std::size_t chunk, box;
  };
@@ -707,7 +712,7 @@ NormalizedAnnotationIndex assemble_annotation_chunks(NormalizedAnnotationBuilder
  const auto workspace = mmltk::common::math::checked_add(mmltk::common::math::checked_multiply(std::uint64_t{total}, std::uint64_t{sizeof(Reference)}, "normalized ordering workspace overflow"),
   std::uint64_t{65536}, "normalized ordering workspace overflow");
  if (execution)
-  execution->run(BenchmarkStage::Metadata, {workspace, 0}, assemble);
+  execution->run(CompileTaskKind::Metadata, {workspace, 0}, assemble);
  else
   assemble(0);
  return output;
@@ -894,7 +899,7 @@ void validate_open_images_classes(const std::filesystem::path& path, const std::
    });
   };
   if (options.execution)
-   options.execution->run(BenchmarkStage::Metadata, {mmltk::common::math::checked_multiply(std::uint64_t{range.end - range.begin}, 64U, "Open Images class workspace overflow"), 0}, consume);
+   options.execution->run(CompileTaskKind::Metadata, {mmltk::common::math::checked_multiply(std::uint64_t{range.end - range.begin}, 64U, "Open Images class workspace overflow"), 0}, consume);
   else
    consume(0);
  }
@@ -1267,7 +1272,8 @@ void retain_normalized_image_slices(NormalizedAnnotationBuilder& index, std::spa
 }
 NormalizedAnnotationIndex parse_coco_style_annotations(
  const std::filesystem::path& json_path, std::string annotation_sha256, const std::span<const NumericCategoryMapping> mappings, const AnnotationParseOptions& options) {
- auto handles = options.input_allowance ? options.input_allowance : options.execution ? options.execution->reserve(BenchmarkResources::handles(1, false)) : BenchmarkAllowance{};
+ auto producer = options.execution ? options.execution->open_class(detail::CompileWorkClass::Annotations) : CompileExecution::Producer{};
+ auto handles = options.input_allowance ? options.input_allowance : options.execution ? options.execution->reserve(CompileResources::handles(1, false)) : CompileAllowance{};
  PaddedMappedFile file(json_path);
  constexpr std::array<std::string_view, 3> fields{"images", "annotations", "categories"};
  const CategoryLookup category_lookup = make_numeric_lookup(mappings);
@@ -1297,7 +1303,7 @@ NormalizedAnnotationIndex parse_coco_style_annotations(
  std::vector<simdjson::ondemand::parser> parsers(static_cast<std::size_t>(workers));
  std::vector<simdjson::ondemand::parser> segmentation_parsers(static_cast<std::size_t>(workers));
  std::vector<SegmentationScratch> segmentation_scratch(static_cast<std::size_t>(workers));
- std::optional<BenchmarkCompilePipeline::Workspace> parser_workspace;
+ std::optional<CompileExecution::Workspace> parser_workspace;
  if (options.execution)
   parser_workspace.emplace(*options.execution, [&](std::size_t lane) noexcept {
    segmentation_scratch[lane] = {};
@@ -1344,7 +1350,7 @@ NormalizedAnnotationIndex parse_coco_style_annotations(
     [&](int worker, simdjson::ondemand::object object, std::uint64_t) { worker_images[static_cast<std::size_t>(worker)].push_back(parse_image_object(object, options.source)); }, options.execution);
    if (complete) {
     if (options.execution)
-     options.execution->run(BenchmarkStage::Metadata, {65536, 0}, join_images);
+     options.execution->run(CompileTaskKind::Metadata, {65536, 0}, join_images);
     else
      join_images(0);
     images_complete = true;
@@ -1372,7 +1378,8 @@ NormalizedAnnotationIndex parse_coco_style_annotations(
 }
 NormalizedAnnotationIndex parse_open_images_annotations(const std::filesystem::path& boxes_csv_path, const std::filesystem::path& classes_csv_path, std::string annotation_sha256,
  const std::span<const StringCategoryMapping> mappings, const AnnotationParseOptions& options) {
- auto handles = options.input_allowance ? options.input_allowance : options.execution ? options.execution->reserve(BenchmarkResources::handles(1, false)) : BenchmarkAllowance{};
+ auto producer = options.execution ? options.execution->open_class(detail::CompileWorkClass::Annotations) : CompileExecution::Producer{};
+ auto handles = options.input_allowance ? options.input_allowance : options.execution ? options.execution->reserve(CompileResources::handles(1, false)) : CompileAllowance{};
  validate_open_images_classes(classes_csv_path, mappings, options);
  std::unordered_map<std::string_view, std::uint8_t> category_lookup;
  category_lookup.reserve(mappings.size());
@@ -1447,7 +1454,7 @@ NormalizedAnnotationIndex parse_open_images_annotations(const std::filesystem::p
   mmltk::common::math::checked_add(mmltk::common::math::checked_multiply(run_count, std::uint64_t{sizeof(ImageRun) + sizeof(std::uint64_t)}, "Open Images boundary workspace overflow"),
    std::uint64_t{65536}, "Open Images boundary workspace overflow");
  if (options.execution)
-  options.execution->run(BenchmarkStage::Metadata, {workspace, 0}, assemble);
+  options.execution->run(CompileTaskKind::Metadata, {workspace, 0}, assemble);
  else
   assemble(0);
  trace_benchmark_event(options.trace, "benchmark.annotations.indexed", [&] { return normalized_index_trace_json(result); });

@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/compile_execution.h"
 #include <atomic>
 #include <functional>
 #include <array>
@@ -19,12 +20,14 @@
 #include <vector>
 #include "src/common/concurrency/cancellation_observation.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/detail/compile_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
 #include "src/backend/data/compiled/compiled_format.h"
 namespace mmltk::backend::data::benchmark_internal {
-class BenchmarkCompilePipeline;
+using mmltk::backend::data::detail::CompileAllowance;
+
+using detail::CompileExecution;
 class StorageReservationPool;
 // Rejection of the annotation document itself, never a local execution failure.
 class AnnotationDocumentRejected final : public std::runtime_error {
@@ -189,9 +192,9 @@ struct AnnotationParseOptions {
  bool keep_images_without_mapped_boxes = false;
  mmltk::common::concurrency::CancellationObservation cancel_requested = {};
  BenchmarkTraceSink trace{};
- BenchmarkCompilePipeline* execution = nullptr;
+ CompileExecution* execution = nullptr;
  // Existing index transaction custody covers its one live input mapping.
- BenchmarkAllowance input_allowance{};
+ CompileAllowance input_allowance{};
 };
 [[nodiscard]] NormalizedAnnotationIndex parse_coco_style_annotations(
  const std::filesystem::path& json_path, std::string annotation_sha256, std::span<const NumericCategoryMapping> mappings, const AnnotationParseOptions& options);

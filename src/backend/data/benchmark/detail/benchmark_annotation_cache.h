@@ -1,5 +1,5 @@
 #pragma once
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/detail/compile_resources.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
@@ -19,21 +19,24 @@
 #include <vector>
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+
 class BenchmarkCompilePipeline;
 class StorageReservationPool;
 class ProgressReporter;
 class ArtifactProgressTotals;
 [[nodiscard]] std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequest>, BenchmarkDatasetSource, std::string_view, ProgressReporter&, ArtifactProgressTotals&, std::size_t,
- mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {},
+ mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, BenchmarkCompilePipeline* execution = nullptr, const CompileAllowance& parent = {},
  StorageReservationPool* storage = nullptr);
 [[nodiscard]] std::string extract_archive_member(const std::filesystem::path&, std::string_view, const std::filesystem::path&, std::string_view, const std::filesystem::path&,
  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, StorageReservationPool* storage = nullptr, BenchmarkCompilePipeline* execution = nullptr,
- const BenchmarkAllowance& parent = {});
+ const CompileAllowance& parent = {});
 [[nodiscard]] std::optional<NormalizedAnnotationIndex> discover_cached_index(
  const std::filesystem::path&, BenchmarkDatasetSource, std::string_view, mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&);
 [[nodiscard]] NormalizedAnnotationIndex load_or_build_index(const BenchmarkCacheLayout&, const std::filesystem::path&, BenchmarkDatasetSource, std::string_view, std::string_view,
- mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, const std::function<NormalizedAnnotationIndex(const BenchmarkAllowance&)>&, StorageReservationPool* storage = nullptr,
- BenchmarkCompilePipeline* execution = nullptr, const BenchmarkAllowance& parent = {});
+ mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, const std::function<NormalizedAnnotationIndex(const CompileAllowance&)>&, StorageReservationPool* storage = nullptr,
+ BenchmarkCompilePipeline* execution = nullptr, const CompileAllowance& parent = {});
 // Three body attempts; cancellation and local capacity failures never repair source data.
 void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservation, const std::function<void()>&, const std::function<void(const std::exception&)>&);
 enum class CocoAnnotationInputBoundary { Extracting, Parsing };
@@ -58,7 +61,7 @@ struct CocoAnnotationSplit {
 using CocoAnnotationSplitSink = std::function<void(CocoAnnotationSplit)>;
 // Holds the source lifecycle lease from independent discovery through settlement.
 // Callers may acquire other source leases after construction, before discovery.
-[[nodiscard]] BenchmarkResources coco_annotation_resources();
+[[nodiscard]] CompileResources coco_annotation_resources();
 class CocoAnnotationCache final {
 public:
  CocoAnnotationCache(const BenchmarkCacheLayout&, const CatalogArtifact&, CocoAnnotationRequest, std::uint32_t train_count, std::uint32_t validation_count, int parse_workers,
@@ -78,12 +81,12 @@ public:
  void download_unavailable(const BenchmarkDownloadUnavailable&, ProgressReporter&);
  void settle(DownloadResult, ProgressReporter&, std::size_t workers, std::uint64_t& completed, std::uint64_t total);
  [[nodiscard]] CocoAnnotationIndexes finish();
- [[nodiscard]] const BenchmarkAllowance& allowance() const noexcept { return lease_->allowance(); }
+ [[nodiscard]] const CompileAllowance& allowance() const noexcept { return lease_->allowance(); }
 
 private:
  void publish_split(bool training, bool terminal);
  void withdraw_split(bool training);
- void build_split(bool training, const std::string&, ProgressReporter&, const BenchmarkAllowance&);
+ void build_split(bool training, const std::string&, ProgressReporter&, const CompileAllowance&);
  void invalidate_missing();
  void warn_unavailable(ProgressReporter&);
  void settle_missing_splits();

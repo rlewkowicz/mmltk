@@ -1,5 +1,6 @@
+#include "src/backend/data/detail/compile_execution.h"
+#include "src/common/system/cpu_affinity.h"
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
-#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
@@ -20,6 +21,11 @@
 #include <utility>
 #include <sys/stat.h>
 namespace mmltk::backend::data::benchmark_internal {
+using detail::CompileExecution;
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileTaskKind;
+
 namespace {
 constexpr std::size_t kBlock = 128U << 10;
 constexpr std::uint64_t kGzipIndexBytes = 64ULL << 20;
@@ -114,8 +120,9 @@ struct BenchmarkArchive::Impl {
   std::optional<std::uint64_t> extent;
   bool raw = false, conflict = false;
  };
- BenchmarkCompilePipeline* execution;
- BenchmarkAllowance parent_allowance, file_allowance, decoder_allowance, credits, supplied_workspace;
+ CompileExecution* execution;
+ CompileExecution::Producer producer;
+ CompileAllowance parent_allowance, file_allowance, decoder_allowance, credits, supplied_workspace;
  mmltk::common::io::FileHandle file;
  std::unique_ptr<rapidgzip::ParallelGzipReader<ArchiveChunk>> gzip;
  std::unique_ptr<rapidgzip::IsalInflateWrapper> streaming;
@@ -138,11 +145,12 @@ struct BenchmarkArchive::Impl {
  std::size_t consumer_descriptors = 0;
  std::uint64_t workspace_bytes = 0;
  Position current;
- Impl(const std::filesystem::path& path, BenchmarkCompilePipeline* owner, std::uint64_t workspace, const BenchmarkAllowance& parent, std::size_t workers, bool verify_gzip_crc,
-  BenchmarkAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t dependent_descriptors, std::size_t gzip_index_entries)
+ Impl(const std::filesystem::path& path, CompileExecution* owner, std::uint64_t workspace, const CompileAllowance& parent, std::size_t workers, bool verify_gzip_crc,
+  CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t dependent_descriptors, std::size_t gzip_index_entries)
      : execution(owner),
+       producer(owner ? owner->open_class(detail::CompileWorkClass::Extraction) : CompileExecution::Producer{}),
        parent_allowance(parent),
-       file_allowance(owner ? owner->reserve(BenchmarkResources::handles(1), parent) : BenchmarkAllowance{}),
+       file_allowance(owner ? owner->reserve(CompileResources::handles(1), parent) : CompileAllowance{}),
        supplied_workspace(std::move(workspace_allowance)),
        file(mmltk::common::io::FileHandle::open_readonly(path.string())) {
   struct stat status{};
@@ -209,15 +217,15 @@ struct BenchmarkArchive::Impl {
    }
   }
   block.resize(kBlock);
-  if (compressed) reset_decoder();
-  cpu([&] { open(0); });
+  if (compressed && execution && !decoder_allowance) decoder_allowance = execution->reserve(CompileResources::handles(1), parent_allowance);
+  cpu([&] { if (compressed) reset_decoder(); open(0); });
  }
  void reset_decoder() {
   // Retire worker, cache, dictionary and compressed-reader backing before
   // constructing a replacement under the same allowance.
   gzip.reset();
   streaming.reset();
-  if (execution && !decoder_allowance) decoder_allowance = execution->reserve(BenchmarkResources::handles(1), parent_allowance);
+  if (execution && !decoder_allowance) decoder_allowance = execution->reserve(CompileResources::handles(1), parent_allowance);
   if (streaming_mode) {
    streaming = std::make_unique<rapidgzip::IsalInflateWrapper>(rapidgzip::gzip::BitReader(std::make_unique<rapidgzip::StandardFileReader>(file.get())));
    streaming->setFileType(rapidgzip::FileType::GZIP);
@@ -365,9 +373,17 @@ struct BenchmarkArchive::Impl {
  }
  void cpu(const std::function<void()>& work) const {
   if (execution && !external_cpus)
-   execution->run(BenchmarkStage::Archive, {}, [&](std::size_t) { work(); }, credits);
-  else
-   work();
+   execution->run(CompileTaskKind::Archive, {}, [&](std::size_t) { work(); }, credits);
+  else if (external_cpus) {
+   // Native decoder workers inherit exactly the elastic CPUs held by this
+   // allowance. Restore each caller's affinity across shared reader handoffs.
+   const auto previous = mmltk::common::system::allowed_cpu_set();
+   const auto granted = credits.cpus();
+   mmltk::common::system::set_thread_affinity(std::vector<int>(granted.begin(), granted.end()));
+   try { work(); }
+   catch (...) { mmltk::common::system::set_thread_affinity(previous); throw; }
+   mmltk::common::system::set_thread_affinity(previous);
+  } else work();
  }
 };
 BenchmarkArchive::InputRequirement BenchmarkArchive::input_requirement(const std::filesystem::path& path, std::uint64_t workspace, std::size_t workers) {
@@ -375,8 +391,8 @@ BenchmarkArchive::InputRequirement BenchmarkArchive::input_requirement(const std
  const bool compressed = gzip_magic(file, file.size());
  return {archive_workspace(compressed, std::max<std::size_t>(1, workers), workspace), compressed ? 2U : 1U};
 }
-BenchmarkArchive::BenchmarkArchive(const std::filesystem::path& path, BenchmarkCompilePipeline* execution, std::uint64_t workspace, const BenchmarkAllowance& parent, std::size_t workers,
- bool verify_gzip_crc, BenchmarkAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t consumer_descriptors, std::size_t gzip_index_entries)
+BenchmarkArchive::BenchmarkArchive(const std::filesystem::path& path, CompileExecution* execution, std::uint64_t workspace, const CompileAllowance& parent, std::size_t workers,
+ bool verify_gzip_crc, CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t consumer_descriptors, std::size_t gzip_index_entries)
     : impl_(std::make_unique<Impl>(path, execution, workspace, parent, workers, verify_gzip_crc, std::move(workspace_allowance), retained_gzip_windows, consumer_descriptors, gzip_index_entries)) {}
 BenchmarkArchive::~BenchmarkArchive() = default;
 bool BenchmarkArchive::next(Cancellation cancellation) {
@@ -618,8 +634,9 @@ void BenchmarkArchive::pause() {
  if (s.owns_workspace) s.credits.retire_workspace();
  s.credits = {};
  s.supplied_workspace = {};
+ s.external_cpus = false;
 }
-void BenchmarkArchive::resume(std::uint64_t workspace, const BenchmarkAllowance& parent, std::size_t consumer_descriptors) {
+void BenchmarkArchive::resume(std::uint64_t workspace, const CompileAllowance& parent, std::size_t consumer_descriptors) {
  if (impl_->reader) throw std::logic_error("archive continuation handoff requires a paused reader");
  impl_->parent_allowance = parent;
  impl_->consumer_descriptors = consumer_descriptors;
@@ -654,6 +671,6 @@ std::uint64_t BenchmarkArchive::retained_workspace_bytes() const {
  return checked_add(
   state.reader ? archive_workspace(state.compressed, state.decoders, 0) : std::uint64_t{0}, static_cast<std::uint64_t>(state.bytes.capacity()), "archive retained workspace overflow");
 }
-BenchmarkAllowance BenchmarkArchive::allowance() const { return impl_->credits; }
+CompileAllowance BenchmarkArchive::allowance() const { return impl_->credits; }
 void BenchmarkArchive::cpu(const std::function<void()>& work) const { impl_->cpu(work); }
 }  // namespace mmltk::backend::data::benchmark_internal

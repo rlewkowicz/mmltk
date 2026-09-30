@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <unistd.h>
@@ -10,6 +11,8 @@
 #include <utility>
 #include <stdexcept>
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileTaskKind;
+
 namespace common_io = mmltk::common::io;
 BenchmarkStagedArtifact BenchmarkStagedArtifact::create(
  StorageReservationPool& destination, const std::filesystem::path& path, std::uint64_t promised, std::string_view description, std::string_view suffix, mode_t mode, int directory) {

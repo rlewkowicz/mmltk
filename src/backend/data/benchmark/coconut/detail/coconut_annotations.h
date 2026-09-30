@@ -1,6 +1,7 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/detail/compile_resources.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
@@ -26,6 +27,8 @@
 #include <utility>
 #include <memory>
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileAllowance;
+
 class BenchmarkCompilePipeline;
 class StorageReservationPool;
 class CoconutMaskRecovery;
@@ -181,7 +184,7 @@ private:
 };
 struct CoconutAnnotationInput {
  std::span<const std::uint8_t> png;
- BenchmarkAllowance allowance;
+ CompileAllowance allowance;
  // Keeps the Arrow batch and its complete pool alive, including after the
  // forward reader closes. Production retains only the current bounded batch.
  std::shared_ptr<const void> backing;
@@ -195,10 +198,10 @@ struct CoconutAnnotationInput {
 // reusable scratch with its input grant; input retirement releases that backing.
 using CoconutRecordConsumer = std::function<void(std::size_t group, const CoconutRecord&, const CoconutAnnotationInput&)>;
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only = false, BenchmarkCompilePipeline* execution = nullptr, const std::function<void(std::size_t)>& finish_consumer_group = {},
- const BenchmarkAllowance& parent = {}, CoconutAnnotationRecords* retained = nullptr, const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace = {},
- const std::function<void(const BenchmarkAllowance&)>& retire_consumer_input = {}, const std::function<void(const std::function<void()>&)>& settle_consumer = {},
- const std::function<bool(const CoconutRecord&, const BenchmarkAllowance&)>& reusable_native = {});
+ const CoconutRecordConsumer& consumer, bool metadata_only = false, detail::CompileExecution* execution = nullptr, const std::function<void(std::size_t)>& finish_consumer_group = {},
+ const CompileAllowance& parent = {}, CoconutAnnotationRecords* retained = nullptr, const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace = {},
+ const std::function<void(const CompileAllowance&)>& retire_consumer_input = {}, const std::function<void(const std::function<void()>&)>& settle_consumer = {},
+ const std::function<bool(const CoconutRecord&, const CompileAllowance&)>& reusable_native = {});
 class CoconutOriginalChanged final : public std::runtime_error {
 public:
  explicit CoconutOriginalChanged(CoconutImageNamespace source) : std::runtime_error("COCONut original annotation generation changed"), source_(source) {}
@@ -216,7 +219,7 @@ using CoconutOriginalProvider = std::function<CoconutOriginalInput(CoconutImageN
 enum class CoconutPreparationStage : std::uint8_t { Archive, Images, Annotations, Membership };
 struct CoconutImportRequest {
  BenchmarkCompilePipeline* execution = nullptr;
- BenchmarkAllowance parent_allowance;
+ CompileAllowance parent_allowance;
  CoconutEdition edition = CoconutEdition::Base;
  std::string input_identity;
  bool metadata_only = false;

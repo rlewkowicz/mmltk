@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <simdjson.h>
@@ -10,7 +11,7 @@
 #include <string_view>
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
-class BenchmarkCompilePipeline;
+using detail::CompileExecution;
 struct ByteRange {
  std::size_t begin = 0, end = 0;
 };
@@ -36,6 +37,6 @@ private:
 // Array completion may carry an empty batch. It always runs outside scan CPU
 // custody; consumers retain ranges only for unresolved semantic dependencies.
 void discover_json_arrays(const PaddedMappedFile&, std::span<const std::string_view>, bool reject_duplicates, const std::function<void(std::size_t, std::span<const ByteRange>, bool complete)>&,
- mmltk::common::concurrency::CancellationObservation = {}, BenchmarkCompilePipeline* = nullptr, const std::function<void(const std::function<void()>&)>& metadata_work = {});
+ mmltk::common::concurrency::CancellationObservation = {}, CompileExecution* = nullptr, const std::function<void(const std::function<void()>&)>& metadata_work = {});
 [[noreturn]] void reject_json_document(const simdjson::simdjson_error&);
 }  // namespace mmltk::backend::data::benchmark_internal

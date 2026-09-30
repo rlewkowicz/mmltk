@@ -1,7 +1,8 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/detail/compile_resources.h"
 #include <atomic>
 #include <cstdint>
 #include <cstddef>
@@ -21,6 +22,9 @@
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileTaskKind;
+
 class BenchmarkCompilePipeline;
 struct BenchmarkLabelChunk;
 struct CachedImageSource {
@@ -93,8 +97,8 @@ public:
  void prepare_lanes(std::size_t);
  void retire_scratch(std::size_t) noexcept;
  [[nodiscard]] std::shared_ptr<BenchmarkPixelInput> prepare_pixel(
-  std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication = {}, BenchmarkAllowance allowance = {}, std::shared_ptr<const BenchmarkEncodedImage> payload = {});
- [[nodiscard]] BenchmarkAllowance pixel_input_allowance(const BenchmarkPixelInput&) const;
+  std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication = {}, CompileAllowance allowance = {}, std::shared_ptr<const BenchmarkEncodedImage> payload = {});
+ [[nodiscard]] CompileAllowance pixel_input_allowance(const BenchmarkPixelInput&) const;
  [[nodiscard]] std::uint64_t pixel_workspace_bytes(const BenchmarkPixelInput&) const;
  [[nodiscard]] std::uint64_t pixel_workspace_bytes(const BenchmarkImageHeader&, std::size_t encoded_bytes) const;
  void write_pixel(std::size_t slot, std::size_t lane, const std::shared_ptr<BenchmarkPixelInput>&);

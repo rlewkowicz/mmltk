@@ -1,8 +1,8 @@
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_parquet.h"
 #include "src/common/types/utf8.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
-#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <arrow/api.h>
 #include "src/common/concurrency/parallel_range.h"
@@ -15,6 +15,11 @@
 #include <tuple>
 #include "src/pch_std.h"
 namespace mmltk::backend::data::benchmark_internal {
+using detail::CompileExecution;
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileTaskKind;
+
 namespace {
 class ParquetFormatError final : public std::runtime_error {
 public:
@@ -343,8 +348,8 @@ public:
  [[nodiscard]] bool full() const noexcept { return mode_ == Mode::Full; }
  [[nodiscard]] bool needs_metadata() const noexcept { return !metadata_ready_; }
  [[nodiscard]] bool reads_projection() const noexcept { return mode_ != Mode::WarmMetadata; }
- [[nodiscard]] BenchmarkResources discovery_demand() const { return {kParquetPoolBytes, 1}; }
- [[nodiscard]] BenchmarkResources demand(std::uint64_t workspace, bool projection) const {
+ [[nodiscard]] CompileResources discovery_demand() const { return {kParquetPoolBytes, 1}; }
+ [[nodiscard]] CompileResources demand(std::uint64_t workspace, bool projection) const {
   using mmltk::common::math::checked_add;
   return {checked_add(projection ? kParquetPoolBytes : 0, workspace, "COCONut Parquet allowance overflow"), projection ? 2U : 0U};
  }
@@ -357,8 +362,8 @@ class ParquetPool final : public arrow::MemoryPool {
  arrow::CappedMemoryPool capped_{&tracked_, kParquetPoolBytes};
 
 public:
- BenchmarkAllowance allowance;
- explicit ParquetPool(BenchmarkAllowance value) : allowance(std::move(value)) {}
+ CompileAllowance allowance;
+ explicit ParquetPool(CompileAllowance value) : allowance(std::move(value)) {}
  arrow::Status Allocate(std::int64_t size, std::int64_t alignment, std::uint8_t** out) override {
   const std::lock_guard lock(mutex_);
   return capped_.Allocate(size, alignment, out);
@@ -398,7 +403,7 @@ struct ParquetBatch {
  std::shared_ptr<arrow::RecordBatch> batch;
 };
 struct ParquetReaderDescriptors {
- const BenchmarkAllowance& allowance;
+ const CompileAllowance& allowance;
  ~ParquetReaderDescriptors() { allowance.retire_descriptors(); }
 };
 }  // namespace
@@ -437,9 +442,10 @@ void CoconutAnnotationRecords::rebase_parquet_segments() {
  prefixes_sealed_ = true;
 }
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only, BenchmarkCompilePipeline* execution, const std::function<void(std::size_t)>& finish_consumer_group, const BenchmarkAllowance& parent,
- CoconutAnnotationRecords* retained, const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace, const std::function<void(const BenchmarkAllowance&)>& retire_consumer_input,
- const std::function<void(const std::function<void()>&)>& settle_consumer, const std::function<bool(const CoconutRecord&, const BenchmarkAllowance&)>& reusable_native) {
+ const CoconutRecordConsumer& consumer, bool metadata_only, CompileExecution* execution, const std::function<void(std::size_t)>& finish_consumer_group, const CompileAllowance& parent,
+ CoconutAnnotationRecords* retained, const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace, const std::function<void(const CompileAllowance&)>& retire_consumer_input,
+ const std::function<void(const std::function<void()>&)>& settle_consumer, const std::function<bool(const CoconutRecord&, const CompileAllowance&)>& reusable_native) {
+ auto producer = execution ? execution->open_class(detail::CompileWorkClass::Extraction) : CompileExecution::Producer{};
  using mmltk::common::math::checked_add;
  using mmltk::common::math::checked_multiply;
  CoconutAnnotationRecords local;
@@ -453,7 +459,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
   decltype(retained->groups) discovered_groups;
   for (const auto& path : shards) {
    throw_if_benchmark_cancelled(cancellation);
-   auto allowance = execution ? execution->reserve(envelope.discovery_demand(), parent) : BenchmarkAllowance{};
+   auto allowance = execution ? execution->reserve(envelope.discovery_demand(), parent) : CompileAllowance{};
    auto pool = std::make_shared<ParquetPool>(allowance);
    // Declared before reader/batches: all library readers close before this
    // guard returns descriptors, including cancellation and consumer throws.
@@ -476,7 +482,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
     } catch (const ParquetFormatError& error) { throw CoconutInputError("COCONut Parquet " + path.string() + ": " + error.what()); }
    };
    if (execution)
-    execution->run(BenchmarkStage::Metadata, {}, discover, allowance);
+    execution->run(CompileTaskKind::Metadata, {}, discover, allowance);
    else
     discover(0);
    reader.reset();
@@ -484,7 +490,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    // keeps its pool and its exact charged remainder after the reader closes.
    if (allowance) {
     const auto held = static_cast<std::uint64_t>(pool->bytes_allocated());
-    auto backing = held ? allowance.split_storage(held) : BenchmarkAllowance{};
+    auto backing = held ? allowance.split_storage(held) : CompileAllowance{};
     allowance.retire_descriptors();
     allowance.retire_workspace();
     pool->allowance = std::move(backing);
@@ -504,12 +510,12 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
  // Each existing parallel range owns one forward Arrow/physical continuation.
  // Groups still publish independently; only their current batch is transient.
  struct Sequence {
-  BenchmarkCompilePipeline* execution;
-  const BenchmarkAllowance& parent;
-  const std::function<void(const BenchmarkAllowance&)>& retire_input;
+  CompileExecution* execution;
+  const CompileAllowance& parent;
+  const std::function<void(const CompileAllowance&)>& retire_input;
   const ParquetCallEnvelope& envelope;
   bool active = false, projection = false;
-  BenchmarkAllowance allowance{};
+  CompileAllowance allowance{};
   std::shared_ptr<ParquetPool> pool{};
   std::unique_ptr<parquet::arrow::FileReader> reader{};
   std::size_t shard = SIZE_MAX;
@@ -517,7 +523,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    reader.reset();
    if (pool && allowance) {
     const auto held = static_cast<std::uint64_t>(pool->bytes_allocated());
-    pool->allowance = held ? allowance.split_storage(held) : BenchmarkAllowance{};
+    pool->allowance = held ? allowance.split_storage(held) : CompileAllowance{};
    }
    pool.reset();
    shard = SIZE_MAX;
@@ -528,7 +534,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    if (allowance && retire_input) retire_input(allowance);
    if (allowance) {
     const auto held = pool ? static_cast<std::uint64_t>(pool->bytes_allocated()) : 0;
-    auto backing = held ? allowance.split_storage(held) : BenchmarkAllowance{};
+    auto backing = held ? allowance.split_storage(held) : CompileAllowance{};
     allowance.retire_descriptors();
     allowance.retire_workspace();
     if (pool) pool->allowance = std::move(backing);
@@ -557,7 +563,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    // and release their actual dependents before complete reacquisition. The
    // typed row and group cursor survive; no Parquet prefix is skipped/reparsed.
    close();
-   allowance = execution ? execution->reserve(demand, parent) : BenchmarkAllowance{};
+   allowance = execution ? execution->reserve(demand, parent) : CompileAllowance{};
    projection = needs_projection;
    if (projection) pool = std::make_shared<ParquetPool>(allowance);
    active = true;
@@ -631,7 +637,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
     } retire{finish_consumer_group, group_index};
     const auto cpu = [&](const std::function<void()>& work) {
      if (execution)
-      execution->run(image_pass ? BenchmarkStage::Metadata : BenchmarkStage::Normalize, {}, [&](std::size_t) { work(); }, allowance);
+      execution->run(image_pass ? CompileTaskKind::Metadata : CompileTaskKind::Normalize, {}, [&](std::size_t) { work(); }, allowance);
      else
       work();
     };
@@ -703,7 +709,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
  if (envelope.full()) {
   const auto rebase = [&](std::size_t) { retained->rebase_parquet_segments(); };
   if (execution)
-   execution->run(BenchmarkStage::Metadata, {}, rebase);
+   execution->run(CompileTaskKind::Metadata, {}, rebase);
   else
    rebase(0);
  }

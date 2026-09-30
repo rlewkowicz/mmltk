@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/compile_execution.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -8,7 +9,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
-class BenchmarkCompilePipeline;
+using detail::CompileExecution;
 inline constexpr std::string_view kSupplementalSamplingRevision = "coco80-adaptive-objects-heavy-v2";
 inline constexpr std::uint32_t kSupplementalBudgetDenominator = 6U;
 inline constexpr std::uint32_t kOpenImagesDiversityDenominator = 24U;
@@ -36,5 +37,5 @@ struct CombinedSupplementalSamplingResult {
 };
 [[nodiscard]] CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const NormalizedAnnotationIndex& coco_train, const NormalizedAnnotationIndex& objects365,
  const NormalizedAnnotationIndex& open_images, std::span<const std::uint64_t> objects365_shard_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested = {},
- BenchmarkCompilePipeline* execution = nullptr);
+ CompileExecution* execution = nullptr);
 }  // namespace mmltk::backend::data::benchmark_internal

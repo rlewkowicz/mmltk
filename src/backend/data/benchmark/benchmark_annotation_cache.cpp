@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/compile_execution.h"
 #include <system_error>
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotation_cache.h"
@@ -15,6 +16,11 @@
 #include <mutex>
 #include "src/pch_std.h"
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::InsufficientCompileResources;
+using mmltk::backend::data::detail::CompileTaskKind;
+
 namespace common_io = mmltk::common::io;
 namespace common_math = mmltk::common::math;
 namespace {
@@ -33,13 +39,13 @@ struct AnnotationMember {
  std::optional<std::uint64_t> encountered{};
 };
 void extract_annotation_members(const DownloadResult& archive, std::span<AnnotationMember> members, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
- StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, const std::function<void(std::size_t, const BenchmarkAllowance&)>& ready) {
+ StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const CompileAllowance& parent, const std::function<void(std::size_t, const CompileAllowance&)>& ready) {
  // Keep the stream/output continuation available while independently ready
  // JSON parsers acquire their own index handles and scratch. Warm callbacks
  // cannot consume the descriptor pair needed by the still-missing sibling.
- auto stream_handles = execution ? execution->reserve(BenchmarkResources::handles(1, true, 2), parent) : BenchmarkAllowance{};
+ auto stream_handles = execution ? execution->execution().reserve(CompileResources::handles(1, true, 2), parent) : CompileAllowance{};
  std::size_t remaining = members.size();
- const auto complete = [&](std::size_t index, const BenchmarkAllowance& input) {
+ const auto complete = [&](std::size_t index, const CompileAllowance& input) {
   --remaining;
   try {
    if (ready && !members[index].failure) ready(index, input);
@@ -60,7 +66,7 @@ void extract_annotation_members(const DownloadResult& archive, std::span<Annotat
   if (!member.identity.empty()) complete(i, parent);
  }
  if (!remaining) return;
- BenchmarkArchive reader(archive.path, execution, 0, stream_handles);
+ BenchmarkArchive reader(archive.path, (execution ? &execution->execution() : nullptr), 0, stream_handles);
  while (remaining && reader.next(cancellation)) {
   const auto found = std::ranges::find_if(members, [&](const auto& member) { return reader.member().ends_with(member.suffix); });
   if (found == members.end()) continue;
@@ -117,8 +123,8 @@ void extract_annotation_members(const DownloadResult& archive, std::span<Annotat
 }  // namespace
 std::string extract_archive_member(const std::filesystem::path& archive_path, std::string_view suffix, const std::filesystem::path& output_path, std::string_view identity,
  const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, StorageReservationPool* storage,
- BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
- auto lease = ArtifactLease::acquire_charged(lock_path, cancellation, execution, BenchmarkResources::handles(1, true, 3), parent);
+ BenchmarkCompilePipeline* execution, const CompileAllowance& parent) {
+ auto lease = ArtifactLease::acquire_charged(lock_path, cancellation, (execution ? &execution->execution() : nullptr), CompileResources::handles(1, true, 3), parent);
  AnnotationMember member{std::string(suffix), output_path};
  DownloadResult archive;
  archive.path = archive_path;
@@ -145,9 +151,9 @@ std::string extract_archive_member(const std::filesystem::path& archive_path, st
 }
 [[nodiscard]] NormalizedAnnotationIndex load_or_build_index(const BenchmarkCacheLayout& cache, const std::filesystem::path& path, const BenchmarkDatasetSource source, const std::string_view split,
  const std::string_view annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace,
- const std::function<NormalizedAnnotationIndex(const BenchmarkAllowance&)>& builder, StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
+ const std::function<NormalizedAnnotationIndex(const CompileAllowance&)>& builder, StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const CompileAllowance& parent) {
  auto lease = ArtifactLease::acquire_charged(
-  cache.locks / (std::string(benchmark_source_name(source)) + "-" + std::string(split) + ".index.lock"), cancel_requested, execution, BenchmarkResources::handles(2), parent);
+  cache.locks / (std::string(benchmark_source_name(source)) + "-" + std::string(split) + ".index.lock"), cancel_requested, (execution ? &execution->execution() : nullptr), CompileResources::handles(2), parent);
  if (auto cached = load_normalized_annotation_index(path, source, split, annotation_sha256, cancel_requested, trace)) { return std::move(*cached); }
  NormalizedAnnotationIndex index = builder(lease->allowance());
  index.completion = store_normalized_annotation_index(path, index, cancel_requested, trace, storage);
@@ -160,7 +166,7 @@ void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservati
   try {
    body();
    break;
-  } catch (const InsufficientBenchmarkResources&) { throw; } catch (const InsufficientBenchmarkStorage&) {
+  } catch (const InsufficientCompileResources&) { throw; } catch (const InsufficientBenchmarkStorage&) {
    throw;
   } catch (const std::exception& error) {
    throw_if_benchmark_cancelled(cancel_requested);
@@ -172,7 +178,7 @@ void retry_annotation_indexing(mmltk::common::concurrency::CancellationObservati
 }
 std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequest> requests, BenchmarkDatasetSource source, std::string_view reason, ProgressReporter& progress,
  ArtifactProgressTotals& totals, std::size_t workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution,
- const BenchmarkAllowance& parent, StorageReservationPool* storage) {
+ const CompileAllowance& parent, StorageReservationPool* storage) {
  for (auto& request : requests) {
   if (trace) try {
     if (std::filesystem::is_regular_file(request.destination)) {
@@ -188,7 +194,7 @@ std::vector<DownloadResult> repair_annotation_artifacts(std::vector<DownloadRequ
   progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals.update(update, progress); }} : DownloadProgressSink{}, trace, {}, execution, parent,
   storage);
 }
-BenchmarkResources coco_annotation_resources() { return BenchmarkResources::handles(1, true, 3); }
+CompileResources coco_annotation_resources() { return CompileResources::handles(1, true, 3); }
 CocoAnnotationCache::CocoAnnotationCache(const BenchmarkCacheLayout& cache, const CatalogArtifact& artifact, CocoAnnotationRequest selection, std::uint32_t train_count, std::uint32_t validation_count,
  int parse_workers, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace, BenchmarkCompilePipeline* execution, StorageReservationPool* storage,
  std::shared_ptr<ArtifactLease> custody)
@@ -201,7 +207,7 @@ CocoAnnotationCache::CocoAnnotationCache(const BenchmarkCacheLayout& cache, cons
       cancellation_(cancellation),
       trace_(trace),
       source_transport_(execution ? execution->curl().channel(BenchmarkCurl::Class::Artifact, cancellation, coco_annotation_resources()) : nullptr),
-      lease_(custody ? std::move(custody) : ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", cancellation, execution, coco_annotation_resources())),
+      lease_(custody ? std::move(custody) : ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources())),
       execution_(execution),
       storage_(execution ? &execution->storage() : storage) {
  indexes_.train_path = cache.source_indexes("coco") / "train2017.normalized.bin";
@@ -226,8 +232,8 @@ void CocoAnnotationCache::discover(ProgressReporter& progress) {
     index = discover_cached_index(training ? indexes_.train_path : indexes_.validation_path, BenchmarkDatasetSource::kCoco2017, training ? "train2017" : "val2017", cancellation_, trace_);
    };
    if (execution_) {
-    auto input = execution_->reserve(BenchmarkResources::handles(1), lease_->allowance());
-    execution_->run(BenchmarkStage::Metadata, {}, read, input);
+    auto input = execution_->execution().reserve(CompileResources::handles(1), lease_->allowance());
+    execution_->execution().run(CompileTaskKind::Metadata, {}, read, input);
    } else
     read(0);
    if (index) publish_split(training, true);
@@ -251,7 +257,7 @@ std::uint64_t CocoAnnotationCache::completed_indexes() const noexcept { return s
 std::filesystem::path CocoAnnotationCache::source_json(bool training) const {
  return cache_.source_indexes("coco") / "source-json" / (training ? "instances_train2017.json" : "instances_val2017.json");
 }
-void CocoAnnotationCache::build_split(bool training, const std::string& digest, ProgressReporter& progress, const BenchmarkAllowance& input) {
+void CocoAnnotationCache::build_split(bool training, const std::string& digest, ProgressReporter& progress, const CompileAllowance& input) {
  auto& index = training ? indexes_.train : indexes_.validation;
  if (index) return;
  const std::string split = training ? "train2017" : "val2017";
@@ -259,12 +265,12 @@ void CocoAnnotationCache::build_split(bool training, const std::string& digest, 
  const auto json_path = source_json(training);
  std::filesystem::create_directories(json_path.parent_path());
  index = load_or_build_index(
-  cache_, training ? indexes_.train_path : indexes_.validation_path, BenchmarkDatasetSource::kCoco2017, split, digest, cancellation_, trace_, [&](const BenchmarkAllowance& input_allowance) {
+  cache_, training ? indexes_.train_path : indexes_.validation_path, BenchmarkDatasetSource::kCoco2017, split, digest, cancellation_, trace_, [&](const CompileAllowance& input_allowance) {
   progress.source_activity(BenchmarkDatasetSource::kCoco2017, "Parsing and indexing COCO " + label + " annotations");
   if (input_observer_) input_observer_(training, CocoAnnotationInputBoundary::Parsing);
   try {
    return parse_coco_style_annotations(json_path, digest, coco_category_mappings(),
-    AnnotationParseOptions{BenchmarkDatasetSource::kCoco2017, split, training ? train_count_ : validation_count_, parse_workers_, !training, cancellation_, trace_, execution_, input_allowance});
+    AnnotationParseOptions{BenchmarkDatasetSource::kCoco2017, split, training ? train_count_ : validation_count_, parse_workers_, !training, cancellation_, trace_, execution_ ? &execution_->execution() : nullptr, input_allowance});
   } catch (const AnnotationDocumentRejected& error) {
    throw_if_benchmark_cancelled(cancellation_);
    throw AnnotationSourceUnavailable(error.what());
@@ -302,7 +308,7 @@ void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progr
     progress.source_activity(BenchmarkDatasetSource::kCoco2017, std::string("Extracting COCO ") + (train ? "train" : "validation") + " annotations");
     if (input_observer_) input_observer_(train, CocoAnnotationInputBoundary::Extracting);
    }
-   extract_annotation_members(archive, members, cancellation_, trace_, storage_, execution_, lease_->allowance(), [&](std::size_t i, const BenchmarkAllowance& input) {
+   extract_annotation_members(archive, members, cancellation_, trace_, storage_, execution_, lease_->allowance(), [&](std::size_t i, const CompileAllowance& input) {
     const bool train = training[i];
     const auto identity = members[i].identity;
     parsers[i] = std::async(std::launch::async, [&, train, identity, input] {

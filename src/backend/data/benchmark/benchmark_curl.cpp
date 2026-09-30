@@ -1,6 +1,7 @@
+#include "src/common/system/cpu_affinity.h"
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include "src/common/math/checked_arithmetic.h"
-#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include <cerrno>
 #include <list>
@@ -14,6 +15,32 @@
 #include <thread>
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
+CompileResources BenchmarkTransferEnvelope::demand(std::size_t count) const {
+ using mmltk::common::math::checked_add;
+ using mmltk::common::math::checked_multiply;
+ return {
+  checked_add(fixed.bytes, checked_multiply(per_transfer.bytes, static_cast<std::uint64_t>(count), "benchmark transfer workspace overflow"), "benchmark transfer workspace overflow"),
+  checked_add(fixed.descriptors, checked_multiply(per_transfer.descriptors, count, "benchmark transfer descriptor overflow"), "benchmark transfer descriptor overflow"), true
+ };
+}
+std::pair<std::size_t, CompileAllowance> reserve_benchmark_transfers(detail::CompileExecution& execution, std::size_t requested, BenchmarkTransferEnvelope envelope, const CompileAllowance& parent) {
+ if (!requested || !envelope.per_transfer.descriptors) throw std::invalid_argument("benchmark transfer admission requires positive concurrency and descriptor demand");
+ execution.require_feasible(envelope.demand(1));
+ for (;;) {
+  const auto observed = execution.admission_generation();
+  for (auto count = requested; count; --count) if (auto allowance = execution.try_reserve(envelope.demand(count), parent)) return {count, std::move(*allowance)};
+  auto wait = execution.defer_resources();
+  execution.wait_for_admission_change(observed);
+ }
+}
+
+using detail::CompileExecution;
+using detail::CompileWorkClass;
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileResourceWait;
+using mmltk::backend::data::detail::InsufficientCompileResources;
+
 namespace {
 constexpr std::size_t kCurlWakeDescriptors = 2, kCurlRequestDescriptors = 1;
 // Ubuntu 24.04's Curl 8.5 TCP Happy Eyeballs owner has two family candidates
@@ -63,7 +90,7 @@ BenchmarkTransferEnvelope benchmark_curl_envelope(std::size_t leases, std::uint6
   {checked_add(std::uint64_t{256U << 10}, payload_bytes, "benchmark Curl workspace overflow"), kCurlNativeSocketCandidates + kCurlRequestDescriptors, true}
  };
 }
-BenchmarkResources benchmark_curl_input_resources(std::uint64_t payload_bytes) {
+CompileResources benchmark_curl_input_resources(std::uint64_t payload_bytes) {
  auto demand = benchmark_curl_envelope(0, 0, payload_bytes).per_transfer;
  // One resolver/header/cache descriptor is reused serially by an image slot.
  // Actual physical sockets and ordinary partial/publication files have owners.
@@ -76,26 +103,28 @@ void CurlMultiDestroy::operator()(CURLM* const handle) const noexcept { curl_mul
 void CurlHeadersDestroy::operator()(curl_slist* const headers) const noexcept { curl_slist_free_all(headers); }
 }  // namespace mmltk::backend::data::benchmark_internal
 namespace mmltk::backend::data::benchmark_internal {
+using detail::CompileExecution;
+using detail::CompileWorkClass;
 struct BenchmarkCurl::Channel::State {
  Class kind;
- BenchmarkResources source;
+ CompileResources source;
  std::size_t descriptor_ceiling = 0;
  bool registered = true, ready = false;
  std::deque<Completed> completed;
  std::size_t outstanding = 0;
  std::uint64_t generation = 0, observed = 0, admission_observed = 0;
  std::exception_ptr failure;
- State(Class value, BenchmarkResources demand) : kind(value), source(demand) {}
+ State(Class value, CompileResources demand) : kind(value), source(demand) {}
 };
 struct BenchmarkCurl::Impl {
  struct Request {
   CURL* handle;
   std::shared_ptr<Channel::State> channel;
-  BenchmarkAllowance work;
+  CompileAllowance work;
   Impl* owner;
   std::exception_ptr socket_failure;
   bool extra_range = false;
-  std::unique_ptr<BenchmarkResourceWait> deferred;
+  std::unique_ptr<CompileResourceWait> deferred;
  };
  using Queue = std::list<std::unique_ptr<Request>>;
  struct Removal {
@@ -105,11 +134,11 @@ struct BenchmarkCurl::Impl {
   Removal* next = nullptr;
  };
  struct Socket {
-  BenchmarkAllowance allowance;
+  CompileAllowance allowance;
   curl_socket_t descriptor = CURL_SOCKET_BAD;
   bool fixed_child = false;
  };
- BenchmarkCompilePipeline* execution;
+ CompileExecution* execution;
  // The public mutex protects commands and channel observations only. Curl and
  // nonblocking ledger operations run on the worker without this mutex, so a
  // credit-return wake never reverses the ledger/transport lock order.
@@ -125,7 +154,7 @@ struct BenchmarkCurl::Impl {
  std::exception_ptr failure;
  CURLM* wake_handle = nullptr;
  CurlMulti multi;
- BenchmarkAllowance fixed, socket_commitment;
+ CompileAllowance fixed, socket_commitment;
  struct ClassState {
   Queue pending;
   std::size_t active = 0, limit = 0;
@@ -151,7 +180,9 @@ struct BenchmarkCurl::Impl {
  bool socket_closed = false;
  std::size_t cursor = 0;
  std::jthread worker;
- explicit Impl(std::size_t cpus, BenchmarkCompilePipeline* pipeline) : execution(pipeline) {
+ std::optional<CompileExecution::Producer> acquisition;
+ std::unique_ptr<CompileExecution::Readiness> readiness;
+ explicit Impl(std::size_t cpus, CompileExecution* pipeline) : execution(pipeline) {
   cpus = std::max<std::size_t>(1, cpus);
   static_assert(std::ranges::all_of(kBenchmarkCurlClasses,
                  [](const auto& entry) {
@@ -167,6 +198,12 @@ struct BenchmarkCurl::Impl {
   }
   ensure_curl_global_initialized("cannot initialize benchmark Curl: ");
   require_supported_curl();
+  if (execution) readiness = std::make_unique<CompileExecution::Readiness>(*execution, [this, prior = CompileResources{}]() mutable {
+   const auto now = execution->resource_usage();
+   if (now.bytes == prior.bytes && now.descriptors == prior.descriptors && now.continuation_descriptors == prior.continuation_descriptors) return;
+   prior = now;
+   const std::lock_guard lock(mutex); notify_readers_locked(); wake_locked();
+  });
   worker = std::jthread([this] { run(); });
  }
  ~Impl() {
@@ -176,6 +213,7 @@ struct BenchmarkCurl::Impl {
    wake_locked();
   }
   worker.join();
+  readiness.reset();
  }
  void wake_locked() {
   ++generation;
@@ -198,7 +236,7 @@ struct BenchmarkCurl::Impl {
    if (slot == owner.sockets.end()) throw std::logic_error("benchmark Curl exceeded its guaranteed native socket envelope");
    const auto descriptor = ::socket(address->family, address->socktype | SOCK_CLOEXEC, address->protocol);
    if (descriptor == CURL_SOCKET_BAD) {
-    if (errno == EMFILE || errno == ENFILE || errno == ENOMEM || errno == ENOBUFS) throw InsufficientBenchmarkResources("benchmark Curl socket capacity exhausted");
+    if (errno == EMFILE || errno == ENFILE || errno == ENOMEM || errno == ENOBUFS) throw InsufficientCompileResources("benchmark Curl socket capacity exhausted");
     return CURL_SOCKET_BAD;
    }
    slot->descriptor = descriptor;
@@ -282,6 +320,7 @@ struct BenchmarkCurl::Impl {
   {
    const std::lock_guard lock(mutex);
    settled = true;
+   if (!channels) acquisition.reset();
    changed.notify_all();
   }
  }
@@ -294,10 +333,10 @@ struct BenchmarkCurl::Impl {
   if (execution && !fixed) {
    // Channels establish the shared fixed promise before their dependent
    // source leases. Generic producer headroom alone need not cover it.
-   auto value = execution->try_reserve(BenchmarkResources::handles(kCurlWakeDescriptors, false, kCurlNativeSocketCandidates + kCurlRequestDescriptors));
+   auto value = execution->try_reserve(CompileResources::handles(kCurlWakeDescriptors, false, kCurlNativeSocketCandidates + kCurlRequestDescriptors));
    if (!value) return false;
    fixed = std::move(*value);
-   auto socket = execution->try_reserve(BenchmarkResources::handles(0, false, kCurlNativeSocketCandidates), fixed);
+   auto socket = execution->try_reserve(CompileResources::handles(0, false, kCurlNativeSocketCandidates), fixed);
    if (!socket) throw std::logic_error("benchmark socket continuation lost its parent commitment");
    socket_commitment = std::move(*socket);
   }
@@ -423,7 +462,7 @@ struct BenchmarkCurl::Impl {
    if (!candidate->deferred) candidate->deferred = execution->defer_resources();
    return false;
   };
-  BenchmarkAllowance work;
+  CompileAllowance work;
   if (execution && !candidate->work) {
    auto value = execution->try_reserve(benchmark_curl_input_resources(), fixed);
    if (!value) return defer();
@@ -440,10 +479,10 @@ struct BenchmarkCurl::Impl {
   std::list<Socket> admitted;
   std::size_t new_fixed = 0;
   while (capacity + admitted.size() < needed) {
-   BenchmarkAllowance allowance;
+   CompileAllowance allowance;
    const bool fixed_child = fixed_socket_grants + new_fixed < kCurlNativeSocketCandidates;
    if (execution) {
-    auto value = execution->try_reserve(BenchmarkResources::handles(1), fixed_child ? socket_commitment : BenchmarkAllowance{});
+    auto value = execution->try_reserve(CompileResources::handles(1), fixed_child ? socket_commitment : CompileAllowance{});
     if (!value) return defer();  // Every partial draw and request workspace returns.
     allowance = std::move(*value);
    }
@@ -480,13 +519,19 @@ struct BenchmarkCurl::Impl {
    for (;;) {
     std::uint64_t observed;
     std::size_t aggregate;
-    bool no_channels;
+    bool no_channels, has_service;
     {
      const std::lock_guard lock(mutex);
      if (stopping) break;
      observed = generation;
      aggregate = policy(images_selected ? Class::OpenImages : Class::Artifact).limit;
      no_channels = !channels;
+     has_service = bool(acquisition);
+    }
+    std::optional<CompileExecution::ServiceGrant> cpu;
+    if (execution && has_service) {
+     cpu.emplace(execution->service_grant(CompileWorkClass::Acquisition));
+     mmltk::common::system::set_thread_affinity({cpu->cpu()});
     }
     (void)drain_commands();
     bool waiting = false;
@@ -538,9 +583,11 @@ struct BenchmarkCurl::Impl {
       if (!channels && !waiting) retire = true;
      }
      if (retire) retire_multi();
+     cpu.reset();
      std::unique_lock lock(mutex);
      changed.wait(lock, [&] { return stopping || generation != observed; });
     } else {
+     cpu.reset();
      int descriptors = 0;
      const auto status = curl_multi_poll(multi.get(), nullptr, 0, kBenchmarkTransferPollMilliseconds, &descriptors);
      if (status != CURLM_OK) throw std::runtime_error(std::string("benchmark Curl poll failed: ") + curl_multi_strerror(status));
@@ -569,10 +616,10 @@ struct BenchmarkCurl::Impl {
   retire_multi();
  }
 };
-BenchmarkCurl::BenchmarkCurl(std::size_t cpus, BenchmarkCompilePipeline* execution) : impl_(std::make_shared<Impl>(cpus, execution)) {}
+BenchmarkCurl::BenchmarkCurl(std::size_t cpus, CompileExecution* execution) : impl_(std::make_shared<Impl>(cpus, execution)) {}
 BenchmarkCurl::~BenchmarkCurl() = default;
 std::size_t BenchmarkCurl::limit(Class kind) const noexcept { return impl_->policy(kind).limit; }
-BenchmarkCurl::Channel::Channel(std::shared_ptr<Impl> owner, Class kind, mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkResources source)
+BenchmarkCurl::Channel::Channel(std::shared_ptr<Impl> owner, Class kind, mmltk::common::concurrency::CancellationObservation cancellation, CompileResources source)
     : owner_(std::move(owner)), state_(std::make_shared<State>(kind, source)) {
  throw_if_benchmark_cancelled(cancellation);
  if (owner_->execution) {
@@ -582,14 +629,15 @@ BenchmarkCurl::Channel::Channel(std::shared_ptr<Impl> owner, Class kind, mmltk::
   // Check the complete promise against its real ceiling, not the generic
   // worst-case producer headroom. Admission below draws from actual capacity.
   // Source bytes keep their ordinary independent/oversized admission policy.
-  owner_->execution->require_feasible(BenchmarkResources::handles(complete, source.producer));
-  state_->descriptor_ceiling = owner_->execution->descriptor_ceiling(BenchmarkResources::handles(complete, source.producer));
+  owner_->execution->require_feasible(CompileResources::handles(complete, source.producer));
+  state_->descriptor_ceiling = owner_->execution->descriptor_ceiling(CompileResources::handles(complete, source.producer));
  }
  std::unique_lock lock(owner_->mutex);
  if (owner_->failure) std::rethrow_exception(owner_->failure);
  std::erase_if(owner_->observers, [](const auto& observer) { return observer.expired(); });
  owner_->observers.push_back(state_);
  owner_->declarations_changed = true;
+ if (!owner_->channels && owner_->execution) owner_->acquisition.emplace(owner_->execution->open_class(CompileWorkClass::Acquisition));
  ++owner_->channels;
  if (kind == Class::OpenImages) owner_->images_selected = true;
  owner_->wake_locked();
@@ -622,7 +670,7 @@ BenchmarkCurl::Channel::~Channel() {
  owner_->wake_locked();
  if (!owner_->channels) owner_->changed.wait(lock, [&] { return owner_->channels || owner_->settled || owner_->failure; });
 }
-std::unique_ptr<BenchmarkCurl::Channel> BenchmarkCurl::channel(Class kind, mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkResources source) {
+std::unique_ptr<BenchmarkCurl::Channel> BenchmarkCurl::channel(Class kind, mmltk::common::concurrency::CancellationObservation cancellation, CompileResources source) {
  return std::unique_ptr<Channel>(new Channel(impl_, kind, cancellation, source));
 }
 std::function<void()> BenchmarkCurl::admission_wakeup() const {
@@ -630,13 +678,11 @@ std::function<void()> BenchmarkCurl::admission_wakeup() const {
   if (auto owner = weak.lock()) {
    const std::lock_guard lock(owner->mutex);
    owner->notify_readers_locked();
-   // Our own failed nonblocking draws return credits too. They must not turn a
-   // capacity wait into a self-waking retry loop.
    if (std::this_thread::get_id() != owner->worker.get_id()) owner->wake_locked();
   }
  };
 }
-void BenchmarkCurl::Channel::add(CURL* handle, bool range, BenchmarkAllowance input) {
+void BenchmarkCurl::Channel::add(CURL* handle, bool range, CompileAllowance input) {
  auto request = std::make_unique<Impl::Request>(Impl::Request{handle, state_, std::move(input), owner_.get(), {}, state_->kind == Class::Artifact && range, {}});
  const std::lock_guard lock(owner_->mutex);
  if (owner_->failure) std::rethrow_exception(owner_->failure);

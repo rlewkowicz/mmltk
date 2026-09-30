@@ -1,6 +1,7 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/common/io/scoped_fd.h"
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/detail/compile_resources.h"
 #include <atomic>
 #include <concepts>
 #include <cstdint>
@@ -15,6 +16,9 @@
 #include <nlohmann/json.hpp>
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+
 inline constexpr std::uint32_t kBenchmarkCacheSchemaVersion = 2U;
 // A null value reports diagnostic construction failure; it is never product state.
 using BenchmarkTraceSink = std::function<void(std::string_view, const nlohmann::json&)>;
@@ -30,7 +34,7 @@ struct BenchmarkCacheLayout {
  [[nodiscard]] std::filesystem::path source_indexes(std::string_view source) const;
 };
 class StorageReservationPool;
-class BenchmarkCompilePipeline;
+using detail::CompileExecution;
 class ArtifactLease {
 public:
  ArtifactLease() = default;
@@ -40,22 +44,22 @@ public:
  ArtifactLease& operator=(ArtifactLease&& other) noexcept;
  ~ArtifactLease();
  [[nodiscard]] static ArtifactLease acquire(const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancellation);
- [[nodiscard]] static std::shared_ptr<ArtifactLease> acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkCompilePipeline*,
-  BenchmarkResources = BenchmarkResources::handles(1), const BenchmarkAllowance& parent = {});
+ [[nodiscard]] static std::shared_ptr<ArtifactLease> acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, CompileExecution*,
+  CompileResources = CompileResources::handles(1), const CompileAllowance& parent = {});
  // The explicit envelope already includes this descriptor (e.g. a batch session).
- [[nodiscard]] static std::shared_ptr<ArtifactLease> acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkAllowance admitted);
+ [[nodiscard]] static std::shared_ptr<ArtifactLease> acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, CompileAllowance admitted);
  // A contended lock returns empty after closing its descriptor and releasing the
  // attempted allowance. Controllers retry outside CPU lanes.
- [[nodiscard]] static std::shared_ptr<ArtifactLease> try_acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkAllowance admitted);
- [[nodiscard]] static std::shared_ptr<ArtifactLease> try_acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkCompilePipeline*,
-  BenchmarkResources = BenchmarkResources::handles(1), const BenchmarkAllowance& parent = {});
- [[nodiscard]] const BenchmarkAllowance& allowance() const noexcept { return allowance_; }
+ [[nodiscard]] static std::shared_ptr<ArtifactLease> try_acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, CompileAllowance admitted);
+ [[nodiscard]] static std::shared_ptr<ArtifactLease> try_acquire_charged(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, CompileExecution*,
+  CompileResources = CompileResources::handles(1), const CompileAllowance& parent = {});
+ [[nodiscard]] const CompileAllowance& allowance() const noexcept { return allowance_; }
 
 private:
- [[nodiscard]] static std::shared_ptr<ArtifactLease> try_acquire(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, BenchmarkAllowance);
+ [[nodiscard]] static std::shared_ptr<ArtifactLease> try_acquire(const std::filesystem::path&, mmltk::common::concurrency::CancellationObservation, CompileAllowance);
  explicit ArtifactLease(int descriptor) noexcept;
  void release() noexcept;
- BenchmarkAllowance allowance_;
+ CompileAllowance allowance_;
  mmltk::common::io::ScopedFd descriptor_;
 };
 void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation cancellation);

@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
@@ -16,6 +17,11 @@
 #include "src/common/system/cpu_affinity.h"
 #include "src/pch_std.h"
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::InsufficientCompileResources;
+using mmltk::backend::data::detail::CompileTaskKind;
+
 struct CoconutReleaseInputs {
  std::unordered_map<std::string, DownloadResult> artifacts;
  std::shared_ptr<ArtifactLease> lease;
@@ -53,7 +59,7 @@ struct CoconutRecipeInputs {
    stopped.store(true, std::memory_order_relaxed);
   }
   changed.notify_all();
-  if (execution) execution->notify_admission_change();
+  if (execution) execution->execution().notify_admission_change();
   join_inputs();
  }
  void join_inputs() {
@@ -67,6 +73,7 @@ struct CoconutRecipeInputs {
   original_controller = {};
  }
  [[nodiscard]] bool cancelled() const noexcept { return stopped.load(std::memory_order_relaxed) || external.requested(); }
+  [[nodiscard]] int descriptor() const noexcept { return external.descriptor(); }
  void fail(std::exception_ptr value) {
   bool first = false;
   {
@@ -77,6 +84,7 @@ struct CoconutRecipeInputs {
    stopped.store(true, std::memory_order_relaxed);
   }
   changed.notify_all();
+  if (execution) execution->execution().notify_admission_change();
   if (first && failed) failed(value);
  }
  void start_originals(std::function<void()> work) {
@@ -113,7 +121,7 @@ struct CoconutRecipeInputs {
   };
   if (recover && value.index) {
    if (execution)
-    execution->run(BenchmarkStage::Metadata, {}, prepare_recovery);
+    execution->execution().run(CompileTaskKind::Metadata, {}, prepare_recovery);
    else
     prepare_recovery(0);
   }
@@ -134,7 +142,7 @@ struct CoconutRecipeInputs {
      execution->labels_ready(execution->source_publication(root, {}, id), id, BenchmarkLabelInput(index, row), index.annotation_sha256, generation, 1);
     }
    }
-   execution->notify_admission_change();
+   execution->execution().notify_admission_change();
   }
   changed.notify_all();
  }
@@ -150,15 +158,15 @@ struct CoconutRecipeInputs {
   }
   return split;
  }
- BenchmarkResources release_controls(std::size_t index) const {
+ CompileResources release_controls(std::size_t index) const {
   const auto readers = releases[index].annotation_descriptors;
-  return BenchmarkResources::handles(1, false, std::max(coco_annotation_resources().continuation_descriptors, readers));
+  return CompileResources::handles(1, false, std::max(coco_annotation_resources().continuation_descriptors, readers));
  }
  void acquire_release(std::size_t index) {
   const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(*this);
   const auto& release = catalog->releases[index];
   const auto lifecycle = cache->locks / (std::string(release.name) + ".annotations.lifecycle.lock");
-  auto lease = ArtifactLease::acquire_charged(lifecycle, cancellation, execution, coco_annotation_resources());
+  auto lease = ArtifactLease::acquire_charged(lifecycle, cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources());
   std::vector<DownloadRequest> requests;
   requests.reserve(release.annotations.size());
   for (const auto& artifact : release.annotations) requests.push_back(make_download_request(*cache, "coconut-" + std::string(release.name), artifact));
@@ -270,7 +278,7 @@ struct CoconutRecipeInputs {
      state.release_cache_selected = true;
      state.parts.clear();
     } else {
-     lease = state.inputs.lease ? std::move(state.inputs.lease) : ArtifactLease::acquire_charged(lifecycle, cancellation, execution, coco_annotation_resources());
+     lease = state.inputs.lease ? std::move(state.inputs.lease) : ArtifactLease::acquire_charged(lifecycle, cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources());
      for (std::size_t i = 0; i < results.size(); ++i) ready({i, results[i]});
     }
    }
@@ -313,7 +321,7 @@ struct CoconutRecipeInputs {
      changed.wait(lock, [&] { return activated || cancelled(); });
      throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation::Borrow(*this));
     }
-    const auto parent = releases[index].inputs.lease ? releases[index].inputs.lease->allowance() : BenchmarkAllowance{};
+    const auto parent = releases[index].inputs.lease ? releases[index].inputs.lease->allowance() : CompileAllowance{};
     if (!releases[index].release_cache_selected) prepare(index, parent);
     releases[index].inputs.lease.reset();
     trace_benchmark_event(trace, "benchmark.annotations.release_complete",
@@ -328,7 +336,7 @@ struct CoconutRecipeInputs {
    } catch (...) { fail(std::current_exception()); }
   });
  }
- void activate(std::function<void(std::size_t, const BenchmarkAllowance&)> work) {
+ void activate(std::function<void(std::size_t, const CompileAllowance&)> work) {
   {
    const std::lock_guard lock(mutex);
    if (activated) return;
@@ -367,7 +375,7 @@ struct CoconutRecipeInputs {
      release.inputs.components.insert_or_assign({component.edition(), component.source()}, component);
    if (indexing) indexing->invalidate(index, *progress, affected);
    const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(*this);
-   auto lease = ArtifactLease::acquire_charged(cache->locks / (std::string(catalog->releases[index].name) + ".annotations.lifecycle.lock"), cancellation, execution, release_controls(index));
+   auto lease = ArtifactLease::acquire_charged(cache->locks / (std::string(catalog->releases[index].name) + ".annotations.lifecycle.lock"), cancellation, (execution ? &execution->execution() : nullptr), release_controls(index));
    prepare(index, lease->allowance());
    lease = {};
   }
@@ -395,9 +403,9 @@ struct CoconutRecipeInputs {
  std::condition_variable changed;
  std::exception_ptr error;
  bool activated = false;
- std::function<void(std::size_t, const BenchmarkAllowance&)> prepare;
- std::function<CoconutRecipePreparation(std::size_t, std::size_t, const BenchmarkAllowance&)> prepare_part;
- std::function<CoconutRecipePreparation(std::size_t, const BenchmarkAllowance&)> prepare_cached_release;
+ std::function<void(std::size_t, const CompileAllowance&)> prepare;
+ std::function<CoconutRecipePreparation(std::size_t, std::size_t, const CompileAllowance&)> prepare_part;
+ std::function<CoconutRecipePreparation(std::size_t, const CompileAllowance&)> prepare_cached_release;
  std::size_t completed = 0;
  BenchmarkCompilePipeline* execution = nullptr;
  const CoconutPhysicalMembership* physical = nullptr;
@@ -529,16 +537,16 @@ void record_coconut_component(
 }
 CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cache, const CoconutReleaseComponent& release, const CoconutPhysicalMembership& physical, ProgressReporter& progress,
  CoconutFailureReport& failures, const CoconutOriginalProvider& original_provider, CoconutReleaseInputs& retained, mmltk::common::concurrency::CancellationObservation cancellation,
- const BenchmarkTraceSink& trace, IndexingProgressTotals* indexing, std::size_t release_index, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent,
+ const BenchmarkTraceSink& trace, IndexingProgressTotals* indexing, std::size_t release_index, BenchmarkCompilePipeline* execution, const CompileAllowance& parent,
  std::size_t annotation_descriptors, const std::function<void(CoconutRecipePreparation)>& membership_ready = {}, const std::function<void()>& masks_started = {}, std::string_view cache_tag = {},
  const std::function<void(std::uint64_t)>& row_progress = {}, bool accept_partial = false, const std::function<void(std::uint64_t)>& row_withdrawn = {}, bool cache_only = false) {
  const FlushReports flush_reports{failures};
  using namespace mmltk::common::math;
  CoconutRecipePreparation prepared;
- BenchmarkAllowance consumer_allowance;
+ CompileAllowance consumer_allowance;
  const auto lifecycle = cache.locks / (std::string(release.name) + ".annotations.lifecycle.lock");
  const auto retain_inputs = [&] {
-  if (!retained.lease) retained.lease = ArtifactLease::acquire_charged(lifecycle, cancellation, execution, coco_annotation_resources(), parent);
+  if (!retained.lease) retained.lease = ArtifactLease::acquire_charged(lifecycle, cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources(), parent);
  };
  const auto release_inputs = [&] {
   // A normalized cache hit no longer consumes the discovery archive. Close
@@ -831,7 +839,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
     continue;
    } catch (const std::bad_alloc&) { throw; } catch (const CoconutPhysicalMembershipError&) {
     throw;
-   } catch (const InsufficientBenchmarkResources&) { throw; } catch (const InsufficientBenchmarkStorage&) {
+   } catch (const InsufficientCompileResources&) { throw; } catch (const InsufficientBenchmarkStorage&) {
     throw;
    } catch (const CoconutInputError& error) {
     // The failed generation cannot retain input backing into artifact repair.
@@ -889,7 +897,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
        downloads[i] = acquire(artifact, owner, true);
        repaired = true;
       } catch (const BenchmarkDownloadUnavailable& unavailable_error) {
-       auto mutation = ArtifactLease::acquire_charged(download_request.lock_path, cancellation, execution, BenchmarkResources::handles(1, true), consumer_allowance);
+       auto mutation = ArtifactLease::acquire_charged(download_request.lock_path, cancellation, (execution ? &execution->execution() : nullptr), CompileResources::handles(1, true), consumer_allowance);
        std::filesystem::create_hard_link(backup, download_request.destination);
        progress.warning("COCONut annotation repair unavailable; retaining readable rows: " + std::string(unavailable_error.what()));
        unavailable = true;
@@ -1013,7 +1021,7 @@ std::shared_ptr<CoconutRecipeInputs> acquire_coconut_recipe_inputs(const Benchma
 CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& config, const BenchmarkCacheLayout& cache, const CoconutRecipeCatalog& catalog,
  std::span<const AdmittedRecipeArchive> acquired, const CoconutPhysicalMembership& physical, ProgressReporter& progress, CoconutFailureReport& failures, std::size_t workers,
  mmltk::common::concurrency::CancellationObservation external_cancellation, const BenchmarkTraceSink& trace, std::shared_ptr<CoconutRecipeInputs> inputs, BenchmarkCompilePipeline* execution,
- BenchmarkAllowance preparation, CocoAnnotationInputObserver stock_input) {
+ CompileAllowance preparation, CocoAnnotationInputObserver stock_input) {
  const FlushReports flush_reports{failures};
  using namespace mmltk::common::math;
  const auto cancellation = external_cancellation;
@@ -1021,7 +1029,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  const bool initial_preparation = !inputs;
  auto source_transport = execution ? execution->curl().channel(BenchmarkCurl::Class::Artifact, cancellation, coco_annotation_resources()) : nullptr;
  if (execution && initial_preparation && !preparation)
-  preparation = execution->reserve(BenchmarkResources::handles(0, true, coco_annotation_resources().descriptors + coco_annotation_resources().continuation_descriptors));
+  preparation = execution->execution().reserve(CompileResources::handles(0, true, coco_annotation_resources().descriptors + coco_annotation_resources().continuation_descriptors));
  prepared.inputs = inputs ? std::move(inputs) : acquire_coconut_recipe_inputs(cache, catalog, progress, 0, cancellation, trace, workers, {}, {}, execution);
  auto& retained = *prepared.inputs;
  retained.physical = &physical;
@@ -1046,7 +1054,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
    // Declare fixed transport before retaining its dependent source lifecycle.
    auto transport = execution ? execution->curl().channel(BenchmarkCurl::Class::Artifact, original_cancellation, coco_annotation_resources()) : nullptr;
    trace_benchmark_event(trace, "benchmark.annotations.originals_wait", [] { return nlohmann::json::object(); });
-   auto original_lease = ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", original_cancellation, execution, coco_annotation_resources(), preparation);
+   auto original_lease = ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", original_cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources(), preparation);
    const CocoAnnotationRequest selection{recover ? CocoSplitAdmission::Optional : CocoSplitAdmission::Unselected, stock ? CocoSplitAdmission::Required : CocoSplitAdmission::Optional};
    trace_benchmark_event(
     trace, "benchmark.annotations.originals_begin", [&] { return nlohmann::json{{"recover_dropped_masks", recover}, {"validation", stock ? CoconutValidation::Stock : CoconutValidation::Coconut}}; });
@@ -1086,7 +1094,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  // acquires only its own bounded source-consumer envelope and can start now.
  preparation = {};
  retained.prepare_part = [&cache, &catalog, &physical, &progress, &failures, &retained, trace, execution, recover = config.selection.recover_dropped_masks](
-                          std::size_t index, std::size_t shard, const BenchmarkAllowance& parent) {
+                          std::size_t index, std::size_t shard, const CompileAllowance& parent) {
   auto release = catalog.releases[index];
   release.annotations = {release.annotations.at(shard)};
   release.expected_rows = 0;
@@ -1131,7 +1139,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   return result;
  };
  retained.prepare_cached_release = [&cache, &catalog, &physical, &progress, &failures, &retained, trace, execution, recover = config.selection.recover_dropped_masks](
-                                    std::size_t index, const BenchmarkAllowance& parent) {
+                                    std::size_t index, const CompileAllowance& parent) {
   const auto& release = catalog.releases[index];
   const bool selected = recover && (release.edition == CoconutEdition::Base || release.edition == CoconutEdition::RelabeledValidation);
   const CoconutOriginalProvider original_provider = selected ? CoconutOriginalProvider{[&retained](CoconutImageNamespace source, bool wait, std::stop_token stop) {
@@ -1159,7 +1167,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   return result;
  };
  retained.activate(
-  [&cache, &catalog, &physical, &progress, &failures, &retained, trace, execution, recover = config.selection.recover_dropped_masks](std::size_t index, const BenchmarkAllowance& parent) {
+  [&cache, &catalog, &physical, &progress, &failures, &retained, trace, execution, recover = config.selection.recover_dropped_masks](std::size_t index, const CompileAllowance& parent) {
   const auto release_cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(retained);
   const auto& release = catalog.releases[index];
   progress.label_plan_started(index);
@@ -1263,7 +1271,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
     failures.reject(image.physical, image.release_image_id, release.name, 0, 0, reason);
    });
    failures.flush();
-   auto publication = ArtifactLease::acquire_charged(cache.locks / (std::string(release.name) + ".annotations.lifecycle.lock"), release_cancellation, execution, coco_annotation_resources());
+   auto publication = ArtifactLease::acquire_charged(cache.locks / (std::string(release.name) + ".annotations.lifecycle.lock"), release_cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources());
    release_inputs.components.clear();
    for (auto& component : merged) {
     const auto source_original = recovery ? recovery(component.source(), true, {}) : CoconutOriginalInput{};

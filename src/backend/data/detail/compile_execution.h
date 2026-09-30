@@ -1,0 +1,241 @@
+#pragma once
+#include "src/backend/data/detail/compile_resources.h"
+#include "src/common/concurrency/cancellation_observation.h"
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <source_location>
+#include <span>
+#include <string_view>
+#include <stop_token>
+#include <vector>
+
+namespace mmltk::backend::data::detail {
+enum class CompileWorkClass : std::uint8_t { Acquisition, Extraction, Annotations, Pixels, Gather, Output, Count };
+enum class CompileTaskKind : std::uint8_t { Acquisition, Metadata, Header, Archive, Normalize, Recovery, Labels, Pixels, Gather, CacheWrite, Output, Count };
+enum class CompileParkReason : std::uint8_t { None, Dependency, Bytes, Descriptors, Cpu, Withdrawal, Count };
+[[nodiscard]] constexpr CompileWorkClass work_class(CompileTaskKind kind) {
+ switch (kind) {
+  case CompileTaskKind::Acquisition: return CompileWorkClass::Acquisition;
+  case CompileTaskKind::Header: case CompileTaskKind::Archive: return CompileWorkClass::Extraction;
+  case CompileTaskKind::Metadata: case CompileTaskKind::Normalize: case CompileTaskKind::Recovery: case CompileTaskKind::Labels: return CompileWorkClass::Annotations;
+  case CompileTaskKind::Pixels: return CompileWorkClass::Pixels;
+  case CompileTaskKind::Gather: return CompileWorkClass::Gather;
+  case CompileTaskKind::CacheWrite: case CompileTaskKind::Output: return CompileWorkClass::Output;
+  case CompileTaskKind::Count: break;
+ }
+ throw std::invalid_argument("invalid compile task kind");
+}
+// Collected only for an enabled observer. Identities describe credit ancestry;
+// they never participate in admission, ordering or resource lifetime.
+struct CompileCreditObservation {
+ std::uintptr_t id = 0, parent = 0;
+ std::source_location location;
+ CompileResources resources;
+ std::size_t available = 0, borrowed = 0;
+ bool descriptors_retired = false, continuations_released = false;
+};
+struct CompileReservationObservation {
+ std::source_location location;
+ CompileResources requested;
+ std::vector<CompileCreditObservation> parents, owners;
+};
+struct CompileExecutionSnapshot {
+ static constexpr std::size_t classes = static_cast<std::size_t>(CompileWorkClass::Count);
+ std::array<bool, classes> live{};
+ std::array<std::size_t, classes> baseline{}, ready{}, running{};
+ std::array<std::size_t, static_cast<std::size_t>(CompileParkReason::Count)> parked{};
+ std::size_t elastic = 0, active = 0, external = 0, services = 0, records = 0, record_limit = 0;
+ CompileResources resources{};
+ std::uint64_t byte_target = 0;
+ std::size_t descriptor_limit = 0;
+ std::uint64_t admitted = 0, completed = 0;
+ std::optional<CompileReservationObservation> reservation;
+};
+class CompileResourceWait;
+class CompileExecution final {
+ struct Impl;
+ struct Job;
+ struct CompletionState;
+ struct DependencyState;
+ using Credits = CompileAllowance::Credits;
+ friend class CompileResourceWait;
+public:
+ using Observer = std::function<void(std::string_view, const CompileExecutionSnapshot&)>;
+ explicit CompileExecution(std::size_t workers, std::span<const int> cpus = {}, CompileExecutionLimits = {},
+  mmltk::common::concurrency::CancellationObservation = {}, Observer = {}, std::exception_ptr cancellation_error = {});
+ ~CompileExecution();
+ CompileExecution(const CompileExecution&) = delete;
+ CompileExecution& operator=(const CompileExecution&) = delete;
+ class Producer final {
+ public:
+  Producer() = default;
+  ~Producer();
+  Producer(Producer&&) noexcept;
+  Producer& operator=(Producer&&) noexcept;
+  Producer(const Producer&) = delete;
+  Producer& operator=(const Producer&) = delete;
+  void close() noexcept;
+ private:
+  friend class CompileExecution;
+  Producer(std::shared_ptr<Impl>, CompileWorkClass);
+  std::shared_ptr<Impl> owner_;
+  CompileWorkClass class_ = CompileWorkClass::Count;
+ };
+ [[nodiscard]] Producer open_class(CompileWorkClass);
+ // Each task owns its completion independently of reusable scheduler records.
+ // Subscribers run once, outside locks, and only post completion/ready work.
+ class CompletionSource;
+ class Completion final {
+ public:
+  Completion() = default;
+  [[nodiscard]] explicit operator bool() const noexcept { return bool(state_); }
+  [[nodiscard]] bool ready() const;
+  [[nodiscard]] std::exception_ptr failure() const;
+  void wait() const;
+  void subscribe(std::function<void(std::exception_ptr)>) const;
+  void cancel() const noexcept;
+ private:
+  friend class CompileExecution;
+  friend class CompletionSource;
+  friend struct Impl;
+  explicit Completion(std::shared_ptr<CompletionState> state) : state_(std::move(state)) {}
+  std::shared_ptr<CompletionState> state_;
+ };
+ class CompletionSource final {
+ public:
+  explicit CompletionSource(CompileExecution* owner = nullptr);
+  [[nodiscard]] Completion completion() const { return Completion(state_); }
+  void settle(std::exception_ptr = {}) const noexcept;
+ private:
+  std::shared_ptr<CompletionState> state_;
+ };
+ class Dependency final {
+ public:
+  explicit Dependency(CompileExecution&);
+  [[nodiscard]] std::uint64_t generation() const;
+  void notify() noexcept;
+ private:
+  friend class CompileExecution;
+  friend struct Impl;
+  std::shared_ptr<DependencyState> state_;
+ };
+ // Stable scratch custody follows the context, not a task's writer identity.
+ // The next workspace-bank implementation replaces the retirement policy while
+ // retaining this lifetime and non-overlap boundary.
+ class Workspace final {
+ public:
+  Workspace(CompileExecution&, std::function<void(std::size_t)> retire);
+  ~Workspace();
+  Workspace(const Workspace&) = delete;
+  Workspace& operator=(const Workspace&) = delete;
+ private:
+  friend class CompileExecution;
+  friend struct Impl;
+  CompileExecution& owner_;
+  std::function<void(std::size_t)> retire_;
+  bool active_ = false;
+  std::exception_ptr failure_;
+ };
+ struct Task {
+  CompileTaskKind kind = CompileTaskKind::Metadata;
+  CompileResources resources{};
+  std::function<void(std::size_t, const CompileAllowance&)> work;
+  CompileAllowance allowance{}, parent{};
+  Workspace* workspace = nullptr;
+  // Only bounded consumers with retained immutable inputs may draw finite loans.
+  bool finite_consumer = false;
+  bool retain_workspace = true;
+  std::function<void(std::exception_ptr)> completed;
+ };
+ [[nodiscard]] std::optional<Completion> try_submit(Task);
+ [[nodiscard]] Completion submit(Task);
+ // Capture generation before checking the owning product predicate. Registration
+ // and the generation check share one lock, including cancellation and resume.
+ [[nodiscard]] std::optional<Completion> try_subscribe(Dependency&, std::uint64_t observed, Task);
+ void resume(const Completion&) noexcept;
+ void fail(std::exception_ptr) noexcept;
+ void cancel() noexcept;
+ void join();
+ void retire_attempt() noexcept;
+ [[nodiscard]] bool on_lane() const noexcept;
+ [[nodiscard]] std::size_t current_lane() const;
+ [[nodiscard]] std::size_t workers() const noexcept;
+ [[nodiscard]] std::span<const int> cpus() const noexcept;
+ [[nodiscard]] CompileExecutionSnapshot snapshot() const;
+ [[nodiscard]] std::uint64_t transient_target() const noexcept;
+ [[nodiscard]] std::size_t descriptor_limit() const noexcept;
+ [[nodiscard]] CompileResources resource_usage() const;
+ [[nodiscard]] bool resource_pressure() const;
+ [[nodiscard]] std::uint64_t admission_generation() const;
+ void wait_for_admission_change(std::uint64_t, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
+ void notify_admission_change() noexcept;
+ // A bounded owner registration receives readiness events, not CPU work. Its
+ // destructor joins callbacks, so captured owner state cannot outlive custody.
+ class Readiness final {
+ public:
+  Readiness(CompileExecution&, std::function<void()>);
+  ~Readiness();
+  Readiness(const Readiness&) = delete;
+  Readiness& operator=(const Readiness&) = delete;
+ private:
+  struct State;
+  friend struct Impl;
+  CompileExecution& owner_;
+  std::shared_ptr<State> state_;
+ };
+ [[nodiscard]] std::unique_ptr<CompileResourceWait> defer_resources();
+ void require_feasible(CompileResources) const;
+ [[nodiscard]] std::size_t descriptor_ceiling(CompileResources) const;
+ [[nodiscard]] std::optional<CompileAllowance> try_reserve(CompileResources, const CompileAllowance& parent = {}, std::source_location = std::source_location::current());
+ [[nodiscard]] CompileAllowance reserve(CompileResources, const CompileAllowance& parent = {}, std::source_location = std::source_location::current());
+ [[nodiscard]] bool try_resize_workspace(const CompileAllowance&, std::uint64_t, bool retain_capacity = false);
+ void with_unused_workspace(const CompileAllowance&, std::uint64_t live_bytes, const std::function<void()>&);
+ void run(CompileTaskKind, CompileResources, const std::function<void(std::size_t)>&, CompileAllowance = {});
+ void for_each(CompileTaskKind, std::size_t, CompileResources, const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>& retire = {});
+ void for_each(CompileTaskKind, std::size_t, const std::function<CompileResources(std::size_t)>&, const std::function<void(std::size_t)>&, const std::function<void(std::size_t)>& retire = {});
+ void for_each(CompileTaskKind, std::size_t, const std::function<CompileResources(std::size_t)>&, const std::function<void(std::size_t)>&, Workspace&);
+ void cooperate();
+ // File/Curl CPU-bearing pumps replace a compute lane while active. A service's
+ // Producer retains the waiting baseline; this short grant covers only a pump.
+ class ServiceGrant final {
+ public:
+  ServiceGrant() = default;
+  ~ServiceGrant();
+  ServiceGrant(ServiceGrant&&) noexcept;
+  ServiceGrant& operator=(ServiceGrant&&) noexcept;
+  ServiceGrant(const ServiceGrant&) = delete;
+  ServiceGrant& operator=(const ServiceGrant&) = delete;
+  [[nodiscard]] int cpu() const noexcept;
+ private:
+  friend class CompileExecution;
+  ServiceGrant(std::shared_ptr<Impl>, CompileWorkClass, std::size_t);
+  void release() noexcept;
+  std::shared_ptr<Impl> owner_;
+  CompileWorkClass class_ = CompileWorkClass::Count;
+  std::size_t lane_ = 0;
+ };
+ // A local stop interrupts only this grant wait and never cancels the session.
+ [[nodiscard]] ServiceGrant service_grant(CompileWorkClass, std::stop_token local_stop = {});
+private:
+ void retire_workspace(Workspace*) noexcept;
+ [[nodiscard]] std::optional<Completion> submit_impl(Task, const std::shared_ptr<DependencyState>&, std::uint64_t);
+ void for_each_impl(CompileTaskKind, std::size_t, const std::function<CompileResources(std::size_t)>&, const std::function<void(std::size_t)>&, Workspace*);
+ std::shared_ptr<Impl> impl_;
+};
+class CompileResourceWait final {
+public:
+ ~CompileResourceWait();
+ CompileResourceWait(const CompileResourceWait&) = delete;
+ CompileResourceWait& operator=(const CompileResourceWait&) = delete;
+private:
+ friend class CompileExecution;
+ explicit CompileResourceWait(std::shared_ptr<CompileAdmission>);
+ std::shared_ptr<CompileAdmission> owner_;
+};
+}

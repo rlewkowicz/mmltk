@@ -1,7 +1,7 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/detail/compile_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <cstddef>

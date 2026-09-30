@@ -1,3 +1,7 @@
+#include "src/common/concurrency/event_cancellation.h"
+#include "src/common/io/scoped_fd.h"
+#include <sys/eventfd.h>
+#include <thread>
 #include "tool_launch.h"
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include <signal.h>
@@ -85,30 +89,54 @@ void finalize_compile_request(CompileCliRequest& request) {
    "--compile-benchmark-dataset");
  }
 }
-std::atomic<bool> benchmark_cancel_requested{false};
-void request_benchmark_cancel(int) noexcept { benchmark_cancel_requested.store(true, std::memory_order_relaxed); }
+std::atomic<int> benchmark_cancel_descriptor{-1};
+std::atomic<unsigned> benchmark_signal_users{0};
+static_assert(std::atomic<int>::is_always_lock_free && std::atomic<unsigned>::is_always_lock_free);
+void request_benchmark_cancel(int) noexcept {
+ const int saved_errno = errno;
+ benchmark_signal_users.fetch_add(1, std::memory_order_seq_cst);
+ const int descriptor = benchmark_cancel_descriptor.load(std::memory_order_seq_cst);
+ if (descriptor >= 0) {
+  const std::uint64_t requested = 1;
+  while (::write(descriptor, &requested, sizeof(requested)) < 0 && errno == EINTR) {}
+ }
+ benchmark_signal_users.fetch_sub(1, std::memory_order_seq_cst);
+ errno = saved_errno;
+}
 class BenchmarkSignalScope final {
 public:
- BenchmarkSignalScope() {
-  benchmark_cancel_requested.store(false, std::memory_order_relaxed);
+ BenchmarkSignalScope() : descriptor_(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) {
+  if (descriptor_.get() < 0) throw std::system_error(errno, std::generic_category(), "cannot create benchmark signal event");
+  int unused = -1;
+  if (!benchmark_cancel_descriptor.compare_exchange_strong(unused, descriptor_.get())) throw std::logic_error("benchmark signal owner already exists");
   struct sigaction action{};
   action.sa_handler = &request_benchmark_cancel;
   ::sigemptyset(&action.sa_mask);
-  if (::sigaction(SIGINT, &action, &previous_interrupt_) != 0) { throw std::system_error(errno, std::generic_category(), "cannot install benchmark signal handler"); }
+  if (::sigaction(SIGINT, &action, &previous_interrupt_) != 0) {
+   const int failure = errno; retire_descriptor();
+   throw std::system_error(failure, std::generic_category(), "cannot install benchmark signal handler");
+  }
   if (::sigaction(SIGTERM, &action, &previous_terminate_) != 0) {
    const int failure = errno;
-   (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
+   (void)::sigaction(SIGINT, &previous_interrupt_, nullptr); retire_descriptor();
    throw std::system_error(failure, std::generic_category(), "cannot install benchmark signal handler");
   }
  }
  ~BenchmarkSignalScope() {
   (void)::sigaction(SIGTERM, &previous_terminate_, nullptr);
   (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
+  retire_descriptor();
  }
+ [[nodiscard]] bool cancelled() const noexcept { return mmltk::common::concurrency::detail::cancellation_descriptor_requested(descriptor_.get()); }
+ [[nodiscard]] int descriptor() const noexcept { return descriptor_.get(); }
  BenchmarkSignalScope(const BenchmarkSignalScope&) = delete;
  BenchmarkSignalScope& operator=(const BenchmarkSignalScope&) = delete;
-
 private:
+ void retire_descriptor() noexcept {
+  benchmark_cancel_descriptor.store(-1, std::memory_order_seq_cst);
+  while (benchmark_signal_users.load(std::memory_order_seq_cst)) std::this_thread::yield();
+ }
+ mmltk::common::io::ScopedFd descriptor_;
  struct sigaction previous_interrupt_{};
  struct sigaction previous_terminate_{};
 };
@@ -123,7 +151,7 @@ void run_compile(const CompileCliRequest& request) {
   config.overwrite = request.overwrite;
   config.perceptual_downscale = request.perceptual_downscale;
   config.resize_mode = request.resize_mode;
-  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(benchmark_cancel_requested);
+  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Borrow(signal_scope);
   config.progress = [](const data::BenchmarkCompileProgress& progress) {
    spdmon::ProgressBar::log(data::format_dataset_compile_tracks(progress.tracks));
    if (!progress.activity.empty()) spdmon::ProgressBar::log(progress.activity);

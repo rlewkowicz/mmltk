@@ -1,7 +1,7 @@
 #pragma once  // backend.data private implementation boundary
 #include <curl/curl.h>
 #include "src/frameworks/reflection/reflection_metadata.h"
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/detail/compile_execution.h"
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -18,13 +18,22 @@
 #include <utility>
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+
+struct BenchmarkTransferEnvelope {
+ CompileResources fixed;
+ CompileResources per_transfer;
+ [[nodiscard]] CompileResources demand(std::size_t) const;
+};
+[[nodiscard]] std::pair<std::size_t, CompileAllowance> reserve_benchmark_transfers(detail::CompileExecution&, std::size_t, BenchmarkTransferEnvelope, const CompileAllowance& = {});
 // Quantified transport envelope: the multi wake pair plus per-request native
 // TCP candidates and resolver custody. The live owner admits these distinct lifetimes;
 // source owners retain their locks, partial files and publication descriptors.
 [[nodiscard]] BenchmarkTransferEnvelope benchmark_curl_envelope(std::size_t lease_descriptors = 0, std::uint64_t fixed_bytes = 0, std::uint64_t payload_bytes_per_transfer = 0);
-[[nodiscard]] BenchmarkResources benchmark_curl_input_resources(std::uint64_t payload_bytes = 0);
+[[nodiscard]] CompileResources benchmark_curl_input_resources(std::uint64_t payload_bytes = 0);
 void reject_local_curl_failure(CURLcode);
-class BenchmarkCompilePipeline;
+using mmltk::backend::data::detail::CompileExecution;
 // Every benchmark HTTP transfer targets the same infrastructure, so it shares one hardening policy.
 inline constexpr long kBenchmarkConnectTimeoutSeconds = 30L;
 inline constexpr long kBenchmarkLowSpeedLimitBytes = 1024L;
@@ -162,7 +171,7 @@ public:
   ~Channel();
   Channel(const Channel&) = delete;
   Channel& operator=(const Channel&) = delete;
-  void add(CURL*, bool extra_range = false, BenchmarkAllowance input = {});
+  void add(CURL*, bool extra_range = false, CompileAllowance input = {});
   [[nodiscard]] std::optional<Completed> next();
   void wait_until(std::chrono::steady_clock::time_point);
   void wake() noexcept;
@@ -170,16 +179,17 @@ public:
   void remove_all();
 
  private:
-  Channel(std::shared_ptr<Impl>, Class, mmltk::common::concurrency::CancellationObservation, BenchmarkResources);
+  Channel(std::shared_ptr<Impl>, Class, mmltk::common::concurrency::CancellationObservation, CompileResources);
   std::shared_ptr<Impl> owner_;
   std::shared_ptr<State> state_;
  };
- explicit BenchmarkCurl(std::size_t cpu_budget, BenchmarkCompilePipeline* = nullptr);
+ explicit BenchmarkCurl(std::size_t cpu_budget, CompileExecution* = nullptr);
  ~BenchmarkCurl();
  // Source admission retains a channel before acquiring its dependent leases.
  // The source demand checks descriptor feasibility only; Curl still admits
  // request bytes and native candidates separately at the active-request turn.
- [[nodiscard]] std::unique_ptr<Channel> channel(Class, mmltk::common::concurrency::CancellationObservation = {}, BenchmarkResources source = {});
+ [[nodiscard]] std::unique_ptr<Channel> channel(Class, mmltk::common::concurrency::CancellationObservation = {}, CompileResources source = {});
+ // Source-owned recycled buffers wake transport admission without a ledger change.
  [[nodiscard]] std::function<void()> admission_wakeup() const;
  [[nodiscard]] std::size_t limit(Class) const noexcept;
 
@@ -196,14 +206,14 @@ public:
   CURL* handle = nullptr;
   CURLcode result = CURLE_OK;
  };
- CurlMultiTransfers(BenchmarkCurl& owner, BenchmarkCurl::Class kind, mmltk::common::concurrency::CancellationObservation cancellation = {}, BenchmarkResources source = {})
+ CurlMultiTransfers(BenchmarkCurl& owner, BenchmarkCurl::Class kind, mmltk::common::concurrency::CancellationObservation cancellation = {}, CompileResources source = {})
      : channel_(owner.channel(kind, cancellation, source)) {}
  ~CurlMultiTransfers() {
   abandon_all([](Transfer&) noexcept {});
  }
  [[nodiscard]] bool empty() const noexcept { return active_.empty(); }
  [[nodiscard]] std::size_t size() const noexcept { return active_.size(); }
- void add(std::unique_ptr<Transfer> transfer, bool extra_range = false, BenchmarkAllowance input = {}) {
+ void add(std::unique_ptr<Transfer> transfer, bool extra_range = false, CompileAllowance input = {}) {
   auto* handle = transfer->easy.get();
   const auto [position, inserted] = active_.emplace(handle, std::move(transfer));
   if (!inserted) throw std::logic_error("benchmark easy handle already registered");

@@ -15,7 +15,10 @@
 #include "src/common/math/checked_arithmetic.h"
 #include "src/backend/data/detail/worker_queue.h"
 namespace mmltk::backend::data::benchmark_internal {
-BenchmarkResources archive_image_resources() { return BenchmarkResources::handles(1, true, 4); }
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+
+CompileResources archive_image_resources() { return CompileResources::handles(1, true, 4); }
 CachedImageWriteProgress::CachedImageWriteProgress(CachedImageProgress callback, const std::uint64_t initial, const std::uint64_t expected)
     : callback_(std::move(callback)), initial_(initial), expected_(expected) {}
 void CachedImageWriteProgress::completed(const std::uint64_t writes) {
@@ -35,7 +38,7 @@ constexpr std::size_t kMaximumArchiveImageBytes = std::size_t{32U} * 1024U * 102
 [[nodiscard]] std::uint64_t checked_byte_add(std::uint64_t left, std::uint64_t right);
 class CachedImageWritePool {
  struct Buffers {
-  BenchmarkAllowance allowance;
+  CompileAllowance allowance;
   std::mutex mutex;
   std::condition_variable available;
   std::vector<std::vector<std::uint8_t>> free;
@@ -66,12 +69,12 @@ class CachedImageWritePool {
   return BenchmarkEncodedImage::pooled(buffers_->allowance, backing, std::span<const std::uint8_t>(backing->encoded), std::move(file));
  }
  std::shared_ptr<const BenchmarkEncodedImage> publish_file(std::uint64_t id, std::span<const std::uint8_t> encoded, BenchmarkImageHeader header) {
-  return BenchmarkEncodedImage::publish(directory_, id, encoded, header, cancellation_, storage_, execution_, buffers_->allowance);
+  return BenchmarkEncodedImage::publish(directory_, id, encoded, header, cancellation_, storage_, (execution_ ? &execution_->execution() : nullptr), buffers_->allowance);
  }
 
 public:
  CachedImageWritePool(const std::size_t worker_count, const std::size_t expected_writes, std::filesystem::path output_root, CachedImageProgress progress, const std::uint64_t initially_completed,
-  const mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready, StorageReservationPool* storage, BenchmarkAllowance allowance,
+  const mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready, StorageReservationPool* storage, CompileAllowance allowance,
   BenchmarkCompilePipeline* execution, int directory)
      : execution_(execution),
        directory_(directory),
@@ -391,8 +394,8 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  completed.reserve(request.selected_image_ids.size());
  std::unordered_set<std::uint64_t> unavailable;
  unavailable.reserve(64U);
- auto directory_allowance = request.execution ? request.execution->reserve(BenchmarkResources::handles(2, true, 2), request.parent_allowance) : BenchmarkAllowance{};
- BenchmarkAllowance stream_allowance;
+ auto directory_allowance = request.execution ? request.execution->execution().reserve(CompileResources::handles(2, true, 2), request.parent_allowance) : CompileAllowance{};
+ CompileAllowance stream_allowance;
  const int output_descriptor = ::open(request.output_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
  if (output_descriptor < 0) { throw errno_error("cannot open cached benchmark image directory", request.output_root.string()); }
  FileHandle output_directory(output_descriptor);
@@ -408,10 +411,10 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
    });
   }
   if (request.trace) { ++inspected; }
-  auto allowance = request.execution ? request.execution->reserve(BenchmarkResources::handles(1, true), directory_allowance) : BenchmarkAllowance{};
+  auto allowance = request.execution ? request.execution->execution().reserve(CompileResources::handles(1, true), directory_allowance) : CompileAllowance{};
   std::shared_ptr<const BenchmarkEncodedImage> payload;
   try {
-   payload = BenchmarkEncodedImage::open(output_directory.get(), image_id, request.validator, request.cancel_requested, request.execution, std::move(allowance),
+   payload = BenchmarkEncodedImage::open(output_directory.get(), image_id, request.validator, request.cancel_requested, (request.execution ? &request.execution->execution() : nullptr), std::move(allowance),
     request.execution ? request.execution->image_input(request.output_root, image_id) : nullptr);
   } catch (const InvalidImageError&) {
    invalidate_cached_image_proofs(request.output_root);
@@ -442,7 +445,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  scheduled.reserve(pending_writes);
  std::unordered_map<std::uint64_t, std::uint64_t> required_positions;
  required_positions.reserve(pending_writes);
- BenchmarkArchive reader(request.archive_path, request.execution, checked_byte_add(64ULL << 20, request.validator_workspace_bytes), directory_allowance, request.decompression_workers, false);
+ BenchmarkArchive reader(request.archive_path, (request.execution ? &request.execution->execution() : nullptr), checked_byte_add(64ULL << 20, request.validator_workspace_bytes), directory_allowance, request.decompression_workers, false);
  stream_allowance = reader.allowance().split_storage(64ULL << 20);
  const auto archive_work = [&](const std::function<void()>& work) { reader.cpu(work); };
  CachedImageWritePool write_pool(request.cache_write_workers, pending_writes, request.output_root, request.progress, completed.size(), request.cancel_requested, request.image_ready, request.storage,

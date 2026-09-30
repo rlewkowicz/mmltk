@@ -1,10 +1,10 @@
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/detail/benchmark_json.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cmath>
-#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -12,6 +12,9 @@
 #include <sys/mman.h>
 #include <cerrno>
 namespace mmltk::backend::data::benchmark_internal {
+using detail::CompileExecution;
+using mmltk::backend::data::detail::CompileTaskKind;
+
 using mmltk::common::io::errno_error;
 using mmltk::common::io::FileHandle;
 [[nodiscard]] bool consume_json_string_token(const char token, bool& in_string, bool& escaped) noexcept {
@@ -85,13 +88,13 @@ namespace {
 class JsonStructure final {
  const PaddedMappedFile& input_;
  mmltk::common::concurrency::CancellationObservation cancellation_;
- BenchmarkCompilePipeline* execution_;
+ CompileExecution* execution_;
  bool strict_;
  std::size_t checkpoint_ = 0;
 
 public:
  std::size_t position = 0;
- JsonStructure(const PaddedMappedFile& input, mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkCompilePipeline* execution, bool strict)
+ JsonStructure(const PaddedMappedFile& input, mmltk::common::concurrency::CancellationObservation cancellation, CompileExecution* execution, bool strict)
      : input_(input), cancellation_(cancellation), execution_(execution), strict_(strict) {}
  [[noreturn]] static void fail() { throw AnnotationDocumentRejected("invalid benchmark JSON envelope"); }
  char peek() const { return position < input_.size() ? input_.data()[position] : '\0'; }
@@ -293,7 +296,7 @@ public:
 };
 }  // namespace
 void discover_json_arrays(const PaddedMappedFile& file, std::span<const std::string_view> names, bool reject_duplicates,
- const std::function<void(std::size_t, std::span<const ByteRange>, bool)>& consume, mmltk::common::concurrency::CancellationObservation cancellation, BenchmarkCompilePipeline* execution,
+ const std::function<void(std::size_t, std::span<const ByteRange>, bool)>& consume, mmltk::common::concurrency::CancellationObservation cancellation, CompileExecution* execution,
  const std::function<void(const std::function<void()>&)>& metadata_work) {
  JsonStructure input(file, cancellation, execution, reject_duplicates);
  std::vector<bool> found(names.size());
@@ -399,7 +402,7 @@ void discover_json_arrays(const PaddedMappedFile& file, std::span<const std::str
   };
   const auto work = [&] {
    if (execution)
-    execution->run(BenchmarkStage::Metadata, {65536, 0}, scan);
+    execution->run(CompileTaskKind::Metadata, {65536, 0}, scan);
    else
     scan(0);
   };

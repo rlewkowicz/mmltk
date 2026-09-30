@@ -1,10 +1,15 @@
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/common/math/deterministic_sampling.h"
 #include "src/backend/data/benchmark/detail/benchmark_sampling.h"
-#include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/pch_std.h"
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data::benchmark_internal {
+using detail::CompileExecution;
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileTaskKind;
+
 using mmltk::common::math::checked_cast;
 namespace {
 constexpr std::size_t kClassCount = 80U;
@@ -271,7 +276,7 @@ void select_image(SourceSelection* source, const std::uint32_t image_index, std:
 }  // namespace
 CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const NormalizedAnnotationIndex& coco_train, const NormalizedAnnotationIndex& objects365,
  const NormalizedAnnotationIndex& open_images, const std::span<const std::uint64_t> objects365_shard_bytes, mmltk::common::concurrency::CancellationObservation cancel_requested,
- BenchmarkCompilePipeline* execution) {
+ CompileExecution* execution) {
  if (coco_train.source != BenchmarkDatasetSource::kCoco2017 || objects365.source != BenchmarkDatasetSource::kObjects365V2 || open_images.source != BenchmarkDatasetSource::kOpenImagesV7) {
   throw std::runtime_error("combined supplemental sampler received the wrong sources");
  }
@@ -284,7 +289,7 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
  // Declaration order keeps credits until every transient vector and borrowed
  // callback below has retired, including exceptional exits. Child jobs draw
  // no additional credits and remain independently runnable when oversized.
- const auto workspace = execution ? execution->reserve({selection_workspace_bytes(objects365, open_images, objects365_shard_bytes.size(), target_images), 0}) : BenchmarkAllowance{};
+ const auto workspace = execution ? execution->reserve({selection_workspace_bytes(objects365, open_images, objects365_shard_bytes.size(), target_images), 0}) : CompileAllowance{};
  CombinedSupplementalSamplingResult result;
  result.target_images = target_images;
  result.open_images_floor = std::max<std::uint64_t>(1U, result.target_images / kOpenImagesDiversityDenominator);
@@ -294,7 +299,7 @@ CombinedSupplementalSamplingResult sample_combined_supplemental_indices(const No
  // share the existing CPU owner; the greedy cross-source choice stays serial.
  const auto parallel = [&](std::size_t count, const std::function<void(std::size_t)>& work) {
   if (execution)
-   execution->for_each(BenchmarkStage::Metadata, count, BenchmarkResources{}, work);
+   execution->for_each(CompileTaskKind::Metadata, count, CompileResources{}, work);
   else
    for (std::size_t i = 0; i < count; ++i) work(i);
  };

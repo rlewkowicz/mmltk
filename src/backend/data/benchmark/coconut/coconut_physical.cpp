@@ -28,6 +28,8 @@
 #include <vector>
 #include <fcntl.h>
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileResources;
+
 namespace {
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
 namespace common_io = mmltk::common::io;
@@ -282,7 +284,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
  const auto cancellation = state.cancellation;
  auto& execution = *state.execution;
  const auto lifecycle = state.cache->locks / (std::string(benchmark_source_name(archive.origin.artifact.source)) + "-" + archive.origin.cache_shard + ".images.lock");
- auto lease = ArtifactLease::acquire_charged(lifecycle, cancellation, &execution, archive_image_resources());
+ auto lease = ArtifactLease::acquire_charged(lifecycle, cancellation, &execution.execution(), archive_image_resources());
  const auto root = state.root(archive.origin.source);
  const auto inventory_path = state.cache->source_indexes(benchmark_source_name(archive.origin.artifact.source)) / (archive.origin.cache_shard + ".images.inventory");
  const auto proof_path = artifact.root / ".recipe-proofs/physical.inventory.complete.json";
@@ -295,7 +297,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
  };
  if (cache_only) {
   if (!std::filesystem::is_regular_file(inventory_path) || !std::filesystem::is_regular_file(proof_path)) return false;
-  auto controls = execution.reserve(BenchmarkResources::handles(1, false), lease->allowance());
+  auto controls = execution.execution().reserve(CompileResources::handles(1, false), lease->allowance());
   std::ifstream input(proof_path);
   if (!input) throw std::runtime_error("cannot read COCONut image cache proof: " + proof_path.string());
   const auto proof = nlohmann::json::parse(input, nullptr, false);
@@ -322,7 +324,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   artifact.admitted = true;
  }
  prepare_cached_image_directory(artifact.root);
- auto directory_allowance = execution.reserve(BenchmarkResources::handles(1), lease->allowance());
+ auto directory_allowance = execution.execution().reserve(CompileResources::handles(1), lease->allowance());
  const int descriptor = ::open(artifact.root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
  if (descriptor < 0) throw common_io::errno_error("cannot open physical image cache", artifact.root.string());
  common_io::FileHandle directory(descriptor);
@@ -405,7 +407,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
      if (rejected) rejected(image, "unreadable JPEG in retained source generation");
      return;
     }
-    auto input = BenchmarkEncodedImage::open(directory.get(), image.image_id, validate, cancellation, &execution, lease->allowance(), {}, 32ULL << 20);
+    auto input = BenchmarkEncodedImage::open(directory.get(), image.image_id, validate, cancellation, &execution.execution(), lease->allowance(), {}, 32ULL << 20);
     if (!input) throw BenchmarkImageError("cached inventory image is missing");
     if (!*complete) publish(image, std::move(input));
     if (state.progress) state.progress(CoconutEdition::Base, archive, image.image_id, artifact.completed_images);
@@ -433,7 +435,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   artifact.admitted = false;
   return false;
  }
- BenchmarkArchive reader(archive.download.path, &execution, 64ULL << 20, lease->allowance(), 1, true, {}, 1024, 2);
+ BenchmarkArchive reader(archive.download.path, &execution.execution(), 64ULL << 20, lease->allowance(), 1, true, {}, 1024, 2);
  std::vector<CoconutPhysicalImage> inventory;
  std::unordered_set<std::uint64_t> encountered;
  artifact.unreadable.clear();
@@ -460,7 +462,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   for (unsigned attempt = 0; attempt < 2; ++attempt) {
    try {
     BenchmarkEncodedImage::Ptr input;
-    if (!attempt && cache_generation_known) input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution, reader.allowance(), {}, 32ULL << 20);
+    if (!attempt && cache_generation_known) input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution.execution(), reader.allowance(), {}, 32ULL << 20);
     if (!input) {
      source_read = true;
      const auto encoded = reader.read(32ULL << 20, cancellation);
@@ -469,12 +471,12 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
      // A new source generation can retain identical healthy JPEG allocations.
      // Compare the actual bytes before reusing a cache from an unknown generation.
      try {
-      input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution, reader.allowance(), {}, 32ULL << 20);
+      input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution.execution(), reader.allowance(), {}, 32ULL << 20);
       if (input && !std::ranges::equal(input->encoded(), encoded)) input.reset();
      } catch (const BenchmarkImageError&) { input.reset(); } catch (const InvalidImageError&) { input.reset(); }
      if (!input) {
       if (std::filesystem::exists(cached_image_path(artifact.root, *id))) invalidate_cached_image_proofs(artifact.root);
-      input = BenchmarkEncodedImage::publish(directory.get(), *id, encoded, header, cancellation, destination, &execution, reader.allowance(), true);
+      input = BenchmarkEncodedImage::publish(directory.get(), *id, encoded, header, cancellation, destination, &execution.execution(), reader.allowance(), true);
      }
     }
     publish(image, std::move(input));

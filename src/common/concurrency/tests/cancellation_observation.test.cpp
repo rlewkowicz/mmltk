@@ -17,13 +17,23 @@ TEST_CASE("borrowed cancellation observes atomic and event sources directly", "[
  std::atomic<bool> atomic_source{false};
  const auto atomic = mmltk::common::concurrency::CancellationObservation::Atomic(atomic_source);
  CHECK_FALSE(atomic.requested());
+ CHECK(atomic.descriptor() == -1);
  atomic_source.store(true, std::memory_order_relaxed);
  CHECK(atomic.requested());
  auto [source, token] = EventSource::Mint();
  const auto event = mmltk::common::concurrency::CancellationObservation::Borrow(token);
  CHECK_FALSE(event.requested());
+ CHECK(event.descriptor() == token.descriptor());
+ struct Composite {
+  mmltk::common::concurrency::CancellationObservation outer;
+  bool cancelled() const noexcept { return outer.requested(); }
+  int descriptor() const noexcept { return outer.descriptor(); }
+ } composite{event};
+ const auto forwarded = mmltk::common::concurrency::CancellationObservation::Borrow(composite);
+ CHECK(forwarded.descriptor() == token.descriptor());
  REQUIRE(source.RequestCancel());
  CHECK(event.requested());
+ CHECK(forwarded.requested());
 }
 TEST_CASE("scoped event cancellation preserves borrowing consumption and source policy", "[common][concurrency]") {
  const auto exercise = []<bool CancelOnDestruction>() {

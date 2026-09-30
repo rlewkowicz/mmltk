@@ -1,5 +1,6 @@
 #pragma once
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/detail/compile_execution.h"
+#include "src/backend/data/detail/compile_resources.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <array>
 #include <optional>
@@ -13,7 +14,9 @@
 #include <string>
 #include <string_view>
 namespace mmltk::backend::data::benchmark_internal {
-class BenchmarkCompilePipeline;
+using mmltk::backend::data::detail::CompileAllowance;
+
+using detail::CompileExecution;
 // Rejected archive bytes are distinct from allocation, local I/O and storage failures.
 class BenchmarkArchiveError : public std::runtime_error {
 public:
@@ -30,8 +33,8 @@ public:
   std::size_t descriptors = 1;
  };
  [[nodiscard]] static InputRequirement input_requirement(const std::filesystem::path&, std::uint64_t consumer_workspace, std::size_t gzip_workers = 1);
- explicit BenchmarkArchive(const std::filesystem::path&, BenchmarkCompilePipeline* = nullptr, std::uint64_t workspace = 0, const BenchmarkAllowance& parent = {}, std::size_t gzip_workers = 1,
-  bool verify_gzip_crc = true, BenchmarkAllowance workspace_allowance = {}, std::size_t retained_gzip_windows = 1024, std::size_t consumer_descriptors = 0, std::size_t gzip_index_entries = 32768);
+ explicit BenchmarkArchive(const std::filesystem::path&, CompileExecution* = nullptr, std::uint64_t workspace = 0, const CompileAllowance& parent = {}, std::size_t gzip_workers = 1,
+  bool verify_gzip_crc = true, CompileAllowance workspace_allowance = {}, std::size_t retained_gzip_windows = 1024, std::size_t consumer_descriptors = 0, std::size_t gzip_index_entries = 32768);
  ~BenchmarkArchive();
  BenchmarkArchive(const BenchmarkArchive&) = delete;
  BenchmarkArchive& operator=(const BenchmarkArchive&) = delete;
@@ -71,7 +74,7 @@ public:
  void pause();
  // The next consumer supplies its continuation; retained inode custody stays
  // with the original file allowance until that physical descriptor closes.
- void resume(std::uint64_t workspace, const BenchmarkAllowance& parent = {}, std::size_t consumer_descriptors = 0);
+ void resume(std::uint64_t workspace, const CompileAllowance& parent = {}, std::size_t consumer_descriptors = 0);
  // Grow a live consumer envelope without reopening or discarding its seek state.
  bool try_resize_workspace(std::uint64_t workspace);
  [[nodiscard]] bool has_member(const std::string&) const;
@@ -92,7 +95,7 @@ public:
  // Full active decoder/prefetch envelope plus retained member capacity.
  // Calling read does not quiesce native workers, so none of their bound is lent.
  [[nodiscard]] std::uint64_t retained_workspace_bytes() const;
- [[nodiscard]] BenchmarkAllowance allowance() const;
+ [[nodiscard]] CompileAllowance allowance() const;
  void cpu(const std::function<void()>&) const;
 
 private:

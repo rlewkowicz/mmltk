@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -39,6 +40,9 @@ public:
  // A repair with a canonical destination uses the actual pixel consumption as
  // its acceptance. Returns false when this ticket has no registered consumer.
  [[nodiscard]] bool consume(const CachedImageReady&) const;
+ // Bind to this exact source attempt/image generation. An accepted subscription
+ // settles once after physical pixel completion or withdrawal, outside fact locks.
+ [[nodiscard]] bool subscribe(std::uint64_t, std::function<void(std::exception_ptr)>) const;
  void geometry_ready(std::uint64_t, std::pair<std::uint32_t, std::uint32_t>) const;
  [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(state_); }
 

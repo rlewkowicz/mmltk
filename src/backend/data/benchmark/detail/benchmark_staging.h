@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/common/io/file_memory.h"
 #include <cstddef>
@@ -7,6 +8,8 @@
 #include <string_view>
 #include <sys/types.h>
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileTaskKind;
+
 class BenchmarkStagedArtifact final {
 public:
  enum class Publication { Rename, RenameAndSync, DurableReplace };

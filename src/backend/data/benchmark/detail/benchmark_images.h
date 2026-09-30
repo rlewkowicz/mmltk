@@ -1,5 +1,5 @@
 #pragma once  // backend.data private implementation boundary
-#include "src/backend/data/benchmark/detail/benchmark_resources.h"
+#include "src/backend/data/detail/compile_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include <algorithm>
 #include <atomic>
@@ -18,10 +18,13 @@
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+
 // Source lifecycle plus the directory/output and archive/decoder descriptor
 // pairs. A metadata producer commits this complete continuation before its
 // borrowed input can wait for an image reader.
-[[nodiscard]] BenchmarkResources archive_image_resources();
+[[nodiscard]] CompileResources archive_image_resources();
 class BenchmarkCompilePipeline;
 class StorageReservationPool;
 // Parses the "quarantined" manifest array shared by the cached-image manifests: each record must
@@ -103,7 +106,7 @@ struct ArchiveExtractionRequest {
  StorageReservationPool* storage = nullptr;
  // Synchronous validation scratch is admitted with its retained encoded input.
  std::uint64_t validator_workspace_bytes = 0;
- BenchmarkAllowance parent_allowance{};
+ CompileAllowance parent_allowance{};
 };
 [[nodiscard]] CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest request);
 }  // namespace mmltk::backend::data::benchmark_internal

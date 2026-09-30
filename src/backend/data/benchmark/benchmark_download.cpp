@@ -28,6 +28,9 @@
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+
 const std::string& download_failure_sha256(DownloadResult& artifact, mmltk::common::concurrency::CancellationObservation cancellation) {
  if (!artifact.failure_digest) {
   auto& memo = artifact.failure_digest.emplace();
@@ -1039,13 +1042,13 @@ struct SegmentTransfer {
 }  // namespace
 namespace {
 DownloadResult download_locked_artifact(const DownloadRequest& request, std::size_t concurrency, mmltk::common::concurrency::CancellationObservation cancellation, const DownloadProgressSink& progress,
- const BenchmarkTraceSink& trace, BenchmarkCurl& transport, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool& storage) {
+ const BenchmarkTraceSink& trace, BenchmarkCurl& transport, BenchmarkCompilePipeline* execution, const CompileAllowance& parent, StorageReservationPool& storage) {
  DownloadStorage destination(request, storage, trace);
  if (auto result = validate_complete_artifact(request, cancellation, progress, trace)) { return *result; }
  // The partial descriptor and atomic checkpoint/publication descriptor belong
  // to this source. Active request workspace is admitted separately by Curl.
- BenchmarkAllowance files;
- if (execution) files = execution->reserve(BenchmarkResources::handles(2, true), parent);
+ CompileAllowance files;
+ if (execution) files = execution->execution().reserve(CompileResources::handles(2, true), parent);
  destination.growth.withdraw_allocation();
  remove_invalid_complete_artifact(request);
  destination.growth.reconcile_download(request.destination);
@@ -1188,13 +1191,13 @@ class DownloadBatch final {
  const DownloadReadySink& ready_;
  const DownloadUnavailableSink& unavailable_;
  BenchmarkCompilePipeline* execution_;
- const BenchmarkAllowance& parent_;
+ const CompileAllowance& parent_;
  Cancellation external_;
  std::atomic<bool> stopped_{false};
  std::unique_ptr<BenchmarkCurl> local_transport_;
  BenchmarkCurl& transport_;
  std::size_t concurrency_;
- BenchmarkResources source_resources_ = BenchmarkResources::handles(1, true, 2);
+ CompileResources source_resources_ = CompileResources::handles(1, true, 2);
  std::unique_ptr<BenchmarkCurl::Channel> source_transport_;
  StorageReservationPool storage_;
  Cancellation cancellation_ = Cancellation::Borrow(*this);
@@ -1211,6 +1214,7 @@ class DownloadBatch final {
  std::vector<std::jthread> controllers_;
  void retire() noexcept {
   stopped_.store(true, std::memory_order_relaxed);
+  if (execution_) execution_->execution().notify_admission_change();
   jobs_changed_.notify_all();
   controllers_.clear();
  }
@@ -1241,6 +1245,7 @@ class DownloadBatch final {
     const std::lock_guard lock(mutex_);
     if (!error_) error_ = std::current_exception();
     stopped_.store(true, std::memory_order_relaxed);
+  if (execution_) execution_->execution().notify_admission_change();
     jobs_changed_.notify_all();
    }
    // The slot is reusable only after its complete borrowed job has retired.
@@ -1255,7 +1260,7 @@ class DownloadBatch final {
 
 public:
  DownloadBatch(const std::vector<DownloadRequest>& requests, std::size_t requested_concurrency, Cancellation cancellation, const DownloadProgressSink& observer, const BenchmarkTraceSink& trace,
-  const DownloadReadySink& ready, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, StorageReservationPool* storage, const DownloadUnavailableSink& unavailable)
+  const DownloadReadySink& ready, BenchmarkCompilePipeline* execution, const CompileAllowance& parent, StorageReservationPool* storage, const DownloadUnavailableSink& unavailable)
      : requests_(requests),
        observer_(observer),
        trace_(trace),
@@ -1289,6 +1294,7 @@ public:
  DownloadBatch(const DownloadBatch&) = delete;
  DownloadBatch& operator=(const DownloadBatch&) = delete;
  bool cancelled() const noexcept { return stopped_.load(std::memory_order_relaxed) || external_.requested(); }
+ [[nodiscard]] int descriptor() const noexcept { return external_.descriptor(); }
  std::vector<DownloadResult> run() try {
   // Thread startup is inside the fully constructed owner's lifetime. A partial
   // startup failure signals and joins every already-started controller.
@@ -1307,7 +1313,7 @@ public:
    done_.clear();
    for (auto it = pending_.begin(); it != pending_.end() && !free_.empty();) {
     const auto index = *it;
-    auto lease = ArtifactLease::try_acquire_charged(requests_[index].lock_path, cancellation_, execution_, source_resources_, parent_);
+    auto lease = ArtifactLease::try_acquire_charged(requests_[index].lock_path, cancellation_, (execution_ ? &execution_->execution() : nullptr), source_resources_, parent_);
     if (!lease) {
      ++it;
      continue;
@@ -1342,13 +1348,13 @@ public:
 };
 }  // namespace
 std::optional<DownloadResult> try_cached_download(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancellation, const BenchmarkTraceSink& trace,
- BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent, const DownloadProgressSink& progress) {
- auto lease = ArtifactLease::try_acquire_charged(request.lock_path, cancellation, execution, BenchmarkResources::handles(2, true), parent);
+ BenchmarkCompilePipeline* execution, const CompileAllowance& parent, const DownloadProgressSink& progress) {
+ auto lease = ArtifactLease::try_acquire_charged(request.lock_path, cancellation, (execution ? &execution->execution() : nullptr), CompileResources::handles(2, true), parent);
  if (!lease) return std::nullopt;
  return validate_complete_artifact(request, cancellation, progress, trace);
 }
 std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t requested_concurrency, mmltk::common::concurrency::CancellationObservation cancel_requested,
- const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready, BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent,
+ const DownloadProgressSink& observer, const BenchmarkTraceSink& trace, const DownloadReadySink& ready, BenchmarkCompilePipeline* execution, const CompileAllowance& parent,
  StorageReservationPool* storage, const DownloadUnavailableSink& unavailable) {
  if (requests.empty()) return {};
  if (!requested_concurrency) throw std::runtime_error("benchmark download concurrency must be positive");
@@ -1363,9 +1369,9 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
  return batch.run();
 }
 void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace,
- BenchmarkCompilePipeline* execution, const BenchmarkAllowance& parent) {
+ BenchmarkCompilePipeline* execution, const CompileAllowance& parent) {
  if (request.artifact_id.empty() || request.destination.empty() || request.lock_path.empty()) { throw std::runtime_error("benchmark download invalidation request is incomplete"); }
- auto lease = ArtifactLease::acquire_charged(request.lock_path, cancel_requested, execution, BenchmarkResources::handles(1, true), parent);
+ auto lease = ArtifactLease::acquire_charged(request.lock_path, cancel_requested, (execution ? &execution->execution() : nullptr), CompileResources::handles(1, true), parent);
  const std::array paths{
   request.destination,
   complete_metadata_path(request),

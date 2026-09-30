@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include <system_error>
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
@@ -24,6 +25,11 @@
 #include <thread>
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileResources;
+using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileTaskKind;
+using mmltk::backend::data::detail::CompileExecution;
+
 class CoconutComponentBacking final : public CoconutComponentMetadata {
 public:
  NormalizedAnnotationReadView index;
@@ -534,7 +540,7 @@ struct PendingNativeImage {
 };
 class Importer final {
  struct Worker {
-  BenchmarkAllowance allowance;
+  CompileAllowance allowance;
   CoconutNativeWorkspace native;
   std::atomic<std::uint64_t> retained{0};
   explicit Worker(const CoconutImportRequest& request) : native(request.limits, request.cancellation) { native.recovery(request.recovery); }
@@ -587,7 +593,7 @@ public:
    return workspace.admit_png(record, png);
   } catch (const CoconutInputError& error) { throw CoconutInputError(physical.member + ": " + error.what()); }
  }
- std::uint64_t png_workspace(const CoconutRecord& record, std::size_t position, std::span<const std::uint8_t> png, const BenchmarkAllowance& allowance, dataset::MaskDimensions& dimensions) {
+ std::uint64_t png_workspace(const CoconutRecord& record, std::size_t position, std::span<const std::uint8_t> png, const CompileAllowance& allowance, dataset::MaskDimensions& dimensions) {
   const auto admitted = identify(record);
   if (!admitted) return 0;
   const auto& physical = *admitted;
@@ -600,7 +606,7 @@ public:
     } catch (const CoconutInputError&) { dimensions = {record.width, record.height}; }
    };
    if (request_.execution)
-    request_.execution->run(BenchmarkStage::Normalize, {}, inspect, allowance);
+    request_.execution->execution().run(CompileTaskKind::Normalize, {}, inspect, allowance);
    else
     inspect(0);
   }
@@ -616,7 +622,7 @@ public:
    for (auto& image : component.inventory) image.source_ordinal = source_ordinals_.at(image.source_ordinal);
   }
  }
- void retire_input(const BenchmarkAllowance& allowance) {
+ void retire_input(const CompileAllowance& allowance) {
   const std::lock_guard lock(groups_mutex_);
   const auto retire = [&](Worker& worker) {
    if (worker.allowance.aliases(allowance)) {
@@ -658,7 +664,7 @@ public:
   if (input.membership) (void)identify(record);
   if (input.membership && !request_.metadata_only) {
    if (request_.execution && input.allowance && input.live_bytes <= input.allowance.bytes())
-    request_.execution->with_unused_workspace(input.allowance, input.live_bytes, [&] { request_.execution->run(BenchmarkStage::Metadata, {}, [](std::size_t) {}, input.allowance); });
+    request_.execution->execution().with_unused_workspace(input.allowance, input.live_bytes, [&] { request_.execution->execution().run(CompileTaskKind::Metadata, {}, [](std::size_t) {}, input.allowance); });
    return;
   }
   Worker* worker;
@@ -694,7 +700,7 @@ public:
   // Pressure comes from blocked admission, never a diagnostic observer. The
   // sequence also checks at every growth/group boundary and closes at
   // terminal, so recovery becoming ready after this check cannot pin a reader.
-  if (!request_.execution || !request_.execution->resource_pressure()) return;
+  if (!request_.execution || !request_.execution->execution().resource_pressure()) return;
   std::unique_lock lock(groups_mutex_);
   const auto ready = recovery_ready_;
   if (ready == recovery_settled_) return;
@@ -718,7 +724,7 @@ public:
   return lineage.annotation_input_identity == request_.input_identity && saved->inventory().physical == physical && lineage.original_generation == original.generation &&
          lineage.original_annotation_identity == identity;
  }
- void consume(const CoconutRecord& record, std::span<const std::uint8_t> png, BenchmarkAllowance allowance = {}, std::uint64_t input_live_bytes = 0, Worker* selected = nullptr,
+ void consume(const CoconutRecord& record, std::span<const std::uint8_t> png, CompileAllowance allowance = {}, std::uint64_t input_live_bytes = 0, Worker* selected = nullptr,
   std::size_t position = SIZE_MAX, dataset::MaskDimensions dimensions = {}) {
   const auto admitted = identify(record, false, true);
   if (!admitted) {
@@ -745,7 +751,7 @@ public:
    retain_image(position, std::move(product));
   }
  }
- void consume_image(const CoconutRecord& record, const CoconutPhysicalImage& physical, std::span<const std::uint8_t> png, BenchmarkAllowance allowance, std::uint64_t input_live_bytes,
+ void consume_image(const CoconutRecord& record, const CoconutPhysicalImage& physical, std::span<const std::uint8_t> png, CompileAllowance allowance, std::uint64_t input_live_bytes,
   Worker* selected, std::size_t position, dataset::MaskDimensions dimensions) {
   if (position == SIZE_MAX) position = record.source_ordinal;
   auto& worker = selected ? *selected : archive_worker_;
@@ -785,7 +791,7 @@ public:
    dimensions = admit_png(workspace, record, png, physical);
   };
   if (request_.execution)
-   request_.execution->run(BenchmarkStage::Normalize, {}, inspect, allowance);
+   request_.execution->execution().run(CompileTaskKind::Normalize, {}, inspect, allowance);
   else
    inspect(0);
   auto upcoming = normalize && !saved ? workspace.workspace_bytes(record, std::uint64_t{dimensions.width} * dimensions.height, record.segments.size(), png.size(), !deferred) : 0;
@@ -855,14 +861,14 @@ public:
     // Archive workspaces retain memory independently of their opened input.
     // Borrow the promised staging handle before entering a CPU frame; Parquet
     // projections already admit that handle in their complete envelope.
-    const auto staging = descriptors && allowance && !allowance.descriptors() ? request_.execution->reserve(BenchmarkResources::handles(descriptors), allowance) : BenchmarkAllowance{};
-    request_.execution->run(request_.metadata_only ? BenchmarkStage::Metadata : BenchmarkStage::Normalize, {bytes, staging ? 0 : descriptors}, work, allowance);
+    const auto staging = descriptors && allowance && !allowance.descriptors() ? request_.execution->execution().reserve(CompileResources::handles(descriptors), allowance) : CompileAllowance{};
+    request_.execution->execution().run(request_.metadata_only ? CompileTaskKind::Metadata : CompileTaskKind::Normalize, {bytes, staging ? 0 : descriptors}, work, allowance);
    } else
     work(0);
   };
   try {
    if (request_.execution && allowance && input_live_bytes)
-    request_.execution->with_unused_workspace(allowance, mmltk::common::math::checked_add(input_live_bytes, bytes, "COCONut live consumer workspace overflow"), run);
+    request_.execution->execution().with_unused_workspace(allowance, mmltk::common::math::checked_add(input_live_bytes, bytes, "COCONut live consumer workspace overflow"), run);
    else
     run();
   } catch (...) {
@@ -972,7 +978,7 @@ public:
    mmltk::common::math::checked_add(join_bytes, std::uint64_t{65536}, "COCONut merge workspace overflow"), "COCONut merge workspace overflow");
   // Layout references retain their credit through final assembly and intervening
   // inventory I/O; only finite CPU work enters the shared lane.
-  auto merge_allowance = request_.execution ? request_.execution->reserve({workspace, 1}, request_.parent_allowance) : BenchmarkAllowance{};
+  auto merge_allowance = request_.execution ? request_.execution->execution().reserve({workspace, 1}, request_.parent_allowance) : CompileAllowance{};
   std::map<CoconutImageNamespace, std::vector<ImageChunk>> images;
   std::map<CoconutImageNamespace, AnnotationRejectCounts> rejected;
   std::map<CoconutImageNamespace, std::pair<std::size_t, std::size_t>> extents;
@@ -1004,7 +1010,7 @@ public:
     }
   };
   if (request_.execution)
-   request_.execution->run(BenchmarkStage::Metadata, {}, gather_images, merge_allowance);
+   request_.execution->execution().run(CompileTaskKind::Metadata, {}, gather_images, merge_allowance);
   else
    gather_images(0);
   std::vector<CoconutComponent> result;
@@ -1012,7 +1018,7 @@ public:
    throw_if_benchmark_cancelled(request_.cancellation);
    const auto order = [&](std::size_t) { std::ranges::sort(rows, {}, [](const ImageChunk& row) { return row.inventory->physical.image_id; }); };
    if (request_.execution)
-    request_.execution->run(BenchmarkStage::Metadata, {}, order, merge_allowance);
+    request_.execution->execution().run(CompileTaskKind::Metadata, {}, order, merge_allowance);
    else
     order(0);
    settle_annotation_identities(rows, [](const ImageChunk& row) -> const CoconutInventoryImage& { return *row.inventory; },
@@ -1106,7 +1112,7 @@ public:
     normalized = metadata_only ? seal_normalized_annotation_metadata(std::move(membership)) : assembly->finish();
    };
    if (request_.execution)
-    request_.execution->run(BenchmarkStage::Metadata, {}, assemble, merge_allowance);
+    request_.execution->execution().run(CompileTaskKind::Metadata, {}, assemble, merge_allowance);
    else
     assemble(0);
    sealed->input_identity =
@@ -1205,12 +1211,12 @@ private:
   pending_changed_.notify_one();
  }
  void recover_pending(std::stop_token stop) {
-  const auto lanes = request_.execution ? request_.execution->workers() : 1;
+  const auto lanes = request_.execution ? request_.execution->execution().workers() : 1;
   std::vector<std::unique_ptr<CoconutNativeWorkspace>> workers(lanes);
   auto retained_bytes = std::make_unique<std::atomic<std::uint64_t>[]>(lanes);
-  std::optional<BenchmarkCompilePipeline::Workspace> workspace;
+  std::optional<CompileExecution::Workspace> workspace;
   if (request_.execution)
-   workspace.emplace(*request_.execution, [&](std::size_t lane) noexcept {
+   workspace.emplace(request_.execution->execution(), [&](std::size_t lane) noexcept {
     workers[lane].reset();
     retained_bytes[lane].store(0, std::memory_order_relaxed);
    });
@@ -1242,7 +1248,7 @@ private:
     const std::lock_guard lock(groups_mutex_);
     ++recovery_ready_;
    }
-   if (request_.execution) request_.execution->notify_admission_change();
+   if (request_.execution) request_.execution->execution().notify_admission_change();
    CoconutNativeWorkspace sizing(request_.limits, request_.cancellation);
    sizing.originals(original.originals);
    std::uint64_t retained = 0;
@@ -1251,7 +1257,7 @@ private:
     const auto& native = *batch[i];
     const auto support = mmltk::common::math::checked_multiply<std::uint64_t>(native.supports.size(), std::uint64_t{1024}, "COCONut recovery support overflow");
     const auto pixels = std::uint64_t{native.dimensions.width} * native.dimensions.height;
-    return BenchmarkResources{
+    return CompileResources{
      mmltk::common::math::checked_add(
       mmltk::common::math::checked_add(mmltk::common::math::checked_add(retained, support, "COCONut retained recovery overflow"), pixels * 32U, "COCONut carving workspace overflow"),
       sizing.recovery() ? sizing.recovery()->workspace_bytes(*native.record) : 0, "COCONut recovery workspace overflow"),
@@ -1259,7 +1265,7 @@ private:
     };
    };
    const auto recover = [&](std::size_t i) {
-    const auto lane = request_.execution ? request_.execution->current_lane() : 0;
+    const auto lane = request_.execution ? request_.execution->execution().current_lane() : 0;
     auto& worker = workers[lane];
     if (!worker) worker = std::make_unique<CoconutNativeWorkspace>(request_.limits, request_.cancellation);
     worker->originals(original.originals);
@@ -1271,7 +1277,7 @@ private:
     retained_bytes[lane].store(worker->retained_bytes(), std::memory_order_relaxed);
    };
    if (request_.execution)
-    request_.execution->for_each(BenchmarkStage::Recovery, batch.size(), demand, recover, *workspace);
+    request_.execution->execution().for_each(CompileTaskKind::Recovery, batch.size(), demand, recover, *workspace);
    else
     for (std::size_t i = 0; i < batch.size(); ++i) recover(i);
    for (auto& native : batch) {
@@ -1381,7 +1387,7 @@ public:
   const auto live = mmltk::common::math::checked_add(archive_->retained_workspace_bytes(), importer_.retained_workspace_bytes(), "COCONut streaming parser overflow");
   const auto allowance = archive_->allowance();
   if (live <= allowance.bytes() && bytes <= allowance.bytes() - live)
-   request_.execution->run(BenchmarkStage::Metadata, {bytes, 0}, [&](std::size_t) { work(); }, allowance);
+   request_.execution->execution().run(CompileTaskKind::Metadata, {bytes, 0}, [&](std::size_t) { work(); }, allowance);
   else {
    pause();
    work();
@@ -1446,7 +1452,7 @@ private:
   // promise. Admit the full consumer envelope at the first native mask.
   if (archive_ && !workspace_) pause();
   if (!archive_) {
-   archive_ = std::make_shared<Archive>(request_.mask_archive, request_.execution, workspace, request_.parent_allowance, 1, true, BenchmarkAllowance{}, 1024, 1);
+   archive_ = std::make_shared<Archive>(request_.mask_archive, (request_.execution ? &request_.execution->execution() : nullptr), workspace, request_.parent_allowance, 1, true, CompileAllowance{}, 1024, 1);
    records_.archive = archive_;
    workspace_ = workspace;
   } else if (paused_ || workspace > workspace_) {
@@ -1485,7 +1491,7 @@ std::uint32_t dimension(const JsonAtom& field, const CoconutImportLimits& limits
  if (value == 0 || value > limits.max_dimension) invalid("image dimension exceeds admission");
  return static_cast<std::uint32_t>(value);
 }
-void json_rows(const CoconutImportRequest& request, const PaddedMappedFile& input, std::span<const ByteRange> rows, std::vector<JsonParser>& parsers, BenchmarkCompilePipeline::Workspace* workspace,
+void json_rows(const CoconutImportRequest& request, const PaddedMappedFile& input, std::span<const ByteRange> rows, std::vector<JsonParser>& parsers, CompileExecution::Workspace* workspace,
  const std::function<void(const JsonRow&, std::size_t)>& consume, const std::function<void(std::size_t, std::size_t)>& ready = {}, bool parallel = false,
  const std::function<bool(std::size_t)>& parsed = {}, AnnotationMaskStream* masks = nullptr) {
  // Source/lane parser capacity survives bounded callbacks under IdleScratch
@@ -1494,7 +1500,7 @@ void json_rows(const CoconutImportRequest& request, const PaddedMappedFile& inpu
   auto end = first + 1;
   while (end < rows.size() && rows[end].end - rows[first].begin <= (256U << 10)) ++end;
   const auto parse = [&](std::size_t job) {
-   auto& storage = parsers[request.execution ? request.execution->current_lane() : 0];
+   auto& storage = parsers[request.execution ? request.execution->execution().current_lane() : 0];
    for (auto i = parallel ? first + job : first; i < (parallel ? first + job + 1 : end); ++i) {
     throw_if_benchmark_cancelled(request.cancellation);
     if (parsed && parsed(i)) continue;
@@ -1507,7 +1513,7 @@ void json_rows(const CoconutImportRequest& request, const PaddedMappedFile& inpu
     if (!row.object) invalid("panoptic row must be an object");
     consume(row, i);
     storage.account();
-    if (request.execution && !parallel && (i - first + 1) % 32 == 0) request.execution->cooperate();
+    if (request.execution && !parallel && (i - first + 1) % 32 == 0) request.execution->execution().cooperate();
    }
   };
   // Previous nested high-water capacity is charged until real retirement.
@@ -1522,11 +1528,11 @@ void json_rows(const CoconutImportRequest& request, const PaddedMappedFile& inpu
    const auto incoming = mmltk::common::math::checked_add(nested,
     mmltk::common::math::checked_add(std::uint64_t{65536}, mmltk::common::math::checked_multiply(std::uint64_t{bytes}, 32U, "COCONut JSON workspace overflow"), "COCONut JSON workspace overflow"),
     "COCONut JSON workspace overflow");
-   return BenchmarkResources{mmltk::common::math::checked_add(retained, incoming, "COCONut retained JSON workspace overflow"), 0};
+   return CompileResources{mmltk::common::math::checked_add(retained, incoming, "COCONut retained JSON workspace overflow"), 0};
   };
   const auto work = [&] {
    if (request.execution)
-    request.execution->for_each(BenchmarkStage::Metadata, parallel ? end - first : 1, demand, parse, *workspace);
+    request.execution->execution().for_each(CompileTaskKind::Metadata, parallel ? end - first : 1, demand, parse, *workspace);
    else if (parallel) {
     for (auto i = first; i < end; ++i) parse(i - first);
    } else
@@ -1567,11 +1573,11 @@ void json_records(const CoconutImportRequest& request, CoconutAnnotationRecords&
   }
   return stem;
  };
- auto handles = request.execution ? request.execution->reserve(BenchmarkResources::handles(1, true), request.parent_allowance) : BenchmarkAllowance{};
+ auto handles = request.execution ? request.execution->execution().reserve(CompileResources::handles(1, true), request.parent_allowance) : CompileAllowance{};
  const PaddedMappedFile input(request.annotation_json);
- std::vector<JsonParser> parsers(request.execution ? request.execution->workers() : 1);
- std::optional<BenchmarkCompilePipeline::Workspace> parser_workspace;
- if (request.execution) parser_workspace.emplace(*request.execution, [&](std::size_t lane) noexcept { parsers[lane].retire(); });
+ std::vector<JsonParser> parsers(request.execution ? request.execution->execution().workers() : 1);
+ std::optional<CompileExecution::Workspace> parser_workspace;
+ if (request.execution) parser_workspace.emplace(request.execution->execution(), [&](std::size_t lane) noexcept { parsers[lane].retire(); });
  auto* workspace = parser_workspace ? &*parser_workspace : nullptr;
  constexpr std::array<std::string_view, 3> fields{"categories", "images", "annotations"};
  const auto category_row = [&](const JsonRow& row, std::size_t) {
@@ -1692,7 +1698,7 @@ void json_records(const CoconutImportRequest& request, CoconutAnnotationRecords&
    annotations(pending_annotations);
    std::vector<ByteRange>().swap(pending_annotations);
   }
- }, request.cancellation, request.execution, [&](const std::function<void()>& work) {
+ }, request.cancellation, (request.execution ? &request.execution->execution() : nullptr), [&](const std::function<void()>& work) {
   if (masks)
    masks->metadata(65536, work);
   else
@@ -1706,7 +1712,7 @@ void json_records(const CoconutImportRequest& request, CoconutAnnotationRecords&
    }
   };
   if (request.execution)
-   request.execution->run(BenchmarkStage::Metadata, {}, check_joins);
+   request.execution->execution().run(CompileTaskKind::Metadata, {}, check_joins);
   else
    check_joins(0);
  }
@@ -1722,7 +1728,7 @@ void xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecord
  if (owned)
   owned->resume(workspace, request.parent_allowance);
  else
-  owned = std::make_shared<Archive>(request.mask_archive, request.execution, workspace, request.parent_allowance, 1, true, BenchmarkAllowance{}, 1024, 0);
+  owned = std::make_shared<Archive>(request.mask_archive, (request.execution ? &request.execution->execution() : nullptr), workspace, request.parent_allowance, 1, true, CompileAllowance{}, 1024, 0);
  auto& archive = *owned;
  retained.archive = owned;
  std::unique_ptr<AnnotationMaskStream> masks;
@@ -2099,7 +2105,7 @@ void CoconutAnnotationRecords::discard() noexcept {
  prefixes_sealed_ = false;
 }
 std::shared_ptr<BenchmarkArchive> discover_coconut_masks(const CoconutImportRequest& request, std::stop_token stop) {
- auto archive = std::make_shared<Archive>(request.mask_archive, request.execution, 0, request.parent_allowance, 1, true, BenchmarkAllowance{}, 1024, 0);
+ auto archive = std::make_shared<Archive>(request.mask_archive, (request.execution ? &request.execution->execution() : nullptr), 0, request.parent_allowance, 1, true, CompileAllowance{}, 1024, 0);
  // Keep only the archive owner's compact locators. The eventual annotation
  // consumer borrows this same generation and its forward compressed context.
  try {
@@ -2114,6 +2120,7 @@ std::shared_ptr<BenchmarkArchive> discover_coconut_masks(const CoconutImportRequ
  }
 }
 std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequest& supplied) {
+ auto producer = supplied.execution ? supplied.execution->execution().open_class(detail::CompileWorkClass::Annotations) : CompileExecution::Producer{};
  auto retained = supplied.records ? supplied.records : std::make_shared<CoconutAnnotationRecords>();
  auto request = supplied;
  request.records = retained;
@@ -2131,10 +2138,10 @@ std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequ
    retained->identity = request.input_identity;
    if (request.parquet_shards.empty()) invalid("missing Parquet shards");
    read_coconut_parquet(request.parquet_shards, request.limits, request.cancellation,
-    [&](std::size_t group, const CoconutRecord& record, const CoconutAnnotationInput& input) { importer.consume_group(group, record, input); }, request.metadata_only, request.execution,
+    [&](std::size_t group, const CoconutRecord& record, const CoconutAnnotationInput& input) { importer.consume_group(group, record, input); }, request.metadata_only, (request.execution ? &request.execution->execution() : nullptr),
     [&](std::size_t group) { importer.retire_group(group); }, request.parent_allowance, retained.get(), [&](const CoconutRecord& record) { return importer.maximum_workspace(record); },
-    [&](const BenchmarkAllowance& producer) { importer.retire_input(producer); }, [&](const std::function<void()>& release) { importer.settle_ready_recovery(release); },
-    [&](const CoconutRecord& record, const BenchmarkAllowance&) { return importer.reusable_native(record); });
+    [&](const CompileAllowance& producer) { importer.retire_input(producer); }, [&](const std::function<void()>& release) { importer.settle_ready_recovery(release); },
+    [&](const CoconutRecord& record, const CompileAllowance&) { return importer.reusable_native(record); });
    importer.collect_groups();
    retained->identity = request.input_identity;
   } else {
@@ -2150,7 +2157,7 @@ std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequ
      else
       json_records(request, *retained);
     }
-    for (std::size_t i = 0; i < retained->size(); ++i) importer.consume(retained->record(i), {}, retained->archive ? retained->archive->allowance() : BenchmarkAllowance{}, 0, nullptr, i);
+    for (std::size_t i = 0; i < retained->size(); ++i) importer.consume(retained->record(i), {}, retained->archive ? retained->archive->allowance() : CompileAllowance{}, 0, nullptr, i);
     if (retained->archive) retained->archive->pause();
    } else if (request.mask_archive.empty() && request.accept_partial) {
     if (!retained->document_complete) json_records(request, *retained);

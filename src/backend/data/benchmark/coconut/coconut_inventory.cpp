@@ -1,3 +1,4 @@
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory_io.h"
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
@@ -5,6 +6,8 @@
 #include "src/pch_linux.h"
 #include "src/pch_std.h"
 namespace mmltk::backend::data::benchmark_internal {
+using mmltk::backend::data::detail::CompileTaskKind;
+
 namespace {
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
 [[noreturn]] void invalid(std::string_view detail) { throw CoconutInputError("COCONut: " + std::string(detail)); }
