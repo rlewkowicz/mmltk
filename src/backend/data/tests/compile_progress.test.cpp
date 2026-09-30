@@ -1,3 +1,5 @@
+#include "src/backend/data/detail/compile_workspace.h"
+#include "src/common/system/numa_memory.h"
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <array>
@@ -1142,4 +1144,27 @@ TEST_CASE("benchmark callback failures settle at explicit flush and warning fail
  CHECK_THROWS_WITH(reporter.flush(), "progress callback");
  REQUIRE(failure);
  CHECK_THROWS_WITH(reporter.phase(DatasetCompilePhase::Publishing, 0, 1), "progress callback");
+}
+
+TEST_CASE("compile preparation uses owner capacities protected reserves and the fixed budget formula", "[backend][data][compile][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page=mmltk::common::system::host_page_size();
+ std::array<CompileWorkspaceProfile,6> profiles{};
+ profiles[0]={page*3,page}; profiles[3]={32ULL<<20,page*2};
+ const auto small=CompileWorkspacePlan::prepare(2,profiles,page,page);
+ CHECK(small.protected_bytes==page*5);
+ CHECK(small.budget==(256ULL<<20)); CHECK(small.contexts==2); CHECK(small.context_bytes==(32ULL<<20));
+ const auto large=CompileWorkspacePlan::prepare(12,profiles,page,page);
+ CHECK(large.budget==large.protected_bytes+12*(32ULL<<20));
+ profiles[3].normal_bytes=1ULL<<30;
+ const auto capped=CompileWorkspacePlan::prepare(12,profiles,page,page);
+ CHECK(capped.budget==CompileWorkspacePlan::ceiling);
+ CHECK(capped.contexts<=12);
+ std::uint64_t materialized=capped.protected_bytes;
+ for (auto bytes : capped.context_capacities) materialized+=bytes;
+ CHECK(materialized<=capped.budget);
+ profiles[3].normal_bytes=CompileWorkspacePlan::ceiling+page;
+ const auto oversized=CompileWorkspacePlan::prepare(2,profiles,page,page);
+ CHECK(oversized.context_bytes==page*3); // Legal large image is an exceptional request, not a preparation rejection.
+ CHECK_THROWS_AS(CompileWorkspacePlan::prepare(2,profiles,CompileWorkspacePlan::ceiling,page),InsufficientCompileResources);
 }

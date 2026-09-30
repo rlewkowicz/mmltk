@@ -6,7 +6,10 @@
 #include <utility>
 #include <stdexcept>
 namespace mmltk::backend::data::detail {
+enum class CompileWorkClass : std::uint8_t { Acquisition, Extraction, Annotations, Pixels, Gather, Output, Count };
+enum class CompileWorkspaceWindow : std::uint8_t { Task, SharedSource, Compaction };
 class CompileExecution;
+struct CompileWorkspacePlan;
 struct CompileAdmission;
 class InsufficientCompileResources : public std::runtime_error {
 public:
@@ -24,12 +27,20 @@ struct CompileResources {
  bool retained_handles = false;
  // Live descriptor commitment for explicitly bound dependent reservations.
  std::size_t continuation_descriptors = 0;
+ // Actual fixed-bank storage, distinct from separately owned source/control charges.
+ bool supplied_workspace = false;
+ bool completion_workspace = false;
+ CompileWorkClass workspace_class = CompileWorkClass::Count;
+ // Checked upper bound for library-owned bookkeeping outside pinned payload.
+ std::uint64_t opaque_bytes = 0;
+ CompileWorkspaceWindow workspace_window = CompileWorkspaceWindow::Task;
  [[nodiscard]] static CompileResources handles(std::size_t count, bool producer = false, std::size_t continuation = 0);
 };
 struct CompileExecutionLimits {
  std::uint64_t transient_bytes = 0;
  std::size_t descriptors = 0;
  std::size_t task_records = 0;
+ std::shared_ptr<const CompileWorkspacePlan> workspace_plan;
 };
 // Shared custody charges backing once and returns it after its last reader.
 class CompileAllowance {
@@ -41,6 +52,7 @@ public:
  [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(credits_); }
  [[nodiscard]] std::uint64_t bytes() const noexcept;
  [[nodiscard]] std::size_t descriptors() const noexcept;
+ [[nodiscard]] std::span<std::byte> workspace() const;
  // Stable for the admitted external grant until its physical retirement.
  [[nodiscard]] std::span<const int> cpus() const noexcept;
  [[nodiscard]] bool aliases(const CompileAllowance& other) const noexcept { return credits_ && credits_ == other.credits_; }

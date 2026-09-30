@@ -54,6 +54,9 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <limits>
+#include <new>
+#include <utility>
 
 #if __cplusplus >= 201103L
 
@@ -77,6 +80,36 @@ using std ::size_t;
 
 namespace detail {
 
+// Explicit scoped backing for all resizer-owned buffers. The thread-local
+// pointer selects a caller-owned allocator; it owns no cache or memory.
+class CWorkspaceAllocator {
+ public:
+  virtual ~CWorkspaceAllocator() {}
+  virtual char* acquire(size_t bytes, bool payload) = 0;
+  virtual void release(char* data, size_t bytes) = 0;
+};
+inline CWorkspaceAllocator*& currentWorkspace() {
+ thread_local CWorkspaceAllocator* value = nullptr;
+ return value;
+}
+class CWorkspaceScope {
+ CWorkspaceAllocator* previous;
+ public:
+ explicit CWorkspaceScope(CWorkspaceAllocator& value) : previous(currentWorkspace()) { currentWorkspace() = &value; }
+ ~CWorkspaceScope() { currentWorkspace() = previous; }
+ private:
+ CWorkspaceScope(const CWorkspaceScope&);
+ CWorkspaceScope& operator=(const CWorkspaceScope&);
+};
+inline size_t workspaceSizeClass(size_t bytes) {
+ if (!bytes) return 0;
+ size_t value = 1;
+ while (value < bytes) {
+  if (value > std::numeric_limits<size_t>::max()/2) throw std::bad_alloc();
+  value *= 2;
+ }
+ return value;
+}
 class CThreadLocalBufferCache {
    public:
     ~CThreadLocalBufferCache() {
@@ -406,10 +439,10 @@ inline void normalizeFIRFilter(T* const p, const int l, const double DCGain, con
 template <typename T, typename capint = int>
 class CBuffer {
    public:
-    CBuffer() : Data(nullptr), DataAligned(nullptr), Capacity(0), Alignment(0) {}
+    CBuffer() : Data(nullptr), DataAligned(nullptr), Capacity(0), Alignment(0), Owner(nullptr) {}
 
-    CBuffer(const capint aCapacity, const int aAlignment = 0) {
-        allocinit(aCapacity, aAlignment);
+    CBuffer(const capint aCapacity, const int aAlignment = 0, const bool Payload = false) {
+        allocinit(aCapacity, aAlignment, Payload);
     }
 
     CBuffer(const CBuffer& Source) {
@@ -468,6 +501,7 @@ class CBuffer {
             char* const PrevData = Data;
             T* const PrevDataAligned = DataAligned;
             const int PrevAlignment = Alignment;
+            detail::CWorkspaceAllocator* PrevOwner = Owner;
 
             allocinit(NewCapacity, Alignment);
 
@@ -475,7 +509,8 @@ class CBuffer {
                 memcpy(DataAligned, PrevDataAligned, (size_t)PrevCapacity * sizeof(T));
             }
 
-            detail ::getThreadLocalBufferCache().release(PrevData, calcAllocBytes(PrevCapacity, PrevAlignment));
+            if (PrevOwner) PrevOwner->release(PrevData, detail::workspaceSizeClass(calcAllocBytes(PrevCapacity, PrevAlignment)));
+            else detail::getThreadLocalBufferCache().release(PrevData, calcAllocBytes(PrevCapacity, PrevAlignment));
         } else {
             freeData();
             allocinit(NewCapacity, Alignment);
@@ -509,16 +544,20 @@ class CBuffer {
     T* DataAligned;
     capint Capacity;
     int Alignment;
+    detail::CWorkspaceAllocator* Owner;
 
     static size_t calcAllocBytes(const capint aCapacity, const int aAlignment) {
         if (aCapacity <= 0) {
             return (0);
         }
 
-        return ((size_t)aCapacity * sizeof(T) + (aAlignment > 0 ? (size_t)aAlignment : 0));
+        const size_t extra = aAlignment > 0 ? (size_t)aAlignment : 0;
+        if ((size_t)aCapacity > (std::numeric_limits<size_t>::max()-extra)/sizeof(T)) throw std::bad_alloc();
+        return ((size_t)aCapacity * sizeof(T) + extra);
     }
 
-    void allocinit(const capint aCapacity, const int aAlignment) {
+    void allocinit(const capint aCapacity, const int aAlignment, const bool Payload = false) {
+        Owner = detail::currentWorkspace();
         if (aCapacity <= 0) {
             Data = nullptr;
             DataAligned = nullptr;
@@ -527,7 +566,8 @@ class CBuffer {
             return;
         }
 
-        char* const RawData = detail ::getThreadLocalBufferCache().acquire(calcAllocBytes(aCapacity, aAlignment));
+        const size_t Bytes = calcAllocBytes(aCapacity, aAlignment);
+        char* const RawData = Owner ? Owner->acquire(detail::workspaceSizeClass(Bytes), Payload) : detail::getThreadLocalBufferCache().acquire(Bytes);
 
         if (aAlignment == 0) {
             Data = RawData;
@@ -545,7 +585,8 @@ class CBuffer {
     }
 
     void freeData() {
-        detail ::getThreadLocalBufferCache().release(Data, calcAllocBytes(Capacity, Alignment));
+        if (Owner) Owner->release(Data, detail::workspaceSizeClass(calcAllocBytes(Capacity, Alignment)));
+        else detail::getThreadLocalBufferCache().release(Data, calcAllocBytes(Capacity, Alignment));
         Data = nullptr;
     }
 };
@@ -553,13 +594,15 @@ class CBuffer {
 template <class T>
 class CStructArray {
    public:
-    CStructArray() : ItemCount(0) {}
+    CStructArray() : Owner(detail::currentWorkspace()), ItemCount(0) {}
 
-    CStructArray(const CStructArray& Source) : ItemCount(0), Items(Source.getItemCount()) {
-        while (ItemCount < Source.getItemCount()) {
-            Items[ItemCount] = new T(Source[ItemCount]);
-            ItemCount++;
-        }
+    CStructArray(const CStructArray& Source) : Items(Source.getItemCount()), Owner(detail::currentWorkspace()), ItemCount(0) {
+        try {
+            while (ItemCount < Source.getItemCount()) {
+                Items[ItemCount] = makeItem(Source[ItemCount]);
+                ItemCount++;
+            }
+        } catch (...) { clear(); throw; }
     }
 
     ~CStructArray() {
@@ -573,7 +616,7 @@ class CStructArray {
         Items.updateCapacity(NewCount);
 
         while (ItemCount < NewCount) {
-            Items[ItemCount] = new T(Source[ItemCount]);
+            Items[ItemCount] = makeItem(Source[ItemCount]);
             ItemCount++;
         }
 
@@ -593,7 +636,7 @@ class CStructArray {
             Items.increaseCapacity(ItemCount * 3 / 2 + 1);
         }
 
-        Items[ItemCount] = new T();
+        Items[ItemCount] = makeItem();
         ItemCount++;
 
         return ((*this)[ItemCount - 1]);
@@ -604,13 +647,13 @@ class CStructArray {
             Items.increaseCapacity(NewCount);
 
             while (ItemCount < NewCount) {
-                Items[ItemCount] = new T();
+                Items[ItemCount] = makeItem();
                 ItemCount++;
             }
         } else {
             while (ItemCount > NewCount) {
                 ItemCount--;
-                delete Items[ItemCount];
+                destroyItem(Items[ItemCount]);
             }
         }
     }
@@ -618,7 +661,7 @@ class CStructArray {
     void clear() {
         while (ItemCount > 0) {
             ItemCount--;
-            delete Items[ItemCount];
+            destroyItem(Items[ItemCount]);
         }
     }
 
@@ -628,6 +671,18 @@ class CStructArray {
 
    private:
     CBuffer<T*> Items;
+    detail::CWorkspaceAllocator* Owner;
+    template<class... Args> T* makeItem(Args&&... args) {
+      if (!Owner) return new T(std::forward<Args>(args)...);
+      char* data = Owner->acquire(detail::workspaceSizeClass(sizeof(T)), false);
+      try { return new(data) T(std::forward<Args>(args)...); }
+      catch (...) { Owner->release(data, detail::workspaceSizeClass(sizeof(T))); throw; }
+    }
+    void destroyItem(T* data) {
+      if (!Owner) { delete data; return; }
+      data->~T(); Owner->release(reinterpret_cast<char*>(data), detail::workspaceSizeClass(sizeof(T)));
+    }
+
     int ItemCount;
 };
 
@@ -2213,7 +2268,7 @@ class CImageResizer {
     template <typename Tin, typename Tout>
     void resizeImage(const Tin* const SrcBuf, const int SrcWidth, const int SrcHeight, int SrcScanlineSize,
                      Tout* const NewBuf, const int NewWidth, const int NewHeight, const int ElCountIO, const double k,
-                     CImageResizerVars* const aVars = nullptr) const {
+                     CImageResizerVars* const aVars = nullptr, const bool PrepareOnly = false) const {
         if (SrcWidth == 0 || SrcHeight == 0) {
             memset(NewBuf, 0, (size_t)NewWidth * (size_t)NewHeight * sizeof(Tout));
 
@@ -2337,14 +2392,15 @@ class CImageResizer {
 
         // Runs all queued scanline workloads across the pool and this thread.
         const auto runWorkloads = [&]() {
+            if (PrepareOnly) return;
             ThreadPool.startAllWorkloads();
             td[0].processScanlineQueue();
             ThreadPool.waitAllWorkloadsToFinish();
         };
 
-        CBuffer<fptype, size_t> FltBuf((size_t)NewWidthE * (size_t)SrcHeight, fpclass ::fpalign);
+        CBuffer<fptype, size_t> FltBuf((size_t)NewWidthE * (size_t)SrcHeight, fpclass ::fpalign, true);
 
-        for (i = 0; i < SrcHeight; i++) {
+        for (i = 0; !PrepareOnly && i < SrcHeight; i++) {
             td[i % ThreadCount].addScanlineToQueue((void*)&SrcBuf[(size_t)i * (size_t)SrcScanlineSize],
                                                    &FltBuf[(size_t)i * (size_t)NewWidthE]);
         }
@@ -2380,7 +2436,7 @@ class CImageResizer {
                 td[i].initScanlineQueue(td[i].sopResizeV, NewWidth, SrcHeight, NewWidthE, NewWidthE);
             }
 
-            for (i = 0; i < NewWidth; i++) {
+            for (i = 0; !PrepareOnly && i < NewWidth; i++) {
                 td[i % ThreadCount].addScanlineToQueue(&FltBuf[i * ElCount], (fptype*)&NewBuf[i * ElCount]);
             }
 
@@ -2390,7 +2446,7 @@ class CImageResizer {
             return;
         }
 
-        CBuffer<fptype, size_t> ResBuf((size_t)NewWidthE * (size_t)NewHeight, fpclass ::fpalign);
+        CBuffer<fptype, size_t> ResBuf((size_t)NewWidthE * (size_t)NewHeight, fpclass ::fpalign, true);
 
         for (i = 0; i < ThreadCount; i++) {
             td[i].initScanlineQueue(td[i].sopResizeV, NewWidth, SrcHeight, NewWidthE, NewWidthE);
@@ -2398,7 +2454,7 @@ class CImageResizer {
 
         const int im = (fpclass ::packmode == 0 ? ElCount : 1);
 
-        for (i = 0; i < NewWidth; i++) {
+        for (i = 0; !PrepareOnly && i < NewWidth; i++) {
             td[i % ThreadCount].addScanlineToQueue(&FltBuf[i * im], &ResBuf[i * im]);
         }
 
@@ -2411,7 +2467,7 @@ class CImageResizer {
                 td[i].initScanlineQueue(sop, NewHeight, NewWidth);
             }
 
-            for (i = 0; i < NewHeight; i++) {
+            for (i = 0; !PrepareOnly && i < NewHeight; i++) {
                 td[i % ThreadCount].addScanlineToQueue(&ResBuf[(size_t)i * (size_t)NewWidthE],
                                                        &NewBuf[(size_t)i * (size_t)(NewWidth * ElCountIO)]);
             }
@@ -2443,7 +2499,7 @@ class CImageResizer {
         if (CDitherer ::isRecursive()) {
             td[0].getDitherer().init(NewWidth, Vars, TrMul, PkOut);
 
-            for (i = 0; i < NewHeight; i++) {
+            for (i = 0; !PrepareOnly && i < NewHeight; i++) {
                 fptype* const ResScanline = &ResBuf[(size_t)i * (size_t)NewWidthE];
 
                 if (Vars.UseSRGBGamma) {

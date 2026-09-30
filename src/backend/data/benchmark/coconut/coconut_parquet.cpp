@@ -334,7 +334,6 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
   ++row_ordinal;
  }
 }
-constexpr std::uint64_t kParquetPoolBytes = 256ULL << 20;
 // Fixed for the entire call, including cold discovery and every later group.
 // Physical controls are acquired by their owner from this continuation; their
 // retained-handle role never becomes the role of decoder or Arrow backing.

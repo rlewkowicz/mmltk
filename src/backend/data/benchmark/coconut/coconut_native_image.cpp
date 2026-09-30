@@ -12,6 +12,7 @@
 #include <type_traits>
 #include <utility>
 #include <stb_image.h>
+#include "src/common/system/numa_topology.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 namespace mmltk::backend::data::benchmark_internal {
 namespace {
@@ -112,6 +113,7 @@ void CoconutNativeWorkspace::originals(std::shared_ptr<const CoconutRecoveryOrig
 }
 void CoconutNativeWorkspace::recovery(const CoconutMaskRecovery* value) { recovery_ = value ? value->make_workspace() : nullptr; }
 void CoconutNativeWorkspace::retire() noexcept {
+ decode_memory_.reset();
  active_record_ = nullptr;
  active_dimensions_ = {};
  unlisted_segment_ = 0;
@@ -120,7 +122,7 @@ void CoconutNativeWorkspace::retire() noexcept {
  if (recovery_) recovery_->retire_scratch();
 }
 std::uint64_t CoconutNativeWorkspace::retained_bytes() const noexcept {
- return run_bytes_ + support_.capacity() * sizeof(CoconutSegmentSupport) + segment_by_id_.capacity() * sizeof(SegmentEntry) + (recovery_ ? recovery_->retained_bytes() : 0);
+ return (decode_memory_ ? decode_memory_->capacity_bytes() : 0) + run_bytes_ + support_.capacity() * sizeof(CoconutSegmentSupport) + segment_by_id_.capacity() * sizeof(SegmentEntry) + (recovery_ ? recovery_->retained_bytes() : 0);
 }
 CoconutNativeWorkspace::SegmentEntry& CoconutNativeWorkspace::segment_entry(std::uint32_t id) {
  auto slot = (static_cast<std::size_t>(id) * 2654435761U) & (segment_by_id_.size() - 1);
@@ -157,13 +159,14 @@ void CoconutNativeWorkspace::borrow_support(
  active_record_ = &record;
  active_dimensions_ = dimensions;
 }
-std::uint64_t CoconutNativeWorkspace::workspace_bytes(const CoconutRecord& record, std::uint64_t pixels, std::uint64_t segments, std::uint64_t encoded, bool recover) const {
+std::uint64_t CoconutNativeWorkspace::support_workspace_bytes(const CoconutRecord& record, std::uint64_t pixels, std::uint64_t segments, bool recover) const {
  using mmltk::common::math::checked_add;
  using mmltk::common::math::checked_multiply;
- // stb's encoded inflate input and scanlines/output; native run growth and
- // carving; support, open-address lookup, recovery grouping and ordinals.
- auto bytes = checked_add(checked_multiply(pixels, 96U, "COCONut pixel workspace overflow"), checked_multiply(encoded, 2U, "COCONut encoded workspace overflow"), "COCONut decode workspace overflow");
- bytes = checked_add(bytes, checked_multiply(segments, 1024U, "COCONut segment workspace overflow"), "COCONut normalize workspace overflow");
+ // Typed capacities for native runs (geometric growth plus immutable output),
+ // support records and the open-address table. PNG storage is admitted from its
+ // actual header by decoder_workspace_bytes before dispatch, separately.
+ auto bytes = checked_multiply(pixels, sizeof(RLEPair)*3U,"COCONut support workspace overflow");
+ bytes = checked_add(bytes,checked_multiply(segments,sizeof(CoconutSegmentSupport)+sizeof(SegmentEntry)*4U+sizeof(NormalizedBox)+sizeof(std::uint64_t)*4U,"COCONut segment workspace overflow"),"COCONut normalize workspace overflow");
  return checked_add(bytes, recover && recovery_ ? recovery_->workspace_bytes(record) : 0, "COCONut recovery workspace overflow");
 }
 dataset::MaskDimensions CoconutNativeWorkspace::admit_png(const CoconutRecord& record, std::span<const std::uint8_t> png) const {
@@ -179,18 +182,29 @@ dataset::MaskDimensions CoconutNativeWorkspace::admit_png(const CoconutRecord& r
  if (record.segments.size() > limits.max_segments) invalid("segment count exceeds admission");
  return {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
 }
-void CoconutNativeWorkspace::decode(const CoconutRecord& record, std::span<const std::uint8_t> png, dataset::MaskDimensions dimensions) {
+std::size_t CoconutNativeWorkspace::decoder_workspace_bytes(std::span<const std::uint8_t> png) const {
+ try { return detail::CompileImageDecoder::plan(decoder_.read_header(png,detail::CompileImagePolicy::Directory)).bytes(); }
+ catch (const detail::CompileImageError&) { invalid("cannot decode panoptic PNG"); }
+}
+void CoconutNativeWorkspace::decode(const CoconutRecord& record, std::span<const std::uint8_t> png, dataset::MaskDimensions dimensions, std::span<std::byte> supplied) {
  active_record_ = nullptr;
  unlisted_segment_ = 0;
  if (png.size() > limits_.max_png_bytes || png.size() > INT_MAX) invalid("PNG exceeds decode admission");
- int width = static_cast<int>(dimensions.width), height = static_cast<int>(dimensions.height), channels = 3;
+ int width = static_cast<int>(dimensions.width), height = static_cast<int>(dimensions.height);
  throw_if_benchmark_cancelled(cancellation_);
- std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> pixels(stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &width, &height, &channels, 3), stbi_image_free);
- if (!pixels) {
-  const auto* reason = stbi_failure_reason();
-  if (reason && (std::strcmp(reason, "outofmem") == 0 || std::strcmp(reason, "out of memory") == 0)) throw std::bad_alloc();
-  invalid("cannot decode panoptic PNG");
+ detail::CompileImageHeader header;
+ try { header=decoder_.read_header(png,detail::CompileImagePolicy::Directory); }
+ catch (const detail::CompileImageError&) { invalid("cannot decode panoptic PNG"); }
+ const auto bytes=detail::CompileImageDecoder::plan(header).bytes();
+ if (supplied.empty()) {
+  if (!decode_memory_) decode_memory_=std::make_unique<common::system::NumaMemory>(common::system::NumaTopology::Capture().permitted_nodes.front(),common::system::NumaMemory::Lock::Pages);
+  decode_memory_->ensure_bytes(bytes);
+  supplied={static_cast<std::byte*>(decode_memory_->data()),decode_memory_->capacity_bytes()};
  }
+ std::span<const std::uint8_t> pixels;
+ try { pixels=decoder_.decode_rgb(png,header,supplied); }
+ catch (const detail::CompileImageError&) { invalid("cannot decode panoptic PNG"); }
+ width=static_cast<int>(header.width); height=static_cast<int>(header.height);
  if (width <= 0 || height <= 0 || static_cast<std::uint32_t>(width) != dimensions.width || static_cast<std::uint32_t>(height) != dimensions.height || dimensions.width > limits_.max_dimension ||
      dimensions.height > limits_.max_dimension || std::uint64_t{dimensions.width} * dimensions.height > limits_.max_pixels || std::uint64_t{dimensions.width} * dimensions.height > UINT32_MAX ||
      record.segments.size() > limits_.max_segments)
@@ -219,7 +233,7 @@ void CoconutNativeWorkspace::decode(const CoconutRecord& record, std::span<const
  for (std::uint32_t begin = 0; begin < count;) {
   if ((begin / static_cast<std::uint32_t>(width)) % 64U == 0) throw_if_benchmark_cancelled(cancellation_);
   const auto id_at = [&](std::uint32_t position) {
-   const auto* pixel = pixels.get() + static_cast<std::size_t>(position) * 3U;
+   const auto* pixel = pixels.data() + static_cast<std::size_t>(position) * 3U;
    return static_cast<std::uint32_t>(pixel[0]) | (static_cast<std::uint32_t>(pixel[1]) << 8U) | (static_cast<std::uint32_t>(pixel[2]) << 16U);
   };
   const auto id = id_at(begin);

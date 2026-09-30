@@ -532,3 +532,30 @@ TEST_CASE("compiler projection rejects invalid canvases before writing padding",
  CHECK(std::ranges::all_of(destination, [](float value) { return value == -19.0F; }));
  check_compiler_projection(resizer, source, 19, 13, 11, 11, ImageResizeMode::Letterbox);
 }
+
+TEST_CASE("Supplied resizer preparation preserves RGB and planar numerical output", "[imaging][resize][workspace]") {
+ using namespace mmltk::backend::imaging::resample;
+ const bool perceptual=GENERATE(false,true);
+ const auto mode=GENERATE(ImageResizeMode::Stretch,ImageResizeMode::Letterbox);
+ const std::uint32_t sw=31,sh=19,dw=11,dh=9;
+ std::vector<std::uint8_t> source(sw*sh*3);
+ for (std::size_t i=0;i<source.size();++i) source[i]=static_cast<std::uint8_t>((i*71+i/3)%256);
+ const auto plan=RgbImageResizer::workspace_plan(sw,sh,dw,dh,mode,perceptual);
+ std::vector<std::byte> backing(plan.bytes()+63);
+ const auto aligned=(reinterpret_cast<std::uintptr_t>(backing.data())+63)/64*64;
+ std::span<std::byte> memory(reinterpret_cast<std::byte*>(aligned),plan.bytes());
+ RgbImageResizer supplied(1,perceptual),reference(1,perceptual);
+ supplied.prepare(plan,memory);
+ std::vector<float> expected(dw*dh*3),actual(expected.size(),-1);
+ const RgbConstImageView input{source.data(),{sw,sh,sw*3,0,source.size(),RgbPixelFormat::RGB8}};
+ const RgbImageLayout output{dw,dh,dw*sizeof(float),dw*dh*sizeof(float),expected.size()*sizeof(float),RgbPixelFormat::PlanarUnitSrgbF32};
+ reference.resize_to_planar(input,{expected.data(),output},mode);
+ supplied.resize_to_planar(input,{actual.data(),output},mode);
+ CHECK(std::memcmp(actual.data(),expected.data(),actual.size()*sizeof(float))==0);
+ const auto retained=supplied.retained_bytes();
+ supplied.prepare(plan,memory);
+ supplied.resize_to_planar(input,{actual.data(),output},mode);
+ CHECK(supplied.retained_bytes()==retained);
+ CHECK(std::memcmp(actual.data(),expected.data(),actual.size()*sizeof(float))==0);
+ CHECK_THROWS_AS(supplied.prepare(plan,memory.first(memory.size()-1)),std::length_error);
+}

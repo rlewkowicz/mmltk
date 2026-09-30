@@ -612,7 +612,7 @@ public:
   }
   return mmltk::common::math::checked_add(retained_workspace_bytes(),
    mmltk::common::math::checked_multiply(
-    assembly_workspace_.workspace_bytes(record, std::uint64_t{dimensions.width} * dimensions.height, record.segments.size(), png.size()), 2U, "COCONut PNG workspace overflow"),
+    assembly_workspace_.support_workspace_bytes(record, std::uint64_t{dimensions.width} * dimensions.height, record.segments.size()), 2U, "COCONut PNG workspace overflow"),
    "COCONut retained PNG workspace overflow");
  }
  void canonical_ordinals(std::vector<std::size_t> ordinals) {
@@ -652,7 +652,7 @@ public:
   const auto pixels = record.width && record.height ? std::uint64_t{record.width} * record.height : request_.limits.max_pixels;
   return mmltk::common::math::checked_add(retained,
    mmltk::common::math::checked_multiply(
-    assembly_workspace_.workspace_bytes(record, pixels, request_.limits.max_segments, request_.limits.max_png_bytes), 2U, "COCONut retained normalizer workspace overflow"),
+    assembly_workspace_.support_workspace_bytes(record, pixels, request_.limits.max_segments), 2U, "COCONut retained normalizer workspace overflow"),
    "COCONut retained normalizer workspace overflow");
  }
  void consume_group(std::size_t group, const CoconutRecord& record, const CoconutAnnotationInput& input) {
@@ -786,18 +786,20 @@ public:
   const auto* reused = normalize && !saved ? reusable_image(physical, reused_position) : nullptr;
   const auto publication = normalize ? request_.physical_membership->label_publication(request_.edition, physical) : BenchmarkSourcePublication{};
   if (normalize && !saved && !reused && png.empty()) throw CoconutInputError("missing required panoptic mask");
+  std::size_t decode_bytes=0;
   const auto inspect = [&](std::size_t) {
-   if (!normalize || reused || saved || dimensions.width) return;
-   dimensions = admit_png(workspace, record, png, physical);
+   if (!normalize || reused || saved) return;
+   if (!dimensions.width) dimensions = admit_png(workspace, record, png, physical);
+   decode_bytes=workspace.decoder_workspace_bytes(png);
   };
   if (request_.execution)
    request_.execution->execution().run(CompileTaskKind::Normalize, {}, inspect, allowance);
   else
    inspect(0);
-  auto upcoming = normalize && !saved ? workspace.workspace_bytes(record, std::uint64_t{dimensions.width} * dimensions.height, record.segments.size(), png.size(), !deferred) : 0;
+  auto upcoming = normalize && !saved ? workspace.support_workspace_bytes(record, std::uint64_t{dimensions.width} * dimensions.height, record.segments.size(), !deferred) : 0;
   if (!deferred && workspace.recovery() && allowance && (input_live_bytes > allowance.bytes() || upcoming > allowance.bytes() - input_live_bytes)) {
    deferred = true;
-   upcoming = workspace.workspace_bytes(record, std::uint64_t{dimensions.width} * dimensions.height, record.segments.size(), png.size(), false);
+   upcoming = workspace.support_workspace_bytes(record, std::uint64_t{dimensions.width} * dimensions.height, record.segments.size(), false);
   }
   auto retained = workspace.retained_bytes();
   if (allowance && (input_live_bytes > allowance.bytes() || upcoming > allowance.bytes() - input_live_bytes || retained > allowance.bytes() - input_live_bytes - upcoming)) {
@@ -828,7 +830,7 @@ public:
       complete = workspace.reuse(record, physical, reused->index(), reused_position, reused->inventory_image(reused_position),
        reused->recovery_policy() ? &reused->recovery_image(reused_position) : nullptr, lineage, reused->image_input_identity(reused_position), reused->required_labels_valid(reused_position));
      else {
-      workspace.decode(record, png, dimensions);
+      workspace.decode(record, png, dimensions, request_.execution ? request_.execution->execution().current_allowance().workspace() : std::span<std::byte>{});
       if (deferred) {
        auto native = std::make_shared<PendingNativeImage>();
        native->record = &record;
@@ -862,7 +864,11 @@ public:
     // Borrow the promised staging handle before entering a CPU frame; Parquet
     // projections already admit that handle in their complete envelope.
     const auto staging = descriptors && allowance && !allowance.descriptors() ? request_.execution->execution().reserve(CompileResources::handles(descriptors), allowance) : CompileAllowance{};
-    request_.execution->execution().run(request_.metadata_only ? CompileTaskKind::Metadata : CompileTaskKind::Normalize, {bytes, staging ? 0 : descriptors}, work, allowance);
+    if (decode_bytes) {
+     request_.execution->execution().submit({.kind=CompileTaskKind::Normalize,
+      .resources={.bytes=decode_bytes,.descriptors=staging ? 0 : descriptors,.supplied_workspace=true},
+      .work=[&](std::size_t lane,const CompileAllowance&) { work(lane); },.parent=allowance,.finite_consumer=true,.retain_workspace=false}).wait();
+    } else request_.execution->execution().run(request_.metadata_only ? CompileTaskKind::Metadata : CompileTaskKind::Normalize,{bytes,staging ? 0 : descriptors},work,allowance);
    } else
     work(0);
   };

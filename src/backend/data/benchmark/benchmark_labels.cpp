@@ -12,8 +12,8 @@ BenchmarkLabelInput::BenchmarkLabelInput(NormalizedAnnotationReadView index, std
  (void)index_.image(0);
 }
 namespace {
-void project_labels(const NormalizedAnnotationReadView& index, std::size_t position, std::pair<std::uint32_t, std::uint32_t> dimensions, std::uint32_t resolution,
- mmltk::backend::imaging::resample::ImageResizeMode resize_mode, BenchmarkLabelWorkspace& workspace, BenchmarkLabelChunk& chunk, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+template<class Chunk> void project_labels(const NormalizedAnnotationReadView& index, std::size_t position, std::pair<std::uint32_t, std::uint32_t> dimensions, std::uint32_t resolution,
+ mmltk::backend::imaging::resample::ImageResizeMode resize_mode, BenchmarkLabelWorkspace& workspace, Chunk& chunk, mmltk::common::concurrency::CancellationObservation cancel_requested) {
  namespace common_math = mmltk::common::math;
  chunk.labels.clear();
  chunk.runs.clear();
@@ -65,16 +65,23 @@ void project_labels(const NormalizedAnnotationReadView& index, std::size_t posit
 }  // namespace
 BenchmarkLabelChunk compile_benchmark_image_labels(const NormalizedAnnotationReadView& index, std::size_t position, std::pair<std::uint32_t, std::uint32_t> dimensions, std::uint32_t resolution,
  mmltk::backend::imaging::resample::ImageResizeMode mode, BenchmarkLabelWorkspace& workspace, mmltk::common::concurrency::CancellationObservation cancellation) {
- BenchmarkLabelChunk result;
- project_labels(index, position, dimensions, resolution, mode, workspace, result, cancellation);
- return result;
+ workspace.prepare(dimensions.first);
+ const auto view = compile_benchmark_image_labels_reused(index,position,dimensions,resolution,mode,workspace,cancellation);
+ return {view.width,view.height,view.dropped,{view.labels.begin(),view.labels.end()},{view.runs.begin(),view.runs.end()}};
 }
-const BenchmarkLabelChunk& compile_benchmark_image_labels_reused(const NormalizedAnnotationReadView& index, std::size_t position, std::pair<std::uint32_t, std::uint32_t> dimensions,
+BenchmarkLabelView compile_benchmark_image_labels_reused(const NormalizedAnnotationReadView& index, std::size_t position, std::pair<std::uint32_t,std::uint32_t> dimensions,
  std::uint32_t resolution, mmltk::backend::imaging::resample::ImageResizeMode mode, BenchmarkLabelWorkspace& workspace, mmltk::common::concurrency::CancellationObservation cancellation) {
- auto& result = workspace.output();
- project_labels(index, position, dimensions, resolution, mode, workspace, result, cancellation);
- return result;
+ workspace.ensure_prepared(dimensions.first);
+ struct Projection {
+  std::uint32_t width=0,height=0;
+  std::uint64_t dropped=0;
+  common::types::WorkspaceBuffer<PackedInstance>& labels;
+  common::types::WorkspaceBuffer<RLEPair>& runs;
+ } result{.labels=workspace.output().labels,.runs=workspace.output().runs};
+ project_labels(index,position,dimensions,resolution,mode,workspace,result,cancellation);
+ return {result.width,result.height,result.dropped,{result.labels.data(),result.labels.size()},{result.runs.data(),result.runs.size()}};
 }
+
 PackedInstance benchmark_canvas_box(
  const std::uint8_t class_id, const float x1, const float y1, const float x2, const float y2, const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
  if (letterbox.resized_width == 0U || letterbox.resized_height == 0U) { throw std::runtime_error("benchmark box requires a valid letterbox"); }

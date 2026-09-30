@@ -35,6 +35,7 @@
 #include <span>
 #include <simdjson.h>
 #include <stb_image_write.h>
+#include <stb_image.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -62,6 +63,10 @@
 #include "src/backend/data/compiled_file.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
+#include "src/backend/data/detail/compile_workspace.h"
+#include "src/backend/data/detail/compiled_label_workspace.h"
+#include "src/common/system/numa_memory.h"
+#include "src/common/system/numa_topology.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/benchmark/detail/open_images_acquisition.h"
@@ -93,6 +98,19 @@ using namespace mmltk::backend::data;
 using namespace mmltk::backend::data::benchmark_internal;
 using mmltk::common::io::FileHandle;
 namespace {
+class DenyStbHeapAllocations final {
+public:
+ std::size_t attempts = 0;
+ DenyStbHeapAllocations() {
+  stbi_set_heap_allocation_guard_thread([](std::size_t,void* user) {
+   ++static_cast<DenyStbHeapAllocations*>(user)->attempts;
+   return 0;
+  },this);
+ }
+ ~DenyStbHeapAllocations() { stbi_set_heap_allocation_guard_thread(nullptr,nullptr); }
+ DenyStbHeapAllocations(const DenyStbHeapAllocations&) = delete;
+ DenyStbHeapAllocations& operator=(const DenyStbHeapAllocations&) = delete;
+};
 using mmltk::backend::data::testsupport::benchmark_entry;
 using mmltk::backend::data::testsupport::bind_benchmark_slots;
 using mmltk::backend::data::testsupport::write_benchmark_fixture;
@@ -1998,10 +2016,16 @@ TEST_CASE("benchmark shrinking images preserve the RGB8 intermediate projection 
  CHECK_FALSE(has_complete_image_markers(std::span(encoded).first(encoded.size() - 1U)));
  BenchmarkEncodedImage::publish(cached_image_path(image_root, 1U), encoded, {});
  BenchmarkImageDecoder decoder;
- std::vector<std::uint8_t> decoded, cmyk;
  const auto header = decoder.read_header(encoded, width, height);
- const auto decoded_view = decoder.decode_rgb(encoded, header, &decoded, &cmyk);
- if (header.encoding == BenchmarkImageEncoding::Png) decoded.assign(decoded_view.begin(), decoded_view.end());
+ mmltk::common::system::NumaMemory workspace(mmltk::common::system::NumaTopology::Capture().permitted_nodes.front(),mmltk::common::system::NumaMemory::Lock::Pages);
+ workspace.ensure_bytes(BenchmarkImageDecoder::plan(header).bytes());
+ const auto decoded_view=decoder.decode_rgb(encoded,header,{static_cast<std::byte*>(workspace.data()),workspace.capacity_bytes()});
+ const std::vector<std::uint8_t> decoded(decoded_view.begin(),decoded_view.end());
+ // A lane may first receive a header inspected by another decoder. Its JPEG
+ // handle starts on that decode and remains reusable on subsequent calls.
+ BenchmarkImageDecoder supplied_header_decoder;
+ for (unsigned pass=0; pass<2; ++pass)
+  CHECK(std::ranges::equal(supplied_header_decoder.decode_rgb(encoded,header,{static_cast<std::byte*>(workspace.data()),workspace.capacity_bytes()}),decoded));
  if (header.encoding == BenchmarkImageEncoding::Png) CHECK(decoded == rgb);
  PreparedBenchmarkSplit split;
  split.name = "train";
@@ -2274,8 +2298,7 @@ TEST_CASE("archive image reuse reports initial and resolved counts without repla
   },
    .decompression_workers = 0U,
    .cache_write_workers = workers,
-   .execution = execution.get(),
-   .validator_workspace_bytes = 96U * 16U * 8U
+   .execution = execution.get()
   };
   auto result = extract_selected_archive_images(request);
   REQUIRE_FALSE(counts.empty());
@@ -6920,14 +6943,18 @@ TEST_CASE("warm image admission owns the opened generation across replacement", 
  REQUIRE(replacement);
  CHECK(std::ranges::equal(replacement->encoded(), second));
 }
-TEST_CASE("PNG decoder views retain the stb allocation through pixel use", "[backend][data][benchmark][writer]") {
+TEST_CASE("PNG decoder views retain the supplied pinned arena through pixel use", "[backend][data][benchmark][writer]") {
  std::vector<std::uint8_t> encoded;
  const std::array<std::uint8_t, 12> expected{0, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 220};
  REQUIRE(stbi_write_png_to_func(append_bytes, &encoded, 2, 2, 3, expected.data(), 6));
  BenchmarkImageDecoder decoder;
- std::vector<std::uint8_t> rgb{251, 252, 253}, cmyk;
+ std::vector<std::uint8_t> rgb{251, 252, 253};
  const auto header = decoder.read_header(encoded);
- const auto view = decoder.decode_rgb(encoded, header, &rgb, &cmyk);
+ mmltk::common::system::NumaMemory workspace(mmltk::common::system::NumaTopology::Capture().permitted_nodes.front(),mmltk::common::system::NumaMemory::Lock::Pages);
+ workspace.ensure_bytes(BenchmarkImageDecoder::plan(header).bytes());
+ const auto view = decoder.decode_rgb(encoded,header,{static_cast<std::byte*>(workspace.data()),workspace.capacity_bytes()});
+ CHECK(reinterpret_cast<std::uintptr_t>(view.data()) >= reinterpret_cast<std::uintptr_t>(workspace.data()));
+ CHECK(view.data()+view.size() <= static_cast<std::uint8_t*>(workspace.data())+workspace.capacity_bytes());
  CHECK(std::ranges::equal(view, expected));
  CHECK(rgb == std::vector<std::uint8_t>{251, 252, 253});
  encoded.clear();
@@ -7622,7 +7649,7 @@ TEST_CASE("concurrent reader offers join a live pixel loan on cancellation", "[b
  bind_benchmark_slots(execution, writer, split);
  // Each offer covers only half the finite consumer. Both physical lenders
  // must participate; unrelated positive offers are exercised separately.
- const auto demand = writer.pixel_workspace_bytes({16, 8}, fs::file_size(cached_image_path(images, 1)));
+ const auto demand = writer.pixel_resources({16, 8}).bytes;
  const auto live_reader_bytes = target / 2 - (demand + 1) / 2;
  std::future<void> first, second;
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
@@ -8695,14 +8722,14 @@ TEST_CASE("label interval capacity reuses charged lanes and retires borrowed win
  REQUIRE(join(1));
  publish(2);
  REQUIRE(join(2));
- CHECK(retained[1] == 0);
+ CHECK(retained[1] > 0);
  CHECK(retained[2] > 0);
- auto pressure = execution.execution().reserve({target, 0});  // Admission retires real idle intervals first.
+ auto pressure = execution.execution().reserve({target, 0});  // Logical borrowers can fill the bank without retiring physical backing.
  publish(3);
  CHECK_FALSE(execution.image_labels(root, 3, "3"));
  pressure = {};
  REQUIRE(join(3));
- CHECK(retained[3] == 0);
+ CHECK(retained[3] > 0);
  auto producer = execution.execution().reserve({target, 0});
  const auto borrowed = [&] {
   execution.execution().with_unused_workspace(producer, 16384, [&] {
@@ -8722,7 +8749,7 @@ TEST_CASE("label interval capacity reuses charged lanes and retires borrowed win
  if (!fail_borrower && !cancel_borrower) {
   publish(5);
   REQUIRE(join(5));
-  CHECK(retained[5] == 0);
+  CHECK(retained[5] > 0);
  }
 }
 TEST_CASE("reused label output preserves immutable results and bounds complete mask extents", "[benchmark][labels][masks][resources]") {
@@ -8753,7 +8780,7 @@ TEST_CASE("reused label output preserves immutable results and bounds complete m
  }
  CHECK(growths == prepared_growths);
  CHECK(workspace.retained_bytes() == retained);
- CHECK(retained <= BenchmarkLabelWorkspace::required_bytes(8));
+ CHECK(retained == mmltk::common::system::page_rounded_bytes(BenchmarkLabelWorkspace::required_bytes(8)));
  std::printf(
   "benchmark_label_fixture first_projection_ns=%lld active_label_bytes=%zu retained_workspace_bytes=%zu output_vector_growths=%zu steady_output_vector_growths=%zu scope=two_output_vectors_only "
   "mapped_backing=excluded production_baseline=unavailable\n",
@@ -8782,14 +8809,15 @@ TEST_CASE("reused label output preserves immutable results and bounds complete m
   CHECK(reason.find("capacity 500000") != std::string::npos);
  }
  CHECK(growths == prepared_growths);
- CHECK(workspace.retained_bytes() <= BenchmarkLabelWorkspace::required_bytes(512));
+ CHECK(workspace.retained_bytes() == mmltk::common::system::page_rounded_bytes(BenchmarkLabelWorkspace::required_bytes(512)));
  const auto& restored = compile_benchmark_image_labels_reused(input, 0, {8, 2}, 16, mode, workspace);
  REQUIRE(restored.runs.size() == reference.runs.size());
  CHECK(std::memcmp(restored.runs.data(), reference.runs.data(), restored.runs.size() * sizeof(RLEPair)) == 0);
- workspace.retire();
- CHECK(workspace.retained_bytes() == 0);
+ const auto locked = workspace.retained_bytes();
+ workspace.clear();
+ CHECK(workspace.retained_bytes() == locked);
  (void)compile_benchmark_image_labels_reused(input, 0, {8, 2}, 16, mode, workspace);
- CHECK(growths == prepared_growths + 2);
+ CHECK(growths == prepared_growths);
 }
 TEST_CASE("label projection preserves geometry provenance and present-empty masks", "[benchmark][labels][masks]") {
  auto input = label_projection_fixture(7);
@@ -9292,7 +9320,7 @@ TEST_CASE("dynamic benchmark slots write labels before pixels and replace one de
  const NormalizedAnnotationReadView large(fixture_index(annotations));
  REQUIRE(execution.labels_ready(source, 7, BenchmarkLabelInput(large, 0), "Large", 0, 2));
  REQUIRE(execution.wait_image_labels(images, 7, "Large"));
- CHECK(retained_before_projection[0] == 0);
+ CHECK(retained_before_projection[0] == BenchmarkLabelWorkspace::required_bytes(annotations.images[0].width));
  CHECK(retained_before_projection[1] >= (COMPILED_LABEL_CAPACITY / sizeof(PackedInstance)) * sizeof(PackedInstance) + COMPILED_LABEL_CAPACITY);
  CHECK_FALSE(execution.has_image_labels(images, 7, "XL"));
  CHECK(execution.has_image_labels(images, 7, "Large"));
@@ -9770,4 +9798,213 @@ TEST_CASE("borrowed runtime file cancellation retires context before delayed poo
  mmltk::testsupport::await_test_future(compute, "runtime reader pool drains stale dispatch");
  pool.wait_idle();
  CHECK(failed == 1); CHECK(calls == 0);
+}
+
+TEST_CASE("compile fixed arenas retain pinning while owned label outputs delay reuse", "[benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const auto bytes=CompiledLabelWorkspace::required_bytes(8);
+ CompileExecution execution(1,{}, {.transient_bytes=bytes},{},[](std::string_view,const CompileExecutionSnapshot&) {});
+ const auto initial=execution.snapshot().normal_locked;
+ CompiledLabelWorkspace workspace;
+ CompiledLabelWorkspace::OutputLease output;
+ const void* base=nullptr;
+ execution.submit({.kind=CompileTaskKind::Labels,.resources={.bytes=bytes,.supplied_workspace=true},
+  .work=[&](std::size_t,const CompileAllowance& allowance) {
+   workspace.prepare(8,allowance); workspace.labels.push_back({}); base=workspace.labels.data(); output=workspace.release_output();
+  },.retain_workspace=false}).wait();
+ CHECK(execution.snapshot().normal_locked==initial);
+ CHECK(execution.resource_usage().bytes==bytes);
+ CHECK(output.labels.data()==base);
+ CHECK_FALSE(execution.try_reserve({.bytes=bytes,.supplied_workspace=true}));
+ output={};
+ auto next=execution.reserve({.bytes=bytes,.supplied_workspace=true});
+ CHECK(next.workspace().data()==base);
+ next.retire_workspace(); // Logical retirement cannot return a live arena lease.
+ CHECK(execution.resource_usage().bytes==bytes);
+ next={};
+ CHECK(execution.resource_usage().bytes==0);
+ CHECK(execution.snapshot().normal_locked==initial);
+}
+TEST_CASE("one exceptional arena finishes its retained lineage and returns to the fixed bank", "[benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page=mmltk::common::system::host_page_size();
+ CompileExecution execution(1,{}, {.transient_bytes=page});
+ const auto locked=execution.snapshot().normal_locked;
+ auto parent=execution.reserve({page,0});
+ CompileAllowance output;
+ execution.submit({.kind=CompileTaskKind::Pixels,.resources={.bytes=page*3,.supplied_workspace=true},
+  .work=[&](std::size_t,const CompileAllowance& allowance) { auto memory=allowance.workspace(); REQUIRE(memory.size()==page*3); memory[0]=std::byte{73}; output=allowance; },
+  .parent=parent,.retain_workspace=false}).wait();
+ CHECK(execution.snapshot().normal_locked==locked);
+ CHECK(execution.snapshot().exceptional==page*3);
+ CHECK_FALSE(execution.try_reserve({.bytes=1,.supplied_workspace=true}));
+ CHECK(output.workspace()[0]==std::byte{73});
+ execution.cancel(); execution.retire_attempt();
+ CHECK(output.workspace()[0]==std::byte{73});
+ CHECK_FALSE(execution.try_reserve({.bytes=1,.supplied_workspace=true}));
+ output={}; parent={};
+ CHECK(execution.snapshot().exceptional==0);
+ CHECK(execution.snapshot().normal_locked==locked);
+ CHECK(execution.reserve({.bytes=1,.supplied_workspace=true}).workspace().size()==1);
+}
+TEST_CASE("Directory supplied decoding accepts PNM content independently of path spelling", "[backend][data][writer]") {
+ using namespace mmltk::backend::data::detail;
+ const std::array<std::uint8_t,17> bytes{'P','6','\n','2',' ','1','\n','2','5','5','\n',1,2,3,4,5,6};
+ CompileImageDecoder decoder;
+ const auto header=decoder.read_header(bytes,CompileImagePolicy::Directory);
+ mmltk::common::system::NumaMemory storage(mmltk::common::system::NumaTopology::Capture().permitted_nodes.front(),mmltk::common::system::NumaMemory::Lock::Pages);
+ const auto plan=CompileImageDecoder::plan(header);
+ storage.ensure_bytes(plan.bytes());
+ auto memory=std::span(static_cast<std::byte*>(storage.data()),plan.bytes());
+ const auto image=decoder.decode_rgb(bytes,header,memory);
+ CHECK(std::ranges::equal(image,std::span(bytes).last(6)));
+ CHECK_THROWS_AS(decoder.decode_rgb(bytes,header,memory.first(plan.bytes()-1)),std::length_error);
+}
+TEST_CASE("protected compile windows remain available to their completion class", "[benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page=mmltk::common::system::host_page_size();
+ const std::array<CompileWorkspaceProfile,6> profiles{{{page,page},{page,page},{page,page},{page,page},{page,page},{page,page}}};
+ auto plan=std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1,profiles,page,page,page*9));
+ CHECK(plan->protected_bytes==page*8); CHECK(plan->contexts==1);
+ CompileExecution execution(1,{}, {.workspace_plan=plan});
+ auto normal=execution.reserve({.bytes=page,.supplied_workspace=true});
+ auto output=execution.reserve({.bytes=page,.supplied_workspace=true,.completion_workspace=true,.workspace_class=CompileWorkClass::Output});
+ CHECK(normal.workspace().data()!=output.workspace().data());
+ CHECK_THROWS_AS(execution.with_unused_workspace(output,0,[] {}),std::invalid_argument);
+ CHECK_FALSE(execution.try_reserve({.bytes=page,.supplied_workspace=true}));
+ CHECK_FALSE(execution.try_reserve({.bytes=page,.supplied_workspace=true,.completion_workspace=true,.workspace_class=CompileWorkClass::Output}));
+ auto annotation=execution.reserve({.bytes=page,.supplied_workspace=true,.completion_workspace=true,.workspace_class=CompileWorkClass::Annotations});
+ auto shared=execution.reserve({.bytes=page,.supplied_workspace=true,.workspace_window=CompileWorkspaceWindow::SharedSource});
+ auto compaction=execution.reserve({.bytes=page,.supplied_workspace=true,.workspace_window=CompileWorkspaceWindow::Compaction});
+ CHECK(shared.workspace().data()!=compaction.workspace().data());
+ CHECK(execution.snapshot().normal_locked==plan->budget);
+}
+TEST_CASE("cancelled oversized admission leaves live output custody and fixed backing intact", "[benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page=mmltk::common::system::host_page_size();
+ std::promise<void> parked;
+ std::atomic<bool> observed{false};
+ CompileExecution execution(1,{}, {.transient_bytes=page}, {}, [&](std::string_view,const CompileExecutionSnapshot& value) {
+  if (value.parked[static_cast<std::size_t>(CompileParkReason::Bytes)] && !observed.exchange(true)) mmltk::testsupport::release_test_promise(parked);
+ });
+ auto output=execution.reserve({.bytes=page,.supplied_workspace=true});
+ auto* const base=output.workspace().data(); base[0]=std::byte{42};
+ std::atomic<unsigned> calls{0};
+ auto oversized=execution.submit({.kind=CompileTaskKind::Pixels,.resources={.bytes=page*3,.supplied_workspace=true},
+  .work=[&](std::size_t,const CompileAllowance&) { ++calls; },.retain_workspace=false});
+ mmltk::testsupport::await_test_promise(parked,"oversized work drains a live output lease");
+ CHECK_FALSE(execution.try_reserve({1,0}));
+ oversized.cancel(); CHECK_THROWS(oversized.wait()); CHECK(calls==0);
+ CHECK(output.workspace()[0]==std::byte{42}); CHECK(execution.snapshot().exceptional_reserved==0);
+ output={};
+ auto normal=execution.reserve({.bytes=page,.supplied_workspace=true});
+ CHECK(normal.workspace().data()==base); CHECK(execution.snapshot().normal_locked==page);
+}
+TEST_CASE("exceptional finite descendants partition one pinned extent until last custody", "[benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page=mmltk::common::system::host_page_size();
+ CompileExecution execution(1,{}, {.transient_bytes=page},{},[](std::string_view,const CompileExecutionSnapshot&) {});
+ auto envelope=execution.reserve({.bytes=page*3,.supplied_workspace=true});
+ auto* const base=envelope.workspace().data();
+ auto input=envelope.split_storage(page), output=envelope.split_storage(page);
+ CHECK(input.workspace().data()==base); CHECK(output.workspace().data()==base+page);
+ CHECK(envelope.workspace().data()==base+page*2);
+ execution.submit({.kind=CompileTaskKind::Output,.resources={.bytes=page,.supplied_workspace=true},
+  .work=[&](std::size_t,const CompileAllowance& own) { own.workspace()[0]=std::byte{19}; },.allowance=output,.retain_workspace=false}).wait();
+ envelope={}; input={};
+ CHECK(execution.snapshot().exceptional==page*3); CHECK(output.workspace()[0]==std::byte{19});
+ CHECK_FALSE(execution.try_reserve({.bytes=1,.supplied_workspace=true}));
+ output={}; CHECK(execution.snapshot().exceptional==0); CHECK(execution.snapshot().physical_retirements==1);
+ CHECK(execution.reserve({.bytes=page,.supplied_workspace=true}).workspace().data()!=nullptr);
+}
+TEST_CASE("Directory supplied codec decoding uses stable pinned storage and preserves decoded bytes", "[backend][data][writer]") {
+ using namespace mmltk::backend::data::detail;
+ constexpr int width=3,height=2;
+ const std::array<std::uint8_t,18> rgb{1,2,3,4,5,6,7,8,9,19,20,21,40,50,60,70,80,90};
+ std::vector<std::uint8_t> encoded;
+ SECTION("BMP") { REQUIRE(stbi_write_bmp_to_func(append_bytes,&encoded,width,height,3,rgb.data())); }
+ SECTION("TGA") { REQUIRE(stbi_write_tga_to_func(append_bytes,&encoded,width,height,3,rgb.data())); }
+ SECTION("PNG") { REQUIRE(stbi_write_png_to_func(append_bytes,&encoded,width,height,3,rgb.data(),width*3)); }
+ CompileImageDecoder decoder;
+ const auto header=decoder.read_header(encoded,CompileImagePolicy::Directory);
+ const auto bytes=CompileImageDecoder::plan(header).bytes();
+ CompileExecution execution(1,{}, {.transient_bytes=bytes},{},[](std::string_view,const CompileExecutionSnapshot&) {});
+ const void* base=nullptr;
+ for (auto kind : {CompileTaskKind::Pixels,CompileTaskKind::Normalize}) {
+  execution.submit({.kind=kind,.resources={.bytes=bytes,.supplied_workspace=true},
+   .work=[&](std::size_t,const CompileAllowance& allowance) {
+    const auto memory=allowance.workspace();
+    if (base) CHECK(memory.data()==base); else base=memory.data();
+    CHECK(std::ranges::equal(decoder.decode_rgb(encoded,header,memory),rgb));
+   },.retain_workspace=false}).wait();
+ }
+ CHECK(execution.snapshot().workspace_reuses>=1);
+}
+
+TEST_CASE("a prepared arena changes work class and CPU lane without moving its backing", "[benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ if (mmltk::common::system::allowed_cpu_set().size()<2) SKIP("requires two assigned CPUs");
+ const auto page=mmltk::common::system::host_page_size();
+ CompileExecution execution(2,{}, {.transient_bytes=page});
+ auto pixels=execution.open_class(CompileWorkClass::Pixels), annotations=execution.open_class(CompileWorkClass::Annotations);
+ const void* base=nullptr;
+ std::array<std::size_t,2> lanes{};
+ std::size_t turn=0;
+ for (auto kind : {CompileTaskKind::Pixels,CompileTaskKind::Normalize}) {
+  execution.submit({.kind=kind,.resources={.bytes=page,.supplied_workspace=true},
+   .work=[&](std::size_t lane,const CompileAllowance& allowance) {
+    lanes[turn++]=lane; const auto memory=allowance.workspace();
+    if (base) { CHECK(memory.data()==base); CHECK(memory[0]==std::byte{31}); }
+    else { base=memory.data(); memory[0]=std::byte{31}; }
+   },.retain_workspace=false}).wait();
+ }
+ CHECK(lanes[0]!=lanes[1]); CHECK(execution.snapshot().normal_locked==page); CHECK(execution.snapshot().workspace_contexts==1);
+}
+
+TEST_CASE("Directory supplied JPEG GIF and 16-bit PNM match the existing STB codec policy", "[backend][data][writer]") {
+ using namespace mmltk::backend::data::detail;
+ static_assert(noexcept(CompileImageDecoder{}));
+ static_assert(noexcept(BenchmarkImageDecoder{}));
+ std::vector<std::uint8_t> encoded;
+ SECTION("JPEG") { encoded=make_jpeg(17,83,149); }
+ SECTION("GIF") {
+  encoded={'G','I','F','8','9','a',1,0,1,0,0x80,0,0,0,0,0,255,255,255,
+   0x2c,0,0,0,0,1,0,1,0,0,2,2,0x44,1,0,0x3b};
+ }
+ SECTION("16-bit PNM") {
+  encoded={'P','6','\n','1',' ','1','\n','6','5','5','3','5','\n',0x12,0x34,0x56,0x78,0x9a,0xbc};
+ }
+ int width=0,height=0,channels=0;
+ std::unique_ptr<stbi_uc,decltype(&stbi_image_free)> reference(stbi_load_from_memory(encoded.data(),static_cast<int>(encoded.size()),&width,&height,&channels,3),stbi_image_free);
+ REQUIRE(reference);
+ CompileImageDecoder decoder;
+ CompileImageHeader header;
+ const std::array<std::uint8_t,4> malformed{0,1,2,3};
+ {
+  DenyStbHeapAllocations denied;
+  int inspected_width=0,inspected_height=0,inspected_channels=0;
+  REQUIRE(stbi_info_from_memory(encoded.data(),static_cast<int>(encoded.size()),&inspected_width,&inspected_height,&inspected_channels));
+  CHECK(inspected_width==width); CHECK(inspected_height==height); CHECK(inspected_channels==channels);
+  header=decoder.read_header(encoded,CompileImagePolicy::Directory);
+  CHECK(header.width==width); CHECK(header.height==height);
+  CHECK(header.decoder_bytes==stbi_workspace_required(encoded.data(),static_cast<int>(encoded.size()),3));
+  CHECK_THROWS_AS(decoder.read_header(malformed,CompileImagePolicy::Directory),CompileImageError);
+  CHECK(stbi_workspace_required(malformed.data(),static_cast<int>(malformed.size()),3)==0);
+  CHECK(std::string_view(stbi_failure_reason())!="workspace capacity");
+  CHECK(denied.attempts==0);
+  // Prove the guard is active on this thread's ordinary decoding allocator.
+  std::unique_ptr<stbi_uc,decltype(&stbi_image_free)> rejected(stbi_load_from_memory(encoded.data(),static_cast<int>(encoded.size()),&inspected_width,&inspected_height,&inspected_channels,3),stbi_image_free);
+  CHECK_FALSE(rejected); CHECK(denied.attempts>0);
+ }
+ const auto bytes=CompileImageDecoder::plan(header).bytes();
+ CompileExecution execution(1,{}, {.transient_bytes=bytes},{},[](std::string_view,const CompileExecutionSnapshot&) {});
+ execution.submit({.kind=CompileTaskKind::Pixels,.resources={.bytes=bytes,.supplied_workspace=true},
+  .work=[&](std::size_t,const CompileAllowance& allowance) {
+   DenyStbHeapAllocations denied;
+   const auto workspace=allowance.workspace();
+   CHECK_THROWS_AS(decoder.decode_rgb(encoded,header,workspace.first(bytes-1)),std::length_error);
+   CHECK(std::ranges::equal(decoder.decode_rgb(encoded,header,workspace),std::span(reference.get(),static_cast<std::size_t>(width)*height*3)));
+   CHECK_THROWS_AS(decoder.decode_rgb(malformed,header,workspace),CompileImageError);
+   CHECK(denied.attempts==0);
+  },.retain_workspace=false}).wait();
 }

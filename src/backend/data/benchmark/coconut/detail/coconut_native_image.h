@@ -9,6 +9,8 @@
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
 #include "src/common/concurrency/cancellation_observation.h"
+#include "src/backend/data/detail/compile_image_decoder.h"
+#include "src/common/system/numa_memory.h"
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -91,9 +93,10 @@ public:
  void recovery(const CoconutMaskRecovery*);
  [[nodiscard]] CoconutMaskRecovery* recovery() const noexcept { return recovery_.get(); }
  [[nodiscard]] std::uint64_t retained_bytes() const noexcept;
- [[nodiscard]] std::uint64_t workspace_bytes(const CoconutRecord&, std::uint64_t pixels, std::uint64_t segments, std::uint64_t encoded, bool recover = true) const;
+ [[nodiscard]] std::uint64_t support_workspace_bytes(const CoconutRecord&, std::uint64_t pixels, std::uint64_t segments, bool recover = true) const;
  [[nodiscard]] dataset::MaskDimensions admit_png(const CoconutRecord&, std::span<const std::uint8_t>) const;
- void decode(const CoconutRecord&, std::span<const std::uint8_t>, dataset::MaskDimensions);
+ [[nodiscard]] std::size_t decoder_workspace_bytes(std::span<const std::uint8_t>) const;
+ void decode(const CoconutRecord&, std::span<const std::uint8_t>, dataset::MaskDimensions, std::span<std::byte> supplied = {});
  [[nodiscard]] std::vector<CoconutSegmentSupport> take_support(std::size_t);
  [[nodiscard]] std::uint32_t unlisted_segment() const noexcept { return unlisted_segment_; }
  void borrow_support(const CoconutRecord&, std::span<const CoconutSegmentSupport>, dataset::MaskDimensions, std::shared_ptr<const void>, std::uint32_t unlisted_segment = 0);
@@ -109,6 +112,8 @@ private:
   std::size_t index = 0;
  };
  SegmentEntry& segment_entry(std::uint32_t);
+ mutable detail::CompileImageDecoder decoder_;
+ std::unique_ptr<common::system::NumaMemory> decode_memory_;
  CoconutImportLimits limits_;
  mmltk::common::concurrency::CancellationObservation cancellation_;
  std::shared_ptr<const CoconutRecoveryOriginals> originals_;

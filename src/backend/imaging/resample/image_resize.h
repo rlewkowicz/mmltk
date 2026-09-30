@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <memory>
+#include <span>
 #if !defined(__CUDACC__)
 #include "src/frameworks/reflection/reflection_metadata.h"
 #endif
@@ -42,6 +43,12 @@ struct ResizeWorkerPlan {
  int resize_threads_per_image = 1;
 };
 ResizeWorkerPlan plan_rgb_resize_workers(int total_workers, bool any_resize, bool any_downscale);
+struct RgbResizeWorkspacePlan {
+ std::size_t avir_bytes = 0, byte_output_bytes = 0, perceptual_bytes = 0;
+ std::uint32_t width = 0, height = 0;
+ bool alpha = false, perceptual = false;
+ [[nodiscard]] std::size_t bytes() const;
+};
 class RgbImageResizer {
 public:
  explicit RgbImageResizer(int thread_count = 1, bool perceptual_downscale = false);
@@ -50,6 +57,10 @@ public:
  RgbImageResizer& operator=(const RgbImageResizer&) = delete;
  RgbImageResizer(RgbImageResizer&&) noexcept;
  RgbImageResizer& operator=(RgbImageResizer&&) noexcept;
+ [[nodiscard]] static RgbResizeWorkspacePlan workspace_plan(std::uint32_t source_width, std::uint32_t source_height,
+  std::uint32_t target_width, std::uint32_t target_height, ImageResizeMode, bool perceptual, RgbPixelFormat = RgbPixelFormat::RGB8);
+ void prepare(const RgbResizeWorkspacePlan&, std::span<std::byte> supplied);
+ [[nodiscard]] std::size_t retained_bytes() const noexcept;
  void resize(const uint8_t* src, int src_width, int src_height, uint8_t* dst, int dst_width, int dst_height);
  // Compiler projection: tightly packed RGB8 to a tightly packed planar
  // canvas. Perceptual output retains RGB8 quantization before conversion.

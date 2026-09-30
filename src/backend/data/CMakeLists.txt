@@ -74,6 +74,8 @@ mmltk_register_public_headers(
         benchmark/benchmark_hash.h
 )
 mmltk_register_ordinary_sources(mmltk_backend_data
+    compile_workspace.cpp
+    compile_image_decoder.cpp
     compile_execution.cpp
     compile_resources.cpp
     file_work_queue.cpp
@@ -143,6 +145,9 @@ mmltk_register_private_headers(mmltk_backend_data
     benchmark/detail/benchmark_compiler.h
     benchmark/detail/benchmark_recipe.h
     benchmark/detail/benchmark_progress.h
+    detail/compile_workspace.h
+    detail/compile_image_decoder.h
+    detail/compiled_label_workspace.h
     detail/compile_execution.h
     detail/compile_resources.h
     detail/compile_admission.h

@@ -407,7 +407,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
      if (rejected) rejected(image, "unreadable JPEG in retained source generation");
      return;
     }
-    auto input = BenchmarkEncodedImage::open(directory.get(), image.image_id, validate, cancellation, &execution.execution(), lease->allowance(), {}, 32ULL << 20);
+    auto input = BenchmarkEncodedImage::open(directory.get(), image.image_id, validate, cancellation, &execution.execution(), lease->allowance(), {}, BenchmarkEncodedImage::normal_window_bytes);
     if (!input) throw BenchmarkImageError("cached inventory image is missing");
     if (!*complete) publish(image, std::move(input));
     if (state.progress) state.progress(CoconutEdition::Base, archive, image.image_id, artifact.completed_images);
@@ -462,16 +462,16 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   for (unsigned attempt = 0; attempt < 2; ++attempt) {
    try {
     BenchmarkEncodedImage::Ptr input;
-    if (!attempt && cache_generation_known) input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution.execution(), reader.allowance(), {}, 32ULL << 20);
+    if (!attempt && cache_generation_known) input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution.execution(), reader.allowance(), {}, BenchmarkEncodedImage::normal_window_bytes);
     if (!input) {
      source_read = true;
-     const auto encoded = reader.read(32ULL << 20, cancellation);
+     const auto encoded = reader.read(BenchmarkEncodedImage::normal_window_bytes, cancellation);
      BenchmarkImageHeader header;
      reader.cpu([&] { header = validate(*id, encoded); });
      // A new source generation can retain identical healthy JPEG allocations.
      // Compare the actual bytes before reusing a cache from an unknown generation.
      try {
-      input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution.execution(), reader.allowance(), {}, 32ULL << 20);
+      input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution.execution(), reader.allowance(), {}, BenchmarkEncodedImage::normal_window_bytes);
       if (input && !std::ranges::equal(input->encoded(), encoded)) input.reset();
      } catch (const BenchmarkImageError&) { input.reset(); } catch (const InvalidImageError&) { input.reset(); }
      if (!input) {

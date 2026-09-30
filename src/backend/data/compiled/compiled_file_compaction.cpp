@@ -28,8 +28,7 @@ FileLayout compact_compiled_file(const mmltk::common::io::FileHandle& file, cons
  if (compact.total_size > staging.total_size) throw std::logic_error("compiled compaction cannot grow its layout");
  // Forward traversal is memmove-safe even when source and destination overlap.
  // Only live prefixes move; page padding and inactive slots remain sparse.
- constexpr std::size_t maximum_scratch = 4U * 1024U * 1024U;
- const auto scratch_bytes = compact.label_pitch == staging.label_pitch ? 0U : std::min(maximum_scratch, std::max(staging.image_stride, maximum));
+ const auto scratch_bytes = compact.label_pitch == staging.label_pitch ? 0U : std::min(COMPILED_COMPACTION_SCRATCH_BYTES, std::max(staging.image_stride, maximum));
  auto scratch = mmltk::common::io::OwnedBuffer<std::byte>::allocate(scratch_bytes);
  bool reclaim_supported = true;
  const auto reclaim = [&](std::size_t begin, std::size_t end) {

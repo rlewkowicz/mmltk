@@ -104,8 +104,6 @@ struct ArchiveExtractionRequest {
  CachedImageReadySink image_ready = {};
  BenchmarkCompilePipeline* execution = nullptr;
  StorageReservationPool* storage = nullptr;
- // Synchronous validation scratch is admitted with its retained encoded input.
- std::uint64_t validator_workspace_bytes = 0;
  CompileAllowance parent_allowance{};
 };
 [[nodiscard]] CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest request);

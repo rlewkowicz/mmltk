@@ -38,6 +38,7 @@ private:
 // before reusing the header. Source publications separately retain mutation custody.
 class BenchmarkEncodedImage final {
 public:
+ static constexpr std::size_t normal_window_bytes=32ULL<<20;
  using Ptr = std::shared_ptr<const BenchmarkEncodedImage>;
  enum class Storage : std::uint8_t { Pooled, Mapped, HeaderOnly };
  class Opened;

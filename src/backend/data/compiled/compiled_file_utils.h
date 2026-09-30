@@ -180,6 +180,7 @@ inline void write_compiled_annotations(
  file.pwrite_all(&zero, payload.run_offset - annotations.labels.size_bytes(), offset + annotations.labels.size_bytes());
  file.pwrite_all(annotations.runs.data(), annotations.runs.size_bytes(), offset + payload.run_offset);
 }
+inline constexpr std::size_t COMPILED_COMPACTION_SCRATCH_BYTES = 4U * 1024U * 1024U;
 using CompiledCompactionProgress = std::function<void(std::size_t completed_bytes, std::size_t total_bytes)>;
 // All pixel/label borrowers must be drained. Compacts this private staged inode;
 // a failed or cancelled compaction is discarded by its existing publication owner.

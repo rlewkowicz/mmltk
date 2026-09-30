@@ -118,13 +118,14 @@ int bound_memory_node(const MemoryPolicy& policy) {
    }
  return node;
 }
-NumaMemory::NumaMemory(int node) : node_(node) { (void)prepare_bound_memory_policy(node); }
+NumaMemory::NumaMemory(int node, Lock lock) : node_(node), lock_(lock) { (void)prepare_bound_memory_policy(node); }
 NumaMemory::~NumaMemory() { reset(); }
-NumaMemory::NumaMemory(NumaMemory&& other) noexcept : node_(other.node_), data_(std::exchange(other.data_, nullptr)), bytes_(std::exchange(other.bytes_, 0)) {}
+NumaMemory::NumaMemory(NumaMemory&& other) noexcept : node_(other.node_), lock_(other.lock_), data_(std::exchange(other.data_, nullptr)), bytes_(std::exchange(other.bytes_, 0)) {}
 NumaMemory& NumaMemory::operator=(NumaMemory&& other) noexcept {
  if (this != &other) {
   reset();
   node_ = other.node_;
+  lock_ = other.lock_;
   data_ = std::exchange(other.data_, nullptr);
   bytes_ = std::exchange(other.bytes_, 0);
  }
@@ -134,12 +135,20 @@ void NumaMemory::ensure_bytes(std::size_t bytes) {
  if (bytes <= bytes_) return;
  const auto capacity = page_rounded_bytes(bytes);
  auto* next = allocate_pages(capacity, host_page_size(), node_);
+ if (lock_ == Lock::Pages && ::mlock(next, capacity) != 0) {
+  const auto error = errno;
+  ::munmap(next, capacity);
+  throw std::system_error(error, std::generic_category(), "page-lock compile NUMA arena (IPC_LOCK and memlock required)");
+ }
  reset();
  data_ = next;
  bytes_ = capacity;
 }
 void NumaMemory::reset() noexcept {
- if (data_) ::munmap(data_, bytes_);
+ if (data_) {
+  if (lock_ == Lock::Pages) ::munlock(data_, bytes_);
+  ::munmap(data_, bytes_);
+ }
  data_ = nullptr;
  bytes_ = 0;
 }

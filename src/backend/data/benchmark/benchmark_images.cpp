@@ -445,7 +445,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  scheduled.reserve(pending_writes);
  std::unordered_map<std::uint64_t, std::uint64_t> required_positions;
  required_positions.reserve(pending_writes);
- BenchmarkArchive reader(request.archive_path, (request.execution ? &request.execution->execution() : nullptr), checked_byte_add(64ULL << 20, request.validator_workspace_bytes), directory_allowance, request.decompression_workers, false);
+ BenchmarkArchive reader(request.archive_path, (request.execution ? &request.execution->execution() : nullptr), 64ULL << 20, directory_allowance, request.decompression_workers, false);
  stream_allowance = reader.allowance().split_storage(64ULL << 20);
  const auto archive_work = [&](const std::function<void()>& work) { reader.cpu(work); };
  CachedImageWritePool write_pool(request.cache_write_workers, pending_writes, request.output_root, request.progress, completed.size(), request.cancel_requested, request.image_ready, request.storage,

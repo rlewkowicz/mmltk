@@ -7,6 +7,7 @@ mmltk_configure_component(mmltk_common_types PUBLIC_DECLARATIONS)
 mmltk_register_public_headers(mmltk_common_types
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
+        workspace_buffer.h
         byte_encoding.h
         generation.h
         stable_identity.h

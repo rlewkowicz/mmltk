@@ -8760,3 +8760,35 @@ TEST_CASE("custom source admission keeps ready label peers useful while its firs
   if (entry.eligible() && entry.source == AnnotationSource::Coco) observed.insert(entry.source_image_id);
  CHECK(observed == std::set<std::uint64_t>(ids.begin(), ids.end()));
 }
+
+TEST_CASE("native PNG normalization borrows the pinned compile context with retained row custody", "[benchmark][coconut][annotations][resources]") {
+ using namespace mmltk::backend::data::detail;
+ CoconutRecord record;
+ record.image_id=7; record.width=3; record.height=2;
+ record.segments={{.id=1,.category_id=1,.isthing=true},{.id=2,.category_id=2,.isthing=true}};
+ const std::array<std::uint32_t,6> ids{1,2,2,1,1,2};
+ const auto encoded=png(3,2,ids);
+ const auto input=std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()),encoded.size());
+ CoconutNativeWorkspace workspace(CoconutImportLimits{});
+ const auto dimensions=workspace.admit_png(record,input);
+ const auto bytes=workspace.decoder_workspace_bytes(input);
+ CompileExecution execution(1,{}, {.transient_bytes=bytes+encoded.size()},{},[](std::string_view,const CompileExecutionSnapshot&) {});
+ auto row=execution.reserve({encoded.size(),0});
+ const void* base=nullptr;
+ for (unsigned pass=0; pass<2; ++pass) {
+  execution.submit({.kind=CompileTaskKind::Normalize,.resources={.bytes=bytes,.supplied_workspace=true},
+   .work=[&](std::size_t,const CompileAllowance& allowance) {
+    const auto memory=allowance.workspace();
+    if (base) CHECK(memory.data()==base); else base=memory.data();
+    workspace.decode(record,input,dimensions,memory);
+   },.parent=row,.finite_consumer=true,.retain_workspace=false}).wait();
+  const auto support=workspace.take_support(record.segments.size());
+  REQUIRE(support.size()==2);
+  CHECK(support[0].area==3); CHECK(support[1].area==3);
+  REQUIRE(support[0].runs.view().size()==2);
+  CHECK(support[0].runs.view()[0].start==0); CHECK(support[0].runs.view()[0].length==1);
+  CHECK(support[0].runs.view()[1].start==3); CHECK(support[0].runs.view()[1].length==2);
+  CHECK(execution.resource_usage().bytes==encoded.size());
+ }
+ row={}; CHECK(execution.resource_usage().bytes==0); CHECK(execution.snapshot().workspace_reuses>=1);
+}

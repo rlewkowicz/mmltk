@@ -18,7 +18,6 @@
 #include <vector>
 
 namespace mmltk::backend::data::detail {
-enum class CompileWorkClass : std::uint8_t { Acquisition, Extraction, Annotations, Pixels, Gather, Output, Count };
 enum class CompileTaskKind : std::uint8_t { Acquisition, Metadata, Header, Archive, Normalize, Recovery, Labels, Pixels, Gather, CacheWrite, Output, Count };
 enum class CompileParkReason : std::uint8_t { None, Dependency, Bytes, Descriptors, Cpu, Withdrawal, Count };
 [[nodiscard]] constexpr CompileWorkClass work_class(CompileTaskKind kind) {
@@ -55,6 +54,9 @@ struct CompileExecutionSnapshot {
  std::size_t elastic = 0, active = 0, external = 0, services = 0, records = 0, record_limit = 0;
  CompileResources resources{};
  std::uint64_t byte_target = 0;
+ std::uint64_t normal_locked = 0, resident = 0, leased = 0, exceptional = 0, exceptional_peak = 0, opaque_library = 0;
+ std::uint64_t protected_workspace = 0, shared_workspace = 0, compaction_workspace = 0, exceptional_reserved = 0, workspace_reuses = 0, physical_retirements = 0;
+ std::size_t workspace_contexts = 0, context_capacity = 0;
  std::size_t descriptor_limit = 0;
  std::uint64_t admitted = 0, completed = 0;
  std::optional<CompileReservationObservation> reservation;
@@ -127,9 +129,9 @@ public:
   friend struct Impl;
   std::shared_ptr<DependencyState> state_;
  };
- // Stable scratch custody follows the context, not a task's writer identity.
- // The next workspace-bank implementation replaces the retirement policy while
- // retaining this lifetime and non-overlap boundary.
+ // Custody for source owners that still allocate their own input/parser window.
+ // Supplied image/label work uses CompileAllowance arena leases directly; this
+ // callback only retires actual separately owned source backing.
  class Workspace final {
  public:
   Workspace(CompileExecution&, std::function<void(std::size_t)> retire);
@@ -167,6 +169,7 @@ public:
  void retire_attempt() noexcept;
  [[nodiscard]] bool on_lane() const noexcept;
  [[nodiscard]] std::size_t current_lane() const;
+ [[nodiscard]] CompileAllowance current_allowance() const;
  [[nodiscard]] std::size_t workers() const noexcept;
  [[nodiscard]] std::span<const int> cpus() const noexcept;
  [[nodiscard]] CompileExecutionSnapshot snapshot() const;

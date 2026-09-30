@@ -12,7 +12,7 @@ mmltk_register_ordinary_sources(mmltk_backend_imaging_resample
     image_resize.cpp detail/perceptual_downscale.cpp detail/perceptual_downscale_views.cpp)
 target_link_libraries(mmltk_backend_imaging_resample
     PUBLIC CUDA::cudart
-    PRIVATE mmltk::common::math avir mmltk::frameworks::gpu CUDA::cuda_driver)
+    PRIVATE mmltk::common::math mmltk::common::types avir mmltk::frameworks::gpu CUDA::cuda_driver)
 mmltk_link_declarations(mmltk_backend_imaging_resample PUBLIC
     mmltk::frameworks::reflection)
 if(BUILD_RFDETR_NATIVE)

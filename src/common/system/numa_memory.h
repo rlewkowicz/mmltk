@@ -21,7 +21,8 @@ void bind_memory_node(int node);
 // and verified before publication. Growth is transactional and high-water.
 class NumaMemory final {
 public:
- explicit NumaMemory(int node);
+ enum class Lock { None, Pages };
+ explicit NumaMemory(int node, Lock = Lock::None);
  ~NumaMemory();
  NumaMemory(const NumaMemory&) = delete;
  NumaMemory& operator=(const NumaMemory&) = delete;
@@ -33,9 +34,11 @@ public:
  [[nodiscard]] void* data() const noexcept { return data_; }
  [[nodiscard]] std::size_t capacity_bytes() const noexcept { return bytes_; }
  [[nodiscard]] int node() const noexcept { return node_; }
+ [[nodiscard]] bool locked() const noexcept { return data_ && lock_ == Lock::Pages; }
 
 private:
  int node_;
+ Lock lock_;
  void* data_ = nullptr;
  std::size_t bytes_ = 0;
 };

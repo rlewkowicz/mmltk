@@ -40,6 +40,18 @@ typedef struct {
 
 STBIDEF stbi_uc* stbi_load_from_memory(stbi_uc const* buffer, int len, int* x, int* y, int* channels_in_file,
                                        int desired_channels);
+// A supplied arena owns the returned pixels. No image_free is needed; reuse
+// only after the caller has finished reading the output. Zero on bad headers
+// or checked size overflow. All default entry points retain their allocators.
+STBIDEF size_t stbi_workspace_png_profile(unsigned width, unsigned height, size_t encoded_bytes);
+STBIDEF size_t stbi_workspace_required(stbi_uc const* buffer, int len, int desired_channels);
+STBIDEF stbi_uc* stbi_load_from_memory_workspace(stbi_uc const* buffer, int len, int* x, int* y,
+ int* channels_in_file, int desired_channels, void* workspace, size_t workspace_bytes);
+// Optional current-thread guard for heap allocations. Returning zero rejects
+// the allocation with the ordinary STB out-of-memory result. A null guard
+// restores default allocation; supplied workspace never calls the heap guard.
+STBIDEF void stbi_set_heap_allocation_guard_thread(int (*guard)(size_t bytes, void* user), void* user);
+
 STBIDEF stbi_uc* stbi_load_from_callbacks(stbi_io_callbacks const* clbk, void* user, int* x, int* y,
                                           int* channels_in_file, int desired_channels);
 
@@ -2565,15 +2577,12 @@ static void* stbi__jpeg_load(stbi__context* s, int* x, int* y, int* comp, int re
 
 static int stbi__jpeg_test(stbi__context* s) {
     int r;
-    stbi__jpeg* j = (stbi__jpeg*)stbi__malloc(sizeof(stbi__jpeg));
-    if (!j)
-        return stbi__err("outofmem", "Out of memory");
-    memset(j, 0, sizeof(stbi__jpeg));
-    j->s = s;
-    stbi__setup_jpeg(j);
-    r = stbi__decode_jpeg_header(j, STBI__SCAN_type);
+    stbi__jpeg j;
+    memset(&j, 0, sizeof(j));
+    j.s = s;
+    stbi__setup_jpeg(&j);
+    r = stbi__decode_jpeg_header(&j, STBI__SCAN_type);
     stbi__rewind(s);
-    STBI_FREE(j);
     return r;
 }
 
@@ -2592,15 +2601,10 @@ static int stbi__jpeg_info_raw(stbi__jpeg* j, int* x, int* y, int* comp) {
 }
 
 static int stbi__jpeg_info(stbi__context* s, int* x, int* y, int* comp) {
-    int result;
-    stbi__jpeg* j = (stbi__jpeg*)(stbi__malloc(sizeof(stbi__jpeg)));
-    if (!j)
-        return stbi__err("outofmem", "Out of memory");
-    memset(j, 0, sizeof(stbi__jpeg));
-    j->s = s;
-    result = stbi__jpeg_info_raw(j, x, y, comp);
-    STBI_FREE(j);
-    return result;
+    stbi__jpeg j;
+    memset(&j, 0, sizeof(j));
+    j.s = s;
+    return stbi__jpeg_info_raw(&j, x, y, comp);
 }
 #endif
 
@@ -4566,19 +4570,16 @@ static int stbi__gif_header(stbi__context* s, stbi__gif* g, int* comp, int is_in
 }
 
 static int stbi__gif_info_raw(stbi__context* s, int* x, int* y, int* comp) {
-    stbi__gif* g = (stbi__gif*)stbi__malloc(sizeof(stbi__gif));
-    if (!g)
-        return stbi__err("outofmem", "Out of memory");
-    if (!stbi__gif_header(s, g, comp, 1)) {
-        STBI_FREE(g);
+    stbi__gif g;
+    memset(&g, 0, sizeof(g));
+    if (!stbi__gif_header(s, &g, comp, 1)) {
         stbi__rewind(s);
         return 0;
     }
     if (x)
-        *x = g->w;
+        *x = g.w;
     if (y)
-        *y = g->h;
-    STBI_FREE(g);
+        *y = g.h;
     return 1;
 }
 

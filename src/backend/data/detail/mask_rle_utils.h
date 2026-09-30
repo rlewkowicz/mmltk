@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/common/types/workspace_buffer.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -26,7 +27,7 @@ struct EncodedRowMajorMask {
  RowMajorMaskBounds bounds;
 };
 struct MaskResizeScratch {
- std::vector<std::pair<std::uint32_t, std::uint32_t>> intervals;
+ mmltk::common::types::WorkspaceBuffer<std::pair<std::uint32_t, std::uint32_t>> intervals;
 };
 class MaskRunCapacityError final : public std::length_error {
 public:
@@ -41,7 +42,7 @@ private:
 // input validation and transactional rollback; overlap union is a separate algorithm.
 class MaskRunEmitter final {
 public:
- MaskRunEmitter(std::vector<RLEPair>& output, std::size_t first_run, std::uint32_t width, RowMajorMaskBounds* bounds = nullptr, const char* start_error = "mask run start overflow",
+ MaskRunEmitter(mmltk::common::types::WorkspaceOutput<RLEPair> output, std::size_t first_run, std::uint32_t width, RowMajorMaskBounds* bounds = nullptr, const char* start_error = "mask run start overflow",
   const char* length_error = "mask run length overflow", std::size_t maximum_runs = std::numeric_limits<std::size_t>::max())
      : output_(output), first_(first_run), width_(width), bounds_(bounds), start_error_(start_error), length_error_(length_error), maximum_(maximum_runs), required_(output.size()) {
   if (required_ > first_) last_ = output.back();
@@ -51,7 +52,7 @@ public:
  void finish() const;
 
 private:
- std::vector<RLEPair>& output_;
+ mmltk::common::types::WorkspaceOutput<RLEPair> output_;
  std::size_t first_;
  std::uint32_t width_;
  RowMajorMaskBounds* bounds_;
@@ -70,5 +71,5 @@ void materialize_row_major_mask(std::span<const RLEPair> pairs, MaskDimensions d
 // Appends one independent mask, coalescing only within that mask. Failure leaves
 // output and source bounds unchanged; empty input leaves source bounds untouched.
 [[nodiscard]] RowMajorMaskBounds append_resized_row_major_mask(std::span<const RLEPair>, MaskDimensions source, MaskDimensions target, const mmltk::backend::imaging::resample::ImageResizeGeometry&,
- MaskResizeScratch*, std::vector<RLEPair>& output, RowMajorMaskBounds* source_bounds = nullptr, std::size_t maximum_runs = std::numeric_limits<std::size_t>::max());
+ MaskResizeScratch*, mmltk::common::types::WorkspaceOutput<RLEPair> output, RowMajorMaskBounds* source_bounds = nullptr, std::size_t maximum_runs = std::numeric_limits<std::size_t>::max());
 }  // namespace mmltk::backend::data::dataset

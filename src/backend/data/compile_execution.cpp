@@ -1,5 +1,6 @@
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/detail/compile_admission.h"
+#include "src/backend/data/detail/compile_workspace.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/io/scoped_fd.h"
 #include <algorithm>
@@ -137,6 +138,7 @@ struct CompileExecution::Impl {
  std::array<Class, class_count> classes;
  std::array<std::list<std::shared_ptr<Job>>, kind_count> ready;
  std::list<std::shared_ptr<Job>> jobs;
+ std::vector<std::shared_ptr<Job>> available_records;
  std::vector<std::shared_ptr<Readiness::State>> observers;
  std::size_t cursor = 0, record_limit = 0, services = 0;
  std::uint64_t admitted = 0, completed = 0;
@@ -234,10 +236,10 @@ struct CompileExecution::Impl {
    visit(lane.idle.allowance.credits_);
   }
  }
- [[nodiscard]] std::uint64_t reclaimable_workspace_bytes() const {
+ [[nodiscard]] std::uint64_t reclaimable_workspace_bytes(bool arenas_only = false) const {
   std::uint64_t result = 0;
   visit_workspace_credits([&](const auto& credit) {
-   if (!credit || credit->resources.retained_handles || !credit->resources.bytes) return;
+   if (!credit || credit->resources.retained_handles || !credit->resources.bytes || (arenas_only && !credit->arena)) return;
    const std::shared_ptr<Credits>* first = nullptr;
    std::size_t references = 0;
    visit_workspace_credits([&](const auto& owned) {
@@ -290,7 +292,9 @@ struct CompileExecution::Impl {
    const std::lock_guard lock(admission->mutex);
    --classes[class_index].pending;
    jobs.remove(job);
+   if (admission->draining_request==job.get()) admission->drain(nullptr,nullptr,0);
    job->done = true;
+   available_records.push_back(job);
    if (observer) ++completed;
    reconcile();
    notify_locked();
@@ -328,7 +332,17 @@ struct CompileExecution::Impl {
   result.records = jobs.size();
   result.record_limit = record_limit;
   result.resources = {admission->bytes + admission->handle_bytes, admission->descriptors, false, admission->active + admission->external_cpus, false, admission->committed};
+  result.opaque_library=admission->opaque_bytes;
   result.byte_target = admission->target; result.descriptor_limit = admission->descriptor_capacity;
+  if (admission->arenas) {
+   const auto bank = admission->arenas->snapshot();
+   result.normal_locked = bank.locked; result.resident = bank.resident; result.leased = bank.leased;
+   result.exceptional = bank.exceptional; result.exceptional_peak = bank.exceptional_peak;
+   result.exceptional_reserved=bank.exceptional_reserved; result.workspace_reuses=bank.reused; result.physical_retirements=bank.physical_retirements;
+   const auto& plan=admission->arenas->plan();
+   result.protected_workspace=plan.protected_bytes; result.shared_workspace=plan.shared_bytes; result.compaction_workspace=plan.compaction_bytes;
+   result.workspace_contexts=plan.contexts; result.context_capacity=plan.context_bytes;
+  }
   result.admitted = admitted;
   result.completed = completed;
   return result;
@@ -361,6 +375,14 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
     if (job->reason == CompileParkReason::Dependency) { job->dependency.reset(); enqueue(job); }
     job->cancelled = true;
    }
+   if (!admission->draining_external) {
+    const Job* drain = nullptr;
+    if (!discard && !admission->arenas->exceptional_active()) for (const auto& job : jobs) {
+     if (!job->done && !job->running && !job->cancelled && job->reason!=CompileParkReason::Dependency &&
+         !job->task.allowance && admission->oversized(job->task.resources)) { drain=job.get(); break; }
+    }
+    admission->drain(drain,drain ? drain->task.parent.credits_.get() : nullptr,drain ? drain->task.resources.bytes : 0);
+   }
    const auto pressure = admission->resource_waiters || std::ranges::any_of(jobs, [](const auto& job) { return job->reason == CompileParkReason::Bytes || job->reason == CompileParkReason::Withdrawal; });
    if (pressure) for (std::size_t i = 0; i < lanes.size(); ++i) {
     auto& value = lanes[i];
@@ -369,15 +391,15 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
     }
    }
    std::shared_ptr<Job> aged;
-   std::optional<std::uint64_t> reclaimable;
+   std::optional<std::uint64_t> reclaimable, reclaimable_arena;
    for (const auto& job : jobs) {
     if (job->running || job->cancelled || job->age < 8 || job->reason != CompileParkReason::Bytes || (aged && job->age <= aged->age)) continue;
-    if (!reclaimable) reclaimable = reclaimable_workspace_bytes();
+    if (!reclaimable) { reclaimable = reclaimable_workspace_bytes(); reclaimable_arena=reclaimable_workspace_bytes(true); }
     const auto& demand = job->task.resources;
     const auto* parent = job->task.parent.credits_.get();
     // Reserve future room only when actual CPU/idle custody can provide it.
     // Retained owners may need the fitting small jobs to finish before release.
-    if (admission->eligibility(demand, parent, job->task.finite_consumer, *reclaimable).fits) aged = job;
+    if (admission->eligibility(demand, parent, job->task.finite_consumer, *reclaimable, *reclaimable_arena).fits) aged = job;
    }
    for (std::size_t turn = 0; turn < class_count; ++turn) {
     const auto class_index = (cursor + turn) % class_count;
@@ -393,6 +415,8 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
       const auto& task = job.task;
       const bool reusable = task.retain_workspace && task.workspace && lane.idle.workspace == task.workspace && CompileAdmission::covers(*lane.idle.allowance.credits_, task.resources);
       if (!job.cancelled && !discard) {
+       if (admission->arenas->exceptional_active() && !CompileAdmission::exceptional_custody(task.allowance.credits_.get()) &&
+           !CompileAdmission::exceptional_custody(task.parent.credits_.get())) { park(job,CompileParkReason::Bytes); continue; }
        if (admission->active + admission->external_cpus >= cpus.size() + (lane.active ? 1 : 0)) {
         // A temporary service grant does not resolve a resource predicate that
         // this record already checked. Retain its pressure until rechecked;
@@ -540,9 +564,20 @@ CompileExecution::CompileExecution(std::size_t workers, std::span<const int> eli
  }
  state.lanes.resize(workers);
  state.record_limit = limits.task_records ? limits.task_records : workers * 8 + class_count;
+ state.available_records.reserve(state.record_limit);
+ for (std::size_t record=0; record<state.record_limit; ++record) {
+  auto job=std::make_shared<Job>(); job->done=true; state.available_records.push_back(std::move(job));
+ }
  if (state.record_limit < workers) throw std::invalid_argument("compile record capacity is smaller than its CPU grant");
  state.admission->cpu_capacity = workers;
- state.admission->target = limits.transient_bytes ? limits.transient_bytes : std::min<std::uint64_t>(6ULL << 30, std::max<std::uint64_t>(256ULL << 20, workers * (64ULL << 20)));
+ const auto workspace_plan = limits.workspace_plan ? *limits.workspace_plan : CompileWorkspacePlan::prepare(workers,{},0,0,limits.transient_bytes);
+ state.admission->target = limits.transient_bytes ? limits.transient_bytes : workspace_plan.budget;
+ std::vector<int> nodes;
+ nodes.reserve(workers);
+ for (std::size_t lane=0; lane<workers; ++lane) nodes.push_back(state.pool->policy(lane).numa_node);
+ state.admission->arenas = std::make_shared<CompileArenaBank>(workspace_plan,nodes,[weak=std::weak_ptr<CompileAdmission>(state.admission)] {
+  if (auto admission = weak.lock()) { const std::lock_guard lock(admission->mutex); admission->notify(CompileAdmission::Change::Resources); }
+ },bool(observer));
  const auto descriptors = descriptor_headroom();
  state.admission->descriptor_capacity = limits.descriptors ? std::min(limits.descriptors, descriptors) : descriptors;
  if (state.admission->descriptor_capacity < 2) throw std::invalid_argument("compile descriptor admission requires completion headroom");
@@ -618,7 +653,7 @@ void CompileExecution::Completion::cancel() const noexcept {
  if (!state_) return;
  if (auto owner = state_->owner.lock()) {
   const std::lock_guard lock(owner->admission->mutex);
-  if (auto job = state_->job.lock(); job && !job->done) { job->cancelled = true; if (job->reason == CompileParkReason::Dependency) { job->dependency.reset(); owner->enqueue(job); } owner->notify_locked(); }
+  if (auto job = state_->job.lock(); job && !job->done && job->completion==state_) { job->cancelled = true; if (job->reason == CompileParkReason::Dependency) { job->dependency.reset(); owner->enqueue(job); } owner->notify_locked(); }
  }
 }
 CompileExecution::CompletionSource::CompletionSource(CompileExecution* owner) : state_(std::make_shared<CompletionState>()) { if (owner) state_->owner = owner->impl_; }
@@ -645,7 +680,8 @@ void CompileExecution::Dependency::notify() noexcept {
  }
 }
 std::optional<CompileExecution::Completion> CompileExecution::submit_impl(Task task, const std::shared_ptr<DependencyState>& dependency, std::uint64_t observed) {
- const std::lock_guard lock(impl_->admission->mutex);
+ std::unique_lock lock(impl_->admission->mutex);
+ task.resources.workspace_class = work_class(task.kind);
  impl_->check(); impl_->validate(task);
  if (impl_->jobs.size() == impl_->record_limit) return {};
  // Keep one prepared admission record per class outside elastic records. A
@@ -657,20 +693,28 @@ std::optional<CompileExecution::Completion> CompileExecution::submit_impl(Task t
   for (const auto& value : impl_->classes) protected_records += value.pending == 0;
   if (impl_->jobs.size() >= impl_->record_limit - protected_records) return {};
  }
- auto job = std::make_shared<Job>();
- job->task = std::move(task);
- job->completion = std::make_shared<CompletionState>();
- job->completion->owner = impl_; job->completion->job = job;
- if (job->task.completed) job->completion->callbacks.push_back(std::move(job->task.completed));
+ if (impl_->available_records.empty()) return {};
+ auto job=impl_->available_records.back();
  if (dependency && dependency->owner.lock() != impl_) throw std::invalid_argument("compile dependency belongs to another session");
- impl_->jobs.push_back(job);
+ auto completion = std::make_shared<CompletionState>();
+ completion->owner = impl_; completion->job = job;
+ if (task.completed) completion->callbacks.push_back(std::move(task.completed));
+ // Allocate fallible records before publishing the reusable slot.
+ try { impl_->jobs.push_back(job); } catch (...) { lock.unlock(); throw; }
+ impl_->available_records.pop_back();
+ *job=Job{};
+ job->task = std::move(task);
+ job->completion = std::move(completion);
  try {
   if (dependency && dependency->generation == observed) {
+   std::erase_if(dependency->waiting, [&](const auto& value) {
+    const auto waiting=value.lock();
+    return !waiting || waiting==job || waiting->done || waiting->dependency!=dependency;
+   });
    job->reason = CompileParkReason::Dependency; job->dependency = dependency;
-   std::erase_if(dependency->waiting, [](const auto& value) { return value.expired(); });
    dependency->waiting.push_back(job);
   } else impl_->enqueue(job);
- } catch (...) { impl_->jobs.remove(job); throw; }
+ } catch (...) { impl_->jobs.remove(job); job->done=true; impl_->available_records.push_back(job); task=std::move(job->task); auto retired_completion=std::exchange(job->completion,{}); lock.unlock(); throw; }
  ++impl_->classes[index(work_class(job->task.kind))].pending;
  if (impl_->observer) ++impl_->admitted; impl_->reconcile(); impl_->notify_locked();
  return Completion(job->completion);
@@ -684,7 +728,7 @@ std::optional<CompileExecution::Completion> CompileExecution::try_subscribe(Depe
 void CompileExecution::resume(const Completion& completion) noexcept {
  if (!completion.state_ || completion.state_->owner.lock() != impl_) return;
  const std::lock_guard lock(impl_->admission->mutex);
- if (auto job = completion.state_->job.lock(); job && !job->done && job->reason == CompileParkReason::Dependency) { job->dependency.reset(); impl_->enqueue(job); impl_->notify_locked(); }
+ if (auto job = completion.state_->job.lock(); job && !job->done && job->completion==completion.state_ && job->reason == CompileParkReason::Dependency) { job->dependency.reset(); impl_->enqueue(job); impl_->notify_locked(); }
 }
 void CompileExecution::fail(std::exception_ptr error) noexcept { const std::lock_guard lock(impl_->admission->mutex); if (!impl_->failure) impl_->failure = std::move(error); impl_->notify_locked(CompileAdmission::Change::Interruption); }
 void CompileExecution::cancel() noexcept { const std::lock_guard lock(impl_->admission->mutex); impl_->stopping = true; impl_->notify_locked(CompileAdmission::Change::Interruption); }
@@ -709,6 +753,10 @@ void CompileExecution::retire_attempt() noexcept {
 }
 bool CompileExecution::on_lane() const noexcept { return Impl::Frame::current && &Impl::Frame::current->owner == impl_.get(); }
 std::size_t CompileExecution::current_lane() const { if (!on_lane()) throw std::logic_error("compile lane requested outside CPU work"); return Impl::Frame::current->lane; }
+CompileAllowance CompileExecution::current_allowance() const {
+ if (!on_lane()) throw std::logic_error("compile allowance requested outside CPU work");
+ return Impl::Frame::current->allowance;
+}
 std::size_t CompileExecution::workers() const noexcept { return impl_->cpus.size(); }
 std::span<const int> CompileExecution::cpus() const noexcept { return impl_->cpus; }
 CompileExecutionSnapshot CompileExecution::snapshot() const { const std::lock_guard lock(impl_->admission->mutex); return impl_->snapshot_locked(); }
@@ -781,8 +829,17 @@ std::optional<CompileAllowance> CompileExecution::try_reserve(CompileResources r
 CompileAllowance CompileExecution::reserve(CompileResources resources, const CompileAllowance& parent, std::source_location location) {
  if (on_lane()) throw std::logic_error("compile CPU lane cannot wait for resource credits");
  require_feasible(resources);
+ struct DrainReservation {
+  std::shared_ptr<CompileAdmission> owner;
+  ~DrainReservation() { const std::lock_guard lock(owner->mutex); if (owner->draining_request==this) owner->drain(nullptr,nullptr,0); }
+ } drain{impl_->admission};
  bool reported = false;
  for (;;) {
+  {
+   const std::lock_guard lock(impl_->admission->mutex);
+   if (!impl_->admission->draining_request && impl_->admission->oversized(resources))
+    impl_->admission->drain(&drain,parent.credits_.get(),resources.bytes,true);
+  }
   const auto observed = admission_generation();
   if (auto value = try_reserve(resources, parent, location)) return std::move(*value);
   if (impl_->observer && !std::exchange(reported, true)) try {
@@ -816,7 +873,7 @@ bool CompileExecution::try_resize_workspace(const CompileAllowance& allowance, s
   auto& owner = *impl_->admission; impl_->check();
   auto& resources = credits->resources;
   if (credits->cpu_users) return Resize::Active;
-  if (resources.retained_handles || !credits->workspace_loans.empty() || credits->workspace_offer) throw std::logic_error("compile workspace resize requires settled own custody");
+  if (credits->arena || resources.retained_handles || !credits->workspace_loans.empty() || credits->workspace_offer) throw std::logic_error("compile workspace resize requires settled own custody");
   if (bytes == resources.bytes || (retain_capacity && !owner.resource_waiters && bytes < resources.bytes)) return Resize::Complete;
   if (bytes > resources.bytes) {
    const auto growth = bytes - resources.bytes;

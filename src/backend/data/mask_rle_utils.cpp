@@ -142,7 +142,7 @@ void materialize_row_major_mask(const std::span<const RLEPair> pairs, const Mask
  }
 }
 RowMajorMaskBounds append_resized_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions source_dimensions, const MaskDimensions target_dimensions,
- const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch, std::vector<RLEPair>& output, RowMajorMaskBounds* source_bounds, std::size_t maximum_runs) {
+ const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch, mmltk::common::types::WorkspaceOutput<RLEPair> output, RowMajorMaskBounds* source_bounds, std::size_t maximum_runs) {
  if (scratch == nullptr || letterbox.resized_width == 0U || letterbox.resized_height == 0U || letterbox.resized_width > target_dimensions.width ||
      letterbox.resized_height > target_dimensions.height || letterbox.offset_x > target_dimensions.width - letterbox.resized_width ||
      letterbox.offset_y > target_dimensions.height - letterbox.resized_height) {

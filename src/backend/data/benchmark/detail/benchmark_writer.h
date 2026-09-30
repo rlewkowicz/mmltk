@@ -23,6 +23,7 @@
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
 
 class BenchmarkCompilePipeline;
@@ -76,7 +77,7 @@ struct BenchmarkWriteRequest {
  CompiledCompactionProgress compaction{};
 };
 // Physical slots are stable across sparse growth. Calls on different
-// slots may overlap; each lane has exclusive reusable decoder/resizer scratch.
+// slots may overlap; execution lends an exclusive pixel context and arena.
 // The owner must drain pixel calls before finalization, repair, or destruction.
 struct BenchmarkPixelInput;
 class BenchmarkSplitWriter final {
@@ -94,14 +95,12 @@ public:
  [[nodiscard]] ImageEntry entry(std::uint32_t) const;
  [[nodiscard]] BenchmarkSealedSplit seal_slots(const BenchmarkWriteRequest&, std::span<const std::uint32_t>);
  void write_labels(std::uint32_t slot, ImageEntry entry, ImageAnnotations, std::size_t lane = 0, std::uint64_t ordinal_base = 0);
- void prepare_lanes(std::size_t);
- void retire_scratch(std::size_t) noexcept;
  [[nodiscard]] std::shared_ptr<BenchmarkPixelInput> prepare_pixel(
   std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication = {}, CompileAllowance allowance = {}, std::shared_ptr<const BenchmarkEncodedImage> payload = {});
  [[nodiscard]] CompileAllowance pixel_input_allowance(const BenchmarkPixelInput&) const;
- [[nodiscard]] std::uint64_t pixel_workspace_bytes(const BenchmarkPixelInput&) const;
- [[nodiscard]] std::uint64_t pixel_workspace_bytes(const BenchmarkImageHeader&, std::size_t encoded_bytes) const;
- void write_pixel(std::size_t slot, std::size_t lane, const std::shared_ptr<BenchmarkPixelInput>&);
+ [[nodiscard]] CompileResources pixel_resources(const BenchmarkPixelInput&) const;
+ [[nodiscard]] CompileResources pixel_resources(const BenchmarkImageHeader&) const;
+ void write_pixel(std::size_t slot, std::size_t lane, const std::shared_ptr<BenchmarkPixelInput>&, CompileAllowance, detail::CompilePixelWorkspace&);
  void write_pixel(std::size_t slot, std::size_t lane);
  void write_remaining(const BenchmarkWriteRequest&);
  void invalidate_source(const std::filesystem::path&);

@@ -36,6 +36,8 @@
 #include "src/backend/data/benchmark/detail/benchmark_compiler.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_recipe.h"
+#include "src/backend/data/detail/compile_image_decoder.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_parquet.h"
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
@@ -155,10 +157,20 @@ public:
   if (decode_probe && ready.image_id == decode_probe->image_id && ready.payload) {
    try {
     if (!publication.consume(ready)) {
-     BenchmarkImageValidator validator;
-     validator.validate_decodable(ready.payload->encoded(), decode_probe->expected_width, decode_probe->expected_height);
+     if (execution) {
+      BenchmarkImageDecoder decoder;
+      const auto header=decoder.read_header(ready.payload->encoded(),decode_probe->expected_width,decode_probe->expected_height);
+      execution->execution().submit({.kind=detail::CompileTaskKind::Pixels,
+       .resources={.bytes=BenchmarkImageDecoder::plan(header).bytes(),.supplied_workspace=true,.opaque_bytes=BenchmarkImageDecoder::plan(header).opaque_bytes},
+       .work=[&](std::size_t,const CompileAllowance& allowance) { (void)decoder.decode_rgb(ready.payload->encoded(),header,allowance.workspace()); },
+       .parent=ready.payload->allowance(),.finite_consumer=true,.retain_workspace=false}).wait();
+     } else {
+      BenchmarkImageValidator validator;
+      validator.validate_decodable(ready.payload->encoded(), decode_probe->expected_width, decode_probe->expected_height);
+     }
     }
    } catch (const BenchmarkImageReadError& error) { throw InvalidImageError(error.what()); }
+     catch (const BenchmarkImageError& error) { throw InvalidImageError(error.what()); }
   } else
    publication(ready);
  };
@@ -256,8 +268,6 @@ public:
     .image_ready = publish_image,
     .execution = execution,
     .storage = storage_reservations,
-    .validator_workspace_bytes =
-     decode_probe ? common_math::checked_multiply(std::uint64_t{decode_probe->expected_width} * decode_probe->expected_height, 96U, "benchmark repair workspace overflow") : 0,
     .parent_allowance = source_handle,
    });
    progress->source_activity(source, "Retaining completed " + archive_name + " archive in cache");
@@ -946,6 +956,8 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
    std::min<std::size_t>(common_math::checked_cast<std::size_t>(config.num_workers, "benchmark effective worker count overflow"), common_system::allowed_cpu_set().size());
   config.num_workers = common_math::checked_cast<int>(effective_num_workers, "benchmark effective worker count overflow");
   auto compile_cpus = common_system::allowed_cpu_set();
+  limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(effective_num_workers,config.resolution,config.perceptual_downscale,
+   coconut ? kParquetPoolBytes : 0,limits.transient_bytes,BenchmarkEncodedImage::normal_window_bytes));
   BenchmarkCompilePipeline pipeline(effective_num_workers, compile_cpus, limits, cancel_requested, trace);
   compile_cpus.assign(pipeline.execution().cpus().begin(), pipeline.execution().cpus().end());
   cancellation_state.execution = &pipeline.execution();

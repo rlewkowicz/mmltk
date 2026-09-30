@@ -6,6 +6,7 @@
 #include <variant>
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
+inline constexpr std::uint64_t kParquetPoolBytes = 256ULL << 20;
 // External Parquet vocabulary. Structural binding derives from these fields;
 // Arrow allocation, null admission, and execution remain ordinary owners.
 struct CoconutParquetImage {

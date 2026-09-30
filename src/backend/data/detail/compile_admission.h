@@ -1,5 +1,6 @@
 #pragma once
 #include "src/backend/data/detail/compile_resources.h"
+#include "src/backend/data/detail/compile_workspace.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <algorithm>
 #include <condition_variable>
@@ -59,6 +60,7 @@ struct CompileAllowance::Credits {
   void clone(const Loans& source) { loans_ = source.loans_; }
   void retire() noexcept { loans_.clear(); }
  } workspace_loans;
+ CompileArenaLease arena;
  std::shared_ptr<CompileAdmission> owner;
  CompileResources resources;
  std::shared_ptr<Credits> parent;
@@ -81,6 +83,7 @@ struct CompileAdmission {
   bool fits = false;
   std::uint64_t loan_bytes = 0;
  };
+ std::shared_ptr<CompileArenaBank> arenas;
  std::mutex mutex;
  std::condition_variable changed;
  std::uint64_t generation = 0;
@@ -89,13 +92,32 @@ struct CompileAdmission {
  std::function<void(Change)> publish_change;
  std::function<void(std::span<const std::size_t>)> release_cpus;
  std::size_t protected_cpus = 0;
- std::uint64_t target = 0, bytes = 0, handle_bytes = 0, offered_bytes = 0;
+ std::uint64_t target = 0, bytes = 0, handle_bytes = 0, offered_bytes = 0, opaque_bytes = 0;
  // Only positive offers participate. Zero-capacity scopes still retain their
  // Credits sentinel, preventing reentry/resize without joining unrelated loans.
  std::vector<std::shared_ptr<CompileWorkspaceOffer>> workspace_offers;
  std::size_t descriptor_capacity = 0, descriptors = 0, committed = 0;
  std::size_t cpu_capacity = 0, active = 0, external_cpus = 0, waiters = 0, resource_waiters = 0, resource_jobs = 0;
  std::size_t withdrawals = 0;
+ // One ready oversized demand closes new transient production while existing
+ // finite consumers finish their retained inputs. Identity is actual request
+ // custody, never a diagnostic token.
+ const void* draining_request = nullptr;
+ const Credits* draining_parent = nullptr;
+ std::uint64_t draining_bytes = 0;
+ bool draining_external = false;
+ [[nodiscard]] static bool exceptional_custody(const Credits* credit) {
+  for (; credit; credit=credit->parent.get()) if (credit->arena.exceptional()) return true;
+  return false;
+ }
+ [[nodiscard]] bool oversized(CompileResources value) const {
+  return value.supplied_workspace && value.bytes && arenas && !arenas->normal_fit(value.bytes,value.completion_workspace,value.workspace_class,value.workspace_window);
+ }
+ void drain(const void* request, const Credits* parent, std::uint64_t count, bool external = false) {
+  if (request==draining_request) return;
+  draining_request=request; draining_parent=parent; draining_bytes=count; draining_external=external;
+  notify(Change::Resources);
+ }
  bool tracing = false;
  std::vector<Credits*> observed_credits;
  void notify(Change change) noexcept {
@@ -153,8 +175,25 @@ struct CompileAdmission {
  // Prospective retirement changes only charged workspace bytes. Offers and
  // descriptor promises remain owned by their actual producers. Zero retirement
  // gives the exact participating draw used by charge under this same mutex.
- [[nodiscard]] Eligibility eligibility(CompileResources value, const Credits* parent = nullptr, bool finite_consumer = false, std::uint64_t retiring_bytes = 0) const {
+ [[nodiscard]] Eligibility eligibility(CompileResources value, const Credits* parent = nullptr, bool finite_consumer = false, std::uint64_t retiring_bytes = 0, std::uint64_t retiring_arena_bytes = 0) const {
   if (!feasible(value)) return {};
+  if (draining_request && value.bytes && !value.retained_handles &&
+      !(value.supplied_workspace && value.bytes==draining_bytes && parent==draining_parent) &&
+      !(parent && finite_consumer)) return {};
+  if (arenas && arenas->exceptional_active() && value.bytes && !exceptional_custody(parent)) return {};
+  if (value.supplied_workspace && value.bytes && arenas) {
+   if (!arenas->fits(value.bytes,value.completion_workspace,value.workspace_class,value.workspace_window)) {
+    // A shape exceeding every normal contiguous context has one exclusive
+    // exceptional route. Busy fitting contexts remain ordinary resource waits.
+    const auto occupied=arenas->snapshot().leased;
+    if (arenas->exceptional_active() || occupied>retiring_arena_bytes) return {};
+    if (!arenas->normal_fit(value.bytes,value.completion_workspace,value.workspace_class,value.workspace_window)) {
+     std::uint64_t lineage = 0;
+     for (auto* credit = parent; credit; credit = credit->parent.get()) if (!credit->resources.retained_handles) lineage += credit->resources.bytes;
+     if (bytes - std::min(bytes,retiring_bytes) != lineage) return {};
+    }
+   }
+  }
   if (value.cpu_workers && (value.cpu_workers > cpu_capacity - std::min(cpu_capacity, protected_cpus) || external_cpus + active > cpu_capacity - value.cpu_workers)) return {};
   if (value.descriptors + value.continuation_descriptors > descriptor_room(value, parent)) return {};
   if (fits_bytes(value, parent, retiring_bytes)) return {.fits = true};
@@ -195,7 +234,7 @@ struct CompileAdmission {
  }
  static bool covers(const Credits& credit, CompileResources demand) {
   const auto held = credit.resources;
-  return demand.bytes <= held.bytes && demand.descriptors <= held.descriptors && demand.cpu_workers <= held.cpu_workers && (!demand.bytes || demand.retained_handles == held.retained_handles) &&
+  return (!demand.supplied_workspace || held.supplied_workspace) && demand.workspace_window==held.workspace_window && demand.opaque_bytes <= held.opaque_bytes && demand.bytes <= held.bytes && demand.descriptors <= held.descriptors && demand.cpu_workers <= held.cpu_workers && (!demand.bytes || demand.retained_handles == held.retained_handles) &&
          (!demand.producer || held.producer) && demand.continuation_descriptors <= credit.available;
  }
  void charge(Credits& credit, bool finite_consumer = false, std::source_location location = std::source_location::current()) {
@@ -210,11 +249,15 @@ struct CompileAdmission {
   const auto next_descriptors = checked_add(descriptors, value.descriptors, "benchmark descriptor admission overflow");
   const auto next_commitment = checked_add(committed - borrowed, value.continuation_descriptors, "benchmark continuation admission overflow");
   const auto next_cpus = checked_add(external_cpus, value.cpu_workers, "benchmark CPU admission overflow");
+  const auto next_opaque = checked_add(opaque_bytes,value.opaque_bytes,"compile opaque library charge overflow");
   if (admitted.loan_bytes) credit.workspace_loans.attach(workspace_offers, admitted.loan_bytes);
+  if (value.supplied_workspace && value.bytes && arenas)
+   credit.arena = arenas->acquire(value.bytes,!arenas->normal_fit(value.bytes,value.completion_workspace,value.workspace_class,value.workspace_window),value.completion_workspace,value.workspace_class,value.workspace_window);
   storage = next_bytes;
   descriptors = next_descriptors;
   committed = next_commitment;
   external_cpus = next_cpus;
+  opaque_bytes = next_opaque;
   credit.borrowed = borrowed;
   if (credit.parent) credit.parent->available -= borrowed;
   credit.charged = true;
@@ -229,7 +272,7 @@ struct CompileAdmission {
  // frame or stable lending window may still use this credit's commitment.
  // Return detached ancestry to a caller that destroys it outside the mutex.
  [[nodiscard]] std::shared_ptr<Credits> retire_workspace(Credits& credit) noexcept {
-  if (!credit.workspace_retirement_pending || credit.cpu_users || credit.workspace_offer) return {};
+  if (!credit.workspace_retirement_pending || credit.cpu_users || credit.workspace_offer || credit.arena) return {};
   credit.workspace_retirement_pending = false;
   auto& value = credit.resources;
   const bool resources_changed = value.bytes || !credit.workspace_loans.empty() || (!credit.borrowed && credit.parent);
@@ -252,6 +295,7 @@ struct CompileAdmission {
    (value.retained_handles ? handle_bytes : bytes) -= value.bytes;
    descriptors -= value.descriptors;
    external_cpus -= value.cpu_workers;
+   opaque_bytes -= value.opaque_bytes;
    if (!credit.cpu_lanes.empty() && release_cpus) release_cpus(credit.cpu_lanes);
    // Children hold this credit, so its own children have all returned before
    // destruction. Return the borrowed promise atomically with physical release.
@@ -292,7 +336,7 @@ struct CompileAdmission {
   OfferScope(std::shared_ptr<Credits> producer, std::uint64_t live_bytes) : producer_(std::move(producer)) {
    auto& owner = *producer_->owner;
    const auto& resources = producer_->resources;
-   if (resources.retained_handles || live_bytes > resources.bytes || !producer_->workspace_loans.empty() || producer_->workspace_retirement_pending)
+   if (producer_->arena || resources.retained_handles || live_bytes > resources.bytes || !producer_->workspace_loans.empty() || producer_->workspace_retirement_pending)
     throw std::invalid_argument("benchmark workspace offer exceeds stable input custody");
    if (producer_->workspace_offer) throw std::invalid_argument("benchmark input already offers unused workspace");
    offer_->bytes = resources.bytes - live_bytes;
