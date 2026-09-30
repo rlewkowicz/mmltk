@@ -9828,12 +9828,14 @@ TEST_CASE("compile fixed arenas retain pinning while owned label outputs delay r
 }
 TEST_CASE("one exceptional arena finishes its retained lineage and returns to the fixed bank", "[benchmark][pipeline][resources]") {
  using namespace mmltk::backend::data::detail;
+ const auto window=GENERATE(CompileWorkspaceWindow::Task,CompileWorkspaceWindow::SharedSource,CompileWorkspaceWindow::Compaction);
+ CAPTURE(window);
  const auto page=mmltk::common::system::host_page_size();
  CompileExecution execution(1,{}, {.transient_bytes=page});
  const auto locked=execution.snapshot().normal_locked;
  auto parent=execution.reserve({page,0});
  CompileAllowance output;
- execution.submit({.kind=CompileTaskKind::Pixels,.resources={.bytes=page*3,.supplied_workspace=true},
+ execution.submit({.kind=CompileTaskKind::Pixels,.resources={.bytes=page*3,.supplied_workspace=true,.workspace_window=window},
   .work=[&](std::size_t,const CompileAllowance& allowance) { auto memory=allowance.workspace(); REQUIRE(memory.size()==page*3); memory[0]=std::byte{73}; output=allowance; },
   .parent=parent,.retain_workspace=false}).wait();
  CHECK(execution.snapshot().normal_locked==locked);
@@ -9880,6 +9882,89 @@ TEST_CASE("protected compile windows remain available to their completion class"
  CHECK(shared.workspace().data()!=compaction.workspace().data());
  CHECK(execution.snapshot().normal_locked==plan->budget);
 }
+TEST_CASE("a source larger than its reserve waits for ordinary backing without exceptional commitment", "[benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const bool cancel=GENERATE(false,true);
+ CAPTURE(cancel);
+ const auto page=mmltk::common::system::host_page_size();
+ // One-to-eight models the encoded reserve and the larger Parquet reader window.
+ std::array<CompileWorkspaceProfile,6> profiles{};
+ profiles[static_cast<std::size_t>(CompileWorkClass::Extraction)].normal_bytes=page*8;
+ profiles[static_cast<std::size_t>(CompileWorkClass::Output)].completion_bytes=page;
+ auto plan=std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1,profiles,page,page,page*11));
+ std::promise<void> parked;
+ std::atomic<bool> observed{false};
+ std::atomic<unsigned> calls{0};
+ const std::byte* resumed=nullptr;
+ CompileExecution execution(1,{}, {.workspace_plan=plan},{},[&](std::string_view,const CompileExecutionSnapshot& value) {
+  if (value.parked[static_cast<std::size_t>(CompileParkReason::Bytes)] && !observed.exchange(true)) mmltk::testsupport::release_test_promise(parked);
+ });
+ auto input=execution.reserve({.bytes=page*8,.supplied_workspace=true});
+ auto* const base=input.workspace().data(); base[0]=std::byte{53};
+ auto source=execution.submit({.kind=CompileTaskKind::Archive,
+  .resources={.bytes=page*8,.supplied_workspace=true,.workspace_window=CompileWorkspaceWindow::SharedSource},
+  .work=[&](std::size_t,const CompileAllowance& allowance) {
+   resumed=allowance.workspace().data(); CHECK(allowance.workspace()[0]==std::byte{53}); ++calls;
+  },.retain_workspace=false});
+ const mmltk::testsupport::ScopedTestCleanup stop([&] { source.cancel(); });
+ mmltk::testsupport::await_test_promise(parked,"reader window waits for the occupied ordinary arena");
+ CHECK(calls==0);
+ CHECK(execution.snapshot().exceptional_reserved==0);
+ // A normal wait leaves unrelated protected work eligible; an oversized drain would block it.
+ auto encoded=execution.try_reserve({.bytes=page,.supplied_workspace=true,.workspace_window=CompileWorkspaceWindow::SharedSource});
+ auto compact=execution.try_reserve({.bytes=page,.supplied_workspace=true,.workspace_window=CompileWorkspaceWindow::Compaction});
+ auto completion=execution.try_reserve({.bytes=page,.supplied_workspace=true,.completion_workspace=true,.workspace_class=CompileWorkClass::Output});
+ REQUIRE(encoded); REQUIRE(compact); REQUIRE(completion);
+ CHECK(execution.resource_usage().bytes==plan->budget);
+ CHECK_FALSE(execution.try_reserve({.bytes=1,.supplied_workspace=true}));
+ if (cancel) {
+  source.cancel(); CHECK_THROWS(source.wait()); CHECK(calls==0);
+  CHECK(input.workspace()[0]==std::byte{53});
+ }
+ input={};
+ if (!cancel) { source.wait(); CHECK(calls==1); CHECK(resumed==base); }
+ auto next=execution.reserve({.bytes=page*8,.supplied_workspace=true,.workspace_window=CompileWorkspaceWindow::SharedSource});
+ CHECK(next.workspace().data()==base);
+ CHECK(execution.snapshot().normal_locked==plan->budget);
+ CHECK(execution.snapshot().exceptional_reserved==0);
+ CHECK(execution.snapshot().exceptional_peak==0);
+ CHECK(execution.snapshot().physical_retirements==0);
+}
+TEST_CASE("independent source and compaction tasks borrow ordinary arenas simultaneously", "[benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ if (mmltk::common::system::allowed_cpu_set().size()<2) SKIP("requires two assigned CPUs");
+ const auto page=mmltk::common::system::host_page_size();
+ const std::array<CompileWorkspaceProfile,1> profiles{{{page*8,0}}};
+ auto plan=std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(2,profiles,page,page,page*18));
+ mmltk::testsupport::TestGate source_entered("ordinary source arena"), compaction_entered("ordinary compaction arena");
+ std::array<std::byte*,2> addresses{};
+ CompileExecution execution(2,{}, {.workspace_plan=plan});
+ const mmltk::testsupport::ScopedTestCleanup release([&] { source_entered.Release(); compaction_entered.Release(); });
+ auto source=execution.submit({.kind=CompileTaskKind::Archive,
+  .resources={.bytes=page*8,.supplied_workspace=true,.workspace_window=CompileWorkspaceWindow::SharedSource},
+  .work=[&](std::size_t,const CompileAllowance& allowance) {
+   addresses[0]=allowance.workspace().data(); addresses[0][0]=std::byte{11}; source_entered.receipt().ArriveAndWait();
+   CHECK(allowance.workspace()[0]==std::byte{11});
+  },.retain_workspace=false});
+ auto compaction=execution.submit({.kind=CompileTaskKind::Output,
+  .resources={.bytes=page*8,.supplied_workspace=true,.workspace_window=CompileWorkspaceWindow::Compaction},
+  .work=[&](std::size_t,const CompileAllowance& allowance) {
+   addresses[1]=allowance.workspace().data(); addresses[1][0]=std::byte{29}; compaction_entered.receipt().ArriveAndWait();
+   CHECK(allowance.workspace()[0]==std::byte{29});
+  },.retain_workspace=false});
+ REQUIRE(source_entered.WaitEntered(2s)); REQUIRE(compaction_entered.WaitEntered(2s));
+ CHECK(addresses[0]!=addresses[1]); CHECK(execution.snapshot().active==2);
+ CHECK(execution.snapshot().leased==page*16);
+ CHECK(execution.snapshot().exceptional_reserved==0);
+ auto encoded=execution.try_reserve({.bytes=page,.supplied_workspace=true,.workspace_window=CompileWorkspaceWindow::SharedSource});
+ auto compact=execution.try_reserve({.bytes=page,.supplied_workspace=true,.workspace_window=CompileWorkspaceWindow::Compaction});
+ REQUIRE(encoded); REQUIRE(compact);
+ CHECK_FALSE(execution.try_reserve({.bytes=1,.supplied_workspace=true}));
+ source_entered.Release(); compaction_entered.Release(); source.wait(); compaction.wait();
+ CHECK(execution.snapshot().leased==page*2);
+ CHECK(execution.snapshot().normal_locked==plan->budget);
+ CHECK(execution.snapshot().exceptional==0);
+}
 TEST_CASE("cancelled oversized admission leaves live output custody and fixed backing intact", "[benchmark][pipeline][resources]") {
  using namespace mmltk::backend::data::detail;
  const auto page=mmltk::common::system::host_page_size();
@@ -9903,14 +9988,16 @@ TEST_CASE("cancelled oversized admission leaves live output custody and fixed ba
 }
 TEST_CASE("exceptional finite descendants partition one pinned extent until last custody", "[benchmark][pipeline][resources]") {
  using namespace mmltk::backend::data::detail;
+ const auto window=GENERATE(CompileWorkspaceWindow::Task,CompileWorkspaceWindow::SharedSource,CompileWorkspaceWindow::Compaction);
+ CAPTURE(window);
  const auto page=mmltk::common::system::host_page_size();
  CompileExecution execution(1,{}, {.transient_bytes=page},{},[](std::string_view,const CompileExecutionSnapshot&) {});
- auto envelope=execution.reserve({.bytes=page*3,.supplied_workspace=true});
+ auto envelope=execution.reserve({.bytes=page*3,.supplied_workspace=true,.workspace_window=window});
  auto* const base=envelope.workspace().data();
  auto input=envelope.split_storage(page), output=envelope.split_storage(page);
  CHECK(input.workspace().data()==base); CHECK(output.workspace().data()==base+page);
  CHECK(envelope.workspace().data()==base+page*2);
- execution.submit({.kind=CompileTaskKind::Output,.resources={.bytes=page,.supplied_workspace=true},
+ execution.submit({.kind=CompileTaskKind::Output,.resources={.bytes=page,.supplied_workspace=true,.workspace_window=window},
   .work=[&](std::size_t,const CompileAllowance& own) { own.workspace()[0]=std::byte{19}; },.allowance=output,.retain_workspace=false}).wait();
  envelope={}; input={};
  CHECK(execution.snapshot().exceptional==page*3); CHECK(output.workspace()[0]==std::byte{19});

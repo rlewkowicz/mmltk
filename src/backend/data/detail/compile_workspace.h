@@ -46,7 +46,10 @@ public:
  struct Snapshot { std::uint64_t locked = 0, resident = 0, leased = 0, exceptional = 0, exceptional_peak = 0, exceptional_reserved = 0, reused = 0, physical_retirements = 0; std::size_t contexts = 0; };
  CompileArenaBank(const CompileWorkspacePlan&, std::span<const int> numa_nodes, std::function<void()> released, bool observe = false);
  [[nodiscard]] const CompileWorkspacePlan& plan() const noexcept;
+ // Unreserved Task contexts serve every window; named and class-completion reserves require
+ // the matching request. Prefer the smallest fitting ordinary context first.
  [[nodiscard]] bool fits(std::size_t bytes, bool completion = false, CompileWorkClass = CompileWorkClass::Count, CompileWorkspaceWindow = CompileWorkspaceWindow::Task) const;
+ // Uses the same compatibility rule without occupancy or exceptional activity.
  [[nodiscard]] bool normal_fit(std::size_t bytes, bool completion = false, CompileWorkClass = CompileWorkClass::Count, CompileWorkspaceWindow = CompileWorkspaceWindow::Task) const;
  [[nodiscard]] bool exceptional_active() const;
  // Called only after CompileAdmission has drained unrelated physical users.

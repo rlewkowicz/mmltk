@@ -1,5 +1,6 @@
 #include "src/backend/data/detail/compile_workspace.h"
 #include "src/common/system/numa_memory.h"
+#include "src/common/system/numa_topology.h"
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <array>
@@ -1167,4 +1168,56 @@ TEST_CASE("compile preparation uses owner capacities protected reserves and the 
  const auto oversized=CompileWorkspacePlan::prepare(2,profiles,page,page);
  CHECK(oversized.context_bytes==page*3); // Legal large image is an exceptional request, not a preparation rejection.
  CHECK_THROWS_AS(CompileWorkspacePlan::prepare(2,profiles,CompileWorkspacePlan::ceiling,page),InsufficientCompileResources);
+}
+
+TEST_CASE("compile arena windows prefer the smallest ordinary context and retain physical borrowers", "[backend][data][compile][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const auto window=GENERATE(CompileWorkspaceWindow::Task,CompileWorkspaceWindow::SharedSource,CompileWorkspaceWindow::Compaction);
+ CAPTURE(window);
+ const auto page=mmltk::common::system::host_page_size();
+ const std::array<CompileWorkspaceProfile,3> profiles{{{page*2,page},{page*8,page},{page*4,page}}};
+ const auto plan=CompileWorkspacePlan::prepare(3,profiles,page,page,page*19);
+ REQUIRE(plan.context_capacities==std::vector<std::size_t>{page*8,page*4,page*2});
+ const auto node=mmltk::common::system::NumaTopology::Capture().permitted_nodes.front();
+ const std::array nodes{node,node,node};
+ std::size_t releases=0;
+ CompileArenaBank bank(plan,nodes,[&] { ++releases; },true);
+ // Even an eligible smaller reserve must remain free while ordinary backing fits.
+ auto small=bank.acquire(page,false,true,CompileWorkClass::Extraction,window);
+ auto middle=bank.acquire(page*4,false,false,CompileWorkClass::Count,CompileWorkspaceWindow::Compaction);
+ auto large=bank.acquire(page*8,false,false,CompileWorkClass::Count,CompileWorkspaceWindow::SharedSource);
+ auto* const base=small.bytes().data();
+ small.bytes()[0]=std::byte{37};
+ CHECK(base!=middle.bytes().data()); CHECK(base!=large.bytes().data());
+ CHECK(middle.bytes().data()!=large.bytes().data());
+ CHECK_FALSE(small.exceptional()); CHECK_FALSE(middle.exceptional()); CHECK_FALSE(large.exceptional());
+ for (const auto request : {CompileWorkspaceWindow::Task,CompileWorkspaceWindow::SharedSource,CompileWorkspaceWindow::Compaction}) {
+  CHECK(bank.normal_fit(page*8,false,CompileWorkClass::Count,request));
+  CHECK_FALSE(bank.fits(page*8,false,CompileWorkClass::Count,request));
+  CHECK_THROWS_AS(bank.acquire(page*8,true,false,CompileWorkClass::Count,request),InsufficientCompileResources);
+ }
+ CHECK_FALSE(bank.fits(page)); // No unmarked Task request may use a reserve.
+ CHECK_FALSE(bank.fits(page,false,CompileWorkClass::Extraction));
+ CHECK_FALSE(bank.fits(page,true,CompileWorkClass::Output));
+ auto completion=bank.acquire(page,false,true,CompileWorkClass::Extraction);
+ CHECK_FALSE(bank.fits(page,true,CompileWorkClass::Extraction));
+ auto source=bank.acquire(page,false,false,CompileWorkClass::Count,CompileWorkspaceWindow::SharedSource);
+ CHECK_FALSE(bank.fits(page,false,CompileWorkClass::Count,CompileWorkspaceWindow::SharedSource));
+ auto compaction=bank.acquire(page,false,false,CompileWorkClass::Count,CompileWorkspaceWindow::Compaction);
+ CHECK(source.bytes().data()!=compaction.bytes().data());
+ CHECK(source.bytes().data()!=completion.bytes().data());
+ CHECK(bank.snapshot().locked==plan.budget);
+ CHECK(bank.snapshot().exceptional_reserved==0);
+ auto borrower=small.slice(0,page);
+ small={};
+ CHECK(releases==0);
+ CHECK_FALSE(bank.fits(page*2,false,CompileWorkClass::Count,window));
+ CHECK(borrower.bytes()[0]==std::byte{37});
+ borrower={};
+ CHECK(releases==1);
+ auto reused=bank.acquire(page*2,false,false,CompileWorkClass::Count,window);
+ CHECK(reused.bytes().data()==base); CHECK(reused.bytes()[0]==std::byte{37});
+ CHECK(bank.snapshot().reused==1);
+ CHECK(bank.snapshot().resident==plan.budget);
+ CHECK(bank.snapshot().physical_retirements==0);
 }

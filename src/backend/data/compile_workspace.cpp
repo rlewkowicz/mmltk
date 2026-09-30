@@ -102,6 +102,24 @@ struct CompileArenaBank::State {
  std::uint64_t leased = 0, exceptional = 0, exceptional_locked = 0, peak = 0, reused = 0, retired = 0;
  int exceptional_node = -1;
  bool observing = false;
+ // The caller holds mutex. Occupancy affects availability, never shape fit.
+ [[nodiscard]] std::size_t select(std::size_t bytes, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window, bool available_only) const {
+  std::size_t selected=contexts.size();
+  bool selected_ordinary=false;
+  for (std::size_t i=0; i<contexts.size(); ++i) {
+   const auto& value=contexts[i];
+   if ((available_only && value.used) || bytes>value.bytes.size()) continue;
+   const bool ordinary=value.window==CompileWorkspaceWindow::Task && value.completion==CompileWorkClass::Count;
+   const bool named=value.window!=CompileWorkspaceWindow::Task && value.window==window;
+   const bool completing=completion && kind!=CompileWorkClass::Count && value.completion==kind;
+   if (!ordinary && !named && !completing) continue;
+   if (selected==contexts.size() || (ordinary && !selected_ordinary) ||
+       (ordinary==selected_ordinary && value.bytes.size()<contexts[selected].bytes.size())) {
+    selected=i; selected_ordinary=ordinary;
+   }
+  }
+  return selected;
+ }
 };
 CompileArenaBank::CompileArenaBank(const CompileWorkspacePlan& plan, std::span<const int> nodes, std::function<void()> released, bool observe) : state_(std::make_shared<State>()) {
  if (nodes.empty()) throw std::invalid_argument("compile arena has no resolved NUMA placement");
@@ -148,11 +166,11 @@ const CompileWorkspacePlan& CompileArenaBank::plan() const noexcept { return sta
 bool CompileArenaBank::fits(std::size_t bytes, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) const {
  const std::lock_guard lock(state_->mutex);
  if (state_->exceptional) return false;
- return std::ranges::any_of(state_->contexts,[&](const auto& value){ return !value.used && value.window==window && (value.completion==CompileWorkClass::Count || (completion && value.completion==kind)) && bytes <= value.bytes.size(); });
+ return state_->select(bytes,completion,kind,window,true)!=state_->contexts.size();
 }
 bool CompileArenaBank::normal_fit(std::size_t bytes, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) const {
  const std::lock_guard lock(state_->mutex);
- return std::ranges::any_of(state_->contexts,[&](const auto& value){ return value.window==window && (value.completion==CompileWorkClass::Count || (completion && value.completion==kind)) && bytes<=value.bytes.size(); });
+ return state_->select(bytes,completion,kind,window,false)!=state_->contexts.size();
 }
 bool CompileArenaBank::exceptional_active() const { const std::lock_guard lock(state_->mutex); return state_->exceptional != 0; }
 CompileArenaLease CompileArenaBank::acquire(std::size_t bytes, bool exceptional, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) {
@@ -161,14 +179,7 @@ CompileArenaLease CompileArenaBank::acquire(std::size_t bytes, bool exceptional,
  std::weak_ptr<State> weak = state_;
  const std::lock_guard lock(state_->mutex);
  if (state_->exceptional) throw InsufficientCompileResources("compile exceptional lineage has not physically retired");
- std::size_t selected=state_->contexts.size();
- for (std::size_t i=0; i<state_->contexts.size(); ++i) {
-  const auto& value=state_->contexts[i];
-  if (value.used || value.window!=window || (value.completion!=CompileWorkClass::Count && (!completion || value.completion!=kind)) || bytes>value.bytes.size()) continue;
-  if (selected==state_->contexts.size() ||
-      (value.completion==CompileWorkClass::Count && state_->contexts[selected].completion!=CompileWorkClass::Count) ||
-      (value.completion==state_->contexts[selected].completion && value.bytes.size()<state_->contexts[selected].bytes.size())) selected=i;
- }
+ const auto selected=state_->select(bytes,completion,kind,window,true);
  if (selected!=state_->contexts.size()) {
   const auto i=selected;
   auto& value=state_->contexts[i];
@@ -181,7 +192,8 @@ CompileArenaLease CompileArenaBank::acquire(std::size_t bytes, bool exceptional,
   };
   value.used = true; if (state_->observing) { if (value.borrowed) ++state_->reused; value.borrowed=true; } state_->leased += bytes; return CompileArenaLease(std::move(lease),0,bytes);
  }
- if (!exceptional || state_->leased) throw InsufficientCompileResources("compile arena has no fitting available context");
+ if (!exceptional || state_->leased || state_->select(bytes,completion,kind,window,false)!=state_->contexts.size())
+  throw InsufficientCompileResources("compile arena has no fitting available context");
  lease->oversized = true; lease->node = state_->exceptional_node;
  const auto extent = page_rounded_bytes(bytes);
  lease->release = [weak] {
