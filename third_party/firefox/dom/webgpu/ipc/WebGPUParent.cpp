@@ -36,7 +36,7 @@ namespace ffi {
 
 extern void wgpu_parent_external_texture_frame_ready(
     WGPUWebGPUParentPtr aParent, WGPUDeviceId aDeviceId,
-    uint64_t aSurfaceIdHigh, uint64_t aSurfaceIdLow, uint64_t aLayer,
+    uint64_t aGeneration, uint64_t aSurfaceIdHigh, uint64_t aSurfaceIdLow, uint64_t aLayer,
     uint32_t aSlot,
     uint64_t aContentSession, uint64_t aContentSequence,
     uint64_t aPresentationRevision, uint32_t aContentWidth,
@@ -45,7 +45,7 @@ extern void wgpu_parent_external_texture_frame_ready(
     uint32_t aCapacityWidth, uint32_t aCapacityHeight, uint64_t aTransferSequence,
     const uint8_t* aMetadata, size_t aMetadataBytes) {
   static_cast<WebGPUParent*>(aParent)->NotifyExternalTextureFrame(
-      aDeviceId, aSurfaceIdHigh, aSurfaceIdLow, aLayer, aSlot, aContentSession,
+      aDeviceId, aGeneration, aSurfaceIdHigh, aSurfaceIdLow, aLayer, aSlot, aContentSession,
       aContentSequence, aPresentationRevision, aContentWidth, aContentHeight, aCopyComplete,
       aSourceHigh, aSourceLow, aDirectSampling, aCapacityWidth, aCapacityHeight,
       aTransferSequence, aMetadata, aMetadataBytes);
@@ -56,15 +56,15 @@ extern void wgpu_parent_workspace_source_requested(WGPUWebGPUParentPtr aParent, 
 }
 
 extern void wgpu_parent_workspace_request_ready(WGPUWebGPUParentPtr aParent,
-    WGPUDeviceId aDevice, uint64_t aHigh, uint64_t aLow, uint32_t aWidth, uint32_t aHeight) {
-  static_cast<WebGPUParent*>(aParent)->NotifyWorkspaceRequestReady(aDevice, aHigh, aLow, aWidth, aHeight);
+    WGPUDeviceId aDevice, uint64_t aGeneration, uint64_t aHigh, uint64_t aLow, uint32_t aWidth, uint32_t aHeight) {
+  static_cast<WebGPUParent*>(aParent)->NotifyWorkspaceRequestReady(aDevice, aGeneration, aHigh, aLow, aWidth, aHeight);
 }
 
 extern void wgpu_parent_external_texture_import_ready(
     WGPUWebGPUParentPtr aParent, WGPUDeviceId aDeviceId,
-    uint64_t aSurfaceIdHigh, uint64_t aSurfaceIdLow) {
+    uint64_t aGeneration, uint64_t aSurfaceIdHigh, uint64_t aSurfaceIdLow) {
   static_cast<WebGPUParent*>(aParent)->NotifyExternalTextureImportReady(
-      aDeviceId, aSurfaceIdHigh, aSurfaceIdLow);
+      aDeviceId, aGeneration, aSurfaceIdHigh, aSurfaceIdLow);
 }
 
 extern bool wgpu_server_use_shared_texture_for_swap_chain(
@@ -489,7 +489,7 @@ WebGPUParent::WebGPUParent(const dom::ContentParentId& aContentId)
 WebGPUParent::~WebGPUParent() = default;
 
 void WebGPUParent::NotifyExternalTextureFrame(
-    const RawId aDeviceId, const uint64_t aSurfaceIdHigh,
+    const RawId aDeviceId, const uint64_t aGeneration, const uint64_t aSurfaceIdHigh,
     const uint64_t aSurfaceIdLow, const uint64_t aLayer,
     const uint32_t aSlot,
     const uint64_t aContentSession, const uint64_t aContentSequence,
@@ -503,17 +503,29 @@ void WebGPUParent::NotifyExternalTextureFrame(
   RefPtr<WebGPUParent> self = this;
   nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction(
       "WebGPUParent::NotifyExternalTextureFrame",
-      [self = std::move(self), aDeviceId, aSurfaceIdHigh, aSurfaceIdLow,
+      [self = std::move(self), aDeviceId, aGeneration, aSurfaceIdHigh, aSurfaceIdLow,
        aLayer, aSlot, aContentSession, aContentSequence,
        aPresentationRevision, aContentWidth, aContentHeight, aCopyComplete, aSourceHigh, aSourceLow, aDirectSampling,
        aCapacityWidth, aCapacityHeight, aTransferSequence, metadata = std::move(metadata)]() {
-        if (self->CanSend() && !self->SendExternalTextureFrame(
-                                   aDeviceId, aSurfaceIdHigh, aSurfaceIdLow,
-                                   aLayer, aSlot, aContentSession, aContentSequence,
-                                   aPresentationRevision, aContentWidth,
-                                   aContentHeight, aCopyComplete, aSourceHigh, aSourceLow, aDirectSampling,
-                                   aCapacityWidth, aCapacityHeight, aTransferSequence, metadata)) {
+        if (!self->mContext) return;
+        const bool current = self->CanSend() &&
+            ffi::wgpu_server_workspace_callback_valid(self->mContext.get(),
+                aDeviceId, aGeneration, aCopyComplete);
+        if (current) {
+          if (self->SendExternalTextureFrame(
+                  aDeviceId, aSurfaceIdHigh, aSurfaceIdLow, aLayer, aSlot,
+                  aContentSession, aContentSequence, aPresentationRevision,
+                  aContentWidth, aContentHeight, aCopyComplete, aSourceHigh,
+                  aSourceLow, aDirectSampling, aCapacityWidth, aCapacityHeight,
+                  aTransferSequence, metadata)) return;
           NS_WARNING("SendExternalTextureFrame failed");
+        }
+        if (!aCopyComplete) {
+          // No page reader accepted this publication. Return its exact slot;
+          // a direct read still owns a physical release obligation.
+          ffi::wgpu_server_external_texture_slot_release(self->mContext.get(),
+              aSurfaceIdHigh, aSurfaceIdLow, aLayer, aSlot, aContentSession,
+              aContentSequence, aPresentationRevision);
         }
       });
   MOZ_ALWAYS_SUCCEEDS(mOwningEventTarget->Dispatch(
@@ -524,30 +536,35 @@ void WebGPUParent::NotifyWorkspaceSourceRequested(const uint64_t aSourceHigh, co
   RefPtr<WebGPUParent> self = this;
   nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction("WebGPUParent::NotifyWorkspaceSourceRequested",
       [self = std::move(self), aSourceHigh, aSourceLow]() {
-        if (self->CanSend()) ffi::wgpu_server_attach_workspace_source(self->mContext.get(), aSourceHigh, aSourceLow);
+        if (self->mContext && self->CanSend()) ffi::wgpu_server_attach_workspace_source(self->mContext.get(), aSourceHigh, aSourceLow);
       });
   MOZ_ALWAYS_SUCCEEDS(mOwningEventTarget->Dispatch(runnable.forget(), nsIThread::DISPATCH_NORMAL));
 }
 
 void WebGPUParent::NotifyWorkspaceRequestReady(const RawId aDeviceId,
-    const uint64_t aHigh, const uint64_t aLow, const uint32_t aWidth, const uint32_t aHeight) {
+    const uint64_t aGeneration, const uint64_t aHigh, const uint64_t aLow, const uint32_t aWidth, const uint32_t aHeight) {
   RefPtr<WebGPUParent> self = this;
   nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction("WebGPUParent::NotifyWorkspaceRequestReady",
-      [self = std::move(self), aDeviceId, aHigh, aLow, aWidth, aHeight]() {
-        if (self->CanSend() && self->mActiveDeviceIds.Contains(aDeviceId))
-          ffi::wgpu_server_workspace_request(self->mContext.get(), aDeviceId, aHigh, aLow, aWidth, aHeight);
+      [self = std::move(self), aDeviceId, aGeneration, aHigh, aLow, aWidth, aHeight]() {
+        // Rust owns the admitted request even if this device was dropped while
+        // the callback waited. It must publish that request's terminal outcome.
+        if (self->mContext && self->CanSend())
+          ffi::wgpu_server_workspace_request(self->mContext.get(), aDeviceId,
+              aGeneration, aHigh, aLow, aWidth, aHeight);
       });
   MOZ_ALWAYS_SUCCEEDS(mOwningEventTarget->Dispatch(runnable.forget(), nsIThread::DISPATCH_NORMAL));
 }
 
 void WebGPUParent::NotifyExternalTextureImportReady(
-    const RawId aDeviceId, const uint64_t aSurfaceIdHigh,
+    const RawId aDeviceId, const uint64_t aGeneration, const uint64_t aSurfaceIdHigh,
     const uint64_t aSurfaceIdLow) {
   RefPtr<WebGPUParent> self = this;
   nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction(
       "WebGPUParent::NotifyExternalTextureImportReady",
-      [self = std::move(self), aDeviceId, aSurfaceIdHigh, aSurfaceIdLow]() {
-        if (self->CanSend() && !self->SendExternalTextureImportReady(
+      [self = std::move(self), aDeviceId, aGeneration, aSurfaceIdHigh, aSurfaceIdLow]() {
+        if (self->mContext && self->CanSend() &&
+            ffi::wgpu_server_workspace_callback_valid(self->mContext.get(),
+                aDeviceId, aGeneration, false) && !self->SendExternalTextureImportReady(
                                    aDeviceId, aSurfaceIdHigh, aSurfaceIdLow)) {
           NS_WARNING("SendExternalTextureImportReady failed");
         }
@@ -1686,7 +1703,9 @@ ipc::IPCResult WebGPUParent::RecvExternalTextureSlotRelease(
 
 ipc::IPCResult WebGPUParent::RecvWorkspaceBind(RawId aDeviceId) {
   if (mContext && mActiveDeviceIds.Contains(aDeviceId)) {
-    ffi::wgpu_server_workspace_bind(mContext.get(), aDeviceId);
+    ErrorBuffer error;
+    ffi::wgpu_server_workspace_bind(mContext.get(), aDeviceId, error.ToFFI());
+    ForwardError(error);
   }
   return IPC_OK();
 }

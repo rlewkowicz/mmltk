@@ -170,7 +170,7 @@ class WebGPUParent final : public PWebGPUParent, public SupportsWeakPtr {
   void PreDeviceDrop(RawId aDeviceId);
   // Thread-safe entry from the native workspace copy dispatcher. The IPDL send
   // is always queued onto this actor's owning serial event target.
-  void NotifyExternalTextureFrame(RawId aDeviceId, uint64_t aSurfaceIdHigh,
+  void NotifyExternalTextureFrame(RawId aDeviceId, uint64_t aGeneration, uint64_t aSurfaceIdHigh,
                                   uint64_t aSurfaceIdLow,
                                   uint64_t aLayer,
                                   uint32_t aSlot,
@@ -183,9 +183,9 @@ class WebGPUParent final : public PWebGPUParent, public SupportsWeakPtr {
                                   uint32_t aCapacityWidth, uint32_t aCapacityHeight,
                                   uint64_t aTransferSequence, const uint8_t* aMetadata, size_t aMetadataBytes);
   void NotifyWorkspaceSourceRequested(uint64_t aSourceHigh, uint64_t aSourceLow);
-  void NotifyWorkspaceRequestReady(RawId aDeviceId, uint64_t aHigh,
+  void NotifyWorkspaceRequestReady(RawId aDeviceId, uint64_t aGeneration, uint64_t aHigh,
                                   uint64_t aLow, uint32_t aWidth, uint32_t aHeight);
-  void NotifyExternalTextureImportReady(RawId aDeviceId,
+  void NotifyExternalTextureImportReady(RawId aDeviceId, uint64_t aGeneration,
                                         uint64_t aSurfaceIdHigh,
                                         uint64_t aSurfaceIdLow);
   struct MapRequest {

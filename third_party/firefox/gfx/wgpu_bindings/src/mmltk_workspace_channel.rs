@@ -1101,158 +1101,155 @@ impl Drop for Channel {
     }
 }
 
-fn channel() -> Option<&'static Mutex<Channel>> {
-    static CHANNEL: OnceLock<Option<Mutex<Channel>>> = OnceLock::new();
-    CHANNEL
-        .get_or_init(|| Channel::connect().map(Mutex::new))
-        .as_ref()
+// The claim is independent of actor-local IDs and reconnectable after the last
+// resource owner releases this connection. No ordinary WebGPU actor touches it.
+static WORKSPACE_CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct ExclusiveClaim;
+
+impl Drop for ExclusiveClaim {
+    fn drop(&mut self) {
+        WORKSPACE_CLAIMED.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
-/// Gives the bridge dispatcher the eventfd that wakes it when a nonblocking
-/// response remains queued after an immediate send attempt.
-pub fn install_dispatch_wake(wake: OwnedFd) {
-    if let Some(channel) = channel() {
-        if let Ok(mut channel) = channel.lock() {
+pub struct Connection {
+    channel: Mutex<Channel>,
+    _claim: ExclusiveClaim,
+}
+
+impl Connection {
+    pub fn connect() -> Result<Self, &'static str> {
+        WORKSPACE_CLAIMED.compare_exchange(false, true,
+            std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+            .map_err(|_| "workspace channel is already owned by another WebGPU actor")?;
+        let claim = ExclusiveClaim;
+        let channel = Channel::connect().ok_or("workspace channel connection failed")?;
+        Ok(Self { channel: Mutex::new(channel), _claim: claim })
+    }
+
+    /// Gives the bridge dispatcher the eventfd that wakes it when a nonblocking
+    /// response remains queued after an immediate send attempt.
+    pub fn install_dispatch_wake(&self, wake: OwnedFd) {
+        if let Ok(mut channel) = self.channel.lock() {
             channel.dispatch_wake = Some(wake);
         }
     }
-}
 
-/// The import socket and the epoll events currently needed for progress.
-pub fn poll_state() -> Option<(RawFd, u32)> {
-    let channel = channel()?;
-    let channel = channel.lock().ok()?;
-    if channel.terminal != ChannelTerminal::Open {
-        return None;
+    /// The import socket and the epoll events currently needed for progress.
+    pub fn poll_state(&self) -> Option<(RawFd, u32)> {
+        let channel = self.channel.lock().ok()?;
+        if channel.terminal != ChannelTerminal::Open {
+            return None;
+        }
+        let mut events = libc::EPOLLIN as u32;
+        if !channel.pending.is_empty()
+            || channel.sources.values().flatten().any(|acquisition| acquisition.pending_record().is_some()) {
+            events |= libc::EPOLLOUT as u32;
+        }
+        Some((channel.fd, events))
     }
-    let mut events = libc::EPOLLIN as u32;
-    if !channel.pending.is_empty()
-        || channel.sources.values().flatten().any(|acquisition| acquisition.pending_record().is_some()) {
-        events |= libc::EPOLLOUT as u32;
+
+    /// Services readiness reported by the single bridge dispatcher.
+    pub fn service(&self, revents: u32) {
+        let Ok(mut channel) = self.channel.lock() else {
+            return;
+        };
+        channel.service_ready(revents);
     }
-    Some((channel.fd, events))
-}
 
-/// Services readiness reported by the single bridge dispatcher.
-pub fn service(revents: u32) {
-    let Some(channel) = channel() else {
-        return;
-    };
-    let Ok(mut channel) = channel.lock() else {
-        return;
-    };
-    channel.service_ready(revents);
-}
-
-/// Makes native bridge failure observable without involving the page stream.
-/// Shutting down the socket wakes the host, which owns browser replacement and
-/// peer-loss timeline rescue.
-#[track_caller]
-pub fn fail() {
-    let Some(channel) = channel() else {
-        return;
-    };
-    let Ok(mut channel) = channel.lock() else {
-        return;
-    };
-    channel.fail();
-}
-
-/// Closes the import boundary after its owning WebGPU server has synchronously
-/// retired every imported GPU resource. This is a local lifecycle completion,
-/// not evidence of a malformed record or failed transfer.
-pub fn close_after_resource_shutdown() {
-    let Some(channel) = channel() else {
-        return;
-    };
-    let Ok(mut channel) = channel.lock() else {
-        return;
-    };
-    channel.close_after_resource_shutdown();
-}
-
-/// Takes the allocation the dispatcher admitted under `id`.
-/// The extents the host described are authoritative: a page asking for anything
-/// else is not describing an admitted allocation.
-pub fn take_admission(id: SurfaceId, width: u32, height: u32) -> Option<Admission> {
-    let channel = channel()?;
-    let mut channel = channel.lock().ok()?;
-    channel.claim(id, width, height)
-}
-
-pub fn arena_admitted(id: SurfaceId) -> bool {
-    channel().and_then(|channel| channel.lock().ok().map(|channel|
-        channel.admitted.get(&id).is_some_and(|admission| admission.layout.opcode == OPCODE_ARENA)))
-        .unwrap_or(false)
-}
-
-pub fn admitted_arenas() -> Vec<(SurfaceId, u32, u32)> {
-    channel().and_then(|channel| channel.lock().ok().map(|channel|
-        channel.admitted.iter().filter_map(|(id, admission)|
-            (admission.layout.opcode == OPCODE_ARENA)
-                .then_some((*id, admission.width, admission.height))).collect()))
-        .unwrap_or_default()
-}
-
-pub fn withdrawn_arenas() -> Vec<SurfaceId> {
-    channel().and_then(|channel| channel.lock().ok().map(|channel|
-        channel.withdrawn.iter().filter(|id| !channel.sources.contains_key(id) && channel.live.contains(id))
-            .copied().collect())).unwrap_or_default()
-}
-
-pub fn send_ready(id: SurfaceId, allocation: Allocation, timeline: OwnedFd) {
-    let Some(channel) = channel() else { return; };
-    let Ok(mut channel) = channel.lock() else { return; };
-    if channel.terminal != ChannelTerminal::Open { return; }
-    if !channel.claimed.remove(&id) || !channel.live.insert(id)
-        || channel.pending.len() >= PENDING_RECORD_CAPACITY { channel.fail(); return; }
-    if !channel.withdrawn.contains(&id) { channel.replied.insert(id); }
-    let mut record = allocation.layout;
-    record.abi_version = ABI_VERSION;
-    record.opcode = OPCODE_READY;
-    record.descriptors = READY_DESCRIPTOR_COUNT as u32;
-    record.id_high = id.high;
-    record.id_low = id.low;
-    let mut descriptors = std::array::from_fn(|_| None);
-    descriptors[READY_MEMORY_DESCRIPTOR] = Some(allocation.memory);
-    descriptors[READY_TIMELINE_DESCRIPTOR] = Some(timeline);
-    channel.pending.push_back(PendingRecord { record, descriptors });
-    trace_state("ready", id, "vulkan_allocation_initialized", || true);
-    channel.flush();
-    channel.wake_dispatcher();
-    if channel.sources.contains_key(&id) && channel.withdrawn.contains(&id) && channel.live.remove(&id) {
-        channel.settled_releases.push_back(id);
+    /// Makes native bridge failure observable without involving the page stream.
+    /// Shutting down the socket wakes the host, which owns browser replacement and
+    /// peer-loss timeline rescue.
+    #[track_caller]
+    pub fn fail(&self) {
+        let Ok(mut channel) = self.channel.lock() else {
+            return;
+        };
+        channel.fail();
     }
-}
 
-/// Reports why `id` produced no texture. `stride` and `size` are meaningful
-/// only for [`FAILED_LAYOUT`], where they carry the layout this device would
-/// accept for the same extent.
-pub fn send_failed(id: SurfaceId, code: u32, stride: u64, size: u64) {
-    if let Some(channel) = channel() {
-        if let Ok(mut channel) = channel.lock() {
+    /// Closes the import boundary after its owning WebGPU server has synchronously
+    /// retired every imported GPU resource. This is a local lifecycle completion,
+    /// not evidence of a malformed record or failed transfer.
+    pub fn close_after_resource_shutdown(&self) {
+        let Ok(mut channel) = self.channel.lock() else {
+            return;
+        };
+        channel.close_after_resource_shutdown();
+    }
+
+    /// Takes the allocation the dispatcher admitted under `id`.
+    /// The extents the host described are authoritative: a page asking for anything
+    /// else is not describing an admitted allocation.
+    pub fn take_admission(&self, id: SurfaceId, width: u32, height: u32) -> Option<Admission> {
+        let mut channel = self.channel.lock().ok()?;
+        channel.claim(id, width, height)
+    }
+
+    pub fn admitted_arenas(&self) -> Vec<(SurfaceId, u32, u32)> {
+        self.channel.lock().ok().map(|channel|
+            channel.admitted.iter().filter_map(|(id, admission)|
+                (admission.layout.opcode == OPCODE_ARENA)
+                    .then_some((*id, admission.width, admission.height))).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn withdrawn_arenas(&self) -> Vec<SurfaceId> {
+        self.channel.lock().ok().map(|channel|
+            channel.withdrawn.iter().filter(|id| !channel.sources.contains_key(id) && channel.live.contains(id))
+                .copied().collect()).unwrap_or_default()
+    }
+
+    pub fn send_ready(&self, id: SurfaceId, allocation: Allocation, timeline: OwnedFd) {
+        let Ok(mut channel) = self.channel.lock() else { return; };
+        if channel.terminal != ChannelTerminal::Open { return; }
+        if !channel.claimed.remove(&id) || !channel.live.insert(id)
+            || channel.pending.len() >= PENDING_RECORD_CAPACITY { channel.fail(); return; }
+        if !channel.withdrawn.contains(&id) { channel.replied.insert(id); }
+        let mut record = allocation.layout;
+        record.abi_version = ABI_VERSION;
+        record.opcode = OPCODE_READY;
+        record.descriptors = READY_DESCRIPTOR_COUNT as u32;
+        record.id_high = id.high;
+        record.id_low = id.low;
+        let mut descriptors = std::array::from_fn(|_| None);
+        descriptors[READY_MEMORY_DESCRIPTOR] = Some(allocation.memory);
+        descriptors[READY_TIMELINE_DESCRIPTOR] = Some(timeline);
+        channel.pending.push_back(PendingRecord { record, descriptors });
+        trace_state("ready", id, "vulkan_allocation_initialized", || true);
+        channel.flush();
+        channel.wake_dispatcher();
+        if channel.sources.contains_key(&id) && channel.withdrawn.contains(&id) && channel.live.remove(&id) {
+            channel.settled_releases.push_back(id);
+        }
+    }
+
+    /// Reports why `id` produced no texture. `stride` and `size` are meaningful
+    /// only for [`FAILED_LAYOUT`], where they carry the layout this device would
+    /// accept for the same extent.
+    pub fn send_failed(&self, id: SurfaceId, code: u32, stride: u64, size: u64) {
+        if let Ok(mut channel) = self.channel.lock() {
             channel.send_outcome(OPCODE_FAILED, id, code, stride, size, None);
         }
     }
-}
 
-pub fn send_mailbox_available(
-    id: SurfaceId,
-    layer: u32,
-    slot: u32,
-    content_session: u64,
-    content_sequence: u64,
-    presentation_revision: u64,
-) {
-    if layer != 0
-        || slot >= 2
-        || (content_session == 0 && content_sequence == 0)
-        || presentation_revision == 0
-    {
-        return;
-    }
-    if let Some(channel) = channel() {
-        if let Ok(mut channel) = channel.lock() {
+    pub fn send_mailbox_available(&self,
+        id: SurfaceId,
+        layer: u32,
+        slot: u32,
+        content_session: u64,
+        content_sequence: u64,
+        presentation_revision: u64,
+    ) {
+        if layer != 0
+            || slot >= 2
+            || (content_session == 0 && content_sequence == 0)
+            || presentation_revision == 0
+        {
+            return;
+        }
+        if let Ok(mut channel) = self.channel.lock() {
             if channel.live.contains(&id) && !channel.withdrawn.contains(&id) {
                 channel.send(
                     OPCODE_AVAILABLE,
@@ -1266,26 +1263,24 @@ pub fn send_mailbox_available(
             }
         }
     }
-}
 
-fn send_mailbox_lifecycle(
-    opcode: u32,
-    id: SurfaceId,
-    layer: u32,
-    slot: u32,
-    content_session: u64,
-    content_sequence: u64,
-    presentation_revision: u64,
-) {
-    if layer != 0
-        || slot >= 2
-        || (content_session == 0 && content_sequence == 0)
-        || presentation_revision == 0
-    {
-        return;
-    }
-    if let Some(channel) = channel() {
-        if let Ok(mut channel) = channel.lock() {
+    fn send_mailbox_lifecycle(&self,
+        opcode: u32,
+        id: SurfaceId,
+        layer: u32,
+        slot: u32,
+        content_session: u64,
+        content_sequence: u64,
+        presentation_revision: u64,
+    ) {
+        if layer != 0
+            || slot >= 2
+            || (content_session == 0 && content_sequence == 0)
+            || presentation_revision == 0
+        {
+            return;
+        }
+        if let Ok(mut channel) = self.channel.lock() {
             if channel.live.contains(&id)
                 && (opcode == OPCODE_COMPLETED || !channel.withdrawn.contains(&id))
             {
@@ -1301,193 +1296,173 @@ fn send_mailbox_lifecycle(
             }
         }
     }
-}
 
-pub fn send_mailbox_presented(
-    id: SurfaceId,
-    layer: u32,
-    slot: u32,
-    content_session: u64,
-    content_sequence: u64,
-    presentation_revision: u64,
-) {
-    send_mailbox_lifecycle(
-        OPCODE_PRESENTED,
-        id,
-        layer,
-        slot,
-        content_session,
-        content_sequence,
-        presentation_revision,
-    );
-}
-
-pub fn send_mailbox_completed(
-    id: SurfaceId,
-    layer: u32,
-    slot: u32,
-    content_session: u64,
-    content_sequence: u64,
-    presentation_revision: u64,
-) {
-    send_mailbox_lifecycle(
-        OPCODE_COMPLETED,
-        id,
-        layer,
-        slot,
-        content_session,
-        content_sequence,
-        presentation_revision,
-    );
-}
-
-/// Releases the capability only after its private texture mirror has stopped
-/// and its final queue submission is complete.
-pub fn release_live(id: SurfaceId) -> LiveRelease {
-    if let Some(channel) = channel() {
-        if let Ok(mut channel) = channel.lock() {
-            return channel.release_live(id);
-        }
+    pub fn send_mailbox_presented(&self,
+        id: SurfaceId,
+        layer: u32,
+        slot: u32,
+        content_session: u64,
+        content_sequence: u64,
+        presentation_revision: u64,
+    ) {
+        self.send_mailbox_lifecycle(
+            OPCODE_PRESENTED,
+            id,
+            layer,
+            slot,
+            content_session,
+            content_sequence,
+            presentation_revision,
+        );
     }
-    LiveRelease::NotLive
-}
 
-/// Returns capabilities whose host Drop now permits the dispatcher's
-/// release-only Vulkan resources to be destroyed.
-pub fn take_settled_releases() -> Vec<SurfaceId> {
-    if let Some(channel) = channel() {
-        if let Ok(mut channel) = channel.lock() {
-            return channel.take_settled_releases();
-        }
+    pub fn send_mailbox_completed(&self,
+        id: SurfaceId,
+        layer: u32,
+        slot: u32,
+        content_session: u64,
+        content_sequence: u64,
+        presentation_revision: u64,
+    ) {
+        self.send_mailbox_lifecycle(
+            OPCODE_COMPLETED,
+            id,
+            layer,
+            slot,
+            content_session,
+            content_sequence,
+            presentation_revision,
+        );
     }
-    Vec::new()
-}
 
-pub fn complete_retirement(id: SurfaceId) {
-    if let Some(channel) = channel() {
-        if let Ok(mut channel) = channel.lock() {
+    /// Releases the capability only after its private texture mirror has stopped
+    /// and its final queue submission is complete.
+    pub fn release_live(&self, id: SurfaceId) -> LiveRelease {
+        self.channel.lock().ok().map_or(LiveRelease::NotLive, |mut channel| channel.release_live(id))
+    }
+
+    /// Returns capabilities whose host Drop now permits the dispatcher's
+    /// release-only Vulkan resources to be destroyed.
+    pub fn take_settled_releases(&self) -> Vec<SurfaceId> {
+        self.channel.lock().ok().map(|mut channel| channel.take_settled_releases()).unwrap_or_default()
+    }
+
+    pub fn complete_retirement(&self, id: SurfaceId) {
+        if let Ok(mut channel) = self.channel.lock() {
             channel.complete_retirement(id);
         }
     }
-}
 
 
-pub fn take_source_requests() -> Vec<SurfaceId> {
-    channel().and_then(|channel| channel.lock().ok().map(|mut channel|
-        channel.source_requests.drain(..).collect())).unwrap_or_default()
-}
-pub fn reserve_acquisition(id: SurfaceId, session: u64, sequence: u64, publication: u64, transfer: u64) -> bool {
-    let Some(channel) = channel() else { return false; };
-    let Ok(mut channel) = channel.lock() else { return false; };
-    if channel.terminal != ChannelTerminal::Open || !channel.live.contains(&id) || channel.withdrawn.contains(&id) {
-        return false;
+    pub fn take_source_requests(&self) -> Vec<SurfaceId> {
+        self.channel.lock().ok().map(|mut channel|
+            channel.source_requests.drain(..).collect()).unwrap_or_default()
     }
-    let Some(source) = channel.sources.get_mut(&id) else { return false; };
-    if source.is_some() { return false; }
-    *source = Some(SourceAcquisition {
-        record: Record { abi_version: ABI_VERSION, opcode: OPCODE_ACQUIRED,
-            id_high: id.high, id_low: id.low, stride: session, size: sequence,
-            presentation_revision: publication, offset: transfer, ..Default::default() },
-        state: AcquisitionState::Reserved,
-        release: ReleaseState::Unsubmitted,
-    });
-    true
-}
+    pub fn reserve_acquisition(&self, id: SurfaceId, session: u64, sequence: u64, publication: u64, transfer: u64) -> bool {
+        let Ok(mut channel) = self.channel.lock() else { return false; };
+        if channel.terminal != ChannelTerminal::Open || !channel.live.contains(&id) || channel.withdrawn.contains(&id) {
+            return false;
+        }
+        let Some(source) = channel.sources.get_mut(&id) else { return false; };
+        if source.is_some() { return false; }
+        *source = Some(SourceAcquisition {
+            record: Record { abi_version: ABI_VERSION, opcode: OPCODE_ACQUIRED,
+                id_high: id.high, id_low: id.low, stride: session, size: sequence,
+                presentation_revision: publication, offset: transfer, ..Default::default() },
+            state: AcquisitionState::Reserved,
+            release: ReleaseState::Unsubmitted,
+        });
+        true
+    }
 
-pub fn retire_binding(id: SurfaceId) {
-    let Some(channel) = channel() else { return; };
-    let Ok(mut channel) = channel.lock() else { return; };
-    if channel.terminal == ChannelTerminal::Open && channel.seen.contains(&id) && !channel.withdrawn.contains(&id) {
-        channel.send(OPCODE_BINDING_RETIRED, id, 0, 0, 0, 0, None);
+    pub fn retire_binding(&self, id: SurfaceId) {
+        let Ok(mut channel) = self.channel.lock() else { return; };
+        if channel.terminal == ChannelTerminal::Open && channel.seen.contains(&id) && !channel.withdrawn.contains(&id) {
+            channel.send(OPCODE_BINDING_RETIRED, id, 0, 0, 0, 0, None);
+        }
+    }
+
+    pub fn submit_acquisition(&self, id: SurfaceId) -> bool {
+        let Ok(mut channel) = self.channel.lock() else { return false; };
+        let Some(acquisition) = channel.sources.get_mut(&id).and_then(Option::as_mut) else { channel.fail(); return false; };
+        if acquisition.state != AcquisitionState::Reserved { channel.fail(); return false; }
+        acquisition.state = AcquisitionState::Submitted;
+        channel.flush();
+        channel.wake_dispatcher();
+        channel.terminal == ChannelTerminal::Open
+    }
+
+    // Physical release submission can precede delivery of Acquired. Keep both
+    // obligations on the exact source owner; flush always sends Acquired first.
+    pub fn submit_release(&self, id: SurfaceId) -> bool {
+        let Ok(mut channel) = self.channel.lock() else { return false; };
+        let Some(acquisition) = channel.sources.get_mut(&id).and_then(Option::as_mut) else { channel.fail(); return false; };
+        if !matches!(acquisition.state, AcquisitionState::Submitted | AcquisitionState::Notified)
+            || acquisition.release != ReleaseState::Unsubmitted {
+            channel.fail(); return false;
+        }
+        acquisition.release = ReleaseState::Submitted;
+        channel.flush();
+        channel.wake_dispatcher();
+        channel.terminal == ChannelTerminal::Open
+    }
+
+    pub fn cancel_acquisition(&self, id: SurfaceId) {
+        let Ok(mut channel) = self.channel.lock() else { return; };
+        if !channel.sources.get(&id).and_then(Option::as_ref).is_some_and(|acquisition| acquisition.state == AcquisitionState::Reserved) {
+            channel.fail(); return;
+        }
+        *channel.sources.get_mut(&id).unwrap() = None;
+        if channel.terminal == ChannelTerminal::Open && channel.withdrawn.contains(&id) {
+            channel.retire_source(id);
+        }
+    }
+
+    pub fn complete_read_settlement(&self, id: SurfaceId) {
+        let Ok(mut channel) = self.channel.lock() else { return; };
+        if !channel.sources.get(&id).and_then(Option::as_ref).is_some_and(|acquisition| acquisition.state == AcquisitionState::Settling) {
+            channel.fail(); return;
+        }
+        *channel.sources.get_mut(&id).unwrap() = None;
+        if channel.terminal == ChannelTerminal::Open && channel.withdrawn.contains(&id) {
+            channel.retire_source(id);
+        }
+    }
+
+    pub fn complete_terminal_read(&self, id: SurfaceId) {
+        let Ok(mut channel) = self.channel.lock() else { return; };
+        channel.sources.remove(&id);
+        // The entry published its exact shared receipt after physical retirement.
+        // The dispatcher closes the orderly boundary after every remaining entry
+        // has done the same; a transport failure may already have closed it.
+    }
+    pub fn take_read_settlements(&self) -> Vec<(SurfaceId, u64, u64, u64, u64)> {
+        self.channel.lock().ok().map(|mut channel|
+            channel.read_settlements.drain(..).collect()).unwrap_or_default()
+    }
+    pub fn take_source_admission(&self, id: SurfaceId) -> Option<Admission> {
+        let mut channel = self.channel.lock().ok()?;
+        let admission = channel.admitted.get(&id)?;
+        if admission.layout.opcode != OPCODE_ALLOCATE { return None; }
+        let (width, height) = (admission.width, admission.height);
+        channel.claim(id, width, height)
+    }
+    pub fn send_arena_ready(&self, id: SurfaceId, mut record: Record) {
+        let Ok(mut channel) = self.channel.lock() else { return; };
+        if !channel.claimed.remove(&id) || !channel.live.insert(id)
+            || channel.pending.len() >= PENDING_RECORD_CAPACITY { channel.fail(); return; }
+        channel.replied.insert(id);
+        trace_state("ready", id, "arena_initialized", || false);
+        record.abi_version = ABI_VERSION;
+        record.opcode = OPCODE_ARENA_READY;
+        record.id_high = id.high;
+        record.id_low = id.low;
+        channel.pending.push_back(PendingRecord { record, descriptors: std::array::from_fn(|_| None) });
+        channel.flush();
+        channel.wake_dispatcher();
     }
 }
 
-pub fn submit_acquisition(id: SurfaceId) -> bool {
-    let Some(channel) = channel() else { return false; };
-    let Ok(mut channel) = channel.lock() else { return false; };
-    let Some(acquisition) = channel.sources.get_mut(&id).and_then(Option::as_mut) else { channel.fail(); return false; };
-    if acquisition.state != AcquisitionState::Reserved { channel.fail(); return false; }
-    acquisition.state = AcquisitionState::Submitted;
-    channel.flush();
-    channel.wake_dispatcher();
-    channel.terminal == ChannelTerminal::Open
-}
-
-// Physical release submission can precede delivery of Acquired. Keep both
-// obligations on the exact source owner; flush always sends Acquired first.
-pub fn submit_release(id: SurfaceId) -> bool {
-    let Some(channel) = channel() else { return false; };
-    let Ok(mut channel) = channel.lock() else { return false; };
-    let Some(acquisition) = channel.sources.get_mut(&id).and_then(Option::as_mut) else { channel.fail(); return false; };
-    if !matches!(acquisition.state, AcquisitionState::Submitted | AcquisitionState::Notified)
-        || acquisition.release != ReleaseState::Unsubmitted {
-        channel.fail(); return false;
-    }
-    acquisition.release = ReleaseState::Submitted;
-    channel.flush();
-    channel.wake_dispatcher();
-    channel.terminal == ChannelTerminal::Open
-}
-
-pub fn cancel_acquisition(id: SurfaceId) {
-    let Some(channel) = channel() else { return; };
-    let Ok(mut channel) = channel.lock() else { return; };
-    if !channel.sources.get(&id).and_then(Option::as_ref).is_some_and(|acquisition| acquisition.state == AcquisitionState::Reserved) {
-        channel.fail(); return;
-    }
-    *channel.sources.get_mut(&id).unwrap() = None;
-    if channel.terminal == ChannelTerminal::Open && channel.withdrawn.contains(&id) {
-        channel.retire_source(id);
-    }
-}
-
-pub fn complete_read_settlement(id: SurfaceId) {
-    let Some(channel) = channel() else { return; };
-    let Ok(mut channel) = channel.lock() else { return; };
-    if !channel.sources.get(&id).and_then(Option::as_ref).is_some_and(|acquisition| acquisition.state == AcquisitionState::Settling) {
-        channel.fail(); return;
-    }
-    *channel.sources.get_mut(&id).unwrap() = None;
-    if channel.terminal == ChannelTerminal::Open && channel.withdrawn.contains(&id) {
-        channel.retire_source(id);
-    }
-}
-
-pub fn complete_terminal_read(id: SurfaceId) {
-    let Some(channel) = channel() else { return; };
-    let Ok(mut channel) = channel.lock() else { return; };
-    channel.sources.remove(&id);
-    // Device/bridge retirement can overtake ReadSettled while the transport is
-    // still open. This source can no longer fulfill the live protocol; close
-    // the boundary so native consumes the shared receipt only after shutdown.
-    channel.terminalize(ChannelTerminal::OrderlyBridgeClose);
-}
-pub fn take_read_settlements() -> Vec<(SurfaceId, u64, u64, u64, u64)> {
-    channel().and_then(|channel| channel.lock().ok().map(|mut channel|
-        channel.read_settlements.drain(..).collect())).unwrap_or_default()
-}
-pub fn take_source_admission(id: SurfaceId) -> Option<Admission> {
-    let mut channel = channel()?.lock().ok()?;
-    let admission = channel.admitted.get(&id)?;
-    if admission.layout.opcode != OPCODE_ALLOCATE { return None; }
-    let (width, height) = (admission.width, admission.height);
-    channel.claim(id, width, height)
-}
-pub fn send_arena_ready(id: SurfaceId, mut record: Record) {
-    let Some(channel) = channel() else { return; };
-    let Ok(mut channel) = channel.lock() else { return; };
-    if !channel.claimed.remove(&id) || !channel.live.insert(id)
-        || channel.pending.len() >= PENDING_RECORD_CAPACITY { channel.fail(); return; }
-    channel.replied.insert(id);
-    trace_state("ready", id, "arena_initialized", || false);
-    record.abi_version = ABI_VERSION;
-    record.opcode = OPCODE_ARENA_READY;
-    record.id_high = id.high;
-    record.id_low = id.low;
-    channel.pending.push_back(PendingRecord { record, descriptors: std::array::from_fn(|_| None) });
-    channel.flush();
-    channel.wake_dispatcher();
-}
 #[cfg(test)]
 mod tests {
     use super::*;
