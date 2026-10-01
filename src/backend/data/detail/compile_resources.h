@@ -53,6 +53,7 @@ public:
  [[nodiscard]] std::uint64_t bytes() const noexcept;
  [[nodiscard]] std::size_t descriptors() const noexcept;
  [[nodiscard]] std::span<std::byte> workspace() const;
+ [[nodiscard]] bool exceptional_workspace() const noexcept;
  // Stable for the admitted external grant until its physical retirement.
  [[nodiscard]] std::span<const int> cpus() const noexcept;
  [[nodiscard]] bool aliases(const CompileAllowance& other) const noexcept { return credits_ && credits_ == other.credits_; }

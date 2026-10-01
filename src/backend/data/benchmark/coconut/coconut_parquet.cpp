@@ -593,7 +593,7 @@ void CoconutAnnotationRecords::rebase_parquet_segments() {
 }
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, common::concurrency::CancellationObservation cancellation,
  const CoconutRecordConsumer& consumer, bool metadata_only, CompileExecution* execution, detail::FileWorkQueue* files, const std::function<void()>& settle_consumers, const CompileAllowance& parent,
- CoconutAnnotationRecords* retained, const std::function<bool(const CoconutRecord&)>& reusable_native, const std::function<bool(const CoconutRecord&, std::span<const std::uint8_t>)>& exceptional,
+ CoconutAnnotationRecords* retained, const std::function<bool(const CoconutRecord&)>& reusable_native, const std::function<bool(const CoconutRecord&, std::span<const std::uint8_t>)>& stage_input,
  const BenchmarkTraceSink& trace) {
  if (execution && !files) throw std::invalid_argument("COCONut Parquet execution requires its file service");
  auto producer = execution ? execution->open_class(detail::CompileWorkClass::Extraction) : CompileExecution::Producer{};
@@ -695,11 +695,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    pool.reset();
    allowance = {};
   }
-  ~Reader() {
-   batches.reset();
-   reader.reset();
-   pool.reset();
-  }
+  ~Reader() { close(); }
  };
  std::vector<Reader> readers(catalog->shards.size());
  for (std::size_t i = 0; i < readers.size(); ++i) readers[i].shard = i;
@@ -816,10 +812,11 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
       }
       state.allowance = std::move(*next);
      }
-     if (!state.pool)
-      state.pool = std::make_shared<CoconutParquetPool>(state.allowance, state.replay_bytes ? state.replay_bytes : kParquetPoolBytes);
-     else
-      state.pool->resume(state.allowance, state.replay_bytes ? state.replay_bytes : kParquetPoolBytes);
+     // The retained footer carries Arrow's allocator into lazy column
+     // statistics. Reopen that same pool's allocation window so metadata and
+     // projected batches share the current admitted source custody.
+     if (!state.pool) state.pool = shard.footer_pool;
+     state.pool->resume(state.allowance, state.replay_bytes ? state.replay_bytes : kParquetPoolBytes);
      if (!state.reader) cpu(*state.pool, state.allowance, [&] { state.reader = open_reader("/proc/self/fd/" + std::to_string(shard.file.get()), *state.pool, shard.footer); });
     }
     if (!state.batches) {
@@ -880,10 +877,10 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      for (const auto& row : ready) retained->stage_segments(row.record->source_ordinal, execution, files, parent);
     state.projected += static_cast<std::uint64_t>(batch->num_rows());
     std::shared_ptr<ParquetBatch> chunk;
-    // Normal borrowers share the quiesced Arrow backing exactly once. An
-    // exceptional row transfers the entire current bounded batch before any
-    // descendant can wait on the normal arena that contains its own input.
-    const bool staged = state.replay_bytes || (!state.image_pass && exceptional && std::ranges::any_of(ready, [&](const auto& row) { return exceptional(*row.record, row.png); }));
+    // Borrowers share quiesced Arrow backing when protected completion storage
+    // can finish them. Otherwise transfer this bounded batch before a descendant
+    // can wait on an ordinary or exceptional arena occupied by its own input.
+    const bool staged = state.replay_bytes || (!state.image_pass && stage_input && std::ranges::any_of(ready, [&](const auto& row) { return stage_input(*row.record, row.png); }));
     if (staged) {
      for (auto& row : ready) row.staged = retained->staging->copy<std::uint8_t>(row.png, execution, files, parent);
      // Arrow buffers must be released while their memory pool is still alive.
@@ -900,7 +897,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      const auto snapshot = execution ? execution->snapshot() : detail::CompileExecutionSnapshot{};
      return nlohmann::json{
       {"artifact", shard.path.string()}, {"group", state.group}, {"rows_projected", state.projected}, {"rows", ready.size()}, {"batch_bytes", staged ? 0 : state.pool->bytes_allocated()},
-      {"retained_bank_capacity", staged ? 0 : state.pool->retained_capacity()}, {"future_window_bytes", 0}, {"exceptional_transfer", staged}, {"normal_locked", snapshot.normal_locked},
+      {"retained_bank_capacity", staged ? 0 : state.pool->retained_capacity()}, {"future_window_bytes", 0}, {"staged_transfer", staged}, {"normal_locked", snapshot.normal_locked},
       {"leased", snapshot.leased}
      };
     });

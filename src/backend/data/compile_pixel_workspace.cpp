@@ -11,7 +11,11 @@ CompilePixelWorkspacePlan::CompilePixelWorkspacePlan(const CompileImageHeader& h
  using common::math::checked_multiply;
  decoder_extent_ = checked_add(decoder_.bytes(), std::size_t{63}, "decode alignment overflow") / 64 * 64;
  resources_ = {
-  .bytes = checked_add(decoder_extent_, resize_.bytes(), "pixel workspace overflow"), .supplied_workspace = true, .workspace_class = CompileWorkClass::Pixels, .opaque_bytes = decoder_.opaque_bytes
+  .bytes = checked_add(decoder_extent_, resize_.bytes(), "pixel workspace overflow"),
+  .supplied_workspace = true,
+  .completion_workspace = true,
+  .workspace_class = CompileWorkClass::Pixels,
+  .opaque_bytes = decoder_.opaque_bytes
  };
  const auto row = checked_multiply<std::size_t>(policy.width, sizeof(float), "pixel row overflow");
  const auto plane = checked_multiply<std::size_t>(row, policy.height, "pixel plane overflow");

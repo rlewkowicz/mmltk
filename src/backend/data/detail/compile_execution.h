@@ -186,6 +186,7 @@ public:
  [[nodiscard]] CompileAllowance current_allowance() const;
  [[nodiscard]] std::size_t workers() const noexcept;
  [[nodiscard]] std::span<const int> cpus() const noexcept;
+ [[nodiscard]] const CompileWorkspacePlan& workspace_plan() const noexcept;
  [[nodiscard]] CompileExecutionSnapshot snapshot() const;
  [[nodiscard]] std::uint64_t transient_target() const noexcept;
  [[nodiscard]] std::size_t descriptor_limit() const noexcept;

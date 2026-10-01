@@ -1158,6 +1158,9 @@ export function mmltkIntegrationCompileResize(step, generation, revision, begin)
     if (!canvas) return false;
     owner.compileResize = {step, generation, revision, inputs: 0,
       sequence: owner.windowTransition?.sequence ?? 0, viewport: [window.innerWidth, window.innerHeight]};
+    report({event: 'integration.compile_resize_requested', control: 'train.compile_dataset.progress',
+      step, generation, revision, sequence: owner.compileResize.sequence,
+      viewport: owner.compileResize.viewport, fullscreen: !!document.fullscreenElement});
     if (step < 2) return mmltkIntegrationCanvasSize(step === 0 ? 480 : 960, step === 0 ? 900 : 720);
     mmltkIntegrationRestoreCanvasSize();
     mmltkIntegrationFullscreen(step === 2);
@@ -1168,9 +1171,20 @@ export function mmltkIntegrationCompileResize(step, generation, revision, begin)
   const root = request?.root;
   const uiRoot = owner.windowRoot;
   const canvas = document.querySelector('canvas');
-  if (!request || request.step !== step || request.generation !== generation || !canvas || !root || !uiRoot || uiRoot.sequence <= request.sequence ||
-      revision <= request.revision || root.revision <= request.revision || !transition ||
-      transition.sequence <= request.sequence || transition.sequence <= root.before_draw || transition.event !== 'iced.window.presented') return false;
+  const waiting = (reason, facts = {}) => {
+    report({event: 'integration.compile_resize_wait', control: 'train.compile_dataset.progress',
+      step, generation, revision, reason, before_revision: request?.revision,
+      request_sequence: request?.sequence, viewport: [window.innerWidth, window.innerHeight],
+      prior_viewport: request?.viewport, fullscreen: !!document.fullscreenElement,
+      fullscreen_settled: integrationDriver.integrationFullscreenSettled,
+      inputs: request?.inputs, root, ui_root: uiRoot, transition, ...facts});
+    return false;
+  };
+  if (!request || request.step !== step || request.generation !== generation || !canvas) return waiting('request');
+  if (!root || !uiRoot || uiRoot.sequence <= request.sequence) return waiting('root');
+  if (revision <= request.revision || root.revision <= request.revision) return waiting('native-progress');
+  if (!transition || transition.sequence <= request.sequence || transition.sequence <= root.before_draw ||
+      transition.event !== 'iced.window.presented') return waiting('presentation');
   const css = canvas.getBoundingClientRect(), scale = window.devicePixelRatio;
   const sized = step < 2 ? mmltkIntegrationCanvasSizeSettled(step === 0 ? 480 : 960, step === 0 ? 900 : 720) :
     mmltkIntegrationFullscreenSettled(step === 2) && (window.innerWidth !== request.viewport[0] || window.innerHeight !== request.viewport[1]);
@@ -1180,15 +1194,18 @@ export function mmltkIntegrationCompileResize(step, generation, revision, begin)
     actualRoot.every((value, index) => Math.abs(value - [root.x, root.y, root.width, root.height][index]) < 1) &&
     Math.abs(root.x) < 1 && Math.abs(root.y) < 1 &&
     Math.abs(root.width * root.scale - canvas.width) <= 2 && Math.abs(root.height * root.scale - canvas.height) <= 2;
-  if (!sized || !covers || request.inputs || transition.pending_resize ||
-      Math.abs(canvas.width - css.width * scale) > 1 || Math.abs(canvas.height - css.height * scale) > 1 ||
-      configured?.[0] !== canvas.width || configured?.[1] !== canvas.height ||
-      transition.width !== canvas.width || transition.height !== canvas.height) return false;
-  report({event: 'integration.compile_resize', control: 'train.compile_dataset.progress',
-    detail: JSON.stringify({step, generation, before_revision: request.revision, revision, root_revision: root.revision,
+  const facts = {step, generation, before_revision: request.revision, revision, root_revision: root.revision,
       css: [css.width, css.height], backing: [canvas.width, canvas.height], viewport: [window.innerWidth, window.innerHeight],
       prior_viewport: request.viewport, configured, ui_root: actualRoot, root: [root.x, root.y, root.width, root.height],
-      root_scale: root.scale, device_scale: scale, inputs: request.inputs, transition})});
+      root_scale: root.scale, device_scale: scale, inputs: request.inputs, transition};
+  if (!sized) return waiting(step < 2 ? 'canvas-size' : 'fullscreen-viewport', facts);
+  if (!covers) return waiting('root-coverage', facts);
+  if (request.inputs) return waiting('input', facts);
+  if (transition.pending_resize) return waiting('pending-resize', facts);
+  if (Math.abs(canvas.width - css.width * scale) > 1 || Math.abs(canvas.height - css.height * scale) > 1) return waiting('backing-size', facts);
+  if (configured?.[0] !== canvas.width || configured?.[1] !== canvas.height) return waiting('configuration', facts);
+  if (transition.width !== canvas.width || transition.height !== canvas.height) return waiting('presented-size', facts);
+  report({event: 'integration.compile_resize', control: 'train.compile_dataset.progress', detail: JSON.stringify(facts)});
   owner.compileResize = undefined;
   return true;
 }

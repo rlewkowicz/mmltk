@@ -98,7 +98,8 @@ struct CoconutAnnotationInput {
  std::uint64_t live_bytes = 0;
  bool membership = false;
  // Archive inputs suspend their forward decoder before exceptional semantic
- // work. Parquet transfers exceptional batches before exposing this input.
+ // work. Parquet stages batches that cannot finish in protected completion
+ // storage before exposing this input.
  std::function<void()> retire_projection{};
  std::function<void(CompileExecution::Completion)> admitted{};
 };
@@ -108,7 +109,7 @@ using CoconutRecordConsumer = std::function<void(std::size_t group, const Coconu
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
  const CoconutRecordConsumer& consumer, bool metadata_only = false, detail::CompileExecution* execution = nullptr, detail::FileWorkQueue* files = nullptr,
  const std::function<void()>& settle_consumers = {}, const CompileAllowance& parent = {}, CoconutAnnotationRecords* retained = nullptr,
- const std::function<bool(const CoconutRecord&)>& reusable_native = {}, const std::function<bool(const CoconutRecord&, std::span<const std::uint8_t>)>& exceptional = {},
+ const std::function<bool(const CoconutRecord&)>& reusable_native = {}, const std::function<bool(const CoconutRecord&, std::span<const std::uint8_t>)>& stage_input = {},
  const BenchmarkTraceSink& trace = {});
 // Import subscriptions extend the component's original-generation value without
 // making component validation depend on the execution-side notification.

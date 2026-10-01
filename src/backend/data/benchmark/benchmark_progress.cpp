@@ -79,6 +79,7 @@ void ProgressReporter::compacting(std::size_t split, std::size_t completed, std:
 }
 void ProgressReporter::phase_unlocked(std::unique_lock<std::mutex>& lock, const DatasetCompilePhase phase, const std::uint64_t completed, const std::uint64_t total) {
  flush_pixels_unlocked();
+ const bool indexing_started = phase == DatasetCompilePhase::Indexing && !indexing_known_;
  const bool background_indexing = phase == DatasetCompilePhase::Indexing && (state_.phase == DatasetCompilePhase::Extracting || state_.phase == DatasetCompilePhase::Pixels);
  if (phase == DatasetCompilePhase::Indexing) {
   indexed_completed_ = std::max(indexed_completed_, completed);
@@ -87,7 +88,7 @@ void ProgressReporter::phase_unlocked(std::unique_lock<std::mutex>& lock, const 
   update_labels();
  }
  if (background_indexing) {
-  emit(lock);
+  emit(lock, indexing_started ? DeliveryMode::Boundary : DeliveryMode::Dirty);
   return;
  }
  const bool phase_changed = state_.phase != phase;
@@ -118,7 +119,7 @@ void ProgressReporter::phase_unlocked(std::unique_lock<std::mutex>& lock, const 
   lock, ((phase_changed && (phase == DatasetCompilePhase::Planning || phase == DatasetCompilePhase::Compacting || phase == DatasetCompilePhase::Syncing || phase == DatasetCompilePhase::Publishing)) ||
          ((phase == DatasetCompilePhase::Syncing || phase == DatasetCompilePhase::Publishing) && total != 0 && completed == total))
          ? DeliveryMode::Lifecycle
-         : DeliveryMode::Dirty);
+         : indexing_started ? DeliveryMode::Boundary : DeliveryMode::Dirty);
 }
 void ProgressReporter::update_labels() {
  if (state_.phase == DatasetCompilePhase::Labels) {
@@ -450,7 +451,7 @@ void IndexingProgressTotals::update(std::size_t release, std::uint64_t completed
  // Ordinary observations remain monotonic within a retained release product.
  // Replacement explicitly withdraws that product before new callbacks begin.
  const auto admitted = std::max(observation.completed, observation.total ? std::min(completed, observation.total) : completed);
- if (admitted == observation.completed) return;
+ if (admitted == observation.completed && reporter.indexing_known_) return;
  completed_ += admitted - observation.completed;
  observation.completed = admitted;
  reporter.phase_unlocked(lock, DatasetCompilePhase::Indexing, completed_, total_);
@@ -537,7 +538,7 @@ void ProgressReporter::select_work_unlocked() {
   phase = DatasetCompilePhase::Pixels;
  else if (labels_admitted_ && !labels.complete)
   phase = DatasetCompilePhase::Labels;
- else if (!state_.tracks.acquisition.complete)
+ else if (!state_.tracks.acquisition.complete && phase != DatasetCompilePhase::Downloading)
   phase = DatasetCompilePhase::Extracting;
  if (phase != state_.phase) {
   state_.phase = phase;

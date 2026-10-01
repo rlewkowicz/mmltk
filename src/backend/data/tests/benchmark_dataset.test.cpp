@@ -161,13 +161,28 @@ NormalizedAnnotationIndex fixture_index(const NormalizedAnnotationBuilder& build
 const NormalizedAnnotationIndex& fixture_index(const NormalizedAnnotationIndex& index) { return index; }
 using mmltk::testsupport::require_condition;
 // Call only while every available CPU is gated and no other admission mutation is in
-// flight. The generation change then proves this borrowed work was queued.
+// flight. A new scheduler record proves this borrowed work was queued;
+// opening its producer can notify admission before the record exists.
 // The caller owns the future before waiting, and releases its gates on unwind.
 void queue_benchmark_work(BenchmarkCompilePipeline& execution, std::future<void>& future, std::function<void()> work) {
- const auto before = execution.execution().admission_generation();
+ const auto before = execution.execution().snapshot().records;
  future = std::async(std::launch::async, std::move(work));
- execution.execution().wait_for_admission_change(before, std::chrono::steady_clock::now() + 2s);
- require_condition(execution.execution().admission_generation() != before, "benchmark work did not reach its ready queue");
+ const auto deadline = std::chrono::steady_clock::now() + 2s;
+ for (;;) {
+  const auto generation = execution.execution().admission_generation();
+  if (execution.execution().snapshot().records > before) return;
+  require_condition(std::chrono::steady_clock::now() < deadline, "benchmark work did not reach its ready queue");
+  execution.execution().wait_for_admission_change(generation, deadline);
+ }
+}
+void wait_benchmark_pressure(BenchmarkCompilePipeline& execution) {
+ const auto deadline = std::chrono::steady_clock::now() + 2s;
+ for (;;) {
+  const auto generation = execution.execution().admission_generation();
+  if (execution.execution().resource_pressure()) return;
+  require_condition(std::chrono::steady_clock::now() < deadline, "pixel demand did not reach resource admission");
+  execution.execution().wait_for_admission_change(generation, deadline);
+ }
 }
 void occupy_benchmark_cpu(BenchmarkCompilePipeline& execution, std::future<void>& work, mmltk::testsupport::TestGate& gate) {
  work = std::async(std::launch::async, [&] { execution.execution().run(CompileTaskKind::Archive, {}, [&](std::size_t) { gate.receipt().ArriveAndWait(); }); });
@@ -2090,7 +2105,14 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
  CHECK_FALSE(unobserved.transfer_observer_enabled());
  CHECK_FALSE(unobserved.pixel_observer_enabled());
  std::size_t traces = 0U;
- const BenchmarkTraceSink trace = [&](std::string_view, const nlohmann::json&) { ++traces; };
+ std::uint64_t completed_pixels = 0, total_pixels = 0;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& value) {
+  ++traces;
+  if (event == "benchmark.pixel_compile.throughput") {
+   completed_pixels = value.at("completed_images");
+   total_pixels = value.at("total_images");
+  }
+ };
  ProgressReporter traced({}, trace);
  CHECK_FALSE(traced.transfer_observer_enabled());
  CHECK(traced.pixel_observer_enabled());
@@ -2101,7 +2123,9 @@ TEST_CASE("transfer observers are independent of trace-only pixel observers", "[
  CHECK(traces == 0U);
  traced.pixels(0U, 1U);
  traced.pixel_completed();
- CHECK(traces == 1U);
+ traced.flush();
+ CHECK(completed_pixels == 1U);
+ CHECK(total_pixels == 1U);
  std::vector<BenchmarkCompileProgress> updates;
  ProgressReporter observed([&](const BenchmarkCompileProgress& update) { updates.push_back(update); }, quiet);
  CHECK(observed.transfer_observer_enabled());
@@ -2451,10 +2475,12 @@ TEST_CASE("activity diagnostics use the isolated serialized adapter independentl
  ProgressReporter reporter({}, trace);
  CHECK_FALSE(reporter.transfer_observer_enabled());
  reporter.phase(DatasetCompilePhase::Extracting);
+ reporter.flush();
  reporter.source_activity(BenchmarkDatasetSource::kObjects365V2, "Checking patch-17 cache");
  reporter.source_activity(BenchmarkDatasetSource::kObjects365V2, "Checking patch-17 cache");
  reporter.activity("Preparing labels");
  reporter.activity("Preparing labels");
+ reporter.flush();
  REQUIRE(activities == std::vector<std::string>{"Acquiring and extracting source images", "Checking patch-17 cache", "Preparing labels"});
  std::size_t failed_deliveries = 0U;
  const auto throwing = make_trace_sink([&](const auto, const auto) {
@@ -3198,7 +3224,7 @@ TEST_CASE("cancelled progressive pixels leave the previously published file inta
  check_preserved_split(output, original);
 }
 TEST_CASE("pipeline failure retires queued custody and drains active readers before reporting", "[backend][data][benchmark][pipeline]") {
- if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires three live class floors and an elastic CPU");
  mmltk::testsupport::ScopedTempDir root("exceptional-pixel-drain");
  const auto images = root.path() / "images";
  prepare_cached_image_directory(images);
@@ -3223,7 +3249,7 @@ TEST_CASE("pipeline failure retires queued custody and drains active readers bef
   state.second.ArriveAndWait();
  }};
  BenchmarkSplitWriter writer(request);
- BenchmarkCompilePipeline pipeline(2);
+ BenchmarkCompilePipeline pipeline(4, {}, {}, {}, mmltk::backend::data::testsupport::benchmark_trace());
  bind_benchmark_slots(pipeline, writer, membership);
  const mmltk::testsupport::ScopedTestCleanup release_readers([&] {
   first.Release();
@@ -3454,20 +3480,20 @@ TEST_CASE("preparation indexing totals preserve successful rows across owner rep
  reporter.flush();
  attempt.update(1, rows[1] + 1, reporter);  // Bad rows cannot overrun the denominator.
  reporter.flush();
- REQUIRE(updates.size() == 7);
+ REQUIRE(updates.size() == 6);
+ CHECK(updates.front().completed == 0);
  CHECK(updates[2].completed == 4160);
  CHECK(updates[3].completed == 4224);
- CHECK(updates[4].completed == 4224);
+ // The unchanged retry count produces no replaceable snapshot.
  std::uint64_t previous = 0;
  for (const auto& value : updates) {
-  CHECK(value.phase == DatasetCompilePhase::Indexing);
-  CHECK(value.total == rows[0] + rows[1]);
-  CHECK(value.completed >= previous);
-  CHECK(value.completed <= value.total);
-  previous = value.completed;
+  CHECK(value.tracks.labels.total == rows[0] + rows[1]);
+  CHECK(value.tracks.labels.completed >= previous);
+  CHECK(value.tracks.labels.completed <= value.tracks.labels.total);
+  previous = value.tracks.labels.completed;
  }
  reporter.flush();
- CHECK(updates.back().completed == updates.back().total);
+ CHECK(updates.back().tracks.labels.completed == updates.back().tracks.labels.total);
  IndexingProgressTotals replacement(rows);
  replacement.update(0, 0, reporter);
  reporter.flush();
@@ -3542,7 +3568,7 @@ TEST_CASE("pixel consumer startup rejects invalid CPU custody without stranded w
  serial.drain();
 }
 TEST_CASE("unrelated compile failure discards queued pixels before joining active readers", "[backend][data][benchmark][pipeline]") {
- if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires extraction and pixel floors plus one elastic CPU");
  mmltk::testsupport::ScopedTempDir root("non-pixel-unwind");
  const auto images = root.path() / "images";
  prepare_cached_image_directory(images);
@@ -3557,17 +3583,22 @@ TEST_CASE("unrelated compile failure discards queued pixels before joining activ
  write_text(output, "previously published generation");
  const auto published = mmltk::common::io::sha256_file(output);
  mmltk::testsupport::TestGate reader("active reader during unrelated failure"), second("second active reader during unrelated failure");
- const auto receipt = reader.receipt();
+ mmltk::testsupport::TestGate extraction_lane("held extraction floor during scope unwind");
+ struct PixelCompletion {
+  mmltk::testsupport::TestGate& first;
+  mmltk::testsupport::TestGate& second;
+  std::atomic<unsigned> count{0};
+ } completion{reader, second};
  std::atomic<unsigned> opened{0};
  auto request = benchmark_write_request(membership, output, 8);
  request.num_workers = 1;
  request.overwrite = true;
  // No cancellation observation is supplied: scope unwind alone must stop work.
- request.image_opened = [&](const fs::path&, std::uint64_t id) {
-  opened.fetch_add(1);
-  if (id == 1) receipt.ArriveAndWait();
-  if (id == 2) second.receipt().ArriveAndWait();
- };
+ request.image_opened = [&](const fs::path&, std::uint64_t) { opened.fetch_add(1); };
+ request.progress = {.context = &completion, .image_completed = [](void* opaque) {
+  auto& state = *static_cast<PixelCompletion*>(opaque);
+  (state.count.fetch_add(1) == 0 ? state.first : state.second).receipt().ArriveAndWait();
+ }};
  BenchmarkSplitWriter writer(request);
  auto active = std::make_shared<ArtifactLease>(ArtifactLease::acquire(root.path() / "active.lock", {}));
  const std::weak_ptr<ArtifactLease> active_custody = active;
@@ -3578,13 +3609,17 @@ TEST_CASE("unrelated compile failure discards queued pixels before joining activ
  });
  const std::weak_ptr<const ArtifactLease> queued_custody = queued;
  auto failed = std::async(std::launch::async, [&, active = std::move(active), queued = std::move(queued)]() mutable {
-  BenchmarkCompilePipeline pipeline(2);
+  BenchmarkCompilePipeline pipeline(3);
   bind_benchmark_slots(pipeline, writer, membership);
   pipeline.source_publication(images, active)({1});
   require_condition(reader.WaitEntered(2s), "active pixel reader did not open");
   pipeline.source_publication(images, active)({2});
   active.reset();
   require_condition(second.WaitEntered(2s), "second pixel reader did not open");
+  auto held_extraction = pipeline.execution().submit({.kind = CompileTaskKind::Header, .work = [&](std::size_t, const CompileAllowance&) {
+   extraction_lane.receipt().ArriveAndWait();
+  }});
+  require_condition(extraction_lane.WaitEntered(2s), "extraction floor did not enter its physical hold");
   for (std::uint64_t id = 3; id <= 5; ++id) pipeline.source_publication(images, queued)({id});
   queued.reset();
   throw std::runtime_error("injected non-pixel output admission failure");
@@ -3592,6 +3627,7 @@ TEST_CASE("unrelated compile failure discards queued pixels before joining activ
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   reader.Release();
   second.Release();
+  extraction_lane.Release();
  });
  // Both consumers are still held. This receipt therefore proves destruction
  // has begun and discarded every queued lease without needing that consumer.
@@ -3602,6 +3638,7 @@ TEST_CASE("unrelated compile failure discards queued pixels before joining activ
  CHECK(failed.wait_for(0ms) == std::future_status::timeout);
  reader.Release();
  second.Release();
+ extraction_lane.Release();
  CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(failed, "unrelated exception reader join"), "injected non-pixel output admission failure");
  CHECK(active_custody.expired());
  CHECK(opened.load() == 2);
@@ -4087,9 +4124,10 @@ TEST_CASE("membership metadata shares one CPU with ready headers and pixels", "[
  membership.images = {{1, 16, 8, 0, 0}};
  auto request = benchmark_write_request(membership, root.path() / "result.bin", 8);
  BenchmarkSplitWriter writer(request);
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536});
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 2U << 20});
  BenchmarkCompilePipeline::Attempt attempt(execution);
  bind_benchmark_slots(execution, writer, membership);
+ auto pixel = mmltk::backend::data::testsupport::prepare_benchmark_pixel(execution, writer);
  mmltk::testsupport::TestGate first("first metadata chunk");
  const mmltk::testsupport::ScopedTestCleanup release([&] { first.Release(); });
  bool pixels_during_metadata = false;
@@ -4101,9 +4139,9 @@ TEST_CASE("membership metadata shares one CPU with ready headers and pixels", "[
  });
  const mmltk::testsupport::ScopedTestCleanup release_before_join([&] { first.Release(); });
  REQUIRE(first.WaitEntered(2s));
- // Publication returns only after the header is queued. Both stages are
- // runnable before the first metadata chunk releases the sole CPU.
- execution.source_publication(images, {})({1, {}, true});
+ // Prepared pixels and metadata are both runnable before the first chunk
+ // releases the sole CPU; physical file preparation has already settled.
+ auto pixel_completion = execution.execution().submit(std::move(pixel));
  first.Release();
  mmltk::testsupport::await_test_future(metadata, "fair membership and pixel scheduling");
  execution.drain();
@@ -4111,8 +4149,8 @@ TEST_CASE("membership metadata shares one CPU with ready headers and pixels", "[
  CHECK(writer.image_complete(0));
  // A completed lane retains reusable decoder capacity. An oversized request
  // must retire that idle capacity without losing the completed product.
- auto oversized = execution.execution().reserve({65537, 0});
- CHECK(oversized.bytes() == 65537);
+ auto oversized = execution.execution().reserve({(2U << 20) + 1, 0});
+ CHECK(oversized.bytes() == (2U << 20) + 1);
  CHECK(writer.image_complete(0));
 }
 TEST_CASE("cancelled shared admission releases a queued borrow with its input held", "[backend][data][benchmark][pipeline]") {
@@ -4350,19 +4388,19 @@ TEST_CASE("cooperative parsing returns one CPU to ready consumer work", "[backen
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  bind_benchmark_slots(execution, writer, split);
+ auto pixel = mmltk::backend::data::testsupport::prepare_benchmark_pixel(execution, writer);
  mmltk::testsupport::TestGate parsing("parser bounded progress");
  bool completed_during_parse = false;
  auto parser = std::async(std::launch::async, [&] {
   execution.execution().run(CompileTaskKind::Metadata, {32, 0}, [&](std::size_t) {
    parsing.receipt().ArriveAndWait();
-   execution.execution().cooperate();  // Header continuation.
-   execution.execution().cooperate();  // Pixel continuation.
+   execution.execution().cooperate();  // Prepared pixel kernel.
    completed_during_parse = writer.image_complete(0);
   });
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] { parsing.Release(); });
  REQUIRE(parsing.WaitEntered(2s));
- execution.source_publication(images, {})({1, {}, true});
+ auto pixel_completion = execution.execution().submit(std::move(pixel));
  parsing.Release();
  mmltk::testsupport::await_test_future(parser, "cooperative parser");
  CHECK(completed_during_parse);
@@ -4391,7 +4429,10 @@ TEST_CASE("stock mask scratch survives adjacent chunks and retires for a waiting
    return false;
   }
  } observation{waiting};
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 16U << 20}, mmltk::common::concurrency::CancellationObservation::Borrow(observation));
+ // A full chunk needs 256 KiB * 64 plus parser overhead. Keep it ordinary
+ // before introducing the explicit oversized pressure below.
+ constexpr std::uint64_t target = 32U << 20;
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = target}, mmltk::common::concurrency::CancellationObservation::Borrow(observation), mmltk::backend::data::testsupport::benchmark_trace());
  AnnotationParseOptions options;
  options.source = BenchmarkDatasetSource::kCoco2017;
  options.split = "train";
@@ -4399,7 +4440,9 @@ TEST_CASE("stock mask scratch survives adjacent chunks and retires for a waiting
  mmltk::testsupport::TestGate reused("second stock chunk with retained mask scratch");
  std::size_t chunks = 0;
  bool capacity_reused = false, pressure_retired = false;
+ const auto diagnostic_trace = mmltk::backend::data::testsupport::benchmark_trace();
  options.trace = [&](std::string_view event, const nlohmann::json& fields) {
+  if (diagnostic_trace) diagnostic_trace(event, fields);
   if (event != "benchmark.annotations.workspace") return;
   if (++chunks == 2) {
    capacity_reused = fields.at("retained_sparse_bytes").get<std::size_t>() >= 128;
@@ -4414,10 +4457,10 @@ TEST_CASE("stock mask scratch survives adjacent chunks and retires for a waiting
  });
  REQUIRE(reused.WaitEntered(2s));
  CHECK(capacity_reused);
- CHECK_FALSE(execution.execution().try_reserve({(16U << 20) + 1, 0}).has_value());
+ CHECK_FALSE(execution.execution().try_reserve({target + 1, 0}).has_value());
  auto pressure = std::async(std::launch::async, [&] {
   PressureObservation::pressure_thread() = true;
-  return execution.execution().reserve({(16U << 20) + 1, 0});
+  return execution.execution().reserve({target + 1, 0});
  });
  const mmltk::testsupport::ScopedTestCleanup release_before_wait([&] {
   reused.Release();
@@ -4427,7 +4470,7 @@ TEST_CASE("stock mask scratch survives adjacent chunks and retires for a waiting
  waiting.Release();
  reused.Release();
  auto grant = mmltk::testsupport::await_test_future(pressure, "stock scratch pressure retirement");
- CHECK(grant.bytes() == (16U << 20) + 1);
+ CHECK(grant.bytes() == target + 1);
  grant = {};
  const auto result = mmltk::testsupport::await_test_future(parse, "stock chunks after workspace pressure");
  CHECK(result.boxes.size() == 2000);
@@ -4565,17 +4608,18 @@ TEST_CASE("cooperative frames retain outer scratch and its grant through child r
  const auto images = root.path() / "images";
  auto split = cached_pixel_membership(images);
  split.images = {{1, 16, 8, 0, 0}};
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536});
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 2U << 20});
  auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  bind_benchmark_slots(execution, writer, split);
+ auto pixel = mmltk::backend::data::testsupport::prepare_benchmark_pixel(execution, writer);
  mmltk::testsupport::TestGate outer("reused outer scratch");
  std::vector<unsigned> scratch;
  std::size_t retirements = 0;
  bool retained_after_child = false, outer_charged = false;
  auto work = std::async(std::launch::async, [&] {
-  execution.execution().for_each(CompileTaskKind::Metadata, 2, {32768, 0}, [&](std::size_t index) {
+  execution.execution().for_each(CompileTaskKind::Metadata, 2, {1U << 20, 0}, [&](std::size_t index) {
    if (index == 0) {
     scratch.assign(8, 47);
     return;
@@ -4583,11 +4627,10 @@ TEST_CASE("cooperative frames retain outer scratch and its grant through child r
    require_condition(scratch.size() == 8 && scratch.front() == 47, "adjacent callback lost its retained scratch");
    outer.receipt().ArriveAndWait();
    execution.execution().cooperate();
-   execution.execution().cooperate();
    require_condition(writer.image_complete(0), "cooperative pixel work did not finish");
    // A larger new consumer would fit if the child had released or replaced the
    // outer allowance. Suspended storage remains live through both frames.
-   outer_charged = !execution.execution().try_reserve({32769, 0}).has_value();
+   outer_charged = !execution.execution().try_reserve({(1U << 20) + 1, 0}).has_value();
    retained_after_child = scratch.size() == 8 && scratch.front() == 47 && retirements == 0;
   }, [&](std::size_t lane) {
    require_condition(lane == 0, "scratch retired on another lane");
@@ -4597,15 +4640,15 @@ TEST_CASE("cooperative frames retain outer scratch and its grant through child r
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] { outer.Release(); });
  REQUIRE(outer.WaitEntered(2s));
- execution.source_publication(images, {})({1, {}, true});
+ auto pixel_completion = execution.execution().submit(std::move(pixel));
  outer.Release();
  mmltk::testsupport::await_test_future(work, "suspended outer scratch custody");
  CHECK(retained_after_child);
  CHECK(outer_charged);
  CHECK(scratch.empty());
  CHECK(retirements == 1);
- auto entire_target = execution.execution().reserve({65536, 0});
- CHECK(entire_target.bytes() == 65536);
+ auto entire_target = execution.execution().reserve({2U << 20, 0});
+ CHECK(entire_target.bytes() == (2U << 20));
  CHECK(writer.image_complete(0));
 }
 TEST_CASE("last shared backing releases credits after borrower and execution retirement", "[backend][data][benchmark][pipeline]") {
@@ -5498,13 +5541,18 @@ TEST_CASE("Open Images admits a third group while two earlier groups retry and p
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 64U << 20, .descriptors = 64}, cancellation);
  std::promise<bool> later;
+ std::vector<std::string> throttle_activities;
  const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
   if (event == "benchmark.images.complete" && fields.at("identity").get<std::string>().find("group-000002") != std::string::npos) later.set_value(true);
+  if (event == "benchmark.progress.activity" && fields.contains("source")) {
+   const auto activity = fields.at("activity").get<std::string>();
+   if (activity.find("server throttled") != std::string::npos) throttle_activities.push_back(activity);
+  }
  };
  std::vector<std::string> throttle_updates;
  ProgressReporter progress([&](const BenchmarkCompileProgress& update) {
   if (update.activity.find("server throttled") != std::string::npos && (throttle_updates.empty() || throttle_updates.back() != update.activity)) throttle_updates.push_back(update.activity);
- }, {});
+ }, trace);
  std::vector<QuarantinedImage> quarantined;
  auto work = std::async(std::launch::async, [&] {
   return acquire_open_images(cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, trace, {}, &execution, [&](std::uint64_t id) {
@@ -5528,9 +5576,11 @@ TEST_CASE("Open Images admits a third group while two earlier groups retry and p
  CHECK(result.directory.image_bytes == count * jpeg.size());
  CHECK(quarantined.empty());
  progress.flush();
- REQUIRE(throttle_updates.size() == 2);
- CHECK(throttle_updates[0].find("7 concurrent") != std::string::npos);
- CHECK(throttle_updates[1].find("5 concurrent") != std::string::npos);
+ // Source facts retain both throttle decisions; observer snapshots may coalesce.
+ REQUIRE(throttle_activities.size() == 2);
+ CHECK(throttle_activities[0].find("7 concurrent") != std::string::npos);
+ CHECK(throttle_activities[1].find("5 concurrent") != std::string::npos);
+ CHECK(std::ranges::all_of(throttle_updates, [&](const auto& update) { return std::ranges::find(throttle_activities, update) != throttle_activities.end(); }));
  for (unsigned group = 0; group < 3; ++group) {
   const auto proof = read_json_file(images / ".groups" / (std::string("group-00000") + std::to_string(group) + ".complete.json"));
   const auto expected = group == 2 ? 1 : 4096;
@@ -5702,7 +5752,6 @@ TEST_CASE("Open Images returns idle input backing to an oversized pixel consumer
   consumer.Release();
  });
  REQUIRE(first.WaitRequest());
- const auto before = execution.execution().admission_generation();
  pixels = std::async(std::launch::async, [&] {
   execution.execution().run(CompileTaskKind::Pixels, {32U << 20, 1}, [&](std::size_t) {
    BenchmarkImageValidator validator;
@@ -5712,7 +5761,7 @@ TEST_CASE("Open Images returns idle input backing to an oversized pixel consumer
  });
  // No transfer can complete at this gate. The shared event observes the newly
  // queued consumer; its complete grant cannot fit beside the encoded input.
- execution.execution().wait_for_admission_change(before);
+ wait_benchmark_pressure(execution);
  CHECK(execution.execution().resource_pressure());
  first.ReleaseRequest();
  REQUIRE(consumer.WaitEntered(5s));
@@ -6005,7 +6054,6 @@ TEST_CASE("Open Images retired backing admits pixel work while an unrelated ordi
    cache, NormalizedAnnotationReadView(fixture_index(index)), &quarantined, cancellation, &progress, 1, 0, {}, {}, &execution, [&](std::uint64_t) { return image.url("image"); });
  });
  REQUIRE(image.WaitRequest());
- const auto observed = execution.execution().admission_generation();
  pixels = std::async(std::launch::async, [&] {
   execution.execution().run(CompileTaskKind::Pixels, {32U << 20, 1}, [&](std::size_t) {
    BenchmarkImageValidator validator;
@@ -6013,7 +6061,7 @@ TEST_CASE("Open Images retired backing admits pixel work while an unrelated ordi
    consumed.receipt().ArriveAndWait();
   });
  });
- execution.execution().wait_for_admission_change(observed);
+ wait_benchmark_pressure(execution);
  CHECK(execution.execution().resource_pressure());
  image.ReleaseRequest();
  REQUIRE(consumed.WaitEntered(5s));
@@ -7287,7 +7335,7 @@ TEST_CASE("deferred warm cache cancellation returns opened custody without waiti
  for (std::uint64_t id : {1U, 2U, 3U}) BenchmarkEncodedImage::publish(cached_image_path(images, id), jpeg, {});
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 16});
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 256U << 10, .descriptors = 16}, {}, mmltk::backend::data::testsupport::benchmark_trace());
  NormalizedAnnotationBuilder index;
  index.source = BenchmarkDatasetSource::kOpenImagesV7;
  for (std::uint64_t id : {1U, 2U, 3U, 4U}) index.images.push_back({.source_image_id = id});
@@ -7398,19 +7446,22 @@ TEST_CASE("deferred mapped input exposes pressure to retained pixel scratch", "[
  REQUIRE(execution.source_publication(images, {}).consume({1}));
  REQUIRE(writer.image_complete(0));
  execution.drain();
- // The legal oversized pixel workspace remains reusable after this completed
- // image. No runnable job or blocking byte borrower currently asks it to retire.
- CHECK_FALSE(execution.execution().try_reserve({256U << 10, 0}).has_value());
+ // Pixel work has returned its logical arena while the fixed bank stays locked.
+ // A live unrelated borrower creates the pressure for this deferred input.
+ const auto locked = execution.execution().snapshot().normal_locked;
+ auto held = execution.execution().reserve({128U << 10, 0});
  auto opened = BenchmarkEncodedImage::open_deferred(directory.get(), 2, {}, execution.execution().reserve(CompileResources::handles(1, true)));
  REQUIRE(opened);
  const auto observed = execution.execution().admission_generation();
  CHECK_FALSE(opened->try_read(&execution.execution(), {}));
  CHECK(execution.execution().resource_pressure());
+ held = {};
  execution.execution().wait_for_admission_change(observed, std::chrono::steady_clock::now() + 2s);
  auto payload = opened->try_read(&execution.execution(), {});
  REQUIRE(payload);
  CHECK_FALSE(execution.execution().resource_pressure());
  CHECK(std::ranges::equal(payload->encoded(), jpeg));
+ CHECK(execution.execution().snapshot().normal_locked == locked);
 }
 TEST_CASE("batch workspace loans finish pixels and retire scratch before reader continuation", "[backend][data][benchmark][pipeline]") {
  bool fail = false, allocation_failure = false;
@@ -7458,7 +7509,8 @@ TEST_CASE("batch workspace loans finish pixels and retire scratch before reader 
  CHECK(descriptor_alias.descriptors() == 0);
  source = {};
  descriptor_alias = {};
- CHECK(execution.execution().try_reserve({target, 12}));  // Only the writer staging file remains live.
+ CHECK(execution.execution().resource_usage().descriptors == 2);
+ CHECK(execution.execution().try_reserve({target, 11}));  // Staging file and cached directory remain live.
 }
 TEST_CASE("a workspace window retains its producing credits through callback unwind", "[backend][data][benchmark][pipeline]") {
  bool fail = false;
@@ -7568,12 +7620,13 @@ TEST_CASE("long JSON documents admit short chunks beside pixels on one CPU", "[b
  const auto images = root.path() / "images";
  auto split = cached_pixel_membership(images);
  split.images = {{1, 16, 8, 0, 0}};
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = target, .descriptors = 13});
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = target, .descriptors = 13}, {}, mmltk::backend::data::testsupport::benchmark_trace());
  auto request = benchmark_write_request(split, root.path() / "pixels.bin", 8);
  request.execution = &execution;
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  bind_benchmark_slots(execution, writer, split);
+ auto pixel = mmltk::backend::data::testsupport::prepare_benchmark_pixel(execution, writer);
  mmltk::testsupport::TestGate chunk("first bounded annotation chunk");
  bool first = true, overlapped = false;
  AnnotationParseOptions options;
@@ -7584,14 +7637,13 @@ TEST_CASE("long JSON documents admit short chunks beside pixels on one CPU", "[b
   if (event != "benchmark.annotations.workspace" || !std::exchange(first, false)) return;
   chunk.receipt().ArriveAndWait();
   execution.execution().cooperate();
-  execution.execution().cooperate();
   overlapped = writer.image_complete(0);
  };
  const std::array<NumericCategoryMapping, 1> categories{{{1, 0, "person"}}};
  auto parsing = std::async(std::launch::async, [&] { return parse_coco_style_annotations(path, std::string(64, 'a'), categories, options); });
  const mmltk::testsupport::ScopedTestCleanup settle([&] { chunk.Release(); });
  REQUIRE(chunk.WaitEntered(5s));
- execution.source_publication(images, {})({1, {}, true});
+ auto pixel_completion = execution.execution().submit(std::move(pixel));
  chunk.Release();
  const auto parsed = mmltk::testsupport::await_test_future(parsing, "bounded JSON with independent pixels", 10s);
  CHECK(overlapped);
@@ -7795,10 +7847,12 @@ TEST_CASE("a zero-byte workspace offer keeps its scope without joining a live pi
  zero.retire_workspace();
  CHECK(alias.bytes() == 0);
  CHECK(alias.descriptors() == 1);
- CHECK(execution.execution().try_reserve({target, 10}));  // Two reader controls and the writer staging file remain live.
+ CHECK(execution.execution().resource_usage().descriptors == 4);
+ CHECK(execution.execution().try_reserve({target, 9}));  // Two readers, staging file and cached directory remain live.
  positive.retire_descriptors();
  zero.retire_descriptors();
- CHECK(execution.execution().try_reserve({target, 12}));  // Only the writer staging file remains live.
+ CHECK(execution.execution().resource_usage().descriptors == 2);
+ CHECK(execution.execution().try_reserve({target, 11}));
 }
 TEST_CASE("Open Images class fields retain escaped text beyond four quoted columns", "[backend][data][benchmark][annotations]") {
  mmltk::testsupport::ScopedTempDir root("open-images-quoted-fields");
@@ -7839,6 +7893,7 @@ TEST_CASE("progressive JSON semantics precede unrelated envelope tails", "[backe
  BenchmarkSplitWriter writer(output);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  bind_benchmark_slots(execution, writer, split);
+ auto pixel = mmltk::backend::data::testsupport::prepare_benchmark_pixel(execution, writer);
  bool visited = false, pixels_ready = false;
  AnnotationParseOptions options;
  options.split = "train";
@@ -7846,8 +7901,8 @@ TEST_CASE("progressive JSON semantics precede unrelated envelope tails", "[backe
  options.cancel_requested = cancellation;
  options.trace = [&](std::string_view event, const nlohmann::json&) {
   if (event != "benchmark.annotations.workspace" || std::exchange(visited, true)) return;
-  execution.source_publication(image_root, {})({1, {}, true});
-  execution.execution().cooperate();
+  auto pixel_completion = execution.execution().try_submit(std::move(pixel));
+  require_condition(pixel_completion.has_value(), "prepared pixel did not obtain a task record");
   execution.execution().cooperate();
   pixels_ready = writer.image_complete(0);
   if (cancel) cancelled.store(true);
@@ -9235,7 +9290,7 @@ TEST_CASE("dependency withdrawal retains the active label through overlapping ge
  BenchmarkCompilePipeline execution(1);
  LiveBenchmarkWriter fixture(execution, temporary.path(), AnnotationSource::Coco);
  mmltk::testsupport::TestGate held("retiring dependency borrower");
- execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto, const auto&) { held.receipt().ArriveAndWait(); });
+ execution.label_configuration(fixture.output.resolution, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, [&](const auto&, auto, const auto&) { held.receipt().ArriveAndWait(); });
  const auto root = temporary.path() / "images";
  const auto source = execution.source_publication(root, {});
  source.geometry_ready(1, {8, 2});
@@ -9295,6 +9350,7 @@ TEST_CASE("label output settles an interrupted projection without another file a
  const auto previous = mmltk::common::io::sha256_file(output);
  BenchmarkCompilePipeline pipeline(held_peer ? 2 : 1);
  LiveBenchmarkWriter fixture(pipeline, temporary.path(), AnnotationSource::Coco);
+ const auto retained_controls = pipeline.execution().resource_usage().bytes;
  const auto root = temporary.path() / "images";
  const auto original = std::make_exception_ptr(std::runtime_error("execution failed during label projection"));
  mmltk::testsupport::TestGate projection("projection owns its input before file admission");
@@ -9346,7 +9402,7 @@ TEST_CASE("label output settles an interrupted projection without another file a
  CHECK(settled == 1);
  CHECK(written == 0);
  CHECK(input_custody.expired());
- CHECK(pipeline.execution().resource_usage().bytes == 0);
+ CHECK(pipeline.execution().resource_usage().bytes == retained_controls);
  CHECK(mmltk::common::io::sha256_file(output) == previous);
  if (held_peer) CHECK_FALSE(peer.ready());
  physical.Release();
@@ -9379,6 +9435,7 @@ TEST_CASE("deferred label outputs retire independently of a full physical file q
  std::atomic<bool> cancelled{false};
  BenchmarkCompilePipeline pipeline(3, {}, {}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled));
  LiveBenchmarkWriter fixture(pipeline, temporary.path(), AnnotationSource::Coco);
+ const auto retained_controls = pipeline.execution().resource_usage().bytes;
  const auto root = temporary.path() / "images";
  mmltk::testsupport::TestGate physical("accepted file peers retain physical custody");
  std::array<CompileExecution::Completion, 6> files;
@@ -9448,7 +9505,7 @@ TEST_CASE("deferred label outputs retire independently of a full physical file q
    CHECK(first);
    if (outcome == Outcome::Failure) CHECK(first == failure);
    CHECK(input_custody[0].expired());
-   CHECK(pipeline.execution().resource_usage().bytes == 0);
+   CHECK(pipeline.execution().resource_usage().bytes == retained_controls);
   }
   CHECK_FALSE(files[0].ready());
   CHECK_FALSE(files[1].ready());
@@ -9472,7 +9529,7 @@ TEST_CASE("deferred label outputs retire independently of a full physical file q
   CHECK(settled[index] == 1);
   CHECK(input_custody[index].expired());
  }
- CHECK(pipeline.execution().resource_usage().bytes == 0);
+ CHECK(pipeline.execution().resource_usage().bytes == retained_controls);
  CHECK(physical_returns >= 2);
 }
 TEST_CASE("provenance settlement coalesces used record blocks while preserving masks and identities", "[benchmark][pipeline][labels][writer]") {
@@ -10950,7 +11007,7 @@ TEST_CASE("pixel preparation permits independent publication completion and reti
  auto split = cached_pixel_membership(images);
  BenchmarkEncodedImage::publish(cached_image_path(images, 2), make_jpeg(8, 240, 8), {});
  split.images = {{1, 16, 8, 0, 0}, {2, 16, 8, 0, 0}};
- BenchmarkCompilePipeline execution(3, {}, {.transient_bytes = 16U << 20});
+ BenchmarkCompilePipeline execution(3, {}, {.transient_bytes = 16U << 20}, {}, mmltk::backend::data::testsupport::benchmark_trace());
  FileHandle directory(::open(images.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
  REQUIRE(directory.get() >= 0);
  auto opened = BenchmarkEncodedImage::open_deferred(directory.get(), 1, {}, execution.execution().reserve(CompileResources::handles(1)));
@@ -11030,7 +11087,12 @@ TEST_CASE("active pixel preparation drains before cancellation repair or writer 
     break;
   }
  });
- execution.execution().wait_for_admission_change(before);
+ if (retirement == Retire::Cancel)
+  CHECK_THROWS_WITH(execution.execution().wait_for_admission_change(before), "benchmark dataset compilation cancelled");
+ else if (retirement == Retire::Attempt)
+  CHECK_THROWS_WITH(execution.execution().wait_for_admission_change(before), "compile admission after shutdown");
+ else
+  execution.execution().wait_for_admission_change(before);
  CHECK(retiring.wait_for(0ms) == std::future_status::timeout);
  CHECK_FALSE(writer->image_complete(0));
  preparation.Release();
@@ -11501,7 +11563,7 @@ TEST_CASE("archive suspension retires scratch without allocating a member checkp
  mmltk::testsupport::ScopedTempDir root("archive-suspension-allocation");
  const auto path = root.path() / "source.tar";
  const auto jpeg = make_jpeg(40, 80, 120);
- write_single_jpeg_tar(path, 1, jpeg);
+ write_single_jpeg_tar(path, 123456789, jpeg);
  BenchmarkArchive input(path);
  const auto suspend = [&] {
   bool allocated;
@@ -11874,7 +11936,8 @@ TEST_CASE("planned normalized gather admits disjoint chunks on shared lanes", "[
  const auto workers = GENERATE(std::size_t{1}, std::size_t{2});
  if (mmltk::common::system::allowed_cpu_set().size() < workers) SKIP("requires the selected assigned CPUs");
  mmltk::testsupport::ScopedTempDir root("normalized-disjoint-gather");
- CompileExecution execution(workers);
+ // This fixture observes the optional task-completion counter at its phase gate.
+ CompileExecution execution(workers, {}, {}, {}, [](std::string_view, const CompileExecutionSnapshot&) {});
  FileWorkQueue files(execution, 2);
  auto allowance = execution.reserve({4096, 1});
  mmltk::testsupport::TestGate planning("admitted gather extent and cursor planning");

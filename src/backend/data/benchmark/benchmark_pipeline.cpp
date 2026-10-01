@@ -630,7 +630,8 @@ void BenchmarkCompilePipeline::Impl::ImageState::publish(Source& source, std::ui
  std::optional<std::pair<std::uint32_t, std::uint32_t>> dimensions, bool defer_pixels, std::uint64_t attempt, std::shared_ptr<const BenchmarkEncodedImage> payload,
  const std::filesystem::path& input_root) {
  auto& execution = execution_;
- Job* accepted = nullptr;
+ const bool synchronous = execution.execution.workers() == 1 && !defer_pixels && !execution.execution.on_lane();
+ CompileExecution::Completion accepted;
  {
   const std::lock_guard lock(execution.mutex);
   // Check captured attempt before consulting borrowed writers or reporting a
@@ -667,12 +668,18 @@ void BenchmarkCompilePipeline::Impl::ImageState::publish(Source& source, std::ui
     execution.header_input(slot);
    }
   }
-  accepted = &slot.job;
+  if (synchronous) accepted = slot.job.completion.completion();
  }
  execution.changed.notify_all();
- if (execution.execution.workers() == 1 && !defer_pixels && !execution.execution.on_lane()) {
-  std::unique_lock lock(execution.mutex);
-  execution.wait(lock, [&] { return attempt != attempt_ || accepted->done; });
+ if (synchronous) {
+  try {
+   execution.files.wait(accepted);
+  } catch (...) {
+   // Recoverable image failures belong to the source's existing repair policy.
+   // A rejected wait still propagates without pretending the reader settled.
+   if (!accepted.ready()) throw;
+  }
+  const std::lock_guard lock(execution.mutex);
   if (execution.failure) std::rethrow_exception(execution.failure);
  }
 }
@@ -937,9 +944,15 @@ bool BenchmarkSourcePublication::consume(const CachedImageReady& ready) const {
   return execution->stopping || state_->attempt != execution->images.attempt() || state_->source->retiring ||
          state_->source->image_generation(ready.image_id) != state_->image_generation(ready.image_id);
  };
- execution->wait(lock, [&] { return retired() || state_->source->images.at(ready.image_id).job.done; });
+ const auto completion = state_->source->images.at(ready.image_id).job.completion.completion();
+ lock.unlock();
+ std::exception_ptr failure;
+ try {
+  execution->files.wait(completion);
+ } catch (...) { failure = std::current_exception(); }
+ lock.lock();
  if (retired()) throw std::runtime_error("benchmark repaired image generation retired");
- if (const auto failure = state_->source->images.at(ready.image_id).job.failure) std::rethrow_exception(failure);
+ if (failure) std::rethrow_exception(failure);
  return true;
 }
 bool BenchmarkSourcePublication::subscribe(std::uint64_t id, std::function<void(std::exception_ptr)> callback) const {
@@ -1491,10 +1504,9 @@ void BenchmarkCompilePipeline::write_remaining(BenchmarkSplitWriter& writer, con
   try {
    image_completion(root, id).wait();
   } catch (...) {
-   if (!failure) {
-    failure = std::current_exception();
-    withdraw();
-   }
+   // A source-local retirement or unreadable body does not withdraw accepted
+   // siblings. Join every member; session failure retires its own pending work.
+   if (!failure) failure = std::current_exception();
   }
  }
  if (failure) std::rethrow_exception(failure);

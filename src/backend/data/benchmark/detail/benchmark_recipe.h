@@ -104,5 +104,6 @@ private:
 // bounded local catalogs. Membership and scheduling remain compiler-owned.
 void compile_benchmark_recipe(BenchmarkCompilerConfig, const CoconutRecipeCatalog*, const CustomRecipeCatalog* = nullptr,
  const std::function<void(BenchmarkDatasetSource, std::string_view)>& source_labels_started = {}, const BenchmarkImageReadObserver& image_opened = {}, CompileExecutionLimits = {},
- CocoAnnotationInputObserver stock_input = {}, const std::function<void()>& selection_started = {});
+ CocoAnnotationInputObserver stock_input = {}, const std::function<void()>& selection_started = {},
+ const std::function<void(BenchmarkDatasetSource, std::string_view)>& source_images_acquired = {});
 }  // namespace mmltk::backend::data::benchmark_internal

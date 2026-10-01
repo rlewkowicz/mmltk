@@ -123,6 +123,8 @@ test('wheel input establishes the target cursor before its pixel delta', t => {
 
 test('ordinary execution constructs neither owner and schedules no input or probe work', t => {
   const f = canvasFixture(t, false, false);
+  assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 2, true), false);
+  assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 3, false), false);
   browser.mmltkIntegrationExpectInitialAtlas();
   browser.mmltkIntegrationDriverDraw(gallery, 7, 11);
   browser.mmltkIntegrationReceipt(gallery, 'unused', 7, 11);
@@ -1695,8 +1697,12 @@ test('active compile resize waits for native progress and actual surface/root se
   const f = canvasFixture(t, true);
   window.innerWidth = 1280; window.innerHeight = 1024;
   assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 2, true), true);
+  const requested = f.reports.find(value => value.event === 'integration.compile_resize_requested');
+  assert.equal(requested.generation, 1);
+  assert.deepEqual(requested.viewport, [1280, 1024]);
   assert.equal(f.events.length, 0);
   assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 3, false), false);
+  assert.equal(f.reports.at(-1).reason, 'root');
   f.css.width = f.canvas.width = 480; f.css.height = f.canvas.height = 900;
   window.mmltkIcedWindowState = {extent: [480, 900]};
   const transition = {event: 'iced.window.redraw', sequence: 4, width: 480, height: 900, pending_resize: false};
@@ -1706,6 +1712,8 @@ test('active compile resize waits for native progress and actual surface/root se
   window.mmltkIntegrationWindowTrace({event: 'iced.window.root', sequence: 5, root: [0, 0, 480, 900]});
   window.mmltkIntegrationWindowTrace({...transition, event: 'iced.window.presented', sequence: 6});
   assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 2, false), false);
+  assert.equal(f.reports.at(-1).reason, 'native-progress');
+  assert.equal(f.reports.at(-1).before_revision, 2);
   assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 3, false), true);
   assert.equal(f.events.length, 0);
   const report = f.reports.find(value => value.event === 'integration.compile_resize');
@@ -1718,4 +1726,6 @@ test('active compile resize waits for native progress and actual surface/root se
   window.mmltkIntegrationWindowTrace({event: 'iced.window.root', sequence: 7, root: [0, 0, 960, 720]});
   window.mmltkIntegrationWindowTrace({...transition, event: 'iced.window.presented', sequence: 8, width: 960, height: 720});
   assert.equal(browser.mmltkIntegrationCompileResize(1, 1, 4, false), false);
+  assert.equal(f.reports.at(-1).reason, 'input');
+  assert.equal(f.reports.at(-1).inputs, 1);
 });

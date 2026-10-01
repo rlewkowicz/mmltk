@@ -245,7 +245,7 @@ struct CompileAdmission {
  }
  static bool covers(const Credits& credit, CompileResources demand) {
   const auto held = credit.resources;
-  return (!demand.supplied_workspace || held.supplied_workspace) && demand.workspace_window == held.workspace_window && demand.opaque_bytes <= held.opaque_bytes && demand.bytes <= held.bytes &&
+  return (!demand.supplied_workspace || held.supplied_workspace) && (!demand.bytes || demand.workspace_window == held.workspace_window) && demand.opaque_bytes <= held.opaque_bytes && demand.bytes <= held.bytes &&
          demand.descriptors <= held.descriptors && demand.cpu_workers <= held.cpu_workers && (!demand.bytes || demand.retained_handles == held.retained_handles) &&
          (!demand.producer || held.producer) && demand.continuation_descriptors <= credit.available;
  }

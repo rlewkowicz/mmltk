@@ -666,6 +666,9 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
  std::mutex rejection_mutex;
  nlohmann::json omitted = nlohmann::json::array();
  const auto reject = [&](const CoconutPhysicalImage& image, std::string_view reason) {
+  trace_benchmark_event(trace, "benchmark.coconut.image_rejected", [&] {
+   return nlohmann::json{{"source", coconut_namespace_name(image.source)}, {"image_id", image.image_id}, {"member", image.member}, {"reason", reason}};
+  });
   failures.reject(image, image.image_id, "physical", 0, 0, reason);
   const std::lock_guard lock(rejection_mutex);
   omitted.push_back({{"source", coconut_namespace_name(image.source)}, {"image_id", image.image_id}, {"reason", reason}});
@@ -920,7 +923,7 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
 }  // namespace benchmark_internal
 void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config, const CoconutRecipeCatalog* explicit_catalog, const CustomRecipeCatalog* explicit_custom_catalog,
  const std::function<void(BenchmarkDatasetSource, std::string_view)>& source_labels_started, const BenchmarkImageReadObserver& image_opened, CompileExecutionLimits limits,
- CocoAnnotationInputObserver stock_input, const std::function<void()>& selection_started) {
+ CocoAnnotationInputObserver stock_input, const std::function<void()>& selection_started, const std::function<void(BenchmarkDatasetSource, std::string_view)>& source_images_acquired) {
  if (!valid_benchmark_selection(config.selection)) throw std::invalid_argument("invalid benchmark dataset selection");
  using namespace benchmark_internal;
  if (config.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Stretch && config.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Letterbox)
@@ -1033,6 +1036,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   if (!staging_owner) staging_owner = std::make_unique<common_io::StagingDirectory>(config.output_dir, ".", ".benchmark.tmp.XXXXXX", "cannot create benchmark dataset staging directory");
   const std::filesystem::path& staging_dir = staging_owner->path();
   const auto pixel_lanes = pipeline.execution().workers();
+  if (progress.pixel_observer_enabled()) progress.pixels(0, 0, false);
   const BenchmarkWriteProgressEvent pixel_progress = progress.pixel_observer_enabled()
                                                       ? BenchmarkWriteProgressEvent{
                                                          .context = &progress,
@@ -1061,7 +1065,13 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   pipeline.bind_source(cache.source_images("open-images") / "train", train_writer, AnnotationSource::OpenImages);
   for (std::size_t shard = 0; shard < custom_catalog.objects_images.size(); ++shard)
    pipeline.bind_source(cache.source_images("objects365") / ("patch-" + std::to_string(shard)), train_writer, AnnotationSource::Objects365);
+  constexpr std::size_t kLabelPlanCount = 4;
+  progress.label_plans(kLabelPlanCount);
   const auto publish_selected_labels = [&](const NormalizedAnnotationReadView& index) {
+   const std::size_t slot = index.source == BenchmarkDatasetSource::kCoco2017 ? (index.split == "val2017" ? 3U : 0U)
+                            : index.source == BenchmarkDatasetSource::kObjects365V2 ? 1U : 2U;
+   progress.label_plan_started(slot);
+   if (source_labels_started) source_labels_started(index.source, index.split);
    BenchmarkCompletionWindow labels(std::clamp<std::size_t>(pipeline.execution().workers() * 2, 2, 64));
    for (std::size_t position = 0; position < index.image_count(); ++position) {
     const auto& image = index.image(position);
@@ -1071,10 +1081,14 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     const auto root = index.source == BenchmarkDatasetSource::kCoco2017       ? cache.source_images("coco") / index.split
                       : index.source == BenchmarkDatasetSource::kObjects365V2 ? cache.source_images("objects365") / ("patch-" + std::to_string(image.source_shard))
                                                                               : cache.source_images("open-images") / "train";
-    if (!pipeline.labels_ready(pipeline.source_publication(root, {}, image.source_image_id), image.source_image_id, BenchmarkLabelInput(index, position), index.annotation_sha256))
-     throw RetiredBenchmarkLabelGeneration("custom annotation generation retired before early publication");
-    labels.push(pipeline.label_completion(root, image.source_image_id, index.annotation_sha256), [](std::exception_ptr error) {
-     if (error) std::rethrow_exception(error);
+    const auto id = image.source_image_id;
+    const auto generation = pipeline.image_generation(root, id);
+    // Acquisition can retire a damaged image while these early labels run.
+    // Required assembly replays missing labels after that source settles.
+    if (!pipeline.labels_ready(pipeline.source_publication(root, {}, id), id, BenchmarkLabelInput(index, position), index.annotation_sha256)) continue;
+    labels.push(pipeline.label_completion(root, id, index.annotation_sha256), [&, root, id, generation](std::exception_ptr error) {
+     throw_if_benchmark_cancelled(cancel_requested);
+     if (error && pipeline.image_generation(root, id) == generation) std::rethrow_exception(error);
     });
    }
    labels.drain();
@@ -1354,10 +1368,8 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   std::array<SourceCompileCount, 4> custom_label_counts{};
   std::array<bool, 4> custom_labels_ready{};
   std::atomic<std::size_t> pending_object_archives{archive_tasks.size() - 2};
-  const std::size_t kLabelPlanCount = 4U;
-  progress.label_plans(kLabelPlanCount);
   const auto prepare_source_labels = [&](std::size_t slot, const NormalizedAnnotationReadView& index, std::vector<CachedImageDirectory> directories) {
-   if (source_labels_started) source_labels_started(index.source, index.split);
+   if (source_images_acquired) source_images_acquired(index.source, index.split);
    std::vector<std::uint64_t> unavailable;
    for (const auto& directory : directories)
     for (const auto& rejected : directory.quarantined) unavailable.push_back(rejected.image_id);

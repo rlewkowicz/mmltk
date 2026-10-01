@@ -217,14 +217,17 @@ public:
    input->output.retire_descriptors();
    if (failure) std::rethrow_exception(failure);
    publication->fact = publication->file->header_only();
-   auto payload = retain_encoded_ && (!execution_ || !execution_->execution().resource_pressure())
+   // Published file backing lets synchronous consumers release an exceptional
+   // input before reserving their own decoder workspace.
+   auto payload = retain_encoded_ && !input->allowance.exceptional_workspace() && (!execution_ || !execution_->execution().resource_pressure())
                    ? BenchmarkEncodedImage::pooled(input->allowance, input, input->encoded, std::move(publication->file))
                    : std::move(publication->file);
    input.reset();
    if (ready_) ready_({id, std::pair{header.width, header.height}, execution_ != nullptr, std::move(payload)});
   };
-  const auto settled = [this, id, header, publication, generation](
-                        std::exception_ptr failure) { settled_({id, std::pair{header.width, header.height}, true, publication->fact}, failure, generation); };
+  const auto settled = [this, id, header, publication, generation](std::exception_ptr failure) {
+   settled_({id, std::pair{header.width, header.height}, true, publication->fact}, failure, generation);
+  };
   if (execution_) {
    // Prepare the fallible callback allocation before physical acceptance.
    std::function<void(std::exception_ptr)> settlement = settled;
@@ -552,7 +555,6 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  archive_reader =
   std::make_unique<BenchmarkArchive>(request.archive_path, (request.execution ? &request.execution->execution() : nullptr), 0, directory_allowance, request.decompression_workers, true);
  auto& reader = *archive_reader;
- const auto archive_work = [&](const std::function<void()>& work) { reader.cpu(work); };
  CachedImageWritePool write_pool(request.output_root, request.cancel_requested, request.image_ready,
   [&](const CachedImageReady& ready, std::exception_ptr error, BenchmarkSourceGeneration generation) { publish(ready, true, true, error, generation); }, request.storage, directory_allowance,
   request.execution, output_directory.get(), request.retain_encoded, reader, request.trace);
@@ -588,7 +590,13 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   BenchmarkImageHeader header;
   {
    try {
-    archive_work([&] { header = request.validator(*image_id, encoded); });
+    const auto validate = [&](std::size_t) { header = request.validator(*image_id, encoded); };
+    // The reader may already be suspended. Header work belongs to the retained
+    // image input, including its exclusive arena under a small normal budget.
+    if (request.execution)
+     request.execution->execution().run(detail::CompileTaskKind::Header, {}, validate, input->allowance);
+    else
+     validate(0);
    } catch (const std::bad_alloc&) { throw; } catch (const std::exception& error) {
     throw_if_benchmark_cancelled(request.cancel_requested);
     if (is_benchmark_capacity_failure(error)) throw;

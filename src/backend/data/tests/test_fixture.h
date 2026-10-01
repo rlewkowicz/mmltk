@@ -1,5 +1,7 @@
 #pragma once
 #include "src/backend/data/compiler/dataset_compiler.h"
+#include "src/backend/data/benchmark/detail/benchmark_cache.h"
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/io/file_memory.h"
 #include <filesystem>
@@ -21,9 +23,14 @@ struct BenchmarkLabelChunk;
 }  // namespace benchmark_internal
 }  // namespace mmltk::backend::data
 namespace mmltk::backend::data::testsupport {
+// Enabled only by MMLTK_TEST_BENCHMARK_TRACE for focused failure diagnosis.
+[[nodiscard]] benchmark_internal::BenchmarkTraceSink benchmark_trace();
 [[nodiscard]] mmltk::common::io::FileHandle create_compiled_fixture_file(const std::filesystem::path&, const FileHeader&);
 [[nodiscard]] std::string benchmark_semantics(const std::filesystem::path&);
 void bind_benchmark_slots(benchmark_internal::BenchmarkCompilePipeline&, benchmark_internal::BenchmarkSplitWriter&, const benchmark_internal::PreparedBenchmarkSplit&);
+// Materialize input and file extents before holding a CPU in cooperation cases.
+// The returned task runs the writer's actual decode/resize/store kernel.
+[[nodiscard]] detail::CompileExecution::Task prepare_benchmark_pixel(benchmark_internal::BenchmarkCompilePipeline&, benchmark_internal::BenchmarkSplitWriter&, std::uint32_t slot = 0);
 [[nodiscard]] ImageEntry benchmark_entry(const benchmark_internal::EncodedImageRecord&);
 void write_benchmark_fixture(const benchmark_internal::BenchmarkWriteRequest&, std::span<const std::shared_ptr<benchmark_internal::BenchmarkLabelChunk>>);
 struct FixtureSpec {

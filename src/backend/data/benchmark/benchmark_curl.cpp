@@ -149,7 +149,7 @@ struct BenchmarkCurl::Impl {
  std::vector<std::weak_ptr<Channel::State>> observers;
  std::size_t channels = 0;
  std::uint64_t generation = 0;
- bool stopping = false, images_selected = false, settled = true, declarations_changed = true;
+ bool stopping = false, images_selected = false, settled = true, declarations_changed = true, waiting_cpu = false;
  std::exception_ptr failure;
  CURLM* wake_handle = nullptr;
  CurlMulti multi;
@@ -199,10 +199,10 @@ struct BenchmarkCurl::Impl {
   require_supported_curl();
   if (execution)
    readiness = std::make_unique<CompileExecution::Readiness>(*execution, [this](CompileExecution::Readiness::Changes changes) {
-    if (!changes.resources && !changes.pressure && !changes.interrupted) return;
     const std::lock_guard lock(mutex);
-    notify_readers_locked();
-    if (changes.retry || changes.interrupted) wake_locked();
+    if (!changes.resources && !changes.pressure && !changes.interrupted && !waiting_cpu) return;
+    if (changes.resources || changes.pressure || changes.interrupted) notify_readers_locked();
+    if (changes.retry || changes.interrupted || waiting_cpu) wake_locked();
    });
   worker = std::jthread([this] { run(); });
  }
@@ -520,7 +520,9 @@ struct BenchmarkCurl::Impl {
   return true;
  }
  void run() noexcept {
+  std::optional<CompileExecution::ServiceDemand> demand;
   try {
+   if (execution) demand.emplace(*execution);
    for (;;) {
     std::uint64_t observed;
     std::size_t aggregate;
@@ -533,12 +535,31 @@ struct BenchmarkCurl::Impl {
      no_channels = !channels;
      has_service = bool(acquisition);
     }
+    // Removal receipts and idle transport retirement cannot wait behind an
+    // unrelated CPU task. They only detach custody; actual transfer pumps still
+    // require a shared execution grant.
+    drain_commands();
     std::optional<CompileExecution::ServiceGrant> cpu;
-    if (execution && has_service) {
-     cpu.emplace(execution->service_grant(CompileWorkClass::Acquisition));
+    if (demand) {
+     CompileExecution::ServiceDemand::Classes requested{};
+     requested[static_cast<std::size_t>(CompileWorkClass::Acquisition)] = has_service && !no_channels;
+     {
+      const std::lock_guard lock(mutex);
+      waiting_cpu = has_service && !no_channels;
+     }
+     demand->update(requested);
+     if (has_service && !no_channels) cpu = demand->try_grant();
+     std::unique_lock lock(mutex);
+     if (waiting_cpu && !cpu) {
+      changed.wait(lock, [&] { return stopping || generation != observed; });
+      waiting_cpu = false;
+      continue;
+     }
+     waiting_cpu = false;
+    }
+    if (cpu) {
      mmltk::common::system::set_thread_affinity({cpu->cpu()});
     }
-    (void)drain_commands();
     bool waiting = false;
     each_queue([&](const auto& queue) { waiting = waiting || !queue.empty(); });
     // Establish fixed transport custody before a channel can admit source

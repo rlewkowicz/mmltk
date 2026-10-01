@@ -13101,11 +13101,7 @@ void Document::RestorePreviousFullscreenState(UniquePtr<FullscreenExit> aExit) {
   size_t fullscreenCount = lastDoc->CountFullscreenElements();
   if (!lastDoc->GetInProcessParentDocument() && fullscreenCount == 1) {
     PendingFullscreenChangeList::Add(std::move(aExit));
-    if (IsMmltkWorkspaceWaylandIntegration()) {
-      ExitFullscreenInDocTree(this);
-    } else {
-      AskWindowToExitFullscreen(this);
-    }
+    AskWindowToExitFullscreen(this);
     return;
   }
 
@@ -13950,8 +13946,7 @@ void Document::RequestFullscreen(UniquePtr<FullscreenRequest> aRequest,
                                  bool aApplyFullscreenDirectly) {
   if (XRE_IsContentProcess()) {
     RequestFullscreenInContentProcess(std::move(aRequest),
-                                      aApplyFullscreenDirectly ||
-                                          IsMmltkWorkspaceWaylandIntegration());
+                                      aApplyFullscreenDirectly);
   } else {
     MOZ_ASSERT(!aApplyFullscreenDirectly);
     RequestFullscreenInParentProcess(std::move(aRequest));

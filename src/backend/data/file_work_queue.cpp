@@ -12,6 +12,7 @@
 #include <vector>
 namespace mmltk::backend::data::detail {
 struct FileWorkQueue::Impl {
+ static thread_local Impl* current;
  enum class State { Free, Queued, Waiting, Running, Completing };
  struct Record {
   Operation operation;
@@ -108,6 +109,7 @@ struct FileWorkQueue::Impl {
   }
  }
  void perform(std::size_t index, std::optional<CompileExecution::ServiceGrant> grant = {}) noexcept {
+  auto* dispatcher = std::exchange(current, nullptr);
   std::exception_ptr error;
   try {
    if (grant) mmltk::common::system::set_thread_affinity({grant->cpu()});
@@ -125,6 +127,7 @@ struct FileWorkQueue::Impl {
   } catch (...) { error = std::current_exception(); }
   // A callback retains the dispatcher and producer, but not its CPU grant.
   grant.reset();
+  current = dispatcher;
   {
    const std::lock_guard lock(mutex);
    records[index].state = State::Completing;
@@ -139,55 +142,60 @@ struct FileWorkQueue::Impl {
   }
   perform(index);
  }
- void service() {
-  for (;;) {
-   std::size_t selected = records.size();
-   std::optional<CompileExecution::ServiceGrant> grant;
-   std::exception_ptr error;
-   {
-    std::unique_lock lock(mutex);
-    for (;;) {
-     if (stopping || shutdown) return;
-     const auto observed = generation;
-     error = {};
-     try {
-      grant = demand->try_grant();
-     } catch (...) { error = std::current_exception(); }
-     for (std::size_t turn = 0; turn < records.size(); ++turn) {
-      const auto candidate = (cursor + turn) % records.size();
-      const auto& record = records[candidate];
-      if (record.state == State::Queued && (error || (grant && record.operation.service_class == grant->work_class()))) {
-       selected = candidate;
-       claim(selected);
-       ++busy_services;
-       update_demand();
-       break;
-      }
+ bool dispatch_one(const CompileExecution::Completion* awaited = nullptr) {
+  std::size_t selected = records.size();
+  std::optional<CompileExecution::ServiceGrant> grant;
+  std::exception_ptr error;
+  {
+   std::unique_lock lock(mutex);
+   for (;;) {
+    if (stopping || shutdown || (awaited && awaited->ready())) return false;
+    const auto observed = generation;
+    error = {};
+    try {
+     grant = demand->try_grant();
+    } catch (...) { error = std::current_exception(); }
+    for (std::size_t turn = 0; turn < records.size(); ++turn) {
+     const auto candidate = (cursor + turn) % records.size();
+     const auto& record = records[candidate];
+     if (record.state == State::Queued && (error || (grant && record.operation.service_class == grant->work_class()))) {
+      selected = candidate;
+      claim(selected);
+      ++busy_services;
+      update_demand();
+      break;
      }
-     if (selected != records.size()) break;
-     // Readiness publication and this predicate share the queue lock. A failed
-     // grant leaves both the record and its demand armed until a real change.
-     changed.wait(lock, [&] { return stopping || shutdown || generation != observed; });
     }
+    if (selected != records.size()) break;
+    // Readiness publication and this predicate share the queue lock. A failed
+    // grant leaves both the record and its demand armed until a real change.
+    changed.wait(lock, [&] { return stopping || shutdown || generation != observed || (awaited && awaited->ready()); });
    }
-   if (error) {
-    {
-     const std::lock_guard lock(mutex);
-     records[selected].state = State::Completing;
-    }
-    finish(selected, error);
-   } else
-    perform(selected, std::move(grant));
+  }
+  auto* previous = std::exchange(current, this);
+  if (error) {
    {
     const std::lock_guard lock(mutex);
-    --busy_services;
-    update_demand();
-    ++generation;
+    records[selected].state = State::Completing;
    }
-   changed.notify_all();
+   finish(selected, error);
+  } else
+   perform(selected, std::move(grant));
+  current = previous;
+  {
+   const std::lock_guard lock(mutex);
+   --busy_services;
+   update_demand();
+   ++generation;
   }
+  changed.notify_all();
+  return true;
+ }
+ void service() {
+  while (dispatch_one()) {}
  }
 };
+thread_local FileWorkQueue::Impl* FileWorkQueue::Impl::current = nullptr;
 FileWorkQueue::FileWorkQueue(CompileExecution& execution, std::size_t records, std::size_t services) : impl_(std::make_shared<Impl>(records)) {
  if (!services || services > execution.workers()) throw std::invalid_argument("file service capacity exceeds compile CPU budget");
  impl_->execution = &execution;
@@ -224,6 +232,42 @@ FileWorkQueue::~FileWorkQueue() {
  cancel();
  join();
  impl_->stop_services();
+}
+void FileWorkQueue::wait(const CompileExecution::Completion& completion) {
+ if (Impl::current != impl_.get() || !impl_->execution || completion.ready()) {
+  completion.wait();
+  return;
+ }
+ completion.subscribe([weak = std::weak_ptr<Impl>(impl_)](std::exception_ptr) {
+  if (auto owner = weak.lock()) {
+   {
+    const std::lock_guard lock(owner->mutex);
+    ++owner->generation;
+   }
+   owner->changed.notify_all();
+  }
+ });
+ struct ResumeService {
+  Impl& owner;
+  ~ResumeService() {
+   {
+    const std::lock_guard lock(owner.mutex);
+    ++owner.busy_services;
+    owner.update_demand();
+    ++owner.generation;
+   }
+   owner.changed.notify_all();
+  }
+ } resume{*impl_};
+ {
+  const std::lock_guard lock(impl_->mutex);
+  --impl_->busy_services;
+  impl_->update_demand();
+  ++impl_->generation;
+ }
+ impl_->changed.notify_all();
+ while (!completion.ready() && impl_->dispatch_one(&completion)) {}
+ completion.wait();
 }
 std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation operation) {
  if (!operation.call && !operation.work) throw std::invalid_argument("empty borrowed file operation");

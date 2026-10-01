@@ -1385,10 +1385,10 @@ TEST_CASE("benchmark progress failure wakes admission and drains physical borrow
  CHECK(fixture.observation.requested());
  CHECK_FALSE(fixture.external.second.cancelled());
  CHECK_FALSE(active.ready());
- CHECK_FALSE(parked->ready());
+ CHECK_THROWS_WITH(parked->wait(), "dataset compilation cancelled");
+ CHECK_FALSE(active.ready());
  physical.Release();
  CHECK_NOTHROW(active.wait());
- CHECK_THROWS_WITH(parked->wait(), "dataset compilation cancelled");
  CHECK_THROWS_WITH(execution.join(), "dataset compilation cancelled");
  CHECK(observed_cancellation.load());
  CHECK_FALSE(parked_ran.load());
@@ -2011,10 +2011,12 @@ TEST_CASE("Directory yields inside one long mask projection for peer pixels and 
   std::shared_future<void> projection_entered;
   std::atomic<unsigned> quanta{0};
   std::atomic<bool> holding{false}, observed{false}, published{false};
+  mmltk::backend::data::benchmark_internal::BenchmarkTraceSink trace = mmltk::backend::data::testsupport::benchmark_trace();
   explicit State(mmltk::testsupport::TestGate::Receipt value) : receipt(std::move(value)), projection_entered(projected.get_future().share()) {}
  } state(held.receipt());
- const DirectoryCompileObservation observer{&state, [](void* context, CompileTaskKind kind, std::uint32_t image, bool complete) {
+ DirectoryCompileObservation observer{&state, [](void* context, CompileTaskKind kind, std::uint32_t image, bool complete) {
   auto& observed = *static_cast<State*>(context);
+  if (observed.trace) observed.trace("directory.task", {{"kind", static_cast<unsigned>(kind)}, {"image", image}, {"complete", complete}});
   // One short RLE token expands to 4096 padded target rows. The first Labels
   // return must be a projection yield, before a packed record can be published.
   if (kind == CompileTaskKind::Labels && !image && complete && ++observed.quanta == 1) {
@@ -2031,7 +2033,12 @@ TEST_CASE("Directory yields inside one long mask projection for peer pixels and 
     release_test_promise(observed.peer);
    }
   }
+ }, [](void* context, std::string_view event, const CompileExecutionSnapshot& snapshot) {
+  auto& observed = *static_cast<State*>(context);
+  if (observed.trace) observed.trace(event, {{"active", snapshot.active}, {"external", snapshot.external}, {"running", snapshot.running}, {"live", snapshot.live},
+   {"parked", snapshot.parked}, {"leased", snapshot.leased}, {"exceptional", snapshot.exceptional}, {"baseline", snapshot.baseline}});
  }};
+ if (!state.trace) observer.execution = nullptr;
  config.observation = &observer;
  const auto plan = DatasetCompiler::prepare(config, {"train"});
  struct CancellationTag {};

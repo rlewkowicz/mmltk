@@ -906,9 +906,16 @@ class OpenImagesAcquisition final {
   // mapped-result backing is charged by the I/O worker before result enqueue.
   const auto begin_cursor = group.scan_cursor;
   while (group.scan_cursor < group.count && group.scan_cursor - begin_cursor < kScanGrain && cache_writer.warm_outstanding() < 8) {
+   const auto position = begin + group.scan_cursor;
+   if (decode_probe && ids[position] == decode_probe->image_id) {
+    // Admission already invalidated this exact repair input. Queue its required
+    // download directly instead of racing another asynchronous missing-file scan.
+    fresh.push_front({position});
+    ++group.scan_cursor;
+    continue;
+   }
    auto input = inputs.acquire(group.lease->allowance(), true);
    if (!input) break;
-   const auto position = begin + group.scan_cursor;
    cache_writer.submit({ids[position], position, 1, std::move(input), true});
    ++group.scan_cursor;
   }

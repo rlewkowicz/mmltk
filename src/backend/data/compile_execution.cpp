@@ -86,24 +86,26 @@ struct CompileExecution::Impl {
   Frame* active = nullptr;
   Workspace* retiring = nullptr;
   Idle idle;
-  CompileWorkClass baseline = CompileWorkClass::Count;
-  bool service = false, dispatching = false, external = false;
-  [[nodiscard]] bool busy() const { return active || retiring || service || dispatching || external; }
+  CompileWorkClass baseline = CompileWorkClass::Count, service = CompileWorkClass::Count;
+  bool dispatching = false, external = false;
+  [[nodiscard]] bool busy() const { return active || retiring || service != CompileWorkClass::Count || dispatching || external; }
   [[nodiscard]] bool owns(Workspace*) const;
  };
  struct Frame {
   Impl& owner;
   std::size_t lane;
+  CompileWorkClass grant_class;
   Frame* parent = nullptr;
   Frame* previous = nullptr;
   Workspace* workspace = nullptr;
   CompileAllowance allowance;
   std::shared_ptr<Credits> credit;
   static thread_local Frame* current;
-  Frame(Impl& value, std::size_t slot) : owner(value), lane(slot) {}
+  Frame(Impl& value, std::size_t slot, CompileWorkClass kind) : owner(value), lane(slot), grant_class(kind) {}
   void enter(CompileAllowance value, Workspace* scratch) {
    auto& local = owner.lanes[lane];
    parent = local.active;
+   if (parent) grant_class = parent->grant_class;
    previous = current;
    workspace = scratch;
    allowance = std::move(value);
@@ -113,6 +115,8 @@ struct CompileExecution::Impl {
    if (!parent && !local.dispatching) ++owner.admission->active;
    local.dispatching = false;
    current = this;
+   owner.reconcile();
+   owner.notify_locked();
   }
   ~Frame() {
    std::shared_ptr<Credits> retired_parent;
@@ -139,7 +143,15 @@ struct CompileExecution::Impl {
  std::vector<int> cpus;
  std::vector<Lane> lanes;
  std::array<Class, class_count> classes;
- std::array<std::list<std::shared_ptr<Job>>, kind_count> ready;
+ struct ReadyQueue {
+  std::list<std::shared_ptr<Job>> jobs;
+  decltype(jobs)::iterator fallback = jobs.end();
+  auto erase(decltype(jobs)::iterator position) {
+   if (fallback == position) fallback = std::next(position);
+   return jobs.erase(position);
+  }
+ };
+ std::array<ReadyQueue, kind_count> ready;
  std::list<std::shared_ptr<Job>> jobs;
  std::vector<std::shared_ptr<Job>> available_records;
  std::vector<std::shared_ptr<Readiness::State>> observers;
@@ -203,7 +215,22 @@ struct CompileExecution::Impl {
   if (count > lanes.size()) return;
   for (std::size_t kind = 0; kind < class_count; ++kind) {
    if (!live(kind) || assigned[kind]) continue;
-   const auto available = std::ranges::find_if(lanes, [](const auto& lane) { return !lane.busy() && lane.baseline == CompileWorkClass::Count; });
+   auto available = std::ranges::find_if(lanes, [](const auto& lane) { return !lane.busy() && lane.baseline == CompileWorkClass::Count; });
+   if (available == lanes.end()) {
+    // An elastic borrower can already supply its class's floor. Move that
+    // assignment from an idle peer so a newly live class can start without
+    // waiting for unrelated work; CPU and workspace custody stay in place.
+    for (auto idle = lanes.begin(); idle != lanes.end(); ++idle) {
+     if (idle->busy() || idle->baseline == CompileWorkClass::Count) continue;
+     const auto occupied = std::ranges::find_if(lanes, [&](const auto& lane) {
+      return lane.baseline == CompileWorkClass::Count && (lane.active ? lane.active->grant_class : lane.service) == idle->baseline;
+     });
+     if (occupied == lanes.end()) continue;
+     occupied->baseline = std::exchange(idle->baseline, CompileWorkClass::Count);
+     available = idle;
+     break;
+    }
+   }
    if (available == lanes.end()) break;
    available->baseline = static_cast<CompileWorkClass>(kind);
   }
@@ -274,7 +301,7 @@ struct CompileExecution::Impl {
  void enqueue(const std::shared_ptr<Job>& job) {
   park(*job, CompileParkReason::None);
   job->blocked_generation = std::numeric_limits<std::uint64_t>::max();
-  ready[static_cast<std::size_t>(job->task.kind)].push_back(job);
+  ready[static_cast<std::size_t>(job->task.kind)].jobs.push_back(job);
  }
  void complete(const std::shared_ptr<Job>& job, std::exception_ptr error) noexcept {
   const auto class_index = index(work_class(job->task.kind));
@@ -405,7 +432,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
     return true;
    }
    auto& lane = lanes[lane_index];
-   if (lane.retiring || lane.service || lane.external || (blocking && lane.active)) return false;
+   if (lane.retiring || lane.service != CompileWorkClass::Count || lane.external || (blocking && lane.active)) return false;
    const bool discard = stopping || failure || cancellation.requested();
    if (discard)
     for (auto& job : jobs) {
@@ -470,8 +497,19 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
     for (std::size_t step = 0; step < kind_count; ++step) {
      const auto kind = (kind_cursor + step) % kind_count;
      if (index(work_class(static_cast<CompileTaskKind>(kind))) != class_index) continue;
-     auto& queue = ready[kind];
-     for (auto position = queue.begin(); position != queue.end(); ++position) {
+     auto& candidates = ready[kind];
+     auto& queue = candidates.jobs;
+     auto next = queue.begin();
+     for (std::size_t examined = 0; examined < queue.size(); ++examined) {
+      const auto position = next;
+      // Reconsider the oldest request first, then resume beyond the last
+      // successful bypass. The queue owns its cursor through cancellation.
+      if (!examined && candidates.fallback != queue.end() && candidates.fallback != queue.begin())
+       next = candidates.fallback;
+      else {
+       ++next;
+       if (next == queue.end()) next = std::next(queue.begin());
+      }
       auto& job = **position;
       const auto& task = job.task;
       const bool reusable = task.retain_workspace && task.workspace && lane.idle.workspace == task.workspace && CompileAdmission::covers(*lane.idle.allowance.credits_, task.resources);
@@ -508,7 +546,8 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
        }
       }
       selected = *position;
-      queue.erase(position);
+      if (position != queue.begin()) candidates.fallback = std::next(position);
+      candidates.erase(position);
       job.running = true;
       lane.dispatching = true;
       if (!lane.active) ++admission->active;
@@ -546,7 +585,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
  if (!selected) return !finished;
  const auto class_index = index(work_class(selected->task.kind));
  {
-  Frame frame(*this, lane_index);
+  Frame frame(*this, lane_index, static_cast<CompileWorkClass>(class_index));
   {
    const std::lock_guard lock(admission->mutex);
    frame.enter(std::move(allowance), selected->task.workspace);
@@ -592,6 +631,8 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
 void CompileExecution::Impl::events() noexcept {
  bool cancellation_observed = false;
  std::vector<std::pair<std::shared_ptr<Readiness::State>, Readiness::Changes>> callbacks;
+ std::vector<std::shared_ptr<Job>> withdrawn;
+ withdrawn.reserve(record_limit);
  for (;;) {
   std::array<pollfd, 2> descriptors{{{event.get(), POLLIN, 0}, {cancellation_observed ? -1 : cancellation.descriptor(), POLLIN, 0}}};
   int timeout = -1;
@@ -616,12 +657,31 @@ void CompileExecution::Impl::events() noexcept {
    while (::read(event.get(), &value, sizeof(value)) < 0 && errno == EINTR) {}
   }
   CompileExecutionSnapshot observation;
+  std::exception_ptr withdrawal_error;
   bool cancelled;
   {
    const std::lock_guard lock(admission->mutex);
    if (shutdown) return;
    cancelled = cancellation.requested();
    if (cancelled && (!cancellation_observed || !result)) publish_locked(CompileAdmission::Change::Interruption);
+   withdrawal_error = failure ? failure : cancelled ? cancellation_error : retired;
+   for (const auto& job : jobs) {
+    if (job->running || job->done || !(job->cancelled || stopping || failure || cancelled)) continue;
+    // Unstarted custody has no physical CPU user to join. Claim its settlement
+    // here so unrelated held compute cannot delay source-local withdrawal.
+    job->running = true;
+    job->dependency.reset();
+    park(*job, CompileParkReason::None);
+    withdrawn.push_back(job);
+   }
+   if (!withdrawn.empty()) {
+    for (auto& queue : ready)
+     for (auto position = queue.jobs.begin(); position != queue.jobs.end();)
+      if ((*position)->running)
+       position = queue.erase(position);
+      else
+       ++position;
+   }
    admission->changed.notify_all();
    for (const auto& callback : observers)
     if (callback->notified) {
@@ -632,6 +692,8 @@ void CompileExecution::Impl::events() noexcept {
     }
    if (observer) observation = snapshot_locked();
   }
+  for (const auto& job : withdrawn) complete(job, withdrawal_error);
+  withdrawn.clear();
   for (const auto& [value, changes] : callbacks) {
    {
     const std::lock_guard lock(value->mutex);
@@ -1005,6 +1067,7 @@ CompileAllowance CompileExecution::current_allowance() const {
 }
 std::size_t CompileExecution::workers() const noexcept { return impl_->cpus.size(); }
 std::span<const int> CompileExecution::cpus() const noexcept { return impl_->cpus; }
+const CompileWorkspacePlan& CompileExecution::workspace_plan() const noexcept { return impl_->admission->arenas->plan(); }
 CompileExecutionSnapshot CompileExecution::snapshot() const {
  const std::lock_guard lock(impl_->admission->mutex);
  return impl_->snapshot_locked();
@@ -1233,7 +1296,7 @@ void CompileExecution::run(CompileTaskKind kind, CompileResources resources, con
    if (resources.cpu_workers || (!allowance && (!parent->allowance || !CompileAdmission::covers(*parent->allowance.credits_, resources))))
     throw std::logic_error("nested compile work exceeds its parent's allowance");
   }
-  Impl::Frame frame(*impl_, parent->lane);
+  Impl::Frame frame(*impl_, parent->lane, parent->grant_class);
   {
    const std::lock_guard lock(impl_->admission->mutex);
    frame.enter(allowance ? std::move(allowance) : parent->allowance, parent->workspace);
@@ -1307,7 +1370,7 @@ void CompileExecution::for_each_impl(
     lane.retiring = workspace;
    }
   }
-  Impl::Frame frame(*impl_, parent->lane);
+  Impl::Frame frame(*impl_, parent->lane, parent->grant_class);
   {
    const std::lock_guard lock(impl_->admission->mutex);
    frame.enter(parent->allowance, workspace ? workspace : parent->workspace);
@@ -1404,7 +1467,7 @@ void CompileExecution::ServiceGrant::release() noexcept {
  if (!owner_) return;
  auto owner = std::move(owner_);
  const std::lock_guard lock(owner->admission->mutex);
- owner->lanes[lane_].service = false;
+ owner->lanes[lane_].service = CompileWorkClass::Count;
  --owner->admission->active;
  --owner->services;
  --owner->classes[index(class_)].running;
@@ -1442,7 +1505,7 @@ std::optional<CompileExecution::ServiceGrant> CompileExecution::ServiceDemand::t
     if (owner_->service_waiters[(owner_->cursor + earlier) % class_count]) return {};
    // Compute and services use one cursor. Earlier runnable compute receives a
    // bounded turn before handing the cursor to a waiting service class.
-   if (turn && std::ranges::any_of(owner_->ready, [](const auto& queue) { return !queue.empty(); })) return {};
+   if (turn && std::ranges::any_of(owner_->ready, [](const auto& queue) { return !queue.jobs.empty(); })) return {};
   }
   const auto service_class = static_cast<CompileWorkClass>(kind);
   for (bool baseline : {true, false})
@@ -1452,7 +1515,7 @@ std::optional<CompileExecution::ServiceGrant> CompileExecution::ServiceDemand::t
     if (!((baseline && lane.baseline == service_class) || (!baseline && (!owner_->floors || lane.baseline == CompileWorkClass::Count)))) continue;
     update_locked({});
     owner_->cursor = (kind + 1) % class_count;
-    lane.service = true;
+    lane.service = service_class;
     ++owner_->admission->active;
     ++owner_->services;
     ++owner_->classes[kind].running;

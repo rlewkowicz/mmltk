@@ -50,6 +50,10 @@ public:
  // on that observation; capacity return and cancellation notify the execution.
  [[nodiscard]] bool has_capacity() const;
  [[nodiscard]] CompileExecution::Completion submit(Operation);
+ // A synchronous consumer inside a compile file callback lends its dispatcher
+ // to queued physical work while waiting, retaining the callback's own record.
+ // Ordinary callers retain Completion::wait's behavior.
+ void wait(const CompileExecution::Completion&);
  void join();
  // Settle unstarted operations and interrupt local service admission. Running
  // calls keep their context until physical return; join waits for that custody.

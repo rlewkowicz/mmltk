@@ -760,6 +760,7 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  exercise_compiled_stream(bin_path, h2d);
  ensure_cuda_ok(cudaSetDevice(0), "restore primary training context after isolated stream coverage");
  exercise_independent_completions(bin_path, h2d);
+ ensure_cuda_ok(cudaSetDevice(0), "restore primary training context after independent stream coverage");
  exercise_bounded_gathers(bin_path, h2d);
  {
   DatasetLoader::Config direct_cfg;

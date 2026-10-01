@@ -368,6 +368,9 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
  CHECK(result.snapshot.terminal.outcome == contracts::ArtifactTerminalOutcome::Succeeded);
  CHECK(result.snapshot.terminal.detail.empty());
  CHECK_FALSE(result.snapshot.active);
+ // Projection can produce identical adjacent snapshots; unchanged public state
+ // has no new revision or event, while every distinct observation is retained.
+ produced.erase(std::unique(produced.begin(), produced.end()), produced.end());
  CHECK(delivered == produced);
  REQUIRE_FALSE(delivered.empty());
  for (const auto& progress : delivered) {

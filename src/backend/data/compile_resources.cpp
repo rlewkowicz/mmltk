@@ -18,6 +18,11 @@ std::size_t CompileAllowance::descriptors() const noexcept {
  return credits_->resources.descriptors;
 }
 std::span<std::byte> CompileAllowance::workspace() const { return credits_ ? credits_->arena.bytes() : std::span<std::byte>{}; }
+bool CompileAllowance::exceptional_workspace() const noexcept {
+ if (!credits_) return false;
+ const std::lock_guard lock(credits_->owner->mutex);
+ return credits_->arena.exceptional();
+}
 void CompileAllowance::retire_workspace() const noexcept {
  if (!credits_) return;
  auto& owner = *credits_->owner;
