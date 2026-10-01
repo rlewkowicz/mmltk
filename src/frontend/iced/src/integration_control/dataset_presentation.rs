@@ -9,6 +9,15 @@ use iced::advanced::{Layout, Shell, Widget, layout, mouse, overlay, renderer, wi
 use iced::{Event, Length, Rectangle, Size, Vector};
 use std::cell::{Cell, RefCell};
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(module = "/src/integration_control/browser.mjs")]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationCompileResize)]
+    pub(super) fn compile_resize(step: u8, generation: f64, revision: f64, begin: bool) -> bool;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationCompileRoot)]
+    fn compile_root(generation: f64, revision: f64, x: f64, y: f64, width: f64, height: f64, scale: f64);
+}
+
 pub(super) const FIXTURE_COUNT: u8 = 36;
 pub(super) const OBSERVATION_BUDGET: u16 = 180;
 pub(super) fn input_key(index: u8) -> u16 {
@@ -59,6 +68,7 @@ pub struct Row {
 #[derive(Clone, Debug)]
 pub struct NativeFrame {
     pub generation: u64,
+    pub revision: u64,
     pub phase: DatasetCompilePhase,
     pub completed: u64,
     pub total: u64,
@@ -71,6 +81,7 @@ impl NativeFrame {
             && state.progress.phase != DatasetCompilePhase::Idle)
             .then(|| Self {
                 generation: state.generation,
+                revision: state.revision,
                 phase: state.progress.phase,
                 completed: state.progress.completed,
                 total: state.progress.total,
@@ -83,8 +94,8 @@ impl NativeFrame {
             "integration.dataset_native_work",
             progress::WORK_ID,
             &format!(
-                r#"{{"generation":{},"phase":{},"completed":{},"total":{}}}"#,
-                self.generation, self.phase as u8, self.completed, self.total
+                r#"{{"generation":{},"revision":{},"phase":{},"completed":{},"total":{}}}"#,
+                self.generation, self.revision, self.phase as u8, self.completed, self.total
             ),
             [0.0; 4],
         );
@@ -873,6 +884,18 @@ impl Widget<RootMessage, Theme, iced::Renderer> for Observed<'_> {
         );
         if observing {
             PAINTS.with_borrow_mut(|paints| paints.active = false);
+        }
+        #[cfg(target_arch = "wasm32")]
+        if observing {
+            let root = layout.bounds();
+            if crate::presentation_surface::surface_trace_enabled() {
+                crate::presentation_surface::emit_surface_trace(&format!(
+                    "{{\"event\":\"iced.window.root_draw\",\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"scale\":{}}}",
+                    root.x, root.y, root.width, root.height, self.scale));
+            }
+            if let Some(native) = &self.native {
+                compile_root(native.generation as f64, native.revision as f64, root.x.into(), root.y.into(), root.width.into(), root.height.into(), self.scale.into());
+            }
         }
         if self.key != 0
             && super::reporting_enabled()

@@ -43,10 +43,7 @@ public:
  void increment() noexcept;
 
 private:
- void flush() noexcept;
- static constexpr size_t kPublishBatch = 32U;
  ProgressCounter* counter_ = nullptr;
- size_t pending_ = 0U;
 };
 // A context owns all scratch across bounded label continuations. No borrowed
 // lane-local parser, input, mask scratch or output survives a return.

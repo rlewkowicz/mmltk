@@ -334,41 +334,16 @@ impl ApplicationModel {
 
     pub(super) fn install_dataset_progress(
         &mut self,
-        generation: u64,
-        active: bool,
-        terminal: crate::generated::ArtifactTerminal,
-        progress: crate::generated::ArtifactProgress,
+        snapshot: crate::generated::ArtifactCompileState,
     ) -> Result<Observation, UiError> {
         let Some(dataset) = self.workflow.dataset.as_mut() else {
             return Ok(Observation::Stale);
         };
-        if generation < dataset.generation {
-            return Ok(Observation::Stale);
+        let observation = compare_dataset_compile(&crate::generated::ArtifactCompileState::from(&*dataset), &snapshot)?;
+        if observation == Observation::Installed {
+            snapshot.apply_to(dataset);
         }
-        if generation > dataset.generation {
-            dataset.generation = generation;
-            dataset.active = active;
-            dataset.terminal = terminal;
-            dataset.progress = progress;
-            return Ok(Observation::Installed);
-        }
-        if artifact_outcome_is_final(dataset.terminal.outcome) {
-            return Ok(Observation::Stale);
-        }
-        if dataset.active == active && dataset.terminal == terminal && dataset.progress == progress
-        {
-            return Ok(Observation::Current);
-        }
-        if artifact_outcome_rank(terminal.outcome) < artifact_outcome_rank(dataset.terminal.outcome)
-        {
-            return Err(UiError::protocol(
-                "Dataset progress regressed its operation terminal",
-            ));
-        }
-        dataset.active = active;
-        dataset.terminal = terminal;
-        dataset.progress = progress;
-        Ok(Observation::Installed)
+        Ok(observation)
     }
 
     pub(super) fn install_dataset_snapshot(
@@ -657,50 +632,57 @@ pub(super) fn merge_compute_snapshot(
     }
 }
 
+fn compare_dataset_compile(
+    installed: &crate::generated::ArtifactCompileState,
+    incoming: &crate::generated::ArtifactCompileState,
+) -> Result<Observation, UiError> {
+    if incoming.generation < installed.generation || incoming.revision < installed.revision {
+        return Ok(Observation::Stale);
+    }
+    if incoming.revision == installed.revision {
+        return if incoming == installed { Ok(Observation::Current) } else {
+            Err(UiError::protocol("inconsistent Dataset compile state revision"))
+        };
+    }
+    if incoming.generation == installed.generation {
+        if artifact_outcome_is_final(installed.terminal.outcome) {
+            if artifact_outcome_is_final(incoming.terminal.outcome)
+                && incoming.terminal != installed.terminal
+            {
+                return Err(UiError::protocol("inconsistent final Dataset snapshot for one generation"));
+            }
+            return Ok(Observation::Stale);
+        }
+        if artifact_outcome_rank(incoming.terminal.outcome) < artifact_outcome_rank(installed.terminal.outcome) {
+            return Ok(Observation::Stale);
+        }
+        if installed.active && (!incoming.active && !artifact_outcome_is_final(incoming.terminal.outcome)
+            || incoming.progress.phase == crate::generated::DatasetCompilePhase::Idle
+                && installed.progress.phase != crate::generated::DatasetCompilePhase::Idle) {
+            return Ok(Observation::Stale);
+        }
+    }
+    Ok(Observation::Installed)
+}
+
 pub(super) fn merge_dataset_state(
     target: &mut Option<crate::generated::ArtifactUiState>,
-    // CLEANUP-IGNORE: Dataset's incoming state enters artifact-specific reconciliation.
-    mut incoming: crate::generated::ArtifactUiState,
-    // CLEANUP-IGNORE: Dataset installation begins artifact-specific reconciliation.
+    incoming: crate::generated::ArtifactUiState,
 ) -> Result<Observation, UiError> {
     let Some(installed) = target.as_mut() else {
         *target = Some(incoming);
         return Ok(Observation::Installed);
     };
-    if incoming.generation < installed.generation {
-        return Ok(Observation::Stale);
-    }
-    if incoming.generation > installed.generation {
+    let observation = compare_dataset_compile(
+        &crate::generated::ArtifactCompileState::from(&*installed),
+        &crate::generated::ArtifactCompileState::from(&incoming),
+    )?;
+    if observation != Observation::Stale {
+        // Inspection belongs to full snapshots, including an unchanged compile
+        // revision from a later inspection or reconnect.
         *installed = incoming;
-        return Ok(Observation::Installed);
     }
-    if artifact_outcome_is_final(installed.terminal.outcome) {
-        if !artifact_outcome_is_final(incoming.terminal.outcome) {
-            return Ok(Observation::Stale);
-        }
-        if incoming.terminal != installed.terminal {
-            return Err(UiError::protocol(
-                "inconsistent final Dataset snapshot for one generation",
-            ));
-        }
-        return Ok(Observation::Current);
-    }
-    if installed.progress.phase != crate::generated::DatasetCompilePhase::Idle
-        && incoming.progress.phase == crate::generated::DatasetCompilePhase::Idle
-    {
-        incoming.progress = installed.progress.clone();
-    }
-    if artifact_outcome_rank(incoming.terminal.outcome)
-        < artifact_outcome_rank(installed.terminal.outcome)
-    {
-        incoming.terminal = installed.terminal.clone();
-        incoming.active = installed.active;
-    }
-    if incoming == *installed {
-        return Ok(Observation::Current);
-    }
-    *installed = incoming;
-    Ok(Observation::Installed)
+    Ok(observation)
 }
 
 pub(super) fn merge_dialog_snapshot(
@@ -1233,6 +1215,7 @@ mod tests {
             .unwrap();
         let mut active = model.workflow.dataset.clone().unwrap();
         active.generation += 1;
+        active.revision += 1;
         active.active = true;
         active.progress.phase = crate::generated::DatasetCompilePhase::Pixels;
         active.progress.activity = "Encoding images".into();
@@ -1248,6 +1231,7 @@ mod tests {
             12
         );
         let mut settled = active.clone();
+        settled.revision += 1;
         settled.active = false;
         settled.terminal.outcome = crate::generated::ArtifactTerminalOutcome::Cancelled;
         model.reduce_event(ApplicationEvent::DatasetDatasetChanged(
@@ -1257,6 +1241,55 @@ mod tests {
         ));
         model.reduce_reply(compile, Ok(ApplicationReply::DatasetCompile(active)));
         assert_eq!(model.workflow.dataset, Some(settled));
+    }
+
+    #[test]
+    fn dataset_revisions_preserve_repairs_stop_settlement_and_reconnect() {
+        let mut model = bootstrapped();
+        let mut state = model.workflow.dataset.clone().unwrap();
+        state.generation = 1;
+        state.revision = 1;
+        state.active = true;
+        state.progress.phase = crate::generated::DatasetCompilePhase::Pixels;
+        state.progress.total = 100;
+        state.progress.completed = 70;
+        model.install_dataset_snapshot(state.clone()).unwrap();
+        let original = state.clone();
+        state.revision += 1;
+        state.progress.completed = 40;
+        state.progress.tracks.pixels.invalidated = 30;
+        model.install_dataset_progress((&state).into()).unwrap();
+        assert_eq!(model.workflow.dataset.as_ref().unwrap().progress.completed, 40);
+        assert_eq!(model.install_dataset_snapshot(original.clone()).unwrap(), Observation::Stale);
+        state.revision += 1;
+        state.terminal.outcome = crate::generated::ArtifactTerminalOutcome::CancellationRequested;
+        model.install_dataset_snapshot(state.clone()).unwrap();
+        let stopping = state.clone();
+        state.revision += 1;
+        state.active = false;
+        state.terminal.outcome = crate::generated::ArtifactTerminalOutcome::Cancelled;
+        model.install_dataset_snapshot(state.clone()).unwrap();
+        assert_eq!(model.install_dataset_snapshot(stopping).unwrap(), Observation::Stale);
+        assert_eq!(model.install_dataset_progress((&original).into()).unwrap(), Observation::Stale);
+        let settled = state.clone();
+        let mut conflicting = state.clone();
+        conflicting.revision += 1;
+        conflicting.terminal.outcome = crate::generated::ArtifactTerminalOutcome::Failed;
+        assert!(model.install_dataset_snapshot(conflicting).is_err());
+        state.revision += 1;
+        state.generation += 1;
+        state.active = true;
+        state.terminal.outcome = crate::generated::ArtifactTerminalOutcome::Idle;
+        state.progress.completed = 0;
+        model.install_dataset_progress((&state).into()).unwrap();
+        assert_eq!(model.install_dataset_snapshot(settled).unwrap(), Observation::Stale);
+        let mut bootstrap = state.clone();
+        bootstrap.inspection.detail = "retained inspection".into();
+        model.install_dataset_snapshot(bootstrap.clone()).unwrap();
+        assert_eq!(model.workflow.dataset, Some(bootstrap));
+        let mut conflict: crate::generated::ArtifactCompileState = (&state).into();
+        conflict.progress.completed = 1;
+        assert!(model.install_dataset_progress(conflict).is_err());
     }
 
     #[test]

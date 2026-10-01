@@ -114,7 +114,7 @@ struct HostCallbackContext final {
  OpenPressure pressure = OpenPressure::None;
  std::mutex mutex;
  std::condition_variable changed;
- std::array<std::size_t, 12U> diagnostics{};
+ std::array<std::size_t, static_cast<std::size_t>(transport::BrowserServerEvent::WriteDrained) + 1U> diagnostics{};
  static void Opened(void* opaque) noexcept {
   auto& self = *static_cast<HostCallbackContext*>(opaque);
   ++self.epoch;
@@ -731,6 +731,8 @@ TEST_CASE("direct host preserves the final complete state across a snapshot burs
  const auto& event = std::get<SystemEvent>(record);
  CHECK(event.delivery == contracts::reflection::EventDelivery::LatestState);
  CHECK(event.event_id == 1U);
+ REQUIRE(server.context()->await(transport::BrowserServerEvent::RecordCoalesced));
+ REQUIRE(server.context()->await(transport::BrowserServerEvent::QueueHighWater));
  CHECK(event.value == wire::Value(wire::Value::Object{{"revision", wire::Value(std::uint64_t{64U})}}));
 }
 }  // namespace

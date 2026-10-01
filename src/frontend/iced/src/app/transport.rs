@@ -20,6 +20,10 @@ impl App {
     }
 
     pub(super) fn on_transport(&mut self, event: TransportEvent) -> Task<Message> {
+        #[cfg(target_arch = "wasm32")]
+        if crate::presentation_surface::surface_trace_enabled() {
+            crate::presentation_surface::emit_surface_trace("{\"event\":\"iced.transport.delivered\",\"count\":1}");
+        }
         if self.connection.is_none()
             && self.model.connection == crate::view_model::ConnectionState::Reconnecting
             && matches!(

@@ -116,20 +116,23 @@ struct ArtifactTerminal final {
  }
  bool operator==(const ArtifactTerminal&) const = default;
 };
-struct ArtifactUiState final {
+struct ArtifactCompileState {
+ std::uint64_t revision = 0U;
  std::uint64_t generation = 0U;
- // CLEANUP-IGNORE: Artifact compilation has a distinct inspection-bearing operation snapshot.
  [[= reflection::OperationStateField{reflection::OperationStateSemantic::Active}]] bool active = false;
- // CLEANUP-IGNORE: Artifact inspection is the domain payload that distinguishes this operation snapshot.
- ArtifactInspection inspection{};
  [[= reflection::OperationStateField{reflection::OperationStateSemantic::Progress}]] ArtifactProgress progress{};
  [[= reflection::OperationStateField{reflection::OperationStateSemantic::Terminal}]] ArtifactTerminal terminal{};
+ bool operator==(const ArtifactCompileState&) const = default;
+};
+struct ArtifactUiState final : ArtifactCompileState {
+ ArtifactInspection inspection{};
  bool operator==(const ArtifactUiState&) const = default;
 };
 MMLTK_REFLECT_FIELDS(ArtifactSplitFact)
 MMLTK_REFLECT_FIELDS(ArtifactInspection)
 MMLTK_REFLECT_FIELDS(ArtifactProgress)
 MMLTK_REFLECT_FIELDS(ArtifactTerminal)
+MMLTK_REFLECT_FIELDS(ArtifactCompileState)
 MMLTK_REFLECT_FIELDS(ArtifactUiState)
 MMLTK_REFLECT_ENUM(ArtifactTerminalOutcome)
 }  // namespace mmltk::controller::contracts

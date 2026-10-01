@@ -866,11 +866,11 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
    rejected_objects = common_math::checked_add(rejected_objects, count, "COCONut rejection count overflow");
  }
  progress.rejected(rejected_objects, omitted.size());
- progress.phase(DatasetCompilePhase::Syncing, 0, 3);
  auto sealed_splits=seal_benchmark_splits(pipeline,[&](std::size_t i,std::span<std::byte> scratch) {
   auto seal_request=request(i ? validation : train); seal_request.compaction_scratch=scratch;
   return (i ? validation_writer : train_writer).seal_slots(seal_request,selected[i]);
  });
+ progress.phase(DatasetCompilePhase::Syncing, 0, 3);
  for (auto& sealed:sealed_splits) sealed.artifact.publish(sealed.info.path,cancellation,detail::StagedArtifact::Publication::DurableReplace,false);
  progress.phase(DatasetCompilePhase::Syncing, 1, 3);
  nlohmann::json manifest{{"recipe", recipe->manifest}, {"sources", recipe->manifest["components"]}, {"image_cache", nlohmann::json::array()}, {"quarantined_images", std::move(omitted)}};

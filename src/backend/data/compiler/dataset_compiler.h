@@ -9,6 +9,8 @@
 #include <expected>
 #include <functional>
 #include <mutex>
+#include <memory>
+#include "src/backend/data/detail/compile_progress_delivery.h"
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -58,9 +60,10 @@ class CompileTelemetry {
 public:
  using Clock = std::chrono::steady_clock;
  using Now = Clock::time_point (*)() noexcept;
- CompileTelemetry() noexcept : started_at_rep_(now_().time_since_epoch().count()) {}
- explicit CompileTelemetry(size_t num_images, CompileProgressObserver observer = {}, Now now = &Clock::now) noexcept
-     : num_images_(num_images), observer_(observer), now_(now), started_at_rep_(now_().time_since_epoch().count()) {}
+ CompileTelemetry() noexcept;
+ explicit CompileTelemetry(size_t num_images, CompileProgressObserver observer = {}, Now now = &Clock::now);
+ ~CompileTelemetry();
+ void flush();
  [[nodiscard]] CompileProgress snapshot() const noexcept;
 
 private:
@@ -83,7 +86,7 @@ private:
  void set_dropped_instances(std::uint64_t count) noexcept;
  [[nodiscard]] CompileProgress snapshot(DatasetCompilePhase phase) const noexcept;
  void publish_semantic(DatasetCompilePhase phase) noexcept;
- void publish_counter() noexcept;
+ void publish_counter(bool boundary = false) noexcept;
  StageProgress labels_;
  StageProgress pixels_;
  std::atomic<std::size_t> compacted_bytes_{0U}, compaction_bytes_{0U};
@@ -91,10 +94,10 @@ private:
  std::atomic<DatasetCompilePhase> phase_{DatasetCompilePhase::Planning};
  std::atomic<std::uint64_t> dropped_instances_{0U};
  CompileProgressObserver observer_{};
- std::atomic<std::size_t> published_counter_quantum_{0U};
  std::mutex publication_mutex_;
  const Now now_ = &Clock::now;
  std::atomic<Clock::duration::rep> started_at_rep_;
+ std::unique_ptr<detail::CompileProgressDelivery<CompileProgress>> delivery_;
  friend class DatasetCompiler;
  friend struct compiler_internal::ProgressCounter;
 };

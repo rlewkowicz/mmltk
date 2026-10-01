@@ -346,6 +346,11 @@ where
         }
     }
 
+    /// Returns the bounds of the laid-out root widget.
+    pub fn root_bounds(&self) -> Rectangle {
+        self.base.bounds()
+    }
+
         pub fn operate(&mut self, renderer: &Renderer, operation: &mut dyn widget::Operation) {
         let viewport = Rectangle::with_size(self.bounds);
 

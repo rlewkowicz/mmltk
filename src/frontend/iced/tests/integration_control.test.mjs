@@ -1689,3 +1689,33 @@ test('Status semantic evidence retires its observer with the accepted session', 
   f.flushFrames();
   assert.deepEqual(results, [false]);
 });
+
+
+test('active compile resize waits for native progress and actual surface/root settlement without input', t => {
+  const f = canvasFixture(t, true);
+  window.innerWidth = 1280; window.innerHeight = 1024;
+  assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 2, true), true);
+  assert.equal(f.events.length, 0);
+  assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 3, false), false);
+  f.css.width = f.canvas.width = 480; f.css.height = f.canvas.height = 900;
+  window.mmltkIcedWindowState = {extent: [480, 900]};
+  const transition = {event: 'iced.window.redraw', sequence: 4, width: 480, height: 900, pending_resize: false};
+  window.mmltkIntegrationWindowTrace(transition);
+  browser.mmltkIntegrationCompileRoot(1, 3, 0, 0, 480, 900, 1);
+  assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 3, false), false);
+  window.mmltkIntegrationWindowTrace({event: 'iced.window.root', sequence: 5, root: [0, 0, 480, 900]});
+  window.mmltkIntegrationWindowTrace({...transition, event: 'iced.window.presented', sequence: 6});
+  assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 2, false), false);
+  assert.equal(browser.mmltkIntegrationCompileResize(0, 1, 3, false), true);
+  assert.equal(f.events.length, 0);
+  const report = f.reports.find(value => value.event === 'integration.compile_resize');
+  assert.equal(JSON.parse(report.detail).inputs, 0);
+  assert.equal(browser.mmltkIntegrationCompileResize(1, 1, 3, true), true);
+  f.input('wheel');
+  f.css.width = f.canvas.width = 960; f.css.height = f.canvas.height = 720;
+  window.mmltkIcedWindowState.extent = [960, 720];
+  browser.mmltkIntegrationCompileRoot(1, 4, 0, 0, 960, 720, 1);
+  window.mmltkIntegrationWindowTrace({event: 'iced.window.root', sequence: 7, root: [0, 0, 960, 720]});
+  window.mmltkIntegrationWindowTrace({...transition, event: 'iced.window.presented', sequence: 8, width: 960, height: 720});
+  assert.equal(browser.mmltkIntegrationCompileResize(1, 1, 4, false), false);
+});

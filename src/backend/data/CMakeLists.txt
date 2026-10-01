@@ -157,6 +157,7 @@ mmltk_register_private_headers(mmltk_backend_data
     detail/compile_image_decoder.h
     detail/compile_pixel_workspace.h
     detail/compiled_label_workspace.h
+    detail/compile_progress_delivery.h
     detail/compile_execution.h
     detail/compile_resources.h
     detail/compile_admission.h

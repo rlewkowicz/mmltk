@@ -2437,6 +2437,34 @@ void native_dataset_frame(BrowserAudit& audit, std::uint64_t generation, std::st
  audit.consume({{"event", "integration.dataset_frame"}, {"a", defect == "fixture" ? 200U : defect == "completed" ? 102U : 100U}});
 }
 }  // namespace
+namespace {
+void native_compile_resizes(BrowserAudit& audit, std::uint64_t generation, std::string_view defect = "none") {
+ for (unsigned step = 0; step < 4; ++step) {
+  const unsigned width = step == 0 ? 480 : 960, height = step == 0 ? 900 : 720;
+  nlohmann::json facts{{"step", step}, {"generation", generation}, {"before_revision", 2U}, {"revision", 3U}, {"root_revision", 3U},
+   {"css", {width, height}}, {"backing", {width, height}}, {"configured", {width, height}}, {"root", {0, 0, width, height}}, {"ui_root", {0, 0, width, height}},
+   {"root_scale", 1}, {"device_scale", 1}, {"inputs", 0}, {"viewport", {width, height}}, {"prior_viewport", {1280, 1024}},
+   {"transition", {{"event", "iced.window.presented"}, {"pending_resize", false}, {"width", width}, {"height", height}}}};
+  if (defect == "stale-ui-root") facts["ui_root"][2] = width - 100;
+  if (defect == "stale-root") facts["root"][2] = width - 100;
+  if (defect == "stale-configure") facts["configured"][1] = height - 1;
+  if (defect == "input-wakeup") facts["inputs"] = 1;
+  if (defect == "stale-progress") facts["revision"] = 2;
+  if (defect == "pending-resize") facts["transition"]["pending_resize"] = true;
+  if (defect == "no-present") facts["transition"]["event"] = "iced.window.requested";
+  if (defect == "unchanged-viewport") facts["prior_viewport"] = facts["viewport"];
+  audit.consume({{"event", "integration.compile_resize"}, {"control", "train.compile_dataset.progress"}, {"detail", facts.dump()}});
+ }
+}
+}
+TEST_CASE("active compile resize evidence requires progress actual presentation and root coverage", "[workspace][audit]") {
+ for (const std::string defect : {"none", "stale-root", "stale-ui-root", "stale-configure", "input-wakeup", "stale-progress", "pending-resize", "no-present", "unchanged-viewport"}) {
+  BrowserAudit audit;
+  native_dataset_frame(audit, 1U);
+  native_compile_resizes(audit, 1U, defect);
+  CHECK(audit.compile_resize_complete(1U) == (defect == "none"));
+ }
+}
 TEST_CASE("native drawn work requires correlated exact captions and track meaning", "[workspace][audit]") {
  for (const std::string defect : {"none", "opening", "missing-work", "wrong-work", "wrong-grouping", "empty-status", "wrong-status", "wrong-generation", "missing-facts", "fixture", "completed"}) {
   BrowserAudit audit;
@@ -2466,10 +2494,12 @@ TEST_CASE("successful compile cannot replace real active cancellation and restar
  audit.consume({{"event", "integration.dataset_complete"}, {"a", 1U}});
  CHECK_FALSE(audit.dataset_complete);
  native_dataset_frame(audit, 1U);
+ native_compile_resizes(audit, 1U);
  audit.consume({{"event", "integration.compile_cancelled"}, {"detail", "native-inactive"}, {"a", 1U}, {"b", 0U}});
  audit.consume({{"event", "integration.dataset_complete"}, {"a", 2U}});
  CHECK_FALSE(audit.dataset_complete);
  native_dataset_frame(audit, 2U);
+ native_compile_resizes(audit, 2U);
  audit.consume({{"event", "integration.dataset_complete"}, {"a", 2U}});
  CHECK(audit.dataset_complete);
  // The terminal status reuses the progress widget, but belongs to a later layout.

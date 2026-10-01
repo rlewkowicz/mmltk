@@ -703,6 +703,7 @@ private:
    using Signature = mmltk::controller::browser::SystemMethodSignature<decltype(&[:Snapshot:])>;
    EmitType<typename Signature::result_type>();
    EmitSnapshotFieldComparison<typename Signature::result_type>();
+   if constexpr (requires { typename SystemCell::type::progress_type; }) { EmitRecordProjection<typename Signature::result_type, typename SystemCell::type::progress_type>(true, true); }
   });
   Schema::VisitEndpoints([&]<class Endpoint>() {
    if constexpr (Endpoint::signature::has_request) EmitType<typename Endpoint::request_type>();
@@ -1307,7 +1308,6 @@ private:
  void EmitImageMetadata() {
   Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
    EmitRecordProjection<typename Projection::snapshot_type, typename Projection::image_type>(false, false);
-   if constexpr (requires { typename Cell::type::progress_type; }) { EmitRecordProjection<typename Projection::snapshot_type, typename Cell::type::progress_type>(true, true); }
   });
   symbols_.Reserve("module", "WorkspaceImageProduct", "canonical visual source image projections");
   symbols_.Reserve("module", "decode_workspace_image_product", "canonical visual source image projections");

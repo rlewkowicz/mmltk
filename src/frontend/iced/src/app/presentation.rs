@@ -509,6 +509,10 @@ impl App {
                 self.model.scale_factor = f64::from(scale_factor);
             }
             iced::window::Event::Resized(size) => {
+                #[cfg(target_arch = "wasm32")]
+                if crate::presentation_surface::surface_trace_enabled() {
+                    crate::presentation_surface::emit_surface_trace(&format!("{{\"event\":\"iced.window.model_resize\",\"width\":{},\"height\":{}}}", size.width, size.height));
+                }
                 self.model.window_width = size.width as u32;
                 self.model.window_height = size.height as u32;
             }

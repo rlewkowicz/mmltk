@@ -57,6 +57,25 @@ use wasm_bindgen::prelude::wasm_bindgen;
 extern "C" {
     #[wasm_bindgen(js_namespace = window, js_name = mmltkRecoverWebGpu)]
     fn request_webgpu_recovery(reason: &str);
+    #[wasm_bindgen(js_namespace = window, js_name = mmltkIcedWindowTraceEnabled)]
+    fn window_trace_enabled() -> bool;
+    #[wasm_bindgen(js_namespace = window, js_name = mmltkIcedWindowTrace)]
+    fn window_trace(stage: &str, width: u32, height: u32, logical_width: f32, logical_height: f32, pending: bool);
+    #[wasm_bindgen(js_namespace = window, js_name = mmltkIcedRootTrace)]
+    fn root_trace(x: f32, y: f32, width: f32, height: f32);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn trace_window<P, C>(stage: &str, window: &window::Window<P, C>)
+where
+    P: Program,
+    C: Compositor<Renderer = P::Renderer>,
+    P::Theme: theme::Base,
+{
+    if !window_trace_enabled() { return; }
+    let physical = window.state.physical_size();
+    let logical = window.state.logical_size();
+    window_trace(stage, physical.width, physical.height, logical.width, logical.height, window.pending_resize.is_some());
 }
 
 pub fn run<P>(program: P) -> Result<(), Error>
@@ -672,6 +691,8 @@ async fn run_instance<P>(
                     event::Event::NewEvents(event::StartCause::Init) => {
                         for (_id, window) in window_manager.iter_mut() {
                             window.raw.request_redraw();
+                            #[cfg(target_arch = "wasm32")]
+                            trace_window("requested", &window);
                         }
                     }
                     event::Event::NewEvents(event::StartCause::ResumeTimeReached { .. }) => {
@@ -682,6 +703,8 @@ async fn run_instance<P>(
                                 && redraw_at <= now
                             {
                                 window.raw.request_redraw();
+                                #[cfg(target_arch = "wasm32")]
+                                trace_window("requested", &window);
                                 window.redraw_at = None;
                             }
                         }
@@ -737,7 +760,17 @@ async fn run_instance<P>(
                         };
 
                         #[cfg(target_arch = "wasm32")]
+                        if window_trace_enabled() {
+                            let physical = window.state.physical_size();
+                            let logical = window.state.logical_size();
+                            window_trace("redraw", physical.width, physical.height, logical.width, logical.height, window.pending_resize.is_some());
+                        }
+
+                        #[cfg(target_arch = "wasm32")]
                         if let Some(new_size) = window.pending_resize.take() {
+                            if window_trace_enabled() {
+                                window_trace("resize_applied", new_size.width, new_size.height, 0.0, 0.0, false);
+                            }
                             let resized = winit::event::WindowEvent::Resized(new_size);
 
                             window.state.update(&program, &window.raw, &resized);
@@ -776,6 +809,10 @@ async fn run_instance<P>(
                             );
 
                             window.surface_version = window.state.surface_version();
+                            #[cfg(target_arch = "wasm32")]
+                            if window_trace_enabled() {
+                                window_trace("configured", physical_size.width, physical_size.height, logical_size.width, logical_size.height, false);
+                            }
                         }
 
                         let redraw_event =
@@ -862,6 +899,8 @@ async fn run_instance<P>(
                                     }
 
                                     window.raw.request_redraw();
+                                    #[cfg(target_arch = "wasm32")]
+                                    trace_window("requested", &window);
                                 }
 
                                 let Some(next_compositor) = compositor.as_mut() else {
@@ -904,6 +943,12 @@ async fn run_instance<P>(
                             cursor,
                         );
                         draw_span.finish();
+                        #[cfg(target_arch = "wasm32")]
+                        if window_trace_enabled() {
+                            let bounds = interface.root_bounds();
+                            root_trace(bounds.x, bounds.y, bounds.width, bounds.height);
+                            window_trace("draw", physical_size.width, physical_size.height, logical_size.width, logical_size.height, window.pending_resize.is_some());
+                        }
 
                         if let user_interface::State::Updated {
                             redraw_request,
@@ -938,6 +983,8 @@ async fn run_instance<P>(
                         ) {
                             Ok(()) => {
                                 present_span.finish();
+                                #[cfg(target_arch = "wasm32")]
+                                trace_window("presented", &window);
                             }
                             Err(error) => match error {
                                 compositor::SurfaceError::OutOfMemory => {
@@ -979,6 +1026,8 @@ async fn run_instance<P>(
                                     }
 
                                     window.raw.request_redraw();
+                                    #[cfg(target_arch = "wasm32")]
+                                    trace_window("requested", &window);
                                 }
                                 compositor::SurfaceError::Occluded => {
                                     present_span.finish();
@@ -991,6 +1040,8 @@ async fn run_instance<P>(
 
                                     for (_id, window) in window_manager.iter_mut() {
                                         window.raw.request_redraw();
+                                        #[cfg(target_arch = "wasm32")]
+                                        trace_window("requested", &window);
                                     }
                                 }
                             },
@@ -1019,6 +1070,9 @@ async fn run_instance<P>(
                         #[cfg(target_arch = "wasm32")]
                         if let winit::event::WindowEvent::Resized(new_size) = &window_event {
                             window.pending_resize = Some(*new_size);
+                            if window_trace_enabled() {
+                                window_trace("resize_pending", new_size.width, new_size.height, 0.0, 0.0, true);
+                            }
                             continue;
                         }
 
@@ -1026,6 +1080,8 @@ async fn run_instance<P>(
                             winit::event::WindowEvent::Resized(_)
                             | winit::event::WindowEvent::Occluded(false) => {
                                 window.raw.request_redraw();
+                                #[cfg(target_arch = "wasm32")]
+                                trace_window("requested", &window);
                             }
                             winit::event::WindowEvent::ThemeChanged(theme) => {
                                 let mode = conversion::theme_mode(theme);
@@ -1197,6 +1253,8 @@ async fn run_instance<P>(
 
                             for (_id, window) in window_manager.iter_mut() {
                                 window.raw.request_redraw();
+                                #[cfg(target_arch = "wasm32")]
+                                trace_window("requested", &window);
                             }
                         }
 
@@ -1607,6 +1665,8 @@ fn run_action<'a, P, C>(
             window::Action::RedrawAll => {
                 for (_id, window) in window_manager.iter_mut() {
                     window.raw.request_redraw();
+                    #[cfg(target_arch = "wasm32")]
+                    trace_window("requested", &window);
                 }
             }
             window::Action::RelayoutAll => {
@@ -1619,6 +1679,8 @@ fn run_action<'a, P, C>(
                     }
 
                     window.raw.request_redraw();
+                    #[cfg(target_arch = "wasm32")]
+                    trace_window("requested", &window);
                 }
             }
         },
@@ -1693,6 +1755,8 @@ fn run_action<'a, P, C>(
                     let _ = interfaces.insert(id, ui);
 
                     window.raw.request_redraw();
+                    #[cfg(target_arch = "wasm32")]
+                    trace_window("requested", &window);
                 }
             }
         },
@@ -1717,6 +1781,8 @@ fn run_action<'a, P, C>(
 
             for (_, window) in window_manager.iter_mut() {
                 window.raw.request_redraw();
+                #[cfg(target_arch = "wasm32")]
+                trace_window("requested", &window);
             }
         }
         Action::Image(action) => match action {
@@ -1796,6 +1862,8 @@ fn run_action<'a, P, C>(
                 );
 
                 window.raw.request_redraw();
+                #[cfg(target_arch = "wasm32")]
+                trace_window("requested", &window);
             }
         }
         Action::Exit => {

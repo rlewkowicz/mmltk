@@ -29,6 +29,7 @@ export function mmltkIntegrationInitialize(enabled) {
       const retired = integrationState;
       integrationState = undefined;
       delete window.mmltkIntegrationRecovery;
+      delete window.mmltkIntegrationWindowTrace;
       for (const complete of retired.completions) complete('invalidated', 0, 0);
     }
     return;
@@ -61,6 +62,12 @@ export function mmltkIntegrationInitialize(enabled) {
     onInput: undefined,
   };
   const owner = integrationState;
+  window.mmltkIntegrationWindowTrace = record => {
+    if (integrationState !== owner) return;
+    owner.windowTransition = record;
+    if (record.event === "iced.window.presented") owner.windowDraw = record;
+    if (record.event === "iced.window.root") owner.windowRoot = record;
+  };
   window.mmltkIntegrationRecovery = (message, manual) => {
     if (integrationState !== owner) return;
     const overlay = document.getElementById('mmltk-recovery');
@@ -72,6 +79,9 @@ export function mmltkIntegrationInitialize(enabled) {
   integrationState.onInput = (event) => {
     if (integrationState !== owner) return;
     ++owner.statusInput;
+    if (owner.compileResize && ['pointermove', 'pointerdown', 'pointerup', 'wheel', 'keydown'].includes(event.type)) {
+      ++owner.compileResize.inputs;
+    }
     if (event.type !== 'pointermove' || event.buttons) ++owner.primaryInput;
     if (!integrationState.initialAtlasWithoutInput || event.type === 'resize') return;
     integrationState.initialAtlasInputCount++;
@@ -1129,19 +1139,6 @@ export function mmltkIntegrationFullscreen(enabled) {
   request.then(() => {
     if (integrationDriver !== owner) return;
     integrationDriver.integrationFullscreenSettled = true;
-    window.dispatchEvent(new Event('resize'));
-    const canvas = document.querySelector('canvas');
-    if (canvas) {
-      const rect = canvas.getBoundingClientRect();
-      canvas.dispatchEvent(new WheelEvent('wheel', {
-        bubbles: true,
-        cancelable: true,
-        clientX: rect.left + rect.width * 0.5,
-        clientY: rect.top + rect.height * 0.5,
-        deltaY: 0,
-        deltaMode: WheelEvent.DOM_DELTA_PIXEL,
-      }));
-    }
     if (integrationState) report({event: 'integration.atlas_window', control: 'explore.gallery.workspace',
       detail: enabled ? 'fullscreen' : 'restored', a: String(window.innerWidth),
       b: String(window.innerHeight), c: String(window.devicePixelRatio), d: String(Number(!!document.fullscreenElement))});
@@ -1151,6 +1148,56 @@ export function mmltkIntegrationFullscreen(enabled) {
       '; activation=' + (navigator.userActivation?.isActive ?? 'unavailable'),
     a: '0', b: '0', c: '0', d: '0'}); });
 }
+// A real native compile owns this short resize sequence. Root observations are
+// made during Iced draw; checks run on existing scenario events without input.
+export function mmltkIntegrationCompileResize(step, generation, revision, begin) {
+  const owner = integrationState;
+  if (!owner || !integrationDriver) return false;
+  if (begin) {
+    const canvas = document.querySelector('canvas');
+    if (!canvas) return false;
+    owner.compileResize = {step, generation, revision, inputs: 0,
+      sequence: owner.windowTransition?.sequence ?? 0, viewport: [window.innerWidth, window.innerHeight]};
+    if (step < 2) return mmltkIntegrationCanvasSize(step === 0 ? 480 : 960, step === 0 ? 900 : 720);
+    mmltkIntegrationRestoreCanvasSize();
+    mmltkIntegrationFullscreen(step === 2);
+    return true;
+  }
+  const request = owner.compileResize;
+  const transition = owner.windowDraw;
+  const root = request?.root;
+  const uiRoot = owner.windowRoot;
+  const canvas = document.querySelector('canvas');
+  if (!request || request.step !== step || request.generation !== generation || !canvas || !root || !uiRoot || uiRoot.sequence <= request.sequence ||
+      revision <= request.revision || root.revision <= request.revision || !transition ||
+      transition.sequence <= request.sequence || transition.sequence <= root.before_draw || transition.event !== 'iced.window.presented') return false;
+  const css = canvas.getBoundingClientRect(), scale = window.devicePixelRatio;
+  const sized = step < 2 ? mmltkIntegrationCanvasSizeSettled(step === 0 ? 480 : 960, step === 0 ? 900 : 720) :
+    mmltkIntegrationFullscreenSettled(step === 2) && (window.innerWidth !== request.viewport[0] || window.innerHeight !== request.viewport[1]);
+  const configured = window.mmltkIcedWindowState?.extent;
+  const actualRoot = uiRoot.root;
+  const covers = Array.isArray(actualRoot) && actualRoot.length === 4 &&
+    actualRoot.every((value, index) => Math.abs(value - [root.x, root.y, root.width, root.height][index]) < 1) &&
+    Math.abs(root.x) < 1 && Math.abs(root.y) < 1 &&
+    Math.abs(root.width * root.scale - canvas.width) <= 2 && Math.abs(root.height * root.scale - canvas.height) <= 2;
+  if (!sized || !covers || request.inputs || transition.pending_resize ||
+      Math.abs(canvas.width - css.width * scale) > 1 || Math.abs(canvas.height - css.height * scale) > 1 ||
+      configured?.[0] !== canvas.width || configured?.[1] !== canvas.height ||
+      transition.width !== canvas.width || transition.height !== canvas.height) return false;
+  report({event: 'integration.compile_resize', control: 'train.compile_dataset.progress',
+    detail: JSON.stringify({step, generation, before_revision: request.revision, revision, root_revision: root.revision,
+      css: [css.width, css.height], backing: [canvas.width, canvas.height], viewport: [window.innerWidth, window.innerHeight],
+      prior_viewport: request.viewport, configured, ui_root: actualRoot, root: [root.x, root.y, root.width, root.height],
+      root_scale: root.scale, device_scale: scale, inputs: request.inputs, transition})});
+  owner.compileResize = undefined;
+  return true;
+}
+export function mmltkIntegrationCompileRoot(generation, revision, x, y, width, height, scale) {
+  const request = integrationState?.compileResize;
+  if (!request || request.generation !== generation) return;
+  request.root = {revision, x, y, width, height, scale, before_draw: integrationState.windowTransition?.sequence ?? 0};
+}
+
 export function mmltkIntegrationFullscreenSettled(enabled) {
   return integrationDriver.integrationFullscreenSettled && !!document.fullscreenElement === enabled;
 }

@@ -390,6 +390,15 @@ TEST_CASE("artifact compile adapters preserve canonical ordinary and benchmark e
  CHECK(projected_ordinary.throughput_per_second == 5U);
  CHECK(projected_ordinary.dropped_instances == 7U);
  CHECK(projected_ordinary.tracks == ordinary.tracks);
+ auto finalizing = ordinary;
+ finalizing.phase = data::DatasetCompilePhase::Compacting;
+ finalizing.compacted_bytes = 128;
+ finalizing.compaction_bytes = 512;
+ const auto compaction = project_artifact_progress(finalizing);
+ CHECK(compaction.completed == 128);
+ CHECK(compaction.total == 512);
+ CHECK(compaction.tracks == ordinary.tracks);
+ CHECK(compaction.phase == data::DatasetCompilePhase::Compacting);
  data::BenchmarkCompileProgress benchmark{
   .phase = data::DatasetCompilePhase::Pixels,
   .activity = "Downloading",

@@ -145,6 +145,7 @@ private:
    }}
    };
    mmltk::backend::data::DatasetCompiler::compile(plan, split, &telemetry, cancellation);
+   telemetry.flush();  // Retire this split's observer before its captures and terminal state.
    if (cancellation.requested()) return;
   }
  }

@@ -117,6 +117,7 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
  std::atomic_bool running = false;
  std::atomic_bool connected = false;
  std::atomic_bool finalization_required = false;
+ std::atomic_size_t pending_coalesced{0U}, pending_stale{0U}, pending_high_water{0U};
  std::atomic_size_t pending_enqueued = 0U;
  std::atomic_size_t pending_transient_dropped = 0U;
  std::atomic_size_t pending_critical_closed = 0U;
@@ -215,6 +216,9 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
  }
  void flush_worker_diagnostics() noexcept {
   if (callbacks.diagnostic == nullptr) return;
+  if (const auto count = pending_coalesced.exchange(0U, std::memory_order_acq_rel); count != 0U) trace(BrowserServerEvent::RecordCoalesced, count);
+  if (const auto count = pending_stale.exchange(0U, std::memory_order_acq_rel); count != 0U) trace(BrowserServerEvent::StaleStateDiscarded, count);
+  if (const auto count = pending_high_water.exchange(0U, std::memory_order_acq_rel); count != 0U) trace(BrowserServerEvent::QueueHighWater, count);
   if (const auto count = pending_invalid.exchange(0U, std::memory_order_acq_rel); count != 0U) trace(BrowserServerEvent::InvalidMessage, count);
   if (const auto count = pending_transient_dropped.exchange(0U, std::memory_order_acq_rel); count != 0U) trace(BrowserServerEvent::TransientDropped, count);
   if (const auto count = pending_critical_closed.exchange(0U, std::memory_order_acq_rel); count != 0U) trace(BrowserServerEvent::CriticalCapacityClosed, count);
@@ -313,7 +317,14 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
    return BrowserRecordPush::Dropped;
   }
   if (!request_wake_locked()) return critical ? BrowserRecordPush::ClosePeer : BrowserRecordPush::Dropped;
-  const BrowserRecordPush result = output.push(std::move(record));
+  BrowserRecordObservation observation;
+  const BrowserRecordPush result = output.push(std::move(record), callbacks.diagnostic != nullptr ? &observation : nullptr);
+  if (callbacks.diagnostic != nullptr) {
+   pending_coalesced.fetch_add(observation.coalesced, std::memory_order_relaxed);
+   pending_stale.fetch_add(observation.stale, std::memory_order_relaxed);
+   auto previous = pending_high_water.load(std::memory_order_relaxed);
+   while (previous < observation.occupancy && !pending_high_water.compare_exchange_weak(previous, observation.occupancy, std::memory_order_relaxed)) {}
+  }
   switch (result) {
    case BrowserRecordPush::Enqueued:
     if (callbacks.diagnostic != nullptr) pending_enqueued.fetch_add(1U, std::memory_order_relaxed);

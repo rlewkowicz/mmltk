@@ -38,11 +38,18 @@ TEST_CASE("latest complete state replaces pending state after ordered edges", "[
  for (std::size_t index = 1U; index < kBrowserRecordRingCapacity; ++index) REQUIRE(ring.push(record(BrowserRecordPriority::Critical)) == BrowserRecordPush::Enqueued);
  snapshot.bytes[0] = std::byte{0x02};
  snapshot.state_revision = 2U;
- REQUIRE(ring.push(snapshot) == BrowserRecordPush::Enqueued);
+ BrowserRecordObservation observation;
+ REQUIRE(ring.push(snapshot, &observation) == BrowserRecordPush::Enqueued);
+ CHECK(observation.coalesced);
+ CHECK_FALSE(observation.stale);
+ CHECK(observation.occupancy == kBrowserRecordRingCapacity);
  auto stale = snapshot;
  stale.state_revision = 1U;
  stale.bytes[0] = std::byte{0x01};
- REQUIRE(ring.push(std::move(stale)) == BrowserRecordPush::Enqueued);
+ REQUIRE(ring.push(std::move(stale), &observation) == BrowserRecordPush::Enqueued);
+ CHECK(observation.stale);
+ CHECK_FALSE(observation.coalesced);
+ CHECK(observation.occupancy == kBrowserRecordRingCapacity);
  CHECK(ring.size() == kBrowserRecordRingCapacity);
  for (std::size_t index = 1U; index < kBrowserRecordRingCapacity; ++index) {
   const auto edge = ring.pop();

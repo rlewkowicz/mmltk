@@ -39,6 +39,8 @@ pub(super) struct State {
     ui_scale_first: Option<f32>,
     primary_pixels: std::collections::BTreeSet<String>,
     cancelled_generation: u64,
+    compile_resize_step: u8,
+    compile_resize_pending: bool,
     fixtures_complete: bool,
     status_notice: u64,
     status_fixture: bool,
@@ -65,6 +67,8 @@ impl Default for State {
             ui_scale_first: None,
             primary_pixels: std::collections::BTreeSet::new(),
             cancelled_generation: 0,
+            compile_resize_step: 0,
+            compile_resize_pending: false,
             fixtures_complete: false,
             status_notice: 0,
             status_fixture: false,
@@ -1309,6 +1313,8 @@ impl State {
                             ],
                         )
                     });
+                    self.compile_resize_step = 0;
+                    self.compile_resize_pending = false;
                     driver.phase = Phase::CompileProgress;
                     return driver.advance_to(Phase::CompileProgress);
                 }
@@ -1363,6 +1369,25 @@ impl State {
                             .iter()
                             .all(|id| frame.row(id).is_some())
                 }) {
+                    return Task::none();
+                }
+                #[cfg(target_arch = "wasm32")]
+                if self.compile_resize_step < 4 {
+                    let dataset = model.workflow.dataset.as_ref().unwrap();
+                    if !self.compile_resize_pending {
+                        if !super::dataset_presentation::compile_resize(self.compile_resize_step, dataset.generation as f64, dataset.revision as f64, true) {
+                            driver.fail("Active compile resize request failed");
+                        } else {
+                            self.compile_resize_pending = true;
+                            self.presentation.stable = 0;
+                        }
+                        return Task::none();
+                    }
+                    if !super::dataset_presentation::compile_resize(self.compile_resize_step, dataset.generation as f64, dataset.revision as f64, false) {
+                        return Task::none();
+                    }
+                    self.compile_resize_step += 1;
+                    self.compile_resize_pending = false;
                     return Task::none();
                 }
                 widgets.arm(driver, COMPILE_PROGRESS)

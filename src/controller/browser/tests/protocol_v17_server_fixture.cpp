@@ -152,6 +152,14 @@ int main(const int argument_count, char* const* const arguments) {
   },
   IntegrationControl{.receipt = {.kind = contracts::IntegrationControlKind::Advance, .sequence = 2U}},
  };
+ contracts::ArtifactCompileState compile_state;
+ compile_state.revision = 17U;
+ compile_state.generation = 2U;
+ compile_state.active = true;
+ compile_state.progress.phase = contracts::ArtifactCompilePhase::Pixels;
+ compile_state.progress.completed = 3U;
+ compile_state.progress.total = 10U;
+ records.emplace_back(encode_system_event<&ApplicationSystems::dataset>(DatasetProgress{compile_state}));
  // An independent named persistence projection is test data, carried as a
  // dynamic value. The client compares every decoded transport field against
  // it through the separate named codec, without a handwritten field mirror.

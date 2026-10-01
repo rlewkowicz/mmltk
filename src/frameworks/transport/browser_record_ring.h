@@ -24,13 +24,17 @@ struct BrowserOutputRecord final {
  std::uint64_t state_event = 0U;
  std::uint64_t state_revision = 0U;
 };
+struct BrowserRecordObservation final {
+ bool coalesced = false, stale = false;
+ std::size_t occupancy = 0;
+};
 // The ring has one uWebSockets-loop consumer and any number of system-worker
 // producers. Storage is allocated once; indices and occupancy remain bounded.
 // The short mutex section moves an already encoded record and never performs
 // socket work.
 class BrowserRecordRing final {
 public:
- [[nodiscard]] BrowserRecordPush push(BrowserOutputRecord record);
+ [[nodiscard]] BrowserRecordPush push(BrowserOutputRecord record, BrowserRecordObservation* observation = nullptr);
  [[nodiscard]] std::optional<BrowserOutputRecord> pop();
  void clear() noexcept;
  [[nodiscard]] std::size_t size() const noexcept;

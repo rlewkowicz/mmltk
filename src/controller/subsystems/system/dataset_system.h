@@ -16,11 +16,8 @@
 #include "src/controller/services/settings/settings_system.h"
 #include "src/controller/runtime/local_run.h"
 namespace mmltk::controller {
-struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] DatasetProgress final {
- std::uint64_t generation = 0U;
- bool active = false;
- contracts::ArtifactTerminal terminal{};
- contracts::ArtifactProgress progress{};
+struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] DatasetProgress final {
+ contracts::ArtifactCompileState snapshot{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] DatasetChanged final {
  contracts::ArtifactUiState snapshot{};
@@ -45,6 +42,7 @@ private:
 class DatasetSystem final {
 public:
  using event_type = std::variant<DatasetProgress, DatasetChanged>;
+ using progress_type = contracts::ArtifactCompileState;
  using RuntimeFactory = std::function<std::unique_ptr<DatasetRuntime>()>;
  DatasetSystem(SettingsSystem&, RuntimeFactory, SystemEventSink<event_type> = {});
  ~DatasetSystem();

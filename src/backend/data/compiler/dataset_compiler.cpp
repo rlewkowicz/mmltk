@@ -31,6 +31,7 @@ namespace mmltk::backend::data {
 using mmltk::common::io::FileHandle;
 using mmltk::common::io::publish_staged_path_atomically;
 using mmltk::common::system::allowed_cpu_set;
+using DeliveryMode = detail::CompileProgressDeliveryMode;
 ProgressEstimate estimate_progress(const std::uint64_t completed, const std::uint64_t total, const std::uint64_t elapsed_seconds) noexcept {
  if (elapsed_seconds == 0U || completed == 0U) { return {}; }
  const std::uint64_t throughput = completed / elapsed_seconds;
@@ -40,13 +41,30 @@ ProgressEstimate estimate_progress(const std::uint64_t completed, const std::uin
   .remaining_seconds = remaining > std::numeric_limits<std::uint64_t>::max() ? std::numeric_limits<std::uint64_t>::max() : static_cast<std::uint64_t>(remaining), .throughput_per_second = throughput
  };
 }
+CompileTelemetry::CompileTelemetry() noexcept : started_at_rep_(now_().time_since_epoch().count()) {}
+CompileTelemetry::CompileTelemetry(size_t num_images, CompileProgressObserver observer, Now now)
+ : num_images_(num_images), observer_(observer), now_(now), started_at_rep_(now_().time_since_epoch().count()) {
+ if (!observer_.report) return;
+ using Delivery = detail::CompileProgressDelivery<CompileProgress>;
+ const bool diagnostic = mmltk::common::logging::enabled(spdlog::level::trace);
+ delivery_ = std::make_unique<Delivery>(publication_mutex_, [this] { return snapshot(); },
+  [this](const CompileProgress& value) { observer_(value); }, Delivery::Failure{},
+  diagnostic ? Delivery::Diagnostic{[](const Delivery::Counts& counts) {
+   mmltk::common::logging::trace([&](spdlog::logger& log) { log.trace("compiler.progress.delivery produced={} materialized={} coalesced={} delivered={} pending={} high_water={}",
+    counts.produced, counts.materialized, counts.coalesced, counts.delivered, counts.pending, counts.high_water); });
+  }} : Delivery::Diagnostic{});
+}
+CompileTelemetry::~CompileTelemetry() { delivery_.reset(); }
+void CompileTelemetry::flush() { if (delivery_) delivery_->flush(); }
 CompileProgress CompileTelemetry::snapshot() const noexcept { return snapshot(phase_.load(std::memory_order_relaxed)); }
-CompileProgress CompileTelemetry::snapshot(const DatasetCompilePhase phase) const noexcept {
+CompileProgress CompileTelemetry::snapshot(DatasetCompilePhase phase) const noexcept {
  const size_t num_images = num_images_.load(std::memory_order_relaxed);
  const size_t label_done = std::min(labels_.done.load(std::memory_order_relaxed), num_images);
  const size_t pixel_done = std::min(pixels_.done.load(std::memory_order_relaxed), num_images);
  const size_t label_active = labels_.active_workers.load(std::memory_order_relaxed);
  const size_t pixel_active = pixels_.active_workers.load(std::memory_order_relaxed);
+ if (phase == DatasetCompilePhase::Labels || phase == DatasetCompilePhase::Pixels)
+  phase = label_done < num_images ? DatasetCompilePhase::Labels : DatasetCompilePhase::Pixels;
  const size_t total = num_images * 2U + 1U;
  const Clock::duration::rep started_at_rep = started_at_rep_.load(std::memory_order_relaxed);
  const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now_().time_since_epoch() - Clock::duration{started_at_rep}).count();
@@ -104,18 +122,17 @@ void CompileTelemetry::reset(const size_t num_images) noexcept {
  compaction_bytes_.store(0U, std::memory_order_relaxed);
  dropped_instances_.store(0U, std::memory_order_relaxed);
  num_images_.store(num_images, std::memory_order_relaxed);
- published_counter_quantum_.store(0U, std::memory_order_relaxed);
  const Clock::duration::rep started_at_rep = now_().time_since_epoch().count();
  started_at_rep_.store(started_at_rep, std::memory_order_relaxed);
  publish_semantic(DatasetCompilePhase::Planning);
 }
 void CompileTelemetry::add_label_done(const size_t count) noexcept {
- labels_.done.fetch_add(count, std::memory_order_relaxed);
- publish_counter();
+ const auto done = labels_.done.fetch_add(count, std::memory_order_relaxed) + count;
+ publish_counter(done == num_images_.load(std::memory_order_relaxed));
 }
 void CompileTelemetry::add_pixel_done(const size_t count) noexcept {
- pixels_.done.fetch_add(count, std::memory_order_relaxed);
- publish_counter();
+ const auto done = pixels_.done.fetch_add(count, std::memory_order_relaxed) + count;
+ publish_counter(done == num_images_.load(std::memory_order_relaxed));
 }
 void CompileTelemetry::enter_labels() noexcept { publish_semantic(DatasetCompilePhase::Labels); }
 void CompileTelemetry::enter_pixels() noexcept { publish_semantic(DatasetCompilePhase::Pixels); }
@@ -129,7 +146,7 @@ void CompileTelemetry::compacting(std::size_t done, std::size_t total) noexcept 
  compacted_bytes_.store(done, std::memory_order_relaxed);
  compaction_bytes_.store(total, std::memory_order_relaxed);
  phase_.store(DatasetCompilePhase::Compacting, std::memory_order_relaxed);
- if (observer_.report) observer_(snapshot(DatasetCompilePhase::Compacting));
+ if (delivery_) delivery_->changed(done == 0 || done == total ? DeliveryMode::Boundary : DeliveryMode::Dirty);
 }
 void CompileTelemetry::enter_publishing() noexcept { publish_semantic(DatasetCompilePhase::Publishing); }
 void CompileTelemetry::set_dropped_instances(const std::uint64_t count) noexcept {
@@ -139,17 +156,12 @@ void CompileTelemetry::set_dropped_instances(const std::uint64_t count) noexcept
 void CompileTelemetry::publish_semantic(const DatasetCompilePhase phase) noexcept {
  const std::lock_guard lock(publication_mutex_);
  phase_.store(phase, std::memory_order_relaxed);
- if (observer_.report != nullptr) { observer_(snapshot(phase)); }
+ if (delivery_) delivery_->changed(DeliveryMode::Lifecycle);
 }
-void CompileTelemetry::publish_counter() noexcept {
- if (observer_.report == nullptr) return;
- constexpr std::size_t kCounterQuantum = 64U;
- const std::size_t completed = labels_.done.load(std::memory_order_relaxed) + pixels_.done.load(std::memory_order_relaxed);
- const std::size_t quantum = completed / kCounterQuantum;
- std::size_t published = published_counter_quantum_.load(std::memory_order_relaxed);
- if (quantum == 0U || quantum <= published || !published_counter_quantum_.compare_exchange_strong(published, quantum, std::memory_order_relaxed)) return;
+void CompileTelemetry::publish_counter(bool boundary) noexcept {
+ if (!delivery_) return;
  const std::lock_guard lock(publication_mutex_);
- observer_(snapshot());
+ delivery_->changed(boundary ? DeliveryMode::Boundary : DeliveryMode::Dirty);
 }
 void compiler_internal::ProgressCounter::begin_worker() noexcept { update_worker_count(true); }
 void compiler_internal::ProgressCounter::update_worker_count(const bool starting) noexcept {
@@ -288,7 +300,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  }}).wait();
  compaction={};
  throw_if_cancelled();
- if (telemetry != nullptr) { telemetry->enter_publishing(); }
+ if (telemetry != nullptr) { telemetry->enter_publishing(); telemetry->flush(); }
  throw_if_cancelled();
  staged.publish(out_path,cancellation);
  mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Written {} ({:.2f} GB)", out_path.string(), static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });

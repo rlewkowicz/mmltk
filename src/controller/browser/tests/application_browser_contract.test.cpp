@@ -1,4 +1,5 @@
 #include "src/frameworks/reflection/reflected_declarations.h"
+#include "src/frameworks/reflection/record_projection.h"
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/browser/application_workspace_abi_emitter.h"
@@ -1664,4 +1665,30 @@ TEST_CASE("Maximum training source retention fits JSON process browser and boots
  STATIC_REQUIRE(r::kTrainingProgressWireBytes <= mmltk::controller::browser::kMaxOutputValueBytes);
  STATIC_REQUIRE(serial::reflected_structural_cbor_bytes<std::variant<mmltk::controller::browser::Bootstrap>>(
                  mmltk::controller::browser::ApplicationSchema<mmltk::controller::ApplicationSystems>::BootstrapPayloadBudget()) <= mmltk::controller::browser::kMaxRecordWireBytes);
+}
+
+namespace mmltk::controller::browser {
+TEST_CASE("Dataset progress projects the canonical revisioned compile state without inspection", "[controller][browser][reflection][dataset]") {
+ contracts::ArtifactUiState full;
+ full.revision = 19;
+ full.generation = 3;
+ full.active = true;
+ full.progress.phase = contracts::ArtifactCompilePhase::Pixels;
+ full.progress.completed = 9;
+ full.progress.total = 10;
+ full.inspection.detail = "inspection belongs only to full snapshots";
+ const auto progress = mmltk::frameworks::reflection::project_record<contracts::ArtifactCompileState>(full);
+ CHECK(progress == static_cast<const contracts::ArtifactCompileState&>(full));
+ const auto event = encode_system_event<&ApplicationSystems::dataset>(DatasetProgress{progress});
+ CHECK(event.delivery == contracts::reflection::EventDelivery::LatestState);
+ CHECK(event.state_revision == full.revision);
+ contracts::ArtifactCompileState roundtrip;
+ const auto projected = mmltk::frameworks::serialization::reflected_value(progress);
+ REQUIRE(projected);
+ const auto decoded = mmltk::frameworks::serialization::decode_into(roundtrip, *projected);
+ REQUIRE(decoded);
+ CHECK(roundtrip == progress);
+ const auto settled = encode_system_event<&ApplicationSystems::dataset>(DatasetChanged{full});
+ CHECK(settled.delivery == contracts::reflection::EventDelivery::Critical);
+}
 }

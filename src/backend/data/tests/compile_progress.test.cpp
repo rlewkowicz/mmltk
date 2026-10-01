@@ -39,6 +39,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
+#include "src/backend/data/compiler/detail/dataset_compiler_internal.h"
 #include "src/backend/data/loading/dataset_loader.h"
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/io/file_memory.h"
@@ -376,7 +377,7 @@ void test_compile_progress_reports_monotonic_updates() {
  CHECK(completed.dropped_instances == 0U);
  CHECK(completed.remaining_seconds == 0U);
  CHECK(observed.front().progress.elapsed_seconds == 0U);
- CHECK(main_thread_observed);
+ CHECK_FALSE(main_thread_observed);
  test_vanished_masks_retain_detection_annotations();
  test_partial_mask_vanish_keeps_instance();
  test_native_compile_letterboxes_pixels_boxes_and_masks();
@@ -1113,15 +1114,20 @@ TEST_CASE("benchmark progress drains outside producers and preserves withdrawal 
   if (updates.size() == 1) held.receipt().ArriveAndWait();
  }, quiet);
  reporter.phase(DatasetCompilePhase::Planning);
+ std::future<void> producing;
  const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); });
  REQUIRE(held.WaitEntered(std::chrono::seconds{5}));
- auto producing = std::async(std::launch::async, [&] {
+ producing = std::async(std::launch::async, [&] {
   reporter.pixels(0, 10000);
   for (std::uint64_t i = 1; i <= 4095; ++i) {
    reporter.pixel_completed();
+   reporter.source_activity(BenchmarkDatasetSource::kCoco2017, "artifact " + std::to_string(i));
    reporter.transfers().update(DownloadProgress{.artifact_id = "one", .transfer = {.completed_bytes = i, .total_bytes = 10000}}, reporter);
   }
-  reporter.invalidate_pixels(95);  // Includes the 63 not yet in a pixel quantum.
+  for (unsigned i = 0; i < 100; ++i) reporter.warning("best effort source warning");
+  for (unsigned i = 0; i < 1000; ++i)
+   reporter.transfers().update(DownloadProgress{.artifact_id = "repair-" + std::to_string(i), .transfer = {.total_bytes = 1, .attempt = 2}}, reporter);
+  reporter.invalidate_pixels(95);  // Every completed image is already accounted.
   reporter.transfers().update(DownloadProgress{.artifact_id = "one", .transfer = {.completed_bytes = 7, .total_bytes = 10000, .attempt = 2}}, reporter);
  });
  // The blocked callback cannot retain producer/reporter/source locks. Thousands
@@ -1135,7 +1141,146 @@ TEST_CASE("benchmark progress drains outside producers and preserves withdrawal 
  CHECK(updates.back().tracks.pixels.invalidated == 95);
  CHECK(updates.back().tracks.acquisition.completed == 7);
  CHECK(updates.back().tracks.acquisition.invalidated == 4088);
+ CHECK(updates.back().sources.front().retry_count == 1001);
  CHECK(std::ranges::any_of(updates, [](const auto& value) { return value.tracks.pixels.invalidated == 95; }));
+}
+TEST_CASE("benchmark throughput consumers retain captured facts without blocking producers", "[backend][data][benchmark][progress]") {
+ using namespace mmltk::backend::data::benchmark_internal;
+ const bool with_progress = GENERATE(false, true);
+ mmltk::testsupport::TestGate held("throughput consumer while producers advance");
+ std::vector<nlohmann::json> throughputs;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
+  if (event != "benchmark.pixel_compile.throughput") return;
+  throughputs.push_back(fields);
+  if (throughputs.size() == 1) held.receipt().ArriveAndWait();
+ };
+ BenchmarkCompileProgress observed;
+ BenchmarkProgressCallback callback;
+ if (with_progress) callback = [&](const auto& value) { observed = value; };
+ ProgressReporter reporter(std::move(callback), trace);
+ std::future<void> producing;
+ const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); });
+ reporter.phase(DatasetCompilePhase::Planning);
+ REQUIRE(held.WaitEntered(std::chrono::seconds{5}));
+ producing = std::async(std::launch::async, [&] {
+  reporter.pixels(0, 10);
+  reporter.source_activity(BenchmarkDatasetSource::kCoco2017, "ready source");
+  for (unsigned i = 0; i < 4; ++i) reporter.pixel_completed();
+  reporter.invalidate_pixels(1);
+ });
+ mmltk::testsupport::await_test_future(producing, "progress producers with a held throughput consumer");
+ held.Release();
+ reporter.flush();
+ REQUIRE(throughputs.size() >= 2);
+ const auto& last = throughputs.back();
+ CHECK(last.at("completed_images") == 3);
+ CHECK(last.at("total_images") == 10);
+ CHECK(last.at("split") == "train and val");
+ for (const auto* field : {"elapsed_seconds", "images_per_second", "eta_seconds"}) CHECK(last.at(field).is_number_float());
+ if (with_progress) {
+  CHECK(observed.tracks.pixels.completed == 3);
+  CHECK(observed.tracks.pixels.invalidated == 1);
+ }
+}
+TEST_CASE("benchmark selected activity traces preserve phase order without retaining producer locks", "[backend][data][benchmark][progress]") {
+ using namespace mmltk::backend::data::benchmark_internal;
+ mmltk::testsupport::TestGate held("selected pixel activity while producers advance");
+ std::vector<DatasetCompilePhase> traced;
+ bool phase_mismatch = false;
+ bool entered = false;
+ BenchmarkCompileProgress observed;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
+  if (event != "benchmark.progress.activity" || fields.contains("source")) return;
+  const auto phase = static_cast<DatasetCompilePhase>(fields.at("phase").get<unsigned>());
+  traced.push_back(phase);
+  if (!entered && phase == DatasetCompilePhase::Pixels) {
+   entered = true;
+   held.receipt().ArriveAndWait();
+  }
+ };
+ ProgressReporter reporter([&](const auto& value) {
+  phase_mismatch = phase_mismatch || traced.empty() || traced.back() != value.phase;
+  observed = value;
+ }, trace);
+ std::future<void> producing;
+ const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); });
+ reporter.phase(DatasetCompilePhase::Indexing, 0, 10);
+ reporter.pixels(0, 10);
+ reporter.phase(DatasetCompilePhase::Indexing, 10, 10);
+ REQUIRE(held.WaitEntered(std::chrono::seconds{5}));
+ producing = std::async(std::launch::async, [&] {
+  reporter.pixel_completed();
+  reporter.invalidate_indexing(3);
+  reporter.phase(DatasetCompilePhase::Indexing, 10, 10);
+ });
+ mmltk::testsupport::await_test_future(producing, "progress producers with a held selected-activity consumer");
+ held.Release();
+ reporter.flush();
+ CHECK(traced == (std::vector{DatasetCompilePhase::Indexing, DatasetCompilePhase::Pixels, DatasetCompilePhase::Indexing, DatasetCompilePhase::Pixels}));
+ CHECK_FALSE(phase_mismatch);
+ CHECK(observed.phase == DatasetCompilePhase::Pixels);
+ CHECK(observed.tracks.pixels.completed == 1);
+ CHECK(observed.tracks.labels.invalidated == 3);
+}
+TEST_CASE("compile observer deadlines expose a lone completion without a later producer", "[backend][data][compile_progress]") {
+ using namespace mmltk::backend::data::benchmark_internal;
+ std::promise<void> observed;
+ auto ready = observed.get_future();
+ bool reported = false;
+ const BenchmarkTraceSink quiet;
+ ProgressReporter reporter([&](const auto& value) {
+  if (!reported && value.tracks.pixels.completed == 1) { reported = true; observed.set_value(); }
+ }, quiet);
+ reporter.phase(DatasetCompilePhase::Indexing, 10, 10);
+ reporter.pixels(0, 1000);
+ reporter.pixel_completed();
+ mmltk::testsupport::await_test_future(ready, "dirty pixel deadline without a count quantum");
+ reporter.flush();
+}
+TEST_CASE("Directory counters remain exact while their observer is held", "[backend][data][compile_progress]") {
+ struct Observer {
+  mmltk::testsupport::TestGate gate{"Directory observer"};
+  std::vector<CompileProgress> values;
+ } observer;
+ CompileTelemetry telemetry{10000, {.context = &observer, .report = [](void* context, const CompileProgress& value) noexcept {
+  auto& owner = *static_cast<Observer*>(context);
+  owner.values.push_back(value);
+  if (owner.values.size() == 1) owner.gate.receipt().ArriveAndWait();
+ }}};
+ compiler_internal::ProgressCounter counter{&telemetry, compiler_internal::ProgressCounter::Stage::kPixels};
+ counter.add_completed(1);
+ const mmltk::testsupport::ScopedTestCleanup release([&] { observer.gate.Release(); });
+ REQUIRE(observer.gate.WaitEntered(std::chrono::seconds{5}));
+ auto producing = std::async(std::launch::async, [&] { for (unsigned i = 1; i < 4095; ++i) counter.add_completed(1); });
+ mmltk::testsupport::await_test_future(producing, "Directory producers independent of observer capacity");
+ CHECK(telemetry.snapshot().tracks.pixels.completed == 4095);
+ observer.gate.Release();
+ telemetry.flush();
+ CHECK(observer.values.back().tracks.pixels.completed == 4095);
+}
+TEST_CASE("benchmark work follows unfinished tracks after indexing and across repair", "[backend][data][benchmark][progress]") {
+ using namespace mmltk::backend::data::benchmark_internal;
+ const BenchmarkTraceSink quiet;
+ BenchmarkCompileProgress last;
+ ProgressReporter reporter([&](const auto& value) { last = value; }, quiet);
+ reporter.phase(DatasetCompilePhase::Indexing, 4, 10);
+ reporter.pixels(0, 0, false);
+ reporter.phase(DatasetCompilePhase::Indexing, 10, 10);
+ reporter.pixel_completed();
+ reporter.flush();
+ CHECK(last.phase == DatasetCompilePhase::Pixels);
+ CHECK(last.completed == 1);
+ CHECK_FALSE(last.tracks.pixels.total_known);
+ reporter.invalidate_indexing(3);
+ reporter.flush();
+ CHECK(last.phase == DatasetCompilePhase::Indexing);
+ CHECK(last.completed == 7);
+ CHECK(last.tracks.labels.invalidated == 3);
+ reporter.phase(DatasetCompilePhase::Indexing, 10, 10);
+ reporter.phase(DatasetCompilePhase::Syncing, 0, 3);
+ reporter.flush();
+ CHECK(last.phase == DatasetCompilePhase::Syncing);
+ CHECK(last.completed == 0);
 }
 TEST_CASE("benchmark callback failures settle at explicit flush and warning failures stay nonfatal", "[backend][data][benchmark][progress]") {
  using namespace mmltk::backend::data::benchmark_internal;

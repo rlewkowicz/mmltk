@@ -287,10 +287,24 @@ fn parse_inbound(encoded: &[u8]) -> TransportEvent {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
+fn trace_delivery(stage: &str, pending: &std::collections::VecDeque<TransportEvent>) {
+    #[cfg(target_arch = "wasm32")]
+    if crate::presentation_surface::surface_trace_enabled() {
+        let occupancy = pending.len();
+        crate::presentation_surface::emit_surface_trace(&format!(
+            "{{\"event\":\"iced.transport.{stage}\",\"count\":1,\"occupancy\":{occupancy},\"capacity\":64}}"
+        ));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (stage, pending);
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
 fn retain_event(
     pending: &mut std::collections::VecDeque<TransportEvent>,
     event: TransportEvent,
 ) -> Result<(), String> {
+    trace_delivery("produced", pending);
     if let TransportEvent::SystemEvent(next) = &event {
         if next.delivery == crate::generated::EventDelivery::LatestState {
             if let Some((index, revision)) =
@@ -309,9 +323,11 @@ fn retain_event(
                     })
             {
                 if next.state_revision <= revision {
+                    trace_delivery("stale", pending);
                     return Ok(());
                 }
                 pending.remove(index);
+                trace_delivery("coalesced", pending);
             }
         } else if next.delivery == crate::generated::EventDelivery::Transient && pending.len() == 64
         {
@@ -322,6 +338,7 @@ fn retain_event(
         return Err("essential application event continuity capacity exceeded".into());
     }
     pending.push_back(event);
+    trace_delivery("enqueued", pending);
     Ok(())
 }
 
@@ -493,6 +510,34 @@ mod tests {
     use super::*;
     use crate::application_codec::Value;
     use crate::protocol::{encode_envelope, object};
+
+    #[test]
+    fn dataset_coalescing_keeps_discrete_settlement_and_new_generation_order() {
+        let mut state = crate::view_model::test_support::bootstrapped().workflow.dataset.unwrap();
+        let mut queue = std::collections::VecDeque::new();
+        let event = |state: &crate::generated::ArtifactUiState| TransportEvent::SystemEvent(crate::protocol::SystemEvent {
+            delivery: crate::generated::EventDelivery::LatestState,
+            state_revision: state.revision,
+            event: crate::generated::ApplicationEvent::DatasetDatasetProgress(crate::view_model::test_support::dataset_progress(state)),
+        });
+        state.revision = 1;
+        state.generation = 1;
+        state.active = true;
+        retain_event(&mut queue, event(&state)).unwrap();
+        let stale = event(&state);
+        retain_event(&mut queue, TransportEvent::SystemEvent(crate::protocol::SystemEvent {
+            delivery: crate::generated::EventDelivery::Critical,
+            state_revision: 0,
+            event: crate::generated::ApplicationEvent::DatasetDatasetChanged(crate::generated::DatasetChanged { snapshot: state.clone() }),
+        })).unwrap();
+        state.revision = 3;
+        state.generation = 2;
+        retain_event(&mut queue, event(&state)).unwrap();
+        retain_event(&mut queue, stale).unwrap();
+        assert_eq!(queue.len(), 2);
+        assert!(matches!(queue.pop_front(), Some(TransportEvent::SystemEvent(value)) if value.delivery == crate::generated::EventDelivery::Critical));
+        assert!(matches!(queue.pop_front(), Some(TransportEvent::SystemEvent(value)) if value.state_revision == 3));
+    }
 
     #[test]
     fn reconnect_configuration_carries_only_the_socket_boundary() {

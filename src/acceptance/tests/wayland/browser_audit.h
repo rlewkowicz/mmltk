@@ -295,6 +295,9 @@ struct BrowserAudit final {
  // CLEANUP-IGNORE: Browser workflow outcomes do not duplicate the native process audit's lifecycle flags.
  std::uint64_t compile_dropped = 0U;
  bool dataset_complete = false;
+ bool compile_resize_valid = true;
+ std::map<std::uint64_t, std::set<unsigned>> compile_resize_steps;
+ [[nodiscard]] bool compile_resize_complete(std::uint64_t generation) const;
  bool explore_ready = false;
  bool sweep = false;
  bool scrolled = false;

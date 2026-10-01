@@ -24,6 +24,8 @@ static NEXT_DRAW_DIAGNOSTIC: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn initialize_diagnostics(surface_trace: bool, pixel_trace: bool) {
     SURFACE_TRACE_ENABLED.with(|flag| flag.set(surface_trace));
+    #[cfg(target_arch = "wasm32")]
+    let _ = js_sys::Reflect::set(&js_sys::global(), &"mmltkSurfaceTraceEnabled".into(), &surface_trace.into());
     pixel_trace::initialize(surface_trace && pixel_trace);
 }
 

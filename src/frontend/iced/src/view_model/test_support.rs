@@ -461,3 +461,8 @@ pub(crate) fn saved_training_run(
         }),
     }
 }
+
+/// Generated subset projection, also used to exercise Dataset event delivery.
+pub(crate) fn dataset_progress(state: &crate::generated::ArtifactUiState) -> crate::generated::DatasetProgress {
+    crate::generated::DatasetProgress { snapshot: state.into() }
+}

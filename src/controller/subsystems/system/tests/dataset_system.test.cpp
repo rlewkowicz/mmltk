@@ -191,7 +191,8 @@ TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and r
   else
    terminals.Publish(std::move(event));
  }};
- static_cast<void>(dataset.Compile({}));
+ const auto admitted = dataset.Compile({});
+ CHECK(admitted.revision > 0);
  CHECK_THROWS_AS(dataset.Compile({}), contracts::BusyError);
  // CLEANUP-IGNORE: Compile and Inspect are separate dataset admission endpoints sharing one system-owned runtime.
  CHECK_THROWS_AS(dataset.Inspect({}, "rf-detr-base", 560U), contracts::BusyError);
@@ -202,11 +203,16 @@ TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and r
  CHECK(std::get<DatasetChanged>(failed_dataset).snapshot.terminal.outcome == contracts::ArtifactTerminalOutcome::Failed);
  CHECK(progress == 0U);
  CHECK_FALSE(dataset.snapshot().active);
+ const auto failed_revision = dataset.snapshot().revision;
+ CHECK(failed_revision > admitted.revision);
  gate = std::make_shared<mmltk::testsupport::StopGate>();
- static_cast<void>(dataset.Compile({}));
- static_cast<void>(dataset.Stop());
+ const auto restarted = dataset.Compile({});
+ CHECK(restarted.revision > failed_revision);
+ const auto stopping = dataset.Stop();
+ CHECK(stopping.revision > restarted.revision);
  CHECK(std::holds_alternative<DatasetChanged>(terminals.Second().get()));
  CHECK(dataset.snapshot().terminal.outcome == contracts::ArtifactTerminalOutcome::Cancelled);
+ CHECK(dataset.snapshot().revision >= stopping.revision);
  gate->Release();
  static_cast<void>(dataset.Compile({}));
  CHECK(std::holds_alternative<DatasetChanged>(terminals.Third().get()));
@@ -338,8 +344,8 @@ TEST_CASE("dataset admits real open ended acquisition and successful HTTP recove
  };
  DatasetSystem dataset{settings, [&] { return std::make_unique<AcquisitionDatasetRuntime>(work); }, [&](DatasetSystem::event_type event) {
   if (const auto* progress = std::get_if<DatasetProgress>(&event)) {
-   delivered.push_back(progress->progress);
-   if (!notified && !progress->progress.tracks.acquisition.total_known && progress->progress.tracks.acquisition.completed > (mixed ? payload.size() : 0U)) {
+   delivered.push_back(progress->snapshot.progress);
+   if (!notified && !progress->snapshot.progress.tracks.acquisition.total_known && progress->snapshot.progress.tracks.acquisition.completed > (mixed ? payload.size() : 0U)) {
     notified = true;
     open_ended.set_value();
    }

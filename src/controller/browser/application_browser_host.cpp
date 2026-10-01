@@ -36,6 +36,9 @@ namespace transport = mmltk::frameworks::transport;
   case transport::BrowserServerEvent::PeerClosed: return "browser.server.peer_closed";
   case transport::BrowserServerEvent::BinaryReceived: return "browser.server.binary_received";
   case transport::BrowserServerEvent::InvalidMessage: return "browser.server.invalid_message";
+  case transport::BrowserServerEvent::RecordCoalesced: return "browser.server.record_coalesced";
+  case transport::BrowserServerEvent::StaleStateDiscarded: return "browser.server.stale_state_discarded";
+  case transport::BrowserServerEvent::QueueHighWater: return "browser.server.queue_high_water";
   case transport::BrowserServerEvent::RecordEnqueued: return "browser.server.record_enqueued";
   case transport::BrowserServerEvent::TransientDropped: return "browser.server.transient_dropped";
   case transport::BrowserServerEvent::CriticalCapacityClosed: return "browser.server.critical_capacity_closed";
@@ -68,6 +71,10 @@ struct ApplicationBrowserHost::Impl final {
     if (record_priority != transport::BrowserRecordPriority::Transient) continuity_lost();
     return false;
    }
+   diagnostics.Emit([&] {
+    return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::BrowserRuntime,
+     .event = "browser.record.serialized", .value = encoded.size(), .detail = static_cast<std::uint64_t>(record_priority)};
+   });
    const auto* state = std::get_if<SystemEvent>(&record);
    if (state != nullptr && state->delivery != contracts::reflection::EventDelivery::LatestState) state = nullptr;
    const auto result = server->publish({

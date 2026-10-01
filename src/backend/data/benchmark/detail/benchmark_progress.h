@@ -3,11 +3,9 @@
 #include <utility>
 #include <chrono>
 #include <atomic>
-#include <condition_variable>
-#include <deque>
+#include "src/backend/data/detail/compile_progress_delivery.h"
 #include <exception>
 #include <functional>
-#include <thread>
 #include <cstddef>
 #include <span>
 #include <cstdint>
@@ -72,7 +70,7 @@ public:
  [[nodiscard]] ArtifactProgressTotals& transfers() noexcept { return transfers_; }
  void pixel_completed();
  void acquisition_complete();
- void source_activity(const BenchmarkDatasetSource source, std::string activity, bool foreground = true, bool preserve = true);
+ void source_activity(const BenchmarkDatasetSource source, std::string activity, bool foreground = true, bool preserve = false);
  [[nodiscard]] bool transfer_observer_enabled() const noexcept;
  [[nodiscard]] bool normalization_observer_enabled() const noexcept;
  [[nodiscard]] bool pixel_observer_enabled() const noexcept;
@@ -97,10 +95,17 @@ private:
  void update_labels();
  void set_source_activity_unlocked(BenchmarkDatasetSource source, std::string activity, bool foreground = true);
  void select_acquisition_source(BenchmarkDatasetSource source);
- void trace_activity(std::optional<BenchmarkDatasetSource> source, std::string_view activity);
+ void trace_activity(DatasetCompilePhase phase, std::optional<BenchmarkDatasetSource> source, std::string_view activity);
  void flush_pixels_unlocked();
- void emit(std::unique_lock<std::mutex>&, bool preserve = false, bool nonfatal = false);
- void drain();
+ struct Snapshot {
+  BenchmarkCompileProgress progress;
+  double pixel_elapsed_seconds = 0;
+  bool activity_changed = false;
+ };
+ using DeliveryMode = detail::CompileProgressDeliveryMode;
+ void emit(std::unique_lock<std::mutex>&, DeliveryMode mode = DeliveryMode::Dirty);
+ [[nodiscard]] Snapshot materialize();
+ void select_work_unlocked();
  BenchmarkProgressCallback callback_;
  std::function<void(std::exception_ptr)> failed_;
  BenchmarkTraceSink trace_;
@@ -108,6 +113,7 @@ private:
  std::array<std::pair<std::size_t, std::size_t>, 2> compaction_{};
  std::chrono::steady_clock::time_point activity_started_{};
  std::chrono::steady_clock::time_point pixel_started_{};
+ bool activity_trace_pending_ = false;
  std::atomic<bool> pixel_total_known_{true};
  std::uint64_t indexed_completed_ = 0, indexed_total_ = 0;
  ArtifactProgressTotals transfers_;
@@ -116,17 +122,6 @@ private:
  std::vector<LabelPlan> label_plans_;
  std::uint64_t label_completed_ = 0, label_active_ = 0;
  bool labels_admitted_ = false, indexing_known_ = false;
- struct Snapshot {
-  BenchmarkCompileProgress value;
-  bool preserve = false, nonfatal = false;
-  std::uint64_t sequence = 0;
- };
- static constexpr std::size_t kPendingSnapshots = 64;
- std::deque<Snapshot> pending_;
- std::condition_variable changed_;
- std::exception_ptr callback_failure_;
- std::uint64_t submitted_ = 0, enqueued_ = 0, delivered_ = 0;
- bool stopping_ = false;
  // Producers accumulate in cache-line-sized thread stripes. The bounded
  // set is compile-owned, so withdrawal/total changes can flush every live lane.
  struct alignas(64) PixelDelta {
@@ -136,7 +131,7 @@ private:
  std::atomic<std::uint64_t> pixel_events_{0}, remaining_pixels_{0};
  std::uint64_t observed_pixel_events_ = 0;
  std::mutex mutex_;
- std::jthread drainer_;
+ std::unique_ptr<detail::CompileProgressDelivery<Snapshot>> delivery_;
 };
 // One compile-owned instance. Each release contributes its full-import row
 // count once across retained products and repairs; metadata never counts twice.

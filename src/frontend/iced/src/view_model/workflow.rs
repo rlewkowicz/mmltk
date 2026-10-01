@@ -550,12 +550,7 @@ impl crate::generated::DatasetApplicationProjection<UiError> for ApplicationMode
     fn project_dataset_event(&mut self, event: ApplicationEvent) {
         match event {
             ApplicationEvent::DatasetDatasetProgress(value) => {
-                if let Err(error) = self.install_dataset_progress(
-                    value.generation,
-                    value.active,
-                    value.terminal,
-                    value.progress,
-                ) {
+                if let Err(error) = self.install_dataset_progress(value.snapshot) {
                     self.report_error(crate::view_model::notices::Origin::Protocol, error);
                 } else {
                     self.observe_dataset();

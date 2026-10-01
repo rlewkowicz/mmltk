@@ -1,13 +1,18 @@
 #include "src/frameworks/transport/browser_record_ring.h"
 #include <utility>
 namespace mmltk::frameworks::transport {
-BrowserRecordPush BrowserRecordRing::push(BrowserOutputRecord record) {
+BrowserRecordPush BrowserRecordRing::push(BrowserOutputRecord record, BrowserRecordObservation* observation) {
  std::scoped_lock lock(mutex_);
+ if (observation) *observation = {.occupancy = size_};
  if (record.state_system != 0U && record.state_event != 0U) {
   for (std::size_t offset = 0U; offset != size_; ++offset) {
    auto& prior = records_[(read_ + offset) % records_.size()];
    if (prior->state_system != record.state_system || prior->state_event != record.state_event) continue;
-   if (prior->state_revision >= record.state_revision) return BrowserRecordPush::Enqueued;
+   if (prior->state_revision >= record.state_revision) {
+    if (observation) observation->stale = true;
+    return BrowserRecordPush::Enqueued;
+   }
+   if (observation) observation->coalesced = true;
    // Append the replacement after every intervening discrete event.
    // The fixed 64-slot move is bounded and retains FIFO edge ordering.
    for (std::size_t next = offset + 1U; next != size_; ++next) records_[(read_ + next - 1U) % records_.size()] = std::move(records_[(read_ + next) % records_.size()]);
@@ -21,6 +26,7 @@ BrowserRecordPush BrowserRecordRing::push(BrowserOutputRecord record) {
  records_[write_].emplace(std::move(record));
  write_ = (write_ + 1U) % records_.size();
  ++size_;
+ if (observation) observation->occupancy = size_;
  return BrowserRecordPush::Enqueued;
 }
 std::optional<BrowserOutputRecord> BrowserRecordRing::pop() {

@@ -1,5 +1,6 @@
 #include "src/controller/subsystems/system/dataset_system.h"
 #include <atomic>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include "src/controller/contracts/compute.h"
@@ -53,7 +54,9 @@ contracts::ArtifactUiState DatasetSystem::Compile(contracts::WorkflowIntent<cont
   if (activity_ != DatasetActivity::None) throw contracts::BusyError("dataset operation is active");
   const auto next = contracts::next_compute_generation(state_.generation);
   if (!next) throw contracts::FailedError("dataset operation generation exhausted");
+  if (state_.revision > std::numeric_limits<std::uint64_t>::max() - 3U) throw contracts::FailedError("dataset observation revision exhausted");
   activity_ = DatasetActivity::Compile;
+  ++state_.revision;
   state_.generation = *next;
   state_.active = true;
   state_.progress = {};
@@ -113,6 +116,7 @@ contracts::ArtifactUiState DatasetSystem::Compile(contracts::WorkflowIntent<cont
   {
    std::scoped_lock lock(mutex_);
    if (activity_ == DatasetActivity::Compile) {
+    ++state_.revision;
     state_.active = false;
     state_.inspection = failed ? contracts::ArtifactInspection{} : result.inspection;
     state_.terminal = terminal;
@@ -128,6 +132,7 @@ contracts::ArtifactUiState DatasetSystem::Compile(contracts::WorkflowIntent<cont
   {
    std::scoped_lock lock(mutex_);
    if (activity_ == DatasetActivity::Compile) {
+    ++state_.revision;
     state_.active = false;
     state_.terminal.outcome = contracts::ArtifactTerminalOutcome::Failed;
     state_.terminal.detail = "dataset worker failed";
@@ -144,15 +149,21 @@ contracts::ArtifactUiState DatasetSystem::Compile(contracts::WorkflowIntent<cont
  return snapshot();
 }
 contracts::ArtifactUiState DatasetSystem::Stop() noexcept {
- static_cast<void>(run_.Stop());
- std::scoped_lock lock(mutex_);
- if (state_.active)
-  state_.terminal = {
-   .outcome = contracts::ArtifactTerminalOutcome::CancellationRequested,
-   .artifact = {},
-   .detail = {},
-  };
- return state_;
+ std::stop_source stopping{std::nostopstate};
+ contracts::ArtifactUiState stopped;
+ {
+  std::scoped_lock lock(mutex_);
+  stopping = run_.CurrentStopSource();
+  if (state_.active && state_.terminal.outcome != contracts::ArtifactTerminalOutcome::CancellationRequested) {
+   ++state_.revision;
+   state_.terminal = {.outcome = contracts::ArtifactTerminalOutcome::CancellationRequested, .artifact = {}, .detail = {}};
+  }
+  stopped = state_;
+ }
+ // The captured generation can settle while cancellation callbacks execute;
+ // its reply keeps that revision and cannot mark a newly admitted run stopped.
+ static_cast<void>(stopping.request_stop());
+ return stopped;
 }
 void DatasetSystem::Shutdown() noexcept {
  static_cast<void>(Stop());
@@ -226,17 +237,14 @@ contracts::ArtifactUiState DatasetSystem::snapshot() const {
  return state_;
 }
 void DatasetSystem::progress(const contracts::ArtifactProgress& value) noexcept {
- std::uint64_t generation = 0U;
- bool active = false;
- contracts::ArtifactTerminal terminal;
+ contracts::ArtifactCompileState snapshot;
  {
   std::scoped_lock lock(mutex_);
-  if (!state_.active) return;
+  if (!state_.active || state_.progress == value || state_.revision >= std::numeric_limits<std::uint64_t>::max() - 2U) return;
+  ++state_.revision;
   state_.progress = value;
-  generation = state_.generation;
-  active = state_.active;
-  terminal = state_.terminal;
+  snapshot = state_;
  }
- direct::PublishLazyNoexcept(events_, [&] { return event_type{DatasetProgress{generation, active, std::move(terminal), value}}; });
+ direct::PublishLazyNoexcept(events_, [&] { return event_type{DatasetProgress{std::move(snapshot)}}; });
 }
 }  // namespace mmltk::controller

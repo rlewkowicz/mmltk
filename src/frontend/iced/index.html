@@ -45,6 +45,38 @@
       (() => {
         let recoveryStarted = false;
 
+        // Effect-only observations of Iced's actual window loop. No application
+        // socket traffic, animation request, or native work depends on this.
+        window.mmltkIcedWindowTraceEnabled = () => window.mmltkSurfaceTraceEnabled === true ||
+          typeof window.mmltkIntegrationWindowTrace === "function";
+        const emitIcedWindowTrace = (stage, fields) => {
+          const state = window.mmltkIcedWindowState ??= {sequence: 0, requested: 0, redraws: 0, configured: 0, draws: 0};
+          ++state.sequence;
+          if (stage === "requested") ++state.requested;
+          if (stage === "redraw") ++state.redraws;
+          if (stage === "configured") ++state.configured;
+          if (stage === "draw") ++state.draws;
+          const record = {event: `iced.window.${stage}`, ...state, ...fields};
+          window.mmltkIntegrationWindowTrace?.(record);
+          if (window.mmltkSurfaceTraceEnabled) {
+            const line = JSON.stringify(record);
+            if (typeof dump === "function") dump(line + "\n");
+            else console.error(line);
+          }
+          return state;
+        };
+        window.mmltkIcedWindowTrace = (stage, width, height, logicalWidth, logicalHeight, pending) => {
+          if (!window.mmltkIcedWindowTraceEnabled()) return;
+          const state = emitIcedWindowTrace(stage, {width, height,
+            logical_width: logicalWidth, logical_height: logicalHeight, pending_resize: pending});
+          if (stage === "configured") state.extent = [width, height];
+          if (stage === "draw") state.draw_extent = [width, height, logicalWidth, logicalHeight];
+        };
+        window.mmltkIcedRootTrace = (x, y, width, height) => {
+          if (!window.mmltkIcedWindowTraceEnabled()) return;
+          emitIcedWindowTrace("root", {root: [x, y, width, height]});
+        };
+
         const showRecovery = (message, manual) => {
           const recovery = document.getElementById("mmltk-recovery");
           const detail = document.getElementById("mmltk-recovery-detail");
