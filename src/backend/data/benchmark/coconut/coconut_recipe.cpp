@@ -55,12 +55,16 @@ struct CoconutRecipeInputs {
      : releases(count), external(cancellation), failed(std::move(failure)) {}
  ~CoconutRecipeInputs() { settle(); }
  void settle() {
+  std::shared_ptr<CompileExecution::CompletionSource> train_changed, validation_changed;
   {
    const std::lock_guard lock(mutex);
    retiring = true;
    stopped.store(true, std::memory_order_relaxed);
-   train_originals.changed->settle(); validation_originals.changed->settle();
+   train_changed = std::move(train_originals.changed);
+   validation_changed = std::move(validation_originals.changed);
   }
+  if (train_changed) train_changed->settle();
+  if (validation_changed) validation_changed->settle();
   changed.notify_all();
   if (execution) execution->execution().notify_admission_change();
   join_inputs();
@@ -79,14 +83,18 @@ struct CoconutRecipeInputs {
   [[nodiscard]] int descriptor() const noexcept { return external.descriptor(); }
  void fail(std::exception_ptr value) {
   bool first = false;
+  std::shared_ptr<CompileExecution::CompletionSource> train_changed, validation_changed;
   {
    const std::lock_guard lock(mutex);
    if (retiring) return;
    first = !error;
    if (first) error = value;
    stopped.store(true, std::memory_order_relaxed);
-   train_originals.changed->settle(); validation_originals.changed->settle();
+   train_changed = std::move(train_originals.changed);
+   validation_changed = std::move(validation_originals.changed);
   }
+  if (train_changed) train_changed->settle();
+  if (validation_changed) validation_changed->settle();
   changed.notify_all();
   if (execution) execution->execution().notify_admission_change();
   if (first && failed) failed(value);
@@ -113,6 +121,8 @@ struct CoconutRecipeInputs {
  struct OriginalSplit {
   CocoAnnotationSplit state;
   std::shared_ptr<const CoconutRecoveryOriginals> recovery;
+  // Snapshots retain their captured completion through replacement, failure,
+  // and retirement; the owner detaches it with the facts and settles unlocked.
   std::shared_ptr<CompileExecution::CompletionSource> changed = std::make_shared<CompileExecution::CompletionSource>();
  };
  void original_split(CocoAnnotationSplit value, bool recover) {
@@ -130,28 +140,42 @@ struct CoconutRecipeInputs {
    else
     prepare_recovery(0);
   }
+  auto notification = std::make_shared<CompileExecution::CompletionSource>();
   {
    const std::lock_guard lock(mutex);
-   auto& split = value.training ? train_originals : validation_originals;
+   const auto& split = training ? train_originals : validation_originals;
    if (value.generation < split.state.generation) return;
-   split.state = std::move(value);
-   split.recovery = std::move(recovery);
-   auto settled=std::exchange(split.changed,std::make_shared<CompileExecution::CompletionSource>());
-   settled->settle();
   }
-  if (execution) {
-   execution->original_generation(physical->identity_root(training ? CoconutImageNamespace::CocoTrain : CoconutImageNamespace::CocoValidation), generation, withdrew);
-   if (published_index) {
-    const NormalizedAnnotationReadView index(*published_index);
-    const auto root = physical->identity_root(CoconutImageNamespace::CocoValidation);
-    for (std::size_t row = 0; row < index.image_count(); ++row) {
-     const auto id = index.image(row).source_image_id;
-     execution->labels_ready(execution->source_publication(root, {}, id), id, BenchmarkLabelInput(index, row), index.annotation_sha256, generation, 1);
+  std::exception_ptr failure;
+  try {
+   // The new snapshot must not authorize recovery before its pipeline generation
+   // and stock labels are ready. Retirement can join work, so keep it unlocked.
+   if (execution) {
+    execution->original_generation(physical->identity_root(training ? CoconutImageNamespace::CocoTrain : CoconutImageNamespace::CocoValidation), generation, withdrew);
+    if (published_index) {
+     const NormalizedAnnotationReadView index(*published_index);
+     const auto root = physical->identity_root(CoconutImageNamespace::CocoValidation);
+     for (std::size_t row = 0; row < index.image_count(); ++row) {
+      const auto id = index.image(row).source_image_id;
+      execution->labels_ready(execution->source_publication(root, {}, id), id, BenchmarkLabelInput(index, row), index.annotation_sha256, generation, 1);
+     }
     }
+    execution->execution().notify_admission_change();
    }
-   execution->execution().notify_admission_change();
+  } catch (...) { failure = std::current_exception(); }
+  {
+   const std::lock_guard lock(mutex);
+   auto& split = training ? train_originals : validation_originals;
+   if (!failure) {
+    if (generation < split.state.generation) return;
+    split.state = std::move(value);
+    split.recovery = std::move(recovery);
+   }
+   notification = std::exchange(split.changed, std::move(notification));
   }
+  if (notification) notification->settle(failure);
   changed.notify_all();
+  if (failure) std::rethrow_exception(failure);
  }
  [[nodiscard]] OriginalSplit original(CoconutImageNamespace source, bool wait, std::stop_token stop = {}) {
   const std::stop_callback wake(stop, [this] { changed.notify_all(); });

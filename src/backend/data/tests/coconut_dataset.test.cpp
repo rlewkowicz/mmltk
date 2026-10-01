@@ -1051,6 +1051,35 @@ TEST_CASE("COCONut duplicate and ambiguous B membership never silently loses row
  parquet_file(input.parquet_shards[0], rows);
  CHECK_THROWS(import_coconut_annotations(input));
 }
+TEST_CASE("physical readiness and resolution share final identity decisions", "[benchmark][coconut][recovery]") {
+ const auto id = GENERATE(0U, 7U);
+ const bool ambiguous = GENERATE(false, true);
+ std::vector<CoconutPhysicalImage> images{coco(id)};
+ if (ambiguous) images.push_back(coco(id, CoconutImageNamespace::CocoUnlabeled));
+ CoconutPhysicalMembership physical(images);
+ CoconutRecord record;
+ record.image_id = id;
+ record.file_name = std::filesystem::path(images.front().member).filename().string();
+ record.namespace_hint = CoconutImageNamespace::CocoUnlabeled;
+ const auto ready = physical.readiness(CoconutEdition::Base, record);
+ CHECK(ready.terminal);
+ if (ambiguous) {
+  CHECK_FALSE(ready.image);
+  CHECK_THROWS_WITH(physical.resolve(CoconutEdition::Base, record), "ambiguous physical image identity: " + record.file_name);
+  CHECK_THROWS_WITH(physical.identify(CoconutEdition::Base, record), "ambiguous physical image identity: " + record.file_name);
+ } else {
+  REQUIRE(ready.image);
+  CHECK(*ready.image == images.front());
+  CHECK(physical.resolve(CoconutEdition::Base, record) == *ready.image);
+  CHECK(physical.identify(CoconutEdition::Base, record) == *ready.image);
+ }
+ record.image_id = 8;
+ record.file_name = "000000000008.jpg";
+ const auto missing = physical.readiness(CoconutEdition::Base, record);
+ CHECK(missing.terminal);
+ CHECK_FALSE(missing.image);
+ CHECK_THROWS_WITH(physical.resolve(CoconutEdition::Base, record), "missing physical image: " + record.file_name);
+}
 TEST_CASE("COCONut authoritative box retains an empty supplied mask and rejects coordinate overflow", "[coconut]") {
  ScopedTempDir root("coconut-authoritative-box");
  const std::array<std::uint32_t, 1> ids{0};
@@ -5599,6 +5628,257 @@ TEST_CASE("physical owner withdraws only affected routes and refreshes their con
  CHECK(geometry->width == 1);
  CHECK(geometry->height == 1);
  CHECK(execution.execution().try_reserve({execution.execution().transient_target(), 16}).has_value());
+}
+TEST_CASE("physical readiness captures each generation before reentrant and late subscriptions", "[benchmark][coconut][pipeline][recovery]") {
+ const bool late = GENERATE(false, true);
+ ScopedTempDir root("physical-generation-subscription");
+ LocalCoconutRecipe local(root.path());
+ const std::array conflicting{std::pair{coco(7, CoconutImageNamespace::CocoUnlabeled).member, white_jpeg()}};
+ replace_physical_images(local.cache, local.catalog, CoconutImageNamespace::CocoUnlabeled, conflicting);
+ auto admitted = local_physical_archives(local.cache, local.catalog);
+ BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 16});
+ CoconutPhysicalMembership physical(admitted, local.catalog, true, local.cache, pipeline.storage(), pipeline);
+ auto& train = *std::ranges::find(admitted, CoconutImageNamespace::CocoTrain, [](const auto& archive) { return archive.origin.source; });
+ CoconutRecord record;
+ record.image_id = 7;
+ record.file_name = "000000000007.jpg";
+ const auto provisional = physical.identify(CoconutEdition::Base, record);
+ CHECK(provisional.archive_identity == "pending");
+ auto current = physical.readiness(CoconutEdition::Base, record);
+ CHECK_FALSE(current.terminal);
+ CHECK_FALSE(current.image);
+ const auto mutate = [&](const auto& change) {
+  const auto before = current;
+  unsigned callbacks = 0;
+  CoconutPhysicalMembership::Readiness observed;
+  const auto subscribe = [&] {
+   before.changed.subscribe([&](std::exception_ptr failure) {
+    if (failure) std::rethrow_exception(failure);
+    observed = physical.readiness(CoconutEdition::Base, record);
+    (void)physical.discovery_complete();
+    (void)physical.identify(CoconutEdition::Base, record);
+    ++callbacks;
+   });
+  };
+  if (!late) subscribe();
+  change();
+  if (late) subscribe();
+  CHECK(callbacks == 1);
+  CHECK(before.changed.ready());
+  CHECK(observed.generation > before.generation);
+  current = physical.readiness(CoconutEdition::Base, record);
+  CHECK(current.generation >= observed.generation);
+ };
+ mutate([&] { physical.admitted(train, train.download); });
+ CHECK_FALSE(current.terminal);
+ mutate([&] { REQUIRE(physical.consume(train)); });
+ REQUIRE(current.image);
+ CHECK(physical.resolve(CoconutEdition::Base, record) == *current.image);
+ const auto first = *current.image;
+ mutate([&] { physical.withdraw(train); });
+ CHECK_FALSE(current.terminal);
+ CHECK_FALSE(current.image);
+ CHECK_FALSE(pipeline.image_input(physical.identity_root(CoconutImageNamespace::CocoTrain), record.image_id));
+ auto replacement = train.download;
+ replacement.identity = "replacement-generation";
+ mutate([&] { physical.admitted(train, replacement, true); });
+ mutate([&] { REQUIRE(physical.consume(train)); });
+ REQUIRE(current.image);
+ CHECK(current.image->archive_identity != first.archive_identity);
+ CHECK(physical.resolve(CoconutEdition::Base, record) == *current.image);
+ mutate([&] { physical.unavailable(train); });
+ REQUIRE(current.image);
+ CHECK(physical.resolve(CoconutEdition::Base, record) == *current.image);
+ auto& unlabeled = *std::ranges::find(admitted, CoconutImageNamespace::CocoUnlabeled, [](const auto& archive) { return archive.origin.source; });
+ physical.admitted(unlabeled, unlabeled.download);
+ const auto conflict_change = physical.readiness(CoconutEdition::Base, record).changed;
+ unsigned conflict_callbacks = 0;
+ bool retired = false, ambiguous = false;
+ std::exception_ptr callback_failure;
+ const auto subscribe_conflict = [&] {
+  conflict_change.subscribe([&](std::exception_ptr failure) {
+   callback_failure = failure;
+   retired = !pipeline.image_input(physical.identity_root(CoconutImageNamespace::CocoTrain), record.image_id);
+   const auto observed = physical.readiness(CoconutEdition::Base, record);
+   ambiguous = observed.terminal && !observed.image;
+   ++conflict_callbacks;
+  });
+ };
+ if (!late) subscribe_conflict();
+ REQUIRE(physical.consume(unlabeled));
+ if (late) subscribe_conflict();
+ CHECK(conflict_callbacks == 1);
+ CHECK_FALSE(callback_failure);
+ CHECK(retired);
+ CHECK(ambiguous);
+ CHECK_THROWS_AS(physical.resolve(CoconutEdition::Base, record), CoconutPhysicalMembershipError);
+}
+TEST_CASE("physical repair shares source selection admission bounds and rejection reasons", "[benchmark][coconut][archive][recovery]") {
+ const bool blocking = GENERATE(false, true);
+ const auto scenario = GENERATE(0, 1, 2, 3);
+ CAPTURE(blocking, scenario);
+ const bool unreadable = scenario == 3;
+ ScopedTempDir root("physical-repair-decisions");
+ const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
+ const auto train = cache.source_downloads("coco") / "train.tar";
+ const auto unlabeled = cache.source_downloads("coco") / "unlabeled.tar";
+ tar(train, std::array{std::pair{coco(unreadable ? 0 : 1).member, unreadable ? std::string("invalid image") : white_jpeg(1, 1)}});
+ tar(unlabeled, std::array{std::pair{coco(2, CoconutImageNamespace::CocoUnlabeled).member, white_jpeg(1, 1)}});
+ auto catalog = base_physical_catalog(train, 2);
+ catalog.images.push_back({CoconutImageNamespace::CocoUnlabeled, 0, "unlabeled2017",
+  {"unlabeled", "unused", unlabeled.filename().string(), std::filesystem::file_size(unlabeled), "", BenchmarkDatasetSource::kCoco2017}});
+ auto admitted = local_physical_archives(cache, catalog);
+ BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 13});
+ std::vector<CoconutImageNamespace> repaired;
+ std::vector<std::string> reasons;
+ CoconutPhysicalMembership* owner = nullptr;
+ CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline, {}, {}, [&](AdmittedRecipeArchive& archive, std::string reason) {
+  repaired.push_back(archive.origin.source);
+  reasons.push_back(std::move(reason));
+  owner->admitted(archive, archive.download);
+  (void)owner->consume(archive);
+ });
+ owner = &physical;
+ physical.admitted(admitted[0], admitted[0].download);
+ for (auto& archive : admitted) {
+  physical.admitted(archive, archive.download);
+  REQUIRE(physical.consume(archive));
+ }
+ CoconutRecord record;
+ record.image_id = 0;
+ record.file_name = "000000000000.jpg";
+ if (scenario == 1) record.namespace_hint = CoconutImageNamespace::CocoTrain;
+ if (scenario >= 2) record.namespace_hint = CoconutImageNamespace::CocoUnlabeled;
+ if (blocking) {
+  if (unreadable) CHECK(physical.resolve(CoconutEdition::Base, record).image_id == 0);
+  else CHECK_THROWS_WITH(physical.resolve(CoconutEdition::Base, record), "missing physical image: " + record.file_name);
+ } else {
+  // The callback can finish synchronously. The captured completion still
+  // reports that change to a subscriber registered only after readiness returns.
+  for (unsigned remaining = 3; remaining; --remaining) {
+   const auto pending = physical.readiness(CoconutEdition::Base, record);
+   if (pending.terminal) break;
+   REQUIRE(pending.changed.ready());
+   unsigned callbacks = 0;
+   pending.changed.subscribe([&](std::exception_ptr) { ++callbacks; });
+   CHECK(callbacks == 1);
+   CHECK_FALSE(pending.image);
+  }
+ }
+ const auto final = physical.readiness(CoconutEdition::Base, record);
+ CHECK(final.terminal);
+ CHECK(final.image.has_value() == unreadable);
+ if (unreadable) {
+  REQUIRE(final.image);
+  CHECK(*final.image == physical.resolve(CoconutEdition::Base, record));
+  CHECK_FALSE(pipeline.image_input(physical.identity_root(CoconutImageNamespace::CocoTrain), record.image_id));
+ } else CHECK_THROWS_AS(physical.resolve(CoconutEdition::Base, record), CoconutPhysicalMembershipError);
+ const std::vector<CoconutImageNamespace> expected = scenario == 0 ? std::vector{CoconutImageNamespace::CocoUnlabeled, CoconutImageNamespace::CocoTrain, CoconutImageNamespace::CocoUnlabeled}
+  : scenario == 2 ? std::vector{CoconutImageNamespace::CocoUnlabeled, CoconutImageNamespace::CocoUnlabeled} : std::vector{CoconutImageNamespace::CocoTrain};
+ CHECK(repaired == expected);
+ for (const auto& reason : reasons) CHECK(reason == std::string(unreadable ? "unreadable required image: " : "missing required image: ") + record.file_name);
+ const auto count = repaired.size();
+ (void)physical.readiness(CoconutEdition::Base, record);
+ CHECK(repaired.size() == count);
+}
+TEST_CASE("one physical repair claim survives racing joins and completion subscription", "[benchmark][coconut][pipeline][recovery]") {
+ using namespace std::chrono_literals;
+ const bool blocking = GENERATE(false, true);
+ ScopedTempDir root("physical-repair-claim");
+ const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
+ const auto archive = cache.source_downloads("coco") / "train.tar";
+ tar(archive, std::array{std::pair{coco(1).member, white_jpeg(1, 1)}});
+ const auto catalog = base_physical_catalog(archive, 1);
+ auto admitted = local_physical_archives(cache, catalog);
+ std::atomic<bool> cancelled{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 13}, cancellation);
+ mmltk::testsupport::TestGate repairing("one source owns the pending repair");
+ std::atomic<unsigned> claims{0}, callbacks{0};
+ CoconutPhysicalMembership* owner = nullptr;
+ CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline, cancellation, {}, [&](AdmittedRecipeArchive& source, std::string) {
+  ++claims;
+  repairing.receipt().ArriveAndWait();
+  owner->unavailable(source);
+ });
+ owner = &physical;
+ physical.admitted(admitted.front(), admitted.front().download);
+ REQUIRE(physical.consume(admitted.front()));
+ CoconutRecord record;
+ record.image_id = 0;
+ record.file_name = "000000000000.jpg";
+ auto joining = std::async(std::launch::async, [&] {
+  if (blocking) {
+   try { (void)physical.resolve(CoconutEdition::Base, record); }
+   catch (const CoconutPhysicalMembershipError& error) { return error.image_id() == 0; }
+   return false;
+  }
+  const auto pending = physical.readiness(CoconutEdition::Base, record);
+  return !pending.terminal && !pending.image && pending.changed.ready();
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled = true; repairing.Release(); pipeline.execution().cancel(); });
+ REQUIRE(repairing.WaitEntered(5s));
+ const auto waiting = physical.readiness(CoconutEdition::Base, record);
+ CHECK_FALSE(waiting.terminal);
+ CHECK_FALSE(waiting.image);
+ CHECK_FALSE(waiting.changed.ready());
+ CHECK(claims.load() == 1);
+ std::latch start{2};
+ std::atomic<bool> terminal{false};
+ auto subscribing = std::async(std::launch::async, [&] {
+  start.arrive_and_wait();
+  waiting.changed.subscribe([&](std::exception_ptr) {
+   terminal = physical.readiness(CoconutEdition::Base, record).terminal;
+   (void)physical.discovery_complete();
+   ++callbacks;
+  });
+ });
+ start.arrive_and_wait();
+ repairing.Release();
+ mmltk::testsupport::await_test_future(subscribing, "subscription races the source terminal publication", 5s);
+ CHECK(mmltk::testsupport::await_test_future(joining, "repair settles both blocking and nonblocking joins", 5s));
+ CHECK(claims.load() == 1);
+ CHECK(callbacks.load() == 1);
+ CHECK(terminal.load());
+ CHECK(waiting.changed.ready());
+ CHECK(physical.readiness(CoconutEdition::Base, record).terminal);
+}
+TEST_CASE("excluded Objects365 shards retain verified ambiguity before eligibility", "[benchmark][coconut][archive][recovery]") {
+ const bool conflict = GENERATE(false, true);
+ ScopedTempDir root("physical-excluded-shard");
+ const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
+ const auto archive = cache.source_downloads("objects365") / "patch32.tar";
+ auto image = objects(1);
+ image.member = "patch32/objects365_v2_00000001.jpg";
+ std::vector<std::pair<std::string, std::string>> members{{image.member, white_jpeg(1, 1)}};
+ if (conflict) members.push_back(members.front());
+ tar(archive, members);
+ CoconutRecipeCatalog catalog;
+ catalog.releases = {coconut_release_component(CoconutEdition::Large), coconut_release_component(CoconutEdition::XLarge)};
+ catalog.images.push_back({CoconutImageNamespace::Objects365V2, 32, "patch-32",
+  {"physical-32", "unused", archive.filename().string(), std::filesystem::file_size(archive), "", BenchmarkDatasetSource::kObjects365V2}});
+ auto admitted = local_physical_archives(cache, catalog);
+ BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 13});
+ CoconutPhysicalMembership physical(admitted, catalog, false, cache, pipeline.storage(), pipeline);
+ physical.admitted(admitted.front(), admitted.front().download);
+ REQUIRE(physical.consume(admitted.front()));
+ CoconutRecord record;
+ record.image_id = 601;
+ record.file_name = "601.jpg";
+ record.physical_stem = "objects365_v2_00000001";
+ CHECK(physical.eligible(CoconutEdition::Large, admitted.front()));
+ CHECK_FALSE(physical.eligible(CoconutEdition::XLarge, admitted.front()));
+ const auto ready = physical.readiness(CoconutEdition::XLarge, record);
+ CHECK(ready.terminal);
+ CHECK_FALSE(ready.image);
+ CHECK_THROWS_WITH(physical.resolve(CoconutEdition::XLarge, record), std::string(conflict ? "ambiguous physical image identity: " : "missing physical image: ") + record.file_name);
+ if (conflict) CHECK_THROWS_AS(physical.identify(CoconutEdition::XLarge, record), CoconutPhysicalMembershipError);
+ else {
+  CHECK(physical.identify(CoconutEdition::XLarge, record).archive_identity == "pending");
+  const auto selected = physical.readiness(CoconutEdition::Large, record);
+  REQUIRE(selected.image);
+  CHECK(physical.resolve(CoconutEdition::Large, record) == *selected.image);
+ }
 }
 TEST_CASE("retained archive images keep storage after decoder CPUs return", "[benchmark][coconut][archive][pipeline]") {
  if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPU lanes");

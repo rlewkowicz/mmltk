@@ -89,14 +89,17 @@ struct CoconutPhysicalMembership::Impl {
  Repair repair;
  mutable std::mutex mutex;
  mutable std::condition_variable changed;
- mutable std::optional<detail::CompileExecution::CompletionSource> readiness_change;
- std::uint64_t readiness_generation=0;
- void notify_locked() {
+ using Change = std::optional<detail::CompileExecution::CompletionSource>;
+ mutable Change readiness_change;
+ std::uint64_t readiness_generation = 0;
+ [[nodiscard]] Change advance_locked() noexcept {
   ++readiness_generation;
-  if (readiness_change) { auto current=std::move(*readiness_change); readiness_change.reset(); current.settle(); }
-  changed.notify_all();
+  return std::exchange(readiness_change, std::nullopt);
  }
- void notify() { const std::lock_guard lock(mutex); notify_locked(); }
+ void notify(Change current, std::exception_ptr failure = {}) noexcept {
+  changed.notify_all();
+  if (current) current->settle(std::move(failure));
+ }
 
  Impl(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& layout, detail::StorageReservationPool& reservations,
   BenchmarkCompilePipeline& pipeline, Cancellation cancel, Progress observer, Repair recover)
@@ -142,65 +145,92 @@ struct CoconutPhysicalMembership::Impl {
   return *found;
  }
  void complete(Artifact& item) {
+  Change notification;
   {
    const std::lock_guard lock(mutex);
    item.complete = true;
    item.admissions = std::max(item.admissions, 1U);
+   notification = advance_locked();
   }
-  notify();
+  notify(std::move(notification));
  }
- CoconutPhysicalImage resolve(CoconutEdition edition, const CoconutRecord& record, bool wait) const {
+ struct Inspection {
+  const Fact* image = nullptr;
+  bool conflict = false, terminal = false;
+  Artifact* repair = nullptr;
+ };
+ // The pointers in this inspection are borrowed only while mutex is held.
+ Inspection inspect_locked(CoconutEdition edition, const CoconutRecord& record, const std::optional<CoconutPhysicalName>& objects) const {
+  Inspection result;
+  const auto id = objects ? objects->id : record.image_id;
+  const auto selected = releases.find(edition);
+  const auto sources = objects ? std::span<const CoconutImageNamespace>(&objects->source, 1) : coconut_release_sources(edition);
+  for (const auto source : sources) {
+   const auto found = images.find({source, id});
+   if (found == images.end() || !found->second.verified) continue;
+   // A verified ambiguous identity is rejected before release eligibility.
+   // Filtering the conflicted spelling first could admit its selected peer.
+   if (found->second.conflict || result.image) {
+    result.image = nullptr;
+    result.conflict = result.terminal = true;
+    return result;
+   }
+   const auto& physical = found->second.physical();
+   if (execution && (selected == releases.end() ||
+       std::ranges::none_of(selected->second, [&](const auto* item) { return item->archive->origin.source == physical.source && item->archive->origin.shard == physical.shard; })))
+    continue;
+   result.image = &found->second;
+  }
+  result.terminal = !execution || (result.image && result.image->pixels) || selected == releases.end() ||
+                    std::ranges::all_of(selected->second, [](const auto* item) { return item->complete; });
+  if (execution && result.terminal && (!result.image || !result.image->pixels) && repair && selected != releases.end())
+   for (auto* item : selected->second) {
+    const auto& origin = item->archive->origin;
+    if (item->admissions >= 3) continue;
+    if (result.image) {
+     const auto& image = result.image->physical();
+     if (origin.source != image.source || origin.shard != image.shard) continue;
+    } else if ((objects && origin.source != objects->source) || (!objects && record.namespace_hint && origin.source != *record.namespace_hint)) {
+     continue;
+    }
+    if (!result.repair || item->admissions < result.repair->admissions) result.repair = item;
+   }
+  return result;
+ }
+ struct RepairClaim {
+  AdmittedRecipeArchive* archive;
+  std::string reason;
+  Change notification;
+ };
+ std::optional<RepairClaim> claim_repair_locked(const Inspection& inspected, const CoconutRecord& record) {
+  if (!inspected.repair) return {};
+  // Prepare the fallible request before withdrawing the terminal fact. Every
+  // other join then sees this source pending until its owner settles it.
+  RepairClaim claim{inspected.repair->archive, std::string(inspected.image ? "unreadable required image: " : "missing required image: ") + record.file_name, {}};
+  inspected.repair->complete = false;
+  claim.notification = advance_locked();
+  return claim;
+ }
+ CoconutPhysicalImage resolve(CoconutEdition edition, const CoconutRecord& record, bool wait) {
   const auto objects = admit_record(edition, record);
   const auto id = objects ? objects->id : record.image_id;
   std::unique_lock lock(mutex);
-  const auto lookup = [&]() -> const CoconutPhysicalImage* {
-   const CoconutPhysicalImage* match = nullptr;
-   const auto sources = objects ? std::span<const CoconutImageNamespace>(&objects->source, 1) : coconut_release_sources(edition);
-   for (const auto source : sources) {
-    const auto found = images.find({source, id});
-    if (found == images.end() || !found->second.verified) continue;
-    if (found->second.conflict || match) throw CoconutPhysicalMembershipError(edition, id, "ambiguous physical image identity: " + record.file_name);
-    const auto& physical = found->second.physical();
-    if (execution) {
-     const auto selected = releases.find(edition);
-     if (selected == releases.end() ||
-         std::ranges::none_of(selected->second, [&](const auto* item) { return item->archive->origin.source == physical.source && item->archive->origin.shard == physical.shard; }))
-      continue;
-    }
-    match = &physical;
-   }
-   return match;
-  };
   for (;;) {
-   const auto* image = lookup();
-   if (image && (!execution || !wait || images.at({image->source, image->image_id}).pixels)) return *image;
+   const auto inspected = inspect_locked(edition, record, objects);
+   if (inspected.conflict) throw CoconutPhysicalMembershipError(edition, id, "ambiguous physical image identity: " + record.file_name);
+   if (inspected.image && (!execution || !wait || inspected.image->pixels || (inspected.terminal && !inspected.repair)))
+    return inspected.image->physical();  // Final selection excludes unreadable pixels.
    if (!execution || !wait) break;
-   const auto selected = releases.find(edition);
-   if (selected == releases.end()) break;
-   if (std::ranges::all_of(selected->second, [](const auto* item) { return item->complete; })) {
-    Artifact* candidate = nullptr;
-    if (repair)
-     for (auto* item : selected->second) {
-      const auto& origin = item->archive->origin;
-      if (item->admissions >= 3) continue;
-      if (image && (origin.source != image->source || origin.shard != image->shard)) continue;
-      if (!image && ((objects && origin.source != objects->source) || (!objects && record.namespace_hint && origin.source != *record.namespace_hint))) continue;
-      if (!candidate || item->admissions < candidate->admissions) candidate = item;
-     }
-    if (!candidate) {
-     if (image) return *image;  // Final selection excludes unreadable pixels.
-     break;
-    }
-    candidate->complete = false;
-    auto* source = candidate->archive;
-    const auto reason = std::string(image ? "unreadable required image: " : "missing required image: ") + record.file_name;
+   if (auto claim = claim_repair_locked(inspected, record)) {
     lock.unlock();
+    notify(std::move(claim->notification));
     // The owning I/O controller repairs its source; this join never traverses
     // an archive or retains a CPU lane while waiting for its new facts.
-    repair(*source, reason);
+    repair(*claim->archive, std::move(claim->reason));
     lock.lock();
     continue;
    }
+   if (inspected.terminal) break;
    throw_if_benchmark_cancelled(cancellation);
    changed.wait_for(lock, std::chrono::milliseconds(100));
   }
@@ -227,47 +257,28 @@ const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespac
  const std::lock_guard lock(impl_->mutex);
  return impl_->find(source, id);
 }
-CoconutPhysicalMembership::Readiness CoconutPhysicalMembership::readiness(CoconutEdition edition,const CoconutRecord& record) const {
- const auto objects=admit_record(edition,record);
- const auto id=objects ? objects->id : record.image_id;
- AdmittedRecipeArchive* repair=nullptr;
+CoconutPhysicalMembership::Readiness CoconutPhysicalMembership::readiness(CoconutEdition edition, const CoconutRecord& record) const {
+ const auto objects = admit_record(edition, record);
+ std::optional<Impl::RepairClaim> claim;
  Readiness result;
  {
   const std::lock_guard lock(impl_->mutex);
-  result.generation=impl_->readiness_generation;
-  const auto sources=objects ? std::span<const CoconutImageNamespace>(&objects->source,1) : coconut_release_sources(edition);
-  bool conflict=false,pixels=false;
-  for (const auto source : sources) {
-   const auto found=impl_->images.find({source,id});
-   if (found==impl_->images.end() || !found->second.verified) continue;
-   const auto& value=found->second.physical();
-   if (impl_->execution) {
-    const auto selected=impl_->releases.find(edition);
-    if (selected==impl_->releases.end() || std::ranges::none_of(selected->second,[&](const auto* item) { return item->archive->origin.source==value.source && item->archive->origin.shard==value.shard; })) continue;
-   }
-   conflict|=found->second.conflict || result.image.has_value();
-   result.image=found->second.physical(); pixels=found->second.pixels;
-  }
-  const auto selected=impl_->releases.find(edition);
-  const bool terminal=!impl_->execution || selected==impl_->releases.end() || std::ranges::all_of(selected->second,[](const auto* item) { return item->complete; });
-  result.terminal=conflict || pixels || terminal;
-  if (conflict) result.image.reset();
-  if (terminal && !pixels && !conflict && impl_->repair && selected!=impl_->releases.end()) {
-   Impl::Artifact* candidate=nullptr;
-   for (auto* item : selected->second) {
-    const auto& origin=item->archive->origin;
-    if (item->admissions>=3) continue;
-    if (result.image && (origin.source!=result.image->source || origin.shard!=result.image->shard)) continue;
-    if (!result.image && ((objects && origin.source!=objects->source) || (!objects && record.namespace_hint && origin.source!=*record.namespace_hint))) continue;
-    if (!candidate || item->admissions<candidate->admissions) candidate=item;
-   }
-   if (candidate) { candidate->complete=false; repair=candidate->archive; result.terminal=false; }
-  }
-  if (!result.terminal) result.image.reset();
-  if (!impl_->readiness_change) impl_->readiness_change.emplace(impl_->execution ? &impl_->execution->execution() : nullptr);
-  result.changed=impl_->readiness_change->completion();
+  const auto inspected = impl_->inspect_locked(edition, record, objects);
+  // Allocate the next subscription before a repair claim changes the facts.
+  // Its generation is captured after that claim and before the owner is called.
+  Impl::Change next;
+  if (!impl_->readiness_change || inspected.repair) next.emplace(impl_->execution ? &impl_->execution->execution() : nullptr);
+  if (inspected.terminal && !inspected.repair && inspected.image) result.image = inspected.image->physical();
+  claim = impl_->claim_repair_locked(inspected, record);
+  result.terminal = inspected.terminal && !claim;
+  result.generation = impl_->readiness_generation;
+  if (next) impl_->readiness_change = std::move(next);
+  result.changed = impl_->readiness_change->completion();
  }
- if (repair) impl_->repair(*repair,"missing or unreadable required image: "+record.file_name);
+ if (claim) {
+  impl_->notify(std::move(claim->notification));
+  impl_->repair(*claim->archive, std::move(claim->reason));
+ }
  return result;
 }
 CoconutPhysicalImage CoconutPhysicalMembership::identify(CoconutEdition edition, const CoconutRecord& record) const { return impl_->resolve(edition, record, false); }
@@ -297,12 +308,16 @@ void CoconutPhysicalMembership::admitted(AdmittedRecipeArchive& archive, Downloa
   invalidate_cached_image_proofs(impl_->artifact(archive).root);
   if (impl_->progress) impl_->progress(CoconutEdition::Base, archive, 0, 0);
  }
- const std::lock_guard lock(impl_->mutex);
- archive.download = std::move(download);
- if (replacement) impl_->artifact(archive).inspected_cache_identity = archive.download.identity;
- impl_->artifact(archive).admitted = true;
- ++impl_->artifact(archive).admissions;
- impl_->notify_locked();
+ Impl::Change notification;
+ {
+  const std::lock_guard lock(impl_->mutex);
+  archive.download = std::move(download);
+  if (replacement) impl_->artifact(archive).inspected_cache_identity = archive.download.identity;
+  impl_->artifact(archive).admitted = true;
+  ++impl_->artifact(archive).admissions;
+  notification = impl_->advance_locked();
+ }
+ impl_->notify(std::move(notification));
 }
 bool CoconutPhysicalMembership::can_retry(const AdmittedRecipeArchive& archive) const {
  const std::lock_guard lock(impl_->mutex);
@@ -325,12 +340,14 @@ void CoconutPhysicalMembership::wait_sources(std::optional<CoconutEdition> editi
  }
 }
 void CoconutPhysicalMembership::unavailable(AdmittedRecipeArchive& archive) {
+ Impl::Change notification;
  {
   const std::lock_guard lock(impl_->mutex);
   impl_->artifact(archive).complete = true;
   impl_->artifact(archive).admissions = 3;
+  notification = impl_->advance_locked();
  }
- impl_->notify();
+ impl_->notify(std::move(notification));
 }
 bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const std::function<void(const CoconutPhysicalImage&, std::string_view)>& rejected, bool cache_only) {
  auto& state = *impl_;
@@ -390,6 +407,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
  };
  const auto fact = [&](const CoconutPhysicalImage& image, bool verified, bool duplicate = false) -> std::optional<bool> {
   bool conflict = duplicate, pixels = false, retire = false;
+  Impl::Change notification;
   {
    const std::lock_guard lock(state.mutex);
    const auto withdraw = [&](Impl::Fact& value) {
@@ -418,10 +436,16 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
    conflict = found->second.conflict;
    pixels = found->second.pixels;
    if (conflict) withdraw(found->second);
-   state.notify_locked();
+   notification = state.advance_locked();
   }
-  if (conflict) {
+  try {
    if (retire) execution.retire_image(root, image.image_id);
+  } catch (...) {
+   state.notify(std::move(notification), std::current_exception());
+   throw;
+  }
+  state.notify(std::move(notification));
+  if (conflict) {
    if (rejected) rejected(image, "ambiguous physical image identity");
    return std::nullopt;
   }
@@ -442,6 +466,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   catch (const BenchmarkImageError& error) { reason = error.what(); }
   catch (const InvalidImageError& error) { reason = error.what(); }
   execution.retire_image(root, image.image_id);
+  Impl::Change notification;
   {
    const std::lock_guard lock(state.mutex);
    const auto found = state.images.find({image.source, image.image_id});
@@ -451,8 +476,9 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
     found->second.pixels = false;
     found->second.bytes = 0;
    }
+   notification = state.advance_locked();
   }
-  state.notify();
+  state.notify(std::move(notification));
   if (source_read) bad_image(image, reason);
   else if (replaying_inventory) cache_incomplete = true;
   else repairs.push_back(image);
@@ -472,6 +498,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
    if (failure) { image_failure(image, source_read, failure); return; }
    bool conflict = false;
    std::size_t completed = 0;
+   Impl::Change notification;
    {
     const std::lock_guard lock(state.mutex);
     const auto found = state.images.find({image.source, image.image_id});
@@ -485,9 +512,15 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
      image_fact.bytes = bytes;
     }
     completed = artifact.completed_images;
+    notification = state.advance_locked();
    }
-   if (conflict) execution.retire_image(root, image.image_id);
-   state.notify();
+   try {
+    if (conflict) execution.retire_image(root, image.image_id);
+   } catch (...) {
+    state.notify(std::move(notification), std::current_exception());
+    throw;
+   }
+   state.notify(std::move(notification));
    if (state.progress) state.progress(CoconutEdition::Base, archive, image.image_id, completed);
   });
  };
@@ -511,11 +544,14 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
     } catch (...) { image_failure(image, false, std::current_exception()); }
    });
    publications.drain();
+   Impl::Change notification;
    {
     const std::lock_guard lock(state.mutex);
     for (auto& [key, value] : state.images)
      if (key.first == archive.origin.source && value.image.shard == archive.origin.shard) value.verified = true;
+    notification = state.advance_locked();
    }
+   state.notify(std::move(notification));
    if (cache_incomplete) throw BenchmarkImageError("cached inventory has unreadable images");
    {
     const std::lock_guard lock(state.mutex);
@@ -652,6 +688,7 @@ BenchmarkSourcePublication CoconutPhysicalMembership::label_publication(CoconutE
 }
 void CoconutPhysicalMembership::withdraw(const AdmittedRecipeArchive& archive) {
  std::vector<std::uint64_t> withdrawn;
+ Impl::Change notification;
  {
   const std::lock_guard lock(impl_->mutex);
   impl_->artifact(archive).complete = false;
@@ -667,8 +704,14 @@ void CoconutPhysicalMembership::withdraw(const AdmittedRecipeArchive& archive) {
    withdrawn.push_back(image.image_id);
    return true;
   });
+  notification = impl_->advance_locked();
  }
- for (const auto id : withdrawn) impl_->execution->retire_image(impl_->root(archive.origin.source), id);
- impl_->notify();
+ try {
+  for (const auto id : withdrawn) impl_->execution->retire_image(impl_->root(archive.origin.source), id);
+ } catch (...) {
+  impl_->notify(std::move(notification), std::current_exception());
+  throw;
+ }
+ impl_->notify(std::move(notification));
 }
 }  // namespace mmltk::backend::data::benchmark_internal

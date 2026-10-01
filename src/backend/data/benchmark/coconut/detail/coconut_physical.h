@@ -70,13 +70,17 @@ public:
  CoconutPhysicalMembership& operator=(const CoconutPhysicalMembership&) = delete;
  struct Readiness {
   std::optional<CoconutPhysicalImage> image;
-  std::uint64_t generation=0;
-  bool terminal=false;
+  std::uint64_t generation = 0;
+  bool terminal = false;
   detail::CompileExecution::Completion changed;
  };
- // Snapshot and next-change subscription share the owner's generation lock.
- [[nodiscard]] Readiness readiness(CoconutEdition,const CoconutRecord&) const;
- // Annotation identity admission has no physical I/O or readiness wait.
+ // Snapshot and next-change subscription share the owner's generation lock;
+ // subscribers run after that lock is released. Terminal missing/ambiguous
+ // identities have no image; resolve supplies their contextual rejection.
+ // Terminal unreadable identities remain available for final pixel selection.
+ [[nodiscard]] Readiness readiness(CoconutEdition, const CoconutRecord&) const;
+ // Annotation identity admission has no physical I/O or readiness wait. A
+ // provisional identity supports normalization without granting eligibility.
  [[nodiscard]] CoconutPhysicalImage identify(CoconutEdition, const CoconutRecord&) const;
  [[nodiscard]] std::filesystem::path identity_root(CoconutImageNamespace) const;
  // One acquisition controller visits this source forward and publishes every
