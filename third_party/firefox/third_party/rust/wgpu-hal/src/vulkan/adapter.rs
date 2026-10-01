@@ -1,5 +1,5 @@
 use alloc::{borrow::ToOwned as _, boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
-use core::{ffi::CStr, marker::PhantomData};
+use core::{ffi::CStr, marker::PhantomData, sync::atomic::AtomicU64};
 
 use ash::{ext, google, khr, vk};
 use parking_lot::Mutex;
@@ -2756,8 +2756,9 @@ impl super::Adapter {
             device: Arc::clone(&shared),
             family_index,
             relay_semaphores: Mutex::new(relay_semaphores),
-            signal_semaphores: Arc::new(Mutex::new(SemaphoreList::new(SemaphoreListMode::Signal))),
+            signal_semaphores: Arc::new(Mutex::new(Vec::new())),
             wait_semaphores: Mutex::new(SemaphoreList::new(SemaphoreListMode::Wait)),
+            last_successful_submission: AtomicU64::new(0),
         };
 
         let allocation_sizes = AllocationSizes::from_memory_hints(memory_hints).into();

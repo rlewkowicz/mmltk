@@ -39,6 +39,7 @@ pub use adapter::PhysicalDeviceFeatures;
 
 use alloc::{
     boxed::Box,
+    collections::VecDeque,
     ffi::CString,
     sync::Arc,
     vec::Vec,
@@ -1090,6 +1091,10 @@ struct RelaySemaphores {
     /// The semaphore the next submission should signal when it has finished
     /// execution on the GPU.
     signal: vk::Semaphore,
+
+    /// Prepared second semaphore until the first submission succeeds. Failed
+    /// preparation/submission keeps both the current relay state and this spare.
+    spare: Option<vk::Semaphore>,
 }
 
 impl RelaySemaphores {
@@ -1097,24 +1102,29 @@ impl RelaySemaphores {
         Ok(Self {
             wait: None,
             signal: device.new_binary_semaphore("RelaySemaphores: 1")?,
+            spare: None,
         })
     }
 
-    /// Advances the semaphores, returning the semaphores that should be used for a submission.
-    fn advance(&mut self, device: &DeviceShared) -> Result<Self, crate::DeviceError> {
-        let old = self.clone();
+    /// Prepare without advancing the dependency to work that may be rejected.
+    fn prepare(&mut self, device: &DeviceShared) -> Result<Self, crate::DeviceError> {
+        if self.wait.is_none() && self.spare.is_none() {
+            self.spare = Some(device.new_binary_semaphore("RelaySemaphores: 2")?);
+        }
+        Ok(self.clone())
+    }
 
+    /// Called only after Vulkan accepted the submission using the current pair.
+    fn advance(&mut self) {
         match self.wait {
             None => {
-                self.wait = Some(old.signal);
-                self.signal = device.new_binary_semaphore("RelaySemaphores: 2")?;
+                self.wait = Some(self.signal);
+                self.signal = self.spare.take().expect("relay was prepared");
             }
             Some(ref mut wait) => {
                 mem::swap(wait, &mut self.signal);
             }
-        };
-
-        Ok(old)
+        }
     }
 
     /// Destroys the semaphores.
@@ -1122,6 +1132,9 @@ impl RelaySemaphores {
         unsafe {
             if let Some(wait) = self.wait {
                 device.destroy_semaphore(wait, None);
+            }
+            if let Some(spare) = self.spare {
+                device.destroy_semaphore(spare, None);
             }
             device.destroy_semaphore(self.signal, None);
         }
@@ -1133,58 +1146,101 @@ pub struct Queue {
     device: Arc<DeviceShared>,
     family_index: u32,
     relay_semaphores: Mutex<RelaySemaphores>,
-    signal_semaphores: Arc<Mutex<SemaphoreList>>,
+    signal_semaphores: Arc<Mutex<Vec<Arc<ExternalSignal>>>>,
     wait_semaphores: Mutex<SemaphoreList>,
+    last_successful_submission: AtomicU64,
 }
 
-/// An externally exported signal and its physical device custody. The owner may
-/// outlive the WebGPU queue registry, but not the completion of its submitted
-/// signal. Dropping a signal that has not yet been submitted cancels it.
-pub struct ExternalSignalSemaphore<C: fmt::Display> {
+/// Effect-only diagnostics supplied by the external signal's caller. Implementations
+/// must gate collection and formatting, and must not affect resource ownership.
+pub trait ExternalSignalContext: fmt::Display + Send + Sync {
+    fn diagnostics_enabled(&self) -> bool;
+
+    fn observe(
+        &self, event: &'static str, device: vk::Device, queue: vk::Queue,
+        semaphore: vk::Semaphore, submission: crate::FenceValue,
+        signal_count: usize, batch_count: usize,
+    );
+}
+
+struct ExternalSignal {
     raw: vk::Semaphore,
     device: Arc<DeviceShared>,
-    pending: Arc<Mutex<SemaphoreList>>,
+    value: Option<u64>,
     timeout_ns: u64,
-    fatal_context: C,
+    context: Box<dyn ExternalSignalContext>,
 }
 
-impl<C: fmt::Display> fmt::Debug for ExternalSignalSemaphore<C> {
+impl fmt::Debug for ExternalSignal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExternalSignalSemaphore")
+        f.debug_struct("ExternalSignal")
             .field("raw", &self.raw)
             .finish_non_exhaustive()
     }
 }
 
-impl<C: fmt::Display> ExternalSignalSemaphore<C> {
-    pub fn as_raw(&self) -> vk::Semaphore {
-        self.raw
+impl ExternalSignal {
+    fn observe(&self, event: &'static str, submission: crate::FenceValue) {
+        if !self.context.diagnostics_enabled() {
+            return;
+        }
+        self.context.observe(event, self.device.raw.handle(), self.device.raw_queue,
+            self.raw, submission, 1, 0);
+    }
+
+    fn observe_submission(&self, submission: crate::FenceValue, signals: usize, batches: usize) {
+        if !self.context.diagnostics_enabled() {
+            return;
+        }
+        self.context.observe("batch_submitted", self.device.raw.handle(), self.device.raw_queue,
+            self.raw, submission, signals, batches);
+    }
+
+    fn abort(&self, operation: &str, status: fmt::Arguments<'_>, submission: crate::FenceValue) -> ! {
+        report_fatal(operation, status, |line|
+            write!(line, "{}vk_device={:?} vk_queue={:?} vk_semaphore={:?} submission={submission} ",
+                self.context, self.device.raw.handle(), self.device.raw_queue, self.raw));
+        std::process::abort();
     }
 }
 
-impl<C: fmt::Display> Drop for ExternalSignalSemaphore<C> {
+impl Drop for ExternalSignal {
     fn drop(&mut self) {
-        // Submit takes the queue gate before draining the pending list. Release
-        // the list lock before taking that gate, preserving the same ordering.
-        let was_pending = self.pending.lock().remove(self.raw);
-        if !was_pending {
-            let result = unsafe {
-                submit_external_commands_and_wait(
-                    &self.device.raw, self.device.raw_queue,
-                    &self.device.queue_operation_gate, &[], self.timeout_ns,
-                    |line| write!(line, "{}vk_semaphore={:?} ", self.fatal_context, self.raw),
-                )
-            };
-            if let Err(error) = result {
-                // No completion proof: destroying a possibly submitted signal
-                // would be unsafe, even if its WebGPU registry entry is gone.
-                report_fatal("external_signal_retire", format_args!("{error:?}"), |line|
-                    write!(line, "{}vk_device={:?} vk_queue={:?} vk_semaphore={:?} ",
-                        self.fatal_context, self.device.raw.handle(), self.device.raw_queue, self.raw));
-                std::process::abort();
-            }
-        }
+        // Submitted references are released only by the fence's physical
+        // completion path. Neither this owner nor DeviceShared owns that fence.
         unsafe { self.device.raw.destroy_semaphore(self.raw, None) };
+        self.observe("retired", 0);
+    }
+}
+
+/// Canvas custody, independent of the reference held by an actual submission.
+/// Dropping an unsent handle cancels that exact pending signal; dropping a
+/// submitted handle never submits work or waits for the GPU on the calling thread.
+#[derive(Debug)]
+pub struct ExternalSignalSemaphore {
+    signal: Arc<ExternalSignal>,
+    pending: Arc<Mutex<Vec<Arc<ExternalSignal>>>>,
+}
+
+impl ExternalSignalSemaphore {
+    pub fn as_raw(&self) -> vk::Semaphore {
+        self.signal.raw
+    }
+}
+
+impl Drop for ExternalSignalSemaphore {
+    fn drop(&mut self) {
+        // Submit holds this lock until custody has moved to the fence. Drop
+        // never takes the queue gate, so it cannot invert submit's lock order.
+        let cancelled = {
+            let mut pending = self.pending.lock();
+            pending.iter().position(|signal| Arc::ptr_eq(signal, &self.signal))
+                .map(|index| pending.swap_remove(index))
+        };
+        if cancelled.is_some() {
+            self.signal.observe("cancelled", 0);
+        }
+        self.signal.observe("handle_released", 0);
     }
 }
 
@@ -1238,6 +1294,7 @@ impl fmt::Debug for Queue {
             relay_semaphores: _,
             signal_semaphores: _,
             wait_semaphores: _,
+            last_successful_submission: _,
         } = self;
         f.debug_struct("Queue")
             .field("family_index", family_index)
@@ -1776,18 +1833,26 @@ impl crate::DynQuerySet for QuerySet {}
 /// Vulkan, and Vulkan timeline semaphores, which are easier and cheaper but
 /// require non-1.0 features.
 ///
-/// [`Device::create_fence`] returns a [`TimelineSemaphore`] if
+/// [`Device::create_fence`] uses a Vulkan timeline semaphore if
 /// [`VK_KHR_timeline_semaphore`] is available and enabled, and a [`FencePool`]
 /// otherwise.
 ///
 /// [`Api::Fence`]: crate::Api::Fence
 /// [`vulkan::Api`]: Api
 /// [`Device::create_fence`]: crate::Device::create_fence
-/// [`TimelineSemaphore`]: Fence::TimelineSemaphore
 /// [`VK_KHR_timeline_semaphore`]: https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#VK_KHR_timeline_semaphore
-/// [`FencePool`]: Fence::FencePool
+/// [`FencePool`]: FencePool
 #[derive(Debug)]
-pub enum Fence {
+pub struct Fence {
+    raw: FenceKind,
+    /// One entry per admitted signal, in successful submission order. Capacity
+    /// is reused as completed entries leave the front; this owns no queue/core
+    /// device and therefore cannot form a device/fence ownership cycle.
+    external_signals: Mutex<VecDeque<(crate::FenceValue, Arc<ExternalSignal>)>>,
+}
+
+#[derive(Debug)]
+enum FenceKind {
     /// A Vulkan [timeline semaphore].
     ///
     /// These are simpler to use than Vulkan fences, since timeline semaphores
@@ -1835,6 +1900,31 @@ pub struct FencePool {
 impl crate::DynFence for Fence {}
 
 impl Fence {
+    fn new(raw: FenceKind) -> Self {
+        Self { raw, external_signals: Mutex::new(VecDeque::new()) }
+    }
+
+    fn retire_external_signals(&self, completed: crate::FenceValue) {
+        loop {
+            let retired = {
+                let mut signals = self.external_signals.lock();
+                if signals.front().is_some_and(|(value, _)| *value <= completed) {
+                    signals.pop_front()
+                } else {
+                    None
+                }
+            };
+            let Some((submission, signal)) = retired else { break };
+            // Neither destruction nor the diagnostic sink runs under the
+            // retirement lock. Only a queried/waited physical fence reaches here.
+            signal.observe("completed", submission);
+        }
+    }
+
+    fn last_external_signal(&self) -> Option<(crate::FenceValue, Arc<ExternalSignal>)> {
+        self.external_signals.lock().back().cloned()
+    }
+
     /// Return the highest [`FenceValue`] among the signalled fences in `active`.
     ///
     /// As an optimization, assume that we already know that the fence has
@@ -1870,8 +1960,8 @@ impl Fence {
         device: &ash::Device,
         extension: Option<&ExtensionFn<khr::timeline_semaphore::Device>>,
     ) -> Result<crate::FenceValue, crate::DeviceError> {
-        match *self {
-            Self::TimelineSemaphore(raw) => unsafe {
+        let completed = match self.raw {
+            FenceKind::TimelineSemaphore(raw) => unsafe {
                 Ok(match *extension.unwrap() {
                     ExtensionFn::Extension(ref ext) => ext
                         .get_semaphore_counter_value(raw)
@@ -1881,7 +1971,7 @@ impl Fence {
                         .map_err(map_host_device_oom_and_lost_err)?,
                 })
             },
-            Self::FencePool(ref pool) => {
+            FenceKind::FencePool(ref pool) => {
                 let FencePool {
                     last_completed,
                     ref active,
@@ -1889,7 +1979,9 @@ impl Fence {
                 } = *pool.read();
                 Self::check_active(device, last_completed, active)
             }
-        }
+        }?;
+        self.retire_external_signals(completed);
+        Ok(completed)
     }
 
     /// Trim the internal state of this [`Fence`].
@@ -1902,12 +1994,12 @@ impl Fence {
     /// [`Queue::submit`] will just keep allocating a new Vulkan fence every
     /// time it's called.
     ///
-    /// [`FencePool`]: Fence::FencePool
+    /// [`FencePool`]: FencePool
     /// [`Queue::submit`]: crate::Queue::submit
     fn maintain(&self, device: &ash::Device) -> Result<(), crate::DeviceError> {
-        match *self {
-            Self::TimelineSemaphore(_) => {}
-            Self::FencePool(ref pool) => {
+        match self.raw {
+            FenceKind::TimelineSemaphore(_) => {}
+            FenceKind::FencePool(ref pool) => {
                 let FencePool {
                     ref mut last_completed,
                     ref mut active,
@@ -1985,17 +2077,12 @@ impl crate::Queue for Queue {
             signal_semaphores.push_signal(signal_semaphore);
         }
 
-        let mut guard = self.signal_semaphores.lock();
-        if !guard.is_empty() {
-            signal_semaphores.append(&mut guard);
-        }
-
         let mut wait_guard = self.wait_semaphores.lock();
         if !wait_guard.is_empty() {
             wait_semaphores.append(&mut wait_guard);
         }
 
-        let semaphore_state = self.relay_semaphores.lock().advance(&self.device)?;
+        let semaphore_state = self.relay_semaphores.lock().prepare(&self.device)?;
 
         if let Some(sem) = semaphore_state.wait {
             wait_semaphores.push_wait(
@@ -2007,18 +2094,23 @@ impl crate::Queue for Queue {
         signal_semaphores.push_signal(SemaphoreType::Binary(semaphore_state.signal));
 
         signal_fence.maintain(&self.device.raw)?;
-        let shared_fence;
-        match *signal_fence {
-            Fence::TimelineSemaphore(raw) => {
-                signal_semaphores.push_signal(SemaphoreType::Timeline(raw, signal_value));
+        let mut pending_signals = self.signal_semaphores.lock();
+        let mut completion_semaphore = None;
+        let shared_fence = match signal_fence.raw {
+            FenceKind::TimelineSemaphore(raw) => {
+                if pending_signals.is_empty() {
+                    signal_semaphores.push_signal(SemaphoreType::Timeline(raw, signal_value));
+                } else {
+                    completion_semaphore = Some(raw);
+                }
+                None
             }
-            Fence::FencePool(ref pool) => {
+            FenceKind::FencePool(ref pool) => {
                 let FencePool {
-                    ref mut active,
                     ref mut free,
                     ..
                 } = *pool.write();
-                shared_fence = match free.pop() {
+                let shared_fence = match free.pop() {
                     Some(raw) => Arc::new(raw),
                     None => unsafe {
                         let fence = self
@@ -2030,9 +2122,20 @@ impl crate::Queue for Queue {
                     },
                 };
                 fence_raw = *shared_fence;
-                active.push((signal_value, shared_fence.clone()));
+                Some(shared_fence)
             }
+        };
+
+        // Keep unsent owners in the pending list through every fallible setup
+        // step. Cancellation serializes here, without acquiring the queue gate.
+        for signal in pending_signals.iter() {
+            signal_semaphores.push_signal(match signal.value {
+                Some(value) => SemaphoreType::Timeline(signal.raw, value),
+                None => SemaphoreType::Binary(signal.raw),
+            });
         }
+        let mut submitted_signals = signal_fence.external_signals.lock();
+        submitted_signals.reserve(pending_signals.len());
 
         let vk_cmd_buffers = command_buffers
             .iter()
@@ -2048,12 +2151,52 @@ impl crate::Queue for Queue {
             &mut vk_timeline_info,
         );
 
-        unsafe {
+        // Signals in one VkSubmitInfo are unordered relative to one another.
+        // Put the existing core timeline signal after the exported signals in
+        // the same queue-submit call, making its value proof that they finished.
+        // A VkFence already signals after every semaphore in the call.
+        let completion_semaphores = [completion_semaphore.unwrap_or(vk::Semaphore::null())];
+        let completion_values = [signal_value];
+        let mut completion_timeline = vk::TimelineSemaphoreSubmitInfo::default()
+            .signal_semaphore_values(&completion_values);
+        let completion_info = vk::SubmitInfo::default()
+            .signal_semaphores(&completion_semaphores)
+            .push_next(&mut completion_timeline);
+        let vk_infos = [vk_info, completion_info];
+        let info_count = if completion_semaphore.is_some() { 2 } else { 1 };
+        let result = unsafe {
             self.device
                 .raw
-                .queue_submit(self.raw, &[vk_info], fence_raw)
-                .map_err(map_host_device_oom_and_lost_err)?
+                .queue_submit(self.raw, &vk_infos[..info_count], fence_raw)
         };
+        if let Err(error) = result {
+            if !matches!(error, vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) {
+                if let Some(signal) = pending_signals.first() {
+                    // Only OOM guarantees Vulkan left the submitted operations
+                    // untouched. Device loss/unknown status cannot cancel custody.
+                    signal.abort("external_signal_submit", format_args!("{error:?}"), signal_value);
+                }
+            }
+            if let (FenceKind::FencePool(pool), Some(fence)) = (&signal_fence.raw, shared_fence) {
+                pool.write().free.push(*fence);
+            }
+            return Err(map_host_device_oom_and_lost_err(error));
+        }
+
+        // Publish only actual Vk success. The retirement lock spans submit and
+        // transfer so a concurrent completion query cannot miss a finished batch.
+        if let Some(signal) = pending_signals.first() {
+            signal.observe_submission(signal_value, pending_signals.len(), info_count);
+        }
+        for signal in pending_signals.drain(..) {
+            signal.observe("submitted", signal_value);
+            submitted_signals.push_back((signal_value, signal));
+        }
+        if let (FenceKind::FencePool(pool), Some(fence)) = (&signal_fence.raw, shared_fence) {
+            pool.write().active.push((signal_value, fence));
+        }
+        self.relay_semaphores.lock().advance();
+        self.last_successful_submission.store(signal_value, Ordering::Release);
         Ok(())
     }
 
@@ -2099,29 +2242,36 @@ impl Queue {
         Arc::clone(&self.device.queue_operation_gate)
     }
 
+    /// Actual Vulkan submission receipt, also available when a later core API
+    /// operation failed. This is a wait target, never a completion receipt.
+    pub fn last_successful_submission(&self) -> crate::FenceValue {
+        self.last_successful_submission.load(Ordering::Acquire)
+    }
+
     /// Take ownership of an external semaphore and signal it on the next submit.
-    /// Caller identity is retained without formatting and used only on a fatal path.
+    /// Caller identity is retained without formatting for fatal and opt-in diagnostics.
     ///
     /// # Safety
     ///
-    /// `semaphore` must belong to this device. The returned owner is its sole
-    /// Vulkan owner; callers must not submit other operations using this handle.
-    pub unsafe fn own_signal_semaphore<C: fmt::Display>(
+    /// `semaphore` must belong to this device. The returned handle and submission
+    /// fence share its sole Vulkan owner; callers must not submit other operations
+    /// using this handle.
+    pub unsafe fn own_signal_semaphore<C: ExternalSignalContext + 'static>(
         &self, semaphore: vk::Semaphore, semaphore_value: Option<u64>, timeout_ns: u64,
         fatal_context: C,
-    ) -> ExternalSignalSemaphore<C> {
-        let mut guard = self.signal_semaphores.lock();
-        if let Some(value) = semaphore_value {
-            guard.push_signal(SemaphoreType::Timeline(semaphore, value));
-        } else {
-            guard.push_signal(SemaphoreType::Binary(semaphore));
-        }
-        ExternalSignalSemaphore {
+    ) -> ExternalSignalSemaphore {
+        let signal = Arc::new(ExternalSignal {
             raw: semaphore,
             device: Arc::clone(&self.device),
-            pending: Arc::clone(&self.signal_semaphores),
+            value: semaphore_value,
             timeout_ns,
-            fatal_context,
+            context: Box::new(fatal_context),
+        });
+        signal.observe("created", 0);
+        self.signal_semaphores.lock().push(Arc::clone(&signal));
+        ExternalSignalSemaphore {
+            signal,
+            pending: Arc::clone(&self.signal_semaphores),
         }
     }
 

@@ -874,6 +874,16 @@ void WebGPUParent::QueueSubmit(RawId aQueueId, RawId aDeviceId,
                                Span<const RawId> aCommandBuffers,
                                Span<const RawId> aTextureIds,
                                Span<const RawId> aExternalTextureSourceIds) {
+  auto cancelCanvasPreparation = MakeScopeExit([&] {
+    // Include textures not reached before a preparation/export failure: none
+    // of this attempt's textures may publish a preceding submission descriptor.
+    for (const auto& textureId : aTextureIds) {
+      auto it = mSharedTextures.find(textureId);
+      if (it != mSharedTextures.end()) {
+        it->second->CancelQueueSubmit();
+      }
+    }
+  });
   for (const auto& textureId : aTextureIds) {
     auto it = mSharedTextures.find(textureId);
     if (it != mSharedTextures.end()) {
@@ -915,6 +925,7 @@ void WebGPUParent::QueueSubmit(RawId aQueueId, RawId aDeviceId,
         }
       }
     }
+    cancelCanvasPreparation.release();
   }
   ForwardError(error);
 }

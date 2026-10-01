@@ -2440,21 +2440,39 @@ impl crate::Device for super::Device {
             let raw = unsafe { self.shared.raw.create_semaphore(&vk_info, None) }
                 .map_err(super::map_host_device_oom_err)?;
 
-            super::Fence::TimelineSemaphore(raw)
+            super::Fence::new(super::FenceKind::TimelineSemaphore(raw))
         } else {
-            super::Fence::FencePool(RwLock::new(super::FencePool {
+            super::Fence::new(super::FenceKind::FencePool(RwLock::new(super::FencePool {
                 last_completed: 0,
                 active: Vec::new(),
                 free: Vec::new(),
-            }))
+            })))
         })
     }
     unsafe fn destroy_fence(&self, fence: super::Fence) {
-        match fence {
-            super::Fence::TimelineSemaphore(raw) => {
+        // Registry/device teardown may reach here without another core poll.
+        // Query first; only a still-outstanding batch needs the existing bounded
+        // wait, once for the fence rather than once per exported handle.
+        if let Some((value, signal)) = fence.last_external_signal() {
+            if fence.get_latest(&self.shared.raw,
+                self.shared.extension_fns.timeline_semaphore.as_ref()).is_err()
+                || fence.last_external_signal().is_some()
+            {
+                signal.observe("retirement_wait", value);
+                match self.shared.wait_for_fence_raw(&fence, value, signal.timeout_ns) {
+                    Ok(true) => fence.retire_external_signals(value),
+                    Ok(false) => signal.abort("external_signal_retire",
+                        format_args!("{:?}", vk::Result::TIMEOUT), value),
+                    Err(error) => signal.abort("external_signal_retire",
+                        format_args!("{error:?}"), value),
+                }
+            }
+        }
+        match fence.raw {
+            super::FenceKind::TimelineSemaphore(raw) => {
                 unsafe { self.shared.raw.destroy_semaphore(raw, None) };
             }
-            super::Fence::FencePool(pool) => {
+            super::FenceKind::FencePool(pool) => {
                 let super::FencePool {
                     active,
                     free,
@@ -2942,8 +2960,23 @@ impl super::DeviceShared {
         wait_value: crate::FenceValue,
         timeout_ns: u64,
     ) -> Result<bool, crate::DeviceError> {
-        match *fence {
-            super::Fence::TimelineSemaphore(raw) => {
+        let completed = self.wait_for_fence_raw(fence, wait_value, timeout_ns)
+            .map_err(super::map_host_device_oom_and_lost_err)?;
+        if completed {
+            fence.retire_external_signals(wait_value);
+        }
+        Ok(completed)
+    }
+
+    /// Retain the original Vulkan status for terminal external-custody failures.
+    fn wait_for_fence_raw(
+        &self,
+        fence: &super::Fence,
+        wait_value: crate::FenceValue,
+        timeout_ns: u64,
+    ) -> Result<bool, vk::Result> {
+        match fence.raw {
+            super::FenceKind::TimelineSemaphore(raw) => {
                 let semaphores = [raw];
                 let values = [wait_value];
                 let vk_info = vk::SemaphoreWaitInfo::default()
@@ -2961,10 +2994,10 @@ impl super::DeviceShared {
                 match result {
                     Ok(()) => Ok(true),
                     Err(vk::Result::TIMEOUT) => Ok(false),
-                    Err(other) => Err(super::map_host_device_oom_and_lost_err(other)),
+                    Err(other) => Err(other),
                 }
             }
-            super::Fence::FencePool(ref pool) => {
+            super::FenceKind::FencePool(ref pool) => {
                 let pool = pool.read();
                 let super::FencePool {
                     last_completed,
@@ -2987,7 +3020,7 @@ impl super::DeviceShared {
                             } {
                                 Ok(()) => Ok(true),
                                 Err(vk::Result::TIMEOUT) => Ok(false),
-                                Err(other) => Err(super::map_host_device_oom_and_lost_err(other)),
+                                Err(other) => Err(other),
                             }
                         }
                         None => {

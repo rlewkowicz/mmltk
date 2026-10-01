@@ -63,6 +63,9 @@ class SharedTexture {
 
   virtual bool onBeforeQueueSubmit(RawId aQueueId) { return true; }
 
+  // Withdraw this attempt's descriptor and any signal not actually submitted.
+  virtual void CancelQueueSubmit() { mSubmissionIndex = 0; }
+
   virtual void CleanForRecycling() { mSubmissionIndex = 0; }
 
   virtual bool IsSubmitted() { return mSubmissionIndex > 0; }

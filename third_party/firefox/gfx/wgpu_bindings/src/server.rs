@@ -6317,17 +6317,25 @@ pub unsafe extern "C" fn wgpu_server_queue_submit(
     command_buffers: FfiSlice<'_, id::CommandBufferId>,
     mut error_buf: ErrorBuffer,
 ) -> u64 {
+    // Retain the queue across the call and read its actual Vk submission receipt.
+    // A core error's requested index is not proof that work reached Vulkan.
+    let hal_queue = global.queue_as_hal::<wgc::api::Vulkan>(self_id);
     let result = global.queue_submit(self_id, command_buffers.as_slice());
 
     match result {
-        Err((_index, err)) => {
+        Err((index, err)) => {
+            if hal_queue.as_ref().is_some_and(|queue| queue.last_successful_submission() == index) {
+                // Match this attempt to an independent successful Vk receipt.
+                // Core has registered this submission before later maintenance
+                // can fail. Never schedule a newer concurrently submitting
+                // attempt whose core registration may still be in progress.
+                global.device_poll_workers.wait_for(device_id, index);
+            }
             error_buf.init(err, device_id);
             return 0;
         }
         Ok(wrapped_index) => {
-            global
-                .device_poll_workers
-                .wait_for(device_id, wrapped_index);
+            global.device_poll_workers.wait_for(device_id, wrapped_index);
             wrapped_index
         }
     }
@@ -6342,6 +6350,7 @@ pub struct SubmittedWorkDoneClosure {
 struct CanvasSignalContext {
     owner: WebGPUParentPtr,
     queue_id: id::QueueId,
+    diagnostic_created: Option<std::time::Instant>,
 }
 
 impl std::fmt::Display for CanvasSignalContext {
@@ -6350,8 +6359,25 @@ impl std::fmt::Display for CanvasSignalContext {
     }
 }
 
+impl wgh::vulkan::ExternalSignalContext for CanvasSignalContext {
+    fn diagnostics_enabled(&self) -> bool {
+        self.diagnostic_created.is_some()
+    }
+
+    fn observe(
+        &self, event: &'static str, device: vk::Device, queue: vk::Queue,
+        semaphore: vk::Semaphore, submission: wgh::FenceValue,
+        signal_count: usize, batch_count: usize,
+    ) {
+        let Some(created) = self.diagnostic_created else { return };
+        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+            "{{\"event\":\"firefox.canvas.signal_{event}\",\"actor\":\"{:p}\",\"queue\":\"{:?}\",\"vk_device\":\"{device:?}\",\"vk_queue\":\"{queue:?}\",\"vk_semaphore\":\"{semaphore:?}\",\"submission\":{submission},\"count\":1,\"signal_count\":{signal_count},\"batch_count\":{batch_count},\"queue_submit_calls\":{},\"age_ns\":{}}}",
+            self.owner.0, self.queue_id, usize::from(batch_count != 0), created.elapsed().as_nanos()));
+    }
+}
+
 pub struct VkSemaphoreHandle {
-    semaphore: wgh::vulkan::ExternalSignalSemaphore<CanvasSignalContext>,
+    semaphore: wgh::vulkan::ExternalSignalSemaphore,
 }
 
 #[no_mangle]
@@ -6380,13 +6406,14 @@ pub extern "C" fn wgpu_vksemaphore_create_signal_semaphore(
             Ok(semaphore) => semaphore,
         };
 
-        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
-            "{{\"event\":\"firefox.canvas.signal_created\",\"vk_device\":\"{:?}\",\"vk_queue\":\"{:?}\",\"vk_semaphore\":\"{:?}\"}}",
-            device.handle(), hal_queue.as_raw(), semaphore));
         VkSemaphoreHandle {
             semaphore: hal_queue.own_signal_semaphore(
                 semaphore, None, MMLTK_WORKSPACE_QUEUE_TIMEOUT_NS,
-                CanvasSignalContext { owner: global.owner, queue_id },
+                CanvasSignalContext {
+                    owner: global.owner, queue_id,
+                    diagnostic_created: mmltk_workspace_channel::workspace_diagnostics_enabled()
+                        .then(std::time::Instant::now),
+                },
             ),
         }
     };
@@ -6428,14 +6455,7 @@ pub unsafe extern "C" fn wgpu_vksemaphore_get_file_descriptor(
 #[no_mangle]
 
 pub unsafe extern "C" fn wgpu_vksemaphore_delete(handle: *mut VkSemaphoreHandle) {
-    let diagnostic_semaphore = mmltk_workspace_channel::workspace_diagnostics_enabled()
-        .then(|| (*handle).semaphore.as_raw());
     let _ = Box::from_raw(handle);
-    if let Some(semaphore) = diagnostic_semaphore {
-        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
-            "{{\"event\":\"firefox.canvas.signal_destroyed\",\"vk_semaphore\":\"{:?}\"}}",
-            semaphore));
-    }
 }
 
 #[no_mangle]

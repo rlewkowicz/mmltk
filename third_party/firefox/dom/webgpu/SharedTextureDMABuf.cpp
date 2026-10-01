@@ -97,13 +97,19 @@ SharedTextureDMABuf::~SharedTextureDMABuf() = default;
 
 void SharedTextureDMABuf::CleanForRecycling() {
   SharedTexture::CleanForRecycling();
-  mSemaphoreFds.Clear();
-  mVkSemaphoreHandles.Clear();
+  mSemaphoreFd = nullptr;
+  mVkSemaphoreHandle = nullptr;
+}
+
+void SharedTextureDMABuf::CancelQueueSubmit() {
+  // Dropping a submitted signal releases canvas custody only. The HAL fence
+  // retains its separate reference until physical completion.
+  CleanForRecycling();
 }
 
 Maybe<layers::SurfaceDescriptor> SharedTextureDMABuf::ToSurfaceDescriptor() {
   MOZ_ASSERT(mSubmissionIndex > 0);
-  if (mSemaphoreFds.IsEmpty()) {
+  if (!mSubmissionIndex || !mSemaphoreFd) {
     return Nothing();
   }
 
@@ -117,7 +123,7 @@ Maybe<layers::SurfaceDescriptor> SharedTextureDMABuf::ToSurfaceDescriptor() {
   }
 
   auto& sdDMABuf = sd.get_SurfaceDescriptorDMABuf();
-  sdDMABuf.semaphoreFd() = mSemaphoreFds.LastElement();
+  sdDMABuf.semaphoreFd() = mSemaphoreFd;
 
   return Some(sd);
 }
@@ -172,7 +178,7 @@ const ffi::WGPUVkImageHandle* SharedTextureDMABuf::GetHandle() {
 
 bool SharedTextureDMABuf::onBeforeQueueSubmit(RawId aQueueId) {
   // A failed new submission must not reuse a preceding completion fence.
-  mSubmissionIndex = 0;
+  CleanForRecycling();
   if (!mParent) {
     return false;
   }
@@ -197,9 +203,8 @@ bool SharedTextureDMABuf::onBeforeQueueSubmit(RawId aQueueId) {
     return false;
   }
 
-  mVkSemaphoreHandles.AppendElement(std::move(handle));
-  mSemaphoreFds.AppendElement(
-      new gfx::FileHandleWrapper(UniqueFileHandle(rawFd)));
+  mVkSemaphoreHandle = std::move(handle);
+  mSemaphoreFd = new gfx::FileHandleWrapper(UniqueFileHandle(rawFd));
   return true;
 }
 

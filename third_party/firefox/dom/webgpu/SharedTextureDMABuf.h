@@ -8,7 +8,6 @@
 #include "mozilla/WeakPtr.h"
 #include "mozilla/gfx/FileHandleWrapper.h"
 #include "mozilla/webgpu/SharedTexture.h"
-#include "nsTArrayForwardDeclare.h"
 
 class DMABufSurface;
 
@@ -43,6 +42,8 @@ class SharedTextureDMABuf final : public SharedTexture {
 
   bool onBeforeQueueSubmit(RawId aQueueId) override;
 
+  void CancelQueueSubmit() override;
+
   void CleanForRecycling() override;
 
   UniqueFileHandle CloneDmaBufFd();
@@ -53,10 +54,10 @@ class SharedTextureDMABuf final : public SharedTexture {
   const WeakPtr<WebGPUParent> mParent;
   const RawId mDeviceId;
   UniquePtr<VkImageHandle> mVkImageHandle;
-  nsTArray<UniquePtr<VkSemaphoreHandle>> mVkSemaphoreHandles;
+  UniquePtr<VkSemaphoreHandle> mVkSemaphoreHandle;
   RefPtr<DMABufSurface> mSurface;
   const layers::SurfaceDescriptorDMABuf mSurfaceDescriptor;
-  nsTArray<RefPtr<gfx::FileHandleWrapper>> mSemaphoreFds;
+  RefPtr<gfx::FileHandleWrapper> mSemaphoreFd;
 };
 
 }  
