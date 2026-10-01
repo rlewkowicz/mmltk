@@ -31,12 +31,15 @@ std::span<std::byte> CoconutStaging::Request::target() const {
  return target_;
 }
 CoconutStaging::CoconutStaging(const std::filesystem::path& directory, detail::StorageReservationPool* storage, std::size_t block_bytes)
- : directory_(directory.empty() ? std::filesystem::temp_directory_path() : directory), storage_(directory_, {}, storage), block_bytes_(block_bytes) {
+    : directory_(directory.empty() ? std::filesystem::temp_directory_path() : directory), storage_(directory_, {}, storage), block_bytes_(block_bytes) {
  if (!block_bytes_) throw std::invalid_argument("empty COCONut staging block");
 }
 void CoconutStaging::retire() noexcept {
  std::shared_ptr<Block> retired;
- { const std::lock_guard lock(mutex_); retired = std::move(active_); }
+ {
+  const std::lock_guard lock(mutex_);
+  retired = std::move(active_);
+ }
 }
 bool CoconutStaging::try_claim(Request& request) {
  if (request.ready()) return true;
@@ -69,10 +72,13 @@ void CoconutStaging::prepare(Request& request, const detail::CompileAllowance& d
 void CoconutStaging::prepare(Request& request, detail::CompileExecution* execution, detail::FileWorkQueue* files, const detail::CompileAllowance& parent) {
  if (execution && (!files || execution->on_lane())) throw std::logic_error("COCONut staging preparation requires a controller and its file service");
  if (try_claim(request)) return;
- if (!execution) { prepare(request, detail::CompileAllowance{}); return; }
+ if (!execution) {
+  prepare(request, detail::CompileAllowance{});
+  return;
+ }
  // The mapped block owns its retained controls; preparation needs one raw
  // descriptor and no additional transient payload or supplied workspace.
- const auto descriptor = execution->reserve({.descriptors=1}, parent);
+ const auto descriptor = execution->reserve({.descriptors = 1}, parent);
  files->submit({.work = [this, &request, descriptor] { prepare(request, descriptor); }}).wait();
 }
-}
+}  // namespace mmltk::backend::data::benchmark_internal

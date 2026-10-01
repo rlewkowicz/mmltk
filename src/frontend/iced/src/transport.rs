@@ -513,30 +513,49 @@ mod tests {
 
     #[test]
     fn dataset_coalescing_keeps_discrete_settlement_and_new_generation_order() {
-        let mut state = crate::view_model::test_support::bootstrapped().workflow.dataset.unwrap();
+        let mut state = crate::view_model::test_support::bootstrapped()
+            .workflow
+            .dataset
+            .unwrap();
         let mut queue = std::collections::VecDeque::new();
-        let event = |state: &crate::generated::ArtifactUiState| TransportEvent::SystemEvent(crate::protocol::SystemEvent {
-            delivery: crate::generated::EventDelivery::LatestState,
-            state_revision: state.revision,
-            event: crate::generated::ApplicationEvent::DatasetDatasetProgress(crate::view_model::test_support::dataset_progress(state)),
-        });
+        let event = |state: &crate::generated::ArtifactUiState| {
+            TransportEvent::SystemEvent(crate::protocol::SystemEvent {
+                delivery: crate::generated::EventDelivery::LatestState,
+                state_revision: state.revision,
+                event: crate::generated::ApplicationEvent::DatasetDatasetProgress(
+                    crate::view_model::test_support::dataset_progress(state),
+                ),
+            })
+        };
         state.revision = 1;
         state.generation = 1;
         state.active = true;
         retain_event(&mut queue, event(&state)).unwrap();
         let stale = event(&state);
-        retain_event(&mut queue, TransportEvent::SystemEvent(crate::protocol::SystemEvent {
-            delivery: crate::generated::EventDelivery::Critical,
-            state_revision: 0,
-            event: crate::generated::ApplicationEvent::DatasetDatasetChanged(crate::generated::DatasetChanged { snapshot: state.clone() }),
-        })).unwrap();
+        retain_event(
+            &mut queue,
+            TransportEvent::SystemEvent(crate::protocol::SystemEvent {
+                delivery: crate::generated::EventDelivery::Critical,
+                state_revision: 0,
+                event: crate::generated::ApplicationEvent::DatasetDatasetChanged(
+                    crate::generated::DatasetChanged {
+                        snapshot: state.clone(),
+                    },
+                ),
+            }),
+        )
+        .unwrap();
         state.revision = 3;
         state.generation = 2;
         retain_event(&mut queue, event(&state)).unwrap();
         retain_event(&mut queue, stale).unwrap();
         assert_eq!(queue.len(), 2);
-        assert!(matches!(queue.pop_front(), Some(TransportEvent::SystemEvent(value)) if value.delivery == crate::generated::EventDelivery::Critical));
-        assert!(matches!(queue.pop_front(), Some(TransportEvent::SystemEvent(value)) if value.state_revision == 3));
+        assert!(
+            matches!(queue.pop_front(), Some(TransportEvent::SystemEvent(value)) if value.delivery == crate::generated::EventDelivery::Critical)
+        );
+        assert!(
+            matches!(queue.pop_front(), Some(TransportEvent::SystemEvent(value)) if value.state_revision == 3)
+        );
     }
 
     #[test]

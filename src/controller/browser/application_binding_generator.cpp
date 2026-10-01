@@ -1306,9 +1306,7 @@ private:
   output_ << "} }\n}\n";
  }
  void EmitImageMetadata() {
-  Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
-   EmitRecordProjection<typename Projection::snapshot_type, typename Projection::image_type>(false, false);
-  });
+  Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() { EmitRecordProjection<typename Projection::snapshot_type, typename Projection::image_type>(false, false); });
   symbols_.Reserve("module", "WorkspaceImageProduct", "canonical visual source image projections");
   symbols_.Reserve("module", "decode_workspace_image_product", "canonical visual source image projections");
   output_ << "#[derive(Debug, Clone, PartialEq)]\npub enum WorkspaceImageProduct {\n";

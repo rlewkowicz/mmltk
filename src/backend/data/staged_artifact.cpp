@@ -53,7 +53,8 @@ StagedArtifact StagedArtifact::create(
  return result;
 }
 StagedArtifact::StagedArtifact(StagedArtifact&& other) noexcept
-    : mutation_(std::move(other.mutation_)), allocation_(std::move(other.allocation_)),
+    : mutation_(std::move(other.mutation_)),
+      allocation_(std::move(other.allocation_)),
       path_(std::move(other.path_)),
       temporary_(std::move(other.temporary_)),
       cleanup_(std::exchange(other.cleanup_, false)),
@@ -81,10 +82,14 @@ void StagedArtifact::discard() noexcept {
  }
  allocation_.release();
 }
-std::uint64_t StagedArtifact::reconcile_locked() { const auto allocated=StorageReservationPool::allocated_bytes(file_.get()); allocation_.reconcile_allocated(allocated); return allocated; }
+std::uint64_t StagedArtifact::reconcile_locked() {
+ const auto allocated = StorageReservationPool::allocated_bytes(file_.get());
+ allocation_.reconcile_allocated(allocated);
+ return allocated;
+}
 void StagedArtifact::preallocate(std::size_t bytes) {
  const std::lock_guard lock(mutation_->mutex);
- allocation_.grow(bytes,"staged allocation");
+ allocation_.grow(bytes, "staged allocation");
  allocation_.withdraw_allocation();
  mutation_->occupied.clear();
  file_.preallocate(bytes);
@@ -108,7 +113,10 @@ void StagedArtifact::forget_range(std::size_t begin, std::size_t end) {
   const auto first = it->first, last = it->second;
   it = ranges.erase(it);
   if (first < begin) ranges.emplace(first, begin);
-  if (last > end) { ranges.emplace(end, last); break; }
+  if (last > end) {
+   ranges.emplace(end, last);
+   break;
+  }
  }
 }
 void StagedArtifact::resize_sparse(std::size_t bytes) {
@@ -116,9 +124,9 @@ void StagedArtifact::resize_sparse(std::size_t bytes) {
  // Invalidate the allocation observation before even a zero-growth mutation.
  allocation_.withdraw_allocation();
  file_.resize_sparse(bytes);
- const auto occupied_end=common::math::checked_add(bytes,std::size_t{4095},"staged page extent overflow")/4096*4096;
+ const auto occupied_end = common::math::checked_add(bytes, std::size_t{4095}, "staged page extent overflow") / 4096 * 4096;
  forget_range(occupied_end, std::numeric_limits<std::size_t>::max());
- allocation_.resize(reconcile_locked(),"sparse staged allocation");
+ allocation_.resize(reconcile_locked(), "sparse staged allocation");
 }
 void StagedArtifact::allocate_range(std::size_t offset, std::size_t bytes) {
  if (!bytes) return;
@@ -129,14 +137,16 @@ void StagedArtifact::allocate_range(std::size_t offset, std::size_t bytes) {
  const std::lock_guard lock(mutation_->mutex);
  auto& ranges = mutation_->occupied;
  auto it = ranges.upper_bound(begin);
- if (it != ranges.begin()) { auto previous = std::prev(it); if (previous->second >= end) return; }
+ if (it != ranges.begin()) {
+  auto previous = std::prev(it);
+  if (previous->second >= end) return;
+ }
  // Charge only uncovered pages. All callers share this inode mutation owner,
  // including compaction destinations reusing already-backed source pages.
  std::size_t uncovered = end - begin;
  it = ranges.lower_bound(begin);
  if (it != ranges.begin() && std::prev(it)->second > begin) --it;
- for (auto scan = it; scan != ranges.end() && scan->first < end; ++scan)
-  uncovered -= std::min(end, scan->second) - std::max(begin, scan->first);
+ for (auto scan = it; scan != ranges.end() && scan->first < end; ++scan) uncovered -= std::min(end, scan->second) - std::max(begin, scan->first);
  const auto allocated = StorageReservationPool::allocated_bytes(file_.get());
  allocation_.reconcile_allocated(allocated);
  allocation_.resize(checked_add(allocated, static_cast<std::uint64_t>(uncovered), "staged growth overflow"), "occupied staged extent");
@@ -145,27 +155,38 @@ void StagedArtifact::allocate_range(std::size_t offset, std::size_t bytes) {
  auto first = begin, last = end;
  it = ranges.lower_bound(begin);
  if (it != ranges.begin() && std::prev(it)->second >= begin) --it;
- while (it != ranges.end() && it->first <= last) { first = std::min(first,it->first); last = std::max(last,it->second); it = ranges.erase(it); }
- ranges.emplace(first,last);
- try { file_.allocate_range(begin, end - begin); }
- catch (...) { forget_range(begin,end); throw; }
+ while (it != ranges.end() && it->first <= last) {
+  first = std::min(first, it->first);
+  last = std::max(last, it->second);
+  it = ranges.erase(it);
+ }
+ ranges.emplace(first, last);
+ try {
+  file_.allocate_range(begin, end - begin);
+ } catch (...) {
+  forget_range(begin, end);
+  throw;
+ }
  allocation_.resize(reconcile_locked(), "occupied staged allocation");
 }
 bool StagedArtifact::reclaim_range(std::size_t offset, std::size_t bytes) {
  if (!bytes) return true;
  const std::lock_guard lock(mutation_->mutex);
- const auto end = common::math::checked_add(offset,bytes,"staged reclaim overflow");
+ const auto end = common::math::checked_add(offset, bytes, "staged reclaim overflow");
  allocation_.withdraw_allocation();
- const auto reclaimed = file_.punch_hole(offset,bytes);
+ const auto reclaimed = file_.punch_hole(offset, bytes);
  if (reclaimed) {
-  const auto first=common::math::checked_add(offset,std::size_t{4095},"staged reclaim page overflow")/4096*4096;
-  const auto last=end/4096*4096;
-  if (first<last) forget_range(first,last);
+  const auto first = common::math::checked_add(offset, std::size_t{4095}, "staged reclaim page overflow") / 4096 * 4096;
+  const auto last = end / 4096 * 4096;
+  if (first < last) forget_range(first, last);
  }
  allocation_.resize(reconcile_locked(), "reclaimed staged allocation");
  return reclaimed;
 }
-void StagedArtifact::reconcile() { const std::lock_guard lock(mutation_->mutex); (void)reconcile_locked(); }
+void StagedArtifact::reconcile() {
+ const std::lock_guard lock(mutation_->mutex);
+ (void)reconcile_locked();
+}
 void StagedArtifact::close() {
  if (file_.get() >= 0) {
   reconcile();
@@ -189,4 +210,4 @@ void StagedArtifact::publish(const std::filesystem::path& destination, mmltk::co
  cleanup_ = false;
  allocation_.release();
 }
-}
+}  // namespace mmltk::backend::data::detail

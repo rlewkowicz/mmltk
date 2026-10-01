@@ -5,7 +5,9 @@
 #include <functional>
 #include <memory>
 #include <optional>
-namespace mmltk::common::concurrency { class WorkerPool; }
+namespace mmltk::common::concurrency {
+class WorkerPool;
+}
 namespace mmltk::backend::data::detail {
 // Prepared borrowed records own physical operation completion. The caller keeps
 // context, descriptors and output spans alive until the returned completion.
@@ -19,8 +21,8 @@ public:
  struct Operation {
   void* context = nullptr;
   void (*call)(void*) = nullptr;
-  std::function<void(std::exception_ptr)> completed;
-  std::function<void()> work;
+  std::function<void(std::exception_ptr)> completed{};
+  std::function<void()> work{};
   CompileWorkClass service_class = CompileWorkClass::Output;
  };
  struct RuntimeReadiness {
@@ -52,8 +54,9 @@ public:
  // Settle unstarted operations and interrupt local service admission. Running
  // calls keep their context until physical return; join waits for that custody.
  void cancel() noexcept;
+
 private:
  struct Impl;
  std::shared_ptr<Impl> impl_;
 };
-}
+}  // namespace mmltk::backend::data::detail

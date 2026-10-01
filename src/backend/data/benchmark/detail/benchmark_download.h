@@ -18,9 +18,7 @@
 #include <stdexcept>
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
-
 class BenchmarkCompilePipeline;
-
 // Only remote/source unavailability or rejected response content. Local setup, allocation,
 // invalid requests, callback failures, storage failures, and cancellation propagate
 // separately and must never permit optional-source omission.

@@ -1666,7 +1666,6 @@ TEST_CASE("Maximum training source retention fits JSON process browser and boots
  STATIC_REQUIRE(serial::reflected_structural_cbor_bytes<std::variant<mmltk::controller::browser::Bootstrap>>(
                  mmltk::controller::browser::ApplicationSchema<mmltk::controller::ApplicationSystems>::BootstrapPayloadBudget()) <= mmltk::controller::browser::kMaxRecordWireBytes);
 }
-
 namespace mmltk::controller::browser {
 TEST_CASE("Dataset progress projects the canonical revisioned compile state without inspection", "[controller][browser][reflection][dataset]") {
  contracts::ArtifactUiState full;
@@ -1677,7 +1676,7 @@ TEST_CASE("Dataset progress projects the canonical revisioned compile state with
  full.progress.completed = 9;
  full.progress.total = 10;
  full.inspection.detail = "inspection belongs only to full snapshots";
- const auto progress = mmltk::frameworks::reflection::project_record<contracts::ArtifactCompileState>(full);
+ const contracts::ArtifactCompileState progress = full;
  CHECK(progress == static_cast<const contracts::ArtifactCompileState&>(full));
  const auto event = encode_system_event<&ApplicationSystems::dataset>(DatasetProgress{progress});
  CHECK(event.delivery == contracts::reflection::EventDelivery::LatestState);
@@ -1691,4 +1690,4 @@ TEST_CASE("Dataset progress projects the canonical revisioned compile state with
  const auto settled = encode_system_event<&ApplicationSystems::dataset>(DatasetChanged{full});
  CHECK(settled.delivery == contracts::reflection::EventDelivery::Critical);
 }
-}
+}  // namespace mmltk::controller::browser

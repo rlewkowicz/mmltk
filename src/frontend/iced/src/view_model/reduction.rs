@@ -339,7 +339,10 @@ impl ApplicationModel {
         let Some(dataset) = self.workflow.dataset.as_mut() else {
             return Ok(Observation::Stale);
         };
-        let observation = compare_dataset_compile(&crate::generated::ArtifactCompileState::from(&*dataset), &snapshot)?;
+        let observation = compare_dataset_compile(
+            &crate::generated::ArtifactCompileState::from(&*dataset),
+            &snapshot,
+        )?;
         if observation == Observation::Installed {
             snapshot.apply_to(dataset);
         }
@@ -640,8 +643,12 @@ fn compare_dataset_compile(
         return Ok(Observation::Stale);
     }
     if incoming.revision == installed.revision {
-        return if incoming == installed { Ok(Observation::Current) } else {
-            Err(UiError::protocol("inconsistent Dataset compile state revision"))
+        return if incoming == installed {
+            Ok(Observation::Current)
+        } else {
+            Err(UiError::protocol(
+                "inconsistent Dataset compile state revision",
+            ))
         };
     }
     if incoming.generation == installed.generation {
@@ -649,16 +656,22 @@ fn compare_dataset_compile(
             if artifact_outcome_is_final(incoming.terminal.outcome)
                 && incoming.terminal != installed.terminal
             {
-                return Err(UiError::protocol("inconsistent final Dataset snapshot for one generation"));
+                return Err(UiError::protocol(
+                    "inconsistent final Dataset snapshot for one generation",
+                ));
             }
             return Ok(Observation::Stale);
         }
-        if artifact_outcome_rank(incoming.terminal.outcome) < artifact_outcome_rank(installed.terminal.outcome) {
+        if artifact_outcome_rank(incoming.terminal.outcome)
+            < artifact_outcome_rank(installed.terminal.outcome)
+        {
             return Ok(Observation::Stale);
         }
-        if installed.active && (!incoming.active && !artifact_outcome_is_final(incoming.terminal.outcome)
-            || incoming.progress.phase == crate::generated::DatasetCompilePhase::Idle
-                && installed.progress.phase != crate::generated::DatasetCompilePhase::Idle) {
+        if installed.active
+            && (!incoming.active && !artifact_outcome_is_final(incoming.terminal.outcome)
+                || incoming.progress.phase == crate::generated::DatasetCompilePhase::Idle
+                    && installed.progress.phase != crate::generated::DatasetCompilePhase::Idle)
+        {
             return Ok(Observation::Stale);
         }
     }
@@ -1259,8 +1272,14 @@ mod tests {
         state.progress.completed = 40;
         state.progress.tracks.pixels.invalidated = 30;
         model.install_dataset_progress((&state).into()).unwrap();
-        assert_eq!(model.workflow.dataset.as_ref().unwrap().progress.completed, 40);
-        assert_eq!(model.install_dataset_snapshot(original.clone()).unwrap(), Observation::Stale);
+        assert_eq!(
+            model.workflow.dataset.as_ref().unwrap().progress.completed,
+            40
+        );
+        assert_eq!(
+            model.install_dataset_snapshot(original.clone()).unwrap(),
+            Observation::Stale
+        );
         state.revision += 1;
         state.terminal.outcome = crate::generated::ArtifactTerminalOutcome::CancellationRequested;
         model.install_dataset_snapshot(state.clone()).unwrap();
@@ -1269,8 +1288,14 @@ mod tests {
         state.active = false;
         state.terminal.outcome = crate::generated::ArtifactTerminalOutcome::Cancelled;
         model.install_dataset_snapshot(state.clone()).unwrap();
-        assert_eq!(model.install_dataset_snapshot(stopping).unwrap(), Observation::Stale);
-        assert_eq!(model.install_dataset_progress((&original).into()).unwrap(), Observation::Stale);
+        assert_eq!(
+            model.install_dataset_snapshot(stopping).unwrap(),
+            Observation::Stale
+        );
+        assert_eq!(
+            model.install_dataset_progress((&original).into()).unwrap(),
+            Observation::Stale
+        );
         let settled = state.clone();
         let mut conflicting = state.clone();
         conflicting.revision += 1;
@@ -1282,7 +1307,10 @@ mod tests {
         state.terminal.outcome = crate::generated::ArtifactTerminalOutcome::Idle;
         state.progress.completed = 0;
         model.install_dataset_progress((&state).into()).unwrap();
-        assert_eq!(model.install_dataset_snapshot(settled).unwrap(), Observation::Stale);
+        assert_eq!(
+            model.install_dataset_snapshot(settled).unwrap(),
+            Observation::Stale
+        );
         let mut bootstrap = state.clone();
         bootstrap.inspection.detail = "retained inspection".into();
         model.install_dataset_snapshot(bootstrap.clone()).unwrap();

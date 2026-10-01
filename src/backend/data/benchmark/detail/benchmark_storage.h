@@ -12,4 +12,4 @@ void require_storage(const std::filesystem::path&, std::uint64_t, const char*, c
 void reconcile_download(detail::StorageReservationPool::Reservation&, const std::filesystem::path&);
 inline constexpr std::uint64_t kArchiveScratchBytes = 24ULL * 1024U * 1024U * 1024U;
 inline constexpr std::uint64_t kEstimatedJpegBytes = std::uint64_t{256U} * 1024U;
-}
+}  // namespace mmltk::backend::data::benchmark_internal

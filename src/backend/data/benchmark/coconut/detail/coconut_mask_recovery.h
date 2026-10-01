@@ -32,7 +32,7 @@ class CoconutSupportRuns final {
  };
 
 public:
- CoconutSupportRuns(std::pmr::memory_resource* resource=std::pmr::get_default_resource()) : owned_(resource) {}
+ CoconutSupportRuns(std::pmr::memory_resource* resource = std::pmr::get_default_resource()) : owned_(resource) {}
  CoconutSupportRuns(const CoconutSupportRuns& other) : owned_(other.owned_), borrowed_(other.borrowed_), owner_(other.owner_) {}
  CoconutSupportRuns& operator=(const CoconutSupportRuns& other) {
   if (this == &other) return *this;
@@ -115,7 +115,7 @@ private:
  std::uint64_t* total_ = nullptr;
 };
 struct CoconutSegmentSupport {
- CoconutSegmentSupport(std::pmr::memory_resource* resource=std::pmr::get_default_resource()) : runs(resource) {}
+ CoconutSegmentSupport(std::pmr::memory_resource* resource = std::pmr::get_default_resource()) : runs(resource) {}
  std::uint64_t area = 0;
  dataset::RowMajorMaskBounds bounds;
  CoconutSupportRuns runs;
@@ -195,9 +195,9 @@ private:
   };
   std::pmr::vector<Cursor> merge;
   std::pmr::vector<RLEPair> combined, scratch;
-  explicit Workspace(std::pmr::memory_resource* resource) : groups(resource),ordinals(resource),candidates(resource),represented(resource),remaining(resource),identities(resource),merge(resource),combined(resource),scratch(resource) {}
+  explicit Workspace(std::pmr::memory_resource* resource)
+      : groups(resource), ordinals(resource), candidates(resource), represented(resource), remaining(resource), identities(resource), merge(resource), combined(resource), scratch(resource) {}
  };
  std::optional<Workspace> workspace_;
-
 };
 }  // namespace mmltk::backend::data::benchmark_internal

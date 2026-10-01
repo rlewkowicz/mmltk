@@ -14,9 +14,8 @@
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data::benchmark_internal {
 using detail::CompileExecution;
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
-
+using mmltk::backend::data::detail::CompileResources;
 CompileResources archive_image_resources() { return CompileResources::handles(1, true, 4); }
 CachedImageWriteProgress::CachedImageWriteProgress(CachedImageProgress callback, const std::uint64_t initial, const std::uint64_t expected)
     : callback_(std::move(callback)), initial_(initial), expected_(expected) {}
@@ -40,6 +39,7 @@ class CachedImageWritePool {
   std::size_t free = 0;
   CompileExecution* execution = nullptr;
  };
+
 public:
  struct Payload {
   std::shared_ptr<Buffers> pool;
@@ -50,29 +50,49 @@ public:
   ~Payload() {
    allowance = {};
    if (pool) {
-    { const std::lock_guard lock(pool->mutex); ++pool->free; }
+    {
+     const std::lock_guard lock(pool->mutex);
+     ++pool->free;
+    }
     if (pool->execution) pool->execution->notify_admission_change();
    }
   }
  };
  using Input = std::shared_ptr<Payload>;
- CachedImageWritePool(std::filesystem::path output_root,
-  mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready, std::function<void(const CachedImageReady&, std::exception_ptr, BenchmarkSourceGeneration)> settled,
-  detail::StorageReservationPool* storage, CompileAllowance parent,
+ CachedImageWritePool(std::filesystem::path output_root, mmltk::common::concurrency::CancellationObservation cancellation, CachedImageReadySink ready,
+  std::function<void(const CachedImageReady&, std::exception_ptr, BenchmarkSourceGeneration)> settled, detail::StorageReservationPool* storage, CompileAllowance parent,
   BenchmarkCompilePipeline* execution, int directory, bool retain_encoded, BenchmarkArchive& reader, const BenchmarkTraceSink& trace)
-     : execution_(execution), directory_(directory), retain_encoded_(retain_encoded), storage_(output_root, {}, storage), ready_(std::move(ready)), settled_(std::move(settled)),
-       cancellation_(cancellation), parent_(std::move(parent)), reader_(reader), trace_(trace),
-       writes_(execution ? std::clamp<std::size_t>(execution->execution().workers() * 2, 2, 8) : 1, execution ? &execution->execution() : nullptr,
-        [this] { if (execution_ && execution_->execution().resource_pressure()) reader_.suspend(parent_); }) {
+     : execution_(execution),
+       directory_(directory),
+       retain_encoded_(retain_encoded),
+       storage_(output_root, {}, storage),
+       ready_(std::move(ready)),
+       settled_(std::move(settled)),
+       cancellation_(cancellation),
+       parent_(std::move(parent)),
+       reader_(reader),
+       trace_(trace),
+       writes_(execution ? std::clamp<std::size_t>(execution->execution().workers() * 2, 2, 8) : 1, execution ? &execution->execution() : nullptr, [this] {
+        if (execution_ && execution_->execution().resource_pressure()) reader_.suspend(parent_);
+       }) {
   buffers_->free = execution ? std::clamp<std::size_t>(execution->execution().workers() * 2, 2, 8) : 1;
   buffers_->execution = execution ? &execution->execution() : nullptr;
-  if (execution) readiness_ = std::make_unique<CompileExecution::Readiness>(execution->execution(), [this](CompileExecution::Readiness::Changes changes) {
-   if (!changes.retry && !changes.interrupted) return;
-   { const std::lock_guard lock(resource_mutex_); ++resource_generation_; }
-   resource_changed_.notify_all();
-  });
+  if (execution)
+   readiness_ = std::make_unique<CompileExecution::Readiness>(execution->execution(), [this](CompileExecution::Readiness::Changes changes) {
+    if (!changes.retry && !changes.interrupted) return;
+    {
+     const std::lock_guard lock(resource_mutex_);
+     ++resource_generation_;
+    }
+    resource_changed_.notify_all();
+   });
  }
- ~CachedImageWritePool() { try { reader_.suspend(parent_); writes_.drain(); } catch (...) {} }
+ ~CachedImageWritePool() {
+  try {
+   reader_.suspend(parent_);
+   writes_.drain();
+  } catch (...) {}
+ }
  [[nodiscard]] Input acquire(std::size_t size) {
   // Reserve a publication record before retaining another encoded input.
   writes_.make_room();
@@ -81,16 +101,25 @@ public:
    writes_.reap();
    throw_if_benchmark_cancelled(cancellation_);
    std::unique_lock lock(buffers_->mutex);
-   if (buffers_->free) { --buffers_->free; break; }
+   if (buffers_->free) {
+    --buffers_->free;
+    break;
+   }
    lock.unlock();
    reader_.suspend(parent_);
    if (!execution_) throw std::logic_error("standalone image input did not retire synchronously");
    execution_->execution().wait_for_admission_change(observed);
-   if (execution_) if (auto failure = execution_->execution().interruption()) std::rethrow_exception(failure);
+   if (execution_)
+    if (auto failure = execution_->execution().interruption()) std::rethrow_exception(failure);
   }
   Input input;
-  try { input = std::make_shared<Payload>(); }
-  catch (...) { const std::lock_guard lock(buffers_->mutex); ++buffers_->free; throw; }
+  try {
+   input = std::make_shared<Payload>();
+  } catch (...) {
+   const std::lock_guard lock(buffers_->mutex);
+   ++buffers_->free;
+   throw;
+  }
   input->pool = buffers_;
   if (execution_) {
    auto& owner = execution_->execution();
@@ -98,7 +127,10 @@ public:
    try {
     for (;;) {
      std::uint64_t observed;
-     { const std::lock_guard lock(resource_mutex_); observed = resource_generation_; }
+     {
+      const std::lock_guard lock(resource_mutex_);
+      observed = resource_generation_;
+     }
      bool retry_after_quiesce = false;
      {
       CompileExecution::Readiness::Attempt attempt(readiness_.get());
@@ -111,13 +143,15 @@ public:
       auto output = owner.try_reserve(CompileResources::handles(1, true), parent_);
       if (output) {
        input->output = std::move(*output);
-       auto granted = owner.try_reserve({.bytes = BenchmarkEncodedImage::normal_window_bytes, .continuation_descriptors = active_decoder ? 0U : 1U, .supplied_workspace = true,
-        .workspace_class = detail::CompileWorkClass::Extraction, .workspace_window = detail::CompileWorkspaceWindow::SharedSource}, parent_);
+       auto granted = owner.try_reserve({.bytes = BenchmarkEncodedImage::normal_window_bytes,
+                                         .continuation_descriptors = active_decoder ? 0U : 1U,
+                                         .supplied_workspace = true,
+                                         .workspace_class = detail::CompileWorkClass::Extraction,
+                                         .workspace_window = detail::CompileWorkspaceWindow::SharedSource},
+        parent_);
        if (granted) {
         input->allowance = std::move(*granted);
-        if (!active_decoder) trace_benchmark_event(trace_, "benchmark.images.decoder_admission", [&] {
-         return nlohmann::json{{"member", reader_.member()}, {"bytes", size}};
-        });
+        if (!active_decoder) trace_benchmark_event(trace_, "benchmark.images.decoder_admission", [&] { return nlohmann::json{{"member", reader_.member()}, {"bytes", size}}; });
         if (active_decoder || reader_.try_resume(0, input->allowance)) {
          input->restored_decoder = !active_decoder;
          attempt.commit();
@@ -126,7 +160,8 @@ public:
        }
       }
       reader_.suspend(parent_);
-      input->allowance = {}; input->output = {};
+      input->allowance = {};
+      input->output = {};
       // Self-induced pressure must quiesce even before a resource waiter exists.
       trace_benchmark_event(trace_, "benchmark.images.input_wait", [&] { return nlohmann::json{{"member", reader_.member()}, {"bytes", size}}; });
       pressure = owner.defer_resources();
@@ -139,7 +174,10 @@ public:
      resource_changed_.wait(lock, [&] { return resource_generation_ != observed || owner.interruption(); });
      if (auto failure = owner.interruption()) std::rethrow_exception(failure);
     }
-   } catch (...) { reader_.suspend(parent_); throw; }
+   } catch (...) {
+    reader_.suspend(parent_);
+    throw;
+   }
    const auto bytes = input->allowance.workspace();
    input->encoded = {reinterpret_cast<std::uint8_t*>(bytes.data()), size};
   } else {
@@ -161,16 +199,18 @@ public:
   }
   if (input->restored_decoder) reader_.suspend(parent_);
  }
- void submit(std::uint64_t id, Input input, BenchmarkImageHeader header, BenchmarkSourceGeneration generation) {
+ void submit(std::uint64_t id, Input admitted_input, BenchmarkImageHeader header, BenchmarkSourceGeneration generation) {
   throw_if_benchmark_cancelled(cancellation_);
-  if (!has_complete_image_markers(input->encoded)) throw InvalidImageError("selected archive image " + std::to_string(id) + " is not a complete JPEG or PNG");
-  struct Publication { Input input; BenchmarkEncodedImage::Ptr file, fact; };
+  if (!has_complete_image_markers(admitted_input->encoded)) throw InvalidImageError("selected archive image " + std::to_string(id) + " is not a complete JPEG or PNG");
+  struct Publication {
+   Input input;
+   BenchmarkEncodedImage::Ptr file, fact;
+  };
   auto publication = std::make_shared<Publication>();
-  publication->input = std::move(input);
+  publication->input = std::move(admitted_input);
   const auto write = [this, id, header, publication] {
    const auto& input = publication->input;
-   publication->file = BenchmarkEncodedImage::publish(directory_, id, input->encoded, header, cancellation_, storage_,
-    execution_ ? &execution_->execution() : nullptr, input->allowance);
+   publication->file = BenchmarkEncodedImage::publish(directory_, id, input->encoded, header, cancellation_, storage_, execution_ ? &execution_->execution() : nullptr, input->allowance);
   };
   const auto completed = [this, id, header, publication](std::exception_ptr failure) {
    auto input = std::exchange(publication->input, {});
@@ -178,13 +218,13 @@ public:
    if (failure) std::rethrow_exception(failure);
    publication->fact = publication->file->header_only();
    auto payload = retain_encoded_ && (!execution_ || !execution_->execution().resource_pressure())
-    ? BenchmarkEncodedImage::pooled(input->allowance, input, input->encoded, std::move(publication->file)) : std::move(publication->file);
+                   ? BenchmarkEncodedImage::pooled(input->allowance, input, input->encoded, std::move(publication->file))
+                   : std::move(publication->file);
    input.reset();
    if (ready_) ready_({id, std::pair{header.width, header.height}, execution_ != nullptr, std::move(payload)});
   };
-  const auto settled = [this, id, header, publication, generation](std::exception_ptr failure) {
-   settled_({id, std::pair{header.width, header.height}, true, publication->fact}, failure, generation);
-  };
+  const auto settled = [this, id, header, publication, generation](
+                        std::exception_ptr failure) { settled_({id, std::pair{header.width, header.height}, true, publication->fact}, failure, generation); };
   if (execution_) {
    // Prepare the fallible callback allocation before physical acceptance.
    std::function<void(std::exception_ptr)> settlement = settled;
@@ -214,11 +254,16 @@ public:
      }
      publication->input = acquire(size);
      read(publication->input, &position);
-    } else owner.wait_for_admission_change(observed);
+    } else
+     owner.wait_for_admission_change(observed);
    }
   } else {
    std::exception_ptr failure;
-   try { write(); auto complete = completed; complete({}); } catch (...) { failure = std::current_exception(); }
+   try {
+    write();
+    auto complete = completed;
+    complete({});
+   } catch (...) { failure = std::current_exception(); }
    settled(failure);
   }
  }
@@ -380,17 +425,18 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
     pixels.make_room();
     const auto generation = request.execution ? request.execution->image_generation(request.output_root, id) : 0;
     request.image_ready({id});
-    pixels.push(request.execution ? request.execution->image_completion(request.output_root, id) : CompileExecution::Completion{},
-     [&, id, generation](std::exception_ptr failure) {
-      if (request.execution && request.execution->image_generation(request.output_root, id) != generation) throw std::runtime_error("custom cached publication generation retired");
-      if (!failure) return;
-      try { std::rethrow_exception(failure); }
-      catch (const BenchmarkImageReadError&) {} catch (const InvalidImageError&) {}
-      healthy = false;
-      if (request.execution) request.execution->retire_image(request.output_root, id);
-      invalidate_cached_image_proofs(request.output_root);
-      remove_cache_path(cached_image_path(request.output_root, id));
-     });
+    pixels.push(request.execution ? request.execution->image_completion(request.output_root, id) : CompileExecution::Completion{}, [&, id, generation](std::exception_ptr failure) {
+     if (request.execution && request.execution->image_generation(request.output_root, id) != generation) throw std::runtime_error("custom cached publication generation retired");
+     if (!failure) return;
+     try {
+      std::rethrow_exception(failure);
+     } catch (const BenchmarkImageReadError&) {
+     } catch (const InvalidImageError&) {}
+     healthy = false;
+     if (request.execution) request.execution->retire_image(request.output_root, id);
+     invalidate_cached_image_proofs(request.output_root);
+     remove_cache_path(cached_image_path(request.output_root, id));
+    });
    }
   pixels.drain();
   if (healthy) {
@@ -413,47 +459,50 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  CachedImageWriteProgress resolved_progress(request.progress, 0, selected.size());
  std::unique_ptr<BenchmarkArchive> archive_reader;
  CompileAllowance directory_allowance;
- const auto quiesce = [&] { if (archive_reader && request.execution && request.execution->execution().resource_pressure()) archive_reader->suspend(directory_allowance); };
- BenchmarkCompletionWindow pixels(request.execution ? std::clamp<std::size_t>(request.execution->execution().workers() * 2, 2, 64) : 1,
-  request.execution ? &request.execution->execution() : nullptr, quiesce);
- const auto publish = [&](const CachedImageReady& ready, bool source_read, bool delivered = false, std::exception_ptr error = {}, std::optional<BenchmarkSourceGeneration> admitted = {}) {
+ const auto quiesce = [&] {
+  if (archive_reader && request.execution && request.execution->execution().resource_pressure()) archive_reader->suspend(directory_allowance);
+ };
+ BenchmarkCompletionWindow pixels(
+  request.execution ? std::clamp<std::size_t>(request.execution->execution().workers() * 2, 2, 64) : 1, request.execution ? &request.execution->execution() : nullptr, quiesce);
+ const auto publish = [&](const CachedImageReady& ready, bool source_read, bool delivered = false, std::exception_ptr publication_error = {}, std::optional<BenchmarkSourceGeneration> admitted = {}) {
   pixels.make_room();
   const auto id = ready.image_id;
-  if (error && !ready.payload) std::rethrow_exception(error);
+  if (publication_error && !ready.payload) std::rethrow_exception(publication_error);
   const auto bytes = ready.payload ? ready.payload->size() : std::filesystem::file_size(cached_image_path(request.output_root, id));
   const auto generation = admitted ? *admitted : request.execution ? request.execution->image_generation(request.output_root, id) : 0;
-  CompileExecution::Completion completion;
+  CompileExecution::Completion image_completion;
   try {
-   if (error) std::rethrow_exception(error);
+   if (publication_error) std::rethrow_exception(publication_error);
    if (!delivered && request.image_ready) request.image_ready(ready);
-   if (request.execution) completion = request.execution->image_completion(request.output_root, id);
+   if (request.execution) image_completion = request.execution->image_completion(request.output_root, id);
   } catch (const InvalidImageError&) {
    CompileExecution::CompletionSource rejected;
    rejected.settle(std::current_exception());
-   completion = rejected.completion();
+   image_completion = rejected.completion();
   }
-  pixels.push(std::move(completion),
-   [&, id, bytes, source_read, generation](std::exception_ptr failure) {
-    if (request.execution && request.execution->image_generation(request.output_root, id) != generation) throw std::runtime_error("custom image publication generation retired");
-    if (failure) {
-     std::string reason;
-     try { std::rethrow_exception(failure); }
-     catch (const BenchmarkImageReadError& error) { reason = error.what(); }
-     catch (const InvalidImageError& error) { reason = error.what(); }
-     if (request.execution) request.execution->retire_image(request.output_root, id);
-     invalidate_cached_image_proofs(request.output_root);
-     remove_cache_path(cached_image_path(request.output_root, id));
-     if (source_read) {
-      if (!request.quarantine_unavailable) std::rethrow_exception(failure);
-      quarantined.push_back({id, std::move(reason)});
-      unavailable.emplace(id);
-      resolved_progress.completed(completed.size() + unavailable.size());
-     }
-     return;
+  pixels.push(std::move(image_completion), [&, id, bytes, source_read, generation](std::exception_ptr failure) {
+   if (request.execution && request.execution->image_generation(request.output_root, id) != generation) throw std::runtime_error("custom image publication generation retired");
+   if (failure) {
+    std::string reason;
+    try {
+     std::rethrow_exception(failure);
+    } catch (const BenchmarkImageReadError& error) { reason = error.what(); } catch (const InvalidImageError& error) {
+     reason = error.what();
     }
-    if (completed.emplace(id).second) image_bytes = checked_byte_add(image_bytes, bytes);
-    resolved_progress.completed(completed.size() + unavailable.size());
-   });
+    if (request.execution) request.execution->retire_image(request.output_root, id);
+    invalidate_cached_image_proofs(request.output_root);
+    remove_cache_path(cached_image_path(request.output_root, id));
+    if (source_read) {
+     if (!request.quarantine_unavailable) std::rethrow_exception(failure);
+     quarantined.push_back({id, std::move(reason)});
+     unavailable.emplace(id);
+     resolved_progress.completed(completed.size() + unavailable.size());
+    }
+    return;
+   }
+   if (completed.emplace(id).second) image_bytes = checked_byte_add(image_bytes, bytes);
+   resolved_progress.completed(completed.size() + unavailable.size());
+  });
  };
  directory_allowance = request.execution ? request.execution->execution().reserve(CompileResources::handles(1, true, 3), request.parent_allowance) : CompileAllowance{};
  const int output_descriptor = ::open(request.output_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -474,8 +523,8 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   auto allowance = request.execution ? request.execution->execution().reserve(CompileResources::handles(1, true), directory_allowance) : CompileAllowance{};
   std::shared_ptr<const BenchmarkEncodedImage> payload;
   try {
-   payload = BenchmarkEncodedImage::open(output_directory.get(), image_id, request.validator, request.cancel_requested, (request.execution ? &request.execution->execution() : nullptr), std::move(allowance),
-    request.execution ? request.execution->image_input(request.output_root, image_id) : nullptr);
+   payload = BenchmarkEncodedImage::open(output_directory.get(), image_id, request.validator, request.cancel_requested, (request.execution ? &request.execution->execution() : nullptr),
+    std::move(allowance), request.execution ? request.execution->image_input(request.output_root, image_id) : nullptr);
   } catch (const InvalidImageError&) {
    invalidate_cached_image_proofs(request.output_root);
    remove_cache_path(cached_image_path(request.output_root, image_id));
@@ -500,12 +549,13 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  scheduled.reserve(pending_writes);
  std::unordered_map<std::uint64_t, std::uint64_t> required_positions;
  required_positions.reserve(pending_writes);
- archive_reader = std::make_unique<BenchmarkArchive>(request.archive_path, (request.execution ? &request.execution->execution() : nullptr), 0, directory_allowance, request.decompression_workers, true);
+ archive_reader =
+  std::make_unique<BenchmarkArchive>(request.archive_path, (request.execution ? &request.execution->execution() : nullptr), 0, directory_allowance, request.decompression_workers, true);
  auto& reader = *archive_reader;
  const auto archive_work = [&](const std::function<void()>& work) { reader.cpu(work); };
  CachedImageWritePool write_pool(request.output_root, request.cancel_requested, request.image_ready,
-  [&](const CachedImageReady& ready, std::exception_ptr error, BenchmarkSourceGeneration generation) { publish(ready, true, true, error, generation); }, request.storage,
-  directory_allowance, request.execution, output_directory.get(), request.retain_encoded, reader, request.trace);
+  [&](const CachedImageReady& ready, std::exception_ptr error, BenchmarkSourceGeneration generation) { publish(ready, true, true, error, generation); }, request.storage, directory_allowance,
+  request.execution, output_directory.get(), request.retain_encoded, reader, request.trace);
  CachedImageWritePool::Input input;
  if (request.activity) { request.activity("Scanning archive headers for selected images"); }
  bool extraction_announced = false;

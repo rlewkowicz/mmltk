@@ -16,6 +16,7 @@ public:
 class StorageReservationPool final {
  struct Ledger;
  struct Destination;
+
 public:
  struct Observation {
   const std::filesystem::path& path;
@@ -37,6 +38,7 @@ public:
   void resize(std::uint64_t promised, std::string_view description);
   void grow(std::uint64_t promised, std::string_view description);
   void release() noexcept;
+
  private:
   friend class StorageReservationPool;
   Reservation(std::shared_ptr<Destination>, std::uint64_t promised, std::uint64_t allocated);
@@ -49,7 +51,8 @@ public:
  [[nodiscard]] Reservation reserve(std::uint64_t promised, std::string_view description, std::uint64_t allocated = 0);
  [[nodiscard]] std::uint64_t outstanding() const;
  [[nodiscard]] static std::uint64_t allocated_bytes(int descriptor);
+
 private:
  std::shared_ptr<Destination> destination_;
 };
-}
+}  // namespace mmltk::backend::data::detail

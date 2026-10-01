@@ -57,22 +57,28 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::rejected(const Coc
  return result;
 }
 namespace {
-std::size_t aligned_native_extent(std::size_t bytes, std::size_t alignment) {
- return common::math::checked_add(bytes, alignment - 1, "COCONut native alignment overflow") & ~(alignment - 1);
-}
+std::size_t aligned_native_extent(std::size_t bytes, std::size_t alignment) { return common::math::checked_add(bytes, alignment - 1, "COCONut native alignment overflow") & ~(alignment - 1); }
 constexpr auto native_alignment = std::max({alignof(NormalizedBox), alignof(RLEPair), alignof(CoconutNativeSupport::Segment)});
-}
+}  // namespace
 CoconutNativeOutput::CoconutNativeOutput(std::shared_ptr<CoconutNativeImage> product, std::span<const NormalizedBox> boxes, std::span<const RLEPair> runs)
- : product_(std::move(product)), boxes_(boxes), runs_(runs), run_offset_(aligned_native_extent(boxes.size_bytes(), alignof(RLEPair))),
- request_(common::math::checked_add(run_offset_, runs.size_bytes(), "COCONut native extent overflow"), native_alignment) {}
+    : product_(std::move(product)),
+      boxes_(boxes),
+      runs_(runs),
+      run_offset_(aligned_native_extent(boxes.size_bytes(), alignof(RLEPair))),
+      request_(common::math::checked_add(run_offset_, runs.size_bytes(), "COCONut native extent overflow"), native_alignment) {}
 void CoconutNativeOutput::retain_support(std::span<const CoconutSegmentSupport> support, CoconutNativeSupport& target) {
  support_ = support;
  support_target_ = &target;
  support_offset_ = aligned_native_extent(common::math::checked_add(run_offset_, runs_.size_bytes(), "COCONut support extent overflow"), alignof(CoconutNativeSupport::Segment));
- support_run_offset_ = aligned_native_extent(common::math::checked_add(support_offset_, common::math::checked_multiply(support.size(), sizeof(CoconutNativeSupport::Segment), "COCONut support extent overflow"), "COCONut support extent overflow"), alignof(RLEPair));
+ support_run_offset_ =
+  aligned_native_extent(common::math::checked_add(
+                         support_offset_, common::math::checked_multiply(support.size(), sizeof(CoconutNativeSupport::Segment), "COCONut support extent overflow"), "COCONut support extent overflow"),
+   alignof(RLEPair));
  support_runs_ = 0;
  for (const auto& item : support) support_runs_ = common::math::checked_add(support_runs_, item.runs.size(), "COCONut support run count overflow");
- request_ = CoconutStaging::Request(common::math::checked_add(support_run_offset_, common::math::checked_multiply(support_runs_, sizeof(RLEPair), "COCONut support extent overflow"), "COCONut support extent overflow"), native_alignment);
+ request_ = CoconutStaging::Request(
+  common::math::checked_add(support_run_offset_, common::math::checked_multiply(support_runs_, sizeof(RLEPair), "COCONut support extent overflow"), "COCONut support extent overflow"),
+  native_alignment);
 }
 void CoconutNativeOutput::fill() {
  const auto target = request_.target();
@@ -107,8 +113,10 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::stage(std::shared_
  return result;
 }
 void CoconutNativeWorkspace::materialize(const std::shared_ptr<CoconutNativeImage>& product, CoconutNativeOutput* output) {
- if (output) *output = CoconutNativeOutput(product, scratch().boxes, scratch().runs);
- else if (scratch().boxes.empty() && scratch().runs.empty()) product->staged_ = true;
+ if (output)
+  *output = CoconutNativeOutput(product, scratch().boxes, scratch().runs);
+ else if (scratch().boxes.empty() && scratch().runs.empty())
+  product->staged_ = true;
  else {
   product->boxes_.assign(scratch().boxes.begin(), scratch().boxes.end());
   product->runs_.assign(scratch().runs.begin(), scratch().runs.end());
@@ -122,7 +130,7 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::bind(std::shared_p
   physical.source == CoconutImageNamespace::Objects365V1 || physical.source == CoconutImageNamespace::Objects365V2 ? BenchmarkDatasetSource::kObjects365V2 : BenchmarkDatasetSource::kCoco2017;
  lineage->index.split = "coconut-" + std::to_string(static_cast<unsigned>(lineage->component.edition)) + "-" + std::to_string(static_cast<unsigned>(physical.source));
  auto result = std::shared_ptr<CoconutNativeImage>(new CoconutNativeImage(*source));
- result->lineage_=std::move(lineage);
+ result->lineage_ = std::move(lineage);
  result->image_.source_shard = physical.shard;
  result->inventory_.physical = physical;
  result->input_identity_ = coconut_image_input_identity(result->lineage().component.annotation_input_identity, physical, result->lineage().component.original_annotation_identity);
@@ -134,7 +142,10 @@ void CoconutNativeWorkspace::originals(std::shared_ptr<const CoconutRecoveryOrig
  if (originals_ == value && (value || !recovery_)) return;
  recovery_.reset();
  originals_ = std::move(value);
- if (originals_) { recovery_ = std::make_unique<CoconutMaskRecovery>(*originals_); if (supplied_) recovery_->prepare(supplied_.get()); }
+ if (originals_) {
+  recovery_ = std::make_unique<CoconutMaskRecovery>(*originals_);
+  if (supplied_) recovery_->prepare(supplied_.get());
+ }
 }
 void CoconutNativeWorkspace::recovery(const CoconutMaskRecovery* value) { recovery_ = value ? value->make_workspace() : nullptr; }
 CoconutNativeWorkspace::Scratch& CoconutNativeWorkspace::scratch() {
@@ -142,28 +153,39 @@ CoconutNativeWorkspace::Scratch& CoconutNativeWorkspace::scratch() {
  return *scratch_;
 }
 void CoconutNativeWorkspace::supports(std::size_t count) {
- auto& values=scratch().support;
+ auto& values = scratch().support;
  values.reserve(count);
- while (values.size()<count) values.emplace_back(values.get_allocator().resource());
+ while (values.size() < count) values.emplace_back(values.get_allocator().resource());
 }
 void CoconutNativeWorkspace::prepare_support(std::span<std::byte> memory) {
  retire();
  if (memory.empty()) return;
- supplied_=std::make_unique<std::pmr::monotonic_buffer_resource>(memory.data(),memory.size(),std::pmr::null_memory_resource());
+ supplied_ = std::make_unique<std::pmr::monotonic_buffer_resource>(memory.data(), memory.size(), std::pmr::null_memory_resource());
  if (recovery_) recovery_->prepare(supplied_.get());
 }
 void CoconutNativeWorkspace::release_supplied() noexcept {
  if (!supplied_) return;
  if (recovery_) recovery_->retire_scratch();
- scratch_.reset(); supplied_.reset(); active_record_=nullptr;
+ scratch_.reset();
+ supplied_.reset();
+ active_record_ = nullptr;
 }
 void CoconutNativeWorkspace::retire() noexcept {
  if (recovery_) recovery_->retire_scratch();
- scratch_.reset(); supplied_.reset(); decode_memory_.reset(); active_record_=nullptr; active_dimensions_={}; unlisted_segment_=0;
+ scratch_.reset();
+ supplied_.reset();
+ decode_memory_.reset();
+ active_record_ = nullptr;
+ active_dimensions_ = {};
+ unlisted_segment_ = 0;
 }
 std::uint64_t CoconutNativeWorkspace::retained_bytes() const noexcept {
- if (supplied_) return 0; // Actual supplied bytes belong to the task arena lease.
- return (decode_memory_ ? decode_memory_->capacity_bytes() : 0)+run_bytes_+(scratch_ ? scratch_->boxes.capacity()*sizeof(NormalizedBox)+scratch_->runs.capacity()*sizeof(RLEPair)+scratch_->support.capacity()*sizeof(CoconutSegmentSupport)+scratch_->segments.capacity()*sizeof(SegmentEntry) : 0)+(recovery_ ? recovery_->retained_bytes() : 0);
+ if (supplied_) return 0;  // Actual supplied bytes belong to the task arena lease.
+ return (decode_memory_ ? decode_memory_->capacity_bytes() : 0) + run_bytes_ +
+        (scratch_ ? scratch_->boxes.capacity() * sizeof(NormalizedBox) + scratch_->runs.capacity() * sizeof(RLEPair) + scratch_->support.capacity() * sizeof(CoconutSegmentSupport) +
+                     scratch_->segments.capacity() * sizeof(SegmentEntry)
+                  : 0) +
+        (recovery_ ? recovery_->retained_bytes() : 0);
 }
 CoconutNativeWorkspace::SegmentEntry& CoconutNativeWorkspace::segment_entry(std::uint32_t id) {
  auto slot = (static_cast<std::size_t>(id) * 2654435761U) & (scratch().segments.size() - 1);
@@ -174,10 +196,10 @@ std::span<const CoconutSegmentSupport> CoconutNativeWorkspace::support(std::size
  if (!scratch_ || count > scratch_->support.size()) throw std::logic_error("COCONut: invalid native support transfer");
  return std::span(scratch_->support).first(count);
 }
-void CoconutNativeWorkspace::borrow_support(
- const CoconutRecord& record, const CoconutNativeSupport& input, dataset::MaskDimensions dimensions, std::uint32_t unlisted_segment) {
+void CoconutNativeWorkspace::borrow_support(const CoconutRecord& record, const CoconutNativeSupport& input, dataset::MaskDimensions dimensions, std::uint32_t unlisted_segment) {
  unlisted_segment_ = unlisted_segment;
- if (input.segments.size() != record.segments.size() || (!input.owner && !input.segments.empty()) || !dimensions.width || !dimensions.height) throw std::logic_error("COCONut: invalid native support custody");
+ if (input.segments.size() != record.segments.size() || (!input.owner && !input.segments.empty()) || !dimensions.width || !dimensions.height)
+  throw std::logic_error("COCONut: invalid native support custody");
  active_record_ = nullptr;
  supports(input.segments.size());
  for (std::size_t i = 0; i < input.segments.size(); ++i) {
@@ -199,16 +221,22 @@ std::uint64_t CoconutNativeWorkspace::support_workspace_bytes(const CoconutRecor
  // Typed capacities for native runs (geometric growth plus immutable output),
  // support records and the open-address table. PNG storage is admitted from its
  // actual header by decoder_workspace_bytes before dispatch, separately.
- auto bytes = checked_add(std::uint64_t{256}, checked_multiply(pixels, sizeof(RLEPair)*(recover && recovery_ ? 12U : 6U),"COCONut support workspace overflow"), "COCONut support alignment overflow");
- bytes = checked_add(bytes,checked_multiply(segments,sizeof(CoconutSegmentSupport)+sizeof(SegmentEntry)*4U+sizeof(NormalizedBox)+sizeof(std::uint64_t)*4U,"COCONut segment workspace overflow"),"COCONut normalize workspace overflow");
+ auto bytes =
+  checked_add(std::uint64_t{256}, checked_multiply(pixels, sizeof(RLEPair) * (recover && recovery_ ? 12U : 6U), "COCONut support workspace overflow"), "COCONut support alignment overflow");
+ bytes =
+  checked_add(bytes, checked_multiply(segments, sizeof(CoconutSegmentSupport) + sizeof(SegmentEntry) * 4U + sizeof(NormalizedBox) + sizeof(std::uint64_t) * 4U, "COCONut segment workspace overflow"),
+   "COCONut normalize workspace overflow");
  return checked_add(bytes, recover && recovery_ ? recovery_->workspace_bytes(record) : 0, "COCONut recovery workspace overflow");
 }
-std::uint64_t CoconutNativeWorkspace::reuse_workspace_bytes(const CoconutRecord& record,const NormalizedAnnotationReadView& source,std::size_t position) const {
- const auto image=source.image(position);
- auto bytes=common::math::checked_add(std::uint64_t{256},common::math::checked_multiply(std::uint64_t{image.box_count},sizeof(NormalizedBox),"COCONut reused boxes overflow"),"COCONut reused alignment overflow");
- bytes=common::math::checked_add(bytes,common::math::checked_multiply(std::uint64_t{std::bit_ceil(std::max<std::size_t>(2,record.segments.size()*2))},sizeof(SegmentEntry),"COCONut reused table overflow"),"COCONut reused workspace overflow");
- for (const auto& box : source.storage().boxes.subspan(image.first_box,image.box_count))
-  bytes=common::math::checked_add(bytes,common::math::checked_multiply(std::uint64_t{box.mask_rle_pairs},sizeof(RLEPair),"COCONut reused runs overflow"),"COCONut reused workspace overflow");
+std::uint64_t CoconutNativeWorkspace::reuse_workspace_bytes(const CoconutRecord& record, const NormalizedAnnotationReadView& source, std::size_t position) const {
+ const auto image = source.image(position);
+ auto bytes = common::math::checked_add(
+  std::uint64_t{256}, common::math::checked_multiply(std::uint64_t{image.box_count}, sizeof(NormalizedBox), "COCONut reused boxes overflow"), "COCONut reused alignment overflow");
+ bytes = common::math::checked_add(bytes,
+  common::math::checked_multiply(std::uint64_t{std::bit_ceil(std::max<std::size_t>(2, record.segments.size() * 2))}, sizeof(SegmentEntry), "COCONut reused table overflow"),
+  "COCONut reused workspace overflow");
+ for (const auto& box : source.storage().boxes.subspan(image.first_box, image.box_count))
+  bytes = common::math::checked_add(bytes, common::math::checked_multiply(std::uint64_t{box.mask_rle_pairs}, sizeof(RLEPair), "COCONut reused runs overflow"), "COCONut reused workspace overflow");
  return bytes;
 }
 dataset::MaskDimensions CoconutNativeWorkspace::admit_png(const CoconutRecord& record, std::span<const std::uint8_t> png) const {
@@ -225,8 +253,9 @@ dataset::MaskDimensions CoconutNativeWorkspace::admit_png(const CoconutRecord& r
  return {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
 }
 std::size_t CoconutNativeWorkspace::decoder_workspace_bytes(std::span<const std::uint8_t> png) const {
- try { return detail::CompileImageDecoder::plan(decoder_.read_header(png,detail::CompileImagePolicy::Directory)).bytes(); }
- catch (const detail::CompileImageError&) { invalid("cannot decode panoptic PNG"); }
+ try {
+  return detail::CompileImageDecoder::plan(decoder_.read_header(png, detail::CompileImagePolicy::Directory)).bytes();
+ } catch (const detail::CompileImageError&) { invalid("cannot decode panoptic PNG"); }
 }
 void CoconutNativeWorkspace::decode(const CoconutRecord& record, std::span<const std::uint8_t> png, dataset::MaskDimensions dimensions, std::span<std::byte> supplied) {
  active_record_ = nullptr;
@@ -235,19 +264,22 @@ void CoconutNativeWorkspace::decode(const CoconutRecord& record, std::span<const
  int width = static_cast<int>(dimensions.width), height = static_cast<int>(dimensions.height);
  throw_if_benchmark_cancelled(cancellation_);
  detail::CompileImageHeader header;
- try { header=decoder_.read_header(png,detail::CompileImagePolicy::Directory); }
- catch (const detail::CompileImageError&) { invalid("cannot decode panoptic PNG"); }
- const auto bytes=detail::CompileImageDecoder::plan(header).bytes();
+ try {
+  header = decoder_.read_header(png, detail::CompileImagePolicy::Directory);
+ } catch (const detail::CompileImageError&) { invalid("cannot decode panoptic PNG"); }
+ const auto bytes = detail::CompileImageDecoder::plan(header).bytes();
  if (!supplied.empty()) prepare_support(supplied.subspan(bytes));
  if (supplied.empty()) {
-  if (!decode_memory_) decode_memory_=std::make_unique<common::system::NumaMemory>(common::system::NumaTopology::Capture().permitted_nodes.front(),common::system::NumaMemory::Lock::Pages);
+  if (!decode_memory_) decode_memory_ = std::make_unique<common::system::NumaMemory>(common::system::NumaTopology::Capture().permitted_nodes.front(), common::system::NumaMemory::Lock::Pages);
   decode_memory_->ensure_bytes(bytes);
-  supplied={static_cast<std::byte*>(decode_memory_->data()),decode_memory_->capacity_bytes()};
+  supplied = {static_cast<std::byte*>(decode_memory_->data()), decode_memory_->capacity_bytes()};
  }
  std::span<const std::uint8_t> pixels;
- try { pixels=decoder_.decode_rgb(png,header,supplied); }
- catch (const detail::CompileImageError&) { invalid("cannot decode panoptic PNG"); }
- width=static_cast<int>(header.width); height=static_cast<int>(header.height);
+ try {
+  pixels = decoder_.decode_rgb(png, header, supplied);
+ } catch (const detail::CompileImageError&) { invalid("cannot decode panoptic PNG"); }
+ width = static_cast<int>(header.width);
+ height = static_cast<int>(header.height);
  if (width <= 0 || height <= 0 || static_cast<std::uint32_t>(width) != dimensions.width || static_cast<std::uint32_t>(height) != dimensions.height || dimensions.width > limits_.max_dimension ||
      dimensions.height > limits_.max_dimension || std::uint64_t{dimensions.width} * dimensions.height > limits_.max_pixels || std::uint64_t{dimensions.width} * dimensions.height > UINT32_MAX ||
      record.segments.size() > limits_.max_segments)
@@ -316,10 +348,12 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::finish(const C
  product->segment_begin_ = record.first_segment_ordinal;
  const auto& component = product->lineage().component;
  CoconutRecoveryImage recovery{physical.image_id, 0, {}};
- if (recovery_) recovery_->apply(physical.source, record, static_cast<unsigned>(width), static_cast<unsigned>(height), std::span(scratch().support).first(record.segments.size()), recovery, cancellation_);
- std::size_t output_runs=0;
- for (const auto& value : std::span(scratch().support).first(record.segments.size())) output_runs=common::math::checked_add(output_runs,value.runs.size(),"COCONut native output overflow");
- scratch().boxes.reserve(record.segments.size()); scratch().runs.reserve(output_runs);
+ if (recovery_)
+  recovery_->apply(physical.source, record, static_cast<unsigned>(width), static_cast<unsigned>(height), std::span(scratch().support).first(record.segments.size()), recovery, cancellation_);
+ std::size_t output_runs = 0;
+ for (const auto& value : std::span(scratch().support).first(record.segments.size())) output_runs = common::math::checked_add(output_runs, value.runs.size(), "COCONut native output overflow");
+ scratch().boxes.reserve(record.segments.size());
+ scratch().runs.reserve(output_runs);
  NormalizedImage image{physical.image_id, scratch().boxes.size(), 0, static_cast<unsigned>(width), static_cast<unsigned>(height), physical.shard, 0};
  for (std::size_t ordinal = 0; ordinal < record.segments.size(); ++ordinal) {
   if (ordinal > UINT64_MAX - record.first_segment_ordinal) invalid("source ordinal overflow");
@@ -425,10 +459,11 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::reuse(const Co
  };
  const auto& index = source.storage();
  const auto& original = source.image(position);
- std::size_t run_count=0;
- for (const auto& box : index.boxes.subspan(original.first_box,original.box_count))
-  run_count=common::math::checked_add(run_count,std::size_t{box.mask_rle_pairs},"COCONut reused run count overflow");
- scratch().boxes.reserve(original.box_count); scratch().runs.reserve(run_count);
+ std::size_t run_count = 0;
+ for (const auto& box : index.boxes.subspan(original.first_box, original.box_count))
+  run_count = common::math::checked_add(run_count, std::size_t{box.mask_rle_pairs}, "COCONut reused run count overflow");
+ scratch().boxes.reserve(original.box_count);
+ scratch().runs.reserve(run_count);
  for (auto box : index.boxes.subspan(original.first_box, original.box_count)) {
   const auto runs = index.mask_rle_pairs.subspan(box.mask_rle_offset, box.mask_rle_pairs);
   box.source_ordinal = ordinal(box.annotation_id);

@@ -50,6 +50,13 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
  std::set<std::string> references;
  std::size_t accepted_occurrences = 0U;
  for (std::size_t cursor = 0U; cursor != index.size();) {
+  const auto remaining = index.substr(cursor);
+  const std::string_view comment_end = remaining.starts_with("<!--") ? "-->" : remaining.starts_with("/*") ? "*/" : remaining.starts_with("//") ? "\n" : "";
+  if (!comment_end.empty()) {
+   const auto end = index.find(comment_end, cursor + (remaining.starts_with("<!--") ? 4U : 2U));
+   cursor = end == std::string_view::npos ? index.size() : end + comment_end.size();
+   continue;
+  }
   if (index[cursor] == '\\') {
    cursor += std::min<std::size_t>(2U, index.size() - cursor);
    continue;

@@ -23,7 +23,10 @@
 #include "src/backend/data/compiler/dataset_compile_phase.h"
 #include "src/backend/data/compiler/dataset_compile_progress.h"
 namespace mmltk::backend::data {
-namespace detail { enum class CompileTaskKind : std::uint8_t; struct CompileExecutionSnapshot; }
+namespace detail {
+enum class CompileTaskKind : std::uint8_t;
+struct CompileExecutionSnapshot;
+}  // namespace detail
 // Optional effect-only observations. Callbacks never govern slot identity or admission.
 struct DirectoryCompileObservation {
  void* context = nullptr;

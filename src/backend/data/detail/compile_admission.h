@@ -34,9 +34,13 @@ struct CompileAllowance::Credits {
     offer->lent += bytes;
     ++offer->borrowers;
    }
-   ~Loan() { offer->lent -= bytes; --offer->borrowers; }
+   ~Loan() {
+    offer->lent -= bytes;
+    --offer->borrowers;
+   }
   };
   std::vector<std::shared_ptr<Loan>> loans_;
+
  public:
   Loans() = default;
   Loans(const Loans&) = delete;
@@ -107,15 +111,19 @@ struct CompileAdmission {
  std::uint64_t draining_bytes = 0;
  bool draining_external = false;
  [[nodiscard]] static bool exceptional_custody(const Credits* credit) {
-  for (; credit; credit=credit->parent.get()) if (credit->arena.exceptional()) return true;
+  for (; credit; credit = credit->parent.get())
+   if (credit->arena.exceptional()) return true;
   return false;
  }
  [[nodiscard]] bool oversized(CompileResources value) const {
-  return value.supplied_workspace && value.bytes && arenas && !arenas->normal_fit(value.bytes,value.completion_workspace,value.workspace_class,value.workspace_window);
+  return value.supplied_workspace && value.bytes && arenas && !arenas->normal_fit(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window);
  }
  void drain(const void* request, const Credits* parent, std::uint64_t count, bool external = false) {
-  if (request==draining_request) return;
-  draining_request=request; draining_parent=parent; draining_bytes=count; draining_external=external;
+  if (request == draining_request) return;
+  draining_request = request;
+  draining_parent = parent;
+  draining_bytes = count;
+  draining_external = external;
   notify(Change::Resources);
  }
  bool tracing = false;
@@ -130,8 +138,10 @@ struct CompileAdmission {
  void change_job_pressure(bool before, bool after) noexcept {
   if (before == after) return;
   const auto previous = pressure();
-  if (after) ++resource_jobs;
-  else --resource_jobs;
+  if (after)
+   ++resource_jobs;
+  else
+   --resource_jobs;
   if (previous != pressure()) notify(Change::Pressure);
  }
  [[nodiscard]] std::size_t descriptor_ceiling(CompileResources value) const {
@@ -175,22 +185,23 @@ struct CompileAdmission {
  // Prospective retirement changes only charged workspace bytes. Offers and
  // descriptor promises remain owned by their actual producers. Zero retirement
  // gives the exact participating draw used by charge under this same mutex.
- [[nodiscard]] Eligibility eligibility(CompileResources value, const Credits* parent = nullptr, bool finite_consumer = false, std::uint64_t retiring_bytes = 0, std::uint64_t retiring_arena_bytes = 0) const {
+ [[nodiscard]] Eligibility eligibility(
+  CompileResources value, const Credits* parent = nullptr, bool finite_consumer = false, std::uint64_t retiring_bytes = 0, std::uint64_t retiring_arena_bytes = 0) const {
   if (!feasible(value)) return {};
-  if (draining_request && value.bytes && !value.retained_handles &&
-      !(value.supplied_workspace && value.bytes==draining_bytes && parent==draining_parent) &&
-      !(parent && finite_consumer)) return {};
+  if (draining_request && value.bytes && !value.retained_handles && !(value.supplied_workspace && value.bytes == draining_bytes && parent == draining_parent) && !(parent && finite_consumer))
+   return {};
   if (arenas && arenas->exceptional_active() && value.bytes && !exceptional_custody(parent)) return {};
   if (value.supplied_workspace && value.bytes && arenas) {
-   if (!arenas->fits(value.bytes,value.completion_workspace,value.workspace_class,value.workspace_window)) {
+   if (!arenas->fits(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window)) {
     // A shape exceeding every normal contiguous context has one exclusive
     // exceptional route. Busy fitting contexts remain ordinary resource waits.
-    const auto occupied=arenas->snapshot().leased;
-    if (arenas->exceptional_active() || occupied>retiring_arena_bytes) return {};
-    if (!arenas->normal_fit(value.bytes,value.completion_workspace,value.workspace_class,value.workspace_window)) {
+    const auto occupied = arenas->snapshot().leased;
+    if (arenas->exceptional_active() || occupied > retiring_arena_bytes) return {};
+    if (!arenas->normal_fit(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window)) {
      std::uint64_t lineage = 0;
-     for (auto* credit = parent; credit; credit = credit->parent.get()) if (!credit->resources.retained_handles) lineage += credit->resources.bytes;
-     if (bytes - std::min(bytes,retiring_bytes) != lineage) return {};
+     for (auto* credit = parent; credit; credit = credit->parent.get())
+      if (!credit->resources.retained_handles) lineage += credit->resources.bytes;
+     if (bytes - std::min(bytes, retiring_bytes) != lineage) return {};
     }
    }
   }
@@ -234,7 +245,8 @@ struct CompileAdmission {
  }
  static bool covers(const Credits& credit, CompileResources demand) {
   const auto held = credit.resources;
-  return (!demand.supplied_workspace || held.supplied_workspace) && demand.workspace_window==held.workspace_window && demand.opaque_bytes <= held.opaque_bytes && demand.bytes <= held.bytes && demand.descriptors <= held.descriptors && demand.cpu_workers <= held.cpu_workers && (!demand.bytes || demand.retained_handles == held.retained_handles) &&
+  return (!demand.supplied_workspace || held.supplied_workspace) && demand.workspace_window == held.workspace_window && demand.opaque_bytes <= held.opaque_bytes && demand.bytes <= held.bytes &&
+         demand.descriptors <= held.descriptors && demand.cpu_workers <= held.cpu_workers && (!demand.bytes || demand.retained_handles == held.retained_handles) &&
          (!demand.producer || held.producer) && demand.continuation_descriptors <= credit.available;
  }
  void charge(Credits& credit, bool finite_consumer = false, std::source_location location = std::source_location::current()) {
@@ -249,10 +261,11 @@ struct CompileAdmission {
   const auto next_descriptors = checked_add(descriptors, value.descriptors, "benchmark descriptor admission overflow");
   const auto next_commitment = checked_add(committed - borrowed, value.continuation_descriptors, "benchmark continuation admission overflow");
   const auto next_cpus = checked_add(external_cpus, value.cpu_workers, "benchmark CPU admission overflow");
-  const auto next_opaque = checked_add(opaque_bytes,value.opaque_bytes,"compile opaque library charge overflow");
+  const auto next_opaque = checked_add(opaque_bytes, value.opaque_bytes, "compile opaque library charge overflow");
   if (admitted.loan_bytes) credit.workspace_loans.attach(workspace_offers, admitted.loan_bytes);
   if (value.supplied_workspace && value.bytes && arenas)
-   credit.arena = arenas->acquire(value.bytes,!arenas->normal_fit(value.bytes,value.completion_workspace,value.workspace_class,value.workspace_window),value.completion_workspace,value.workspace_class,value.workspace_window);
+   credit.arena = arenas->acquire(value.bytes, !arenas->normal_fit(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window), value.completion_workspace,
+    value.workspace_class, value.workspace_window);
   storage = next_bytes;
   descriptors = next_descriptors;
   committed = next_commitment;
@@ -262,11 +275,11 @@ struct CompileAdmission {
   if (credit.parent) credit.parent->available -= borrowed;
   credit.charged = true;
   notify(value.bytes || value.descriptors || value.continuation_descriptors ? Change::Resources : Change::Scheduling);
-  if (tracing)
-   try {
+  if (tracing) try {
     observed_credits.push_back(&credit);
     credit.location = location;
-   } catch (...) { /* Diagnostic tracking cannot change admission. */ }
+   } catch (...) { /* Diagnostic tracking cannot change admission. */
+   }
  }
  // The physical owner requests retirement after freeing its backing. A CPU
  // frame or stable lending window may still use this credit's commitment.
@@ -315,8 +328,10 @@ struct CompileAdmission {
    resource_waiters -= resource;
   }
   changed.notify_all();
-  if (previous != pressure()) notify(Change::Pressure);
-  else if (publish_change) publish_change(Change::Scheduling);
+  if (previous != pressure())
+   notify(Change::Pressure);
+  else if (publish_change)
+   publish_change(Change::Scheduling);
  }
  struct Waiter {
   CompileAdmission& owner;
@@ -370,5 +385,4 @@ struct CompileAdmission {
   OfferScope& operator=(const OfferScope&) = delete;
  };
 };
-
-}
+}  // namespace mmltk::backend::data::detail

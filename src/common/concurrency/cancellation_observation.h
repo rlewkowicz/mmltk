@@ -15,8 +15,10 @@ public:
  template <class Source>
  [[nodiscard]] static CancellationObservation Borrow(const Source& source) noexcept {
   return {&source, [](const void* value) noexcept { return static_cast<const Source*>(value)->cancelled(); }, [](const void* value) noexcept {
-   if constexpr (requires { static_cast<const Source*>(value)->descriptor(); }) return static_cast<const Source*>(value)->descriptor();
-   else return -1;
+   if constexpr (requires { static_cast<const Source*>(value)->descriptor(); })
+    return static_cast<const Source*>(value)->descriptor();
+   else
+    return -1;
   }};
  }
  template <class Source>
@@ -25,7 +27,8 @@ public:
 private:
  using Observer = bool (*)(const void*) noexcept;
  using Descriptor = int (*)(const void*) noexcept;
- constexpr CancellationObservation(const void* source, const Observer observe, const Descriptor descriptor = nullptr) noexcept : source_(source), observe_(observe), descriptor_(descriptor) {}
+ constexpr CancellationObservation(const void* source, const Observer observe, const Descriptor descriptor_source = nullptr) noexcept
+     : source_(source), observe_(observe), descriptor_(descriptor_source) {}
  const void* source_ = nullptr;
  Observer observe_ = nullptr;
  Descriptor descriptor_ = nullptr;

@@ -31,10 +31,9 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 namespace mmltk::backend::data::benchmark_internal {
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileExecutionLimits;
-
+using mmltk::backend::data::detail::CompileResources;
 class BenchmarkCompilePipeline;
 class CoconutPhysicalMembership;
 struct AdmittedRecipeArchive;
@@ -56,8 +55,7 @@ struct CustomRecipePreparation {
 };
 [[nodiscard]] CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout&, const CustomRecipeCatalog&, ProgressReporter&, std::size_t,
  mmltk::common::concurrency::CancellationObservation, const BenchmarkTraceSink&, std::span<const int> worker_cpus = {}, BenchmarkCompilePipeline* execution = nullptr,
- CompileAllowance preparation = {}, CocoAnnotationSplitSink coco_ready = {},
- std::function<void(const NormalizedAnnotationReadView&)> selected_ready = {});
+ CompileAllowance preparation = {}, CocoAnnotationSplitSink coco_ready = {}, std::function<void(const NormalizedAnnotationReadView&)> selected_ready = {});
 }  // namespace mmltk::backend::data::benchmark_internal
 namespace mmltk::backend::data::benchmark_internal {
 struct CoconutRecipeInputs;

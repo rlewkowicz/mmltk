@@ -70,12 +70,15 @@ std::string_view CoconutRecoveryOriginals::identity(CoconutImageNamespace source
 }
 std::string_view CoconutMaskRecovery::original_identity(CoconutImageNamespace source) const noexcept { return originals_.identity(source); }
 void CoconutMaskRecovery::retire_scratch() noexcept { workspace_.reset(); }
-void CoconutMaskRecovery::prepare(std::pmr::memory_resource* resource) { workspace_.reset(); workspace_.emplace(resource); }
+void CoconutMaskRecovery::prepare(std::pmr::memory_resource* resource) {
+ workspace_.reset();
+ workspace_.emplace(resource);
+}
 std::uint64_t CoconutMaskRecovery::retained_bytes() const noexcept {
  if (!workspace_) return 0;
- return workspace_->groups.capacity() * sizeof(Group) + workspace_->ordinals.capacity() * sizeof(std::size_t) + workspace_->candidates.capacity() * sizeof(Candidate) + workspace_->represented.capacity() +
-        workspace_->remaining.capacity() * sizeof(const Candidate*) + workspace_->identities.capacity() * sizeof(std::uint64_t) + workspace_->merge.capacity() * sizeof(Workspace::Cursor) +
-        (workspace_->combined.capacity() + workspace_->scratch.capacity()) * sizeof(RLEPair);
+ return workspace_->groups.capacity() * sizeof(Group) + workspace_->ordinals.capacity() * sizeof(std::size_t) + workspace_->candidates.capacity() * sizeof(Candidate) +
+        workspace_->represented.capacity() + workspace_->remaining.capacity() * sizeof(const Candidate*) + workspace_->identities.capacity() * sizeof(std::uint64_t) +
+        workspace_->merge.capacity() * sizeof(Workspace::Cursor) + (workspace_->combined.capacity() + workspace_->scratch.capacity()) * sizeof(RLEPair);
 }
 std::uint64_t CoconutMaskRecovery::workspace_bytes(const CoconutRecord& record) const {
  using mmltk::common::math::checked_add;
@@ -101,7 +104,8 @@ std::uint64_t CoconutMaskRecovery::workspace_bytes(const CoconutRecord& record) 
   maximum = std::max(maximum, checked_add(checked_multiply(runs, std::uint64_t{128}, "COCONut recovery run workspace overflow"),
                                checked_multiply(std::uint64_t{image.box_count}, std::uint64_t{512}, "COCONut recovery candidate workspace overflow"), "COCONut recovery workspace overflow"));
  }
- return checked_add(maximum,checked_multiply(std::uint64_t{record.segments.size()},std::uint64_t{4*(sizeof(Group)+sizeof(std::size_t))},"COCONut recovery group workspace overflow"),"COCONut recovery workspace overflow");
+ return checked_add(maximum, checked_multiply(std::uint64_t{record.segments.size()}, std::uint64_t{4 * (sizeof(Group) + sizeof(std::size_t))}, "COCONut recovery group workspace overflow"),
+  "COCONut recovery workspace overflow");
 }
 void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecord& record, std::uint32_t width, std::uint32_t height, std::span<CoconutSegmentSupport> support,
  CoconutRecoveryImage& facts, Cancellation cancellation) {

@@ -10,9 +10,8 @@
 #include <thread>
 #include "src/common/system/cpu_affinity.h"
 namespace mmltk::backend::data::benchmark_internal {
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
-
+using mmltk::backend::data::detail::CompileResources;
 namespace common_math = mmltk::common::math;
 namespace {
 [[nodiscard]] std::string combined_artifact_digest(const std::string& left, const std::string& right) {
@@ -38,8 +37,7 @@ CustomRecipeCatalog custom_recipe_catalog() {
 }
 CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, const BenchmarkCacheLayout& cache, const CustomRecipeCatalog& catalog, ProgressReporter& progress,
  std::size_t effective_num_workers, mmltk::common::concurrency::CancellationObservation external_cancellation, const BenchmarkTraceSink& trace, std::span<const int> worker_cpus,
- BenchmarkCompilePipeline* execution, CompileAllowance preparation, CocoAnnotationSplitSink coco_ready,
- std::function<void(const NormalizedAnnotationReadView&)> selected_ready) {
+ BenchmarkCompilePipeline* execution, CompileAllowance preparation, CocoAnnotationSplitSink coco_ready, std::function<void(const NormalizedAnnotationReadView&)> selected_ready) {
  auto annotations = execution ? execution->execution().open_class(detail::CompileWorkClass::Annotations) : detail::CompileExecution::Producer{};
  struct SourceCancellation {
   mmltk::common::concurrency::CancellationObservation external;
@@ -69,7 +67,9 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  const auto annotation_parse_options = [&](BenchmarkDatasetSource source, std::string split, std::uint32_t expected, bool keep, const CompileAllowance& input_allowance) {
   return AnnotationParseOptions{source, std::move(split), expected, static_cast<int>(parse_workers), keep, cancel_requested, trace, execution ? &execution->execution() : nullptr, input_allowance};
  };
- const auto acquire_lifecycle = [&](const std::string& name) { return ArtifactLease::acquire_charged(cache.locks / name, cancel_requested, (execution ? &execution->execution() : nullptr), coco_annotation_resources(), preparation); };
+ const auto acquire_lifecycle = [&](const std::string& name) {
+  return ArtifactLease::acquire_charged(cache.locks / name, cancel_requested, (execution ? &execution->execution() : nullptr), coco_annotation_resources(), preparation);
+ };
  const auto download_source = [&](const std::vector<DownloadRequest>& requests, const CompileAllowance& allowance) {
   progress.phase(DatasetCompilePhase::Downloading);
   progress.source_activity(requests.front().source, "Downloading annotation metadata");
@@ -122,8 +122,7 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
     progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Extracting Objects365 train annotations");
     const std::string annotation_digest = extract_archive_member(annotation_archive.path, "zhiyuan_objv2_train.json", json_path, annotation_archive.identity,
      cache.locks / "objects365-train-json.extract.lock", cancel_requested, trace, &storage, execution, lifecycle_allowance);
-    objects =
-     load_or_build_index(cache, objects_index_path, BenchmarkDatasetSource::kObjects365V2, "train", annotation_digest, cancel_requested, trace, [&](const CompileAllowance& input_allowance) {
+    objects = load_or_build_index(cache, objects_index_path, BenchmarkDatasetSource::kObjects365V2, "train", annotation_digest, cancel_requested, trace, [&](const CompileAllowance& input_allowance) {
      progress.source_activity(BenchmarkDatasetSource::kObjects365V2, "Parsing and indexing Objects365 annotations");
      return parse_coco_style_annotations(
       json_path, annotation_digest, objects365_category_mappings(), annotation_parse_options(BenchmarkDatasetSource::kObjects365V2, "train", 0U, false, input_allowance));
@@ -226,7 +225,8 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
  std::vector<std::uint64_t> object_shard_bytes;
  object_shard_bytes.reserve(sampling_object_artifacts.size());
  for (const CatalogArtifact& artifact : sampling_object_artifacts) { object_shard_bytes.push_back(artifact.expected_size); }
- CombinedSupplementalSamplingResult combined_sampling = sample_combined_supplemental_indices(*coco_train, *objects, *open_images, object_shard_bytes, cancel_requested, (execution ? &execution->execution() : nullptr));
+ CombinedSupplementalSamplingResult combined_sampling =
+  sample_combined_supplemental_indices(*coco_train, *objects, *open_images, object_shard_bytes, cancel_requested, (execution ? &execution->execution() : nullptr));
  SupplementalSamplingResult objects_sampling = std::move(combined_sampling.objects365);
  SupplementalSamplingResult open_images_sampling = std::move(combined_sampling.open_images);
  if (selected_ready) {
@@ -236,7 +236,11 @@ CustomRecipePreparation prepare_custom_recipe(const BenchmarkCompilerConfig&, co
   publishers[0] = std::async(std::launch::async, [&] { selected_ready(objects_sampling.view); });
   publishers[1] = std::async(std::launch::async, [&] { selected_ready(open_images_sampling.view); });
   std::exception_ptr label_failure;
-  for (auto& publisher : publishers) try { publisher.get(); } catch (...) { if (!label_failure) label_failure = std::current_exception(); }
+  for (auto& publisher : publishers) try {
+    publisher.get();
+   } catch (...) {
+    if (!label_failure) label_failure = std::current_exception();
+   }
   if (label_failure) std::rethrow_exception(label_failure);
  }
  progress.phase(DatasetCompilePhase::Indexing, ++completed_indexes, kIndexCount);

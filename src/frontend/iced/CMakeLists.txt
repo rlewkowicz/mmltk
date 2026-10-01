@@ -224,8 +224,11 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
             list(APPEND _mmltk_frontend_js_arguments "--test-name-pattern=${MMLTK_ICED_JS_TEST_PATTERN}")
         endif()
         list(APPEND _mmltk_frontend_test_commands
-            COMMAND "${MMLTK_FRONTEND_NODE_EXECUTABLE}" --test
+            COMMAND "${CMAKE_COMMAND}" -E env
+                "MMLTK_BROWSER_BUNDLE_PUBLISHER=$<TARGET_FILE:mmltk_frontend_iced_publisher>"
+                "${MMLTK_FRONTEND_NODE_EXECUTABLE}" --test
                 ${_mmltk_frontend_js_arguments}
+                "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/browser_bundle.test.mjs"
                 "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/integration_control.test.mjs"
                 "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/workspace_graphics.test.mjs"
                 "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/graphics_recovery.test.mjs"
@@ -275,6 +278,7 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
     )
     add_dependencies(mmltk_frontend_iced_tests
         mmltk_controller_browser_protocol_v17_boundary
+        mmltk_frontend_iced_publisher
     )
 
     set(_mmltk_frontend_dist_next_dir

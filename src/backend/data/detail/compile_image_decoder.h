@@ -19,7 +19,10 @@ struct CompileImagePlan {
  std::size_t output_bytes = 0, cmyk_bytes = 0, stb_bytes = 0, opaque_bytes = 0;
  [[nodiscard]] std::size_t bytes() const;
 };
-class CompileImageError : public std::runtime_error { public: using std::runtime_error::runtime_error; };
+class CompileImageError : public std::runtime_error {
+public:
+ using std::runtime_error::runtime_error;
+};
 class CompileImageDecoder final {
 public:
  // Construction is resource-free; only benchmark JPEG operations own a handle.
@@ -30,8 +33,9 @@ public:
  [[nodiscard]] CompileImageHeader read_header(std::span<const std::uint8_t>, CompileImagePolicy, std::uint32_t expected_width = 0, std::uint32_t expected_height = 0);
  [[nodiscard]] static CompileImagePlan plan(const CompileImageHeader&);
  [[nodiscard]] std::span<const std::uint8_t> decode_rgb(std::span<const std::uint8_t>, const CompileImageHeader&, std::span<std::byte>);
+
 private:
  void ensure_jpeg_handle();
  void* handle_ = nullptr;
 };
-}
+}  // namespace mmltk::backend::data::detail

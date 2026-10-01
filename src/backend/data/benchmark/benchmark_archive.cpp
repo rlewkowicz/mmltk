@@ -22,10 +22,9 @@
 #include <sys/stat.h>
 namespace mmltk::backend::data::benchmark_internal {
 using detail::CompileExecution;
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
-
 namespace {
 constexpr std::size_t kBlock = 128U << 10;
 constexpr std::uint64_t kGzipIndexBytes = 64ULL << 20;
@@ -151,7 +150,9 @@ struct BenchmarkArchive::Impl {
  // Map nodes are never erased and survive rehash. Keep the already-owned key,
  // not name (which replay mutates). A null member explicitly means before the
  // first header; an absent optional means no suspended continuation.
- struct Suspended { const std::string* member = nullptr; };
+ struct Suspended {
+  const std::string* member = nullptr;
+ };
  std::optional<Suspended> suspended;
  Impl(const std::filesystem::path& path, CompileExecution* owner, std::uint64_t workspace, const CompileAllowance& parent, std::size_t workers, bool verify_gzip_crc,
   CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t dependent_descriptors, std::size_t gzip_index_entries)
@@ -227,7 +228,10 @@ struct BenchmarkArchive::Impl {
   streaming_mode = compressed && decoders == 1;
   block.resize(kBlock);
   if (compressed && execution && !decoder_allowance) decoder_allowance = execution->reserve(CompileResources::handles(1), parent_allowance);
-  cpu([&] { if (compressed) reset_decoder(); open(0); });
+  cpu([&] {
+   if (compressed) reset_decoder();
+   open(0);
+  });
  }
  void reset_decoder() {
   // Retire worker, cache, dictionary and compressed-reader backing before
@@ -393,10 +397,15 @@ struct BenchmarkArchive::Impl {
    const auto previous = mmltk::common::system::allowed_cpu_set();
    const auto granted = credits.cpus();
    mmltk::common::system::set_thread_affinity(std::vector<int>(granted.begin(), granted.end()));
-   try { work(); }
-   catch (...) { mmltk::common::system::set_thread_affinity(previous); throw; }
+   try {
+    work();
+   } catch (...) {
+    mmltk::common::system::set_thread_affinity(previous);
+    throw;
+   }
    mmltk::common::system::set_thread_affinity(previous);
-  } else work();
+  } else
+   work();
  }
 };
 BenchmarkArchive::InputRequirement BenchmarkArchive::input_requirement(const std::filesystem::path& path, std::uint64_t workspace, std::size_t workers) {
@@ -404,8 +413,8 @@ BenchmarkArchive::InputRequirement BenchmarkArchive::input_requirement(const std
  const bool compressed = gzip_magic(file, file.size());
  return {archive_workspace(compressed, std::max<std::size_t>(1, workers), workspace), compressed ? 2U : 1U};
 }
-BenchmarkArchive::BenchmarkArchive(const std::filesystem::path& path, CompileExecution* execution, std::uint64_t workspace, const CompileAllowance& parent, std::size_t workers,
- bool verify_gzip_crc, CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t consumer_descriptors, std::size_t gzip_index_entries)
+BenchmarkArchive::BenchmarkArchive(const std::filesystem::path& path, CompileExecution* execution, std::uint64_t workspace, const CompileAllowance& parent, std::size_t workers, bool verify_gzip_crc,
+ CompileAllowance workspace_allowance, std::size_t retained_gzip_windows, std::size_t consumer_descriptors, std::size_t gzip_index_entries)
     : impl_(std::make_unique<Impl>(path, execution, workspace, parent, workers, verify_gzip_crc, std::move(workspace_allowance), retained_gzip_windows, consumer_descriptors, gzip_index_entries)) {}
 BenchmarkArchive::~BenchmarkArchive() = default;
 bool BenchmarkArchive::next(Cancellation cancellation) {
@@ -691,9 +700,11 @@ void BenchmarkArchive::resume(std::uint64_t workspace, const CompileAllowance& p
 bool BenchmarkArchive::try_resume(std::uint64_t workspace, const CompileAllowance& parent, std::size_t consumer_descriptors) {
  auto& s = *impl_;
  if (s.reader) throw std::logic_error("archive continuation handoff requires a paused reader");
- if (!s.execution) { resume(workspace, parent, consumer_descriptors); return true; }
- auto admitted = s.execution->try_reserve({archive_workspace(s.compressed, 1, workspace), s.compressed ? 1U : 0U,
-  consumer_descriptors == 0, 0, false, consumer_descriptors}, parent);
+ if (!s.execution) {
+  resume(workspace, parent, consumer_descriptors);
+  return true;
+ }
+ auto admitted = s.execution->try_reserve({archive_workspace(s.compressed, 1, workspace), s.compressed ? 1U : 0U, consumer_descriptors == 0, 0, false, consumer_descriptors}, parent);
  if (!admitted) return false;
  auto previous_parent = std::exchange(s.parent_allowance, parent);
  s.consumer_descriptors = consumer_descriptors;
@@ -703,8 +714,13 @@ bool BenchmarkArchive::try_resume(std::uint64_t workspace, const CompileAllowanc
  // This complete grant includes the descriptor duplicated by the serial gzip
  // decoder. Its alias suppresses any second, potentially blocking reservation.
  if (s.compressed) s.decoder_allowance = s.credits;
- try { s.resume(workspace); }
- catch (...) { pause(); s.parent_allowance = std::move(previous_parent); throw; }
+ try {
+  s.resume(workspace);
+ } catch (...) {
+  pause();
+  s.parent_allowance = std::move(previous_parent);
+  throw;
+ }
  return true;
 }
 bool BenchmarkArchive::try_resize_workspace(std::uint64_t workspace) {

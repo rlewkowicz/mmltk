@@ -64,18 +64,23 @@ void MaskRunEmitter::finish() const {
  if (required_ > maximum_) throw MaskRunCapacityError(required_);
 }
 bool MaskRunEmitter::step_slab(Slab& slab) {
- if (slab.row==slab.end || slab.intervals.empty()) return true;
- if (slab.intervals.size()==1 && slab.intervals.front().first==0 && slab.intervals.front().second==width_) {
-  run(std::uint64_t{slab.row}*width_,std::uint64_t{slab.end}*width_); slab.row=slab.end; return true;
+ if (slab.row == slab.end || slab.intervals.empty()) return true;
+ if (slab.intervals.size() == 1 && slab.intervals.front().first == 0 && slab.intervals.front().second == width_) {
+  run(std::uint64_t{slab.row} * width_, std::uint64_t{slab.end} * width_);
+  slab.row = slab.end;
+  return true;
  }
- if (slab.row>=slab.end) return true;
- const auto [begin,end]=slab.intervals[slab.interval];
- run(std::uint64_t{slab.row}*width_+begin,std::uint64_t{slab.row}*width_+end);
- if (++slab.interval==slab.intervals.size()) { slab.interval=0; ++slab.row; }
- return slab.row==slab.end;
+ if (slab.row >= slab.end) return true;
+ const auto [begin, end] = slab.intervals[slab.interval];
+ run(std::uint64_t{slab.row} * width_ + begin, std::uint64_t{slab.row} * width_ + end);
+ if (++slab.interval == slab.intervals.size()) {
+  slab.interval = 0;
+  ++slab.row;
+ }
+ return slab.row == slab.end;
 }
 void MaskRunEmitter::slab(std::uint32_t first, std::uint32_t end, std::span<const std::pair<std::uint32_t, std::uint32_t>> intervals) {
- Slab pending{first,end,intervals};
+ Slab pending{first, end, intervals};
  while (!step_slab(pending)) {}
 }
 EncodedRowMajorMask encode_dense_row_major_mask(const std::span<const std::uint8_t> dense, const MaskDimensions dimensions) {
@@ -150,103 +155,152 @@ void materialize_row_major_mask(const std::span<const RLEPair> pairs, const Mask
 namespace {
 // First target coordinate whose nearest-center source coordinate is >= bound.
 // The wide intermediate covers every pair of uint32_t dimensions exactly.
-std::uint32_t inverse_mask_coordinate(std::uint32_t bound,std::uint32_t source_extent,std::uint32_t target_extent) {
- const auto numerator=static_cast<__uint128_t>(2)*target_extent*bound;
- if (numerator<=source_extent) return 0;
- const auto denominator=std::uint64_t{2}*source_extent;
- return static_cast<std::uint32_t>(std::min<__uint128_t>(target_extent,(numerator-source_extent+denominator-1)/denominator));
+std::uint32_t inverse_mask_coordinate(std::uint32_t bound, std::uint32_t source_extent, std::uint32_t target_extent) {
+ const auto numerator = static_cast<__uint128_t>(2) * target_extent * bound;
+ if (numerator <= source_extent) return 0;
+ const auto denominator = std::uint64_t{2} * source_extent;
+ return static_cast<std::uint32_t>(std::min<__uint128_t>(target_extent, (numerator - source_extent + denominator - 1) / denominator));
 }
-}
-RowMajorMaskProjection::RowMajorMaskProjection(std::span<const RLEPair> pairs,MaskDimensions source,MaskDimensions target,
- const mmltk::backend::imaging::resample::ImageResizeGeometry& geometry,MaskResizeScratch* scratch,
- mmltk::common::types::WorkspaceOutput<RLEPair> output,std::size_t maximum_runs)
- : pairs_(pairs),source_dimensions_(source),geometry_(geometry),scratch_(scratch),output_(output),first_(output.size()),
-   emitter_(output,first_,target.width,&target_,"mask run start overflow","mask run length overflow",maximum_runs) {
- if (!scratch || !geometry.resized_width || !geometry.resized_height || geometry.resized_width>target.width || geometry.resized_height>target.height ||
-     geometry.offset_x>target.width-geometry.resized_width || geometry.offset_y>target.height-geometry.resized_height)
+}  // namespace
+RowMajorMaskProjection::RowMajorMaskProjection(std::span<const RLEPair> pairs, MaskDimensions source, MaskDimensions target, const mmltk::backend::imaging::resample::ImageResizeGeometry& geometry,
+ MaskResizeScratch* scratch, mmltk::common::types::WorkspaceOutput<RLEPair> output, std::size_t maximum_runs)
+    : pairs_(pairs),
+      source_dimensions_(source),
+      geometry_(geometry),
+      scratch_(scratch),
+      output_(output),
+      first_(output.size()),
+      emitter_(output, first_, target.width, &target_, "mask run start overflow", "mask run length overflow", maximum_runs) {
+ if (!scratch || !geometry.resized_width || !geometry.resized_height || geometry.resized_width > target.width || geometry.resized_height > target.height ||
+     geometry.offset_x > target.width - geometry.resized_width || geometry.offset_y > target.height - geometry.resized_height)
   throw std::invalid_argument("mask resize parameters are invalid");
- if (pairs.empty()) { finished_=true; return; }
- pixels_=checked_pixel_count(source); (void)checked_pixel_count(target);
- identity_=source.width==target.width && source.height==target.height && geometry.resized_width==source.width &&
-  geometry.resized_height==source.height && !geometry.offset_x && !geometry.offset_y;
- full_={geometry.offset_x,geometry.offset_x+geometry.resized_width};
+ if (pairs.empty()) {
+  finished_ = true;
+  return;
+ }
+ pixels_ = checked_pixel_count(source);
+ (void)checked_pixel_count(target);
+ identity_ =
+  source.width == target.width && source.height == target.height && geometry.resized_width == source.width && geometry.resized_height == source.height && !geometry.offset_x && !geometry.offset_y;
+ full_ = {geometry.offset_x, geometry.offset_x + geometry.resized_width};
  scratch_->intervals.clear();
 }
-RowMajorMaskProjection::~RowMajorMaskProjection() { if (!finished_ && !failed_) rollback(); }
-void RowMajorMaskProjection::rollback() noexcept { output_.resize(first_); failed_=true; }
-void RowMajorMaskProjection::start_slab(std::uint32_t first,std::uint32_t end,std::span<const std::pair<std::uint32_t,std::uint32_t>> intervals,bool clear) {
- slab_={first+geometry_.offset_y,end+geometry_.offset_y,intervals}; slab_active_=true; clear_intervals_=clear;
+RowMajorMaskProjection::~RowMajorMaskProjection() {
+ if (!finished_ && !failed_) rollback();
+}
+void RowMajorMaskProjection::rollback() noexcept {
+ output_.resize(first_);
+ failed_ = true;
+}
+void RowMajorMaskProjection::start_slab(std::uint32_t first, std::uint32_t end, std::span<const std::pair<std::uint32_t, std::uint32_t>> intervals, bool clear) {
+ slab_ = {first + geometry_.offset_y, end + geometry_.offset_y, intervals};
+ slab_active_ = true;
+ clear_intervals_ = clear;
 }
 void RowMajorMaskProjection::flush() {
- start_slab(inverse_mask_coordinate(pending_row_,source_dimensions_.height,geometry_.resized_height),
-  inverse_mask_coordinate(pending_row_+1,source_dimensions_.height,geometry_.resized_height),scratch_->intervals,true);
+ start_slab(inverse_mask_coordinate(pending_row_, source_dimensions_.height, geometry_.resized_height), inverse_mask_coordinate(pending_row_ + 1, source_dimensions_.height, geometry_.resized_height),
+  scratch_->intervals, true);
 }
-bool RowMajorMaskProjection::partial(std::uint32_t row,std::uint32_t begin,std::uint32_t end) {
- if (row!=pending_row_) { flush(); pending_row_=row; return false; }
- const auto first=inverse_mask_coordinate(begin,source_dimensions_.width,geometry_.resized_width)+geometry_.offset_x;
- const auto last=inverse_mask_coordinate(end,source_dimensions_.width,geometry_.resized_width)+geometry_.offset_x;
- if (first!=last) {
-  if (!scratch_->intervals.empty() && first==scratch_->intervals.back().second) scratch_->intervals.back().second=last;
-  else scratch_->intervals.emplace_back(first,last);
+bool RowMajorMaskProjection::partial(std::uint32_t row, std::uint32_t begin, std::uint32_t end) {
+ if (row != pending_row_) {
+  flush();
+  pending_row_ = row;
+  return false;
+ }
+ const auto first = inverse_mask_coordinate(begin, source_dimensions_.width, geometry_.resized_width) + geometry_.offset_x;
+ const auto last = inverse_mask_coordinate(end, source_dimensions_.width, geometry_.resized_width) + geometry_.offset_x;
+ if (first != last) {
+  if (!scratch_->intervals.empty() && first == scratch_->intervals.back().second)
+   scratch_->intervals.back().second = last;
+  else
+   scratch_->intervals.emplace_back(first, last);
  }
  return true;
 }
 void RowMajorMaskProjection::advance() {
  if (slab_active_) {
-  if (emitter_.step_slab(slab_)) { slab_active_=false; if (clear_intervals_) scratch_->intervals.clear(); }
+  if (emitter_.step_slab(slab_)) {
+   slab_active_ = false;
+   if (clear_intervals_) scratch_->intervals.clear();
+  }
   return;
  }
  switch (stage_) {
   case Stage::Source: {
-   if (cursor_==pairs_.size()) { stage_=Stage::FinalFlush; break; }
-   const auto run=pairs_[cursor_++];
-   const auto end=std::uint64_t{run.start}+run.length;
-   if (!run.length || run.start<previous_end_ || end>pixels_) throw std::runtime_error("row-major mask contains an invalid run");
-   previous_end_=end;
-   include_row_major_mask_run(&source_,run.start,end,source_dimensions_.width);
-   if (identity_) { emitter_.run(run.start,end); break; }
-   row_=run.start/source_dimensions_.width; x_=run.start%source_dimensions_.width; remaining_=run.length;
-   stage_=Stage::Head; break;
+   if (cursor_ == pairs_.size()) {
+    stage_ = Stage::FinalFlush;
+    break;
+   }
+   const auto run = pairs_[cursor_++];
+   const auto end = std::uint64_t{run.start} + run.length;
+   if (!run.length || run.start < previous_end_ || end > pixels_) throw std::runtime_error("row-major mask contains an invalid run");
+   previous_end_ = end;
+   include_row_major_mask_run(&source_, run.start, end, source_dimensions_.width);
+   if (identity_) {
+    emitter_.run(run.start, end);
+    break;
+   }
+   row_ = run.start / source_dimensions_.width;
+   x_ = run.start % source_dimensions_.width;
+   remaining_ = run.length;
+   stage_ = Stage::Head;
+   break;
   }
   case Stage::Head:
    if (x_) {
-    const auto count=static_cast<std::uint32_t>(std::min(remaining_,std::uint64_t{source_dimensions_.width-x_}));
-    if (!partial(row_,x_,x_+count)) break;
-    remaining_-=count; ++row_;
+    const auto count = static_cast<std::uint32_t>(std::min(remaining_, std::uint64_t{source_dimensions_.width - x_}));
+    if (!partial(row_, x_, x_ + count)) break;
+    remaining_ -= count;
+    ++row_;
    }
-   stage_=Stage::Full; break;
+   stage_ = Stage::Full;
+   break;
   case Stage::Full:
-   rows_=static_cast<std::uint32_t>(remaining_/source_dimensions_.width);
-   if (rows_) { flush(); stage_=Stage::FullSlab; }
-   else stage_=Stage::Tail;
+   rows_ = static_cast<std::uint32_t>(remaining_ / source_dimensions_.width);
+   if (rows_) {
+    flush();
+    stage_ = Stage::FullSlab;
+   } else
+    stage_ = Stage::Tail;
    break;
   case Stage::FullSlab:
-   start_slab(inverse_mask_coordinate(row_,source_dimensions_.height,geometry_.resized_height),
-    inverse_mask_coordinate(row_+rows_,source_dimensions_.height,geometry_.resized_height),std::span(&full_,1),false);
-   row_+=rows_; remaining_%=source_dimensions_.width; stage_=Stage::Tail; break;
+   start_slab(inverse_mask_coordinate(row_, source_dimensions_.height, geometry_.resized_height), inverse_mask_coordinate(row_ + rows_, source_dimensions_.height, geometry_.resized_height),
+    std::span(&full_, 1), false);
+   row_ += rows_;
+   remaining_ %= source_dimensions_.width;
+   stage_ = Stage::Tail;
+   break;
   case Stage::Tail:
-   if (remaining_ && !partial(row_,0,static_cast<std::uint32_t>(remaining_))) break;
-   stage_=Stage::Source; break;
+   if (remaining_ && !partial(row_, 0, static_cast<std::uint32_t>(remaining_))) break;
+   stage_ = Stage::Source;
+   break;
   case Stage::FinalFlush:
    if (!identity_) flush();
-   stage_=Stage::Finish; break;
+   stage_ = Stage::Finish;
+   break;
   case Stage::Finish:
-   emitter_.finish(); finished_=true; break;
+   emitter_.finish();
+   finished_ = true;
+   break;
  }
 }
 bool RowMajorMaskProjection::step(std::size_t maximum_steps) {
  if (!maximum_steps) throw std::invalid_argument("mask projection step requires a positive bound");
  if (failed_) throw std::logic_error("mask projection resumed after failure");
- try { while (!finished_ && maximum_steps--) advance(); }
- catch (...) { rollback(); throw; }
+ try {
+  while (!finished_ && maximum_steps--) advance();
+ } catch (...) {
+  rollback();
+  throw;
+ }
  return finished_;
 }
-RowMajorMaskBounds append_resized_row_major_mask(const std::span<const RLEPair> pairs,const MaskDimensions source,const MaskDimensions target,
- const mmltk::backend::imaging::resample::ImageResizeGeometry& geometry,MaskResizeScratch* scratch,mmltk::common::types::WorkspaceOutput<RLEPair> output,
- RowMajorMaskBounds* source_bounds,std::size_t maximum_runs) {
- RowMajorMaskProjection projection(pairs,source,target,geometry,scratch,output,maximum_runs);
+RowMajorMaskBounds append_resized_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions source, const MaskDimensions target,
+ const mmltk::backend::imaging::resample::ImageResizeGeometry& geometry, MaskResizeScratch* scratch, mmltk::common::types::WorkspaceOutput<RLEPair> output, RowMajorMaskBounds* source_bounds,
+ std::size_t maximum_runs) {
+ RowMajorMaskProjection projection(pairs, source, target, geometry, scratch, output, maximum_runs);
  while (!projection.step()) {}
- if (source_bounds && !pairs.empty()) *source_bounds=projection.source_bounds();
+ if (source_bounds && !pairs.empty()) *source_bounds = projection.source_bounds();
  return projection.target_bounds();
 }
 }  // namespace mmltk::backend::data::dataset

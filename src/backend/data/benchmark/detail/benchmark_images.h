@@ -19,15 +19,13 @@
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 namespace mmltk::backend::data::benchmark_internal {
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
-
+using mmltk::backend::data::detail::CompileResources;
 // Source lifecycle plus the directory/output and archive/decoder descriptor
 // pairs. A metadata producer commits this complete continuation before its
 // borrowed input can wait for an image reader.
 [[nodiscard]] CompileResources archive_image_resources();
 class BenchmarkCompilePipeline;
-
 // Parses the "quarantined" manifest array shared by the cached-image manifests: each record must
 // carry a reason and reference a requested image id. Returns false when the array is malformed.
 // append receives (image_id, reason) per record.

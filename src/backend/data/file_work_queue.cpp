@@ -30,9 +30,9 @@ struct FileWorkQueue::Impl {
  CompileExecution* execution = nullptr;
  mmltk::common::concurrency::WorkerPool* pool = nullptr;
  RuntimeReadiness runtime_readiness;
- std::array<std::optional<CompileExecution::Producer>,static_cast<std::size_t>(CompileWorkClass::Count)> producers;
- std::array<std::size_t,static_cast<std::size_t>(CompileWorkClass::Count)> class_pending{};
- std::array<std::size_t,static_cast<std::size_t>(CompileWorkClass::Count)> queued{};
+ std::array<std::optional<CompileExecution::Producer>, static_cast<std::size_t>(CompileWorkClass::Count)> producers;
+ std::array<std::size_t, static_cast<std::size_t>(CompileWorkClass::Count)> class_pending{};
+ std::array<std::size_t, static_cast<std::size_t>(CompileWorkClass::Count)> queued{};
  std::unique_ptr<CompileExecution::ServiceDemand> demand;
  std::unique_ptr<CompileExecution::Readiness> readiness;
  const std::exception_ptr cancelled = std::make_exception_ptr(std::runtime_error("file operation cancelled before admission"));
@@ -40,10 +40,13 @@ struct FileWorkQueue::Impl {
  std::size_t service_capacity = 0, busy_services = 0;
  std::uint64_t generation = 0;
  bool stopping = false, shutdown = false;
- explicit Impl(std::size_t capacity) : records(capacity) { if (!capacity) throw std::invalid_argument("file queue requires prepared records"); }
+ explicit Impl(std::size_t capacity) : records(capacity) {
+  if (!capacity) throw std::invalid_argument("file queue requires prepared records");
+ }
  void check_admission() const {
   if (stopping) throw std::runtime_error("file queue admission after stop");
-  if (execution) if (const auto error = execution->interruption()) std::rethrow_exception(error);
+  if (execution)
+   if (const auto error = execution->interruption()) std::rethrow_exception(error);
  }
  // Lock order is queue then execution admission. Readiness delivery takes only
  // the queue lock, after the execution owner has released its admission lock.
@@ -64,8 +67,12 @@ struct FileWorkQueue::Impl {
   auto completion = records[index].completion;
   // Only the record's completion owner gets here. An admitted syscall has
   // returned, and all callbacks finish outside both queue and admission locks.
-  if (operation.completed) try { operation.completed(error); } catch (...) { if (!error) error = std::current_exception(); }
-  const auto service_class=static_cast<std::size_t>(operation.service_class);
+  if (operation.completed) try {
+    operation.completed(error);
+   } catch (...) {
+    if (!error) error = std::current_exception();
+   }
+  const auto service_class = static_cast<std::size_t>(operation.service_class);
   auto* const context = operation.context;
   operation = {};
   if (!runtime_readiness.available) completion.settle(error);
@@ -82,7 +89,10 @@ struct FileWorkQueue::Impl {
   if (runtime_readiness.available) {
    runtime_readiness.available(runtime_readiness.context, context);
    completion.settle(error);
-   { const std::lock_guard lock(mutex); --notifying; }
+   {
+    const std::lock_guard lock(mutex);
+    --notifying;
+   }
    changed.notify_all();
   }
  }
@@ -97,8 +107,10 @@ struct FileWorkQueue::Impl {
     // precedes it or joins the admitted call through its actual return.
     records[index].state = State::Running;
    }
-   if (records[index].operation.work) records[index].operation.work();
-   else records[index].operation.call(records[index].operation.context);
+   if (records[index].operation.work)
+    records[index].operation.work();
+   else
+    records[index].operation.call(records[index].operation.context);
   } catch (...) { error = std::current_exception(); }
   // A callback retains the dispatcher and producer, but not its CPU grant.
   grant.reset();
@@ -127,14 +139,17 @@ struct FileWorkQueue::Impl {
      if (stopping || shutdown) return;
      const auto observed = generation;
      error = {};
-     try { grant = demand->try_grant(); }
-     catch (...) { error = std::current_exception(); }
+     try {
+      grant = demand->try_grant();
+     } catch (...) { error = std::current_exception(); }
      for (std::size_t turn = 0; turn < records.size(); ++turn) {
       const auto candidate = (cursor + turn) % records.size();
       const auto& record = records[candidate];
       if (record.state == State::Queued && (error || (grant && record.operation.service_class == grant->work_class()))) {
        selected = candidate;
-       claim(selected); ++busy_services; update_demand();
+       claim(selected);
+       ++busy_services;
+       update_demand();
        break;
       }
      }
@@ -145,12 +160,18 @@ struct FileWorkQueue::Impl {
     }
    }
    if (error) {
-    { const std::lock_guard lock(mutex); records[selected].state = State::Completing; }
+    {
+     const std::lock_guard lock(mutex);
+     records[selected].state = State::Completing;
+    }
     finish(selected, error);
-   } else perform(selected, std::move(grant));
+   } else
+    perform(selected, std::move(grant));
    {
     const std::lock_guard lock(mutex);
-    --busy_services; update_demand(); ++generation;
+    --busy_services;
+    update_demand();
+    ++generation;
    }
    changed.notify_all();
   }
@@ -163,14 +184,24 @@ FileWorkQueue::FileWorkQueue(CompileExecution& execution, std::size_t records, s
  impl_->demand = std::make_unique<CompileExecution::ServiceDemand>(execution);
  impl_->readiness = std::make_unique<CompileExecution::Readiness>(execution, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness::Changes) {
   if (auto owner = weak.lock()) {
-   { const std::lock_guard lock(owner->mutex); ++owner->generation; }
+   {
+    const std::lock_guard lock(owner->mutex);
+    ++owner->generation;
+   }
    owner->changed.notify_all();
   }
  });
- try { for (std::size_t i = 0; i < services; ++i) impl_->services.emplace_back([owner = impl_] { owner->service(); }); }
- catch (...) {
-  { const std::lock_guard lock(impl_->mutex); impl_->shutdown = true; }
-  impl_->changed.notify_all(); impl_->services.clear(); impl_->readiness.reset(); throw;
+ try {
+  for (std::size_t i = 0; i < services; ++i) impl_->services.emplace_back([owner = impl_] { owner->service(); });
+ } catch (...) {
+  {
+   const std::lock_guard lock(impl_->mutex);
+   impl_->shutdown = true;
+  }
+  impl_->changed.notify_all();
+  impl_->services.clear();
+  impl_->readiness.reset();
+  throw;
  }
 }
 FileWorkQueue::FileWorkQueue(mmltk::common::concurrency::WorkerPool& pool, std::size_t records, RuntimeReadiness readiness) : impl_(std::make_shared<Impl>(records)) {
@@ -185,17 +216,22 @@ FileWorkQueue::FileWorkQueue(mmltk::common::concurrency::WorkerPool& pool, std::
  }
 }
 FileWorkQueue::~FileWorkQueue() {
- cancel(); join();
- { const std::lock_guard lock(impl_->mutex); impl_->shutdown = true; }
- impl_->changed.notify_all(); impl_->services.clear();
+ cancel();
+ join();
+ {
+  const std::lock_guard lock(impl_->mutex);
+  impl_->shutdown = true;
+ }
+ impl_->changed.notify_all();
+ impl_->services.clear();
  // Unregister while this owner is still retained; a final weak callback must
  // never destroy its own Readiness registration on the notifier thread.
  impl_->readiness.reset();
 }
 std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation operation) {
  if (!operation.call && !operation.work) throw std::invalid_argument("empty borrowed file operation");
- const auto service_class=static_cast<std::size_t>(operation.service_class);
- if (service_class>=impl_->class_pending.size()) throw std::invalid_argument("invalid file operation service class");
+ const auto service_class = static_cast<std::size_t>(operation.service_class);
+ if (service_class >= impl_->class_pending.size()) throw std::invalid_argument("invalid file operation service class");
  std::unique_lock lock(impl_->mutex);
  impl_->check_admission();
  const auto position = std::ranges::find(impl_->records, Impl::State::Free, &Impl::Record::state);
@@ -207,20 +243,29 @@ std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation 
  if (!impl_->class_pending[service_class] && impl_->execution) producer.emplace(impl_->execution->open_class(operation.service_class));
  position->completion = std::move(completion);
  auto result = position->completion.completion();
- position->operation = std::move(operation); position->state = Impl::State::Queued;
+ position->operation = std::move(operation);
+ position->state = Impl::State::Queued;
  if (impl_->pool) {
   position->dispatch_owner = impl_;
   try {
    impl_->pool->enqueue_borrowed(*position->dispatch);
   } catch (...) {
-   position->dispatch_owner.reset(); operation = std::move(position->operation); position->state = Impl::State::Free;
-   lock.unlock(); throw;
+   position->dispatch_owner.reset();
+   operation = std::move(position->operation);
+   position->state = Impl::State::Free;
+   lock.unlock();
+   throw;
   }
  }
  if (producer) impl_->producers[service_class] = std::move(producer);
- ++impl_->class_pending[service_class]; ++impl_->pending; ++impl_->queued[service_class];
- impl_->update_demand(); ++impl_->generation;
- lock.unlock(); impl_->changed.notify_all(); return result;
+ ++impl_->class_pending[service_class];
+ ++impl_->pending;
+ ++impl_->queued[service_class];
+ impl_->update_demand();
+ ++impl_->generation;
+ lock.unlock();
+ impl_->changed.notify_all();
+ return result;
 }
 bool FileWorkQueue::has_capacity() const {
  const std::lock_guard lock(impl_->mutex);
@@ -232,13 +277,22 @@ CompileExecution::Completion FileWorkQueue::submit(Operation operation) {
  for (;;) {
   if (auto completion = try_submit(operation)) return std::move(*completion);
   std::unique_lock lock(impl_->mutex);
-  impl_->changed.wait(lock,[&] { return impl_->stopping || (impl_->execution && impl_->execution->interruption()) ||
-   std::ranges::any_of(impl_->records,[](const Impl::Record& record) { return record.state == Impl::State::Free; }); });
+  impl_->changed.wait(lock, [&] {
+   return impl_->stopping || (impl_->execution && impl_->execution->interruption()) ||
+          std::ranges::any_of(impl_->records, [](const Impl::Record& record) { return record.state == Impl::State::Free; });
+  });
  }
 }
-void FileWorkQueue::join() { std::unique_lock lock(impl_->mutex); impl_->changed.wait(lock, [&] { return !impl_->pending && !impl_->notifying; }); }
+void FileWorkQueue::join() {
+ std::unique_lock lock(impl_->mutex);
+ impl_->changed.wait(lock, [&] { return !impl_->pending && !impl_->notifying; });
+}
 void FileWorkQueue::cancel() noexcept {
- { const std::lock_guard lock(impl_->mutex); impl_->stopping = true; impl_->update_demand(); }
+ {
+  const std::lock_guard lock(impl_->mutex);
+  impl_->stopping = true;
+  impl_->update_demand();
+ }
  // Claimed records settle on their service thread; queued records can settle
  // here even while every service is in a physical call. Local stop withdraws
  // only this queue's demand and never interrupts the execution owner.
@@ -255,4 +309,4 @@ void FileWorkQueue::cancel() noexcept {
   impl_->finish(index, impl_->cancelled);
  }
 }
-}
+}  // namespace mmltk::backend::data::detail

@@ -49,10 +49,9 @@ import mmltk.common.logging.profile_utils;
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
 namespace mmltk::backend::data::benchmark_internal {
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
-
 namespace common_concurrency = mmltk::common::concurrency;
 namespace common_io = mmltk::common::io;
 namespace common_math = mmltk::common::math;
@@ -126,10 +125,11 @@ struct BenchmarkSplitWriter::Impl {
   (void)catalog::ClassCatalog(class_names, COMPILED_CLASS_NAME_CAPACITY);
   if (class_names.empty() || class_names.size() > MAX_CLASSES) throw std::runtime_error("benchmark split exceeds the compiled class limit");
   execution = request.execution;
-  if (!request.worker_cpus.empty()) output_cpu=request.worker_cpus.front();
+  if (!request.worker_cpus.empty()) output_cpu = request.worker_cpus.front();
   if (execution) {
-   output_execution=&execution->execution(); files=&execution->files();
-   writer_handles=output_execution->reserve(CompileResources::handles(1));
+   output_execution = &execution->execution();
+   files = &execution->files();
+   writer_handles = output_execution->reserve(CompileResources::handles(1));
   }
   if (resolution == 0 || resolution > MAX_IMAGE_EXTENT) throw std::runtime_error("benchmark pixel membership is incomplete");
   layout = compute_file_layout(common_math::checked_cast<std::uint32_t>(images.size(), "benchmark image count overflow"), stride);
@@ -144,21 +144,24 @@ struct BenchmarkSplitWriter::Impl {
  }
  // The enclosing attempt drains a borrowed pipeline before either owner can
  // retire. Only the locally owned service is safe to join from this destructor.
- ~Impl() { if (standalone_files) standalone_files->join(); }
+ ~Impl() {
+  if (standalone_files) standalone_files->join();
+ }
  detail::FileWorkQueue& output() {
   if (execution) return *files;
   // Pixel-only standalone sessions retain their existing useful-worker bound.
   // Initialize the reusable output owner only when a controller writes labels,
   // settles provenance, or seals this writer.
-  std::call_once(standalone_output,[&] {
-   const auto label_bytes=detail::CompiledLabelWorkspace::required_bytes(0);
+  std::call_once(standalone_output, [&] {
+   const auto label_bytes = detail::CompiledLabelWorkspace::required_bytes(0);
    detail::CompileExecutionLimits limits;
-   const std::array<detail::CompileWorkspaceProfile,1> profiles{{{label_bytes,0}}};
-   limits.workspace_plan=std::make_shared<detail::CompileWorkspacePlan>(detail::CompileWorkspacePlan::prepare(1,profiles,0,COMPILED_COMPACTION_SCRATCH_BYTES,
-    common_math::checked_add(label_bytes,COMPILED_COMPACTION_SCRATCH_BYTES,"standalone output workspace overflow")));
-   standalone_execution=std::make_unique<detail::CompileExecution>(1,output_cpu ? std::span<const int>(&*output_cpu,1) : std::span<const int>{},limits,cancellation);
-   standalone_files=std::make_unique<detail::FileWorkQueue>(*standalone_execution,2);
-   output_execution=standalone_execution.get(); files=standalone_files.get();
+   const std::array<detail::CompileWorkspaceProfile, 1> profiles{{{label_bytes, 0}}};
+   limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::CompileWorkspacePlan::prepare(
+    1, profiles, 0, COMPILED_COMPACTION_SCRATCH_BYTES, common_math::checked_add(label_bytes, COMPILED_COMPACTION_SCRATCH_BYTES, "standalone output workspace overflow")));
+   standalone_execution = std::make_unique<detail::CompileExecution>(1, output_cpu ? std::span<const int>(&*output_cpu, 1) : std::span<const int>{}, limits, cancellation);
+   standalone_files = std::make_unique<detail::FileWorkQueue>(*standalone_execution, 2);
+   output_execution = standalone_execution.get();
+   files = standalone_files.get();
   });
   return *files;
  }
@@ -230,56 +233,58 @@ void BenchmarkSplitWriter::invalidate_labels(std::uint32_t slot) {
 }
 void BenchmarkSplitWriter::settle_labels(std::uint32_t slot, std::uint64_t ordinal_base, bool ordinal_incomplete) {
  if (!ordinal_base && !ordinal_incomplete) return;
- const auto transform = [this,slot,ordinal_base,ordinal_incomplete] {
-  auto labels=impl_->slots_storage->labels(slot);
-  const auto selected=entry(slot);
-  labels.settle_ordinals(selected.num_instances,ordinal_base,ordinal_incomplete);
+ const auto transform = [this, slot, ordinal_base, ordinal_incomplete] {
+  auto labels = impl_->slots_storage->labels(slot);
+  const auto selected = entry(slot);
+  labels.settle_ordinals(selected.num_instances, ordinal_base, ordinal_incomplete);
  };
- impl_->output().submit({.work=transform}).wait();
+ impl_->output().submit({.work = transform}).wait();
 }
 void BenchmarkSplitWriter::prepare_pixels(std::uint32_t slot) {
- if (impl_->extent_preparing) { const auto [root,id]=identity(slot); impl_->extent_preparing(root,id); }
+ if (impl_->extent_preparing) {
+  const auto [root, id] = identity(slot);
+  impl_->extent_preparing(root, id);
+ }
  impl_->slots_storage->prepare_pixels(slot);
 }
 void BenchmarkSplitWriter::write_labels(std::uint32_t slot, ImageEntry entry, ImageAnnotations annotations, std::uint64_t ordinal_base) {
- set_annotation_extent(entry,annotations.labels.size(),annotations.runs.size(),std::to_string(entry.source_image_id));
+ set_annotation_extent(entry, annotations.labels.size(), annotations.runs.size(), std::to_string(entry.source_image_id));
  // Direct controller callers also hand physical I/O an owned pinned payload.
- auto& files=impl_->output();
+ auto& files = impl_->output();
  detail::CompiledLabelWorkspace workspace;
- workspace.prepare(0,impl_->output_execution->reserve({.bytes=detail::CompiledLabelWorkspace::required_bytes(0),.supplied_workspace=true,
-  .completion_workspace=true,.workspace_class=detail::CompileWorkClass::Output}));
+ workspace.prepare(0, impl_->output_execution->reserve(
+                       {.bytes = detail::CompiledLabelWorkspace::required_bytes(0), .supplied_workspace = true, .completion_workspace = true, .workspace_class = detail::CompileWorkClass::Output}));
  workspace.labels.resize(annotations.labels.size());
  workspace.runs.resize(annotations.runs.size());
- std::ranges::copy(annotations.labels,workspace.labels.begin());
- std::ranges::copy(annotations.runs,workspace.runs.begin());
+ std::ranges::copy(annotations.labels, workspace.labels.begin());
+ std::ranges::copy(annotations.runs, workspace.runs.begin());
  auto output = std::make_shared<detail::CompiledLabelWorkspace::OutputLease>(workspace.release_output());
- const auto write = [this,slot,entry,output,ordinal_base] { write_label_output(slot,entry,std::move(*output),ordinal_base); };
- files.submit({.work=write}).wait();
+ const auto write = [this, slot, entry, output, ordinal_base] { write_label_output(slot, entry, std::move(*output), ordinal_base); };
+ files.submit({.work = write}).wait();
 }
 void BenchmarkSplitWriter::write_label_output(std::uint32_t slot, ImageEntry entry, detail::CompiledLabelWorkspace::OutputLease output, std::uint64_t ordinal_base) {
  auto& state = *impl_;
  throw_if_benchmark_cancelled(state.cancellation);
  entry.status = ImageStatus::Eligible;
- set_annotation_extent(entry,output.labels.size(),output.runs.size(),std::to_string(entry.source_image_id));
+ set_annotation_extent(entry, output.labels.size(), output.runs.size(), std::to_string(entry.source_image_id));
  FileHeader checks{};
- checks.num_classes = common_math::checked_cast<std::uint32_t>(state.class_names.size(),"benchmark class count overflow");
+ checks.num_classes = common_math::checked_cast<std::uint32_t>(state.class_names.size(), "benchmark class count overflow");
  checks.max_instances_per_image = UINT16_MAX;
  checks.image_width = checks.image_height = state.resolution;
- (void)admit_compiled_annotations(entry,{output.labels,output.runs},checks,slot,state.cancellation);
+ (void)admit_compiled_annotations(entry, {output.labels, output.runs}, checks, slot, state.cancellation);
  {
   const std::lock_guard lock(state.facts_mutex);
   if (state.images.at(slot).source_image_id != entry.source_image_id) throw std::runtime_error("benchmark label identity or canvas differs from pixels");
  }
- auto labels=state.slots_storage->labels(slot);
- labels.write(entry,std::move(output),ordinal_base);
+ auto labels = state.slots_storage->labels(slot);
+ labels.write(entry, std::move(output), ordinal_base);
  {
   const std::lock_guard lock(state.facts_mutex);
   state.entries[slot] = entry;
  }
 }
-std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(
- std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication, CompileAllowance allowance, std::shared_ptr<const BenchmarkEncodedImage> payload,
- std::shared_ptr<const detail::CompilePixelWorkspacePlan> plan) {
+std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication, CompileAllowance allowance,
+ std::shared_ptr<const BenchmarkEncodedImage> payload, std::shared_ptr<const detail::CompilePixelWorkspacePlan> plan) {
  auto& state = *impl_;
  EncodedImageRecord image;
  std::filesystem::path source_root;
@@ -380,12 +385,12 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane) {
  auto input = prepare_pixel(slot, lane);
  if (!input) return;
  detail::CompileExecutionLimits limits;
- limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(1,impl_->resolution,impl_->perceptual,0,0,BenchmarkEncodedImage::normal_window_bytes));
- detail::CompileExecution execution(1,{},limits,impl_->cancellation);
+ limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(1, impl_->resolution, impl_->perceptual, 0, 0, BenchmarkEncodedImage::normal_window_bytes));
+ detail::CompileExecution execution(1, {}, limits, impl_->cancellation);
  detail::CompilePixelWorkspace workspace;
- detail::FileWorkQueue files(execution,1);
- files.submit({.work=[&] { prepare_pixels(common_math::checked_cast<std::uint32_t>(slot,"benchmark pixel slot overflow")); }}).wait();
- execution.run(CompileTaskKind::Pixels,pixel_resources(*input),[&](std::size_t) { write_pixel(slot,lane,input,execution.current_allowance(),workspace); });
+ detail::FileWorkQueue files(execution, 1);
+ files.submit({.work = [&] { prepare_pixels(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow")); }}).wait();
+ execution.run(CompileTaskKind::Pixels, pixel_resources(*input), [&](std::size_t) { write_pixel(slot, lane, input, execution.current_allowance(), workspace); });
 }
 void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const std::shared_ptr<BenchmarkPixelInput>& input, CompileAllowance allowance, detail::CompilePixelWorkspace& scratch) {
  if (!input || image_complete(slot)) return;
@@ -399,8 +404,8 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const
  if (memory.size() < plan.bytes()) throw std::logic_error("benchmark pixels have no admitted arena");
  throw_if_benchmark_cancelled(state.cancellation);
  try {
-  auto destination = state.slots_storage->pixels(common_math::checked_cast<std::uint32_t>(slot,"benchmark pixel slot overflow"));
-  scratch.write(plan,input->payload->encoded(),header,memory,{destination.data(),plan.destination()});
+  auto destination = state.slots_storage->pixels(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow"));
+  scratch.write(plan, input->payload->encoded(), header, memory, {destination.data(), plan.destination()});
  } catch (const detail::CompileImageError& error) {
   throw_if_benchmark_cancelled(state.cancellation);
   const std::lock_guard lock(state.facts_mutex);
@@ -488,29 +493,41 @@ void BenchmarkSplitWriter::write_remaining(const BenchmarkWriteRequest& request)
   return;
  }
  const auto cpus = request.worker_cpus.empty() ? mmltk::common::system::allowed_cpu_set() : std::vector<int>(request.worker_cpus.begin(), request.worker_cpus.end());
- const int workers = std::max(1, std::min({request.num_workers,
-  common_math::checked_cast<int>(cpus.size(), "benchmark CPU count overflow"), common_math::checked_cast<int>(slots.size(), "benchmark slot count overflow")}));
+ const int workers = std::max(
+  1, std::min({request.num_workers, common_math::checked_cast<int>(cpus.size(), "benchmark CPU count overflow"), common_math::checked_cast<int>(slots.size(), "benchmark slot count overflow")}));
  detail::CompileExecutionLimits limits;
- limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(workers,impl_->resolution,impl_->perceptual,0,0,BenchmarkEncodedImage::normal_window_bytes));
- detail::CompileExecution execution(workers,cpus,limits,request.cancel_requested);
- detail::FileWorkQueue files(execution,execution.workers());
+ limits.workspace_plan =
+  std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(workers, impl_->resolution, impl_->perceptual, 0, 0, BenchmarkEncodedImage::normal_window_bytes));
+ detail::CompileExecution execution(workers, cpus, limits, request.cancel_requested);
+ detail::FileWorkQueue files(execution, execution.workers());
  std::vector<std::unique_ptr<detail::CompilePixelWorkspace>> workspaces;
- for (std::size_t i=0; i<execution.workers(); ++i) workspaces.push_back(std::make_unique<detail::CompilePixelWorkspace>());
+ for (std::size_t i = 0; i < execution.workers(); ++i) workspaces.push_back(std::make_unique<detail::CompilePixelWorkspace>());
  std::vector<detail::CompileExecution::Completion> active;
  active.reserve(execution.workers());
  try {
   for (const auto slot : slots) {
    // The existing strict standalone writer admits each immutable header before
    // its actual workspace request; submitted pixels may finish independently.
-   auto input = prepare_pixel(slot,0);
+   auto input = prepare_pixel(slot, 0);
    if (!input) continue;
-   files.submit({.work=[&] { prepare_pixels(common_math::checked_cast<std::uint32_t>(slot,"benchmark pixel slot overflow")); }}).wait();
-   active.push_back(execution.submit({.kind=CompileTaskKind::Pixels,.resources=pixel_resources(*input),
-    .work=[this,slot,input,&workspaces](std::size_t lane,const CompileAllowance& allowance) { write_pixel(slot,lane,input,allowance,*workspaces[lane]); },.retain_workspace=false}));
-   if (active.size()==execution.workers()) { for (const auto& work : active) work.wait(); active.clear(); }
+   files.submit({.work = [&] { prepare_pixels(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow")); }}).wait();
+   active.push_back(
+    execution.submit({.kind = CompileTaskKind::Pixels, .resources = pixel_resources(*input), .work = [this, slot, input, &workspaces](std::size_t lane, const CompileAllowance& allowance) {
+    write_pixel(slot, lane, input, allowance, *workspaces[lane]);
+   }, .retain_workspace = false}));
+   if (active.size() == execution.workers()) {
+    for (const auto& work : active) work.wait();
+    active.clear();
+   }
   }
   for (const auto& work : active) work.wait();
- } catch (...) { execution.cancel(); try { execution.join(); } catch (...) {} throw; }
+ } catch (...) {
+  execution.cancel();
+  try {
+   execution.join();
+  } catch (...) {}
+  throw;
+ }
 }
 BenchmarkSealedSplit BenchmarkSplitWriter::seal(const BenchmarkWriteRequest& request) {
  auto& state = *impl_;
@@ -557,11 +574,10 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
   state.directory = {};
   state.directory_source = std::numeric_limits<std::uint16_t>::max();
  }
- state.layout = compact_compiled_file(
-  state.staging.file(), state.layout, index, request.cancel_requested, request.compaction, {
-   [&](std::size_t offset,std::size_t bytes) { state.staging.allocate_range(offset,bytes); },
-   [&](std::size_t offset,std::size_t bytes) { return state.staging.reclaim_range(offset,bytes); },
-   [&](std::size_t bytes) { state.staging.resize_sparse(bytes); }},request.compaction_scratch);
+ state.layout = compact_compiled_file(state.staging.file(), state.layout, index, request.cancel_requested, request.compaction, {[&](std::size_t offset, std::size_t bytes) {
+  state.staging.allocate_range(offset, bytes);
+ }, [&](std::size_t offset, std::size_t bytes) { return state.staging.reclaim_range(offset, bytes); }, [&](std::size_t bytes) { state.staging.resize_sparse(bytes); }},
+  request.compaction_scratch);
  state.staging.reconcile();
  const auto header =
   make_file_header({common_math::checked_cast<std::uint32_t>(slots.size(), "benchmark image count overflow"), state.resolution, state.resolution, 3U, maximum, state.stride, state.resize_mode},
@@ -582,14 +598,18 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
  return {std::move(state.staging), std::move(info)};
 }
 void BenchmarkSplitWriter::finish(const BenchmarkWriteRequest& request) {
- auto& files=impl_->output();
- auto scratch=impl_->output_execution->reserve({.bytes=COMPILED_COMPACTION_SCRATCH_BYTES,.supplied_workspace=true,
-  .completion_workspace=true,.workspace_class=detail::CompileWorkClass::Output,.workspace_window=detail::CompileWorkspaceWindow::Compaction});
+ auto& files = impl_->output();
+ auto scratch = impl_->output_execution->reserve(
+  {.bytes = COMPILED_COMPACTION_SCRATCH_BYTES,
+   .supplied_workspace = true,
+   .completion_workspace = true,
+   .workspace_class = detail::CompileWorkClass::Output,
+   .workspace_window = detail::CompileWorkspaceWindow::Compaction});
  std::optional<BenchmarkSealedSplit> sealed;
- auto seal_request=request;
- seal_request.compaction_scratch=scratch.workspace();
- files.submit({.work=[&] { sealed=seal(seal_request); }}).wait();
- scratch={};
+ auto seal_request = request;
+ seal_request.compaction_scratch = scratch.workspace();
+ files.submit({.work = [&] { sealed = seal(seal_request); }}).wait();
+ scratch = {};
  sealed->artifact.publish(request.output_path, request.cancel_requested, detail::StagedArtifact::Publication::DurableReplace, request.overwrite);
 }
 void write_benchmark_split(const BenchmarkWriteRequest& request) {
@@ -599,21 +619,32 @@ void write_benchmark_split(const BenchmarkWriteRequest& request) {
  writer.write_remaining(request);
  writer.finish(request);
 }
-std::array<BenchmarkSealedSplit,2> seal_benchmark_splits(BenchmarkCompilePipeline& pipeline,
- const std::function<BenchmarkSealedSplit(std::size_t,std::span<std::byte>)>& seal) {
- std::array<BenchmarkSealedSplit,2> results{};
- std::array<detail::CompileExecution::Completion,2> completions;
+std::array<BenchmarkSealedSplit, 2> seal_benchmark_splits(BenchmarkCompilePipeline& pipeline, const std::function<BenchmarkSealedSplit(std::size_t, std::span<std::byte>)>& seal) {
+ std::array<BenchmarkSealedSplit, 2> results{};
+ std::array<detail::CompileExecution::Completion, 2> completions;
  std::exception_ptr failure;
- for (std::size_t i=0;i<results.size();++i) {
+ for (std::size_t i = 0; i < results.size(); ++i) {
   try {
-   auto scratch=pipeline.execution().reserve({.bytes=COMPILED_COMPACTION_SCRATCH_BYTES,.supplied_workspace=true,
-    .completion_workspace=true,.workspace_class=detail::CompileWorkClass::Output,.workspace_window=detail::CompileWorkspaceWindow::Compaction});
-   completions[i]=pipeline.files().submit({.work=[&,i,scratch] { results[i]=seal(i,scratch.workspace()); }});
-  } catch (...) { if (!failure) failure=std::current_exception(); break; }
+   auto scratch = pipeline.execution().reserve(
+    {.bytes = COMPILED_COMPACTION_SCRATCH_BYTES,
+     .supplied_workspace = true,
+     .completion_workspace = true,
+     .workspace_class = detail::CompileWorkClass::Output,
+     .workspace_window = detail::CompileWorkspaceWindow::Compaction});
+   completions[i] = pipeline.files().submit({.work = [&, i, scratch] { results[i] = seal(i, scratch.workspace()); }});
+  } catch (...) {
+   if (!failure) failure = std::current_exception();
+   break;
+  }
  }
- for (const auto& completion:completions) if (completion) {
-  try { completion.wait(); } catch (...) { if (!failure) failure=std::current_exception(); }
- }
+ for (const auto& completion : completions)
+  if (completion) {
+   try {
+    completion.wait();
+   } catch (...) {
+    if (!failure) failure = std::current_exception();
+   }
+  }
  if (failure) std::rethrow_exception(failure);
  return results;
 }

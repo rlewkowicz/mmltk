@@ -42,15 +42,15 @@ private:
 // input validation and transactional rollback; overlap union is a separate algorithm.
 class MaskRunEmitter final {
 public:
- MaskRunEmitter(mmltk::common::types::WorkspaceOutput<RLEPair> output, std::size_t first_run, std::uint32_t width, RowMajorMaskBounds* bounds = nullptr, const char* start_error = "mask run start overflow",
-  const char* length_error = "mask run length overflow", std::size_t maximum_runs = std::numeric_limits<std::size_t>::max())
+ MaskRunEmitter(mmltk::common::types::WorkspaceOutput<RLEPair> output, std::size_t first_run, std::uint32_t width, RowMajorMaskBounds* bounds = nullptr,
+  const char* start_error = "mask run start overflow", const char* length_error = "mask run length overflow", std::size_t maximum_runs = std::numeric_limits<std::size_t>::max())
      : output_(output), first_(first_run), width_(width), bounds_(bounds), start_error_(start_error), length_error_(length_error), maximum_(maximum_runs), required_(output.size()) {
   if (required_ > first_) last_ = output.back();
  }
  void run(std::uint64_t begin, std::uint64_t end);
  struct Slab {
   std::uint32_t row = 0, end = 0;
-  std::span<const std::pair<std::uint32_t,std::uint32_t>> intervals;
+  std::span<const std::pair<std::uint32_t, std::uint32_t>> intervals;
   std::size_t interval = 0;
  };
  // Emits at most one interval, or one coalesced full-width slab.
@@ -81,34 +81,34 @@ void materialize_row_major_mask(std::span<const RLEPair> pairs, MaskDimensions d
 // Destruction before success rolls back this mask; earlier masks are untouched.
 class RowMajorMaskProjection final {
 public:
- RowMajorMaskProjection(std::span<const RLEPair>,MaskDimensions source,MaskDimensions target,
-  const mmltk::backend::imaging::resample::ImageResizeGeometry&,MaskResizeScratch*,
-  mmltk::common::types::WorkspaceOutput<RLEPair>,std::size_t maximum_runs=std::numeric_limits<std::size_t>::max());
+ RowMajorMaskProjection(std::span<const RLEPair>, MaskDimensions source, MaskDimensions target, const mmltk::backend::imaging::resample::ImageResizeGeometry&, MaskResizeScratch*,
+  mmltk::common::types::WorkspaceOutput<RLEPair>, std::size_t maximum_runs = std::numeric_limits<std::size_t>::max());
  ~RowMajorMaskProjection();
- RowMajorMaskProjection(const RowMajorMaskProjection&)=delete;
- RowMajorMaskProjection& operator=(const RowMajorMaskProjection&)=delete;
- [[nodiscard]] bool step(std::size_t maximum_steps=1024);
+ RowMajorMaskProjection(const RowMajorMaskProjection&) = delete;
+ RowMajorMaskProjection& operator=(const RowMajorMaskProjection&) = delete;
+ [[nodiscard]] bool step(std::size_t maximum_steps = 1024);
  [[nodiscard]] const RowMajorMaskBounds& source_bounds() const noexcept { return source_; }
  [[nodiscard]] const RowMajorMaskBounds& target_bounds() const noexcept { return target_; }
+
 private:
- enum class Stage { Source,Head,Full,FullSlab,Tail,FinalFlush,Finish };
+ enum class Stage { Source, Head, Full, FullSlab, Tail, FinalFlush, Finish };
  std::span<const RLEPair> pairs_;
  MaskDimensions source_dimensions_;
  mmltk::backend::imaging::resample::ImageResizeGeometry geometry_;
  MaskResizeScratch* scratch_;
  mmltk::common::types::WorkspaceOutput<RLEPair> output_;
- std::size_t first_,cursor_=0,pixels_=0;
- RowMajorMaskBounds source_,target_;
+ std::size_t first_, cursor_ = 0, pixels_ = 0;
+ RowMajorMaskBounds source_, target_;
  MaskRunEmitter emitter_;
  MaskRunEmitter::Slab slab_;
- std::pair<std::uint32_t,std::uint32_t> full_;
- std::uint64_t previous_end_=0,remaining_=0;
- std::uint32_t pending_row_=0,row_=0,x_=0,rows_=0;
- Stage stage_=Stage::Source;
- bool identity_=false,slab_active_=false,clear_intervals_=false,finished_=false,failed_=false;
- void start_slab(std::uint32_t first,std::uint32_t end,std::span<const std::pair<std::uint32_t,std::uint32_t>>,bool clear);
+ std::pair<std::uint32_t, std::uint32_t> full_;
+ std::uint64_t previous_end_ = 0, remaining_ = 0;
+ std::uint32_t pending_row_ = 0, row_ = 0, x_ = 0, rows_ = 0;
+ Stage stage_ = Stage::Source;
+ bool identity_ = false, slab_active_ = false, clear_intervals_ = false, finished_ = false, failed_ = false;
+ void start_slab(std::uint32_t first, std::uint32_t end, std::span<const std::pair<std::uint32_t, std::uint32_t>>, bool clear);
  void flush();
- [[nodiscard]] bool partial(std::uint32_t row,std::uint32_t begin,std::uint32_t end);
+ [[nodiscard]] bool partial(std::uint32_t row, std::uint32_t begin, std::uint32_t end);
  void advance();
  void rollback() noexcept;
 };

@@ -2441,10 +2441,11 @@ namespace {
 void native_compile_resizes(BrowserAudit& audit, std::uint64_t generation, std::string_view defect = "none") {
  for (unsigned step = 0; step < 4; ++step) {
   const unsigned width = step == 0 ? 480 : 960, height = step == 0 ? 900 : 720;
-  nlohmann::json facts{{"step", step}, {"generation", generation}, {"before_revision", 2U}, {"revision", 3U}, {"root_revision", 3U},
-   {"css", {width, height}}, {"backing", {width, height}}, {"configured", {width, height}}, {"root", {0, 0, width, height}}, {"ui_root", {0, 0, width, height}},
-   {"root_scale", 1}, {"device_scale", 1}, {"inputs", 0}, {"viewport", {width, height}}, {"prior_viewport", {1280, 1024}},
-   {"transition", {{"event", "iced.window.presented"}, {"pending_resize", false}, {"width", width}, {"height", height}}}};
+  nlohmann::json facts{
+   {"step", step}, {"generation", generation}, {"before_revision", 2U}, {"revision", 3U}, {"root_revision", 3U}, {"css", {width, height}}, {"backing", {width, height}},
+   {"configured", {width, height}}, {"root", {0, 0, width, height}}, {"ui_root", {0, 0, width, height}}, {"root_scale", 1}, {"device_scale", 1}, {"inputs", 0}, {"viewport", {width, height}},
+   {"prior_viewport", {1280, 1024}}, {"transition", {{"event", "iced.window.presented"}, {"pending_resize", false}, {"width", width}, {"height", height}}}
+  };
   if (defect == "stale-ui-root") facts["ui_root"][2] = width - 100;
   if (defect == "stale-root") facts["root"][2] = width - 100;
   if (defect == "stale-configure") facts["configured"][1] = height - 1;
@@ -2456,7 +2457,7 @@ void native_compile_resizes(BrowserAudit& audit, std::uint64_t generation, std::
   audit.consume({{"event", "integration.compile_resize"}, {"control", "train.compile_dataset.progress"}, {"detail", facts.dump()}});
  }
 }
-}
+}  // namespace
 TEST_CASE("active compile resize evidence requires progress actual presentation and root coverage", "[workspace][audit]") {
  for (const std::string defect : {"none", "stale-root", "stale-ui-root", "stale-configure", "input-wakeup", "stale-progress", "pending-resize", "no-present", "unchanged-viewport"}) {
   BrowserAudit audit;

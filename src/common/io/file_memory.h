@@ -35,7 +35,10 @@ public:
  void resize_sparse(std::size_t bytes) const;
  void allocate_range(std::size_t offset, std::size_t bytes) const;
  [[nodiscard]] bool punch_hole(std::size_t offset, std::size_t bytes) const;
- struct WriteSpan { const void* data; std::size_t bytes; };
+ struct WriteSpan {
+  const void* data;
+  std::size_t bytes;
+ };
  // Checked bounded scatter/gather; inputs remain borrowed through return.
  void pwritev_all(std::span<const WriteSpan>, std::size_t offset) const;
  void pwrite_all(const void* source, std::size_t bytes, std::size_t offset) const;

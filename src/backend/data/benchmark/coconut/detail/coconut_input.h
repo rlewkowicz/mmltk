@@ -16,10 +16,11 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-namespace mmltk::backend::data::detail { class FileWorkQueue; }
+namespace mmltk::backend::data::detail {
+class FileWorkQueue;
+}
 namespace mmltk::backend::data::benchmark_internal {
 class CoconutStaging;
-
 class CoconutInputError final : public std::runtime_error {
 public:
  using std::runtime_error::runtime_error;

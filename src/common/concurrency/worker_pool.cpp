@@ -242,8 +242,10 @@ void WorkerPool::enqueue_borrowed(BorrowedTask& record) {
   record.sequence_ = impl_->submitted++;
   record.queued_ = true;
   record.next_ = nullptr;
-  if (impl_->borrowed_tail) impl_->borrowed_tail->next_ = &record;
-  else impl_->borrowed_head = &record;
+  if (impl_->borrowed_tail)
+   impl_->borrowed_tail->next_ = &record;
+  else
+   impl_->borrowed_head = &record;
   impl_->borrowed_tail = &record;
   ++impl_->pending_tasks;
  }

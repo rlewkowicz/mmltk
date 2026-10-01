@@ -66,6 +66,7 @@ public:
   UsedRangeCursor() = default;
   [[nodiscard]] std::optional<UsedRange> next(std::size_t limit = read_chunk_bytes);
   [[nodiscard]] bool empty() const noexcept { return source_ == nullptr; }
+
  private:
   friend class CompiledDataset;
   const CompiledDataset* source_ = nullptr;

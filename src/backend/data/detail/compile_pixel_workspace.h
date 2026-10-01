@@ -22,6 +22,7 @@ public:
  [[nodiscard]] CompileResources resources() const noexcept { return resources_; }
  [[nodiscard]] std::size_t bytes() const noexcept { return resources_.bytes; }
  [[nodiscard]] const imaging::resample::RgbImageLayout& destination() const noexcept { return destination_; }
+
 private:
  friend class CompilePixelWorkspace;
  friend CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, CompilePixelPolicy);
@@ -35,18 +36,17 @@ private:
  imaging::resample::RgbImageLayout destination_;
 };
 [[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, CompilePixelPolicy);
-[[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, std::uint32_t resolution,
- imaging::resample::ImageResizeMode, bool perceptual);
+[[nodiscard]] CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader&, std::uint32_t resolution, imaging::resample::ImageResizeMode, bool perceptual);
 // Session-owned controls bind only to the current arena. Pixels go directly
 // into the prepared destination; neither controls nor borrowed scratch escape.
 // A supplied storage preparation runs after successful decoding, before stores.
 class CompilePixelWorkspace final {
 public:
- void write(const CompilePixelWorkspacePlan&, std::span<const std::uint8_t> encoded, const CompileImageHeader&,
-  std::span<std::byte> workspace, imaging::resample::RgbMutableImageView destination,
+ void write(const CompilePixelWorkspacePlan&, std::span<const std::uint8_t> encoded, const CompileImageHeader&, std::span<std::byte> workspace, imaging::resample::RgbMutableImageView destination,
   std::function_ref<void()> prepare_destination = +[] {});
+
 private:
  CompileImageDecoder decoder_;
  imaging::resample::RgbImageResizer resizer_{1, false};
 };
-}
+}  // namespace mmltk::backend::data::detail

@@ -29,9 +29,8 @@
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 namespace mmltk::backend::data::benchmark_internal {
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
-
+using mmltk::backend::data::detail::CompileResources;
 const std::string& download_failure_sha256(DownloadResult& artifact, mmltk::common::concurrency::CancellationObservation cancellation) {
  if (!artifact.failure_digest) {
   auto& memo = artifact.failure_digest.emplace();
@@ -1246,7 +1245,7 @@ class DownloadBatch final {
     const std::lock_guard lock(mutex_);
     if (!error_) error_ = std::current_exception();
     stopped_.store(true, std::memory_order_relaxed);
-  if (execution_) execution_->execution().notify_admission_change();
+    if (execution_) execution_->execution().notify_admission_change();
     jobs_changed_.notify_all();
    }
    // The slot is reusable only after its complete borrowed job has retired.

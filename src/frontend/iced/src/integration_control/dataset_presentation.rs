@@ -15,7 +15,15 @@ extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationCompileResize)]
     pub(super) fn compile_resize(step: u8, generation: f64, revision: f64, begin: bool) -> bool;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationCompileRoot)]
-    fn compile_root(generation: f64, revision: f64, x: f64, y: f64, width: f64, height: f64, scale: f64);
+    fn compile_root(
+        generation: f64,
+        revision: f64,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        scale: f64,
+    );
 }
 
 pub(super) const FIXTURE_COUNT: u8 = 36;
@@ -891,10 +899,19 @@ impl Widget<RootMessage, Theme, iced::Renderer> for Observed<'_> {
             if crate::presentation_surface::surface_trace_enabled() {
                 crate::presentation_surface::emit_surface_trace(&format!(
                     "{{\"event\":\"iced.window.root_draw\",\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"scale\":{}}}",
-                    root.x, root.y, root.width, root.height, self.scale));
+                    root.x, root.y, root.width, root.height, self.scale
+                ));
             }
             if let Some(native) = &self.native {
-                compile_root(native.generation as f64, native.revision as f64, root.x.into(), root.y.into(), root.width.into(), root.height.into(), self.scale.into());
+                compile_root(
+                    native.generation as f64,
+                    native.revision as f64,
+                    root.x.into(),
+                    root.y.into(),
+                    root.width.into(),
+                    root.height.into(),
+                    self.scale.into(),
+                );
             }
         }
         if self.key != 0

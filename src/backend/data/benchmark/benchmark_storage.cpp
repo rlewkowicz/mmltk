@@ -34,21 +34,23 @@ std::uint64_t additional_download_bytes(const std::filesystem::path& destination
 }
 void require_storage(const std::filesystem::path& path, std::uint64_t required, const char* description, const BenchmarkTraceSink& trace) {
  detail::StorageReservationPool::Observer observe;
- if (trace) observe=[trace](const detail::StorageReservationPool::Observation& value) {
-  trace_benchmark_event(trace,"benchmark.storage.preflight",[&] { return nlohmann::json{{"target",value.description},{"path",value.path.string()},
-   {"required_bytes",value.required},{"available_bytes",value.available}}; });
- };
- detail::StorageReservationPool::require_capacity(path,required,description,std::move(observe));
+ if (trace)
+  observe = [trace](const detail::StorageReservationPool::Observation& value) {
+   trace_benchmark_event(trace, "benchmark.storage.preflight",
+    [&] { return nlohmann::json{{"target", value.description}, {"path", value.path.string()}, {"required_bytes", value.required}, {"available_bytes", value.available}}; });
+  };
+ detail::StorageReservationPool::require_capacity(path, required, description, std::move(observe));
 }
 detail::StorageReservationPool::Observer storage_observer(const BenchmarkTraceSink& trace) {
  if (!trace) return {};
  return [trace](const detail::StorageReservationPool::Observation& value) {
-  trace_benchmark_event(trace, "benchmark.storage.reserved", [&] { return nlohmann::json{{"target", value.description}, {"path", value.path.string()},
-   {"required_bytes", value.required}, {"reserved_bytes", value.outstanding}, {"available_bytes", value.available}}; });
+  trace_benchmark_event(trace, "benchmark.storage.reserved", [&] {
+   return nlohmann::json{{"target", value.description}, {"path", value.path.string()}, {"required_bytes", value.required}, {"reserved_bytes", value.outstanding}, {"available_bytes", value.available}};
+  });
  };
 }
 detail::StorageReservationPool::Reservation reserve_download(detail::StorageReservationPool& storage, const std::filesystem::path& path, std::uint64_t expected, std::string_view description) {
  return storage.reserve(expected, description, download_allocation(path));
 }
 void reconcile_download(detail::StorageReservationPool::Reservation& reservation, const std::filesystem::path& path) { reservation.reconcile_allocated(download_allocation(path)); }
-}
+}  // namespace mmltk::backend::data::benchmark_internal

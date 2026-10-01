@@ -24,6 +24,7 @@
 #include "src/common/io/scoped_fd.h"
 #include "src/test_support/async_test_utils.hpp"
 namespace mmltk::backend::data::testsupport {
+using mmltk::testsupport::require_condition;
 class HttpServer {
 public:
  // The payload is borrowed until Stop(); retain it and mutate only between settled transfers.
@@ -108,9 +109,6 @@ public:
  [[nodiscard]] std::uint64_t ranged_requests() const { return ranged_requests_.load(std::memory_order_relaxed); }
 
 private:
- static void require_condition(const bool condition, const char* message) {
-  if (!condition) { throw std::runtime_error(message); }
- }
  static bool send_all(const int socket, const void* data, const std::size_t bytes) {
   const auto* input = static_cast<const std::uint8_t*>(data);
   std::size_t sent = 0;

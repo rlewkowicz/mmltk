@@ -17,11 +17,10 @@
 #include <mutex>
 #include "src/pch_std.h"
 namespace mmltk::backend::data::benchmark_internal {
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
-using mmltk::backend::data::detail::InsufficientCompileResources;
+using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
-
+using mmltk::backend::data::detail::InsufficientCompileResources;
 namespace common_io = mmltk::common::io;
 namespace common_math = mmltk::common::math;
 namespace {
@@ -153,8 +152,8 @@ std::string extract_archive_member(const std::filesystem::path& archive_path, st
 [[nodiscard]] NormalizedAnnotationIndex load_or_build_index(const BenchmarkCacheLayout& cache, const std::filesystem::path& path, const BenchmarkDatasetSource source, const std::string_view split,
  const std::string_view annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace,
  const std::function<NormalizedAnnotationIndex(const CompileAllowance&)>& builder, detail::StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const CompileAllowance& parent) {
- auto lease = ArtifactLease::acquire_charged(
-  cache.locks / (std::string(benchmark_source_name(source)) + "-" + std::string(split) + ".index.lock"), cancel_requested, (execution ? &execution->execution() : nullptr), CompileResources::handles(2), parent);
+ auto lease = ArtifactLease::acquire_charged(cache.locks / (std::string(benchmark_source_name(source)) + "-" + std::string(split) + ".index.lock"), cancel_requested,
+  (execution ? &execution->execution() : nullptr), CompileResources::handles(2), parent);
  if (auto cached = load_normalized_annotation_index(path, source, split, annotation_sha256, cancel_requested, trace)) { return std::move(*cached); }
  NormalizedAnnotationIndex index = builder(lease->allowance());
  index.completion = store_normalized_annotation_index(path, index, cancel_requested, trace, storage);
@@ -208,7 +207,8 @@ CocoAnnotationCache::CocoAnnotationCache(const BenchmarkCacheLayout& cache, cons
       cancellation_(cancellation),
       trace_(trace),
       source_transport_(execution ? execution->curl().channel(BenchmarkCurl::Class::Artifact, cancellation, coco_annotation_resources()) : nullptr),
-      lease_(custody ? std::move(custody) : ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources())),
+      lease_(custody ? std::move(custody)
+                     : ArtifactLease::acquire_charged(cache.locks / "coco-annotations.lifecycle.lock", cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources())),
       execution_(execution),
       storage_(execution ? &execution->storage() : storage) {
  indexes_.train_path = cache.source_indexes("coco") / "train2017.normalized.bin";
@@ -271,7 +271,10 @@ void CocoAnnotationCache::build_split(bool training, const std::string& digest, 
   if (input_observer_) input_observer_(training, CocoAnnotationInputBoundary::Parsing);
   try {
    return parse_coco_style_annotations(json_path, digest, coco_category_mappings(),
-    AnnotationParseOptions{BenchmarkDatasetSource::kCoco2017, split, training ? train_count_ : validation_count_, parse_workers_, !training, cancellation_, trace_, execution_ ? &execution_->execution() : nullptr, input_allowance});
+    AnnotationParseOptions{
+     BenchmarkDatasetSource::kCoco2017, split, training ? train_count_ : validation_count_, parse_workers_, !training, cancellation_, trace_, execution_ ? &execution_->execution() : nullptr,
+     input_allowance
+    });
   } catch (const AnnotationDocumentRejected& error) {
    throw_if_benchmark_cancelled(cancellation_);
    throw AnnotationSourceUnavailable(error.what());

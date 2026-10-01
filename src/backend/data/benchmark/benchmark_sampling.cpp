@@ -6,10 +6,9 @@
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data::benchmark_internal {
 using detail::CompileExecution;
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
-
 using mmltk::common::math::checked_cast;
 namespace {
 constexpr std::size_t kClassCount = 80U;

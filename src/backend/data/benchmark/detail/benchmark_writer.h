@@ -28,7 +28,6 @@ namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
-
 class BenchmarkCompilePipeline;
 struct BenchmarkLabelChunk;
 struct CachedImageSource {
@@ -105,9 +104,8 @@ public:
  void prepare_pixels(std::uint32_t);
  void write_label_output(std::uint32_t, ImageEntry, detail::CompiledLabelWorkspace::OutputLease, std::uint64_t ordinal_base = 0);
  void write_labels(std::uint32_t slot, ImageEntry entry, ImageAnnotations, std::uint64_t ordinal_base = 0);
- [[nodiscard]] std::shared_ptr<BenchmarkPixelInput> prepare_pixel(
-  std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication = {}, CompileAllowance allowance = {}, std::shared_ptr<const BenchmarkEncodedImage> payload = {},
-  std::shared_ptr<const detail::CompilePixelWorkspacePlan> plan = {});
+ [[nodiscard]] std::shared_ptr<BenchmarkPixelInput> prepare_pixel(std::size_t slot, std::size_t lane, BenchmarkSourcePublication publication = {}, CompileAllowance allowance = {},
+  std::shared_ptr<const BenchmarkEncodedImage> payload = {}, std::shared_ptr<const detail::CompilePixelWorkspacePlan> plan = {});
  [[nodiscard]] std::shared_ptr<const detail::CompilePixelWorkspacePlan> prepare_pixel_plan(std::size_t slot, const BenchmarkImageHeader&) const;
  [[nodiscard]] CompileAllowance pixel_input_allowance(const BenchmarkPixelInput&) const;
  [[nodiscard]] CompileResources pixel_resources(const BenchmarkPixelInput&) const;
@@ -132,6 +130,5 @@ private:
 void write_benchmark_split(const BenchmarkWriteRequest& request);
 // Joins both physical seals before returning either result or propagating an
 // error. Each callback receives admitted pinned compaction scratch.
-[[nodiscard]] std::array<BenchmarkSealedSplit,2> seal_benchmark_splits(BenchmarkCompilePipeline&,
- const std::function<BenchmarkSealedSplit(std::size_t,std::span<std::byte>)>&);
+[[nodiscard]] std::array<BenchmarkSealedSplit, 2> seal_benchmark_splits(BenchmarkCompilePipeline&, const std::function<BenchmarkSealedSplit(std::size_t, std::span<std::byte>)>&);
 }  // namespace mmltk::backend::data::benchmark_internal

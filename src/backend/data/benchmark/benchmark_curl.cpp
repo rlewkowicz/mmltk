@@ -28,19 +28,18 @@ std::pair<std::size_t, CompileAllowance> reserve_benchmark_transfers(detail::Com
  execution.require_feasible(envelope.demand(1));
  for (;;) {
   const auto observed = execution.admission_generation();
-  for (auto count = requested; count; --count) if (auto allowance = execution.try_reserve(envelope.demand(count), parent)) return {count, std::move(*allowance)};
+  for (auto count = requested; count; --count)
+   if (auto allowance = execution.try_reserve(envelope.demand(count), parent)) return {count, std::move(*allowance)};
   auto wait = execution.defer_resources();
   execution.wait_for_admission_change(observed);
  }
 }
-
 using detail::CompileExecution;
 using detail::CompileWorkClass;
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileResourceWait;
 using mmltk::backend::data::detail::InsufficientCompileResources;
-
 namespace {
 constexpr std::size_t kCurlWakeDescriptors = 2, kCurlRequestDescriptors = 1;
 // Ubuntu 24.04's Curl 8.5 TCP Happy Eyeballs owner has two family candidates
@@ -198,12 +197,13 @@ struct BenchmarkCurl::Impl {
   }
   ensure_curl_global_initialized("cannot initialize benchmark Curl: ");
   require_supported_curl();
-  if (execution) readiness = std::make_unique<CompileExecution::Readiness>(*execution, [this](CompileExecution::Readiness::Changes changes) {
-   if (!changes.resources && !changes.pressure && !changes.interrupted) return;
-   const std::lock_guard lock(mutex);
-   notify_readers_locked();
-   if (changes.retry || changes.interrupted) wake_locked();
-  });
+  if (execution)
+   readiness = std::make_unique<CompileExecution::Readiness>(*execution, [this](CompileExecution::Readiness::Changes changes) {
+    if (!changes.resources && !changes.pressure && !changes.interrupted) return;
+    const std::lock_guard lock(mutex);
+    notify_readers_locked();
+    if (changes.retry || changes.interrupted) wake_locked();
+   });
   worker = std::jthread([this] { run(); });
  }
  ~Impl() {

@@ -9,12 +9,12 @@
 #include "src/pch_std.h"
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileTaskKind;
-
 namespace {
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
 [[noreturn]] void invalid(std::string_view detail) { throw CoconutInputError("COCONut: " + std::string(detail)); }
 template <InventoryRecord T>
-std::string store_inventory(const std::filesystem::path& path, const InventoryHeader& header, std::span<const T> records, Cancellation cancellation, detail::StorageReservationPool* storage = nullptr) {
+std::string store_inventory(
+ const std::filesystem::path& path, const InventoryHeader& header, std::span<const T> records, Cancellation cancellation, detail::StorageReservationPool* storage = nullptr) {
  throw_if_benchmark_cancelled(cancellation);
  (void)mmltk::common::io::ensure_parent_directory(path);
  detail::StorageReservationPool destination(path, {}, storage);

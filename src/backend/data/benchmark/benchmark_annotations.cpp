@@ -21,10 +21,9 @@
 #include "src/backend/data/detail/mask_rle_utils.h"
 namespace mmltk::backend::data::benchmark_internal {
 using detail::CompileExecution;
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
-
 using mmltk::common::concurrency::parallel_for_range_indexed;
 using mmltk::common::io::errno_error;
 using mmltk::common::io::FileHandle;
@@ -93,8 +92,8 @@ void annotation_ranges(CompileExecution* execution, std::size_t count, int worke
  return std::max(1, std::min(std::max(available, 1), bounded_work));
 }
 void parallel_object_array(const PaddedMappedFile& file, std::span<const ByteRange> rows, int requested_workers, std::vector<simdjson::ondemand::parser>& parsers,
- CompileExecution::Workspace* parser_workspace, mmltk::common::concurrency::CancellationObservation cancellation,
- const std::function<void(int, simdjson::ondemand::object, std::uint64_t)>& callback, CompileExecution* execution = nullptr, const std::function<void(int)>& begin_chunk = {}) {
+ CompileExecution::Workspace* parser_workspace, mmltk::common::concurrency::CancellationObservation cancellation, const std::function<void(int, simdjson::ondemand::object, std::uint64_t)>& callback,
+ CompileExecution* execution = nullptr, const std::function<void(int)>& begin_chunk = {}) {
  const auto workers = execution ? execution->workers() : static_cast<std::size_t>(effective_worker_count(requested_workers, rows.size()));
  std::vector<ByteRange> chunks;
  for (std::size_t begin = 0; begin < rows.size();) {
@@ -297,9 +296,8 @@ void parse_segmentation(simdjson::ondemand::value value, ParsedAnnotation::Segme
  parsed.complete = have_image && have_category;
  return parsed;
 }
-void validate_numeric_categories(const PaddedMappedFile& file, std::span<const ByteRange> categories, std::vector<simdjson::ondemand::parser>& parsers,
- CompileExecution::Workspace* parser_workspace, NumericCategoryAdmission& admission, bool complete, mmltk::common::concurrency::CancellationObservation cancel_requested,
- CompileExecution* execution) try {
+void validate_numeric_categories(const PaddedMappedFile& file, std::span<const ByteRange> categories, std::vector<simdjson::ondemand::parser>& parsers, CompileExecution::Workspace* parser_workspace,
+ NumericCategoryAdmission& admission, bool complete, mmltk::common::concurrency::CancellationObservation cancel_requested, CompileExecution* execution) try {
  std::mutex admission_mutex;
  parallel_object_array(file, categories, 1, parsers, parser_workspace, cancel_requested, [&](int, simdjson::ondemand::object object, std::uint64_t) {
   std::uint32_t id = 0U;
@@ -1057,8 +1055,8 @@ struct NormalizedAnnotationAssembler::Mapped {
  std::size_t image_count = 0, box_count = 0, run_count = 0;
  Mapped(detail::StorageReservationPool& storage, const std::filesystem::path& path, std::size_t bytes) : artifact(storage, path, bytes, "normalized annotation assembly") {}
 };
-NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(NormalizedAnnotationMetadata metadata,
- mmltk::common::concurrency::CancellationObservation cancellation, const std::filesystem::path& staging_directory, detail::StorageReservationPool* storage)
+NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(
+ NormalizedAnnotationMetadata metadata, mmltk::common::concurrency::CancellationObservation cancellation, const std::filesystem::path& staging_directory, detail::StorageReservationPool* storage)
     : cancellation_(cancellation), staging_directory_(staging_directory), storage_(storage) {
  throw_if_benchmark_cancelled(cancellation_);
  static_cast<NormalizedAnnotationMetadata&>(builder_) = std::move(metadata);
@@ -1101,110 +1099,155 @@ void validate_assembled_box(NormalizedBox& box, std::size_t runs, BenchmarkDatas
  box.mask_rle_pairs = checked_cast<std::uint32_t>(runs, "normalized mask run count overflow");
  validate_box_value(box, source);
 }
-}
+}  // namespace
 void NormalizedAnnotationAssembler::gather(std::span<const Slice> slices, CompileExecution* execution, detail::FileWorkQueue* files, const CompileAllowance& allowance) {
  if (finished_ || incomplete_gather_ || (mapped_ ? mapped_->image_count : builder_.images.size())) throw std::logic_error("normalized gather requires an empty assembler");
  if (execution && execution->on_lane()) throw std::logic_error("normalized gather requires a controller outside CPU work");
  // Every planning/preparation/copy failure leaves the assembler unsealable.
  incomplete_gather_ = true;
- struct Cursor { std::size_t first_box, first_run, box=0, run=0, output_run=0; std::uint64_t previous=0; bool complete=false; };
+ struct Cursor {
+  std::size_t first_box, first_run, box = 0, run = 0, output_run = 0;
+  std::uint64_t previous = 0;
+  bool complete = false;
+ };
  std::vector<Cursor> cursors;
- std::size_t boxes=0,runs=0;
- auto producer=execution ? execution->open_class(detail::CompileWorkClass::Gather) : CompileExecution::Producer{};
+ std::size_t boxes = 0, runs = 0;
+ auto producer = execution ? execution->open_class(detail::CompileWorkClass::Gather) : CompileExecution::Producer{};
  const auto plan = [&](std::size_t) {
   throw_if_benchmark_cancelled(cancellation_);
   cursors.reserve(slices.size());
   std::optional<std::uint64_t> previous;
   for (const auto& slice : slices) {
    throw_if_benchmark_cancelled(cancellation_);
-   validate_assembled_image(slice.image,builder_.source,previous);
-   previous=slice.image.source_image_id;
+   validate_assembled_image(slice.image, builder_.source, previous);
+   previous = slice.image.source_image_id;
    if (slice.image.box_count != slice.boxes.size()) throw std::runtime_error("normalized gather box extent mismatch");
-   cursors.push_back({boxes,runs});
-   boxes=common::math::checked_add(boxes,slice.boxes.size(),"normalized gather box overflow");
+   cursors.push_back({boxes, runs});
+   boxes = common::math::checked_add(boxes, slice.boxes.size(), "normalized gather box overflow");
    for (const auto& box : slice.boxes) {
-    if (box.mask_rle_offset>slice.runs.size() || box.mask_rle_pairs>slice.runs.size()-box.mask_rle_offset) throw std::runtime_error("normalized gather run extent mismatch");
-    runs=common::math::checked_add(runs,std::size_t{box.mask_rle_pairs},"normalized gather run overflow");
+    if (box.mask_rle_offset > slice.runs.size() || box.mask_rle_pairs > slice.runs.size() - box.mask_rle_offset) throw std::runtime_error("normalized gather run extent mismatch");
+    runs = common::math::checked_add(runs, std::size_t{box.mask_rle_pairs}, "normalized gather run overflow");
    }
   }
   if (mapped_) {
-   if (slices.size()!=mapped_->images.size() || boxes!=mapped_->boxes.size() || runs!=mapped_->runs.size()) throw std::runtime_error("normalized gather planned extent mismatch");
+   if (slices.size() != mapped_->images.size() || boxes != mapped_->boxes.size() || runs != mapped_->runs.size()) throw std::runtime_error("normalized gather planned extent mismatch");
   } else if (staging_directory_.empty()) {
-   builder_.images.resize(slices.size()); builder_.boxes.resize(boxes); builder_.mask_rle_pairs.resize(runs);
+   builder_.images.resize(slices.size());
+   builder_.boxes.resize(boxes);
+   builder_.mask_rle_pairs.resize(runs);
    prepared_ = true;
   }
  };
- if (execution) execution->run(CompileTaskKind::Gather, {}, plan, allowance);
- else plan(0);
+ if (execution)
+  execution->run(CompileTaskKind::Gather, {}, plan, allowance);
+ else
+  plan(0);
  if (!prepared_) {
   const auto prepare_destination = [&, allowance] { prepare(slices.size(), boxes, runs); };
-  if (files) files->submit({.work = prepare_destination}).wait();
-  else prepare_destination();
+  if (files)
+   files->submit({.work = prepare_destination}).wait();
+  else
+   prepare_destination();
  }
- auto images=mapped_ ? mapped_->images : std::span(builder_.images);
- auto output_boxes=mapped_ ? mapped_->boxes : std::span(builder_.boxes);
- auto output_runs=mapped_ ? mapped_->runs : std::span(builder_.mask_rle_pairs);
- const auto chunk=[&](std::size_t i) {
-  auto& cursor=cursors[i]; const auto& slice=slices[i];
+ auto images = mapped_ ? mapped_->images : std::span(builder_.images);
+ auto output_boxes = mapped_ ? mapped_->boxes : std::span(builder_.boxes);
+ auto output_runs = mapped_ ? mapped_->runs : std::span(builder_.mask_rle_pairs);
+ const auto chunk = [&](std::size_t i) {
+  auto& cursor = cursors[i];
+  const auto& slice = slices[i];
   if (cursor.complete) return;
-  std::size_t copied=0,completed_boxes=0;
-  while (cursor.box<slice.boxes.size() && copied<65536 && completed_boxes<256) {
+  std::size_t copied = 0, completed_boxes = 0;
+  while (cursor.box < slice.boxes.size() && copied < 65536 && completed_boxes < 256) {
    throw_if_benchmark_cancelled(cancellation_);
-   auto box=slice.boxes[cursor.box];
-   const auto input=slice.runs.subspan(box.mask_rle_offset,box.mask_rle_pairs);
+   auto box = slice.boxes[cursor.box];
+   const auto input = slice.runs.subspan(box.mask_rle_offset, box.mask_rle_pairs);
    if (!cursor.run) {
-    box.source_ordinal=common::math::checked_add(box.source_ordinal,slice.ordinal_base,"normalized gather source ordinal overflow");
-    if (slice.incomplete_ordinals) box.flags|=kAnnotationOrdinalIncomplete;
-    box.mask_rle_offset=cursor.first_run+cursor.output_run;
-    validate_assembled_box(box,input.size(),builder_.source);
-    output_boxes[cursor.first_box+cursor.box]=box;
+    box.source_ordinal = common::math::checked_add(box.source_ordinal, slice.ordinal_base, "normalized gather source ordinal overflow");
+    if (slice.incomplete_ordinals) box.flags |= kAnnotationOrdinalIncomplete;
+    box.mask_rle_offset = cursor.first_run + cursor.output_run;
+    validate_assembled_box(box, input.size(), builder_.source);
+    output_boxes[cursor.first_box + cursor.box] = box;
    }
-   const auto count=std::min<std::size_t>(input.size()-cursor.run,65536-copied);
-   for (std::size_t r=0;r<count;++r) cursor.previous=validate_run_value(input[cursor.run+r],std::uint64_t{slice.image.width}*slice.image.height,cursor.previous);
-   if (count) std::memcpy(output_runs.data()+cursor.first_run+cursor.output_run,input.data()+cursor.run,count*sizeof(RLEPair));
-   cursor.run+=count; cursor.output_run+=count; copied+=count;
-   if (cursor.run==input.size()) { ++cursor.box; ++completed_boxes; cursor.run=0; cursor.previous=0; }
+   const auto count = std::min<std::size_t>(input.size() - cursor.run, 65536 - copied);
+   for (std::size_t r = 0; r < count; ++r) cursor.previous = validate_run_value(input[cursor.run + r], std::uint64_t{slice.image.width} * slice.image.height, cursor.previous);
+   if (count) std::memcpy(output_runs.data() + cursor.first_run + cursor.output_run, input.data() + cursor.run, count * sizeof(RLEPair));
+   cursor.run += count;
+   cursor.output_run += count;
+   copied += count;
+   if (cursor.run == input.size()) {
+    ++cursor.box;
+    ++completed_boxes;
+    cursor.run = 0;
+    cursor.previous = 0;
+   }
   }
-  if (cursor.box==slice.boxes.size()) {
-   auto image=slice.image; image.first_box=cursor.first_box; images[i]=image; cursor.complete=true;
+  if (cursor.box == slice.boxes.size()) {
+   auto image = slice.image;
+   image.first_box = cursor.first_box;
+   images[i] = image;
+   cursor.complete = true;
   }
  };
  // Each disjoint range advances as soon as its own preceding chunk settles.
  // A held peer never creates a round barrier for ready successors.
  if (execution) {
-  struct Active { std::size_t image; CompileExecution::Completion completion; };
+  struct Active {
+   std::size_t image;
+   CompileExecution::Completion completion;
+  };
   std::vector<Active> active;
-  active.reserve(std::min(slices.size(),execution->workers()*2));
-  std::size_t next=0;
+  active.reserve(std::min(slices.size(), execution->workers() * 2));
+  std::size_t next = 0;
   std::exception_ptr failure;
   try {
-   while (next<slices.size() || !active.empty()) {
-    const auto observed=execution->admission_generation();
-    for (auto i=active.begin();i!=active.end();) {
-     if (!i->completion.ready()) { ++i; continue; }
+   while (next < slices.size() || !active.empty()) {
+    const auto observed = execution->admission_generation();
+    for (auto i = active.begin(); i != active.end();) {
+     if (!i->completion.ready()) {
+      ++i;
+      continue;
+     }
      i->completion.wait();
-     if (cursors[i->image].complete) i=active.erase(i);
-     else { i->completion={}; ++i; }
+     if (cursors[i->image].complete)
+      i = active.erase(i);
+     else {
+      i->completion = {};
+      ++i;
+     }
     }
-    while (next<slices.size() && active.size()<active.capacity()) active.push_back({next++,{}});
-    for (auto& item : active) if (!item.completion) {
-     auto admitted=execution->try_submit({.kind=CompileTaskKind::Gather,.work=[&,image=item.image](std::size_t,const CompileAllowance&) { chunk(image); },.allowance=allowance});
-     if (admitted) item.completion=std::move(*admitted);
-    }
-    if (next<slices.size() || !active.empty()) execution->wait_for_admission_change(observed);
+    while (next < slices.size() && active.size() < active.capacity()) active.push_back({next++, {}});
+    for (auto& item : active)
+     if (!item.completion) {
+      auto admitted = execution->try_submit({.kind = CompileTaskKind::Gather, .work = [&, image = item.image](std::size_t, const CompileAllowance&) { chunk(image); }, .allowance = allowance});
+      if (admitted) item.completion = std::move(*admitted);
+     }
+    if (next < slices.size() || !active.empty()) execution->wait_for_admission_change(observed);
    }
-  } catch (...) { failure=std::current_exception(); for (auto& item : active) item.completion.cancel(); }
-  for (auto& item : active) try { item.completion.wait(); } catch (...) { if (!failure) failure=std::current_exception(); }
+  } catch (...) {
+   failure = std::current_exception();
+   for (auto& item : active) item.completion.cancel();
+  }
+  for (auto& item : active) try {
+    item.completion.wait();
+   } catch (...) {
+    if (!failure) failure = std::current_exception();
+   }
   if (failure) std::rethrow_exception(failure);
- } else for (std::size_t i=0;i<slices.size();++i) while (!cursors[i].complete) chunk(i);
- if (mapped_) { mapped_->image_count=slices.size(); mapped_->box_count=boxes; mapped_->run_count=runs; }
- incomplete_gather_=false;
+ } else
+  for (std::size_t i = 0; i < slices.size(); ++i)
+   while (!cursors[i].complete) chunk(i);
+ if (mapped_) {
+  mapped_->image_count = slices.size();
+  mapped_->box_count = boxes;
+  mapped_->run_count = runs;
+ }
+ incomplete_gather_ = false;
 }
 void NormalizedAnnotationAssembler::begin_image(NormalizedImage image) {
  if (!prepared_ || finished_ || incomplete_gather_) throw std::logic_error("normalized assembler is unprepared, sealed or has incomplete gather work");
  throw_if_benchmark_cancelled(cancellation_);
  const auto images = mapped_ ? mapped_->images.first(mapped_->image_count) : std::span(builder_.images);
- validate_assembled_image(image,builder_.source,images.empty() ? std::nullopt : std::optional{images.back().source_image_id});
+ validate_assembled_image(image, builder_.source, images.empty() ? std::nullopt : std::optional{std::uint64_t{images.back().source_image_id}});
  image.first_box = mapped_ ? mapped_->box_count : builder_.boxes.size();
  image.box_count = 0;
  if (mapped_) {
@@ -1223,7 +1266,7 @@ void NormalizedAnnotationAssembler::append_box(NormalizedBox box, std::span<cons
  if (mapped_ && (mapped_->box_count == mapped_->boxes.size() || runs.size() > mapped_->runs.size() - mapped_->run_count)) throw std::overflow_error("normalized assembly extent exceeded");
  const auto first_run = mapped_ ? mapped_->run_count : builder_.mask_rle_pairs.size();
  box.mask_rle_offset = first_run;
- validate_assembled_box(box,runs.size(),builder_.source);
+ validate_assembled_box(box, runs.size(), builder_.source);
  std::uint64_t previous = 0;
  for (std::size_t i = 0; i < runs.size(); ++i) {
   if ((i & 4095U) == 0) throw_if_benchmark_cancelled(cancellation_);

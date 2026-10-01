@@ -41,28 +41,41 @@ struct BenchmarkLabelView {
 class BenchmarkLabelWorkspace final {
  detail::CompiledLabelWorkspace workspace_;
  std::uint32_t prepared_width_ = 0;
+
 public:
  struct OutputGrowthObserver {
   void* context = nullptr;
-  void (*grown)(void*,bool,std::size_t,std::size_t) noexcept = nullptr;
+  void (*grown)(void*, bool, std::size_t, std::size_t) noexcept = nullptr;
  };
  void observe_output_growth(OutputGrowthObserver observer) noexcept { growth_ = observer; }
  [[nodiscard]] static std::uint64_t required_bytes(std::uint32_t width) { return detail::CompiledLabelWorkspace::required_bytes(width); }
  void prepare(std::uint32_t width, detail::CompileAllowance allowance = {}) {
-  const auto previous = workspace_.labels.capacity()*sizeof(PackedInstance);
-  const auto previous_runs = workspace_.runs.capacity()*sizeof(RLEPair);
-  workspace_.prepare(width,std::move(allowance));
+  const auto previous = workspace_.labels.capacity() * sizeof(PackedInstance);
+  const auto previous_runs = workspace_.runs.capacity() * sizeof(RLEPair);
+  workspace_.prepare(width, std::move(allowance));
   prepared_width_ = width;
-  if (growth_.grown && !previous) growth_.grown(growth_.context,false,previous,workspace_.labels.capacity()*sizeof(PackedInstance));
-  if (growth_.grown && !previous_runs) growth_.grown(growth_.context,true,previous_runs,workspace_.runs.capacity()*sizeof(RLEPair));
+  if (growth_.grown && !previous) growth_.grown(growth_.context, false, previous, workspace_.labels.capacity() * sizeof(PackedInstance));
+  if (growth_.grown && !previous_runs) growth_.grown(growth_.context, true, previous_runs, workspace_.runs.capacity() * sizeof(RLEPair));
  }
- void finish() noexcept { workspace_.release_borrow(); prepared_width_=0; }
- void clear() noexcept { workspace_.labels.clear(); workspace_.runs.clear(); }
- void ensure_prepared(std::uint32_t width) { if (width > prepared_width_) prepare(width); }
+ void finish() noexcept {
+  workspace_.release_borrow();
+  prepared_width_ = 0;
+ }
+ void clear() noexcept {
+  workspace_.labels.clear();
+  workspace_.runs.clear();
+ }
+ void ensure_prepared(std::uint32_t width) {
+  if (width > prepared_width_) prepare(width);
+ }
  [[nodiscard]] std::size_t retained_bytes() const noexcept { return workspace_.retained_bytes(); }
  [[nodiscard]] dataset::MaskResizeScratch& scratch() noexcept { return workspace_.scratch(); }
  [[nodiscard]] detail::CompiledLabelWorkspace& output() noexcept { return workspace_; }
- [[nodiscard]] detail::CompiledLabelWorkspace::OutputLease release_output() { prepared_width_ = 0; return workspace_.release_output(); }
+ [[nodiscard]] detail::CompiledLabelWorkspace::OutputLease release_output() {
+  prepared_width_ = 0;
+  return workspace_.release_output();
+ }
+
 private:
  OutputGrowthObserver growth_;
 };

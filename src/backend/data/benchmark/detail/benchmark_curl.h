@@ -18,9 +18,8 @@
 #include <utility>
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
-
+using mmltk::backend::data::detail::CompileResources;
 struct BenchmarkTransferEnvelope {
  CompileResources fixed;
  CompileResources per_transfer;

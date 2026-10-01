@@ -25,9 +25,9 @@ public:
  [[nodiscard]] BenchmarkImageHeader read_header(std::span<const std::uint8_t> encoded, std::uint32_t expected_width = 0U, std::uint32_t expected_height = 0U);
  [[nodiscard]] std::span<const std::uint8_t> decode_rgb(std::span<const std::uint8_t>, const BenchmarkImageHeader&, std::span<std::byte>);
  [[nodiscard]] static detail::CompileImagePlan plan(const BenchmarkImageHeader& header) { return detail::CompileImageDecoder::plan(header); }
+
 private:
  detail::CompileImageDecoder decoder_;
-
 };
 class InvalidImageError : public std::runtime_error {
 public:

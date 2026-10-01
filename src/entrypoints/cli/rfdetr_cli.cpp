@@ -113,12 +113,14 @@ public:
   action.sa_handler = &request_benchmark_cancel;
   ::sigemptyset(&action.sa_mask);
   if (::sigaction(SIGINT, &action, &previous_interrupt_) != 0) {
-   const int failure = errno; retire_descriptor();
+   const int failure = errno;
+   retire_descriptor();
    throw std::system_error(failure, std::generic_category(), "cannot install benchmark signal handler");
   }
   if (::sigaction(SIGTERM, &action, &previous_terminate_) != 0) {
    const int failure = errno;
-   (void)::sigaction(SIGINT, &previous_interrupt_, nullptr); retire_descriptor();
+   (void)::sigaction(SIGINT, &previous_interrupt_, nullptr);
+   retire_descriptor();
    throw std::system_error(failure, std::generic_category(), "cannot install benchmark signal handler");
   }
  }
@@ -131,6 +133,7 @@ public:
  [[nodiscard]] int descriptor() const noexcept { return descriptor_.get(); }
  BenchmarkSignalScope(const BenchmarkSignalScope&) = delete;
  BenchmarkSignalScope& operator=(const BenchmarkSignalScope&) = delete;
+
 private:
  void retire_descriptor() noexcept {
   benchmark_cancel_descriptor.store(-1, std::memory_order_seq_cst);

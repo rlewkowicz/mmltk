@@ -91,15 +91,17 @@ CompiledDataset::UsedRangeCursor CompiledDataset::used_ranges(std::span<const Co
 void CompiledDataset::UsedRangeCursor::normalize() {
  while (source_) {
   if (image_ == reads_.size()) {
-   if (section_ == ReadSection::Pixels) { source_ = nullptr; return; }
+   if (section_ == ReadSection::Pixels) {
+    source_ = nullptr;
+    return;
+   }
    section_ = ReadSection::Pixels;
    image_ = 0;
    offset_ = 0;
    continue;
   }
   const auto& entry = source_->image_entry(reads_[image_].index);
-  if ((section_ == ReadSection::Labels && entry.label_bytes == 0) ||
-      (advice_ && offset_ == 0 && image_ != 0 && reads_[image_ - 1].index == reads_[image_].index)) {
+  if ((section_ == ReadSection::Labels && entry.label_bytes == 0) || (advice_ && offset_ == 0 && image_ != 0 && reads_[image_ - 1].index == reads_[image_].index)) {
    ++image_;
    continue;
   }
@@ -114,26 +116,29 @@ std::optional<CompiledDataset::UsedRange> CompiledDataset::UsedRangeCursor::next
   const bool labels = section_ == ReadSection::Labels;
   const auto size = labels ? source_->image_entry(read.index).label_bytes : source_->layout_.image_stride;
   const auto source_offset = (labels ? source_->layout_.label_offset(read.index) : source_->layout_.pixel_offset(read.index)) + offset_;
-  const auto destination_offset = (labels ? mmltk::common::math::checked_multiply(read.destination_offset / source_->layout_.image_stride, label_pitch_, "compiled label destination overflow") : read.destination_offset) + offset_;
-  if (result && (result->section != section_ || result->source_offset + result->bytes != source_offset ||
-                 (!advice_ && result->destination_offset + result->bytes != destination_offset))) break;
+  const auto destination_offset =
+   (labels ? mmltk::common::math::checked_multiply(read.destination_offset / source_->layout_.image_stride, label_pitch_, "compiled label destination overflow") : read.destination_offset) + offset_;
+  if (result && (result->section != section_ || result->source_offset + result->bytes != source_offset || (!advice_ && result->destination_offset + result->bytes != destination_offset))) break;
   const auto bytes = std::min(size - offset_, limit - (result ? result->bytes : 0U));
-  if (result) result->bytes += bytes;
-  else result = UsedRange{section_, source_offset, destination_offset, bytes};
+  if (result)
+   result->bytes += bytes;
+  else
+   result = UsedRange{section_, source_offset, destination_offset, bytes};
   offset_ += bytes;
-  if (offset_ == size) { ++image_; offset_ = 0; }
+  if (offset_ == size) {
+   ++image_;
+   offset_ = 0;
+  }
   normalize();
   if (result->bytes == limit) break;
  }
  return result;
 }
-void CompiledDataset::prepare_range(const UsedRange& range, bool prefault) const {
- mapping_.advise_aligned_range(range.source_offset, range.bytes, prefault ? MADV_POPULATE_READ : MADV_WILLNEED);
-}
+void CompiledDataset::prepare_range(const UsedRange& range, bool prefault) const { mapping_.advise_aligned_range(range.source_offset, range.bytes, prefault ? MADV_POPULATE_READ : MADV_WILLNEED); }
 void CompiledDataset::gather_range(const UsedRange& range, const ImageDestination destination) const {
  if (!destination.write) throw std::invalid_argument("compiled image destination has no writer");
- if (range.source_offset > mapping_.size() || range.bytes > mapping_.size() - range.source_offset ||
-     range.destination_offset > destination.capacity || range.bytes > destination.capacity - range.destination_offset)
+ if (range.source_offset > mapping_.size() || range.bytes > mapping_.size() - range.source_offset || range.destination_offset > destination.capacity ||
+     range.bytes > destination.capacity - range.destination_offset)
   throw std::out_of_range("compiled read exceeds source or destination");
  destination.write(destination.context, range.destination_offset, {reinterpret_cast<const std::byte*>(mapping_.data() + range.source_offset), range.bytes});
 }

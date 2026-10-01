@@ -27,10 +27,8 @@
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
 #include "src/backend/data/compiled/compiled_format.h"
 namespace mmltk::backend::data::benchmark_internal {
-using mmltk::backend::data::detail::CompileAllowance;
-
 using detail::CompileExecution;
-
+using mmltk::backend::data::detail::CompileAllowance;
 // Rejection of the annotation document itself, never a local execution failure.
 class AnnotationDocumentRejected final : public std::runtime_error {
 public:
@@ -159,8 +157,8 @@ public:
  // Gather derives its exact destination once, then prepares storage separately
  // from the admitted CPU plan. The explicit-capacity constructor also supports
  // standalone incremental assembly.
- explicit NormalizedAnnotationAssembler(NormalizedAnnotationMetadata, mmltk::common::concurrency::CancellationObservation,
-  const std::filesystem::path& staging_directory, detail::StorageReservationPool* = nullptr);
+ explicit NormalizedAnnotationAssembler(
+  NormalizedAnnotationMetadata, mmltk::common::concurrency::CancellationObservation, const std::filesystem::path& staging_directory, detail::StorageReservationPool* = nullptr);
  explicit NormalizedAnnotationAssembler(NormalizedAnnotationMetadata, std::size_t images, std::size_t boxes, std::size_t runs, mmltk::common::concurrency::CancellationObservation = {},
   const std::filesystem::path& staging_directory = {}, detail::StorageReservationPool* = nullptr);
  NormalizedAnnotationAssembler(const NormalizedAnnotationAssembler&) = delete;

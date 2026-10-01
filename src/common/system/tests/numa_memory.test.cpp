@@ -96,36 +96,47 @@ TEST_CASE("Prepared memory policy capture reuses storage and validates permitted
  }) == 0);
 }
 }  // namespace
-
 TEST_CASE("Page-locked NUMA ownership is transactional and movable", "[common][system][numa-memory]") {
  using namespace mmltk::common::system;
- const auto node=NumaTopology::Capture().permitted_nodes.front();
- const auto locked_bytes=[] {
-  std::ifstream status("/proc/self/status"); std::string line;
-  while (std::getline(status,line)) if (line.starts_with("VmLck:")) {
-   std::istringstream input(line.substr(6)); std::uint64_t kib=0; input>>kib; return kib*1024;
-  }
+ const auto node = NumaTopology::Capture().permitted_nodes.front();
+ const auto locked_bytes = [] {
+  std::ifstream status("/proc/self/status");
+  std::string line;
+  while (std::getline(status, line))
+   if (line.starts_with("VmLck:")) {
+    std::istringstream input(line.substr(6));
+    std::uint64_t kib = 0;
+    input >> kib;
+    return kib * 1024;
+   }
   throw std::runtime_error("kernel did not expose locked memory accounting");
  };
- const auto before=locked_bytes();
- NumaMemory memory(node,NumaMemory::Lock::Pages);
+ const auto before = locked_bytes();
+ NumaMemory memory(node, NumaMemory::Lock::Pages);
  memory.ensure_bytes(17);
- CHECK(locked_bytes()==before+host_page_size());
+ CHECK(locked_bytes() == before + host_page_size());
  REQUIRE(memory.locked());
  memory.verify();
- auto* const address=memory.data();
+ auto* const address = memory.data();
  NumaMemory moved(std::move(memory));
- CHECK_FALSE(memory.locked()); CHECK(moved.locked()); CHECK(moved.data()==address);
- CHECK(test_support::with_denied_syscall(SYS_mlock,[&] {
-  try { moved.ensure_bytes(moved.capacity_bytes()+1); }
-  catch (const std::system_error& error) { return error.code().value()==EPERM && moved.data()==address && moved.locked(); }
+ CHECK_FALSE(memory.locked());
+ CHECK(moved.locked());
+ CHECK(moved.data() == address);
+ CHECK(test_support::with_denied_syscall(SYS_mlock, [&] {
+  try {
+   moved.ensure_bytes(moved.capacity_bytes() + 1);
+  } catch (const std::system_error& error) { return error.code().value() == EPERM && moved.data() == address && moved.locked(); }
   return false;
- })==0);
- moved.reset(); CHECK_FALSE(moved.locked()); CHECK(moved.data()==nullptr); CHECK(locked_bytes()==before);
- CHECK(test_support::with_denied_syscall(SYS_mlock,[&] {
-  NumaMemory denied(node,NumaMemory::Lock::Pages);
-  try { denied.ensure_bytes(1); }
-  catch (const std::system_error& error) { return error.code().value()==EPERM && denied.data()==nullptr && denied.capacity_bytes()==0; }
+ }) == 0);
+ moved.reset();
+ CHECK_FALSE(moved.locked());
+ CHECK(moved.data() == nullptr);
+ CHECK(locked_bytes() == before);
+ CHECK(test_support::with_denied_syscall(SYS_mlock, [&] {
+  NumaMemory denied(node, NumaMemory::Lock::Pages);
+  try {
+   denied.ensure_bytes(1);
+  } catch (const std::system_error& error) { return error.code().value() == EPERM && denied.data() == nullptr && denied.capacity_bytes() == 0; }
   return false;
- })==0);
+ }) == 0);
 }

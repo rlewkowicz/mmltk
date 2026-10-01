@@ -130,36 +130,38 @@ CpuDownscaler::CpuDownscaler() {
 }
 namespace {
 std::size_t aligned_extent(std::size_t count, std::size_t size) {
- const auto bytes = common::math::checked_multiply(count,size,"perceptual workspace overflow");
- return common::math::checked_add(bytes,std::size_t{63},"perceptual workspace overflow") / 64 * 64;
+ const auto bytes = common::math::checked_multiply(count, size, "perceptual workspace overflow");
+ return common::math::checked_add(bytes, std::size_t{63}, "perceptual workspace overflow") / 64 * 64;
 }
-}
+}  // namespace
 std::size_t CpuDownscaler::workspace_bytes(std::uint32_t width, std::uint32_t height, bool alpha) {
  using common::math::checked_add;
- auto total = checked_add(aligned_extent(width,sizeof(Footprint)),aligned_extent(height,sizeof(Footprint)),"perceptual workspace overflow");
- for (unsigned row=0; row<2; ++row) {
-  total = checked_add(total,aligned_extent(width,sizeof(Moment)),"perceptual workspace overflow");
-  total = checked_add(total,aligned_extent(width,sizeof(Coefficient)),"perceptual workspace overflow");
-  if (alpha) total = checked_add(total,aligned_extent(width,sizeof(float)),"perceptual workspace overflow");
+ auto total = checked_add(aligned_extent(width, sizeof(Footprint)), aligned_extent(height, sizeof(Footprint)), "perceptual workspace overflow");
+ for (unsigned row = 0; row < 2; ++row) {
+  total = checked_add(total, aligned_extent(width, sizeof(Moment)), "perceptual workspace overflow");
+  total = checked_add(total, aligned_extent(width, sizeof(Coefficient)), "perceptual workspace overflow");
+  if (alpha) total = checked_add(total, aligned_extent(width, sizeof(float)), "perceptual workspace overflow");
  }
  return total;
 }
 void CpuDownscaler::bind(std::uint32_t width, std::uint32_t height, bool alpha, std::span<std::byte> memory) {
- if (memory.size() < workspace_bytes(width,height,alpha) || reinterpret_cast<std::uintptr_t>(memory.data()) % 64)
-  throw std::length_error("perceptual workspace capacity or alignment invalid");
+ if (memory.size() < workspace_bytes(width, height, alpha) || reinterpret_cast<std::uintptr_t>(memory.data()) % 64) throw std::length_error("perceptual workspace capacity or alignment invalid");
  prepared_ = false;
  const auto array = [&]<class T>(mmltk::common::types::WorkspaceBuffer<T>& target, std::size_t count) {
-  target.bind({reinterpret_cast<T*>(memory.data()),count}); memory = memory.subspan(aligned_extent(count,sizeof(T)));
+  target.bind({reinterpret_cast<T*>(memory.data()), count});
+  memory = memory.subspan(aligned_extent(count, sizeof(T)));
  };
- array(x_,width); array(y_,height);
- for (unsigned row=0; row<2; ++row) {
-  array(moments_[row],width); array(coefficients_[row],width);
-  if (alpha) array(alpha_[row],width);
+ array(x_, width);
+ array(y_, height);
+ for (unsigned row = 0; row < 2; ++row) {
+  array(moments_[row], width);
+  array(coefficients_[row], width);
+  if (alpha) array(alpha_[row], width);
  }
 }
 std::size_t CpuDownscaler::retained_bytes() const noexcept {
- auto result = x_.capacity()*sizeof(Footprint)+y_.capacity()*sizeof(Footprint);
- for (unsigned row=0; row<2; ++row) result += moments_[row].capacity()*sizeof(Moment)+coefficients_[row].capacity()*sizeof(Coefficient)+alpha_[row].capacity()*sizeof(float);
+ auto result = x_.capacity() * sizeof(Footprint) + y_.capacity() * sizeof(Footprint);
+ for (unsigned row = 0; row < 2; ++row) result += moments_[row].capacity() * sizeof(Moment) + coefficients_[row].capacity() * sizeof(Coefficient) + alpha_[row].capacity() * sizeof(float);
  return result;
 }
 void CpuDownscaler::preparation_checkpoint(PreparationStep step) {

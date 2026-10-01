@@ -18,11 +18,9 @@
 #include <string>
 #include <string_view>
 namespace mmltk::backend::data::benchmark_internal {
+using detail::CompileExecution;
 using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileResourceWait;
-
-using detail::CompileExecution;
-
 using CachedImageValidator = std::function<BenchmarkImageHeader(std::uint64_t, std::span<const std::uint8_t>)>;
 class BenchmarkImageReadError final : public std::runtime_error {
 public:
@@ -39,21 +37,21 @@ private:
 // before reusing the header. Source publications separately retain mutation custody.
 class BenchmarkEncodedImage final {
 public:
- static constexpr std::size_t normal_window_bytes=32ULL<<20;
+ static constexpr std::size_t normal_window_bytes = 32ULL << 20;
  using Ptr = std::shared_ptr<const BenchmarkEncodedImage>;
  enum class Storage : std::uint8_t { Pooled, Mapped, HeaderOnly };
  class Opened;
  [[nodiscard]] static Ptr pooled(CompileAllowance, std::shared_ptr<const void>, std::span<const std::uint8_t>, Ptr published);
- [[nodiscard]] static Ptr open(int directory, std::uint64_t, const CachedImageValidator&, mmltk::common::concurrency::CancellationObservation, CompileExecution* = nullptr,
-  CompileAllowance = {}, Ptr admitted = {}, std::uint64_t maximum_bytes = std::numeric_limits<std::uint64_t>::max());
- [[nodiscard]] static Ptr open(mmltk::common::io::FileHandle, std::uint64_t, const CachedImageValidator&, mmltk::common::concurrency::CancellationObservation, CompileExecution*,
-  CompileAllowance, Ptr admitted, std::uint64_t maximum_bytes);
+ [[nodiscard]] static Ptr open(int directory, std::uint64_t, const CachedImageValidator&, mmltk::common::concurrency::CancellationObservation, CompileExecution* = nullptr, CompileAllowance = {},
+  Ptr admitted = {}, std::uint64_t maximum_bytes = std::numeric_limits<std::uint64_t>::max());
+ [[nodiscard]] static Ptr open(mmltk::common::io::FileHandle, std::uint64_t, const CachedImageValidator&, mmltk::common::concurrency::CancellationObservation, CompileExecution*, CompileAllowance,
+  Ptr admitted, std::uint64_t maximum_bytes);
  // Inspect once before nonblocking mapped-input admission. A null record is a
  // cache miss; an opened record keeps that exact inode through deferral.
  [[nodiscard]] static std::unique_ptr<Opened> open_deferred(int directory, std::uint64_t, mmltk::common::concurrency::CancellationObservation, CompileAllowance controls, Ptr admitted = {},
   std::uint64_t maximum_bytes = std::numeric_limits<std::uint64_t>::max());
- static Ptr publish(const std::filesystem::path&, std::span<const std::uint8_t>, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool&, std::optional<BenchmarkImageHeader> = {},
-  CompileAllowance = {}, bool retain_mapping = true, int directory = -1, std::string_view relative = {});
+ static Ptr publish(const std::filesystem::path&, std::span<const std::uint8_t>, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool&,
+  std::optional<BenchmarkImageHeader> = {}, CompileAllowance = {}, bool retain_mapping = true, int directory = -1, std::string_view relative = {});
  static Ptr publish(const std::filesystem::path&, std::span<const std::uint8_t>, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool* = nullptr,
   std::optional<BenchmarkImageHeader> = {}, CompileAllowance = {}, bool retain_mapping = true, int directory = -1, std::string_view relative = {});
  // Shared source-worker publication choice, including nonblocking FD pressure.

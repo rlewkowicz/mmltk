@@ -1375,7 +1375,12 @@ impl State {
                 if self.compile_resize_step < 4 {
                     let dataset = model.workflow.dataset.as_ref().unwrap();
                     if !self.compile_resize_pending {
-                        if !super::dataset_presentation::compile_resize(self.compile_resize_step, dataset.generation as f64, dataset.revision as f64, true) {
+                        if !super::dataset_presentation::compile_resize(
+                            self.compile_resize_step,
+                            dataset.generation as f64,
+                            dataset.revision as f64,
+                            true,
+                        ) {
                             driver.fail("Active compile resize request failed");
                         } else {
                             self.compile_resize_pending = true;
@@ -1383,7 +1388,12 @@ impl State {
                         }
                         return Task::none();
                     }
-                    if !super::dataset_presentation::compile_resize(self.compile_resize_step, dataset.generation as f64, dataset.revision as f64, false) {
+                    if !super::dataset_presentation::compile_resize(
+                        self.compile_resize_step,
+                        dataset.generation as f64,
+                        dataset.revision as f64,
+                        false,
+                    ) {
                         return Task::none();
                     }
                     self.compile_resize_step += 1;

@@ -12,7 +12,6 @@
 #include <stdexcept>
 #include <thread>
 #include <utility>
-
 namespace mmltk::backend::data::detail {
 // Dirty updates wait for the observation deadline. Boundaries are immediate
 // cumulative facts (including repair), replaceable under saturation. Lifecycle
@@ -38,8 +37,13 @@ public:
   if (observer_) worker_ = std::jthread([this] { drain(); });
  }
  ~CompileProgressDelivery() {
-  try { flush(); } catch (...) {}
-  { const std::lock_guard lock(mutex_); stopping_ = true; }
+  try {
+   flush();
+  } catch (...) {}
+  {
+   const std::lock_guard lock(mutex_);
+   stopping_ = true;
+  }
   changed_.notify_all();
   if (worker_.joinable()) worker_.join();
  }
@@ -66,8 +70,7 @@ public:
     // Cumulative repair/source facts and warnings cannot consume lifecycle capacity.
     for (std::size_t offset = 0; offset < size_; ++offset) {
      if (pending_[(read_ + offset) % pending_.size()]->mode == CompileProgressDeliveryMode::Lifecycle) continue;
-     for (std::size_t next = offset + 1; next < size_; ++next)
-      pending_[(read_ + next - 1) % pending_.size()] = std::move(pending_[(read_ + next) % pending_.size()]);
+     for (std::size_t next = offset + 1; next < size_; ++next) pending_[(read_ + next - 1) % pending_.size()] = std::move(pending_[(read_ + next) % pending_.size()]);
      pending_[(read_ + size_ - 1) % pending_.size()].reset();
      --size_;
      if (diagnostic_) ++counts_.coalesced;
@@ -82,16 +85,17 @@ public:
    try {
     pending_[(read_ + size_) % pending_.size()].emplace(Item{materialize_(), sequence, mode});
    } catch (...) {
-    if (nonfatal) { --submitted_; return; }
+    if (nonfatal) {
+     --submitted_;
+     return;
+    }
     failure_ = std::current_exception();
     changed_.notify_all();
     throw;
    }
    ++size_;
    dirty_ = false;
-   if (diagnostic_) {
-    ++counts_.materialized;
-   }
+   if (diagnostic_) { ++counts_.materialized; }
   } else if (!dirty_) {
    dirty_ = true;
    deadline_ = Clock::now() + std::chrono::milliseconds{100};
@@ -109,16 +113,25 @@ public:
   changed_.wait(lock, [&] { return failure_ ? failure_notified_ : delivered_ >= through; });
   if (failure_) std::rethrow_exception(failure_);
  }
+
 private:
  using Clock = std::chrono::steady_clock;
- struct Item { Value value; std::uint64_t sequence; CompileProgressDeliveryMode mode; };
+ struct Item {
+  Value value;
+  std::uint64_t sequence;
+  CompileProgressDeliveryMode mode;
+ };
  void drain() noexcept {
   std::unique_lock lock(mutex_);
   for (;;) {
    if (failure_) {
     const auto failure = failure_;
     lock.unlock();
-    if (failed_) { try { failed_(failure); } catch (...) {} }
+    if (failed_) {
+     try {
+      failed_(failure);
+     } catch (...) {}
+    }
     lock.lock();
     failure_notified_ = true;
     changed_.notify_all();
@@ -144,10 +157,17 @@ private:
      dirty_ = false;
      if (diagnostic_) ++counts_.materialized;
     }
-   } catch (...) { failure_ = std::current_exception(); continue; }
+   } catch (...) {
+    failure_ = std::current_exception();
+    continue;
+   }
    lock.unlock();
    std::exception_ptr failure;
-   try { observer_(item->value); } catch (...) { if (item->mode != CompileProgressDeliveryMode::Warning) failure = std::current_exception(); }
+   try {
+    observer_(item->value);
+   } catch (...) {
+    if (item->mode != CompileProgressDeliveryMode::Warning) failure = std::current_exception();
+   }
    lock.lock();
    delivered_ = item->sequence;
    if (failure) failure_ = failure;
@@ -156,7 +176,9 @@ private:
     counts_.pending = size_ + static_cast<std::size_t>(dirty_);
     const auto counts = counts_;
     lock.unlock();
-    try { diagnostic_(counts); } catch (...) {}
+    try {
+     diagnostic_(counts);
+    } catch (...) {}
     lock.lock();
    }
    changed_.notify_all();

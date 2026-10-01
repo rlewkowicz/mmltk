@@ -27,7 +27,6 @@ struct AdmittedRecipeArchive {
 };
 struct BenchmarkCacheLayout;
 class BenchmarkCompilePipeline;
-
 struct CoconutPhysicalImage;
 struct CoconutInventoryImage;
 struct CoconutRecord;
@@ -62,8 +61,8 @@ public:
  // Synchronous observations of independently completed images and the source cursor.
  using Progress = std::function<void(CoconutEdition, const AdmittedRecipeArchive&, std::uint64_t image_id, std::uint64_t entries)>;
  using Repair = std::function<void(AdmittedRecipeArchive&, std::string)>;
- CoconutPhysicalMembership(std::span<AdmittedRecipeArchive>, const CoconutRecipeCatalog&, bool explicit_catalog, const BenchmarkCacheLayout&, detail::StorageReservationPool&, BenchmarkCompilePipeline&,
-  mmltk::common::concurrency::CancellationObservation = {}, Progress = {}, Repair = {});
+ CoconutPhysicalMembership(std::span<AdmittedRecipeArchive>, const CoconutRecipeCatalog&, bool explicit_catalog, const BenchmarkCacheLayout&, detail::StorageReservationPool&,
+  BenchmarkCompilePipeline&, mmltk::common::concurrency::CancellationObservation = {}, Progress = {}, Repair = {});
  explicit CoconutPhysicalMembership(std::span<const CoconutPhysicalImage>, mmltk::common::concurrency::CancellationObservation = {});
  ~CoconutPhysicalMembership();
  CoconutPhysicalMembership(const CoconutPhysicalMembership&) = delete;

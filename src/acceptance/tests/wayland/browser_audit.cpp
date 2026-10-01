@@ -1473,27 +1473,27 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   bool valid = !facts.is_discarded() && facts.is_object() && facts.contains("transition") && facts["transition"].is_object();
   for (const auto* name : {"css", "backing", "configured", "viewport", "prior_viewport", "root", "ui_root"})
    valid = valid && facts.contains(name) && facts[name].is_array() && facts[name].size() == (std::string_view{name}.ends_with("root") ? 4U : 2U) &&
-    std::ranges::all_of(facts[name], [](const auto& value) { return value.is_number(); });
+           std::ranges::all_of(facts[name], [](const auto& value) { return value.is_number(); });
   if (valid) {
    const auto generation = facts.value("generation", std::uint64_t{0});
    const auto step = facts.value("step", 4U);
    const auto& transition = facts["transition"];
    const double scale = facts.value("root_scale", 0.0), dpi = facts.value("device_scale", 0.0);
    valid = generation == active_compile_generation && generation != 0 && step < 4 && scale > 0 && dpi > 0 && facts.value("inputs", 1U) == 0 &&
-    facts.value("revision", std::uint64_t{0}) > facts.value("before_revision", std::uint64_t{0}) &&
-    facts.value("root_revision", std::uint64_t{0}) > facts.value("before_revision", std::uint64_t{0}) &&
-    transition.value("event", "") == "iced.window.presented" && !transition.value("pending_resize", true);
+           facts.value("revision", std::uint64_t{0}) > facts.value("before_revision", std::uint64_t{0}) &&
+           facts.value("root_revision", std::uint64_t{0}) > facts.value("before_revision", std::uint64_t{0}) && transition.value("event", "") == "iced.window.presented" &&
+           !transition.value("pending_resize", true);
    for (std::size_t axis = 0; axis < 2; ++axis) {
     const double backing = facts["backing"][axis].get<double>();
-    valid = valid && backing > 0 && std::abs(facts["css"][axis].get<double>() * dpi - backing) <= 1 &&
-      facts["configured"][axis].get<double>() == backing && std::abs(facts["root"][axis].get<double>()) < 1 &&
-      std::abs(facts["root"][axis + 2].get<double>() * scale - backing) <= 2 &&
-      transition.value(axis == 0 ? "width" : "height", 0.0) == backing;
+    valid = valid && backing > 0 && std::abs(facts["css"][axis].get<double>() * dpi - backing) <= 1 && facts["configured"][axis].get<double>() == backing &&
+            std::abs(facts["root"][axis].get<double>()) < 1 && std::abs(facts["root"][axis + 2].get<double>() * scale - backing) <= 2 &&
+            transition.value(axis == 0 ? "width" : "height", 0.0) == backing;
    }
-   for (std::size_t index = 0; index < 4; ++index)
-    valid = valid && std::abs(facts["ui_root"][index].get<double>() - facts["root"][index].get<double>()) < 1;
-   if (step >= 2) valid = valid && facts["viewport"] != facts["prior_viewport"];
-   else valid = valid && facts["css"][0] == (step == 0 ? 480 : 960) && facts["css"][1] == (step == 0 ? 900 : 720);
+   for (std::size_t index = 0; index < 4; ++index) valid = valid && std::abs(facts["ui_root"][index].get<double>() - facts["root"][index].get<double>()) < 1;
+   if (step >= 2)
+    valid = valid && facts["viewport"] != facts["prior_viewport"];
+   else
+    valid = valid && facts["css"][0] == (step == 0 ? 480 : 960) && facts["css"][1] == (step == 0 ? 900 : 720);
    if (valid && (compile_resize_steps.size() < 2U || compile_resize_steps.contains(generation))) compile_resize_steps[generation].insert(step);
   }
   compile_resize_valid = compile_resize_valid && valid;
@@ -1505,8 +1505,9 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   compile_metrics = record.value("control", "") == COMPILE_PROGRESS && record.value("detail", "") == "elapsed-eta-throughput-dropped" && progress &&
                     scalar(record, "b") == expected.remaining_seconds && scalar(record, "c") == expected.throughput_per_second && scalar(record, "d") == compile_dropped;
  } else if (event == "integration.dataset_complete") {
-  dataset_complete = compile_resize_complete(cancelled_compile_generation) && compile_resize_complete(active_compile_generation) && dataset_native_valid && dataset_native_generations.contains(cancelled_compile_generation) && dataset_native_generations.contains(active_compile_generation) &&
-                     cancelled_compile_generation != 0U && scalar(record, "a") > cancelled_compile_generation && scalar(record, "a") == active_compile_generation;
+  dataset_complete = compile_resize_complete(cancelled_compile_generation) && compile_resize_complete(active_compile_generation) && dataset_native_valid &&
+                     dataset_native_generations.contains(cancelled_compile_generation) && dataset_native_generations.contains(active_compile_generation) && cancelled_compile_generation != 0U &&
+                     scalar(record, "a") > cancelled_compile_generation && scalar(record, "a") == active_compile_generation;
   dataset_complete_ordinal = ordinal;
   compiled_images = scalar(record, "b");
   compiled_width = scalar(record, "c");

@@ -72,8 +72,9 @@ struct ApplicationBrowserHost::Impl final {
     return false;
    }
    diagnostics.Emit([&] {
-    return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::BrowserRuntime,
-     .event = "browser.record.serialized", .value = encoded.size(), .detail = static_cast<std::uint64_t>(record_priority)};
+    return services::RuntimeDiagnosticFact{
+     .owner = contracts::DiagnosticOwner::BrowserRuntime, .event = "browser.record.serialized", .value = encoded.size(), .detail = static_cast<std::uint64_t>(record_priority)
+    };
    });
    const auto* state = std::get_if<SystemEvent>(&record);
    if (state != nullptr && state->delivery != contracts::reflection::EventDelivery::LatestState) state = nullptr;

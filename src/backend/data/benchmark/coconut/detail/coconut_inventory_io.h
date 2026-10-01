@@ -23,7 +23,6 @@
 #include <type_traits>
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
-
 class CoconutInventorySeal final {
 public:
  void capture(const mmltk::common::io::FileHandle& file);

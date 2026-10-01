@@ -109,8 +109,8 @@ std::size_t FileHandle::size() const {
 void FileHandle::preallocate(const std::size_t bytes) const {
  const auto length = mmltk::common::math::checked_cast<off_t>(bytes, "file size overflow");
  int result;
- do { result=::fallocate(get(),0,0,length); } while (result<0 && errno==EINTR);
- if (result!=0) resize_sparse(bytes);
+ do { result = ::fallocate(get(), 0, 0, length); } while (result < 0 && errno == EINTR);
+ if (result != 0) resize_sparse(bytes);
 }
 void FileHandle::resize_sparse(std::size_t bytes) const {
  int result;
@@ -121,16 +121,19 @@ void FileHandle::allocate_range(std::size_t offset, std::size_t bytes) const {
  if (!bytes) return;
  (void)mmltk::common::math::checked_cast<off_t>(mmltk::common::math::checked_add(offset, bytes, "file extent overflow"), "file extent overflow");
  int result;
- do { result = ::fallocate(get(), 0, mmltk::common::math::checked_cast<off_t>(offset, "allocation offset overflow"), mmltk::common::math::checked_cast<off_t>(bytes, "allocation size overflow")); } while (result < 0 && errno == EINTR);
+ do {
+  result = ::fallocate(get(), 0, mmltk::common::math::checked_cast<off_t>(offset, "allocation offset overflow"), mmltk::common::math::checked_cast<off_t>(bytes, "allocation size overflow"));
+ } while (result < 0 && errno == EINTR);
  if (result != 0) throw errno_error("file extent allocation failed");
 }
 bool FileHandle::punch_hole(std::size_t offset, std::size_t bytes) const {
  if (!bytes) return true;
  using namespace mmltk::common::math;
- (void)checked_cast<off_t>(checked_add(offset,bytes,"hole extent overflow"),"hole extent overflow");
+ (void)checked_cast<off_t>(checked_add(offset, bytes, "hole extent overflow"), "hole extent overflow");
  int result;
- do { result = ::fallocate(get(),FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,checked_cast<off_t>(offset,"hole offset overflow"),checked_cast<off_t>(bytes,"hole size overflow")); }
- while (result < 0 && errno == EINTR);
+ do {
+  result = ::fallocate(get(), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, checked_cast<off_t>(offset, "hole offset overflow"), checked_cast<off_t>(bytes, "hole size overflow"));
+ } while (result < 0 && errno == EINTR);
  if (!result) return true;
  if (errno == EOPNOTSUPP || errno == ENOSYS) return false;
  throw errno_error("file extent reclaim failed");
@@ -138,41 +141,51 @@ bool FileHandle::punch_hole(std::size_t offset, std::size_t bytes) const {
 void FileHandle::pwritev_all(std::span<const WriteSpan> sources, std::size_t offset) const {
  using namespace mmltk::common::math;
  std::size_t total = 0;
- for (const auto& source : sources) total = checked_add(total,source.bytes,"pwritev extent overflow");
- (void)checked_cast<off_t>(checked_add(offset,total,"pwritev extent overflow"),"pwritev extent overflow");
+ for (const auto& source : sources) total = checked_add(total, source.bytes, "pwritev extent overflow");
+ (void)checked_cast<off_t>(checked_add(offset, total, "pwritev extent overflow"), "pwritev extent overflow");
  std::size_t index = 0, consumed = 0;
  while (index < sources.size()) {
-  std::array<iovec,16> vectors{};
+  std::array<iovec, 16> vectors{};
   std::size_t count = 0, bytes = 0;
   for (auto i = index; i < sources.size() && count < vectors.size(); ++i) {
    const auto skip = i == index ? consumed : 0;
    if (skip == sources[i].bytes) continue;
-   const auto amount = std::min(sources[i].bytes-skip,std::size_t{0x7ffff000}-bytes);
+   const auto amount = std::min(sources[i].bytes - skip, std::size_t{0x7ffff000} - bytes);
    if (!amount) break;
-   vectors[count++] = {const_cast<std::byte*>(static_cast<const std::byte*>(sources[i].data)+skip),amount}; bytes += amount;
+   vectors[count++] = {const_cast<std::byte*>(static_cast<const std::byte*>(sources[i].data) + skip), amount};
+   bytes += amount;
   }
   if (!count) break;
-  const auto result = ::pwritev(get(),vectors.data(),static_cast<int>(count),checked_cast<off_t>(offset,"pwritev offset overflow"));
-  if (result < 0) { if (errno == EINTR) continue; throw errno_error("pwritev failed"); }
+  const auto result = ::pwritev(get(), vectors.data(), static_cast<int>(count), checked_cast<off_t>(offset, "pwritev offset overflow"));
+  if (result < 0) {
+   if (errno == EINTR) continue;
+   throw errno_error("pwritev failed");
+  }
   if (!result) throw std::runtime_error("zero progress during pwritev");
   auto completed = static_cast<std::size_t>(result);
   offset += completed;
-  while (index < sources.size() && completed >= sources[index].bytes-consumed) {
-   completed -= sources[index].bytes-consumed; ++index; consumed = 0;
+  while (index < sources.size() && completed >= sources[index].bytes - consumed) {
+   completed -= sources[index].bytes - consumed;
+   ++index;
+   consumed = 0;
   }
   consumed += completed;
  }
 }
 void FileHandle::pwrite_all(const void* source, const std::size_t bytes, const std::size_t offset) const {
- const WriteSpan span{source,bytes}; pwritev_all({&span,1},offset);
+ const WriteSpan span{source, bytes};
+ pwritev_all({&span, 1}, offset);
 }
 void FileHandle::pread_all(void* destination, const std::size_t bytes, const std::size_t offset) const {
  using namespace mmltk::common::math;
- (void)checked_cast<off_t>(checked_add(offset,bytes,"pread extent overflow"),"pread extent overflow");
+ (void)checked_cast<off_t>(checked_add(offset, bytes, "pread extent overflow"), "pread extent overflow");
  auto* data = static_cast<std::uint8_t*>(destination);
  for (std::size_t read = 0; read < bytes;) {
-  const auto result = ::pread(get(),data+read,std::min(bytes-read,std::size_t{0x7ffff000}),checked_cast<off_t>(offset+read,"pread offset overflow"));
-  if (result < 0) { if (errno == EINTR) continue; throw errno_error("pread failed"); }
+  const auto result = ::pread(get(), data + read, std::min(bytes - read, std::size_t{0x7ffff000}), checked_cast<off_t>(offset + read, "pread offset overflow"));
+  if (result < 0) {
+   if (errno == EINTR) continue;
+   throw errno_error("pread failed");
+  }
   if (!result) throw std::runtime_error("unexpected EOF during pread");
   read += static_cast<std::size_t>(result);
  }

@@ -2,7 +2,6 @@
 #include "src/backend/data/detail/compile_execution.h"
 #include <stdexcept>
 #include <utility>
-
 namespace mmltk::backend::data::benchmark_internal {
 BenchmarkCompileCancellation::BenchmarkCompileCancellation(mmltk::common::concurrency::CancellationObservation external) noexcept : external_(external) {}
 void BenchmarkCompileCancellation::cancel_locked() noexcept {

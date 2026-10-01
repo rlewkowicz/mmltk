@@ -31,12 +31,12 @@ FileLayout compact_compiled_file(const mmltk::common::io::FileHandle& file, cons
  if (compact.total_size > staging.total_size) throw std::logic_error("compiled compaction cannot grow its layout");
  // Forward traversal is memmove-safe even when source and destination overlap.
  // Only live prefixes move; page padding and inactive slots remain sparse.
- const auto scratch_bytes = compact.label_pitch == staging.label_pitch ? 0U : std::min(COMPILED_COMPACTION_SCRATCH_BYTES, compiled_align_up(std::max(staging.image_stride, maximum),PAGE_SIZE));
+ const auto scratch_bytes = compact.label_pitch == staging.label_pitch ? 0U : std::min(COMPILED_COMPACTION_SCRATCH_BYTES, compiled_align_up(std::max(staging.image_stride, maximum), PAGE_SIZE));
  std::optional<common::system::NumaMemory> owned;
  if (scratch_bytes && supplied_scratch.empty()) {
-  owned.emplace(common::system::NumaTopology::Capture().permitted_nodes.front(),common::system::NumaMemory::Lock::Pages);
+  owned.emplace(common::system::NumaTopology::Capture().permitted_nodes.front(), common::system::NumaMemory::Lock::Pages);
   owned->ensure_bytes(scratch_bytes);
-  supplied_scratch = {static_cast<std::byte*>(owned->data()),owned->capacity_bytes()};
+  supplied_scratch = {static_cast<std::byte*>(owned->data()), owned->capacity_bytes()};
  }
  if (supplied_scratch.size() < scratch_bytes) throw std::length_error("compiled compaction scratch is too small");
  auto scratch = supplied_scratch.first(scratch_bytes);
@@ -44,7 +44,7 @@ FileLayout compact_compiled_file(const mmltk::common::io::FileHandle& file, cons
  const auto reclaim = [&](std::size_t begin, std::size_t end) {
   if (!reclaim_supported || begin >= end) return;
   check_cancelled();
-  reclaim_supported = mutation.reclaim ? mutation.reclaim(begin,end-begin) : file.punch_hole(begin,end-begin);
+  reclaim_supported = mutation.reclaim ? mutation.reclaim(begin, end - begin) : file.punch_hole(begin, end - begin);
  };
  std::size_t retained_end = compact.data_offset, completed = 0;
  if (progress) progress(0, total);
@@ -67,12 +67,12 @@ FileLayout compact_compiled_file(const mmltk::common::io::FileHandle& file, cons
     check_cancelled();
     const auto size = std::min(scratch.size(), bytes - offset);
     file.pread_all(scratch.data(), size, source + offset);
-    const auto occupied_begin=(destination+offset)/PAGE_SIZE*PAGE_SIZE;
-    const auto occupied_end=compiled_align_up(destination+offset+size,PAGE_SIZE);
+    const auto occupied_begin = (destination + offset) / PAGE_SIZE * PAGE_SIZE;
+    const auto occupied_end = compiled_align_up(destination + offset + size, PAGE_SIZE);
     if (mutation.allocate)
-     mutation.allocate(occupied_begin,occupied_end-occupied_begin);
+     mutation.allocate(occupied_begin, occupied_end - occupied_begin);
     else
-     file.allocate_range(occupied_begin,occupied_end-occupied_begin);
+     file.allocate_range(occupied_begin, occupied_end - occupied_begin);
     file.pwrite_all(scratch.data(), size, destination + offset);
     // Release only fully consumed source pages beyond the destination prefix.
     // Future source reads remain intact; later destinations can reuse the holes.
@@ -83,13 +83,16 @@ FileLayout compact_compiled_file(const mmltk::common::io::FileHandle& file, cons
   }
   retained_end = compiled_align_up(destination + bytes, PAGE_SIZE);
  };
- struct LiveExtent { std::size_t source=0,destination=0,bytes=0; } pending;
- const auto append = [&](std::size_t source,std::size_t destination,std::size_t bytes) {
-  if (pending.bytes && pending.source+pending.bytes==source && pending.destination+pending.bytes==destination) {
-   pending.bytes=checked_add(pending.bytes,bytes,"compiled live extent overflow"); return;
+ struct LiveExtent {
+  std::size_t source = 0, destination = 0, bytes = 0;
+ } pending;
+ const auto append = [&](std::size_t source, std::size_t destination, std::size_t bytes) {
+  if (pending.bytes && pending.source + pending.bytes == source && pending.destination + pending.bytes == destination) {
+   pending.bytes = checked_add(pending.bytes, bytes, "compiled live extent overflow");
+   return;
   }
-  if (pending.bytes) move(pending.source,pending.destination,pending.bytes);
-  pending={source,destination,bytes};
+  if (pending.bytes) move(pending.source, pending.destination, pending.bytes);
+  pending = {source, destination, bytes};
  };
  for (std::size_t block = 0; block < staging.block_count(); ++block) {
   const auto first = block * COMPILED_BLOCK_SLOTS;
@@ -105,11 +108,13 @@ FileLayout compact_compiled_file(const mmltk::common::io::FileHandle& file, cons
    append(staging.label_offset(slot), compact.label_offset(slot), entries[image].label_bytes);
   }
  }
- if (pending.bytes) move(pending.source,pending.destination,pending.bytes);
+ if (pending.bytes) move(pending.source, pending.destination, pending.bytes);
  reclaim(retained_end, compact.index_offset);
  check_cancelled();
- if (mutation.shrink) mutation.shrink(compact.total_size);
- else file.resize_sparse(compact.total_size);
+ if (mutation.shrink)
+  mutation.shrink(compact.total_size);
+ else
+  file.resize_sparse(compact.total_size);
  return compact;
 }
 }  // namespace mmltk::backend::data

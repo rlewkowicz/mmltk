@@ -3,8 +3,9 @@ namespace mmltk::backend::data::detail {
 CompileResources CompileResources::handles(std::size_t count, bool producer, std::size_t continuation) {
  return {mmltk::common::math::checked_multiply(std::uint64_t{8192}, static_cast<std::uint64_t>(count), "benchmark handle custody overflow"), count, producer, 0, true, continuation};
 }
-
-CompileAllowance::Credits::~Credits() { if (charged) owner->release(*this); }
+CompileAllowance::Credits::~Credits() {
+ if (charged) owner->release(*this);
+}
 std::uint64_t CompileAllowance::bytes() const noexcept {
  if (!credits_) return 0;
  const std::lock_guard lock(credits_->owner->mutex);
@@ -63,14 +64,15 @@ CompileAllowance CompileAllowance::split_storage(std::uint64_t bytes) {
  {
   const std::lock_guard lock(owner.mutex);
   if (credits_->resources.retained_handles || bytes > credits_->resources.bytes) throw std::invalid_argument("benchmark storage partition exceeds its admitted envelope");
-  if ((credits_->arena && credits_->cpu_users) || credits_->workspace_offer || credits_->workspace_retirement_pending) throw std::logic_error("benchmark storage partition requires a settled input window");
+  if ((credits_->arena && credits_->cpu_users) || credits_->workspace_offer || credits_->workspace_retirement_pending)
+   throw std::logic_error("benchmark storage partition requires a settled input window");
   if (bytes) storage->workspace_loans.clone(credits_->workspace_loans);
   if (credits_->arena) {
-   storage->resources.supplied_workspace=true;
-   storage->resources.workspace_class=credits_->resources.workspace_class;
-   storage->resources.workspace_window=credits_->resources.workspace_window;
-   storage->arena=credits_->arena.slice(0,bytes);
-   credits_->arena=credits_->arena.slice(bytes,credits_->resources.bytes-bytes);
+   storage->resources.supplied_workspace = true;
+   storage->resources.workspace_class = credits_->resources.workspace_class;
+   storage->resources.workspace_window = credits_->resources.workspace_window;
+   storage->arena = credits_->arena.slice(0, bytes);
+   credits_->arena = credits_->arena.slice(bytes, credits_->resources.bytes - bytes);
   }
   credits_->resources.bytes -= bytes;
   if (!credits_->resources.bytes) credits_->workspace_loans.retire();
@@ -79,5 +81,4 @@ CompileAllowance CompileAllowance::split_storage(std::uint64_t bytes) {
  }
  return CompileAllowance(std::move(storage));
 }
-
-}
+}  // namespace mmltk::backend::data::detail

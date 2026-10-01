@@ -14,9 +14,8 @@
 #include <string>
 #include <string_view>
 namespace mmltk::backend::data::benchmark_internal {
-using mmltk::backend::data::detail::CompileAllowance;
-
 using detail::CompileExecution;
+using mmltk::backend::data::detail::CompileAllowance;
 // Rejected archive bytes are distinct from allocation, local I/O and storage failures.
 class BenchmarkArchiveError : public std::runtime_error {
 public:

@@ -24,7 +24,6 @@ namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileExecution;
 using mmltk::backend::data::detail::CompileTaskKind;
-
 class CoconutComponentBacking final : public CoconutComponentMetadata {
 public:
  NormalizedAnnotationReadView index;
@@ -83,8 +82,10 @@ void settle_annotation_identities(std::vector<Row>& rows, Inventory inventory, D
    first = end;
   }
  };
- if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, inspect, allowance);
- else inspect(0);
+ if (execution)
+  execution->execution().run(CompileTaskKind::Metadata, {}, inspect, allowance);
+ else
+  inspect(0);
  for (const auto [first, end] : ambiguous)
   for (auto i = first; i < end; ++i) {
    throw_if_benchmark_cancelled(cancellation);
@@ -116,8 +117,10 @@ void settle_annotation_identities(std::vector<Row>& rows, Inventory inventory, D
   retain(rows.size());
   rows.resize(kept);
  };
- if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, compact, allowance);
- else compact(0);
+ if (execution)
+  execution->execution().run(CompileTaskKind::Metadata, {}, compact, allowance);
+ else
+  compact(0);
 }
 }  // namespace
 namespace {
@@ -206,7 +209,7 @@ private:
  const CoconutRecoveryImage* fact_;
  std::unordered_map<std::uint64_t, NormalizedBox> by_annotation_;
 };
-} // namespace
+}  // namespace
 BenchmarkDatasetSource coconut_index_source(CoconutImageNamespace source) {
  return source == CoconutImageNamespace::Objects365V1 || source == CoconutImageNamespace::Objects365V2 ? BenchmarkDatasetSource::kObjects365V2 : BenchmarkDatasetSource::kCoco2017;
 }
@@ -217,22 +220,21 @@ detail::CompileResources coconut_component_assembly_resources(std::uint64_t imag
  // Layout/slice/cursor capacity survives assembly and inventory I/O. Only one
  // image's recovery join is live; the same descriptor serves each physical close.
  const auto join = common::math::checked_multiply(recovery_join_boxes, std::uint64_t{256}, "COCONut recovery join workspace overflow");
- const auto bytes = common::math::checked_add(
-  common::math::checked_multiply(images, std::uint64_t{6 * sizeof(CoconutComponentImage)}, "COCONut merge workspace overflow"),
+ const auto bytes = common::math::checked_add(common::math::checked_multiply(images, std::uint64_t{6 * sizeof(CoconutComponentImage)}, "COCONut merge workspace overflow"),
   common::math::checked_add(join, std::uint64_t{65536}, "COCONut merge workspace overflow"), "COCONut merge workspace overflow");
  return {bytes, 1};
 }
-std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetadata header, std::vector<CoconutComponentImage>& rows, AnnotationRejectCounts rejected,
- bool metadata_only, std::uint64_t source_rows, std::optional<std::uint64_t> source_extent, std::span<const std::size_t> source_ordinals,
- std::span<const CoconutComponent> reusable_components, const CoconutPhysicalMembership& physical, const CoconutMaskRecovery* recovery,
- const std::filesystem::path& directory, Cancellation cancellation, detail::StorageReservationPool* storage, BenchmarkCompilePipeline* execution,
- const CompileAllowance& merge_allowance, bool local_rejection, const CoconutImageRejection& reject) {
+std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetadata header, std::vector<CoconutComponentImage>& rows, AnnotationRejectCounts rejected, bool metadata_only,
+ std::uint64_t source_rows, std::optional<std::uint64_t> source_extent, std::span<const std::size_t> source_ordinals, std::span<const CoconutComponent> reusable_components,
+ const CoconutPhysicalMembership& physical, const CoconutMaskRecovery* recovery, const std::filesystem::path& directory, Cancellation cancellation, detail::StorageReservationPool* storage,
+ BenchmarkCompilePipeline* execution, const CompileAllowance& merge_allowance, bool local_rejection, const CoconutImageRejection& reject) {
  if (rows.empty()) return std::nullopt;
  auto producer = execution ? execution->execution().open_class(detail::CompileWorkClass::Annotations) : CompileExecution::Producer{};
  const auto source = header.source;
  settle_annotation_identities(rows, [](const auto& row) -> const CoconutInventoryImage& { return *row.inventory; },
-  [](const auto& row) -> std::string_view { return row.dependency ? std::string_view(*row.dependency) : std::string_view{}; },
-  [&](const auto& row, std::string_view reason) { if (reject) reject(*row.inventory, reason); }, local_rejection, physical, execution, merge_allowance, cancellation);
+  [](const auto& row) -> std::string_view { return row.dependency ? std::string_view(*row.dependency) : std::string_view{}; }, [&](const auto& row, std::string_view reason) {
+  if (reject) reject(*row.inventory, reason);
+ }, local_rejection, physical, execution, merge_allowance, cancellation);
  if (rows.empty()) return std::nullopt;
  auto sealed = std::make_shared<CoconutComponentBacking>();
  auto inventory = std::make_shared<std::vector<CoconutInventoryImage>>();
@@ -283,18 +285,18 @@ std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetad
    sealed->image_dependencies.push_back(
     row.dependency ? *row.dependency : coconut_image_input_identity(sealed->annotation_input_identity, row.inventory->physical, sealed->original_annotation_identity));
    if (sealed->recovery_policy) {
-    auto recovery = row.component->recovery_policy ? *row.recovery : CoconutRecoveryImage{image.source_image_id, 0, {}};
-    for (auto* objects : {&recovery.objects, &recovery.omissions})
+    auto recovered_image = row.component->recovery_policy ? *row.recovery : CoconutRecoveryImage{image.source_image_id, 0, {}};
+    for (auto* objects : {&recovered_image.objects, &recovered_image.omissions})
      for (auto& object : *objects) object.source_ordinal = mmltk::common::math::checked_add(object.source_ordinal, row.segment_base, "COCONut recovery ordinal overflow");
-    admit_recovery_image(recovery, image);
-    sealed->recovery.push_back(std::move(recovery));
+    admit_recovery_image(recovered_image, image);
+    sealed->recovery.push_back(std::move(recovered_image));
    }
    ComponentRecoveryAdmission recovery_admission(sealed->recovery_policy ? &sealed->recovery.back() : nullptr);
    if (metadata_only)
     membership.images.push_back(image);
    else {
     for (auto box : row.boxes) {
-     box.source_ordinal = common::math::checked_add(box.source_ordinal,row.segment_base,"COCONut segment ordinal overflow");
+     box.source_ordinal = common::math::checked_add(box.source_ordinal, row.segment_base, "COCONut segment ordinal overflow");
      if (!row.ordinals_complete) box.flags |= kAnnotationOrdinalIncomplete;
      recovery_admission.box(box);
     }
@@ -305,18 +307,21 @@ std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetad
   if (metadata_only) normalized = seal_normalized_annotation_metadata(std::move(membership));
   sealed->inventory = std::move(inventory);
  };
- if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, plan, merge_allowance);
- else plan(0);
+ if (execution)
+  execution->execution().run(CompileTaskKind::Metadata, {}, plan, merge_allowance);
+ else
+  plan(0);
  if (assembly) {
   assembly->gather(slices, execution ? &execution->execution() : nullptr, execution ? &execution->files() : nullptr, merge_allowance);
   normalized = assembly->finish();
  }
  const auto identify = [&](std::size_t) {
-  sealed->input_identity =
-   coconut_component_input_identity(header.annotation_input_identity, source, metadata_only ? nullptr : recovery, &physical, header.edition, sealed->dependencies);
+  sealed->input_identity = coconut_component_input_identity(header.annotation_input_identity, source, metadata_only ? nullptr : recovery, &physical, header.edition, sealed->dependencies);
  };
- if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, identify, merge_allowance);
- else identify(0);
+ if (execution)
+  execution->execution().run(CompileTaskKind::Metadata, {}, identify, merge_allowance);
+ else
+  identify(0);
  // The mapped normalized output closed its file before returning. Inventory
  // sealing uses the caller's same retained output descriptor grant.
  return CoconutComponentBacking::finish(
@@ -396,8 +401,10 @@ CoconutComponent CoconutComponentBacking::finish(std::shared_ptr<CoconutComponen
   backing->seal = reuse->seal_;
  } else {
   const auto seal = [&, allowance] { backing->seal = seal_inventory(loaded(backing), cancellation, directory, storage); };
-  if (files) files->submit({.work = seal}).wait();
-  else seal();
+  if (files)
+   files->submit({.work = seal}).wait();
+  else
+   seal();
  }
  if (!expected_identity.empty() && expected_identity != backing->seal->identity) invalid("component inventory/index identity mismatch");
  normalized.annotation_sha256 = backing->seal->identity;
@@ -453,8 +460,7 @@ std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutCo
  };
  std::uint64_t image_count = 0;
  for (const auto& part : parts)
-  for (const auto& component : part.components)
-   image_count = common::math::checked_add(image_count, std::uint64_t{component.index().image_count()}, "COCONut merge image count overflow");
+  for (const auto& component : part.components) image_count = common::math::checked_add(image_count, std::uint64_t{component.index().image_count()}, "COCONut merge image count overflow");
  if (!image_count) return {};
  auto producer = execution ? execution->execution().open_class(detail::CompileWorkClass::Annotations) : CompileExecution::Producer{};
  // Source views remain owned by parts through planning, mapped preparation,
@@ -469,8 +475,10 @@ std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutCo
      sources[component.source()].push_back({&component, i, part.row_base, part.segment_base});
     }
  };
- if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, collect, merge_allowance);
- else collect(0);
+ if (execution)
+  execution->execution().run(CompileTaskKind::Metadata, {}, collect, merge_allowance);
+ else
+  collect(0);
  std::vector<CoconutComponent> result;
  for (auto& [source, rows] : sources) {
   settle_annotation_identities(rows, [](const Row& row) -> const CoconutInventoryImage& { return row.component->inventory_image(row.position); },
@@ -532,7 +540,7 @@ std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutCo
     backing->compiled_ordinal_bases.push_back(mmltk::common::math::checked_add(component.compiled_ordinal_base(row.position), segment_base.value_or(0), "COCONut compiled ordinal overflow"));
     if (!component.required_labels_valid(row.position)) backing->rejected_images.push_back(physical_row.physical.image_id);
     const auto& image = component.index().image(row.position);
-    slices.push_back({image,component.index().storage().boxes.subspan(image.first_box,image.box_count),component.index().storage().mask_rle_pairs,segment_base.value_or(0),!complete});
+    slices.push_back({image, component.index().storage().boxes.subspan(image.first_box, image.box_count), component.index().storage().mask_rle_pairs, segment_base.value_or(0), !complete});
     if (backing->recovery_policy) {
      auto recovery = component.recovery_image(row.position);
      for (auto* objects : {&recovery.objects, &recovery.omissions})
@@ -543,17 +551,21 @@ std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutCo
    }
    backing->inventory = std::move(inventory);
   };
-  if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, plan, merge_allowance);
-  else plan(0);
+  if (execution)
+   execution->execution().run(CompileTaskKind::Metadata, {}, plan, merge_allowance);
+  else
+   plan(0);
   assembled->gather(slices, execution ? &execution->execution() : nullptr, execution ? &execution->files() : nullptr, merge_allowance);
   const auto identify = [&](std::size_t) {
    backing->input_identity =
     component_input_identity(identity, source, physical.dependency_identity(first.edition(), source, backing->dependencies), backing->recovery_policy, backing->original_annotation_identity);
   };
-  if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, identify, merge_allowance);
-  else identify(0);
-  result.push_back(CoconutComponentBacking::finish(
-   std::move(backing), assembled->finish(), false, cancellation, directory, storage, nullptr, execution ? &execution->files() : nullptr, merge_allowance));
+  if (execution)
+   execution->execution().run(CompileTaskKind::Metadata, {}, identify, merge_allowance);
+  else
+   identify(0);
+  result.push_back(
+   CoconutComponentBacking::finish(std::move(backing), assembled->finish(), false, cancellation, directory, storage, nullptr, execution ? &execution->files() : nullptr, merge_allowance));
  }
  return result;
 }

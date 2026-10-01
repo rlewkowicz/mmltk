@@ -108,6 +108,7 @@ public:
  void retain_support(std::span<const CoconutSegmentSupport>, CoconutNativeSupport&);
  [[nodiscard]] CoconutStaging::Request& request() noexcept { return request_; }
  void fill();
+
 private:
  friend class CoconutNativeWorkspace;
  friend class CoconutNativeImage;
@@ -135,7 +136,7 @@ public:
  [[nodiscard]] CoconutMaskRecovery* recovery() const noexcept { return recovery_.get(); }
  [[nodiscard]] std::uint64_t retained_bytes() const noexcept;
  [[nodiscard]] std::uint64_t support_workspace_bytes(const CoconutRecord&, std::uint64_t pixels, std::uint64_t segments, bool recover = true) const;
- [[nodiscard]] std::uint64_t reuse_workspace_bytes(const CoconutRecord&,const NormalizedAnnotationReadView&,std::size_t) const;
+ [[nodiscard]] std::uint64_t reuse_workspace_bytes(const CoconutRecord&, const NormalizedAnnotationReadView&, std::size_t) const;
  [[nodiscard]] dataset::MaskDimensions admit_png(const CoconutRecord&, std::span<const std::uint8_t>) const;
  [[nodiscard]] std::size_t decoder_workspace_bytes(std::span<const std::uint8_t>) const;
  void decode(const CoconutRecord&, std::span<const std::uint8_t>, dataset::MaskDimensions, std::span<std::byte> supplied = {});
@@ -172,13 +173,12 @@ private:
   std::pmr::vector<CoconutSegmentSupport> support;
   std::pmr::vector<NormalizedBox> boxes;
   std::pmr::vector<RLEPair> runs;
-  explicit Scratch(std::pmr::memory_resource* resource) : segments(resource),support(resource),boxes(resource),runs(resource) {}
+  explicit Scratch(std::pmr::memory_resource* resource) : segments(resource), support(resource), boxes(resource), runs(resource) {}
  };
  // Supplied production scratch never has an upstream allocation fallback.
  std::unique_ptr<std::pmr::monotonic_buffer_resource> supplied_;
  std::optional<Scratch> scratch_;
  Scratch& scratch();
  void supports(std::size_t);
-
 };
 }  // namespace mmltk::backend::data::benchmark_internal

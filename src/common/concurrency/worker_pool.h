@@ -22,6 +22,7 @@ public:
   BorrowedTask(void* context, std::size_t index, void (*call)(void*, std::size_t)) : context_(context), index_(index), call_(call) {}
   BorrowedTask(const BorrowedTask&) = delete;
   BorrowedTask& operator=(const BorrowedTask&) = delete;
+
  private:
   friend class WorkerPool;
   void* context_;

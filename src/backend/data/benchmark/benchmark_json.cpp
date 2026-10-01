@@ -14,7 +14,6 @@
 namespace mmltk::backend::data::benchmark_internal {
 using detail::CompileExecution;
 using mmltk::backend::data::detail::CompileTaskKind;
-
 using mmltk::common::io::errno_error;
 using mmltk::common::io::FileHandle;
 [[nodiscard]] bool consume_json_string_token(const char token, bool& in_string, bool& escaped) noexcept {

@@ -72,8 +72,11 @@ void CompileImageDecoder::ensure_jpeg_handle() {
  handle_ = tjInitDecompress();
  if (!handle_) throw CompileImageError("cannot initialize benchmark TurboJPEG decoder");
 }
-CompileImageDecoder::~CompileImageDecoder() { if (handle_) (void)tjDestroy(handle_); }
-CompileImageHeader CompileImageDecoder::read_header(const std::span<const std::uint8_t> encoded, const CompileImagePolicy policy, const std::uint32_t expected_width, const std::uint32_t expected_height) {
+CompileImageDecoder::~CompileImageDecoder() {
+ if (handle_) (void)tjDestroy(handle_);
+}
+CompileImageHeader CompileImageDecoder::read_header(
+ const std::span<const std::uint8_t> encoded, const CompileImagePolicy policy, const std::uint32_t expected_width, const std::uint32_t expected_height) {
  if (encoded.empty()) { throw CompileImageError("benchmark image is empty"); }
  int width = 0;
  int height = 0;
@@ -106,7 +109,7 @@ CompileImageHeader CompileImageDecoder::read_header(const std::span<const std::u
 }
 std::size_t CompileImagePlan::bytes() const {
  using mmltk::common::math::checked_add;
- return checked_add(checked_add(output_bytes,cmyk_bytes,"image workspace overflow"),stb_bytes,"image workspace overflow");
+ return checked_add(checked_add(output_bytes, cmyk_bytes, "image workspace overflow"), stb_bytes, "image workspace overflow");
 }
 CompileImagePlan CompileImageDecoder::plan(const CompileImageHeader& header) {
  if (!header.width || !header.height) throw CompileImageError("image workspace has no admitted dimensions");
@@ -117,13 +120,15 @@ CompileImagePlan CompileImageDecoder::plan(const CompileImageHeader& header) {
  // TurboJPEG owns opaque MCU/progressive coefficient bookkeeping. It cannot
  // allocate from a supplied arena. Charge four padded short-coefficient planes
  // and row/control storage separately from the RGB/CMYK payload we supply.
- using mmltk::common::math::checked_multiply;
  using mmltk::common::math::checked_add;
+ using mmltk::common::math::checked_multiply;
  const auto width = (std::size_t(header.width) + 31) / 32 * 32;
  const auto height = (std::size_t(header.height) + 31) / 32 * 32;
- const auto coefficients = checked_multiply(checked_multiply(width,height,"JPEG coefficients overflow"),4*sizeof(short),"JPEG coefficients overflow");
- return {checked_pixel_bytes(header,3), header.colorspace == TJCS_CMYK || header.colorspace == TJCS_YCCK ? checked_pixel_bytes(header,4) : 0,
-  0, checked_add(coefficients, checked_add(checked_multiply(width,16,"JPEG rows overflow"),std::size_t{65536},"JPEG controls overflow"),"JPEG workspace overflow")};
+ const auto coefficients = checked_multiply(checked_multiply(width, height, "JPEG coefficients overflow"), 4 * sizeof(short), "JPEG coefficients overflow");
+ return {
+  checked_pixel_bytes(header, 3), header.colorspace == TJCS_CMYK || header.colorspace == TJCS_YCCK ? checked_pixel_bytes(header, 4) : 0, 0,
+  checked_add(coefficients, checked_add(checked_multiply(width, 16, "JPEG rows overflow"), std::size_t{65536}, "JPEG controls overflow"), "JPEG workspace overflow")
+ };
 }
 std::span<const std::uint8_t> CompileImageDecoder::decode_rgb(std::span<const std::uint8_t> encoded, const CompileImageHeader& header, std::span<std::byte> workspace) {
  const auto required = plan(header);
@@ -131,7 +136,7 @@ std::span<const std::uint8_t> CompileImageDecoder::decode_rgb(std::span<const st
  if (header.encoding != CompileImageEncoding::Jpeg) {
   if (encoded.size() > INT_MAX) throw CompileImageError("benchmark PNG size overflow");
   int width = 0, height = 0, channels = 0;
-  auto* pixels = stbi_load_from_memory_workspace(encoded.data(),static_cast<int>(encoded.size()),&width,&height,&channels,3,workspace.data(),required.stb_bytes);
+  auto* pixels = stbi_load_from_memory_workspace(encoded.data(), static_cast<int>(encoded.size()), &width, &height, &channels, 3, workspace.data(), required.stb_bytes);
   if (!pixels) {
    const auto* reason = stbi_failure_reason();
    if (reason && std::string_view(reason) == "workspace capacity") throw std::length_error("supplied decoder workspace exhausted");
@@ -139,22 +144,21 @@ std::span<const std::uint8_t> CompileImageDecoder::decode_rgb(std::span<const st
   }
   if (width <= 0 || height <= 0 || static_cast<std::uint32_t>(width) != header.width || static_cast<std::uint32_t>(height) != header.height)
    throw CompileImageError("decoded benchmark PNG dimensions do not match its header");
-  return {pixels,checked_pixel_bytes(header,3)};
+  return {pixels, checked_pixel_bytes(header, 3)};
  }
  if (encoded.size() > std::numeric_limits<unsigned long>::max()) throw CompileImageError("benchmark JPEG size overflow");
- auto rgb = std::span(reinterpret_cast<std::uint8_t*>(workspace.data()),required.output_bytes);
+ auto rgb = std::span(reinterpret_cast<std::uint8_t*>(workspace.data()), required.output_bytes);
  const auto bytes = static_cast<unsigned long>(encoded.size());
- const auto width = checked_cast<int>(header.width,"benchmark JPEG width overflow"), height = checked_cast<int>(header.height,"benchmark JPEG height overflow");
+ const auto width = checked_cast<int>(header.width, "benchmark JPEG width overflow"), height = checked_cast<int>(header.height, "benchmark JPEG height overflow");
  ensure_jpeg_handle();
  if (!required.cmyk_bytes) {
-  if (tjDecompress2(handle_,encoded.data(),bytes,rgb.data(),width,0,height,TJPF_RGB,0) < 0)
-   throw CompileImageError(std::string("cannot decode benchmark JPEG: ")+tjGetErrorStr2(handle_));
+  if (tjDecompress2(handle_, encoded.data(), bytes, rgb.data(), width, 0, height, TJPF_RGB, 0) < 0) throw CompileImageError(std::string("cannot decode benchmark JPEG: ") + tjGetErrorStr2(handle_));
  } else {
-  auto cmyk = std::span(reinterpret_cast<std::uint8_t*>(workspace.data())+required.output_bytes,required.cmyk_bytes);
-  if (tjDecompress2(handle_,encoded.data(),bytes,cmyk.data(),width,0,height,TJPF_CMYK,0) < 0)
-   throw CompileImageError(std::string("cannot decode benchmark CMYK JPEG: ")+tjGetErrorStr2(handle_));
-  convert_cmyk_to_rgb(cmyk,header.inverted_cmyk,rgb);
+  auto cmyk = std::span(reinterpret_cast<std::uint8_t*>(workspace.data()) + required.output_bytes, required.cmyk_bytes);
+  if (tjDecompress2(handle_, encoded.data(), bytes, cmyk.data(), width, 0, height, TJPF_CMYK, 0) < 0)
+   throw CompileImageError(std::string("cannot decode benchmark CMYK JPEG: ") + tjGetErrorStr2(handle_));
+  convert_cmyk_to_rgb(cmyk, header.inverted_cmyk, rgb);
  }
  return rgb;
 }
-}
+}  // namespace mmltk::backend::data::detail

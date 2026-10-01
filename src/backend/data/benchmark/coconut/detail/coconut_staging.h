@@ -9,18 +9,22 @@
 #include <span>
 #include <type_traits>
 #include <utility>
-namespace mmltk::backend::data::detail { class FileWorkQueue; }
+namespace mmltk::backend::data::detail {
+class FileWorkQueue;
+}
 namespace mmltk::backend::data::benchmark_internal {
 // One generation appends into fixed allocated blocks. Published ranges never
 // move or change; their block survives independently of this append owner.
 class CoconutStaging final {
  struct Block;
+
 public:
  struct Bytes {
   std::shared_ptr<const void> owner;
   std::span<const std::byte> values;
  };
- template<class T> struct Range {
+ template <class T>
+ struct Range {
   std::shared_ptr<const void> owner;
   std::span<const T> values;
  };
@@ -33,6 +37,7 @@ public:
   [[nodiscard]] bool ready() const noexcept { return !bytes_ || bool(owner_); }
   [[nodiscard]] std::span<std::byte> target() const;
   [[nodiscard]] Bytes bytes() const { return {owner_, target()}; }
+
  private:
   friend class CoconutStaging;
   std::size_t bytes_ = 0, alignment_ = 1;
@@ -48,8 +53,8 @@ public:
  // Controller/standalone entry point. Execution-backed callers supply their
  // existing file service; no CPU lane may wait for preparation or admission.
  void prepare(Request&, detail::CompileExecution* = nullptr, detail::FileWorkQueue* = nullptr, const detail::CompileAllowance& parent = {});
- template<class T> [[nodiscard]] Range<T> copy(std::span<const T> values, detail::CompileExecution* execution = nullptr,
-  detail::FileWorkQueue* files = nullptr, const detail::CompileAllowance& parent = {}) {
+ template <class T>
+ [[nodiscard]] Range<T> copy(std::span<const T> values, detail::CompileExecution* execution = nullptr, detail::FileWorkQueue* files = nullptr, const detail::CompileAllowance& parent = {}) {
   static_assert(std::is_trivially_copyable_v<T>);
   Request request(values.size_bytes(), alignof(T));
   prepare(request, execution, files, parent);
@@ -58,6 +63,7 @@ public:
   auto range = request.bytes();
   return {std::move(range.owner), {reinterpret_cast<const T*>(range.values.data()), values.size()}};
  }
+
 private:
  std::filesystem::path directory_;
  detail::StorageReservationPool storage_;
@@ -65,4 +71,4 @@ private:
  std::mutex mutex_, preparation_mutex_;
  std::shared_ptr<Block> active_;
 };
-}
+}  // namespace mmltk::backend::data::benchmark_internal

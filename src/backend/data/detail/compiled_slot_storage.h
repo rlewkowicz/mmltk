@@ -14,6 +14,7 @@ namespace mmltk::backend::data::detail {
 class CompiledSlotStorage final {
  struct Slot;
  struct SlotBlock;
+
 public:
  class PixelLease final {
  public:
@@ -24,6 +25,7 @@ public:
   PixelLease(const PixelLease&) = delete;
   PixelLease& operator=(const PixelLease&) = delete;
   [[nodiscard]] float* data() const noexcept { return data_; }
+
  private:
   friend class CompiledSlotStorage;
   PixelLease(CompiledSlotStorage*, Slot*, float*);
@@ -38,11 +40,12 @@ public:
   LabelLease& operator=(LabelLease&&) noexcept = default;
   LabelLease(const LabelLease&) = delete;
   LabelLease& operator=(const LabelLease&) = delete;
-  void write(const ImageEntry&,CompiledLabelWorkspace::OutputLease,std::uint64_t ordinal_base=0);
-  void settle_ordinals(std::size_t count,std::uint64_t base,bool incomplete);
+  void write(const ImageEntry&, CompiledLabelWorkspace::OutputLease, std::uint64_t ordinal_base = 0);
+  void settle_ordinals(std::size_t count, std::uint64_t base, bool incomplete);
+
  private:
   friend class CompiledSlotStorage;
-  LabelLease(CompiledSlotStorage&,std::uint32_t,PixelLease,std::unique_lock<std::mutex>);
+  LabelLease(CompiledSlotStorage&, std::uint32_t, PixelLease, std::unique_lock<std::mutex>);
   CompiledSlotStorage* owner_;
   std::uint32_t index_;
   PixelLease custody_;
@@ -61,6 +64,7 @@ public:
  [[nodiscard]] LabelLease labels(std::uint32_t);
  // No new borrowers after this boundary; joins all physical writers then unmaps.
  void quiesce();
+
 private:
  [[nodiscard]] Slot& slot(std::uint32_t);
  [[nodiscard]] Slot& slot_locked(std::uint32_t);
@@ -77,4 +81,4 @@ private:
  std::size_t borrowers_ = 0;
  bool closed_ = false;
 };
-}
+}  // namespace mmltk::backend::data::detail

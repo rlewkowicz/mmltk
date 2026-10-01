@@ -73,8 +73,8 @@
 #include <string>
 #include <utility>
 #include <vector>
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileResourceWait;
 using mmltk::backend::data::detail::CompileTaskKind;
 using namespace mmltk::backend::data;
@@ -84,6 +84,7 @@ using mmltk::backend::data::testsupport::benchmark_entry;
 using mmltk::backend::data::testsupport::benchmark_semantics;
 using mmltk::backend::data::testsupport::bind_benchmark_slots;
 using mmltk::backend::data::testsupport::write_benchmark_fixture;
+using mmltk::testsupport::require_condition;
 std::uint32_t compiled_slot(const CompiledDataset& dataset, std::uint64_t identity, AnnotationSource source) {
  auto slots = dataset.eligible_slots();
  const auto found = std::ranges::find_if(slots, [&](auto slot) {
@@ -211,7 +212,8 @@ void append_value(arrow::ArrayBuilder& builder, const Json& value) {
  }
 }
 void parquet_file(const std::filesystem::path& path, const Json& rows, std::shared_ptr<arrow::Schema> schema = hf_schema(), parquet::Compression::type codec = parquet::Compression::SNAPPY,
- std::int64_t group_rows = 1, std::shared_ptr<parquet::ArrowWriterProperties> arrow_properties = parquet::default_arrow_writer_properties(), std::shared_ptr<parquet::WriterProperties> writer_properties = {}) {
+ std::int64_t group_rows = 1, std::shared_ptr<parquet::ArrowWriterProperties> arrow_properties = parquet::default_arrow_writer_properties(),
+ std::shared_ptr<parquet::WriterProperties> writer_properties = {}) {
  std::vector<std::shared_ptr<arrow::Array>> columns;
  for (const auto& field : schema->fields()) {
   std::unique_ptr<arrow::ArrayBuilder> builder;
@@ -224,7 +226,8 @@ void parquet_file(const std::filesystem::path& path, const Json& rows, std::shar
  auto output = arrow_value(arrow::io::FileOutputStream::Open(path.string()));
  parquet::WriterProperties::Builder properties;
  properties.compression(codec);
- arrow_ok(parquet::arrow::WriteTable(*arrow::Table::Make(schema, columns), arrow::default_memory_pool(), output, group_rows, writer_properties ? std::move(writer_properties) : properties.build(), std::move(arrow_properties)));
+ arrow_ok(parquet::arrow::WriteTable(
+  *arrow::Table::Make(schema, columns), arrow::default_memory_pool(), output, group_rows, writer_properties ? std::move(writer_properties) : properties.build(), std::move(arrow_properties)));
  arrow_ok(output->Close());
 }
 Json hf_row(unsigned id, std::string encoded, Json segments, int width = 3, int height = 3, std::string_view physical_source = "train2017") {
@@ -553,9 +556,7 @@ TEST_CASE("COCONut Parquet rejects malformed nested records missing membership a
   rejected_labels = true;
   input.limits.max_png_bytes = 1;
  }
- SECTION("pixel admission") {
-  input.limits.max_pixels = 8;
- }
+ SECTION("pixel admission") { input.limits.max_pixels = 8; }
  SECTION("segment admission") { input.limits.max_segments = 0; }
  SECTION("release completeness") { input.expected_rows = 2; }
  SECTION("missing physical member") {
@@ -1772,26 +1773,26 @@ TEST_CASE("shared root repair invalidates all proofs and preserves valid JPEG al
   mmltk::testsupport::write_text_file(cached_image_path(images, 2), "bad JPEG");
   const auto archive = std::ranges::find(catalog.images, CoconutImageNamespace::Objects365V2, &RecipeImageArchive::source);
   REQUIRE(archive != catalog.images.end());
-  const auto extracted = extract_selected_archive_images(
-   {.archive_path = local.cache.source_downloads("objects365") / archive->artifact.filename,
-    .source_identity = original["identity"].get<std::string>(),
-    .output_root = images,
-    .source = "objects365",
-    .shard = "patch-32",
-    .selected_image_ids = ids,
-    .image_id_parser = [](std::string_view member) -> std::optional<std::uint64_t> {
+  const auto extracted = extract_selected_archive_images({
+   .archive_path = local.cache.source_downloads("objects365") / archive->artifact.filename,
+   .source_identity = original["identity"].get<std::string>(),
+   .output_root = images,
+   .source = "objects365",
+   .shard = "patch-32",
+   .selected_image_ids = ids,
+   .image_id_parser = [](std::string_view member) -> std::optional<std::uint64_t> {
    if (member == "patch32/objects365_v2_00000001.jpg") return 1;
    if (member == "patch32/objects365_v2_00000002.jpg") return 2;
    return {};
   },
-    .validator =
-     [](std::uint64_t, std::span<const std::uint8_t> bytes) {
+   .validator =
+    [](std::uint64_t, std::span<const std::uint8_t> bytes) {
    if (!has_complete_image_markers(bytes)) throw std::runtime_error("invalid JPEG");
    return BenchmarkImageDecoder{}.read_header(bytes);
   },
-    .quarantine_unavailable = true,
-    .decompression_workers = 0,
-});
+   .quarantine_unavailable = true,
+   .decompression_workers = 0,
+  });
   CHECK(extracted.image_count == 2);
   CHECK_FALSE(std::filesystem::exists(proof));
  }
@@ -3762,9 +3763,7 @@ TEST_CASE("COCONut contradictory annotation geometry remains excluded across pix
  CHECK(train.header().num_images == 2);
  CHECK_THROWS(compiled_slot(train, 1, AnnotationSource::CoconutObjects365V2));
  const auto manifest = read_json_file(config.output_dir / "benchmark_manifest.json");
- CHECK(std::ranges::any_of(manifest.at("quarantined_images"), [](const auto& image) {
-  return image.at("image_id") == 1 && image.at("reason") == "annotation canvas contradicts the image header";
- }));
+ CHECK(std::ranges::any_of(manifest.at("quarantined_images"), [](const auto& image) { return image.at("image_id") == 1 && image.at("reason") == "annotation canvas contradicts the image header"; }));
 }
 TEST_CASE("production output admission counts only unsettled occupied extents", "[benchmark][coconut][storage]") {
  ScopedTempDir root("output-additional-storage");
@@ -4827,15 +4826,15 @@ TEST_CASE("requested archive extraction closes before unsafe unused members", "[
  const std::array<std::pair<std::string, std::string>, 2> members{{{"images/1.jpg", encoded}, {"../unused.jpg", "unsafe unused bytes"}}};
  tar(path, members);
  const std::array<std::uint64_t, 1> ids{1};
- const auto result = extract_selected_archive_images(
-  {.archive_path = path,
-   .source_identity = "consumed-only",
-   .output_root = root.path() / "images",
-   .source = "coco",
-   .shard = "train2017",
-   .selected_image_ids = ids,
-   .image_id_parser = [](std::string_view name) -> std::optional<std::uint64_t> { return name == "images/1.jpg" ? std::optional<std::uint64_t>{1} : std::nullopt; },
-});
+ const auto result = extract_selected_archive_images({
+  .archive_path = path,
+  .source_identity = "consumed-only",
+  .output_root = root.path() / "images",
+  .source = "coco",
+  .shard = "train2017",
+  .selected_image_ids = ids,
+  .image_id_parser = [](std::string_view name) -> std::optional<std::uint64_t> { return name == "images/1.jpg" ? std::optional<std::uint64_t>{1} : std::nullopt; },
+ });
  CHECK(result.image_count == 1);
  BenchmarkArchive reader(path);
  REQUIRE(reader.next());
@@ -4998,7 +4997,6 @@ TEST_CASE("archive image payloads outlive acquisition and exceptional pool retir
   .shard = "train2017",
   .selected_image_ids = ids,
   .image_id_parser = [](std::string_view name) -> std::optional<std::uint64_t> { return name == "images/1.jpg" ? std::optional<std::uint64_t>{1} : std::nullopt; },
-
  };
  request.image_ready = [&](const CachedImageReady& ready) {
   retained = ready.payload;
@@ -5032,8 +5030,7 @@ TEST_CASE("independent physical consumers and labels progress beside Curl at low
  std::promise<void> pixels, labels;
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  config.trace = [&](std::string_view event, std::string_view fields) {
-  if (std::getenv("MMLTK_TEST_BENCHMARK_TRACE") && event == "benchmark.resource.wait")
-   std::fprintf(stderr, "%s\n", Json{{"event", event}, {"payload", Json::parse(fields)}}.dump().c_str());
+  if (std::getenv("MMLTK_TEST_BENCHMARK_TRACE") && event == "benchmark.resource.wait") std::fprintf(stderr, "%s\n", Json{{"event", event}, {"payload", Json::parse(fields)}}.dump().c_str());
   if (event == "benchmark.archive.image_ready" && Json::parse(fields).at("image_id") == 8 && !pixels_done.exchange(true)) pixels.set_value();
   if (event == "benchmark.labels.placed" && Json::parse(fields).at("image_id") == 7 && !labels_done.exchange(true)) labels.set_value();
  };
@@ -5725,8 +5722,8 @@ TEST_CASE("physical repair shares source selection admission bounds and rejectio
  tar(train, std::array{std::pair{coco(unreadable ? 0 : 1).member, unreadable ? std::string("invalid image") : white_jpeg(1, 1)}});
  tar(unlabeled, std::array{std::pair{coco(2, CoconutImageNamespace::CocoUnlabeled).member, white_jpeg(1, 1)}});
  auto catalog = base_physical_catalog(train, 2);
- catalog.images.push_back({CoconutImageNamespace::CocoUnlabeled, 0, "unlabeled2017",
-  {"unlabeled", "unused", unlabeled.filename().string(), std::filesystem::file_size(unlabeled), "", BenchmarkDatasetSource::kCoco2017}});
+ catalog.images.push_back(
+  {CoconutImageNamespace::CocoUnlabeled, 0, "unlabeled2017", {"unlabeled", "unused", unlabeled.filename().string(), std::filesystem::file_size(unlabeled), "", BenchmarkDatasetSource::kCoco2017}});
  auto admitted = local_physical_archives(cache, catalog);
  BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 13});
  std::vector<CoconutImageNamespace> repaired;
@@ -5750,8 +5747,10 @@ TEST_CASE("physical repair shares source selection admission bounds and rejectio
  if (scenario == 1) record.namespace_hint = CoconutImageNamespace::CocoTrain;
  if (scenario >= 2) record.namespace_hint = CoconutImageNamespace::CocoUnlabeled;
  if (blocking) {
-  if (unreadable) CHECK(physical.resolve(CoconutEdition::Base, record).image_id == 0);
-  else CHECK_THROWS_WITH(physical.resolve(CoconutEdition::Base, record), "missing physical image: " + record.file_name);
+  if (unreadable)
+   CHECK(physical.resolve(CoconutEdition::Base, record).image_id == 0);
+  else
+   CHECK_THROWS_WITH(physical.resolve(CoconutEdition::Base, record), "missing physical image: " + record.file_name);
  } else {
   // The callback can finish synchronously. The captured completion still
   // reports that change to a subscriber registered only after readiness returns.
@@ -5772,9 +5771,11 @@ TEST_CASE("physical repair shares source selection admission bounds and rejectio
   REQUIRE(final.image);
   CHECK(*final.image == physical.resolve(CoconutEdition::Base, record));
   CHECK_FALSE(pipeline.image_input(physical.identity_root(CoconutImageNamespace::CocoTrain), record.image_id));
- } else CHECK_THROWS_AS(physical.resolve(CoconutEdition::Base, record), CoconutPhysicalMembershipError);
- const std::vector<CoconutImageNamespace> expected = scenario == 0 ? std::vector{CoconutImageNamespace::CocoUnlabeled, CoconutImageNamespace::CocoTrain, CoconutImageNamespace::CocoUnlabeled}
-  : scenario == 2 ? std::vector{CoconutImageNamespace::CocoUnlabeled, CoconutImageNamespace::CocoUnlabeled} : std::vector{CoconutImageNamespace::CocoTrain};
+ } else
+  CHECK_THROWS_AS(physical.resolve(CoconutEdition::Base, record), CoconutPhysicalMembershipError);
+ const std::vector<CoconutImageNamespace> expected = scenario == 0   ? std::vector{CoconutImageNamespace::CocoUnlabeled, CoconutImageNamespace::CocoTrain, CoconutImageNamespace::CocoUnlabeled}
+                                                     : scenario == 2 ? std::vector{CoconutImageNamespace::CocoUnlabeled, CoconutImageNamespace::CocoUnlabeled}
+                                                                     : std::vector{CoconutImageNamespace::CocoTrain};
  CHECK(repaired == expected);
  for (const auto& reason : reasons) CHECK(reason == std::string(unreadable ? "unreadable required image: " : "missing required image: ") + record.file_name);
  const auto count = repaired.size();
@@ -5809,14 +5810,19 @@ TEST_CASE("one physical repair claim survives racing joins and completion subscr
  record.file_name = "000000000000.jpg";
  auto joining = std::async(std::launch::async, [&] {
   if (blocking) {
-   try { (void)physical.resolve(CoconutEdition::Base, record); }
-   catch (const CoconutPhysicalMembershipError& error) { return error.image_id() == 0; }
+   try {
+    (void)physical.resolve(CoconutEdition::Base, record);
+   } catch (const CoconutPhysicalMembershipError& error) { return error.image_id() == 0; }
    return false;
   }
   const auto pending = physical.readiness(CoconutEdition::Base, record);
   return !pending.terminal && !pending.image && pending.changed.ready();
  });
- const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled = true; repairing.Release(); pipeline.execution().cancel(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled = true;
+  repairing.Release();
+  pipeline.execution().cancel();
+ });
  REQUIRE(repairing.WaitEntered(5s));
  const auto waiting = physical.readiness(CoconutEdition::Base, record);
  CHECK_FALSE(waiting.terminal);
@@ -5855,8 +5861,8 @@ TEST_CASE("excluded Objects365 shards retain verified ambiguity before eligibili
  tar(archive, members);
  CoconutRecipeCatalog catalog;
  catalog.releases = {coconut_release_component(CoconutEdition::Large), coconut_release_component(CoconutEdition::XLarge)};
- catalog.images.push_back({CoconutImageNamespace::Objects365V2, 32, "patch-32",
-  {"physical-32", "unused", archive.filename().string(), std::filesystem::file_size(archive), "", BenchmarkDatasetSource::kObjects365V2}});
+ catalog.images.push_back(
+  {CoconutImageNamespace::Objects365V2, 32, "patch-32", {"physical-32", "unused", archive.filename().string(), std::filesystem::file_size(archive), "", BenchmarkDatasetSource::kObjects365V2}});
  auto admitted = local_physical_archives(cache, catalog);
  BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 13});
  CoconutPhysicalMembership physical(admitted, catalog, false, cache, pipeline.storage(), pipeline);
@@ -5872,7 +5878,8 @@ TEST_CASE("excluded Objects365 shards retain verified ambiguity before eligibili
  CHECK(ready.terminal);
  CHECK_FALSE(ready.image);
  CHECK_THROWS_WITH(physical.resolve(CoconutEdition::XLarge, record), std::string(conflict ? "ambiguous physical image identity: " : "missing physical image: ") + record.file_name);
- if (conflict) CHECK_THROWS_AS(physical.identify(CoconutEdition::XLarge, record), CoconutPhysicalMembershipError);
+ if (conflict)
+  CHECK_THROWS_AS(physical.identify(CoconutEdition::XLarge, record), CoconutPhysicalMembershipError);
  else {
   CHECK(physical.identify(CoconutEdition::XLarge, record).archive_identity == "pending");
   const auto selected = physical.readiness(CoconutEdition::Large, record);
@@ -5902,7 +5909,6 @@ TEST_CASE("retained archive images keep storage after decoder CPUs return", "[be
   .selected_image_ids = ids,
   .image_id_parser = [](std::string_view) { return std::optional<std::uint64_t>{1}; },
   .decompression_workers = 2,
-
   .image_ready =
    [&](const CachedImageReady& ready) {
   retained = ready.payload;
@@ -6008,14 +6014,14 @@ TEST_CASE("retained Parquet metadata joins group ordinals and owns batches after
  std::vector<std::string> names(3);
  read_coconut_parquet(paths, {}, {}, [&](std::size_t, const CoconutRecord& record, const CoconutAnnotationInput& input) {
   CHECK(input.membership);
-  names.at(record.source_ordinal)=record.file_name;
+  names.at(record.source_ordinal) = record.file_name;
  }, true, &execution.execution(), &execution.files(), {}, {}, &records);
  REQUIRE(records.size() == 3);
  REQUIRE(records.groups.size() == 3);
  CoconutAnnotationInput retained;
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- std::size_t payload_rows=0;
+ std::size_t payload_rows = 0;
  const auto consume = [&] {
   read_coconut_parquet(paths, {}, cancellation, [&](std::size_t, const CoconutRecord& record, const CoconutAnnotationInput& input) {
    CHECK_FALSE(input.membership);
@@ -6582,7 +6588,9 @@ TEST_CASE("consecutive Parquet groups retain compressed physical progress with b
  const std::array paths{root.path() / "records.parquet"};
  parquet_file(paths[0], rows);
  CoconutAnnotationRecords retained;
- if (warm) read_coconut_parquet(paths, {}, cancellation, [&](std::size_t, const CoconutRecord&, const CoconutAnnotationInput& input) { CHECK(input.membership); }, true, &execution.execution(), &execution.files(), {}, {}, &retained);
+ if (warm)
+  read_coconut_parquet(paths, {}, cancellation, [&](std::size_t, const CoconutRecord&, const CoconutAnnotationInput& input) { CHECK(input.membership); }, true, &execution.execution(),
+   &execution.files(), {}, {}, &retained);
  CompileAllowance blocker;
  std::size_t metadata_rows = 0, payload_rows = 0, retired_inputs = 0, retired_groups = 0;
  Json transitions = Json::array();
@@ -6598,7 +6606,7 @@ TEST_CASE("consecutive Parquet groups retain compressed physical progress with b
    if ((input.membership || warm) && record.image_id == 1) {
     const auto unrelated = execution.execution().reserve({0, 0});
     if (pressure)
-     blocker = execution.execution().reserve({64U << 10,0});
+     blocker = execution.execution().reserve({64U << 10, 0});
     else {
      // The next groups must consume this already-open generation. Reopening
      // the pathname would encounter the corrupt replacement, exposing a reset.
@@ -6615,9 +6623,11 @@ TEST_CASE("consecutive Parquet groups retain compressed physical progress with b
     CHECK(record.segments.size() == 2);
     if (fail && payload_rows == 2) throw std::runtime_error("consecutive group consumer failed");
    }
-   if (!cancelled.load()) execution.execution().run(CompileTaskKind::Metadata,{},[](std::size_t) {});
-  }, false, &execution.execution(), &execution.files(), [&] { ++retired_groups; blocker={}; }, {}, &retained);
-
+   if (!cancelled.load()) execution.execution().run(CompileTaskKind::Metadata, {}, [](std::size_t) {});
+  }, false, &execution.execution(), &execution.files(), [&] {
+   ++retired_groups;
+   blocker = {};
+  }, {}, &retained);
  };
  try {
   if (cancel || fail)
@@ -6649,29 +6659,30 @@ TEST_CASE("consecutive Parquet groups retain compressed physical progress with b
 }
 TEST_CASE("quiesced Parquet batches retain their backing while another artifact progresses", "[benchmark][coconut][parquet][pipeline]") {
  ScopedTempDir root("parquet-shared-batch");
- const std::array<std::uint32_t,1> ids{1};
- const auto encoded=png(1,1,ids);
- const std::array main_paths{root.path()/"sequence.parquet"},other_paths{root.path()/"independent.parquet"};
- parquet_file(main_paths[0],Json::array({hf_row(1,encoded,Json::array({segment()}),1,1),hf_row(2,encoded,Json::array({segment()}),1,1)}));
- parquet_file(other_paths[0],Json::array({hf_row(3,encoded,Json::array({segment()}),1,1)}));
- BenchmarkCompilePipeline execution(2,{}, {.transient_bytes=2ULL<<30,.descriptors=13});
+ const std::array<std::uint32_t, 1> ids{1};
+ const auto encoded = png(1, 1, ids);
+ const std::array main_paths{root.path() / "sequence.parquet"}, other_paths{root.path() / "independent.parquet"};
+ parquet_file(main_paths[0], Json::array({hf_row(1, encoded, Json::array({segment()}), 1, 1), hf_row(2, encoded, Json::array({segment()}), 1, 1)}));
+ parquet_file(other_paths[0], Json::array({hf_row(3, encoded, Json::array({segment()}), 1, 1)}));
+ BenchmarkCompilePipeline execution(2, {}, {.transient_bytes = 2ULL << 30, .descriptors = 13});
  CoconutAnnotationInput retained_batch;
- bool independent=false;
- read_coconut_parquet(main_paths,{}, {},[&](std::size_t,const CoconutRecord& record,const CoconutAnnotationInput& input) {
+ bool independent = false;
+ read_coconut_parquet(main_paths, {}, {}, [&](std::size_t, const CoconutRecord& record, const CoconutAnnotationInput& input) {
   if (input.membership) return;
-  if (record.image_id==1) {
-   retained_batch=input;
-   CHECK(input.live_bytes>=input.png.size());
-   CHECK(execution.execution().snapshot().leased>=kParquetPoolBytes);
-   read_coconut_parquet(other_paths,{}, {},[&](std::size_t,const CoconutRecord& row,const CoconutAnnotationInput&) { independent=row.image_id==3; },true,&execution.execution(), &execution.files());
+  if (record.image_id == 1) {
+   retained_batch = input;
+   CHECK(input.live_bytes >= input.png.size());
+   CHECK(execution.execution().snapshot().leased >= kParquetPoolBytes);
+   read_coconut_parquet(
+    other_paths, {}, {}, [&](std::size_t, const CoconutRecord& row, const CoconutAnnotationInput&) { independent = row.image_id == 3; }, true, &execution.execution(), &execution.files());
   }
-  CHECK(std::string(input.png.begin(),input.png.end())==encoded);
- },false,&execution.execution(), &execution.files());
+  CHECK(std::string(input.png.begin(), input.png.end()) == encoded);
+ }, false, &execution.execution(), &execution.files());
  CHECK(independent);
  REQUIRE(retained_batch.backing);
- CHECK(std::string(retained_batch.png.begin(),retained_batch.png.end())==encoded);
- retained_batch={};
- CHECK(execution.execution().try_reserve({2ULL<<30,13}));
+ CHECK(std::string(retained_batch.png.begin(), retained_batch.png.end()) == encoded);
+ retained_batch = {};
+ CHECK(execution.execution().try_reserve({2ULL << 30, 13}));
 }
 TEST_CASE("repeated warm Parquet membership needs no physical workspace or Arrow reads", "[benchmark][coconut][parquet][pipeline]") {
  bool cancel = false, fail = false;
@@ -6889,7 +6900,7 @@ TEST_CASE("pending train originals leave mixed Base unlabeled rows runnable", "[
   terminal.store(true);
   originals.settle();
  });
- mmltk::testsupport::await_test_promise(pending_original,"original readiness subscription");
+ mmltk::testsupport::await_test_promise(pending_original, "original readiness subscription");
  mmltk::testsupport::await_test_promise(independent, "unlabeled native rows finish while train originals are pending");
  REQUIRE(input.records->row(63).native());
  CHECK(input.records->row(63).native()->lineage().component.source == CoconutImageNamespace::CocoUnlabeled);
@@ -7145,22 +7156,22 @@ TEST_CASE("late original withdrawal retains physical work and remaps changed sto
 }
 TEST_CASE("a quiesced Parquet reader releases its window for independent recovery", "[benchmark][coconut][pipeline][resources]") {
  ScopedTempDir root("coconut-reader-recovery-retirement");
- const std::array<std::uint32_t,1> pixel{1};
- const std::array shards{root.path()/"groups.parquet"};
- parquet_file(shards.front(),Json::array({hf_row(1,png(1,1,pixel),Json::array({segment()}),1,1),hf_row(2,png(1,1,pixel),Json::array({segment()}),1,1)}));
- BenchmarkCompilePipeline execution(1,{}, {.transient_bytes=1,.descriptors=13});
- bool recovered=false;
+ const std::array<std::uint32_t, 1> pixel{1};
+ const std::array shards{root.path() / "groups.parquet"};
+ parquet_file(shards.front(), Json::array({hf_row(1, png(1, 1, pixel), Json::array({segment()}), 1, 1), hf_row(2, png(1, 1, pixel), Json::array({segment()}), 1, 1)}));
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 13});
+ bool recovered = false;
  CoconutAnnotationRecords records;
- read_coconut_parquet(shards,{}, {},[&](std::size_t group,const CoconutRecord&,const CoconutAnnotationInput& input) {
+ read_coconut_parquet(shards, {}, {}, [&](std::size_t group, const CoconutRecord&, const CoconutAnnotationInput& input) {
   if (input.membership) return;
   if (!group) {
-   auto completion=execution.execution().submit({.kind=CompileTaskKind::Recovery,.resources={65536,0},.work=[&](std::size_t,const CompileAllowance&) { recovered=true; }});
+   auto completion = execution.execution().submit({.kind = CompileTaskKind::Recovery, .resources = {65536, 0}, .work = [&](std::size_t, const CompileAllowance&) { recovered = true; }});
    input.admitted(std::move(completion));
   }
- },false,&execution.execution(), &execution.files(),{}, {},&records);
+ }, false, &execution.execution(), &execution.files(), {}, {}, &records);
  CHECK(recovered);
  records.discard();
- CHECK(execution.execution().try_reserve({1,13}));
+ CHECK(execution.execution().try_reserve({1, 13}));
 }
 TEST_CASE("a Parquet group joins native recovery before JPEG geometry", "[benchmark][coconut][pipeline][resources]") {
  using namespace std::chrono_literals;
@@ -7204,20 +7215,24 @@ TEST_CASE("a Parquet group joins native recovery before JPEG geometry", "[benchm
  CompileExecution::CompletionSource originals;
  std::atomic<bool> original_terminal{false};
  std::promise<void> next_group;
- auto advanced=next_group.get_future();
- input.originals=[&](CoconutImageNamespace,bool,std::stop_token) { return CoconutOriginalReadiness{{},original_terminal.load(),1,originals.completion()}; };
- input.input_finished=[&] { next_group.set_value(); };
+ auto advanced = next_group.get_future();
+ input.originals = [&](CoconutImageNamespace, bool, std::stop_token) { return CoconutOriginalReadiness{{}, original_terminal.load(), 1, originals.completion()}; };
+ input.input_finished = [&] { next_group.set_value(); };
  auto importing = std::async(std::launch::async, [&] {
   auto result = import_coconut_annotations(input);
   if (fail_labels && !result.empty()) (void)execution.wait_image_labels(images, 7, result[0].image_input_identity(0));
   return result;
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] {
-  cancelled.store(true); original_terminal.store(true); originals.settle(); execution.execution().notify_admission_change();
+  cancelled.store(true);
+  original_terminal.store(true);
+  originals.settle();
+  execution.execution().notify_admission_change();
  });
- mmltk::testsupport::await_test_future(advanced,"all source groups settle while original recovery is pending",5s);
- CHECK_FALSE(execution.geometry(images,7));
- original_terminal.store(true); originals.settle();
+ mmltk::testsupport::await_test_future(advanced, "all source groups settle while original recovery is pending", 5s);
+ CHECK_FALSE(execution.geometry(images, 7));
+ original_terminal.store(true);
+ originals.settle();
  if (fail_labels) {
   CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(importing, "fatal label conversion before JPEG geometry", 5s), "mask run length overflow");
   return;
@@ -7453,8 +7468,8 @@ TEST_CASE("native image custody survives workspace reuse and physical retirement
  lineage->component.source = CoconutImageNamespace::CocoTrain;
  lineage->component.annotation_input_identity = "native-custody";
  auto product = workspace.finish(wide, coco(7), dimensions, lineage, {});
- const auto capacity=workspace.retained_bytes();
- CHECK(capacity>=decoded_capacity);
+ const auto capacity = workspace.retained_bytes();
+ CHECK(capacity >= decoded_capacity);
  const auto identity = product->input_identity();
  if (staged) {
   const auto original = product;
@@ -7522,12 +7537,13 @@ TEST_CASE("prepared immutable ranges preserve alignment parallel claims and last
  std::memset(first.target().data(), 0x31, first.target().size());
  auto retained = first.bytes();
  std::vector<std::future<CoconutStaging::Bytes>> copies;
- for (unsigned value = 1; value <= 8; ++value) copies.push_back(std::async(std::launch::async, [&, value] {
-  CoconutStaging::Request range(31, 16);
-  require_condition(staging.try_claim(range), "ordinary concurrent range did not share its prepared block");
-  std::memset(range.target().data(), static_cast<int>(value), range.target().size());
-  return range.bytes();
- }));
+ for (unsigned value = 1; value <= 8; ++value)
+  copies.push_back(std::async(std::launch::async, [&, value] {
+   CoconutStaging::Request range(31, 16);
+   require_condition(staging.try_claim(range), "ordinary concurrent range did not share its prepared block");
+   std::memset(range.target().data(), static_cast<int>(value), range.target().size());
+   return range.bytes();
+  }));
  std::set<const std::byte*> addresses;
  for (std::size_t i = 0; i < copies.size(); ++i) {
   auto range = mmltk::testsupport::await_test_future(copies[i], "disjoint prepared range fill");
@@ -7539,7 +7555,7 @@ TEST_CASE("prepared immutable ranges preserve alignment parallel claims and last
  CoconutStaging::Request abandoned(32, 32);
  REQUIRE(staging.try_claim(abandoned));
  const auto* hole = abandoned.target().data();
- abandoned = {}; // A failed producer's claim remains an unpublished hole.
+ abandoned = {};  // A failed producer's claim remains an unpublished hole.
  CoconutStaging::Request after(1, 1);
  REQUIRE(staging.try_claim(after));
  CHECK(after.target().data() >= hole + 32);
@@ -7551,11 +7567,16 @@ TEST_CASE("prepared immutable ranges preserve alignment parallel claims and last
  CHECK(reinterpret_cast<std::uintptr_t>(oversized.target().data()) % 64 == 0);
  auto survivor = oversized.bytes();
  std::memset(oversized.target().data(), 0x7a, oversized.target().size());
- staging.retire(); first = {}; after = {}; oversized = {};
+ staging.retire();
+ first = {};
+ after = {};
+ oversized = {};
  CHECK(std::ranges::all_of(retained.values, [](auto value) { return value == std::byte{0x31}; }));
- CHECK(survivor.values.front() == std::byte{0x7a}); CHECK(survivor.values.back() == std::byte{0x7a});
+ CHECK(survivor.values.front() == std::byte{0x7a});
+ CHECK(survivor.values.back() == std::byte{0x7a});
  CHECK(std::distance(std::filesystem::directory_iterator(root.path()), std::filesystem::directory_iterator{}) == 2);
- retained = {}; survivor = {};
+ retained = {};
+ survivor = {};
  CHECK(std::filesystem::is_empty(root.path()));
  CHECK(storage.outstanding() == 0);
 }
@@ -7563,56 +7584,69 @@ TEST_CASE("compact staged support populates supplied native scratch without inte
  ScopedTempDir root("coconut-compact-support");
  CoconutStaging staging(root.path());
  CoconutRecord record;
- record.image_id = 7; record.width = 3; record.height = 1;
- record.segments = {{.id=1,.category_id=1,.isthing=true},{.id=2,.category_id=1,.isthing=true}};
- const std::array<std::uint32_t,3> pixels{1,2,1};
- const auto encoded = png(3,1,pixels);
- const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()),encoded.size());
+ record.image_id = 7;
+ record.width = 3;
+ record.height = 1;
+ record.segments = {{.id = 1, .category_id = 1, .isthing = true}, {.id = 2, .category_id = 1, .isthing = true}};
+ const std::array<std::uint32_t, 3> pixels{1, 2, 1};
+ const auto encoded = png(3, 1, pixels);
+ const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
  auto lineage = std::make_shared<CoconutNativeLineage>();
  lineage->component.source = CoconutImageNamespace::CocoTrain;
  CoconutNativeWorkspace decoded(CoconutImportLimits{});
- decoded.decode(record,bytes,{3,1});
+ decoded.decode(record, bytes, {3, 1});
  CoconutNativeOutput output;
- auto original = decoded.finish(record,coco(7),{3,1},lineage,{},&output);
+ auto original = decoded.finish(record, coco(7), {3, 1}, lineage, {}, &output);
  CoconutNativeSupport support;
- output.retain_support(decoded.support(record.segments.size()),support);
- staging.prepare(output.request()); output.fill(); output = {}; decoded.retire(); staging.retire();
- REQUIRE(support.segments.size() == 2); REQUIRE(support.runs.size() == 3);
- CHECK(support.segments[0].area == 2); CHECK(support.segments[1].area == 1);
- std::array<std::byte,65536> supplied{};
+ output.retain_support(decoded.support(record.segments.size()), support);
+ staging.prepare(output.request());
+ output.fill();
+ output = {};
+ decoded.retire();
+ staging.retire();
+ REQUIRE(support.segments.size() == 2);
+ REQUIRE(support.runs.size() == 3);
+ CHECK(support.segments[0].area == 2);
+ CHECK(support.segments[1].area == 1);
+ std::array<std::byte, 65536> supplied{};
  CoconutNativeWorkspace recovered(CoconutImportLimits{});
  recovered.prepare_support(supplied);
- recovered.borrow_support(record,support,{3,1});
+ recovered.borrow_support(record, support, {3, 1});
  const auto held = recovered.support(record.segments.size());
  CHECK(held[0].runs.data() == support.runs.data());
- CHECK(held[1].runs.data() == support.runs.data()+support.segments[1].first_run);
- support = {}; original.reset();
+ CHECK(held[1].runs.data() == support.runs.data() + support.segments[1].first_run);
+ support = {};
+ original.reset();
  CHECK_FALSE(std::filesystem::is_empty(root.path()));
- const auto product = recovered.finish(record,coco(7),{3,1},lineage,{});
+ const auto product = recovered.finish(record, coco(7), {3, 1}, lineage, {});
  recovered.release_supplied();
  CHECK(std::filesystem::is_empty(root.path()));
- REQUIRE(product->runs().size() == 3); CHECK(product->boxes()[0].original_area == 2);
+ REQUIRE(product->runs().size() == 3);
+ CHECK(product->boxes()[0].original_area == 2);
 }
 TEST_CASE("file preparation rejects invalid destinations and CPU lane waits before range publication", "[benchmark][coconut][resources]") {
  ScopedTempDir root("coconut-preparation-failure");
- BenchmarkCompilePipeline pipeline(1,{}, {.transient_bytes=1,.descriptors=13});
- const auto path = root.path()/"not-a-directory";
- mmltk::testsupport::write_text_file(path,"occupied");
- CoconutStaging failed(path,&pipeline.storage());
- CoconutStaging::Request request(32,8);
- CHECK_THROWS(failed.prepare(request,&pipeline.execution(),&pipeline.files()));
+ BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 13});
+ const auto path = root.path() / "not-a-directory";
+ mmltk::testsupport::write_text_file(path, "occupied");
+ CoconutStaging failed(path, &pipeline.storage());
+ CoconutStaging::Request request(32, 8);
+ CHECK_THROWS(failed.prepare(request, &pipeline.execution(), &pipeline.files()));
  CHECK_FALSE(request.ready());
  CHECK(pipeline.execution().resource_usage().descriptors == 0);
- CoconutStaging staging(root.path(),&pipeline.storage());
- CHECK_THROWS_AS(staging.prepare(request,&pipeline.execution()),std::logic_error);
+ CoconutStaging staging(root.path(), &pipeline.storage());
+ CHECK_THROWS_AS(staging.prepare(request, &pipeline.execution()), std::logic_error);
  std::atomic<bool> rejected{false};
- pipeline.execution().run(CompileTaskKind::Normalize,{},[&](std::size_t) {
-  try { staging.prepare(request,&pipeline.execution(),&pipeline.files()); }
-  catch (const std::logic_error&) { rejected=true; }
+ pipeline.execution().run(CompileTaskKind::Normalize, {}, [&](std::size_t) {
+  try {
+   staging.prepare(request, &pipeline.execution(), &pipeline.files());
+  } catch (const std::logic_error&) { rejected = true; }
  });
- CHECK(rejected.load()); CHECK_FALSE(request.ready());
- staging.prepare(request,&pipeline.execution(),&pipeline.files());
- CHECK(request.ready()); CHECK(pipeline.execution().resource_usage().descriptors == 0);
+ CHECK(rejected.load());
+ CHECK_FALSE(request.ready());
+ staging.prepare(request, &pipeline.execution(), &pipeline.files());
+ CHECK(request.ready());
+ CHECK(pipeline.execution().resource_usage().descriptors == 0);
 }
 TEST_CASE("staged segments share immutable backing and detach only the mutated copy", "[benchmark][coconut][annotations][resources]") {
  ScopedTempDir root("coconut-segment-custody");
@@ -7761,17 +7795,18 @@ TEST_CASE("ready recovery that fits retains its forward Parquet reader on one CP
  input.parquet_shards = {path};
  CompileExecution::CompletionSource originals;
  std::promise<void> completed_native;
- auto completed=completed_native.get_future();
+ auto completed = completed_native.get_future();
  std::promise<void> later_group;
- auto advanced=later_group.get_future();
- input.originals=[&](CoconutImageNamespace,bool,std::stop_token) { return CoconutOriginalReadiness{{},terminal.load(),1,originals.completion()}; };
- input.preparation_progress=[&](CoconutPreparationStage stage,std::uint64_t count) {
-  if (stage==CoconutPreparationStage::Annotations && count==128) {
-   terminal.store(true); originals.settle();
-   std::filesystem::rename(path,root.path()/"opened-generation.parquet");
+ auto advanced = later_group.get_future();
+ input.originals = [&](CoconutImageNamespace, bool, std::stop_token) { return CoconutOriginalReadiness{{}, terminal.load(), 1, originals.completion()}; };
+ input.preparation_progress = [&](CoconutPreparationStage stage, std::uint64_t count) {
+  if (stage == CoconutPreparationStage::Annotations && count == 128) {
+   terminal.store(true);
+   originals.settle();
+   std::filesystem::rename(path, root.path() / "opened-generation.parquet");
   }
  };
- input.input_finished=[&] { later_group.set_value(); };
+ input.input_finished = [&] { later_group.set_value(); };
  input.progress = [&](std::uint64_t count) {
   if (count == 64) completed_native.set_value();
  };
@@ -7784,7 +7819,7 @@ TEST_CASE("ready recovery that fits retains its forward Parquet reader on one CP
  });
  mmltk::testsupport::await_test_future(advanced, "next group while completed recovery retains no blocking input demand", 10s);
  const auto result = mmltk::testsupport::await_test_future(importing, "forward reader and all native rows settle", 10s);
- mmltk::testsupport::await_test_future(completed,"recovery completed independently");
+ mmltk::testsupport::await_test_future(completed, "recovery completed independently");
  REQUIRE(result.size() == 1);
  CHECK(result.front().index().image_count() == 129);
  CHECK(result.front().index().box_count() == 0);
@@ -7928,14 +7963,17 @@ TEST_CASE("recovery batches publish independent labels before withheld geometry"
  std::atomic<bool> original_terminal{false};
  std::atomic<unsigned> offered{0};
  std::promise<void> all_offered;
- input.originals = [&](CoconutImageNamespace,bool,std::stop_token) {
-  return CoconutOriginalReadiness{original_terminal.load() ? original_owner : nullptr,original_terminal.load(),1,originals.completion()};
+ input.originals = [&](CoconutImageNamespace, bool, std::stop_token) {
+  return CoconutOriginalReadiness{original_terminal.load() ? original_owner : nullptr, original_terminal.load(), 1, originals.completion()};
  };
- input.preparation_progress=[&](CoconutPreparationStage stage,std::uint64_t count) { if (stage==CoconutPreparationStage::Annotations && count==ids.size()) all_offered.set_value(); };
+ input.preparation_progress = [&](CoconutPreparationStage stage, std::uint64_t count) {
+  if (stage == CoconutPreparationStage::Annotations && count == ids.size()) all_offered.set_value();
+ };
  auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   cancelled.store(true);
-  original_terminal.store(true); originals.settle();
+  original_terminal.store(true);
+  originals.settle();
   execution.execution().notify_admission_change();
  });
  mmltk::testsupport::await_test_promise(all_offered, "every native input precedes original readiness");
@@ -7944,7 +7982,8 @@ TEST_CASE("recovery batches publish independent labels before withheld geometry"
   REQUIRE(execution.wait_image_labels(images, id, provisional));
   CHECK(conversions[id] == 1);
  }
- original_terminal.store(true); originals.settle();
+ original_terminal.store(true);
+ originals.settle();
  const auto result = mmltk::testsupport::await_test_future(importing, "later ready recovery batches settle without first-image geometry");
  REQUIRE(result.size() == 1);
  REQUIRE(result[0].index().image_count() == ids.size());
@@ -8414,7 +8453,8 @@ TEST_CASE("COCONut independently writes pixels and labels while every opposite i
    entry.second.assign(fields);
   }
   if (std::getenv("MMLTK_TEST_BENCHMARK_TRACE"))
-   std::fprintf(stderr, "%s\n", Json{{"event", event}, {"payload", Json::parse(fields)}, {"validation", validation}, {"warm", warm}, {"hold_annotations", hold_annotations}, {"recover", recover}}.dump().c_str());
+   std::fprintf(
+    stderr, "%s\n", Json{{"event", event}, {"payload", Json::parse(fields)}, {"validation", validation}, {"warm", warm}, {"hold_annotations", hold_annotations}, {"recover", recover}}.dump().c_str());
   if (!hold_annotations && event == "benchmark.labels.placed" && !completed.exchange(true)) first.set_value();
  };
  auto compiling = compile_constrained_coconut(config, catalog);
@@ -8501,8 +8541,7 @@ TEST_CASE("ready Parquet artifact labels precede a held sibling and settle canon
  std::promise<void> labels;
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  config.trace = [&](std::string_view event, std::string_view fields) {
-  if (std::getenv("MMLTK_TEST_BENCHMARK_TRACE") && event == "benchmark.resource.wait")
-   std::fprintf(stderr, "%s\n", Json{{"event", event}, {"payload", Json::parse(fields)}}.dump().c_str());
+  if (std::getenv("MMLTK_TEST_BENCHMARK_TRACE") && event == "benchmark.resource.wait") std::fprintf(stderr, "%s\n", Json{{"event", event}, {"payload", Json::parse(fields)}}.dump().c_str());
   if (event == "benchmark.labels.placed" && Json::parse(fields).at("image_id") == 11 && !published.exchange(true)) labels.set_value();
  };
  auto compiling = compile_constrained_coconut(config, catalog);
@@ -9103,42 +9142,59 @@ TEST_CASE("custom source admission keeps ready label peers useful while its firs
   if (entry.eligible() && entry.source == AnnotationSource::Coco) observed.insert(entry.source_image_id);
  CHECK(observed == std::set<std::uint64_t>(ids.begin(), ids.end()));
 }
-
 TEST_CASE("native PNG normalization borrows the pinned compile context with retained row custody", "[benchmark][coconut][annotations][resources]") {
  using namespace mmltk::backend::data::detail;
  CoconutRecord record;
- record.image_id=7; record.width=3; record.height=2;
- record.segments={{.id=1,.category_id=1,.isthing=true},{.id=2,.category_id=2,.isthing=true}};
- const std::array<std::uint32_t,6> ids{1,2,2,1,1,2};
- const auto encoded=png(3,2,ids);
- const auto input=std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()),encoded.size());
+ record.image_id = 7;
+ record.width = 3;
+ record.height = 2;
+ record.segments = {{.id = 1, .category_id = 1, .isthing = true}, {.id = 2, .category_id = 2, .isthing = true}};
+ const std::array<std::uint32_t, 6> ids{1, 2, 2, 1, 1, 2};
+ const auto encoded = png(3, 2, ids);
+ const auto input = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
  CoconutNativeWorkspace workspace(CoconutImportLimits{});
- const auto dimensions=workspace.admit_png(record,input);
- const auto bytes=workspace.decoder_workspace_bytes(input)+workspace.support_workspace_bytes(record,ids.size(),record.segments.size());
- CompileExecution execution(1,{}, {.transient_bytes=bytes+encoded.size()},{},[](std::string_view,const CompileExecutionSnapshot&) {});
- auto row=execution.reserve({encoded.size(),0});
- const void* base=nullptr;
- for (unsigned pass=0; pass<2; ++pass) {
+ const auto dimensions = workspace.admit_png(record, input);
+ const auto bytes = workspace.decoder_workspace_bytes(input) + workspace.support_workspace_bytes(record, ids.size(), record.segments.size());
+ CompileExecution execution(1, {}, {.transient_bytes = bytes + encoded.size()}, {}, [](std::string_view, const CompileExecutionSnapshot&) {});
+ auto row = execution.reserve({encoded.size(), 0});
+ const void* base = nullptr;
+ for (unsigned pass = 0; pass < 2; ++pass) {
   CompileAllowance borrowed;
-  execution.submit({.kind=CompileTaskKind::Normalize,.resources={.bytes=bytes,.supplied_workspace=true},
-   .work=[&](std::size_t,const CompileAllowance& allowance) {
-    borrowed=allowance;
-    const auto memory=allowance.workspace();
-    if (base) CHECK(memory.data()==base); else base=memory.data();
-    workspace.decode(record,input,dimensions,memory);
-   },.parent=row,.finite_consumer=true,.retain_workspace=false}).wait();
-  const auto support=workspace.support(record.segments.size());
-  REQUIRE(support.size()==2);
-  CHECK(support[0].area==3); CHECK(support[1].area==3);
-  REQUIRE(support[0].runs.view().size()==2);
-  CHECK(support[0].runs.view()[0].start==0); CHECK(support[0].runs.view()[0].length==1);
-  CHECK(support[0].runs.view()[1].start==3); CHECK(support[0].runs.view()[1].length==2);
-  workspace.release_supplied(); borrowed={};
-  CHECK(execution.resource_usage().bytes==encoded.size());
+  execution
+   .submit(
+    {.kind = CompileTaskKind::Normalize,
+     .resources = {.bytes = bytes, .supplied_workspace = true},
+     .work =
+      [&](std::size_t, const CompileAllowance& allowance) {
+   borrowed = allowance;
+   const auto memory = allowance.workspace();
+   if (base)
+    CHECK(memory.data() == base);
+   else
+    base = memory.data();
+   workspace.decode(record, input, dimensions, memory);
+  },
+     .parent = row,
+     .finite_consumer = true,
+     .retain_workspace = false})
+   .wait();
+  const auto support = workspace.support(record.segments.size());
+  REQUIRE(support.size() == 2);
+  CHECK(support[0].area == 3);
+  CHECK(support[1].area == 3);
+  REQUIRE(support[0].runs.view().size() == 2);
+  CHECK(support[0].runs.view()[0].start == 0);
+  CHECK(support[0].runs.view()[0].length == 1);
+  CHECK(support[0].runs.view()[1].start == 3);
+  CHECK(support[0].runs.view()[1].length == 2);
+  workspace.release_supplied();
+  borrowed = {};
+  CHECK(execution.resource_usage().bytes == encoded.size());
  }
- row={}; CHECK(execution.resource_usage().bytes==0); CHECK(execution.snapshot().workspace_reuses>=1);
+ row = {};
+ CHECK(execution.resource_usage().bytes == 0);
+ CHECK(execution.snapshot().workspace_reuses >= 1);
 }
-
 TEST_CASE("one physical artifact refills from completed pixels while its first consumer is held", "[benchmark][coconut][pipeline]") {
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPUs");
@@ -9148,7 +9204,7 @@ TEST_CASE("one physical artifact refills from completed pixels while its first c
  std::vector<std::pair<std::string, std::string>> members;
  for (unsigned id = 1; id <= 12; ++id) members.emplace_back(coco(id).member, white_jpeg());
  tar(archive, members);
- const auto catalog = base_physical_catalog(archive, members.size());
+ const auto catalog = base_physical_catalog(archive, static_cast<std::uint32_t>(members.size()));
  bool warm = false, mixed = false;
  SECTION("cold forward source") {}
  SECTION("retained physical inventory") { warm = true; }
@@ -9160,7 +9216,9 @@ TEST_CASE("one physical artifact refills from completed pixels while its first c
  auto admitted = local_physical_archives(cache, catalog);
  BenchmarkCompilePipeline pipeline(4);
  CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline);
- PreparedBenchmarkSplit split; split.name = "train"; split.class_names = {"person"};
+ PreparedBenchmarkSplit split;
+ split.name = "train";
+ split.class_names = {"person"};
  struct Observed {
   mmltk::testsupport::TestGate held{"first physical pixel retains its completion"};
   std::atomic<unsigned> completed{0};
@@ -9168,13 +9226,24 @@ TEST_CASE("one physical artifact refills from completed pixels while its first c
   unsigned expected = 12;
  } observed;
  observed.expected = mixed ? 11 : 12;
- BenchmarkWriteRequest request{.split = split, .output_path = directory.path() / "pixels.bin", .resolution = 3, .num_workers = 4,
-  .progress = {.context = &observed, .image_completed = [](void* context) {
-   auto& value = *static_cast<Observed*>(context);
-   const auto count = value.completed.fetch_add(1);
-   if (!count) value.held.receipt().ArriveAndWait();
-   else if (count + 1 == value.expected) value.independent.set_value();
-  }}, .execution = &pipeline};
+ BenchmarkWriteRequest request{
+  .split = split,
+  .output_path = directory.path() / "pixels.bin",
+  .resolution = 3,
+  .num_workers = 4,
+  .progress =
+   {.context = &observed,
+    .image_completed =
+     [](void* context) {
+  auto& value = *static_cast<Observed*>(context);
+  const auto count = value.completed.fetch_add(1);
+  if (!count)
+   value.held.receipt().ArriveAndWait();
+  else if (count + 1 == value.expected)
+   value.independent.set_value();
+ }},
+  .execution = &pipeline
+ };
  BenchmarkSplitWriter writer(request, true);
  BenchmarkCompilePipeline::Attempt attempt(pipeline);
  pipeline.bind_source(physical.identity_root(CoconutImageNamespace::CocoTrain), writer, AnnotationSource::CoconutCoco);
@@ -9192,7 +9261,6 @@ TEST_CASE("one physical artifact refills from completed pixels while its first c
  CHECK(physical.summary(admitted.front()).image_count == members.size());
  CHECK(physical.discovery_complete());
 }
-
 TEST_CASE("custom COCO labels and pixels progress before unrelated metadata and image inputs settle", "[benchmark][pipeline][annotations]") {
  using namespace std::chrono_literals;
  bool hold_images = false;
@@ -9217,17 +9285,22 @@ TEST_CASE("custom COCO labels and pixels progress before unrelated metadata and 
   if (event == "benchmark.images.complete" && Json::parse(fields).at("root").get<std::string>() == root.string() && !image_seen.exchange(true)) pixels.set_value();
  };
  auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, nullptr, &catalog); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { cancelled = true; images = {}; metadata = {}; });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled = true;
+  images = {};
+  metadata = {};
+ });
  mmltk::testsupport::await_test_promise(labels, "canvas labels complete before held unrelated metadata", 5s);
- if (hold_images) CHECK_FALSE(image_seen.load());
- else mmltk::testsupport::await_test_promise(pixels, "physical COCO completion precedes the supplemental metadata join", 5s);
+ if (hold_images)
+  CHECK_FALSE(image_seen.load());
+ else
+  mmltk::testsupport::await_test_promise(pixels, "physical COCO completion precedes the supplemental metadata join", 5s);
  CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
  images = {};
  metadata = {};
  mmltk::testsupport::await_test_future(compiling, "independent custom sources retain canonical final selection", 10s);
  check_custom_compilation(local.output);
 }
-
 TEST_CASE("physical cached failures share bounded ordered repair on the retained archive generation", "[benchmark][coconut][archive][cache]") {
  const bool compressed = GENERATE(false, true);
  ScopedTempDir directory("physical-collected-cache-repair");
@@ -9245,19 +9318,27 @@ TEST_CASE("physical cached failures share bounded ordered repair on the retained
  auto admitted = local_physical_archives(cache, catalog);
  BenchmarkCompilePipeline pipeline(1);
  CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline);
- PreparedBenchmarkSplit split; split.name = "train"; split.class_names = {"person"};
+ PreparedBenchmarkSplit split;
+ split.name = "train";
+ split.class_names = {"person"};
  std::array<unsigned, 3> opens{};
- BenchmarkSplitWriter writer({.split = split, .output_path = directory.path() / "pixels.bin", .resolution = 3, .num_workers = 1,
-  .image_opened = [&](const auto&, std::uint64_t id) {
-   const auto attempt = ++opens.at(id - 1);
-   if (id == 1 && attempt == 2) {
-    // The forward owner is open before the second cached decode. Collected
-    // raw extents or gzip replay must retain that inode after path replacement.
-    std::filesystem::rename(archive, archive.string() + ".opened");
-    mmltk::testsupport::write_text_file(archive, "replacement is not an archive");
-   }
-   if (id < 3 && attempt <= 2) throw BenchmarkImageError("injected cached image read failure");
-  }, .execution = &pipeline}, true);
+ BenchmarkSplitWriter writer({.split = split,
+                              .output_path = directory.path() / "pixels.bin",
+                              .resolution = 3,
+                              .num_workers = 1,
+                              .image_opened =
+                               [&](const auto&, std::uint64_t id) {
+  const auto attempt = ++opens.at(id - 1);
+  if (id == 1 && attempt == 2) {
+   // The forward owner is open before the second cached decode. Collected
+   // raw extents or gzip replay must retain that inode after path replacement.
+   std::filesystem::rename(archive, archive.string() + ".opened");
+   mmltk::testsupport::write_text_file(archive, "replacement is not an archive");
+  }
+  if (id < 3 && attempt <= 2) throw BenchmarkImageError("injected cached image read failure");
+ },
+                              .execution = &pipeline},
+  true);
  BenchmarkCompilePipeline::Attempt attempt(pipeline);
  pipeline.bind_source(physical.identity_root(CoconutImageNamespace::CocoTrain), writer, AnnotationSource::CoconutCoco);
  physical.admitted(admitted.front(), admitted.front().download);
@@ -9272,540 +9353,646 @@ TEST_CASE("physical cached failures share bounded ordered repair on the retained
  CHECK(file_bytes(peer) == jpeg);
  CHECK(physical.discovery_complete());
 }
-
 TEST_CASE("Parquet artifact readiness bypasses a held batch borrower", "[benchmark][coconut][parquet][pipeline][resources]") {
  using namespace mmltk::backend::data::detail;
  using namespace std::chrono_literals;
- if (mmltk::common::system::allowed_cpu_set().size()<2) SKIP("requires two assigned CPUs");
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
  ScopedTempDir root("parquet-artifact-readiness");
- const std::array<std::uint32_t,1> pixel{1};
- const auto encoded=png(1,1,pixel);
+ const std::array<std::uint32_t, 1> pixel{1};
+ const auto encoded = png(1, 1, pixel);
  std::vector<std::filesystem::path> paths;
  SECTION("independent artifacts") {
-  paths={root.path()/"held.parquet",root.path()/"ready.parquet"};
-  for (std::size_t i=0;i<paths.size();++i) parquet_file(paths[i],Json::array({hf_row(i+1,encoded,Json::array({segment()}),1,1)}));
+  paths = {root.path() / "held.parquet", root.path() / "ready.parquet"};
+  for (std::size_t i = 0; i < paths.size(); ++i) parquet_file(paths[i], Json::array({hf_row(static_cast<std::uint32_t>(i + 1), encoded, Json::array({segment()}), 1, 1)}));
  }
  SECTION("later groups in one artifact") {
-  paths={root.path()/"groups.parquet"};
-  parquet_file(paths.front(),Json::array({hf_row(1,encoded,Json::array({segment()}),1,1),hf_row(2,encoded,Json::array({segment()}),1,1)}));
+  paths = {root.path() / "groups.parquet"};
+  parquet_file(paths.front(), Json::array({hf_row(1, encoded, Json::array({segment()}), 1, 1), hf_row(2, encoded, Json::array({segment()}), 1, 1)}));
  }
- BenchmarkCompilePipeline pipeline(2,{}, {.transient_bytes=1ULL<<30,.descriptors=13});
- auto semantic=pipeline.execution().open_class(CompileWorkClass::Annotations);
+ BenchmarkCompilePipeline pipeline(2, {}, {.transient_bytes = 1ULL << 30, .descriptors = 13});
+ auto semantic = pipeline.execution().open_class(CompileWorkClass::Annotations);
  mmltk::testsupport::TestGate held("first artifact retains its immutable batch");
  std::promise<void> sibling;
- auto importing=std::async(std::launch::async,[&] {
-  read_coconut_parquet(paths,{}, {},[&](std::size_t,const CoconutRecord& record,const CoconutAnnotationInput& input) {
+ auto importing = std::async(std::launch::async, [&] {
+  read_coconut_parquet(paths, {}, {}, [&](std::size_t, const CoconutRecord& record, const CoconutAnnotationInput& input) {
    if (input.membership) return;
-   require_condition(!pipeline.execution().on_lane(),"semantic handoff is nested inside input projection");
-   if (record.image_id==1) {
-    auto task=pipeline.execution().submit({.kind=CompileTaskKind::Normalize,.work=[&,backing=input.backing,png=input.png](std::size_t,const CompileAllowance&) {
-     require_condition(std::string(png.begin(),png.end())==encoded,"held batch lost its immutable PNG");
+   require_condition(!pipeline.execution().on_lane(), "semantic handoff is nested inside input projection");
+   if (record.image_id == 1) {
+    auto task = pipeline.execution().submit({.kind = CompileTaskKind::Normalize, .work = [&, backing = input.backing, png = input.png](std::size_t, const CompileAllowance&) {
+     require_condition(std::string(png.begin(), png.end()) == encoded, "held batch lost its immutable PNG");
      held.receipt().ArriveAndWait();
     }});
     input.admitted(task);
-   } else mmltk::testsupport::release_test_promise(sibling);
-  },false,&pipeline.execution(), &pipeline.files());
+   } else
+    mmltk::testsupport::release_test_promise(sibling);
+  }, false, &pipeline.execution(), &pipeline.files());
  });
- const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); pipeline.execution().cancel(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  held.Release();
+  pipeline.execution().cancel();
+ });
  REQUIRE(held.WaitEntered(5s));
- mmltk::testsupport::await_test_promise(sibling,"ready artifact projects while its sibling retains a normal batch",5s);
- const auto snapshot=pipeline.execution().snapshot();
+ mmltk::testsupport::await_test_promise(sibling, "ready artifact projects while its sibling retains a normal batch", 5s);
+ const auto snapshot = pipeline.execution().snapshot();
  CHECK(snapshot.live[static_cast<std::size_t>(CompileWorkClass::Extraction)]);
  CHECK(snapshot.live[static_cast<std::size_t>(CompileWorkClass::Annotations)]);
- CHECK(work_class(CompileTaskKind::Projection)==CompileWorkClass::Extraction);
+ CHECK(work_class(CompileTaskKind::Projection) == CompileWorkClass::Extraction);
  held.Release();
- mmltk::testsupport::await_test_future(importing,"both artifact continuations settle",5s);
+ mmltk::testsupport::await_test_future(importing, "both artifact continuations settle", 5s);
 }
-
 TEST_CASE("independent native normalization enters shared annotation lanes", "[benchmark][coconut][annotations][pipeline]") {
  using namespace mmltk::backend::data::detail;
  using namespace std::chrono_literals;
- if (mmltk::common::system::allowed_cpu_set().size()<3) SKIP("requires an Extraction floor and two Annotation lanes");
+ if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires an Extraction floor and two Annotation lanes");
  ScopedTempDir root("coconut-native-lanes");
- const std::array<std::uint32_t,1> background{};
- const auto encoded=png(1,1,background);
- const std::array physical{coco(1),coco(2)};
- auto input=request(physical);
- input.parquet_shards={root.path()/"rows.parquet"};
- parquet_file(input.parquet_shards.front(),Json::array({hf_row(1,encoded,Json::array({segment()}),1,1),hf_row(2,encoded,Json::array({segment()}),1,1)}),hf_schema(),parquet::Compression::SNAPPY,2);
- BenchmarkCompilePipeline pipeline(3,{}, {.transient_bytes=1ULL<<30,.descriptors=13});
- input.execution=&pipeline;
- input.inventory_directory=root.path()/"staging";
+ const std::array<std::uint32_t, 1> background{};
+ const auto encoded = png(1, 1, background);
+ const std::array physical{coco(1), coco(2)};
+ auto input = request(physical);
+ input.parquet_shards = {root.path() / "rows.parquet"};
+ parquet_file(
+  input.parquet_shards.front(), Json::array({hf_row(1, encoded, Json::array({segment()}), 1, 1), hf_row(2, encoded, Json::array({segment()}), 1, 1)}), hf_schema(), parquet::Compression::SNAPPY, 2);
+ BenchmarkCompilePipeline pipeline(3, {}, {.transient_bytes = 1ULL << 30, .descriptors = 13});
+ input.execution = &pipeline;
+ input.inventory_directory = root.path() / "staging";
  mmltk::testsupport::TestGate entered("independent native support normalization");
- input.rejected_object=[&](const auto&,const auto&,const auto&,auto,auto) { entered.receipt().ArriveAndWait(); };
- auto importing=std::async(std::launch::async,[&] { return import_coconut_annotations(input); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { entered.Release(); pipeline.execution().cancel(); });
- REQUIRE(entered.WaitEntered(5s,2));
- CHECK(pipeline.execution().snapshot().running[static_cast<std::size_t>(CompileWorkClass::Annotations)]==2);
+ input.rejected_object = [&](const auto&, const auto&, const auto&, auto, auto) { entered.receipt().ArriveAndWait(); };
+ auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  entered.Release();
+  pipeline.execution().cancel();
+ });
+ REQUIRE(entered.WaitEntered(5s, 2));
+ CHECK(pipeline.execution().snapshot().running[static_cast<std::size_t>(CompileWorkClass::Annotations)] == 2);
  entered.Release();
- const auto result=mmltk::testsupport::await_test_future(importing,"independent native products gather in source order",5s);
- REQUIRE(result.size()==1);
- CHECK(result.front().index().image_count()==2);
- CHECK(result.front().index().rejected.degenerate_boxes==2);
+ const auto result = mmltk::testsupport::await_test_future(importing, "independent native products gather in source order", 5s);
+ REQUIRE(result.size() == 1);
+ CHECK(result.front().index().image_count() == 2);
+ CHECK(result.front().index().rejected.degenerate_boxes == 2);
 }
-
 TEST_CASE("a legal exceptional native row releases its own pinned Parquet batch", "[benchmark][coconut][parquet][annotations][resources]") {
  using namespace mmltk::backend::data::detail;
  using namespace std::chrono_literals;
  ScopedTempDir root("coconut-exceptional-batch");
- const std::array<CompileWorkspaceProfile,1> profiles{{{64U<<10,0}}};
- auto plan=std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1,profiles,kParquetPoolBytes,0,320ULL<<20));
- BenchmarkCompilePipeline pipeline(1,{}, {.descriptors=13,.workspace_plan=plan});
- const auto locked=pipeline.execution().snapshot().normal_locked;
- auto source=pipeline.execution().reserve(CompileResources::handles(0,false,pipeline.execution().descriptor_limit()));
- std::vector<std::uint32_t> pixels(64*64,1);
- const auto encoded=png(64,64,pixels);
+ const std::array<CompileWorkspaceProfile, 1> profiles{{{64U << 10, 0}}};
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, profiles, kParquetPoolBytes, 0, 320ULL << 20));
+ BenchmarkCompilePipeline pipeline(1, {}, {.descriptors = 13, .workspace_plan = plan});
+ const auto locked = pipeline.execution().snapshot().normal_locked;
+ auto source = pipeline.execution().reserve(CompileResources::handles(0, false, pipeline.execution().descriptor_limit()));
+ std::vector<std::uint32_t> pixels(64 * 64, 1);
+ const auto encoded = png(64, 64, pixels);
  const std::array physical{coco(7)};
- auto input=request(physical);
- input.execution=&pipeline; input.parent_allowance=source;
- input.inventory_directory=root.path()/"staging";
- input.records=std::make_shared<CoconutAnnotationRecords>();
- input.records->identity=input.input_identity;
+ auto input = request(physical);
+ input.execution = &pipeline;
+ input.parent_allowance = source;
+ input.inventory_directory = root.path() / "staging";
+ input.records = std::make_shared<CoconutAnnotationRecords>();
+ input.records->identity = input.input_identity;
  // All descriptor headroom belongs to this source. Native rollover must draw
  // its actual descriptor from that promise even while its arena is exceptional.
- input.records->staging=std::make_shared<CoconutStaging>(input.inventory_directory,&pipeline.storage(),1);
- input.parquet_shards={root.path()/"row.parquet"};
- parquet_file(input.parquet_shards.front(),Json::array({hf_row(7,encoded,Json::array({segment()}),64,64)}));
+ input.records->staging = std::make_shared<CoconutStaging>(input.inventory_directory, &pipeline.storage(), 1);
+ input.parquet_shards = {root.path() / "row.parquet"};
+ parquet_file(input.parquet_shards.front(), Json::array({hf_row(7, encoded, Json::array({segment()}), 64, 64)}));
  std::atomic<bool> transferred{false};
- input.trace=[&](std::string_view event,const Json& value) {
-  if (event=="benchmark.coconut.projected_batch" && value.at("exceptional_transfer").get<bool>()) transferred=true;
+ input.trace = [&](std::string_view event, const Json& value) {
+  if (event == "benchmark.coconut.projected_batch" && value.at("exceptional_transfer").get<bool>()) transferred = true;
  };
  mmltk::testsupport::TestGate completed("exceptional native values outlive the retired arena");
- input.progress=[&](std::uint64_t count) { if (count==1) completed.receipt().ArriveAndWait(); };
- auto importing=std::async(std::launch::async,[&] { return import_coconut_annotations(input); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { completed.Release(); pipeline.execution().cancel(); });
+ input.progress = [&](std::uint64_t count) {
+  if (count == 1) completed.receipt().ArriveAndWait();
+ };
+ auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  completed.Release();
+  pipeline.execution().cancel();
+ });
  REQUIRE(completed.WaitEntered(5s));
  CHECK(transferred.load());
- CHECK(pipeline.execution().snapshot().exceptional==0);
- CHECK(pipeline.execution().snapshot().normal_locked==locked);
+ CHECK(pipeline.execution().snapshot().exceptional == 0);
+ CHECK(pipeline.execution().snapshot().normal_locked == locked);
  completed.Release();
- const auto result=mmltk::testsupport::await_test_future(importing,"oversized row returns to the retained source generation",5s);
- REQUIRE(result.size()==1);
- REQUIRE(result.front().index().box_count()==1);
- CHECK(result.front().index().storage().mask_rle_pairs.front().length==pixels.size());
- CHECK(pipeline.execution().snapshot().exceptional==0);
- CHECK(pipeline.execution().snapshot().normal_locked==locked);
+ const auto result = mmltk::testsupport::await_test_future(importing, "oversized row returns to the retained source generation", 5s);
+ REQUIRE(result.size() == 1);
+ REQUIRE(result.front().index().box_count() == 1);
+ CHECK(result.front().index().storage().mask_rle_pairs.front().length == pixels.size());
+ CHECK(pipeline.execution().snapshot().exceptional == 0);
+ CHECK(pipeline.execution().snapshot().normal_locked == locked);
 }
-
 TEST_CASE("one pinned normalizer context drains every row of a shared Parquet batch", "[benchmark][coconut][parquet][annotations][resources]") {
  using namespace mmltk::backend::data::detail;
  ScopedTempDir root("coconut-single-normal-context");
- const std::array<std::uint32_t,1> pixel{1};
- const auto encoded=png(1,1,pixel);
- const auto png_bytes=std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()),encoded.size());
+ const std::array<std::uint32_t, 1> pixel{1};
+ const auto encoded = png(1, 1, pixel);
+ const auto png_bytes = std::span(reinterpret_cast<const std::uint8_t*>(encoded.data()), encoded.size());
  CoconutRecord record;
- record.width=record.height=1; record.segments={{.id=1,.category_id=1,.isthing=true}};
+ record.width = record.height = 1;
+ record.segments = {{.id = 1, .category_id = 1, .isthing = true}};
  CoconutNativeWorkspace workspace(CoconutImportLimits{});
- const auto bytes=workspace.decoder_workspace_bytes(png_bytes)+workspace.support_workspace_bytes(record,1,1);
- const std::array<CompileWorkspaceProfile,1> profiles{{{bytes,0}}};
- auto plan=std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1,profiles,kParquetPoolBytes,0));
- BenchmarkCompilePipeline pipeline(1,{}, {.descriptors=13,.workspace_plan=plan});
+ const auto bytes = workspace.decoder_workspace_bytes(png_bytes) + workspace.support_workspace_bytes(record, 1, 1);
+ const std::array<CompileWorkspaceProfile, 1> profiles{{{bytes, 0}}};
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, profiles, kParquetPoolBytes, 0));
+ BenchmarkCompilePipeline pipeline(1, {}, {.descriptors = 13, .workspace_plan = plan});
  struct Observation {
   CompileExecution& execution;
-  mutable std::atomic<bool> projected{false},normalized{false};
+  mutable std::atomic<bool> projected{false}, normalized{false};
   bool cancelled() const noexcept {
    if (execution.on_lane()) {
-    const auto snapshot=execution.snapshot();
-    if (snapshot.running[static_cast<std::size_t>(CompileWorkClass::Extraction)]) projected=true;
-    if (snapshot.running[static_cast<std::size_t>(CompileWorkClass::Annotations)]) normalized=true;
+    const auto snapshot = execution.snapshot();
+    if (snapshot.running[static_cast<std::size_t>(CompileWorkClass::Extraction)]) projected = true;
+    if (snapshot.running[static_cast<std::size_t>(CompileWorkClass::Annotations)]) normalized = true;
    }
    return false;
   }
  } observation{pipeline.execution()};
  std::vector<CoconutPhysicalImage> physical;
- Json rows=Json::array();
- for (unsigned id=1;id<=8;++id) { physical.push_back(coco(id)); rows.push_back(hf_row(id,encoded,Json::array({segment()}),1,1)); }
- auto input=request(physical);
- input.execution=&pipeline; input.inventory_directory=root.path()/"staging";
- input.cancellation=mmltk::common::concurrency::CancellationObservation::Borrow(observation);
- input.parquet_shards={root.path()/"batch.parquet"};
- parquet_file(input.parquet_shards.front(),rows,hf_schema(),parquet::Compression::SNAPPY,8);
- const auto locked=pipeline.execution().snapshot().normal_locked;
- auto importing=std::async(std::launch::async,[&] { return import_coconut_annotations(input); });
+ Json rows = Json::array();
+ for (unsigned id = 1; id <= 8; ++id) {
+  physical.push_back(coco(id));
+  rows.push_back(hf_row(id, encoded, Json::array({segment()}), 1, 1));
+ }
+ auto input = request(physical);
+ input.execution = &pipeline;
+ input.inventory_directory = root.path() / "staging";
+ input.cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(observation);
+ input.parquet_shards = {root.path() / "batch.parquet"};
+ parquet_file(input.parquet_shards.front(), rows, hf_schema(), parquet::Compression::SNAPPY, 8);
+ const auto locked = pipeline.execution().snapshot().normal_locked;
+ auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
  const mmltk::testsupport::ScopedTestCleanup settle([&] { pipeline.execution().cancel(); });
- const auto components=mmltk::testsupport::await_test_future(importing,"one context settles all retained batch descendants");
- REQUIRE(components.size()==1);
- CHECK(components.front().index().image_count()==8);
- CHECK(components.front().index().box_count()==8);
- CHECK(observation.projected.load()); CHECK(observation.normalized.load());
- CHECK(pipeline.execution().snapshot().exceptional==0);
- CHECK(pipeline.execution().snapshot().normal_locked==locked);
+ const auto components = mmltk::testsupport::await_test_future(importing, "one context settles all retained batch descendants");
+ REQUIRE(components.size() == 1);
+ CHECK(components.front().index().image_count() == 8);
+ CHECK(components.front().index().box_count() == 8);
+ CHECK(observation.projected.load());
+ CHECK(observation.normalized.load());
+ CHECK(pipeline.execution().snapshot().exceptional == 0);
+ CHECK(pipeline.execution().snapshot().normal_locked == locked);
 }
-
 TEST_CASE("physical and original recovery subscriptions bypass a parked first row", "[benchmark][coconut][pipeline][recovery]") {
  using namespace std::chrono_literals;
- bool cancel_parked=false;
+ bool cancel_parked = false;
  SECTION("a ready physical sibling settles before train originals") {}
- SECTION("cancellation wakes the parked physical and original dependencies") { cancel_parked=true; }
+ SECTION("cancellation wakes the parked physical and original dependencies") { cancel_parked = true; }
  ScopedTempDir root("coconut-recovery-readiness");
- const auto cache=BenchmarkCacheLayout::create(root.path()/"cache");
- const auto train=cache.source_downloads("coco")/"train.tar";
- const auto unlabeled=cache.source_downloads("coco")/"unlabeled.tar";
- tar(train,std::array{std::pair{coco(1).member,white_jpeg(1,1)}});
- tar(unlabeled,std::array{std::pair{coco(2,CoconutImageNamespace::CocoUnlabeled).member,white_jpeg(1,1)}});
- auto catalog=base_physical_catalog(train,2);
- catalog.images.push_back({CoconutImageNamespace::CocoUnlabeled,0,"unlabeled2017",
-  {"unlabeled","unused",unlabeled.filename().string(),std::filesystem::file_size(unlabeled),"",BenchmarkDatasetSource::kCoco2017}});
- auto admitted=local_physical_archives(cache,catalog);
- std::atomic<bool> cancelled{false},terminal{false};
- const auto cancellation=mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- BenchmarkCompilePipeline pipeline(1,{}, {.transient_bytes=1,.descriptors=13},cancellation);
- CoconutPhysicalMembership physical(admitted,catalog,true,cache,pipeline.storage(),pipeline,cancellation);
+ const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
+ const auto train = cache.source_downloads("coco") / "train.tar";
+ const auto unlabeled = cache.source_downloads("coco") / "unlabeled.tar";
+ tar(train, std::array{std::pair{coco(1).member, white_jpeg(1, 1)}});
+ tar(unlabeled, std::array{std::pair{coco(2, CoconutImageNamespace::CocoUnlabeled).member, white_jpeg(1, 1)}});
+ auto catalog = base_physical_catalog(train, 2);
+ catalog.images.push_back(
+  {CoconutImageNamespace::CocoUnlabeled, 0, "unlabeled2017", {"unlabeled", "unused", unlabeled.filename().string(), std::filesystem::file_size(unlabeled), "", BenchmarkDatasetSource::kCoco2017}});
+ auto admitted = local_physical_archives(cache, catalog);
+ std::atomic<bool> cancelled{false}, terminal{false};
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 13}, cancellation);
+ CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline, cancellation);
  CoconutImportRequest input;
- input.execution=&pipeline; input.physical_membership=&physical; input.input_identity="readiness-generation";
- input.records=std::make_shared<CoconutAnnotationRecords>(); input.cancellation=cancellation;
- input.parquet_shards={root.path()/"rows.parquet"}; input.expected_rows=2;
- const std::array<std::uint32_t,1> pixel{1};
- parquet_file(input.parquet_shards.front(),Json::array({hf_row(1,png(1,1,pixel),Json::array({segment()}),1,1),
-  hf_row(2,png(1,1,pixel),Json::array({segment()}),1,1,"unlabeled2017")}));
+ input.execution = &pipeline;
+ input.physical_membership = &physical;
+ input.input_identity = "readiness-generation";
+ input.records = std::make_shared<CoconutAnnotationRecords>();
+ input.cancellation = cancellation;
+ input.parquet_shards = {root.path() / "rows.parquet"};
+ input.expected_rows = 2;
+ const std::array<std::uint32_t, 1> pixel{1};
+ parquet_file(input.parquet_shards.front(), Json::array({hf_row(1, png(1, 1, pixel), Json::array({segment()}), 1, 1), hf_row(2, png(1, 1, pixel), Json::array({segment()}), 1, 1, "unlabeled2017")}));
  CompileExecution::CompletionSource originals;
- input.originals=[&](CoconutImageNamespace source,bool,std::stop_token) {
-  if (source!=CoconutImageNamespace::CocoTrain) throw std::logic_error("unlabeled recovery requested train originals");
-  return CoconutOriginalReadiness{{},terminal.load(),1,originals.completion()};
+ input.originals = [&](CoconutImageNamespace source, bool, std::stop_token) {
+  if (source != CoconutImageNamespace::CocoTrain) throw std::logic_error("unlabeled recovery requested train originals");
+  return CoconutOriginalReadiness{{}, terminal.load(), 1, originals.completion()};
  };
- std::promise<void> source_done,sibling;
- input.input_finished=[&] { source_done.set_value(); };
- input.progress=[&](std::uint64_t count) { if (count==1) sibling.set_value(); };
- auto importing=std::async(std::launch::async,[&] { return import_coconut_annotations(input); });
+ std::promise<void> source_done, sibling;
+ input.input_finished = [&] { source_done.set_value(); };
+ input.progress = [&](std::uint64_t count) {
+  if (count == 1) sibling.set_value();
+ };
+ auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
  const mmltk::testsupport::ScopedTestCleanup release([&] {
-  cancelled.store(true); terminal.store(true); originals.settle(); pipeline.execution().cancel();
+  cancelled.store(true);
+  terminal.store(true);
+  originals.settle();
+  pipeline.execution().cancel();
  });
- mmltk::testsupport::await_test_promise(source_done,"both native rows release their forward source before physical readiness",5s);
+ mmltk::testsupport::await_test_promise(source_done, "both native rows release their forward source before physical readiness", 5s);
  CHECK_FALSE(input.records->row(0).native());
  CHECK_FALSE(input.records->row(1).native());
  if (cancel_parked) {
-  cancelled.store(true); pipeline.execution().cancel();
-  CHECK_THROWS(mmltk::testsupport::await_test_future(importing,"cancel subscribed recovery dependencies",5s));
+  cancelled.store(true);
+  pipeline.execution().cancel();
+  CHECK_THROWS(mmltk::testsupport::await_test_future(importing, "cancel subscribed recovery dependencies", 5s));
  } else {
-  physical.admitted(admitted[1],admitted[1].download);
+  physical.admitted(admitted[1], admitted[1].download);
   REQUIRE(physical.consume(admitted[1]));
-  mmltk::testsupport::await_test_promise(sibling,"ready unlabeled recovery bypasses the parked train row",5s);
+  mmltk::testsupport::await_test_promise(sibling, "ready unlabeled recovery bypasses the parked train row", 5s);
   CHECK_FALSE(input.records->row(0).native());
   REQUIRE(input.records->row(1).native());
-  CHECK(input.records->row(1).native()->inventory().physical.source==CoconutImageNamespace::CocoUnlabeled);
-  CHECK(importing.wait_for(0ms)==std::future_status::timeout);
-  physical.admitted(admitted[0],admitted[0].download);
+  CHECK(input.records->row(1).native()->inventory().physical.source == CoconutImageNamespace::CocoUnlabeled);
+  CHECK(importing.wait_for(0ms) == std::future_status::timeout);
+  physical.admitted(admitted[0], admitted[0].download);
   REQUIRE(physical.consume(admitted[0]));
-  terminal.store(true); originals.settle();
-  const auto components=mmltk::testsupport::await_test_future(importing,"both recovery generations settle",5s);
-  REQUIRE(components.size()==2);
-  CHECK(components[0].index().image(0).source_image_id==1);
-  CHECK(components[1].index().image(0).source_image_id==2);
+  terminal.store(true);
+  originals.settle();
+  const auto components = mmltk::testsupport::await_test_future(importing, "both recovery generations settle", 5s);
+  REQUIRE(components.size() == 2);
+  CHECK(components[0].index().image(0).source_image_id == 1);
+  CHECK(components[1].index().image(0).source_image_id == 2);
  }
 }
-
 TEST_CASE("Parquet contiguous fit is distinct from its logical payload cap", "[benchmark][coconut][parquet][resources]") {
  using namespace mmltk::backend::data::detail;
- constexpr std::int64_t unit=1U<<20,small=80*unit,large=100*unit;
- const bool moving=GENERATE(false,true);
+ constexpr std::int64_t unit = 1U << 20, small = 80 * unit, large = 100 * unit;
+ const bool moving = GENERATE(false, true);
  CAPTURE(moving);
- const std::array<CompileWorkspaceProfile,1> profiles{{{64U<<10,0}}};
- auto plan=std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1,profiles,kParquetPoolBytes,0));
- BenchmarkCompilePipeline pipeline(1,{}, {.descriptors=13,.workspace_plan=plan},{},[](std::string_view,const Json&) {});
- const auto locked=pipeline.execution().snapshot().normal_locked;
- std::size_t retry_bytes=0;
+ const std::array<CompileWorkspaceProfile, 1> profiles{{{64U << 10, 0}}};
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, profiles, kParquetPoolBytes, 0));
+ BenchmarkCompilePipeline pipeline(1, {}, {.descriptors = 13, .workspace_plan = plan}, {}, [](std::string_view, const Json&) {});
+ const auto locked = pipeline.execution().snapshot().normal_locked;
+ std::size_t retry_bytes = 0;
  // A failed moving reallocation must leave the original pointer intact. A
  // failed allocation has the same logical headroom after freeing its prefix.
- for (unsigned attempt=0;attempt<2;++attempt) {
-  const auto bytes=attempt ? retry_bytes : kParquetPoolBytes;
-  auto allowance=pipeline.execution().reserve({.bytes=bytes,.supplied_workspace=true,.workspace_class=CompileWorkClass::Extraction,.workspace_window=CompileWorkspaceWindow::SharedSource});
+ for (unsigned attempt = 0; attempt < 2; ++attempt) {
+  const auto bytes = attempt ? retry_bytes : kParquetPoolBytes;
+  auto allowance =
+   pipeline.execution().reserve({.bytes = bytes, .supplied_workspace = true, .workspace_class = CompileWorkClass::Extraction, .workspace_window = CompileWorkspaceWindow::SharedSource});
   CoconutParquetPool pool(allowance);
-  std::uint8_t* first=nullptr; std::uint8_t* second=nullptr; std::uint8_t* next=nullptr;
-  arrow_ok(pool.Allocate(small,64,&first)); arrow_ok(pool.Allocate(small,64,&second));
-  first[0]=71; second[0]=93;
-  const auto* stable=second;
-  const auto first_address=first;
-  std::int64_t first_size=small;
-  if (!moving) { pool.Free(first,small,64); first=nullptr; }
+  std::uint8_t* first = nullptr;
+  std::uint8_t* second = nullptr;
+  std::uint8_t* next = nullptr;
+  arrow_ok(pool.Allocate(small, 64, &first));
+  arrow_ok(pool.Allocate(small, 64, &second));
+  first[0] = 71;
+  second[0] = 93;
+  const auto* stable = second;
+  const auto first_address = first;
+  std::int64_t first_size = small;
+  if (!moving) {
+   pool.Free(first, small, 64);
+   first = nullptr;
+  }
   const mmltk::testsupport::ScopedTestCleanup release([&] {
-   if (first) pool.Free(first,first_size,64);
-   if (second) pool.Free(second,small,64);
-   if (next) pool.Free(next,large,64);
+   if (first) pool.Free(first, first_size, 64);
+   if (second) pool.Free(second, small, 64);
+   if (next) pool.Free(next, large, 64);
   });
   pool.begin_call();
-  auto status=moving ? pool.Reallocate(small,large,64,&first) : pool.Allocate(large,64,&next);
-  if (moving && status.ok()) first_size=large;
-  CHECK(second==stable); CHECK(second[0]==93);
-  CHECK(pipeline.execution().snapshot().normal_locked==locked);
+  auto status = moving ? pool.Reallocate(small, large, 64, &first) : pool.Allocate(large, 64, &next);
+  if (moving && status.ok()) first_size = large;
+  CHECK(second == stable);
+  CHECK(second[0] == 93);
+  CHECK(pipeline.execution().snapshot().normal_locked == locked);
   if (!attempt) {
    REQUIRE(status.IsCapacityError());
-   REQUIRE(pool.fragmented_extent()>kParquetPoolBytes);
-   retry_bytes=pool.fragmented_extent();
-   CHECK(pool.bytes_allocated()==(moving ? 2*small : small));
-   if (moving) { CHECK(first==first_address); CHECK(first[0]==71); }
-   pool.begin_call();
-   std::uint8_t* rejected=nullptr;
-   CHECK(pool.Allocate(kParquetPoolBytes,64,&rejected).IsOutOfMemory());
-   CHECK(pool.fragmented_extent()==0);
-   CHECK(rejected==nullptr);
+   REQUIRE(pool.fragmented_extent() > kParquetPoolBytes);
+   retry_bytes = pool.fragmented_extent();
+   CHECK(pool.bytes_allocated() == (moving ? 2 * small : small));
    if (moving) {
-    CHECK(pool.Reallocate(small,kParquetPoolBytes,64,&first).IsOutOfMemory());
-    CHECK(pool.fragmented_extent()==0); CHECK(first==first_address);
+    CHECK(first == first_address);
+    CHECK(first[0] == 71);
    }
-   if (first) { pool.Free(first,small,64); first=nullptr; }
-   pool.quiesce(); allowance={};
-   CHECK(pipeline.execution().snapshot().leased>=kParquetPoolBytes);
-   CHECK(second==stable); CHECK(second[0]==93);
-   pool.Free(second,small,64); second=nullptr;
-   CHECK(pool.retained_capacity()==0);
-   CHECK(pipeline.execution().snapshot().leased==0);
+   pool.begin_call();
+   std::uint8_t* rejected = nullptr;
+   CHECK(pool.Allocate(kParquetPoolBytes, 64, &rejected).IsOutOfMemory());
+   CHECK(pool.fragmented_extent() == 0);
+   CHECK(rejected == nullptr);
+   if (moving) {
+    CHECK(pool.Reallocate(small, kParquetPoolBytes, 64, &first).IsOutOfMemory());
+    CHECK(pool.fragmented_extent() == 0);
+    CHECK(first == first_address);
+   }
+   if (first) {
+    pool.Free(first, small, 64);
+    first = nullptr;
+   }
+   pool.quiesce();
+   allowance = {};
+   CHECK(pipeline.execution().snapshot().leased >= kParquetPoolBytes);
+   CHECK(second == stable);
+   CHECK(second[0] == 93);
+   pool.Free(second, small, 64);
+   second = nullptr;
+   CHECK(pool.retained_capacity() == 0);
+   CHECK(pipeline.execution().snapshot().leased == 0);
   } else {
    REQUIRE(status.ok());
-   CHECK(pool.bytes_allocated()==small+large);
-   CHECK(pool.max_memory()<=static_cast<std::int64_t>(kParquetPoolBytes));
-   CHECK(pool.retained_capacity()==retry_bytes);
-   CHECK(pipeline.execution().snapshot().exceptional>=retry_bytes);
-   if (moving) { CHECK(first[0]==71); next=std::exchange(first,nullptr); }
-   pool.Free(next,large,64); next=nullptr;
-   pool.Free(second,small,64); second=nullptr;
-   pool.close(); allowance={};
-   CHECK(pipeline.execution().snapshot().exceptional==0);
+   CHECK(pool.bytes_allocated() == small + large);
+   CHECK(pool.max_memory() <= static_cast<std::int64_t>(kParquetPoolBytes));
+   CHECK(pool.retained_capacity() == retry_bytes);
+   CHECK(pipeline.execution().snapshot().exceptional >= retry_bytes);
+   if (moving) {
+    CHECK(first[0] == 71);
+    next = std::exchange(first, nullptr);
+   }
+   pool.Free(next, large, 64);
+   next = nullptr;
+   pool.Free(second, small, 64);
+   second = nullptr;
+   pool.close();
+   allowance = {};
+   CHECK(pipeline.execution().snapshot().exceptional == 0);
   }
  }
- CHECK(pipeline.execution().snapshot().exceptional_peak>locked);
- CHECK(pipeline.execution().snapshot().normal_locked==locked);
+ CHECK(pipeline.execution().snapshot().exceptional_peak > locked);
+ CHECK(pipeline.execution().snapshot().normal_locked == locked);
 }
-
 TEST_CASE("large projected Parquet batches keep the opened generation through staging and interruption", "[benchmark][coconut][parquet][resources]") {
  using namespace mmltk::backend::data::detail;
- const bool interrupt=GENERATE(false,true);
+ const bool interrupt = GENERATE(false, true);
  ScopedTempDir root("parquet-opened-projection");
- const std::array paths{root.path()/"rows.parquet"};
- Json rows=Json::array();
+ const std::array paths{root.path() / "rows.parquet"};
+ Json rows = Json::array();
  // Distinct compressible payloads exercise Arrow's growth and moving copies
  // without requiring a large encoded file or changing its ordinary allocator.
- for (unsigned id=1;id<=16;++id) rows.push_back(hf_row(id,std::string((8+(id%3))*1024*1024,static_cast<char>(id)),Json::array(),1,1));
+ for (unsigned id = 1; id <= 16; ++id) rows.push_back(hf_row(id, std::string((8 + (id % 3)) * 1024 * 1024, static_cast<char>(id)), Json::array(), 1, 1));
  parquet::WriterProperties::Builder writer;
- writer.compression(parquet::Compression::ZSTD); writer.disable_dictionary(); writer.write_batch_size(1);
- parquet_file(paths.front(),rows,hf_schema(),parquet::Compression::ZSTD,16,parquet::default_arrow_writer_properties(),writer.build());
- rows=Json{};
- const std::array<CompileWorkspaceProfile,1> profiles{{{64U<<10,0}}};
- auto plan=std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1,profiles,kParquetPoolBytes,0));
- BenchmarkCompilePipeline pipeline(1,{}, {.descriptors=13,.workspace_plan=plan},{},[](std::string_view,const Json&) {});
- const auto locked=pipeline.execution().snapshot().normal_locked;
+ writer.compression(parquet::Compression::ZSTD);
+ writer.disable_dictionary();
+ writer.write_batch_size(1);
+ parquet_file(paths.front(), rows, hf_schema(), parquet::Compression::ZSTD, 16, parquet::default_arrow_writer_properties(), writer.build());
+ rows = Json{};
+ const std::array<CompileWorkspaceProfile, 1> profiles{{{64U << 10, 0}}};
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, profiles, kParquetPoolBytes, 0));
+ BenchmarkCompilePipeline pipeline(1, {}, {.descriptors = 13, .workspace_plan = plan}, {}, [](std::string_view, const Json&) {});
+ const auto locked = pipeline.execution().snapshot().normal_locked;
  CoconutAnnotationRecords retained;
- retained.staging_directory=root.path()/"staging";
+ retained.staging_directory = root.path() / "staging";
  std::atomic<bool> cancelled{false};
- const auto cancellation=mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- unsigned accepted=0;
+ const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ unsigned accepted = 0;
  std::vector<CoconutAnnotationInput> durable;
- const auto consume=[&](std::size_t,const CoconutRecord& record,const CoconutAnnotationInput& input) {
+ const auto consume = [&](std::size_t, const CoconutRecord& record, const CoconutAnnotationInput& input) {
   if (input.membership) return;
-  require_condition(record.image_id==++accepted,"physical replay duplicated or reordered a row");
-  require_condition(input.png.size()==(8+(record.image_id%3))*1024*1024,"physical replay changed the opened payload extent");
-  require_condition(input.png.front()==record.image_id && input.png.back()==record.image_id,"physical replay changed the opened payload");
-  require_condition(pipeline.execution().snapshot().exceptional==0,"exceptional source backing escaped into semantic admission");
-  durable.push_back(input); durable.back().admitted={};
-  if (accepted==1) {
-   std::filesystem::rename(paths.front(),root.path()/"opened.parquet");
-   mmltk::testsupport::write_text_file(paths.front(),"replacement must never be opened");
+  require_condition(record.image_id == ++accepted, "physical replay duplicated or reordered a row");
+  require_condition(input.png.size() == (8 + (record.image_id % 3)) * 1024 * 1024, "physical replay changed the opened payload extent");
+  require_condition(input.png.front() == record.image_id && input.png.back() == record.image_id, "physical replay changed the opened payload");
+  require_condition(pipeline.execution().snapshot().exceptional == 0, "exceptional source backing escaped into semantic admission");
+  durable.push_back(input);
+  durable.back().admitted = {};
+  if (accepted == 1) {
+   std::filesystem::rename(paths.front(), root.path() / "opened.parquet");
+   mmltk::testsupport::write_text_file(paths.front(), "replacement must never be opened");
   }
-  if (interrupt && accepted==8) cancelled.store(true);
+  if (interrupt && accepted == 8) cancelled.store(true);
  };
- unsigned replays=0;
- bool replay_retired=true;
- const BenchmarkTraceSink trace=[&](std::string_view event,const Json& value) {
-  if (event!="benchmark.coconut.projection_replay") return;
+ unsigned replays = 0;
+ bool replay_retired = true;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const Json& value) {
+  if (event != "benchmark.coconut.projection_replay") return;
   ++replays;
-  replay_retired=replay_retired && value.at("exceptional").get<std::uint64_t>()==0 && value.at("normal_locked").get<std::uint64_t>()==locked;
+  replay_retired = replay_retired && value.at("exceptional").get<std::uint64_t>() == 0 && value.at("normal_locked").get<std::uint64_t>() == locked;
  };
  // Every completed batch is durably transferred, so even a one-source-window
  // session can resume its physical prefix while earlier inputs stay readable.
- const auto run=[&] { read_coconut_parquet(paths,{},cancellation,consume,false,&pipeline.execution(), &pipeline.files(),{}, {},&retained,{},
-  [](const CoconutRecord&,std::span<const std::uint8_t>) { return true; },trace); };
- if (interrupt) { CHECK_THROWS(run()); CHECK(accepted==8); }
- else { REQUIRE_NOTHROW(run()); CHECK(accepted==16); }
- for (unsigned i=0;i<durable.size();++i) {
-  CHECK(durable[i].png.front()==i+1); CHECK(durable[i].png.back()==i+1);
+ const auto run = [&] {
+  read_coconut_parquet(
+   paths, {}, cancellation, consume, false, &pipeline.execution(), &pipeline.files(), {}, {}, &retained, {}, [](const CoconutRecord&, std::span<const std::uint8_t>) { return true; }, trace);
+ };
+ if (interrupt) {
+  CHECK_THROWS(run());
+  CHECK(accepted == 8);
+ } else {
+  REQUIRE_NOTHROW(run());
+  CHECK(accepted == 16);
+ }
+ for (unsigned i = 0; i < durable.size(); ++i) {
+  CHECK(durable[i].png.front() == i + 1);
+  CHECK(durable[i].png.back() == i + 1);
   CHECK(retained.row(i).complete());
  }
- CHECK(pipeline.execution().snapshot().normal_locked==locked);
- CHECK(pipeline.execution().snapshot().exceptional==0);
+ CHECK(pipeline.execution().snapshot().normal_locked == locked);
+ CHECK(pipeline.execution().snapshot().exceptional == 0);
  CHECK(replay_retired);
- if (replays) CHECK(pipeline.execution().snapshot().exceptional_peak>locked);
+ if (replays) CHECK(pipeline.execution().snapshot().exceptional_peak > locked);
 }
-
 TEST_CASE("native staging and arena retirement precede controller settlement", "[benchmark][coconut][annotations][recovery][resources]") {
  using namespace mmltk::backend::data::detail;
  using namespace std::chrono_literals;
- if (mmltk::common::system::allowed_cpu_set().size()<3) SKIP("requires an Extraction floor and two Annotation lanes");
- const bool recovery=GENERATE(false,true);
+ if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires an Extraction floor and two Annotation lanes");
+ const bool recovery = GENERATE(false, true);
  CAPTURE(recovery);
  ScopedTempDir root("coconut-task-staging");
- const std::array<CompileWorkspaceProfile,1> profiles{{{1U<<20,0}}};
- auto plan=std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(3,profiles,kParquetPoolBytes,0,kParquetPoolBytes+(2U<<20)));
- REQUIRE(plan->contexts==2);
- BenchmarkCompilePipeline pipeline(3,{}, {.descriptors=13,.workspace_plan=plan});
- const std::array physical{coco(1),coco(2)};
- auto input=request(physical);
- input.execution=&pipeline; input.inventory_directory=root.path()/"staging"; input.records=std::make_shared<CoconutAnnotationRecords>();
- input.parquet_shards={root.path()/"rows.parquet"};
- const std::array<std::uint32_t,1> foreground{1};
- const auto encoded=png(1,1,foreground);
- const auto segments=Json::array({segment(),segment(2)});
- parquet_file(input.parquet_shards.front(),Json::array({hf_row(1,encoded,segments,1,1),hf_row(2,encoded,segments,1,1)}),hf_schema(),parquet::Compression::SNAPPY,2);
+ const std::array<CompileWorkspaceProfile, 1> profiles{{{1U << 20, 0}}};
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(3, profiles, kParquetPoolBytes, 0, kParquetPoolBytes + (2U << 20)));
+ REQUIRE(plan->contexts == 2);
+ BenchmarkCompilePipeline pipeline(3, {}, {.descriptors = 13, .workspace_plan = plan});
+ const std::array physical{coco(1), coco(2)};
+ auto input = request(physical);
+ input.execution = &pipeline;
+ input.inventory_directory = root.path() / "staging";
+ input.records = std::make_shared<CoconutAnnotationRecords>();
+ input.parquet_shards = {root.path() / "rows.parquet"};
+ const std::array<std::uint32_t, 1> foreground{1};
+ const auto encoded = png(1, 1, foreground);
+ const auto segments = Json::array({segment(), segment(2)});
+ parquet_file(input.parquet_shards.front(), Json::array({hf_row(1, encoded, segments, 1, 1), hf_row(2, encoded, segments, 1, 1)}), hf_schema(), parquet::Compression::SNAPPY, 2);
  CompileExecution::CompletionSource originals;
  std::atomic<bool> terminal{false};
- if (recovery) input.originals=[&](CoconutImageNamespace,bool,std::stop_token) { return CoconutOriginalReadiness{{},terminal.load(),1,originals.completion()}; };
- std::promise<void> projected,staged;
+ if (recovery) input.originals = [&](CoconutImageNamespace, bool, std::stop_token) { return CoconutOriginalReadiness{{}, terminal.load(), 1, originals.completion()}; };
+ std::promise<void> projected, staged;
  std::atomic<unsigned> normalized{0};
- input.input_finished=[&] { mmltk::testsupport::release_test_promise(projected); };
- mmltk::testsupport::TestGate settlement("first immutable image waits in controller publication"),first_work("first work waits for its independent sibling"),second("second image has not staged its native ranges");
- input.progress=[&](std::uint64_t count) { if (count==1) settlement.receipt().ArriveAndWait(); };
- input.rejected_object=[&](const auto&,const CoconutRecord& record,const auto&,auto,auto) { (record.image_id==1 ? first_work : second).receipt().ArriveAndWait(); };
- input.trace=[&](std::string_view event,const Json& value) {
-  const auto kind=recovery ? CompileTaskKind::Recovery : CompileTaskKind::Normalize;
-  if (event=="benchmark.coconut.native_staged" && value.at("kind")==CompileTaskKind::Normalize) ++normalized;
-  if (event=="benchmark.coconut.native_staged" && value.at("image_id")==2 && value.at("kind")==kind) {
-   require_condition(pipeline.execution().on_lane(),"native output copied outside an admitted task");
-   require_condition(value.at("boxes")==1 && value.at("runs")==1,"staging omitted live native spans");
+ input.input_finished = [&] { mmltk::testsupport::release_test_promise(projected); };
+ mmltk::testsupport::TestGate settlement("first immutable image waits in controller publication"), first_work("first work waits for its independent sibling"),
+  second("second image has not staged its native ranges");
+ input.progress = [&](std::uint64_t count) {
+  if (count == 1) settlement.receipt().ArriveAndWait();
+ };
+ input.rejected_object = [&](const auto&, const CoconutRecord& record, const auto&, auto, auto) { (record.image_id == 1 ? first_work : second).receipt().ArriveAndWait(); };
+ input.trace = [&](std::string_view event, const Json& value) {
+  const auto kind = recovery ? CompileTaskKind::Recovery : CompileTaskKind::Normalize;
+  if (event == "benchmark.coconut.native_staged" && value.at("kind") == CompileTaskKind::Normalize) ++normalized;
+  if (event == "benchmark.coconut.native_staged" && value.at("image_id") == 2 && value.at("kind") == kind) {
+   require_condition(pipeline.execution().on_lane(), "native output copied outside an admitted task");
+   require_condition(value.at("boxes") == 1 && value.at("runs") == 1, "staging omitted live native spans");
    mmltk::testsupport::release_test_promise(staged);
   }
  };
- auto importing=std::async(std::launch::async,[&] { return import_coconut_annotations(input); });
+ auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
  const mmltk::testsupport::ScopedTestCleanup release([&] {
-  first_work.Release(); second.Release(); settlement.Release(); terminal.store(true); originals.settle(); pipeline.execution().cancel();
+  first_work.Release();
+  second.Release();
+  settlement.Release();
+  terminal.store(true);
+  originals.settle();
+  pipeline.execution().cancel();
  });
  if (recovery) {
-  mmltk::testsupport::await_test_promise(projected,"provisional support is immutable before original readiness",5s);
-  CHECK(normalized.load()==2);
-  CHECK_FALSE(input.records->row(0).native()); CHECK_FALSE(input.records->row(1).native());
-  terminal.store(true); originals.settle();
+  mmltk::testsupport::await_test_promise(projected, "provisional support is immutable before original readiness", 5s);
+  CHECK(normalized.load() == 2);
+  CHECK_FALSE(input.records->row(0).native());
+  CHECK_FALSE(input.records->row(1).native());
+  terminal.store(true);
+  originals.settle();
  }
- REQUIRE(first_work.WaitEntered(5s)); REQUIRE(second.WaitEntered(5s));
+ REQUIRE(first_work.WaitEntered(5s));
+ REQUIRE(second.WaitEntered(5s));
  first_work.Release();
  REQUIRE(settlement.WaitEntered(5s));
- const auto first=input.records->row(0).native();
+ const auto first = input.records->row(0).native();
  REQUIRE(first);
- REQUIRE(first->boxes().size()==1); REQUIRE(first->runs().size()==1);
- std::array<std::byte,sizeof(NormalizedBox)> first_box;
- std::array<std::byte,sizeof(RLEPair)> first_run;
- std::memcpy(first_box.data(),first->boxes().data(),first_box.size()); std::memcpy(first_run.data(),first->runs().data(),first_run.size());
+ REQUIRE(first->boxes().size() == 1);
+ REQUIRE(first->runs().size() == 1);
+ std::array<std::byte, sizeof(NormalizedBox)> first_box;
+ std::array<std::byte, sizeof(RLEPair)> first_run;
+ std::memcpy(first_box.data(), first->boxes().data(), first_box.size());
+ std::memcpy(first_run.data(), first->runs().data(), first_run.size());
  // With two normal contexts, the second task owns one and this task can only
  // run if the first output released its workspace before settlement started.
- auto reusing=std::async(std::launch::async,[&] {
-  pipeline.execution().run(CompileTaskKind::Normalize,{.bytes=plan->context_bytes,.supplied_workspace=true},[&](std::size_t) {
-   auto bytes=pipeline.execution().current_allowance().workspace(); std::memset(bytes.data(),0xa5,bytes.size());
+ auto reusing = std::async(std::launch::async, [&] {
+  pipeline.execution().run(CompileTaskKind::Normalize, {.bytes = plan->context_bytes, .supplied_workspace = true}, [&](std::size_t) {
+   auto bytes = pipeline.execution().current_allowance().workspace();
+   std::memset(bytes.data(), 0xa5, bytes.size());
   });
  });
  const mmltk::testsupport::ScopedTestCleanup release_reuse([&] { pipeline.execution().cancel(); });
- mmltk::testsupport::await_test_future(reusing,"completed native arena is reusable while its controller is held",5s);
- CHECK(std::memcmp(first_box.data(),first->boxes().data(),first_box.size())==0);
- CHECK(std::memcmp(first_run.data(),first->runs().data(),first_run.size())==0);
+ mmltk::testsupport::await_test_future(reusing, "completed native arena is reusable while its controller is held", 5s);
+ CHECK(std::memcmp(first_box.data(), first->boxes().data(), first_box.size()) == 0);
+ CHECK(std::memcmp(first_run.data(), first->runs().data(), first_run.size()) == 0);
  second.Release();
- mmltk::testsupport::await_test_promise(staged,"independent admitted work stages while the first settlement is held",5s);
- CHECK(importing.wait_for(0ms)==std::future_status::timeout);
- CHECK(std::distance(std::filesystem::directory_iterator(input.inventory_directory),std::filesystem::directory_iterator{})==1);
+ mmltk::testsupport::await_test_promise(staged, "independent admitted work stages while the first settlement is held", 5s);
+ CHECK(importing.wait_for(0ms) == std::future_status::timeout);
+ CHECK(std::distance(std::filesystem::directory_iterator(input.inventory_directory), std::filesystem::directory_iterator{}) == 1);
  settlement.Release();
- const auto components=mmltk::testsupport::await_test_future(importing,"staged native products gather after publication resumes",5s);
- REQUIRE(components.size()==1); CHECK(components.front().index().image_count()==2); CHECK(components.front().index().box_count()==2);
- CHECK(pipeline.execution().snapshot().leased==0);
+ const auto components = mmltk::testsupport::await_test_future(importing, "staged native products gather after publication resumes", 5s);
+ REQUIRE(components.size() == 1);
+ CHECK(components.front().index().image_count() == 2);
+ CHECK(components.front().index().box_count() == 2);
+ CHECK(pipeline.execution().snapshot().leased == 0);
  input.records->staging->retire();
- CHECK(first->runs().front().length==1);
- CHECK(std::memcmp(first_box.data(),first->boxes().data(),first_box.size())==0);
+ CHECK(first->runs().front().length == 1);
+ CHECK(std::memcmp(first_box.data(), first->boxes().data(), first_box.size()) == 0);
 }
-
 TEST_CASE("native pending output keeps its arena while a full file queue leaves CPU work runnable", "[benchmark][coconut][annotations][resources]") {
  using namespace mmltk::backend::data::detail;
  using namespace std::chrono_literals;
- if (mmltk::common::system::allowed_cpu_set().size()<3) SKIP("requires independent Extraction Annotation and Output grants");
- const auto stop=GENERATE(0,1,2);
+ if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires independent Extraction Annotation and Output grants");
+ const auto stop = GENERATE(0, 1, 2);
  CAPTURE(stop);
  ScopedTempDir root("coconut-pending-preparation");
- const std::array<CompileWorkspaceProfile,1> profiles{{{1U<<20,0}}};
- auto plan=std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(3,profiles,kParquetPoolBytes,0,kParquetPoolBytes+(1U<<20)));
- REQUIRE(plan->contexts==1);
- BenchmarkCompilePipeline pipeline(3,{}, {.descriptors=13,.workspace_plan=plan});
+ const std::array<CompileWorkspaceProfile, 1> profiles{{{1U << 20, 0}}};
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(3, profiles, kParquetPoolBytes, 0, kParquetPoolBytes + (1U << 20)));
+ REQUIRE(plan->contexts == 1);
+ BenchmarkCompilePipeline pipeline(3, {}, {.descriptors = 13, .workspace_plan = plan});
  const std::array physical{coco(7)};
- auto input=request(physical);
- input.execution=&pipeline; input.inventory_directory=root.path()/"staging";
- input.records=std::make_shared<CoconutAnnotationRecords>();
+ auto input = request(physical);
+ input.execution = &pipeline;
+ input.inventory_directory = root.path() / "staging";
+ input.records = std::make_shared<CoconutAnnotationRecords>();
  // The parsed segments exhaust this block, so native output must prepare a
  // new range after normalization, while retaining its exact supplied scratch.
- input.records->identity=input.input_identity;
- input.records->staging=std::make_shared<CoconutStaging>(input.inventory_directory,&pipeline.storage(),1);
- input.parquet_shards={root.path()/"row.parquet"};
- const std::array<std::uint32_t,1> pixel{1};
- parquet_file(input.parquet_shards.front(),Json::array({hf_row(7,png(1,1,pixel),Json::array({segment(),segment(2)}),1,1)}));
+ input.records->identity = input.input_identity;
+ input.records->staging = std::make_shared<CoconutStaging>(input.inventory_directory, &pipeline.storage(), 1);
+ input.parquet_shards = {root.path() / "row.parquet"};
+ const std::array<std::uint32_t, 1> pixel{1};
+ parquet_file(input.parquet_shards.front(), Json::array({hf_row(7, png(1, 1, pixel), Json::array({segment(), segment(2)}), 1, 1)}));
  mmltk::testsupport::TestGate physical_call("held physical file service");
  std::promise<void> full;
- std::atomic<unsigned> accepted{0},settled{0};
- input.rejected_object=[&](const auto&,const auto&,const auto&,auto,auto) {
+ std::atomic<unsigned> accepted{0}, settled{0};
+ input.rejected_object = [&](const auto&, const auto&, const auto&, auto, auto) {
   for (;;) {
-   auto operation=pipeline.files().try_submit({.completed=[&](std::exception_ptr) { ++settled; },
-    .work=[receipt=physical_call.receipt()] { receipt.ArriveAndWait(); }});
+   auto operation = pipeline.files().try_submit({.completed = [&](std::exception_ptr) { ++settled; }, .work = [receipt = physical_call.receipt()] { receipt.ArriveAndWait(); }});
    if (!operation) break;
    ++accepted;
   }
   mmltk::testsupport::release_test_promise(full);
  };
- auto importing=std::async(std::launch::async,[&] { return import_coconut_annotations(input); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { physical_call.Release(); pipeline.execution().cancel(); });
- mmltk::testsupport::await_test_promise(full,"normalization fills the bounded physical queue",5s);
+ auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  physical_call.Release();
+  pipeline.execution().cancel();
+ });
+ mmltk::testsupport::await_test_promise(full, "normalization fills the bounded physical queue", 5s);
  REQUIRE(physical_call.WaitEntered(5s));
- CHECK(accepted.load()==6);
- auto independent=std::async(std::launch::async,[&] { pipeline.execution().run(CompileTaskKind::Normalize,{},[](std::size_t) {}); });
- const mmltk::testsupport::ScopedTestCleanup release_independent([&] { physical_call.Release(); pipeline.execution().cancel(); });
- mmltk::testsupport::await_test_future(independent,"CPU work enters while native output waits for file capacity",5s);
- CHECK_FALSE(pipeline.execution().try_reserve({.bytes=plan->context_bytes,.supplied_workspace=true}));
- CHECK(importing.wait_for(0ms)==std::future_status::timeout);
- if (stop==1) pipeline.files().cancel();
- if (stop==2) pipeline.execution().cancel();
+ CHECK(accepted.load() == 6);
+ auto independent = std::async(std::launch::async, [&] { pipeline.execution().run(CompileTaskKind::Normalize, {}, [](std::size_t) {}); });
+ const mmltk::testsupport::ScopedTestCleanup release_independent([&] {
+  physical_call.Release();
+  pipeline.execution().cancel();
+ });
+ mmltk::testsupport::await_test_future(independent, "CPU work enters while native output waits for file capacity", 5s);
+ CHECK_FALSE(pipeline.execution().try_reserve({.bytes = plan->context_bytes, .supplied_workspace = true}));
+ CHECK(importing.wait_for(0ms) == std::future_status::timeout);
+ if (stop == 1) pipeline.files().cancel();
+ if (stop == 2) pipeline.execution().cancel();
  physical_call.Release();
- if (stop) CHECK_THROWS(mmltk::testsupport::await_test_future(importing,"cancelled or rejected preparation settles its native owner",5s));
+ if (stop)
+  CHECK_THROWS(mmltk::testsupport::await_test_future(importing, "cancelled or rejected preparation settles its native owner", 5s));
  else {
-  const auto components=mmltk::testsupport::await_test_future(importing,"pending preparation resumes and publishes immutable output",5s);
-  REQUIRE(components.size()==1); REQUIRE(components.front().index().box_count()==1);
-  CHECK(components.front().index().storage().mask_rle_pairs.front().length==1);
+  const auto components = mmltk::testsupport::await_test_future(importing, "pending preparation resumes and publishes immutable output", 5s);
+  REQUIRE(components.size() == 1);
+  REQUIRE(components.front().index().box_count() == 1);
+  CHECK(components.front().index().storage().mask_rle_pairs.front().length == 1);
  }
  pipeline.files().join();
- CHECK(settled.load()==accepted.load());
- input.records->discard(); // Failure retains the independently valid source generation until its owner retires it.
- CHECK(pipeline.execution().snapshot().leased==0);
- CHECK(pipeline.execution().resource_usage().descriptors==0);
+ CHECK(settled.load() == accepted.load());
+ input.records->discard();  // Failure retains the independently valid source generation until its owner retires it.
+ CHECK(pipeline.execution().snapshot().leased == 0);
+ CHECK(pipeline.execution().resource_usage().descriptors == 0);
 }
-
 TEST_CASE("accepted staging preparation retains charged custody through physical cancellation drain", "[benchmark][coconut][resources]") {
  using namespace mmltk::backend::data::detail;
  using namespace std::chrono_literals;
- if (mmltk::common::system::allowed_cpu_set().size()<2) SKIP("requires independent file and semantic grants");
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires independent file and semantic grants");
  ScopedTempDir root("coconut-accepted-preparation");
- CompileExecution execution(2,{}, {.transient_bytes=65536,.descriptors=4});
- FileWorkQueue files(execution,1);
+ CompileExecution execution(2, {}, {.transient_bytes = 65536, .descriptors = 4});
+ FileWorkQueue files(execution, 1);
  CoconutStaging staging(root.path());
- struct Preparation { CompileAllowance descriptor; CoconutStaging::Request range{32,16}; };
- auto context=std::make_shared<Preparation>();
- context->descriptor=execution.reserve(CompileResources::handles(1));
- std::weak_ptr<Preparation> lifetime=context;
+ struct Preparation {
+  CompileAllowance descriptor;
+  CoconutStaging::Request range{32, 16};
+ };
+ auto context = std::make_shared<Preparation>();
+ context->descriptor = execution.reserve(CompileResources::handles(1));
+ std::weak_ptr<Preparation> lifetime = context;
  std::shared_ptr<Preparation> prepared;
  std::atomic<unsigned> settlements{0};
  mmltk::testsupport::TestGate physical("accepted preparation still owns its descriptor and target");
- auto completion=files.try_submit({.completed=[&,context](std::exception_ptr error) {
-  require_condition(!error,"running preparation was settled before physical return");
-  prepared=context; ++settlements;
- },.work=[&,context] { physical.receipt().ArriveAndWait(); staging.prepare(context->range,context->descriptor); }});
- const mmltk::testsupport::ScopedTestCleanup release([&] { physical.Release(); files.cancel(); files.join(); });
- REQUIRE(completion); REQUIRE(physical.WaitEntered(5s));
+ auto completion = files.try_submit({.completed = [&, context](std::exception_ptr error) {
+  require_condition(!error, "running preparation was settled before physical return");
+  prepared = context;
+  ++settlements;
+ }, .work = [&, context] {
+  physical.receipt().ArriveAndWait();
+  staging.prepare(context->range, context->descriptor);
+ }});
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  physical.Release();
+  files.cancel();
+  files.join();
+ });
+ REQUIRE(completion);
+ REQUIRE(physical.WaitEntered(5s));
  context.reset();
- CHECK_FALSE(lifetime.expired()); CHECK(execution.resource_usage().descriptors==1);
- CHECK_FALSE(files.try_submit({.work=[] {}}));
- auto sibling=std::async(std::launch::async,[&] { execution.run(CompileTaskKind::Normalize,{},[](std::size_t) {}); });
- const mmltk::testsupport::ScopedTestCleanup release_sibling([&] { physical.Release(); execution.cancel(); });
- mmltk::testsupport::await_test_future(sibling,"independent CPU task passes held physical staging",5s);
+ CHECK_FALSE(lifetime.expired());
+ CHECK(execution.resource_usage().descriptors == 1);
+ CHECK_FALSE(files.try_submit({.work = [] {}}));
+ auto sibling = std::async(std::launch::async, [&] { execution.run(CompileTaskKind::Normalize, {}, [](std::size_t) {}); });
+ const mmltk::testsupport::ScopedTestCleanup release_sibling([&] {
+  physical.Release();
+  execution.cancel();
+ });
+ mmltk::testsupport::await_test_future(sibling, "independent CPU task passes held physical staging", 5s);
  files.cancel();
- CHECK_FALSE(completion->ready()); CHECK_FALSE(lifetime.expired());
- CHECK_THROWS(files.try_submit({.work=[] {}}));
- physical.Release(); completion->wait(); files.join();
- REQUIRE(prepared); CHECK(prepared->range.ready()); CHECK(settlements.load()==1);
- prepared->descriptor={}; CHECK(execution.resource_usage().descriptors==0);
- execution.run(CompileTaskKind::Normalize,{},[&](std::size_t) { std::memset(prepared->range.target().data(),0x46,32); });
- auto immutable=prepared->range.bytes();
- prepared.reset(); staging.retire();
- CHECK(lifetime.expired()); CHECK(immutable.values.front()==std::byte{0x46});
+ CHECK_FALSE(completion->ready());
+ CHECK_FALSE(lifetime.expired());
+ CHECK_THROWS(files.try_submit({.work = [] {}}));
+ physical.Release();
+ completion->wait();
+ files.join();
+ REQUIRE(prepared);
+ CHECK(prepared->range.ready());
+ CHECK(settlements.load() == 1);
+ prepared->descriptor = {};
+ CHECK(execution.resource_usage().descriptors == 0);
+ execution.run(CompileTaskKind::Normalize, {}, [&](std::size_t) { std::memset(prepared->range.target().data(), 0x46, 32); });
+ auto immutable = prepared->range.bytes();
+ prepared.reset();
+ staging.retire();
+ CHECK(lifetime.expired());
+ CHECK(immutable.values.front() == std::byte{0x46});
  CHECK_FALSE(std::filesystem::is_empty(root.path()));
- immutable={}; CHECK(std::filesystem::is_empty(root.path()));
+ immutable = {};
+ CHECK(std::filesystem::is_empty(root.path()));
 }
-
 TEST_CASE("component planning and physical output retain their admitted custody", "[benchmark][coconut][annotations][resources]") {
  using namespace mmltk::backend::data::detail;
  using namespace std::chrono_literals;
@@ -9858,15 +10045,16 @@ TEST_CASE("component planning and physical output retain their admitted custody"
     if (state.running[static_cast<std::size_t>(CompileWorkClass::Annotations)] && !planned.exchange(true)) metadata.receipt().ArriveAndWait();
     if (state.running[static_cast<std::size_t>(CompileWorkClass::Gather)]) gathered = true;
    } else if (std::this_thread::get_id() != controller && execution.snapshot().services) {
-    if (!metadata_only && !prepared.exchange(true)) preparation.receipt().ArriveAndWait();
-    else if (!sealed.exchange(true)) sealing.receipt().ArriveAndWait();
+    if (!metadata_only && !prepared.exchange(true))
+     preparation.receipt().ArriveAndWait();
+    else if (!sealed.exchange(true))
+     sealing.receipt().ArriveAndWait();
    }
    return stop.load();
   }
  } observation{pipeline.execution(), allowance, metadata, preparation, sealing, metadata_only, {}};
  std::vector<CoconutComponentImage> rows;
- for (std::size_t i : {std::size_t{1}, std::size_t{0}})
-  rows.push_back({&source, &source.index, &source.index.images[i], {}, {}, &source.inventory[i], nullptr, 0});
+ for (std::size_t i : {std::size_t{1}, std::size_t{0}}) rows.push_back({&source, &source.index, &source.index.images[i], {}, {}, &source.inventory[i], nullptr, 0});
  const std::array<std::size_t, 2> ordinals{20, 10};
  auto assembling = std::async(std::launch::async, [&] {
   observation.controller = std::this_thread::get_id();
@@ -9874,7 +10062,10 @@ TEST_CASE("component planning and physical output retain their admitted custody"
    mmltk::common::concurrency::CancellationObservation::Borrow(observation), &pipeline.storage(), &pipeline, allowance, false, {});
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] {
-  metadata.Release(); preparation.Release(); sealing.Release(); pipeline.execution().cancel();
+  metadata.Release();
+  preparation.Release();
+  sealing.Release();
+  pipeline.execution().cancel();
  });
  REQUIRE(metadata.WaitEntered(5s));
  CHECK(pipeline.execution().snapshot().running[static_cast<std::size_t>(CompileWorkClass::Annotations)] == 1);
@@ -9902,7 +10093,8 @@ TEST_CASE("component planning and physical output retain their admitted custody"
   sealing.Release();
  }
  CHECK(observation.charged.load());
- if (failure) CHECK_THROWS(mmltk::testsupport::await_test_future(assembling, "failed planning or inventory sealing cannot complete a component", 5s));
+ if (failure)
+  CHECK_THROWS(mmltk::testsupport::await_test_future(assembling, "failed planning or inventory sealing cannot complete a component", 5s));
  else {
   const auto component = mmltk::testsupport::await_test_future(assembling, "one controller joins admitted planning, copies and physical output", 5s);
   REQUIRE(component);

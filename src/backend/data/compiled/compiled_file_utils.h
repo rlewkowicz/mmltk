@@ -176,15 +176,16 @@ inline void write_compiled_annotations(
  if (ordinal_base) write_compiled_label_ordinals(file, offset, annotations.labels.size(), annotations.labels, ordinal_base);
  const std::array spans{
   mmltk::common::io::FileHandle::WriteSpan{annotations.labels.data(), ordinal_base ? 0 : annotations.labels.size_bytes()},
-  mmltk::common::io::FileHandle::WriteSpan{&zero,payload.run_offset-annotations.labels.size_bytes()},
-  mmltk::common::io::FileHandle::WriteSpan{annotations.runs.data(),annotations.runs.size_bytes()}};
- file.pwritev_all(spans,offset+(ordinal_base ? annotations.labels.size_bytes() : 0));
+  mmltk::common::io::FileHandle::WriteSpan{&zero, payload.run_offset - annotations.labels.size_bytes()},
+  mmltk::common::io::FileHandle::WriteSpan{annotations.runs.data(), annotations.runs.size_bytes()}
+ };
+ file.pwritev_all(spans, offset + (ordinal_base ? annotations.labels.size_bytes() : 0));
 }
 inline constexpr std::size_t COMPILED_COMPACTION_SCRATCH_BYTES = 4U * 1024U * 1024U;
 struct CompiledStorageMutation {
- std::function<void(std::size_t,std::size_t)> allocate;
- std::function<bool(std::size_t,std::size_t)> reclaim;
- std::function<void(std::size_t)> shrink;
+ std::function<void(std::size_t, std::size_t)> allocate{};
+ std::function<bool(std::size_t, std::size_t)> reclaim{};
+ std::function<void(std::size_t)> shrink{};
 };
 using CompiledCompactionProgress = std::function<void(std::size_t completed_bytes, std::size_t total_bytes)>;
 // All pixel/label borrowers must be drained. Compacts this private staged inode;

@@ -16,18 +16,23 @@
 #include <stop_token>
 #include <utility>
 #include <vector>
-
 namespace mmltk::backend::data::detail {
 enum class CompileTaskKind : std::uint8_t { Acquisition, Metadata, Header, Projection, Archive, Normalize, Recovery, Labels, Pixels, Gather, CacheWrite, Output, Count };
 enum class CompileParkReason : std::uint8_t { None, Dependency, Bytes, Descriptors, Cpu, Withdrawal, Count };
 [[nodiscard]] constexpr CompileWorkClass work_class(CompileTaskKind kind) {
  switch (kind) {
   case CompileTaskKind::Acquisition: return CompileWorkClass::Acquisition;
-  case CompileTaskKind::Header: case CompileTaskKind::Projection: case CompileTaskKind::Archive: return CompileWorkClass::Extraction;
-  case CompileTaskKind::Metadata: case CompileTaskKind::Normalize: case CompileTaskKind::Recovery: case CompileTaskKind::Labels: return CompileWorkClass::Annotations;
+  case CompileTaskKind::Header:
+  case CompileTaskKind::Projection:
+  case CompileTaskKind::Archive: return CompileWorkClass::Extraction;
+  case CompileTaskKind::Metadata:
+  case CompileTaskKind::Normalize:
+  case CompileTaskKind::Recovery:
+  case CompileTaskKind::Labels: return CompileWorkClass::Annotations;
   case CompileTaskKind::Pixels: return CompileWorkClass::Pixels;
   case CompileTaskKind::Gather: return CompileWorkClass::Gather;
-  case CompileTaskKind::CacheWrite: case CompileTaskKind::Output: return CompileWorkClass::Output;
+  case CompileTaskKind::CacheWrite:
+  case CompileTaskKind::Output: return CompileWorkClass::Output;
   case CompileTaskKind::Count: break;
  }
  throw std::invalid_argument("invalid compile task kind");
@@ -69,10 +74,11 @@ class CompileExecution final {
  struct DependencyState;
  using Credits = CompileAllowance::Credits;
  friend class CompileResourceWait;
+
 public:
  using Observer = std::function<void(std::string_view, const CompileExecutionSnapshot&)>;
- explicit CompileExecution(std::size_t workers, std::span<const int> cpus = {}, CompileExecutionLimits = {},
-  mmltk::common::concurrency::CancellationObservation = {}, Observer = {}, std::exception_ptr cancellation_error = {});
+ explicit CompileExecution(std::size_t workers, std::span<const int> cpus = {}, CompileExecutionLimits = {}, mmltk::common::concurrency::CancellationObservation = {}, Observer = {},
+  std::exception_ptr cancellation_error = {});
  ~CompileExecution();
  CompileExecution(const CompileExecution&) = delete;
  CompileExecution& operator=(const CompileExecution&) = delete;
@@ -85,6 +91,7 @@ public:
   Producer(const Producer&) = delete;
   Producer& operator=(const Producer&) = delete;
   void close() noexcept;
+
  private:
   friend class CompileExecution;
   Producer(std::shared_ptr<Impl>, CompileWorkClass);
@@ -104,6 +111,7 @@ public:
   void wait() const;
   void subscribe(std::function<void(std::exception_ptr)>) const;
   void cancel() const noexcept;
+
  private:
   friend class CompileExecution;
   friend class CompletionSource;
@@ -116,6 +124,7 @@ public:
   explicit CompletionSource(CompileExecution* owner = nullptr);
   [[nodiscard]] Completion completion() const { return Completion(state_); }
   void settle(std::exception_ptr = {}) const noexcept;
+
  private:
   std::shared_ptr<CompletionState> state_;
  };
@@ -124,6 +133,7 @@ public:
   explicit Dependency(CompileExecution&);
   [[nodiscard]] std::uint64_t generation() const;
   void notify() noexcept;
+
  private:
   friend class CompileExecution;
   friend struct Impl;
@@ -138,6 +148,7 @@ public:
   ~Workspace();
   Workspace(const Workspace&) = delete;
   Workspace& operator=(const Workspace&) = delete;
+
  private:
   friend class CompileExecution;
   friend struct Impl;
@@ -149,13 +160,13 @@ public:
  struct Task {
   CompileTaskKind kind = CompileTaskKind::Metadata;
   CompileResources resources{};
-  std::function<void(std::size_t, const CompileAllowance&)> work;
+  std::function<void(std::size_t, const CompileAllowance&)> work{};
   CompileAllowance allowance{}, parent{};
   Workspace* workspace = nullptr;
   // Only bounded consumers with retained immutable inputs may draw finite loans.
   bool finite_consumer = false;
   bool retain_workspace = true;
-  std::function<void(std::exception_ptr)> completed;
+  std::function<void(std::exception_ptr)> completed{};
  };
  [[nodiscard]] std::optional<Completion> try_submit(Task);
  [[nodiscard]] Completion submit(Task);
@@ -207,6 +218,7 @@ public:
    Attempt(const Attempt&) = delete;
    Attempt& operator=(const Attempt&) = delete;
    void commit() noexcept { committed_ = true; }
+
   private:
    friend struct Impl;
    static thread_local Attempt* current_;
@@ -214,6 +226,7 @@ public:
    Attempt* previous_;
    bool resources_ = false, pressure_ = false, committed_ = false;
   };
+
  private:
   struct State;
   friend struct Impl;
@@ -245,6 +258,7 @@ public:
   ServiceGrant& operator=(const ServiceGrant&) = delete;
   [[nodiscard]] int cpu() const noexcept;
   [[nodiscard]] CompileWorkClass work_class() const noexcept { return class_; }
+
  private:
   friend class CompileExecution;
   friend class ServiceDemand;
@@ -268,6 +282,7 @@ public:
   // Success clears this demand. Failure keeps it armed and publishes no change;
   // the caller waits on Readiness before probing again. Serialize owner access.
   [[nodiscard]] std::optional<ServiceGrant> try_grant(std::stop_token local_stop = {});
+
  private:
   friend class CompileExecution;
   void update_locked(const Classes&) noexcept;
@@ -277,6 +292,7 @@ public:
  };
  // A local stop interrupts only this grant wait and never cancels the session.
  [[nodiscard]] ServiceGrant service_grant(CompileWorkClass, std::stop_token local_stop = {});
+
 private:
  void retire_workspace(Workspace*) noexcept;
  [[nodiscard]] std::optional<Completion> submit_impl(Task, const std::shared_ptr<DependencyState>&, std::uint64_t);
@@ -288,9 +304,10 @@ public:
  ~CompileResourceWait();
  CompileResourceWait(const CompileResourceWait&) = delete;
  CompileResourceWait& operator=(const CompileResourceWait&) = delete;
+
 private:
  friend class CompileExecution;
  explicit CompileResourceWait(std::shared_ptr<CompileAdmission>);
  std::shared_ptr<CompileAdmission> owner_;
 };
-}
+}  // namespace mmltk::backend::data::detail

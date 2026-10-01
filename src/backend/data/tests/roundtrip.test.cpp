@@ -17,6 +17,7 @@
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <cstdio>
 #include <cstdlib>
@@ -571,9 +572,8 @@ void exercise_used_ranges(const std::string& path) {
  while (const auto range = cursor.next(stride / 3 + 1)) {
   auto& destination = range->section == CompiledDataset::ReadSection::Pixels ? pixels : labels;
   (range->section == CompiledDataset::ReadSection::Pixels ? copied_pixels : copied_labels) += range->bytes;
-  source.gather_range(*range, {destination.data(), destination.size(), [](void* context, std::size_t offset, std::span<const std::byte> bytes) {
-   std::memcpy(static_cast<std::byte*>(context) + offset, bytes.data(), bytes.size());
-  }});
+  source.gather_range(*range, {destination.data(), destination.size(),
+                               [](void* context, std::size_t offset, std::span<const std::byte> bytes) { std::memcpy(static_cast<std::byte*>(context) + offset, bytes.data(), bytes.size()); }});
  }
  CHECK(cursor.empty());
  CHECK(copied_pixels == pixels.size());
@@ -601,30 +601,27 @@ void exercise_bounded_gathers(const std::string& path, bool h2d) {
   std::array<unsigned, 2> labels{}, pixels{}, gathers{}, completions{};
   bool ordering_error = false;
  } observation;
- const CompiledImageStream::ReadObserver observer{
-  .context = &observation,
-  .complete = [](void* context, std::size_t slot, std::exception_ptr, bool) noexcept {
-   auto& state = *static_cast<Observation*>(context);
+ const CompiledImageStream::ReadObserver observer{.context = &observation, .complete = [](void* context, std::size_t slot, std::exception_ptr, bool) noexcept {
+  auto& state = *static_cast<Observation*>(context);
+  const std::lock_guard lock(state.mutex);
+  ++state.completions[slot];
+ }, .range = [](void* context, std::size_t slot, CompiledImageStream::ReadOperation operation, const CompiledDataset::UsedRange& range) {
+  auto& state = *static_cast<Observation*>(context);
+  bool hold = false;
+  {
    const std::lock_guard lock(state.mutex);
-   ++state.completions[slot];
-  },
-  .range = [](void* context, std::size_t slot, CompiledImageStream::ReadOperation operation, const CompiledDataset::UsedRange& range) {
-   auto& state = *static_cast<Observation*>(context);
-   bool hold = false;
-   {
-    const std::lock_guard lock(state.mutex);
-    if (operation == CompiledImageStream::ReadOperation::Advice) {
-     state.ordering_error |= state.gathers[slot] != 0;
-     ++(range.section == CompiledDataset::ReadSection::Labels ? state.labels[slot] : state.pixels[slot]);
-    } else if (operation == CompiledImageStream::ReadOperation::Gather) {
-     state.ordering_error |= !state.labels[slot] || !state.pixels[slot];
-     ++state.gathers[slot];
-     hold = slot == 0 && state.gathers[slot] == 1;
-     if (slot == 0 && state.gathers[slot] == 2) state.disjoint.set_value();
-    }
+   if (operation == CompiledImageStream::ReadOperation::Advice) {
+    state.ordering_error |= state.gathers[slot] != 0;
+    ++(range.section == CompiledDataset::ReadSection::Labels ? state.labels[slot] : state.pixels[slot]);
+   } else if (operation == CompiledImageStream::ReadOperation::Gather) {
+    state.ordering_error |= !state.labels[slot] || !state.pixels[slot];
+    ++state.gathers[slot];
+    hold = slot == 0 && state.gathers[slot] == 1;
+    if (slot == 0 && state.gathers[slot] == 2) state.disjoint.set_value();
    }
-   if (hold) state.first.receipt().ArriveAndWait();
-  }};
+  }
+  if (hold) state.first.receipt().ArriveAndWait();
+ }};
  CompiledImageStream stream({.slots = 2, .workers = 2, .device = 0, .loading = data_loading_options(h2d)});
  stream.bind_current_context();
  for (std::size_t slot = 0; slot < 2; ++slot) {
@@ -632,7 +629,11 @@ void exercise_bounded_gathers(const std::string& path, bool h2d) {
   stream.prepare_reads(slot, count, source.header().max_label_bytes);
  }
  std::future<bool> peer, cancelled;
- const mmltk::testsupport::ScopedTestCleanup release([&] { stream.cancel_reads(); observation.first.Release(); stream.wait_reads(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  stream.cancel_reads();
+  observation.first.Release();
+  stream.wait_reads();
+ });
  stream.submit(0, source, reads, observer);
  REQUIRE(observation.first.WaitEntered(std::chrono::seconds{2}));
  if (h2d) mmltk::testsupport::await_test_promise(observation.disjoint, "disjoint chunk enters while its peer is held");
@@ -681,15 +682,18 @@ void exercise_prefault_custody(const std::string& path) {
  }
  std::future<bool> first, second;
  const mmltk::testsupport::ScopedTestCleanup release([&] {
-  observation.physical.Release(); observation.rejection.Release(); stream.cancel_reads(); stream.wait_reads();
+  observation.physical.Release();
+  observation.rejection.Release();
+  stream.cancel_reads();
+  stream.wait_reads();
  });
- const CompiledImageStream::ReadObserver observer{.context = &observation,
-  .complete = [](void* context, std::size_t slot, std::exception_ptr, bool) noexcept { ++static_cast<Observation*>(context)->completed[slot]; },
-  .range = [](void* context, std::size_t slot, CompiledImageStream::ReadOperation operation, const CompiledDataset::UsedRange&) {
-   auto& state = *static_cast<Observation*>(context);
-   if (slot == 0 && operation == CompiledImageStream::ReadOperation::Prefault && !state.held.exchange(true)) state.physical.receipt().ArriveAndWait();
-   if (slot == 1 && operation == CompiledImageStream::ReadOperation::Advice && !state.observed_second.exchange(true)) state.second_advice.set_value();
-  }};
+ const CompiledImageStream::ReadObserver observer{.context = &observation, .complete = [](void* context, std::size_t slot, std::exception_ptr, bool) noexcept {
+  ++static_cast<Observation*>(context)->completed[slot];
+ }, .range = [](void* context, std::size_t slot, CompiledImageStream::ReadOperation operation, const CompiledDataset::UsedRange&) {
+  auto& state = *static_cast<Observation*>(context);
+  if (slot == 0 && operation == CompiledImageStream::ReadOperation::Prefault && !state.held.exchange(true)) state.physical.receipt().ArriveAndWait();
+  if (slot == 1 && operation == CompiledImageStream::ReadOperation::Advice && !state.observed_second.exchange(true)) state.second_advice.set_value();
+ }};
  stream.submit(0, source, reads, observer);
  REQUIRE(observation.physical.WaitEntered(std::chrono::seconds{2}));
  stream.submit(1, source, reads, observer);
@@ -701,8 +705,10 @@ void exercise_prefault_custody(const std::string& path) {
  first = std::async(std::launch::async, [&] { return stream.wait_read(0); });
  second = std::async(std::launch::async, [&] { return stream.wait_read(1); });
  for (const bool all : {false, true}) {
-  if (all) stream.cancel_reads();
-  else stream.cancel_read(1);
+  if (all)
+   stream.cancel_reads();
+  else
+   stream.cancel_read(1);
   CHECK_FALSE(mmltk::testsupport::await_test_future(second, "unadmitted cancellation settles before the held peer"));
   CHECK(first.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
   CHECK(observation.completed[0] == 0);
@@ -724,7 +730,8 @@ void exercise_prefault_custody(const std::string& path) {
  CHECK(observation.completed[1] == 3);
  CHECK(std::memcmp(stream.host_images(1).data(), source.image_pixels(13), stride) == 0);
  stream.submit(0, source, reads, {.context = &observation, .before = [](void* context, std::size_t) {
-  static_cast<Observation*>(context)->rejection.receipt().ArriveAndWait(); return true;
+  static_cast<Observation*>(context)->rejection.receipt().ArriveAndWait();
+  return true;
  }, .complete = observer.complete});
  REQUIRE(observation.rejection.WaitEntered(std::chrono::seconds{2}));
  readers->enqueue_detached([] { throw std::runtime_error("runtime reader admission failed"); });
@@ -1600,20 +1607,21 @@ TEST_CASE("Directory metadata construction preserves empty masks offsets and pub
  }
  // Pixel stores retain the rectangular Directory canvas through the shared
  // checked plan in both numerical policies and both geometry modes.
- for (const auto mode:{mmltk::backend::imaging::resample::ImageResizeMode::Stretch,mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}) {
-  config.resize_mode=mode;
-  for (const bool perceptual:{false,true}) {
-   config.perceptual_downscale=perceptual;
-   const auto plan=DatasetCompiler::prepare(config,{"train"});
-   DatasetCompiler::compile(plan,0);
-   const auto result=CompiledDataset::open(compiled_bin_path(fixture));
-   CHECK(result.header().image_width==16); CHECK(result.header().image_height==8);
-   CHECK(result.image_labels(0)[0].source_ordinal==1);
+ for (const auto mode : {mmltk::backend::imaging::resample::ImageResizeMode::Stretch, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}) {
+  config.resize_mode = mode;
+  for (const bool perceptual : {false, true}) {
+   config.perceptual_downscale = perceptual;
+   const auto plan = DatasetCompiler::prepare(config, {"train"});
+   DatasetCompiler::compile(plan, 0);
+   const auto result = CompiledDataset::open(compiled_bin_path(fixture));
+   CHECK(result.header().image_width == 16);
+   CHECK(result.header().image_height == 8);
+   CHECK(result.image_labels(0)[0].source_ordinal == 1);
   }
  }
- config.resize_mode=mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
- config.perceptual_downscale=false;
- DatasetCompiler::compile(DatasetCompiler::prepare(config,{"train"}),0);
+ config.resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ config.perceptual_downscale = false;
+ DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0);
  // Consumed input errors use the same parser, merge and publication transaction.
  for (const auto malformed :
   {R"({"class":"person","bbox_xyxy":[0,0,4,4],"iscrowd":2})", R"({"class":"person","bbox_xyxy":[0,0,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:4 2:2"})",
@@ -1627,50 +1635,52 @@ TEST_CASE("Directory metadata construction preserves empty masks offsets and pub
 TEST_CASE("compiled scatter output checks bounded vectors and partial physical writes", "[backend][data][storage]") {
  using mmltk::common::io::FileHandle;
  const mmltk::testsupport::ScopedTempDir root("compiled-scatter-write");
- auto file=FileHandle::create_output((root.path()/"scatter").string(),0);
+ auto file = FileHandle::create_output((root.path() / "scatter").string(), 0);
  SECTION("vector batches preserve empty spans and offsets") {
-  std::array<std::uint8_t,40> source{};
-  std::array<FileHandle::WriteSpan,80> spans{};
-  for (std::size_t i=0;i<source.size();++i) { source[i]=static_cast<std::uint8_t>(i); spans[i*2]={&source[i],1}; }
-  file.pwritev_all(spans,17);
-  std::array<std::uint8_t,40> stored{};
-  file.pread_all(stored.data(),stored.size(),17);
-  CHECK(stored==source);
-  CHECK_THROWS(file.pwritev_all(spans,SIZE_MAX-1));
-  CHECK(file.size()==57);
+  std::array<std::uint8_t, 40> source{};
+  std::array<FileHandle::WriteSpan, 80> spans{};
+  for (std::size_t i = 0; i < source.size(); ++i) {
+   source[i] = static_cast<std::uint8_t>(i);
+   spans[i * 2] = {&source[i], 1};
+  }
+  file.pwritev_all(spans, 17);
+  std::array<std::uint8_t, 40> stored{};
+  file.pread_all(stored.data(), stored.size(), 17);
+  CHECK(stored == source);
+  CHECK_THROWS(file.pwritev_all(spans, SIZE_MAX - 1));
+  CHECK(file.size() == 57);
  }
  SECTION("short label write reports the later physical limit error") {
-  const auto layout=compute_file_layout(1,12);
+  const auto layout = compute_file_layout(1, 12);
   PackedInstance label{};
-  label.source_ordinal=83;
+  label.source_ordinal = 83;
   ImageEntry entry{};
-  set_annotation_extent(entry,1,0,"short output");
+  set_annotation_extent(entry, 1, 0, "short output");
   struct rlimit original{};
-  REQUIRE(::getrlimit(RLIMIT_FSIZE,&original)==0);
-  sigset_t blocked{},previous{};
-  REQUIRE(::sigemptyset(&blocked)==0);
-  REQUIRE(::sigaddset(&blocked,SIGXFSZ)==0);
-  REQUIRE(::pthread_sigmask(SIG_BLOCK,&blocked,&previous)==0);
+  REQUIRE(::getrlimit(RLIMIT_FSIZE, &original) == 0);
+  sigset_t blocked{}, previous{};
+  REQUIRE(::sigemptyset(&blocked) == 0);
+  REQUIRE(::sigaddset(&blocked, SIGXFSZ) == 0);
+  REQUIRE(::pthread_sigmask(SIG_BLOCK, &blocked, &previous) == 0);
   const mmltk::testsupport::ScopedTestCleanup restore([&] {
-   (void)::setrlimit(RLIMIT_FSIZE,&original);
+   (void)::setrlimit(RLIMIT_FSIZE, &original);
    timespec immediate{};
-   while (::sigtimedwait(&blocked,nullptr,&immediate)>=0) {}
-   (void)::pthread_sigmask(SIG_SETMASK,&previous,nullptr);
+   while (::sigtimedwait(&blocked, nullptr, &immediate) >= 0) {}
+   (void)::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
   });
-  auto limited=original;
-  limited.rlim_cur=static_cast<rlim_t>(layout.label_offset(0)+17);
-  REQUIRE(limited.rlim_cur<=original.rlim_max);
-  REQUIRE(::setrlimit(RLIMIT_FSIZE,&limited)==0);
-  CHECK_THROWS(write_compiled_annotations(file,layout,0,entry,{{&label,1},{}}));
-  CHECK(file.size()==layout.label_offset(0)+17);
-  std::array<std::byte,17> prefix{};
-  file.pread_all(prefix.data(),prefix.size(),layout.label_offset(0));
-  CHECK(std::memcmp(prefix.data(),&label,prefix.size())==0);
+  auto limited = original;
+  limited.rlim_cur = static_cast<rlim_t>(layout.label_offset(0) + 17);
+  REQUIRE(limited.rlim_cur <= original.rlim_max);
+  REQUIRE(::setrlimit(RLIMIT_FSIZE, &limited) == 0);
+  CHECK_THROWS(write_compiled_annotations(file, layout, 0, entry, {{&label, 1}, {}}));
+  CHECK(file.size() == layout.label_offset(0) + 17);
+  std::array<std::byte, 17> prefix{};
+  file.pread_all(prefix.data(), prefix.size(), layout.label_offset(0));
+  CHECK(std::memcmp(prefix.data(), &label, prefix.size()) == 0);
  }
 }
-
 TEST_CASE("runtime file readiness follows actual capacity return and retains notification custody", "[backend][data][roundtrip]") {
- using detail::FileWorkQueue;
+ using mmltk::backend::data::detail::FileWorkQueue;
  const auto topology = NumaTopology::Capture();
  const auto first_cpu = std::ranges::find(topology.cpus, topology.permitted_cpus.front(), &CpuTopology::cpu);
  const auto placement = resolve_placement(topology, first_cpu->node);
@@ -1680,7 +1690,7 @@ TEST_CASE("runtime file readiness follows actual capacity return and retains not
   FileWorkQueue* files = nullptr;
   mmltk::testsupport::TestGate* notifying = nullptr;
   std::atomic<unsigned> notifications{0}, physical{0};
-  std::optional<detail::CompileExecution::Completion> retried;
+  std::optional<mmltk::backend::data::detail::CompileExecution::Completion> retried;
   std::exception_ptr failure;
  } readiness;
  readiness.notifying = &notifying;
@@ -1694,10 +1704,14 @@ TEST_CASE("runtime file readiness follows actual capacity return and retains not
  }});
  readiness.files = &files;
  std::future<void> joined;
- const mmltk::testsupport::ScopedTestCleanup release([&] { completing.Release(); notifying.Release(); files.cancel(); files.join(); });
- auto first = files.try_submit({.context = &readiness.physical,
-  .call = [](void* value) { ++*static_cast<std::atomic<unsigned>*>(value); },
-  .completed = [&](std::exception_ptr) { completing.receipt().ArriveAndWait(); }});
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  completing.Release();
+  notifying.Release();
+  files.cancel();
+  files.join();
+ });
+ auto first = files.try_submit(
+  {.context = &readiness.physical, .call = [](void* value) { ++*static_cast<std::atomic<unsigned>*>(value); }, .completed = [&](std::exception_ptr) { completing.receipt().ArriveAndWait(); }});
  REQUIRE(first);
  REQUIRE(completing.WaitEntered(std::chrono::seconds{2}));
  CHECK_FALSE(files.has_capacity());

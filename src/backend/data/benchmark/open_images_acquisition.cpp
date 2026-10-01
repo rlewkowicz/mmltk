@@ -36,11 +36,10 @@
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/numa_topology.h"
 namespace mmltk::backend::data::benchmark_internal {
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileExecutionLimits;
+using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
-
 namespace common_io = mmltk::common::io;
 namespace common_math = mmltk::common::math;
 namespace {
@@ -249,8 +248,8 @@ private:
     execution_->execution().run(CompileTaskKind::Header, {}, read_header, result.input.buffer->allowance);
    else
     read_header(0);
-   result.file_payload = BenchmarkEncodedImage::publish(
-    directory_, result.input.image_id, result.input.buffer->encoded, result.input.buffer->validator->admitted_header(), cancellation_, storage_, (execution_ ? &execution_->execution() : nullptr), result.input.buffer->allowance);
+   result.file_payload = BenchmarkEncodedImage::publish(directory_, result.input.image_id, result.input.buffer->encoded, result.input.buffer->validator->admitted_header(), cancellation_, storage_,
+    (execution_ ? &execution_->execution() : nullptr), result.input.buffer->allowance);
    throw_if_benchmark_cancelled(cancellation_);
   } catch (const InvalidImageError& error) {
    result.input.opened.reset();
@@ -941,7 +940,8 @@ public:
        active_limit(concurrency),
        minimum_limit(std::max<std::size_t>(1, concurrency / 8)),
        repair_bytes(repair_workspace(probe)),
-       control_limit(std::max(group_control(std::min(kOpenImagesGroupImages, ids.size())), execution ? execution->execution().transient_target() : group_control(kOpenImagesGroupImages) * concurrency)),
+       control_limit(
+        std::max(group_control(std::min(kOpenImagesGroupImages, ids.size())), execution ? execution->execution().transient_target() : group_control(kOpenImagesGroupImages) * concurrency)),
        inputs(execution, repair_bytes, transport.admission_wakeup()),
        active(transport, BenchmarkCurl::Class::OpenImages, cancellation, group_resources),
        directory_allowance(execution ? execution->execution().reserve(CompileResources::handles(1, true)) : CompileAllowance{}),

@@ -1,7 +1,6 @@
 #include "src/backend/data/detail/staged_artifact.h"
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
-
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/pch_linux.h"
 #include "src/pch_std.h"
@@ -16,10 +15,9 @@
 #include "src/common/io/file_memory.h"
 namespace mmltk::backend::data::benchmark_internal {
 using detail::CompileExecution;
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
-
 using mmltk::common::io::errno_error;
 namespace common_io = mmltk::common::io;
 namespace {
@@ -87,8 +85,8 @@ enum class LeaseWait { Once, UntilAcquired };
 ArtifactLease ArtifactLease::acquire(const std::filesystem::path& path, mmltk::common::concurrency::CancellationObservation cancellation) {
  return ArtifactLease(acquire_physical_lease(path, cancellation, LeaseWait::UntilAcquired).release());
 }
-std::shared_ptr<ArtifactLease> ArtifactLease::acquire_charged(const std::filesystem::path& path, mmltk::common::concurrency::CancellationObservation cancellation, CompileExecution* execution,
- CompileResources demand, const CompileAllowance& parent) {
+std::shared_ptr<ArtifactLease> ArtifactLease::acquire_charged(
+ const std::filesystem::path& path, mmltk::common::concurrency::CancellationObservation cancellation, CompileExecution* execution, CompileResources demand, const CompileAllowance& parent) {
  if (!demand.descriptors) throw std::invalid_argument("benchmark lease requires a descriptor allowance");
  for (;;) {
   auto allowance = execution ? execution->reserve(demand, parent) : CompileAllowance{};
@@ -111,8 +109,8 @@ std::shared_ptr<ArtifactLease> ArtifactLease::try_acquire_charged(const std::fil
  if (admitted && !admitted.descriptors()) throw std::invalid_argument("benchmark lease allowance has no descriptor");
  return try_acquire(path, cancellation, std::move(admitted));
 }
-std::shared_ptr<ArtifactLease> ArtifactLease::try_acquire_charged(const std::filesystem::path& path, mmltk::common::concurrency::CancellationObservation cancellation,
- CompileExecution* execution, CompileResources demand, const CompileAllowance& parent) {
+std::shared_ptr<ArtifactLease> ArtifactLease::try_acquire_charged(
+ const std::filesystem::path& path, mmltk::common::concurrency::CancellationObservation cancellation, CompileExecution* execution, CompileResources demand, const CompileAllowance& parent) {
  if (!demand.descriptors) throw std::invalid_argument("benchmark lease requires a descriptor allowance");
  throw_if_benchmark_cancelled(cancellation);
  CompileAllowance allowance;

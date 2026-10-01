@@ -11,6 +11,10 @@
 #include <stop_token>
 #include <utility>
 namespace mmltk::testsupport {
+// Worker callbacks propagate fixture failures through their owner's completion.
+inline void require_condition(bool condition, const char* message) {
+ if (!condition) throw std::runtime_error(message);
+}
 inline void release_test_promise(std::promise<void>& promise) noexcept {
  try {
   promise.set_value();
@@ -20,9 +24,7 @@ inline void release_test_promise(std::promise<void>& promise) noexcept {
 // scenario's release/stop guard before any joining future is destroyed.
 template <class T>
 T await_test_future(std::future<T>& future, std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds{2}) {
- if (future.wait_for(timeout) != std::future_status::ready) {
-  throw std::runtime_error(std::string(name) + ": settlement deadline expired");
- }
+ if (future.wait_for(timeout) != std::future_status::ready) { throw std::runtime_error(std::string(name) + ": settlement deadline expired"); }
  return future.get();
 }
 // Promise futures never join on destruction; their lifetime remains local.

@@ -52,4 +52,4 @@ private:
  int directory_ = -1;
  mmltk::common::io::FileHandle file_;
 };
-}
+}  // namespace mmltk::backend::data::detail

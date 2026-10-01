@@ -52,15 +52,15 @@ class DirectoryLabels final {
  struct Impl;
  std::unique_ptr<Parser> parser_;
  std::unique_ptr<Impl> impl_;
+
 public:
  explicit DirectoryLabels(detail::CompileExecution&);
  ~DirectoryLabels();
  DirectoryLabels(const DirectoryLabels&) = delete;
  DirectoryLabels& operator=(const DirectoryLabels&) = delete;
  [[nodiscard]] static detail::CompileResources resources(std::uint32_t width, std::size_t maximum_line);
- void begin(std::uint32_t image_index, detail::CompileAllowance, std::span<const std::uint8_t> input, std::size_t maximum_line,
-  const detail::CompileImageHeader&, const CompilerConfig&, const catalog::ClassCatalog&, std::uint8_t category_base,
-  std::filesystem::path annotation, std::filesystem::path image);
+ void begin(std::uint32_t image_index, detail::CompileAllowance, std::span<const std::uint8_t> input, std::size_t maximum_line, const detail::CompileImageHeader&, const CompilerConfig&,
+  const catalog::ClassCatalog&, std::uint8_t category_base, std::filesystem::path annotation, std::filesystem::path image);
  [[nodiscard]] bool step(mmltk::common::concurrency::CancellationObservation);
  [[nodiscard]] const ImageEntry& entry() const;
  [[nodiscard]] detail::CompiledLabelWorkspace::OutputLease release_output();
@@ -69,9 +69,8 @@ public:
 };
 inline constexpr std::size_t directory_encoded_window = 32U << 20;
 inline constexpr std::size_t directory_line_window = 64U << 10;
-LabelBlocks compile_directory_images(const std::filesystem::path&, std::uint32_t images, const CompilerConfig&, const catalog::ClassCatalog&, std::uint8_t category_base,
- detail::CompiledSlotStorage&, detail::CompileExecution&, detail::FileWorkQueue&, ProgressCounter* labels, ProgressCounter* pixels,
- mmltk::common::concurrency::CancellationObservation);
+LabelBlocks compile_directory_images(const std::filesystem::path&, std::uint32_t images, const CompilerConfig&, const catalog::ClassCatalog&, std::uint8_t category_base, detail::CompiledSlotStorage&,
+ detail::CompileExecution&, detail::FileWorkQueue&, ProgressCounter* labels, ProgressCounter* pixels, mmltk::common::concurrency::CancellationObservation);
 int resolve_num_workers(int configured_workers, std::span<const int> worker_cpus);
 std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);
 std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <cstddef>
 #include <chrono>
 #include <future>
@@ -134,8 +135,7 @@ TEST_CASE("WorkerPool preserves FIFO across queue wrap and high-water growth", "
   target.first->push_back(*target.second + static_cast<int>(index));
  };
  std::vector<std::unique_ptr<WorkerPool::BorrowedTask>> prepared;
- for (std::size_t index = 0; index < 19; ++index)
-  prepared.push_back(std::make_unique<WorkerPool::BorrowedTask>(&output, index, append));
+ for (std::size_t index = 0; index < 19; ++index) prepared.push_back(std::make_unique<WorkerPool::BorrowedTask>(&output, index, append));
  mmltk::testsupport::ScopedTestCleanup settle_fifo{[&] {
   try {
    pool.wait_idle();
@@ -156,7 +156,8 @@ TEST_CASE("WorkerPool preserves FIFO across queue wrap and high-water growth", "
     CHECK_THROWS_AS(pool.enqueue_borrowed(*prepared[index]), std::logic_error);
    } else if (index % 3 == 1) {
     pool.enqueue_borrowed(&output, index, append);
-   } else pool.enqueue_detached([&observed, value] { observed.push_back(value); });
+   } else
+    pool.enqueue_detached([&observed, value] { observed.push_back(value); });
   }
   gate.Release();
   pool.wait_idle();
@@ -211,7 +212,7 @@ TEST_CASE("Prepared worker continuations yield through the same FIFO and report 
  struct Continuation {
   WorkerPool* pool;
   WorkerPool::BorrowedTask* task = nullptr;
-  std::vector<int> observed;
+  std::vector<int> observed{};
   int next = 0;
  } state{&pool};
  WorkerPool::BorrowedTask task(&state, 0, [](void* context, std::size_t) {
@@ -221,7 +222,12 @@ TEST_CASE("Prepared worker continuations yield through the same FIFO and report 
  });
  state.task = &task;
  mmltk::testsupport::TestGate admitted("continuation FIFO admission");
- const mmltk::testsupport::ScopedTestCleanup drain([&] { admitted.Release(); try { pool.wait_idle(); } catch (...) {} });
+ const mmltk::testsupport::ScopedTestCleanup drain([&] {
+  admitted.Release();
+  try {
+   pool.wait_idle();
+  } catch (...) {}
+ });
  pool.enqueue_detached([receipt = admitted.receipt()] { receipt.ArriveAndWait(); });
  REQUIRE(admitted.WaitEntered(std::chrono::seconds{2}));
  pool.enqueue_borrowed(task);

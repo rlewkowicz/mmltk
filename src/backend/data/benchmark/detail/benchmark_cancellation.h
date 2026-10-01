@@ -3,7 +3,6 @@
 #include <atomic>
 #include <exception>
 #include <mutex>
-
 namespace mmltk::backend::data::detail {
 class CompileExecution;
 }
@@ -20,12 +19,12 @@ public:
  void rethrow_failure() const;
  [[nodiscard]] bool cancelled() const noexcept;
  [[nodiscard]] int descriptor() const noexcept;
-
  class ExecutionBinding final {
  public:
   ~ExecutionBinding();
   ExecutionBinding(const ExecutionBinding&) = delete;
   ExecutionBinding& operator=(const ExecutionBinding&) = delete;
+
  private:
   friend class BenchmarkCompileCancellation;
   ExecutionBinding(BenchmarkCompileCancellation&, detail::CompileExecution&);

@@ -43,19 +43,23 @@ ProgressEstimate estimate_progress(const std::uint64_t completed, const std::uin
 }
 CompileTelemetry::CompileTelemetry() noexcept : started_at_rep_(now_().time_since_epoch().count()) {}
 CompileTelemetry::CompileTelemetry(size_t num_images, CompileProgressObserver observer, Now now)
- : num_images_(num_images), observer_(observer), now_(now), started_at_rep_(now_().time_since_epoch().count()) {
+    : num_images_(num_images), observer_(observer), now_(now), started_at_rep_(now_().time_since_epoch().count()) {
  if (!observer_.report) return;
  using Delivery = detail::CompileProgressDelivery<CompileProgress>;
  const bool diagnostic = mmltk::common::logging::enabled(spdlog::level::trace);
- delivery_ = std::make_unique<Delivery>(publication_mutex_, [this] { return snapshot(); },
-  [this](const CompileProgress& value) { observer_(value); }, Delivery::Failure{},
+ delivery_ = std::make_unique<Delivery>(publication_mutex_, [this] { return snapshot(); }, [this](const CompileProgress& value) { observer_(value); }, Delivery::Failure{},
   diagnostic ? Delivery::Diagnostic{[](const Delivery::Counts& counts) {
-   mmltk::common::logging::trace([&](spdlog::logger& log) { log.trace("compiler.progress.delivery produced={} materialized={} coalesced={} delivered={} pending={} high_water={}",
-    counts.produced, counts.materialized, counts.coalesced, counts.delivered, counts.pending, counts.high_water); });
-  }} : Delivery::Diagnostic{});
+  mmltk::common::logging::trace([&](spdlog::logger& log) {
+   log.trace("compiler.progress.delivery produced={} materialized={} coalesced={} delivered={} pending={} high_water={}", counts.produced, counts.materialized, counts.coalesced, counts.delivered,
+    counts.pending, counts.high_water);
+  });
+ }}
+             : Delivery::Diagnostic{});
 }
 CompileTelemetry::~CompileTelemetry() { delivery_.reset(); }
-void CompileTelemetry::flush() { if (delivery_) delivery_->flush(); }
+void CompileTelemetry::flush() {
+ if (delivery_) delivery_->flush();
+}
 CompileProgress CompileTelemetry::snapshot() const noexcept { return snapshot(phase_.load(std::memory_order_relaxed)); }
 CompileProgress CompileTelemetry::snapshot(DatasetCompilePhase phase) const noexcept {
  const size_t num_images = num_images_.load(std::memory_order_relaxed);
@@ -63,8 +67,7 @@ CompileProgress CompileTelemetry::snapshot(DatasetCompilePhase phase) const noex
  const size_t pixel_done = std::min(pixels_.done.load(std::memory_order_relaxed), num_images);
  const size_t label_active = labels_.active_workers.load(std::memory_order_relaxed);
  const size_t pixel_active = pixels_.active_workers.load(std::memory_order_relaxed);
- if (phase == DatasetCompilePhase::Labels || phase == DatasetCompilePhase::Pixels)
-  phase = label_done < num_images ? DatasetCompilePhase::Labels : DatasetCompilePhase::Pixels;
+ if (phase == DatasetCompilePhase::Labels || phase == DatasetCompilePhase::Pixels) phase = label_done < num_images ? DatasetCompilePhase::Labels : DatasetCompilePhase::Pixels;
  const size_t total = num_images * 2U + 1U;
  const Clock::duration::rep started_at_rep = started_at_rep_.load(std::memory_order_relaxed);
  const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now_().time_since_epoch() - Clock::duration{started_at_rep}).count();
@@ -213,8 +216,8 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  const uint32_t channels = 3;
  const size_t image_stride = static_cast<size_t>(channels) * height * width * sizeof(float);
  const int configured_workers = compiler_internal::resolve_num_workers(effective_config.num_workers, std::span<const int>(effective_config.worker_cpus));
- const auto worker_cpus=std::span<const int>(effective_config.worker_cpus).first(static_cast<std::size_t>(configured_workers));
- mmltk::common::logging::profile_set_value("compiler.num_workers",static_cast<std::size_t>(configured_workers));
+ const auto worker_cpus = std::span<const int>(effective_config.worker_cpus).first(static_cast<std::size_t>(configured_workers));
+ mmltk::common::logging::profile_set_value("compiler.num_workers", static_cast<std::size_t>(configured_workers));
  const auto& class_catalog = plan.class_catalog;
  if (class_catalog.empty() || plan.source_category_base > 1U) throw std::runtime_error("invalid generic compile catalog");
  const uint32_t num_images = plan.splits[split_index].image_count;
@@ -228,7 +231,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  compiler_internal::ProgressCounter label_progress{telemetry, compiler_internal::ProgressCounter::Stage::kLabels};
  compiler_internal::ProgressCounter pixel_progress{telemetry, compiler_internal::ProgressCounter::Stage::kPixels};
  mmltk::common::logging::debug([&](spdlog::logger& log) {
-  log.debug("[compile] {}: {} images, {} shared workers, target {}x{}, stride={} bytes/img",effective_config.split,num_images,configured_workers,width,height,image_stride);
+  log.debug("[compile] {}: {} images, {} shared workers, target {}x{}, stride={} bytes/img", effective_config.split, num_images, configured_workers, width, height, image_stride);
  });
  FileLayout layout;
  {
@@ -241,68 +244,77 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  });
  const std::filesystem::path out_path = out_dir / (effective_config.split + ".bin");
  detail::StorageReservationPool destination(out_path);
- auto staged=detail::StagedArtifact::create(destination,out_path,0,"directory compiled staging");
- auto& fd=staged.file();
- detail::CompiledSlotStorage storage(staged,layout);
- constexpr std::array classes{detail::CompileWorkClass::Extraction,detail::CompileWorkClass::Annotations,detail::CompileWorkClass::Pixels,detail::CompileWorkClass::Output};
- const auto label_window=compiler_internal::DirectoryLabels::resources(2048,compiler_internal::directory_line_window).bytes;
+ auto staged = detail::StagedArtifact::create(destination, out_path, 0, "directory compiled staging");
+ auto& fd = staged.file();
+ detail::CompiledSlotStorage storage(staged, layout);
+ constexpr std::array classes{detail::CompileWorkClass::Extraction, detail::CompileWorkClass::Annotations, detail::CompileWorkClass::Pixels, detail::CompileWorkClass::Output};
+ const auto label_window = compiler_internal::DirectoryLabels::resources(2048, compiler_internal::directory_line_window).bytes;
  detail::CompileExecutionLimits limits;
- limits.workspace_plan=std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(static_cast<std::size_t>(configured_workers),
-  {width,height,effective_config.resize_mode,effective_config.perceptual_downscale},classes,
-  {label_window,label_window},0,compiler_internal::directory_encoded_window));
+ limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(static_cast<std::size_t>(configured_workers),
+  {width, height, effective_config.resize_mode, effective_config.perceptual_downscale}, classes, {label_window, label_window}, 0, compiler_internal::directory_encoded_window));
  detail::CompileExecution::Observer observer;
- if (effective_config.observation && effective_config.observation->execution) observer=[&](std::string_view event,const detail::CompileExecutionSnapshot& snapshot) {
-  effective_config.observation->execution(effective_config.observation->context,event,snapshot);
- };
- detail::CompileExecution execution(static_cast<std::size_t>(configured_workers),worker_cpus,limits,cancellation,std::move(observer),
-  std::make_exception_ptr(std::runtime_error("dataset compilation cancelled")));
- auto output=execution.open_class(detail::CompileWorkClass::Output);
- detail::FileWorkQueue files(execution,std::max<std::size_t>(2,static_cast<std::size_t>(configured_workers)*2),std::min<std::size_t>(2,execution.workers()));
- auto label_blocks=compiler_internal::compile_directory_images(split_dir,num_images,effective_config,class_catalog,plan.source_category_base,storage,execution,files,
-  telemetry ? &label_progress : nullptr,telemetry ? &pixel_progress : nullptr,cancellation);
+ if (effective_config.observation && effective_config.observation->execution)
+  observer = [&](std::string_view event, const detail::CompileExecutionSnapshot& snapshot) { effective_config.observation->execution(effective_config.observation->context, event, snapshot); };
+ detail::CompileExecution execution(
+  static_cast<std::size_t>(configured_workers), worker_cpus, limits, cancellation, std::move(observer), std::make_exception_ptr(std::runtime_error("dataset compilation cancelled")));
+ auto output = execution.open_class(detail::CompileWorkClass::Output);
+ detail::FileWorkQueue files(execution, std::max<std::size_t>(2, static_cast<std::size_t>(configured_workers) * 2), std::min<std::size_t>(2, execution.workers()));
+ auto label_blocks = compiler_internal::compile_directory_images(split_dir, num_images, effective_config, class_catalog, plan.source_category_base, storage, execution, files,
+  telemetry ? &label_progress : nullptr, telemetry ? &pixel_progress : nullptr, cancellation);
  if (telemetry) telemetry->set_dropped_instances(label_blocks.dropped_instances);
  throw_if_cancelled();
  files.join();
  storage.quiesce();
- auto compaction=execution.reserve({.bytes=COMPILED_COMPACTION_SCRATCH_BYTES,.supplied_workspace=true,.completion_workspace=true,
-  .workspace_class=detail::CompileWorkClass::Output,.workspace_window=detail::CompileWorkspaceWindow::Compaction});
- files.submit({.work=[&] {
- layout = compact_compiled_file(fd, layout, label_blocks.index, cancellation,
-  telemetry ? CompiledCompactionProgress{[&](std::size_t done, std::size_t total) { telemetry->compacting(done, total); }} : CompiledCompactionProgress{},
-  { [&](std::size_t offset,std::size_t bytes) { staged.allocate_range(offset,bytes); },
-    [&](std::size_t offset,std::size_t bytes) { return staged.reclaim_range(offset,bytes); },
-    [&](std::size_t bytes) { staged.resize_sparse(bytes); }},compaction.workspace());
- mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Layout: total={:.2f} GB", static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
- staged.allocate_range(0, compiled_align_up(sizeof(FileHeader), PAGE_SIZE));
- staged.allocate_range(layout.index_offset, compiled_align_up(layout.index_size, PAGE_SIZE));
- staged.resize_sparse(layout.total_size);
- const FileHeader header = make_file_header(
-  FileHeaderInputs{
-   num_images,
-   width,
-   height,
-   channels,
-   label_blocks.max_instances_per_image,
-   image_stride,
-   effective_config.resize_mode,
-  },
-  class_catalog.names(), layout);
- validate_compiled_header(header);
+ auto compaction = execution.reserve(
+  {.bytes = COMPILED_COMPACTION_SCRATCH_BYTES,
+   .supplied_workspace = true,
+   .completion_workspace = true,
+   .workspace_class = detail::CompileWorkClass::Output,
+   .workspace_window = detail::CompileWorkspaceWindow::Compaction});
+ files
+  .submit(
+   {.work =
+     [&] {
+  layout = compact_compiled_file(fd, layout, label_blocks.index, cancellation,
+   telemetry ? CompiledCompactionProgress{[&](std::size_t done, std::size_t total) { telemetry->compacting(done, total); }} : CompiledCompactionProgress{},
+   {[&](std::size_t offset, std::size_t bytes) { staged.allocate_range(offset, bytes); }, [&](std::size_t offset, std::size_t bytes) { return staged.reclaim_range(offset, bytes); },
+    [&](std::size_t bytes) { staged.resize_sparse(bytes); }},
+   compaction.workspace());
+  mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Layout: total={:.2f} GB", static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
+  staged.allocate_range(0, compiled_align_up(sizeof(FileHeader), PAGE_SIZE));
+  staged.allocate_range(layout.index_offset, compiled_align_up(layout.index_size, PAGE_SIZE));
+  staged.resize_sparse(layout.total_size);
+  const FileHeader header = make_file_header(
+   FileHeaderInputs{
+    num_images,
+    width,
+    height,
+    channels,
+    label_blocks.max_instances_per_image,
+    image_stride,
+    effective_config.resize_mode,
+   },
+   class_catalog.names(), layout);
+  validate_compiled_header(header);
+  throw_if_cancelled();
+  compiler_internal::write_metadata_blocks(fd, layout, header, label_blocks, cancellation);
+  throw_if_cancelled();
+  if (telemetry != nullptr) { telemetry->enter_syncing(); }
+  fd.sync_data();
+  throw_if_cancelled();
+  const FileHeader staged_header = read_compiled_header(fd);
+  (void)validate_compiled_file_sections(staged_header, fd.size());
+  staged.close();
+ }})
+  .wait();
+ compaction = {};
  throw_if_cancelled();
- compiler_internal::write_metadata_blocks(fd, layout, header, label_blocks, cancellation);
+ if (telemetry != nullptr) {
+  telemetry->enter_publishing();
+  telemetry->flush();
+ }
  throw_if_cancelled();
- if (telemetry != nullptr) { telemetry->enter_syncing(); }
- fd.sync_data();
- throw_if_cancelled();
- const FileHeader staged_header = read_compiled_header(fd);
- (void)validate_compiled_file_sections(staged_header, fd.size());
- staged.close();
- }}).wait();
- compaction={};
- throw_if_cancelled();
- if (telemetry != nullptr) { telemetry->enter_publishing(); telemetry->flush(); }
- throw_if_cancelled();
- staged.publish(out_path,cancellation);
+ staged.publish(out_path, cancellation);
  mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Written {} ({:.2f} GB)", out_path.string(), static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
 }
 }  // namespace mmltk::backend::data

@@ -30,7 +30,6 @@
 #include <fcntl.h>
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileResources;
-
 namespace {
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
 namespace common_io = mmltk::common::io;
@@ -100,7 +99,6 @@ struct CoconutPhysicalMembership::Impl {
   changed.notify_all();
   if (current) current->settle(std::move(failure));
  }
-
  Impl(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& layout, detail::StorageReservationPool& reservations,
   BenchmarkCompilePipeline& pipeline, Cancellation cancel, Progress observer, Repair recover)
      : cache(&layout), storage(&reservations), execution(&pipeline), cancellation(cancel), progress(std::move(observer)), repair(std::move(recover)) {
@@ -177,12 +175,11 @@ struct CoconutPhysicalMembership::Impl {
    }
    const auto& physical = found->second.physical();
    if (execution && (selected == releases.end() ||
-       std::ranges::none_of(selected->second, [&](const auto* item) { return item->archive->origin.source == physical.source && item->archive->origin.shard == physical.shard; })))
+                     std::ranges::none_of(selected->second, [&](const auto* item) { return item->archive->origin.source == physical.source && item->archive->origin.shard == physical.shard; })))
     continue;
    result.image = &found->second;
   }
-  result.terminal = !execution || (result.image && result.image->pixels) || selected == releases.end() ||
-                    std::ranges::all_of(selected->second, [](const auto* item) { return item->complete; });
+  result.terminal = !execution || (result.image && result.image->pixels) || selected == releases.end() || std::ranges::all_of(selected->second, [](const auto* item) { return item->complete; });
   if (execution && result.terminal && (!result.image || !result.image->pixels) && repair && selected != releases.end())
    for (auto* item : selected->second) {
     const auto& origin = item->archive->origin;
@@ -362,9 +359,10 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
  const auto& catalog = archive.origin.artifact;
  const nlohmann::json source_identity = nlohmann::json::array({catalog.artifact_id, catalog.url, catalog.filename, catalog.expected_size, catalog.expected_sha256});
  const auto seal_proof = [&] {
-  write_json_atomically(
-   proof_path, {{"schema_version", kBenchmarkCacheSchemaVersion}, {"source", source_identity}, {"identity", archive.download.identity}, {"bytes", archive.download.size},
-                {"unreadable_images", artifact.unreadable}}, cancellation, state.storage);
+  write_json_atomically(proof_path,
+   {{"schema_version", kBenchmarkCacheSchemaVersion}, {"source", source_identity}, {"identity", archive.download.identity}, {"bytes", archive.download.size},
+    {"unreadable_images", artifact.unreadable}},
+   cancellation, state.storage);
  };
  if (cache_only) {
   if (!std::filesystem::is_regular_file(inventory_path) || !std::filesystem::is_regular_file(proof_path)) return false;
@@ -461,10 +459,11 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
  };
  const auto image_failure = [&](const CoconutPhysicalImage& image, bool source_read, std::exception_ptr failure) {
   std::string reason;
-  try { std::rethrow_exception(failure); }
-  catch (const BenchmarkImageReadError& error) { reason = error.what(); }
-  catch (const BenchmarkImageError& error) { reason = error.what(); }
-  catch (const InvalidImageError& error) { reason = error.what(); }
+  try {
+   std::rethrow_exception(failure);
+  } catch (const BenchmarkImageReadError& error) { reason = error.what(); } catch (const BenchmarkImageError& error) {
+   reason = error.what();
+  } catch (const InvalidImageError& error) { reason = error.what(); }
   execution.retire_image(root, image.image_id);
   Impl::Change notification;
   {
@@ -479,9 +478,12 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
    notification = state.advance_locked();
   }
   state.notify(std::move(notification));
-  if (source_read) bad_image(image, reason);
-  else if (replaying_inventory) cache_incomplete = true;
-  else repairs.push_back(image);
+  if (source_read)
+   bad_image(image, reason);
+  else if (replaying_inventory)
+   cache_incomplete = true;
+  else
+   repairs.push_back(image);
  };
  std::unique_ptr<BenchmarkArchive> archive_reader;
  BenchmarkCompletionWindow publications(window_size, &execution.execution(), [&] {
@@ -495,7 +497,10 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   ticket({image.image_id, std::pair{input->header().width, input->header().height}, true, std::move(input), artifact.root});
   publications.push(execution.image_completion(root, image.image_id), [&, image, bytes, generation, source_read, ticket](std::exception_ptr failure) {
    if (execution.image_generation(root, image.image_id) != generation) return;
-   if (failure) { image_failure(image, source_read, failure); return; }
+   if (failure) {
+    image_failure(image, source_read, failure);
+    return;
+   }
    bool conflict = false;
    std::size_t completed = 0;
    Impl::Change notification;
@@ -573,7 +578,8 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   return false;
  }
  replaying_inventory = false;
- archive_reader = std::make_unique<BenchmarkArchive>(archive.download.path, &execution.execution(), BenchmarkEncodedImage::normal_window_bytes, lease->allowance(), 1, true, CompileAllowance{}, 1024, 2);
+ archive_reader =
+  std::make_unique<BenchmarkArchive>(archive.download.path, &execution.execution(), BenchmarkEncodedImage::normal_window_bytes, lease->allowance(), 1, true, CompileAllowance{}, 1024, 2);
  auto& reader = *archive_reader;
  std::vector<CoconutPhysicalImage> inventory;
  std::unordered_set<std::uint64_t> encountered;
@@ -589,7 +595,9 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
    try {
     input = BenchmarkEncodedImage::open(directory.get(), image.image_id, validate, cancellation, &execution.execution(), reader.allowance(), {}, BenchmarkEncodedImage::normal_window_bytes);
     if (input && !std::ranges::equal(input->encoded(), encoded)) input.reset();
-   } catch (const BenchmarkImageError&) { input.reset(); } catch (const InvalidImageError&) { input.reset(); }
+   } catch (const BenchmarkImageError&) { input.reset(); } catch (const InvalidImageError&) {
+    input.reset();
+   }
    if (!input) {
     if (std::filesystem::exists(cached_image_path(artifact.root, image.image_id))) invalidate_cached_image_proofs(artifact.root);
     input = BenchmarkEncodedImage::publish(directory.get(), image.image_id, encoded, header, cancellation, destination, &execution.execution(), reader.allowance(), true);
@@ -620,8 +628,12 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   const auto id = benchmark_archive_image_candidate(reader.member());
   if (!id) continue;
   CoconutPhysicalImage image{archive.origin.source, *id, archive.origin.shard, reader.member(), archive.download.identity};
-  try { validate_coconut_physical_image(image); }
-  catch (const CoconutInputError& error) { if (rejected) rejected(image, error.what()); continue; }
+  try {
+   validate_coconut_physical_image(image);
+  } catch (const CoconutInputError& error) {
+   if (rejected) rejected(image, error.what());
+   continue;
+  }
   const auto complete = fact(image, true, !encountered.insert(*id).second);
   if (!complete) continue;
   inventory.push_back(image);
@@ -629,11 +641,15 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
   publications.make_room();
   BenchmarkEncodedImage::Ptr input;
   if (cache_generation_known) {
-   try { input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution.execution(), reader.allowance(), {}, BenchmarkEncodedImage::normal_window_bytes); }
-   catch (const BenchmarkImageError&) {} catch (const InvalidImageError&) {}
+   try {
+    input = BenchmarkEncodedImage::open(directory.get(), *id, validate, cancellation, &execution.execution(), reader.allowance(), {}, BenchmarkEncodedImage::normal_window_bytes);
+   } catch (const BenchmarkImageError&) {
+   } catch (const InvalidImageError&) {}
   }
-  if (input) publish(image, std::move(input));
-  else read_source(image);
+  if (input)
+   publish(image, std::move(input));
+  else
+   read_source(image);
  }
  repair_cached(false);
  // An omitted ambiguous ID stays absent from the completed source inventory.

@@ -27,7 +27,6 @@ struct PreparedBenchmarkSplit;
 struct BenchmarkLabelChunk;
 class BenchmarkLabelInput;
 class BenchmarkLabelWorkspace;
-
 // Bounded physical completion custody shared by artifact publication and final
 // claim restoration. Completion order frees records; metadata order stays with
 // the caller. Use outside CPU lanes; execution and callback captures outlive the
@@ -48,15 +47,17 @@ public:
  void wait_one();
  void drain();
  [[nodiscard]] std::size_t size() const noexcept;
+
 private:
  struct Impl;
  std::unique_ptr<Impl> impl_;
 };
-
 class BenchmarkCompilePipeline final {
  friend class BenchmarkSourcePublication;
+
 public:
- explicit BenchmarkCompilePipeline(std::size_t workers, std::span<const int> cpus = {}, detail::CompileExecutionLimits = {}, mmltk::common::concurrency::CancellationObservation = {}, BenchmarkTraceSink = {});
+ explicit BenchmarkCompilePipeline(
+  std::size_t workers, std::span<const int> cpus = {}, detail::CompileExecutionLimits = {}, mmltk::common::concurrency::CancellationObservation = {}, BenchmarkTraceSink = {});
  ~BenchmarkCompilePipeline();
  BenchmarkCompilePipeline(const BenchmarkCompilePipeline&) = delete;
  BenchmarkCompilePipeline& operator=(const BenchmarkCompilePipeline&) = delete;

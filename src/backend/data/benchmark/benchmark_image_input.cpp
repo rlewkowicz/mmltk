@@ -14,10 +14,9 @@
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
 using detail::CompileExecution;
-using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
-
 namespace {
 namespace io = mmltk::common::io;
 using Cancellation = mmltk::common::concurrency::CancellationObservation;
@@ -156,8 +155,8 @@ BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::read_opened(
  throw_if_benchmark_cancelled(cancellation);
  return Ptr(new BenchmarkEncodedImage(std::move(allowance), mapping, encoded, header, opened.identity_, Storage::Mapped, charged));
 }
-BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(const std::filesystem::path& path, std::span<const std::uint8_t> encoded, Cancellation cancellation, detail::StorageReservationPool& destination,
- std::optional<BenchmarkImageHeader> header, CompileAllowance allowance, bool retain_mapping, int directory, std::string_view relative) {
+BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(const std::filesystem::path& path, std::span<const std::uint8_t> encoded, Cancellation cancellation,
+ detail::StorageReservationPool& destination, std::optional<BenchmarkImageHeader> header, CompileAllowance allowance, bool retain_mapping, int directory, std::string_view relative) {
  if (encoded.empty()) throw std::runtime_error("cannot cache an empty benchmark image");
  const auto target = directory >= 0 ? std::filesystem::path(relative) : path;
  auto staging = detail::StagedArtifact::create(destination, target, encoded.size(), "cached image staging", ".tmp.XXXXXX", 0600, directory);
@@ -180,8 +179,7 @@ BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(int directory, std::ui
  auto mapping = execution && retain_mapping ? execution->try_reserve(CompileResources::handles(1), input) : std::optional<CompileAllowance>{};
  std::array<char, 24> relative{};
  const auto length = format_cached_image_relative_path(id, relative);
- return publish(
-  {}, encoded, cancellation, storage, header, {}, retain_mapping && (!execution || mapping.has_value()), directory, std::string_view(relative.data(), length));
+ return publish({}, encoded, cancellation, storage, header, {}, retain_mapping && (!execution || mapping.has_value()), directory, std::string_view(relative.data(), length));
 }
 BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::publish(const std::filesystem::path& path, std::span<const std::uint8_t> encoded, Cancellation cancellation, detail::StorageReservationPool* storage,
  std::optional<BenchmarkImageHeader> header, CompileAllowance allowance, bool retain_mapping, int directory, std::string_view relative) {

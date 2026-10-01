@@ -58,7 +58,7 @@ uint32_t count_sequential_images(const std::filesystem::path& split_dir, mmltk::
  mmltk::common::logging::profile_set_value("compiler.scan.num_images", png_count);
  return png_count;
 }
-}
+}  // namespace
 std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) { return numbered_path(split_dir, zero_based_index + 1, ".png"); }
 std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) { return numbered_path(split_dir, zero_based_index + 1, ".jsonl"); }
 DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::string>& splits, const mmltk::common::concurrency::CancellationObservation cancellation) {
@@ -123,44 +123,44 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
  return scan;
 }
 namespace {
-std::size_t aligned_bytes(std::size_t bytes) { return checked_add(bytes,std::size_t{63},"annotation workspace overflow") / 64 * 64; }
-std::size_t json_stack_capacity(std::size_t maximum_line) { return std::max(maximum_line,directory_line_window) / 2 + 1; }
-std::size_t source_run_capacity(std::size_t maximum_line) { return std::max(maximum_line,directory_line_window) / 4 + 1; }
-std::size_t padded_line_bytes(std::size_t maximum_line) { return aligned_bytes(checked_add(std::max(maximum_line,directory_line_window),simdjson::SIMDJSON_PADDING,"annotation input overflow")); }
+std::size_t aligned_bytes(std::size_t bytes) { return checked_add(bytes, std::size_t{63}, "annotation workspace overflow") / 64 * 64; }
+std::size_t json_stack_capacity(std::size_t maximum_line) { return std::max(maximum_line, directory_line_window) / 2 + 1; }
+std::size_t source_run_capacity(std::size_t maximum_line) { return std::max(maximum_line, directory_line_window) / 4 + 1; }
+std::size_t padded_line_bytes(std::size_t maximum_line) { return aligned_bytes(checked_add(std::max(maximum_line, directory_line_window), simdjson::SIMDJSON_PADDING, "annotation input overflow")); }
 std::size_t parser_bytes(std::size_t maximum_line) {
- return checked_add(checked_multiply(padded_line_bytes(maximum_line),std::size_t{16},"JSON parser workspace overflow"),std::size_t{64U<<10},"JSON parser workspace overflow");
+ return checked_add(checked_multiply(padded_line_bytes(maximum_line), std::size_t{16}, "JSON parser workspace overflow"), std::size_t{64U << 10}, "JSON parser workspace overflow");
 }
-std::uint64_t identity(const DatasetAnnotationScalar& value,const char* error) {
- if (const auto* number=value.get<std::uint64_t>()) return *number;
- if (const auto* number=value.get<std::int64_t>(); number && *number>=0) return static_cast<std::uint64_t>(*number);
+std::uint64_t identity(const DatasetAnnotationScalar& value, const char* error) {
+ if (const auto* number = value.get<std::uint64_t>()) return *number;
+ if (const auto* number = value.get<std::int64_t>(); number && *number >= 0) return static_cast<std::uint64_t>(*number);
  throw std::runtime_error(error);
 }
-double numeric(const DatasetAnnotationScalar& value,const char* error) {
- if (const auto* number=value.get<double>()) return *number;
- if (const auto* number=value.get<std::uint64_t>()) return static_cast<double>(*number);
- if (const auto* number=value.get<std::int64_t>()) return static_cast<double>(*number);
+double numeric(const DatasetAnnotationScalar& value, const char* error) {
+ if (const auto* number = value.get<double>()) return *number;
+ if (const auto* number = value.get<std::uint64_t>()) return static_cast<double>(*number);
+ if (const auto* number = value.get<std::int64_t>()) return static_cast<double>(*number);
  throw std::runtime_error(error);
 }
-std::string_view text_value(const DatasetAnnotationScalar& value,const char* error) {
- if (const auto* text=value.get<std::string_view>()) return *text;
+std::string_view text_value(const DatasetAnnotationScalar& value, const char* error) {
+ if (const auto* text = value.get<std::string_view>()) return *text;
  throw std::runtime_error(error);
 }
 // The original get<int>() also admits booleans and truncates finite fractions.
 int source_extent(const DatasetAnnotationScalar& value) {
- if (const auto* boolean=value.get<bool>()) return *boolean;
- if (const auto* number=value.get<std::int64_t>()) return static_cast<int>(*number);
- if (const auto* number=value.get<std::uint64_t>()) return static_cast<int>(*number);
- const auto number=numeric(value,"image_size_wh coordinates must be numeric");
- if (number<std::numeric_limits<int>::min() || number>std::numeric_limits<int>::max()) return -1;
+ if (const auto* boolean = value.get<bool>()) return *boolean;
+ if (const auto* number = value.get<std::int64_t>()) return static_cast<int>(*number);
+ if (const auto* number = value.get<std::uint64_t>()) return static_cast<int>(*number);
+ const auto number = numeric(value, "image_size_wh coordinates must be numeric");
+ if (number < std::numeric_limits<int>::min() || number > std::numeric_limits<int>::max()) return -1;
  return static_cast<int>(number);
 }
-}
+}  // namespace
 struct DirectoryLabels::Parser {
  detail::CompileAllowance custody;
  simdjson::ondemand::parser value;
- explicit Parser(detail::CompileExecution& execution) : custody(execution.reserve({.opaque_bytes=parser_bytes(directory_line_window)})) {
-  value.threaded=false;
-  if (const auto error=value.allocate(directory_line_window,json_stack_capacity(directory_line_window)+1)) throw simdjson::simdjson_error(error);
+ explicit Parser(detail::CompileExecution& execution) : custody(execution.reserve({.opaque_bytes = parser_bytes(directory_line_window)})) {
+  value.threaded = false;
+  if (const auto error = value.allocate(directory_line_window, json_stack_capacity(directory_line_window) + 1)) throw simdjson::simdjson_error(error);
  }
 };
 struct DirectoryLabels::Impl {
@@ -191,220 +191,273 @@ struct DirectoryLabels::Impl {
  bool runs_complete = false, record_active = false, exceeded = false, finished = false;
  std::vector<CompileDiagnostic> diagnostics;
  [[noreturn]] void contextual(const std::exception& error) const {
-  throw std::runtime_error(std::string(error.what())+" in "+annotation.string()+" at line "+std::to_string(line_number)+
-   " (source "+std::to_string(dimensions.width)+"x"+std::to_string(dimensions.height)+", target "+std::to_string(config->target_width)+"x"+std::to_string(config->target_height)+")");
+  throw std::runtime_error(std::string(error.what()) + " in " + annotation.string() + " at line " + std::to_string(line_number) + " (source " + std::to_string(dimensions.width) + "x" +
+                           std::to_string(dimensions.height) + ", target " + std::to_string(config->target_width) + "x" + std::to_string(config->target_height) + ")");
  }
  void open_record(std::size_t bytes) {
-  std::memcpy(line_buffer.data(),input.data()+cursor,bytes);
+  std::memcpy(line_buffer.data(), input.data() + cursor, bytes);
   try {
-   auto document=parser->iterate(simdjson::padded_string_view(line_buffer.data(),bytes,line_buffer.size()));
-   record=project_dataset_annotation(document.get_object().value(),json_stack);
+   auto document = parser->iterate(simdjson::padded_string_view(line_buffer.data(), bytes, line_buffer.size()));
+   record = project_dataset_annotation(document.get_object().value(), json_stack);
    if (!document.at_end()) throw std::runtime_error("trailing JSON content");
-  } catch (const std::exception&) {
-   throw std::runtime_error("invalid JSON annotation record in "+annotation.string()+" at line "+std::to_string(line_number));
-  }
+  } catch (const std::exception&) { throw std::runtime_error("invalid JSON annotation record in " + annotation.string() + " at line " + std::to_string(line_number)); }
   if (record.image_size_wh) {
-   const auto& size=*record.image_size_wh;
-   if (!size.array_size || *size.array_size!=2) throw std::runtime_error("invalid image_size_wh in "+annotation.string());
-   const auto width=source_extent(size.coordinates[0]), height=source_extent(size.coordinates[1]);
-   if (width!=static_cast<int>(dimensions.width) || height!=static_cast<int>(dimensions.height))
-    throw std::runtime_error("annotation image_size_wh does not match PNG dimensions in "+annotation.string());
+   const auto& size = *record.image_size_wh;
+   if (!size.array_size || *size.array_size != 2) throw std::runtime_error("invalid image_size_wh in " + annotation.string());
+   const auto width = source_extent(size.coordinates[0]), height = source_extent(size.coordinates[1]);
+   if (width != static_cast<int>(dimensions.width) || height != static_cast<int>(dimensions.height))
+    throw std::runtime_error("annotation image_size_wh does not match PNG dimensions in " + annotation.string());
   }
   if (record.image_id) {
-   const auto id=identity(*record.image_id,"image_id must be a nonnegative integer");
-   if (result.has_source_image_id && result.source_image_id!=id) throw std::runtime_error("inconsistent source image identities");
-   result.has_source_image_id=true; result.source_image_id=id;
+   const auto id = identity(*record.image_id, "image_id must be a nonnegative integer");
+   if (result.has_source_image_id && result.source_image_id != id) throw std::runtime_error("inconsistent source image identities");
+   result.has_source_image_id = true;
+   result.source_image_id = id;
   }
-  if (!record.class_name) throw std::runtime_error("annotation class must be a string in "+annotation.string()+" at line "+std::to_string(line_number));
-  class_name=text_value(*record.class_name,"annotation class must be a string");
-  const auto class_id=catalog->resolve(class_name);
-  if (!class_id) throw std::runtime_error("annotation class '"+std::string(class_name)+"' is not declared in categories.json: "+annotation.string()+" at line "+std::to_string(line_number));
-  label={}; label.class_id=checked_cast<std::uint8_t>(*class_id,"compiled class index overflow"); label.source_ordinal=line_number;
+  if (!record.class_name) throw std::runtime_error("annotation class must be a string in " + annotation.string() + " at line " + std::to_string(line_number));
+  class_name = text_value(*record.class_name, "annotation class must be a string");
+  const auto class_id = catalog->resolve(class_name);
+  if (!class_id) throw std::runtime_error("annotation class '" + std::string(class_name) + "' is not declared in categories.json: " + annotation.string() + " at line " + std::to_string(line_number));
+  label = {};
+  label.class_id = checked_cast<std::uint8_t>(*class_id, "compiled class index overflow");
+  label.source_ordinal = line_number;
   try {
-   const auto flag=[&](const auto& field,std::uint8_t bit) {
+   const auto flag = [&](const auto& field, std::uint8_t bit) {
     if (!field) return;
-    bool enabled=false;
-    if (field->is_bool()) enabled=*field->template get<bool>();
+    bool enabled = false;
+    if (field->is_bool())
+     enabled = *field->template get<bool>();
     else {
      if (!field->is_int64() && !field->is_uint64()) throw std::runtime_error("annotation flag must be boolean or 0/1");
-     const auto value=identity(*field,"annotation flag must be 0/1");
-     if (value>1) throw std::runtime_error("annotation flag must be 0/1");
-     enabled=value!=0;
+     const auto value = identity(*field, "annotation flag must be 0/1");
+     if (value > 1) throw std::runtime_error("annotation flag must be 0/1");
+     enabled = value != 0;
     }
-    if (enabled) label.flags|=bit;
+    if (enabled) label.flags |= bit;
    };
-   flag(record.iscrowd,kAnnotationCrowd); flag(record.ignore,kAnnotationIgnore);
-   const auto id=[&](const auto& field,std::uint8_t bit) -> std::uint64_t {
+   flag(record.iscrowd, kAnnotationCrowd);
+   flag(record.ignore, kAnnotationIgnore);
+   const auto id = [&](const auto& field, std::uint8_t bit) -> std::uint64_t {
     if (!field) return 0;
-    const auto value=identity(*field,"annotation identity must be a nonnegative integer"); label.flags|=bit; return value;
+    const auto value = identity(*field, "annotation identity must be a nonnegative integer");
+    label.flags |= bit;
+    return value;
    };
-   label.annotation_id=id(record.id,kAnnotationId);
-   label.source_category_id=id(record.category_id,kAnnotationCategory);
-   if (!(label.flags&kAnnotationCategory)) { label.source_category_id=std::uint64_t(label.class_id)+category_base; label.flags|=kAnnotationCategory; }
-   rle={};
+   label.annotation_id = id(record.id, kAnnotationId);
+   label.source_category_id = id(record.category_id, kAnnotationCategory);
+   if (!(label.flags & kAnnotationCategory)) {
+    label.source_category_id = std::uint64_t(label.class_id) + category_base;
+    label.flags |= kAnnotationCategory;
+   }
+   rle = {};
    if (record.mask_rle) {
-    if (!record.mask_rle_encoding || text_value(*record.mask_rle_encoding,"mask_rle requires row_major_start_length string encoding")!="row_major_start_length")
+    if (!record.mask_rle_encoding || text_value(*record.mask_rle_encoding, "mask_rle requires row_major_start_length string encoding") != "row_major_start_length")
      throw std::runtime_error("mask_rle requires row_major_start_length string encoding");
-    rle=text_value(*record.mask_rle,"mask_rle requires row_major_start_length string encoding"); label.flags|=kAnnotationMask;
+    rle = text_value(*record.mask_rle, "mask_rle requires row_major_start_length string encoding");
+    label.flags |= kAnnotationMask;
    }
   } catch (const std::exception& error) { contextual(error); }
-  source_runs.clear(); run_cursor=0; previous_end=0; foreground=0; runs_complete=false; record_active=true;
+  source_runs.clear();
+  run_cursor = 0;
+  previous_end = 0;
+  foreground = 0;
+  runs_complete = false;
+  record_active = true;
  }
  bool parse_runs() {
   // One long source mask cannot monopolize a ready lane. The decoded string and
   // source-run array belong to this context through the next continuation.
   if (rle.empty()) return true;
-  const char* begin=rle.data();
-  const char* cursor=begin+run_cursor;
-  const char* end=begin+rle.size();
-  for (std::size_t quantum=0; cursor!=end && quantum<1024; ++quantum) {
-   while (cursor!=end && std::isspace(static_cast<unsigned char>(*cursor))) ++cursor;
-   if (cursor==end) break;
-   std::uint32_t start=0,length=0;
-   auto parsed=std::from_chars(cursor,end,start);
-   if (parsed.ec!=std::errc{} || parsed.ptr==cursor) throw std::runtime_error("mask_rle contains an invalid or overflowing run start");
-   cursor=parsed.ptr;
-   if (cursor==end || *cursor!=':') throw std::runtime_error("mask_rle run is missing ':' separator");
-   parsed=std::from_chars(++cursor,end,length);
-   if (parsed.ec!=std::errc{} || parsed.ptr==cursor || !length) throw std::runtime_error("mask_rle contains an invalid, zero, or overflowing run length");
-   cursor=parsed.ptr;
-   if (cursor!=end && !std::isspace(static_cast<unsigned char>(*cursor))) throw std::runtime_error("mask_rle runs must be separated by whitespace");
-   if (!source_runs.empty() && start<previous_end) throw std::runtime_error("mask_rle runs must be sorted and non-overlapping");
-   foreground=checked_add(foreground,std::size_t(length),"mask_rle foreground count overflow");
-   if (!source_runs.empty() && start==previous_end)
-    source_runs.back().length=checked_cast<std::uint32_t>(std::uint64_t(source_runs.back().length)+length,"mask run length overflow");
-   else source_runs.push_back({start,length});
-   previous_end=std::size_t(start)+length;
+  const char* begin = rle.data();
+  const char* run_input = begin + run_cursor;
+  const char* end = begin + rle.size();
+  for (std::size_t quantum = 0; run_input != end && quantum < 1024; ++quantum) {
+   while (run_input != end && std::isspace(static_cast<unsigned char>(*run_input))) ++run_input;
+   if (run_input == end) break;
+   std::uint32_t start = 0, length = 0;
+   auto parsed = std::from_chars(run_input, end, start);
+   if (parsed.ec != std::errc{} || parsed.ptr == run_input) throw std::runtime_error("mask_rle contains an invalid or overflowing run start");
+   run_input = parsed.ptr;
+   if (run_input == end || *run_input != ':') throw std::runtime_error("mask_rle run is missing ':' separator");
+   parsed = std::from_chars(++run_input, end, length);
+   if (parsed.ec != std::errc{} || parsed.ptr == run_input || !length) throw std::runtime_error("mask_rle contains an invalid, zero, or overflowing run length");
+   run_input = parsed.ptr;
+   if (run_input != end && !std::isspace(static_cast<unsigned char>(*run_input))) throw std::runtime_error("mask_rle runs must be separated by whitespace");
+   if (!source_runs.empty() && start < previous_end) throw std::runtime_error("mask_rle runs must be sorted and non-overlapping");
+   foreground = checked_add(foreground, std::size_t(length), "mask_rle foreground count overflow");
+   if (!source_runs.empty() && start == previous_end)
+    source_runs.back().length = checked_cast<std::uint32_t>(std::uint64_t(source_runs.back().length) + length, "mask run length overflow");
+   else
+    source_runs.push_back({start, length});
+   previous_end = std::size_t(start) + length;
   }
-  run_cursor=static_cast<std::size_t>(cursor-begin);
-  return cursor==end;
+  run_cursor = static_cast<std::size_t>(run_input - begin);
+  return run_input == end;
  }
  bool project_runs() {
   if (!projection) {
-   projection_first=output.runs.size();
-   const auto count=checked_add(labels,std::size_t{1},"annotation count overflow");
-   const auto fits_labels=count<=output.labels.capacity();
-   const auto offset=fits_labels ? annotation_layout(count,0).run_offset : COMPILED_LABEL_CAPACITY;
-   const auto available=fits_labels && offset<=COMPILED_LABEL_CAPACITY ? (COMPILED_LABEL_CAPACITY-offset)/sizeof(RLEPair) : 0;
-   if (!fits_labels || projection_first>available) exceeded=true;
-   projection.emplace(std::span<const RLEPair>{source_runs.data(),source_runs.size()},dimensions,dataset::MaskDimensions{config->target_width,config->target_height},geometry,
-    &output.scratch(),output.runs,exceeded ? projection_first : available);
+   projection_first = output.runs.size();
+   const auto count = checked_add(labels, std::size_t{1}, "annotation count overflow");
+   const auto fits_labels = count <= output.labels.capacity();
+   const auto offset = fits_labels ? annotation_layout(count, 0).run_offset : COMPILED_LABEL_CAPACITY;
+   const auto available = fits_labels && offset <= COMPILED_LABEL_CAPACITY ? (COMPILED_LABEL_CAPACITY - offset) / sizeof(RLEPair) : 0;
+   if (!fits_labels || projection_first > available) exceeded = true;
+   projection.emplace(std::span<const RLEPair>{source_runs.data(), source_runs.size()}, dimensions, dataset::MaskDimensions{config->target_width, config->target_height}, geometry, &output.scratch(),
+    output.runs, exceeded ? projection_first : available);
   }
   try {
    if (!projection->step()) return false;
-   mask_runs=output.runs.size()-projection_first;
+   mask_runs = output.runs.size() - projection_first;
   } catch (const dataset::MaskRunCapacityError& error) {
-   mask_runs=error.required_runs()-projection_first; exceeded=true;
+   mask_runs = error.required_runs() - projection_first;
+   exceeded = true;
    // All validated source bounds survive the transactional output rollback.
    // Reusing them avoids another unbounded source scan after a capacity yield.
   }
-  source_bounds=projection->source_bounds();
+  source_bounds = projection->source_bounds();
   return true;
  }
  void finish_record() {
-  const auto first=projection_first;
-  const auto count=checked_add(labels,std::size_t{1},"annotation count overflow");
-  const auto& bounds=source_bounds;
-  required_runs=checked_add(required_runs,mask_runs,"annotation required mask runs overflow");
-  std::array<double,4> box{};
+  const auto first = projection_first;
+  const auto count = checked_add(labels, std::size_t{1}, "annotation count overflow");
+  const auto& bounds = source_bounds;
+  required_runs = checked_add(required_runs, mask_runs, "annotation required mask runs overflow");
+  std::array<double, 4> box{};
   if (record.bbox_xyxy) {
-   const auto& values=*record.bbox_xyxy;
-   if (!values.array_size || *values.array_size!=4) throw std::runtime_error("bbox_xyxy must have four numeric coordinates");
-   for (std::size_t i=0;i<box.size();++i) box[i]=numeric(values.coordinates[i],"bbox_xyxy coordinates must be numeric");
+   const auto& values = *record.bbox_xyxy;
+   if (!values.array_size || *values.array_size != 4) throw std::runtime_error("bbox_xyxy must have four numeric coordinates");
+   for (std::size_t i = 0; i < box.size(); ++i) box[i] = numeric(values.coordinates[i], "bbox_xyxy coordinates must be numeric");
   } else {
    if (!bounds.has_foreground) throw std::runtime_error("annotation requires a bbox or a nonempty source mask");
-   box={double(bounds.min_x),double(bounds.min_y),double(bounds.max_x),double(bounds.max_y)};
+   box = {double(bounds.min_x), double(bounds.min_y), double(bounds.max_x), double(bounds.max_y)};
   }
-  if (!std::ranges::all_of(box,[](double value) { return std::isfinite(value); }) || box[2]<=box[0] || box[3]<=box[1]) throw std::runtime_error("invalid source bbox");
+  if (!std::ranges::all_of(box, [](double value) { return std::isfinite(value); }) || box[2] <= box[0] || box[3] <= box[1]) throw std::runtime_error("invalid source bbox");
   if (config->diagnostics && record.mask_rle && bounds.has_foreground && record.bbox_xyxy) {
-   const std::array mask_box{double(bounds.min_x),double(bounds.min_y),double(bounds.max_x),double(bounds.max_y)};
-   if (mask_box!=box) try {
-    diagnostics.push_back({.kind=CompileDiagnosticKind::kSourceBoundingBoxMismatch,.annotation_path=annotation.string(),.class_name=std::string(class_name),.line=line_number,
-     .source_width=dimensions.width,.source_height=dimensions.height,.target_width=config->target_width,.target_height=config->target_height,.source_foreground=foreground,.declared_bbox=box,.mask_bbox=mask_box});
-   } catch (...) {}
+   const std::array mask_box{double(bounds.min_x), double(bounds.min_y), double(bounds.max_x), double(bounds.max_y)};
+   if (mask_box != box) try {
+     diagnostics.push_back(
+      {.kind = CompileDiagnosticKind::kSourceBoundingBoxMismatch,
+       .annotation_path = annotation.string(),
+       .class_name = std::string(class_name),
+       .line = line_number,
+       .source_width = dimensions.width,
+       .source_height = dimensions.height,
+       .target_width = config->target_width,
+       .target_height = config->target_height,
+       .source_foreground = foreground,
+       .declared_bbox = box,
+       .mask_bbox = mask_box});
+    } catch (...) {}
   }
-  label.original_area=record.area ? numeric(*record.area,"annotation area must be numeric") : record.mask_rle ? double(foreground) : (box[2]-box[0])*(box[3]-box[1]);
-  if (!std::isfinite(label.original_area) || label.original_area<0) throw std::runtime_error("invalid annotation area");
-  std::array<float,4> transformed{};
-  for (std::size_t i=0;i<4;++i) {
-   const bool x=(i&1)==0;
-   const double value=box[i]*(x ? geometry.resized_width : geometry.resized_height)/(x ? dimensions.width : dimensions.height)+(x ? geometry.offset_x : geometry.offset_y);
-   constexpr auto limit=std::numeric_limits<float>::max();
+  label.original_area = record.area ? numeric(*record.area, "annotation area must be numeric") : record.mask_rle ? double(foreground) : (box[2] - box[0]) * (box[3] - box[1]);
+  if (!std::isfinite(label.original_area) || label.original_area < 0) throw std::runtime_error("invalid annotation area");
+  std::array<float, 4> transformed{};
+  for (std::size_t i = 0; i < 4; ++i) {
+   const bool x = (i & 1) == 0;
+   const double value = box[i] * (x ? geometry.resized_width : geometry.resized_height) / (x ? dimensions.width : dimensions.height) + (x ? geometry.offset_x : geometry.offset_y);
+   constexpr auto limit = std::numeric_limits<float>::max();
    if (!std::isfinite(value) || value < -limit || value > limit) throw std::runtime_error("transformed bbox overflow");
-   transformed[i]=static_cast<float>(value);
+   transformed[i] = static_cast<float>(value);
   }
-  if (transformed[2]<=transformed[0] || transformed[3]<=transformed[1]) throw std::runtime_error("transformed bbox loses strict corner ordering");
-  labels=count;
+  if (transformed[2] <= transformed[0] || transformed[3] <= transformed[1]) throw std::runtime_error("transformed bbox loses strict corner ordering");
+  labels = count;
   if (!exceeded) {
-   label.bbox_x1=transformed[0]; label.bbox_y1=transformed[1]; label.bbox_x2=transformed[2]; label.bbox_y2=transformed[3];
-   label.mask_rle_offset=first*sizeof(RLEPair); label.mask_rle_pairs=checked_cast<std::uint16_t>(mask_runs,"too many RLE pairs for one instance");
+   label.bbox_x1 = transformed[0];
+   label.bbox_y1 = transformed[1];
+   label.bbox_x2 = transformed[2];
+   label.bbox_y2 = transformed[3];
+   label.mask_rle_offset = first * sizeof(RLEPair);
+   label.mask_rle_pairs = checked_cast<std::uint16_t>(mask_runs, "too many RLE pairs for one instance");
    output.labels.push_back(label);
   }
-  mmltk::common::logging::profile_add_value("compiler.labels.instances",1);
-  mmltk::common::logging::profile_add_value("compiler.labels.rle_pairs",mask_runs);
-  projection.reset(); record_active=false;
+  mmltk::common::logging::profile_add_value("compiler.labels.instances", 1);
+  mmltk::common::logging::profile_add_value("compiler.labels.rle_pairs", mask_runs);
+  projection.reset();
+  record_active = false;
  }
 };
 DirectoryLabels::DirectoryLabels(detail::CompileExecution& execution) : parser_(std::make_unique<Parser>(execution)) {}
 DirectoryLabels::~DirectoryLabels() = default;
-detail::CompileResources DirectoryLabels::resources(std::uint32_t width,std::size_t maximum_line) {
- const auto input=padded_line_bytes(maximum_line);
- const auto source=aligned_bytes(checked_multiply(source_run_capacity(maximum_line),sizeof(RLEPair),"source mask workspace overflow"));
- const auto stack=aligned_bytes(checked_multiply(json_stack_capacity(maximum_line),sizeof(DatasetAnnotationFrame),"JSON traversal workspace overflow"));
+detail::CompileResources DirectoryLabels::resources(std::uint32_t width, std::size_t maximum_line) {
+ const auto input = padded_line_bytes(maximum_line);
+ const auto source = aligned_bytes(checked_multiply(source_run_capacity(maximum_line), sizeof(RLEPair), "source mask workspace overflow"));
+ const auto stack = aligned_bytes(checked_multiply(json_stack_capacity(maximum_line), sizeof(DatasetAnnotationFrame), "JSON traversal workspace overflow"));
  // simdjson owns its decoded strings, structural indexes and depth stack.
  // Payload buffers we control are supplied; the parser's fixed opaque allocation
  // is separately charged for the full lifetime of this context, including yields.
- const auto opaque=maximum_line>directory_line_window ? parser_bytes(maximum_line) : 0;
- return {.bytes=checked_add(detail::CompiledLabelWorkspace::required_bytes(width),checked_add(checked_add(input,source,"annotation workspace overflow"),stack,"annotation workspace overflow"),"annotation workspace overflow"),
-  .supplied_workspace=true,.completion_workspace=true,.workspace_class=detail::CompileWorkClass::Annotations,.opaque_bytes=opaque};
+ const auto opaque = maximum_line > directory_line_window ? parser_bytes(maximum_line) : 0;
+ return {
+  .bytes = checked_add(detail::CompiledLabelWorkspace::required_bytes(width), checked_add(checked_add(input, source, "annotation workspace overflow"), stack, "annotation workspace overflow"),
+   "annotation workspace overflow"),
+  .supplied_workspace = true,
+  .completion_workspace = true,
+  .workspace_class = detail::CompileWorkClass::Annotations,
+  .opaque_bytes = opaque
+ };
 }
-void DirectoryLabels::begin(std::uint32_t image_index,detail::CompileAllowance allowance,std::span<const std::uint8_t> input,std::size_t maximum_line,const detail::CompileImageHeader& header,
- const CompilerConfig& config,const catalog::ClassCatalog& catalog,std::uint8_t category_base,std::filesystem::path annotation,std::filesystem::path image) {
- impl_=std::make_unique<Impl>(); auto& value=*impl_;
- value.custody=allowance; value.output.prepare(header.width,allowance);
- auto memory=allowance.workspace().subspan(detail::CompiledLabelWorkspace::required_bytes(header.width));
- const auto padded=padded_line_bytes(maximum_line);
- value.line_buffer={reinterpret_cast<char*>(memory.data()),padded}; memory=memory.subspan(padded);
- std::ranges::fill(value.line_buffer,'\0');
- value.source_runs.bind({reinterpret_cast<RLEPair*>(memory.data()),source_run_capacity(maximum_line)});
- memory=memory.subspan(aligned_bytes(checked_multiply(source_run_capacity(maximum_line),sizeof(RLEPair),"source mask workspace overflow")));
- value.json_stack.bind({reinterpret_cast<DatasetAnnotationFrame*>(memory.data()),json_stack_capacity(maximum_line)});
- value.parser=&parser_->value;
- if (maximum_line>directory_line_window) {
-  value.exceptional_parser=std::make_unique<simdjson::ondemand::parser>();
-  value.exceptional_parser->threaded=false;
-  if (const auto error=value.exceptional_parser->allocate(maximum_line,json_stack_capacity(maximum_line)+1)) throw simdjson::simdjson_error(error);
-  value.parser=value.exceptional_parser.get();
+void DirectoryLabels::begin(std::uint32_t image_index, detail::CompileAllowance allowance, std::span<const std::uint8_t> input, std::size_t maximum_line, const detail::CompileImageHeader& header,
+ const CompilerConfig& config, const catalog::ClassCatalog& catalog, std::uint8_t category_base, std::filesystem::path annotation, std::filesystem::path image) {
+ impl_ = std::make_unique<Impl>();
+ auto& value = *impl_;
+ value.custody = allowance;
+ value.output.prepare(header.width, allowance);
+ auto memory = allowance.workspace().subspan(detail::CompiledLabelWorkspace::required_bytes(header.width));
+ const auto padded = padded_line_bytes(maximum_line);
+ value.line_buffer = {reinterpret_cast<char*>(memory.data()), padded};
+ memory = memory.subspan(padded);
+ std::ranges::fill(value.line_buffer, '\0');
+ value.source_runs.bind({reinterpret_cast<RLEPair*>(memory.data()), source_run_capacity(maximum_line)});
+ memory = memory.subspan(aligned_bytes(checked_multiply(source_run_capacity(maximum_line), sizeof(RLEPair), "source mask workspace overflow")));
+ value.json_stack.bind({reinterpret_cast<DatasetAnnotationFrame*>(memory.data()), json_stack_capacity(maximum_line)});
+ value.parser = &parser_->value;
+ if (maximum_line > directory_line_window) {
+  value.exceptional_parser = std::make_unique<simdjson::ondemand::parser>();
+  value.exceptional_parser->threaded = false;
+  if (const auto error = value.exceptional_parser->allocate(maximum_line, json_stack_capacity(maximum_line) + 1)) throw simdjson::simdjson_error(error);
+  value.parser = value.exceptional_parser.get();
  }
- value.image_index=image_index; value.input=input; value.config=&config; value.catalog=&catalog; value.category_base=category_base; value.annotation=std::move(annotation); value.image=std::move(image);
- value.dimensions={header.width,header.height};
- value.geometry=imaging::resample::compute_image_resize_geometry(header.width,header.height,config.target_width,config.target_height,config.resize_mode);
- value.result.status=ImageStatus::Eligible; value.result.original_width=header.width; value.result.original_height=header.height;
+ value.image_index = image_index;
+ value.input = input;
+ value.config = &config;
+ value.catalog = &catalog;
+ value.category_base = category_base;
+ value.annotation = std::move(annotation);
+ value.image = std::move(image);
+ value.dimensions = {header.width, header.height};
+ value.geometry = imaging::resample::compute_image_resize_geometry(header.width, header.height, config.target_width, config.target_height, config.resize_mode);
+ value.result.status = ImageStatus::Eligible;
+ value.result.original_width = header.width;
+ value.result.original_height = header.height;
 }
 bool DirectoryLabels::step(mmltk::common::concurrency::CancellationObservation cancellation) {
- auto& value=*impl_;
- for (std::size_t records=0;records<32;++records) {
+ auto& value = *impl_;
+ for (std::size_t records = 0; records < 32; ++records) {
   if (cancellation.requested()) throw std::runtime_error("dataset compilation cancelled");
   if (!value.record_active) {
-   if (value.cursor==value.input.size()) {
-    set_annotation_extent(value.result,value.labels,value.required_runs,value.image.string());
-    FileHeader checks{}; checks.num_classes=checked_cast<std::uint32_t>(value.catalog->size(),"class count overflow"); checks.max_instances_per_image=UINT16_MAX;
-    checks.image_width=value.config->target_width; checks.image_height=value.config->target_height;
-    (void)admit_compiled_annotations(value.result,{{value.output.labels.data(),value.output.labels.size()},{value.output.runs.data(),value.output.runs.size()}},checks,value.image_index,cancellation);
-    value.finished=true; return true;
+   if (value.cursor == value.input.size()) {
+    set_annotation_extent(value.result, value.labels, value.required_runs, value.image.string());
+    FileHeader checks{};
+    checks.num_classes = checked_cast<std::uint32_t>(value.catalog->size(), "class count overflow");
+    checks.max_instances_per_image = UINT16_MAX;
+    checks.image_width = value.config->target_width;
+    checks.image_height = value.config->target_height;
+    (void)admit_compiled_annotations(
+     value.result, {{value.output.labels.data(), value.output.labels.size()}, {value.output.runs.data(), value.output.runs.size()}}, checks, value.image_index, cancellation);
+    value.finished = true;
+    return true;
    }
-   const auto* begin=value.input.data()+value.cursor;
-   const auto* newline=static_cast<const std::uint8_t*>(std::memchr(begin,'\n',value.input.size()-value.cursor));
-   const auto bytes=newline ? static_cast<std::size_t>(newline-begin) : value.input.size()-value.cursor;
+   const auto* begin = value.input.data() + value.cursor;
+   const auto* newline = static_cast<const std::uint8_t*>(std::memchr(begin, '\n', value.input.size() - value.cursor));
+   const auto bytes = newline ? static_cast<std::size_t>(newline - begin) : value.input.size() - value.cursor;
    ++value.line_number;
    if (bytes) value.open_record(bytes);
-   value.cursor+=bytes+(newline ? 1 : 0);
+   value.cursor += bytes + (newline ? 1 : 0);
    if (!bytes) continue;
   }
   try {
    if (!value.runs_complete) {
     if (!value.parse_runs()) return false;
-    value.runs_complete=true;
+    value.runs_complete = true;
    }
    if (!value.project_runs()) return false;
    value.finish_record();
@@ -418,7 +471,9 @@ detail::CompiledLabelWorkspace::OutputLease DirectoryLabels::release_output() {
  return impl_->output.release_output();
 }
 void DirectoryLabels::take_diagnostics(std::vector<CompileDiagnostic>& destination) {
- for (auto& value:impl_->diagnostics) try { destination.push_back(std::move(value)); } catch (...) {}
+ for (auto& value : impl_->diagnostics) try {
+   destination.push_back(std::move(value));
+  } catch (...) {}
  impl_->diagnostics.clear();
 }
 void DirectoryLabels::reset() noexcept { impl_.reset(); }

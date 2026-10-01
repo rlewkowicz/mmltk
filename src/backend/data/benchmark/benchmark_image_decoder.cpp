@@ -15,12 +15,14 @@ bool has_complete_image_markers(const std::span<const std::uint8_t> encoded) noe
  return end >= 4U && encoded[end - 2U] == 0xFFU && encoded[end - 1U] == 0xD9U;
 }
 BenchmarkImageHeader BenchmarkImageDecoder::read_header(std::span<const std::uint8_t> encoded, std::uint32_t width, std::uint32_t height) {
- try { return decoder_.read_header(encoded, detail::CompileImagePolicy::Benchmark, width, height); }
- catch (const detail::CompileImageError& error) { throw BenchmarkImageError(error.what()); }
+ try {
+  return decoder_.read_header(encoded, detail::CompileImagePolicy::Benchmark, width, height);
+ } catch (const detail::CompileImageError& error) { throw BenchmarkImageError(error.what()); }
 }
 std::span<const std::uint8_t> BenchmarkImageDecoder::decode_rgb(std::span<const std::uint8_t> encoded, const BenchmarkImageHeader& header, std::span<std::byte> workspace) {
- try { return decoder_.decode_rgb(encoded, header, workspace); }
- catch (const detail::CompileImageError& error) { throw BenchmarkImageError(error.what()); }
+ try {
+  return decoder_.decode_rgb(encoded, header, workspace);
+ } catch (const detail::CompileImageError& error) { throw BenchmarkImageError(error.what()); }
 }
 namespace {
 namespace common_io = mmltk::common::io;
@@ -61,9 +63,10 @@ std::pair<std::uint32_t, std::uint32_t> BenchmarkImageValidator::validate_file(c
 void BenchmarkImageValidator::validate_decodable(const std::span<const std::uint8_t> encoded, const std::uint32_t expected_width, const std::uint32_t expected_height) {
  try {
   const BenchmarkImageHeader header = decoder_.read_header(encoded, expected_width, expected_height);
-  if (!workspace_) workspace_ = std::make_unique<mmltk::common::system::NumaMemory>(mmltk::common::system::NumaTopology::Capture().permitted_nodes.front(), mmltk::common::system::NumaMemory::Lock::Pages);
+  if (!workspace_)
+   workspace_ = std::make_unique<mmltk::common::system::NumaMemory>(mmltk::common::system::NumaTopology::Capture().permitted_nodes.front(), mmltk::common::system::NumaMemory::Lock::Pages);
   workspace_->ensure_bytes(BenchmarkImageDecoder::plan(header).bytes());
-  (void)decoder_.decode_rgb(encoded, header, {static_cast<std::byte*>(workspace_->data()),workspace_->capacity_bytes()});
+  (void)decoder_.decode_rgb(encoded, header, {static_cast<std::byte*>(workspace_->data()), workspace_->capacity_bytes()});
  } catch (const BenchmarkImageError& error) { throw InvalidImageError(std::string("cannot fully decode benchmark image: ") + error.what()); }
 }
 void BenchmarkImageValidator::validate_decodable_file(const std::filesystem::path& path, const std::uint32_t expected_width, const std::uint32_t expected_height) {

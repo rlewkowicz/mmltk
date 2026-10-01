@@ -40,7 +40,7 @@ struct CompileExecutionLimits {
  std::uint64_t transient_bytes = 0;
  std::size_t descriptors = 0;
  std::size_t task_records = 0;
- std::shared_ptr<const CompileWorkspacePlan> workspace_plan;
+ std::shared_ptr<const CompileWorkspacePlan> workspace_plan{};
 };
 // Shared custody charges backing once and returns it after its last reader.
 class CompileAllowance {

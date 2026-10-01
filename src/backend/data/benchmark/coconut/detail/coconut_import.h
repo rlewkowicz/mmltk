@@ -56,7 +56,10 @@ public:
  }
  [[nodiscard]] std::size_t size() const noexcept { return rows_.size(); }
  [[nodiscard]] bool metadata_complete() const noexcept { return metadata_rows_.load(std::memory_order_relaxed) == rows_.size(); }
- [[nodiscard]] const Row& row(std::size_t i) const { const std::lock_guard lock(rows_mutex_); return rows_.at(i); }
+ [[nodiscard]] const Row& row(std::size_t i) const {
+  const std::lock_guard lock(rows_mutex_);
+  return rows_.at(i);
+ }
  [[nodiscard]] const CoconutRecord& record(std::size_t i) const { return row(i).record(); }
  [[nodiscard]] const std::deque<Row>& rows() const noexcept { return rows_; }
  void admit_metadata(std::size_t, CoconutRecord);
@@ -88,10 +91,10 @@ private:
  bool prefixes_sealed_ = false;
 };
 struct CoconutAnnotationInput {
- std::span<const std::uint8_t> png;
+ std::span<const std::uint8_t> png{};
  // Keeps the Arrow batch and its complete pool alive, including after the
  // forward reader closes. Production bounds outstanding batch borrowers.
- std::shared_ptr<const void> backing;
+ std::shared_ptr<const void> backing{};
  std::uint64_t live_bytes = 0;
  bool membership = false;
  // Archive inputs suspend their forward decoder before exceptional semantic
@@ -103,16 +106,16 @@ struct CoconutAnnotationInput {
 // reacquires a complete allocation window before the next library call.
 using CoconutRecordConsumer = std::function<void(std::size_t group, const CoconutRecord&, const CoconutAnnotationInput&)>;
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only = false, detail::CompileExecution* execution = nullptr, detail::FileWorkQueue* files = nullptr, const std::function<void()>& settle_consumers = {},
- const CompileAllowance& parent = {}, CoconutAnnotationRecords* retained = nullptr,
- const std::function<bool(const CoconutRecord&)>& reusable_native = {},
- const std::function<bool(const CoconutRecord&,std::span<const std::uint8_t>)>& exceptional = {}, const BenchmarkTraceSink& trace = {});
+ const CoconutRecordConsumer& consumer, bool metadata_only = false, detail::CompileExecution* execution = nullptr, detail::FileWorkQueue* files = nullptr,
+ const std::function<void()>& settle_consumers = {}, const CompileAllowance& parent = {}, CoconutAnnotationRecords* retained = nullptr,
+ const std::function<bool(const CoconutRecord&)>& reusable_native = {}, const std::function<bool(const CoconutRecord&, std::span<const std::uint8_t>)>& exceptional = {},
+ const BenchmarkTraceSink& trace = {});
 // Import subscriptions extend the component's original-generation value without
 // making component validation depend on the execution-side notification.
 struct CoconutOriginalReadiness : CoconutOriginalInput {
  detail::CompileExecution::Completion changed;
- CoconutOriginalReadiness(std::shared_ptr<const CoconutRecoveryOriginals> value={},bool complete=false,std::uint64_t version=0,detail::CompileExecution::Completion next={})
-  : CoconutOriginalInput{std::move(value),complete,version},changed(std::move(next)) {}
+ CoconutOriginalReadiness(std::shared_ptr<const CoconutRecoveryOriginals> value = {}, bool complete = false, std::uint64_t version = 0, detail::CompileExecution::Completion next = {})
+     : CoconutOriginalInput{std::move(value), complete, version}, changed(std::move(next)) {}
 };
 using CoconutOriginalProvider = std::function<CoconutOriginalReadiness(CoconutImageNamespace, bool wait, std::stop_token)>;
 enum class CoconutPreparationStage : std::uint8_t { Archive, Images, Annotations, Membership };
@@ -161,4 +164,4 @@ struct CoconutImportRequest {
 // Discover generation-bound mask locators while its external JSON is still pending.
 [[nodiscard]] std::shared_ptr<BenchmarkArchive> discover_coconut_masks(const CoconutImportRequest&, std::stop_token);
 [[nodiscard]] std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequest& request);
-}
+}  // namespace mmltk::backend::data::benchmark_internal
