@@ -1,6 +1,7 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
+#include "src/backend/data/detail/file_work_queue.h"
 #include <atomic>
 #include <functional>
 #include <array>
@@ -155,6 +156,11 @@ private:
 // its admitted product without a later traversal over freshly produced masks.
 class NormalizedAnnotationAssembler final {
 public:
+ // Gather derives its exact destination once, then prepares storage separately
+ // from the admitted CPU plan. The explicit-capacity constructor also supports
+ // standalone incremental assembly.
+ explicit NormalizedAnnotationAssembler(NormalizedAnnotationMetadata, mmltk::common::concurrency::CancellationObservation,
+  const std::filesystem::path& staging_directory, detail::StorageReservationPool* = nullptr);
  explicit NormalizedAnnotationAssembler(NormalizedAnnotationMetadata, std::size_t images, std::size_t boxes, std::size_t runs, mmltk::common::concurrency::CancellationObservation = {},
   const std::filesystem::path& staging_directory = {}, detail::StorageReservationPool* = nullptr);
  NormalizedAnnotationAssembler(const NormalizedAnnotationAssembler&) = delete;
@@ -168,16 +174,20 @@ public:
  };
  // Planning fixes canonical disjoint destinations before any worker writes.
  // Each task admits/copies at most 65,536 runs or 256 boxes, then yields.
- void gather(std::span<const Slice>, CompileExecution* = nullptr);
+ void gather(std::span<const Slice>, CompileExecution* = nullptr, detail::FileWorkQueue* = nullptr, const CompileAllowance& = {});
  void begin_image(NormalizedImage);
  void append_box(NormalizedBox, std::span<const RLEPair>);
  [[nodiscard]] NormalizedAnnotationIndex finish(const BenchmarkTraceSink& = {});
 
 private:
+ void prepare(std::size_t images, std::size_t boxes, std::size_t runs);
  NormalizedAnnotationBuilder builder_;
  struct Mapped;
  std::shared_ptr<Mapped> mapped_;
  mmltk::common::concurrency::CancellationObservation cancellation_;
+ std::filesystem::path staging_directory_;
+ detail::StorageReservationPool* storage_ = nullptr;
+ bool prepared_ = false;
  bool finished_ = false;
  bool incomplete_gather_ = false;
 };

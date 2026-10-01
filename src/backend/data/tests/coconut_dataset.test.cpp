@@ -8738,6 +8738,7 @@ TEST_CASE("artifact identity settlement withdraws exact labels and preserves pix
  const std::array parts{CoconutComponentPart{components[0], 0, 0}, CoconutComponentPart{components[1], 2, incomplete ? std::optional<std::uint64_t>{} : std::optional<std::uint64_t>{2}}};
  std::vector<CoconutInventoryImage> rejected;
  const auto merged = merge_coconut_components(parts, "release", *input.physical_membership, directory.path(), {}, nullptr, &pipeline, [&](const CoconutInventoryImage& image, std::string_view reason) {
+  CHECK_FALSE(pipeline.execution().on_lane());
   CHECK(reason == "ambiguous annotation physical identity");
   rejected.push_back(image);
  });
@@ -9523,4 +9524,121 @@ TEST_CASE("accepted staging preparation retains charged custody through physical
  CHECK(lifetime.expired()); CHECK(immutable.values.front()==std::byte{0x46});
  CHECK_FALSE(std::filesystem::is_empty(root.path()));
  immutable={}; CHECK(std::filesystem::is_empty(root.path()));
+}
+
+TEST_CASE("component planning and physical output retain their admitted custody", "[benchmark][coconut][annotations][resources]") {
+ using namespace mmltk::backend::data::detail;
+ using namespace std::chrono_literals;
+ const auto workers = GENERATE(std::size_t{1}, std::size_t{2});
+ const bool metadata_only = GENERATE(false, true);
+ const auto failure = GENERATE(0, 1, 2);
+ CAPTURE(workers, metadata_only, failure);
+ if (mmltk::common::system::allowed_cpu_set().size() < workers) SKIP("requires the selected assigned CPUs");
+ ScopedTempDir root("coconut-component-admission");
+ const std::array physical{coco(7), coco(11)};
+ auto input = request(physical);
+ CoconutComponentBuilder source;
+ source.edition = input.edition;
+ source.source = CoconutImageNamespace::CocoTrain;
+ source.input_identity = "previous";
+ source.annotation_input_identity = input.input_identity;
+ source.index.source = coconut_index_source(source.source);
+ source.index.split = coconut_component_split(source.edition, source.source);
+ for (std::size_t i = 0; i < physical.size(); ++i) {
+  source.index.images.push_back({.source_image_id = physical[i].image_id, .width = 1, .height = 1});
+  source.inventory.push_back({physical[i], physical[i].image_id, i});
+ }
+ auto previous_builder = source;
+ const auto previous = std::move(previous_builder).finish({}, root.path());
+ const auto published = root.path() / "published.normalized.bin";
+ store_coconut_component(published, previous);
+ const auto previous_index = file_bytes(published);
+ const auto previous_inventory = file_bytes(published.string() + ".inventory");
+ const auto previous_completion = file_bytes(published.string() + ".complete.json");
+ BenchmarkCompilePipeline pipeline(workers);
+ auto allowance = pipeline.execution().reserve(coconut_component_assembly_resources(physical.size()));
+ mmltk::testsupport::TestGate metadata("component inventory planning holds its Metadata grant");
+ mmltk::testsupport::TestGate preparation("normalized destination preparation holds its physical service");
+ mmltk::testsupport::TestGate sealing("inventory sealing holds its physical service");
+ struct Observation {
+  CompileExecution& execution;
+  const CompileAllowance& allowance;
+  mmltk::testsupport::TestGate& metadata;
+  mmltk::testsupport::TestGate& preparation;
+  mmltk::testsupport::TestGate& sealing;
+  bool metadata_only;
+  std::thread::id controller;
+  mutable std::atomic<bool> planned{false}, gathered{false}, prepared{false}, sealed{false}, charged{true};
+  std::atomic<bool> stop{false};
+  bool cancelled() const noexcept {
+   if (execution.on_lane()) {
+    const auto current = execution.current_allowance();
+    if (!current.aliases(allowance)) charged = false;
+    const auto state = execution.snapshot();
+    if (state.running[static_cast<std::size_t>(CompileWorkClass::Annotations)] && !planned.exchange(true)) metadata.receipt().ArriveAndWait();
+    if (state.running[static_cast<std::size_t>(CompileWorkClass::Gather)]) gathered = true;
+   } else if (std::this_thread::get_id() != controller && execution.snapshot().services) {
+    if (!metadata_only && !prepared.exchange(true)) preparation.receipt().ArriveAndWait();
+    else if (!sealed.exchange(true)) sealing.receipt().ArriveAndWait();
+   }
+   return stop.load();
+  }
+ } observation{pipeline.execution(), allowance, metadata, preparation, sealing, metadata_only, {}};
+ std::vector<CoconutComponentImage> rows;
+ for (std::size_t i : {std::size_t{1}, std::size_t{0}})
+  rows.push_back({&source, &source.index, &source.index.images[i], {}, {}, &source.inventory[i], nullptr, 0});
+ const std::array<std::size_t, 2> ordinals{20, 10};
+ auto assembling = std::async(std::launch::async, [&] {
+  observation.controller = std::this_thread::get_id();
+  return assemble_coconut_component(source, rows, {}, metadata_only, 2, 0, ordinals, {}, *input.physical_membership, nullptr, root.path(),
+   mmltk::common::concurrency::CancellationObservation::Borrow(observation), &pipeline.storage(), &pipeline, allowance, false, {});
+ });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  metadata.Release(); preparation.Release(); sealing.Release(); pipeline.execution().cancel();
+ });
+ REQUIRE(metadata.WaitEntered(5s));
+ CHECK(pipeline.execution().snapshot().running[static_cast<std::size_t>(CompileWorkClass::Annotations)] == 1);
+ CHECK(pipeline.execution().resource_usage().descriptors == 1);
+ observation.stop = failure == 1;
+ metadata.Release();
+ if (failure != 1 && !metadata_only) {
+  REQUIRE(preparation.WaitEntered(5s));
+  CHECK(observation.gathered.load());
+  CHECK(pipeline.execution().snapshot().services == 1);
+  CHECK(pipeline.execution().resource_usage().descriptors == 1);
+  if (workers > 1) {
+   auto independent = std::async(std::launch::async, [&] { pipeline.execution().run(CompileTaskKind::Metadata, {}, [](std::size_t) {}); });
+   const mmltk::testsupport::ScopedTestCleanup unblock([&] { preparation.Release(); });
+   mmltk::testsupport::await_test_future(independent, "independent CPU work completes while component preparation is held", 5s);
+   CHECK(assembling.wait_for(0ms) == std::future_status::timeout);
+  }
+  preparation.Release();
+ }
+ if (failure != 1) {
+  REQUIRE(sealing.WaitEntered(5s));
+  CHECK(pipeline.execution().snapshot().services == 1);
+  CHECK(pipeline.execution().resource_usage().descriptors == 1);
+  observation.stop = failure == 2;
+  sealing.Release();
+ }
+ CHECK(observation.charged.load());
+ if (failure) CHECK_THROWS(mmltk::testsupport::await_test_future(assembling, "failed planning or inventory sealing cannot complete a component", 5s));
+ else {
+  const auto component = mmltk::testsupport::await_test_future(assembling, "one controller joins admitted planning, copies and physical output", 5s);
+  REQUIRE(component);
+  CHECK(component->index().image_count() == 2);
+  CHECK(component->inventory_image(0).physical.image_id == 7);
+  CHECK(component->inventory_image(1).physical.image_id == 11);
+  CHECK(component->inventory_image(0).source_ordinal == (metadata_only ? 0 : 20));
+  CHECK(component->inventory_image(1).source_ordinal == (metadata_only ? 1 : 10));
+  CHECK(component->source_extent_complete());
+  if (!metadata_only) REQUIRE_NOTHROW(admit_coconut_component(*component));
+ }
+ pipeline.files().join();
+ allowance = {};
+ CHECK(pipeline.execution().resource_usage().descriptors == 0);
+ CHECK(pipeline.execution().snapshot().leased == 0);
+ CHECK(file_bytes(published) == previous_index);
+ CHECK(file_bytes(published.string() + ".inventory") == previous_inventory);
+ CHECK(file_bytes(published.string() + ".complete.json") == previous_completion);
 }

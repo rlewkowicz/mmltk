@@ -1057,19 +1057,27 @@ struct NormalizedAnnotationAssembler::Mapped {
  std::size_t image_count = 0, box_count = 0, run_count = 0;
  Mapped(detail::StorageReservationPool& storage, const std::filesystem::path& path, std::size_t bytes) : artifact(storage, path, bytes, "normalized annotation assembly") {}
 };
-NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(NormalizedAnnotationMetadata metadata, std::size_t images, std::size_t boxes, std::size_t runs,
+NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(NormalizedAnnotationMetadata metadata,
  mmltk::common::concurrency::CancellationObservation cancellation, const std::filesystem::path& staging_directory, detail::StorageReservationPool* storage)
-    : cancellation_(cancellation) {
+    : cancellation_(cancellation), staging_directory_(staging_directory), storage_(storage) {
  throw_if_benchmark_cancelled(cancellation_);
  static_cast<NormalizedAnnotationMetadata&>(builder_) = std::move(metadata);
- if (!staging_directory.empty()) {
+}
+NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(NormalizedAnnotationMetadata metadata, std::size_t images, std::size_t boxes, std::size_t runs,
+ mmltk::common::concurrency::CancellationObservation cancellation, const std::filesystem::path& staging_directory, detail::StorageReservationPool* storage)
+    : NormalizedAnnotationAssembler(std::move(metadata), cancellation, staging_directory, storage) {
+ prepare(images, boxes, runs);
+}
+void NormalizedAnnotationAssembler::prepare(std::size_t images, std::size_t boxes, std::size_t runs) {
+ throw_if_benchmark_cancelled(cancellation_);
+ if (!staging_directory_.empty()) {
   const auto image_bytes = mmltk::common::math::checked_multiply(images, sizeof(NormalizedImage), "normalized image staging overflow");
   const auto box_bytes = mmltk::common::math::checked_multiply(boxes, sizeof(NormalizedBox), "normalized box staging overflow");
   const auto run_offset = mmltk::common::math::checked_add(image_bytes, box_bytes, "normalized staging overflow");
   const auto bytes = mmltk::common::math::checked_add(run_offset, mmltk::common::math::checked_multiply(runs, sizeof(RLEPair), "normalized run staging overflow"), "normalized staging overflow");
-  std::filesystem::create_directories(staging_directory);
-  detail::StorageReservationPool reservations(staging_directory, {}, storage);
-  auto owner = std::make_shared<Mapped>(reservations, staging_directory / ".normalized-assembly", bytes);
+  std::filesystem::create_directories(staging_directory_);
+  detail::StorageReservationPool reservations(staging_directory_, {}, storage_);
+  auto owner = std::make_shared<Mapped>(reservations, staging_directory_ / ".normalized-assembly", bytes);
   auto* data = static_cast<std::byte*>(owner->artifact.map_writable());
   if (bytes) {
    owner->images = {reinterpret_cast<NormalizedImage*>(data), images};
@@ -1077,11 +1085,12 @@ NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(NormalizedAnnotatio
    owner->runs = {reinterpret_cast<RLEPair*>(data + run_offset), runs};
   }
   mapped_ = std::move(owner);
-  return;
+ } else {
+  builder_.images.reserve(images);
+  builder_.boxes.reserve(boxes);
+  builder_.mask_rle_pairs.reserve(runs);
  }
- builder_.images.reserve(images);
- builder_.boxes.reserve(boxes);
- builder_.mask_rle_pairs.reserve(runs);
+ prepared_ = true;
 }
 namespace {
 void validate_assembled_image(const NormalizedImage& image, BenchmarkDatasetSource source, std::optional<std::uint64_t> previous) {
@@ -1093,35 +1102,48 @@ void validate_assembled_box(NormalizedBox& box, std::size_t runs, BenchmarkDatas
  validate_box_value(box, source);
 }
 }
-void NormalizedAnnotationAssembler::gather(std::span<const Slice> slices, CompileExecution* execution) {
+void NormalizedAnnotationAssembler::gather(std::span<const Slice> slices, CompileExecution* execution, detail::FileWorkQueue* files, const CompileAllowance& allowance) {
  if (finished_ || incomplete_gather_ || (mapped_ ? mapped_->image_count : builder_.images.size())) throw std::logic_error("normalized gather requires an empty assembler");
+ if (execution && execution->on_lane()) throw std::logic_error("normalized gather requires a controller outside CPU work");
+ // Every planning/preparation/copy failure leaves the assembler unsealable.
+ incomplete_gather_ = true;
  struct Cursor { std::size_t first_box, first_run, box=0, run=0, output_run=0; std::uint64_t previous=0; bool complete=false; };
  std::vector<Cursor> cursors;
- cursors.reserve(slices.size());
  std::size_t boxes=0,runs=0;
- std::optional<std::uint64_t> previous;
- for (const auto& slice : slices) {
+ auto producer=execution ? execution->open_class(detail::CompileWorkClass::Gather) : CompileExecution::Producer{};
+ const auto plan = [&](std::size_t) {
   throw_if_benchmark_cancelled(cancellation_);
-  validate_assembled_image(slice.image,builder_.source,previous);
-  previous=slice.image.source_image_id;
-  if (slice.image.box_count != slice.boxes.size()) throw std::runtime_error("normalized gather box extent mismatch");
-  cursors.push_back({boxes,runs});
-  boxes=common::math::checked_add(boxes,slice.boxes.size(),"normalized gather box overflow");
-  for (const auto& box : slice.boxes) {
-   if (box.mask_rle_offset>slice.runs.size() || box.mask_rle_pairs>slice.runs.size()-box.mask_rle_offset) throw std::runtime_error("normalized gather run extent mismatch");
-   runs=common::math::checked_add(runs,std::size_t{box.mask_rle_pairs},"normalized gather run overflow");
+  cursors.reserve(slices.size());
+  std::optional<std::uint64_t> previous;
+  for (const auto& slice : slices) {
+   throw_if_benchmark_cancelled(cancellation_);
+   validate_assembled_image(slice.image,builder_.source,previous);
+   previous=slice.image.source_image_id;
+   if (slice.image.box_count != slice.boxes.size()) throw std::runtime_error("normalized gather box extent mismatch");
+   cursors.push_back({boxes,runs});
+   boxes=common::math::checked_add(boxes,slice.boxes.size(),"normalized gather box overflow");
+   for (const auto& box : slice.boxes) {
+    if (box.mask_rle_offset>slice.runs.size() || box.mask_rle_pairs>slice.runs.size()-box.mask_rle_offset) throw std::runtime_error("normalized gather run extent mismatch");
+    runs=common::math::checked_add(runs,std::size_t{box.mask_rle_pairs},"normalized gather run overflow");
+   }
   }
- }
- incomplete_gather_=true;
- if (mapped_) {
-  if (slices.size()!=mapped_->images.size() || boxes!=mapped_->boxes.size() || runs!=mapped_->runs.size()) throw std::runtime_error("normalized gather planned extent mismatch");
- } else {
-  builder_.images.resize(slices.size()); builder_.boxes.resize(boxes); builder_.mask_rle_pairs.resize(runs);
+  if (mapped_) {
+   if (slices.size()!=mapped_->images.size() || boxes!=mapped_->boxes.size() || runs!=mapped_->runs.size()) throw std::runtime_error("normalized gather planned extent mismatch");
+  } else if (staging_directory_.empty()) {
+   builder_.images.resize(slices.size()); builder_.boxes.resize(boxes); builder_.mask_rle_pairs.resize(runs);
+   prepared_ = true;
+  }
+ };
+ if (execution) execution->run(CompileTaskKind::Gather, {}, plan, allowance);
+ else plan(0);
+ if (!prepared_) {
+  const auto prepare_destination = [&, allowance] { prepare(slices.size(), boxes, runs); };
+  if (files) files->submit({.work = prepare_destination}).wait();
+  else prepare_destination();
  }
  auto images=mapped_ ? mapped_->images : std::span(builder_.images);
  auto output_boxes=mapped_ ? mapped_->boxes : std::span(builder_.boxes);
  auto output_runs=mapped_ ? mapped_->runs : std::span(builder_.mask_rle_pairs);
- auto producer=execution ? execution->open_class(detail::CompileWorkClass::Gather) : CompileExecution::Producer{};
  const auto chunk=[&](std::size_t i) {
   auto& cursor=cursors[i]; const auto& slice=slices[i];
   if (cursor.complete) return;
@@ -1166,7 +1188,7 @@ void NormalizedAnnotationAssembler::gather(std::span<const Slice> slices, Compil
     }
     while (next<slices.size() && active.size()<active.capacity()) active.push_back({next++,{}});
     for (auto& item : active) if (!item.completion) {
-     auto admitted=execution->try_submit({.kind=CompileTaskKind::Gather,.work=[&,image=item.image](std::size_t,const CompileAllowance&) { chunk(image); }});
+     auto admitted=execution->try_submit({.kind=CompileTaskKind::Gather,.work=[&,image=item.image](std::size_t,const CompileAllowance&) { chunk(image); },.allowance=allowance});
      if (admitted) item.completion=std::move(*admitted);
     }
     if (next<slices.size() || !active.empty()) execution->wait_for_admission_change(observed);
@@ -1179,7 +1201,7 @@ void NormalizedAnnotationAssembler::gather(std::span<const Slice> slices, Compil
  incomplete_gather_=false;
 }
 void NormalizedAnnotationAssembler::begin_image(NormalizedImage image) {
- if (finished_ || incomplete_gather_) throw std::logic_error("normalized assembler is sealed or has incomplete gather work");
+ if (!prepared_ || finished_ || incomplete_gather_) throw std::logic_error("normalized assembler is unprepared, sealed or has incomplete gather work");
  throw_if_benchmark_cancelled(cancellation_);
  const auto images = mapped_ ? mapped_->images.first(mapped_->image_count) : std::span(builder_.images);
  validate_assembled_image(image,builder_.source,images.empty() ? std::nullopt : std::optional{images.back().source_image_id});
@@ -1192,7 +1214,7 @@ void NormalizedAnnotationAssembler::begin_image(NormalizedImage image) {
   builder_.images.push_back(image);
 }
 void NormalizedAnnotationAssembler::append_box(NormalizedBox box, std::span<const RLEPair> runs) {
- if (finished_ || incomplete_gather_) throw std::logic_error("normalized assembler is sealed or has incomplete gather work");
+ if (!prepared_ || finished_ || incomplete_gather_) throw std::logic_error("normalized assembler is unprepared, sealed or has incomplete gather work");
  throw_if_benchmark_cancelled(cancellation_);
  const auto images = mapped_ ? mapped_->images.first(mapped_->image_count) : std::span(builder_.images);
  if (images.empty()) throw std::logic_error("normalized box requires an owning image");
@@ -1223,7 +1245,7 @@ void NormalizedAnnotationAssembler::append_box(NormalizedBox box, std::span<cons
  ++image.box_count;
 }
 NormalizedAnnotationIndex NormalizedAnnotationAssembler::finish(const BenchmarkTraceSink& trace) {
- if (finished_ || incomplete_gather_) throw std::logic_error("normalized assembler is sealed or has incomplete gather work");
+ if (!prepared_ || finished_ || incomplete_gather_) throw std::logic_error("normalized assembler is unprepared, sealed or has incomplete gather work");
  throw_if_benchmark_cancelled(cancellation_);
  trace_benchmark_event(trace, "benchmark.annotations.assembled", [&] {
   return nlohmann::json{

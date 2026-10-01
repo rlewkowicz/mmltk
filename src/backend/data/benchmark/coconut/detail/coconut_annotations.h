@@ -144,10 +144,11 @@ struct CoconutComponentImage {
  bool required_labels_valid = true;
  bool ordinals_complete = true;
 };
+[[nodiscard]] detail::CompileResources coconut_component_assembly_resources(std::uint64_t images, std::uint64_t recovery_join_boxes = 0);
 [[nodiscard]] std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetadata, std::vector<CoconutComponentImage>&, AnnotationRejectCounts,
  bool metadata_only, std::uint64_t source_rows, std::optional<std::uint64_t> source_segments, std::span<const std::size_t> source_ordinals,
  std::span<const CoconutComponent> reusable, const CoconutPhysicalMembership&, const CoconutMaskRecovery*, const std::filesystem::path&,
- common::concurrency::CancellationObservation, detail::StorageReservationPool*, BenchmarkCompilePipeline*, bool local_rejection, const CoconutImageRejection&);
+ common::concurrency::CancellationObservation, detail::StorageReservationPool*, BenchmarkCompilePipeline*, const CompileAllowance&, bool local_rejection, const CoconutImageRejection&);
 [[nodiscard]] std::string coconut_component_input_identity(std::string_view base, CoconutImageNamespace, const CoconutMaskRecovery*, const CoconutPhysicalMembership* = nullptr,
  CoconutEdition = CoconutEdition::Base, const CoconutPhysicalDependencies& = {}, bool current = true);
 // Removes only XL rows covered by Large, retaining B and all namespace distinctions.

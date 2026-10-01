@@ -11428,16 +11428,26 @@ TEST_CASE("planned normalized gather admits disjoint chunks on shared lanes", "[
  if (mmltk::common::system::allowed_cpu_set().size()<workers) SKIP("requires the selected assigned CPUs");
  mmltk::testsupport::ScopedTempDir root("normalized-disjoint-gather");
  CompileExecution execution(workers);
+ FileWorkQueue files(execution, 2);
+ auto allowance = execution.reserve({4096, 1});
+ mmltk::testsupport::TestGate planning("admitted gather extent and cursor planning");
  mmltk::testsupport::TestGate entered("independent bounded gather ranges");
  struct Gate {
   CompileExecution& execution;
+  mmltk::testsupport::TestGate& planning;
   mmltk::testsupport::TestGate& gate;
+  mutable std::atomic<bool> planned{false}, charged{true};
   mutable std::atomic<std::size_t> calls{0};
   bool cancelled() const noexcept {
-   if (execution.on_lane() && calls.fetch_add(1)<execution.workers()) gate.receipt().ArriveAndWait();
+   if (execution.on_lane()) {
+    if (execution.current_allowance().bytes() != 4096) charged = false;
+    if (!execution.snapshot().completed) {
+     if (!planned.exchange(true)) planning.receipt().ArriveAndWait();
+    } else if (calls.fetch_add(1)<execution.workers()) gate.receipt().ArriveAndWait();
+   }
    return false;
   }
- } cancellation{execution,entered};
+ } cancellation{execution,planning,entered};
  const auto source=label_projection_fixture(7);
  std::vector<RLEPair> runs(65537);
  for (std::size_t i=0;i<runs.size();++i) runs[i]={static_cast<std::uint32_t>(i*2),1};
@@ -11445,13 +11455,19 @@ TEST_CASE("planned normalized gather admits disjoint chunks on shared lanes", "[
  box.mask_rle_offset=0; box.mask_rle_pairs=runs.size();
  std::array<NormalizedAnnotationAssembler::Slice,2> slices;
  for (std::size_t i=0;i<slices.size();++i) slices[i]={{7+i,0,1,262144,1,0,0},{&box,1},runs,i*100,i!=0};
- NormalizedAnnotationAssembler assembly({},2,2,runs.size()*2,mmltk::common::concurrency::CancellationObservation::Borrow(cancellation),root.path());
- auto gathering=std::async(std::launch::async,[&] { assembly.gather(slices,&execution); return assembly.finish(); });
- const mmltk::testsupport::ScopedTestCleanup release([&] { entered.Release(); execution.cancel(); });
+ NormalizedAnnotationAssembler assembly({},mmltk::common::concurrency::CancellationObservation::Borrow(cancellation),root.path());
+ auto gathering=std::async(std::launch::async,[&] { assembly.gather(slices,&execution,&files,allowance); return assembly.finish(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { planning.Release(); entered.Release(); execution.cancel(); });
+ REQUIRE(planning.WaitEntered(5s));
+ CHECK(execution.snapshot().running[static_cast<std::size_t>(CompileWorkClass::Gather)]==1);
+ CHECK(execution.snapshot().completed==0);
+ CHECK(fs::is_empty(root.path()));
+ planning.Release();
  REQUIRE(entered.WaitEntered(5s,workers));
  CHECK(execution.snapshot().running[static_cast<std::size_t>(CompileWorkClass::Gather)]==workers);
  entered.Release();
  const auto product=mmltk::testsupport::await_test_future(gathering,"canonical gather completes every disjoint run continuation",5s);
+ CHECK(cancellation.charged.load());
  REQUIRE(product.images.size()==2);
  REQUIRE(product.boxes.size()==2);
  CHECK(product.images[0].source_image_id==7);
@@ -11487,12 +11503,14 @@ TEST_CASE("a Parquet source uses its protected window beside busy fitting contex
 
 TEST_CASE("failed normalized gather cannot seal a partially copied product", "[benchmark][annotations][resources]") {
  const bool mapped=GENERATE(false,true);
+ const bool planning_failure=GENERATE(false,true);
  mmltk::testsupport::ScopedTempDir root("normalized-gather-failure");
  const auto source=label_projection_fixture(7);
  auto box=source.storage().boxes.front();
  const std::array<RLEPair,2> runs{{{0,1},{0,1}}};
  box.mask_rle_offset=0; box.mask_rle_pairs=runs.size();
  auto image=source.image(0); image.box_count=1;
+ if (planning_failure) image.box_count=2;
  const std::array slices{NormalizedAnnotationAssembler::Slice{image,{&box,1},runs}};
  NormalizedAnnotationAssembler assembly(source,1,1,runs.size(),{},mapped ? root.path() : fs::path{});
  CHECK_THROWS(assembly.gather(slices));

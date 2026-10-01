@@ -837,15 +837,9 @@ public:
     (void)source;
     image_count += component.inventory.size();
    }
-  // Layout capacity and the temporary ordinal set live through assembly. Only
-  // one image's recovery join is live; bound it by that component's boxes and
-  // the admitted per-image segment limit without another image census.
-  const auto join_bytes = mmltk::common::math::checked_multiply(recovery_join_boxes, std::uint64_t{256}, "COCONut recovery join workspace overflow");
-  const auto workspace = mmltk::common::math::checked_add(mmltk::common::math::checked_multiply(image_count, std::uint64_t{6 * sizeof(CoconutComponentImage)}, "COCONut merge workspace overflow"),
-   mmltk::common::math::checked_add(join_bytes, std::uint64_t{65536}, "COCONut merge workspace overflow"), "COCONut merge workspace overflow");
   // Layout references retain their credit through final assembly and intervening
   // inventory I/O; only finite CPU work enters the shared lane.
-  auto merge_allowance = request_.execution ? request_.execution->execution().reserve({workspace, 1}, request_.parent_allowance) : CompileAllowance{};
+  auto merge_allowance = request_.execution ? request_.execution->execution().reserve(coconut_component_assembly_resources(image_count, recovery_join_boxes), request_.parent_allowance) : CompileAllowance{};
   std::map<CoconutImageNamespace, std::vector<CoconutComponentImage>> images;
   std::map<CoconutImageNamespace, AnnotationRejectCounts> rejected;
   const auto gather = [&](CoconutComponentImage chunk, const AnnotationRejectCounts& counts) {
@@ -897,7 +891,7 @@ public:
    auto component = assemble_coconut_component(header, rows, rejected[source], metadata_only, request_.records->size(), source_extent,
     source_ordinals_, request_.records->identity == request_.input_identity ? std::span<const CoconutComponent>(request_.records->inventories) : std::span<const CoconutComponent>{},
     *request_.physical_membership, metadata_only ? nullptr : assembly_workspace_.recovery(), request_.inventory_directory, request_.cancellation,
-    request_.execution ? &request_.execution->storage() : nullptr, request_.execution, request_.accept_partial || request_.reject_invalid_identities,
+    request_.execution ? &request_.execution->storage() : nullptr, request_.execution, merge_allowance, request_.accept_partial || request_.reject_invalid_identities,
     [&](const CoconutInventoryImage& image, std::string_view reason) {
      if (request_.rejected_object) {
       CoconutRecord available;

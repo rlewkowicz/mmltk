@@ -1,6 +1,7 @@
 #include "src/backend/data/detail/staged_artifact.h"
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
+#include "src/backend/data/detail/file_work_queue.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include <system_error>
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
@@ -22,6 +23,7 @@
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileExecution;
+using mmltk::backend::data::detail::CompileTaskKind;
 
 class CoconutComponentBacking final : public CoconutComponentMetadata {
 public:
@@ -39,7 +41,7 @@ public:
  mutable std::shared_ptr<const NormalizedAnnotationCompletion> completion;
  bool metadata_only = false;
  static CoconutComponent finish(std::shared_ptr<CoconutComponentBacking>, NormalizedAnnotationIndex, bool, mmltk::common::concurrency::CancellationObservation, const std::filesystem::path&,
-  detail::StorageReservationPool*, const CoconutComponent* reuse = nullptr);
+  detail::StorageReservationPool*, const CoconutComponent* reuse = nullptr, detail::FileWorkQueue* = nullptr, const CompileAllowance& = {});
  static CoconutComponent loaded(std::shared_ptr<CoconutComponentBacking> backing) { return CoconutComponent(backing, backing->index, backing->seal, false); }
 };
 namespace {
@@ -60,39 +62,62 @@ struct PhysicalKeyHash {
  std::size_t operator()(PhysicalKey key) const noexcept { return std::hash<std::uint64_t>{}(key.id) ^ (static_cast<std::size_t>(key.source) * 0x9e3779b97f4a7c15ULL); }
 };
 PhysicalKey physical_key(CoconutImageNamespace source, std::uint64_t id) { return {source, id}; }
-// Both import assembly and the final artifact join supply rows sorted by
-// physical ID within one namespace. Compact in place; never create a second
-// identity registry or renumber surviving source rows.
+// Both import assembly and the final artifact join sort by physical ID within
+// one namespace. Withdrawal joins and rejection callbacks stay on the controller;
+// they retire exact claims before any later component admission.
 template <class Row, class Inventory, class Dependency, class Reject>
 void settle_annotation_identities(std::vector<Row>& rows, Inventory inventory, Dependency dependency, Reject reject, bool local_rejection, const CoconutPhysicalMembership& membership,
- BenchmarkCompilePipeline* execution, Cancellation cancellation) {
- std::size_t kept = 0;
- for (std::size_t first = 0; first < rows.size();) {
-  throw_if_benchmark_cancelled(cancellation);
-  const auto& image = inventory(rows[first]).physical;
-  auto end = first + 1;
-  while (end < rows.size() && inventory(rows[end]).physical.image_id == image.image_id) ++end;
-  if (end == first + 1) {
-   if (kept != first) rows[kept] = std::move(rows[first]);
-   ++kept;
-  } else {
-   if (!local_rejection) invalid("duplicate annotation physical identity: " + image.member);
-   for (auto i = first; i < end; ++i) {
-    throw_if_benchmark_cancelled(cancellation);
-    const auto& row = rows[i];
-    const auto& physical = inventory(row).physical;
-    const std::string_view input = dependency(row);
-    if (execution && !input.empty()) {
-     const auto root = membership.identity_root(physical.source);
-     execution->retire_labels(root, physical.image_id, input);
-     execution->retire_labels(root, physical.image_id, std::string(input) + ".provisional");
-    }
-    reject(row, "ambiguous annotation physical identity");
+ BenchmarkCompilePipeline* execution, const CompileAllowance& allowance, Cancellation cancellation) {
+ std::vector<std::pair<std::size_t, std::size_t>> ambiguous;
+ const auto inspect = [&](std::size_t) {
+  std::ranges::sort(rows, {}, [&](const Row& row) { return inventory(row).physical.image_id; });
+  for (std::size_t first = 0; first < rows.size();) {
+   throw_if_benchmark_cancelled(cancellation);
+   const auto& image = inventory(rows[first]).physical;
+   auto end = first + 1;
+   while (end < rows.size() && inventory(rows[end]).physical.image_id == image.image_id) ++end;
+   if (end != first + 1) {
+    if (!local_rejection) invalid("duplicate annotation physical identity: " + image.member);
+    ambiguous.emplace_back(first, end);
    }
+   first = end;
   }
-  first = end;
- }
- rows.resize(kept);
+ };
+ if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, inspect, allowance);
+ else inspect(0);
+ for (const auto [first, end] : ambiguous)
+  for (auto i = first; i < end; ++i) {
+   throw_if_benchmark_cancelled(cancellation);
+   const auto& row = rows[i];
+   const auto& physical = inventory(row).physical;
+   const std::string_view input = dependency(row);
+   if (execution && !input.empty()) {
+    const auto root = membership.identity_root(physical.source);
+    execution->retire_labels(root, physical.image_id, input);
+    execution->retire_labels(root, physical.image_id, std::string(input) + ".provisional");
+   }
+   reject(row, "ambiguous annotation physical identity");
+  }
+ if (ambiguous.empty()) return;
+ const auto compact = [&](std::size_t) {
+  std::size_t kept = 0, first = 0;
+  const auto retain = [&](std::size_t end) {
+   while (first < end) {
+    throw_if_benchmark_cancelled(cancellation);
+    if (kept != first) rows[kept] = std::move(rows[first]);
+    ++kept;
+    ++first;
+   }
+  };
+  for (const auto [begin, end] : ambiguous) {
+   retain(begin);
+   first = end;
+  }
+  retain(rows.size());
+  rows.resize(kept);
+ };
+ if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, compact, allowance);
+ else compact(0);
 }
 }  // namespace
 namespace {
@@ -188,47 +213,55 @@ BenchmarkDatasetSource coconut_index_source(CoconutImageNamespace source) {
 std::string coconut_component_split(CoconutEdition edition, CoconutImageNamespace source) {
  return "coconut-" + std::to_string(static_cast<unsigned>(edition)) + "-" + std::to_string(static_cast<unsigned>(source));
 }
+detail::CompileResources coconut_component_assembly_resources(std::uint64_t images, std::uint64_t recovery_join_boxes) {
+ // Layout/slice/cursor capacity survives assembly and inventory I/O. Only one
+ // image's recovery join is live; the same descriptor serves each physical close.
+ const auto join = common::math::checked_multiply(recovery_join_boxes, std::uint64_t{256}, "COCONut recovery join workspace overflow");
+ const auto bytes = common::math::checked_add(
+  common::math::checked_multiply(images, std::uint64_t{6 * sizeof(CoconutComponentImage)}, "COCONut merge workspace overflow"),
+  common::math::checked_add(join, std::uint64_t{65536}, "COCONut merge workspace overflow"), "COCONut merge workspace overflow");
+ return {bytes, 1};
+}
 std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetadata header, std::vector<CoconutComponentImage>& rows, AnnotationRejectCounts rejected,
  bool metadata_only, std::uint64_t source_rows, std::optional<std::uint64_t> source_extent, std::span<const std::size_t> source_ordinals,
  std::span<const CoconutComponent> reusable_components, const CoconutPhysicalMembership& physical, const CoconutMaskRecovery* recovery,
  const std::filesystem::path& directory, Cancellation cancellation, detail::StorageReservationPool* storage, BenchmarkCompilePipeline* execution,
- bool local_rejection, const CoconutImageRejection& reject) {
+ const CompileAllowance& merge_allowance, bool local_rejection, const CoconutImageRejection& reject) {
+ if (rows.empty()) return std::nullopt;
+ auto producer = execution ? execution->execution().open_class(detail::CompileWorkClass::Annotations) : CompileExecution::Producer{};
  const auto source = header.source;
- std::ranges::sort(rows, {}, [](const CoconutComponentImage& row) { return row.inventory->physical.image_id; });
  settle_annotation_identities(rows, [](const auto& row) -> const CoconutInventoryImage& { return *row.inventory; },
   [](const auto& row) -> std::string_view { return row.dependency ? std::string_view(*row.dependency) : std::string_view{}; },
-  [&](const auto& row, std::string_view reason) { if (reject) reject(*row.inventory, reason); }, local_rejection, physical, execution, cancellation);
+  [&](const auto& row, std::string_view reason) { if (reject) reject(*row.inventory, reason); }, local_rejection, physical, execution, merge_allowance, cancellation);
  if (rows.empty()) return std::nullopt;
- std::pair<std::size_t,std::size_t> extents{};
- for (const auto& row : rows) {
-  extents.first = common::math::checked_add(extents.first, row.boxes.size(), "COCONut box count overflow");
-  extents.second = common::math::checked_add(extents.second, row.runs.size(), "COCONut run count overflow");
- }
  auto sealed = std::make_shared<CoconutComponentBacking>();
- static_cast<CoconutComponentMetadata&>(*sealed) = header;
- sealed->source_rows = source_rows;
- sealed->source_extent_complete = source_extent.has_value();
- sealed->source_segments = source_extent.value_or(0);
  auto inventory = std::make_shared<std::vector<CoconutInventoryImage>>();
  const CoconutComponent* reusable = nullptr;
- if (!sealed->recovery_policy && !reusable_components.empty())
-  for (const auto& candidate : reusable_components)
-   if (!candidate.index().selected() && !candidate.recovery_policy() && candidate.edition() == sealed->edition && candidate.source() == source &&
-       candidate.matches_inputs(header.annotation_input_identity, physical, metadata_only ? nullptr : recovery) && candidate.index().image_count() == rows.size()) {
-    reusable = &candidate;
-    break;
-   }
+ std::optional<NormalizedAnnotationAssembler> assembly;
+ std::vector<NormalizedAnnotationAssembler::Slice> slices;
  NormalizedAnnotationIndex normalized;
- {
+ const auto plan = [&](std::size_t) {
+  static_cast<CoconutComponentMetadata&>(*sealed) = header;
+  sealed->source_rows = source_rows;
+  sealed->source_extent_complete = source_extent.has_value();
+  sealed->source_segments = source_extent.value_or(0);
+  if (!sealed->recovery_policy && !reusable_components.empty())
+   for (const auto& candidate : reusable_components)
+    if (!candidate.index().selected() && !candidate.recovery_policy() && candidate.edition() == sealed->edition && candidate.source() == source &&
+        candidate.matches_inputs(header.annotation_input_identity, physical, metadata_only ? nullptr : recovery) && candidate.index().image_count() == rows.size()) {
+     reusable = &candidate;
+     break;
+    }
   inventory->reserve(rows.size());
   sealed->image_dependencies.reserve(rows.size());
   if (sealed->recovery_policy) sealed->recovery.reserve(rows.size());
   ComponentInventoryAdmission inventory_admission(source);
   NormalizedAnnotationMetadata metadata = *rows.front().metadata;
   metadata.rejected = rejected;
-  const auto [boxes, runs] = extents;
-  std::optional<NormalizedAnnotationAssembler> assembly;
-  if (!metadata_only) assembly.emplace(metadata, rows.size(), boxes, runs, cancellation, directory, storage);
+  if (!metadata_only) {
+   assembly.emplace(metadata, cancellation, directory, storage);
+   slices.reserve(rows.size());
+  }
   NormalizedAnnotationBuilder membership;
   static_cast<NormalizedAnnotationMetadata&>(membership) = metadata;
   if (metadata_only) membership.images.reserve(rows.size());
@@ -266,23 +299,28 @@ std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetad
      recovery_admission.box(box);
     }
     recovery_admission.finish();
+    slices.push_back({image, row.boxes, row.runs, row.segment_base, !row.ordinals_complete});
    }
   }
-  if (assembly) {
-   std::vector<NormalizedAnnotationAssembler::Slice> slices;
-   slices.reserve(rows.size());
-   for (const auto& row : rows) slices.push_back({*row.image,row.boxes,row.runs,row.segment_base,!row.ordinals_complete});
-   assembly->gather(slices,execution ? &execution->execution() : nullptr);
-  }
-  normalized = metadata_only ? seal_normalized_annotation_metadata(std::move(membership)) : assembly->finish();
+  if (metadata_only) normalized = seal_normalized_annotation_metadata(std::move(membership));
+  sealed->inventory = std::move(inventory);
+ };
+ if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, plan, merge_allowance);
+ else plan(0);
+ if (assembly) {
+  assembly->gather(slices, execution ? &execution->execution() : nullptr, execution ? &execution->files() : nullptr, merge_allowance);
+  normalized = assembly->finish();
  }
- sealed->input_identity =
-  coconut_component_input_identity(header.annotation_input_identity, source, metadata_only ? nullptr : recovery, &physical, header.edition, sealed->dependencies);
- sealed->inventory = std::move(inventory);
+ const auto identify = [&](std::size_t) {
+  sealed->input_identity =
+   coconut_component_input_identity(header.annotation_input_identity, source, metadata_only ? nullptr : recovery, &physical, header.edition, sealed->dependencies);
+ };
+ if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, identify, merge_allowance);
+ else identify(0);
  // The mapped normalized output closed its file before returning. Inventory
  // sealing uses the caller's same retained output descriptor grant.
  return CoconutComponentBacking::finish(
-  std::move(sealed), std::move(normalized), metadata_only, cancellation, directory, storage, reusable);
+  std::move(sealed), std::move(normalized), metadata_only, cancellation, directory, storage, reusable, execution ? &execution->files() : nullptr, merge_allowance);
 }
 CoconutComponent::CoconutComponent(std::shared_ptr<const CoconutComponentBacking> backing, NormalizedAnnotationReadView index, std::shared_ptr<CoconutInventorySeal> seal, bool membership)
     : backing_(std::move(backing)), index_(std::move(index)), seal_(std::move(seal)), membership_(membership), original_generation_(backing_->original_generation) {}
@@ -347,7 +385,7 @@ CoconutComponent CoconutComponent::select_images(std::vector<std::size_t> positi
  return result;
 }
 CoconutComponent CoconutComponentBacking::finish(std::shared_ptr<CoconutComponentBacking> backing, NormalizedAnnotationIndex normalized, bool metadata_only, Cancellation cancellation,
- const std::filesystem::path& directory, detail::StorageReservationPool* storage, const CoconutComponent* reuse) {
+ const std::filesystem::path& directory, detail::StorageReservationPool* storage, const CoconutComponent* reuse, detail::FileWorkQueue* files, const CompileAllowance& allowance) {
  admit_component_metadata(*backing, normalized, normalized.images.size(), backing->inventory->size(), backing->recovery.size());
  const auto expected_identity = std::exchange(normalized.annotation_sha256, {});
  normalized.completion.reset();
@@ -356,8 +394,11 @@ CoconutComponent CoconutComponentBacking::finish(std::shared_ptr<CoconutComponen
  if (reuse) {
   backing->inventory = reuse->backing_->inventory;
   backing->seal = reuse->seal_;
- } else
-  backing->seal = seal_inventory(loaded(backing), cancellation, directory, storage);
+ } else {
+  const auto seal = [&, allowance] { backing->seal = seal_inventory(loaded(backing), cancellation, directory, storage); };
+  if (files) files->submit({.work = seal}).wait();
+  else seal();
+ }
  if (!expected_identity.empty() && expected_identity != backing->seal->identity) invalid("component inventory/index identity mismatch");
  normalized.annotation_sha256 = backing->seal->identity;
  backing->index = NormalizedAnnotationReadView(std::move(normalized));
@@ -410,90 +451,109 @@ std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutCo
   std::size_t position;
   std::optional<std::uint64_t> rows, segments;
  };
- std::map<CoconutImageNamespace, std::vector<Row>> sources;
+ std::uint64_t image_count = 0;
  for (const auto& part : parts)
   for (const auto& component : part.components)
-   for (std::size_t i = 0; i < component.index().image_count(); ++i) sources[component.source()].push_back({&component, i, part.row_base, part.segment_base});
+   image_count = common::math::checked_add(image_count, std::uint64_t{component.index().image_count()}, "COCONut merge image count overflow");
+ if (!image_count) return {};
+ auto producer = execution ? execution->execution().open_class(detail::CompileWorkClass::Annotations) : CompileExecution::Producer{};
+ // Source views remain owned by parts through planning, mapped preparation,
+ // gather and sealing. One descriptor promise serves the sequential outputs.
+ auto merge_allowance = execution ? execution->execution().reserve(coconut_component_assembly_resources(image_count)) : CompileAllowance{};
+ std::map<CoconutImageNamespace, std::vector<Row>> sources;
+ const auto collect = [&](std::size_t) {
+  for (const auto& part : parts)
+   for (const auto& component : part.components)
+    for (std::size_t i = 0; i < component.index().image_count(); ++i) {
+     throw_if_benchmark_cancelled(cancellation);
+     sources[component.source()].push_back({&component, i, part.row_base, part.segment_base});
+    }
+ };
+ if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, collect, merge_allowance);
+ else collect(0);
  std::vector<CoconutComponent> result;
  for (auto& [source, rows] : sources) {
-  std::ranges::sort(rows, {}, [](const Row& row) { return row.component->index().image(row.position).source_image_id; });
   settle_annotation_identities(rows, [](const Row& row) -> const CoconutInventoryImage& { return row.component->inventory_image(row.position); },
    [](const Row& row) -> std::string_view { return row.component->image_input_identity(row.position); }, [&](const Row& row, std::string_view reason) {
    if (rejected) rejected(row.component->inventory_image(row.position), reason);
-  }, true, physical, execution, cancellation);
+  }, true, physical, execution, merge_allowance, cancellation);
   if (rows.empty()) continue;
   const auto& first = *rows.front().component;
   auto backing = std::make_shared<CoconutComponentBacking>();
-  static_cast<CoconutComponentMetadata&>(*backing) = static_cast<const CoconutComponentMetadata&>(*first.backing_);
-  backing->annotation_input_identity = identity;
-  backing->source_extent_complete = std::ranges::all_of(parts, [](const auto& part) {
-   return part.row_base && part.segment_base && (part.source_extent || (!part.components.empty() && std::ranges::all_of(part.components, &CoconutComponent::source_extent_complete)));
-  });
-  if (backing->source_extent_complete)
-   for (const auto& part : parts) {
-    auto extent = part.source_extent.value_or(std::pair<std::uint64_t, std::uint64_t>{});
-    if (!part.source_extent)
-     for (const auto& component : part.components) {
-      extent.first = std::max(extent.first, component.source_extent().first);
-      extent.second = std::max(extent.second, component.source_extent().second);
-     }
-    const auto [count, segments] = extent;
-    backing->source_rows = std::max(backing->source_rows, mmltk::common::math::checked_add(*part.row_base, count, "COCONut source row extent overflow"));
-    backing->source_segments = std::max(backing->source_segments, mmltk::common::math::checked_add(*part.segment_base, segments, "COCONut source segment extent overflow"));
-   }
-  std::uint64_t boxes = 0, runs = 0;
-  for (const auto& row : rows) {
-   const auto& image = row.component->index().image(row.position);
-   boxes += image.box_count;
-   for (const auto& box : row.component->index().storage().boxes.subspan(image.first_box, image.box_count)) runs += box.mask_rle_pairs;
-  }
-  NormalizedAnnotationMetadata metadata = first.index();
-  metadata.annotation_sha256.clear();
-  metadata.completion.reset();
-  metadata.rejected = {};
-  for (const auto& part : parts)
-   for (const auto& component : part.components)
-    if (component.source() == source)
-     mmltk::frameworks::reflection::visit_materialized_members<AnnotationRejectCounts>([&]<class Declaration>(const auto&) {
-      metadata.rejected.*Declaration::pointer =
-       mmltk::common::math::checked_add(metadata.rejected.*Declaration::pointer, component.index().rejected.*Declaration::pointer, "COCONut rejected count overflow");
-     });
-  NormalizedAnnotationAssembler assembled(metadata, rows.size(), boxes, runs, cancellation, directory, storage);
+  std::optional<NormalizedAnnotationAssembler> assembled;
   std::vector<NormalizedAnnotationAssembler::Slice> slices;
-  slices.reserve(rows.size());
-  auto inventory = std::make_shared<std::vector<CoconutInventoryImage>>();
-  inventory->reserve(rows.size());
-  for (const auto& row : rows) {
-   throw_if_benchmark_cancelled(cancellation);
-   const auto& component = *row.component;
-   if (component.recovery_policy() != first.recovery_policy() || component.original_annotation_identity() != first.original_annotation_identity() ||
-       component.original_generation() != first.original_generation())
-    throw CoconutOriginalChanged(source);
-   auto physical_row = component.inventory_image(row.position);
-   const auto segment_base = component.source_ordinals_complete(row.position) ? row.segments : std::nullopt;
-   const bool complete = row.rows && segment_base;
-   if (row.rows) physical_row.source_ordinal = mmltk::common::math::checked_add(physical_row.source_ordinal, *row.rows, "COCONut shard row ordinal overflow");
-   if (!complete) backing->incomplete_ordinal_images.push_back(physical_row.physical.image_id);
-   inventory->push_back(physical_row);
-   backing->dependencies.add(physical_row.physical);
-   backing->image_dependencies.push_back(component.image_input_identity(row.position));
-   backing->compiled_ordinal_bases.push_back(mmltk::common::math::checked_add(component.compiled_ordinal_base(row.position), segment_base.value_or(0), "COCONut compiled ordinal overflow"));
-   if (!component.required_labels_valid(row.position)) backing->rejected_images.push_back(physical_row.physical.image_id);
-   const auto& image = component.index().image(row.position);
-   slices.push_back({image,component.index().storage().boxes.subspan(image.first_box,image.box_count),component.index().storage().mask_rle_pairs,segment_base.value_or(0),!complete});
-   if (backing->recovery_policy) {
-    auto recovery = component.recovery_image(row.position);
-    for (auto* objects : {&recovery.objects, &recovery.omissions})
-     for (auto& object : *objects)
-      if (segment_base) object.source_ordinal = mmltk::common::math::checked_add(object.source_ordinal, *segment_base, "COCONut shard recovery ordinal overflow");
-    backing->recovery.push_back(std::move(recovery));
+  const auto plan = [&](std::size_t) {
+   static_cast<CoconutComponentMetadata&>(*backing) = static_cast<const CoconutComponentMetadata&>(*first.backing_);
+   backing->annotation_input_identity = identity;
+   backing->source_extent_complete = std::ranges::all_of(parts, [](const auto& part) {
+    return part.row_base && part.segment_base && (part.source_extent || (!part.components.empty() && std::ranges::all_of(part.components, &CoconutComponent::source_extent_complete)));
+   });
+   if (backing->source_extent_complete)
+    for (const auto& part : parts) {
+     auto extent = part.source_extent.value_or(std::pair<std::uint64_t, std::uint64_t>{});
+     if (!part.source_extent)
+      for (const auto& component : part.components) {
+       extent.first = std::max(extent.first, component.source_extent().first);
+       extent.second = std::max(extent.second, component.source_extent().second);
+      }
+     const auto [count, segments] = extent;
+     backing->source_rows = std::max(backing->source_rows, mmltk::common::math::checked_add(*part.row_base, count, "COCONut source row extent overflow"));
+     backing->source_segments = std::max(backing->source_segments, mmltk::common::math::checked_add(*part.segment_base, segments, "COCONut source segment extent overflow"));
+    }
+   NormalizedAnnotationMetadata metadata = first.index();
+   metadata.annotation_sha256.clear();
+   metadata.completion.reset();
+   metadata.rejected = {};
+   for (const auto& part : parts)
+    for (const auto& component : part.components)
+     if (component.source() == source)
+      mmltk::frameworks::reflection::visit_materialized_members<AnnotationRejectCounts>([&]<class Declaration>(const auto&) {
+       metadata.rejected.*Declaration::pointer =
+        mmltk::common::math::checked_add(metadata.rejected.*Declaration::pointer, component.index().rejected.*Declaration::pointer, "COCONut rejected count overflow");
+      });
+   assembled.emplace(metadata, cancellation, directory, storage);
+   slices.reserve(rows.size());
+   auto inventory = std::make_shared<std::vector<CoconutInventoryImage>>();
+   inventory->reserve(rows.size());
+   for (const auto& row : rows) {
+    throw_if_benchmark_cancelled(cancellation);
+    const auto& component = *row.component;
+    if (component.recovery_policy() != first.recovery_policy() || component.original_annotation_identity() != first.original_annotation_identity() ||
+        component.original_generation() != first.original_generation())
+     throw CoconutOriginalChanged(source);
+    auto physical_row = component.inventory_image(row.position);
+    const auto segment_base = component.source_ordinals_complete(row.position) ? row.segments : std::nullopt;
+    const bool complete = row.rows && segment_base;
+    if (row.rows) physical_row.source_ordinal = mmltk::common::math::checked_add(physical_row.source_ordinal, *row.rows, "COCONut shard row ordinal overflow");
+    if (!complete) backing->incomplete_ordinal_images.push_back(physical_row.physical.image_id);
+    inventory->push_back(physical_row);
+    backing->dependencies.add(physical_row.physical);
+    backing->image_dependencies.push_back(component.image_input_identity(row.position));
+    backing->compiled_ordinal_bases.push_back(mmltk::common::math::checked_add(component.compiled_ordinal_base(row.position), segment_base.value_or(0), "COCONut compiled ordinal overflow"));
+    if (!component.required_labels_valid(row.position)) backing->rejected_images.push_back(physical_row.physical.image_id);
+    const auto& image = component.index().image(row.position);
+    slices.push_back({image,component.index().storage().boxes.subspan(image.first_box,image.box_count),component.index().storage().mask_rle_pairs,segment_base.value_or(0),!complete});
+    if (backing->recovery_policy) {
+     auto recovery = component.recovery_image(row.position);
+     for (auto* objects : {&recovery.objects, &recovery.omissions})
+      for (auto& object : *objects)
+       if (segment_base) object.source_ordinal = mmltk::common::math::checked_add(object.source_ordinal, *segment_base, "COCONut shard recovery ordinal overflow");
+     backing->recovery.push_back(std::move(recovery));
+    }
    }
-  }
-  assembled.gather(slices,execution ? &execution->execution() : nullptr);
-  backing->input_identity =
-   component_input_identity(identity, source, physical.dependency_identity(first.edition(), source, backing->dependencies), backing->recovery_policy, backing->original_annotation_identity);
-  backing->inventory = std::move(inventory);
-  result.push_back(CoconutComponentBacking::finish(std::move(backing), assembled.finish(), false, cancellation, directory, storage));
+   backing->inventory = std::move(inventory);
+  };
+  if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, plan, merge_allowance);
+  else plan(0);
+  assembled->gather(slices, execution ? &execution->execution() : nullptr, execution ? &execution->files() : nullptr, merge_allowance);
+  const auto identify = [&](std::size_t) {
+   backing->input_identity =
+    component_input_identity(identity, source, physical.dependency_identity(first.edition(), source, backing->dependencies), backing->recovery_policy, backing->original_annotation_identity);
+  };
+  if (execution) execution->execution().run(CompileTaskKind::Metadata, {}, identify, merge_allowance);
+  else identify(0);
+  result.push_back(CoconutComponentBacking::finish(
+   std::move(backing), assembled->finish(), false, cancellation, directory, storage, nullptr, execution ? &execution->files() : nullptr, merge_allowance));
  }
  return result;
 }
