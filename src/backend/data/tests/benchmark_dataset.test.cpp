@@ -8505,7 +8505,7 @@ TEST_CASE("normalized label custody rejects unrelated backing for detached nativ
  physical.image_id = 1;
  auto lineage = std::make_shared<CoconutNativeLineage>();
  lineage->component.source = physical.source;
- workspace.borrow_support(record, {}, {1, 1}, std::make_shared<const int>(0));
+ workspace.borrow_support(record, {}, {1, 1});
  auto native = workspace.finish(record, physical, {1, 1}, lineage, {});
  CoconutStaging staging(root.path());
  CHECK(CoconutNativeImage::stage(native, staging) == native);

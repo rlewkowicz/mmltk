@@ -62,7 +62,7 @@ public:
  void admit_metadata(std::size_t, CoconutRecord);
  void admit_segments(std::size_t, std::vector<CoconutSegment>, std::uint64_t local_ordinal);
  void adopt(std::vector<CoconutRecord>);
- void stage_segments(std::size_t);
+ void stage_segments(std::size_t, detail::CompileExecution* = nullptr, detail::FileWorkQueue* = nullptr, const CompileAllowance& = {});
  void admit_json(std::size_t, CoconutRecord, std::optional<std::size_t> = {});
  void json_prefix(std::size_t, std::uint64_t);
  [[nodiscard]] std::vector<std::size_t> seal_xlarge_order();
@@ -103,7 +103,7 @@ struct CoconutAnnotationInput {
 // reacquires a complete allocation window before the next library call.
 using CoconutRecordConsumer = std::function<void(std::size_t group, const CoconutRecord&, const CoconutAnnotationInput&)>;
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only = false, detail::CompileExecution* execution = nullptr, const std::function<void()>& settle_consumers = {},
+ const CoconutRecordConsumer& consumer, bool metadata_only = false, detail::CompileExecution* execution = nullptr, detail::FileWorkQueue* files = nullptr, const std::function<void()>& settle_consumers = {},
  const CompileAllowance& parent = {}, CoconutAnnotationRecords* retained = nullptr,
  const std::function<bool(const CoconutRecord&)>& reusable_native = {},
  const std::function<bool(const CoconutRecord&,std::span<const std::uint8_t>)>& exceptional = {}, const BenchmarkTraceSink& trace = {});

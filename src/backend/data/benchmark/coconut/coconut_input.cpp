@@ -36,9 +36,9 @@ void CoconutSegments::writable() {
  mapped_ = {};
  backing_.reset();
 }
-void CoconutSegments::stage(CoconutStaging& staging) {
+void CoconutSegments::stage(CoconutStaging& staging, detail::CompileExecution* execution, detail::FileWorkQueue* files, const detail::CompileAllowance& parent) {
  if (backing_ || values_.empty()) return;
- auto range = staging.copy<CoconutSegment>(values_);
+ auto range = staging.copy<CoconutSegment>(values_, execution, files, parent);
  mapped_ = range.values;
  backing_ = std::move(range.owner);
  std::vector<CoconutSegment>().swap(values_);

@@ -545,9 +545,10 @@ void CoconutAnnotationRecords::rebase_parquet_segments() {
  prefixes_sealed_ = true;
 }
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only, CompileExecution* execution, const std::function<void()>& settle_consumers, const CompileAllowance& parent,
+ const CoconutRecordConsumer& consumer, bool metadata_only, CompileExecution* execution, detail::FileWorkQueue* files, const std::function<void()>& settle_consumers, const CompileAllowance& parent,
  CoconutAnnotationRecords* retained, const std::function<bool(const CoconutRecord&)>& reusable_native,
  const std::function<bool(const CoconutRecord&,std::span<const std::uint8_t>)>& exceptional,const BenchmarkTraceSink& trace) {
+ if (execution && !files) throw std::invalid_argument("COCONut Parquet execution requires its file service");
  auto producer=execution ? execution->open_class(detail::CompileWorkClass::Extraction) : CompileExecution::Producer{};
  CoconutAnnotationRecords local;
  if (!retained) retained=&local;
@@ -753,18 +754,21 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
       },state.row,state.segments,state.image_pass,*retained,state.annotations);
      });
     } catch (const ParquetFormatError&) { parse_failure=std::current_exception(); }
-    if (!state.image_pass) for (const auto& row : ready) retained->stage_segments(row.record->source_ordinal);
+    if (!state.image_pass) for (const auto& row : ready) retained->stage_segments(row.record->source_ordinal,execution,files,parent);
     state.projected+=static_cast<std::uint64_t>(batch->num_rows());
-    state.pool->quiesce(); state.allowance={};
-    auto chunk=std::make_shared<ParquetBatch>(state.pool,std::move(batch));
+    std::shared_ptr<ParquetBatch> chunk;
     // Normal borrowers share the quiesced Arrow backing exactly once. An
     // exceptional row transfers the entire current bounded batch before any
     // descendant can wait on the normal arena that contains its own input.
     const bool staged=state.replay_bytes || (!state.image_pass && exceptional && std::ranges::any_of(ready,[&](const auto& row) { return exceptional(*row.record,row.png); }));
     if (staged) {
-     for (auto& row : ready) row.staged=retained->staging->copy<std::uint8_t>(row.png);
-     state.close(); chunk.reset();
+     for (auto& row : ready) row.staged=retained->staging->copy<std::uint8_t>(row.png,execution,files,parent);
+     // Arrow buffers must be released while their memory pool is still alive.
+     batch.reset(); state.close();
      state.replay_bytes=0; replay=nullptr;
+    } else {
+     state.pool->quiesce(); state.allowance={};
+     chunk=std::make_shared<ParquetBatch>(state.pool,std::move(batch));
     }
     trace_benchmark_event(trace,"benchmark.coconut.projected_batch",[&] {
      const auto snapshot=execution ? execution->snapshot() : detail::CompileExecutionSnapshot{};

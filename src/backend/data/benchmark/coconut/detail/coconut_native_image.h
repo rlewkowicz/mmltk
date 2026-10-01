@@ -1,5 +1,6 @@
 #pragma once
 #include "src/backend/data/detail/storage_reservation.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_staging.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
@@ -25,7 +26,20 @@
 #include <vector>
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
-class CoconutStaging;
+// Compact immutable recovery input; conversion into mutable PMR support occurs
+// once in the native workspace, retaining these ranges through every borrow.
+struct CoconutNativeSupport {
+ struct Segment {
+  std::uint64_t area;
+  dataset::RowMajorMaskBounds bounds;
+  std::uint64_t first_run, runs;
+  bool valid;
+ };
+ std::shared_ptr<const void> owner;
+ std::span<const Segment> segments;
+ std::span<const RLEPair> runs;
+};
+class CoconutNativeOutput;
 [[nodiscard]] const CategoryLookup& coconut_categories();
 [[nodiscard]] std::string coconut_image_input_identity(std::string_view annotations, const CoconutPhysicalImage&, std::string_view originals);
 struct CoconutComponentMetadata {
@@ -68,7 +82,7 @@ public:
 
 private:
  friend class CoconutNativeWorkspace;
- void stage(CoconutStaging&,std::span<const NormalizedBox>,std::span<const RLEPair>);
+ friend class CoconutNativeOutput;
  explicit CoconutNativeImage(std::shared_ptr<const CoconutNativeLineage> lineage) : lineage_(std::move(lineage)) {}
  std::shared_ptr<const CoconutNativeLineage> lineage_;
  std::string input_identity_;
@@ -86,7 +100,28 @@ private:
  std::uint64_t segment_begin_ = 0;
 };
 using CoconutRejectedObject = std::function<void(const CoconutPhysicalImage&, const CoconutRecord&, const CoconutSegment&, std::string_view, std::uint32_t)>;
-// No controller or publication state. One CPU lane owns each mutable workspace.
+// Exact pending output borrows the job-owned workspace until its prepared range
+// has been filled. No immutable product is published before fill succeeds.
+class CoconutNativeOutput final {
+public:
+ CoconutNativeOutput() = default;
+ void retain_support(std::span<const CoconutSegmentSupport>, CoconutNativeSupport&);
+ [[nodiscard]] CoconutStaging::Request& request() noexcept { return request_; }
+ void fill();
+private:
+ friend class CoconutNativeWorkspace;
+ friend class CoconutNativeImage;
+ CoconutNativeOutput(std::shared_ptr<CoconutNativeImage>, std::span<const NormalizedBox>, std::span<const RLEPair>);
+ std::shared_ptr<CoconutNativeImage> product_;
+ std::span<const NormalizedBox> boxes_;
+ std::span<const RLEPair> runs_;
+ std::span<const CoconutSegmentSupport> support_;
+ CoconutNativeSupport* support_target_ = nullptr;
+ std::size_t run_offset_ = 0, support_offset_ = 0, support_run_offset_ = 0, support_runs_ = 0;
+ CoconutStaging::Request request_;
+};
+// No controller or publication state. A task owns each mutable workspace,
+// including its supplying arena while physical output preparation is pending.
 class CoconutNativeWorkspace final {
 public:
  explicit CoconutNativeWorkspace(const CoconutImportLimits&, mmltk::common::concurrency::CancellationObservation = {});
@@ -106,11 +141,11 @@ public:
  void decode(const CoconutRecord&, std::span<const std::uint8_t>, dataset::MaskDimensions, std::span<std::byte> supplied = {});
  [[nodiscard]] std::span<const CoconutSegmentSupport> support(std::size_t) const;
  [[nodiscard]] std::uint32_t unlisted_segment() const noexcept { return unlisted_segment_; }
- void borrow_support(const CoconutRecord&, std::span<const CoconutSegmentSupport>, dataset::MaskDimensions, std::shared_ptr<const void>, std::uint32_t unlisted_segment = 0);
+ void borrow_support(const CoconutRecord&, const CoconutNativeSupport&, dataset::MaskDimensions, std::uint32_t unlisted_segment = 0);
  [[nodiscard]] std::shared_ptr<const CoconutNativeImage> finish(
-  const CoconutRecord&, const CoconutPhysicalImage&, dataset::MaskDimensions, std::shared_ptr<const CoconutNativeLineage>, const CoconutRejectedObject&, CoconutStaging* = nullptr);
+  const CoconutRecord&, const CoconutPhysicalImage&, dataset::MaskDimensions, std::shared_ptr<const CoconutNativeLineage>, const CoconutRejectedObject&, CoconutNativeOutput* = nullptr);
  [[nodiscard]] std::shared_ptr<const CoconutNativeImage> reuse(const CoconutRecord&, const CoconutPhysicalImage&, const NormalizedAnnotationReadView&, std::size_t, const CoconutInventoryImage&,
-  const CoconutRecoveryImage*, std::shared_ptr<const CoconutNativeLineage>, std::string_view dependency, bool required_labels_valid, CoconutStaging* = nullptr);
+  const CoconutRecoveryImage*, std::shared_ptr<const CoconutNativeLineage>, std::string_view dependency, bool required_labels_valid, CoconutNativeOutput* = nullptr);
  void prepare_support(std::span<std::byte>);
  void release_supplied() noexcept;
  void retire() noexcept;
@@ -120,7 +155,7 @@ private:
   std::uint32_t id = 0;
   std::size_t index = 0;
  };
- void materialize(CoconutNativeImage&, CoconutStaging*);
+ void materialize(const std::shared_ptr<CoconutNativeImage>&, CoconutNativeOutput*);
  SegmentEntry& segment_entry(std::uint32_t);
  mutable detail::CompileImageDecoder decoder_;
  std::unique_ptr<common::system::NumaMemory> decode_memory_;

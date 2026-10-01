@@ -12,7 +12,15 @@
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_import.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_staging.h"
+#include "src/backend/data/detail/file_work_queue.h"
 #include <exception>
+#include <algorithm>
+#include <array>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <utility>
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory_io.h"
@@ -308,65 +316,22 @@ void segments_from_json(const JsonArray<JsonSegment>& input, CoconutRecord& reco
  }
 }
 struct PendingNativeImage {
- struct Support {
-  std::uint64_t area;
-  dataset::RowMajorMaskBounds bounds;
-  std::uint64_t first_run, runs;
-  bool valid;
- };
  CoconutRecord record;
  std::size_t position = 0;
  CoconutPhysicalImage physical;
  dataset::MaskDimensions dimensions;
  std::uint32_t unlisted_segment = 0;
- std::shared_ptr<const void> backing;
- std::span<const Support> supports;
- std::span<const RLEPair> runs;
+ CoconutNativeSupport support;
  std::shared_ptr<const CoconutNativeImage> product;
  BenchmarkSourcePublication publication;
  std::string provisional_dependency;
  std::uint64_t physical_generation=0, original_generation=0;
- void stage_support(std::span<const CoconutSegmentSupport> input, CoconutStaging& staging) {
-  std::size_t count = 0;
-  for (const auto& item : input) count = common::math::checked_add(count, item.runs.size(), "pending support run count overflow");
-  const auto run_offset = common::math::checked_multiply(input.size(), sizeof(Support), "pending support extent overflow");
-  const auto bytes = common::math::checked_add(run_offset, common::math::checked_multiply(count, sizeof(RLEPair), "pending support extent overflow"), "pending support extent overflow");
-  auto range = staging.append(bytes, std::max(alignof(Support),alignof(RLEPair)), [&](std::span<std::byte> target) {
-   auto* headers = reinterpret_cast<Support*>(target.data());
-   auto* output = reinterpret_cast<RLEPair*>(target.data()+run_offset);
-   std::size_t offset = 0;
-   for (std::size_t i=0;i<input.size();++i) {
-    const auto& item = input[i];
-    headers[i] = {item.area,item.bounds,offset,item.runs.size(),item.valid};
-    if (!item.runs.empty()) std::memcpy(output+offset,item.runs.data(),item.runs.size()*sizeof(RLEPair));
-    offset += item.runs.size();
-   }
-  });
-  supports = {reinterpret_cast<const Support*>(range.values.data()),input.size()};
-  runs = {bytes ? reinterpret_cast<const RLEPair*>(range.values.data()+run_offset) : nullptr,count};
-  backing = std::move(range.owner);
- }
- std::vector<CoconutSegmentSupport> read_support() const {
-  std::vector<CoconutSegmentSupport> result(supports.size());
-  for (std::size_t i = 0; i < result.size(); ++i) {
-   result[i].valid = supports[i].valid;
-   result[i].area = supports[i].area;
-   result[i].bounds = supports[i].bounds;
-   result[i].runs.borrow(runs.subspan(supports[i].first_run, supports[i].runs), backing);
-  }
-  return result;
- }
 };
 class Importer final {
- // Scratch is usable only while its admitted task owns the supplying arena.
- // Output materialization finishes before this guard releases every PMR view.
- struct NativeScratch {
-  CoconutNativeWorkspace& workspace;
-  NativeScratch(CoconutNativeWorkspace& value,std::span<std::byte> memory) : workspace(value) { workspace.prepare_support(memory); }
-  ~NativeScratch() { workspace.release_supplied(); }
- };
+ static constexpr std::size_t native_window = 64;
  struct Worker {
   CoconutNativeWorkspace native;
+  CoconutNativeOutput output;
   std::shared_ptr<const CoconutNativeImage> complete;
   std::shared_ptr<PendingNativeImage> pending;
   BenchmarkSourcePublication publication;
@@ -377,14 +342,139 @@ class Importer final {
   ~Worker() { complete.reset(); pending.reset(); native.release_supplied(); }
  };
 
+ struct NativeJob {
+  enum class State { Working, Prepare, Preparing, Copy, Copying, Done };
+  CoconutRecord record;
+  CoconutAnnotationInput input;
+  CompileAllowance arena, descriptor;
+  std::unique_ptr<Worker> worker;
+  CompileTaskKind kind;
+  CompileExecution::CompletionSource completion;
+  State state = State::Working;
+  std::exception_ptr error;
+  NativeJob(CompileExecution& execution, CompileTaskKind task_kind) : kind(task_kind), completion(&execution) {}
+ };
+ // The existing 64-entry normalization and recovery windows own these jobs.
+ // Readiness only retries bounded admission; physical work and mapped copies
+ // run on the existing file service and semantic CPU lanes respectively.
+ void post_output(const std::shared_ptr<NativeJob>& job, NativeJob::State state, std::exception_ptr error) {
+  {
+   const std::lock_guard lock(outputs_mutex_);
+   job->state = error ? NativeJob::State::Done : state;
+   job->error = error;
+  }
+  request_.execution->execution().notify_admission_change();
+ }
+ void pump_outputs() {
+  auto& execution = request_.execution->execution();
+  std::array<std::shared_ptr<NativeJob>, 2 * native_window> finished;
+  std::size_t count = 0;
+  {
+   const std::lock_guard lock(outputs_mutex_);
+   for (auto& entry : outputs_) {
+    if (!entry) continue;
+    const auto job = entry;
+    if (job->state == NativeJob::State::Working || job->state == NativeJob::State::Preparing || job->state == NativeJob::State::Copying) continue;
+    CompileExecution::Readiness::Attempt attempt(output_readiness_.get());
+    try {
+     if (job->state != NativeJob::State::Done) {
+      if (auto error = execution.interruption()) std::rethrow_exception(error);
+     }
+     if (job->state == NativeJob::State::Prepare) {
+      if (request_.records->staging->try_claim(job->worker->output.request())) job->state = NativeJob::State::Copy;
+      else {
+       if (!job->descriptor) {
+        auto descriptor = execution.try_reserve({.descriptors=1}, request_.parent_allowance);
+        if (!descriptor) continue;
+        job->descriptor = std::move(*descriptor);
+       }
+       auto operation = request_.execution->files().try_submit({
+        .completed = [this, job](std::exception_ptr error) { post_output(job, NativeJob::State::Copy, error); },
+        .work = [this, job] { request_.records->staging->prepare(job->worker->output.request(), job->descriptor); }
+       });
+       if (!operation) continue; // Full retains this exact request and allowance.
+       job->state = NativeJob::State::Preparing;
+       attempt.commit();
+      }
+     }
+     if (job->state == NativeJob::State::Copy) {
+      // Every accepted physical operation has returned and closed its handle.
+      job->descriptor = {};
+      auto copy = execution.try_submit({.kind = job->kind,
+       .work = [this, job](std::size_t, const CompileAllowance&) {
+        auto& worker = *job->worker;
+        worker.output.fill();
+        worker.output = {};
+        worker.native.release_supplied();
+        if (worker.pending) native_staged(*worker.pending->product, job->kind);
+        else if (worker.complete) native_staged(*worker.complete, job->kind);
+       },
+       .allowance = job->arena, .finite_consumer = true, .retain_workspace = false,
+       .completed = [this, job](std::exception_ptr error) { post_output(job, NativeJob::State::Done, error); }
+      });
+      if (!copy) continue;
+      job->state = NativeJob::State::Copying;
+      attempt.commit();
+     }
+    } catch (...) { job->error = std::current_exception(); job->state = NativeJob::State::Done; }
+    if (job->state == NativeJob::State::Done) finished[count++] = std::move(entry);
+   }
+  }
+  for (const auto& job : std::span(finished).first(count)) {
+   // No accepted operation or copy can still touch these PMR objects. Destroy
+   // every view before returning its arena, and before controller observers.
+   job->worker->output = {};
+   job->worker->native.release_supplied();
+   job->arena = {}; job->descriptor = {}; job->input = {};
+   job->completion.settle(job->error);
+  }
+ }
+ CompileExecution::Completion submit_native(const std::shared_ptr<NativeJob>& job, std::uint64_t bytes, std::function<void(const CompileAllowance&)> work) {
+  // Acquire actual scratch on the input/recovery controller before consuming a
+  // scheduler record. Byte-waiting first steps must not fill that bounded queue
+  // and strand the copy continuation which returns their only fitting arena.
+  job->arena = request_.execution->execution().reserve({.bytes=bytes,.supplied_workspace=true,.workspace_class=detail::work_class(job->kind)},request_.parent_allowance);
+  {
+   const std::lock_guard lock(outputs_mutex_);
+   auto free = std::ranges::find_if(outputs_, [](const auto& value) { return !value; });
+   if (free == outputs_.end()) throw std::logic_error("COCONut native window exceeded prepared output records");
+   *free = job;
+  }
+  try {
+   (void)request_.execution->execution().submit({.kind = job->kind, .resources = {.bytes = bytes, .supplied_workspace = true},
+    .work = [job, work = std::move(work)](std::size_t, const CompileAllowance& allowance) {
+     job->arena = allowance;
+     job->worker->native.prepare_support(allowance.workspace());
+     work(allowance);
+    },
+    .allowance = job->arena, .finite_consumer = true, .retain_workspace = false,
+    .completed = [this, job](std::exception_ptr error) { post_output(job, NativeJob::State::Prepare, error); }
+   });
+  } catch (...) { post_output(job, NativeJob::State::Done, std::current_exception()); }
+  return job->completion.completion();
+ }
+
+ template<class Settlement>
+ static void track_native(BenchmarkCompletionWindow& window, const CompileExecution::Completion& completion, Settlement&& settlement) {
+  try { window.push(completion, std::forward<Settlement>(settlement)); }
+  catch (...) {
+   // Even allocation failure while registering controller settlement must join
+   // a job whose file operation or mapped copy has already been accepted.
+   const auto error = std::current_exception();
+   try { completion.wait(); } catch (...) {}
+   std::rethrow_exception(error);
+  }
+ }
+
 public:
- explicit Importer(const CoconutImportRequest& request) : request_(request), archive_worker_(request), assembly_workspace_(request.limits, request.cancellation), normalizations_(64, request.execution ? &request.execution->execution() : nullptr) {
+ explicit Importer(const CoconutImportRequest& request) : request_(request), archive_worker_(request), assembly_workspace_(request.limits, request.cancellation), normalizations_(native_window, request.execution ? &request.execution->execution() : nullptr) {
+  if (request.execution) output_readiness_ = std::make_unique<CompileExecution::Readiness>(request.execution->execution(), [this](auto) { pump_outputs(); });
   if (request.input_identity.empty()) invalid("missing pinned input identity");
   if (!request.physical_membership) invalid("missing physical membership admission");
   assembly_workspace_.recovery(request.recovery);
   if (request_.progress) request_.progress(0);
  }
- ~Importer() { try { normalizations_.drain(); } catch (...) {} stop_recovery(); }
+ ~Importer() { try { normalizations_.drain(); } catch (...) {} stop_recovery(); output_readiness_.reset(); }
  void drain_normalization() { normalizations_.drain(); }
  void stop_recovery() {
   if (recovery_controller_.joinable()) {
@@ -479,12 +569,7 @@ public:
   }
   if (!request_.execution || request_.metadata_only) { consume(record,input.png,{},nullptr,record.source_ordinal); return; }
   normalizations_.make_room();
-  struct Job {
-   CoconutRecord record;
-   CoconutAnnotationInput input;
-   std::unique_ptr<Worker> worker;
-  };
-  auto job=std::make_shared<Job>();
+  auto job=std::make_shared<NativeJob>(request_.execution->execution(),CompileTaskKind::Normalize);
   job->record=record; job->input=input;
   if (idle_.empty()) job->worker=std::make_unique<Worker>(request_);
   else { job->worker=std::move(idle_.back()); idle_.pop_back(); }
@@ -509,14 +594,10 @@ public:
   trace_benchmark_event(request_.trace,"benchmark.coconut.normalize_request",[&] { return nlohmann::json{{"image_id",record.image_id},{"source_ordinal",record.source_ordinal},{"png_bytes",input.png.size()},{"input_backing_bytes",input.live_bytes},{"decoder_bytes",decode},{"support_bytes",support},{"workspace_bytes",bytes}}; });
   if (bytes>request_.execution->execution().snapshot().context_capacity && input.retire_projection) input.retire_projection();
   job->input.retire_projection={}; job->input.admitted={};
-  auto completion=request_.execution->execution().submit({.kind=CompileTaskKind::Normalize,
-   .resources={.bytes=bytes,.supplied_workspace=true},
-    .work=[this,job](std::size_t,const CompileAllowance& allowance) {
-    const NativeScratch scratch(job->worker->native,allowance.workspace());
-    consume(job->record,job->input.png,allowance,job->worker.get(),job->record.source_ordinal);
-   },
-   .parent=request_.parent_allowance,.finite_consumer=true,.retain_workspace=false});
-  normalizations_.push(completion,[this,job](std::exception_ptr failure) {
+  auto completion=submit_native(job,bytes,[this,job](const CompileAllowance& allowance) {
+   consume(job->record,job->input.png,allowance,job->worker.get(),job->record.source_ordinal);
+  });
+  track_native(normalizations_,completion,[this,job](std::exception_ptr failure) {
    if (failure) {
     job->worker->complete.reset(); job->worker->pending.reset(); job->worker->native.release_supplied();
     std::rethrow_exception(failure);
@@ -641,7 +722,7 @@ public:
     } else if (!saved) {
      if (reused)
       complete = workspace.reuse(record, physical, reused->index(), reused_position, reused->inventory_image(reused_position),
-       reused->recovery_policy() ? &reused->recovery_image(reused_position) : nullptr, lineage, reused->image_input_identity(reused_position), reused->required_labels_valid(reused_position), request_.records->staging.get());
+       reused->recovery_policy() ? &reused->recovery_image(reused_position) : nullptr, lineage, reused->image_input_identity(reused_position), reused->required_labels_valid(reused_position), &worker.output);
      else {
       workspace.decode(record, png, dimensions, request_.execution ? request_.execution->execution().current_allowance().workspace() : std::span<std::byte>{});
       if (deferred) {
@@ -653,11 +734,11 @@ public:
        native->publication = publication;
        native->unlisted_segment = workspace.unlisted_segment();
        workspace.originals({});
-       native->product=workspace.finish(record,physical,dimensions,lineage,{},request_.records->staging.get());
-       native->stage_support(workspace.support(record.segments.size()),*request_.records->staging);
+       native->product=workspace.finish(record,physical,dimensions,lineage,{},&worker.output);
+       worker.output.retain_support(workspace.support(record.segments.size()), native->support);
        worker.pending=std::move(native);
       } else
-       complete = workspace.finish(record, physical, dimensions, lineage, request_.rejected_object, request_.records->staging.get());
+       complete = workspace.finish(record, physical, dimensions, lineage, request_.rejected_object, &worker.output);
      }
     }
    } catch (const CoconutInputError& error) { throw CoconutInputError(physical.member + ": " + error.what()); }
@@ -673,10 +754,14 @@ public:
    throw;
   }
   worker.complete=std::move(complete); worker.publication=publication; worker.position=position; worker.saved=bool(saved); worker.reused=reused!=nullptr;
-  if (worker.pending) native_staged(*worker.pending->product,CompileTaskKind::Normalize);
-  else if (worker.complete) native_staged(*worker.complete,CompileTaskKind::Normalize);
   if (!normalize) complete_row();
-  if (!request_.execution || !request_.execution->execution().on_lane()) settle_worker(worker);
+  if (!request_.execution || !request_.execution->execution().on_lane()) {
+   request_.records->staging->prepare(worker.output.request(),request_.execution ? &request_.execution->execution() : nullptr,request_.execution ? &request_.execution->files() : nullptr,request_.parent_allowance);
+   worker.output.fill(); worker.output = {};
+   if (worker.pending) native_staged(*worker.pending->product,CompileTaskKind::Normalize);
+   else if (worker.complete) native_staged(*worker.complete,CompileTaskKind::Normalize);
+   settle_worker(worker);
+  }
  }
  std::vector<CoconutComponent> finish(bool partial = false) {
   normalizations_.drain();
@@ -922,7 +1007,7 @@ private:
   const std::stop_callback stopping(stop,[signal] { signal->notify(); });
   std::unique_ptr<CompileExecution::Readiness> interrupted;
   if (request_.execution) interrupted=std::make_unique<CompileExecution::Readiness>(request_.execution->execution(),[signal](auto change) { if (change.interrupted) signal->notify(); });
-  BenchmarkCompletionWindow ready(64,request_.execution ? &request_.execution->execution() : nullptr);
+  BenchmarkCompletionWindow ready(native_window,request_.execution ? &request_.execution->execution() : nullptr);
   CompileExecution::Completion physical_change;
   std::map<CoconutImageNamespace,std::pair<std::uint64_t,CompileExecution::Completion>> original_changes;
   std::uint64_t scanned_generation=UINT64_MAX;
@@ -932,7 +1017,7 @@ private:
    ready.reap();
    if (stop.stop_requested()) { ready.drain(); return; }
    throw_if_benchmark_cancelled(request_.cancellation);
-   std::array<std::shared_ptr<PendingNativeImage>,64> pending;
+   std::array<std::shared_ptr<PendingNativeImage>,native_window> pending;
    std::size_t count=0;
    bool done=false,empty=false;
    {
@@ -982,19 +1067,17 @@ private:
     native->original_generation=original.generation;
     native->publication=request_.physical_membership->label_publication(request_.edition,native->physical);
     ready.make_room();
-    auto workspace=std::make_shared<CoconutNativeWorkspace>(request_.limits,request_.cancellation);
-    workspace->originals(original.originals);
+    auto worker=std::make_unique<Worker>(request_);
+    worker->native.originals(original.originals);
     const auto pixels=std::uint64_t{native->dimensions.width}*native->dimensions.height;
-    const auto bytes=workspace->support_workspace_bytes(native->record,pixels,native->record.segments.size());
+    const auto bytes=worker->native.support_workspace_bytes(native->record,pixels,native->record.segments.size());
     trace_benchmark_event(request_.trace,"benchmark.coconut.recovery_ready",[&] { return nlohmann::json{{"image_id",native->record.image_id},{"source",source},{"physical_generation",physical.generation},{"original_generation",original.generation},{"support_bytes",bytes}}; });
-    const auto recover=[this,native,workspace,original] {
-     const auto memory=request_.execution ? request_.execution->execution().current_allowance() : CompileAllowance{};
-     const NativeScratch scratch(*workspace,memory.workspace());
-     const auto support=native->read_support();
-     workspace->borrow_support(native->record,support,native->dimensions,native,native->unlisted_segment);
-     native->product=workspace->finish(native->record,native->physical,native->dimensions,
-      lineage_for(native->physical.source,workspace->recovery(),original.generation),request_.rejected_object,request_.records->staging.get());
-     native_staged(*native->product,CompileTaskKind::Recovery);
+    const auto recover=[this,native,original](Worker& target) {
+     auto& workspace=target.native;
+     workspace.borrow_support(native->record,native->support,native->dimensions,native->unlisted_segment);
+     native->product=workspace.finish(native->record,native->physical,native->dimensions,
+      lineage_for(native->physical.source,workspace.recovery(),original.generation),request_.rejected_object,&target.output);
+     target.complete=native->product;
     };
     const auto settle=[this,native,original](std::exception_ptr failure) {
      if (failure) { native->product.reset(); std::rethrow_exception(failure); }
@@ -1012,11 +1095,18 @@ private:
      settle_report(*native->product); retain_image(native->position,native->product); publish_labels(std::move(native->product),native->publication);
     };
     if (request_.execution) {
-     auto completion=request_.execution->execution().submit({.kind=CompileTaskKind::Recovery,.resources={.bytes=bytes,.supplied_workspace=true},
-      .work=[recover](std::size_t,const CompileAllowance&) { recover(); },.parent=request_.parent_allowance,.finite_consumer=true,.retain_workspace=false});
-     ready.push(completion,settle);
+     auto job=std::make_shared<NativeJob>(request_.execution->execution(),CompileTaskKind::Recovery);
+     job->worker=std::move(worker);
+     auto completion=submit_native(job,bytes,[recover,job](const CompileAllowance&) { recover(*job->worker); });
+     track_native(ready,completion,settle);
      completion.subscribe([signal](std::exception_ptr) { signal->notify(); });
-    } else { recover(); settle({}); }
+    } else {
+     recover(*worker);
+     request_.records->staging->prepare(worker->output.request());
+     worker->output.fill();
+     native_staged(*native->product,CompileTaskKind::Recovery);
+     settle({});
+    }
    }
    if (!progressed && !remaining_scan) {
     std::unique_lock lock(signal->mutex);
@@ -1044,6 +1134,9 @@ private:
  std::jthread recovery_controller_;
  std::mutex groups_mutex_, progress_mutex_;
  std::uint64_t completed_rows_ = 0, rows_ = 0, parsed_rows_ = 0;
+ std::mutex outputs_mutex_;
+ std::array<std::shared_ptr<NativeJob>,2 * native_window> outputs_{};
+ std::unique_ptr<CompileExecution::Readiness> output_readiness_;
  BenchmarkCompletionWindow normalizations_;
  std::vector<std::unique_ptr<Worker>> idle_;
  std::set<std::pair<CoconutImageNamespace,std::uint64_t>> offered_;
@@ -1164,9 +1257,11 @@ private:
   const auto& record=records_.record(position);
   archive_->require_regular(request_.limits.max_png_bytes);
   const auto bytes=common::math::checked_cast<std::size_t>(archive_->size(),"COCONut PNG source range overflow");
-  auto staged=records_.staging->append(bytes,alignof(std::uint8_t),[&](auto output) {
-   archive_->read_into({reinterpret_cast<std::uint8_t*>(output.data()),output.size()},request_.cancellation);
-  });
+  CoconutStaging::Request range(bytes,alignof(std::uint8_t));
+  records_.staging->prepare(range,request_.execution ? &request_.execution->execution() : nullptr,request_.execution ? &request_.execution->files() : nullptr,request_.parent_allowance);
+  const auto output=range.target();
+  archive_->read_into({reinterpret_cast<std::uint8_t*>(output.data()),output.size()},request_.cancellation);
+  auto staged=range.bytes();
   CoconutAnnotationInput input{.png={reinterpret_cast<const std::uint8_t*>(staged.values.data()),staged.values.size()},.backing=std::move(staged.owner),.live_bytes=staged.values.size(),.retire_projection=[&] { pause(); }};
   importer_.consume_group(0,record,input);
   if (paused_) (void)ensure();
@@ -1375,7 +1470,7 @@ void json_records(const CoconutImportRequest& request, CoconutAnnotationRecords&
   const auto ready = [&](std::size_t first, std::size_t end) {
    if (request.preparation_progress) request.preparation_progress(CoconutPreparationStage::Annotations, base + end);
    for (auto i = first; i < end; ++i) {
-    retained.stage_segments(base+i);
+    retained.stage_segments(base+i,request.execution ? &request.execution->execution() : nullptr,request.execution ? &request.execution->files() : nullptr,request.parent_allowance);
     const auto& row = retained.row(base + i);
     const auto& record = row.record();
     if (row.image_join()) {
@@ -1504,10 +1599,12 @@ void xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecord
   const auto member=archive.member();
   // The parser can exceed an ordinary task context. Its immutable source range
   // survives suspension of the forward archive and retains the opened inode.
-  const auto input=retained.staging->append(bytes+simdjson::SIMDJSON_PADDING,alignof(char),[&](auto output) {
-   archive.read_into({reinterpret_cast<std::uint8_t*>(output.data()),bytes},request.cancellation);
-   std::memset(output.data()+bytes,0,simdjson::SIMDJSON_PADDING);
-  });
+  CoconutStaging::Request range(common::math::checked_add(bytes,std::size_t{simdjson::SIMDJSON_PADDING},"COCONut XL source padding overflow"),alignof(char));
+  retained.staging->prepare(range,request.execution ? &request.execution->execution() : nullptr,request.execution ? &request.execution->files() : nullptr,request.parent_allowance);
+  const auto output=range.target();
+  archive.read_into({reinterpret_cast<std::uint8_t*>(output.data()),bytes},request.cancellation);
+  std::memset(output.data()+bytes,0,simdjson::SIMDJSON_PADDING);
+  const auto input=range.bytes();
   std::uint64_t prior=0;
   for (const auto& state : parsers) prior=std::max(prior,state.retained.load(std::memory_order_relaxed));
   const auto demand=common::math::checked_add(json_workspace_bytes(bytes,request.limits),prior,"COCONut XL parser workspace overflow");
@@ -1535,7 +1632,7 @@ void xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecord
   if (!unique) invalid("duplicate XL info member: " + archive.member());
   retained.resize(position + 1);
   retained.admit_json(position, std::move(record));
-  retained.stage_segments(position);
+  retained.stage_segments(position,request.execution ? &request.execution->execution() : nullptr,request.execution ? &request.execution->files() : nullptr,request.parent_allowance);
   if (request.preparation_progress && (position == 0 || (position + 1) % 64 == 0)) request.preparation_progress(CoconutPreparationStage::Annotations, position + 1);
   // Resolve real image work as each JSON record arrives. XL source ordering is
   // assigned below; its full physical stem is already a stable logical key.
@@ -1571,9 +1668,9 @@ void CoconutAnnotationRecords::admit_segments(std::size_t position, std::vector<
  row.segment_ordinal_ = local_ordinal;
  row.state_ = Row::State::Complete;
 }
-void CoconutAnnotationRecords::stage_segments(std::size_t position) {
+void CoconutAnnotationRecords::stage_segments(std::size_t position, detail::CompileExecution* execution, detail::FileWorkQueue* files, const CompileAllowance& parent) {
  if (!staging) staging=std::make_shared<CoconutStaging>(staging_directory,storage);
- rows_.at(position).record_.segments.stage(*staging);
+ rows_.at(position).record_.segments.stage(*staging,execution,files,parent);
 }
 void CoconutAnnotationRecords::adopt(std::vector<CoconutRecord> records) {
  std::deque<Row> rows(records.size());
@@ -1680,7 +1777,7 @@ std::vector<CoconutComponent> import_coconut_annotations(const CoconutImportRequ
    if (request.parquet_shards.empty()) invalid("missing Parquet shards");
    read_coconut_parquet(request.parquet_shards, request.limits, request.cancellation,
     [&](std::size_t group, const CoconutRecord& record, const CoconutAnnotationInput& input) { importer.consume_group(group, record, input); },
-    request.metadata_only, request.execution ? &request.execution->execution() : nullptr,
+    request.metadata_only, request.execution ? &request.execution->execution() : nullptr, request.execution ? &request.execution->files() : nullptr,
     [&] { importer.settle_normalizations(); }, request.parent_allowance, retained.get(),
     [&](const CoconutRecord& record) { return importer.reusable_native(record); },
     [&](const CoconutRecord& record,std::span<const std::uint8_t> png) { return importer.exceptional(record,png); },request.trace);

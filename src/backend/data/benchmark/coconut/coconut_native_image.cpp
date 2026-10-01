@@ -56,31 +56,62 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::rejected(const Coc
  result->input_identity_ = coconut_image_input_identity(result->lineage().component.annotation_input_identity, physical, result->lineage().component.original_annotation_identity);
  return result;
 }
-void CoconutNativeImage::stage(CoconutStaging& staging,std::span<const NormalizedBox> boxes,std::span<const RLEPair> runs) {
- const auto run_offset=common::math::checked_add(boxes.size_bytes(),alignof(RLEPair)-1,"native run alignment overflow") & ~(alignof(RLEPair)-1);
- const auto bytes=common::math::checked_add(run_offset,runs.size_bytes(),"native staging extent overflow");
- auto range=staging.append(bytes,std::max(alignof(NormalizedBox),alignof(RLEPair)),[&](auto target) {
-  if (!boxes.empty()) std::memcpy(target.data(),boxes.data(),boxes.size_bytes());
-  if (!runs.empty()) std::memcpy(target.data()+run_offset,runs.data(),runs.size_bytes());
- });
- backing_=std::move(range.owner);
- mapped_boxes_={reinterpret_cast<const NormalizedBox*>(range.values.data()),boxes.size()};
- mapped_runs_={bytes ? reinterpret_cast<const RLEPair*>(range.values.data()+run_offset) : nullptr,runs.size()};
- staged_=true;
- std::vector<NormalizedBox>().swap(boxes_); std::vector<RLEPair>().swap(runs_);
+namespace {
+std::size_t aligned_native_extent(std::size_t bytes, std::size_t alignment) {
+ return common::math::checked_add(bytes, alignment - 1, "COCONut native alignment overflow") & ~(alignment - 1);
+}
+constexpr auto native_alignment = std::max({alignof(NormalizedBox), alignof(RLEPair), alignof(CoconutNativeSupport::Segment)});
+}
+CoconutNativeOutput::CoconutNativeOutput(std::shared_ptr<CoconutNativeImage> product, std::span<const NormalizedBox> boxes, std::span<const RLEPair> runs)
+ : product_(std::move(product)), boxes_(boxes), runs_(runs), run_offset_(aligned_native_extent(boxes.size_bytes(), alignof(RLEPair))),
+ request_(common::math::checked_add(run_offset_, runs.size_bytes(), "COCONut native extent overflow"), native_alignment) {}
+void CoconutNativeOutput::retain_support(std::span<const CoconutSegmentSupport> support, CoconutNativeSupport& target) {
+ support_ = support;
+ support_target_ = &target;
+ support_offset_ = aligned_native_extent(common::math::checked_add(run_offset_, runs_.size_bytes(), "COCONut support extent overflow"), alignof(CoconutNativeSupport::Segment));
+ support_run_offset_ = aligned_native_extent(common::math::checked_add(support_offset_, common::math::checked_multiply(support.size(), sizeof(CoconutNativeSupport::Segment), "COCONut support extent overflow"), "COCONut support extent overflow"), alignof(RLEPair));
+ support_runs_ = 0;
+ for (const auto& item : support) support_runs_ = common::math::checked_add(support_runs_, item.runs.size(), "COCONut support run count overflow");
+ request_ = CoconutStaging::Request(common::math::checked_add(support_run_offset_, common::math::checked_multiply(support_runs_, sizeof(RLEPair), "COCONut support extent overflow"), "COCONut support extent overflow"), native_alignment);
+}
+void CoconutNativeOutput::fill() {
+ const auto target = request_.target();
+ if (!product_) return;
+ if (!boxes_.empty()) std::memcpy(target.data(), boxes_.data(), boxes_.size_bytes());
+ if (!runs_.empty()) std::memcpy(target.data() + run_offset_, runs_.data(), runs_.size_bytes());
+ if (support_target_) {
+  auto* headers = support_.empty() ? nullptr : reinterpret_cast<CoconutNativeSupport::Segment*>(target.data() + support_offset_);
+  auto* output = support_runs_ ? reinterpret_cast<RLEPair*>(target.data() + support_run_offset_) : nullptr;
+  std::size_t offset = 0;
+  for (std::size_t i = 0; i < support_.size(); ++i) {
+   const auto& item = support_[i];
+   headers[i] = {item.area, item.bounds, offset, item.runs.size(), item.valid};
+   if (!item.runs.empty()) std::memcpy(output + offset, item.runs.data(), item.runs.size() * sizeof(RLEPair));
+   offset += item.runs.size();
+  }
+  *support_target_ = {request_.bytes().owner, {headers, support_.size()}, {output, support_runs_}};
+ }
+ product_->backing_ = request_.bytes().owner;
+ product_->mapped_boxes_ = {boxes_.empty() ? nullptr : reinterpret_cast<const NormalizedBox*>(target.data()), boxes_.size()};
+ product_->mapped_runs_ = {runs_.empty() ? nullptr : reinterpret_cast<const RLEPair*>(target.data() + run_offset_), runs_.size()};
+ product_->staged_ = true;
+ std::vector<NormalizedBox>().swap(product_->boxes_);
+ std::vector<RLEPair>().swap(product_->runs_);
 }
 std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::stage(std::shared_ptr<const CoconutNativeImage> source, CoconutStaging& staging) {
  if (source->staged_ || (!source->backing_ && source->boxes().empty() && source->runs().empty())) return source;
- auto result=std::shared_ptr<CoconutNativeImage>(new CoconutNativeImage(*source));
- result->stage(staging,source->boxes(),source->runs());
+ auto result = std::shared_ptr<CoconutNativeImage>(new CoconutNativeImage(*source));
+ CoconutNativeOutput output(result, source->boxes(), source->runs());
+ staging.prepare(output.request());
+ output.fill();
  return result;
 }
-void CoconutNativeWorkspace::materialize(CoconutNativeImage& product,CoconutStaging* staging) {
- if (scratch().boxes.empty() && scratch().runs.empty()) { product.staged_=true; return; }
- if (staging) product.stage(*staging,scratch().boxes,scratch().runs);
+void CoconutNativeWorkspace::materialize(const std::shared_ptr<CoconutNativeImage>& product, CoconutNativeOutput* output) {
+ if (output) *output = CoconutNativeOutput(product, scratch().boxes, scratch().runs);
+ else if (scratch().boxes.empty() && scratch().runs.empty()) product->staged_ = true;
  else {
-  product.boxes_.assign(scratch().boxes.begin(),scratch().boxes.end());
-  product.runs_.assign(scratch().runs.begin(),scratch().runs.end());
+  product->boxes_.assign(scratch().boxes.begin(), scratch().boxes.end());
+  product->runs_.assign(scratch().runs.begin(), scratch().runs.end());
  }
 }
 std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::bind(std::shared_ptr<const CoconutNativeImage> source, const CoconutPhysicalImage& physical) {
@@ -144,20 +175,20 @@ std::span<const CoconutSegmentSupport> CoconutNativeWorkspace::support(std::size
  return std::span(scratch_->support).first(count);
 }
 void CoconutNativeWorkspace::borrow_support(
- const CoconutRecord& record, std::span<const CoconutSegmentSupport> input, dataset::MaskDimensions dimensions, std::shared_ptr<const void> owner, std::uint32_t unlisted_segment) {
+ const CoconutRecord& record, const CoconutNativeSupport& input, dataset::MaskDimensions dimensions, std::uint32_t unlisted_segment) {
  unlisted_segment_ = unlisted_segment;
- if (input.size() != record.segments.size() || !owner || !dimensions.width || !dimensions.height) throw std::logic_error("COCONut: invalid native support custody");
+ if (input.segments.size() != record.segments.size() || (!input.owner && !input.segments.empty()) || !dimensions.width || !dimensions.height) throw std::logic_error("COCONut: invalid native support custody");
  active_record_ = nullptr;
- supports(input.size());
- for (std::size_t i = 0; i < input.size(); ++i) {
+ supports(input.segments.size());
+ for (std::size_t i = 0; i < input.segments.size(); ++i) {
   auto& target = scratch().support[i];
   target.runs.account(&run_bytes_);
-  target.area = input[i].area;
-  target.bounds = input[i].bounds;
+  target.area = input.segments[i].area;
+  target.bounds = input.segments[i].bounds;
   target.recovered.reset();
   target.carved = false;
-  target.valid = input[i].valid;
-  target.runs.borrow(input[i].runs.view(), owner);
+  target.valid = input.segments[i].valid;
+  target.runs.borrow(input.runs.subspan(input.segments[i].first_run, input.segments[i].runs), input.owner);
  }
  active_record_ = &record;
  active_dimensions_ = dimensions;
@@ -275,7 +306,7 @@ void CoconutNativeWorkspace::decode(const CoconutRecord& record, std::span<const
  active_dimensions_ = dimensions;
 }
 std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::finish(const CoconutRecord& record, const CoconutPhysicalImage& physical, dataset::MaskDimensions dimensions,
- std::shared_ptr<const CoconutNativeLineage> lineage, const CoconutRejectedObject& rejected_object, CoconutStaging* staging) {
+ std::shared_ptr<const CoconutNativeLineage> lineage, const CoconutRejectedObject& rejected_object, CoconutNativeOutput* output) {
  if (active_record_ != &record || active_dimensions_.width != dimensions.width || active_dimensions_.height != dimensions.height || !lineage || lineage->component.source != physical.source)
   throw std::logic_error("COCONut: native image has no matching production workspace");
  const auto width = dimensions.width, height = dimensions.height;
@@ -365,12 +396,12 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::finish(const C
  product->recovery_ = std::move(recovery);
  active_record_ = nullptr;
  product->input_identity_ = coconut_image_input_identity(product->lineage().component.annotation_input_identity, physical, product->lineage().component.original_annotation_identity);
- materialize(*product, staging);
+ materialize(product, output);
  return product;
 }
 std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::reuse(const CoconutRecord& record, const CoconutPhysicalImage& physical, const NormalizedAnnotationReadView& source,
  std::size_t position, const CoconutInventoryImage& inventory, const CoconutRecoveryImage* recovered, std::shared_ptr<const CoconutNativeLineage> lineage, std::string_view dependency,
- bool required_labels_valid, CoconutStaging* staging) {
+ bool required_labels_valid, CoconutNativeOutput* output) {
  if (!lineage || lineage->component.source != physical.source || inventory.physical != physical) throw std::logic_error("COCONut: reused native image has no matching physical input");
  auto product = std::shared_ptr<CoconutNativeImage>(new CoconutNativeImage(std::move(lineage)));
  scratch().boxes.clear();
@@ -418,7 +449,7 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeWorkspace::reuse(const Co
   product->recovery_ = std::move(recovery);
  }
  product->input_identity_ = dependency;
- materialize(*product, staging);
+ materialize(product, output);
  return product;
 }
 }  // namespace mmltk::backend::data::benchmark_internal

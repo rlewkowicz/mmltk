@@ -1,5 +1,6 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/detail/storage_reservation.h"
+#include "src/backend/data/detail/compile_resources.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include <array>
@@ -15,6 +16,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+namespace mmltk::backend::data::detail { class FileWorkQueue; }
 namespace mmltk::backend::data::benchmark_internal {
 class CoconutStaging;
 
@@ -59,7 +61,7 @@ public:
   writable();
   values_.push_back(std::move(value));
  }
- void stage(CoconutStaging&);
+ void stage(CoconutStaging&, detail::CompileExecution* = nullptr, detail::FileWorkQueue* = nullptr, const detail::CompileAllowance& = {});
 
 private:
  void writable();
