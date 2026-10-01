@@ -114,6 +114,15 @@ impl Queue {
         self.raw.as_ref()
     }
 
+    /// Returns the highest index successfully submitted to the HAL, or zero if
+    /// no submission has succeeded. This is an actual-submit high-water mark,
+    /// not proof of physical completion.
+    pub fn last_successful_submission_index(&self) -> SubmissionIndex {
+        self.device
+            .last_successful_submission_index
+            .load(Ordering::Acquire)
+    }
+
     #[track_caller]
     pub(crate) fn lock_life<'a>(&'a self) -> MutexGuard<'a, LifetimeTracker> {
         self.life_tracker.lock()

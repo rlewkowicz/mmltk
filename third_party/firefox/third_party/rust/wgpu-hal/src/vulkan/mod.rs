@@ -1148,7 +1148,6 @@ pub struct Queue {
     relay_semaphores: Mutex<RelaySemaphores>,
     signal_semaphores: Arc<Mutex<Vec<Arc<ExternalSignal>>>>,
     wait_semaphores: Mutex<SemaphoreList>,
-    last_successful_submission: AtomicU64,
 }
 
 /// Effect-only diagnostics supplied by the external signal's caller. Implementations
@@ -1294,7 +1293,6 @@ impl fmt::Debug for Queue {
             relay_semaphores: _,
             signal_semaphores: _,
             wait_semaphores: _,
-            last_successful_submission: _,
         } = self;
         f.debug_struct("Queue")
             .field("family_index", family_index)
@@ -2196,7 +2194,6 @@ impl crate::Queue for Queue {
             pool.write().active.push((signal_value, fence));
         }
         self.relay_semaphores.lock().advance();
-        self.last_successful_submission.store(signal_value, Ordering::Release);
         Ok(())
     }
 
@@ -2240,12 +2237,6 @@ impl Queue {
 
     pub fn queue_operation_gate(&self) -> Arc<std::sync::Mutex<()>> {
         Arc::clone(&self.device.queue_operation_gate)
-    }
-
-    /// Actual Vulkan submission receipt, also available when a later core API
-    /// operation failed. This is a wait target, never a completion receipt.
-    pub fn last_successful_submission(&self) -> crate::FenceValue {
-        self.last_successful_submission.load(Ordering::Acquire)
     }
 
     /// Take ownership of an external semaphore and signal it on the next submit.

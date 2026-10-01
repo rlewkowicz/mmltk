@@ -6317,15 +6317,15 @@ pub unsafe extern "C" fn wgpu_server_queue_submit(
     command_buffers: FfiSlice<'_, id::CommandBufferId>,
     mut error_buf: ErrorBuffer,
 ) -> u64 {
-    // Retain the queue across the call and read its actual Vk submission receipt.
-    // A core error's requested index is not proof that work reached Vulkan.
-    let hal_queue = global.queue_as_hal::<wgc::api::Vulkan>(self_id);
+    // Retain the core queue across the call and read its actual-submit receipt.
+    // An error's requested index is not proof that work reached the HAL.
+    let queue = global.resolve_queue_id(self_id);
     let result = global.queue_submit(self_id, command_buffers.as_slice());
 
     match result {
         Err((index, err)) => {
-            if hal_queue.as_ref().is_some_and(|queue| queue.last_successful_submission() == index) {
-                // Match this attempt to an independent successful Vk receipt.
+            if queue.last_successful_submission_index() == index {
+                // Match this attempt to the canonical successful submission.
                 // Core has registered this submission before later maintenance
                 // can fail. Never schedule a newer concurrently submitting
                 // attempt whose core registration may still be in progress.
