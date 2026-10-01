@@ -226,9 +226,8 @@ struct CompileExecution::Impl {
     // waiting for unrelated work; CPU and workspace custody stay in place.
     for (auto idle = lanes.begin(); idle != lanes.end(); ++idle) {
      if (idle->busy() || idle->baseline == CompileWorkClass::Count) continue;
-     const auto occupied = std::ranges::find_if(lanes, [&](const auto& lane) {
-      return lane.baseline == CompileWorkClass::Count && (lane.active ? lane.active->grant_class : lane.service) == idle->baseline;
-     });
+     const auto occupied =
+      std::ranges::find_if(lanes, [&](const auto& lane) { return lane.baseline == CompileWorkClass::Count && (lane.active ? lane.active->grant_class : lane.service) == idle->baseline; });
      if (occupied == lanes.end()) continue;
      occupied->baseline = std::exchange(idle->baseline, CompileWorkClass::Count);
      available = idle;
@@ -973,8 +972,7 @@ void CompileExecution::Dependency::notify() noexcept {
   owner->notify_locked();
  }
 }
-CompileExecution::Continuation::Continuation(std::shared_ptr<Impl> owner, std::shared_ptr<CompletionState> completion)
-    : owner_(std::move(owner)), completion_(std::move(completion)) {}
+CompileExecution::Continuation::Continuation(std::shared_ptr<Impl> owner, std::shared_ptr<CompletionState> completion) : owner_(std::move(owner)), completion_(std::move(completion)) {}
 CompileExecution::Continuation::~Continuation() { release(); }
 CompileExecution::Continuation::Continuation(Continuation&& other) noexcept : owner_(std::move(other.owner_)), completion_(std::move(other.completion_)) {}
 CompileExecution::Continuation& CompileExecution::Continuation::operator=(Continuation&& other) noexcept {

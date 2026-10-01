@@ -72,7 +72,8 @@ struct DatasetCompileTrack final {
  std::uint64_t invalidated = 0;
  DatasetCompileUnit unit = DatasetCompileUnit::Items;
  [[nodiscard]] bool valid() const noexcept {
-  return static_cast<std::uint8_t>(unit) <= static_cast<std::uint8_t>(DatasetCompileUnit::Rows) && static_cast<std::uint8_t>(activity) <= static_cast<std::uint8_t>(DatasetCompileActivity::Complete) && (!total_known || completed <= total) && !(active && complete);
+  return static_cast<std::uint8_t>(unit) <= static_cast<std::uint8_t>(DatasetCompileUnit::Rows) && static_cast<std::uint8_t>(activity) <= static_cast<std::uint8_t>(DatasetCompileActivity::Complete) &&
+         (!total_known || completed <= total) && !(active && complete);
  }
  bool operator==(const DatasetCompileTrack&) const = default;
 };

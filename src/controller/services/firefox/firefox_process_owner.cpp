@@ -433,7 +433,8 @@ private:
    publish_infrastructure_failure(failure);
    return;
   }
-  publish_terminal(child.si_code == CLD_EXITED ? FirefoxProcessTerminal::Exited : FirefoxProcessTerminal::Signaled, child.si_code == CLD_EXITED ? child.si_status : 128 + child.si_status, child.si_pid);
+  publish_terminal(
+   child.si_code == CLD_EXITED ? FirefoxProcessTerminal::Exited : FirefoxProcessTerminal::Signaled, child.si_code == CLD_EXITED ? child.si_status : 128 + child.si_status, child.si_pid);
  }
  void settle_failure(const std::string_view event, const int error, const int cause = 0) noexcept {
   trace(event, static_cast<std::uint64_t>(static_cast<std::uint32_t>(error)));

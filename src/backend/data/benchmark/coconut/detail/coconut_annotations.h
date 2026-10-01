@@ -87,7 +87,8 @@ private:
  friend class CoconutComponentBacking;
  friend void admit_coconut_component(const CoconutComponent&, mmltk::common::concurrency::CancellationObservation);
  friend std::uint64_t coconut_component_storage_bytes(const CoconutComponent&);
- friend void store_coconut_component(const std::filesystem::path&, const CoconutComponent&, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool*, const BenchmarkTraceSink&);
+ friend void store_coconut_component(
+  const std::filesystem::path&, const CoconutComponent&, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool*, const BenchmarkTraceSink&);
  friend std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutComponentPart>, std::string_view, const CoconutPhysicalMembership&, const std::filesystem::path&,
   mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool*, BenchmarkCompilePipeline*, const CoconutImageRejection&, const BenchmarkTraceSink&);
  CoconutComponent(std::shared_ptr<const CoconutComponentBacking>, NormalizedAnnotationReadView, std::shared_ptr<CoconutInventorySeal>, bool);
@@ -105,7 +106,8 @@ struct CoconutComponentPart {
  std::optional<std::pair<std::uint64_t, std::uint64_t>> source_extent{};
 };
 [[nodiscard]] std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutComponentPart>, std::string_view, const CoconutPhysicalMembership&, const std::filesystem::path&,
- mmltk::common::concurrency::CancellationObservation = {}, detail::StorageReservationPool* = nullptr, BenchmarkCompilePipeline* = nullptr, const CoconutImageRejection& = {}, const BenchmarkTraceSink& = {});
+ mmltk::common::concurrency::CancellationObservation = {}, detail::StorageReservationPool* = nullptr, BenchmarkCompilePipeline* = nullptr, const CoconutImageRejection& = {},
+ const BenchmarkTraceSink& = {});
 struct CoconutComponentBuilder : CoconutComponentMetadata {
  std::uint64_t source_segment_begin = 0;
  NormalizedAnnotationBuilder index;
@@ -152,8 +154,8 @@ struct CoconutComponentImage {
 [[nodiscard]] std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& components, mmltk::common::concurrency::CancellationObservation cancellation = {});
 void admit_coconut_component(const CoconutComponent&, mmltk::common::concurrency::CancellationObservation = {});
 [[nodiscard]] std::uint64_t coconut_component_storage_bytes(const CoconutComponent&);
-void store_coconut_component(
- const std::filesystem::path& index_path, const CoconutComponent& component, mmltk::common::concurrency::CancellationObservation cancellation = {}, detail::StorageReservationPool* storage = nullptr, const BenchmarkTraceSink& trace = {});
+void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component, mmltk::common::concurrency::CancellationObservation cancellation = {},
+ detail::StorageReservationPool* storage = nullptr, const BenchmarkTraceSink& trace = {});
 // Rows retain their mapping while a later inventory/recovery proof is checked.
 // Withdrawal addresses only rows exposed by this admission attempt.
 struct CoconutCacheAdmission {

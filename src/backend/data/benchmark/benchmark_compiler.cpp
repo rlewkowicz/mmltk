@@ -668,9 +668,8 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
  std::mutex rejection_mutex;
  nlohmann::json omitted = nlohmann::json::array();
  const auto reject = [&](const CoconutPhysicalImage& image, std::string_view reason) {
-  trace_benchmark_event(trace, "benchmark.coconut.image_rejected", [&] {
-   return nlohmann::json{{"source", coconut_namespace_name(image.source)}, {"image_id", image.image_id}, {"member", image.member}, {"reason", reason}};
-  });
+  trace_benchmark_event(trace, "benchmark.coconut.image_rejected",
+   [&] { return nlohmann::json{{"source", coconut_namespace_name(image.source)}, {"image_id", image.image_id}, {"member", image.member}, {"reason", reason}}; });
   failures.reject(image, image.image_id, "physical", 0, 0, reason);
   const std::lock_guard lock(rejection_mutex);
   omitted.push_back({{"source", coconut_namespace_name(image.source)}, {"image_id", image.image_id}, {"reason", reason}});
@@ -1072,8 +1071,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   constexpr std::size_t kLabelPlanCount = 4;
   progress.label_plans(kLabelPlanCount);
   const auto publish_selected_labels = [&](const NormalizedAnnotationReadView& index) {
-   const std::size_t slot = index.source == BenchmarkDatasetSource::kCoco2017 ? (index.split == "val2017" ? 3U : 0U)
-                            : index.source == BenchmarkDatasetSource::kObjects365V2 ? 1U : 2U;
+   const std::size_t slot = index.source == BenchmarkDatasetSource::kCoco2017 ? (index.split == "val2017" ? 3U : 0U) : index.source == BenchmarkDatasetSource::kObjects365V2 ? 1U : 2U;
    progress.label_plan_started(slot);
    if (source_labels_started) source_labels_started(index.source, index.split);
    BenchmarkCompletionWindow labels(std::clamp<std::size_t>(pipeline.execution().workers() * 2, 2, 64));

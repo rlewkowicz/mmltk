@@ -30,9 +30,11 @@ detail::FileWorkQueue::Observer observe_files(const BenchmarkTraceSink& trace, s
  if (!trace) return {};
  return [trace, service](std::string_view event, const detail::FileWorkQueue::Observation& value) {
   trace_benchmark_event(trace, event, [&] {
-   return nlohmann::json{{"service", service}, {"queued", value.queued}, {"running", value.running}, {"completing", value.completing}, {"records", value.records},
-    {"capacity", value.capacity}, {"services", value.services}, {"busy", value.busy}, {"admitted", value.admitted}, {"completed", value.completed}, {"operation", value.operation},
-    {"bytes", value.bytes}, {"duration_ns", value.duration_ns}, {"class", value.work_class}, {"failed", value.failed}};
+   return nlohmann::json{
+    {"service", service}, {"queued", value.queued}, {"running", value.running}, {"completing", value.completing}, {"records", value.records}, {"capacity", value.capacity},
+    {"services", value.services}, {"busy", value.busy}, {"admitted", value.admitted}, {"completed", value.completed}, {"operation", value.operation}, {"bytes", value.bytes},
+    {"duration_ns", value.duration_ns}, {"class", value.work_class}, {"failed", value.failed}
+   };
   });
  };
 }
@@ -187,8 +189,10 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
    assert(!job.queued && !job.ready_previous && !job.ready_next && !job.retired_next);
    const auto stage = static_cast<std::size_t>(job.stage);
    job.ready_previous = tails_[stage];
-   if (tails_[stage]) tails_[stage]->ready_next = &job;
-   else heads_[stage] = &job;
+   if (tails_[stage])
+    tails_[stage]->ready_next = &job;
+   else
+    heads_[stage] = &job;
    tails_[stage] = &job;
    job.queued = true;
    ++counts_[stage];
@@ -198,10 +202,14 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
   bool remove(Job& job) noexcept {
    if (!job.queued) return false;
    const auto stage = static_cast<std::size_t>(job.stage);
-   if (job.ready_previous) job.ready_previous->ready_next = job.ready_next;
-   else heads_[stage] = job.ready_next;
-   if (job.ready_next) job.ready_next->ready_previous = job.ready_previous;
-   else tails_[stage] = job.ready_previous;
+   if (job.ready_previous)
+    job.ready_previous->ready_next = job.ready_next;
+   else
+    heads_[stage] = job.ready_next;
+   if (job.ready_next)
+    job.ready_next->ready_previous = job.ready_previous;
+   else
+    tails_[stage] = job.ready_previous;
    job.ready_previous = job.ready_next = nullptr;
    job.queued = false;
    if (!--counts_[stage]) ready_ &= ~(std::uint32_t{1} << stage);
@@ -440,7 +448,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
           };
          });
         }}
-              : CompileExecution::Observer{},
+                   : CompileExecution::Observer{},
         std::make_exception_ptr(std::runtime_error("benchmark dataset compilation cancelled"))),
        files(execution, std::max(std::size_t{4}, workers * 2), std::min(std::size_t{2}, workers), observe_files(trace_sink, "output")),
        image_files(execution, std::max(std::size_t{2}, std::min(std::size_t{4}, workers * 2)), std::min(std::size_t{2}, workers), observe_files(trace_sink, "image")),
@@ -481,9 +489,14 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
   const auto observe = [&](std::string_view event, std::uint64_t duration, bool failed) {
    trace_benchmark_event(trace, event, [&] {
     constexpr std::array names{"header", "workspace", "input", "output", "pixels"};
-    return nlohmann::json{{"root", slot.source->root.string()}, {"image_id", slot.image_id}, {"generation", slot.generation}, {"stage", names[static_cast<std::size_t>(stage)]},
-     {"workspace_bytes", slot.job.resources.bytes}, {"encoded_bytes", slot.input ? slot.writer->pixel_input_bytes(*slot.input) : slot.payload ? slot.payload->size() : 0},
-     {"duration_ns", duration}, {"failed", failed}};
+    return nlohmann::json{
+     {"root", slot.source->root.string()}, {"image_id", slot.image_id}, {"generation", slot.generation}, {"stage", names[static_cast<std::size_t>(stage)]},
+     {"workspace_bytes", slot.job.resources.bytes},
+     {"encoded_bytes", slot.input     ? slot.writer->pixel_input_bytes(*slot.input)
+                       : slot.payload ? slot.payload->size()
+                                      : 0},
+     {"duration_ns", duration}, {"failed", failed}
+    };
    });
   };
   observe("benchmark.image.stage_started", 0, false);
@@ -1244,7 +1257,9 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
  const auto weak = weak_from_this();
  if (job.stage == PixelStage::Input || job.stage == PixelStage::Output) {
   const auto stage = job.stage;
-  auto task = image_files.try_submit({.completed = [weak, &slot, stage](std::exception_ptr error) {
+  auto task = image_files.try_submit(
+   {.completed =
+     [weak, &slot, stage](std::exception_ptr error) {
    auto owner = weak.lock();
    if (!owner) return;
    {
@@ -1260,7 +1275,9 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
     }
    }
    owner->settle(slot.job, error);
-  }, .work = [weak, &slot, stage] {
+  },
+    .work =
+     [weak, &slot, stage] {
    if (auto owner = weak.lock()) {
     {
      const std::lock_guard lock(owner->mutex);
@@ -1273,24 +1290,25 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
       slot.writer->prepare_pixels(static_cast<std::uint32_t>(slot.index));
     });
    }
-  }, .service_class = stage == PixelStage::Input ? CompileWorkClass::Extraction : CompileWorkClass::Pixels,
-   .bytes = trace && stage == PixelStage::Input ? slot.writer->pixel_input_bytes(*slot.input) : 0});
+  },
+    .service_class = stage == PixelStage::Input ? CompileWorkClass::Extraction : CompileWorkClass::Pixels,
+    .bytes = trace && stage == PixelStage::Input ? slot.writer->pixel_input_bytes(*slot.input) : 0});
   if (!task) return false;
   job.handle = std::move(*task);
   return true;
  }
- CompileExecution::Task work
-  {.kind = job.stage == PixelStage::Header ? CompileTaskKind::Header : CompileTaskKind::Pixels,
-   .resources = job.resources,
-   .work =
-    [weak, &slot](std::size_t lane, const CompileAllowance& allowance) {
+ CompileExecution::Task work{
+  .kind = job.stage == PixelStage::Header ? CompileTaskKind::Header : CompileTaskKind::Pixels,
+  .resources = job.resources,
+  .work =
+   [weak, &slot](std::size_t lane, const CompileAllowance& allowance) {
   if (auto owner = weak.lock()) owner->pixel_work(slot, slot.job.stage, [&] { owner->run_pixel(slot, lane, allowance); });
  },
-   .allowance = job.stage == PixelStage::Pixels ? slot.pixel_allowance : CompileAllowance{},
-   .parent = job.parent,
-   .finite_consumer = job.stage != PixelStage::Header,
-   .retain_workspace = false,
-   .completed = [weak, &slot](std::exception_ptr error) {
+  .allowance = job.stage == PixelStage::Pixels ? slot.pixel_allowance : CompileAllowance{},
+  .parent = job.parent,
+  .finite_consumer = job.stage != PixelStage::Header,
+  .retain_workspace = false,
+  .completed = [weak, &slot](std::exception_ptr error) {
   auto owner = weak.lock();
   if (!owner) return;
   bool recoverable = false;
@@ -1328,7 +1346,8 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
    }
   }
   owner->settle(slot.job, error, recoverable);
- }};
+ }
+ };
  auto task = job.stage == PixelStage::Pixels ? slot.continuation.try_submit(std::move(work)) : execution.try_submit(std::move(work));
  if (!task) return false;
  job.handle = std::move(*task);
@@ -1423,9 +1442,10 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
   const auto outputs = label_outputs.size();
   lock.unlock();
   trace_benchmark_event(trace, "benchmark.pipeline.ready", [&] {
-   return nlohmann::json{{"header", queued[0]}, {"workspace", queued[1]}, {"input", queued[2]}, {"output", queued[3]}, {"pixels", queued[4]},
-    {"pending_images", pending_images}, {"image_head_probes", image_head_probes}, {"image_admitted", image_admitted},
-    {"label_outputs", outputs}, {"stage_records_blocked", blocked}, {"label_file_records_blocked", file_full}};
+   return nlohmann::json{
+    {"header", queued[0]}, {"workspace", queued[1]}, {"input", queued[2]}, {"output", queued[3]}, {"pixels", queued[4]}, {"pending_images", pending_images}, {"image_head_probes", image_head_probes},
+    {"image_admitted", image_admitted}, {"label_outputs", outputs}, {"stage_records_blocked", blocked}, {"label_file_records_blocked", file_full}
+   };
   });
  }
 }

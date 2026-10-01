@@ -1121,7 +1121,8 @@ void validate_assembled_box(NormalizedBox& box, std::size_t runs, BenchmarkDatas
  validate_box_value(box, source);
 }
 }  // namespace
-void NormalizedAnnotationAssembler::gather(std::span<const Slice> slices, CompileExecution* execution, detail::FileWorkQueue* files, const CompileAllowance& allowance, const BenchmarkTraceSink& trace) {
+void NormalizedAnnotationAssembler::gather(
+ std::span<const Slice> slices, CompileExecution* execution, detail::FileWorkQueue* files, const CompileAllowance& allowance, const BenchmarkTraceSink& trace) {
  if (finished_ || incomplete_gather_ || (mapped_ ? mapped_->image_count : builder_.images.size())) throw std::logic_error("normalized gather requires an empty assembler");
  if (execution && execution->on_lane()) throw std::logic_error("normalized gather requires a controller outside CPU work");
  trace_benchmark_event(trace, "benchmark.annotations.gather_started", [&] { return nlohmann::json{{"images", slices.size()}}; });
@@ -1836,9 +1837,8 @@ std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotatio
  auto backing = index.backing->staged;
  const bool transfer = backing && backing->can_publish(path);
  detail::StagedArtifact staging;
- trace_benchmark_event(trace, "benchmark.annotations.cache_prepare", [&] {
-  return nlohmann::json{{"path", path.string()}, {"bytes", total_size}, {"payload_copy_bytes", transfer ? 0 : total_size - sizeof(header)}, {"same_backing", transfer}};
- });
+ trace_benchmark_event(trace, "benchmark.annotations.cache_prepare",
+  [&] { return nlohmann::json{{"path", path.string()}, {"bytes", total_size}, {"payload_copy_bytes", transfer ? 0 : total_size - sizeof(header)}, {"same_backing", transfer}}; });
  if (transfer) {
   backing->seal_prefix(std::as_bytes(std::span(&header, 1)));
  } else {
@@ -1862,8 +1862,10 @@ std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotatio
  if (error) { throw std::filesystem::filesystem_error("cannot invalidate normalized annotation completion manifest", completion, error); }
  if (removed) { sync_parent_directory(completion); }
  throw_if_benchmark_cancelled(cancel_requested);
- if (transfer) backing->publish(path, cancel_requested);
- else staging.publish(path, cancel_requested);
+ if (transfer)
+  backing->publish(path, cancel_requested);
+ else
+  staging.publish(path, cancel_requested);
  auto facts = std::make_shared<NormalizedAnnotationCompletion>();
  facts->schema_version = kBenchmarkCacheSchemaVersion;
  facts->index_version = kNormalizedAnnotationIndexVersion;
@@ -1882,8 +1884,11 @@ std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotatio
  mmltk::frameworks::reflection::visit_materialized_members<NormalizedAnnotationCompletionFacts>(
   [&]<class Declaration>(const auto& field) { manifest[field.member_name] = facts.get()->*Declaration::pointer; });
  facts->proof_bytes = write_json_atomically(completion, manifest, cancel_requested, &destination);
- trace_benchmark_event(trace, "benchmark.annotations.cache_store",
-  [&] { return nlohmann::json{{"path", path.string()}, {"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"bytes", total_size}}; });
+ trace_benchmark_event(trace, "benchmark.annotations.cache_store", [&] {
+  return nlohmann::json{
+   {"path", path.string()}, {"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"bytes", total_size}
+  };
+ });
  return facts;
 }
 NormalizedAnnotationReadView::NormalizedAnnotationReadView(NormalizedAnnotationIndex storage)

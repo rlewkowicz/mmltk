@@ -451,17 +451,26 @@ fn row_counts_remain_distinct_from_component_work_and_terminal_settlement() {
     rows.active = true;
     rows.activity = DatasetCompileActivity::Preparing;
     assert_eq!(track_ratio(rows), None);
-    assert_eq!(track_caption(rows), "Preparing labels and masks · 241,730 / ? rows");
+    assert_eq!(
+        track_caption(rows),
+        "Preparing labels and masks · 241,730 / ? rows"
+    );
     rows.total = 241_730;
     rows.totalknown = true;
     assert_eq!(track_ratio(rows), Some(1.0));
-    assert_eq!(track_caption(rows), "Preparing labels and masks · 241,730 / 241,730 rows");
+    assert_eq!(
+        track_caption(rows),
+        "Preparing labels and masks · 241,730 / 241,730 rows"
+    );
     rows.active = false;
     assert_eq!(track_caption(rows), "Waiting · 241,730 / 241,730 rows");
     assert_eq!(work_caption(&state).as_deref(), Some("Labels · 1 / 3"));
     state.progress.tracks.labels.complete = true;
     state.progress.completed = 3;
-    assert_eq!(track_caption(&state.progress.tracks.labels), "Complete · 241,730 rows");
+    assert_eq!(
+        track_caption(&state.progress.tracks.labels),
+        "Complete · 241,730 rows"
+    );
     assert!(show_tracks(&state));
     state.active = false;
     state.terminal.outcome = ArtifactTerminalOutcome::Succeeded;

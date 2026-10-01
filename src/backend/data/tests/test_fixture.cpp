@@ -23,26 +23,19 @@ namespace fs = std::filesystem;
 namespace mmltk::backend::data::testsupport {
 benchmark_internal::BenchmarkTraceSink benchmark_trace() {
  if (!std::getenv("MMLTK_TEST_BENCHMARK_TRACE")) return {};
- return [](std::string_view event, const nlohmann::json& fields) {
-  std::fprintf(stderr, "%s\n", nlohmann::json{{"event", event}, {"payload", fields}}.dump().c_str());
- };
+ return [](std::string_view event, const nlohmann::json& fields) { std::fprintf(stderr, "%s\n", nlohmann::json{{"event", event}, {"payload", fields}}.dump().c_str()); };
 }
 detail::CompileExecution::Task prepare_benchmark_pixel(benchmark_internal::BenchmarkCompilePipeline& pipeline, benchmark_internal::BenchmarkSplitWriter& writer, std::uint32_t slot) {
  using namespace detail;
  auto& execution = pipeline.execution();
  std::shared_ptr<benchmark_internal::BenchmarkPixelInput> input;
- execution.run(CompileTaskKind::Header, CompileResources::handles(1, false, 1), [&](std::size_t lane) {
-  input = writer.prepare_pixel(slot, lane, {}, execution.current_allowance());
- });
+ execution.run(CompileTaskKind::Header, CompileResources::handles(1, false, 1), [&](std::size_t lane) { input = writer.prepare_pixel(slot, lane, {}, execution.current_allowance()); });
  if (!input) throw std::logic_error("cooperative pixel fixture was already completed");
  pipeline.files().submit({.work = [&] { writer.prepare_pixels(slot); }}).wait();
  auto scratch = std::make_shared<CompilePixelWorkspace>();
- return {.kind = CompileTaskKind::Pixels,
-         .resources = writer.pixel_resources(*input),
-         .work = [&writer, slot, input, scratch](std::size_t lane, const CompileAllowance& allowance) { writer.write_pixel(slot, lane, input, allowance, *scratch); },
-         .parent = writer.pixel_input_allowance(*input),
-         .finite_consumer = true,
-         .retain_workspace = false};
+ return {.kind = CompileTaskKind::Pixels, .resources = writer.pixel_resources(*input), .work = [&writer, slot, input, scratch](std::size_t lane, const CompileAllowance& allowance) {
+  writer.write_pixel(slot, lane, input, allowance, *scratch);
+ }, .parent = writer.pixel_input_allowance(*input), .finite_consumer = true, .retain_workspace = false};
 }
 mmltk::common::io::FileHandle create_compiled_fixture_file(const std::filesystem::path& path, const FileHeader& header) {
  (void)validate_compiled_file_sections(header, header.total_file_size);

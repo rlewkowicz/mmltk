@@ -557,9 +557,7 @@ struct BenchmarkCurl::Impl {
      }
      waiting_cpu = false;
     }
-    if (cpu) {
-     mmltk::common::system::set_thread_affinity({cpu->cpu()});
-    }
+    if (cpu) { mmltk::common::system::set_thread_affinity({cpu->cpu()}); }
     bool waiting = false;
     each_queue([&](const auto& queue) { waiting = waiting || !queue.empty(); });
     // Establish fixed transport custody before a channel can admit source

@@ -89,14 +89,16 @@ CompileProgress CompileTelemetry::snapshot(DatasetCompilePhase phase) const noex
        .total_known = true,
        .active = phase != DatasetCompilePhase::Planning && label_done != num_images,
        .complete = label_done == num_images,
-       .activity = label_done == num_images ? DatasetCompileActivity::Complete : DatasetCompileActivity::Preparing, .unit = DatasetCompileUnit::Images},
+       .activity = label_done == num_images ? DatasetCompileActivity::Complete : DatasetCompileActivity::Preparing,
+       .unit = DatasetCompileUnit::Images},
      .pixels =
       {.completed = pixel_done,
        .total = num_images,
        .total_known = true,
        .active = (pixel_active != 0 || phase == DatasetCompilePhase::Pixels) && pixel_done != num_images,
        .complete = pixel_done == num_images,
-       .activity = pixel_done == num_images ? DatasetCompileActivity::Complete : DatasetCompileActivity::Compiling, .unit = DatasetCompileUnit::Images}},
+       .activity = pixel_done == num_images ? DatasetCompileActivity::Complete : DatasetCompileActivity::Compiling,
+       .unit = DatasetCompileUnit::Images}},
    .active_workers = label_active + pixel_active,
    .dropped_instances = dropped_instances_.load(std::memory_order_relaxed)
   };

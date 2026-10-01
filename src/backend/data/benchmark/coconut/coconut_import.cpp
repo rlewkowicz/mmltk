@@ -578,8 +578,7 @@ public:
    if (reusable_native(record)) return false;
    if (const auto physical = identify(record)) {
     std::size_t position = 0;
-    if (const auto* reused = reusable_image(*physical, position))
-     return assembly_workspace_.reuse_workspace_bytes(record, reused->index(), position) > capacity;
+    if (const auto* reused = reusable_image(*physical, position)) return assembly_workspace_.reuse_workspace_bytes(record, reused->index(), position) > capacity;
    }
    const auto dimensions = assembly_workspace_.admit_png(record, png);
    const auto bytes = common::math::checked_add(assembly_workspace_.decoder_workspace_bytes(png),
@@ -976,8 +975,7 @@ public:
     const auto original = request_.originals(source, true, {});
     header = lineage_for(source, assembly_workspace_.recovery(), original.generation)->component;
     for (const auto& row : rows)
-     if (row.component->original_generation != header.original_generation || row.component->original_annotation_identity != header.original_annotation_identity)
-      throw CoconutOriginalChanged(source);
+     if (row.component->original_generation != header.original_generation || row.component->original_annotation_identity != header.original_annotation_identity) throw CoconutOriginalChanged(source);
    }
    std::optional<std::uint64_t> source_extent;
    if ((request_.records->parquet || request_.records->document_complete) && std::ranges::all_of(request_.records->rows(), [](const auto& row) { return row.complete(); })) {
@@ -1063,8 +1061,8 @@ private:
   trace_benchmark_event(request_.trace, "benchmark.coconut.native_staged", [&] {
    const auto snapshot = request_.execution ? request_.execution->execution().snapshot() : detail::CompileExecutionSnapshot{};
    return nlohmann::json{
-    {"image_id", image.inventory().physical.image_id}, {"kind", kind}, {"admitted_runs", image.admission() ? image.runs().size() : 0}, {"boxes", image.boxes().size()}, {"runs", image.runs().size()}, {"normal_locked", snapshot.normal_locked},
-    {"leased", snapshot.leased}, {"exceptional", snapshot.exceptional}
+    {"image_id", image.inventory().physical.image_id}, {"kind", kind}, {"admitted_runs", image.admission() ? image.runs().size() : 0}, {"boxes", image.boxes().size()}, {"runs", image.runs().size()},
+    {"normal_locked", snapshot.normal_locked}, {"leased", snapshot.leased}, {"exceptional", snapshot.exceptional}
    };
   });
  }
@@ -1173,8 +1171,7 @@ private:
     signal->working(native);
     progressed = true;
     if (native->recovered) {
-     if (request_.execution)
-      request_.execution->retire_labels(request_.physical_membership->identity_root(native->physical.source), native->physical.image_id, native->product->input_identity());
+     if (request_.execution) request_.execution->retire_labels(request_.physical_membership->identity_root(native->physical.source), native->physical.image_id, native->product->input_identity());
      native->product.reset();
      native->recovered = false;
     }
@@ -1234,9 +1231,8 @@ private:
       // Rechecking through the ready queue closes changes during CPU work.
       recovery_signal_->retry(native);
      }
-     trace_benchmark_event(request_.trace, "benchmark.coconut.recovery_settled", [&] {
-      return nlohmann::json{{"image_id", native->record.image_id}, {"source", native->physical.source}, {"physical_terminal", current_physical.terminal}};
-     });
+     trace_benchmark_event(request_.trace, "benchmark.coconut.recovery_settled",
+      [&] { return nlohmann::json{{"image_id", native->record.image_id}, {"source", native->physical.source}, {"physical_terminal", current_physical.terminal}}; });
     };
     if (request_.execution) {
      auto job = std::make_shared<NativeJob>(request_.execution->execution(), CompileTaskKind::Recovery);
@@ -1355,21 +1351,25 @@ private:
       enqueue_locked(row);
      }
     }
-    found->second = OriginalGroup{.delivered = true};
+    found->second = OriginalGroup{.rows = {}, .delivered = true};
    }
    trace_benchmark_event(trace, "benchmark.coconut.original_notified", [&] { return nlohmann::json{{"source", key.first}, {"generation", key.second}, {"rows", count}}; });
   }
   void append(const std::shared_ptr<PendingNativeImage>& row) {
    row->readiness = State::Ready;
-   if (last) last->next_ready = row;
-   else first = row;
+   if (last)
+    last->next_ready = row;
+   else
+    first = row;
    last = row.get();
    revision.fetch_add(1, std::memory_order_release);
    changed.notify_all();
   }
   void enqueue_locked(const std::shared_ptr<PendingNativeImage>& row) {
-   if (row->readiness == State::Checking) row->notified = true;
-   else if (row->readiness == State::Parked) append(row);
+   if (row->readiness == State::Checking)
+    row->notified = true;
+   else if (row->readiness == State::Parked)
+    append(row);
   }
   void enqueue(const std::shared_ptr<PendingNativeImage>& row) {
    const std::lock_guard lock(mutex);
@@ -1387,8 +1387,10 @@ private:
   }
   void park(const std::shared_ptr<PendingNativeImage>& row) {
    const std::lock_guard lock(mutex);
-   if (row->notified) append(row);
-   else row->readiness = State::Parked;
+   if (row->notified)
+    append(row);
+   else
+    row->readiness = State::Parked;
   }
   void working(const std::shared_ptr<PendingNativeImage>& row) {
    const std::lock_guard lock(mutex);
@@ -1425,9 +1427,7 @@ private:
    const std::lock_guard lock(groups_mutex_);
    pending_.erase(native->position);
   }
-  trace_benchmark_event(request_.trace, "benchmark.coconut.recovery_retired", [&] {
-   return nlohmann::json{{"image_id", native->record.image_id}, {"source_ordinal", native->position}};
-  });
+  trace_benchmark_event(request_.trace, "benchmark.coconut.recovery_retired", [&] { return nlohmann::json{{"image_id", native->record.image_id}, {"source_ordinal", native->position}}; });
  }
  std::shared_ptr<RecoverySignal> recovery_signal_ = std::make_shared<RecoverySignal>(request_.trace);
  std::exception_ptr recovery_failure_;

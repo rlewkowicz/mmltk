@@ -2035,8 +2035,9 @@ TEST_CASE("Directory yields inside one long mask projection for peer pixels and 
   }
  }, [](void* context, std::string_view event, const CompileExecutionSnapshot& snapshot) {
   auto& observed = *static_cast<State*>(context);
-  if (observed.trace) observed.trace(event, {{"active", snapshot.active}, {"external", snapshot.external}, {"running", snapshot.running}, {"live", snapshot.live},
-   {"parked", snapshot.parked}, {"leased", snapshot.leased}, {"exceptional", snapshot.exceptional}, {"baseline", snapshot.baseline}});
+  if (observed.trace)
+   observed.trace(event, {{"active", snapshot.active}, {"external", snapshot.external}, {"running", snapshot.running}, {"live", snapshot.live}, {"parked", snapshot.parked},
+                          {"leased", snapshot.leased}, {"exceptional", snapshot.exceptional}, {"baseline", snapshot.baseline}});
  }};
  if (!state.trace) observer.execution = nullptr;
  config.observation = &observer;

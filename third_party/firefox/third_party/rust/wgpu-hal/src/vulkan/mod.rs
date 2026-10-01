@@ -84,7 +84,7 @@ pub fn report_fatal(
         len: usize,
         truncated: bool,
     }
-    impl fmt::Write for Line {
+    impl Write for Line {
         fn write_str(&mut self, value: &str) -> fmt::Result {
             for character in value.chars() {
                 let character = if character.is_control() { ' ' } else { character };

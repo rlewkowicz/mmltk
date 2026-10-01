@@ -327,8 +327,10 @@ TEST_CASE("dataset delivers mixed Coconut row extents and continuing pixels thro
   reporter.flush();
  };
  DatasetSystem dataset{settings, [&] { return std::make_unique<AcquisitionDatasetRuntime>(work); }, [&](DatasetSystem::event_type event) {
-  if (const auto* progress = std::get_if<DatasetProgress>(&event)) delivered.push_back(progress->snapshot.progress);
-  else terminal.set_value(std::get<DatasetChanged>(std::move(event)));
+  if (const auto* progress = std::get_if<DatasetProgress>(&event))
+   delivered.push_back(progress->snapshot.progress);
+  else
+   terminal.set_value(std::get<DatasetChanged>(std::move(event)));
  }};
  const mmltk::testsupport::ScopedTestCleanup settle([&] { dataset.Shutdown(); });
  static_cast<void>(dataset.Compile({}));

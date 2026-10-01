@@ -129,7 +129,8 @@ void ProgressReporter::phase_unlocked(std::unique_lock<std::mutex>& lock, const 
   lock, ((phase_changed && (phase == DatasetCompilePhase::Planning || phase == DatasetCompilePhase::Compacting || phase == DatasetCompilePhase::Syncing || phase == DatasetCompilePhase::Publishing)) ||
          ((phase == DatasetCompilePhase::Syncing || phase == DatasetCompilePhase::Publishing) && total != 0 && completed == total))
          ? DeliveryMode::Lifecycle
-         : indexing_started ? DeliveryMode::Boundary : DeliveryMode::Dirty);
+        : indexing_started ? DeliveryMode::Boundary
+                           : DeliveryMode::Dirty);
 }
 void ProgressReporter::update_labels() {
  if (state_.phase == DatasetCompilePhase::Labels) {
@@ -144,10 +145,10 @@ void ProgressReporter::update_labels() {
  labels.total_known = indexing_known_;
  labels.complete = labels_admitted_ && indexing_settled_ && label_completed_ == label_plans_.size();
  labels.active = !labels.complete && ((indexing_started_ && !indexing_settled_) || label_active_ != 0);
- labels.activity = labels.complete ? DatasetCompileActivity::Complete
-                   : label_active_ != 0 ? DatasetCompileActivity::Preparing
-                   : indexing_started_ && !indexing_settled_ ? DatasetCompileActivity::Normalizing
-                                        : DatasetCompileActivity::Waiting;
+ labels.activity = labels.complete                            ? DatasetCompileActivity::Complete
+                   : label_active_ != 0                       ? DatasetCompileActivity::Preparing
+                    : indexing_started_ && !indexing_settled_ ? DatasetCompileActivity::Normalizing
+                                                              : DatasetCompileActivity::Waiting;
 }
 void ProgressReporter::label_plans(std::size_t total) {
  if (!callback_) return;
@@ -164,9 +165,7 @@ void ProgressReporter::label_plan_started(std::size_t slot) {
  auto& plan = label_plans_.at(slot);
  if (plan == LabelPlan::Active) return;
  const bool invalidated = plan == LabelPlan::Complete;
- if (invalidated) {
-  --label_completed_;
- }
+ if (invalidated) { --label_completed_; }
  plan = LabelPlan::Active;
  ++label_active_;
  update_labels();

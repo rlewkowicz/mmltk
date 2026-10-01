@@ -319,9 +319,8 @@ void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progr
      build_split(train, identity, progress, input);
      const std::lock_guard lock(completion_mutex);
      const auto settled = completed_count.fetch_add(1) + 1;
-     trace_benchmark_event(trace_, "benchmark.annotations.original_index_completed", [&] {
-      return nlohmann::json{{"split", train ? "train2017" : "val2017"}, {"completed_items", settled}, {"total_items", total}};
-     });
+     trace_benchmark_event(
+      trace_, "benchmark.annotations.original_index_completed", [&] { return nlohmann::json{{"split", train ? "train2017" : "val2017"}, {"completed_items", settled}, {"total_items", total}}; });
      progress.phase(DatasetCompilePhase::Indexing, settled, total);
     });
    });

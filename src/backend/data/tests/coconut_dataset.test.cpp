@@ -4223,7 +4223,8 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
 TEST_CASE("cold benchmark readers finish oversized grants with retained release control on one CPU", "[benchmark][coconut][pipeline]") {
  ScopedTempDir root("cold-shared-readers");
  std::atomic<bool> cancelled{false};
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 65536, .descriptors = 32}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), mmltk::backend::data::testsupport::benchmark_trace());
+ BenchmarkCompilePipeline execution(
+  1, {}, {.transient_bytes = 65536, .descriptors = 32}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), mmltk::backend::data::testsupport::benchmark_trace());
  auto release = execution.execution().reserve(CompileResources::handles(1, true, 4));
  const std::array<std::uint32_t, 1> ids{1};
  const auto mask = png(1, 1, ids);
@@ -6013,13 +6014,14 @@ TEST_CASE("retained archive images keep storage after decoder CPUs return", "[be
   .shard = "train2017",
   .selected_image_ids = ids,
   .image_id_parser = [](std::string_view) { return std::optional<std::uint64_t>{1}; },
-  .validator = [&](std::uint64_t, std::span<const std::uint8_t> bytes) {
-   // Extraction owns this header grant even when the forward reader has
-   // returned its optional decompression helpers between chunks.
-   const auto state = execution.execution().snapshot();
-   live_cpus_charged = state.running[static_cast<std::size_t>(CompileWorkClass::Extraction)] > 0 && state.active > 0 && state.active + state.external <= execution.execution().workers();
-   return BenchmarkImageDecoder{}.read_header(bytes);
-  },
+  .validator =
+   [&](std::uint64_t, std::span<const std::uint8_t> bytes) {
+  // Extraction owns this header grant even when the forward reader has
+  // returned its optional decompression helpers between chunks.
+  const auto state = execution.execution().snapshot();
+  live_cpus_charged = state.running[static_cast<std::size_t>(CompileWorkClass::Extraction)] > 0 && state.active > 0 && state.active + state.external <= execution.execution().workers();
+  return BenchmarkImageDecoder{}.read_header(bytes);
+ },
   .decompression_workers = 2,
   .image_ready =
    [&](const CachedImageReady& ready) {
@@ -9930,8 +9932,7 @@ TEST_CASE("original generation delivery visits only live recovery rows after phy
   if (event == "benchmark.coconut.recovery_parked") {
    const unsigned bit = 1U << (id - first_id);
    if ((parked_mask.fetch_or(bit) | bit) == (1U << count) - 1) mmltk::testsupport::release_test_promise(parked);
-   if (id == first_id && fields.at("physical_generation").get<std::uint64_t>() >= revisit_generation.load())
-    mmltk::testsupport::release_test_promise(live_revisited);
+   if (id == first_id && fields.at("physical_generation").get<std::uint64_t>() >= revisit_generation.load()) mmltk::testsupport::release_test_promise(live_revisited);
   }
   if (event == "benchmark.coconut.recovery_retired" && ++retired == count - 1) mmltk::testsupport::release_test_promise(peers_retired);
  };

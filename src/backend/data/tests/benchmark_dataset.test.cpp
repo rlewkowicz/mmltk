@@ -542,9 +542,9 @@ void test_benchmark_annotation_indexes() {
  // Field offsets, record extents and values are independent of the production
  // header/layout implementation. Overflowing corrupt counts remain cache misses.
  const std::array invalid_headers{
-  InvalidHeader{16, 4, 0}, InvalidHeader{16, 4, UINT32_MAX}, InvalidHeader{20, 8, UINT64_MAX}, InvalidHeader{28, 8, UINT64_MAX},
-  InvalidHeader{20, 8, UINT64_MAX / 64}, InvalidHeader{28, 8, UINT64_MAX / 8}, InvalidHeader{20, 8, 3}, InvalidHeader{28, 8, 1},
-  InvalidHeader{36, 8, 257}, InvalidHeader{44, 8, 321}, InvalidHeader{52, 8, 449}, InvalidHeader{60, 8, 449}, InvalidHeader{13, 1, 1}, InvalidHeader{244, 1, 1}
+  InvalidHeader{16, 4, 0}, InvalidHeader{16, 4, UINT32_MAX}, InvalidHeader{20, 8, UINT64_MAX}, InvalidHeader{28, 8, UINT64_MAX}, InvalidHeader{20, 8, UINT64_MAX / 64},
+  InvalidHeader{28, 8, UINT64_MAX / 8}, InvalidHeader{20, 8, 3}, InvalidHeader{28, 8, 1}, InvalidHeader{36, 8, 257}, InvalidHeader{44, 8, 321}, InvalidHeader{52, 8, 449}, InvalidHeader{60, 8, 449},
+  InvalidHeader{13, 1, 1}, InvalidHeader{244, 1, 1}
  };
  for (const auto& invalid : invalid_headers) {
   CAPTURE(invalid.offset, invalid.width, invalid.value);
@@ -3664,9 +3664,7 @@ TEST_CASE("unrelated compile failure discards queued pixels before joining activ
   pipeline.source_publication(images, active)({2});
   active.reset();
   require_condition(second.WaitEntered(2s), "second pixel reader did not open");
-  auto held_extraction = pipeline.execution().submit({.kind = CompileTaskKind::Header, .work = [&](std::size_t, const CompileAllowance&) {
-   extraction_lane.receipt().ArriveAndWait();
-  }});
+  auto held_extraction = pipeline.execution().submit({.kind = CompileTaskKind::Header, .work = [&](std::size_t, const CompileAllowance&) { extraction_lane.receipt().ArriveAndWait(); }});
   require_condition(extraction_lane.WaitEntered(2s), "extraction floor did not enter its physical hold");
   for (std::uint64_t id = 3; id <= 5; ++id) pipeline.source_publication(images, queued)({id});
   queued.reset();
@@ -8638,9 +8636,7 @@ TEST_CASE("normalized assembly handles empty extents and mapped capacity boundar
  }
  SECTION("mapped extent overflow fails before storage creation") {
   constexpr auto maximum = std::numeric_limits<std::size_t>::max();
-  const std::array<std::array<std::size_t, 3>, 6> counts{{
-   {maximum, 0, 0}, {0, maximum, 0}, {0, 0, maximum}, {maximum / 32, 0, 0}, {0, maximum / 64, 0}, {0, 0, maximum / 8}
-  }};
+  const std::array<std::array<std::size_t, 3>, 6> counts{{{maximum, 0, 0}, {0, maximum, 0}, {0, 0, maximum}, {maximum / 32, 0, 0}, {0, maximum / 64, 0}, {0, 0, maximum / 8}}};
   for (const auto& count : counts) {
    CAPTURE(count);
    CHECK_THROWS_AS(NormalizedAnnotationAssembler({}, count[0], count[1], count[2], {}, root.path()), std::overflow_error);
@@ -9994,7 +9990,9 @@ TEST_CASE("compile continuation custody separates step callbacks from record ret
    callback.Release();
    resumed.Release();
    execution.cancel();
-   if (first) try { first.wait(); } catch (...) {}
+   if (first) try {
+     first.wait();
+    } catch (...) {}
    retained = {};
    continuation = {};
    if (retiring.valid()) retiring.wait();
@@ -10071,8 +10069,7 @@ TEST_CASE("compile continuation custody separates step callbacks from record ret
   CHECK(execution.snapshot().records == 0);
   CHECK(execution.resource_usage().bytes == (finite_loan ? 64 : 0));
   CompileExecution::Dependency dependency(execution);
-  auto replacement = execution.try_subscribe(dependency, dependency.generation(),
-   {.kind = CompileTaskKind::Normalize, .work = [&](std::size_t, const CompileAllowance&) { ++calls; }});
+  auto replacement = execution.try_subscribe(dependency, dependency.generation(), {.kind = CompileTaskKind::Normalize, .work = [&](std::size_t, const CompileAllowance&) { ++calls; }});
   REQUIRE(replacement);
   first.cancel();
   execution.resume(first);
@@ -10082,8 +10079,10 @@ TEST_CASE("compile continuation custody separates step callbacks from record ret
   execution.join();
   CHECK(calls == (outcome == Outcome::Resume ? 2 : 1));
  };
- if (finite_loan) execution.with_unused_workspace(lender, 32, exercise);
- else exercise();
+ if (finite_loan)
+  execution.with_unused_workspace(lender, 32, exercise);
+ else
+  exercise();
 }
 TEST_CASE("aged compile demands leave retained-owner dependencies runnable", "[backend][data][benchmark][pipeline]") {
  const bool parent_custody = GENERATE(false, true);
@@ -12309,8 +12308,10 @@ TEST_CASE("preloaded image custody preserves an admitted inode while a ready pee
  publication({2});
  std::promise<void> ready;
  pipeline.image_completion(images, 2).subscribe([&](std::exception_ptr error) {
-  if (error) ready.set_exception(error);
-  else ready.set_value();
+  if (error)
+   ready.set_exception(error);
+  else
+   ready.set_value();
  });
  mmltk::testsupport::await_test_promise(ready, "ready image converts while its peer is preloading", 5s);
  CHECK(writer.image_complete(1));
@@ -12344,8 +12345,10 @@ TEST_CASE("image file capacity remains useful behind held cache and label output
  publication({1});
  std::promise<void> ready;
  pipeline.image_completion(images, 1).subscribe([&](std::exception_ptr error) {
-  if (error) ready.set_exception(error);
-  else ready.set_value();
+  if (error)
+   ready.set_exception(error);
+  else
+   ready.set_value();
  });
  mmltk::testsupport::await_test_promise(ready, "pixels prepare their extent and finish beside held output", 5s);
  const auto slot = pipeline.image_slot(images, 1);
@@ -12388,8 +12391,10 @@ TEST_CASE("preload and extent cancellation join physical custody before replacem
  CHECK(pipeline.execution().snapshot().leased > 0);
  CHECK(pipeline.execution().snapshot().records == 1);
  auto retiring = std::async(std::launch::async, [&] {
-  if (retirement == Retire::Image) pipeline.retire_image(images, 1);
-  else if (retirement == Retire::Source) pipeline.retire_source(images);
+  if (retirement == Retire::Image)
+   pipeline.retire_image(images, 1);
+  else if (retirement == Retire::Source)
+   pipeline.retire_source(images);
   else {
    pipeline.execution().cancel();
    pipeline.drain();
@@ -12540,9 +12545,8 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
   }
   if (event == "compile.execution") {
    const auto exceptional = fields.at("exceptional_reserved").get<std::uint64_t>();
-   if (fields.at("records").get<std::size_t>() > workers || fields.at("active").get<std::size_t>() + fields.at("external").get<std::size_t>() > workers ||
-       fields.at("normal_locked") != budget || fields.at("leased").get<std::uint64_t>() > budget + exceptional ||
-       fields.at("bytes").get<std::uint64_t>() > budget + exceptional + CompileResources::handles(16).bytes ||
+   if (fields.at("records").get<std::size_t>() > workers || fields.at("active").get<std::size_t>() + fields.at("external").get<std::size_t>() > workers || fields.at("normal_locked") != budget ||
+       fields.at("leased").get<std::uint64_t>() > budget + exceptional || fields.at("bytes").get<std::uint64_t>() > budget + exceptional + CompileResources::handles(16).bytes ||
        fields.at("descriptors").get<std::size_t>() + fields.at("descriptor_promises").get<std::size_t>() > 16)
     bounded = false;
    if (workers == 2 && fields.at("parked")[static_cast<std::size_t>(CompileParkReason::Bytes)].get<std::size_t>()) mmltk::testsupport::release_test_promise(waiting);
@@ -12571,8 +12575,10 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
  publication({1, {}, true, std::move(payload)});
  receipts.subscribe(pipeline.image_completion(images, 1), 0);
  pipeline.image_completion(images, 1).subscribe([&](std::exception_ptr error) {
-  if (error) first_completed.set_exception(error);
-  else first_completed.set_value();
+  if (error)
+   first_completed.set_exception(error);
+  else
+   first_completed.set_value();
  });
  REQUIRE(physical.WaitEntered(5s));
  CHECK(pipeline.execution().snapshot().active == 0);
@@ -12682,8 +12688,7 @@ TEST_CASE("pending image stage probes and source withdrawal stay bounded behind 
  const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
   if (event == "benchmark.pipeline.ready") {
    evidence.observe(fields);
-   if (fields.at("header") == count && fields.at("image_admitted") == 0 && fields.at("image_head_probes") == 1)
-    mmltk::testsupport::release_test_promise(pending);
+   if (fields.at("header") == count && fields.at("image_admitted") == 0 && fields.at("image_head_probes") == 1) mmltk::testsupport::release_test_promise(pending);
   }
   if (event == "benchmark.image.stage_started") {
    if (fields.at("stage") == "header") ++headers;
@@ -12720,8 +12725,7 @@ TEST_CASE("pending image stage probes and source withdrawal stay bounded behind 
  // the read returns. Fill only the remaining record with unrelated work.
  std::array<CompileExecution::Completion, 1> occupied;
  for (auto& completion : occupied) {
-  auto record = pipeline.execution().try_subscribe(dependency, dependency.generation(),
-   {.kind = CompileTaskKind::Normalize, .work = [&](std::size_t, const CompileAllowance&) { ++resumed; }});
+  auto record = pipeline.execution().try_subscribe(dependency, dependency.generation(), {.kind = CompileTaskKind::Normalize, .work = [&](std::size_t, const CompileAllowance&) { ++resumed; }});
   REQUIRE(record);
   completion = std::move(*record);
  }
@@ -12790,16 +12794,14 @@ TEST_CASE("large pending image sets retire behind full physical records and leav
  std::array<std::atomic<bool>, admitted> physically_started{};
  std::promise<void> full, pending;
  const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
-  if (event == "file.admitted" && fields.at("service") == "image" && fields.at("records") == admitted)
-   mmltk::testsupport::release_test_promise(full);
+  if (event == "file.admitted" && fields.at("service") == "image" && fields.at("records") == admitted) mmltk::testsupport::release_test_promise(full);
   if (event == "benchmark.image.stage_started" && fields.at("stage") == "input") {
    physically_started.at(fields.at("image_id").get<std::size_t>() - 1) = true;
    physical.receipt().ArriveAndWait();
   }
   if (event == "benchmark.pipeline.ready") {
    evidence.observe(fields);
-   if (fields.at("header") == count && fields.at("image_admitted") == 0 && fields.at("image_head_probes") == 1)
-    mmltk::testsupport::release_test_promise(pending);
+   if (fields.at("header") == count && fields.at("image_admitted") == 0 && fields.at("image_head_probes") == 1) mmltk::testsupport::release_test_promise(pending);
   }
  };
  BenchmarkCompilePipeline pipeline(4, {}, {.transient_bytes = 4U << 20, .task_records = admitted}, {}, trace);
@@ -12882,7 +12884,6 @@ TEST_CASE("large pending image sets retire behind full physical records and leav
  CHECK(evidence.observations > 0);
  CHECK(mmltk::common::io::sha256_file(request.output_path) == previous);
 }
-
 TEST_CASE("mixed annotation extents retain every row and independent pixels through settlement", "[benchmark][progress]") {
  std::vector<BenchmarkCompileProgress> snapshots;
  ProgressReporter reporter([&](const auto& snapshot) { snapshots.push_back(snapshot); }, {});

@@ -393,9 +393,11 @@ CoconutComponent CoconutComponent::select_images(std::vector<std::size_t> positi
  return result;
 }
 CoconutComponent CoconutComponentBacking::finish(std::shared_ptr<CoconutComponentBacking> backing, NormalizedAnnotationIndex normalized, bool metadata_only, Cancellation cancellation,
- const std::filesystem::path& directory, detail::StorageReservationPool* storage, const CoconutComponent* reuse, detail::FileWorkQueue* files, const CompileAllowance& allowance, const BenchmarkTraceSink& trace) {
+ const std::filesystem::path& directory, detail::StorageReservationPool* storage, const CoconutComponent* reuse, detail::FileWorkQueue* files, const CompileAllowance& allowance,
+ const BenchmarkTraceSink& trace) {
  admit_component_metadata(*backing, normalized, normalized.images.size(), backing->inventory->size(), backing->recovery.size());
- trace_benchmark_event(trace, "benchmark.annotations.inventory_started", [&] { return nlohmann::json{{"source", backing->source}, {"images", normalized.images.size()}, {"reused", reuse != nullptr}}; });
+ trace_benchmark_event(
+  trace, "benchmark.annotations.inventory_started", [&] { return nlohmann::json{{"source", backing->source}, {"images", normalized.images.size()}, {"reused", reuse != nullptr}}; });
  const auto expected_identity = std::exchange(normalized.annotation_sha256, {});
  normalized.completion.reset();
  backing->index = NormalizedAnnotationReadView(normalized);
@@ -411,7 +413,8 @@ CoconutComponent CoconutComponentBacking::finish(std::shared_ptr<CoconutComponen
    seal();
  }
  if (!expected_identity.empty() && expected_identity != backing->seal->identity) invalid("component inventory/index identity mismatch");
- trace_benchmark_event(trace, "benchmark.annotations.inventory_sealed", [&] { return nlohmann::json{{"source", backing->source}, {"images", normalized.images.size()}, {"identity", backing->seal->identity}}; });
+ trace_benchmark_event(
+  trace, "benchmark.annotations.inventory_sealed", [&] { return nlohmann::json{{"source", backing->source}, {"images", normalized.images.size()}, {"identity", backing->seal->identity}}; });
  normalized.annotation_sha256 = backing->seal->identity;
  backing->index = NormalizedAnnotationReadView(std::move(normalized));
  if (!metadata_only) std::call_once(backing->full_admission, [] {});
@@ -457,7 +460,8 @@ std::string coconut_component_input_identity(std::string_view base, CoconutImage
   base, source, physical ? physical->dependency_identity(edition, source, dependencies, current) : std::string{}, original.empty() ? 0 : kCoconutRecoveryPolicy, original);
 }
 std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutComponentPart> parts, std::string_view identity, const CoconutPhysicalMembership& physical,
- const std::filesystem::path& directory, Cancellation cancellation, detail::StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const CoconutImageRejection& rejected, const BenchmarkTraceSink& trace) {
+ const std::filesystem::path& directory, Cancellation cancellation, detail::StorageReservationPool* storage, BenchmarkCompilePipeline* execution, const CoconutImageRejection& rejected,
+ const BenchmarkTraceSink& trace) {
  struct Row {
   const CoconutComponent* component;
   std::size_t position;
@@ -604,7 +608,8 @@ std::uint64_t reconcile_coconut_extensions(std::vector<CoconutComponent>& compon
  components = std::move(replacement);
  return removed;
 }
-void store_coconut_component(const std::filesystem::path& index_path, const CoconutComponent& component, Cancellation cancellation, detail::StorageReservationPool* storage, const BenchmarkTraceSink& trace) {
+void store_coconut_component(
+ const std::filesystem::path& index_path, const CoconutComponent& component, Cancellation cancellation, detail::StorageReservationPool* storage, const BenchmarkTraceSink& trace) {
  if (component.membership_ || component.backing_->metadata_only) invalid("membership cannot publish a full component");
  admit_coconut_component(component, cancellation);
  // Reassembled compact provenance can describe an already published immutable
@@ -651,12 +656,12 @@ void store_coconut_component(const std::filesystem::path& index_path, const Coco
  // backing keep their cache identity; the newly written product gets its own.
  NormalizedAnnotationIndex persisted;
  if (component.index().selected()) {
-  NormalizedAnnotationAssembler assembly(component.index(), component.index().image_count(), component.index().box_count(), component.index().run_count(), cancellation, index_path.parent_path(), storage);
+  NormalizedAnnotationAssembler assembly(
+   component.index(), component.index().image_count(), component.index().box_count(), component.index().run_count(), cancellation, index_path.parent_path(), storage);
   const auto& source = component.index().storage();
   std::vector<NormalizedAnnotationAssembler::Slice> slices;
   slices.reserve(component.index().image_count());
-  for (std::size_t i = 0; i < component.index().image_count(); ++i)
-   slices.push_back(NormalizedAnnotationAssembler::Slice::admitted(source, component.index().source_position(i)));
+  for (std::size_t i = 0; i < component.index().image_count(); ++i) slices.push_back(NormalizedAnnotationAssembler::Slice::admitted(source, component.index().source_position(i)));
   assembly.gather(slices, nullptr, nullptr, {}, trace);
   persisted = assembly.finish(trace);
  } else {

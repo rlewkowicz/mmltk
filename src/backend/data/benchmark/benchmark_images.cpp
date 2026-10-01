@@ -225,9 +225,8 @@ public:
    input.reset();
    if (ready_) ready_({id, std::pair{header.width, header.height}, execution_ != nullptr, std::move(payload)});
   };
-  const auto settled = [this, id, header, publication, generation](std::exception_ptr failure) {
-   settled_({id, std::pair{header.width, header.height}, true, publication->fact}, failure, generation);
-  };
+  const auto settled = [this, id, header, publication, generation](
+                        std::exception_ptr failure) { settled_({id, std::pair{header.width, header.height}, true, publication->fact}, failure, generation); };
   if (execution_) {
    // Prepare the fallible callback allocation before physical acceptance.
    std::function<void(std::exception_ptr)> settlement = settled;

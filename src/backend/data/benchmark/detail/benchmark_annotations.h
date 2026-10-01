@@ -202,8 +202,8 @@ private:
 };
 // One immutable row admits its payload before publication. The backing owns a
 // copied image header and retains the actual range custody through every view.
-[[nodiscard]] NormalizedAnnotationIndex seal_normalized_annotation_image(BenchmarkDatasetSource, NormalizedImage, std::span<const NormalizedBox>, std::span<const RLEPair>,
- std::shared_ptr<const void>, mmltk::common::concurrency::CancellationObservation = {});
+[[nodiscard]] NormalizedAnnotationIndex seal_normalized_annotation_image(
+ BenchmarkDatasetSource, NormalizedImage, std::span<const NormalizedBox>, std::span<const RLEPair>, std::shared_ptr<const void>, mmltk::common::concurrency::CancellationObservation = {});
 // Rebind identity/shard metadata while preserving exactly the admitted geometry
 // and payload. Changed dimensions or extents require fresh real admission.
 [[nodiscard]] NormalizedAnnotationIndex rebind_normalized_annotation_image(const NormalizedAnnotationIndex&, BenchmarkDatasetSource, NormalizedImage);

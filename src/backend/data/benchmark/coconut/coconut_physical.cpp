@@ -64,8 +64,7 @@ struct CoconutPhysicalMembership::Registration::State {
  std::pair<CoconutEdition, std::uint64_t> key;
  detail::CompileExecution::CompletionSource completion;
  bool registered = false;
- State(const std::shared_ptr<Impl>& membership, std::pair<CoconutEdition, std::uint64_t> identity, detail::CompileExecution* execution)
-     : owner(membership), key(identity), completion(execution) {}
+ State(const std::shared_ptr<Impl>& membership, std::pair<CoconutEdition, std::uint64_t> identity, detail::CompileExecution* execution) : owner(membership), key(identity), completion(execution) {}
  ~State();
 };
 struct CoconutPhysicalMembership::Impl {
