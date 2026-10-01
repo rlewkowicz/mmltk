@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <optional>
 #include <memory>
+#include <memory_resource>
 #include <span>
 #include <string_view>
 #include <tuple>
@@ -31,7 +32,7 @@ class CoconutSupportRuns final {
  };
 
 public:
- CoconutSupportRuns() = default;
+ CoconutSupportRuns(std::pmr::memory_resource* resource=std::pmr::get_default_resource()) : owned_(resource) {}
  CoconutSupportRuns(const CoconutSupportRuns& other) : owned_(other.owned_), borrowed_(other.borrowed_), owner_(other.owner_) {}
  CoconutSupportRuns& operator=(const CoconutSupportRuns& other) {
   if (this == &other) return *this;
@@ -43,13 +44,21 @@ public:
  }
  CoconutSupportRuns(CoconutSupportRuns&& other) noexcept
      : owned_(std::move(other.owned_)), borrowed_(std::exchange(other.borrowed_, {})), owner_(std::move(other.owner_)), total_(std::exchange(other.total_, nullptr)) {}
- CoconutSupportRuns& operator=(CoconutSupportRuns&& other) noexcept {
+ CoconutSupportRuns& operator=(CoconutSupportRuns&& other) {
   if (this == &other) return *this;
-  account(nullptr);
-  owned_ = std::move(other.owned_);
-  borrowed_ = std::exchange(other.borrowed_, {});
-  owner_ = std::move(other.owner_);
-  total_ = std::exchange(other.total_, nullptr);
+  auto* transferred = other.total_;
+  {
+   Accounting destination(*this), source(other);
+   owned_ = std::move(other.owned_);
+   // Unequal PMR allocators move elements and leave source capacity behind.
+   // Retire that allocation before transferring its accounting association.
+   std::pmr::vector<RLEPair> retired(other.owned_.get_allocator().resource());
+   retired.swap(other.owned_);
+   borrowed_ = std::exchange(other.borrowed_, {});
+   owner_ = std::move(other.owner_);
+  }
+  other.account(nullptr);
+  account(transferred);
   return *this;
  }
  ~CoconutSupportRuns() { account(nullptr); }
@@ -92,7 +101,7 @@ public:
   borrowed_ = runs;
   owner_ = std::move(owner);
  }
- void replace(std::vector<RLEPair>& runs) noexcept {
+ void replace(std::pmr::vector<RLEPair>& runs) noexcept {
   Accounting accounting(*this);
   owner_.reset();
   borrowed_ = {};
@@ -100,12 +109,13 @@ public:
  }
 
 private:
- std::vector<RLEPair> owned_;
+ std::pmr::vector<RLEPair> owned_;
  std::span<const RLEPair> borrowed_;
  std::shared_ptr<const void> owner_;
  std::uint64_t* total_ = nullptr;
 };
 struct CoconutSegmentSupport {
+ CoconutSegmentSupport(std::pmr::memory_resource* resource=std::pmr::get_default_resource()) : runs(resource) {}
  std::uint64_t area = 0;
  dataset::RowMajorMaskBounds bounds;
  CoconutSupportRuns runs;
@@ -148,6 +158,7 @@ public:
  [[nodiscard]] std::uint64_t retained_bytes() const noexcept;
  // The input owner's allowance covers this reusable workspace until retirement.
  void retire_scratch() noexcept;
+ void prepare(std::pmr::memory_resource*);
  // Support belongs to this decoded image. Facts are appended for successful
  // assignments; rejection counts are settled by the importer after carving.
  void apply(CoconutImageNamespace source, const CoconutRecord& record, std::uint32_t width, std::uint32_t height, std::span<CoconutSegmentSupport> support, CoconutRecoveryImage& facts,
@@ -172,18 +183,21 @@ private:
  const CoconutRecoveryOriginals originals_;
  // Flat image/group workspaces retain only high-water capacity, never historical keys.
  struct Workspace {
-  std::vector<Group> groups;
-  std::vector<std::size_t> ordinals;
-  std::vector<Candidate> candidates;
-  std::vector<std::uint8_t> represented;
-  std::vector<const Candidate*> remaining;
-  std::vector<std::uint64_t> identities;
+  std::pmr::vector<Group> groups;
+  std::pmr::vector<std::size_t> ordinals;
+  std::pmr::vector<Candidate> candidates;
+  std::pmr::vector<std::uint8_t> represented;
+  std::pmr::vector<const Candidate*> remaining;
+  std::pmr::vector<std::uint64_t> identities;
   struct Cursor {
    std::span<const RLEPair> runs;
    std::size_t next = 0;
   };
-  std::vector<Cursor> merge;
-  std::vector<RLEPair> combined, scratch;
- } workspace_;
+  std::pmr::vector<Cursor> merge;
+  std::pmr::vector<RLEPair> combined, scratch;
+  explicit Workspace(std::pmr::memory_resource* resource) : groups(resource),ordinals(resource),candidates(resource),represented(resource),remaining(resource),identities(resource),merge(resource),combined(resource),scratch(resource) {}
+ };
+ std::optional<Workspace> workspace_;
+
 };
 }  // namespace mmltk::backend::data::benchmark_internal

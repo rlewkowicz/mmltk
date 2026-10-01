@@ -25,10 +25,10 @@ CompileWorkspacePlan compile_workspace_plan(std::size_t workers,std::uint32_t re
  if (explicit_budget) return CompileWorkspacePlan::prepare(workers,{},0,0,explicit_budget);
  constexpr std::array enabled{CompileWorkClass::Acquisition,CompileWorkClass::Extraction,CompileWorkClass::Annotations,
   CompileWorkClass::Pixels,CompileWorkClass::Gather,CompileWorkClass::Output};
- return compile_workspace_plan(workers,{std::max(1U,resolution),std::max(1U,resolution),imaging::resample::ImageResizeMode::Stretch,perceptual},enabled,{reader_window,0},encoded_window);
+ return compile_workspace_plan(workers,{std::max(1U,resolution),std::max(1U,resolution),imaging::resample::ImageResizeMode::Stretch,perceptual},enabled,{reader_window,0},encoded_window,0,reader_window);
 }
 CompileWorkspacePlan compile_workspace_plan(std::size_t workers, CompilePixelPolicy policy, std::span<const CompileWorkClass> enabled,
- CompileWorkspaceProfile annotations, std::size_t encoded_window, std::size_t pixel_input_bytes) {
+ CompileWorkspaceProfile annotations, std::size_t encoded_window, std::size_t pixel_input_bytes, std::size_t source_window) {
  // These normal shapes choose reusable capacity, never legal-input admission.
  constexpr std::uint32_t normal_extent=2048;
  const CompileImageHeader normal{normal_extent,normal_extent,0,false,CompileImageEncoding::Png,stbi_workspace_png_profile(normal_extent,normal_extent,std::max(encoded_window,pixel_input_bytes))};
@@ -42,7 +42,7 @@ CompileWorkspacePlan compile_workspace_plan(std::size_t workers, CompilePixelPol
   if (index>=profiles.size()) throw std::invalid_argument("invalid enabled compile workspace class");
   profiles[index]=available[index];
  }
- return CompileWorkspacePlan::prepare(workers,profiles,encoded_window,COMPILED_COMPACTION_SCRATCH_BYTES);
+ return CompileWorkspacePlan::prepare(workers,profiles,std::max(encoded_window,source_window),COMPILED_COMPACTION_SCRATCH_BYTES);
 }
 
 CompileWorkspacePlan CompileWorkspacePlan::prepare(std::size_t workers, std::span<const CompileWorkspaceProfile> profiles,

@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
-class BenchmarkMappedArtifact;
+class CoconutStaging;
 
 class CoconutInputError final : public std::runtime_error {
 public:
@@ -59,11 +59,11 @@ public:
   writable();
   values_.push_back(std::move(value));
  }
- void stage(const std::filesystem::path&, detail::StorageReservationPool*);
+ void stage(CoconutStaging&);
 
 private:
  void writable();
- std::shared_ptr<const BenchmarkMappedArtifact> backing_;
+ std::shared_ptr<const void> backing_;
  std::span<const CoconutSegment> mapped_;
  std::vector<CoconutSegment> values_;
 };

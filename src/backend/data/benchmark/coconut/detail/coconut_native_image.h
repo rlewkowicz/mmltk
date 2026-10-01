@@ -17,13 +17,15 @@
 #include <functional>
 #include <filesystem>
 #include <memory>
+#include <memory_resource>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <utility>
 namespace mmltk::backend::data::benchmark_internal {
-class BenchmarkMappedArtifact;
+class CoconutStaging;
 [[nodiscard]] const CategoryLookup& coconut_categories();
 [[nodiscard]] std::string coconut_image_input_identity(std::string_view annotations, const CoconutPhysicalImage&, std::string_view originals);
 struct CoconutComponentMetadata {
@@ -55,7 +57,7 @@ public:
  [[nodiscard]] const NormalizedImage& image() const noexcept { return image_; }
  [[nodiscard]] std::span<const NormalizedBox> boxes() const noexcept { return mapped_boxes_.empty() ? std::span<const NormalizedBox>(boxes_) : mapped_boxes_; }
  [[nodiscard]] std::span<const RLEPair> runs() const noexcept { return mapped_runs_.empty() ? std::span<const RLEPair>(runs_) : mapped_runs_; }
- [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> stage(std::shared_ptr<const CoconutNativeImage>, const std::filesystem::path&, detail::StorageReservationPool* = nullptr);
+ [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> stage(std::shared_ptr<const CoconutNativeImage>, CoconutStaging&);
  [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> bind(std::shared_ptr<const CoconutNativeImage>, const CoconutPhysicalImage&);
  [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> rejected(const CoconutRecord&, const CoconutPhysicalImage&, std::shared_ptr<const CoconutNativeLineage>);
  [[nodiscard]] bool required_labels_valid() const noexcept { return required_labels_valid_; }
@@ -66,15 +68,17 @@ public:
 
 private:
  friend class CoconutNativeWorkspace;
+ void stage(CoconutStaging&,std::span<const NormalizedBox>,std::span<const RLEPair>);
  explicit CoconutNativeImage(std::shared_ptr<const CoconutNativeLineage> lineage) : lineage_(std::move(lineage)) {}
  std::shared_ptr<const CoconutNativeLineage> lineage_;
  std::string input_identity_;
  NormalizedImage image_;
  std::vector<NormalizedBox> boxes_;
  std::vector<RLEPair> runs_;
- std::shared_ptr<const BenchmarkMappedArtifact> backing_;
+ std::shared_ptr<const void> backing_;
  std::span<const NormalizedBox> mapped_boxes_;
  std::span<const RLEPair> mapped_runs_;
+ bool staged_ = false;
  bool required_labels_valid_ = true;
  AnnotationRejectCounts rejected_;
  CoconutInventoryImage inventory_;
@@ -86,6 +90,7 @@ using CoconutRejectedObject = std::function<void(const CoconutPhysicalImage&, co
 class CoconutNativeWorkspace final {
 public:
  explicit CoconutNativeWorkspace(const CoconutImportLimits&, mmltk::common::concurrency::CancellationObservation = {});
+ ~CoconutNativeWorkspace();
  CoconutNativeWorkspace(const CoconutNativeWorkspace&) = delete;
  CoconutNativeWorkspace& operator=(const CoconutNativeWorkspace&) = delete;
  CoconutNativeWorkspace(CoconutNativeWorkspace&&) = delete;
@@ -95,16 +100,19 @@ public:
  [[nodiscard]] CoconutMaskRecovery* recovery() const noexcept { return recovery_.get(); }
  [[nodiscard]] std::uint64_t retained_bytes() const noexcept;
  [[nodiscard]] std::uint64_t support_workspace_bytes(const CoconutRecord&, std::uint64_t pixels, std::uint64_t segments, bool recover = true) const;
+ [[nodiscard]] std::uint64_t reuse_workspace_bytes(const CoconutRecord&,const NormalizedAnnotationReadView&,std::size_t) const;
  [[nodiscard]] dataset::MaskDimensions admit_png(const CoconutRecord&, std::span<const std::uint8_t>) const;
  [[nodiscard]] std::size_t decoder_workspace_bytes(std::span<const std::uint8_t>) const;
  void decode(const CoconutRecord&, std::span<const std::uint8_t>, dataset::MaskDimensions, std::span<std::byte> supplied = {});
- [[nodiscard]] std::vector<CoconutSegmentSupport> take_support(std::size_t);
+ [[nodiscard]] std::span<const CoconutSegmentSupport> support(std::size_t) const;
  [[nodiscard]] std::uint32_t unlisted_segment() const noexcept { return unlisted_segment_; }
  void borrow_support(const CoconutRecord&, std::span<const CoconutSegmentSupport>, dataset::MaskDimensions, std::shared_ptr<const void>, std::uint32_t unlisted_segment = 0);
  [[nodiscard]] std::shared_ptr<const CoconutNativeImage> finish(
-  const CoconutRecord&, const CoconutPhysicalImage&, dataset::MaskDimensions, std::shared_ptr<const CoconutNativeLineage>, const CoconutRejectedObject&);
+  const CoconutRecord&, const CoconutPhysicalImage&, dataset::MaskDimensions, std::shared_ptr<const CoconutNativeLineage>, const CoconutRejectedObject&, CoconutStaging* = nullptr);
  [[nodiscard]] std::shared_ptr<const CoconutNativeImage> reuse(const CoconutRecord&, const CoconutPhysicalImage&, const NormalizedAnnotationReadView&, std::size_t, const CoconutInventoryImage&,
-  const CoconutRecoveryImage*, std::shared_ptr<const CoconutNativeLineage>, std::string_view dependency, bool required_labels_valid);
+  const CoconutRecoveryImage*, std::shared_ptr<const CoconutNativeLineage>, std::string_view dependency, bool required_labels_valid, CoconutStaging* = nullptr);
+ void prepare_support(std::span<std::byte>);
+ void release_supplied() noexcept;
  void retire() noexcept;
 
 private:
@@ -112,6 +120,7 @@ private:
   std::uint32_t id = 0;
   std::size_t index = 0;
  };
+ void materialize(CoconutNativeImage&, CoconutStaging*);
  SegmentEntry& segment_entry(std::uint32_t);
  mutable detail::CompileImageDecoder decoder_;
  std::unique_ptr<common::system::NumaMemory> decode_memory_;
@@ -123,7 +132,18 @@ private:
  dataset::MaskDimensions active_dimensions_{};
  std::uint64_t run_bytes_ = 0;
  std::uint32_t unlisted_segment_ = 0;
- std::vector<SegmentEntry> segment_by_id_;
- std::vector<CoconutSegmentSupport> support_;
+ struct Scratch {
+  std::pmr::vector<SegmentEntry> segments;
+  std::pmr::vector<CoconutSegmentSupport> support;
+  std::pmr::vector<NormalizedBox> boxes;
+  std::pmr::vector<RLEPair> runs;
+  explicit Scratch(std::pmr::memory_resource* resource) : segments(resource),support(resource),boxes(resource),runs(resource) {}
+ };
+ // Supplied production scratch never has an upstream allocation fallback.
+ std::unique_ptr<std::pmr::monotonic_buffer_resource> supplied_;
+ std::optional<Scratch> scratch_;
+ Scratch& scratch();
+ void supports(std::size_t);
+
 };
 }  // namespace mmltk::backend::data::benchmark_internal

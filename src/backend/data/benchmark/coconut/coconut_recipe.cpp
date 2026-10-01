@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_import.h"
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
@@ -58,6 +59,7 @@ struct CoconutRecipeInputs {
    const std::lock_guard lock(mutex);
    retiring = true;
    stopped.store(true, std::memory_order_relaxed);
+   train_originals.changed->settle(); validation_originals.changed->settle();
   }
   changed.notify_all();
   if (execution) execution->execution().notify_admission_change();
@@ -83,6 +85,7 @@ struct CoconutRecipeInputs {
    first = !error;
    if (first) error = value;
    stopped.store(true, std::memory_order_relaxed);
+   train_originals.changed->settle(); validation_originals.changed->settle();
   }
   changed.notify_all();
   if (execution) execution->execution().notify_admission_change();
@@ -110,6 +113,7 @@ struct CoconutRecipeInputs {
  struct OriginalSplit {
   CocoAnnotationSplit state;
   std::shared_ptr<const CoconutRecoveryOriginals> recovery;
+  std::shared_ptr<CompileExecution::CompletionSource> changed = std::make_shared<CompileExecution::CompletionSource>();
  };
  void original_split(CocoAnnotationSplit value, bool recover) {
   const bool withdrew = !value.index;
@@ -132,6 +136,8 @@ struct CoconutRecipeInputs {
    if (value.generation < split.state.generation) return;
    split.state = std::move(value);
    split.recovery = std::move(recovery);
+   auto settled=std::exchange(split.changed,std::make_shared<CompileExecution::CompletionSource>());
+   settled->settle();
   }
   if (execution) {
    execution->original_generation(physical->identity_root(training ? CoconutImageNamespace::CocoTrain : CoconutImageNamespace::CocoValidation), generation, withdrew);
@@ -151,6 +157,8 @@ struct CoconutRecipeInputs {
   const std::stop_callback wake(stop, [this] { changed.notify_all(); });
   std::unique_lock lock(mutex);
   auto& split = source == CoconutImageNamespace::CocoTrain ? train_originals : validation_originals;
+  if (error) std::rethrow_exception(error);
+  throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation::Borrow(*this));
   if (wait) {
    changed.wait(lock, [&] { return split.state.terminal || error || cancelled() || stop.stop_requested(); });
    if (error) std::rethrow_exception(error);
@@ -570,7 +578,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
  std::shared_ptr<const CoconutRecoveryOriginals> originals;
  const auto recovery_source = release.edition == CoconutEdition::Base ? CoconutImageNamespace::CocoTrain : CoconutImageNamespace::CocoValidation;
  const auto refresh_original = [&](bool wait) {
-  if (!original_provider) return CoconutOriginalInput{};
+  if (!original_provider) return CoconutOriginalReadiness{};
   auto input = original_provider(recovery_source, wait, {});
   originals = input.originals;
   recovery.reset();
@@ -741,6 +749,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    return input;
   }};
   request.physical_membership = &physical;
+  request.trace=trace;
   request.expected_rows = release.expected_rows;
   request.cancellation = cancellation;
   if (membership_ready)
@@ -1102,7 +1111,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   const bool recovery_selected = recover && (release.edition == CoconutEdition::Base || release.edition == CoconutEdition::RelabeledValidation);
   const CoconutOriginalProvider original_provider = recovery_selected ? CoconutOriginalProvider{[&retained](CoconutImageNamespace source, bool wait, std::stop_token stop) {
    auto value = retained.original(source, wait, stop);
-   return CoconutOriginalInput{value.recovery, value.state.terminal, value.state.generation};
+   return CoconutOriginalReadiness{value.recovery, value.state.terminal, value.state.generation, value.changed->completion()};
   }}
                                                                       : CoconutOriginalProvider{};
   auto& part = *retained.releases[index].parts[shard];
@@ -1145,7 +1154,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   const bool selected = recover && (release.edition == CoconutEdition::Base || release.edition == CoconutEdition::RelabeledValidation);
   const CoconutOriginalProvider original_provider = selected ? CoconutOriginalProvider{[&retained](CoconutImageNamespace source, bool wait, std::stop_token stop) {
    auto value = retained.original(source, wait, stop);
-   return CoconutOriginalInput{value.recovery, value.state.terminal, value.state.generation};
+   return CoconutOriginalReadiness{value.recovery, value.state.terminal, value.state.generation, value.changed->completion()};
   }}
                                                              : CoconutOriginalProvider{};
   progress.label_plan_started(index);
@@ -1176,7 +1185,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   const bool eligible_recovery = recover && (release.edition == CoconutEdition::Base || release.edition == CoconutEdition::RelabeledValidation);
   const CoconutOriginalProvider recovery = eligible_recovery ? CoconutOriginalProvider{[&retained](CoconutImageNamespace source, bool wait, std::stop_token stop) {
    auto split = retained.original(source, wait, stop);
-   return CoconutOriginalInput{split.recovery, split.state.terminal, split.state.generation};
+   return CoconutOriginalReadiness{split.recovery, split.state.terminal, split.state.generation,split.changed->completion()};
   }}
                                                              : CoconutOriginalProvider{};
   const auto membership = [&](CoconutRecipePreparation metadata) {
@@ -1275,7 +1284,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
    auto publication = ArtifactLease::acquire_charged(cache.locks / (std::string(release.name) + ".annotations.lifecycle.lock"), release_cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources());
    release_inputs.components.clear();
    for (auto& component : merged) {
-    const auto source_original = recovery ? recovery(component.source(), true, {}) : CoconutOriginalInput{};
+    const auto source_original = recovery ? recovery(component.source(), true, {}) : CoconutOriginalReadiness{};
     std::optional<CoconutMaskRecovery> source_recovery;
     if (source_original.originals) source_recovery.emplace(*source_original.originals);
     const auto suffix =

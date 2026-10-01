@@ -1,11 +1,17 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_import.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
-#include "src/backend/data/benchmark/coconut/detail/coconut_parquet.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_parquet_pool.h"
 #include "src/common/types/utf8.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <arrow/api.h>
-#include "src/common/concurrency/parallel_range.h"
+#include "src/common/io/file_memory.h"
+#include "src/common/system/numa_topology.h"
+#include "src/common/system/numa_memory.h"
+#include <bit>
+#include "src/backend/data/benchmark/coconut/detail/coconut_staging.h"
+#include <map>
 #include <arrow/memory_pool.h>
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/schema.h>
@@ -334,54 +340,158 @@ void read_batch(const arrow::RecordBatch& batch, const CoconutImportLimits& limi
   ++row_ordinal;
  }
 }
-// Fixed for the entire call, including cold discovery and every later group.
-// Physical controls are acquired by their owner from this continuation; their
-// retained-handle role never becomes the role of decoder or Arrow backing.
-class ParquetCallEnvelope final {
- enum class Mode { ColdMetadata, Full, WarmMetadata };
- const Mode mode_;
- const bool metadata_ready_;
-
-public:
- ParquetCallEnvelope(bool metadata_only, bool metadata_ready) : mode_(metadata_only ? (metadata_ready ? Mode::WarmMetadata : Mode::ColdMetadata) : Mode::Full), metadata_ready_(metadata_ready) {}
- [[nodiscard]] bool full() const noexcept { return mode_ == Mode::Full; }
- [[nodiscard]] bool needs_metadata() const noexcept { return !metadata_ready_; }
- [[nodiscard]] bool reads_projection() const noexcept { return mode_ != Mode::WarmMetadata; }
- [[nodiscard]] CompileResources discovery_demand() const { return {kParquetPoolBytes, 1}; }
- [[nodiscard]] CompileResources demand(std::uint64_t workspace, bool projection) const {
-  using mmltk::common::math::checked_add;
-  return {checked_add(projection ? kParquetPoolBytes : 0, workspace, "COCONut Parquet allowance overflow"), projection ? 2U : 0U};
+} // namespace
+struct CoconutParquetPool::Window {
+  CompileAllowance backing;
+  std::unique_ptr<common::system::NumaMemory> standalone;
+  std::span<std::byte> memory;
+  std::map<std::size_t,std::size_t> free;
+  std::size_t high_water=0,allocations=0;
+ };
+CoconutParquetPool::CoconutParquetPool(CompileAllowance value,std::size_t standalone_bytes) { resume(std::move(value),standalone_bytes); }
+void CoconutParquetPool::resume(CompileAllowance value,std::size_t standalone_bytes) {
+  const std::lock_guard lock(mutex_);
+  if (active_) return;
+  auto window=std::make_shared<Window>(); window->backing=std::move(value);
+  if (window->backing) window->memory=window->backing.workspace();
+  else {
+   window->standalone=std::make_unique<common::system::NumaMemory>(common::system::NumaTopology::Capture().permitted_nodes.front(),common::system::NumaMemory::Lock::Pages);
+   window->standalone->ensure_bytes(standalone_bytes);
+   window->memory={static_cast<std::byte*>(window->standalone->data()),standalone_bytes};
+  }
+  if (window->memory.size()<kParquetPoolBytes) throw std::logic_error("COCONut Parquet allocation requires its complete source window");
+  window->free.emplace(0,window->memory.size()); windows_.push_back(window); active_=std::move(window);
  }
+void CoconutParquetPool::quiesce() {
+  const std::lock_guard lock(mutex_);
+  if (!active_) return;
+  auto window=std::exchange(active_,{});
+  if (window->backing) {
+   // The used prefix describes immutable bytes. The parent suffix and this
+   // prefix share one fixed physical bank lease until the last allocation;
+   // quiescence never advertises that suffix as separately lendable capacity.
+   auto backing=window->allocations ? window->backing.split_storage(window->high_water) : CompileAllowance{};
+   window->backing.retire_workspace(); window->backing=std::move(backing);
+  }
+  if (!window->allocations) std::erase(windows_,window);
+ }
+arrow::Status CoconutParquetPool::allocate(std::int64_t size,std::int64_t alignment,std::uint8_t** out,std::int64_t replaced) {
+  if (!active_) return arrow::Status::Invalid("quiesced COCONut Parquet source");
+  if (size<0 || alignment<=0 || !std::has_single_bit(static_cast<std::uint64_t>(alignment))) return arrow::Status::Invalid("invalid Parquet allocation");
+  if (size>static_cast<std::int64_t>(kParquetPoolBytes)-(live_-replaced)) return arrow::Status::OutOfMemory("COCONut Parquet payload exceeds 256 MiB");
+  auto& window=*active_;
+  for (auto i=window.free.begin();i!=window.free.end();++i) {
+   const auto start=i->first,extent=i->second;
+   const auto address=reinterpret_cast<std::uintptr_t>(window.memory.data()+start);
+   const auto padding=(static_cast<std::uintptr_t>(alignment)-(address%alignment))%alignment;
+   const auto count=std::max<std::size_t>(1,static_cast<std::size_t>(size));
+   if (padding>extent || count>extent-padding) continue;
+   const auto offset=start+padding;
+   window.free.erase(i);
+   if (padding) window.free.emplace(start,padding);
+   if (extent-padding>count) window.free.emplace(offset+count,extent-padding-count);
+   *out=reinterpret_cast<std::uint8_t*>(window.memory.data()+offset);
+   ++window.allocations; window.high_water=std::max(window.high_water,offset+count);
+   live_+=size; total_+=size; ++allocations_; peak_=std::max(peak_,live_-replaced);
+   return arrow::Status::OK();
+  }
+  // Logical headroom is available, but live addresses cannot move. Record an
+  // envelope that can hold this failed physical request after the current
+  // window. The reader alone decides when every borrower has retired and the
+  // allocation sequence can be replayed in an exclusive larger arena.
+  const auto request=common::math::checked_add(std::max<std::size_t>(1,static_cast<std::size_t>(size)),static_cast<std::size_t>(alignment)-1,"Parquet allocation envelope overflow");
+  fragmented_extent_=common::math::checked_add(window.memory.size(),request,"Parquet allocation envelope overflow");
+  return arrow::Status::CapacityError("COCONut Parquet source window has no contiguous fit");
+ }
+void CoconutParquetPool::free(std::uint8_t* buffer,std::int64_t size) {
+  if (!buffer) return;
+  const auto address=reinterpret_cast<std::uintptr_t>(buffer);
+  const auto found=std::ranges::find_if(windows_,[&](const auto& window) {
+   const auto begin=reinterpret_cast<std::uintptr_t>(window->memory.data()); return address>=begin && address-begin<window->memory.size();
+  });
+  if (found==windows_.end()) std::terminate();
+  auto& window=**found;
+  auto offset=address-reinterpret_cast<std::uintptr_t>(window.memory.data());
+  auto count=std::max<std::size_t>(1,static_cast<std::size_t>(size));
+  auto next=window.free.lower_bound(offset);
+  if (next!=window.free.end() && offset+count==next->first) { count+=next->second; next=window.free.erase(next); }
+  if (next!=window.free.begin()) { auto previous=std::prev(next); if (previous->first+previous->second==offset) { offset=previous->first; count+=previous->second; window.free.erase(previous); } }
+  window.free.emplace(offset,count); live_-=size;
+  if (!--window.allocations && found->get()!=active_.get()) windows_.erase(found);
+ }
+arrow::Status CoconutParquetPool::Allocate(std::int64_t size,std::int64_t alignment,std::uint8_t** out) {
+  const std::lock_guard lock(mutex_);
+  fragmented_extent_=0;
+  return allocate(size,alignment,out);
+ }
+arrow::Status CoconutParquetPool::Reallocate(std::int64_t old_size,std::int64_t size,std::int64_t alignment,std::uint8_t** out) {
+  const std::lock_guard lock(mutex_);
+  fragmented_extent_=0;
+  if (old_size<0 || size<0 || alignment<=0 || !std::has_single_bit(static_cast<std::uint64_t>(alignment))) return arrow::Status::Invalid("invalid Parquet reallocation");
+  if (!active_) return arrow::Status::Invalid("quiesced COCONut Parquet source");
+  if (size>static_cast<std::int64_t>(kParquetPoolBytes)-(live_-old_size)) return arrow::Status::OutOfMemory("COCONut Parquet payload exceeds 256 MiB");
+  const auto address=reinterpret_cast<std::uintptr_t>(*out);
+  const auto begin=reinterpret_cast<std::uintptr_t>(active_->memory.data());
+  if (*out && address>=begin && address-begin<active_->memory.size() && address%alignment==0) {
+   auto& window=*active_;
+   const auto offset=address-begin;
+   const auto old_count=std::max<std::size_t>(1,static_cast<std::size_t>(old_size));
+   const auto count=std::max<std::size_t>(1,static_cast<std::size_t>(size));
+   auto next=window.free.lower_bound(offset+old_count);
+   const auto tail=next!=window.free.end() && next->first==offset+old_count ? next->second : 0;
+   if (count<=old_count+tail) {
+    if (tail) window.free.erase(next);
+    if (old_count+tail>count) window.free.emplace(offset+count,old_count+tail-count);
+    window.high_water=std::max(window.high_water,offset+count);
+    live_+=size-old_size; total_+=std::max<std::int64_t>(0,size-old_size); peak_=std::max(peak_,live_);
+    return arrow::Status::OK();
+   }
+  }
+  // Reallocation admits the final payload size, as Arrow's capped pool does.
+  // The old immutable window remains physically charged through this copy;
+  // future allocation still occurs only in the fully admitted active window.
+  std::uint8_t* next=nullptr;
+  auto status=allocate(size,alignment,&next,old_size);
+  if (!status.ok()) return status;
+  if (old_size && size) std::memcpy(next,*out,static_cast<std::size_t>(std::min(old_size,size)));
+  free(*out,old_size); *out=next;
+  return status;
+ }
+void CoconutParquetPool::Free(std::uint8_t* buffer,std::int64_t size,std::int64_t) {
+  const std::lock_guard lock(mutex_);
+  free(buffer,size);
+ }
+ std::uint64_t CoconutParquetPool::retained_capacity() const { const std::lock_guard lock(mutex_); std::uint64_t bytes=0; for (const auto& window : windows_) bytes=common::math::checked_add(bytes,std::uint64_t{window->memory.size()},"Parquet retained capacity overflow"); return bytes; }
+ std::int64_t CoconutParquetPool::bytes_allocated() const { const std::lock_guard lock(mutex_); return live_; }
+ std::int64_t CoconutParquetPool::max_memory() const { const std::lock_guard lock(mutex_); return peak_; }
+ std::int64_t CoconutParquetPool::total_bytes_allocated() const { const std::lock_guard lock(mutex_); return total_; }
+ std::int64_t CoconutParquetPool::num_allocations() const { const std::lock_guard lock(mutex_); return allocations_; }
+ std::string CoconutParquetPool::backend_name() const { return "mmltk-pinned-source"; }
+void CoconutParquetPool::begin_call() { const std::lock_guard lock(mutex_); fragmented_extent_=0; }
+std::size_t CoconutParquetPool::fragmented_extent() const { const std::lock_guard lock(mutex_); return fragmented_extent_; }
+namespace {
+struct ParquetContiguousFit final : std::exception {
+ std::size_t envelope;
+ explicit ParquetContiguousFit(std::size_t value) : envelope(value) {}
+ const char* what() const noexcept override { return "COCONut Parquet source window has no contiguous fit"; }
 };
-// Allocation and cross-thread batch destruction share this heap owner. The
-// underlying cap remains 256 MiB; serializing its check makes that cap exact.
-class ParquetPool final : public arrow::MemoryPool {
- mutable std::mutex mutex_;
- arrow::ProxyMemoryPool tracked_{arrow::system_memory_pool()};
- arrow::CappedMemoryPool capped_{&tracked_, kParquetPoolBytes};
-
-public:
- CompileAllowance allowance;
- explicit ParquetPool(CompileAllowance value) : allowance(std::move(value)) {}
- arrow::Status Allocate(std::int64_t size, std::int64_t alignment, std::uint8_t** out) override {
-  const std::lock_guard lock(mutex_);
-  return capped_.Allocate(size, alignment, out);
+std::size_t replay_envelope(std::size_t observed,CompileExecution* execution) {
+ if (execution) {
+  const auto snapshot=execution->snapshot();
+  const auto normal=std::max(snapshot.context_capacity,snapshot.shared_workspace);
+  observed=std::max(observed,common::math::checked_add(normal,std::size_t{1},"Parquet exceptional envelope overflow"));
  }
- arrow::Status Reallocate(std::int64_t old_size, std::int64_t size, std::int64_t alignment, std::uint8_t** out) override {
-  const std::lock_guard lock(mutex_);
-  return capped_.Reallocate(old_size, size, alignment, out);
- }
- void Free(std::uint8_t* buffer, std::int64_t size, std::int64_t alignment) override {
-  const std::lock_guard lock(mutex_);
-  capped_.Free(buffer, size, alignment);
- }
- std::int64_t bytes_allocated() const override { return tracked_.bytes_allocated(); }
- std::int64_t max_memory() const override { return tracked_.max_memory(); }
- std::int64_t total_bytes_allocated() const override { return tracked_.total_bytes_allocated(); }
- std::int64_t num_allocations() const override { return tracked_.num_allocations(); }
- std::string backend_name() const override { return tracked_.backend_name(); }
-};
-std::unique_ptr<parquet::arrow::FileReader> open_reader(const std::filesystem::path& path, ParquetPool& pool, std::shared_ptr<parquet::FileMetaData> metadata = {}) {
+ // Leave room for the bank's page rounding as well as Arrow's signed sizes.
+ const auto page=common::system::host_page_size();
+ const auto rounded=common::math::checked_add(observed,page-1,"Parquet exceptional alignment overflow")/page*page;
+ (void)common::math::checked_cast<std::int64_t>(rounded,"Parquet exceptional extent overflow");
+ return rounded;
+}
+CompileResources parquet_window(std::size_t bytes=kParquetPoolBytes) {
+ return {.bytes=bytes,.supplied_workspace=true,.workspace_class=detail::CompileWorkClass::Extraction,
+  .opaque_bytes=16U<<20,.workspace_window=detail::CompileWorkspaceWindow::SharedSource};
+}
+std::unique_ptr<parquet::arrow::FileReader> open_reader(const std::filesystem::path& path, CoconutParquetPool& pool, std::shared_ptr<parquet::FileMetaData> metadata = {}) {
  parquet::ReaderProperties input(&pool);
  input.enable_buffered_stream();
  input.set_buffer_size(128U * 1024U);
@@ -398,28 +508,22 @@ std::unique_ptr<parquet::arrow::FileReader> open_reader(const std::filesystem::p
  return take(builder.Build());
 }
 struct ParquetBatch {
- std::shared_ptr<ParquetPool> pool;
+ std::shared_ptr<CoconutParquetPool> pool;
  std::shared_ptr<arrow::RecordBatch> batch;
-};
-struct ParquetReaderDescriptors {
- const CompileAllowance& allowance;
- ~ParquetReaderDescriptors() { allowance.retire_descriptors(); }
 };
 }  // namespace
 class CoconutParquetMetadata final {
 public:
  struct Shard {
   std::filesystem::path path;
-  std::shared_ptr<ParquetPool> pool;
+  CompileAllowance descriptor;
+  common::io::FileHandle file;
+  std::shared_ptr<CoconutParquetPool> footer_pool;
   std::shared_ptr<parquet::FileMetaData> footer;
   ParquetProjection projection;
- };
- struct Group {
-  std::size_t shard;
-  int group;
+  std::size_t first_group=0;
  };
  std::vector<Shard> shards;
- std::vector<Group> groups;
 };
 void CoconutAnnotationRecords::rebase_parquet_segments() {
  if (prefixes_sealed_) return;
@@ -427,12 +531,12 @@ void CoconutAnnotationRecords::rebase_parquet_segments() {
  for (auto& group : groups) {
   if (group.first_row > size() || group.rows > size() - group.first_row) malformed("retained group row extent");
   group.first_segment = prefix.value_or(0);
-  for (auto& row : std::span(rows_).subspan(static_cast<std::size_t>(group.first_row), static_cast<std::size_t>(group.rows))) {
+  for (auto& row : rows_ | std::views::drop(static_cast<std::size_t>(group.first_row)) | std::views::take(static_cast<std::size_t>(group.rows))) {
    if (!row.complete()) continue;
    row.segment_ordinal_complete_ = prefix.has_value();
    row.segment_ordinal_ = prefix ? mmltk::common::math::checked_add(row.record_.first_segment_ordinal, *prefix, "COCONut Parquet record ordinal overflow") : row.record_.first_segment_ordinal;
   }
-  const auto rows = std::span(rows_).subspan(static_cast<std::size_t>(group.first_row), static_cast<std::size_t>(group.rows));
+  const auto rows = rows_ | std::views::drop(static_cast<std::size_t>(group.first_row)) | std::views::take(static_cast<std::size_t>(group.rows));
   if (std::ranges::any_of(rows, [](const auto& row) { return !row.complete(); }))
    prefix.reset();
   else if (prefix)
@@ -440,277 +544,280 @@ void CoconutAnnotationRecords::rebase_parquet_segments() {
  }
  prefixes_sealed_ = true;
 }
-void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
- const CoconutRecordConsumer& consumer, bool metadata_only, CompileExecution* execution, const std::function<void(std::size_t)>& finish_consumer_group, const CompileAllowance& parent,
- CoconutAnnotationRecords* retained, const std::function<std::uint64_t(const CoconutRecord&)>& consumer_workspace, const std::function<void(const CompileAllowance&)>& retire_consumer_input,
- const std::function<void(const std::function<void()>&)>& settle_consumer, const std::function<bool(const CoconutRecord&, const CompileAllowance&)>& reusable_native) {
- auto producer = execution ? execution->open_class(detail::CompileWorkClass::Extraction) : CompileExecution::Producer{};
- using mmltk::common::math::checked_add;
- using mmltk::common::math::checked_multiply;
+void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, common::concurrency::CancellationObservation cancellation,
+ const CoconutRecordConsumer& consumer, bool metadata_only, CompileExecution* execution, const std::function<void()>& settle_consumers, const CompileAllowance& parent,
+ CoconutAnnotationRecords* retained, const std::function<bool(const CoconutRecord&)>& reusable_native,
+ const std::function<bool(const CoconutRecord&,std::span<const std::uint8_t>)>& exceptional,const BenchmarkTraceSink& trace) {
+ auto producer=execution ? execution->open_class(detail::CompileWorkClass::Extraction) : CompileExecution::Producer{};
  CoconutAnnotationRecords local;
- if (!retained) retained = &local;
- const ParquetCallEnvelope envelope(metadata_only, retained->parquet && retained->metadata_complete());
- if (!retained->parquet) {
-  // An unsuccessful footer discovery proves no retained row extent.
-  retained->groups.clear();
-  auto catalog = std::make_shared<CoconutParquetMetadata>();
-  std::uint64_t rows = 0;
-  decltype(retained->groups) discovered_groups;
-  for (const auto& path : shards) {
+ if (!retained) retained=&local;
+ if (!retained->staging) retained->staging=std::make_shared<CoconutStaging>(retained->staging_directory,retained->storage);
+ const auto cpu=[&](CoconutParquetPool& pool,const CompileAllowance& allowance,const std::function<void()>& work) {
+  pool.begin_call();
+  try {
+   if (execution) execution->run(CompileTaskKind::Projection,{.workspace_window=detail::CompileWorkspaceWindow::SharedSource},[&](std::size_t) { work(); },allowance); else work();
+  } catch (...) {
+   // Parquet may wrap Arrow's status in its own exception. Only this pool's
+   // distinct failed fit authorizes replay; a logical cap, malformed value,
+   // pin failure or cancellation has no such signal.
+   if (execution) if (auto interrupted=execution->interruption()) std::rethrow_exception(interrupted);
    throw_if_benchmark_cancelled(cancellation);
-   auto allowance = execution ? execution->reserve(envelope.discovery_demand(), parent) : CompileAllowance{};
-   auto pool = std::make_shared<ParquetPool>(allowance);
-   // Declared before reader/batches: all library readers close before this
-   // guard returns descriptors, including cancellation and consumer throws.
-   ParquetReaderDescriptors retire_reader{allowance};
-   std::unique_ptr<parquet::arrow::FileReader> reader;
-   std::shared_ptr<parquet::FileMetaData> footer;
-   ParquetProjection projection;
-   const auto discover = [&](std::size_t) {
-    try {
-     reader = open_reader(path, *pool);
-     projection = resolve_projection(reader->manifest());
-     footer = reader->parquet_reader()->metadata();
-     for (int group = 0; group < reader->num_row_groups(); ++group) {
-      const auto count = footer->RowGroup(group)->num_rows();
-      if (count < 0) malformed("negative row group count");
-      catalog->groups.push_back({catalog->shards.size(), group});
-      discovered_groups.push_back({rows, static_cast<std::uint64_t>(count), 0, 0});
-      rows = checked_add(rows, static_cast<std::uint64_t>(count), "COCONut Parquet row prefix overflow");
-     }
-    } catch (const ParquetFormatError& error) { throw CoconutInputError("COCONut Parquet " + path.string() + ": " + error.what()); }
-   };
-   if (execution)
-    execution->run(CompileTaskKind::Metadata, {}, discover, allowance);
-   else
-    discover(0);
-   reader.reset();
-   // Footer facts are canonical metadata. Any Arrow-backed footer storage
-   // keeps its pool and its exact charged remainder after the reader closes.
-   if (allowance) {
-    const auto held = static_cast<std::uint64_t>(pool->bytes_allocated());
-    auto backing = held ? allowance.split_storage(held) : CompileAllowance{};
-    allowance.retire_descriptors();
-    allowance.retire_workspace();
-    pool->allowance = std::move(backing);
-   }
-   catalog->shards.push_back({path, std::move(pool), std::move(footer), std::move(projection)});
-  }
-  retained->resize(mmltk::common::math::checked_cast<std::size_t>(rows, "COCONut Parquet row count overflow"));
-  retained->groups = std::move(discovered_groups);
-  retained->parquet = std::move(catalog);
-  // The first pass projects only image columns and publishes each ready row.
-  // A full import then joins these same owned records from mask-only batches.
- }
- auto catalog = retained->parquet;
- if (catalog->shards.size() != shards.size()) malformed("retained shard generation mismatch");
- for (std::size_t i = 0; i < shards.size(); ++i)
-  if (catalog->shards[i].path != shards[i]) malformed("retained shard path mismatch");
- // Each existing parallel range owns one forward Arrow/physical continuation.
- // Groups still publish independently; only their current batch is transient.
- struct Sequence {
-  CompileExecution* execution;
-  const CompileAllowance& parent;
-  const std::function<void(const CompileAllowance&)>& retire_input;
-  const ParquetCallEnvelope& envelope;
-  bool active = false, projection = false;
-  CompileAllowance allowance{};
-  std::shared_ptr<ParquetPool> pool{};
-  std::unique_ptr<parquet::arrow::FileReader> reader{};
-  std::size_t shard = SIZE_MAX;
-  void close_projection() {
-   reader.reset();
-   if (pool && allowance) {
-    const auto held = static_cast<std::uint64_t>(pool->bytes_allocated());
-    pool->allowance = held ? allowance.split_storage(held) : CompileAllowance{};
-   }
-   pool.reset();
-   shard = SIZE_MAX;
-   projection = false;
-  }
-  void close() {
-   reader.reset();
-   if (allowance && retire_input) retire_input(allowance);
-   if (allowance) {
-    const auto held = pool ? static_cast<std::uint64_t>(pool->bytes_allocated()) : 0;
-    auto backing = held ? allowance.split_storage(held) : CompileAllowance{};
-    allowance.retire_descriptors();
-    allowance.retire_workspace();
-    if (pool) pool->allowance = std::move(backing);
-   }
-   pool.reset();
-   allowance = {};
-   shard = SIZE_MAX;
-   active = false;
-  }
-  ~Sequence() {
-   try {
-    close();
-   } catch (...) { allowance.retire_descriptors(); }  // Unwinding keeps any unsplit pool promise until its last batch.
-  }
-  std::uint64_t live_bytes() const { return pool ? static_cast<std::uint64_t>(pool->bytes_allocated()) : 0; }
-  void ensure(std::uint64_t workspace, bool needs_projection) {
-   const auto demand = envelope.demand(workspace, needs_projection);
-   // Every transition keeps the same future cap (hence every live pool/batch
-   // allocation) and complete descriptor promise. Only excess group work varies.
-   if (active && (!execution || execution->try_resize_workspace(allowance, demand.bytes, needs_projection && projection && !execution->resource_pressure()))) {
-    if (needs_projection && !pool) pool = std::make_shared<ParquetPool>(allowance);
-    projection = needs_projection;
-    return;
-   }
-   // No blocking upgrade with retained input: two readers can both fail growth
-   // and release their actual dependents before complete reacquisition. The
-   // typed row and group cursor survive; no Parquet prefix is skipped/reparsed.
-   close();
-   allowance = execution ? execution->reserve(demand, parent) : CompileAllowance{};
-   projection = needs_projection;
-   if (projection) pool = std::make_shared<ParquetPool>(allowance);
-   active = true;
+   if (const auto envelope=pool.fragmented_extent()) throw ParquetContiguousFit(envelope);
+   throw;
   }
  };
- const auto workers = execution ? execution->workers() : std::size_t{1};
- mmltk::common::concurrency::parallel_for_range_indexed(
-  std::size_t{0}, catalog->groups.size(), mmltk::common::math::checked_cast<int>(workers, "COCONut Parquet worker count overflow"), [&](int, std::size_t begin, std::size_t end) {
-  Sequence sequence{execution, parent, retire_consumer_input, envelope};
-  const auto group_work = [&](std::size_t group_index, bool image_pass) {
-   auto& group = retained->groups[group_index];
-   const auto position = catalog->groups[group_index];
-   const auto& shard = catalog->shards[position.shard];
+ if (!retained->parquet) {
+  retained->groups.clear();
+  auto catalog=std::make_shared<CoconutParquetMetadata>();
+  std::uint64_t rows=0;
+  std::vector<CoconutRecordGroup> groups;
+  for (const auto& path : shards) {
    throw_if_benchmark_cancelled(cancellation);
-   try {
-    if (image_pass && (!envelope.needs_metadata() || std::ranges::all_of(retained->rows().subspan(group.first_row, group.rows), [](const auto& row) { return row.metadata_ready(); }))) {
-     if (!envelope.full()) sequence.close_projection();
-     sequence.ensure(0, envelope.full());
-     for (auto row = group.first_row; row < group.first_row + group.rows; ++row)
-      consumer(
-       group_index, retained->record(static_cast<std::size_t>(row)), CoconutAnnotationInput{{}, sequence.allowance, sequence.pool, sequence.live_bytes(), true, [&] { sequence.close_projection(); }});
-     if (finish_consumer_group) finish_consumer_group(group_index);
-     return;
+   auto descriptor=execution ? execution->reserve(CompileResources::handles(1),parent) : CompileAllowance{};
+   auto file=common::io::FileHandle::open_readonly(path.string());
+   auto reader_descriptor=execution ? execution->reserve(CompileResources::handles(1),parent) : CompileAllowance{};
+   CompileAllowance allowance;
+   std::shared_ptr<CoconutParquetPool> pool;
+   std::shared_ptr<parquet::FileMetaData> footer;
+   ParquetProjection projection;
+   const auto first_group=groups.size();
+   std::size_t window_bytes=kParquetPoolBytes;
+   for (;;) {
+    throw_if_benchmark_cancelled(cancellation);
+    allowance=execution ? execution->reserve(parquet_window(window_bytes),parent) : CompileAllowance{};
+    pool=std::make_shared<CoconutParquetPool>(allowance,window_bytes);
+    try {
+     cpu(*pool,allowance,[&] {
+      auto reader=open_reader("/proc/self/fd/"+std::to_string(file.get()),*pool);
+      projection=resolve_projection(reader->manifest());
+      footer=reader->parquet_reader()->metadata();
+     });
+     break;
+    } catch (const ParquetContiguousFit& fit) {
+     footer.reset(); pool->close(); pool.reset(); allowance={};
+     window_bytes=replay_envelope(fit.envelope,execution);
+    } catch (const ParquetFormatError& error) { throw CoconutInputError("COCONut Parquet "+path.string()+": "+error.what()); }
+   }
+   try { cpu(*pool,allowance,[&] {
+    for (int group=0;group<footer->num_row_groups();++group) {
+     const auto count=footer->RowGroup(group)->num_rows();
+     if (count<0) malformed("negative row group count");
+     groups.push_back({rows,static_cast<std::uint64_t>(count),0,0});
+     rows=common::math::checked_add(rows,static_cast<std::uint64_t>(count),"COCONut Parquet row prefix overflow");
     }
-    bool annotations_needed = false, png_needed = false;
-    std::uint64_t scratch = 0;
-    // Native reuse checks actual current physical/original dependencies. No
-    // cached presence bit alone can omit a mask projection.
-    if (!image_pass)
-     for (auto row = group.first_row; row < group.first_row + group.rows; ++row) {
-      const auto& stored = retained->row(row);
-      annotations_needed |= !stored.complete();
-      const bool reused = reusable_native && reusable_native(stored.record(), sequence.active ? sequence.allowance : parent);
-      const bool needed = !stored.complete() || !reused;
-      png_needed |= needed;
-      if (needed && consumer_workspace) scratch = std::max(scratch, consumer_workspace(stored.record()));
-     }
-    // The native reuse callback resolves current physical membership before
-    // mask allocation. Its immutable join now survives physical reader closure.
-    if (!image_pass && reusable_native && retire_consumer_input && !sequence.active) retire_consumer_input(sequence.active ? sequence.allowance : parent);
-    if (!image_pass && !png_needed) {
-     // No Arrow input is opened for a completely reusable group. Retained rows
-     // still enter the real duplicate/row-count/progress consumer exactly once.
-     std::uint64_t segments = 0;
-     for (auto row = group.first_row; row < group.first_row + group.rows; ++row) {
-      const auto& record = retained->record(row);
-      if (record.first_segment_ordinal != segments) malformed("retained local segment offset");
-      segments = checked_add(segments, std::uint64_t{record.segments.size()}, "COCONut Parquet segment count overflow");
-      consumer(group_index, record, CoconutAnnotationInput{{}, sequence.allowance, {}, sequence.active ? sequence.live_bytes() : 0, false});
-     }
-     group.segments = segments;
-     if (finish_consumer_group) finish_consumer_group(group_index);
-     return;
-    }
-    const auto bytes = checked_add(scratch, std::uint64_t{128ULL << 10}, "COCONut Parquet batch workspace overflow");
-    sequence.ensure(bytes, true);
-    const auto& allowance = sequence.allowance;
-    const auto& pool = sequence.pool;
-    struct RetireConsumer {
-     const std::function<void(std::size_t)>& callback;
-     std::size_t group;
-     bool pending = true;
-     void finish() {
-      if (std::exchange(pending, false) && callback) callback(group);
-     }
-     ~RetireConsumer() {
-      if (pending) try {
-        finish();
-       } catch (...) {}
-     }
-    } retire{finish_consumer_group, group_index};
-    const auto cpu = [&](const std::function<void()>& work) {
-     if (execution)
-      execution->run(image_pass ? CompileTaskKind::Metadata : CompileTaskKind::Normalize, {}, [&](std::size_t) { work(); }, allowance);
-     else
-      work();
-    };
-    if (sequence.shard != position.shard) {
-     sequence.reader.reset();
-     cpu([&] { sequence.reader = open_reader(shard.path, *pool, shard.footer); });
-     sequence.shard = position.shard;
-    }
-    auto& reader = sequence.reader;
-    const auto& columns = image_pass ? shard.projection.images : annotations_needed ? shard.projection.masks : shard.projection.png;
-    std::unique_ptr<arrow::RecordBatchReader> batches;
-    cpu([&] { batches = take(reader->GetRecordBatchReader({position.group}, columns)); });
-    auto row_ordinal = group.first_row;
-    std::uint64_t segment_ordinal = 0;
-    for (;;) {
-     throw_if_benchmark_cancelled(cancellation);
-     auto chunk = std::make_shared<ParquetBatch>();
-     chunk->pool = pool;
-     cpu([&] { check(batches->ReadNext(&chunk->batch)); });
-     if (!chunk->batch) break;
-     std::vector<std::pair<const CoconutRecord*, std::span<const std::uint8_t>>> records;
-     records.reserve(static_cast<std::size_t>(chunk->batch->num_rows()));
-     std::exception_ptr input_error;
-     try {
-      cpu([&] {
-       read_batch(*chunk->batch, limits, cancellation, [&](const CoconutRecord& record, std::span<const std::uint8_t> png) { records.emplace_back(&record, png); }, row_ordinal, segment_ordinal,
-        image_pass, *retained, annotations_needed);
-      });
-     } catch (const ParquetFormatError&) { input_error = std::current_exception(); }
-     if (!image_pass) group.segments = segment_ordinal;
-     const auto live = checked_add(sequence.live_bytes(), records.capacity() * sizeof(records.front()), "COCONut live batch overflow");
-     // Successful parsing already committed the canonical immutable row. A
-     // physical consumer failure cannot destroy it or cause a second parse.
-     if (!image_pass)
-      for (const auto& [record, png] : records) consumer(group_index, *record, CoconutAnnotationInput{png, allowance, chunk, live, false});
-     if (input_error) std::rethrow_exception(input_error);
-    }
-    if (row_ordinal != group.first_row + group.rows) malformed("row group extent mismatch");
-    if (!image_pass) group.segments = segment_ordinal;
-    batches.reset();
-    if (image_pass) {
-     // Metadata-only discovery can retire Arrow before a physical source wait.
-     // A full import retains its opened projection and complete input envelope
-     // for the immediately following payload and subsequent row groups.
-     if (!envelope.full()) {
-      sequence.close_projection();
-      sequence.ensure(0, false);
-     }
-     for (auto row = group.first_row; row < group.first_row + group.rows; ++row)
-      consumer(group_index, retained->record(row), CoconutAnnotationInput{{}, sequence.allowance, sequence.pool, sequence.live_bytes(), true, [&] { sequence.close_projection(); }});
-    }
-    retire.finish();
-    // A ready independent recovery batch cannot borrow an arbitrary callback's
-    // reader promise. At this settled group boundary pressure may release the
-    // actual reader/pool before reacquiring the next group's complete envelope.
-    // Footer and row/group cursors survive; no consumed rows are replayed.
-    if (settle_consumer) settle_consumer([&] { sequence.close(); });
-   } catch (const ParquetFormatError& error) { throw CoconutInputError("COCONut Parquet " + shard.path.string() + ": " + error.what()); }
-  };
-  for (auto group = begin; group < end; ++group) {
-   // Cold imports publish metadata group by group, then grow using that
-   // group's actual dimensions. Successful growth preserves the same decoder;
-   // pressure may reopen it and replay a physical prefix, never a row prefix.
-   if (envelope.full() && envelope.needs_metadata()) group_work(group, true);
-   group_work(group, !envelope.full());
+   }); } catch (const ParquetFormatError& error) { throw CoconutInputError("COCONut Parquet "+path.string()+": "+error.what()); }
+   pool->close();
+   catalog->shards.push_back({path,std::move(descriptor),std::move(file),std::move(pool),std::move(footer),std::move(projection),first_group});
   }
-  sequence.close();
- });
- if (envelope.full()) {
-  const auto rebase = [&](std::size_t) { retained->rebase_parquet_segments(); };
-  if (execution)
-   execution->run(CompileTaskKind::Metadata, {}, rebase);
-  else
-   rebase(0);
+  retained->resize(common::math::checked_cast<std::size_t>(rows,"COCONut Parquet row count overflow"));
+  retained->groups=std::move(groups); retained->parquet=std::move(catalog);
  }
+ auto catalog=retained->parquet;
+ if (catalog->shards.size()!=shards.size()) malformed("retained shard generation mismatch");
+ for (std::size_t i=0;i<shards.size();++i) if (catalog->shards[i].path!=shards[i]) malformed("retained shard path mismatch");
+ // The calling controller advances bounded artifact cursors; worker count never
+ // creates extra source threads/readers. Only a projected batch enters a lane.
+ struct Reader {
+  std::size_t shard=0,group=0,replay_bytes=0;
+  std::uint64_t row=0,segments=0,projected=0;
+  bool initialized=false,image_pass=true,annotations=true,finished=false;
+  CompileAllowance allowance,reader_descriptor;
+  std::shared_ptr<CoconutParquetPool> pool;
+  std::unique_ptr<parquet::arrow::FileReader> reader;
+  std::unique_ptr<arrow::RecordBatchReader> batches;
+  std::vector<CompileExecution::Completion> consumers;
+  // Keep the bounded reader descriptor reservation while parked. Repeatedly
+  // taking and returning it on a failed byte draw would notify our own retry
+  // loop forever without any external resource change.
+  void close() { batches.reset(); reader.reset(); if (pool) pool->close(); pool.reset(); allowance={}; }
+  ~Reader() { batches.reset(); reader.reset(); pool.reset(); }
+ };
+ std::vector<Reader> readers(catalog->shards.size());
+ for (std::size_t i=0;i<readers.size();++i) readers[i].shard=i;
+ Reader* replay=nullptr;
+ std::size_t remaining=readers.size();
+ while (remaining) {
+  bool progressed=false;
+  if (execution && execution->resource_pressure()) for (auto& state : readers) state.close();
+  const auto generation=execution ? execution->admission_generation() : 0;
+  for (auto& state : readers) {
+   if (state.finished || (replay && replay!=&state)) continue;
+   // Admitted tasks already staged their output; settlement retires their
+   // remaining input custody. Reap before waiting for another source window.
+   if (!state.consumers.empty() && settle_consumers) settle_consumers();
+   std::erase_if(state.consumers,[](const auto& completion) {
+    if (!completion.ready()) return false;
+    completion.wait();
+    return true;
+   });
+   // One artifact can have several bounded batches in flight. An earlier
+   // borrower never fences later groups when another source window fits.
+   if (state.consumers.size() >= 64) continue;
+   const auto& shard=catalog->shards[state.shard];
+   if (state.group==static_cast<std::size_t>(shard.footer->num_row_groups())) {
+    state.close();
+    if (replay==&state) { replay=nullptr; state.replay_bytes=0; }
+    state.reader_descriptor={};
+    if (state.consumers.empty()) { state.finished=true; --remaining; progressed=true; }
+    continue;
+   }
+   const auto group_index=shard.first_group+state.group;
+   auto& group=retained->groups[group_index];
+   try {
+    if (!state.initialized) {
+     state.row=group.first_row; state.segments=0; state.projected=0; state.image_pass=metadata_only || std::ranges::any_of(retained->rows() | std::views::drop(group.first_row) | std::views::take(group.rows),[](const auto& row) { return !row.metadata_ready(); }); state.initialized=true;
+    }
+    const auto rows=retained->rows() | std::views::drop(group.first_row) | std::views::take(group.rows);
+    if (state.image_pass && std::ranges::all_of(rows,[](const auto& row) { return row.metadata_ready(); })) {
+     if (state.replay_bytes) { state.close(); state.replay_bytes=0; replay=nullptr; }
+     for (const auto& row : rows) consumer(group_index,row.record(),CoconutAnnotationInput{.membership=true});
+     state.image_pass=false; state.row=group.first_row; state.projected=0;
+     if (metadata_only) { if (settle_consumers) settle_consumers(); ++state.group; state.initialized=false; }
+     progressed=true; continue;
+    }
+    if (!state.image_pass && state.projected==0) {
+     state.annotations=std::ranges::any_of(rows,[](const auto& row) { return !row.complete(); });
+     if (!state.annotations && reusable_native && std::ranges::all_of(rows,[&](const auto& row) { return reusable_native(row.record()); })) {
+      if (state.replay_bytes) { state.close(); state.replay_bytes=0; replay=nullptr; }
+      for (const auto& row : rows) {
+       if (row.record().first_segment_ordinal!=state.segments) malformed("retained local segment offset");
+       state.segments=common::math::checked_add(state.segments,std::uint64_t{row.record().segments.size()},"COCONut Parquet segment count overflow");
+       consumer(group_index,row.record(),{});
+      }
+      group.segments=state.segments;
+      if (settle_consumers) settle_consumers();
+      ++state.group; state.initialized=false; progressed=true; continue;
+     }
+    }
+    if (!state.allowance) {
+     if (execution) {
+      if (!state.reader && !state.reader_descriptor) {
+       auto descriptor=execution->try_reserve(CompileResources::handles(1),parent);
+       if (!descriptor) { state.close(); continue; }
+       state.reader_descriptor=std::move(*descriptor);
+      }
+      // Replay owns no reader pages or semantic borrowers now. The blocking
+      // exclusive reservation asks other systems to drain their idle backing;
+      // an ordinary availability probe cannot establish that global handoff.
+      auto next=state.replay_bytes ? std::optional<CompileAllowance>{execution->reserve(parquet_window(state.replay_bytes),parent)}
+                                  : execution->try_reserve(parquet_window(),parent);
+      if (!next) {
+       // An idle projection can release its own retained pages without losing
+       // its opened generation or parsed row/batch position.
+       state.close();
+       trace_benchmark_event(trace,"benchmark.coconut.projection_parked",[&] { return nlohmann::json{{"artifact",shard.path.string()},{"group",state.group},{"rows_projected",state.projected},{"window_bytes",kParquetPoolBytes}}; });
+       continue;
+      }
+      state.allowance=std::move(*next);
+     }
+     if (!state.pool) state.pool=std::make_shared<CoconutParquetPool>(state.allowance,state.replay_bytes ? state.replay_bytes : kParquetPoolBytes);
+     else state.pool->resume(state.allowance,state.replay_bytes ? state.replay_bytes : kParquetPoolBytes);
+     if (!state.reader) cpu(*state.pool,state.allowance,[&] { state.reader=open_reader("/proc/self/fd/"+std::to_string(shard.file.get()),*state.pool,shard.footer); });
+    }
+    if (!state.batches) {
+     const auto& columns=state.image_pass ? shard.projection.images : state.annotations ? shard.projection.masks : shard.projection.png;
+     cpu(*state.pool,state.allowance,[&] {
+      state.batches=take(state.reader->GetRecordBatchReader({static_cast<int>(state.group)},columns));
+      // Suspension retains the last complete batch boundary. Replaying its
+      // physical prefix never re-admits rows or changes canonical ordinals.
+      std::uint64_t skipped=0;
+      while (skipped<state.projected) {
+       std::shared_ptr<arrow::RecordBatch> prior; check(state.batches->ReadNext(&prior));
+       if (!prior) malformed("retained projection cursor");
+       skipped+=static_cast<std::uint64_t>(prior->num_rows());
+      }
+      if (skipped!=state.projected) malformed("retained projection batch boundary");
+     });
+    }
+    std::shared_ptr<arrow::RecordBatch> batch;
+    cpu(*state.pool,state.allowance,[&] { check(state.batches->ReadNext(&batch)); });
+    if (!batch) {
+     state.batches.reset();
+     if (state.replay_bytes) { state.close(); state.replay_bytes=0; replay=nullptr; }
+     if (state.row!=group.first_row+group.rows) malformed("row group extent mismatch");
+     if (state.image_pass) {
+      for (const auto& row : rows) consumer(group_index,row.record(),CoconutAnnotationInput{.membership=true});
+      state.image_pass=false; state.row=group.first_row; state.projected=0;
+     } else { group.segments=state.segments; ++state.group; state.initialized=false; }
+     if (metadata_only) { ++state.group; state.initialized=false; }
+     if ((!state.initialized || !state.image_pass) && settle_consumers) settle_consumers();
+     progressed=true; continue;
+    }
+    struct Ready { const CoconutRecord* record; std::span<const std::uint8_t> png; CoconutStaging::Range<std::uint8_t> staged; };
+    std::vector<Ready> ready;
+    std::exception_ptr parse_failure;
+    try {
+     cpu(*state.pool,state.allowance,[&] {
+      read_batch(*batch,limits,cancellation,[&](const CoconutRecord& record,std::span<const std::uint8_t> png) {
+       ready.push_back({&record,png,{}});
+      },state.row,state.segments,state.image_pass,*retained,state.annotations);
+     });
+    } catch (const ParquetFormatError&) { parse_failure=std::current_exception(); }
+    if (!state.image_pass) for (const auto& row : ready) retained->stage_segments(row.record->source_ordinal);
+    state.projected+=static_cast<std::uint64_t>(batch->num_rows());
+    state.pool->quiesce(); state.allowance={};
+    auto chunk=std::make_shared<ParquetBatch>(state.pool,std::move(batch));
+    // Normal borrowers share the quiesced Arrow backing exactly once. An
+    // exceptional row transfers the entire current bounded batch before any
+    // descendant can wait on the normal arena that contains its own input.
+    const bool staged=state.replay_bytes || (!state.image_pass && exceptional && std::ranges::any_of(ready,[&](const auto& row) { return exceptional(*row.record,row.png); }));
+    if (staged) {
+     for (auto& row : ready) row.staged=retained->staging->copy<std::uint8_t>(row.png);
+     state.close(); chunk.reset();
+     state.replay_bytes=0; replay=nullptr;
+    }
+    trace_benchmark_event(trace,"benchmark.coconut.projected_batch",[&] {
+     const auto snapshot=execution ? execution->snapshot() : detail::CompileExecutionSnapshot{};
+     return nlohmann::json{{"artifact",shard.path.string()},{"group",state.group},{"rows_projected",state.projected},{"rows",ready.size()},
+      {"batch_bytes",staged ? 0 : state.pool->bytes_allocated()},{"retained_bank_capacity",staged ? 0 : state.pool->retained_capacity()},{"future_window_bytes",0},{"exceptional_transfer",staged},{"normal_locked",snapshot.normal_locked},{"leased",snapshot.leased}};
+    });
+    if (!state.image_pass) {
+     group.segments=state.segments;
+     for (auto& row : ready) consumer(group_index,*row.record,CoconutAnnotationInput{
+      .png=staged ? row.staged.values : row.png,.backing=staged ? row.staged.owner : chunk,
+      .live_bytes=staged ? row.staged.values.size() : static_cast<std::uint64_t>(state.pool->bytes_allocated()),
+      .admitted=[&](CompileExecution::Completion completion) { state.consumers.push_back(std::move(completion)); }});
+    }
+    if (parse_failure) std::rethrow_exception(parse_failure);
+    // The footer already fixes the exact group extent. Its final live batch
+    // must not require another allocation window merely to read an EOF that
+    // is already known, especially when the caller retains that batch.
+    if (state.row==group.first_row+group.rows) {
+     state.batches.reset();
+     if (state.image_pass) {
+      for (const auto& row : rows) consumer(group_index,row.record(),CoconutAnnotationInput{.membership=true});
+      state.image_pass=false; state.row=group.first_row; state.projected=0;
+      if (metadata_only) { ++state.group; state.initialized=false; }
+     } else { ++state.group; state.initialized=false; }
+     if (settle_consumers) settle_consumers();
+    }
+    progressed=true;
+   } catch (const ParquetContiguousFit& fit) {
+    // Close every idle reader before waiting: each may retain its own Arrow
+    // pages. Batch borrowers drain at complete semantic boundaries, with
+    // settlement releasing their input custody before exclusive admission.
+    for (auto& other : readers) other.close();
+    for (auto& other : readers) {
+     for (const auto& completion : other.consumers) {
+      completion.wait();
+      if (settle_consumers) settle_consumers();
+     }
+     other.consumers.clear();
+    }
+    if (settle_consumers) settle_consumers();
+    state.replay_bytes=replay_envelope(fit.envelope,execution); replay=&state;
+    trace_benchmark_event(trace,"benchmark.coconut.projection_replay",[&] {
+     const auto snapshot=execution ? execution->snapshot() : detail::CompileExecutionSnapshot{};
+     return nlohmann::json{{"artifact",shard.path.string()},{"group",state.group},{"rows_projected",state.projected},
+      {"window_bytes",state.replay_bytes},{"normal_locked",snapshot.normal_locked},{"leased",snapshot.leased},{"exceptional",snapshot.exceptional}};
+    });
+    progressed=true;
+    break;
+   } catch (const ParquetFormatError& error) { throw CoconutInputError("COCONut Parquet "+shard.path.string()+": "+error.what()); }
+  }
+  throw_if_benchmark_cancelled(cancellation);
+  if (!progressed && execution) execution->wait_for_admission_change(generation);
+ }
+ if (!metadata_only) retained->rebase_parquet_segments();
 }
-}  // namespace mmltk::backend::data::benchmark_internal
+} // namespace mmltk::backend::data::benchmark_internal

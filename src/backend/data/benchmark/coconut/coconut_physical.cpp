@@ -89,6 +89,15 @@ struct CoconutPhysicalMembership::Impl {
  Repair repair;
  mutable std::mutex mutex;
  mutable std::condition_variable changed;
+ mutable std::optional<detail::CompileExecution::CompletionSource> readiness_change;
+ std::uint64_t readiness_generation=0;
+ void notify_locked() {
+  ++readiness_generation;
+  if (readiness_change) { auto current=std::move(*readiness_change); readiness_change.reset(); current.settle(); }
+  changed.notify_all();
+ }
+ void notify() { const std::lock_guard lock(mutex); notify_locked(); }
+
  Impl(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& layout, detail::StorageReservationPool& reservations,
   BenchmarkCompilePipeline& pipeline, Cancellation cancel, Progress observer, Repair recover)
      : cache(&layout), storage(&reservations), execution(&pipeline), cancellation(cancel), progress(std::move(observer)), repair(std::move(recover)) {
@@ -138,7 +147,7 @@ struct CoconutPhysicalMembership::Impl {
    item.complete = true;
    item.admissions = std::max(item.admissions, 1U);
   }
-  changed.notify_all();
+  notify();
  }
  CoconutPhysicalImage resolve(CoconutEdition edition, const CoconutRecord& record, bool wait) const {
   const auto objects = admit_record(edition, record);
@@ -218,6 +227,49 @@ const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespac
  const std::lock_guard lock(impl_->mutex);
  return impl_->find(source, id);
 }
+CoconutPhysicalMembership::Readiness CoconutPhysicalMembership::readiness(CoconutEdition edition,const CoconutRecord& record) const {
+ const auto objects=admit_record(edition,record);
+ const auto id=objects ? objects->id : record.image_id;
+ AdmittedRecipeArchive* repair=nullptr;
+ Readiness result;
+ {
+  const std::lock_guard lock(impl_->mutex);
+  result.generation=impl_->readiness_generation;
+  const auto sources=objects ? std::span<const CoconutImageNamespace>(&objects->source,1) : coconut_release_sources(edition);
+  bool conflict=false,pixels=false;
+  for (const auto source : sources) {
+   const auto found=impl_->images.find({source,id});
+   if (found==impl_->images.end() || !found->second.verified) continue;
+   const auto& value=found->second.physical();
+   if (impl_->execution) {
+    const auto selected=impl_->releases.find(edition);
+    if (selected==impl_->releases.end() || std::ranges::none_of(selected->second,[&](const auto* item) { return item->archive->origin.source==value.source && item->archive->origin.shard==value.shard; })) continue;
+   }
+   conflict|=found->second.conflict || result.image.has_value();
+   result.image=found->second.physical(); pixels=found->second.pixels;
+  }
+  const auto selected=impl_->releases.find(edition);
+  const bool terminal=!impl_->execution || selected==impl_->releases.end() || std::ranges::all_of(selected->second,[](const auto* item) { return item->complete; });
+  result.terminal=conflict || pixels || terminal;
+  if (conflict) result.image.reset();
+  if (terminal && !pixels && !conflict && impl_->repair && selected!=impl_->releases.end()) {
+   Impl::Artifact* candidate=nullptr;
+   for (auto* item : selected->second) {
+    const auto& origin=item->archive->origin;
+    if (item->admissions>=3) continue;
+    if (result.image && (origin.source!=result.image->source || origin.shard!=result.image->shard)) continue;
+    if (!result.image && ((objects && origin.source!=objects->source) || (!objects && record.namespace_hint && origin.source!=*record.namespace_hint))) continue;
+    if (!candidate || item->admissions<candidate->admissions) candidate=item;
+   }
+   if (candidate) { candidate->complete=false; repair=candidate->archive; result.terminal=false; }
+  }
+  if (!result.terminal) result.image.reset();
+  if (!impl_->readiness_change) impl_->readiness_change.emplace(impl_->execution ? &impl_->execution->execution() : nullptr);
+  result.changed=impl_->readiness_change->completion();
+ }
+ if (repair) impl_->repair(*repair,"missing or unreadable required image: "+record.file_name);
+ return result;
+}
 CoconutPhysicalImage CoconutPhysicalMembership::identify(CoconutEdition edition, const CoconutRecord& record) const { return impl_->resolve(edition, record, false); }
 CoconutPhysicalImage CoconutPhysicalMembership::resolve(CoconutEdition edition, const CoconutRecord& record) const { return impl_->resolve(edition, record, true); }
 CoconutPhysicalImage CoconutPhysicalMembership::resolve(CoconutEdition edition, const CoconutPhysicalImage& image) const {
@@ -250,6 +302,7 @@ void CoconutPhysicalMembership::admitted(AdmittedRecipeArchive& archive, Downloa
  if (replacement) impl_->artifact(archive).inspected_cache_identity = archive.download.identity;
  impl_->artifact(archive).admitted = true;
  ++impl_->artifact(archive).admissions;
+ impl_->notify_locked();
 }
 bool CoconutPhysicalMembership::can_retry(const AdmittedRecipeArchive& archive) const {
  const std::lock_guard lock(impl_->mutex);
@@ -277,7 +330,7 @@ void CoconutPhysicalMembership::unavailable(AdmittedRecipeArchive& archive) {
   impl_->artifact(archive).complete = true;
   impl_->artifact(archive).admissions = 3;
  }
- impl_->changed.notify_all();
+ impl_->notify();
 }
 bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const std::function<void(const CoconutPhysicalImage&, std::string_view)>& rejected, bool cache_only) {
  auto& state = *impl_;
@@ -365,7 +418,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
    conflict = found->second.conflict;
    pixels = found->second.pixels;
    if (conflict) withdraw(found->second);
-   state.changed.notify_all();
+   state.notify_locked();
   }
   if (conflict) {
    if (retire) execution.retire_image(root, image.image_id);
@@ -399,6 +452,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
     found->second.bytes = 0;
    }
   }
+  state.notify();
   if (source_read) bad_image(image, reason);
   else if (replaying_inventory) cache_incomplete = true;
   else repairs.push_back(image);
@@ -433,7 +487,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
     completed = artifact.completed_images;
    }
    if (conflict) execution.retire_image(root, image.image_id);
-   state.changed.notify_all();
+   state.notify();
    if (state.progress) state.progress(CoconutEdition::Base, archive, image.image_id, completed);
   });
  };
@@ -615,5 +669,6 @@ void CoconutPhysicalMembership::withdraw(const AdmittedRecipeArchive& archive) {
   });
  }
  for (const auto id : withdrawn) impl_->execution->retire_image(impl_->root(archive.origin.source), id);
+ impl_->notify();
 }
 }  // namespace mmltk::backend::data::benchmark_internal

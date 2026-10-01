@@ -25,7 +25,7 @@ struct CompileWorkspacePlan {
 [[nodiscard]] CompileWorkspacePlan compile_workspace_plan(std::size_t workers, std::uint32_t resolution, bool perceptual,
  std::size_t reader_window = 0, std::uint64_t explicit_budget = 0, std::size_t encoded_window = 0);
 [[nodiscard]] CompileWorkspacePlan compile_workspace_plan(std::size_t workers, CompilePixelPolicy,
- std::span<const CompileWorkClass> enabled, CompileWorkspaceProfile annotations, std::size_t encoded_window, std::size_t pixel_input_bytes = 0);
+ std::span<const CompileWorkClass> enabled, CompileWorkspaceProfile annotations, std::size_t encoded_window, std::size_t pixel_input_bytes = 0, std::size_t source_window = 0);
 // Shared custody supports a moved output lease or immutable batch descendants.
 // Its backing is physically released only after its last actual borrower.
 class CompileArenaLease final {

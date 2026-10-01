@@ -18,12 +18,12 @@
 #include <vector>
 
 namespace mmltk::backend::data::detail {
-enum class CompileTaskKind : std::uint8_t { Acquisition, Metadata, Header, Archive, Normalize, Recovery, Labels, Pixels, Gather, CacheWrite, Output, Count };
+enum class CompileTaskKind : std::uint8_t { Acquisition, Metadata, Header, Projection, Archive, Normalize, Recovery, Labels, Pixels, Gather, CacheWrite, Output, Count };
 enum class CompileParkReason : std::uint8_t { None, Dependency, Bytes, Descriptors, Cpu, Withdrawal, Count };
 [[nodiscard]] constexpr CompileWorkClass work_class(CompileTaskKind kind) {
  switch (kind) {
   case CompileTaskKind::Acquisition: return CompileWorkClass::Acquisition;
-  case CompileTaskKind::Header: case CompileTaskKind::Archive: return CompileWorkClass::Extraction;
+  case CompileTaskKind::Header: case CompileTaskKind::Projection: case CompileTaskKind::Archive: return CompileWorkClass::Extraction;
   case CompileTaskKind::Metadata: case CompileTaskKind::Normalize: case CompileTaskKind::Recovery: case CompileTaskKind::Labels: return CompileWorkClass::Annotations;
   case CompileTaskKind::Pixels: return CompileWorkClass::Pixels;
   case CompileTaskKind::Gather: return CompileWorkClass::Gather;

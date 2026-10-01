@@ -1,3 +1,5 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_import.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_parquet.h"
 #include "src/backend/data/detail/staged_artifact.h"
 #include "src/backend/data/detail/compiled_slot_storage.h"
 #include "src/backend/data/detail/storage_reservation.h"
@@ -8505,7 +8507,8 @@ TEST_CASE("normalized label custody rejects unrelated backing for detached nativ
  lineage->component.source = physical.source;
  workspace.borrow_support(record, {}, {1, 1}, std::make_shared<const int>(0));
  auto native = workspace.finish(record, physical, {1, 1}, lineage, {});
- CHECK(CoconutNativeImage::stage(native, root.path()) == native);
+ CoconutStaging staging(root.path());
+ CHECK(CoconutNativeImage::stage(native, staging) == native);
  CHECK(fs::is_empty(root.path()));
  auto read = CoconutNativeImage::read(native);
  const auto ordinary = label_projection_fixture(1);
@@ -11416,4 +11419,83 @@ TEST_CASE("custom archive admission retires decoder and unaccepted input through
  CHECK(file_returns == files.size());
  CHECK(pipeline.execution().snapshot().exceptional == 0);
  CHECK(pipeline.execution().snapshot().normal_locked == locked);
+}
+
+TEST_CASE("planned normalized gather admits disjoint chunks on shared lanes", "[benchmark][annotations][resources]") {
+ using namespace mmltk::backend::data::detail;
+ using namespace std::chrono_literals;
+ const auto workers=GENERATE(std::size_t{1},std::size_t{2});
+ if (mmltk::common::system::allowed_cpu_set().size()<workers) SKIP("requires the selected assigned CPUs");
+ mmltk::testsupport::ScopedTempDir root("normalized-disjoint-gather");
+ CompileExecution execution(workers);
+ mmltk::testsupport::TestGate entered("independent bounded gather ranges");
+ struct Gate {
+  CompileExecution& execution;
+  mmltk::testsupport::TestGate& gate;
+  mutable std::atomic<std::size_t> calls{0};
+  bool cancelled() const noexcept {
+   if (execution.on_lane() && calls.fetch_add(1)<execution.workers()) gate.receipt().ArriveAndWait();
+   return false;
+  }
+ } cancellation{execution,entered};
+ const auto source=label_projection_fixture(7);
+ std::vector<RLEPair> runs(65537);
+ for (std::size_t i=0;i<runs.size();++i) runs[i]={static_cast<std::uint32_t>(i*2),1};
+ auto box=source.storage().boxes.front();
+ box.mask_rle_offset=0; box.mask_rle_pairs=runs.size();
+ std::array<NormalizedAnnotationAssembler::Slice,2> slices;
+ for (std::size_t i=0;i<slices.size();++i) slices[i]={{7+i,0,1,262144,1,0,0},{&box,1},runs,i*100,i!=0};
+ NormalizedAnnotationAssembler assembly({},2,2,runs.size()*2,mmltk::common::concurrency::CancellationObservation::Borrow(cancellation),root.path());
+ auto gathering=std::async(std::launch::async,[&] { assembly.gather(slices,&execution); return assembly.finish(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { entered.Release(); execution.cancel(); });
+ REQUIRE(entered.WaitEntered(5s,workers));
+ CHECK(execution.snapshot().running[static_cast<std::size_t>(CompileWorkClass::Gather)]==workers);
+ entered.Release();
+ const auto product=mmltk::testsupport::await_test_future(gathering,"canonical gather completes every disjoint run continuation",5s);
+ REQUIRE(product.images.size()==2);
+ REQUIRE(product.boxes.size()==2);
+ CHECK(product.images[0].source_image_id==7);
+ CHECK(product.images[1].first_box==1);
+ CHECK(product.boxes[1].mask_rle_offset==runs.size());
+ CHECK(product.boxes[1].source_ordinal==box.source_ordinal+100);
+ CHECK((product.boxes[1].flags&kAnnotationOrdinalIncomplete)!=0);
+ CHECK(std::memcmp(product.mask_rle_pairs.data(),runs.data(),runs.size()*sizeof(RLEPair))==0);
+ CHECK(std::memcmp(product.mask_rle_pairs.data()+runs.size(),runs.data(),runs.size()*sizeof(RLEPair))==0);
+ REQUIRE_NOTHROW(admit_normalized_annotations(product));
+}
+
+TEST_CASE("a Parquet source uses its protected window beside busy fitting contexts", "[benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ auto plan=std::make_shared<CompileWorkspacePlan>(compile_workspace_plan(1,1,false,kParquetPoolBytes,0,BenchmarkEncodedImage::normal_window_bytes));
+ CompileExecution execution(1,{}, {.workspace_plan=plan});
+ const auto locked=execution.snapshot().normal_locked;
+ auto normal=execution.reserve({.bytes=plan->context_bytes,.supplied_workspace=true});
+ auto ordinary=normal.workspace();
+ ordinary.front()=std::byte{19};
+ auto source=execution.try_reserve({.bytes=kParquetPoolBytes,.supplied_workspace=true,.workspace_class=CompileWorkClass::Extraction,.workspace_window=CompileWorkspaceWindow::SharedSource});
+ REQUIRE(source);
+ auto shared=source->workspace();
+ REQUIRE(shared.size()==kParquetPoolBytes);
+ shared.front()=std::byte{23};
+ CHECK(shared.data()!=ordinary.data());
+ CHECK(ordinary.front()==std::byte{19});
+ CHECK(execution.snapshot().exceptional==0);
+ CHECK(execution.snapshot().normal_locked==locked);
+ source.reset(); normal={};
+ CHECK(execution.snapshot().normal_locked==locked);
+}
+
+TEST_CASE("failed normalized gather cannot seal a partially copied product", "[benchmark][annotations][resources]") {
+ const bool mapped=GENERATE(false,true);
+ mmltk::testsupport::ScopedTempDir root("normalized-gather-failure");
+ const auto source=label_projection_fixture(7);
+ auto box=source.storage().boxes.front();
+ const std::array<RLEPair,2> runs{{{0,1},{0,1}}};
+ box.mask_rle_offset=0; box.mask_rle_pairs=runs.size();
+ auto image=source.image(0); image.box_count=1;
+ const std::array slices{NormalizedAnnotationAssembler::Slice{image,{&box,1},runs}};
+ NormalizedAnnotationAssembler assembly(source,1,1,runs.size(),{},mapped ? root.path() : fs::path{});
+ CHECK_THROWS(assembly.gather(slices));
+ CHECK_THROWS_AS(assembly.finish(),std::logic_error);
+ CHECK_THROWS_AS(assembly.begin_image(image),std::logic_error);
 }

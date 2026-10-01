@@ -1,6 +1,8 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/detail/storage_reservation.h"
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
 #include "src/backend/data/detail/compile_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
@@ -66,6 +68,14 @@ public:
  ~CoconutPhysicalMembership();
  CoconutPhysicalMembership(const CoconutPhysicalMembership&) = delete;
  CoconutPhysicalMembership& operator=(const CoconutPhysicalMembership&) = delete;
+ struct Readiness {
+  std::optional<CoconutPhysicalImage> image;
+  std::uint64_t generation=0;
+  bool terminal=false;
+  detail::CompileExecution::Completion changed;
+ };
+ // Snapshot and next-change subscription share the owner's generation lock.
+ [[nodiscard]] Readiness readiness(CoconutEdition,const CoconutRecord&) const;
  // Annotation identity admission has no physical I/O or readiness wait.
  [[nodiscard]] CoconutPhysicalImage identify(CoconutEdition, const CoconutRecord&) const;
  [[nodiscard]] std::filesystem::path identity_root(CoconutImageNamespace) const;

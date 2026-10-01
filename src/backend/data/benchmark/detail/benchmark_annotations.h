@@ -159,6 +159,16 @@ public:
   const std::filesystem::path& staging_directory = {}, detail::StorageReservationPool* = nullptr);
  NormalizedAnnotationAssembler(const NormalizedAnnotationAssembler&) = delete;
  NormalizedAnnotationAssembler& operator=(const NormalizedAnnotationAssembler&) = delete;
+ struct Slice {
+  NormalizedImage image;
+  std::span<const NormalizedBox> boxes;
+  std::span<const RLEPair> runs;
+  std::uint64_t ordinal_base = 0;
+  bool incomplete_ordinals = false;
+ };
+ // Planning fixes canonical disjoint destinations before any worker writes.
+ // Each task admits/copies at most 65,536 runs or 256 boxes, then yields.
+ void gather(std::span<const Slice>, CompileExecution* = nullptr);
  void begin_image(NormalizedImage);
  void append_box(NormalizedBox, std::span<const RLEPair>);
  [[nodiscard]] NormalizedAnnotationIndex finish(const BenchmarkTraceSink& = {});
@@ -169,6 +179,7 @@ private:
  std::shared_ptr<Mapped> mapped_;
  mmltk::common::concurrency::CancellationObservation cancellation_;
  bool finished_ = false;
+ bool incomplete_gather_ = false;
 };
 [[nodiscard]] NormalizedAnnotationIndex seal_normalized_annotations(NormalizedAnnotationBuilder&&, mmltk::common::concurrency::CancellationObservation = {});
 [[nodiscard]] NormalizedAnnotationIndex seal_normalized_annotation_metadata(NormalizedAnnotationBuilder&&);
