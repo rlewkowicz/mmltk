@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_staging.h"
 #include "src/backend/data/detail/compile_execution.h"
@@ -20,6 +21,7 @@
 namespace mmltk::backend::data::benchmark_internal {
 class BenchmarkArchive;
 class CoconutParquetMetadata;
+class CoconutNativeImage;
 struct CoconutRecordGroup {
  std::uint64_t first_row = 0, rows = 0, first_segment = 0, segments = 0;
 };

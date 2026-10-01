@@ -1,9 +1,8 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
-#include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/detail/compile_resources.h"
-#include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_annotation_identity.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
@@ -28,6 +27,7 @@
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
 class BenchmarkCompilePipeline;
+class BenchmarkLabelInput;
 class CoconutMaskRecovery;
 class CoconutRecoveryOriginals;
 struct CoconutCompletionFacts {
@@ -127,8 +127,6 @@ struct CoconutOriginalInput {
  bool terminal = false;
  std::uint64_t generation = 0;
 };
-[[nodiscard]] BenchmarkDatasetSource coconut_index_source(CoconutImageNamespace);
-[[nodiscard]] std::string coconut_component_split(CoconutEdition, CoconutImageNamespace);
 struct CoconutComponentImage {
  const CoconutComponentMetadata* component;
  const NormalizedAnnotationMetadata* metadata;

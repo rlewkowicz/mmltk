@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/benchmark/coconut/detail/coconut_annotation_identity.h"
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_staging.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
@@ -41,17 +42,6 @@ struct CoconutNativeSupport {
 };
 class CoconutNativeOutput;
 [[nodiscard]] const CategoryLookup& coconut_categories();
-[[nodiscard]] std::string coconut_image_input_identity(std::string_view annotations, const CoconutPhysicalImage&, std::string_view originals);
-struct CoconutComponentMetadata {
- CoconutEdition edition = CoconutEdition::Base;
- CoconutImageNamespace source = CoconutImageNamespace::CocoTrain;
- std::string input_identity;
- std::uint32_t recovery_policy = 0;
- std::string original_annotation_identity;
- // Compile-local annotation lineage; persisted input_identity seals this plus physical dependencies.
- std::string annotation_input_identity{};
- std::uint64_t original_generation = 0;
-};
 // Shared once per release/source/original generation; each image owns payload only.
 struct CoconutNativeLineage {
  CoconutComponentMetadata component;

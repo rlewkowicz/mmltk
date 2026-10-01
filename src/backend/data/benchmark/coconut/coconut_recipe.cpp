@@ -1,3 +1,5 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_annotation_identity.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_import.h"
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"

@@ -87,6 +87,7 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     benchmark/benchmark_annotations.cpp
     benchmark/coconut/coconut_import.cpp
     benchmark/coconut/coconut_staging.cpp
+    benchmark/coconut/coconut_annotation_identity.cpp
     benchmark/coconut/coconut_annotations.cpp
     benchmark/coconut/coconut_input.cpp
     benchmark/coconut/coconut_inventory.cpp
@@ -140,6 +141,7 @@ mmltk_register_private_headers(mmltk_backend_data
     benchmark/coconut/detail/coconut_json.h
     benchmark/coconut/detail/coconut_import.h
     benchmark/coconut/detail/coconut_staging.h
+    benchmark/coconut/detail/coconut_annotation_identity.h
     benchmark/coconut/detail/coconut_annotations.h
     benchmark/coconut/detail/coconut_input.h
     benchmark/coconut/detail/coconut_inventory_io.h

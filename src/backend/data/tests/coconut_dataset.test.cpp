@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_annotation_identity.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_import.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_parquet.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_parquet_pool.h"
@@ -752,7 +753,7 @@ TEST_CASE("COCONut Large shapes and sorted XL masks retain complete rows with La
  auto covered = original;
  auto covering = component_builder(original[1]);
  covering.edition = CoconutEdition::Large;
- covering.index.split = "coconut-" + std::to_string(static_cast<unsigned>(covering.edition)) + "-" + std::to_string(static_cast<unsigned>(covering.source));
+ covering.index.split = coconut_component_split(covering.edition, covering.source);
  covering.index.annotation_sha256.clear();
  covered[0] = std::move(covering).finish({}, root.path());
  CHECK(reconcile_coconut_extensions(covered) == 2);
@@ -2726,7 +2727,7 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  unsigned image_id = 2212;
  unsigned supporter_category = 63;
  bool enabled = true;
- bool empty_supporter = false;
+ bool empty_supporter = false, replace_original = false;
  std::vector<RLEPair> masks{{0, 2}, {1, 2}};  // Independent originals intentionally overlap.
  SECTION("two dogs on couch") {}
  SECTION("dog on boat") {
@@ -2735,6 +2736,7 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
   masks.resize(1);
  }
  SECTION("recovery off retains the previous omission and metadata") { enabled = false; }
+ SECTION("original replacement changes identity without changing recovered geometry") { replace_original = true; }
  SECTION("an emptied supporter is omitted without recursive recovery") { empty_supporter = true; }
  auto originals = recovery_originals(image_id, masks);
  const auto indexed_originals_view = fixture_index(originals);
@@ -2748,6 +2750,11 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  if (empty_supporter) pixels = {30, 30, 30, 0, 0, 0, 0, 0, 0};
  const std::array physical{coco(image_id)};
  auto input = request(physical);
+ input.records = std::make_shared<CoconutAnnotationRecords>();
+ std::shared_ptr<const CoconutNativeImage> native;
+ input.progress = [&](std::uint64_t complete) {
+  if (complete == 1) native = input.records->row(0).native();
+ };
  input.parquet_shards = {root.path() / "dogs.parquet"};
  input.recovery = enabled ? &recovery : nullptr;
  if (enabled) input.originals = [&](CoconutImageNamespace, bool, std::stop_token) { return CoconutOriginalReadiness{indexed_originals, true, 11}; };
@@ -2762,6 +2769,46 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
  const auto& component = result.front();
  REQUIRE(component.index().image_count() == 1);
  CHECK(component.index().images()[0].source_image_id == image_id);
+ REQUIRE(native);
+ CHECK(native->input_identity() == component.image_input_identity(0));
+ CHECK(native->lineage().index.source == component.index().source);
+ CHECK(native->lineage().index.split == component.index().split);
+ CHECK(native->lineage().component.recovery_policy == (enabled ? kCoconutRecoveryPolicy : 0));
+ const auto cache = root.path() / "recovery.normalized.bin";
+ store_coconut_component(cache, component);
+ const auto cached = load_coconut_component(cache, component.edition(), component.source(), input.input_identity, {}, false, input.physical_membership, enabled ? &recovery : nullptr);
+ REQUIRE(cached);
+ CHECK(cached->image_input_identity(0) == native->input_identity());
+ if (replace_original) {
+  const auto previous = native;
+  auto replacement_source = originals;
+  replacement_source.annotation_sha256 = std::string(64, 'b');
+  const auto replacement_index = fixture_index(replacement_source);
+  auto replacement_originals = std::make_shared<CoconutRecoveryOriginals>(&replacement_index, nullptr);
+  CoconutMaskRecovery replacement_recovery(*replacement_originals);
+  input.recovery = &replacement_recovery;
+  input.originals = [replacement_originals](CoconutImageNamespace, bool, std::stop_token) { return CoconutOriginalReadiness{replacement_originals, true, 12}; };
+  const auto replacement = import_coconut_annotations(input);
+  REQUIRE(replacement.size() == 1);
+  REQUIRE(native);
+  CHECK(native->input_identity() != previous->input_identity());
+  CHECK(previous->input_identity() == "293304b221de8f6d6984ad2998e7ec88701087a77e3eb3efb34520a1fbaf51d4");
+  CHECK(native->input_identity() == "fc84daad7aac93ac6c70eda8a20d27c043b4589c833056f7afccdaef86059e51");
+  CHECK(native->input_identity() == replacement.front().image_input_identity(0));
+  CHECK(native->lineage().component.original_generation == 12);
+  CHECK(previous->lineage().component.original_generation == 11);
+  CHECK(native->lineage().component.original_annotation_identity == replacement_source.annotation_sha256);
+  REQUIRE(native->runs().size() == previous->runs().size());
+  CHECK(std::memcmp(native->runs().data(), previous->runs().data(), native->runs().size_bytes()) == 0);
+  const auto replacement_path = root.path() / "replacement.bin";
+  store_coconut_component(replacement_path, replacement.front());
+  const auto reloaded = load_coconut_component(replacement_path, component.edition(), component.source(), input.input_identity, {}, false, input.physical_membership, &replacement_recovery);
+  REQUIRE(reloaded);
+  CHECK(reloaded->image_input_identity(0) == native->input_identity());
+  CHECK_FALSE(load_coconut_component(cache, component.edition(), component.source(), input.input_identity, {}, false, input.physical_membership, &replacement_recovery));
+  CHECK(cached->image_input_identity(0) == previous->input_identity());
+  input.recovery = &recovery;
+ }
  if (!enabled) {
   REQUIRE(component.index().box_count() == 1);
   CHECK(component.index().storage().boxes[0].annotation_id == 30);
@@ -2805,10 +2852,6 @@ TEST_CASE("COCONut recovers the complete dropped dog candidate set and carves so
    CHECK(runs[0].length == 2);
   }
  }
- const auto cache = root.path() / "recovery.normalized.bin";
- store_coconut_component(cache, component);
- const auto cached = load_coconut_component(cache, component.edition(), component.source(), component.input_identity());
- REQUIRE(cached);
  CHECK(cached->original_generation() == 0);
  const auto admitted = cached->with_original({indexed_originals, true, 11});
  CHECK(admitted.original_generation() == 11);
@@ -7351,7 +7394,7 @@ TEST_CASE("Large and XL component identities retain only their consumed physical
   builder.source = CoconutImageNamespace::Objects365V2;
   builder.annotation_input_identity = "annotations";
   builder.index.source = BenchmarkDatasetSource::kObjects365V2;
-  builder.index.split = "coconut-" + std::to_string(static_cast<unsigned>(edition)) + "-" + std::to_string(static_cast<unsigned>(builder.source));
+  builder.index.split = coconut_component_split(edition, builder.source);
   auto image = objects(id);
   image.shard = shard;
   image.member.replace(0, image.member.find('/'), "patch" + std::to_string(shard));
@@ -7547,6 +7590,8 @@ TEST_CASE("native image custody survives workspace reuse and physical retirement
  auto lineage = std::make_shared<CoconutNativeLineage>();
  lineage->component.source = CoconutImageNamespace::CocoTrain;
  lineage->component.annotation_input_identity = "native-custody";
+ lineage->index.source = coconut_index_source(lineage->component.source);
+ lineage->index.split = coconut_component_split(lineage->component.edition, lineage->component.source);
  auto product = workspace.finish(wide, coco(7), dimensions, lineage, {});
  const auto capacity = workspace.retained_bytes();
  CHECK(capacity >= decoded_capacity);
@@ -7560,6 +7605,66 @@ TEST_CASE("native image custody survives workspace reuse and physical retirement
   CHECK(std::memcmp(product->runs().data(), original->runs().data(), original->runs().size_bytes()) == 0);
   CHECK(CoconutNativeImage::stage(product, staging) == product);
   staging.retire();
+ }
+ // Independent v1 image hashes pin the numeric namespace mapping and the
+ // deliberate unlabeled/train equivalence; physical archive/shard is excluded.
+ {
+  ScopedTempDir identities("native-component-identities");
+  struct IdentityCase {
+   CoconutImageNamespace source;
+   BenchmarkDatasetSource index_source;
+   std::string_view suffix, hash;
+  };
+  const std::array cases{
+   IdentityCase{CoconutImageNamespace::CocoTrain, BenchmarkDatasetSource::kCoco2017, "0", "461ecd8b7dd078df9bf761a44b0d7a78b5b6570b46dcb694e43f2b42f0b5e410"},
+   IdentityCase{CoconutImageNamespace::CocoUnlabeled, BenchmarkDatasetSource::kCoco2017, "1", "461ecd8b7dd078df9bf761a44b0d7a78b5b6570b46dcb694e43f2b42f0b5e410"},
+   IdentityCase{CoconutImageNamespace::CocoValidation, BenchmarkDatasetSource::kCoco2017, "2", "138c6d48894ee0f14a135186f0e0f777a0d3b7d92f84142b67e32a25a23851f0"},
+   IdentityCase{CoconutImageNamespace::Objects365V1, BenchmarkDatasetSource::kObjects365V2, "3", "eaeca804f0b1697b075bdc8b0d676ae3487b233b983780b438bb626c768894f9"},
+   IdentityCase{CoconutImageNamespace::Objects365V2, BenchmarkDatasetSource::kObjects365V2, "4", "2ee9962bfab217c4b4aac6babd090b815531ae68b0433d3dbabb29f22061e3a4"}
+  };
+  const std::array editions{
+   std::pair{CoconutEdition::Base, "coconut-0-"}, std::pair{CoconutEdition::RelabeledValidation, "coconut-1-"}, std::pair{CoconutEdition::Large, "coconut-2-"},
+   std::pair{CoconutEdition::XLarge, "coconut-3-"}, std::pair{CoconutEdition::ObjectsValidation, "coconut-4-"}
+  };
+  for (const auto& item : cases) {
+   CAPTURE(item.suffix);
+   for (const auto& [edition, prefix] : editions) CHECK(coconut_component_split(edition, item.source) == std::string(prefix) + std::string(item.suffix));
+   CHECK(coconut_index_source(item.source) == item.index_source);
+   const std::array images{item.index_source == BenchmarkDatasetSource::kCoco2017 ? coco(7, item.source) : objects(7, item.source)};
+   auto rebound = CoconutNativeImage::bind(product, images.front());
+   CHECK(rebound->input_identity() == item.hash);
+   CHECK(rebound->lineage().index.source == item.index_source);
+   CHECK(rebound->lineage().index.split == "coconut-0-" + std::string(item.suffix));
+   if (staged) CHECK(rebound->runs().data() == product->runs().data());
+   auto moved = images.front();
+   ++moved.shard;
+   const auto relocated = CoconutNativeImage::bind(rebound, moved);
+   CHECK(relocated->input_identity() == item.hash);
+   CHECK(relocated->inventory().physical == moved);
+   moved.archive_identity = "replacement archive";
+   CHECK(CoconutNativeImage::bind(relocated, moved)->input_identity() == item.hash);
+   CHECK(rebound->inventory().physical == images.front());
+   CoconutPhysicalMembership membership(images);
+   CoconutPhysicalDependencies dependencies;
+   dependencies.add(images.front());
+   CoconutComponentBuilder builder;
+   static_cast<CoconutComponentMetadata&>(builder) = rebound->lineage().component;
+   builder.input_identity = coconut_component_input_identity(builder.annotation_input_identity, builder.source, nullptr, &membership, builder.edition, dependencies);
+   static_cast<NormalizedAnnotationMetadata&>(builder.index) = rebound->lineage().index;
+   builder.index.images.push_back(rebound->image());
+   builder.index.boxes.assign(rebound->boxes().begin(), rebound->boxes().end());
+   builder.index.mask_rle_pairs.assign(rebound->runs().begin(), rebound->runs().end());
+   builder.inventory.push_back(rebound->inventory());
+   const auto component = std::move(builder).finish({}, identities.path());
+   CHECK(component.image_input_identity(0) == rebound->input_identity());
+   const auto path = identities.path() / (std::string(item.suffix) + ".bin");
+   store_coconut_component(path, component);
+   const auto loaded = load_coconut_component(path, component.edition(), component.source(), "native-custody", {}, false, &membership);
+   REQUIRE(loaded);
+   CHECK(loaded->image_input_identity(0) == item.hash);
+   CHECK(loaded->index().source == item.index_source);
+   CHECK(loaded->index().split == rebound->lineage().index.split);
+  }
  }
  auto physical = coco(7, CoconutImageNamespace::CocoUnlabeled);
  physical.shard = 3;

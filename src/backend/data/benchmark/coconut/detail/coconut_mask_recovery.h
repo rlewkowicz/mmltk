@@ -17,7 +17,6 @@
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
 struct CoconutRecord;
-inline constexpr std::uint32_t kCoconutRecoveryPolicy = 1;
 // A support owns mutable native runs or borrows admitted immutable originals.
 // Borrowing retains the original mapping; capacity reports only physical owned
 // storage, including cleared reusable capacity, never the borrowed span twice.

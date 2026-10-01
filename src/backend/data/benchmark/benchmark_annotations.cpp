@@ -70,6 +70,22 @@ struct __attribute__((packed)) NormalizedIndexHeader {
 };
 static_assert(kNormalizedAnnotationIndexVersion == 3U);
 static_assert(sizeof(NormalizedIndexHeader) == 256U);
+// One v3 physical layout serves mapped capacity, persisted admission and publication.
+// Callers decide whether an overflow is corrupt cache data or a capacity failure.
+struct NormalizedIndexLayout {
+ std::uint64_t image_offset, box_offset, mask_rle_offset, total_file_size;
+};
+[[nodiscard]] NormalizedIndexLayout normalized_index_layout(std::uint64_t images, std::uint64_t boxes, std::uint64_t runs) {
+ const auto block_end = [](std::uint64_t begin, std::uint64_t count, std::uint64_t record_size, const char* context) {
+  return common::math::checked_add(begin, common::math::checked_multiply(count, record_size, context), context);
+ };
+ NormalizedIndexLayout layout{};
+ layout.image_offset = sizeof(NormalizedIndexHeader);
+ layout.box_offset = block_end(layout.image_offset, images, sizeof(NormalizedImage), "normalized image block size overflow");
+ layout.mask_rle_offset = block_end(layout.box_offset, boxes, sizeof(NormalizedBox), "normalized box block size overflow");
+ layout.total_file_size = block_end(layout.mask_rle_offset, runs, sizeof(RLEPair), "normalized mask block size overflow");
+ return layout;
+}
 using RejectFields = std::remove_cvref_t<decltype(mmltk::frameworks::reflection::field_declarations<AnnotationRejectCounts>())>;
 [[nodiscard]] AnnotationRejectCounts decode_rejected(const std::array<std::uint64_t, 6>& rejected) noexcept {
  AnnotationRejectCounts result;
@@ -909,14 +925,18 @@ void validate_open_images_classes(const std::filesystem::path& path, const std::
  if (matched.size() != expected.size()) { throw std::runtime_error("Open Images class metadata is missing a required mapped class"); }
 }
 void validate_index_layout(const NormalizedIndexHeader& header, const std::size_t file_size) {
- const std::uint64_t expected_box_offset = sizeof(NormalizedIndexHeader) + static_cast<std::uint64_t>(header.image_count) * sizeof(NormalizedImage);
- if (header.box_count > (std::numeric_limits<std::uint64_t>::max() - expected_box_offset) / sizeof(NormalizedBox)) { throw std::runtime_error("normalized benchmark annotation index size overflows"); }
- const std::uint64_t expected_mask_offset = expected_box_offset + header.box_count * sizeof(NormalizedBox);
- if (header.mask_rle_pair_count > (std::numeric_limits<std::uint64_t>::max() - expected_mask_offset) / sizeof(RLEPair)) { throw std::runtime_error("normalized benchmark mask index size overflows"); }
- const std::uint64_t expected_size = expected_mask_offset + header.mask_rle_pair_count * sizeof(RLEPair);
+ const auto layout = [&] {
+  try {
+   return normalized_index_layout(header.image_count, header.box_count, header.mask_rle_pair_count);
+  } catch (const std::overflow_error& error) {
+   // Only arithmetic read from the persisted header is a cache miss. Capacity,
+   // mapping I/O and callback failures still propagate from the loading owner.
+   throw std::runtime_error(error.what());
+  }
+ }();
  if (header.magic != kNormalizedIndexMagic || header.version != kNormalizedAnnotationIndexVersion || header.source > static_cast<std::uint8_t>(BenchmarkDatasetSource::kOpenImagesV7) ||
-     header.image_count == 0U || header.image_offset != sizeof(NormalizedIndexHeader) || header.box_offset != expected_box_offset || header.mask_rle_offset != expected_mask_offset ||
-     header.total_file_size != expected_size || header.total_file_size != file_size || !std::ranges::all_of(header.reserved0, [](const std::uint8_t value) { return value == 0U; }) ||
+     header.image_count == 0U || header.image_offset != layout.image_offset || header.box_offset != layout.box_offset || header.mask_rle_offset != layout.mask_rle_offset ||
+     header.total_file_size != layout.total_file_size || header.total_file_size != file_size || !std::ranges::all_of(header.reserved0, [](const std::uint8_t value) { return value == 0U; }) ||
      !std::ranges::all_of(header.reserved, [](const std::uint8_t value) { return value == 0U; })) {
   throw std::runtime_error("normalized benchmark annotation index header is invalid");
  }
@@ -1072,19 +1092,16 @@ NormalizedAnnotationAssembler::NormalizedAnnotationAssembler(NormalizedAnnotatio
 void NormalizedAnnotationAssembler::prepare(std::size_t images, std::size_t boxes, std::size_t runs) {
  throw_if_benchmark_cancelled(cancellation_);
  if (!staging_directory_.empty()) {
-  const auto image_bytes = mmltk::common::math::checked_multiply(images, sizeof(NormalizedImage), "normalized image staging overflow");
-  const auto box_bytes = mmltk::common::math::checked_multiply(boxes, sizeof(NormalizedBox), "normalized box staging overflow");
-  const auto box_offset = mmltk::common::math::checked_add(sizeof(NormalizedIndexHeader), image_bytes, "normalized staging overflow");
-  const auto run_offset = mmltk::common::math::checked_add(box_offset, box_bytes, "normalized staging overflow");
-  const auto bytes = mmltk::common::math::checked_add(run_offset, mmltk::common::math::checked_multiply(runs, sizeof(RLEPair), "normalized run staging overflow"), "normalized staging overflow");
+  const auto layout = normalized_index_layout(images, boxes, runs);
+  const auto bytes = checked_cast<std::size_t>(layout.total_file_size, "normalized staging overflow");
   std::filesystem::create_directories(staging_directory_);
   detail::StorageReservationPool reservations(staging_directory_, {}, storage_);
   auto owner = std::make_shared<Mapped>(reservations, staging_directory_ / ".normalized-assembly", bytes);
   auto* data = static_cast<std::byte*>(owner->artifact.map_writable());
   if (bytes) {
-   owner->images = {reinterpret_cast<NormalizedImage*>(data + sizeof(NormalizedIndexHeader)), images};
-   owner->boxes = {reinterpret_cast<NormalizedBox*>(data + box_offset), boxes};
-   owner->runs = {reinterpret_cast<RLEPair*>(data + run_offset), runs};
+   owner->images = {reinterpret_cast<NormalizedImage*>(data + layout.image_offset), images};
+   owner->boxes = {reinterpret_cast<NormalizedBox*>(data + layout.box_offset), boxes};
+   owner->runs = {reinterpret_cast<RLEPair*>(data + layout.mask_rle_offset), runs};
   }
   mapped_ = std::move(owner);
  } else {
@@ -1798,22 +1815,17 @@ std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotatio
      kBenchmarkMappingRevision.size() >= NormalizedIndexHeader{}.mapping_revision.size()) {
   throw std::runtime_error("normalized benchmark annotation index identity is invalid");
  }
- const std::uint64_t image_offset = sizeof(NormalizedIndexHeader);
- if (index.images.size() > (std::numeric_limits<std::uint64_t>::max() - image_offset) / sizeof(NormalizedImage)) { throw std::overflow_error("normalized image block size overflow"); }
- const std::uint64_t box_offset = image_offset + static_cast<std::uint64_t>(index.images.size()) * sizeof(NormalizedImage);
- if (index.boxes.size() > (std::numeric_limits<std::uint64_t>::max() - box_offset) / sizeof(NormalizedBox)) { throw std::overflow_error("normalized box block size overflow"); }
- const std::uint64_t mask_rle_offset = box_offset + static_cast<std::uint64_t>(index.boxes.size()) * sizeof(NormalizedBox);
- if (index.mask_rle_pairs.size() > (std::numeric_limits<std::uint64_t>::max() - mask_rle_offset) / sizeof(RLEPair)) { throw std::overflow_error("normalized mask block size overflow"); }
- const std::uint64_t total_size = mask_rle_offset + static_cast<std::uint64_t>(index.mask_rle_pairs.size()) * sizeof(RLEPair);
+ const auto layout = normalized_index_layout(index.images.size(), index.boxes.size(), index.mask_rle_pairs.size());
+ const auto total_size = layout.total_file_size;
  detail::StorageReservationPool destination(path, storage_observer(trace), storage);
  NormalizedIndexHeader header;
  header.source = static_cast<std::uint8_t>(index.source);
  header.image_count = checked_cast<std::uint32_t>(index.images.size(), "normalized image count overflow");
  header.box_count = index.boxes.size();
  header.mask_rle_pair_count = index.mask_rle_pairs.size();
- header.image_offset = image_offset;
- header.box_offset = box_offset;
- header.mask_rle_offset = mask_rle_offset;
+ header.image_offset = layout.image_offset;
+ header.box_offset = layout.box_offset;
+ header.mask_rle_offset = layout.mask_rle_offset;
  header.total_file_size = total_size;
  header.annotation_sha256 = mmltk::common::io::parse_sha256_hex(index.annotation_sha256);
  std::memcpy(header.split.data(), index.split.data(), index.split.size());
@@ -1833,9 +1845,9 @@ std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotatio
   staging = detail::StagedArtifact::create(destination, path, total_size, "normalized annotation index staging");
   staging.preallocate(checked_cast<std::size_t>(total_size, "normalized index size overflow"));
   staging.file().pwrite_all(&header, sizeof(header), 0U);
-  staging.file().pwrite_all(index.images.data(), index.images.size_bytes(), checked_cast<std::size_t>(image_offset, "normalized image offset overflow"));
-  staging.file().pwrite_all(index.boxes.data(), index.boxes.size_bytes(), checked_cast<std::size_t>(box_offset, "normalized box offset overflow"));
-  staging.file().pwrite_all(index.mask_rle_pairs.data(), index.mask_rle_pairs.size_bytes(), checked_cast<std::size_t>(mask_rle_offset, "normalized mask offset overflow"));
+  staging.file().pwrite_all(index.images.data(), index.images.size_bytes(), checked_cast<std::size_t>(layout.image_offset, "normalized image offset overflow"));
+  staging.file().pwrite_all(index.boxes.data(), index.boxes.size_bytes(), checked_cast<std::size_t>(layout.box_offset, "normalized box offset overflow"));
+  staging.file().pwrite_all(index.mask_rle_pairs.data(), index.mask_rle_pairs.size_bytes(), checked_cast<std::size_t>(layout.mask_rle_offset, "normalized mask offset overflow"));
   staging.file().sync_data();
   staging.close();
  }

@@ -527,6 +527,44 @@ void test_benchmark_annotation_indexes() {
  persisted.read(reinterpret_cast<char*>(slots.data()), sizeof(slots));
  REQUIRE(persisted.good());
  CHECK((slots == std::array<std::uint64_t, 6>{101U, 23U, 37U, 41U, 53U, 67U}));
+ std::array<std::uint64_t, 4> layout{};
+ persisted.seekg(36);
+ persisted.read(reinterpret_cast<char*>(layout.data()), sizeof(layout));
+ REQUIRE(persisted.good());
+ CHECK((layout == std::array<std::uint64_t, 4>{256, 320, 448, 448}));
+ persisted.seekg(0);
+ const std::string valid_bytes{std::istreambuf_iterator<char>(persisted), std::istreambuf_iterator<char>()};
+ REQUIRE(valid_bytes.size() == 448);
+ struct InvalidHeader {
+  std::size_t offset, width;
+  std::uint64_t value;
+ };
+ // Field offsets, record extents and values are independent of the production
+ // header/layout implementation. Overflowing corrupt counts remain cache misses.
+ const std::array invalid_headers{
+  InvalidHeader{16, 4, 0}, InvalidHeader{16, 4, UINT32_MAX}, InvalidHeader{20, 8, UINT64_MAX}, InvalidHeader{28, 8, UINT64_MAX},
+  InvalidHeader{20, 8, UINT64_MAX / 64}, InvalidHeader{28, 8, UINT64_MAX / 8}, InvalidHeader{20, 8, 3}, InvalidHeader{28, 8, 1},
+  InvalidHeader{36, 8, 257}, InvalidHeader{44, 8, 321}, InvalidHeader{52, 8, 449}, InvalidHeader{60, 8, 449}, InvalidHeader{13, 1, 1}, InvalidHeader{244, 1, 1}
+ };
+ for (const auto& invalid : invalid_headers) {
+  CAPTURE(invalid.offset, invalid.width, invalid.value);
+  auto bytes = valid_bytes;
+  for (std::size_t i = 0; i < invalid.width; ++i) bytes[invalid.offset + i] = static_cast<char>((invalid.value >> (i * 8)) & 0xffU);
+  write_text(index_path, bytes);
+  CHECK_FALSE(load_normalized_annotation_index(index_path, options.source, options.split, digest, {}));
+ }
+ for (const auto size : {valid_bytes.size() - 1, valid_bytes.size() + 1}) {
+  auto bytes = valid_bytes;
+  bytes.resize(size);
+  write_text(index_path, bytes);
+  CHECK_FALSE(load_normalized_annotation_index(index_path, options.source, options.split, digest, {}));
+ }
+ write_text(index_path, valid_bytes);
+ REQUIRE(load_normalized_annotation_index(index_path, options.source, options.split, digest, {}));
+ const NormalizedAnnotationRowReady capacity_failure = [](const auto&, std::size_t) { throw std::overflow_error("row consumer capacity"); };
+ CHECK_THROWS_AS(load_normalized_annotation_index(index_path, options.source, options.split, digest, {}, {}, nullptr, false, 0, capacity_failure), std::overflow_error);
+ const NormalizedAnnotationRowReady callback_failure = [](const auto&, std::size_t) { throw std::logic_error("row consumer failure"); };
+ CHECK_THROWS_AS(load_normalized_annotation_index(index_path, options.source, options.split, digest, {}, {}, nullptr, false, 0, callback_failure), std::logic_error);
  const nlohmann::json expected_rejections{
   {"raw_records", 101U}, {"unmapped_categories", 23U}, {"unknown_images", 37U}, {"malformed_records", 41U}, {"degenerate_boxes", 53U}, {"duplicate_boxes", 67U}
  };
@@ -8453,6 +8491,34 @@ TEST_CASE("normalized assembly backings preserve identical used records and reta
  CHECK(std::memcmp(products[0].mask_rle_pairs.data(), products[1].mask_rle_pairs.data(), products[0].mask_rle_pairs.size_bytes()) == 0);
  REQUIRE(std::distance(fs::directory_iterator(root.path()), fs::directory_iterator{}) == 1);
  const auto staged = fs::directory_iterator(root.path())->path();
+ {
+  mmltk::testsupport::ScopedTempDir publications("normalized-partial-publications");
+  struct stat staging_inode{};
+  REQUIRE(::stat(staged.c_str(), &staging_inode) == 0);
+  std::array<std::filesystem::path, 2> paths{publications.path() / "vector.bin", publications.path() / "mapped.bin"};
+  for (std::size_t i = 0; i < products.size(); ++i) {
+   bool copied = false;
+   const auto completion = store_normalized_annotation_index(paths[i], products[i], {}, [&](std::string_view event, const nlohmann::json& fields) {
+    if (event != "benchmark.annotations.cache_prepare") return;
+    CHECK_FALSE(fields.at("same_backing").get<bool>());
+    CHECK(fields.at("payload_copy_bytes") == 272);
+    copied = true;
+   });
+   CHECK(copied);
+   CHECK(completion->size == 528);  // 256 + 3 * 32 + 2 * 64 + 6 * 8, excluding unused capacity.
+   struct stat published{};
+   REQUIRE(::stat(paths[i].c_str(), &published) == 0);
+   CHECK(published.st_ino != staging_inode.st_ino);
+   const auto loaded = load_normalized_annotation_index(paths[i], products[i].source, products[i].split, products[i].annotation_sha256, {});
+   REQUIRE(loaded);
+   CHECK(loaded->images.size() == 3);
+   CHECK(loaded->boxes.size() == 2);
+   CHECK(loaded->mask_rle_pairs.size() == 6);
+   CHECK(std::memcmp(loaded->mask_rle_pairs.data(), products[i].mask_rle_pairs.data(), products[i].mask_rle_pairs.size_bytes()) == 0);
+  }
+  CHECK(mmltk::common::io::sha256_file(paths[0]) == mmltk::common::io::sha256_file(paths[1]));
+  CHECK(fs::exists(staged));
+ }
  auto reader = NormalizedAnnotationReadView(products[1]).select_images({1});
  products = {};
  CHECK(fs::exists(staged));
@@ -8569,6 +8635,17 @@ TEST_CASE("normalized assembly handles empty extents and mapped capacity boundar
    REQUIRE_NOTHROW(assembly.begin_image({7}));
    CHECK(assembly.finish().images.front().width == 0);
   }
+ }
+ SECTION("mapped extent overflow fails before storage creation") {
+  constexpr auto maximum = std::numeric_limits<std::size_t>::max();
+  const std::array<std::array<std::size_t, 3>, 6> counts{{
+   {maximum, 0, 0}, {0, maximum, 0}, {0, 0, maximum}, {maximum / 32, 0, 0}, {0, maximum / 64, 0}, {0, 0, maximum / 8}
+  }};
+  for (const auto& count : counts) {
+   CAPTURE(count);
+   CHECK_THROWS_AS(NormalizedAnnotationAssembler({}, count[0], count[1], count[2], {}, root.path()), std::overflow_error);
+  }
+  CHECK(fs::is_empty(root.path()));
  }
  SECTION("cancelled construction leaves no staging payload") {
   std::atomic<bool> cancelled{true};
@@ -12885,7 +12962,18 @@ TEST_CASE("an empty annotation extent is known only while its settlement remains
 }
 TEST_CASE("normalized cache publication transfers one gathered inode and preserves independent destinations", "[benchmark][annotations][cache][resources]") {
  mmltk::testsupport::ScopedTempDir root("normalized-cache-layout");
- const auto input = label_projection_fixture(7);
+ const unsigned shape = GENERATE(0U, 1U, 2U);  // Background, empty mask, nonempty mask.
+ auto input = label_projection_fixture(7);
+ if (shape < 2) {
+  NormalizedAnnotationBuilder builder;
+  builder.images.push_back(input.image(0));
+  builder.images.front().box_count = shape;
+  if (shape) {
+   builder.boxes.push_back(input.storage().boxes.front());
+   builder.boxes.front().mask_rle_pairs = 0;
+  }
+  input = NormalizedAnnotationReadView(seal_normalized_annotations(std::move(builder)));
+ }
  auto metadata = static_cast<const NormalizedAnnotationMetadata&>(input);
  metadata.split = "same-backing";
  metadata.annotation_sha256 = std::string(64, 'a');
@@ -12926,12 +13014,19 @@ TEST_CASE("normalized cache publication transfers one gathered inode and preserv
  CHECK(copied.back() == index.images.size_bytes() + index.boxes.size_bytes() + index.mask_rle_pairs.size_bytes());
  const auto loaded = load_normalized_annotation_index(destination, index.source, index.split, index.annotation_sha256, {});
  REQUIRE(loaded);
- CHECK(std::memcmp(loaded->mask_rle_pairs.data(), input.storage().mask_rle_pairs.data(), input.storage().mask_rle_pairs.size_bytes()) == 0);
+ CHECK(loaded->images.size() == 1);
+ CHECK(loaded->boxes.size() == (shape ? 1 : 0));
+ CHECK(loaded->mask_rle_pairs.size() == (shape == 2 ? 3 : 0));
+ if (shape == 2) CHECK(std::memcmp(loaded->mask_rle_pairs.data(), input.storage().mask_rle_pairs.data(), input.storage().mask_rle_pairs.size_bytes()) == 0);
+ std::array<std::uint64_t, 4> layout{};
+ FileHandle::open_readonly(destination.string()).pread_all(layout.data(), sizeof(layout), 36);
+ const std::uint64_t run_offset = shape ? 352 : 288;
+ CHECK((layout == std::array<std::uint64_t, 4>{256, 288, run_offset, run_offset + (shape == 2 ? 24 : 0)}));
  std::atomic<bool> cancelled{true};
  CHECK_THROWS(store_normalized_annotation_index(destination, index, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), trace, &storage));
  REQUIRE(::stat(destination.c_str(), &first) == 0);
  CHECK(first.st_ino == before.st_ino);
- CHECK(index.mask_rle_pairs.back().start == 4);
+ if (shape == 2) CHECK(index.mask_rle_pairs.back().start == 4);
 }
 TEST_CASE("immutable row admission survives identity rebinding and rejects changed mask geometry", "[benchmark][annotations][resources]") {
  const auto input = label_projection_fixture(7);

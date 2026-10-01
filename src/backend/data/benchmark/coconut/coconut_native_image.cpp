@@ -1,7 +1,6 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_annotation_identity.h"
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
-#include "src/common/io/file_digest.h"
-#include <nlohmann/json.hpp>
 #include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <algorithm>
@@ -19,14 +18,6 @@ namespace mmltk::backend::data::benchmark_internal {
 namespace {
 [[noreturn]] void invalid(std::string_view detail) { throw CoconutInputError("COCONut: " + std::string(detail)); }
 }  // namespace
-std::string coconut_image_input_identity(std::string_view annotations, const CoconutPhysicalImage& physical, std::string_view originals) {
- const auto material = nlohmann::json{
-  {"domain", "coconut-image-labels-v1"}, {"annotations", annotations},
-  {"physical", {physical.source == CoconutImageNamespace::CocoUnlabeled ? CoconutImageNamespace::CocoTrain : physical.source, physical.image_id}},
-  {"recovery_policy", originals.empty() ? 0 : kCoconutRecoveryPolicy}, {"originals", originals}
- }.dump();
- return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(material.data()), material.size())));
-}
 const CategoryLookup& coconut_categories() {
  static const auto lookup = make_numeric_lookup(coco_category_mappings());
  return lookup;
@@ -125,9 +116,8 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::bind(std::shared_p
  if (source->inventory_.physical == physical) return source;
  auto lineage = std::make_shared<CoconutNativeLineage>(*source->lineage_);
  lineage->component.source = physical.source;
- lineage->index.source =
-  physical.source == CoconutImageNamespace::Objects365V1 || physical.source == CoconutImageNamespace::Objects365V2 ? BenchmarkDatasetSource::kObjects365V2 : BenchmarkDatasetSource::kCoco2017;
- lineage->index.split = "coconut-" + std::to_string(static_cast<unsigned>(lineage->component.edition)) + "-" + std::to_string(static_cast<unsigned>(physical.source));
+ lineage->index.source = coconut_index_source(physical.source);
+ lineage->index.split = coconut_component_split(lineage->component.edition, physical.source);
  auto result = std::shared_ptr<CoconutNativeImage>(new CoconutNativeImage(*source));
  result->lineage_ = std::move(lineage);
  result->image_.source_shard = physical.shard;

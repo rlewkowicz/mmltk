@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/coconut/detail/coconut_annotation_identity.h"
 #include "src/backend/data/detail/staged_artifact.h"
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
@@ -210,12 +211,6 @@ private:
  std::unordered_map<std::uint64_t, NormalizedBox> by_annotation_;
 };
 }  // namespace
-BenchmarkDatasetSource coconut_index_source(CoconutImageNamespace source) {
- return source == CoconutImageNamespace::Objects365V1 || source == CoconutImageNamespace::Objects365V2 ? BenchmarkDatasetSource::kObjects365V2 : BenchmarkDatasetSource::kCoco2017;
-}
-std::string coconut_component_split(CoconutEdition edition, CoconutImageNamespace source) {
- return "coconut-" + std::to_string(static_cast<unsigned>(edition)) + "-" + std::to_string(static_cast<unsigned>(source));
-}
 detail::CompileResources coconut_component_assembly_resources(std::uint64_t images, std::uint64_t recovery_join_boxes) {
  // Layout/slice/cursor capacity survives assembly and inventory I/O. Only one
  // image's recovery join is live; the same descriptor serves each physical close.
