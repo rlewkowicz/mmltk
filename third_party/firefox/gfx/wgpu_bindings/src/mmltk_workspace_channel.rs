@@ -491,7 +491,11 @@ impl Channel {
                 ChannelTerminal::ProtocolFailure => "protocol_failure",
             };
             write!(line,
-                "{{\"event\":\"firefox.workspace.channel_terminal\",\"terminal\":\"{terminal_name}\",\"admitted\":{},\"claimed\":{},\"live\":{},\"released\":{},\"withdrawn\":{}}}",
+                "{{\"event\":\"firefox.workspace.channel_terminal\",\"terminal\":\"{terminal_name}\",\"pid\":{},\"ppid\":{},\"pgid\":{},\"channel_descriptor\":{},\"admitted\":{},\"claimed\":{},\"live\":{},\"released\":{},\"withdrawn\":{}}}",
+                std::process::id(),
+                unsafe { libc::getppid() },
+                unsafe { libc::getpgrp() },
+                self.fd,
                 self.admitted.len(),
                 self.claimed.len(),
                 self.live.len(),

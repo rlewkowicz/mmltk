@@ -60,6 +60,11 @@ RUST = re.compile(
     r"(?P<level>TRACE|DEBUG|INFO|WARN|ERROR)\s+(?P<module>[^\s\]]+)\]\s?(?P<message>.*)$",
     re.DOTALL,
 )
+FATAL = re.compile(r"^fatal: (?P<component>[^:\r\n]{1,128}): (?P<detail>.*)$")
+FATAL_STATUS = re.compile(
+    r"^operation=(?P<operation>[A-Za-z0-9_.-]+) pid=(?P<pid>[0-9]{1,10}) "
+    r"ppid=(?P<ppid>[0-9]{1,10}) pgid=(?P<pgid>[0-9]{1,10}) (?P<context>.*?)status=(?P<status>.*)$"
+)
 VULKAN_HEADER = re.compile(r"^VALIDATION\s+\[(?P<id>[A-Za-z0-9_-]+)(?:\s+\((?P<message_id>0x[0-9a-fA-F]+)\))?\]")
 VULKAN_BODY = re.compile(
     r"^\s*Validation\s+(?P<level>Error|Warning|Info):\s*\[\s*(?P<id>[A-Za-z0-9_-]+)\s*\]",
@@ -124,7 +129,10 @@ INCOMPLETE_STAGES = frozenset(("missing", "unavailable", "blocked", "stalled", "
 FAILED_STAGES = frozenset(("failed", "failure", "error", "aborted", "rejected"))
 AMBIENT_IDS = frozenset(("pid", "tid", "process_id", "thread_id", "device_id", "host_id",
                          "user_id", "test_id", "run_id", "session_id", "parent_process_id",
-                         "native_process_id", "browser_process_id"))
+                         "native_process_id", "browser_process_id", "ppid", "pgid", "process_group_id"))
+FIREFOX_PROCESS_EVENTS = frozenset((
+    "child.spawned", "child.exited", "child.signaled", "stop.term_selected", "stop.kill_selected",
+))
 REFINEMENT_FIELDS = ("sequence", "generation", "slot")
 MAX_TRIAGE_STATES = 256
 MAX_TRIAGE_EVENTS = 64
@@ -583,6 +591,39 @@ def vulkan_process(record):
     return values[0]
 
 
+def exact_process_id(value):
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,9}", value):
+        value = int(value)
+    return value if type(value) is int and 0 < value <= 2**31 - 1 else MISSING
+
+
+def process_identity(record, field):
+    """Project observed Linux identities; never derive a PID from a filename.
+
+    FirefoxProcessOwner's sequence is its child PID, which posix_spawn installs
+    as the process group leader. The native logger PID belongs to the reporter,
+    not that child. No other event's sequence acquires this meaning.
+    """
+    if record.get("@event") in FIREFOX_PROCESS_EVENTS and record.get("@owner") == "firefox_process":
+        if field in ("@process", "@process_group"):
+            return exact_process_id(record.get("sequence"))
+        return MISSING
+    names = {"@process": ("pid", "process_id", "browser_process_id"),
+             "@parent_process": ("ppid", "parent_process_id"),
+             "@process_group": ("pgid", "process_group_id")}[field]
+    observed = [record.get(name) for name in names if record.get(name) is not MISSING]
+    values = [exact_process_id(value) for value in observed]
+    if not values or any(value is MISSING for value in values) or len(set(values)) != 1:
+        return MISSING
+    return values[0]
+
+
+def process_evidence(record):
+    event = record.get("@event")
+    return (event == "fatal.report" or event == "firefox.workspace.channel_terminal"
+            or event in FIREFOX_PROCESS_EVENTS and record.get("@owner") == "firefox_process")
+
+
 @dataclass
 class Record:
     source: str
@@ -631,6 +672,8 @@ class Record:
             return surface_identity(self.data)
         if name == "@workspace_source":
             return workspace_source_identity(self.data)
+        if name in ("@process", "@parent_process", "@process_group"):
+            return process_identity(self, name)
         if name == "@intent_request":
             event = self.get("@event")
             if event == "integration.intent":
@@ -879,6 +922,25 @@ def parse_record(source, line, raw, truncated=False):
                 data[key] = int(data[key])
         message = data["message"]
     error = "line exceeds byte limit; text is truncated" if truncated else ""
+    if fatal := FATAL.match(message):
+        data.update({"event": "fatal.report", "level": "fatal", "component": fatal["component"],
+                     "message": message, "detail": fatal["detail"]})
+        if envelope := FATAL_STATUS.match(fatal["detail"]):
+            # Status is opaque original text, including braces or key=value text.
+            # Only the envelope preceding it establishes identity/context facts.
+            for key in ("operation", "status"):
+                data[key] = envelope[key]
+            for key in ("pid", "ppid", "pgid"):
+                data[key] = int(envelope[key])
+            for key, value in KEY_VALUE.findall(envelope["context"].rstrip()):
+                if key not in data:
+                    try:
+                        data[key] = scalar(value, value.startswith(("'", '"')))
+                    except (ValueError, SyntaxError):
+                        data[key] = value
+        elif status := re.search(r" \(status=([^()]*)\)$", fatal["detail"]):
+            data["status"] = status[1]
+        return Record(source, line, clean, data, "fatal", error)
     if (vulkan_error := vulkan_diagnostic(message, data)) is not None:
         return Record(source, line, raw.rstrip("\r\n"), data, log_format, error or vulkan_error)
     transcript = transcript_data(clean)
@@ -2194,6 +2256,14 @@ def auto_facts(record):
         if all(value is not None for value in values):
             identities.append((priority, Identity(run, names, values)))
 
+    if process_evidence(record):
+        for name in ("@process", "@parent_process", "@process_group"):
+            if (value := record.get(name)) is not MISSING:
+                facts[name] = encoded(value)
+        add(0, ("@process",))
+        if parent := facts.get("@parent_process"):
+            add(0, ("@process",), (parent,))
+        add(1, ("@process_group",))
     if isinstance(event, str) and (event == "vulkan.validation" or event in VULKAN_PROVENANCE_EVENTS):
         process = vulkan_process(record)
         if process is not MISSING:
@@ -2237,6 +2307,8 @@ def auto_facts(record):
 
 def auto_event_rank(record):
     event = record.get("@event")
+    if process_evidence(record):
+        return 2
     if not isinstance(event, str) or AUTO_NOISE.search(event):
         return None
     if event in MEMORY_PROVENANCE_EVENTS or event in VULKAN_PROVENANCE_EVENTS:
@@ -2358,6 +2430,21 @@ class AutoCorrelation:
     def link(self, row, facts, priority, identity, index):
         seed = self.seeds[index].record
         original = self.facts[index]
+        if identity.names in (("@process",), ("@process_group",)):
+            if ("@process_group" in facts and "@process_group" in original
+                    and facts["@process_group"] != original["@process_group"]):
+                return None
+            if identity.names == ("@process",):
+                observed = identity.values[0]
+                same_process = facts.get("@process") == original.get("@process") == observed
+                parent_child = (facts.get("@process") == original.get("@parent_process") == observed
+                                or original.get("@process") == facts.get("@parent_process") == observed)
+                if not same_process and not parent_child:
+                    return None
+                relation = "exact recorded process" if same_process else "recorded parent/child relationship"
+            else:
+                relation = "recorded process-group membership; not a crash-cause attribution"
+            return (False, priority, abs(row.line - seed.line) if row.source == seed.source else 2**63, index), identity.label() + " (" + relation + ")"
         # A coarse surface/trace/dataset match must not override contradictory
         # recorded source, frame, publication, allocation, or dataset identities.
         for name in ("domain", "@surface", "@workspace_source", "workspace_allocation", "transfer_sequence", "source_session", "source_instance", "frame",
@@ -3977,6 +4064,7 @@ Fields:
   JSON paths (fields.name), event/trace_id/etc. (unqualified names also look
   inside fields), plus @file, @line, @line_end, @text, @format, @clock, @time_ns,
   @event, @owner, @level, @error, @surface, @intent_request, @parse_error, @test, @tags,
+  @process, @parent_process, @process_group,
   @run, @archive_id, @family, @artifact, @mtime_ns, @context_copy, @part,
   @terminal, @exit_code, @signal, @signal_number, @proximity_ns, @time_link,
   @triage_reason, @triage_payload_truncated, @discovery.
@@ -3990,6 +4078,16 @@ Fields:
   search aid, not a diagnosis. Numeric error=0 metrics do not mark failures.
   child.signaled value=139 decodes to SIGSEGV (11); 143 to SIGTERM (15).
   Signals describe the observed termination, not whether shutdown was intended.
+  fatal: envelopes normalize to fatal.report and level=fatal, retaining original
+  text and status. Structured Firefox envelopes expose operation, PID, PPID, PGID,
+  and available actor/device/submission context; status text never creates identity.
+  @process/@parent_process/@process_group accept exact positive Linux IDs only.
+  Native firefox_process child/stop records project the observed child sequence
+  as PID and spawn-established PGID; zero historical terminal IDs remain unknown.
+  Automatic fatal/channel/process-terminal joins stay within one capture run and
+  distinguish exact process, parent/child, and process-group membership. Shared
+  parent alone does not join siblings. Group membership never attributes a crash
+  cause or says which child supplied a parent's terminal status.
   Bare terms search test/tag/run/signal metadata as well as original text.
   Catch INFO copies retain their original timestamps and are labeled context-copy.
   Memory provenance follows Firefox Vulkan allocation/binding/export, SCM_RIGHTS

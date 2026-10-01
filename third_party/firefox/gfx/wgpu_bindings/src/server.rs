@@ -142,14 +142,24 @@ pub struct Global {
 const DEVICE_POLL_COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 const DEVICE_POLL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(6);
 
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload.downcast_ref::<&str>().copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
 fn abort_device_poll_driver(
+    owner: WebGPUParentPtr,
     device_id: Option<id::DeviceId>,
     submission_index: wgc::SubmissionIndex,
-    detail: &'static str,
+    detail: std::fmt::Arguments<'_>,
 ) -> ! {
-    log::error!(
-        "WebGPU completion driver failure: {detail}; device={device_id:?}, submission={submission_index}"
-    );
+    wgh::vulkan::report_fatal("device_completion", detail, |line| {
+        write!(line, "actor={:p} ", owner.0)?;
+        if let Some(device) = device_id { write!(line, "device={device:?} ")?; }
+        if submission_index != 0 { write!(line, "submission={submission_index} ")?; }
+        Ok(())
+    });
     std::process::abort();
 }
 
@@ -160,6 +170,7 @@ struct DevicePollDriverState {
 }
 
 struct DevicePollDriver {
+    owner: WebGPUParentPtr,
     device_id: id::DeviceId,
     state: Arc<DevicePollDriverState>,
     wake_sender: mpsc::SyncSender<()>,
@@ -168,7 +179,7 @@ struct DevicePollDriver {
 }
 
 impl DevicePollDriver {
-    fn new(global: Arc<wgc::global::Global>, device_id: id::DeviceId) -> Self {
+    fn new(owner: WebGPUParentPtr, global: Arc<wgc::global::Global>, device_id: id::DeviceId) -> Self {
         let state = Arc::new(DevicePollDriverState::default());
         let worker_state = state.clone();
         let (wake_sender, wake_receiver) = mpsc::sync_channel(1);
@@ -180,9 +191,10 @@ impl DevicePollDriver {
                     let submission_index = match worker_state.pending_submission.lock() {
                         Ok(mut pending) => pending.take(),
                         Err(_) => abort_device_poll_driver(
+                            owner,
                             Some(device_id),
                             0,
-                            "completion state mutex was poisoned",
+                            format_args!("completion state mutex was poisoned"),
                         ),
                     };
                     if let Some(submission_index) = submission_index {
@@ -193,21 +205,10 @@ impl DevicePollDriver {
                                 timeout: Some(DEVICE_POLL_COMPLETION_TIMEOUT),
                             },
                         ) {
-                            Err(wgc::device::WaitIdleError::Timeout) => abort_device_poll_driver(
-                                Some(device_id),
-                                submission_index,
-                                "GPU completion deadline expired",
+                            Err(error) => abort_device_poll_driver(
+                                owner, Some(device_id), submission_index,
+                                format_args!("device_poll: {error:?}"),
                             ),
-                            Err(error) => {
-                                log::error!(
-                                    "WebGPU completion driver could not settle submission: device={device_id:?}, submission={submission_index}, error={error:?}"
-                                );
-                                abort_device_poll_driver(
-                                    Some(device_id),
-                                    submission_index,
-                                    "device polling failed",
-                                );
-                            }
                             Ok(_) => {}
                         }
                         continue;
@@ -216,27 +217,30 @@ impl DevicePollDriver {
                     if worker_state.shutdown.load(Ordering::Acquire) {
                         break;
                     }
-                    if wake_receiver.recv().is_err() {
+                    if let Err(error) = wake_receiver.recv() {
                         abort_device_poll_driver(
+                            owner,
                             Some(device_id),
                             0,
-                            "completion wake channel disconnected",
+                            format_args!("completion wake channel: {error:?}"),
                         );
                     }
                 }));
-                if outcome.is_err() {
-                    abort_device_poll_driver(Some(device_id), 0, "completion worker panicked");
+                if let Err(payload) = outcome {
+                    abort_device_poll_driver(owner, Some(device_id), 0, format_args!("completion worker panic: {}", panic_detail(&*payload)));
                 }
                 let _ = finished_sender.try_send(());
             })
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|error| {
                 abort_device_poll_driver(
+                    owner,
                     Some(device_id),
                     0,
-                    "completion worker could not start",
+                    format_args!("completion worker spawn: {error:?}"),
                 );
             });
         Self {
+            owner,
             device_id,
             state,
             wake_sender,
@@ -246,12 +250,14 @@ impl DevicePollDriver {
     }
 
     fn wait_for(&self, submission_index: wgc::SubmissionIndex) {
+        let owner = self.owner;
         let device_id = self.device_id;
         if self.state.shutdown.load(Ordering::Acquire) {
             abort_device_poll_driver(
+                owner,
                 Some(device_id),
                 submission_index,
-                "completion submitted after device shutdown",
+                format_args!("completion submitted after device shutdown"),
             );
         }
         match self.state.pending_submission.lock() {
@@ -260,17 +266,19 @@ impl DevicePollDriver {
                     Some(pending.map_or(submission_index, |current| current.max(submission_index)));
             }
             Err(_) => abort_device_poll_driver(
+                owner,
                 Some(device_id),
                 submission_index,
-                "completion state mutex was poisoned",
+                format_args!("completion state mutex was poisoned"),
             ),
         }
         match self.wake_sender.try_send(()) {
             Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
             Err(mpsc::TrySendError::Disconnected(())) => abort_device_poll_driver(
+                owner,
                 Some(device_id),
                 submission_index,
-                "completion worker exited before accepting work",
+                format_args!("completion wake send: {:?}", mpsc::TrySendError::Disconnected(())),
             ),
         }
     }
@@ -284,6 +292,7 @@ impl DevicePollDriver {
     }
 
     fn join(&mut self) {
+        let owner = self.owner;
         let Some(thread) = self.thread.take() else {
             return;
         };
@@ -293,14 +302,15 @@ impl DevicePollDriver {
         {
             Ok(()) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => abort_device_poll_driver(
+                owner,
                 Some(self.device_id),
                 0,
-                "completion worker did not quiesce during shutdown",
+                format_args!("completion shutdown: {:?}", mpsc::RecvTimeoutError::Timeout),
             ),
             Err(mpsc::RecvTimeoutError::Disconnected) => {}
         }
-        if thread.join().is_err() {
-            abort_device_poll_driver(Some(self.device_id), 0, "completion worker join failed");
+        if let Err(payload) = thread.join() {
+            abort_device_poll_driver(owner, Some(self.device_id), 0, format_args!("completion worker join: {}", panic_detail(&*payload)));
         }
     }
 }
@@ -319,61 +329,69 @@ struct DevicePollWorkersState {
 }
 
 struct DevicePollWorkers {
+    owner: WebGPUParentPtr,
     global: Arc<wgc::global::Global>,
     state: Mutex<DevicePollWorkersState>,
 }
 
 impl DevicePollWorkers {
-    fn new(global: Arc<wgc::global::Global>) -> Self {
+    fn new(owner: WebGPUParentPtr, global: Arc<wgc::global::Global>) -> Self {
         Self {
+            owner,
             global,
             state: Mutex::new(DevicePollWorkersState::default()),
         }
     }
 
     fn wait_for(&self, device_id: id::DeviceId, submission_index: wgc::SubmissionIndex) {
+        let owner = self.owner;
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => abort_device_poll_driver(
+                owner,
                 Some(device_id),
                 submission_index,
-                "completion owner mutex was poisoned",
+                format_args!("completion owner mutex was poisoned"),
             ),
         };
         if state.shutting_down {
             abort_device_poll_driver(
+                owner,
                 Some(device_id),
                 submission_index,
-                "completion submitted after global shutdown",
+                format_args!("completion submitted after global shutdown"),
             );
         }
         state
             .drivers
             .entry(device_id)
-            .or_insert_with(|| DevicePollDriver::new(self.global.clone(), device_id))
+            .or_insert_with(|| DevicePollDriver::new(owner, self.global.clone(), device_id))
             .wait_for(submission_index);
     }
 
     fn stop_device(&self, device_id: id::DeviceId) {
+        let owner = self.owner;
         let driver = match self.state.lock() {
             Ok(mut state) => state.drivers.remove(&device_id),
             Err(_) => {
-                abort_device_poll_driver(Some(device_id), 0, "completion owner mutex was poisoned")
+                abort_device_poll_driver(owner, Some(device_id), 0, format_args!("completion owner mutex was poisoned"))
             }
         };
         drop(driver);
     }
 
     fn shutdown_all(&self) {
+        let owner = self.owner;
         let mut drivers = match self.state.lock() {
             Ok(mut state) => {
                 state.shutting_down = true;
                 std::mem::take(&mut state.drivers)
             }
             Err(_) => abort_device_poll_driver(
+                owner,
                 None,
                 0,
-                "completion owner mutex was poisoned during global shutdown",
+                format_args!("completion owner mutex was poisoned during global shutdown"),
             ),
         };
         for driver in drivers.values() {
@@ -482,7 +500,7 @@ pub extern "C" fn wgpu_server_new(owner: WebGPUParentPtr, render_device: &nsACSt
         },
         None,
     ));
-    let device_poll_workers = DevicePollWorkers::new(global.clone());
+    let device_poll_workers = DevicePollWorkers::new(owner, global.clone());
     let global = Global {
         owner,
         display_pci_bus_id: display_pci_bus_id(render_device),
@@ -2847,12 +2865,15 @@ impl MmltkWorkspaceDispatcher {
         let channel = Arc::new(mmltk_workspace_channel::Connection::connect()?);
         let wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if wake < 0 {
-            log::error!("WebGPU workspace dispatcher could not create its wake eventfd");
+            let error = std::io::Error::last_os_error();
+            wgh::vulkan::report_fatal("workspace_eventfd_create", format_args!("{error:?}"), |line|
+                write!(line, "actor={:p} ", owner.0));
             std::process::abort();
         }
         let wake = unsafe { OwnedFd::from_raw_fd(wake) };
-        let channel_wake = wake.try_clone().unwrap_or_else(|_| {
-            log::error!("WebGPU workspace dispatcher could not clone its wake eventfd");
+        let channel_wake = wake.try_clone().unwrap_or_else(|error| {
+            wgh::vulkan::report_fatal("workspace_eventfd_clone", format_args!("{error:?}"), |line|
+                write!(line, "actor={:p} ", owner.0));
             std::process::abort();
         });
         channel.install_dispatch_wake(channel_wake);
@@ -2872,8 +2893,9 @@ impl MmltkWorkspaceDispatcher {
         let thread = thread::Builder::new()
             .name("WebGPU workspace bridge".into())
             .spawn(move || run_mmltk_workspace_dispatcher(worker))
-            .unwrap_or_else(|_| {
-                log::error!("WebGPU workspace dispatcher could not start");
+            .unwrap_or_else(|error| {
+                wgh::vulkan::report_fatal("workspace_dispatcher_spawn", format_args!("{error:?}"), |line|
+                    write!(line, "actor={:p} ", owner.0));
                 std::process::abort();
             });
         Ok(Self {
@@ -2893,12 +2915,14 @@ impl Drop for MmltkWorkspaceDispatcher {
             .enqueue(MmltkWorkspaceDispatcherCommand::Shutdown { response });
         result
             .recv_timeout(MMLTK_WORKSPACE_DISPATCH_TIMEOUT)
-            .unwrap_or_else(|_| {
-                log::error!("WebGPU workspace dispatcher shutdown timed out");
+            .unwrap_or_else(|error| {
+                wgh::vulkan::report_fatal("workspace_dispatcher_shutdown", format_args!("{error:?}"), |line|
+                    write!(line, "actor={:p} ", self.shared.owner.0));
                 std::process::abort();
             });
-        if thread.join().is_err() {
-            log::error!("WebGPU workspace dispatcher panicked");
+        if let Err(payload) = thread.join() {
+            wgh::vulkan::report_fatal("workspace_dispatcher_join", format_args!("{}", panic_detail(&*payload)), |line|
+                write!(line, "actor={:p} ", self.shared.owner.0));
             std::process::abort();
         }
     }
@@ -3046,7 +3070,9 @@ fn release_mmltk_workspace_mailbox(
 fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
     let epoll = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epoll < 0 {
-        log::error!("WebGPU workspace dispatcher could not create epoll");
+        let error = std::io::Error::last_os_error();
+        wgh::vulkan::report_fatal("workspace_epoll_create", format_args!("{error:?}"), |line|
+            write!(line, "actor={:p} ", shared.owner.0));
         std::process::abort();
     }
     let wake_fd = shared.wake.as_raw_fd();
@@ -3055,7 +3081,9 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
         u64: wake_fd as u64,
     };
     if unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_ADD, wake_fd, &mut wake_event) } != 0 {
-        log::error!("WebGPU workspace dispatcher could not register its wake eventfd");
+        let error = std::io::Error::last_os_error();
+        wgh::vulkan::report_fatal("workspace_epoll_register", format_args!("{error:?}"), |line|
+            write!(line, "actor={:p} ", shared.owner.0));
         std::process::abort();
     }
     let mut channel = None;
@@ -3069,10 +3097,12 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
             libc::epoll_wait(epoll, events.as_mut_ptr(), events.len() as libc::c_int, -1)
         };
         if ready < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            log::error!("WebGPU workspace dispatcher lost epoll");
+            wgh::vulkan::report_fatal("workspace_epoll_wait", format_args!("{error:?}"), |line|
+                write!(line, "actor={:p} ", shared.owner.0));
             std::process::abort();
         }
         let mut retired_blits = Vec::new();
@@ -3095,7 +3125,8 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                     .commands
                     .lock()
                     .unwrap_or_else(|_| {
-                        log::error!("WebGPU workspace dispatcher command queue was poisoned");
+                        wgh::vulkan::report_fatal("workspace_dispatcher_commands", format_args!("PoisonError"), |line|
+                            write!(line, "actor={:p} ", shared.owner.0));
                         std::process::abort();
                     })
                     .drain(..)
@@ -3106,7 +3137,7 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                             let accepted = arena.binding.active.load(Ordering::Acquire) && !arenas.contains_key(&arena.surface_id);
                             drop(entries);
                             drop(arenas);
-                            let initialized = accepted && Global::initialize_mmltk_workspace_arena(&arena).is_ok()
+                            let initialized = accepted && Global::initialize_mmltk_workspace_arena(shared.owner, &arena).is_ok()
                                 && arena.binding.active.load(Ordering::Acquire);
                             arenas = shared.arenas.lock().unwrap();
                             entries = shared.entries.lock().unwrap();
@@ -3978,6 +4009,8 @@ impl Drop for MmltkWorkspacePixels {
 }
 
 struct MmltkWorkspaceBlit {
+    owner: WebGPUParentPtr,
+    device_id: id::DeviceId,
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
@@ -4270,6 +4303,7 @@ impl MmltkWorkspaceBlit {
             wgh::vulkan::submit_external_commands_and_wait(
                 &self.device, self.queue, &self.queue_gate, &buffers,
                 MMLTK_WORKSPACE_QUEUE_TIMEOUT_NS,
+                |line| write!(line, "actor={:p} device={:?} ", self.owner.0, self.device_id),
             )
         }
     }
@@ -4283,12 +4317,8 @@ impl MmltkWorkspaceBlit {
         // Retirement shares the HAL queue gate with submit/present/idle. It
         // releases one final producer-owned frame without touching the page
         // destination, deactivates the registration, and waits for its release.
-        if self
-            .submission()
-            .retire(MMLTK_WORKSPACE_QUEUE_TIMEOUT_NS)
-            .is_err()
-        {
-            log::error!("WebGPU workspace mirror could not retire safely");
+        if self.submission().retire(MMLTK_WORKSPACE_QUEUE_TIMEOUT_NS, |line|
+            write!(line, "actor={:p} device={:?} ", self.owner.0, self.device_id)).is_err() {
             // The destination remains page-owned and may be destroyed as soon
             // as this Drop returns. Continuing after a failed queue/release
             // fence would therefore permit an in-flight raw command buffer to
@@ -4525,7 +4555,7 @@ impl Global {
         Ok((image, packet))
     }
 
-    fn initialize_mmltk_workspace_arena(arena: &MmltkWorkspaceArena) -> Result<(), vk::Result> {
+    fn initialize_mmltk_workspace_arena(owner: WebGPUParentPtr, arena: &MmltkWorkspaceArena) -> Result<(), vk::Result> {
         if arena.storage.is_none() { return Ok(()); }
         let image = arena.destination;
         let device = &arena.device;
@@ -4553,6 +4583,7 @@ impl Global {
                 wgh::vulkan::submit_external_commands_and_wait(
                     device, arena.queue, &arena.queue_gate, &[command],
                     MMLTK_WORKSPACE_QUEUE_TIMEOUT_NS,
+                    |line| write!(line, "actor={:p} device={:?} ", owner.0, arena.device_id),
                 )
             }
         })();
@@ -4746,6 +4777,8 @@ impl Global {
                 }
             } else { None };
             Some(MmltkWorkspaceBlit {
+                owner: self.owner,
+                device_id: arena.device_id,
                 _reservation: reservation,
                 device: device.clone(),
                 queue: hal_device.raw_queue(),
@@ -6306,8 +6339,19 @@ pub struct SubmittedWorkDoneClosure {
     pub user_data: *mut u8,
 }
 
+struct CanvasSignalContext {
+    owner: WebGPUParentPtr,
+    queue_id: id::QueueId,
+}
+
+impl std::fmt::Display for CanvasSignalContext {
+    fn fmt(&self, line: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(line, "actor={:p} queue={:?} ", self.owner.0, self.queue_id)
+    }
+}
+
 pub struct VkSemaphoreHandle {
-    semaphore: wgh::vulkan::ExternalSignalSemaphore,
+    semaphore: wgh::vulkan::ExternalSignalSemaphore<CanvasSignalContext>,
 }
 
 #[no_mangle]
@@ -6342,6 +6386,7 @@ pub extern "C" fn wgpu_vksemaphore_create_signal_semaphore(
         VkSemaphoreHandle {
             semaphore: hal_queue.own_signal_semaphore(
                 semaphore, None, MMLTK_WORKSPACE_QUEUE_TIMEOUT_NS,
+                CanvasSignalContext { owner: global.owner, queue_id },
             ),
         }
     };

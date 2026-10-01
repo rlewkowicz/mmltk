@@ -68,6 +68,67 @@ use crate::vulkan::semaphore_list::{SemaphoreListMode, SemaphoreType};
 
 const MAX_TOTAL_ATTACHMENTS: usize = crate::MAX_COLOR_ATTACHMENTS * 2 + 1;
 
+/// Bounded ordinary fatal reporting, independent of the Gecko/log logger. This
+/// is not a signal handler. Context contains only identities known by the caller;
+/// status keeps the original OS, wgpu, or Vulkan error instead of a mapped cause.
+pub fn report_fatal(
+    operation: &str,
+    status: fmt::Arguments<'_>,
+    context: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
+) {
+    use core::fmt::Write;
+
+    struct Line {
+        bytes: [u8; 2048],
+        len: usize,
+        truncated: bool,
+    }
+    impl fmt::Write for Line {
+        fn write_str(&mut self, value: &str) -> fmt::Result {
+            for character in value.chars() {
+                let character = if character.is_control() { ' ' } else { character };
+                let mut encoded = [0; 4];
+                let bytes = character.encode_utf8(&mut encoded).as_bytes();
+                // Reserve a truncation marker and the terminating newline.
+                if self.len + bytes.len() > self.bytes.len() - 4 {
+                    self.truncated = true;
+                    return Err(fmt::Error);
+                }
+                self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+                self.len += bytes.len();
+            }
+            Ok(())
+        }
+    }
+
+    let saved_errno = unsafe { *libc::__errno_location() };
+    let mut line = Line { bytes: [0; 2048], len: 0, truncated: false };
+    let _ = write!(line, "fatal: firefox.webgpu: operation={operation} pid={} ppid={} pgid={} ",
+        unsafe { libc::getpid() }, unsafe { libc::getppid() }, unsafe { libc::getpgrp() });
+    let _ = context(&mut line);
+    let _ = write!(line, "status={status}");
+    if line.truncated {
+        line.bytes[line.len..line.len + 3].copy_from_slice(b"...");
+        line.len += 3;
+    }
+    line.bytes[line.len] = b'\n';
+    line.len += 1;
+    // One pipe-atomic-sized write in the ordinary case. A failed stderr never
+    // panics or changes the fatal path; retries and partial writes are bounded.
+    let mut offset = 0;
+    for _ in 0..8 {
+        let written = unsafe { libc::write(libc::STDERR_FILENO,
+            line.bytes.as_ptr().add(offset).cast(), line.len - offset) };
+        if written > 0 {
+            offset += written as usize;
+            if offset == line.len { break; }
+        } else if written == 0 || unsafe { *libc::__errno_location() } != libc::EINTR {
+            break;
+        }
+    }
+    unsafe { *libc::__errno_location() = saved_errno };
+}
+
 #[derive(Clone, Debug)]
 pub struct Api;
 
@@ -788,18 +849,41 @@ impl ExternalTimelineQueueSubmission {
 
     /// Serializes retirement with every queue operation. Retirement uses only
     /// the release command, so cancellation and shutdown cannot overwrite the
-    /// last frame whose identity reached the page.
-    pub fn retire(&self, timeout_ns: u64) -> Result<(), vk::Result> {
-        {
-            let _queue_operation = self.device.queue_operation_gate.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !self.active.load(Ordering::Acquire) { return Ok(()); }
-            self.destination_attached.store(false, Ordering::Release);
-            let ready = self.acquired_ready.load(Ordering::Acquire);
-            if ready != 0 { self.submit_acquired_locked(ready, &[self.release_command_buffer], true)?; }
-            self.active.store(false, Ordering::Release);
+    /// last frame whose identity reached the page. A failure is reported once
+    /// with its physical release identity; the caller must terminate instead
+    /// of continuing destructive cleanup without completion proof.
+    pub fn retire(
+        &self, timeout_ns: u64,
+        fatal_context: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
+    ) -> Result<(), vk::Result> {
+        let result = (|| {
+            {
+                let _queue_operation = self.device.queue_operation_gate.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !self.active.load(Ordering::Acquire) { return Ok(()); }
+                self.destination_attached.store(false, Ordering::Release);
+                let ready = self.acquired_ready.load(Ordering::Acquire);
+                if ready != 0 {
+                    self.submit_acquired_locked(ready, &[self.release_command_buffer], true)
+                        .map_err(|error| ("workspace_retire_submit", error))?;
+                }
+                self.active.store(false, Ordering::Release);
+            }
+            self.wait_for_submitted_release(timeout_ns)
+                .map_err(|error| ("workspace_retire_wait", error))
+        })();
+        if let Err((operation, error)) = result {
+            report_fatal(operation, format_args!("{error:?}"), |line| {
+                fatal_context(line)?;
+                write!(line, "vk_device={:?} vk_queue={:?} vk_semaphore={:?} ",
+                    self.device.raw.handle(), self.device.raw_queue, self.timeline)?;
+                let release = self.submitted_release.load(Ordering::Acquire);
+                if release != 0 { write!(line, "timeline_submitted_release={release} ")?; }
+                Ok(())
+            });
+            return Err(error);
         }
-        self.wait_for_submitted_release(timeout_ns)
+        Ok(())
     }
 
 }
@@ -1056,14 +1140,15 @@ pub struct Queue {
 /// An externally exported signal and its physical device custody. The owner may
 /// outlive the WebGPU queue registry, but not the completion of its submitted
 /// signal. Dropping a signal that has not yet been submitted cancels it.
-pub struct ExternalSignalSemaphore {
+pub struct ExternalSignalSemaphore<C: fmt::Display> {
     raw: vk::Semaphore,
     device: Arc<DeviceShared>,
     pending: Arc<Mutex<SemaphoreList>>,
     timeout_ns: u64,
+    fatal_context: C,
 }
 
-impl fmt::Debug for ExternalSignalSemaphore {
+impl<C: fmt::Display> fmt::Debug for ExternalSignalSemaphore<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExternalSignalSemaphore")
             .field("raw", &self.raw)
@@ -1071,13 +1156,13 @@ impl fmt::Debug for ExternalSignalSemaphore {
     }
 }
 
-impl ExternalSignalSemaphore {
+impl<C: fmt::Display> ExternalSignalSemaphore<C> {
     pub fn as_raw(&self) -> vk::Semaphore {
         self.raw
     }
 }
 
-impl Drop for ExternalSignalSemaphore {
+impl<C: fmt::Display> Drop for ExternalSignalSemaphore<C> {
     fn drop(&mut self) {
         // Submit takes the queue gate before draining the pending list. Release
         // the list lock before taking that gate, preserving the same ordering.
@@ -1087,11 +1172,15 @@ impl Drop for ExternalSignalSemaphore {
                 submit_external_commands_and_wait(
                     &self.device.raw, self.device.raw_queue,
                     &self.device.queue_operation_gate, &[], self.timeout_ns,
+                    |line| write!(line, "{}vk_semaphore={:?} ", self.fatal_context, self.raw),
                 )
             };
-            if result.is_err() {
+            if let Err(error) = result {
                 // No completion proof: destroying a possibly submitted signal
                 // would be unsafe, even if its WebGPU registry entry is gone.
+                report_fatal("external_signal_retire", format_args!("{error:?}"), |line|
+                    write!(line, "{}vk_device={:?} vk_queue={:?} vk_semaphore={:?} ",
+                        self.fatal_context, self.device.raw.handle(), self.device.raw_queue, self.raw));
                 std::process::abort();
             }
         }
@@ -1107,12 +1196,15 @@ impl Drop for ExternalSignalSemaphore {
 ///
 /// The device and queue must be live, `queue_gate` must serialize every operation
 /// on this queue, and command buffers and their resources must remain valid.
+/// `fatal_context` formats caller-owned identity only after a terminal wait
+/// failure; successful and recoverable pre-submission paths do not invoke it.
 pub unsafe fn submit_external_commands_and_wait(
     device: &ash::Device,
     queue: vk::Queue,
     queue_gate: &Arc<std::sync::Mutex<()>>,
     command_buffers: &[vk::CommandBuffer],
     timeout_ns: u64,
+    fatal_context: impl FnOnce(&mut dyn fmt::Write) -> fmt::Result,
 ) -> Result<(), vk::Result> {
     let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
     let submission = [vk::SubmitInfo::default().command_buffers(command_buffers)];
@@ -1125,8 +1217,12 @@ pub unsafe fn submit_external_commands_and_wait(
         unsafe { device.destroy_fence(fence, None) };
         return Err(error);
     }
-    if unsafe { device.wait_for_fences(&[fence], true, timeout_ns) }.is_err() {
-        log::error!("External queue boundary did not complete within the safety deadline");
+    if let Err(error) = unsafe { device.wait_for_fences(&[fence], true, timeout_ns) } {
+        report_fatal("external_queue_wait", format_args!("{error:?}"), |line| {
+            fatal_context(line)?;
+            write!(line, "vk_device={:?} vk_queue={queue:?} vk_fence={fence:?} timeout_ns={timeout_ns} ",
+                device.handle())
+        });
         std::process::abort();
     }
     unsafe { device.destroy_fence(fence, None) };
@@ -2004,14 +2100,16 @@ impl Queue {
     }
 
     /// Take ownership of an external semaphore and signal it on the next submit.
+    /// Caller identity is retained without formatting and used only on a fatal path.
     ///
     /// # Safety
     ///
     /// `semaphore` must belong to this device. The returned owner is its sole
     /// Vulkan owner; callers must not submit other operations using this handle.
-    pub unsafe fn own_signal_semaphore(
+    pub unsafe fn own_signal_semaphore<C: fmt::Display>(
         &self, semaphore: vk::Semaphore, semaphore_value: Option<u64>, timeout_ns: u64,
-    ) -> ExternalSignalSemaphore {
+        fatal_context: C,
+    ) -> ExternalSignalSemaphore<C> {
         let mut guard = self.signal_semaphores.lock();
         if let Some(value) = semaphore_value {
             guard.push_signal(SemaphoreType::Timeline(semaphore, value));
@@ -2023,6 +2121,7 @@ impl Queue {
             device: Arc::clone(&self.device),
             pending: Arc::clone(&self.signal_semaphores),
             timeout_ns,
+            fatal_context,
         }
     }
 

@@ -431,7 +431,7 @@ private:
    publish_infrastructure_failure(failure);
    return;
   }
-  publish_terminal(child.si_code == CLD_EXITED ? FirefoxProcessTerminal::Exited : FirefoxProcessTerminal::Signaled, child.si_code == CLD_EXITED ? child.si_status : 128 + child.si_status);
+  publish_terminal(child.si_code == CLD_EXITED ? FirefoxProcessTerminal::Exited : FirefoxProcessTerminal::Signaled, child.si_code == CLD_EXITED ? child.si_status : 128 + child.si_status, child.si_pid);
  }
  void settle_failure(const std::string_view event, const int error, const int cause = 0) noexcept {
   trace(event, static_cast<std::uint64_t>(static_cast<std::uint32_t>(error)));
@@ -459,7 +459,7 @@ private:
   }
   observations_.publish({.kind = FirefoxPhysicalObservationKind::InfrastructureFailure, .process = published});
  }
- void publish_terminal(FirefoxProcessTerminal terminal, int status) noexcept {
+ void publish_terminal(FirefoxProcessTerminal terminal, int status, pid_t process) noexcept {
   FirefoxProcessLifecycle published;
   {
    std::scoped_lock lock{mutex_};
@@ -470,7 +470,7 @@ private:
    stop_fd_.reset();
    timer_fd_.reset();
   }
-  trace(terminal == FirefoxProcessTerminal::Exited ? "child.exited" : "child.signaled", static_cast<std::uint64_t>(static_cast<std::uint32_t>(status)));
+  trace(terminal == FirefoxProcessTerminal::Exited ? "child.exited" : "child.signaled", static_cast<std::uint64_t>(static_cast<std::uint32_t>(status)), process);
   observations_.publish({.kind = FirefoxPhysicalObservationKind::ProcessTerminal, .process = published});
  }
  [[nodiscard]] bool valid_launch_inputs() const noexcept {
@@ -501,10 +501,9 @@ private:
   std::error_code error;
   if (mmltk::common::io::remove_tree_no_follow(profile_, error) && !error) profile_.clear();
  }
- void trace(std::string_view event, std::uint64_t value = 0U) const noexcept {
+ void trace(std::string_view event, std::uint64_t value = 0U, pid_t process = -1) const noexcept {
   if (!diagnostics_.valid()) return;
-  pid_t process = -1;
-  {
+  if (process <= 0) {
    std::scoped_lock lock{mutex_};
    process = custody_.pid();
   }
