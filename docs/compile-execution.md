@@ -28,6 +28,13 @@ retains the source/image join, stable arrival-order slots, selected label
 claims, geometry agreement, and generation-safe withdrawal. Source owners submit
 generic work directly to the shared execution owner.
 
+Benchmark image work keeps a persistent file service separate from label and
+output file operations. For `W` CPU slots, its record capacity is
+`max(2, min(4, 2 × W))`, with `min(2, W)` service threads. The output service
+has `max(4, 2 × W)` records and the same service-thread limit. Both services
+still acquire CPU grants from `CompileExecution`; these limits do not add CPU
+capacity outside the shared budget.
+
 The canonical work classes are Acquisition, Extraction, Annotations, Pixels,
 Gather, and Output. Their task kinds distinguish network/cache work, headers
 and archive/Parquet projection, parsing/normalization/recovery/labels, image
@@ -45,6 +52,14 @@ after bounded tasks. With fewer CPUs than live classes, fair sharing occurs at
 task/chunk boundaries. Feasible work can pass a blocked task, and aged byte
 demands participate in admission so fitting larger work can progress.
 
+The benchmark image pipeline keeps FIFO ready lists for Header, Workspace,
+Input, Output, and Pixels. It rotates between stages after successful admission;
+a denied probe does not consume a turn. Header admission establishes geometry
+and a checked plan. Workspace admission reserves the complete input/conversion
+envelope before retaining it, Input preloads encoded bytes, Output prepares the
+occupied destination, and Pixels converts directly into its disjoint extent.
+These stages can advance alongside source, label, and cache work.
+
 Curl pumps and file-service calls draw CPU grants from the same owner; a service
 grant replaces a compute lane while active. External archive helpers can use
 admitted elastic capacity. Unstarted file records remain selectable by class
@@ -58,6 +73,13 @@ They resume or retire once; they do not retain borrowed lane scratch. Elastic
 lanes do not block on file operations, resource admission, or another task's
 completion. System-owned controllers and the bounded file service own necessary
 waits. Ordinary mapped stores can still incur page faults.
+
+`CompileExecution::Continuation` retains the same bounded scheduler record
+across external preparation without holding a CPU lane. The predecessor's
+completion settles before the successor uses that record; cancellation and
+join retain physical custody until the continuation and its admitted work
+retire. This lets preloaded image input and its workspace survive asynchronous
+file preparation without requiring a second scheduler record.
 
 ## Fixed pinned arenas
 
@@ -100,6 +122,12 @@ retain their admission constraints. Controllable payload allocations use the
 supplied storage; opaque library bookkeeping, including TurboJPEG's coefficient
 and control storage, has a separate checked charge. Directory preserves its STB
 codec policy; benchmark JPEG uses TurboJPEG and benchmark PNG uses STB.
+
+Benchmark preload fills a reusable pinned input slice from the admitted file
+generation. If retained pooled source bytes prevent admission of the complete
+conversion envelope, the pipeline releases that source charge and reopens the
+same admitted inode before reserving the consumer workspace. A path replacement
+cannot substitute a different input generation.
 
 A legal request that cannot fit a normal context enters one exclusive
 exceptional lineage. Unrelated transient borrowers drain while the normal bank

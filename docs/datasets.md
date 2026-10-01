@@ -384,6 +384,11 @@ prepared buffers. Image headers determine actual decode/resize requirements;
 legal oversized work uses the explicit exceptional arena policy. CPU compiler
 arenas use Linux page locking, without a CUDA context requirement.
 
+Their three progress tracks carry canonical native units independently of the
+selected work caption. Directory labels/pixels count images; benchmark row and
+component accounting follows the
+[compilation progress reference](benchmark-datasets.md#reading-compilation-progress).
+
 To measure actual loading rather than inspect metadata:
 
 ```bash

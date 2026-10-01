@@ -129,6 +129,51 @@ The [logging module](../src/common/logging/mmltk_logging.cppm) and
 `report_fatal` is for ordinary terminal boundaries, **not signal handlers**;
 it must not be called from a fatal signal handler.
 
+### Firefox fatal causes and process identity
+
+Unrecoverable Firefox WebGPU, dispatcher, queue, and completion boundaries
+report their original OS, wgpu, or Vulkan cause before aborting, independently
+of diagnostics:
+
+```text
+fatal: firefox.webgpu: operation=<name> pid=<pid> ppid=<ppid> pgid=<pgid> <available context>status=<original error>
+```
+
+The ordinary-boundary reporter uses a 2048-byte stack buffer, UTF-8-safe
+truncation, control-byte replacement, at most eight write attempts, and preserved
+`errno`. Available context identifies the actor, device, queue, semaphore, or
+submission. This reporter is not a signal handler and does not enable tracing.
+
+Unexpected content-channel loss is classified by the surviving `ContentParent`,
+which knows whether shutdown was requested. Its bounded 1024-byte report uses
+component `firefox.ipc`, operation `content_channel_error`, `child_pid`, `actor`,
+`channel=PContentParent`, `side=parent`, and `status=AbnormalShutdown`, with the
+same PID/PPID/PGID envelope. The native
+[FirefoxProcessOwner](../src/controller/services/firefox/firefox_process_owner.cpp)
+classifies the root process's exit or signal and shutdown intent. Child-side EOF
+during a requested root SIGTERM does not by itself establish a fatal cause;
+healthy disabled-diagnostic shutdown stays quiet.
+
+The query parser exposes these lines as `fatal.report` with level `fatal`,
+retaining the original text and opaque status. Only fields before `status=`
+establish structured context; text inside an error cannot manufacture an
+identity. For a selected capture:
+
+```bash
+./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID \
+  -q '@event=fatal.report OR @event=firefox.workspace.channel_terminal OR @owner=firefox_process' \
+  --fields @event,operation,component,@process,@parent_process,@process_group,child_pid,status,@signal,@exit_code \
+  --auto-correlate --format timeline --limit 40
+```
+
+`@process`, `@parent_process`, and `@process_group` admit exact positive Linux
+IDs. Firefox process-owner child/stop records use the observed child PID and
+spawn-established process group; historical zero terminal IDs remain unknown.
+Automatic fatal/channel/process joins remain within one capture run and label
+exact-process, parent/child, and process-group relationships separately. A
+shared parent does not join siblings. Group membership establishes neither a
+crash cause nor which child supplied a parent's terminal status.
+
 ## Local training failures
 
 [TrainProcessClient](../src/controller/services/training/train_process_client.cpp) scans
@@ -323,6 +368,9 @@ artifact names and monotonic timestamps do not join different runs.
 | `benchmark.progress.activity` | Current `activity`, numeric `phase`, and optional numeric `source` |
 | `benchmark.progress.delivery` | Opt-in `produced`, `materialized`, `coalesced`, `delivered`, `pending`, and `high_water` counts from the bounded progress observer |
 | `compile.execution` | Shared class/CPU admission, parked/ready/running records, normal and exceptional pinned storage, active loans, descriptor promises, and completed work |
+| `file.service.started`, `.stopped`, `file.admitted`, `.wait_records`, `.wait_cpu`, `.running`, `.physical_completed`, `.completed` | Bounded file-service records, class grants, physical calls, and callback settlement; `service` distinguishes `image` from `output` |
+| `benchmark.image.stage_started`, `.stage_completed` | `root`, `image_id`, `generation`, `stage` (`header`, `workspace`, `input`, `output`, `pixels`), `workspace_bytes`, `encoded_bytes`, `duration_ns`, and `failed` |
+| `benchmark.pipeline.ready` | Per-stage ready counts, `pending_images`, `image_head_probes`, `image_admitted`, `label_outputs`, `stage_records_blocked`, and `label_file_records_blocked` |
 | `benchmark.download.cache_hit`, `.preseeded` | Retained archive `artifact`, `bytes`, and admission `integrity` |
 | `benchmark.download.progress` | `artifact`, `completed_bytes`, `total_bytes`, `attempt`, `resumed`, `retained_bytes`, `durable_bytes`, and `redownload` |
 | `benchmark.download.segmented_resume_state`, `.partial_checkpoint` | Retained range state or ordinary-transfer checkpoint and resume eligibility |
@@ -333,6 +381,9 @@ artifact names and monotonic timestamps do not join different runs.
 | `benchmark.archive.admission_wait` | Source admission snapshot: `bytes`, `descriptors`, `committed_descriptors`, `descriptor_capacity`, `producer_ceiling`, and `active_cpus`; `reason` is `source_admission` |
 | `benchmark.resource.wait` | First blocked reservation snapshot: requested/held bytes and descriptors, continuation commitments, limits, source location, parent chain, and live owner locations |
 | `benchmark.annotations.originals_wait`, `.originals_begin` | Entry to stock-original lifecycle admission, then admitted work with `recover_dropped_masks` and numeric `validation` |
+| `benchmark.annotations.inputs_wait`, `.inputs_acquired`, `.inputs_reused` | COCONut `release`/`part` input custody: waiting for a new physical lease, acquiring it, or reusing the same still-live lease |
+| `benchmark.coconut.original_subscribed`, `.original_notified` | One physical `source`/original `generation` subscription and its delivery to currently live `rows` |
+| `benchmark.coconut.recovery_observed`, `.recovery_parked`, `.recovery_ready`, `.recovery_settled`, `.recovery_retired` | Row-owned recovery lifecycle with available `image_id`, source ordinal, namespace, and generation context |
 | `benchmark.annotations.release_metadata`, `.release_complete` | COCONut release `edition`, with `cache_hit` when available, at metadata and settled component completion; source-local omissions can leave a healthy subset |
 | `benchmark.annotations.preparation` | COCONut `edition`, preparation `stage`, `completed`, `total` (zero means unknown), and `unit` (`rows` or `archive entries`), independently of normalized-row completion |
 | `benchmark.annotations.progress` | COCONut normalized `completed_rows` and `total_rows` by `edition`, including the first completed row |
@@ -341,13 +392,16 @@ artifact names and monotonic timestamps do not join different runs.
 | `benchmark.annotations.cache_row` | A reused component row published independently: `edition`, physical `source`, `image_id`, and component `position` |
 | `benchmark.annotations.component_admitted` | Reused COCONut component `edition`, physical `source`, and `images` |
 | `benchmark.annotations.assembled`, `.workspace` | Assembled image/box/run counts and retained vector capacities, or a parser lane's `retained_sparse_bytes` |
+| `benchmark.annotations.gather_started`, `.gathered` | Gathered `images`, `boxes`, `runs`, `validated_runs`, and `copied_bytes`; proven immutable rows need no second run-admission scan |
+| `benchmark.annotations.cache_prepare`, `.cache_synced` | Cache destination `path`, `bytes`, and `same_backing`; preparation also reports `payload_copy_bytes` |
 | `benchmark.labels.projection_started`, `.slot_written` | Projection entry with `root`, `image_id`, and retained lane workspace bytes, or successful direct label-slot write with `root` and `image_id` |
 | `benchmark.labels.placed` | COCONut's successful per-image label-slot placement: `split` and `image_id`; this is not a final split seal |
 | `benchmark.images.archive_retry`, `benchmark.pixel_compile.cache_repair` | Bounded image/archive repair context |
 | `benchmark.download.failure_sha256`, `benchmark.images.failure_sha256` | Failure digest and cause for an artifact or image; COCONut annotation repair additionally reports `matches_expected` |
 | `benchmark.pixel_compile.throughput`, `.complete` | Completed/total images where available, `split`, elapsed seconds, images/second, and ETA observations |
 | `benchmark.storage.reserved`, `.projection` | Outstanding physical-growth reservation (`required_bytes`, aggregate `reserved_bytes`, `available_bytes`) or projected output bounds |
-| `benchmark.publication.complete` | Successful final publication facts |
+| `benchmark.compaction.started`, `.completed`, `benchmark.split_sync.started`, `.completed` | Split compaction or physical sync boundaries with `split` and `bytes` |
+| `benchmark.directory_sync.started`, `.completed`, `benchmark.publication.started`, `.complete` | Directory sync and final atomic publication boundaries with `path` or `output` |
 
 For a capture produced by [the GUI example](#capture-one-reproduction):
 
@@ -380,6 +434,9 @@ For a capture produced by [the GUI example](#capture-one-reproduction):
 ./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
   -q '@event=benchmark.archive.image_ready OR @event=benchmark.annotations.cache_row OR @event:benchmark.labels' \
   --where 'image_id=2212' --format jsonl --limit 30
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
+  -q '@event:file. OR @event:benchmark.image.stage OR @event=benchmark.pipeline.ready OR @event:benchmark.annotations.inputs_' \
+  --format jsonl --limit 60
 ```
 
 [Compilation progress](benchmark-datasets.md#reading-compilation-progress) defines
@@ -404,7 +461,9 @@ tracing does not collect this owner inventory.
 
 `compile.execution` uses canonical class order Acquisition, Extraction,
 Annotations, Pixels, Gather, Output for `live`, `baseline`, `ready`, and
-`running`; `parked` uses None, Dependency, Bytes, Descriptors, Cpu, Withdrawal.
+`running`; `parked` uses None, Dependency, Bytes, Descriptors, Cpu, Withdrawal,
+Continuation. Task-indexed arrays use Acquisition, Metadata, Header, Projection,
+Archive, Normalize, Recovery, Labels, Pixels, Gather, CacheWrite, Output.
 `external` and `services` describe grants within the same CPU budget.
 `normal_locked` is fixed normal backing; `resident` adds physically materialized
 exceptional backing, while `leased` counts normal slices currently borrowed.
@@ -414,6 +473,15 @@ exceptional high-water commitment. `opaque_library` is the separate library
 charge. `protected_workspace`, `shared_workspace`, `compaction_workspace`,
 `workspace_contexts`, and `context_capacity` expose the checked preparation.
 `workspace_reuses` and `physical_retirements` are enabled-observer counters.
+
+File records expose class-ordered `queued`, `running`, and `completing` arrays,
+plus `records`, `capacity`, `services`, `busy`, `admitted`, `completed`,
+`operation`, `bytes`, `duration_ns`, `class`, and `failed`. The physical call
+returns its shared CPU grant before its completion callback releases record
+and borrowed-input custody: `file.physical_completed` and `file.completed`
+therefore describe different boundaries. Service capacity and retained
+[continuation ownership](compile-execution.md#owners-and-ready-work) remain
+product facts with tracing disabled.
 
 Source progress facts remain exact while ordinary observations coalesce on the
 [dirty-state drainer](compile-execution.md#progress-delivery). Delivery counts
@@ -552,6 +620,16 @@ selection/acquisition, `draw_encoded`, `draw_submitted`, and terminal
 the actual queue call. Independent draws may settle out of order; their exact
 identities preserve the join. Resource holds and physical timelines govern
 release even with diagnostics disabled.
+
+Canvas semaphore records are separate from workspace image reads:
+`firefox.canvas.signal_created`, `.signal_cancelled`, `.signal_handle_released`,
+`.signal_batch_submitted`, `.signal_submitted`, `.signal_completed`, and
+`.signal_retired`. They carry available `actor`, `queue`, `vk_device`,
+`vk_queue`, `vk_semaphore`, `submission`, `count`, `signal_count`, `batch_count`,
+`queue_submit_calls`, and `age_ns`. Handle release does not prove completion;
+`signal_completed` follows the exact submission fence. A timeline-backed
+`batch_count=2` can still have `queue_submit_calls=1`, as explained in
+[canvas submission custody](gpu-execution.md#browser-canvas-descriptors-and-submission-custody).
 
 `acceptance.physical_inventory` reports these observed facts:
 
@@ -1025,6 +1103,7 @@ Useful metadata includes:
 | `@test`, `@tags`, `@context_copy`, `@part` | Test context, copied INFO, transcript segment |
 | `@run`, `@archive_id`, `@family`, `@artifact` | Capture and artifact grouping |
 | `@terminal`, `@exit_code`, `@signal`, `@signal_number` | Observed terminal status |
+| `@process`, `@parent_process`, `@process_group` | Exact observed Linux process relationships; see [Firefox fatal causes](#firefox-fatal-causes-and-process-identity) |
 | `@parse_error` | Damaged/truncated input |
 | `@proximity_ns`, `@time_link` | Pasted-error proximity and its time-link method |
 | `@triage_reason`, `@triage_payload_truncated`, `@discovery` | Triage inclusion and limits |
@@ -1235,9 +1314,11 @@ The default is `build/validation` without recursive archived captures.
 | `--top` | 5 in triage, 10 otherwise | 1–100 |
 
 Triage follows strong run-qualified surface IDs, typed handles, nonempty
-`*_id`/`*_identity` fields, and source-session composites. Ambient process,
-thread, device, user, and session IDs are excluded unless explicitly selected
-with `--correlate`. Related identities co-occurring on evidence can seed the
+`*_id`/`*_identity` fields, and source-session composites. Fatal/channel/process
+evidence has the bounded [process relationship rules](#firefox-fatal-causes-and-process-identity)
+above. Other ambient process, thread, device, user, and session IDs are excluded
+unless explicitly selected with `--correlate`. Related identities co-occurring
+on evidence can seed the
 next hop. Sequence/generation/slot values only join as nearby multi-field
 composites; they do not start further identity expansion.
 

@@ -171,6 +171,15 @@ full snapshot. Bootstrap and operation replies also carry full state; progress
 does not copy inspection products. Dataset revisions advance for accepted
 compile, changed progress, cancellation request, and terminal settlement.
 
+[DatasetCompileTrack](../src/backend/data/compiler/dataset_compile_progress.h)
+includes its canonical `DatasetCompileUnit` (`Items`, `Bytes`, `Images`, or
+`Rows`), projected into generated Rust with the counters and known-total flag.
+The unit determines presentation; the track's position does not imply bytes or
+images. Native admission still checks enum bounds, completed work against a
+known total, and compatible active/complete state. The
+[progress reference](benchmark-datasets.md#reading-compilation-progress) owns
+row/component accounting, unknown totals, and display rules.
+
 Both native and Rust pending queues replace an older latest-state record by
 appending the newer record after intervening discrete events. Older/equal
 queued revisions are discarded. The
@@ -184,7 +193,7 @@ Reconnect admits current Bootstrap state through the ordinary schema boundary.
 The [compiler observer](compile-execution.md#progress-delivery) coalesces ordinary
 updates before snapshot copying and serialization. Native state revisions are
 product identity; trace sequences and rendering receipts remain diagnostics.
-This declaration change affects the schema fingerprint while retaining protocol
+These declaration changes affect the schema fingerprint while retaining protocol
 17, so native host and generated client must be packaged together.
 
 ## CBOR encoding, limits and decoding

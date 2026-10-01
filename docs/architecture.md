@@ -183,6 +183,8 @@ pinned arena bank and allowances, and the bounded
 admission, normal/exceptional storage, physical completion, and progress delivery.
 [BenchmarkCompilePipeline](../src/backend/data/benchmark/detail/benchmark_pipeline.h)
 retains its source/image join, selected claims, withdrawal, and attempt drain.
+It owns separate bounded image and output file services using the shared CPU
+budget; retained continuations carry image preparation through to conversion.
 Recipes retain membership and recovery policy; Curl owns transport, archives
 retain opened generations, and split writers retain physical placement and
 publication. Pixels and labels advance independently through those joins.
@@ -190,6 +192,9 @@ publication. Pixels and labels advance independently through those joins.
 owns import continuations and retained row/recovery readiness;
 [coconut_annotations.h](../src/backend/data/benchmark/coconut/detail/coconut_annotations.h)
 owns component products and persisted admission.
+[coconut_annotation_identity.h](../src/backend/data/benchmark/coconut/detail/coconut_annotation_identity.h)
+owns shared source/recovery policy, component identities, and metadata used by
+those independent runtime owners.
 [coconut_input.h](../src/backend/data/benchmark/coconut/detail/coconut_input.h)
 owns parsed records, segment backing, import limits, and lexical member admission.
 Reflected inventory facts remain in
@@ -563,14 +568,26 @@ explains their handoffs.
 The Rust browser-image boundary is
 [presentation_surface.rs](../src/frontend/iced/src/presentation_surface.rs)
 and its child modules. Firefox allocation/export and WebGPU/Vulkan integration
-live in the owned [third_party/firefox](../third_party/firefox) tree, including
-`gfx/wgpu_bindings/src/server.rs`. Iced owns view transforms and rendering;
+live in the owned [third_party/firefox](../third_party/firefox) tree.
+`dom/webgpu/ipc/WebGPUParent.cpp` serializes workspace binding changes;
+`gfx/wgpu_bindings/src/server.rs` owns binding generations and dispatcher custody;
+`gfx/wgpu_bindings/src/mmltk_workspace_channel.rs` owns the exclusive channel
+claim. Only an explicitly bound workspace actor acquires that claim; ordinary
+WebGPU actors retain their independent behavior. Iced owns view transforms and rendering;
 its stable graphics binding acquires the latest completed workspace with paired
 image metadata, independently of application snapshot delivery.
 [metadata.rs](../src/frontend/iced/src/presentation_surface/metadata.rs)
 validates that opaque payload against generated native types.
 Physical Vulkan image and semaphore owners retain device custody beyond
 registry and IPC removal.
+Ordinary wgpu texture validation supplies canvas descriptors through HAL and
+DMA-BUF reuse. The existing completion worker retires semaphore custody at the
+actual submission fence; the
+[GPU reference](gpu-execution.md#browser-canvas-descriptors-and-submission-custody)
+owns these mechanics. The
+[fatal-report reference](logging.md#firefox-fatal-causes-and-process-identity)
+distinguishes graphics causes, surviving-parent content-channel failure, and
+native root-process classification.
 The vendored Iced [primitive resource batch](../third_party/iced/wgpu/src/primitive.rs)
 retains sampled resources through the actual encoder's submission or
 abandonment; it carries no application schema or selection policy.

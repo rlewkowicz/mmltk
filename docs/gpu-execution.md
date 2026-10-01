@@ -345,6 +345,40 @@ GPU-to-CPU-to-GPU pixel transfer. A cross-device route without peer access may
 use pinned host staging; explicitly enabled pixel probes also read back small
 GPU samples. These are separate from the same-GPU display path.
 
+### Browser canvas descriptors and submission custody
+
+The compositor canvas uses a separate DMA-BUF path from the native RGBA
+workspace allocations above. Firefox's
+[canvas integration](../third_party/firefox/gfx/wgpu_bindings/src/server.rs)
+retains the ordinary wgpu-validated texture descriptor together with its HAL
+projection. Accepted usage, zero-initialization requirements, and compatible
+view formats reach allocation and import without a second handwritten usage
+mapping. Recycling requires both the same Vulkan device and the same complete
+descriptor.
+
+The canvas path currently accepts `BGRA8Unorm`, two-dimensional textures with
+one layer, one mip, and one sample. Modifier selection intersects compositor
+support with the driver's support for the exact image extent, HAL usage,
+creation flags including `ALIAS`, and view-format list. It requires DMA-BUF
+import and export support and one to three planes. Unsupported capabilities
+produce a controlled API error; allocation errors retain their Vulkan status.
+
+Each canvas handle holds one current signal semaphore and exported FD. An
+unsent signal can be removed from the queue's pending signals. Once Vulkan
+accepts a submission, a separate semaphore reference belongs to that exact
+submission fence. The existing completion worker services the accepted
+submission even while idle or if a later API operation reports an error.
+Dropping or recycling the canvas handle releases its own custody without an
+empty queue submission or a host wait on the dropping thread.
+
+For timeline-backed completion, a second `VkSubmitInfo` signals the completion
+timeline after the canvas signal batch within the same `vkQueueSubmit` call.
+It does not create a second queue call. Physical fence completion releases the
+submission reference; the final owner destroys the semaphore and releases its
+device custody. The fence and device owners do not form a reference cycle.
+Gated [canvas signal events](logging.md#physical-presentation-evidence) expose
+these distinct submission, handle-release, completion, and retirement facts.
+
 ### Display transfer coverage
 
 `ImageWorkspaceDamage` retains 64 content transitions with at most eight

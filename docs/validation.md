@@ -1050,7 +1050,7 @@ behavior independently of rendered UI acceptance:
 
 | Owner | Evidence |
 | --- | --- |
-| [benchmark_dataset.test.cpp](../src/backend/data/tests/benchmark_dataset.test.cpp), `mmltk_backend_data_tests` | Cache-root/output overlap, retained generations, shared CPU/byte/descriptor/storage admission, mixed ordinary/range transport, Open Images continuation, independent pixels/labels, stable slot writes and compaction, cancellation/repair, progress, and lazy diagnostics |
+| [benchmark_dataset.test.cpp](../src/backend/data/tests/benchmark_dataset.test.cpp), `mmltk_backend_data_tests` | Cache-root/output overlap, retained generations and row-admission proofs, shared CPU/byte/descriptor/storage admission, bounded image services and continuations, mixed ordinary/range transport, Open Images continuation, independent pixels/labels/cache work, stable slot writes and compaction, cancellation/repair, native progress units, and lazy diagnostics |
 | [coconut_dataset.test.cpp](../src/backend/data/tests/coconut_dataset.test.cpp), same target | Pinned recipe/validation choices, exact masks and physical/release joins, independent image/annotation acquisition, archive/Parquet continuation, native recovery, source ordinals and incomplete provenance, healthy subsets, Large/XL claim replacement, cache reuse/repair, and atomic publication |
 | [roundtrip.test.cpp](../src/backend/data/tests/roundtrip.test.cpp), same target | Fixed layout/record admission, capacity and measured maxima, malformed/inactive-slot rejection, present-empty masks, Directory output equality across workers, prepared stream reuse, and preservation of published output on failure |
 | [compile_progress.test.cpp](../src/backend/data/tests/compile_progress.test.cpp), same target | Exact counters behind a held observer, dirty deadlines and lifecycle/repair flushes, terminal/failure propagation, preparation budgets, Directory continuations and class floors, annotation/mask meaning, and complete capacity rejection |
@@ -1086,11 +1086,13 @@ causal coverage includes:
 | Boundary | Cases in the data suites |
 | --- | --- |
 | CPU admission | Waiting live-class floors, activation/retirement, fewer-core fairness, blocked-demand bypass/aging, shared Curl/file/external grants, class-aware file dispatch, and cancellation of queued/active borrowers |
+| Image preparation | Dedicated bounded file capacity behind held cache/label output, stable service workers and pinned storage on small CPU plans, stage selection under a hard record bank, retained continuations ahead of later workspace waiters, checked inode preload, and physical cancellation/failure drain before another attempt |
 | Memory and descriptors | Fixed pinning across class/lane reassignment, protected completion windows, one exceptional lineage and retained descendants, Arrow/encoded allocation windows, finite loans including zero-byte offers, nested descriptor commitments, low limits, and physical release before reacquisition |
 | Filesystem growth | Shared destination-filesystem reservations, sparse occupied allocation outside source locks, physical output leases, immutable staging blocks, source-safe same-inode compaction, staged publication, and exception cleanup |
 | Transport | Contended artifact locks, whole files alongside stored ranges, one-connection resume, rejected validators/coverage, durable out-of-order checkpoints, redirects, fair Curl admission, Open Images retries, and channel cancellation |
 | Archives and Parquet | Requested members before unused tails, consumed checksum/truncation errors, raw/ZIP/sparse/gzip continuation, bounded gzip dictionaries/controls, retained Parquet rows/batches, independent groups, and pressure-driven reader retirement |
-| Immutable products | Mapped indexes/images across path replacement, independent original split publication/withdrawal, retained native support through repair, full-backing component dependencies, and cached groups that omit payload projections |
+| Immutable products | Mapped indexes/images across path replacement, exact row-admission proof reuse and geometry rejection, same-inode cache publication with independent destinations, independent original split publication/withdrawal, retained native support through repair, full-backing component dependencies, and cached groups that omit payload projections |
+| Readiness and source custody | Per-row physical registrations, namespace/generation original subscriptions, already-delivered generations and retired-row withdrawal, EOF descriptor/continuation release, and cache preparation reusing a controller/sibling's live source lease |
 | Final labels | Labels before JPEG arrival and pixels before annotations, per-image geometry admission, canonical ordinal settlement/backpatches, explicit incomplete provenance across cache reuse and later repair, Large-over-XL claim restoration, present-empty masks, and validation progress during held training |
 | Healthy subsets | Partially valid labels, true backgrounds, rejected/unlisted physical holes, unreadable annotation artifacts and pixels, bounded repair, contradictory geometry, empty required splits, and preservation of old publication on fatal failure |
 | Fixed storage | 64-slot boundaries, checked extents, 500,000-byte payload overflow, eligible-only maxima including zero, cancellation/fault preservation, unified label/pixel read preparation, bounded prefault/gather continuations, repeated logical draws, and prepared capacities through epoch changes |
@@ -1102,7 +1104,11 @@ peak process memory, or live-download duration. Resource targets are described
 in [shared compilation execution](compile-execution.md).
 Progress cases retain one artifact/release contribution across interleaving,
 repair, and preparation replacement, with explicit withdrawals instead of
-counting repeated attempts as completed work.
+counting repeated attempts as completed work. Mixed known B and unknown
+Large/XL row extents remain unknown while independent pixels advance; component
+completion leaves row counts unchanged. Settlement, invalidation, and known
+empty extents preserve strict Dataset-system admission and generated unit
+formatting.
 They also preserve the latest artifact transfer independently of source totals,
 clear it on changed activity/completion, and retain the CLI's detailed status.
 
@@ -1128,9 +1134,50 @@ proves rendering, input, cancellation/restart, and native caption agreement;
 these claims. Trace/serialization suites cover timestamps, effect-only delivery
 failure, Unicode scalars, and malformed wire-text rejection.
 
+### Firefox and benchmark pipeline validation record
+
+The completed implementation and validation are recorded at `87a0d2b1`.
+The local [validation ledger](../build/validation/firefox-benchmark-validation.json)
+retains both full tidy stages, fresh C++/frontend cleanup results, builds,
+focused remediation, and final suite results. The cleanup checkpoints are
+`464b4b6c` (`pre cleanup`) and `10f3cdd4` (`post cleanup`). The final runtime image
+is `sha256:63660f31e205ff07335861d7922b3fb9fffe12d0b9b9d4c1b661b9e17c710308`.
+
+| Final required operation | Transcript and result |
+| --- | --- |
+| `./mmltk --build`, after remediation | [mmltk-build-20261001-161418-1078382.log](../build/logs/mmltk-build-20261001-161418-1078382.log), exit 0 |
+| `./mmltk --test all` | [mmltk-test-20261001-162542-1107674.log](../build/logs/mmltk-test-20261001-162542-1107674.log), exit 0; 480 dataset cases passed with 399,183 assertions, nine GDR-dependent native skips across the suites, and one existing ignored Rust case |
+| Subsequent `./mmltk --test workspace-wayland --headless-compositor` | [mmltk-test-20261001-165121-1164919.log](../build/logs/mmltk-test-20261001-165121-1164919.log), exit 0; 88 cases passed, one GDR-dependent skip, 148,715 assertions |
+
+These are local ignored artifacts, absent from a fresh checkout. The
+[log query](logging.md#wrapper-build-test-and-tidy-transcripts) exposes terminal
+and suite summaries without rerunning validation.
+
+The reported production configuration was COCONut, Stock validation, mask
+recovery enabled, Stretch, and perceptual downscaling. Its observation of
+Labels/masks `241596/241605` and Pixels `16177/unknown` ended with
+`dataset compiler returned invalid progress in its current state`. Source and
+controlled cases established mixed row/component accounting and premature
+known-total aggregation; the compiler now reports canonical units and exact row
+ledgers while retaining strict progress rejection. Separate controlled source
+custody evidence established cache preparation waiting on a still-live lease
+held by its own controller/sibling; the correction reuses that exact lease.
+The fixture with the same configuration also proves ready physical-archive
+pixels can complete while a peer download remains held. No supplied production
+trace establishes sustained throughput, a measured speedup, or every cause of
+the production wait.
+
+Firefox coverage remains in the existing first-party suites and packaged
+application acceptance. The complete Wayland pass covers direct/copy workspace
+integration, retained content, resizing, recovery, quiet execution, and shutdown.
+It does not individually exercise every actor collision or binding ordering,
+descriptor/capability rejection, Vulkan fatal branch, or idle semaphore-retirement
+branch. GDR-dependent skips remain unverified hardware coverage. No Firefox-owned
+test suite or dedicated Firefox harness was run for this validation.
+
 ### Adaptive compilation validation record
 
-The current execution/progress cutover finished at implementation commit
+The earlier execution/progress cutover finished at implementation commit
 `7f2c12b9`. Its local
 [validation ledger](../build/validation/adaptive-execution-state.txt) records
 the complete stage history: first full tidy and initial build, `pre cleanup`

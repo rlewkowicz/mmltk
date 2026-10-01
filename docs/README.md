@@ -24,7 +24,7 @@
   local macros/aliases, structural projection, and safe mechanical formatting.
 - [Generated Rust and application CBOR](application-wire.md): canonical native
   schema, generator ownership and consumption, record representations,
-  revisioned Dataset progress, encoding/decoding limits, compatibility,
+  revisioned Dataset progress and native units, encoding/decoding limits, compatibility,
   session admission, and failures.
 - [GUI interaction and presentation](gui-interaction.md): layout and controls,
   session Status, retained editing/charts/viewers, input ordering,
@@ -41,28 +41,30 @@
   perceptual downscaling, loading/leases, and Explore cache residency.
 - [Compilation execution and working storage](compile-execution.md): shared
   Directory/benchmark ownership, live-class CPU floors and elastic work,
-  fixed pinned arenas, exceptional inputs, file preparation/completion,
+  fixed pinned arenas, exceptional inputs, bounded image/file services and
+  retained continuations, file preparation/completion,
   physical-growth promises, and bounded progress delivery.
 - [Built-in benchmark datasets](benchmark-datasets.md): recipe membership,
   native import/provenance, optional mask recovery, persistent cache/repair,
   recipe readiness, archive and Parquet continuation,
-  immutable image/annotation custody, healthy subsets and incomplete provenance,
-  progress units, and capacity limits.
+  immutable row-admission and cache custody, healthy subsets and incomplete
+  provenance, row/component progress accounting, and capacity limits.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA selection,
   transfers, runtime retirement, inference lanes, readbacks, Vulkan/CUDA import,
-  sparse display damage, Upscale preparation, and capability inspection.
+  canvas descriptor/submission custody, sparse display damage, Upscale
+  preparation, and capability inspection.
 
 ## Engineering, validation, and operations
 
 - [Validation](validation.md): required gates, suite/filter selection, tidy,
   test-run replacement, PCH include audits, cleanup and raw-review tooling,
   declaration formatting, symbol/address and GPU diagnostics, evidence ownership,
-  rendered acceptance, numerical coverage, compilation continuation records,
+  rendered acceptance, numerical coverage, Firefox/benchmark validation records,
   historical fixed-storage measurements, fixtures, and evidence limits.
 - [Headless Wayland](headless-wayland.md): private NVIDIA Weston setup, input
   seat, readiness, deadlines, shutdown, artifacts, and limitations.
 - [Logging](logging.md): automatic build/test/tidy transcripts, opt-in runtime
-  diagnostics, fatal stderr, acceptance evidence formats, capture/history
+  diagnostics, fatal causes and process identity, acceptance evidence formats, capture/history
   selection, queries, correlation, triage, and output limits.
 - [Planned work](roadmap.md): future directions, distinct from current capability.
 

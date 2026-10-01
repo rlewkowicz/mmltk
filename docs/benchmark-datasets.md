@@ -260,6 +260,13 @@ Native products unrelated to deferred original-mask recovery remain runnable.
 Large-over-XL reconciliation settles the selected labels for duplicate physical
 images; it does not prevent independent pixel conversion.
 
+Each row owns its physical-readiness registration. Observing the snapshot,
+generation, and registration is atomic; retiring the last copy withdraws only
+that observer. Original-mask waits share one subscription per physical namespace
+and original generation, retaining weak row references and a delivery receipt.
+Rows joining a delivered generation can proceed immediately; retiring a row
+removes its wait without disturbing another row or namespace.
+
 Image publications capture source generation, attempt, and mutation custody.
 The compile-only source-family/image-ID join retains one compact per-image
 state and stable slot; duplicate readiness cannot create duplicate pixel work.
@@ -442,17 +449,37 @@ work. Annotation controllers first attempt an existing version-3 release cache
 and otherwise admit independent `.part-<shard>.normalized.bin` products, then
 merge component provenance when those inputs settle. Release and part caches
 remain reusable across cold, warm, and repaired acquisitions. Source archives
-remain retained, and healthy reuse does not hash whole payloads.
+remain reusable on disk, and healthy reuse does not hash whole payloads.
+
+At input EOF, controllers close archive descriptors, return unused continuation
+commitments, and release their strong source lease before joining downstream
+work. Cache preparation first reuses a weakly retained `ArtifactLease` if that
+exact live lease is still held by a controller or sibling. It reacquires the
+physical cache lease only after the previous lease expires, avoiding a wait on
+its own still-live ownership. The gated
+[input-custody events](logging.md#benchmark-compilation-traces) distinguish reuse
+from a new acquisition wait.
 
 Normalized indexes map immutable backing. Header/layout and image extents are
 checked before membership use; boxes and runs are admitted once when full
 annotation consumption is required. Derived read selections retain the full
 source identity and backing instead of copying payloads. Completed builder
 checks and inventory serialization seals are reused by storage/publication.
+An immutable row-admission proof binds the source domain, complete normalized
+image record, exact box/run spans, and their backing. Native staging and cache
+gather reuse that proof; changed geometry, domain, or extents cannot inherit it.
+Persisted untrusted rows still pass their ordinary admission checks.
 The mapping retains the opened inode after its descriptor closes, so atomic
 replacement/unlink can proceed after the path-based readers settle without
 holding an annotation lifecycle lock through downstream label work. Published
 normalized inodes are never truncated or modified in place.
+
+Validation, recovery, and cache-part preparation advance incrementally for ready
+rows. Final membership, provenance, sync, and publication retain their required
+settlement barriers. An eligible unpublished mapped staging inode can be sealed,
+synced, and renamed into its first destination on the same filesystem while
+existing borrowers retain the mapping. An independent destination receives its
+own staged copy; publication never repurposes an already published inode.
 
 After COCONut annotation-import failure, a file matching its pinned SHA-256 is retained.
 Recovery replaces only inputs without a matching pinned checksum. If every
@@ -544,18 +571,25 @@ recovered/unresolved summary. These product/cache facts need no diagnostic log.
 [DatasetCompileTracks](../src/backend/data/compiler/dataset_compile_progress.h) declares
 three independent tracks shared by benchmark and Directory compilation. Each
 has completed work, a known/unknown total, activity, active/completed state, and
-explicit invalidated work. The native declaration also supplies generated Rust;
+explicit invalidated work. Its canonical `DatasetCompileUnit` is `Items`,
+`Bytes`, `Images`, or `Rows`. The native declaration also supplies generated Rust;
 the GUI and CLI format the same typed facts for their respective displays.
 
 | Track | Benchmark units and completion |
 | --- | --- |
 | Acquisition | Artifact bytes transferred or admitted from cache, aggregated once per artifact; completion additionally requires the owning acquisition work to settle |
-| Labels/masks | Normalization work plus completed source/component label plans; COCONut normalization counts full-import rows, while Coco custom uses index/sampling milestones |
+| Labels/masks | COCONut full-import rows (`Rows`), or Coco custom index/sampling milestones (`Items`); completion also requires every selected source/component label plan to settle |
 | Pixels | Successfully compiled physical image slots across train and validation, retaining compatible completed work through preparation retries; final selection settles the eligible population |
 
-Label totals can grow when final plans become known; they are work units, not
-image counts or a time estimate. Explicit COCONut metadata-only imports do not
-count normalization work a second time.
+COCONut's row ledger and component jobs are separate measures. Completing a
+component never adds a job to the row count; the current Labels phase can report
+those jobs separately. A known B release does not make the aggregate row total
+known while Large or XL remains unknown. Settling a release establishes its
+actual extent; invalidating an undeclared settled extent makes the aggregate
+unknown again. Explicit metadata-only imports and concurrent original-index
+jobs do not add rows to this ledger. Native progress validation continues to
+reject completed work above a known total and incompatible active/complete
+states; totals are not enlarged to conceal invalid accounting.
 Source activity reports parsed image/annotation rows and resolved source images.
 XL also reports annotation-archive entries before its first JSON record arrives.
 Independent physical-archive consumers report encountered images and their
@@ -582,8 +616,9 @@ process their eligible pixels. Phase completion follows actual range work.
 observations and compile-scoped artifact/indexing ledgers. An observed artifact
 with an unknown size makes its source and aggregate byte totals unknown; the
 GUI shows `?` and omits a determinate bar for that track. Totals can change as
-new artifacts are observed. At snapshot materialization, unfinished known
-indexing takes priority; afterward the caption selects active Pixels, unfinished
+new artifacts are observed. At snapshot materialization, unfinished indexing,
+including an unknown row total, takes priority; afterward the caption selects
+active Pixels, unfinished
 admitted Labels, or outstanding acquisition. A settled Indexing count therefore
 does not leave that caption over ongoing pixel work. Planning, Compacting,
 Syncing, and Publishing retain their lifecycle boundaries. The selected phase
@@ -617,6 +652,8 @@ The [Dataset progress component](../src/frontend/iced/src/view/train/dataset/pro
 formats byte quantities as KiB, MiB, GiB, or TiB, including byte throughput and
 projected storage. Values at least one KiB use one decimal place; smaller nonzero
 values use three so that one byte remains visible. Zero is `0 KiB`.
+Track formatting follows the native unit: row and image counts carry `rows`
+and `images`, bytes use IEC quantities, and generic items remain grouped counts.
 Counts use comma grouping without converting the integer text through floating
 point. Completed quantities whose total matches appear once; unknown totals
 remain `?`. Directory acquisition consequently reads **No acquisition needed ·
@@ -667,12 +704,20 @@ These formats have independent versions:
 | `benchmark_manifest.json` | Schema 3 compilation facts, including recipe, source identities, recovery selection/counts, mappings, resolution, resize/resampling policy, and cache root |
 
 [benchmark_annotations.cpp](../src/backend/data/benchmark/benchmark_annotations.cpp)
-owns normalized-index layout and staged publication. Its six
+owns normalized-index admission and staged publication. Its private
+`NormalizedIndexLayout` computes the checked version-3 extents used for mapped
+capacity, loading, admission, and publication. Its six
 [AnnotationRejectCounts](../src/backend/data/benchmark/detail/benchmark_annotations.h)
 fields generate both binary and named JSON projections from one declaration.
 Compile-time format guards pin their names, `uint64` types, and declaration
 order. [Cache admission](#persistent-cache-and-publication) covers parsed and
 mapped products and the lifetime of their checked backing.
+
+[coconut_annotation_identity.h](../src/backend/data/benchmark/coconut/detail/coconut_annotation_identity.h)
+and its [implementation](../src/backend/data/benchmark/coconut/coconut_annotation_identity.cpp)
+own the shared annotation/recovery policy, input identities, component metadata,
+and physical-source split mapping. Runtime import, recovery, and cache owners
+consume those facts while retaining their own resource lifetimes.
 
 [coconut_inventory.h](../src/backend/data/benchmark/coconut/detail/coconut_inventory.h) is the
 canonical inventory declaration. The explicit physical-inventory format binds

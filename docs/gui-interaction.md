@@ -784,6 +784,21 @@ borrowing the same stale observation.
 
 ## Native GPU custody and completion
 
+Firefox opens the native workspace channel only for an explicitly bound
+`WebGPUParent` actor. A process-wide exclusive claim prevents another actor
+from attaching to the same channel; ordinary WebGPU actors create no workspace
+dispatcher or channel connection. Bind/unbind operations run on the actor's
+serialized IPC path. Each replacement binding has its own generation, checked
+with device and owner identity before admitting work or accepting an admission
+callback.
+
+Supersession stops new admission from the old binding while its physical reads,
+submissions, and completion callbacks retain their existing obligations. The
+connection claim survives dispatcher retirement until its last physical owner
+releases it; a replacement actor then obtains a fresh connection. Native peer
+loss remains an authoritative connection failure. Logical selection changes
+never establish GPU completion or permit early storage reuse.
+
 Each visual producer owns its raw processing products and display preparation:
 
 | Producer | Raw product and retained work | Display preparation |
@@ -889,6 +904,9 @@ physical source reads, and arena retirement settle independently.
 retain Vulkan device, backing FD, and CUDA context custody through removal,
 partial failure, and completed uses. Browser exit is not a completion receipt;
 terminal rescue never waits for an unavailable peer's timeline.
+The browser's separate canvas path carries its validated texture descriptor
+through DMA-BUF allocation/import/recycling and retains signal semaphores
+through the [actual submission fence](gpu-execution.md#browser-canvas-descriptors-and-submission-custody).
 
 Live's requested rate configures capture and its system-owned consumption
 cadence. Firefox's graphics queue, swapchain, compositor, and Wayland determine
