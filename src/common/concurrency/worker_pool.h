@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <future>
 #include <memory>
@@ -13,6 +14,23 @@
 namespace mmltk::common::concurrency {
 class WorkerPool final {
 public:
+ // Intrusive storage for bounded owners. The pool copies the invocation before
+ // calling it, so a continuation may enqueue the same record at its tail.
+ // Keep the record alive through dispatch and its context through physical return.
+ class BorrowedTask final {
+ public:
+  BorrowedTask(void* context, std::size_t index, void (*call)(void*, std::size_t)) : context_(context), index_(index), call_(call) {}
+  BorrowedTask(const BorrowedTask&) = delete;
+  BorrowedTask& operator=(const BorrowedTask&) = delete;
+ private:
+  friend class WorkerPool;
+  void* context_;
+  std::size_t index_;
+  void (*call_)(void*, std::size_t);
+  BorrowedTask* next_ = nullptr;
+  std::uint64_t sequence_ = 0;
+  bool queued_ = false;
+ };
  WorkerPool(size_t worker_count, std::vector<int> cpu_affinity = {}, std::string thread_name_prefix = "fastworker", std::size_t queued_capacity = 0U,
   const mmltk::common::system::ExecutionPlacement* placement = nullptr, bool storage_worker = true);
  ~WorkerPool();
@@ -30,6 +48,9 @@ public:
  void enqueue_detached(std::function<void()> task);
  // Borrowed records have no type-erasure allocation; owner outlives wait_idle/shutdown.
  void enqueue_borrowed(void* context, std::size_t index, void (*call)(void*, std::size_t));
+ // Shares the ordinary FIFO, failure, and shutdown contract without growing
+ // the task vector or allocating an erased callable. Duplicate admission throws.
+ void enqueue_borrowed(BorrowedTask&);
  template <typename Func>
  auto enqueue(Func&& func) -> std::future<typename std::invoke_result_t<Func>>;
  template <typename Index, typename Func>

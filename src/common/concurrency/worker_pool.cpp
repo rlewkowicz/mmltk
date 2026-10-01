@@ -33,6 +33,10 @@ struct WorkerPool::Impl final {
  std::vector<Task> tasks;
  std::size_t task_head = 0U;
  std::size_t task_count = 0U;
+ BorrowedTask* borrowed_head = nullptr;
+ BorrowedTask* borrowed_tail = nullptr;
+ std::uint64_t submitted = 0, dispatched = 0;
+ [[nodiscard]] bool empty() const noexcept { return task_count == 0U && borrowed_head == nullptr; }
  void push(Task task) {
   if (task_count == tasks.size()) {
    if (tasks.size() > tasks.max_size() / 2U) throw std::length_error("worker task queue capacity exhausted");
@@ -43,11 +47,24 @@ struct WorkerPool::Impl final {
   }
   tasks[(task_head + task_count) % tasks.size()] = std::move(task);
   ++task_count;
+  ++submitted;
  }
  Task pop() noexcept {
+  // Exact FIFO ordinals merge the two storage forms, including unsigned wrap.
+  // This is the same queue and scheduling decision for every enqueue API.
+  if (borrowed_head && borrowed_head->sequence_ == dispatched) {
+   auto& record = *borrowed_head;
+   borrowed_head = record.next_;
+   if (!borrowed_head) borrowed_tail = nullptr;
+   record.queued_ = false;
+   record.next_ = nullptr;
+   ++dispatched;
+   return {.context = record.context_, .index = record.index_, .borrowed = record.call_};
+  }
   auto task = std::move(tasks[task_head]);
   task_head = (task_head + 1U) % tasks.size();
   --task_count;
+  ++dispatched;
   return task;
  }
  std::vector<std::thread> workers;
@@ -129,8 +146,8 @@ WorkerPool::WorkerPool(const std::size_t worker_count, std::vector<int> cpu_affi
      Impl::Task task;
      {
       std::unique_lock lock(impl_->mutex);
-      impl_->work_cv.wait(lock, [this] { return impl_->shutdown || impl_->task_count != 0U; });
-      if (impl_->shutdown && impl_->task_count == 0U) {
+      impl_->work_cv.wait(lock, [this] { return impl_->shutdown || !impl_->empty(); });
+      if (impl_->shutdown && impl_->empty()) {
        current_worker_pool = nullptr;
        return;
       }
@@ -211,6 +228,23 @@ void WorkerPool::enqueue_borrowed(void* context, std::size_t index, void (*call)
   if (impl_->startup_error) std::rethrow_exception(impl_->startup_error);
   if (impl_->shutdown) throw std::runtime_error("worker pool is shut down");
   impl_->push({.context = context, .index = index, .borrowed = call});
+  ++impl_->pending_tasks;
+ }
+ impl_->work_cv.notify_one();
+}
+void WorkerPool::enqueue_borrowed(BorrowedTask& record) {
+ if (!record.call_) throw std::invalid_argument("borrowed worker task is empty");
+ {
+  const std::lock_guard lock(impl_->mutex);
+  if (impl_->startup_error) std::rethrow_exception(impl_->startup_error);
+  if (impl_->shutdown) throw std::runtime_error("worker pool is shut down");
+  if (record.queued_) throw std::logic_error("borrowed worker task is already queued");
+  record.sequence_ = impl_->submitted++;
+  record.queued_ = true;
+  record.next_ = nullptr;
+  if (impl_->borrowed_tail) impl_->borrowed_tail->next_ = &record;
+  else impl_->borrowed_head = &record;
+  impl_->borrowed_tail = &record;
   ++impl_->pending_tasks;
  }
  impl_->work_cv.notify_one();

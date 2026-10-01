@@ -53,6 +53,7 @@ public:
   uint64_t seed = 42;
   int device_id = 0;
   int prefetch_factor = 6;
+  // CPU ceiling for useful bounded chunks across slots; zero uses prefetch_factor.
   int gather_workers = 0;
   std::string cpu_affinity{};
   uint32_t batch_shard_rank = 0;

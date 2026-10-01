@@ -33,6 +33,7 @@
 #include <limits>
 #include "src/backend/data/compiled/compiled_dataset.h"
 #include "src/backend/data/compiled/compiled_image_stream.h"
+#include "src/backend/data/detail/file_work_queue.h"
 #include "src/frameworks/gpu/image/image_buffer.h"
 #include "src/frameworks/gpu/cuda/terminal_cuda_retirement_owner.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
@@ -76,16 +77,17 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
  } completion;
  const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, NumaTopology::Capture());
  auto readers = std::make_shared<WorkerPool>(1U, execution.placement.cpus, "shared-read", 2U, &execution.placement, true);
- std::array<std::size_t, 6> storage_growths{};
+ std::size_t storage_growths = 0;
  CompiledImageStream stream(
   {.slots = 1U,
    .workers = 1U,
    .device = 0,
+   .prefault = true,
    .loading = data_loading_options(h2d),
    .execution = execution,
    .reader_pool = readers,
-   .storage_growth = {&storage_growths, [](void* observer_context, CompiledImageStream::StorageKind kind, std::size_t, std::size_t, std::size_t) noexcept {
-  ++(*static_cast<std::array<std::size_t, 6>*>(observer_context))[static_cast<std::size_t>(kind)];
+   .storage_growth = {&storage_growths, [](void* observer_context, CompiledImageStream::StorageKind, std::size_t, std::size_t, std::size_t) noexcept {
+  ++*static_cast<std::size_t*>(observer_context);
  }}});
  CHECK(&stream.workers() == readers.get());
  context.emplace(0, mmltk::frameworks::gpu::cuda_image_copy_backend());
@@ -174,8 +176,7 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
   CHECK(std::memcmp(host, source.image_pixels(13U), stride) == 0);
  }
  CHECK(storage_growths == prepared_growths);
- std::size_t preparation_growths = 0;
- for (const auto count : prepared_growths) preparation_growths += count;
+ const auto preparation_growths = prepared_growths;
  std::printf(
   "compiled_stream_fixture transport=%s first_host_pixels_labels_ns=%lld active_pixel_bytes=%zu active_label_bytes=%zu logical_label_capacity=%zu retained_label_bytes=%zu retained_host_bytes=%zu "
   "retained_device_bytes=%zu preparation_growths=%zu steady_growths=0 scope=owned_buffers_and_read_containers_not_total_malloc cache=warm_fixture\n",
@@ -415,15 +416,11 @@ void exercise_demanded_host_shutdown(const std::string& path, const bool h2d) {
   const float* prepared = materialize_before_stop ? loader.host_images(batch).data() : nullptr;
   loader.stop_workers();
   CHECK_FALSE(batch.image_custody.expired());
-  if (!h2d && !materialize_before_stop) {
-   CHECK_THROWS_AS(loader.host_images(batch), std::runtime_error);
-  } else {
-   const auto pixels = loader.host_images(batch);
-   if (prepared) CHECK(pixels.data() == prepared);
-   CHECK(loader.host_images(batch).data() == pixels.data());
-   const auto stride = loader.image_stride();
-   for (std::size_t image = 0; image < batch.num_images; ++image) CHECK(std::memcmp(pixels.data() + image * stride / sizeof(float), loader.image_pixels(batch.image_indices[image]), stride) == 0);
-  }
+  const auto pixels = loader.host_images(batch);
+  if (prepared) CHECK(pixels.data() == prepared);
+  CHECK(loader.host_images(batch).data() == pixels.data());
+  const auto stride = loader.image_stride();
+  for (std::size_t image = 0; image < batch.num_images; ++image) CHECK(std::memcmp(pixels.data() + image * stride / sizeof(float), loader.image_pixels(batch.image_indices[image]), stride) == 0);
  }
 }
 void exercise_independent_completions(const std::string& path, const bool h2d) {
@@ -545,6 +542,200 @@ void exercise_independent_completions(const std::string& path, const bool h2d) {
  const auto* received = static_cast<const std::byte*>(stream.metadata_storage(0U).data());
  for (const auto& read : reads) CHECK(std::memcmp(received + read.destination_offset, source.image_pixels(read.index), stride) == 0);
 }
+void exercise_used_ranges(const std::string& path) {
+ const auto source = CompiledDataset::open(path);
+ const auto stride = static_cast<std::size_t>(source.header().image_stride);
+ const auto pitch = source.header().max_label_bytes;
+ const auto layout = compute_file_layout(source.header().num_slots, stride, pitch);
+ const std::array reads{CompiledImageRead{1, stride}, CompiledImageRead{13, 0}, CompiledImageRead{13, 2 * stride}};
+ std::vector<std::byte> pixels(3 * stride, std::byte{0x5a}), labels(3 * pitch, std::byte{0x5a});
+ auto advice = source.used_ranges(reads, pitch, true);
+ std::size_t advised_pixels = 0, advised_labels = 0;
+ bool saw_pixels = false;
+ while (const auto range = advice.next()) {
+  CHECK(range->bytes <= CompiledDataset::read_chunk_bytes);
+  if (range->section == CompiledDataset::ReadSection::Pixels) {
+   saw_pixels = true;
+   advised_pixels += range->bytes;
+   CHECK((range->source_offset == source.pixel_offset(1) || range->source_offset == source.pixel_offset(13)));
+  } else {
+   CHECK_FALSE(saw_pixels);
+   advised_labels += range->bytes;
+   CHECK(range->source_offset == layout.label_offset(13));
+  }
+ }
+ CHECK(advised_pixels == 2 * stride);
+ CHECK(advised_labels == source.image_entry(13).label_bytes);
+ auto cursor = source.used_ranges(reads, pitch);
+ std::size_t copied_pixels = 0, copied_labels = 0;
+ while (const auto range = cursor.next(stride / 3 + 1)) {
+  auto& destination = range->section == CompiledDataset::ReadSection::Pixels ? pixels : labels;
+  (range->section == CompiledDataset::ReadSection::Pixels ? copied_pixels : copied_labels) += range->bytes;
+  source.gather_range(*range, {destination.data(), destination.size(), [](void* context, std::size_t offset, std::span<const std::byte> bytes) {
+   std::memcpy(static_cast<std::byte*>(context) + offset, bytes.data(), bytes.size());
+  }});
+ }
+ CHECK(cursor.empty());
+ CHECK(copied_pixels == pixels.size());
+ CHECK(copied_labels == 2 * source.image_entry(13).label_bytes);
+ for (const auto& read : reads) {
+  CHECK(std::memcmp(pixels.data() + read.destination_offset, source.image_pixels(read.index), stride) == 0);
+  const auto payload = source.label_payload(read.index);
+  const auto destination = std::span{labels}.subspan(read.destination_offset / stride * pitch, pitch);
+  CHECK(std::ranges::equal(destination.first(payload.size()), payload));
+  CHECK(std::ranges::all_of(destination.subspan(payload.size()), [](std::byte value) { return value == std::byte{0x5a}; }));
+ }
+ CHECK(CompiledDataset::gather_chunks(3, CompiledDataset::read_chunk_bytes, pitch) == 4);
+ CHECK_THROWS_AS(cursor.next(0), std::invalid_argument);
+}
+void exercise_bounded_gathers(const std::string& path, bool h2d) {
+ const auto source = CompiledDataset::open(path);
+ const auto stride = static_cast<std::size_t>(source.header().image_stride);
+ const auto count = 2 * CompiledDataset::read_chunk_bytes / stride + 3;
+ std::vector<CompiledImageRead> reads(count);
+ for (std::size_t image = 0; image < count; ++image) reads[image] = {image % 3 == 1 ? 1U : 13U, image * stride};
+ struct Observation {
+  mmltk::testsupport::TestGate first{"first bounded gather retains its slot"};
+  std::promise<void> disjoint;
+  std::mutex mutex;
+  std::array<unsigned, 2> labels{}, pixels{}, gathers{}, completions{};
+  bool ordering_error = false;
+ } observation;
+ const CompiledImageStream::ReadObserver observer{
+  .context = &observation,
+  .complete = [](void* context, std::size_t slot, std::exception_ptr, bool) noexcept {
+   auto& state = *static_cast<Observation*>(context);
+   const std::lock_guard lock(state.mutex);
+   ++state.completions[slot];
+  },
+  .range = [](void* context, std::size_t slot, CompiledImageStream::ReadOperation operation, const CompiledDataset::UsedRange& range) {
+   auto& state = *static_cast<Observation*>(context);
+   bool hold = false;
+   {
+    const std::lock_guard lock(state.mutex);
+    if (operation == CompiledImageStream::ReadOperation::Advice) {
+     state.ordering_error |= state.gathers[slot] != 0;
+     ++(range.section == CompiledDataset::ReadSection::Labels ? state.labels[slot] : state.pixels[slot]);
+    } else if (operation == CompiledImageStream::ReadOperation::Gather) {
+     state.ordering_error |= !state.labels[slot] || !state.pixels[slot];
+     ++state.gathers[slot];
+     hold = slot == 0 && state.gathers[slot] == 1;
+     if (slot == 0 && state.gathers[slot] == 2) state.disjoint.set_value();
+    }
+   }
+   if (hold) state.first.receipt().ArriveAndWait();
+  }};
+ CompiledImageStream stream({.slots = 2, .workers = 2, .device = 0, .loading = data_loading_options(h2d)});
+ stream.bind_current_context();
+ for (std::size_t slot = 0; slot < 2; ++slot) {
+  stream.prepare_images(slot, count * stride);
+  stream.prepare_reads(slot, count, source.header().max_label_bytes);
+ }
+ std::future<bool> peer, cancelled;
+ const mmltk::testsupport::ScopedTestCleanup release([&] { stream.cancel_reads(); observation.first.Release(); stream.wait_reads(); });
+ stream.submit(0, source, reads, observer);
+ REQUIRE(observation.first.WaitEntered(std::chrono::seconds{2}));
+ if (h2d) mmltk::testsupport::await_test_promise(observation.disjoint, "disjoint chunk enters while its peer is held");
+ stream.submit(1, source, reads, observer);
+ peer = std::async(std::launch::async, [&] { return stream.wait_read(1); });
+ REQUIRE(mmltk::testsupport::await_test_future(peer, "independent slot gathers while a peer chunk is held"));
+ stream.synchronize(1);
+ const auto pixels = stream.host_images(1);
+ for (const auto& read : reads) {
+  CHECK(std::memcmp(pixels.data() + read.destination_offset, source.image_pixels(read.index), stride) == 0);
+  CHECK(stream.annotations(1)[read.destination_offset / stride].labels.size() == source.image_labels(read.index).size());
+ }
+ CHECK_THROWS_AS(stream.prepare_images(0, stride), std::logic_error);
+ cancelled = std::async(std::launch::async, [&] { return stream.wait_read(0); });
+ stream.cancel_read(0);
+ CHECK(cancelled.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+ observation.first.Release();
+ CHECK_FALSE(mmltk::testsupport::await_test_future(cancelled, "all cancelled chunk custody settles"));
+ stream.synchronize();
+ CHECK_FALSE(observation.ordering_error);
+ CHECK(observation.completions == std::array<unsigned, 2>{1, 1});
+ // The same maximum-sized storage and task records remain usable after drain.
+ stream.submit(0, source, reads, {});
+ REQUIRE(stream.wait_read(0));
+ stream.stop_workers();
+ CHECK(std::memcmp(stream.host_images(0).data(), source.image_pixels(13), stride) == 0);
+}
+void exercise_prefault_custody(const std::string& path) {
+ const auto source = CompiledDataset::open(path);
+ const auto stride = static_cast<std::size_t>(source.header().image_stride);
+ const std::array reads{CompiledImageRead{13, 0}, CompiledImageRead{1, stride}};
+ const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, NumaTopology::Capture());
+ auto readers = std::make_shared<WorkerPool>(2, execution.placement.cpus, "prefault-read", 1, &execution.placement);
+ struct Observation {
+  mmltk::testsupport::TestGate physical{"admitted prefault retains source and slot"};
+  mmltk::testsupport::TestGate rejection{"reader prepares before service rejection"};
+  std::promise<void> second_advice;
+  std::atomic<bool> observed_second{false}, held{false};
+  std::array<std::atomic<unsigned>, 2> completed{};
+ } observation;
+ CompiledImageStream stream({.slots = 2, .workers = 1, .device = 0, .prefault = true, .execution = execution, .reader_pool = readers});
+ stream.bind_current_context();
+ for (std::size_t slot = 0; slot < 2; ++slot) {
+  stream.prepare_images(slot, 2 * stride);
+  stream.prepare_reads(slot, 2, source.header().max_label_bytes);
+ }
+ std::future<bool> first, second;
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  observation.physical.Release(); observation.rejection.Release(); stream.cancel_reads(); stream.wait_reads();
+ });
+ const CompiledImageStream::ReadObserver observer{.context = &observation,
+  .complete = [](void* context, std::size_t slot, std::exception_ptr, bool) noexcept { ++static_cast<Observation*>(context)->completed[slot]; },
+  .range = [](void* context, std::size_t slot, CompiledImageStream::ReadOperation operation, const CompiledDataset::UsedRange&) {
+   auto& state = *static_cast<Observation*>(context);
+   if (slot == 0 && operation == CompiledImageStream::ReadOperation::Prefault && !state.held.exchange(true)) state.physical.receipt().ArriveAndWait();
+   if (slot == 1 && operation == CompiledImageStream::ReadOperation::Advice && !state.observed_second.exchange(true)) state.second_advice.set_value();
+  }};
+ stream.submit(0, source, reads, observer);
+ REQUIRE(observation.physical.WaitEntered(std::chrono::seconds{2}));
+ stream.submit(1, source, reads, observer);
+ mmltk::testsupport::await_test_promise(observation.second_advice, "second slot prepares while file record is occupied");
+ // With the first worker physically held, this FIFO barrier proves the other
+ // worker returned from the second slot's full-admission attempt.
+ auto prepared = readers->enqueue([] {});
+ mmltk::testsupport::await_test_future(prepared, "full prefault request remains parked");
+ first = std::async(std::launch::async, [&] { return stream.wait_read(0); });
+ second = std::async(std::launch::async, [&] { return stream.wait_read(1); });
+ for (const bool all : {false, true}) {
+  if (all) stream.cancel_reads();
+  else stream.cancel_read(1);
+  CHECK_FALSE(mmltk::testsupport::await_test_future(second, "unadmitted cancellation settles before the held peer"));
+  CHECK(first.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+  CHECK(observation.completed[0] == 0);
+  CHECK(observation.completed[1] == (all ? 2U : 1U));
+  stream.submit(1, source, reads, observer);
+  prepared = readers->enqueue([] {});
+  mmltk::testsupport::await_test_future(prepared, "reused slot parks behind the same physical prefault");
+  second = std::async(std::launch::async, [&] { return stream.wait_read(1); });
+ }
+ stream.cancel_read(0);
+ CHECK(first.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+ CHECK(second.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+ CHECK_THROWS(stream.prepare_images(0, stride));
+ observation.physical.Release();
+ CHECK_FALSE(mmltk::testsupport::await_test_future(first, "cancelled prefault physically returned"));
+ REQUIRE(mmltk::testsupport::await_test_future(second, "full prefault resumes after capacity return"));
+ stream.synchronize();
+ CHECK(observation.completed[0] == 1);
+ CHECK(observation.completed[1] == 3);
+ CHECK(std::memcmp(stream.host_images(1).data(), source.image_pixels(13), stride) == 0);
+ stream.submit(0, source, reads, {.context = &observation, .before = [](void* context, std::size_t) {
+  static_cast<Observation*>(context)->rejection.receipt().ArriveAndWait(); return true;
+ }, .complete = observer.complete});
+ REQUIRE(observation.rejection.WaitEntered(std::chrono::seconds{2}));
+ readers->enqueue_detached([] { throw std::runtime_error("runtime reader admission failed"); });
+ CHECK_THROWS_WITH(readers->wait_idle(), "runtime reader admission failed");
+ observation.rejection.Release();
+ first = std::async(std::launch::async, [&] { return stream.wait_read(0); });
+ CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(first, "rejected prefault settles its slot directly"), "runtime reader admission failed");
+ stream.wait_reads();
+ CHECK(observation.completed[0] == 2);
+ stream.stop_workers();
+}
 void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cudaStream_t compute_stream) {
  const std::string bin_path = compiled_bin_path(fixture);
  const std::string dataset_dir_path = dataset_dir(fixture);
@@ -561,6 +752,7 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
  exercise_compiled_stream(bin_path, h2d);
  ensure_cuda_ok(cudaSetDevice(0), "restore primary training context after isolated stream coverage");
  exercise_independent_completions(bin_path, h2d);
+ exercise_bounded_gathers(bin_path, h2d);
  {
   DatasetLoader::Config direct_cfg;
   direct_cfg.loading.h2d_dataloader = h2d;
@@ -714,14 +906,14 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
   budgeted_loader.synchronize();
   REQUIRE(total == static_cast<size_t>(NUM_IMAGES));
  }
- DatasetLoader::Config invalid_budget_cfg = shuffled_cfg;
- invalid_budget_cfg.prefetch_factor = 2;
- invalid_budget_cfg.gather_workers = 3;
- bool invalid_budget_threw = false;
- try {
-  DatasetLoader invalid_budget_loader(invalid_budget_cfg);
- } catch (const std::invalid_argument&) { invalid_budget_threw = true; }
- REQUIRE(invalid_budget_threw);
+ // Useful chunks can outnumber slots; the reader CPU ceiling is independent
+ // of prefetch depth. Small batches still clamp to their useful work.
+ auto chunk_budget_cfg = shuffled_cfg;
+ chunk_budget_cfg.prefetch_factor = 1;
+ chunk_budget_cfg.gather_workers = 3;
+ DatasetLoader chunk_budget_loader(chunk_budget_cfg);
+ while (chunk_budget_loader.next_batch(batch)) chunk_budget_loader.release_batch(batch);
+ chunk_budget_loader.synchronize();
  DatasetLoader::Config invalid_affinity_cfg = direct_cfg;
  invalid_affinity_cfg.cpu_affinity = "999999";
  bool invalid_affinity_threw = false;
@@ -1140,6 +1332,8 @@ void test_roundtrip_end_to_end() {
  const bool bin_exists = fs::exists(bin_path);
  REQUIRE(bin_exists);
  printf("Compiled file: %zu bytes\n", static_cast<size_t>(fs::file_size(bin_path)));
+ exercise_used_ranges(bin_path);
+ exercise_prefault_custody(bin_path);
  exercise_used_read_measurements(bin_path);
  // Run every H2D assertion before probing the optional GDR transport.
  for (const bool h2d : {true, false}) {
@@ -1473,4 +1667,56 @@ TEST_CASE("compiled scatter output checks bounded vectors and partial physical w
   file.pread_all(prefix.data(),prefix.size(),layout.label_offset(0));
   CHECK(std::memcmp(prefix.data(),&label,prefix.size())==0);
  }
+}
+
+TEST_CASE("runtime file readiness follows actual capacity return and retains notification custody", "[backend][data][roundtrip]") {
+ using detail::FileWorkQueue;
+ const auto topology = NumaTopology::Capture();
+ const auto first_cpu = std::ranges::find(topology.cpus, topology.permitted_cpus.front(), &CpuTopology::cpu);
+ const auto placement = resolve_placement(topology, first_cpu->node);
+ WorkerPool pool(2, placement.cpus, "runtime-file", 1, &placement);
+ mmltk::testsupport::TestGate completing("file completion still owns its record"), notifying("file capacity notification retains its owner");
+ struct Readiness {
+  FileWorkQueue* files = nullptr;
+  mmltk::testsupport::TestGate* notifying = nullptr;
+  std::atomic<unsigned> notifications{0}, physical{0};
+  std::optional<detail::CompileExecution::Completion> retried;
+  std::exception_ptr failure;
+ } readiness;
+ readiness.notifying = &notifying;
+ FileWorkQueue files(pool, 1, {&readiness, [](void* context, void*) noexcept {
+  auto& state = *static_cast<Readiness*>(context);
+  if (state.notifications.fetch_add(1) != 0) return;
+  try {
+   state.retried = state.files->try_submit({.context = &state.physical, .call = [](void* value) { ++*static_cast<std::atomic<unsigned>*>(value); }});
+   state.notifying->receipt().ArriveAndWait();
+  } catch (...) { state.failure = std::current_exception(); }
+ }});
+ readiness.files = &files;
+ std::future<void> joined;
+ const mmltk::testsupport::ScopedTestCleanup release([&] { completing.Release(); notifying.Release(); files.cancel(); files.join(); });
+ auto first = files.try_submit({.context = &readiness.physical,
+  .call = [](void* value) { ++*static_cast<std::atomic<unsigned>*>(value); },
+  .completed = [&](std::exception_ptr) { completing.receipt().ArriveAndWait(); }});
+ REQUIRE(first);
+ REQUIRE(completing.WaitEntered(std::chrono::seconds{2}));
+ CHECK_FALSE(files.has_capacity());
+ CHECK_FALSE(files.try_submit({.work = [] {}}));
+ completing.Release();
+ REQUIRE(notifying.WaitEntered(std::chrono::seconds{2}));
+ REQUIRE(readiness.retried);
+ CHECK_FALSE(first->ready());
+ readiness.retried->wait();
+ joined = std::async(std::launch::async, [&] { files.join(); });
+ CHECK(joined.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+ notifying.Release();
+ mmltk::testsupport::await_test_future(joined, "file queue joins final readiness callback");
+ first->wait();
+ CHECK_FALSE(readiness.failure);
+ CHECK(readiness.notifications == 2);
+ CHECK(readiness.physical == 2);
+ CHECK(files.has_capacity());
+ files.cancel();
+ CHECK_THROWS(files.try_submit({.work = [] {}}));
+ CHECK_THROWS(files.has_capacity());
 }

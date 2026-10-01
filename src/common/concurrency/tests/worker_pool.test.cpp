@@ -8,10 +8,12 @@
 #include <chrono>
 #include <future>
 #include <mutex>
+#include <memory>
 #include <set>
 #include <string>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/execution_policy.h"
@@ -125,6 +127,15 @@ TEST_CASE("WorkerPool detached failures wake waiters and close admission", "[com
 TEST_CASE("WorkerPool preserves FIFO across queue wrap and high-water growth", "[common][concurrency][worker_pool]") {
  WorkerPool pool(1U, {}, "queue-order", 3U);
  std::vector<int> observed;
+ int base = 0;
+ std::pair output{&observed, &base};
+ const auto append = +[](void* context, std::size_t index) {
+  auto& target = *static_cast<decltype(output)*>(context);
+  target.first->push_back(*target.second + static_cast<int>(index));
+ };
+ std::vector<std::unique_ptr<WorkerPool::BorrowedTask>> prepared;
+ for (std::size_t index = 0; index < 19; ++index)
+  prepared.push_back(std::make_unique<WorkerPool::BorrowedTask>(&output, index, append));
  mmltk::testsupport::ScopedTestCleanup settle_fifo{[&] {
   try {
    pool.wait_idle();
@@ -132,14 +143,20 @@ TEST_CASE("WorkerPool preserves FIFO across queue wrap and high-water growth", "
  }};
  std::vector<int> expected;
  for (int round = 0; round < 4; ++round) {
+  base = round * 100;
   mmltk::testsupport::TestGate gate{"FIFO worker admission"};
   pool.enqueue_detached([receipt = gate.receipt()] { receipt.ArriveAndWait(); });
   REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
   const int count = round == 1 ? 19 : 7;
   for (int index = 0; index < count; ++index) {
-   const int value = round * 100 + index;
+   const int value = base + index;
    expected.push_back(value);
-   pool.enqueue_detached([&observed, value] { observed.push_back(value); });
+   if (index % 3 == 0) {
+    pool.enqueue_borrowed(*prepared[index]);
+    CHECK_THROWS_AS(pool.enqueue_borrowed(*prepared[index]), std::logic_error);
+   } else if (index % 3 == 1) {
+    pool.enqueue_borrowed(&output, index, append);
+   } else pool.enqueue_detached([&observed, value] { observed.push_back(value); });
   }
   gate.Release();
   pool.wait_idle();
@@ -148,6 +165,8 @@ TEST_CASE("WorkerPool preserves FIFO across queue wrap and high-water growth", "
 }
 TEST_CASE("WorkerPool shutdown drains previously admitted FIFO work after detached failure", "[common][concurrency][worker_pool]") {
  std::future<int> accepted;
+ std::atomic<bool> borrowed_completed{false};
+ WorkerPool::BorrowedTask borrowed(&borrowed_completed, 0, [](void* context, std::size_t) { static_cast<std::atomic<bool>*>(context)->store(true); });
  {
   WorkerPool pool(1U, {}, "queue-failure", 1U);
   mmltk::testsupport::TestGate gate{"FIFO worker admission"};
@@ -157,10 +176,12 @@ TEST_CASE("WorkerPool shutdown drains previously admitted FIFO work after detach
   });
   REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
   accepted = pool.enqueue([] { return 31; });
+  pool.enqueue_borrowed(borrowed);
   gate.Release();
   REQUIRE_THROWS_AS(pool.wait_idle(), std::runtime_error);
  }
  REQUIRE(accepted.get() == 31);
+ CHECK(borrowed_completed.load());
 }
 TEST_CASE("WorkerPool result failures remain owned by their futures", "[common][concurrency][worker_pool]") {
  WorkerPool pool(1);
@@ -184,6 +205,34 @@ TEST_CASE("Borrowed worker records reuse bounded queues and preserve task failur
  auto failed = pool.enqueue([] { throw std::runtime_error("future-owned failure"); });
  CHECK_THROWS_AS(failed.get(), std::runtime_error);
  CHECK_NOTHROW(pool.wait_idle());
+}
+TEST_CASE("Prepared worker continuations yield through the same FIFO and report failures", "[common][concurrency][worker_pool]") {
+ WorkerPool pool(1, {}, "continuation", 2);
+ struct Continuation {
+  WorkerPool* pool;
+  WorkerPool::BorrowedTask* task = nullptr;
+  std::vector<int> observed;
+  int next = 0;
+ } state{&pool};
+ WorkerPool::BorrowedTask task(&state, 0, [](void* context, std::size_t) {
+  auto& continuation = *static_cast<Continuation*>(context);
+  continuation.observed.push_back(continuation.next++);
+  if (continuation.next != 4) continuation.pool->enqueue_borrowed(*continuation.task);
+ });
+ state.task = &task;
+ mmltk::testsupport::TestGate admitted("continuation FIFO admission");
+ const mmltk::testsupport::ScopedTestCleanup drain([&] { admitted.Release(); try { pool.wait_idle(); } catch (...) {} });
+ pool.enqueue_detached([receipt = admitted.receipt()] { receipt.ArriveAndWait(); });
+ REQUIRE(admitted.WaitEntered(std::chrono::seconds{2}));
+ pool.enqueue_borrowed(task);
+ pool.enqueue_detached([&] { state.observed.push_back(17); });
+ admitted.Release();
+ pool.wait_idle();
+ CHECK(state.observed == std::vector<int>{0, 17, 1, 2, 3});
+ WorkerPool::BorrowedTask failing(nullptr, 0, [](void*, std::size_t) { throw std::runtime_error("prepared task failed"); });
+ pool.enqueue_borrowed(failing);
+ CHECK_THROWS_WITH(pool.wait_idle(), "prepared task failed");
+ CHECK_THROWS_WITH(pool.enqueue_borrowed(task), "prepared task failed");
 }
 TEST_CASE("Child pools use immutable placement after the creator is pinned", "[common][concurrency][worker_pool]") {
  using namespace mmltk::common::system;

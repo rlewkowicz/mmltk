@@ -23,8 +23,16 @@ public:
   std::function<void()> work;
   CompileWorkClass service_class = CompileWorkClass::Output;
  };
+ struct RuntimeReadiness {
+  void* context = nullptr;
+  // After physical completion, completed, and actual capacity return. May
+  // retry try_submit. The second argument is the retired operation's context;
+  // The returned completion and join retain callback and operation-context
+  // custody through its return; do not wait for that completion in the callback.
+  void (*available)(void*, void*) noexcept = nullptr;
+ };
  FileWorkQueue(CompileExecution&, std::size_t records, std::size_t services = 1);
- FileWorkQueue(mmltk::common::concurrency::WorkerPool&, std::size_t records);
+ FileWorkQueue(mmltk::common::concurrency::WorkerPool&, std::size_t records, RuntimeReadiness = {nullptr, nullptr});
  ~FileWorkQueue();
  FileWorkQueue(const FileWorkQueue&) = delete;
  FileWorkQueue& operator=(const FileWorkQueue&) = delete;

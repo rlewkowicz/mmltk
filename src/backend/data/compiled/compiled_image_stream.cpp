@@ -1,5 +1,6 @@
 #include "src/backend/data/compiled/compiled_image_stream.h"
 #include "src/common/math/checked_arithmetic.h"
+#include "src/backend/data/detail/file_work_queue.h"
 #include <cuda_runtime_api.h>
 #include <cuda.h>
 #include <spdlog/spdlog.h>
@@ -43,6 +44,11 @@ void on_context(const CUcontext context, Operation&& operation) {
   std::rethrow_exception(failure);
  }
  gpu::ensure_cuda_driver_ok(cuCtxPopCurrent(&popped), "compiled image stream context restoration");
+}
+template <class Emit>
+void observe_read(Emit&& emit) noexcept {
+ // Optional observations never become a read or physical-retirement failure.
+ try { mmltk::common::logging::debug(std::forward<Emit>(emit)); } catch (...) {}
 }
 }  // namespace
 struct CompiledImageStream::Buffer::Impl {
@@ -129,8 +135,19 @@ void CompiledImageStream::Buffer::consumed(void* stream) {
  if (impl_->gdr) impl_->lease.record_consumed(reinterpret_cast<CUstream>(stream));
 }
 struct CompiledImageStream::Impl {
+ using BorrowedTask = mmltk::common::concurrency::WorkerPool::BorrowedTask;
+ enum class ReadStage { Idle, Preparing, PrefaultWaiting, PrefaultRunning, PrefaultReturning, Gathering, Finishing };
+ struct GatherTask {
+  GatherTask(CompiledImageStream* owner, std::size_t index) : dispatch(owner, index, [](void* context, std::size_t task) { static_cast<CompiledImageStream*>(context)->gather_chunk(task); }) {}
+  BorrowedTask dispatch;
+  CompiledDataset::UsedRangeCursor cursor;
+  std::size_t slot = 0, bytes = 0;
+  bool active = false;
+ };
  struct Slot {
-  explicit Slot(const mmltk::common::system::ExecutionPlacement& placement, bool demanded_host) : host(true, &placement), metadata(true, &placement), labels(true, &placement) {
+  explicit Slot(const mmltk::common::system::ExecutionPlacement& placement, bool demanded_host, CompiledImageStream* owner, std::size_t index)
+      : host(true, &placement), metadata(true, &placement), labels(true, &placement), owner(owner), index(index),
+        dispatch(owner, index, [](void* context, std::size_t slot) { static_cast<CompiledImageStream*>(context)->read_slot(slot); }) {
    if (demanded_host) host_policy.emplace(mmltk::common::system::ExecutionPolicyRequest{placement.cpus, {}, 0, placement.numa_node, -10, true});
   }
   Buffer host;
@@ -140,6 +157,13 @@ struct CompiledImageStream::Impl {
   std::vector<ImageAnnotations> annotations;
   std::size_t label_pitch = 0;
   std::vector<CompiledImageRead> reads;
+  CompiledImageStream* owner;
+  std::size_t index;
+  BorrowedTask dispatch;
+  ReadStage stage = ReadStage::Idle;
+  bool dispatched = false;
+  std::size_t gathers = 0;
+  CompiledDataset::UsedRangeCursor cursor, preparation;
   const CompiledDataset* source = nullptr;
   ReadObserver observer;
   CompletionObserver transfer_observer;
@@ -169,7 +193,7 @@ struct CompiledImageStream::Impl {
   std::thread worker;
   [[nodiscard]] bool idle() const noexcept { return queued == 0U && active == 0U; }
  };
- explicit Impl(Config selected)
+ explicit Impl(Config selected, CompiledImageStream* owner)
      : config(std::move(selected)),
        execution(config.execution ? *config.execution : gpu::resolve_device_execution(config.device, mmltk::common::system::NumaTopology::Capture(), config.loading.numa_node, config.cpu_affinity)),
        cpus(execution.placement.cpus),
@@ -191,7 +215,16 @@ struct CompiledImageStream::Impl {
      policy.io_class, policy.io_priority_data);
    });
   }
-  for (auto& slot : slots) slot = std::make_unique<Slot>(execution.placement, !config.loading.h2d_dataloader);
+  for (std::size_t index = 0; index < slots.size(); ++index)
+   slots[index] = std::make_unique<Slot>(execution.placement, !config.loading.h2d_dataloader, owner, index);
+  const auto task_count = std::min(config.workers, pool->size());
+  tasks.reserve(task_count);
+  for (std::size_t task = 0; task < task_count; ++task) tasks.push_back(std::make_unique<GatherTask>(owner, task));
+  if (config.storage_growth.grown) config.storage_growth.grown(config.storage_growth.context, StorageKind::ReadTasks, 0, 0, task_count * sizeof(GatherTask));
+  if (config.prefault) files = std::make_unique<detail::FileWorkQueue>(*pool, std::min(task_count, slots.size()),
+   detail::FileWorkQueue::RuntimeReadiness{owner, [](void* context, void* operation) noexcept {
+    static_cast<CompiledImageStream*>(context)->prefault_returned(static_cast<Slot*>(operation)->index);
+   }});
   for (auto& device : devices) device = std::make_unique<Buffer>(false, nullptr, !config.loading.h2d_dataloader);
   for (auto& queue : completions) queue.jobs.resize(config.slots);
  }
@@ -219,6 +252,10 @@ struct CompiledImageStream::Impl {
  bool private_pool;
  std::shared_ptr<mmltk::common::concurrency::WorkerPool> pool;
  std::vector<std::unique_ptr<Slot>> slots;
+ std::vector<std::unique_ptr<GatherTask>> tasks;
+ std::unique_ptr<detail::FileWorkQueue> files;
+ std::size_t next_slot = 0;
+ std::size_t read_workers = 0;
  std::vector<std::unique_ptr<Buffer>> devices;
  CUcontext context = nullptr;
  cudaStream_t copy = nullptr;
@@ -292,6 +329,9 @@ struct CompiledImageStream::Impl {
      const auto& slot = *slots[job.slot];
      gpu::ensure_cuda_ok(cudaEventSynchronize(consumer ? slot.consumer : slot.transfer), "compiled image GPU completion");
     } catch (...) { error = std::current_exception(); }
+    observe_read([&](auto& log) {
+     log.debug("event=compiled.stream.retirement stream={} slot={} consumer={} failed={}", reinterpret_cast<std::uintptr_t>(this), job.slot, consumer, bool(error));
+    });
     {
      std::lock_guard lock(mutex);
      if (error) {
@@ -344,11 +384,11 @@ struct CompiledImageStream::Retention {
  std::shared_ptr<Impl> state;
 };
 CompiledImageStream::CompiledImageStream(Config config, std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement) {
- if (!config.settle || !config.record_consumer || config.slots == 0 || config.slots > std::numeric_limits<std::size_t>::max() / 2 || config.workers == 0 || config.workers > config.slots ||
+ if (!config.settle || !config.record_consumer || config.slots == 0 || config.slots > std::numeric_limits<std::size_t>::max() / 2 || config.workers == 0 ||
      config.workers > static_cast<std::size_t>(std::numeric_limits<int>::max()))
   throw std::invalid_argument("invalid compiled image stream capacity");
  retention_ = std::make_unique<Retention>(std::move(retirement));
- impl_ = std::make_shared<Impl>(std::move(config));
+ impl_ = std::make_shared<Impl>(std::move(config), this);
 }
 const gpu::DeviceExecution& CompiledImageStream::execution() const noexcept { return impl_->execution; }
 void CompiledImageStream::bind_current_context() {
@@ -415,6 +455,7 @@ void CompiledImageStream::stop_workers() {
   impl_->stopping = true;
  }
  cancel_reads();
+ if (impl_->files) impl_->files->cancel();
  if (impl_->pool) {
   // Shared pools retain unrelated work. A private pool also settles external
   // catalog tasks before its final owner releases the workers.
@@ -422,6 +463,7 @@ void CompiledImageStream::stop_workers() {
   try {
    wait_reads();
   } catch (...) { failure = std::current_exception(); }
+  if (impl_->files) { impl_->files->join(); impl_->files.reset(); }
   impl_->pool.reset();
   impl_->config.reader_pool.reset();
   if (failure) {
@@ -472,7 +514,7 @@ void CompiledImageStream::prepare_reads(std::size_t index, std::size_t count, st
  if (max_label_bytes && (*max_label_bytes > COMPILED_LABEL_CAPACITY || *max_label_bytes % sizeof(RLEPair))) throw std::invalid_argument("invalid prepared maximum label size");
  if (max_label_bytes || !slot.annotations.empty()) {
   count = std::max(count, slot.annotations.size());
-  const auto pitch = max_label_bytes.value_or(slot.label_pitch);
+  const auto pitch = std::max(slot.label_pitch, max_label_bytes.value_or(0));
   const auto bytes = mmltk::common::math::checked_multiply(count, pitch, "compiled batch labels overflow");
   if (bytes) on_context(impl_->context, [&] { impl_->prepare_storage(StorageKind::Labels, index, slot.labels, [&] { slot.labels.ensure_bytes(bytes); }); });
   impl_->prepare_storage(StorageKind::AnnotationViews, index, slot.annotations, [&] { slot.annotations.resize(count); });
@@ -543,7 +585,9 @@ std::span<const std::byte> CompiledImageStream::host_images(const std::size_t in
    // The caller can hold its loader lease lock. Never wait behind a reader
    // callback that needs that lock, or depend on a pool detached during stop.
    mmltk::common::system::ScopedExecutionPolicy policy(*slot.host_policy);
-   complete = slot.source->read_images(slot.reads, {static_cast<std::byte*>(slot.host.data()), bytes}, slot.cancelled, impl_->config.prefault);
+   // Explicit prefault already completed before this slot was published.
+   // CPU demand remains valid after reader stop and uses no service queue.
+   complete = slot.source->read_images(slot.reads, {static_cast<std::byte*>(slot.host.data()), bytes}, slot.cancelled);
    policy.Restore();
   } catch (...) { failure = std::current_exception(); }
   {
@@ -583,6 +627,8 @@ void CompiledImageStream::submit(
   slot.reads.assign(reads.begin(), reads.end());
   slot.cancelled.store(false, std::memory_order_release);
   slot.reading = true;
+  slot.stage = Impl::ReadStage::Preparing;
+  slot.dispatched = true;
   ++slot.read_callbacks;
   slot.read = false;
   slot.host_materialized = false;
@@ -590,102 +636,263 @@ void CompiledImageStream::submit(
   slot.source = &source;
   slot.observer = observer;
   slot.transfer_observer = transfer;
+  ++impl_->read_workers;
  }
  try {
-  impl_->pool->enqueue_borrowed(this, index, [](void* owner, std::size_t queued_slot) { static_cast<CompiledImageStream*>(owner)->read_slot(queued_slot); });
+  impl_->pool->enqueue_borrowed(slot.dispatch);
  } catch (...) {
   std::lock_guard lock(impl_->mutex);
   slot.reading = false;
+  slot.stage = Impl::ReadStage::Idle;
+  slot.dispatched = false;
   --slot.read_callbacks;
+  --impl_->read_workers;
   impl_->changed.notify_all();
   throw;
  }
 }
 void CompiledImageStream::read_slot(const std::size_t index) noexcept {
  auto& current = *impl_->slots[index];
- const auto observer = current.observer;
- const auto transfer = current.transfer_observer;
  const auto& source = *current.source;
- std::exception_ptr failure;
- bool read = false;
- bool transfer_submitted = false;
- mmltk::common::logging::ScopedProfile profile{"compiled.stream.read"};
+ observe_read([&](auto& log) {
+  log.debug("event=compiled.stream.read stream={} slot={} source={} images={} h2d={} prefault={}", reinterpret_cast<std::uintptr_t>(impl_.get()), index,
+   source.path().string(), current.reads.size(), impl_->config.loading.h2d_dataloader, impl_->config.prefault);
+ });
  try {
-  if (!current.cancelled.load(std::memory_order_acquire) && (!observer.before || observer.before(observer.context, index))) {
-   // The compiled layout fixes source offsets in index order. Keep every
-   // logical occurrence and its destination, reusing only this slot's inventory.
-   // Sequential batches avoid sorting and retain their coalesced gather copy.
-   if (!current.annotations.empty()) {
-    for (std::size_t i = 0; i < current.reads.size(); ++i) {
-     if (current.cancelled.load(std::memory_order_acquire)) break;
-     const auto& image_read = current.reads[i];
-     const auto position = image_read.destination_offset / source.header().image_stride;
-     const auto payload = source.label_payload(image_read.index);
-     if (payload.empty()) {
-      current.annotations[position] = {};
-      continue;
-     }
-     auto* destination = static_cast<std::byte*>(current.labels.data()) + position * current.label_pitch;
-     std::memcpy(destination, payload.data(), payload.size());
-     current.annotations[position] = annotation_view(source.image_entry(image_read.index), {destination, payload.size()});
+  if (!current.cancelled.load(std::memory_order_acquire) && (!current.observer.before || current.observer.before(current.observer.context, index))) {
+   // All physical order and range metadata are ready before touching labels.
+   if (!std::ranges::is_sorted(current.reads, {}, &CompiledImageRead::index)) std::ranges::sort(current.reads, {}, &CompiledImageRead::index);
+   for (const auto& read : current.reads) {
+    const auto& entry = source.image_entry(read.index);
+    if (!current.annotations.empty()) {
+     const auto position = read.destination_offset / source.header().image_stride;
+     auto* destination = static_cast<std::byte*>(current.labels.data());
+     if (entry.label_bytes) destination += position * current.label_pitch;
+     current.annotations[position] = annotation_view(entry, {destination, entry.label_bytes});
     }
    }
-   if (!std::ranges::is_sorted(current.reads, {}, &CompiledImageRead::index)) std::ranges::sort(current.reads, {}, &CompiledImageRead::index);
-   if (impl_->config.loading.h2d_dataloader) {
-    read = source.read_images(current.reads, {static_cast<std::byte*>(current.host.data()), current.host.capacity_bytes()}, current.cancelled, impl_->config.prefault);
-   } else {
-    auto& destination = *impl_->devices.at(index);
-    on_context(impl_->context, [&] {
-     destination.begin_write();
-     read = source.read_images_to(current.reads,
-      CompiledDataset::ImageDestination{
-       &destination, destination.capacity_bytes(), [](void* buffer, std::size_t offset, std::span<const std::byte> bytes) { static_cast<Buffer*>(buffer)->write(offset, bytes); }
-      },
-      current.cancelled, impl_->config.prefault);
-     if (read) destination.publish(nullptr);
-    });
+   const auto labels = current.annotations.empty() ? std::optional<std::size_t>{} : current.label_pitch;
+   current.cursor = source.used_ranges(current.reads, labels);
+   current.preparation = source.used_ranges(current.reads, labels, true);
+   auto advice = current.preparation;
+   {
+    mmltk::common::logging::ScopedProfile profile{"compiled.stream.advice"};
+    while (!current.cancelled.load(std::memory_order_acquire)) {
+     const auto range = advice.next();
+     if (!range) break;
+     operate_range(index, ReadOperation::Advice, *range);
+    }
    }
+   if (!impl_->config.loading.h2d_dataloader && !current.cancelled.load(std::memory_order_acquire))
+    on_context(impl_->context, [&] { impl_->devices[index]->begin_write(); });
+  } else current.cancelled.store(true, std::memory_order_release);
+ } catch (...) { current.read_failure = std::current_exception(); }
+ {
+  const std::lock_guard lock(impl_->mutex);
+  current.dispatched = false;
+  current.stage = current.read_failure || current.cancelled.load(std::memory_order_acquire) ? Impl::ReadStage::Finishing :
+   impl_->files ? Impl::ReadStage::PrefaultWaiting : Impl::ReadStage::Gathering;
+ }
+ dispatch_reads();
+ read_worker_returned();
+}
+void CompiledImageStream::prefault_returned(std::size_t index) noexcept {
+ {
+  const std::lock_guard lock(impl_->mutex);
+  auto& slot = *impl_->slots[index];
+  slot.stage = slot.read_failure || slot.cancelled.load(std::memory_order_acquire) ? Impl::ReadStage::Finishing :
+   slot.preparation.empty() ? Impl::ReadStage::Gathering : Impl::ReadStage::PrefaultWaiting;
+ }
+ // Actual capacity is free now. Both this continuation and any previously
+ // full request stay armed under the same mutex as their admission attempt.
+ dispatch_reads();
+ read_worker_returned();
+}
+void CompiledImageStream::dispatch_reads() noexcept {
+ for (;;) {
+  std::optional<std::size_t> finish;
+  {
+   const std::lock_guard lock(impl_->mutex);
+   for (std::size_t turn = 0; turn < impl_->slots.size(); ++turn) {
+    const auto index = (impl_->next_slot + turn) % impl_->slots.size();
+    auto& slot = *impl_->slots[index];
+    if (slot.dispatched || slot.stage == Impl::ReadStage::Idle || slot.stage == Impl::ReadStage::Preparing ||
+        slot.stage == Impl::ReadStage::PrefaultRunning || slot.stage == Impl::ReadStage::PrefaultReturning) continue;
+    try {
+     if (slot.read_failure || slot.cancelled.load(std::memory_order_acquire)) {
+      if (slot.gathers) continue;
+      slot.stage = Impl::ReadStage::Finishing;
+     }
+     if (slot.stage == Impl::ReadStage::PrefaultWaiting) {
+      auto accepted = impl_->files->try_submit({.context = &slot,
+       .call = [](void* context) {
+        auto& current = *static_cast<Impl::Slot*>(context);
+        mmltk::common::logging::ScopedProfile profile{"compiled.stream.prefault"};
+        std::size_t remaining = CompiledDataset::read_chunk_bytes;
+        while (remaining && !current.cancelled.load(std::memory_order_acquire)) {
+         const auto range = current.preparation.next(remaining);
+         if (!range) break;
+         current.owner->operate_range(current.index, ReadOperation::Prefault, *range);
+         remaining -= range->bytes;
+        }
+       },
+       .completed = [current = &slot](std::exception_ptr error) {
+        const std::lock_guard completion(current->owner->impl_->mutex);
+        if (error && !current->cancelled.load(std::memory_order_acquire)) current->read_failure = error;
+        current->stage = Impl::ReadStage::PrefaultReturning;
+       }});
+      if (accepted) { slot.stage = Impl::ReadStage::PrefaultRunning; ++impl_->read_workers; }
+      // Full leaves the same cursor/request waiting for capacity return.
+      continue;
+     }
+     if (slot.stage == Impl::ReadStage::Gathering) {
+      if (!impl_->config.loading.h2d_dataloader && slot.gathers) continue;
+      for (auto& task : impl_->tasks) {
+       if (slot.cursor.empty()) break;
+       if (task->active) continue;
+       task->cursor = slot.cursor;
+       task->bytes = 0;
+       while (task->bytes < CompiledDataset::read_chunk_bytes) {
+        const auto range = slot.cursor.next(CompiledDataset::read_chunk_bytes - task->bytes);
+        if (!range) break;
+        task->bytes += range->bytes;
+       }
+       task->slot = index;
+       impl_->pool->enqueue_borrowed(task->dispatch);
+       task->active = true;
+       ++slot.gathers;
+       ++impl_->read_workers;
+       if (!impl_->config.loading.h2d_dataloader) break;
+      }
+      if (slot.gathers || !slot.cursor.empty()) continue;
+      slot.stage = Impl::ReadStage::Finishing;
+     }
+    } catch (...) {
+     if (!slot.read_failure) slot.read_failure = std::current_exception();
+     if (slot.gathers) continue;
+     slot.stage = Impl::ReadStage::Finishing;
+    }
+    if (slot.stage == Impl::ReadStage::Finishing && !finish) {
+     slot.dispatched = true;
+     finish = index;
+    }
+   }
+   if (finish) impl_->next_slot = (*finish + 1) % impl_->slots.size();
   }
-  if (read && impl_->config.loading.h2d_dataloader) {
-   on_context(impl_->context, [&] {
-    std::lock_guard submission(impl_->submission);
-    const auto bytes = current.reads.size() * source.header().image_stride;
-    upload(index, bytes, impl_->copy);
+  if (!finish) return;
+  finish_read(*finish);
+ }
+}
+void CompiledImageStream::gather_chunk(const std::size_t index) noexcept {
+ auto& task = *impl_->tasks[index];
+ auto& slot = *impl_->slots[task.slot];
+ std::exception_ptr failure;
+ try {
+  mmltk::common::logging::ScopedProfile profile{"compiled.stream.gather"};
+  const auto gather = [&] {
+   auto remaining = task.bytes;
+   while (remaining && !slot.cancelled.load(std::memory_order_acquire)) {
+    const auto range = task.cursor.next(remaining);
+    if (!range) throw std::logic_error("compiled gather cursor ended before its prepared chunk");
+    operate_range(task.slot, ReadOperation::Gather, *range);
+    remaining -= range->bytes;
+   }
+  };
+  if (impl_->config.loading.h2d_dataloader) gather();
+  else on_context(impl_->context, gather);
+ } catch (...) { failure = std::current_exception(); }
+ {
+  const std::lock_guard lock(impl_->mutex);
+  if (failure && !slot.read_failure) slot.read_failure = failure;
+  --slot.gathers;
+  task.active = false;
+  // Yield to a peer slot before assigning this same prepared record again.
+  impl_->next_slot = (task.slot + 1) % impl_->slots.size();
+ }
+ dispatch_reads();
+ read_worker_returned();
+}
+void CompiledImageStream::operate_range(std::size_t index, ReadOperation operation, const CompiledDataset::UsedRange& range) {
+ auto& slot = *impl_->slots[index];
+ if (slot.observer.range) slot.observer.range(slot.observer.context, index, operation, range);
+ if (operation == ReadOperation::Gather) {
+  auto& destination = range.section == CompiledDataset::ReadSection::Labels ? slot.labels :
+   impl_->config.loading.h2d_dataloader ? slot.host : *impl_->devices[index];
+  const bool mapped = range.section == CompiledDataset::ReadSection::Pixels && !impl_->config.loading.h2d_dataloader;
+  slot.source->gather_range(range, {&destination, destination.capacity_bytes(), mapped ?
+   +[](void* context, std::size_t offset, std::span<const std::byte> bytes) { static_cast<Buffer*>(context)->write(offset, bytes); } :
+   +[](void* context, std::size_t offset, std::span<const std::byte> bytes) { std::memcpy(static_cast<std::byte*>(static_cast<Buffer*>(context)->data()) + offset, bytes.data(), bytes.size()); }});
+  mmltk::common::logging::profile_add_value(range.section == CompiledDataset::ReadSection::Labels ? "compiled.stream.labels.bytes" : "compiled.stream.pixels.bytes", range.bytes);
+ } else slot.source->prepare_range(range, operation == ReadOperation::Prefault);
+ observe_read([&](auto& log) {
+  log.debug("event=compiled.stream.range stream={} slot={} operation={} section={} source={} destination={} bytes={}", reinterpret_cast<std::uintptr_t>(impl_.get()), index,
+   operation == ReadOperation::Advice ? "advice" : operation == ReadOperation::Prefault ? "prefault" : "gather",
+   range.section == CompiledDataset::ReadSection::Labels ? "labels" : "pixels", range.source_offset, range.destination_offset, range.bytes);
+ });
+}
+void CompiledImageStream::read_worker_returned() noexcept {
+ const std::lock_guard lock(impl_->mutex);
+ --impl_->read_workers;
+ // The final borrowed invocation makes no owner access after this boundary.
+ impl_->changed.notify_all();
+}
+void CompiledImageStream::finish_read(const std::size_t index) noexcept {
+ auto& current = *impl_->slots[index];
+ const auto observer = current.observer;
+ const auto transfer = current.transfer_observer;
+ auto failure = current.read_failure;
+ bool read = !failure && !current.cancelled.load(std::memory_order_acquire);
+ bool transfer_submitted = false;
+ try {
+  if (read) on_context(impl_->context, [&] {
+   if (impl_->config.loading.h2d_dataloader) {
+    const std::lock_guard submission(impl_->submission);
+    upload(index, current.reads.size() * current.source->header().image_stride, impl_->copy);
     impl_->enqueue(index, false, impl_->copy, transfer);
     transfer_submitted = true;
-   });
-  }
+   } else impl_->devices[index]->publish(nullptr);
+  });
  } catch (...) { failure = std::current_exception(); }
- // The observer publishes host availability only after the gather
- // and optional upload submission have completed.
+ observe_read([&](auto& log) {
+  log.debug("event=compiled.stream.read_complete stream={} slot={} read={} failed={} uploaded={}", reinterpret_cast<std::uintptr_t>(impl_.get()), index, read, bool(failure), transfer_submitted);
+ });
  {
-  std::lock_guard lock(impl_->mutex);
+  const std::lock_guard lock(impl_->mutex);
   current.read = read;
-  if (failure && !current.read_failure) current.read_failure = failure;
+  current.read_failure = failure;
   current.reading = false;
+  current.stage = Impl::ReadStage::Idle;
+  current.dispatched = false;
  }
  if (!transfer_submitted && transfer.complete) transfer.complete(transfer.context, index, failure);
  if (observer.complete) observer.complete(observer.context, index, failure, read);
  {
-  std::lock_guard lock(impl_->mutex);
+  const std::lock_guard lock(impl_->mutex);
   --current.read_callbacks;
-  // A shared pool's owner may retire this stream as soon as its last callback
-  // completes. Notify before releasing the lock and make no later owner access.
   impl_->changed.notify_all();
  }
 }
 void CompiledImageStream::cancel_reads() noexcept {
- for (auto& slot : impl_->slots) slot->cancelled.store(true, std::memory_order_release);
- impl_->changed.notify_all();
+ {
+  const std::lock_guard lock(impl_->mutex);
+  for (auto& slot : impl_->slots) if (slot->reading) slot->cancelled.store(true, std::memory_order_release);
+  impl_->changed.notify_all();
+ }
+ dispatch_reads();
 }
 void CompiledImageStream::cancel_read(const std::size_t index) noexcept {
- impl_->slots[index]->cancelled.store(true, std::memory_order_release);
- impl_->changed.notify_all();
+ {
+  const std::lock_guard lock(impl_->mutex);
+  auto& slot = *impl_->slots[index];
+  if (slot.reading) slot.cancelled.store(true, std::memory_order_release);
+  impl_->changed.notify_all();
+ }
+ dispatch_reads();
 }
 void CompiledImageStream::wait_reads() {
  if (impl_->pool && impl_->private_pool) { impl_->pool->wait_idle(); }
  std::unique_lock lock(impl_->mutex);
- impl_->changed.wait(lock, [&] { return std::ranges::all_of(impl_->slots, [](const auto& slot) { return !slot->reading && slot->read_callbacks == 0; }); });
+ impl_->changed.wait(lock, [&] { return impl_->read_workers == 0 && std::ranges::all_of(impl_->slots, [](const auto& slot) { return !slot->reading && slot->read_callbacks == 0; }); });
 }
 bool CompiledImageStream::wait_read(const std::size_t index) {
  std::unique_lock lock(impl_->mutex);
@@ -708,6 +915,9 @@ void CompiledImageStream::upload(const std::size_t slot, const std::size_t bytes
  mmltk::common::logging::profile_add_value("compiled.stream.h2d.bytes", bytes);
  mmltk::common::logging::profile_add_value("compiled.stream.h2d.submissions", 1U);
  gpu::ensure_cuda_ok(cudaMemcpyAsync(device.data(), host.data(), bytes, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream)), "compiled image upload");
+ observe_read([&](auto& log) {
+  log.debug("event=compiled.stream.upload stream={} slot={} bytes={}", reinterpret_cast<std::uintptr_t>(impl_.get()), slot, bytes);
+ });
 }
 void CompiledImageStream::wait_transfer(const std::size_t slot) {
  if (!impl_->config.loading.h2d_dataloader) {

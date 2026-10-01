@@ -3,6 +3,7 @@
 #include <cassert>
 #include "src/pch_std.h"
 #include "src/backend/data/compiled/compiled_file_utils.h"
+#include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data {
 CompiledDataset CompiledDataset::open(const std::filesystem::path& path, const AccessPattern access) {
  auto mapping = mmltk::common::io::MappedFile::try_open_readonly(path.string());
@@ -24,6 +25,8 @@ CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, 
  if (store.header_.num_images > image_limit) { throw std::runtime_error("compiled dataset exceeds the caller image limit"); }
  const mmltk::backend::data::CompiledFileSections sections = mmltk::backend::data::validate_compiled_file_sections(store.header_, store.mapping_.size());
  store.layout_ = sections.layout;
+ const int advice = access == AccessPattern::Normal ? MADV_NORMAL : access == AccessPattern::Sequential ? MADV_SEQUENTIAL : MADV_RANDOM;
+ store.mapping_.advise_aligned_range(store.layout_.data_offset, store.layout_.index_offset - store.layout_.data_offset, advice);
  store.image_entries_.resize(store.header_.num_slots);
  std::memcpy(store.image_entries_.data(), store.mapping_.data() + sections.index_offset, sections.expected_index_bytes);
  std::size_t eligible = 0;
@@ -44,8 +47,6 @@ CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, 
  if (eligible != store.header_.num_images) throw std::runtime_error("compiled eligible population differs from header");
  if (maximum_label_bytes != store.header_.max_label_bytes) throw std::runtime_error("compiled maximum label size differs from eligible payloads");
  store.catalog_ = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(store.header_));
- const int advice = access == AccessPattern::Normal ? MADV_NORMAL : access == AccessPattern::Sequential ? MADV_SEQUENTIAL : MADV_RANDOM;
- store.mapping_.advise_aligned_range(store.layout_.data_offset, store.layout_.index_offset - store.layout_.data_offset, advice);
  return store;
 }
 const std::filesystem::path& CompiledDataset::path() const noexcept { return path_; }
@@ -73,6 +74,69 @@ mmltk::backend::imaging::resample::ImageResizeGeometry CompiledDataset::geometry
  const mmltk::backend::data::ImageEntry& entry = image_entry(compiled_index);
  return mmltk::backend::imaging::resample::compute_image_resize_geometry(entry.original_width, entry.original_height, header_.image_width, header_.image_height, header_.resize_mode);
 }
+std::size_t CompiledDataset::gather_chunks(std::size_t images, std::size_t stride, std::size_t pitch) {
+ const auto bytes = mmltk::common::math::checked_multiply(images, mmltk::common::math::checked_add(stride, pitch, "compiled read extent overflow"), "compiled batch extent overflow");
+ return bytes / read_chunk_bytes + (bytes % read_chunk_bytes != 0);
+}
+CompiledDataset::UsedRangeCursor CompiledDataset::used_ranges(std::span<const CompiledImageRead> reads, std::optional<std::size_t> label_pitch, bool advice) const {
+ UsedRangeCursor cursor;
+ cursor.source_ = this;
+ cursor.reads_ = reads;
+ cursor.label_pitch_ = label_pitch.value_or(0);
+ cursor.section_ = label_pitch ? ReadSection::Labels : ReadSection::Pixels;
+ cursor.advice_ = advice;
+ cursor.normalize();
+ return cursor;
+}
+void CompiledDataset::UsedRangeCursor::normalize() {
+ while (source_) {
+  if (image_ == reads_.size()) {
+   if (section_ == ReadSection::Pixels) { source_ = nullptr; return; }
+   section_ = ReadSection::Pixels;
+   image_ = 0;
+   offset_ = 0;
+   continue;
+  }
+  const auto& entry = source_->image_entry(reads_[image_].index);
+  if ((section_ == ReadSection::Labels && entry.label_bytes == 0) ||
+      (advice_ && offset_ == 0 && image_ != 0 && reads_[image_ - 1].index == reads_[image_].index)) {
+   ++image_;
+   continue;
+  }
+  return;
+ }
+}
+std::optional<CompiledDataset::UsedRange> CompiledDataset::UsedRangeCursor::next(std::size_t limit) {
+ if (!limit || limit > read_chunk_bytes) throw std::invalid_argument("compiled read chunk limit is invalid");
+ std::optional<UsedRange> result;
+ while (source_) {
+  const auto& read = reads_[image_];
+  const bool labels = section_ == ReadSection::Labels;
+  const auto size = labels ? source_->image_entry(read.index).label_bytes : source_->layout_.image_stride;
+  const auto source_offset = (labels ? source_->layout_.label_offset(read.index) : source_->layout_.pixel_offset(read.index)) + offset_;
+  const auto destination_offset = (labels ? mmltk::common::math::checked_multiply(read.destination_offset / source_->layout_.image_stride, label_pitch_, "compiled label destination overflow") : read.destination_offset) + offset_;
+  if (result && (result->section != section_ || result->source_offset + result->bytes != source_offset ||
+                 (!advice_ && result->destination_offset + result->bytes != destination_offset))) break;
+  const auto bytes = std::min(size - offset_, limit - (result ? result->bytes : 0U));
+  if (result) result->bytes += bytes;
+  else result = UsedRange{section_, source_offset, destination_offset, bytes};
+  offset_ += bytes;
+  if (offset_ == size) { ++image_; offset_ = 0; }
+  normalize();
+  if (result->bytes == limit) break;
+ }
+ return result;
+}
+void CompiledDataset::prepare_range(const UsedRange& range, bool prefault) const {
+ mapping_.advise_aligned_range(range.source_offset, range.bytes, prefault ? MADV_POPULATE_READ : MADV_WILLNEED);
+}
+void CompiledDataset::gather_range(const UsedRange& range, const ImageDestination destination) const {
+ if (!destination.write) throw std::invalid_argument("compiled image destination has no writer");
+ if (range.source_offset > mapping_.size() || range.bytes > mapping_.size() - range.source_offset ||
+     range.destination_offset > destination.capacity || range.bytes > destination.capacity - range.destination_offset)
+  throw std::out_of_range("compiled read exceeds source or destination");
+ destination.write(destination.context, range.destination_offset, {reinterpret_cast<const std::byte*>(mapping_.data() + range.source_offset), range.bytes});
+}
 bool CompiledDataset::read_images(const std::span<const CompiledImageRead> reads, const std::span<std::byte> destination, const std::atomic<bool>& cancelled, const bool prefault) const {
  return read_images_to(reads,
   ImageDestination{
@@ -82,47 +146,21 @@ bool CompiledDataset::read_images(const std::span<const CompiledImageRead> reads
 }
 bool CompiledDataset::read_images_to(const std::span<const CompiledImageRead> reads, const ImageDestination destination, const std::atomic<bool>& cancelled, const bool prefault) const {
  if (!destination.write) throw std::invalid_argument("compiled image destination has no writer");
- constexpr std::size_t kReadExtent = 16U * 1024U * 1024U;
  const auto stride = static_cast<std::size_t>(header_.image_stride);
  for (const auto& read : reads) {
   if (!eligible(read.index) || read.destination_offset > destination.capacity || stride > destination.capacity - read.destination_offset)
    throw std::out_of_range("compiled image read exceeds source or destination");
  }
- // Request the admitted slot's source runs before copying any of them. Source
- // locality is independent of destination order; repeated images need advice
- // only once, but still have a separate destination for each logical draw.
- for (std::size_t first = 0; first < reads.size();) {
-  std::size_t end = first + 1;
-  auto last_index = reads[first].index;
-  while (end < reads.size() && reads[end].index >= last_index && (reads[end].index == last_index || layout_.pixel_offset(reads[end].index) == layout_.pixel_offset(last_index) + stride) &&
-         static_cast<std::size_t>(reads[end].index - reads[first].index) < std::max<std::size_t>(1U, kReadExtent / stride)) {
-   last_index = reads[end++].index;
-  }
-  const auto source_offset = layout_.pixel_offset(reads[first].index);
-  const auto bytes = (static_cast<std::size_t>(last_index - reads[first].index) + 1U) * stride;
-  for (std::size_t offset = 0; offset < bytes;) {
-   if (cancelled.load(std::memory_order_acquire)) return false;
-   const auto extent = std::min(kReadExtent, bytes - offset);
-   mapping_.advise_aligned_range(source_offset + offset, extent, MADV_WILLNEED);
-   offset += extent;
-  }
-  first = end;
+ auto advice = used_ranges(reads, {}, true);
+ while (const auto range = advice.next()) {
+  if (cancelled.load(std::memory_order_acquire)) return false;
+  prepare_range(*range, false);
  }
- for (std::size_t first = 0; first < reads.size();) {
-  std::size_t count = 1;
-  while (first + count < reads.size() && layout_.pixel_offset(reads[first + count].index) == layout_.pixel_offset(reads[first].index) + count * stride &&
-         reads[first + count].destination_offset == reads[first].destination_offset + count * stride && count < std::max<std::size_t>(1, kReadExtent / stride))
-   ++count;
-  const auto source_offset = layout_.pixel_offset(reads[first].index);
-  const auto bytes = count * stride;
-  for (std::size_t offset = 0; offset < bytes;) {
-   if (cancelled.load(std::memory_order_acquire)) return false;
-   const auto extent = std::min(kReadExtent, bytes - offset);
-   if (prefault) mapping_.advise_aligned_range(source_offset + offset, extent, MADV_POPULATE_READ);
-   destination.write(destination.context, reads[first].destination_offset + offset, {reinterpret_cast<const std::byte*>(mapping_.data() + source_offset + offset), extent});
-   offset += extent;
-  }
-  first += count;
+ auto gather = used_ranges(reads);
+ while (const auto range = gather.next()) {
+  if (cancelled.load(std::memory_order_acquire)) return false;
+  if (prefault) prepare_range(*range, true);
+  gather_range(*range, destination);
  }
  return !cancelled.load(std::memory_order_acquire);
 }

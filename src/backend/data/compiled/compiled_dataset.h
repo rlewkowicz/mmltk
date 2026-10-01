@@ -12,6 +12,7 @@
 #include <ranges>
 #include "src/backend/data/catalog/class_catalog.h"
 #include <memory>
+#include <optional>
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/io/file_memory.h"
 namespace mmltk::backend::data {
@@ -51,15 +52,39 @@ public:
  [[nodiscard]] std::span<const mmltk::backend::data::RLEPair> instance_rle(std::uint32_t slot, const mmltk::backend::data::PackedInstance& instance) const;
  [[nodiscard]] const float* image_pixels(std::uint32_t compiled_index) const;
  [[nodiscard]] mmltk::backend::imaging::resample::ImageResizeGeometry geometry(std::uint32_t compiled_index) const;
- // Called only by image-stream I/O workers. Each advised/populated range is
- // bounded; successful advice does not replace the actual gather copy. Source
- // runs across this admitted batch are advised before gathering, independently
- // of destination adjacency. Source-ordered inventories maximize coalescing.
+ static constexpr std::size_t read_chunk_bytes = 16U * 1024U * 1024U;
+ enum class ReadSection : std::uint8_t { Labels, Pixels };
+ struct UsedRange {
+  ReadSection section;
+  std::size_t source_offset, destination_offset, bytes;
+ };
+ // Borrows the slot's existing descriptors and resident index. No source index
+ // or payload is materialized. Advice coalesces source adjacency independently
+ // of destinations; gathering coalesces only disjoint contiguous destinations.
+ class UsedRangeCursor final {
+ public:
+  UsedRangeCursor() = default;
+  [[nodiscard]] std::optional<UsedRange> next(std::size_t limit = read_chunk_bytes);
+  [[nodiscard]] bool empty() const noexcept { return source_ == nullptr; }
+ private:
+  friend class CompiledDataset;
+  const CompiledDataset* source_ = nullptr;
+  std::span<const CompiledImageRead> reads_;
+  std::size_t label_pitch_ = 0, image_ = 0, offset_ = 0;
+  ReadSection section_ = ReadSection::Pixels;
+  bool advice_ = false;
+  void normalize();
+ };
+ [[nodiscard]] UsedRangeCursor used_ranges(std::span<const CompiledImageRead>, std::optional<std::size_t> label_pitch = {}, bool advice = false) const;
+ void prepare_range(const UsedRange&, bool prefault = false) const;
+ // Upper bound for useful gather records at the configured maximum batch.
+ [[nodiscard]] static std::size_t gather_chunks(std::size_t images, std::size_t image_stride, std::size_t label_pitch = 0);
  struct ImageDestination {
   void* context;
   std::size_t capacity;
   void (*write)(void*, std::size_t, std::span<const std::byte>);
  };
+ void gather_range(const UsedRange&, ImageDestination) const;
  [[nodiscard]] bool read_images_to(std::span<const CompiledImageRead>, ImageDestination, const std::atomic<bool>&, bool prefault = false) const;
  [[nodiscard]] bool read_images(std::span<const CompiledImageRead> reads, std::span<std::byte> destination, const std::atomic<bool>& cancelled, bool prefault = false) const;
 

@@ -36,7 +36,6 @@ void validate_config(const DatasetLoader::Config& config) {
  if (config.batch_size == 0) { throw std::invalid_argument("batch_size must be greater than zero"); }
  if (config.prefetch_factor <= 0) { throw std::invalid_argument("prefetch_factor must be greater than zero"); }
  if (config.gather_workers < 0) { throw std::invalid_argument("gather_workers must be non-negative"); }
- if (config.shuffle && config.gather_workers > 0 && config.gather_workers > config.prefetch_factor) { throw std::invalid_argument("gather_workers must not exceed prefetch_factor"); }
  if (config.batch_shard_count == 0) { throw std::invalid_argument("batch_shard_count must be greater than zero"); }
  if (config.batch_shard_rank >= config.batch_shard_count) { throw std::invalid_argument("batch_shard_rank must be less than batch_shard_count"); }
 }
@@ -229,7 +228,10 @@ DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::framew
  const auto& cpus = execution.placement.cpus;
  const int requested = config.gather_workers > 0 ? config.gather_workers : config.prefetch_factor;
  const auto useful_slots = std::max<std::size_t>(1U, std::min(static_cast<std::size_t>(config.prefetch_factor), state.batch_count));
- const auto workers = static_cast<size_t>(clamp_worker_count_to_cpus(std::min(requested, static_cast<int>(useful_slots)), cpus.size(), 1, 1));
+ const auto chunks = std::max<std::size_t>(1, CompiledDataset::gather_chunks(config.batch_size, state.source->header().image_stride, state.source->header().max_label_bytes));
+ const auto per_slot = config.loading.h2d_dataloader ? std::min<std::size_t>(chunks, requested) : 1U;
+ const auto useful_workers = useful_slots > static_cast<std::size_t>(requested) / per_slot ? static_cast<std::size_t>(requested) : useful_slots * per_slot;
+ const auto workers = static_cast<size_t>(clamp_worker_count_to_cpus(static_cast<int>(useful_workers), cpus.size(), 1, 1));
  state.slots.resize(useful_slots);
  state.batch_slots.resize(useful_slots);
  // Explicit epochs may repeat eligible slots to fill the configured batch.

@@ -41,7 +41,7 @@ public:
   struct Impl;
   std::unique_ptr<Impl> impl_;
  };
- enum class StorageKind : std::uint8_t { HostImages, DeviceImages, Labels, Metadata, ReadDescriptors, AnnotationViews };
+ enum class StorageKind : std::uint8_t { HostImages, DeviceImages, Labels, Metadata, ReadDescriptors, AnnotationViews, ReadTasks };
  struct StorageGrowthObserver {
   void* context = nullptr;
   // Successful owned capacity growth, not total malloc activity or lower-level
@@ -62,12 +62,17 @@ public:
   decltype(&cudaEventRecord) record_consumer = &cudaEventRecord;
   StorageGrowthObserver storage_growth{};
  };
+ enum class ReadOperation : std::uint8_t { Advice, Prefault, Gather };
  struct ReadObserver {
   void* context = nullptr;
   // Runs on an I/O worker before touching file-backed pixels. False
   // cancels the read, including an acceptance gate superseded by a view.
   bool (*before)(void*, std::size_t) = nullptr;
   void (*complete)(void*, std::size_t, std::exception_ptr, bool) noexcept = nullptr;
+  // Optional range observation immediately before the physical operation.
+  // Disjoint gather callbacks may run concurrently; no diagnostic work occurs
+  // when absent. This observation never establishes residency or completion.
+  void (*range)(void*, std::size_t, ReadOperation, const CompiledDataset::UsedRange&) = nullptr;
  };
  struct CompletionObserver {
   void* context = nullptr;
@@ -98,7 +103,8 @@ public:
  [[nodiscard]] mmltk::common::concurrency::WorkerPool& workers() noexcept;
  // Copies the compact read list into reused slot storage, then gathers in
  // source order while preserving packed destination offsets. At most one read
- // job per slot is admitted. Visible work can cancel queued prefetch jobs.
+ // transaction per slot is admitted; prepared tasks yield after bounded chunks.
+ // Visible work can cancel queued prefetch jobs.
  void submit(std::size_t slot, const CompiledDataset& source, std::span<const CompiledImageRead> reads, ReadObserver observer, CompletionObserver transfer = {nullptr, nullptr});
  void cancel_reads() noexcept;
  void cancel_read(std::size_t slot) noexcept;
@@ -127,6 +133,12 @@ public:
 private:
  struct Impl;
  void read_slot(std::size_t slot) noexcept;
+ void gather_chunk(std::size_t task) noexcept;
+ void dispatch_reads() noexcept;
+ void finish_read(std::size_t slot) noexcept;
+ void prefault_returned(std::size_t slot) noexcept;
+ void read_worker_returned() noexcept;
+ void operate_range(std::size_t slot, ReadOperation, const CompiledDataset::UsedRange&);
  void upload(std::size_t slot, std::size_t bytes, void* stream);
  struct Retention;
  std::unique_ptr<Retention> retention_;
