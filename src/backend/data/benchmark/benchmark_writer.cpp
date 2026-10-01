@@ -331,7 +331,9 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::si
    const CachedImageValidator header = [&](std::uint64_t, std::span<const std::uint8_t> encoded) {
     return header_decoder.read_header(encoded, state.actual_dimensions ? 0 : image.source_width, state.actual_dimensions ? 0 : image.source_height);
    };
-   input->payload = BenchmarkEncodedImage::open(std::move(file), image.source_image_id, header, state.cancellation, nullptr, allowance, input->payload, std::numeric_limits<std::uint32_t>::max());
+   auto opened = BenchmarkEncodedImage::open(std::move(file), image.source_image_id, header, state.cancellation, nullptr, allowance, input->payload, std::numeric_limits<std::uint32_t>::max());
+   if (input->payload && opened && !input->payload->same_file(*opened)) throw BenchmarkImageError("cached benchmark image changed its admitted inode");
+   input->payload = std::move(opened);
    if (!input->payload) throw BenchmarkImageError("cached benchmark image is missing or has an invalid size");
   }
   const auto& header = input->payload->header();
@@ -361,7 +363,20 @@ std::shared_ptr<BenchmarkPixelInput> BenchmarkSplitWriter::prepare_pixel(std::si
  return input;
 }
 CompileAllowance BenchmarkSplitWriter::pixel_input_allowance(const BenchmarkPixelInput& input) const { return input.payload->allowance(); }
+std::size_t BenchmarkSplitWriter::pixel_input_bytes(const BenchmarkPixelInput& input) const { return input.payload->size(); }
 CompileResources BenchmarkSplitWriter::pixel_resources(const BenchmarkPixelInput& input) const { return input.workspace->resources(); }
+CompileResources BenchmarkSplitWriter::preload_resources(const BenchmarkPixelInput& input) const {
+ auto resources = pixel_resources(input);
+ // Keep the following decoder/resizer arena naturally aligned.
+ const auto encoded = common_math::checked_add(pixel_input_bytes(input), std::size_t{63}, "benchmark preload alignment overflow") / 64 * 64;
+ resources.bytes = common_math::checked_add(resources.bytes, static_cast<std::uint64_t>(encoded), "benchmark preload workspace overflow");
+ return resources;
+}
+void BenchmarkSplitWriter::preload_pixel(BenchmarkPixelInput& input, CompileAllowance& allowance) {
+ const auto bytes = preload_resources(input).bytes - pixel_resources(input).bytes;
+ auto encoded = allowance.split_storage(bytes);
+ input.payload = input.payload->preload(std::move(encoded), impl_->cancellation);
+}
 std::shared_ptr<const detail::CompilePixelWorkspacePlan> BenchmarkSplitWriter::prepare_pixel_plan(std::size_t slot, const BenchmarkImageHeader& header) const {
  detail::CompilePixelPolicy policy;
  std::filesystem::path root;

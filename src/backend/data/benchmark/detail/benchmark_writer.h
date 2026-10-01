@@ -108,7 +108,12 @@ public:
   std::shared_ptr<const BenchmarkEncodedImage> payload = {}, std::shared_ptr<const detail::CompilePixelWorkspacePlan> plan = {});
  [[nodiscard]] std::shared_ptr<const detail::CompilePixelWorkspacePlan> prepare_pixel_plan(std::size_t slot, const BenchmarkImageHeader&) const;
  [[nodiscard]] CompileAllowance pixel_input_allowance(const BenchmarkPixelInput&) const;
+ [[nodiscard]] std::size_t pixel_input_bytes(const BenchmarkPixelInput&) const;
  [[nodiscard]] CompileResources pixel_resources(const BenchmarkPixelInput&) const;
+ [[nodiscard]] CompileResources preload_resources(const BenchmarkPixelInput&) const;
+ // Completes the already admitted input+conversion envelope on a file service.
+ // Its encoded slice and remaining conversion slice retain one physical arena.
+ void preload_pixel(BenchmarkPixelInput&, CompileAllowance&);
  void write_pixel(std::size_t slot, std::size_t lane, const std::shared_ptr<BenchmarkPixelInput>&, CompileAllowance, detail::CompilePixelWorkspace&);
  void write_pixel(std::size_t slot, std::size_t lane);
  void write_remaining(const BenchmarkWriteRequest&);

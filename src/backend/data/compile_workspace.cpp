@@ -34,7 +34,7 @@ CompileWorkspacePlan compile_workspace_plan(std::size_t workers, CompilePixelPol
  const CompileImageHeader normal{
   normal_extent, normal_extent, 0, false, CompileImageEncoding::Png, stbi_workspace_png_profile(normal_extent, normal_extent, std::max(encoded_window, pixel_input_bytes))
  };
- const auto pixels = checked_add(compile_pixel_workspace_plan(normal, policy).bytes(), pixel_input_bytes, "pixel input workspace overflow");
+ const auto pixels = checked_add(compile_pixel_workspace_plan(normal, policy).bytes(), std::max(encoded_window, pixel_input_bytes), "pixel input workspace overflow");
  const auto labels = CompiledLabelWorkspace::required_bytes(normal_extent);
  const std::array<CompileWorkspaceProfile, static_cast<std::size_t>(CompileWorkClass::Count)> available{
   {{64U << 10, 64U << 10}, {std::max(encoded_window, annotations.normal_bytes), 64U << 10}, {std::max(labels, annotations.normal_bytes), std::max(labels, annotations.completion_bytes)},

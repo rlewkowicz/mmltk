@@ -7,7 +7,9 @@
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <cerrno>
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -69,6 +71,33 @@ BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::pooled(CompileAllowance allowa
  return Ptr(new BenchmarkEncodedImage(std::move(allowance), std::move(backing), encoded, header, stamp, Storage::Pooled, true, std::move(file)));
 }
 BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::header_only() const { return Ptr(new BenchmarkEncodedImage({}, {}, {}, header_, identity_, Storage::HeaderOnly, false)); }
+BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::file_input() const {
+ // A charged mapping cannot outlive its byte allowance. Under record or pixel
+ // pressure retain only its identity; prepare_pixel checks that identity when
+ // it reopens the path, and rejects a replacement inode.
+ if (storage_ == Storage::Mapped) {
+  if (charged_bytes_) return header_only();
+  return Ptr(new BenchmarkEncodedImage({}, backing_, encoded_, header_, identity_, Storage::Mapped, false));
+ }
+ return file_backing_ ? file_backing_->file_input() : header_only();
+}
+BenchmarkEncodedImage::Ptr BenchmarkEncodedImage::preload(CompileAllowance allowance, Cancellation cancellation) const {
+ auto storage = allowance.workspace();
+ if (encoded_.empty() || storage.size() < encoded_.size()) throw std::logic_error("benchmark preload requires admitted input storage");
+ // Bounded copies fault the mapping here, on the persistent file service. The
+ // mapping owns the already-opened inode through rename/unlink and repair.
+ constexpr std::size_t chunk = 1U << 20;
+ for (std::size_t offset = 0; offset < encoded_.size();) {
+  throw_if_benchmark_cancelled(cancellation);
+  const auto count = std::min(chunk, encoded_.size() - offset);
+  std::memcpy(storage.data() + offset, encoded_.data() + offset, count);
+  offset += count;
+ }
+ throw_if_benchmark_cancelled(cancellation);
+ const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(storage.data()), encoded_.size());
+ auto backing = std::make_shared<const CompileAllowance>(allowance);
+ return pooled(std::move(allowance), std::move(backing), bytes, header_only());
+}
 BenchmarkEncodedImage::Opened::Opened(io::FileHandle file, std::uint64_t id, Identity stamp, CompileAllowance controls, Ptr admitted)
     : controls_(std::move(controls)), file_(std::move(file)), image_id_(id), identity_(stamp), admitted_(std::move(admitted)) {}
 BenchmarkEncodedImage::Opened::~Opened() = default;

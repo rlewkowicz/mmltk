@@ -10151,3 +10151,46 @@ TEST_CASE("component planning and physical output retain their admitted custody"
  CHECK(file_bytes(published.string() + ".inventory") == previous_inventory);
  CHECK(file_bytes(published.string() + ".complete.json") == previous_completion);
 }
+TEST_CASE("stock recovery compiles a completed physical archive while a peer download is held", "[benchmark][coconut][pipeline][preload]") {
+ using namespace std::chrono_literals;
+ ScopedTempDir root("coconut-ready-archive-held-download");
+ LocalCoconutRecipe local(root.path());
+ auto catalog = local.selected(CoconutValidation::Stock);
+ const std::array<std::pair<std::string, std::string>, 1> members{{{coco(7).member, white_jpeg(3, 3, 1U << 20)}}};
+ replace_physical_images(local.cache, catalog, CoconutImageNamespace::CocoTrain, members);
+ ServedPhysicalArchive held(local.cache, catalog, CoconutImageNamespace::CocoTrain, "held-train");
+ REQUIRE(std::filesystem::remove(held.path));
+ held.server.GateNextTransfer();
+ // Release the completed peer only after the download is physically held, so
+ // its later pixel receipt proves useful overlap rather than completion order.
+ std::optional<ArtifactLease> ready_archive(ArtifactLease::acquire(local.cache.locks / "objects365-patch-32.images.lock", {}));
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock, true});
+ config.resolution = 2;
+ config.perceptual_downscale = true;
+ config.resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
+ std::atomic<bool> cancelled{false}, delivered{false};
+ config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+ std::promise<void> pixels;
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event != "benchmark.image.stage_completed") return;
+  const auto value = Json::parse(fields);
+  if (value.at("stage") == "pixels" && value.at("image_id") == 1 && !value.at("failed").get<bool>() && !delivered.exchange(true)) pixels.set_value();
+ };
+ auto compiling = std::async(std::launch::async, [&] { compile_benchmark_recipe(config, &catalog); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  cancelled.store(true);
+  ready_archive.reset();
+  held.server.ReleasePartial();
+ });
+ REQUIRE(held.server.WaitPartial());
+ CHECK_FALSE(delivered.load());
+ ready_archive.reset();
+ mmltk::testsupport::await_test_promise(pixels, "completed archive pixels while a different archive downloads on one CPU", 5s);
+ CHECK(compiling.wait_for(0ms) == std::future_status::timeout);
+ CHECK_FALSE(std::filesystem::exists(config.output_dir / "train.bin"));
+ held.server.ReleasePartial();
+ mmltk::testsupport::await_test_future(compiling, "stock recovery joins the held download and publishes", 5s);
+ CHECK(CompiledDataset::open(config.output_dir / "train.bin").header().num_images == 4);
+ CHECK(CompiledDataset::open(config.output_dir / "val.bin").header().num_images == 1);
+ held.server.Check();
+}

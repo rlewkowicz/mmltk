@@ -42,6 +42,9 @@ public:
  enum class Storage : std::uint8_t { Pooled, Mapped, HeaderOnly };
  class Opened;
  [[nodiscard]] static Ptr pooled(CompileAllowance, std::shared_ptr<const void>, std::span<const std::uint8_t>, Ptr published);
+ // Copy this exact admitted inode into a supplied, reusable input slice. The
+ // caller admits conversion scratch in the same envelope before retaining it.
+ [[nodiscard]] Ptr preload(CompileAllowance, mmltk::common::concurrency::CancellationObservation) const;
  [[nodiscard]] static Ptr open(int directory, std::uint64_t, const CachedImageValidator&, mmltk::common::concurrency::CancellationObservation, CompileExecution* = nullptr, CompileAllowance = {},
   Ptr admitted = {}, std::uint64_t maximum_bytes = std::numeric_limits<std::uint64_t>::max());
  [[nodiscard]] static Ptr open(mmltk::common::io::FileHandle, std::uint64_t, const CachedImageValidator&, mmltk::common::concurrency::CancellationObservation, CompileExecution*, CompileAllowance,
@@ -58,6 +61,10 @@ public:
  static Ptr publish(int directory, std::uint64_t, std::span<const std::uint8_t>, BenchmarkImageHeader, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool&,
   CompileExecution*, CompileAllowance input = {}, bool retain_mapping = true);
  [[nodiscard]] Ptr header_only() const;
+ // Release charged mapped bytes under pressure, retaining their inode identity
+ // for checked reopening; independently owned uncharged mappings remain mapped.
+ [[nodiscard]] Ptr file_input() const;
+ [[nodiscard]] bool same_file(const BenchmarkEncodedImage& other) const noexcept { return identity_ == other.identity_; }
  [[nodiscard]] const BenchmarkImageHeader& header() const noexcept { return header_; }
  [[nodiscard]] std::span<const std::uint8_t> encoded() const noexcept { return encoded_; }
  [[nodiscard]] std::size_t size() const noexcept { return identity_[2]; }

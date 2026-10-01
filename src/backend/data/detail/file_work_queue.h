@@ -1,10 +1,13 @@
 #pragma once
 #include "src/backend/data/detail/compile_execution.h"
 #include <cstddef>
+#include <cstdint>
+#include <array>
 #include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string_view>
 namespace mmltk::common::concurrency {
 class WorkerPool;
 }
@@ -24,7 +27,18 @@ public:
   std::function<void(std::exception_ptr)> completed{};
   std::function<void()> work{};
   CompileWorkClass service_class = CompileWorkClass::Output;
+  std::uint64_t bytes = 0;
  };
+ struct Observation {
+  std::array<std::size_t, static_cast<std::size_t>(CompileWorkClass::Count)> queued{}, running{}, completing{};
+  std::size_t records = 0, capacity = 0, services = 0, busy = 0;
+  std::uint64_t admitted = 0, completed = 0, operation = 0, bytes = 0, duration_ns = 0;
+  CompileWorkClass work_class = CompileWorkClass::Count;
+  bool failed = false;
+ };
+ // Optional effects only, delivered outside queue/admission locks on callers
+ // and service workers. Counters and clocks stay disabled with no observer.
+ using Observer = std::function<void(std::string_view, const Observation&)>;
  struct RuntimeReadiness {
   void* context = nullptr;
   // After physical completion, completed, and actual capacity return. May
@@ -33,7 +47,7 @@ public:
   // custody through its return; do not wait for that completion in the callback.
   void (*available)(void*, void*) noexcept = nullptr;
  };
- FileWorkQueue(CompileExecution&, std::size_t records, std::size_t services = 1);
+ FileWorkQueue(CompileExecution&, std::size_t records, std::size_t services = 1, Observer = {});
  FileWorkQueue(mmltk::common::concurrency::WorkerPool&, std::size_t records, RuntimeReadiness = {nullptr, nullptr});
  ~FileWorkQueue();
  FileWorkQueue(const FileWorkQueue&) = delete;

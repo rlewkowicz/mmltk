@@ -157,6 +157,7 @@ struct CompileExecution::Impl {
  std::vector<std::shared_ptr<Readiness::State>> observers;
  std::size_t cursor = 0, record_limit = 0, services = 0;
  std::uint64_t admitted = 0, completed = 0;
+ std::array<std::uint64_t, kind_count> task_completed{}, task_duration_ns{}, task_max_duration_ns{};
  bool stopping = false, shutdown = false, floors = true;
  std::array<std::size_t, class_count> service_waiters{};
  std::exception_ptr failure;
@@ -405,6 +406,9 @@ struct CompileExecution::Impl {
   }
   result.admitted = admitted;
   result.completed = completed;
+  result.task_completed = task_completed;
+  result.task_duration_ns = task_duration_ns;
+  result.task_max_duration_ns = task_max_duration_ns;
   return result;
  }
  bool consume(std::size_t lane_index, bool blocking);
@@ -584,6 +588,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
  if (retired_idle.workspace) release_idle(std::move(retired_idle), retirement_lane);
  if (!selected) return !finished;
  const auto class_index = index(work_class(selected->task.kind));
+ const auto started = observer ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
  {
   Frame frame(*this, lane_index, static_cast<CompileWorkClass>(class_index));
   {
@@ -624,6 +629,13 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
  {
   const std::lock_guard lock(admission->mutex);
   --classes[class_index].running;
+  if (observer) {
+   const auto kind = static_cast<std::size_t>(selected->task.kind);
+   const auto duration = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+   ++task_completed[kind];
+   task_duration_ns[kind] += duration;
+   task_max_duration_ns[kind] = std::max(task_max_duration_ns[kind], duration);
+  }
  }
  complete(selected, error);
  return true;

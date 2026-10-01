@@ -64,6 +64,8 @@ struct CompileExecutionSnapshot {
  std::size_t workspace_contexts = 0, context_capacity = 0;
  std::size_t descriptor_limit = 0;
  std::uint64_t admitted = 0, completed = 0;
+ // Physical bounded task calls by CompileTaskKind, collected only when observed.
+ std::array<std::uint64_t, static_cast<std::size_t>(CompileTaskKind::Count)> task_completed{}, task_duration_ns{}, task_max_duration_ns{};
  std::optional<CompileReservationObservation> reservation;
 };
 class CompileResourceWait;
