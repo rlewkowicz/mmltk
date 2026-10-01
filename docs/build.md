@@ -20,6 +20,12 @@ use privileged containers and host resource mounts. Log and I/O diagnostic
 containers use restricted, read-only mounts; see [logging](logging.md) and
 [GPU execution](gpu-execution.md).
 
+Execution containers receive `SYS_NICE`, `IPC_LOCK`, unlimited memlock, and the
+configured nice limit. CPU compiler arenas use that page-locking capability
+without CUDA registration; failed placement or pinning fails preparation.
+The [compilation reference](compile-execution.md#fixed-pinned-arenas) owns the
+normal and exceptional storage budgets.
+
 ## Release builds
 
 ```bash
@@ -43,6 +49,13 @@ iced_aw, iced_plot, and `iced-fluent-theme` Rust sources/manifests; plot WGSL
 also invalidates the bundle. Configured host Rust tests compile with `--no-run`,
 separately from the optimized `trunk build --release` Wasm bundle. Execution and
 package selection belong to [validation](validation.md#native-and-browser-suites).
+
+The native [bundle publisher](../src/frontend/iced/browser_dist_publish.cpp)
+admits the hashed Wasm URL selected by the generated index before publication.
+It skips HTML/JavaScript comments while scanning quoted references, rejects
+ambiguous or escaping URLs, and requires the selected asset inside the bundle.
+The registered browser JavaScript suite exercises that publisher and checks
+the index's optional Iced window-trace hooks.
 
 Desktop startup resolves the native CLI beside `mmltk-browser-host` and gives
 that executable to the training process owner. Keep both installed siblings in

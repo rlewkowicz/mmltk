@@ -156,6 +156,37 @@ source/peer/document identity. Replaceable interaction scheduling is local
 queue policy, not an extra wire bit. The [GUI input reference](gui-interaction.md#shared-immediate-workspace-input)
 owns ordering and retained component behavior.
 
+## Dataset operation snapshots
+
+[artifact.h](../src/controller/contracts/artifact.h) declares
+`ArtifactCompileState` with `revision`, `generation`, `active`, `progress`, and
+`terminal`. `ArtifactUiState` structurally extends it with `inspection`.
+The generator emits both the borrowed projection and `apply_to` conversion;
+handwritten Rust retains no second member inventory.
+
+[DatasetSystem](../src/controller/subsystems/system/dataset_system.h) publishes
+`DatasetProgress { snapshot: ArtifactCompileState }` as LatestState, using its
+native revision for transport coalescing. `DatasetChanged` remains a critical
+full snapshot. Bootstrap and operation replies also carry full state; progress
+does not copy inspection products. Dataset revisions advance for accepted
+compile, changed progress, cancellation request, and terminal settlement.
+
+Both native and Rust pending queues replace an older latest-state record by
+appending the newer record after intervening discrete events. Older/equal
+queued revisions are discarded. The
+[Dataset reducer](../src/frontend/iced/src/view_model/reduction.rs) additionally
+checks operation generation, revision, and terminal rank: late progress cannot
+revive a finished operation, undo Stop, or overwrite a new generation. Conflicting
+facts at one revision or incompatible final outcomes are protocol errors.
+A full snapshot at the same compile revision can still refresh inspection.
+Reconnect admits current Bootstrap state through the ordinary schema boundary.
+
+The [compiler observer](compile-execution.md#progress-delivery) coalesces ordinary
+updates before snapshot copying and serialization. Native state revisions are
+product identity; trace sequences and rendering receipts remain diagnostics.
+This declaration change affects the schema fingerprint while retaining protocol
+17, so native host and generated client must be packaged together.
+
 ## CBOR encoding, limits and decoding
 
 The native [CBOR implementation](../src/frameworks/serialization/cbor_wire.cpp)

@@ -24,7 +24,8 @@
   local macros/aliases, structural projection, and safe mechanical formatting.
 - [Generated Rust and application CBOR](application-wire.md): canonical native
   schema, generator ownership and consumption, record representations,
-  encoding/decoding limits, compatibility, session admission, and failures.
+  revisioned Dataset progress, encoding/decoding limits, compatibility,
+  session admission, and failures.
 - [GUI interaction and presentation](gui-interaction.md): layout and controls,
   session Status, retained editing/charts/viewers, input ordering,
   image geometry, rendering, graphics custody, and redraws.
@@ -38,9 +39,13 @@
 - [Datasets and compilation](datasets.md): source annotations, format 10 fixed
   slots, in-place compaction, prepared batch capacity, resize geometry,
   perceptual downscaling, loading/leases, and Explore cache residency.
+- [Compilation execution and working storage](compile-execution.md): shared
+  Directory/benchmark ownership, live-class CPU floors and elastic work,
+  fixed pinned arenas, exceptional inputs, file preparation/completion,
+  physical-growth promises, and bounded progress delivery.
 - [Built-in benchmark datasets](benchmark-datasets.md): recipe membership,
   native import/provenance, optional mask recovery, persistent cache/repair,
-  shared execution/resource admission, archive and Parquet continuation,
+  recipe readiness, archive and Parquet continuation,
   immutable image/annotation custody, healthy subsets and incomplete provenance,
   progress units, and capacity limits.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA selection,
@@ -52,8 +57,8 @@
 - [Validation](validation.md): required gates, suite/filter selection, tidy,
   test-run replacement, PCH include audits, cleanup and raw-review tooling,
   declaration formatting, symbol/address and GPU diagnostics, evidence ownership,
-  rendered acceptance, numerical coverage, fixed-storage measurements, fixtures,
-  and evidence limits.
+  rendered acceptance, numerical coverage, compilation continuation records,
+  historical fixed-storage measurements, fixtures, and evidence limits.
 - [Headless Wayland](headless-wayland.md): private NVIDIA Weston setup, input
   seat, readiness, deadlines, shutdown, artifacts, and limitations.
 - [Logging](logging.md): automatic build/test/tidy transcripts, opt-in runtime

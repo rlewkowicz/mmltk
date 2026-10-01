@@ -198,6 +198,12 @@ compilation**, using the Dataset system's Stop operation. Progress shows the
 current work, separate **Acquisition**, **Labels/masks**, and **Pixels** tracks,
 and benchmark source details. The [progress reference](benchmark-datasets.md#reading-compilation-progress)
 defines their units, readable quantities, and source summaries.
+Native ordinary progress is coalesced at the
+[compiler observer](compile-execution.md#progress-delivery), and revisioned
+[Dataset snapshots](application-wire.md#dataset-operation-snapshots) guard
+delivery through cancellation, terminal state, and reconnect. The current-work
+caption follows remaining native work when Indexing finishes; track state is
+independent of that caption.
 After those tracks settle, **Compacting** reports the live pixel/label bytes
 processed before sync and publication. Completed track bars alone do not settle
 the Compile action. Rejected-image and annotation counts remain distinct from
@@ -1073,6 +1079,15 @@ release them; normal retirement does not depend on JavaScript collection.
 
 The visible graphics/window loop can continuously redraw the completed fallback;
 native dirty rendering progresses independently on events.
+
+During native compilation, canvas resizing and actual Wayland fullscreen
+entry/exit retain Iced layout, surface configuration, and presentation. The
+[Dataset acceptance sequence](validation.md#dataset-presentation-and-lifecycle)
+joins advancing native revisions with actual root bounds and successful present
+after each resize, without pointer, wheel, or keydown stimuli. A document fullscreen
+flag alone does not establish that the Wayland window resized. Gated
+[window and resize observations](logging.md#dataset-presentation-evidence)
+observe these boundaries without driving native work or requesting redraws.
 
 Show FPS enables one component-owned counter of actual browser queue
 submissions containing workspace draws, including retained pixels. Several

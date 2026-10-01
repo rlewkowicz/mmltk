@@ -80,8 +80,11 @@ priority, and required storage I/O priority before admission. The wrapper
 supplies execution capabilities and nice/memlock limits. Denied required
 placement or policy is an operation failure.
 
-Owned local host storage is page-rounded, prefaulted, residency-checked, and
-registered for CUDA with reusable capacity. Foreign and file-cache pages keep
+GPU transfer host storage is page-rounded, prefaulted, residency-checked, and
+registered for CUDA with reusable capacity. CPU compiler arenas instead use
+explicit Linux `mlock` custody in `NumaMemory`; their
+[checked fixed-bank and exceptional policies](compile-execution.md#fixed-pinned-arenas)
+require no CUDA context. Foreign and file-cache pages keep
 their actual ownership. CUDA stream priority does not establish DMA-engine
 priority. The implementation starts in
 [src/common/system](../src/common/system) and
@@ -91,6 +94,9 @@ Each training rank resolves placement for its own device and can preload
 independently. [Training loader ownership](rfdetr-training.md#logical-lanes-and-global-batch)
 defines sharing and scoped cancellation. [Compiled loading](datasets.md#why-compiled-loading-is-fast)
 owns physical read order and independent upload/consumer retirement.
+Runtime prefault and bounded gather continuations use the already-owned reader
+pool, with each stream retaining its configured task ceiling. The shared file
+operation boundary does not add compiler scheduling classes to GPU loading.
 
 ## H2D and GDRCopy
 

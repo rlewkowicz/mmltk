@@ -144,6 +144,9 @@ annotation metadata, and provenance without a model-layer dependency.
 
 [FileLayout](../src/backend/data/compiled/compiled_file_layout.h) owns checked
 fixed-block address and payload arithmetic. The shared
+[CompiledSlotStorage](../src/backend/data/detail/compiled_slot_storage.h) owns
+occupied-range preparation and borrowed pixel/label writes; its staged inode
+retains mutation and growth custody. The
 [compactor](../src/backend/data/compiled/compiled_file_compaction.cpp) finalizes
 both directory and benchmark output in the staged inode.
 [CompiledDataset](../src/backend/data/compiled/compiled_dataset.h) owns bounded
@@ -164,18 +167,29 @@ copy, visibility, and interaction.
 [dataset_compile_progress.h](../src/backend/data/compiler/dataset_compile_progress.h)
 owns the shared acquisition, labels/masks, and pixel tracks plus benchmark source
 observations. `ArtifactProgress` carries those declarations directly into generated
-Rust. The [benchmark guide](benchmark-datasets.md#overlapping-acquisition-labels-and-pixels)
+Rust; `ArtifactCompileState` supplies the revisioned operation projection shared
+by full Dataset snapshots and LatestState progress. The
+[application boundary](application-wire.md#dataset-operation-snapshots) owns
+its wire/reduction rules. The [benchmark guide](benchmark-datasets.md#overlapping-acquisition-labels-and-pixels)
 locates the ordinary readiness, generation-custody, and split-writer owners;
 its [progress reference](benchmark-datasets.md#reading-compilation-progress)
 defines the units for both benchmark and Directory compilation.
 
-Benchmark execution and resource admission belong to
-[BenchmarkCompilePipeline](../src/backend/data/benchmark/detail/benchmark_pipeline.h).
-Recipes retain membership and recovery policy; the shared Curl owner retains
-transport, the archive owner retains opened generations, and the split writer
-retains stable physical placement and publication. The pipeline's compile-only
-source/image join admits pixel and label production independently; final
-selection settles recipe membership and the selected label claim.
+Directory and benchmark execution share
+[CompileExecution](../src/backend/data/detail/compile_execution.h), its fixed
+pinned arena bank and allowances, and the bounded
+[FileWorkQueue](../src/backend/data/detail/file_work_queue.h). The
+[execution reference](compile-execution.md) owns class floors, elastic CPU
+admission, normal/exceptional storage, physical completion, and progress delivery.
+[BenchmarkCompilePipeline](../src/backend/data/benchmark/detail/benchmark_pipeline.h)
+retains its source/image join, selected claims, withdrawal, and attempt drain.
+Recipes retain membership and recovery policy; Curl owns transport, archives
+retain opened generations, and split writers retain physical placement and
+publication. Pixels and labels advance independently through those joins.
+[coconut_import.h](../src/backend/data/benchmark/coconut/detail/coconut_import.h)
+owns import continuations and retained row/recovery readiness;
+[coconut_annotations.h](../src/backend/data/benchmark/coconut/detail/coconut_annotations.h)
+owns component products and persisted admission.
 [coconut_input.h](../src/backend/data/benchmark/coconut/detail/coconut_input.h)
 owns parsed records, segment backing, import limits, and lexical member admission.
 Reflected inventory facts remain in
@@ -183,8 +197,11 @@ Reflected inventory facts remain in
 its [I/O boundary](../src/backend/data/benchmark/coconut/detail/coconut_inventory_io.h)
 owns checked encoding and retained serialization seals.
 [BenchmarkMappedArtifact](../src/backend/data/benchmark/detail/benchmark_staging.h)
-keeps temporary file, mapping, growth accounting, and last-consumer cleanup
-together. The benchmark guide owns
+combines immutable mappings with the neutral
+[StagedArtifact](../src/backend/data/detail/staged_artifact.h).
+[CoconutStaging](../src/backend/data/benchmark/coconut/detail/coconut_staging.h)
+retains generation-owned immutable ranges and their last-consumer block custody.
+The benchmark guide owns
 [parser continuation](benchmark-datasets.md#archive-and-parser-continuation),
 [memory/storage admission](benchmark-datasets.md#memory-descriptors-and-storage),
 and [immutable cache custody](benchmark-datasets.md#persistent-cache-and-publication).
@@ -295,6 +312,12 @@ its owned cancellation storage, settling any in-flight callback first.
 
 [file_memory.h](../src/common/io/file_memory.h) owns file handles, mappings, and
 shared destination-parent creation, treating a bare filename's parent as `.`.
+Its checked positional/vectored I/O handles interrupted and short calls;
+per-file allocation and reclaim policy remains with the staged owner.
+[WorkspaceBuffer](../src/common/types/workspace_buffer.h) supplies bounded typed
+views over caller-owned scratch. [NumaMemory](../src/common/system/numa_memory.h)
+owns Linux NUMA allocation and optional page-lock custody; compiler arena
+selection remains data-owned.
 [json_file.h](../src/common/io/json_file.h) supplies append and atomic JSON
 publication; [StagingDirectory](../src/common/io/staging_directory.h) owns
 temporary-directory cleanup until publication. Domain owners retain staging,

@@ -207,6 +207,12 @@ Key option groups (required fields and defaults remain in command help):
 | `rfdetr evaluate`, `validate` | One backend or ordered multi-backend report, respectively; independent `--candidate-count` and `--eval-max-dets` |
 | Train / Predict counts | Train exposes `--eval-max-dets`; Predict uses `--max-dets-per-image`; [count semantics and zero defaults](rfdetr-workflows.md#model-input-and-detection-selection) |
 
+Both `compile` routes expose `--workers` as a shared CPU budget. It respects
+eligible CPUs; live work classes and bounded file/Curl service use that budget.
+The [compilation reference](compile-execution.md) owns scheduling, checked
+page-locked storage preparation, and exceptional inputs. Worker count is not
+a count of independent per-source controller pools or a process-memory cap.
+
 [RF-DETR workflows](rfdetr-workflows.md) owns checkpoint, metric, and history behavior.
 Train, predict and evaluate accept `--compile-mode none|selective|full`.
 The [native selective contract](rfdetr-training.md#native-selective-compilation)

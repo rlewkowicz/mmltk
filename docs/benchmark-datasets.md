@@ -63,8 +63,10 @@ and validation membership.
 
 [coconut_parquet.cpp](../src/backend/data/benchmark/coconut/coconut_parquet.cpp) reads bounded
 Arrow record batches for embedded PNG masks, `segments_info`, and `image_info`.
-[coconut_annotations.cpp](../src/backend/data/benchmark/coconut/coconut_annotations.cpp) owns
-external JSON/archive admission and component construction;
+[coconut_import.cpp](../src/backend/data/benchmark/coconut/coconut_import.cpp) owns
+external JSON/archive admission, retained rows, and ready normalization/recovery;
+[coconut_annotations.cpp](../src/backend/data/benchmark/coconut/coconut_annotations.cpp)
+owns persisted component admission, assembly, and publication;
 [coconut_physical.cpp](../src/backend/data/benchmark/coconut/coconut_physical.cpp)
 consumes physical archives independently and joins image identities, and
 [coconut_native_image.cpp](../src/backend/data/benchmark/coconut/coconut_native_image.cpp)
@@ -178,7 +180,7 @@ ordinary normalization.
 
 [CoconutRecoveryOriginals and CoconutMaskRecovery](../src/backend/data/benchmark/coconut/detail/coconut_mask_recovery.h)
 share one immutable physical-image lookup per admitted original generation and
-reuse per-lane RLE scratch. Recovered support retains its original backing
+reuse context-owned RLE scratch. Recovered support retains its original backing
 through the last consumer. A dropped slot is a declared thing with zero panoptic
 support and no authoritative box. A boxed, present-empty mask is already a valid
 object and is not a dropped slot. Recovery requires matching physical namespace, image
@@ -218,13 +220,13 @@ they are not converted into optional-source omissions.
 
 The [compiler](../src/backend/data/benchmark/benchmark_compiler.cpp) constructs
 [BenchmarkCompilePipeline](../src/backend/data/benchmark/detail/benchmark_pipeline.h)
-before source preparation. Ready metadata, headers, pixel decode/resize,
-normalization, recovery, labels, archive work, and cache writes share its CPU
-lanes. The configured worker count is clamped to the process's assigned CPUs.
-Source controllers own I/O, lifecycle locks, and dependency waits outside those
-lanes. Jobs blocked on resources do not prevent another feasible job in the
-same stage from running. One CPU uses cooperative ready work between bounded
-parser/consumer steps; a library call is not interrupted midway.
+before source preparation. The pipeline owns source/image joins and selected
+label claims; ready metadata, headers, pixel decode/resize, normalization,
+recovery, labels, gathering, archive work, and cache writes use the data-owned
+[shared execution kernel](compile-execution.md#owners-and-ready-work).
+Its live-class floors, elastic lanes, and bounded file service also serve
+Directory compilation. The configured worker count respects assigned CPUs;
+source policy and dependency custody stay with the recipe/import owners.
 
 Acquisition has independent connection admission through
 [BenchmarkCurl](../src/backend/data/benchmark/detail/benchmark_curl.h).
@@ -261,9 +263,12 @@ images; it does not prevent independent pixel conversion.
 Image publications capture source generation, attempt, and mutation custody.
 The compile-only source-family/image-ID join retains one compact per-image
 state and stable slot; duplicate readiness cannot create duplicate pixel work.
-Pixels and labels write independently. Lane-owned label output remains alive
-through its synchronous write, then its reusable workspace serves the next
-sample. No complete-image queue or global label/run prefix inventory is needed.
+Pixels and labels write independently. The pinned label-output lease moves to
+the bounded file operation and remains alive through physical completion, then
+its workspace becomes reusable. Independent image/label publication uses bounded
+completion windows refilled by completion order; a slow earlier image does not
+serialize ready peers. No complete-image queue or global label/run prefix
+inventory is needed.
 A failed body can retain useful header geometry while its image is repaired.
 Old publications cannot attach to replacement generations or attempts.
 
@@ -295,6 +300,12 @@ nonpreemptible grants last through that reader's active stream and leave
 consumer capacity available. Returning decoder capacity does not release
 encoded bytes still held by another consumer.
 
+Ordinary compilation selects forward streaming extraction. A parallel gzip
+backend requires its complete fixed workspace and helper-CPU grant to be
+admitted; it is not multiplied by the number of source controllers. Suspending
+an archive retires its decoder without allocating replacement state while
+consumers retain the opened generation and their encoded bytes.
+
 [JSON discovery](../src/backend/data/benchmark/benchmark_json.cpp) walks the
 document structure once and yields bounded record ranges. Semantic parsing
 retains canonical rows, source offsets, and reusable parser/mask scratch.
@@ -322,6 +333,22 @@ archive prefixes may need replay. A contended physical-source lock also lets
 settled metadata retire its Arrow projection before waiting. Borrowed PNG spans
 retain their record batch and its complete allocation pool after a reader closes.
 
+[CoconutParquetPool](../src/backend/data/benchmark/coconut/detail/coconut_parquet_pool.h)
+allocates payload from pinned windows and keeps live batch addresses stable.
+The reader quiesces its allocation window before semantic consumers borrow
+capacity, then reacquires a complete window before its next library call.
+Recovery waits are per physical namespace/original generation; they park the
+affected rows while other parsing and normalization remain ready.
+
+[CoconutStaging](../src/backend/data/benchmark/coconut/detail/coconut_staging.h)
+appends immutable segments, mask support, native objects, and deferred input
+into generation-owned blocks, normally 4 MiB. A short aligned claim is separate
+from file-service preparation and payload fill. Published ranges never move;
+their block survives through its last borrower even after the append owner
+retires. Normalized component assembly plans disjoint record/run destinations
+and gathers bounded chunks on shared lanes, retaining canonical source order
+and backing through completion.
+
 Ready-input arrival determines physical slot placement. Source annotation order
 has its own authority:
 
@@ -336,48 +363,31 @@ has its own authority:
 
 ### Memory, descriptors, and storage
 
-[Resource allowances](../src/backend/data/benchmark/detail/benchmark_resources.h)
-admit input, working storage, and completion needs together. Encoded capacity,
-retained Arrow allocations, archive workspace, bounded handoffs, and reusable
-decoder/normalizer/recovery/label scratch stay charged until their physical
-backing is released. Shared backing is charged once. A stopped input reader
-can lend unused promised workspace to ready pixel/label consumers only within
-a stable allocation window; borrowers and their scratch settle before that
-reader allocates again. Idle oversized scratch yields under pressure.
+The [shared preparation and admission rules](compile-execution.md#fixed-pinned-arenas)
+own the checked normal budget, fixed pinned contexts, separate library charges,
+descriptor commitments, and exclusive oversized lineage. Source readers, Arrow
+batches, encoded images, and output leases retain their physical custody across
+parked work. The normal bank stays pinned while borrowers change.
 
-The private transient scheduling target is
-`min(6 GiB, max(256 MiB, 64 MiB × admitted worker count))`. It is neither a
-process-memory cap nor a public tuning option. A legal oversized operation can run without
-competing transient users and finish its dependent consumers. Canonical
-metadata, originals, and normalized/native products retain their own backing;
-their overlap can exceed the transient target. Mapped/staged annotation products
-keep the file, mapping, and charged custody together through their last consumer.
-Completed compiled labels live in sample slots rather than an unbounded RAM
-queue. This remains the existing worker-scaled 6 GiB ceiling, not a new RSS cap.
-Whole-image JPEG/PNG decode and resizing retain their existing storage needs
-and allocation-failure behavior.
+Benchmark source windows are bounded by actual admitted headers/rows and
+independent completion windows. Reader future growth is distinct from immutable
+live backing and ready-row scratch. Optional originals, component planning, and
+physical output preparation share admission without one controller per worker.
+Mapped/staged annotation products retain their file, mapping, and charged
+custody through the last consumer. Canonical metadata and immutable retained
+products can outlive transient work and exceed its normal-arena bound.
 
-Descriptor admission measures process headroom and reserves dependent reader,
-writer, and transport needs before retaining their source. Copied allowances
-share the same commitment; nested consumers cannot spend a promise twice.
-Closing a reader returns its own descriptors and unused commitments while
-published descendants retain theirs. Small retained file/lease controls have
-separate accounting from transient decoder workspace.
-
-[StorageReservationPool](../src/backend/data/benchmark/benchmark_storage.cpp)
-shares one compile-scoped ledger keyed by destination filesystem. Downloads,
-image writes, caches, and split staging reserve outstanding physical growth;
-already allocated blocks are not counted again. Sparse logical file length is
-not allocated capacity. Allocation withdrawal precedes truncation/removal, and
-[BenchmarkStagedArtifact](../src/backend/data/benchmark/detail/benchmark_staging.h)
-keeps the file, growth reservation, and unpublished-file cleanup together.
-These reservations coordinate this compilation, not unrelated filesystem users.
+Downloads retain benchmark-specific storage estimates; the neutral
+[filesystem ledger and staged-file owner](compile-execution.md#file-preparation-and-settlement)
+coordinate downloads, images, caches, and split output on the same destination
+filesystem. Sparse logical length, occupied page allocation, and outstanding
+growth are separate facts. Completed compiled labels live in their sample slots.
 
 ## Persistent cache and publication
 
 Source-image validation and decoding recognize JPEG or PNG from the encoded
 content, including PNG payloads stored under `.jpg` archive members. The shared
-[image decoder](../src/backend/data/benchmark/benchmark_image_decoder.cpp) retains TurboJPEG
+[image decoder](../src/backend/data/compile_image_decoder.cpp) retains TurboJPEG
 for JPEG and uses the existing PNG decoder without recompressing the source.
 Cached image paths keep their stable `.jpg` spelling and original encoded bytes;
 PNG pixels, dimensions, and annotation joins remain intact.
@@ -468,6 +478,12 @@ and cannot become omissions. Reports retain the underlying failure and available
 image identity. Opt-in `benchmark.images.validation_failed`
 records include the archive member, source/shard, image ID, encoded byte count,
 and rejection reason.
+
+Coco custom can publish early labels while physical acquisition is still active.
+If acquisition retires that image generation for repair, required final assembly
+replays missing labels from the retained annotation product after the source
+settles. Cancellation and failures belonging to the unchanged image generation
+still propagate; retired early work cannot attach to replacement pixels.
 
 [CocoAnnotationCache](../src/backend/data/benchmark/detail/benchmark_annotation_cache.h)
 is the shared stock-annotation admission owner for Coco custom, Coconut's
@@ -566,8 +582,12 @@ process their eligible pixels. Phase completion follows actual range work.
 observations and compile-scoped artifact/indexing ledgers. An observed artifact
 with an unknown size makes its source and aggregate byte totals unknown; the
 GUI shows `?` and omits a determinate bar for that track. Totals can change as
-new artifacts are observed. The overall phase and current activity describe
-the latest observed work, not the only running lane.
+new artifacts are observed. At snapshot materialization, unfinished known
+indexing takes priority; afterward the caption selects active Pixels, unfinished
+admitted Labels, or outstanding acquisition. A settled Indexing count therefore
+does not leave that caption over ongoing pixel work. Planning, Compacting,
+Syncing, and Publishing retain their lifecycle boundaries. The selected phase
+describes one observed kind of work while other tracks can advance concurrently.
 
 Per-source rows retain actual bytes, resolved/selected images, retry counts,
 cache reuse, resume, and invalidated-image facts. Resolved images include
@@ -622,7 +642,12 @@ through [its source-status formatter](../src/backend/data/benchmark/benchmark_co
 native activity strings carry the operation description rather than a second
 encoded copy of the transfer quantities.
 
-Transfer and scan observations use existing bounded observation points.
+Exact native counters feed the shared
+[100 ms dirty-state delivery](compile-execution.md#progress-delivery). Ordinary
+snapshots coalesce before copying and serialization; lifecycle/repair boundaries
+and ordered publication flushes preserve their required observations. Intermediate
+source activity or throttle decisions may therefore be absent from delivered
+snapshots. Enabled source-activity traces retain those decisions separately.
 Enabled [benchmark traces](logging.md#benchmark-compilation-traces) expose cache,
 archive, transfer, and retry context independently of pixel probes. Diagnostic
 records do not authorize cache reuse, readiness, completion, or publication.

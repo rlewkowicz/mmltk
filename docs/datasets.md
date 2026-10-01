@@ -215,7 +215,10 @@ Rejected or speculative slots do not influence the maximum.
 
 [Compaction](../src/backend/data/compiled/compiled_file_compaction.cpp) moves only
 live pixel and label prefixes forward within the same staged inode, using at
-most 4 MiB of reusable scratch. It preserves physical slot IDs and sample-local
+most 4 MiB of reusable pinned scratch. Within each block it visits pixels then
+labels in increasing source order, reading a complete chunk before any
+overlapping destination write. Adjacent live extents can coalesce while that
+order remains intact. It preserves physical slot IDs and sample-local
 run offsets, reclaims unused extents where hole punching is supported, and
 truncates to the computed final length. No move buffer is needed when the label
 pitch is unchanged. Header and resident-metadata records are then written and synced
@@ -227,7 +230,7 @@ and preallocate page-covered pixel and used-label writes, not the entire sparse
 prefix. Stable block mappings survive growth while borrowed. Final file length
 still includes arithmetic holes and block/page padding; it is not the total
 number of bytes physically allocated or read by the loader. The
-[benchmark storage ledger](benchmark-datasets.md#memory-descriptors-and-storage)
+[shared storage ledger](compile-execution.md#file-preparation-and-settlement)
 coordinates outstanding growth on each destination filesystem.
 
 ### File header
@@ -373,6 +376,14 @@ and [perceptual shrinking](#optional-perceptual-downscaling) through
 provides matching controls. `rfdetr validate --resize-mode` affects source
 compilation only; existing bins retain their stored mode.
 
+Directory and benchmark compilation use one
+[execution and pinned-workspace boundary](compile-execution.md). Directory
+keeps numbered source slots and strict failures while ready image/label work
+shares CPU admission and bounded file preparation. Worker reassignment retains
+prepared buffers. Image headers determine actual decode/resize requirements;
+legal oversized work uses the explicit exceptional arena policy. CPU compiler
+arenas use Linux page locking, without a CUDA context requirement.
+
 To measure actual loading rather than inspect metadata:
 
 ```bash
@@ -388,7 +399,8 @@ inspection that does not read dataset contents or benchmark transfers.
 The [benchmark compiler](../src/backend/data/benchmark/benchmark_dataset_compiler.h)
 supports **Coco custom**, the existing COCO/Objects365/Open Images recipe, and
 **Coconut**, the full COCONut training recipe with three validation choices.
-It shares the compiled layout, resizer, and loader described here.
+It shares the execution kernel, pinned workspaces, slot storage, compiled
+layout, resizer, and loader described here.
 
 [Benchmark datasets](benchmark-datasets.md) owns recipes, import/provenance,
 mask recovery, acquisition/cache/repair, and capacity. Its
@@ -520,22 +532,38 @@ supplies draw order, rank slices, and Resume offset; the loader does not
 reshuffle them or choose model membership. Empty rank slices retain collective
 participation without allocating an empty forward batch.
 
-The stream sorts each slot's physical read descriptors by physical sample ID
-while retaining their destination offsets. Image order, repeated draws,
-annotation pointers, draw keys and delivered batch identity therefore still
-follow the logical schedule. Source runs, including isolated or repeated images,
-receive bounded `MADV_WILLNEED` advice before copying; only source-and-destination-contiguous
-runs can become one copy. Training opens the shared pixel source with random
-access advice, then supplies these explicit local read ranges. Annotation-only
+The stream sorts each slot's physical read descriptors before touching labels,
+retaining destination offsets. Image order, repeated draws, annotation pointers,
+draw keys and delivered batch identity therefore still follow the logical
+schedule. A slot-owned cursor covers used label prefixes and logical pixel
+ranges together. It deduplicates repeated source advice while retaining every
+logical destination copy; only source-and-destination-contiguous runs coalesce
+for gathering. Training opens the shared pixel source with random access
+advice, then supplies these explicit local read ranges. Annotation-only
 `describe_batch` views support [next-batch preparation](rfdetr-training.md#bounded-next-batch-preparation)
 without consuming the loader cursor or obtaining pixel custody.
+
+`MADV_WILLNEED` is advice, not completed I/O. When prefault is enabled, bounded
+`MADV_POPULATE_READ` operations run through `FileWorkQueue` on the stream's
+existing reader pool. Completion and actual capacity return wake the next
+continuation. Gather records issue at most 16 MiB per turn, preserve disjoint
+destinations, and yield to peer slots. H2D gathers can share available reader
+capacity; GDR gathers serialize a slot's writes through its mapped owner.
+The stream caps tasks by its configured worker count even when it borrows a
+larger pool. Compilation class floors do not enter runtime reader ownership.
+Cancellation settles prefaults, gathers, callbacks, and the existing GPU
+completion owners before source or slot reuse.
 
 ### Prepared batch storage
 
 The local schedule bounds slot count to the smaller of prefetch depth and
 locally scheduled batch count, retaining one slot when that count is zero.
-Worker count also respects useful slots and eligible CPUs. Every retained slot
-prepares the full configured maximum batch size before reads, including an
+Worker count respects useful bounded chunks across those slots and eligible
+CPUs. H2D can use multiple workers for a large slot; `gather_workers` is the
+ceiling, with zero selecting `prefetch_factor`. Inference and evaluation pass
+their configured reader ceiling through without clamping it to slot count.
+Every retained slot prepares the full configured maximum batch size before
+reads, including an
 empty shard's retained slot; later epochs can use repeated draws without
 growing its buffers.
 

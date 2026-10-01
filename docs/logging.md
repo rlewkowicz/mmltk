@@ -321,6 +321,8 @@ artifact names and monotonic timestamps do not join different runs.
 | --- | --- |
 | `benchmark.compile.paths` | Resolved `cache_root` and compiler `output_root`, with separate `*_truncated` and `*_utf8_replaced` diagnostic flags |
 | `benchmark.progress.activity` | Current `activity`, numeric `phase`, and optional numeric `source` |
+| `benchmark.progress.delivery` | Opt-in `produced`, `materialized`, `coalesced`, `delivered`, `pending`, and `high_water` counts from the bounded progress observer |
+| `compile.execution` | Shared class/CPU admission, parked/ready/running records, normal and exceptional pinned storage, active loans, descriptor promises, and completed work |
 | `benchmark.download.cache_hit`, `.preseeded` | Retained archive `artifact`, `bytes`, and admission `integrity` |
 | `benchmark.download.progress` | `artifact`, `completed_bytes`, `total_bytes`, `attempt`, `resumed`, `retained_bytes`, `durable_bytes`, and `redownload` |
 | `benchmark.download.segmented_resume_state`, `.partial_checkpoint` | Retained range state or ordinary-transfer checkpoint and resume eligibility |
@@ -372,6 +374,10 @@ For a capture produced by [the GUI example](#capture-one-reproduction):
   -q '@event=benchmark.resource.wait' \
   --format jsonl --limit 10
 ./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
+  -q '@event=compile.execution OR @event=benchmark.progress.delivery' \
+  --fields @event,live,baseline,elastic,ready,running,parked,normal_locked,leased,exceptional,exceptional_reserved,opaque_library,produced,materialized,coalesced,delivered,pending,high_water \
+  --format jsonl --limit 20
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
   -q '@event=benchmark.archive.image_ready OR @event=benchmark.annotations.cache_row OR @event:benchmark.labels' \
   --where 'image_id=2212' --format jsonl --limit 30
 ```
@@ -386,7 +392,7 @@ network liveness.
 
 Admission snapshots describe the shared ledger at an observation point, not
 process RSS, filesystem-wide reservations, or a deadlock diagnosis. The
-[resource reference](benchmark-datasets.md#memory-descriptors-and-storage)
+[resource reference](compile-execution.md#fixed-pinned-arenas)
 distinguishes transient workspace from retained canonical products.
 `benchmark.resource.wait` is emitted once per blocked reservation with tracing
 enabled. Its `parents` chain records available and borrowed continuation
@@ -395,6 +401,25 @@ Owner `id` and `parent` values are process-local addresses for that snapshot,
 and may be reused after retirement. The record is not a heartbeat: subsequent
 ledger changes during the same wait need not produce another snapshot. Disabled
 tracing does not collect this owner inventory.
+
+`compile.execution` uses canonical class order Acquisition, Extraction,
+Annotations, Pixels, Gather, Output for `live`, `baseline`, `ready`, and
+`running`; `parked` uses None, Dependency, Bytes, Descriptors, Cpu, Withdrawal.
+`external` and `services` describe grants within the same CPU budget.
+`normal_locked` is fixed normal backing; `resident` adds physically materialized
+exceptional backing, while `leased` counts normal slices currently borrowed.
+These are arena quantities, not measured process RSS. `exceptional_reserved`
+can precede materialization; `exceptional_peak` records the observed normal-plus-
+exceptional high-water commitment. `opaque_library` is the separate library
+charge. `protected_workspace`, `shared_workspace`, `compaction_workspace`,
+`workspace_contexts`, and `context_capacity` expose the checked preparation.
+`workspace_reuses` and `physical_retirements` are enabled-observer counters.
+
+Source progress facts remain exact while ordinary observations coalesce on the
+[dirty-state drainer](compile-execution.md#progress-delivery). Delivery counts
+measure observation work, not completed images. Tracing a source activity can
+retain a decision that no visible snapshot sampled; do not require one UI update
+per producer callback or infer scheduling from these effect-only identities.
 
 Metadata, originals, normalization, labels, and pixels can progress separately;
 `release_complete` is not a prerequisite for every image's label conversion.
@@ -449,6 +474,17 @@ Complete delivery is an acceptance mode, not the ordinary GUI's policy.
 Sources are [diagnostics_client.h](../src/controller/services/diagnostics/diagnostics_client.h),
 [runtime_diagnostics.cpp](../src/controller/services/diagnostics/runtime_diagnostics.cpp),
 and [desktop startup](../src/entrypoints/desktop/browser_runtime_entry.cpp).
+
+Enabled native application transport emits `browser.record.serialized` with
+encoded bytes in `value` and record priority in `detail`.
+`browser.server.record_coalesced`, `.stale_state_discarded`, and
+`.queue_high_water` report accumulated replacement/discard counts and peak
+pending occupancy since the preceding diagnostic flush. With surface tracing,
+Rust emits `iced.transport.produced`, `.coalesced`, `.stale`, `.enqueued`, and
+`.delivered`; queued records include occupancy and the 64-record capacity.
+These distinguish source materialization, encoding, transport retention, and
+model delivery. Coalescing preserves intervening discrete events, as described
+in [Dataset snapshot delivery](application-wire.md#dataset-operation-snapshots).
 
 Quiet acceptance still uses real receipts/input, accepted-unsent pressure,
 command settlement, and exact drawn-frame readiness. Its driver is separate
@@ -762,6 +798,8 @@ fixture matrix, real input, and native cancellation/restart requirements.
 | `integration.dataset_paint`, `.dataset_label`, `.dataset_clip`, `.dataset_font`, `.dataset_label_reference` | Actual control/label bounds and clip, available resolved paragraph metrics, and recovery-label shaping using the description's small-text metrics |
 | `integration.dataset_native_work`, `.dataset_native_track` | Native generation and exact current-work/track facts captured with the draw; `detail` contains JSON with decimal integer values |
 | `integration.compile_progress`, `.compile_metrics`, `.compile_cancelled`, `.dataset_complete` | Real native activity, metrics, inactive cancellation, and the later successful generation |
+| `integration.compile_resize_requested`, `.compile_resize_wait` | Resize request and an unmet predicate, with step/generation/revisions, viewport/fullscreen, input count, root, and presentation facts when available |
+| `integration.compile_resize` | Completed active-compilation resize: advancing native/root revisions, CSS/backing/configured/presented extents, actual UI root, scale, and zero recorded pointer/wheel/keydown events |
 | `integration.dataset_fixture`, `.dataset_pixels`, `.dataset_label_pixels`, `.dataset_divider_pixels` | Settled local fixture receipt, canvas contrast, visible label samples, and measured divider color/span/stroke/gaps |
 | `integration.dataset_reversal`, `.dataset_hidden_input`, `.dataset_drag_edit`, `.dataset_offscreen_release` | Actual interrupted motion, rejected outgoing input, settled drag-selection editing, and unchanged native value after offscreen release |
 | `integration.dataset_custody` | Probe admission/stimulus/outcome and retired-callback drain, with request scope, owner, geometry, snapshot/read/report counts, and replacement-owner isolation |
@@ -773,6 +811,24 @@ label-reference records use `a`/`b` for measured width/height and `c`/`d` for th
 small-text metrics. Observation keys and probe scopes belong only to acceptance
 diagnostics. They never become native operation generations, settings revisions,
 or resource-lifetime state.
+
+The compile-resize sequence uses steps 0/1 for 480×900 and 960×720 canvas sizes,
+then 2/3 for real fullscreen entry and exit. A successful record puts its facts
+in JSON `detail`; request/wait diagnostics expose fields directly. Wait `reason`
+identifies `request`, `root`, `native-progress`, `presentation`, `canvas-size`,
+`fullscreen-viewport`, `root-coverage`, `input`, `pending-resize`, `backing-size`,
+`configuration`, or `presented-size`. These records explain which predicate
+remains unmet; a wait record alone is not failure or a deadline extension.
+
+Iced's actual window loop emits gated `iced.window.resize_pending`,
+`.resize_applied`, `.requested`, `.redraw`, `.configured`, `.root`, `.draw`, and
+`.presented` observations. Model delivery adds `.model_resize`; Dataset draw
+observation adds `.root_draw`. The index bridge records sequences, actual
+dimensions, pending-resize state, root bounds, and request/redraw/configure/draw
+counters. Surface tracing or the installed acceptance observer enables these
+hooks. They neither request a redraw nor send application socket traffic.
+`presented` means successful Iced compositor presentation; physical Wayland/GPU
+completion retains its [independent evidence](#physical-presentation-evidence).
 
 A frame closes preceding row/paint/viewport/native observations. The audit checks
 complete work/track captions against both real generations; fixture completion
@@ -796,6 +852,10 @@ then replace `ARCHIVE_ID` with that run's identity:
   --fields @event,control,detail,a,b,c,d --format jsonl --limit 80
 ./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID \
   -q '@event=integration.dataset_custody' --format jsonl --limit 40
+./mmltk --logs --family latest-wayland-test --run ARCHIVE_ID \
+  -q '@event:integration.compile_resize OR @event:iced.window.' \
+  --fields @event,reason,step,generation,revision,detail,width,height,root,pending_resize \
+  --format jsonl --limit 60
 ```
 
 ## Start with a bounded investigation

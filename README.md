@@ -110,6 +110,12 @@ omissions; both output splits still need usable data. See the
 [built-in dataset guide](docs/benchmark-datasets.md) for those choices and for
 reading the independent acquisition, labels/masks, and pixel progress.
 
+Directory and benchmark compilation share available CPU capacity and reuse
+prepared, page-locked working buffers. Progress remains responsive while the
+window resizes, and Cancel settles native work before another run starts.
+The [compilation guide](docs/compile-execution.md) explains worker sharing,
+memory preparation, oversized inputs, and file settlement.
+
 ## Quick reference
 
 ```bash
