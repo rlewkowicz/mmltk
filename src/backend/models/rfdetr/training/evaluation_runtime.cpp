@@ -531,7 +531,7 @@ mmltk::backend::data::DatasetLoader::Config make_loader_config(const std::string
  config.batch_size = batch_size;
  config.shuffle = shuffle;
  config.prefetch_factor = prefetch_factor;
- config.gather_workers = std::clamp(gather_workers, 1, prefetch_factor);
+ config.gather_workers = std::max(gather_workers, 1);
  config.cpu_affinity = cpu_affinity;
  config.device_id = device_id;
  config.seed = seed;

@@ -1,6 +1,5 @@
 module;
 #include <filesystem>
-#include <algorithm>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -22,7 +21,7 @@ std::unique_ptr<mmltk::backend::data::DatasetLoader> make_loader(const std::file
  config.loading = execution;
  config.cpu_affinity = execution.cpu_affinity;
  config.prefetch_factor = static_cast<int>(prefetch_factor);
- config.gather_workers = execution.workers == 0 ? config.prefetch_factor : std::min(execution.workers, config.prefetch_factor);
+ config.gather_workers = execution.workers == 0 ? config.prefetch_factor : execution.workers;
  config.drop_last = false;
  return std::make_unique<mmltk::backend::data::DatasetLoader>(std::move(config), std::move(retirement));
 }

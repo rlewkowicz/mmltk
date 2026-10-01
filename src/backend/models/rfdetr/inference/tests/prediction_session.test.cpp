@@ -33,8 +33,12 @@
 #include "src/entrypoints/cli/tests/support/cli_path.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
+#include "src/common/system/cpu_affinity.h"
+#include "src/common/system/execution_policy.h"
 #include "src/backend/models/rfdetr/inference/dataset_batch_lease.h"
+#include <spdlog/sinks/callback_sink.h>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <algorithm>
 #include <span>
@@ -47,6 +51,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include "src/backend/models/rfdetr/core/gpu_batch_preprocessor.h"
 #include "src/backend/models/rfdetr/inference/prediction_capacity.h"
@@ -55,7 +60,9 @@
 #include "src/backend/models/rfdetr/inference/prediction_count.h"
 #include "src/backend/models/rfdetr/inference/prediction_raw_preparation.h"
 import mmltk.backend.models.rfdetr.inference.prediction;
+import mmltk.backend.models.rfdetr.inference.loader;
 import mmltk.backend.models.rfdetr.model_export;
+import mmltk.common.logging.mmltk_logging;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 using rfdetr::test_support::write_prediction_model;
 TEST_CASE("Fixed artifact batches preserve tails ordered lane reuse and callback retirement", "[model][rfdetr][prediction][gpu]") {
@@ -1035,6 +1042,64 @@ TEST_CASE("raw preparation settles submitted tensor copies and reports unobserva
  // The fake settlement failure did not poison actual hardware. Finish the
  // real work before these test-owned allocations leave scope.
  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+}
+TEST_CASE("compiled inference loader admits explicit readers beyond prefetch and retains default sizing", "[model][rfdetr][prediction][gpu][loader]") {
+ namespace data = mmltk::backend::data;
+ namespace gpu = mmltk::frameworks::gpu;
+ namespace system = mmltk::common::system;
+ namespace logging = mmltk::common::logging;
+ const mmltk::testsupport::ScopedTempDir root("inference-loader-readers");
+ // Three 12 MiB images provide three bounded gather chunks in one slot;
+ // the fourth image also exercises the factory's retained partial batch.
+ const data::testsupport::FixtureSpec fixture{.root_dir = root.path().string(), .width = 1024, .height = 1024, .num_images = 4, .background_images = 4};
+ data::testsupport::create_synthetic_dataset(fixture);
+ data::testsupport::compile_existing_fixture(fixture);
+ REQUIRE(cudaSetDevice(0) == cudaSuccess);
+ const auto placement = gpu::resolve_device_execution(0, system::NumaTopology::Capture());
+ rfdetr::InferenceExecutionConfig execution;
+ execution.h2d_dataloader = true;
+ execution.numa_node = placement.placement.numa_node;
+ execution.cpu_affinity = system::format_cpu_list(placement.placement.cpus);
+ const auto path = data::testsupport::compiled_bin_path(fixture);
+ std::atomic<std::size_t> admitted_readers{0U};
+ const auto observations = std::make_shared<spdlog::sinks::callback_sink_mt>([&](const spdlog::details::log_msg& message) {
+  if (std::string_view(message.payload.data(), message.payload.size()).starts_with("event=execution.placement owner=compiled-read ")) ++admitted_readers;
+ });
+ const auto previous_level = logging::level();
+ logging::set_level(spdlog::level::debug);
+ const mmltk::testsupport::ScopedTestCleanup restore_logging([&] {
+  logging::debug([&](auto& logger) { std::erase(logger.sinks(), observations); });
+  logging::set_level(previous_level);
+ });
+ logging::debug([&](auto& logger) { logger.sinks().push_back(observations); });
+ for (const auto [readers, prefetch] : std::array{std::pair{3, 1U}, std::pair{0, 1U}, std::pair{0, 2U}}) {
+  CAPTURE(readers, prefetch, placement.placement.cpus.size());
+  execution.workers = readers;
+  admitted_readers = 0U;
+  auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(rfdetr::DatasetBatchLease::kSourceRetirementCapacity);
+  auto loader = rfdetr::inference_detail::make_loader(path, 3U, execution, prefetch, authority);
+  const auto requested_readers = readers == 0 ? static_cast<int>(prefetch) : readers;
+  CHECK(admitted_readers.load() == static_cast<std::size_t>(system::clamp_worker_count_to_cpus(requested_readers, placement.placement.cpus.size(), 1, 1)));
+  CHECK(authority->fact().reservations == 1U);
+  CHECK(loader->num_batches() == 2U);
+  std::size_t delivered = 0U;
+  data::Batch batch;
+  while (loader->next_batch(batch)) {
+   CHECK(batch.num_images == (delivered == 0U ? 3U : 1U));
+   for (std::size_t image = 0U; image < batch.num_images; ++image) CHECK(batch.image_indices[image] == delivered + image);
+   loader->wait_batch(batch);
+   CHECK_FALSE(batch.image_custody.expired());
+   delivered += batch.num_images;
+   loader->release_batch(batch);
+  }
+  CHECK(delivered == 4U);
+  loader->synchronize();
+  loader.reset();
+  CHECK(authority->fact().reservations == 0U);
+  CHECK(authority->admission_open());
+ }
+ execution.workers = -1;
+ CHECK_THROWS_WITH(rfdetr::inference_detail::make_loader(path, 3U, execution, 1U), "gather_workers must be non-negative");
 }
 TEST_CASE("compiled prediction batch unwind closes shared source custody without losing the primary failure", "[model][rfdetr][prediction][gpu][custody]") {
  namespace data = mmltk::backend::data;

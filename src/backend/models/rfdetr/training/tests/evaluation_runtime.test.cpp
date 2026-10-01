@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cmath>
 #include <exception>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <stdexcept>
@@ -15,6 +16,24 @@
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <set>
 using namespace mmltk::backend::models::rfdetr;
+TEST_CASE("Training loader configuration preserves granted readers and scheduling inputs", "[rfdetr][evaluation][loader]") {
+ for (const int prefetch : {1, 4})
+  for (const int readers : {3, 0, -2}) {
+   CAPTURE(readers, prefetch);
+   const auto config = make_loader_config("compiled/train.bin", 17U, true, prefetch, readers, "2-5", 2, 91U, 1U, 3U);
+   CHECK(config.compiled_path == std::filesystem::absolute("compiled/train.bin").string());
+   CHECK(config.batch_size == 17U);
+   CHECK(config.shuffle);
+   CHECK(config.prefetch_factor == prefetch);
+   CHECK(config.gather_workers == (readers > 0 ? readers : 1));
+   CHECK(config.cpu_affinity == "2-5");
+   CHECK(config.device_id == 2);
+   CHECK(config.seed == 91U);
+   CHECK(config.batch_shard_rank == 1U);
+   CHECK(config.batch_shard_count == 3U);
+   CHECK(config.drop_last);
+  }
+}
 TEST_CASE("Training validation owns independent capacity and versioned immutable lane weights", "[rfdetr][evaluation][gpu]") {
  namespace data = mmltk::backend::data;
  const mmltk::testsupport::ScopedTempDir root("validation-forward-lanes");
@@ -32,9 +51,9 @@ TEST_CASE("Training validation owns independent capacity and versioned immutable
  auto runtime_config = resolve_runtime_config(12, 1, 2, {}, 0);
  runtime_config.workers = 12;
  RuntimeContext training(runtime_config);
- const data::DatasetLoader::Config loader_config{
-  .compiled_path = data::testsupport::compiled_bin_path(fixture), .batch_size = 1, .shuffle = false, .prefetch_factor = 2, .gather_workers = 1, .loading = data::data_loading_options(true)
- };
+ auto loader_config = make_loader_config(data::testsupport::compiled_bin_path(fixture), 1U, false, 1, 3, {}, 0, 42U);
+ loader_config.loading = data::data_loading_options(true);
+ loader_config.drop_last = false;
  TrainingValidationRuntime validation(request, training, std::make_unique<data::DatasetLoader>(loader_config), 1, true, EvaluationMetricSet::BBox, 3, "validation", false);
  REQUIRE(training.split().lane_threads == 1);
  REQUIRE(validation.lane_capacity() == 4);
