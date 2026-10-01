@@ -33,12 +33,10 @@ const CategoryLookup& coconut_categories() {
 }
 CoconutNativeImage::Read CoconutNativeImage::read(std::shared_ptr<const CoconutNativeImage> owner) {
  if (!owner) throw std::invalid_argument("missing native image custody");
- NormalizedAnnotationIndex index;
+ auto index = owner->admitted_.value_or(NormalizedAnnotationIndex{});
+ if (!owner->admitted_) index = seal_normalized_annotation_image(owner->lineage().index.source, owner->image_, owner->boxes(), owner->runs(), owner);
  static_cast<NormalizedAnnotationMetadata&>(index) = owner->lineage().index;
  index.rejected = owner->rejected();
- index.images = {&owner->image_, 1};
- index.boxes = owner->boxes();
- index.mask_rle_pairs = owner->runs();
  return {std::move(owner), NormalizedAnnotationReadView(std::move(index))};
 }
 BenchmarkLabelInput CoconutNativeImage::labels(std::shared_ptr<const CoconutNativeImage> owner) {
@@ -80,7 +78,7 @@ void CoconutNativeOutput::retain_support(std::span<const CoconutSegmentSupport> 
   common::math::checked_add(support_run_offset_, common::math::checked_multiply(support_runs_, sizeof(RLEPair), "COCONut support extent overflow"), "COCONut support extent overflow"),
   native_alignment);
 }
-void CoconutNativeOutput::fill() {
+void CoconutNativeOutput::fill(mmltk::common::concurrency::CancellationObservation cancellation) {
  const auto target = request_.target();
  if (!product_) return;
  if (!boxes_.empty()) std::memcpy(target.data(), boxes_.data(), boxes_.size_bytes());
@@ -103,6 +101,7 @@ void CoconutNativeOutput::fill() {
  product_->staged_ = true;
  std::vector<NormalizedBox>().swap(product_->boxes_);
  std::vector<RLEPair>().swap(product_->runs_);
+ product_->admitted_ = seal_normalized_annotation_image(product_->lineage().index.source, product_->image_, product_->mapped_boxes_, product_->mapped_runs_, product_->backing_, cancellation);
 }
 std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::stage(std::shared_ptr<const CoconutNativeImage> source, CoconutStaging& staging) {
  if (source->staged_ || (!source->backing_ && source->boxes().empty() && source->runs().empty())) return source;
@@ -133,6 +132,7 @@ std::shared_ptr<const CoconutNativeImage> CoconutNativeImage::bind(std::shared_p
  result->lineage_ = std::move(lineage);
  result->image_.source_shard = physical.shard;
  result->inventory_.physical = physical;
+ if (result->admitted_) result->admitted_ = rebind_normalized_annotation_image(*result->admitted_, result->lineage_->index.source, result->image_);
  result->input_identity_ = coconut_image_input_identity(result->lineage().component.annotation_input_identity, physical, result->lineage().component.original_annotation_identity);
  return result;
 }

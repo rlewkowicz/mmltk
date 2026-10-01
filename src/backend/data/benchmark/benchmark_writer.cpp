@@ -589,10 +589,12 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
   state.directory = {};
   state.directory_source = std::numeric_limits<std::uint16_t>::max();
  }
+ trace_benchmark_event(request.trace, "benchmark.compaction.started", [&] { return nlohmann::json{{"split", request.split.name}, {"images", slots.size()}, {"bytes", state.layout.total_size}}; });
  state.layout = compact_compiled_file(state.staging.file(), state.layout, index, request.cancel_requested, request.compaction, {[&](std::size_t offset, std::size_t bytes) {
   state.staging.allocate_range(offset, bytes);
  }, [&](std::size_t offset, std::size_t bytes) { return state.staging.reclaim_range(offset, bytes); }, [&](std::size_t bytes) { state.staging.resize_sparse(bytes); }},
   request.compaction_scratch);
+ trace_benchmark_event(request.trace, "benchmark.compaction.completed", [&] { return nlohmann::json{{"split", request.split.name}, {"images", slots.size()}, {"bytes", state.layout.total_size}}; });
  state.staging.reconcile();
  const auto header =
   make_file_header({common_math::checked_cast<std::uint32_t>(slots.size(), "benchmark image count overflow"), state.resolution, state.resolution, 3U, maximum, state.stride, state.resize_mode},
@@ -603,7 +605,9 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
  output.pwrite_all(&header, sizeof(header), 0);
  output.pwrite_all(index.data(), state.layout.index_size, state.layout.index_offset);
  state.staging.resize_sparse(state.layout.total_size);
+ trace_benchmark_event(request.trace, "benchmark.split_sync.started", [&] { return nlohmann::json{{"split", request.split.name}, {"bytes", state.layout.total_size}}; });
  output.sync_data();
+ trace_benchmark_event(request.trace, "benchmark.split_sync.completed", [&] { return nlohmann::json{{"split", request.split.name}, {"bytes", state.layout.total_size}}; });
  const auto persisted = read_compiled_header(output);
  (void)validate_compiled_file_sections(persisted, output.size());
  if (std::memcmp(&persisted, &header, sizeof(header))) throw std::runtime_error("staged benchmark header differs");

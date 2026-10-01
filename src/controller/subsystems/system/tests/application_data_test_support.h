@@ -49,9 +49,9 @@ public:
                .completed = 1U,
                .total = 2U,
                .tracks = {
-                .acquisition = {.total_known = true, .complete = true, .activity = mmltk::backend::data::DatasetCompileActivity::Unnecessary},
-                .labels = {.completed = 1U, .total = 1U, .total_known = true, .complete = true, .activity = mmltk::backend::data::DatasetCompileActivity::Complete},
-                .pixels = {.total = 1U, .total_known = true, .active = true, .activity = mmltk::backend::data::DatasetCompileActivity::Compiling}
+                .acquisition = {.total_known = true, .complete = true, .activity = mmltk::backend::data::DatasetCompileActivity::Unnecessary, .unit = mmltk::backend::data::DatasetCompileUnit::Bytes},
+                .labels = {.completed = 1U, .total = 1U, .total_known = true, .complete = true, .activity = mmltk::backend::data::DatasetCompileActivity::Complete, .unit = mmltk::backend::data::DatasetCompileUnit::Images},
+                .pixels = {.total = 1U, .total_known = true, .active = true, .activity = mmltk::backend::data::DatasetCompileActivity::Compiling, .unit = mmltk::backend::data::DatasetCompileUnit::Images}
                }
               });
   if (!gate_->Wait(stop)) return {.output = request.output, .cancelled = true};

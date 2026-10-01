@@ -1,6 +1,5 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/detail/storage_reservation.h"
-#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_catalog.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
@@ -57,6 +56,8 @@ private:
 // until this owner and every importer retire. The compiler replaces an artifact
 // only after withdrawal and settlement of its source publications/readers.
 class CoconutPhysicalMembership final {
+ struct Impl;
+
 public:
  // Synchronous observations of independently completed images and the source cursor.
  using Progress = std::function<void(CoconutEdition, const AdmittedRecipeArchive&, std::uint64_t image_id, std::uint64_t entries)>;
@@ -67,16 +68,34 @@ public:
  ~CoconutPhysicalMembership();
  CoconutPhysicalMembership(const CoconutPhysicalMembership&) = delete;
  CoconutPhysicalMembership& operator=(const CoconutPhysicalMembership&) = delete;
+ // Copies retain one observation; independent observations have independent
+ // custody. Releasing the last copy withdraws its callback without settling
+ // another observer of the same identity.
+ class Registration final {
+ public:
+  Registration() = default;
+  explicit operator bool() const noexcept { return bool(state_); }
+  [[nodiscard]] bool ready() const;
+  void subscribe(std::function<void(std::exception_ptr)>) const;
+
+ private:
+  friend class CoconutPhysicalMembership;
+  struct State;
+  std::shared_ptr<State> state_;
+ };
  struct Readiness {
+  // Early identity includes an admitted encoded header. Terminal identity
+  // also retains unreadable members for ordinary contextual rejection; neither
+  // observation promises successful pixels or final membership.
   std::optional<CoconutPhysicalImage> image;
   std::uint64_t generation = 0;
   bool terminal = false;
-  detail::CompileExecution::Completion changed;
+  Registration changed;
  };
  // Snapshot and next-change subscription share the owner's generation lock;
  // subscribers run after that lock is released. Terminal missing/ambiguous
  // identities have no image; resolve supplies their contextual rejection.
- // Terminal unreadable identities remain available for final pixel selection.
+ // terminal marks source/pixel settlement separately from recovery readiness.
  [[nodiscard]] Readiness readiness(CoconutEdition, const CoconutRecord&) const;
  // Annotation identity admission has no physical I/O or readiness wait. A
  // provisional identity supports normalization without granting eligibility.
@@ -103,7 +122,6 @@ public:
  [[nodiscard]] const CoconutPhysicalImage* find(CoconutImageNamespace, std::uint64_t) const noexcept;
 
 private:
- struct Impl;
- std::unique_ptr<Impl> impl_;
+ std::shared_ptr<Impl> impl_;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

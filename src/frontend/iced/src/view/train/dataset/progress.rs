@@ -5,7 +5,7 @@ pub(crate) mod fixtures;
 use crate::fluent_theme::Element;
 use crate::generated::{
     ArtifactTerminalOutcome, ArtifactUiState, BenchmarkDatasetSource, BenchmarkSourceProgress,
-    DatasetCompileActivity, DatasetCompilePhase, DatasetCompileTrack,
+    DatasetCompileActivity, DatasetCompilePhase, DatasetCompileTrack, DatasetCompileUnit,
 };
 use iced::Fill;
 use iced::widget::{Space, column, container, progress_bar, text};
@@ -96,7 +96,7 @@ fn quantity(completed: u64, total: Option<u64>, complete: bool, bytes: bool) -> 
     }
 }
 
-fn track_caption(track: &DatasetCompileTrack, bytes: bool) -> String {
+fn track_caption(track: &DatasetCompileTrack) -> String {
     let activity = if track.activity == DatasetCompileActivity::Unnecessary {
         "No acquisition needed"
     } else if track.complete {
@@ -120,9 +120,14 @@ fn track_caption(track: &DatasetCompileTrack, bytes: bool) -> String {
             track.completed,
             track.totalknown.then_some(track.total),
             track.complete,
-            bytes
+            track.unit == DatasetCompileUnit::Bytes
         )
     );
+    match track.unit {
+        DatasetCompileUnit::Rows => caption.push_str(" rows"),
+        DatasetCompileUnit::Images => caption.push_str(" images"),
+        DatasetCompileUnit::Items | DatasetCompileUnit::Bytes => {}
+    }
     if track.invalidated != 0 {
         caption.push_str(&format!(
             " · {} invalidated by repair",
@@ -141,7 +146,6 @@ fn track<Message: 'static>(
     id: &'static str,
     name: &'static str,
     fact: &DatasetCompileTrack,
-    bytes: bool,
 ) -> Element<'static, Message> {
     let bar: Element<'static, Message> = match track_ratio(fact) {
         Some(ratio) => progress_bar(0.0..=1.0, ratio).girth(4).into(),
@@ -150,7 +154,7 @@ fn track<Message: 'static>(
     container(
         column![
             text(name).size(12),
-            status_text(track_caption(fact, bytes)).size(12),
+            status_text(track_caption(fact)).size(12),
             bar
         ]
         .spacing(4)
@@ -338,7 +342,7 @@ pub(crate) fn view<Message: 'static>(state: Option<&ArtifactUiState>) -> Element
                 (1, "Labels/masks", &progress.tracks.labels),
                 (2, "Pixels", &progress.tracks.pixels),
             ] {
-                body = body.push(track(TRACK_IDS[index], name, fact, index == 0));
+                body = body.push(track(TRACK_IDS[index], name, fact));
             }
             for source in &progress.sources {
                 let mut row = column![

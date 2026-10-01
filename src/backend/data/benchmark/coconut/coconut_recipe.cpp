@@ -981,7 +981,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    if (std::ranges::find(sources, component.source()) == sources.end()) throw std::runtime_error("COCONut release references a namespace outside its selected recipe");
   retain_inputs();
   for (const auto& component : components) {
-   if (component.index().image_count() != 0 && !reusable.contains(component.source())) store_coconut_component(path_for(component.source()), component, cancellation, &reservations);
+   if (component.index().image_count() != 0 && !reusable.contains(component.source())) store_coconut_component(path_for(component.source()), component, cancellation, &reservations, trace);
   }
  }
  if (complete) {
@@ -1082,6 +1082,13 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  const bool needs_originals = config.selection.recover_dropped_masks || config.selection.validation == CoconutValidation::Stock;
  progress.label_plans(catalog.releases.size());
  retained.stock_validation = config.selection.validation == CoconutValidation::Stock;
+ if (progress.normalization_observer_enabled() && !retained.indexing) {
+  std::vector<std::uint64_t> rows;
+  rows.reserve(catalog.releases.size());
+  for (const auto& release : catalog.releases) rows.push_back(release.expected_rows);
+  retained.indexing = progress.indexing(rows);
+  if (!rows.empty()) retained.indexing->update(0, 0, progress);
+ }
  if (needs_originals) {
   const bool recover = config.selection.recover_dropped_masks;
   const bool stock = config.selection.validation == CoconutValidation::Stock;
@@ -1121,13 +1128,6 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
  } else {
   const std::lock_guard lock(retained.mutex);
   retained.originals_ready = true;
- }
- if (progress.normalization_observer_enabled() && !retained.indexing) {
-  std::vector<std::uint64_t> rows;
-  rows.reserve(catalog.releases.size());
-  for (const auto& release : catalog.releases) rows.push_back(release.expected_rows);
-  retained.indexing = progress.indexing(rows);
-  if (!rows.empty()) retained.indexing->update(0, 0, progress);
  }
  // Original preparation owns its prerequisite commitment. Release metadata
  // acquires only its own bounded source-consumer envelope and can start now.
@@ -1308,7 +1308,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
     products, identity, physical, directory, release_cancellation, execution ? &execution->storage() : nullptr, execution, [&](const CoconutInventoryImage& image, std::string_view reason) {
     rejected_identity = true;
     failures.reject(image.physical, image.release_image_id, release.name, 0, 0, reason);
-   });
+   }, trace);
    failures.flush();
    auto publication = ArtifactLease::acquire_charged(
     cache.locks / (std::string(release.name) + ".annotations.lifecycle.lock"), release_cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources());
@@ -1320,7 +1320,7 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
     const auto suffix =
      component.original_annotation_identity().empty() ? std::string{} : ".recovery-" + coconut_component_input_identity(identity, component.source(), source_recovery ? &*source_recovery : nullptr);
     const auto path = directory / (std::string(coconut_namespace_name(component.source())) + suffix + ".normalized.bin");
-    store_coconut_component(path, component, release_cancellation, execution ? &execution->storage() : nullptr);
+    store_coconut_component(path, component, release_cancellation, execution ? &execution->storage() : nullptr, trace);
     record_coconut_component(partial, release, component, path, cache);
     release_inputs.components.insert_or_assign({component.edition(), component.source()}, std::move(component));
    }

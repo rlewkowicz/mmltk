@@ -12,6 +12,7 @@ std::uint64_t replace_progress(const std::uint64_t aggregate, const std::uint64_
 using Clock = std::chrono::steady_clock;
 ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace, std::span<const BenchmarkDatasetSource> sources, std::function<void(std::exception_ptr)> failed)
     : callback_(std::move(callback)), failed_(std::move(failed)), trace_(trace) {
+ state_.tracks.labels.unit = DatasetCompileUnit::Items;
  if (!callback_ && !trace_) { return; }
  const auto source_progress = [](const BenchmarkDatasetSource source) {
   BenchmarkSourceProgress progress;
@@ -61,6 +62,7 @@ void ProgressReporter::invalidate_indexing(std::uint64_t count) {
 void ProgressReporter::invalidate_indexing_unlocked(std::unique_lock<std::mutex>& lock, std::uint64_t count) {
  if (count > indexed_completed_) throw std::underflow_error("benchmark indexing invalidation underflow");
  indexed_completed_ -= count;
+ indexing_settled_ = false;
  add_progress(state_.tracks.labels.invalidated, count, "benchmark indexing invalidation overflow");
  update_labels();
  if (state_.phase == DatasetCompilePhase::Indexing) state_.completed = indexed_completed_;
@@ -77,14 +79,22 @@ void ProgressReporter::compacting(std::size_t split, std::size_t completed, std:
  compaction_.at(split) = {completed, total};
  phase_unlocked(lock, DatasetCompilePhase::Compacting, compaction_[0].first + compaction_[1].first, compaction_[0].second + compaction_[1].second);
 }
-void ProgressReporter::phase_unlocked(std::unique_lock<std::mutex>& lock, const DatasetCompilePhase phase, const std::uint64_t completed, const std::uint64_t total) {
+void ProgressReporter::phase_unlocked(std::unique_lock<std::mutex>& lock, const DatasetCompilePhase phase, const std::uint64_t completed, const std::uint64_t total, bool indexing_facts) {
  flush_pixels_unlocked();
- const bool indexing_started = phase == DatasetCompilePhase::Indexing && !indexing_known_;
+ // A row ledger owns this track for its entire compile. Concurrent original
+ // index jobs retain their source activity/readiness and diagnostic counts;
+ // their item counts cannot replace or add to the aggregate row measure.
+ if (phase == DatasetCompilePhase::Indexing && indexing_ && !indexing_facts) return;
+ const bool indexing_started = phase == DatasetCompilePhase::Indexing && !indexing_started_;
  const bool background_indexing = phase == DatasetCompilePhase::Indexing && (state_.phase == DatasetCompilePhase::Extracting || state_.phase == DatasetCompilePhase::Pixels);
  if (phase == DatasetCompilePhase::Indexing) {
   indexed_completed_ = std::max(indexed_completed_, completed);
-  indexed_total_ = std::max(indexed_total_, total);
-  indexing_known_ = true;
+  indexed_total_ = total;
+  indexing_started_ = true;
+  if (!indexing_facts) {
+   indexing_known_ = total != 0;
+   indexing_settled_ = indexing_known_ && indexed_completed_ == total;
+  }
   update_labels();
  }
  if (background_indexing) {
@@ -127,17 +137,17 @@ void ProgressReporter::update_labels() {
   state_.total = label_plans_.size();
  }
  auto& labels = state_.tracks.labels;
+ // Rows and release jobs have different units. The label track retains rows;
+ // the top-level Labels phase reports the separately owned component jobs.
  labels.completed = indexed_completed_;
- add_progress(labels.completed, label_completed_, "benchmark labels completed overflow");
- labels.total = indexed_total_;
- add_progress(labels.total, label_plans_.size(), "benchmark labels total overflow");
+ labels.total = indexing_known_ ? indexed_total_ : 0;
  labels.total_known = indexing_known_;
- labels.complete = labels_admitted_ && indexing_known_ && labels.completed == labels.total;
- labels.active = !labels.complete && (indexed_completed_ < indexed_total_ || label_active_ != 0);
- labels.activity = labels.complete                        ? DatasetCompileActivity::Complete
-                   : label_active_ != 0                   ? DatasetCompileActivity::Preparing
-                    : indexed_completed_ < indexed_total_ ? DatasetCompileActivity::Normalizing
-                                                          : DatasetCompileActivity::Waiting;
+ labels.complete = labels_admitted_ && indexing_settled_ && label_completed_ == label_plans_.size();
+ labels.active = !labels.complete && ((indexing_started_ && !indexing_settled_) || label_active_ != 0);
+ labels.activity = labels.complete ? DatasetCompileActivity::Complete
+                   : label_active_ != 0 ? DatasetCompileActivity::Preparing
+                   : indexing_started_ && !indexing_settled_ ? DatasetCompileActivity::Normalizing
+                                        : DatasetCompileActivity::Waiting;
 }
 void ProgressReporter::label_plans(std::size_t total) {
  if (!callback_) return;
@@ -156,7 +166,6 @@ void ProgressReporter::label_plan_started(std::size_t slot) {
  const bool invalidated = plan == LabelPlan::Complete;
  if (invalidated) {
   --label_completed_;
-  add_progress(state_.tracks.labels.invalidated, 1, "benchmark label invalidation overflow");
  }
  plan = LabelPlan::Active;
  ++label_active_;
@@ -178,7 +187,6 @@ void ProgressReporter::label_plan_completed(std::size_t slot) {
 void ProgressReporter::discard_label_plans() {
  if (!callback_) return;
  std::unique_lock lock(mutex_);
- add_progress(state_.tracks.labels.invalidated, label_completed_, "benchmark label invalidation overflow");
  label_completed_ = label_active_ = 0;
  label_plans_.clear();
  labels_admitted_ = false;
@@ -200,7 +208,7 @@ void ProgressReporter::pixels(const std::uint64_t completed, const std::uint64_t
  if (total_known && completed > total) throw std::logic_error("benchmark pixel count exceeds total");
  if (completed < pixels.completed) add_progress(pixels.invalidated, pixels.completed - completed, "benchmark invalidated pixels overflow");
  pixels.completed = completed;
- pixels.total = total;
+ pixels.total = total_known ? total : 0;
  remaining_pixels_.store(total_known ? total - completed : 0, std::memory_order_release);
  pixel_total_known_.store(total_known, std::memory_order_release);
  pixels.total_known = total_known;
@@ -434,27 +442,31 @@ void ProgressReporter::update_acquisition() {
   state_.total = acquisition.total;
  }
 }
-IndexingProgressTotals::IndexingProgressTotals(std::span<const std::uint64_t> totals) {
+IndexingProgressTotals::IndexingProgressTotals(std::span<const std::uint64_t> totals) : unsettled_(totals.size()) {
  releases_.reserve(totals.size());
  for (const auto total : totals) {
   if (total > std::numeric_limits<std::uint64_t>::max() - total_) throw std::overflow_error("benchmark indexing total overflow");
   total_ += total;
-  releases_.push_back({0, total});
+  unknown_ += total == 0;
+  releases_.push_back({0, total, total, false});
  }
- // CLEANUP-OFF: shared guard and locking only; update clamps observations while settle replaces final counts.
+}
+void IndexingProgressTotals::publish(std::unique_lock<std::mutex>& lock, ProgressReporter& reporter) {
+ reporter.state_.tracks.labels.unit = DatasetCompileUnit::Rows;
+ reporter.indexing_known_ = unknown_ == 0;
+ reporter.indexing_settled_ = unsettled_ == 0;
+ reporter.phase_unlocked(lock, DatasetCompilePhase::Indexing, completed_, unknown_ ? 0 : total_, true);
 }
 void IndexingProgressTotals::update(std::size_t release, std::uint64_t completed, ProgressReporter& reporter) {
  if (!reporter.normalization_observer_enabled()) return;
  std::unique_lock lock(reporter.mutex_);
  auto& observation = releases_.at(release);
- // CLEANUP-ON
- // Ordinary observations remain monotonic within a retained release product.
- // Replacement explicitly withdraws that product before new callbacks begin.
- const auto admitted = std::max(observation.completed, observation.total ? std::min(completed, observation.total) : completed);
- if (admitted == observation.completed && reporter.indexing_known_) return;
- completed_ += admitted - observation.completed;
+ if ((observation.total || observation.settled) && completed > observation.total) throw std::overflow_error("benchmark indexing completion exceeds source total");
+ const auto admitted = std::max(observation.completed, completed);
+ if (admitted == observation.completed && reporter.indexing_started_) return;
+ completed_ = replace_progress(completed_, observation.completed, admitted);
  observation.completed = admitted;
- reporter.phase_unlocked(lock, DatasetCompilePhase::Indexing, completed_, total_);
+ publish(lock, reporter);
 }
 void IndexingProgressTotals::settle(std::size_t release, std::uint64_t completed, ProgressReporter& reporter) {
  if (!reporter.normalization_observer_enabled()) return;
@@ -463,20 +475,34 @@ void IndexingProgressTotals::settle(std::size_t release, std::uint64_t completed
  completed_ = replace_progress(completed_, observation.completed, completed);
  total_ = replace_progress(total_, observation.total, completed);
  if (completed < observation.completed) ProgressReporter::add_progress(reporter.state_.tracks.labels.invalidated, observation.completed - completed, "benchmark indexing settlement overflow");
- observation = {completed, completed};
+ if (!observation.settled) {
+  --unsettled_;
+  if (!observation.total) --unknown_;
+ }
+ observation.completed = observation.total = completed;
+ observation.settled = true;
  reporter.indexed_completed_ = completed_;
- reporter.indexed_total_ = total_;
- reporter.phase_unlocked(lock, DatasetCompilePhase::Indexing, completed_, total_);
+ publish(lock, reporter);
 }
 void IndexingProgressTotals::invalidate(std::size_t release, ProgressReporter& reporter, std::uint64_t rows) {
  if (!reporter.normalization_observer_enabled()) return;
  std::unique_lock lock(reporter.mutex_);
  auto& observation = releases_.at(release);
  const auto withdrawn = std::min(observation.completed, rows);
- if (!withdrawn) return;
  completed_ -= withdrawn;
  observation.completed -= withdrawn;
- reporter.invalidate_indexing_unlocked(lock, withdrawn);
+ if (observation.settled) {
+  ++unsettled_;
+  if (!observation.declared_total) ++unknown_;
+  total_ = replace_progress(total_, observation.total, observation.declared_total);
+  observation.total = observation.declared_total;
+  observation.settled = false;
+ }
+ // Reopening even an empty settled source revokes its extent/completion proof.
+ reporter.indexed_completed_ = completed_;
+ ProgressReporter::add_progress(reporter.state_.tracks.labels.invalidated, withdrawn, "benchmark indexing invalidation overflow");
+ publish(lock, reporter);
+ reporter.emit(lock, ProgressReporter::DeliveryMode::Boundary);
 }
 void ArtifactProgressTotals::update(const DownloadProgress& update, ProgressReporter& reporter) {
  if (!reporter.transfer_observer_enabled()) { return; }
@@ -532,7 +558,7 @@ void ProgressReporter::select_work_unlocked() {
  const auto& labels = state_.tracks.labels;
  const auto& pixels = state_.tracks.pixels;
  DatasetCompilePhase phase = state_.phase;
- if (indexing_known_ && indexed_completed_ < indexed_total_)
+ if (indexing_started_ && (!indexing_known_ || indexed_completed_ < indexed_total_))
   phase = DatasetCompilePhase::Indexing;
  else if (!pixels.complete && pixels.active)
   phase = DatasetCompilePhase::Pixels;
@@ -548,7 +574,7 @@ void ProgressReporter::select_work_unlocked() {
  switch (phase) {
   case DatasetCompilePhase::Indexing:
    state_.completed = indexed_completed_;
-   state_.total = indexed_total_;
+   state_.total = indexing_known_ ? indexed_total_ : 0;
    break;
   case DatasetCompilePhase::Labels:
    state_.completed = label_completed_;

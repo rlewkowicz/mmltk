@@ -169,10 +169,20 @@ public:
   std::span<const RLEPair> runs;
   std::uint64_t ordinal_base = 0;
   bool incomplete_ordinals = false;
+  Slice() = default;
+  Slice(NormalizedImage value, std::span<const NormalizedBox> objects, std::span<const RLEPair> masks, std::uint64_t base = 0, bool incomplete = false)
+      : image(value), boxes(objects), runs(masks), ordinal_base(base), incomplete_ordinals(incomplete) {}
+  [[nodiscard]] static Slice admitted(const NormalizedAnnotationIndex&, std::size_t image, std::uint64_t base = 0, bool incomplete = false);
+
+ private:
+  friend class NormalizedAnnotationAssembler;
+  [[nodiscard]] bool proven(BenchmarkDatasetSource) const noexcept;
+  std::shared_ptr<NormalizedAnnotationBacking> backing_;
+  std::size_t position_ = 0;
  };
  // Planning fixes canonical disjoint destinations before any worker writes.
  // Each task admits/copies at most 65,536 runs or 256 boxes, then yields.
- void gather(std::span<const Slice>, CompileExecution* = nullptr, detail::FileWorkQueue* = nullptr, const CompileAllowance& = {});
+ void gather(std::span<const Slice>, CompileExecution* = nullptr, detail::FileWorkQueue* = nullptr, const CompileAllowance& = {}, const BenchmarkTraceSink& = {});
  void begin_image(NormalizedImage);
  void append_box(NormalizedBox, std::span<const RLEPair>);
  [[nodiscard]] NormalizedAnnotationIndex finish(const BenchmarkTraceSink& = {});
@@ -190,6 +200,13 @@ private:
  bool finished_ = false;
  bool incomplete_gather_ = false;
 };
+// One immutable row admits its payload before publication. The backing owns a
+// copied image header and retains the actual range custody through every view.
+[[nodiscard]] NormalizedAnnotationIndex seal_normalized_annotation_image(BenchmarkDatasetSource, NormalizedImage, std::span<const NormalizedBox>, std::span<const RLEPair>,
+ std::shared_ptr<const void>, mmltk::common::concurrency::CancellationObservation = {});
+// Rebind identity/shard metadata while preserving exactly the admitted geometry
+// and payload. Changed dimensions or extents require fresh real admission.
+[[nodiscard]] NormalizedAnnotationIndex rebind_normalized_annotation_image(const NormalizedAnnotationIndex&, BenchmarkDatasetSource, NormalizedImage);
 [[nodiscard]] NormalizedAnnotationIndex seal_normalized_annotations(NormalizedAnnotationBuilder&&, mmltk::common::concurrency::CancellationObservation = {});
 [[nodiscard]] NormalizedAnnotationIndex seal_normalized_annotation_metadata(NormalizedAnnotationBuilder&&);
 void admit_normalized_annotations(const NormalizedAnnotationIndex&, mmltk::common::concurrency::CancellationObservation = {});

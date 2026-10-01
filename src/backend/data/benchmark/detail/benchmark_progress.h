@@ -83,7 +83,7 @@ public:
 private:
  friend class ArtifactProgressTotals;
  friend class IndexingProgressTotals;
- void phase_unlocked(std::unique_lock<std::mutex>&, DatasetCompilePhase, std::uint64_t, std::uint64_t);
+ void phase_unlocked(std::unique_lock<std::mutex>&, DatasetCompilePhase, std::uint64_t, std::uint64_t, bool indexing_facts = false);
  void invalidate_indexing_unlocked(std::unique_lock<std::mutex>&, std::uint64_t);
  void source_transfer_unlocked(std::unique_lock<std::mutex>&, const DownloadProgress&, const BenchmarkSourceProgress&);
  void source_images_unlocked(std::unique_lock<std::mutex>&, BenchmarkDatasetSource, std::uint64_t, std::uint64_t, std::string);
@@ -121,7 +121,7 @@ private:
  enum class LabelPlan { Waiting, Active, Complete };
  std::vector<LabelPlan> label_plans_;
  std::uint64_t label_completed_ = 0, label_active_ = 0;
- bool labels_admitted_ = false, indexing_known_ = false;
+ bool labels_admitted_ = false, indexing_started_ = false, indexing_known_ = false, indexing_settled_ = false;
  // Producers accumulate in cache-line-sized thread stripes. The bounded
  // set is compile-owned, so withdrawal/total changes can flush every live lane.
  struct alignas(64) PixelDelta {
@@ -145,9 +145,12 @@ public:
 
 private:
  struct Observation {
-  std::uint64_t completed = 0, total = 0;
+  std::uint64_t completed = 0, total = 0, declared_total = 0;
+  bool settled = false;
  };
+ void publish(std::unique_lock<std::mutex>&, ProgressReporter&);
  std::vector<Observation> releases_;
  std::uint64_t completed_ = 0, total_ = 0;
+ std::size_t unknown_ = 0, unsettled_ = 0;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

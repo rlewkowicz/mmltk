@@ -3393,19 +3393,19 @@ TEST_CASE("concurrent tracks preserve unique work through repair and settlement"
  progress.label_plan_started(1);
  progress.label_plan_completed(1);
  progress.flush();
- CHECK(latest.tracks.labels.completed == 8);
+ CHECK(latest.tracks.labels.completed == 6);
  progress.discard_label_plans();
  progress.label_plans(2);
  progress.flush();
  CHECK(latest.tracks.labels.completed == 6);
- CHECK(latest.tracks.labels.invalidated == 2);
+ CHECK(latest.tracks.labels.invalidated == 0);
  progress.label_plan_started(0);
  progress.label_plan_completed(0);
  progress.label_plan_completed(0);
  progress.label_plan_started(1);
  progress.label_plan_completed(1);
  progress.flush();
- CHECK(latest.tracks.labels.completed == 8);
+ CHECK(latest.tracks.labels.completed == 6);
  CHECK(latest.tracks.labels.complete);
  CHECK(latest.tracks.acquisition.active);
  progress.acquisition_complete();
@@ -3487,7 +3487,8 @@ TEST_CASE("preparation indexing totals preserve successful rows across owner rep
  reporter.flush();
  attempt.update(0, rows[0], reporter);
  reporter.flush();
- attempt.update(1, rows[1] + 1, reporter);  // Bad rows cannot overrun the denominator.
+ CHECK_THROWS_AS(attempt.update(1, rows[1] + 1, reporter), std::overflow_error);
+ attempt.update(1, rows[1], reporter);
  reporter.flush();
  REQUIRE(updates.size() == 6);
  CHECK(updates.front().completed == 0);
@@ -12803,4 +12804,149 @@ TEST_CASE("large pending image sets retire behind full physical records and leav
  CHECK(evidence.bounded);
  CHECK(evidence.observations > 0);
  CHECK(mmltk::common::io::sha256_file(request.output_path) == previous);
+}
+
+TEST_CASE("mixed annotation extents retain every row and independent pixels through settlement", "[benchmark][progress]") {
+ std::vector<BenchmarkCompileProgress> snapshots;
+ ProgressReporter reporter([&](const auto& snapshot) { snapshots.push_back(snapshot); }, {});
+ const std::array<std::uint64_t, 3> extents{241602, 0, 0};
+ auto& rows = *reporter.indexing(extents);
+ reporter.label_plans(3);
+ for (std::size_t i = 0; i < 3; ++i) reporter.label_plan_started(i);
+ reporter.pixels(16177, 0, false);
+ rows.update(0, 241596, reporter);
+ reporter.flush();
+ REQUIRE_FALSE(snapshots.empty());
+ CHECK(snapshots.back().tracks.labels.completed == 241596);
+ CHECK_FALSE(snapshots.back().tracks.labels.total_known);
+ CHECK(snapshots.back().tracks.labels.total == 0);
+ for (std::size_t release = 1; release < 3; ++release) {
+  rows.update(release, 64, reporter);
+  reporter.pixel_completed();
+  reporter.phase(DatasetCompilePhase::Indexing, release, 2);
+  reporter.flush();
+  CHECK(snapshots.back().tracks.labels.completed == 241596 + 64 * release);
+  CHECK(snapshots.back().tracks.pixels.completed == 16177 + release);
+  CHECK(snapshots.back().total == 0);
+ }
+ rows.settle(1, 64, reporter);
+ rows.settle(2, 64, reporter);
+ reporter.flush();
+ CHECK(snapshots.back().tracks.labels.total_known);
+ CHECK(snapshots.back().tracks.labels.total == 241730);
+ rows.settle(0, 241602, reporter);
+ reporter.flush();
+ CHECK(snapshots.back().tracks.labels.completed == 241730);
+ CHECK_FALSE(snapshots.back().tracks.labels.complete);
+ for (std::size_t i = 0; i < 3; ++i) reporter.label_plan_completed(i);
+ reporter.flush();
+ CHECK(snapshots.back().tracks.labels.completed == 241730);
+ CHECK(snapshots.back().tracks.labels.complete);
+ rows.invalidate(1, reporter);
+ reporter.flush();
+ CHECK_FALSE(snapshots.back().tracks.labels.total_known);
+ CHECK_FALSE(snapshots.back().tracks.labels.complete);
+ CHECK(snapshots.back().tracks.labels.invalidated == 64);
+ rows.settle(1, 64, reporter);
+ reporter.flush();
+ for (const auto& snapshot : snapshots) {
+  CHECK(snapshot.tracks.valid());
+  CHECK((snapshot.total == 0 || snapshot.completed <= snapshot.total));
+ }
+}
+TEST_CASE("an empty annotation extent is known only while its settlement remains admitted", "[benchmark][progress]") {
+ BenchmarkCompileProgress latest;
+ ProgressReporter reporter([&](const auto& snapshot) { latest = snapshot; }, {});
+ const std::array<std::uint64_t, 1> extent{0};
+ auto& rows = *reporter.indexing(extent);
+ reporter.label_plans(1);
+ reporter.label_plan_started(0);
+ rows.update(0, 0, reporter);
+ reporter.flush();
+ CHECK_FALSE(latest.tracks.labels.total_known);
+ rows.settle(0, 0, reporter);
+ reporter.label_plan_completed(0);
+ reporter.flush();
+ CHECK(latest.tracks.labels.total_known);
+ CHECK(latest.tracks.labels.complete);
+ rows.invalidate(0, reporter, 0);
+ reporter.flush();
+ CHECK_FALSE(latest.tracks.labels.total_known);
+ CHECK_FALSE(latest.tracks.labels.complete);
+ CHECK(latest.tracks.labels.invalidated == 0);
+ rows.update(0, 7, reporter);
+ reporter.flush();
+ CHECK(latest.tracks.labels.completed == 7);
+ CHECK(latest.total == 0);
+ rows.settle(0, 7, reporter);
+ reporter.flush();
+ CHECK(latest.tracks.labels.complete);
+ CHECK(latest.tracks.labels.total == 7);
+}
+TEST_CASE("normalized cache publication transfers one gathered inode and preserves independent destinations", "[benchmark][annotations][cache][resources]") {
+ mmltk::testsupport::ScopedTempDir root("normalized-cache-layout");
+ const auto input = label_projection_fixture(7);
+ auto metadata = static_cast<const NormalizedAnnotationMetadata&>(input);
+ metadata.split = "same-backing";
+ metadata.annotation_sha256 = std::string(64, 'a');
+ detail::StorageReservationPool storage(root.path());
+ NormalizedAnnotationAssembler assembly(metadata, {}, root.path(), &storage);
+ const std::array slices{NormalizedAnnotationAssembler::Slice::admitted(input.storage(), 0)};
+ std::uint64_t validated_runs = UINT64_MAX;
+ assembly.gather(slices, nullptr, nullptr, {}, [&](std::string_view event, const nlohmann::json& fields) {
+  if (event == "benchmark.annotations.gathered") validated_runs = fields.at("validated_runs");
+ });
+ auto index = assembly.finish();
+ CHECK(validated_runs == 0);
+ std::filesystem::path staged;
+ for (const auto& file : fs::directory_iterator(root.path())) staged = file.path();
+ REQUIRE_FALSE(staged.empty());
+ struct stat before{}, first{}, second{};
+ REQUIRE(::stat(staged.c_str(), &before) == 0);
+ const auto destination = root.path() / "first.bin";
+ std::vector<std::uint64_t> copied;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
+  if (event == "benchmark.annotations.cache_prepare") copied.push_back(fields.at("payload_copy_bytes"));
+ };
+ const auto completion = store_normalized_annotation_index(destination, index, {}, trace, &storage);
+ REQUIRE(::stat(destination.c_str(), &first) == 0);
+ CHECK(first.st_ino == before.st_ino);
+ CHECK_FALSE(fs::exists(staged));
+ REQUIRE(copied.size() == 1);
+ CHECK(copied.front() == 0);
+ const auto other = root.path() / "second.bin";
+ const auto another = store_normalized_annotation_index(other, index, {}, trace, &storage);
+ REQUIRE(::stat(other.c_str(), &second) == 0);
+ REQUIRE(::stat(destination.c_str(), &first) == 0);
+ CHECK(first.st_ino == before.st_ino);
+ CHECK(second.st_ino != first.st_ino);
+ CHECK(another->identity == completion->identity);
+ CHECK(mmltk::common::io::sha256_file(destination) == mmltk::common::io::sha256_file(other));
+ REQUIRE(copied.size() == 2);
+ CHECK(copied.back() == index.images.size_bytes() + index.boxes.size_bytes() + index.mask_rle_pairs.size_bytes());
+ const auto loaded = load_normalized_annotation_index(destination, index.source, index.split, index.annotation_sha256, {});
+ REQUIRE(loaded);
+ CHECK(std::memcmp(loaded->mask_rle_pairs.data(), input.storage().mask_rle_pairs.data(), input.storage().mask_rle_pairs.size_bytes()) == 0);
+ std::atomic<bool> cancelled{true};
+ CHECK_THROWS(store_normalized_annotation_index(destination, index, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), trace, &storage));
+ REQUIRE(::stat(destination.c_str(), &first) == 0);
+ CHECK(first.st_ino == before.st_ino);
+ CHECK(index.mask_rle_pairs.back().start == 4);
+}
+TEST_CASE("immutable row admission survives identity rebinding and rejects changed mask geometry", "[benchmark][annotations][resources]") {
+ const auto input = label_projection_fixture(7);
+ auto row = seal_normalized_annotation_image(input.source, input.image(0), input.storage().boxes, input.storage().mask_rle_pairs, input.storage().backing);
+ auto image = row.images.front();
+ image.source_shard = 4;
+ image.source_image_id = 8;
+ auto rebound = rebind_normalized_annotation_image(row, row.source, image);
+ CHECK(rebound.mask_rle_pairs.data() == row.mask_rle_pairs.data());
+ CHECK(rebound.images.front().source_shard == 4);
+ image.width = image.height = 1;
+ CHECK_THROWS(rebind_normalized_annotation_image(row, row.source, image));
+ auto slice = NormalizedAnnotationAssembler::Slice::admitted(rebound, 0);
+ slice.image.width = slice.image.height = 1;
+ NormalizedAnnotationAssembler assembly({}, {}, {});
+ CHECK_THROWS(assembly.gather(std::span(&slice, 1)));
+ CHECK_THROWS(assembly.finish());
 }

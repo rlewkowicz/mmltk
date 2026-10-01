@@ -60,6 +60,7 @@ MMLTK_REFLECT_ENUM(BenchmarkDatasetSource)
 MMLTK_REFLECT_FIELDS(BenchmarkSourceProgress)
 // Fixed-size observed facts: safe to snapshot in local compiler noexcept paths.
 enum class DatasetCompileActivity : std::uint8_t { Waiting, Unnecessary, Acquiring, Normalizing, Preparing, Compiling, Complete };
+enum class DatasetCompileUnit : std::uint8_t { Items, Bytes, Images, Rows };
 struct DatasetCompileTrack final {
  std::uint64_t completed = 0;
  std::uint64_t total = 0;
@@ -69,15 +70,16 @@ struct DatasetCompileTrack final {
  DatasetCompileActivity activity = DatasetCompileActivity::Waiting;
  // Successful contributions explicitly removed by repair, never attempts.
  std::uint64_t invalidated = 0;
+ DatasetCompileUnit unit = DatasetCompileUnit::Items;
  [[nodiscard]] bool valid() const noexcept {
-  return static_cast<std::uint8_t>(activity) <= static_cast<std::uint8_t>(DatasetCompileActivity::Complete) && (!total_known || completed <= total) && !(active && complete);
+  return static_cast<std::uint8_t>(unit) <= static_cast<std::uint8_t>(DatasetCompileUnit::Rows) && static_cast<std::uint8_t>(activity) <= static_cast<std::uint8_t>(DatasetCompileActivity::Complete) && (!total_known || completed <= total) && !(active && complete);
  }
  bool operator==(const DatasetCompileTrack&) const = default;
 };
 struct DatasetCompileTracks final {
- DatasetCompileTrack acquisition{};
- DatasetCompileTrack labels{};
- DatasetCompileTrack pixels{};
+ DatasetCompileTrack acquisition{.unit = DatasetCompileUnit::Bytes};
+ DatasetCompileTrack labels{.unit = DatasetCompileUnit::Images};
+ DatasetCompileTrack pixels{.unit = DatasetCompileUnit::Images};
  [[nodiscard]] bool valid() const noexcept { return acquisition.valid() && labels.valid() && pixels.valid(); }
  bool operator==(const DatasetCompileTracks&) const = default;
 };
@@ -93,6 +95,7 @@ struct DatasetCompileTracks final {
  return format("Acquisition", tracks.acquisition) + " | " + format("Labels/masks", tracks.labels) + " | " + format("Pixels", tracks.pixels);
 }
 MMLTK_REFLECT_ENUM(DatasetCompileActivity)
+MMLTK_REFLECT_ENUM(DatasetCompileUnit)
 MMLTK_REFLECT_FIELDS(DatasetCompileTrack)
 MMLTK_REFLECT_FIELDS(DatasetCompileTracks)
 }  // namespace mmltk::backend::data

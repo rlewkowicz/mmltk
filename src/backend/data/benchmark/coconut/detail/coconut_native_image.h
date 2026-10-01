@@ -67,6 +67,7 @@ public:
  [[nodiscard]] static Read read(std::shared_ptr<const CoconutNativeImage>);
  [[nodiscard]] static BenchmarkLabelInput labels(std::shared_ptr<const CoconutNativeImage>);
  [[nodiscard]] const std::string& input_identity() const noexcept { return input_identity_; }
+ [[nodiscard]] const NormalizedAnnotationIndex* admission() const noexcept { return admitted_ ? &*admitted_ : nullptr; }
  [[nodiscard]] const CoconutNativeLineage& lineage() const noexcept { return *lineage_; }
  [[nodiscard]] const NormalizedImage& image() const noexcept { return image_; }
  [[nodiscard]] std::span<const NormalizedBox> boxes() const noexcept { return mapped_boxes_.empty() ? std::span<const NormalizedBox>(boxes_) : mapped_boxes_; }
@@ -92,6 +93,7 @@ private:
  std::shared_ptr<const void> backing_;
  std::span<const NormalizedBox> mapped_boxes_;
  std::span<const RLEPair> mapped_runs_;
+ std::optional<NormalizedAnnotationIndex> admitted_;
  bool staged_ = false;
  bool required_labels_valid_ = true;
  AnnotationRejectCounts rejected_;
@@ -107,7 +109,7 @@ public:
  CoconutNativeOutput() = default;
  void retain_support(std::span<const CoconutSegmentSupport>, CoconutNativeSupport&);
  [[nodiscard]] CoconutStaging::Request& request() noexcept { return request_; }
- void fill();
+ void fill(mmltk::common::concurrency::CancellationObservation = {});
 
 private:
  friend class CoconutNativeWorkspace;

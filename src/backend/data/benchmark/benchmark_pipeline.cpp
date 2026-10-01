@@ -402,11 +402,11 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  std::unique_ptr<BenchmarkCurl> curl;
  detail::StorageReservationPool storage{".", {}};
  std::unique_ptr<CompileExecution::Readiness> readiness;
- Impl(std::size_t workers, std::span<const int> cpus, detail::CompileExecutionLimits limits, mmltk::common::concurrency::CancellationObservation cancel, BenchmarkTraceSink trace)
+ Impl(std::size_t workers, std::span<const int> cpus, detail::CompileExecutionLimits limits, mmltk::common::concurrency::CancellationObservation cancel, BenchmarkTraceSink trace_sink)
      : execution(workers, cpus, limits, cancel,
-        trace ? CompileExecution::Observer{[trace](std::string_view event, const detail::CompileExecutionSnapshot& value) {
+        trace_sink ? CompileExecution::Observer{[trace_sink](std::string_view event, const detail::CompileExecutionSnapshot& value) {
          if (value.reservation) {
-          trace_benchmark_event(trace, "benchmark.resource.wait", [&] {
+          trace_benchmark_event(trace_sink, "benchmark.resource.wait", [&] {
            const auto& request = *value.reservation;
            nlohmann::json result{
             {"file", request.location.file_name()}, {"line", request.location.line()}, {"function", request.location.function_name()}, {"requested_bytes", request.requested.bytes},
@@ -426,7 +426,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
           });
           return;
          }
-         trace_benchmark_event(trace, event, [&] {
+         trace_benchmark_event(trace_sink, event, [&] {
           return nlohmann::json{
            {"live", value.live}, {"baseline", value.baseline}, {"elastic", value.elastic}, {"ready", value.ready}, {"parked", value.parked}, {"running", value.running}, {"active", value.active},
            {"external", value.external}, {"services", value.services}, {"bytes", value.resources.bytes}, {"byte_target", value.byte_target}, {"normal_locked", value.normal_locked},
@@ -442,9 +442,9 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
         }}
               : CompileExecution::Observer{},
         std::make_exception_ptr(std::runtime_error("benchmark dataset compilation cancelled"))),
-       files(execution, std::max(std::size_t{4}, workers * 2), std::min(std::size_t{2}, workers), observe_files(trace, "output")),
-       image_files(execution, std::max(std::size_t{2}, std::min(std::size_t{4}, workers * 2)), std::min(std::size_t{2}, workers), observe_files(trace, "image")),
-       trace(std::move(trace)),
+       files(execution, std::max(std::size_t{4}, workers * 2), std::min(std::size_t{2}, workers), observe_files(trace_sink, "output")),
+       image_files(execution, std::max(std::size_t{2}, std::min(std::size_t{4}, workers * 2)), std::min(std::size_t{2}, workers), observe_files(trace_sink, "image")),
+       trace(std::move(trace_sink)),
        cancellation(cancel),
        label_workspaces(execution.workers()) {
   for (std::size_t i = 0; i < execution.workers(); ++i) pixel_workspaces.push_back(std::make_unique<detail::CompilePixelWorkspace>());

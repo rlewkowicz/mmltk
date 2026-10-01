@@ -329,6 +329,13 @@ struct PendingNativeImage {
  BenchmarkSourcePublication publication;
  std::string provisional_dependency;
  std::uint64_t physical_generation = 0, original_generation = 0;
+ CoconutPhysicalMembership::Registration physical_change;
+ using OriginalWait = std::pair<CoconutImageNamespace, std::uint64_t>;
+ std::optional<OriginalWait> original_wait;
+ enum class Readiness { Ready, Checking, Parked, Working, Retired };
+ Readiness readiness = Readiness::Parked;
+ bool notified = false, recovered = false, counted = false;
+ std::shared_ptr<PendingNativeImage> next_ready;
 };
 class Importer final {
  static constexpr std::size_t native_window = 64;
@@ -355,6 +362,7 @@ class Importer final {
   std::unique_ptr<Worker> worker;
   CompileTaskKind kind;
   CompileExecution::CompletionSource completion;
+  CompileExecution::Continuation continuation;
   State state = State::Working;
   std::exception_ptr error;
   NativeJob(CompileExecution& execution, CompileTaskKind task_kind) : kind(task_kind), completion(&execution) {}
@@ -405,9 +413,9 @@ class Importer final {
      if (job->state == NativeJob::State::Copy) {
       // Every accepted physical operation has returned and closed its handle.
       job->descriptor = {};
-      auto copy = execution.try_submit({.kind = job->kind, .work = [this, job](std::size_t, const CompileAllowance&) {
+      auto copy = job->continuation.try_submit({.kind = job->kind, .work = [this, job](std::size_t, const CompileAllowance&) {
        auto& worker = *job->worker;
-       worker.output.fill();
+       worker.output.fill(request_.cancellation);
        worker.output = {};
        worker.native.release_supplied();
        if (worker.pending)
@@ -434,6 +442,7 @@ class Importer final {
    job->arena = {};
    job->descriptor = {};
    job->input = {};
+   job->continuation = {};
    job->completion.settle(job->error);
   }
  }
@@ -457,10 +466,11 @@ class Importer final {
   }
   try {
    (void)request_.execution->execution().submit(
-    {.kind = job->kind, .resources = {.bytes = bytes, .supplied_workspace = true}, .work = [job, work = std::move(work)](std::size_t, const CompileAllowance& allowance) {
+    {.kind = job->kind, .resources = {.bytes = bytes, .supplied_workspace = true}, .work = [job, &execution, work = std::move(work)](std::size_t, const CompileAllowance& allowance) {
     job->arena = allowance;
     job->worker->native.prepare_support(allowance.workspace());
     work(allowance);
+    job->continuation = execution.retain_current(job->kind);
    }, .allowance = job->arena, .finite_consumer = true, .retain_workspace = false, .completed = [this, job](std::exception_ptr error) { post_output(job, NativeJob::State::Prepare, error); }});
   } catch (...) { post_output(job, NativeJob::State::Done, std::current_exception()); }
   return job->completion.completion();
@@ -506,6 +516,18 @@ public:
    recovery_signal_->notify();
    recovery_controller_.join();
   }
+  // Accepted recovery work has joined. Withdraw parked registrations before
+  // releasing their support, even when a provider never settles its generation.
+  for (;;) {
+   std::shared_ptr<PendingNativeImage> row;
+   {
+    const std::lock_guard lock(groups_mutex_);
+    if (pending_.empty()) break;
+    row = pending_.begin()->second;
+   }
+   retire_pending(row);
+  }
+  recovery_signal_->clear();
  }
  void retire_scratch() noexcept { archive_worker_.native.retire(); }
  std::optional<CoconutPhysicalImage> identify(const CoconutRecord& record, bool wait = false, bool report = false) {
@@ -815,7 +837,7 @@ public:
   if (!request_.execution || !request_.execution->execution().on_lane()) {
    request_.records->staging->prepare(
     worker.output.request(), request_.execution ? &request_.execution->execution() : nullptr, request_.execution ? &request_.execution->files() : nullptr, request_.parent_allowance);
-   worker.output.fill();
+   worker.output.fill(request_.cancellation);
    worker.output = {};
    if (worker.pending)
     native_staged(*worker.pending->product, CompileTaskKind::Normalize);
@@ -841,15 +863,18 @@ public:
   }
   if (early_membership) request_.membership_ready(assemble(true));
   {
-   const std::lock_guard lock(groups_mutex_);
-   input_done_ = true;
+   const std::lock_guard lock(progress_mutex_);
+   {
+    const std::lock_guard facts_lock(groups_mutex_);
+    input_done_ = true;
+   }
+   // Serialize the last row and source closure so exactly one reports the
+   // final partial quantum before recovery's physical eligibility join.
+   if (completed_rows_ == rows_ && completed_rows_ != 1 && completed_rows_ % kProgressQuantum != 0) report_rows();
   }
   recovery_signal_->notify();
   if (recovery_controller_.joinable()) recovery_controller_.join();
   if (recovery_failure_) std::rethrow_exception(recovery_failure_);
-  if (request_.progress && completed_rows_ != 1 && completed_rows_ % kProgressQuantum != 0) request_.progress(completed_rows_);
-  if (request_.metadata_only && request_.preparation_progress && completed_rows_ != 1 && completed_rows_ % kProgressQuantum != 0)
-   request_.preparation_progress(CoconutPreparationStage::Membership, completed_rows_);
   throw_if_benchmark_cancelled(request_.cancellation);
   auto result = assemble(request_.metadata_only);
   if (request_.membership_ready && !request_.metadata_only && !early_membership) {
@@ -865,7 +890,9 @@ public:
  std::vector<CoconutComponent> assemble(bool metadata_only) {
   if (!metadata_only) {
    request_.parent_allowance.release_unused_continuation();
+   trace_benchmark_event(request_.trace, "benchmark.annotations.physical_join_wait", [&] { return nlohmann::json{{"edition", request_.edition}, {"rows", request_.records->size()}}; });
    request_.physical_membership->wait_sources(request_.edition);
+   trace_benchmark_event(request_.trace, "benchmark.annotations.physical_join_ready", [&] { return nlohmann::json{{"edition", request_.edition}, {"rows", request_.records->size()}}; });
    for (std::size_t position = 0; position < request_.records->size(); ++position) {
     const auto& row = request_.records->row(position);
     if (!row.native()) continue;
@@ -874,9 +901,11 @@ public:
      continue;
     }
     const auto physical = identify(row.record(), true, true);
-    if (physical)
+    if (physical) {
+     const auto& lineage = row.native()->lineage().component;
+     if (lineage.recovery_policy && lineage.source != physical->source) throw CoconutOriginalChanged(lineage.source);
      request_.records->native(position, CoconutNativeImage::bind(row.native(), *physical));
-    else {
+    } else {
      if (request_.execution) {
       const auto& previous = row.native()->inventory().physical;
       const auto root = request_.physical_membership->identity_root(previous.source);
@@ -918,7 +947,7 @@ public:
      if (!native || std::ranges::find(request_.retained_sources, native->lineage().component.source) != request_.retained_sources.end()) continue;
      if (row.segment_ordinal() < native->segment_begin()) invalid("native chunk ordinal exceeds its canonical row");
      gather({&native->lineage().component, &native->lineage().index, &native->image(), native->boxes(), native->runs(), &native->inventory(), &native->recovery(),
-             row.segment_ordinal() - native->segment_begin(), &native->input_identity(), native->required_labels_valid(), row.segment_ordinal_complete()},
+             row.segment_ordinal() - native->segment_begin(), &native->input_identity(), native->required_labels_valid(), row.segment_ordinal_complete(), native->admission()},
       native->rejected());
     }
    if (metadata_only)
@@ -944,6 +973,9 @@ public:
    if (!metadata_only && request_.originals && (source == CoconutImageNamespace::CocoTrain || source == CoconutImageNamespace::CocoValidation)) {
     const auto original = request_.originals(source, true, {});
     header = lineage_for(source, assembly_workspace_.recovery(), original.generation)->component;
+    for (const auto& row : rows)
+     if (row.component->original_generation != header.original_generation || row.component->original_annotation_identity != header.original_annotation_identity)
+      throw CoconutOriginalChanged(source);
    }
    std::optional<std::uint64_t> source_extent;
    if ((request_.records->parquet || request_.records->document_complete) && std::ranges::all_of(request_.records->rows(), [](const auto& row) { return row.complete(); })) {
@@ -960,7 +992,7 @@ public:
      available.file_name = image.physical.member;
      request_.rejected_object(image.physical, available, {}, reason, 0);
     }
-   });
+   }, request_.trace);
    if (!component) continue;
    if (request_.records && metadata_only) request_.records->inventories.push_back(*component);
    result.push_back(std::move(*component));
@@ -1012,18 +1044,24 @@ private:
   }
   complete_row();
  }
+ void report_rows() {
+  if (request_.progress) request_.progress(completed_rows_);
+  if (request_.metadata_only && request_.preparation_progress) request_.preparation_progress(CoconutPreparationStage::Membership, completed_rows_);
+ }
  void complete_row() {
   const std::lock_guard lock(progress_mutex_);
   ++completed_rows_;
-  if (completed_rows_ != 1 && completed_rows_ % kProgressQuantum != 0) return;
-  if (request_.progress) request_.progress(completed_rows_);
-  if (request_.metadata_only && request_.preparation_progress) request_.preparation_progress(CoconutPreparationStage::Membership, completed_rows_);
+  if (completed_rows_ != 1 && completed_rows_ % kProgressQuantum != 0) {
+   const std::lock_guard facts_lock(groups_mutex_);
+   if (!input_done_ || completed_rows_ != rows_) return;
+  }
+  report_rows();
  }
  void native_staged(const CoconutNativeImage& image, CompileTaskKind kind) const {
   trace_benchmark_event(request_.trace, "benchmark.coconut.native_staged", [&] {
    const auto snapshot = request_.execution ? request_.execution->execution().snapshot() : detail::CompileExecutionSnapshot{};
    return nlohmann::json{
-    {"image_id", image.inventory().physical.image_id}, {"kind", kind}, {"boxes", image.boxes().size()}, {"runs", image.runs().size()}, {"normal_locked", snapshot.normal_locked},
+    {"image_id", image.inventory().physical.image_id}, {"kind", kind}, {"admitted_runs", image.admission() ? image.runs().size() : 0}, {"boxes", image.boxes().size()}, {"runs", image.runs().size()}, {"normal_locked", snapshot.normal_locked},
     {"leased", snapshot.leased}, {"exceptional", snapshot.exceptional}
    };
   });
@@ -1046,7 +1084,8 @@ private:
  void defer_native(std::shared_ptr<PendingNativeImage> native) {
   const std::lock_guard lock(groups_mutex_);
   if (recovery_failure_) std::rethrow_exception(recovery_failure_);
-  pending_.push_back(std::move(native));
+  pending_.emplace(native->position, native);
+  recovery_signal_->enqueue(native);
   if (!recovery_controller_.joinable())
    recovery_controller_ = std::jthread([this](std::stop_token stop) {
     try {
@@ -1067,11 +1106,8 @@ private:
    interrupted = std::make_unique<CompileExecution::Readiness>(request_.execution->execution(), [signal](auto change) {
     if (change.interrupted) signal->notify();
    });
+  std::vector<std::unique_ptr<Worker>> idle_recovery;
   BenchmarkCompletionWindow ready(native_window, request_.execution ? &request_.execution->execution() : nullptr);
-  CompileExecution::Completion physical_change;
-  std::map<CoconutImageNamespace, std::pair<std::uint64_t, CompileExecution::Completion>> original_changes;
-  std::uint64_t scanned_generation = UINT64_MAX;
-  std::size_t remaining_scan = 0;
   for (;;) {
    const auto observed = signal->revision.load(std::memory_order_acquire);
    ready.reap();
@@ -1085,18 +1121,13 @@ private:
    bool done = false, empty = false;
    {
     const std::lock_guard lock(groups_mutex_);
-    if (scanned_generation != observed) {
-     remaining_scan = pending_.size();
-     scanned_generation = observed;
-    }
     done = input_done_;
     empty = pending_.empty();
-    count = std::min({pending.size(), pending_.size(), remaining_scan});
-    for (std::size_t i = 0; i < count; ++i) {
-     pending[i] = std::move(pending_.front());
-     pending_.pop_front();
-    }
-    remaining_scan -= count;
+   }
+   while (count < pending.size()) {
+    auto next = signal->take();
+    if (!next) break;
+    pending[count++] = std::move(next);
    }
    if (empty && done) {
     ready.drain();
@@ -1106,36 +1137,50 @@ private:
    }
    bool progressed = false;
    for (const auto& native : std::span(pending).first(count)) {
+    trace_benchmark_event(request_.trace, "benchmark.coconut.recovery_observed", [&] { return nlohmann::json{{"image_id", native->record.image_id}, {"source_ordinal", native->position}}; });
     const auto physical = request_.physical_membership->readiness(request_.edition, native->record);
     const auto source = physical.image ? physical.image->source : native->physical.source;
     auto original = original_input(source);
-    const auto subscribe = [&](CompileExecution::Completion& held, const CompileExecution::Completion& next) {
-     if (held && !held.ready()) return;
-     held = next;
-     if (held) held.subscribe([signal](std::exception_ptr) { signal->notify(); });
-    };
-    if (!physical.terminal) subscribe(physical_change, physical.changed);
-    if (!original.terminal) {
-     auto& changed = original_changes[source];
-     if (changed.first != original.generation) { changed = {original.generation, {}}; }
-     subscribe(changed.second, original.changed);
+    // Physical custody is per row, including a terminal image awaiting its
+    // originals. The snapshot already owns its next-change registration.
+    if ((!physical.terminal || !original.terminal) && (!native->physical_change || native->physical_change.ready())) {
+     native->physical_change = physical.changed;
+     native->physical_change.subscribe([weak_signal = std::weak_ptr(signal), weak = std::weak_ptr(native)](std::exception_ptr) {
+      if (auto ready_signal = weak_signal.lock())
+       if (auto row = weak.lock()) ready_signal->enqueue(row);
+     });
     }
-    if (!physical.terminal || !original.terminal) {
+    signal->observe_original(native, source, original);
+    const bool recovered_identity = native->recovered && physical.image && *physical.image == native->physical;
+    if (recovered_identity && original.generation != native->original_generation) throw CoconutOriginalChanged(source);
+    if (recovered_identity && physical.terminal && original.terminal) {
+     settle_report(*native->product);
+     retire_pending(native);
+     continue;
+    }
+    if ((!physical.image && !physical.terminal) || !original.terminal || recovered_identity) {
      trace_benchmark_event(request_.trace, "benchmark.coconut.recovery_parked", [&] {
       return nlohmann::json{
-       {"image_id", native->record.image_id}, {"source", source}, {"physical_generation", physical.generation}, {"original_generation", original.generation}, {"physical_ready", physical.terminal},
+       {"image_id", native->record.image_id}, {"source", source}, {"physical_generation", physical.generation}, {"original_generation", original.generation}, {"physical_ready", bool(physical.image)},
        {"original_ready", original.terminal}
       };
      });
-     const std::lock_guard lock(groups_mutex_);
-     pending_.push_back(native);
+     signal->park(native);
      continue;
     }
+    signal->working(native);
     progressed = true;
+    if (native->recovered) {
+     if (request_.execution)
+      request_.execution->retire_labels(request_.physical_membership->identity_root(native->physical.source), native->physical.image_id, native->product->input_identity());
+     native->product.reset();
+     native->recovered = false;
+    }
     if (!physical.image) {
      (void)identify(native->record, true, true);
      if (request_.execution) request_.execution->retire_labels(request_.physical_membership->identity_root(native->physical.source), native->physical.image_id, native->provisional_dependency);
-     retain_image(native->position, {});
+     retain_pending(native, {});
+     retire_pending(native);
      continue;
     }
     native->physical = *physical.image;
@@ -1143,7 +1188,8 @@ private:
     native->original_generation = original.generation;
     native->publication = request_.physical_membership->label_publication(request_.edition, native->physical);
     ready.make_room();
-    auto worker = std::make_unique<Worker>(request_);
+    auto worker = idle_recovery.empty() ? std::make_unique<Worker>(request_) : std::move(idle_recovery.back());
+    if (!idle_recovery.empty()) idle_recovery.pop_back();
     worker->native.originals(original.originals);
     const auto pixels = std::uint64_t{native->dimensions.width} * native->dimensions.height;
     const auto bytes = worker->native.support_workspace_bytes(native->record, pixels, native->record.segments.size());
@@ -1167,36 +1213,50 @@ private:
      const auto current = original_input(native->physical.source);
      if (current.generation != original.generation) throw CoconutOriginalChanged(native->physical.source);
      const auto current_physical = request_.physical_membership->readiness(request_.edition, native->record);
-     if (!current_physical.terminal || !current_physical.image || *current_physical.image != native->physical) {
+     if (!current_physical.image || *current_physical.image != native->physical) {
       // The immutable PNG support remains valid while its physical join is
       // withdrawn. Re-arm that record without retaining the finished arena.
       native->product.reset();
-      {
-       const std::lock_guard lock(groups_mutex_);
-       pending_.push_back(native);
-      }
-      recovery_signal_->notify();
+      recovery_signal_->retry(native);
       return;
      }
-     settle_report(*native->product);
-     retain_image(native->position, native->product);
-     publish_labels(std::move(native->product), native->publication);
+     retain_pending(native, native->product);
+     publish_labels(native->product, native->publication);
+     native->recovered = true;
+     if (current_physical.terminal) {
+      settle_report(*native->product);
+      retire_pending(native);
+     } else {
+      // Recovery's result is usable now, but its immutable input support and
+      // subscription remain until physical eligibility admits that identity.
+      // Rechecking through the ready queue closes changes during CPU work.
+      recovery_signal_->retry(native);
+     }
+     trace_benchmark_event(request_.trace, "benchmark.coconut.recovery_settled", [&] {
+      return nlohmann::json{{"image_id", native->record.image_id}, {"source", native->physical.source}, {"physical_terminal", current_physical.terminal}};
+     });
     };
     if (request_.execution) {
      auto job = std::make_shared<NativeJob>(request_.execution->execution(), CompileTaskKind::Recovery);
      job->worker = std::move(worker);
      auto completion = submit_native(job, bytes, [recover, job](const CompileAllowance&) { recover(*job->worker); });
-     track_native(ready, completion, settle);
+     track_native(ready, completion, [&, job, settle](std::exception_ptr failure) {
+      settle(failure);
+      job->worker->complete.reset();
+      idle_recovery.push_back(std::move(job->worker));
+     });
      completion.subscribe([signal](std::exception_ptr) { signal->notify(); });
     } else {
      recover(*worker);
      request_.records->staging->prepare(worker->output.request());
-     worker->output.fill();
+     worker->output.fill(request_.cancellation);
      native_staged(*native->product, CompileTaskKind::Recovery);
      settle({});
+     worker->complete.reset();
+     idle_recovery.push_back(std::move(worker));
     }
    }
-   if (!progressed && !remaining_scan) {
+   if (!progressed && !count) {
     std::unique_lock lock(signal->mutex);
     signal->changed.wait(lock, [&] { return stop.stop_requested() || signal->revision.load(std::memory_order_acquire) != observed; });
    }
@@ -1206,11 +1266,141 @@ private:
  Worker archive_worker_;
  CoconutNativeWorkspace assembly_workspace_;
  std::shared_ptr<const CoconutRecoveryOriginals> original_owner_;
- std::deque<std::shared_ptr<PendingNativeImage>> pending_;
- struct RecoverySignal {
+ std::unordered_map<std::size_t, std::shared_ptr<PendingNativeImage>> pending_;
+ // Intrusive ready links reuse each retained row: notification neither scans
+ // the backlog nor allocates a second work record. All subscription callbacks
+ // hold only weak row custody and this signal, never the importer.
+ struct RecoverySignal : std::enable_shared_from_this<RecoverySignal> {
+  using State = PendingNativeImage::Readiness;
   std::mutex mutex;
   std::condition_variable changed;
   std::atomic<std::uint64_t> revision{0};
+  std::shared_ptr<PendingNativeImage> first;
+  PendingNativeImage* last = nullptr;
+  struct OriginalGroup {
+   std::unordered_map<std::size_t, std::weak_ptr<PendingNativeImage>> rows;
+   bool delivered = false;
+  };
+  std::map<PendingNativeImage::OriginalWait, OriginalGroup> originals;
+  BenchmarkTraceSink trace;
+  explicit RecoverySignal(BenchmarkTraceSink observer) : trace(std::move(observer)) {}
+  ~RecoverySignal() { clear(); }
+  void clear() {
+   std::shared_ptr<PendingNativeImage> rows;
+   {
+    const std::lock_guard lock(mutex);
+    originals.clear();
+    rows = std::move(first);
+    last = nullptr;
+   }
+   // Releasing immutable support can notify other resource owners. Do it
+   // outside the readiness lock and break the shared links iteratively.
+   while (rows) {
+    auto row = std::move(rows);
+    rows = std::move(row->next_ready);
+   }
+  }
+  void remove_original(const std::shared_ptr<PendingNativeImage>& row) {
+   if (!row->original_wait) return;
+   const auto found = originals.find(*row->original_wait);
+   if (found != originals.end()) {
+    found->second.rows.erase(row->position);
+    if (found->second.rows.empty()) found->second.rows = decltype(found->second.rows){};
+   }
+   row->original_wait.reset();
+   // Retain one receipt per observed namespace/generation, never per retired
+   // row. Later observations join its existing callback or immediate delivery.
+  }
+  void observe_original(const std::shared_ptr<PendingNativeImage>& row, CoconutImageNamespace source, const CoconutOriginalReadiness& original) {
+   const PendingNativeImage::OriginalWait key{source, original.generation};
+   bool subscribe = false;
+   {
+    const std::lock_guard lock(mutex);
+    if (original.terminal || !original.changed) {
+     remove_original(row);
+     return;
+    }
+    if (row->original_wait == key) return;
+    remove_original(row);
+    auto [group, inserted] = originals.try_emplace(key);
+    if (group->second.delivered) {
+     enqueue_locked(row);
+     return;
+    }
+    group->second.rows.emplace(row->position, row);
+    row->original_wait = key;
+    subscribe = inserted;
+   }
+   if (!subscribe) return;
+   trace_benchmark_event(trace, "benchmark.coconut.original_subscribed", [&] { return nlohmann::json{{"source", source}, {"generation", original.generation}}; });
+   // Membership precedes subscription. A completion that raced its snapshot
+   // delivers immediately; callbacks never capture a row or importer.
+   original.changed.subscribe([weak = weak_from_this(), key](std::exception_ptr) {
+    if (auto signal = weak.lock()) signal->original_ready(key);
+   });
+  }
+  void original_ready(PendingNativeImage::OriginalWait key) {
+   std::size_t count = 0;
+   {
+    const std::lock_guard lock(mutex);
+    const auto found = originals.find(key);
+    if (found == originals.end()) return;
+    if (trace) count = found->second.rows.size();
+    for (const auto& [position, weak] : found->second.rows) {
+     (void)position;
+     if (auto row = weak.lock()) {
+      row->original_wait.reset();
+      enqueue_locked(row);
+     }
+    }
+    found->second = OriginalGroup{.delivered = true};
+   }
+   trace_benchmark_event(trace, "benchmark.coconut.original_notified", [&] { return nlohmann::json{{"source", key.first}, {"generation", key.second}, {"rows", count}}; });
+  }
+  void append(const std::shared_ptr<PendingNativeImage>& row) {
+   row->readiness = State::Ready;
+   if (last) last->next_ready = row;
+   else first = row;
+   last = row.get();
+   revision.fetch_add(1, std::memory_order_release);
+   changed.notify_all();
+  }
+  void enqueue_locked(const std::shared_ptr<PendingNativeImage>& row) {
+   if (row->readiness == State::Checking) row->notified = true;
+   else if (row->readiness == State::Parked) append(row);
+  }
+  void enqueue(const std::shared_ptr<PendingNativeImage>& row) {
+   const std::lock_guard lock(mutex);
+   enqueue_locked(row);
+  }
+  std::shared_ptr<PendingNativeImage> take() {
+   const std::lock_guard lock(mutex);
+   if (!first) return {};
+   auto row = std::move(first);
+   first = std::move(row->next_ready);
+   if (!first) last = nullptr;
+   row->readiness = State::Checking;
+   row->notified = false;
+   return row;
+  }
+  void park(const std::shared_ptr<PendingNativeImage>& row) {
+   const std::lock_guard lock(mutex);
+   if (row->notified) append(row);
+   else row->readiness = State::Parked;
+  }
+  void working(const std::shared_ptr<PendingNativeImage>& row) {
+   const std::lock_guard lock(mutex);
+   row->readiness = State::Working;
+  }
+  void retry(const std::shared_ptr<PendingNativeImage>& row) {
+   const std::lock_guard lock(mutex);
+   append(row);
+  }
+  void retire(const std::shared_ptr<PendingNativeImage>& row) {
+   const std::lock_guard lock(mutex);
+   row->readiness = State::Retired;
+   remove_original(row);
+  }
   void notify() {
    {
     const std::lock_guard lock(mutex);
@@ -1219,7 +1409,25 @@ private:
    changed.notify_all();
   }
  };
- std::shared_ptr<RecoverySignal> recovery_signal_ = std::make_shared<RecoverySignal>();
+ void retain_pending(const std::shared_ptr<PendingNativeImage>& native, std::shared_ptr<const CoconutNativeImage> product) {
+  {
+   const std::lock_guard lock(groups_mutex_);
+   request_.records->native(native->position, std::move(product));
+  }
+  if (!std::exchange(native->counted, true)) complete_row();
+ }
+ void retire_pending(const std::shared_ptr<PendingNativeImage>& native) {
+  recovery_signal_->retire(native);
+  native->physical_change = {};
+  {
+   const std::lock_guard lock(groups_mutex_);
+   pending_.erase(native->position);
+  }
+  trace_benchmark_event(request_.trace, "benchmark.coconut.recovery_retired", [&] {
+   return nlohmann::json{{"image_id", native->record.image_id}, {"source_ordinal", native->position}};
+  });
+ }
+ std::shared_ptr<RecoverySignal> recovery_signal_ = std::make_shared<RecoverySignal>(request_.trace);
  std::exception_ptr recovery_failure_;
  bool input_done_ = false;
  std::jthread recovery_controller_;

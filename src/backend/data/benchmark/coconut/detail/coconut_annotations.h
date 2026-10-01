@@ -87,9 +87,9 @@ private:
  friend class CoconutComponentBacking;
  friend void admit_coconut_component(const CoconutComponent&, mmltk::common::concurrency::CancellationObservation);
  friend std::uint64_t coconut_component_storage_bytes(const CoconutComponent&);
- friend void store_coconut_component(const std::filesystem::path&, const CoconutComponent&, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool*);
+ friend void store_coconut_component(const std::filesystem::path&, const CoconutComponent&, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool*, const BenchmarkTraceSink&);
  friend std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutComponentPart>, std::string_view, const CoconutPhysicalMembership&, const std::filesystem::path&,
-  mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool*, BenchmarkCompilePipeline*, const CoconutImageRejection&);
+  mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool*, BenchmarkCompilePipeline*, const CoconutImageRejection&, const BenchmarkTraceSink&);
  CoconutComponent(std::shared_ptr<const CoconutComponentBacking>, NormalizedAnnotationReadView, std::shared_ptr<CoconutInventorySeal>, bool);
  std::shared_ptr<const CoconutComponentBacking> backing_;
  NormalizedAnnotationReadView index_;
@@ -105,7 +105,7 @@ struct CoconutComponentPart {
  std::optional<std::pair<std::uint64_t, std::uint64_t>> source_extent{};
 };
 [[nodiscard]] std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutComponentPart>, std::string_view, const CoconutPhysicalMembership&, const std::filesystem::path&,
- mmltk::common::concurrency::CancellationObservation = {}, detail::StorageReservationPool* = nullptr, BenchmarkCompilePipeline* = nullptr, const CoconutImageRejection& = {});
+ mmltk::common::concurrency::CancellationObservation = {}, detail::StorageReservationPool* = nullptr, BenchmarkCompilePipeline* = nullptr, const CoconutImageRejection& = {}, const BenchmarkTraceSink& = {});
 struct CoconutComponentBuilder : CoconutComponentMetadata {
  std::uint64_t source_segment_begin = 0;
  NormalizedAnnotationBuilder index;
@@ -141,12 +141,13 @@ struct CoconutComponentImage {
  const std::string* dependency = nullptr;
  bool required_labels_valid = true;
  bool ordinals_complete = true;
+ const NormalizedAnnotationIndex* admission = nullptr;
 };
 [[nodiscard]] detail::CompileResources coconut_component_assembly_resources(std::uint64_t images, std::uint64_t recovery_join_boxes = 0);
 [[nodiscard]] std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetadata, std::vector<CoconutComponentImage>&, AnnotationRejectCounts, bool metadata_only,
  std::uint64_t source_rows, std::optional<std::uint64_t> source_segments, std::span<const std::size_t> source_ordinals, std::span<const CoconutComponent> reusable, const CoconutPhysicalMembership&,
  const CoconutMaskRecovery*, const std::filesystem::path&, common::concurrency::CancellationObservation, detail::StorageReservationPool*, BenchmarkCompilePipeline*, const CompileAllowance&,
- bool local_rejection, const CoconutImageRejection&);
+ bool local_rejection, const CoconutImageRejection&, const BenchmarkTraceSink& = {});
 [[nodiscard]] std::string coconut_component_input_identity(std::string_view base, CoconutImageNamespace, const CoconutMaskRecovery*, const CoconutPhysicalMembership* = nullptr,
  CoconutEdition = CoconutEdition::Base, const CoconutPhysicalDependencies& = {}, bool current = true);
 // Removes only XL rows covered by Large, retaining B and all namespace distinctions.
@@ -154,7 +155,7 @@ struct CoconutComponentImage {
 void admit_coconut_component(const CoconutComponent&, mmltk::common::concurrency::CancellationObservation = {});
 [[nodiscard]] std::uint64_t coconut_component_storage_bytes(const CoconutComponent&);
 void store_coconut_component(
- const std::filesystem::path& index_path, const CoconutComponent& component, mmltk::common::concurrency::CancellationObservation cancellation = {}, detail::StorageReservationPool* storage = nullptr);
+ const std::filesystem::path& index_path, const CoconutComponent& component, mmltk::common::concurrency::CancellationObservation cancellation = {}, detail::StorageReservationPool* storage = nullptr, const BenchmarkTraceSink& trace = {});
 // Rows retain their mapping while a later inventory/recovery proof is checked.
 // Withdrawal addresses only rows exposed by this admission attempt.
 struct CoconutCacheAdmission {

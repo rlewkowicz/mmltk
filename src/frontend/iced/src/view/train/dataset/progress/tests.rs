@@ -128,17 +128,17 @@ fn tracks_preserve_independent_ratios_unknowns_zero_and_repair() {
     assert_eq!(track_ratio(track), Some((4097_f64 / 8193_f64) as f32));
     track.totalknown = false;
     assert_eq!(track_ratio(track), None);
-    assert!(track_caption(track, true).contains("4.0 KiB / ?"));
+    assert!(track_caption(track).contains("4.0 KiB / ?"));
     track.totalknown = true;
     track.completed = 1024;
     track.invalidated = 3073;
     assert_eq!(track_ratio(track), Some((1024_f64 / 8193_f64) as f32));
-    assert!(track_caption(track, true).contains("3,073 invalidated by repair"));
+    assert!(track_caption(track).contains("3,073 invalidated by repair"));
     track.completed = 0;
     track.total = 0;
     track.activity = DatasetCompileActivity::Unnecessary;
     assert_eq!(track_ratio(track), None);
-    assert!(track_caption(track, true).starts_with("No acquisition needed"));
+    assert!(track_caption(track).starts_with("No acquisition needed"));
     dataset.progress.tracks.labels.total = 10;
     dataset.progress.tracks.labels.completed = 3;
     dataset.progress.tracks.labels.totalknown = true;
@@ -162,16 +162,16 @@ fn tracks_preserve_independent_ratios_unknowns_zero_and_repair() {
         track.activity = activity;
         track.active = false;
         track.complete = false;
-        assert!(track_caption(track, false).starts_with("Waiting · "));
+        assert!(track_caption(track).starts_with("Waiting · "));
         track.active = true;
-        assert!(track_caption(track, false).starts_with(caption));
+        assert!(track_caption(track).starts_with(caption));
         track.completed = track.total;
-        assert!(track_caption(track, false).starts_with(caption));
+        assert!(track_caption(track).starts_with(caption));
         track.active = false;
         track.complete = true;
         assert_eq!(
-            track_caption(track, false),
-            format!("Complete · {}", count(track.total))
+            track_caption(track),
+            format!("Complete · {} images", count(track.total))
         );
         assert_eq!(track.activity, activity);
     }
@@ -434,4 +434,37 @@ fn measured_active_area_holds_shorter_updates_and_cancellation_removes_rows() {
             .operate(&mut restarted, Layout::new(&node), &renderer, &mut rows);
         assert_eq!((rows.tracks, rows.work, rows.sources), (3, 1, 0));
     }
+}
+
+#[test]
+fn row_counts_remain_distinct_from_component_work_and_terminal_settlement() {
+    let mut state = dataset();
+    state.active = true;
+    state.progress.phase = DatasetCompilePhase::Labels;
+    state.progress.completed = 1;
+    state.progress.total = 3;
+    let rows = &mut state.progress.tracks.labels;
+    rows.unit = DatasetCompileUnit::Rows;
+    rows.completed = 241_730;
+    rows.total = 0;
+    rows.totalknown = false;
+    rows.active = true;
+    rows.activity = DatasetCompileActivity::Preparing;
+    assert_eq!(track_ratio(rows), None);
+    assert_eq!(track_caption(rows), "Preparing labels and masks · 241,730 / ? rows");
+    rows.total = 241_730;
+    rows.totalknown = true;
+    assert_eq!(track_ratio(rows), Some(1.0));
+    assert_eq!(track_caption(rows), "Preparing labels and masks · 241,730 / 241,730 rows");
+    rows.active = false;
+    assert_eq!(track_caption(rows), "Waiting · 241,730 / 241,730 rows");
+    assert_eq!(work_caption(&state).as_deref(), Some("Labels · 1 / 3"));
+    state.progress.tracks.labels.complete = true;
+    state.progress.completed = 3;
+    assert_eq!(track_caption(&state.progress.tracks.labels), "Complete · 241,730 rows");
+    assert!(show_tracks(&state));
+    state.active = false;
+    state.terminal.outcome = ArtifactTerminalOutcome::Succeeded;
+    assert_eq!(heading(&state), "Completed");
+    assert!(!show_tracks(&state));
 }

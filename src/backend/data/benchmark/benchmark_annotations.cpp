@@ -44,6 +44,9 @@ public:
  std::span<const RLEPair> runs;
  std::once_flag image_admission, full_admission;
  std::atomic<std::size_t> admitted_rows{0};
+ std::shared_ptr<BenchmarkMappedArtifact> staged;
+ std::mutex publication_mutex;
+ NormalizedImage single_image{};
 };
 namespace {
 constexpr std::uint64_t kNormalizedIndexMagic = 0x4D4D4C544B4E4931ULL;
@@ -1071,15 +1074,16 @@ void NormalizedAnnotationAssembler::prepare(std::size_t images, std::size_t boxe
  if (!staging_directory_.empty()) {
   const auto image_bytes = mmltk::common::math::checked_multiply(images, sizeof(NormalizedImage), "normalized image staging overflow");
   const auto box_bytes = mmltk::common::math::checked_multiply(boxes, sizeof(NormalizedBox), "normalized box staging overflow");
-  const auto run_offset = mmltk::common::math::checked_add(image_bytes, box_bytes, "normalized staging overflow");
+  const auto box_offset = mmltk::common::math::checked_add(sizeof(NormalizedIndexHeader), image_bytes, "normalized staging overflow");
+  const auto run_offset = mmltk::common::math::checked_add(box_offset, box_bytes, "normalized staging overflow");
   const auto bytes = mmltk::common::math::checked_add(run_offset, mmltk::common::math::checked_multiply(runs, sizeof(RLEPair), "normalized run staging overflow"), "normalized staging overflow");
   std::filesystem::create_directories(staging_directory_);
   detail::StorageReservationPool reservations(staging_directory_, {}, storage_);
   auto owner = std::make_shared<Mapped>(reservations, staging_directory_ / ".normalized-assembly", bytes);
   auto* data = static_cast<std::byte*>(owner->artifact.map_writable());
   if (bytes) {
-   owner->images = {reinterpret_cast<NormalizedImage*>(data), images};
-   owner->boxes = {reinterpret_cast<NormalizedBox*>(data + image_bytes), boxes};
+   owner->images = {reinterpret_cast<NormalizedImage*>(data + sizeof(NormalizedIndexHeader)), images};
+   owner->boxes = {reinterpret_cast<NormalizedBox*>(data + box_offset), boxes};
    owner->runs = {reinterpret_cast<RLEPair*>(data + run_offset), runs};
   }
   mapped_ = std::move(owner);
@@ -1100,15 +1104,16 @@ void validate_assembled_box(NormalizedBox& box, std::size_t runs, BenchmarkDatas
  validate_box_value(box, source);
 }
 }  // namespace
-void NormalizedAnnotationAssembler::gather(std::span<const Slice> slices, CompileExecution* execution, detail::FileWorkQueue* files, const CompileAllowance& allowance) {
+void NormalizedAnnotationAssembler::gather(std::span<const Slice> slices, CompileExecution* execution, detail::FileWorkQueue* files, const CompileAllowance& allowance, const BenchmarkTraceSink& trace) {
  if (finished_ || incomplete_gather_ || (mapped_ ? mapped_->image_count : builder_.images.size())) throw std::logic_error("normalized gather requires an empty assembler");
  if (execution && execution->on_lane()) throw std::logic_error("normalized gather requires a controller outside CPU work");
+ trace_benchmark_event(trace, "benchmark.annotations.gather_started", [&] { return nlohmann::json{{"images", slices.size()}}; });
  // Every planning/preparation/copy failure leaves the assembler unsealable.
  incomplete_gather_ = true;
  struct Cursor {
   std::size_t first_box, first_run, box = 0, run = 0, output_run = 0;
   std::uint64_t previous = 0;
-  bool complete = false;
+  bool complete = false, admitted = false;
  };
  std::vector<Cursor> cursors;
  std::size_t boxes = 0, runs = 0;
@@ -1122,7 +1127,7 @@ void NormalizedAnnotationAssembler::gather(std::span<const Slice> slices, Compil
    validate_assembled_image(slice.image, builder_.source, previous);
    previous = slice.image.source_image_id;
    if (slice.image.box_count != slice.boxes.size()) throw std::runtime_error("normalized gather box extent mismatch");
-   cursors.push_back({boxes, runs});
+   cursors.push_back({.first_box = boxes, .first_run = runs, .admitted = slice.proven(builder_.source)});
    boxes = common::math::checked_add(boxes, slice.boxes.size(), "normalized gather box overflow");
    for (const auto& box : slice.boxes) {
     if (box.mask_rle_offset > slice.runs.size() || box.mask_rle_pairs > slice.runs.size() - box.mask_rle_offset) throw std::runtime_error("normalized gather run extent mismatch");
@@ -1169,7 +1174,8 @@ void NormalizedAnnotationAssembler::gather(std::span<const Slice> slices, Compil
     output_boxes[cursor.first_box + cursor.box] = box;
    }
    const auto count = std::min<std::size_t>(input.size() - cursor.run, 65536 - copied);
-   for (std::size_t r = 0; r < count; ++r) cursor.previous = validate_run_value(input[cursor.run + r], std::uint64_t{slice.image.width} * slice.image.height, cursor.previous);
+   if (!cursor.admitted)
+    for (std::size_t r = 0; r < count; ++r) cursor.previous = validate_run_value(input[cursor.run + r], std::uint64_t{slice.image.width} * slice.image.height, cursor.previous);
    if (count) std::memcpy(output_runs.data() + cursor.first_run + cursor.output_run, input.data() + cursor.run, count * sizeof(RLEPair));
    cursor.run += count;
    cursor.output_run += count;
@@ -1236,6 +1242,12 @@ void NormalizedAnnotationAssembler::gather(std::span<const Slice> slices, Compil
  } else
   for (std::size_t i = 0; i < slices.size(); ++i)
    while (!cursors[i].complete) chunk(i);
+ trace_benchmark_event(trace, "benchmark.annotations.gathered", [&] {
+  std::uint64_t validated = 0;
+  for (std::size_t i = 0; i < slices.size(); ++i)
+   if (!cursors[i].admitted) validated += cursors[i].output_run;
+  return nlohmann::json{{"images", slices.size()}, {"boxes", boxes}, {"runs", runs}, {"validated_runs", validated}, {"copied_bytes", boxes * sizeof(NormalizedBox) + runs * sizeof(RLEPair)}};
+ });
  if (mapped_) {
   mapped_->image_count = slices.size();
   mapped_->box_count = boxes;
@@ -1302,6 +1314,10 @@ NormalizedAnnotationIndex NormalizedAnnotationAssembler::finish(const BenchmarkT
   auto owner = std::make_shared<NormalizedAnnotationBacking>();
   owner->source = builder_.source;
   owner->storage = mapped_;
+  // An exact-capacity assembly is already in the canonical persisted layout.
+  // Partial-capacity standalone builders remain ordinary immutable inputs.
+  if (mapped_->image_count == mapped_->images.size() && mapped_->box_count == mapped_->boxes.size() && mapped_->run_count == mapped_->runs.size())
+   owner->staged = std::shared_ptr<BenchmarkMappedArtifact>(mapped_, &mapped_->artifact);
   owner->images = images;
   owner->boxes = mapped_->boxes.first(mapped_->box_count);
   owner->runs = mapped_->runs.first(mapped_->run_count);
@@ -1341,6 +1357,62 @@ void admit_normalized_annotations(const NormalizedAnnotationIndex& index, mmltk:
   });
   if (!combined) validate_normalized_records(index, cancellation, false, true);
  });
+}
+NormalizedAnnotationIndex seal_normalized_annotation_image(BenchmarkDatasetSource source, NormalizedImage image, std::span<const NormalizedBox> boxes, std::span<const RLEPair> runs,
+ std::shared_ptr<const void> custody, mmltk::common::concurrency::CancellationObservation cancellation) {
+ if ((!boxes.empty() || !runs.empty()) && !custody) throw std::logic_error("normalized row requires immutable payload custody");
+ auto backing = std::make_shared<NormalizedAnnotationBacking>();
+ backing->source = source;
+ backing->storage = std::move(custody);
+ backing->single_image = image;
+ backing->images = {&backing->single_image, 1};
+ backing->boxes = boxes;
+ backing->runs = runs;
+ NormalizedAnnotationIndex result;
+ result.source = source;
+ result.images = backing->images;
+ result.boxes = boxes;
+ result.mask_rle_pairs = runs;
+ result.backing = std::move(backing);
+ admit_normalized_annotations(result, cancellation);
+ return result;
+}
+NormalizedAnnotationIndex rebind_normalized_annotation_image(const NormalizedAnnotationIndex& source, BenchmarkDatasetSource kind, NormalizedImage image) {
+ admit_normalized_annotations(source);
+ if (source.images.size() != 1) throw std::logic_error("normalized row rebind requires one image");
+ const auto& before = source.images.front();
+ if (image.width != before.width || image.height != before.height || image.first_box != before.first_box || image.box_count != before.box_count)
+  throw std::logic_error("normalized row rebind changed admitted payload geometry");
+ validate_assembled_image(image, kind, {});
+ // Source-specific box rules cannot inherit a different domain's admission.
+ if (kind != source.source) return seal_normalized_annotation_image(kind, image, source.boxes, source.mask_rle_pairs, source.backing);
+ auto backing = std::make_shared<NormalizedAnnotationBacking>();
+ backing->source = kind;
+ backing->storage = source.backing;
+ backing->single_image = image;
+ backing->images = {&backing->single_image, 1};
+ backing->boxes = source.boxes;
+ backing->runs = source.mask_rle_pairs;
+ auto result = source;
+ result.images = backing->images;
+ result.backing = std::move(backing);
+ std::call_once(result.backing->image_admission, [] {});
+ std::call_once(result.backing->full_admission, [] {});
+ return result;
+}
+NormalizedAnnotationAssembler::Slice NormalizedAnnotationAssembler::Slice::admitted(const NormalizedAnnotationIndex& index, std::size_t position, std::uint64_t base, bool incomplete) {
+ admit_normalized_annotation_image(index, position);
+ const auto& image = index.images[position];
+ Slice result(image, index.boxes.subspan(image.first_box, image.box_count), index.mask_rle_pairs, base, incomplete);
+ result.backing_ = index.backing;
+ result.position_ = position;
+ return result;
+}
+bool NormalizedAnnotationAssembler::Slice::proven(BenchmarkDatasetSource source) const noexcept {
+ if (!backing_ || backing_->source != source || position_ >= backing_->images.size()) return false;
+ const auto& admitted = backing_->images[position_];
+ return std::memcmp(&image, &admitted, sizeof(image)) == 0 && boxes.data() == backing_->boxes.subspan(admitted.first_box, admitted.box_count).data() && boxes.size() == admitted.box_count &&
+        runs.data() == backing_->runs.data() && runs.size() == backing_->runs.size();
 }
 NormalizedAnnotationIndex seal_normalized_annotations(NormalizedAnnotationBuilder&& builder, mmltk::common::concurrency::CancellationObservation cancellation) {
  auto result = seal_normalized_annotation_metadata(std::move(builder));
@@ -1720,6 +1792,7 @@ void remove_normalized_annotation_index(const std::filesystem::path& path) {
 }
 std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotation_index(const std::filesystem::path& path, const NormalizedAnnotationIndex& index,
  mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace, detail::StorageReservationPool* storage, const nlohmann::json& extension) {
+ throw_if_benchmark_cancelled(cancel_requested);
  admit_normalized_annotations(index, cancel_requested);
  if (index.split.empty() || index.annotation_sha256.empty() || index.split.size() >= NormalizedIndexHeader{}.split.size() ||
      kBenchmarkMappingRevision.size() >= NormalizedIndexHeader{}.mapping_revision.size()) {
@@ -1747,14 +1820,26 @@ std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotatio
  std::memcpy(header.mapping_revision.data(), kBenchmarkMappingRevision.data(), kBenchmarkMappingRevision.size());
  header.rejected = encode_rejected(index.rejected);
  (void)mmltk::common::io::ensure_parent_directory(path);
- auto staging = detail::StagedArtifact::create(destination, path, total_size, "normalized annotation index staging");
- staging.preallocate(checked_cast<std::size_t>(total_size, "normalized index size overflow"));
- staging.file().pwrite_all(&header, sizeof(header), 0U);
- staging.file().pwrite_all(index.images.data(), index.images.size() * sizeof(NormalizedImage), checked_cast<std::size_t>(image_offset, "normalized image offset overflow"));
- staging.file().pwrite_all(index.boxes.data(), index.boxes.size() * sizeof(NormalizedBox), checked_cast<std::size_t>(box_offset, "normalized box offset overflow"));
- staging.file().pwrite_all(index.mask_rle_pairs.data(), index.mask_rle_pairs.size() * sizeof(RLEPair), checked_cast<std::size_t>(mask_rle_offset, "normalized mask offset overflow"));
- staging.file().sync_data();
- staging.close();
+ std::unique_lock publication_lock(index.backing->publication_mutex);
+ auto backing = index.backing->staged;
+ const bool transfer = backing && backing->can_publish(path);
+ detail::StagedArtifact staging;
+ trace_benchmark_event(trace, "benchmark.annotations.cache_prepare", [&] {
+  return nlohmann::json{{"path", path.string()}, {"bytes", total_size}, {"payload_copy_bytes", transfer ? 0 : total_size - sizeof(header)}, {"same_backing", transfer}};
+ });
+ if (transfer) {
+  backing->seal_prefix(std::as_bytes(std::span(&header, 1)));
+ } else {
+  staging = detail::StagedArtifact::create(destination, path, total_size, "normalized annotation index staging");
+  staging.preallocate(checked_cast<std::size_t>(total_size, "normalized index size overflow"));
+  staging.file().pwrite_all(&header, sizeof(header), 0U);
+  staging.file().pwrite_all(index.images.data(), index.images.size_bytes(), checked_cast<std::size_t>(image_offset, "normalized image offset overflow"));
+  staging.file().pwrite_all(index.boxes.data(), index.boxes.size_bytes(), checked_cast<std::size_t>(box_offset, "normalized box offset overflow"));
+  staging.file().pwrite_all(index.mask_rle_pairs.data(), index.mask_rle_pairs.size_bytes(), checked_cast<std::size_t>(mask_rle_offset, "normalized mask offset overflow"));
+  staging.file().sync_data();
+  staging.close();
+ }
+ trace_benchmark_event(trace, "benchmark.annotations.cache_synced", [&] { return nlohmann::json{{"path", path.string()}, {"bytes", total_size}, {"same_backing", transfer}}; });
  std::string identity_material = index.annotation_sha256 + "\n" + std::string(kBenchmarkMappingRevision) + "\n" + index.split + "\n" + std::to_string(total_size) + "\n" +
                                  std::to_string(index.images.size()) + "\n" + std::to_string(index.boxes.size());
  identity_material += "\n" + std::to_string(index.mask_rle_pairs.size());
@@ -1765,7 +1850,8 @@ std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotatio
  if (error) { throw std::filesystem::filesystem_error("cannot invalidate normalized annotation completion manifest", completion, error); }
  if (removed) { sync_parent_directory(completion); }
  throw_if_benchmark_cancelled(cancel_requested);
- staging.publish(path, cancel_requested);
+ if (transfer) backing->publish(path, cancel_requested);
+ else staging.publish(path, cancel_requested);
  auto facts = std::make_shared<NormalizedAnnotationCompletion>();
  facts->schema_version = kBenchmarkCacheSchemaVersion;
  facts->index_version = kNormalizedAnnotationIndexVersion;
@@ -1785,7 +1871,7 @@ std::shared_ptr<const NormalizedAnnotationCompletion> store_normalized_annotatio
   [&]<class Declaration>(const auto& field) { manifest[field.member_name] = facts.get()->*Declaration::pointer; });
  facts->proof_bytes = write_json_atomically(completion, manifest, cancel_requested, &destination);
  trace_benchmark_event(trace, "benchmark.annotations.cache_store",
-  [&] { return nlohmann::json{{"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"bytes", total_size}}; });
+  [&] { return nlohmann::json{{"path", path.string()}, {"source", benchmark_source_name(index.source)}, {"split", index.split}, {"images", index.images.size()}, {"boxes", index.boxes.size()}, {"bytes", total_size}}; });
  return facts;
 }
 NormalizedAnnotationReadView::NormalizedAnnotationReadView(NormalizedAnnotationIndex storage)

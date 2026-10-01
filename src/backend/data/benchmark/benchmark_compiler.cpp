@@ -505,6 +505,7 @@ void publish_dataset_directory(const std::filesystem::path& staging, const std::
  const BenchmarkTraceSink& trace) {
  throw_if_benchmark_cancelled(cancellation);
  const bool output_exists = std::filesystem::exists(output);
+ trace_benchmark_event(trace, "benchmark.publication.started", [&] { return nlohmann::json{{"output", output.string()}, {"replacing", output_exists}}; });
  if (!output_exists) {
   throw_if_benchmark_cancelled(cancellation);
   std::filesystem::rename(staging, output);
@@ -627,6 +628,7 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
    split, staging.path() / (split.name + ".bin"), config.resolution, static_cast<int>(pipeline.execution().workers()), pipeline.execution().cpus(), false, cancellation, pixel_progress,
    config.perceptual_downscale, config.resize_mode, image_opened, {}, &pipeline
   };
+  result.trace = trace;
   if (progress.pixel_observer_enabled()) result.compaction = [&, val = split.name == "val"](std::size_t done, std::size_t total) { progress.compacting(val ? 1U : 0U, done, total); };
   return result;
  };
@@ -908,7 +910,9 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
  manifest["projected_output_bytes"] = manifest["compiled_bytes"];
  publish_benchmark_manifest(config, staging.path(), cache.root, std::move(manifest), cancellation, &pipeline.storage());
  progress.phase(DatasetCompilePhase::Syncing, 2, 3);
+ trace_benchmark_event(trace, "benchmark.directory_sync.started", [&] { return nlohmann::json{{"path", staging.path().string()}}; });
  sync_directory(staging.path());
+ trace_benchmark_event(trace, "benchmark.directory_sync.completed", [&] { return nlohmann::json{{"path", staging.path().string()}}; });
  progress.phase(DatasetCompilePhase::Syncing, 3, 3);
  progress.phase(DatasetCompilePhase::Publishing, 0, 1);
  progress.flush();
@@ -1764,6 +1768,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
     product, staging_dir / (i == 0 ? "train.bin" : "val.bin"), config.resolution, config.num_workers, compile_cpus, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode
    };
    if (progress.pixel_observer_enabled()) seal_request.compaction = [&, i](std::size_t done, std::size_t total) { progress.compacting(i, done, total); };
+   seal_request.trace = trace;
    seal_request.compaction_scratch = scratch;
    return writer.seal(seal_request);
   });
@@ -1883,7 +1888,9 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   publish_benchmark_manifest(config, staging_dir, cache.root, std::move(manifest), cancel_requested, &pipeline.storage());
   progress.phase(DatasetCompilePhase::Syncing, 3U, kSyncStepCount);
   progress.activity("Syncing staged benchmark dataset");
+  trace_benchmark_event(trace, "benchmark.directory_sync.started", [&] { return nlohmann::json{{"path", staging_dir.string()}}; });
   sync_directory(staging_dir);
+  trace_benchmark_event(trace, "benchmark.directory_sync.completed", [&] { return nlohmann::json{{"path", staging_dir.string()}}; });
   progress.phase(DatasetCompilePhase::Syncing, kSyncStepCount, kSyncStepCount);
   progress.phase(DatasetCompilePhase::Publishing, 0U, 1U);
   progress.activity("Atomically publishing benchmark dataset");

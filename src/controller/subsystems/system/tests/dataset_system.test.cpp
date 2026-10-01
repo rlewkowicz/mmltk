@@ -287,6 +287,66 @@ public:
 private:
  Work work_;
 };
+TEST_CASE("dataset delivers mixed Coconut row extents and continuing pixels through successful publication", "[controller][systems][dataset][progress]") {
+ namespace data = mmltk::backend::data;
+ using namespace data::benchmark_internal;
+ const mmltk::testsupport::ScopedTempDir root{"dataset-mixed-annotation-extents"};
+ SettingsSystem settings;
+ REQUIRE(settings.Load(install_settings(root.path())).applied());
+ std::vector<contracts::ArtifactProgress> produced, delivered;
+ std::promise<DatasetChanged> terminal;
+ auto completed = terminal.get_future();
+ const AcquisitionDatasetRuntime::Work work = [&](const auto& progress) {
+  ProgressReporter reporter([&](const auto& snapshot) {
+   auto projected = services::project_artifact_progress(snapshot);
+   produced.push_back(projected);
+   progress(projected);
+  }, {});
+  reporter.phase(data::DatasetCompilePhase::Planning);
+  const std::array<std::uint64_t, 3> extents{241602, 0, 0};
+  auto& rows = *reporter.indexing(extents);
+  reporter.label_plans(3);
+  for (std::size_t i = 0; i < 3; ++i) reporter.label_plan_started(i);
+  reporter.pixels(16177, 0, false);
+  rows.update(0, 241596, reporter);
+  reporter.flush();
+  for (std::size_t release = 1; release < 3; ++release) {
+   rows.update(release, 128, reporter);
+   reporter.pixel_completed();
+   // The ordinary COCO cache concurrently completes one original-index job.
+   reporter.phase(data::DatasetCompilePhase::Indexing, release, 2);
+   reporter.flush();
+  }
+  rows.settle(0, 241602, reporter);
+  rows.settle(1, 128, reporter);
+  rows.settle(2, 128, reporter);
+  for (std::size_t i = 0; i < 3; ++i) reporter.label_plan_completed(i);
+  reporter.acquisition_complete();
+  reporter.pixels(16179, 16179);
+  reporter.phase(data::DatasetCompilePhase::Publishing, 1, 1);
+  reporter.flush();
+ };
+ DatasetSystem dataset{settings, [&] { return std::make_unique<AcquisitionDatasetRuntime>(work); }, [&](DatasetSystem::event_type event) {
+  if (const auto* progress = std::get_if<DatasetProgress>(&event)) delivered.push_back(progress->snapshot.progress);
+  else terminal.set_value(std::get<DatasetChanged>(std::move(event)));
+ }};
+ const mmltk::testsupport::ScopedTestCleanup settle([&] { dataset.Shutdown(); });
+ static_cast<void>(dataset.Compile({}));
+ const auto result = mmltk::testsupport::await_test_future(completed, "mixed row extents publish through DatasetSystem");
+ dataset.Shutdown();
+ CHECK(result.snapshot.terminal.outcome == contracts::ArtifactTerminalOutcome::Succeeded);
+ CHECK(result.snapshot.terminal.detail.empty());
+ CHECK_FALSE(result.snapshot.active);
+ produced.erase(std::unique(produced.begin(), produced.end()), produced.end());
+ CHECK(delivered == produced);
+ REQUIRE_FALSE(delivered.empty());
+ for (const auto& snapshot : delivered) CHECK(snapshot.valid());
+ for (std::uint64_t pixels = 16177; pixels <= 16179; ++pixels)
+  CHECK(std::ranges::any_of(delivered, [&](const auto& snapshot) { return snapshot.tracks.pixels.completed == pixels && !snapshot.tracks.labels.total_known; }));
+ CHECK(std::ranges::any_of(delivered, [](const auto& snapshot) { return snapshot.tracks.labels.completed > 241605 && !snapshot.tracks.labels.total_known; }));
+ CHECK(delivered.back().tracks.labels.completed == 241858);
+ CHECK(delivered.back().tracks.labels.complete);
+}
 TEST_CASE("dataset admits real open ended acquisition and successful HTTP recovery", "[controller][systems][dataset][progress]") {
  namespace data = mmltk::backend::data;
  using namespace data::benchmark_internal;
@@ -437,6 +497,7 @@ TEST_CASE("dataset independently rejects each malformed progress invariant", "[c
   malformed.tracks.labels.active = true;
   malformed.tracks.labels.complete = true;
  }
+ SECTION("invalid track unit") { malformed.tracks.labels.unit = static_cast<mmltk::backend::data::DatasetCompileUnit>(255); }
  SECTION("invalid track activity") { malformed.tracks.pixels.activity = static_cast<mmltk::backend::data::DatasetCompileActivity>(255); }
  SECTION("oversized source activity") { malformed.sources.push_back({.activity = std::string(contracts::kArtifactProgressTextCapacity + 1, 'x')}); }
  SECTION("artifact transfer exceeds known total") { malformed.sources.emplace_back().transfer = mmltk::backend::data::BenchmarkTransferProgress{.completed_bytes = 3, .total_bytes = 2}; }

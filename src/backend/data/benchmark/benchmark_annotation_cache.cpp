@@ -318,7 +318,11 @@ void CocoAnnotationCache::settle(DownloadResult archive, ProgressReporter& progr
     parsers[i] = std::async(std::launch::async, [&, train, identity, input] {
      build_split(train, identity, progress, input);
      const std::lock_guard lock(completion_mutex);
-     progress.phase(DatasetCompilePhase::Indexing, completed_count.fetch_add(1) + 1, total);
+     const auto settled = completed_count.fetch_add(1) + 1;
+     trace_benchmark_event(trace_, "benchmark.annotations.original_index_completed", [&] {
+      return nlohmann::json{{"split", train ? "train2017" : "val2017"}, {"completed_items", settled}, {"total_items", total}};
+     });
+     progress.phase(DatasetCompilePhase::Indexing, settled, total);
     });
    });
   } catch (const BenchmarkArchiveError& error) { stream_error = std::make_exception_ptr(AnnotationSourceUnavailable(error.what())); } catch (const AnnotationSourceUnavailable&) {

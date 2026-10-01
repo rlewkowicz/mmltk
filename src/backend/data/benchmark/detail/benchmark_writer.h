@@ -1,5 +1,6 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/detail/staged_artifact.h"
+#include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
@@ -82,6 +83,7 @@ struct BenchmarkWriteRequest {
  std::span<std::byte> compaction_scratch{};
  // Effect-only physical preparation observation, outside source/facts locks.
  BenchmarkImageReadObserver extent_preparing{};
+ BenchmarkTraceSink trace{};
 };
 // Physical slots are stable across sparse growth. Calls on different
 // slots may overlap; execution lends an exclusive pixel context and arena.

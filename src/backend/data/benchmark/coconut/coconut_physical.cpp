@@ -1,4 +1,5 @@
 #include "src/backend/data/detail/storage_reservation.h"
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory_io.h"
@@ -58,6 +59,15 @@ std::span<const CoconutImageNamespace> coconut_release_sources(CoconutEdition ed
  }
  throw std::invalid_argument("invalid COCONut edition");
 }
+struct CoconutPhysicalMembership::Registration::State {
+ std::weak_ptr<Impl> owner;
+ std::pair<CoconutEdition, std::uint64_t> key;
+ detail::CompileExecution::CompletionSource completion;
+ bool registered = false;
+ State(const std::shared_ptr<Impl>& membership, std::pair<CoconutEdition, std::uint64_t> identity, detail::CompileExecution* execution)
+     : owner(membership), key(identity), completion(execution) {}
+ ~State();
+};
 struct CoconutPhysicalMembership::Impl {
  struct Artifact {
   AdmittedRecipeArchive* archive;
@@ -71,7 +81,7 @@ struct CoconutPhysicalMembership::Impl {
  };
  struct Fact {
   CoconutPhysicalImage image{};
-  bool conflict = false, pixels = false, verified = true;
+  bool conflict = false, pixels = false, verified = true, header = false;
   std::uint64_t bytes = 0;
   const CoconutPhysicalImage* borrowed = nullptr;
   [[nodiscard]] const CoconutPhysicalImage& physical() const { return borrowed ? *borrowed : image; }
@@ -88,16 +98,39 @@ struct CoconutPhysicalMembership::Impl {
  Repair repair;
  mutable std::mutex mutex;
  mutable std::condition_variable changed;
- using Change = std::optional<detail::CompileExecution::CompletionSource>;
- mutable Change readiness_change;
+ // Only registrations own their completion/callback. This routing table
+ // retains weak entries, removed by the last observer even without an event.
+ using Registrations = std::map<Registration::State*, std::weak_ptr<Registration::State>>;
+ using Change = std::map<std::pair<CoconutEdition, std::uint64_t>, Registrations>;
+ mutable Change readiness_changes;
  std::uint64_t readiness_generation = 0;
- [[nodiscard]] Change advance_locked() noexcept {
+ [[nodiscard]] Change advance_locked(CoconutImageNamespace source, std::optional<std::uint64_t> image = {}) noexcept {
   ++readiness_generation;
-  return std::exchange(readiness_change, std::nullopt);
+  Change notifications;
+  // Only a changed identity wakes its subscribers. Source settlement/repair
+  // also wakes missing identities in that namespace to prove terminal absence.
+  for (const auto& [edition, selected] : releases) {
+   (void)selected;
+   if (std::ranges::find(coconut_release_sources(edition), source) == coconut_release_sources(edition).end()) continue;
+   if (image) {
+    auto node = readiness_changes.extract({edition, *image});
+    if (!node.empty()) notifications.insert(std::move(node));
+   } else {
+    auto next = readiness_changes.lower_bound({edition, 0});
+    while (next != readiness_changes.end() && next->first.first == edition) notifications.insert(readiness_changes.extract(next++));
+   }
+  }
+  return notifications;
  }
  void notify(Change current, std::exception_ptr failure = {}) noexcept {
   changed.notify_all();
-  if (current) current->settle(std::move(failure));
+  for (auto& [key, registrations] : current) {
+   (void)key;
+   for (auto& [identity, weak] : registrations) {
+    (void)identity;
+    if (const auto registration = weak.lock()) registration->completion.settle(failure);
+   }
+  }
  }
  Impl(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& layout, detail::StorageReservationPool& reservations,
   BenchmarkCompilePipeline& pipeline, Cancellation cancel, Progress observer, Repair recover)
@@ -148,7 +181,7 @@ struct CoconutPhysicalMembership::Impl {
    const std::lock_guard lock(mutex);
    item.complete = true;
    item.admissions = std::max(item.admissions, 1U);
-   notification = advance_locked();
+   notification = advance_locked(item.archive->origin.source);
   }
   notify(std::move(notification));
  }
@@ -205,7 +238,7 @@ struct CoconutPhysicalMembership::Impl {
   // other join then sees this source pending until its owner settles it.
   RepairClaim claim{inspected.repair->archive, std::string(inspected.image ? "unreadable required image: " : "missing required image: ") + record.file_name, {}};
   inspected.repair->complete = false;
-  claim.notification = advance_locked();
+  claim.notification = advance_locked(inspected.repair->archive->origin.source);
   return claim;
  }
  CoconutPhysicalImage resolve(CoconutEdition edition, const CoconutRecord& record, bool wait) {
@@ -245,10 +278,24 @@ struct CoconutPhysicalMembership::Impl {
   throw CoconutPhysicalMembershipError(edition, id, "missing physical image: " + record.file_name);
  }
 };
+CoconutPhysicalMembership::Registration::State::~State() {
+ if (!registered) return;
+ if (const auto membership = owner.lock()) {
+  const std::lock_guard lock(membership->mutex);
+  const auto found = membership->readiness_changes.find(key);
+  if (found == membership->readiness_changes.end()) return;
+  found->second.erase(this);
+  if (found->second.empty()) membership->readiness_changes.erase(found);
+ }
+}
+bool CoconutPhysicalMembership::Registration::ready() const { return !state_ || state_->completion.completion().ready(); }
+void CoconutPhysicalMembership::Registration::subscribe(std::function<void(std::exception_ptr)> callback) const {
+ if (state_) state_->completion.completion().subscribe(std::move(callback));
+}
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& cache,
  detail::StorageReservationPool& storage, BenchmarkCompilePipeline& execution, Cancellation cancellation, Progress progress, Repair repair)
-    : impl_(std::make_unique<Impl>(admitted, catalog, explicit_catalog, cache, storage, execution, cancellation, std::move(progress), std::move(repair))) {}
-CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<const CoconutPhysicalImage> images, Cancellation cancellation) : impl_(std::make_unique<Impl>(images, cancellation)) {}
+    : impl_(std::make_shared<Impl>(admitted, catalog, explicit_catalog, cache, storage, execution, cancellation, std::move(progress), std::move(repair))) {}
+CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<const CoconutPhysicalImage> images, Cancellation cancellation) : impl_(std::make_shared<Impl>(images, cancellation)) {}
 CoconutPhysicalMembership::~CoconutPhysicalMembership() = default;
 const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespace source, std::uint64_t id) const noexcept {
  const std::lock_guard lock(impl_->mutex);
@@ -261,16 +308,24 @@ CoconutPhysicalMembership::Readiness CoconutPhysicalMembership::readiness(Coconu
  {
   const std::lock_guard lock(impl_->mutex);
   const auto inspected = impl_->inspect_locked(edition, record, objects);
-  // Allocate the next subscription before a repair claim changes the facts.
-  // Its generation is captured after that claim and before the owner is called.
-  Impl::Change next;
-  if (!impl_->readiness_change || inspected.repair) next.emplace(impl_->execution ? &impl_->execution->execution() : nullptr);
-  if (inspected.terminal && !inspected.repair && inspected.image) result.image = inspected.image->physical();
+  // Verified identity and its admitted encoded header authorize recovery;
+  // successful resized pixels remain a separate final eligibility fact.
+  if (inspected.image && !inspected.repair && (!impl_->execution || inspected.image->header || inspected.terminal)) result.image = inspected.image->physical();
   claim = impl_->claim_repair_locked(inspected, record);
   result.terminal = inspected.terminal && !claim;
   result.generation = impl_->readiness_generation;
-  if (next) impl_->readiness_change = std::move(next);
-  result.changed = impl_->readiness_change->completion();
+  const auto id = objects ? objects->id : record.image_id;
+  const auto key = std::pair{edition, id};
+  auto registration = std::make_shared<Registration::State>(impl_, key, impl_->execution ? &impl_->execution->execution() : nullptr);
+  auto [next, inserted] = impl_->readiness_changes.try_emplace(key);
+  try {
+   next->second.emplace(registration.get(), registration);
+  } catch (...) {
+   if (inserted) impl_->readiness_changes.erase(next);
+   throw;
+  }
+  registration->registered = true;
+  result.changed.state_ = std::move(registration);
  }
  if (claim) {
   impl_->notify(std::move(claim->notification));
@@ -312,7 +367,7 @@ void CoconutPhysicalMembership::admitted(AdmittedRecipeArchive& archive, Downloa
   if (replacement) impl_->artifact(archive).inspected_cache_identity = archive.download.identity;
   impl_->artifact(archive).admitted = true;
   ++impl_->artifact(archive).admissions;
-  notification = impl_->advance_locked();
+  notification = impl_->advance_locked(archive.origin.source);
  }
  impl_->notify(std::move(notification));
 }
@@ -342,7 +397,7 @@ void CoconutPhysicalMembership::unavailable(AdmittedRecipeArchive& archive) {
   const std::lock_guard lock(impl_->mutex);
   impl_->artifact(archive).complete = true;
   impl_->artifact(archive).admissions = 3;
-  notification = impl_->advance_locked();
+  notification = impl_->advance_locked(archive.origin.source);
  }
  impl_->notify(std::move(notification));
 }
@@ -434,7 +489,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
    conflict = found->second.conflict;
    pixels = found->second.pixels;
    if (conflict) withdraw(found->second);
-   notification = state.advance_locked();
+   notification = state.advance_locked(image.source, image.image_id);
   }
   try {
    if (retire) execution.retire_image(root, image.image_id);
@@ -475,7 +530,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
     found->second.pixels = false;
     found->second.bytes = 0;
    }
-   notification = state.advance_locked();
+   notification = state.advance_locked(image.source, image.image_id);
   }
   state.notify(std::move(notification));
   if (source_read)
@@ -491,6 +546,18 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
  });
  const auto publish = [&](const CoconutPhysicalImage& image, BenchmarkEncodedImage::Ptr input, bool source_read = false) {
   publications.make_room();
+  // Header admission precedes resize/output. The mapping and source ticket
+  // retain the same inode/generation through all independent consumers.
+  Impl::Change header_notification;
+  {
+   const std::lock_guard lock(state.mutex);
+   const auto found = state.images.find({image.source, image.image_id});
+   if (found != state.images.end() && found->second.image == image && !found->second.header) {
+    found->second.header = true;
+    header_notification = state.advance_locked(image.source, image.image_id);
+   }
+  }
+  state.notify(std::move(header_notification));
   const auto bytes = input->size();
   const auto generation = execution.image_generation(root, image.image_id);
   auto ticket = execution.source_publication(root, lease, image.image_id);
@@ -517,7 +584,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
      image_fact.bytes = bytes;
     }
     completed = artifact.completed_images;
-    notification = state.advance_locked();
+    notification = state.advance_locked(image.source, image.image_id);
    }
    try {
     if (conflict) execution.retire_image(root, image.image_id);
@@ -548,15 +615,15 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
      if (!*complete) publish(image, std::move(input));
     } catch (...) { image_failure(image, false, std::current_exception()); }
    });
-   publications.drain();
    Impl::Change notification;
    {
     const std::lock_guard lock(state.mutex);
     for (auto& [key, value] : state.images)
      if (key.first == archive.origin.source && value.image.shard == archive.origin.shard) value.verified = true;
-    notification = state.advance_locked();
+    notification = state.advance_locked(archive.origin.source);
    }
    state.notify(std::move(notification));
+   publications.drain();
    if (cache_incomplete) throw BenchmarkImageError("cached inventory has unreadable images");
    {
     const std::lock_guard lock(state.mutex);
@@ -720,7 +787,7 @@ void CoconutPhysicalMembership::withdraw(const AdmittedRecipeArchive& archive) {
    withdrawn.push_back(image.image_id);
    return true;
   });
-  notification = impl_->advance_locked();
+  notification = impl_->advance_locked(archive.origin.source);
  }
  try {
   for (const auto id : withdrawn) impl_->execution->retire_image(impl_->root(archive.origin.source), id);
