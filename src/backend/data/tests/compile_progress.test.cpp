@@ -37,6 +37,7 @@
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/compiled_file.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
+#include "src/backend/data/benchmark/detail/benchmark_cancellation.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/backend/data/compiler/detail/dataset_compiler_internal.h"
@@ -1282,18 +1283,201 @@ TEST_CASE("benchmark work follows unfinished tracks after indexing and across re
  CHECK(last.phase == DatasetCompilePhase::Syncing);
  CHECK(last.completed == 0);
 }
-TEST_CASE("benchmark callback failures settle at explicit flush and warning failures stay nonfatal", "[backend][data][benchmark][progress]") {
+namespace {
+struct BenchmarkCancellationFixture {
+ struct Tag;
+ using Source = mmltk::common::concurrency::EventCancellationSource<Tag, false>;
+ using Observation = mmltk::common::concurrency::CancellationObservation;
+ std::pair<Source, Source::Token> external = Source::Mint();
+ benchmark_internal::BenchmarkCompileCancellation cancellation{Observation::Borrow(external.second)};
+ const Observation observation = Observation::Borrow(cancellation);
+ const detail::CompileExecutionLimits limits{.transient_bytes = mmltk::common::system::host_page_size(), .descriptors = 8, .task_records = 4};
+};
+}
+TEST_CASE("benchmark callback failures survive execution attachment and warning failures stay nonfatal", "[backend][data][benchmark][progress]") {
  using namespace mmltk::backend::data::benchmark_internal;
+ BenchmarkCancellationFixture fixture;
  const BenchmarkTraceSink quiet;
- std::exception_ptr failure;
- ProgressReporter warning([](const auto&) { throw std::runtime_error("warning callback"); }, quiet);
+ const auto failed = [&](std::exception_ptr value) { fixture.cancellation.fail(std::move(value)); };
+ ProgressReporter warning([](const auto&) { throw std::runtime_error("warning callback"); }, quiet, {}, failed);
  warning.warning("best effort warning");
  CHECK_NOTHROW(warning.flush());
- ProgressReporter reporter([](const auto&) { throw std::runtime_error("progress callback"); }, quiet, {}, [&](std::exception_ptr value) { failure = value; });
+ CHECK_FALSE(fixture.observation.requested());
+ CHECK_NOTHROW(fixture.cancellation.rethrow_failure());
+ ProgressReporter reporter([](const auto&) { throw std::runtime_error("progress callback"); }, quiet, {}, failed);
  reporter.phase(DatasetCompilePhase::Planning);
  CHECK_THROWS_WITH(reporter.flush(), "progress callback");
- REQUIRE(failure);
+ CHECK(fixture.observation.requested());
+ CHECK(fixture.observation.descriptor() == fixture.external.second.descriptor());
+ CHECK_FALSE(fixture.external.second.cancelled());
+ CHECK_THROWS_WITH(fixture.cancellation.rethrow_failure(), "progress callback");
  CHECK_THROWS_WITH(reporter.phase(DatasetCompilePhase::Publishing, 0, 1), "progress callback");
+ detail::CompileExecution execution(1, {}, fixture.limits, fixture.observation);
+ const auto generation = execution.admission_generation();
+ {
+  const auto binding = fixture.cancellation.bind_execution(execution);
+  CHECK(execution.admission_generation() > generation);
+  CHECK(execution.interruption());
+  CHECK_THROWS_AS(fixture.cancellation.bind_execution(execution), std::logic_error);
+  fixture.cancellation.cancel();
+  fixture.cancellation.cancel();
+  fixture.cancellation.fail(std::make_exception_ptr(std::runtime_error("later source failure")));
+ }
+ CHECK_THROWS_WITH(fixture.cancellation.rethrow_failure(), "progress callback");
+ CHECK(fixture.external.first.RequestCancel());  // The borrowed descriptor is still owned by the caller.
+ CHECK(fixture.external.second.cancelled());
+}
+TEST_CASE("benchmark cancellation observes an external stop without inventing a failure", "[backend][data][benchmark][progress]") {
+ BenchmarkCancellationFixture fixture;
+ CHECK_FALSE(fixture.cancellation.cancelled());
+ CHECK(fixture.external.first.RequestCancel());
+ CHECK(fixture.cancellation.cancelled());
+ CHECK(fixture.observation.requested());
+ CHECK(fixture.cancellation.descriptor() == fixture.external.second.descriptor());
+ CHECK_NOTHROW(fixture.cancellation.rethrow_failure());
+ fixture.cancellation.cancel();
+ fixture.cancellation.cancel();
+ CHECK_NOTHROW(fixture.cancellation.rethrow_failure());
+}
+TEST_CASE("benchmark progress failure wakes admission and drains physical borrowers", "[backend][data][benchmark][progress][concurrency]") {
+ using namespace mmltk::backend::data::benchmark_internal;
+ using namespace mmltk::backend::data::detail;
+ using namespace mmltk::testsupport;
+ BenchmarkCancellationFixture fixture;
+ TestGate physical("active benchmark workspace borrower");
+ std::promise<void> resource_waiting;
+ std::atomic<bool> reported_wait{false}, observed_cancellation{false}, parked_ran{false};
+ const BenchmarkTraceSink quiet;
+ ProgressReporter reporter([](const auto&) { throw std::runtime_error("live progress failure"); }, quiet, {},
+  [&](std::exception_ptr error) { fixture.cancellation.fail(std::move(error)); });
+ CompileExecution execution(1, {}, fixture.limits, fixture.observation, [&](std::string_view event, const CompileExecutionSnapshot&) {
+  if (event == "compile.resource.wait" && !reported_wait.exchange(true)) resource_waiting.set_value();
+ });
+ const auto binding = fixture.cancellation.bind_execution(execution);
+ CompileExecution::Dependency dependency(execution);
+ auto parked = execution.try_subscribe(dependency, dependency.generation(), {.kind = CompileTaskKind::Normalize,
+  .work = [&](std::size_t, const CompileAllowance&) { parked_ran.store(true); }});
+ REQUIRE(parked);
+ CHECK(execution.snapshot().parked[static_cast<std::size_t>(CompileParkReason::Dependency)] == 1);
+ std::future<CompileAllowance> admission;
+ const ScopedTestCleanup release([&] { fixture.cancellation.cancel(); physical.Release(); if (admission.valid()) admission.wait(); });
+ auto active = execution.submit({.kind = CompileTaskKind::Pixels, .resources = {.bytes = fixture.limits.transient_bytes, .supplied_workspace = true},
+  .work = [&](std::size_t, const CompileAllowance& allowance) {
+   const auto workspace = allowance.workspace();
+   workspace.front() = std::byte{17};
+   physical.receipt().ArriveAndWait();
+   observed_cancellation.store(fixture.observation.requested());
+   workspace.back() = std::byte{23};  // Cancellation cannot shorten physical workspace custody.
+  }});
+ REQUIRE(physical.WaitEntered(std::chrono::seconds{5}));
+ admission = std::async(std::launch::async, [&] {
+  return execution.reserve({.bytes = fixture.limits.transient_bytes, .supplied_workspace = true});
+ });
+ await_test_promise(resource_waiting, "benchmark admission waiting for the held workspace");
+ reporter.phase(DatasetCompilePhase::Planning);
+ CHECK_THROWS_WITH(reporter.flush(), "live progress failure");
+ CHECK_THROWS_WITH(await_test_future(admission, "benchmark failure wakes descriptor-backed admission"), "dataset compilation cancelled");
+ CHECK(fixture.observation.requested());
+ CHECK_FALSE(fixture.external.second.cancelled());
+ CHECK_FALSE(active.ready());
+ CHECK_FALSE(parked->ready());
+ physical.Release();
+ CHECK_NOTHROW(active.wait());
+ CHECK_THROWS_WITH(parked->wait(), "dataset compilation cancelled");
+ CHECK_THROWS_WITH(execution.join(), "dataset compilation cancelled");
+ CHECK(observed_cancellation.load());
+ CHECK_FALSE(parked_ran.load());
+ const auto drained = execution.snapshot();
+ CHECK(drained.active == 0);
+ CHECK(drained.records == 0);
+ CHECK(drained.leased == 0);
+ fixture.cancellation.cancel();
+ fixture.cancellation.fail(std::make_exception_ptr(std::runtime_error("drain failure")));
+ CHECK_THROWS_WITH(fixture.cancellation.rethrow_failure(), "live progress failure");
+}
+TEST_CASE("benchmark held progress failure survives execution retirement during unwinding", "[backend][data][benchmark][progress][concurrency]") {
+ using namespace mmltk::backend::data::benchmark_internal;
+ using namespace mmltk::testsupport;
+ BenchmarkCancellationFixture fixture;
+ TestGate observer("progress observer held across execution retirement");
+ std::promise<void> execution_retired;
+ auto compiling = std::async(std::launch::async, [&] {
+  try {
+   const BenchmarkTraceSink quiet;
+   ProgressReporter reporter([&](const auto&) {
+    observer.receipt().ArriveAndWait();
+    throw std::runtime_error("late progress failure");
+   }, quiet, {}, [&](std::exception_ptr error) { fixture.cancellation.fail(std::move(error)); });
+   struct Retired {
+    std::promise<void>& event;
+    ~Retired() { release_test_promise(event); }
+   } retired{execution_retired};
+   detail::CompileExecution execution(1, {}, fixture.limits, fixture.observation);
+   const auto binding = fixture.cancellation.bind_execution(execution);
+   reporter.phase(DatasetCompilePhase::Planning);
+   if (!observer.WaitEntered(std::chrono::seconds{5})) throw std::runtime_error("progress observer did not enter");
+   throw std::runtime_error("later source setup failure");
+  } catch (...) {
+   // The reporter has drained its callback before the outer session catch.
+   fixture.cancellation.rethrow_failure();
+   throw;
+  }
+ });
+ const ScopedTestCleanup release([&] { observer.Release(); if (compiling.valid()) compiling.wait(); });
+ await_test_promise(execution_retired, "execution retired while the observer remains held", std::chrono::seconds{5});
+ CHECK_FALSE(fixture.cancellation.cancelled());
+ observer.Release();
+ CHECK_THROWS_WITH(await_test_future(compiling, "late observer failure drained during unwinding"), "late progress failure");
+ CHECK(fixture.cancellation.cancelled());
+ fixture.cancellation.cancel();
+ fixture.cancellation.fail(std::make_exception_ptr(std::runtime_error("failure after reporter retirement")));
+ CHECK_THROWS_WITH(fixture.cancellation.rethrow_failure(), "late progress failure");
+}
+TEST_CASE("benchmark binding transitions serialize concurrent progress failure", "[backend][data][benchmark][progress][concurrency]") {
+ using namespace mmltk::backend::data::benchmark_internal;
+ using namespace mmltk::testsupport;
+ const bool attaching = GENERATE(false, true);
+ CAPTURE(attaching);
+ BenchmarkCancellationFixture fixture;
+ TestGate transition("execution binding transition and observer failure");
+ std::promise<void> failure_delivered;
+ auto failure_ready = failure_delivered.get_future();
+ const BenchmarkTraceSink quiet;
+ ProgressReporter reporter([&](const auto&) {
+  transition.receipt().ArriveAndWait();
+  throw std::runtime_error("concurrent progress failure");
+ }, quiet, {}, [&](std::exception_ptr error) {
+  fixture.cancellation.fail(std::move(error));
+  release_test_promise(failure_delivered);
+ });
+ auto execution_scope = std::async(std::launch::async, [&] {
+  detail::CompileExecution execution(1, {}, fixture.limits, fixture.observation);
+  const auto generation = execution.admission_generation();
+  if (attaching) transition.receipt().ArriveAndWait();
+  {
+   const auto binding = fixture.cancellation.bind_execution(execution);
+   if (!attaching) transition.receipt().ArriveAndWait();
+   else {
+    failure_ready.wait();
+    return execution.interruption() && execution.admission_generation() > generation;
+   }
+  }
+  // Destruction races the released failure callback after scoped detachment.
+  return true;
+ });
+ const ScopedTestCleanup release([&] {
+  transition.Release();
+  release_test_promise(failure_delivered);
+  if (execution_scope.valid()) execution_scope.wait();
+ });
+ reporter.phase(DatasetCompilePhase::Planning);
+ REQUIRE(transition.WaitEntered(std::chrono::seconds{5}, 2));
+ transition.Release();
+ CHECK_THROWS_WITH(reporter.flush(), "concurrent progress failure");
+ CHECK(await_test_future(execution_scope, "concurrent benchmark binding transition"));
+ fixture.cancellation.cancel();
+ fixture.cancellation.fail(std::make_exception_ptr(std::runtime_error("subsequent progress failure")));
+ CHECK_THROWS_WITH(fixture.cancellation.rethrow_failure(), "concurrent progress failure");
 }
 
 TEST_CASE("compile preparation uses owner capacities protected reserves and the fixed budget formula", "[backend][data][compile][resources]") {

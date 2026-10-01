@@ -42,6 +42,7 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_parquet.h"
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
+#include "src/backend/data/benchmark/detail/benchmark_cancellation.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/backend/data/benchmark/detail/open_images_acquisition.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
@@ -912,41 +913,14 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   throw std::invalid_argument("invalid benchmark resize mode");
  if (config.resolution == 0U || config.resolution > MAX_IMAGE_EXTENT) { throw std::runtime_error("benchmark resolution exceeds the compiled coordinate format"); }
  if (config.output_dir.empty()) { throw std::runtime_error("benchmark output directory must not be empty"); }
- struct CancellationState final {
-  mmltk::common::concurrency::CancellationObservation external;
-  std::atomic<bool> internal{false};
-  std::mutex failure_mutex{};
-  std::exception_ptr failure{};
-  detail::CompileExecution* execution = nullptr;
-  void fail(std::exception_ptr error) {
-   const std::lock_guard lock(failure_mutex);
-   if (!failure) failure = std::move(error);
-   internal.store(true, std::memory_order_relaxed);
-   if (execution) execution->notify_admission_change();
-  }
-  void rethrow_failure() {
-   std::exception_ptr error;
-   {
-    const std::lock_guard lock(failure_mutex);
-    error = failure;
-   }
-   if (error) std::rethrow_exception(error);
-  }
-  [[nodiscard]] bool cancelled() const noexcept { return external.requested() || internal.load(std::memory_order_relaxed); }
-  [[nodiscard]] int descriptor() const noexcept { return external.descriptor(); }
- } cancellation_state{.external = config.cancel_requested};
+ BenchmarkCompileCancellation cancellation_state(config.cancel_requested);
  const auto cancel_requested = mmltk::common::concurrency::CancellationObservation::Borrow(cancellation_state);
- std::atomic<bool>* const cancel_signal = &cancellation_state.internal;
  try {
   struct StopFailedAttempt {
-   std::atomic<bool>* stop;
-   BenchmarkCompilePipeline& execution;
+   BenchmarkCompileCancellation& cancellation;
    int exceptions = std::uncaught_exceptions();
    ~StopFailedAttempt() {
-    if (std::uncaught_exceptions() > exceptions) {
-     stop->store(true, std::memory_order_relaxed);
-     execution.execution().notify_admission_change();
-    }
+    if (std::uncaught_exceptions() > exceptions) cancellation.cancel();
    }
   };
   const BenchmarkTraceSink trace = make_trace_sink(config.trace);
@@ -1004,8 +978,8 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(effective_num_workers,config.resolution,config.perceptual_downscale,
    coconut ? kParquetPoolBytes : 0,limits.transient_bytes,BenchmarkEncodedImage::normal_window_bytes));
   BenchmarkCompilePipeline pipeline(effective_num_workers, compile_cpus, limits, cancel_requested, trace);
+  const auto cancellation_binding = cancellation_state.bind_execution(pipeline.execution());
   compile_cpus.assign(pipeline.execution().cpus().begin(), pipeline.execution().cpus().end());
-  cancellation_state.execution = &pipeline.execution();
   std::function<void(const std::filesystem::path&, std::uint64_t, const BenchmarkLabelWorkspace&)> observe_label_projection;
   std::function<void(const std::filesystem::path&, std::uint64_t)> observe_label_write;
   if (trace) {
@@ -1022,7 +996,6 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   auto source_transport = pipeline.curl().channel(BenchmarkCurl::Class::Artifact, cancel_requested, archive_image_resources());
   const auto fail_compile = [&](std::exception_ptr error) {
    cancellation_state.fail(std::move(error));
-   pipeline.execution().notify_admission_change();
   };
   const auto custom_catalog = explicit_custom_catalog ? *explicit_custom_catalog : coconut ? CustomRecipeCatalog{} : custom_recipe_catalog();
   const auto coconut_catalog = coconut ? (explicit_catalog ? *explicit_catalog : coconut_recipe_catalog(config.selection.validation)) : CoconutRecipeCatalog{};
@@ -1044,7 +1017,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   };
   std::mutex archive_readiness_mutex;
   std::array<std::future<PrefetchedArchive>, 2> custom_transfers;
-  StopFailedAttempt stop_failed_attempt{cancel_signal, pipeline};
+  StopFailedAttempt stop_failed_attempt{cancellation_state};
   if (!staging_owner) staging_owner = std::make_unique<common_io::StagingDirectory>(config.output_dir, ".", ".benchmark.tmp.XXXXXX", "cannot create benchmark dataset staging directory");
   const std::filesystem::path& staging_dir = staging_owner->path();
   const auto pixel_lanes = pipeline.execution().workers();
@@ -1069,7 +1042,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   auto& train_writer = *retained_train_pixels;
   auto& validation_writer = *retained_validation_pixels;
   BenchmarkCompilePipeline::Attempt retire_pixels(pipeline);
-  StopFailedAttempt stop_pixel_attempt{cancel_signal, pipeline};
+  StopFailedAttempt stop_pixel_attempt{cancellation_state};
   pipeline.membership_ready();
   pipeline.bind_source(cache.source_images("coco") / "train2017", train_writer, AnnotationSource::Coco);
   pipeline.bind_source(cache.source_images("coco") / "val2017", validation_writer, AnnotationSource::Coco);
@@ -1126,7 +1099,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   std::array<std::vector<std::uint64_t>, 2> early_coco_ids;
   std::array<bool, 2> early_coco_ready{};
   std::array<std::future<CachedImageDirectory>, 2> early_coco_images;
-  StopFailedAttempt stop_early_inputs{cancel_signal, pipeline};
+  StopFailedAttempt stop_early_inputs{cancellation_state};
   const auto start_coco_images = [&](const NormalizedAnnotationReadView& index, std::size_t source) {
    if (early_coco_images[source].valid()) return;
    early_coco_ids[source] = image_ids(index);
@@ -1407,7 +1380,7 @@ void benchmark_internal::compile_benchmark_recipe(BenchmarkCompilerConfig config
   // physical geometry. It does not depend on training release completion.
   SourceCompileCount validation_count;
   std::uint64_t validation_target_dropped_boxes = 0;
-  StopFailedAttempt stop_validation_attempt{cancel_signal, pipeline};
+  StopFailedAttempt stop_validation_attempt{cancellation_state};
   // These are I/O controllers. Their CPU chunks use the compile owner, with
   // no reserved pixel/input/archive partition or nested cache CPU pool.
   const bool overlap_open_images = true;
