@@ -1,4 +1,5 @@
 #include "audit_facts.h"
+#include "src/backend/data/compiler/dataset_compile_progress.h"
 #include <nlohmann/json.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <stb_image_write.h>
@@ -2413,9 +2414,12 @@ TEST_CASE("cached viewport evidence joins initial readiness before new read admi
 namespace mmltk::acceptance::wayland {
 namespace {
 void native_dataset_frame(BrowserAudit& audit, std::uint64_t generation, std::string_view defect = "none") {
+ using mmltk::backend::data::DatasetCompileUnit;
  audit.consume({{"event", "integration.compile_progress"}, {"control", "train.compile_dataset.progress"}, {"detail", "pixels"}, {"a", generation}, {"b", 1234}, {"c", 5678}, {"d", 0}});
  const auto row = [&](const char* id, const std::string& caption, nlohmann::json facts, bool work = false) {
   facts["generation"] = defect == "wrong-generation" ? generation + 1U : generation;
+  if (!work && defect == "missing-unit") facts.erase("unit");
+  if (!work && defect == "invalid-unit") facts["unit"] = 255U;
   if (!(work && defect == "missing-work") && !(defect == "opening" && std::string_view(id) == "train.dataset.progress.pixels"))
    audit.consume({{"event", "integration.dataset_draw"}, {"control", id}, {"detail", caption}, {"a", 1}, {"b", 2}, {"c", 100}, {"d", 32}});
   if (defect != "missing-facts") audit.consume({{"event", work ? "integration.dataset_native_work" : "integration.dataset_native_track"}, {"control", id}, {"detail", facts.dump()}});
@@ -2426,14 +2430,15 @@ void native_dataset_frame(BrowserAudit& audit, std::uint64_t generation, std::st
                                : "Pixels · 1,234 / 5,678",
   {{"phase", 6U}, {"completed", 1234U}, {"total", 5678U}}, true);
  row("train.dataset.progress.acquisition", defect == "opening" ? "Acquisition" : "Acquisition\nNo acquisition needed · 0 KiB",
-  {{"activity", 1U}, {"completed", 0U}, {"total", 0U}, {"known", true}, {"active", false}, {"complete", true}, {"invalidated", 0U}});
- row("train.dataset.progress.labels", "Labels/masks\nWaiting · 2,345 / 9,876",
-  {{"activity", 0U}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", false}, {"complete", false}, {"invalidated", 0U}});
+  {{"activity", 1U}, {"unit", static_cast<std::uint8_t>(DatasetCompileUnit::Bytes)}, {"completed", 0U}, {"total", 0U}, {"known", true}, {"active", false}, {"complete", true}, {"invalidated", 0U}});
+ row("train.dataset.progress.labels", "Labels/masks\nWaiting · 2,345 / 9,876 rows",
+  {{"activity", 0U}, {"unit", static_cast<std::uint8_t>(DatasetCompileUnit::Rows)}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", false}, {"complete", false}, {"invalidated", 0U}});
  row("train.dataset.progress.pixels",
   defect == "empty-status"   ? ""
-  : defect == "wrong-status" ? "Pixels\nWaiting · 2,345 / 9,876"
-                             : "Pixels\nCompiling image pixels · 2,345 / 9,876",
-  {{"activity", 5U}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", true}, {"complete", false}, {"invalidated", 0U}});
+  : defect == "wrong-status" ? "Pixels\nWaiting · 2,345 / 9,876 images"
+  : defect == "wrong-unit"   ? "Pixels\nCompiling image pixels · 2,345 / 9,876 rows"
+                             : "Pixels\nCompiling image pixels · 2,345 / 9,876 images",
+  {{"activity", 5U}, {"unit", static_cast<std::uint8_t>(DatasetCompileUnit::Images)}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", true}, {"complete", false}, {"invalidated", 0U}});
  audit.consume({{"event", "integration.dataset_frame"}, {"a", defect == "fixture" ? 200U : defect == "completed" ? 102U : 100U}});
 }
 }  // namespace
@@ -2467,7 +2472,7 @@ TEST_CASE("active compile resize evidence requires progress actual presentation 
  }
 }
 TEST_CASE("native drawn work requires correlated exact captions and track meaning", "[workspace][audit]") {
- for (const std::string defect : {"none", "opening", "missing-work", "wrong-work", "wrong-grouping", "empty-status", "wrong-status", "wrong-generation", "missing-facts", "fixture", "completed"}) {
+ for (const std::string defect : {"none", "opening", "missing-work", "wrong-work", "wrong-grouping", "empty-status", "wrong-status", "wrong-unit", "missing-unit", "invalid-unit", "wrong-generation", "missing-facts", "fixture", "completed"}) {
   BrowserAudit audit;
   native_dataset_frame(audit, 1U, defect);
   CHECK(audit.compile_tracks.size() == (defect == "none" ? 3U : 0U));
@@ -2598,7 +2603,7 @@ TEST_CASE("Dataset component audit rejects source and lifecycle presentation sub
   row("train.dataset.progress.work", defect == "wrong-work" ? "Pixels · 2,345 / 9,876" : "Pixels · 1,234 / 5,678");
   row("train.dataset.progress.acquisition", defect == "false-total" ? "Acquisition\nAcquiring sources · 2.3 KiB / 9.6 KiB" : "Acquisition\nAcquiring sources · 2.3 KiB / ?");
   row("train.dataset.progress.labels", "Labels/masks\nWaiting · 2,345 / 9,876");
-  row("train.dataset.progress.pixels", "Pixels\nCompiling image pixels · 2,345 / 9,876");
+  row("train.dataset.progress.pixels", "Pixels\nCompiling image pixels · 2,345 / 9,876 images");
   row("train.dataset.progress.source.objects365v2", defect == "raw-bytes"         ? "Objects365 v2 · Cached\n91268055040 · 345491 images"
                                                     : defect == "duplicate-cache" ? "Objects365 v2 · Cached\n85.0 GiB · 345,491 images\nCache hit"
                                                                                   : "Objects365 v2 · Cached\n85.0 GiB · 345,491 images");
@@ -2750,7 +2755,7 @@ TEST_CASE("status paragraphs retain one normal-height line with half-pixel fitti
   CHECK(audit.dataset_status_valid);
   CHECK_FALSE(audit.dataset_status_fitted);
   audit.consume(
-   {{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.pixels"}, {"detail", "Pixels\nCompiling image pixels · 2,345 / 9,876"}, {"a", 12}, {"b", 30}, {"c", 200}, {"d", 43.2}});
+   {{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.pixels"}, {"detail", "Pixels\nCompiling image pixels · 2,345 / 9,876 images"}, {"a", 12}, {"b", 30}, {"c", 200}, {"d", 43.2}});
   audit.consume({{"event", "integration.dataset_frame"}, {"a", 200U}});
   CHECK(audit.dataset_status_fitted == (size < 12.0));
  }
@@ -2776,7 +2781,7 @@ TEST_CASE("Dataset fitted pixels require the exact narrow compiling frame", "[wo
    {{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.pixels"},
     {"detail", defect == "short-caption"   ? "Pixels\nComplete"
                : defect == "wrong-caption" ? "Pixels\nWaiting · 2,345 / 9,876"
-                                           : "Pixels\nCompiling image pixels · 2,345 / 9,876"},
+                                           : "Pixels\nCompiling image pixels · 2,345 / 9,876 images"},
     {"a", 12}, {"b", 30}, {"c", defect == "wide-row" ? 336.0 : 200.0}, {"d", 43.2}});
   audit.consume({{"event", "integration.dataset_frame"}, {"a", defect == "wide-frame" ? 209U : defect == "native-frame" ? 100U : 200U}});
   CHECK(audit.dataset_status_fitted == (defect == "none"));

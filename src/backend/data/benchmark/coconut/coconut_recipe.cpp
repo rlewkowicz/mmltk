@@ -582,8 +582,22 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
  CoconutRecipePreparation prepared;
  CompileAllowance consumer_allowance;
  const auto lifecycle = cache.locks / (std::string(release.name) + ".annotations.lifecycle.lock");
+ std::weak_ptr<ArtifactLease> source_lease = retained.lease;
  const auto retain_inputs = [&] {
-  if (!retained.lease) retained.lease = ArtifactLease::acquire_charged(lifecycle, cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources(), parent);
+  if (!retained.lease) {
+   // EOF returns idle input custody while physical joins settle. Acquisition
+   // or a sibling may still own this same lease: share it again instead of
+   // waiting on our own release's exclusive lock before publishing this part.
+   retained.lease = source_lease.lock();
+   if (retained.lease) {
+    trace_benchmark_event(trace, "benchmark.annotations.inputs_reused", [&] { return nlohmann::json{{"release", release.name}, {"part", cache_tag}}; });
+    return;
+   }
+   trace_benchmark_event(trace, "benchmark.annotations.inputs_wait", [&] { return nlohmann::json{{"release", release.name}, {"part", cache_tag}}; });
+   retained.lease = ArtifactLease::acquire_charged(lifecycle, cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources(), parent);
+   source_lease = retained.lease;
+   trace_benchmark_event(trace, "benchmark.annotations.inputs_acquired", [&] { return nlohmann::json{{"release", release.name}, {"part", cache_tag}}; });
+  }
  };
  const auto release_inputs = [&] {
   // A normalized cache hit no longer consumes the discovery archive. Close

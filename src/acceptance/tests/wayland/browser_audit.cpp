@@ -565,11 +565,12 @@ std::optional<std::string> dataset_native_caption(const nlohmann::json& facts, s
  }
  if (!facts.contains("activity") || !facts["activity"].is_number_unsigned() || facts["activity"] > static_cast<std::uint8_t>(DatasetCompileActivity::Complete) || !facts.contains("known") ||
      !facts["known"].is_boolean() || !facts.contains("active") || !facts["active"].is_boolean() || !facts.contains("complete") || !facts["complete"].is_boolean() || !facts.contains("invalidated") ||
-     !facts["invalidated"].is_number_unsigned())
+     !facts["invalidated"].is_number_unsigned() || !facts.contains("unit") || !facts["unit"].is_number_unsigned() || facts["unit"] > static_cast<std::uint8_t>(DatasetCompileUnit::Rows))
   return std::nullopt;
  const bool acquisition = id == "train.dataset.progress.acquisition";
  const std::string label = acquisition ? "Acquisition" : id == "train.dataset.progress.labels" ? "Labels/masks" : "Pixels";
  const auto activity = static_cast<DatasetCompileActivity>(facts["activity"].get<std::uint8_t>());
+ const auto unit = static_cast<DatasetCompileUnit>(facts["unit"].get<std::uint8_t>());
  const bool known = facts["known"].get<bool>(), active = facts["active"].get<bool>(), complete = facts["complete"].get<bool>();
  if ((active && complete) || (known && facts["completed"] > facts["total"])) return std::nullopt;
  std::string status;
@@ -589,7 +590,13 @@ std::optional<std::string> dataset_native_caption(const nlohmann::json& facts, s
    case DatasetCompileActivity::Compiling: status = "Compiling image pixels"; break;
    case DatasetCompileActivity::Complete: status = "Complete"; break;
   }
- std::string expected = label + "\n" + status + " · " + dataset_quantity(facts, acquisition, known, complete);
+ std::string expected = label + "\n" + status + " · " + dataset_quantity(facts, unit == DatasetCompileUnit::Bytes, known, complete);
+ switch (unit) {
+  case DatasetCompileUnit::Rows: expected += " rows"; break;
+  case DatasetCompileUnit::Images: expected += " images"; break;
+  case DatasetCompileUnit::Items:
+  case DatasetCompileUnit::Bytes: break;
+ }
  const auto invalidated = facts["invalidated"].get<std::uint64_t>();
  if (invalidated != 0U) expected += " · " + dataset_count(invalidated) + " invalidated by repair";
  return expected;
@@ -1350,7 +1357,7 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
   if (((key >= 200U && key <= 208U) || (key >= 218U && key <= 226U)) && (key - 200U) % 9U < 2U && dataset_pixels_status_font) {
    const auto pixels = dataset_draw_rows.find("train.dataset.progress.pixels");
    const auto& font = *dataset_pixels_status_font;
-   const bool narrow_compiling = pixels != dataset_draw_rows.end() && pixels->second.second == "Pixels\nCompiling image pixels · 2,345 / 9,876" && std::isfinite(pixels->second.first[2]) &&
+   const bool narrow_compiling = pixels != dataset_draw_rows.end() && pixels->second.second == "Pixels\nCompiling image pixels · 2,345 / 9,876 images" && std::isfinite(pixels->second.first[2]) &&
                                  pixels->second.first[2] > 0.0 && pixels->second.first[2] <= 200.1;
    dataset_status_fitted =
     dataset_status_fitted || (dataset_status_valid && narrow_compiling && font[0] >= 8.0 && font[0] < 12.0 && font[1] == 12.0 && std::abs(font[2] - 15.6) < 0.1 && std::abs(font[3] - 15.6) < 0.1);

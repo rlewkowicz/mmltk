@@ -5,16 +5,10 @@
 #include "mozilla/ipc/MessageChannel.h"
 
 #include <math.h>
-#include <errno.h>
-#include <stdio.h>
-#include <unistd.h>
-
-#include <algorithm>
 #include <utility>
 
 #include "base/waitable_event.h"
 #include "mozilla/Assertions.h"
-#include "mozilla/AppShutdown.h"
 #include "mozilla/CycleCollectedJSContext.h"
 #include "mozilla/IntentionalCrash.h"
 #include "mozilla/Logging.h"
@@ -1538,33 +1532,10 @@ void MessageChannel::OnChannelErrorFromLink() {
   }
 
   if (mAbortOnError) {
-    // Goodbye already transitions to ChannelClosing and never takes this path.
-    // Parent-requested shutdown can also close the link while still connected.
-    if (!AppShutdown::IsShutdownImpending() &&
-        AppShutdown::GetCurrentShutdownPhase() == ShutdownPhase::NotInShutdown) {
-      const int savedErrno = errno;
-      char report[1024];
-      const int length = snprintf(
-          report, sizeof(report),
-          "fatal: firefox.ipc: operation=channel_error pid=%d ppid=%d pgid=%d "
-          "actor=%p channel=%.128s side=%s status=unexpected IPC channel loss before QuickExit\n",
-          int(getpid()), int(getppid()), int(getpgrp()),
-          static_cast<const void*>(mListener), mName,
-          mSide == ParentSide ? "parent" : "child");
-      if (length > 0) {
-        const size_t count = std::min(size_t(length), sizeof(report) - 1);
-        size_t offset = 0;
-        for (unsigned attempt = 0; attempt < 8 && offset < count; ++attempt) {
-          const ssize_t written = write(STDERR_FILENO, report + offset, count - offset);
-          if (written > 0) {
-            offset += size_t(written);
-          } else if (written == 0 || errno != EINTR) {
-            break;
-          }
-        }
-      }
-      errno = savedErrno;
-    }
+    // EOF also follows a requested termination of the parent. The surviving
+    // process owner classifies unexpected peer loss; this child has no exit
+    // status or parent-side shutdown intent from which to infer a fatal cause.
+    MOZ_LOG(sLogModule, LogLevel::Error, ("Exiting due to channel error."));
     ProcessChild::QuickExit();
   }
   mChannelState = ChannelError;

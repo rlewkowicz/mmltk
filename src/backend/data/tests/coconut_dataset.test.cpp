@@ -4158,10 +4158,10 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
  }
  auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock});
  config.num_workers = 3;
- std::uint64_t total = catalog.releases.size();
+ std::uint64_t total = 0;
  for (const auto& release : catalog.releases) total += release.expected_rows;
  REQUIRE(catalog.releases[0].expected_rows != catalog.releases[1].expected_rows);
- const auto base_units = catalog.releases[0].expected_rows + 1;
+ const auto base_units = catalog.releases[0].expected_rows;
  mmltk::testsupport::TestGate base("base cold mask import"), last_release("last independent cold mask import");
  const auto base_receipt = base.receipt(), last_receipt = last_release.receipt();
  catalog.release_observer = [&](CoconutEdition edition, CoconutReleaseBoundary boundary) {
@@ -4181,7 +4181,7 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
                           value.completed == previous_update->completed && value.total == previous_update->total && value.activity_elapsed_seconds >= previous_update->activity_elapsed_seconds;
   }
   previous_update = value;
-  if (value.tracks.labels.total < total || value.tracks.labels.completed > total) return;
+  if (value.tracks.labels.unit != DatasetCompileUnit::Rows || !value.tracks.labels.total_known) return;
   indexing.push_back(value);
   if (value.tracks.labels.completed == total - base_units && !independent_reported) {
    independent_reported = true;
@@ -4214,13 +4214,14 @@ TEST_CASE("cold COCONut releases retain one aggregate indexing denominator", "[b
  CHECK(indexing.back().tracks.labels.completed == total);
  std::uint64_t previous = 0;
  for (const auto& value : indexing) {
-  CHECK(value.tracks.labels.total >= total);
+  CHECK(value.tracks.labels.total == total);
+  CHECK(value.tracks.valid());
   if (value.tracks.labels.completed < previous) {
    CHECK(repair_annotations);
    CHECK(previous - value.tracks.labels.completed == 64);
    CHECK(value.tracks.labels.invalidated == 64);
-   // Final label plans can finish while normalization is still active. Their
-   // completed units share this track and survive an unrelated row withdrawal.
+   // Other releases retain their rows across this withdrawal. Component jobs
+   // settle the track lifecycle independently of the measured row count.
    CHECK(value.tracks.labels.completed >= total - base_units);
    CHECK(value.tracks.labels.completed <= value.tracks.labels.total - base_units);
    CHECK(value.tracks.labels.active);
@@ -4562,6 +4563,9 @@ TEST_CASE("COCONut JSON parsing yields one shared CPU before its source pass fin
  BenchmarkSplitWriter writer(pixels);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  bind_benchmark_slots(execution, writer, split);
+ // Measure yielding to ready CPU work; asynchronous input/output preparation
+ // has its own scheduling and must not race the parser's bounded checkpoint.
+ auto pixel = mmltk::backend::data::testsupport::prepare_benchmark_pixel(execution, writer);
  std::vector<CoconutPhysicalImage> physical;
  Json rows = Json::array(), annotations = Json::array();
  for (unsigned id = 1; id <= 256; ++id) {
@@ -4597,12 +4601,13 @@ TEST_CASE("COCONut JSON parsing yields one shared CPU before its source pass fin
   later.Release();
  });
  REQUIRE(entered.WaitEntered(std::chrono::seconds(2)));
- execution.source_publication(images, {})({7, {}, true});
+ auto pixel_completion = execution.execution().submit(std::move(pixel));
  entered.Release();
  REQUIRE(later.WaitEntered(std::chrono::seconds(2)));
  CHECK(writer.image_complete(0));
  later.Release();
  const auto result = mmltk::testsupport::await_test_future(work, "shared JSON source pass");
+ pixel_completion.wait();
  REQUIRE(result.size() == 1);
  CHECK(result.front().index().image_count() == 256);
 }
@@ -8743,7 +8748,7 @@ TEST_CASE("ready Parquet artifact labels precede a held sibling and settle canon
  std::atomic<bool> admitted_native{false}, admitted_gather{false}, sealed_inventory{false}, direct_cache{false};
  config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  config.trace = [&](std::string_view event, std::string_view fields) {
-  if (std::getenv("MMLTK_TEST_BENCHMARK_TRACE") && event == "benchmark.resource.wait") std::fprintf(stderr, "%s\n", Json{{"event", event}, {"payload", Json::parse(fields)}}.dump().c_str());
+  if (std::getenv("MMLTK_TEST_BENCHMARK_TRACE")) std::fprintf(stderr, "%s\n", Json{{"event", event}, {"payload", Json::parse(fields)}}.dump().c_str());
   const auto value = Json::parse(fields);
   if (event == "benchmark.labels.placed" && value.at("image_id") == 11 && !published.exchange(true)) labels.set_value();
   if (event == "benchmark.coconut.native_staged" && value.at("image_id") == 11 && value.at("admitted_runs").get<std::uint64_t>() > 0) admitted_native = true;

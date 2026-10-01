@@ -113,8 +113,8 @@ impl NativeFrame {
             &self.tracks.pixels,
         ]) {
             sink.record("integration.dataset_native_track", id,
-                &format!(r#"{{"generation":{},"activity":{},"completed":{},"total":{},"known":{},"active":{},"complete":{},"invalidated":{}}}"#,
-                    self.generation, track.activity as u8, track.completed, track.total,
+                &format!(r#"{{"generation":{},"activity":{},"unit":{},"completed":{},"total":{},"known":{},"active":{},"complete":{},"invalidated":{}}}"#,
+                    self.generation, track.activity as u8, track.unit as u8, track.completed, track.total,
                     track.totalknown, track.active, track.complete, track.invalidated), [0.0; 4]);
         }
     }

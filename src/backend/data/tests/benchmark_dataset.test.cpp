@@ -7549,9 +7549,14 @@ TEST_CASE("charged warm input releases byte custody before checked reopening", "
  bind_benchmark_slots(pipeline, writer, split);
  const auto publication = pipeline.source_publication(images, {});
  publication({1, {}, true, std::move(file)});
- CHECK_THROWS(pipeline.image_completion(images, 1).wait());
+ CHECK_THROWS_AS(pipeline.image_completion(images, 1).wait(), BenchmarkImageReadError);
  CHECK_FALSE(writer.image_complete(0));
- CHECK_THROWS(pipeline.drain());
+ // Source damage remains repairable; only this image receipt carries the error.
+ CHECK_NOTHROW(pipeline.drain());
+ pipeline.retire_image(images, 1);
+ pipeline.source_publication(images, {}, 1)({1, {}, true});
+ REQUIRE_NOTHROW(pipeline.image_completion(images, 1).wait());
+ CHECK(writer.image_complete(0));
 }
 TEST_CASE("batch workspace loans finish pixels and retire scratch before reader continuation", "[backend][data][benchmark][pipeline]") {
  bool fail = false, allocation_failure = false;
@@ -7837,9 +7842,9 @@ TEST_CASE("concurrent reader offers join a live pixel loan on cancellation", "[b
  BenchmarkSplitWriter writer(request);
  BenchmarkCompilePipeline::Attempt attempt(execution);
  bind_benchmark_slots(execution, writer, split);
- // Each offer covers only half the finite consumer. Both physical lenders
- // must participate; unrelated positive offers are exercised separately.
- const auto demand = writer.prepare_pixel_plan(0, {16, 8})->resources().bytes;
+ // Each offer covers only half the complete preload/conversion consumer.
+ // Both physical lenders must participate, including its resident input bytes.
+ const auto demand = writer.preload_resources(*writer.prepare_pixel(0, 0)).bytes;
  const auto live_reader_bytes = target / 2 - (demand + 1) / 2;
  std::future<void> first, second;
  const mmltk::testsupport::ScopedTestCleanup settle([&] {
@@ -8701,14 +8706,18 @@ TEST_CASE("normalized label custody rejects unrelated backing for detached nativ
  detached.backing = ordinary.storage().backing;
  CHECK_THROWS_WITH(BenchmarkLabelInput(NormalizedAnnotationReadView(detached), 0), "normalized annotation view does not belong to its backing");
  REQUIRE_NOTHROW(BenchmarkLabelInput(ordinary, 0));
- auto native_input = CoconutNativeImage::labels(native);
  const std::weak_ptr<const CoconutNativeImage> lifetime = native;
- read.owner.reset();
- native.reset();
- workspace.retire();
- CHECK_FALSE(lifetime.expired());
- CHECK(native_input.index().image(0).source_image_id == 1);
- CHECK_FALSE(native_input.index().storage().backing);
+ {
+  auto native_input = CoconutNativeImage::labels(native);
+  read = {};
+  native.reset();
+  workspace.retire();
+  CHECK_FALSE(lifetime.expired());
+  CHECK(native_input.index().image(0).source_image_id == 1);
+  REQUIRE(native_input.index().storage().backing);
+  CHECK_NOTHROW(admit_normalized_annotations(native_input.index().storage()));
+ }
+ CHECK(lifetime.expired());
 }
 TEST_CASE("owned label inputs use their annotation canvas and reuse completed dependencies", "[benchmark][pipeline][labels]") {
  BenchmarkCompilePipeline execution(1);
@@ -12392,7 +12401,8 @@ TEST_CASE("preload and extent cancellation join physical custody before replacem
  publication({1});
  REQUIRE(physical.WaitEntered(5s));
  const auto locked = pipeline.execution().snapshot().normal_locked;
- CHECK(pipeline.execution().snapshot().leased > 0);
+ const auto held = pipeline.execution().snapshot();
+ CHECK((held.leased > 0 || held.exceptional_reserved > 0));
  CHECK(pipeline.execution().snapshot().records == 1);
  auto retiring = std::async(std::launch::async, [&] {
   if (retirement == Retire::Image)
@@ -12518,6 +12528,7 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
  enum class Input { File, Retained, Exceptional };
  const auto input = GENERATE(Input::File, Input::Retained, Input::Exceptional);
  const auto workers = GENERATE(std::size_t{1}, std::size_t{2});
+ CAPTURE(static_cast<int>(input), workers);
  if (mmltk::common::system::allowed_cpu_set().size() < workers) SKIP("requires the selected assigned CPUs");
  const auto page = mmltk::common::system::host_page_size();
  const auto budget = input == Input::Exceptional ? page : std::size_t{4U << 20};
@@ -12527,7 +12538,8 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
  const auto images = root.path() / "images";
  auto split = cached_pixel_membership(images);
  split.images = {{1, 16, 8, 0, 0}, {2, 16, 8, 0, 0}};
- const auto encoded = make_jpeg(70, 80, 90);
+ const auto encoded = input == Input::Exceptional ? make_large_cached_jpeg() : make_jpeg(70, 80, 90);
+ if (input == Input::Exceptional) REQUIRE(encoded.size() > budget);
  const auto header = BenchmarkImageDecoder{}.read_header(encoded);
  auto file = BenchmarkEncodedImage::publish(cached_image_path(images, 1), encoded, {}, nullptr, header);
  BenchmarkEncodedImage::publish(cached_image_path(images, 2), encoded, {});
@@ -12537,7 +12549,9 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
  std::promise<void> waiting, first_completed;
  std::atomic<bool> first{true}, bounded{true};
  std::atomic<unsigned> first_workspaces{0};
+ const auto diagnostics = mmltk::backend::data::testsupport::benchmark_trace();
  const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
+  if (diagnostics) diagnostics(event, fields);
   if (event == "file.physical_completed" && fields.at("service") == "image" && first.exchange(false)) physical.receipt().ArriveAndWait();
   if (event == "benchmark.pipeline.ready") {
    pending.observe(fields);
@@ -12559,7 +12573,11 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
  BenchmarkCompilePipeline pipeline(workers, {}, {.transient_bytes = budget, .descriptors = 16, .task_records = workers, .workspace_plan = plan}, {}, trace);
  BenchmarkEncodedImage::Ptr payload;
  if (input == Input::Retained) {
+  // Ordinary contexts are preferred. Occupy the sole conversion context while
+  // placing this source in its protected window, then make conversion runnable.
+  auto conversion = pipeline.execution().reserve({.bytes = plan->context_bytes, .supplied_workspace = true});
   auto backing = std::make_shared<CompileAllowance>(pipeline.execution().reserve({.bytes = page, .supplied_workspace = true, .workspace_window = CompileWorkspaceWindow::SharedSource}));
+  conversion = {};
   const auto memory = backing->workspace();
   REQUIRE(encoded.size() < memory.size());
   std::memcpy(memory.data(), encoded.data(), encoded.size());
@@ -12583,9 +12601,11 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
  REQUIRE(physical.WaitEntered(5s));
  CHECK(pipeline.execution().snapshot().active == 0);
  CHECK(pipeline.execution().snapshot().records == 1);
- CHECK(pipeline.execution().snapshot().leased > 0);
  CHECK(first_workspaces == (input == Input::Retained ? 0 : 1));
- if (input == Input::Exceptional) CHECK(pipeline.execution().snapshot().exceptional > 0);
+ if (input == Input::Exceptional)
+  CHECK(pipeline.execution().snapshot().exceptional > 0);
+ else
+  CHECK(pipeline.execution().snapshot().leased > 0);
  publication({2});
  receipts.subscribe(pipeline.image_completion(images, 2), 1);
  mmltk::testsupport::await_test_promise(waiting, "new image waits behind retained record or arena custody", 5s);

@@ -4,7 +4,11 @@
 
 #include "ContentParent.h"
 
+#include <algorithm>
+#include <errno.h>
 #include <map>
+#include <stdio.h>
+#include <unistd.h>
 #include <utility>
 
 #include "BrowserParent.h"
@@ -1446,6 +1450,35 @@ void ContentParent::ProcessingError(Result aCode, const char* aReason) {
 }
 
 void ContentParent::ActorDestroy(ActorDestroyReason why) {
+  // Only the surviving owner knows whether this content process was asked to
+  // shut down. Root-process failures are reported by the application's process
+  // owner, including signal termination before children receive shutdown IPC.
+  if (why == AbnormalShutdown && !mIsSignaledImpendingShutdown &&
+      !mCalledClose && !AppShutdown::IsShutdownImpending() &&
+      AppShutdown::GetCurrentShutdownPhase() == ShutdownPhase::NotInShutdown) {
+    const int savedErrno = errno;
+    char report[1024];
+    const int length = snprintf(
+        report, sizeof(report),
+        "fatal: firefox.ipc: operation=content_channel_error pid=%d ppid=%d "
+        "pgid=%d child_pid=%d actor=%p channel=PContentParent side=parent "
+        "status=AbnormalShutdown\n",
+        int(getpid()), int(getppid()), int(getpgrp()), int(OtherPidMaybeInvalid()),
+        static_cast<const void*>(this));
+    if (length > 0) {
+      const size_t count = std::min(size_t(length), sizeof(report) - 1);
+      size_t offset = 0;
+      for (unsigned attempt = 0; attempt < 8 && offset < count; ++attempt) {
+        const ssize_t written = write(STDERR_FILENO, report + offset, count - offset);
+        if (written > 0) {
+          offset += size_t(written);
+        } else if (written == 0 || errno != EINTR) {
+          break;
+        }
+      }
+    }
+    errno = savedErrno;
+  }
 
   if (mSendShutdownTimer) {
     mSendShutdownTimer->Cancel();
