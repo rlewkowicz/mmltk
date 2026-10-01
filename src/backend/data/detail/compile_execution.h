@@ -18,7 +18,7 @@
 #include <vector>
 namespace mmltk::backend::data::detail {
 enum class CompileTaskKind : std::uint8_t { Acquisition, Metadata, Header, Projection, Archive, Normalize, Recovery, Labels, Pixels, Gather, CacheWrite, Output, Count };
-enum class CompileParkReason : std::uint8_t { None, Dependency, Bytes, Descriptors, Cpu, Withdrawal, Count };
+enum class CompileParkReason : std::uint8_t { None, Dependency, Bytes, Descriptors, Cpu, Withdrawal, Continuation, Count };
 [[nodiscard]] constexpr CompileWorkClass work_class(CompileTaskKind kind) {
  switch (kind) {
   case CompileTaskKind::Acquisition: return CompileWorkClass::Acquisition;
@@ -170,6 +170,30 @@ public:
   bool retain_workspace = true;
   std::function<void(std::exception_ptr)> completed{};
  };
+ // Retain the current record across externally owned physical work, without a
+ // CPU grant. The current task still settles its own Completion normally. Its
+ // successor uses this same record after those callbacks return; successful
+ // submission consumes the custody. Destruction returns an unused record.
+ // Cancellation/join wait for the physical owner to submit or release custody.
+ class Continuation final {
+ public:
+  Continuation() = default;
+  ~Continuation();
+  Continuation(Continuation&&) noexcept;
+  Continuation& operator=(Continuation&&) noexcept;
+  Continuation(const Continuation&) = delete;
+  Continuation& operator=(const Continuation&) = delete;
+  [[nodiscard]] explicit operator bool() const noexcept { return bool(owner_); }
+  [[nodiscard]] std::optional<Completion> try_submit(Task);
+
+ private:
+  friend class CompileExecution;
+  Continuation(std::shared_ptr<Impl>, std::shared_ptr<CompletionState>);
+  void release() noexcept;
+  std::shared_ptr<Impl> owner_;
+  std::shared_ptr<CompletionState> completion_;
+ };
+ [[nodiscard]] Continuation retain_current(CompileTaskKind successor);
  [[nodiscard]] std::optional<Completion> try_submit(Task);
  [[nodiscard]] Completion submit(Task);
  // Capture generation before checking the owning product predicate. Registration

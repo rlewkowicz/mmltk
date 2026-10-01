@@ -256,6 +256,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
   std::shared_ptr<BenchmarkPixelInput> input;
   std::shared_ptr<const BenchmarkEncodedImage> payload;
   CompileAllowance pixel_allowance;
+  CompileExecution::Continuation continuation;
   std::mutex label_write;
   Label* selected_label = nullptr;
  };
@@ -1138,6 +1139,7 @@ void BenchmarkCompilePipeline::Impl::settle(Job& job, std::exception_ptr error, 
  slot.publication = {};
  job.allowance = {};
  job.parent = {};
+ slot.continuation = {};
  auto completion = job.completion;
  CompileExecution::Producer retained_headers, retained_pixels;
  {
@@ -1189,7 +1191,8 @@ void BenchmarkCompilePipeline::Impl::run_pixel(Slot& slot, std::size_t lane, con
  throw_if_benchmark_cancelled(cancellation);
  if (slot.job.stage == PixelStage::Workspace) {
   // Reserve the entire consumer before its input becomes resident. The task
-  // lends no scratch to I/O; its allowance transfers after this CPU frame ends.
+  // keeps its record through I/O so later arena waiters cannot strand Pixels.
+  slot.continuation = execution.retain_current(CompileTaskKind::Pixels);
   slot.pixel_allowance = allowance;
   return;
  }
@@ -1212,12 +1215,16 @@ void BenchmarkCompilePipeline::Impl::run_pixel(Slot& slot, std::size_t lane, con
    reopen = payload->encoded().empty();
   }
  }
+ // A retained pooled input can obtain its consumer during Header itself. That
+ // shortcut owes exactly the same record custody as the Workspace stage.
+ auto continuation = pixel_allowance ? execution.retain_current(CompileTaskKind::Pixels) : CompileExecution::Continuation{};
  {
   const std::lock_guard lock(mutex);
   if (!current()) std::rethrow_exception(retired_failure);
   slot.plan = std::move(plan);
   slot.payload = std::move(payload);
   slot.pixel_allowance = std::move(pixel_allowance);
+  slot.continuation = std::move(continuation);
   slot.reopen = reopen;
  }
  // Reopening needs its own descriptor admission. Return the current Header
@@ -1272,7 +1279,7 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
   job.handle = std::move(*task);
   return true;
  }
- auto task = execution.try_submit(
+ CompileExecution::Task work
   {.kind = job.stage == PixelStage::Header ? CompileTaskKind::Header : CompileTaskKind::Pixels,
    .resources = job.resources,
    .work =
@@ -1321,7 +1328,8 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
    }
   }
   owner->settle(slot.job, error, recoverable);
- }});
+ }};
+ auto task = job.stage == PixelStage::Pixels ? slot.continuation.try_submit(std::move(work)) : execution.try_submit(std::move(work));
  if (!task) return false;
  job.handle = std::move(*task);
  slot.pixel_allowance = {};

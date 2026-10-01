@@ -63,6 +63,8 @@ struct CompileExecution::Job {
  std::uint64_t blocked_generation = std::numeric_limits<std::uint64_t>::max();
  std::size_t age = 0;
  bool running = false, cancelled = false, done = false;
+ bool retained = false;
+ CompileTaskKind successor = CompileTaskKind::Count;
 };
 struct CompileExecution::Readiness::State {
  std::mutex mutex;
@@ -100,6 +102,7 @@ struct CompileExecution::Impl {
   Workspace* workspace = nullptr;
   CompileAllowance allowance;
   std::shared_ptr<Credits> credit;
+  Job* job = nullptr;
   static thread_local Frame* current;
   Frame(Impl& value, std::size_t slot, CompileWorkClass kind) : owner(value), lane(slot), grant_class(kind) {}
   void enter(CompileAllowance value, Workspace* scratch) {
@@ -304,8 +307,18 @@ struct CompileExecution::Impl {
   job->blocked_generation = std::numeric_limits<std::uint64_t>::max();
   ready[static_cast<std::size_t>(job->task.kind)].jobs.push_back(job);
  }
+ void recycle(const std::shared_ptr<Job>& job) noexcept {
+  --classes[index(work_class(job->task.kind))].pending;
+  jobs.remove(job);
+  if (admission->draining_request == job.get()) admission->drain(nullptr, nullptr, 0);
+  job->done = true;
+  available_records.push_back(job);
+  if (observer) ++completed;
+  reconcile();
+  notify_locked();
+ }
  void complete(const std::shared_ptr<Job>& job, std::exception_ptr error) noexcept {
-  const auto class_index = index(work_class(job->task.kind));
+  const auto kind = job->task.kind;
   // Input captures and byte/descriptor custody retire before completion becomes
   // visible; physical owners remain alive across cancellation and failed joins.
   Task retired_task;
@@ -335,14 +348,21 @@ struct CompileExecution::Impl {
   callbacks.clear();
   {
    const std::lock_guard lock(admission->mutex);
-   --classes[class_index].pending;
-   jobs.remove(job);
-   if (admission->draining_request == job.get()) admission->drain(nullptr, nullptr, 0);
-   job->done = true;
-   available_records.push_back(job);
-   if (observer) ++completed;
-   reconcile();
-   notify_locked();
+   job->task.kind = kind;
+   if (job->retained) {
+    // The physical owner may release custody inside a completion callback.
+    // Only park after all callbacks return, so a successor cannot race them.
+    --classes[index(work_class(kind))].pending;
+    job->task = {};
+    job->task.kind = job->successor;
+    ++classes[index(work_class(job->task.kind))].pending;
+    job->running = false;
+    park(*job, CompileParkReason::Continuation);
+    if (admission->draining_request == job.get()) admission->drain(nullptr, nullptr, 0);
+    reconcile();
+    notify_locked();
+   } else
+    recycle(job);
   }
  }
  void release_idle(Idle idle, std::size_t lane) noexcept {
@@ -591,6 +611,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
  const auto started = observer ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
  {
   Frame frame(*this, lane_index, static_cast<CompileWorkClass>(class_index));
+  frame.job = selected.get();
   {
    const std::lock_guard lock(admission->mutex);
    frame.enter(std::move(allowance), selected->task.workspace);
@@ -678,7 +699,7 @@ void CompileExecution::Impl::events() noexcept {
    if (cancelled && (!cancellation_observed || !result)) publish_locked(CompileAdmission::Change::Interruption);
    withdrawal_error = failure ? failure : cancelled ? cancellation_error : retired;
    for (const auto& job : jobs) {
-    if (job->running || job->done || !(job->cancelled || stopping || failure || cancelled)) continue;
+    if (job->running || job->done || job->reason == CompileParkReason::Continuation || !(job->cancelled || stopping || failure || cancelled)) continue;
     // Unstarted custody has no physical CPU user to join. Claim its settlement
     // here so unrelated held compute cannot delay source-local withdrawal.
     job->running = true;
@@ -897,6 +918,8 @@ void CompileExecution::Completion::cancel() const noexcept {
  if (!state_) return;
  if (auto owner = state_->owner.lock()) {
   const std::lock_guard lock(owner->admission->mutex);
+  const std::lock_guard completion_lock(state_->mutex);
+  if (state_->done) return;
   if (auto job = state_->job.lock(); job && !job->done && job->completion == state_) {
    job->cancelled = true;
    if (job->reason == CompileParkReason::Dependency) {
@@ -949,6 +972,77 @@ void CompileExecution::Dependency::notify() noexcept {
   state_->waiting.clear();
   owner->notify_locked();
  }
+}
+CompileExecution::Continuation::Continuation(std::shared_ptr<Impl> owner, std::shared_ptr<CompletionState> completion)
+    : owner_(std::move(owner)), completion_(std::move(completion)) {}
+CompileExecution::Continuation::~Continuation() { release(); }
+CompileExecution::Continuation::Continuation(Continuation&& other) noexcept : owner_(std::move(other.owner_)), completion_(std::move(other.completion_)) {}
+CompileExecution::Continuation& CompileExecution::Continuation::operator=(Continuation&& other) noexcept {
+ if (this != &other) {
+  release();
+  owner_ = std::move(other.owner_);
+  completion_ = std::move(other.completion_);
+ }
+ return *this;
+}
+void CompileExecution::Continuation::release() noexcept {
+ if (!owner_) return;
+ auto owner = std::move(owner_);
+ auto completion = std::move(completion_);
+ const std::lock_guard lock(owner->admission->mutex);
+ if (auto job = completion->job.lock(); job && !job->done && job->completion == completion && job->retained) {
+  job->retained = false;
+  // An executing task or its callbacks still own their normal settlement.
+  if (job->reason == CompileParkReason::Continuation) owner->recycle(job);
+ }
+}
+CompileExecution::Continuation CompileExecution::retain_current(CompileTaskKind successor) {
+ (void)work_class(successor);
+ if (!on_lane() || !Impl::Frame::current->job) throw std::logic_error("compile continuation requires a current task record");
+ const auto& job = Impl::Frame::current->job;
+ const std::lock_guard lock(impl_->admission->mutex);
+ if (job->retained) throw std::logic_error("compile task already retained its record");
+ job->retained = true;
+ job->successor = successor;
+ return Continuation(impl_, job->completion);
+}
+std::optional<CompileExecution::Completion> CompileExecution::Continuation::try_submit(Task task) {
+ if (!owner_) throw std::logic_error("compile continuation has no record");
+ auto owner = owner_;
+ std::unique_lock lock(owner->admission->mutex);
+ owner->check();
+ auto job = completion_->job.lock();
+ if (!job || job->done || job->completion != completion_ || !job->retained) throw std::logic_error("compile continuation record retired");
+ if (job->cancelled) std::rethrow_exception(owner->retired);
+ if (task.kind != job->successor) throw std::invalid_argument("compile continuation changed its task kind");
+ task.resources.workspace_class = work_class(task.kind);
+ owner->validate(task);
+ // Completion callbacks publish readiness before relinquishing their task.
+ // The ordinary admission notification at that boundary retries this draw.
+ if (job->reason != CompileParkReason::Continuation) return {};
+ auto completion = std::make_shared<CompletionState>();
+ completion->owner = owner;
+ completion->job = job;
+ try {
+  if (task.completed) completion->callbacks.push_back(std::move(task.completed));
+  // Allocate the queue link before changing the parked record's identity.
+  owner->ready[static_cast<std::size_t>(task.kind)].jobs.push_back(job);
+ } catch (...) {
+  // A callback capture may own credits; destroy it outside admission locks.
+  lock.unlock();
+  throw;
+ }
+ job->task = std::move(task);
+ job->completion = completion;
+ job->retained = false;
+ job->age = 0;
+ job->blocked_generation = std::numeric_limits<std::uint64_t>::max();
+ owner->park(*job, CompileParkReason::None);
+ completion_.reset();
+ owner_.reset();
+ owner->reconcile();
+ owner->notify_locked();
+ return Completion(std::move(completion));
 }
 std::optional<CompileExecution::Completion> CompileExecution::submit_impl(Task task, const std::shared_ptr<DependencyState>& dependency, std::uint64_t observed) {
  std::unique_lock lock(impl_->admission->mutex);
