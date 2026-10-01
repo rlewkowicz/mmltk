@@ -1232,8 +1232,16 @@ pub struct DMABufInfo {
     pub strides: [u64; 3],
 }
 
+// Opaque across the C++ boundary: the canonical descriptor and its validated
+// HAL projection travel together, with no second format/usage vocabulary.
+pub struct SharedCanvasDescriptor {
+    desc: wgc::resource::TextureDescriptor<'static>,
+    hal: wgh::TextureDescriptor<'static>,
+}
+
 pub struct VkImageHandle {
     device: ash::Device,
+    desc: wgc::resource::TextureDescriptor<'static>,
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
     pub memory_size: u64,
@@ -1243,14 +1251,18 @@ pub struct VkImageHandle {
     _device_custody: Arc<dyn std::any::Any + Send + Sync>,
 }
 
-// Shared canvas textures support rendering and the copies used by WebGPU
-// initialization and canvas readback. The exported allocation and its imported
-// image must negotiate the same usages.
-const SHARED_CANVAS_IMAGE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
-    vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw()
-        | vk::ImageUsageFlags::TRANSFER_SRC.as_raw()
-        | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
-);
+#[no_mangle]
+pub extern "C" fn wgpu_vkimage_matches_descriptor(
+    global: &Global,
+    device_id: id::DeviceId,
+    handle: &VkImageHandle,
+    descriptor: &SharedCanvasDescriptor,
+) -> bool {
+    let Some(device) = (unsafe { global.device_as_hal::<wgc::api::Vulkan>(device_id) }) else {
+        return false;
+    };
+    handle.device.handle() == device.raw_device().handle() && handle.desc == descriptor.desc
+}
 
 impl Drop for VkImageHandle {
     fn drop(&mut self) {
@@ -1269,6 +1281,7 @@ fn canvas_vk_error(status: vk::Result) -> ErrMsg {
         message: format!("WebGPU canvas allocation failed: {status:?}").into(),
         r#type: match status {
             vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY => ErrorType::OutOfMemory,
+            vk::Result::ERROR_FORMAT_NOT_SUPPORTED => ErrorType::Validation,
             _ => ErrorType::Internal,
         },
     }
@@ -1279,20 +1292,40 @@ fn canvas_vk_error(status: vk::Result) -> ErrMsg {
 pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
     global: &Global,
     device_id: id::DeviceId,
-    width: u32,
-    height: u32,
+    descriptor: &SharedCanvasDescriptor,
     out_memory_size: *mut u64,
     out_error: *mut i32,
 ) -> *mut VkImageHandle {
     unsafe {
+        // Capability rejection is a controlled API error, never a readback
+        // fallback. Preserve the precise status for actual allocation failures.
+        *out_error = vk::Result::ERROR_FORMAT_NOT_SUPPORTED.as_raw();
+        let width = descriptor.desc.size.width;
+        let height = descriptor.desc.size.height;
         let Some(hal_device) = global.device_as_hal::<wgc::api::Vulkan>(device_id) else {
             emit_critical_invalid_note("Vulkan device");
             return ptr::null_mut();
         };
 
+        let extensions = hal_device.enabled_device_extensions();
+        if ![
+            khr::external_memory_fd::NAME,
+            ash::ext::external_memory_dma_buf::NAME,
+            ash::ext::image_drm_format_modifier::NAME,
+        ]
+        .iter()
+        .all(|extension| extensions.contains(extension))
+        {
+            return ptr::null_mut();
+        }
+
         let device = hal_device.raw_device();
         let physical_device = hal_device.raw_physical_device();
         let instance = hal_device.shared_instance().raw_instance();
+
+        let mut prepared = hal_device.texture_image_descriptor(&descriptor.hal);
+        prepared.image.flags |= vk::ImageCreateFlags::ALIAS;
+        prepared.image.tiling = vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT;
 
         let count = {
             let mut drm_format_modifier_props_list =
@@ -1302,7 +1335,7 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
 
             instance.get_physical_device_format_properties2(
                 physical_device,
-                vk::Format::B8G8R8A8_UNORM,
+                prepared.image.format,
                 &mut format_properties_2,
             );
             drm_format_modifier_props_list.drm_format_modifier_count
@@ -1324,21 +1357,35 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
 
         instance.get_physical_device_format_properties2(
             physical_device,
-            vk::Format::B8G8R8A8_UNORM,
+            prepared.image.format,
             &mut format_properties_2,
         );
 
-        let usage_flags = SHARED_CANVAS_IMAGE_USAGE;
-
+        let mut query_error = None;
         modifier_props.retain(|modifier_prop| {
-            is_dmabuf_supported(
+            // The compositor descriptor has room for at most three planes.
+            if query_error.is_some()
+                || !(1..=3).contains(&modifier_prop.drm_format_modifier_plane_count)
+            {
+                return false;
+            }
+            match is_dmabuf_supported(
                 instance,
                 physical_device,
-                vk::Format::B8G8R8A8_UNORM,
+                &prepared,
                 modifier_prop.drm_format_modifier,
-                usage_flags,
-            )
+            ) {
+                Ok(supported) => supported,
+                Err(error) => {
+                    query_error = Some(error);
+                    false
+                }
+            }
         });
+        if let Some(error) = query_error {
+            *out_error = error.as_raw();
+            return ptr::null_mut();
+        }
 
         if modifier_props.is_empty() {
             let msg = c"format not supported for dmabuf import";
@@ -1370,32 +1417,20 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
         let mut modifier_list =
             vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&modifiers);
 
-        let extent = vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        };
-
         let mut external_image_create_info = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
 
         let mut export_memory_alloc_info = vk::ExportMemoryAllocateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
 
-        let vk_info = vk::ImageCreateInfo::default()
-            .flags(vk::ImageCreateFlags::ALIAS)
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::B8G8R8A8_UNORM)
-            .extent(extent)
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(usage_flags)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
+        let mut format_list = vk::ImageFormatListCreateInfo::default()
+            .view_formats(&prepared.view_formats);
+        let mut vk_info = prepared.image
             .push_next(&mut modifier_list)
             .push_next(&mut external_image_create_info);
+        if !prepared.view_formats.is_empty() {
+            vk_info = vk_info.push_next(&mut format_list);
+        }
 
         let image = match device.create_image(&vk_info, None) {
             Err(err) => {
@@ -1410,6 +1445,7 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
         // Retain the physical device, including on partial-construction exits.
         let mut image_handle = VkImageHandle {
             device: device.clone(),
+            desc: descriptor.desc.clone(),
             image,
             memory: vk::DeviceMemory::null(),
             memory_size: 0,
@@ -1422,14 +1458,13 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
         let mut image_modifier_properties = vk::ImageDrmFormatModifierPropertiesEXT::default();
         let image_drm_format_modifier =
             ash::ext::image_drm_format_modifier::Device::new(instance, device);
-        let ret = image_drm_format_modifier
-            .get_image_drm_format_modifier_properties(image, &mut image_modifier_properties);
-        if ret.is_err() {
+        if let Err(err) = image_drm_format_modifier
+            .get_image_drm_format_modifier_properties(image, &mut image_modifier_properties)
+        {
+            *out_error = err.as_raw();
             let msg = CString::new(format!(
-                "get_image_drm_format_modifier_properties() failed: {:?}",
-                ret
-            ))
-            .unwrap();
+                "get_image_drm_format_modifier_properties() failed: {err:?}"
+            )).unwrap();
             gfx_critical_note(msg.as_ptr());
             return ptr::null_mut();
         }
@@ -1523,6 +1558,7 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
             "{{\"event\":\"firefox.canvas.export_created\",\"vk_device\":\"{:?}\",\"vk_image\":\"{:?}\",\"vk_memory\":\"{:?}\",\"memory_size\":{},\"width\":{},\"height\":{}}}",
             device.handle(), image, memory, memory_req.size, width, height));
 
+        *out_error = vk::Result::SUCCESS.as_raw();
         Box::into_raw(Box::new(image_handle))
     }
 }
@@ -1539,9 +1575,11 @@ pub extern "C" fn wgpu_vkimage_get_file_descriptor(
     global: &Global,
     device_id: id::DeviceId,
     handle: &VkImageHandle,
+    out_error: *mut i32,
 ) -> i32 {
     unsafe {
         let Some(hal_device) = global.device_as_hal::<wgc::api::Vulkan>(device_id) else {
+            *out_error = vk::Result::ERROR_DEVICE_LOST.as_raw();
             emit_critical_invalid_note("Vulkan device");
             return -1;
         };
@@ -1555,7 +1593,13 @@ pub extern "C" fn wgpu_vkimage_get_file_descriptor(
 
         let loader = khr::external_memory_fd::Device::new(instance, device);
 
-        loader.get_memory_fd(&get_fd_info).unwrap_or(-1)
+        match loader.get_memory_fd(&get_fd_info) {
+            Ok(fd) => fd,
+            Err(error) => {
+                *out_error = error.as_raw();
+                -1
+            }
+        }
     }
 }
 
@@ -1586,12 +1630,8 @@ extern "C" {
         parent: WebGPUParentPtr,
         swap_chain_id: SwapChainId,
     ) -> bool;
-    fn wgpu_server_disable_shared_texture_for_swap_chain(
-        parent: WebGPUParentPtr,
-        swap_chain_id: SwapChainId,
-    );
 
-    #[allow(dead_code)]
+    #[allow(improper_ctypes)]
     fn wgpu_server_ensure_shared_texture_for_swap_chain(
         parent: WebGPUParentPtr,
         swap_chain_id: SwapChainId,
@@ -1601,6 +1641,7 @@ extern "C" {
         height: u32,
         format: wgt::TextureFormat,
         usage: wgt::TextureUsages,
+        descriptor: &SharedCanvasDescriptor,
         out_error: *mut i32,
     ) -> bool;
     fn wgpu_server_ensure_shared_texture_for_readback(
@@ -1762,49 +1803,50 @@ extern "C" {
     fn wgpu_texture_format_is_valid_for_webidl(format: *const nsCString) -> bool;
 }
 
-pub unsafe fn is_dmabuf_supported(
+unsafe fn is_dmabuf_supported(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
-    format: vk::Format,
+    descriptor: &wgh::vulkan::TextureImageDescriptor,
     modifier: u64,
-    usage: vk::ImageUsageFlags,
-) -> bool {
-    let mut drm_props = vk::ExternalImageFormatProperties::default();
-    let mut props = vk::ImageFormatProperties2::default().push_next(&mut drm_props);
-
-    let mut modifier_info =
-        vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default().drm_format_modifier(modifier);
-
-    let mut external_format_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+) -> Result<bool, vk::Result> {
+    let image = &descriptor.image;
+    let mut external_props = vk::ExternalImageFormatProperties::default();
+    let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+    let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(modifier)
+        .sharing_mode(image.sharing_mode);
+    let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
         .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-
-    let format_info = vk::PhysicalDeviceImageFormatInfo2::default()
-        .format(format)
-        .ty(vk::ImageType::TYPE_2D)
-        .usage(usage)
-        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-        .push_next(&mut external_format_info)
+    let mut format_list = vk::ImageFormatListCreateInfo::default()
+        .view_formats(&descriptor.view_formats);
+    let mut info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(image.format)
+        .ty(image.image_type)
+        .usage(image.usage)
+        .flags(image.flags)
+        .tiling(image.tiling)
+        .push_next(&mut external_info)
         .push_next(&mut modifier_info);
-
-    match instance.get_physical_device_image_format_properties2(
-        physical_device,
-        &format_info,
-        &mut props,
-    ) {
-        Ok(_) => (),
-        Err(_) => {
-            return false;
-        }
+    if !descriptor.view_formats.is_empty() {
+        info = info.push_next(&mut format_list);
     }
-
-    drm_props
-        .external_memory_properties
-        .compatible_handle_types
-        .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-        && drm_props
-            .external_memory_properties
-            .external_memory_features
-            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+    match instance.get_physical_device_image_format_properties2(physical_device, &info, &mut props) {
+        Ok(()) => {},
+        Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    let limits = props.image_format_properties;
+    let external = external_props.external_memory_properties;
+    Ok(image.extent.width <= limits.max_extent.width
+        && image.extent.height <= limits.max_extent.height
+        && image.extent.depth <= limits.max_extent.depth
+        && image.mip_levels <= limits.max_mip_levels
+        && image.array_layers <= limits.max_array_layers
+        && limits.sample_counts.contains(image.samples)
+        && external.compatible_handle_types.contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+        && external.external_memory_features.contains(
+            vk::ExternalMemoryFeatureFlags::IMPORTABLE | vk::ExternalMemoryFeatureFlags::EXPORTABLE,
+        ))
 }
 
 pub fn select_memory_type(
@@ -4944,6 +4986,44 @@ impl Global {
         swap_chain_id: Option<SwapChainId>,
         error_buf: &mut OwnedErrorBuffer,
     ) -> bool {
+        let hal_desc = match self.device_prepare_texture_descriptor(device_id, desc) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                error_buf.init(error, device_id);
+                return false;
+            }
+        };
+        let descriptor = SharedCanvasDescriptor {
+            desc: desc.map_label(|_| None),
+            hal: wgh::TextureDescriptor {
+                label: None,
+                ..hal_desc
+            },
+        };
+        // The compositor surface is one two-dimensional, single-sampled image.
+        if desc.format != wgt::TextureFormat::Bgra8Unorm
+            || desc.dimension != wgt::TextureDimension::D2
+            || desc.size.depth_or_array_layers != 1
+            || desc.mip_level_count != 1
+            || desc.sample_count != 1
+        {
+            error_buf.init(canvas_vk_error(vk::Result::ERROR_FORMAT_NOT_SUPPORTED), device_id);
+            return false;
+        }
+        // The C++ surface registry owns the export after ensure succeeds. Roll
+        // that admission back if import or core registration fails.
+        struct SharedCanvasAdmission {
+            owner: WebGPUParentPtr,
+            texture: id::TextureId,
+            committed: bool,
+        }
+        impl Drop for SharedCanvasAdmission {
+            fn drop(&mut self) {
+                if !self.committed {
+                    unsafe { wgpu_server_remove_shared_texture(self.owner, self.texture) };
+                }
+            }
+        }
         // Keep partial imports owned until wgpu takes both Vulkan handles.
         // In particular, allocating imported memory can fail under pressure.
         struct PendingImage<'a> {
@@ -4960,7 +5040,7 @@ impl Global {
             }
         }
         unsafe {
-            let mut export_error = vk::Result::SUCCESS.as_raw();
+            let mut export_error = vk::Result::ERROR_UNKNOWN.as_raw();
             let ret = wgpu_server_ensure_shared_texture_for_swap_chain(
                 self.owner,
                 swap_chain_id.unwrap(),
@@ -4970,6 +5050,7 @@ impl Global {
                 desc.size.height,
                 desc.format,
                 desc.usage,
+                &descriptor,
                 &mut export_error,
             );
             if ret != true {
@@ -4981,6 +5062,11 @@ impl Global {
                 return false;
             }
 
+            let mut admission = SharedCanvasAdmission {
+                owner: self.owner,
+                texture: texture_id,
+                committed: false,
+            };
             let handle = wgpu_server_get_vk_image_handle(self.owner, texture_id);
             if handle.is_null() {
                 let msg = c"Failed to get VkImageHandle";
@@ -4989,6 +5075,10 @@ impl Global {
             }
 
             let vk_image_wrapper = &*handle;
+            if !wgpu_vkimage_matches_descriptor(self, device_id, vk_image_wrapper, &descriptor) {
+                error_buf.init(canvas_vk_error(vk::Result::ERROR_FORMAT_NOT_SUPPORTED), device_id);
+                return false;
+            }
 
             let fd = wgpu_server_get_dma_buf_fd(self.owner, texture_id);
             if fd < 0 {
@@ -5006,12 +5096,22 @@ impl Global {
 
             let device = hal_device.raw_device();
 
-            let extent = vk::Extent3D {
-                width: desc.size.width,
-                height: desc.size.height,
-                depth: 1,
-            };
-            let usage_flags = SHARED_CANVAS_IMAGE_USAGE;
+            let mut prepared = hal_device.texture_image_descriptor(&descriptor.hal);
+            prepared.image.flags |= vk::ImageCreateFlags::ALIAS;
+            prepared.image.tiling = vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT;
+            match is_dmabuf_supported(
+                hal_device.shared_instance().raw_instance(),
+                hal_device.raw_physical_device(),
+                &prepared,
+                vk_image_wrapper.modifier,
+            ) {
+                Ok(true) => {},
+                result => {
+                    let error = result.err().unwrap_or(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
+                    error_buf.init(canvas_vk_error(error), device_id);
+                    return false;
+                }
+            }
 
             let mut external_image_create_info = vk::ExternalMemoryImageCreateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -5032,20 +5132,14 @@ impl Global {
                 .drm_format_modifier(vk_image_wrapper.modifier)
                 .plane_layouts(&memory_plane_layouts);
 
-            let vk_info = vk::ImageCreateInfo::default()
-                .flags(vk::ImageCreateFlags::ALIAS)
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(vk::Format::B8G8R8A8_UNORM)
-                .extent(extent)
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                .usage(usage_flags)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .initial_layout(vk::ImageLayout::UNDEFINED)
+            let mut format_list = vk::ImageFormatListCreateInfo::default()
+                .view_formats(&prepared.view_formats);
+            let mut vk_info = prepared.image
                 .push_next(&mut modifier_list)
                 .push_next(&mut external_image_create_info);
+            if !prepared.view_formats.is_empty() {
+                vk_info = vk_info.push_next(&mut format_list);
+            }
 
             let image = match device.create_image(&vk_info, None) {
                 Err(err) => {
@@ -5063,9 +5157,24 @@ impl Global {
 
             let mut pending = PendingImage { device, image, memory: vk::DeviceMemory::null() };
             let memory_req = device.get_image_memory_requirements(image);
-            if memory_req.size > vk_image_wrapper.memory_size {
-                let msg = c"Invalid memory size";
-                gfx_critical_note(msg.as_ptr());
+            let external_memory = khr::external_memory_fd::Device::new(
+                hal_device.shared_instance().raw_instance(),
+                device,
+            );
+            let mut fd_properties = vk::MemoryFdPropertiesKHR::default();
+            if let Err(error) = external_memory.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                owned_fd.as_raw_fd(),
+                &mut fd_properties,
+            ) {
+                error_buf.init(canvas_vk_error(error), device_id);
+                return false;
+            }
+            let memory_type = 1u32.checked_shl(vk_image_wrapper.memory_type_index).unwrap_or(0);
+            if memory_req.size > vk_image_wrapper.memory_size
+                || memory_req.memory_type_bits & fd_properties.memory_type_bits & memory_type == 0
+            {
+                error_buf.init(canvas_vk_error(vk::Result::ERROR_FORMAT_NOT_SUPPORTED), device_id);
                 return false;
             }
 
@@ -5116,14 +5225,7 @@ impl Global {
                 .then(|| format!("mmltk shared canvas {:?}", texture_id));
             let hal_desc = wgh::TextureDescriptor {
                 label: diagnostic_label.as_deref(),
-                size: desc.size,
-                mip_level_count: desc.mip_level_count,
-                sample_count: desc.sample_count,
-                dimension: desc.dimension,
-                format: desc.format,
-                usage: wgt::TextureUses::COPY_SRC | wgt::TextureUses::COPY_DST | wgt::TextureUses::COLOR_TARGET,
-                memory_flags: wgh::MemoryFlags::empty(),
-                view_formats: vec![],
+                ..descriptor.hal
             };
 
             let mut hal_texture = <wgh::api::Vulkan as wgh::Api>::Device::texture_from_raw(
@@ -5152,10 +5254,11 @@ impl Global {
             if let Some(err) = error {
                 error_buf.init(err, device_id);
                 // create_texture_from_hal registered this ID, including on
-                // failure. A fallback must not register the same ID again.
+                // failure. The caller must not register the same ID again.
                 return true;
             }
 
+            admission.committed = true;
             if mmltk_workspace_channel::workspace_diagnostics_enabled() {
                 mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                     "{{\"event\":\"firefox.canvas.texture_imported\",\"device_id\":\"{:?}\",\"texture_id\":\"{:?}\",\"vk_device\":\"{:?}\",\"vk_queue\":\"{:?}\",\"vk_image\":\"{:?}\",\"vk_memory\":\"{:?}\",\"export_image\":\"{:?}\",\"export_memory\":\"{:?}\",\"memory_size\":{},\"width\":{},\"height\":{}}}",
@@ -5320,67 +5423,26 @@ impl Global {
                 };
 
                 if use_shared_texture {
-                    let limits = self.device_limits(device_id);
-                    if desc.size.width > limits.max_texture_dimension_2d
-                        || desc.size.height > limits.max_texture_dimension_2d
-                    {
-                        self.create_texture_error(device_id, Some(id), &desc);
-                        error_buf.init(
-                            ErrMsg {
-                                message: "size exceeds limits.max_texture_dimension_2d".into(),
-                                r#type: ErrorType::Validation,
-                            },
-                            device_id,
-                        );
-                        return;
-                    }
-
-                    let features = self.device_features(device_id);
-                    if desc.format == wgt::TextureFormat::Bgra8Unorm
-                        && desc.usage.contains(wgt::TextureUsages::STORAGE_BINDING)
-                        && !features.contains(wgt::Features::BGRA8UNORM_STORAGE)
-                    {
-                        self.create_texture_error(device_id, Some(id), &desc);
-                        error_buf.init(
-                            ErrMsg {
-                                message: concat!(
-                                    "Bgra8Unorm with GPUStorageBinding usage ",
-                                    "with BGRA8UNORM_STORAGE disabled"
-                                )
-                                .into(),
-                                r#type: ErrorType::Validation,
-                            },
-                            device_id,
-                        );
-                        return;
-                    }
-
-                    {
-                        let is_created = self.create_texture_with_shared_texture_dmabuf(
-                            device_id,
-                            id,
-                            &desc,
-                            swap_chain_id,
-                            error_buf,
-                        );
-                        if is_created {
-                            return;
+                    let registered = self.create_texture_with_shared_texture_dmabuf(
+                        device_id,
+                        id,
+                        &desc,
+                        swap_chain_id,
+                        error_buf,
+                    );
+                    if !registered {
+                        if error_buf.get_inner_data().is_none() {
+                            error_buf.init(
+                                ErrMsg {
+                                    message: "WebGPU shared canvas import failed".into(),
+                                    r#type: ErrorType::Internal,
+                                },
+                                device_id,
+                            );
                         }
-                        if error_buf.get_inner_data().is_some() {
-                            // Memory pressure is not a capability negotiation.
-                            // Register the failed frame once and report it;
-                            // allocating readback resources would compound it.
-                            self.create_texture_error(device_id, Some(id), &desc);
-                            return;
-                        }
+                        self.create_texture_error(device_id, Some(id), &desc);
                     }
-
-                    unsafe {
-                        wgpu_server_disable_shared_texture_for_swap_chain(
-                            self.owner,
-                            swap_chain_id.unwrap(),
-                        )
-                    };
+                    return;
                 }
 
                 if let Some(swap_chain_id) = swap_chain_id {

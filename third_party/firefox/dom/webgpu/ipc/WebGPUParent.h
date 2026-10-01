@@ -123,14 +123,11 @@ class WebGPUParent final : public PWebGPUParent, public SupportsWeakPtr {
 
   bool UseSharedTextureForSwapChain(ffi::WGPUSwapChainId aSwapChainId);
 
-  void DisableSharedTextureForSwapChain(ffi::WGPUSwapChainId aSwapChainId);
-
-  bool EnsureSharedTextureForSwapChain(ffi::WGPUSwapChainId aSwapChainId,
-                                       ffi::WGPUDeviceId aDeviceId,
-                                       ffi::WGPUTextureId aTextureId,
-                                       uint32_t aWidth, uint32_t aHeight,
-                                       struct ffi::WGPUTextureFormat aFormat,
-                                       ffi::WGPUTextureUsages aUsage, int32_t* aOutError);
+  bool EnsureSharedTextureForSwapChain(
+      ffi::WGPUSwapChainId aSwapChainId, ffi::WGPUDeviceId aDeviceId,
+      ffi::WGPUTextureId aTextureId, uint32_t aWidth, uint32_t aHeight,
+      struct ffi::WGPUTextureFormat aFormat, ffi::WGPUTextureUsages aUsage,
+      const ffi::WGPUSharedCanvasDescriptor* aDescriptor, int32_t* aOutError);
 
   void EnsureSharedTextureForReadBackPresent(
       ffi::WGPUSwapChainId aSwapChainId, ffi::WGPUDeviceId aDeviceId,
@@ -141,7 +138,8 @@ class WebGPUParent final : public PWebGPUParent, public SupportsWeakPtr {
       const layers::RemoteTextureOwnerId& aOwnerId, ffi::WGPUDeviceId aDeviceId,
       ffi::WGPUTextureId aTextureId, uint32_t aWidth, uint32_t aHeight,
       const struct ffi::WGPUTextureFormat aFormat,
-      ffi::WGPUTextureUsages aUsage, int32_t* aOutError);
+      ffi::WGPUTextureUsages aUsage,
+      const ffi::WGPUSharedCanvasDescriptor* aDescriptor, int32_t* aOutError);
 
   std::shared_ptr<SharedTexture> GetSharedTexture(ffi::WGPUTextureId aId);
 

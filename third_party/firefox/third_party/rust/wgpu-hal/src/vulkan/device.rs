@@ -335,26 +335,13 @@ impl super::Device {
         None
     }
 
-    fn create_image_without_memory(
+    /// Prepare the same image flags, physical format, usages and compatible
+    /// views used by ordinary texture creation. External-image users may add
+    /// tiling and external-memory pNext records before querying or creating it.
+    pub fn texture_image_descriptor(
         &self,
         desc: &crate::TextureDescriptor,
-        external_memory_image_create_info: Option<&mut vk::ExternalMemoryImageCreateInfo>,
-    ) -> Result<ImageWithoutMemory, crate::DeviceError> {
-        self.create_image_without_memory_with_tiling(
-            desc,
-            vk::ImageTiling::OPTIMAL,
-            external_memory_image_create_info,
-            None,
-        )
-    }
-
-    fn create_image_without_memory_with_tiling(
-        &self,
-        desc: &crate::TextureDescriptor,
-        tiling: vk::ImageTiling,
-        external_memory_image_create_info: Option<&mut vk::ExternalMemoryImageCreateInfo>,
-        drm_modifier_info: Option<&mut vk::ImageDrmFormatModifierExplicitCreateInfoEXT>,
-    ) -> Result<ImageWithoutMemory, crate::DeviceError> {
+    ) -> super::TextureImageDescriptor {
         let copy_size = desc.copy_extent();
 
         let mut raw_flags = vk::ImageCreateFlags::empty();
@@ -386,7 +373,7 @@ impl super::Device {
                 vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE;
         }
 
-        let mut vk_info = vk::ImageCreateInfo::default()
+        let image = vk::ImageCreateInfo::default()
             .flags(raw_flags)
             .image_type(conv::map_texture_dimension(desc.dimension))
             .format(original_format)
@@ -394,14 +381,44 @@ impl super::Device {
             .mip_levels(desc.mip_level_count)
             .array_layers(desc.array_layer_count())
             .samples(vk::SampleCountFlags::from_raw(desc.sample_count))
-            .tiling(tiling)
+            .tiling(vk::ImageTiling::OPTIMAL)
             .usage(conv::map_texture_usage(desc.usage))
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
+        super::TextureImageDescriptor {
+            image,
+            view_formats: vk_view_formats,
+        }
+    }
+
+    fn create_image_without_memory(
+        &self,
+        desc: &crate::TextureDescriptor,
+        external_memory_image_create_info: Option<&mut vk::ExternalMemoryImageCreateInfo>,
+    ) -> Result<ImageWithoutMemory, crate::DeviceError> {
+        self.create_image_without_memory_with_tiling(
+            desc,
+            vk::ImageTiling::OPTIMAL,
+            external_memory_image_create_info,
+            None,
+        )
+    }
+
+    fn create_image_without_memory_with_tiling(
+        &self,
+        desc: &crate::TextureDescriptor,
+        tiling: vk::ImageTiling,
+        external_memory_image_create_info: Option<&mut vk::ExternalMemoryImageCreateInfo>,
+        drm_modifier_info: Option<&mut vk::ImageDrmFormatModifierExplicitCreateInfoEXT>,
+    ) -> Result<ImageWithoutMemory, crate::DeviceError> {
+        let prepared = self.texture_image_descriptor(desc);
+        let mut vk_info = prepared.image.tiling(tiling);
+        let vk_view_formats = &prepared.view_formats;
+
         let mut format_list_info = vk::ImageFormatListCreateInfo::default();
         if !vk_view_formats.is_empty() {
-            format_list_info = format_list_info.view_formats(&vk_view_formats);
+            format_list_info = format_list_info.view_formats(vk_view_formats);
             vk_info = vk_info.push_next(&mut format_list_info);
         }
 

@@ -1040,6 +1040,14 @@ impl DeviceShared {
     }
 }
 
+/// Owned preparation for ordinary and externally backed Vulkan texture images.
+/// `image` has no pNext chain; `view_formats` supplies the optional format list.
+#[derive(Debug)]
+pub struct TextureImageDescriptor {
+    pub image: vk::ImageCreateInfo<'static>,
+    pub view_formats: Vec<vk::Format>,
+}
+
 #[expect(
     missing_debug_implementations,
     reason = "needs work to not be disastrously verbose"

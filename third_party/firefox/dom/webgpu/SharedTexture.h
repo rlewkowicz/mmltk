@@ -29,7 +29,8 @@ class SharedTexture {
       WebGPUParent* aParent, const ffi::WGPUDeviceId aDeviceId,
       const uint32_t aWidth, const uint32_t aHeight,
       const struct ffi::WGPUTextureFormat aFormat,
-      const ffi::WGPUTextureUsages aUsage, int32_t* aOutError);
+      const ffi::WGPUTextureUsages aUsage,
+      const ffi::WGPUSharedCanvasDescriptor* aDescriptor, int32_t* aOutError);
 
   SharedTexture(const uint32_t aWidth, const uint32_t aHeight,
                 const struct ffi::WGPUTextureFormat aFormat,

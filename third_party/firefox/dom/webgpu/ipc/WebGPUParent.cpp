@@ -74,22 +74,17 @@ extern bool wgpu_server_use_shared_texture_for_swap_chain(
   return parent->UseSharedTextureForSwapChain(aSwapChainId);
 }
 
-extern void wgpu_server_disable_shared_texture_for_swap_chain(
-    WGPUWebGPUParentPtr aParent, WGPUSwapChainId aSwapChainId) {
-  auto* parent = static_cast<WebGPUParent*>(aParent);
-
-  parent->DisableSharedTextureForSwapChain(aSwapChainId);
-}
-
 extern bool wgpu_server_ensure_shared_texture_for_swap_chain(
     WGPUWebGPUParentPtr aParent, WGPUSwapChainId aSwapChainId,
     WGPUDeviceId aDeviceId, WGPUTextureId aTextureId, uint32_t aWidth,
     uint32_t aHeight, struct WGPUTextureFormat aFormat,
-    WGPUTextureUsages aUsage, int32_t* aOutError) {
+    WGPUTextureUsages aUsage, const WGPUSharedCanvasDescriptor* aDescriptor,
+    int32_t* aOutError) {
   auto* parent = static_cast<WebGPUParent*>(aParent);
 
   return parent->EnsureSharedTextureForSwapChain(
-      aSwapChainId, aDeviceId, aTextureId, aWidth, aHeight, aFormat, aUsage, aOutError);
+      aSwapChainId, aDeviceId, aTextureId, aWidth, aHeight, aFormat, aUsage,
+      aDescriptor, aOutError);
 }
 
 extern void wgpu_server_ensure_shared_texture_for_readback(
@@ -1796,25 +1791,6 @@ bool WebGPUParent::UseSharedTextureForSwapChain(
   return data->mUseSharedTextureInSwapChain;
 }
 
-void WebGPUParent::DisableSharedTextureForSwapChain(
-    ffi::WGPUSwapChainId aSwapChainId) {
-  auto ownerId = layers::RemoteTextureOwnerId{aSwapChainId._0};
-  const auto& lookup = mPresentationDataMap.find(ownerId);
-  if (lookup == mPresentationDataMap.end()) {
-    MOZ_ASSERT_UNREACHABLE("unexpected to be called");
-    return;
-  }
-
-  RefPtr<PresentationData> data = lookup->second.get();
-
-  if (data->mUseSharedTextureInSwapChain) {
-    gfxCriticalNote << "Disable SharedTexture for SwapChain:  "
-                    << aSwapChainId._0;
-  }
-
-  data->mUseSharedTextureInSwapChain = false;
-}
-
 static bool SwapChainFormatMatches(
     gfx::SurfaceFormat aSurfaceFormat,
     const ffi::WGPUTextureFormat& aTextureFormat) {
@@ -1833,7 +1809,8 @@ static bool SwapChainFormatMatches(
 bool WebGPUParent::EnsureSharedTextureForSwapChain(
     ffi::WGPUSwapChainId aSwapChainId, ffi::WGPUDeviceId aDeviceId,
     ffi::WGPUTextureId aTextureId, uint32_t aWidth, uint32_t aHeight,
-    struct ffi::WGPUTextureFormat aFormat, ffi::WGPUTextureUsages aUsage, int32_t* aOutError) {
+    struct ffi::WGPUTextureFormat aFormat, ffi::WGPUTextureUsages aUsage,
+    const ffi::WGPUSharedCanvasDescriptor* aDescriptor, int32_t* aOutError) {
   auto ownerId = layers::RemoteTextureOwnerId{aSwapChainId._0};
   const auto& lookup = mPresentationDataMap.find(ownerId);
   if (lookup == mPresentationDataMap.end()) {
@@ -1855,8 +1832,8 @@ bool WebGPUParent::EnsureSharedTextureForSwapChain(
   if (!data->mRecycledSharedTextures.empty()) {
     std::shared_ptr<SharedTexture> texture =
         data->mRecycledSharedTextures.front();
-    if (texture->mWidth == aWidth && texture->mHeight == aHeight &&
-        texture->mFormat.tag == aFormat.tag && texture->mUsage == aUsage) {
+    auto* dmabuf = texture->AsSharedTextureDMABuf();
+    if (dmabuf && dmabuf->MatchesDescriptor(this, aDeviceId, aDescriptor)) {
       texture->SetOwnerId(ownerId);
       data->mRecycledSharedTextures.pop_front();
       mSharedTextures.emplace(aTextureId, texture);
@@ -1865,8 +1842,9 @@ bool WebGPUParent::EnsureSharedTextureForSwapChain(
     data->mRecycledSharedTextures.clear();
   }
 
-  auto sharedTexture = CreateSharedTexture(ownerId, aDeviceId, aTextureId,
-                                           aWidth, aHeight, aFormat, aUsage, aOutError);
+  auto sharedTexture =
+      CreateSharedTexture(ownerId, aDeviceId, aTextureId, aWidth, aHeight,
+                          aFormat, aUsage, aDescriptor, aOutError);
   return static_cast<bool>(sharedTexture);
 }
 
@@ -1908,11 +1886,12 @@ std::shared_ptr<SharedTexture> WebGPUParent::CreateSharedTexture(
     const layers::RemoteTextureOwnerId& aOwnerId, ffi::WGPUDeviceId aDeviceId,
     ffi::WGPUTextureId aTextureId, uint32_t aWidth, uint32_t aHeight,
     const struct ffi::WGPUTextureFormat aFormat,
-    ffi::WGPUTextureUsages aUsage, int32_t* aOutError) {
+    ffi::WGPUTextureUsages aUsage,
+    const ffi::WGPUSharedCanvasDescriptor* aDescriptor, int32_t* aOutError) {
   MOZ_RELEASE_ASSERT(mSharedTextures.find(aTextureId) == mSharedTextures.end());
 
-  UniquePtr<SharedTexture> texture =
-      SharedTexture::Create(this, aDeviceId, aWidth, aHeight, aFormat, aUsage, aOutError);
+  UniquePtr<SharedTexture> texture = SharedTexture::Create(
+      this, aDeviceId, aWidth, aHeight, aFormat, aUsage, aDescriptor, aOutError);
   if (!texture) {
     return nullptr;
   }

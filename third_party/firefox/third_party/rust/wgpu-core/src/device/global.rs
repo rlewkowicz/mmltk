@@ -289,11 +289,26 @@ impl Global {
         (id, error)
     }
 
+    /// Validate and prepare a physical descriptor without allocating or
+    /// registering a texture ID. External allocations must satisfy this result.
+    pub fn device_prepare_texture_descriptor<'a>(
+        &self,
+        device_id: DeviceId,
+        desc: &'a resource::TextureDescriptor,
+    ) -> Result<hal::TextureDescriptor<'a>, resource::CreateTextureError> {
+        self.hub.devices.get(device_id)
+            .prepare_texture_descriptor(desc)
+            .map(|(hal_desc, _)| hal_desc)
+    }
+
     /// # Safety
     ///
     /// - `hal_texture` must be created from `device_id` corresponding raw handle.
     /// - `hal_texture` must be created respecting `desc`
-    /// - `hal_texture` must be initialized
+    /// - `hal_texture` must be initialized unless `initial_state` is
+    ///   `UNINITIALIZED`. In that case it must satisfy the complete physical
+    ///   descriptor returned by `device_prepare_texture_descriptor`, including
+    ///   usages needed for zero initialization.
     /// - The `initial_state` must match the actual driver-side state of
     ///   the wrapped resource at the moment of wrap.
     pub unsafe fn create_texture_from_hal(

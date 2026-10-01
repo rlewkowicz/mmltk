@@ -1240,6 +1240,23 @@ impl Device {
         desc: &resource::TextureDescriptor,
         initial_state: wgt::TextureUses,
     ) -> Result<Arc<Texture>, resource::CreateTextureError> {
+        if initial_state == wgt::TextureUses::UNINITIALIZED {
+            unsafe { self.raw().add_raw_texture(&*hal_texture) };
+            let (hal_desc, format_features) = match self.prepare_texture_descriptor(desc) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    unsafe { self.raw().destroy_texture(hal_texture) };
+                    return Err(error);
+                }
+            };
+            return self.finish_uninitialized_texture(
+                hal_texture,
+                desc,
+                hal_desc.usage,
+                format_features,
+            );
+        }
+
         let format_features = self
             .describe_format_features(desc.format)
             .map_err(|error| resource::CreateTextureError::MissingFeatures(desc.format, error))?;
@@ -1382,10 +1399,15 @@ impl Device {
         }
     }
 
-    fn create_texture_inner(
-        self: &Arc<Self>,
-        desc: &resource::TextureDescriptor,
-    ) -> Result<Arc<Texture>, resource::CreateTextureError> {
+    /// Validate a texture exactly as ordinary creation does, and prepare the
+    /// physical usages (including initialization) and compatible view formats.
+    pub(crate) fn prepare_texture_descriptor<'a>(
+        &self,
+        desc: &'a resource::TextureDescriptor,
+    ) -> Result<
+        (hal::TextureDescriptor<'a>, wgt::TextureFormatFeatures),
+        resource::CreateTextureError,
+    > {
         use resource::{CreateTextureError, TextureDimensionError};
 
         self.check_is_valid()?;
@@ -1660,9 +1682,26 @@ impl Device {
             view_formats: hal_view_formats,
         };
 
+        Ok((hal_desc, format_features))
+    }
+
+    fn create_texture_inner(
+        self: &Arc<Self>,
+        desc: &resource::TextureDescriptor,
+    ) -> Result<Arc<Texture>, resource::CreateTextureError> {
+        let (hal_desc, format_features) = self.prepare_texture_descriptor(desc)?;
         let raw_texture = unsafe { self.raw().create_texture(&hal_desc) }
             .map_err(|e| self.handle_hal_error_with_nonfatal_oom(e))?;
+        self.finish_uninitialized_texture(raw_texture, desc, hal_desc.usage, format_features)
+    }
 
+    fn finish_uninitialized_texture(
+        self: &Arc<Self>,
+        raw_texture: Box<dyn hal::DynTexture>,
+        desc: &resource::TextureDescriptor,
+        hal_usage: wgt::TextureUses,
+        format_features: wgt::TextureFormatFeatures,
+    ) -> Result<Arc<Texture>, resource::CreateTextureError> {
         let clear_mode = if hal_usage
             .intersects(wgt::TextureUses::DEPTH_STENCIL_WRITE | wgt::TextureUses::COLOR_TARGET)
             && desc.dimension == wgt::TextureDimension::D2
@@ -1696,12 +1735,23 @@ impl Device {
                                     array_layer_count: Some(1),
                                 },
                             };
-                            clear_views.push(ManuallyDrop::new(
-                                unsafe {
-                                    self.raw().create_texture_view(raw_texture.as_ref(), &desc)
+                            let view = match unsafe {
+                                self.raw().create_texture_view(raw_texture.as_ref(), &desc)
+                            } {
+                                Ok(view) => view,
+                                Err(error) => {
+                                    for view in clear_views.drain(..) {
+                                        unsafe {
+                                            self.raw().destroy_texture_view(
+                                                ManuallyDrop::into_inner(view),
+                                            );
+                                        }
+                                    }
+                                    unsafe { self.raw().destroy_texture(raw_texture) };
+                                    return Err(self.handle_hal_error(error).into());
                                 }
-                                .map_err(|e| self.handle_hal_error(e))?,
-                            ));
+                            };
+                            clear_views.push(ManuallyDrop::new(view));
                         };
                     }
 

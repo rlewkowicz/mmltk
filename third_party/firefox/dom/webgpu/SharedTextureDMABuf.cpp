@@ -17,16 +17,12 @@ UniquePtr<SharedTextureDMABuf> SharedTextureDMABuf::Create(
     WebGPUParent* aParent, const ffi::WGPUDeviceId aDeviceId,
     const uint32_t aWidth, const uint32_t aHeight,
     const struct ffi::WGPUTextureFormat aFormat,
-    const ffi::WGPUTextureUsages aUsage, int32_t* aOutError) {
-  if (aFormat.tag != ffi::WGPUTextureFormat_Bgra8Unorm) {
-    gfxCriticalNoteOnce << "Non supported format: " << aFormat.tag;
-    return nullptr;
-  }
-
+    const ffi::WGPUTextureUsages aUsage,
+    const ffi::WGPUSharedCanvasDescriptor* aDescriptor, int32_t* aOutError) {
   auto* context = aParent->GetContext();
   uint64_t memorySize = 0;
   ffi::WGPUVkImageHandle* vkImage = wgpu_vkimage_create_with_dma_buf(
-      context, aDeviceId, aWidth, aHeight, &memorySize, aOutError);
+      context, aDeviceId, aDescriptor, &memorySize, aOutError);
   if (!vkImage) {
     gfxCriticalNoteOnce << "Failed to create VkImage";
     return nullptr;
@@ -47,7 +43,8 @@ UniquePtr<SharedTextureDMABuf> SharedTextureDMABuf::Create(
     return nullptr;
   }
 
-  auto rawFd = wgpu_vkimage_get_file_descriptor(context, aDeviceId, vkImage);
+  auto rawFd =
+      wgpu_vkimage_get_file_descriptor(context, aDeviceId, vkImage, aOutError);
   if (rawFd < 0) {
     gfxCriticalNoteOnce << "Failed to get fd fom VkDeviceMemory";
     return nullptr;
@@ -59,19 +56,19 @@ UniquePtr<SharedTextureDMABuf> SharedTextureDMABuf::Create(
   RefPtr<DMABufSurface> surface = DMABufSurfaceRGBA::CreateDMABufSurface(
       std::move(fd), dmaBufInfo, aWidth, aHeight);
   if (!surface) {
-    MOZ_ASSERT_UNREACHABLE("unexpected to be called");
+    gfxCriticalNoteOnce << "Failed to create canvas DMABuf surface";
     return nullptr;
   }
 
   layers::SurfaceDescriptor desc;
   if (!surface->Serialize(desc)) {
-    MOZ_ASSERT_UNREACHABLE("unexpected to be called");
+    gfxCriticalNoteOnce << "Failed to serialize canvas DMABuf surface";
     return nullptr;
   }
 
   const auto sdType = desc.type();
   if (sdType != layers::SurfaceDescriptor::TSurfaceDescriptorDMABuf) {
-    MOZ_ASSERT_UNREACHABLE("unexpected to be called");
+    gfxCriticalNoteOnce << "Invalid canvas DMABuf surface descriptor";
     return nullptr;
   }
 
@@ -94,6 +91,14 @@ SharedTextureDMABuf::SharedTextureDMABuf(
       mSurfaceDescriptor(aSurfaceDescriptor) {}
 
 SharedTextureDMABuf::~SharedTextureDMABuf() = default;
+
+bool SharedTextureDMABuf::MatchesDescriptor(
+    WebGPUParent* aParent, ffi::WGPUDeviceId aDeviceId,
+    const ffi::WGPUSharedCanvasDescriptor* aDescriptor) {
+  return mParent.get() == aParent && mDeviceId == aDeviceId &&
+         wgpu_vkimage_matches_descriptor(aParent->GetContext(), aDeviceId,
+                                        mVkImageHandle->Get(), aDescriptor);
+}
 
 void SharedTextureDMABuf::CleanForRecycling() {
   SharedTexture::CleanForRecycling();
