@@ -1,4 +1,6 @@
+#include <fcntl.h>
 #include <poll.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <array>
 #include <cerrno>
@@ -6,12 +8,18 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <csignal>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <nlohmann/json.hpp>
 #include "src/common/io/scoped_fd.h"
+#include "src/controller/services/diagnostics/diagnostics_client.h"
+#include "src/controller/services/diagnostics/runtime_diagnostics.h"
 #include "src/controller/services/firefox/firefox_process_owner.h"
 namespace mmltk::test {
 class FirefoxProcessOwnerTestAccess final {
@@ -56,7 +64,51 @@ struct FirefoxObservations final {
   };
  }
 };
-[[nodiscard]] services::FirefoxProcessOwner make_firefox_owner(FirefoxObservations& observations, std::string page_url) {
+class ProcessDiagnostics final {
+public:
+ explicit ProcessDiagnostics(const bool enabled)
+     : enabled_(enabled), diagnostics_(enabled ? open_trace() : ScopedFd{}, services::DiagnosticsExecutionPolicy::CallerDriven), runtime_(diagnostics_.producer()) {}
+ [[nodiscard]] services::RuntimeDiagnosticTarget target() noexcept { return runtime_.target(); }
+ void check(const FirefoxObservations& observations, const std::initializer_list<std::string_view> events) {
+  diagnostics_.close();
+  if (!enabled_) {
+   CHECK(diagnostics_.counters().accepted == 0U);
+   CHECK_FALSE(std::filesystem::exists(path_));
+   return;
+  }
+  REQUIRE(observations.process_group > 0);
+  REQUIRE(observations.terminal_count == 1U);
+  CHECK(diagnostics_.counters().accepted == events.size() + 1U);
+  std::ifstream input{path_};
+  std::string line;
+  const auto check_event = [&](const std::string_view event, const int value) {
+   REQUIRE(static_cast<bool>(std::getline(input, line)));
+   const auto record = nlohmann::json::parse(line);
+   CHECK(record["owner"] == "firefox_process");
+   CHECK(record["sequence"] == observations.process_group);
+   CHECK(record["event"] == event);
+   CHECK(record["value"] == value);
+  };
+  for (const auto event : events) check_event(event, 0);
+  const auto terminal = observations.terminal.terminal;
+  REQUIRE((terminal == services::FirefoxProcessTerminal::Exited || terminal == services::FirefoxProcessTerminal::Signaled));
+  check_event(terminal == services::FirefoxProcessTerminal::Exited ? "child.exited" : "child.signaled", observations.terminal.status);
+  CHECK_FALSE(static_cast<bool>(std::getline(input, line)));
+ }
+
+private:
+ [[nodiscard]] ScopedFd open_trace() const {
+  ScopedFd descriptor{::open(path_.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR)};
+  REQUIRE(descriptor.get() >= 0);
+  return descriptor;
+ }
+ mmltk::testsupport::ScopedTempDir temporary_{"mmltk-process-diagnostics"};
+ const std::filesystem::path path_ = temporary_.path() / "trace.jsonl";
+ const bool enabled_;
+ services::DiagnosticsClient diagnostics_;
+ services::RuntimeDiagnostics runtime_;
+};
+[[nodiscard]] services::FirefoxProcessOwner make_firefox_owner(FirefoxObservations& observations, std::string page_url, services::RuntimeDiagnosticTarget diagnostics = {}) {
  return services::FirefoxProcessOwner{
   std::filesystem::path{"/tmp/mmltk-test-import.sock"},
   {
@@ -64,31 +116,37 @@ struct FirefoxObservations final {
    .page_url = std::move(page_url),
   },
   observations.target(),
+  std::move(diagnostics),
  };
 }
 TEST_CASE("Firefox process owner reaps a normal pidfd terminal") {
  REQUIRE(services::block_browser_runtime_signals());
+ ProcessDiagnostics diagnostics{GENERATE(false, true)};
  FirefoxObservations observations;
- auto owner = make_firefox_owner(observations, "normal-exit");
+ auto owner = make_firefox_owner(observations, "normal-exit", diagnostics.target());
  REQUIRE(owner.start() == services::FirefoxProcessStartResult::ChildInstalled);
  owner.wait();
  CHECK(observations.process_group > 0);
  CHECK(owner.lifecycle().terminal == services::FirefoxProcessTerminal::Exited);
  CHECK(owner.lifecycle().status == 0);
  CHECK(owner.lifecycle().error_code == 0);
+ diagnostics.check(observations, {"child.spawned"});
 }
 TEST_CASE("Firefox process owner stops and joins through its eventfd") {
  REQUIRE(services::block_browser_runtime_signals());
+ ProcessDiagnostics diagnostics{GENERATE(false, true)};
  FirefoxObservations observations;
- auto owner = make_firefox_owner(observations, "term-ack");
+ auto owner = make_firefox_owner(observations, "term-ack", diagnostics.target());
  REQUIRE(owner.start() == services::FirefoxProcessStartResult::ChildInstalled);
  owner.request_stop();
  owner.wait();
  CHECK(owner.lifecycle().settled());
  CHECK(owner.lifecycle().stop_requested);
+ diagnostics.check(observations, {"child.spawned", "stop.term_selected"});
 }
 TEST_CASE("Firefox process owner escalates one expired stop deadline") {
  REQUIRE(services::block_browser_runtime_signals());
+ ProcessDiagnostics diagnostics{GENERATE(false, true)};
  std::array<int, 2U> readiness_descriptors{};
  REQUIRE(::pipe(readiness_descriptors.data()) == 0);
  ScopedFd readiness_reader{readiness_descriptors[0]};
@@ -102,6 +160,7 @@ TEST_CASE("Firefox process owner escalates one expired stop deadline") {
    .stop_grace = std::chrono::milliseconds{10},
   },
   observations.target(),
+  diagnostics.target(),
  };
  REQUIRE(owner.start() == services::FirefoxProcessStartResult::ChildInstalled);
  readiness_writer.reset();
@@ -111,6 +170,9 @@ TEST_CASE("Firefox process owner escalates one expired stop deadline") {
  CHECK(owner.lifecycle().settled());
  CHECK(owner.lifecycle().kill_selected);
  CHECK(observations.terminal_count == 1U);
+ CHECK(owner.lifecycle().terminal == services::FirefoxProcessTerminal::Signaled);
+ CHECK(owner.lifecycle().status == 128 + SIGKILL);
+ diagnostics.check(observations, {"child.spawned", "stop.term_selected", "stop.kill_selected"});
 }
 TEST_CASE("Firefox process owner settles a rejected child installation") {
  REQUIRE(services::block_browser_runtime_signals());
@@ -128,14 +190,16 @@ TEST_CASE("Firefox process owner settles a rejected child installation") {
 }
 TEST_CASE("Firefox process custody settles through its retained PID") {
  REQUIRE(services::block_browser_runtime_signals());
+ ProcessDiagnostics diagnostics{GENERATE(false, true)};
  FirefoxObservations observations;
- auto owner = make_firefox_owner(observations, "term-ack");
+ auto owner = make_firefox_owner(observations, "term-ack", diagnostics.target());
  REQUIRE(owner.start() == services::FirefoxProcessStartResult::ChildInstalled);
  mmltk::test::FirefoxProcessOwnerTestAccess::PreferRetainedPidWait(owner);
  owner.request_stop();
  owner.wait();
  CHECK(owner.lifecycle().settled());
  CHECK(observations.terminal_count == 1U);
+ diagnostics.check(observations, {"child.spawned", "stop.term_selected"});
 }
 }  // namespace
 TEST_CASE("browser runtime exit policy classifies every owned Firefox terminal", "[gui][services][firefox][lifecycle]") {

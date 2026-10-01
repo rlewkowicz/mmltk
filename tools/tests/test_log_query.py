@@ -22,6 +22,13 @@ def record(data, source="runtime.jsonl", line=1):
     return logs.parse_record(source, line, json.dumps(data))
 
 
+def firefox_fatal(*, component="firefox.webgpu", operation="signal_retire",
+                  pid=202, ppid=101, pgid=202, context="actor=7 device=9 submission=11 ",
+                  status="ERROR_DEVICE_LOST"):
+    return (f"fatal: {component}: operation={operation} pid={pid} ppid={ppid} pgid={pgid} "
+            f"{context}status={status}")
+
+
 def vulkan_message(identifier="VUID-vkCmdCopyImageToBuffer-srcImage-00186", *,
                    handle="0x001AbC", object_type="IMAGE", pid=None, level="ERROR",
                    detail="The Vulkan spec states: srcImage must have transfer source usage."):
@@ -236,6 +243,90 @@ class LogFormatTests(unittest.TestCase):
         self.assertEqual(row.get("device"), 0)
         self.assertEqual(row.get("failed"), False)
         self.assertEqual((row.clock, row.time_ns), ("wall-local", 1123456789))
+
+    def test_native_fatal_components_and_detail_keep_the_reporter_bounds(self):
+        identity_text = '{"pid":999,"event":"shadow","trace_id":42} pid=888 pgid=777'
+        detail = identity_text.ljust(800, "x") + "..."
+        for component in ("cli", "x" * 128, "x" * 129, "x" * 160, "x" * 160 + "..."):
+            for status in (None, "-2147483648"):
+                with self.subTest(component_bytes=len(component), status=status):
+                    suffix = "" if status is None else f" (status={status})"
+                    message = f"fatal: {component}: {detail}{suffix}"
+                    self.assertLess(len(message.encode()) + 1, 1024)
+                    row = logs.parse_record("native.log", 4, message)
+                    self.assertEqual(row.format, "fatal")
+                    self.assertEqual(row.get("@event"), "fatal.report")
+                    self.assertEqual(row.get("@level"), "fatal")
+                    self.assertTrue(row.get("@error"))
+                    self.assertEqual(row.get("component"), component)
+                    self.assertEqual(row.get("detail"), detail + suffix)
+                    self.assertEqual(row.get("message"), message)
+                    self.assertEqual(row.raw, message)
+                    self.assertEqual(row.get("status"), logs.MISSING if status is None else status)
+                    self.assertFalse(row.parse_error)
+                    for field in ("pid", "pgid", "trace_id", "message_fields", "@process", "@process_group"):
+                        self.assertIs(row.get(field), logs.MISSING)
+
+    def test_firefox_fatal_envelopes_preserve_context_and_opaque_status(self):
+        cases = (
+            ("firefox.webgpu", "signal_retire", "actor=7 device=9 submission=11 ",
+             {"actor": 7, "device": 9, "submission": 11}),
+            ("firefox.ipc", "channel_error", "actor=0x123 channel=PWebGPU side=child ",
+             {"actor": "0x123", "channel": "PWebGPU", "side": "child"}),
+        )
+        statuses = ("ERROR_DEVICE_LOST", '{"pid":999,"pgid":888,"event":"shadow"}',
+                    "pid=999 ppid=888 pgid=777 actor=99 trace_id=42 status=original (detail)")
+        prefixes = ("", "1970-01-01 00:00:01 [694:836] [mmltk] [critical] ",
+                    "[Child 202: Renderer]: E/wgpu ")
+        for component, operation, context, expected in cases:
+            for status in statuses:
+                for prefix in prefixes:
+                    with self.subTest(component=component, status=status, prefix=prefix):
+                        message = firefox_fatal(component=component, operation=operation,
+                                                context=context, status=status)
+                        row = logs.parse_record("firefox.log", 5, prefix + message)
+                        self.assertEqual(row.format, "fatal")
+                        self.assertEqual(row.get("@event"), "fatal.report")
+                        self.assertEqual(row.get("@level"), "fatal")
+                        self.assertTrue(row.get("@error"))
+                        self.assertEqual(row.raw, prefix + message)
+                        self.assertEqual(row.get("message"), message)
+                        self.assertEqual(row.get("status"), status)
+                        self.assertEqual(row.get("operation"), operation)
+                        self.assertFalse(row.parse_error)
+                        for name, value in {**expected, "@process": 202, "@parent_process": 101,
+                                            "@process_group": 202}.items():
+                            self.assertEqual(row.get(name), value)
+                        for name in ("trace_id", "message_fields", "process_id", "process_group_id"):
+                            self.assertIs(row.get(name), logs.MISSING)
+                        if "[694:836]" in prefix:
+                            self.assertEqual(row.get("logger"), "mmltk")
+                            self.assertEqual(row.get("tid"), 836)
+
+    def test_process_projections_require_exact_consistent_observed_ids(self):
+        identities = (("@process", ("pid", "process_id", "browser_process_id")),
+                      ("@parent_process", ("ppid", "parent_process_id")),
+                      ("@process_group", ("pgid", "process_group_id")))
+        for projection, fields in identities:
+            for value in (1, 202, 2**31 - 1, "202", str(2**31 - 1)):
+                self.assertEqual(record(dict.fromkeys(fields, value)).get(projection), int(value))
+            for value in (0, -1, True, 202.0, "", "0", "0202", "+202", "202.0", 2**31, str(2**31)):
+                with self.subTest(projection=projection, value=value):
+                    self.assertIs(record(dict.fromkeys(fields, value)).get(projection), logs.MISSING)
+            self.assertIs(record({fields[0]: 202, fields[1]: 303}).get(projection), logs.MISSING)
+            self.assertIs(record({fields[0]: 202, fields[1]: 0}).get(projection), logs.MISSING)
+        for event in ("child.spawned", "stop.term_selected", "stop.kill_selected", "child.exited", "child.signaled"):
+            for sequence in (202, "202", 0, "0"):
+                with self.subTest(event=event, sequence=sequence):
+                    row = record({"owner": "firefox_process", "event": event, "sequence": sequence,
+                                  "pid": 999, "ppid": 888, "pgid": 777})
+                    expected = 202 if sequence in (202, "202") else logs.MISSING
+                    self.assertEqual(row.get("@process"), expected)
+                    self.assertEqual(row.get("@process_group"), expected)
+                    self.assertIs(row.get("@parent_process"), logs.MISSING)
+        # A filename or a different owner's sequence never supplies a process.
+        self.assertIs(record({"event": "child.exited", "owner": "training", "sequence": 202},
+                             source="firefox-child-202.log").get("@process"), logs.MISSING)
 
     def test_vulkan_report_conditions_do_not_become_allocation_or_fd_identity_facts(self):
         message = (
@@ -1243,6 +1334,105 @@ class FileQueryTests(unittest.TestCase):
         self.assertEqual(related[0]["data"]["browser_process_id"], 202)
         self.assertIn("recorded process", related[0]["_log"]["auto_reason"])
         self.assertTrue(related[0]["_log"]["run"].endswith("@current"))
+
+    def test_forced_stop_joins_observed_child_records_without_reconstructing_historical_pids(self):
+        common = {"owner": "firefox_process", "sequence": 202, "pid": 999}
+        terminal = {**common, "event": "child.signaled", "value": 137}
+        self.write("build/validation/process-native.log", [
+            {**common, "event": "child.spawned"},
+            {**common, "event": "stop.kill_selected"},
+            terminal,
+            {**terminal, "sequence": 0},
+            {**terminal, "sequence": 303},
+            {**terminal, "owner": "training"},
+        ])
+        self.write("build/validation/process-native.log.history/57-1000000000.log", [terminal])
+        status, rows, diagnostics = self.exported(
+            "--family", "process", "--history", "-q", "@event=stop.kill_selected",
+            "--auto-correlate", "--limit", "3")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual({row["_log"]["line"] for row in rows}, {1, 2, 3})
+        self.assertTrue(all(row["_log"]["run"].endswith("@current") for row in rows))
+        related = [row for row in rows if row["_log"]["match"] == "auto"]
+        self.assertEqual(len(related), 2)
+        for row in related:
+            self.assertIn("exact recorded process", row["_log"]["auto_reason"])
+        # The same query still honors its output bound and its global filter.
+        for options in (("--limit", "1"), ("--where", "@event=stop.kill_selected")):
+            status, rows, diagnostics = self.exported(
+                "--family", "process", "--history", "-q", "@event=stop.kill_selected",
+                "--auto-correlate", *options)
+            self.assertEqual(status, 0, diagnostics)
+            self.assertEqual(len(rows), 1)
+
+    def test_fatal_process_links_distinguish_relationships_and_reject_conflicting_facts(self):
+        self.write("build/validation/process-firefox.log", firefox_fatal() + "\n")
+        cases = (
+            ({"pid": 202, "pgid": 202}, "exact recorded process"),
+            ({"pid": 101}, "recorded parent/child relationship"),
+            ({"pid": 303, "ppid": 202, "pgid": 202}, "recorded parent/child relationship"),
+            ({"pid": 404, "ppid": 999, "pgid": 202}, "recorded process-group membership"),
+            ({"pid": 303, "ppid": 101, "pgid": 202}, "recorded process-group membership"),
+            ({"pid": 303, "ppid": 101}, None),
+            ({"pid": 404, "pgid": 404}, None),
+            ({"pid": 202, "pgid": 404}, None),
+            ({"pid": 202, "process_id": 303}, None),
+            ({"pid": 404, "pgid": 202, "process_group_id": 404}, None),
+            ({"pid": 0, "ppid": 0, "pgid": 0}, None),
+            ({"owner": "firefox_process", "event": "child.signaled", "sequence": 0, "pid": 202}, None),
+        )
+        for fields, relationship in cases:
+            with self.subTest(fields=fields):
+                candidate = {"event": "firefox.workspace.channel_terminal", **fields}
+                self.write("build/validation/process-native.log", [candidate])
+                # Equal numeric identities in another capture are never candidates.
+                self.write("build/validation/process-native.log.history/57-1000000000.log", [candidate])
+                status, rows, diagnostics = self.exported(
+                    "--family", "process", "--history", "-q", "@event=fatal.report",
+                    "--auto-correlate")
+                self.assertEqual(status, 0, diagnostics)
+                self.assertEqual(len(rows), 1 if relationship is None else 2)
+                related = [row for row in rows if row["_log"]["match"] == "auto"]
+                if relationship is None:
+                    self.assertFalse(related)
+                    continue
+                self.assertEqual(len(related), 1)
+                self.assertEqual(related[0]["data"], candidate)
+                self.assertTrue(related[0]["_log"]["run"].endswith("@current"))
+                self.assertIn(relationship, related[0]["_log"]["auto_reason"])
+                if relationship == "recorded process-group membership":
+                    self.assertIn("not a crash-cause attribution", related[0]["_log"]["auto_reason"])
+
+    def test_fatal_envelopes_use_the_reader_byte_bound_and_keep_status_opaque(self):
+        prefix = firefox_fatal(status="")
+        status = '{"pid":999,"pgid":888} pid=777 trace_id=42 '
+        # The Rust reporter reserves its last four bytes for the marker/newline.
+        status = status.ljust(2044 - len(prefix), "x") + "..."
+        firefox = prefix + status
+        native = "fatal: " + "n" * 160 + "...: " + "detail " * 100 + "... (status=75)"
+        path = self.write("fatal.log", native + "\n" + firefox + "\n")
+        rows = list(logs.LogFile.capture(path, self.root).records())
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].get("status"), "75")
+        self.assertEqual(rows[1].get("status"), status)
+        self.assertEqual([row.raw for row in rows], [native, firefox])
+        for row in rows:
+            self.assertEqual(row.get("@event"), "fatal.report")
+            self.assertTrue(row.get("@error"))
+            self.assertFalse(row.parse_error)
+            self.assertIs(row.get("trace_id"), logs.MISSING)
+        with patch.object(logs, "MAX_LINE_BYTES", 1024):
+            rows = list(logs.LogFile.capture(path, self.root).records())
+            result, _, diagnostics = self.run_query("fatal.log", "--strict")
+        self.assertEqual(result, 2)
+        self.assertIn("truncated", diagnostics)
+        self.assertFalse(rows[0].parse_error)
+        self.assertTrue(rows[1].parse_error)
+        self.assertEqual(rows[1].raw, firefox[:1024])
+        self.assertEqual(rows[1].get("@event"), "fatal.report")
+        self.assertEqual(rows[1].get("status"), status[:1024 - len(prefix)])
+        self.assertEqual(rows[1].get("@process"), 202)
+        self.assertIs(rows[1].get("trace_id"), logs.MISSING)
 
     def test_vulkan_ambiguous_handle_owners_are_reported_without_asserted_provenance(self):
         common = {"event": "firefox.workspace.memory_import", "browser_process_id": 202,

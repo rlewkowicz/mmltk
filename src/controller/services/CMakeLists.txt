@@ -163,7 +163,7 @@ function(mmltk_add_controller_firefox_process_tests)
     target_compile_definitions(mmltk_controller_firefox_process_tests PRIVATE
         "MMLTK_BROWSER_RUNTIME_CHILD_FIXTURE=\"$<TARGET_FILE:mmltk_entrypoints_desktop_child_fixture>\"")
     target_link_libraries(mmltk_controller_firefox_process_tests PRIVATE
-        mmltk_test_support mmltk::controller::direct_services)
+        mmltk_test_support mmltk::controller::direct_services nlohmann_json)
     add_dependencies(mmltk_controller_firefox_process_tests mmltk_entrypoints_desktop_child_fixture)
     catch_discover_tests(mmltk_controller_firefox_process_tests
         TEST_PREFIX "controller::firefox-process::" DISCOVERY_MODE PRE_TEST ADD_TAGS_AS_LABELS)

@@ -400,14 +400,16 @@ private:
  }
  [[nodiscard]] bool force_stop() noexcept {
   ChildSettlement settlement;
+  pid_t process = -1;
   {
    std::scoped_lock lock{mutex_};
    if (lifecycle_.settled() || lifecycle_.kill_selected) return false;
    lifecycle_.kill_selected = true;
+   if (diagnostics_.valid()) process = custody_.pid();
    if (!custody_.Signal(SIGKILL)) record_infrastructure_failure_locked(errno, errno);
    settlement = custody_.Settle(diagnostics_);
   }
-  trace("stop.kill_selected");
+  trace("stop.kill_selected", 0U, process);
   publish_settlement(settlement.child);
   return false;
  }

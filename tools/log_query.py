@@ -60,7 +60,9 @@ RUST = re.compile(
     r"(?P<level>TRACE|DEBUG|INFO|WARN|ERROR)\s+(?P<module>[^\s\]]+)\]\s?(?P<message>.*)$",
     re.DOTALL,
 )
-FATAL = re.compile(r"^fatal: (?P<component>[^:\r\n]{1,128}): (?P<detail>.*)$")
+# The reader's MAX_LINE_BYTES bounds the whole envelope, including components
+# and truncation markers emitted by the native and Firefox reporters.
+FATAL = re.compile(r"^fatal: (?P<component>[^:\r\n]+): (?P<detail>.*)$")
 FATAL_STATUS = re.compile(
     r"^operation=(?P<operation>[A-Za-z0-9_.-]+) pid=(?P<pid>[0-9]{1,10}) "
     r"ppid=(?P<ppid>[0-9]{1,10}) pgid=(?P<pgid>[0-9]{1,10}) (?P<context>.*?)status=(?P<status>.*)$"
