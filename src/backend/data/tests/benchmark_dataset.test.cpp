@@ -189,7 +189,7 @@ void occupy_benchmark_cpu(BenchmarkCompilePipeline& execution, std::future<void>
  REQUIRE(gate.WaitEntered(2s));
 }
 [[nodiscard]] BenchmarkWriteRequest benchmark_write_request(const PreparedBenchmarkSplit& split, fs::path output, const std::uint32_t resolution,
- const mmltk::common::concurrency::CancellationObservation cancellation = {}, BenchmarkCompilePipeline* execution = nullptr) {
+ const mmltk::common::concurrency::CancellationObservation cancellation = {}, BenchmarkCompilePipeline* execution = nullptr, bool perceptual_downscale = false) {
  return {
   .split = split,
   .output_path = std::move(output),
@@ -199,9 +199,19 @@ void occupy_benchmark_cpu(BenchmarkCompilePipeline& execution, std::future<void>
   .overwrite = false,
   .cancel_requested = cancellation,
   .progress = {},
+  .perceptual_downscale = perceptual_downscale,
   .execution = execution,
  };
 }
+// Fixed slots borrow the split; the attempt retires them before their writer.
+struct BoundBenchmarkWriter {
+ BenchmarkWriteRequest request;
+ BenchmarkSplitWriter writer;
+ BenchmarkCompilePipeline::Attempt attempt;
+ BoundBenchmarkWriter(BenchmarkCompilePipeline& execution, BenchmarkWriteRequest input) : request(std::move(input)), writer(request), attempt(execution) {
+  bind_benchmark_slots(execution, writer, request.split);
+ }
+};
 // The attempt retires every pipeline borrower before its referenced writer and
 // split storage. Tests may retain direct access to both output and slot owner.
 struct LiveBenchmarkWriter {
@@ -4430,18 +4440,15 @@ TEST_CASE("cooperative parsing returns one CPU to ready consumer work", "[backen
  auto split = cached_pixel_membership(images);
  split.images = {{1, 16, 8, 0, 0}};
  BenchmarkCompilePipeline execution(1);
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
- BenchmarkSplitWriter writer(request);
- BenchmarkCompilePipeline::Attempt attempt(execution);
- bind_benchmark_slots(execution, writer, split);
- auto pixel = mmltk::backend::data::testsupport::prepare_benchmark_pixel(execution, writer);
+ BoundBenchmarkWriter fixture(execution, benchmark_write_request(split, root.path() / "result.bin", 8));
+ auto pixel = mmltk::backend::data::testsupport::prepare_benchmark_pixel(execution, fixture.writer);
  mmltk::testsupport::TestGate parsing("parser bounded progress");
  bool completed_during_parse = false;
  auto parser = std::async(std::launch::async, [&] {
   execution.execution().run(CompileTaskKind::Metadata, {32, 0}, [&](std::size_t) {
    parsing.receipt().ArriveAndWait();
    execution.execution().cooperate();  // Prepared pixel kernel.
-   completed_during_parse = writer.image_complete(0);
+   completed_during_parse = fixture.writer.image_complete(0);
   });
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] { parsing.Release(); });
@@ -4655,11 +4662,8 @@ TEST_CASE("cooperative frames retain outer scratch and its grant through child r
  auto split = cached_pixel_membership(images);
  split.images = {{1, 16, 8, 0, 0}};
  BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 2U << 20});
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8);
- BenchmarkSplitWriter writer(request);
- BenchmarkCompilePipeline::Attempt attempt(execution);
- bind_benchmark_slots(execution, writer, split);
- auto pixel = mmltk::backend::data::testsupport::prepare_benchmark_pixel(execution, writer);
+ BoundBenchmarkWriter fixture(execution, benchmark_write_request(split, root.path() / "result.bin", 8));
+ auto pixel = mmltk::backend::data::testsupport::prepare_benchmark_pixel(execution, fixture.writer);
  mmltk::testsupport::TestGate outer("reused outer scratch");
  std::vector<unsigned> scratch;
  std::size_t retirements = 0;
@@ -4673,7 +4677,7 @@ TEST_CASE("cooperative frames retain outer scratch and its grant through child r
    require_condition(scratch.size() == 8 && scratch.front() == 47, "adjacent callback lost its retained scratch");
    outer.receipt().ArriveAndWait();
    execution.execution().cooperate();
-   require_condition(writer.image_complete(0), "cooperative pixel work did not finish");
+   require_condition(fixture.writer.image_complete(0), "cooperative pixel work did not finish");
    // A larger new consumer would fit if the child had released or replaced the
    // outer allowance. Suspended storage remains live through both frames.
    outer_charged = !execution.execution().try_reserve({(1U << 20) + 1, 0}).has_value();
@@ -4695,7 +4699,7 @@ TEST_CASE("cooperative frames retain outer scratch and its grant through child r
  CHECK(retirements == 1);
  auto entire_target = execution.execution().reserve({2U << 20, 0});
  CHECK(entire_target.bytes() == (2U << 20));
- CHECK(writer.image_complete(0));
+ CHECK(fixture.writer.image_complete(0));
 }
 TEST_CASE("last shared backing releases credits after borrower and execution retirement", "[backend][data][benchmark][pipeline]") {
  mmltk::testsupport::ScopedTempDir root("detached-allowance-custody");
@@ -12561,11 +12565,7 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
   std::memcpy(memory.data(), encoded.data(), encoded.size());
   payload = BenchmarkEncodedImage::pooled(*backing, backing, {reinterpret_cast<const std::uint8_t*>(memory.data()), encoded.size()}, std::move(file));
  }
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8, {}, &pipeline);
- request.perceptual_downscale = true;
- BenchmarkSplitWriter writer(request);
- BenchmarkCompilePipeline::Attempt attempt(pipeline);
- bind_benchmark_slots(pipeline, writer, split);
+ BoundBenchmarkWriter fixture(pipeline, benchmark_write_request(split, root.path() / "result.bin", 8, {}, &pipeline, true));
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   physical.Release();
   second.Release();
@@ -12593,7 +12593,7 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
  physical.Release();
  mmltk::testsupport::await_test_promise(first_completed, "retained Pixels finishes before the newer image can finish", 5s);
  REQUIRE(second.WaitEntered(5s));
- CHECK(writer.image_complete(0));
+ CHECK(fixture.writer.image_complete(0));
  CHECK_FALSE(pipeline.image_completion(images, 2).ready());
  second.Release();
  receipts.wait();
@@ -12605,8 +12605,8 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
  CHECK(pipeline.execution().snapshot().exceptional == 0);
  CHECK(bounded);
  CHECK(pending.bounded);
- writer.finish(request);
- const auto compiled = CompiledDataset::open(request.output_path);
+ fixture.writer.finish(fixture.request);
+ const auto compiled = CompiledDataset::open(fixture.request.output_path);
  CHECK(std::memcmp(compiled.image_pixels(0), compiled.image_pixels(1), 8 * 8 * 3 * sizeof(float)) == 0);
 }
 TEST_CASE("image file failure releases retained records after physical settlement and permits another attempt", "[benchmark][pipeline][images][preload][resources]") {
@@ -12700,11 +12700,7 @@ TEST_CASE("pending image stage probes and source withdrawal stay bounded behind 
  };
  BenchmarkCompilePipeline pipeline(2, {}, {.transient_bytes = 4U << 20, .task_records = 2}, {}, trace);
  CompileExecution::Dependency dependency(pipeline.execution());
- auto request = benchmark_write_request(split, root.path() / "result.bin", 8, {}, &pipeline);
- request.perceptual_downscale = true;
- BenchmarkSplitWriter writer(request);
- BenchmarkCompilePipeline::Attempt attempt(pipeline);
- bind_benchmark_slots(pipeline, writer, split);
+ BoundBenchmarkWriter fixture(pipeline, benchmark_write_request(split, root.path() / "result.bin", 8, {}, &pipeline, true));
  std::future<void> retiring;
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   input.Release();
@@ -12763,7 +12759,7 @@ TEST_CASE("pending image stage probes and source withdrawal stay bounded behind 
  receipts.wait();
  pipeline.drain();
  CHECK(resumed == occupied.size());
- CHECK(writer.completed() == 1);
+ CHECK(fixture.writer.completed() == 1);
  CHECK_FALSE(receipts.images.front().error);
  for (std::size_t index = 1; index < receipts.images.size(); ++index) {
   REQUIRE(receipts.images[index].error);
@@ -12887,13 +12883,7 @@ TEST_CASE("large pending image sets retire behind full physical records and leav
 TEST_CASE("mixed annotation extents retain every row and independent pixels through settlement", "[benchmark][progress]") {
  std::vector<BenchmarkCompileProgress> snapshots;
  ProgressReporter reporter([&](const auto& snapshot) { snapshots.push_back(snapshot); }, {});
- const std::array<std::uint64_t, 3> extents{241602, 0, 0};
- auto& rows = *reporter.indexing(extents);
- reporter.label_plans(3);
- for (std::size_t i = 0; i < 3; ++i) reporter.label_plan_started(i);
- reporter.pixels(16177, 0, false);
- rows.update(0, 241596, reporter);
- reporter.flush();
+ auto& rows = mmltk::backend::data::testsupport::mixed_coconut_row_progress(reporter);
  REQUIRE_FALSE(snapshots.empty());
  CHECK(snapshots.back().tracks.labels.completed == 241596);
  CHECK_FALSE(snapshots.back().tracks.labels.total_known);

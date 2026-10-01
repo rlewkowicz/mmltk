@@ -2,6 +2,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
+#include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/detail/compile_pixel_workspace.h"
 #include "src/backend/data/detail/file_work_queue.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
@@ -24,6 +25,16 @@ namespace mmltk::backend::data::testsupport {
 benchmark_internal::BenchmarkTraceSink benchmark_trace() {
  if (!std::getenv("MMLTK_TEST_BENCHMARK_TRACE")) return {};
  return [](std::string_view event, const nlohmann::json& fields) { std::fprintf(stderr, "%s\n", nlohmann::json{{"event", event}, {"payload", fields}}.dump().c_str()); };
+}
+benchmark_internal::IndexingProgressTotals& mixed_coconut_row_progress(benchmark_internal::ProgressReporter& reporter) {
+ const std::array<std::uint64_t, 3> extents{241602, 0, 0};
+ auto& rows = *reporter.indexing(extents);
+ reporter.label_plans(extents.size());
+ for (std::size_t i = 0; i < extents.size(); ++i) reporter.label_plan_started(i);
+ reporter.pixels(16177, 0, false);
+ rows.update(0, 241596, reporter);
+ reporter.flush();
+ return rows;
 }
 detail::CompileExecution::Task prepare_benchmark_pixel(benchmark_internal::BenchmarkCompilePipeline& pipeline, benchmark_internal::BenchmarkSplitWriter& writer, std::uint32_t slot) {
  using namespace detail;

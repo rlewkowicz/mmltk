@@ -7,6 +7,7 @@
 #include "src/common/concurrency/cancellation_observation.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/tests/benchmark_http_fixture.h"
+#include "src/backend/data/tests/test_fixture.h"
 #include "src/common/io/file_digest.h"
 #include <vector>
 #include <fcntl.h>
@@ -303,13 +304,7 @@ TEST_CASE("dataset delivers mixed Coconut row extents and continuing pixels thro
    progress(projected);
   }, {});
   reporter.phase(data::DatasetCompilePhase::Planning);
-  const std::array<std::uint64_t, 3> extents{241602, 0, 0};
-  auto& rows = *reporter.indexing(extents);
-  reporter.label_plans(3);
-  for (std::size_t i = 0; i < 3; ++i) reporter.label_plan_started(i);
-  reporter.pixels(16177, 0, false);
-  rows.update(0, 241596, reporter);
-  reporter.flush();
+  auto& rows = data::testsupport::mixed_coconut_row_progress(reporter);
   for (std::size_t release = 1; release < 3; ++release) {
    rows.update(release, 128, reporter);
    reporter.pixel_completed();

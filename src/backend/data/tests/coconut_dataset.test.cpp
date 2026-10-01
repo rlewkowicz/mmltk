@@ -259,6 +259,18 @@ struct LocalCoconutImportRequest : CoconutImportRequest {
   input_identity = "pinned-local-fixture-inputs";
   physical_membership = membership.get();
  }
+ void prepare_partial_staging(BenchmarkCompilePipeline& pipeline, const std::filesystem::path& directory) {
+  execution = &pipeline;
+  inventory_directory = directory;
+  records = std::make_shared<CoconutAnnotationRecords>();
+  records->identity = input_identity;
+  // The two parsed segments exhaust this block before the single valid mask
+  // is staged, forcing a new range while normalization retains its scratch.
+  records->staging = std::make_shared<CoconutStaging>(directory, &pipeline.storage(), 1);
+  parquet_shards = {directory.parent_path() / "row.parquet"};
+  const std::array<std::uint32_t, 1> pixel{1};
+  parquet_file(parquet_shards.front(), Json::array({hf_row(7, png(1, 1, pixel), Json::array({segment(), segment(2)}), 1, 1)}));
+ }
 };
 LocalCoconutImportRequest request(std::span<const CoconutPhysicalImage> physical, CoconutEdition edition = CoconutEdition::Base) { return LocalCoconutImportRequest(physical, edition); }
 void check_rejected_coconut_labels(CoconutImportRequest& input) {
@@ -1543,21 +1555,25 @@ struct PhysicalMembershipFixture {
  mmltk::common::concurrency::CancellationObservation cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  BenchmarkCompilePipeline execution;
  CoconutPhysicalMembership physical;
- PhysicalMembershipFixture(const BenchmarkCacheLayout& cache, const CoconutRecipeCatalog& catalog, std::uint64_t transient_bytes = 256ULL << 20)
+ PhysicalMembershipFixture(const BenchmarkCacheLayout& cache, const CoconutRecipeCatalog& catalog, std::uint64_t transient_bytes = 256ULL << 20, bool consume = true)
      : admitted(local_physical_archives(cache, catalog)),
        execution(1, {}, {.transient_bytes = transient_bytes, .descriptors = 13}, cancellation, mmltk::backend::data::testsupport::benchmark_trace()),
        physical(admitted, catalog, true, cache, execution.storage(), execution, cancellation) {
-  for (auto& source : admitted) {
-   physical.admitted(source, source.download);
-   physical.consume(source);
-  }
+  if (consume)
+   for (auto& source : admitted) {
+    physical.admitted(source, source.download);
+    physical.consume(source);
+   }
  }
 };
-CoconutRecipeCatalog base_physical_catalog(const std::filesystem::path& archive, std::uint32_t images) {
+CoconutRecipeCatalog base_physical_catalog(const std::filesystem::path& archive, std::uint32_t images, const std::filesystem::path& unlabeled = {}) {
  CoconutRecipeCatalog catalog;
  catalog.releases.push_back({CoconutEdition::Base, "fixture-base", "fixture-v1", images, {}});
  catalog.images.push_back(
   {CoconutImageNamespace::CocoTrain, 0, "train2017", {"physical", "unused", archive.filename().string(), std::filesystem::file_size(archive), "", BenchmarkDatasetSource::kCoco2017}});
+ if (!unlabeled.empty())
+  catalog.images.push_back(
+   {CoconutImageNamespace::CocoUnlabeled, 0, "unlabeled2017", {"unlabeled", "unused", unlabeled.filename().string(), std::filesystem::file_size(unlabeled), "", BenchmarkDatasetSource::kCoco2017}});
  return catalog;
 }
 std::pair<PreparedBenchmarkSplit, std::string> cached_mask_pixel_fixture(const std::filesystem::path& images) {
@@ -5826,9 +5842,7 @@ TEST_CASE("physical repair shares source selection admission bounds and rejectio
  const auto unlabeled = cache.source_downloads("coco") / "unlabeled.tar";
  tar(train, std::array{std::pair{coco(unreadable ? 0 : 1).member, unreadable ? std::string("invalid image") : white_jpeg(1, 1)}});
  tar(unlabeled, std::array{std::pair{coco(2, CoconutImageNamespace::CocoUnlabeled).member, white_jpeg(1, 1)}});
- auto catalog = base_physical_catalog(train, 2);
- catalog.images.push_back(
-  {CoconutImageNamespace::CocoUnlabeled, 0, "unlabeled2017", {"unlabeled", "unused", unlabeled.filename().string(), std::filesystem::file_size(unlabeled), "", BenchmarkDatasetSource::kCoco2017}});
+ const auto catalog = base_physical_catalog(train, 2, unlabeled);
  auto admitted = local_physical_archives(cache, catalog);
  BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 13});
  std::vector<CoconutImageNamespace> repaired;
@@ -9750,20 +9764,17 @@ TEST_CASE("physical and original recovery subscriptions bypass a parked first ro
  std::vector<std::pair<std::string, std::string>> members;
  for (unsigned id = 2; id <= peers + 1; ++id) members.emplace_back(coco(id, CoconutImageNamespace::CocoUnlabeled).member, white_jpeg(1, 1));
  tar(unlabeled, members);
- auto catalog = base_physical_catalog(train, peers + 1);
- catalog.images.push_back(
-  {CoconutImageNamespace::CocoUnlabeled, 0, "unlabeled2017", {"unlabeled", "unused", unlabeled.filename().string(), std::filesystem::file_size(unlabeled), "", BenchmarkDatasetSource::kCoco2017}});
- auto admitted = local_physical_archives(cache, catalog);
- std::atomic<bool> cancelled{false}, terminal{false};
- const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 13}, cancellation);
- CoconutPhysicalMembership physical(admitted, catalog, true, cache, pipeline.storage(), pipeline, cancellation);
+ const auto catalog = base_physical_catalog(train, peers + 1, unlabeled);
+ PhysicalMembershipFixture fixture(cache, catalog, 1, false);
+ auto& pipeline = fixture.execution;
+ auto& physical = fixture.physical;
+ std::atomic<bool> terminal{false};
  CoconutImportRequest input;
  input.execution = &pipeline;
  input.physical_membership = &physical;
  input.input_identity = "readiness-generation";
  input.records = std::make_shared<CoconutAnnotationRecords>();
- input.cancellation = cancellation;
+ input.cancellation = fixture.cancellation;
  input.parquet_shards = {root.path() / "rows.parquet"};
  input.expected_rows = peers + 1;
  const std::array<std::uint32_t, 1> pixel{1};
@@ -9791,7 +9802,7 @@ TEST_CASE("physical and original recovery subscriptions bypass a parked first ro
  input.input_finished = [&] { source_done.set_value(); };
  auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
  const mmltk::testsupport::ScopedTestCleanup release([&] {
-  cancelled.store(true);
+  fixture.cancelled.store(true);
   terminal.store(true);
   originals.settle();
   pipeline.execution().cancel();
@@ -9802,12 +9813,12 @@ TEST_CASE("physical and original recovery subscriptions bypass a parked first ro
  CHECK_FALSE(input.records->row(0).native());
  CHECK_FALSE(input.records->row(1).native());
  if (cancel_parked) {
-  cancelled.store(true);
+  fixture.cancelled.store(true);
   pipeline.execution().cancel();
   CHECK_THROWS(mmltk::testsupport::await_test_future(importing, "cancel subscribed recovery dependencies", 5s));
  } else {
-  physical.admitted(admitted[1], admitted[1].download);
-  REQUIRE(physical.consume(admitted[1]));
+  physical.admitted(fixture.admitted[1], fixture.admitted[1].download);
+  REQUIRE(physical.consume(fixture.admitted[1]));
   mmltk::testsupport::await_test_promise(sibling, "ready unlabeled recovery bypasses the parked train row", 5s);
   // Only the admitted/completed source boundaries can affect train ambiguity.
   // Individual unrelated image and recovery completions never revisit it.
@@ -9817,8 +9828,8 @@ TEST_CASE("physical and original recovery subscriptions bypass a parked first ro
   REQUIRE(input.records->row(1).native());
   CHECK(input.records->row(1).native()->inventory().physical.source == CoconutImageNamespace::CocoUnlabeled);
   CHECK(importing.wait_for(0ms) == std::future_status::timeout);
-  physical.admitted(admitted[0], admitted[0].download);
-  REQUIRE(physical.consume(admitted[0]));
+  physical.admitted(fixture.admitted[0], fixture.admitted[0].download);
+  REQUIRE(physical.consume(fixture.admitted[0]));
   terminal.store(true);
   originals.settle();
   const auto components = mmltk::testsupport::await_test_future(importing, "both recovery generations settle", 5s);
@@ -9892,13 +9903,12 @@ TEST_CASE("original generation delivery visits only live recovery rows after phy
  }
  replace_physical_images(local.cache, local.catalog, CoconutImageNamespace::CocoTrain, train_members);
  replace_physical_images(local.cache, local.catalog, CoconutImageNamespace::CocoUnlabeled, unlabeled_members);
- auto admitted = local_physical_archives(local.cache, local.catalog);
- auto& train = *std::ranges::find(admitted, CoconutImageNamespace::CocoTrain, [](const auto& archive) { return archive.origin.source; });
- auto& unlabeled = *std::ranges::find(admitted, CoconutImageNamespace::CocoUnlabeled, [](const auto& archive) { return archive.origin.source; });
- std::atomic<bool> cancelled{false}, terminal{false};
- const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
- BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 13}, cancellation);
- CoconutPhysicalMembership physical(admitted, local.catalog, true, local.cache, pipeline.storage(), pipeline, cancellation);
+ PhysicalMembershipFixture fixture(local.cache, local.catalog, 1, false);
+ auto& pipeline = fixture.execution;
+ auto& physical = fixture.physical;
+ auto& train = *std::ranges::find(fixture.admitted, CoconutImageNamespace::CocoTrain, [](const auto& archive) { return archive.origin.source; });
+ auto& unlabeled = *std::ranges::find(fixture.admitted, CoconutImageNamespace::CocoUnlabeled, [](const auto& archive) { return archive.origin.source; });
+ std::atomic<bool> terminal{false};
  physical.admitted(train, train.download);
  REQUIRE(physical.consume(train));
  CoconutImportRequest input;
@@ -9906,7 +9916,7 @@ TEST_CASE("original generation delivery visits only live recovery rows after phy
  input.physical_membership = &physical;
  input.input_identity = "original-registration-generation";
  input.records = std::make_shared<CoconutAnnotationRecords>();
- input.cancellation = cancellation;
+ input.cancellation = fixture.cancellation;
  input.expected_rows = count;
  input.parquet_shards = {root.path() / "rows.parquet"};
  parquet_file(input.parquet_shards.front(), rows);
@@ -9938,7 +9948,7 @@ TEST_CASE("original generation delivery visits only live recovery rows after phy
  };
  auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
  const mmltk::testsupport::ScopedTestCleanup release([&] {
-  cancelled = true;
+  fixture.cancelled = true;
   terminal = true;
   originals.settle();
   pipeline.execution().cancel();
@@ -9969,7 +9979,7 @@ TEST_CASE("original generation delivery visits only live recovery rows after phy
  mmltk::testsupport::await_test_promise(live_revisited, "source boundary revisits the remaining live original waiter");
  for (unsigned i = 1; i < count; ++i) CHECK(observations[i].load() == before[i]);
  if (cancel_remaining) {
-  cancelled = true;
+  fixture.cancelled = true;
   pipeline.execution().cancel();
   CHECK_THROWS(mmltk::testsupport::await_test_future(importing, "cancellation retires the last original and physical registration"));
   terminal = true;
@@ -10271,16 +10281,7 @@ TEST_CASE("native pending output keeps its arena while a full file queue leaves 
  BenchmarkCompilePipeline pipeline(3, {}, {.descriptors = 13, .workspace_plan = plan});
  const std::array physical{coco(7)};
  auto input = request(physical);
- input.execution = &pipeline;
- input.inventory_directory = root.path() / "staging";
- input.records = std::make_shared<CoconutAnnotationRecords>();
- // The parsed segments exhaust this block, so native output must prepare a
- // new range after normalization, while retaining its exact supplied scratch.
- input.records->identity = input.input_identity;
- input.records->staging = std::make_shared<CoconutStaging>(input.inventory_directory, &pipeline.storage(), 1);
- input.parquet_shards = {root.path() / "row.parquet"};
- const std::array<std::uint32_t, 1> pixel{1};
- parquet_file(input.parquet_shards.front(), Json::array({hf_row(7, png(1, 1, pixel), Json::array({segment(), segment(2)}), 1, 1)}));
+ input.prepare_partial_staging(pipeline, root.path() / "staging");
  mmltk::testsupport::TestGate physical_call("held physical file service");
  std::promise<void> full;
  std::atomic<unsigned> accepted{0}, settled{0};
@@ -10575,14 +10576,7 @@ TEST_CASE("native staging retains its record while a competing image waits for t
  BenchmarkCompilePipeline pipeline(2, {}, {.descriptors = 16, .task_records = 2, .workspace_plan = plan}, {}, trace);
  const std::array identities{coco(7)};
  auto input = request(identities);
- input.execution = &pipeline;
- input.inventory_directory = root.path() / "native";
- input.records = std::make_shared<CoconutAnnotationRecords>();
- input.records->identity = input.input_identity;
- input.records->staging = std::make_shared<CoconutStaging>(input.inventory_directory, &pipeline.storage(), 1);
- input.parquet_shards = {root.path() / "row.parquet"};
- const std::array<std::uint32_t, 1> pixel{1};
- parquet_file(input.parquet_shards.front(), Json::array({hf_row(7, png(1, 1, pixel), Json::array({segment(), segment(2)}), 1, 1)}));
+ input.prepare_partial_staging(pipeline, root.path() / "native");
  input.rejected_object = [&](const auto&, const auto&, const auto&, auto, auto) { hold_next = true; };
  input.trace = [&](std::string_view event, const Json&) {
   if (event == "benchmark.coconut.native_staged") mmltk::testsupport::release_test_promise(copied);
