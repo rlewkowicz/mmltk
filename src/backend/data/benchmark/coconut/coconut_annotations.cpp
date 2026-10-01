@@ -305,6 +305,7 @@ std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetad
    }
   }
   if (metadata_only) normalized = seal_normalized_annotation_metadata(std::move(membership));
+  // CLEANUP-IGNORE: Distinct component and shard planning bodies only share inventory publication and the direct metadata admission call.
   sealed->inventory = std::move(inventory);
  };
  if (execution)

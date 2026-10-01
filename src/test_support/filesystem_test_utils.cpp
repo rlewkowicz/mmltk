@@ -38,6 +38,12 @@ void write_binary_file(const std::filesystem::path& path, const std::span<const 
   if (!contents.empty()) stream.write(reinterpret_cast<const char*>(contents.data()), static_cast<std::streamsize>(contents.size()));
  });
 }
+std::vector<std::uint8_t> read_binary_file(const std::filesystem::path& path) {
+ const auto file = mmltk::common::io::FileHandle::open_readonly(path.string());
+ std::vector<std::uint8_t> bytes(file.size());
+ file.pread_all(bytes.data(), bytes.size(), 0);
+ return bytes;
+}
 void make_executable(const std::filesystem::path& path, const std::filesystem::perms permissions, const std::filesystem::perm_options options) {
  std::filesystem::permissions(path, permissions, options);
 }

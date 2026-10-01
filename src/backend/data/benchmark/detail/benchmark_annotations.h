@@ -179,6 +179,7 @@ public:
 
 private:
  void prepare(std::size_t images, std::size_t boxes, std::size_t runs);
+ [[nodiscard]] std::span<NormalizedImage> writable_images();
  NormalizedAnnotationBuilder builder_;
  struct Mapped;
  std::shared_ptr<Mapped> mapped_;

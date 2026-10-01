@@ -1243,10 +1243,13 @@ void NormalizedAnnotationAssembler::gather(std::span<const Slice> slices, Compil
  }
  incomplete_gather_ = false;
 }
-void NormalizedAnnotationAssembler::begin_image(NormalizedImage image) {
+std::span<NormalizedImage> NormalizedAnnotationAssembler::writable_images() {
  if (!prepared_ || finished_ || incomplete_gather_) throw std::logic_error("normalized assembler is unprepared, sealed or has incomplete gather work");
  throw_if_benchmark_cancelled(cancellation_);
- const auto images = mapped_ ? mapped_->images.first(mapped_->image_count) : std::span(builder_.images);
+ return mapped_ ? mapped_->images.first(mapped_->image_count) : std::span(builder_.images);
+}
+void NormalizedAnnotationAssembler::begin_image(NormalizedImage image) {
+ const auto images = writable_images();
  validate_assembled_image(image, builder_.source, images.empty() ? std::nullopt : std::optional{std::uint64_t{images.back().source_image_id}});
  image.first_box = mapped_ ? mapped_->box_count : builder_.boxes.size();
  image.box_count = 0;
@@ -1257,9 +1260,7 @@ void NormalizedAnnotationAssembler::begin_image(NormalizedImage image) {
   builder_.images.push_back(image);
 }
 void NormalizedAnnotationAssembler::append_box(NormalizedBox box, std::span<const RLEPair> runs) {
- if (!prepared_ || finished_ || incomplete_gather_) throw std::logic_error("normalized assembler is unprepared, sealed or has incomplete gather work");
- throw_if_benchmark_cancelled(cancellation_);
- const auto images = mapped_ ? mapped_->images.first(mapped_->image_count) : std::span(builder_.images);
+ const auto images = writable_images();
  if (images.empty()) throw std::logic_error("normalized box requires an owning image");
  auto& image = images.back();
  if (image.box_count == UINT32_MAX) throw std::overflow_error("normalized per-image box count overflow");
@@ -1288,14 +1289,12 @@ void NormalizedAnnotationAssembler::append_box(NormalizedBox box, std::span<cons
  ++image.box_count;
 }
 NormalizedAnnotationIndex NormalizedAnnotationAssembler::finish(const BenchmarkTraceSink& trace) {
- if (!prepared_ || finished_ || incomplete_gather_) throw std::logic_error("normalized assembler is unprepared, sealed or has incomplete gather work");
- throw_if_benchmark_cancelled(cancellation_);
+ const auto images = writable_images();
  trace_benchmark_event(trace, "benchmark.annotations.assembled", [&] {
   return nlohmann::json{
-   {"source", benchmark_source_name(builder_.source)}, {"split", builder_.split}, {"images", mapped_ ? mapped_->image_count : builder_.images.size()},
-   {"boxes", mapped_ ? mapped_->box_count : builder_.boxes.size()}, {"mask_rle_pairs", mapped_ ? mapped_->run_count : builder_.mask_rle_pairs.size()},
-   {"image_capacity", mapped_ ? mapped_->images.size() : builder_.images.capacity()}, {"box_capacity", mapped_ ? mapped_->boxes.size() : builder_.boxes.capacity()},
-   {"mask_rle_capacity", mapped_ ? mapped_->runs.size() : builder_.mask_rle_pairs.capacity()}
+   {"source", benchmark_source_name(builder_.source)}, {"split", builder_.split}, {"images", images.size()}, {"boxes", mapped_ ? mapped_->box_count : builder_.boxes.size()},
+   {"mask_rle_pairs", mapped_ ? mapped_->run_count : builder_.mask_rle_pairs.size()}, {"image_capacity", mapped_ ? mapped_->images.size() : builder_.images.capacity()},
+   {"box_capacity", mapped_ ? mapped_->boxes.size() : builder_.boxes.capacity()}, {"mask_rle_capacity", mapped_ ? mapped_->runs.size() : builder_.mask_rle_pairs.capacity()}
   };
  });
  NormalizedAnnotationIndex result;
@@ -1303,7 +1302,7 @@ NormalizedAnnotationIndex NormalizedAnnotationAssembler::finish(const BenchmarkT
   auto owner = std::make_shared<NormalizedAnnotationBacking>();
   owner->source = builder_.source;
   owner->storage = mapped_;
-  owner->images = mapped_->images.first(mapped_->image_count);
+  owner->images = images;
   owner->boxes = mapped_->boxes.first(mapped_->box_count);
   owner->runs = mapped_->runs.first(mapped_->run_count);
   static_cast<NormalizedAnnotationMetadata&>(result) = std::move(static_cast<NormalizedAnnotationMetadata&>(builder_));

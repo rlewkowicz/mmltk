@@ -17,6 +17,7 @@
 #include "src/common/math/checked_arithmetic.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/system/cpu_affinity.h"
+#include <array>
 #include "src/pch_std.h"
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
@@ -53,19 +54,25 @@ struct CoconutRecipeInputs {
  CoconutRecipeInputs(std::size_t count, mmltk::common::concurrency::CancellationObservation cancellation, std::function<void(std::exception_ptr)> failure)
      : releases(count), external(cancellation), failed(std::move(failure)) {}
  ~CoconutRecipeInputs() { settle(); }
+ using OriginalChanges = std::array<std::shared_ptr<CompileExecution::CompletionSource>, 2>;
+ OriginalChanges stop_locked() {
+  stopped.store(true, std::memory_order_relaxed);
+  return {std::move(train_originals.changed), std::move(validation_originals.changed)};
+ }
+ void notify_stopped(const OriginalChanges& stop_changes) {
+  for (const auto& notification : stop_changes)
+   if (notification) notification->settle();
+  changed.notify_all();
+  if (execution) execution->execution().notify_admission_change();
+ }
  void settle() {
-  std::shared_ptr<CompileExecution::CompletionSource> train_changed, validation_changed;
+  OriginalChanges stop_changes;
   {
    const std::lock_guard lock(mutex);
    retiring = true;
-   stopped.store(true, std::memory_order_relaxed);
-   train_changed = std::move(train_originals.changed);
-   validation_changed = std::move(validation_originals.changed);
+   stop_changes = stop_locked();
   }
-  if (train_changed) train_changed->settle();
-  if (validation_changed) validation_changed->settle();
-  changed.notify_all();
-  if (execution) execution->execution().notify_admission_change();
+  notify_stopped(stop_changes);
   join_inputs();
  }
  void join_inputs() {
@@ -82,20 +89,15 @@ struct CoconutRecipeInputs {
  [[nodiscard]] int descriptor() const noexcept { return external.descriptor(); }
  void fail(std::exception_ptr value) {
   bool first = false;
-  std::shared_ptr<CompileExecution::CompletionSource> train_changed, validation_changed;
+  OriginalChanges stop_changes;
   {
    const std::lock_guard lock(mutex);
    if (retiring) return;
    first = !error;
    if (first) error = value;
-   stopped.store(true, std::memory_order_relaxed);
-   train_changed = std::move(train_originals.changed);
-   validation_changed = std::move(validation_originals.changed);
+   stop_changes = stop_locked();
   }
-  if (train_changed) train_changed->settle();
-  if (validation_changed) validation_changed->settle();
-  changed.notify_all();
-  if (execution) execution->execution().notify_admission_change();
+  notify_stopped(stop_changes);
   if (first && failed) failed(value);
  }
  void start_originals(std::function<void()> work) {

@@ -750,16 +750,19 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      state.initialized = true;
     }
     const auto rows = retained->rows() | std::views::drop(group.first_row) | std::views::take(group.rows);
+    const auto publish_membership = [&] {
+     for (const auto& row : rows) consumer(group_index, row.record(), CoconutAnnotationInput{.membership = true});
+     state.image_pass = false;
+     state.row = group.first_row;
+     state.projected = 0;
+    };
     if (state.image_pass && std::ranges::all_of(rows, [](const auto& row) { return row.metadata_ready(); })) {
      if (state.replay_bytes) {
       state.close();
       state.replay_bytes = 0;
       replay = nullptr;
      }
-     for (const auto& row : rows) consumer(group_index, row.record(), CoconutAnnotationInput{.membership = true});
-     state.image_pass = false;
-     state.row = group.first_row;
-     state.projected = 0;
+     publish_membership();
      if (metadata_only) {
       if (settle_consumers) settle_consumers();
       ++state.group;
@@ -846,10 +849,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      }
      if (state.row != group.first_row + group.rows) malformed("row group extent mismatch");
      if (state.image_pass) {
-      for (const auto& row : rows) consumer(group_index, row.record(), CoconutAnnotationInput{.membership = true});
-      state.image_pass = false;
-      state.row = group.first_row;
-      state.projected = 0;
+      publish_membership();
      } else {
       group.segments = state.segments;
       ++state.group;
@@ -922,10 +922,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
     if (state.row == group.first_row + group.rows) {
      state.batches.reset();
      if (state.image_pass) {
-      for (const auto& row : rows) consumer(group_index, row.record(), CoconutAnnotationInput{.membership = true});
-      state.image_pass = false;
-      state.row = group.first_row;
-      state.projected = 0;
+      publish_membership();
       if (metadata_only) {
        ++state.group;
        state.initialized = false;

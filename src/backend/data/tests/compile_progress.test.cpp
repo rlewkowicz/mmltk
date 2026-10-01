@@ -1678,13 +1678,7 @@ TEST_CASE("Directory large source masks may compile to a small bounded payload",
  CHECK(label.original_area == source_runs);
  CHECK(label.mask_rle_pairs <= 2);
  CHECK(store.image_entry(0).label_bytes <= sizeof(PackedInstance) + 2 * sizeof(RLEPair));
- const auto read_output = [&] {
-  auto file = FileHandle::open_readonly(compiled_bin_path(fixture));
-  std::vector<std::uint8_t> bytes(file.size());
-  file.pread_all(bytes.data(), bytes.size(), 0);
-  return bytes;
- };
- const auto baseline = read_output();
+ const auto baseline = mmltk::testsupport::read_binary_file(compiled_bin_path(fixture));
  // Identity projection preserves each separated source run. Its bounded
  // continuation must still count the whole mask after storage is exhausted.
  config.target_width = fixture.width;
@@ -1699,7 +1693,7 @@ TEST_CASE("Directory large source masks may compile to a small bounded payload",
   CHECK(message.find("required " + std::to_string(bytes) + " bytes") != std::string::npos);
   CHECK(message.find("capacity " + std::to_string(COMPILED_LABEL_CAPACITY)) != std::string::npos);
  }
- CHECK(read_output() == baseline);
+ CHECK(mmltk::testsupport::read_binary_file(compiled_bin_path(fixture)) == baseline);
 }
 TEST_CASE("Directory one-core continuations keep ready labels running behind held physical output", "[backend][data][compiler][concurrency]") {
  using namespace mmltk::backend::data::detail;
@@ -1859,13 +1853,7 @@ TEST_CASE("Directory file services preserve Extraction floors and peer pixels th
  if (config.worker_cpus.size() < 4) SKIP("requires four admitted CPUs for the four live class floors");
  config.num_workers = 4;
  DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0);
- const auto read_output = [&] {
-  auto file = FileHandle::open_readonly(compiled_bin_path(fixture));
-  std::vector<std::uint8_t> bytes(file.size());
-  file.pread_all(bytes.data(), bytes.size(), 0);
-  return bytes;
- };
- const auto baseline = read_output();
+ const auto baseline = mmltk::testsupport::read_binary_file(compiled_bin_path(fixture));
  mmltk::testsupport::TestGate input("Directory Extraction service"), output("Directory occupied Output service");
  struct State {
   mmltk::testsupport::TestGate::Receipt input, output;
@@ -1933,7 +1921,7 @@ TEST_CASE("Directory file services preserve Extraction floors and peer pixels th
   CHECK(state.pixels == static_cast<unsigned>(fixture.num_images));
  }
  CHECK_FALSE(state.invalid_budget.load());
- CHECK(read_output() == baseline);
+ CHECK(mmltk::testsupport::read_binary_file(compiled_bin_path(fixture)) == baseline);
 }
 TEST_CASE("mask continuations bound long slabs and preserve rollback and complete capacity counts", "[backend][data][compiler][mask]") {
  using namespace mmltk::backend::data::dataset;
@@ -2015,13 +2003,7 @@ TEST_CASE("Directory yields inside one long mask projection for peer pixels and 
  config.target_height = 4096;
  config.resize_mode = ImageResizeMode::Letterbox;
  DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0);
- const auto read_output = [&] {
-  auto file = FileHandle::open_readonly(compiled_bin_path(fixture));
-  std::vector<std::uint8_t> bytes(file.size());
-  file.pread_all(bytes.data(), bytes.size(), 0);
-  return bytes;
- };
- const auto baseline = read_output();
+ const auto baseline = mmltk::testsupport::read_binary_file(compiled_bin_path(fixture));
  mmltk::testsupport::TestGate held("unfinished Directory mask projection");
  struct State {
   mmltk::testsupport::TestGate::Receipt receipt;
@@ -2076,7 +2058,7 @@ TEST_CASE("Directory yields inside one long mask projection for peer pixels and 
   mmltk::testsupport::await_test_future(compile, "resumed mask projection", std::chrono::seconds{30});
   CHECK(state.quanta.load() > 1);
  }
- CHECK(read_output() == baseline);
+ CHECK(mmltk::testsupport::read_binary_file(compiled_bin_path(fixture)) == baseline);
  const auto result = CompiledDataset::open(compiled_bin_path(fixture));
  REQUIRE(result.image_labels(0).size() == 1);
  const auto& label = result.image_labels(0).front();

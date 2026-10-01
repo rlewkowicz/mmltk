@@ -43,6 +43,17 @@ struct FileWorkQueue::Impl {
  explicit Impl(std::size_t capacity) : records(capacity) {
   if (!capacity) throw std::invalid_argument("file queue requires prepared records");
  }
+ void stop_services() {
+  {
+   const std::lock_guard lock(mutex);
+   shutdown = true;
+  }
+  changed.notify_all();
+  services.clear();
+  // Unregister while the caller retains this owner; a final weak callback must
+  // never destroy its own Readiness registration on the notifier thread.
+  readiness.reset();
+ }
  void check_admission() const {
   if (stopping) throw std::runtime_error("file queue admission after stop");
   if (execution)
@@ -194,13 +205,7 @@ FileWorkQueue::FileWorkQueue(CompileExecution& execution, std::size_t records, s
  try {
   for (std::size_t i = 0; i < services; ++i) impl_->services.emplace_back([owner = impl_] { owner->service(); });
  } catch (...) {
-  {
-   const std::lock_guard lock(impl_->mutex);
-   impl_->shutdown = true;
-  }
-  impl_->changed.notify_all();
-  impl_->services.clear();
-  impl_->readiness.reset();
+  impl_->stop_services();
   throw;
  }
 }
@@ -218,15 +223,7 @@ FileWorkQueue::FileWorkQueue(mmltk::common::concurrency::WorkerPool& pool, std::
 FileWorkQueue::~FileWorkQueue() {
  cancel();
  join();
- {
-  const std::lock_guard lock(impl_->mutex);
-  impl_->shutdown = true;
- }
- impl_->changed.notify_all();
- impl_->services.clear();
- // Unregister while this owner is still retained; a final weak callback must
- // never destroy its own Readiness registration on the notifier thread.
- impl_->readiness.reset();
+ impl_->stop_services();
 }
 std::optional<CompileExecution::Completion> FileWorkQueue::try_submit(Operation operation) {
  if (!operation.call && !operation.work) throw std::invalid_argument("empty borrowed file operation");

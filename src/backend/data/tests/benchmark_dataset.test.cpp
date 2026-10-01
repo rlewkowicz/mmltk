@@ -9130,9 +9130,7 @@ TEST_CASE("independent slots settle payloads and release chunks across source fa
   CHECK(dataset.image_labels(2)[0].source_ordinal == 205);
   CHECK(dataset.image_labels(1).empty());
   CHECK(dataset.instance_rle(0, dataset.image_labels(0)[1]).empty());
-  const auto file = FileHandle::open_readonly(request.output_path.string());
-  std::vector<std::uint8_t> bytes(file.size());
-  file.pread_all(bytes.data(), bytes.size(), 0);
+  auto bytes = mmltk::testsupport::read_binary_file(request.output_path);
   if (baseline.empty())
    baseline = std::move(bytes);
   else
@@ -9827,6 +9825,7 @@ TEST_CASE("aged compile demands leave retained-owner dependencies runnable", "[b
  CHECK(smaller == 12);
  CHECK(observed_smaller == 12);
 }
+// CLEANUP-IGNORE: Independent fairness and alias-lifetime cases only share CPU eligibility and parameter setup.
 TEST_CASE("aged compile demands reserve reclaimable workspace ahead of smaller work", "[backend][data][benchmark][pipeline]") {
  using mmltk::backend::data::detail::CompileWorkClass;
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
@@ -10524,6 +10523,7 @@ TEST_CASE("compile fixed arenas retain pinning while owned label outputs delay r
  CHECK(execution.resource_usage().bytes == 0);
  CHECK(execution.snapshot().normal_locked == initial);
 }
+// CLEANUP-IGNORE: Independent arena cases select the same window parameters and page size; their execution and ownership assertions differ.
 TEST_CASE("one exceptional arena finishes its retained lineage and returns to the fixed bank", "[benchmark][pipeline][resources]") {
  using namespace mmltk::backend::data::detail;
  const auto window = GENERATE(CompileWorkspaceWindow::Task, CompileWorkspaceWindow::SharedSource, CompileWorkspaceWindow::Compaction);
@@ -10656,6 +10656,7 @@ TEST_CASE("a source larger than its reserve waits for ordinary backing without e
  CHECK(execution.snapshot().exceptional_peak == 0);
  CHECK(execution.snapshot().physical_retirements == 0);
 }
+// CLEANUP-IGNORE: Independent concurrent-borrow and lane-reassignment cases only share CPU eligibility and page-size setup.
 TEST_CASE("independent source and compaction tasks borrow ordinary arenas simultaneously", "[benchmark][pipeline][resources]") {
  using namespace mmltk::backend::data::detail;
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
@@ -10736,6 +10737,7 @@ TEST_CASE("cancelled oversized admission leaves live output custody and fixed ba
  CHECK(normal.workspace().data() == base);
  CHECK(execution.snapshot().normal_locked == page);
 }
+// CLEANUP-IGNORE: Independent arena cases select the same window parameters and page size; their execution and ownership assertions differ.
 TEST_CASE("exceptional finite descendants partition one pinned extent until last custody", "[benchmark][pipeline][resources]") {
  using namespace mmltk::backend::data::detail;
  const auto window = GENERATE(CompileWorkspaceWindow::Task, CompileWorkspaceWindow::SharedSource, CompileWorkspaceWindow::Compaction);
@@ -10785,6 +10787,7 @@ TEST_CASE("Directory supplied codec decoding uses stable pinned storage and pres
  SECTION("PNG") { REQUIRE(stbi_write_png_to_func(append_bytes, &encoded, width, height, 3, rgb.data(), width * 3)); }
  CompileImageDecoder decoder;
  const auto header = decoder.read_header(encoded, CompileImagePolicy::Directory);
+ // CLEANUP-IGNORE: Independent decoder cases construct execution from the checked workspace size; their operations and assertions differ.
  const auto bytes = CompileImageDecoder::plan(header).bytes();
  CompileExecution execution(1, {}, {.transient_bytes = bytes}, {}, [](std::string_view, const CompileExecutionSnapshot&) {});
  const void* base = nullptr;

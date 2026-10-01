@@ -4756,12 +4756,15 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
   REQUIRE(archive_write_close(output.get()) == ARCHIVE_OK);
  }
  BenchmarkArchive input(path);
+ const auto suspend_readmitted_input = [&] {
+  input.suspend();
+  input.suspend();
+  CHECK(input.retained_workspace_bytes() == 0);
+  REQUIRE(input.try_resume(0));
+ };
  // Before-first-header suspension is distinct from a saved member. Repeated
  // teardown and decoder admission must retain that initial forward position.
- input.suspend();
- input.suspend();
- CHECK(input.retained_workspace_bytes() == 0);
- REQUIRE(input.try_resume(0));
+ suspend_readmitted_input();
  input.suspend();
  REQUIRE(input.next());
  CHECK(input.member() == name);
@@ -4786,10 +4789,7 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
   BenchmarkArchive changed_generation(path);
   CHECK_THROWS_AS(changed_generation.seek(first_position), BenchmarkArchiveError);
  }
- input.suspend();
- input.suspend();
- CHECK(input.retained_workspace_bytes() == 0);
- REQUIRE(input.try_resume(0));
+ suspend_readmitted_input();
  // Admission itself does not consume the saved member; resuspending before a
  // read must keep its metadata even though the fresh decoder starts at zero.
  input.suspend();
@@ -9400,6 +9400,7 @@ TEST_CASE("Parquet artifact readiness bypasses a held batch borrower", "[benchma
  held.Release();
  mmltk::testsupport::await_test_future(importing, "both artifact continuations settle", 5s);
 }
+// CLEANUP-IGNORE: Independent normalization and staging-retirement cases only share namespace and CPU eligibility setup.
 TEST_CASE("independent native normalization enters shared annotation lanes", "[benchmark][coconut][annotations][pipeline]") {
  using namespace mmltk::backend::data::detail;
  using namespace std::chrono_literals;
@@ -9599,14 +9600,20 @@ TEST_CASE("physical and original recovery subscriptions bypass a parked first ro
   CHECK(components[1].index().image(0).source_image_id == 2);
  }
 }
+namespace {
+BenchmarkCompilePipeline parquet_projection_pipeline() {
+ using namespace mmltk::backend::data::detail;
+ const std::array<CompileWorkspaceProfile, 1> profiles{{{64U << 10, 0}}};
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, profiles, kParquetPoolBytes, 0));
+ return BenchmarkCompilePipeline(1, {}, {.descriptors = 13, .workspace_plan = std::move(plan)}, {}, [](std::string_view, const Json&) {});
+}
+}  // namespace
 TEST_CASE("Parquet contiguous fit is distinct from its logical payload cap", "[benchmark][coconut][parquet][resources]") {
  using namespace mmltk::backend::data::detail;
  constexpr std::int64_t unit = 1U << 20, small = 80 * unit, large = 100 * unit;
  const bool moving = GENERATE(false, true);
  CAPTURE(moving);
- const std::array<CompileWorkspaceProfile, 1> profiles{{{64U << 10, 0}}};
- auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, profiles, kParquetPoolBytes, 0));
- BenchmarkCompilePipeline pipeline(1, {}, {.descriptors = 13, .workspace_plan = plan}, {}, [](std::string_view, const Json&) {});
+ auto pipeline = parquet_projection_pipeline();
  const auto locked = pipeline.execution().snapshot().normal_locked;
  std::size_t retry_bytes = 0;
  // A failed moving reallocation must leave the original pointer intact. A
@@ -9710,9 +9717,7 @@ TEST_CASE("large projected Parquet batches keep the opened generation through st
  writer.write_batch_size(1);
  parquet_file(paths.front(), rows, hf_schema(), parquet::Compression::ZSTD, 16, parquet::default_arrow_writer_properties(), writer.build());
  rows = Json{};
- const std::array<CompileWorkspaceProfile, 1> profiles{{{64U << 10, 0}}};
- auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, profiles, kParquetPoolBytes, 0));
- BenchmarkCompilePipeline pipeline(1, {}, {.descriptors = 13, .workspace_plan = plan}, {}, [](std::string_view, const Json&) {});
+ auto pipeline = parquet_projection_pipeline();
  const auto locked = pipeline.execution().snapshot().normal_locked;
  CoconutAnnotationRecords retained;
  retained.staging_directory = root.path() / "staging";

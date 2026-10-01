@@ -55,6 +55,7 @@ using namespace mmltk::common::logging;
 using namespace mmltk::common::system;
 using mmltk::frameworks::gpu::ensure_cuda_ok;
 using namespace mmltk::backend::data::testsupport;
+// CLEANUP-IGNORE: Independent stream and bounded-gather cases open their own dataset and read its stride; no shared execution algorithm.
 void exercise_compiled_stream(const std::string& path, bool h2d) {
  const auto source = CompiledDataset::open(path);
  const auto stride = static_cast<std::size_t>(source.header().image_stride);
@@ -1565,12 +1566,6 @@ TEST_CASE("Directory metadata construction preserves empty masks offsets and pub
  write("000001.jsonl", first + "\n" + empty + "\n");
  write("000002.jsonl", "");
  write("000003.jsonl", empty + "\n");
- const auto read_output = [&] {
-  const auto file = mmltk::common::io::FileHandle::open_readonly(compiled_bin_path(fixture));
-  std::vector<std::uint8_t> bytes(file.size());
-  file.pread_all(bytes.data(), bytes.size(), 0);
-  return bytes;
- };
  std::vector<std::uint8_t> baseline;
  for (const auto workers : {1, 2, 3}) {
   config.num_workers = workers;
@@ -1599,7 +1594,7 @@ TEST_CASE("Directory metadata construction preserves empty masks offsets and pub
   }
   for (std::uint32_t image = 0; image < result.image_entries().size(); ++image)
    CHECK(result.pixel_offset(image) == compute_file_layout(result.header().num_slots, result.header().image_stride, result.header().max_label_bytes).pixel_offset(image));
-  const auto bytes = read_output();
+  const auto bytes = mmltk::testsupport::read_binary_file(compiled_bin_path(fixture));
   if (baseline.empty())
    baseline = bytes;
   else
@@ -1629,7 +1624,7 @@ TEST_CASE("Directory metadata construction preserves empty masks offsets and pub
   write("000001.jsonl", malformed);
   const auto plan = DatasetCompiler::prepare(config, {"train"});
   CHECK_THROWS(DatasetCompiler::compile(plan, 0));
-  CHECK(read_output() == baseline);
+  CHECK(mmltk::testsupport::read_binary_file(compiled_bin_path(fixture)) == baseline);
  }
 }
 TEST_CASE("compiled scatter output checks bounded vectors and partial physical writes", "[backend][data][storage]") {

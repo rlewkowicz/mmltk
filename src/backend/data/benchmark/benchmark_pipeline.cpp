@@ -249,14 +249,17 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
   void ready_labels(Label&);
   void unlink_labels(Label&);
   void withdraw_labels(Image&);
+  void withdraw_labels(Source& source) {
+   for (auto& [id, image] : source.images) {
+    (void)id;
+    withdraw_labels(image);
+   }
+  }
   void admit_labels();
   void withdraw_all_labels() {
    for (auto& [root, source] : sources_) {
     (void)root;
-    for (auto& [id, image] : source.images) {
-     (void)id;
-     withdraw_labels(image);
-    }
+    withdraw_labels(source);
    }
   }
   [[nodiscard]] const Label* waiting_labels() const { return labels_head_; }
@@ -267,12 +270,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
    ++attempt_;
    for (auto& [root, source] : sources_) {
     (void)root;
-    for (auto& [id, image] : source.images) {
-     (void)id;
-     withdraw_labels(image);
-     image.selected_label = nullptr;
-     image.labels.clear();
-    }
+    withdraw_labels(source);
     source.images.clear();
     source.writers.clear();
     source.incremental_writer = nullptr;
