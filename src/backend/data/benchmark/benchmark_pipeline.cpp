@@ -11,6 +11,8 @@
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cassert>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -159,6 +161,8 @@ void BenchmarkCompletionWindow::drain() {
 std::size_t BenchmarkCompletionWindow::size() const noexcept { return impl_->entries.size(); }
 struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  enum class PixelStage { Header, Workspace, Input, Output, Pixels, Count };
+ static constexpr auto pixel_stage_count = static_cast<std::size_t>(PixelStage::Count);
+ static_assert(pixel_stage_count <= 32);
  struct Slot;
  struct Label;
  struct LabelWork;
@@ -169,9 +173,73 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
   CompileExecution::Completion handle;
   CompileExecution::CompletionSource completion;
   Slot* slot = nullptr;
-  Job* next = nullptr;
+  Job* ready_previous = nullptr;
+  Job* ready_next = nullptr;
+  Job* retired_next = nullptr;
   bool queued = false, done = false, independent = false;
   std::exception_ptr failure;
+ };
+ // Stable source slots own the jobs. This queue alone owns ready membership;
+ // detached settlement uses a separate link and runs outside the facts lock.
+ class PixelQueue {
+ public:
+  void push(Job& job) noexcept {
+   assert(!job.queued && !job.ready_previous && !job.ready_next && !job.retired_next);
+   const auto stage = static_cast<std::size_t>(job.stage);
+   job.ready_previous = tails_[stage];
+   if (tails_[stage]) tails_[stage]->ready_next = &job;
+   else heads_[stage] = &job;
+   tails_[stage] = &job;
+   job.queued = true;
+   ++counts_[stage];
+   ++size_;
+   ready_ |= std::uint32_t{1} << stage;
+  }
+  bool remove(Job& job) noexcept {
+   if (!job.queued) return false;
+   const auto stage = static_cast<std::size_t>(job.stage);
+   if (job.ready_previous) job.ready_previous->ready_next = job.ready_next;
+   else heads_[stage] = job.ready_next;
+   if (job.ready_next) job.ready_next->ready_previous = job.ready_previous;
+   else tails_[stage] = job.ready_previous;
+   job.ready_previous = job.ready_next = nullptr;
+   job.queued = false;
+   if (!--counts_[stage]) ready_ &= ~(std::uint32_t{1} << stage);
+   --size_;
+   return true;
+  }
+  void accept(Job& job) noexcept {
+   // Denied probes do not spend a turn: the next freed record starts after
+   // the last accepted stage, even when every other head was blocked.
+   cursor_ = (static_cast<std::size_t>(job.stage) + 1) % pixel_stage_count;
+   remove(job);
+  }
+  void detach(Job& job, Job*& retired) noexcept {
+   if (!remove(job)) return;
+   job.retired_next = retired;
+   retired = &job;
+  }
+  [[nodiscard]] Job* detach_all() noexcept {
+   Job* retired = nullptr;
+   while (ready_) detach(*heads_[std::countr_zero(ready_)], retired);
+   cursor_ = 0;
+   return retired;
+  }
+  [[nodiscard]] Job& next(std::uint32_t eligible) const noexcept {
+   assert(eligible && !(eligible & ~ready_));
+   const auto following = eligible & (~std::uint32_t{0} << cursor_);
+   const auto stage = static_cast<std::size_t>(std::countr_zero(following ? following : eligible));
+   return *heads_[stage];
+  }
+  [[nodiscard]] std::uint32_t ready_stages() const noexcept { return ready_; }
+  [[nodiscard]] const auto& counts() const noexcept { return counts_; }
+  [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+ private:
+  std::array<Job*, pixel_stage_count> heads_{}, tails_{};
+  std::array<std::size_t, pixel_stage_count> counts_{};
+  std::size_t size_ = 0, cursor_ = 0;
+  std::uint32_t ready_ = 0;
  };
  struct Source;
  struct Slot {
@@ -311,7 +379,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  std::mutex mutex;
  std::condition_variable changed;
  ImageState images{*this};
- std::deque<Job*> pixels;
+ PixelQueue pixels;
  std::deque<std::shared_ptr<LabelWork>> label_outputs;
  struct RetiredCompletion {
   CompileExecution::CompletionSource completion;
@@ -398,13 +466,8 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
   if (stopping) throw std::runtime_error("benchmark admission after retirement");
  }
  void push(Job& job) {
-  job.queued = true;
-  pixels.push_back(&job);
+  pixels.push(job);
   execution.notify_admission_change();
- }
- void remove(Job& job) {
-  std::erase(pixels, &job);
-  job.queued = false;
  }
  void settle(Job&, std::exception_ptr = {}, bool recoverable = false) noexcept;
  void settle_list(Job*, std::exception_ptr) noexcept;
@@ -610,11 +673,7 @@ void BenchmarkCompilePipeline::Impl::ImageState::retire_image(const std::filesys
  if (slot) {
   slot->retiring = true;
   slot->job.handle.cancel();
-  if (slot->job.queued) {
-   execution.remove(slot->job);
-   slot->job.next = detached;
-   detached = &slot->job;
-  }
+  execution.pixels.detach(slot->job, detached);
  }
  lock.unlock();
  execution.settle_list(detached, execution.retired_failure);
@@ -706,8 +765,7 @@ void BenchmarkCompilePipeline::Impl::ImageState::publish(Source& source, std::ui
   // arena behind parked pixels that need that same arena to drain.
   if (slot.payload && slot.payload->charged_bytes()) {
    if (execution.submit_pixel(slot.job)) {
-    execution.pixels.pop_back();
-    slot.job.queued = false;
+    execution.pixels.accept(slot.job);
    } else {
     slot.payload = slot.payload->file_input();
     execution.header_input(slot);
@@ -746,10 +804,7 @@ void BenchmarkCompilePipeline::Impl::ImageState::retire_source(const std::filesy
  for (auto& [id, slot] : source.images) {
   (void)id;
   slot.job.handle.cancel();
-  if (!slot.job.queued) continue;
-  execution.remove(slot.job);
-  slot.job.next = retired;
-  retired = &slot.job;
+  execution.pixels.detach(slot.job, retired);
  }
  lock.unlock();
  execution.settle_list(retired, execution.retired_failure);
@@ -1093,7 +1148,7 @@ void BenchmarkCompilePipeline::Impl::settle(Job& job, std::exception_ptr error, 
   }
   job.failure = error;
   job.done = true;
-  job.queued = false;
+  assert(!job.queued);
   --pending;
   --slot.source->pending;
   retained_headers = std::move(slot.headers);
@@ -1106,8 +1161,8 @@ void BenchmarkCompilePipeline::Impl::settle(Job& job, std::exception_ptr error, 
 void BenchmarkCompilePipeline::Impl::settle_list(Job* jobs, std::exception_ptr error) noexcept {
  while (jobs) {
   auto* job = jobs;
-  jobs = job->next;
-  job->next = nullptr;
+  jobs = job->retired_next;
+  job->retired_next = nullptr;
   settle(*job, error, true);
  }
 }
@@ -1301,14 +1356,7 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
  if (stopping || failure || cancellation.requested()) {
   images.withdraw_all_labels();
   auto completions = std::exchange(retired_completions, {});
-  Job* retired = nullptr;
-  while (!pixels.empty()) {
-   auto* job = pixels.front();
-   pixels.pop_front();
-   job->queued = false;
-   job->next = retired;
-   retired = job;
-  }
+  auto* retired = pixels.detach_all();
   const auto error = failure ? failure : retired_failure;
   lock.unlock();
   for (auto& completion : completions) completion.completion.settle(error);
@@ -1334,39 +1382,41 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
   label_outputs.pop_front();
   return true;
  };
- // One bounded turn per product type. A denied file stage never conceals a
- // ready CPU stage; denied admission is common to that stage, so probe it once
- // per readiness pass rather than repeatedly walking a blocked prefix.
- std::array<bool, static_cast<std::size_t>(PixelStage::Count)> blocked{};
- auto pixel = pixels.begin();
+ // Fair stage turns preserve FIFO within each stage. Callbacks need this lock,
+ // so the eligible set can only shrink during a pass. Each head probe either
+ // admits one job or excludes that stage until the next readiness event.
+ std::array<bool, pixel_stage_count> blocked{};
+ auto eligible = pixels.ready_stages();
+ std::size_t image_head_probes = 0, image_admitted = 0;
  for (;;) {
   bool accepted = admit_output();
   if (labels_first) accepted = images.admit_labels() || accepted;
-  while (pixel != pixels.end()) {
-   auto& job = **pixel;
+  while (eligible) {
+   auto& job = pixels.next(eligible);
    const auto stage = static_cast<std::size_t>(job.stage);
-   if (!blocked[stage]) {
-    if (submit_pixel(job)) {
-     pixel = pixels.erase(pixel);
-     job.queued = false;
-     accepted = true;
-     break;
-    }
-    blocked[stage] = true;
+   if (trace) ++image_head_probes;
+   if (submit_pixel(job)) {
+    pixels.accept(job);
+    eligible &= pixels.ready_stages();
+    if (trace) ++image_admitted;
+    accepted = true;
+    break;
    }
-   ++pixel;
+   if (trace) blocked[stage] = true;
+   eligible &= ~(std::uint32_t{1} << stage);
   }
   if (!labels_first) accepted = images.admit_labels() || accepted;
   labels_first = !labels_first;
   if (!accepted) break;
  }
  if (trace) {
-  std::array<std::size_t, static_cast<std::size_t>(PixelStage::Count)> queued{};
-  for (const auto* job : pixels) ++queued[static_cast<std::size_t>(job->stage)];
+  const auto queued = pixels.counts();
+  const auto pending_images = pixels.size();
   const auto outputs = label_outputs.size();
   lock.unlock();
   trace_benchmark_event(trace, "benchmark.pipeline.ready", [&] {
    return nlohmann::json{{"header", queued[0]}, {"workspace", queued[1]}, {"input", queued[2]}, {"output", queued[3]}, {"pixels", queued[4]},
+    {"pending_images", pending_images}, {"image_head_probes", image_head_probes}, {"image_admitted", image_admitted},
     {"label_outputs", outputs}, {"stage_records_blocked", blocked}, {"label_file_records_blocked", file_full}};
   });
  }
@@ -1554,11 +1604,7 @@ void BenchmarkCompilePipeline::write_remaining(BenchmarkSplitWriter& writer, con
     auto& slot = impl_->images.source(root).images.at(id);
     if (!slot.submitted || slot.job.done || slot.job.independent) continue;
     slot.job.handle.cancel();
-    if (slot.job.queued) {
-     impl_->remove(slot.job);
-     slot.job.next = discarded;
-     discarded = &slot.job;
-    }
+    impl_->pixels.detach(slot.job, discarded);
    }
   }
   impl_->settle_list(discarded, impl_->retired_failure);
@@ -1615,13 +1661,7 @@ void BenchmarkCompilePipeline::retire_attempt() noexcept {
  {
   const std::lock_guard lock(impl_->mutex);
   impl_->stopping = true;
-  while (!impl_->pixels.empty()) {
-   auto* job = impl_->pixels.front();
-   impl_->pixels.pop_front();
-   job->queued = false;
-   job->next = discarded;
-   discarded = job;
-  }
+  discarded = impl_->pixels.detach_all();
  }
  impl_->settle_list(discarded, impl_->retired_failure);
  impl_->execution.retire_attempt();

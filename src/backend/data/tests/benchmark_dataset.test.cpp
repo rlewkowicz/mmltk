@@ -12271,3 +12271,269 @@ TEST_CASE("bounded preload services reuse workers and fixed storage on small CPU
   CHECK(bounded);
  }
 }
+namespace {
+struct PendingImageEvidence {
+ std::atomic<bool> bounded{true};
+ std::atomic<std::size_t> observations{0};
+ void observe(const nlohmann::json& fields) {
+  std::size_t pending = 0, denied = 0;
+  for (const auto* stage : {"header", "workspace", "input", "output", "pixels"}) pending += fields.at(stage).get<std::size_t>();
+  for (const auto& blocked : fields.at("stage_records_blocked")) denied += blocked.get<bool>();
+  const auto accepted = fields.at("image_admitted").get<std::size_t>();
+  const auto probes = fields.at("image_head_probes").get<std::size_t>();
+  if (pending != fields.at("pending_images").get<std::size_t>() || probes != accepted + denied || denied > 5) bounded = false;
+  ++observations;
+ }
+};
+struct PipelineImageReceipts {
+ struct Image {
+  std::atomic<unsigned> settled{0};
+  std::exception_ptr error;
+ };
+ std::vector<Image> images;
+ std::atomic<std::size_t> settled{0};
+ std::promise<void> completed;
+ explicit PipelineImageReceipts(std::size_t count) : images(count) {}
+ void subscribe(const CompileExecution::Completion& completion, std::size_t index) {
+  REQUIRE(completion);
+  completion.subscribe([this, index](std::exception_ptr error) {
+   images[index].error = error;
+   ++images[index].settled;
+   if (++settled == images.size()) mmltk::testsupport::release_test_promise(completed);
+  });
+ }
+ void wait() {
+  mmltk::testsupport::await_test_promise(completed, "every image settles its completion receipt", 5s);
+  for (const auto& image : images) CHECK(image.settled == 1);
+ }
+};
+}  // namespace
+TEST_CASE("pending image stage probes and source withdrawal stay bounded behind a small record bank", "[benchmark][pipeline][images][preload][resources]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ const auto count = GENERATE(std::size_t{32}, std::size_t{256});
+ mmltk::testsupport::ScopedTempDir root("pending-image-stage-heads");
+ const auto images = root.path() / "images";
+ const auto pending_images = root.path() / "pending-images";
+ auto split = cached_pixel_membership(images);
+ split.images = {{1, 16, 8, 0, 0}};
+ add_cached_pixel_source(split, pending_images);
+ const auto encoded = make_jpeg(70, 80, 90);
+ for (std::uint64_t id = 1; id <= count; ++id) {
+  BenchmarkEncodedImage::publish(cached_image_path(pending_images, id), encoded, {});
+  split.images.push_back({id, 16, 8, 0, 1});
+ }
+ mmltk::testsupport::TestGate input("admitted peer retains its physical image read"), output("cache callbacks retain every output record");
+ PendingImageEvidence evidence;
+ PipelineImageReceipts receipts(count + 1);
+ std::promise<void> pending, prepared, peer_ready;
+ std::atomic<unsigned> resumed{0}, output_returns{0};
+ std::atomic<unsigned> headers{0};
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
+  if (event == "benchmark.pipeline.ready") {
+   evidence.observe(fields);
+   if (fields.at("header") == count && fields.at("image_admitted") == 0 && fields.at("image_head_probes") == 1)
+    mmltk::testsupport::release_test_promise(pending);
+   if (fields.at("header") == count && fields.at("pixels") == 1) mmltk::testsupport::release_test_promise(peer_ready);
+  }
+  if (event == "benchmark.image.stage_started") {
+   if (fields.at("stage") == "header") ++headers;
+   if (fields.at("stage") == "input" && fields.at("image_id") == 1) input.receipt().ArriveAndWait();
+  }
+  if (event == "benchmark.image.stage_completed" && fields.at("stage") == "output" && fields.at("image_id") == 1 && !fields.at("failed").get<bool>())
+   mmltk::testsupport::release_test_promise(prepared);
+ };
+ BenchmarkCompilePipeline pipeline(2, {}, {.transient_bytes = 4U << 20, .task_records = 2}, {}, trace);
+ CompileExecution::Dependency dependency(pipeline.execution());
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, {}, &pipeline);
+ request.perceptual_downscale = true;
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(pipeline);
+ bind_benchmark_slots(pipeline, writer, split);
+ std::future<void> retiring;
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  input.Release();
+  output.Release();
+  dependency.notify();
+  if (retiring.valid()) {
+   pipeline.execution().cancel();
+   retiring.wait();
+  }
+  pipeline.retire_attempt();
+  pipeline.files().join();
+ });
+ const auto publication = pipeline.source_publication(images, {}, {}, true);
+ publication({1});
+ REQUIRE(input.WaitEntered(5s));
+ pipeline.execution().join();
+ std::array<CompileExecution::Completion, 2> occupied;
+ for (auto& completion : occupied) {
+  auto record = pipeline.execution().try_subscribe(dependency, dependency.generation(),
+   {.kind = CompileTaskKind::Normalize, .work = [&](std::size_t, const CompileAllowance&) { ++resumed; }});
+  REQUIRE(record);
+  completion = std::move(*record);
+ }
+ std::array<CompileExecution::Completion, 4> outputs;
+ for (auto& completion : outputs)
+  completion = pipeline.files().submit({.completed = [&](std::exception_ptr) {
+   output.receipt().ArriveAndWait();
+   ++output_returns;
+  }, .work = [] {}});
+ REQUIRE(output.WaitEntered(5s, 2));
+ CHECK_FALSE(pipeline.files().has_capacity());
+ // Published images can accumulate independently of the admitted record bank.
+ // A denied Header head leaves the rest of that source's pending work alone.
+ const auto queued = pipeline.source_publication(pending_images, {}, {}, true);
+ receipts.subscribe(pipeline.image_completion(images, 1), 0);
+ for (std::size_t id = 1; id <= count; ++id) {
+  queued({id});
+  receipts.subscribe(pipeline.image_completion(pending_images, id), id);
+ }
+ mmltk::testsupport::await_test_promise(pending, "large Header queue receives one denied head probe", 5s);
+ CHECK(pipeline.execution().snapshot().records == occupied.size());
+ input.Release();
+ mmltk::testsupport::await_test_promise(prepared, "ready image extent bypasses the denied Header queue", 5s);
+ mmltk::testsupport::await_test_promise(peer_ready, "unrelated source retains its ready Pixels head", 5s);
+ CHECK_FALSE(pipeline.image_completion(images, 1).ready());
+ CHECK_FALSE(occupied.front().ready());
+ CHECK(output_returns == 0);
+ retiring = std::async(std::launch::async, [&] { pipeline.retire_source(pending_images); });
+ mmltk::testsupport::await_test_future(retiring, "source withdrawal unlinks only its pending slots beside a live peer", 5s);
+ CHECK_FALSE(pipeline.image_completion(images, 1).ready());
+ CHECK(headers == 1);
+ dependency.notify();
+ for (const auto& completion : occupied) completion.wait();
+ receipts.wait();
+ pipeline.drain();
+ CHECK(resumed == occupied.size());
+ CHECK(writer.completed() == 1);
+ CHECK_FALSE(receipts.images.front().error);
+ for (std::size_t index = 1; index < receipts.images.size(); ++index) {
+  REQUIRE(receipts.images[index].error);
+  CHECK_THROWS_WITH(std::rethrow_exception(receipts.images[index].error), "benchmark work retired before completion");
+ }
+ CHECK_FALSE(outputs.front().ready());
+ CHECK(evidence.bounded);
+ CHECK(evidence.observations > 0);
+ output.Release();
+ pipeline.files().join();
+ CHECK(output_returns == outputs.size());
+}
+TEST_CASE("large pending image sets retire behind full physical records and leave a reusable attempt", "[benchmark][pipeline][images][preload][resources]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPUs");
+ const bool fail = GENERATE(false, true);
+ constexpr std::size_t admitted = 4, count = 64;
+ mmltk::testsupport::ScopedTempDir root("pending-image-physical-retirement");
+ const auto images = root.path() / "images";
+ auto split = cached_pixel_membership(images);
+ const auto encoded = make_jpeg(70, 80, 90);
+ for (std::uint64_t id = 1; id <= admitted + count; ++id) {
+  BenchmarkEncodedImage::publish(cached_image_path(images, id), encoded, {});
+  split.images.push_back({id, 16, 8, 0, 0});
+ }
+ mmltk::testsupport::TestGate physical("full image service retains its physical borrowers");
+ PendingImageEvidence evidence;
+ PipelineImageReceipts physical_receipts(admitted), pending_receipts(count), replacement_receipt(1);
+ std::array<std::atomic<bool>, admitted> physically_started{};
+ std::promise<void> full, pending;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
+  if (event == "file.admitted" && fields.at("service") == "image" && fields.at("records") == admitted)
+   mmltk::testsupport::release_test_promise(full);
+  if (event == "benchmark.image.stage_started" && fields.at("stage") == "input") {
+   physically_started.at(fields.at("image_id").get<std::size_t>() - 1) = true;
+   physical.receipt().ArriveAndWait();
+  }
+  if (event == "benchmark.pipeline.ready") {
+   evidence.observe(fields);
+   if (fields.at("header") == count && fields.at("image_admitted") == 0 && fields.at("image_head_probes") == 1)
+    mmltk::testsupport::release_test_promise(pending);
+  }
+ };
+ BenchmarkCompilePipeline pipeline(4, {}, {.transient_bytes = 4U << 20, .task_records = admitted}, {}, trace);
+ CompileExecution::Dependency dependency(pipeline.execution());
+ auto request = benchmark_write_request(split, root.path() / "result.bin", 8, {}, &pipeline);
+ write_text(request.output_path, "previously published pixels");
+ const auto previous = mmltk::common::io::sha256_file(request.output_path);
+ BenchmarkSplitWriter writer(request);
+ BenchmarkCompilePipeline::Attempt attempt(pipeline);
+ bind_benchmark_slots(pipeline, writer, split);
+ std::future<void> draining;
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  physical.Release();
+  dependency.notify();
+  if (draining.valid()) {
+   pipeline.execution().cancel();
+   draining.wait();
+  }
+  pipeline.retire_attempt();
+ });
+ const auto publication = pipeline.source_publication(images, {}, {}, true);
+ for (std::size_t id = 1; id <= admitted; ++id) {
+  publication({id});
+  physical_receipts.subscribe(pipeline.image_completion(images, id), id - 1);
+ }
+ REQUIRE(physical.WaitEntered(5s, 2));
+ mmltk::testsupport::await_test_promise(full, "all bounded image file records hold admitted work", 5s);
+ pipeline.execution().join();
+ const auto locked = pipeline.execution().snapshot().normal_locked;
+ std::array<CompileExecution::Completion, admitted> records;
+ for (auto& completion : records) {
+  auto parked = pipeline.execution().try_subscribe(dependency, dependency.generation(),
+   {.kind = CompileTaskKind::Normalize, .work = [](std::size_t, const CompileAllowance&) {}});
+  REQUIRE(parked);
+  completion = std::move(*parked);
+ }
+ for (std::size_t index = 0; index < count; ++index) {
+  const auto id = admitted + index + 1;
+  publication({id});
+  pending_receipts.subscribe(pipeline.image_completion(images, id), index);
+ }
+ mmltk::testsupport::await_test_promise(pending, "pending population exceeds both physical and CPU record banks", 5s);
+ const auto original = std::make_exception_ptr(std::runtime_error("first failure behind full image records"));
+ if (fail) {
+  pipeline.execution().fail(original);
+  pipeline.execution().fail(std::make_exception_ptr(std::runtime_error("later failure must not replace the cause")));
+ } else
+  pipeline.execution().cancel();
+ draining = std::async(std::launch::async, [&] { pipeline.drain(); });
+ pending_receipts.wait();
+ for (const auto& image : pending_receipts.images) {
+  CHECK(image.error);
+  if (fail) CHECK(image.error == original);
+ }
+ CHECK(physical_receipts.settled <= admitted - 2);
+ CHECK(draining.wait_for(0ms) == std::future_status::timeout);
+ for (std::size_t index = 0; index < admitted; ++index)
+  if (physically_started[index]) {
+   CHECK(physical_receipts.images[index].settled == 0);
+   CHECK_FALSE(pipeline.image_completion(images, index + 1).ready());
+  }
+ CHECK(pipeline.execution().snapshot().leased > 0);
+ CHECK(mmltk::common::io::sha256_file(request.output_path) == previous);
+ physical.Release();
+ physical_receipts.wait();
+ if (fail)
+  CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(draining, "failed attempt joins all physical image borrowers", 5s), "first failure behind full image records");
+ else
+  CHECK_THROWS(mmltk::testsupport::await_test_future(draining, "cancelled attempt joins all physical image borrowers", 5s));
+ for (const auto& image : physical_receipts.images) {
+  CHECK(image.error);
+  if (fail) CHECK(image.error == original);
+ }
+ CHECK(pipeline.execution().snapshot().leased == 0);
+ pipeline.retire_attempt();
+ bind_benchmark_slots(pipeline, writer, split);
+ publication({1});
+ CHECK_FALSE(pipeline.image_completion(images, 1));
+ const auto replacement = pipeline.source_publication(images, {}, {}, true);
+ replacement({1});
+ replacement_receipt.subscribe(pipeline.image_completion(images, 1), 0);
+ replacement_receipt.wait();
+ pipeline.drain();
+ CHECK_FALSE(replacement_receipt.images.front().error);
+ CHECK(writer.completed() == 1);
+ CHECK(pipeline.execution().snapshot().leased == 0);
+ CHECK(pipeline.execution().snapshot().normal_locked == locked);
+ CHECK(evidence.bounded);
+ CHECK(evidence.observations > 0);
+ CHECK(mmltk::common::io::sha256_file(request.output_path) == previous);
+}
