@@ -1,5 +1,7 @@
 #pragma once
 #include "src/backend/data/detail/compile_resources.h"
+#include "src/backend/data/detail/compile_workspace.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <array>
 #include <chrono>
@@ -49,8 +51,29 @@ struct CompileCreditObservation {
 struct CompileReservationObservation {
  std::source_location location;
  CompileResources requested;
+ CompileResourceDenial denial = CompileResourceDenial::None;
+ std::uint64_t resource_epoch = 0;
+ std::uint64_t largest_eligible_extent = 0;
  std::vector<CompileCreditObservation> parents, owners;
 };
+struct CompileAdmissionObservation {
+ CompileTaskKind kind = CompileTaskKind::Count;
+ CompileResourceDenial denial = CompileResourceDenial::None;
+ std::uint64_t requested_bytes = 0, opaque_bytes = 0, resource_epoch = 0;
+ std::size_t descriptors = 0, continuation_descriptors = 0, cpu_workers = 0;
+ CompileWorkspaceWindow window = CompileWorkspaceWindow::Task;
+ CompileWorkClass work_class = CompileWorkClass::Count;
+ bool supplied_workspace = false, completion_workspace = false, producer = false, retained_handles = false;
+ std::uint64_t largest_eligible_extent = 0;
+};
+MMLTK_REFLECT_FIELDS(CompileAdmissionObservation)
+struct CompileExecutionCosts {
+ std::uint64_t eligibility_probes = 0, notifier_deliveries = 0, resource_epoch = 0, admission_lock_ns = 0;
+ std::uint64_t callback_ns = 0, completion_callback_ns = 0, workers_created = 0, workers_retired = 0;
+ std::uint64_t submission_attempts = 0, record_denials = 0;
+ bool incomplete = false;
+};
+MMLTK_REFLECT_FIELDS(CompileExecutionCosts)
 struct CompileExecutionSnapshot {
  static constexpr std::size_t classes = static_cast<std::size_t>(CompileWorkClass::Count);
  std::array<bool, classes> live{};
@@ -67,6 +90,10 @@ struct CompileExecutionSnapshot {
  // Physical bounded task calls by CompileTaskKind, collected only when observed.
  std::array<std::uint64_t, static_cast<std::size_t>(CompileTaskKind::Count)> task_completed{}, task_duration_ns{}, task_max_duration_ns{};
  std::optional<CompileReservationObservation> reservation;
+ CompileArenaObservation arena{};
+ CompileExecutionCosts costs{};
+ std::vector<CompileAdmissionObservation> demands;
+ std::array<std::uint64_t, static_cast<std::size_t>(CompileTaskKind::Count)> task_body_ns{}, task_cpu_ns{}, ready_to_start_ns{};
 };
 class CompileResourceWait;
 class CompileExecution final {
@@ -76,6 +103,7 @@ class CompileExecution final {
  struct DependencyState;
  using Credits = CompileAllowance::Credits;
  friend class CompileResourceWait;
+ std::optional<CompileAllowance> try_reserve_observed(CompileResources, const CompileAllowance&, std::source_location, CompileExecutionSnapshot*);
 
 public:
  using Observer = std::function<void(std::string_view, const CompileExecutionSnapshot&)>;

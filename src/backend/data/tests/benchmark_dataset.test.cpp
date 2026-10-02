@@ -2288,8 +2288,20 @@ TEST_CASE("benchmark trace failures are lazy and delivered once", "[backend][dat
 TEST_CASE("benchmark storage releases reservations after diagnostic rejection", "[backend][data][benchmark][trace]") {
  mmltk::testsupport::ScopedTempDir root{"benchmark-storage-trace"};
  std::vector<std::uint64_t> reservations;
+ std::vector<nlohmann::json> preflights;
  const BenchmarkTraceSink sink = [&](std::string_view event, const nlohmann::json& fields) {
-  if (event == "benchmark.storage.reserved") reservations.push_back(fields.at("reserved_bytes").get<std::uint64_t>());
+  if (event == "benchmark.storage.preflight") {
+   preflights.push_back(fields);
+   CHECK(fields.at("capacity_samples") == 1);
+   CHECK(fields.at("retries") == 0);
+   CHECK(fields.contains("duration_ns"));
+  }
+  if (event == "benchmark.storage.reserved") {
+   reservations.push_back(fields.at("reserved_bytes").get<std::uint64_t>());
+   CHECK(fields.at("capacity_samples") == 1);
+   CHECK(fields.at("retries") == 0);
+   CHECK(fields.at("failed") == false);
+  }
   throw std::runtime_error("storage diagnostic failure");
  };
  CHECK_NOTHROW(require_storage(root.path(), 1U, "fixture", sink));
@@ -2302,6 +2314,15 @@ TEST_CASE("benchmark storage releases reservations after diagnostic rejection", 
  CHECK_THROWS_AS(require_storage(root.path(), impossible, "fixture", sink), std::runtime_error);
  CHECK_THROWS_AS(pool.reserve(impossible, "fixture"), std::runtime_error);
  CHECK(reservations.size() == 2U);
+ REQUIRE(preflights.size() == 2U);
+ CHECK(preflights[0].at("failed") == false);
+ CHECK(preflights[1].at("failed") == true);
+ CHECK(preflights[1].at("required_bytes") == impossible);
+ // An invalid path fails before statvfs, while the known demand remains visible.
+ CHECK_THROWS(require_storage(root.path() / std::string(4096, 'x'), 17U, "fixture", sink));
+ REQUIRE(preflights.size() == 3U);
+ CHECK(preflights.back().at("failed") == true);
+ CHECK(preflights.back().at("required_bytes") == 17U);
 }
 TEST_CASE("benchmark sink setup failure reports once without creating a sink", "[backend][data][benchmark][trace]") {
  struct Callback {
@@ -10863,6 +10884,9 @@ TEST_CASE("compile fixed arenas retain pinning while owned label outputs delay r
   .wait();
  CHECK(execution.snapshot().normal_locked == initial);
  CHECK(execution.resource_usage().bytes == bytes);
+ CHECK(execution.snapshot().arena.requested_bytes == bytes);
+ CHECK(execution.snapshot().arena.occupied_bytes >= bytes);
+ CHECK(execution.snapshot().arena.live_allocations == 1);
  CHECK(output.labels.data() == base);
  CHECK_FALSE(execution.try_reserve({.bytes = bytes, .supplied_workspace = true}));
  output = {};
@@ -10872,7 +10896,36 @@ TEST_CASE("compile fixed arenas retain pinning while owned label outputs delay r
  CHECK(execution.resource_usage().bytes == bytes);
  next = {};
  CHECK(execution.resource_usage().bytes == 0);
+ CHECK(execution.snapshot().arena.live_allocations == 0);
+ CHECK(execution.snapshot().arena.ordinary_free_bytes == initial);
  CHECK(execution.snapshot().normal_locked == initial);
+}
+TEST_CASE("scheduled admission observations expose resource predicates and request shapes", "[benchmark][pipeline][resources][trace]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page = mmltk::common::system::host_page_size();
+ std::promise<void> denied;
+ std::atomic<bool> reported{false};
+ CompileExecution execution(1, {}, {.transient_bytes = page}, {}, [&](std::string_view, const CompileExecutionSnapshot& value) {
+  if (std::ranges::any_of(value.demands, [](const auto& request) { return request.denial == CompileResourceDenial::ArenaBusy; }) && !reported.exchange(true))
+   mmltk::testsupport::release_test_promise(denied);
+ });
+ auto held = execution.reserve({.bytes = page, .supplied_workspace = true});
+ const mmltk::testsupport::ScopedTestCleanup release([&] { held = {}; execution.cancel(); });
+ const auto task = execution.submit({.kind = CompileTaskKind::Header, .resources = {.bytes = 1, .supplied_workspace = true}, .work = [](std::size_t, const CompileAllowance&) {}});
+ mmltk::testsupport::await_test_promise(denied, "scheduled demand exposes its exact arena denial");
+ const auto value = execution.snapshot();
+ REQUIRE(value.demands.size() == 1);
+ CHECK(value.demands.front().kind == CompileTaskKind::Header);
+ CHECK(value.demands.front().requested_bytes == 1);
+ CHECK(value.demands.front().largest_eligible_extent == 0);
+ CHECK(value.arena.occupied_bytes == page);
+ CHECK(value.arena.requested_bytes == page);
+ CHECK(value.costs.eligibility_probes > 0);
+ CHECK(value.costs.resource_epoch > 0);
+ held = {};
+ task.wait();
+ execution.join();
+ CHECK(execution.snapshot().arena.live_allocations == 0);
 }
 // CLEANUP-IGNORE: Independent arena cases select the same window parameters and page size; their execution and ownership assertions differ.
 TEST_CASE("one exceptional arena finishes its retained lineage and returns to the fixed bank", "[benchmark][pipeline][resources]") {
@@ -11293,6 +11346,48 @@ TEST_CASE("sealed pixel plans validate custody and geometry before writing the d
  RgbImageResizer resizer(1, perceptual);
  resizer.resize_to_planar({rgb.data(), {4, 2, 12, 0, rgb.size(), RgbPixelFormat::RGB8}}, {reference.data(), plan.destination()}, mode);
  CHECK(output == reference);
+}
+TEST_CASE("pixel cost observations retain exact plan facts and cannot change failed or successful writes", "[backend][data][writer][trace]") {
+ using namespace mmltk::backend::data::detail;
+ using namespace mmltk::backend::data::testsupport;
+ using namespace mmltk::backend::imaging::resample;
+ const auto encoding = GENERATE(FixtureImageEncoding::Png, FixtureImageEncoding::Jpeg);
+ const auto input = profile_image_fixture(8, 6, encoding);
+ CompileImageDecoder decoder;
+ const auto header = decoder.read_header(input.encoded, CompileImagePolicy::Benchmark);
+ const auto plan = compile_pixel_workspace_plan(header, 4, ImageResizeMode::Stretch, true);
+ CHECK(plan.resize_plan().path(header.width, header.height) == RgbResizePath::PerceptualFractional);
+ CompileExecution execution(1, {}, {.transient_bytes = plan.bytes()});
+ CompilePixelWorkspace pixels;
+ std::vector<float> output(4 * 4 * 3, -1), unobserved(output);
+ std::vector<CompilePixelObservation> observations;
+ const CompilePixelObserver observer = [&](const CompilePixelObservation& value) {
+  observations.push_back(value);
+  throw std::runtime_error("diagnostic delivery failure");
+ };
+ execution.run(CompileTaskKind::Pixels, plan.resources(), [&](std::size_t) {
+  const auto memory = execution.current_allowance().workspace();
+  auto wrong = header;
+  ++wrong.width;
+  CHECK_THROWS_AS(pixels.write(plan, input.encoded, wrong, memory, {output.data(), plan.destination()}, +[] {}, observer), CompileImageError);
+  CHECK(std::ranges::all_of(output, [](float value) { return value == -1; }));
+  pixels.write(plan, input.encoded, header, memory, {output.data(), plan.destination()}, +[] {}, observer);
+  pixels.write(plan, input.encoded, header, memory, {unobserved.data(), plan.destination()});
+ });
+ REQUIRE(observations.size() == 2);
+ CHECK(observations[0].failed);
+ CHECK(observations[0].stage == CompilePixelStage::Validation);
+ CHECK_FALSE(observations[1].failed);
+ CHECK(observations[1].stage == CompilePixelStage::Complete);
+ CHECK(observations[1].codec == header.encoding);
+ CHECK(observations[1].path == plan.resize_plan().path(header.width, header.height));
+ CHECK(observations[1].requested_bytes == plan.bytes());
+ CHECK(observations[1].opaque_bytes == plan.resources().opaque_bytes);
+ CHECK(observations[1].output_bytes == output.size() * sizeof(float));
+ CHECK(output == unobserved);
+ CHECK(execution.snapshot().costs.eligibility_probes == 0);
+ CHECK(execution.snapshot().costs.admission_lock_ns == 0);
+ CHECK(execution.snapshot().arena.live_allocations == 0);
 }
 TEST_CASE("pixel preparation permits independent publication completion and retirement", "[backend][data][benchmark][pipeline]") {
  if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPUs");

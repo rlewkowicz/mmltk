@@ -86,6 +86,7 @@ struct CompileAdmission {
  struct Eligibility {
   bool fits = false;
   std::uint64_t loan_bytes = 0;
+  CompileResourceDenial denial = CompileResourceDenial::None;
  };
  std::shared_ptr<CompileArenaBank> arenas;
  std::mutex mutex;
@@ -127,8 +128,11 @@ struct CompileAdmission {
   notify(Change::Resources);
  }
  bool tracing = false;
+ mutable std::uint64_t eligibility_probes = 0;
+ std::uint64_t resource_epoch = 0, admission_lock_ns = 0;
  std::vector<Credits*> observed_credits;
  void notify(Change change) noexcept {
+  if (tracing && change == Change::Resources) ++resource_epoch;
   // Pressure registration must not invalidate its own failed reserve attempt.
   if (change != Change::Pressure) ++generation;
   changed.notify_all();
@@ -187,36 +191,37 @@ struct CompileAdmission {
  // gives the exact participating draw used by charge under this same mutex.
  [[nodiscard]] Eligibility eligibility(
   CompileResources value, const Credits* parent = nullptr, bool finite_consumer = false, std::uint64_t retiring_bytes = 0, std::uint64_t retiring_arena_bytes = 0) const {
-  if (!feasible(value)) return {};
+  if (tracing) ++eligibility_probes;
+  if (!feasible(value)) return {.denial = CompileResourceDenial::Infeasible};
   if (draining_request && value.bytes && !value.retained_handles && !(value.supplied_workspace && value.bytes == draining_bytes && parent == draining_parent) && !(parent && finite_consumer))
-   return {};
-  if (arenas && arenas->exceptional_active() && value.bytes && !exceptional_custody(parent)) return {};
+   return {.denial = CompileResourceDenial::ExceptionalDrain};
+  if (arenas && arenas->exceptional_active() && value.bytes && !exceptional_custody(parent)) return {.denial = CompileResourceDenial::ExceptionalLineage};
   if (value.supplied_workspace && value.bytes && arenas) {
    if (!arenas->fits(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window)) {
     // A shape exceeding every normal contiguous context has one exclusive
     // exceptional route. Busy fitting contexts remain ordinary resource waits.
     const auto occupied = arenas->snapshot().leased;
-    if (arenas->exceptional_active() || occupied > retiring_arena_bytes) return {};
+    if (arenas->exceptional_active() || occupied > retiring_arena_bytes) return {.denial = CompileResourceDenial::ArenaBusy};
     if (!arenas->normal_fit(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window)) {
      std::uint64_t lineage = 0;
      for (auto* credit = parent; credit; credit = credit->parent.get())
       if (!credit->resources.retained_handles) lineage += credit->resources.bytes;
-     if (bytes - std::min(bytes, retiring_bytes) != lineage) return {};
+     if (bytes - std::min(bytes, retiring_bytes) != lineage) return {.denial = CompileResourceDenial::RetainedLineage};
     }
    }
   }
-  if (value.cpu_workers && (value.cpu_workers > cpu_capacity - std::min(cpu_capacity, protected_cpus) || external_cpus + active > cpu_capacity - value.cpu_workers)) return {};
-  if (value.descriptors + value.continuation_descriptors > descriptor_room(value, parent)) return {};
+  if (value.cpu_workers && (value.cpu_workers > cpu_capacity - std::min(cpu_capacity, protected_cpus) || external_cpus + active > cpu_capacity - value.cpu_workers)) return {.denial = CompileResourceDenial::Cpu};
+  if (value.descriptors + value.continuation_descriptors > descriptor_room(value, parent)) return {.denial = CompileResourceDenial::Descriptors};
   if (fits_bytes(value, parent, retiring_bytes)) return {.fits = true};
-  if (!finite_consumer || value.producer || value.cpu_workers || value.retained_handles || !value.bytes || value.bytes > target) return {};
+  if (!finite_consumer || value.producer || value.cpu_workers || value.retained_handles || !value.bytes || value.bytes > target) return {.denial = CompileResourceDenial::Bytes};
   const auto remaining = bytes - std::min(bytes, retiring_bytes);
-  if (offered_bytes > remaining) return {};
+  if (offered_bytes > remaining) return {.denial = CompileResourceDenial::LoanCapacity};
   std::uint64_t loaned = 0;
   for (const auto& offer : workspace_offers) loaned += offer->lent;
   const auto uncovered = remaining - loaned;
   const auto room = target - value.bytes;
   const auto needed = uncovered > room ? uncovered - room : 0;
-  if (needed > offered_bytes - loaned) return {};
+  if (needed > offered_bytes - loaned) return {.denial = CompileResourceDenial::LoanCapacity};
   return {.fits = true, .loan_bytes = needed};
  }
  // Returned child promises pass through ancestors whose descriptor work has

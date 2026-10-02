@@ -8,6 +8,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 import errno
 import glob
 import heapq
@@ -1779,6 +1780,77 @@ class Retained:
         return self.key < other.key if self.tail else self.key > other.key
 
 
+class Statistics:
+    """Bounded streaming aggregates over query matches, independent of row retention.
+
+    Each source/run/clock is independent. Integer sums and bucket boundaries
+    remain exact; rational accumulation also avoids intermediate float overflow.
+    """
+    def __init__(self, fields, bucket_ms):
+        self.fields = fields
+        self.width = bucket_ms * 1000000 if bucket_ms else None
+        self.groups = {}
+
+    def include(self, record, group):
+        recorded_run = record.get("run_id")
+        if recorded_run is MISSING or isinstance(recorded_run, (dict, list, bool)):
+            recorded_run = None
+        scope = (record.get("@run"), encoded(recorded_run), record.source, record.clock, group)
+        buckets = [None]
+        if self.width and record.time_ns is not None:
+            buckets.append(record.time_ns // self.width * self.width)
+        for bucket in buckets:
+            key = (*scope, bucket)
+            if key not in self.groups:
+                if len(self.groups) == MAX_DISTINCT_KEYS:
+                    raise QueryError(f"statistics exceed {MAX_DISTINCT_KEYS} groups/buckets; narrow inputs or increase --bucket-ms")
+                self.groups[key] = {"events": 0, "first_line": record.line, "last_line": record.line,
+                                    "first_ns": record.time_ns, "last_ns": record.time_ns,
+                                    "fields": {name: {"count": 0, "missing": 0, "invalid": 0,
+                                                      "sum": 0, "min": None, "max": None} for name in self.fields}}
+            row = self.groups[key]
+            row["events"] += 1
+            row["last_line"] = record.line
+            if record.time_ns is not None:
+                row["first_ns"] = min(row["first_ns"], record.time_ns) if row["first_ns"] is not None else record.time_ns
+                row["last_ns"] = max(row["last_ns"], record.time_ns) if row["last_ns"] is not None else record.time_ns
+            for name, values in row["fields"].items():
+                value = record.get(name)
+                if value is MISSING or value is None:
+                    values["missing"] += 1
+                    continue
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or isinstance(value, float) and not math.isfinite(value):
+                    values["invalid"] += 1
+                    continue
+                number = Fraction(str(value))
+                total = values["sum"] + number
+                if max(total.numerator.bit_length(), total.denominator.bit_length()) > 8192:
+                    raise QueryError("statistics numeric capacity exceeds 8192 bits; narrow inputs")
+                values["sum"] = total
+                values["count"] += 1
+                values["min"] = value if values["min"] is None else min(values["min"], value)
+                values["max"] = value if values["max"] is None else max(values["max"], value)
+
+    @staticmethod
+    def number(value):
+        # Exact integers stay JSON integers; nonintegral results are exact
+        # rational strings, avoiding rounded uint64 means and overflow to inf.
+        return value.numerator if value.denominator == 1 else f"{value.numerator}/{value.denominator}"
+
+    def render(self, output, names):
+        for (run, recorded_run, source, clock, group, bucket), row in self.groups.items():
+            result = {"run": run, "recorded_run": json.loads(recorded_run), "source": source, "clock": clock,
+                      "group": dict(zip(names, (json.loads(value) for value in group))),
+                      **{name: value for name, value in row.items() if name != "fields"}}
+            if bucket is not None:
+                result.update(bucket_start_ns=bucket, bucket_end_ns=bucket + self.width,
+                              events_per_second=self.number(Fraction(row["events"] * 1000000000, self.width)))
+            result["fields"] = {name: {**values, "sum": self.number(Fraction(values["sum"])),
+                                       "mean": self.number(Fraction(values["sum"], values["count"])) if values["count"] else None}
+                                for name, values in row["fields"].items()}
+            print("Statistics " + json.dumps(result, ensure_ascii=True, allow_nan=False), file=output)
+
+
 class QueryResult:
     def __init__(self, options):
         self.options = options
@@ -1792,6 +1864,7 @@ class QueryResult:
         self.parse_examples = []
         self.files = Counter()
         self.groups = Counter()
+        self.statistics = Statistics(options.stats, options.bucket_ms) if options.stats or options.bucket_ms else None
         self.clocks = {}
         self.retained = []
         self.terminals = {}
@@ -1855,6 +1928,8 @@ class QueryResult:
             if group not in self.groups and len(self.groups) == MAX_DISTINCT_KEYS:
                 raise QueryError(f"group count exceeds {MAX_DISTINCT_KEYS}; narrow the query or --group-by")
             self.groups[group] += 1
+            if reason == "query" and self.statistics:
+                self.statistics.include(record, group)
             bounds = self.clocks.setdefault(record.clock, [record.time_ns, record.time_ns])
             if record.time_ns is not None:
                 bounds[0] = min(bounds[0], record.time_ns)
@@ -3946,6 +4021,8 @@ def render(result, options, output, diagnostics):
     )
     if options.representatives:
         status += " One representative per --group-by value; occurrences count all selected records."
+    if result.statistics:
+        result.statistics.render(output if options.format == "summary" else diagnostics, options.group_by)
     if result.lookup:
         lookup = result.lookup
         report = output if options.format == "summary" else diagnostics
@@ -4041,6 +4118,7 @@ Examples:
       -q '@event:loaded_library OR @event:library_inventory' --format timeline --limit 70
   ./mmltk --logs -q '@event=firefox.workspace.ready' --correlate @surface
   ./mmltk --logs -q 'duration_ns>=1000000' --fields @event,duration_ns,trace_id
+  ./mmltk --logs run.jsonl --stats duration_ns --stats bytes --bucket-ms 1000
   ./mmltk --logs --where '@file:"latest-wayland-test"' --group-by @event
   ./mmltk --logs --family latest-wayland-test --errors --related-run --tail
   ./mmltk --logs --family latest-wayland-test --history --list-runs
@@ -4147,6 +4225,20 @@ Vulkan layer diagnostics:
   --no-auto-correlate disables the automatic joins in human timelines.
 
 Inputs and ordering:
+  --stats FIELD (repeatable, at most 32 distinct fields) aggregates all exact
+  query matches independently of --limit/--top; related/context rows do not
+  contribute. Each artifact run, explicit run_id, source, clock and --group-by
+  value remains separate. Missing/null and invalid/nonfinite values have
+  separate counters. Sum/mean retain exact integer arithmetic; nonintegral
+  results are exact numerator/denominator strings. Accumulators are bounded to
+  8192 bits and 10000 total groups/buckets; overflow fails explicitly.
+  --bucket-ms N adds half-open [start,end) clock-local buckets, anchored at that
+  clock's zero, using exact integer nanoseconds. Rates divide observed events
+  by the requested full bucket width; edge buckets may be partial captures.
+  Untimed rows contribute only to totals. Statistics include first/last
+  physical line and timestamp anchors. JSONL keeps projected rows on stdout
+  and writes Statistics JSON objects to stderr. No cross-clock alignment or
+  capture-completeness inference is performed.
   Paths/globs are repository-relative or absolute within the repository.
   Directories select .jsonl/.log/.out/.txt and Mozilla process logs; --recursive includes histories.
   Explicit files can have any suffix. Repeated paths are deduplicated.
@@ -4334,6 +4426,10 @@ def argument_parser():
     parser.add_argument("--format", choices=("summary", "timeline", "jsonl"), default="summary")
     parser.add_argument("--fields", help="comma-separated output field projection; provenance is always retained")
     parser.add_argument("--group-by", default="@owner,@event", help="comma-separated summary grouping fields")
+    parser.add_argument("--stats", action="append", default=[], metavar="FIELD",
+                        help="numeric count/sum/min/max/mean over all matches per source/run/clock/group; repeatable (max 32)")
+    parser.add_argument("--bucket-ms", type=bounded_integer(1, 86400000), metavar="N",
+                        help="also aggregate event rates/statistics in exact clock-local buckets (max 10000 aggregate rows)")
     parser.add_argument("--representatives", action="store_true",
                         help="retain one first record per --group-by value, with full occurrence counts")
     parser.add_argument("--top", type=bounded_integer(1, 100),
@@ -4385,6 +4481,11 @@ def main(argv=None, *, root=None, output=None, diagnostics=None):
                              "--correlate, --related-run, --error, or --triage")
         options.fields = field_names(options.fields) if options.fields else ()
         options.group_by = field_names(options.group_by)
+        options.stats = tuple(dict.fromkeys(name for field in options.stats for name in field_names(field)))
+        if len(options.stats) > 32:
+            raise QueryError("--stats accepts at most 32 distinct fields")
+        if (options.stats or options.bucket_ms) and (options.triage or options.list_runs):
+            raise QueryError("statistics require the streaming query and cannot combine with --triage or --list-runs")
         options.top = options.top or (5 if options.triage else 10)
         options.order = options.order or ("proximity" if options.error is not None else "time")
         if options.order == "proximity" and options.error is None:

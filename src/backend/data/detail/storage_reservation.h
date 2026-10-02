@@ -22,6 +22,8 @@ public:
   const std::filesystem::path& path;
   std::string_view description;
   std::uint64_t required, outstanding, available;
+  std::uint64_t capacity_samples = 0, retries = 0, duration_ns = 0;
+  bool failed = false;
  };
  using Observer = std::function<void(const Observation&)>;
  class Reservation final {

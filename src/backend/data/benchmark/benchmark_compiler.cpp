@@ -776,11 +776,17 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
  pipeline.drain();
  if (selection_started) selection_started();
  std::array<std::vector<std::uint32_t>, 2> selected;
+ std::uint64_t rows_revisited = 0;
+ BenchmarkCostSpan selection_cost(trace, BenchmarkCostKind::Selection, [&] {
+  return nlohmann::json{{"rows_revisited", rows_revisited}, {"selected_train", selected[0].size()}, {"selected_validation", selected[1].size()},
+   {"stock_validation_generation", recipe->stock_validation_generation}};
+ });
  std::array<std::uint64_t, 2> boxes{}, runs{};
  std::map<BenchmarkDatasetSource, std::uint64_t> eligible_by_source;
  BenchmarkCompletionWindow restored(std::clamp<std::size_t>(pipeline.execution().workers() * 2, 2, 64));
  const auto select = [&](const NormalizedAnnotationReadView& index, std::size_t position, const CoconutPhysicalImage& physical, const CoconutComponent* component, std::uint64_t original_generation,
                       bool val) {
+  if (trace) ++rows_revisited;
   const auto& image = index.image(position);
   const auto physical_member = membership.find(physical.source, physical.image_id);
   if (!physical_member || *physical_member != physical) {
@@ -848,6 +854,7 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
  }
  pipeline.drain();
  restored.drain();
+ selection_cost.finish();
  for (auto& slots : selected) std::erase(slots, std::numeric_limits<std::uint32_t>::max());
  progress.source_images(BenchmarkDatasetSource::kCoconut, selected[0].size() + selected[1].size(), selected[0].size() + selected[1].size());
  progress.source_complete(BenchmarkDatasetSource::kCoconut, recipe->annotation_cache_hit);

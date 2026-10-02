@@ -10947,6 +10947,30 @@ TEST_CASE("native staging retains its record while a competing image waits for t
  CHECK(pipeline.execution().snapshot().leased == 0);
  CHECK(bounded);
 }
+TEST_CASE("Coconut cost spans preserve disabled and unwinding diagnostic behavior", "[benchmark][coconut][trace]") {
+ std::size_t constructions = 0;
+ const auto fields = [&] { ++constructions; return Json{{"rows_revisited", 18446744073709551615ULL}}; };
+ {
+  const BenchmarkTraceSink disabled;
+  BenchmarkCostSpan quiet(disabled, BenchmarkCostKind::RecoveryDrain, fields);
+  quiet.finish();
+ }
+ CHECK(constructions == 0);
+ std::vector<std::pair<std::string, Json>> records;
+ const BenchmarkTraceSink enabled = [&](std::string_view event, const Json& value) {
+  records.emplace_back(event, value);
+  throw std::runtime_error("diagnostics cannot replace the source failure");
+ };
+ CHECK_THROWS_WITH([&] {
+  BenchmarkCostSpan span(enabled, BenchmarkCostKind::RecoveryDrain, fields);
+  throw std::runtime_error("source failed");
+ }(), "source failed");
+ REQUIRE(records.size() == 2);
+ CHECK(records[0].first == "benchmark.cost.started");
+ CHECK(records[1].first == "benchmark.cost.completed");
+ CHECK(records[1].second.at("failed") == true);
+ CHECK(records[1].second.at("rows_revisited").get<std::uint64_t>() == UINT64_MAX);
+}
 TEST_CASE("admitted physical headers recover labels before the same image finishes pixels", "[benchmark][coconut][pipeline][recovery]") {
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires independent extraction, pixels and recovery lanes");

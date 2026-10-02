@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "src/frameworks/reflection/reflection_metadata.h"
 namespace mmltk::backend::data {
 struct ImageEntry;
 struct FileHeader;
@@ -25,6 +26,13 @@ struct BenchmarkLabelChunk;
 }  // namespace benchmark_internal
 }  // namespace mmltk::backend::data
 namespace mmltk::backend::data::testsupport {
+enum class FixtureImageEncoding : std::uint8_t { Png, Jpeg };
+MMLTK_REFLECT_ENUM(FixtureImageEncoding)
+struct ProfileImageFixture {
+ std::uint32_t width = 0, height = 0;
+ std::vector<std::uint8_t> encoded;
+};
+[[nodiscard]] ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t height, FixtureImageEncoding, std::uint32_t seed = 7);
 // Enabled only by MMLTK_TEST_BENCHMARK_TRACE for focused failure diagnosis.
 [[nodiscard]] benchmark_internal::BenchmarkTraceSink benchmark_trace();
 // Seed the mixed known/unknown Coconut extents at the reported progress boundary.

@@ -607,6 +607,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
     return;
    }
    trace_benchmark_event(trace, "benchmark.annotations.inputs_wait", [&] { return nlohmann::json{{"release", release.name}, {"part", cache_tag}}; });
+   BenchmarkCostSpan input_wait(trace, BenchmarkCostKind::PhysicalWait, [&] { return nlohmann::json{{"release", release.name}, {"part", cache_tag}, {"path", lifecycle.string()}}; });
    retained.lease = ArtifactLease::acquire_charged(lifecycle, cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources(), parent);
    source_lease = retained.lease;
    trace_benchmark_event(trace, "benchmark.annotations.inputs_acquired", [&] { return nlohmann::json{{"release", release.name}, {"part", cache_tag}}; });
@@ -1023,7 +1024,11 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    row_progress(std::max(rows, admitted));
   }
   release_inputs();
+  BenchmarkCostSpan physical_wait(trace, BenchmarkCostKind::PhysicalWait, [&] {
+   return nlohmann::json{{"release", release.name}, {"input_identity", identity}, {"components", components.size()}};
+  });
   physical.wait_sources(release.edition);
+  physical_wait.finish();
   for (const auto& component : components)
    for (const auto& image : component.inventory()) {
     try {
@@ -1439,7 +1444,9 @@ CoconutRecipePreparation prepare_coconut_recipe(const BenchmarkCompilerConfig& c
   facts["covered_by_large_images"] = facts["offered_images"].get<std::uint64_t>() - admitted;
   facts["selected_annotation_sha256"] = found == prepared.components.end() ? nlohmann::json(nullptr) : nlohmann::json(found->index().annotation_sha256);
  }
+ BenchmarkCostSpan physical_wait(trace, BenchmarkCostKind::PhysicalWait, [&] { return nlohmann::json{{"sources", acquired.size()}}; });
  physical.wait_sources();
+ physical_wait.finish();
  for (const auto& admitted : acquired) {
   const auto& archive = admitted.origin;
   prepared.manifest["artifacts"].push_back(

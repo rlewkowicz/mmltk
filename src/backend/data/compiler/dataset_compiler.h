@@ -26,12 +26,14 @@ namespace mmltk::backend::data {
 namespace detail {
 enum class CompileTaskKind : std::uint8_t;
 struct CompileExecutionSnapshot;
+struct CompilePixelObservation;
 }  // namespace detail
 // Optional effect-only observations. Callbacks never govern slot identity or admission.
 struct DirectoryCompileObservation {
  void* context = nullptr;
  void (*task)(void*, detail::CompileTaskKind, std::uint32_t, bool completed) = nullptr;
  void (*execution)(void*, std::string_view, const detail::CompileExecutionSnapshot&) = nullptr;
+ void (*pixel)(void*, std::uint32_t, const detail::CompilePixelObservation&) = nullptr;
 };
 namespace compiler_internal {
 struct ProgressCounter;

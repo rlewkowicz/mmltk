@@ -4,6 +4,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/detail/compile_pixel_workspace.h"
 #include "src/backend/data/detail/compile_workspace.h"
+#include "src/backend/data/detail/compile_observation.h"
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_input.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
@@ -413,40 +414,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  Impl(std::size_t workers, std::span<const int> cpus, detail::CompileExecutionLimits limits, mmltk::common::concurrency::CancellationObservation cancel, BenchmarkTraceSink trace_sink)
      : execution(workers, cpus, limits, cancel,
         trace_sink ? CompileExecution::Observer{[trace_sink](std::string_view event, const detail::CompileExecutionSnapshot& value) {
-         if (value.reservation) {
-          trace_benchmark_event(trace_sink, "benchmark.resource.wait", [&] {
-           const auto& request = *value.reservation;
-           nlohmann::json result{
-            {"file", request.location.file_name()}, {"line", request.location.line()}, {"function", request.location.function_name()}, {"requested_bytes", request.requested.bytes},
-            {"requested_descriptors", request.requested.descriptors}, {"requested_continuation", request.requested.continuation_descriptors}, {"producer", request.requested.producer},
-            {"held_bytes", value.resources.bytes}, {"byte_target", value.byte_target}, {"held_descriptors", value.resources.descriptors},
-            {"committed_descriptors", value.resources.continuation_descriptors}, {"descriptor_limit", value.descriptor_limit}, {"parents", nlohmann::json::array()}, {"owners", nlohmann::json::array()}
-           };
-           for (const auto& credit : request.parents)
-            result["parents"].push_back(
-             {{"bytes", credit.resources.bytes}, {"descriptors", credit.resources.descriptors}, {"available", credit.available}, {"borrowed", credit.borrowed},
-              {"descriptors_retired", credit.descriptors_retired}, {"continuations_released", credit.continuations_released}});
-           for (const auto& credit : request.owners)
-            result["owners"].push_back(
-             {{"id", credit.id}, {"parent", credit.parent}, {"file", credit.location.file_name()}, {"line", credit.location.line()}, {"bytes", credit.resources.bytes},
-              {"descriptors", credit.resources.descriptors}, {"available", credit.available}, {"borrowed", credit.borrowed}});
-           return result;
-          });
-          return;
-         }
-         trace_benchmark_event(trace_sink, event, [&] {
-          return nlohmann::json{
-           {"live", value.live}, {"baseline", value.baseline}, {"elastic", value.elastic}, {"ready", value.ready}, {"parked", value.parked}, {"running", value.running}, {"active", value.active},
-           {"external", value.external}, {"services", value.services}, {"bytes", value.resources.bytes}, {"byte_target", value.byte_target}, {"normal_locked", value.normal_locked},
-           {"resident", value.resident}, {"leased", value.leased}, {"exceptional", value.exceptional}, {"exceptional_peak", value.exceptional_peak}, {"opaque_library", value.opaque_library},
-           {"protected_workspace", value.protected_workspace}, {"shared_workspace", value.shared_workspace}, {"compaction_workspace", value.compaction_workspace},
-           {"workspace_contexts", value.workspace_contexts}, {"context_capacity", value.context_capacity}, {"exceptional_reserved", value.exceptional_reserved},
-           {"workspace_reuses", value.workspace_reuses}, {"physical_retirements", value.physical_retirements}, {"descriptors", value.resources.descriptors},
-           {"descriptor_limit", value.descriptor_limit}, {"descriptor_promises", value.resources.continuation_descriptors}, {"records", value.records}, {"record_limit", value.record_limit},
-           {"admitted", value.admitted}, {"completed", value.completed}, {"task_completed", value.task_completed}, {"task_duration_ns", value.task_duration_ns},
-           {"task_max_duration_ns", value.task_max_duration_ns}
-          };
-         });
+         trace_compile_execution(trace_sink, value.reservation ? "benchmark.resource.wait" : event, value);
         }}
                    : CompileExecution::Observer{},
         std::make_exception_ptr(std::runtime_error("benchmark dataset compilation cancelled"))),
@@ -1355,7 +1323,9 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
  return true;
 }
 void BenchmarkCompilePipeline::Impl::dispatch() {
+ detail::CompileObservationClock dispatch_clock{bool(trace)};
  std::unique_lock lock(mutex);
+ const auto lock_ns = trace ? dispatch_clock.lap() : 0;
  // A session can fail while projection or unrelated physical I/O still runs.
  // Observe that cause even when file capacity cannot admit another operation.
  if (!failure && !stopping) failure = execution.interruption();
@@ -1415,6 +1385,7 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
  std::array<bool, pixel_stage_count> blocked{};
  auto eligible = pixels.ready_stages();
  std::size_t image_head_probes = 0, image_admitted = 0;
+ bool any_admitted = false;
  for (;;) {
   bool accepted = admit_output();
   if (labels_first) accepted = images.admit_labels() || accepted;
@@ -1433,6 +1404,7 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
    eligible &= ~(std::uint32_t{1} << stage);
   }
   if (!labels_first) accepted = images.admit_labels() || accepted;
+  if (trace) any_admitted |= accepted;
   labels_first = !labels_first;
   if (!accepted) break;
  }
@@ -1440,11 +1412,13 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
   const auto queued = pixels.counts();
   const auto pending_images = pixels.size();
   const auto outputs = label_outputs.size();
+  const auto body_ns = dispatch_clock.elapsed();
   lock.unlock();
   trace_benchmark_event(trace, "benchmark.pipeline.ready", [&] {
    return nlohmann::json{
     {"header", queued[0]}, {"workspace", queued[1]}, {"input", queued[2]}, {"output", queued[3]}, {"pixels", queued[4]}, {"pending_images", pending_images}, {"image_head_probes", image_head_probes},
     {"image_admitted", image_admitted}, {"label_outputs", outputs}, {"stage_records_blocked", blocked}, {"label_file_records_blocked", file_full}
+    , {"empty_dispatch", !any_admitted}, {"lock_wait_ns", lock_ns}, {"body_ns", body_ns}
    };
   });
  }

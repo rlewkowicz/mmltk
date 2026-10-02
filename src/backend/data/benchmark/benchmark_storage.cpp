@@ -32,23 +32,21 @@ std::uint64_t additional_download_bytes(const std::filesystem::path& destination
  const auto allocated = download_allocation(destination);
  return expected > allocated ? expected - allocated : 0;
 }
-void require_storage(const std::filesystem::path& path, std::uint64_t required, const char* description, const BenchmarkTraceSink& trace) {
- detail::StorageReservationPool::Observer observe;
- if (trace)
-  observe = [trace](const detail::StorageReservationPool::Observation& value) {
-   trace_benchmark_event(trace, "benchmark.storage.preflight",
-    [&] { return nlohmann::json{{"target", value.description}, {"path", value.path.string()}, {"required_bytes", value.required}, {"available_bytes", value.available}}; });
-  };
- detail::StorageReservationPool::require_capacity(path, required, description, std::move(observe));
-}
-detail::StorageReservationPool::Observer storage_observer(const BenchmarkTraceSink& trace) {
+namespace {
+detail::StorageReservationPool::Observer observe_storage(const BenchmarkTraceSink& trace, bool preflight) {
  if (!trace) return {};
- return [trace](const detail::StorageReservationPool::Observation& value) {
-  trace_benchmark_event(trace, "benchmark.storage.reserved", [&] {
-   return nlohmann::json{{"target", value.description}, {"path", value.path.string()}, {"required_bytes", value.required}, {"reserved_bytes", value.outstanding}, {"available_bytes", value.available}};
+ return [trace, preflight](const detail::StorageReservationPool::Observation& value) {
+  trace_benchmark_event(trace, preflight ? "benchmark.storage.preflight" : value.failed ? "benchmark.storage.capacity_failed" : "benchmark.storage.reserved", [&] {
+   return nlohmann::json{{"target", value.description}, {"path", value.path.string()}, {"required_bytes", value.required}, {"reserved_bytes", value.outstanding}, {"available_bytes", value.available},
+    {"capacity_samples", value.capacity_samples}, {"retries", value.retries}, {"duration_ns", value.duration_ns}, {"failed", value.failed}};
   });
  };
 }
+} // namespace
+void require_storage(const std::filesystem::path& path, std::uint64_t required, const char* description, const BenchmarkTraceSink& trace) {
+ detail::StorageReservationPool::require_capacity(path, required, description, observe_storage(trace, true));
+}
+detail::StorageReservationPool::Observer storage_observer(const BenchmarkTraceSink& trace) { return observe_storage(trace, false); }
 detail::StorageReservationPool::Reservation reserve_download(detail::StorageReservationPool& storage, const std::filesystem::path& path, std::uint64_t expected, std::string_view description) {
  return storage.reserve(expected, description, download_allocation(path));
 }

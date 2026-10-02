@@ -25,8 +25,10 @@ struct RgbMutableImageView {
  RgbImageLayout layout{};
 };
 enum class ImageResizeMode : std::uint8_t { Stretch, Letterbox };
+enum class RgbResizePath : std::uint8_t { Identity, PerceptualInteger, PerceptualFractional, Avir };
 #if !defined(__CUDACC__)
 MMLTK_REFLECT_ENUM(ImageResizeMode)
+MMLTK_REFLECT_ENUM(RgbResizePath)
 #endif
 struct ImageResizeGeometry {
  std::uint32_t resized_width = 0;
@@ -47,6 +49,7 @@ struct RgbResizeWorkspacePlan {
  std::size_t avir_bytes = 0, byte_output_bytes = 0, perceptual_bytes = 0;
  std::uint32_t width = 0, height = 0;
  bool alpha = false, perceptual = false;
+ [[nodiscard]] RgbResizePath path(std::uint32_t source_width, std::uint32_t source_height) const noexcept;
  [[nodiscard]] std::size_t bytes() const;
 };
 class RgbImageResizer {

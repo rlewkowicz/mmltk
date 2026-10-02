@@ -22,6 +22,28 @@
 #include <vector>
 namespace fs = std::filesystem;
 namespace mmltk::backend::data::testsupport {
+ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t height, FixtureImageEncoding encoding, std::uint32_t seed) {
+ if (!width || !height || width > MAX_IMAGE_EXTENT || height > MAX_IMAGE_EXTENT) throw std::invalid_argument("profile fixture geometry is invalid");
+ if (std::uint64_t(width) * height * 3 > (256ULL << 20)) throw std::length_error("profile synthetic image exceeds 256 MiB");
+ ProfileImageFixture result{width, height, {}};
+ std::vector<std::uint8_t> rgb(std::size_t(width) * height * 3);
+ for (std::size_t i = 0; i < rgb.size(); ++i) {
+  seed ^= seed << 13;
+  seed ^= seed >> 17;
+  seed ^= seed << 5;
+  rgb[i] = static_cast<std::uint8_t>(seed);
+ }
+ const auto append = +[](void* context, void* data, int bytes) {
+  auto& target = *static_cast<std::vector<std::uint8_t>*>(context);
+  const auto* begin = static_cast<std::uint8_t*>(data);
+  target.insert(target.end(), begin, begin + bytes);
+ };
+ const auto written = encoding == FixtureImageEncoding::Jpeg
+  ? stbi_write_jpg_to_func(append, &result.encoded, static_cast<int>(width), static_cast<int>(height), 3, rgb.data(), 95)
+  : stbi_write_png_to_func(append, &result.encoded, static_cast<int>(width), static_cast<int>(height), 3, rgb.data(), static_cast<int>(width * 3));
+ if (!written) throw std::runtime_error("cannot encode profile fixture");
+ return result;
+}
 benchmark_internal::BenchmarkTraceSink benchmark_trace() {
  if (!std::getenv("MMLTK_TEST_BENCHMARK_TRACE")) return {};
  return [](std::string_view event, const nlohmann::json& fields) { std::fprintf(stderr, "%s\n", nlohmann::json{{"event", event}, {"payload", fields}}.dump().c_str()); };

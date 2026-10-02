@@ -1182,6 +1182,56 @@ class FileQueryTests(unittest.TestCase):
         status, output, diagnostics = self.run_query(*arguments, "--format", "jsonl")
         return status, [json.loads(line) for line in output.splitlines()], diagnostics
 
+    def statistics(self, *arguments):
+        status, output, diagnostics = self.run_query(*arguments)
+        values = [json.loads(line.removeprefix("Statistics ")) for line in (output + diagnostics).splitlines() if line.startswith("Statistics ")]
+        return status, values, output, diagnostics
+
+    def test_statistics_preserve_integer_sums_buckets_and_full_match_counts(self):
+        start = 18446744073709000000
+        path = self.write("cost.jsonl", [{"event": "cost", "steady_ns": start + i, "bytes": 2**64 - 1, "duration_ns": i} for i in range(5)])
+        status, values, output, _ = self.statistics(str(path), "--stats", "bytes", "--stats", "duration_ns", "--bucket-ms", "1", "--limit", "1")
+        self.assertEqual(status, 0)
+        total = next(row for row in values if "bucket_start_ns" not in row)
+        self.assertEqual(total["events"], 5)
+        self.assertEqual(total["fields"]["bytes"]["sum"], 5 * (2**64 - 1))
+        self.assertEqual(total["fields"]["duration_ns"]["mean"], 2)
+        self.assertEqual(total["first_ns"], start)
+        self.assertEqual(total["last_line"], 5)
+        bucket = next(row for row in values if "bucket_start_ns" in row)
+        self.assertEqual(bucket["bucket_start_ns"], start // 1000000 * 1000000)
+        self.assertEqual(bucket["events_per_second"], 5000)
+        self.assertIn("showing 1/5", output)
+
+    def test_statistics_separate_runs_sources_clocks_and_numeric_absence(self):
+        path = self.write("mixed.jsonl", [
+            {"event": "cost", "run_id": "first", "steady_ns": 7, "value": 3},
+            {"event": "cost", "run_id": "first", "steady_ns": 8, "value": 4},
+            {"event": "cost", "run_id": "second", "steady_ns": 9, "value": 9},
+            {"event": "cost", "run_id": "first", "elapsed_ms": 1, "value": 12},
+            {"event": "cost", "run_id": "first", "steady_ns": 10},
+            {"event": "cost", "run_id": "first", "steady_ns": 11, "value": True},
+            {"event": "cost", "run_id": "first", "steady_ns": 12, "value": "NaN"},
+        ])
+        other = self.write("other.jsonl", [{"event": "cost", "run_id": "first", "steady_ns": 7, "value": 17}])
+        status, values, _, _ = self.statistics(str(path), str(other), "--stats", "value", "--format", "jsonl", "--limit", "1")
+        self.assertEqual(status, 0)
+        self.assertEqual(len(values), 4)
+        selected = next(row for row in values if row["recorded_run"] == "first" and row["clock"] == "steady" and row["source"].endswith("mixed.jsonl"))
+        self.assertEqual(selected["fields"]["value"], {"count": 2, "sum": 7, "min": 3, "max": 4, "mean": "7/2", "missing": 1, "invalid": 2})
+
+    def test_statistics_report_capacity_and_truncated_inputs(self):
+        path = self.write("buckets.jsonl", [{"event": "cost", "steady_ns": i * 1000000, "bytes": i} for i in range(3)])
+        with patch.object(logs, "MAX_DISTINCT_KEYS", 2):
+            status, _, _, diagnostics = self.statistics(str(path), "--stats", "bytes", "--bucket-ms", "1")
+        self.assertEqual(status, 2)
+        self.assertIn("statistics exceed", diagnostics)
+        malformed = self.write("partial.jsonl", '{"event":"cost","bytes":5}\n{"event":"cost","bytes":NaN}\n{"event":')
+        status, values, _, diagnostics = self.statistics(str(malformed), "--stats", "bytes", "--strict")
+        self.assertEqual(status, 2)
+        self.assertTrue(any(row["fields"]["bytes"]["sum"] == 5 for row in values))
+        self.assertIn("malformed", diagnostics.lower())
+
     def test_explicit_intent_correlation_connects_browser_and_native_stages(self):
         path = self.write("intent.jsonl", [
             {"event": "integration.intent", "control": "7", "detail": "queued SettingsUpdate"},

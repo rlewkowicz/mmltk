@@ -848,6 +848,10 @@ public:
   }
  }
  std::vector<CoconutComponent> finish(bool partial = false) {
+  BenchmarkCostSpan drain(request_.trace, BenchmarkCostKind::RecoveryDrain, [&] {
+   const std::lock_guard lock(groups_mutex_);
+   return nlohmann::json{{"edition", request_.edition}, {"rows", rows_}, {"input_identity", request_.input_identity}};
+  });
   normalizations_.drain();
   if (partial && rows_ == 0 && std::ranges::none_of(request_.records->rows(), [](const auto& row) { return bool(row.native()); })) return {};
   if (partial && !request_.records->groups.empty()) request_.records->rebase_parquet_segments();
@@ -876,6 +880,7 @@ public:
   recovery_signal_->notify();
   if (recovery_controller_.joinable()) recovery_controller_.join();
   if (recovery_failure_) std::rethrow_exception(recovery_failure_);
+  drain.finish();
   throw_if_benchmark_cancelled(request_.cancellation);
   auto result = assemble(request_.metadata_only);
   if (request_.membership_ready && !request_.metadata_only && !early_membership) {
@@ -891,8 +896,12 @@ public:
  std::vector<CoconutComponent> assemble(bool metadata_only) {
   if (!metadata_only) {
    request_.parent_allowance.release_unused_continuation();
+   BenchmarkCostSpan wait(request_.trace, BenchmarkCostKind::PhysicalWait, [&] {
+    return nlohmann::json{{"edition", request_.edition}, {"rows", request_.records->size()}, {"input_identity", request_.input_identity}};
+   });
    trace_benchmark_event(request_.trace, "benchmark.annotations.physical_join_wait", [&] { return nlohmann::json{{"edition", request_.edition}, {"rows", request_.records->size()}}; });
    request_.physical_membership->wait_sources(request_.edition);
+   wait.finish();
    trace_benchmark_event(request_.trace, "benchmark.annotations.physical_join_ready", [&] { return nlohmann::json{{"edition", request_.edition}, {"rows", request_.records->size()}}; });
    for (std::size_t position = 0; position < request_.records->size(); ++position) {
     const auto& row = request_.records->row(position);
@@ -918,6 +927,10 @@ public:
    }
   }
   std::uint64_t image_count = 0, recovery_join_boxes = 0;
+  BenchmarkCostSpan gather_cost(request_.trace, BenchmarkCostKind::ComponentGather, [&] {
+   return nlohmann::json{{"edition", request_.edition}, {"rows_revisited", request_.records->size()}, {"images", image_count}, {"metadata_only", metadata_only},
+    {"input_identity", request_.input_identity}};
+  });
   for (const auto& row : request_.records->rows())
    if (const auto& native = row.native(); !metadata_only && native && std::ranges::find(request_.retained_sources, native->lineage().component.source) == request_.retained_sources.end()) {
     ++image_count;

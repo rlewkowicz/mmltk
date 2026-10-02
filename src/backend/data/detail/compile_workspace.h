@@ -8,7 +8,16 @@
 #include <span>
 #include <vector>
 #include <utility>
+#include "src/frameworks/reflection/reflected_field_policy.h"
 namespace mmltk::backend::data::detail {
+struct CompileArenaObservation {
+ std::uint64_t occupied_bytes = 0, requested_bytes = 0, alignment_loss = 0;
+ std::uint64_t ordinary_free_bytes = 0, largest_ordinary_extent = 0, unregistered_bytes = 0;
+ std::uint64_t completion_occupied = 0, shared_occupied = 0, compaction_occupied = 0;
+ std::size_t live_allocations = 0;
+ std::uint64_t lease_acquisitions = 0, allocation_high_water = 0, occupied_high_water = 0;
+};
+MMLTK_REFLECT_FIELDS(CompileArenaObservation)
 struct CompileWorkspaceProfile {
  std::size_t normal_bytes = 0;
  std::size_t completion_bytes = 0;
@@ -51,6 +60,7 @@ public:
  struct Snapshot {
   std::uint64_t locked = 0, resident = 0, leased = 0, exceptional = 0, exceptional_peak = 0, exceptional_reserved = 0, reused = 0, physical_retirements = 0;
   std::size_t contexts = 0;
+  CompileArenaObservation observation{};
  };
  CompileArenaBank(const CompileWorkspacePlan&, std::span<const int> numa_nodes, std::function<void()> released, bool observe = false);
  [[nodiscard]] const CompileWorkspacePlan& plan() const noexcept;
@@ -65,5 +75,6 @@ public:
  [[nodiscard]] CompileArenaLease acquire(
   std::size_t bytes, bool exceptional, bool completion = false, CompileWorkClass = CompileWorkClass::Count, CompileWorkspaceWindow = CompileWorkspaceWindow::Task);
  [[nodiscard]] Snapshot snapshot() const;
+ [[nodiscard]] std::uint64_t largest_available(bool completion, CompileWorkClass, CompileWorkspaceWindow) const;
 };
 }  // namespace mmltk::backend::data::detail

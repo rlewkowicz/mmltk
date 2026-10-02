@@ -2645,6 +2645,7 @@ print_test_suites() {
         '  tsan    Unavailable in the native Catch2 suite' \
         '  rfdetr  RF-DETR native/model Catch2 suite' \
         '  rfdetr-profile  Opt-in RF-DETR training profile runner' \
+        '  data-profile    Opt-in CPU compile/resample and CUDA loader profile runner' \
         '  build   Build every available native release test target without running tests' \
         '  all     Build native targets; run ordinary native, browser-app, cleanup-tool, and log-query suites' \
         '' \
@@ -3722,6 +3723,10 @@ run_tests() {
             ;;
         rfdetr-profile)
             targets=(mmltk_rfdetr_train_profile_runner)
+            executables=("${targets[@]}")
+            ;;
+        data-profile)
+            targets=(mmltk_backend_data_profile_runner)
             executables=("${targets[@]}")
             ;;
         build)

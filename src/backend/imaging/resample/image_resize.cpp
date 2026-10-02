@@ -48,6 +48,11 @@ public:
 std::size_t RgbResizeWorkspacePlan::bytes() const {
  return common::math::checked_add(resize_aligned(avir_bytes), common::math::checked_add(resize_aligned(byte_output_bytes), perceptual_bytes, "resize workspace overflow"), "resize workspace overflow");
 }
+RgbResizePath RgbResizeWorkspacePlan::path(std::uint32_t source_width, std::uint32_t source_height) const noexcept {
+ if (perceptual_bytes) return source_width % width == 0 && source_height % height == 0 ? RgbResizePath::PerceptualInteger : RgbResizePath::PerceptualFractional;
+ if (avir_bytes || byte_output_bytes) return RgbResizePath::Avir;
+ return RgbResizePath::Identity;
+}
 RgbResizeWorkspacePlan RgbImageResizer::workspace_plan(std::uint32_t sw, std::uint32_t sh, std::uint32_t dw, std::uint32_t dh, ImageResizeMode mode, bool perceptual, RgbPixelFormat format) {
  const auto geometry = compute_image_resize_geometry(sw, sh, dw, dh, mode);
  RgbResizeWorkspacePlan result{.width = geometry.resized_width, .height = geometry.resized_height, .alpha = format == RgbPixelFormat::RGBA8, .perceptual = perceptual};

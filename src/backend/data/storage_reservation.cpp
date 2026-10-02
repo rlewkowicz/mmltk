@@ -1,4 +1,5 @@
 #include "src/backend/data/detail/storage_reservation.h"
+#include "src/backend/data/detail/compile_observation.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <sys/stat.h>
@@ -7,8 +8,29 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <exception>
 namespace mmltk::backend::data::detail {
 namespace {
+class CapacityObservation final {
+ const StorageReservationPool::Observer& observer_;
+ StorageReservationPool::Observation value_;
+ CompileObservationClock clock_;
+ int exceptions_;
+public:
+ CapacityObservation(const StorageReservationPool::Observer& observer, const std::filesystem::path& path, std::string_view description)
+     : observer_(observer), value_{path, description, 0, 0, 0}, clock_(bool(observer)), exceptions_(observer ? std::uncaught_exceptions() : 0) {}
+ ~CapacityObservation() {
+  if (!observer_) return;
+  value_.duration_ns = clock_.elapsed();
+  value_.failed = std::uncaught_exceptions() > exceptions_;
+  try { observer_(value_); } catch (...) {}
+ }
+ void sample() noexcept { if (observer_) ++value_.capacity_samples; }
+ void retry() noexcept { if (observer_) ++value_.retries; }
+ void capacity(std::uint64_t required, std::uint64_t outstanding, std::uint64_t available) noexcept {
+  if (observer_) { value_.required = required; value_.outstanding = outstanding; value_.available = available; }
+ }
+};
 std::filesystem::path existing_parent(const std::filesystem::path& path) {
  auto probe = std::filesystem::absolute(path).lexically_normal();
  while (!std::filesystem::is_directory(probe)) {
@@ -43,8 +65,11 @@ struct StorageReservationPool::Destination {
  Ledger::Filesystem* filesystem = nullptr;
 };
 void StorageReservationPool::require_capacity(const std::filesystem::path& path, std::uint64_t required, std::string_view description, Observer observer) {
+ CapacityObservation observation(observer, path, description);
+ observation.capacity(required, 0, 0);
+ observation.sample();
  const auto available = available_bytes(existing_parent(path));
- if (observer) observer({path, description, required, 0, available});
+ observation.capacity(required, 0, available);
  check_capacity(available, 0, required, description);
 }
 StorageReservationPool::StorageReservationPool(std::filesystem::path path, Observer observer, StorageReservationPool* shared) : destination_(std::make_shared<Destination>()) {
@@ -105,6 +130,7 @@ void StorageReservationPool::Reservation::grow(std::uint64_t promised, std::stri
 void StorageReservationPool::Reservation::resize(std::uint64_t promised, std::string_view description) {
  if (!destination_) throw std::logic_error("cannot resize an empty storage reservation");
  auto& fs = *destination_->filesystem;
+ CapacityObservation observation(destination_->observer, destination_->path, description);
  {
   const std::lock_guard lock(destination_->ledger->mutex);
   const auto remaining = promised > allocated_ ? promised - allocated_ : 0;
@@ -112,6 +138,7 @@ void StorageReservationPool::Reservation::resize(std::uint64_t promised, std::st
    fs.outstanding -= outstanding() - remaining;
    promised_ = promised;
    ++fs.revision;
+   observation.capacity(remaining, fs.outstanding, 0);
    return;
   }
  }
@@ -120,14 +147,17 @@ void StorageReservationPool::Reservation::resize(std::uint64_t promised, std::st
   {
    const std::lock_guard lock(destination_->ledger->mutex);
    revision = fs.revision;
+   observation.capacity(promised > allocated_ ? promised - allocated_ : 0, fs.outstanding - outstanding(), 0);
   }
+  observation.sample();
   const auto available = available_bytes(destination_->probe);
   const std::lock_guard lock(destination_->ledger->mutex);
   // Allocation promises remain visible throughout the observation. Any ledger
   // settlement invalidates this sample, including zero-growth punch/truncate.
-  if (revision != fs.revision) continue;
+  if (revision != fs.revision) { observation.retry(); continue; }
   const auto remaining = promised > allocated_ ? promised - allocated_ : 0;
   const auto others = fs.outstanding - outstanding();
+  observation.capacity(remaining, others, available);
   if (remaining > outstanding()) check_capacity(available, others, remaining, description);
   fs.outstanding = common::math::checked_add(others, remaining, "storage reservation overflow");
   promised_ = promised;
@@ -137,25 +167,29 @@ void StorageReservationPool::Reservation::resize(std::uint64_t promised, std::st
 }
 StorageReservationPool::Reservation StorageReservationPool::reserve(std::uint64_t promised, std::string_view description, std::uint64_t allocated) {
  auto& fs = *destination_->filesystem;
+ CapacityObservation observation(destination_->observer, destination_->path, description);
  for (;;) {
   std::uint64_t revision;
   {
    const std::lock_guard lock(destination_->ledger->mutex);
    revision = fs.revision;
+   observation.capacity(promised > allocated ? promised - allocated : 0, fs.outstanding, 0);
   }
+  observation.sample();
   const auto available = available_bytes(destination_->probe);
   const auto required = promised > allocated ? promised - allocated : 0;
   std::uint64_t total;
   {
    const std::lock_guard lock(destination_->ledger->mutex);
-   if (revision != fs.revision) continue;
+   if (revision != fs.revision) { observation.retry(); continue; }
+   observation.capacity(required, fs.outstanding, available);
    if (required) check_capacity(available, fs.outstanding, required, description);
    total = common::math::checked_add(fs.outstanding, required, "storage reservation overflow");
    fs.outstanding = total;
    ++fs.revision;
   }
   Reservation result(destination_, promised, allocated);
-  if (destination_->observer) destination_->observer({destination_->path, description, required, total, available});
+  observation.capacity(required, total, available);
   return result;
  }
 }

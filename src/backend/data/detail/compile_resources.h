@@ -8,6 +8,9 @@
 namespace mmltk::backend::data::detail {
 enum class CompileWorkClass : std::uint8_t { Acquisition, Extraction, Annotations, Pixels, Gather, Output, Count };
 enum class CompileWorkspaceWindow : std::uint8_t { Task, SharedSource, Compaction };
+enum class CompileResourceDenial : std::uint8_t {
+ None, Infeasible, ExceptionalDrain, ExceptionalLineage, ArenaBusy, RetainedLineage, Cpu, Descriptors, Bytes, LoanCapacity, AgedDemand, Records
+};
 class CompileExecution;
 struct CompileWorkspacePlan;
 struct CompileAdmission;
