@@ -172,11 +172,12 @@ TEST_CASE("artifact dataset runtime owns its diagnostic target and borrows only 
 }
 TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and stop join", "[controller][systems][dataset][diagnostics]") {
  const mmltk::testsupport::ScopedTempDir root{"dataset-diagnostic-reconstruction"};
+ const auto output = root.path() / "compiled";
  SettingsSystem settings;
  const services::SettingsLocation location{(root.path() / "settings.json").string()};
  auto stored = contracts::default_gui_settings_state();
  stored.workflows.train.compile_benchmark_dataset_override = true;
- stored.workflows.train.compiled_dataset_dir = root.path() / "compiled";
+ stored.workflows.train.compiled_dataset_dir = output.string();
  stored.workflows.train.request.resolution = 32;
  stored.workflows.train.request.preset_name = "rf-detr-nano";
  REQUIRE(services::SettingsStore::save(location.value(), stored, 1U).succeeded());
@@ -218,14 +219,14 @@ TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and 
  CHECK(compiler.observer_enabled);
  const auto failed_staging = compiler.physical_output;
  CHECK_FALSE(std::filesystem::exists(failed_staging));
- CHECK_FALSE(std::filesystem::exists(stored.workflows.train.compiled_dataset_dir));
+ CHECK_FALSE(std::filesystem::exists(output));
  compiler.work = [receipt = gate.receipt()](auto) { receipt.ArriveAndWait(); };
  bool cancel = true;
  SECTION("retry can stop while its reconstructed compiler is active") {}
  SECTION("retry publishes and inspects new output after the failed output remained absent") {
   cancel = false;
   compiler.work = [&](auto cancellation) {
-   if (compiler.physical_output == failed_staging || !std::filesystem::is_empty(compiler.physical_output) || std::filesystem::exists(stored.workflows.train.compiled_dataset_dir))
+   if (compiler.physical_output == failed_staging || !std::filesystem::is_empty(compiler.physical_output) || std::filesystem::exists(output))
     throw std::runtime_error("retry did not receive fresh staging beside absent output");
    compile_staged_fixture(compiler.physical_output, cancellation);
   };
@@ -240,14 +241,14 @@ TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and 
  const auto retried = std::get<DatasetChanged>(mmltk::testsupport::await_test_future(second, "retried compile")).snapshot;
  CAPTURE(retried.terminal.detail);
  CHECK(retried.terminal.outcome == (cancel ? contracts::ArtifactTerminalOutcome::Cancelled : contracts::ArtifactTerminalOutcome::Succeeded));
- CHECK(std::filesystem::exists(stored.workflows.train.compiled_dataset_dir / "train.bin") == !cancel);
+ CHECK(std::filesystem::exists(output / "train.bin") == !cancel);
  CHECK(retried.inspection.available() == !cancel);
  CHECK(compiler.physical_output != failed_staging);
  if (!cancel) {
-  CHECK(retried.terminal.artifact == stored.workflows.train.compiled_dataset_dir.string());
+  CHECK(retried.terminal.artifact == output.string());
   REQUIRE(retried.inspection.splits.size() == 1U);
   const auto& split = retried.inspection.splits.front();
-  CHECK(split.path == (stored.workflows.train.compiled_dataset_dir / "train.bin").string());
+  CHECK(split.path == (output / "train.bin").string());
   CHECK(split.image_count == 1U);
   CHECK(split.width == 32U);
   CHECK(split.height == 32U);
@@ -262,7 +263,7 @@ TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and 
  REQUIRE(failures.size() == 1U);
  CHECK(failures.front().at("operation") == "compilation");
  CHECK(failures.front().at("staged_path") == failed_staging.string());
- CHECK(failures.front().at("final_path") == stored.workflows.train.compiled_dataset_dir.string());
+ CHECK(failures.front().at("final_path") == output.string());
  CHECK(failures.front().at("error") == "diagnostic compiler failure");
 }
 TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and reconstructs after failure", "[controller][systems][dataset]") {

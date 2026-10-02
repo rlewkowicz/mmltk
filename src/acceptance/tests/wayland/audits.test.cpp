@@ -2432,13 +2432,15 @@ void native_dataset_frame(BrowserAudit& audit, std::uint64_t generation, std::st
  row("train.dataset.progress.acquisition", defect == "opening" ? "Acquisition" : "Acquisition\nNo acquisition needed · 0 KiB",
   {{"activity", 1U}, {"unit", static_cast<std::uint8_t>(DatasetCompileUnit::Bytes)}, {"completed", 0U}, {"total", 0U}, {"known", true}, {"active", false}, {"complete", true}, {"invalidated", 0U}});
  row("train.dataset.progress.labels", "Labels/masks\nWaiting · 2,345 / 9,876 rows",
-  {{"activity", 0U}, {"unit", static_cast<std::uint8_t>(DatasetCompileUnit::Rows)}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", false}, {"complete", false}, {"invalidated", 0U}});
+  {{"activity", 0U}, {"unit", static_cast<std::uint8_t>(DatasetCompileUnit::Rows)}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", false}, {"complete", false},
+   {"invalidated", 0U}});
  row("train.dataset.progress.pixels",
   defect == "empty-status"   ? ""
   : defect == "wrong-status" ? "Pixels\nWaiting · 2,345 / 9,876 images"
-  : defect == "wrong-unit"   ? "Pixels\nCompiling image pixels · 2,345 / 9,876 rows"
+   : defect == "wrong-unit"  ? "Pixels\nCompiling image pixels · 2,345 / 9,876 rows"
                              : "Pixels\nCompiling image pixels · 2,345 / 9,876 images",
-  {{"activity", 5U}, {"unit", static_cast<std::uint8_t>(DatasetCompileUnit::Images)}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", true}, {"complete", false}, {"invalidated", 0U}});
+  {{"activity", 5U}, {"unit", static_cast<std::uint8_t>(DatasetCompileUnit::Images)}, {"completed", 2345U}, {"total", 9876U}, {"known", true}, {"active", true}, {"complete", false},
+   {"invalidated", 0U}});
  audit.consume({{"event", "integration.dataset_frame"}, {"a", defect == "fixture" ? 200U : defect == "completed" ? 102U : 100U}});
 }
 }  // namespace
@@ -2472,7 +2474,9 @@ TEST_CASE("active compile resize evidence requires progress actual presentation 
  }
 }
 TEST_CASE("native drawn work requires correlated exact captions and track meaning", "[workspace][audit]") {
- for (const std::string defect : {"none", "opening", "missing-work", "wrong-work", "wrong-grouping", "empty-status", "wrong-status", "wrong-unit", "missing-unit", "invalid-unit", "wrong-generation", "missing-facts", "fixture", "completed"}) {
+ for (const std::string defect :
+  {"none", "opening", "missing-work", "wrong-work", "wrong-grouping", "empty-status", "wrong-status", "wrong-unit", "missing-unit", "invalid-unit", "wrong-generation", "missing-facts", "fixture",
+   "completed"}) {
   BrowserAudit audit;
   native_dataset_frame(audit, 1U, defect);
   CHECK(audit.compile_tracks.size() == (defect == "none" ? 3U : 0U));
@@ -2755,7 +2759,8 @@ TEST_CASE("status paragraphs retain one normal-height line with half-pixel fitti
   CHECK(audit.dataset_status_valid);
   CHECK_FALSE(audit.dataset_status_fitted);
   audit.consume(
-   {{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.pixels"}, {"detail", "Pixels\nCompiling image pixels · 2,345 / 9,876 images"}, {"a", 12}, {"b", 30}, {"c", 200}, {"d", 43.2}});
+   {{"event", "integration.dataset_draw"}, {"control", "train.dataset.progress.pixels"}, {"detail", "Pixels\nCompiling image pixels · 2,345 / 9,876 images"}, {"a", 12}, {"b", 30}, {"c", 200},
+    {"d", 43.2}});
   audit.consume({{"event", "integration.dataset_frame"}, {"a", 200U}});
   CHECK(audit.dataset_status_fitted == (size < 12.0));
  }

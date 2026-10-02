@@ -2854,7 +2854,7 @@ TEST_CASE("late original repair settles completed Coconut recovery without retai
    ++train_components;
   }
  CHECK(train_components == 1);
- for (const auto& release : catalog.releases) CHECK(ArtifactLease::try_acquire_charged(local.cache.locks / (std::string(release.name) + ".annotations.lifecycle.lock"), {}, nullptr));
+ for (const auto& source_release : catalog.releases) CHECK(ArtifactLease::try_acquire_charged(local.cache.locks / (std::string(source_release.name) + ".annotations.lifecycle.lock"), {}, nullptr));
  CHECK(ArtifactLease::try_acquire_charged(local.cache.locks / "coco-annotations.lifecycle.lock", {}, nullptr));
  server.Check();
 }

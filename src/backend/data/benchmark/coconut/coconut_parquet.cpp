@@ -746,8 +746,8 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
       if (trace) ++inspected;
       return row.metadata_ready();
      });
-     trace_benchmark_event(trace, "benchmark.coconut.metadata_readiness",
-      [&] { return nlohmann::json{{"artifact", shard.path.string()}, {"group", state.group}, {"inspected_rows", inspected}, {"ready", ready}}; });
+     trace_benchmark_event(
+      trace, "benchmark.coconut.metadata_readiness", [&] { return nlohmann::json{{"artifact", shard.path.string()}, {"group", state.group}, {"inspected_rows", inspected}, {"ready", ready}}; });
      state.row = group.first_row + (metadata_only && ready ? group.rows : 0);
      state.segments = 0;
      state.projected = 0;

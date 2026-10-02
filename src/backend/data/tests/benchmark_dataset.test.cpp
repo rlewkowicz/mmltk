@@ -9939,8 +9939,7 @@ TEST_CASE("compile class floors remain runnable while another class settles comp
  auto annotations = execution.open_class(CompileWorkClass::Annotations);
  auto pixels = execution.open_class(CompileWorkClass::Pixels);
  auto output = execution.open_class(CompileWorkClass::Output);
- std::array<mmltk::testsupport::TestGate, 3> running{
-  mmltk::testsupport::TestGate("first worker"), mmltk::testsupport::TestGate("second worker"), mmltk::testsupport::TestGate("third worker")};
+ std::array<mmltk::testsupport::TestGate, 3> running{mmltk::testsupport::TestGate("first worker"), mmltk::testsupport::TestGate("second worker"), mmltk::testsupport::TestGate("third worker")};
  mmltk::testsupport::TestGate callback("annotation completion retains its worker");
  std::array<std::size_t, 3> lanes{};
  std::array<CompileExecution::Completion, 3> completions;

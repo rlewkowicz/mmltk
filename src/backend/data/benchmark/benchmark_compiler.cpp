@@ -516,9 +516,8 @@ void publish_dataset_directory(const std::filesystem::path& staging, const std::
  throw_if_benchmark_cancelled(cancellation);
  const auto publication = common_io::publish_staged_path_atomically(staging, output, overwrite);
  if (publication.replaced) {
-  trace_benchmark_event(trace, "benchmark.publication.old_generation_cleanup", [&] {
-   return nlohmann::json{{"path", staging.string()}, {"removed", !publication.cleanup_error}, {"error", publication.cleanup_error ? publication.cleanup_error.message() : std::string{}}};
-  });
+  trace_benchmark_event(trace, "benchmark.publication.old_generation_cleanup",
+   [&] { return nlohmann::json{{"path", staging.string()}, {"removed", !publication.cleanup_error}, {"error", publication.cleanup_error ? publication.cleanup_error.message() : std::string{}}}; });
  }
 }
 void write_split_with_progress(BenchmarkSplitWriter& writer, const BenchmarkWriteRequest& request, ProgressReporter* progress, const BenchmarkTraceSink& trace) {

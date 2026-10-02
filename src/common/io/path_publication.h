@@ -6,7 +6,7 @@ struct PathPublicationResult final {
  bool replaced = false;
  // Publication has committed on return. A cleanup error only means that the
  // old generation was not fully removed; it never invalidates the new output.
- std::error_code cleanup_error;
+ std::error_code cleanup_error{};
 };
 // Staging and destination must share a filesystem. Refuses an occupied
 // destination when overwrite is false, otherwise exchanges existing paths.

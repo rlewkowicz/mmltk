@@ -342,8 +342,7 @@ ArtifactCompileResult ArtifactStore::compile(
  };
  if (diagnostics.benchmark.report != nullptr) operation = "compilation";
  try {
-  if (request.kind == ArtifactCompileKind::Directory && !std::filesystem::is_directory(request.source))
-   return failed("artifact source directory is unavailable");
+  if (request.kind == ArtifactCompileKind::Directory && !std::filesystem::is_directory(request.source)) return failed("artifact source directory is unavailable");
   if (!request.overwrite && std::filesystem::exists(request.output)) return failed("artifact output already exists");
   staging.emplace(request.output, "", ".tmp.XXXXXX", "failed to stage compiled artifact");
   switch (request.kind) {
