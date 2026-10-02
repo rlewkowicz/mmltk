@@ -2798,7 +2798,7 @@ TEST_CASE("late original repair settles completed Coconut recovery without retai
  tar(path, members);
  REQUIRE(std::filesystem::file_size(path) == originals.expected_size);
  for (const auto split : {"train2017", "val2017"}) remove_normalized_annotation_index(indexes / (std::string(split) + ".normalized.bin"));
- remove_cache_path(indexes / "source-json");
+ std::filesystem::remove_all(indexes / "source-json");
  auto artifact = warm ? ArtifactLease::acquire(local.cache.locks / (base_release.annotations.front().artifact_id + ".lock"), {}) : ArtifactLease{};
  mmltk::testsupport::TestGate validation("validation parse waits for completed Base recovery");
  std::promise<void> base, train_ready;
@@ -7515,9 +7515,10 @@ TEST_CASE("a quiesced Parquet reader releases its window for independent recover
 }
 TEST_CASE("a Parquet group joins native recovery before JPEG geometry", "[benchmark][coconut][pipeline][resources]") {
  using namespace std::chrono_literals;
- bool fail_labels = false;
+ bool fail_labels = false, fail_execution = false;
  SECTION("the next group and labels progress before JPEG geometry") {}
  SECTION("required label conversion failure remains fatal before JPEG geometry") { fail_labels = true; }
+ SECTION("shared execution failure settles recovery while originals remain pending") { fail_execution = true; }
  ScopedTempDir root("coconut-native-recovery-boundary");
  LocalCoconutRecipe local(root.path());
  auto catalog = local.selected(CoconutValidation::Stock);
@@ -7577,6 +7578,12 @@ TEST_CASE("a Parquet group joins native recovery before JPEG geometry", "[benchm
  }
  mmltk::testsupport::await_test_future(advanced, "all source groups settle while original recovery is pending", 5s);
  CHECK_FALSE(execution.geometry(images, 7));
+ if (fail_execution) {
+  execution.execution().fail(std::make_exception_ptr(std::runtime_error("independent compiler task failed")));
+  CHECK_THROWS_WITH(mmltk::testsupport::await_test_future(importing, "interrupted recovery with pending originals", 5s), "independent compiler task failed");
+  CHECK_FALSE(original_terminal.load());
+  return;
+ }
  original_terminal.store(true);
  originals.settle();
  // Native production and persistence settle without final geometry. Its owning

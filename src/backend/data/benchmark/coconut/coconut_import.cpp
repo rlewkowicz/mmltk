@@ -1115,6 +1115,8 @@ private:
     ready.drain();
     return;
    }
+   if (request_.execution)
+    if (auto error = request_.execution->execution().interruption()) std::rethrow_exception(error);
    throw_if_benchmark_cancelled(request_.cancellation);
    std::array<std::shared_ptr<PendingNativeImage>, native_window> pending;
    std::size_t count = 0;
