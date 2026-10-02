@@ -1,3 +1,5 @@
+#include "src/backend/data/benchmark/detail/benchmark_cache.h"
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotation_identity.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_import.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_parquet.h"
@@ -10948,6 +10950,7 @@ TEST_CASE("native staging retains its record while a competing image waits for t
  CHECK(bounded);
 }
 TEST_CASE("Coconut cost spans preserve disabled and unwinding diagnostic behavior", "[benchmark][coconut][trace]") {
+ const bool unwinding = GENERATE(false, true);
  std::size_t constructions = 0;
  const auto fields = [&] { ++constructions; return Json{{"rows_revisited", 18446744073709551615ULL}}; };
  {
@@ -10961,14 +10964,21 @@ TEST_CASE("Coconut cost spans preserve disabled and unwinding diagnostic behavio
   records.emplace_back(event, value);
   throw std::runtime_error("diagnostics cannot replace the source failure");
  };
- CHECK_THROWS_WITH([&] {
+ const auto run = [&] {
   BenchmarkCostSpan span(enabled, BenchmarkCostKind::RecoveryDrain, fields);
-  throw std::runtime_error("source failed");
- }(), "source failed");
+  if (unwinding) throw std::runtime_error("source failed");
+  span.finish();
+  span.finish();
+ };
+ if (unwinding)
+  CHECK_THROWS_WITH(run(), "source failed");
+ else
+  CHECK_NOTHROW(run());
  REQUIRE(records.size() == 2);
  CHECK(records[0].first == "benchmark.cost.started");
  CHECK(records[1].first == "benchmark.cost.completed");
- CHECK(records[1].second.at("failed") == true);
+ CHECK(records[0].second.at("span_id") == records[1].second.at("span_id"));
+ CHECK(records[1].second.at("failed") == unwinding);
  CHECK(records[1].second.at("rows_revisited").get<std::uint64_t>() == UINT64_MAX);
 }
 TEST_CASE("admitted physical headers recover labels before the same image finishes pixels", "[benchmark][coconut][pipeline][recovery]") {

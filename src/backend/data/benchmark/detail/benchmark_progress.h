@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include <array>
 #include <utility>
 #include <chrono>
@@ -18,7 +19,6 @@
 #include <unordered_map>
 #include <vector>
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
-#include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
 namespace mmltk::backend::data::benchmark_internal {
 class ProgressReporter;

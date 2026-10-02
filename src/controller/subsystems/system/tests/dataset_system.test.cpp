@@ -1,3 +1,5 @@
+#include "src/backend/data/benchmark/detail/benchmark_cache.h"
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/controller/subsystems/system/tests/application_data_test_support.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"

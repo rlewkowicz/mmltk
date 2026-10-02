@@ -1,6 +1,6 @@
 #pragma once
 #include "src/backend/data/detail/compile_resources.h"
-#include "src/backend/data/detail/compile_workspace.h"
+#include "src/backend/data/detail/compile_arena_observation.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <array>
@@ -59,11 +59,8 @@ struct CompileReservationObservation {
 struct CompileAdmissionObservation {
  CompileTaskKind kind = CompileTaskKind::Count;
  CompileResourceDenial denial = CompileResourceDenial::None;
- std::uint64_t requested_bytes = 0, opaque_bytes = 0, resource_epoch = 0;
- std::size_t descriptors = 0, continuation_descriptors = 0, cpu_workers = 0;
- CompileWorkspaceWindow window = CompileWorkspaceWindow::Task;
- CompileWorkClass work_class = CompileWorkClass::Count;
- bool supplied_workspace = false, completion_workspace = false, producer = false, retained_handles = false;
+ CompileResources requested{};
+ std::uint64_t resource_epoch = 0;
  std::uint64_t largest_eligible_extent = 0;
 };
 MMLTK_REFLECT_FIELDS(CompileAdmissionObservation)

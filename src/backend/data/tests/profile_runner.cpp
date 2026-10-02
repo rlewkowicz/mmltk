@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include <cuda_runtime.h>
 #include <array>
 #include <charconv>
@@ -21,6 +22,8 @@
 #include <nlohmann/json.hpp>
 #include "src/backend/data/detail/compile_pixel_workspace.h"
 #include "src/backend/data/detail/compile_workspace.h"
+#include "src/backend/data/detail/compile_execution.h"
+#include "src/common/io/file_memory.h"
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
 #include "src/common/system/numa_memory.h"
 #include "src/common/system/numa_topology.h"

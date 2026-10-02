@@ -1,4 +1,6 @@
 #pragma once
+#include "src/backend/data/benchmark/detail/benchmark_cache.h"
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/benchmark/detail/benchmark_archive.h"
 #include "src/backend/data/detail/compile_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"

@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_annotations.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_staging.h"

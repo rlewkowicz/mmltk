@@ -98,6 +98,7 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     benchmark/coconut/coconut_catalog.cpp
     benchmark/benchmark_annotation_cache.cpp
     benchmark/benchmark_cache.cpp
+    benchmark/benchmark_trace.cpp
     benchmark/benchmark_catalog.cpp
     benchmark/benchmark_compiler.cpp
     benchmark/benchmark_cancellation.cpp
@@ -151,12 +152,14 @@ mmltk_register_private_headers(mmltk_backend_data
     benchmark/coconut/detail/coconut_catalog.h
     benchmark/coconut/detail/coconut_inventory.h
     benchmark/detail/benchmark_cache.h
+    benchmark/detail/benchmark_trace.h
     benchmark/detail/benchmark_catalog.h
     benchmark/detail/benchmark_compiler.h
     benchmark/detail/benchmark_recipe.h
     benchmark/detail/benchmark_progress.h
     benchmark/detail/benchmark_cancellation.h
     detail/compile_workspace.h
+    detail/compile_arena_observation.h
     detail/compile_json_number.h
     detail/compile_image_decoder.h
     detail/compile_pixel_workspace.h

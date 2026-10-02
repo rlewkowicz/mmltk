@@ -1,3 +1,5 @@
+#include "src/backend/data/benchmark/detail/benchmark_cache.h"
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include <poll.h>
 #include <sys/stat.h>
 #include <sys/wait.h>

@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -39,6 +40,7 @@ struct CompileResources {
  CompileWorkspaceWindow workspace_window = CompileWorkspaceWindow::Task;
  [[nodiscard]] static CompileResources handles(std::size_t count, bool producer = false, std::size_t continuation = 0);
 };
+MMLTK_REFLECT_FIELDS(CompileResources)
 struct CompileExecutionLimits {
  std::uint64_t transient_bytes = 0;
  std::size_t descriptors = 0;

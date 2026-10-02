@@ -1,3 +1,5 @@
+#include "src/backend/data/benchmark/detail/benchmark_cache.h"
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_import.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"

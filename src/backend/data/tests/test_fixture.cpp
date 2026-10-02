@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/data/benchmark/detail/benchmark_writer.h"
 #include "src/backend/data/benchmark/detail/benchmark_labels.h"

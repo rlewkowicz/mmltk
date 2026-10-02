@@ -1,10 +1,10 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/detail/storage_reservation.h"
 #include <string_view>
 #include <filesystem>
 #include <nlohmann/json.hpp>
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
-#include "src/backend/data/benchmark/detail/benchmark_cache.h"
 namespace mmltk::backend::data::benchmark_internal {
 [[nodiscard]] BenchmarkTraceSink make_trace_sink(const BenchmarkTraceCallback& callback) noexcept;
 [[nodiscard]] bool archive_selection_allows_quarantine(BenchmarkDatasetSource source, std::string_view split) noexcept;

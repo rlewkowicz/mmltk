@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/detail/compile_workspace.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/common/system/numa_memory.h"

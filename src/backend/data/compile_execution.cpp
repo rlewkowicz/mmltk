@@ -390,9 +390,7 @@ struct CompileExecution::Impl {
   notify_locked();
  }
  static CompileAdmissionObservation observe_demand(CompileTaskKind kind, const CompileResources& demand, CompileResourceDenial denial, std::uint64_t epoch, std::uint64_t extent) {
-  return {kind, denial, demand.bytes, demand.opaque_bytes, epoch,
-   demand.descriptors, demand.continuation_descriptors, demand.cpu_workers, demand.workspace_window, demand.workspace_class,
-   demand.supplied_workspace, demand.completion_workspace, demand.producer, demand.retained_handles, extent};
+  return {kind, denial, demand, epoch, extent};
  }
  [[nodiscard]] CompileExecutionSnapshot snapshot_locked() const {
   CompileExecutionSnapshot result;

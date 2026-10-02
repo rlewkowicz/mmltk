@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/detail/staged_artifact.h"
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"

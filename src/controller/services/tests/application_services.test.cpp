@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/controller/services/tests/support/diagnostics_client_test_access.h"
 #include <fcntl.h>
 #include <poll.h>

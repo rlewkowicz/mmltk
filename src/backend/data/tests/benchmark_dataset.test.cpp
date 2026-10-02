@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_import.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_parquet.h"
 #include "src/backend/data/detail/staged_artifact.h"
@@ -38,6 +39,7 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <simdjson.h>
 #include <stb_image_write.h>
@@ -2284,6 +2286,89 @@ TEST_CASE("benchmark trace failures are lazy and delivered once", "[backend][dat
  trace_benchmark_event(success, "benchmark.test.first", [] { return nlohmann::json{{"value", 1U}}; });
  trace_benchmark_event(success, "benchmark.test.second", [] { return nlohmann::json{{"value", 2U}}; });
  CHECK((events == std::vector<std::string>{"benchmark.test.first", "benchmark.test.second"}));
+}
+TEST_CASE("compile admission traces preserve every requested resource in the flat format", "[backend][data][benchmark][trace]") {
+ using namespace mmltk::backend::data::detail;
+ constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+ const CompileResources requested{
+  .bytes = maximum, .descriptors = 7, .producer = true, .cpu_workers = 3, .retained_handles = true, .continuation_descriptors = 11,
+  .supplied_workspace = true, .completion_workspace = true, .workspace_class = CompileWorkClass::Output,
+  .opaque_bytes = maximum - 1, .workspace_window = CompileWorkspaceWindow::Compaction
+ };
+ CompileExecutionSnapshot snapshot;
+ snapshot.demands.push_back({CompileTaskKind::Header, CompileResourceDenial::ArenaBusy, requested, maximum - 2, maximum - 3});
+ const nlohmann::json expected{
+  {"kind", 2}, {"denial", 4}, {"requested_bytes", maximum}, {"descriptors", 7}, {"producer", true}, {"cpu_workers", 3},
+  {"retained_handles", true}, {"continuation_descriptors", 11}, {"supplied_workspace", true}, {"completion_workspace", true},
+  {"work_class", 5}, {"opaque_bytes", maximum - 1}, {"window", 2}, {"resource_epoch", maximum - 2}, {"largest_eligible_extent", maximum - 3}
+ };
+ std::size_t deliveries = 0;
+ const BenchmarkTraceSink sink = [&](std::string_view event, const nlohmann::json& fields) {
+  ++deliveries;
+  CHECK(event == "compile.execution.resources");
+  REQUIRE(fields.at("demands").size() == 1);
+  const auto& demand = fields.at("demands").front();
+  CHECK(demand == expected);
+  CHECK(demand.at("requested_bytes").get<std::uint64_t>() == maximum);
+  CHECK(demand.at("opaque_bytes").get<std::uint64_t>() == maximum - 1);
+  CHECK(demand.at("resource_epoch").get<std::uint64_t>() == maximum - 2);
+  CHECK(demand.at("largest_eligible_extent").get<std::uint64_t>() == maximum - 3);
+  CHECK(fields.at("costs").at("incomplete") == false);
+  throw std::runtime_error("sink failed after admission evidence delivery");
+ };
+ CHECK_NOTHROW(trace_compile_execution({}, "compile.execution.resources", snapshot));
+ CHECK_NOTHROW(trace_compile_execution(sink, "compile.execution.resources", snapshot));
+ CHECK(deliveries == 1);
+}
+TEST_CASE("compile reservation traces retain complete and partial owner evidence", "[backend][data][benchmark][trace]") {
+ using namespace mmltk::backend::data::detail;
+ const bool incomplete = GENERATE(false, true);
+ constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+ CompileExecutionSnapshot snapshot;
+ snapshot.records = 3;
+ snapshot.record_limit = 4;
+ snapshot.resources = {.bytes = 23, .descriptors = 2, .continuation_descriptors = 5};
+ snapshot.byte_target = 29;
+ snapshot.descriptor_limit = 13;
+ snapshot.costs = {.eligibility_probes = maximum, .incomplete = incomplete};
+ auto& request = snapshot.reservation.emplace();
+ request.location = std::source_location::current();
+ request.requested = {.bytes = maximum, .descriptors = 7, .producer = true, .continuation_descriptors = 11};
+ request.denial = CompileResourceDenial::Descriptors;
+ request.resource_epoch = maximum - 1;
+ request.largest_eligible_extent = maximum - 2;
+ const CompileCreditObservation credit{
+  .id = 37, .parent = 31, .location = std::source_location::current(), .resources = {.bytes = maximum - 3, .descriptors = 2},
+  .available = 3, .borrowed = 5, .descriptors_retired = true, .continuations_released = true
+ };
+ request.parents.push_back(credit);
+ if (!incomplete) request.owners.push_back(credit);
+ nlohmann::json captured;
+ std::size_t deliveries = 0;
+ const BenchmarkTraceSink sink = [&](std::string_view event, const nlohmann::json& fields) {
+  ++deliveries;
+  CHECK(event == "compile.execution.reservation");
+  captured = fields;
+  throw std::runtime_error("sink failed after reservation evidence delivery");
+ };
+ CHECK_NOTHROW(trace_compile_execution(sink, "compile.execution.reservation", snapshot));
+ REQUIRE(deliveries == 1);
+ REQUIRE(captured.is_object());
+ const nlohmann::json expected{
+  {"file", request.location.file_name()}, {"line", request.location.line()}, {"function", request.location.function_name()},
+  {"requested_bytes", maximum}, {"denial", 7}, {"resource_epoch", maximum - 1}, {"records", 3}, {"record_limit", 4},
+  {"largest_eligible_extent", maximum - 2}, {"requested_descriptors", 7}, {"requested_continuation", 11}, {"producer", true},
+  {"held_bytes", 23}, {"byte_target", 29}, {"held_descriptors", 2}, {"committed_descriptors", 5}, {"descriptor_limit", 13},
+  {"parents", {{{"bytes", maximum - 3}, {"descriptors", 2}, {"available", 3}, {"borrowed", 5}, {"descriptors_retired", true}, {"continuations_released", true}}}},
+  {"owners", incomplete ? nlohmann::json::array() : nlohmann::json::array({{
+   {"id", 37}, {"parent", 31}, {"file", credit.location.file_name()}, {"line", credit.location.line()},
+   {"bytes", maximum - 3}, {"descriptors", 2}, {"available", 3}, {"borrowed", 5}
+  }})}
+ };
+ CHECK(captured.at("costs").at("incomplete") == incomplete);
+ CHECK(captured.at("costs").at("eligibility_probes").get<std::uint64_t>() == maximum);
+ captured.erase("costs");
+ CHECK(captured == expected);
 }
 TEST_CASE("benchmark storage releases reservations after diagnostic rejection", "[backend][data][benchmark][trace]") {
  mmltk::testsupport::ScopedTempDir root{"benchmark-storage-trace"};
@@ -10916,7 +11001,7 @@ TEST_CASE("scheduled admission observations expose resource predicates and reque
  const auto value = execution.snapshot();
  REQUIRE(value.demands.size() == 1);
  CHECK(value.demands.front().kind == CompileTaskKind::Header);
- CHECK(value.demands.front().requested_bytes == 1);
+ CHECK(value.demands.front().requested.bytes == 1);
  CHECK(value.demands.front().largest_eligible_extent == 0);
  CHECK(value.arena.occupied_bytes == page);
  CHECK(value.arena.requested_bytes == page);

@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/detail/file_work_queue.h"
@@ -21,7 +22,6 @@
 #include <string_view>
 #include <vector>
 #include "src/common/concurrency/cancellation_observation.h"
-#include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/detail/compile_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"

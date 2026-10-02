@@ -1,3 +1,4 @@
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/pch_std.h"
 namespace mmltk::backend::data::benchmark_internal {

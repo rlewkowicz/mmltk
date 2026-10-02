@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include <compare>
 #include <cstddef>
 #include <cstdint>

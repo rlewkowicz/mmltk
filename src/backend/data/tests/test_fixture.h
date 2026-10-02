@@ -1,6 +1,6 @@
 #pragma once
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
-#include "src/backend/data/benchmark/detail/benchmark_cache.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/io/file_memory.h"
