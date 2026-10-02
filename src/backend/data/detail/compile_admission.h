@@ -64,9 +64,27 @@ struct CompileAllowance::Credits {
   void clone(const Loans& source) { loans_ = source.loans_; }
   void retire() noexcept { loans_.clear(); }
  } workspace_loans;
+ struct ArenaPadding {
+  std::shared_ptr<CompileAdmission> owner;
+  std::uint64_t bytes = 0;
+  bool retained_handles = false;
+  ~ArenaPadding();
+ };
+ // Physical aliases share padding independently of descriptor/producer ancestry.
+ // Declare it before arena so the final physical lease retires before its charge.
+ std::shared_ptr<ArenaPadding> arena_padding;
  CompileArenaLease arena;
  std::shared_ptr<CompileAdmission> owner;
  CompileResources resources;
+ [[nodiscard]] std::uint64_t charged_bytes() const noexcept {
+  // An ancestry walk counts shared physical padding only at its oldest owner.
+  if (arena_padding) {
+   for (auto* ancestor = parent.get(); ancestor; ancestor = ancestor->parent.get())
+    if (ancestor->arena_padding == arena_padding) return resources.bytes;
+   return resources.bytes + arena_padding->bytes;
+  }
+  return resources.bytes;
+ }
  std::shared_ptr<Credits> parent;
  std::size_t available = 0, borrowed = 0, cpu_users = 0;
  bool charged = false;
@@ -166,14 +184,18 @@ struct CompileAdmission {
  }
  [[nodiscard]] bool fits_bytes(CompileResources value, const Credits* parent = nullptr, std::uint64_t retiring_bytes = 0) const {
   if (value.retained_handles || !value.bytes) return true;
+  const auto requested = reservation_bytes(value);
   const auto remaining = bytes - std::min(bytes, retiring_bytes);
-  if (value.bytes <= target && remaining <= target - value.bytes) return true;
+  if (requested <= target && remaining <= target - requested) return true;
   // A legal oversized consumer may finish its own retained input. The complete
   // lineage is charged, and unrelated transient users must first retire.
   std::uint64_t lineage = 0;
   for (auto* credit = parent; credit; credit = credit->parent.get())
-   if (!credit->resources.retained_handles) lineage += credit->resources.bytes;
+   if (!credit->resources.retained_handles) lineage += credit->charged_bytes();
   return remaining == lineage;
+ }
+ [[nodiscard]] std::uint64_t reservation_bytes(CompileResources value) const {
+  return value.supplied_workspace && value.bytes && arenas ? arenas->reservation_bytes(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window) : value.bytes;
  }
  [[nodiscard]] std::size_t descriptor_room(CompileResources value, const Credits* parent = nullptr) const {
   const auto ceiling = descriptor_ceiling(value);
@@ -198,14 +220,14 @@ struct CompileAdmission {
   if (arenas && arenas->exceptional_active() && value.bytes && !exceptional_custody(parent)) return {.denial = CompileResourceDenial::ExceptionalLineage};
   if (value.supplied_workspace && value.bytes && arenas) {
    if (!arenas->fits(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window)) {
-    // A shape exceeding every normal contiguous context has one exclusive
-    // exceptional route. Busy fitting contexts remain ordinary resource waits.
+    // Shape fit ignores fragmentation and busy slices. Only shapes exceeding
+    // all compatible regions have an exclusive exceptional route.
     const auto occupied = arenas->snapshot().leased;
     if (arenas->exceptional_active() || occupied > retiring_arena_bytes) return {.denial = CompileResourceDenial::ArenaBusy};
     if (!arenas->normal_fit(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window)) {
      std::uint64_t lineage = 0;
      for (auto* credit = parent; credit; credit = credit->parent.get())
-      if (!credit->resources.retained_handles) lineage += credit->resources.bytes;
+      if (!credit->resources.retained_handles) lineage += credit->charged_bytes();
      if (bytes - std::min(bytes, retiring_bytes) != lineage) return {.denial = CompileResourceDenial::RetainedLineage};
     }
    }
@@ -213,13 +235,14 @@ struct CompileAdmission {
   if (value.cpu_workers && (value.cpu_workers > cpu_capacity - std::min(cpu_capacity, protected_cpus) || external_cpus + active > cpu_capacity - value.cpu_workers)) return {.denial = CompileResourceDenial::Cpu};
   if (value.descriptors + value.continuation_descriptors > descriptor_room(value, parent)) return {.denial = CompileResourceDenial::Descriptors};
   if (fits_bytes(value, parent, retiring_bytes)) return {.fits = true};
-  if (!finite_consumer || value.producer || value.cpu_workers || value.retained_handles || !value.bytes || value.bytes > target) return {.denial = CompileResourceDenial::Bytes};
+  const auto requested = reservation_bytes(value);
+  if (!finite_consumer || value.producer || value.cpu_workers || value.retained_handles || !requested || requested > target) return {.denial = CompileResourceDenial::Bytes};
   const auto remaining = bytes - std::min(bytes, retiring_bytes);
   if (offered_bytes > remaining) return {.denial = CompileResourceDenial::LoanCapacity};
   std::uint64_t loaned = 0;
   for (const auto& offer : workspace_offers) loaned += offer->lent;
   const auto uncovered = remaining - loaned;
-  const auto room = target - value.bytes;
+  const auto room = target - requested;
   const auto needed = uncovered > room ? uncovered - room : 0;
   if (needed > offered_bytes - loaned) return {.denial = CompileResourceDenial::LoanCapacity};
   return {.fits = true, .loan_bytes = needed};
@@ -262,15 +285,22 @@ struct CompileAdmission {
   const auto claim = checked_add(value.descriptors, value.continuation_descriptors, "benchmark continuation admission overflow");
   const auto borrowed = credit.parent ? std::min(claim, credit.parent->available) : 0;
   auto& storage = value.retained_handles ? handle_bytes : bytes;
-  const auto next_bytes = checked_add(storage, value.bytes, "benchmark byte admission overflow");
+  const auto reserved = reservation_bytes(value);
+  const auto next_bytes = checked_add(storage, reserved, "benchmark byte admission overflow");
   const auto next_descriptors = checked_add(descriptors, value.descriptors, "benchmark descriptor admission overflow");
   const auto next_commitment = checked_add(committed - borrowed, value.continuation_descriptors, "benchmark continuation admission overflow");
   const auto next_cpus = checked_add(external_cpus, value.cpu_workers, "benchmark CPU admission overflow");
   const auto next_opaque = checked_add(opaque_bytes, value.opaque_bytes, "compile opaque library charge overflow");
   if (admitted.loan_bytes) credit.workspace_loans.attach(workspace_offers, admitted.loan_bytes);
+  if (reserved != value.bytes) {
+   credit.arena_padding = std::make_shared<Credits::ArenaPadding>();
+   credit.arena_padding->owner = credit.owner;
+   credit.arena_padding->retained_handles = value.retained_handles;
+  }
   if (value.supplied_workspace && value.bytes && arenas)
    credit.arena = arenas->acquire(value.bytes, !arenas->normal_fit(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window), value.completion_workspace,
     value.workspace_class, value.workspace_window);
+  if (credit.arena_padding) credit.arena_padding->bytes = reserved - value.bytes;
   storage = next_bytes;
   descriptors = next_descriptors;
   committed = next_commitment;

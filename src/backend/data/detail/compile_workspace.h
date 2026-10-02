@@ -45,22 +45,27 @@ public:
  [[nodiscard]] CompileArenaLease slice(std::size_t offset, std::size_t bytes) const;
 };
 class CompileArenaBank final {
+ friend class CompileArenaLease;
  struct State;
  std::shared_ptr<State> state_;
 
 public:
+ static constexpr std::size_t alignment = 64;
  struct Snapshot {
   std::uint64_t locked = 0, resident = 0, leased = 0, exceptional = 0, exceptional_peak = 0, exceptional_reserved = 0, reused = 0, physical_retirements = 0;
-  std::size_t contexts = 0;
   CompileArenaObservation observation{};
  };
  CompileArenaBank(const CompileWorkspacePlan&, std::span<const int> numa_nodes, std::function<void()> released, bool observe = false);
  [[nodiscard]] const CompileWorkspacePlan& plan() const noexcept;
- // Unreserved Task contexts serve every window; named and class-completion reserves require
- // the matching request. Prefer the smallest fitting ordinary context first.
+ // Ordinary slices serve every window; named and class-completion reserves require
+ // the matching request. Ordinary free extents are used before protected storage.
  [[nodiscard]] bool fits(std::size_t bytes, bool completion = false, CompileWorkClass = CompileWorkClass::Count, CompileWorkspaceWindow = CompileWorkspaceWindow::Task) const;
  // Uses the same compatibility rule without occupancy or exceptional activity.
  [[nodiscard]] bool normal_fit(std::size_t bytes, bool completion = false, CompileWorkClass = CompileWorkClass::Count, CompileWorkspaceWindow = CompileWorkspaceWindow::Task) const;
+ [[nodiscard]] std::size_t normal_capacity(bool completion = false, CompileWorkClass = CompileWorkClass::Count, CompileWorkspaceWindow = CompileWorkspaceWindow::Task) const noexcept;
+ // Actual slice charge, including alignment; a shape beyond normal capacity uses
+ // page-rounded exceptional backing. Occupancy never changes this calculation.
+ [[nodiscard]] std::size_t reservation_bytes(std::size_t bytes, bool completion = false, CompileWorkClass = CompileWorkClass::Count, CompileWorkspaceWindow = CompileWorkspaceWindow::Task) const;
  [[nodiscard]] bool exceptional_active() const;
  // Called only after CompileAdmission has drained unrelated physical users.
  // Exceptional materialization occurs at bytes(), outside scheduler locks.

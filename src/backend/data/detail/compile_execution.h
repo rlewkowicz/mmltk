@@ -81,7 +81,6 @@ struct CompileExecutionSnapshot {
  std::uint64_t byte_target = 0;
  std::uint64_t normal_locked = 0, resident = 0, leased = 0, exceptional = 0, exceptional_peak = 0, opaque_library = 0;
  std::uint64_t protected_workspace = 0, shared_workspace = 0, compaction_workspace = 0, exceptional_reserved = 0, workspace_reuses = 0, physical_retirements = 0;
- std::size_t workspace_contexts = 0, context_capacity = 0;
  std::size_t descriptor_limit = 0;
  std::uint64_t admitted = 0, completed = 0;
  // Physical bounded task calls by CompileTaskKind, collected only when observed.
@@ -238,6 +237,7 @@ public:
  [[nodiscard]] std::size_t workers() const noexcept;
  [[nodiscard]] std::span<const int> cpus() const noexcept;
  [[nodiscard]] const CompileWorkspacePlan& workspace_plan() const noexcept;
+ [[nodiscard]] std::size_t workspace_capacity(bool completion = false, CompileWorkClass = CompileWorkClass::Count, CompileWorkspaceWindow = CompileWorkspaceWindow::Task) const noexcept;
  [[nodiscard]] CompileExecutionSnapshot snapshot() const;
  [[nodiscard]] std::uint64_t transient_target() const noexcept;
  [[nodiscard]] std::size_t descriptor_limit() const noexcept;

@@ -297,7 +297,10 @@ struct CompileExecution::Impl {
     if (!first) first = &owned;
     ++references;
    });
-   if (first == &credit && static_cast<std::size_t>(credit.use_count()) == references) result += credit->resources.bytes;
+   if (first == &credit && static_cast<std::size_t>(credit.use_count()) == references) {
+    result += credit->resources.bytes;
+    if (!arenas_only && credit->arena_padding && credit->arena_padding.use_count() == 1) result += credit->arena_padding->bytes;
+   }
   });
   return result;
  }
@@ -437,8 +440,6 @@ struct CompileExecution::Impl {
    result.protected_workspace = plan.protected_bytes;
    result.shared_workspace = plan.shared_bytes;
    result.compaction_workspace = plan.compaction_bytes;
-   result.workspace_contexts = plan.contexts;
-   result.context_capacity = plan.context_bytes;
   }
   result.admitted = admitted;
   result.completed = completed;
@@ -1286,6 +1287,9 @@ CompileAllowance CompileExecution::current_allowance() const {
 std::size_t CompileExecution::workers() const noexcept { return impl_->cpus.size(); }
 std::span<const int> CompileExecution::cpus() const noexcept { return impl_->cpus; }
 const CompileWorkspacePlan& CompileExecution::workspace_plan() const noexcept { return impl_->admission->arenas->plan(); }
+std::size_t CompileExecution::workspace_capacity(bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) const noexcept {
+ return impl_->admission->arenas->normal_capacity(completion, kind, window);
+}
 CompileExecutionSnapshot CompileExecution::snapshot() const {
  const std::lock_guard lock(impl_->admission->mutex);
  return impl_->snapshot_locked();

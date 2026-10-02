@@ -8,6 +8,7 @@
 #include "src/common/system/numa_memory.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <algorithm>
+#include <bit>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -94,36 +95,119 @@ CompileWorkspacePlan CompileWorkspacePlan::prepare(std::size_t workers, std::spa
  for (auto extent : result.context_capacities) result.context_bytes = std::max(result.context_bytes, extent);
  return result;
 }
+namespace {
+// Allocated links live in the existing shared lease control. Free links live at
+// the end of their own unused extent. No allocator node or payload allocation is
+// needed to split or coalesce, and no metadata occupies an admitted byte.
+struct ArenaBlock {
+ std::byte* data = nullptr;
+ std::size_t size = 0;
+ ArenaBlock *previous = nullptr, *next = nullptr;
+ ArenaBlock *free_previous = nullptr, *free_next = nullptr;
+ bool free = false;
+};
+static_assert(sizeof(ArenaBlock) <= CompileArenaBank::alignment);
+static_assert(CompileArenaBank::alignment % alignof(ArenaBlock) == 0);
+}  // namespace
 struct CompileArenaLease::State {
+ ArenaBlock block;
  std::span<std::byte> memory;
- std::size_t requested = 0;
+ std::size_t requested = 0, region = 0;
  int node = -1;
- bool oversized = false;
+ bool oversized = false, acquired = false;
  std::unique_ptr<NumaMemory> exceptional;
- std::shared_ptr<void> bank;
- std::function<void()> release, materialized;
+ std::shared_ptr<CompileArenaBank::State> bank;
  mutable std::mutex mutex;
- ~State() {
-  exceptional.reset();  // Physical retirement precedes eligibility publication.
-  if (release) release();
- }
+ ~State();
 };
 struct CompileArenaBank::State {
- struct Context {
+ struct Region {
   std::span<std::byte> bytes;
-  bool used = false;
   CompileWorkClass completion = CompileWorkClass::Count;
   CompileWorkspaceWindow window = CompileWorkspaceWindow::Task;
-  bool borrowed = false;
+  std::array<ArenaBlock*, std::numeric_limits<std::size_t>::digits> bins{};
+  std::uint64_t nonempty = 0;
+  std::size_t free_bytes = 0, observed_end = 0;
+  [[nodiscard]] bool ordinary() const noexcept { return window == CompileWorkspaceWindow::Task && completion == CompileWorkClass::Count; }
   [[nodiscard]] bool eligible(bool completing, CompileWorkClass kind, CompileWorkspaceWindow requested) const noexcept {
-   return (window == CompileWorkspaceWindow::Task && completion == CompileWorkClass::Count) ||
+   return ordinary() ||
     (window != CompileWorkspaceWindow::Task && window == requested) ||
     (completing && kind != CompileWorkClass::Count && completion == kind);
+  }
+  [[nodiscard]] static std::size_t bin(std::size_t size) noexcept { return std::bit_width(size / alignment) - 1; }
+  void unlink(ArenaBlock& block) noexcept {
+   const auto index = bin(block.size);
+   if (block.free_previous) block.free_previous->free_next = block.free_next;
+   else bins[index] = block.free_next;
+   if (block.free_next) block.free_next->free_previous = block.free_previous;
+   if (!bins[index]) nonempty &= ~(std::uint64_t{1} << index);
+  }
+  ArenaBlock* insert(std::byte* data, std::size_t size, ArenaBlock* previous, ArenaBlock* next) noexcept {
+   const auto index = bin(size);
+   auto* block = std::construct_at(reinterpret_cast<ArenaBlock*>(data + size - alignment), ArenaBlock{data, size, previous, next, nullptr, bins[index], true});
+   if (previous) previous->next = block;
+   if (next) next->previous = block;
+   if (bins[index]) bins[index]->free_previous = block;
+   bins[index] = block;
+   nonempty |= std::uint64_t{1} << index;
+   return block;
+  }
+  [[nodiscard]] ArenaBlock* find(std::size_t size) const noexcept {
+   if (size > free_bytes) return nullptr;
+   const auto index = bin(size);
+   // Only the size's own bin can contain undersized fragments. Every block in
+   // the next occupied bin fits; bounded bin selection skips all smaller ones.
+   ArenaBlock* best = nullptr;
+   for (auto* block = bins[index]; block; block = block->free_next)
+    if (block->size >= size && (!best || block->size < best->size)) {
+     best = block;
+     if (block->size == size) return best;
+    }
+   if (best) return best;
+   const auto larger = nonempty & (~std::uint64_t{1} << index);
+   return larger ? bins[std::countr_zero(larger)] : nullptr;
+  }
+  [[nodiscard]] std::size_t largest() const noexcept {
+   if (!nonempty) return 0;
+   std::size_t result = 0;
+   for (auto* block = bins[std::bit_width(nonempty) - 1]; block; block = block->free_next) result = std::max(result, block->size);
+   return result;
+  }
+  void acquire(ArenaBlock& free, ArenaBlock& owned, std::size_t size) noexcept {
+   unlink(free);
+   owned = free;
+   owned.free = false;
+   owned.free_previous = owned.free_next = nullptr;
+   if (owned.previous) owned.previous->next = &owned;
+   if (owned.next) owned.next->previous = &owned;
+   const auto remaining = owned.size - size;
+   owned.size = size;
+   if (remaining) owned.next = insert(owned.data + size, remaining, &owned, owned.next);
+   free_bytes -= size;
+  }
+  void release(ArenaBlock& owned) noexcept {
+   auto* data = owned.data;
+   auto size = owned.size;
+   auto* previous = owned.previous;
+   auto* next = owned.next;
+   free_bytes += size;
+   if (previous && previous->free) {
+    unlink(*previous);
+    data = previous->data;
+    size += previous->size;
+    previous = previous->previous;
+   }
+   if (next && next->free) {
+    unlink(*next);
+    size += next->size;
+    next = next->next;
+   }
+   insert(data, size, previous, next);
   }
  };
  CompileWorkspacePlan plan;
  std::vector<NumaMemory> memory;
- std::vector<Context> contexts;
+ std::vector<Region> regions;
  std::function<void()> released;
  mutable std::mutex mutex;
  std::uint64_t leased = 0, exceptional = 0, exceptional_locked = 0, peak = 0, reused = 0, retired = 0;
@@ -143,23 +227,58 @@ struct CompileArenaBank::State {
   --observed_live;
   observed_occupied -= bytes;
  }
- // The caller holds mutex. Occupancy affects availability, never shape fit.
- [[nodiscard]] std::size_t select(std::size_t bytes, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window, bool available_only) const {
-  std::size_t selected = contexts.size();
+ struct Selection {
+  std::size_t region = 0;
+  ArenaBlock* block = nullptr;
+ };
+ // The caller holds mutex. Protected windows are separate regions even when
+ // they share one physical allocation; coalescing never crosses their edges.
+ [[nodiscard]] Selection select(std::size_t bytes, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) const {
+  Selection selected;
   bool selected_ordinary = false;
-  for (std::size_t i = 0; i < contexts.size(); ++i) {
-   const auto& value = contexts[i];
-   if ((available_only && value.used) || bytes > value.bytes.size()) continue;
-   const bool ordinary = value.window == CompileWorkspaceWindow::Task && value.completion == CompileWorkClass::Count;
+  for (std::size_t i = 0; i < regions.size(); ++i) {
+   const auto& value = regions[i];
    if (!value.eligible(completion, kind, window)) continue;
-   if (selected == contexts.size() || (ordinary && !selected_ordinary) || (ordinary == selected_ordinary && value.bytes.size() < contexts[selected].bytes.size())) {
-    selected = i;
+   const bool ordinary = value.ordinary();
+   if (selected.block && selected_ordinary && !ordinary) continue;
+   auto* block = value.find(bytes);
+   if (block && (!selected.block || (ordinary && !selected_ordinary) || (ordinary == selected_ordinary && block->size < selected.block->size))) {
+    selected = {i, block};
     selected_ordinary = ordinary;
    }
   }
   return selected;
  }
+ void release(CompileArenaLease::State& lease) {
+  {
+   const std::lock_guard lock(mutex);
+   if (lease.oversized) {
+    observe_release(exceptional);
+    exceptional = 0;
+    if (observing) exceptional_requested = 0;
+    if (observing && exceptional_locked) ++retired;
+    exceptional_locked = 0;
+   } else {
+    observe_release(lease.block.size);
+    regions[lease.region].release(lease.block);
+    leased -= lease.requested;
+   }
+  }
+  if (released) released();
+ }
+ void materialized(std::size_t extent) {
+  {
+   const std::lock_guard lock(mutex);
+   exceptional_locked = extent;
+   if (observing) peak = std::max(peak, plan.budget + extent);
+  }
+  if (released) released();
+ }
 };
+CompileArenaLease::State::~State() {
+ exceptional.reset();  // Physical retirement precedes eligibility publication.
+ if (acquired) bank->release(*this);
+}
 CompileArenaBank::CompileArenaBank(const CompileWorkspacePlan& plan, std::span<const int> nodes, std::function<void()> released, bool observe) : state_(std::make_shared<State>()) {
  if (nodes.empty()) throw std::invalid_argument("compile arena has no resolved NUMA placement");
  const auto page = common::system::host_page_size();
@@ -184,10 +303,10 @@ CompileArenaBank::CompileArenaBank(const CompileWorkspacePlan& plan, std::span<c
  state.released = std::move(released);
  state.exceptional_node = nodes.front();
  state.observing = observe;
- // Each context is independently placed in resolved CPU order. The protected
- // windows and the remaining budget are pinned too, even while no task uses them.
+ // Preserve the prepared physical allocations and their resolved CPU placement.
+ // Every ordinary byte, including the tail after protected windows, is usable.
  state.memory.reserve(plan.contexts + 1);
- state.contexts.reserve(plan.contexts + plan.completion.size());
+ state.regions.reserve(plan.contexts + plan.completion.size() + 3);
  const auto allocate = [&](std::size_t bytes, int node) {
   state.memory.emplace_back(node, NumaMemory::Lock::Pages);
   try {
@@ -195,101 +314,95 @@ CompileArenaBank::CompileArenaBank(const CompileWorkspacePlan& plan, std::span<c
   } catch (const std::bad_alloc&) { throw std::system_error(std::make_error_code(std::errc::not_enough_memory), "prepare fixed pinned compile arena on NUMA node " + std::to_string(node)); }
   return std::span(static_cast<std::byte*>(state.memory.back().data()), state.memory.back().capacity_bytes());
  };
+ const auto region = [&](std::span<std::byte> bytes, CompileWorkClass completion = CompileWorkClass::Count, CompileWorkspaceWindow window = CompileWorkspaceWindow::Task) {
+  if (bytes.empty()) return;
+  auto& value = state.regions.emplace_back();
+  value.bytes = bytes;
+  value.completion = completion;
+  value.window = window;
+  value.free_bytes = bytes.size();
+  value.insert(bytes.data(), bytes.size(), nullptr, nullptr);
+ };
  std::size_t used = 0;
  for (std::size_t i = 0; i < plan.context_capacities.size(); ++i) {
   const auto bytes = plan.context_capacities[i];
   used += bytes;
-  state.contexts.push_back({allocate(bytes, nodes[i % nodes.size()])});
+  region(allocate(bytes, nodes[i % nodes.size()]));
  }
- auto tail = allocate(static_cast<std::size_t>(plan.budget) - used, nodes.front());
+ const auto remaining = static_cast<std::size_t>(plan.budget) - used;
+ auto tail = remaining ? allocate(remaining, nodes.front()) : std::span<std::byte>{};
  for (std::size_t i = 0; i < plan.completion.size(); ++i)
   if (const auto bytes = plan.completion[i]) {
-   state.contexts.push_back({tail.first(bytes), false, static_cast<CompileWorkClass>(i)});
+   region(tail.first(bytes), static_cast<CompileWorkClass>(i));
    tail = tail.subspan(bytes);
   }
  for (const auto window : {CompileWorkspaceWindow::SharedSource, CompileWorkspaceWindow::Compaction}) {
   const auto bytes = window == CompileWorkspaceWindow::SharedSource ? plan.shared_bytes : plan.compaction_bytes;
   if (bytes) {
-   state.contexts.push_back({tail.first(bytes), false, CompileWorkClass::Count, window});
+   region(tail.first(bytes), CompileWorkClass::Count, window);
    tail = tail.subspan(bytes);
   }
  }
+ region(tail);
 }
 const CompileWorkspacePlan& CompileArenaBank::plan() const noexcept { return state_->plan; }
 bool CompileArenaBank::fits(std::size_t bytes, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) const {
  const std::lock_guard lock(state_->mutex);
  if (state_->exceptional) return false;
- return state_->select(bytes, completion, kind, window, true) != state_->contexts.size();
+ if (!bytes) return true;
+ if (!normal_fit(bytes, completion, kind, window)) return false;
+ return state_->select(reservation_bytes(bytes, completion, kind, window), completion, kind, window).block != nullptr;
 }
 bool CompileArenaBank::normal_fit(std::size_t bytes, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) const {
- const std::lock_guard lock(state_->mutex);
- return state_->select(bytes, completion, kind, window, false) != state_->contexts.size();
+ return bytes <= normal_capacity(completion, kind, window);
+}
+std::size_t CompileArenaBank::normal_capacity(bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) const noexcept {
+ // Shape and protection are immutable after bank construction.
+ std::size_t largest = 0;
+ for (const auto& region : state_->regions)
+  if (region.eligible(completion, kind, window)) largest = std::max(largest, region.bytes.size());
+ return largest;
+}
+std::size_t CompileArenaBank::reservation_bytes(std::size_t bytes, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) const {
+ if (!bytes) return 0;
+ if (!normal_fit(bytes, completion, kind, window)) return page_rounded_bytes(bytes);
+ return checked_add(bytes, alignment - 1, "compile arena alignment overflow") / alignment * alignment;
 }
 bool CompileArenaBank::exceptional_active() const {
  const std::lock_guard lock(state_->mutex);
  return state_->exceptional != 0;
 }
 CompileArenaLease CompileArenaBank::acquire(std::size_t bytes, bool exceptional, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) {
+ if (!bytes) return {};
+ const auto extent = reservation_bytes(bytes, completion, kind, window);
  auto lease = std::make_shared<CompileArenaLease::State>();
  lease->bank = state_;
  lease->requested = bytes;
- std::weak_ptr<State> weak = state_;
  const std::lock_guard lock(state_->mutex);
  if (state_->exceptional) throw InsufficientCompileResources("compile exceptional lineage has not physically retired");
- const auto selected = state_->select(bytes, completion, kind, window, true);
- if (selected != state_->contexts.size()) {
-  const auto i = selected;
-  auto& value = state_->contexts[i];
-  lease->memory = value.bytes;
-  lease->release = [weak, i, bytes] {
-   if (auto state = weak.lock()) {
-    {
-     const std::lock_guard guard(state->mutex);
-     state->contexts[i].used = false;
-     state->observe_release(state->contexts[i].bytes.size());
-     state->leased -= bytes;
-    }
-    if (state->released) state->released();
-   }
-  };
-  value.used = true;
-  state_->observe_acquire(value.bytes.size());
+ const auto selected = state_->select(extent, completion, kind, window);
+ if (selected.block) {
+  const auto i = selected.region;
+  auto& value = state_->regions[i];
+  lease->memory = {selected.block->data, bytes};
+  lease->region = i;
+  value.acquire(*selected.block, lease->block, extent);
+  lease->acquired = true;
+  state_->observe_acquire(extent);
   if (state_->observing) {
-   if (value.borrowed) ++state_->reused;
-   value.borrowed = true;
+   const auto offset = static_cast<std::size_t>(lease->block.data - value.bytes.data());
+   if (offset < value.observed_end) ++state_->reused;
+   value.observed_end = std::max(value.observed_end, offset + extent);
   }
   state_->leased += bytes;
   return CompileArenaLease(std::move(lease), 0, bytes);
  }
- if (!exceptional || state_->leased || state_->select(bytes, completion, kind, window, false) != state_->contexts.size())
-  throw InsufficientCompileResources("compile arena has no fitting available context");
+ if (!exceptional || state_->leased || normal_fit(bytes, completion, kind, window))
+  throw InsufficientCompileResources("compile arena has no fitting available extent");
  lease->oversized = true;
  lease->node = state_->exceptional_node;
- const auto extent = page_rounded_bytes(bytes);
- lease->release = [weak] {
-  if (auto state = weak.lock()) {
-   {
-    const std::lock_guard guard(state->mutex);
-    state->observe_release(state->exceptional);
-    state->exceptional = 0;
-    if (state->observing) state->exceptional_requested = 0;
-    if (state->observing && state->exceptional_locked) ++state->retired;
-    state->exceptional_locked = 0;
-   }
-   if (state->released) state->released();
-  }
- };
- lease->materialized = [weak, extent] {
-  if (auto state = weak.lock()) {
-   {
-    const std::lock_guard guard(state->mutex);
-    state->exceptional_locked = extent;
-    if (state->observing) state->peak = std::max(state->peak, state->plan.budget + extent);
-   }
-   if (state->released) state->released();
-  }
- };
  state_->exceptional = extent;
+ lease->acquired = true;
  state_->observe_acquire(extent);
  if (state_->observing) state_->exceptional_requested = bytes;
  return CompileArenaLease(std::move(lease), 0, bytes);
@@ -297,8 +410,7 @@ CompileArenaLease CompileArenaBank::acquire(std::size_t bytes, bool exceptional,
 CompileArenaBank::Snapshot CompileArenaBank::snapshot() const {
  const std::lock_guard lock(state_->mutex);
  Snapshot result{
-  state_->plan.budget, state_->plan.budget + state_->exceptional_locked, state_->leased, state_->exceptional_locked, state_->peak, state_->exceptional, state_->reused, state_->retired,
-  state_->plan.contexts
+  state_->plan.budget, state_->plan.budget + state_->exceptional_locked, state_->leased, state_->exceptional_locked, state_->peak, state_->exceptional, state_->reused, state_->retired
  };
  if (state_->observing) {
   auto& value = result.observation;
@@ -306,29 +418,26 @@ CompileArenaBank::Snapshot CompileArenaBank::snapshot() const {
   value.allocation_high_water = state_->allocation_high_water;
   value.occupied_high_water = state_->occupied_high_water;
   value.requested_bytes = state_->leased + state_->exceptional_requested;
+  value.live_allocations = state_->observed_live;
+  value.occupied_bytes = state_->observed_occupied;
+  value.alignment_loss = value.occupied_bytes - value.requested_bytes;
+  value.backing_regions = state_->memory.size() + (state_->exceptional_locked ? 1 : 0);
   std::uint64_t registered = 0;
-  for (const auto& context : state_->contexts) {
-   const auto bytes = context.bytes.size();
+  for (const auto& region : state_->regions) {
+   const auto bytes = region.bytes.size();
    registered += bytes;
-   if (context.used) {
-    ++value.live_allocations;
-    value.occupied_bytes += bytes;
-    if (context.window == CompileWorkspaceWindow::SharedSource) value.shared_occupied += bytes;
-    else if (context.window == CompileWorkspaceWindow::Compaction) value.compaction_occupied += bytes;
-    else if (context.completion != CompileWorkClass::Count) value.completion_occupied += bytes;
-   } else if (context.window == CompileWorkspaceWindow::Task && context.completion == CompileWorkClass::Count) {
-    value.ordinary_free_bytes += bytes;
-    value.largest_ordinary_extent = std::max<std::uint64_t>(value.largest_ordinary_extent, bytes);
+   const auto occupied = bytes - region.free_bytes;
+   if (region.window == CompileWorkspaceWindow::SharedSource) value.shared_occupied += occupied;
+   else if (region.window == CompileWorkspaceWindow::Compaction) value.compaction_occupied += occupied;
+   else if (region.completion != CompileWorkClass::Count) value.completion_occupied += occupied;
+   else {
+    value.ordinary_capacity += bytes;
+    value.largest_ordinary_capacity = std::max<std::uint64_t>(value.largest_ordinary_capacity, bytes);
+    value.ordinary_free_bytes += region.free_bytes;
+    value.largest_ordinary_extent = std::max<std::uint64_t>(value.largest_ordinary_extent, region.largest());
    }
   }
-  // Whole contexts have no alignment padding: their excess is occupancy, not
-  // alignment loss. The unused tail is separately visible until suballocation.
   value.unregistered_bytes = state_->plan.budget - registered;
-  if (state_->exceptional) {
-   ++value.live_allocations;
-   value.occupied_bytes += state_->exceptional;
-   value.alignment_loss += state_->exceptional - state_->exceptional_requested;
-  }
  }
  return result;
 }
@@ -336,8 +445,8 @@ std::uint64_t CompileArenaBank::largest_available(bool completion, CompileWorkCl
  const std::lock_guard lock(state_->mutex);
  if (state_->exceptional) return 0;
  std::uint64_t largest = 0;
- for (const auto& context : state_->contexts)
-  if (!context.used && context.eligible(completion, kind, window)) largest = std::max<std::uint64_t>(largest, context.bytes.size());
+ for (const auto& region : state_->regions)
+  if (region.eligible(completion, kind, window)) largest = std::max<std::uint64_t>(largest, region.largest());
  return largest;
 }
 std::span<std::byte> CompileArenaLease::bytes() const {
@@ -348,7 +457,7 @@ std::span<std::byte> CompileArenaLease::bytes() const {
   memory->ensure_bytes(state_->requested);
   state_->memory = {static_cast<std::byte*>(memory->data()), memory->capacity_bytes()};
   state_->exceptional = std::move(memory);
-  if (state_->materialized) state_->materialized();
+  state_->bank->materialized(state_->memory.size());
  }
  return state_->memory.subspan(offset_, bytes_);
 }

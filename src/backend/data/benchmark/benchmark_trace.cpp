@@ -61,7 +61,7 @@ void trace_compile_execution(const BenchmarkTraceSink& sink, std::string_view ev
    {"external", value.external}, {"services", value.services}, {"bytes", value.resources.bytes}, {"byte_target", value.byte_target}, {"normal_locked", value.normal_locked},
    {"resident", value.resident}, {"leased", value.leased}, {"exceptional", value.exceptional}, {"exceptional_peak", value.exceptional_peak}, {"opaque_library", value.opaque_library},
    {"protected_workspace", value.protected_workspace}, {"shared_workspace", value.shared_workspace}, {"compaction_workspace", value.compaction_workspace},
-   {"workspace_contexts", value.workspace_contexts}, {"context_capacity", value.context_capacity}, {"exceptional_reserved", value.exceptional_reserved},
+   {"exceptional_reserved", value.exceptional_reserved},
    {"workspace_reuses", value.workspace_reuses}, {"physical_retirements", value.physical_retirements}, {"descriptors", value.resources.descriptors},
    {"descriptor_limit", value.descriptor_limit}, {"descriptor_promises", value.resources.continuation_descriptors}, {"records", value.records}, {"record_limit", value.record_limit},
    {"admitted", value.admitted}, {"completed", value.completed}, {"task_completed", value.task_completed}, {"task_duration_ns", value.task_duration_ns},

@@ -1513,8 +1513,25 @@ TEST_CASE("compile preparation uses owner capacities protected reserves and the 
  const auto oversized = CompileWorkspacePlan::prepare(2, profiles, page, page);
  CHECK(oversized.context_bytes == page * 3);  // Legal large image is an exceptional request, not a preparation rejection.
  CHECK_THROWS_AS(CompileWorkspacePlan::prepare(2, profiles, CompileWorkspacePlan::ceiling, page), InsufficientCompileResources);
+ for (const std::size_t workers : {1, 6, 24}) {
+  std::array<CompileWorkspaceProfile, 6> enabled;
+  enabled.fill({1ULL << 30, page});
+  const auto bounded = CompileWorkspacePlan::prepare(workers, enabled, page, page);
+  CHECK(bounded.contexts <= workers);
+  CHECK(bounded.protected_bytes == page * 8);
+  CHECK(bounded.budget <= CompileWorkspacePlan::ceiling);
+  if (workers >= enabled.size()) CHECK(bounded.budget == CompileWorkspacePlan::ceiling);
+  auto ordinary = bounded.budget - bounded.protected_bytes;
+  for (const auto bytes : bounded.context_capacities) {
+   REQUIRE(bytes <= ordinary);
+   ordinary -= bytes;
+  }
+  // Remaining ordinary bytes form a usable tail; the plan does not multiply
+  // protected windows or increase its ceiling to fit all class maxima.
+  CHECK(ordinary % page == 0);
+ }
 }
-TEST_CASE("compile arena windows prefer the smallest ordinary context and retain physical borrowers", "[backend][data][compile][resources]") {
+TEST_CASE("compile arena windows prefer small ordinary extents and retain physical borrowers", "[backend][data][compile][resources]") {
  using namespace mmltk::backend::data::detail;
  const auto window = GENERATE(CompileWorkspaceWindow::Task, CompileWorkspaceWindow::SharedSource, CompileWorkspaceWindow::Compaction);
  CAPTURE(window);
@@ -1528,6 +1545,7 @@ TEST_CASE("compile arena windows prefer the smallest ordinary context and retain
  CompileArenaBank bank(plan, nodes, [&] { ++releases; }, true);
  // Even an eligible smaller reserve must remain free while ordinary backing fits.
  auto small = bank.acquire(page, false, true, CompileWorkClass::Extraction, window);
+ auto fragment = bank.acquire(page, false);
  auto middle = bank.acquire(page * 4, false, false, CompileWorkClass::Count, CompileWorkspaceWindow::Compaction);
  auto large = bank.acquire(page * 8, false, false, CompileWorkClass::Count, CompileWorkspaceWindow::SharedSource);
  auto* const base = small.bytes().data();
@@ -1562,6 +1580,9 @@ TEST_CASE("compile arena windows prefer the smallest ordinary context and retain
  CHECK(borrower.bytes()[0] == std::byte{37});
  borrower = {};
  CHECK(releases == 1);
+ CHECK_FALSE(bank.fits(page * 2, false, CompileWorkClass::Count, window));
+ fragment = {};
+ CHECK(releases == 2);
  auto reused = bank.acquire(page * 2, false, false, CompileWorkClass::Count, window);
  CHECK(reused.bytes().data() == base);
  CHECK(reused.bytes()[0] == std::byte{37});

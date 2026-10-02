@@ -10399,7 +10399,7 @@ TEST_CASE("Parquet staged batches retain one forward reader and reusable source 
  });
  const mmltk::testsupport::ScopedTestCleanup release([&] { pipeline.execution().cancel(); });
  if (pressure) {
-  const auto bytes = pipeline.execution().workspace_plan().context_bytes;
+  const auto bytes = pipeline.execution().workspace_capacity();
   held = pipeline.execution().reserve({.bytes = bytes, .supplied_workspace = true});
   blocked = pipeline.execution().submit({.kind = CompileTaskKind::Normalize, .resources = {.bytes = bytes, .supplied_workspace = true}, .work = [](std::size_t, const CompileAllowance&) {}});
   mmltk::testsupport::await_test_promise(waiting, "ordinary scratch contention leaves the protected source window useful");
@@ -10566,8 +10566,10 @@ TEST_CASE("native staging and arena retirement precede controller settlement", "
  }
  REQUIRE(first_work.WaitEntered(5s));
  REQUIRE(second.WaitEntered(5s));
+ const auto both_leased = pipeline.execution().snapshot().leased;
  first_work.Release();
  REQUIRE(settlement.WaitEntered(5s));
+ CHECK(pipeline.execution().snapshot().leased < both_leased);
  const auto first = input.records->row(0).native();
  REQUIRE(first);
  REQUIRE(first->boxes().size() == 1);
@@ -10576,10 +10578,11 @@ TEST_CASE("native staging and arena retirement precede controller settlement", "
  std::array<std::byte, sizeof(RLEPair)> first_run;
  std::memcpy(first_box.data(), first->boxes().data(), first_box.size());
  std::memcpy(first_run.data(), first->runs().data(), first_run.size());
- // With two normal contexts, the second task owns one and this task can only
- // run if the first output released its workspace before settlement started.
+ // The first slice has retired before controller settlement, while the second
+ // task retains its own slice. A full region can be reused without mutating
+ // the first immutable output.
  auto reusing = std::async(std::launch::async, [&] {
-  pipeline.execution().run(CompileTaskKind::Normalize, {.bytes = plan->context_bytes, .supplied_workspace = true}, [&](std::size_t) {
+  pipeline.execution().run(CompileTaskKind::Normalize, {.bytes = pipeline.execution().workspace_capacity(), .supplied_workspace = true}, [&](std::size_t) {
    auto bytes = pipeline.execution().current_allowance().workspace();
    std::memset(bytes.data(), 0xa5, bytes.size());
   });
@@ -10889,7 +10892,7 @@ TEST_CASE("stock recovery compiles a completed physical archive while a peer dow
  CHECK(CompiledDataset::open(config.output_dir / "val.bin").header().num_images == 1);
  held.server.Check();
 }
-TEST_CASE("native staging retains its record while a competing image waits for the shared arena", "[benchmark][coconut][annotations][resources]") {
+TEST_CASE("native staging retains its record while an image uses another slice of shared backing", "[benchmark][coconut][annotations][resources]") {
  using namespace mmltk::backend::data::detail;
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
@@ -10898,13 +10901,14 @@ TEST_CASE("native staging retains its record while a competing image waits for t
  auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(2, profiles, kParquetPoolBytes, 0, kParquetPoolBytes + (4U << 20)));
  REQUIRE(plan->contexts == 1);
  mmltk::testsupport::TestGate prepared("native staging has physically prepared its immutable range");
+ mmltk::testsupport::TestGate pixels("independent image keeps its admitted slice while native copy resumes");
  std::atomic<bool> hold_next{false}, bounded{true};
- std::promise<void> waiting, copied;
+ std::promise<void> copied;
  const BenchmarkTraceSink trace = [&](std::string_view event, const Json& fields) {
   if (event == "file.physical_completed" && fields.at("service") == "output" && hold_next.exchange(false)) prepared.receipt().ArriveAndWait();
+  if (event == "benchmark.image.stage_started" && fields.at("stage") == "pixels") pixels.receipt().ArriveAndWait();
   if (event == "compile.execution") {
    if (fields.at("records").get<std::size_t>() > 2 || fields.at("leased").get<std::uint64_t>() > plan->budget + fields.at("exceptional_reserved").get<std::uint64_t>()) bounded = false;
-   if (fields.at("parked")[static_cast<std::size_t>(CompileParkReason::Bytes)].get<std::size_t>()) mmltk::testsupport::release_test_promise(waiting);
   }
  };
  BenchmarkCompilePipeline pipeline(2, {}, {.descriptors = 16, .task_records = 2, .workspace_plan = plan}, {}, trace);
@@ -10928,17 +10932,20 @@ TEST_CASE("native staging retains its record while a competing image waits for t
  auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
  const mmltk::testsupport::ScopedTestCleanup release([&] {
   prepared.Release();
+  pixels.Release();
   pipeline.execution().cancel();
  });
  REQUIRE(prepared.WaitEntered(5s));
  CHECK(pipeline.execution().snapshot().records == 1);
  const auto publication = pipeline.source_publication(images, {});
  publication({99});
- mmltk::testsupport::await_test_promise(waiting, "competing image workspace is admitted but cannot borrow native scratch", 5s);
+ REQUIRE(pixels.WaitEntered(5s));
  CHECK(pipeline.execution().snapshot().records == 2);
+ CHECK(pipeline.execution().snapshot().arena.live_allocations >= 2);
  CHECK_FALSE(pipeline.image_completion(images, 99).ready());
  prepared.Release();
  mmltk::testsupport::await_test_promise(copied, "native copy reuses its retained record under a full record bank", 5s);
+ pixels.Release();
  const auto components = mmltk::testsupport::await_test_future(importing, "native storage retires without cancelling the competing image", 5s);
  pipeline.wait_image(images, 99);
  REQUIRE(components.size() == 1);

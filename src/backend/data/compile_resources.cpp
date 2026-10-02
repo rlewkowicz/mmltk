@@ -1,5 +1,11 @@
 #include "src/backend/data/detail/compile_admission.h"
 namespace mmltk::backend::data::detail {
+CompileAllowance::Credits::ArenaPadding::~ArenaPadding() {
+ if (!bytes) return;
+ const std::lock_guard lock(owner->mutex);
+ (retained_handles ? owner->handle_bytes : owner->bytes) -= bytes;
+ owner->notify(CompileAdmission::Change::Resources);
+}
 CompileResources CompileResources::handles(std::size_t count, bool producer, std::size_t continuation) {
  return {mmltk::common::math::checked_multiply(std::uint64_t{8192}, static_cast<std::uint64_t>(count), "benchmark handle custody overflow"), count, producer, 0, true, continuation};
 }
@@ -73,7 +79,9 @@ CompileAllowance CompileAllowance::split_storage(std::uint64_t bytes) {
    throw std::logic_error("benchmark storage partition requires a settled input window");
   if (bytes) storage->workspace_loans.clone(credits_->workspace_loans);
   if (credits_->arena) {
+   storage->arena_padding = credits_->arena_padding;
    storage->resources.supplied_workspace = true;
+   storage->resources.completion_workspace = credits_->resources.completion_workspace;
    storage->resources.workspace_class = credits_->resources.workspace_class;
    storage->resources.workspace_window = credits_->resources.workspace_window;
    storage->arena = credits_->arena.slice(0, bytes);

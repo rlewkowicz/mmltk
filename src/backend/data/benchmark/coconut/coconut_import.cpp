@@ -1528,7 +1528,7 @@ public:
   return true;
  }
  void metadata(std::uint64_t bytes, const std::function<void()>& work) {
-  if (request_.execution && bytes > request_.execution->execution().snapshot().context_capacity) {
+  if (request_.execution && bytes > request_.execution->execution().workspace_capacity()) {
    if (archive_) pause();
    importer_.drain_normalization();
   }
@@ -1964,7 +1964,7 @@ void xlarge_records(const CoconutImportRequest& request, CoconutAnnotationRecord
    segments_from_json(segments, record, request.limits);
   };
   if (request.execution) {
-   if (demand > request.execution->execution().snapshot().context_capacity) {
+   if (demand > request.execution->execution().workspace_capacity()) {
     if (masks)
      masks->suspend();
     else {

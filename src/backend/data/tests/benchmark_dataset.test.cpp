@@ -10247,13 +10247,16 @@ TEST_CASE("compile continuation custody separates step callbacks from record ret
   exercise();
 }
 TEST_CASE("aged compile demands leave retained-owner dependencies runnable", "[backend][data][benchmark][pipeline]") {
+ using namespace mmltk::backend::data::detail;
  const bool parent_custody = GENERATE(false, true);
- CAPTURE(parent_custody);
- CompileExecution execution(1, {}, {.transient_bytes = 64, .descriptors = 16});
- auto retained = execution.reserve({32, 0});
+ const bool supplied = GENERATE(false, true);
+ CAPTURE(parent_custody, supplied);
+ const auto unit = supplied ? mmltk::common::system::host_page_size() : std::size_t{32};
+ CompileExecution execution(1, {}, {.transient_bytes = unit * 2, .descriptors = 16});
+ auto retained = execution.reserve({.bytes = unit, .supplied_workspace = supplied});
  std::atomic<unsigned> smaller{0}, observed_smaller{0};
  mmltk::testsupport::TestGate first("retained owner needs fitting small work");
- auto large = execution.submit({.kind = CompileTaskKind::Recovery, .resources = {64, 0}, .work = [&](std::size_t, const CompileAllowance&) { observed_smaller = smaller.load(); }});
+ auto large = execution.submit({.kind = CompileTaskKind::Recovery, .resources = {.bytes = unit * 2, .supplied_workspace = supplied}, .work = [&](std::size_t, const CompileAllowance&) { observed_smaller = smaller.load(); }});
  auto owner = std::async(std::launch::async, [&, retained = std::move(retained)]() mutable {
   // These completions cross the age threshold before the outside owner can
   // release its bytes. Explicit parent custody must preserve the same progress.
@@ -10261,7 +10264,7 @@ TEST_CASE("aged compile demands leave retained-owner dependencies runnable", "[b
    execution
     .submit(
      {.kind = CompileTaskKind::Recovery,
-      .resources = {32, 0},
+      .resources = {.bytes = unit, .supplied_workspace = supplied},
       .work =
        [&](std::size_t, const CompileAllowance&) {
     if (!item) first.receipt().ArriveAndWait();
@@ -10968,7 +10971,8 @@ TEST_CASE("compile fixed arenas retain pinning while owned label outputs delay r
     .retain_workspace = false})
   .wait();
  CHECK(execution.snapshot().normal_locked == initial);
- CHECK(execution.resource_usage().bytes == bytes);
+ const auto charged = (bytes + CompileArenaBank::alignment - 1) / CompileArenaBank::alignment * CompileArenaBank::alignment;
+ CHECK(execution.resource_usage().bytes == charged);
  CHECK(execution.snapshot().arena.requested_bytes == bytes);
  CHECK(execution.snapshot().arena.occupied_bytes >= bytes);
  CHECK(execution.snapshot().arena.live_allocations == 1);
@@ -10978,12 +10982,178 @@ TEST_CASE("compile fixed arenas retain pinning while owned label outputs delay r
  auto next = execution.reserve({.bytes = bytes, .supplied_workspace = true});
  CHECK(next.workspace().data() == base);
  next.retire_workspace();  // Logical retirement cannot return a live arena lease.
- CHECK(execution.resource_usage().bytes == bytes);
+ CHECK(execution.resource_usage().bytes == charged);
  next = {};
  CHECK(execution.resource_usage().bytes == 0);
  CHECK(execution.snapshot().arena.live_allocations == 0);
  CHECK(execution.snapshot().arena.ordinary_free_bytes == initial);
  CHECK(execution.snapshot().normal_locked == initial);
+}
+TEST_CASE("pinned arena slices exhaust exact capacity and coalesce across non-FIFO release", "[benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page = mmltk::common::system::host_page_size();
+ const auto plan = CompileWorkspacePlan::prepare(1, {}, 0, 0, page * 4);
+ const std::array nodes{mmltk::common::system::NumaTopology::Capture().permitted_nodes.front()};
+ std::size_t releases = 0;
+ CompileArenaBank bank(plan, nodes, [&] { ++releases; }, true);
+ const std::array sizes{std::size_t{1}, std::size_t{65}, page + 1, std::size_t{65}, page * 3 - 384};
+ std::array<CompileArenaLease, sizes.size()> leases;
+ std::array<std::uintptr_t, sizes.size()> addresses{};
+ std::uint64_t requested = 0;
+ for (std::size_t i = 0; i < leases.size(); ++i) {
+  leases[i] = bank.acquire(sizes[i], false);
+  auto memory = leases[i].bytes();
+  addresses[i] = reinterpret_cast<std::uintptr_t>(memory.data());
+  CHECK(addresses[i] % CompileArenaBank::alignment == 0);
+  CHECK(memory.size() == sizes[i]);
+  if (i) CHECK(addresses[i] >= addresses[i - 1] + sizes[i - 1]);
+  std::ranges::fill(memory, static_cast<std::byte>(i + 1));
+  requested += sizes[i];
+ }
+ const auto full = bank.snapshot();
+ CHECK(full.locked == page * 4);
+ CHECK(full.observation.backing_regions == 1);
+ CHECK(full.observation.live_allocations == leases.size());
+ CHECK(full.observation.requested_bytes == requested);
+ CHECK(full.observation.occupied_bytes == page * 4);
+ CHECK(full.observation.alignment_loss == page * 4 - requested);
+ CHECK(full.observation.ordinary_free_bytes == 0);
+ CHECK(full.observation.unregistered_bytes == 0);
+ CHECK_FALSE(bank.fits(1));
+ CHECK_THROWS_AS(bank.acquire(1, true), InsufficientCompileResources);
+ for (std::size_t i = 0; i < leases.size(); ++i)
+  CHECK(std::ranges::all_of(leases[i].bytes(), [i](std::byte value) { return value == static_cast<std::byte>(i + 1); }));
+ for (auto index : {0U, 2U, 4U}) leases[index] = {};
+ CHECK(releases == 3);
+ CHECK(bank.snapshot().observation.ordinary_free_bytes > page * 3);
+ CHECK(bank.normal_fit(page * 3));
+ CHECK_FALSE(bank.fits(page * 3));
+ CHECK_THROWS_AS(bank.acquire(page * 3, true), InsufficientCompileResources);
+ CHECK(bank.snapshot().exceptional_reserved == 0);
+ leases[1] = {};
+ CHECK_FALSE(bank.fits(page * 4));
+ CHECK(std::ranges::all_of(leases[3].bytes(), [](std::byte value) { return value == std::byte{4}; }));
+ leases[3] = {};
+ CHECK(releases == leases.size());
+ CHECK(bank.largest_available(false, CompileWorkClass::Count, CompileWorkspaceWindow::Task) == page * 4);
+ auto whole = bank.acquire(page * 4, false);
+ CHECK(reinterpret_cast<std::uintptr_t>(whole.bytes().data()) == addresses.front());
+ CHECK(bank.snapshot().observation.live_allocations == 1);
+ CHECK(bank.snapshot().observation.alignment_loss == 0);
+ CHECK(bank.snapshot().observation.backing_regions == 1);
+ CHECK(bank.snapshot().physical_retirements == 0);
+}
+TEST_CASE("ordinary split allowances retain slice padding and physical custody through the last alias", "[benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const auto page = mmltk::common::system::host_page_size();
+ CompileExecution execution(1, {}, {.transient_bytes = page}, {}, [](std::string_view, const CompileExecutionSnapshot&) {});
+ SECTION("finite consumers detach ancestry while aliases retain the alignment charge") {
+  const bool nested = GENERATE(false, true);
+  const bool siblings = GENERATE(false, true);
+  auto envelope = execution.reserve({.bytes = page - 1, .continuation_descriptors = 1, .supplied_workspace = true});
+  auto descendant = envelope.split_storage(page - 1);
+  envelope = {};
+  if (nested) {
+   auto child = descendant.split_storage(descendant.bytes());
+   descendant = std::move(child);
+  }
+  auto sibling = siblings ? descendant.split_storage(CompileArenaBank::alignment) : CompileAllowance{};
+  const auto run = [&](CompileAllowance allowance) {
+   auto completion = execution.submit({.kind = CompileTaskKind::Pixels,
+    .resources = {.bytes = allowance.bytes(), .supplied_workspace = true},
+    .work = [](std::size_t, const CompileAllowance& input) { std::ranges::fill(input.workspace(), std::byte{19}); },
+    .allowance = std::move(allowance), .finite_consumer = true});
+   completion.wait();
+  };
+  run(descendant);
+  if (sibling) run(sibling);
+  CHECK(execution.resource_usage().continuation_descriptors == 0);
+  CHECK(execution.resource_usage().bytes == page);
+  CHECK(execution.snapshot().arena.occupied_bytes == page);
+  // An unsupplied one-byte charge tests accounting rather than physical fit.
+  CHECK_FALSE(execution.try_reserve({.bytes = 1}));
+  auto alias = descendant;
+  descendant = {};
+  sibling = {};
+  alias.retire_workspace();
+  CHECK(execution.resource_usage().bytes == alias.bytes() + 1);
+  CHECK(std::ranges::all_of(alias.workspace(), [](std::byte value) { return value == std::byte{19}; }));
+  CHECK(execution.snapshot().arena.occupied_bytes == page);
+  alias = {};
+  CHECK(execution.resource_usage().bytes == 0);
+  CHECK(execution.snapshot().arena.occupied_bytes == 0);
+ }
+ SECTION("unexecuted split aliases retain their producing envelope") {
+  auto envelope = execution.reserve({.bytes = page - 1, .supplied_workspace = true});
+  auto first = envelope.split_storage(CompileArenaBank::alignment);
+  auto second = envelope.split_storage(CompileArenaBank::alignment);
+  auto alias = second;
+  const auto base = first.workspace().data();
+  CHECK(second.workspace().data() == base + CompileArenaBank::alignment);
+  CHECK(envelope.workspace().data() == base + 2 * CompileArenaBank::alignment);
+  std::ranges::fill(first.workspace(), std::byte{7});
+  std::ranges::fill(second.workspace(), std::byte{19});
+  CHECK(execution.resource_usage().bytes == page);
+  CHECK(execution.snapshot().arena.requested_bytes == page - 1);
+  CHECK(execution.snapshot().arena.alignment_loss == 1);
+  CHECK(execution.snapshot().arena.live_allocations == 1);
+  CHECK_FALSE(execution.try_reserve({.bytes = 1, .supplied_workspace = true}));
+  envelope = {};
+  first = {};
+  second = {};
+  alias.retire_workspace();
+  CHECK(std::ranges::all_of(alias.workspace(), [](std::byte value) { return value == std::byte{19}; }));
+  CHECK(execution.snapshot().arena.occupied_bytes == page);
+  CHECK(execution.snapshot().arena.live_allocations == 1);
+  CHECK_FALSE(execution.try_reserve({.bytes = 1, .supplied_workspace = true}));
+  alias = {};
+  CHECK(execution.resource_usage().bytes == 0);
+  CHECK(execution.snapshot().arena.occupied_bytes == 0);
+  auto whole = execution.reserve({.bytes = page, .supplied_workspace = true});
+  CHECK(whole.workspace().data() == base);
+ }
+}
+TEST_CASE("ordinary pinned tail is usable without spending protected completion windows", "[benchmark][pipeline][resources]") {
+ using namespace mmltk::backend::data::detail;
+ const bool observing = GENERATE(false, true);
+ const auto page = mmltk::common::system::host_page_size();
+ const std::array<CompileWorkspaceProfile, 1> profiles{{{page, page}}};
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, profiles, page, page, page * 7));
+ CompileExecution::Observer observer;
+ if (observing) observer = [](std::string_view, const CompileExecutionSnapshot&) {};
+ CompileExecution execution(1, {}, {.workspace_plan = plan}, {}, observer);
+ // The tail's three contiguous pages exceed the separately prepared one-page
+ // region. It must be an ordinary request, including with observation disabled.
+ CHECK(execution.workspace_capacity() == page * 3);
+ auto tail = execution.reserve({.bytes = page * 3, .supplied_workspace = true});
+ auto ordinary = execution.reserve({.bytes = page, .supplied_workspace = true});
+ CHECK_FALSE(tail.exceptional_workspace());
+ CHECK_FALSE(execution.try_reserve({.bytes = 1, .supplied_workspace = true}));
+ CHECK_FALSE(execution.try_reserve({.bytes = 1, .supplied_workspace = true, .completion_workspace = true, .workspace_class = CompileWorkClass::Pixels}));
+ auto completion = execution.reserve({.bytes = page, .supplied_workspace = true, .completion_workspace = true, .workspace_class = CompileWorkClass::Acquisition});
+ auto source = execution.reserve({.bytes = page, .supplied_workspace = true, .workspace_window = CompileWorkspaceWindow::SharedSource});
+ auto compaction = execution.reserve({.bytes = page, .supplied_workspace = true, .workspace_window = CompileWorkspaceWindow::Compaction});
+ const auto full = execution.snapshot();
+ CHECK(full.normal_locked == plan->budget);
+ if (observing) {
+  CHECK(full.arena.backing_regions == 2);
+  CHECK(full.arena.live_allocations == 5);
+  CHECK(full.arena.occupied_bytes == plan->budget);
+  CHECK(full.arena.ordinary_capacity == page * 4);
+  CHECK(full.arena.completion_occupied == page);
+  CHECK(full.arena.shared_occupied == page);
+  CHECK(full.arena.compaction_occupied == page);
+  CHECK(full.arena.unregistered_bytes == 0);
+ } else {
+  CHECK(full.arena.live_allocations == 0);
+  CHECK(full.arena.occupied_bytes == 0);
+ }
+ // Returning one protected window never makes it available to an ordinary
+ // request or a different source window, even though they share physical backing.
+ completion = {};
+ CHECK_FALSE(execution.try_reserve({.bytes = 1, .supplied_workspace = true}));
+ CHECK_FALSE(execution.try_reserve({.bytes = 1, .supplied_workspace = true, .workspace_window = CompileWorkspaceWindow::SharedSource}));
+ CHECK(execution.try_reserve({.bytes = page, .supplied_workspace = true, .completion_workspace = true, .workspace_class = CompileWorkClass::Acquisition}));
 }
 TEST_CASE("scheduled admission observations expose resource predicates and request shapes", "[benchmark][pipeline][resources][trace]") {
  using namespace mmltk::backend::data::detail;
@@ -11330,7 +11500,7 @@ TEST_CASE("a prepared arena changes work class and CPU lane without moving its b
  }
  CHECK(lanes[0] != lanes[1]);
  CHECK(execution.snapshot().normal_locked == page);
- CHECK(execution.snapshot().workspace_contexts == 1);
+ CHECK(execution.workspace_capacity() == page);
 }
 TEST_CASE("Directory supplied JPEG GIF and 16-bit PNM match the existing STB codec policy", "[backend][data][writer]") {
  using namespace mmltk::backend::data::detail;
@@ -12165,11 +12335,11 @@ TEST_CASE("an exceptional archive pixel releases its normal input and quiesces t
  }
  const std::array<CompileWorkspaceProfile, 1> profiles{{{64U << 10, 0}}};
  auto plan = std::make_shared<CompileWorkspacePlan>(below_window ? compile_workspace_plan(1, 128, false, 0, 1, BenchmarkEncodedImage::normal_window_bytes)
-                                                                 : CompileWorkspacePlan::prepare(1, profiles, BenchmarkEncodedImage::normal_window_bytes, 0, 40ULL << 20));
+                                                                 : CompileWorkspacePlan::prepare(1, profiles, BenchmarkEncodedImage::normal_window_bytes, 0, BenchmarkEncodedImage::normal_window_bytes + (64U << 10)));
  const auto header = BenchmarkImageDecoder{}.read_header(jpeg);
- REQUIRE(compile_pixel_workspace_plan(header, {128, 128, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, false}).bytes() > plan->context_bytes);
  const auto decoder_bytes = BenchmarkArchive::input_requirement(archive, 0).workspace_bytes;
  BenchmarkCompilePipeline pipeline(1, {}, {.workspace_plan = plan});
+ REQUIRE(compile_pixel_workspace_plan(header, {128, 128, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, false}).bytes() > pipeline.execution().workspace_capacity());
  const auto locked = pipeline.execution().snapshot().normal_locked;
  PreparedBenchmarkSplit split;
  split.name = "train";
@@ -12264,13 +12434,13 @@ TEST_CASE("custom archive admission retires decoder and unaccepted input through
    mmltk::testsupport::release_test_promise(testing_full_queue ? pixel_waiting : restoration_waiting);
  };
  const std::array<CompileWorkspaceProfile, 1> profiles{{{64U << 10, 0}}};
- auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(3, profiles, BenchmarkEncodedImage::normal_window_bytes, 0, 40ULL << 20));
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(3, profiles, BenchmarkEncodedImage::normal_window_bytes, 0, BenchmarkEncodedImage::normal_window_bytes + 3 * (64U << 10)));
  BenchmarkCompilePipeline pipeline(3, {}, {.workspace_plan = plan}, {}, trace);
  auto occupied = pipeline.execution().reserve({.bytes = BenchmarkEncodedImage::normal_window_bytes, .supplied_workspace = true, .workspace_window = CompileWorkspaceWindow::SharedSource});
  const auto locked = pipeline.execution().snapshot().normal_locked;
  std::array<CompileExecution::Completion, 5> files;
  const auto pixel_bytes = compile_pixel_workspace_plan(BenchmarkImageDecoder{}.read_header(jpeg), {128, 128, mmltk::backend::imaging::resample::ImageResizeMode::Stretch, false}).bytes();
- REQUIRE(pixel_bytes > plan->context_bytes);
+ REQUIRE(pixel_bytes > pipeline.execution().workspace_capacity());
  const auto pixel_task = [&](mmltk::testsupport::TestGate& gate) {
   return pipeline.execution().submit(
    {.kind = CompileTaskKind::Pixels,
@@ -12746,7 +12916,7 @@ struct PipelineImageReceipts {
  }
 };
 }  // namespace
-TEST_CASE("image continuations finish ahead of newer arena waiters with a hard record bank", "[benchmark][pipeline][images][preload][resources]") {
+TEST_CASE("image continuations keep record custody while sibling slices advance or wait", "[benchmark][pipeline][images][preload][resources]") {
  using namespace mmltk::backend::data::detail;
  enum class Input { File, Retained, Exceptional };
  const auto input = GENERATE(Input::File, Input::Retained, Input::Exceptional);
@@ -12755,7 +12925,7 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
  if (mmltk::common::system::allowed_cpu_set().size() < workers) SKIP("requires the selected assigned CPUs");
  const auto page = mmltk::common::system::host_page_size();
  const auto budget = input == Input::Exceptional ? page : std::size_t{4U << 20};
- // Keep exactly one normal conversion arena even with two CPU grants.
+ // Keep one ordinary physical region; independent admitted slices may share it.
  auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, {}, input == Input::Retained ? page : 0, 0, budget));
  mmltk::testsupport::ScopedTempDir root("image-continuation-records");
  const auto images = root.path() / "images";
@@ -12782,7 +12952,10 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
   }
   if (event == "benchmark.image.stage_started") {
    if (fields.at("stage") == "workspace" && fields.at("image_id") == 1) ++first_workspaces;
-   if (fields.at("stage") == "pixels" && fields.at("image_id") == 2) second.receipt().ArriveAndWait();
+   if (fields.at("stage") == "pixels" && fields.at("image_id") == 2) {
+    if (workers == 2 && input != Input::Exceptional) mmltk::testsupport::release_test_promise(waiting);
+    second.receipt().ArriveAndWait();
+   }
   }
   if (event == "compile.execution") {
    const auto exceptional = fields.at("exceptional_reserved").get<std::uint64_t>();
@@ -12790,15 +12963,15 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
        fields.at("leased").get<std::uint64_t>() > budget + exceptional || fields.at("bytes").get<std::uint64_t>() > budget + exceptional + CompileResources::handles(16).bytes ||
        fields.at("descriptors").get<std::size_t>() + fields.at("descriptor_promises").get<std::size_t>() > 16)
     bounded = false;
-   if (workers == 2 && fields.at("parked")[static_cast<std::size_t>(CompileParkReason::Bytes)].get<std::size_t>()) mmltk::testsupport::release_test_promise(waiting);
+   if (workers == 2 && input == Input::Exceptional && fields.at("parked")[static_cast<std::size_t>(CompileParkReason::Bytes)].get<std::size_t>()) mmltk::testsupport::release_test_promise(waiting);
   }
  };
  BenchmarkCompilePipeline pipeline(workers, {}, {.transient_bytes = budget, .descriptors = 16, .task_records = workers, .workspace_plan = plan}, {}, trace);
  BenchmarkEncodedImage::Ptr payload;
  if (input == Input::Retained) {
-  // Ordinary contexts are preferred. Occupy the sole conversion context while
+  // Ordinary extents are preferred. Occupy the entire ordinary region while
   // placing this source in its protected window, then make conversion runnable.
-  auto conversion = pipeline.execution().reserve({.bytes = plan->context_bytes, .supplied_workspace = true});
+  auto conversion = pipeline.execution().reserve({.bytes = pipeline.execution().workspace_capacity(), .supplied_workspace = true});
   auto backing = std::make_shared<CompileAllowance>(pipeline.execution().reserve({.bytes = page, .supplied_workspace = true, .workspace_window = CompileWorkspaceWindow::SharedSource}));
   conversion = {};
   const auto memory = backing->workspace();
@@ -12831,8 +13004,13 @@ TEST_CASE("image continuations finish ahead of newer arena waiters with a hard r
   CHECK(pipeline.execution().snapshot().leased > 0);
  publication({2});
  receipts.subscribe(pipeline.image_completion(images, 2), 1);
- mmltk::testsupport::await_test_promise(waiting, "new image waits behind retained record or arena custody", 5s);
+ mmltk::testsupport::await_test_promise(waiting, "sibling reaches its pixel slice or a real record/exceptional limit", 5s);
  CHECK(pipeline.execution().snapshot().records == workers);
+ if (workers == 2 && input != Input::Exceptional) {
+  REQUIRE(second.WaitEntered(5s));
+  CHECK_FALSE(pipeline.image_completion(images, 1).ready());
+  CHECK(pipeline.execution().snapshot().arena.live_allocations >= 2);
+ }
  physical.Release();
  mmltk::testsupport::await_test_promise(first_completed, "retained Pixels finishes before the newer image can finish", 5s);
  REQUIRE(second.WaitEntered(5s));

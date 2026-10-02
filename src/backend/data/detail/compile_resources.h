@@ -31,7 +31,8 @@ struct CompileResources {
  bool retained_handles = false;
  // Live descriptor commitment for explicitly bound dependent reservations.
  std::size_t continuation_descriptors = 0;
- // Actual fixed-bank storage, distinct from separately owned source/control charges.
+ // Requested fixed-bank payload, distinct from separately owned source/control
+ // charges. Admission additionally accounts the bank's bounded slice alignment.
  bool supplied_workspace = false;
  bool completion_workspace = false;
  CompileWorkClass workspace_class = CompileWorkClass::Count;
