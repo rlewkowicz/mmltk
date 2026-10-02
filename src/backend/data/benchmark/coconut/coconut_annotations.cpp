@@ -501,6 +501,7 @@ std::vector<CoconutComponent> merge_coconut_components(std::span<const CoconutCo
   std::vector<NormalizedAnnotationAssembler::Slice> slices;
   const auto plan = [&](std::size_t) {
    static_cast<CoconutComponentMetadata&>(*backing) = static_cast<const CoconutComponentMetadata&>(*first.backing_);
+   backing->original_generation = first.original_generation();
    backing->annotation_input_identity = identity;
    backing->source_extent_complete = std::ranges::all_of(parts, [](const auto& part) {
     return part.row_base && part.segment_base && (part.source_extent || (!part.components.empty() && std::ranges::all_of(part.components, &CoconutComponent::source_extent_complete)));
