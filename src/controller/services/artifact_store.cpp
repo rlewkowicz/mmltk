@@ -1,5 +1,6 @@
 #include "src/controller/services/artifact_store.h"
 #include <curl/curl.h>
+#include <nlohmann/json.hpp>
 #include "src/pch_linux.h"
 #include "src/common/io/file_digest.h"
 #include "src/pch_std.h"
@@ -8,7 +9,7 @@
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
-#include "src/common/io/file_memory.h"
+#include "src/common/io/path_publication.h"
 #include "src/common/io/staging_directory.h"
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/runtime_paths.h"
@@ -324,47 +325,68 @@ ArtifactCompileResult ArtifactStore::compile(
  const auto cancellation_observation = mmltk::common::concurrency::CancellationObservation::Borrow(cancellation);
  if (!request.valid()) return {.output = {}, .cancelled = false, .inspection = rejected_inspection("invalid artifact compile request")};
  if (cancellation_observation.requested()) return {.output = {}, .cancelled = true, .inspection = {}};
+ std::optional<mmltk::common::io::StagingDirectory> staging;
+ std::string_view operation;
+ const auto diagnose_failure = [&](const std::string_view error) noexcept {
+  if (diagnostics.benchmark.report == nullptr) return;
+  try {
+   const auto fields = nlohmann::json{{"operation", operation}, {"staged_path", staging ? staging->path().string() : std::string{}}, {"final_path", request.output.string()}, {"error", error}}.dump();
+   diagnostics.benchmark("artifact.compile.failed", fields);
+  } catch (...) {
+   // Diagnostics cannot replace the original failure or decide publication.
+  }
+ };
+ const auto failed = [&](const std::string_view error, const bool cancelled = false) {
+  diagnose_failure(error);
+  return ArtifactCompileResult{.output = {}, .cancelled = cancelled, .inspection = rejected_inspection(error)};
+ };
+ if (diagnostics.benchmark.report != nullptr) operation = "compilation";
  try {
   if (request.kind == ArtifactCompileKind::Directory && !std::filesystem::is_directory(request.source))
-   return {.output = {}, .cancelled = false, .inspection = rejected_inspection("artifact source directory is unavailable")};
-  if (!request.overwrite && std::filesystem::exists(request.output)) return {.output = {}, .cancelled = false, .inspection = rejected_inspection("artifact output already exists")};
-  mmltk::common::io::StagingDirectory staging{request.output, "", ".tmp.XXXXXX", "failed to stage compiled artifact"};
+   return failed("artifact source directory is unavailable");
+  if (!request.overwrite && std::filesystem::exists(request.output)) return failed("artifact output already exists");
+  staging.emplace(request.output, "", ".tmp.XXXXXX", "failed to stage compiled artifact");
   switch (request.kind) {
    case ArtifactCompileKind::Directory:
-    compiler_operations_->compile_directory(request.source, staging.path(), request.resolution, request.perceptual_downscale, request.resize_mode, cancellation_observation, progress);
+    compiler_operations_->compile_directory(request.source, staging->path(), request.resolution, request.perceptual_downscale, request.resize_mode, cancellation_observation, progress);
     break;
    case ArtifactCompileKind::Benchmark: {
     const ArtifactBenchmarkTraceObserver trace = diagnostics.benchmark;
     compiler_operations_->compile_benchmark(
-     request.benchmark_selection, staging.path(), request.output, request.resolution, request.perceptual_downscale, request.resize_mode, cancellation_observation, progress, trace);
+     request.benchmark_selection, staging->path(), request.output, request.resolution, request.perceptual_downscale, request.resize_mode, cancellation_observation, progress, trace);
     break;
    }
   }
   if (cancellation_observation.requested()) return {.output = {}, .cancelled = true, .inspection = {}};
+  if (diagnostics.benchmark.report != nullptr) operation = "staged_inspection";
   std::array<std::filesystem::path, contracts::kArtifactSplitCapacity> paths{};
   std::size_t path_count = 0U;
-  for (const auto& entry : std::filesystem::directory_iterator(staging.path())) {
+  for (const auto& entry : std::filesystem::directory_iterator(staging->path())) {
    if (cancellation_observation.requested()) return {.output = {}, .cancelled = true, .inspection = {}};
    if (!entry.is_regular_file() || entry.path().extension() != ".bin") continue;
    if (cancellation_observation.requested()) return {.output = {}, .cancelled = true, .inspection = {}};
-   if (path_count == paths.size()) return {.output = {}, .cancelled = false, .inspection = rejected_inspection("compiled artifact split count is outside fixed capacity")};
+   if (path_count == paths.size()) return failed("compiled artifact split count is outside fixed capacity");
    paths[path_count++] = entry.path();
   }
   if (cancellation_observation.requested()) return {.output = {}, .cancelled = true, .inspection = {}};
-  if (path_count == 0U) return {.output = {}, .cancelled = false, .inspection = rejected_inspection("compiled artifact split count is outside fixed capacity")};
+  if (path_count == 0U) return failed("compiled artifact split count is outside fixed capacity");
   std::ranges::sort(std::span{paths.data(), path_count});
   if (cancellation_observation.requested()) return {.output = {}, .cancelled = true, .inspection = {}};
   mmltk::controller::contracts::ArtifactInspection inspection = inspect_artifact(paths, request.preset, request.resolution, cancellation_observation);
-  if (!inspection.compatible) { return {.output = {}, .cancelled = cancellation_observation.requested(), .inspection = std::move(inspection)}; }
+  if (!inspection.compatible) {
+   diagnose_failure(inspection.detail);
+   return {.output = {}, .cancelled = cancellation_observation.requested(), .inspection = std::move(inspection)};
+  }
   // This is the publication linearization point: cancellation may stop
   // preparation and verification up to this check, while a completed
   // atomic publish owns the successful output.
   if (cancellation_observation.requested()) return {.output = {}, .cancelled = true, .inspection = {}};
-  mmltk::common::io::publish_staged_path_atomically(staging.path(), request.output, request.overwrite);
-  staging.published();
+  if (diagnostics.benchmark.report != nullptr) operation = "final_publication";
+  mmltk::common::io::publish_staged_path_atomically(staging->path(), request.output, request.overwrite);
+  staging->published();
   for (auto& split : inspection.splits) { split.path = (request.output / std::filesystem::path{split.path}.filename()).string(); }
   return {.output = request.output, .cancelled = false, .inspection = std::move(inspection)};
- } catch (const std::exception& error) { return {.output = {}, .cancelled = cancellation_observation.requested(), .inspection = rejected_inspection(error.what())}; }
+ } catch (const std::exception& error) { return failed(error.what(), cancellation_observation.requested()); }
 }
 std::filesystem::path ArtifactStore::canonical_weight_path(const std::string_view preset) const {
  auto pair = ArtifactCancellationSource::Mint();

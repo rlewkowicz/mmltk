@@ -21,6 +21,7 @@
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/concurrency/concurrency.h"
 #include "src/common/io/file_memory.h"
+#include "src/common/io/path_publication.h"
 #include "src/common/io/staging_directory.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "src/common/system/cpu_affinity.h"
@@ -506,28 +507,19 @@ void publish_dataset_directory(const std::filesystem::path& staging, const std::
  throw_if_benchmark_cancelled(cancellation);
  const bool output_exists = std::filesystem::exists(output);
  trace_benchmark_event(trace, "benchmark.publication.started", [&] { return nlohmann::json{{"output", output.string()}, {"replacing", output_exists}}; });
- if (!output_exists) {
-  throw_if_benchmark_cancelled(cancellation);
-  std::filesystem::rename(staging, output);
-  common_io::sync_parent_directory(output);
-  return;
- }
- if (!overwrite) {
+ if (output_exists && !overwrite) {
   if (!std::filesystem::is_empty(output)) { throw std::runtime_error("benchmark output directory is no longer empty"); }
-  std::filesystem::remove(output);
-  throw_if_benchmark_cancelled(cancellation);
-  std::filesystem::rename(staging, output);
-  common_io::sync_parent_directory(output);
-  return;
+  // rmdir refuses a directory populated since the check. No-replace publication
+  // then refuses any new occupant appearing after the empty directory retires.
+  if (::rmdir(output.c_str()) != 0) throw common_io::errno_error("cannot remove empty benchmark output directory", output.string());
  }
  throw_if_benchmark_cancelled(cancellation);
- const long result = ::syscall(SYS_renameat2, AT_FDCWD, staging.c_str(), AT_FDCWD, output.c_str(), RENAME_EXCHANGE);
- if (result != 0) { throw common_io::errno_error("cannot atomically exchange benchmark dataset directory", output.string()); }
- common_io::sync_parent_directory(output);
- std::error_code cleanup_error;
- const bool removed = common_io::remove_tree_no_follow(staging, cleanup_error);
- trace_benchmark_event(trace, "benchmark.publication.old_generation_cleanup",
-  [&] { return nlohmann::json{{"path", staging.string()}, {"removed", removed}, {"error", cleanup_error ? cleanup_error.message() : std::string{}}}; });
+ const auto publication = common_io::publish_staged_path_atomically(staging, output, overwrite);
+ if (publication.replaced) {
+  trace_benchmark_event(trace, "benchmark.publication.old_generation_cleanup", [&] {
+   return nlohmann::json{{"path", staging.string()}, {"removed", !publication.cleanup_error}, {"error", publication.cleanup_error ? publication.cleanup_error.message() : std::string{}}};
+  });
+ }
 }
 void write_split_with_progress(BenchmarkSplitWriter& writer, const BenchmarkWriteRequest& request, ProgressReporter* progress, const BenchmarkTraceSink& trace) {
  progress->phase(DatasetCompilePhase::Pixels);

@@ -10,6 +10,7 @@
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/common/io/file_digest.h"
 #include <vector>
+#include <nlohmann/json.hpp>
 #include <fcntl.h>
 #include <fstream>
 #include <iterator>
@@ -61,6 +62,24 @@ private:
   if (work) work(cancellation);
  }
 };
+void compile_staged_fixture(const std::filesystem::path& output, mmltk::common::concurrency::CancellationObservation cancellation) {
+ const mmltk::backend::data::testsupport::FixtureSpec fixture{.root_dir = (output.parent_path() / "source").string(), .width = 32, .height = 32, .num_images = 1};
+ mmltk::backend::data::testsupport::create_synthetic_dataset(fixture);
+ auto config = mmltk::backend::data::testsupport::compiler_config(fixture);
+ config.output_dir = output.string();
+ config.num_workers = 1;
+ const auto plan = mmltk::backend::data::DatasetCompiler::prepare(std::move(config), {fixture.split}, cancellation);
+ mmltk::backend::data::DatasetCompiler::compile(plan, 0, nullptr, cancellation);
+}
+std::vector<nlohmann::json> artifact_failures(const std::filesystem::path& log) {
+ std::ifstream input{log};
+ std::vector<nlohmann::json> failures;
+ for (std::string line; std::getline(input, line);) {
+  auto record = nlohmann::json::parse(line);
+  if (record.at("name") == "artifact.compile.failed") failures.push_back(std::move(record.at("fields")));
+ }
+ return failures;
+}
 TEST_CASE("artifact dataset runtime owns its diagnostic target and borrows only during compile", "[controller][systems][dataset][diagnostics]") {
  const mmltk::testsupport::ScopedTempDir root{"ordinary-dataset-diagnostics"};
  UnusedWeightOperations weights;
@@ -73,7 +92,31 @@ TEST_CASE("artifact dataset runtime owns its diagnostic target and borrows only 
   services::RuntimeDiagnostics creator{client.producer()};
   target = creator.target();
  }
+ services::ArtifactCompileRequest request{
+  .kind = services::ArtifactCompileKind::Benchmark,
+  .source = {},
+  .output = root.path() / "output",
+  .preset = "rf-detr-nano",
+  .resolution = 32U,
+  .overwrite = false,
+  .benchmark_selection = {mmltk::backend::data::BenchmarkDatasetVariant::Coconut, mmltk::backend::data::CoconutValidation::Stock}
+ };
  bool enabled = true;
+ std::string_view operation = "staged_inspection";
+ SECTION("compilation retains the original error") {
+  operation = "compilation";
+  compiler.work = [](auto) { throw std::runtime_error("compiler original failure"); };
+ }
+ SECTION("staged inspection rejects corrupt output") {
+  compiler.work = [&](auto) { mmltk::testsupport::write_text_file(compiler.physical_output / "train.bin", "incomplete compiled output"); };
+ }
+ SECTION("final publication refuses a concurrently occupied output") {
+  operation = "final_publication";
+  compiler.work = [&](auto cancellation) {
+   compile_staged_fixture(compiler.physical_output, cancellation);
+   mmltk::testsupport::write_text_file(request.output / "concurrent", "preserved");
+  };
+ }
  SECTION("target copy survives creator and caller copy destruction") {}
  SECTION("absent target installs no observer") {
   target = {};
@@ -91,21 +134,20 @@ TEST_CASE("artifact dataset runtime owns its diagnostic target and borrows only 
   target = creator.target();
   enabled = false;
  }
- const services::ArtifactCompileRequest request{
-  .kind = services::ArtifactCompileKind::Benchmark,
-  .source = {},
-  .output = root.path() / "output",
-  .preset = "rf-detr-base",
-  .resolution = 560U,
-  .overwrite = true,
-  .benchmark_selection = {mmltk::backend::data::BenchmarkDatasetVariant::Coconut, mmltk::backend::data::CoconutValidation::Stock}
- };
+ std::string original_error;
  {
   ArtifactDatasetRuntime runtime{services::ArtifactStore{root.path() / "cache", weights, compiler}, target};
   target = {};
   const auto result = runtime.Compile(request, {}, {});
   CHECK_FALSE(result.cancelled);
   CHECK_FALSE(result.inspection.available());
+  original_error = result.inspection.detail;
+  CHECK_FALSE(original_error.empty());
+  if (operation == "compilation") CHECK(original_error == "compiler original failure");
+  if (operation == "final_publication") {
+   CHECK(original_error == "publication destination already exists: " + request.output.string());
+   CHECK(std::filesystem::exists(request.output / "concurrent"));
+  }
   CHECK(compiler.observer_enabled == enabled);
   CHECK(compiler.observer_context == enabled);
   CHECK(compiler.publication_output == request.output);
@@ -114,11 +156,19 @@ TEST_CASE("artifact dataset runtime owns its diagnostic target and borrows only 
   CHECK(compiler.physical_output.parent_path() == request.output.parent_path());
   CHECK_FALSE(std::filesystem::exists(compiler.physical_output));
  }
- CHECK(client.counters().accepted == (enabled ? 1U : 0U));
+ CHECK(client.counters().accepted == (enabled ? 2U : 0U));
  client.close(services::DiagnosticsCloseMode::Flush);
  std::ifstream input{log};
  const std::string records{std::istreambuf_iterator<char>{input}, {}};
  CHECK(records.contains("benchmark.direct") == enabled);
+ const auto failures = artifact_failures(log);
+ REQUIRE(failures.size() == (enabled ? 1U : 0U));
+ if (enabled) {
+  CHECK(failures.front().at("operation") == operation);
+  CHECK(failures.front().at("staged_path") == compiler.physical_output.string());
+  CHECK(failures.front().at("final_path") == request.output.string());
+  CHECK(failures.front().at("error") == original_error);
+ }
 }
 TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and stop join", "[controller][systems][dataset][diagnostics]") {
  const mmltk::testsupport::ScopedTempDir root{"dataset-diagnostic-reconstruction"};
@@ -145,7 +195,10 @@ TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and 
  std::size_t constructions = 0U;
  TerminalSequence<DatasetSystem::event_type> terminals;
  mmltk::testsupport::TestGate gate{"dataset compiler"};
- compiler.work = [](auto) { throw std::runtime_error("diagnostic compiler failure"); };
+ compiler.work = [&](auto) {
+  mmltk::testsupport::write_text_file(compiler.physical_output / "train.bin", "unfinished candidate");
+  throw std::runtime_error("diagnostic compiler failure");
+ };
  DatasetSystem dataset{settings, [&, target] {
   ++constructions;
   return std::make_unique<ArtifactDatasetRuntime>(services::ArtifactStore{root.path() / "cache", weights, compiler}, target);
@@ -161,21 +214,20 @@ TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and 
  auto first = terminals.First();
  const auto failed = mmltk::testsupport::await_test_future(first, "failed compile");
  CHECK(std::get<DatasetChanged>(failed).snapshot.terminal.outcome == contracts::ArtifactTerminalOutcome::Failed);
+ CHECK(std::get<DatasetChanged>(failed).snapshot.terminal.detail == "diagnostic compiler failure");
  CHECK(compiler.observer_enabled);
- CHECK_FALSE(std::filesystem::exists(stored.workflows.train.compiled_dataset_dir / "train.bin"));
+ const auto failed_staging = compiler.physical_output;
+ CHECK_FALSE(std::filesystem::exists(failed_staging));
+ CHECK_FALSE(std::filesystem::exists(stored.workflows.train.compiled_dataset_dir));
  compiler.work = [receipt = gate.receipt()](auto) { receipt.ArriveAndWait(); };
  bool cancel = true;
  SECTION("retry can stop while its reconstructed compiler is active") {}
  SECTION("retry publishes and inspects new output after the failed output remained absent") {
   cancel = false;
-  const mmltk::backend::data::testsupport::FixtureSpec fixture{.root_dir = (root.path() / "source").string(), .width = 32, .height = 32, .num_images = 1};
-  mmltk::backend::data::testsupport::create_synthetic_dataset(fixture);
-  compiler.work = [&, fixture](auto cancellation) {
-   auto config = mmltk::backend::data::testsupport::compiler_config(fixture);
-   config.output_dir = compiler.physical_output.string();
-   config.num_workers = 1;
-   const auto plan = mmltk::backend::data::DatasetCompiler::prepare(std::move(config), {fixture.split}, cancellation);
-   mmltk::backend::data::DatasetCompiler::compile(plan, 0, nullptr, cancellation);
+  compiler.work = [&](auto cancellation) {
+   if (compiler.physical_output == failed_staging || !std::filesystem::is_empty(compiler.physical_output) || std::filesystem::exists(stored.workflows.train.compiled_dataset_dir))
+    throw std::runtime_error("retry did not receive fresh staging beside absent output");
+   compile_staged_fixture(compiler.physical_output, cancellation);
   };
  }
  static_cast<void>(dataset.Compile({}));
@@ -190,12 +242,28 @@ TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and 
  CHECK(retried.terminal.outcome == (cancel ? contracts::ArtifactTerminalOutcome::Cancelled : contracts::ArtifactTerminalOutcome::Succeeded));
  CHECK(std::filesystem::exists(stored.workflows.train.compiled_dataset_dir / "train.bin") == !cancel);
  CHECK(retried.inspection.available() == !cancel);
+ CHECK(compiler.physical_output != failed_staging);
+ if (!cancel) {
+  CHECK(retried.terminal.artifact == stored.workflows.train.compiled_dataset_dir.string());
+  REQUIRE(retried.inspection.splits.size() == 1U);
+  const auto& split = retried.inspection.splits.front();
+  CHECK(split.path == (stored.workflows.train.compiled_dataset_dir / "train.bin").string());
+  CHECK(split.image_count == 1U);
+  CHECK(split.width == 32U);
+  CHECK(split.height == 32U);
+ }
  dataset.Shutdown();
  CHECK(constructions == 2U);
  CHECK(compiler.observer_enabled);
  CHECK_FALSE(std::filesystem::exists(compiler.physical_output));
- CHECK(client.counters().accepted == 2U);
+ CHECK(client.counters().accepted == 3U);
  client.close(services::DiagnosticsCloseMode::Flush);
+ const auto failures = artifact_failures(root.path() / "trace.jsonl");
+ REQUIRE(failures.size() == 1U);
+ CHECK(failures.front().at("operation") == "compilation");
+ CHECK(failures.front().at("staged_path") == failed_staging.string());
+ CHECK(failures.front().at("final_path") == stored.workflows.train.compiled_dataset_dir.string());
+ CHECK(failures.front().at("error") == "diagnostic compiler failure");
 }
 TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and reconstructs after failure", "[controller][systems][dataset]") {
  const auto root = mmltk::testsupport::make_temp_root("ordinary-dataset");

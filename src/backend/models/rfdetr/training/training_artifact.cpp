@@ -4,6 +4,7 @@
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
 #include "src/common/io/file_digest.h"
 #include "src/common/io/file_memory.h"
+#include "src/common/io/path_publication.h"
 #include "src/frameworks/serialization/reflected_json.h"
 #include "src/pch_std.h"
 namespace mmltk::backend::models::rfdetr {

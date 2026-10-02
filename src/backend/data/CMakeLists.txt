@@ -253,7 +253,8 @@ function(mmltk_add_backend_data_tests)
     mmltk_register_ordinary_sources(mmltk_backend_data_tests
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/coconut_dataset.test.cpp
         ${CMAKE_SOURCE_DIR}/src/backend/data/catalog/tests/class_catalog.test.cpp
-        ${CMAKE_SOURCE_DIR}/src/common/io/tests/file_digest.test.cpp)
+        ${CMAKE_SOURCE_DIR}/src/common/io/tests/file_digest.test.cpp
+        ${CMAKE_SOURCE_DIR}/src/common/io/tests/path_publication.test.cpp)
     mmltk_configure_component(
         mmltk_backend_data_tests PRIVATE_DECLARATIONS)
     target_include_directories(mmltk_backend_data_tests PRIVATE

@@ -27,7 +27,6 @@ using mmltk::backend::data::detail::CompileTaskKind;
 using mmltk::common::concurrency::parallel_for_range_indexed;
 using mmltk::common::io::errno_error;
 using mmltk::common::io::FileHandle;
-using mmltk::common::io::publish_staged_path_atomically;
 using mmltk::common::io::sync_parent_directory;
 using mmltk::common::math::checked_cast;
 nlohmann::json reject_json(const AnnotationRejectCounts& rejected) {

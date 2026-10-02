@@ -13,6 +13,7 @@ mmltk_register_public_headers(mmltk_common_io
         file_memory.h
         json_file.h
         noexcept_io.h
+        path_publication.h
         scoped_fd.h
         staging_directory.h
 )
@@ -25,7 +26,8 @@ mmltk_register_ordinary_sources(
     scoped_fd.cpp
     staging_directory.cpp
     json_file.cpp
-    path_cleanup.cpp)
+    path_cleanup.cpp
+    path_publication.cpp)
 
 target_link_libraries(mmltk_common_io
     PUBLIC

@@ -415,8 +415,21 @@ and checks both the compiler's staging output and the final publication
 destination against the cache. Equal paths, a cache inside either output, or
 an output inside the cache are rejected before publication can replace data.
 The GUI's outer staging transaction supplies its final destination separately.
-Compilation validates and syncs staged outputs before atomic publication;
-failure or cancellation preserves the previous published output.
+Compilation validates and syncs staged outputs before atomic publication.
+The shared [path publication owner](../src/common/io/path_publication.h) uses
+no-replace rename for new destinations and exchange for replacement. A failed
+parent-directory sync restores the staged and previous paths; failure to restore
+them is fatal. Old-generation removal is best effort after commit, with its
+actual outcome available in [publication traces](logging.md#benchmark-compilation-traces).
+Benchmark admission accepts an empty existing directory without overwrite,
+removes only that empty directory, and refuses any new occupant at publication.
+Failure or cancellation before publication preserves previous healthy output.
+
+The GUI artifact service creates fresh staging for each Compile request, inspects
+its compiled splits, and publishes only compatible output. Failed staging is
+retired before retry; returned split paths refer to the published destination.
+Opt-in failure traces distinguish compilation, staged inspection, and final
+publication while preserving the original error.
 
 The [cache layout](../src/backend/data/benchmark/benchmark_cache.cpp) separates
 `downloads/`, `images/`, `indexes/`, and `locks/`. Downloaded archives and COCO/

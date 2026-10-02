@@ -8646,6 +8646,53 @@ TEST_CASE("COCONut failure reports batch append and flush best effort through un
   for (unsigned producer = 0; producer < producers; ++producer) CHECK(records[producer] == count);
  }
 }
+TEST_CASE("benchmark publication retains empty-directory admission and refuses concurrent occupants", "[benchmark][coconut][publication]") {
+ ScopedTempDir root("coconut-publication-admission");
+ LocalCoconutRecipe local(root.path());
+ auto config = local.compiler_config({BenchmarkDatasetVariant::Coconut, CoconutValidation::CoconutStock});
+ const auto catalog = local.selected(CoconutValidation::CoconutStock);
+ bool concurrent_empty = false, occupied = false;
+ SECTION("admitted empty directory publishes without overwrite") {}
+ SECTION("admitted empty directory becomes occupied") { occupied = true; }
+ SECTION("an absent destination becomes an empty directory at publication") { concurrent_empty = true; }
+ SECTION("overwrite commits and reports old-generation cleanup") { config.overwrite = true; }
+ if (!concurrent_empty) std::filesystem::create_directories(config.output_dir);
+ const auto previous = config.output_dir / "previous";
+ if (config.overwrite) mmltk::testsupport::write_text_file(previous, "previous generation");
+ bool started = false, completed = false;
+ std::optional<Json> cleanup;
+ config.trace = [&](std::string_view event, std::string_view fields) {
+  if (event == "benchmark.publication.started") {
+   started = true;
+   if (concurrent_empty) std::filesystem::create_directory(config.output_dir);
+   if (occupied) mmltk::testsupport::write_text_file(previous, "concurrent occupant");
+  }
+  if (event == "benchmark.publication.old_generation_cleanup") cleanup = Json::parse(fields);
+  if (event == "benchmark.publication.complete") {
+   completed = true;
+   throw std::runtime_error("diagnostic observer cannot revoke committed publication");
+  }
+ };
+ if (occupied || concurrent_empty) {
+  CHECK_THROWS(compile_benchmark_recipe(config, &catalog));
+  CHECK_FALSE(completed);
+  CHECK_FALSE(std::filesystem::exists(config.output_dir / "train.bin"));
+  if (occupied) CHECK(file_bytes(previous) == "concurrent occupant");
+  if (concurrent_empty) CHECK(std::filesystem::is_empty(config.output_dir));
+ } else {
+  REQUIRE_NOTHROW(compile_benchmark_recipe(config, &catalog));
+  CHECK(completed);
+  CHECK(CompiledDataset::open(config.output_dir / "train.bin").header().num_images == 4);
+  CHECK_FALSE(std::filesystem::exists(previous));
+ }
+ CHECK(started);
+ REQUIRE(cleanup.has_value() == config.overwrite);
+ if (cleanup) {
+  CHECK(cleanup->at("removed") == true);
+  CHECK(cleanup->at("error") == "");
+  CHECK_FALSE(std::filesystem::exists(cleanup->at("path").get<std::string>()));
+ }
+}
 TEST_CASE("progress failure before commit differs from terminal notification failure", "[benchmark][coconut][publication]") {
  ScopedTempDir root("coconut-publication-callback");
  LocalCoconutRecipe local(root.path());

@@ -1,18 +1,15 @@
 #include "src/common/io/file_memory.h"
 #include <fcntl.h>
-#include <linux/fs.h>
 #include <linux/falloc.h>
 #include <sys/uio.h>
 #include <array>
 #include <algorithm>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
-#include <exception>
 #include <expected>
 #include <filesystem>
 #include <stdexcept>
@@ -40,36 +37,6 @@ void sync_parent_directory(const std::filesystem::path& path) {
  const ScopedFd directory(::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
  if (directory.get() < 0) throw errno_error("open parent directory failed", parent.string());
  if (::fsync(directory.get()) != 0) throw errno_error("fsync parent directory failed", parent.string());
-}
-void publish_staged_path_atomically(const std::filesystem::path& staging, const std::filesystem::path& destination, const bool overwrite) {
- std::error_code status_error;
- const auto status = std::filesystem::symlink_status(destination, status_error);
- if (status_error && status_error != std::errc::no_such_file_or_directory) { throw std::filesystem::filesystem_error("failed to inspect publication destination", destination, status_error); }
- const bool exists = !status_error && status.type() != std::filesystem::file_type::not_found;
- if (!overwrite || !exists) {
-  if (!overwrite) {
-   if (exists) throw std::runtime_error("publication destination already exists: " + destination.string());
-   if (::syscall(SYS_renameat2, AT_FDCWD, staging.c_str(), AT_FDCWD, destination.c_str(), RENAME_NOREPLACE) != 0) { throw errno_error("atomic no-replace publication failed", destination.string()); }
-  } else {
-   std::filesystem::rename(staging, destination);
-  }
-  try {
-   sync_parent_directory(destination);
-  } catch (...) {
-   std::filesystem::rename(destination, staging);
-   throw;
-  }
-  return;
- }
- if (::syscall(SYS_renameat2, AT_FDCWD, staging.c_str(), AT_FDCWD, destination.c_str(), RENAME_EXCHANGE) != 0) { throw errno_error("atomic path exchange failed", destination.string()); }
- try {
-  sync_parent_directory(destination);
- } catch (...) {
-  if (::syscall(SYS_renameat2, AT_FDCWD, staging.c_str(), AT_FDCWD, destination.c_str(), RENAME_EXCHANGE) != 0) std::terminate();
-  throw;
- }
- std::error_code ignored;
- (void)remove_tree_no_follow(staging, ignored);
 }
 FileHandle::FileHandle(const int fd) noexcept : fd_(fd) {}
 FileHandle FileHandle::open_readonly(const std::string& path) {

@@ -29,7 +29,6 @@ import mmltk.common.logging.profile_utils;
 #include "src/backend/data/detail/compile_workspace.h"
 namespace mmltk::backend::data {
 using mmltk::common::io::FileHandle;
-using mmltk::common::io::publish_staged_path_atomically;
 using mmltk::common::system::allowed_cpu_set;
 using DeliveryMode = detail::CompileProgressDeliveryMode;
 ProgressEstimate estimate_progress(const std::uint64_t completed, const std::uint64_t total, const std::uint64_t elapsed_seconds) noexcept {

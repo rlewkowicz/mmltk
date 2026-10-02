@@ -364,6 +364,7 @@ artifact names and monotonic timestamps do not join different runs.
 
 | Events or fields | Observed work |
 | --- | --- |
+| `artifact.compile.failed` | Artifact-service `operation` (`compilation`, `staged_inspection`, or `final_publication`), `staged_path`, `final_path`, and original `error`; staging is empty when admission or staging creation fails |
 | `benchmark.compile.paths` | Resolved `cache_root` and compiler `output_root`, with separate `*_truncated` and `*_utf8_replaced` diagnostic flags |
 | `benchmark.progress.activity` | Current `activity`, numeric `phase`, and optional numeric `source` |
 | `benchmark.progress.delivery` | Opt-in `produced`, `materialized`, `coalesced`, `delivered`, `pending`, and `high_water` counts from the bounded progress observer |
@@ -404,6 +405,13 @@ artifact names and monotonic timestamps do not join different runs.
 | `benchmark.storage.reserved`, `.projection` | Outstanding physical-growth reservation (`required_bytes`, aggregate `reserved_bytes`, `available_bytes`) or projected output bounds |
 | `benchmark.compaction.started`, `.completed`, `benchmark.split_sync.started`, `.completed` | Split compaction or physical sync boundaries with `split` and `bytes` |
 | `benchmark.directory_sync.started`, `.completed`, `benchmark.publication.started`, `.complete` | Directory sync and final atomic publication boundaries with `path` or `output` |
+| `benchmark.publication.old_generation_cleanup` | Best-effort removal of the exchanged old generation: `path`, `removed`, and `error`; cleanup failure does not revoke committed publication |
+
+`artifact.compile.failed` uses the same optional runtime transport for Directory
+and benchmark requests. The artifact service inspects the staged split files,
+then publishes and returns final split paths. Its failure record preserves the
+original cause and both locations. Paths and JSON are formatted only when the
+observer is installed. Diagnostic delivery cannot change the operation result.
 
 For a capture produced by [the GUI example](#capture-one-reproduction):
 

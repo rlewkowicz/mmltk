@@ -1,4 +1,5 @@
 #include "src/backend/data/detail/staged_artifact.h"
+#include "src/common/io/path_publication.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <unistd.h>
 #include <array>
