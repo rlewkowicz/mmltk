@@ -3,6 +3,8 @@
 #include "src/common/system/tests/denied_syscall.h"
 #include <catch2/catch_test_macros.hpp>
 #include <sys/syscall.h>
+#include <sys/mman.h>
+#include <cerrno>
 #include <limits>
 #include <algorithm>
 #include <vector>
@@ -38,6 +40,14 @@ TEST_CASE("Owned local pages keep high-water storage and verify placement", "[co
  NumaMemory moved(std::move(memory));
  CHECK(memory.data() == nullptr);
  CHECK(moved.data() == stable);
+ REQUIRE(::madvise(moved.data(), moved.capacity_bytes(), MADV_DONTNEED) == 0);
+ try {
+  moved.verify();
+  FAIL("discarded unlocked pages must report their per-page residency error");
+ } catch (const std::system_error& error) {
+  CHECK(error.code().value() == ENOENT);
+  CHECK(std::string(error.what()).contains("byte 0 of " + std::to_string(moved.capacity_bytes())));
+ }
 }
 TEST_CASE("Node-bound PMR backs reusable solver vectors and over-aligned objects", "[common][system][numa-memory]") {
  const auto facts = NumaTopology::Capture();
@@ -53,8 +63,8 @@ TEST_CASE("Node-bound PMR backs reusable solver vectors and over-aligned objects
  CHECK(reinterpret_cast<std::uintptr_t>(aligned) % (host_page_size() * 2) == 0);
  resource.deallocate(aligned, 8, host_page_size() * 2);
 }
-TEST_CASE("Denied binding or page verification never publishes host storage", "[common][system][numa-memory]") {
- for (const int call : {SYS_mbind, SYS_move_pages}) {
+TEST_CASE("Denied binding prefault or page verification never publishes host storage", "[common][system][numa-memory]") {
+ for (const int call : {SYS_mbind, SYS_madvise, SYS_move_pages}) {
   CHECK(test_support::with_denied_syscall(call, [] {
    NumaMemory memory(NumaTopology::Capture().permitted_nodes.front());
    try {
@@ -122,12 +132,17 @@ TEST_CASE("Page-locked NUMA ownership is transactional and movable", "[common][s
  CHECK_FALSE(memory.locked());
  CHECK(moved.locked());
  CHECK(moved.data() == address);
- CHECK(test_support::with_denied_syscall(SYS_mlock, [&] {
-  try {
-   moved.ensure_bytes(moved.capacity_bytes() + 1);
-  } catch (const std::system_error& error) { return error.code().value() == EPERM && moved.data() == address && moved.locked(); }
-  return false;
- }) == 0);
+ CHECK(::madvise(moved.data(), moved.capacity_bytes(), MADV_DONTNEED) == -1);
+ CHECK(errno == EINVAL);
+ moved.verify();
+ for (const int call : {SYS_mlock, SYS_move_pages})
+  CHECK(test_support::with_denied_syscall(call, [&] {
+   const auto pinned = locked_bytes(), capacity = moved.capacity_bytes();
+   try {
+    moved.ensure_bytes(capacity + 1);
+   } catch (const std::system_error& error) { return error.code().value() == EPERM && moved.data() == address && moved.capacity_bytes() == capacity && moved.locked() && locked_bytes() == pinned; }
+   return false;
+  }) == 0);
  moved.reset();
  CHECK_FALSE(moved.locked());
  CHECK(moved.data() == nullptr);

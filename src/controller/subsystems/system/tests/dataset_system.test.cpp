@@ -127,6 +127,8 @@ TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and 
  auto stored = contracts::default_gui_settings_state();
  stored.workflows.train.compile_benchmark_dataset_override = true;
  stored.workflows.train.compiled_dataset_dir = root.path() / "compiled";
+ stored.workflows.train.request.resolution = 32;
+ stored.workflows.train.request.preset_name = "rf-detr-nano";
  REQUIRE(services::SettingsStore::save(location.value(), stored, 1U).succeeded());
  REQUIRE(settings.Load(location).applied());
  services::DiagnosticsClient client{
@@ -160,14 +162,34 @@ TEST_CASE("owned dataset diagnostics survive runtime failure reconstruction and 
  const auto failed = mmltk::testsupport::await_test_future(first, "failed compile");
  CHECK(std::get<DatasetChanged>(failed).snapshot.terminal.outcome == contracts::ArtifactTerminalOutcome::Failed);
  CHECK(compiler.observer_enabled);
+ CHECK_FALSE(std::filesystem::exists(stored.workflows.train.compiled_dataset_dir / "train.bin"));
  compiler.work = [receipt = gate.receipt()](auto) { receipt.ArriveAndWait(); };
+ bool cancel = true;
+ SECTION("retry can stop while its reconstructed compiler is active") {}
+ SECTION("retry publishes and inspects new output after the failed output remained absent") {
+  cancel = false;
+  const mmltk::backend::data::testsupport::FixtureSpec fixture{.root_dir = (root.path() / "source").string(), .width = 32, .height = 32, .num_images = 1};
+  mmltk::backend::data::testsupport::create_synthetic_dataset(fixture);
+  compiler.work = [&, fixture](auto cancellation) {
+   auto config = mmltk::backend::data::testsupport::compiler_config(fixture);
+   config.output_dir = compiler.physical_output.string();
+   config.num_workers = 1;
+   const auto plan = mmltk::backend::data::DatasetCompiler::prepare(std::move(config), {fixture.split}, cancellation);
+   mmltk::backend::data::DatasetCompiler::compile(plan, 0, nullptr, cancellation);
+  };
+ }
  static_cast<void>(dataset.Compile({}));
- REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
- static_cast<void>(dataset.Stop());
- gate.Release();
+ if (cancel) {
+  REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
+  static_cast<void>(dataset.Stop());
+  gate.Release();
+ }
  auto second = terminals.Second();
- const auto cancelled = mmltk::testsupport::await_test_future(second, "cancelled compile");
- CHECK(std::get<DatasetChanged>(cancelled).snapshot.terminal.outcome == contracts::ArtifactTerminalOutcome::Cancelled);
+ const auto retried = std::get<DatasetChanged>(mmltk::testsupport::await_test_future(second, "retried compile")).snapshot;
+ CAPTURE(retried.terminal.detail);
+ CHECK(retried.terminal.outcome == (cancel ? contracts::ArtifactTerminalOutcome::Cancelled : contracts::ArtifactTerminalOutcome::Succeeded));
+ CHECK(std::filesystem::exists(stored.workflows.train.compiled_dataset_dir / "train.bin") == !cancel);
+ CHECK(retried.inspection.available() == !cancel);
  dataset.Shutdown();
  CHECK(constructions == 2U);
  CHECK(compiler.observer_enabled);

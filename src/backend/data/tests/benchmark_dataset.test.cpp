@@ -9098,6 +9098,7 @@ TEST_CASE("required label joins surface failed geometry readers without a pixel 
  auto split = cached_pixel_membership(images);
  split.images = {{1, 8, 2, 0, 0}};
  fs::remove(cached_image_path(images, 1));
+ std::promise<std::exception_ptr> labels;
  BenchmarkCompilePipeline execution(1);
  execution.label_configuration(16, mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
  auto request = benchmark_write_request(split, root.path() / "pixels.bin", 16);
@@ -9106,12 +9107,14 @@ TEST_CASE("required label joins surface failed geometry readers without a pixel 
  BenchmarkCompilePipeline::Attempt attempt(execution);
  bind_benchmark_slots(execution, writer, split);
  const auto publication = execution.source_publication(images, {});
- execution.labels_ready(publication, 1, BenchmarkLabelInput(label_projection_fixture(1), 0), "required");
+ execution.labels_ready(publication, 1, BenchmarkLabelInput(label_projection_fixture(1), 0), "required", 1);
+ REQUIRE(execution.subscribe_labels(publication, 1, "required", 1, [&](std::exception_ptr error) { labels.set_value(error); }));
  publication({1});
  CHECK_THROWS_AS(execution.wait_image_labels(images, 1, "required"), BenchmarkImageReadError);
  CHECK_FALSE(execution.geometry(images, 1));
  // Native annotation geometry permits independent conversion; the failed
  // physical join still prevents this completed label from becoming eligible.
+ CHECK_FALSE(mmltk::testsupport::await_test_promise(labels, "independent labels after failed physical geometry"));
  CHECK(execution.image_labels(images, 1, "required"));
  CHECK_FALSE(writer.image_complete(0));
 }
@@ -9928,6 +9931,47 @@ TEST_CASE("compile class producers retain waiting floors and release them after 
  REQUIRE(raced);
  raced->wait();
  CHECK(resumed == 2);
+}
+TEST_CASE("compile class floors remain runnable while another class settles completion", "[backend][data][benchmark][pipeline]") {
+ if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPUs");
+ CompileExecution execution(3);
+ auto extraction = execution.open_class(CompileWorkClass::Extraction);
+ auto annotations = execution.open_class(CompileWorkClass::Annotations);
+ auto pixels = execution.open_class(CompileWorkClass::Pixels);
+ auto output = execution.open_class(CompileWorkClass::Output);
+ std::array<mmltk::testsupport::TestGate, 3> running{
+  mmltk::testsupport::TestGate("first worker"), mmltk::testsupport::TestGate("second worker"), mmltk::testsupport::TestGate("third worker")};
+ mmltk::testsupport::TestGate callback("annotation completion retains its worker");
+ std::array<std::size_t, 3> lanes{};
+ std::array<CompileExecution::Completion, 3> completions;
+ std::promise<void> converted;
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  for (auto& gate : running) gate.Release();
+  callback.Release();
+  execution.cancel();
+  execution.retire_attempt();
+ });
+ for (std::size_t i = 0; i < completions.size(); ++i)
+  completions[i] = execution.submit({.kind = CompileTaskKind::Labels, .work = [&, i](std::size_t lane, const CompileAllowance&) {
+   lanes[i] = lane;
+   running[lane].receipt().ArriveAndWait();
+  }, .completed = [&, i](std::exception_ptr) {
+   if (lanes[i] == 1) callback.receipt().ArriveAndWait();
+  }});
+ for (auto& gate : running) REQUIRE(gate.WaitEntered(5s));
+ for (auto& gate : running) gate.Release();
+ REQUIRE(callback.WaitEntered(5s));
+ for (const auto& completion : completions) completion.wait();
+ CHECK(execution.snapshot().active == 0);
+ // Four live classes share three workers. Once Extraction closes, the new
+ // Pixels floor must belong to a worker that can actually dispatch it.
+ extraction.close();
+ auto pixel = execution.submit({.kind = CompileTaskKind::Pixels, .work = [&](std::size_t, const CompileAllowance&) { converted.set_value(); }});
+ mmltk::testsupport::await_test_promise(converted, "pixel floor beside a held annotation completion", 5s);
+ pixel.wait();
+ CHECK(execution.snapshot().active == 0);
+ callback.Release();
+ execution.join();
 }
 TEST_CASE("compile bounded records and event cancellation settle parked subscribers once", "[backend][data][benchmark][pipeline]") {
  struct CancellationTag;

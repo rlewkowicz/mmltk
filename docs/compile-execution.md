@@ -67,6 +67,11 @@ until both a dispatcher and its CPU grant are available. The completion callback
 retains the record and producer after the physical call returns its CPU grant.
 This preserves service readiness without adding an unaccounted full worker pool.
 
+Compute completion returns its CPU grant and scratch before invoking callbacks.
+The settling worker retains its class identity until those callbacks return, so
+another class's floor is assigned to a worker that can dispatch it. File services
+can still borrow the returned CPU while that callback retains its worker.
+
 Dependency registration checks the observed generation atomically with arming
 readiness. Parked records retain inputs, output leases, and completion custody.
 They resume or retire once; they do not retain borrowed lane scratch. Elastic
@@ -108,7 +113,10 @@ window and, for COCONut, the 256 MiB Arrow payload profile. Shared source window
 are counted once. Output geometry and perceptual filtering also affect the plan.
 
 [NumaMemory](../src/common/system/numa_memory.cpp) binds and prefaults owned pages,
-verifies placement, and calls `mlock` before publishing compiler storage.
+calls `mlock`, and verifies their retained placement before publishing compiler storage.
+Allocation rejects extents larger than the selected node's total memory;
+Linux prefaulting decides whether actual pages can be obtained, including by
+reclaiming file cache. A transient `MemFree` reading is not an allocation limit.
 The wrapper supplies `IPC_LOCK` and unlimited memlock; preparation or locking
 failure fails the operation. CPU compilation uses Linux page locking without
 acquiring a CUDA context. CUDA-registered runtime transfer buffers retain their

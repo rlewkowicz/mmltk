@@ -10,6 +10,7 @@
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <utility>
 namespace mmltk::common::system {
@@ -26,16 +27,23 @@ void verify_pages(void* data, std::size_t bytes, int node) {
   const auto count = std::min(pages.size(), (bytes - offset) / page);
   for (std::size_t i = 0; i < count; ++i) pages[i] = static_cast<std::byte*>(data) + offset + i * page;
   checked(::move_pages(0, count, pages.data(), nullptr, status.data(), 0), "verify host page NUMA placement");
-  for (std::size_t i = 0; i < count; ++i)
-   if (status[i] != node) throw std::runtime_error("host page is not resident on required NUMA node");
+  for (std::size_t i = 0; i < count; ++i) {
+   if (status[i] == node) continue;
+   const auto operation = "verify host page at byte " + std::to_string(offset + i * page) + " of " + std::to_string(bytes) + " on NUMA node " + std::to_string(node);
+   if (status[i] < 0) throw std::system_error(-status[i], std::generic_category(), operation);
+   throw std::runtime_error(operation + ": resident on NUMA node " + std::to_string(status[i]));
+  }
   offset += count * page;
  }
 }
-void* allocate_pages(std::size_t bytes, std::size_t alignment, int node) {
+void* allocate_pages(std::size_t bytes, std::size_t alignment, int node, NumaMemory::Lock lock = NumaMemory::Lock::None) {
  const auto policy = prepare_bound_memory_policy(node);
- long long free_bytes = 0;
- const auto total = numa_node_size64(node, &free_bytes);
- if (total < 0 || free_bytes < 0 || bytes > static_cast<std::uint64_t>(free_bytes)) throw std::bad_alloc();
+ // MemFree excludes reclaimable file cache and cannot decide allocation
+ // admission while a compiler is reading and writing large mapped datasets.
+ // Reject physically impossible extents here; prefaulting below asks Linux
+ // to reclaim pages and reports an actual allocation failure transactionally.
+ const auto total = numa_node_size64(node, nullptr);
+ if (total < 0 || bytes > static_cast<std::uint64_t>(total)) throw std::bad_alloc();
  const auto page = host_page_size();
  const auto extra = alignment > page ? alignment : 0U;
  if (bytes > std::numeric_limits<std::size_t>::max() - extra) throw std::bad_alloc();
@@ -52,9 +60,10 @@ void* allocate_pages(std::size_t bytes, std::size_t alignment, int node) {
  }
  try {
   checked(::mbind(mapping, bytes, policy.mode, policy.mask.data(), policy.mask.size() * word_bits, 0), "bind owned host storage");
-  // Unlike user-space first-touch stores, this reports allocation failure
-  // to the owner instead of relying on a fault handler to survive OOM.
+  // Populate writable pages before locking so allocation errors can be reported
+  // by the syscall. Locking then keeps every page resident through verification.
   checked(::madvise(mapping, bytes, MADV_POPULATE_WRITE), "prefault owned local host storage");
+  if (lock == NumaMemory::Lock::Pages) checked(::mlock(mapping, bytes), "page-lock compile NUMA arena (IPC_LOCK and memlock required)");
   verify_pages(mapping, bytes, node);
  } catch (...) {
   ::munmap(mapping, bytes);
@@ -134,12 +143,7 @@ NumaMemory& NumaMemory::operator=(NumaMemory&& other) noexcept {
 void NumaMemory::ensure_bytes(std::size_t bytes) {
  if (bytes <= bytes_) return;
  const auto capacity = page_rounded_bytes(bytes);
- auto* next = allocate_pages(capacity, host_page_size(), node_);
- if (lock_ == Lock::Pages && ::mlock(next, capacity) != 0) {
-  const auto error = errno;
-  ::munmap(next, capacity);
-  throw std::system_error(error, std::generic_category(), "page-lock compile NUMA arena (IPC_LOCK and memlock required)");
- }
+ auto* next = allocate_pages(capacity, host_page_size(), node_, lock_);
  reset();
  data_ = next;
  bytes_ = capacity;

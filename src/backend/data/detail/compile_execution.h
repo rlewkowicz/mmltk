@@ -218,6 +218,9 @@ public:
  [[nodiscard]] std::size_t descriptor_limit() const noexcept;
  [[nodiscard]] CompileResources resource_usage() const;
  [[nodiscard]] bool resource_pressure() const;
+ // A legal oversized request needs every ordinary arena to retire. Ordinary
+ // contention alone does not require a forward reader to discard its cursor.
+ [[nodiscard]] bool oversized_workspace_pending() const;
  [[nodiscard]] std::uint64_t admission_generation() const;
  void wait_for_admission_change(std::uint64_t, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
  void notify_admission_change() noexcept;

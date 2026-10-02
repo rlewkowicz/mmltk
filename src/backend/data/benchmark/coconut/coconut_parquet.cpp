@@ -701,10 +701,12 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
  for (std::size_t i = 0; i < readers.size(); ++i) readers[i].shard = i;
  Reader* replay = nullptr;
  std::size_t remaining = readers.size();
+ const auto retire_projections = [&] {
+  for (auto& state : readers) state.close();
+ };
  while (remaining) {
   bool progressed = false;
-  if (execution && execution->resource_pressure())
-   for (auto& state : readers) state.close();
+  if (execution && execution->oversized_workspace_pending()) retire_projections();
   const auto generation = execution ? execution->admission_generation() : 0;
   for (auto& state : readers) {
    if (state.finished || (replay && replay != &state)) continue;
@@ -736,23 +738,29 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    }
    const auto group_index = shard.first_group + state.group;
    auto& group = retained->groups[group_index];
+   const auto rows = retained->rows() | std::views::drop(group.first_row) | std::views::take(group.rows);
    try {
     if (!state.initialized) {
-     state.row = group.first_row;
+     std::uint64_t inspected = 0;
+     const bool ready = std::ranges::all_of(rows, [&](const auto& row) {
+      if (trace) ++inspected;
+      return row.metadata_ready();
+     });
+     trace_benchmark_event(trace, "benchmark.coconut.metadata_readiness",
+      [&] { return nlohmann::json{{"artifact", shard.path.string()}, {"group", state.group}, {"inspected_rows", inspected}, {"ready", ready}}; });
+     state.row = group.first_row + (metadata_only && ready ? group.rows : 0);
      state.segments = 0;
      state.projected = 0;
-     state.image_pass =
-      metadata_only || std::ranges::any_of(retained->rows() | std::views::drop(group.first_row) | std::views::take(group.rows), [](const auto& row) { return !row.metadata_ready(); });
+     state.image_pass = metadata_only || !ready;
      state.initialized = true;
     }
-    const auto rows = retained->rows() | std::views::drop(group.first_row) | std::views::take(group.rows);
     const auto publish_membership = [&] {
      for (const auto& row : rows) consumer(group_index, row.record(), CoconutAnnotationInput{.membership = true});
      state.image_pass = false;
      state.row = group.first_row;
      state.projected = 0;
     };
-    if (state.image_pass && std::ranges::all_of(rows, [](const auto& row) { return row.metadata_ready(); })) {
+    if (state.image_pass && state.row == group.first_row + group.rows) {
      if (state.replay_bytes) {
       state.close();
       state.replay_bytes = 0;
@@ -821,6 +829,8 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
     }
     if (!state.batches) {
      const auto& columns = state.image_pass ? shard.projection.images : state.annotations ? shard.projection.masks : shard.projection.png;
+     trace_benchmark_event(trace, "benchmark.coconut.projection_opened",
+      [&] { return nlohmann::json{{"artifact", shard.path.string()}, {"group", state.group}, {"image_pass", state.image_pass}, {"replayed_rows", state.projected}}; });
      cpu(*state.pool, state.allowance, [&] {
       state.batches = take(state.reader->GetRecordBatchReader({static_cast<int>(state.group)}, columns));
       // Suspension retains the last complete batch boundary. Replaying its
@@ -885,9 +895,15 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      for (auto& row : ready) row.staged = retained->staging->copy<std::uint8_t>(row.png, execution, files, parent);
      // Arrow buffers must be released while their memory pool is still alive.
      batch.reset();
-     state.close();
-     state.replay_bytes = 0;
-     replay = nullptr;
+     if (state.replay_bytes) {
+      state.close();
+      state.replay_bytes = 0;
+      replay = nullptr;
+     }
+    } else if (state.image_pass) {
+     // Metadata has been copied into canonical rows and has no Arrow borrower.
+     // Keep the reader and its allocation window at their forward position.
+     batch.reset();
     } else {
      state.pool->quiesce();
      state.allowance = {};
@@ -897,8 +913,8 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      const auto snapshot = execution ? execution->snapshot() : detail::CompileExecutionSnapshot{};
      return nlohmann::json{
       {"artifact", shard.path.string()}, {"group", state.group}, {"rows_projected", state.projected}, {"rows", ready.size()}, {"batch_bytes", staged ? 0 : state.pool->bytes_allocated()},
-      {"retained_bank_capacity", staged ? 0 : state.pool->retained_capacity()}, {"future_window_bytes", 0}, {"staged_transfer", staged}, {"normal_locked", snapshot.normal_locked},
-      {"leased", snapshot.leased}
+      {"retained_bank_capacity", state.pool ? state.pool->retained_capacity() : 0}, {"future_window_bytes", state.allowance.bytes()}, {"staged_transfer", staged},
+      {"normal_locked", snapshot.normal_locked}, {"leased", snapshot.leased}
      };
     });
     if (!state.image_pass) {
@@ -909,6 +925,9 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
         .png = staged ? row.staged.values : row.png,
         .backing = staged ? row.staged.owner : chunk,
         .live_bytes = staged ? row.staged.values.size() : static_cast<std::uint64_t>(state.pool->bytes_allocated()),
+        // A normal staged batch leaves its cursor open. Its controller releases
+        // idle readers only if a descendant actually cannot acquire scratch.
+        .retire_projection = staged ? std::function<void()>(retire_projections) : std::function<void()>{},
         .admitted = [&](CompileExecution::Completion completion) { state.consumers.push_back(std::move(completion)); }
        });
     }
@@ -935,7 +954,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
     // Close every idle reader before waiting: each may retain its own Arrow
     // pages. Batch borrowers drain at complete semantic boundaries, with
     // settlement releasing their input custody before exclusive admission.
-    for (auto& other : readers) other.close();
+    retire_projections();
     for (auto& other : readers) {
      for (const auto& completion : other.consumers) {
       completion.wait();

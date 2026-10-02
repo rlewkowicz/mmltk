@@ -334,16 +334,23 @@ Independent row-group ranges share CPU admission with Arrow internal threading
 and prebuffering disabled. The image-column pass retains typed metadata;
 later projections read missing segments/PNGs, skip reused fields, and omit
 payload reads for completely reusable groups. Each range keeps a forward
-Arrow reader and physical continuation across compatible groups. Resource
-pressure can close/reacquire readers without reparsing retained rows; physical
-archive prefixes may need replay. A contended physical-source lock also lets
+Arrow reader and physical continuation across compatible groups. Metadata and
+normally staged mask batches reuse the current reader and pinned window. An
+initial group inspection establishes retained metadata readiness; the forward
+cursor establishes completion without rescanning the consumed prefix. An
+oversized reservation, a failed descendant scratch admission, or a failed next
+source-window draw can retire idle readers; reopening replays the physical
+prefix without republishing retained rows. Ordinary contention in unrelated
+scratch does not discard a forward cursor. A contended physical-source lock also lets
 settled metadata retire its Arrow projection before waiting. Borrowed PNG spans
 retain their record batch and its complete allocation pool after a reader closes.
 
 [CoconutParquetPool](../src/backend/data/benchmark/coconut/detail/coconut_parquet_pool.h)
 allocates payload from pinned windows and keeps live batch addresses stable.
-The reader quiesces its allocation window before semantic consumers borrow
-capacity, then reacquires a complete window before its next library call.
+When semantic consumers borrow Arrow payload directly, the reader quiesces its
+allocation window, then reacquires a complete window before its next library
+call. Staged payload has independent custody, so normal readers stay open;
+exceptional source backing retires before semantic admission.
 Recovery waits are per physical namespace/original generation; they park the
 affected rows while other parsing and normalization remain ready.
 
@@ -459,6 +466,14 @@ physical cache lease only after the previous lease expires, avoiding a wait on
 its own still-live ownership. The gated
 [input-custody events](logging.md#benchmark-compilation-traces) distinguish reuse
 from a new acquisition wait.
+
+`CoconutRecipeInputs` joins its source controllers, then reconciles completed
+releases against both original and physical generations until they agree.
+Preparation retains its callbacks and transport through this boundary and
+acquires its own input/publication leases; reconciliation holds no competing
+lease. Unaffected native components and parsed rows remain reusable. Recovery
+providers expose CocoTrain for Base and CocoValidation for relabeled validation;
+other namespaces receive terminal absence without waiting on another split.
 
 Normalized indexes map immutable backing. Header/layout and image extents are
 checked before membership use; boxes and runs are admitted once when full

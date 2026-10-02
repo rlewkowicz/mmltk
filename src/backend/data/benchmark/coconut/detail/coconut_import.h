@@ -99,14 +99,14 @@ struct CoconutAnnotationInput {
  std::shared_ptr<const void> backing{};
  std::uint64_t live_bytes = 0;
  bool membership = false;
- // Archive inputs suspend their forward decoder before exceptional semantic
- // work. Parquet stages batches that cannot finish in protected completion
- // storage before exposing this input.
+ // Staged inputs can release their idle forward decoder if the consumer cannot
+ // acquire scratch. The consumer calls or clears this during synchronous
+ // admission; it must never retain the borrowed controller callback for work.
  std::function<void()> retire_projection{};
  std::function<void(CompileExecution::Completion)> admitted{};
 };
-// A consumer retains immutable backing through its own completion. Projection
-// reacquires a complete allocation window before the next library call.
+// A consumer retains immutable backing through its own completion. Staged
+// batches let the normal projection reuse its reader and allocation window.
 using CoconutRecordConsumer = std::function<void(std::size_t group, const CoconutRecord&, const CoconutAnnotationInput&)>;
 void read_coconut_parquet(std::span<const std::filesystem::path> shards, const CoconutImportLimits& limits, mmltk::common::concurrency::CancellationObservation cancellation,
  const CoconutRecordConsumer& consumer, bool metadata_only = false, detail::CompileExecution* execution = nullptr, detail::FileWorkQueue* files = nullptr,

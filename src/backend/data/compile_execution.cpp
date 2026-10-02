@@ -88,9 +88,10 @@ struct CompileExecution::Impl {
   Frame* active = nullptr;
   Workspace* retiring = nullptr;
   Idle idle;
-  CompileWorkClass baseline = CompileWorkClass::Count, service = CompileWorkClass::Count;
+  CompileWorkClass baseline = CompileWorkClass::Count, service = CompileWorkClass::Count, completing = CompileWorkClass::Count;
   bool dispatching = false, external = false;
   [[nodiscard]] bool busy() const { return active || retiring || service != CompileWorkClass::Count || dispatching || external; }
+  [[nodiscard]] bool occupied() const { return busy() || completing != CompileWorkClass::Count; }
   [[nodiscard]] bool owns(Workspace*) const;
  };
  struct Frame {
@@ -213,21 +214,23 @@ struct CompileExecution::Impl {
   floors = count <= lanes.size();
   std::array<bool, class_count> assigned{};
   for (auto& lane : lanes) {
-   if (!lane.busy() && (count > lanes.size() || (lane.baseline != CompileWorkClass::Count && !live(index(lane.baseline))))) lane.baseline = CompileWorkClass::Count;
+   if (!lane.occupied() && (count > lanes.size() || (lane.baseline != CompileWorkClass::Count && !live(index(lane.baseline))))) lane.baseline = CompileWorkClass::Count;
    if (lane.baseline != CompileWorkClass::Count) assigned[index(lane.baseline)] = true;
   }
   if (count > lanes.size()) return;
   for (std::size_t kind = 0; kind < class_count; ++kind) {
    if (!live(kind) || assigned[kind]) continue;
-   auto available = std::ranges::find_if(lanes, [](const auto& lane) { return !lane.busy() && lane.baseline == CompileWorkClass::Count; });
+   auto available = std::ranges::find_if(lanes, [](const auto& lane) { return !lane.occupied() && lane.baseline == CompileWorkClass::Count; });
    if (available == lanes.end()) {
     // An elastic borrower can already supply its class's floor. Move that
     // assignment from an idle peer so a newly live class can start without
     // waiting for unrelated work; CPU and workspace custody stay in place.
     for (auto idle = lanes.begin(); idle != lanes.end(); ++idle) {
-     if (idle->busy() || idle->baseline == CompileWorkClass::Count) continue;
-     const auto occupied =
-      std::ranges::find_if(lanes, [&](const auto& lane) { return lane.baseline == CompileWorkClass::Count && (lane.active ? lane.active->grant_class : lane.service) == idle->baseline; });
+     if (idle->occupied() || idle->baseline == CompileWorkClass::Count) continue;
+     const auto occupied = std::ranges::find_if(lanes, [&](const auto& lane) {
+      const auto grant_class = lane.active ? lane.active->grant_class : lane.service != CompileWorkClass::Count ? lane.service : lane.completing;
+      return lane.baseline == CompileWorkClass::Count && grant_class == idle->baseline;
+     });
      if (occupied == lanes.end()) continue;
      occupied->baseline = std::exchange(idle->baseline, CompileWorkClass::Count);
      available = idle;
@@ -608,6 +611,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
  if (!selected) return !finished;
  const auto class_index = index(work_class(selected->task.kind));
  const auto started = observer ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+ CompileWorkClass previous_completion;
  {
   Frame frame(*this, lane_index, static_cast<CompileWorkClass>(class_index));
   frame.job = selected.get();
@@ -645,6 +649,14 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
    }
    if (displaced.workspace) release_idle(std::move(displaced), lane_index);
   }
+  {
+   const std::lock_guard lock(admission->mutex);
+   // Return the CPU grant and scratch before callbacks, while retaining the
+   // physical worker's class until it can dispatch again. A newly live floor
+   // must not be assigned to this still-settling call. Services may continue
+   // to borrow its returned CPU independently.
+   previous_completion = std::exchange(lanes[lane_index].completing, frame.grant_class);
+  }
  }
  {
   const std::lock_guard lock(admission->mutex);
@@ -658,6 +670,12 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
   }
  }
  complete(selected, error);
+ {
+  const std::lock_guard lock(admission->mutex);
+  lanes[lane_index].completing = previous_completion;
+  reconcile();
+  notify_locked();
+ }
  return true;
 }
 void CompileExecution::Impl::events() noexcept {
@@ -1186,6 +1204,10 @@ CompileResources CompileExecution::resource_usage() const {
 bool CompileExecution::resource_pressure() const {
  const std::lock_guard lock(impl_->admission->mutex);
  return impl_->admission->pressure();
+}
+bool CompileExecution::oversized_workspace_pending() const {
+ const std::lock_guard lock(impl_->admission->mutex);
+ return impl_->admission->draining_request != nullptr;
 }
 std::uint64_t CompileExecution::admission_generation() const {
  const std::lock_guard lock(impl_->admission->mutex);

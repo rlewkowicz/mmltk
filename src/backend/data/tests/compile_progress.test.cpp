@@ -2016,7 +2016,8 @@ TEST_CASE("Directory yields inside one long mask projection for peer pixels and 
  } state(held.receipt());
  DirectoryCompileObservation observer{&state, [](void* context, CompileTaskKind kind, std::uint32_t image, bool complete) {
   auto& observed = *static_cast<State*>(context);
-  if (observed.trace) observed.trace("directory.task", {{"kind", static_cast<unsigned>(kind)}, {"image", image}, {"complete", complete}});
+  if (observed.trace)
+   observed.trace("directory.task", {{"kind", static_cast<unsigned>(kind)}, {"image", image}, {"complete", complete}, {"thread", std::hash<std::thread::id>{}(std::this_thread::get_id())}});
   // One short RLE token expands to 4096 padded target rows. The first Labels
   // return must be a projection yield, before a packed record can be published.
   if (kind == CompileTaskKind::Labels && !image && complete && ++observed.quanta == 1) {
@@ -2036,8 +2037,8 @@ TEST_CASE("Directory yields inside one long mask projection for peer pixels and 
  }, [](void* context, std::string_view event, const CompileExecutionSnapshot& snapshot) {
   auto& observed = *static_cast<State*>(context);
   if (observed.trace)
-   observed.trace(event, {{"active", snapshot.active}, {"external", snapshot.external}, {"running", snapshot.running}, {"live", snapshot.live}, {"parked", snapshot.parked},
-                          {"leased", snapshot.leased}, {"exceptional", snapshot.exceptional}, {"baseline", snapshot.baseline}});
+   observed.trace(event, {{"active", snapshot.active}, {"external", snapshot.external}, {"running", snapshot.running}, {"live", snapshot.live}, {"ready", snapshot.ready},
+                          {"parked", snapshot.parked}, {"leased", snapshot.leased}, {"exceptional", snapshot.exceptional}, {"baseline", snapshot.baseline}});
  }};
  if (!state.trace) observer.execution = nullptr;
  config.observation = &observer;
