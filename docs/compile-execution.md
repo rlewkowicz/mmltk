@@ -3,8 +3,10 @@
 [Wiki index](README.md) · [Dataset format](datasets.md) · [Benchmark recipes](benchmark-datasets.md) · [Diagnostics](logging.md#benchmark-compilation-traces)
 
 Directory and benchmark compilation share the data-owned execution, workspace,
-and file-service boundaries below. Recipe membership, cache repair, source
-identity, and publication decisions stay with their compiler and recipe owners.
+file-service, slot-storage, and compiled-format boundaries below, plus common
+filesystem publication. Their source front ends and codec policies remain
+distinct. Recipe membership, cache repair, source identity, and publication
+decisions stay with their compiler and recipe owners.
 Runtime batch loading uses its existing reader pool, described in
 [compiled loading](datasets.md#loading-a-compiled-file).
 
@@ -114,6 +116,10 @@ are counted once. Output geometry and perceptual filtering also affect the plan.
 
 [NumaMemory](../src/common/system/numa_memory.cpp) binds and prefaults owned pages,
 calls `mlock`, and verifies their retained placement before publishing compiler storage.
+Failed allocation, locking, or placement verification discards the candidate
+and preserves existing storage. Per-page placement errors identify the page offset,
+allocation extent, and required node, distinguishing a per-page kernel error
+from an actual resident-node mismatch.
 Allocation rejects extents larger than the selected node's total memory;
 Linux prefaulting decides whether actual pages can be obtained, including by
 reclaiming file cache. A transient `MemFree` reading is not an allocation limit.
@@ -184,6 +190,24 @@ split seals may overlap, but the recipe joins their completion before atomic
 directory publication. A file-operation completion includes its callback and
 borrowed context lifetime. Failure/cancellation stops pending work and joins
 physical users before staged files, mappings, or arenas retire.
+
+### Filesystem publication
+
+[path_publication.h](../src/common/io/path_publication.h) and its
+[implementation](../src/common/io/path_publication.cpp) own the shared atomic
+publication primitive used by staged files, benchmark directories, and the
+outer artifact service. Staging and destination must share a filesystem.
+Callers retain content validation/sync, cancellation, destination admission,
+and overwrite policy.
+
+Publication first attempts a no-replace rename. An occupied destination is
+exchanged only when overwrite is allowed. A failed destination-parent sync
+restores the staged and previous paths; an impossible rollback is fatal.
+After commit, old-generation removal is best effort and never follows symlinks.
+The returned `PathPublicationResult` reports replacement and any cleanup error;
+a cleanup error does not revoke the new output. Benchmark-specific
+[destination admission and outer staging](benchmark-datasets.md#persistent-cache-and-publication)
+remain with their existing owners.
 
 ## Progress delivery
 

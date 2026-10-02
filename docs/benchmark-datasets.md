@@ -215,6 +215,10 @@ when the other optional split fails. Stock validation still requires usable
 val2017 annotations. Cancellation, allocation/capacity failures, local file or
 I/O failures, and staging/publication failures remain fatal to the operation;
 they are not converted into optional-source omissions.
+Recovery also observes the shared compiler's interruption cause before
+processing or parking rows. A fatal label conversion or independent compiler
+failure therefore settles recovery without waiting for pending originals or
+JPEG geometry, preserving the original cause.
 
 ## Overlapping acquisition, labels, and pixels
 
@@ -416,11 +420,9 @@ destination against the cache. Equal paths, a cache inside either output, or
 an output inside the cache are rejected before publication can replace data.
 The GUI's outer staging transaction supplies its final destination separately.
 Compilation validates and syncs staged outputs before atomic publication.
-The shared [path publication owner](../src/common/io/path_publication.h) uses
-no-replace rename for new destinations and exchange for replacement. A failed
-parent-directory sync restores the staged and previous paths; failure to restore
-them is fatal. Old-generation removal is best effort after commit, with its
-actual outcome available in [publication traces](logging.md#benchmark-compilation-traces).
+The shared [filesystem publication boundary](compile-execution.md#filesystem-publication)
+owns rename, rollback, and old-generation cleanup; its cleanup outcome is
+available in [publication traces](logging.md#benchmark-compilation-traces).
 Benchmark admission accepts an empty existing directory without overwrite,
 removes only that empty directory, and refuses any new occupant at publication.
 Failure or cancellation before publication preserves previous healthy output.
@@ -487,6 +489,14 @@ acquires its own input/publication leases; reconciliation holds no competing
 lease. Unaffected native components and parsed rows remain reusable. Recovery
 providers expose CocoTrain for Base and CocoValidation for relabeled validation;
 other namespaces receive terminal absence without waiting on another split.
+
+Cached COCO components check the admitted original annotation identity before
+binding their view to its current compile-local generation. Rebinding leaves
+retained backing and sibling views unchanged. Component merging carries that
+authoritative view generation into the composed product and rejects mixed
+original identities, recovery policies, or generations. Withdrawn generations
+cannot supply fallback labels to replacement pixels. This view binding changes
+neither persisted cache identity nor format.
 
 Normalized indexes map immutable backing. Header/layout and image extents are
 checked before membership use; boxes and runs are admitted once when full

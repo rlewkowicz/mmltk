@@ -187,7 +187,11 @@ It owns separate bounded image and output file services using the shared CPU
 budget; retained continuations carry image preparation through to conversion.
 Recipes retain membership and recovery policy; Curl owns transport, archives
 retain opened generations, and split writers retain physical placement and
-publication. Pixels and labels advance independently through those joins.
+sealing. Recipe and artifact-service owners select final publication. Pixels
+and labels advance independently through those joins.
+[CoconutRecipeInputs](../src/backend/data/benchmark/coconut/coconut_recipe.cpp)
+owns release-scoped original providers and final
+[source reconciliation](benchmark-datasets.md#persistent-cache-and-publication).
 [coconut_import.h](../src/backend/data/benchmark/coconut/detail/coconut_import.h)
 owns import continuations and retained row/recovery readiness;
 [coconut_annotations.h](../src/backend/data/benchmark/coconut/detail/coconut_annotations.h)
@@ -325,8 +329,11 @@ owns Linux NUMA allocation and optional page-lock custody; compiler arena
 selection remains data-owned.
 [json_file.h](../src/common/io/json_file.h) supplies append and atomic JSON
 publication; [StagingDirectory](../src/common/io/staging_directory.h) owns
-temporary-directory cleanup until publication. Domain owners retain staging,
-sync, cancellation, overwrite, and persistence-format policy.
+temporary-directory cleanup until publication.
+[path_publication.h](../src/common/io/path_publication.h) owns shared
+[filesystem publication](compile-execution.md#filesystem-publication) for
+staged files and directories. Domain owners retain staging, content-sync
+requirements, cancellation, destination admission, and persistence-format policy.
 [file_digest.cpp](../src/common/io/file_digest.cpp) reads file snapshots through
 overwrite-only scratch bounded to 16 MiB, hashing only bytes filled by completed
 reads. Cancellation and before/after file-identity checks remain with that owner.

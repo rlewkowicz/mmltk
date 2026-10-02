@@ -43,12 +43,14 @@
   Directory/benchmark ownership, live-class CPU floors and elastic work,
   fixed pinned arenas, exceptional inputs, bounded image/file services and
   retained continuations, file preparation/completion,
-  physical-growth promises, and bounded progress delivery.
+  physical-growth promises, atomic filesystem publication, and bounded progress
+  delivery.
 - [Built-in benchmark datasets](benchmark-datasets.md): recipe membership,
   native import/provenance, optional mask recovery, persistent cache/repair,
   recipe readiness, archive and Parquet continuation,
-  immutable row-admission and cache custody, healthy subsets and incomplete
-  provenance, row/component progress accounting, and capacity limits.
+  source-generation reconciliation, immutable row-admission and cache custody,
+  healthy subsets and incomplete provenance, row/component progress accounting,
+  and capacity limits.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA selection,
   transfers, runtime retirement, inference lanes, readbacks, Vulkan/CUDA import,
   canvas descriptor/submission custody, sparse display damage, Upscale
@@ -59,8 +61,9 @@
 - [Validation](validation.md): required gates, suite/filter selection, tidy,
   test-run replacement, PCH include audits, cleanup and raw-review tooling,
   declaration formatting, symbol/address and GPU diagnostics, evidence ownership,
-  rendered acceptance, numerical coverage, Firefox/benchmark validation records,
-  historical fixed-storage measurements, fixtures, and evidence limits.
+  rendered acceptance, numerical coverage, benchmark ownership/recovery and
+  Firefox validation records, historical fixed-storage measurements, fixtures,
+  and evidence limits.
 - [Headless Wayland](headless-wayland.md): private NVIDIA Weston setup, input
   seat, readiness, deadlines, shutdown, artifacts, and limitations.
 - [Logging](logging.md): automatic build/test/tidy transcripts, opt-in runtime

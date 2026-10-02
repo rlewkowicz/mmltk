@@ -364,7 +364,7 @@ artifact names and monotonic timestamps do not join different runs.
 
 | Events or fields | Observed work |
 | --- | --- |
-| `artifact.compile.failed` | Artifact-service `operation` (`compilation`, `staged_inspection`, or `final_publication`), `staged_path`, `final_path`, and original `error`; staging is empty when admission or staging creation fails |
+| `artifact.compile.failed` | Artifact-service `operation` (`compilation`, `staged_inspection`, or `final_publication`), `staged_path`, `final_path`, and original `error`; staging is empty when source/output checks or staging creation fail |
 | `benchmark.compile.paths` | Resolved `cache_root` and compiler `output_root`, with separate `*_truncated` and `*_utf8_replaced` diagnostic flags |
 | `benchmark.progress.activity` | Current `activity`, numeric `phase`, and optional numeric `source` |
 | `benchmark.progress.delivery` | Opt-in `produced`, `materialized`, `coalesced`, `delivered`, `pending`, and `high_water` counts from the bounded progress observer |
@@ -416,6 +416,9 @@ observer is installed. Diagnostic delivery cannot change the operation result.
 For a capture produced by [the GUI example](#capture-one-reproduction):
 
 ```bash
+./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
+  -q '@event=artifact.compile.failed' \
+  --fields @event,operation,staged_path,final_path,error --format jsonl --limit 20
 ./mmltk --logs .mmltk-data/logs/gui-trace.jsonl \
   -q '@event=benchmark.compile.paths OR @event=benchmark.progress.activity' \
   --format timeline --limit 40

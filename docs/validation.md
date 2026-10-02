@@ -1056,7 +1056,9 @@ behavior independently of rendered UI acceptance:
 | [compile_progress.test.cpp](../src/backend/data/tests/compile_progress.test.cpp), same target | Exact counters behind a held observer, dirty deadlines and lifecycle/repair flushes, terminal/failure propagation, preparation budgets, Directory continuations and class floors, annotation/mask meaning, and complete capacity rejection |
 | [benchmark_image_diagnostic.test.cpp](../src/entrypoints/tools/tests/benchmark_image_diagnostic.test.cpp), `mmltk_entrypoints_tools_tests` | CMake-owned native helper execution, format-10 physical slot admission, malformed/old-format rejection, normalized mask export, and raw PNG/Parquet inspection |
 | [application_compute_services.test.cpp](../src/controller/subsystems/system/tests/application_compute_services.test.cpp), `mmltk_controller_data_compute_systems_tests` | Environment cache selection and staged/final output overlap through the artifact service, retained choices through materialization, and real resumed/restarted/unknown-total HTTP observations projected as typed transfer facts separately from bounded activity at an unchanged image fraction |
-| [dataset_system.test.cpp](../src/controller/subsystems/system/tests/dataset_system.test.cpp), same target | Explicit compile captures settled choices, later settings edits preserve the admitted request, owned diagnostics survive runtime reconstruction and stop/join, open-ended/recovered progress remains valid, and malformed progress including transfer/retained-byte bounds is rejected |
+| [dataset_system.test.cpp](../src/controller/subsystems/system/tests/dataset_system.test.cpp), same target | Explicit compile captures settled choices, later settings edits preserve the admitted request, owned diagnostics survive runtime reconstruction and stop/join, a retry publishes real compiled output after failure leaves the destination absent, compilation/inspection/publication failure traces preserve their original cause, open-ended/recovered progress remains valid, and malformed progress including transfer/retained-byte bounds is rejected |
+| [path_publication.test.cpp](../src/common/io/tests/path_publication.test.cpp), `mmltk_backend_data_tests` | New and replacement file/directory publication, occupied empty directories and dangling symlinks, parent-sync rollback, and best-effort old-generation cleanup after commit |
+| [numa_memory.test.cpp](../src/common/system/tests/numa_memory.test.cpp), `mmltk_common_system_tests` | Page-locked ownership/move/reuse, locked-page discard refusal, per-page kernel error context, failed-candidate rollback, and preservation of existing storage |
 | [dataset_wiring.test.cpp](../src/controller/shell/tests/dataset_wiring.test.cpp), `mmltk_controller_shell_tests` | Production shell/factory propagation of enabled and disabled diagnostics through the staged compiler path |
 | [settings.test.cpp](../src/controller/services/tests/settings.test.cpp), `mmltk_controller_services_tests` | Native defaults, missing/invalid setting repair, default-off recovery for settings missing that field, and recipe/hidden validation/recovery persistence |
 | [Dataset component](../src/frontend/iced/src/view/train/dataset.rs), [progress cases](../src/frontend/iced/src/view/train/dataset/progress/tests.rs), and [integration reporting](../src/frontend/iced/src/integration_control/reporting.rs), `browser-app` | Generated selection edits, visibility/active-control policy, exact grouped/IEC quantities, independent transfer/track semantics, native terminal visibility, measured height reservation, and disabled-reporting quietness |
@@ -1085,14 +1087,14 @@ causal coverage includes:
 
 | Boundary | Cases in the data suites |
 | --- | --- |
-| CPU admission | Waiting live-class floors, activation/retirement, fewer-core fairness, blocked-demand bypass/aging, shared Curl/file/external grants, class-aware file dispatch, and cancellation of queued/active borrowers |
+| CPU admission | Waiting live-class floors, activation/retirement, fewer-core fairness, blocked-demand bypass/aging, shared Curl/file/external grants, class-aware file dispatch, returned CPU grants while compute callbacks still occupy their workers, and cancellation of queued/active borrowers |
 | Image preparation | Dedicated bounded file capacity behind held cache/label output, stable service workers and pinned storage on small CPU plans, stage selection under a hard record bank, retained continuations ahead of later workspace waiters, checked inode preload, and physical cancellation/failure drain before another attempt |
 | Memory and descriptors | Fixed pinning across class/lane reassignment, protected completion windows, one exceptional lineage and retained descendants, Arrow/encoded allocation windows, finite loans including zero-byte offers, nested descriptor commitments, low limits, and physical release before reacquisition |
 | Filesystem growth | Shared destination-filesystem reservations, sparse occupied allocation outside source locks, physical output leases, immutable staging blocks, source-safe same-inode compaction, staged publication, and exception cleanup |
 | Transport | Contended artifact locks, whole files alongside stored ranges, one-connection resume, rejected validators/coverage, durable out-of-order checkpoints, redirects, fair Curl admission, Open Images retries, and channel cancellation |
-| Archives and Parquet | Requested members before unused tails, consumed checksum/truncation errors, raw/ZIP/sparse/gzip continuation, bounded gzip dictionaries/controls, retained Parquet rows/batches, independent groups, and pressure-driven reader retirement |
-| Immutable products | Mapped indexes/images across path replacement, exact row-admission proof reuse and geometry rejection, same-inode cache publication with independent destinations, independent original split publication/withdrawal, retained native support through repair, full-backing component dependencies, and cached groups that omit payload projections |
-| Readiness and source custody | Per-row physical registrations, namespace/generation original subscriptions, already-delivered generations and retired-row withdrawal, EOF descriptor/continuation release, and cache preparation reusing a controller/sibling's live source lease |
+| Archives and Parquet | Requested members before unused tails, consumed checksum/truncation errors, raw/ZIP/sparse/gzip continuation, bounded gzip dictionaries/controls, retained Parquet rows/batches, independent groups, forward reader/window reuse through ordinary unrelated contention, bounded metadata readiness inspections, and exceptional reader retirement/replay |
+| Immutable products | Mapped indexes/images across path replacement, exact row-admission proof reuse and geometry rejection, same-inode cache publication with independent destinations, independent original split publication/withdrawal, retained native support through repair, rebound view generations through component composition, rejection of stale composed labels, full-backing component dependencies, and cached groups that omit payload projections |
+| Readiness and source custody | Per-row physical registrations, release-scoped namespace/generation original subscriptions, already-delivered generations and retired-row withdrawal, EOF descriptor/continuation release, cache preparation reusing a controller/sibling's live source lease, cold/retained late original and shared-physical repair, and fatal recovery settlement while originals/JPEG geometry remain held |
 | Final labels | Labels before JPEG arrival and pixels before annotations, per-image geometry admission, canonical ordinal settlement/backpatches, explicit incomplete provenance across cache reuse and later repair, Large-over-XL claim restoration, present-empty masks, and validation progress during held training |
 | Healthy subsets | Partially valid labels, true backgrounds, rejected/unlisted physical holes, unreadable annotation artifacts and pixels, bounded repair, contradictory geometry, empty required splits, and preservation of old publication on fatal failure |
 | Fixed storage | 64-slot boundaries, checked extents, 500,000-byte payload overflow, eligible-only maxima including zero, cancellation/fault preservation, unified label/pixel read preparation, bounded prefault/gather continuations, repeated logical draws, and prepared capacities through epoch changes |
@@ -1134,9 +1136,67 @@ proves rendering, input, cancellation/restart, and native caption agreement;
 these claims. Trace/serialization suites cover timestamps, effect-only delivery
 failure, Unicode scalars, and malformed wire-text rejection.
 
+### Benchmark ownership and recovery validation record
+
+This compilation ownership, recovery, and publication work completed at
+`9da36b78`. The local
+[validation ledger](../build/validation/benchmark-ownership.json) retains
+phase/audit commits, controlled before/after evidence, focused remediation,
+and the full validation stage history. Cleanup checkpoints are `14e261f8`
+(`pre cleanup`) and `f8404cad` (`post cleanup`). Both full tidy stages ended
+clean; the fresh C++ and frontend cleanup profiles reported zero textual and
+structural hits. The final runtime image is
+`sha256:55e52edfd4da54686f751e5332da9760e1e6c4e6613bb5244a46d05378b0148a`.
+
+| Final required operation | Transcript and result |
+| --- | --- |
+| `./mmltk --build`, after remediation | [mmltk-build-20261002-142718-2352585.log](../build/logs/mmltk-build-20261002-142718-2352585.log), exit 0 |
+| `./mmltk --test all` | [mmltk-test-20261002-143151-2373087.log](../build/logs/mmltk-test-20261002-143151-2373087.log), exit 0; 489 dataset cases passed, one GDR skip, 400,790 assertions; nine GDR-dependent native skips across the complete run, one existing ignored Rust doctest, and 177 log-query fixtures passed |
+| Subsequent `./mmltk --test workspace-wayland --headless-compositor` | [mmltk-test-20261002-150148-2441664.log](../build/logs/mmltk-test-20261002-150148-2441664.log), exit 0; 88 cases passed, one GDR skip, 147,757 assertions |
+
+These local ignored artifacts are absent from a fresh checkout. Compiler
+coverage includes Coconut with Stock validation, dropped-mask recovery enabled,
+Stretch, and perceptual downscaling. Directory and benchmark retain distinct
+source front ends and codec policies while sharing the
+[execution, storage, and publication owners](compile-execution.md).
+
+Controlled NUMA evidence reproduced the reported residency error by discarding
+an unlocked prefaulted page before verification. After locking moved before
+verification, the discard was refused and the ownership case passed. The
+original workload was unlogged: its actual per-page kernel status, including
+whether a page was missing or on another node, remains unknown.
+
+The 96-row Parquet fixture previously observed 540 metadata readiness visits
+in each pressure variant. The final case bounds those visits to the row count
+and requires two projection openings, zero replayed rows, retained payloads,
+and settled storage with and without unrelated scratch contention. Late
+physical/original repair cases cover cold and retained components, independent
+unrelated sources, converged identities, and released publication leases.
+
+Final Validation also reproduced recovery returning to a pending-original wait
+after shared execution had already failed. The correction propagates the
+existing interruption cause through recovery settlement. The final suites cover
+both fatal label conversion and independent compiler failure while originals
+and JPEG geometry remain held. Retry coverage creates and inspects a real
+compiled artifact through fresh staging after the preceding failure leaves
+the final destination absent. The historical Compile-again error
+`open failed: compiled/train.bin: No such file or directory` has not been
+reproduced through the current direct Compile path; successful retry and
+operation-stage diagnostics do not establish its historical root cause.
+
+The recipe became 17 lines smaller and the duplicated publication bodies
+shrank from 58 to 39 lines; production changes from `5b0e775a` through
+`9da36b78` totaled 234 additions and 174 deletions, a net increase of 60 lines.
+Fixture counts establish removed scans and reused workers, not a production
+speedup percentage.
+No production-sized throughput or peak-memory benchmark was measured. GDR skips
+remain unverified hardware coverage. Firefox coverage used only first-party
+suites and packaged application acceptance; no Firefox-owned tests were added
+or run.
+
 ### Firefox and benchmark pipeline validation record
 
-The completed implementation and validation are recorded at `87a0d2b1`.
+The preceding Firefox and benchmark pipeline validation is recorded at `87a0d2b1`.
 The local [validation ledger](../build/validation/firefox-benchmark-validation.json)
 retains both full tidy stages, fresh C++/frontend cleanup results, builds,
 focused remediation, and final suite results. The cleanup checkpoints are
