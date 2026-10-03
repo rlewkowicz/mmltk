@@ -37,13 +37,19 @@ namespace {
 detail::StorageReservationPool::Observer observe_storage(const BenchmarkTraceSink& trace, bool preflight) {
  if (!trace) return {};
  return [trace, preflight](const detail::StorageReservationPool::Observation& value) {
-  trace_benchmark_event(trace, preflight ? "benchmark.storage.preflight" : value.failed ? "benchmark.storage.capacity_failed" : "benchmark.storage.reserved", [&] {
-   return nlohmann::json{{"target", value.description}, {"path", value.path.string()}, {"required_bytes", value.required}, {"reserved_bytes", value.outstanding}, {"available_bytes", value.available},
-    {"capacity_samples", value.capacity_samples}, {"retries", value.retries}, {"duration_ns", value.duration_ns}, {"failed", value.failed}};
+  trace_benchmark_event(trace,
+   preflight      ? "benchmark.storage.preflight"
+   : value.failed ? "benchmark.storage.capacity_failed"
+                  : "benchmark.storage.reserved",
+   [&] {
+   return nlohmann::json{
+    {"target", value.description}, {"path", value.path.string()}, {"required_bytes", value.required}, {"reserved_bytes", value.outstanding}, {"available_bytes", value.available},
+    {"capacity_samples", value.capacity_samples}, {"retries", value.retries}, {"duration_ns", value.duration_ns}, {"failed", value.failed}
+   };
   });
  };
 }
-} // namespace
+}  // namespace
 void require_storage(const std::filesystem::path& path, std::uint64_t required, const char* description, const BenchmarkTraceSink& trace) {
  detail::StorageReservationPool::require_capacity(path, required, description, observe_storage(trace, true));
 }

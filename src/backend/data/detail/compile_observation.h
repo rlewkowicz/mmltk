@@ -15,12 +15,20 @@ class CompileObservationClock final {
  [[nodiscard]] std::uint64_t now() const noexcept {
   if (!thread_cpu_) return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
   timespec time{};
-  if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) != 0) { valid_ = false; incomplete_ = true; return 0; }
+  if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) != 0) {
+   valid_ = false;
+   incomplete_ = true;
+   return 0;
+  }
   return static_cast<std::uint64_t>(time.tv_sec) * 1000000000ULL + static_cast<std::uint64_t>(time.tv_nsec);
  }
+
 public:
  explicit CompileObservationClock(bool enabled, bool thread_cpu = false) noexcept : enabled_(enabled), thread_cpu_(thread_cpu) {
-  if (enabled_) { valid_ = true; started_ = now(); }
+  if (enabled_) {
+   valid_ = true;
+   started_ = now();
+  }
  }
  [[nodiscard]] bool incomplete() const noexcept { return incomplete_; }
  [[nodiscard]] std::uint64_t elapsed() const noexcept {
@@ -36,4 +44,4 @@ public:
   return elapsed;
  }
 };
-} // namespace mmltk::backend::data::detail
+}  // namespace mmltk::backend::data::detail

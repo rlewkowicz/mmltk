@@ -16,6 +16,7 @@ class CapacityObservation final {
  StorageReservationPool::Observation value_;
  CompileObservationClock clock_;
  int exceptions_;
+
 public:
  CapacityObservation(const StorageReservationPool::Observer& observer, const std::filesystem::path& path, std::string_view description)
      : observer_(observer), value_{path, description, 0, 0, 0}, clock_(bool(observer)), exceptions_(observer ? std::uncaught_exceptions() : 0) {}
@@ -23,11 +24,19 @@ public:
   if (!observer_) return;
   value_.duration_ns = clock_.elapsed();
   value_.failed = std::uncaught_exceptions() > exceptions_;
-  try { observer_(value_); } catch (...) {}
+  try {
+   observer_(value_);
+  } catch (...) {}
  }
- void sample() noexcept { if (observer_) ++value_.capacity_samples; }
+ void sample() noexcept {
+  if (observer_) ++value_.capacity_samples;
+ }
  void capacity(std::uint64_t required, std::uint64_t outstanding, std::uint64_t available) noexcept {
-  if (observer_) { value_.required = required; value_.outstanding = outstanding; value_.available = available; }
+  if (observer_) {
+   value_.required = required;
+   value_.outstanding = outstanding;
+   value_.available = available;
+  }
  }
 };
 std::filesystem::path existing_parent(const std::filesystem::path& path) {

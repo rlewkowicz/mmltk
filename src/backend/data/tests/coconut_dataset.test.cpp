@@ -77,10 +77,10 @@
 #include <utility>
 #include <vector>
 using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileChange;
 using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileResourceWait;
 using mmltk::backend::data::detail::CompileTaskKind;
-using mmltk::backend::data::detail::CompileChange;
 using namespace mmltk::backend::data;
 using namespace mmltk::backend::data::benchmark_internal;
 namespace {
@@ -6481,18 +6481,28 @@ TEST_CASE("blocking controller local notices leave pipeline and native output ow
  auto input = request(physical);
  input.prepare_partial_staging(pipeline, root.path() / "staging");
  mmltk::testsupport::TestGate initialized("native output registration is live before input starts");
- input.progress = [&](std::uint64_t count) { if (!count) initialized.receipt().ArriveAndWait(); };
+ input.progress = [&](std::uint64_t count) {
+  if (!count) initialized.receipt().ArriveAndWait();
+ };
  auto importing = std::async(std::launch::async, [&] { return import_coconut_annotations(input); });
- const mmltk::testsupport::ScopedTestCleanup finish_import([&] { initialized.Release(); pipeline.execution().cancel(); });
+ const mmltk::testsupport::ScopedTestCleanup finish_import([&] {
+  initialized.Release();
+  pipeline.execution().cancel();
+ });
  REQUIRE(initialized.WaitEntered(5s));
  mmltk::testsupport::TestGate initial("prior owner callbacks settled"), delivered("blocking controller received global Local");
  unsigned notices = 0;
  CompileExecution::Readiness controller(pipeline.execution(), CompileChange::Local, [&](auto changes) {
   if (!includes(changes.causes, CompileChange::Local)) return;
-  if (++notices == 1) initial.receipt().ArriveAndWait();
-  else if (notices == 2) delivered.receipt().ArriveAndWait();
+  if (++notices == 1)
+   initial.receipt().ArriveAndWait();
+  else if (notices == 2)
+   delivered.receipt().ArriveAndWait();
  });
- const mmltk::testsupport::ScopedTestCleanup release([&] { initial.Release(); delivered.Release(); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  initial.Release();
+  delivered.Release();
+ });
  controller.notify();
  REQUIRE(initial.WaitEntered(5s));
  const auto before = pipeline.execution().snapshot().costs.notifier_deliveries;
@@ -9967,15 +9977,19 @@ TEST_CASE("continuing physical repair advances beside an unrelated accepted pixe
                               .output_path = directory.path() / "pixels.bin",
                               .resolution = 3,
                               .num_workers = 4,
-                              .progress = {.context = &observed, .image_completed = [](void* context) {
-                               auto& value = *static_cast<Observed*>(context);
-                               if (!value.completed.fetch_add(1)) value.repaired.set_value();
-                              }},
-                              .image_opened = [&](const auto&, std::uint64_t id) {
-                               const auto attempt = ++opens.at(id - 1);
-                               if (attempt == 1 || (id != held_id && attempt == 2)) throw BenchmarkImageError("cached pixel needs its forward source repair");
-                               if (id == held_id) held.receipt().ArriveAndWait();
-                              },
+                              .progress =
+                               {.context = &observed,
+                                .image_completed =
+                                 [](void* context) {
+  auto& value = *static_cast<Observed*>(context);
+  if (!value.completed.fetch_add(1)) value.repaired.set_value();
+ }},
+                              .image_opened =
+                               [&](const auto&, std::uint64_t id) {
+  const auto attempt = ++opens.at(id - 1);
+  if (attempt == 1 || (id != held_id && attempt == 2)) throw BenchmarkImageError("cached pixel needs its forward source repair");
+  if (id == held_id) held.receipt().ArriveAndWait();
+ },
                               .execution = &pipeline},
   true);
  BenchmarkCompilePipeline::Attempt attempt(pipeline);
@@ -11106,7 +11120,10 @@ TEST_CASE("native staging retains its record while an image uses another slice o
 TEST_CASE("Coconut cost spans preserve disabled and unwinding diagnostic behavior", "[benchmark][coconut][trace]") {
  const bool unwinding = GENERATE(false, true);
  std::size_t constructions = 0;
- const auto fields = [&] { ++constructions; return Json{{"rows_revisited", 18446744073709551615ULL}}; };
+ const auto fields = [&] {
+  ++constructions;
+  return Json{{"rows_revisited", 18446744073709551615ULL}};
+ };
  {
   const BenchmarkTraceSink disabled;
   BenchmarkCostSpan quiet(disabled, BenchmarkCostKind::RecoveryDrain, fields);

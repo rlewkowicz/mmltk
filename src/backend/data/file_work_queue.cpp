@@ -330,7 +330,11 @@ FileWorkQueue::Reservation::Reservation(std::shared_ptr<Impl> owner, std::size_t
 FileWorkQueue::Reservation::~Reservation() { release(); }
 FileWorkQueue::Reservation::Reservation(Reservation&& other) noexcept : owner_(std::move(other.owner_)), index_(other.index_) {}
 FileWorkQueue::Reservation& FileWorkQueue::Reservation::operator=(Reservation&& other) noexcept {
- if (this != &other) { release(); owner_ = std::move(other.owner_); index_ = other.index_; }
+ if (this != &other) {
+  release();
+  owner_ = std::move(other.owner_);
+  index_ = other.index_;
+ }
  return *this;
 }
 void FileWorkQueue::Reservation::release() noexcept {
@@ -383,8 +387,9 @@ CompileExecution::Completion FileWorkQueue::Reservation::submit(Operation operat
  record.state = Impl::State::Queued;
  if (owner->pool) {
   record.dispatch_owner = owner;
-  try { owner->pool->enqueue_borrowed(*record.dispatch); }
-  catch (...) {
+  try {
+   owner->pool->enqueue_borrowed(*record.dispatch);
+  } catch (...) {
    record.dispatch_owner.reset();
    operation = std::move(record.operation);
    record.state = Impl::State::Reserved;

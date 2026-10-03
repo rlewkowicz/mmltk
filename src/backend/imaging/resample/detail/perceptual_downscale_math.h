@@ -36,7 +36,9 @@ MMLTK_PERCEPTUAL_HD inline Color transform(float r, float g, float b) {
  return {C::yr * r + C::yg * g + C::yb * b, C::cbr * r + C::cbg * g + C::cbb * b, C::crr * r + C::crg * g + C::crb * b};
 }
 template <class Value>
-MMLTK_PERCEPTUAL_HD inline ColorValue<Value> inverse(ColorValue<Value> v) { return {v.y + 1.402F * v.cr, v.y - 0.344136F * v.cb - 0.714136F * v.cr, v.y + 1.772F * v.cb}; }
+MMLTK_PERCEPTUAL_HD inline ColorValue<Value> inverse(ColorValue<Value> v) {
+ return {v.y + 1.402F * v.cr, v.y - 0.344136F * v.cb - 0.714136F * v.cr, v.y + 1.772F * v.cb};
+}
 // Integer rational endpoints avoid loss of coverage even at large uint32
 // extents. Interior weights are exactly one; only the two borders are partial.
 struct Footprint {
@@ -123,12 +125,13 @@ MMLTK_PERCEPTUAL_HD inline CoefficientValue<Value> patch(const MomentValue<Value
  return result;
 }
 template <class Value>
-MMLTK_PERCEPTUAL_HD inline ColorValue<Value> reconstruct(const MomentValue<Value>& m, const CoefficientValue<Value>& a, const CoefficientValue<Value>& b, const CoefficientValue<Value>& c, const CoefficientValue<Value>& d) {
+MMLTK_PERCEPTUAL_HD inline ColorValue<Value> reconstruct(
+ const MomentValue<Value>& m, const CoefficientValue<Value>& a, const CoefficientValue<Value>& b, const CoefficientValue<Value>& c, const CoefficientValue<Value>& d) {
  Value v[3];
  for (int k = 0; k < 3; ++k) {
   // Centered reconstruction avoids subtracting large r*m terms.
-  v[k] = (multiply_add(a.ratio[k], m.mean[k] - a.center[k], a.center[k]) + multiply_add(b.ratio[k], m.mean[k] - b.center[k], b.center[k]) + multiply_add(c.ratio[k], m.mean[k] - c.center[k], c.center[k]) +
-          multiply_add(d.ratio[k], m.mean[k] - d.center[k], d.center[k])) *
+  v[k] = (multiply_add(a.ratio[k], m.mean[k] - a.center[k], a.center[k]) + multiply_add(b.ratio[k], m.mean[k] - b.center[k], b.center[k]) +
+          multiply_add(c.ratio[k], m.mean[k] - c.center[k], c.center[k]) + multiply_add(d.ratio[k], m.mean[k] - d.center[k], d.center[k])) *
          0.25F;
  }
  return {v[0], v[1], v[2]};

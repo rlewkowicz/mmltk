@@ -7,7 +7,8 @@ CompilePixelWorkspacePlan::CompilePixelWorkspacePlan(const CompileImageHeader& h
     : header_(header),
       policy_(policy),
       decoder_(CompileImageDecoder::plan(header)),
-      resize_(imaging::resample::RgbImageResizer::workspace_plan(header.width, header.height, policy.width, policy.height, policy.mode, policy.perceptual, imaging::resample::RgbPixelFormat::RGB8, observed)) {
+      resize_(imaging::resample::RgbImageResizer::workspace_plan(
+       header.width, header.height, policy.width, policy.height, policy.mode, policy.perceptual, imaging::resample::RgbPixelFormat::RGB8, observed)) {
  using common::math::checked_add;
  using common::math::checked_multiply;
  decoder_extent_ = checked_add(decoder_.bytes(), std::size_t{63}, "decode alignment overflow") / 64 * 64;
@@ -22,7 +23,9 @@ CompilePixelWorkspacePlan::CompilePixelWorkspacePlan(const CompileImageHeader& h
  const auto plane = checked_multiply<std::size_t>(row, policy.height, "pixel plane overflow");
  destination_ = {policy.width, policy.height, row, plane, checked_multiply<std::size_t>(plane, 3, "pixel destination overflow"), imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32};
 }
-CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, CompilePixelPolicy policy, imaging::resample::RgbResizeWork* observed) { return CompilePixelWorkspacePlan(header, policy, observed); }
+CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, CompilePixelPolicy policy, imaging::resample::RgbResizeWork* observed) {
+ return CompilePixelWorkspacePlan(header, policy, observed);
+}
 CompilePixelWorkspacePlan compile_pixel_workspace_plan(const CompileImageHeader& header, std::uint32_t resolution, imaging::resample::ImageResizeMode mode, bool perceptual) {
  return compile_pixel_workspace_plan(header, {resolution, resolution, mode, perceptual}, nullptr);
 }
@@ -54,7 +57,9 @@ void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::sp
   observation.duration_ns = total.elapsed();
   observation.cpu_ns = cpu.elapsed();
   observation.cpu_incomplete = cpu.incomplete();
-  try { observer(observation); } catch (...) {}
+  try {
+   observer(observation);
+  } catch (...) {}
  };
  try {
   if (header != plan.header_) throw CompileImageError("pixel input differs from its prepared header");
@@ -69,16 +74,31 @@ void CompilePixelWorkspace::write(const CompilePixelWorkspacePlan& plan, std::sp
   // supplied output extent. Verify actual content before any destination write.
   const auto policy = header.encoding == CompileImageEncoding::Stb ? CompileImagePolicy::Directory : CompileImagePolicy::Benchmark;
   if (decoder_.read_header(encoded, policy) != header) throw CompileImageError("pixel content differs from its prepared header");
-  if (observer) { observation.validation_ns = step.lap(); observation.stage = CompilePixelStage::Preparation; }
+  if (observer) {
+   observation.validation_ns = step.lap();
+   observation.stage = CompilePixelStage::Preparation;
+  }
   resizer_.prepare(plan.resize_, memory.subspan(plan.decoder_extent_, plan.resize_.bytes()));
-  if (observer) { observation.preparation_ns = step.lap(); observation.stage = CompilePixelStage::Decode; }
+  if (observer) {
+   observation.preparation_ns = step.lap();
+   observation.stage = CompilePixelStage::Decode;
+  }
   const auto decoded = decoder_.decode_rgb(encoded, header, memory.first(plan.decoder_.bytes()));
-  if (observer) { observation.decode_ns = step.lap(); observation.stage = CompilePixelStage::Destination; }
+  if (observer) {
+   observation.decode_ns = step.lap();
+   observation.stage = CompilePixelStage::Destination;
+  }
   prepare_destination();
-  if (observer) { observation.destination_ns = step.lap(); observation.stage = CompilePixelStage::ResizeStore; }
-  resizer_.resize_to_planar(
-   {decoded.data(), {header.width, header.height, static_cast<std::size_t>(header.width) * 3U, 0U, decoded.size(), imaging::resample::RgbPixelFormat::RGB8}}, destination, plan.policy_.mode, observer ? &resize_work : nullptr);
-  if (observer) { observation.resize_store_ns = step.lap(); observation.stage = CompilePixelStage::Complete; }
+  if (observer) {
+   observation.destination_ns = step.lap();
+   observation.stage = CompilePixelStage::ResizeStore;
+  }
+  resizer_.resize_to_planar({decoded.data(), {header.width, header.height, static_cast<std::size_t>(header.width) * 3U, 0U, decoded.size(), imaging::resample::RgbPixelFormat::RGB8}}, destination,
+   plan.policy_.mode, observer ? &resize_work : nullptr);
+  if (observer) {
+   observation.resize_store_ns = step.lap();
+   observation.stage = CompilePixelStage::Complete;
+  }
  } catch (...) {
   report(true);
   throw;

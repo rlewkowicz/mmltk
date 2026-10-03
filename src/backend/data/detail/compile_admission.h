@@ -222,7 +222,8 @@ struct CompileAdmission {
     }
    }
   }
-  if (value.cpu_workers && (value.cpu_workers > cpu_capacity - std::min(cpu_capacity, protected_cpus) || external_cpus + active > cpu_capacity - value.cpu_workers)) return {.denial = CompileResourceDenial::Cpu};
+  if (value.cpu_workers && (value.cpu_workers > cpu_capacity - std::min(cpu_capacity, protected_cpus) || external_cpus + active > cpu_capacity - value.cpu_workers))
+   return {.denial = CompileResourceDenial::Cpu};
   if (value.descriptors + value.continuation_descriptors > descriptor_room(value, parent)) return {.denial = CompileResourceDenial::Descriptors};
   if (fits_bytes(value, parent, retiring_bytes)) return {.fits = true};
   const auto requested = reservation_bytes(value);

@@ -227,8 +227,10 @@ std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetad
  BenchmarkCompilePipeline* execution, const CompileAllowance& merge_allowance, bool local_rejection, const CoconutImageRejection& reject, const BenchmarkTraceSink& trace) {
  std::uint64_t rows_revisited = 0, bytes_revisited = 0;
  BenchmarkCostSpan gather_cost(trace, BenchmarkCostKind::ComponentGather, [&] {
-  return nlohmann::json{{"source", header.source}, {"input_identity", header.annotation_input_identity}, {"original_generation", header.original_generation},
-   {"rows_revisited", rows_revisited}, {"bytes_revisited", bytes_revisited}, {"source_rows", source_rows}};
+  return nlohmann::json{
+   {"source", header.source}, {"input_identity", header.annotation_input_identity}, {"original_generation", header.original_generation}, {"rows_revisited", rows_revisited},
+   {"bytes_revisited", bytes_revisited}, {"source_rows", source_rows}
+  };
  });
  if (rows.empty()) return std::nullopt;
  auto producer = execution ? execution->execution().open_class(detail::CompileWorkClass::Annotations) : CompileExecution::Producer{};
@@ -270,7 +272,10 @@ std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetad
   static_cast<NormalizedAnnotationMetadata&>(membership) = metadata;
   if (metadata_only) membership.images.reserve(rows.size());
   for (const auto& row : rows) {
-   if (trace) { ++rows_revisited; bytes_revisited += row.boxes.size_bytes() + row.runs.size_bytes(); }
+   if (trace) {
+    ++rows_revisited;
+    bytes_revisited += row.boxes.size_bytes() + row.runs.size_bytes();
+   }
    throw_if_benchmark_cancelled(cancellation);
    const auto& image = *row.image;
    inventory->push_back(*row.inventory);
@@ -336,9 +341,8 @@ std::optional<CoconutComponent> assemble_coconut_component(CoconutComponentMetad
  // The mapped normalized output closed its file before returning. Inventory
  // sealing uses the caller's same retained output descriptor grant.
  gather_cost.finish();
- BenchmarkCostSpan seal_cost(trace, BenchmarkCostKind::InventorySeal, [&] {
-  return nlohmann::json{{"source", header.source}, {"rows", rows.size()}, {"input_identity", header.annotation_input_identity}, {"original_generation", header.original_generation}};
- });
+ BenchmarkCostSpan seal_cost(trace, BenchmarkCostKind::InventorySeal,
+  [&] { return nlohmann::json{{"source", header.source}, {"rows", rows.size()}, {"input_identity", header.annotation_input_identity}, {"original_generation", header.original_generation}}; });
  return CoconutComponentBacking::finish(
   std::move(sealed), std::move(normalized), metadata_only, cancellation, directory, storage, reusable, execution ? &execution->files() : nullptr, merge_allowance, trace);
 }

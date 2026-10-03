@@ -45,9 +45,7 @@ __m256i quantize8(const TransferTable& table, __m256 value) {
  }
  return code;
 }
-__m256i lane_mask(unsigned count) {
- return _mm256_cmpgt_epi32(_mm256_set1_epi32(static_cast<int>(count)), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
-}
+__m256i lane_mask(unsigned count) { return _mm256_cmpgt_epi32(_mm256_set1_epi32(static_cast<int>(count)), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7)); }
 // Six contiguous channel planes per row avoid the old moment scatter followed
 // by coefficient gathers. Only the two rows of each state are retained.
 class StateRow {
@@ -62,6 +60,7 @@ class StateRow {
   const auto mask = lane_mask(remaining);
   return _mm256_blendv_ps(_mm256_set1_ps(values[width_ - 1]), _mm256_maskload_ps(values + x, mask), _mm256_castsi256_ps(mask));
  }
+
 public:
  StateRow(float* data, std::uint32_t width) : data_(data), width_(width) {}
  float* channel(unsigned k, unsigned x = 0) const { return data_ + std::size_t(k) * width_ + x; }
@@ -101,8 +100,10 @@ void store_packed_block(std::uint8_t* output, unsigned count, const __m128i (&rg
  }
  if (count == 8) {
   _mm_storeu_si128(reinterpret_cast<__m128i*>(output), first);
-  if constexpr (channels == 4) _mm_storeu_si128(reinterpret_cast<__m128i*>(output + 16), second);
-  else _mm_storel_epi64(reinterpret_cast<__m128i*>(output + 16), second);
+  if constexpr (channels == 4)
+   _mm_storeu_si128(reinterpret_cast<__m128i*>(output + 16), second);
+  else
+   _mm_storel_epi64(reinterpret_cast<__m128i*>(output + 16), second);
  } else {
   alignas(16) std::uint8_t bytes[32];
   _mm_store_si128(reinterpret_cast<__m128i*>(bytes), first);
@@ -128,8 +129,7 @@ void store_block(RgbMutableImageView destination, unsigned x, unsigned y, ColorV
   }
   linear = unit8(linear);
   if constexpr (QuantizedPlanar) {
-   _mm256_maskstore_ps(reinterpret_cast<float*>(row + k * destination.layout.plane_stride_bytes) + x, mask,
-    _mm256_mul_ps(_mm256_cvtepi32_ps(quantize8(table, linear)), _mm256_set1_ps(1.0F / 255.0F)));
+   _mm256_maskstore_ps(reinterpret_cast<float*>(row + k * destination.layout.plane_stride_bytes) + x, mask, _mm256_mul_ps(_mm256_cvtepi32_ps(quantize8(table, linear)), _mm256_set1_ps(1.0F / 255.0F)));
   } else if constexpr (Format == RgbPixelFormat::PlanarUnitSrgbF32) {
    // Continuous Float32 output deliberately retains the scalar library powf.
    alignas(32) float values[8];
@@ -392,14 +392,13 @@ void CpuDownscaler::execute(RgbConstImageView source, RgbMutableImageView destin
   const StateRow next(moments_[(y + 1 < height ? y + 1 : y) % 2].data(), width);
   const StateRow current(coefficients_[y % 2].data(), width);
   const StateRow previous(coefficients_[(y ? y - 1 : y) % 2].data(), width);
-  for (std::uint32_t x = 0; x < width; x += 8)
-   current.store(x, patch(row.moment(x), row.moment(std::int64_t(x) + 1), next.moment(x), next.moment(std::int64_t(x) + 1)));
+  for (std::uint32_t x = 0; x < width; x += 8) current.store(x, patch(row.moment(x), row.moment(std::int64_t(x) + 1), next.moment(x), next.moment(std::int64_t(x) + 1)));
   for (std::uint32_t x = 0; x < width; x += 8) {
    const auto left = std::int64_t(x) - 1;
    const float* alpha = nullptr;
    if constexpr (Format == RgbPixelFormat::RGBA8) alpha = alpha_[y % 2].data();
-   store_block<Format, QuantizedPlanar>(destination, x, y,
-    reconstruct(row.moment(x), current.coefficient(x), current.coefficient(left), previous.coefficient(x), previous.coefficient(left)), alpha, transfer_);
+   store_block<Format, QuantizedPlanar>(
+    destination, x, y, reconstruct(row.moment(x), current.coefficient(x), current.coefficient(left), previous.coefficient(x), previous.coefficient(left)), alpha, transfer_);
   }
  }
 }
@@ -422,8 +421,10 @@ void CpuDownscaler::run_selected(RgbConstImageView source, RgbMutableImageView d
  prepare(source.layout, destination.layout, observed);
  const bool integer = path == RgbResizePath::PerceptualInteger;
  if (quantized_planar) {
-  if (integer) execute<RgbPixelFormat::RGB8, true, true>(source, destination);
-  else execute<RgbPixelFormat::RGB8, false, true>(source, destination);
+  if (integer)
+   execute<RgbPixelFormat::RGB8, true, true>(source, destination);
+  else
+   execute<RgbPixelFormat::RGB8, false, true>(source, destination);
   return;
  }
  // One format/geometry dispatch per image, never per source pixel.

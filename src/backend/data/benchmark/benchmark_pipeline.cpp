@@ -194,10 +194,14 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
    const auto stage = static_cast<std::size_t>(job.stage);
    job.ready_previous = first ? nullptr : tails_[stage];
    job.ready_next = first ? heads_[stage] : nullptr;
-   if (job.ready_previous) job.ready_previous->ready_next = &job;
-   else heads_[stage] = &job;
-   if (job.ready_next) job.ready_next->ready_previous = &job;
-   else tails_[stage] = &job;
+   if (job.ready_previous)
+    job.ready_previous->ready_next = &job;
+   else
+    heads_[stage] = &job;
+   if (job.ready_next)
+    job.ready_next->ready_previous = &job;
+   else
+    tails_[stage] = &job;
    job.queued = true;
    ++counts_[stage];
    ++size_;
@@ -1088,7 +1092,8 @@ BenchmarkCompilePipeline::BenchmarkCompilePipeline(
  if (!limits.workspace_plan)
   limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(workers, 1, false, 0, limits.transient_bytes, BenchmarkEncodedImage::normal_window_bytes));
  impl_ = std::make_shared<Impl>(workers, cpus, limits, cancellation, std::move(trace));
- impl_->readiness = std::make_unique<CompileExecution::Readiness>(impl_->execution, CompileChange::Resources | CompileChange::Records | CompileChange::Fairness, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness::Changes changes) {
+ impl_->readiness = std::make_unique<CompileExecution::Readiness>(
+  impl_->execution, CompileChange::Resources | CompileChange::Records | CompileChange::Fairness, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness::Changes changes) {
   if (!changes.retry && !includes(changes.causes, CompileChange::Records | CompileChange::Local | CompileChange::Fairness | CompileChange::Interruption)) return;
   if (auto owner = weak.lock()) {
    try {
@@ -1410,7 +1415,10 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
   const auto work = label_outputs.front();
   const auto weak = weak_from_this();
   auto record = files.try_reserve_record();
-  if (!record) { file_full = true; return false; }
+  if (!record) {
+   file_full = true;
+   return false;
+  }
   auto completion = record->submit({.completed = [weak, work](std::exception_ptr error) {
    if (auto owner = weak.lock()) owner->finish_label(work, error);
   }, .work = [weak, work] {
@@ -1449,8 +1457,10 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
     break;
    }
    if (trace) {
-    if (workspace && !records_full) ++resource_denied;
-    else blocked[stage] = true;
+    if (workspace && !records_full)
+     ++resource_denied;
+    else
+     blocked[stage] = true;
    }
    if (!workspace || records_full || !workspace_remaining) eligible &= ~(std::uint32_t{1} << stage);
    eligible &= pixels.ready_stages();
@@ -1477,8 +1487,8 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
   trace_benchmark_event(trace, "benchmark.pipeline.ready", [&] {
    return nlohmann::json{
     {"header", queued[0]}, {"workspace", queued[1]}, {"input", queued[2]}, {"output", queued[3]}, {"pixels", queued[4]}, {"pending_images", pending_images}, {"image_head_probes", image_head_probes},
-    {"image_admitted", image_admitted}, {"workspace_resource_denied", resource_denied}, {"workspace_probe_limit", workspace_limit}, {"label_outputs", outputs}, {"stage_records_blocked", blocked}, {"label_file_records_blocked", file_full}
-    , {"empty_dispatch", !any_admitted}, {"lock_wait_ns", lock_ns}, {"body_ns", body_ns}
+    {"image_admitted", image_admitted}, {"workspace_resource_denied", resource_denied}, {"workspace_probe_limit", workspace_limit}, {"label_outputs", outputs}, {"stage_records_blocked", blocked},
+    {"label_file_records_blocked", file_full}, {"empty_dispatch", !any_admitted}, {"lock_wait_ns", lock_ns}, {"body_ns", body_ns}
    };
   });
  }

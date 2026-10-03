@@ -130,15 +130,15 @@ struct CompileArenaBank::State {
   std::size_t free_bytes = 0, observed_end = 0;
   [[nodiscard]] bool ordinary() const noexcept { return window == CompileWorkspaceWindow::Task && completion == CompileWorkClass::Count; }
   [[nodiscard]] bool eligible(bool completing, CompileWorkClass kind, CompileWorkspaceWindow requested) const noexcept {
-   return ordinary() ||
-    (window != CompileWorkspaceWindow::Task && window == requested) ||
-    (completing && kind != CompileWorkClass::Count && completion == kind);
+   return ordinary() || (window != CompileWorkspaceWindow::Task && window == requested) || (completing && kind != CompileWorkClass::Count && completion == kind);
   }
   [[nodiscard]] static std::size_t bin(std::size_t size) noexcept { return std::bit_width(size / alignment) - 1; }
   void unlink(ArenaBlock& block) noexcept {
    const auto index = bin(block.size);
-   if (block.free_previous) block.free_previous->free_next = block.free_next;
-   else bins[index] = block.free_next;
+   if (block.free_previous)
+    block.free_previous->free_next = block.free_next;
+   else
+    bins[index] = block.free_next;
    if (block.free_next) block.free_next->free_previous = block.free_previous;
    if (!bins[index]) nonempty &= ~(std::uint64_t{1} << index);
   }
@@ -353,9 +353,7 @@ bool CompileArenaBank::fits(std::size_t bytes, bool completion, CompileWorkClass
  if (!normal_fit(bytes, completion, kind, window)) return false;
  return state_->select(reservation_bytes(bytes, completion, kind, window), completion, kind, window).block != nullptr;
 }
-bool CompileArenaBank::normal_fit(std::size_t bytes, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) const {
- return bytes <= normal_capacity(completion, kind, window);
-}
+bool CompileArenaBank::normal_fit(std::size_t bytes, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) const { return bytes <= normal_capacity(completion, kind, window); }
 std::size_t CompileArenaBank::normal_capacity(bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) const noexcept {
  // Shape and protection are immutable after bank construction.
  std::size_t largest = 0;
@@ -397,8 +395,7 @@ CompileArenaLease CompileArenaBank::acquire(std::size_t bytes, bool exceptional,
   state_->leased += bytes;
   return CompileArenaLease(std::move(lease), 0, bytes);
  }
- if (!exceptional || state_->leased || normal_fit(bytes, completion, kind, window))
-  throw InsufficientCompileResources("compile arena has no fitting available extent");
+ if (!exceptional || state_->leased || normal_fit(bytes, completion, kind, window)) throw InsufficientCompileResources("compile arena has no fitting available extent");
  lease->oversized = true;
  lease->node = state_->exceptional_node;
  state_->exceptional = extent;
@@ -409,9 +406,7 @@ CompileArenaLease CompileArenaBank::acquire(std::size_t bytes, bool exceptional,
 }
 CompileArenaBank::Snapshot CompileArenaBank::snapshot() const {
  const std::lock_guard lock(state_->mutex);
- Snapshot result{
-  state_->plan.budget, state_->plan.budget + state_->exceptional_locked, state_->leased, state_->exceptional_locked, state_->peak, state_->exceptional, state_->reused, state_->retired
- };
+ Snapshot result{state_->plan.budget, state_->plan.budget + state_->exceptional_locked, state_->leased, state_->exceptional_locked, state_->peak, state_->exceptional, state_->reused, state_->retired};
  if (state_->observing) {
   auto& value = result.observation;
   value.lease_acquisitions = state_->lease_acquisitions;
@@ -427,9 +422,12 @@ CompileArenaBank::Snapshot CompileArenaBank::snapshot() const {
    const auto bytes = region.bytes.size();
    registered += bytes;
    const auto occupied = bytes - region.free_bytes;
-   if (region.window == CompileWorkspaceWindow::SharedSource) value.shared_occupied += occupied;
-   else if (region.window == CompileWorkspaceWindow::Compaction) value.compaction_occupied += occupied;
-   else if (region.completion != CompileWorkClass::Count) value.completion_occupied += occupied;
+   if (region.window == CompileWorkspaceWindow::SharedSource)
+    value.shared_occupied += occupied;
+   else if (region.window == CompileWorkspaceWindow::Compaction)
+    value.compaction_occupied += occupied;
+   else if (region.completion != CompileWorkClass::Count)
+    value.completion_occupied += occupied;
    else {
     value.ordinary_capacity += bytes;
     value.largest_ordinary_capacity = std::max<std::uint64_t>(value.largest_ordinary_capacity, bytes);

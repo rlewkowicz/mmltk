@@ -59,7 +59,9 @@ public:
  }
  // Only explicit overwrite consumers may bypass supplied value construction.
  // Owning vector semantics and ordinary resize remain unchanged.
- void resize_for_overwrite(std::size_t count) requires(std::is_trivially_default_constructible_v<T>) {
+ void resize_for_overwrite(std::size_t count)
+  requires(std::is_trivially_default_constructible_v<T>)
+ {
   reserve(count);
   if (bound_) {
    if (count > size_) std::uninitialized_default_construct_n(data() + size_, count - size_);

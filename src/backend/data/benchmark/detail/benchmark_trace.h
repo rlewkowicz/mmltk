@@ -12,7 +12,7 @@
 namespace mmltk::backend::data::detail {
 struct CompileAdmissionObservation;
 struct CompileExecutionSnapshot;
-}
+}  // namespace mmltk::backend::data::detail
 namespace mmltk::backend::data::benchmark_internal {
 // A null value reports diagnostic construction failure; it is never product state.
 using BenchmarkTraceSink = std::function<void(std::string_view, const nlohmann::json&)>;
@@ -20,9 +20,7 @@ void trace_compile_execution(const BenchmarkTraceSink&, std::string_view, const 
 template <class Observation>
 [[nodiscard]] nlohmann::json benchmark_observation_fields(const Observation& observation) {
  nlohmann::json result = nlohmann::json::object();
- mmltk::frameworks::reflection::visit_materialized_members<Observation>([&]<class Declaration>(const auto& field) {
-  result[field.member_name] = observation.*Declaration::pointer;
- });
+ mmltk::frameworks::reflection::visit_materialized_members<Observation>([&]<class Declaration>(const auto& field) { result[field.member_name] = observation.*Declaration::pointer; });
  return result;
 }
 [[nodiscard]] nlohmann::json benchmark_observation_fields(const detail::CompileAdmissionObservation&);
@@ -62,10 +60,13 @@ class BenchmarkCostSpan final {
    return value;
   });
  }
+
 public:
- BenchmarkCostSpan(const BenchmarkTraceSink& sink, BenchmarkCostKind kind, Fields fields)
-     : sink_(sink), kind_(kind), fields_(std::move(fields)), clock_(bool(sink)) {
-  if (sink_) { exceptions_ = std::uncaught_exceptions(); report("benchmark.cost.started", false); }
+ BenchmarkCostSpan(const BenchmarkTraceSink& sink, BenchmarkCostKind kind, Fields fields) : sink_(sink), kind_(kind), fields_(std::move(fields)), clock_(bool(sink)) {
+  if (sink_) {
+   exceptions_ = std::uncaught_exceptions();
+   report("benchmark.cost.started", false);
+  }
  }
  ~BenchmarkCostSpan() { finish(); }
  BenchmarkCostSpan(const BenchmarkCostSpan&) = delete;

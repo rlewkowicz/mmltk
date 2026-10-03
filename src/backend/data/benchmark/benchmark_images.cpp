@@ -357,8 +357,9 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   if (std::filesystem::exists(cached_image_path(request.output_root, *image_id))) invalidate_cached_image_proofs(request.output_root);
   try {
    const auto generation = request.execution ? request.execution->image_generation(request.output_root, *image_id) : 0;
-   write_pool.submit(*image_id, std::move(input), header, [&](const CachedImageReady& ready) { if (request.image_ready) request.image_ready(ready); },
-    [&, generation](const CachedImageReady& ready, std::exception_ptr error) { publish(ready, true, true, error, generation); });
+   write_pool.submit(*image_id, std::move(input), header, [&](const CachedImageReady& ready) {
+    if (request.image_ready) request.image_ready(ready);
+   }, [&, generation](const CachedImageReady& ready, std::exception_ptr error) { publish(ready, true, true, error, generation); });
    scheduled.emplace(*image_id);
   } catch (const InvalidImageError& error) {
    if (!request.quarantine_unavailable) throw;

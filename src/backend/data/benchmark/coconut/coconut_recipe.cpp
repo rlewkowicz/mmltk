@@ -1027,9 +1027,7 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
    row_progress(std::max(rows, admitted));
   }
   release_inputs();
-  BenchmarkCostSpan physical_wait(trace, BenchmarkCostKind::PhysicalWait, [&] {
-   return nlohmann::json{{"release", release.name}, {"input_identity", identity}, {"components", components.size()}};
-  });
+  BenchmarkCostSpan physical_wait(trace, BenchmarkCostKind::PhysicalWait, [&] { return nlohmann::json{{"release", release.name}, {"input_identity", identity}, {"components", components.size()}}; });
   physical.wait_sources(release.edition);
   physical_wait.finish();
   for (const auto& component : components)

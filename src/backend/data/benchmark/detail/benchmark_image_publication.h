@@ -48,8 +48,8 @@ public:
  };
  using Input = std::shared_ptr<Payload>;
  using Settled = std::function<void(const CachedImageReady&, std::exception_ptr)>;
- BenchmarkImagePublication(std::filesystem::path, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool*, detail::CompileAllowance,
-  BenchmarkCompilePipeline*, int directory, bool retain_encoded, BenchmarkArchive&, const BenchmarkTraceSink&);
+ BenchmarkImagePublication(std::filesystem::path, mmltk::common::concurrency::CancellationObservation, detail::StorageReservationPool*, detail::CompileAllowance, BenchmarkCompilePipeline*,
+  int directory, bool retain_encoded, BenchmarkArchive&, const BenchmarkTraceSink&);
  ~BenchmarkImagePublication();
  BenchmarkImagePublication(const BenchmarkImagePublication&) = delete;
  BenchmarkImagePublication& operator=(const BenchmarkImagePublication&) = delete;

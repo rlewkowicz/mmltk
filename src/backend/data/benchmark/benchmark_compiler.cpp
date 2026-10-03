@@ -49,11 +49,11 @@
 #include "src/backend/data/benchmark/detail/open_images_acquisition.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
 using mmltk::backend::data::detail::CompileAllowance;
+using mmltk::backend::data::detail::CompileChange;
 using mmltk::backend::data::detail::CompileExecutionLimits;
 using mmltk::backend::data::detail::CompileResources;
 using mmltk::backend::data::detail::CompileTaskKind;
 using mmltk::backend::data::detail::InsufficientCompileResources;
-using mmltk::backend::data::detail::CompileChange;
 namespace mmltk::backend::data {
 namespace common_concurrency = mmltk::common::concurrency;
 namespace common_io = mmltk::common::io;
@@ -780,8 +780,9 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
  std::array<std::vector<std::uint32_t>, 2> selected;
  std::uint64_t rows_revisited = 0;
  BenchmarkCostSpan selection_cost(trace, BenchmarkCostKind::Selection, [&] {
-  return nlohmann::json{{"rows_revisited", rows_revisited}, {"selected_train", selected[0].size()}, {"selected_validation", selected[1].size()},
-   {"stock_validation_generation", recipe->stock_validation_generation}};
+  return nlohmann::json{
+   {"rows_revisited", rows_revisited}, {"selected_train", selected[0].size()}, {"selected_validation", selected[1].size()}, {"stock_validation_generation", recipe->stock_validation_generation}
+  };
  });
  std::array<std::uint64_t, 2> boxes{}, runs{};
  std::map<BenchmarkDatasetSource, std::uint64_t> eligible_by_source;

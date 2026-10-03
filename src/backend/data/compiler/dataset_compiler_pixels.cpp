@@ -205,9 +205,8 @@ LabelBlocks compile_directory_images(const std::filesystem::path& split, std::ui
       auto destination = storage.pixels(image.index);
       try {
        detail::CompilePixelObserver observer;
-       if (config.observation && config.observation->pixel) observer = [&](const detail::CompilePixelObservation& value) {
-        config.observation->pixel(config.observation->context, image.index, value);
-       };
+       if (config.observation && config.observation->pixel)
+        observer = [&](const detail::CompilePixelObservation& value) { config.observation->pixel(config.observation->context, image.index, value); };
        pixels[lane]->write(*image.plan, encoded, image.plan->header(), memory.subspan(image.encoded_extent), {destination.data(), image.plan->destination()}, +[] {}, observer);
       } catch (const detail::CompileImageError& error) {
        throw std::runtime_error("failed to load image file: " + image_path(std::filesystem::path(config.source_dir) / config.split, image.index).string() + ": " + error.what());

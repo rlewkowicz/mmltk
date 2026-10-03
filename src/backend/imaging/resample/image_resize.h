@@ -51,6 +51,7 @@ class RgbResizeWorkspacePlan final {
 public:
  [[nodiscard]] RgbResizePath path() const noexcept { return path_; }
  [[nodiscard]] std::size_t bytes() const;
+
 private:
  friend class RgbImageResizer;
  RgbResizeWorkspacePlan() = default;
@@ -75,8 +76,8 @@ public:
  RgbImageResizer& operator=(const RgbImageResizer&) = delete;
  RgbImageResizer(RgbImageResizer&&) noexcept;
  RgbImageResizer& operator=(RgbImageResizer&&) noexcept;
- [[nodiscard]] static RgbResizeWorkspacePlan workspace_plan(
-  std::uint32_t source_width, std::uint32_t source_height, std::uint32_t target_width, std::uint32_t target_height, ImageResizeMode, bool perceptual, RgbPixelFormat = RgbPixelFormat::RGB8, RgbResizeWork* observed = nullptr);
+ [[nodiscard]] static RgbResizeWorkspacePlan workspace_plan(std::uint32_t source_width, std::uint32_t source_height, std::uint32_t target_width, std::uint32_t target_height, ImageResizeMode,
+  bool perceptual, RgbPixelFormat = RgbPixelFormat::RGB8, RgbResizeWork* observed = nullptr);
  void prepare(const RgbResizeWorkspacePlan&, std::span<std::byte> supplied);
  [[nodiscard]] std::size_t retained_bytes() const noexcept;
  void resize(const uint8_t* src, int src_width, int src_height, uint8_t* dst, int dst_width, int dst_height);

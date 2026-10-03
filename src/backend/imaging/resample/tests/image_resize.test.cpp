@@ -616,15 +616,15 @@ TEST_CASE("Supplied resizer preparation preserves RGB and planar numerical outpu
  CHECK(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0);
  CHECK_THROWS_AS(supplied.prepare(plan, memory.first(memory.size() - 1)), std::length_error);
 }
-
 TEST_CASE("eight-lane transfer search preserves every threshold and adjacent float", "[backend][data][image_resize][perceptual]") {
  perceptual::TransferTable table;
  for (unsigned code = 0; code < 256; ++code) table.linear[code] = perceptual::decode(float(code) * (1.0F / 255.0F));
  for (unsigned code = 0; code < 256; ++code) {
   const float threshold = table.linear[code];
-  const std::array values{threshold, std::nextafter(threshold, -std::numeric_limits<float>::infinity()),
-   std::nextafter(threshold, std::numeric_limits<float>::infinity()), -1.0F, 2.0F, std::numeric_limits<float>::quiet_NaN(),
-   -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity()};
+  const std::array values{
+   threshold, std::nextafter(threshold, -std::numeric_limits<float>::infinity()), std::nextafter(threshold, std::numeric_limits<float>::infinity()), -1.0F, 2.0F,
+   std::numeric_limits<float>::quiet_NaN(), -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity()
+  };
   std::array<std::uint8_t, 8> output{};
   perceptual::CpuDownscalerTestAccess::quantize(table, values.data(), output.data());
   CHECK(output[0] == code);
@@ -634,12 +634,11 @@ TEST_CASE("eight-lane transfer search preserves every threshold and adjacent flo
  }
 }
 TEST_CASE("checked resize plans retain their selected algorithm independently of storage", "[backend][data][image_resize][workspace]") {
- const std::array<std::pair<std::array<unsigned, 2>, RgbResizePath>, 11> cases{{
-  {{640, 480}, RgbResizePath::PerceptualFractional}, {{768, 768}, RgbResizePath::PerceptualInteger},
-  {{384, 384}, RgbResizePath::Identity}, {{640, 360}, RgbResizePath::Avir}, {{320, 240}, RgbResizePath::Avir},
-  {{1024, 768}, RgbResizePath::PerceptualFractional}, {{2048, 2048}, RgbResizePath::PerceptualFractional},
-  {{384, 768}, RgbResizePath::PerceptualInteger}, {{768, 384}, RgbResizePath::PerceptualInteger},
-  {{384, 480}, RgbResizePath::PerceptualFractional}, {{640, 384}, RgbResizePath::PerceptualFractional}}};
+ const std::array<std::pair<std::array<unsigned, 2>, RgbResizePath>, 11> cases{
+  {{{640, 480}, RgbResizePath::PerceptualFractional}, {{768, 768}, RgbResizePath::PerceptualInteger}, {{384, 384}, RgbResizePath::Identity}, {{640, 360}, RgbResizePath::Avir},
+   {{320, 240}, RgbResizePath::Avir}, {{1024, 768}, RgbResizePath::PerceptualFractional}, {{2048, 2048}, RgbResizePath::PerceptualFractional}, {{384, 768}, RgbResizePath::PerceptualInteger},
+   {{768, 384}, RgbResizePath::PerceptualInteger}, {{384, 480}, RgbResizePath::PerceptualFractional}, {{640, 384}, RgbResizePath::PerceptualFractional}}
+ };
  for (const auto& [source, expected] : cases) {
   const auto plan = RgbImageResizer::workspace_plan(source[0], source[1], 384, 384, ImageResizeMode::Stretch, true);
   CHECK(plan.path() == expected);
@@ -670,8 +669,7 @@ TEST_CASE("explicit supplied overwrite sizing preserves contents and ordinary re
 TEST_CASE("one supplied arena supports poisoned mixed geometry and rejects stale plan use", "[backend][data][image_resize][workspace]") {
  const auto mode = GENERATE(ImageResizeMode::Stretch, ImageResizeMode::Letterbox);
  const auto perceptual = GENERATE(false, true);
- constexpr std::array<std::array<unsigned, 4>, 7> geometries{{
-  {17, 13, 9, 7}, {18, 14, 9, 7}, {9, 7, 9, 7}, {19, 1, 8, 9}, {1, 19, 1, 8}, {8, 7, 17, 13}, {31, 19, 16, 9}}};
+ constexpr std::array<std::array<unsigned, 4>, 7> geometries{{{17, 13, 9, 7}, {18, 14, 9, 7}, {9, 7, 9, 7}, {19, 1, 8, 9}, {1, 19, 1, 8}, {8, 7, 17, 13}, {31, 19, 16, 9}}};
  std::vector<RgbResizeWorkspacePlan> plans;
  std::size_t maximum = 0;
  for (const auto& d : geometries) {
@@ -723,7 +721,6 @@ TEST_CASE("one supplied arena supports poisoned mixed geometry and rejects stale
   }
  }
 }
-
 TEST_CASE("SIMD final rows retain scalar patch reconstruction and output bits", "[backend][data][image_resize][perceptual]") {
  using namespace test_perceptual;
  for (auto format : formats)
@@ -758,7 +755,7 @@ public:
  }
  void release(char* pointer, std::size_t) override { delete[] pointer; }
 };
-}
+}  // namespace
 TEST_CASE("AVIR checked layout matches all execution reservations and preparation is fallible before stores", "[backend][data][image_resize][workspace]") {
  using Resizer = avir::CImageResizer<avir::fpclass_float4>;
  for (const auto& d : std::array<std::array<int, 4>, 5>{{{19, 3, 8, 9}, {17, 13, 9, 7}, {18, 14, 9, 7}, {1, 19, 1, 8}, {8, 7, 17, 13}}}) {
@@ -784,7 +781,8 @@ TEST_CASE("AVIR checked layout matches all execution reservations and preparatio
     CHECK_THROWS_AS(([&] {
      Resizer prepared;
      prepared.resizeImage(source.data(), d[0], d[1], 0, output.data(), d[2], d[3], 3, 0.0);
-    }()), std::bad_alloc);
+    }()),
+     std::bad_alloc);
    }
    CHECK(std::ranges::all_of(output, [](auto value) { return value == 179; }));
    Resizer{}.resizeImage(source.data(), d[0], d[1], 0, output.data(), d[2], d[3], 3, 0.0);

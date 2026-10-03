@@ -571,10 +571,10 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
    }
    publications.make_room();
    const auto bytes = value.payload->size();
-   publications.push(execution.image_completion(root, image.image_id), [&, image, bytes, generation, source_read, ticket](std::exception_ptr failure) {
+   publications.push(execution.image_completion(root, image.image_id), [&, image, bytes, generation, source_read, ticket](std::exception_ptr pixel_failure) {
     if (execution.image_generation(root, image.image_id) != generation) return;
-    if (failure) {
-     image_failure(image, source_read, failure);
+    if (pixel_failure) {
+     image_failure(image, source_read, pixel_failure);
      return;
     }
     bool conflict = false;

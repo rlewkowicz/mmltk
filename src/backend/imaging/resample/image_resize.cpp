@@ -17,7 +17,9 @@ namespace {
 using CpuAvirResizer = avir::CImageResizer<avir::fpclass_float4>;
 }  // namespace
 struct RgbImageResizer::Impl {
- struct AlignedDelete { void operator()(std::byte* data) const { ::operator delete(data, std::align_val_t{64}); } };
+ struct AlignedDelete {
+  void operator()(std::byte* data) const { ::operator delete(data, std::align_val_t{64}); }
+ };
  std::unique_ptr<std::byte, AlignedDelete> owned_avir;
  std::size_t owned_avir_bytes = 0;
  std::optional<RgbResizeWorkspacePlan> plan;
@@ -43,7 +45,10 @@ public:
   const auto extent = resize_aligned(bytes);
   const auto begin = used;
   used = common::math::checked_add(used, extent, "AVIR workspace overflow");
-  if (observed_) { ++observed_->allocation_requests; observed_->allocation_bytes += extent; }
+  if (observed_) {
+   ++observed_->allocation_requests;
+   observed_->allocation_bytes += extent;
+  }
   if (used > supplied_.size()) throw std::length_error("AVIR supplied workspace exhausted");
   return reinterpret_cast<char*>(supplied_.data() + begin);
  }
@@ -53,14 +58,23 @@ public:
 std::size_t RgbResizeWorkspacePlan::bytes() const {
  return common::math::checked_add(resize_aligned(avir_bytes), common::math::checked_add(resize_aligned(byte_output_bytes), perceptual_bytes, "resize workspace overflow"), "resize workspace overflow");
 }
-RgbResizeWorkspacePlan RgbImageResizer::workspace_plan(std::uint32_t sw, std::uint32_t sh, std::uint32_t dw, std::uint32_t dh, ImageResizeMode mode, bool perceptual, RgbPixelFormat format, RgbResizeWork* observed) {
+RgbResizeWorkspacePlan RgbImageResizer::workspace_plan(
+ std::uint32_t sw, std::uint32_t sh, std::uint32_t dw, std::uint32_t dh, ImageResizeMode mode, bool perceptual, RgbPixelFormat format, RgbResizeWork* observed) {
  RgbResizeWorkspacePlan result;
  if (observed) ++observed->preparations;
  result.geometry = compute_image_resize_geometry(sw, sh, dw, dh, mode);
- result.source_width = sw; result.source_height = sh; result.target_width = dw; result.target_height = dh;
- result.mode = mode; result.format = format; result.alpha = format == RgbPixelFormat::RGBA8; result.perceptual = perceptual;
+ result.source_width = sw;
+ result.source_height = sh;
+ result.target_width = dw;
+ result.target_height = dh;
+ result.mode = mode;
+ result.format = format;
+ result.alpha = format == RgbPixelFormat::RGBA8;
+ result.perceptual = perceptual;
  switch (format) {
-  case RgbPixelFormat::RGB8: case RgbPixelFormat::RGBA8: case RgbPixelFormat::PlanarUnitSrgbF32: break;
+  case RgbPixelFormat::RGB8:
+  case RgbPixelFormat::RGBA8:
+  case RgbPixelFormat::PlanarUnitSrgbF32: break;
   default: throw std::invalid_argument("invalid resize pixel format");
  }
  const auto width = result.geometry.resized_width, height = result.geometry.resized_height;
@@ -75,7 +89,10 @@ RgbResizeWorkspacePlan RgbImageResizer::workspace_plan(std::uint32_t sw, std::ui
  result.path_ = RgbResizePath::Avir;
  std::size_t requests = 0;
  result.avir_bytes = CpuAvirResizer::workspaceBytes<std::uint8_t, std::uint8_t>(checked(sw), checked(sh), checked(width), checked(height), 3, observed ? &requests : nullptr);
- if (observed) { observed->allocation_requests += requests; observed->allocation_bytes += result.avir_bytes; }
+ if (observed) {
+  observed->allocation_requests += requests;
+  observed->allocation_bytes += result.avir_bytes;
+ }
  result.byte_output_bytes = common::math::checked_multiply(common::math::checked_multiply<std::size_t>(width, height, "resize workspace overflow"), 3, "resize workspace overflow");
  return result;
 }
@@ -97,8 +114,8 @@ void RgbImageResizer::Impl::execute_avir(const RgbResizeWorkspacePlan& selected,
  avir::detail::CWorkspaceScope scope(allocation);
  if (observed) ++observed->preparations;
  CpuAvirResizer prepared{8};
- prepared.resizeImage(source, static_cast<int>(selected.source_width), static_cast<int>(selected.source_height), 0, destination,
-  static_cast<int>(selected.geometry.resized_width), static_cast<int>(selected.geometry.resized_height), 3, 0.0);
+ prepared.resizeImage(source, static_cast<int>(selected.source_width), static_cast<int>(selected.source_height), 0, destination, static_cast<int>(selected.geometry.resized_width),
+  static_cast<int>(selected.geometry.resized_height), 3, 0.0);
 }
 void RgbImageResizer::prepare(const RgbResizeWorkspacePlan& plan, std::span<std::byte> memory) {
  if (memory.size() < plan.bytes() || (memory.size() && reinterpret_cast<std::uintptr_t>(memory.data()) % 64)) throw std::length_error("resize supplied workspace capacity or alignment invalid");
@@ -113,9 +130,7 @@ void RgbImageResizer::prepare(const RgbResizeWorkspacePlan& plan, std::span<std:
  memory = memory.subspan(resize_aligned(plan.avir_bytes));
  impl_->byte_scratch.bind({reinterpret_cast<std::uint8_t*>(memory.data()), plan.byte_output_bytes});
  memory = memory.subspan(resize_aligned(plan.byte_output_bytes));
- if (plan.perceptual_bytes) {
-  impl_->perceptual->bind(plan.geometry.resized_width, plan.geometry.resized_height, plan.alpha, memory.first(plan.perceptual_bytes));
- }
+ if (plan.perceptual_bytes) { impl_->perceptual->bind(plan.geometry.resized_width, plan.geometry.resized_height, plan.alpha, memory.first(plan.perceptual_bytes)); }
 }
 std::size_t RgbImageResizer::retained_bytes() const noexcept {
  if (impl_->supplied) return impl_->supplied_bytes;
@@ -284,8 +299,9 @@ void RgbImageResizer::resize(const uint8_t* src, int src_width, int src_height, 
   case RgbResizePath::PerceptualFractional: {
    const auto layout = [](int width, int height) {
     const auto row = common::math::checked_multiply<std::size_t>(width, 3, "perceptual image extent overflow");
-    return RgbImageLayout{static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), row, 0,
-     common::math::checked_multiply(row, height, "perceptual image extent overflow"), RgbPixelFormat::RGB8};
+    return RgbImageLayout{
+     static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), row, 0, common::math::checked_multiply(row, height, "perceptual image extent overflow"), RgbPixelFormat::RGB8
+    };
    };
    if (!impl_->perceptual) impl_->perceptual = std::make_unique<perceptual::CpuDownscaler>();
    impl_->perceptual->run_selected({src, layout(src_width, src_height)}, {dst, layout(dst_width, dst_height)}, plan.path());
@@ -294,7 +310,6 @@ void RgbImageResizer::resize(const uint8_t* src, int src_width, int src_height, 
   case RgbResizePath::Avir: impl_->execute_avir(plan, src, dst, nullptr); return;
  }
 }
-
 ImageResizeGeometry RgbImageResizer::resize_to_planar(RgbConstImageView source, RgbMutableImageView destination, const ImageResizeMode mode, RgbResizeWork* observed) {
  const auto source_bytes = perceptual::validate_view(source.data, source.layout);
  const auto destination_bytes = perceptual::validate_view(destination.data, destination.layout);

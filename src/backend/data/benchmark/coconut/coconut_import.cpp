@@ -501,7 +501,10 @@ public:
        archive_worker_(request),
        assembly_workspace_(request.limits, request.cancellation),
        normalizations_(native_window, request.execution ? &request.execution->execution() : nullptr) {
-  if (request.execution) output_readiness_ = std::make_unique<CompileExecution::Readiness>(request.execution->execution(), CompileChange::Resources | CompileChange::Records, [this](auto changes) { if (changes.retry || includes(changes.causes, CompileChange::Records | CompileChange::Local | CompileChange::Interruption)) pump_outputs(); });
+  if (request.execution)
+   output_readiness_ = std::make_unique<CompileExecution::Readiness>(request.execution->execution(), CompileChange::Resources | CompileChange::Records, [this](auto changes) {
+    if (changes.retry || includes(changes.causes, CompileChange::Records | CompileChange::Local | CompileChange::Interruption)) pump_outputs();
+   });
   if (request.input_identity.empty()) invalid("missing pinned input identity");
   if (!request.physical_membership) invalid("missing physical membership admission");
   assembly_workspace_.recovery(request.recovery);
@@ -899,9 +902,8 @@ public:
  std::vector<CoconutComponent> assemble(bool metadata_only) {
   if (!metadata_only) {
    request_.parent_allowance.release_unused_continuation();
-   BenchmarkCostSpan wait(request_.trace, BenchmarkCostKind::PhysicalWait, [&] {
-    return nlohmann::json{{"edition", request_.edition}, {"rows", request_.records->size()}, {"input_identity", request_.input_identity}};
-   });
+   BenchmarkCostSpan wait(
+    request_.trace, BenchmarkCostKind::PhysicalWait, [&] { return nlohmann::json{{"edition", request_.edition}, {"rows", request_.records->size()}, {"input_identity", request_.input_identity}}; });
    trace_benchmark_event(request_.trace, "benchmark.annotations.physical_join_wait", [&] { return nlohmann::json{{"edition", request_.edition}, {"rows", request_.records->size()}}; });
    request_.physical_membership->wait_sources(request_.edition);
    wait.finish();
@@ -931,8 +933,9 @@ public:
   }
   std::uint64_t image_count = 0, recovery_join_boxes = 0;
   BenchmarkCostSpan gather_cost(request_.trace, BenchmarkCostKind::ComponentGather, [&] {
-   return nlohmann::json{{"edition", request_.edition}, {"rows_revisited", request_.records->size()}, {"images", image_count}, {"metadata_only", metadata_only},
-    {"input_identity", request_.input_identity}};
+   return nlohmann::json{
+    {"edition", request_.edition}, {"rows_revisited", request_.records->size()}, {"images", image_count}, {"metadata_only", metadata_only}, {"input_identity", request_.input_identity}
+   };
   });
   for (const auto& row : request_.records->rows())
    if (const auto& native = row.native(); !metadata_only && native && std::ranges::find(request_.retained_sources, native->lineage().component.source) == request_.retained_sources.end()) {

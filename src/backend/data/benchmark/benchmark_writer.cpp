@@ -125,7 +125,9 @@ struct BenchmarkSplitWriter::Impl {
        actual_dimensions(actual),
        perceptual(request.perceptual_downscale),
        stride(common_math::checked_cast<std::size_t>(static_cast<std::uint64_t>(resolution) * resolution * 3U * sizeof(float), "benchmark image stride overflow")) {
-  if (request.trace) try { trace = request.trace; } catch (...) {}
+  if (request.trace) try {
+    trace = request.trace;
+   } catch (...) {}
   (void)catalog::ClassCatalog(class_names, COMPILED_CLASS_NAME_CAPACITY);
   if (class_names.empty() || class_names.size() > MAX_CLASSES) throw std::runtime_error("benchmark split exceeds the compiled class limit");
   execution = request.execution;
@@ -425,17 +427,18 @@ void BenchmarkSplitWriter::write_pixel(std::size_t slot, std::size_t lane, const
  try {
   auto destination = state.slots_storage->pixels(common_math::checked_cast<std::uint32_t>(slot, "benchmark pixel slot overflow"));
   detail::CompilePixelObserver observer;
-  if (state.trace) observer = [&](const detail::CompilePixelObservation& value) {
-   trace_benchmark_event(state.trace, "compile.pixel", [&] {
-    auto fields = benchmark_observation_fields(value);
-    const std::lock_guard lock(state.facts_mutex);
-    const auto& image = state.images.at(slot);
-    fields["source"] = image.source_index;
-    fields["image_id"] = image.source_image_id;
-    fields["slot"] = slot;
-    return fields;
-   });
-  };
+  if (state.trace)
+   observer = [&](const detail::CompilePixelObservation& value) {
+    trace_benchmark_event(state.trace, "compile.pixel", [&] {
+     auto fields = benchmark_observation_fields(value);
+     const std::lock_guard lock(state.facts_mutex);
+     const auto& image = state.images.at(slot);
+     fields["source"] = image.source_index;
+     fields["image_id"] = image.source_image_id;
+     fields["slot"] = slot;
+     return fields;
+    });
+   };
   scratch.write(plan, input->payload->encoded(), header, memory, {destination.data(), plan.destination()}, +[] {}, observer);
  } catch (const detail::CompileImageError& error) {
   throw_if_benchmark_cancelled(state.cancellation);
@@ -606,9 +609,8 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
   state.directory_source = std::numeric_limits<std::uint16_t>::max();
  }
  trace_benchmark_event(request.trace, "benchmark.compaction.started", [&] { return nlohmann::json{{"split", request.split.name}, {"images", slots.size()}, {"bytes", state.layout.total_size}}; });
- BenchmarkCostSpan compaction_cost(request.trace, BenchmarkCostKind::Compaction, [&] {
-  return nlohmann::json{{"split", request.split.name}, {"rows_revisited", index.size()}, {"bytes", state.layout.total_size}};
- });
+ BenchmarkCostSpan compaction_cost(
+  request.trace, BenchmarkCostKind::Compaction, [&] { return nlohmann::json{{"split", request.split.name}, {"rows_revisited", index.size()}, {"bytes", state.layout.total_size}}; });
  state.layout = compact_compiled_file(state.staging.file(), state.layout, index, request.cancel_requested, request.compaction, {[&](std::size_t offset, std::size_t bytes) {
   state.staging.allocate_range(offset, bytes);
  }, [&](std::size_t offset, std::size_t bytes) { return state.staging.reclaim_range(offset, bytes); }, [&](std::size_t bytes) { state.staging.resize_sparse(bytes); }},

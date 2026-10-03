@@ -21,6 +21,7 @@ namespace mmltk::backend::data::detail {
 // after the physical call releases its CPU grant.
 class FileWorkQueue final {
  struct Impl;
+
 public:
  struct Operation {
   void* context = nullptr;
@@ -69,6 +70,7 @@ public:
   Reservation(const Reservation&) = delete;
   Reservation& operator=(const Reservation&) = delete;
   [[nodiscard]] CompileExecution::Completion submit(Operation);
+
  private:
   friend class FileWorkQueue;
   Reservation(std::shared_ptr<Impl>, std::size_t);

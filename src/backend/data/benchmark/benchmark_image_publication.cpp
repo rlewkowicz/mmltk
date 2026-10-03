@@ -38,7 +38,8 @@ BenchmarkImagePublication::BenchmarkImagePublication(std::filesystem::path outpu
  buffers_->free = execution ? std::clamp<std::size_t>(execution->execution().workers() * 2, 2, 8) : 1;
  buffers_->execution = execution ? &execution->execution() : nullptr;
  if (execution)
-  readiness_ = std::make_unique<CompileExecution::Readiness>(execution->execution(), CompileChange::Resources | CompileChange::Pressure | CompileChange::Local, [this](CompileExecution::Readiness::Changes changes) {
+  readiness_ = std::make_unique<CompileExecution::Readiness>(
+   execution->execution(), CompileChange::Resources | CompileChange::Pressure | CompileChange::Local, [this](CompileExecution::Readiness::Changes changes) {
    if (!changes.retry && !includes(changes.causes, CompileChange::Local | CompileChange::Interruption)) return;
    {
     const std::lock_guard lock(resource_mutex_);
@@ -212,9 +213,7 @@ void BenchmarkImagePublication::submit(std::uint64_t id, Input admitted_input, B
   input.reset();
   if (ready) ready({id, std::pair{header.width, header.height}, execution_ != nullptr, std::move(payload)});
  };
- auto settlement = [id, header, publication, settled = std::move(settled)](std::exception_ptr failure) {
-  settled({id, std::pair{header.width, header.height}, true, publication->fact}, failure);
- };
+ auto settlement = [id, header, publication, settled = std::move(settled)](std::exception_ptr failure) { settled({id, std::pair{header.width, header.height}, true, publication->fact}, failure); };
  if (record) {
   // Both operation and controller callback allocations precede acceptance.
   std::function<void(std::exception_ptr)> on_settled = std::move(settlement);
