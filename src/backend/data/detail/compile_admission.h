@@ -98,7 +98,6 @@ struct CompileAllowance::Credits {
      : owner(std::move(value)), resources(demand), parent(std::move(producing)), available(demand.continuation_descriptors) {}
  ~Credits();
 };
-class CompileResourceWait;
 struct CompileAdmission {
  using Credits = CompileAllowance::Credits;
  using Change = CompileChange;
@@ -123,16 +122,10 @@ struct CompileAdmission {
  std::size_t descriptor_capacity = 0, descriptors = 0, committed = 0;
  std::size_t cpu_capacity = 0, active = 0, external_cpus = 0, waiters = 0, resource_waiters = 0, resource_jobs = 0;
  std::size_t withdrawals = 0;
- // One ready oversized demand closes new transient production while existing
- // finite consumers finish their retained inputs. Identity is actual request
- // custody, never a diagnostic token.
- const void* draining_request = nullptr;
+ // Execution selects one ready oversized demand. Its constraint closes new
+ // transient production while finite consumers finish their retained inputs.
  const Credits* draining_parent = nullptr;
  std::uint64_t draining_bytes = 0;
- bool draining_external = false;
- CompileResourceWait* drain_head = nullptr;
- CompileResourceWait* drain_tail = nullptr;
- void refresh_external_drain() noexcept;
  [[nodiscard]] static bool exceptional_custody(const Credits* credit) {
   for (; credit; credit = credit->parent.get())
    if (credit->arena.exceptional()) return true;
@@ -140,14 +133,6 @@ struct CompileAdmission {
  }
  [[nodiscard]] bool oversized(CompileResources value) const {
   return value.supplied_workspace && value.bytes && arenas && !arenas->normal_fit(value.bytes, value.completion_workspace, value.workspace_class, value.workspace_window);
- }
- void drain(const void* request, const Credits* parent, std::uint64_t count, bool external = false) {
-  if (request == draining_request) return;
-  draining_request = request;
-  draining_parent = parent;
-  draining_bytes = count;
-  draining_external = external;
-  notify(Change::Resources);
  }
  bool tracing = false;
  mutable std::uint64_t eligibility_probes = 0;
@@ -220,7 +205,7 @@ struct CompileAdmission {
   CompileResources value, const Credits* parent = nullptr, bool finite_consumer = false, std::uint64_t retiring_bytes = 0, std::uint64_t retiring_arena_bytes = 0) const {
   if (tracing) ++eligibility_probes;
   if (!feasible(value)) return {.denial = CompileResourceDenial::Infeasible};
-  if (draining_request && value.bytes && !value.retained_handles && !(value.supplied_workspace && value.bytes == draining_bytes && parent == draining_parent) && !(parent && finite_consumer))
+  if (draining_bytes && value.bytes && !value.retained_handles && !(value.supplied_workspace && value.bytes == draining_bytes && parent == draining_parent) && !(parent && finite_consumer))
    return {.denial = CompileResourceDenial::ExceptionalDrain};
   if (arenas && arenas->exceptional_active() && value.bytes && !exceptional_custody(parent)) return {.denial = CompileResourceDenial::ExceptionalLineage};
   if (value.supplied_workspace && value.bytes && arenas) {

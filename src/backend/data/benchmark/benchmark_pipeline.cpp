@@ -1237,8 +1237,8 @@ bool BenchmarkCompilePipeline::Impl::retain_pixel(Job& job, std::unique_lock<std
  std::exception_ptr error;
  detail::CompileResourceDenial denial{};
  try {
-  if (!waiting) waiting = execution.defer_resources(resources, parent, true);
-  retained = execution.try_retain(CompileTaskKind::Pixels, *waiting, &denial);
+  if (!waiting) waiting = execution.defer_continuation(CompileTaskKind::Pixels, resources, parent, true);
+  retained = execution.try_retain(*waiting, &denial);
  } catch (...) { error = std::current_exception(); }
  if (retained || error) waiting.reset();
  lock.lock();

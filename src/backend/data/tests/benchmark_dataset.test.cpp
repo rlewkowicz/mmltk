@@ -7112,12 +7112,15 @@ TEST_CASE("direct continuation admission retains complete bounded custody withou
  CompileResourceDenial denial{};
  CHECK_FALSE(execution.try_retain(CompileTaskKind::Pixels, demand, {}, true, &denial));
  CHECK(execution.snapshot().records == 0);
- auto pressure = execution.defer_resources(demand);
+ auto waiting = execution.defer_continuation(CompileTaskKind::Pixels, demand, {}, true);
  CHECK(execution.oversized_workspace_pending() == exceptional);
  occupied = {};
- auto retained = execution.try_retain(CompileTaskKind::Pixels, demand, {}, true);
+ auto retained = execution.try_retain(*waiting);
  REQUIRE(retained);
- pressure.reset();
+ CHECK_FALSE(execution.resource_pressure());
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ CHECK_THROWS_AS(execution.try_retain(*waiting), std::invalid_argument);
+ waiting.reset();
  CHECK(execution.snapshot().active == 0);
  CHECK(execution.snapshot().records == 1);
  CHECK(retained->allowance().workspace().size() == demand.bytes);
@@ -10572,11 +10575,11 @@ TEST_CASE("ordinary direct demands preserve age and raw eligibility across small
  const mmltk::testsupport::ScopedTestCleanup release([&] { holding.Release(); execution.retire_attempt(); });
  auto active = execution.submit({.kind = CompileTaskKind::Pixels, .resources = {32, 0}, .work = [&](std::size_t, const CompileAllowance&) { holding.receipt().ArriveAndWait(); }});
  REQUIRE(holding.WaitEntered(2s));
- auto waiting = execution.defer_resources({.bytes = 64, .workspace_class = CompileWorkClass::Pixels}, {}, finite);
- CHECK_FALSE(execution.try_retain(CompileTaskKind::Pixels, *waiting));
+ auto waiting = execution.defer_continuation(CompileTaskKind::Pixels, {.bytes = 64}, {}, finite);
+ CHECK_FALSE(execution.try_retain(*waiting));
  for (unsigned item = 0; item < 12; ++item) execution.run(CompileTaskKind::Labels, {}, [](std::size_t) {});
  const auto probes = execution.snapshot().costs.eligibility_probes;
- for (unsigned item = 0; item < 12; ++item) CHECK_FALSE(execution.try_retain(CompileTaskKind::Pixels, *waiting));
+ for (unsigned item = 0; item < 12; ++item) CHECK_FALSE(execution.try_retain(*waiting));
  CHECK(execution.snapshot().costs.eligibility_probes == probes);
  detail::CompileResourceDenial denial = detail::CompileResourceDenial::None;
  CHECK_FALSE(execution.try_retain(CompileTaskKind::Pixels, {16, 0}, {}, finite, &denial));
@@ -10590,7 +10593,7 @@ TEST_CASE("ordinary direct demands preserve age and raw eligibility across small
  holding.Release();
  active.wait();
  if (waiting) {
-  auto retained = execution.try_retain(CompileTaskKind::Pixels, *waiting);
+  auto retained = execution.try_retain(*waiting);
   REQUIRE(retained);
   CHECK(execution.resource_usage().bytes == 64);
  }
@@ -10602,7 +10605,7 @@ TEST_CASE("direct demands preserve the continuation work needed to return their 
  auto continuation = execution.try_retain(CompileTaskKind::Pixels);
  REQUIRE(continuation);
  const CompileResources demand{.bytes = exceptional ? page * 2 : page, .supplied_workspace = exceptional, .workspace_class = CompileWorkClass::Pixels};
- auto waiting = execution.defer_resources(demand, {}, false);
+ auto waiting = execution.defer_continuation(CompileTaskKind::Pixels, demand);
  CHECK_FALSE(execution.oversized_workspace_pending());
  std::promise<void> finished;
  const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
@@ -10630,13 +10633,13 @@ TEST_CASE("direct demands preserve the continuation work needed to return their 
   step.wait();
  }
  detail::CompileResourceDenial denial{};
- CHECK_FALSE(execution.try_retain(CompileTaskKind::Pixels, *waiting, &denial));
+ CHECK_FALSE(execution.try_retain(*waiting, &denial));
  CHECK(denial == detail::CompileResourceDenial::Records);
  auto final = submit_step({.kind = CompileTaskKind::Pixels, .resources = {16, 0}, .work = [&](std::size_t, const CompileAllowance&) { finished.set_value(); }});
  mmltk::testsupport::await_test_promise(finished, "byte-bearing successor returns the only record");
  final.wait();
  execution.join();
- auto admitted = execution.try_retain(CompileTaskKind::Pixels, *waiting);
+ auto admitted = execution.try_retain(*waiting);
  REQUIRE(admitted);
  CHECK(execution.resource_usage().bytes == demand.bytes);
 }
@@ -10670,12 +10673,13 @@ TEST_CASE("failed deferred workspace preparation leaves admission and retirement
  CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 1});
  const auto generation = execution.resource_generation();
  const CompileResources impossible{.bytes = std::numeric_limits<std::size_t>::max(), .supplied_workspace = true, .workspace_class = CompileWorkClass::Pixels};
- CHECK_THROWS_AS(execution.defer_resources(impossible, {}, direct ? std::optional<bool>{false} : std::nullopt), std::bad_alloc);
+ if (direct) CHECK_THROWS_AS(execution.defer_continuation(CompileTaskKind::Pixels, impossible), std::bad_alloc);
+ else CHECK_THROWS_AS(execution.defer_resources(impossible), std::bad_alloc);
  CHECK(execution.resource_generation() == generation);
  CHECK_FALSE(execution.resource_pressure());
  CHECK_FALSE(execution.oversized_workspace_pending());
- auto waiting = execution.defer_resources({.bytes = page, .supplied_workspace = true, .workspace_class = CompileWorkClass::Pixels}, {}, false);
- auto continuation = execution.try_retain(CompileTaskKind::Pixels, *waiting);
+ auto waiting = execution.defer_continuation(CompileTaskKind::Pixels, {.bytes = page, .supplied_workspace = true});
+ auto continuation = execution.try_retain(*waiting);
  REQUIRE(continuation);
  auto completion = continuation->try_submit({.kind = CompileTaskKind::Pixels, .resources = {.bytes = page, .supplied_workspace = true}, .work = [](std::size_t, const CompileAllowance&) {}});
  REQUIRE(completion);
@@ -10684,6 +10688,233 @@ TEST_CASE("failed deferred workspace preparation leaves admission and retirement
  execution.join();
  CHECK(execution.resource_usage().bytes == 0);
  execution.retire_attempt();
+}
+TEST_CASE("deferred continuations classify their bound completion capacity before publishing demand", "[backend][data][benchmark][pipeline][resources]") {
+ const auto page = mmltk::common::system::host_page_size();
+ std::array<detail::CompileWorkspaceProfile, 6> profiles{};
+ profiles[static_cast<std::size_t>(CompileWorkClass::Pixels)] = {page, page * 2};
+ auto plan = std::make_shared<detail::CompileWorkspacePlan>(detail::CompileWorkspacePlan::prepare(1, profiles, 0, 0, page * 3));
+ CompileExecution execution(1, {}, {.workspace_plan = plan});
+ REQUIRE(execution.workspace_capacity() == page);
+ REQUIRE(execution.workspace_capacity(true, CompileWorkClass::Pixels) == page * 2);
+ auto occupied = execution.reserve({.bytes = page * 2, .supplied_workspace = true, .completion_workspace = true, .workspace_class = CompileWorkClass::Pixels});
+ // Caller defaults or stale classes cannot determine the successor's shape.
+ const auto supplied_class = GENERATE(CompileWorkClass::Count, CompileWorkClass::Output);
+ auto waiting = execution.defer_continuation(CompileTaskKind::Pixels, {.bytes = page * 2, .supplied_workspace = true, .completion_workspace = true, .workspace_class = supplied_class});
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ CHECK_FALSE(execution.try_retain(*waiting));
+ std::promise<void> runnable;
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] { execution.retire_attempt(); });
+ auto unrelated = execution.submit({.kind = CompileTaskKind::Labels, .resources = {.bytes = 1, .supplied_workspace = true},
+  .work = [&](std::size_t, const CompileAllowance&) { mmltk::testsupport::release_test_promise(runnable); }});
+ mmltk::testsupport::await_test_promise(runnable, "normal completion demand leaves unrelated normal work runnable");
+ unrelated.wait();
+ execution.join();
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ occupied = {};
+ auto retained = execution.try_retain(*waiting);
+ REQUIRE(retained);
+ CHECK_FALSE(retained->allowance().exceptional_workspace());
+ CHECK(retained->allowance().workspace().size() == page * 2);
+ CHECK(execution.resource_usage().bytes == page * 2);
+ CHECK_FALSE(execution.resource_pressure());
+ retained.reset();
+ waiting.reset();
+ CHECK(execution.snapshot().leased == 0);
+ CHECK(execution.snapshot().exceptional_peak == 0);
+}
+TEST_CASE("queued and external exceptional demands retain their selected drain order", "[backend][data][benchmark][pipeline][resources]") {
+ const bool external_first = GENERATE(false, true);
+ const auto page = mmltk::common::system::host_page_size();
+ std::promise<void> parked;
+ std::atomic<bool> observed{false};
+ CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 4}, {}, [&](std::string_view, const detail::CompileExecutionSnapshot& value) {
+  if (value.parked[static_cast<std::size_t>(detail::CompileParkReason::Bytes)] && !observed.exchange(true)) mmltk::testsupport::release_test_promise(parked);
+ });
+ auto occupied = execution.reserve({.bytes = page, .supplied_workspace = true});
+ std::unique_ptr<detail::CompileResourceWait> waiting;
+ std::optional<CompileExecution::Continuation> retained;
+ mmltk::testsupport::TestGate running("queued exceptional request owns the arena");
+ const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+  running.Release();
+  waiting.reset();
+  retained.reset();
+  occupied = {};
+  execution.retire_attempt();
+ });
+ const auto defer = [&] { return execution.defer_continuation(CompileTaskKind::Pixels, {.bytes = page * 3, .supplied_workspace = true}); };
+ if (external_first) waiting = defer();
+ auto queued = execution.submit({.kind = CompileTaskKind::Pixels, .resources = {.bytes = page * 2, .supplied_workspace = true},
+  .work = [&](std::size_t, const CompileAllowance&) { running.receipt().ArriveAndWait(); }});
+ mmltk::testsupport::await_test_promise(parked, "queued exceptional demand has been selected or denied by the external head");
+ if (!external_first) waiting = defer();
+ detail::CompileResourceDenial denial{};
+ CHECK_FALSE(execution.try_retain(*waiting, &denial));
+ CHECK(denial == (external_first ? detail::CompileResourceDenial::ArenaBusy : detail::CompileResourceDenial::ExceptionalDrain));
+ occupied = {};
+ if (external_first) {
+  retained = execution.try_retain(*waiting);
+  REQUIRE(retained);
+  CHECK_FALSE(queued.ready());
+  CHECK(execution.snapshot().exceptional_reserved == page * 3);
+  retained.reset();
+ }
+ REQUIRE(running.WaitEntered(5s));
+ CHECK(execution.snapshot().exceptional_reserved == page * 2);
+ if (!external_first) {
+  CHECK_FALSE(execution.try_retain(*waiting));
+  CHECK(execution.resource_pressure());
+ }
+ running.Release();
+ queued.wait();
+ execution.join();
+ if (!external_first) {
+  retained = execution.try_retain(*waiting);
+  REQUIRE(retained);
+  CHECK(execution.snapshot().exceptional_reserved == page * 3);
+  retained.reset();
+ }
+ waiting.reset();
+ CHECK_FALSE(execution.resource_pressure());
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ CHECK(execution.snapshot().leased == 0);
+ CHECK(execution.snapshot().exceptional == 0);
+}
+TEST_CASE("external drain withdrawal advances the next registration without retaining parent custody", "[backend][data][benchmark][pipeline][resources]") {
+ const bool pressure_only = GENERATE(false, true);
+ const auto page = mmltk::common::system::host_page_size();
+ CompileExecution execution(1, {}, {.transient_bytes = page, .descriptors = 8});
+ auto parent = execution.reserve({.bytes = page, .descriptors = 1});
+ const CompileResources first{.bytes = page * 2, .supplied_workspace = true};
+ auto head = pressure_only ? execution.defer_resources(first, parent) : execution.defer_continuation(CompileTaskKind::Pixels, first, parent);
+ parent = {};
+ auto next = execution.defer_continuation(CompileTaskKind::Pixels, {.bytes = page * 3, .descriptors = 1, .supplied_workspace = true});
+ detail::CompileResourceDenial denial{};
+ CHECK_FALSE(execution.try_retain(*next, &denial));
+ CHECK(denial == detail::CompileResourceDenial::ExceptionalDrain);
+ CHECK(execution.resource_usage().descriptors == 1);
+ // The wait is the final parent owner; its destructor must unlock before
+ // retiring that charge, then preserve the surviving external registration.
+ head.reset();
+ CHECK(execution.resource_usage().bytes == 0);
+ CHECK(execution.resource_usage().descriptors == 0);
+ CHECK(execution.oversized_workspace_pending());
+ auto retained = execution.try_retain(*next);
+ REQUIRE(retained);
+ CHECK_FALSE(execution.resource_pressure());
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ CHECK(execution.resource_usage().bytes == page * 3);
+ CHECK(execution.resource_usage().descriptors == 1);
+ next.reset();
+ retained.reset();
+ CHECK(execution.snapshot().exceptional == 0);
+ CHECK(execution.resource_usage().descriptors == 0);
+}
+TEST_CASE("external exceptional selection bypasses a head without its protected successor record", "[backend][data][benchmark][pipeline][resources]") {
+ const auto page = mmltk::common::system::host_page_size();
+ CompileExecution execution(1, {}, {.transient_bytes = page, .task_records = 6});
+ auto occupied = execution.try_retain(CompileTaskKind::Pixels);
+ REQUIRE(occupied);
+ auto head = execution.defer_continuation(CompileTaskKind::Pixels, {.bytes = page * 2, .supplied_workspace = true});
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ auto next = execution.defer_continuation(CompileTaskKind::Header, {.bytes = page * 3, .supplied_workspace = true});
+ CHECK(execution.oversized_workspace_pending());
+ detail::CompileResourceDenial denial{};
+ CHECK_FALSE(execution.try_retain(*head, &denial));
+ CHECK(denial == detail::CompileResourceDenial::Records);
+ auto accepted = execution.try_retain(*next);
+ REQUIRE(accepted);
+ CHECK(execution.snapshot().records == 2);
+ CHECK(accepted->allowance().workspace().size() == page * 3);
+ accepted.reset();
+ occupied.reset();
+ auto following = execution.try_retain(*head);
+ REQUIRE(following);
+ CHECK(following->allowance().workspace().size() == page * 2);
+ following.reset();
+ head.reset();
+ next.reset();
+ CHECK(execution.snapshot().records == 0);
+ CHECK(execution.resource_usage().bytes == 0);
+ CHECK_FALSE(execution.resource_pressure());
+}
+TEST_CASE("pressure registrations have neither continuation records nor aging reservations", "[backend][data][benchmark][pipeline][resources]") {
+ CompileExecution execution(1, {}, {.transient_bytes = 64, .task_records = 1});
+ auto parent = execution.reserve({32, 0});
+ auto pressure = execution.defer_resources({64, 0});
+ CHECK(execution.resource_pressure());
+ CHECK_THROWS_AS(execution.try_retain(*pressure), std::invalid_argument);
+ for (unsigned i = 0; i < 12; ++i) execution.run(CompileTaskKind::Pixels, {}, [](std::size_t) {});
+ execution.join();
+ auto fitting = execution.try_retain(CompileTaskKind::Pixels, {16, 0});
+ REQUIRE(fitting);
+ CHECK(execution.resource_usage().bytes == 48);
+ pressure.reset();
+ CHECK_FALSE(execution.resource_pressure());
+ // Pressure still drains oversized resources even when every scheduler record
+ // is held. It does not promise to acquire another record.
+ auto drain = execution.defer_resources({.bytes = mmltk::common::system::host_page_size() * 2, .supplied_workspace = true});
+ CHECK(execution.oversized_workspace_pending());
+ drain.reset();
+ fitting.reset();
+ parent = {};
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ CHECK(execution.resource_usage().bytes == 0);
+}
+TEST_CASE("deferred registration rejects foreign custody and invalid successors before publication", "[backend][data][benchmark][pipeline][resources]") {
+ const bool direct = GENERATE(false, true);
+ CompileExecution execution(1, {}, {.transient_bytes = 64}), foreign(1, {}, {.transient_bytes = 64});
+ auto parent = foreign.reserve({32, 0});
+ const auto generation = execution.resource_generation();
+ if (direct) CHECK_THROWS_AS(execution.defer_continuation(CompileTaskKind::Pixels, {64, 0}, parent), std::invalid_argument);
+ else CHECK_THROWS_AS(execution.defer_resources({64, 0}, parent), std::invalid_argument);
+ CHECK_THROWS_AS(execution.defer_continuation(CompileTaskKind::Count, {64, 0}), std::invalid_argument);
+ auto waiting = foreign.defer_continuation(CompileTaskKind::Pixels, {32, 0});
+ CHECK_THROWS_AS(execution.try_retain(*waiting), std::invalid_argument);
+ CHECK(execution.resource_generation() == generation);
+ CHECK_FALSE(execution.resource_pressure());
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ CHECK(execution.snapshot().records == 0);
+ CHECK(foreign.resource_usage().bytes == 32);
+ waiting.reset();
+ parent = {};
+ CHECK_FALSE(foreign.resource_pressure());
+ CHECK(foreign.resource_usage().bytes == 0);
+}
+TEST_CASE("deferred registration allocation failure leaves pressure and parent accounting intact", "[backend][data][benchmark][pipeline][resources]") {
+ const bool direct = GENERATE(false, true);
+ const auto allowed = GENERATE(std::size_t{0}, std::size_t{1});
+ const auto page = mmltk::common::system::host_page_size();
+ CompileExecution execution(1, {}, {.transient_bytes = page, .descriptors = 8});
+ const CompileResources demand{.bytes = page * 2, .supplied_workspace = true};
+ auto parent = execution.reserve({.bytes = page, .descriptors = 1});
+ const auto generation = execution.resource_generation();
+ std::exception_ptr failure;
+ bool fired = false;
+ {
+  const FailNextAllocation allocation(allowed);
+  try {
+   if (direct) (void)execution.defer_continuation(CompileTaskKind::Pixels, demand, parent);
+   else (void)execution.defer_resources(demand, parent);
+  } catch (...) { failure = std::current_exception(); }
+  fired = allocation.fired();
+ }
+ REQUIRE(fired);
+ REQUIRE(failure);
+ CHECK_THROWS_AS(std::rethrow_exception(failure), std::bad_alloc);
+ CHECK(execution.resource_generation() == generation);
+ CHECK_FALSE(execution.resource_pressure());
+ CHECK_FALSE(execution.oversized_workspace_pending());
+ CHECK(execution.resource_usage().bytes == page);
+ CHECK(execution.resource_usage().descriptors == 1);
+ parent = {};
+ auto waiting = execution.defer_continuation(CompileTaskKind::Pixels, demand);
+ auto retained = execution.try_retain(*waiting);
+ REQUIRE(retained);
+ waiting.reset();
+ retained.reset();
+ CHECK(execution.resource_usage().bytes == 0);
+ CHECK(execution.resource_usage().descriptors == 0);
 }
 TEST_CASE("post-aging parent custody releases the reservation for its finite consumer", "[backend][data][benchmark][pipeline]") {
  if (mmltk::common::system::allowed_cpu_set().size() < 3) SKIP("requires three assigned CPUs");
@@ -10709,7 +10940,7 @@ TEST_CASE("post-aging parent custody releases the reservation for its finite con
  REQUIRE(publish.WaitEntered(2s));
  std::unique_ptr<detail::CompileResourceWait> waiting;
  CompileExecution::Completion large;
- if (direct_demand) waiting = execution.defer_resources({.bytes = 64, .workspace_class = CompileWorkClass::Pixels}, {}, false);
+ if (direct_demand) waiting = execution.defer_continuation(CompileTaskKind::Pixels, {.bytes = 64});
  else large = execution.submit({.kind = CompileTaskKind::Labels, .resources = {64, 0}, .work = [&](std::size_t, const CompileAllowance&) { large_gate.receipt().ArriveAndWait(); }});
  for (unsigned item = 0; item < 12; ++item) execution.run(CompileTaskKind::Labels, {}, [](std::size_t) {});
  detail::CompileResourceDenial denial = detail::CompileResourceDenial::None;
@@ -10734,7 +10965,7 @@ TEST_CASE("post-aging parent custody releases the reservation for its finite con
  child.Release();
  consumer->wait();
  if (waiting) {
-  auto retained = execution.try_retain(CompileTaskKind::Pixels, *waiting);
+  auto retained = execution.try_retain(*waiting);
   REQUIRE(retained);
   CHECK(execution.resource_usage().bytes == 64);
  } else {
