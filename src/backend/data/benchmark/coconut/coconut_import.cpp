@@ -422,12 +422,12 @@ class Importer final {
       auto copy = job->continuation.try_submit({.kind = job->kind, .work = [this, job](std::size_t, const CompileAllowance&) {
        auto& worker = *job->worker;
        worker.output.fill(request_.cancellation);
+       if (worker.pending)
+        native_staged(*worker.pending->product, job->kind, worker.output);
+       else if (worker.complete)
+        native_staged(*worker.complete, job->kind, worker.output);
        worker.output = {};
        worker.native.release_supplied();
-       if (worker.pending)
-        native_staged(*worker.pending->product, job->kind);
-       else if (worker.complete)
-        native_staged(*worker.complete, job->kind);
       }, .allowance = job->arena, .finite_consumer = true, .retain_workspace = false, .completed = [this, job](std::exception_ptr error) { post_output(job, NativeJob::State::Done, error); }});
       if (!copy) continue;
       job->state = NativeJob::State::Copying;
@@ -461,7 +461,7 @@ class Importer final {
    job->completion.settle(job->error);
   }
  }
- CompileExecution::Completion submit_native(const std::shared_ptr<NativeJob>& job, std::uint64_t bytes, std::function<void(const CompileAllowance&)> work) {
+ CompileExecution::Completion submit_native(const std::shared_ptr<NativeJob>& job, std::uint64_t bytes, std::function<void(const CompileAllowance&)> work, bool produces_output = true) {
   // Acquire actual scratch on the input/recovery controller before consuming a
   // scheduler record. Byte-waiting first steps must not fill that bounded queue
   // and strand the copy continuation which returns their only fitting arena.
@@ -481,12 +481,14 @@ class Importer final {
   }
   try {
    (void)request_.execution->execution().submit(
-    {.kind = job->kind, .resources = {.bytes = bytes, .supplied_workspace = true}, .work = [job, &execution, work = std::move(work)](std::size_t, const CompileAllowance& allowance) {
+    {.kind = job->kind, .resources = {.bytes = bytes, .supplied_workspace = true}, .work = [job, &execution, work = std::move(work), produces_output](std::size_t, const CompileAllowance& allowance) {
     job->arena = allowance;
     job->worker->native.prepare_support(allowance.workspace());
     work(allowance);
-    job->continuation = execution.retain_current(job->kind);
-   }, .allowance = job->arena, .finite_consumer = true, .retain_workspace = false, .completed = [this, job](std::exception_ptr error) { post_output(job, NativeJob::State::Prepare, error); }});
+    if (produces_output) job->continuation = execution.retain_current(job->kind);
+   }, .allowance = job->arena, .finite_consumer = true, .retain_workspace = false, .completed = [this, job, produces_output](std::exception_ptr error) {
+    post_output(job, produces_output ? NativeJob::State::Prepare : NativeJob::State::Done, error);
+   }});
   } catch (...) { post_output(job, NativeJob::State::Done, std::current_exception()); }
   return job->completion.completion();
  }
@@ -612,7 +614,7 @@ public:
   });
   if (worker.pending) {
    auto native = std::move(worker.pending);
-   auto provisional = std::move(native->product);
+   const auto& provisional = native->product;
    native->provisional_dependency = provisional->input_identity() + ".provisional";
    publish_labels(provisional, native->publication, true);
    defer_native(std::move(native));
@@ -776,14 +778,15 @@ public:
   if (normalize && !saved && !reused && png.empty()) throw CoconutInputError("missing required panoptic mask");
   std::size_t decode_bytes = 0;
   const auto inspect = [&](std::size_t) {
-   if (!normalize || reused || saved) return;
    if (!dimensions.width) dimensions = admit_png(workspace, record, png, physical);
    decode_bytes = workspace.decoder_workspace_bytes(png);
   };
-  if (request_.execution && !request_.execution->execution().on_lane())
-   request_.execution->execution().run(CompileTaskKind::Projection, {}, inspect, allowance);
-  else
-   inspect(0);
+  if (normalize && !reused && !saved) {
+   if (request_.execution && !request_.execution->execution().on_lane())
+    request_.execution->execution().run(CompileTaskKind::Projection, {}, inspect, allowance);
+   else
+    inspect(0);
+  }
   if (reused) dimensions = {reused->index().images()[reused_position].width, reused->index().images()[reused_position].height};
   auto upcoming = normalize && !saved ? workspace.support_workspace_bytes(record, std::uint64_t{dimensions.width} * dimensions.height, record.segments.size(), !deferred) : 0;
   const auto available = allowance && decode_bytes <= allowance.bytes() ? allowance.bytes() - decode_bytes : 0;
@@ -855,11 +858,11 @@ public:
    request_.records->staging->prepare(
     worker.output.request(), request_.execution ? &request_.execution->execution() : nullptr, request_.execution ? &request_.execution->files() : nullptr, request_.parent_allowance);
    worker.output.fill(request_.cancellation);
-   worker.output = {};
    if (worker.pending)
-    native_staged(*worker.pending->product, CompileTaskKind::Normalize);
+    native_staged(*worker.pending->product, CompileTaskKind::Normalize, worker.output);
    else if (worker.complete)
-    native_staged(*worker.complete, CompileTaskKind::Normalize);
+    native_staged(*worker.complete, CompileTaskKind::Normalize, worker.output);
+   worker.output = {};
    settle_worker(worker);
   }
  }
@@ -1086,12 +1089,13 @@ private:
   }
   report_rows();
  }
- void native_staged(const CoconutNativeImage& image, CompileTaskKind kind) const {
+ void native_staged(const CoconutNativeImage& image, CompileTaskKind kind, const CoconutNativeOutput& output) const {
   trace_benchmark_event(request_.trace, "benchmark.coconut.native_staged", [&] {
    const auto snapshot = request_.execution ? request_.execution->execution().snapshot() : detail::CompileExecutionSnapshot{};
    return nlohmann::json{
     {"image_id", image.inventory().physical.image_id}, {"kind", kind}, {"admitted_runs", image.admission() ? image.runs().size() : 0}, {"boxes", image.boxes().size()}, {"runs", image.runs().size()},
-    {"normal_locked", snapshot.normal_locked}, {"leased", snapshot.leased}, {"exceptional", snapshot.exceptional}
+    {"normal_locked", snapshot.normal_locked}, {"leased", snapshot.leased}, {"exceptional", snapshot.exceptional},
+    {"staged_bytes", output.staged_bytes()}, {"copied_bytes", output.copied_bytes()}
    };
   });
  }
@@ -1221,19 +1225,28 @@ private:
     auto worker = idle_recovery.empty() ? std::make_unique<Worker>(request_) : std::move(idle_recovery.back());
     if (!idle_recovery.empty()) idle_recovery.pop_back();
     worker->native.originals(original.originals);
+    const bool unchanged = native->product && native->product->can_finalize_unchanged();
     const auto pixels = std::uint64_t{native->dimensions.width} * native->dimensions.height;
-    const auto bytes = worker->native.support_workspace_bytes(native->record, pixels, native->record.segments.size());
+    const auto bytes = unchanged ? 0 : worker->native.support_workspace_bytes(native->record, pixels, native->record.segments.size());
     trace_benchmark_event(request_.trace, "benchmark.coconut.recovery_ready", [&] {
      return nlohmann::json{
       {"image_id", native->record.image_id}, {"source", source}, {"physical_generation", physical.generation}, {"original_generation", original.generation}, {"support_bytes", bytes}
      };
     });
-    const auto recover = [this, native, original](Worker& target) {
+    const auto recover = [this, native, original, unchanged](Worker& target) {
+     throw_if_benchmark_cancelled(request_.cancellation);
      auto& workspace = target.native;
-     workspace.borrow_support(native->record, native->support, native->dimensions, native->unlisted_segment);
-     native->product =
-      workspace.finish(native->record, native->physical, native->dimensions, lineage_for(native->physical.source, workspace.recovery(), original.generation), request_.rejected_object, &target.output);
+     const auto lineage = lineage_for(native->physical.source, workspace.recovery(), original.generation);
+     if (unchanged)
+      native->product = CoconutNativeImage::bind(native->product, native->physical, lineage);
+     else {
+      workspace.borrow_support(native->record, native->support, native->dimensions, native->unlisted_segment);
+      native->product = workspace.finish(native->record, native->physical, native->dimensions, lineage, request_.rejected_object, &target.output);
+     }
      target.complete = native->product;
+     trace_benchmark_event(request_.trace, "benchmark.coconut.native_finalized", [&] {
+      return benchmark_observation_fields(CoconutNativeObservation{native->physical.image_id, native->product->boxes().size(), native->product->runs().size(), native->product->recovery().objects.size(), unchanged});
+     });
     };
     const auto settle = [this, native, original](std::exception_ptr failure) {
      if (failure) {
@@ -1268,7 +1281,7 @@ private:
     if (request_.execution) {
      auto job = std::make_shared<NativeJob>(request_.execution->execution(), CompileTaskKind::Recovery);
      job->worker = std::move(worker);
-     auto completion = submit_native(job, bytes, [recover, job](const CompileAllowance&) { recover(*job->worker); });
+     auto completion = submit_native(job, bytes, [recover, job](const CompileAllowance&) { recover(*job->worker); }, !unchanged);
      track_native(ready, completion, [&, job, settle](std::exception_ptr failure) {
       settle(failure);
       job->worker->complete.reset();
@@ -1277,9 +1290,12 @@ private:
      completion.subscribe([signal](std::exception_ptr) { signal->notify(); });
     } else {
      recover(*worker);
-     request_.records->staging->prepare(worker->output.request());
-     worker->output.fill(request_.cancellation);
-     native_staged(*native->product, CompileTaskKind::Recovery);
+     if (!unchanged) {
+      request_.records->staging->prepare(worker->output.request());
+      worker->output.fill(request_.cancellation);
+      native_staged(*native->product, CompileTaskKind::Recovery, worker->output);
+      worker->output = {};
+     }
      settle({});
      worker->complete.reset();
      idle_recovery.push_back(std::move(worker));

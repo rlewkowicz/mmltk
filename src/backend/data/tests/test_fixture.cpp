@@ -5,6 +5,11 @@
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/detail/compile_pixel_workspace.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_import.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_native_image.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_parquet.h"
+#include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
+#include "src/common/io/file_digest.h"
 #include "src/backend/data/detail/compile_image_decoder.h"
 #include "src/common/system/numa_memory.h"
 #include "src/common/system/numa_topology.h"
@@ -15,8 +20,16 @@
 #include "src/backend/data/compiler/dataset_compiler.h"
 #include <stb_image_write.h>
 #include <archive.h>
+#include <arrow/api.h>
+#include <arrow/io/api.h>
+#include <parquet/arrow/writer.h>
+#include <parquet/properties.h>
 #include <archive_entry.h>
 #include <array>
+#include <atomic>
+#include <concepts>
+#include <type_traits>
+#include <variant>
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
@@ -29,6 +42,76 @@
 #include <vector>
 namespace fs = std::filesystem;
 namespace mmltk::backend::data::testsupport {
+using Json = nlohmann::json;
+void arrow_ok(const arrow::Status& status) {
+ if (!status.ok()) throw std::runtime_error(status.ToString());
+}
+std::shared_ptr<arrow::DataType> coconut_parquet_segment_type(bool integer_area) {
+ return arrow::struct_(
+  {arrow::field("area", integer_area ? arrow::int64() : arrow::float64()), arrow::field("category_id", arrow::int64()), arrow::field("id", arrow::int64()), arrow::field("iscrowd", arrow::int64()),
+   arrow::field("isthing", arrow::int64())});
+}
+std::shared_ptr<arrow::Schema> coconut_parquet_schema(bool integer_area) {
+ return arrow::schema(
+  {arrow::field("mask", arrow::struct_({arrow::field("bytes", arrow::binary()), arrow::field("path", arrow::utf8())})),
+   arrow::field(
+    "segments_info", arrow::struct_({arrow::field("file_name", arrow::utf8()), arrow::field("image_id", arrow::int64()), arrow::field("segments_info", arrow::list(coconut_parquet_segment_type(integer_area)))})),
+   arrow::field("image_info", arrow::struct_(
+                               {arrow::field("coco_url", arrow::utf8()), arrow::field("date_captured", arrow::utf8()), arrow::field("file_name", arrow::utf8()), arrow::field("height", arrow::int64()),
+                                arrow::field("id", arrow::int64()), arrow::field("license", arrow::int64()), arrow::field("width", arrow::int64())}))});
+}
+namespace {
+void append_value(arrow::ArrayBuilder& builder, const Json& value) {
+ if (value.is_null()) {
+  arrow_ok(builder.AppendNull());
+  return;
+ }
+ switch (builder.type()->id()) {
+  case arrow::Type::STRUCT: {
+   auto& typed = static_cast<arrow::StructBuilder&>(builder);
+   arrow_ok(typed.Append());
+   const auto type = std::static_pointer_cast<const arrow::StructType>(builder.type());
+   for (int i = 0; i < type->num_fields(); ++i) append_value(*typed.field_builder(i), value.at(type->field(i)->name()));
+   break;
+  }
+  case arrow::Type::LIST: {
+   auto& typed = static_cast<arrow::ListBuilder&>(builder);
+   arrow_ok(typed.Append());
+   for (const auto& entry : value) append_value(*typed.value_builder(), entry);
+   break;
+  }
+  case arrow::Type::INT64: arrow_ok(static_cast<arrow::Int64Builder&>(builder).Append(value.get<std::int64_t>())); break;
+  case arrow::Type::DOUBLE: arrow_ok(static_cast<arrow::DoubleBuilder&>(builder).Append(value.get<double>())); break;
+  case arrow::Type::STRING: arrow_ok(static_cast<arrow::StringBuilder&>(builder).Append(value.get<std::string>())); break;
+  case arrow::Type::BINARY: arrow_ok(static_cast<arrow::BinaryBuilder&>(builder).Append(value.get<std::string>())); break;
+  default: throw std::runtime_error("unsupported fixture type");
+ }
+}
+}  // namespace
+void write_coconut_parquet(const std::filesystem::path& path, const Json& rows, std::shared_ptr<arrow::Schema> schema,
+ std::int64_t group_rows, std::shared_ptr<parquet::ArrowWriterProperties> arrow_properties,
+ std::shared_ptr<parquet::WriterProperties> writer_properties) {
+ if (!schema) schema = coconut_parquet_schema();
+ if (!arrow_properties) arrow_properties = parquet::default_arrow_writer_properties();
+ std::vector<std::shared_ptr<arrow::Array>> columns;
+ for (const auto& field : schema->fields()) {
+  std::unique_ptr<arrow::ArrayBuilder> builder;
+  arrow_ok(arrow::MakeBuilder(arrow::default_memory_pool(), field->type(), &builder));
+  for (const auto& row : rows) append_value(*builder, row.at(field->name()));
+  std::shared_ptr<arrow::Array> column;
+  arrow_ok(builder->Finish(&column));
+  columns.push_back(std::move(column));
+ }
+ auto opened = arrow::io::FileOutputStream::Open(path.string());
+ arrow_ok(opened.status());
+ auto output = std::move(opened).ValueOrDie();
+ parquet::WriterProperties::Builder properties;
+ properties.compression(parquet::Compression::SNAPPY);
+ arrow_ok(parquet::arrow::WriteTable(
+  *arrow::Table::Make(schema, columns), arrow::default_memory_pool(), output, group_rows, writer_properties ? std::move(writer_properties) : properties.build(), std::move(arrow_properties)));
+ arrow_ok(output->Close());
+}
+
 ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t height, FixtureImageEncoding encoding, std::uint32_t seed, std::size_t byte_limit) {
  if (!width || !height || width > MAX_IMAGE_EXTENT || height > MAX_IMAGE_EXTENT) throw std::invalid_argument("profile fixture geometry is invalid");
  const auto pixels = mmltk::common::math::checked_multiply<std::size_t>(width, height, "profile synthetic extent overflow");
@@ -151,6 +234,141 @@ benchmark_internal::NormalizedAnnotationReadView pipeline_annotation_fixture(std
   }
  }
  return NormalizedAnnotationReadView(seal_normalized_annotations(std::move(builder)));
+}
+namespace {
+// Fixture values follow the native external-row vocabulary. Only the binary
+// representation is adapted to the shared writer's external JSON input.
+template<class T>
+Json parquet_fixture_value(const T& value) {
+ if constexpr (std::is_arithmetic_v<T> || std::same_as<T, std::string>) return value;
+ else if constexpr (std::same_as<T, std::vector<std::uint8_t>>) return std::string(value.begin(), value.end());
+ else if constexpr (requires { value.has_value(); }) return value ? parquet_fixture_value(*value) : Json{};
+ else if constexpr (requires { std::variant_size<T>::value; }) return std::visit([](const auto& item) { return parquet_fixture_value(item); }, value);
+ else if constexpr (requires { value.begin(); value.end(); }) {
+  auto result = Json::array();
+  for (const auto& item : value) result.push_back(parquet_fixture_value(item));
+  return result;
+ } else {
+  auto result = Json::object();
+  mmltk::frameworks::reflection::visit_materialized_members<T>([&]<class Declaration>(const auto& field) { result[field.member_name] = parquet_fixture_value(value.*Declaration::pointer); });
+  return result;
+ }
+}
+}
+struct PipelineNativeFixture::Impl {
+ std::filesystem::path path, staging;
+ std::string identity;
+ // Membership borrows these immutable entries until its own retirement.
+ std::vector<benchmark_internal::CoconutPhysicalImage> identities;
+ std::unique_ptr<benchmark_internal::CoconutPhysicalMembership> physical;
+ std::shared_ptr<const benchmark_internal::CoconutRecoveryOriginals> originals;
+ std::uint64_t workspace = 0;
+};
+PipelineNativeFixture::PipelineNativeFixture(const std::filesystem::path& directory, std::span<const ProfileImageFixture> inputs, std::span<const std::size_t> order, bool dropped)
+ : impl_(std::make_unique<Impl>()) {
+ using namespace benchmark_internal;
+ if (order.empty() || order.size() > 1024) throw std::length_error("native profile exceeds 1024 rows");
+ for (const auto position : order) if (position >= inputs.size()) throw std::out_of_range("native fixture input index");
+ fs::create_directories(directory);
+ impl_->path = directory / "native.parquet";
+ impl_->staging = directory / "native-staging";
+ std::vector<std::array<std::vector<std::uint8_t>, 2>> masks(inputs.size());
+ std::size_t mask_bytes = 0;
+ for (std::size_t i = 0; i < inputs.size(); ++i) {
+  const auto& input = inputs[i];
+  const auto pixels = mmltk::common::math::checked_multiply<std::size_t>(input.width, input.height, "native fixture extent overflow");
+  if (pixels > (64U << 20) / 3) throw std::length_error("native fixture canvas exceeds 64 MiB");
+  std::vector<std::uint8_t> rgb(pixels * 3);
+  for (unsigned foreground = 0; foreground != 2; ++foreground) {
+   if (foreground) for (std::size_t pixel = 0; pixel < pixels; ++pixel) rgb[pixel * 3] = 1;
+   auto& encoded = masks[i][foreground];
+   if (!stbi_write_png_to_func([](void* output, void* data, int count) {
+     auto& bytes = *static_cast<std::vector<std::uint8_t>*>(output);
+     const auto* first = static_cast<const std::uint8_t*>(data);
+     bytes.insert(bytes.end(), first, first + count);
+    }, &encoded, input.width, input.height, 3, rgb.data(), input.width * 3)) throw std::runtime_error("cannot encode native fixture mask");
+   mask_bytes += encoded.size();
+   if (mask_bytes > (64U << 20)) throw std::length_error("native fixture masks exceed 64 MiB");
+  }
+ }
+ NormalizedAnnotationBuilder original;
+ original.split = "train2017";
+ original.annotation_sha256 = "bounded-native-profile-originals";
+ impl_->identities.reserve(order.size());
+ auto rows = Json::array();
+ std::uint64_t encoded_bytes = 0;
+ for (std::size_t i = 0; i < order.size(); ++i) {
+  const auto& input = inputs[order[i]];
+  const auto id = i + 1;
+  const auto digits = std::to_string(id);
+  const auto stem = std::string(12 - digits.size(), '0') + digits;
+  const bool foreground = i % 4 != 0;
+  CoconutParquetRow row;
+  row.mask.bytes = masks.at(order[i])[foreground && !dropped ? 1 : 0];
+  encoded_bytes += row.mask.bytes.size();
+  if (encoded_bytes > (64U << 20)) throw std::length_error("native fixture retained rows exceed 64 MiB");
+  row.image_info = {stem + ".jpg", "http://images.cocodataset.org/train2017/" + stem + ".jpg", "2017", static_cast<std::int64_t>(id), input.height, input.width, 1};
+  row.segments_info.file_name = stem + ".png";
+  row.segments_info.image_id = id;
+  if (foreground) row.segments_info.segments_info.push_back({.id = 1, .category_id = 1, .isthing = 1, .iscrowd = 0, .ignore = 0, .area = double(input.width) * input.height});
+  rows.push_back(parquet_fixture_value(row));
+  impl_->identities.push_back({CoconutImageNamespace::CocoTrain, id, 0, "train2017/" + stem + ".jpg", "bounded-native-profile-physical"});
+  original.images.push_back({id, original.boxes.size(), foreground ? 1U : 0U, input.width, input.height, 0, 0});
+  if (foreground) {
+   NormalizedBox box;
+   box.x2 = box.y2 = 1;
+   box.mask_rle_offset = original.mask_rle_pairs.size();
+   box.mask_rle_pairs = 1;
+   box.flags = kAnnotationMask | kAnnotationId | kAnnotationCategory;
+   box.annotation_id = id + 10000;
+   box.source_category_id = 1;
+   box.source_ordinal = i;
+   box.original_area = double(input.width) * input.height;
+   original.boxes.push_back(box);
+   original.mask_rle_pairs.push_back({0, input.width * input.height});
+  }
+ }
+ const auto index = seal_normalized_annotations(std::move(original));
+ impl_->originals = std::make_shared<CoconutRecoveryOriginals>(&index, nullptr);
+ impl_->physical = std::make_unique<CoconutPhysicalMembership>(impl_->identities);
+ CoconutNativeWorkspace workspace(CoconutImportLimits{});
+ workspace.originals(impl_->originals);
+ for (std::size_t i = 0; i < order.size(); ++i) {
+  const auto& input = inputs[order[i]];
+  CoconutRecord record;
+  record.image_id = i + 1;
+  record.width = input.width;
+  record.height = input.height;
+  if (i % 4) record.segments = {{.id = 1, .category_id = 1, .isthing = true}};
+  const auto support = workspace.support_workspace_bytes(record, std::uint64_t{input.width} * input.height, record.segments.size());
+  const auto decode = workspace.decoder_workspace_bytes(masks[order[i]][i % 4 && !dropped ? 1 : 0]);
+  impl_->workspace = std::max(impl_->workspace, mmltk::common::math::checked_add<std::uint64_t>(support, decode, "native fixture workspace overflow"));
+ }
+ write_coconut_parquet(impl_->path, rows, {}, 64);
+ impl_->identity = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(impl_->path));
+}
+PipelineNativeFixture::~PipelineNativeFixture() = default;
+std::uint64_t PipelineNativeFixture::workspace_bytes() const { return impl_->workspace; }
+const std::string& PipelineNativeFixture::input_identity() const { return impl_->identity; }
+benchmark_internal::NormalizedAnnotationReadView PipelineNativeFixture::run(benchmark_internal::BenchmarkCompilePipeline& pipeline, const benchmark_internal::BenchmarkTraceSink& trace) {
+ using namespace benchmark_internal;
+ CoconutImportRequest request;
+ request.execution = &pipeline;
+ request.input_identity = impl_->identity;
+ request.parquet_shards = {impl_->path};
+ request.inventory_directory = impl_->staging;
+ request.physical_membership = impl_->physical.get();
+ request.trace = trace;
+ std::atomic<bool> ready{false};
+ detail::CompileExecution::CompletionSource originals;
+ request.originals = [&](CoconutImageNamespace, bool, std::stop_token) {
+  const bool available = ready.load();
+  return CoconutOriginalReadiness{available ? impl_->originals : nullptr, available, 1, originals.completion()};
+ };
+ request.input_finished = [&] { ready = true; originals.settle(); };
+ auto components = import_coconut_annotations(request);
+ if (components.size() != 1) throw std::runtime_error("native fixture did not produce one complete component");
+ return components.front().index();
 }
 benchmark_internal::BenchmarkTraceSink benchmark_trace() {
  if (!std::getenv("MMLTK_TEST_BENCHMARK_TRACE")) return {};

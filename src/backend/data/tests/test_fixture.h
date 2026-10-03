@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 #include "src/frameworks/reflection/reflection_metadata.h"
+namespace arrow { class Status; class DataType; class Schema; }
+namespace parquet { class ArrowWriterProperties; class WriterProperties; }
 namespace mmltk::backend::data {
 struct ImageEntry;
 struct FileHeader;
@@ -28,6 +30,13 @@ class NormalizedAnnotationReadView;
 }  // namespace benchmark_internal
 }  // namespace mmltk::backend::data
 namespace mmltk::backend::data::testsupport {
+// Arrow/Parquet definitions remain implementation dependencies for consumers
+// that only need ordinary profile fixtures. Malformed-schema tests opt in.
+void arrow_ok(const arrow::Status&);
+[[nodiscard]] std::shared_ptr<arrow::DataType> coconut_parquet_segment_type(bool integer_area);
+[[nodiscard]] std::shared_ptr<arrow::Schema> coconut_parquet_schema(bool integer_area = false);
+void write_coconut_parquet(const std::filesystem::path&, const nlohmann::json&, std::shared_ptr<arrow::Schema> = {}, std::int64_t group_rows = 1,
+ std::shared_ptr<parquet::ArrowWriterProperties> = {}, std::shared_ptr<parquet::WriterProperties> = {});
 enum class FixtureImageEncoding : std::uint8_t { Png, Jpeg };
 MMLTK_REFLECT_ENUM(FixtureImageEncoding)
 struct ProfileImageFixture {
@@ -43,6 +52,18 @@ struct ProfileImageFixture {
 [[nodiscard]] std::vector<std::vector<std::uint8_t>> retained_profile_rgb(std::span<const ProfileImageFixture>, std::size_t retained_limit, std::size_t workspace_limit);
 // Deterministic source-ordered rows: every fourth image is a background.
 [[nodiscard]] benchmark_internal::NormalizedAnnotationReadView pipeline_annotation_fixture(std::span<const ProfileImageFixture>, std::span<const std::size_t> order);
+// Bounded immutable native source/original fixtures. The production importer
+// owns scheduling, deferred recovery, staged output, and component assembly.
+class PipelineNativeFixture final {
+ struct Impl;
+ std::unique_ptr<Impl> impl_;
+public:
+ PipelineNativeFixture(const std::filesystem::path&, std::span<const ProfileImageFixture>, std::span<const std::size_t>, bool dropped);
+ ~PipelineNativeFixture();
+ [[nodiscard]] std::uint64_t workspace_bytes() const;
+ [[nodiscard]] const std::string& input_identity() const;
+ [[nodiscard]] benchmark_internal::NormalizedAnnotationReadView run(benchmark_internal::BenchmarkCompilePipeline&, const benchmark_internal::BenchmarkTraceSink&);
+};
 // Enabled only by MMLTK_TEST_BENCHMARK_TRACE for focused failure diagnosis.
 [[nodiscard]] benchmark_internal::BenchmarkTraceSink benchmark_trace();
 // Seed the mixed known/unknown Coconut extents at the reported progress boundary.

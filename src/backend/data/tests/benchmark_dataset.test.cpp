@@ -15945,3 +15945,96 @@ TEST_CASE("rolled-back archive input remains part of the complete retry demand",
  CHECK(execution.resource_usage().descriptors == 0);
  CHECK_FALSE(execution.resource_pressure());
 }
+
+TEST_CASE("ready normalized rows share bounded gathers across empty and oversized slices", "[benchmark][annotations][resources]") {
+ const bool threaded = GENERATE(false, true);
+ const bool mapped = GENERATE(false, true);
+ mmltk::testsupport::ScopedTempDir root("normalized-ready-batches");
+ NormalizedAnnotationBuilder input;
+ input.split = "train";
+ for (std::size_t i = 0; i < 321; ++i) {
+  const auto count = i == 65 ? 257U : i % 2 ? 1U : 0U;
+  input.images.push_back({i + 1, input.boxes.size(), count, 262144, 1, 0, 0});
+  for (std::size_t b = 0; b < count; ++b) {
+   NormalizedBox box;
+   box.x2 = box.y2 = 1;
+   box.annotation_id = input.boxes.size() + 1;
+   box.source_ordinal = input.boxes.size();
+   box.flags = kAnnotationId | kAnnotationMask;
+   box.mask_rle_offset = input.mask_rle_pairs.size();
+   box.mask_rle_pairs = i == 129 ? 65537 : 1;
+   for (std::size_t r = 0; r < box.mask_rle_pairs; ++r) input.mask_rle_pairs.push_back({static_cast<std::uint32_t>(r * 2), 1});
+   input.boxes.push_back(box);
+  }
+ }
+ const auto source = seal_normalized_annotations(std::move(input));
+ std::vector<NormalizedAnnotationAssembler::Slice> slices;
+ std::uint64_t validated = 0;
+ for (std::size_t i = 0; i < source.images.size(); ++i) {
+  auto row = NormalizedAnnotationAssembler::Slice::admitted(source, i, i * 1000, i % 3 == 0);
+  if (i % 2) {
+   row = {row.image, row.boxes, row.runs, row.ordinal_base, row.incomplete_ordinals};
+   for (const auto& box : row.boxes) validated += box.mask_rle_pairs;
+  }
+  slices.push_back(row);
+ }
+ CompileExecution execution(1);
+ mmltk::backend::data::detail::FileWorkQueue files(execution, 1);
+ NormalizedAnnotationAssembler assembly(source, {}, mapped ? root.path() : fs::path{});
+ nlohmann::json observation;
+ const BenchmarkTraceSink trace{CompileTraceSelection({"benchmark.annotations.gathered"}), [&](std::string_view, const nlohmann::json& value) { observation = value; }};
+ assembly.gather(slices, threaded ? &execution : nullptr, threaded ? &files : nullptr, {}, trace);
+ const auto result = assembly.finish();
+ REQUIRE(result.images.size() == source.images.size());
+ REQUIRE(result.boxes.size() == source.boxes.size());
+ REQUIRE(result.mask_rle_pairs.size() == source.mask_rle_pairs.size());
+ CHECK(std::memcmp(result.mask_rle_pairs.data(), source.mask_rle_pairs.data(), source.mask_rle_pairs.size_bytes()) == 0);
+ for (std::size_t i = 0; i < result.images.size(); ++i) {
+  CHECK(result.images[i].source_image_id == source.images[i].source_image_id);
+  CHECK(result.images[i].first_box == source.images[i].first_box);
+  for (std::size_t b = 0; b < result.images[i].box_count; ++b) {
+   const auto position = result.images[i].first_box + b;
+   auto expected = source.boxes[position];
+   expected.source_ordinal += i * 1000;
+   if (i % 3 == 0) expected.flags |= kAnnotationOrdinalIncomplete;
+   CHECK(std::memcmp(&result.boxes[position], &expected, sizeof(expected)) == 0);
+  }
+ }
+ CHECK(observation.at("tasks").get<std::size_t>() < 16);
+ CHECK(observation.at("max_images").get<std::size_t>() <= 64);
+ CHECK(observation.at("max_boxes").get<std::size_t>() <= 256);
+ CHECK(observation.at("max_runs").get<std::size_t>() <= 65536);
+ CHECK(observation.at("validated_runs") == validated);
+ REQUIRE_NOTHROW(admit_normalized_annotations(result));
+}
+TEST_CASE("held gather batches leave ready independent continuations runnable and cancellation unsealable", "[benchmark][annotations][resources]") {
+ using namespace std::chrono_literals;
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ const bool cancel = GENERATE(false, true);
+ std::atomic<bool> cancelled{false};
+ CompileExecution execution(2);
+ std::array<NormalizedAnnotationAssembler::Slice, 193> slices;
+ for (std::size_t i = 0; i < slices.size(); ++i) slices[i].image = {i + 1, 0, 0, 1, 1, 0, 0};
+ mmltk::testsupport::TestGate held("first ready batch retains one independent CPU");
+ std::promise<void> peer;
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json& fields) {
+  if (event != "benchmark.annotations.gather_batch") return;
+  if (fields.at("first_image") == 1) held.receipt().ArriveAndWait();
+  if (fields.at("first_image") == 193) mmltk::testsupport::release_test_promise(peer);
+ };
+ NormalizedAnnotationAssembler assembly({}, mmltk::common::concurrency::CancellationObservation::Atomic(cancelled), {});
+ auto gather = std::async(std::launch::async, [&] { assembly.gather(slices, &execution, nullptr, {}, trace); });
+ const mmltk::testsupport::ScopedTestCleanup release([&] { held.Release(); execution.cancel(); });
+ REQUIRE(held.WaitEntered(5s));
+ mmltk::testsupport::await_test_promise(peer, "later ready batches pass their held peer", 5s);
+ CHECK(gather.wait_for(0ms) == std::future_status::timeout);
+ if (cancel) { cancelled = true; execution.cancel(); }
+ held.Release();
+ if (cancel) {
+  CHECK_THROWS(mmltk::testsupport::await_test_future(gather, "cancelled gather joins held custody", 5s));
+  CHECK_THROWS_AS(assembly.finish(), std::logic_error);
+ } else {
+  mmltk::testsupport::await_test_future(gather, "all ready batches settle", 5s);
+  CHECK(assembly.finish().images.size() == slices.size());
+ }
+}

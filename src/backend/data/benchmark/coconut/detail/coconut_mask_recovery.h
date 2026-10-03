@@ -17,6 +17,7 @@
 #include <vector>
 namespace mmltk::backend::data::benchmark_internal {
 struct CoconutRecord;
+struct CoconutSegment;
 // A support owns mutable native runs or borrows admitted immutable originals.
 // Borrowing retains the original mapping; capacity reports only physical owned
 // storage, including cleared reusable capacity, never the borrowed span twice.
@@ -147,6 +148,7 @@ private:
 // One synchronous importer owns this mutable, capacity-retaining workspace.
 class CoconutMaskRecovery final {
 public:
+ [[nodiscard]] static bool eligible_dropped(const CoconutSegment&, const CoconutSegmentSupport&) noexcept;
  explicit CoconutMaskRecovery(const CoconutRecoveryOriginals& originals) : originals_(originals, CoconutRecoveryOriginals::Share{}) {}
  CoconutMaskRecovery(const CoconutMaskRecovery&) = delete;
  CoconutMaskRecovery& operator=(const CoconutMaskRecovery&) = delete;

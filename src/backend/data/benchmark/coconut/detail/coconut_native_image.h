@@ -47,6 +47,11 @@ struct CoconutNativeLineage {
  CoconutComponentMetadata component;
  NormalizedAnnotationMetadata index;
 };
+struct CoconutNativeObservation {
+ std::uint64_t image_id = 0, boxes = 0, runs = 0, recovered = 0;
+ bool unchanged = false;
+};
+MMLTK_REFLECT_FIELDS(CoconutNativeObservation)
 class CoconutNativeWorkspace;
 class CoconutNativeImage final {
 public:
@@ -63,7 +68,9 @@ public:
  [[nodiscard]] std::span<const NormalizedBox> boxes() const noexcept { return mapped_boxes_.empty() ? std::span<const NormalizedBox>(boxes_) : mapped_boxes_; }
  [[nodiscard]] std::span<const RLEPair> runs() const noexcept { return mapped_runs_.empty() ? std::span<const RLEPair>(runs_) : mapped_runs_; }
  [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> stage(std::shared_ptr<const CoconutNativeImage>, CoconutStaging&);
- [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> bind(std::shared_ptr<const CoconutNativeImage>, const CoconutPhysicalImage&);
+ [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> bind(
+  std::shared_ptr<const CoconutNativeImage>, const CoconutPhysicalImage&, std::shared_ptr<const CoconutNativeLineage> = {});
+ [[nodiscard]] bool can_finalize_unchanged() const noexcept { return staged_ && unchanged_payload_; }
  [[nodiscard]] static std::shared_ptr<const CoconutNativeImage> rejected(const CoconutRecord&, const CoconutPhysicalImage&, std::shared_ptr<const CoconutNativeLineage>);
  [[nodiscard]] bool required_labels_valid() const noexcept { return required_labels_valid_; }
  [[nodiscard]] const AnnotationRejectCounts& rejected() const noexcept { return rejected_; }
@@ -85,6 +92,8 @@ private:
  std::span<const RLEPair> mapped_runs_;
  std::optional<NormalizedAnnotationIndex> admitted_;
  bool staged_ = false;
+ // Constructed only by native normalization; never inferred from output emptiness.
+ bool unchanged_payload_ = false;
  bool required_labels_valid_ = true;
  AnnotationRejectCounts rejected_;
  CoconutInventoryImage inventory_;
@@ -99,6 +108,10 @@ public:
  CoconutNativeOutput() = default;
  void retain_support(std::span<const CoconutSegmentSupport>, CoconutNativeSupport&);
  [[nodiscard]] CoconutStaging::Request& request() noexcept { return request_; }
+ [[nodiscard]] std::size_t staged_bytes() const { return request_.target().size(); }
+ [[nodiscard]] std::size_t copied_bytes() const noexcept {
+  return boxes_.size_bytes() + runs_.size_bytes() + support_.size() * sizeof(CoconutNativeSupport::Segment) + support_runs_ * sizeof(RLEPair);
+ }
  void fill(mmltk::common::concurrency::CancellationObservation = {});
 
 private:

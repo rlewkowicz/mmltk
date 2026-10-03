@@ -107,6 +107,9 @@ std::uint64_t CoconutMaskRecovery::workspace_bytes(const CoconutRecord& record) 
  return checked_add(maximum, checked_multiply(std::uint64_t{record.segments.size()}, std::uint64_t{4 * (sizeof(Group) + sizeof(std::size_t))}, "COCONut recovery group workspace overflow"),
   "COCONut recovery workspace overflow");
 }
+bool CoconutMaskRecovery::eligible_dropped(const CoconutSegment& segment, const CoconutSegmentSupport& support) noexcept {
+ return segment.valid && support.valid && segment.isthing && support.area == 0 && !segment.bbox;
+}
 void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecord& record, std::uint32_t width, std::uint32_t height, std::span<CoconutSegmentSupport> support,
  CoconutRecoveryImage& facts, Cancellation cancellation) {
  if (!workspace_) workspace_.emplace(std::pmr::get_default_resource());
@@ -130,11 +133,11 @@ void CoconutMaskRecovery::apply(CoconutImageNamespace source, const CoconutRecor
  if (width == 0 || height == 0 || static_cast<std::uint64_t>(width) * height > UINT32_MAX || image.width != width || image.height != height || image.first_box > index.boxes.size() ||
      image.box_count > index.boxes.size() - image.first_box || support.size() != record.segments.size())
   return;
- const auto dropped = [&](std::size_t ordinal) { return support[ordinal].area == 0 && !record.segments[ordinal].bbox; };
+ const auto dropped = [&](std::size_t ordinal) { return eligible_dropped(record.segments[ordinal], support[ordinal]); };
  bool has_dropped = false;
  for (std::size_t ordinal = 0; ordinal < record.segments.size(); ++ordinal) {
   throw_if_benchmark_cancelled(cancellation);
-  if (record.segments[ordinal].valid && support[ordinal].valid && record.segments[ordinal].isthing && dropped(ordinal)) {
+  if (dropped(ordinal)) {
    has_dropped = true;
    break;
   }

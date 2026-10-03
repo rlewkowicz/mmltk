@@ -19,6 +19,8 @@ enum class CompactionCase : std::uint8_t { Dense, Sparse, MixedLabels };
 MMLTK_REFLECT_ENUM(CompactionCase)
 enum class ProfileInputStorage : std::uint8_t { Mapped, Pooled, Archive };
 MMLTK_REFLECT_ENUM(ProfileInputStorage)
+enum class PipelineAnnotations : std::uint8_t { Ready, Gather, DeferredClean, DeferredRecovery };
+MMLTK_REFLECT_ENUM(PipelineAnnotations)
 enum class ProfileArchivePressure : std::uint8_t { None, Arena, Bytes, Exclusive };
 MMLTK_REFLECT_ENUM(ProfileArchivePressure)
 struct Options {
@@ -35,6 +37,7 @@ struct Options {
  int warmup_runs = 1;
  int task_records = 0, output_cap_mib = 2048;
  ProfileInputStorage input_storage = ProfileInputStorage::Mapped;
+ PipelineAnnotations annotations = PipelineAnnotations::Ready;
  ProfileArchivePressure archive_pressure = ProfileArchivePressure::None;
  bool completion_gaps = false;
  ProfileMode mode = ProfileMode::Loader;

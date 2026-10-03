@@ -286,22 +286,18 @@ struct CoconutRecipeInputs {
   const DownloadProgressSink transfer_progress =
    progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { progress->transfers().update(update, *progress); }} : DownloadProgressSink{};
   std::vector<DownloadResult> results;
-  // Old v3 releases have no part caches. Probe only that layout, with ordinary
-  // nonblocking artifact admission: a held sibling immediately leaves the
-  // independent ready callbacks in charge. Modern part caches keep priority.
-  bool release_cache = false, part_cache = false;
+  // A final release avoids replaying its parts only when every cached input is
+  // immediately admitted. Held prerequisites leave independent callbacks in charge.
+  bool release_cache = false;
   const auto cache_directory = cache->source_indexes("coconut-" + std::string(release.name));
   if (shard_stream && std::filesystem::is_directory(cache_directory)) {
    for (const auto& entry : std::filesystem::directory_iterator(cache_directory)) {
     const auto name = entry.path().filename().string();
     if (!name.ends_with(".normalized.bin.complete.json")) continue;
-    if (name.find(".part-") != std::string::npos)
-     part_cache = true;
-    else
-     release_cache = true;
+    if (name.find(".part-") == std::string::npos) release_cache = true;
    }
   }
-  if (release_cache && !part_cache) {
+  if (release_cache) {
    for (const auto& request : requests) {
     auto cached = try_cached_download(request, cancellation, trace, execution, lease->allowance(), transfer_progress);
     if (!cached) {
@@ -324,6 +320,7 @@ struct CoconutRecipeInputs {
      state.complete = std::move(cached);
      state.release_cache_selected = true;
      state.parts.clear();
+     trace_benchmark_event(trace, "benchmark.annotations.release_cache_selected", [&] { return nlohmann::json{{"edition", release.edition}}; });
     } else {
      lease = state.inputs.lease ? std::move(state.inputs.lease) : ArtifactLease::acquire_charged(lifecycle, cancellation, (execution ? &execution->execution() : nullptr), coco_annotation_resources());
      for (std::size_t i = 0; i < results.size(); ++i) ready({i, results[i]});
@@ -644,7 +641,11 @@ CoconutRecipePreparation prepare_coconut_release(const BenchmarkCacheLayout& cac
   if (originals) recovery.emplace(*originals);
   return input;
  };
- const auto initial_original = refresh_original(cache_only);
+ const auto initial_original = refresh_original(false);
+ if (cache_only && original_provider && !initial_original.terminal) {
+  prepared.annotation_cache_hit = false;
+  return prepared;
+ }
  const auto acquire = [&](const CatalogArtifact& artifact, std::string_view owner, bool redownload = false) {
   if (!redownload) return retained.artifacts.at(artifact.artifact_id);
   auto request = make_download_request(cache, owner, artifact);

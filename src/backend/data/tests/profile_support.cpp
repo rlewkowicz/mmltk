@@ -30,6 +30,7 @@ std::string iteration_label(const int repetition) {
 }
 using ProfileOptions = mmltk::frameworks::reflection::CliScope<Options>;
 inline constexpr std::array profile_options{
+ MMLTK_CLI_OPTION(ProfileOptions, annotations, "Pipeline annotations: Ready, Gather, DeferredClean, DeferredRecovery", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, archive_pressure, "Archive input pressure: none, arena, bytes, exclusive", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, input_storage, "Pipeline input custody: mapped, pooled, or archive (focused bounded transport)", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, task_records, "Pipeline task records, at most 1024; zero uses production sizing", "Profiling"),
@@ -82,6 +83,8 @@ Options parse_options(int argc, char** argv) {
  if (opts.mode == ProfileMode::Coconut && (opts.cache_dir.empty() || opts.width != opts.height)) throw std::invalid_argument("coconut mode requires --cache-dir and square target dimensions");
  if (!opts.trace_prefix.empty() && opts.trace_file.empty()) throw std::invalid_argument("trace-prefix requires trace-file");
  if (!opts.input_manifest.empty() && opts.mode != ProfileMode::Pixels && opts.mode != ProfileMode::Resample) throw std::invalid_argument("retained input manifests require pixels or resample mode");
+ if (opts.annotations != PipelineAnnotations::Ready && (opts.mode != ProfileMode::Pipeline || opts.input_storage == ProfileInputStorage::Archive))
+  throw std::invalid_argument("annotation variants require Pipeline mapped or pooled input");
  const bool archive_input = opts.input_storage == ProfileInputStorage::Archive;
  if (archive_input && (opts.mode != ProfileMode::Pipeline || opts.num_images < 128 || opts.num_images > 256)) throw std::invalid_argument("archive input requires Pipeline and 128-256 members within 64 MiB");
  if (!archive_input && opts.archive_pressure != ProfileArchivePressure::None) throw std::invalid_argument("archive pressure requires archive input");

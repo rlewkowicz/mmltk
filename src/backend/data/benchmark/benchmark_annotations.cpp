@@ -4,6 +4,7 @@
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include <system_error>
+#include <deque>
 #include <sys/mman.h>
 #include "src/backend/data/benchmark/detail/benchmark_json.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
@@ -1176,12 +1177,20 @@ void NormalizedAnnotationAssembler::gather(
  auto images = mapped_ ? mapped_->images : std::span(builder_.images);
  auto output_boxes = mapped_ ? mapped_->boxes : std::span(builder_.boxes);
  auto output_runs = mapped_ ? mapped_->runs : std::span(builder_.mask_rle_pairs);
- const auto chunk = [&](std::size_t i) {
-  auto& cursor = cursors[i];
-  const auto& slice = slices[i];
-  if (cursor.complete) return;
-  std::size_t copied = 0, completed_boxes = 0;
-  while (cursor.box < slice.boxes.size() && copied < 65536 && completed_boxes < 256) {
+ constexpr std::size_t image_quantum = 64, box_quantum = 256, run_quantum = 65536;
+ struct Chunk {
+  std::size_t image = 0, boxes = 0, runs = 0;
+ };
+ struct Batch {
+  std::array<Chunk, image_quantum> chunks;
+  std::size_t count = 0, boxes = 0, runs = 0;
+ };
+ const auto chunk = [&](const Chunk& work) {
+  throw_if_benchmark_cancelled(cancellation_);
+  auto& cursor = cursors[work.image];
+  const auto& slice = slices[work.image];
+  std::size_t copied = 0;
+  for (std::size_t touched = 0; touched < work.boxes; ++touched) {
    throw_if_benchmark_cancelled(cancellation_);
    auto box = slice.boxes[cursor.box];
    const auto input = slice.runs.subspan(box.mask_rle_offset, box.mask_rle_pairs);
@@ -1192,7 +1201,7 @@ void NormalizedAnnotationAssembler::gather(
     validate_assembled_box(box, input.size(), builder_.source);
     output_boxes[cursor.first_box + cursor.box] = box;
    }
-   const auto count = std::min<std::size_t>(input.size() - cursor.run, 65536 - copied);
+   const auto count = std::min(input.size() - cursor.run, work.runs - copied);
    if (!cursor.admitted)
     for (std::size_t r = 0; r < count; ++r) cursor.previous = validate_run_value(input[cursor.run + r], std::uint64_t{slice.image.width} * slice.image.height, cursor.previous);
    if (count) std::memcpy(output_runs.data() + cursor.first_run + cursor.output_run, input.data() + cursor.run, count * sizeof(RLEPair));
@@ -1201,7 +1210,6 @@ void NormalizedAnnotationAssembler::gather(
    copied += count;
    if (cursor.run == input.size()) {
     ++cursor.box;
-    ++completed_boxes;
     cursor.run = 0;
     cursor.previous = 0;
    }
@@ -1209,44 +1217,84 @@ void NormalizedAnnotationAssembler::gather(
   if (cursor.box == slice.boxes.size()) {
    auto image = slice.image;
    image.first_box = cursor.first_box;
-   images[i] = image;
+   images[work.image] = image;
    cursor.complete = true;
   }
  };
- // Each disjoint range advances as soon as its own preceding chunk settles.
- // A held peer never creates a round barrier for ready successors.
+ // Only settled cursors enter this bounded queue. A held task retains its own
+ // rows while ready continuations and new rows fill independent task records.
+ std::deque<std::size_t> ready;
+ std::size_t next = 0;
+ const auto batch = [&] {
+  Batch result;
+  while ((!ready.empty() || next < slices.size()) && result.count < image_quantum && result.boxes < box_quantum && result.runs < run_quantum) {
+   const auto image = ready.empty() ? next++ : ready.front();
+   if (!ready.empty()) ready.pop_front();
+   const auto& cursor = cursors[image];
+   const auto& slice = slices[image];
+   Chunk work{image};
+   for (auto box = cursor.box; box < slice.boxes.size() && result.boxes + work.boxes < box_quantum && result.runs + work.runs < run_quantum; ++box) {
+    const auto remaining = slice.boxes[box].mask_rle_pairs - (box == cursor.box ? cursor.run : 0);
+    const auto count = std::min<std::size_t>(remaining, run_quantum - result.runs - work.runs);
+    ++work.boxes;
+    work.runs += count;
+    if (count != remaining) break;
+   }
+   result.chunks[result.count++] = work;
+   result.boxes += work.boxes;
+   result.runs += work.runs;
+  }
+  return result;
+ };
+ const bool observed = trace.accepts("benchmark.annotations.gathered");
+ NormalizedGatherObservation observation;
+ const auto copied = [&](const Batch& work) {
+  if (!observed) return;
+  ++observation.tasks;
+  observation.max_images = std::max<std::uint64_t>(observation.max_images, work.count);
+  observation.max_boxes = std::max<std::uint64_t>(observation.max_boxes, work.boxes);
+  observation.max_runs = std::max<std::uint64_t>(observation.max_runs, work.runs);
+ };
+ const auto perform = [&](const Batch& work) {
+  trace_benchmark_event(trace, "benchmark.annotations.gather_batch", [&] {
+   return nlohmann::json{{"first_image", slices[work.chunks[0].image].image.source_image_id}, {"images", work.count}, {"boxes", work.boxes}, {"runs", work.runs}};
+  });
+  for (const auto& item : std::span(work.chunks).first(work.count)) chunk(item);
+ };
+ const auto resume = [&](const Batch& work) {
+  for (const auto& item : std::span(work.chunks).first(work.count))
+   if (!cursors[item.image].complete) ready.push_back(item.image);
+ };
  if (execution) {
   struct Active {
-   std::size_t image;
+   Batch work;
    CompileExecution::Completion completion;
   };
   std::vector<Active> active;
   active.reserve(std::min(slices.size(), execution->workers() * 2));
-  std::size_t next = 0;
+  std::optional<Batch> pending;
   std::exception_ptr failure;
   try {
-   while (next < slices.size() || !active.empty()) {
-    const auto observed = execution->admission_generation();
+   while (next < slices.size() || !ready.empty() || pending || !active.empty()) {
+    const auto generation = execution->admission_generation();
     for (auto i = active.begin(); i != active.end();) {
      if (!i->completion.ready()) {
       ++i;
       continue;
      }
      i->completion.wait();
-     if (cursors[i->image].complete)
-      i = active.erase(i);
-     else {
-      i->completion = {};
-      ++i;
-     }
+     resume(i->work);
+     i = active.erase(i);
     }
-    while (next < slices.size() && active.size() < active.capacity()) active.push_back({next++, {}});
-    for (auto& item : active)
-     if (!item.completion) {
-      auto admitted = execution->try_submit({.kind = CompileTaskKind::Gather, .work = [&, image = item.image](std::size_t, const CompileAllowance&) { chunk(image); }, .allowance = allowance});
-      if (admitted) item.completion = std::move(*admitted);
-     }
-    if (next < slices.size() || !active.empty()) execution->wait_for_admission_change(observed);
+    while (active.size() < active.capacity() && (pending || !ready.empty() || next < slices.size())) {
+     if (!pending) pending = batch();
+     auto admitted = execution->try_submit({.kind = CompileTaskKind::Gather, .work = [&, work = *pending](std::size_t, const CompileAllowance&) { perform(work); }, .allowance = allowance});
+     if (!admitted) break;
+     copied(*pending);
+     active.push_back({*pending, std::move(*admitted)});
+     pending.reset();
+    }
+    if (next < slices.size() || !ready.empty() || pending || !active.empty()) execution->wait_for_admission_change(generation);
    }
   } catch (...) {
    failure = std::current_exception();
@@ -1258,14 +1306,22 @@ void NormalizedAnnotationAssembler::gather(
     if (!failure) failure = std::current_exception();
    }
   if (failure) std::rethrow_exception(failure);
- } else
-  for (std::size_t i = 0; i < slices.size(); ++i)
-   while (!cursors[i].complete) chunk(i);
+ } else {
+  while (!ready.empty() || next < slices.size()) {
+   const auto work = batch();
+   perform(work);
+   copied(work);
+   resume(work);
+  }
+ }
  trace_benchmark_event(trace, "benchmark.annotations.gathered", [&] {
-  std::uint64_t validated = 0;
-  for (std::size_t i = 0; i < slices.size(); ++i)
-   if (!cursors[i].admitted) validated += cursors[i].output_run;
-  return nlohmann::json{{"images", slices.size()}, {"boxes", boxes}, {"runs", runs}, {"validated_runs", validated}, {"copied_bytes", boxes * sizeof(NormalizedBox) + runs * sizeof(RLEPair)}};
+  observation.images = slices.size();
+  observation.boxes = boxes;
+  observation.runs = runs;
+  observation.copied_bytes = boxes * sizeof(NormalizedBox) + runs * sizeof(RLEPair);
+  for (const auto& cursor : cursors)
+   if (!cursor.admitted) observation.validated_runs += cursor.output_run;
+  return benchmark_observation_fields(observation);
  });
  if (mapped_) {
   mapped_->image_count = slices.size();

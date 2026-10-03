@@ -150,6 +150,11 @@ private:
  std::shared_ptr<const std::vector<std::size_t>> positions_;
  Counts counts_;
 };
+struct NormalizedGatherObservation {
+ std::uint64_t images = 0, boxes = 0, runs = 0, validated_runs = 0, copied_bytes = 0;
+ std::uint64_t tasks = 0, max_images = 0, max_boxes = 0, max_runs = 0;
+};
+MMLTK_REFLECT_FIELDS(NormalizedGatherObservation)
 // Construction and admission share each append. Only this owner can publish
 // its admitted product without a later traversal over freshly produced masks.
 class NormalizedAnnotationAssembler final {
@@ -181,7 +186,7 @@ public:
   std::size_t position_ = 0;
  };
  // Planning fixes canonical disjoint destinations before any worker writes.
- // Each task admits/copies at most 65,536 runs or 256 boxes, then yields.
+ // Each task admits/copies at most 64 images, 256 boxes and 65,536 runs.
  void gather(std::span<const Slice>, CompileExecution* = nullptr, detail::FileWorkQueue* = nullptr, const CompileAllowance& = {}, const BenchmarkTraceSink& = {});
  void begin_image(NormalizedImage);
  void append_box(NormalizedBox, std::span<const RLEPair>);

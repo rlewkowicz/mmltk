@@ -251,7 +251,7 @@ function(mmltk_add_backend_data_tests)
         mmltk_test_support
         mmltk::backend::data
         stb
-        PRIVATE LibArchive::LibArchive
+        PRIVATE LibArchive::LibArchive Arrow::arrow_static Parquet::parquet_static
     )
 
     add_executable(mmltk_backend_data_tests EXCLUDE_FROM_ALL)
