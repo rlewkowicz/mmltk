@@ -9,6 +9,7 @@ mmltk_register_public_headers(mmltk_common_types
     FILES
         workspace_buffer.h
         byte_encoding.h
+        cancellation_observation.h
         generation.h
         stable_identity.h
         string_utils.h

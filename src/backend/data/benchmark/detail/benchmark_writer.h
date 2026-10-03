@@ -24,7 +24,7 @@
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/backend/imaging/resample/image_resize.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::backend::data::detail::CompileAllowance;
 using mmltk::backend::data::detail::CompileResources;

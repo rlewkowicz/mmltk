@@ -7,7 +7,7 @@
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/detail/compile_resources.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>

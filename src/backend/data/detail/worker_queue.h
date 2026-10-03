@@ -4,7 +4,7 @@
 #include <mutex>
 #include <optional>
 #include <utility>
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
 template <class Task, class BeforeUnlock>
 [[nodiscard]] std::optional<Task> wait_pop_task(

@@ -1,6 +1,6 @@
 #pragma once
 #include "src/common/io/scoped_fd.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include <cstddef>
 #include <cstdint>
 #include <expected>

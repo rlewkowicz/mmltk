@@ -4,7 +4,7 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_input.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include "src/common/io/file_digest.h"
 #include "src/common/io/file_memory.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"

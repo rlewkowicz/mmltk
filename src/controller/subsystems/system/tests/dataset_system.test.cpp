@@ -6,7 +6,7 @@
 #include "src/controller/subsystems/system/dataset_system.h"
 #include "src/controller/services/artifact_store.h"
 #include "src/controller/services/settings/settings_system.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/tests/benchmark_http_fixture.h"
 #include "src/backend/data/tests/test_fixture.h"

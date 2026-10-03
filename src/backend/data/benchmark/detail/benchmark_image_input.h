@@ -3,7 +3,7 @@
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 #include "src/backend/data/detail/compile_resources.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include "src/common/io/file_memory.h"
 #include <array>
 #include <cstddef>

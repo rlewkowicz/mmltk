@@ -21,7 +21,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <vector>
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include "src/backend/data/detail/compile_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"

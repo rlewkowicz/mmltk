@@ -1,7 +1,7 @@
 #pragma once
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/common/io/file_memory.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include <simdjson.h>
 #include <cstddef>
 #include <cstdint>

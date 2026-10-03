@@ -6,7 +6,7 @@
 #include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/detail/file_work_queue.h"
 #include "src/backend/data/compiled/compiled_format.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include <cstddef>
 #include <chrono>
 #include <cstdint>

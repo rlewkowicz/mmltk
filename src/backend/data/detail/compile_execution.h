@@ -3,7 +3,7 @@
 #include "src/backend/data/detail/compile_execution_observer.h"
 #include "src/backend/data/detail/compile_arena_observation.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include <array>
 #include <chrono>
 #include <cstddef>

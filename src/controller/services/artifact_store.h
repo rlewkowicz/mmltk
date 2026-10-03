@@ -10,7 +10,7 @@
 #include <string_view>
 #include <utility>
 #include "src/common/concurrency/concurrency.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include "src/controller/contracts/artifact.h"
 #include "src/backend/data/catalog/class_catalog.h"
 #include "src/backend/imaging/resample/image_resize.h"

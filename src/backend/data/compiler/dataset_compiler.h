@@ -18,7 +18,7 @@
 #include "src/backend/data/catalog/class_catalog.h"
 #include <utility>
 #include <vector>
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include "src/frameworks/reflection/include/mmltk/frameworks/reflection/materializer.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/compiler/dataset_compile_phase.h"

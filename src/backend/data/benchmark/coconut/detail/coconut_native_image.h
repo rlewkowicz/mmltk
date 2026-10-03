@@ -11,7 +11,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_catalog.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include "src/backend/data/detail/compile_image_decoder.h"
 #include "src/common/system/numa_memory.h"
 #include <cstddef>

@@ -7,7 +7,7 @@
 #include <type_traits>
 #include <utility>
 #include <catch2/catch_test_macros.hpp>
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include "src/common/concurrency/event_cancellation.h"
 namespace {
 struct ObservationTestTag;

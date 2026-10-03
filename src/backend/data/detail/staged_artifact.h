@@ -1,12 +1,14 @@
 #pragma once
 #include "src/backend/data/detail/storage_reservation.h"
 #include "src/common/io/file_memory.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <map>
+#include <span>
 #include <string>
 #include <string_view>
 #include <sys/types.h>

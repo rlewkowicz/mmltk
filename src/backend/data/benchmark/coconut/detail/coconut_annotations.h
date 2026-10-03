@@ -9,7 +9,7 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_physical.h"
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/compiled/compiled_format.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include <array>
 #include <cstddef>

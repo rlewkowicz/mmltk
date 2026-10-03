@@ -7,7 +7,7 @@
 #include <string_view>
 #include <vector>
 #include "src/backend/data/benchmark/detail/benchmark_annotations.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
 using detail::CompileExecution;
 inline constexpr std::string_view kSupplementalSamplingRevision = "coco80-adaptive-objects-heavy-v2";

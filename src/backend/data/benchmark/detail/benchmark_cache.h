@@ -10,7 +10,7 @@
 #include <string_view>
 #include <utility>
 #include <nlohmann/json.hpp>
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 namespace mmltk::backend::data::detail {
 class CompileExecution;
 }

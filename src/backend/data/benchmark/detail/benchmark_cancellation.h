@@ -1,5 +1,5 @@
 #pragma once
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include <atomic>
 #include <exception>
 #include <mutex>

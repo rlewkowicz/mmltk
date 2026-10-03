@@ -3,7 +3,7 @@
 #include "src/backend/data/detail/compiled_label_workspace.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/imaging/resample/image_resize.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>

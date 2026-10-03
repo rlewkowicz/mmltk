@@ -11,7 +11,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include "src/backend/data/compiler/dataset_compile_phase.h"
 #include "src/backend/data/compiler/dataset_compile_progress.h"
 namespace mmltk::backend::data {

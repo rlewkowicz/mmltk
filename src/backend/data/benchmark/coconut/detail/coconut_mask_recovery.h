@@ -3,7 +3,7 @@
 #include "src/backend/data/benchmark/coconut/detail/coconut_inventory.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/detail/mask_rle_utils.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include <cstddef>
 #include <cstdint>
 #include <optional>

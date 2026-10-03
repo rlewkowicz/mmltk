@@ -9,7 +9,7 @@
 #include <vector>
 #include "src/backend/data/compiler/dataset_compile_progress.h"
 #include "src/backend/data/benchmark/detail/benchmark_cache.h"
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
 namespace mmltk::backend::data::benchmark_internal {

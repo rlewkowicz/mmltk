@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -15,8 +16,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
-#include "src/common/concurrency/cancellation_observation.h"
+#include "src/common/types/cancellation_observation.h"
 #include "src/backend/data/compiled/compiled_format.h"
 #include "src/backend/data/compiled/compiled_file_layout.h"
 #include "src/backend/data/catalog/class_catalog.h"

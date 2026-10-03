@@ -9,7 +9,6 @@ mmltk_register_public_headers(mmltk_common_concurrency
     FILES
         concurrency.h
         event_cancellation.h
-        cancellation_observation.h
         parallel_range.h
         worker_pool.h
 )
