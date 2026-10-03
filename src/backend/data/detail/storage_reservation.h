@@ -41,12 +41,16 @@ public:
   void withdraw_allocation();
   void resize(std::uint64_t promised, std::string_view description);
   void grow(std::uint64_t promised, std::string_view description);
+  // Commit freshly observed backing and an additional physical growth promise
+  // in one capacity transaction. Rejection preserves both previous values.
+  void reserve_growth(std::uint64_t allocated, std::uint64_t additional, std::string_view description);
   void release() noexcept;
 
  private:
   friend class StorageReservationPool;
   Reservation(std::shared_ptr<Destination>, std::uint64_t promised, std::uint64_t allocated);
   [[nodiscard]] std::uint64_t outstanding() const noexcept;
+  void replace(std::uint64_t promised, std::uint64_t allocated, std::string_view description, bool sample);
   std::shared_ptr<Destination> destination_;
   std::uint64_t promised_ = 0, allocated_ = 0;
  };

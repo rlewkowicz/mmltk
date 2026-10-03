@@ -279,9 +279,8 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
      [&] {
   layout = compact_compiled_file(fd, layout, label_blocks.index, cancellation,
    telemetry ? CompiledCompactionProgress{[&](std::size_t done, std::size_t total) { telemetry->compacting(done, total); }} : CompiledCompactionProgress{},
-   {[&](std::size_t offset, std::size_t bytes) { staged.allocate_range(offset, bytes); }, [&](std::size_t offset, std::size_t bytes) { return staged.reclaim_range(offset, bytes); },
-    [&](std::size_t bytes) { staged.resize_sparse(bytes); }},
-   compaction.workspace());
+   CompiledStorageMutation::for_artifact(staged),
+   compaction.workspace(), effective_config.observation && effective_config.observation->compaction ? CompiledCompactionObserver{[&](const auto& value) { effective_config.observation->compaction(effective_config.observation->context, value); }} : CompiledCompactionObserver{});
   mmltk::common::logging::debug([&](spdlog::logger& log) { log.debug("[compile] Layout: total={:.2f} GB", static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
   staged.allocate_range(0, compiled_align_up(sizeof(FileHeader), PAGE_SIZE));
   staged.allocate_range(layout.index_offset, compiled_align_up(layout.index_size, PAGE_SIZE));

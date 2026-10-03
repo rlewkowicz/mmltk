@@ -13382,6 +13382,129 @@ TEST_CASE("occupied allocation distinguishes overwrite and reclaimed growth", "[
  CHECK_THROWS(stage.reclaim_range(0, 4096));
  CHECK_THROWS(stage.resize_sparse(0));
 }
+TEST_CASE("staged range batches normalize coverage and preserve sibling promises", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("staged-range-batches");
+ std::uint64_t samples = 0;
+ detail::StorageReservationPool pool(root.path(), [&](const detail::StorageReservationPool::Observation& value) { samples += value.capacity_samples; });
+ auto sibling = pool.reserve(8192, "sibling output");
+ auto stage = detail::StagedArtifact::create(pool, root.path() / "batch", 0, "range batch");
+ stage.resize_sparse(32768);
+ using Range = FileHandle::Range;
+ const std::array ranges{Range{8193, 1}, Range{4097, 4096}, Range{4096, 1}};
+ std::uint64_t calls = 0;
+ const auto initial_samples = samples;
+ stage.allocate_ranges(ranges, {}, &calls);
+ CHECK(calls == 1);
+ CHECK(samples == initial_samples + 1);
+ CHECK(pool.outstanding() == 8192);
+ stage.allocate_ranges(ranges, {}, &calls);
+ CHECK(calls == 1);
+ CHECK(samples == initial_samples + 1);
+ const std::array punches{Range{8192, 4096}, Range{4096, 4096}, Range{8192, 1}};
+ const auto backed = detail::StorageReservationPool::allocated_bytes(stage.file().get());
+ const auto punched = stage.reclaim_ranges(punches, {}, &calls);
+ CHECK(calls == 2); // Adjacent and overlapping requests share one kernel punch.
+ CHECK(pool.outstanding() == 8192);
+ if (punched) CHECK(detail::StorageReservationPool::allocated_bytes(stage.file().get()) < backed);
+ CHECK(samples == initial_samples + 1);
+ stage.allocate_ranges(ranges, {}, &calls);
+ CHECK(samples == initial_samples + (punched ? 2 : 1));
+ CHECK(pool.outstanding() == 8192);
+ // A malformed trailing range is rejected before any leading syscall.
+ const auto before = calls;
+ const std::array invalid{Range{0, 4096}, Range{std::numeric_limits<std::size_t>::max(), 4096}};
+ CHECK_THROWS(stage.allocate_ranges(invalid, {}, &calls));
+ CHECK_THROWS(stage.reclaim_ranges(invalid, {}, &calls));
+ CHECK(calls == before);
+ CHECK(pool.outstanding() == 8192);
+}
+TEST_CASE("range admission rejection and partial mutations retain conservative custody", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("range-batch-failure");
+ detail::StorageReservationPool pool(root.path());
+ auto sibling = pool.reserve(8192, "sibling output");
+ using Range = FileHandle::Range;
+ const std::array ranges{Range{0, 4096}, Range{8192, 4096}};
+ std::filesystem::path temporary;
+ {
+  auto stage = detail::StagedArtifact::create(pool, root.path() / "batch", 0, "range batch");
+  temporary = stage.path();
+  stage.resize_sparse(32768);
+  std::uint64_t calls = 0;
+  SECTION("nonmutating aggregate capacity rejection") {
+   const std::array excessive{ranges[0], Range{8192, std::size_t{1} << 60}};
+   CHECK_THROWS_AS(stage.allocate_ranges(excessive, {}, &calls), detail::InsufficientStorage);
+   CHECK(calls == 0);
+   CHECK(pool.outstanding() == 8192);
+   CHECK(stage.file().size() == 32768);
+   CHECK(detail::StorageReservationPool::allocated_bytes(stage.file().get()) == 0);
+   stage.allocate_ranges(ranges, {}, &calls);
+   CHECK(calls == 2);
+   CHECK(pool.outstanding() == 8192);
+  }
+  SECTION("rejected growth preserves unreconciled backing and promises") {
+   stage = detail::StagedArtifact::create(pool, root.path() / "promised", 8192, "unreconciled stage");
+   temporary = stage.path();
+   stage.file().pwrite_all("bytes", 5, 0);
+   const auto outstanding = pool.outstanding();
+   const std::array excessive{Range{8192, std::size_t{1} << 60}};
+   CHECK_THROWS_AS(stage.allocate_ranges(excessive, {}, &calls), detail::InsufficientStorage);
+   CHECK(calls == 0);
+   CHECK(pool.outstanding() == outstanding);
+   std::array<char, 5> actual{};
+   stage.file().pread_all(actual.data(), actual.size(), 0);
+   CHECK(std::string_view(actual.data(), actual.size()) == "bytes");
+  }
+  // The real owner checks once before mutation, then once before each syscall.
+  // Stop at the second syscall to exercise partial physical success without
+  // filling a disk or introducing production failure-injection machinery.
+  struct StopSecondRange {
+   mutable unsigned checks = 0;
+   bool cancelled() const noexcept { return ++checks >= 3; }
+  } stop;
+  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(stop);
+  SECTION("partial allocation keeps the full admitted promise") {
+   CHECK_THROWS(stage.allocate_ranges(ranges, cancellation, &calls));
+   CHECK(calls == 1);
+   CHECK(detail::StorageReservationPool::allocated_bytes(stage.file().get()) >= 4096);
+   CHECK(pool.outstanding() == 8192 + 8192);
+  }
+  SECTION("partial reclamation withdraws credit until retirement") {
+   stage.allocate_range(0, 32768);
+   const auto allocated = detail::StorageReservationPool::allocated_bytes(stage.file().get());
+   try {
+    const auto supported = stage.reclaim_ranges(ranges, cancellation, &calls);
+    // An unsupported first punch is a valid completed operation, and keeps
+    // positive backing knowledge as well as the ordinary sibling accounting.
+    CHECK_FALSE(supported);
+    CHECK(calls == 1);
+    CHECK(pool.outstanding() == 8192);
+   } catch (const std::runtime_error&) {
+    CHECK(calls == 1);
+    CHECK(pool.outstanding() >= 8192 + allocated);
+   }
+  }
+ }
+ CHECK_FALSE(fs::exists(temporary));
+ CHECK(pool.outstanding() == 8192);
+}
+TEST_CASE("reclamation includes raw-written and fully preallocated staged extents", "[backend][data][benchmark][storage]") {
+ mmltk::testsupport::ScopedTempDir root("unknown-occupied-coverage");
+ detail::StorageReservationPool pool(root.path());
+ auto stage = detail::StagedArtifact::create(pool, root.path() / "batch", 8192, "raw range");
+ SECTION("raw writes") { stage.resize_sparse(8192); }
+ SECTION("whole-file preallocation") { stage.preallocate(8192); }
+ SECTION("whole-file resize") { stage.resize(8192, "full resize"); }
+ const std::array<char, 7> content{'p', 'a', 'y', 'l', 'o', 'a', 'd'};
+ stage.file().pwrite_all(content.data(), content.size(), 4096);
+ stage.reconcile();
+ std::uint64_t calls = 0;
+ const FileHandle::Range range{4096, 4096};
+ const bool supported = stage.reclaim_ranges({&range, 1}, {}, &calls);
+ CHECK(calls == 1);
+ std::array<char, 7> actual{};
+ stage.file().pread_all(actual.data(), actual.size(), 4096);
+ CHECK(actual == (supported ? std::array<char, 7>{} : content));
+}
 TEST_CASE("file output retains pinned labels until physical completion through cancellation", "[backend][data][benchmark][storage]") {
  using detail::FileWorkQueue;
  mmltk::testsupport::ScopedTempDir root("label-output-custody");

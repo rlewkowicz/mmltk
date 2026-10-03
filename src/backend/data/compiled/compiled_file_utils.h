@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include <memory>
 #include <array>
 #include <cmath>
@@ -182,16 +183,34 @@ inline void write_compiled_annotations(
  file.pwritev_all(spans, offset + (ordinal_base ? annotations.labels.size_bytes() : 0));
 }
 inline constexpr std::size_t COMPILED_COMPACTION_SCRATCH_BYTES = 4U * 1024U * 1024U;
+namespace detail { class StagedArtifact; }
 struct CompiledStorageMutation {
- std::function<void(std::size_t, std::size_t)> allocate{};
- std::function<bool(std::size_t, std::size_t)> reclaim{};
- std::function<void(std::size_t)> shrink{};
+ using Ranges = std::span<const common::io::FileHandle::Range>;
+ [[nodiscard]] static CompiledStorageMutation for_artifact(detail::StagedArtifact&);
+ std::function<void(Ranges, common::concurrency::CancellationObservation, std::uint64_t* syscalls)> allocate{};
+ std::function<bool(Ranges, common::concurrency::CancellationObservation, std::uint64_t* syscalls)> reclaim{};
+ std::function<void(std::size_t, common::concurrency::CancellationObservation, std::uint64_t* syscalls)> shrink{};
 };
+// Calls/ranges are wrapper requests; syscall counts are actual pread, pwritev,
+// fallocate and ftruncate attempts (including retries), excluding ledger stat
+// probes. Byte counters record completed copy requests, even on a failed run.
+struct CompiledCompactionObservation {
+ std::uint64_t live_bytes = 0, moved_bytes = 0, stationary_bytes = 0;
+ std::uint64_t read_calls = 0, read_bytes = 0, read_syscalls = 0, read_ns = 0;
+ std::uint64_t write_calls = 0, write_bytes = 0, write_syscalls = 0, write_ns = 0;
+ std::uint64_t allocation_calls = 0, allocation_ranges = 0, allocation_syscalls = 0, allocation_ns = 0;
+ std::uint64_t reclaim_calls = 0, reclaim_ranges = 0, reclaim_syscalls = 0, reclaim_ns = 0;
+ std::uint64_t truncate_calls = 0, truncate_syscalls = 0, truncate_ns = 0;
+ std::uint64_t scratch_high_water = 0, capacity_fallbacks = 0, duration_ns = 0;
+ bool reclaim_supported = true, failed = false;
+};
+MMLTK_REFLECT_FIELDS(CompiledCompactionObservation)
+using CompiledCompactionObserver = std::function<void(const CompiledCompactionObservation&)>;
 using CompiledCompactionProgress = std::function<void(std::size_t completed_bytes, std::size_t total_bytes)>;
 // All pixel/label borrowers must be drained. Compacts this private staged inode;
 // a failed or cancelled compaction is discarded by its existing publication owner.
 [[nodiscard]] FileLayout compact_compiled_file(const mmltk::common::io::FileHandle&, const FileLayout&, std::span<const ImageEntry>, mmltk::common::concurrency::CancellationObservation = {},
- CompiledCompactionProgress = {}, CompiledStorageMutation = {}, std::span<std::byte> scratch = {});
+ CompiledCompactionProgress = {}, CompiledStorageMutation = {}, std::span<std::byte> scratch = {}, CompiledCompactionObserver = {});
 inline catalog::ClassCatalog compiled_class_catalog(const FileHeader& header) {
  std::vector<std::string> names;
  names.reserve(header.num_classes);

@@ -907,9 +907,10 @@ TEST_CASE("compiled finalization compacts live partitions in place with bounded 
    completed = done;
    expected = total;
    if (cancel_during && done) cancelled.store(true);
-  }, {.allocate = [&](std::size_t offset, std::size_t bytes) {
+  }, {.allocate = [&](auto ranges, auto cancel, auto* calls) {
+   CHECK(calls == nullptr); // Disabled compaction observation supplies no syscall counters.
    if (fail_storage) throw std::runtime_error("compaction storage failure");
-   file.allocate_range(offset, bytes);
+   file.allocate_ranges(ranges, cancel, calls);
   }});
  };
  if (cancel_during || (fail_storage && maximum != COMPILED_LABEL_CAPACITY)) {
@@ -947,6 +948,221 @@ TEST_CASE("compiled finalization compacts live partitions in place with bounded 
  }
  std::printf("compiled_compaction_fixture staging_bytes=%zu final_bytes=%zu max_label_bytes=%zu live_bytes=%zu inode_preserved=1 scratch_limit_bytes=4194304\n", staging.total_size, layout.total_size,
   maximum, expected);
+}
+TEST_CASE("bounded compaction captures overlapping labels and full contiguous pixel windows", "[backend][data][compiler][storage]") {
+ const auto stride = GENERATE(std::size_t{12}, std::size_t{98304});
+ const auto capacity = GENERATE(std::size_t{8192}, COMPILED_LABEL_CAPACITY);
+ CAPTURE(stride, capacity);
+ const mmltk::testsupport::ScopedTempDir root("bounded-compaction-windows");
+ detail::StorageReservationPool pool(root.path());
+ auto stage = detail::StagedArtifact::create(pool, root.path() / "compiled", 0, "compaction windows");
+ constexpr std::uint32_t count = 131;
+ const auto staging = compute_file_layout(count, stride, capacity);
+ detail::CompiledSlotStorage storage(stage, staging);
+ std::vector<ImageEntry> entries(count);
+ std::vector<std::byte> expected(stride), actual(stride);
+ std::size_t live_bytes = 0;
+ const RLEPair run{0, 1};
+ const auto label_for = [](std::uint32_t slot) {
+  PackedInstance label{};
+  label.bbox_x2 = label.bbox_y2 = 1;
+  label.flags = kAnnotationMask;
+  label.mask_rle_pairs = 1;
+  label.source_ordinal = 99 + slot;
+  return label;
+ };
+ for (std::uint32_t slot = 0; slot < count; ++slot) {
+  if (slot == 0 || slot == 8 || slot == 66 || slot >= 129) continue;
+  auto& entry = entries[slot];
+  entry.status = ImageStatus::Eligible;
+  entry.original_width = entry.original_height = 1;
+  storage.prepare_pixels(slot);
+  { auto pixels = storage.pixels(slot); std::memset(pixels.data(), static_cast<int>(slot + 1), stride); }
+  if (slot % 4) {
+   set_annotation_extent(entry, 1, 1, "bounded labels");
+   stage.allocate_range(staging.label_offset(slot), entry.label_bytes);
+   const auto label = label_for(slot);
+   write_compiled_annotations(stage.file(), staging, slot, entry, {{&label, 1}, {&run, 1}});
+  }
+  live_bytes += stride + entry.label_bytes;
+ }
+ storage.quiesce();
+ stage.resize_sparse(staging.total_size);
+ // Retired bytes outside the positive slot map must still be reclaimed.
+ stage.allocate_range(staging.pixel_offset(8), PAGE_SIZE);
+ stage.file().pwrite_all("retired", 7, staging.pixel_offset(8));
+ bool pressure = false, unsupported = false;
+ SECTION("normal windows") {}
+ SECTION("single-payload headroom") { pressure = true; }
+ SECTION("unsupported reclaim") { unsupported = true; }
+ const auto old_window = std::min(COMPILED_COMPACTION_SCRATCH_BYTES, compiled_align_up(std::max(stride, std::size_t{72}), PAGE_SIZE));
+ std::vector<std::byte> scratch(COMPILED_COMPACTION_SCRATCH_BYTES);
+ CompiledCompactionObservation observed;
+ std::size_t reports = 0, rejected = 0, reclaim_requests = 0;
+ const auto compact = compact_compiled_file(stage.file(), staging, entries, {}, {},
+  {[&](auto ranges, auto cancel, auto* calls) {
+    if (pressure && (ranges.size() > 1 || ranges.front().bytes > old_window + PAGE_SIZE)) {
+     ++rejected;
+     throw detail::InsufficientStorage("fixture permits one old-size allocation");
+    }
+    stage.allocate_ranges(ranges, cancel, calls);
+   },
+   [&](auto ranges, auto cancel, auto* calls) { ++reclaim_requests; return unsupported ? false : stage.reclaim_ranges(ranges, cancel, calls); },
+   [&](std::size_t bytes, auto cancel, auto* calls) { stage.resize_sparse(bytes, calls, cancel); }}, scratch,
+  [&](const CompiledCompactionObservation& value) { ++reports; observed = value; });
+ CHECK(reports == 1);
+ CHECK_FALSE(observed.failed);
+ CHECK(observed.live_bytes == live_bytes);
+ CHECK(observed.live_bytes == observed.stationary_bytes + observed.moved_bytes);
+ CHECK(observed.read_bytes == observed.moved_bytes);
+ CHECK(observed.write_bytes == observed.moved_bytes);
+ CHECK(observed.read_syscalls >= observed.read_calls);
+ CHECK(observed.write_syscalls >= observed.write_calls);
+ CHECK(observed.allocation_ranges > observed.allocation_calls);
+ CHECK(observed.scratch_high_water <= scratch.size());
+ if (stride == 98304 && compact.block_bytes < staging.block_bytes) CHECK(observed.scratch_high_water == scratch.size());
+ CHECK(observed.capacity_fallbacks == rejected);
+ if (pressure) CHECK(rejected > 0);
+ if (unsupported) { CHECK(reclaim_requests == 1); CHECK_FALSE(observed.reclaim_supported); }
+ CHECK(compact.label_capacity == 72);
+ if (capacity == 8192) CHECK(compact.block_bytes == staging.block_bytes);
+ CHECK(stage.file().size() == compact.total_size);
+ CHECK(pool.outstanding() == 0);
+ for (std::uint32_t slot = 0; slot < count; ++slot) if (entries[slot].eligible()) {
+  std::fill(expected.begin(), expected.end(), static_cast<std::byte>(slot + 1));
+  stage.file().pread_all(actual.data(), actual.size(), compact.pixel_offset(slot));
+  CHECK(actual == expected);
+  if (entries[slot].label_bytes) {
+   std::array<std::byte, 72> payload{};
+   stage.file().pread_all(payload.data(), payload.size(), compact.label_offset(slot));
+   const auto label = label_for(slot);
+   CHECK(std::memcmp(payload.data(), &label, sizeof(label)) == 0);
+   CHECK(std::memcmp(payload.data() + annotation_layout(1, 1).run_offset, &run, sizeof(run)) == 0);
+   CHECK(std::all_of(payload.begin() + sizeof(label), payload.begin() + annotation_layout(1, 1).run_offset, [](auto byte) { return byte == std::byte{}; }));
+  }
+ }
+ if (observed.reclaim_supported) {
+  std::array<char, 7> dead{};
+  stage.file().pread_all(dead.data(), dead.size(), compact.pixel_offset(8));
+  CHECK((dead == std::array<char, 7>{}));
+ }
+}
+TEST_CASE("near-capacity label prefixes split at admitted scratch without reading padding", "[backend][data][compiler][storage]") {
+ const auto scratch_bytes = GENERATE(std::size_t{491520}, COMPILED_COMPACTION_SCRATCH_BYTES);
+ const mmltk::testsupport::ScopedTempDir root("compaction-label-windows");
+ detail::StorageReservationPool pool(root.path());
+ auto stage = detail::StagedArtifact::create(pool, root.path() / "labels", 0, "large label windows");
+ constexpr std::uint32_t count = 16;
+ const auto staging = compute_file_layout(count, 12);
+ stage.resize_sparse(staging.total_size);
+ std::vector<ImageEntry> entries(count);
+ std::vector<PackedInstance> labels(8191), actual(labels.size());
+ const auto populate = [&](std::uint32_t slot) {
+  for (std::size_t i = 0; i < labels.size(); ++i) {
+   labels[i] = {};
+   labels[i].bbox_x2 = labels[i].bbox_y2 = 1;
+   labels[i].source_ordinal = std::uint64_t{slot} * 8192 + i;
+  }
+ };
+ for (std::uint32_t slot = 0; slot < count; ++slot) {
+  auto& entry = entries[slot];
+  entry.status = ImageStatus::Eligible;
+  entry.original_width = entry.original_height = 1;
+  set_annotation_extent(entry, labels.size(), 0, "large prefix");
+  stage.allocate_range(staging.pixel_offset(slot), 12);
+  const std::array<float, 3> pixel{0.25F, 0.5F, static_cast<float>(slot)};
+  stage.file().pwrite_all(pixel.data(), sizeof(pixel), staging.pixel_offset(slot));
+  populate(slot);
+  stage.allocate_range(staging.label_offset(slot), entry.label_bytes);
+  write_compiled_annotations(stage.file(), staging, slot, entry, {labels, {}});
+ }
+ std::vector<std::byte> scratch(scratch_bytes);
+ CompiledCompactionObservation observed;
+ const auto compact = compact_compiled_file(stage.file(), staging, entries, {}, {},
+  CompiledStorageMutation::for_artifact(stage), scratch, [&](const auto& value) { observed = value; });
+ CHECK(observed.scratch_high_water <= scratch_bytes);
+ CHECK(observed.read_bytes == (count - 1) * entries.front().label_bytes);
+ CHECK(observed.write_bytes == observed.read_bytes);
+ CHECK(observed.read_calls == count - 1);
+ if (scratch_bytes == COMPILED_COMPACTION_SCRATCH_BYTES) {
+  CHECK(observed.allocation_calls == 2);
+  CHECK(observed.scratch_high_water == std::size_t{8} * entries.front().label_bytes);
+ } else CHECK(observed.allocation_calls == count - 1);
+ for (std::uint32_t slot = 0; slot < count; ++slot) {
+  populate(slot);
+  stage.file().pread_all(actual.data(), actual.size() * sizeof(PackedInstance), compact.label_offset(slot));
+  CHECK(std::memcmp(actual.data(), labels.data(), actual.size() * sizeof(PackedInstance)) == 0);
+  std::array<float, 3> pixel{};
+  stage.file().pread_all(pixel.data(), sizeof(pixel), compact.pixel_offset(slot));
+  CHECK((pixel == std::array<float, 3>{0.25F, 0.5F, static_cast<float>(slot)}));
+ }
+}
+TEST_CASE("compaction cancellation and physical errors discard only the private inode", "[backend][data][compiler][storage]") {
+ const mmltk::testsupport::ScopedTempDir root("compaction-private-failures");
+ const auto published = root.path() / "published";
+ { auto old = FileHandle::create_output(published.string(), 3); old.pwrite_all("old", 3, 0); }
+ detail::StorageReservationPool pool(root.path());
+ enum class Failure { Allocation, Write, Reclaim, CancelAllocation, CancelReclaim, CancelTruncate } failure = Failure::Allocation;
+ SECTION("partial allocation error") {}
+ SECTION("partial write error") { failure = Failure::Write; }
+ SECTION("partial reclaim error") { failure = Failure::Reclaim; }
+ SECTION("cancel after captured destination allocation") { failure = Failure::CancelAllocation; }
+ SECTION("cancel after captured-source reclamation") { failure = Failure::CancelReclaim; }
+ SECTION("cancel before final truncate") { failure = Failure::CancelTruncate; }
+ std::filesystem::path temporary;
+ CompiledCompactionObservation observed;
+ std::size_t reports = 0;
+ {
+  auto stage = detail::StagedArtifact::create(pool, published, 0, "failure fixture");
+  temporary = stage.path();
+  const auto staging = compute_file_layout(65, 12, 8192);
+  stage.resize_sparse(staging.total_size);
+  std::vector<ImageEntry> entries(staging.num_slots);
+  for (std::uint32_t slot = 0; slot < staging.num_slots; ++slot) {
+   entries[slot].status = ImageStatus::Eligible;
+   entries[slot].original_width = entries[slot].original_height = 1;
+   set_annotation_extent(entries[slot], 1, 0, "failure labels");
+   stage.allocate_range(staging.pixel_offset(slot), 12);
+   stage.allocate_range(staging.label_offset(slot), entries[slot].label_bytes);
+   const std::array<float, 3> pixel{0.25F, 0.5F, 0.75F};
+   stage.file().pwrite_all(pixel.data(), sizeof(pixel), staging.pixel_offset(slot));
+   PackedInstance label{};
+   label.bbox_x2 = label.bbox_y2 = 1;
+   write_compiled_annotations(stage.file(), staging, slot, entries[slot], {{&label, 1}, {}});
+  }
+  std::atomic<bool> cancelled{false};
+  const auto cancel = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
+  std::vector<std::byte> scratch(COMPILED_COMPACTION_SCRATCH_BYTES);
+  const auto run = [&] { return compact_compiled_file(stage.file(), staging, entries, cancel, {},
+   {[&](auto ranges, auto cancellation, auto* calls) {
+     if (failure == Failure::Allocation) { stage.allocate_ranges(ranges.first(1), cancellation, calls); throw std::runtime_error("partial allocation failure"); }
+     stage.allocate_ranges(ranges, cancellation, calls);
+     if (failure == Failure::CancelAllocation) cancelled.store(true);
+     if (failure == Failure::Write) {
+      stage.file().pwrite_all("partial", 7, ranges.front().offset);
+      stage.file() = FileHandle::open_readonly(stage.path().string());
+     }
+    },
+    [&](auto ranges, auto cancellation, auto* calls) {
+     if (failure == Failure::Reclaim) { (void)stage.reclaim_ranges(ranges.first(1), cancellation, calls); throw std::runtime_error("partial reclaim failure"); }
+     const auto supported = stage.reclaim_ranges(ranges, cancellation, calls);
+     if (failure == Failure::CancelReclaim) cancelled.store(true);
+     return supported;
+    },
+    [&](std::size_t bytes, auto cancel, auto* calls) {
+     if (failure == Failure::CancelTruncate) { cancelled.store(true); throw std::runtime_error("cancelled before truncate"); }
+     stage.resize_sparse(bytes, calls, cancel);
+    }}, scratch, [&](const auto& value) { ++reports; observed = value; }); };
+  CHECK_THROWS(run());
+  CHECK(reports == 1);
+  CHECK(observed.failed);
+  CHECK(observed.capacity_fallbacks == 0);
+ }
+ CHECK_FALSE(std::filesystem::exists(temporary));
+ CHECK(pool.outstanding() == 0);
+ std::array<char, 3> old{};
+ FileHandle::open_readonly(published.string()).pread_all(old.data(), old.size(), 0);
+ CHECK(std::string_view(old.data(), old.size()) == "old");
 }
 TEST_CASE("categorical resize agrees exactly with dense nearest-center sampling", "[backend][data][compiler][mask]") {
  using namespace mmltk::backend::data::dataset;

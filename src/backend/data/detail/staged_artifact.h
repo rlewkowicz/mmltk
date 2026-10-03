@@ -28,9 +28,11 @@ public:
  // Storage-changing operations couple the physical mutation to its promise.
  void preallocate(std::size_t bytes);
  void resize(std::size_t bytes, std::string_view description);
- void resize_sparse(std::size_t bytes);
+ void resize_sparse(std::size_t bytes, std::uint64_t* syscalls = nullptr, common::concurrency::CancellationObservation = {});
  void allocate_range(std::size_t offset, std::size_t bytes);
+ void allocate_ranges(std::span<const common::io::FileHandle::Range>, common::concurrency::CancellationObservation = {}, std::uint64_t* syscalls = nullptr);
  [[nodiscard]] bool reclaim_range(std::size_t offset, std::size_t bytes);
+ [[nodiscard]] bool reclaim_ranges(std::span<const common::io::FileHandle::Range>, common::concurrency::CancellationObservation = {}, std::uint64_t* syscalls = nullptr);
  void reconcile();
  void close();
  void publish(const std::filesystem::path& destination, mmltk::common::concurrency::CancellationObservation, Publication = Publication::DurableReplace, bool overwrite = true);
@@ -42,7 +44,8 @@ private:
  };
  void discard() noexcept;
  [[nodiscard]] std::uint64_t reconcile_locked();
- void forget_range(std::size_t begin, std::size_t end);
+ void forget_range(std::size_t begin, std::size_t end, std::map<std::size_t, std::size_t>& prepared);
+ void occupy_range(std::size_t begin, std::size_t end, std::map<std::size_t, std::size_t>& prepared);
  std::unique_ptr<Mutation> mutation_;
  StorageReservationPool::Reservation allocation_;
  std::filesystem::path path_;

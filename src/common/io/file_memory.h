@@ -1,5 +1,6 @@
 #pragma once
 #include "src/common/io/scoped_fd.h"
+#include "src/common/concurrency/cancellation_observation.h"
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -10,6 +11,7 @@
 #include <string>
 #include <sys/types.h>
 #include <system_error>
+#include <vector>
 namespace mmltk::common::io {
 [[nodiscard]] std::runtime_error errno_error(const char* action, const std::string& path = {});
 void remove_path_recursively_best_effort(const std::filesystem::path& path) noexcept;
@@ -31,17 +33,28 @@ public:
  [[nodiscard]] int get() const noexcept;
  [[nodiscard]] std::size_t size() const;
  void preallocate(std::size_t bytes) const;
- void resize_sparse(std::size_t bytes) const;
+ // A range is validated before any batch syscall, including its native offset.
+ struct Range {
+  std::size_t offset = 0, bytes = 0;
+  [[nodiscard]] std::size_t end() const;
+ };
+ enum class RangeCoverage { Exact, CoverPages };
+ [[nodiscard]] static std::vector<Range> normalize_ranges(std::span<const Range>, RangeCoverage = RangeCoverage::Exact);
+ // Optional counters count actual syscall attempts, including EINTR retries.
+ void resize_sparse(std::size_t bytes, std::uint64_t* syscalls = nullptr, concurrency::CancellationObservation = {}) const;
  void allocate_range(std::size_t offset, std::size_t bytes) const;
+ void allocate_ranges(std::span<const Range>, concurrency::CancellationObservation = {}, std::uint64_t* syscalls = nullptr) const;
  [[nodiscard]] bool punch_hole(std::size_t offset, std::size_t bytes) const;
+ // completed records successful ranges even when a later range fails.
+ [[nodiscard]] bool punch_holes(std::span<const Range>, concurrency::CancellationObservation = {}, std::uint64_t* syscalls = nullptr, std::size_t* completed = nullptr) const;
  struct WriteSpan {
   const void* data;
   std::size_t bytes;
  };
  // Checked bounded scatter/gather; inputs remain borrowed through return.
- void pwritev_all(std::span<const WriteSpan>, std::size_t offset) const;
- void pwrite_all(const void* source, std::size_t bytes, std::size_t offset) const;
- void pread_all(void* destination, std::size_t bytes, std::size_t offset) const;
+ void pwritev_all(std::span<const WriteSpan>, std::size_t offset, std::uint64_t* syscalls = nullptr, concurrency::CancellationObservation = {}) const;
+ void pwrite_all(const void* source, std::size_t bytes, std::size_t offset, std::uint64_t* syscalls = nullptr, concurrency::CancellationObservation = {}) const;
+ void pread_all(void* destination, std::size_t bytes, std::size_t offset, std::uint64_t* syscalls = nullptr, concurrency::CancellationObservation = {}) const;
  void advise(std::size_t offset, std::size_t bytes, int advice) const;
  void sync_data() const;
 

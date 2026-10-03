@@ -108,82 +108,126 @@ void StagedArtifact::resize(std::size_t bytes, std::string_view description) {
  if (bytes) file_.preallocate(bytes);
  (void)reconcile_locked();
 }
-void StagedArtifact::forget_range(std::size_t begin, std::size_t end) {
+namespace {
+// At most one split/insert node per normalized range. Allocate every node before
+// admission or destructive mutation; map node transfer below cannot allocate.
+std::map<std::size_t, std::size_t> prepare_range_nodes(std::size_t count) {
+ std::map<std::size_t, std::size_t> nodes;
+ for (std::size_t i = 0; i < count; ++i) nodes.emplace(i, 0);
+ return nodes;
+}
+}
+void StagedArtifact::forget_range(std::size_t begin, std::size_t end, std::map<std::size_t, std::size_t>& prepared) {
+ if (begin >= end) return;
  auto& ranges = mutation_->occupied;
  auto it = ranges.lower_bound(begin);
  if (it != ranges.begin() && std::prev(it)->second > begin) --it;
  while (it != ranges.end() && it->first < end) {
   const auto first = it->first, last = it->second;
-  it = ranges.erase(it);
-  if (first < begin) ranges.emplace(first, begin);
-  if (last > end) {
-   ranges.emplace(end, last);
+  if (first < begin) {
+   it->second = begin;
+   ++it;
+   if (last > end) {
+    auto node = prepared.extract(prepared.begin());
+    node.key() = end;
+    node.mapped() = last;
+    ranges.insert(std::move(node));
+    break;
+   }
+  } else if (last > end) {
+   auto node = ranges.extract(it);
+   node.key() = end;
+   ranges.insert(std::move(node));
    break;
-  }
+  } else it = ranges.erase(it);
  }
 }
-void StagedArtifact::resize_sparse(std::size_t bytes) {
- const std::lock_guard lock(mutation_->mutex);
- // Withdraw credited backing before truncate can remove it. Keep that promise
- // charged until reconciliation, including when sparse length only grows.
- allocation_.withdraw_allocation();
- file_.resize_sparse(bytes);
+void StagedArtifact::occupy_range(std::size_t begin, std::size_t end, std::map<std::size_t, std::size_t>& prepared) {
+ auto& ranges = mutation_->occupied;
+ auto it = ranges.lower_bound(begin);
+ if (it != ranges.begin() && std::prev(it)->second >= begin) --it;
+ while (it != ranges.end() && it->first <= end) {
+  begin = std::min(begin, it->first);
+  end = std::max(end, it->second);
+  it = ranges.erase(it);
+ }
+ auto node = prepared.extract(prepared.begin());
+ node.key() = begin;
+ node.mapped() = end;
+ ranges.insert(std::move(node));
+}
+void StagedArtifact::resize_sparse(std::size_t bytes, std::uint64_t* syscalls, common::concurrency::CancellationObservation cancellation) {
  const auto occupied_end = common::math::checked_add(bytes, std::size_t{4095}, "staged page extent overflow") / 4096 * 4096;
- forget_range(occupied_end, std::numeric_limits<std::size_t>::max());
+ std::map<std::size_t, std::size_t> unused;
+ const std::lock_guard lock(mutation_->mutex);
+ // Withdraw credited backing before truncate can remove it. No map allocation
+ // can fail after the physical operation, including when length only grows.
+ allocation_.withdraw_allocation();
+ file_.resize_sparse(bytes, syscalls, cancellation);
+ forget_range(occupied_end, std::numeric_limits<std::size_t>::max(), unused);
  allocation_.resize(reconcile_locked(), "sparse staged allocation");
 }
 void StagedArtifact::allocate_range(std::size_t offset, std::size_t bytes) {
- if (!bytes) return;
+ const common_io::FileHandle::Range range{offset, bytes};
+ allocate_ranges({&range, 1});
+}
+void StagedArtifact::allocate_ranges(std::span<const common_io::FileHandle::Range> input, common::concurrency::CancellationObservation cancellation, std::uint64_t* syscalls) {
  using namespace common::math;
- constexpr std::size_t page = 4096;
- const auto begin = offset / page * page;
- const auto end = checked_add(checked_add(offset, bytes, "staged extent overflow"), page - 1, "staged page extent overflow") / page * page;
+ auto normalized = common_io::FileHandle::normalize_ranges(input, common_io::FileHandle::RangeCoverage::CoverPages);
+ if (normalized.empty()) return;
  const std::lock_guard lock(mutation_->mutex);
- auto& ranges = mutation_->occupied;
- auto it = ranges.upper_bound(begin);
- if (it != ranges.begin()) {
-  auto previous = std::prev(it);
-  if (previous->second >= end) return;
+ const auto& occupied = mutation_->occupied;
+ std::size_t uncovered = 0, used = 0;
+ for (const auto& range : normalized) {
+  const auto begin = range.offset, end = range.end();
+  auto missing = range.bytes;
+  auto it = occupied.lower_bound(begin);
+  if (it != occupied.begin() && std::prev(it)->second > begin) --it;
+  for (; it != occupied.end() && it->first < end; ++it) missing -= std::min(end, it->second) - std::max(begin, it->first);
+  if (!missing) continue;
+  uncovered = checked_add(uncovered, missing, "staged uncovered extent overflow");
+  normalized[used++] = range;
  }
- // Charge only uncovered pages. All callers share this inode mutation owner,
- // including compaction destinations reusing already-backed source pages.
- std::size_t uncovered = end - begin;
- it = ranges.lower_bound(begin);
- if (it != ranges.begin() && std::prev(it)->second > begin) --it;
- for (auto scan = it; scan != ranges.end() && scan->first < end; ++scan) uncovered -= std::min(end, scan->second) - std::max(begin, scan->first);
+ normalized.resize(used);
+ if (normalized.empty()) return;
+ auto prepared = prepare_range_nodes(normalized.size());
+ if (cancellation.requested()) throw std::runtime_error("staged allocation cancelled");
  const auto allocated = StorageReservationPool::allocated_bytes(file_.get());
- allocation_.reconcile_allocated(allocated);
- allocation_.resize(checked_add(allocated, static_cast<std::uint64_t>(uncovered), "staged growth overflow"), "occupied staged extent");
- // Allocate the bookkeeping node before physical mutation; on a syscall failure
- // invalidate it and retain the outstanding promise until cleanup/reconciliation.
- auto first = begin, last = end;
- it = ranges.lower_bound(begin);
- if (it != ranges.begin() && std::prev(it)->second >= begin) --it;
- while (it != ranges.end() && it->first <= last) {
-  first = std::min(first, it->first);
-  last = std::max(last, it->second);
-  it = ranges.erase(it);
- }
- ranges.emplace(first, last);
- try {
-  file_.allocate_range(begin, end - begin);
- } catch (...) {
-  forget_range(begin, end);
-  throw;
- }
+ // Exactly one growth admission covers the batch. Rejection has not changed
+ // the file or its positive occupied-range knowledge. Unknown pages, including
+ // raw writes and legacy full preallocation, are never assumed to be holes.
+ allocation_.reserve_growth(allocated, static_cast<std::uint64_t>(uncovered), "occupied staged extent");
+ // On partial failure retain the complete promise and prior known backing;
+ // successful kernel work can only add backing. Retirement/reconcile settles it.
+ file_.allocate_ranges(normalized, cancellation, syscalls);
+ for (const auto& range : normalized) occupy_range(range.offset, range.end(), prepared);
  allocation_.resize(reconcile_locked(), "occupied staged allocation");
 }
 bool StagedArtifact::reclaim_range(std::size_t offset, std::size_t bytes) {
- if (!bytes) return true;
+ const common_io::FileHandle::Range range{offset, bytes};
+ return reclaim_ranges({&range, 1});
+}
+bool StagedArtifact::reclaim_ranges(std::span<const common_io::FileHandle::Range> input, common::concurrency::CancellationObservation cancellation, std::uint64_t* syscalls) {
+ const auto normalized = common_io::FileHandle::normalize_ranges(input);
+ if (normalized.empty()) return true;
+ auto prepared = prepare_range_nodes(normalized.size());
  const std::lock_guard lock(mutation_->mutex);
- const auto end = common::math::checked_add(offset, bytes, "staged reclaim overflow");
+ if (cancellation.requested()) throw std::runtime_error("staged reclamation cancelled");
  allocation_.withdraw_allocation();
- const auto reclaimed = file_.punch_hole(offset, bytes);
- if (reclaimed) {
-  const auto first = common::math::checked_add(offset, std::size_t{4095}, "staged reclaim page overflow") / 4096 * 4096;
-  const auto last = end / 4096 * 4096;
-  if (first < last) forget_range(first, last);
- }
+ // Keep positive knowledge for an unsupported first punch. On an error,
+ // invalidate the whole requested window conservatively (the failing syscall
+ // may itself have partially changed backing) without allocating any nodes.
+ const auto forget = [&](std::span<const common_io::FileHandle::Range> ranges) {
+  for (const auto& range : ranges) {
+   const auto first = common::math::checked_add(range.offset, std::size_t{4095}, "staged reclaim page overflow") / 4096 * 4096;
+   forget_range(first, range.end() / 4096 * 4096, prepared);
+  }
+ };
+ std::size_t completed = 0;
+ bool reclaimed;
+ try { reclaimed = file_.punch_holes(normalized, cancellation, syscalls, &completed); }
+ catch (...) { forget(normalized); throw; }
+ forget(std::span(normalized).first(completed));
  allocation_.resize(reconcile_locked(), "reclaimed staged allocation");
  return reclaimed;
 }

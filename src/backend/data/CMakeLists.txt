@@ -308,7 +308,8 @@ function(mmltk_add_backend_data_tests)
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_runner.cpp
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_support.cpp)
     mmltk_register_ordinary_sources(mmltk_backend_data_profile_runner
-        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_pipeline.cpp)
+        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_pipeline.cpp
+        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_compaction.cpp)
     mmltk_register_private_headers(mmltk_backend_data_profile_runner
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_support.h)
     target_include_directories(mmltk_backend_data_profile_runner PRIVATE

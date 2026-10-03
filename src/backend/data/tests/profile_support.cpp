@@ -32,9 +32,11 @@ using ProfileOptions = mmltk::frameworks::reflection::CliScope<Options>;
 inline constexpr std::array profile_options{
  MMLTK_CLI_OPTION(ProfileOptions, input_storage, "Pipeline input custody: mapped or pooled", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, task_records, "Pipeline task records, at most 1024; zero uses production sizing", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, output_cap_mib, "Pipeline staging/output cap, at most 2048 MiB", "Profiling"),
+ MMLTK_CLI_OPTION(ProfileOptions, output_cap_mib, "Staging/output cap: Pipeline <=2048 MiB, Compaction <=16384 MiB", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, completion_gaps, "Collect bounded completion spacing with profile.pipeline.completed selected", "Profiling"),
- MMLTK_CLI_OPTION(ProfileOptions, mode, "loader, compile (Directory STB), pixels (benchmark decode), resample (retained RGB), coconut (Stock + recovery), pipeline (bounded local benchmark)", "Profiling"),
+ MMLTK_CLI_OPTION(ProfileOptions, compaction_case, "Compaction fixture: Dense, Sparse, MixedLabels", "Profiling"),
+ MMLTK_CLI_OPTION(ProfileOptions, compaction_cold, "Sync and advise only the staged fixture out of cache before compaction", "Profiling"),
+ MMLTK_CLI_OPTION(ProfileOptions, mode, "loader, compile (Directory STB), pixels (benchmark decode), resample (retained RGB), coconut (Stock + recovery), pipeline (bounded local benchmark), compaction (bounded staged file)", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, encoding, "PNG or JPEG synthetic input", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, input_manifest, "Retained JPEG/PNG paths, one per line; pixels/resample only", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, cache_dir, "Retained production benchmark cache; required for coconut", "Profiling"),
@@ -88,7 +90,18 @@ Options parse_options(int argc, char** argv) {
   const auto layout = compute_file_layout(static_cast<std::uint32_t>(opts.num_images), stride);
   if (layout.total_size > (static_cast<std::uint64_t>(opts.output_cap_mib) << 20)) throw std::length_error("pipeline staging/output exceeds configured cap before fixture creation");
  }
+ if (opts.mode == ProfileMode::Compaction) (void)profile_compaction_layout(opts);
  return opts;
+}
+FileLayout profile_compaction_layout(const Options& opts) {
+ if (opts.num_images <= 0 || opts.num_images > 4096 || opts.width <= 0 || opts.height <= 0 || std::cmp_greater(opts.width, MAX_IMAGE_EXTENT) || std::cmp_greater(opts.height, MAX_IMAGE_EXTENT) ||
+     opts.output_cap_mib <= 0 || opts.output_cap_mib > 16384)
+  throw std::invalid_argument("compaction requires 1-4096 slots, valid dimensions, and 1-16384 MiB output cap");
+ namespace math = mmltk::common::math;
+ const auto pixels = math::checked_multiply<std::size_t>(opts.width, opts.height, "compaction pixel extent overflow");
+ const auto layout = compute_file_layout(static_cast<std::uint32_t>(opts.num_images), math::checked_multiply(pixels, 3 * sizeof(float), "compaction stride overflow"));
+ if (layout.total_size > (static_cast<std::uint64_t>(opts.output_cap_mib) << 20)) throw std::length_error("compaction staging/output exceeds configured cap before fixture creation");
+ return layout;
 }
 ProfileTrace::ProfileTrace(const std::string& path, std::vector<std::string> prefixes)
     : selection_(prefixes), selected_(!prefixes.empty()) {

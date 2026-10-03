@@ -1,5 +1,6 @@
 #pragma once
 #include "src/backend/data/compile_trace_selection.h"
+#include "src/backend/data/compiled/compiled_file_layout.h"
 #include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
@@ -12,8 +13,10 @@
 #include <string>
 #include <vector>
 namespace mmltk::backend::data::testsupport::profile {
-enum class ProfileMode : std::uint8_t { Loader, Compile, Pixels, Resample, Coconut, Pipeline };
+enum class ProfileMode : std::uint8_t { Loader, Compile, Pixels, Resample, Coconut, Pipeline, Compaction };
 MMLTK_REFLECT_ENUM(ProfileMode)
+enum class CompactionCase : std::uint8_t { Dense, Sparse, MixedLabels };
+MMLTK_REFLECT_ENUM(CompactionCase)
 enum class ProfileInputStorage : std::uint8_t { Mapped, Pooled };
 MMLTK_REFLECT_ENUM(ProfileInputStorage)
 struct Options {
@@ -32,6 +35,8 @@ struct Options {
  ProfileInputStorage input_storage = ProfileInputStorage::Mapped;
  bool completion_gaps = false;
  ProfileMode mode = ProfileMode::Loader;
+ CompactionCase compaction_case = CompactionCase::MixedLabels;
+ bool compaction_cold = false;
  FixtureImageEncoding encoding = FixtureImageEncoding::Png;
  int source_width = 0, source_height = 0;
  bool perceptual = false, mixed_geometry = false, shuffle_geometry = false;
@@ -59,5 +64,7 @@ public:
  ProfileTrace(const std::string&, std::vector<std::string>);
  [[nodiscard]] benchmark_internal::BenchmarkTraceSink sink();
 };
+[[nodiscard]] FileLayout profile_compaction_layout(const Options&);
+void run_compaction_profile(const Options&, const benchmark_internal::BenchmarkTraceSink&);
 void run_pipeline_profile(const Options&, std::span<const ProfileImageFixture>, const benchmark_internal::BenchmarkTraceSink&);
 }  // namespace mmltk::backend::data::testsupport::profile

@@ -79,33 +79,87 @@ void FileHandle::preallocate(const std::size_t bytes) const {
  do { result = ::fallocate(get(), 0, 0, length); } while (result < 0 && errno == EINTR);
  if (result != 0) resize_sparse(bytes);
 }
-void FileHandle::resize_sparse(std::size_t bytes) const {
+std::size_t FileHandle::Range::end() const {
+ using namespace mmltk::common::math;
+ const auto last = checked_add(offset, bytes, "file extent overflow");
+ (void)checked_cast<off_t>(last, "file extent overflow");
+ return last;
+}
+std::vector<FileHandle::Range> FileHandle::normalize_ranges(std::span<const Range> input, RangeCoverage coverage) {
+ std::vector<Range> ranges;
+ ranges.reserve(input.size());
+ for (auto range : input) {
+  auto end = range.end();
+  if (!range.bytes) continue;
+  if (coverage == RangeCoverage::CoverPages) {
+   constexpr std::size_t page = 4096;
+   range.offset = range.offset / page * page;
+   end = mmltk::common::math::checked_add(end, page - 1, "file page extent overflow") / page * page;
+   range.bytes = end - range.offset;
+   (void)range.end();
+  }
+  ranges.push_back(range);
+ }
+ std::sort(ranges.begin(), ranges.end(), [](const Range& a, const Range& b) { return a.offset < b.offset; });
+ std::size_t used = 0;
+ for (const auto range : ranges) {
+  if (used && range.offset <= ranges[used - 1].end()) {
+   auto& previous = ranges[used - 1];
+   previous.bytes = std::max(previous.end(), range.end()) - previous.offset;
+  } else ranges[used++] = range;
+ }
+ ranges.resize(used);
+ return ranges;
+}
+void FileHandle::resize_sparse(std::size_t bytes, std::uint64_t* syscalls, concurrency::CancellationObservation cancellation) const {
+ const auto length = mmltk::common::math::checked_cast<off_t>(bytes, "sparse file size overflow");
  int result;
- do { result = ::ftruncate(get(), mmltk::common::math::checked_cast<off_t>(bytes, "sparse file size overflow")); } while (result < 0 && errno == EINTR);
+ do {
+  if (cancellation.requested()) throw std::runtime_error("file resize cancelled");
+  if (syscalls) ++*syscalls;
+  result = ::ftruncate(get(), length);
+ } while (result < 0 && errno == EINTR);
  if (result != 0) throw errno_error("sparse file resize failed");
 }
 void FileHandle::allocate_range(std::size_t offset, std::size_t bytes) const {
- if (!bytes) return;
- (void)mmltk::common::math::checked_cast<off_t>(mmltk::common::math::checked_add(offset, bytes, "file extent overflow"), "file extent overflow");
- int result;
- do {
-  result = ::fallocate(get(), 0, mmltk::common::math::checked_cast<off_t>(offset, "allocation offset overflow"), mmltk::common::math::checked_cast<off_t>(bytes, "allocation size overflow"));
- } while (result < 0 && errno == EINTR);
- if (result != 0) throw errno_error("file extent allocation failed");
+ const Range range{offset, bytes};
+ allocate_ranges({&range, 1});
+}
+void FileHandle::allocate_ranges(std::span<const Range> ranges, concurrency::CancellationObservation cancellation, std::uint64_t* syscalls) const {
+ for (const auto& range : ranges) (void)range.end();
+ for (const auto& range : ranges) {
+  if (!range.bytes) continue;
+  int result;
+  do {
+   if (cancellation.requested()) throw std::runtime_error("file allocation cancelled");
+   if (syscalls) ++*syscalls;
+   result = ::fallocate(get(), 0, static_cast<off_t>(range.offset), static_cast<off_t>(range.bytes));
+  } while (result < 0 && errno == EINTR);
+  if (result != 0) throw errno_error("file extent allocation failed");
+ }
 }
 bool FileHandle::punch_hole(std::size_t offset, std::size_t bytes) const {
- if (!bytes) return true;
- using namespace mmltk::common::math;
- (void)checked_cast<off_t>(checked_add(offset, bytes, "hole extent overflow"), "hole extent overflow");
- int result;
- do {
-  result = ::fallocate(get(), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, checked_cast<off_t>(offset, "hole offset overflow"), checked_cast<off_t>(bytes, "hole size overflow"));
- } while (result < 0 && errno == EINTR);
- if (!result) return true;
- if (errno == EOPNOTSUPP || errno == ENOSYS) return false;
- throw errno_error("file extent reclaim failed");
+ const Range range{offset, bytes};
+ return punch_holes({&range, 1});
 }
-void FileHandle::pwritev_all(std::span<const WriteSpan> sources, std::size_t offset) const {
+bool FileHandle::punch_holes(std::span<const Range> ranges, concurrency::CancellationObservation cancellation, std::uint64_t* syscalls, std::size_t* completed) const {
+ if (completed) *completed = 0;
+ for (const auto& range : ranges) (void)range.end();
+ for (const auto& range : ranges) {
+  if (!range.bytes) { if (completed) ++*completed; continue; }
+  int result;
+  do {
+   if (cancellation.requested()) throw std::runtime_error("file reclamation cancelled");
+   if (syscalls) ++*syscalls;
+   result = ::fallocate(get(), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(range.offset), static_cast<off_t>(range.bytes));
+  } while (result < 0 && errno == EINTR);
+  if (!result) { if (completed) ++*completed; continue; }
+  if (errno == EOPNOTSUPP || errno == ENOSYS) return false;
+  throw errno_error("file extent reclaim failed");
+ }
+ return true;
+}
+void FileHandle::pwritev_all(std::span<const WriteSpan> sources, std::size_t offset, std::uint64_t* syscalls, concurrency::CancellationObservation cancellation) const {
  using namespace mmltk::common::math;
  std::size_t total = 0;
  for (const auto& source : sources) total = checked_add(total, source.bytes, "pwritev extent overflow");
@@ -123,6 +177,8 @@ void FileHandle::pwritev_all(std::span<const WriteSpan> sources, std::size_t off
    bytes += amount;
   }
   if (!count) break;
+  if (cancellation.requested()) throw std::runtime_error("file write cancelled");
+  if (syscalls) ++*syscalls;
   const auto result = ::pwritev(get(), vectors.data(), static_cast<int>(count), checked_cast<off_t>(offset, "pwritev offset overflow"));
   if (result < 0) {
    if (errno == EINTR) continue;
@@ -139,15 +195,17 @@ void FileHandle::pwritev_all(std::span<const WriteSpan> sources, std::size_t off
   consumed += completed;
  }
 }
-void FileHandle::pwrite_all(const void* source, const std::size_t bytes, const std::size_t offset) const {
+void FileHandle::pwrite_all(const void* source, const std::size_t bytes, const std::size_t offset, std::uint64_t* syscalls, concurrency::CancellationObservation cancellation) const {
  const WriteSpan span{source, bytes};
- pwritev_all({&span, 1}, offset);
+ pwritev_all({&span, 1}, offset, syscalls, cancellation);
 }
-void FileHandle::pread_all(void* destination, const std::size_t bytes, const std::size_t offset) const {
+void FileHandle::pread_all(void* destination, const std::size_t bytes, const std::size_t offset, std::uint64_t* syscalls, concurrency::CancellationObservation cancellation) const {
  using namespace mmltk::common::math;
  (void)checked_cast<off_t>(checked_add(offset, bytes, "pread extent overflow"), "pread extent overflow");
  auto* data = static_cast<std::uint8_t*>(destination);
  for (std::size_t read = 0; read < bytes;) {
+  if (cancellation.requested()) throw std::runtime_error("file read cancelled");
+  if (syscalls) ++*syscalls;
   const auto result = ::pread(get(), data + read, std::min(bytes - read, std::size_t{0x7ffff000}), checked_cast<off_t>(offset + read, "pread offset overflow"));
   if (result < 0) {
    if (errno == EINTR) continue;

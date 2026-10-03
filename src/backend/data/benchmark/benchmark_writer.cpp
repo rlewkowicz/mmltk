@@ -615,10 +615,15 @@ BenchmarkSealedSplit BenchmarkSplitWriter::seal_slots(const BenchmarkWriteReques
  trace_benchmark_event(request.trace, "benchmark.compaction.started", [&] { return nlohmann::json{{"split", request.split.name}, {"images", slots.size()}, {"bytes", state.layout.total_size}}; });
  BenchmarkCostSpan compaction_cost(
   request.trace, BenchmarkCostKind::Compaction, [&] { return nlohmann::json{{"split", request.split.name}, {"rows_revisited", index.size()}, {"bytes", state.layout.total_size}}; });
- state.layout = compact_compiled_file(state.staging.file(), state.layout, index, request.cancel_requested, request.compaction, {[&](std::size_t offset, std::size_t bytes) {
-  state.staging.allocate_range(offset, bytes);
- }, [&](std::size_t offset, std::size_t bytes) { return state.staging.reclaim_range(offset, bytes); }, [&](std::size_t bytes) { state.staging.resize_sparse(bytes); }},
-  request.compaction_scratch);
+ state.layout = compact_compiled_file(state.staging.file(), state.layout, index, request.cancel_requested, request.compaction,
+  CompiledStorageMutation::for_artifact(state.staging), request.compaction_scratch,
+  request.trace.accepts("benchmark.compaction.summary") ? CompiledCompactionObserver{[&](const auto& value) {
+   trace_benchmark_event(request.trace, "benchmark.compaction.summary", [&] {
+    auto fields = benchmark_observation_fields(value);
+    fields["split"] = request.split.name;
+    return fields;
+   });
+  }} : CompiledCompactionObserver{});
  compaction_cost.finish();
  trace_benchmark_event(request.trace, "benchmark.compaction.completed", [&] { return nlohmann::json{{"split", request.split.name}, {"images", slots.size()}, {"bytes", state.layout.total_size}}; });
  state.staging.reconcile();

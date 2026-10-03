@@ -33,6 +33,7 @@
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/io/file_digest.h"
 #include "src/backend/data/compiler/dataset_compiler.h"
+#include "src/backend/data/compiled/compiled_file_utils.h"
 #include "src/backend/data/loading/dataset_loader.h"
 #include "src/backend/data/tests/test_fixture.h"
 import mmltk.common.logging.mmltk_logging;
@@ -202,6 +203,10 @@ void run_profile_iteration(const FixtureSpec& fixture, const Options& opts, cons
     return fields;
    });
   };
+  if (trace.accepts("compile.compaction.summary")) observation.compaction = +[](void* context, const CompiledCompactionObservation& value) {
+   const auto& sink = *static_cast<benchmark_internal::BenchmarkTraceSink*>(context);
+   benchmark_internal::trace_benchmark_event(sink, "compile.compaction.summary", [&] { return benchmark_internal::benchmark_observation_fields(value); });
+  };
   ccfg.observation = &observation;
  }
  const auto compile_start = std::chrono::steady_clock::now();
@@ -249,7 +254,7 @@ int main(int argc, char** argv) {
    opts.source_height,
    opts.num_images,
   };
-  auto inputs = opts.mode == ProfileMode::Coconut ? std::vector<ProfileImageFixture>{} : profile_inputs(opts);
+  auto inputs = (opts.mode == ProfileMode::Coconut || opts.mode == ProfileMode::Compaction) ? std::vector<ProfileImageFixture>{} : profile_inputs(opts);
   if (opts.shuffle_geometry && opts.mode != ProfileMode::Pixels && opts.mode != ProfileMode::Resample && opts.mode != ProfileMode::Pipeline) {
    std::mt19937 random(1729);
    std::shuffle(inputs.begin(), inputs.end(), random);
@@ -285,6 +290,8 @@ int main(int argc, char** argv) {
     run_pixel_profile(opts, inputs, trace_sink);
    else if (opts.mode == ProfileMode::Pipeline)
     run_pipeline_profile(opts, inputs, trace_sink);
+   else if (opts.mode == ProfileMode::Compaction)
+    run_compaction_profile(opts, trace_sink);
    else if (opts.mode == ProfileMode::Coconut) {
     BenchmarkCompilerConfig config;
     config.selection = {BenchmarkDatasetVariant::Coconut, CoconutValidation::Stock, true};

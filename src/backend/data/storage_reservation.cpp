@@ -63,13 +63,13 @@ struct StorageReservationPool::Ledger {
  struct Filesystem {
   std::mutex mutex;
   std::uint64_t outstanding = 0;
-  void replace(std::uint64_t previous, std::uint64_t required, bool initial, const std::filesystem::path& probe, std::string_view description, CapacityObservation& observation) {
+  void replace(std::uint64_t previous, std::uint64_t required, bool sample, const std::filesystem::path& probe, std::string_view description, CapacityObservation& observation) {
    const std::lock_guard lock(mutex);
    const auto others = outstanding - previous;
    std::uint64_t available = 0;
    observation.capacity(required, others, 0);
-   // New reservations observe the filesystem even when all bytes are credited.
-   if (initial || required > previous) {
+   // Explicit observations also cover new reservations with fully credited bytes.
+   if (sample || required > previous) {
     // Keep every sibling promise charged across this single sample and commit.
     // Physical writes may continue, but their settlement takes this same lock.
     observation.sample();
@@ -78,7 +78,7 @@ struct StorageReservationPool::Ledger {
     if (required) check_capacity(available, others, required, description);
    }
    outstanding = common::math::checked_add(others, required, "storage reservation overflow");
-   if (initial || required <= previous) observation.capacity(required, outstanding, available);
+   if (sample || required <= previous) observation.capacity(required, outstanding, available);
   }
  };
  // Registration alone uses this mutex. Filesystem entries remain stable and
@@ -153,12 +153,19 @@ void StorageReservationPool::Reservation::withdraw_allocation() { reconcile_allo
 void StorageReservationPool::Reservation::grow(std::uint64_t promised, std::string_view description) {
  if (promised > promised_) resize(promised, description);
 }
-void StorageReservationPool::Reservation::resize(std::uint64_t promised, std::string_view description) {
+void StorageReservationPool::Reservation::resize(std::uint64_t promised, std::string_view description) { replace(promised, allocated_, description, false); }
+void StorageReservationPool::Reservation::reserve_growth(std::uint64_t allocated, std::uint64_t additional, std::string_view description) {
+ // Sampling is required even when the previous outstanding promise is larger:
+ // physical writes may have consumed it since the last backing observation.
+ replace(common::math::checked_add(allocated, additional, "staged growth overflow"), allocated, description, true);
+}
+void StorageReservationPool::Reservation::replace(std::uint64_t promised, std::uint64_t allocated, std::string_view description, bool sample) {
  if (!destination_) throw std::logic_error("cannot resize an empty storage reservation");
  CapacityObservation observation(destination_->observer, destination_->path, description);
- const auto remaining = promised > allocated_ ? promised - allocated_ : 0;
- destination_->filesystem->replace(outstanding(), remaining, false, destination_->probe, description, observation);
+ const auto remaining = promised > allocated ? promised - allocated : 0;
+ destination_->filesystem->replace(outstanding(), remaining, sample, destination_->probe, description, observation);
  promised_ = promised;
+ allocated_ = allocated;
 }
 StorageReservationPool::Reservation StorageReservationPool::reserve(std::uint64_t promised, std::string_view description, std::uint64_t allocated) {
  CapacityObservation observation(destination_->observer, destination_->path, description);
