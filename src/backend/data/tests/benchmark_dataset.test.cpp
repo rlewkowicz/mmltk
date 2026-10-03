@@ -163,6 +163,16 @@ using mmltk::backend::data::testsupport::write_benchmark_fixture;
 NormalizedAnnotationIndex fixture_index(const NormalizedAnnotationBuilder& builder) { return seal_normalized_annotation_metadata(NormalizedAnnotationBuilder(builder)); }
 const NormalizedAnnotationIndex& fixture_index(const NormalizedAnnotationIndex& index) { return index; }
 using mmltk::testsupport::require_condition;
+std::array<CompileAllowance, 2> require_protected_compile_windows(CompileExecution& execution, std::size_t bytes) {
+ using enum detail::CompileWorkspaceWindow;
+ std::array<CompileAllowance, 2> leases;
+ for (std::size_t index = 0; const auto window : std::array{SharedSource, Compaction}) {
+  auto lease = execution.try_reserve({.bytes = bytes, .supplied_workspace = true, .workspace_window = window});
+  REQUIRE(lease);
+  leases[index++] = std::move(*lease);
+ }
+ return leases;
+}
 // Call only while every available CPU is gated and no other admission mutation is in
 // flight. A new scheduler record proves this borrowed work was queued;
 // opening its producer can notify admission before the record exists.
@@ -7133,6 +7143,7 @@ TEST_CASE("admission readiness retains external returns across local rollback an
  CHECK_FALSE(execution.resource_pressure());
 }
 TEST_CASE("accepted local readiness retries after custody commits", "[backend][data][benchmark][pipeline][resources]") {
+ // CLEANUP-IGNORE: Independent readiness scenarios share only type aliases and optional-observer fixture setup; their state transitions differ.
  using Changes = CompileExecution::Readiness::Changes;
  const bool observed = GENERATE(false, true);
  CompileExecution execution(
@@ -10764,6 +10775,7 @@ TEST_CASE("aged compile demands reserve reclaimable workspace ahead of smaller w
  });
 }
 TEST_CASE("ordinary direct demands preserve age and raw eligibility across smaller work", "[backend][data][benchmark][pipeline]") {
+ // CLEANUP-IGNORE: Independent direct and queued fairness cases share only CPU eligibility and boolean parameters with different roles.
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
  const bool cancel = GENERATE(false, true);
  const bool finite = GENERATE(false, true);
@@ -10866,6 +10878,7 @@ TEST_CASE("rejected compute publication returns sole parent custody before recor
  execution.join();
  CHECK(execution.resource_usage().bytes == 0);
 }
+// CLEANUP-IGNORE: Independent constructor-failure and record-return cases share only a boolean parameter and one-page, one-record fixture configuration.
 TEST_CASE("failed deferred workspace preparation leaves admission and retirement usable", "[backend][data][benchmark][pipeline][resources]") {
  const bool direct = GENERATE(false, true);
  const auto page = mmltk::common::system::host_page_size();
@@ -12237,11 +12250,8 @@ TEST_CASE("a source larger than its reserve waits for ordinary backing without e
  CHECK(calls == 0);
  CHECK(execution.snapshot().exceptional_reserved == 0);
  // A normal wait leaves unrelated protected work eligible; an oversized drain would block it.
- auto encoded = execution.try_reserve({.bytes = page, .supplied_workspace = true, .workspace_window = CompileWorkspaceWindow::SharedSource});
- auto compact = execution.try_reserve({.bytes = page, .supplied_workspace = true, .workspace_window = CompileWorkspaceWindow::Compaction});
+ auto protected_windows = require_protected_compile_windows(execution, page);
  auto completion = execution.try_reserve({.bytes = page, .supplied_workspace = true, .completion_workspace = true, .workspace_class = CompileWorkClass::Output});
- REQUIRE(encoded);
- REQUIRE(compact);
  REQUIRE(completion);
  CHECK(execution.resource_usage().bytes == plan->budget);
  CHECK_FALSE(execution.try_reserve({.bytes = 1, .supplied_workspace = true}));
@@ -12306,10 +12316,7 @@ TEST_CASE("independent source and compaction tasks borrow ordinary arenas simult
  CHECK(execution.snapshot().active == 2);
  CHECK(execution.snapshot().leased == page * 16);
  CHECK(execution.snapshot().exceptional_reserved == 0);
- auto encoded = execution.try_reserve({.bytes = page, .supplied_workspace = true, .workspace_window = CompileWorkspaceWindow::SharedSource});
- auto compact = execution.try_reserve({.bytes = page, .supplied_workspace = true, .workspace_window = CompileWorkspaceWindow::Compaction});
- REQUIRE(encoded);
- REQUIRE(compact);
+ auto protected_windows = require_protected_compile_windows(execution, page);
  CHECK_FALSE(execution.try_reserve({.bytes = 1, .supplied_workspace = true}));
  source_entered.Release();
  compaction_entered.Release();
