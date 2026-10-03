@@ -1,7 +1,7 @@
 #pragma once  // backend.data private implementation boundary
 #include "src/backend/data/detail/compile_observation.h"
 #include "src/backend/data/compile_trace_selection.h"
-#include "src/backend/data/detail/compile_execution.h"
+#include "src/backend/data/detail/compile_execution_observer.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include <concepts>
 #include <cstdint>
@@ -18,7 +18,7 @@ struct CompileExecutionSnapshot;
 namespace mmltk::backend::data::benchmark_internal {
 // A null value reports diagnostic construction failure; it is never product state.
 using BenchmarkTraceSink = CompileTraceSink<const nlohmann::json&>;
-[[nodiscard]] detail::CompileExecution::Observer observe_compile_execution(const BenchmarkTraceSink&, std::string_view reservation_event = "benchmark.resource.wait");
+[[nodiscard]] detail::CompileExecutionObserver observe_compile_execution(const BenchmarkTraceSink&, std::string_view reservation_event = "benchmark.resource.wait");
 void trace_compile_execution(const BenchmarkTraceSink&, std::string_view, const detail::CompileExecutionSnapshot&) noexcept;
 template <class Observation>
 [[nodiscard]] nlohmann::json benchmark_observation_fields(const Observation& observation) {

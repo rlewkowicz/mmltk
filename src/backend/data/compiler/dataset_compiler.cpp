@@ -26,6 +26,7 @@ import mmltk.common.logging.profile_utils;
 #include "src/backend/data/detail/staged_artifact.h"
 #include "src/backend/data/detail/compiled_slot_storage.h"
 #include "src/backend/data/detail/file_work_queue.h"
+#include "src/backend/data/detail/compile_execution.h"
 #include "src/backend/data/detail/compile_workspace.h"
 namespace mmltk::backend::data {
 using mmltk::common::io::FileHandle;
@@ -253,7 +254,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
  detail::CompileExecutionLimits limits;
  limits.workspace_plan = std::make_shared<detail::CompileWorkspacePlan>(detail::compile_workspace_plan(static_cast<std::size_t>(configured_workers),
   {width, height, effective_config.resize_mode, effective_config.perceptual_downscale}, classes, {label_window, label_window}, 0, compiler_internal::directory_encoded_window));
- detail::CompileExecution::Observer observer;
+ detail::CompileExecutionObserver observer;
  if (effective_config.observation && effective_config.observation->execution)
   observer = {effective_config.observation->execution_demand, [&](std::string_view event, const detail::CompileExecutionSnapshot& snapshot) { effective_config.observation->execution(effective_config.observation->context, event, snapshot); }};
  detail::CompileExecution execution(

@@ -43,7 +43,7 @@ public:
   bool failed = false;
  };
  // Optional effects only, delivered outside queue/admission locks on callers
- // and service workers. Counters and clocks stay disabled with no observer.
+ // and service workers. Counters and clocks require selected file events.
  using Observer = CompileTraceSink<const Observation&>;
  struct RuntimeReadiness {
   void* context = nullptr;
@@ -88,6 +88,8 @@ public:
  // Compile callers capture admission_generation before this predicate and wait
  // on that observation; capacity return and cancellation notify the execution.
  [[nodiscard]] bool has_capacity() const;
+ // The installed selection determines whether producers need operation bytes.
+ [[nodiscard]] bool observes_operation_bytes() const noexcept;
  [[nodiscard]] CompileExecution::Completion submit(Operation);
  // A synchronous consumer inside a compile file callback lends its dispatcher
  // to queued physical work while waiting, retaining the callback's own record.

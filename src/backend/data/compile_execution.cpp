@@ -320,7 +320,7 @@ struct CompileExecution::Impl {
  std::exception_ptr cancellation_error = std::make_exception_ptr(std::runtime_error("dataset compilation cancelled"));
  const std::exception_ptr retired = std::make_exception_ptr(std::runtime_error("compile work retired before completion"));
  mmltk::common::concurrency::CancellationObservation cancellation;
- Observer observer;
+ CompileExecutionObserver observer;
  mmltk::common::io::ScopedFd event;
  std::jthread notifier;
  std::unique_ptr<mmltk::common::concurrency::WorkerPool> pool;
@@ -1068,7 +1068,7 @@ void CompileExecution::Impl::events() noexcept {
  }
 }
 CompileExecution::CompileExecution(std::size_t workers, std::span<const int> eligible, CompileExecutionLimits limits, mmltk::common::concurrency::CancellationObservation cancellation,
- Observer observer, std::exception_ptr cancellation_error)
+ CompileExecutionObserver observer, std::exception_ptr cancellation_error)
     : impl_(std::make_shared<Impl>()) {
  auto& state = *impl_;
  workers = std::max<std::size_t>(1, workers);

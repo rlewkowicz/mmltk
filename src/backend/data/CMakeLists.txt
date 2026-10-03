@@ -169,6 +169,7 @@ mmltk_register_private_headers(mmltk_backend_data
     detail/compiled_label_workspace.h
     detail/compile_progress_delivery.h
     detail/compile_execution.h
+    detail/compile_execution_observer.h
     detail/compile_resources.h
     detail/compile_admission.h
     detail/file_work_queue.h
@@ -309,8 +310,7 @@ function(mmltk_add_backend_data_tests)
     mmltk_register_ordinary_sources(mmltk_backend_data_profile_runner
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_pipeline.cpp)
     mmltk_register_private_headers(mmltk_backend_data_profile_runner
-        BASE_DIRS ${CMAKE_SOURCE_DIR}
-        FILES ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_support.h)
+        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/profile_support.h)
     target_include_directories(mmltk_backend_data_profile_runner PRIVATE
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests
     )
@@ -322,4 +322,5 @@ function(mmltk_add_backend_data_tests)
         mmltk_backend_data_test_support
         CUDA::cudart
     )
+    mmltk_register_header_isolation(mmltk_backend_data_profile_runner)
 endfunction()

@@ -40,9 +40,6 @@ MMLTK_REFLECT_FIELDS(PipelineObservation)
 namespace {
 detail::FileWorkQueue::Observer observe_files(const BenchmarkTraceSink& trace, std::string_view service) {
  if (!trace) return {};
- // No clocks or queue scans for an unrelated installed trace.
- if (!trace.accepts("file.service.started") && !trace.accepts("file.service.stopped") && !trace.accepts("file.admitted") && !trace.accepts("file.running") &&
-     !trace.accepts("file.physical_completed") && !trace.accepts("file.completed") && !trace.accepts("file.wait_cpu") && !trace.accepts("file.wait_records")) return {};
  return {trace.selection(), [trace, service](std::string_view event, const detail::FileWorkQueue::Observation& value) {
   trace_benchmark_event(trace, event, [&] {
    auto fields = benchmark_observation_fields(value);
@@ -1380,7 +1377,7 @@ bool BenchmarkCompilePipeline::Impl::submit_pixel(Job& job) {
    }
   },
     .service_class = stage == PixelStage::Input ? CompileWorkClass::Extraction : CompileWorkClass::Pixels,
-    .bytes = (trace.accepts("file.physical_completed") || trace.accepts("file.completed") || trace.accepts("file.service.stopped")) && stage == PixelStage::Input ? slot.writer->pixel_input_bytes(*slot.input) : 0});
+    .bytes = image_files.observes_operation_bytes() && stage == PixelStage::Input ? slot.writer->pixel_input_bytes(*slot.input) : 0});
   job.handle = std::move(task);
   return true;
  }

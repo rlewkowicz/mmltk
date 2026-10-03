@@ -15,6 +15,15 @@
 namespace mmltk::backend::data::detail {
 struct FileWorkQueue::Impl {
  static thread_local Impl* current;
+ // Physical/completed/stopped reports carry body and callback totals. Running
+ // alone needs the operation's identity and bytes without collecting clocks.
+ struct ObservationDemand {
+  bool timing, operation_bytes, counts;
+  explicit ObservationDemand(const Observer& observer)
+      : timing(observer.accepts("file.physical_completed") || observer.accepts("file.completed") || observer.accepts("file.service.stopped")),
+        operation_bytes(timing || observer.accepts("file.running")),
+        counts(operation_bytes || observer.accepts("file.service.started") || observer.accepts("file.admitted") || observer.accepts("file.wait_cpu") || observer.accepts("file.wait_records")) {}
+ };
  enum class State { Free, Reserved, Queued, Waiting, Running, Completing };
  struct Record {
   Operation operation;
@@ -46,11 +55,11 @@ struct FileWorkQueue::Impl {
  std::size_t service_capacity = 0, busy_services = 0;
  std::uint64_t generation = 0;
  bool stopping = false, shutdown = false;
- Observer observer;
+ const Observer observer;
+ const ObservationDemand observation_demand;
  std::uint64_t admitted = 0, completed = 0;
  Observation totals;
- bool timing = false;
- explicit Impl(std::size_t capacity) : records(capacity) {
+ explicit Impl(std::size_t capacity, Observer sink = {}) : records(capacity), observer(std::move(sink)), observation_demand(observer) {
   if (!capacity) throw std::invalid_argument("file queue requires prepared records");
  }
  void observe(std::string_view event) noexcept {
@@ -118,7 +127,7 @@ struct FileWorkQueue::Impl {
   cursor = (index + 1) % records.size();
  }
  void finish(std::size_t index, std::exception_ptr error, Observation value = {}) noexcept {
-  CompileObservationClock callback_clock{timing};
+  CompileObservationClock callback_clock{observation_demand.timing};
   auto operation = std::move(records[index].operation);
   const auto observation = records[index].observation;
   auto completion = records[index].completion;
@@ -133,7 +142,7 @@ struct FileWorkQueue::Impl {
   auto* const context = operation.context;
   operation = {};
   if (!runtime_readiness.available) completion.settle(error);
-  if (timing) {
+  if (observation_demand.timing) {
    value.callback_ns = callback_clock.elapsed();
    if (!value.operation) value.queue_ns = records[index].queued_at.elapsed();
   }
@@ -144,8 +153,8 @@ struct FileWorkQueue::Impl {
    if (!--class_pending[service_class]) producers[service_class].reset();
    if (runtime_readiness.available) ++notifying;
    ++generation;
-   if (observer) ++completed;
-   if (timing) {
+   if (observation_demand.counts) ++completed;
+   if (observation_demand.timing) {
     totals.total_bytes += value.bytes;
     totals.total_queue_ns += value.queue_ns;
     totals.total_physical_ns += value.duration_ns;
@@ -177,12 +186,12 @@ struct FileWorkQueue::Impl {
   std::exception_ptr error;
   std::optional<Observation> observation;
   std::optional<CompileObservationBody> body;
-  if (timing || observer.accepts("file.running")) {
+  if (observation_demand.operation_bytes) {
    observation.emplace();
    observation->operation = records[index].observation;
    observation->bytes = records[index].operation.bytes;
    observation->work_class = records[index].operation.service_class;
-   if (timing) observation->queue_ns = records[index].queued_at.elapsed();
+   if (observation_demand.timing) observation->queue_ns = records[index].queued_at.elapsed();
   }
   try {
    if (grant) mmltk::common::system::set_thread_affinity({grant->cpu()});
@@ -194,7 +203,7 @@ struct FileWorkQueue::Impl {
     records[index].state = State::Running;
    }
    if (observation) observe("file.running", *observation);
-   if (timing) body.emplace(true);
+   if (observation_demand.timing) body.emplace(true);
    if (records[index].operation.work)
     records[index].operation.work();
    else
@@ -288,12 +297,10 @@ struct FileWorkQueue::Impl {
  }
 };
 thread_local FileWorkQueue::Impl* FileWorkQueue::Impl::current = nullptr;
-FileWorkQueue::FileWorkQueue(CompileExecution& execution, std::size_t records, std::size_t services, Observer observer) : impl_(std::make_shared<Impl>(records)) {
+FileWorkQueue::FileWorkQueue(CompileExecution& execution, std::size_t records, std::size_t services, Observer observer) : impl_(std::make_shared<Impl>(records, std::move(observer))) {
  if (!services || services > execution.workers()) throw std::invalid_argument("file service capacity exceeds compile CPU budget");
  impl_->execution = &execution;
  impl_->service_capacity = services;
- impl_->observer = std::move(observer);
- impl_->timing = impl_->observer.accepts("file.physical_completed") || impl_->observer.accepts("file.completed") || impl_->observer.accepts("file.service.stopped");
  impl_->demand = std::make_unique<CompileExecution::ServiceDemand>(execution);
  impl_->readiness = std::make_unique<CompileExecution::Readiness>(execution, CompileChange::None, [weak = std::weak_ptr<Impl>(impl_)](CompileExecution::Readiness::Changes) {
   if (auto owner = weak.lock()) {
@@ -435,8 +442,8 @@ CompileExecution::Completion FileWorkQueue::Reservation::submit(Operation operat
    throw;
   }
  }
- if (owner->observer) record.observation = ++owner->admitted;
- record.queued_at = CompileObservationClock(owner->timing);
+ if (owner->observation_demand.counts) record.observation = ++owner->admitted;
+ if (owner->observation_demand.timing) record.queued_at = CompileObservationClock(true);
  ++owner->queued[static_cast<std::size_t>(record.work_class)];
  owner->update_demand();
  ++owner->generation;
@@ -457,6 +464,7 @@ bool FileWorkQueue::has_capacity() const {
  impl_->check_admission();
  return impl_->pending < impl_->records.size();
 }
+bool FileWorkQueue::observes_operation_bytes() const noexcept { return impl_->observation_demand.operation_bytes; }
 CompileExecution::Completion FileWorkQueue::submit(Operation operation) {
  if (impl_->execution && impl_->execution->on_lane()) throw std::logic_error("blocking file admission inside a compile lane");
  for (;;) {

@@ -56,6 +56,7 @@
 #include <sys/ioctl.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 #include "src/test_support/async_test_utils.hpp"
 #include "src/common/io/staging_directory.h"
@@ -2439,6 +2440,17 @@ TEST_CASE("selected rejection snapshots retain parked resource demand facts", "[
  execution.join();
 }
 TEST_CASE("execution reservation demand selects the final adapter event", "[backend][data][benchmark][trace][resources]") {
+ const std::function<void(std::string_view, const detail::CompileExecutionSnapshot&)> empty;
+ const detail::CompileExecutionObserver disabled{detail::CompileExecutionObservationDemand::all(), empty};
+ CHECK_FALSE(disabled);
+ CHECK_FALSE(disabled.demand().any());
+ const detail::CompileExecutionObserver full{[](std::string_view, const detail::CompileExecutionSnapshot&) {}};
+ CHECK(full.demand().aggregates);
+ CHECK(full.demand().snapshots);
+ CHECK(full.demand().record_rejections);
+ CHECK(full.demand().continuation_rejections);
+ CHECK(full.demand().reservations);
+ CHECK(full.demand().retired);
  const BenchmarkTraceSink sink{CompileTraceSelection({"benchmark.resource.wait"}), [](std::string_view, const nlohmann::json&) {}};
  const auto benchmark = observe_compile_execution(sink);
  CHECK(benchmark.demand().reservations);
@@ -7223,7 +7235,7 @@ TEST_CASE("admission readiness retains external returns across local rollback an
  using Changes = CompileExecution::Readiness::Changes;
  using mmltk::backend::data::detail::CompileWorkClass;
  CompileExecution execution(
-  1, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? CompileExecution::Observer{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : CompileExecution::Observer{});
+  1, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
  auto parent = execution.reserve(CompileResources::handles(0, false, 2));
  auto external = execution.reserve(CompileResources::handles(5));
  mmltk::testsupport::TestGate initial("hold readiness before partial admission"), failed("last descriptor draw failed before rollback"), delivering("hold acknowledged readiness batch");
@@ -7296,7 +7308,7 @@ TEST_CASE("admission readiness retains external returns across local rollback an
 TEST_CASE("one armed event turn retains coalesced causes and callback arrivals", "[backend][data][benchmark][pipeline][resources][trace]") {
  using Changes = CompileExecution::Readiness::Changes;
  detail::CompileExecutionSnapshot retired;
- const CompileExecution::ObservationDemand demand{.aggregates = true, .retired = true};
+ const detail::CompileExecutionObservationDemand demand{.aggregates = true, .retired = true};
  {
   CompileExecution execution(1, {}, {.transient_bytes = 4096}, {}, {demand, [&](std::string_view event, const detail::CompileExecutionSnapshot& value) {
    if (event == "compile.execution.retired") retired = value;
@@ -7366,7 +7378,7 @@ TEST_CASE("accepted local readiness retries after custody commits", "[backend][d
  using Changes = CompileExecution::Readiness::Changes;
  const bool observed = GENERATE(false, true);
  CompileExecution execution(
-  1, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? CompileExecution::Observer{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : CompileExecution::Observer{});
+  1, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
  mmltk::testsupport::TestGate initial("hold readiness before accepted draw"), delivering("local changes acknowledged before custody commits");
  std::promise<Changes> drawn, committed, external;
  unsigned deliveries = 0;
@@ -7419,7 +7431,7 @@ TEST_CASE("readiness preserves pending interests and implicitly delivers interru
  using Changes = CompileExecution::Readiness::Changes;
  const bool observed = GENERATE(false, true);
  CompileExecution execution(
-  1, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? CompileExecution::Observer{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : CompileExecution::Observer{});
+  1, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
  mmltk::testsupport::TestGate initial("hold notifier before changing interests"), delivering("hold prior interest batch during targeted publication");
  std::promise<Changes> pending, targeted, interrupted;
  unsigned deliveries = 0;
@@ -7464,7 +7476,7 @@ TEST_CASE("compile readiness routes resource epochs records and owner publicatio
  const bool observed = GENERATE(false, true);
  const bool descriptors = GENERATE(false, true);
  CompileExecution execution(
-  1, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? CompileExecution::Observer{[](std::string_view, const CompileExecutionSnapshot&) {}} : CompileExecution::Observer{});
+  1, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? detail::CompileExecutionObserver{[](std::string_view, const CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
  auto acquisition = execution.open_class(CompileWorkClass::Acquisition);
  auto held = execution.reserve(descriptors ? CompileResources{0, 8} : CompileResources{64, 0});
  auto blocked = execution.submit({.kind = CompileTaskKind::Normalize, .resources = descriptors ? CompileResources{0, 1} : CompileResources{1, 0}, .work = [](std::size_t, const CompileAllowance&) {}});
@@ -11608,7 +11620,7 @@ TEST_CASE("external workspace retirement delivers every returned resource to que
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
  const bool observed = GENERATE(false, true);
  CompileExecution execution(
-  2, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? CompileExecution::Observer{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : CompileExecution::Observer{});
+  2, {}, {.transient_bytes = 64, .descriptors = 8}, {}, observed ? detail::CompileExecutionObserver{[](std::string_view, const detail::CompileExecutionSnapshot&) {}} : detail::CompileExecutionObserver{});
  auto external = execution.reserve({.bytes = 64, .descriptors = 1, .cpu_workers = 1});
  auto alias = external;
  auto acquisition = execution.open_class(CompileWorkClass::Acquisition);
@@ -12009,6 +12021,114 @@ TEST_CASE("borrowed file demand observes notifying and legacy cancellation throu
  physical.Release();
  peer.wait();
 }
+TEST_CASE("file observation demand follows independently selected endpoints", "[backend][data][benchmark][pipeline][trace]") {
+ using detail::FileWorkQueue;
+ const std::string selected = GENERATE("", "benchmark.unrelated", "file.", "file.service.started", "file.service.stopped", "file.admitted", "file.running", "file.physical_completed", "file.completed", "file.wait_cpu", "file.wait_records");
+ const bool throwing = GENERATE(false, true);
+ CAPTURE(selected, throwing);
+ const bool full = selected == "file.";
+ const bool timing = full || selected == "file.physical_completed" || selected == "file.completed" || selected == "file.service.stopped";
+ const bool bytes = timing || selected == "file.running";
+ std::mutex mutex;
+ std::vector<std::pair<std::string, FileWorkQueue::Observation>> events;
+ std::promise<void> waiting;
+ FileWorkQueue::Observer observer;
+ if (!selected.empty()) observer = {CompileTraceSelection({selected}), [&](std::string_view event, const FileWorkQueue::Observation& value) {
+  {
+   const std::lock_guard lock(mutex);
+   events.emplace_back(event, value);
+  }
+  if (event == "file.wait_cpu") mmltk::testsupport::release_test_promise(waiting);
+  if (throwing) throw std::runtime_error("file observation delivery failed after receipt");
+ }};
+ constexpr std::array<std::uint64_t, 2> sizes{17, 29};
+ std::array<std::uint64_t, 2> output{};
+ std::atomic<unsigned> callbacks{0}, failures{0};
+ CompileExecution execution(1);
+ auto held = execution.service_grant(CompileWorkClass::Output);
+ {
+  FileWorkQueue files(execution, sizes.size(), 1, observer);
+  const mmltk::testsupport::ScopedTestCleanup cleanup([&] { held = {}; files.cancel(); files.join(); });
+  CHECK(files.observes_operation_bytes() == bytes);
+  std::array<CompileExecution::Completion, sizes.size()> work;
+  for (std::size_t i = 0; i < sizes.size(); ++i) {
+   work[i] = files.submit({.completed = [&](std::exception_ptr error) {
+    ++callbacks;
+    if (error) ++failures;
+   }, .work = [&, i] { output[i] = sizes[i]; }, .bytes = files.observes_operation_bytes() ? sizes[i] : 0});
+  }
+  CHECK_FALSE(files.try_reserve_record());
+  if (full || selected == "file.wait_cpu") mmltk::testsupport::await_test_promise(waiting, "selected file CPU wait before grant return");
+  held = {};
+  for (const auto& completion : work) CHECK_NOTHROW(completion.wait());
+  files.join();
+  CHECK(files.has_capacity());
+ }
+ CHECK(output == sizes);
+ CHECK(callbacks == sizes.size());
+ CHECK(failures == 0);
+ if (selected.empty() || selected == "benchmark.unrelated") {
+  CHECK(events.empty());
+  return;
+ }
+ REQUIRE_FALSE(events.empty());
+ const auto output_class = static_cast<std::size_t>(CompileWorkClass::Output);
+ for (const auto& [event, value] : events) {
+  CAPTURE(event);
+  CHECK((full || event == selected));
+  CHECK(value.capacity == sizes.size());
+  CHECK(value.services == 1);
+  CHECK_FALSE(value.failed);
+  if (!timing) {
+   CHECK(value.queue_ns == 0);
+   CHECK(value.duration_ns == 0);
+   CHECK(value.cpu_ns == 0);
+   CHECK(value.callback_ns == 0);
+   CHECK(value.minor_faults == 0);
+   CHECK(value.major_faults == 0);
+   CHECK(value.total_bytes == 0);
+   CHECK(value.total_queue_ns == 0);
+   CHECK(value.total_physical_ns == 0);
+   CHECK(value.total_cpu_ns == 0);
+   CHECK(value.total_callback_ns == 0);
+   CHECK(value.total_minor_faults == 0);
+   CHECK(value.total_major_faults == 0);
+  }
+  if (event == "file.running" || event == "file.physical_completed" || event == "file.completed") {
+   REQUIRE(value.operation >= 1);
+   REQUIRE(value.operation <= sizes.size());
+   CHECK(value.bytes == sizes[value.operation - 1]);
+   CHECK(value.work_class == CompileWorkClass::Output);
+   if (timing && event != "file.completed") CHECK(value.total_bytes == (value.operation == 1 ? 0 : sizes[0]));
+   if (event == "file.running") CHECK(value.running[output_class] == 1);
+   else if (event == "file.physical_completed") CHECK(value.completing[output_class] == 1);
+   else {
+    CHECK(value.completed == value.operation);
+    CHECK(value.total_bytes == (value.operation == 1 ? sizes[0] : sizes[0] + sizes[1]));
+   }
+  } else if (event == "file.service.stopped") {
+   CHECK(value.records == 0);
+   CHECK(value.busy == 0);
+   CHECK(value.admitted == sizes.size());
+   CHECK(value.completed == sizes.size());
+   CHECK(value.total_bytes == sizes[0] + sizes[1]);
+  } else if (event == "file.service.started") {
+   CHECK(value.records == 0);
+   CHECK(value.admitted == 0);
+   CHECK(value.completed == 0);
+  } else if (event == "file.wait_records") {
+   CHECK(value.records == sizes.size());
+   CHECK(value.admitted == sizes.size());
+   CHECK(value.completed == 0);
+   CHECK(value.queued[output_class] == sizes.size());
+  }
+ }
+ for (const auto event : {"file.service.started", "file.service.stopped", "file.admitted", "file.running", "file.physical_completed", "file.completed", "file.wait_records"}) {
+  const auto count = std::string_view(event).starts_with("file.service.") || std::string_view(event) == "file.wait_records" ? 1U : sizes.size();
+  const auto expected = full || selected == event ? count : 0U;
+  CHECK(std::ranges::count_if(events, [&](const auto& observation) { return observation.first == event; }) == expected);
+ }
+}
 TEST_CASE("borrowed file records retain physical completion and share compile service capacity", "[backend][data][benchmark][pipeline]") {
  using mmltk::backend::data::detail::FileWorkQueue;
  if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
@@ -12396,7 +12516,7 @@ TEST_CASE("ordinary pinned tail is usable without spending protected completion 
  const auto page = mmltk::common::system::host_page_size();
  const std::array<CompileWorkspaceProfile, 1> profiles{{{page, page}}};
  auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(1, profiles, page, page, page * 7));
- CompileExecution::Observer observer;
+ detail::CompileExecutionObserver observer;
  if (observing) observer = [](std::string_view, const CompileExecutionSnapshot&) {};
  CompileExecution execution(1, {}, {.workspace_plan = plan}, {}, observer);
  // The one-page planning context and three-page remainder share one ordinary
@@ -15056,6 +15176,8 @@ TEST_CASE("immutable row admission survives identity rebinding and rejects chang
 TEST_CASE("bounded pipeline fixtures preserve mapped and pooled products under selected summaries", "[backend][data][benchmark][pipeline][resources][trace]") {
  using namespace mmltk::backend::data::testsupport;
  const bool pooled = GENERATE(false, true);
+ const std::string file_event = GENERATE("file.service.stopped", "file.running", "file.physical_completed", "file.completed");
+ CAPTURE(pooled, file_event);
  mmltk::testsupport::ScopedTempDir root("pipeline-selected-summary");
  const std::array inputs{profile_image_fixture(32, 24, FixtureImageEncoding::Png), profile_image_fixture(24, 32, FixtureImageEncoding::Jpeg)};
  const std::array<std::size_t, 8> order{0, 1, 1, 0, 1, 0, 0, 1};
@@ -15069,12 +15191,13 @@ TEST_CASE("bounded pipeline fixtures preserve mapped and pooled products under s
   split.images.push_back({i + 1, input.width, input.height, static_cast<std::uint16_t>(annotations.image(i).box_count), 0});
  }
  std::optional<nlohmann::json> summary, execution_summary;
- std::size_t queues = 0;
- const BenchmarkTraceSink trace{CompileTraceSelection({"benchmark.pipeline.retired", "compile.execution.retired", "file.service.stopped"}),
+ std::mutex file_mutex;
+ std::vector<nlohmann::json> file_events;
+ const BenchmarkTraceSink trace{CompileTraceSelection({"benchmark.pipeline.retired", "compile.execution.retired", file_event}),
   [&](std::string_view event, const nlohmann::json& fields) {
    if (event == "benchmark.pipeline.retired") summary = fields;
    else if (event == "compile.execution.retired") execution_summary = fields;
-   else if (event == "file.service.stopped") { CHECK(fields.at("admitted") == fields.at("completed")); ++queues; }
+   else if (event == file_event) { const std::lock_guard lock(file_mutex); file_events.push_back(fields); }
    else FAIL("excluded detailed event reached selected summary");
   }};
  {
@@ -15116,7 +15239,35 @@ TEST_CASE("bounded pipeline fixtures preserve mapped and pooled products under s
  for (auto bytes : summary->at("retained_input_bytes")) CHECK(bytes == 0);
  REQUIRE(execution_summary);
  CHECK(execution_summary->at("costs").at("snapshots_built") == 1);
- CHECK(queues == 2);
+ std::uint64_t input_bytes = 0;
+ for (const auto index : order) input_bytes += inputs[index].encoded.size();
+ const auto input_calls = summary->at("stage_calls").at(2).get<std::size_t>();
+ if (!pooled) CHECK(input_calls == order.size());
+ std::uint64_t observed_bytes = 0;
+ std::size_t image_events = 0;
+ for (const auto& fields : file_events) {
+  CHECK_FALSE(fields.contains("work_class"));
+  CHECK(fields.contains("class"));
+  if (file_event == "file.service.stopped") CHECK(fields.at("admitted") == fields.at("completed"));
+  if (fields.at("service") != "image") continue;
+  ++image_events;
+  if (file_event == "file.service.stopped") {
+   observed_bytes += fields.at("total_bytes").get<std::uint64_t>();
+   CHECK(fields.at("admitted") == input_calls + order.size());
+  } else if (fields.at("class") == static_cast<unsigned>(CompileWorkClass::Extraction)) {
+   const auto bytes = fields.at("bytes").get<std::uint64_t>();
+   CHECK((bytes == inputs[0].encoded.size() || bytes == inputs[1].encoded.size()));
+   observed_bytes += bytes;
+  } else {
+   CHECK(fields.at("class") == static_cast<unsigned>(CompileWorkClass::Pixels));
+   CHECK(fields.at("bytes") == 0);
+  }
+ }
+ if (!pooled) CHECK(observed_bytes == input_bytes);
+ else CHECK(observed_bytes <= input_bytes);
+ if (input_calls == 0) CHECK(observed_bytes == 0);
+ CHECK(image_events == (file_event == "file.service.stopped" ? 1 : input_calls + order.size()));
+ if (file_event == "file.service.stopped") CHECK(file_events.size() == 2);
 }
 
 TEST_CASE("a finite Workspace pass yields to other owners and reaches a fitting tail", "[benchmark][pipeline][images][resources]") {

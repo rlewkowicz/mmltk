@@ -1,7 +1,10 @@
 #pragma once
+#include "src/backend/data/compile_trace_selection.h"
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <mutex>

@@ -3,9 +3,9 @@
 #include "src/backend/data/detail/compile_resources.h"
 namespace mmltk::backend::data::benchmark_internal {
 namespace reflection = mmltk::frameworks::reflection;
-detail::CompileExecution::Observer observe_compile_execution(const BenchmarkTraceSink& sink, std::string_view reservation_event) {
+detail::CompileExecutionObserver observe_compile_execution(const BenchmarkTraceSink& sink, std::string_view reservation_event) {
  if (!sink) return {};
- detail::CompileExecution::ObservationDemand demand{
+ detail::CompileExecutionObservationDemand demand{
   .snapshots = sink.accepts("compile.execution"),
   .record_rejections = sink.accepts("compile.record.rejected"),
   .continuation_rejections = sink.accepts("compile.continuation.rejected"),
