@@ -7,8 +7,25 @@
 #include <cstring>
 #include <immintrin.h>
 #include <new>
+#include <stdexcept>
 namespace mmltk::backend::imaging::resample::perceptual {
 namespace {
+const CpuTransferTable& cpu_transfer_table() {
+ static const auto table = [] {
+  CpuTransferTable result;
+  for (unsigned code = 0; code < 256; ++code) result.thresholds.linear[code] = decode(float(code) * (1.0F / 255.0F));
+  // Double subtraction is exact for these Float32 thresholds. A spacing
+  // strictly greater than 2^-12 proves at most one threshold inside each
+  // half-open bucket. Verify the real table before publishing the lookup.
+  for (unsigned code = 1; code < 256; ++code)
+   if (!(double(result.thresholds.linear[code]) - double(result.thresholds.linear[code - 1]) > 1.0 / CpuTransferTable::bucket_count))
+    throw std::logic_error("CPU transfer thresholds exceed one correction per bucket");
+  for (unsigned bucket = 0; bucket <= CpuTransferTable::bucket_count; ++bucket)
+   result.base_code[bucket] = result.thresholds.quantize(float(bucket) * (1.0F / CpuTransferTable::bucket_count));
+  return result;
+ }();
+ return table;
+}
 // The same patch, reconstruction and inverse expressions instantiate for CPU
 // lanes and the scalar/CUDA value type. Explicit FMA remains explicit; ordinary
 // expressions retain their association and the target's contraction policy.
@@ -37,20 +54,26 @@ __m256 unit8(__m256 value) {
  // Second-operand zero gives scalar unit's NaN -> zero behavior.
  return _mm256_min_ps(_mm256_max_ps(value, _mm256_setzero_ps()), _mm256_set1_ps(1));
 }
-__m256i quantize8(const TransferTable& table, __m256 value) {
+__m256i quantize8(const CpuTransferTable& table, __m256 value) {
  value = unit8(value);
- auto code = _mm256_setzero_si256();
- // Exact upper-bound search, including equality, over the Float32 EOTF.
- // Every candidate is in [0,255]; no approximate inverse transfer is used.
- for (unsigned bit = 128; bit; bit >>= 1) {
-  const auto candidate = _mm256_or_si256(code, _mm256_set1_epi32(static_cast<int>(bit)));
-  const auto threshold = _mm256_i32gather_ps(table.linear, candidate, 4);
-  const auto accept = _mm256_castps_si256(_mm256_cmp_ps(threshold, value, _CMP_LE_OQ));
-  code = _mm256_blendv_epi8(code, candidate, accept);
- }
- return code;
+ // Power-of-two scaling preserves the exact bucket for clamped Float32
+ // inputs, including subnormals. The shared table proves one correction.
+ const auto bucket = _mm256_cvttps_epi32(_mm256_mul_ps(value, _mm256_set1_ps(CpuTransferTable::bucket_count)));
+ const auto code = _mm256_i32gather_epi32(reinterpret_cast<const int*>(table.base_code.data()), bucket, 4);
+ const auto last = _mm256_set1_epi32(255);
+ const auto candidate = _mm256_min_epi32(_mm256_add_epi32(code, _mm256_set1_epi32(1)), last);
+ const auto threshold = _mm256_i32gather_ps(table.thresholds.linear, candidate, 4);
+ const auto accept = _mm256_and_si256(_mm256_cmpgt_epi32(last, code), _mm256_castps_si256(_mm256_cmp_ps(threshold, value, _CMP_LE_OQ)));
+ // The endpoint gathers threshold 255 and cannot increment beyond it.
+ return _mm256_sub_epi32(code, accept);
 }
 __m256i lane_mask(unsigned count) { return _mm256_cmpgt_epi32(_mm256_set1_epi32(static_cast<int>(count)), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7)); }
+void store_lanes(float* output, unsigned count, __m256 value) {
+ if (count == 8)
+  _mm256_storeu_ps(output, value);
+ else
+  _mm256_maskstore_ps(output, lane_mask(count), value);
+}
 // Six contiguous channel planes per row avoid the old moment scatter followed
 // by coefficient gathers. Only the two rows of each state are retained.
 class StateRow {
@@ -72,10 +95,10 @@ public:
  MomentValue<Lanes> moment(std::int64_t x) const { return {{load(0, x), load(1, x), load(2, x)}, {load(3, x), load(4, x), load(5, x)}}; }
  CoefficientValue<Lanes> coefficient(std::int64_t x) const { return {{load(0, x), load(1, x), load(2, x)}, {load(3, x), load(4, x), load(5, x)}}; }
  void store(unsigned x, const CoefficientValue<Lanes>& value) const {
-  const auto mask = lane_mask(std::min(8U, width_ - x));
+  const auto count = std::min(8U, width_ - x);
   for (unsigned k = 0; k < 3; ++k) {
-   _mm256_maskstore_ps(channel(k, x), mask, value.ratio[k].value);
-   _mm256_maskstore_ps(channel(k + 3, x), mask, value.center[k].value);
+   store_lanes(channel(k, x), count, value.ratio[k].value);
+   store_lanes(channel(k + 3, x), count, value.center[k].value);
   }
  }
 };
@@ -117,7 +140,7 @@ void store_packed_block(std::uint8_t* output, unsigned count, const __m128i (&rg
  }
 }
 template <RgbPixelFormat Format, bool QuantizedPlanar>
-void store_block(RgbMutableImageView destination, unsigned x, unsigned y, ColorValue<Lanes> value, const float* alpha, const TransferTable& table) {
+void store_block(RgbMutableImageView destination, unsigned x, unsigned y, ColorValue<Lanes> value, const float* alpha, const CpuTransferTable& table) {
  const auto rgb = inverse(value);
  __m256 channels[]{rgb.y.value, rgb.cb.value, rgb.cr.value};
  const unsigned count = std::min(8U, destination.layout.width - x);
@@ -134,7 +157,7 @@ void store_block(RgbMutableImageView destination, unsigned x, unsigned y, ColorV
   }
   linear = unit8(linear);
   if constexpr (QuantizedPlanar) {
-   _mm256_maskstore_ps(reinterpret_cast<float*>(row + k * destination.layout.plane_stride_bytes) + x, mask, _mm256_mul_ps(_mm256_cvtepi32_ps(quantize8(table, linear)), _mm256_set1_ps(1.0F / 255.0F)));
+   store_lanes(reinterpret_cast<float*>(row + k * destination.layout.plane_stride_bytes) + x, count, _mm256_mul_ps(_mm256_cvtepi32_ps(quantize8(table, linear)), _mm256_set1_ps(1.0F / 255.0F)));
   } else if constexpr (Format == RgbPixelFormat::PlanarUnitSrgbF32) {
    // Continuous Float32 output deliberately retains the scalar library powf.
    alignas(32) float values[8];
@@ -253,9 +276,9 @@ void moments8(RgbConstImageView source, const TransferTable& transfer, const Foo
  if constexpr (Format == RgbPixelFormat::RGBA8) _mm256_storeu_ps(alpha_output, _mm256_min_ps(_mm256_set1_ps(1), _mm256_max_ps(_mm256_setzero_ps(), normalize(_mm256_sub_ps(alpha_sum, alpha_error)))));
 }
 }  // namespace
-void CpuDownscaler::quantize_block(const TransferTable& table, const float* input, std::uint8_t* output) {
+void CpuDownscaler::quantize_block(const float* input, std::uint8_t* output) const {
  alignas(32) int codes[8];
- _mm256_store_si256(reinterpret_cast<__m256i*>(codes), quantize8(table, _mm256_loadu_ps(input)));
+ _mm256_store_si256(reinterpret_cast<__m256i*>(codes), quantize8(transfer_, _mm256_loadu_ps(input)));
  for (unsigned lane = 0; lane < 8; ++lane) output[lane] = static_cast<std::uint8_t>(codes[lane]);
 }
 void copy_identity(RgbConstImageView source, RgbMutableImageView destination) {
@@ -266,9 +289,7 @@ void copy_identity(RgbConstImageView source, RgbMutableImageView destination) {
    std::memcpy(static_cast<std::uint8_t*>(destination.data) + plane * destination.layout.plane_stride_bytes + y * destination.layout.row_stride_bytes,
     static_cast<const std::uint8_t*>(source.data) + plane * source.layout.plane_stride_bytes + y * source.layout.row_stride_bytes, geometry.row_bytes);
 }
-CpuDownscaler::CpuDownscaler() {
- for (unsigned i = 0; i < 256; ++i) transfer_.linear[i] = decode(float(i) * (1.0F / 255.0F));
-}
+CpuDownscaler::CpuDownscaler() : transfer_(cpu_transfer_table()) {}
 namespace {
 std::size_t aligned_extent(std::size_t count, std::size_t size) {
  const auto bytes = common::math::checked_multiply(count, size, "perceptual workspace overflow");
@@ -323,8 +344,12 @@ void CpuDownscaler::prepare(const RgbImageLayout& source, const RgbImageLayout& 
    ++observed->allocation_requests;
    observed->allocation_bytes += count * sizeof(T);
   }
-  buffer.resize(count);
+  buffer.resize_for_overwrite(count);
  };
+ // Both axes are filled below. Execution fills every active moment/alpha
+ // row before reading it and every coefficient row before reconstruction;
+ // first/last-row aliases only address those filled rows. Accumulator zeros
+ // remain mathematical state in execute/moments8, never scratch contents.
  // In-place preparation retains useful capacity. Any exception after this
  // point must force complete axis/row preparation, even for the old key.
  prepared_ = false;
@@ -366,7 +391,7 @@ void CpuDownscaler::execute(RgbConstImageView source, RgbMutableImageView destin
   for (; width - x >= 8; x += 8) {
    float* alpha = nullptr;
    if constexpr (Format == RgbPixelFormat::RGBA8) alpha = alpha_[y % 2].data() + x;
-   moments8<Format, Integer>(source, transfer_, x_.data() + x, fy, row, x, alpha);
+   moments8<Format, Integer>(source, transfer_.thresholds, x_.data() + x, fy, row, x, alpha);
   }
   for (; x < width; ++x) {
    const Footprint fx = x_[x];
@@ -377,7 +402,7 @@ void CpuDownscaler::execute(RgbConstImageView source, RgbMutableImageView destin
     for (std::uint32_t sx = fx.first; sx < fx.end; ++sx) {
      const float weight = Integer ? 1.0F : wy * fx.weight(sx);
      float alpha = 1.0F;
-     const Color color = load<Format>(source, sx, sy, transfer_, alpha);
+     const Color color = load<Format>(source, sx, sy, transfer_.thresholds, alpha);
      sum.add(color, weight);
      if constexpr (Format == RgbPixelFormat::RGBA8) compensated_add(weight * alpha, coverage, coverage_error);
     }

@@ -35,6 +35,9 @@ struct ProfileImageFixture {
  std::vector<std::uint8_t> encoded;
 };
 [[nodiscard]] ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t height, FixtureImageEncoding, std::uint32_t seed = 7, std::size_t byte_limit = 256U << 20);
+// Preflight every actual RGB extent and peak decoder workspace before retaining
+// any pixels. Limits are explicit so standard cases use small real fixtures.
+[[nodiscard]] std::vector<std::vector<std::uint8_t>> retained_profile_rgb(std::span<const ProfileImageFixture>, std::size_t retained_limit, std::size_t workspace_limit);
 // Deterministic source-ordered rows: every fourth image is a background.
 [[nodiscard]] benchmark_internal::NormalizedAnnotationReadView pipeline_annotation_fixture(std::span<const ProfileImageFixture>, std::span<const std::size_t> order);
 // Enabled only by MMLTK_TEST_BENCHMARK_TRACE for focused failure diagnosis.

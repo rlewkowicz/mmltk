@@ -12630,8 +12630,76 @@ TEST_CASE("Directory supplied decoding accepts PNM content independently of path
  storage.ensure_bytes(plan.bytes());
  auto memory = std::span(static_cast<std::byte*>(storage.data()), plan.bytes());
  const auto image = decoder.decode_rgb(bytes, header, memory);
+ CHECK(header.rgb_bytes() == 6);
+ CHECK(plan.output_bytes == 0);
+ CHECK(image.size() == header.rgb_bytes());
  CHECK(std::ranges::equal(image, std::span(bytes).last(6)));
  CHECK_THROWS_AS(decoder.decode_rgb(bytes, header, memory.first(plan.bytes() - 1)), std::length_error);
+}
+TEST_CASE("decoded RGB extent is checked independently of codec workspace", "[backend][data][writer][resources]") {
+ using namespace mmltk::backend::data::detail;
+ for (const auto encoding : {CompileImageEncoding::Jpeg, CompileImageEncoding::Png, CompileImageEncoding::Stb}) {
+  CompileImageHeader header{.width = 17, .height = 13, .encoding = encoding, .decoder_bytes = 8192};
+  CHECK(header.rgb_bytes() == 17 * 13 * 3);
+  const auto plan = CompileImageDecoder::plan(header);
+  CHECK(plan.output_bytes == (encoding == CompileImageEncoding::Jpeg ? header.rgb_bytes() : 0));
+  CHECK(plan.stb_bytes == (encoding == CompileImageEncoding::Jpeg ? 0 : header.decoder_bytes));
+  for (const auto dimensions : {std::pair{0U, 1U}, std::pair{1U, 0U}, std::pair{std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max()}}) {
+   header.width = dimensions.first;
+   header.height = dimensions.second;
+   CHECK_THROWS_AS(header.rgb_bytes(), CompileImageError);
+   CHECK_THROWS_AS(CompileImageDecoder::plan(header), CompileImageError);
+  }
+ }
+}
+TEST_CASE("retained RGB profiles preflight every codec extent before decoding", "[backend][data][writer][resources]") {
+ using namespace mmltk::backend::data::detail;
+ using namespace mmltk::backend::data::testsupport;
+ using mmltk::common::system::page_rounded_bytes;
+ const auto encoding = GENERATE(FixtureImageEncoding::Png, FixtureImageEncoding::Jpeg);
+ const std::array inputs{profile_image_fixture(6, 4, encoding), profile_image_fixture(19, 17, encoding)};
+ constexpr std::size_t rgb_limit = (6 * 4 + 19 * 17) * 3;
+ CompileImageDecoder decoder;
+ std::size_t supplied = 0, opaque = 0;
+ for (const auto& input : inputs) {
+  const auto header = decoder.read_header(input.encoded, CompileImagePolicy::Benchmark);
+  CHECK(header.rgb_bytes() == std::size_t(input.width) * input.height * 3);
+  const auto plan = CompileImageDecoder::plan(header);
+  CHECK(plan.output_bytes == (encoding == FixtureImageEncoding::Jpeg ? header.rgb_bytes() : 0));
+  supplied = std::max(supplied, page_rounded_bytes(plan.bytes()));
+  opaque = std::max(opaque, plan.opaque_bytes);
+ }
+ const auto scratch_limit = supplied + opaque;
+ DenyStbHeapAllocations denied_heap;
+ const auto decoded = retained_profile_rgb(inputs, rgb_limit, scratch_limit);
+ REQUIRE(decoded.size() == inputs.size());
+ std::size_t retained = 0;
+ for (std::size_t i = 0; i < inputs.size(); ++i) {
+  CHECK(decoded[i].size() == std::size_t(inputs[i].width) * inputs[i].height * 3);
+  retained += decoded[i].size();
+ }
+ CHECK(retained == rgb_limit);
+ CHECK_THROWS_AS(retained_profile_rgb(inputs, rgb_limit - 1, scratch_limit), std::length_error);
+ CHECK_THROWS_AS(retained_profile_rgb(inputs, rgb_limit, scratch_limit - 1), std::length_error);
+ CHECK_THROWS_AS(retained_profile_rgb(inputs, 0, scratch_limit), std::length_error);
+ CHECK_THROWS_AS(retained_profile_rgb(inputs, rgb_limit, 0), std::length_error);
+ // This header is readable but its body cannot decode. A later inventory
+ // denial must win before its decode, for both RGB and scratch limits.
+ auto broken = profile_image_fixture(6, 4, FixtureImageEncoding::Png);
+ broken.encoded.resize(41);  // IHDR and IDAT header, without image data.
+ const auto broken_header = decoder.read_header(broken.encoded, CompileImagePolicy::Benchmark);
+ const auto broken_plan = CompileImageDecoder::plan(broken_header);
+ const auto broken_scratch = page_rounded_bytes(broken_plan.bytes()) + broken_plan.opaque_bytes;
+ const std::array denied{broken, inputs[1]};
+ CHECK_THROWS_WITH(retained_profile_rgb(denied, broken_header.rgb_bytes(), scratch_limit), "profile decoded inputs exceed retained RGB cap");
+ CHECK_THROWS_WITH(retained_profile_rgb(denied, rgb_limit, broken_scratch), "profile decode exceeds bounded workspace budget");
+ CHECK_THROWS_AS(retained_profile_rgb(std::span(&broken, 1), rgb_limit, scratch_limit), CompileImageError);
+ auto mismatch = inputs;
+ ++mismatch[1].width;
+ CHECK_THROWS_AS(retained_profile_rgb(mismatch, rgb_limit, scratch_limit), CompileImageError);
+ // Retry after each denied inventory retains the same actual pixel bytes.
+ CHECK(retained_profile_rgb(inputs, rgb_limit, scratch_limit) == decoded);
+ CHECK(denied_heap.attempts == 0);
 }
 TEST_CASE("protected compile windows remain available to their completion class", "[benchmark][pipeline][resources]") {
  using namespace mmltk::backend::data::detail;

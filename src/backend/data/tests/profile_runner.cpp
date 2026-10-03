@@ -27,7 +27,6 @@
 #include "src/common/io/file_memory.h"
 #include "src/backend/data/benchmark/benchmark_dataset_compiler.h"
 #include "src/common/system/numa_memory.h"
-#include "src/common/system/numa_topology.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
 #include "src/frameworks/reflection/cli_declarations.h"
 #include "src/common/system/cpu_affinity.h"
@@ -63,26 +62,21 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
  std::size_t maximum = 0;
  std::uint64_t retained_decoded = 0;
  CompileImageDecoder decoder;
- NumaMemory decode_memory(NumaTopology::Capture().permitted_nodes.front());
  for (const auto& input : inputs) {
   const auto header = decoder.read_header(input.encoded, CompileImagePolicy::Benchmark);
   pixel_plans.push_back(compile_pixel_workspace_plan(header, policy, observe_resize ? &layout_work : nullptr));
   resize_plans.push_back(pixel_plans.back().resize_plan());
   maximum = std::max(maximum, opts.mode == ProfileMode::Resample ? resize_plans.back().bytes() : pixel_plans.back().bytes());
-  if (opts.mode == ProfileMode::Resample) {
-   const auto plan = CompileImageDecoder::plan(header);
-   retained_decoded += plan.output_bytes;
-   if (retained_decoded > (512ULL << 20)) throw std::length_error("profile decoded inputs exceed 512 MiB");
-   decode_memory.ensure_bytes(plan.bytes());
-   const auto rgb = decoder.decode_rgb(input.encoded, header, {static_cast<std::byte*>(decode_memory.data()), decode_memory.capacity_bytes()});
-   decoded.emplace_back(rgb.begin(), rgb.end());
-  }
  }
  const auto backing = std::max<std::size_t>(host_page_size(), page_rounded_bytes(maximum));
  if (backing > CompileWorkspacePlan::ceiling) throw std::length_error("profile image exceeds bounded workspace budget");
  const auto budget = backing > CompileWorkspacePlan::ceiling / workers ? CompileWorkspacePlan::ceiling : backing * workers;
  const std::array profiles{CompileWorkspaceProfile{backing, 0}};
  auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(workers, profiles, 0, 0, budget));
+ if (opts.mode == ProfileMode::Resample) {
+  decoded = retained_profile_rgb(inputs, 512U << 20, CompileWorkspacePlan::ceiling);
+  for (const auto& rgb : decoded) retained_decoded += rgb.size();
+ }
  auto observer = benchmark_internal::observe_compile_execution(trace, "compile.resource.wait");
  CompileExecution execution(workers, {}, {.workspace_plan = plan}, {}, std::move(observer));
  std::vector<std::unique_ptr<CompilePixelWorkspace>> pixels;

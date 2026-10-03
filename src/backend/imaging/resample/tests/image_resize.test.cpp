@@ -23,7 +23,8 @@ namespace mmltk::backend::imaging::resample::perceptual {
 struct CpuDownscalerTestAccess {
  using Step = CpuDownscaler::PreparationStep;
  using Storage = std::array<std::pair<const void*, std::size_t>, 8>;
- static void quantize(const TransferTable& table, const float* values, std::uint8_t* codes) { CpuDownscaler::quantize_block(table, values, codes); }
+ static void quantize(const CpuDownscaler& owner, const float* values, std::uint8_t* codes) { owner.quantize_block(values, codes); }
+ static const CpuTransferTable& transfer(const CpuDownscaler& owner) { return owner.transfer_; }
  static void fail_before(CpuDownscaler& owner, Step step) { owner.fail_before_ = step; }
  static bool prepared(const CpuDownscaler& owner) { return owner.prepared_; }
  static bool armed(const CpuDownscaler& owner) { return owner.fail_before_ != Step::None; }
@@ -31,7 +32,7 @@ struct CpuDownscalerTestAccess {
  // Reconstruct the final retained row with the original scalar arithmetic.
  // Both required moment rows are still live after execution; this compares
  // SIMD output with scalar operations on identical compensated moments.
- static void scalar_final_row(const CpuDownscaler& owner, RgbMutableImageView destination) {
+ static void scalar_final_row(const CpuDownscaler& owner, RgbMutableImageView destination, bool quantized_planar = false) {
   const auto width = destination.layout.width, y = destination.layout.height - 1;
   const auto moment = [&](unsigned row, unsigned x) {
    Moment result;
@@ -54,10 +55,14 @@ struct CpuDownscalerTestAccess {
   for (unsigned x = 0; x < width; ++x) {
    const auto left = x ? x - 1 : 0, previous = y ? y - 1 : y;
    const auto color = reconstruct(moment(y, x), coefficient(y, x), coefficient(y, left), coefficient(previous, x), coefficient(previous, left));
+   if (quantized_planar) {
+    store<RgbPixelFormat::RGB8, true>(destination, x, y, color, 1, owner.transfer_.thresholds);
+    continue;
+   }
    switch (destination.layout.format) {
-    case RgbPixelFormat::RGB8: store<RgbPixelFormat::RGB8>(destination, x, y, color, 1, owner.transfer_); break;
-    case RgbPixelFormat::RGBA8: store<RgbPixelFormat::RGBA8>(destination, x, y, color, owner.alpha_[y % 2][x], owner.transfer_); break;
-    case RgbPixelFormat::PlanarUnitSrgbF32: store<RgbPixelFormat::PlanarUnitSrgbF32>(destination, x, y, color, 1, owner.transfer_); break;
+    case RgbPixelFormat::RGB8: store<RgbPixelFormat::RGB8>(destination, x, y, color, 1, owner.transfer_.thresholds); break;
+    case RgbPixelFormat::RGBA8: store<RgbPixelFormat::RGBA8>(destination, x, y, color, owner.alpha_[y % 2][x], owner.transfer_.thresholds); break;
+    case RgbPixelFormat::PlanarUnitSrgbF32: store<RgbPixelFormat::PlanarUnitSrgbF32>(destination, x, y, color, 1, owner.transfer_.thresholds); break;
    }
   }
  }
@@ -229,12 +234,19 @@ void check_prepared_pixels(perceptual::CpuDownscaler& resizer, const test_percep
  REQUIRE(perceptual::CpuDownscalerTestAccess::prepared(resizer));
 }
 void check_preparation_recovery(
- RgbPixelFormat prior_format, RgbPixelFormat requested_format, const std::array<unsigned, 4>& requested, perceptual::CpuDownscalerTestAccess::Step failure, bool prior_first) {
+ RgbPixelFormat prior_format, RgbPixelFormat requested_format, const std::array<unsigned, 4>& requested, perceptual::CpuDownscalerTestAccess::Step failure, bool prior_first, bool supplied) {
  using namespace test_perceptual;
  using Access = perceptual::CpuDownscalerTestAccess;
  INFO("prior format " << static_cast<int>(prior_format) << " requested format " << static_cast<int>(requested_format) << " geometry " << requested[0] << "x" << requested[1] << " -> " << requested[2]
-                      << "x" << requested[3] << " boundary " << static_cast<int>(failure) << " prior first " << prior_first);
+                      << "x" << requested[3] << " boundary " << static_cast<int>(failure) << " prior first " << prior_first << " supplied " << supplied);
  perceptual::CpuDownscaler resizer;
+ const auto width = std::max(9U, requested[2]), height = std::max(7U, requested[3]);
+ const auto bytes = perceptual::CpuDownscaler::workspace_bytes(width, height, true);
+ std::vector<std::byte> backing(supplied ? bytes + 63 : 0, std::byte{0xFF});
+ if (supplied) {
+  const auto aligned = (reinterpret_cast<std::uintptr_t>(backing.data()) + 63) / 64 * 64;
+  resizer.bind(width, height, true, {reinterpret_cast<std::byte*>(aligned), bytes});
+ }
  Image prior_source(17, 13, prior_format, 3), prior_output(9, 7, prior_format, 5);
  Image source(requested[0], requested[1], requested_format, 3), output(requested[2], requested[3], requested_format, 5);
  prior_source.fill(5);
@@ -272,6 +284,7 @@ void check_preparation_recovery(
 TEST_CASE("perceptual CPU preparation retains safe recovery at each storage boundary", "[backend][data][image_resize][perceptual]") {
  using Access = perceptual::CpuDownscalerTestAccess;
  using Step = Access::Step;
+ const bool supplied = GENERATE(false, true);
  constexpr std::array steps{Step::HorizontalAxis, Step::VerticalAxis, Step::FirstMoment, Step::SecondMoment, Step::FirstCoefficient, Step::SecondCoefficient, Step::FirstAlpha, Step::SecondAlpha};
  constexpr std::array<std::array<unsigned, 4>, 3> requests{{{19, 101, 7, 99}, {29, 23, 19, 17}, {18, 14, 9, 7}}};
  for (auto prior : test_perceptual::formats)
@@ -280,14 +293,15 @@ TEST_CASE("perceptual CPU preparation retains safe recovery at each storage boun
     for (auto step : steps)
      for (bool prior_first : {false, true}) {
       if (requested != RgbPixelFormat::RGBA8 && (step == Step::FirstAlpha || step == Step::SecondAlpha)) continue;
-      check_preparation_recovery(prior, requested, geometry, step, prior_first);
+      check_preparation_recovery(prior, requested, geometry, step, prior_first, supplied);
      }
 }
 TEST_CASE("perceptual CPU first alpha preparation invalidates an unchanged geometry on failure", "[backend][data][image_resize][perceptual]") {
  using Step = perceptual::CpuDownscalerTestAccess::Step;
+ const bool supplied = GENERATE(false, true);
  for (auto prior : {RgbPixelFormat::RGB8, RgbPixelFormat::PlanarUnitSrgbF32})
   for (auto step : {Step::FirstAlpha, Step::SecondAlpha})
-   for (bool prior_first : {false, true}) check_preparation_recovery(prior, RgbPixelFormat::RGBA8, {17, 13, 9, 7}, step, prior_first);
+   for (bool prior_first : {false, true}) check_preparation_recovery(prior, RgbPixelFormat::RGBA8, {17, 13, 9, 7}, step, prior_first, supplied);
 }
 TEST_CASE("perceptual CPU identity copies preserve exact pixels and padding in every format", "[backend][data][image_resize][perceptual]") {
  using namespace test_perceptual;
@@ -537,10 +551,17 @@ TEST_CASE("compiler planar projection preserves every quantized RGB8 bit", "[bac
 TEST_CASE("quantized planar preparation failure leaves the complete canvas untouched and permits retry", "[backend][data][image_resize][perceptual]") {
  using Access = perceptual::CpuDownscalerTestAccess;
  using Step = Access::Step;
+ const bool supplied = GENERATE(false, true);
  const auto dims = GENERATE((std::array<unsigned, 4>{19, 13, 9, 7}), (std::array<unsigned, 4>{18, 14, 9, 7}), (std::array<unsigned, 4>{9, 1, 9, 1}));
  for (const auto step : {Step::HorizontalAxis, Step::VerticalAxis, Step::FirstMoment, Step::SecondMoment, Step::FirstCoefficient, Step::SecondCoefficient}) {
   INFO("geometry " << dims[0] << "x" << dims[1] << " -> " << dims[2] << "x" << dims[3] << " boundary " << static_cast<int>(step));
   perceptual::CpuDownscaler owner;
+  const auto workspace_size = perceptual::CpuDownscaler::workspace_bytes(dims[2], dims[3], false);
+  std::vector<std::byte> backing(supplied ? workspace_size + 63 : 0, std::byte{0xFF});
+  if (supplied) {
+   const auto aligned = (reinterpret_cast<std::uintptr_t>(backing.data()) + 63) / 64 * 64;
+   owner.bind(dims[2], dims[3], false, {reinterpret_cast<std::byte*>(aligned), workspace_size});
+  }
   test_perceptual::Image source(dims[0], dims[1], RgbPixelFormat::RGB8, 3), destination(dims[2], dims[3], RgbPixelFormat::PlanarUnitSrgbF32, 5);
   source.fill(5);
   const auto untouched = destination.storage;
@@ -622,22 +643,51 @@ TEST_CASE("Supplied resizer preparation preserves RGB and planar numerical outpu
  CHECK(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0);
  CHECK_THROWS_AS(supplied.prepare(plan, memory.first(memory.size() - 1)), std::length_error);
 }
-TEST_CASE("eight-lane transfer search preserves every threshold and adjacent float", "[backend][data][image_resize][perceptual]") {
- perceptual::TransferTable table;
- for (unsigned code = 0; code < 256; ++code) table.linear[code] = perceptual::decode(float(code) * (1.0F / 255.0F));
+TEST_CASE("eight-lane transfer lookup preserves every threshold bucket and adjacent float", "[backend][data][image_resize][perceptual]") {
+ using Access = perceptual::CpuDownscalerTestAccess;
+ perceptual::CpuDownscaler owner, peer;
+ const auto& transfer = Access::transfer(owner);
+ const auto& table = transfer.thresholds;
+ CHECK(&transfer == &Access::transfer(peer));
+ constexpr float infinity = std::numeric_limits<float>::infinity();
+ const auto check = [&](const std::array<float, 8>& values) {
+  std::array<std::uint8_t, 8> output{};
+  Access::quantize(owner, values.data(), output.data());
+  for (unsigned lane = 0; lane < output.size(); ++lane) {
+   CAPTURE(lane, values[lane]);
+   CHECK(output[lane] == table.quantize(values[lane]));
+  }
+  return output;
+ };
  for (unsigned code = 0; code < 256; ++code) {
   const float threshold = table.linear[code];
+  CAPTURE(code);
+  CHECK(std::bit_cast<std::uint32_t>(threshold) == std::bit_cast<std::uint32_t>(perceptual::decode(float(code) * (1.0F / 255.0F))));
+  if (code) REQUIRE(double(threshold) - double(table.linear[code - 1]) > 1.0 / perceptual::CpuTransferTable::bucket_count);
   const std::array values{
-   threshold, std::nextafter(threshold, -std::numeric_limits<float>::infinity()), std::nextafter(threshold, std::numeric_limits<float>::infinity()), -1.0F, 2.0F,
-   std::numeric_limits<float>::quiet_NaN(), -std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity()
+   threshold, std::nextafter(threshold, -infinity), std::nextafter(threshold, infinity), -1.0F, 2.0F, std::numeric_limits<float>::quiet_NaN(), -infinity, infinity
   };
-  std::array<std::uint8_t, 8> output{};
-  perceptual::CpuDownscalerTestAccess::quantize(table, values.data(), output.data());
+  const auto output = check(values);
   CHECK(output[0] == code);
   CHECK(output[1] == (code ? code - 1 : 0));
   CHECK(output[2] == code);
-  for (unsigned lane = 0; lane < output.size(); ++lane) CHECK(output[lane] == table.quantize(values[lane]));
  }
+ constexpr auto buckets = perceptual::CpuTransferTable::bucket_count;
+ for (unsigned bucket = 0; bucket <= buckets; ++bucket) {
+  CAPTURE(bucket);
+  const float lower = float(bucket) * (1.0F / buckets), upper = float(bucket + 1) * (1.0F / buckets);
+  const float last = std::nextafter(upper, -infinity);
+  const auto base = transfer.base_code[bucket];
+  CHECK(base == table.quantize(lower));
+  // Exhaustive occupancy proof on the actual table: the highest Float32
+  // within each bucket is no more than one scalar code above its base.
+  CHECK(table.quantize(last) >= base);
+  CHECK(table.quantize(last) - base <= 1);
+  check({lower, std::nextafter(lower, -infinity), std::nextafter(lower, infinity), (lower + upper) * 0.5F, last, upper, std::nextafter(upper, infinity), -lower});
+ }
+ check({-0.0F, 0.0F, std::numeric_limits<float>::denorm_min(), -std::numeric_limits<float>::denorm_min(), std::numeric_limits<float>::min(), -std::numeric_limits<float>::min(),
+  std::numeric_limits<float>::lowest(), std::numeric_limits<float>::max()});
+ CHECK(transfer.base_code.back() == 255);
 }
 TEST_CASE("checked resize plans retain their selected algorithm independently of storage", "[backend][data][image_resize][workspace]") {
  const std::array<std::pair<std::array<unsigned, 2>, RgbResizePath>, 11> cases{
@@ -729,26 +779,68 @@ TEST_CASE("one supplied arena supports poisoned mixed geometry and rejects stale
 }
 TEST_CASE("SIMD final rows retain scalar patch reconstruction and output bits", "[backend][data][image_resize][perceptual]") {
  using namespace test_perceptual;
+ using Access = perceptual::CpuDownscalerTestAccess;
+ const bool tight = GENERATE(false, true);
  for (auto format : formats)
   for (unsigned width : {1U, 3U, 7U, 8U, 9U, 15U, 16U, 17U})
    for (unsigned height : {1U, 5U})
     for (unsigned extra : {0U, 1U})
      for (unsigned pattern : {0U, 3U, 5U, 7U}) {
-      CAPTURE(static_cast<int>(format), width, height, extra, pattern);
-      Image source(width * 2 + extra, height * 2 + extra, format, 3), actual(width, height, format, 5), scalar(width, height, format, 5);
+      CAPTURE(static_cast<int>(format), width, height, extra, pattern, tight);
+      Image source(width * 2 + extra, height * 2 + extra, format, tight ? 0 : 3), actual(width, height, format, tight ? 0 : 5), scalar(width, height, format, tight ? 0 : 5);
+      // Image's usual byte rows are float-aligned. Exercise legal tightly
+      // packed RGB rows as well, including a last three-byte source pixel.
+      if (tight && format == RgbPixelFormat::RGB8)
+       for (auto* image : {&source, &actual, &scalar}) {
+        image->layout.row_stride_bytes = image->layout.width * 3;
+        image->layout.capacity_bytes = image->layout.row_stride_bytes * image->layout.height;
+       }
       source.fill(pattern);
-      perceptual::CpuDownscaler owner;
-      owner.run(source.read(), actual.write());
-      perceptual::CpuDownscalerTestAccess::scalar_final_row(owner, scalar.write());
-      const auto layout = actual.read().layout;
-      const unsigned planes = format == RgbPixelFormat::PlanarUnitSrgbF32 ? 3 : 1;
-      const std::size_t row_bytes = width * (format == RgbPixelFormat::PlanarUnitSrgbF32 ? sizeof(float) : format == RgbPixelFormat::RGBA8 ? 4 : 3);
-      for (unsigned plane = 0; plane < planes; ++plane) {
-       CAPTURE(plane);
-       const auto offset = plane * layout.plane_stride_bytes + (height - 1) * layout.row_stride_bytes;
-       CHECK(std::memcmp(static_cast<const std::byte*>(actual.read().data) + offset, static_cast<const std::byte*>(scalar.read().data) + offset, row_bytes) == 0);
+      auto expected = actual;
+      perceptual::CpuDownscaler owner, owned;
+      owned.run(source.read(), expected.write());
+      const bool alpha = format == RgbPixelFormat::RGBA8;
+      const auto bytes = perceptual::CpuDownscaler::workspace_bytes(width, height, alpha);
+      std::vector<std::byte> backing(bytes + 127);
+      const auto aligned = (reinterpret_cast<std::uintptr_t>(backing.data()) + 63) / 64 * 64;
+      const std::span memory(reinterpret_cast<std::byte*>(aligned), bytes);
+      for (const auto poison : {std::byte{0xA7}, std::byte{0xFF}}) {
+       std::ranges::fill(backing, poison);
+       owner.bind(width, height, alpha, memory);
+       owner.run(source.read(), actual.write());
+       CHECK(std::memcmp(actual.storage.data(), expected.storage.data(), actual.storage.size() * sizeof(float)) == 0);
+       CHECK(std::all_of(backing.data(), memory.data(), [=](auto value) { return value == poison; }));
+       CHECK(std::all_of(memory.data() + memory.size(), backing.data() + backing.size(), [=](auto value) { return value == poison; }));
       }
+      const auto compare_final_row = [&](const Image& result, const Image& reference) {
+       const auto layout = result.layout;
+       const unsigned planes = layout.format == RgbPixelFormat::PlanarUnitSrgbF32 ? 3 : 1;
+       const std::size_t row_bytes = width * (layout.format == RgbPixelFormat::RGB8 ? 3 : 4);
+       for (unsigned plane = 0; plane < planes; ++plane) {
+        CAPTURE(plane);
+        const auto offset = plane * layout.plane_stride_bytes + (height - 1) * layout.row_stride_bytes;
+        CHECK(std::memcmp(static_cast<const std::byte*>(result.read().data) + offset, static_cast<const std::byte*>(reference.read().data) + offset, row_bytes) == 0);
+       }
+      };
+      Access::scalar_final_row(owner, scalar.write());
+      compare_final_row(actual, scalar);
+      CHECK(padding_intact(source));
       CHECK(padding_intact(actual));
+      const auto* end = reinterpret_cast<const std::uint8_t*>(actual.storage.data());
+      CHECK(std::all_of(end + actual.layout.capacity_bytes, end + actual.storage.size() * sizeof(float), [](auto byte) { return byte == 0xCD; }));
+      if (format == RgbPixelFormat::RGB8) {
+       Image planar(width, height, RgbPixelFormat::PlanarUnitSrgbF32, tight ? 0 : 5), scalar_planar(planar);
+       owner.run_quantized_planar(source.read(), planar.write());
+       Access::scalar_final_row(owner, scalar_planar.write(), true);
+       compare_final_row(planar, scalar_planar);
+       for (unsigned y = 0; y < height; ++y)
+        for (unsigned x = 0; x < width; ++x)
+         for (unsigned k = 0; k < 3; ++k) {
+          const auto code = static_cast<unsigned>(std::lround(actual.at(x, y, k) * 255.0));
+          CHECK(std::bit_cast<std::uint32_t>(static_cast<float>(planar.at(x, y, k))) == std::bit_cast<std::uint32_t>(float(code) * (1.0F / 255.0F)));
+         }
+       CHECK(padding_intact(planar));
+      }
      }
 }
 namespace {

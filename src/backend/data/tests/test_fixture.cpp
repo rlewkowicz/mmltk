@@ -5,6 +5,9 @@
 #include "src/backend/data/benchmark/detail/benchmark_pipeline.h"
 #include "src/backend/data/benchmark/detail/benchmark_progress.h"
 #include "src/backend/data/detail/compile_pixel_workspace.h"
+#include "src/backend/data/detail/compile_image_decoder.h"
+#include "src/common/system/numa_memory.h"
+#include "src/common/system/numa_topology.h"
 #include "src/backend/data/detail/file_work_queue.h"
 #include "src/backend/data/compiled/compiled_dataset.h"
 #include "src/common/math/checked_arithmetic.h"
@@ -50,6 +53,40 @@ ProfileImageFixture profile_image_fixture(std::uint32_t width, std::uint32_t hei
  if (output.overflow) throw std::length_error("profile encoded image exceeds input cap");
  if (!written) throw std::runtime_error("cannot encode profile fixture");
  return result;
+}
+std::vector<std::vector<std::uint8_t>> retained_profile_rgb(std::span<const ProfileImageFixture> inputs, std::size_t retained_limit, std::size_t workspace_limit) {
+ using namespace detail;
+ using namespace mmltk::common::system;
+ if (inputs.empty() || inputs.size() > 64) throw std::length_error("profile requires 1-64 retained images");
+ CompileImageDecoder decoder;
+ std::vector<CompileImageHeader> headers;
+ headers.reserve(inputs.size());
+ std::size_t retained = 0, supplied = 0, opaque = 0;
+ for (const auto& input : inputs) {
+  const auto header = decoder.read_header(input.encoded, CompileImagePolicy::Benchmark, input.width, input.height);
+  const auto rgb_bytes = header.rgb_bytes();
+  if (rgb_bytes > retained_limit - retained) throw std::length_error("profile decoded inputs exceed retained RGB cap");
+  retained += rgb_bytes;
+  const auto plan = CompileImageDecoder::plan(header);
+  const auto bytes = plan.bytes();
+  if (bytes > workspace_limit) throw std::length_error("profile decode exceeds bounded workspace budget");
+  supplied = std::max(supplied, page_rounded_bytes(bytes));
+  opaque = std::max(opaque, plan.opaque_bytes);
+  if (opaque > workspace_limit || supplied > workspace_limit - opaque) throw std::length_error("profile decode exceeds bounded workspace budget");
+  headers.push_back(header);
+ }
+ // The complete inventory is admitted. One reusable arena covers all codecs;
+ // STB's returned RGB remains within it, while JPEG has a supplied RGB span.
+ NumaMemory workspace(NumaTopology::Capture().permitted_nodes.front());
+ workspace.ensure_bytes(supplied);
+ std::vector<std::vector<std::uint8_t>> decoded;
+ decoded.reserve(inputs.size());
+ for (std::size_t i = 0; i < inputs.size(); ++i) {
+  const auto rgb = decoder.decode_rgb(inputs[i].encoded, headers[i], {static_cast<std::byte*>(workspace.data()), supplied});
+  if (rgb.size() != headers[i].rgb_bytes()) throw CompileImageError("profile decoded RGB extent differs from its admitted header");
+  decoded.emplace_back(rgb.begin(), rgb.end());
+ }
+ return decoded;
 }
 benchmark_internal::NormalizedAnnotationReadView pipeline_annotation_fixture(std::span<const ProfileImageFixture> inputs, std::span<const std::size_t> order) {
  using namespace benchmark_internal;

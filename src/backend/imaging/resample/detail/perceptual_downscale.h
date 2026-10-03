@@ -11,6 +11,13 @@
 #include "src/backend/imaging/resample/detail/perceptual_downscale_math.h"
 namespace mmltk::backend::imaging::resample::perceptual {
 void copy_identity(RgbConstImageView source, RgbMutableImageView destination);
+// CPU-only projection of the scalar transfer authority; shared immutably by
+// every downscaler, independently of supplied image storage and CUDA tables.
+struct CpuTransferTable {
+ static constexpr unsigned bucket_count = 4096;
+ TransferTable thresholds;
+ std::array<std::uint32_t, bucket_count + 1> base_code;
+};
 class CpuDownscaler final {
 public:
  CpuDownscaler();
@@ -24,7 +31,7 @@ private:
  friend class mmltk::backend::imaging::resample::RgbImageResizer;
  friend struct CpuDownscalerTestAccess;
  void run_selected(RgbConstImageView, RgbMutableImageView, RgbResizePath, bool quantized_planar = false, RgbResizeWork* observed = nullptr);
- static void quantize_block(const TransferTable&, const float*, std::uint8_t*);
+ void quantize_block(const float*, std::uint8_t*) const;
  // Owner-local, one-shot preparation seam; never exposed by the public
  // resizer or consulted during pixel execution.
  enum class PreparationStep : std::uint8_t { None, HorizontalAxis, VerticalAxis, FirstMoment, SecondMoment, FirstCoefficient, SecondCoefficient, FirstAlpha, SecondAlpha };
@@ -33,7 +40,7 @@ private:
  void prepare(const RgbImageLayout& source, const RgbImageLayout& destination, RgbResizeWork* observed);
  template <RgbPixelFormat Format, bool Integer, bool QuantizedPlanar = false>
  void execute(RgbConstImageView source, RgbMutableImageView destination);
- TransferTable transfer_;
+ const CpuTransferTable& transfer_;
  bool prepared_ = false;
  std::uint32_t source_width_ = 0, source_height_ = 0, width_ = 0, height_ = 0;
  mmltk::common::types::WorkspaceBuffer<Footprint> x_, y_;

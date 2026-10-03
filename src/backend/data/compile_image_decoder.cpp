@@ -20,6 +20,7 @@ namespace {
  throw CompileImageError(std::string(action) + ": " + (reason ? reason : "PNG decoding failed"));
 }
 [[nodiscard]] std::size_t checked_pixel_bytes(const CompileImageHeader& header, const std::uint32_t channels) {
+ if (!header.width || !header.height) throw CompileImageError("image workspace has no admitted dimensions");
  const std::uint64_t pixels = static_cast<std::uint64_t>(header.width) * header.height;
  if (pixels > std::numeric_limits<std::size_t>::max() / channels) { throw CompileImageError("benchmark image decoded buffer size overflow"); }
  return static_cast<std::size_t>(pixels * channels);
@@ -67,6 +68,7 @@ void convert_cmyk_to_rgb(const std::span<const std::uint8_t> cmyk, const bool in
  }
 }
 }  // namespace
+std::size_t CompileImageHeader::rgb_bytes() const { return checked_pixel_bytes(*this, 3); }
 void CompileImageDecoder::ensure_jpeg_handle() {
  if (handle_) return;
  handle_ = tjInitDecompress();
@@ -112,7 +114,7 @@ std::size_t CompileImagePlan::bytes() const {
  return checked_add(checked_add(output_bytes, cmyk_bytes, "image workspace overflow"), stb_bytes, "image workspace overflow");
 }
 CompileImagePlan CompileImageDecoder::plan(const CompileImageHeader& header) {
- if (!header.width || !header.height) throw CompileImageError("image workspace has no admitted dimensions");
+ const auto rgb_bytes = header.rgb_bytes();
  if (header.encoding != CompileImageEncoding::Jpeg) {
   if (!header.decoder_bytes) throw CompileImageError("image decoder has no checked workspace plan");
   return {.stb_bytes = header.decoder_bytes};
@@ -126,7 +128,7 @@ CompileImagePlan CompileImageDecoder::plan(const CompileImageHeader& header) {
  const auto height = (std::size_t(header.height) + 31) / 32 * 32;
  const auto coefficients = checked_multiply(checked_multiply(width, height, "JPEG coefficients overflow"), 4 * sizeof(short), "JPEG coefficients overflow");
  return {
-  checked_pixel_bytes(header, 3), header.colorspace == TJCS_CMYK || header.colorspace == TJCS_YCCK ? checked_pixel_bytes(header, 4) : 0, 0,
+  rgb_bytes, header.colorspace == TJCS_CMYK || header.colorspace == TJCS_YCCK ? checked_pixel_bytes(header, 4) : 0, 0,
   checked_add(coefficients, checked_add(checked_multiply(width, 16, "JPEG rows overflow"), std::size_t{65536}, "JPEG controls overflow"), "JPEG workspace overflow")
  };
 }
@@ -144,7 +146,7 @@ std::span<const std::uint8_t> CompileImageDecoder::decode_rgb(std::span<const st
   }
   if (width <= 0 || height <= 0 || static_cast<std::uint32_t>(width) != header.width || static_cast<std::uint32_t>(height) != header.height)
    throw CompileImageError("decoded benchmark PNG dimensions do not match its header");
-  return {pixels, checked_pixel_bytes(header, 3)};
+  return {pixels, header.rgb_bytes()};
  }
  if (encoded.size() > std::numeric_limits<unsigned long>::max()) throw CompileImageError("benchmark JPEG size overflow");
  auto rgb = std::span(reinterpret_cast<std::uint8_t*>(workspace.data()), required.output_bytes);

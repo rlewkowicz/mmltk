@@ -13,6 +13,8 @@ struct CompileImageHeader {
  bool inverted_cmyk = false;
  CompileImageEncoding encoding = CompileImageEncoding::Jpeg;
  std::size_t decoder_bytes = 0;
+ // Actual decoded RGB extent, independent of the codec's supplied workspace.
+ [[nodiscard]] std::size_t rgb_bytes() const;
  bool operator==(const CompileImageHeader&) const = default;
 };
 struct CompileImagePlan {
