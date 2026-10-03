@@ -5,6 +5,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_download.h"
 #include "src/backend/data/detail/compile_resources.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_facts.h"
+#include "src/backend/data/benchmark/detail/benchmark_trace.h"
 #include "src/common/concurrency/cancellation_observation.h"
 #include <cstddef>
 #include <cstdint>
@@ -63,7 +64,7 @@ public:
  using Progress = std::function<void(CoconutEdition, const AdmittedRecipeArchive&, std::uint64_t image_id, std::uint64_t entries)>;
  using Repair = std::function<void(AdmittedRecipeArchive&, std::string)>;
  CoconutPhysicalMembership(std::span<AdmittedRecipeArchive>, const CoconutRecipeCatalog&, bool explicit_catalog, const BenchmarkCacheLayout&, detail::StorageReservationPool&,
-  BenchmarkCompilePipeline&, mmltk::common::concurrency::CancellationObservation = {}, Progress = {}, Repair = {});
+  BenchmarkCompilePipeline&, mmltk::common::concurrency::CancellationObservation = {}, Progress = {}, Repair = {}, BenchmarkTraceSink = {});
  explicit CoconutPhysicalMembership(std::span<const CoconutPhysicalImage>, mmltk::common::concurrency::CancellationObservation = {});
  ~CoconutPhysicalMembership();
  CoconutPhysicalMembership(const CoconutPhysicalMembership&) = delete;

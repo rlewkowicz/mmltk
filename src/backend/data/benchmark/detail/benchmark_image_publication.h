@@ -27,7 +27,7 @@ class BenchmarkImagePublication final {
  struct Buffers {
   std::mutex mutex;
   std::size_t free = 0;
-  detail::CompileExecution* execution = nullptr;
+  detail::CompileExecution::Readiness* readiness = nullptr;
  };
 
 public:
@@ -74,7 +74,7 @@ private:
  std::mutex resource_mutex_;
  std::condition_variable resource_changed_;
  std::uint64_t resource_generation_ = 0;
- std::unique_ptr<detail::CompileExecution::Readiness> readiness_;
+ std::unique_ptr<detail::CompileExecution::Readiness> readiness_, buffer_readiness_;
  BenchmarkCompletionWindow writes_;
 };
 }  // namespace mmltk::backend::data::benchmark_internal

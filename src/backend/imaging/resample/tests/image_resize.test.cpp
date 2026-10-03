@@ -43,7 +43,13 @@ struct CpuDownscalerTestAccess {
   };
   const auto coefficient = [&](unsigned row, unsigned x) {
    const auto right = std::min(x + 1, width - 1), below = std::min(row + 1, y);
-   return patch(moment(row, x), moment(row, right), moment(below, x), moment(below, right));
+   const auto result = patch(moment(row, x), moment(row, right), moment(below, x), moment(below, right));
+   for (unsigned k = 0; k < 3; ++k) {
+    CAPTURE(row, x, k);
+    CHECK(result.ratio[k] == owner.coefficients_[row % 2][k * width + x]);
+    CHECK(result.center[k] == owner.coefficients_[row % 2][(k + 3) * width + x]);
+   }
+   return result;
   };
   for (unsigned x = 0; x < width; ++x) {
    const auto left = x ? x - 1 : 0, previous = y ? y - 1 : y;
@@ -728,6 +734,7 @@ TEST_CASE("SIMD final rows retain scalar patch reconstruction and output bits", 
    for (unsigned height : {1U, 5U})
     for (unsigned extra : {0U, 1U})
      for (unsigned pattern : {0U, 3U, 5U, 7U}) {
+      CAPTURE(static_cast<int>(format), width, height, extra, pattern);
       Image source(width * 2 + extra, height * 2 + extra, format, 3), actual(width, height, format, 5), scalar(width, height, format, 5);
       source.fill(pattern);
       perceptual::CpuDownscaler owner;
@@ -737,6 +744,7 @@ TEST_CASE("SIMD final rows retain scalar patch reconstruction and output bits", 
       const unsigned planes = format == RgbPixelFormat::PlanarUnitSrgbF32 ? 3 : 1;
       const std::size_t row_bytes = width * (format == RgbPixelFormat::PlanarUnitSrgbF32 ? sizeof(float) : format == RgbPixelFormat::RGBA8 ? 4 : 3);
       for (unsigned plane = 0; plane < planes; ++plane) {
+       CAPTURE(plane);
        const auto offset = plane * layout.plane_stride_bytes + (height - 1) * layout.row_stride_bytes;
        CHECK(std::memcmp(static_cast<const std::byte*>(actual.read().data) + offset, static_cast<const std::byte*>(scalar.read().data) + offset, row_bytes) == 0);
       }

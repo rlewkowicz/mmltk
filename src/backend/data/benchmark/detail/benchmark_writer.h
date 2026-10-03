@@ -91,6 +91,11 @@ struct BenchmarkWriteRequest {
 struct BenchmarkPixelInput;
 class BenchmarkSplitWriter final {
 public:
+ struct LabelSettlement {
+  std::uint32_t slot = 0;
+  bool ordinal_incomplete = false;
+  std::uint64_t ordinal_base = 0;
+ };
  explicit BenchmarkSplitWriter(const BenchmarkWriteRequest&, bool use_actual_dimensions = false);
  ~BenchmarkSplitWriter();
  BenchmarkSplitWriter(const BenchmarkSplitWriter&) = delete;
@@ -100,7 +105,8 @@ public:
  [[nodiscard]] std::uint32_t allocate_slot(EncodedImageRecord, const CachedImageSource&);
  void input_root(std::uint32_t, const std::filesystem::path&);
  void invalidate_labels(std::uint32_t);
- void settle_labels(std::uint32_t, std::uint64_t ordinal_base, bool ordinal_incomplete = false);
+ // A bounded caller-owned batch settles physically before this method returns.
+ void settle_labels(std::span<const LabelSettlement>);
  [[nodiscard]] ImageEntry entry(std::uint32_t) const;
  [[nodiscard]] BenchmarkSealedSplit seal_slots(const BenchmarkWriteRequest&, std::span<const std::uint32_t>);
  void prepare_pixels(std::uint32_t);

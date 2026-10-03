@@ -47,6 +47,7 @@ struct BenchmarkCompletionWindow::Impl {
  struct Wake {
   std::mutex mutex;
   std::condition_variable changed;
+  CompileExecution::Readiness* readiness = nullptr;
  };
  struct Entry {
   CompileExecution::Completion completion;
@@ -57,12 +58,20 @@ struct BenchmarkCompletionWindow::Impl {
  std::vector<Entry> entries;
  std::size_t capacity;
  std::function<void()> waiting;
- CompileExecution* execution;
+ std::unique_ptr<CompileExecution::Readiness> readiness;
  bool interrupted = false;
  bool waiting_failed = false;
  std::exception_ptr failure;
- explicit Impl(std::size_t count, CompileExecution* owner, std::function<void()> parked) : capacity(std::max<std::size_t>(1, count)), waiting(std::move(parked)), execution(owner) {
+ explicit Impl(std::size_t count, CompileExecution* owner, std::function<void()> parked) : capacity(std::max<std::size_t>(1, count)), waiting(std::move(parked)) {
   entries.reserve(capacity);
+  if (owner) readiness = std::make_unique<CompileExecution::Readiness>(*owner, CompileChange::Pressure);
+  wake->readiness = readiness.get();
+ }
+ ~Impl() {
+  // Completion readiness precedes subscription delivery. A late callback owns
+  // Wake, but must stop touching the registration before its owner retires.
+  const std::lock_guard lock(wake->mutex);
+  wake->readiness = nullptr;
  }
  void failed() noexcept {
   if (!failure) failure = std::current_exception();
@@ -71,10 +80,9 @@ struct BenchmarkCompletionWindow::Impl {
   std::unique_lock lock(wake->mutex);
   const auto ready = [&] { return std::ranges::find_if(entries, [](const auto& entry) { return entry.completion.ready(); }); };
   while (wait && !entries.empty() && ready() == entries.end()) {
-   // Subscribe completions into the same admission event used for pressure.
-   // After interruption, keep joining accepted physical borrowers on their own
-   // completion signal; a cancelled admission wait must not spin or abandon them.
-   const auto observed = execution && !interrupted ? execution->admission_generation() : 0;
+   // Only owned completions and pressure require another wait-hook visit.
+   // After interruption, join accepted physical borrowers on their own signal.
+   const auto observed = readiness && !interrupted ? readiness->generation() : 0;
    lock.unlock();
    if (waiting && !waiting_failed) try {
      waiting();
@@ -94,12 +102,12 @@ struct BenchmarkCompletionWindow::Impl {
      if (!unregistered->completion.ready()) throw;
     }
     lock.lock();
-   } else if (execution && !interrupted) {
+   } else if (readiness && !interrupted) {
     lock.lock();
     const bool pending = ready() == entries.end();
     lock.unlock();
     if (pending) try {
-      execution->wait_for_admission_change(observed);
+      readiness->wait(observed);
      } catch (...) {
       failed();
       interrupted = true;
@@ -139,12 +147,10 @@ void BenchmarkCompletionWindow::push(CompileExecution::Completion completion, st
  if (impl_->entries.size() == impl_->capacity) throw std::logic_error("benchmark completion window is full");
  impl_->entries.push_back({completion, std::move(settled)});
  try {
-  completion.subscribe([wake = impl_->wake, execution = impl_->execution](std::exception_ptr) {
-   {
-    const std::lock_guard lock(wake->mutex);
-    wake->changed.notify_all();
-   }
-   if (execution) execution->notify_change(CompileChange::Local);
+  completion.subscribe([wake = impl_->wake](std::exception_ptr) {
+   const std::lock_guard lock(wake->mutex);
+   wake->changed.notify_all();
+   if (wake->readiness) wake->readiness->notify();
   });
   impl_->entries.back().subscribed = true;
  } catch (...) {
@@ -307,6 +313,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
  // source facts. The kernel bounds their combined active/suspended population.
  struct LabelWork {
   CompileExecution::Completion handle;
+  CompileExecution::Continuation continuation;
   Label* label = nullptr;
   std::optional<BenchmarkLabelInput> input;
   BenchmarkSourceGeneration generation = 0;
@@ -405,7 +412,7 @@ struct BenchmarkCompilePipeline::Impl : std::enable_shared_from_this<Impl> {
   CompileExecution::Producer producer;
  };
  std::vector<RetiredCompletion> retired_completions;
- std::size_t pending = 0;
+ std::size_t pending = 0, pending_labels = 0;
  bool membership_pending = true, stopping = false, labels_first = true;
  std::exception_ptr failure;
  const std::exception_ptr retired_failure = std::make_exception_ptr(std::runtime_error("benchmark work retired before completion"));
@@ -1021,7 +1028,7 @@ void BenchmarkSourcePublication::operator()(const CachedImageReady& ready) const
   execution->images.publish(
    *state_->source, ready.image_id, state_->image_generation(ready.image_id), *this, ready.dimensions, ready.defer_pixels || state_->defer_pixels, state_->attempt, ready.payload, ready.input_root);
 }
-bool BenchmarkSourcePublication::consume(const CachedImageReady& ready) const {
+bool BenchmarkSourcePublication::consume(CachedImageReady&& ready) const {
  if (!state_) return false;
  auto execution = state_->execution.lock();
  if (!execution) return false;
@@ -1030,7 +1037,7 @@ bool BenchmarkSourcePublication::consume(const CachedImageReady& ready) const {
   if (state_->attempt != execution->images.attempt()) throw std::runtime_error("benchmark repaired image attempt retired");
   if (!state_->source->images.contains(ready.image_id) || !state_->source->images.at(ready.image_id).writer) return false;
  }
- execution->images.publish(*state_->source, ready.image_id, state_->image_generation(ready.image_id), *this, ready.dimensions, false, state_->attempt, ready.payload, ready.input_root);
+ execution->images.publish(*state_->source, ready.image_id, state_->image_generation(ready.image_id), *this, ready.dimensions, false, state_->attempt, std::move(ready.payload), ready.input_root);
  std::unique_lock lock(execution->mutex);
  const auto retired = [&] {
   return execution->stopping || state_->attempt != execution->images.attempt() || state_->source->retiring ||
@@ -1495,6 +1502,10 @@ void BenchmarkCompilePipeline::Impl::dispatch() {
 }
 bool BenchmarkCompilePipeline::Impl::ImageState::admit_labels() {
  auto& execution = execution_;
+ // Label output has a separate bounded physical service. Keep at most one
+ // conversion per CPU slot in flight through that service, leaving shared
+ // records available for image preload and source normalization.
+ if (execution.pending_labels >= execution.execution.workers()) return false;
  // Every eligible claim uses ordinary kernel admission. A blocked claim cannot
  // hide a ready sibling, and only one claim per image may own the selected slot.
  for (auto* candidate = labels_head_; candidate;) {
@@ -1549,6 +1560,7 @@ bool BenchmarkCompilePipeline::Impl::ImageState::admit_labels() {
   label.input.reset();
   label.active = work.get();
   ++execution.pending;
+  ++execution.pending_labels;
   ++label.image->source->pending;
   ++label.image->source->pending_labels;
   ++label.image->pending_labels;
@@ -1566,6 +1578,7 @@ void BenchmarkCompilePipeline::Impl::finish_label(const std::shared_ptr<LabelWor
  auto* owner = this;
  work->input.reset();
  work->output = {};
+ work->continuation = {};
  auto& product = *work->label;
  auto completion = product.completion;
  CompileExecution::Producer producer;
@@ -1584,6 +1597,7 @@ void BenchmarkCompilePipeline::Impl::finish_label(const std::shared_ptr<LabelWor
   --image.source->pending_labels;
   --image.pending_labels;
   --owner->pending;
+  --owner->pending_labels;
   product.active = nullptr;
   producer = std::move(product.producer);
  }
@@ -1592,6 +1606,10 @@ void BenchmarkCompilePipeline::Impl::finish_label(const std::shared_ptr<LabelWor
  owner->changed.notify_all();
 }
 void BenchmarkCompilePipeline::Impl::run_label(LabelWork& label, std::size_t lane) {
+ // The record bounds the entire conversion, including pinned output awaiting
+ // file capacity. Keep its annotation class until physical settlement so other
+ // classes retain their record floors while labels apply backpressure.
+ label.continuation = execution.retain_current(CompileTaskKind::Labels);
  {
   const std::lock_guard lock(mutex);
   if (stopping || label.label->retired || label.label->image->retiring || label.label->image->source->retiring) std::rethrow_exception(retired_failure);

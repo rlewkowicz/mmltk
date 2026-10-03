@@ -159,7 +159,7 @@ public:
  const auto& source_handle = extraction_lease->allowance();
  const auto publication =
   execution ? execution->source_publication(image_root, extraction_lease, decode_probe ? std::optional(decode_probe->image_id) : std::nullopt, true) : BenchmarkSourcePublication{};
- const CachedImageReadySink publish_image = [&, publication](const CachedImageReady& ready) {
+ const CachedImageReadySink publish_image = [&, publication](CachedImageReady ready) {
   if (decode_probe && ready.image_id == decode_probe->image_id && ready.payload) {
    // Bound writers report decode health through the same physical completion
    // window as ordinary extraction. A source controller must remain free to
@@ -169,7 +169,7 @@ public:
     return;
    }
    try {
-    if (!publication.consume(ready)) {
+    if (!publication.consume(std::move(ready))) {
      if (execution) {
       BenchmarkImageDecoder decoder;
       const auto header = decoder.read_header(ready.payload->encoded(), decode_probe->expected_width, decode_probe->expected_height);
@@ -644,7 +644,7 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
    source_work.emplace_back(&archive, std::move(reason));
   }
   source_work_changed.notify_one();
- });
+ }, trace);
  BenchmarkCompilePipeline::Attempt retire(pipeline);
  for (const auto source : {CoconutImageNamespace::CocoTrain, CoconutImageNamespace::CocoValidation, CoconutImageNamespace::Objects365V1, CoconutImageNamespace::Objects365V2}) {
   const bool val = source == CoconutImageNamespace::CocoValidation || source == CoconutImageNamespace::Objects365V1;
@@ -778,14 +778,28 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
  pipeline.drain();
  if (selection_started) selection_started();
  std::array<std::vector<std::uint32_t>, 2> selected;
- std::uint64_t rows_revisited = 0;
+ std::uint64_t rows_revisited = 0, settlement_batches = 0, settled_images = 0;
  BenchmarkCostSpan selection_cost(trace, BenchmarkCostKind::Selection, [&] {
   return nlohmann::json{
-   {"rows_revisited", rows_revisited}, {"selected_train", selected[0].size()}, {"selected_validation", selected[1].size()}, {"stock_validation_generation", recipe->stock_validation_generation}
+   {"rows_revisited", rows_revisited}, {"selected_train", selected[0].size()}, {"selected_validation", selected[1].size()}, {"stock_validation_generation", recipe->stock_validation_generation},
+   {"settlement_batches", settlement_batches}, {"settled_images", settled_images}
   };
  });
  std::array<std::uint64_t, 2> boxes{}, runs{};
  std::map<BenchmarkDatasetSource, std::uint64_t> eligible_by_source;
+ constexpr std::size_t settlement_capacity = 64;
+ std::array<std::array<BenchmarkSplitWriter::LabelSettlement, settlement_capacity>, 2> settlements;
+ std::array<std::size_t, 2> settlement_counts{};
+ const auto settle = [&](bool val) {
+  const auto count = std::exchange(settlement_counts[val], 0);
+  if (!count) return;
+  (val ? validation_writer : train_writer).settle_labels(std::span(settlements[val]).first(count));
+  if (trace) {
+   ++settlement_batches;
+   settled_images += count;
+  }
+ };
+ // Draining callbacks borrow the batches, including while unwinding a failure.
  BenchmarkCompletionWindow restored(std::clamp<std::size_t>(pipeline.execution().workers() * 2, 2, 64));
  const auto select = [&](const NormalizedAnnotationReadView& index, std::size_t position, const CoconutPhysicalImage& physical, const CoconutComponent* component, std::uint64_t original_generation,
                       bool val) {
@@ -826,7 +840,15 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
    if (error) std::rethrow_exception(error);
    if (!pipeline.has_image_labels(root, physical.image_id, dependency, original_generation)) throw std::logic_error("selected COCONut label claim does not occupy its physical slot");
    auto& target = val ? validation_writer : train_writer;
-   if (retained && component) target.settle_labels(*slot, component->compiled_ordinal_base(position), !component->source_ordinals_complete(position));
+   if (retained && component) {
+    const auto base = component->compiled_ordinal_base(position);
+    const auto incomplete = !component->source_ordinals_complete(position);
+    if (base || incomplete) {
+     auto& count = settlement_counts[val];
+     settlements[val][count++] = {.slot = *slot, .ordinal_incomplete = incomplete, .ordinal_base = base};
+     if (count == settlement_capacity) settle(val);
+    }
+   }
    const auto entry = target.entry(*slot);
    if (!entry.eligible()) {
     reject(physical, "required label product is unavailable");
@@ -857,6 +879,8 @@ void compile_coconut_sources(const BenchmarkCompilerConfig& config, const Benchm
  }
  pipeline.drain();
  restored.drain();
+ settle(false);
+ settle(true);
  selection_cost.finish();
  for (auto& slots : selected) std::erase(slots, std::numeric_limits<std::uint32_t>::max());
  progress.source_images(BenchmarkDatasetSource::kCoconut, selected[0].size() + selected[1].size(), selected[0].size() + selected[1].size());

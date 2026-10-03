@@ -523,11 +523,7 @@ struct ParquetContiguousFit final : std::exception {
  explicit ParquetContiguousFit(std::size_t value) : envelope(value) {}
  const char* what() const noexcept override { return "COCONut Parquet source window has no contiguous fit"; }
 };
-std::size_t replay_envelope(std::size_t observed, CompileExecution* execution) {
- if (execution) {
-  const auto normal = execution->workspace_capacity(false, detail::CompileWorkClass::Count, detail::CompileWorkspaceWindow::SharedSource);
-  observed = std::max(observed, common::math::checked_add(normal, std::size_t{1}, "Parquet exceptional envelope overflow"));
- }
+std::size_t replay_envelope(std::size_t observed) {
  // Leave room for the bank's page rounding as well as Arrow's signed sizes.
  const auto page = common::system::host_page_size();
  const auto rounded = common::math::checked_add(observed, page - 1, "Parquet exceptional alignment overflow") / page * page;
@@ -651,7 +647,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      pool->close();
      pool.reset();
      allowance = {};
-     window_bytes = replay_envelope(fit.envelope, execution);
+     window_bytes = replay_envelope(fit.envelope);
     } catch (const ParquetFormatError& error) { throw CoconutInputError("COCONut Parquet " + path.string() + ": " + error.what()); }
    }
    try {
@@ -807,9 +803,9 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
        }
        state.reader_descriptor = std::move(*descriptor);
       }
-      // Replay owns no reader pages or semantic borrowers now. The blocking
-      // exclusive reservation asks other systems to drain their idle backing;
-      // an ordinary availability probe cannot establish that global handoff.
+      // Replay owns no reader pages or semantic borrowers now. Reserve the
+      // measured envelope; admission drains idle backing while waiting, and
+      // only shapes exceeding node capacity require an exclusive handoff.
       auto next = state.replay_bytes ? std::optional<CompileAllowance>{execution->reserve(parquet_window(state.replay_bytes), parent)} : execution->try_reserve(parquet_window(), parent);
       if (!next) {
        // An idle projection can release its own retained pages without losing
@@ -954,7 +950,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
    } catch (const ParquetContiguousFit& fit) {
     // Close every idle reader before waiting: each may retain its own Arrow
     // pages. Batch borrowers drain at complete semantic boundaries, with
-    // settlement releasing their input custody before exclusive admission.
+    // settlement releasing their input custody before the larger admission.
     retire_projections();
     for (auto& other : readers) {
      for (const auto& completion : other.consumers) {
@@ -964,7 +960,7 @@ void read_coconut_parquet(std::span<const std::filesystem::path> shards, const C
      other.consumers.clear();
     }
     if (settle_consumers) settle_consumers();
-    state.replay_bytes = replay_envelope(fit.envelope, execution);
+    state.replay_bytes = replay_envelope(fit.envelope);
     replay = &state;
     trace_benchmark_event(trace, "benchmark.coconut.projection_replay", [&] {
      const auto snapshot = execution ? execution->snapshot() : detail::CompileExecutionSnapshot{};

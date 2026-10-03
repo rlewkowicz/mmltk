@@ -110,6 +110,7 @@ MMLTK_PERCEPTUAL_HD inline Moment merge(Moment a, float aw, Moment b, float bw) 
 }
 MMLTK_PERCEPTUAL_HD inline float contrast_ratio(float low, float within) { return low >= variance_threshold ? ::sqrtf(1.0F + ::fmaxf(0, within) / low) : low_variance_ratio; }
 MMLTK_PERCEPTUAL_HD inline float multiply_add(float a, float b, float c) { return ::fmaf(a, b, c); }
+MMLTK_PERCEPTUAL_HD inline float sum_squares(float a, float b, float c, float d) { return a * a + b * b + c * c + d * d; }
 template <class Value>
 MMLTK_PERCEPTUAL_HD inline CoefficientValue<Value> patch(const MomentValue<Value>& a, const MomentValue<Value>& b, const MomentValue<Value>& c, const MomentValue<Value>& d) {
  CoefficientValue<Value> result;
@@ -117,7 +118,7 @@ MMLTK_PERCEPTUAL_HD inline CoefficientValue<Value> patch(const MomentValue<Value
   const Value db = b.mean[k] - a.mean[k], dc = c.mean[k] - a.mean[k], dd = d.mean[k] - a.mean[k];
   const Value offset = (db + dc + dd) * 0.25F;
   const Value rb = db - offset, rc = dc - offset, rd = dd - offset;
-  const Value low = (offset * offset + rb * rb + rc * rc + rd * rd) * 0.25F;
+  const Value low = sum_squares(offset, rb, rc, rd) * 0.25F;
   const Value within = (a.variance[k] + b.variance[k] + c.variance[k] + d.variance[k]) * 0.25F;
   result.ratio[k] = contrast_ratio(low, within);
   result.center[k] = a.mean[k] + offset;

@@ -227,6 +227,7 @@ def main():
         "scope": "read-only container capability observation; no content read, writes, CUDA allocation, or benchmark",
         "source_path": arguments.source_path,
         "kernel": platform.uname()._asdict(),
+        "cpu": command("lscpu", "--json"),
         "gpu": command("nvidia-smi", "--query-gpu=name,driver_version,pci.bus_id,memory.total", "--format=csv"),
         "gpu_topology": command("nvidia-smi", "topo", "-m"),
         "numa_hardware": command("numactl", "--hardware"),
@@ -272,6 +273,18 @@ def main():
         }
         report["filesystem"] = command("findmnt", "--json", "--target", arguments.compiled_file,
                                        "--output", "SOURCE,FSTYPE,TARGET,OPTIONS,MAJ:MIN")
+        try:
+            capacity = os.statvfs(arguments.compiled_file)
+            report["filesystem_capacity"] = {
+                "status": "observed",
+                "total_bytes": capacity.f_blocks * capacity.f_frsize,
+                "free_bytes": capacity.f_bfree * capacity.f_frsize,
+                "available_bytes": capacity.f_bavail * capacity.f_frsize,
+                "fragment_bytes": capacity.f_frsize,
+                "scope": "instantaneous capacity; unrelated writers can consume it",
+            }
+        except OSError as error:
+            report["filesystem_capacity"] = unavailable(error)
         report["block_devices"] = command("lsblk", "--json", "--output",
                                           "NAME,MAJ:MIN,TYPE,PKNAME,MODEL,TRAN,ROTA,LOG-SEC,PHY-SEC")
         report["direct_io"] = direct_io(arguments.compiled_file)

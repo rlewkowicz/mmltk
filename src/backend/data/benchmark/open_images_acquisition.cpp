@@ -676,14 +676,14 @@ class OpenImagesAcquisition final {
     group.images[result.input.position - group.begin] = ImageState::Available;
     const auto local = result.input.position - group.begin;
     auto payload = inputs.retain(std::move(result.input), std::move(result.file_payload));
-    const CachedImageReady ready{image.source_image_id, std::pair{result.width, result.height}, execution != nullptr, payload};
+    CachedImageReady ready{image.source_image_id, std::pair{result.width, result.height}, execution != nullptr, std::move(payload)};
     if (decode_probe && image.source_image_id == decode_probe->image_id) {
      const auto path = cached_image_path(image_root, image.source_image_id);
      try {
       progress->source_activity(BenchmarkDatasetSource::kOpenImagesV7, "Full-decode checking repaired Open Images JPEG " + std::to_string(image.source_image_id));
       if (repair_input) repair_input(image.source_image_id);
       try {
-       if (!group.publication.consume(ready)) {
+       if (!group.publication.consume(std::move(ready))) {
         // Standalone acquisition has no canonical pixel consumer. Its saved
         // cache artifact still supplies the one acceptance decode.
         BenchmarkImageValidator validator;

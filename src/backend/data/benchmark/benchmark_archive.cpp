@@ -388,6 +388,69 @@ struct BenchmarkArchive::Impl {
   throw_if_benchmark_cancelled(cancellation);
   if (status < ARCHIVE_WARN) failure(reader.get(), "cannot open archive");
  }
+ bool next_header(Cancellation observed) {
+  auto& s = *this;
+  s.cancellation = observed;
+  throw_if_benchmark_cancelled(observed);
+  if (s.direct) {
+   s.open(s.current.header, observed, s.current.ordinal);
+   s.direct = false;
+   if (!next_header(observed)) return false;
+  }
+  int status = ARCHIVE_RETRY;
+  for (int retry = 0; retry < 8 && status == ARCHIVE_RETRY; ++retry) status = archive_read_next_header(s.reader.get(), &s.entry);
+  throw_if_benchmark_cancelled(observed);
+  s.started = true;
+  if (status == ARCHIVE_EOF) return false;
+  if (status != ARCHIVE_OK && status != ARCHIVE_WARN) failure(s.reader.get(), "cannot read archive header");
+  const char* path = archive_entry_pathname(s.entry);
+  if (!path) throw BenchmarkArchiveError("archive member has no name");
+  s.safe_name = true;
+  try {
+   s.name = (std::string_view(path) == "." || std::string_view(path) == "./") ? "." : canonical_benchmark_archive_member(path);
+  } catch (const BenchmarkArchiveError&) {
+   s.name = path;
+   s.safe_name = false;
+  }
+  s.is_regular = archive_entry_filetype(s.entry) == AE_IFREG && !archive_entry_symlink(s.entry) && !archive_entry_hardlink(s.entry);
+  const auto size = archive_entry_size(s.entry);
+  if (size < 0) throw BenchmarkArchiveError("negative archive member size");
+  s.current = {
+   checked_add(s.origin, checked_cast<std::uint64_t>(archive_read_header_position(s.reader.get()), "archive header position overflow"), "archive position overflow"), static_cast<std::uint64_t>(size),
+   s.next_ordinal++, {}
+  };
+  s.raw_tar = !s.compressed && archive_filter_count(s.reader.get()) == 1 && archive_filter_code(s.reader.get(), 0) == ARCHIVE_FILTER_NONE &&
+              archive_format(s.reader.get()) == ARCHIVE_FORMAT_TAR_USTAR && archive_entry_sparse_count(s.entry) == 0;
+  // Member locations are canonical metadata; conflicting required identities are
+  // checked by consumers when encountered, never by draining an unused tail.
+  s.current.raw = archive_format(s.reader.get()) == ARCHIVE_FORMAT_TAR_USTAR && archive_entry_sparse_count(s.entry) == 0 && archive_filter_count(s.reader.get()) == 1 &&
+                  archive_filter_code(s.reader.get(), 0) == ARCHIVE_FILTER_NONE;
+  const auto [stored, inserted] = s.positions.try_emplace(s.name, s.current);
+  if (!inserted && stored->second.ordinal != s.current.ordinal) stored->second.conflict = true;
+  return true;
+ }
+ template <class Match>
+ bool scan(Match&& match, Cancellation observed) {
+  for (;;) {
+   bool found = false, exhausted = false;
+   // Replaying a format context advances metadata under one bounded CPU grant.
+   // Cancellation remains checked at every header, and unrelated classes get
+   // another scheduling boundary after at most 64 skipped entries.
+   cpu([&] {
+    for (unsigned i = 0; i < 64; ++i) {
+     if (!next_header(observed)) {
+      exhausted = true;
+      break;
+     }
+     if (match()) {
+      found = true;
+      break;
+     }
+    }
+   });
+   if (found || exhausted) return found;
+  }
+ }
  void cpu(const std::function<void()>& work) const {
   if (execution && !external_cpus)
    execution->run(CompileTaskKind::Archive, {}, [&](std::size_t) { work(); }, credits);
@@ -423,44 +486,9 @@ bool BenchmarkArchive::next(Cancellation cancellation) {
  s.cancellation = cancellation;
  throw_if_benchmark_cancelled(cancellation);
  if (!s.reader) s.resume(s.workspace_bytes);
- if (s.direct) {
-  s.cpu([&] { s.open(s.current.header, cancellation, s.current.ordinal); });
-  s.direct = false;
-  if (!next(cancellation)) return false;
- }
- int status = ARCHIVE_RETRY;
- s.cpu([&] {
-  for (int retry = 0; retry < 8 && status == ARCHIVE_RETRY; ++retry) status = archive_read_next_header(s.reader.get(), &s.entry);
- });
- throw_if_benchmark_cancelled(cancellation);
- s.started = true;
- if (status == ARCHIVE_EOF) return false;
- if (status != ARCHIVE_OK && status != ARCHIVE_WARN) failure(s.reader.get(), "cannot read archive header");
- const char* path = archive_entry_pathname(s.entry);
- if (!path) throw BenchmarkArchiveError("archive member has no name");
- s.safe_name = true;
- try {
-  s.name = (std::string_view(path) == "." || std::string_view(path) == "./") ? "." : canonical_benchmark_archive_member(path);
- } catch (const BenchmarkArchiveError&) {
-  s.name = path;
-  s.safe_name = false;
- }
- s.is_regular = archive_entry_filetype(s.entry) == AE_IFREG && !archive_entry_symlink(s.entry) && !archive_entry_hardlink(s.entry);
- const auto size = archive_entry_size(s.entry);
- if (size < 0) throw BenchmarkArchiveError("negative archive member size");
- s.current = {
-  checked_add(s.origin, checked_cast<std::uint64_t>(archive_read_header_position(s.reader.get()), "archive header position overflow"), "archive position overflow"), static_cast<std::uint64_t>(size),
-  s.next_ordinal++, {}
- };
- s.raw_tar = !s.compressed && archive_filter_count(s.reader.get()) == 1 && archive_filter_code(s.reader.get(), 0) == ARCHIVE_FILTER_NONE &&
-             archive_format(s.reader.get()) == ARCHIVE_FORMAT_TAR_USTAR && archive_entry_sparse_count(s.entry) == 0;
- // Member locations are canonical metadata; conflicting required identities are
- // checked by consumers when encountered, never by draining an unused tail.
- s.current.raw = archive_format(s.reader.get()) == ARCHIVE_FORMAT_TAR_USTAR && archive_entry_sparse_count(s.entry) == 0 && archive_filter_count(s.reader.get()) == 1 &&
-                 archive_filter_code(s.reader.get(), 0) == ARCHIVE_FILTER_NONE;
- const auto [stored, inserted] = s.positions.try_emplace(s.name, s.current);
- if (!inserted && stored->second.ordinal != s.current.ordinal) stored->second.conflict = true;
- return true;
+ bool result = false;
+ s.cpu([&] { result = s.next_header(cancellation); });
+ return result;
 }
 const std::string& BenchmarkArchive::member() const { return impl_->name; }
 bool BenchmarkArchive::regular() const { return impl_->is_regular; }
@@ -598,8 +626,7 @@ bool BenchmarkArchive::seek(std::string_view member, Cancellation cancellation) 
  // ZIP and extended tar keep the library's full format context. A requested
  // reread is necessary; this is never a census or separate validation pass.
  s.cpu([&] { s.open(0, cancellation); });
- while (next(cancellation))
-  if (s.name == member) return true;
+ if (s.scan([&] { return s.name == member; }, cancellation)) return true;
  throw BenchmarkArchiveError("archive member disappeared from opened generation");
 }
 void BenchmarkArchive::visit_known(std::span<const std::string> members, const std::function<void(std::size_t)>& consume, Cancellation cancellation) {
@@ -633,19 +660,15 @@ void BenchmarkArchive::visit_known(std::span<const std::string> members, const s
   if (direct) {
    if (!seek(name, cancellation)) throw BenchmarkArchiveError("archive member disappeared from opened generation");
   } else {
-   bool found = false;
-   while (next(cancellation)) {
-    // ZIP can consume a data descriptor during either read or skip. Its byte
-    // header position therefore depends on the earlier body-consumption path.
-    // Entry order is stable across both traversals of this opened generation.
-    if (position() < required.position.ordinal) continue;
-    if (position() != required.position.ordinal || member() != name || size() != required.position.bytes)
-     throw BenchmarkArchiveError(
-      "archive visit identity mismatch: expected " + name + " at entry " + std::to_string(required.position.ordinal) + ", found " + member() + " at entry " + std::to_string(position()));
-    found = true;
-    break;
-   }
+   restore(cancellation);
+   if (!s.reader) s.resume(s.workspace_bytes);
+   const bool found = s.scan([&] { return s.current.ordinal >= required.position.ordinal; }, cancellation);
    if (!found) throw BenchmarkArchiveError("archive member disappeared from opened generation");
+   // ZIP data descriptors make byte positions depend on prior read/skip work.
+   // Stable entry order preserves identity across both traversal paths.
+   if (position() != required.position.ordinal || member() != name || size() != required.position.bytes)
+    throw BenchmarkArchiveError(
+     "archive visit identity mismatch: expected " + name + " at entry " + std::to_string(required.position.ordinal) + ", found " + member() + " at entry " + std::to_string(position()));
   }
   consume(required.index);
  }

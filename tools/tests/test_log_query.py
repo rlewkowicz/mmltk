@@ -1806,6 +1806,31 @@ class FileQueryTests(unittest.TestCase):
         with self.assertRaisesRegex(logs.QueryError, "truncated"):
             list(source.records())
 
+    def test_recent_input_preserves_physical_lines_and_limits_evidence(self):
+        for ending in ("", "\n"):
+            with self.subTest(ending=ending):
+                path = self.write("recent.jsonl", "malformed {\n" + "x" * (1024 * 1024 + 7)
+                                  + '\n{"event":"earlier","id":7}\n\n{"event":"ready","id":7}'
+                                  + '\n{"event":"done","id":7}' + ending)
+                status, rows, diagnostics = self.exported(str(path), "--last-lines", "3", "--strict",
+                                                         "-q", "@event=done", "--correlate", "id")
+                self.assertEqual(status, 0)
+                self.assertEqual([row["_log"]["line"] for row in rows], [5, 6])
+                self.assertIn("Partial input", diagnostics)
+                self.assertIn("starting at line 4", diagnostics)
+                self.assertIn("1 matched, 1 correlated", diagnostics)
+                source = logs.LogFile.capture(path, self.root).recent(1)
+                with path.open("a", encoding="utf-8") as output:
+                    output.write("\nappended\n")
+                self.assertEqual([row.line for row in source.records()], [6])
+                with self.assertRaisesRegex(logs.QueryError, "changed during correlation"):
+                    list(source.records(unchanged=True))
+        for content in ("", "\n", "one", "one\n", "one\ntwo"):
+            path = self.write("short.log", content)
+            source = logs.LogFile.capture(path, self.root)
+            self.assertEqual([(row.line, row.raw) for row in source.recent(10).records()],
+                             [(row.line, row.raw) for row in source.records()])
+
     def test_retention_is_bounded_deterministic_and_counts_all_matches(self):
         self.write("b.jsonl", [{"event": "tick", "steady_ns": time} for time in (5, 1, 3)])
         self.write("a.jsonl", [{"event": "tick", "steady_ns": time} for time in (4, 2, 3)])

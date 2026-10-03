@@ -1531,7 +1531,7 @@ TEST_CASE("compile preparation uses owner capacities protected reserves and the 
   CHECK(ordinary % page == 0);
  }
 }
-TEST_CASE("compile arena windows prefer small ordinary extents and retain physical borrowers", "[backend][data][compile][resources]") {
+TEST_CASE("compile arena windows share ordinary node capacity and retain physical borrowers", "[backend][data][compile][resources]") {
  using namespace mmltk::backend::data::detail;
  const auto window = GENERATE(CompileWorkspaceWindow::Task, CompileWorkspaceWindow::SharedSource, CompileWorkspaceWindow::Compaction);
  CAPTURE(window);
@@ -1589,6 +1589,21 @@ TEST_CASE("compile arena windows prefer small ordinary extents and retain physic
  CHECK(bank.snapshot().reused == 1);
  CHECK(bank.snapshot().resident == plan.budget);
  CHECK(bank.snapshot().physical_retirements == 0);
+ reused = {};
+ middle = {};
+ large = {};
+ // One larger image can use several planning contexts while protected
+ // completion, source, and compaction borrowers remain physically live.
+ const auto ordinary = plan.budget - plan.protected_bytes;
+ REQUIRE(ordinary > plan.context_bytes);
+ REQUIRE(bank.normal_fit(ordinary));
+ auto combined = bank.acquire(ordinary, false);
+ CHECK_FALSE(combined.exceptional());
+ CHECK(combined.bytes().data() == base);
+ CHECK(bank.snapshot().observation.backing_regions == 1);
+ CHECK(bank.snapshot().observation.largest_ordinary_capacity == ordinary);
+ CHECK(bank.snapshot().exceptional_reserved == 0);
+ CHECK(bank.snapshot().resident == plan.budget);
 }
 TEST_CASE("Directory annotations preserve external JSON presence and last-key interpretation", "[backend][data][compiler]") {
  const mmltk::testsupport::ScopedTempDir root("directory-json-presence");
@@ -1722,6 +1737,7 @@ TEST_CASE("Directory one-core continuations keep ready labels running behind hel
  using mmltk::testsupport::release_test_promise;
  const bool cancel = GENERATE(false, true);
  const mmltk::testsupport::ScopedTempDir root("directory-one-core-ready");
+ CAPTURE(cancel);
  const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 8, .num_images = 2};
  create_synthetic_dataset(fixture);
  auto config = compiler_config(fixture);
@@ -1740,15 +1756,22 @@ TEST_CASE("Directory one-core continuations keep ready labels running behind hel
  mmltk::testsupport::TestGate gate("Directory prepared extent physical completion");
  struct Observations {
   mmltk::testsupport::TestGate::Receipt receipt;
-  std::promise<void> held, labels;
-  std::shared_future<void> output_ready;
+  std::promise<void> opened, held, labels;
+  std::shared_future<void> source_ready, output_ready;
   std::atomic<bool> holding{false}, label_seen{false}, invalid_budget{false};
   std::atomic<std::uint64_t> locked{0};
   std::atomic<std::size_t> continuations{0};
-  explicit Observations(mmltk::testsupport::TestGate::Receipt value) : receipt(std::move(value)), output_ready(held.get_future().share()) {}
+  mmltk::backend::data::benchmark_internal::BenchmarkTraceSink trace = mmltk::backend::data::testsupport::benchmark_trace();
+  explicit Observations(mmltk::testsupport::TestGate::Receipt value) : receipt(std::move(value)), source_ready(opened.get_future().share()), output_ready(held.get_future().share()) {}
  } observations(gate.receipt());
  const DirectoryCompileObservation observer{&observations, [](void* context, CompileTaskKind kind, std::uint32_t image, bool complete) {
   auto& state = *static_cast<Observations*>(context);
+  if (state.trace) state.trace("directory.task", {{"kind", static_cast<unsigned>(kind)}, {"image", image}, {"complete", complete}});
+  if (kind == CompileTaskKind::Archive && image == 1 && complete) release_test_promise(state.opened);
+  // Open the peer before prepared Output 0 can hold the sole file service.
+  // This completion has returned its CPU grant, so the service can open that
+  // source on the same one-CPU budget while this physical callback waits.
+  if (kind == CompileTaskKind::Header && image == 0 && complete) state.source_ready.wait();
   if (kind == CompileTaskKind::Output && image == 0 && complete) {
    state.holding.store(true);
    release_test_promise(state.held);
@@ -1785,6 +1808,7 @@ TEST_CASE("Directory one-core continuations keep ready labels running behind hel
  std::future<void> compile;
  const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
   (void)cancellation.RequestCancel();
+  release_test_promise(observations.opened);
   release_test_promise(observations.held);
   gate.Release();
   if (compile.valid()) compile.wait();

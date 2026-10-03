@@ -303,10 +303,24 @@ CompileArenaBank::CompileArenaBank(const CompileWorkspacePlan& plan, std::span<c
  state.released = std::move(released);
  state.exceptional_node = nodes.front();
  state.observing = observe;
- // Preserve the prepared physical allocations and their resolved CPU placement.
- // Every ordinary byte, including the tail after protected windows, is usable.
- state.memory.reserve(plan.contexts + 1);
- state.regions.reserve(plan.contexts + plan.completion.size() + 3);
+ // Planning assigns capacity to CPU placements, not physical allocation
+ // boundaries. Pool each node's ordinary bytes so an image larger than one
+ // planning context can coexist with other work inside the fixed budget.
+ struct NodeCapacity {
+  int node;
+  std::size_t bytes;
+ };
+ std::vector<NodeCapacity> capacities{{nodes.front(), static_cast<std::size_t>(plan.budget - committed + protected_bytes)}};
+ for (std::size_t i = 0; i < plan.context_capacities.size(); ++i) {
+  const auto node = nodes[i];
+  const auto capacity = std::ranges::find(capacities, node, &NodeCapacity::node);
+  if (capacity == capacities.end())
+   capacities.push_back({node, plan.context_capacities[i]});
+  else
+   capacity->bytes += plan.context_capacities[i];
+ }
+ state.memory.reserve(capacities.size());
+ state.regions.reserve(capacities.size() + plan.completion.size() + 2);
  const auto allocate = [&](std::size_t bytes, int node) {
   state.memory.emplace_back(node, NumaMemory::Lock::Pages);
   try {
@@ -323,14 +337,16 @@ CompileArenaBank::CompileArenaBank(const CompileWorkspacePlan& plan, std::span<c
   value.free_bytes = bytes.size();
   value.insert(bytes.data(), bytes.size(), nullptr, nullptr);
  };
- std::size_t used = 0;
- for (std::size_t i = 0; i < plan.context_capacities.size(); ++i) {
-  const auto bytes = plan.context_capacities[i];
-  used += bytes;
-  region(allocate(bytes, nodes[i % nodes.size()]));
+ std::span<std::byte> tail;
+ for (const auto& capacity : capacities) {
+  auto memory = capacity.bytes ? allocate(capacity.bytes, capacity.node) : std::span<std::byte>{};
+  if (capacity.node == nodes.front()) {
+   const auto ordinary = memory.size() - protected_bytes;
+   region(memory.first(ordinary));
+   tail = memory.subspan(ordinary);
+  } else
+   region(memory);
  }
- const auto remaining = static_cast<std::size_t>(plan.budget) - used;
- auto tail = remaining ? allocate(remaining, nodes.front()) : std::span<std::byte>{};
  for (std::size_t i = 0; i < plan.completion.size(); ++i)
   if (const auto bytes = plan.completion[i]) {
    region(tail.first(bytes), static_cast<CompileWorkClass>(i));
@@ -343,7 +359,6 @@ CompileArenaBank::CompileArenaBank(const CompileWorkspacePlan& plan, std::span<c
    tail = tail.subspan(bytes);
   }
  }
- region(tail);
 }
 const CompileWorkspacePlan& CompileArenaBank::plan() const noexcept { return state_->plan; }
 bool CompileArenaBank::fits(std::size_t bytes, bool completion, CompileWorkClass kind, CompileWorkspaceWindow window) const {

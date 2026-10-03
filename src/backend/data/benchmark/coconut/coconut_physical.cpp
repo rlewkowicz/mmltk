@@ -96,6 +96,7 @@ struct CoconutPhysicalMembership::Impl {
  Cancellation cancellation;
  Progress progress;
  Repair repair;
+ BenchmarkTraceSink trace;
  mutable std::mutex mutex;
  mutable std::condition_variable changed;
  // Only registrations own their completion/callback. This routing table
@@ -133,8 +134,8 @@ struct CoconutPhysicalMembership::Impl {
   }
  }
  Impl(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& layout, detail::StorageReservationPool& reservations,
-  BenchmarkCompilePipeline& pipeline, Cancellation cancel, Progress observer, Repair recover)
-     : cache(&layout), storage(&reservations), execution(&pipeline), cancellation(cancel), progress(std::move(observer)), repair(std::move(recover)) {
+  BenchmarkCompilePipeline& pipeline, Cancellation cancel, Progress observer, Repair recover, BenchmarkTraceSink diagnostics)
+     : cache(&layout), storage(&reservations), execution(&pipeline), cancellation(cancel), progress(std::move(observer)), repair(std::move(recover)), trace(std::move(diagnostics)) {
   artifacts.reserve(admitted.size());
   for (auto& archive : admitted) artifacts.push_back({&archive, cache->source_images(benchmark_source_name(archive.origin.artifact.source)) / archive.origin.cache_shard});
   for (const auto& release : catalog.releases)
@@ -193,6 +194,7 @@ struct CoconutPhysicalMembership::Impl {
  // The pointers in this inspection are borrowed only while mutex is held.
  Inspection inspect_locked(CoconutEdition edition, const CoconutRecord& record, const std::optional<CoconutPhysicalName>& objects) const {
   Inspection result;
+  bool excluded = false;
   const auto id = objects ? objects->id : record.image_id;
   const auto selected = releases.find(edition);
   const auto sources = objects ? std::span<const CoconutImageNamespace>(&objects->source, 1) : coconut_release_sources(edition);
@@ -208,11 +210,17 @@ struct CoconutPhysicalMembership::Impl {
    }
    const auto& physical = found->second.physical();
    if (execution && (selected == releases.end() ||
-                     std::ranges::none_of(selected->second, [&](const auto* item) { return item->archive->origin.source == physical.source && item->archive->origin.shard == physical.shard; })))
+                     std::ranges::none_of(selected->second, [&](const auto* item) { return item->archive->origin.source == physical.source && item->archive->origin.shard == physical.shard; }))) {
+    excluded = true;
     continue;
+   }
    result.image = &found->second;
   }
   result.terminal = !execution || (result.image && result.image->pixels) || selected == releases.end() || std::ranges::all_of(selected->second, [](const auto* item) { return item->complete; });
+  // Discovery still settles before absence is terminal, preserving later
+  // ambiguity. A verified location outside this release is already known;
+  // replacing its eligible archives cannot make that location eligible.
+  if (!result.image && excluded) return result;
   if (execution && result.terminal && (!result.image || !result.image->pixels) && repair && selected != releases.end())
    for (auto* item : selected->second) {
     const auto& origin = item->archive->origin;
@@ -293,8 +301,8 @@ void CoconutPhysicalMembership::Registration::subscribe(std::function<void(std::
  if (state_) state_->completion.completion().subscribe(std::move(callback));
 }
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<AdmittedRecipeArchive> admitted, const CoconutRecipeCatalog& catalog, bool explicit_catalog, const BenchmarkCacheLayout& cache,
- detail::StorageReservationPool& storage, BenchmarkCompilePipeline& execution, Cancellation cancellation, Progress progress, Repair repair)
-    : impl_(std::make_shared<Impl>(admitted, catalog, explicit_catalog, cache, storage, execution, cancellation, std::move(progress), std::move(repair))) {}
+ detail::StorageReservationPool& storage, BenchmarkCompilePipeline& execution, Cancellation cancellation, Progress progress, Repair repair, BenchmarkTraceSink trace)
+    : impl_(std::make_shared<Impl>(admitted, catalog, explicit_catalog, cache, storage, execution, cancellation, std::move(progress), std::move(repair), std::move(trace))) {}
 CoconutPhysicalMembership::CoconutPhysicalMembership(std::span<const CoconutPhysicalImage> images, Cancellation cancellation) : impl_(std::make_shared<Impl>(images, cancellation)) {}
 CoconutPhysicalMembership::~CoconutPhysicalMembership() = default;
 const CoconutPhysicalImage* CoconutPhysicalMembership::find(CoconutImageNamespace source, std::uint64_t id) const noexcept {
@@ -540,8 +548,20 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
    repairs.push_back(image);
  };
  std::unique_ptr<BenchmarkArchive> archive_reader;
+ BenchmarkTraceSink publication_trace;
+ if (state.trace) publication_trace = [&](std::string_view event, const nlohmann::json& value) {
+  auto fields = value;
+  fields["artifact"] = archive.origin.artifact.artifact_id;
+  state.trace(event, fields);
+ };
  BenchmarkCompletionWindow publications(window_size, &execution.execution(), [&] {
-  if (archive_reader && execution.execution().resource_pressure()) archive_reader->suspend();
+  if (archive_reader && execution.execution().resource_pressure()) {
+   trace_benchmark_event(publication_trace, "benchmark.images.pixel_wait", [&] {
+    return nlohmann::json{{"member", archive_reader->member()}, {"decoder_bytes", archive_reader->retained_workspace_bytes()}};
+   });
+   if (publication_trace && archive_reader->retained_workspace_bytes()) trace_compile_execution(publication_trace, "benchmark.images.pressure", execution.execution().snapshot());
+   archive_reader->suspend();
+  }
  });
  // Capture source/image generations and mutation custody before any file work
  // is accepted. Only header facts and the ticket cross into file completion;
@@ -667,7 +687,7 @@ bool CoconutPhysicalMembership::consume(AdmittedRecipeArchive& archive, const st
  std::vector<CoconutPhysicalImage> inventory;
  std::unordered_set<std::uint64_t> encountered;
  artifact.unreadable.clear();
- BenchmarkImagePublication write_pool(artifact.root, cancellation, state.storage, lease->allowance(), &execution, directory.get(), true, reader, {});
+ BenchmarkImagePublication write_pool(artifact.root, cancellation, state.storage, lease->allowance(), &execution, directory.get(), true, reader, publication_trace);
  const auto read_source = [&](const CoconutPhysicalImage& image) {
   try {
    reader.require_regular(BenchmarkEncodedImage::normal_window_bytes);

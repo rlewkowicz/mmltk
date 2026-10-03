@@ -211,7 +211,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
  };
  BenchmarkCompletionWindow pixels(
   request.execution ? std::clamp<std::size_t>(request.execution->execution().workers() * 2, 2, 64) : 1, request.execution ? &request.execution->execution() : nullptr, quiesce);
- const auto publish = [&](const CachedImageReady& ready, bool source_read, bool delivered = false, std::exception_ptr publication_error = {}, std::optional<BenchmarkSourceGeneration> admitted = {}) {
+ const auto publish = [&](CachedImageReady ready, bool source_read, bool delivered = false, std::exception_ptr publication_error = {}, std::optional<BenchmarkSourceGeneration> admitted = {}) {
   pixels.make_room();
   const auto id = ready.image_id;
   if (publication_error && !ready.payload) std::rethrow_exception(publication_error);
@@ -220,7 +220,7 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   CompileExecution::Completion image_completion;
   try {
    if (publication_error) std::rethrow_exception(publication_error);
-   if (!delivered && request.image_ready) request.image_ready(ready);
+   if (!delivered && request.image_ready) request.image_ready(std::move(ready));
    if (request.execution) image_completion = request.execution->image_completion(request.output_root, id);
   } catch (const InvalidImageError&) {
    CompileExecution::CompletionSource rejected;
@@ -357,9 +357,8 @@ CachedImageDirectory extract_selected_archive_images(ArchiveExtractionRequest re
   if (std::filesystem::exists(cached_image_path(request.output_root, *image_id))) invalidate_cached_image_proofs(request.output_root);
   try {
    const auto generation = request.execution ? request.execution->image_generation(request.output_root, *image_id) : 0;
-   write_pool.submit(*image_id, std::move(input), header, [&](const CachedImageReady& ready) {
-    if (request.image_ready) request.image_ready(ready);
-   }, [&, generation](const CachedImageReady& ready, std::exception_ptr error) { publish(ready, true, true, error, generation); });
+   write_pool.submit(*image_id, std::move(input), header, request.image_ready,
+    [&, generation](const CachedImageReady& ready, std::exception_ptr error) { publish(ready, true, true, error, generation); });
    scheduled.emplace(*image_id);
   } catch (const InvalidImageError& error) {
    if (!request.quarantine_unavailable) throw;

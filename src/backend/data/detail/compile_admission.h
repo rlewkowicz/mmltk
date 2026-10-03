@@ -147,13 +147,13 @@ struct CompileAdmission {
   if (publish_change) publish_change(change);
  }
  [[nodiscard]] bool pressure() const noexcept { return resource_waiters || resource_jobs; }
- void change_job_pressure(bool before, bool after) noexcept {
+ void change_pressure(std::size_t& owners, bool before, bool after) noexcept {
   if (before == after) return;
   const auto previous = pressure();
   if (after)
-   ++resource_jobs;
+   ++owners;
   else
-   --resource_jobs;
+   --owners;
   if (previous != pressure()) notify(Change::Pressure);
  }
  [[nodiscard]] std::size_t descriptor_ceiling(CompileResources value) const {
@@ -347,18 +347,13 @@ struct CompileAdmission {
  }
  void change_waiters(bool add, bool resource) {
   const auto previous = pressure();
-  if (add) {
+  if (add)
    ++waiters;
-   resource_waiters += resource;
-  } else {
+  else
    --waiters;
-   resource_waiters -= resource;
-  }
+  if (resource) change_pressure(resource_waiters, !add, add);
   changed.notify_all();
-  if (previous != pressure())
-   notify(Change::Pressure);
-  else if (publish_change)
-   publish_change(Change::Cpu);
+  if (previous == pressure() && publish_change) publish_change(Change::Cpu);
  }
  struct Waiter {
   CompileAdmission& owner;

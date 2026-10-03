@@ -24,6 +24,7 @@
 #include "src/backend/data/benchmark/detail/benchmark_recipe.h"
 #include "src/backend/data/benchmark/detail/benchmark_images.h"
 #include "src/backend/data/benchmark/detail/benchmark_image_decoder.h"
+#include "src/backend/data/benchmark/detail/benchmark_image_publication.h"
 #include "src/backend/data/benchmark/detail/benchmark_storage.h"
 #include "src/backend/data/benchmark/detail/benchmark_staging.h"
 #include "src/backend/data/benchmark/detail/benchmark_curl.h"
@@ -5093,6 +5094,49 @@ TEST_CASE("archive transport seeks only consumed generations across supported fo
  input.suspend();
  CHECK_FALSE(input.next());
 }
+TEST_CASE("archive replay amortizes skipped headers across bounded CPU work", "[benchmark][coconut][archive][resources]") {
+ using namespace mmltk::backend::data::detail;
+ ScopedTempDir root("archive-replay-work");
+ int format = ARCHIVE_FORMAT_TAR_PAX_INTERCHANGE;
+ bool gzip = false;
+ SECTION("extended tar") {}
+ SECTION("GNU extended names") { format = ARCHIVE_FORMAT_TAR_GNUTAR; }
+ SECTION("ZIP") { format = ARCHIVE_FORMAT_ZIP; }
+ SECTION("compressed extended tar") { gzip = true; }
+ constexpr std::size_t count = 256;
+ std::vector<std::pair<std::string, std::string>> members;
+ for (std::size_t i = 0; i < count; ++i) members.emplace_back(std::string(140, 'p') + "/" + std::to_string(i) + ".bin", "payload " + std::to_string(i));
+ const auto path = root.path() / (gzip ? "source.tar.gz" : "source.archive");
+ tar(path, members, false, format);
+ CompileExecution execution(1, {}, {.transient_bytes = 8U << 20}, {}, [](auto, const auto&) {});
+ BenchmarkArchive input(path, &execution);
+ std::size_t discovered = 0;
+ while (input.next()) ++discovered;
+ REQUIRE(discovered == count);
+ const auto calls = [&] { return execution.snapshot().task_completed[static_cast<std::size_t>(CompileTaskKind::Archive)]; };
+ input.pause();
+ const auto before = calls();
+ REQUIRE(input.seek(members.back().first));
+ const auto last = input.read(1024);
+ CHECK(std::string(last.begin(), last.end()) == members.back().second);
+ input.suspend();
+ CHECK_FALSE(input.next());
+ const auto replay_calls = calls() - before;
+ CAPTURE(format, gzip, replay_calls);
+ CHECK(replay_calls < count / 4);
+ input.pause();
+ const std::array required{members.back().first, members[count / 2].first};
+ const auto batch_start = calls();
+ std::vector<std::size_t> order;
+ input.visit_known(required, [&](std::size_t index) {
+  order.push_back(index);
+  const auto actual = input.read(1024);
+  CHECK(std::string(actual.begin(), actual.end()) == members[index ? count / 2 : count - 1].second);
+  input.suspend();
+ });
+ CHECK(order == std::vector<std::size_t>{1, 0});
+ CHECK(calls() - batch_start < count / 4);
+}
 TEST_CASE("requested archive extraction closes before unsafe unused members", "[benchmark][coconut][archive]") {
  ScopedTempDir root("archive-unused-tail");
  const auto path = root.path() / "images.tar";
@@ -6178,19 +6222,26 @@ TEST_CASE("excluded Objects365 shards retain verified ambiguity before eligibili
  const bool conflict = GENERATE(false, true);
  ScopedTempDir root("physical-excluded-shard");
  const auto cache = BenchmarkCacheLayout::create(root.path() / "cache");
- const auto archive = cache.source_downloads("objects365") / "patch32.tar";
- auto image = objects(1);
- image.member = "patch32/objects365_v2_00000001.jpg";
- std::vector<std::pair<std::string, std::string>> members{{image.member, white_jpeg(1, 1)}};
- if (conflict) members.push_back(members.front());
- tar(archive, members);
  CoconutRecipeCatalog catalog;
  catalog.releases = {coconut_release_component(CoconutEdition::Large), coconut_release_component(CoconutEdition::XLarge)};
- catalog.images.push_back(
-  {CoconutImageNamespace::Objects365V2, 32, "patch-32", {"physical-32", "unused", archive.filename().string(), std::filesystem::file_size(archive), "", BenchmarkDatasetSource::kObjects365V2}});
+ for (const auto [shard, id] : std::array{std::pair{32U, 1U}, std::pair{17U, 2U}}) {
+  const auto archive = cache.source_downloads("objects365") / ("patch" + std::to_string(shard) + ".tar");
+  const auto image = objects(id);
+  std::vector<std::pair<std::string, std::string>> members{{image.member, white_jpeg(1, 1)}};
+  if (shard == 32 && conflict) members.push_back(members.front());
+  tar(archive, members);
+  catalog.images.push_back({CoconutImageNamespace::Objects365V2, static_cast<std::uint16_t>(shard), "patch-" + std::to_string(shard),
+   {"physical-" + std::to_string(shard), "unused", archive.filename().string(), std::filesystem::file_size(archive), "", BenchmarkDatasetSource::kObjects365V2}});
+ }
  auto admitted = local_physical_archives(cache, catalog);
  BenchmarkCompilePipeline pipeline(1, {}, {.transient_bytes = 1, .descriptors = 13});
- CoconutPhysicalMembership physical(admitted, catalog, false, cache, pipeline.storage(), pipeline);
+ unsigned repairs = 0;
+ CoconutPhysicalMembership* owner = nullptr;
+ CoconutPhysicalMembership physical(admitted, catalog, false, cache, pipeline.storage(), pipeline, {}, {}, [&](AdmittedRecipeArchive& archive, std::string) {
+  ++repairs;
+  owner->unavailable(archive);
+ });
+ owner = &physical;
  physical.admitted(admitted.front(), admitted.front().download);
  REQUIRE(physical.consume(admitted.front()));
  CoconutRecord record;
@@ -6199,6 +6250,12 @@ TEST_CASE("excluded Objects365 shards retain verified ambiguity before eligibili
  record.physical_stem = "objects365_v2_00000001";
  CHECK(physical.eligible(CoconutEdition::Large, admitted.front()));
  CHECK_FALSE(physical.eligible(CoconutEdition::XLarge, admitted.front()));
+ const auto discovering = physical.readiness(CoconutEdition::XLarge, record);
+ CHECK(discovering.terminal == conflict);
+ CHECK_FALSE(discovering.image);
+ CHECK(repairs == 0);
+ physical.admitted(admitted.back(), admitted.back().download);
+ REQUIRE(physical.consume(admitted.back()));
  const auto ready = physical.readiness(CoconutEdition::XLarge, record);
  CHECK(ready.terminal);
  CHECK_FALSE(ready.image);
@@ -6211,6 +6268,12 @@ TEST_CASE("excluded Objects365 shards retain verified ambiguity before eligibili
   REQUIRE(selected.image);
   CHECK(physical.resolve(CoconutEdition::Large, record) == *selected.image);
  }
+ CHECK(repairs == 0);
+ // A genuinely unknown identity still requests repair from the eligible set.
+ record.physical_stem = "objects365_v2_00000003";
+ (void)physical.readiness(CoconutEdition::XLarge, record);
+ CHECK(repairs == 1);
+ CHECK(physical.readiness(CoconutEdition::XLarge, record).terminal);
 }
 TEST_CASE("retained archive images keep storage after decoder CPUs return", "[benchmark][coconut][archive][pipeline]") {
  using mmltk::backend::data::detail::CompileWorkClass;
@@ -6259,7 +6322,8 @@ TEST_CASE("retained archive images keep storage after decoder CPUs return", "[be
  REQUIRE(retained);
  CHECK(retained->storage() == BenchmarkEncodedImage::Storage::Pooled);
  CHECK(std::string(retained->encoded().begin(), retained->encoded().end()) == encoded);
- CHECK(retained->allowance().bytes() == BenchmarkEncodedImage::normal_window_bytes);
+ CHECK(retained->allowance().bytes() == encoded.size());
+ CHECK(retained->allowance().workspace().size() == encoded.size());
  CHECK(execution.execution().snapshot().active == 0);
  CHECK(execution.execution().snapshot().external == 0);
  CHECK(execution.execution().try_reserve({0, 0, false, 3}).has_value());
@@ -6296,7 +6360,9 @@ TEST_CASE("oversized gzip storage admits its synchronous pixel continuation", "[
  std::atomic<bool> cancelled{false};
  const auto cancellation = mmltk::common::concurrency::CancellationObservation::Atomic(cancelled);
  const auto trace = mmltk::backend::data::testsupport::benchmark_trace();
- BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = 1, .descriptors = 13}, cancellation, trace);
+ const auto budget = GENERATE(std::uint64_t{1}, std::uint64_t{4096});
+ CAPTURE(budget);
+ BenchmarkCompilePipeline execution(1, {}, {.transient_bytes = budget, .descriptors = 13}, cancellation, trace);
  PreparedBenchmarkSplit split;
  split.name = "train";
  split.class_names = {"person"};
@@ -6321,8 +6387,9 @@ TEST_CASE("oversized gzip storage admits its synchronous pixel continuation", "[
     .cancel_requested = cancellation,
     .trace = trace,
     .image_ready =
-     [&](const CachedImageReady& ready) {
-   if (!publication.consume(ready)) throw std::runtime_error("missing synchronous pixel consumer");
+     [&](CachedImageReady ready) {
+   if (!publication.consume(std::move(ready))) throw std::runtime_error("missing synchronous pixel consumer");
+   require_condition(!ready.payload, "synchronous consumption retained its caller's encoded input");
    ++consumed;
   },
     .execution = &execution});
@@ -9756,6 +9823,84 @@ TEST_CASE("native PNG normalization borrows the pinned compile context with reta
  CHECK(execution.resource_usage().bytes == 0);
  CHECK(execution.snapshot().workspace_reuses >= 1);
 }
+TEST_CASE("archive publication retains its forward decoder through ordinary backpressure", "[benchmark][coconut][archive][resources]") {
+ using namespace std::chrono_literals;
+ if (mmltk::common::system::allowed_cpu_set().size() < 2) SKIP("requires two assigned CPUs");
+ const bool files = GENERATE(false, true);
+ const bool pressure = GENERATE(false, true);
+ CAPTURE(files, pressure);
+ ScopedTempDir directory("archive-publication-backpressure");
+ const auto path = directory.path() / "source.tar.gz", output = directory.path() / "images";
+ const auto jpeg = white_jpeg();
+ const std::array<std::pair<std::string, std::string>, 1> members{{{"1.jpg", jpeg}}};
+ tar(path, members);
+ prepare_cached_image_directory(output);
+ mmltk::common::io::FileHandle descriptor(::open(output.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+ REQUIRE(descriptor.get() >= 0);
+ BenchmarkCompilePipeline pipeline(2, {}, {.transient_bytes = 512U << 20});
+ BenchmarkArchive reader(path, &pipeline.execution());
+ REQUIRE(reader.next());
+ const auto decoder_bytes = reader.retained_workspace_bytes();
+ REQUIRE(decoder_bytes > 0);
+ mmltk::testsupport::TestGate waiting("ordinary publication capacity wait"), quiesced("publication responds to resource pressure");
+ std::atomic<unsigned> waits{0};
+ const BenchmarkTraceSink trace = [&](std::string_view event, const nlohmann::json&) {
+  if (files && pressure && event == "benchmark.images.input_released") quiesced.receipt().ArriveAndWait();
+  if (event != (files ? "benchmark.images.file_wait" : "benchmark.images.buffer_wait")) return;
+  const auto count = ++waits;
+  if (count == 1)
+   waiting.receipt().ArriveAndWait();
+  else if (count == 2 && pressure)
+   quiesced.receipt().ArriveAndWait();
+ };
+ BenchmarkImagePublication publication(output, {}, nullptr, {}, &pipeline, descriptor.get(), true, reader, trace);
+ std::vector<BenchmarkImagePublication::Input> inputs;
+ std::vector<mmltk::backend::data::detail::FileWorkQueue::Reservation> records;
+ if (files) {
+  while (auto record = pipeline.files().try_reserve_record()) records.push_back(std::move(*record));
+  REQUIRE_FALSE(records.empty());
+ } else {
+  for (unsigned i = 0; i < 4; ++i) inputs.push_back(publication.acquire(jpeg.size()));
+ }
+ std::unique_ptr<CompileResourceWait> resource_wait;
+ std::future<void> work;
+ const mmltk::testsupport::ScopedTestCleanup release([&] {
+  waiting.Release();
+  quiesced.Release();
+  resource_wait.reset();
+  inputs.clear();
+  records.clear();
+  pipeline.execution().cancel();
+  if (work.valid()) work.wait();
+ });
+ work = std::async(std::launch::async, [&] {
+  auto input = publication.acquire(jpeg.size());
+  publication.read(input);
+  require_condition(std::ranges::equal(input->encoded, std::span(reinterpret_cast<const std::uint8_t*>(jpeg.data()), jpeg.size())), "backpressure changed the opened archive payload");
+  const auto header = BenchmarkImageDecoder{}.read_header(input->encoded);
+  publication.submit(1, std::move(input), header, {}, [](const CachedImageReady&, std::exception_ptr failure) {
+   if (failure) std::rethrow_exception(failure);
+  });
+  publication.finish();
+ });
+ REQUIRE(waiting.WaitEntered(5s));
+ CHECK_FALSE(pipeline.execution().resource_pressure());
+ CHECK(reader.retained_workspace_bytes() == decoder_bytes);
+ if (pressure) {
+  resource_wait = pipeline.execution().defer_resources();
+  waiting.Release();
+  REQUIRE(quiesced.WaitEntered(5s));
+  CHECK(reader.retained_workspace_bytes() == 0);
+  resource_wait.reset();
+ }
+ inputs.clear();
+ records.clear();
+ waiting.Release();
+ quiesced.Release();
+ mmltk::testsupport::await_test_future(work, "forward publication resumes from bounded backpressure", 5s);
+ CHECK(mmltk::common::io::sha256_file(cached_image_path(output, 1)) == mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(jpeg.data()), jpeg.size())));
+ CHECK(pipeline.execution().snapshot().leased == 0);
+}
 TEST_CASE("one physical artifact refills from completed pixels while its first consumer is held", "[benchmark][coconut][pipeline]") {
  using namespace std::chrono_literals;
  if (mmltk::common::system::allowed_cpu_set().size() < 4) SKIP("requires four assigned CPUs");
@@ -9839,7 +9984,7 @@ TEST_CASE("one physical artifact refills from completed pixels while its first c
  if (cancel_write) {
   pipeline.execution().cancel();
   CHECK(consuming.wait_for(0ms) == std::future_status::timeout);
-  CHECK(pipeline.execution().snapshot().leased >= BenchmarkEncodedImage::normal_window_bytes);
+  CHECK(pipeline.execution().snapshot().leased >= members.front().second.size());
  }
  observed.held.Release();
  if (cancel_write) {
@@ -10740,10 +10885,10 @@ TEST_CASE("native staging and arena retirement precede controller settlement", "
  std::memcpy(first_box.data(), first->boxes().data(), first_box.size());
  std::memcpy(first_run.data(), first->runs().data(), first_run.size());
  // The first slice has retired before controller settlement, while the second
- // task retains its own slice. A full region can be reused without mutating
- // the first immutable output.
+ // task retains its own slice. One planned context's capacity can be reused
+ // from the shared node pool without mutating the first immutable output.
  auto reusing = std::async(std::launch::async, [&] {
-  pipeline.execution().run(CompileTaskKind::Normalize, {.bytes = pipeline.execution().workspace_capacity(), .supplied_workspace = true}, [&](std::size_t) {
+  pipeline.execution().run(CompileTaskKind::Normalize, {.bytes = plan->context_bytes, .supplied_workspace = true}, [&](std::size_t) {
    auto bytes = pipeline.execution().current_allowance().workspace();
    std::memset(bytes.data(), 0xa5, bytes.size());
   });

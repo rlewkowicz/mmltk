@@ -22,6 +22,11 @@ struct Lanes {
  friend Lanes operator*(Lanes a, Lanes b) { return _mm256_mul_ps(a.value, b.value); }
 };
 Lanes multiply_add(Lanes a, Lanes b, Lanes c) { return _mm256_fmadd_ps(a.value, b.value, c.value); }
+Lanes sum_squares(Lanes a, Lanes b, Lanes c, Lanes d) {
+ // Match scalar contraction: round b*b before the first fused addition.
+ // Intrinsic expression contraction otherwise chooses a*a as its addend.
+ return multiply_add(d, d, multiply_add(c, c, multiply_add(a, a, b * b)));
+}
 Lanes contrast_ratio(Lanes low, Lanes within) {
  const auto active = _mm256_cmp_ps(low.value, _mm256_set1_ps(variance_threshold), _CMP_GE_OQ);
  const auto denominator = _mm256_blendv_ps(_mm256_set1_ps(1), low.value, active);

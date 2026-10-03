@@ -15,11 +15,9 @@ BenchmarkImagePublication::Payload::~Payload() {
  allowance = {};
  output = {};
  if (pool) {
-  {
-   const std::lock_guard lock(pool->mutex);
-   ++pool->free;
-  }
-  if (pool->execution) pool->execution->notify_change(CompileChange::Local);
+  const std::lock_guard lock(pool->mutex);
+  ++pool->free;
+  if (pool->readiness) pool->readiness->notify();
  }
 }
 BenchmarkImagePublication::BenchmarkImagePublication(std::filesystem::path output_root, mmltk::common::concurrency::CancellationObservation cancellation, detail::StorageReservationPool* storage,
@@ -36,8 +34,9 @@ BenchmarkImagePublication::BenchmarkImagePublication(std::filesystem::path outpu
        if (execution_ && execution_->execution().resource_pressure()) reader_.suspend(parent_);
       }) {
  buffers_->free = execution ? std::clamp<std::size_t>(execution->execution().workers() * 2, 2, 8) : 1;
- buffers_->execution = execution ? &execution->execution() : nullptr;
- if (execution)
+ if (execution) {
+  buffer_readiness_ = std::make_unique<CompileExecution::Readiness>(execution->execution(), CompileChange::Pressure);
+  buffers_->readiness = buffer_readiness_.get();
   readiness_ = std::make_unique<CompileExecution::Readiness>(
    execution->execution(), CompileChange::Resources | CompileChange::Pressure | CompileChange::Local, [this](CompileExecution::Readiness::Changes changes) {
    if (!changes.retry && !includes(changes.causes, CompileChange::Local | CompileChange::Interruption)) return;
@@ -46,20 +45,27 @@ BenchmarkImagePublication::BenchmarkImagePublication(std::filesystem::path outpu
     ++resource_generation_;
    }
    resource_changed_.notify_all();
+   // Pressure registration leaves the admission generation unchanged. Relay it
+   // to completion and record waits so their controller can release a decoder.
+   if (includes(changes.causes, CompileChange::Pressure)) execution_->execution().notify_change(CompileChange::Local);
   });
+ }
 }
 BenchmarkImagePublication::~BenchmarkImagePublication() {
  try {
   reader_.suspend(parent_);
   writes_.drain();
  } catch (...) {}
+ // Retained inputs may outlive publication and its execution owner.
+ const std::lock_guard lock(buffers_->mutex);
+ buffers_->readiness = nullptr;
 }
 BenchmarkImagePublication::Input BenchmarkImagePublication::acquire(std::size_t size) {
  if (!size || size > BenchmarkEncodedImage::normal_window_bytes) throw InvalidImageError("selected benchmark archive image has an invalid size");
  // Reserve a publication record before retaining another encoded input.
  writes_.make_room();
  for (;;) {
-  const auto observed = execution_ ? execution_->execution().admission_generation() : 0;
+  const auto observed = buffer_readiness_ ? buffer_readiness_->generation() : 0;
   writes_.reap();
   throw_if_benchmark_cancelled(cancellation_);
   std::unique_lock lock(buffers_->mutex);
@@ -68,9 +74,10 @@ BenchmarkImagePublication::Input BenchmarkImagePublication::acquire(std::size_t 
    break;
   }
   lock.unlock();
-  reader_.suspend(parent_);
+  if (execution_ && execution_->execution().resource_pressure()) reader_.suspend(parent_);
+  trace_benchmark_event(trace_, "benchmark.images.buffer_wait", [&] { return nlohmann::json{{"member", reader_.member()}, {"bytes", size}, {"decoder_bytes", reader_.retained_workspace_bytes()}}; });
   if (!execution_) throw std::logic_error("standalone image input did not retire synchronously");
-  execution_->execution().wait_for_admission_change(observed);
+  buffer_readiness_->wait(observed);
   if (execution_)
    if (auto failure = execution_->execution().interruption()) std::rethrow_exception(failure);
  }
@@ -105,7 +112,7 @@ BenchmarkImagePublication::Input BenchmarkImagePublication::acquire(std::size_t 
      auto output = owner.try_reserve(CompileResources::handles(1, true), parent_);
      if (output) {
       input->output = std::move(*output);
-      auto granted = owner.try_reserve({.bytes = BenchmarkEncodedImage::normal_window_bytes,
+      auto granted = owner.try_reserve({.bytes = size,
                                         .continuation_descriptors = active_decoder ? 0U : 1U,
                                         .supplied_workspace = true,
                                         .workspace_class = detail::CompileWorkClass::Extraction,
@@ -121,6 +128,7 @@ BenchmarkImagePublication::Input BenchmarkImagePublication::acquire(std::size_t 
        }
       }
      }
+     if (trace_) trace_compile_execution(trace_, "benchmark.images.input_pressure", owner.snapshot());
      reader_.suspend(parent_);
      input->allowance = {};
      input->output = {};
@@ -173,12 +181,13 @@ void BenchmarkImagePublication::submit(std::uint64_t id, Input admitted_input, B
    if (record) break;
    // A full queue has accepted nothing. Keep input while records alone are
    // busy; under resource pressure release and replay this exact opened member.
-   reader_.suspend(parent_);
-   trace_benchmark_event(trace_, "benchmark.images.file_wait", [&] { return nlohmann::json{{"image_id", id}, {"member", reader_.member()}}; });
+   trace_benchmark_event(trace_, "benchmark.images.file_wait", [&] { return nlohmann::json{{"image_id", id}, {"member", reader_.member()}, {"decoder_bytes", reader_.retained_workspace_bytes()}}; });
    if (owner.resource_pressure()) {
+    reader_.suspend(parent_);
     const auto position = reader_.member_position();
     const auto size = admitted_input->encoded.size();
     admitted_input.reset();
+    trace_benchmark_event(trace_, "benchmark.images.input_released", [&] { return nlohmann::json{{"image_id", id}, {"member", reader_.member()}}; });
     for (;;) {
      const auto changed = owner.admission_generation();
      if (execution_->files().has_capacity()) break;

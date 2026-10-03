@@ -20,7 +20,7 @@
 #include <vector>
 namespace mmltk::backend::data::detail {
 enum class CompileTaskKind : std::uint8_t { Acquisition, Metadata, Header, Projection, Archive, Normalize, Recovery, Labels, Pixels, Gather, CacheWrite, Output, Count };
-enum class CompileParkReason : std::uint8_t { None, Dependency, Bytes, Descriptors, Cpu, Withdrawal, Continuation, Count };
+enum class CompileParkReason : std::uint8_t { None, Dependency, Bytes, Descriptors, Cpu, Withdrawal, Continuation, Fairness, Count };
 [[nodiscard]] constexpr CompileWorkClass work_class(CompileTaskKind kind) {
  switch (kind) {
   case CompileTaskKind::Acquisition: return CompileWorkClass::Acquisition;
@@ -268,10 +268,14 @@ public:
    // CPU, record and owner-local activity never requests a resource retry.
    bool retry = false;
   };
-  Readiness(CompileExecution&, CompileChange interests, std::function<void(Changes)>);
+  Readiness(CompileExecution&, CompileChange interests, std::function<void(Changes)> = {});
   // Publish only to this owner; the common wait generation still advances.
   void notify() noexcept;
   void interests(CompileChange) noexcept;
+  // Capture before checking owner state. Blocking owners retain the common
+  // interruption policy without retrying on unrelated admission activity.
+  [[nodiscard]] std::uint64_t generation() const;
+  void wait(std::uint64_t observed);
   ~Readiness();
   Readiness(const Readiness&) = delete;
   Readiness& operator=(const Readiness&) = delete;

@@ -75,6 +75,7 @@ struct Options {
  int source_width = 0, source_height = 0;
  bool perceptual = false, mixed_geometry = false, shuffle_geometry = false;
  std::string input_manifest, cache_dir, trace_file, cpu_affinity;
+ std::vector<std::string> trace_prefix;
 };
 MMLTK_REFLECT_FIELDS(Options)
 using ProfileOptions = mmltk::frameworks::reflection::CliScope<Options>;
@@ -84,6 +85,7 @@ inline constexpr std::array profile_options{
  MMLTK_CLI_OPTION(ProfileOptions, input_manifest, "Retained JPEG/PNG paths, one per line; pixels/resample only", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, cache_dir, "Retained production benchmark cache; required for coconut", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, trace_file, "Opt-in causal JSONL; omit for throughput", "Profiling"),
+ MMLTK_CLI_OPTION(ProfileOptions, trace_prefix, "Retain matching event prefixes (repeatable); observation costs remain enabled", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, test_dir, "Synthetic working directory or isolated Coconut output root", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, keep_artifacts, "Retain generated fixtures", "Profiling"),
  MMLTK_CLI_OPTION(ProfileOptions, perceptual, "Enable perceptual shrinking", "Profiling"),
@@ -121,6 +123,7 @@ Options parse_options(int argc, char** argv) {
      opts.num_epochs <= 0 || opts.shuffle_prefetch <= 0 || opts.repetitions <= 0 || opts.warmup_runs < 0 || opts.compile_workers == 0 || opts.compile_workers < -1)
   throw std::invalid_argument("invalid profile dimensions or counts");
  if (opts.mode == ProfileMode::Coconut && (opts.cache_dir.empty() || opts.width != opts.height)) throw std::invalid_argument("coconut mode requires --cache-dir and square target dimensions");
+ if (!opts.trace_prefix.empty() && opts.trace_file.empty()) throw std::invalid_argument("trace-prefix requires trace-file");
  if (!opts.input_manifest.empty() && opts.mode != ProfileMode::Pixels && opts.mode != ProfileMode::Resample) throw std::invalid_argument("retained input manifests require pixels or resample mode");
  return opts;
 }
@@ -128,9 +131,10 @@ class ProfileTrace final {
  std::ofstream output_;
  std::mutex mutex_;
  std::uint64_t run_ = 0;
+ std::vector<std::string> prefixes_;
 
 public:
- explicit ProfileTrace(const std::string& path) {
+ explicit ProfileTrace(const std::string& path, std::vector<std::string> prefixes) : prefixes_(std::move(prefixes)) {
   if (path.empty()) return;
   if (const auto parent = fs::path(path).parent_path(); !parent.empty()) fs::create_directories(parent);
   output_.open(path, std::ios::app);
@@ -140,9 +144,11 @@ public:
  [[nodiscard]] benchmark_internal::BenchmarkTraceSink sink() {
   if (!output_.is_open()) return {};
   return [this](std::string_view event, const nlohmann::json& fields) {
+   if (!prefixes_.empty() && std::ranges::none_of(prefixes_, [&](const auto& prefix) { return event.starts_with(prefix); })) return;
    const auto stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
    const std::lock_guard lock(mutex_);
    output_ << nlohmann::json{{"event", event}, {"steady_ns", stamp}, {"run_id", run_}, {"fields", fields}}.dump() << '\n';
+   if (!prefixes_.empty()) output_.flush();
   };
  }
 };
@@ -190,7 +196,7 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
  NumaMemory decode_memory(NumaTopology::Capture().permitted_nodes.front());
  for (const auto& input : inputs) {
   const auto header = decoder.read_header(input.encoded, CompileImagePolicy::Benchmark);
-  pixel_plans.push_back(compile_pixel_workspace_plan(header, policy, &layout_work));
+  pixel_plans.push_back(compile_pixel_workspace_plan(header, policy, trace ? &layout_work : nullptr));
   resize_plans.push_back(pixel_plans.back().resize_plan());
   maximum = std::max(maximum, opts.mode == ProfileMode::Resample ? resize_plans.back().bytes() : pixel_plans.back().bytes());
   if (opts.mode == ProfileMode::Resample) {
@@ -203,15 +209,17 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
   }
  }
  const auto backing = std::max<std::size_t>(host_page_size(), page_rounded_bytes(maximum));
- if (backing > CompileWorkspacePlan::ceiling / workers) throw std::length_error("profile workers exceed bounded workspace budget");
- auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(workers, {}, 0, 0, backing * workers));
+ if (backing > CompileWorkspacePlan::ceiling) throw std::length_error("profile image exceeds bounded workspace budget");
+ const auto budget = backing > CompileWorkspacePlan::ceiling / workers ? CompileWorkspacePlan::ceiling : backing * workers;
+ const std::array profiles{CompileWorkspaceProfile{backing, 0}};
+ auto plan = std::make_shared<CompileWorkspacePlan>(CompileWorkspacePlan::prepare(workers, profiles, 0, 0, budget));
  CompileExecution::Observer observer;
  if (trace) observer = [&](std::string_view event, const CompileExecutionSnapshot& value) { benchmark_internal::trace_compile_execution(trace, event, value); };
  CompileExecution execution(workers, {}, {.workspace_plan = plan}, {}, std::move(observer));
  std::vector<std::unique_ptr<CompilePixelWorkspace>> pixels;
  std::vector<std::unique_ptr<RgbImageResizer>> resizers;
  std::vector<std::vector<float>> output;
- std::vector<RgbResizeWork> resize_work(workers);
+ std::vector<RgbResizeWork> resize_work(trace ? workers : 0);
  for (std::size_t i = 0; i < workers; ++i) {
   pixels.push_back(std::make_unique<CompilePixelWorkspace>());
   resizers.push_back(std::make_unique<RgbImageResizer>(1, opts.perceptual));
@@ -236,19 +244,20 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
   if (opts.mode == ProfileMode::Resample) {
    resizers[lane]->prepare(resize_plans[i], memory);
    resizers[lane]->resize_to_planar(
-    {decoded[i].data(), {inputs[i].width, inputs[i].height, std::size_t(inputs[i].width) * 3, 0, decoded[i].size(), RgbPixelFormat::RGB8}}, destination, policy.mode, &resize_work[lane]);
+    {decoded[i].data(), {inputs[i].width, inputs[i].height, std::size_t(inputs[i].width) * 3, 0, decoded[i].size(), RgbPixelFormat::RGB8}}, destination, policy.mode,
+    trace ? &resize_work[lane] : nullptr);
   } else {
-   const CompilePixelObserver observed = [&](const CompilePixelObservation& value) {
+   CompilePixelObserver observed;
+   if (trace) observed = [&](const CompilePixelObservation& value) {
     resize_work[lane].preparations += value.resize_preparations;
     resize_work[lane].allocation_requests += value.resize_allocation_requests;
     resize_work[lane].allocation_bytes += value.resize_allocation_bytes;
-    if (trace)
-     benchmark_internal::trace_benchmark_event(trace, "compile.pixel", [&] {
-      auto fields = benchmark_internal::benchmark_observation_fields(value);
-      fields["image_id"] = index;
-      fields["input_index"] = i;
-      return fields;
-     });
+    benchmark_internal::trace_benchmark_event(trace, "compile.pixel", [&] {
+     auto fields = benchmark_internal::benchmark_observation_fields(value);
+     fields["image_id"] = index;
+     fields["input_index"] = i;
+     return fields;
+    });
    };
    pixels[lane]->write(pixel_plans[i], inputs[i].encoded, pixel_plans[i].header(), memory, destination, +[] {}, observed);
   }
@@ -259,16 +268,18 @@ void run_pixel_profile(const Options& opts, const std::vector<ProfileImageFixtur
  std::printf("cpu_profile images=%zu workers=%zu sec=%.6f images_per_sec=%.3f source_bytes_per_sec=%.3f output_bytes_per_sec=%.3f retained_decoded_bytes=%llu plan_count=%zu setup_sec=%.6f\n",
   order.size(), workers, seconds, static_cast<double>(order.size()) / seconds, static_cast<double>(source_bytes) / seconds,
   static_cast<double>(order.size() * std::size_t(opts.width) * opts.height * 12) / seconds, static_cast<unsigned long long>(retained_decoded), inputs.size(), seconds_since(setup_start, start));
- std::printf("cpu_profile layout_preparations=%llu layout_allocation_requests=%llu layout_allocation_bytes=%llu\n", static_cast<unsigned long long>(layout_work.preparations),
-  static_cast<unsigned long long>(layout_work.allocation_requests), static_cast<unsigned long long>(layout_work.allocation_bytes));
- RgbResizeWork work;
- for (const auto& lane : resize_work) {
-  work.preparations += lane.preparations;
-  work.allocation_requests += lane.allocation_requests;
-  work.allocation_bytes += lane.allocation_bytes;
+ if (trace) {
+  std::printf("cpu_profile layout_preparations=%llu layout_allocation_requests=%llu layout_allocation_bytes=%llu\n", static_cast<unsigned long long>(layout_work.preparations),
+   static_cast<unsigned long long>(layout_work.allocation_requests), static_cast<unsigned long long>(layout_work.allocation_bytes));
+  RgbResizeWork work;
+  for (const auto& lane : resize_work) {
+   work.preparations += lane.preparations;
+   work.allocation_requests += lane.allocation_requests;
+   work.allocation_bytes += lane.allocation_bytes;
+  }
+  std::printf("cpu_profile resize_preparations=%llu resize_allocation_requests=%llu resize_allocation_bytes=%llu\n", static_cast<unsigned long long>(work.preparations),
+   static_cast<unsigned long long>(work.allocation_requests), static_cast<unsigned long long>(work.allocation_bytes));
  }
- std::printf("cpu_profile resize_preparations=%llu resize_allocation_requests=%llu resize_allocation_bytes=%llu\n", static_cast<unsigned long long>(work.preparations),
-  static_cast<unsigned long long>(work.allocation_requests), static_cast<unsigned long long>(work.allocation_bytes));
  record_duration_metric("pixels", "total", start, end);
 }
 void run_loader_case(const char* label, const DatasetLoader::Config& cfg, int num_epochs, bool overlap_consumer) {
@@ -396,12 +407,13 @@ int main(int argc, char** argv) {
     file.pwrite_all(input.encoded.data(), input.encoded.size(), 0);
    }
   }
-  ProfileTrace trace_file(opts.trace_file);
+  ProfileTrace trace_file(opts.trace_file, opts.trace_prefix);
   const auto trace_sink = trace_file.sink();
   std::printf("profile mode=%s encoding=%s target=%dx%d perceptual=%d mixed_geometry=%d shuffled=%d retained_inputs=%zu trace=%d\n",
    std::string(mmltk::frameworks::reflection::enum_name(opts.mode)).c_str(), std::string(mmltk::frameworks::reflection::enum_name(opts.encoding)).c_str(), opts.width, opts.height, opts.perceptual,
    opts.mixed_geometry, opts.shuffle_geometry, inputs.size(), bool(trace_sink));
   std::printf("profile cpu_affinity=%s\n", format_cpu_list(allowed_cpu_set()).c_str());
+  for (const auto& prefix : opts.trace_prefix) std::printf("profile_trace_prefix=%s\n", prefix.c_str());
   for (std::size_t i = 0; i < inputs.size(); ++i) {
    const auto& input = inputs[i];
    std::printf("profile_input index=%zu width=%u height=%u encoded_bytes=%zu sha256=%s\n", i, input.width, input.height, input.encoded.size(),
@@ -422,6 +434,16 @@ int main(int argc, char** argv) {
     config.overwrite = true;
     if (trace_sink) config.trace = [&](std::string_view event, std::string_view fields) { trace_sink(event, nlohmann::json::parse(fields)); };
     const auto started = std::chrono::steady_clock::now();
+    config.progress = [started, next = started, phase = DatasetCompilePhase::Planning](const BenchmarkCompileProgress& value) mutable {
+     const auto now = std::chrono::steady_clock::now();
+     if (now < next && value.phase == phase) return;
+     next = now + std::chrono::seconds(5);
+     phase = value.phase;
+     std::printf("coconut_progress elapsed_sec=%.3f phase=%s phase_completed=%llu phase_total=%llu %s activity=%s\n", std::chrono::duration<double>(now - started).count(),
+      std::string(mmltk::frameworks::reflection::enum_name(phase)).c_str(), static_cast<unsigned long long>(value.completed), static_cast<unsigned long long>(value.total),
+      format_dataset_compile_tracks(value.tracks).c_str(), nlohmann::json(value.activity).dump().c_str());
+     std::fflush(stdout);
+    };
     compile_benchmark_dataset(std::move(config));
     const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     std::ifstream manifest_file(fs::path(compiled_dir(fixture)) / "benchmark_manifest.json");

@@ -1173,6 +1173,8 @@ class LogFile:
     modified_ns: int
     metadata: dict = field(default_factory=dict, compare=False)
     linked_runs: tuple = field(default=(), compare=False)
+    start_offset: int = 0
+    first_line: int = 1
 
     @classmethod
     def capture(cls, path, root):
@@ -1183,6 +1185,33 @@ class LogFile:
             raise QueryError(f"not a regular log file: {path}")
         info = resolved.stat()
         return cls(resolved, str(resolved.relative_to(root)), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+    def check_capture(self, stream, unchanged=False):
+        info = os.fstat(stream.fileno())
+        if (info.st_dev, info.st_ino) != (self.device, self.inode) or info.st_size < self.size:
+            raise QueryError(f"log was replaced or truncated during query: {self.source}")
+        if unchanged and (info.st_size, info.st_mtime_ns) != (self.size, self.modified_ns):
+            raise QueryError(f"log changed during correlation query; retry a completed capture: {self.source}")
+
+    def recent(self, count):
+        """Locate a bounded physical-line window without decoding older payloads."""
+        starts = deque([0], maxlen=count)
+        lines, offset = 1, 0
+        with self.path.open("rb") as stream:
+            self.check_capture(stream)
+            while offset < self.size:
+                block = stream.read(min(1024 * 1024, self.size - offset))
+                if not block:
+                    raise QueryError(f"log was truncated during query: {self.source}")
+                position = block.find(b"\n")
+                while position >= 0:
+                    following = offset + position + 1
+                    if following < self.size:
+                        starts.append(following)
+                        lines += 1
+                    position = block.find(b"\n", position + 1)
+                offset += len(block)
+        return replace(self, start_offset=starts[0], first_line=lines - len(starts) + 1)
 
     def records(self, unchanged=False, anchors=None, line_hint=None):
         context = TranscriptContext()
@@ -1204,13 +1233,10 @@ class LogFile:
                 yield row
 
         with self.path.open("rb") as stream:
-            info = os.fstat(stream.fileno())
-            if (info.st_dev, info.st_ino) != (self.device, self.inode) or info.st_size < self.size:
-                raise QueryError(f"log was replaced or truncated during query: {self.source}")
-            if unchanged and (info.st_size, info.st_mtime_ns) != (self.size, self.modified_ns):
-                raise QueryError(f"log changed during correlation query; retry a completed capture: {self.source}")
-            remaining = self.size
-            line = 0
+            self.check_capture(stream, unchanged)
+            stream.seek(self.start_offset)
+            remaining = self.size - self.start_offset
+            line = self.first_line - 1
             while remaining:
                 part = stream.readline(min(remaining, MAX_LINE_BYTES + 1))
                 if not part:
@@ -1235,9 +1261,7 @@ class LogFile:
             for message in messages.finish():
                 yield from parse_message(*message)
             if unchanged:
-                final = os.fstat(stream.fileno())
-                if (final.st_size, final.st_mtime_ns) != (self.size, self.modified_ns):
-                    raise QueryError(f"log changed during correlation query; retry a completed capture: {self.source}")
+                self.check_capture(stream, unchanged=True)
 
 
 MOZILLA_ARTIFACT = re.compile(
@@ -4438,6 +4462,8 @@ def argument_parser():
                         help="maximum timeline sample records; counts cover all matches (default: 20)")
     parser.add_argument("--order", choices=("time", "file", "capture", "proximity"))
     parser.add_argument("--tail", action="store_true", help="retain the last N records, displayed in ascending order")
+    parser.add_argument("--last-lines", type=bounded_integer(1, 100000), metavar="N",
+                        help="parse only the last N physical lines per file; counts, context and correlation cover only that window")
     parser.add_argument("--recursive", action="store_true", help="descend directories, including archived runs")
     parser.add_argument("--family", action="append", default=[], metavar="STEM",
                         help="discover native/acceptance/application/Firefox/Mozilla artifact siblings; repeatable")
@@ -4499,6 +4525,11 @@ def main(argv=None, *, root=None, output=None, diagnostics=None):
         if options.list_runs:
             catalog.list_runs(output, options.limit)
             return 0
+        if options.last_lines:
+            catalog.files = [source.recent(options.last_lines) for source in catalog.files]
+            print(f"Partial input: last {options.last_lines} physical lines per file; earlier context and evidence excluded.", file=diagnostics)
+            for source in catalog.files:
+                print(f"  {source.source}: starting at line {source.first_line}, byte {source.start_offset}", file=diagnostics)
         if options.family or options.history or options.run or options.related_run or options.triage:
             catalog.prepare_anchors()
         if catalog.selected_runs:

@@ -79,7 +79,7 @@ struct CompileResourceWait::State {
   State* next = nullptr;
   bool linked = false;
  } exceptional;
- bool registered = false;
+ bool registered = false, pressure = false;
  State(std::shared_ptr<CompileExecution::Impl> owner, CompileTaskKind kind, CompileResources resources, CompileAllowance parent, bool finite)
      : execution(std::move(owner)), demand{.resources = resources, .parent = std::move(parent), .finite_consumer = finite, .needs_record = kind != CompileTaskKind::Count}, successor(kind) {}
 };
@@ -110,6 +110,7 @@ struct CompileExecution::Readiness::State {
  // Pending notices are published and acknowledged under admission->mutex.
  Changes pending;
  CompileChange interests = CompileChange::None;
+ std::uint64_t generation = 0;
  bool notified = false;
  bool active = false, removed = false;
 };
@@ -280,7 +281,7 @@ struct CompileExecution::Impl {
    if (draining_request == &waiting) drain(nullptr, nullptr, 0);
    refresh_external_drain();
   }
-  admission->change_waiters(false, true);
+  admission->change_waiters(false, waiting.pressure);
  }
  std::array<ReadyQueue, kind_count> ready;
  std::list<std::shared_ptr<Job>> jobs;
@@ -307,6 +308,8 @@ struct CompileExecution::Impl {
   for (const auto& state : observers) {
    const auto delivered = state->interests & change;
    if (delivered == CompileChange::None) continue;
+   ++state->generation;
+   if (!state->callback) continue;
    state->notified = true;
    wake = true;
    state->pending.causes |= delivered;
@@ -325,9 +328,9 @@ struct CompileExecution::Impl {
  void notify_locked(CompileAdmission::Change change = CompileAdmission::Change::Cpu) noexcept { admission->notify(change); }
  void park(Job& job, CompileParkReason reason) noexcept {
   const auto resource = [](CompileParkReason value) { return value == CompileParkReason::Bytes || value == CompileParkReason::Descriptors; };
-  admission->change_job_pressure(resource(job.reason), resource(reason));
+  admission->change_pressure(admission->resource_jobs, resource(job.reason), resource(reason));
   job.reason = reason;
-  if (reason != CompileParkReason::Bytes) remove_demand(job.demand);
+  if (reason != CompileParkReason::Bytes && reason != CompileParkReason::Fairness) remove_demand(job.demand);
  }
  [[nodiscard]] bool live(std::size_t kind) const { return classes[kind].producers || classes[kind].pending || classes[kind].running; }
  void reconcile() {
@@ -770,7 +773,7 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
         // A temporary service grant does not resolve a resource predicate that
         // this record already checked. Retain its pressure until rechecked;
         // otherwise CPU acquire/release would manufacture pressure wake loops.
-        if (job.reason != CompileParkReason::Bytes && job.reason != CompileParkReason::Descriptors) {
+        if (job.reason != CompileParkReason::Bytes && job.reason != CompileParkReason::Descriptors && job.reason != CompileParkReason::Fairness) {
          if (observer) {
           job.denial = CompileResourceDenial::Cpu;
           job.observed_epoch = admission->resource_generation;
@@ -795,9 +798,12 @@ bool CompileExecution::Impl::consume(std::size_t lane_index, bool blocking) {
         const bool unfair = eligible && fairness_denied(task.resources, &job.demand);
         if (unfair) job.denial = CompileResourceDenial::AgedDemand;
         if (!eligible || unfair) {
-         park(
-          job, task.resources.descriptors + task.resources.continuation_descriptors > admission->descriptor_room(task.resources, parent) ? CompileParkReason::Descriptors : CompileParkReason::Bytes);
-         if (job.reason == CompileParkReason::Bytes) wait_demand(job.demand);
+         // A ready older demand owns the next turn. Its peers retain their age
+         // without asking source owners to discard otherwise fitting storage.
+         park(job,
+          unfair ? CompileParkReason::Fairness
+                 : task.resources.descriptors + task.resources.continuation_descriptors > admission->descriptor_room(task.resources, parent) ? CompileParkReason::Descriptors : CompileParkReason::Bytes);
+         if (job.reason == CompileParkReason::Bytes || job.reason == CompileParkReason::Fairness) wait_demand(job.demand);
          continue;
         }
        }
@@ -1313,6 +1319,12 @@ std::optional<CompileExecution::Continuation> CompileExecution::retain(
  if (parent.credits_ && parent.credits_->owner != impl_->admission) throw std::invalid_argument("compile continuation parent belongs to another session");
  if (impl_->observer) ++impl_->costs.submission_attempts;
  const auto reject = [&](CompileResourceDenial reason) -> std::optional<Continuation> {
+  if (deferred) {
+   auto& state = *deferred->state_;
+   const bool pressure = reason != CompileResourceDenial::Records && reason != CompileResourceDenial::Cpu && reason != CompileResourceDenial::AgedDemand;
+   impl_->admission->change_pressure(impl_->admission->resource_waiters, state.pressure, pressure);
+   state.pressure = pressure;
+  }
   if (denial) *denial = reason;
   impl_->observe_rejection(lock, successor, resources, reason);
   return {};
@@ -1577,9 +1589,8 @@ CompileExecution::Readiness::Readiness(CompileExecution& owner, CompileChange in
  state_->callback = std::move(callback);
  state_->interests = interests | CompileChange::Interruption;
  const std::lock_guard lock(owner_.impl_->admission->mutex);
- // Control owners remain independently live even with one prepared CPU task
- // record. Keep bounded class-owner headroom for their readiness registrations.
- if (owner_.impl_->observers.size() >= std::max(owner_.impl_->record_limit, class_count)) throw std::length_error("compile readiness capacity exceeded");
+ // Registrations follow the live service and source owners, independently of
+ // reusable CPU task records. Each owner removes its registration on retirement.
  owner_.impl_->observers.push_back(state_);
 }
 void CompileExecution::Readiness::interests(CompileChange interests) noexcept {
@@ -1590,10 +1601,26 @@ void CompileExecution::Readiness::notify() noexcept {
  const auto& impl = owner_.impl_;
  const std::lock_guard lock(impl->admission->mutex);
  ++impl->admission->generation;
+ ++state_->generation;
  impl->admission->changed.notify_all();
+ if (!state_->callback) return;
  state_->pending.causes |= CompileChange::Local;
  state_->notified = true;
  signal_event(impl->event.get());
+}
+std::uint64_t CompileExecution::Readiness::generation() const {
+ const std::lock_guard lock(owner_.impl_->admission->mutex);
+ return state_->generation;
+}
+void CompileExecution::Readiness::wait(std::uint64_t observed) {
+ if (owner_.on_lane()) throw std::logic_error("compile CPU lane cannot wait for readiness");
+ auto& impl = *owner_.impl_;
+ std::unique_lock lock(impl.admission->mutex);
+ CompileAdmission::Waiter waiter(*impl.admission);
+ impl.wait(lock, [&] {
+  impl.check();
+  return state_->generation != observed;
+ });
 }
 CompileExecution::Readiness::~Readiness() {
  // Keep state_ alive while unlinking. Publication never takes or destroys a
@@ -1614,6 +1641,9 @@ CompileExecution::Readiness::Attempt::~Attempt() {
  const auto& impl = owner_->owner_.impl_;
  const std::lock_guard lock(impl->admission->mutex);
  auto& state = *owner_->state_;
+ ++state.generation;
+ impl->admission->changed.notify_all();
+ if (!state.callback) return;
  state.pending.causes |= causes_;
  state.pending.retry = true;
  state.notified = true;
@@ -1635,7 +1665,11 @@ CompileResourceWait::CompileResourceWait(std::shared_ptr<CompileExecution::Impl>
   owner.refresh_external_drain();
  }
  if (state.demand.needs_record) owner.wait_demand(state.demand);
- owner.admission->change_waiters(true, true);
+ // A continuation first needs a successor record. Publish resource pressure
+ // only after an actual resource denial; fitting and record-only attempts must
+ // not force unrelated forward readers to discard their decoders.
+ state.pressure = !state.demand.needs_record;
+ owner.admission->change_waiters(true, state.pressure);
  state.registered = true;
 }
 CompileResourceWait::~CompileResourceWait() {

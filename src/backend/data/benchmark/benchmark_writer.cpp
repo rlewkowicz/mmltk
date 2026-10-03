@@ -237,12 +237,16 @@ void BenchmarkSplitWriter::invalidate_labels(std::uint32_t slot) {
  const std::lock_guard lock(impl_->facts_mutex);
  impl_->entries.at(slot) = {};
 }
-void BenchmarkSplitWriter::settle_labels(std::uint32_t slot, std::uint64_t ordinal_base, bool ordinal_incomplete) {
- if (!ordinal_base && !ordinal_incomplete) return;
- const auto transform = [this, slot, ordinal_base, ordinal_incomplete] {
-  auto labels = impl_->slots_storage->labels(slot);
-  const auto selected = entry(slot);
-  labels.settle_ordinals(selected.num_instances, ordinal_base, ordinal_incomplete);
+void BenchmarkSplitWriter::settle_labels(std::span<const LabelSettlement> settlements) {
+ if (std::ranges::none_of(settlements, [](const auto& value) { return value.ordinal_base || value.ordinal_incomplete; })) return;
+ const auto transform = [this, settlements] {
+  for (const auto& settlement : settlements) {
+   if (!settlement.ordinal_base && !settlement.ordinal_incomplete) continue;
+   if (impl_->cancellation.requested()) throw std::runtime_error("dataset compilation cancelled");
+   auto labels = impl_->slots_storage->labels(settlement.slot);
+   const auto selected = entry(settlement.slot);
+   labels.settle_ordinals(selected.num_instances, settlement.ordinal_base, settlement.ordinal_incomplete);
+  }
  };
  impl_->output().submit({.work = transform}).wait();
 }

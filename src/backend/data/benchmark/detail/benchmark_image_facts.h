@@ -38,8 +38,9 @@ public:
  BenchmarkSourcePublication() = default;
  void operator()(const CachedImageReady&) const;
  // A repair with a canonical destination uses the actual pixel consumption as
- // its acceptance. Returns false when this ticket has no registered consumer.
- [[nodiscard]] bool consume(const CachedImageReady&) const;
+ // its acceptance. Transfer the payload before waiting so admission can release
+ // its storage. Without a registered consumer, return false without consuming it.
+ [[nodiscard]] bool consume(CachedImageReady&&) const;
  // Bind to this exact source attempt/image generation. An accepted subscription
  // settles once after physical pixel completion or withdrawal, outside fact locks.
  [[nodiscard]] bool subscribe(std::uint64_t, std::function<void(std::exception_ptr)>) const;
@@ -52,5 +53,5 @@ private:
  explicit BenchmarkSourcePublication(std::shared_ptr<const State> state) : state_(std::move(state)) {}
  std::shared_ptr<const State> state_;
 };
-using CachedImageReadySink = std::function<void(const CachedImageReady&)>;
+using CachedImageReadySink = std::function<void(CachedImageReady)>;
 }  // namespace mmltk::backend::data::benchmark_internal

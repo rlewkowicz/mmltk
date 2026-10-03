@@ -19,7 +19,7 @@ constexpr std::size_t word_bits = sizeof(unsigned long) * 8U;
 void checked(long result, const char* operation) {
  if (result < 0) throw std::system_error(errno, std::generic_category(), operation);
 }
-void verify_pages(void* data, std::size_t bytes, int node) {
+void verify_pages(void* data, std::size_t bytes, int node, NumaMemory::Lock lock) {
  std::array<void*, 256> pages{};
  std::array<int, 256> status{};
  const auto page = host_page_size();
@@ -28,6 +28,12 @@ void verify_pages(void* data, std::size_t bytes, int node) {
   for (std::size_t i = 0; i < count; ++i) pages[i] = static_cast<std::byte*>(data) + offset + i * page;
   checked(::move_pages(0, count, pages.data(), nullptr, status.data(), 0), "verify host page NUMA placement");
   for (std::size_t i = 0; i < count; ++i) {
+   // mlock prevents eviction, but Linux may still migrate a resident page.
+   // The non-faulting batch query sees its temporary migration entry as
+   // ENOENT. Resolve that locked page through the fault-aware node query;
+   // this still verifies actual placement and does not retry other failures.
+   if (status[i] == -ENOENT && lock == NumaMemory::Lock::Pages)
+    checked(::get_mempolicy(&status[i], nullptr, 0, pages[i], MPOL_F_NODE | MPOL_F_ADDR), "resolve locked host page NUMA placement");
    if (status[i] == node) continue;
    const auto operation = "verify host page at byte " + std::to_string(offset + i * page) + " of " + std::to_string(bytes) + " on NUMA node " + std::to_string(node);
    if (status[i] < 0) throw std::system_error(-status[i], std::generic_category(), operation);
@@ -64,7 +70,7 @@ void* allocate_pages(std::size_t bytes, std::size_t alignment, int node, NumaMem
   // by the syscall. Locking then keeps every page resident through verification.
   checked(::madvise(mapping, bytes, MADV_POPULATE_WRITE), "prefault owned local host storage");
   if (lock == NumaMemory::Lock::Pages) checked(::mlock(mapping, bytes), "page-lock compile NUMA arena (IPC_LOCK and memlock required)");
-  verify_pages(mapping, bytes, node);
+  verify_pages(mapping, bytes, node, lock);
  } catch (...) {
   ::munmap(mapping, bytes);
   throw;
@@ -157,7 +163,7 @@ void NumaMemory::reset() noexcept {
  bytes_ = 0;
 }
 void NumaMemory::verify() const {
- if (data_) verify_pages(data_, bytes_, node_);
+ if (data_) verify_pages(data_, bytes_, node_, lock_);
 }
 NumaMemoryResource::NumaMemoryResource(int node) : node_(node) { (void)prepare_bound_memory_policy(node); }
 void* NumaMemoryResource::do_allocate(std::size_t bytes, std::size_t alignment) { return allocate_pages(page_rounded_bytes(std::max(bytes, std::size_t{1})), alignment, node_); }
